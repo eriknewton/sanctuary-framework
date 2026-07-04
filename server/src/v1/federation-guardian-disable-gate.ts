@@ -51,13 +51,20 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { fromBase64url, toBase64url } from "../core/encoding.js";
 import { canonicalizeToBytes } from "../mesh/canonical-json.js";
 import { SIGNATURE_SCHEME_V1 } from "../mesh/constants.js";
+import { verifyGuardianRoster } from "../mesh/guardian/guardian-roster.js";
 import type { FortressMasterPublicKey } from "../mesh/types.js";
 import {
   buildApprovalSigningInput,
   enforceThreshold,
   type GuardianApproval,
 } from "../recovery/index.js";
-import type { GuardianRevocationRequirement } from "./federation-revocation-guardian-gate.js";
+import {
+  effectiveThresholdM,
+  LOWERED_THRESHOLD_AUTHORIZATION_DOMAIN,
+  type GuardianRevocationRequirement,
+  type LoweredThresholdAuthorization,
+  type LoweredThresholdAuthorizationBody,
+} from "./federation-revocation-guardian-gate.js";
 
 /**
  * The recovery-action token guardians sign over when authorizing an INSTANT
@@ -583,4 +590,550 @@ function readErrorCode(err: unknown): string | null {
 function errorDetail(err: unknown): string {
   if (err instanceof Error && err.message.length > 0) return err.message;
   return "guardian disable-gate verification failed";
+}
+
+// ── Reboot-survivable lowered-M authorization (F1 chokepoint slice) ──────────
+//
+// The lowered-threshold DATA TYPES + `effectiveThresholdM` live in
+// `federation-revocation-guardian-gate.ts` (co-located with the
+// `GuardianRevocationRequirement` they describe) so that module never needs to
+// import from THIS one - which keeps the two modules a single directed edge
+// (disable-gate -> revocation-gate), not an import cycle. This module keeps the
+// CRYPTO helpers (build / sign / verify) since they are disable-gate concerns
+// (they mirror `MASTER_DISABLE_AUTHORIZATION_DOMAIN`'s sign/verify next door).
+
+export function buildLoweredThresholdAuthorizationBody(params: {
+  fortressId: string;
+  rosterVersion: number;
+  effectiveM: number;
+  disableNonce: number;
+}): LoweredThresholdAuthorizationBody {
+  return {
+    domain: LOWERED_THRESHOLD_AUTHORIZATION_DOMAIN,
+    fortress_id: params.fortressId,
+    roster_version: params.rosterVersion,
+    effective_m: params.effectiveM,
+    disable_nonce: params.disableNonce,
+  };
+}
+
+/** Sign a lowered-effective-threshold authorization with the fortress master key. */
+export function signLoweredThresholdAuthorization(params: {
+  fortressId: string;
+  rosterVersion: number;
+  effectiveM: number;
+  disableNonce: number;
+  masterPrivateKey: Uint8Array;
+}): LoweredThresholdAuthorization {
+  const body = buildLoweredThresholdAuthorizationBody(params);
+  const signedBytes = canonicalizeToBytes(body);
+  const sig = ed25519.sign(signedBytes, params.masterPrivateKey);
+  return { body, signature: toBase64url(sig) };
+}
+
+export type LoweredThresholdAuthorizationDecision =
+  | { valid: true }
+  | { valid: false; reason: string };
+
+/**
+ * Verify a lowered-threshold authorization, FAIL-CLOSED, mirroring
+ * {@link verifyMasterDisableAuthorization}. Checks, in order: domain tag,
+ * fortress id, roster version binding, `1 <= effective_m <= rosterM` (a lowering
+ * never exceeds the issued ceiling), and the Ed25519 signature over the
+ * canonical body against the PINNED fortress-master public key. Any failure is
+ * a deny; never returns valid on ambiguity. A lowered record that does not
+ * verify is exactly the tamper case and must latch invalid on reboot.
+ */
+export function verifyLoweredThresholdAuthorization(params: {
+  authorization: unknown;
+  fortressId: string;
+  rosterVersion: number;
+  rosterM: number;
+  pinnedMaster: FortressMasterPublicKey;
+}): LoweredThresholdAuthorizationDecision {
+  const auth = params.authorization;
+  if (auth === null || auth === undefined || typeof auth !== "object") {
+    return { valid: false, reason: "lowered_threshold_required" };
+  }
+  const candidate = auth as Partial<LoweredThresholdAuthorization>;
+  const body = candidate.body;
+  const signature = candidate.signature;
+  if (
+    body === undefined ||
+    typeof body !== "object" ||
+    typeof signature !== "string" ||
+    signature.length === 0
+  ) {
+    return { valid: false, reason: "lowered_threshold_malformed" };
+  }
+  if (body.domain !== LOWERED_THRESHOLD_AUTHORIZATION_DOMAIN) {
+    return { valid: false, reason: "lowered_threshold_wrong_domain" };
+  }
+  if (body.fortress_id !== params.fortressId) {
+    return { valid: false, reason: "lowered_threshold_wrong_fortress" };
+  }
+  if (body.roster_version !== params.rosterVersion) {
+    return { valid: false, reason: "lowered_threshold_stale_roster_version" };
+  }
+  if (
+    typeof body.effective_m !== "number" ||
+    !Number.isSafeInteger(body.effective_m) ||
+    body.effective_m < 1 ||
+    body.effective_m > params.rosterM
+  ) {
+    return { valid: false, reason: "lowered_threshold_out_of_range" };
+  }
+  if (
+    typeof body.disable_nonce !== "number" ||
+    !Number.isSafeInteger(body.disable_nonce) ||
+    body.disable_nonce < 0
+  ) {
+    return { valid: false, reason: "lowered_threshold_bad_nonce" };
+  }
+  try {
+    const signedBytes = canonicalizeToBytes(
+      buildLoweredThresholdAuthorizationBody({
+        fortressId: body.fortress_id,
+        rosterVersion: body.roster_version,
+        effectiveM: body.effective_m,
+        disableNonce: body.disable_nonce,
+      }),
+    );
+    const ok = ed25519.verify(
+      fromBase64url(signature),
+      signedBytes,
+      fromBase64url(params.pinnedMaster.public_key),
+    );
+    if (!ok) {
+      return { valid: false, reason: "lowered_threshold_signature_invalid" };
+    }
+    return { valid: true };
+  } catch {
+    return { valid: false, reason: "lowered_threshold_signature_invalid" };
+  }
+}
+
+// ── The single chokepoint: transition -> authorized effect ──────────────────
+
+/**
+ * The read-only view of the live guardian-requirement state the pure authorizer
+ * decides against. The dashboard snapshots these fields (no writes) before
+ * calling {@link authorizeGuardianRequirementTransition}, then applies the
+ * returned effect atomically. Crucially the authorizer sees the LATCH, so a
+ * `set(null)` against a latched-invalid fortress classifies as a real decrease
+ * (fail-open #1) rather than a benign noop keyed only off the nulled live req.
+ */
+export interface GuardianRequirementState {
+  /** The live requirement, or null when none is configured. */
+  requirement: GuardianRevocationRequirement | null;
+  /** The fail-closed latch: true when a persisted roster failed to re-verify. */
+  latchInvalid: boolean;
+  /** The pinned fortress-master public key, or null when unprovisioned. */
+  pinnedMaster: FortressMasterPublicKey | null;
+  /** The fortress id, or null when unprovisioned. */
+  fortressId: string | null;
+  /** True when the durable sync-state record is unavailable/unverified. */
+  syncStateUnavailable: boolean;
+  /** The nonce a NEW authorization must target (current disable nonce + 1). */
+  nextDisableNonce: number;
+}
+
+/** Every distinct way the guardian requirement / latch may transition. */
+export type GuardianRequirementTransition =
+  /** Operator sets the requirement to a new value (or null). Latch-aware. */
+  | {
+      kind: "operator_set";
+      next: GuardianRevocationRequirement | null;
+      /** Present only for a decrease (disable / lower); absent for increase / noop. */
+      auth?: GuardianDisableAuthorization | null;
+      /**
+       * A master-signed lowered-threshold record for the `next` requirement,
+       * required when the effective M strictly decreases via the master path.
+       */
+      loweredThreshold?: LoweredThresholdAuthorization | null;
+    }
+  /** Break-glass countdown completed (disable-only; lower is refused at initiate). */
+  | { kind: "break_glass_complete"; intent: "disable"; targetM: number | null };
+
+/**
+ * The exact post-state the chokepoint applies atomically. `requirement === null`
+ * and `clearsLatch === true` is unrepresentable by construction on the operator
+ * path (INV-A): a null-install never clears the latch except the one carve-out,
+ * a MASTER-signed disable (OR-3), which sets `masterAuthorizedNull`.
+ */
+export interface GuardianRequirementEffect {
+  requirement: GuardianRevocationRequirement | null;
+  /** Clear the fail-closed latch. Only ever true when installing a verified roster. */
+  clearsLatch: boolean;
+  /**
+   * OR-3 carve-out: a MASTER-signed disable of a latched-invalid fortress
+   * positively authorizes the absence of a guard, so it clears the latch even
+   * though it installs null. Operator/quorum/break-glass disable leave it as-is.
+   */
+  masterAuthorizedNull: boolean;
+  /** The auth method that carried a decrease, for the audit trail. */
+  authMethod: "operator" | "quorum" | "master" | "break_glass" | null;
+  /** The nonce burned by this transition (a decrease/completion), else null. */
+  burnedNonce: number | null;
+  /** Classification for the audit trail. */
+  classification: "increase" | "decrease" | "noop";
+}
+
+export type GuardianRequirementCommit =
+  | { ok: true; effect: GuardianRequirementEffect }
+  | { ok: false; reason: GuardianRequirementRefusalReason; detail: string };
+
+export type GuardianRequirementRefusalReason =
+  | "federation_not_provisioned"
+  | "federation_sync_state_unavailable"
+  | "guardian_disable_authorization_required"
+  | "guardian_roster_signature_invalid"
+  | "lowered_threshold_invalid"
+  | "no_requirement_configured";
+
+/**
+ * The single PURE authorizer for every guardian-requirement / latch transition.
+ * Decides authorization + validates the roster/lowered record BEFORE any state
+ * write and returns the exact effect the caller applies atomically. FAIL-CLOSED:
+ * any missing auth, verification failure, or ambiguity is `{ ok: false }`.
+ *
+ * This encodes the §4 invariant table. Two structural invariants it guarantees:
+ *   - INV-A: the latch clears ONLY by installing a positively-verified roster,
+ *     NEVER by removing the requirement - EXCEPT a master-signed disable (OR-3),
+ *     which positively authorizes the absence. An operator `set(null)` never
+ *     clears the latch (fail-open #1 closed).
+ *   - INV-B: no signed-body field is mutated; a lowering rides in a sibling
+ *     master-signed record, never by rewriting `roster.m`.
+ */
+export function authorizeGuardianRequirementTransition(
+  state: GuardianRequirementState,
+  t: GuardianRequirementTransition,
+): GuardianRequirementCommit {
+  if (t.kind === "break_glass_complete") {
+    // Completion is authorized by the elapsed, unvetoed countdown. It is
+    // disable-only (lower is refused at initiate - OR-1), so it installs null
+    // and, being NON-master, leaves the latch as-is (the caller only completes
+    // when the latch is clear anyway; belt-and-suspenders here).
+    return {
+      ok: true,
+      effect: {
+        requirement: null,
+        clearsLatch: false,
+        masterAuthorizedNull: false,
+        authMethod: "break_glass",
+        burnedNonce: null,
+        classification: "decrease",
+      },
+    };
+  }
+
+  const next = t.next;
+  const live = state.requirement;
+  // A latched-invalid fortress is "a guard IS configured but unverifiable": for
+  // classification it counts as a non-null current requirement (this is the
+  // #1 fix - a `set(null)` against it is a decrease, not a noop).
+  const guardConfigured = live !== null || state.latchInvalid;
+
+  // Effective-M comparison uses the effective threshold on both sides so a
+  // lowered record participates correctly.
+  const currentEffectiveM =
+    live !== null ? effectiveThresholdM(live) : null;
+  const nextEffectiveM = next !== null ? effectiveThresholdM(next) : null;
+
+  let classification: "increase" | "decrease" | "noop";
+  if (!guardConfigured && next === null) {
+    classification = "noop"; // genuinely nothing configured
+  } else if (!guardConfigured && next !== null) {
+    classification = "increase"; // enable
+  } else if (guardConfigured && next === null) {
+    classification = "decrease"; // disable (incl. set(null) on a latched fortress)
+  } else if (currentEffectiveM === null) {
+    // Recovery from latched-invalid (live req nulled by rehydrate) by installing
+    // a verified roster is an increase (it positively re-asserts a guard).
+    classification = "increase";
+  } else {
+    // both effective-M defined
+    const nm = nextEffectiveM as number;
+    if (nm < currentEffectiveM) classification = "decrease";
+    else if (nm > currentEffectiveM) classification = "increase";
+    else classification = "noop";
+  }
+
+  // A decrease demands the durable record be trustworthy (same latch/unavailable
+  // guard the pre-chokepoint decrease branch enforced) BEFORE any auth check, so
+  // we never tear down a guard whose state we could not trust on boot. The one
+  // exception is the master path: a master-signed disable of a latched-invalid
+  // fortress is the OR-3 carve-out and is allowed to run (it positively clears
+  // the latch). We special-case that below after the auth decision.
+  if (classification === "decrease") {
+    const intent: "disable" | "lower" = next === null ? "disable" : "lower";
+    const targetM = next === null ? null : effectiveThresholdM(next);
+    const auth = t.auth ?? null;
+
+    // Decide the auth method first (master checked first: top authority).
+    let authMethod: "quorum" | "master" | null = null;
+    let detail = "guardian_disable_authorization_required";
+    const pinnedMaster = state.pinnedMaster;
+    const fortressId = state.fortressId;
+
+    if (auth?.masterAuthorization !== undefined && auth.masterAuthorization !== null) {
+      if (pinnedMaster === null || fortressId === null) {
+        detail = "federation_not_provisioned";
+      } else {
+        const decision = verifyMasterDisableAuthorization({
+          authorization: auth.masterAuthorization,
+          fortressId,
+          disableNonce: state.nextDisableNonce,
+          intent,
+          targetM,
+          pinnedMaster,
+        });
+        if (decision.allowed) authMethod = "master";
+        else detail = decision.reason;
+      }
+    } else if (
+      auth?.quorumApprovals !== undefined &&
+      auth.quorumApprovals !== null &&
+      live !== null
+    ) {
+      // The quorum is over the CURRENT effective roster: lowering to a smaller M'
+      // still needs the current effective M's worth of signatures. This path is
+      // only reachable when a LIVE roster exists (`live !== null`): a
+      // latched-invalid fortress has `live === null` (rehydrate nulled it), so a
+      // quorum has no live roster to verify against - it falls through to the
+      // no-auth refusal below, then the latch guard. Only a MASTER key (OR-3) can
+      // decrease a latched fortress.
+      const decision = evaluateGuardianDisableSignOff({
+        requirement: live,
+        fortressId: live.roster.fortress_id,
+        disableNonce: state.nextDisableNonce,
+        intent,
+        targetM,
+        approvals: auth.quorumApprovals,
+      });
+      if (decision.allowed) authMethod = "quorum";
+      else detail = decision.detail;
+    }
+
+    if (authMethod === null) {
+      return {
+        ok: false,
+        reason: "guardian_disable_authorization_required",
+        detail,
+      };
+    }
+
+    // The sync-state guard: a decrease of EITHER auth method must refuse while
+    // the durable record itself is unavailable (corrupt/deleted) - we cannot
+    // durably commit against a record the store will throw on, and a master
+    // authorization does not repair a corrupt blob. This applies to master too.
+    if (state.syncStateUnavailable) {
+      return {
+        ok: false,
+        reason: "federation_sync_state_unavailable",
+        detail:
+          "the durable federation sync-state is unavailable; refusing to disable/lower the guardian requirement until the operator recovers the record",
+      };
+    }
+    // The LATCH guard (roster failed to re-verify on boot): a NON-master decrease
+    // must refuse while latched. A MASTER decrease is the OR-3 carve-out: the
+    // trust root positively authorizes the transition and, on a disable, clears
+    // the latch. This lets the fortress owner re-assert authoritatively while
+    // still refusing a stolen-operator-key quorum against a latched fortress.
+    if (authMethod !== "master" && state.latchInvalid) {
+      return {
+        ok: false,
+        reason: "federation_sync_state_unavailable",
+        detail:
+          "the durable guardian requirement is unverified (latched invalid); refusing to disable/lower via quorum until the operator re-pins a valid roster, or the master key authorizes it directly",
+      };
+    }
+
+    // A LOWER (next !== null on the decrease branch) must always verify its
+    // roster. There are two shapes of a legitimate lower:
+    //   (i)  the installed roster's OWN issued `m` IS the lower threshold (a
+    //        genuinely NEW master-signed roster re-issued at a lower m). Its own
+    //        signature covers the lower m, so it survives reboot with no sibling
+    //        record - no lowered-threshold record is needed or expected.
+    //   (ii) the effective M is pushed BELOW the installed roster's issued m
+    //        WITHOUT re-issuing the roster. That MUST ride in a master-signed
+    //        lowered-threshold record (INV-B: never mutate `roster.m`), bound to
+    //        this transition's nonce + target, else the lowering could not
+    //        survive reboot (fail-open #2).
+    // The discriminator is `loweredThreshold` presence: absent -> shape (i);
+    // present -> shape (ii). A DISABLE (next === null) never carries one.
+    let installedNext: GuardianRevocationRequirement | null = next;
+    if (next !== null) {
+      const rosterCheck = verifyNextRoster(next, pinnedMaster);
+      if (!rosterCheck.ok) return rosterCheck;
+      const lowered = t.loweredThreshold ?? next.loweredThreshold ?? null;
+      if (lowered !== null) {
+        const loweredCheck = requireLoweredThresholdForNext(next, lowered, state);
+        if (!loweredCheck.ok) return loweredCheck;
+        // Bind the lowered record to THIS transition: effective_m == target and
+        // nonce == the nonce being burned (anti-replay / anti-outliving).
+        if (lowered.body.effective_m !== targetM) {
+          return {
+            ok: false,
+            reason: "lowered_threshold_invalid",
+            detail:
+              "lowered-threshold effective_m does not match the transition target",
+          };
+        }
+        if (lowered.body.disable_nonce !== state.nextDisableNonce) {
+          return {
+            ok: false,
+            reason: "lowered_threshold_invalid",
+            detail:
+              "lowered-threshold disable_nonce does not match the transition nonce",
+          };
+        }
+        installedNext = { ...next, loweredThreshold: lowered };
+      }
+    }
+
+    // OR-3: a MASTER disable of a latched-invalid fortress clears the latch;
+    // every other disable leaves it as-is (moot once requirement is null).
+    const masterAuthorizedNull =
+      next === null && authMethod === "master";
+    return {
+      ok: true,
+      effect: {
+        requirement: installedNext,
+        // INV-A: installing a positively-verified roster clears the latch. A
+        // decrease that installs a non-null requirement (a master-LOWER, the
+        // only decrease that reaches here with a latched fortress since a quorum
+        // has no live roster to verify against) installs a verified roster, so
+        // it clears the latch. A disable (next === null) never clears via this
+        // flag - the master-disable carve-out uses masterAuthorizedNull instead.
+        clearsLatch: next !== null && state.latchInvalid,
+        masterAuthorizedNull,
+        authMethod,
+        burnedNonce: state.nextDisableNonce,
+        classification,
+      },
+    };
+  }
+
+  // increase / noop: operator-only. A non-null install MUST verify its roster
+  // (and its lowered record, if any) against the pinned master. The latch clears
+  // ONLY by installing such a positively-verified roster (INV-A).
+  if (next !== null) {
+    const rosterCheck = verifyNextRoster(next, state.pinnedMaster);
+    if (!rosterCheck.ok) return rosterCheck;
+    const loweredCheck = requireLoweredThresholdForNext(
+      next,
+      next.loweredThreshold ?? null,
+      state,
+    );
+    if (!loweredCheck.ok) return loweredCheck;
+    // Anti-replay of a superseded lowered record (A3): if the PRIOR live
+    // requirement carried a lowered record that the NEXT state does NOT carry
+    // (a raise/re-pin that drops the lowering), advance the disable-nonce floor
+    // PAST that dropped record's nonce. Otherwise a same-roster raise would
+    // leave the floor at the dropped record's nonce, letting an attacker who can
+    // re-encrypt the blob re-inject the stale lowered record at nonce == floor.
+    // Burning here pushes the floor strictly above it so the replay is stale.
+    const priorLoweredNonce = live?.loweredThreshold?.body.disable_nonce ?? null;
+    const nextLoweredNonce = next.loweredThreshold?.body.disable_nonce ?? null;
+    const supersedesLowered =
+      priorLoweredNonce !== null && priorLoweredNonce !== nextLoweredNonce;
+    return {
+      ok: true,
+      effect: {
+        requirement: next,
+        // Installing a verified roster is the ONLY way to clear the latch.
+        clearsLatch: state.latchInvalid,
+        masterAuthorizedNull: false,
+        authMethod: "operator",
+        burnedNonce: supersedesLowered ? state.nextDisableNonce : null,
+        classification,
+      },
+    };
+  }
+
+  // next === null && !guardConfigured -> genuine noop; nothing configured, no
+  // latch to clear (there is none by definition when !guardConfigured).
+  return {
+    ok: true,
+    effect: {
+      requirement: null,
+      clearsLatch: false,
+      masterAuthorizedNull: false,
+      authMethod: null,
+      burnedNonce: null,
+      classification: "noop",
+    },
+  };
+}
+
+/**
+ * Verify the roster of a non-null install against the pinned master, fail-closed
+ * (mirrors the boot rehydrate check). No pinned master -> refuse the whole call.
+ */
+function verifyNextRoster(
+  next: GuardianRevocationRequirement,
+  pinnedMaster: FortressMasterPublicKey | null,
+):
+  | { ok: true }
+  | { ok: false; reason: GuardianRequirementRefusalReason; detail: string } {
+  if (pinnedMaster === null) {
+    return {
+      ok: false,
+      reason: "federation_not_provisioned",
+      detail:
+        "no pinned fortress-master public key is available to verify the supplied guardian roster; refusing to install it",
+    };
+  }
+  try {
+    verifyGuardianRoster(next.roster, pinnedMaster);
+    return { ok: true };
+  } catch {
+    return {
+      ok: false,
+      reason: "guardian_roster_signature_invalid",
+      detail:
+        "the supplied guardian roster does not verify against the pinned fortress-master public key; refusing to install it",
+    };
+  }
+}
+
+/**
+ * When a non-null requirement carries a lowered-threshold record, verify it
+ * against the pinned master (domain, fortress, roster-version binding, range,
+ * signature). A requirement WITHOUT a lowered record is fine (effective M =
+ * roster.m). FAIL-CLOSED: a present-but-invalid lowered record refuses the
+ * install.
+ */
+function requireLoweredThresholdForNext(
+  next: GuardianRevocationRequirement,
+  lowered: LoweredThresholdAuthorization | null,
+  state: GuardianRequirementState,
+):
+  | { ok: true }
+  | { ok: false; reason: GuardianRequirementRefusalReason; detail: string } {
+  if (lowered === null) return { ok: true };
+  if (state.pinnedMaster === null || state.fortressId === null) {
+    return {
+      ok: false,
+      reason: "federation_not_provisioned",
+      detail:
+        "no pinned fortress-master public key is available to verify the supplied lowered-threshold record",
+    };
+  }
+  const decision = verifyLoweredThresholdAuthorization({
+    authorization: lowered,
+    fortressId: state.fortressId,
+    rosterVersion: next.roster.version,
+    rosterM: next.roster.m,
+    pinnedMaster: state.pinnedMaster,
+  });
+  if (!decision.valid) {
+    return {
+      ok: false,
+      reason: "lowered_threshold_invalid",
+      detail: decision.reason,
+    };
+  }
+  return { ok: true };
 }

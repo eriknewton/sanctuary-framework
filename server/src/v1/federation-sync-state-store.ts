@@ -522,6 +522,12 @@ function cloneGuardianRevocationRequirement(
   if (requirement.expectedRosterVersion !== undefined) {
     cloned.expectedRosterVersion = requirement.expectedRosterVersion;
   }
+  if (requirement.loweredThreshold !== undefined) {
+    cloned.loweredThreshold = {
+      body: { ...requirement.loweredThreshold.body },
+      signature: requirement.loweredThreshold.signature,
+    };
+  }
   return cloned;
 }
 
@@ -813,6 +819,16 @@ function projectPersistedRequirement(
   };
   if (persisted.expected_roster_version !== undefined) {
     requirement.expectedRosterVersion = persisted.expected_roster_version;
+  }
+  // Carry the lowered-threshold record verbatim (its own master signature rides
+  // along) so the consumer can re-verify it against the pinned master on
+  // rehydrate, exactly like the roster's `master_signature`. Absent -> effective
+  // M = roster.m.
+  if (persisted.lowered_threshold !== undefined) {
+    requirement.loweredThreshold = {
+      body: { ...persisted.lowered_threshold.body },
+      signature: persisted.lowered_threshold.signature,
+    };
   }
   return requirement;
 }

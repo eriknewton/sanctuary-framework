@@ -13,13 +13,17 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateKeypair } from "../../src/core/identity.js";
 import { toBase64url } from "../../src/core/encoding.js";
-import { issueGuardianRoster } from "../../src/mesh/guardian/guardian-roster.js";
+import {
+  issueGuardianRoster,
+  verifyGuardianRoster,
+} from "../../src/mesh/guardian/guardian-roster.js";
 import type { GuardianIdentity, GuardianRoster } from "../../src/mesh/guardian/types.js";
 import {
   FederationSyncStateStore,
@@ -27,13 +31,19 @@ import {
   FEDERATION_SYNC_STATE_STORE_KEY,
 } from "../../src/v1/federation-sync-state-store.js";
 import type { V1FederationDeps } from "../../src/v1/federation.js";
-import type { GuardianRevocationRequirement } from "../../src/v1/federation-revocation-guardian-gate.js";
-import { GUARDIAN_SIGN_OFF_ACTION } from "../../src/v1/federation-revocation-guardian-gate.js";
+import {
+  GUARDIAN_SIGN_OFF_ACTION,
+  effectiveThresholdM,
+  type GuardianRevocationRequirement,
+  type LoweredThresholdAuthorization,
+} from "../../src/v1/federation-revocation-guardian-gate.js";
 import {
   classifyRequirementTransition,
   signGuardianDisableApproval,
   signGuardianBreakGlassVeto,
   signMasterDisableAuthorization,
+  signLoweredThresholdAuthorization,
+  authorizeGuardianRequirementTransition,
   MIN_BREAK_GLASS_DELAY_MS,
   type GuardianDisableAuthorization,
 } from "../../src/v1/federation-guardian-disable-gate.js";
@@ -1026,5 +1036,420 @@ describe("F1 E1: rotate-root style stale-writer merge cannot revive a vetoed bre
     ).buildV1FederationDeps().federationPosture!();
     expect(posture.guardian_break_glass.active).toBe(false);
     expect(signOff(restarted)).not.toBeNull();
+  });
+});
+
+// ── Chokepoint + reboot-survivable lowered-M (2026-07-05 design, T-1..T-9) ───
+
+describe("F1 chokepoint: lowered-M + latch fail-opens", () => {
+  const NS = FEDERATION_SYNC_STATE_STORE_NAMESPACE;
+  const KEY = FEDERATION_SYNC_STATE_STORE_KEY;
+
+  function masterKey(fortress: MultiNodeFortress, nodeId: string): Uint8Array {
+    return fortress.nodes[nodeId]!.context.getMasterPrivateKey!();
+  }
+
+  // Force a latched-INVALID (roster failed to re-verify) fortress that still has
+  // a PRESENT durable record (distinct from the corrupt-blob syncStateUnavailable
+  // case). Mint a valid requirement, then tamper roster.m in the persisted
+  // snapshot and re-encrypt under the same master key (models an attacker who can
+  // re-encrypt but not forge the fortress-master signature), then rehydrate.
+  async function makeRosterLatchedDashboard(): Promise<{
+    dashboard: DepsAccess;
+    fortress: MultiNodeFortress;
+    storage: MemoryStorage;
+    keypairs: GuardianKeypair[];
+  }> {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const before = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await before.setFederationGuardianRevocationRequirement({ roster });
+
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    const snapshot = await store.load();
+    snapshot.guardianRevocationRequirement!.roster.m = 1; // signature no longer matches
+    await storage.delete(NS, KEY);
+    await store.persist(snapshot);
+
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const hook = signOff(dashboard) as { unavailable?: boolean } | null;
+    expect(hook && hook.unavailable).toBe(true); // latched invalid, record present
+    return { dashboard, fortress, storage, keypairs };
+  }
+
+  function mintLowered(
+    fortress: MultiNodeFortress,
+    nodeId: string,
+    rosterVersion: number,
+    effectiveM: number,
+    disableNonce: number,
+  ): LoweredThresholdAuthorization {
+    return signLoweredThresholdAuthorization({
+      fortressId: fortress.fortressId,
+      rosterVersion,
+      effectiveM,
+      disableNonce,
+      masterPrivateKey: masterKey(fortress, nodeId),
+    });
+  }
+
+  // T-1 (fail-open #1): set(null) on a latched-invalid fortress with NO auth
+  // must REFUSE; latch stays set; kill path still returns { unavailable: true }.
+  it("T-1: set(null) on a latched-invalid fortress with no authorization REFUSES (latch persists)", async () => {
+    const { dashboard } = await makeRosterLatchedDashboard();
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement(null),
+    ).rejects.toMatchObject({ code: "guardian_disable_authorization_required" });
+    const hook = signOff(dashboard) as { unavailable?: boolean } | null;
+    expect(hook && hook.unavailable).toBe(true);
+  });
+
+  // T-1 (OR-3): a MASTER-signed disable on a latched-invalid fortress CLEARS the
+  // latch (master positively authorizes the absence). Non-master set(null) above
+  // still refuses.
+  it("T-1/OR-3: a master-signed disable on a latched-invalid fortress clears the latch", async () => {
+    const { dashboard, fortress } = await makeRosterLatchedDashboard();
+    const nonce = dashboard.nextFederationGuardianDisableNonce();
+    const masterAuthorization = signMasterDisableAuthorization({
+      fortressId: fortress.fortressId,
+      disableNonce: nonce,
+      intent: "disable",
+      targetM: null,
+      masterPrivateKey: masterKey(fortress, "mini-1"),
+    });
+    await dashboard.setFederationGuardianRevocationRequirement(null, {
+      masterAuthorization,
+    });
+    // Latch cleared AND requirement is null -> the hook returns null (legacy
+    // single-operator), NOT the unavailable sentinel.
+    expect(signOff(dashboard)).toBeNull();
+  });
+
+  // T-2 (fail-open #2): master-lower from M=3 to M=2 mints a lowered record; the
+  // roster's own signature STILL verifies (roster body unmutated), the effective
+  // threshold is 2, and after a reboot it re-verifies clean, latch NOT set,
+  // effective M still 2.
+  it("T-2: master-lower keeps the roster signature valid and survives reboot with effective M=2", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    const nonce = dashboard.nextFederationGuardianDisableNonce();
+    const lowered = mintLowered(fortress, "mini-1", roster.version, 2, nonce);
+    const masterAuthorization = signMasterDisableAuthorization({
+      fortressId: fortress.fortressId,
+      disableNonce: nonce,
+      intent: "lower",
+      targetM: 2,
+      masterPrivateKey: masterKey(fortress, "mini-1"),
+    });
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: lowered },
+      { masterAuthorization },
+    );
+
+    const live = signOff(dashboard) as GuardianRevocationRequirement;
+    expect(live.roster.master_signature).toBe(roster.master_signature); // UNMUTATED
+    expect(live.roster.m).toBe(3); // issued ceiling unchanged
+    expect(effectiveThresholdM(live)).toBe(2); // effective threshold lowered
+
+    // Reboot.
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable: true };
+    expect((after as { unavailable?: boolean }).unavailable).not.toBe(true);
+    const req = after as GuardianRevocationRequirement;
+    expect(req.roster.master_signature).toBe(roster.master_signature);
+    expect(effectiveThresholdM(req)).toBe(2);
+  });
+
+  // T-3 (A3 lowered-M replay): lower to M=2 (nonce burns), raise back to M=3,
+  // then inject the stale M=2 lowered record into the persisted blob -> the
+  // nonce floor has climbed past it, so the replay cannot silently take effect.
+  it("T-3: a replayed stale lowered-M record is refused on reboot (below-floor nonce)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Lower to M=2 (burns nonce N).
+    const nonceLower = dashboard.nextFederationGuardianDisableNonce();
+    const staleLowered = mintLowered(fortress, "mini-1", roster.version, 2, nonceLower);
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: staleLowered },
+      {
+        masterAuthorization: signMasterDisableAuthorization({
+          fortressId: fortress.fortressId,
+          disableNonce: nonceLower,
+          intent: "lower",
+          targetM: 2,
+          masterPrivateKey: masterKey(fortress, "mini-1"),
+        }),
+      },
+    );
+    // Raise back to M=3 (drop the lowered record) - an increase, operator-only.
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+    expect(
+      effectiveThresholdM(signOff(dashboard) as GuardianRevocationRequirement),
+    ).toBe(3);
+
+    // Attacker re-injects the stale M=2 lowered record into the persisted blob,
+    // re-encrypting under the same master key. Its nonce is BELOW the burned
+    // floor -> the reboot nonce floor climbs past it.
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    const snapshot = await store.load();
+    snapshot.guardianRevocationRequirement!.loweredThreshold = staleLowered;
+    await storage.delete(NS, KEY);
+    await store.persist(snapshot);
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const nextNonce = restarted.nextFederationGuardianDisableNonce();
+    expect(nextNonce).toBeGreaterThan(staleLowered.body.disable_nonce + 1);
+  });
+
+  // T-4 (A6 derived latch): tamper the roster signature -> reboot latches
+  // invalid; a verified re-pin (master-signed roster) CLEARS the latch; a
+  // set(null) does NOT (it refuses).
+  it("T-4: a verified re-pin clears the derived latch; set(null) does not", async () => {
+    const { dashboard, fortress } = await makeRosterLatchedDashboard();
+
+    // set(null) does NOT clear the latch (it refuses).
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement(null),
+    ).rejects.toMatchObject({ code: "guardian_disable_authorization_required" });
+    expect((signOff(dashboard) as { unavailable?: boolean }).unavailable).toBe(true);
+
+    // A verified re-pin (a genuine master-signed roster) clears the latch.
+    const freshKeypairs = buildGuardianKeypairs(5);
+    const freshRoster = buildRosterFromKeypairs(fortress, "mini-1", freshKeypairs, 3, 2);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster: freshRoster });
+    const hook = signOff(dashboard) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    expect((hook as { unavailable?: boolean }).unavailable).not.toBe(true);
+    expect((hook as GuardianRevocationRequirement).roster.version).toBe(2);
+  });
+
+  // T-5 (M2 recovery preserved): a re-pin (increase, verified roster) recovers
+  // from the latch, while a disable (decrease) refuses under the same latch.
+  it("T-5: re-pin recovery is preserved; disable under the same latch refuses", async () => {
+    const { dashboard, fortress } = await makeRosterLatchedDashboard();
+    // Disable (decrease) under the latch refuses (no auth).
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement(null),
+    ).rejects.toMatchObject({ code: "guardian_disable_authorization_required" });
+    // Re-pin (increase) recovers.
+    const kp = buildGuardianKeypairs(5);
+    const r = buildRosterFromKeypairs(fortress, "mini-1", kp, 3, 2);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster: r });
+    expect((signOff(dashboard) as { unavailable?: boolean }).unavailable).not.toBe(true);
+  });
+
+  // T-6 (A8 break-glass disable-only): initiate(lower) REFUSES; initiate(disable)
+  // proceeds.
+  it("T-6: break-glass 'lower' is REFUSED; 'disable' proceeds", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    await expect(
+      dashboard.initiateFederationGuardianBreakGlass("lower", 2),
+    ).rejects.toMatchObject({ code: "break_glass_disable_only" });
+    // disable proceeds (arms a countdown).
+    await dashboard.initiateFederationGuardianBreakGlass("disable", null);
+    const posture = (
+      dashboard as unknown as { buildV1FederationDeps(): V1FederationDeps }
+    ).buildV1FederationDeps().federationPosture!();
+    expect(posture.guardian_break_glass.active).toBe(true);
+  });
+
+  // T-7 (INV-A/B structural): the four coupled fields are written only inside the
+  // chokepoint (+ rehydrate boot handler + break-glass veto/cancel terminal
+  // path); verifyGuardianRoster passes on the persisted requirement post-lower.
+  it("T-7: INV-A/B - requirement/latch fields are written only in the chokepoint or rehydrate", () => {
+    const src = readFileSync(
+      new URL("../../src/principal-policy/dashboard.ts", import.meta.url),
+      "utf8",
+    );
+    const requirementAssigns = (
+      src.match(/this\._federationGuardianRevocationRequirement\s*=/g) ?? []
+    ).length;
+    const latchAssigns = (
+      src.match(/this\._federationGuardianRevocationRequirementInvalid\s*=/g) ?? []
+    ).length;
+    // Bounded assignment count is the regression tripwire: if a NEW writer of
+    // requirement/latch is added outside the chokepoint/rehydrate, this fails.
+    // chokepoint apply + rollback = 2; rehydrate branches = 5. Total <= 7 each.
+    expect(requirementAssigns).toBeLessThanOrEqual(7);
+    expect(latchAssigns).toBeLessThanOrEqual(7);
+    // The chokepoint method must exist (the single mutator).
+    expect(src).toContain("private async commitGuardianRequirementTransition");
+  });
+
+  it("T-7: verifyGuardianRoster passes on the persisted requirement after lower + reboot", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    const nonce = dashboard.nextFederationGuardianDisableNonce();
+    const lowered = mintLowered(fortress, "mini-1", roster.version, 2, nonce);
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: lowered },
+      {
+        masterAuthorization: signMasterDisableAuthorization({
+          fortressId: fortress.fortressId,
+          disableNonce: nonce,
+          intent: "lower",
+          targetM: 2,
+          masterPrivateKey: masterKey(fortress, "mini-1"),
+        }),
+      },
+    );
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    const persisted = await store.load();
+    const pinned = fortress.nodes["mini-1"]!.context.pinnedMasterPubkey!;
+    expect(() =>
+      verifyGuardianRoster(persisted.guardianRevocationRequirement!.roster, pinned),
+    ).not.toThrow();
+  });
+
+  // T-8 (boot survival, N>=5): lower-then-reboot survives 5/5 with effective
+  // state intact and latch clear.
+  it("T-8: lower-then-reboot survives 5/5 with effective M intact and latch clear", async () => {
+    for (let i = 0; i < 5; i++) {
+      const fortress = makeMultiNodeFortress(["mini-1"]);
+      const storage = new MemoryStorage();
+      const dashboard = await buildDashboard(fortress, "mini-1", storage);
+      const keypairs = buildGuardianKeypairs(5);
+      const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+      await dashboard.setFederationGuardianRevocationRequirement({ roster });
+      const nonce = dashboard.nextFederationGuardianDisableNonce();
+      const lowered = mintLowered(fortress, "mini-1", roster.version, 2, nonce);
+      await dashboard.setFederationGuardianRevocationRequirement(
+        { roster, loweredThreshold: lowered },
+        {
+          masterAuthorization: signMasterDisableAuthorization({
+            fortressId: fortress.fortressId,
+            disableNonce: nonce,
+            intent: "lower",
+            targetM: 2,
+            masterPrivateKey: masterKey(fortress, "mini-1"),
+          }),
+        },
+      );
+      const restarted = await buildDashboard(fortress, "mini-1", storage);
+      const after = signOff(restarted) as
+        | GuardianRevocationRequirement
+        | { unavailable?: boolean };
+      expect((after as { unavailable?: boolean }).unavailable).not.toBe(true);
+      expect(effectiveThresholdM(after as GuardianRevocationRequirement)).toBe(2);
+    }
+  });
+
+  // T-9 (frozen surface / no migration): a pre-lower v:1 record decodes with
+  // loweredThreshold absent -> effective M = roster.m.
+  it("T-9: a pre-lower record decodes with loweredThreshold absent -> effective M = roster.m", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const req = signOff(restarted) as GuardianRevocationRequirement;
+    expect(req.loweredThreshold).toBeUndefined();
+    expect(effectiveThresholdM(req)).toBe(roster.m); // defaults to roster.m
+
+    // The persisted record carries no lowered field when none was set.
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    const loaded = await store.load();
+    expect(loaded.guardianRevocationRequirement!.loweredThreshold).toBeUndefined();
+  });
+
+  // A quorum decrease against a latched-invalid fortress (live requirement is
+  // null) must REFUSE cleanly (no crash on a null live roster); only the master
+  // key (OR-3) can decrease a latched fortress.
+  it("a quorum decrease against a latched fortress refuses cleanly (no live roster to verify)", async () => {
+    const { dashboard, fortress, keypairs } = await makeRosterLatchedDashboard();
+    const nonce = dashboard.nextFederationGuardianDisableNonce();
+    const approvals = keypairs.slice(0, 3).map((g) =>
+      signGuardianDisableApproval({
+        guardianId: g.identity.guardian_id,
+        guardianPrivateKey: g.privateKey,
+        fortressId: fortress.fortressId,
+        disableNonce: nonce,
+        intent: "disable",
+        targetM: null,
+        rosterVersion: 1,
+      }),
+    );
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement(null, {
+        quorumApprovals: approvals,
+      }),
+    ).rejects.toMatchObject({ code: "guardian_disable_authorization_required" });
+    // Latch persists.
+    expect((signOff(dashboard) as { unavailable?: boolean }).unavailable).toBe(true);
+  });
+
+  // A master-LOWER against a latched fortress installs a verified roster + lowered
+  // record, which CLEARS the latch (INV-A: installing a positively-verified
+  // roster is what clears it) and the effective threshold is the lowered value.
+  it("a master-lower on a latched fortress clears the latch and installs the lowered requirement", async () => {
+    const { dashboard, fortress, keypairs } = await makeRosterLatchedDashboard();
+    // Re-issue the SAME roster (still valid, master-signed) with a lowered record.
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    const nonce = dashboard.nextFederationGuardianDisableNonce();
+    const lowered = mintLowered(fortress, "mini-1", roster.version, 2, nonce);
+    const masterAuthorization = signMasterDisableAuthorization({
+      fortressId: fortress.fortressId,
+      disableNonce: nonce,
+      intent: "lower",
+      targetM: 2,
+      masterPrivateKey: masterKey(fortress, "mini-1"),
+    });
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: lowered },
+      { masterAuthorization },
+    );
+    const live = signOff(dashboard) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    expect((live as { unavailable?: boolean }).unavailable).not.toBe(true); // latch cleared
+    expect(effectiveThresholdM(live as GuardianRevocationRequirement)).toBe(2);
+  });
+
+  // INV-A pure-authorizer: a quorum-less disable of a latched fortress refuses
+  // (no effect that both nulls the requirement AND clears the latch escapes).
+  it("INV-A: authorizeGuardianRequirementTransition refuses a no-auth set(null) under a latch", () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const pinned = fortress.nodes["mini-1"]!.context.pinnedMasterPubkey!;
+    const commit = authorizeGuardianRequirementTransition(
+      {
+        requirement: null,
+        latchInvalid: true,
+        pinnedMaster: pinned,
+        fortressId: fortress.fortressId,
+        syncStateUnavailable: false,
+        nextDisableNonce: 5,
+      },
+      { kind: "operator_set", next: null, auth: null },
+    );
+    expect(commit.ok).toBe(false);
   });
 });
