@@ -1,30 +1,28 @@
 /**
- * Fleet license ledger I/O layer — durability + owner-verified lock (PR-1
- * fast-follow fix-round) adversarial tests.
+ * Fleet license ledger I/O layer — durability + minimal O_EXCL mutation lock
+ * (PR-1 fast-follow, fix-round 3) adversarial tests.
  *
- * These are the acceptance criteria for the two durability/ordering fixes the
- * two-family gate demanded:
+ * These are the acceptance criteria for the durability fix and the SIMPLIFIED
+ * lock contract:
  *   - Fix 1 (P0): `saveLedger` must be a DURABLE rename — it must fsync the temp
  *     FILE (and best-effort the parent DIRECTORY) before returning, so the blob
  *     is on stable storage before the external anchor can advance. Without this
  *     the "blob-before-anchor" ordering claim is FALSE and a crash can
  *     false-brick a legitimate fortress (`ledger.gen < anchor.gen`).
- *   - Fix 2 (P1): `withLedgerMutationLock` must be OWNER-VERIFIED — a stale-break
- *     may only remove a lock whose recorded pid is provably DEAD, and a release
- *     may only unlink a lockfile that still carries OUR nonce. Otherwise a
- *     stale-break of a live-but-slow holder, or a foreign-token unlink, produces
- *     two live holders / vanishes a peer's lock mid-run.
+ *   - Fix-round 3: `withLedgerMutationLock` is a MINIMAL `O_EXCL` advisory lock
+ *     with NO auto-stale-break. Acquire is a single atomic `open(lockPath,'wx')`;
+ *     contention backs off and retries to a budget; budget exhaustion FAILS
+ *     CLOSED with a recovery hint; release is an unconditional `unlink` of the
+ *     file we created (sole holder by O_EXCL). The whole token/nonce/pid-liveness
+ *     stale-break machinery was DELETED because its `stat`/`readFile`-then-
+ *     `unlink` check-then-act was a `js/file-system-race` fail-open. The only
+ *     behavior change is that a crashed-mid-mutation holder wedges until a
+ *     one-time manual `rm` (a fail-safe, hinted in the error) — strictly better
+ *     than a fail-open auto-break for a single-operator local CLI.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  mkdtemp,
-  open,
-  readFile,
-  rm,
-  stat,
-  writeFile,
-} from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -86,7 +84,7 @@ describe("ledger-io — saveLedger is a DURABLE rename (Fix 1, the F1 class)", (
   });
 });
 
-describe("ledger-io — owner-verified mutation lock (Fix 2)", () => {
+describe("ledger-io — minimal O_EXCL mutation lock (fix-round 3)", () => {
   let dir: string;
   let path: string;
 
@@ -100,7 +98,9 @@ describe("ledger-io — owner-verified mutation lock (Fix 2)", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("serializes concurrent mutations (no interleave)", async () => {
+  it("serializes concurrent mutations (no interleave, no double-acquire)", async () => {
+    // The CORE guarantee: two concurrent issue/revoke sequences must run one at
+    // a time so neither lost-updates the ledger or races the anchor.
     const order: string[] = [];
     let active = 0;
     let maxActive = 0;
@@ -132,32 +132,15 @@ describe("ledger-io — owner-verified mutation lock (Fix 2)", () => {
     }
   });
 
-  it("does NOT stale-break a LIVE but EMPTY/unparseable lockfile (empty-window fail-open closed)", async () => {
-    // Codex's exact repro of the empty-lockfile fail-open: the OLD acquire path
-    // created the lockfile with `open(lockPath,'wx')` (EMPTY) and wrote the token
-    // in a SEPARATE step, so a contender could observe an empty lockfile while a
-    // LIVE acquirer was mid-create. `parseLockToken` returned null for the empty
-    // file → the contender treated it as an ownerless dead holder → unlinked it →
-    // DOUBLE-ACQUIRE. Here we pin that window open deterministically: an
-    // empty-but-HELD lockfile (open handle kept alive = a live mid-create holder)
-    // with a backdated mtime, and a real contender at a small staleMs. The
-    // contender must NOT break it and must NOT enter (no overlap / no
-    // double-acquire).
+  it("a held lock makes a second mutation FAIL CLOSED with a hint naming the lock path", async () => {
+    // A lockfile already exists (a holder is mid-mutation, or a crashed holder
+    // left it behind). With no auto-stale-break, the contender must exhaust its
+    // budget and throw rather than proceed unlocked. The error must hint the
+    // self-service recovery (`rm '<lockPath>'`) and name the lock path.
     const lockPath = `${path}.lock`;
-    // A live holder that has created the lockfile but not yet written its token:
-    // an empty, held (open FD) lockfile — the exact mid-create state.
     const heldHandle = await open(lockPath, "wx", 0o600);
     try {
-      // Backdate the mtime so it looks older than the contender's staleMs — this
-      // is what tempted the old code into a mtime-only stale-break of a file it
-      // could not parse.
-      const { utimes } = await import("node:fs/promises");
-      const old = new Date(Date.now() - 10_000);
-      await utimes(lockPath, old, old);
-
       let contenderEntered = false;
-      // The contender must fail closed (never enter) — the empty/unparseable lock
-      // is owner-unknown and must NOT be stale-broken in the fail-open direction.
       await expect(
         withLedgerMutationLock(
           path,
@@ -165,151 +148,53 @@ describe("ledger-io — owner-verified mutation lock (Fix 2)", () => {
             contenderEntered = true;
             return "should-not-run";
           },
-          { staleMs: 20, maxAttempts: 4, backoffMs: 5 },
+          { maxAttempts: 4, backoffMs: 5 },
         ),
       ).rejects.toThrow(/could not acquire/);
-      // No overlap: the contender never entered the critical section while the
-      // live holder still held the (empty) lockfile.
+      // Never proceeded unlocked (no double-acquire / no unlocked mutate).
       expect(contenderEntered).toBe(false);
-      // The live holder's lockfile was left intact (never broken as debris).
+      // The recovery hint names the exact lock path so an operator can `rm` it.
+      await expect(
+        withLedgerMutationLock(path, async () => "x", {
+          maxAttempts: 2,
+          backoffMs: 5,
+        }),
+      ).rejects.toThrow(new RegExp(`rm '${lockPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`));
+      // The held lockfile is left intact (the contender never breaks it).
       await expect(stat(lockPath)).resolves.toBeTruthy();
     } finally {
       await heldHandle.close();
     }
   });
 
-  it("does NOT break a live-but-slow holder even past staleMs (no two holders)", async () => {
-    // Holder A takes longer than staleMs. A contender B must NOT steal the lock,
-    // because A's recorded pid (this very process) is provably ALIVE — the
-    // stale-break guard requires BOTH age > staleMs AND a dead pid.
-    let overlap = false;
-    let aInside = false;
-
-    const a = withLedgerMutationLock(
-      path,
-      async () => {
-        aInside = true;
-        // Hold well past staleMs while B contends.
-        await new Promise((r) => setTimeout(r, 120));
-        aInside = false;
-      },
-      { staleMs: 20, maxAttempts: 40, backoffMs: 10 },
-    );
-
-    // Give A time to acquire, then contend with B.
-    await new Promise((r) => setTimeout(r, 30));
-    const b = withLedgerMutationLock(
-      path,
-      async () => {
-        // If B ever runs while A is still inside, that is two live holders.
-        if (aInside) overlap = true;
-      },
-      { staleMs: 20, maxAttempts: 40, backoffMs: 10 },
-    );
-
-    await Promise.all([a, b]);
-    expect(overlap).toBe(false);
-  });
-
-  it("DOES break a genuinely-dead holder's stale lock (pid not alive)", async () => {
-    // Simulate a crashed holder: a stale lockfile recording a pid that is not a
-    // live process. The contender must break it (age > staleMs AND pid dead) and
-    // acquire, otherwise a single crash wedges the CLI forever.
-    const lockPath = `${path}.lock`;
-    const deadPid = 2_147_483_646; // implausibly high; not a live process
-    await writeFile(
-      lockPath,
-      `${deadPid}\n${Date.now() - 10_000}\ndead-holder-nonce\n`,
-      { mode: 0o600 },
-    );
-    // Backdate the mtime so it is older than staleMs.
-    const { utimes } = await import("node:fs/promises");
-    const old = new Date(Date.now() - 10_000);
-    await utimes(lockPath, old, old);
-
-    let ran = false;
-    await withLedgerMutationLock(
-      path,
-      async () => {
-        ran = true;
-      },
-      { staleMs: 100, maxAttempts: 40, backoffMs: 10 },
-    );
-    expect(ran).toBe(true);
-  });
-
-  it("does NOT break a stale lock whose recorded pid is still ALIVE", async () => {
-    // A lockfile older than staleMs but recording THIS process's (alive) pid
-    // must NOT be broken — that is the two-live-holders race. The acquire must
-    // exhaust its budget and fail-closed instead of stealing a live lock.
-    const lockPath = `${path}.lock`;
-    await writeFile(
-      lockPath,
-      `${process.pid}\n${Date.now() - 10_000}\nlive-holder-nonce\n`,
-      { mode: 0o600 },
-    );
-    const { utimes } = await import("node:fs/promises");
-    const old = new Date(Date.now() - 10_000);
-    await utimes(lockPath, old, old);
-
-    await expect(
-      withLedgerMutationLock(path, async () => "should-not-run", {
-        staleMs: 100,
-        maxAttempts: 3,
-        backoffMs: 5,
-      }),
-    ).rejects.toThrow(/could not acquire/);
-    // The live holder's lockfile is left intact (never broken).
-    const still = await readFile(lockPath, "utf-8");
-    expect(still).toContain("live-holder-nonce");
-  });
-
-  it("release unlinks ONLY our own nonce, never a foreign token", async () => {
-    // Model the mid-run steal: while we hold the lock, a peer replaces the
-    // lockfile contents with THEIR token. Our finally-release must see the
-    // foreign nonce and LEAVE it (unlinking it would vanish the peer's lock).
-    const lockPath = `${path}.lock`;
-    let foreignSurvived = false;
-
-    await withLedgerMutationLock(path, async () => {
-      // A peer broke ours as stale and now holds it (different nonce).
-      await writeFile(
-        lockPath,
-        `${process.pid}\n${Date.now()}\nforeign-peer-nonce\n`,
-        { mode: 0o600 },
-      );
-    });
-
-    // After our release, the foreign token must STILL be present.
-    try {
-      const after = await readFile(lockPath, "utf-8");
-      foreignSurvived = after.includes("foreign-peer-nonce");
-    } catch {
-      foreignSurvived = false;
-    }
-    expect(foreignSurvived).toBe(true);
-  });
-
-  it("release removes our OWN lockfile on the normal (unstolen) path", async () => {
+  it("release removes the lockfile on the clean path (a subsequent acquire succeeds)", async () => {
     const lockPath = `${path}.lock`;
     await withLedgerMutationLock(path, async () => {
-      // Our nonce is on disk; a normal release should remove it.
+      // While held, the lockfile exists and carries the human diagnostic.
       const held = await readFile(lockPath, "utf-8");
       expect(held.trim().length).toBeGreaterThan(0);
     });
-    // Lockfile gone after a clean release.
+    // Lockfile gone after a clean release (sole-holder unconditional unlink).
     await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+    // And a subsequent acquire succeeds because the path is free again.
+    let ran = false;
+    await withLedgerMutationLock(path, async () => {
+      ran = true;
+    });
+    expect(ran).toBe(true);
   });
 
-  it("fails closed (throws) rather than mutating unlocked when the lock cannot be acquired", async () => {
-    // A live holder that outlasts the contender's budget → fail-closed, never a
-    // silent unlocked mutate.
+  it("does NOT auto-break a pre-existing lockfile — it fails closed (no fail-open)", async () => {
+    // Explicit regression for the deleted stale-break: even a lockfile with an
+    // ancient mtime and an implausible/dead-looking pid must NOT be auto-broken.
+    // There is no stat/mtime/pid-liveness path anymore; the contender simply
+    // fails closed and leaves the file for a manual `rm`.
     const lockPath = `${path}.lock`;
-    await writeFile(
-      lockPath,
-      `${process.pid}\n${Date.now()}\nheld-nonce\n`,
-      { mode: 0o600 },
-    );
+    const { writeFile, utimes } = await import("node:fs/promises");
+    await writeFile(lockPath, `2147483646\nstale\n`, { mode: 0o600 });
+    const old = new Date(Date.now() - 10 * 60_000);
+    await utimes(lockPath, old, old);
+
     let mutated = false;
     await expect(
       withLedgerMutationLock(
@@ -317,9 +202,11 @@ describe("ledger-io — owner-verified mutation lock (Fix 2)", () => {
         async () => {
           mutated = true;
         },
-        { staleMs: 60_000, maxAttempts: 2, backoffMs: 5 },
+        { maxAttempts: 3, backoffMs: 5 },
       ),
     ).rejects.toThrow(/could not acquire/);
     expect(mutated).toBe(false);
+    // The pre-existing lockfile is untouched (never stale-broken).
+    await expect(stat(lockPath)).resolves.toBeTruthy();
   });
 });

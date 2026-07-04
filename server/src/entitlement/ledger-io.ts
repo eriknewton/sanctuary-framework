@@ -9,8 +9,7 @@
  * that fails its integrity check.
  */
 
-import { readFile, mkdir, open, stat, unlink, link } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { readFile, mkdir, open, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { loadConfig } from "../config.js";
 import { writeFileCustody } from "../storage/custody-fs.js";
@@ -89,66 +88,10 @@ export interface LedgerLockOptions {
   maxAttempts?: number;
   /** Base backoff between attempts, in ms (grows linearly with the attempt). */
   backoffMs?: number;
-  /**
-   * Age (ms) past which an existing lockfile is treated as STALE (a crashed
-   * holder that never released) and force-broken. Keeps a single crashed mutate
-   * from wedging the CLI forever. Generous relative to a mutate's duration.
-   */
-  staleMs?: number;
 }
 
 const DEFAULT_LOCK_MAX_ATTEMPTS = 50;
 const DEFAULT_LOCK_BACKOFF_MS = 20;
-const DEFAULT_LOCK_STALE_MS = 30_000;
-
-/** The parsed contents of an owner-verified lockfile token. */
-interface LockToken {
-  pid: number;
-  ts: number;
-  nonce: string;
-}
-
-/**
- * Serialize a lock token to the on-disk form `${pid}\n${ts}\n${nonce}\n`. The
- * nonce is what makes the lock OWNER-VERIFIED: only the holder that wrote it
- * knows the value, so release only unlinks a lockfile that still carries it.
- */
-function serializeLockToken(token: LockToken): string {
-  return `${token.pid}\n${token.ts}\n${token.nonce}\n`;
-}
-
-/** Parse a lockfile's bytes back into a token, or null if it is not our shape. */
-function parseLockToken(raw: string): LockToken | null {
-  const lines = raw.split("\n");
-  if (lines.length < 3) return null;
-  const pid = Number.parseInt(lines[0], 10);
-  const ts = Number.parseInt(lines[1], 10);
-  const nonce = lines[2];
-  if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(ts) || !nonce) {
-    return null;
-  }
-  return { pid, ts, nonce };
-}
-
-/**
- * Is `pid` a live process on this host? Uses `process.kill(pid, 0)` which sends
- * NO signal but performs the permission/existence check: it throws ESRCH when
- * the process does not exist (safe to break the lock) and EPERM when it exists
- * but is owned by another user (still ALIVE -> we must NOT break). Any other
- * error (or a successful no-op signal) is treated conservatively as ALIVE so we
- * never break a lock we cannot prove is dead.
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return false; // no such process -> provably dead
-    // EPERM (exists, other owner) or anything unexpected -> assume alive.
-    return true;
-  }
-}
 
 /**
  * Run `fn` while holding an ADVISORY exclusive lock for the ledger at `path`.
@@ -159,37 +102,38 @@ function isProcessAlive(pid: number): boolean {
  *
  * The whole read-modify-write-then-advance-anchor sequence for a mutation MUST
  * run inside this callback so the anchor bump is serialized with the blob write
- * that it trails (write-ordering §4: blob durable first, then anchor; the lock
- * keeps a second writer from observing the in-between state).
+ * that it trails (write-ordering section 4: blob durable first, then anchor; the
+ * lock keeps a second writer from observing the in-between state).
  *
- * OWNER-VERIFIED (Fix 2): this is issuer-local single-host locking (not a
- * distributed lock), so the guard is the pid-liveness + token-verify pair, with
- * NO dependency and NO heartbeat thread:
- *   - ACQUIRE writes a unique token `${pid}\n${ts}\n${nonce}` (nonce =
- *     `randomUUID`) to a PRIVATE temp file, then `link()`s the temp onto
- *     `lockPath` atomically. `link` fails EEXIST when the lock is held (the same
- *     exclusive-create guarantee as `open('wx')`), but the PUBLISHED lockfile
- *     already carries the token  -  it is NEVER observably empty. This closes the
- *     empty-window fail-open (Fix 3): the old two-step
- *     `open('wx')`-then-`writeFile` published an EMPTY lockfile that a contender
- *     could observe, fail to parse, mistake for an ownerless dead holder, and
- *     stale-break out from under a LIVE mid-create acquirer -> double-acquire.
- *   - STALE-BREAK happens ONLY when the lockfile is BOTH older than `staleMs`
- *     AND its recorded pid is provably gone (`process.kill(pid, 0)` -> ESRCH).
- *     A live-but-slow holder (age > staleMs but pid still alive) is NEVER
- *     broken, so a stale-break can no longer create two live holders. An
- *     UNparseable lockfile is NEVER stale-broken in the fail-open direction: it
- *     is treated as owner-unknown and left in place (the contender backs off and,
- *     if truly orphaned, eventually fails closed with a recoverable "could not
- *     acquire" error) rather than unlinked. With the atomic-link publish above a
- *     lockfile is never empty, so this is a belt-and-suspenders fail-safe.
- *   - RELEASE reads the lockfile and unlinks ONLY if it still carries OUR nonce.
- *     If it holds a different token (a peer broke ours as stale and now holds
- *     it), we leave it (never unlink a foreign token).
+ * MINIMAL O_EXCL CONTRACT (fix-round 3, a NET DELETION): this is issuer-local,
+ * single-operator, millisecond-duration locking, so the whole guard is exactly
+ * one atomic exclusive-create. There is NO token, NO nonce, NO temp+link
+ * publish, and NO auto-stale-break:
+ *   - ACQUIRE: `open(lockPath, 'wx', 0o600)` atomically creates the lockfile or
+ *     fails EEXIST if it already exists. On success we write
+ *     `${pid}\n${iso}\n` purely as a HUMAN diagnostic (an operator can `cat` the
+ *     lockfile to see who holds it) and close.
+ *   - CONTENDED (EEXIST): back off (linear) and retry up to the budget. We do
+ *     NOT `stat`, do NOT read/parse the lockfile, do NOT probe a pid, and do NOT
+ *     unlink anyone else's lock. There is no check-then-act on the lock path, so
+ *     the `js/file-system-race` class (the old `stat`->`unlink` /
+ *     `readFile`->`unlink` stale-break) is structurally gone.
+ *   - BUDGET EXHAUSTED: FAIL CLOSED (throw) with a self-service recovery hint
+ *     naming the lock path (`rm '<lockPath>'`). A silent unlocked mutate is
+ *     exactly the lost-update this guards against, so we never proceed unlocked.
+ *   - RELEASE: `unlink(lockPath)` in `finally` (best-effort). We are the SOLE
+ *     holder by O_EXCL  -  nobody else could have created this exact file  -  so
+ *     there is nothing to verify: we simply delete what we created.
  *
- * Fail-closed: if the lock cannot be acquired within the retry budget, this
- * THROWS rather than proceeding unlocked (a silent unlocked mutate is exactly
- * the lost-update this guards against).
+ * TRADEOFF (recorded intentionally): with no auto-stale-break, a holder that
+ * crashes MID-mutation leaves the lockfile behind and wedges the next mutation
+ * until a one-time manual `rm` (which the fail-closed error hints). For a local
+ * single-operator CLI this FAIL-SAFE wedge is strictly better than a fail-OPEN
+ * auto-break that could double-acquire (which is what created every prior narrow
+ * race: the empty-lockfile fail-open AND the concurrent-breaker
+ * check-then-act). Correctness of the security primitive beats convenience.
+ * (memory: build-correct-simple-elegant; whack-a-mole -> simplify to a
+ * chokepoint.)
  */
 export async function withLedgerMutationLock<T>(
   path: string,
@@ -198,83 +142,28 @@ export async function withLedgerMutationLock<T>(
 ): Promise<T> {
   const maxAttempts = opts.maxAttempts ?? DEFAULT_LOCK_MAX_ATTEMPTS;
   const backoffMs = opts.backoffMs ?? DEFAULT_LOCK_BACKOFF_MS;
-  const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS;
   const lockPath = `${path}.lock`;
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-
-  // Our unique ownership token. The nonce is never reused, so no other holder
-  // (even one that reuses our pid after we exit) can impersonate this lock.
-  const ourToken: LockToken = {
-    pid: process.pid,
-    ts: Date.now(),
-    nonce: randomUUID(),
-  };
-
-  // Private temp that carries our token BEFORE it is published as the lockfile.
-  // The nonce makes it collision-free even if two acquirers share our pid.
-  const acqTmpPath = `${lockPath}.acq-${ourToken.pid}-${ourToken.nonce}`;
 
   let acquired = false;
   for (let attempt = 0; attempt < maxAttempts && !acquired; attempt++) {
     try {
-      // Write the token to a PRIVATE temp first (`wx` = O_CREAT|O_EXCL, so a
-      // stray temp from a crashed prior attempt with this exact nonce cannot be
-      // silently reused), then atomically LINK it onto the lockfile. `link` is
-      // atomic and fails EEXIST when the lock is held  -  the same exclusive
-      // test-and-set as `open('wx')`  -  but the PUBLISHED lockfile already
-      // contains the token, so it is NEVER observably empty. This closes the
-      // empty-window fail-open (a contender can no longer observe an empty
-      // lockfile, fail to parse it, and stale-break a live mid-create holder).
-      const handle = await open(acqTmpPath, "wx", 0o600);
+      // Atomic exclusive create: succeeds iff no lockfile exists, else EEXIST.
+      // This IS the lock. There is no separate token/nonce and no
+      // check-then-act on the lock path.
+      const handle = await open(lockPath, "wx", 0o600);
       try {
-        await handle.writeFile(serializeLockToken(ourToken));
+        // Human diagnostic only (never read back for a trust decision): lets an
+        // operator `cat` the lockfile to see which pid/time holds it.
+        await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n`);
       } finally {
         await handle.close();
       }
-      try {
-        await link(acqTmpPath, lockPath);
-        acquired = true;
-      } finally {
-        // The lockfile is now its own hard link to the same inode (or the link
-        // failed); either way the temp name has served its purpose. Remove it so
-        // no debris accumulates. Best-effort: a leftover temp never blocks a
-        // future acquire (each carries a fresh nonce).
-        await unlink(acqTmpPath).catch(() => {});
-      }
+      acquired = true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      // Contended. Only break a lock that is BOTH stale by age AND whose
-      // recorded holder is provably dead (never break a live-but-slow holder).
-      let broke = false;
-      try {
-        const st = await stat(lockPath);
-        if (Date.now() - st.mtimeMs > staleMs) {
-          let holderAlive = true;
-          try {
-            const holder = parseLockToken(await readFile(lockPath, "utf-8"));
-            // A parseable token: break only if its pid is provably gone. An
-            // UNparseable lockfile is owner-UNKNOWN: never stale-break it in the
-            // fail-open direction (that is exactly the empty-window
-            // double-acquire). Treat it as alive/held so the contender backs off
-            // and, if truly orphaned, fails closed with the recoverable "could
-            // not acquire" error. With the atomic-link publish a lockfile is
-            // never actually empty, so this branch is belt-and-suspenders.
-            holderAlive = holder ? isProcessAlive(holder.pid) : true;
-          } catch {
-            // The lockfile vanished between stat and read (holder released).
-            holderAlive = true; // nothing to break; fall through to retry.
-          }
-          if (!holderAlive) {
-            await unlink(lockPath).catch(() => {});
-            broke = true;
-          }
-        }
-      } catch {
-        // The lock vanished between EEXIST and stat (holder released); retry.
-      }
-      // If we just broke a dead holder's lock, re-contend immediately without
-      // burning the backoff so we grab the freed lock promptly.
-      if (broke) continue;
+      // Contended: back off and retry. We NEVER stat/read/unlink the existing
+      // lockfile here, so there is no check-then-act race to auto-break.
       await new Promise((r) => setTimeout(r, backoffMs * (attempt + 1)));
     }
   }
@@ -282,25 +171,16 @@ export async function withLedgerMutationLock<T>(
     throw new Error(
       `could not acquire the license ledger lock at ${lockPath} after ` +
         `${maxAttempts} attempts; another 'sanctuary license' mutation may be ` +
-        "in progress. Retry shortly. If no mutation is running and this persists, " +
-        `a stale lockfile may need manual removal: rm '${lockPath}'.`,
+        "running. If you are certain none is, remove the stale lock file: " +
+        `rm '${lockPath}'`,
     );
   }
   try {
     return await fn();
   } finally {
-    // OWNER-VERIFIED release: unlink ONLY if the lockfile still carries OUR
-    // nonce. If a peer broke ours as stale and now holds it, the on-disk nonce
-    // differs and we leave it: unlinking a foreign token would vanish B's lock
-    // mid-run. Best-effort throughout: a release failure must not mask fn's
-    // own result/error.
-    try {
-      const current = parseLockToken(await readFile(lockPath, "utf-8"));
-      if (current && current.nonce === ourToken.nonce) {
-        await unlink(lockPath).catch(() => {});
-      }
-    } catch {
-      // Lockfile already gone (or unreadable) -> nothing for us to release.
-    }
+    // We are the sole holder by O_EXCL, so release is an unconditional unlink of
+    // the file WE created  -  no token/nonce verification needed. Best-effort: a
+    // release failure must not mask fn's own result/error.
+    await unlink(lockPath).catch(() => {});
   }
 }
