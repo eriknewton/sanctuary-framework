@@ -5,7 +5,13 @@
  * Prints a notice to stderr if an update is available.
  * Never throws; failures are silently ignored (network issues, offline, etc.).
  *
- * Respects SANCTUARY_NO_UPDATE_CHECK=1 to disable entirely.
+ * ZERO-OUTBOUND-BY-DEFAULT (2026-07-05): these background probes are OFF
+ * unless the operator opts in with `SANCTUARY_UPDATE_CHECK=1`. Every reader
+ * that decides whether to make an outbound call for an update check MUST route
+ * through `outboundUpdateChecksEnabled` below rather than reading either env
+ * var directly. See that function's doc comment for the precedence rule.
+ * Explicit operator intent (the `sanctuary check-updates` CLI verb) bypasses
+ * this gate entirely and always runs the check.
  *
  * AUTHENTICITY: the bare version notice below trusts the registry for
  * transport only. For an advisory whose authenticity is independent of the
@@ -55,6 +61,34 @@ export interface UpdateAuditSink {
 /** Audit operation names for the signed-update gate (stable wire strings). */
 export const UPDATE_MANIFEST_VERIFIED_OP = "update.manifest.verified";
 export const UPDATE_MANIFEST_REFUSED_OP = "update.manifest.refused";
+
+/**
+ * Central gate for every advisory, no-credential, never-blocking outbound
+ * update/pin probe in the server (the startup bare-version check, the
+ * signed-manifest check, and wrap's pinned-version resolvability probe).
+ *
+ * ZERO-OUTBOUND-BY-DEFAULT (2026-07-05): with NEITHER env var set, this
+ * returns `false` — Sanctuary makes no unrequested outbound connection.
+ *
+ * Precedence:
+ *   1. `SANCTUARY_NO_UPDATE_CHECK=1` — back-compat alias, ALWAYS forces off.
+ *      It can never be used to force checks ON; it exists only so operators
+ *      who already set it under the old (checks-on-by-default) behavior keep
+ *      getting the same zero-outbound outcome they had before.
+ *   2. `SANCTUARY_UPDATE_CHECK=1` — explicit opt-in. Only takes effect when
+ *      the alias above is not also set.
+ *   3. Neither set — off (the new default).
+ *
+ * This governs only the AMBIENT background probes. Explicit operator intent
+ * (the `sanctuary check-updates` CLI verb) bypasses this gate and always
+ * runs the check regardless of what this function returns.
+ */
+export function outboundUpdateChecksEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env.SANCTUARY_NO_UPDATE_CHECK === "1") return false;
+  return env.SANCTUARY_UPDATE_CHECK === "1";
+}
 
 /** npm registry endpoint for the package */
 const REGISTRY_URL =
@@ -423,8 +457,9 @@ export async function fetchLatestSignedManifest(): Promise<unknown | null> {
  * never falls through to a bare-npm advisory for the authenticated path. Both
  * the verified and refused outcomes are audited when an audit sink is supplied.
  *
- * Fire-and-forget: never throws, never blocks startup. Respects
- * SANCTUARY_NO_UPDATE_CHECK=1.
+ * Fire-and-forget: never throws, never blocks startup. OFF by default; see
+ * `outboundUpdateChecksEnabled` (opt in with SANCTUARY_UPDATE_CHECK=1;
+ * SANCTUARY_NO_UPDATE_CHECK=1 is a back-compat alias that also keeps it off).
  *
  * With the pinned key still the all-zero placeholder, `verifyReleaseManifest`
  * refuses with `bad_pinned_key`, so this function is INERT (silent) until the
@@ -438,7 +473,7 @@ export async function checkForSignedUpdate(
   currentVersion: string,
   audit?: UpdateAuditSink,
 ): Promise<void> {
-  if (process.env.SANCTUARY_NO_UPDATE_CHECK === "1") {
+  if (!outboundUpdateChecksEnabled()) {
     return;
   }
 
@@ -478,11 +513,12 @@ export async function checkForSignedUpdate(
  * Run the update check and print a notice to stderr if an update is available.
  * This function is fire-and-forget; it never throws or blocks the server.
  *
- * Set SANCTUARY_NO_UPDATE_CHECK=1 to disable.
+ * OFF by default (zero unrequested outbound); see `outboundUpdateChecksEnabled`.
+ * Opt in with SANCTUARY_UPDATE_CHECK=1. SANCTUARY_NO_UPDATE_CHECK=1 is a
+ * back-compat alias that also keeps this off.
  */
 export async function checkForUpdate(currentVersion: string): Promise<void> {
-  // Allow users to opt out
-  if (process.env.SANCTUARY_NO_UPDATE_CHECK === "1") {
+  if (!outboundUpdateChecksEnabled()) {
     return;
   }
 

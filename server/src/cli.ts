@@ -16,6 +16,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createSanctuaryServer } from "./index.js";
 import { refuseMissingMcpChildFortressOrExit } from "./mcp-child-fortress-refusal.js";
 import { checkForUpdate, checkForSignedUpdate } from "./update-check.js";
+import { printFirstRunNoticeOnce } from "./first-run-notice.js";
 import { assertSupportedNodeVersion } from "./cli/node-version.js";
 import { extractTopLevelFortressFlag } from "./cli/top-level-fortress.js";
 import { SUPERVISOR_KEY_FD_ENV } from "./supervisor/spawn-launcher.js";
@@ -171,6 +172,12 @@ async function main(): Promise<void> {
   if (args[0] === "doctor") {
     const { runDoctorCommand } = await import("./cli/doctor.js");
     const code = await runDoctorCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
+  if (args[0] === "check-updates") {
+    const { runCheckUpdatesCommand } = await import("./cli/check-updates.js");
+    const code = await runCheckUpdatesCommand({ argv: args.slice(1) });
     return drainAndExit(code);
   }
 
@@ -571,6 +578,10 @@ Commands:
     console.error(`Storage: ${config.storage_path}`);
     console.error("Tools: all registered");
 
+    // One-time zero-outbound-by-default notice (2026-07-05). Fire and
+    // forget: fails open on any I/O error and never blocks startup.
+    void printFirstRunNoticeOnce(config.storage_path);
+
     // Non-blocking update check. Fire and forget (checkForUpdate catches
     // all failures internally and never rejects).
     void checkForUpdate(PKG_VERSION);
@@ -775,6 +786,7 @@ Usage:
   sanctuary dashboard [opts]              # Standalone dashboard
   sanctuary status [opts]                 # Daemon status over the /v1 API
   sanctuary doctor [opts]                 # Local environment diagnostic
+  sanctuary check-updates                 # Explicitly check for updates
   sanctuary completion <bash|zsh|fish>    # Emit shell completion
   sanctuary audit search [opts]           # Search local audit log
   sanctuary transparency <cmd> [opts]     # Signed enforcement checkpoints
@@ -817,6 +829,12 @@ Subcommands:
 
   doctor               Run read-only local health diagnostics.
                        Use "sanctuary doctor --help" for options.
+
+  check-updates        Explicitly check npmjs.org / GitHub Releases for a
+                       newer version, right now, regardless of the
+                       zero-outbound default. Sanctuary makes no unrequested
+                       outbound connection otherwise.
+                       Use "sanctuary check-updates --help" for options.
 
   completion           Emit shell completion for bash, zsh, or fish.
 
@@ -880,9 +898,16 @@ Environment variables:
   SANCTUARY_WEBHOOK_ENABLED         "true" to enable webhook approvals
   SANCTUARY_WEBHOOK_URL             Webhook target URL
   SANCTUARY_WEBHOOK_SECRET          HMAC-SHA256 shared secret
-  SANCTUARY_NO_UPDATE_CHECK         "1" to disable the startup update check
-                                      and wrap's pinned-version registry probe
-                                      (the zero-outbound knob)
+  SANCTUARY_UPDATE_CHECK            "1" to opt in to the startup update check
+                                      and wrap's pinned-version registry probe.
+                                      Sanctuary makes NO unrequested outbound
+                                      connection by default (zero-outbound);
+                                      run "sanctuary check-updates" any time
+                                      to check on demand regardless of this
+                                      setting.
+  SANCTUARY_NO_UPDATE_CHECK         "1" is a back-compat alias that also keeps
+                                      the above checks off (cannot force them
+                                      on)
 
 For more info: https://github.com/eriknewton/sanctuary-framework
 `);
