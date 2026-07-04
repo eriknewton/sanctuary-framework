@@ -442,26 +442,17 @@ interface FederationDashboardState {
 }
 
 /**
- * §8: the exact set of critical audit operations emitted by every committed
- * guardian-requirement transition (see `commitGuardianRequirementTransition`,
- * `initiateFederationGuardianBreakGlass`, and the break-glass terminal helper).
- * The audit-witnessed floor scans ONLY these so a forged non-guardian entry
- * cannot poison the floor, and each carries `details.generation` (the monotonic
- * primary witness) and, on the transitions that burn a nonce, `details.
- * disable_nonce` / `details.nonce`.
+ * §8.7: the operation-name PREFIX every guardian-requirement audit entry shares.
+ * The §8 audit-witnessed floor matches guardian entries by this prefix (plus
+ * `result === "success"` and a valid `details.generation`) rather than a
+ * hardcoded op-name set, so it structurally witnesses EVERY generation-bumping
+ * guardian transition, current and future. A hardcoded set was the round-2
+ * coverage gap: it omitted `federation_guardian_break_glass_vetoed` /
+ * `_cancelled`, which DO bump + audit the committed generation, re-opening
+ * finding #1 via a stale-armed-break-glass restore. The prefix match is
+ * drift-proof: a new guardian op-name cannot silently escape the floor.
  */
-const GUARDIAN_AUDIT_OPERATIONS: ReadonlySet<string> = new Set([
-  "federation_guardian_revocation_requirement_set",
-  "federation_guardian_revocation_requirement_disabled",
-  "federation_guardian_disable_master_authorized",
-  "federation_guardian_disable_quorum_authorized",
-  "federation_guardian_break_glass_initiated",
-  "federation_guardian_break_glass_completed",
-]);
-
-function isGuardianAuditOperation(operation: string): boolean {
-  return GUARDIAN_AUDIT_OPERATIONS.has(operation);
-}
+const GUARDIAN_AUDIT_OP_PREFIX = "federation_guardian_" as const;
 
 /**
  * §8.6 P1: the audit integrity-finding kinds that indicate the audit COVERAGE
@@ -3219,12 +3210,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       disableNonce: number;
     }> = [];
     const collect = (item: { sequence: number; entry: AuditEntry }): void => {
-      if (!isGuardianAuditOperation(item.entry.operation)) return;
-      const details = item.entry.details;
+      // §8.7 P0 DRIFT-PROOF MATCHER (fixes the round-2 op-name coverage gap):
+      // do NOT depend on a hardcoded op-name set (which omitted the veto/cancel
+      // ops even though they bump + audit the committed generation, re-opening
+      // finding #1). Instead, structurally witness EVERY generation-bumping
+      // guardian transition, current AND future, by matching ANY audit entry
+      // whose operation is prefixed `federation_guardian_`, whose result is
+      // "success" (a rolled-back FAILURE never committed a generation), and that
+      // carries a valid non-negative-integer committed `generation`. Every
+      // guardian emit sets `generation` to the CURRENT committed value, so this
+      // set's max is always <= the true committed max (never over-latches), and a
+      // keyless attacker cannot forge a valid MAC'd audit entry to inflate it. A
+      // non-generation-bearing entry (e.g. the break-glass tick) is skipped by the
+      // generation check, so it never enters the floor.
+      const entry = item.entry;
+      if (!entry.operation.startsWith(GUARDIAN_AUDIT_OP_PREFIX)) return;
+      if (entry.result !== "success") return;
+      const details = entry.details;
       if (details === undefined) return;
       const gen = details.generation;
-      const generation =
-        typeof gen === "number" && Number.isSafeInteger(gen) && gen >= 0 ? gen : 0;
+      if (typeof gen !== "number" || !Number.isSafeInteger(gen) || gen < 0) return;
       let disableNonce = 0;
       for (const field of ["disable_nonce", "nonce"] as const) {
         const v = details[field];
@@ -3232,7 +3237,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           disableNonce = v;
         }
       }
-      guardianEntries.push({ sequence: item.sequence, generation, disableNonce });
+      guardianEntries.push({ sequence: item.sequence, generation: gen, disableNonce });
     };
 
     let findings: readonly AuditIntegrityFinding[] = [];

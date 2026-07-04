@@ -154,11 +154,18 @@ const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
  * irreducible residual is therefore specifically a coordinated restore that ALSO
  * truncates or removes the guardian audit entries themselves (together with the
  * audit head anchor + its established marker and the checkpoints), i.e. a
- * wholesale guardian-audit-coverage destruction, which is itself separately
- * surfaced (empty/truncated chain, a coverage integrity finding that fails the
- * floor TOWARD latch) and is bounded only by an OFF-HOST or HARDWARE witness
- * (anti-rollback Stage 2b / Stage 4). Do NOT claim on-disk detection of a full
- * self-consistent tree+audit restore that ALSO removes the guardian audit trail.
+ * wholesale guardian-audit-coverage destruction. That truncation is surfaced as a
+ * coverage integrity finding (empty/truncated chain) that fails the floor TOWARD
+ * latch UNLESS the attacker ALSO rolls the audit head anchor (`__head_anchor`, a
+ * single overwrite-in-place key with no on-disk rollback protection of its own)
+ * back to the MAC-valid OLD head that matches the truncated tail: with the head
+ * anchor consistently rolled back the truncated chain re-verifies with ZERO
+ * findings, so no coverage finding fires and the restore is on-disk-undetectable.
+ * That fully-coordinated case (blob + anchor + old head anchor + established
+ * marker rolled back AND the raise entry deleted) is bounded only by an OFF-HOST
+ * or HARDWARE witness (anti-rollback Stage 2b / Stage 4). Do NOT claim on-disk
+ * detection of a full self-consistent tree+audit restore that ALSO removes the
+ * guardian audit trail and rolls the head anchor back consistently.
  */
 export const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY =
   "federation-guardian-antirollback-anchor-v1";

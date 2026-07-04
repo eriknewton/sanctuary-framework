@@ -2320,4 +2320,182 @@ describe("F1 re-gate: keyless whole-blob rollback latches (§1 + §8)", () => {
     // Finding sequence >= lowest guardian sequence -> fail toward latch.
     expect((after as { unavailable?: boolean }).unavailable).toBe(true);
   });
+
+  // Drive a fortress to: requirement set (gen 1) -> arm break-glass (gen 2,
+  // ARMED state persisted) -> CAPTURE blob+anchor at gen 2 -> terminate the
+  // countdown via `outcome` (cancel/veto: gen 3, break-glass cleared). Returns
+  // the captured low-floor bytes so a test can restore + reboot.
+  async function armedThenTerminated(
+    outcome: "cancel" | "veto",
+  ): Promise<{
+    fortress: MultiNodeFortress;
+    storage: MemoryStorage;
+    armedBlob: Uint8Array;
+    armedAnchor: Uint8Array;
+    keypairs: GuardianKeypair[];
+    roster: GuardianRoster;
+  }> {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster }); // gen 1
+
+    await dashboard.initiateFederationGuardianBreakGlass("disable", null); // gen 2, ARMED
+    const inFlightNonce = dashboard.nextFederationGuardianDisableNonce() - 1;
+
+    // CAPTURE the ARMED state (gen 2) raw bytes: blob + anchor. No master used.
+    const armedBlob = (await storage.read(NS, KEY))!;
+    const armedAnchor = (await storage.read("_meta", ANCHOR_KEY))!;
+    expect(armedBlob).not.toBeNull();
+    expect(armedAnchor).not.toBeNull();
+
+    // Terminate the countdown (gen 3, break-glass cleared). The veto/cancel audit
+    // entry (federation_guardian_break_glass_vetoed / _cancelled) carries the
+    // committed generation 3 - the entry the round-2 hardcoded set OMITTED.
+    if (outcome === "cancel") {
+      await dashboard.cancelFederationGuardianBreakGlass();
+    } else {
+      const veto = signGuardianBreakGlassVeto({
+        guardianId: keypairs[4]!.identity.guardian_id,
+        guardianPrivateKey: keypairs[4]!.privateKey,
+        fortressId: fortress.fortressId,
+        disableNonce: inFlightNonce,
+        rosterVersion: 1,
+      });
+      const decision = await dashboard.vetoFederationGuardianBreakGlass(veto);
+      expect(decision.vetoed).toBe(true);
+    }
+    // Sanity: the live break-glass is cleared after termination.
+    const liveStore = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    expect((await liveStore.load()).guardianBreakGlass).toBeNull();
+
+    return { fortress, storage, armedBlob, armedAnchor, keypairs, roster };
+  }
+
+  // §8.7 P0 (Codex's exact exploit, CANCEL variant). The break-glass CANCEL entry
+  // bumps + audits the committed generation under an op-name the round-2 hardcoded
+  // matcher OMITTED. Restoring the captured ARMED (gen 2) blob + anchor after a
+  // cancel (gen 3) must LATCH via the drift-proof floor (auditFloor.generation=3
+  // from the matched cancel entry > blob.generation=2), and the stale ARMED
+  // break-glass must NOT resurrect. On 8f213716 (hardcoded set) the cancel entry
+  // is skipped -> auditFloor=2 -> no latch -> the armed break-glass rehydrates.
+  it("P0(round3): a stale-armed break-glass restore after CANCEL latches (drift-proof floor)", async () => {
+    const { fortress, storage, armedBlob, armedAnchor } =
+      await armedThenTerminated("cancel");
+
+    // Restore the captured ARMED (gen 2) blob + anchor.
+    await storage.write(NS, KEY, armedBlob);
+    await storage.write("_meta", ANCHOR_KEY, armedAnchor);
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    // Give any (wrongly) armed poll an immediate tick window.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Must LATCH: blob.generation (2) < auditFloor.generation (3, from the matched
+    // cancel entry).
+    expect(restarted._federationSyncStateUnavailable ?? false).toBe(true);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // The stale ARMED break-glass must NOT resurrect: a latched fortress serves
+    // the unavailable sentinel (never auto-disables the requirement to null via
+    // the poll path), so the kill hook is { unavailable: true }, NOT null.
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
+  });
+
+  // §8.7 P0 (VETO variant). Same exploit via a guardian veto (also an unmatched
+  // op in the round-2 set). Must LATCH.
+  it("P0(round3): a stale-armed break-glass restore after VETO latches (drift-proof floor)", async () => {
+    const { fortress, storage, armedBlob, armedAnchor } =
+      await armedThenTerminated("veto");
+    await storage.write(NS, KEY, armedBlob);
+    await storage.write("_meta", ANCHOR_KEY, armedAnchor);
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(restarted._federationSyncStateUnavailable ?? false).toBe(true);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
+  });
+
+  // §8.7 ANTI-DRIFT (prefix-not-set proof): the floor matches guardian
+  // generations by PREFIX + success + details.generation, NOT a hardcoded
+  // op-name set. Prove it counts a SYNTHETIC guardian op-name that NO set could
+  // enumerate, and that this is the ONLY entry above the on-disk blob generation
+  // (so a hardcoded set would MISS it and NOT latch, while the prefix matcher
+  // DOES). Models a future generation-bumping transition whose audit landed (gen
+  // higher) but whose blob write was then rolled back to the enable generation.
+  it("anti-drift: a synthetic federation_guardian_* success entry with a higher generation RAISES the floor (set would miss)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster }); // gen 1
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    const blobGen = (await store.load()).guardianRevocationRequirementGeneration;
+
+    // Append ONLY a SYNTHETIC guardian op-name (no matched _set/_initiated entry
+    // above the blob generation), carrying a strictly-higher generation. On a
+    // HARDCODED-SET matcher this is unmatched -> floor stays == blobGen -> NO
+    // latch. On the PREFIX matcher it raises the floor -> blobGen < floor -> LATCH.
+    const log = new AuditLog(storage, AUDIT_KEY);
+    await log.appendCritical({
+      layer: "l2",
+      operation: "federation_guardian_some_future_transition_v9",
+      identity_id: "dashboard",
+      result: "success",
+      details: { generation: blobGen + 5 },
+    });
+    await log.flush();
+
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // The synthetic entry raised the audit floor to blobGen+5 > the on-disk blob
+    // generation -> LATCH (drift-proof prefix match). A hardcoded set would miss
+    // the synthetic op and would NOT latch.
+    expect((after as { unavailable?: boolean }).unavailable).toBe(true);
+  });
+
+  // §8.7 ANTI-DRIFT regression: the EXISTING matched paths still count. A
+  // requirement set + a break-glass initiate both raise the floor via the
+  // drift-proof matcher (they always did; this guards against the matcher
+  // narrowing). A FAILURE entry (no committed generation) must NOT count.
+  it("anti-drift: success guardian entries count; a failure entry (no committed generation) does not", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster }); // gen 1 (matched)
+
+    // Append a FAILURE guardian entry carrying rolled_back_generation, NOT a
+    // committed `generation`. It must NOT raise the floor (it never committed).
+    const log = new AuditLog(storage, AUDIT_KEY);
+    await log.appendCritical({
+      layer: "l2",
+      operation: "federation_guardian_revocation_requirement_persist_failed",
+      identity_id: "dashboard",
+      result: "failure",
+      details: { rolled_back_generation: 999 },
+    });
+    await log.flush();
+
+    // A consistent reboot (no rollback staged) does NOT latch: the failure entry's
+    // rolled_back_generation (999) is ignored (result !== "success" AND no
+    // committed `generation`), so the floor stays at the real committed gen 1,
+    // which matches the on-disk blob.
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    expect((after as { unavailable?: boolean }).unavailable).not.toBe(true);
+    expect(effectiveThresholdM(after as GuardianRevocationRequirement)).toBe(3);
+  });
 });
