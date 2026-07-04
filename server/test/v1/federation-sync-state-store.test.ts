@@ -30,8 +30,11 @@ import {
   FederationSyncStateStore,
   FederationSyncStateStoreError,
   emptyFederationSyncState,
+  FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
   type FederationSyncStateSnapshot,
 } from "../../src/v1/federation-sync-state-store.js";
+import { FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY } from "../../src/v1/federation-sync-state-store.js";
+import { bytesToString, stringToBytes } from "../../src/core/encoding.js";
 
 /** A 32-byte custody master stand-in (deterministic, keychain-free). */
 function masterKey(): Uint8Array {
@@ -504,5 +507,142 @@ describe("FederationSyncStateStore - write-OVERLAP close (cross-process lock)", 
     expect(writes.length).toBe(2);
     // The second read happens after the first write: serialized, not overlapping.
     expect(reads[1]!.i).toBeGreaterThan(writes[0]!.i);
+  });
+});
+
+/**
+ * F1 re-gate (§1 + Finding #6): the EXTERNAL anti-rollback anchor + the
+ * tamper-evident tri-state established sentinel. These operate at the STORE
+ * level, capturing/restoring RAW on-disk bytes (never handing the attacker the
+ * master), which is exactly the keyless filesystem attacker the fix defends
+ * against. The dashboard-level composition (§8 audit floor, the latch) is
+ * covered in federation-guardian-disable-gate.test.ts.
+ */
+describe("FederationSyncStateStore - §1 external anti-rollback anchor", () => {
+  function snapshotWithFloors(floors: {
+    generation: number;
+    disableNonce: number;
+    loweredHighWater: number;
+  }): FederationSyncStateSnapshot {
+    return {
+      ...emptyFederationSyncState(),
+      guardianRevocationRequirementGeneration: floors.generation,
+      guardianDisableNonce: floors.disableNonce,
+      guardianLoweredHighWater: floors.loweredHighWater,
+    };
+  }
+
+  it("persist writes a valid anchor at the merged floors; read authenticates it", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.persist(
+      snapshotWithFloors({ generation: 4, disableNonce: 3, loweredHighWater: 2 }),
+    );
+    const anchor = await store.readGuardianAntiRollbackAnchor();
+    expect(anchor.status).toBe("valid");
+    if (anchor.status !== "valid") throw new Error("unreachable");
+    expect(anchor.data.requirement_generation).toBe(4);
+    expect(anchor.data.disable_nonce).toBe(3);
+    expect(anchor.data.lowered_high_water).toBe(2);
+  });
+
+  it("the anchor is NON-DECREASING: a lower persist never lowers an anchored floor", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.persist(
+      snapshotWithFloors({ generation: 9, disableNonce: 7, loweredHighWater: 5 }),
+    );
+    // A subsequent persist carrying LOWER floors (a stale writer) must not lower
+    // the anchor.
+    await store.writeGuardianAntiRollbackAnchor({
+      loweredHighWater: 0,
+      disableNonce: 0,
+      requirementGeneration: 0,
+    });
+    const anchor = await store.readGuardianAntiRollbackAnchor();
+    expect(anchor.status).toBe("valid");
+    if (anchor.status !== "valid") throw new Error("unreachable");
+    expect(anchor.data.requirement_generation).toBe(9);
+    expect(anchor.data.disable_nonce).toBe(7);
+    expect(anchor.data.lowered_high_water).toBe(5);
+  });
+
+  it("absent anchor reads as absent (neutral); tampered anchor reads as invalid (latch signal)", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("absent");
+
+    await store.persist(
+      snapshotWithFloors({ generation: 2, disableNonce: 1, loweredHighWater: 0 }),
+    );
+    // Corrupt the anchor's MAC on disk (a keyless attacker mangling the record).
+    const raw = await storage.read("_meta", FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY);
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(bytesToString(raw!)) as { mac: string };
+    parsed.mac = "AAAA" + parsed.mac.slice(4);
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+      stringToBytes(JSON.stringify(parsed)),
+    );
+    expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("invalid");
+  });
+
+  it("a keyless attacker who cannot re-MAC the anchor cannot forge a higher floor", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.persist(
+      snapshotWithFloors({ generation: 2, disableNonce: 2, loweredHighWater: 2 }),
+    );
+    // The attacker rewrites the anchor's data floors UP without the master key
+    // (leaving the old MAC): the read must reject it (invalid), never accept a
+    // forged higher floor.
+    const raw = await storage.read("_meta", FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY);
+    const parsed = JSON.parse(bytesToString(raw!)) as {
+      data: { requirement_generation: number };
+      mac: string;
+    };
+    parsed.data.requirement_generation = 999;
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+      stringToBytes(JSON.stringify(parsed)),
+    );
+    expect((await store.readGuardianAntiRollbackAnchor()).status).toBe("invalid");
+  });
+});
+
+describe("FederationSyncStateStore - Finding #6 tamper-evident established sentinel (tri-state)", () => {
+  it("absent -> {status: absent}; established -> {status: established}", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    expect((await store.guardianRequirementEstablished()).status).toBe("absent");
+    await store.markGuardianRequirementEstablished();
+    expect((await store.guardianRequirementEstablished()).status).toBe("established");
+  });
+
+  it("present-but-bad-MAC -> {status: invalid} (was the old false 'absent')", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.markGuardianRequirementEstablished();
+    // Corrupt the MAC (a keyless attacker cannot recompute it under the master).
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+      stringToBytes(JSON.stringify({ v: 1, mac: "not-the-real-mac" })),
+    );
+    expect((await store.guardianRequirementEstablished()).status).toBe("invalid");
+  });
+
+  it("present-but-unparseable -> {status: invalid}", async () => {
+    const storage = new MemoryStorage();
+    const store = new FederationSyncStateStore({ storage, masterKey: masterKey() });
+    await store.markGuardianRequirementEstablished();
+    await storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+      stringToBytes("{ this is not json"),
+    );
+    expect((await store.guardianRequirementEstablished()).status).toBe("invalid");
   });
 });

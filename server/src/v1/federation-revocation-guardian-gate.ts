@@ -52,6 +52,66 @@ import {
  */
 export const GUARDIAN_SIGN_OFF_ACTION = "federation_node_eviction" as const;
 
+// ── Lowered effective-M authorization (data types + effective-M accessor) ────
+//
+// These live HERE, co-located with `GuardianRevocationRequirement`, so this
+// module never imports from `federation-guardian-disable-gate.ts` (which owns
+// the sign/verify crypto + the chokepoint). That keeps the two a single
+// directed edge (disable-gate -> this module) rather than an import cycle. A
+// lowering of the effective kill threshold below the roster's issued `m` is
+// operational state that can legitimately move down, but the roster's signed
+// body is immutable authorization material (its `master_signature` covers `m`).
+// Rewriting `m` inside the roster body to represent a lowering forges the roster
+// and self-invalidates it on the next reboot (fail-open #2). Instead the
+// effective threshold is carried as its OWN separately master-signed sibling
+// record next to the (byte-for-byte unchanged) roster (INV-B).
+
+/** Domain-separated signing context for a LOWERED effective-M authorization. */
+export const LOWERED_THRESHOLD_AUTHORIZATION_DOMAIN =
+  "sanctuary.federation.guardian-requirement.lowered-threshold.v1" as const;
+
+/**
+ * The canonical body a fortress-master key signs to authorize a lowered
+ * effective kill threshold. Binds the fortress, the roster version the lowering
+ * is scoped to (so a lowering minted for roster v7 cannot survive a rotate to
+ * v8), the lowered effective M (a strict LOWERING: 1 <= effective_m <= roster.m
+ * at mint time), and the anti-replay nonce burned by the transition that
+ * produced it (folded into the boot nonce floor so a stale lowering below the
+ * floor is refused - OR-2).
+ */
+export interface LoweredThresholdAuthorizationBody {
+  domain: typeof LOWERED_THRESHOLD_AUTHORIZATION_DOMAIN;
+  fortress_id: string;
+  roster_version: number;
+  effective_m: number;
+  disable_nonce: number;
+}
+
+/**
+ * A master-key-signed authorization carrying the lowered effective threshold.
+ * The value that feeds the kill threshold MUST come from inside the signed
+ * `body` ({@link effectiveThresholdM} reads `body.effective_m`), so there is no
+ * unsigned copy of the effective M anywhere.
+ */
+export interface LoweredThresholdAuthorization {
+  body: LoweredThresholdAuthorizationBody;
+  /** base64url Ed25519 over `canonicalizeToBytes(body)`, by the fortress master. */
+  signature: string;
+}
+
+/**
+ * The EFFECTIVE kill threshold M for a requirement: the master-signed lowered
+ * record's `effective_m` when present, else the roster's issued `m`. The value
+ * always comes from inside a signed body (`roster.m` is covered by the roster's
+ * `master_signature`; `loweredThreshold.body.effective_m` by its own). This is
+ * the single source of truth the kill path and the disable-gate quorum eval
+ * threshold on - the roster's signed `m` is NEVER mutated to represent a lower
+ * threshold (INV-B).
+ */
+export function effectiveThresholdM(req: GuardianRevocationRequirement): number {
+  return req.loweredThreshold?.body.effective_m ?? req.roster.m;
+}
+
 /**
  * Operator-configured requirement for guardian sign-off on a node revocation.
  *
@@ -68,6 +128,16 @@ export interface GuardianRevocationRequirement {
    * specific expected version for an extra stale-roster guard.
    */
   expectedRosterVersion?: number;
+  /**
+   * OPTIONAL master-signed lowered effective-M record. When present the kill
+   * path thresholds on `loweredThreshold.body.effective_m` instead of
+   * `roster.m` ({@link effectiveThresholdM}). The roster's signed body is NEVER
+   * mutated to represent the lowering (INV-B): the lowered threshold rides in
+   * this sibling record, so the roster's `master_signature` stays valid forever
+   * and the lowering carries its own reboot verification. Absent -> effective M
+   * = `roster.m` (the default; a pre-lower record decodes with this absent).
+   */
+  loweredThreshold?: LoweredThresholdAuthorization;
 }
 
 /**
@@ -136,6 +206,10 @@ export function evaluateGuardianRevocationSignOff(params: {
       roster: requirement.roster,
       signing_input: signingInput,
       expected_roster_version: expectedRosterVersion,
+      // Threshold on the EFFECTIVE M (a master-signed lowered record when
+      // present, else roster.m). The signed roster is never mutated; only the
+      // integer the valid-signature count is compared against changes.
+      effective_m: effectiveThresholdM(requirement),
     });
     return { allowed: true, validGuardianIds: result.valid_guardian_ids };
   } catch (err) {

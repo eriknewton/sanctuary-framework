@@ -38,7 +38,13 @@ import type { SanctuaryConfig } from "../config.js";
 import type { ApprovalChannel } from "./approval-channel.js";
 import type { ApprovalRequest, ApprovalResponse, PrincipalPolicy } from "./types.js";
 import type { BaselineTracker } from "./baseline.js";
-import type { AuditLog } from "../operational/audit-log.js";
+import type {
+  AuditLog,
+  AuditEntry,
+  AuditIntegrityFinding,
+  AuditIntegrityFindingKind,
+} from "../operational/audit-log.js";
+import { AuditIntegrityError } from "../operational/audit-log.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { HandshakeResult } from "../handshake/types.js";
 // SignedSHR type available via shr/types if needed in future
@@ -128,8 +134,25 @@ import {
   startFederationNodeCertificateAutoRenewal,
   type FederationNodeCertificateAutoRenewalHandle,
 } from "../v1/federation-revocation.js";
-import type { GuardianRevocationRequirement } from "../v1/federation-revocation-guardian-gate.js";
+import {
+  effectiveThresholdM,
+  type GuardianRevocationRequirement,
+} from "../v1/federation-revocation-guardian-gate.js";
 import { verifyGuardianRoster } from "../mesh/guardian/guardian-roster.js";
+import {
+  computeBreakGlassCompletion,
+  breakGlassElapsed,
+  DEFAULT_BREAK_GLASS_DELAY_MS,
+  evaluateGuardianBreakGlassVeto,
+  authorizeGuardianRequirementTransition,
+  verifyLoweredThresholdAuthorization,
+  type BreakGlassState,
+  type BreakGlassVetoDecision,
+  type GuardianDisableAuthorization,
+  type GuardianRequirementState,
+  type GuardianRequirementTransition,
+  type GuardianRequirementEffect,
+} from "../v1/federation-guardian-disable-gate.js";
 import {
   FEDERATION_POLICY_BUNDLE_EVENT_KIND,
   foldFederationPolicyBundleEvent as foldVerifiedFederationPolicyBundleEvent,
@@ -238,6 +261,33 @@ export type UnlockCredential =
   | { recoveryKey: string };
 
 type SSEClient = ServerResponse;
+
+/**
+ * F1 E1: poll interval for the guardian-requirement break-glass countdown.
+ * There is no durable OS-level scheduler in this codebase; this mirrors the
+ * node-certificate auto-renewal poll's role - it only ever DELAYS completion
+ * past the durable `completesAt`, never shortens it. One hour keeps the
+ * `..._tick` audit heartbeat frequent enough to prove the countdown stayed
+ * continuously live without flooding the audit log over a 72h window.
+ */
+const FEDERATION_BREAK_GLASS_POLL_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * F1 E1: thrown when the guardian-requirement disable-gate refuses a
+ * decrease (disable/lower) or a break-glass state transition. Carries a
+ * machine-readable `code` and a human `detail`; NEVER leaks which
+ * signature/nonce/roster field specifically failed beyond what the caller
+ * itself supplied (fail-closed, generic-enough deny per AGENTS.md 7's spirit
+ * for this operator-facing - not agent-facing - surface).
+ */
+export class GuardianDisableGateRefusedError extends Error {
+  readonly code: string;
+  constructor(code: string, detail: string) {
+    super(detail);
+    this.name = "GuardianDisableGateRefusedError";
+    this.code = code;
+  }
+}
 
 // ── Dashboard Approval Channel ──────────────────────────────────────────
 
@@ -390,6 +440,48 @@ interface FederationDashboardState {
   appliedPolicyVersions: Map<string, FederationAppliedPolicyVersion>;
   nodes: Map<string, FederationNodeView>;
 }
+
+/**
+ * §8.7: the operation-name PREFIX every guardian-requirement audit entry shares.
+ * The §8 audit-witnessed floor matches guardian entries by this prefix (plus
+ * `result === "success"` and a valid `details.generation`) rather than a
+ * hardcoded op-name set, so it structurally witnesses EVERY generation-bumping
+ * guardian transition, current and future. A hardcoded set was the round-2
+ * coverage gap: it omitted `federation_guardian_break_glass_vetoed` /
+ * `_cancelled`, which DO bump + audit the committed generation, re-opening
+ * finding #1 via a stale-armed-break-glass restore. The prefix match is
+ * drift-proof: a new guardian op-name cannot silently escape the floor.
+ */
+const GUARDIAN_AUDIT_OP_PREFIX = "federation_guardian_" as const;
+
+/**
+ * §8.6 P1: the audit integrity-finding kinds that indicate the audit COVERAGE
+ * could be compromised such that a guardian entry might be HIDDEN or a higher
+ * generation removed (truncation / structural / anchor / checkpoint classes). A
+ * finding of any of these kinds forces the anti-rollback floor to fail TOWARD
+ * latch regardless of its sequence, because it can mean the guardian set the
+ * floor is derived from is INCOMPLETE. The complement (a single in-place
+ * corruption, `entry_hash_mismatch` / `entry_malformed`, strictly BELOW every
+ * guardian entry) does NOT compromise guardian coverage, so it does not latch.
+ */
+const GUARDIAN_AUDIT_COVERAGE_FINDING_KINDS: ReadonlySet<AuditIntegrityFindingKind> =
+  new Set<AuditIntegrityFindingKind>([
+    "storage_unavailable",
+    "entry_unreadable",
+    "entry_decrypt_failed",
+    "sequence_gap_or_reorder",
+    "prev_hash_mismatch",
+    "tail_anchor_missing",
+    "tail_anchor_invalid",
+    "rotation_anchor_missing",
+    "rotation_anchor_invalid",
+    "legacy_anchor_missing",
+    "legacy_anchor_mismatch",
+    "checkpoint_malformed",
+    "checkpoint_root_mismatch",
+    "checkpoint_signature_mismatch",
+    "checkpoint_signature_unverifiable",
+  ]);
 
 function newerAppliedPolicy(
   base: FederationAppliedPolicyVersion | null,
@@ -642,6 +734,57 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * can never clobber a fresher requirement.
    */
   private _federationGuardianRevocationRequirementGeneration = 0;
+  /**
+   * F1 E1: anti-replay counter for the guardian DISABLE-gate. Burns (advances)
+   * on every terminal disable-gate transition (instant quorum/master-key
+   * authorize, break-glass vetoed, break-glass cancelled, break-glass
+   * completed). See {@link FederationSyncStateSnapshot.guardianDisableNonce}.
+   */
+  private _federationGuardianDisableNonce = 0;
+  /**
+   * FIX 1 (A3 replay, reboot leg): a DEDICATED high-water for SUPERSEDED
+   * lowered-threshold records, distinct from {@link
+   * _federationGuardianDisableNonce}. It advances ONLY when a lowering is
+   * actually dropped (a raise/re-pin that removes a prior lowered record, or a
+   * decrease that replaces one), never on a break-glass initiate. On boot,
+   * {@link rehydrateGuardianRevocationRequirement} REJECTS a persisted lowered
+   * record whose nonce is below this floor (a replayed, already-superseded
+   * lowering). See {@link
+   * FederationSyncStateSnapshot.guardianLoweredHighWater} for why it must NOT
+   * key off the general disable nonce.
+   */
+  private _federationGuardianLoweredHighWater = 0;
+  /**
+   * F1 E1: the in-flight break-glass countdown, or `null` when IDLE. Every
+   * mutation of this field MUST happen in the SAME set as a bump of
+   * {@link _federationGuardianRevocationRequirementGeneration} (the H1 fix from
+   * the design review): the two travel together under one generation so a
+   * stale rotate-root CLI persist can never revive a cancelled/completed
+   * countdown nor silently drop an armed one.
+   */
+  private _federationGuardianBreakGlass: BreakGlassState | null = null;
+  /**
+   * F1 E1: the poll handle driving break-glass completion. There is no durable
+   * OS-level scheduler in this codebase (the M1 finding from the design
+   * review); this mirrors `startFederationNodeCertificateAutoRenewal` - an
+   * in-process `setInterval` that re-checks the DURABLE `completesAt` on every
+   * tick and on every boot re-arm. It can only ever DELAY completion (never
+   * shorten it): a missed tick, a restart, or a slow poll interval all just
+   * mean completion happens at the next tick after `completesAt`, never before.
+   */
+  private _federationBreakGlassPoll: ReturnType<typeof setInterval> | null = null;
+  /**
+   * F1 E1: in-flight guard for {@link tickFederationGuardianBreakGlass}. A tick
+   * awaits an async audit write + (on completion) a durable persist; without
+   * this guard, a slow tick overlapping the next interval firing (or many
+   * timers compressed into one macrotask flush, as happens under fake timers
+   * in tests) could run two ticks CONCURRENTLY against the same audit log /
+   * live fields, corrupting the audit hash chain. Skipping an overlapping tick
+   * is always safe: the poll only ever needs to observe `completesAt` has
+   * elapsed at SOME later tick, and the next interval (or the tick already in
+   * flight) covers that.
+   */
+  private _federationBreakGlassTickInFlight = false;
   private readonly _federationRoster = new Set<string>();
   private _federationState: FederationDashboardState = {
     eventLog: [],
@@ -1979,90 +2122,637 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * (kill) path. Pass a {@link GuardianRevocationRequirement} (the pinned,
    * fortress-master-signed guardian roster) to REQUIRE an M-of-N guardian quorum
    * before any node eviction is minted; pass `null` to DISABLE the requirement
-   * and restore the legacy single-operator revoke path. Default is `null`
-   * (off). This is an additive precondition only: it never relaxes the existing
-   * operator-signature gate on revoke.
+   * and restore the legacy single-operator revoke path. This is an additive
+   * precondition only: it never relaxes the existing operator-signature gate on
+   * revoke.
+   *
+   * This is now a THIN ADAPTER over the single chokepoint
+   * {@link commitGuardianRequirementTransition} - it builds an `operator_set`
+   * transition and hands it to the one mutator. All authorization, latch, and
+   * roster/lowered-record verification happen in the pure
+   * {@link authorizeGuardianRequirementTransition} the chokepoint calls; this
+   * method contains NO direct writes to the coupled fields.
+   *
+   * F1 (the disable-gate): an increase (enable, or raise effective M) and a
+   * noop (equal-M re-pin) are operator-only; a decrease (disable, or lower
+   * effective M) REQUIRES a valid {@link GuardianDisableAuthorization} (a
+   * master-key instant authorization or an M-of-N guardian quorum over the
+   * CURRENT effective roster). The one behavioral change vs. the pre-chokepoint
+   * setter: a `set(null)` against a LATCHED-INVALID fortress is now classified
+   * as a DECREASE (a real, if unverifiable, guard is being torn down) and
+   * demands that authorization, closing fail-open #1.
+   *
+   * Lowering the effective M (`requirement.loweredThreshold` present) rides in a
+   * sibling master-signed record; the roster's signed body is NEVER mutated
+   * (INV-B), so the roster's signature stays valid across reboot and the
+   * lowering carries its own reboot verification (closing fail-open #2).
    */
   async setFederationGuardianRevocationRequirement(
     requirement: GuardianRevocationRequirement | null,
+    authorization?: GuardianDisableAuthorization | null,
   ): Promise<void> {
-    // ATOMIC mutation (F2). Capture the prior values of all three live fields so
-    // we can ROLL BACK if the durable persist throws. Without this rollback a
-    // failed persist would leave in-memory state advanced (possibly DISABLED)
-    // while the durable store still holds the prior value: a subsequent
-    // in-process revoke would read the mutated requirement while a restart would
-    // read the prior one, diverging until reboot. The rule (AGENTS.md 5) is that
-    // a security-state advance is never acknowledged unless it durably committed,
-    // so on a persist failure the live state must snap back to the durable value.
+    await this.commitGuardianRequirementTransition({
+      kind: "operator_set",
+      next: requirement,
+      auth: authorization ?? null,
+      loweredThreshold: requirement?.loweredThreshold ?? null,
+    });
+  }
+
+  /**
+   * THE SINGLE CHOKEPOINT. The ONLY writer of the four coupled guardian fields
+   * (`_federationGuardianRevocationRequirement`,
+   * `_federationGuardianRevocationRequirementInvalid` (the latch),
+   * `_federationGuardianRevocationRequirementGeneration`,
+   * `_federationGuardianDisableNonce`) plus `_federationGuardianBreakGlass` on
+   * the completion path. Every public mutation and every latch transition flows
+   * through here. Strict order:
+   *
+   *   1. READ the current live state + latch + pinned master + fortress id
+   *      (no writes yet).
+   *   2. CLASSIFY + AUTHORIZE (pure): {@link authorizeGuardianRequirementTransition}.
+   *      Fail-closed - any missing auth / verification failure / ambiguity
+   *      throws {@link GuardianDisableGateRefusedError} with NO state change
+   *      (and, for a refused decrease, a loud audit).
+   *   3. SNAPSHOT all coupled fields for rollback.
+   *   4. APPLY the effect (single synchronous block - the atomic mutation).
+   *   5. AUDIT the intent (before persist, so it is on the record even if the
+   *      write fails).
+   *   6. PERSIST; on throw, ROLL BACK every coupled field, re-audit, re-throw.
+   *
+   * INV-A: the latch clears ONLY by installing a positively-verified roster,
+   * NEVER by removing the requirement - except the OR-3 carve-out (a
+   * master-signed disable positively authorizes the absence and clears it).
+   */
+  private async commitGuardianRequirementTransition(
+    t: GuardianRequirementTransition,
+  ): Promise<void> {
+    // 1. READ (no writes).
+    const state: GuardianRequirementState = {
+      requirement: this._federationGuardianRevocationRequirement,
+      latchInvalid: this._federationGuardianRevocationRequirementInvalid,
+      pinnedMaster: this._federationContext?.pinnedMasterPubkey ?? null,
+      fortressId: this._federationContext?.fortressId ?? null,
+      syncStateUnavailable: this._federationSyncStateUnavailable,
+      nextDisableNonce: this._federationGuardianDisableNonce + 1,
+      // Finding #5: thread the superseded-lowering high-water so the authorizer
+      // rejects a below-floor lowered record on EVERY runtime install, matching
+      // the boot-rehydrate floor check.
+      guardianLoweredHighWater: this._federationGuardianLoweredHighWater,
+    };
+
+    // 2. AUTHORIZE (pure).
+    const commit = authorizeGuardianRequirementTransition(state, t);
+    if (!commit.ok) {
+      // A refused DECREASE is loudly audited (the pre-chokepoint behavior).
+      if (
+        commit.reason === "guardian_disable_authorization_required" ||
+        commit.reason === "federation_sync_state_unavailable" ||
+        commit.reason === "lowered_threshold_invalid"
+      ) {
+        const intent =
+          t.kind === "operator_set" && t.next !== null ? "lower" : "disable";
+        const targetM =
+          t.kind === "operator_set" && t.next !== null
+            ? effectiveThresholdM(t.next)
+            : null;
+        await this.auditLog?.appendCritical({
+          layer: "l2",
+          operation: "federation_guardian_disable_quorum_refused",
+          identity_id: "dashboard",
+          result: "failure",
+          details: {
+            intent,
+            target_m: targetM,
+            attempted_nonce: state.nextDisableNonce,
+            reason: commit.detail,
+          },
+        });
+      }
+      throw new GuardianDisableGateRefusedError(commit.reason, commit.detail);
+    }
+    const effect: GuardianRequirementEffect = commit.effect;
+
+    // 3. SNAPSHOT for rollback.
     const priorRequirement = this._federationGuardianRevocationRequirement;
     const priorInvalid = this._federationGuardianRevocationRequirementInvalid;
     const priorGeneration = this._federationGuardianRevocationRequirementGeneration;
+    const priorDisableNonce = this._federationGuardianDisableNonce;
+    const priorLoweredHighWater = this._federationGuardianLoweredHighWater;
+    const priorBreakGlass = this._federationGuardianBreakGlass;
 
-    this._federationGuardianRevocationRequirement = requirement;
-    // An explicit operator (re-)pin or clear supersedes any prior fail-closed
-    // latch: the operator is asserting the current requirement directly.
-    this._federationGuardianRevocationRequirementInvalid = false;
-    // Bump the monotonic generation on EVERY set (enable, re-pin, OR clear) so a
-    // stale cross-process writer (the rotate-root CLI) can never clobber this
-    // change in the durable-store merge.
+    // 4. APPLY (atomic mutation - single synchronous block).
+    this._federationGuardianRevocationRequirement = effect.requirement;
+    // INV-A: the latch clears ONLY by installing a positively-verified roster
+    // (effect.clearsLatch, set by the authorizer for enable/raise/repin
+    // recovery), OR by the OR-3 master-signed-disable carve-out
+    // (effect.masterAuthorizedNull). Every other transition leaves the latch
+    // as-is: a non-master `set(null)` NEVER clears it (fail-open #1 closed).
+    if (effect.clearsLatch || effect.masterAuthorizedNull) {
+      this._federationGuardianRevocationRequirementInvalid = false;
+    }
+    // Bump the monotonic generation on EVERY committed transition so a stale
+    // cross-process writer (the rotate-root CLI) can never clobber this change
+    // in the durable-store merge.
     this._federationGuardianRevocationRequirementGeneration = priorGeneration + 1;
-    // LOUD, DURABLE audit on every call. Turning the fleet-kill guard OFF
-    // (`set(null)`) is a Tier-1-class relaxation and MUST be as loud as enabling
-    // it; it is emitted as a critical audit event, never silent. Emitted BEFORE
-    // the persist so the intent is on the record even if the durable write then
-    // fails. (Disabling is not gated by M-of-N in this build by product
-    // decision; it is instead made unmistakably auditable.)
-    await this.auditLog?.appendCritical({
-      layer: "l2",
-      operation:
-        requirement === null
-          ? "federation_guardian_revocation_requirement_disabled"
-          : "federation_guardian_revocation_requirement_set",
-      identity_id: "dashboard",
-      result: "success",
-      details: {
-        enabled: requirement !== null,
-        generation: this._federationGuardianRevocationRequirementGeneration,
-        ...(requirement !== null
-          ? {
-              roster_version: requirement.roster.version,
-              guardian_m: requirement.roster.m,
-              guardian_n: requirement.roster.n,
-            }
-          : {}),
-      },
-    });
-    // Persist so the requirement SURVIVES A RESTART. Without this the M-of-N
-    // guarantee would evaporate on the next reboot and silently revert to
-    // single-operator kill. THROWS on a durable-write failure so the operator's
-    // opt-in is not acknowledged unless it durably committed (fail-closed write).
+    if (effect.burnedNonce !== null) {
+      // Burn the nonce (a decrease/completion): this exact authorization can
+      // never be replayed for a later disable/lower.
+      this._federationGuardianDisableNonce = Math.max(
+        this._federationGuardianDisableNonce,
+        effect.burnedNonce,
+      );
+    }
+    // FIX 1: when this transition SUPERSEDES a prior lowered record (a raise/
+    // re-pin that drops it, or a decrease that replaces it), advance the
+    // DEDICATED lowered high-water past that record's nonce so a reboot rejects
+    // its re-injection. Distinct from the general disable-nonce burn above: this
+    // floor does NOT advance on a break-glass initiate, so a lowered fortress
+    // that arms break-glass and reboots mid-countdown is not falsely rejected.
+    if (effect.supersedesLoweredNonce !== null) {
+      this._federationGuardianLoweredHighWater = Math.max(
+        this._federationGuardianLoweredHighWater,
+        effect.supersedesLoweredNonce,
+      );
+    }
+    // Break-glass completion additionally clears the in-flight countdown here
+    // (the ONE place besides veto/cancel that touches it), under the same
+    // generation bump.
+    if (t.kind === "break_glass_complete") {
+      this._federationGuardianBreakGlass = null;
+    }
+
+    // 5. AUDIT the intent (before persist), then 6. PERSIST - BOTH inside the
+    // rollback try (FIX 3 / P1): an audit-append throw AFTER the mutation was
+    // applied must roll back every coupled field, exactly like a persist throw,
+    // so a throw can never leave live state weakened-but-not-durably-committed.
+    // Audit-before-persist ordering is preserved so intent is on the record even
+    // if the durable write later fails.
+    const operation = this.guardianTransitionAuditOperation(t, effect);
     try {
+      await this.auditLog?.appendCritical({
+        layer: "l2",
+        operation,
+        identity_id: "dashboard",
+        result: "success",
+        details: {
+          enabled: effect.requirement !== null,
+          transition: effect.classification,
+          generation: this._federationGuardianRevocationRequirementGeneration,
+          ...(effect.burnedNonce !== null ? { disable_nonce: effect.burnedNonce } : {}),
+          ...(effect.requirement !== null
+            ? {
+                roster_version: effect.requirement.roster.version,
+                guardian_m: effect.requirement.roster.m,
+                guardian_effective_m: effectiveThresholdM(effect.requirement),
+                guardian_n: effect.requirement.roster.n,
+              }
+            : {}),
+        },
+      });
+      // Finding #2 (P0) write-ordering: write the tamper-evident "ever-
+      // established" sentinel BEFORE the record persist on any transition that
+      // installs OR retains a non-null requirement. The pre-fix order (record
+      // first, sentinel second) left a crash window in the DANGEROUS state:
+      // record-present + sentinel-absent, where a later single-file delete of the
+      // record boots UN-latched (the sentinel that would have caught it was never
+      // written), restoring single-operator kill. With the sentinel first, the
+      // only interrupted state is sentinel-present + record-absent, which the
+      // hydrate path already latches fail-closed. The sentinel is grow-only and
+      // idempotent (fixed bytes), so writing it before a persist that later throws
+      // is safe: the transition rolls back its live fields in the catch below, and
+      // a stale sentinel with no record simply latches until the operator re-pins.
+      // Kept inside the same try/rollback so a sentinel-write throw still rolls
+      // back the transition.
+      if (effect.requirement !== null) {
+        await this._federationSyncStateStore?.markGuardianRequirementEstablished();
+      }
       await this.persistFederationSyncState();
     } catch (err) {
-      // ROLL BACK all three live fields to their prior values so in-memory state
-      // == durable state (the prior value) after a failed write. Note the safe
-      // direction: an ENABLE that fails to persist rolls back to the PRIOR guard
-      // (stays as it was); a DISABLE that fails to persist rolls back to ENABLED
-      // (the guard stays ON). Emit a SECOND critical audit recording the
-      // rollback so the trail shows both the intent (above) and that it did NOT
-      // durably take effect, then re-throw so the caller sees the failure.
       this._federationGuardianRevocationRequirement = priorRequirement;
       this._federationGuardianRevocationRequirementInvalid = priorInvalid;
       this._federationGuardianRevocationRequirementGeneration = priorGeneration;
+      this._federationGuardianDisableNonce = priorDisableNonce;
+      this._federationGuardianLoweredHighWater = priorLoweredHighWater;
+      this._federationGuardianBreakGlass = priorBreakGlass;
+      // The state rollback above is the load-bearing part; the failure audit is
+      // best-effort. If the audit subsystem is itself the thing that threw (FIX
+      // 3), do not let its re-throw mask the original error or the rollback -
+      // swallow a secondary audit failure and re-throw the ORIGINAL `err`.
+      try {
+        await this.auditLog?.appendCritical({
+          layer: "l2",
+          operation: "federation_guardian_revocation_requirement_persist_failed",
+          identity_id: "dashboard",
+          result: "failure",
+          details: {
+            attempted_enabled: effect.requirement !== null,
+            rolled_back_to_enabled: priorRequirement !== null,
+            rolled_back_generation: priorGeneration,
+          },
+        });
+      } catch {
+        // best-effort failure audit; original error is authoritative
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The critical-audit operation string for a committed guardian-requirement
+   * transition, preserving the exact operation names the pre-chokepoint call
+   * sites emitted so the audit surface + posture board are unchanged.
+   */
+  private guardianTransitionAuditOperation(
+    t: GuardianRequirementTransition,
+    effect: GuardianRequirementEffect,
+  ): string {
+    if (t.kind === "break_glass_complete") {
+      return "federation_guardian_break_glass_completed";
+    }
+    if (effect.authMethod === "master") {
+      return "federation_guardian_disable_master_authorized";
+    }
+    if (effect.authMethod === "quorum") {
+      return "federation_guardian_disable_quorum_authorized";
+    }
+    return effect.requirement === null
+      ? "federation_guardian_revocation_requirement_disabled"
+      : "federation_guardian_revocation_requirement_set";
+  }
+
+  /**
+   * F1 E1: the nonce a NEW disable/lower authorization (quorum OR master-key)
+   * must target. Guardians/the master key sign over `nextFederationGuardianDisableNonce()`
+   * BEFORE the operator calls {@link setFederationGuardianRevocationRequirement};
+   * on success that exact nonce burns and this getter advances past it.
+   */
+  nextFederationGuardianDisableNonce(): number {
+    return this._federationGuardianDisableNonce + 1;
+  }
+
+  /**
+   * F1: the deep, non-master, non-quorum escape hatch. Starts a loud, durable,
+   * guardian-vetoable countdown that DISABLES the current guardian revocation
+   * requirement if it completes unvetoed. Operator-only, only from IDLE (no
+   * in-flight break-glass), only when the current requirement is non-null, and
+   * only when the F3 sync-state latch is clear (same latch check as the instant
+   * path - we cannot tear down a guard whose state we could not trust on boot).
+   * `delayMs` defaults to {@link DEFAULT_BREAK_GLASS_DELAY_MS} (72h) and is
+   * clamped to the hard 24h floor (`MIN_BREAK_GLASS_DELAY_MS`).
+   *
+   * DISABLE-ONLY (OR-1, Erik-ratified 2026-07-05): break-glass is the "no
+   * master, no quorum" posture, so at completion there is NO signing authority
+   * present to mint a reboot-verifiable lowered-M record. A break-glass `lower`
+   * would therefore produce a lowered-M that self-invalidates on reboot (the
+   * original fail-open #2). It is also redundant - if you can wait 72h to lower,
+   * you can wait 72h to disable, and disable is the genuine "I am wedged"
+   * escape. So `intent: "lower"` is REFUSED; only `disable` proceeds. Quorum-
+   * lower and master-lower (which DO have a signing authority present) keep the
+   * lowered record via the instant setter path.
+   */
+  async initiateFederationGuardianBreakGlass(
+    intent: "disable" | "lower",
+    targetM: number | null,
+    delayMs: number = DEFAULT_BREAK_GLASS_DELAY_MS,
+  ): Promise<void> {
+    // OR-1: break-glass is disable-only. A lower is refused BEFORE any state
+    // read so the disable-only restriction cannot silently regress (T-6).
+    if (intent !== "disable") {
+      throw new GuardianDisableGateRefusedError(
+        "break_glass_disable_only",
+        "break-glass is disable-only: it cannot lower the effective M (there is no signing authority present in the no-master no-quorum posture to mint a reboot-verifiable lowered-M record). Use the master-key or M-of-N quorum instant path to lower.",
+      );
+    }
+    if (
+      this._federationSyncStateUnavailable ||
+      this._federationGuardianRevocationRequirementInvalid
+    ) {
+      throw new GuardianDisableGateRefusedError(
+        "federation_sync_state_unavailable",
+        "the durable federation sync-state is unavailable or unverified; cannot initiate break-glass",
+      );
+    }
+    const current = this._federationGuardianRevocationRequirement;
+    if (current === null) {
+      throw new GuardianDisableGateRefusedError(
+        "no_requirement_configured",
+        "no guardian revocation requirement is configured; there is nothing to disable",
+      );
+    }
+    if (this._federationGuardianBreakGlass !== null) {
+      throw new GuardianDisableGateRefusedError(
+        "break_glass_already_armed",
+        "a break-glass countdown is already in flight for this fortress; cancel it before initiating another",
+      );
+    }
+
+    const priorGeneration = this._federationGuardianRevocationRequirementGeneration;
+    const priorBreakGlass = this._federationGuardianBreakGlass;
+    const priorDisableNonce = this._federationGuardianDisableNonce;
+
+    const nextNonce = this._federationGuardianDisableNonce + 1;
+    const { initiatedAt, completesAt, delayMs: clampedDelayMs } =
+      computeBreakGlassCompletion(Date.now(), delayMs);
+    const state: BreakGlassState = {
+      nonce: nextNonce,
+      intent,
+      targetM,
+      initiatedAt,
+      completesAt,
+      delayMs: clampedDelayMs,
+    };
+
+    // H1 fix: bump the shared generation in the SAME set as the break-glass
+    // mutation, exactly like the setter does for the requirement itself, so
+    // the sub-object and the generation integer can never decouple across a
+    // rotate-root merge.
+    this._federationGuardianRevocationRequirementGeneration = priorGeneration + 1;
+    this._federationGuardianBreakGlass = state;
+    this._federationGuardianDisableNonce = nextNonce;
+
+    await this.auditLog?.appendCritical({
+      layer: "l2",
+      operation: "federation_guardian_break_glass_initiated",
+      identity_id: "dashboard",
+      result: "success",
+      details: {
+        intent,
+        target_m: targetM,
+        nonce: nextNonce,
+        initiated_at: initiatedAt,
+        completes_at: completesAt,
+        delay_ms: clampedDelayMs,
+        generation: this._federationGuardianRevocationRequirementGeneration,
+      },
+    });
+
+    try {
+      await this.persistFederationSyncState();
+    } catch (err) {
+      this._federationGuardianRevocationRequirementGeneration = priorGeneration;
+      this._federationGuardianBreakGlass = priorBreakGlass;
+      this._federationGuardianDisableNonce = priorDisableNonce;
       await this.auditLog?.appendCritical({
         layer: "l2",
-        operation: "federation_guardian_revocation_requirement_persist_failed",
+        operation: "federation_guardian_break_glass_persist_failed",
         identity_id: "dashboard",
         result: "failure",
-        details: {
-          // The intent that failed to commit, and the fact that the live state
-          // was rolled back to the prior (durable) value.
-          attempted_enabled: requirement !== null,
-          rolled_back_to_enabled: priorRequirement !== null,
-          rolled_back_generation: priorGeneration,
-        },
+        details: { attempted_nonce: nextNonce, stage: "initiate" },
       });
       throw err;
+    }
+    this.armFederationGuardianBreakGlassPoll();
+  }
+
+  /**
+   * F1 E1: a single guardian (any 1-of-N in the current pinned roster) vetoes
+   * the in-flight break-glass countdown. One valid signature is sufficient
+   * (the deliberate asymmetry: easy to stop a teardown, hard to perform one).
+   * On success the countdown is aborted, the nonce burns (so the SAME
+   * authorization can never be replayed to re-arm), and the requirement is
+   * left UNCHANGED.
+   */
+  async vetoFederationGuardianBreakGlass(
+    approval: unknown,
+  ): Promise<BreakGlassVetoDecision> {
+    const state = this._federationGuardianBreakGlass;
+    const current = this._federationGuardianRevocationRequirement;
+    if (state === null || current === null) {
+      return {
+        vetoed: false,
+        reason: "guardian_signoff_invalid",
+        detail: "no break-glass countdown is currently armed",
+      };
+    }
+    const decision = evaluateGuardianBreakGlassVeto({
+      requirement: current,
+      fortressId: current.roster.fortress_id,
+      disableNonce: state.nonce,
+      approval,
+    });
+    if (!decision.vetoed) {
+      await this.auditLog?.appendCritical({
+        layer: "l2",
+        operation: "federation_guardian_break_glass_veto_refused",
+        identity_id: "dashboard",
+        result: "failure",
+        details: { nonce: state.nonce, reason: decision.reason, detail: decision.detail },
+      });
+      return decision;
+    }
+    await this.terminateFederationGuardianBreakGlass({
+      outcome: "vetoed",
+      guardianId: decision.guardianId,
+    });
+    return decision;
+  }
+
+  /**
+   * F1 E1: operator-only abort of the in-flight break-glass countdown. This is
+   * how an operator whose guardians (or master key) came back online abandons
+   * the slow path and instead uses the instant quorum/master-key path. Same
+   * effect as a veto (nonce burns, requirement unchanged) but attributed to the
+   * operator rather than a guardian.
+   */
+  async cancelFederationGuardianBreakGlass(): Promise<void> {
+    if (this._federationGuardianBreakGlass === null) {
+      throw new GuardianDisableGateRefusedError(
+        "break_glass_not_armed",
+        "no break-glass countdown is currently armed",
+      );
+    }
+    await this.terminateFederationGuardianBreakGlass({ outcome: "cancelled" });
+  }
+
+  /**
+   * F1: terminal-transition helper for veto/cancel/complete.
+   *
+   *   - `"completed"` routes through the single chokepoint
+   *     {@link commitGuardianRequirementTransition} as a
+   *     `break_glass_complete` transition, so the requirement/latch mutation is
+   *     applied by the ONE mutator (never a second direct write). Break-glass is
+   *     DISABLE-ONLY (OR-1: lower is refused at initiate), so completion always
+   *     installs null.
+   *   - `"vetoed"` / `"cancelled"` leave the requirement + latch UNCHANGED; they
+   *     only clear the break-glass state and burn the nonce, so they keep their
+   *     own break-glass-only terminal path (they do NOT route through the
+   *     requirement chokepoint). H1 fix preserved: the generation is bumped in
+   *     the SAME set as clearing the break-glass state.
+   */
+  private async terminateFederationGuardianBreakGlass(params: {
+    outcome: "vetoed" | "cancelled" | "completed";
+    guardianId?: string;
+  }): Promise<void> {
+    const state = this._federationGuardianBreakGlass;
+    if (state === null) return;
+    this.stopFederationGuardianBreakGlassPoll();
+
+    if (params.outcome === "completed") {
+      // Defensive: break-glass is disable-only (a lower is refused at initiate),
+      // so any armed countdown must carry intent "disable". Reject a lingering
+      // "lower" state rather than silently completing it (OR-1 regression guard).
+      if (state.intent !== "disable") {
+        this.armFederationGuardianBreakGlassPoll();
+        return;
+      }
+      // Route the requirement/latch mutation through the ONE chokepoint. The
+      // chokepoint bumps the generation, burns the nonce, clears the break-glass
+      // state (t.kind === "break_glass_complete"), audits, and persists (with
+      // rollback on failure). On a persist failure it throws AFTER re-arming
+      // nothing, so we re-arm the poll here to preserve the "never silently
+      // stuck armed" guarantee.
+      try {
+        await this.commitGuardianRequirementTransition({
+          kind: "break_glass_complete",
+          intent: "disable",
+          targetM: state.targetM,
+        });
+      } catch {
+        // The chokepoint already rolled back the coupled fields (including the
+        // break-glass state back to ARMED) and audited the failure; re-arm the
+        // poll so completion retries on the next tick.
+        this.armFederationGuardianBreakGlassPoll();
+      }
+      return;
+    }
+
+    // veto / cancel: break-glass-only terminal path. The requirement + latch are
+    // UNCHANGED; only the break-glass state clears and the nonce burns.
+    const priorGeneration = this._federationGuardianRevocationRequirementGeneration;
+    const priorBreakGlass = state;
+    const priorDisableNonce = this._federationGuardianDisableNonce;
+
+    this._federationGuardianRevocationRequirementGeneration = priorGeneration + 1;
+    this._federationGuardianBreakGlass = null;
+    this._federationGuardianDisableNonce = Math.max(
+      this._federationGuardianDisableNonce,
+      state.nonce,
+    );
+
+    const operation =
+      params.outcome === "vetoed"
+        ? "federation_guardian_break_glass_vetoed"
+        : "federation_guardian_break_glass_cancelled";
+    await this.auditLog?.appendCritical({
+      layer: "l2",
+      operation,
+      identity_id: params.guardianId ?? "dashboard",
+      result: "success",
+      details: {
+        nonce: state.nonce,
+        intent: state.intent,
+        target_m: state.targetM,
+        generation: this._federationGuardianRevocationRequirementGeneration,
+        ...(params.guardianId ? { guardian_id: params.guardianId } : {}),
+      },
+    });
+
+    try {
+      await this.persistFederationSyncState();
+    } catch (err) {
+      this._federationGuardianRevocationRequirementGeneration = priorGeneration;
+      this._federationGuardianBreakGlass = priorBreakGlass;
+      this._federationGuardianDisableNonce = priorDisableNonce;
+      await this.auditLog?.appendCritical({
+        layer: "l2",
+        operation: "federation_guardian_break_glass_persist_failed",
+        identity_id: "dashboard",
+        result: "failure",
+        details: { nonce: state.nonce, stage: params.outcome },
+      });
+      // Re-arm the poll: the break-glass was rolled back to ARMED and the poll
+      // was stopped above; keep the countdown alive so it is never silently
+      // stuck (the caller sees the throw and may retry the SAME veto/cancel).
+      this.armFederationGuardianBreakGlassPoll();
+      throw err;
+    }
+  }
+
+  /**
+   * F1 E1: (re)arm the in-process poll that drives break-glass completion.
+   * There is no durable OS-level scheduler in this codebase (mirrors
+   * `startFederationNodeCertificateAutoRenewal`): each tick re-checks the
+   * DURABLE `completesAt` against the current time, so a missed tick, a
+   * restart, or a slow interval can only ever DELAY completion, never shorten
+   * it. Call on initiate AND on boot rehydrate (so a countdown armed before a
+   * restart resumes from its persisted `completesAt`, never reset, never
+   * cancelled, and never requiring guardian input to re-arm).
+   */
+  private armFederationGuardianBreakGlassPoll(
+    intervalMs = FEDERATION_BREAK_GLASS_POLL_INTERVAL_MS,
+  ): void {
+    this.stopFederationGuardianBreakGlassPoll();
+    const tick = (): void => {
+      void this.tickFederationGuardianBreakGlass();
+    };
+    const timer = setInterval(tick, intervalMs);
+    timer.unref?.();
+    this._federationBreakGlassPoll = timer;
+    // Fire an immediate tick too so a boot re-arm with an ALREADY-elapsed
+    // completesAt (the daemon was down past the deadline) completes promptly
+    // rather than waiting a full interval.
+    tick();
+  }
+
+  private stopFederationGuardianBreakGlassPoll(): void {
+    if (this._federationBreakGlassPoll !== null) {
+      clearInterval(this._federationBreakGlassPoll);
+      this._federationBreakGlassPoll = null;
+    }
+  }
+
+  /**
+   * F1 E1: one poll tick. Emits the periodic heartbeat audit while armed (so a
+   * suppressed audit trail leaves a detectable gap), and applies completion
+   * ONLY when the countdown has durably elapsed AND the F3 latch is clear. A
+   * latched/unavailable sync-state record does NOT auto-complete (M2 fix): the
+   * requirement stays as it was, fail-closed, and the poll keeps running so it
+   * can complete once the operator clears the latch (e.g. via a re-pin, which
+   * recovers the F3 latch on the increase path).
+   */
+  private async tickFederationGuardianBreakGlass(): Promise<void> {
+    if (this._federationBreakGlassTickInFlight) return;
+    this._federationBreakGlassTickInFlight = true;
+    try {
+      await this.tickFederationGuardianBreakGlassInner();
+    } finally {
+      this._federationBreakGlassTickInFlight = false;
+    }
+  }
+
+  private async tickFederationGuardianBreakGlassInner(): Promise<void> {
+    const state = this._federationGuardianBreakGlass;
+    if (state === null) {
+      this.stopFederationGuardianBreakGlassPoll();
+      return;
+    }
+    await this.auditLog?.appendCritical({
+      layer: "l2",
+      operation: "federation_guardian_break_glass_tick",
+      identity_id: "dashboard",
+      result: "success",
+      details: {
+        nonce: state.nonce,
+        completes_at: state.completesAt,
+        elapsed: breakGlassElapsed(state, Date.now()),
+      },
+    });
+    if (!breakGlassElapsed(state, Date.now())) return;
+    if (
+      this._federationSyncStateUnavailable ||
+      this._federationGuardianRevocationRequirementInvalid
+    ) {
+      // Fail closed: do NOT complete while the durable record is unavailable
+      // or the requirement failed to re-verify. Stay COUNTDOWN; the next tick
+      // (or the operator recovering the latch) will re-evaluate.
+      return;
+    }
+    try {
+      await this.terminateFederationGuardianBreakGlass({ outcome: "completed" });
+    } catch {
+      // terminateFederationGuardianBreakGlass already audited the failure and
+      // re-armed the poll; swallow here so the interval callback never throws.
     }
   }
 
@@ -2182,12 +2872,85 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationSyncStateUnavailable = true;
       return;
     }
+    // FIX 2 (P0): ADD an independent deletion signal for the guardian-requirement
+    // case, which the root-revocation-history heuristic above MISSES. A fortress
+    // that enabled a guardian requirement but never performed a root revocation
+    // has NO independent revocation history, so deleting its sync-state record
+    // used to boot un-latched -> rehydrate(null) cleared the requirement -> the
+    // kill hook returned null -> single-operator kill was silently restored. The
+    // tamper-evident "established" sentinel closes it: if a guardian requirement
+    // was EVER configured (per the MAC'd `_meta` marker) but the sync-state
+    // record is now absent, the record was deleted - fail closed regardless of
+    // root-revocation history. A read fault on the sentinel also fails closed.
+    // Finding #6 (tamper-evident sentinel, tri-state): read the sentinel once and
+    // branch on absent/established/invalid. A read fault fails closed.
+    let established: { status: "absent" } | { status: "established" } | { status: "invalid" };
+    try {
+      established = await store.guardianRequirementEstablished();
+    } catch {
+      this._federationSyncStateUnavailable = true;
+      return;
+    }
+    if (!recordPresent) {
+      // Record ABSENT. Both "established" (FIX 2, the deletion signal) AND
+      // "invalid" (Finding #6, a corrupted sentinel that used to read as absent
+      // and boot fresh) now LATCH: with the record gone there is nothing to
+      // legitimize a marker we cannot attribute to the current master, so a
+      // corrupt-marker + absent-record is the attack, not a rotation. Only a
+      // genuinely absent marker falls through (a fresh fortress, or a guard
+      // configured before this fix which the record-present backfill below would
+      // have protected on a prior boot).
+      if (established.status === "established" || established.status === "invalid") {
+        this._federationSyncStateUnavailable = true;
+        return;
+      }
+    }
     let snapshot: FederationSyncStateSnapshot;
     try {
       snapshot = await store.load();
     } catch {
       // Present-but-corrupt -> fail closed. Do NOT touch the live fields (no
       // half-applied state); latch unavailability so every sync path denies.
+      this._federationSyncStateUnavailable = true;
+      return;
+    }
+    // Finding #3 (pre-upgrade backfill) + Finding #6 (record-present re-stamp).
+    // We are on the RECORD-PRESENT path (load succeeded). Two record-present
+    // cases need a sentinel WRITE, both idempotent and grow-only:
+    //   - the durable record configures a guard (guardianRevocationRequirement
+    //     !== null) but the sentinel is ABSENT: a guard was configured before
+    //     this fix shipped (or a crash landed the record without the sentinel per
+    //     finding #2). Backfill it now so a subsequent record-delete is caught
+    //     from the NEXT boot onward.
+    //   - the sentinel is INVALID under the current master while the record IS
+    //     present: this is the legitimate post-rotation stale-marker case (the
+    //     record proves the guard is real and current-master-decryptable), so
+    //     re-stamp a clean marker rather than brick.
+    // A write fault fails closed. (Backfill closes the window from the next boot
+    // on; it does NOT retroactively protect a record deleted before the fortress
+    // ever boots under the fixed binary. That residual is irreducible without an
+    // off-host witness, identical to the epoch-witness delete-both residual.)
+    if (
+      (snapshot.guardianRevocationRequirement !== null &&
+        established.status === "absent") ||
+      established.status === "invalid"
+    ) {
+      try {
+        await store.markGuardianRequirementEstablished();
+      } catch {
+        this._federationSyncStateUnavailable = true;
+        return;
+      }
+    }
+    // Finding #1 + §8: reconcile the security-load-bearing floors against the
+    // external anti-rollback anchor AND the guardian audit-trail floor, and LATCH
+    // fail-closed on ANY regression, BEFORE adopting the snapshot's floors. Pass
+    // the established-sentinel status so the §8.6 scoped-latch rule can tell a
+    // never-guarded fortress (do not brick on an unrelated audit finding) from
+    // one that ever configured a guard (fail closed on a coverage finding).
+    if (
+      await this.reconcileGuardianAntiRollbackFloors(store, snapshot, established.status)
+    ) {
       this._federationSyncStateUnavailable = true;
       return;
     }
@@ -2238,10 +3001,42 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ),
     };
     this.projectAppliedPoliciesOntoRoster();
+    // FIX 1: adopt the DEDICATED superseded-lowering high-water floor BEFORE
+    // rehydrate so the rehydrate check can reject a below-floor lowered record.
+    // Never regress it across a restart (a Math.max floor, like every other
+    // replay floor in this record). This high-water advances ONLY when a
+    // lowering was actually dropped, so - unlike the general disable nonce - it
+    // does NOT trip on a lowered fortress that armed break-glass mid-countdown.
+    this._federationGuardianLoweredHighWater = Math.max(
+      this._federationGuardianLoweredHighWater,
+      snapshot.guardianLoweredHighWater,
+    );
     this.rehydrateGuardianRevocationRequirement(
       snapshot.guardianRevocationRequirement,
       snapshot.guardianRevocationRequirementGeneration,
     );
+    // F1: never regress the disable-gate nonce floor across a restart (same
+    // treatment as every other replay floor in this record). OR-2 (build-
+    // critical): fold in the LOWERED-THRESHOLD record's nonce too, so a replayed
+    // old lowered-M record carrying a below-floor nonce (A3) can never be
+    // accepted - the floor now covers all three nonce-bearing sub-objects
+    // (guardianDisableNonce, break-glass nonce (below), and the lowered record).
+    this._federationGuardianDisableNonce = Math.max(
+      this._federationGuardianDisableNonce,
+      snapshot.guardianDisableNonce,
+      snapshot.guardianRevocationRequirement?.loweredThreshold?.body.disable_nonce ?? 0,
+    );
+    // Boot re-arm (8.4 / design 5.3): a break-glass armed before a restart
+    // resumes from its persisted completesAt, NEVER reset, NEVER cancelled,
+    // and requires no guardian input to re-arm. If the daemon was down PAST
+    // the deadline, the immediate tick inside armFederationGuardianBreakGlassPoll
+    // completes it promptly (still gated on the F3 latch check in the tick).
+    this._federationGuardianBreakGlass = snapshot.guardianBreakGlass;
+    if (snapshot.guardianBreakGlass !== null) {
+      this.armFederationGuardianBreakGlassPoll();
+    } else {
+      this.stopFederationGuardianBreakGlassPoll();
+    }
   }
 
   /**
@@ -2268,6 +3063,255 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * F1 re-gate (§1 + §8): reconcile the security-load-bearing guardian sync-state
+   * floors against BOTH the external `_meta` anti-rollback anchor (§1) AND the
+   * guardian AUDIT-trail floor (§8). Returns `true` when a rollback is
+   * positively detected and the caller MUST LATCH fail-closed; `false` when the
+   * floors are consistent (no regression).
+   *
+   * The threat (§1): every guardian floor (`guardianLoweredHighWater`,
+   * `guardianDisableNonce`, the requirement generation) is a `Math.max` floor
+   * that lives INSIDE the same rollbackable `_federation/sync-state-v1` blob as
+   * the record it gates. A KEYLESS filesystem attacker captures an OLD copy of
+   * that blob and, after the operator raises the threshold back up, restores it,
+   * regressing the floor to the old blob's value.
+   *
+   *   - The external anchor (§1) catches the SINGLE-record restore (blob alone):
+   *     the anchor lives in a SEPARATE `_meta` location the blob restore does not
+   *     touch, so `blob.floor < anchor.floor` is a positively-detected rollback.
+   *   - The audit-trail floor (§8) catches the TWO-record restore (blob + anchor
+   *     BOTH rolled back): the finding-#1 attack requires a guardian transition
+   *     (the raise) between capture and restore, which increments the requirement
+   *     GENERATION and is critically audited BEFORE persist. The audit trail
+   *     durably remembers the highest generation reached, in a location the
+   *     two-record anchor+blob restore does NOT touch, so `blob.generation <
+   *     auditFloor.generation` is a positively-detected rollback.
+   *
+   * FAIL DIRECTION: an "invalid" (present-but-tampered) anchor latches; an
+   * unreadable/failed-integrity audit read fails TOWARD latch (never toward a
+   * spuriously-low floor). A forged HIGH audit entry only causes an over-latch
+   * (fail-closed = safe); LOWERING the audit floor requires DELETING higher
+   * guardian entries, which is audit truncation, caught separately by the audit
+   * head-anchor machinery.
+   *
+   * NO federation->core master coupling: the store retains only
+   * `derivePurposeKey(master, "federation-sync-state")`, never the raw master; the
+   * anchor MACs under that purpose key, and the audit floor is a read-only
+   * composition over the integrity-judged audit log the dashboard already holds.
+   */
+  private async reconcileGuardianAntiRollbackFloors(
+    store: FederationSyncStateStore,
+    snapshot: FederationSyncStateSnapshot,
+    establishedStatus: "absent" | "established" | "invalid",
+  ): Promise<boolean> {
+    // Read the external anchor (tri-state). A present-but-tampered anchor is a
+    // positively-detected tamper: latch. Absent is neutral (pre-fix / first
+    // boot). A read fault is surfaced as "invalid" by the store (fail toward
+    // latch).
+    const anchor = await store.readGuardianAntiRollbackAnchor();
+    if (anchor.status === "invalid") return true;
+    const anchorFloor =
+      anchor.status === "valid"
+        ? {
+            loweredHighWater: anchor.data.lowered_high_water,
+            disableNonce: anchor.data.disable_nonce,
+            generation: anchor.data.requirement_generation,
+          }
+        : { loweredHighWater: 0, disableNonce: 0, generation: 0 };
+
+    // §8: derive the audit-witnessed floor over the WHOLE verified guardian audit
+    // set (window-independent, §8.6 P0). Unreadable / coverage-compromised ->
+    // fail TOWARD latch (returns null -> latch).
+    const auditFloor = await this.deriveGuardianFloorFromAudit(establishedStatus);
+    if (auditFloor === null) return true;
+
+    // Regression detection: the on-disk blob floors must be >= both witnesses.
+    // The blob floor for the generation is the persisted generation; for the
+    // nonce/lowered-high-water it is the persisted snapshot fields.
+    const blobLoweredHighWater = snapshot.guardianLoweredHighWater;
+    const blobDisableNonce = snapshot.guardianDisableNonce;
+    const blobGeneration = snapshot.guardianRevocationRequirementGeneration;
+
+    if (
+      // §1 anchor regressions.
+      blobLoweredHighWater < anchorFloor.loweredHighWater ||
+      blobDisableNonce < anchorFloor.disableNonce ||
+      blobGeneration < anchorFloor.generation ||
+      // §8 audit-floor regressions (generation is the robust primary witness;
+      // the other two are best-effort reinforcement, 0 when not recoverable).
+      blobGeneration < auditFloor.generation ||
+      blobLoweredHighWater < auditFloor.loweredHighWater ||
+      blobDisableNonce < auditFloor.disableNonce
+    ) {
+      return true; // positively-detected rollback -> latch fail-closed
+    }
+    return false;
+  }
+
+  /**
+   * §8 + §8.6: derive the audit-witnessed guardian floor from the
+   * INTEGRITY-VERIFIED guardian audit entries. Returns `null` when the audit
+   * COVERAGE could be compromised such that a guardian entry might be hidden or a
+   * higher generation removed (the caller fails TOWARD latch), and a neutral
+   * `{0,0,0}` floor when there is no guardian audit history at all (no first-boot
+   * false positive; mirrors the epoch-witness "absent -> neutral").
+   *
+   * Primary witness = the requirement GENERATION recorded on every committed
+   * guardian transition (`details.generation`); it is monotonic. disable_nonce /
+   * the break-glass nonce are best-effort reinforcement when recoverable.
+   *
+   * §8.6 P0 (WINDOW-INDEPENDENT): the read must cover the WHOLE verified chain,
+   * not a bounded recent tail. The prior `query({layer:"l2", limit:1000})` sliced
+   * the last 1000 l2 entries AFTER the layer filter, so on a busy l2 layer (>1000
+   * l2 entries since the last guardian transition, the normal steady state) the
+   * guardian raise fell out of the window and the floor collapsed to 0 with ZERO
+   * findings (benign forward growth, not a truncation) -> a two-record restore
+   * landed. We instead stream the ENTIRE surviving verified chain
+   * ({@link AuditLog.streamVerifiedChain}, which is window-independent by
+   * construction and yields each entry's chain SEQUENCE) and take the max
+   * generation over ALL guardian entries. Guardian transitions are rare +
+   * monotonic, so this is cheap.
+   *
+   * §8.6 P1 (SCOPED integrity latch): `streamVerifiedChain` throws
+   * `AuditIntegrityError` in strict mode when the chain does not verify; we catch
+   * it and SCOPE the fail-closed decision to findings that could hide a guardian
+   * entry, rather than latching on ANY finding. We fail TOWARD latch when a
+   * COVERAGE/structural finding is present (truncation / gap / anchor /
+   * checkpoint), OR any finding sits at-or-above the lowest guardian entry's
+   * sequence, OR a finding lacks a sequence. A benign in-place single-entry
+   * corruption STRICTLY BELOW every guardian entry (with no coverage finding)
+   * does NOT latch: the guardian set is complete and each guardian entry
+   * individually hash-verifies, so the max generation is trustworthy. When NO
+   * guardian entries are found and only a coverage finding is present, we latch
+   * ONLY when the established-sentinel says a guard was ever configured (else a
+   * never-guarded fortress is not bricked by an unrelated l2 finding).
+   */
+  private async deriveGuardianFloorFromAudit(
+    establishedStatus: "absent" | "established" | "invalid",
+  ): Promise<
+    | { generation: number; disableNonce: number; loweredHighWater: number }
+    | null
+  > {
+    const auditLog = this.auditLog;
+    if (auditLog === null) {
+      // No audit log wired (minimal in-memory rig): no audit witness to compose.
+      // Neutral floor, exactly like "no guardian audit history".
+      return { generation: 0, disableNonce: 0, loweredHighWater: 0 };
+    }
+
+    // Collect guardian entries WITH their chain sequence over the WHOLE verified
+    // chain. `onEntry` fires only after each entry is decrypt + hash verified, so
+    // a collected guardian entry's `details` are individually trustworthy even if
+    // the FULL-CHAIN (coverage) check later throws. `reset` drops an abandoned
+    // torn-read pass so the kept set is exactly the single accepted pass.
+    let guardianEntries: Array<{
+      sequence: number;
+      generation: number;
+      disableNonce: number;
+    }> = [];
+    const collect = (item: { sequence: number; entry: AuditEntry }): void => {
+      // §8.7 P0 DRIFT-PROOF MATCHER (fixes the round-2 op-name coverage gap):
+      // do NOT depend on a hardcoded op-name set (which omitted the veto/cancel
+      // ops even though they bump + audit the committed generation, re-opening
+      // finding #1). Instead, structurally witness EVERY generation-bumping
+      // guardian transition, current AND future, by matching ANY audit entry
+      // whose operation is prefixed `federation_guardian_`, whose result is
+      // "success" (a rolled-back FAILURE never committed a generation), and that
+      // carries a valid non-negative-integer committed `generation`. Every
+      // guardian emit sets `generation` to the CURRENT committed value, so this
+      // set's max is always <= the true committed max (never over-latches), and a
+      // keyless attacker cannot forge a valid MAC'd audit entry to inflate it. A
+      // non-generation-bearing entry (e.g. the break-glass tick) is skipped by the
+      // generation check, so it never enters the floor.
+      const entry = item.entry;
+      if (!entry.operation.startsWith(GUARDIAN_AUDIT_OP_PREFIX)) return;
+      if (entry.result !== "success") return;
+      const details = entry.details;
+      if (details === undefined) return;
+      const gen = details.generation;
+      if (typeof gen !== "number" || !Number.isSafeInteger(gen) || gen < 0) return;
+      let disableNonce = 0;
+      for (const field of ["disable_nonce", "nonce"] as const) {
+        const v = details[field];
+        if (typeof v === "number" && Number.isSafeInteger(v) && v > disableNonce) {
+          disableNonce = v;
+        }
+      }
+      guardianEntries.push({ sequence: item.sequence, generation: gen, disableNonce });
+    };
+
+    let findings: readonly AuditIntegrityFinding[] = [];
+    try {
+      await auditLog.streamVerifiedChain({
+        onEntry: collect,
+        reset: () => {
+          guardianEntries = [];
+        },
+      });
+    } catch (err) {
+      if (err instanceof AuditIntegrityError) {
+        // The chain did not verify. Keep the guardian entries the (final) pass
+        // streamed and SCOPE the latch decision to `err.findings` below.
+        findings = err.findings;
+      } else {
+        // A non-integrity failure (storage unreadable, etc.): fail toward latch.
+        return null;
+      }
+    }
+
+    // The floor = max generation / disable-nonce over ALL guardian entries.
+    let generation = 0;
+    let disableNonce = 0;
+    let lowestGuardianSeq = Number.POSITIVE_INFINITY;
+    for (const g of guardianEntries) {
+      if (g.generation > generation) generation = g.generation;
+      if (g.disableNonce > disableNonce) disableNonce = g.disableNonce;
+      if (g.sequence < lowestGuardianSeq) lowestGuardianSeq = g.sequence;
+    }
+    const haveGuardianEntries = guardianEntries.length > 0;
+
+    // §8.6 P1: scope the fail-closed decision to findings that could HIDE a
+    // guardian entry or remove a higher generation.
+    if (findings.length > 0) {
+      // Guard-configured but NO guardian entry recovered from the trail while
+      // findings are present: the guardian evidence itself may have been the
+      // corrupted/hidden entry (a corrupted guardian entry never reaches onEntry).
+      // Fail TOWARD latch. A never-guarded fortress (sentinel not established)
+      // with an unrelated finding is NOT bricked (falls through to the scoped
+      // per-finding checks, where a non-coverage below-only finding is benign).
+      if (!haveGuardianEntries && establishedStatus === "established") {
+        return null;
+      }
+      for (const f of findings) {
+        // A coverage/structural finding can hide a guardian entry anywhere ->
+        // fail toward latch.
+        if (GUARDIAN_AUDIT_COVERAGE_FINDING_KINDS.has(f.kind)) {
+          // Exception: when NO guardian entries exist AND the fortress never
+          // configured a guard, an unrelated l2 coverage finding must not brick a
+          // never-guarded fortress (neutral). (The guard-configured + no-guardian
+          // case already returned null above.)
+          if (!haveGuardianEntries && establishedStatus !== "established") {
+            continue;
+          }
+          return null;
+        }
+        // A finding lacking a sequence cannot be proven below the guardian set ->
+        // fail toward latch (conservative).
+        if (f.sequence === undefined) return null;
+        // A finding AT OR ABOVE the lowest guardian entry could alter/hide a
+        // higher-generation guardian raise -> fail toward latch. (When there are
+        // guardian entries; the no-guardian cases are handled above.)
+        if (f.sequence >= lowestGuardianSeq) return null;
+      }
+    }
+
+    // loweredHighWater is not directly recorded per guardian audit entry today,
+    // so it stays 0 (best-effort reinforcement per §8.2). The GENERATION floor
+    // alone catches the two-record restore, which is the load-bearing guarantee.
+    return { generation, disableNonce, loweredHighWater: 0 };
+  }
+
+  /**
    * Restore the operator's guardian revocation requirement from the durable
    * snapshot, FAIL-CLOSED. The persisted requirement carries the
    * fortress-master-signed roster verbatim; we re-verify that signature against
@@ -2283,6 +3327,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *     this into "no requirement" would be a silent security downgrade.
    *   - no pinned master available yet -> latch invalid (fail closed) rather than
    *     enforce an unverified requirement.
+   *   - a lowered-threshold record is PRESENT but does NOT verify against the
+   *     pinned master (§3.4 step 4a) -> latch invalid. A lowered record that does
+   *     not verify is exactly the tamper case; it must not silently drop to
+   *     `roster.m` (which would RAISE the kill threshold the operator lowered)
+   *     nor be enforced unverified.
+   *
+   * Because the roster's signed body is NEVER mutated to represent a lowering
+   * (INV-B), the roster's own signature re-verifies clean here for a lowered
+   * fortress - closing fail-open #2 (the pre-fix mutated-`m` roster
+   * self-invalidated on reboot).
    */
   private rehydrateGuardianRevocationRequirement(
     persisted: GuardianRevocationRequirement | null,
@@ -2315,6 +3369,56 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationGuardianRevocationRequirement = null;
       this._federationGuardianRevocationRequirementInvalid = true;
       return;
+    }
+    // §3.4 step 4a: verify the lowered-threshold record (if present) against the
+    // pinned master - domain, fortress, roster-version binding, range, signature.
+    // Any failure latches invalid (a lowered record that does not verify is the
+    // tamper case). Absent -> effective M = roster.m (safe default).
+    if (persisted.loweredThreshold !== undefined) {
+      const fortressId = this._federationContext?.fortressId ?? null;
+      const decision =
+        fortressId === null
+          ? { valid: false as const, reason: "federation_not_provisioned" }
+          : verifyLoweredThresholdAuthorization({
+              authorization: persisted.loweredThreshold,
+              fortressId,
+              rosterVersion: persisted.roster.version,
+              rosterM: persisted.roster.m,
+              pinnedMaster,
+            });
+      if (!decision.valid) {
+        this._federationGuardianRevocationRequirement = null;
+        this._federationGuardianRevocationRequirementInvalid = true;
+        return;
+      }
+      // FIX 1 (A3 replay, reboot leg): even a SIGNATURE-VALID lowered record must
+      // be REFUSED when its nonce is at-or-below the dedicated superseded-
+      // lowering high-water. That is the replayed, already-dropped lowering
+      // (lower to M', raise back, re-inject the still-valid-signed old record):
+      // the signature, roster-version, and range all still pass, so the OTHER
+      // checks above let it through - only the high-water catches it. A
+      // signature-valid-but-stale lowered record is the tamper case, so fail
+      // closed (latch invalid); we do NOT silently drop to `roster.m` (which
+      // would still honor the attacker's re-injection as a "no lowering"
+      // downgrade of the operator's intent) nor accept the stale lowering.
+      //
+      // The comparison is `<=` because the high-water is set to the EXACT nonce
+      // of a lowering that was DROPPED (not one-past it): a record whose nonce
+      // equals the high-water is precisely the record that was superseded. This
+      // does NOT false-reject a currently-valid lowering: the high-water only
+      // ever advances to a DROPPED record's nonce, and it uses the DEDICATED
+      // high-water (adopted just above), NOT the general disable nonce - so a
+      // freshly-installed lowering always carries a nonce STRICTLY ABOVE the
+      // high-water, and a lowered fortress that armed break-glass and rebooted
+      // mid-countdown (which does NOT advance this high-water) is never rejected.
+      if (
+        persisted.loweredThreshold.body.disable_nonce <=
+        this._federationGuardianLoweredHighWater
+      ) {
+        this._federationGuardianRevocationRequirement = null;
+        this._federationGuardianRevocationRequirementInvalid = true;
+        return;
+      }
     }
     this._federationGuardianRevocationRequirement = persisted;
     this._federationGuardianRevocationRequirementInvalid = false;
@@ -2366,6 +3470,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // carrying an older generation cannot clobber this requirement.
       guardianRevocationRequirementGeneration:
         this._federationGuardianRevocationRequirementGeneration,
+      // F1 E1: the disable-gate anti-replay nonce floor + the in-flight
+      // break-glass state, if armed. The break-glass sub-object travels under
+      // the SAME generation stamped above (H1 fix): every break-glass mutation
+      // bumps that same counter in the same set, so the two can never diverge
+      // across a rotate-root merge.
+      guardianDisableNonce: this._federationGuardianDisableNonce,
+      // FIX 1: the dedicated superseded-lowering high-water (see the field doc).
+      guardianLoweredHighWater: this._federationGuardianLoweredHighWater,
+      guardianBreakGlass: this._federationGuardianBreakGlass,
     };
   }
 
@@ -2761,6 +3874,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       (node) => node.trust_boundary.provider_in_trust_boundary,
     );
     const teeAttested = nodes.some((node) => node.tee_attested === true);
+    const breakGlass = this._federationGuardianBreakGlass;
     return {
       version: NODE_TRUST_BOUNDARY_VERSION,
       local_nodes: localNodes,
@@ -2770,6 +3884,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       provider_in_trust_boundary: providerInTrustBoundary,
       tee_attested: teeAttested,
       disclosure: operatorCloudNodes > 0 ? OPERATOR_CLOUD_DISCLOSURE : null,
+      guardian_break_glass:
+        breakGlass === null
+          ? { active: false }
+          : {
+              active: true,
+              intent: breakGlass.intent,
+              target_m: breakGlass.targetM,
+              initiated_at: breakGlass.initiatedAt,
+              completes_at: breakGlass.completesAt,
+              time_remaining_ms: Math.max(0, Date.parse(breakGlass.completesAt) - Date.now()),
+            },
     };
   }
 
@@ -3187,6 +4312,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.sessionCleanupTimer = null;
     }
     this.stopFederationCertificateAutoRenewal();
+    this.stopFederationGuardianBreakGlassPoll();
 
     // Clean up rate limit tracking
     this.rateLimits.clear();

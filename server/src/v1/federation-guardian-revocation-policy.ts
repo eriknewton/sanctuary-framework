@@ -44,7 +44,15 @@ import type {
   GuardianRoster,
 } from "../mesh/guardian/types.js";
 import type { FortressMasterPublicKey } from "../mesh/types.js";
-import type { GuardianRevocationRequirement } from "./federation-revocation-guardian-gate.js";
+import {
+  LOWERED_THRESHOLD_AUTHORIZATION_DOMAIN,
+  type GuardianRevocationRequirement,
+  type LoweredThresholdAuthorization,
+} from "./federation-revocation-guardian-gate.js";
+// FIX 4: re-verify the lowered record's master signature on this verified path.
+// This is a clean directed edge (policy -> disable-gate -> revocation-gate);
+// disable-gate does NOT import policy, so no cycle is introduced.
+import { verifyLoweredThresholdAuthorization } from "./federation-guardian-disable-gate.js";
 
 /**
  * The at-rest JSON shape of a persisted guardian revocation requirement. Carries
@@ -63,6 +71,17 @@ export interface PersistedGuardianRevocationRequirement {
   roster: PersistedGuardianRoster;
   /** Optional pinned expected roster version (extra stale-roster guard). */
   expected_roster_version?: number;
+  /**
+   * OPTIONAL master-signed lowered effective-M record (F1 chokepoint slice).
+   * ADDITIVE + optional on read: a pre-lower `v:1` record omits it and decodes
+   * with `loweredThreshold` absent -> effective M = `roster.m`. NO new HKDF
+   * label, NO `v` bump, NO migration - it rides inside this same requirement
+   * sub-object under the same generation selector so the roster and its
+   * lowered-M can never decouple across a rotate-root merge. The roster's own
+   * signed body is NEVER mutated to represent the lowering (INV-B). PRESENT-
+   * but-malformed THROWS (same fail-closed-on-corrupt contract as the roster).
+   */
+  lowered_threshold?: LoweredThresholdAuthorization;
 }
 
 interface PersistedGuardianRoster {
@@ -115,6 +134,15 @@ export function encodeGuardianRevocationRequirement(
   if (requirement.expectedRosterVersion !== undefined) {
     persisted.expected_roster_version = requirement.expectedRosterVersion;
   }
+  if (requirement.loweredThreshold !== undefined) {
+    // The lowered-threshold record is carried VERBATIM (its own master signature
+    // rides along) so it can be re-verified against the pinned master on load,
+    // exactly like the roster's `master_signature`.
+    persisted.lowered_threshold = {
+      body: { ...requirement.loweredThreshold.body },
+      signature: requirement.loweredThreshold.signature,
+    };
+  }
   return persisted;
 }
 
@@ -155,12 +183,98 @@ export function decodeGuardianRevocationRequirement(
       );
     }
   }
+  // Optional on read (a pre-lower v1 record omits it -> undefined -> effective M
+  // = roster.m). PRESENT-but-malformed THROWS (never accept a half-decoded
+  // lowered record). Signature re-verification against the pinned master is done
+  // by the consumer on rehydrate, mirroring the roster's own re-verification.
+  const loweredThreshold = decodeLoweredThreshold(obj.lowered_threshold);
   return {
     v: 1,
     roster,
     ...(expectedRosterVersion !== undefined
       ? { expected_roster_version: expectedRosterVersion }
       : {}),
+    ...(loweredThreshold !== undefined
+      ? { lowered_threshold: loweredThreshold }
+      : {}),
+  };
+}
+
+/**
+ * Structurally decode the optional lowered-threshold record. Returns
+ * `undefined` when absent (legitimate back-compat) and throws when present-but-
+ * malformed. Does NOT verify the master signature (the pinned master is not
+ * available at pure-decode time); the consumer re-verifies on rehydrate.
+ */
+function decodeLoweredThreshold(
+  value: unknown,
+): LoweredThresholdAuthorization | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new GuardianRevocationPolicyDecodeError(
+      "lowered_threshold is not an object",
+    );
+  }
+  const obj = value as Record<string, unknown>;
+  const body = obj.body;
+  const signature = obj.signature;
+  if (typeof signature !== "string" || signature.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError(
+      "lowered_threshold signature is invalid",
+    );
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new GuardianRevocationPolicyDecodeError(
+      "lowered_threshold body is not an object",
+    );
+  }
+  const b = body as Record<string, unknown>;
+  if (b.domain !== LOWERED_THRESHOLD_AUTHORIZATION_DOMAIN) {
+    throw new GuardianRevocationPolicyDecodeError(
+      "lowered_threshold body domain is invalid",
+    );
+  }
+  if (typeof b.fortress_id !== "string" || b.fortress_id.length === 0) {
+    throw new GuardianRevocationPolicyDecodeError(
+      "lowered_threshold body fortress_id is invalid",
+    );
+  }
+  if (
+    typeof b.roster_version !== "number" ||
+    !Number.isSafeInteger(b.roster_version) ||
+    b.roster_version < 1
+  ) {
+    throw new GuardianRevocationPolicyDecodeError(
+      "lowered_threshold body roster_version is invalid",
+    );
+  }
+  if (
+    typeof b.effective_m !== "number" ||
+    !Number.isSafeInteger(b.effective_m) ||
+    b.effective_m < 1
+  ) {
+    throw new GuardianRevocationPolicyDecodeError(
+      "lowered_threshold body effective_m is invalid",
+    );
+  }
+  if (
+    typeof b.disable_nonce !== "number" ||
+    !Number.isSafeInteger(b.disable_nonce) ||
+    b.disable_nonce < 0
+  ) {
+    throw new GuardianRevocationPolicyDecodeError(
+      "lowered_threshold body disable_nonce is invalid",
+    );
+  }
+  return {
+    body: {
+      domain: LOWERED_THRESHOLD_AUTHORIZATION_DOMAIN,
+      fortress_id: b.fortress_id,
+      roster_version: b.roster_version,
+      effective_m: b.effective_m,
+      disable_nonce: b.disable_nonce,
+    },
+    signature,
   };
 }
 
@@ -169,6 +283,16 @@ export function decodeGuardianRevocationRequirement(
  * project it into the live {@link GuardianRevocationRequirement} the gate
  * consumes. FAIL-CLOSED: a roster that does not verify yields `kind: "invalid"`,
  * never a silent `kind: "none"`.
+ *
+ * FIX 4 (P2): the lowered-threshold record (if present) is ALSO re-verified here
+ * against the pinned master - domain, fortress, roster-version binding, range,
+ * and Ed25519 signature - before it is copied into the `kind: "verified"`
+ * requirement. Previously this path copied `lowered_threshold` VERBATIM, so any
+ * consumer that trusted `kind: "verified"` and thresholded on
+ * `effectiveThresholdM` would have honored an UNVERIFIED lowered record (a
+ * latent trap: only test code calls this today, but the verified contract must
+ * be honest). A lowered record that does not verify is the tamper case and
+ * yields `kind: "invalid"`, exactly like a roster that does not verify.
  */
 export function verifyLoadedGuardianRevocationRequirement(
   persisted: PersistedGuardianRevocationRequirement | undefined,
@@ -188,6 +312,28 @@ export function verifyLoadedGuardianRevocationRequirement(
   const requirement: GuardianRevocationRequirement = { roster };
   if (persisted.expected_roster_version !== undefined) {
     requirement.expectedRosterVersion = persisted.expected_roster_version;
+  }
+  if (persisted.lowered_threshold !== undefined) {
+    // FIX 4: fail-closed re-verification of the lowered record's OWN master
+    // signature, so this `kind: "verified"` path never returns an unverified
+    // lowering. Mirrors the boot rehydrate check in dashboard.ts.
+    const decision = verifyLoweredThresholdAuthorization({
+      authorization: persisted.lowered_threshold,
+      fortressId: roster.fortress_id,
+      rosterVersion: roster.version,
+      rosterM: roster.m,
+      pinnedMaster,
+    });
+    if (!decision.valid) {
+      return {
+        kind: "invalid",
+        reason: `lowered threshold failed to verify: ${decision.reason}`,
+      };
+    }
+    requirement.loweredThreshold = {
+      body: { ...persisted.lowered_threshold.body },
+      signature: persisted.lowered_threshold.signature,
+    };
   }
   return { kind: "verified", requirement };
 }

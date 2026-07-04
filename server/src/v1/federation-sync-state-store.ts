@@ -55,7 +55,15 @@ import type { StorageBackend } from "../storage/interface.js";
 import { withCrossProcessLock } from "../storage/cross-process-lock.js";
 import { encrypt, decrypt, type EncryptedPayload } from "../core/encryption.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
-import { bytesToString, stringToBytes } from "../core/encoding.js";
+import { hmacSha256 } from "../core/hashing.js";
+import {
+  bytesToString,
+  stringToBytes,
+  toBase64url,
+  fromBase64url,
+  constantTimeEqual,
+} from "../core/encoding.js";
+import { canonicalJson } from "../audit/chain.js";
 import type { FederationAppliedPolicyVersion } from "./federation-policy-bundle.js";
 import {
   decodeGuardianRevocationRequirement,
@@ -63,6 +71,7 @@ import {
   type PersistedGuardianRevocationRequirement,
 } from "./federation-guardian-revocation-policy.js";
 import type { GuardianRevocationRequirement } from "./federation-revocation-guardian-gate.js";
+import type { BreakGlassState } from "./federation-guardian-disable-gate.js";
 
 /**
  * At-rest location + HKDF label for the durable sync-state record. ADDITIVE and
@@ -87,6 +96,114 @@ export const FEDERATION_SYNC_STATE_STORE_HKDF_INFO =
  * completes. The leading dot keeps it out of normal record enumeration.
  */
 export const FEDERATION_SYNC_STATE_LOCK_FILE = ".sync-state.lock";
+
+/**
+ * FIX 2 (P0): the tamper-evident "a guardian revocation requirement was EVER
+ * configured" sentinel. Written under `_meta` when the operator first ENABLES a
+ * guardian requirement; NEVER cleared (a guard having once existed is a
+ * grow-only fact). On boot, if this sentinel is present but the sync-state
+ * record is ABSENT, the record was DELETED to strip a configured guard - the
+ * caller fails closed (latches the sync state unavailable) REGARDLESS of whether
+ * the fortress has independent root-revocation history. This closes the
+ * fail-open where a fortress that configured a guardian requirement but never
+ * performed a root revocation had its record deleted -> boot did NOT latch ->
+ * the requirement cleared -> single-operator kill restored.
+ *
+ * It mirrors the audit head-anchor "established marker" pattern
+ * (`audit-head-anchor-established-v1`): the marker's PRESENCE is the signal, and
+ * it is MAC'd under the fortress master (via the store's existing purpose key -
+ * NO new HKDF label) so it cannot be forged by an attacker without the master
+ * key, and a stale marker from a PRIOR master (after a legitimate rotation) does
+ * not verify and so does not falsely brick. Residual (documented, matches the
+ * audit-anchor residual): an attacker who deletes BOTH the sync-state record AND
+ * this `_meta` sentinel is again indistinguishable from a fresh fortress; the
+ * marker raises the bar from "delete one file" to "delete two", and the second
+ * deletion is itself the established->gone signature for any future ceremony
+ * that carries an off-host witness.
+ */
+export const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY =
+  "federation-guardian-requirement-established-v1";
+/**
+ * Domain-separated HMAC input for the established sentinel. The MAC is over this
+ * fixed string using the store's existing purpose key (the same key that
+ * encrypts the sync-state blob) - no new key material, no new HKDF label.
+ */
+const FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN =
+  "sanctuary.federation.guardian-requirement.established.v1";
+
+/**
+ * F1 re-gate (§1): the EXTERNAL, MAC'd, monotonic anti-rollback ANCHOR for the
+ * security-load-bearing guardian sync-state floors. It lives in `_meta` (a
+ * SEPARATE deletable namespace from the `_federation/sync-state-v1` blob it
+ * protects), so a KEYLESS filesystem attacker who captures an OLD copy of the
+ * sync-state blob and restores it AFTER the operator raised the threshold back
+ * up cannot silently regress the floor: on load we take `Math.max(blob, anchor)`
+ * and LATCH fail-closed on any regression. Mirrors the shipped
+ * `core/anti-rollback.ts` epoch-witness precedent (`custody-epoch-witness-v1`):
+ * the `{marker,data,mac}` record shape, the tri-state read (valid/absent/
+ * invalid), and the non-decreasing write are copied verbatim; NO new crypto
+ * scheme is invented.
+ *
+ * HONEST RESIDUAL (§8.3, round 2, do not over-claim): Anti-rollback covers a
+ * KEYLESS same-master filesystem attacker. A single-record rollback (the
+ * sync-state blob alone) is caught by the external `_meta` anchor; a two-record
+ * restore (blob + anchor BOTH rolled back) is caught by the guardian AUDIT-trail
+ * floor, which is derived WINDOW-INDEPENDENTLY over the WHOLE verified chain (not
+ * a bounded tail, §8.6 P0), so a surviving guardian raise entry is always found
+ * regardless of how much unrelated audit volume was appended after it. The
+ * irreducible residual is therefore specifically a coordinated restore that ALSO
+ * truncates or removes the guardian audit entries themselves (together with the
+ * audit head anchor + its established marker and the checkpoints), i.e. a
+ * wholesale guardian-audit-coverage destruction. That truncation is surfaced as a
+ * coverage integrity finding (empty/truncated chain) that fails the floor TOWARD
+ * latch UNLESS the attacker ALSO rolls the audit head anchor (`__head_anchor`, a
+ * single overwrite-in-place key with no on-disk rollback protection of its own)
+ * back to the MAC-valid OLD head that matches the truncated tail: with the head
+ * anchor consistently rolled back the truncated chain re-verifies with ZERO
+ * findings, so no coverage finding fires and the restore is on-disk-undetectable.
+ * That fully-coordinated case (blob + anchor + old head anchor + established
+ * marker rolled back AND the raise entry deleted) is bounded only by an OFF-HOST
+ * or HARDWARE witness (anti-rollback Stage 2b / Stage 4). Do NOT claim on-disk
+ * detection of a full self-consistent tree+audit restore that ALSO removes the
+ * guardian audit trail and rolls the head anchor back consistently.
+ */
+export const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY =
+  "federation-guardian-antirollback-anchor-v1";
+const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER =
+  "__sanctuary_federation_guardian_antirollback_anchor_v1";
+const FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MAC_DOMAIN =
+  "sanctuary.federation.guardian-antirollback-anchor.v1\n";
+
+/**
+ * The monotonic floors carried in the anti-rollback anchor. Each mirrors a
+ * `Math.max` floor that also lives inside the rollbackable sync-state blob; the
+ * anchor is the external witness that keeps the blob from silently regressing
+ * them. `updated_at` is advisory provenance only (NOT compared).
+ */
+export interface GuardianAntiRollbackAnchorData {
+  /** Floor for `guardianLoweredHighWater` (the superseded-lowering replay floor). */
+  lowered_high_water: number;
+  /** Floor for `guardianDisableNonce` (the general burned-nonce floor). */
+  disable_nonce: number;
+  /** Floor for `guardianRevocationRequirementGeneration` (the config generation). */
+  requirement_generation: number;
+  /** Advisory provenance only (never part of the monotonic comparison). */
+  updated_at: string;
+}
+
+/**
+ * Tri-state read of the anti-rollback anchor, mirroring `readEpochWitness`
+ * (`core/anti-rollback.ts`):
+ *  - "valid": authenticates under the store's purpose key -> a trustworthy floor.
+ *  - "absent": no anchor record at all (pre-fix fortress, or first boot).
+ *  - "invalid": present but tampered/malformed/wrong-key -> the caller LATCHES
+ *    fail-closed (present-but-untrusted is a positively-detected tamper, never
+ *    read as absent).
+ */
+export type GuardianAntiRollbackAnchorRead =
+  | { status: "valid"; data: GuardianAntiRollbackAnchorData }
+  | { status: "absent" }
+  | { status: "invalid" };
 
 /** The derived security state this store persists and rehydrates. */
 export interface FederationSyncStateSnapshot {
@@ -136,6 +253,55 @@ export interface FederationSyncStateSnapshot {
    * ever set).
    */
   guardianRevocationRequirementGeneration: number;
+  /**
+   * F1 E1: monotonic anti-replay counter for the guardian DISABLE-gate (distinct
+   * from {@link guardianRevocationRequirementGeneration}, which tracks the
+   * requirement's own config generation). Burns (advances) on every terminal
+   * disable-gate transition (instant quorum/master-key authorize, break-glass
+   * vetoed, break-glass cancelled, break-glass completed) so a quorum or
+   * master-key signature collected for a consumed nonce can never be replayed.
+   * Merged by `Math.max` (same treatment as `highestEvictionSerial`) AS A FLOOR;
+   * the authoritative live value while a break-glass is armed is
+   * `guardianBreakGlass.nonce` (see that field's doc for why the two can never
+   * disagree). Defaults to 0 (fresh fortress / gate never used).
+   */
+  guardianDisableNonce: number;
+  /**
+   * FIX 1 (A3 replay, reboot leg): a DEDICATED monotonic high-water for
+   * SUPERSEDED lowered-threshold records, distinct from {@link
+   * guardianDisableNonce}. It advances ONLY when a lowering is actually dropped
+   * (a raise/re-pin that removes a prior lowered record, or a decrease that
+   * replaces one) - NOT on a break-glass initiate (which advances the general
+   * disable nonce while leaving a present lowered record intact). On reboot the
+   * consumer REJECTS a persisted lowered record whose `disable_nonce` is below
+   * this high-water (a replayed, already-superseded lowering). Keying it off the
+   * general disable nonce would falsely reject a legitimately-lowered fortress
+   * that armed break-glass and rebooted mid-countdown. Merged by `Math.max` (a
+   * floor that never regresses). Defaults to 0 (no lowering ever superseded).
+   */
+  guardianLoweredHighWater: number;
+  /**
+   * F1 E1: the in-flight break-glass countdown, or `null` when IDLE (no
+   * countdown armed). NOT grow-only (it is set on initiate and cleared on
+   * veto/cancel/complete), so - exactly like {@link guardianRevocationRequirement}
+   * - it CANNOT be merged by union or `Math.max`. It travels under the SAME
+   * generation counter as the requirement
+   * ({@link guardianRevocationRequirementGeneration}), and it is a HARD,
+   * TESTED invariant that EVERY break-glass transition (initiate, veto, cancel,
+   * complete) bumps that shared generation exactly like the dashboard setter
+   * already does for the requirement itself. This is required so the
+   * sub-object and the generation integer can never decouple: if a transition
+   * changed `guardianBreakGlass` without bumping the generation, two on-disk
+   * states could tie at the same generation with different break-glass
+   * payloads, and the `nextGen > baseGen` merge could not tell them apart. With
+   * the shared-bump invariant held, the existing generation-selector logic
+   * (`selectGuardianRevocationRequirementByGeneration`, extended below to also
+   * carry this field) is sufficient: a stale writer's lower generation can
+   * never clobber a fresher armed-or-cleared break-glass state, and the
+   * `guardianBreakGlass.nonce` it carries is therefore always the authoritative
+   * live nonce (never behind the `guardianDisableNonce` floor).
+   */
+  guardianBreakGlass: BreakGlassState | null;
 }
 
 interface PersistedSyncState {
@@ -178,6 +344,35 @@ interface PersistedSyncState {
    * higher generation so a stale writer cannot clobber a fresher requirement.
    */
   guardian_revocation_requirement_generation?: number;
+  /**
+   * F1 E1. Optional on read (a pre-E1 record omits it -> 0). Merged as a
+   * `Math.max` floor; see {@link FederationSyncStateSnapshot.guardianDisableNonce}.
+   */
+  guardian_disable_nonce?: number;
+  /**
+   * FIX 1. Optional on read (a pre-fix record omits it -> 0). Merged as a
+   * `Math.max` floor; see {@link
+   * FederationSyncStateSnapshot.guardianLoweredHighWater}. ADDITIVE within the
+   * existing v1 record (the enclosing AEAD tag still authenticates it), NO `v`
+   * bump, NO new HKDF label, NO migration.
+   */
+  guardian_lowered_high_water?: number;
+  /**
+   * F1 E1. Optional on read (a pre-E1 record omits it, or a fresh IDLE state,
+   * both decode to `null`: no countdown armed). Rides under the SAME generation
+   * as `guardian_revocation_requirement_generation`; see
+   * {@link FederationSyncStateSnapshot.guardianBreakGlass}.
+   */
+  guardian_break_glass?: PersistedBreakGlassState | null;
+}
+
+interface PersistedBreakGlassState {
+  nonce: number;
+  intent: "disable" | "lower";
+  target_m: number | null;
+  initiated_at: string;
+  completes_at: string;
+  delay_ms: number;
 }
 
 interface PersistedAppliedPolicyVersion {
@@ -208,6 +403,9 @@ export function emptyFederationSyncState(): FederationSyncStateSnapshot {
     appliedPolicyVersions: new Map(),
     guardianRevocationRequirement: null,
     guardianRevocationRequirementGeneration: 0,
+    guardianDisableNonce: 0,
+    guardianLoweredHighWater: 0,
+    guardianBreakGlass: null,
   };
 }
 
@@ -272,6 +470,212 @@ export class FederationSyncStateStore {
   async recordExists(): Promise<boolean> {
     const raw = await this.storage.read(this.namespace, this.recordKey);
     return raw !== null;
+  }
+
+  /** The MAC bytes over the fixed established-sentinel domain, base64url. */
+  private guardianRequirementEstablishedMac(): string {
+    return toBase64url(
+      hmacSha256(
+        this.encryptionKey,
+        stringToBytes(FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_MAC_DOMAIN),
+      ),
+    );
+  }
+
+  /**
+   * FIX 2: idempotently record that a guardian revocation requirement was EVER
+   * configured on this fortress. Called when the operator first ENABLES a
+   * requirement (the enable transition), BEFORE/at the first persist. Writes a
+   * small MAC'd marker under `_meta` that is NEVER cleared. Best-effort within
+   * the enable path's own fail-closed persist: the caller awaits it so a write
+   * fault surfaces. Writing again with the same key is harmless (same bytes).
+   */
+  async markGuardianRequirementEstablished(): Promise<void> {
+    const envelope = { v: 1, mac: this.guardianRequirementEstablishedMac() };
+    await this.storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+      stringToBytes(JSON.stringify(envelope)),
+    );
+  }
+
+  /**
+   * FIX 2 + Finding #6 (tri-state, tamper-evident): has a guardian requirement
+   * EVER been configured on this fortress (per the tamper-evident `_meta`
+   * sentinel)? The return contract distinguishes ABSENT from PRESENT-BUT-INVALID
+   * so the hydrate path can fail closed on tamper instead of booting fresh.
+   *
+   *   - "absent": no marker at all (fresh fortress, or a fortress that never
+   *     enabled a guard). Not anomalous on its own; a guard-in-record still
+   *     backfills per finding #3.
+   *   - "established": present AND its MAC verifies under the current master's
+   *     purpose key. A guard was configured; if the sync-state record is now
+   *     absent, the caller fails closed.
+   *   - "invalid": present but unparseable, malformed, OR MAC-mismatched. The
+   *     MAC-mismatch case is EITHER tamper OR a stale marker from a PRIOR master
+   *     after a legitimate rotation; we CANNOT distinguish the two here (doing so
+   *     would brick a rotated fortress), so we return "invalid" and let the
+   *     CALLER combine it with `recordPresent`: record-ABSENT + marker-invalid is
+   *     the attack (LATCH); record-PRESENT + marker-invalid is the rotation case
+   *     (re-stamp a clean marker). This is the same combine-with-independent-
+   *     evidence move the epoch-witness uses.
+   *
+   * A read fault (not a clean absence) PROPAGATES so the caller can fail closed
+   * rather than mis-read a transient backend error as "never established".
+   */
+  async guardianRequirementEstablished(): Promise<
+    { status: "absent" } | { status: "established" } | { status: "invalid" }
+  > {
+    const raw = await this.storage.read(
+      "_meta",
+      FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
+    );
+    if (raw === null) return { status: "absent" };
+    let parsed: { mac?: unknown };
+    try {
+      parsed = JSON.parse(bytesToString(raw)) as { mac?: unknown };
+    } catch {
+      // Present-but-unparseable = tamper (a legit marker is always well-formed
+      // JSON). NOT read as absent: the caller latches when the record is gone.
+      return { status: "invalid" };
+    }
+    if (typeof parsed.mac !== "string") return { status: "invalid" };
+    if (parsed.mac === this.guardianRequirementEstablishedMac()) {
+      return { status: "established" };
+    }
+    // Present, well-formed, but the MAC mismatches under the CURRENT master:
+    // tamper OR a stale marker from a prior master (legit rotation). We cannot
+    // hard-latch on mismatch alone (that would brick a rotated fortress), so we
+    // return "invalid" and let the caller key the fail-closed decision on
+    // recordPresent (see the hydrate rule in dashboard.ts).
+    return { status: "invalid" };
+  }
+
+  /** The MAC bytes over the anti-rollback anchor `data`, base64url. */
+  private guardianAntiRollbackAnchorMac(
+    data: GuardianAntiRollbackAnchorData,
+  ): string {
+    return toBase64url(
+      hmacSha256(
+        this.encryptionKey,
+        stringToBytes(
+          FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MAC_DOMAIN + canonicalJson(data),
+        ),
+      ),
+    );
+  }
+
+  /**
+   * F1 re-gate (§1): read + authenticate the external anti-rollback anchor,
+   * tri-state, mirroring `readEpochWitness`. "invalid" (present-but-tampered)
+   * makes the caller LATCH fail-closed; "absent" is neutral (pre-fix / first
+   * boot). A read FAULT (storage throws) is treated as "invalid" (fail toward
+   * latch), never as "absent": an anchor we cannot read is one we cannot trust.
+   */
+  async readGuardianAntiRollbackAnchor(): Promise<GuardianAntiRollbackAnchorRead> {
+    let raw: Uint8Array | null;
+    try {
+      raw = await this.storage.read(
+        "_meta",
+        FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+      );
+    } catch {
+      // Unreadable storage is an anchor we cannot trust -> suspected, not absent.
+      return { status: "invalid" };
+    }
+    if (raw === null) return { status: "absent" };
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      (parsed as Record<string, unknown>)[
+        FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER
+      ] !== true
+    ) {
+      return { status: "invalid" };
+    }
+    const obj = parsed as Record<string, unknown>;
+    const data = obj.data as Partial<GuardianAntiRollbackAnchorData> | undefined;
+    const mac = obj.mac;
+    if (
+      !data ||
+      typeof data !== "object" ||
+      !isNonNegSafeInt(data.lowered_high_water) ||
+      !isNonNegSafeInt(data.disable_nonce) ||
+      !isNonNegSafeInt(data.requirement_generation) ||
+      typeof data.updated_at !== "string" ||
+      typeof mac !== "string"
+    ) {
+      return { status: "invalid" };
+    }
+    const fullData: GuardianAntiRollbackAnchorData = {
+      lowered_high_water: data.lowered_high_water,
+      disable_nonce: data.disable_nonce,
+      requirement_generation: data.requirement_generation,
+      updated_at: data.updated_at,
+    };
+    let provided: Uint8Array;
+    try {
+      provided = fromBase64url(mac);
+    } catch {
+      return { status: "invalid" };
+    }
+    if (
+      !constantTimeEqual(
+        provided,
+        fromBase64url(this.guardianAntiRollbackAnchorMac(fullData)),
+      )
+    ) {
+      return { status: "invalid" };
+    }
+    return { status: "valid", data: fullData };
+  }
+
+  /**
+   * F1 re-gate (§1): persist (or RAISE) the anti-rollback anchor. The anchor is
+   * MONOTONIC: it NEVER regresses. Each field is folded `Math.max` over the
+   * currently-authenticated anchor, so a caller passing floors LOWER than what is
+   * already anchored leaves the higher values in place (a lower write can never
+   * launder a rollback). Mirrors `writeEpochWitness`'s non-decreasing guard. An
+   * "invalid" current anchor is treated as absent for the raise (we re-establish
+   * a clean anchor at the supplied floors); the hydrate-side latch is what
+   * catches a tampered anchor, not this writer.
+   */
+  async writeGuardianAntiRollbackAnchor(floors: {
+    loweredHighWater: number;
+    disableNonce: number;
+    requirementGeneration: number;
+    now?: () => Date;
+  }): Promise<void> {
+    const current = await this.readGuardianAntiRollbackAnchor();
+    const prior =
+      current.status === "valid"
+        ? current.data
+        : { lowered_high_water: 0, disable_nonce: 0, requirement_generation: 0 };
+    const data: GuardianAntiRollbackAnchorData = {
+      lowered_high_water: Math.max(prior.lowered_high_water, floors.loweredHighWater),
+      disable_nonce: Math.max(prior.disable_nonce, floors.disableNonce),
+      requirement_generation: Math.max(
+        prior.requirement_generation,
+        floors.requirementGeneration,
+      ),
+      updated_at: (floors.now ?? (() => new Date()))().toISOString(),
+    };
+    const record = {
+      [FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_MARKER]: true,
+      data,
+      mac: this.guardianAntiRollbackAnchorMac(data),
+    };
+    await this.storage.write(
+      "_meta",
+      FEDERATION_GUARDIAN_ANTIROLLBACK_ANCHOR_KEY,
+      stringToBytes(JSON.stringify(record)),
+    );
   }
 
   /**
@@ -364,6 +768,22 @@ export class FederationSyncStateStore {
         // committed state with a stale subset.
         const onDisk = await this.load();
         const merged = mergeSyncStateMonotonic(onDisk, snapshot);
+        // F1 re-gate (§1 / §3A write-ordering): ADVANCE the external anti-rollback
+        // anchor to the merged floors BEFORE writing the blob, inside this same
+        // cross-process lock. The anchor is non-decreasing (never lowers), so this
+        // is idempotent and safe under the lock. Ordering matters: the only
+        // interrupted-crash state (anchor advanced, blob not yet written) is the
+        // SAFE direction, a higher anchor over a lower blob, which the hydrate
+        // reconcile LATCHES fail-closed (the operator's next persist re-writes the
+        // blob at the anchor floor and clears the latch). The dangerous direction
+        // (blob advanced past the anchor) is impossible because the anchor is
+        // written first and never lowered. Mirrors the epoch-witness "witness leads
+        // the protected record" ordering.
+        await this.writeGuardianAntiRollbackAnchor({
+          loweredHighWater: merged.guardianLoweredHighWater,
+          disableNonce: merged.guardianDisableNonce,
+          requirementGeneration: merged.guardianRevocationRequirementGeneration,
+        });
         const persisted: PersistedSyncState = {
           v: 1,
           accepted_high_water: [...merged.acceptedHighWater],
@@ -385,6 +805,11 @@ export class FederationSyncStateStore {
             : null,
           guardian_revocation_requirement_generation:
             merged.guardianRevocationRequirementGeneration,
+          guardian_disable_nonce: merged.guardianDisableNonce,
+          guardian_lowered_high_water: merged.guardianLoweredHighWater,
+          guardian_break_glass: merged.guardianBreakGlass
+            ? encodeBreakGlassState(merged.guardianBreakGlass)
+            : null,
         };
         const serialized = stringToBytes(JSON.stringify(persisted));
         try {
@@ -431,7 +856,21 @@ function cloneSnapshot(
     guardianRevocationRequirementGeneration:
       (snapshot as Partial<FederationSyncStateSnapshot>)
         .guardianRevocationRequirementGeneration ?? 0,
+    guardianDisableNonce:
+      (snapshot as Partial<FederationSyncStateSnapshot>).guardianDisableNonce ?? 0,
+    guardianLoweredHighWater:
+      (snapshot as Partial<FederationSyncStateSnapshot>).guardianLoweredHighWater ?? 0,
+    guardianBreakGlass: cloneBreakGlassState(
+      (snapshot as Partial<FederationSyncStateSnapshot>).guardianBreakGlass ?? null,
+    ),
   };
+}
+
+function cloneBreakGlassState(
+  state: BreakGlassState | null | undefined,
+): BreakGlassState | null {
+  if (state === null || state === undefined) return null;
+  return { ...state };
 }
 
 function cloneGuardianRevocationRequirement(
@@ -446,6 +885,12 @@ function cloneGuardianRevocationRequirement(
   };
   if (requirement.expectedRosterVersion !== undefined) {
     cloned.expectedRosterVersion = requirement.expectedRosterVersion;
+  }
+  if (requirement.loweredThreshold !== undefined) {
+    cloned.loweredThreshold = {
+      body: { ...requirement.loweredThreshold.body },
+      signature: requirement.loweredThreshold.signature,
+    };
   }
   return cloned;
 }
@@ -525,16 +970,51 @@ function mergeSyncStateMonotonic(
     // lower generation can never lower or clobber a fresher on-disk value; the
     // store's locked read-modify-write re-reads the on-disk generation, so the
     // fresher value always wins the merge regardless of interleaving.
+    //
+    // F1 E1: guardianBreakGlass travels under the SAME generation (see that
+    // field's doc for why every break-glass transition MUST bump it), so the
+    // exact same selector resolves both fields atomically - they can never
+    // diverge across a rotate-root merge (H1 fix).
     ...selectGuardianRevocationRequirementByGeneration(base, next),
+    // F1 E1: guardianDisableNonce is a Math.max FLOOR (same treatment as
+    // highestEvictionSerial), independent of the generation selector. It exists
+    // so a burned nonce can never regress even if a break-glass sub-object is
+    // momentarily absent (e.g. just after completion, before the next
+    // generation-carried write); the AUTHORITATIVE live nonce while a
+    // break-glass is armed is `guardianBreakGlass.nonce` (H2 fix - the two
+    // cannot disagree because both derive from the same monotonically-bumped
+    // source of truth in the dashboard).
+    guardianDisableNonce: Math.max(base.guardianDisableNonce, next.guardianDisableNonce),
+    // FIX 1: the dedicated superseded-lowering high-water is a Math.max FLOOR,
+    // independent of the generation selector, exactly like guardianDisableNonce.
+    // A stale cross-process writer can never regress it below an already-
+    // superseded lowering's nonce.
+    guardianLoweredHighWater: Math.max(
+      base.guardianLoweredHighWater,
+      next.guardianLoweredHighWater,
+    ),
   };
 }
 
 /**
- * Choose the guardian revocation requirement + its generation by the HIGHER
- * generation counter. On a tie (neither writer bumped the generation) the values
- * are identical, so `base` is kept deterministically. This is the stale-clobber
- * guard: `base` is the freshly re-read on-disk state and `next` is the caller's
- * (possibly stale) snapshot; a stale `next` carries an OLD generation and loses.
+ * Choose the guardian revocation requirement + its generation + its in-flight
+ * break-glass state, ALL THREE, by the HIGHER generation counter. On a tie
+ * (neither writer bumped the generation) the values are identical, so `base`
+ * is kept deterministically. This is the stale-clobber guard: `base` is the
+ * freshly re-read on-disk state and `next` is the caller's (possibly stale)
+ * snapshot; a stale `next` carries an OLD generation and loses.
+ *
+ * F1 E1 (H1 fix): `guardianBreakGlass` is folded into this SAME selector
+ * rather than merged independently, because it is not grow-only either (armed
+ * -> cleared is a valid transition) and it must never decouple from the
+ * generation integer. Every break-glass-mutating call site in dashboard.ts
+ * (initiate/veto/cancel/complete) bumps
+ * `_federationGuardianRevocationRequirementGeneration` in the SAME set as it
+ * mutates `_federationGuardianBreakGlass`, exactly mirroring how the setter
+ * already bumps the generation on every requirement change - so a rotate-root
+ * CLI persist carrying a stale (lower-generation) break-glass snapshot always
+ * loses to a concurrently-committed dashboard transition, and can never revive
+ * a cancelled/completed countdown nor silently drop an armed one.
  */
 function selectGuardianRevocationRequirementByGeneration(
   base: FederationSyncStateSnapshot,
@@ -542,6 +1022,7 @@ function selectGuardianRevocationRequirementByGeneration(
 ): {
   guardianRevocationRequirement: GuardianRevocationRequirement | null;
   guardianRevocationRequirementGeneration: number;
+  guardianBreakGlass: BreakGlassState | null;
 } {
   const baseGen = base.guardianRevocationRequirementGeneration;
   const nextGen = next.guardianRevocationRequirementGeneration;
@@ -551,6 +1032,7 @@ function selectGuardianRevocationRequirementByGeneration(
       winner.guardianRevocationRequirement,
     ),
     guardianRevocationRequirementGeneration: Math.max(baseGen, nextGen),
+    guardianBreakGlass: cloneBreakGlassState(winner.guardianBreakGlass),
   };
 }
 
@@ -612,6 +1094,25 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
           obj.guardian_revocation_requirement_generation,
           "guardian_revocation_requirement_generation",
         );
+  // F1 E1 fields. Optional on read (a pre-E1 record omits them). Absent ->
+  // nonce 0 / no break-glass armed (NOT a corruption). PRESENT-but-malformed
+  // THROWS (same fail-closed-on-corrupt contract as every other optional field
+  // in this record).
+  const guardianDisableNonce =
+    obj.guardian_disable_nonce === undefined
+      ? 0
+      : decodeNonNegativeInt(obj.guardian_disable_nonce, "guardian_disable_nonce");
+  // FIX 1: optional on read (a pre-fix record omits it -> 0). PRESENT-but-
+  // malformed THROWS (same fail-closed-on-corrupt contract as every other
+  // optional field in this record).
+  const guardianLoweredHighWater =
+    obj.guardian_lowered_high_water === undefined
+      ? 0
+      : decodeNonNegativeInt(
+          obj.guardian_lowered_high_water,
+          "guardian_lowered_high_water",
+        );
+  const guardianBreakGlass = decodeBreakGlassState(obj.guardian_break_glass);
 
   return {
     acceptedHighWater,
@@ -624,6 +1125,64 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     appliedPolicyVersions,
     guardianRevocationRequirement,
     guardianRevocationRequirementGeneration,
+    guardianDisableNonce,
+    guardianLoweredHighWater,
+    guardianBreakGlass,
+  };
+}
+
+function encodeBreakGlassState(state: BreakGlassState): PersistedBreakGlassState {
+  return {
+    nonce: state.nonce,
+    intent: state.intent,
+    target_m: state.targetM,
+    initiated_at: state.initiatedAt,
+    completes_at: state.completesAt,
+    delay_ms: state.delayMs,
+  };
+}
+
+function decodeBreakGlassState(value: unknown): BreakGlassState | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new FederationSyncStateStoreError("guardian_break_glass is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const nonce = obj.nonce;
+  const intent = obj.intent;
+  const targetM = obj.target_m;
+  const initiatedAt = obj.initiated_at;
+  const completesAt = obj.completes_at;
+  const delayMs = obj.delay_ms;
+  if (typeof nonce !== "number" || !Number.isSafeInteger(nonce) || nonce < 0) {
+    throw new FederationSyncStateStoreError("guardian_break_glass nonce is invalid");
+  }
+  if (intent !== "disable" && intent !== "lower") {
+    throw new FederationSyncStateStoreError("guardian_break_glass intent is invalid");
+  }
+  if (targetM !== null && (typeof targetM !== "number" || !Number.isSafeInteger(targetM))) {
+    throw new FederationSyncStateStoreError("guardian_break_glass target_m is invalid");
+  }
+  if (typeof initiatedAt !== "string" || initiatedAt.length === 0) {
+    throw new FederationSyncStateStoreError(
+      "guardian_break_glass initiated_at is invalid",
+    );
+  }
+  if (typeof completesAt !== "string" || completesAt.length === 0) {
+    throw new FederationSyncStateStoreError(
+      "guardian_break_glass completes_at is invalid",
+    );
+  }
+  if (typeof delayMs !== "number" || !Number.isSafeInteger(delayMs) || delayMs < 0) {
+    throw new FederationSyncStateStoreError("guardian_break_glass delay_ms is invalid");
+  }
+  return {
+    nonce,
+    intent,
+    targetM: targetM ?? null,
+    initiatedAt,
+    completesAt,
+    delayMs,
   };
 }
 
@@ -643,6 +1202,16 @@ function projectPersistedRequirement(
   };
   if (persisted.expected_roster_version !== undefined) {
     requirement.expectedRosterVersion = persisted.expected_roster_version;
+  }
+  // Carry the lowered-threshold record verbatim (its own master signature rides
+  // along) so the consumer can re-verify it against the pinned master on
+  // rehydrate, exactly like the roster's `master_signature`. Absent -> effective
+  // M = roster.m.
+  if (persisted.lowered_threshold !== undefined) {
+    requirement.loweredThreshold = {
+      body: { ...persisted.lowered_threshold.body },
+      signature: persisted.lowered_threshold.signature,
+    };
   }
   return requirement;
 }
@@ -802,6 +1371,11 @@ function decodeNonNegativeInt(value: unknown, label: string): number {
     throw new FederationSyncStateStoreError(`${label} is invalid`);
   }
   return value;
+}
+
+/** Non-throwing non-negative-safe-integer check for the anchor tri-state read. */
+function isNonNegSafeInt(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 function publicErrorReason(err: unknown): string {

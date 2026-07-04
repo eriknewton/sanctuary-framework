@@ -1275,6 +1275,10 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       reason:
         "sentinel background watcher: windowed read on its own cadence; internal scoring.",
     },
+    // NOTE (F1 anti-rollback §8.6 round 2): dashboard.deriveGuardianFloorFromAudit
+    // does NOT use auditLog.query at all. It reads the WHOLE verified chain via
+    // streamVerifiedChain (window-independent per §8.6 P0), which is not one of
+    // the query sites this tripwire discovers, so it needs no query-escape row.
     // ── operator-per-request: deliberately per-request operator reads ───────
     {
       module: "principal-policy/dashboard.ts",

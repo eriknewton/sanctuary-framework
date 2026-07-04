@@ -132,8 +132,27 @@ export function evaluateThreshold(params: {
   approvals: GuardianApproval[];
   roster: GuardianRoster;
   signing_input: ApprovalSigningInput;
+  /**
+   * OPTIONAL effective threshold override (F1 lowered-M). When supplied, the
+   * valid-signature count is compared against this integer instead of
+   * `roster.m`; the roster's SIGNED body is untouched (it is still verified
+   * byte-for-byte against the pinned master upstream). This is how a
+   * master-signed lowered-M record lowers the kill threshold WITHOUT forging the
+   * roster. Absent -> `roster.m` (unchanged behavior). It is a strict LOWERING
+   * ceiling: `min(effective_m, roster.m)` is used so an out-of-range override
+   * can never RAISE the threshold above the issued `m` (defense in depth; the
+   * mint-time verifier already bounds it to `<= roster.m`).
+   */
+  effective_m?: number;
 }): ThresholdEvaluationResult {
   const { approvals, roster, signing_input } = params;
+  // The effective threshold: a supplied lowered-M (clamped so it can never
+  // exceed the issued roster.m), else roster.m. `threshold_m` in the result is
+  // reported as this effective value for honest posture display.
+  const effectiveM =
+    params.effective_m !== undefined
+      ? Math.min(params.effective_m, roster.m)
+      : roster.m;
 
   // Fail-closed shape gate: a threshold decision compares a validated-approval
   // count against roster.m, so a structurally invalid roster must be rejected
@@ -148,7 +167,7 @@ export function evaluateThreshold(params: {
     return {
       threshold_met: false,
       valid_count: 0,
-      threshold_m: roster.m,
+      threshold_m: effectiveM,
       total_n: roster.n,
       valid_guardian_ids: [],
       invalid_guardian_ids: approvals.map((a) => a.guardian_id),
@@ -163,7 +182,7 @@ export function evaluateThreshold(params: {
     return {
       threshold_met: false,
       valid_count: 0,
-      threshold_m: roster.m,
+      threshold_m: effectiveM,
       total_n: roster.n,
       valid_guardian_ids: [],
       invalid_guardian_ids: approvals.map((a) => a.guardian_id),
@@ -252,9 +271,12 @@ export function evaluateThreshold(params: {
   }
 
   return {
-    threshold_met: validIds.length >= roster.m,
+    // Threshold on the EFFECTIVE M (a lowered-M override when supplied, else
+    // roster.m). The signed roster is verified untouched upstream; only the
+    // integer the valid-signature count is compared against is the effective M.
+    threshold_met: validIds.length >= effectiveM,
     valid_count: validIds.length,
-    threshold_m: roster.m,
+    threshold_m: effectiveM,
     total_n: roster.n,
     valid_guardian_ids: validIds,
     invalid_guardian_ids: invalidIds,
@@ -272,6 +294,12 @@ export function enforceThreshold(params: {
   roster: GuardianRoster;
   signing_input: ApprovalSigningInput;
   expected_roster_version?: number;
+  /**
+   * OPTIONAL effective threshold override (F1 lowered-M). Forwarded to
+   * {@link evaluateThreshold}; clamped there so it can never RAISE the threshold
+   * above the issued `roster.m`. Absent -> `roster.m` (unchanged behavior).
+   */
+  effective_m?: number;
 }): ThresholdEvaluationResult {
   // Roster version check (failure mode d).
   if (
@@ -300,6 +328,7 @@ export function enforceThreshold(params: {
     approvals: params.approvals,
     roster: params.roster,
     signing_input: params.signing_input,
+    effective_m: params.effective_m,
   });
 
   if (!result.threshold_met) {

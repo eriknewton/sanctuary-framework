@@ -41,6 +41,7 @@ import {
 } from "../../src/v1/federation-sync-state-store.js";
 import type { V1FederationDeps } from "../../src/v1/federation.js";
 import type { GuardianRevocationRequirement } from "../../src/v1/federation-revocation-guardian-gate.js";
+import { signMasterDisableAuthorization } from "../../src/v1/federation-guardian-disable-gate.js";
 import { makeMultiNodeFortress, type MultiNodeFortress } from "./fed-materials.js";
 
 type DepsAccess = DashboardApprovalChannel & {
@@ -49,13 +50,22 @@ type DepsAccess = DashboardApprovalChannel & {
 };
 
 const MASTER_KEY = new Uint8Array(32).fill(13);
+// A FIXED audit-log encryption key reused across every simulated "restart" (a
+// real daemon derives its audit key from the PERSISTENT master, never a fresh
+// random one). A per-restart random key would mint a NEW key each boot, so the
+// post-restart audit read (now consulted by the §8 anti-rollback floor) would
+// try to decrypt the PRIOR process's entries under the WRONG key and fail
+// integrity -> the anti-rollback floor would fail TOWARD latch. That is a
+// test-rig artifact, not a product defect (mirrors the AUDIT_KEY convention in
+// federation-guardian-disable-gate.test.ts).
+const AUDIT_KEY = new Uint8Array(32).fill(29);
 
 async function buildDashboard(
   fortress: MultiNodeFortress,
   nodeId: string,
   storage: MemoryStorage,
 ): Promise<DepsAccess> {
-  const auditLog = new AuditLog(storage, randomBytes(32));
+  const auditLog = new AuditLog(storage, AUDIT_KEY);
   const dashboard = new DashboardApprovalChannel({
     port: 0,
     host: "127.0.0.1",
@@ -207,9 +217,21 @@ describe("guardian revocation requirement: enable/disable is loudly audited", ()
     );
 
     const roster = buildRoster(fortress, "mini-1");
-    // Enable, then disable (the fleet-kill guard is turned OFF).
+    // Enable (increase: operator-only, unchanged), then disable (decrease: F1
+    // E1 now requires a disable-gate authorization - the fortress master key
+    // is the top authority and can do this instantly).
     await dashboard.setFederationGuardianRevocationRequirement({ roster });
-    await dashboard.setFederationGuardianRevocationRequirement(null);
+    const disableNonce = dashboard.nextFederationGuardianDisableNonce();
+    const masterAuthorization = signMasterDisableAuthorization({
+      fortressId: fortress.fortressId,
+      disableNonce,
+      intent: "disable",
+      targetM: null,
+      masterPrivateKey: fortress.nodes["mini-1"]!.context.getMasterPrivateKey!(),
+    });
+    await dashboard.setFederationGuardianRevocationRequirement(null, {
+      masterAuthorization,
+    });
 
     const { entries } = await auditLog.query({ layer: "l2", limit: 1000 });
     const ops = entries.map((e) => ({ operation: e.operation, result: e.result }));
@@ -220,8 +242,58 @@ describe("guardian revocation requirement: enable/disable is loudly audited", ()
     });
     // The disable MUST be as loud as the enable: an explicit audit event.
     expect(ops).toContainEqual({
-      operation: "federation_guardian_revocation_requirement_disabled",
+      operation: "federation_guardian_disable_master_authorized",
       result: "success",
     });
+  });
+
+  it("F1 E1: a disable attempted WITHOUT authorization is refused (the guard stays ON)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const auditLog = new AuditLog(storage, randomBytes(32));
+
+    const dashboard = new DashboardApprovalChannel({
+      port: 0,
+      host: "127.0.0.1",
+      timeout_seconds: 30,
+      auth_token: "test",
+      auto_open: false,
+    }) as DepsAccess;
+    dashboard.setDependencies({
+      policy: {
+        version: 1,
+        tier1_always_approve: [],
+        tier3_auto_allow: [],
+        anomaly_thresholds: {
+          new_namespace: true,
+          unfamiliar_counterparty_window_days: 7,
+          frequency_spike_multiplier: 5,
+        },
+        approval_channel: { type: "stderr", timeout_seconds: 30 },
+      } as never,
+      baseline: { load: async () => {}, save: async () => {} } as never,
+      auditLog,
+    });
+    dashboard.setFederationContext(fortress.nodes["mini-1"]!.context);
+    dashboard._federationEnabled = true;
+    await dashboard.setFederationSyncStateStore(
+      new FederationSyncStateStore({ storage, masterKey: MASTER_KEY }),
+    );
+
+    const roster = buildRoster(fortress, "mini-1");
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement(null),
+    ).rejects.toMatchObject({ code: "guardian_disable_authorization_required" });
+
+    const deps = dashboard.buildV1FederationDeps();
+    const hook = deps.requireGuardianRevocationSignOff!();
+    expect(hook).not.toBeNull();
+    expect((hook as { unavailable?: boolean }).unavailable).not.toBe(true);
+
+    const { entries } = await auditLog.query({ layer: "l2", limit: 1000 });
+    const ops = entries.map((e) => e.operation);
+    expect(ops).toContain("federation_guardian_disable_quorum_refused");
   });
 });
