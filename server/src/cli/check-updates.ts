@@ -9,9 +9,10 @@
  * so it ALWAYS performs both the bare npm-registry check and the signed
  * release-manifest check, regardless of the env-var default.
  *
- * Both checks stay advisory / never-block / no-credential; this verb only
- * adds a human-readable result and a non-zero exit when an update is found
- * (useful for scripting), never a hard failure on "offline".
+ * Both checks stay advisory / never-block / no-credential; this verb always
+ * exits 0 and prints a human-readable result, whether an update is available,
+ * the install is up to date, or a check was unreachable. An available update
+ * is informational, not an error, so it is never a non-zero exit signal.
  */
 
 import { Writable } from "node:stream";
