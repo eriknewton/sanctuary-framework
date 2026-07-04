@@ -210,6 +210,35 @@ describe("release-manifest verifier", () => {
       expect(result.ok).toBe(false);
       if (!result.ok) expect(result.reason).toBe("malformed");
     });
+
+    it("rejects a NON-CANONICAL base64url signature (strict decode)", () => {
+      // Defense-in-depth against signature-encoding malleability. Build a
+      // GENUINELY VALID signature (its 64 bytes verify against `key`), then
+      // append a stray `=` to its canonical base64url. The lenient decoder
+      // silently strips the `=` and yields the same 64 valid bytes, so under
+      // the old decode the manifest would have passed the length check AND the
+      // signature verify. The strict decoder rejects the non-canonical encoding
+      // up front, so the outcome is now `malformed` — a distinct encoding of a
+      // valid signature no longer round-trips to acceptance.
+      const { publicKey: key, privateKey } = generateKeypair();
+      const manifest = signManifest(BODY, privateKey);
+
+      // Control: the canonical form of this exact signature still PASSES, so
+      // any rejection below is attributable to the encoding, not the bytes.
+      expect(verifyReleaseManifestWithKey(manifest, key).ok).toBe(true);
+
+      // A canonical no-padding base64url of a 64-byte value is 86 chars
+      // (86 % 4 === 2), so appending one `=` is an illegal non-canonical
+      // encoding that nonetheless lenient-decodes to the same 64 bytes.
+      const nonCanonical = manifest.signature + "=";
+      expect(nonCanonical.length % 4).not.toBe(1); // still a decodable length
+      const result = verifyReleaseManifestWithKey(
+        { ...manifest, signature: nonCanonical },
+        key,
+      );
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.reason).toBe("malformed");
+    });
   });
 
   describe("pinned-key gate (live production key, activated 2026-07-01)", () => {
