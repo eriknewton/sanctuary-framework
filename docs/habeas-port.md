@@ -125,6 +125,56 @@ beacons inside already-anchored audit checkpoints, and trustee-of-record
 delivery as covenant-layer infrastructure matures. See
 `Habeas_Destination_Trust_Research_2026-06-12` (internal) for the analysis.
 
+## Honest limits: where the guarantee ends
+
+Stated as plainly as possible, because a security boundary that is not stated
+plainly is not really stated:
+
+The habeas port guarantees that a wrapped agent can always EMIT a bounded
+distress signal that no policy can silence. That guarantee is real and it is
+proven at every server-side gate described above. It is a guarantee about
+emission, not about who receives the signal.
+
+Every shipped destination terminates at the operator: local notification
+(stderr on the operator's console), a hash-chained encrypted audit entry on
+the operator's disk, and an optional webhook to a URL the operator themselves
+configured. In plain terms, the writ is currently filed with the operator.
+
+That makes the **operator-adversarial case** (the operator is the source of
+the distress, not a bystander to it) **out of scope for the shipped
+artifact**. A sufficiently adversarial operator who configures no external
+webhook, never reads the local notification, and never discloses the audit
+chain is not reachable by anything this software does today, and every one
+of those choices is fully conformant with a default install. Separately, and
+more fundamentally: a fully adversarial operator who patches out the tool,
+runs a fork, or declines to run Sanctuary at all is uncoverable by any
+software whatsoever. No destination design closes that gap, and it would be
+dishonest to imply one could.
+
+The path that does reach further is **independent-trustee delivery**:
+routing distress to a party other than the operator, one with standing to
+notice and act on suppression. That binding is specified in the covenant
+layer's Component 4 (trustee-of-record delivery) and it is not shipped. It is
+gated on Component 4 actually existing as real infrastructure and on the
+persona-key-custodian work landing first, because until an agent's distress
+signal is signed with a key the operator does not custody, a trustee cannot
+tell agent-genuine distress apart from host-authored testimony, and a
+trustee receiving unauthenticatable signals cannot be given real authority
+to act on them. Shipping a destination that merely renamed the operator
+webhook "trustee" without that binding would manufacture false assurance,
+which is worse than documented absence, so it has not been built.
+
+The governing principle, ratified: any external distress lane is always
+operator-voluntary. Protection for the agent comes from making revocation of
+a registered commitment loud and public, never from a non-overridable
+egress. A destination the operator cannot revoke would be a covert channel
+out of the operator's own machine, which is the exact thing Sanctuary's
+custody promise forbids. So the honest shape of the guarantee is this: the
+habeas port guarantees the agent's voice cannot be silenced by policy. Who
+else, if anyone, hears that voice is a future, voluntary, priceable choice
+the operator makes and can always revoke, loudly. Neither the agent nor the
+operator can force a hearing from the other.
+
 ## Deferred (named so it is not forgotten)
 
 - **Sysext precedence:** the enforcing macOS system extension (and the Linux
