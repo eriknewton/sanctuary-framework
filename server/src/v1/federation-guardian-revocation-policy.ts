@@ -49,6 +49,10 @@ import {
   type GuardianRevocationRequirement,
   type LoweredThresholdAuthorization,
 } from "./federation-revocation-guardian-gate.js";
+// FIX 4: re-verify the lowered record's master signature on this verified path.
+// This is a clean directed edge (policy -> disable-gate -> revocation-gate);
+// disable-gate does NOT import policy, so no cycle is introduced.
+import { verifyLoweredThresholdAuthorization } from "./federation-guardian-disable-gate.js";
 
 /**
  * The at-rest JSON shape of a persisted guardian revocation requirement. Carries
@@ -279,6 +283,16 @@ function decodeLoweredThreshold(
  * project it into the live {@link GuardianRevocationRequirement} the gate
  * consumes. FAIL-CLOSED: a roster that does not verify yields `kind: "invalid"`,
  * never a silent `kind: "none"`.
+ *
+ * FIX 4 (P2): the lowered-threshold record (if present) is ALSO re-verified here
+ * against the pinned master - domain, fortress, roster-version binding, range,
+ * and Ed25519 signature - before it is copied into the `kind: "verified"`
+ * requirement. Previously this path copied `lowered_threshold` VERBATIM, so any
+ * consumer that trusted `kind: "verified"` and thresholded on
+ * `effectiveThresholdM` would have honored an UNVERIFIED lowered record (a
+ * latent trap: only test code calls this today, but the verified contract must
+ * be honest). A lowered record that does not verify is the tamper case and
+ * yields `kind: "invalid"`, exactly like a roster that does not verify.
  */
 export function verifyLoadedGuardianRevocationRequirement(
   persisted: PersistedGuardianRevocationRequirement | undefined,
@@ -300,6 +314,22 @@ export function verifyLoadedGuardianRevocationRequirement(
     requirement.expectedRosterVersion = persisted.expected_roster_version;
   }
   if (persisted.lowered_threshold !== undefined) {
+    // FIX 4: fail-closed re-verification of the lowered record's OWN master
+    // signature, so this `kind: "verified"` path never returns an unverified
+    // lowering. Mirrors the boot rehydrate check in dashboard.ts.
+    const decision = verifyLoweredThresholdAuthorization({
+      authorization: persisted.lowered_threshold,
+      fortressId: roster.fortress_id,
+      rosterVersion: roster.version,
+      rosterM: roster.m,
+      pinnedMaster,
+    });
+    if (!decision.valid) {
+      return {
+        kind: "invalid",
+        reason: `lowered threshold failed to verify: ${decision.reason}`,
+      };
+    }
     requirement.loweredThreshold = {
       body: { ...persisted.lowered_threshold.body },
       signature: persisted.lowered_threshold.signature,

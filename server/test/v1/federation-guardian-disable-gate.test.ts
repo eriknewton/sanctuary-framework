@@ -29,7 +29,9 @@ import {
   FederationSyncStateStore,
   FEDERATION_SYNC_STATE_STORE_NAMESPACE,
   FEDERATION_SYNC_STATE_STORE_KEY,
+  FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY,
 } from "../../src/v1/federation-sync-state-store.js";
+import { verifyLoadedGuardianRevocationRequirement } from "../../src/v1/federation-guardian-revocation-policy.js";
 import type { V1FederationDeps } from "../../src/v1/federation.js";
 import {
   GUARDIAN_SIGN_OFF_ACTION,
@@ -1213,6 +1215,71 @@ describe("F1 chokepoint: lowered-M + latch fail-opens", () => {
     const restarted = await buildDashboard(fortress, "mini-1", storage);
     const nextNonce = restarted.nextFederationGuardianDisableNonce();
     expect(nextNonce).toBeGreaterThan(staleLowered.body.disable_nonce + 1);
+
+    // FIX 1: the floor advancing is NOT sufficient (the pre-fix false-confidence
+    // gap - the floor climbed but rehydrate NEVER used it to reject the record).
+    // The load-bearing assertion is BEHAVIORAL: the replayed stale record must
+    // NOT silently take effect. The kill hook must either latch INVALID (the
+    // stale record is refused) OR keep the effective threshold HIGH (never drop
+    // to the attacker's lowered M=2).
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    const latched = (after as { unavailable?: boolean }).unavailable === true;
+    const effectiveHigh =
+      !latched && effectiveThresholdM(after as GuardianRevocationRequirement) === 3;
+    expect(latched || effectiveHigh).toBe(true);
+    // Specifically it must NOT be the exploit outcome (a live requirement whose
+    // effective M silently dropped to the attacker's 2).
+    if (!latched) {
+      expect(effectiveThresholdM(after as GuardianRevocationRequirement)).not.toBe(2);
+    }
+  });
+
+  // FIX 1 (break-glass-mid-countdown edge, do-not-false-reject): a legitimately
+  // lowered fortress (record nonce N, dedicated lowered high-water still BELOW N)
+  // that then ARMS break-glass (which advances the GENERAL disable nonce but NOT
+  // the dedicated lowered high-water, and does NOT drop the lowered record) and
+  // reboots mid-countdown must NOT be falsely rejected. A bare `nonce < general
+  // disable nonce` check (the wrong keying) WOULD reject it; the dedicated
+  // high-water keeps it valid.
+  it("FIX1: a lowered fortress that armed break-glass and rebooted mid-countdown is NOT falsely rejected", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Lower to M=2 (a legitimate master-lower; NO prior lowering, so the
+    // dedicated lowered high-water stays BELOW this record's nonce).
+    const nonce = dashboard.nextFederationGuardianDisableNonce();
+    const lowered = mintLowered(fortress, "mini-1", roster.version, 2, nonce);
+    await dashboard.setFederationGuardianRevocationRequirement(
+      { roster, loweredThreshold: lowered },
+      {
+        masterAuthorization: signMasterDisableAuthorization({
+          fortressId: fortress.fortressId,
+          disableNonce: nonce,
+          intent: "lower",
+          targetM: 2,
+          masterPrivateKey: masterKey(fortress, "mini-1"),
+        }),
+      },
+    );
+    // Arm break-glass (disable-only). This advances the GENERAL disable nonce
+    // (to nonce+1) but leaves the lowered record present and the dedicated
+    // lowered high-water unmoved.
+    await dashboard.initiateFederationGuardianBreakGlass("disable", null);
+
+    // Reboot mid-countdown.
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const after = signOff(restarted) as
+      | GuardianRevocationRequirement
+      | { unavailable?: boolean };
+    // NOT falsely rejected: the guard is live, effective M is still the lowered 2.
+    expect((after as { unavailable?: boolean }).unavailable).not.toBe(true);
+    expect(effectiveThresholdM(after as GuardianRevocationRequirement)).toBe(2);
   });
 
   // T-4 (A6 derived latch): tamper the roster signature -> reboot latches
@@ -1290,9 +1357,10 @@ describe("F1 chokepoint: lowered-M + latch fail-opens", () => {
     ).length;
     // Bounded assignment count is the regression tripwire: if a NEW writer of
     // requirement/latch is added outside the chokepoint/rehydrate, this fails.
-    // chokepoint apply + rollback = 2; rehydrate branches = 5. Total <= 7 each.
-    expect(requirementAssigns).toBeLessThanOrEqual(7);
-    expect(latchAssigns).toBeLessThanOrEqual(7);
+    // chokepoint apply + rollback = 2; rehydrate branches = 6 (the 6th is the
+    // FIX 1 below-floor lowered-record rejection). Total <= 8 each.
+    expect(requirementAssigns).toBeLessThanOrEqual(8);
+    expect(latchAssigns).toBeLessThanOrEqual(8);
     // The chokepoint method must exist (the single mutator).
     expect(src).toContain("private async commitGuardianRequirementTransition");
   });
@@ -1451,5 +1519,148 @@ describe("F1 chokepoint: lowered-M + latch fail-opens", () => {
       { kind: "operator_set", next: null, auth: null },
     );
     expect(commit.ok).toBe(false);
+  });
+
+  // FIX 2 (P0): a fortress that configured a guardian requirement but has NO
+  // independent root-revocation history has its sync-state record DELETED. On
+  // reboot the guard MUST be latched unavailable (kill hook returns
+  // { unavailable: true }), NOT cleared to single-operator kill. The tamper-
+  // evident "ever-established" sentinel is the signal (the root-revocation-
+  // history heuristic misses this case entirely).
+  it("FIX2: deleting the record after a requirement was configured latches unavailable (not single-operator)", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    // Enable a requirement (NO root revocation ever performed -> no independent
+    // revocation history). The sentinel is written on this enable.
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+
+    // Attacker deletes the sync-state record out of band to strip the guard.
+    await storage.delete(NS, KEY);
+
+    // Reboot. The guard must fail closed (latched), NOT clear to single-operator.
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    const hook = signOff(restarted) as { unavailable?: boolean } | null;
+    expect(hook && hook.unavailable).toBe(true);
+    // Direct proof the sentinel was established under the master.
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    expect(await store.guardianRequirementEstablished()).toBe(true);
+  });
+
+  // FIX 2 (brick-safety): a genuinely FRESH fortress (no requirement ever
+  // configured, no sentinel) with no sync-state record must NOT latch - the
+  // first sync/eviction has to be able to write the record. The sentinel path
+  // only fires when a guard was actually established.
+  it("FIX2: a fresh fortress with no sentinel and no record does NOT latch", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    // Build the dashboard WITHOUT ever configuring a requirement.
+    const dashboard = await buildDashboard(fortress, "mini-1", storage);
+    // No record, no sentinel -> the kill hook is the legacy single-operator null
+    // (no requirement configured), NOT the unavailable sentinel.
+    const hook = signOff(dashboard) as { unavailable?: boolean } | null;
+    expect(hook === null || hook.unavailable !== true).toBe(true);
+    const store = new FederationSyncStateStore({ storage, masterKey: MASTER_KEY });
+    expect(await store.guardianRequirementEstablished()).toBe(false);
+    expect(
+      await storage.exists("_meta", FEDERATION_GUARDIAN_REQUIREMENT_ESTABLISHED_KEY),
+    ).toBe(false);
+  });
+
+  // FIX 3 (P1): an audit-append throw AFTER the mutation is applied but BEFORE
+  // the durable persist must ROLL BACK the live state, not leave it weakened.
+  // Force the success-audit to throw during a master-lower and assert the live
+  // effective threshold is UNCHANGED (still 3), i.e. the decrease did not take
+  // effect in memory.
+  it("FIX3: an audit throw during a decrease rolls back the live state fully", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const storage = new MemoryStorage();
+    const auditLog = new AuditLog(storage, AUDIT_KEY);
+    const dashboard = await buildDashboard(fortress, "mini-1", storage, auditLog);
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    await dashboard.setFederationGuardianRevocationRequirement({ roster });
+    expect(effectiveThresholdM(signOff(dashboard) as GuardianRevocationRequirement)).toBe(3);
+
+    // Make the NEXT success-audit (the master-lower intent) throw; the failure
+    // audit (persist_failed) still succeeds so the rollback path completes.
+    const original = auditLog.appendCritical.bind(auditLog);
+    const spy = vi
+      .spyOn(auditLog, "appendCritical")
+      .mockImplementation(async (entry: Parameters<typeof original>[0]) => {
+        if (
+          entry.operation === "federation_guardian_disable_master_authorized" &&
+          entry.result === "success"
+        ) {
+          throw new Error("audit backend down");
+        }
+        return original(entry);
+      });
+
+    const nonce = dashboard.nextFederationGuardianDisableNonce();
+    const lowered = mintLowered(fortress, "mini-1", roster.version, 2, nonce);
+    await expect(
+      dashboard.setFederationGuardianRevocationRequirement(
+        { roster, loweredThreshold: lowered },
+        {
+          masterAuthorization: signMasterDisableAuthorization({
+            fortressId: fortress.fortressId,
+            disableNonce: nonce,
+            intent: "lower",
+            targetM: 2,
+            masterPrivateKey: masterKey(fortress, "mini-1"),
+          }),
+        },
+      ),
+    ).rejects.toThrow("audit backend down");
+    spy.mockRestore();
+
+    // The live requirement must be UNCHANGED (rolled back): effective M still 3,
+    // and the nonce floor did NOT burn the attempted nonce (it rolled back).
+    expect(effectiveThresholdM(signOff(dashboard) as GuardianRevocationRequirement)).toBe(3);
+    expect(dashboard.nextFederationGuardianDisableNonce()).toBe(nonce);
+
+    // And the rolled-back state is what durably reboots (no partial commit).
+    const restarted = await buildDashboard(fortress, "mini-1", storage);
+    expect(effectiveThresholdM(signOff(restarted) as GuardianRevocationRequirement)).toBe(3);
+  });
+
+  // FIX 4 (P2): the verified-load path re-verifies the lowered record's OWN
+  // master signature. A persisted requirement carrying a lowered record whose
+  // signature does NOT match the pinned master must yield kind: "invalid", never
+  // a kind: "verified" that honors an unverified lowering.
+  it("FIX4: verifyLoadedGuardianRevocationRequirement re-verifies the lowered record signature", async () => {
+    const fortress = makeMultiNodeFortress(["mini-1"]);
+    const pinned = fortress.nodes["mini-1"]!.context.pinnedMasterPubkey!;
+    const keypairs = buildGuardianKeypairs(5);
+    const roster = buildRosterFromKeypairs(fortress, "mini-1", keypairs, 3);
+    const good = mintLowered(fortress, "mini-1", roster.version, 2, 1);
+
+    // A valid lowered record verifies (baseline).
+    const okResult = verifyLoadedGuardianRevocationRequirement(
+      { v: 1, roster, lowered_threshold: good },
+      pinned,
+    );
+    expect(okResult.kind).toBe("verified");
+
+    // Now forge the lowered record: keep the body but corrupt the signature.
+    // The verified path MUST reject it (fail-closed), not copy it verbatim.
+    const forged = { body: { ...good.body }, signature: good.signature.slice(0, -4) + "AAAA" };
+    const badResult = verifyLoadedGuardianRevocationRequirement(
+      { v: 1, roster, lowered_threshold: forged },
+      pinned,
+    );
+    expect(badResult.kind).toBe("invalid");
+
+    // A body-tamper (effective_m rewritten) that the signature does not cover
+    // must ALSO be rejected (the signature no longer matches the mutated body).
+    const bodyTampered = { body: { ...good.body, effective_m: 1 }, signature: good.signature };
+    const tamperedResult = verifyLoadedGuardianRevocationRequirement(
+      { v: 1, roster, lowered_threshold: bodyTampered },
+      pinned,
+    );
+    expect(tamperedResult.kind).toBe("invalid");
   });
 });

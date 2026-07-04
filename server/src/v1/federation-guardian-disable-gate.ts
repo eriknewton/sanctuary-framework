@@ -186,9 +186,19 @@ export type GuardianDisableGateDenyReason =
 /**
  * Evaluate the M-of-N guardian quorum required for an INSTANT disable/lower.
  * The quorum is evaluated against the roster of the requirement BEING TORN
- * DOWN (M and N as they stand now) - you need M of the CURRENT guardians to
- * authorize weakening the current rule; lowering to a smaller M' still needs
- * the current (larger) M's worth of signatures. Pure decision, no I/O.
+ * DOWN, at its CURRENT EFFECTIVE M (`effectiveThresholdM(requirement)`), NOT the
+ * issued `roster.m`.
+ *
+ * FIX 5: the CHOSEN threshold is the current EFFECTIVE M, so that disabling or
+ * lowering the guard demands exactly the same quorum strength that currently
+ * guards the KILL path (`evaluateGuardianRevocationSignOff` already thresholds
+ * on `effectiveThresholdM`). A fortress already lowered to effective M=2 needs 2
+ * signatures to weaken it further, not the issued 3 - anything else would demand
+ * MORE authority to tear the guard down than the guard itself currently
+ * enforces, an internal inconsistency. This aligns the code with the authorizer
+ * comment at {@link authorizeGuardianRequirementTransition} ("the quorum is over
+ * the CURRENT effective roster") and the §4 invariant table ("M-of-N quorum over
+ * CURRENT effective roster"). Pure decision, no I/O.
  */
 export function evaluateGuardianDisableSignOff(params: {
   /** The CURRENT (pinned) requirement being disabled/lowered. */
@@ -225,6 +235,9 @@ export function evaluateGuardianDisableSignOff(params: {
       roster: requirement.roster,
       signing_input: signingInput,
       expected_roster_version: expectedRosterVersion,
+      // FIX 5: threshold on the current EFFECTIVE M (bounded to roster.m by
+      // enforceThreshold), matching the kill-path threshold and the authorizer.
+      effective_m: effectiveThresholdM(requirement),
     });
     return { allowed: true, validGuardianIds: result.valid_guardian_ids };
   } catch (err) {
@@ -775,6 +788,19 @@ export interface GuardianRequirementEffect {
   authMethod: "operator" | "quorum" | "master" | "break_glass" | null;
   /** The nonce burned by this transition (a decrease/completion), else null. */
   burnedNonce: number | null;
+  /**
+   * FIX 1 (A3 replay, reboot leg): the disable_nonce of a lowered-threshold
+   * record this transition SUPERSEDES (a raise/re-pin that drops a prior
+   * lowering), else null. The chokepoint folds it into a DEDICATED lowered-
+   * record high-water (`_federationGuardianLoweredHighWater`), distinct from the
+   * general disable nonce, that ONLY advances when a lowering is actually
+   * dropped. Rehydrate then REJECTS a persisted lowered record whose nonce is
+   * below that high-water. It must NOT key off the general disable nonce, which
+   * also advances on a break-glass INITIATE that leaves a present lowered record
+   * intact (a legitimately-lowered fortress mid-countdown would be falsely
+   * rejected by a bare `nonce < disableNonce`).
+   */
+  supersedesLoweredNonce: number | null;
   /** Classification for the audit trail. */
   classification: "increase" | "decrease" | "noop";
 }
@@ -822,6 +848,7 @@ export function authorizeGuardianRequirementTransition(
         masterAuthorizedNull: false,
         authMethod: "break_glass",
         burnedNonce: null,
+        supersedesLoweredNonce: null,
         classification: "decrease",
       },
     };
@@ -996,6 +1023,19 @@ export function authorizeGuardianRequirementTransition(
     // every other disable leaves it as-is (moot once requirement is null).
     const masterAuthorizedNull =
       next === null && authMethod === "master";
+    // FIX 1: a decrease that REPLACES a prior lowered record (a disable that
+    // drops one, or a lower whose new record carries a DIFFERENT nonce)
+    // supersedes it - fold the prior record's nonce into the lowered high-water
+    // so it can never be replayed on reboot. (A lower whose new record reuses
+    // the same nonce cannot happen: the new record binds the fresh nonce being
+    // burned, so any prior lowered record's nonce is strictly older.)
+    const priorLoweredNonce = live?.loweredThreshold?.body.disable_nonce ?? null;
+    const nextInstalledLoweredNonce =
+      installedNext?.loweredThreshold?.body.disable_nonce ?? null;
+    const decreaseSupersedesLoweredNonce =
+      priorLoweredNonce !== null && priorLoweredNonce !== nextInstalledLoweredNonce
+        ? priorLoweredNonce
+        : null;
     return {
       ok: true,
       effect: {
@@ -1010,6 +1050,7 @@ export function authorizeGuardianRequirementTransition(
         masterAuthorizedNull,
         authMethod,
         burnedNonce: state.nextDisableNonce,
+        supersedesLoweredNonce: decreaseSupersedesLoweredNonce,
         classification,
       },
     };
@@ -1047,6 +1088,9 @@ export function authorizeGuardianRequirementTransition(
         masterAuthorizedNull: false,
         authMethod: "operator",
         burnedNonce: supersedesLowered ? state.nextDisableNonce : null,
+        // FIX 1: fold the DROPPED lowered record's nonce into the dedicated
+        // lowered high-water so a reboot rejects a re-injection of it.
+        supersedesLoweredNonce: supersedesLowered ? priorLoweredNonce : null,
         classification,
       },
     };
@@ -1062,6 +1106,7 @@ export function authorizeGuardianRequirementTransition(
       masterAuthorizedNull: false,
       authMethod: null,
       burnedNonce: null,
+      supersedesLoweredNonce: null,
       classification: "noop",
     },
   };

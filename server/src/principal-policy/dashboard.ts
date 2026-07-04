@@ -694,6 +694,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private _federationGuardianDisableNonce = 0;
   /**
+   * FIX 1 (A3 replay, reboot leg): a DEDICATED high-water for SUPERSEDED
+   * lowered-threshold records, distinct from {@link
+   * _federationGuardianDisableNonce}. It advances ONLY when a lowering is
+   * actually dropped (a raise/re-pin that removes a prior lowered record, or a
+   * decrease that replaces one), never on a break-glass initiate. On boot,
+   * {@link rehydrateGuardianRevocationRequirement} REJECTS a persisted lowered
+   * record whose nonce is below this floor (a replayed, already-superseded
+   * lowering). See {@link
+   * FederationSyncStateSnapshot.guardianLoweredHighWater} for why it must NOT
+   * key off the general disable nonce.
+   */
+  private _federationGuardianLoweredHighWater = 0;
+  /**
    * F1 E1: the in-flight break-glass countdown, or `null` when IDLE. Every
    * mutation of this field MUST happen in the SAME set as a bump of
    * {@link _federationGuardianRevocationRequirementGeneration} (the H1 fix from
@@ -2173,6 +2186,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     const priorInvalid = this._federationGuardianRevocationRequirementInvalid;
     const priorGeneration = this._federationGuardianRevocationRequirementGeneration;
     const priorDisableNonce = this._federationGuardianDisableNonce;
+    const priorLoweredHighWater = this._federationGuardianLoweredHighWater;
     const priorBreakGlass = this._federationGuardianBreakGlass;
 
     // 4. APPLY (atomic mutation - single synchronous block).
@@ -2197,6 +2211,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         effect.burnedNonce,
       );
     }
+    // FIX 1: when this transition SUPERSEDES a prior lowered record (a raise/
+    // re-pin that drops it, or a decrease that replaces it), advance the
+    // DEDICATED lowered high-water past that record's nonce so a reboot rejects
+    // its re-injection. Distinct from the general disable-nonce burn above: this
+    // floor does NOT advance on a break-glass initiate, so a lowered fortress
+    // that arms break-glass and reboots mid-countdown is not falsely rejected.
+    if (effect.supersedesLoweredNonce !== null) {
+      this._federationGuardianLoweredHighWater = Math.max(
+        this._federationGuardianLoweredHighWater,
+        effect.supersedesLoweredNonce,
+      );
+    }
     // Break-glass completion additionally clears the in-flight countdown here
     // (the ONE place besides veto/cancel that touches it), under the same
     // generation bump.
@@ -2204,49 +2230,70 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationGuardianBreakGlass = null;
     }
 
-    // 5. AUDIT the intent (before persist).
+    // 5. AUDIT the intent (before persist), then 6. PERSIST - BOTH inside the
+    // rollback try (FIX 3 / P1): an audit-append throw AFTER the mutation was
+    // applied must roll back every coupled field, exactly like a persist throw,
+    // so a throw can never leave live state weakened-but-not-durably-committed.
+    // Audit-before-persist ordering is preserved so intent is on the record even
+    // if the durable write later fails.
     const operation = this.guardianTransitionAuditOperation(t, effect);
-    await this.auditLog?.appendCritical({
-      layer: "l2",
-      operation,
-      identity_id: "dashboard",
-      result: "success",
-      details: {
-        enabled: effect.requirement !== null,
-        transition: effect.classification,
-        generation: this._federationGuardianRevocationRequirementGeneration,
-        ...(effect.burnedNonce !== null ? { disable_nonce: effect.burnedNonce } : {}),
-        ...(effect.requirement !== null
-          ? {
-              roster_version: effect.requirement.roster.version,
-              guardian_m: effect.requirement.roster.m,
-              guardian_effective_m: effectiveThresholdM(effect.requirement),
-              guardian_n: effect.requirement.roster.n,
-            }
-          : {}),
-      },
-    });
-
-    // 6. PERSIST; on throw, ROLL BACK every coupled field and re-audit.
     try {
+      await this.auditLog?.appendCritical({
+        layer: "l2",
+        operation,
+        identity_id: "dashboard",
+        result: "success",
+        details: {
+          enabled: effect.requirement !== null,
+          transition: effect.classification,
+          generation: this._federationGuardianRevocationRequirementGeneration,
+          ...(effect.burnedNonce !== null ? { disable_nonce: effect.burnedNonce } : {}),
+          ...(effect.requirement !== null
+            ? {
+                roster_version: effect.requirement.roster.version,
+                guardian_m: effect.requirement.roster.m,
+                guardian_effective_m: effectiveThresholdM(effect.requirement),
+                guardian_n: effect.requirement.roster.n,
+              }
+            : {}),
+        },
+      });
       await this.persistFederationSyncState();
+      // FIX 2 (P0): once a non-null requirement is DURABLY committed, record the
+      // tamper-evident "ever-established" sentinel so a later deletion of the
+      // sync-state record is caught on boot (see hydrateFederationSyncState).
+      // Written AFTER the record persist so the marker only ever exists for a
+      // guard that durably committed; a throw here rolls the transition back
+      // like any other commit failure (the marker is part of "committed").
+      if (effect.requirement !== null) {
+        await this._federationSyncStateStore?.markGuardianRequirementEstablished();
+      }
     } catch (err) {
       this._federationGuardianRevocationRequirement = priorRequirement;
       this._federationGuardianRevocationRequirementInvalid = priorInvalid;
       this._federationGuardianRevocationRequirementGeneration = priorGeneration;
       this._federationGuardianDisableNonce = priorDisableNonce;
+      this._federationGuardianLoweredHighWater = priorLoweredHighWater;
       this._federationGuardianBreakGlass = priorBreakGlass;
-      await this.auditLog?.appendCritical({
-        layer: "l2",
-        operation: "federation_guardian_revocation_requirement_persist_failed",
-        identity_id: "dashboard",
-        result: "failure",
-        details: {
-          attempted_enabled: effect.requirement !== null,
-          rolled_back_to_enabled: priorRequirement !== null,
-          rolled_back_generation: priorGeneration,
-        },
-      });
+      // The state rollback above is the load-bearing part; the failure audit is
+      // best-effort. If the audit subsystem is itself the thing that threw (FIX
+      // 3), do not let its re-throw mask the original error or the rollback -
+      // swallow a secondary audit failure and re-throw the ORIGINAL `err`.
+      try {
+        await this.auditLog?.appendCritical({
+          layer: "l2",
+          operation: "federation_guardian_revocation_requirement_persist_failed",
+          identity_id: "dashboard",
+          result: "failure",
+          details: {
+            attempted_enabled: effect.requirement !== null,
+            rolled_back_to_enabled: priorRequirement !== null,
+            rolled_back_generation: priorGeneration,
+          },
+        });
+      } catch {
+        // best-effort failure audit; original error is authoritative
+      }
       throw err;
     }
   }
@@ -2765,6 +2812,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this._federationSyncStateUnavailable = true;
       return;
     }
+    // FIX 2 (P0): ADD an independent deletion signal for the guardian-requirement
+    // case, which the root-revocation-history heuristic above MISSES. A fortress
+    // that enabled a guardian requirement but never performed a root revocation
+    // has NO independent revocation history, so deleting its sync-state record
+    // used to boot un-latched -> rehydrate(null) cleared the requirement -> the
+    // kill hook returned null -> single-operator kill was silently restored. The
+    // tamper-evident "established" sentinel closes it: if a guardian requirement
+    // was EVER configured (per the MAC'd `_meta` marker) but the sync-state
+    // record is now absent, the record was deleted - fail closed regardless of
+    // root-revocation history. A read fault on the sentinel also fails closed.
+    if (!recordPresent) {
+      let everEstablished: boolean;
+      try {
+        everEstablished = await store.guardianRequirementEstablished();
+      } catch {
+        this._federationSyncStateUnavailable = true;
+        return;
+      }
+      if (everEstablished) {
+        this._federationSyncStateUnavailable = true;
+        return;
+      }
+    }
     let snapshot: FederationSyncStateSnapshot;
     try {
       snapshot = await store.load();
@@ -2821,6 +2891,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ),
     };
     this.projectAppliedPoliciesOntoRoster();
+    // FIX 1: adopt the DEDICATED superseded-lowering high-water floor BEFORE
+    // rehydrate so the rehydrate check can reject a below-floor lowered record.
+    // Never regress it across a restart (a Math.max floor, like every other
+    // replay floor in this record). This high-water advances ONLY when a
+    // lowering was actually dropped, so - unlike the general disable nonce - it
+    // does NOT trip on a lowered fortress that armed break-glass mid-countdown.
+    this._federationGuardianLoweredHighWater = Math.max(
+      this._federationGuardianLoweredHighWater,
+      snapshot.guardianLoweredHighWater,
+    );
     this.rehydrateGuardianRevocationRequirement(
       snapshot.guardianRevocationRequirement,
       snapshot.guardianRevocationRequirementGeneration,
@@ -2952,6 +3032,34 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this._federationGuardianRevocationRequirementInvalid = true;
         return;
       }
+      // FIX 1 (A3 replay, reboot leg): even a SIGNATURE-VALID lowered record must
+      // be REFUSED when its nonce is at-or-below the dedicated superseded-
+      // lowering high-water. That is the replayed, already-dropped lowering
+      // (lower to M', raise back, re-inject the still-valid-signed old record):
+      // the signature, roster-version, and range all still pass, so the OTHER
+      // checks above let it through - only the high-water catches it. A
+      // signature-valid-but-stale lowered record is the tamper case, so fail
+      // closed (latch invalid); we do NOT silently drop to `roster.m` (which
+      // would still honor the attacker's re-injection as a "no lowering"
+      // downgrade of the operator's intent) nor accept the stale lowering.
+      //
+      // The comparison is `<=` because the high-water is set to the EXACT nonce
+      // of a lowering that was DROPPED (not one-past it): a record whose nonce
+      // equals the high-water is precisely the record that was superseded. This
+      // does NOT false-reject a currently-valid lowering: the high-water only
+      // ever advances to a DROPPED record's nonce, and it uses the DEDICATED
+      // high-water (adopted just above), NOT the general disable nonce - so a
+      // freshly-installed lowering always carries a nonce STRICTLY ABOVE the
+      // high-water, and a lowered fortress that armed break-glass and rebooted
+      // mid-countdown (which does NOT advance this high-water) is never rejected.
+      if (
+        persisted.loweredThreshold.body.disable_nonce <=
+        this._federationGuardianLoweredHighWater
+      ) {
+        this._federationGuardianRevocationRequirement = null;
+        this._federationGuardianRevocationRequirementInvalid = true;
+        return;
+      }
     }
     this._federationGuardianRevocationRequirement = persisted;
     this._federationGuardianRevocationRequirementInvalid = false;
@@ -3009,6 +3117,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // bumps that same counter in the same set, so the two can never diverge
       // across a rotate-root merge.
       guardianDisableNonce: this._federationGuardianDisableNonce,
+      // FIX 1: the dedicated superseded-lowering high-water (see the field doc).
+      guardianLoweredHighWater: this._federationGuardianLoweredHighWater,
       guardianBreakGlass: this._federationGuardianBreakGlass,
     };
   }
