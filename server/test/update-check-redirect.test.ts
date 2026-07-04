@@ -90,6 +90,31 @@ describe("httpGetText redirect-following (F1)", () => {
     const body = await httpGetText(`${originBase}/latest`, 2, localhostPolicy);
     expect(body).toBeNull();
   });
+
+  it("policy-gates the INITIAL url, not only followed redirects", async () => {
+    // A live server that WOULD return a body if reached. If the initial-url
+    // SSRF gate is missing, this fetch succeeds; with the gate, a policy that
+    // rejects this host makes hop 0 resolve null WITHOUT opening the socket.
+    let reached = false;
+    const base = await listen((_req, res) => {
+      reached = true;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    // A policy that rejects EVERY host: the initial url must be refused.
+    const rejectAll = (): boolean => false;
+    const body = await httpGetText(`${base}/latest`, 2, rejectAll);
+    expect(body).toBeNull();
+    // The gate must short-circuit BEFORE any request is made.
+    expect(reached).toBe(false);
+  });
+
+  it("returns null (never throws) on an unparsable initial url", async () => {
+    // A malformed url must resolve null, not throw — httpGetText is contractually
+    // non-throwing on every failure path, including a bad initial url.
+    const body = await httpGetText("not a url", 2, localhostPolicy);
+    expect(body).toBeNull();
+  });
 });
 
 describe("production redirect policy: SSRF allowlist", () => {
@@ -127,5 +152,24 @@ describe("production redirect policy: SSRF allowlist", () => {
     ).toBe(true);
     // https but non-allowlisted host -> rejected.
     expect(productionRedirectPolicy(new URL("https://evil.com/x"))).toBe(false);
+  });
+
+  it("default httpGetText refuses a non-GitHub INITIAL url before fetching", async () => {
+    // fetchLatestSignedManifest hands httpGetText an asset browser_download_url
+    // read from the untrusted release JSON body. With the DEFAULT (production)
+    // policy, an initial url whose host is not an allowlisted GitHub host must
+    // resolve null WITHOUT opening a socket. The local server here would answer
+    // 200 if reached, so `reached === false` proves the hop-0 SSRF gate holds.
+    let reached = false;
+    const base = await listen((_req, res) => {
+      reached = true;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    // No policy arg -> productionRedirectPolicy (https-only + GitHub allowlist).
+    // The base url here is http://127.0.0.1 -> rejected on BOTH scheme and host.
+    const body = await httpGetText(`${base}/release-manifest.json`);
+    expect(body).toBeNull();
+    expect(reached).toBe(false);
   });
 });

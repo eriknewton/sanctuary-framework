@@ -312,6 +312,14 @@ export const productionRedirectPolicy: RedirectPolicy = (next) =>
  * unreachable = silent). A GitHub API call requires a User-Agent header or
  * GitHub returns 403.
  *
+ * SSRF guard is applied to the INITIAL url too, not just followed redirects:
+ * the same `policy` gates hop 0 before any socket is opened. This matters
+ * because `fetchLatestSignedManifest` passes an asset `browser_download_url`
+ * read from the (untrusted) release JSON body as the initial url; without this
+ * gate a compromised/redirected API response could aim the FIRST fetch at an
+ * internal/metadata host. A url the policy rejects resolves null (silent),
+ * exactly like a rejected redirect target.
+ *
  * Redirects: a 3xx with a `Location` header is followed up to
  * MAX_REDIRECT_HOPS times, and ONLY to a target the redirect policy accepts.
  * The default `productionRedirectPolicy` is https-only + an allowlisted GitHub
@@ -329,6 +337,20 @@ export function httpGetText(
   hopsRemaining = MAX_REDIRECT_HOPS,
   policy: RedirectPolicy = productionRedirectPolicy,
 ): Promise<string | null> {
+  // SSRF guard on the INITIAL url. The policy (https-only + allowlisted GitHub
+  // host in production) must gate hop 0, not only followed redirects: the
+  // asset url handed to fetchLatestSignedManifest comes from the untrusted
+  // release JSON body, so an unvetted initial url is exactly the SSRF surface.
+  // An unparsable or policy-rejected url is a silent null, never a throw.
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return Promise.resolve(null);
+  }
+  if (!policy(parsed)) {
+    return Promise.resolve(null);
+  }
   // Select the transport by scheme. Production always uses https (the GitHub
   // API + release-asset redirect targets are https, enforced by the redirect
   // policy). http support exists so the redirect-follow behavior is testable

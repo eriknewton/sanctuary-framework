@@ -27,7 +27,7 @@
  */
 
 import { canonicalJson } from "./v1/operator-signed.js";
-import { fromBase64url, stringToBytes } from "./core/encoding.js";
+import { fromBase64urlStrict, stringToBytes } from "./core/encoding.js";
 import { verify } from "./core/identity.js";
 
 /** Domain separator for the release-manifest signature (versioned). */
@@ -190,7 +190,15 @@ export function verifyReleaseManifestWithKey(
 
   let signature: Uint8Array;
   try {
-    signature = fromBase64url(manifest.signature);
+    // STRICT base64url: reject non-canonical encodings of the signature
+    // (defense-in-depth against signature-encoding malleability). Node's
+    // lenient decoder would silently drop stray whitespace/`=`/out-of-alphabet
+    // chars, so an attacker could append `"!"`, a newline, or `"=="` to a
+    // valid-length signature and still decode to the same 64 bytes. The strict
+    // decoder throws on any such deviation; the catch maps that to a
+    // fail-closed `malformed` refusal (unchanged behavior for a genuinely
+    // valid signature — it just now also rejects non-canonical encodings).
+    signature = fromBase64urlStrict(manifest.signature);
   } catch {
     return { ok: false, reason: "malformed" };
   }
@@ -225,7 +233,11 @@ export function verifyReleaseManifestWithKey(
  */
 export function loadPinnedReleaseKey(): Uint8Array | null {
   try {
-    const key = fromBase64url(PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL);
+    // Strict decode for consistency with the signature path. The pinned key is
+    // a hardcoded canonical constant, so leniency is moot here, but decoding it
+    // strictly keeps a single decode discipline across all signature material
+    // and would catch a future non-canonical edit to the constant.
+    const key = fromBase64urlStrict(PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL);
     if (key.length !== ED25519_PUBLIC_KEY_LENGTH) return null;
     // CRITICAL: reject the all-zero placeholder. The all-zero key is the
     // Ed25519 identity point and accepts a zero signature for ANY message —
