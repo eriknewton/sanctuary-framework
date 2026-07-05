@@ -73,7 +73,18 @@ sudo sanctuary castle-wall install-boot
 #    boot service installed in step 2. 'enable' refuses if no daemon is reachable.
 sanctuary castle-wall daemon
 
-# 4. Arm the content filter. You MUST choose a dead-man TTL mode:
+# 4. Set the agent-origin descriptor BEFORE arming (CRITICAL on a multi-user host).
+#    Without a descriptor the classifier routes EVERY flow - sshd, Tailscale, and
+#    your own operator shell - to default-deny + allowlist (verified: with no
+#    descriptor even a root/ruid-0 flow classifies `.agent`). Arming then cuts
+#    SSH/Tailscale unless each is explicitly allowlisted - this is the 2026-06-26
+#    Mini1 "arming cut SSH" boot-cut. In uid mode, real uids BELOW --ceiling
+#    classify as operator (allowed); the dedicated agent-account uid is the
+#    confined side. Verify uids first: `id <agent-user>`, and confirm daemon uids
+#    (e.g. `id _sshd`) sit below the ceiling.
+sanctuary castle-wall configure-origin uid --agent-uid=<agent-account-uid> --ceiling=500
+
+# 5. Arm the content filter. You MUST choose a dead-man TTL mode:
 #      --no-ttl        durable arming (stays armed until you disarm)
 #      --ttl <dur>     drill arming (auto-disarms after the TTL; e.g. --ttl 15m)
 sanctuary castle-wall enable --no-ttl
@@ -90,6 +101,11 @@ fake-arms) if any fail:
 - a TTL mode chosen (`--ttl` or `--no-ttl`; exit code 2 if you pass neither),
 - the sysext toggled ON (exit code 4 if not) and content-filter consent granted
   (exit code 3 if not).
+
+Note: `enable` does NOT yet gate on the agent-origin descriptor (step 4 above). If
+you skip `configure-origin`, arming still succeeds but classifies every flow as
+`.agent`, cutting SSH / Tailscale / operator traffic that is not in the allowlist.
+Always run step 4 before `enable` on a remote or multi-user host.
 
 ---
 
@@ -139,6 +155,7 @@ failed arm:
 | **CWD build-SHA trap** | `enable`/`disable` fail with `deployed app <X> != CLI <Y> - rebuild + redeploy` | the CLI SHA comes from `git rev-parse HEAD` in the CURRENT WORKING DIRECTORY (or `SANCTUARY_CASTLE_BUILD_SHA`), NOT the binary. If you are inside a git worktree whose HEAD differs from the deployed app, run the arm verbs **outside any git repo**, or `export SANCTUARY_CASTLE_BUILD_SHA=<app-sha>` first. This is NOT a real rebuild need. |
 | **No reachable daemon** | `enable` refuses (deny-all brick guard) | run `sanctuary castle-wall daemon` or install the boot service; `--force` only if supervised out of band |
 | **No boot service for this fortress** | `enable` refuses (reboot-brick guard) | `sudo sanctuary castle-wall install-boot`; `--force` only if boot-survival is supervised out of band |
+| **No agent-origin descriptor set** | `enable` arms, but SSH / Tailscale / your operator shell are cut (every flow classifies `.agent` and hits default-deny) | run `sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500` BEFORE `enable` (step 4); `enable` does NOT yet guard for this |
 
 ---
 
