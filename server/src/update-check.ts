@@ -23,6 +23,9 @@
 
 import { get as httpsGet } from "node:https";
 import { get as httpGet } from "node:http";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
+import { resolveStoragePath } from "./paths.js";
 import {
   verifyReleaseManifest,
   type ManifestVerificationResult,
@@ -130,17 +133,75 @@ export function isNewerVersion(current: string, latest: string): boolean {
 }
 
 /**
+ * A well-formed release version: `MAJOR.MINOR.PATCH` with an optional
+ * pre-release suffix. Registry-supplied `latest` must match this before it is
+ * ever interpolated into a copy-paste command, so an injection-shaped string
+ * from a compromised or malformed registry response cannot reach the operator
+ * as a runnable command (defense-in-depth; `fetchLatestVersion` already
+ * rejects non-conforming shapes upstream).
+ */
+const RELEASE_VERSION_SHAPE = /^\d+\.\d+\.\d+(-[\w.]+)?$/;
+
+/**
+ * Best-effort detection of a version-pinned wrapped install. A current wrap
+ * records a `wrap-meta.json` pointer (default) or a surface-scoped
+ * `wrap-meta-<tag>.json` slot under `<storage>/backup`. Presence of any such
+ * pointer means the running server was launched from a pinned wrapped entry,
+ * for which `npx ...@latest` is a no-op; those operators must re-run
+ * `sanctuary protect` (the pin-rewrite path) to upgrade. (Pre-retirement
+ * legacy pointers are not the post-#846 version-pinned population and are
+ * intentionally not enumerated here.)
+ *
+ * Never throws: any error (no storage dir, unreadable, permissions) resolves
+ * to `false` and the caller falls back to the generic advice. A disclosed
+ * limit: a stale pre-`removeWrapMeta` pointer can read as wrapped, which only
+ * ever swaps in the safe `sanctuary protect` advice, never the reverse.
+ */
+export function isWrappedInstall(): boolean {
+  try {
+    const backupDir = join(resolveStoragePath(), "backup");
+    for (const name of readdirSync(backupDir)) {
+      if (name === "wrap-meta.json" || /^wrap-meta-[0-9a-f]{12}\.json$/.test(name)) {
+        return true;
+      }
+    }
+  } catch {
+    // no storage dir / unreadable -> treat as not-wrapped (generic advice)
+  }
+  return false;
+}
+
+/**
  * Format the update notification message.
  *
  * The suggested command pins the exact version the message announces
  * (v1.6.1 install-path hardening): the operator runs precisely what was
  * advertised, not whatever `latest` resolves to by the time they act.
+ *
+ * For a version-pinned wrapped install (`wrapped`), the generic
+ * `npx ...@latest` command is a no-op, so the notice instead advises re-running
+ * `sanctuary protect` (the pin-rewrite mechanism). Without this, a pinned
+ * wrapped operator is told to run a command that never upgrades them, so they
+ * silently stay on an old version and never receive security fixes.
+ *
+ * If `latest` is not a well-formed release version it is never interpolated
+ * into a runnable command; the notice points at the package page instead.
  */
 export function formatUpdateMessage(
   current: string,
-  latest: string
+  latest: string,
+  wrapped = false,
 ): string {
-  return `[Sanctuary] Update available: ${current} → ${latest}. Run: npx @sanctuary-framework/mcp-server@${latest}`;
+  const head = `[Sanctuary] Update available: ${current} → ${latest}.`;
+  if (!RELEASE_VERSION_SHAPE.test(latest)) {
+    return `${head} See https://www.npmjs.com/package/@sanctuary-framework/mcp-server`;
+  }
+  if (wrapped) {
+    // Angle brackets in advice parse as shell redirects if pasted verbatim,
+    // so the harness is named inline rather than as a `<placeholder>`.
+    return `${head} Your install is version-pinned by a wrap; re-run: sanctuary protect --claude-code (or your harness flag) to update the pinned version.`;
+  }
+  return `${head} Run: npx @sanctuary-framework/mcp-server@${latest}`;
 }
 
 /**
@@ -181,6 +242,7 @@ export function fetchLatestVersion(
             const latest = json.version;
             if (
               typeof latest === "string" &&
+              RELEASE_VERSION_SHAPE.test(latest) &&
               isNewerVersion(currentVersion, latest)
             ) {
               resolve(latest);
@@ -548,7 +610,7 @@ export async function checkForUpdate(currentVersion: string): Promise<void> {
     const latest = await fetchLatestVersion(currentVersion);
     if (latest) {
       // SAFETY: no structured logger module is wired in server/src/ yet; until one lands, raw stderr is the runtime warning channel for this site.
-      console.error(formatUpdateMessage(currentVersion, latest));
+      console.error(formatUpdateMessage(currentVersion, latest, isWrappedInstall()));
     }
   } catch {
     // Never fail the server over an update check

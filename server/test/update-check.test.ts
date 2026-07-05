@@ -7,9 +7,13 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   isNewerVersion,
   formatUpdateMessage,
+  isWrappedInstall,
   outboundUpdateChecksEnabled,
   checkForUpdate,
   checkForSignedUpdate,
@@ -167,6 +171,64 @@ describe("update-check", () => {
     it("is a single line", () => {
       const msg = formatUpdateMessage("0.3.1", "0.4.0");
       expect(msg).not.toContain("\n");
+    });
+
+    it("advises re-running `sanctuary protect` for a wrapped install (npx would be a no-op)", () => {
+      const msg = formatUpdateMessage("1.6.0", "1.6.1", true);
+      expect(msg).toContain("sanctuary protect");
+      expect(msg).not.toContain("npx @sanctuary-framework/mcp-server@1.6.1");
+      expect(msg).not.toContain("\n");
+      // copy-paste safe: no unescaped angle-bracket placeholder
+      expect(msg).not.toMatch(/<[^>]+>/);
+    });
+
+    it("never emits a runnable command when `latest` is not a well-formed version (injection-shape guard)", () => {
+      const msg = formatUpdateMessage("1.6.0", "1.6.1; rm -rf ~");
+      expect(msg).not.toContain("npx @sanctuary-framework/mcp-server@");
+      expect(msg).not.toContain("sanctuary protect");
+      expect(msg).toContain("npmjs.com/package/@sanctuary-framework/mcp-server");
+      // guard applies even if a wrapped flag is set
+      const wrappedMsg = formatUpdateMessage("1.6.0", "not a version", true);
+      expect(wrappedMsg).not.toContain("sanctuary protect");
+      expect(wrappedMsg).toContain("npmjs.com");
+    });
+  });
+
+  describe("isWrappedInstall", () => {
+    let dir: string;
+    let prevStoragePath: string | undefined;
+
+    beforeEach(() => {
+      dir = mkdtempSync(join(tmpdir(), "sanctuary-wrapcheck-"));
+      prevStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+      process.env.SANCTUARY_STORAGE_PATH = dir;
+    });
+
+    afterEach(() => {
+      if (prevStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+      else process.env.SANCTUARY_STORAGE_PATH = prevStoragePath;
+      rmSync(dir, { recursive: true, force: true });
+    });
+
+    it("is false when no storage/backup dir exists", () => {
+      expect(isWrappedInstall()).toBe(false);
+    });
+
+    it("is false for an empty backup dir (no wrap-meta pointer)", () => {
+      mkdirSync(join(dir, "backup"), { recursive: true });
+      expect(isWrappedInstall()).toBe(false);
+    });
+
+    it("detects a default wrap-meta pointer", () => {
+      mkdirSync(join(dir, "backup"), { recursive: true });
+      writeFileSync(join(dir, "backup", "wrap-meta.json"), "{}");
+      expect(isWrappedInstall()).toBe(true);
+    });
+
+    it("detects a surface-scoped wrap-meta slot", () => {
+      mkdirSync(join(dir, "backup"), { recursive: true });
+      writeFileSync(join(dir, "backup", "wrap-meta-0123456789ab.json"), "{}");
+      expect(isWrappedInstall()).toBe(true);
     });
   });
 });
