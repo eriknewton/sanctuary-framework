@@ -899,7 +899,7 @@ describe("Console metadata", () => {
 // Default-deny on non-GET mutation (latent-surface hardening)
 // =====================================================================
 
-describe("console router — default-deny on non-GET mutation", () => {
+describe("console router - default-deny on non-GET mutation", () => {
   // `handleConsoleRoute` used a FLAT `authMiddleware(authConfig)` for all
   // methods, so LOOPBACK auto-auth would have released its POST mutations
   // (fortress transition, agent retry-reset, policy compile, chat send)
@@ -947,7 +947,7 @@ describe("console router — default-deny on non-GET mutation", () => {
     };
   }
 
-  it("POST fortress/transition on loopback with NO bearer is REJECTED (401) — default-deny mutation", async () => {
+  it("POST fortress/transition on loopback with NO bearer is REJECTED (401) - default-deny mutation", async () => {
     const { base, close } = await makeServer();
     try {
       const res = await fetch(`${base}${API_ROUTES.FORTRESS_TRANSITION}`, {
@@ -962,7 +962,7 @@ describe("console router — default-deny on non-GET mutation", () => {
     }
   });
 
-  it("POST chat/send on loopback with NO bearer is REJECTED (401) — default-deny mutation", async () => {
+  it("POST chat/send on loopback with NO bearer is REJECTED (401) - default-deny mutation", async () => {
     const { base, close } = await makeServer();
     try {
       const res = await fetch(`${base}${API_ROUTES.CHAT_SEND}`, {
@@ -976,7 +976,7 @@ describe("console router — default-deny on non-GET mutation", () => {
     }
   });
 
-  it("POST policy/compile on loopback with NO bearer is REJECTED (401) — default-deny mutation", async () => {
+  it("POST policy/compile on loopback with NO bearer is REJECTED (401) - default-deny mutation", async () => {
     const { base, close } = await makeServer();
     try {
       const res = await fetch(`${base}${API_ROUTES.POLICY_COMPILE}`, {
@@ -990,7 +990,7 @@ describe("console router — default-deny on non-GET mutation", () => {
     }
   });
 
-  it("POST agents/retry-reset on loopback with NO bearer is REJECTED (401) — default-deny mutation", async () => {
+  it("POST agents/retry-reset on loopback with NO bearer is REJECTED (401) - default-deny mutation", async () => {
     const { base, close } = await makeServer();
     try {
       const res = await fetch(`${base}${API_ROUTES.AGENT_RETRY_RESET}`, {
@@ -1020,7 +1020,7 @@ describe("console router — default-deny on non-GET mutation", () => {
 // Unexpected-error responses never leak internal detail (info-exposure)
 // =====================================================================
 
-describe("console router — 500 responses do not leak internal error detail", () => {
+describe("console router - 500 responses do not leak internal error detail", () => {
   // A non-ConsoleError thrown from a route handler must NOT have its message
   // (which can carry filesystem paths, stack text, or upstream internals)
   // returned to the client. The response is a generic { ok:false,
