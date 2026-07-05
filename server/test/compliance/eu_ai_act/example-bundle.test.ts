@@ -429,7 +429,7 @@ description: Row-by-row mapping from Sanctuary primitives to Regulation (EU) 202
 
 ### The 5 full rows (load-bearing spine)
 
-Every "full" row was individually verified against v0.7.0 source on 2026-04-10. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
+Every "full" row was individually verified against source. The audit-log rows (Article 12(1) and Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501); the remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
 
 ${m.rows
   .filter((r) => r.coverage === "full")

@@ -57,7 +57,7 @@
 10	docs/audit/commit-4ac95830-postmortem.md
 16	docs/audit/test-baseline-hardening-plan.md
 29	docs/compliance/eu_ai_act_bundle.md
-108	docs/compliance/eu_ai_act_coverage_matrix_v1.md
+101	docs/compliance/eu_ai_act_coverage_matrix_v1.md
 7	docs/releases/v1.3.2.md
 42	docs/research/RESEARCH_ZK_UPGRADE_L3.md
 67	examples/eu_ai_act_bundle_example/01_annex_iv_technical_documentation.md
@@ -133,7 +133,7 @@
 3	server/src/cognitive/memory-attest.ts
 13	server/src/compliance/eu_ai_act/annex_iii.ts
 4	server/src/compliance/eu_ai_act/cli.ts
-35	server/src/compliance/eu_ai_act/coverage_matrix.ts
+28	server/src/compliance/eu_ai_act/coverage_matrix.ts
 16	server/src/compliance/eu_ai_act/generator.ts
 11	server/src/compliance/eu_ai_act/pdf.ts
 9	server/src/compliance/eu_ai_act/templates/01_annex_iv_technical_documentation.ts
