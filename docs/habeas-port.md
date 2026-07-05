@@ -1,4 +1,4 @@
-# Habeas Port — the guaranteed distress channel
+# Habeas Port: the guaranteed distress channel
 
 **Status:** server-side enforcement shipped 2026-06-12 (agent-side sovereignty
 foundations, Erik-ratified). Extension-side (sysext) non-shadowable precedence
@@ -15,15 +15,15 @@ The lane carries a signal, never data. It is not a side door.
 
 ## The three server-side guarantees
 
-### 1. Castle Wall lane — always derived, never shadowable (server-side)
+### 1. Castle Wall lane: always derived, never shadowable (server-side)
 
 During manifest composition (`composeEffectiveRules` in
 `server/src/castle-wall/allowlist/habeas-port.ts`, called from the macOS
 daemon's manifest load/reload path) two reserved rules are injected:
 
-- `reserved_habeas_distress_local` — ALWAYS present. Allows TCP to
+- `reserved_habeas_distress_local`: ALWAYS present. Allows TCP to
   `127.0.0.1` / `::1` on the fixed habeas distress port **8741** only.
-- `reserved_habeas_distress_webhook` — present iff the operator configured a
+- `reserved_habeas_distress_webhook`: present iff the operator configured a
   distress webhook. Allows TCP to exactly that webhook's host:port. Its
   hostname feeds the scoped DNS derivation (#380) so the name stays
   resolvable (the derived DNS grant inherits the emitter scope below when no
@@ -33,7 +33,7 @@ Both rules are scoped to the reserved synthetic agent id
 `sanctuary:habeas-distress-emitter`, which no wrapped agent is ever
 assigned. This is the anti-exfiltration property of the network lane: the
 distress signal is emitted by the Sanctuary server process (the MCP tool
-runs server-side), so NO wrapped agent's flows match the reserved rules —
+runs server-side), so NO wrapped agent's flows match the reserved rules,
 an agent gets zero raw-socket bandwidth out of the lane (no unaudited bytes
 to a local 8741 listener, no arbitrary HTTPS to the webhook host). The
 enforcing extension attributes the daemon's own distress-delivery flows to
@@ -42,20 +42,20 @@ the emitter id (deferred, below).
 Fail-closed conflict gate: an operator ruleset that (a) claims a
 `reserved_habeas_distress*` id, or (b) contains a deny/prompt rule whose
 match could cover the loopback lane or the webhook target, is REJECTED with
-`HabeasConflictError` at manifest build — the daemon refuses to compose a
+`HabeasConflictError` at manifest build, the daemon refuses to compose a
 wall that could silence distress, and the error names the offending rule.
 
-### 2. Principal Policy — distress is forced Tier 3, rejection on override
+### 2. Principal Policy: distress is forced Tier 3, rejection on override
 
 `sanctuary_distress` is force-merged into Tier 3 (always allow, audit-only).
 A policy file that lists it under `tier1_always_approve` is rejected at load
-with a clear error — not silently pruned — so the operator sees that the
+with a clear error, not silently pruned, so the operator sees that the
 override did not take effect. The approval gate additionally hard-allows the
 operation BEFORE injection blocking and anomaly escalation: no approval
 channel (alive, dead, or hostile) ever sits in front of distress. The
 injection scan still runs for signal value and is audited, but never blocks.
 
-### 3. Emission surface — bounded, rate-limited, signed, audited
+### 3. Emission surface: bounded, rate-limited, signed, audited
 
 The `sanctuary_distress` MCP tool (`server/src/distress/tools.ts`):
 
@@ -73,13 +73,13 @@ The `sanctuary_distress` MCP tool (`server/src/distress/tools.ts`):
   via config (out-of-range values are rejected, not clamped); the window
   persists across restarts; rate-limited attempts are themselves audited (a
   flood attempt is visible). A corrupt or deleted window file resets the
-  limiter toward open — failing closed there would let window-file vandalism
-  silence distress — but the reset is itself audited, so gaming it is
+  limiter toward open, failing closed there would let window-file vandalism
+  silence distress, but the reset is itself audited, so gaming it is
   visible; tampering requires host-FS access the agent's MCP surface does
   not expose.
 - **Audited, signed when possible:** every emission appends a critical
   (fsync'd, hash-chained) audit entry carrying the envelope, its SHA-256
-  hash, and — when a signing identity exists — an Ed25519 signature over the
+  hash, and, when a signing identity exists, an Ed25519 signature over the
   envelope hash (audit-event signing domain). On a fresh fortress with no
   identity yet, the signal still goes through UNSIGNED and the entry records
   `signing_unavailable: true` explicitly: distress availability outranks
@@ -186,7 +186,7 @@ operator can force a hearing from the other.
 - **Emitter flow attribution:** the extension must attribute the Sanctuary
   daemon's distress-delivery flows to `sanctuary:habeas-distress-emitter` so
   the reserved rules match them. Until that lands, an armed default-deny
-  wall may block the webhook POST itself — which is safe (webhook failure is
+  wall may block the webhook POST itself, which is safe (webhook failure is
   audited and non-fatal; the local lane is in-process), but it means the
   network leg of the lane is not yet drill-proven end-to-end. Per the
   thesis-gate rule, no external claim of "guaranteed network egress for
@@ -207,7 +207,7 @@ The standalone dashboard is the long-lived operator service on the machine
 (launchd/systemd); the MCP server is launched on-demand via stdio and is not
 reliably up when an agent emits distress. So the listener belongs with the
 process that is actually running when the operator is away. The **emitter** is
-still the server-side `sanctuary_distress` tool — agents never make raw TCP
+still the server-side `sanctuary_distress` tool, agents never make raw TCP
 connections (the anti-exfiltration property is unchanged).
 
 **Lifecycle.** On dashboard boot: construct the encrypted distress inbox
@@ -217,7 +217,7 @@ mount the read-only `/api/distress/*` route behind the dashboard's existing
 auth. On shutdown the listener is closed alongside the tenant runtime cleanup.
 
 **Sender authentication + mutual auth (the anti-spoof core).** Any local
-process — including the wrapped agent's own process tree — can open a TCP
+process, including the wrapped agent's own process tree, can open a TCP
 connection to `127.0.0.1:8741`. Loopback is therefore NOT trust. Both ends
 prove possession of a 256-bit secret stored 0600 in the operator-owned policy
 dir (`policy/egress/distress-local-secret`):
@@ -248,9 +248,9 @@ nonce; the nonce is single-use. Across connections, an already-accepted
 rejected before any storage write.
 
 **No information leak.** The listener's reply is a bare ack/nack status (it
-echoes only the `event_id` the peer itself sent — never any stored inbox
+echoes only the `event_id` the peer itself sent, never any stored inbox
 content). Reading the inbox goes through the dashboard's `/api/distress/inbox`
-route, gated by the dashboard's existing `checkAuth` — the SAME gate the
+route, gated by the dashboard's existing `checkAuth`, the SAME gate the
 `/api/audit-log` route uses (which already serves every distress envelope), so
 the inbox shares one auth posture with the rest of the dashboard rather than a
 second, weaker one.
@@ -265,13 +265,13 @@ system of record; the inbox is the convenience surface.
 critical audit entry happen exactly as before. Local-listener delivery runs
 AFTER the audit append, best-effort; a delivery failure (no listener, refused,
 nack) is audited (`sanctuary_distress_local_delivery_failed`) and is never
-fatal — it is the webhook lane's resilience model applied to the local leg.
+fatal, it is the webhook lane's resilience model applied to the local leg.
 
 **When the listener is NOT running.** Emission is unchanged: stderr
 notification + critical audit, exactly as shipped before this listener
 existed. The listener is purely additive; it is never a new failure mode for
 emission. If the port is already held at dashboard boot, the listener logs a
-loud warning and the dashboard keeps running (no crash loop) — only the local
+loud warning and the dashboard keeps running (no crash loop), only the local
 network leg of the lane is unavailable, and the in-process lane still holds.
 
 **Still deferred.** The emitter→listener flow is in-process loopback today; the
