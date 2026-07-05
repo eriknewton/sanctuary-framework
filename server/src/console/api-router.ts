@@ -305,7 +305,11 @@ function handleError(res: ServerResponse, err: unknown): void {
       detail: err.message,
     });
   } else {
-    const msg = err instanceof Error ? err.message : String(err);
-    writeJSON(res, 500, { ok: false, error: "internal", detail: msg });
+    // Unexpected (non-ConsoleError) failures can carry internal detail in
+    // their message or stack (filesystem paths, upstream error text). Never
+    // return that to the console client: the ConsoleError branch above is the
+    // only operator-facing error text, and its messages are constructed from
+    // known-safe strings. Unexpected errors get a generic 500 with no detail.
+    writeJSON(res, 500, { ok: false, error: "internal" });
   }
 }

@@ -1015,3 +1015,65 @@ describe("console router — default-deny on non-GET mutation", () => {
     }
   });
 });
+
+// =====================================================================
+// Unexpected-error responses never leak internal detail (info-exposure)
+// =====================================================================
+
+describe("console router — 500 responses do not leak internal error detail", () => {
+  // A non-ConsoleError thrown from a route handler must NOT have its message
+  // (which can carry filesystem paths, stack text, or upstream internals)
+  // returned to the client. The response is a generic { ok:false,
+  // error:"internal" } with no `detail`. Regression guard for the
+  // js/stack-trace-exposure finding in api-router.ts handleError().
+  const SECRET_MARKER = "/Users/secret/.sanctuary/private-internal-path";
+
+  async function makeThrowingServer(): Promise<{
+    base: string;
+    close: () => Promise<void>;
+  }> {
+    // GET header/badge passes loopback auto-auth and reaches the service; a
+    // plain Error here exercises handleError()'s non-ConsoleError branch.
+    const stubService = {
+      getHeader: async () => {
+        throw new Error(`boom ${SECRET_MARKER}`);
+      },
+    } as unknown as ConsoleRouterDeps["service"];
+    const deps: ConsoleRouterDeps = {
+      authConfig: { loopbackAutoAuth: true, authToken: "irrelevant" },
+      service: stubService,
+    };
+    const server: Server = createServer(
+      async (req: IncomingMessage, res: ServerResponse) => {
+        const handled = await handleConsoleRoute(deps, req, res);
+        if (!handled) res.writeHead(404).end();
+      },
+    );
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const addr = server.address() as AddressInfo;
+    return {
+      base: `http://127.0.0.1:${addr.port}`,
+      close: () =>
+        new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  it("an unexpected handler error returns a generic 500 with no leaked detail", async () => {
+    const { base, close } = await makeThrowingServer();
+    try {
+      const res = await fetch(`${base}${API_ROUTES.HEADER_BADGE}`);
+      expect(res.status).toBe(500);
+      const raw = await res.text();
+      // The internal error text (and the secret path inside it) must not appear.
+      expect(raw).not.toContain(SECRET_MARKER);
+      expect(raw).not.toContain("boom");
+      const body = JSON.parse(raw);
+      expect(body).toEqual({ ok: false, error: "internal" });
+      expect(body.detail).toBeUndefined();
+    } finally {
+      await close();
+    }
+  });
+});
