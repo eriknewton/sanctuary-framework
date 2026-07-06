@@ -141,6 +141,15 @@ export interface MacOSFlowIpcListenerOptions {
   adminHandler?: MacOSFlowIpcAdminHandler;
   /** Called before an inbound operator revoke is broadcast to subscribers. */
   onArmLeaseRevoke?: (lease: ArmLeaseNotification) => void | Promise<void>;
+  /**
+   * Called before an inbound NON-revoke operator arm-lease is broadcast to
+   * subscribers, so the daemon can ADOPT the operator's dead-man TTL. Without
+   * this, the daemon's periodic no-TTL heartbeat re-broadcast erases the
+   * operator's `--ttl` deadline in the extension every heartbeat interval, so
+   * the dead-man `ttl_expired` fail-open never fires (the 2026-07-05 Mini1
+   * TTL-expiry drill gap: armed `--ttl 90s`, still enforcing at t+160s).
+   */
+  onArmLease?: (lease: ArmLeaseNotification) => void | Promise<void>;
 }
 
 export interface MacOSHandshakeSigner {
@@ -225,6 +234,7 @@ export class MacOSFlowIpcListener {
   private readonly handshakeSigner: MacOSHandshakeSigner | null;
   private readonly adminHandler: MacOSFlowIpcAdminHandler | null;
   private readonly onArmLeaseRevoke: ((lease: ArmLeaseNotification) => void | Promise<void>) | null;
+  private readonly onArmLease: ((lease: ArmLeaseNotification) => void | Promise<void>) | null;
   private currentArmLease: ArmLeaseNotification | null = null;
   private server: Server | null = null;
   private connections = new Map<string, ConnectionState>();
@@ -246,6 +256,7 @@ export class MacOSFlowIpcListener {
     this.handshakeSigner = opts.handshakeSigner ?? null;
     this.adminHandler = opts.adminHandler ?? null;
     this.onArmLeaseRevoke = opts.onArmLeaseRevoke ?? null;
+    this.onArmLease = opts.onArmLease ?? null;
   }
 
   /** Bind the UDS socket and start accepting connections. */
@@ -560,6 +571,11 @@ export class MacOSFlowIpcListener {
   private async handleArmLease(message: ArmLeaseNotification): Promise<void> {
     if (message.revoked === true) {
       await this.onArmLeaseRevoke?.(message);
+    } else {
+      // A non-revoke operator arm lets the daemon ADOPT the operator's TTL so
+      // its periodic heartbeat re-broadcasts the SAME dead-man deadline instead
+      // of erasing it with a no-TTL renewal.
+      await this.onArmLease?.(message);
     }
     await this.broadcastArmLease(message);
   }

@@ -291,6 +291,163 @@ describe("Castle Wall macOS daemon integration", () => {
     await handle.stop();
   });
 
+  // Regression for the 2026-07-05 Mini1 TTL-expiry gap: `enable --ttl 90s`
+  // armed the wall but at t+160s the dead-man had NOT fired. Root cause: the
+  // daemon's periodic heartbeat rebuilt the lease from the static
+  // `input.armLeaseTtlSeconds` (never set by any caller -> null), erasing the
+  // operator's TTL in the extension every interval so `leaseExpiresAt` never
+  // arrived. The fix adopts the operator's TTL (onArmLease) and re-broadcasts
+  // the DECREMENTING remaining seconds toward a fixed deadline. These two tests
+  // pin both invariants: the dead-man FIRES on real expiry, and NEVER fires
+  // early on a still-live lease (the anti-spurious-disarm / anti-brick side).
+  it("adopts the operator TTL and broadcasts ttl_seconds=0 (fail-open) once the injected clock passes the deadline", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const broadcasts: ArmLeaseNotification[] = [];
+    let armHook:
+      | ((lease: ArmLeaseNotification) => void | Promise<void>)
+      | undefined;
+    // Injected wall clock so the deadline is crossed by advancing a number, not
+    // by sleeping the test.
+    const clock = { ms: 1_000_000 };
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      armLeaseHeartbeatIntervalSeconds: 0.01,
+      now: () => clock.ms,
+      listenerFactory(options) {
+        armHook = options.onArmLease;
+        return {
+          async start() {
+            await writeFile(options.socketPath, "");
+          },
+          async stop() {
+            await unlink(options.socketPath).catch(() => {});
+          },
+          async broadcastManifestUpdate() {
+            return 0;
+          },
+          async broadcastDecisionResponse() {
+            return 0;
+          },
+          async broadcastArmLease(lease: ArmLeaseNotification) {
+            broadcasts.push(lease);
+            return 0;
+          },
+        };
+      },
+    });
+
+    // Operator arms with a 90s dead-man TTL (the drill's `--ttl 90s`). The
+    // daemon adopts the deadline = now + 90s.
+    await armHook?.({
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: 90,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-05T00:00:00.000Z",
+    });
+
+    // Let several heartbeats fire WITHOUT advancing the clock: every one must
+    // carry a positive remaining TTL (never null, never 0) so the operator's
+    // deadline is preserved rather than erased.
+    broadcasts.length = 0;
+    await wait(40);
+    expect(broadcasts.length).toBeGreaterThan(0);
+    for (const lease of broadcasts) {
+      expect(lease.armed).toBe(true);
+      expect(lease.ttl_seconds).toBeGreaterThan(0);
+      expect(lease.ttl_seconds).toBeLessThanOrEqual(90);
+    }
+
+    // Advance the injected clock PAST the 90s deadline. The next heartbeat must
+    // broadcast ttl_seconds=0, which the Swift extension turns into an immediate
+    // `ttl_expired` fail-open (the dead-man firing).
+    broadcasts.length = 0;
+    clock.ms += 91_000;
+    await wait(40);
+    expect(broadcasts.some((lease) => lease.ttl_seconds === 0)).toBe(true);
+
+    // ...and the lease heartbeat then STOPS (it does not keep spamming a 0-TTL
+    // renewal once fail-open has been signalled).
+    await wait(20);
+    const afterExpiry = broadcasts.length;
+    await wait(40);
+    expect(broadcasts.length).toBe(afterExpiry);
+
+    await handle.stop();
+  });
+
+  it("keeps renewing a positive TTL and NEVER broadcasts 0 while the operator lease is still live (no spurious dead-man)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const broadcasts: ArmLeaseNotification[] = [];
+    let armHook:
+      | ((lease: ArmLeaseNotification) => void | Promise<void>)
+      | undefined;
+    const clock = { ms: 5_000_000 };
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      armLeaseHeartbeatIntervalSeconds: 0.01,
+      now: () => clock.ms,
+      listenerFactory(options) {
+        armHook = options.onArmLease;
+        return {
+          async start() {
+            await writeFile(options.socketPath, "");
+          },
+          async stop() {
+            await unlink(options.socketPath).catch(() => {});
+          },
+          async broadcastManifestUpdate() {
+            return 0;
+          },
+          async broadcastDecisionResponse() {
+            return 0;
+          },
+          async broadcastArmLease(lease: ArmLeaseNotification) {
+            broadcasts.push(lease);
+            return 0;
+          },
+        };
+      },
+    });
+
+    await armHook?.({
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: 90,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-05T00:00:00.000Z",
+    });
+
+    // Advance the clock only PART WAY toward the deadline (30s of a 90s TTL) and
+    // let many heartbeats fire. A live, unexpired lease must NEVER report 0.
+    broadcasts.length = 0;
+    clock.ms += 30_000;
+    await wait(60);
+    expect(broadcasts.length).toBeGreaterThan(0);
+    for (const lease of broadcasts) {
+      expect(lease.armed).toBe(true);
+      expect(lease.ttl_seconds).not.toBeNull();
+      expect(lease.ttl_seconds).toBeGreaterThan(0);
+      // Remaining is bounded by the original 90s and reflects the ~60s left.
+      expect(lease.ttl_seconds).toBeLessThanOrEqual(90);
+      expect(lease.ttl_seconds).toBeGreaterThanOrEqual(59);
+    }
+
+    await handle.stop();
+  });
+
   it("emits a provenance-marked castle_wall_heartbeat audit entry on its audit-cadence interval (Slice 2)", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress();
     const handle = await startMacOSCastleWallDaemon({

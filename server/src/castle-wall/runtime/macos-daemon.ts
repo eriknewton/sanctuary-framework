@@ -195,6 +195,12 @@ export interface MacOSCastleWallDaemonInput {
   armLeaseTtlSeconds?: number | null;
   armLeaseHeartbeatIntervalSeconds?: number;
   /**
+   * Injectable wall clock (epoch ms) for the dead-man TTL deadline. Defaults to
+   * `Date.now`. Tests inject a controllable clock so the periodic heartbeat's
+   * TTL-expiry fail-open can be asserted deterministically without a real sleep.
+   */
+  now?: () => number;
+  /**
    * Interval (seconds) of the periodic AUDIT liveness heartbeat (observability
    * Slice 2). This is a SEPARATE, slower cadence than the ~5s IPC arm-lease
    * heartbeat above: the IPC lease is an in-memory broadcast (no audit write),
@@ -299,6 +305,46 @@ export async function startMacOSCastleWallDaemon(
     clearInterval(leaseHeartbeat);
     leaseHeartbeat = undefined;
   };
+  // Absolute epoch-ms deadline of the operator's active dead-man TTL, or null
+  // for durable (--no-ttl) arming. The daemon ADOPTS this when an operator
+  // arm-lease with a positive `ttl_seconds` arrives (onArmLease), and its
+  // periodic heartbeat re-broadcasts the REMAINING seconds toward this fixed
+  // deadline. Without it, each heartbeat rebuilt the lease from the static
+  // `input.armLeaseTtlSeconds` (never set by any caller -> always null), which
+  // erased the operator's TTL in the extension every heartbeat interval, so the
+  // dead-man `ttl_expired` fail-open never fired (2026-07-05 Mini1 TTL-expiry
+  // drill: armed `--ttl 90s`, still enforcing at t+160s). `nowMs` is injectable
+  // so the fail-open deadline is testable without a wall-clock sleep.
+  const nowMs = input.now ?? (() => Date.now());
+  let operatorLeaseDeadlineMs: number | null =
+    typeof input.armLeaseTtlSeconds === "number" && input.armLeaseTtlSeconds > 0
+      ? nowMs() + input.armLeaseTtlSeconds * 1000
+      : null;
+  // Latched once the lease heartbeat has broadcast a fully-expired (0s) lease,
+  // so the interval self-cancels even in the first-emit-already-expired edge.
+  // A fresh operator arm (onArmLease) clears it to resume renewals.
+  let leaseExpired = false;
+  /**
+   * Remaining whole seconds until the operator's dead-man deadline, or null for
+   * durable arming. Returns 0 once the deadline has passed so the next heartbeat
+   * broadcasts `ttl_seconds: 0`, which the Swift extension turns into an
+   * immediate `ttl_expired` fail-open. Never negative. Rounds UP so a still-live
+   * lease is never reported as already-expired by a sub-second rounding error
+   * (the anti-spurious-disarm direction: a dead-man must never fire early on a
+   * live/renewed lease).
+   */
+  const remainingLeaseSeconds = (): number | null => {
+    if (operatorLeaseDeadlineMs === null) return null;
+    const remainingMs = operatorLeaseDeadlineMs - nowMs();
+    if (remainingMs <= 0) return 0;
+    return Math.ceil(remainingMs / 1000);
+  };
+  // Restart the periodic lease heartbeat if it is not currently running. Used
+  // when a fresh operator arm arrives AFTER a prior TTL expiry stopped the beat
+  // (re-arm resumes renewals). Assigned once the emit loop is wired up below;
+  // an operator arm can only arrive after `listener.start()`, by which point
+  // this is set. A no-op before then.
+  let restartLeaseHeartbeat: (() => void) | undefined;
   const auditHeartbeatIntervalSeconds =
     input.auditHeartbeatIntervalSeconds ??
     CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS;
@@ -376,8 +422,27 @@ export async function startMacOSCastleWallDaemon(
         return { ok: true };
       },
     },
+    onArmLease(lease) {
+      // ADOPT the operator's dead-man TTL so the periodic heartbeat below
+      // re-broadcasts the SAME deadline (decrementing remaining seconds) rather
+      // than erasing it with a no-TTL renewal. A positive `ttl_seconds` anchors
+      // a fresh deadline; null/absent (an explicit --no-ttl arm) clears any
+      // prior deadline back to durable. Never EXTENDS an unrelated deadline: the
+      // most recent operator arm is authoritative.
+      operatorLeaseDeadlineMs =
+        typeof lease.ttl_seconds === "number" && lease.ttl_seconds > 0
+          ? nowMs() + lease.ttl_seconds * 1000
+          : null;
+      // A fresh arm clears any prior expiry latch and resumes renewals if a
+      // previous TTL expiry had stopped the beat (re-arm after fail-open).
+      leaseExpired = false;
+      restartLeaseHeartbeat?.();
+    },
     async onArmLeaseRevoke() {
       stopLeaseHeartbeat();
+      // A revoke ends the operator's dead-man window; drop the adopted deadline
+      // so a later re-arm cannot inherit a stale expiry.
+      operatorLeaseDeadlineMs = null;
       // A revoked arm-lease means the wall is no longer enforcing for this
       // operator; stop claiming liveness too so the reader does not see a fresh
       // heartbeat from a daemon that has been told to stand down.
@@ -448,17 +513,47 @@ export async function startMacOSCastleWallDaemon(
     );
     await input.auditLog.flush();
     const emitLease = async (): Promise<void> => {
+      // Broadcast the REMAINING seconds of the operator's active dead-man TTL,
+      // not the static `input.armLeaseTtlSeconds`. This is the fix for the
+      // 2026-07-05 TTL-expiry gap: previously every heartbeat re-broadcast a
+      // no-TTL lease (input.armLeaseTtlSeconds was never set by any caller), so
+      // the extension's `leaseExpiresAt` was cleared every interval and the
+      // dead-man never fired. Now the deadline stays fixed (heartbeat refreshes
+      // liveness; remaining seconds count down toward the operator's arm+ttl
+      // instant) and the Swift `ttl_expired` fail-open fires on schedule.
+      const remaining = remainingLeaseSeconds();
       await listener.broadcastArmLease(buildArmLease({
         armed: true,
-        ttlSeconds: input.armLeaseTtlSeconds ?? null,
+        ttlSeconds: remaining,
         heartbeatIntervalSeconds,
       })).catch(() => undefined);
+      // Once the deadline has passed, we have broadcast `ttl_seconds: 0` (an
+      // immediate fail-open in the extension). Stop the lease heartbeat so we do
+      // not keep spamming a 0-TTL renewal; the wall has intentionally degraded
+      // to the operator-armed fail-open. The audit liveness heartbeat is left
+      // running (the daemon process itself is still alive and honest about it).
+      // `leaseExpired` also covers the (test-only) case where the FIRST emit is
+      // already expired: the interval is created just below, so a plain
+      // stopLeaseHeartbeat() here would no-op against a not-yet-assigned handle;
+      // the flag makes the next tick self-cancel.
+      if (remaining === 0) {
+        leaseExpired = true;
+        stopLeaseHeartbeat();
+      }
+    };
+    restartLeaseHeartbeat = (): void => {
+      if (leaseHeartbeat) return;
+      leaseHeartbeat = setInterval(() => {
+        if (leaseExpired) {
+          stopLeaseHeartbeat();
+          return;
+        }
+        void emitLease();
+      }, heartbeatIntervalSeconds * 1000);
+      leaseHeartbeat.unref();
     };
     await emitLease();
-    leaseHeartbeat = setInterval(() => {
-      void emitLease();
-    }, heartbeatIntervalSeconds * 1000);
-    leaseHeartbeat.unref();
+    restartLeaseHeartbeat();
 
     // Observability Slice 2: periodic AUDIT liveness heartbeat. SEPARATE from the
     // IPC arm-lease heartbeat above (that is an in-memory broadcast; this writes
