@@ -195,6 +195,53 @@ describe("sanctuary federation revoke-push / downgrade-log — end-to-end (keych
     }
   });
 
+  it("UNSORTED + DUPLICATE --license-id ids verify and persist (canonicalized before signing)", async () => {
+    // Regression for the argv-order signature mismatch: the CLI must canonicalize
+    // (sort + dedupe) the id set INTO the payload before signing so the signed
+    // bytes match what verifyPushedRevocationList (which canonicalizes) recomputes.
+    // A raw-order sign would spuriously bad_signature this set (exit 3).
+    const fortressPath = join(tmp, "f");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runFederationCommand({
+      argv: [
+        "revoke-push", "--fortress", fortressPath,
+        "--version", "1",
+        // deliberately UNSORTED + a DUPLICATE:
+        "--license-id", "lic-zeta",
+        "--license-id", "lic-alpha",
+        "--license-id", "lic-zeta",
+        "--license-id", "lic-mid",
+      ],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+    expect(code).toBe(0);
+    expect(err.text).toBe("");
+    // 3 unique ids after dedupe.
+    expect(out.text).toContain('"revoked_count": 3');
+
+    // The persisted list is the CANONICAL sorted, deduped set and authenticates.
+    const master = await fortressMasterKey(fortressPath, recoveryKey);
+    try {
+      const stored = await readRevocationList(new FilesystemStorage(join(fortressPath, "state")), master);
+      expect(stored.status).toBe("valid");
+      if (stored.status === "valid") {
+        expect(stored.payload.revokedLicenseIds).toEqual([
+          "lic-alpha",
+          "lic-mid",
+          "lic-zeta",
+        ]);
+      }
+    } finally {
+      master.fill(0);
+    }
+  });
+
   it("MONOTONIC: a second push at an equal version is refused (exit 3); a higher version advances", async () => {
     const fortressPath = join(tmp, "f");
     const recoveryKey = await seedFortressWithIdentity(fortressPath);

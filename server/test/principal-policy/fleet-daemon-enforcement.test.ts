@@ -51,6 +51,11 @@ import {
   writeFleetActivation,
   resolveActivation,
 } from "../../src/entitlement/activation.js";
+import {
+  writeRevocationList,
+  signRevocationList,
+  verifyPushedRevocationList,
+} from "../../src/entitlement/revocation-list.js";
 import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
 import type {
   FederationContext,
@@ -478,5 +483,64 @@ describe("PR-B daemon activation route - fail-closed auth + real grandfather bas
     expect(cap.paid).toBe(false);
     expect(cap.reason).toBe("expired");
     expect(cap.maxNodes).toBe(5);
+  });
+});
+
+describe("PR-3 fail-closed - a CORRUPT revocation list drops a paid fleet on the enforcement path", () => {
+  it("a PRESENT-but-corrupt revocation list drops the paid roster from 8 back to 5 (fail closed, HTTP)", async () => {
+    // Coordinator-adjudicated 2026-07-06: revocation state that cannot be
+    // authenticated must NOT keep a paid tier. A valid Team license lifts the
+    // roster to all 8; a present-but-corrupt revocation list then forces the
+    // per-request `resolveFleetCap` to Community (5), even though the license
+    // token itself still verifies and is in-window.
+    h = await startHarness({ totalNodes: 8 });
+    await writeFleetActivation(h.storage, h.masterKey, liveValidLicense(25), 0);
+    // Baseline: paid, all 8 on the console.
+    expect((await fetchFleet(h)).nodes).toHaveLength(8);
+
+    // Write a revocation list under a DIFFERENT master so it reads INVALID under
+    // the harness master (a present-but-corrupt list, the fail-closed trigger).
+    await writeRevocationList(h.storage, randomBytes(32), {
+      version: 1,
+      revokedLicenseIds: ["lic-daemon-e2e"],
+      issuer: "issuer-fp",
+      issuedAt: "2026-07-06T00:00:00.000Z",
+    });
+
+    // The paid fleet is now dropped to the community floor of 5.
+    const dropped = await fetchFleet(h);
+    expect(dropped.nodes).toHaveLength(5);
+    // Security is never gated: policy-push stays available to every node.
+    expect(dropped.policy_distribution.available).toBe(true);
+  });
+
+  it("an ABSENT revocation list keeps the paid roster at all 8 (must NOT fail closed)", async () => {
+    // The absent-vs-corrupt distinction at the enforcement path: an absent list
+    // means nothing is revoked, so the paid fleet is unaffected.
+    h = await startHarness({ totalNodes: 8 });
+    await writeFleetActivation(h.storage, h.masterKey, liveValidLicense(25), 0);
+    // No revocation list written (absent).
+    expect((await fetchFleet(h)).nodes).toHaveLength(8);
+  });
+
+  it("a VALID revocation list that names the active license drops the roster to 5 (authenticated revoke)", async () => {
+    // The positive-path control: a real, authenticated revocation of the active
+    // license id also drops the paid fleet - proving the corrupt-list path is
+    // fail-closed alongside a genuine revoke, not instead of it.
+    h = await startHarness({ totalNodes: 8 });
+    await writeFleetActivation(h.storage, h.masterKey, liveValidLicense(25), 0);
+    const signed = signRevocationList(
+      {
+        version: 1,
+        revokedLicenseIds: ["lic-daemon-e2e"],
+        issuer: "issuer-fp",
+        issuedAt: "2026-07-06T00:00:00.000Z",
+      },
+      (m) => ed25519.sign(m, issuer.privateKey),
+    );
+    const v = verifyPushedRevocationList(signed, issuer.publicKey, 0);
+    expect(v.ok).toBe(true);
+    if (v.ok) await writeRevocationList(h.storage, h.masterKey, v.payload);
+    expect((await fetchFleet(h)).nodes).toHaveLength(5);
   });
 });

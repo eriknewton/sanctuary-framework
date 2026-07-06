@@ -315,6 +315,22 @@ describe("isLicenseRevoked - fail-closed lookup", () => {
     expect((await isLicenseRevoked(storage, master, null)).revoked).toBe(false);
     expect((await isLicenseRevoked(storage, master, "")).revoked).toBe(false);
   });
+
+  it("distinguishes ABSENT (listReadable:true) from CORRUPT (listReadable:false) - the enforcement trigger", async () => {
+    // The fail-closed enforcement callers key off listReadable: absent keeps a
+    // paid grant (nothing revoked), corrupt drops it (state unverifiable). This
+    // asserts the SIGNAL the callers rely on cleanly separates the two.
+    const absentStorage = new MemoryStorage();
+    const absent = await isLicenseRevoked(absentStorage, master, "lic-x");
+    expect(absent).toEqual({ revoked: false, listReadable: true, version: 0 });
+
+    const corruptStorage = new MemoryStorage();
+    await writeRevocationList(corruptStorage, master, payload({ version: 3 }));
+    // Read under the wrong master -> present-but-invalid (corrupt).
+    const corrupt = await isLicenseRevoked(corruptStorage, wrongMaster, "lic-x");
+    expect(corrupt.listReadable).toBe(false);
+    expect(corrupt.revoked).toBe(false);
+  });
 });
 
 // ── buildRevocationListMessage sanity ─────────────────────────────────────────

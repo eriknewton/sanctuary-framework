@@ -207,6 +207,20 @@ function isPlausibleToken(token: unknown): token is EntitlementToken {
  * master-MAC'd record. `grandfatheredBaseline` is clamped to a safe non-negative
  * integer (a malformed baseline persists as 0 - no grandfather floor - never a
  * large silent cap-lift).
+ *
+ * GROW-ONLY (fleet control plane PR-3 fix): the grandfather baseline is the
+ * PERMANENT free floor of an existing fleet; it must never be LOWERED by a write.
+ * A paid re-activation (or a concurrent auto-capture tick) recomputes the baseline
+ * from the LIVE roster, which can be transiently small (a node briefly offline, a
+ * roster hiccup mid-recompute) - blind-writing that lower value would permanently
+ * strip a previously-captured higher floor. So this reads the currently-stored
+ * (authenticated) baseline and persists `Math.max(existing, incoming)`, protecting
+ * BOTH the auto-capture path and the paid-activation path at the ONE persistence
+ * chokepoint. A LOWER baseline is only reachable by an explicit deactivation
+ * ({@link clearFleetActivation} removes the whole record, so a subsequent activate
+ * starts from an ABSENT record with no stored floor to compare against) - never by
+ * an accidental lowering write here. An unreadable/absent stored record supplies
+ * no floor (existing = incoming), so a first write is unaffected.
  */
 export async function writeFleetActivation(
   storage: StorageBackend,
@@ -215,10 +229,20 @@ export async function writeFleetActivation(
   grandfatheredBaseline: number,
   now: () => Date = () => new Date(),
 ): Promise<void> {
-  const baseline =
+  const incoming =
     Number.isSafeInteger(grandfatheredBaseline) && grandfatheredBaseline >= 0
       ? grandfatheredBaseline
       : 0;
+  // Grow-only: never lower a previously-captured, authenticated baseline. Only a
+  // VALID stored record supplies a trustworthy floor; an absent/invalid record
+  // contributes 0 (a tampered on-disk baseline must never raise the floor - it is
+  // inside a failed MAC - and an absent record has no floor yet).
+  let existingFloor = 0;
+  const current = await readFleetActivation(storage, master);
+  if (current.status === "valid") {
+    existingFloor = current.data.grandfatheredBaseline;
+  }
+  const baseline = Math.max(existingFloor, incoming);
   const data: FleetActivationData = {
     token,
     grandfatheredBaseline: baseline,

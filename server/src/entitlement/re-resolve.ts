@@ -28,10 +28,13 @@
  *
  * ── FAIL-CLOSED ─────────────────────────────────────────────────────────────
  * Any resolve/verify/read failure resolves to Community; a revoked license
- * resolves to Community; this pass can only ever REMOVE paid capacity, never
- * grant it, and NEVER touches a node's wall (there is no wall/enforcement code on
- * this path). Auto-capture is grow-only + idempotent: it captures ONCE, from the
- * durable count, and never LOWERS an existing baseline.
+ * resolves to Community; a PRESENT-but-CORRUPT revocation list (revocation state
+ * unverifiable) ALSO drops a paid grant to Community (coordinator-adjudicated
+ * 2026-07-06 - an ABSENT list keeps the grant, since nothing is revoked). This
+ * pass can only ever REMOVE paid capacity, never grant it, and NEVER touches a
+ * node's wall (there is no wall/enforcement code on this path). Auto-capture is
+ * grow-only + idempotent: it captures ONCE, from the durable count, and never
+ * LOWERS an existing baseline.
  */
 
 import type { StorageBackend } from "../storage/interface.js";
@@ -179,8 +182,9 @@ function transitionMessage(
   if (kind === "revocation_list_unreadable") {
     return (
       "The stored license revocation list could not be authenticated " +
-      "(it may be corrupt). Re-push the signed revocation list. No node's " +
-      "Castle Wall protection is affected."
+      "(it may be corrupt), so revocation state is unverifiable and central " +
+      "management has dropped to Community until a fresh signed revocation list " +
+      "is re-pushed. No node's Castle Wall protection is affected."
     );
   }
   if (kind === "upgrade") {
@@ -305,13 +309,17 @@ export async function runFleetReResolve(args: {
 
   // ── Revocation: a revoked license is forced to Community. Consult the SIGNED
   // list by the resolved license id (only meaningful when we actually resolved a
-  // paid grant with an id).
+  // paid grant with an id). FAIL-CLOSED (coordinator-adjudicated 2026-07-06): a
+  // PRESENT-but-CORRUPT list (revocation.listReadable === false) is ALSO a
+  // drop-to-Community trigger for a paid grant - we must not keep the paid tier on
+  // the basis of a revocation list we cannot authenticate. An ABSENT list is
+  // listReadable:true and keeps the grant.
   const revocation = await isLicenseRevoked(storage, master, licenseId);
   let revoked = false;
-  if (cap.paid && revocation.revoked) {
-    revoked = true;
+  if (cap.paid && (revocation.revoked || !revocation.listReadable)) {
+    revoked = revocation.revoked;
     // Force to the community floor, preserving the (authenticated) grandfather
-    // baseline so a revoked-but-grandfathered fleet keeps its historical count.
+    // baseline so a revoked/corrupt-but-grandfathered fleet keeps its count.
     const baseline =
       capRecord.status === "valid" ? capRecord.data.grandfatheredBaseline : 0;
     cap = resolveFleetCap(

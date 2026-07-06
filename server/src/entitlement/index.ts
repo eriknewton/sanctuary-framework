@@ -111,6 +111,7 @@ export {
   REVOCATION_LIST_SIGN_ACTION,
   REVOCATION_LIST_META_KEY,
   buildRevocationListMessage,
+  canonicalizeRevocationListIds,
   signRevocationList,
   verifyPushedRevocationList,
   readRevocationList,
@@ -123,6 +124,14 @@ export {
   type RevocationListVerification,
   type RevocationStatus,
 } from "./revocation-list.js";
+
+export {
+  REVOCATION_VERSION_ANCHOR_META_KEY,
+  readRevocationVersionAnchor,
+  writeRevocationVersionAnchor,
+  effectiveRevocationVersionFloor,
+  type RevocationVersionAnchorData,
+} from "./revocation-antirollback.js";
 
 export {
   DOWNGRADE_LOG_META_KEY,

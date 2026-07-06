@@ -226,6 +226,51 @@ describe("runFleetReResolve - grandfather auto-capture", () => {
     const log = await readDowngradeLog(storage, master);
     expect(log.entries.some((e) => e.kind === "grandfather_capture")).toBe(true);
   });
+
+  it("out-of-order serialized captures never LOWER the baseline (persistence grow-only holds the floor)", async () => {
+    // Fix #4: the auto-capture reads `record.status === "absent"` then writes. In
+    // production the dashboard in-flight latch (fix #3) serializes ticks; the
+    // remaining guarantee at the persistence layer is that even if a SMALLER-roster
+    // write commits FIRST and a larger one lands after (or vice versa), the durable
+    // floor is the MAX, never lowered. We drive that ordering deterministically: the
+    // larger (9) write is delayed so the smaller (6) commits first, then the 9-write's
+    // grow-only read observes 6 and persists max(6, 9) = 9.
+    let firstWriteSeen = false;
+    class OrderedStorage extends MemoryStorage {
+      override async write(ns: string, key: string, data: Uint8Array): Promise<void> {
+        // Delay ONLY the first activation write to land (the larger 9) so the 6
+        // commits ahead of it; the 9's own grow-only read then sees 6.
+        if (ns === "_meta" && key.includes("activation") && !firstWriteSeen) {
+          firstWriteSeen = true;
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        return super.write(ns, key, data);
+      }
+    }
+    const storage = new OrderedStorage();
+    await Promise.all([
+      runFleetReResolve({
+        storage, master, issuerPublicKey: issuer.publicKey, now: NOW,
+        roster: roster(9), prior: null,
+      }),
+      runFleetReResolve({
+        storage, master, issuerPublicKey: issuer.publicKey, now: NOW,
+        roster: roster(6), prior: null,
+      }),
+    ]);
+    const record = await readFleetActivation(storage, master);
+    expect(record.status).toBe("valid");
+    if (record.status === "valid") {
+      // Grow-only held the floor at the larger capture; never lowered to 6.
+      expect(record.data.grandfatheredBaseline).toBe(9);
+    }
+    // A later tick with a small roster still cannot lower it.
+    const again = await runFleetReResolve({
+      storage, master, issuerPublicKey: issuer.publicKey, now: NOW,
+      roster: roster(2), prior: null,
+    });
+    expect(again.cap.maxNodes).toBe(9);
+  });
 });
 
 // ── REVOCATION ───────────────────────────────────────────────────────────────
@@ -348,7 +393,10 @@ describe("runFleetReResolve - fail-closed posture", () => {
     expect(result.cap.maxNodes).toBe(COMMUNITY_FREE_NODE_CAP);
   });
 
-  it("surfaces a corrupt revocation list without stripping a paid fleet", async () => {
+  it("FAILS CLOSED on a PRESENT-but-corrupt revocation list: drops the paid fleet to Community", async () => {
+    // Coordinator-adjudicated 2026-07-06: a corrupt (present-but-invalid) list
+    // means revocation state is UNVERIFIABLE, so a paid grant must NOT keep its
+    // tier. (Failing open would hand a disk attacker a targeted un-revoke.)
     const storage = new MemoryStorage();
     await writeFleetActivation(storage, master, signV2(v2Claims()), 0);
     // A revocation list written under a DIFFERENT master reads invalid here.
@@ -364,11 +412,39 @@ describe("runFleetReResolve - fail-closed posture", () => {
       issuerPublicKey: issuer.publicKey,
       now: NOW,
       roster: roster(10),
-      prior: null,
+      prior: { tier: "team", maxNodes: 25 },
     });
-    // The corrupt list is surfaced, but the paid fleet is NOT stripped.
+    // The corrupt list is surfaced AND the paid fleet is dropped to Community.
     expect(result.revocationListUnreadable).toBe(true);
+    // `revoked` reflects a specific id being on the list; a corrupt list cannot
+    // say WHICH id, so revoked stays false while the cap still drops.
+    expect(result.revoked).toBe(false);
+    expect(result.cap.paid).toBe(false);
+    expect(result.cap.tier).toBe("community");
+    // A downgrade-log row records the corruption so the operator re-pushes.
+    const log = await readDowngradeLog(storage, master);
+    expect(
+      log.entries.some((e) => e.kind === "revocation_list_unreadable"),
+    ).toBe(true);
+  });
+
+  it("an ABSENT revocation list keeps the paid grant (nothing revoked, do NOT fail closed)", async () => {
+    // The absent-vs-corrupt distinction: an absent list must never brick a normal
+    // paid fleet - failing closed there would strip every fleet that never revoked.
+    const storage = new MemoryStorage();
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 0);
+    // No revocation list written at all (absent).
+    const result = await runFleetReResolve({
+      storage,
+      master,
+      issuerPublicKey: issuer.publicKey,
+      now: NOW,
+      roster: roster(10),
+      prior: { tier: "team", maxNodes: 25 },
+    });
+    expect(result.revocationListUnreadable).toBe(false);
     expect(result.revoked).toBe(false);
     expect(result.cap.paid).toBe(true);
+    expect(result.cap.maxNodes).toBe(25);
   });
 });

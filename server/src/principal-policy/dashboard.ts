@@ -93,6 +93,8 @@ import {
   readRevocationList,
   writeRevocationList,
   verifyPushedRevocationList,
+  effectiveRevocationVersionFloor,
+  writeRevocationVersionAnchor,
   readDowngradeLog,
   runFleetReResolve,
   resolveFleetCap as resolveFleetCapPure,
@@ -826,6 +828,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   private _fleetReResolveTimer: ReturnType<typeof setInterval> | null = null;
   private _fleetPriorCap: PriorCapState | null = null;
+  /**
+   * Fleet control plane PR-3 fix: in-flight latch that SERIALIZES the re-resolve
+   * tick. Two ticks can overlap (the hourly interval and the push-triggered
+   * reconcile), and the grandfather auto-capture reads `record.status === "absent"`
+   * BEFORE it writes - two concurrent ticks would both pass that guard and race on
+   * the write, letting the last writer lock in a transient count or lower the
+   * baseline. This holds the running tick's promise so a second call awaits it
+   * (or no-ops) instead of racing. Cleared in a `finally` so a thrown tick never
+   * wedges the latch. (The write itself is also grow-only at the persistence layer;
+   * this latch removes the read-then-write TOCTOU window as well.)
+   */
+  private _fleetReResolveInFlight: Promise<void> | null = null;
   /** Default license re-resolve cadence: hourly (expiry/revocation are coarse). */
   private static readonly FLEET_RE_RESOLVE_INTERVAL_MS = 60 * 60 * 1000;
   /**
@@ -2200,7 +2214,27 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * with no unlocked custody (locked/standalone) is a no-op. Never touches a
    * node's wall.
    */
-  private async runFleetLicenseReResolveTick(): Promise<void> {
+  private runFleetLicenseReResolveTick(): Promise<void> {
+    // Serialize: if a tick is already running, return the SAME promise so a second
+    // caller (the hourly interval firing while a push-triggered tick is mid-flight,
+    // or vice versa) awaits it rather than racing the absent-record capture guard.
+    // Cleared in `finally` so a thrown tick never wedges the latch.
+    if (this._fleetReResolveInFlight !== null) {
+      return this._fleetReResolveInFlight;
+    }
+    const run = this.runFleetLicenseReResolveTickOnce().finally(() => {
+      this._fleetReResolveInFlight = null;
+    });
+    this._fleetReResolveInFlight = run;
+    return run;
+  }
+
+  /**
+   * The body of one re-resolve pass. NEVER call this directly except through the
+   * serializing {@link runFleetLicenseReResolveTick} wrapper - calling it bare
+   * reopens the concurrent-capture race the latch closes.
+   */
+  private async runFleetLicenseReResolveTickOnce(): Promise<void> {
     try {
       const storage = this.storage;
       const masterKey = this.shrOpts?.masterKey;
@@ -3759,21 +3793,25 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // Fleet control plane PR-3: consult the SIGNED revocation list. A paid
       // grant whose license id is on the issuer-signed revocation list is forced
       // CLOSED to the community floor even though its token still verifies and is
-      // in-window (refund / compromise / kill after activation). A corrupt local
-      // list is surfaced elsewhere (the re-resolve tick logs it) but never strips
-      // a paid fleet here (that would be an attacker-triggerable DoS). Consulting
-      // by license id requires re-reading the resolved id; `resolveActivation`
-      // returns only the cap, so we do a cheap revocation-only recheck that fails
-      // OPEN to the already-resolved cap on any read hiccup (never a false strip).
+      // in-window (refund / compromise / kill after activation). Two fail-closed
+      // triggers (coordinator-adjudicated 2026-07-06):
+      //   1. the license id IS on an authenticated list -> revoked -> Community;
+      //   2. the stored list is PRESENT-but-CORRUPT (listReadable:false) ->
+      //      revocation state is UNVERIFIABLE, so we must NOT keep the paid tier on
+      //      the basis of a list we cannot authenticate; drop to Community too. An
+      //      ABSENT list (nothing revoked) is listReadable:true and keeps the grant.
+      // The earlier "corrupt-file DoS" objection is void: corrupting fleet state
+      // already strips paid capacity via the activation MAC, so failing closed here
+      // grants an attacker nothing, while failing open is a targeted un-revoke.
       if (cap.paid) {
         const revocation = await this.revocationStatusForActiveLicense(
           storage,
           masterKey,
           issuerPublicKey ?? new Uint8Array(32),
         );
-        if (revocation.revoked) {
-          // Preserve the authenticated grandfather baseline so a revoked fleet
-          // keeps its historical free count, but drop the PAID lift.
+        if (revocation.revoked || revocation.listUnverifiable) {
+          // Preserve the authenticated grandfather baseline so a revoked/corrupt
+          // fleet keeps its historical free count, but drop the PAID lift.
           return resolveFleetCapPure(
             { granted: false, tier: "community", reason: "invalid" },
             revocation.grandfatheredBaseline,
@@ -3790,37 +3828,58 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   /**
    * Fleet control plane PR-3: resolve whether the CURRENTLY-active license is on
-   * the signed revocation list, plus the authenticated grandfather baseline to
-   * preserve if it is. Reads the activation record for the resolved license id,
-   * then consults {@link isLicenseRevoked}. Fail-SAFE toward "not revoked" on any
-   * read failure (a corrupt/unreadable list must never falsely strip a paid
-   * fleet); the corruption is surfaced by the re-resolve tick's log instead.
-   * Never throws.
+   * the signed revocation list (or whether that list is PRESENT-but-corrupt), plus
+   * the authenticated grandfather baseline to preserve if the paid tier is dropped.
+   * Reads the activation record for the resolved license id, then consults
+   * {@link isLicenseRevoked}.
+   *
+   * FAIL-CLOSED (coordinator-adjudicated 2026-07-06): `revoked` is true when the id
+   * is on an authenticated list; `listUnverifiable` is true when the stored list is
+   * PRESENT-but-INVALID (corrupt / tamper-failed), which the caller ALSO treats as a
+   * drop-to-Community trigger - a paid grant must not survive on an unverifiable
+   * revocation list. An ABSENT list (nothing revoked) is neither: it keeps the
+   * grant. Note `isLicenseRevoked` reports `listReadable:false` ONLY for a
+   * present-corrupt list, never for an absent one, so this cleanly separates the
+   * two. A genuine READ error (storage hiccup) is caught below and returns neither
+   * flag set (fail-SAFE for a transient I/O blip, distinct from an authenticated
+   * corrupt-list verdict). Never throws.
    */
   private async revocationStatusForActiveLicense(
     storage: StorageBackend,
     masterKey: Uint8Array,
     issuerPublicKey: Uint8Array,
-  ): Promise<{ revoked: boolean; grandfatheredBaseline: number }> {
+  ): Promise<{
+    revoked: boolean;
+    listUnverifiable: boolean;
+    grandfatheredBaseline: number;
+  }> {
     try {
       const record = await readFleetActivation(storage, masterKey);
-      if (record.status !== "valid") {
-        return { revoked: false, grandfatheredBaseline: 0 };
+      // The revocation-list readability is independent of the activation id: a
+      // corrupt list is a fail-closed trigger even before we resolve an id.
+      // `isLicenseRevoked` with a null id still surfaces `listReadable` for the
+      // stored list (revoked stays false for a null id).
+      const baseline =
+        record.status === "valid" ? record.data.grandfatheredBaseline : 0;
+      let licenseId: string | null = null;
+      if (record.status === "valid") {
+        const resolution = resolveEntitlement({
+          token: record.data.token,
+          issuerPublicKey,
+          now: Math.floor(Date.now() / 1000),
+        });
+        licenseId =
+          typeof resolution.licenseId === "string" ? resolution.licenseId : null;
       }
-      const resolution = resolveEntitlement({
-        token: record.data.token,
-        issuerPublicKey,
-        now: Math.floor(Date.now() / 1000),
-      });
-      const licenseId =
-        typeof resolution.licenseId === "string" ? resolution.licenseId : null;
       const status = await isLicenseRevoked(storage, masterKey, licenseId);
       return {
         revoked: status.revoked,
-        grandfatheredBaseline: record.data.grandfatheredBaseline,
+        // listReadable:false ONLY for a present-but-corrupt list (absent -> true).
+        listUnverifiable: !status.listReadable,
+        grandfatheredBaseline: baseline,
       };
     } catch {
-      return { revoked: false, grandfatheredBaseline: 0 };
+      return { revoked: false, listUnverifiable: false, grandfatheredBaseline: 0 };
     }
   }
 
@@ -6313,13 +6372,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (issuerPublicKey === null) {
       return { ok: false, reason: "no_issuer" };
     }
-    // The monotonic floor is the CURRENTLY-stored list version (0 when absent);
-    // an unreadable stored list is treated as version 0 so a corrupt file cannot
-    // pin the floor artificially high and block a legitimate newer push.
-    let currentVersion = 0;
+    // The monotonic floor is the EXTERNALLY-ANCHORED version, not merely the
+    // stored list's readable version. A corrupt stored list reads as version 0,
+    // but the master-MAC'd anchor still holds the true floor, so a disk attacker
+    // who trashes the list file cannot roll the floor back to 0 and re-apply an
+    // OLD genuinely-signed (lower-version) list to un-revoke licenses.
+    // `effectiveRevocationVersionFloor` returns max(storedListVersion, anchor)
+    // and never throws; guard anyway and fail SAFE toward floor 0 (the verify below
+    // still rejects any non-newer version, so a hiccup never lowers the real floor
+    // beyond what the persisted records carry).
+    let currentVersion: number;
     try {
-      const current = await readRevocationList(storage, masterKey);
-      if (current.status === "valid") currentVersion = current.payload.version;
+      currentVersion = await effectiveRevocationVersionFloor(storage, masterKey);
     } catch {
       currentVersion = 0;
     }
@@ -6345,7 +6409,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     } catch {
       // Best-effort prior seeding; the tick still runs and fails closed.
     }
+    // BLOB BEFORE ANCHOR: persist the authenticated newer list FIRST, then advance
+    // the external version anchor. A crash between the two leaves the anchor
+    // LAGGING the list, which the max()-based floor treats as benign (never a
+    // rollback, never a false-block) - the dangerous order would false-block a
+    // legitimate re-push at the intended version on a crash.
     await writeRevocationList(storage, masterKey, verification.payload);
+    await writeRevocationVersionAnchor(
+      storage,
+      masterKey,
+      verification.payload.version,
+    );
     // Reconcile immediately: a now-revoked active license drops to Community and
     // the transition is logged without waiting for the hourly tick.
     void this.runFleetLicenseReResolveTick();

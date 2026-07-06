@@ -24,19 +24,30 @@
  *     replay an OLD (shorter) list to un-revoke a license.
  *   - TAMPER-rejected: any edit to the ids/version/issuer flips the signature.
  *
- * ── FAIL-CLOSED DIRECTION ───────────────────────────────────────────────────
+ * ── FAIL-CLOSED DIRECTION (coordinator-adjudicated 2026-07-06) ──────────────
  * This module can only ever ADD a license to the revoked set (drop it to
- * Community); it can never grant a paid tier. The ONE subtle fail-closed rule:
- * when the stored list itself is UNREADABLE/tampered (its master-MAC fails), the
- * caller MUST treat the license as POTENTIALLY revoked is NOT the safe direction
- * here - see the note on {@link isLicenseRevoked}: an unreadable list is treated
- * as "revocation status unknown", and the SECURE resolution is that a fortress
- * with a corrupt revocation list still resolves its cap normally BUT the
- * corruption is surfaced (the downgrade log / banner records "revocation list
- * unreadable"). We deliberately do NOT brick a paid fleet on a corrupt local
- * list (that would be a denial-of-service an attacker could trigger by trashing
- * the file); instead the corruption is loud and the operator re-pushes. The
- * revocation SET only ever grows on an AUTHENTICATED push.
+ * Community); it can never grant a paid tier. The subtle rule is the ABSENT vs.
+ * CORRUPT distinction:
+ *   - ABSENT list (never pushed): nothing has been revoked -> every license is
+ *     fine. Failing closed here would brick every normal fleet, so absent is
+ *     treated as "not revoked" ({@link isLicenseRevoked} returns
+ *     `revoked:false, listReadable:true`).
+ *   - PRESENT-but-INVALID list (corrupt bytes / failed master-MAC / unparseable):
+ *     revocation state is INDETERMINATE. A stored list that WAS pushed but no
+ *     longer authenticates cannot be relied on to say a revoked license is still
+ *     paid. This module's {@link isLicenseRevoked} still returns
+ *     `revoked:false, listReadable:false` (it does not, by itself, know WHICH
+ *     license was revoked), but the `listReadable:false` signal is a HARD
+ *     fail-closed trigger the ENFORCEMENT callers MUST honor: a paid grant is
+ *     dropped toward Community with a loud, specific "revocation state
+ *     unverifiable" banner + downgrade-log entry until a fresh signed list is
+ *     re-pushed. The earlier DoS counter-argument is void: corrupting the record
+ *     already strips paid capacity via the activation MAC, so failing closed on a
+ *     corrupt revocation list grants the attacker no new capability, while
+ *     failing open would hand a disk attacker a targeted un-revoke primitive.
+ * The revocation SET only ever grows on an AUTHENTICATED push, and the version is
+ * externally anchored ({@link readRevocationVersionAnchor}) so a corrupt file
+ * cannot roll the monotonic floor back to 0 and let an old signed list re-apply.
  *
  * Persistence is the SAME master-MAC'd `_meta` discipline as
  * {@link FLEET_ACTIVATION_META_KEY}: `derivePurposeKey` -> `hmacSha256`, marker +
@@ -120,6 +131,20 @@ function canonicalizeRevokedIds(value: unknown): string[] | null {
     seen.add(item);
   }
   return Array.from(seen).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/**
+ * PUBLIC canonicalizer for a revoked-id set: the SAME sort+dedupe the sign and
+ * verify sides use. A caller (the CLI `revoke-push`) that assembles the id set
+ * from raw, operator-supplied, argv-ORDER ids MUST canonicalize them INTO the
+ * payload BEFORE signing - otherwise the signed bytes are over the raw order while
+ * {@link verifyPushedRevocationList} recomputes the message over the CANONICAL
+ * order, producing a spurious `bad_signature` on any unsorted or duplicated set.
+ * Returns null on a malformed set (non-array / non-string / empty-string element)
+ * so the caller can reject it up front rather than sign a set that can never verify.
+ */
+export function canonicalizeRevocationListIds(value: unknown): string[] | null {
+  return canonicalizeRevokedIds(value);
 }
 
 /**
@@ -404,11 +429,14 @@ export async function writeRevocationList(
 
 /**
  * The revocation status of a license against the stored list. `revoked` is true
- * ONLY when an AUTHENTICATED list contains the id. `listReadable` is false when
- * the stored list did not authenticate (surfaced by the caller as "revocation
- * status unknown / list unreadable" - NOT as "revoked", to avoid a
- * corrupt-file denial-of-service that would strip a paid fleet). `version` is the
- * authenticated list version (0 when absent).
+ * ONLY when an AUTHENTICATED list contains the id. `listReadable` is:
+ *   - true for an ABSENT list (nothing revoked yet) or a VALID list;
+ *   - false ONLY for a PRESENT-but-INVALID (corrupt / tamper-failed) list.
+ * `listReadable:false` is the ENFORCEMENT fail-closed trigger: a caller resolving a
+ * paid grant against a corrupt list must NOT keep the paid tier on the basis of an
+ * unverifiable list; it drops toward Community and surfaces the corruption loudly.
+ * (Distinguish from absent, which is `listReadable:true` and keeps the grant.)
+ * `version` is the authenticated list version (0 when absent/invalid).
  */
 export interface RevocationStatus {
   revoked: boolean;
@@ -426,9 +454,12 @@ export interface RevocationStatus {
  *    revoked; the caller drops it to Community).
  *  - valid list NOT containing the id -> `{ revoked: false, ... }`.
  *  - INVALID (tampered/unreadable) list -> `{ revoked: false, listReadable: false,
- *    version: 0 }`. We do NOT report `revoked: true` on a corrupt local file
- *    (that is an attacker-triggerable DoS on a paid fleet); the corruption is
- *    surfaced by `listReadable: false` and the operator re-pushes.
+ *    version: 0 }`. This function does not itself know WHICH license the corrupt
+ *    list revoked, so it does not assert `revoked: true`; instead it flags
+ *    `listReadable: false`, which the enforcement callers treat as a HARD
+ *    fail-closed trigger (drop a paid grant toward Community with a loud banner
+ *    until a fresh signed list is re-pushed). See the module note on the
+ *    absent-vs-corrupt distinction.
  */
 export async function isLicenseRevoked(
   storage: StorageBackend,

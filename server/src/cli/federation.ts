@@ -23,9 +23,11 @@ import { toBase64url, fromBase64url } from "../core/encoding.js";
 import { generateIdentityId } from "../core/identity.js";
 import {
   REVOCATION_LIST_SIGN_ACTION,
-  readRevocationList,
+  canonicalizeRevocationListIds,
   writeRevocationList,
   verifyPushedRevocationList,
+  effectiveRevocationVersionFloor,
+  writeRevocationVersionAnchor,
   readDowngradeLog,
   type RevocationListPayload,
 } from "../entitlement/index.js";
@@ -1311,9 +1313,23 @@ export async function runFederationRevokePush(args: {
 
   try {
     const issuer = generateIdentityId(signer.operatorPublicKey);
+    // CANONICALIZE the operator's raw argv-order id set (sort + dedupe) BEFORE
+    // signing. `verifyPushedRevocationList` recomputes the signed message over the
+    // CANONICAL id order, so signing over the raw order would spuriously
+    // `bad_signature` any unsorted/duplicated set (exit 3, reading like a key
+    // problem). Reject a malformed set up front rather than sign one that can
+    // never verify.
+    const canonicalIds = canonicalizeRevocationListIds(licenseIds);
+    if (canonicalIds === null) {
+      err.write(
+        "sanctuary federation revoke-push: refusing to sign a malformed " +
+          "--license-id set (each id must be a non-empty string)\n",
+      );
+      return 1;
+    }
     const payload: RevocationListPayload = {
       version,
-      revokedLicenseIds: licenseIds,
+      revokedLicenseIds: canonicalIds,
       issuer,
       issuedAt: new Date().toISOString(),
     };
@@ -1324,9 +1340,15 @@ export async function runFederationRevokePush(args: {
     const signature = signer.signPayload(REVOCATION_LIST_SIGN_ACTION, payload);
     const signed = { payload, signature };
 
-    let currentVersion = 0;
-    const stored = await readRevocationList(signer.storage, signer.masterKey);
-    if (stored.status === "valid") currentVersion = stored.payload.version;
+    // The monotonic floor is the EXTERNALLY-ANCHORED version, not merely the
+    // stored list's readable version: a corrupt stored list reads as version 0,
+    // but the anchor still holds the true floor, so a corrupt file can never let
+    // an OLD signed list roll the version back. `effectiveRevocationVersionFloor`
+    // returns max(storedListVersion, anchorVersion).
+    const currentVersion = await effectiveRevocationVersionFloor(
+      signer.storage,
+      signer.masterKey,
+    );
 
     const verification = verifyPushedRevocationList(
       signed,
@@ -1342,7 +1364,16 @@ export async function runFederationRevokePush(args: {
       );
       return 3;
     }
+    // BLOB BEFORE ANCHOR: persist the authenticated newer list FIRST, then advance
+    // the external version anchor. A crash between the two leaves the anchor
+    // LAGGING the list, which the max()-based floor treats as benign (never a
+    // rollback, never a false-block).
     await writeRevocationList(signer.storage, signer.masterKey, verification.payload);
+    await writeRevocationVersionAnchor(
+      signer.storage,
+      signer.masterKey,
+      verification.payload.version,
+    );
     out.write(
       `${JSON.stringify(
         {
