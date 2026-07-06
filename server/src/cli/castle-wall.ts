@@ -1,4 +1,8 @@
-import { execFile as nodeExecFile, execSync as nodeExecSync } from "node:child_process";
+import {
+  execFile as nodeExecFile,
+  execSync as nodeExecSync,
+  spawnSync as nodeSpawnSync,
+} from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
@@ -259,6 +263,54 @@ const EXIT_SYSEXT_DISABLED = 4;
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
+}
+
+/**
+ * Shared helper: on a helper-sign-mode daemon-start failure (in `runDaemon` or
+ * `runSafeModeDaemon`), run the signer-helper boot-readiness preflight
+ * (design pass 2026-06-26) and print the SPECIFIC diagnosis (approve the
+ * Background Item, pin mismatch, or repair the custody directory) instead of
+ * leaving the operator with only the generic "signer helper is unreachable"
+ * message the caller already printed. Best-effort: a failure running the
+ * preflight itself must never mask the original daemon-start error, so this
+ * never throws.
+ */
+async function writeSignerHelperReadinessDiagnosis(
+  err: Writable,
+  opts: {
+    platform: NodeJS.Platform;
+    signerClientPath: string | undefined;
+    signerClientInvoke: ShimInvoker | undefined;
+    globalPinPath: string;
+  },
+): Promise<void> {
+  try {
+    const { assessSignerHelperReadiness, buildHelperPublicKeyQuery } = await import(
+      "./castle-wall-signer-helper.js"
+    );
+    const readiness = await assessSignerHelperReadiness({
+      execFileFn: (cmd, cmdArgs) => {
+        const result = nodeSpawnSync(cmd, cmdArgs, { encoding: "utf8" });
+        return {
+          code: result.status ?? 1,
+          stdout: result.stdout ?? "",
+          stderr: result.stderr ?? "",
+        };
+      },
+      queryHelperPublicKey: buildHelperPublicKeyQuery(opts.signerClientPath, opts.signerClientInvoke),
+      readGlobalPin: () => readFile(opts.globalPinPath),
+      statCustodyDir: async (dirPath) => {
+        const info = await stat(dirPath);
+        return { uid: info.uid, mode: info.mode & 0o777 };
+      },
+      platform: opts.platform,
+    });
+    if (!readiness.ready) {
+      write(err, `${readiness.guidance}\n`);
+    }
+  } catch {
+    // Preflight itself failed to run; the caller's generic message still stands.
+  }
 }
 
 function fingerprintFromPublicKey(publicKey: Uint8Array): string {
@@ -1353,7 +1405,13 @@ export async function runDaemon(
       if (localSign) {
         write(err, "Local-sign mode: a decrypt error means the passphrase does not match the pinned key. Refusing to arm with a mismatched key.\n");
       } else {
-        write(err, "Helper-sign mode: the signer helper is unreachable. Confirm the helper is installed + approved and SANCTUARY_CASTLE_SIGNER_CLIENT points at the shim. Refusing to arm without a signer (fail-closed).\n");
+        write(err, "Helper-sign mode: the signer helper is unreachable. Refusing to arm without a signer (fail-closed).\n");
+        await writeSignerHelperReadinessDiagnosis(err, {
+          platform,
+          signerClientPath: resolvedSignerClient,
+          signerClientInvoke: ctx.signerClientInvoke,
+          globalPinPath: CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+        });
       }
       return 1;
     }
@@ -1671,6 +1729,14 @@ export async function runSafeModeDaemon(
       err,
       "The signer helper is unreachable. The system extension keeps enforcing the persisted last-valid manifest (deny baseline) meanwhile; KeepAlive will retry. Refusing to arm without a signer (fail-closed).\n",
     );
+    // Boot-readiness preflight (design pass 2026-06-26): this is the boot-daemon
+    // path itself, so the diagnosis matters most here.
+    await writeSignerHelperReadinessDiagnosis(err, {
+      platform,
+      signerClientPath,
+      signerClientInvoke: ctx.signerClientInvoke,
+      globalPinPath: ctx.globalPinnedPublicKeyPath ?? CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+    });
     return 1;
   }
 

@@ -165,4 +165,35 @@ describe("castle-wall safe-mode daemon (F1 Option C)", () => {
       expect(captured!.socketOwnerUid).toBe(selfUid);
     }
   });
+
+  it("on daemon-start failure, appends a signer-helper boot-readiness diagnosis (design pass 2026-06-26)", async () => {
+    // Boot-readiness preflight: when the safe-mode daemon fails to start in
+    // helper-sign mode, the operator gets a SPECIFIC diagnosis (approve the
+    // Background Item / pin mismatch / repair custody dir), not only the
+    // generic "signer helper is unreachable" line. The preflight diagnosis
+    // shells out to the REAL `launchctl` binary (it is not test-injectable
+    // from this context), which on any machine that has not registered the
+    // signer helper reports the job as not loaded - so the guidance is
+    // expected to point at the Background Item approval on a normal dev/CI
+    // box, which is exactly the case this test exercises.
+    const fortress = await makeFortress();
+    const tok = await makeToken();
+    const err = new CaptureStream();
+
+    const code = await runSafeModeDaemon([], {
+      err,
+      platform: "darwin",
+      env: { SANCTUARY_STORAGE_PATH: fortress },
+      bootTokenPath: tok.path,
+      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+      safeModeDaemonStart: async () => {
+        throw new Error("helper unreachable in test");
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Safe-mode daemon failed to start");
+    expect(err.text()).toContain("signer helper is unreachable");
+    expect(err.text()).toMatch(/Background Item/);
+  });
 });
