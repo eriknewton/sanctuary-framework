@@ -2969,6 +2969,29 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // durable revoked-set over the live one and lift the eviction-serial floor.
     const mergedRevoked = new Set(this._federationState.revoked);
     for (const nodeId of snapshot.revokedNodeIds) mergedRevoked.add(nodeId);
+    // PR-A (durable fleet membership): rehydrate the node roster GROW-ONLY,
+    // mirroring the revoked-set union directly above. The roster is the
+    // authoritative source of the paid node-count; it was in-memory ONLY before
+    // this fix (rebuilt from the unpersisted event log), so it came up EMPTY on
+    // every restart and the count reset to zero. We UNION the durable roster
+    // OVER the live one (which on a fresh boot is empty) so a stale/older
+    // durable snapshot can never DROP a node the live state already holds, and a
+    // node id present only on disk is restored. On a per-id collision we keep
+    // the live entry unless the durable one carries a strictly newer
+    // last_sequence (the durable state is the more-recently-synced view). The
+    // active count is then this grow-only roster MINUS the grow-only revoked set
+    // (a node LEAVES only by eviction/revocation), computed by the existing
+    // buildFleetRoster summary.admitted path -- we do NOT recount here.
+    const mergedNodes = new Map(this._federationState.nodes);
+    for (const [nodeId, durableNode] of snapshot.nodes) {
+      const liveNode = mergedNodes.get(nodeId);
+      if (
+        !liveNode ||
+        durableNode.last_sync.last_sequence > liveNode.last_sync.last_sequence
+      ) {
+        mergedNodes.set(nodeId, durableNode);
+      }
+    }
     this._federationState = {
       ...this._federationState,
       revoked: mergedRevoked,
@@ -2976,6 +2999,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this._federationState.evictionMaxSerial,
         snapshot.highestEvictionSerial,
       ),
+      nodes: mergedNodes,
     };
     // Slice 3c-1: rehydrate the durable revoked-ROOT projection so a compromise
     // rotate's revocation of the old root SURVIVES a restart. This is the
@@ -3460,6 +3484,13 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           { ...marker },
         ]),
       ),
+      // PR-A (durable fleet membership): persist the live node roster so the
+      // paid node-count survives a reboot. The store deep-clones + reduces this
+      // to the minimal durable per-node fields inside the SAME AEAD record, and
+      // grow-only-unions it over what is already at rest, so a persist can never
+      // DROP a node the disk already knows about. The store owns the clone; we
+      // hand it the live Map directly.
+      nodes: new Map(this._federationState.nodes),
       // Persist the operator's guardian revocation requirement so it survives a
       // restart. Carries the fortress-master-signed roster verbatim so its
       // signature can be re-verified against the pinned master on rehydrate.
@@ -3538,7 +3569,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       },
       resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
       rosterNodeIds: () => [...this._federationRoster],
-      recordJoin: (certificate) => {
+      recordJoin: async (certificate) => {
         this._federationRoster.add(certificate.node_id);
         this.upsertFederationNode(certificate.node_id, {
           attestation_status: "verified",
@@ -3548,6 +3579,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           node_id: certificate.node_id,
           node_mode: certificate.node_mode,
         });
+        // PR-A durable membership: a join ADDS a node to the roster, the
+        // authoritative source of the paid node-count. Persist the durable
+        // snapshot NOW so the new member survives a reboot. THROWS on a persist
+        // failure so the join endpoint fails closed (never acknowledges a join
+        // whose membership did not reach disk). Idempotent whole-snapshot write.
+        await this.persistFederationSyncState();
       },
       listNodes: () => [...this._federationState.nodes.values()],
       listFederationEvents: (since) => this.listFederationEvents(since),
@@ -3557,6 +3594,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.assertFederationSyncStateAvailable();
         const before = this._federationState.evictionMaxSerial;
         const beforePolicyVersion = this._federationState.operatorPolicy?.version ?? 0;
+        // PR-A durable membership: a non-authority sync event UPSERTS its origin
+        // node into the roster (buildFederationNodeUpsert). Snapshot the roster
+        // size so a NEW node id triggers a durable persist below, keeping the
+        // paid node-count reboot-stable even for a plain agent-event sync that
+        // advances no eviction/policy floor.
+        const beforeNodeCount = this._federationState.nodes.size;
         const result = this.appendFederationEvents(events, options);
         // Persist ONLY when an operator-authority eviction advanced the durable
         // revocation projection. On a persist failure THROW so the handler
@@ -3571,7 +3614,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // silent un-revoke.
         if (
           this._federationState.evictionMaxSerial > before ||
-          (this._federationState.operatorPolicy?.version ?? 0) > beforePolicyVersion
+          (this._federationState.operatorPolicy?.version ?? 0) > beforePolicyVersion ||
+          this._federationState.nodes.size > beforeNodeCount
         ) {
           await this.persistFederationSyncState();
         }

@@ -553,8 +553,16 @@ export interface V1FederationDeps {
   audit: FederationAudit;
   /** Joined node ids, for the status roster summary. */
   rosterNodeIds(): string[];
-  /** Record a newly joined node (status roster). */
-  recordJoin(certificate: NodeIdentityCertificate): void;
+  /**
+   * Record a newly joined node (status roster + DURABLE fleet membership).
+   * ASYNC + fail-closed (PR-A durable membership): the in-memory roster upsert
+   * is committed, then the DURABLE sync-state snapshot is persisted so the node
+   * survives a reboot and is counted for the paid node-count. THROWS if that
+   * persist fails so the caller fails closed (a join that did not durably commit
+   * its membership must not be acknowledged as fully joined). When no durable
+   * store is wired (in-memory rigs) the persist is a no-op and cannot throw.
+   */
+  recordJoin(certificate: NodeIdentityCertificate): Promise<void>;
   /** List federated nodes for GET /v1/nodes. */
   listNodes(): FederationNodeView[];
   /** Local append-only events available for exchange. */
@@ -2211,7 +2219,12 @@ export async function handleFederationCeremony(
     return true;
   }
 
-  deps.recordJoin(outcome.certificate);
+  // PR-A durable membership: persist the roster before acknowledging the join.
+  // A persist failure THROWS here; the join endpoint's error path returns the
+  // uniform 401 rather than acknowledging a join whose membership did not reach
+  // disk (the node would be silently forgotten on the next reboot and dropped
+  // from the paid count).
+  await deps.recordJoin(outcome.certificate);
   await deps.audit({
     operation,
     result: "success",
