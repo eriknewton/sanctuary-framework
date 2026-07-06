@@ -65,6 +65,11 @@ import {
 } from "../core/encoding.js";
 import { canonicalJson } from "../audit/chain.js";
 import type { FederationAppliedPolicyVersion } from "./federation-policy-bundle.js";
+import type { FederationNodeView } from "./federation.js";
+import {
+  deriveNodePosture,
+  type NodeModeForPosture,
+} from "../mesh/node-posture.js";
 import {
   decodeGuardianRevocationRequirement,
   encodeGuardianRevocationRequirement,
@@ -230,6 +235,26 @@ export interface FederationSyncStateSnapshot {
   /** Per-node applied policy version markers: nodeId -> verified applied marker. */
   appliedPolicyVersions: Map<string, FederationAppliedPolicyVersion>;
   /**
+   * PR-A (durable fleet membership): the GROW-ONLY node roster
+   * (`_federationState.nodes`), the authoritative source of the paid
+   * node-count. BEFORE this field the roster was in-memory ONLY: it was
+   * rebuilt from the event log, but the event log is not persisted, so the
+   * roster came up EMPTY on every restart and the count reset to zero.
+   *
+   * Persisting it here makes membership SURVIVE A REBOOT so the count
+   * (active-non-revoked = this roster MINUS the already-durable
+   * {@link revokedNodeIds}) is stable across restarts. A node LEAVES the fleet
+   * only by eviction/revocation (added to {@link revokedNodeIds}); the roster
+   * itself is never deleted from (verified: no `nodes.delete` anywhere in the
+   * dashboard), so grow-only-roster minus grow-only-revoked is the correct,
+   * non-over-counting active set. Its integrity is the AEAD tag of THIS record
+   * (the SAME operator-master purpose key as every other field), so a
+   * disk-level attacker cannot forge extra nodes to inflate the count / claim a
+   * higher grandfather baseline. Absent on an OLD-code snapshot -> decodes to
+   * the empty roster (today's behavior), never a crash.
+   */
+  nodes: Map<string, FederationNodeView>;
+  /**
    * OPTIONAL M-of-N guardian sign-off requirement on the revoke/kill path
    * (competitor-readiness item 6). `null` = no requirement configured (legacy
    * single-operator revoke). Persisting it here makes the requirement SURVIVE A
@@ -331,6 +356,18 @@ interface PersistedSyncState {
   /** Per-node applied policy version markers. */
   applied_policy_versions?: Array<[string, PersistedAppliedPolicyVersion]>;
   /**
+   * PR-A (durable fleet membership). The persisted grow-only node roster:
+   * `[nodeId, minimalDurableNode]` pairs. Optional on read for back-compat
+   * within v1 (a pre-PR-A record omits it -> the empty roster, exactly today's
+   * post-reboot behavior). ADDITIVE within the existing v1 record: the
+   * enclosing AEAD tag authenticates it, so a tampered/truncated blob (incl. a
+   * forged extra node) still fails closed at decrypt. Only the MINIMAL fields
+   * needed to reconstruct the `FederationNodeView` the roster + count consume
+   * are stored; the posture (trust boundary, tee, drill status) is DERIVED from
+   * `node_mode` on rehydrate, and NO secret / private key is ever persisted.
+   */
+  nodes?: Array<[string, PersistedFederationNode]>;
+  /**
    * OPTIONAL persisted guardian revocation requirement. Absent (a pre-item-6
    * record) OR null both decode to "no requirement configured"; present decodes
    * to the fortress-master-signed roster verbatim so its signature can be
@@ -375,6 +412,37 @@ interface PersistedBreakGlassState {
   delay_ms: number;
 }
 
+/**
+ * PR-A (durable fleet membership): the MINIMAL durable representation of a
+ * roster node. Only the fields that {@link buildFederationNodeUpsert} carries
+ * as sticky state are persisted; the trust-boundary posture (`trust_boundary`,
+ * `tee_attested`, `host_provider`, `drill_status`) is RE-DERIVED from
+ * `node_mode` on rehydrate, so it is not stored. NO secret / private key is
+ * ever included: node trust for the count is membership-minus-revocation, and
+ * the per-node pubkey/attestation is verified at JOIN + sync time, never
+ * re-checked at count time from this record.
+ */
+interface PersistedFederationNode {
+  node_id: string;
+  label: string | null;
+  attestation_status: FederationNodeView["attestation_status"];
+  node_mode: FederationNodeView["node_mode"];
+  first_seen: string;
+  last_seen: string;
+  last_sync: {
+    received_at: string | null;
+    sent_at: string | null;
+    last_sequence: number;
+  };
+  applied_policy: {
+    version: number | null;
+    hash: string | null;
+    hash_algorithm: string | null;
+    applied_at: string | null;
+    source_event_id: string | null;
+  };
+}
+
 interface PersistedAppliedPolicyVersion {
   version: number;
   hash: string;
@@ -401,6 +469,7 @@ export function emptyFederationSyncState(): FederationSyncStateSnapshot {
     highestRevocationSerial: 0,
     operatorPolicy: null,
     appliedPolicyVersions: new Map(),
+    nodes: new Map(),
     guardianRevocationRequirement: null,
     guardianRevocationRequirementGeneration: 0,
     guardianDisableNonce: 0,
@@ -798,6 +867,10 @@ export class FederationSyncStateStore {
           applied_policy_versions: [...merged.appliedPolicyVersions].map(
             ([nodeId, marker]) => [nodeId, encodeAppliedPolicyVersion(marker)],
           ),
+          nodes: [...merged.nodes].map(([nodeId, node]) => [
+            nodeId,
+            encodeFederationNode(node),
+          ]),
           guardian_revocation_requirement: merged.guardianRevocationRequirement
             ? encodeGuardianRevocationRequirement(
                 merged.guardianRevocationRequirement,
@@ -849,6 +922,10 @@ function cloneSnapshot(
         { ...marker },
       ]),
     ),
+    nodes: cloneNodeRoster(
+      (snapshot as Partial<FederationSyncStateSnapshot>).nodes ??
+        new Map<string, FederationNodeView>(),
+    ),
     guardianRevocationRequirement: cloneGuardianRevocationRequirement(
       (snapshot as Partial<FederationSyncStateSnapshot>)
         .guardianRevocationRequirement ?? null,
@@ -871,6 +948,30 @@ function cloneBreakGlassState(
 ): BreakGlassState | null {
   if (state === null || state === undefined) return null;
   return { ...state };
+}
+
+/**
+ * PR-A: deep-clone the node roster so a persisted snapshot never aliases the
+ * caller's live `_federationState.nodes` (mirrors the defensive clone every
+ * other reference-typed field in {@link cloneSnapshot} gets). Nested objects
+ * (`last_sync`, `applied_policy`, `trust_boundary`) are copied so a later live
+ * mutation cannot retroactively change the queued write.
+ */
+function cloneNodeRoster(
+  nodes: Map<string, FederationNodeView>,
+): Map<string, FederationNodeView> {
+  return new Map(
+    [...nodes].map(([nodeId, node]) => [nodeId, cloneNodeView(node)]),
+  );
+}
+
+function cloneNodeView(node: FederationNodeView): FederationNodeView {
+  return {
+    ...node,
+    trust_boundary: { ...node.trust_boundary },
+    last_sync: { ...node.last_sync },
+    applied_policy: { ...node.applied_policy },
+  };
 }
 
 function cloneGuardianRevocationRequirement(
@@ -941,6 +1042,25 @@ function mergeSyncStateMonotonic(
       appliedPolicyVersions.set(nodeId, { ...marker });
     }
   }
+  // PR-A (durable fleet membership): GROW-ONLY union of the node roster. A node
+  // id present on EITHER side is kept, so folding a stale/older `next` over a
+  // fresher `base` (or vice versa) can NEVER DROP a node -> the paid node-count
+  // never spuriously shrinks across a merge/restart. This mirrors the revoked-
+  // set union above; the billing-correct active count is this grow-only roster
+  // MINUS the grow-only `revokedNodeIds`. On a per-id collision we keep the
+  // entry with the higher `last_sync.last_sequence` (the more-recently-advanced
+  // view), preferring `next` on a tie, so the merge is deterministic and never
+  // regresses a node's freshness. Node departure is ONLY via eviction (union
+  // into `revokedNodeIds`), so grow-only here does not over-count.
+  const nodes = new Map(
+    [...base.nodes].map(([nodeId, node]) => [nodeId, cloneNodeView(node)]),
+  );
+  for (const [nodeId, nextNode] of next.nodes) {
+    const priorNode = nodes.get(nodeId);
+    if (!priorNode || nextNode.last_sync.last_sequence >= priorNode.last_sync.last_sequence) {
+      nodes.set(nodeId, cloneNodeView(nextNode));
+    }
+  }
   return {
     acceptedHighWater,
     outboundHighWater: Math.max(base.outboundHighWater, next.outboundHighWater),
@@ -956,6 +1076,7 @@ function mergeSyncStateMonotonic(
     ),
     operatorPolicy: newerPolicy(base.operatorPolicy, next.operatorPolicy),
     appliedPolicyVersions,
+    nodes,
     // The guardian revocation requirement is operator CONFIG, not grow-only
     // security state: it can be upgraded, re-pinned, OR cleared (disable). A
     // grow-only union would wrongly make it un-clearable, so we cannot union it.
@@ -1072,6 +1193,10 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
   const appliedPolicyVersions = decodeAppliedPolicyVersions(
     obj.applied_policy_versions,
   );
+  // PR-A: OPTIONAL on read (a pre-PR-A v1 record omits it) -> the empty roster,
+  // exactly today's post-reboot behavior. PRESENT-but-malformed THROWS (the
+  // same fail-closed-on-corrupt contract every other optional field honors).
+  const nodes = decodeNodeRoster(obj.nodes);
   // Item-6 field is OPTIONAL on read (a pre-item-6 v1 record omits it). Absent OR
   // null -> no requirement configured. PRESENT-but-malformed THROWS via
   // decodeGuardianRevocationRequirement (same fail-closed-on-corrupt contract).
@@ -1123,6 +1248,7 @@ function decodeSyncState(value: unknown): FederationSyncStateSnapshot {
     highestRevocationSerial,
     operatorPolicy,
     appliedPolicyVersions,
+    nodes,
     guardianRevocationRequirement,
     guardianRevocationRequirementGeneration,
     guardianDisableNonce,
@@ -1302,6 +1428,207 @@ function decodeAppliedPolicyVersion(
     hash_algorithm: hashAlgorithm,
     applied_at: appliedAt,
     source_event_id: sourceEventId,
+  };
+}
+
+/**
+ * PR-A: encode a live {@link FederationNodeView} into the MINIMAL durable form.
+ * The trust-boundary posture is dropped (re-derived from `node_mode` on load),
+ * and no secret / private key is ever present in a node view to begin with.
+ */
+function encodeFederationNode(node: FederationNodeView): PersistedFederationNode {
+  return {
+    node_id: node.node_id,
+    label: node.label,
+    attestation_status: node.attestation_status,
+    node_mode: node.node_mode,
+    first_seen: node.first_seen,
+    last_seen: node.last_seen,
+    last_sync: {
+      received_at: node.last_sync.received_at,
+      sent_at: node.last_sync.sent_at,
+      last_sequence: node.last_sync.last_sequence,
+    },
+    applied_policy: {
+      version: node.applied_policy.version,
+      hash: node.applied_policy.hash,
+      hash_algorithm: node.applied_policy.hash_algorithm,
+      applied_at: node.applied_policy.applied_at,
+      source_event_id: node.applied_policy.source_event_id,
+    },
+  };
+}
+
+/**
+ * PR-A: decode the persisted grow-only node roster back into
+ * `Map<nodeId, FederationNodeView>`. Absent (a pre-PR-A v1 record) -> the empty
+ * roster, the legitimate back-compat default (today's post-reboot behavior).
+ * PRESENT-but-malformed THROWS (fail-closed-on-corrupt, same as every other
+ * optional field). Each node's trust-boundary posture is RE-DERIVED from its
+ * `node_mode` so the roster the count + console consume is byte-consistent with
+ * a live upsert.
+ */
+function decodeNodeRoster(value: unknown): Map<string, FederationNodeView> {
+  if (value === undefined) return new Map();
+  if (!Array.isArray(value)) {
+    throw new FederationSyncStateStoreError("nodes is not an array");
+  }
+  const out = new Map<string, FederationNodeView>();
+  for (const pair of value) {
+    if (!Array.isArray(pair) || pair.length !== 2) {
+      throw new FederationSyncStateStoreError(
+        "nodes entry is not a [string, object] pair",
+      );
+    }
+    const [nodeId, node] = pair as [unknown, unknown];
+    if (typeof nodeId !== "string" || nodeId.length === 0) {
+      throw new FederationSyncStateStoreError("nodes node id is invalid");
+    }
+    out.set(nodeId, decodeFederationNode(nodeId, node));
+  }
+  return out;
+}
+
+const VALID_ATTESTATION_STATUS = new Set<FederationNodeView["attestation_status"]>([
+  "verified",
+  "pending",
+  "failed",
+  "unknown",
+]);
+
+const VALID_NODE_MODE = new Set<NodeModeForPosture>([
+  "local",
+  "operator_cloud",
+  "sovereign_tee",
+  "unknown",
+]);
+
+function decodeFederationNode(
+  nodeId: string,
+  value: unknown,
+): FederationNodeView {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new FederationSyncStateStoreError("node is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const label = obj.label;
+  if (label !== null && typeof label !== "string") {
+    throw new FederationSyncStateStoreError("node label is invalid");
+  }
+  const attestationStatus = obj.attestation_status;
+  if (
+    typeof attestationStatus !== "string" ||
+    !VALID_ATTESTATION_STATUS.has(
+      attestationStatus as FederationNodeView["attestation_status"],
+    )
+  ) {
+    throw new FederationSyncStateStoreError("node attestation_status is invalid");
+  }
+  const nodeMode = obj.node_mode;
+  if (
+    typeof nodeMode !== "string" ||
+    !VALID_NODE_MODE.has(nodeMode as NodeModeForPosture)
+  ) {
+    throw new FederationSyncStateStoreError("node node_mode is invalid");
+  }
+  const firstSeen = obj.first_seen;
+  if (typeof firstSeen !== "string" || firstSeen.length === 0) {
+    throw new FederationSyncStateStoreError("node first_seen is invalid");
+  }
+  const lastSeen = obj.last_seen;
+  if (typeof lastSeen !== "string" || lastSeen.length === 0) {
+    throw new FederationSyncStateStoreError("node last_seen is invalid");
+  }
+  const lastSync = decodeNodeLastSync(obj.last_sync);
+  const appliedPolicy = decodeNodeAppliedPolicy(obj.applied_policy);
+  // Re-derive the trust-boundary posture from node_mode, exactly like a live
+  // upsert (buildFederationNodeUpsert). verifiedTeeEvidence is false here (the
+  // durable record never carries TEE evidence; a sovereign_tee node re-attests
+  // at runtime), so the rehydrated posture is the honest "unverified" shape.
+  const posture = deriveNodePosture({
+    nodeMode: nodeMode as NodeModeForPosture,
+    verifiedTeeEvidence: false,
+  });
+  return {
+    node_id: nodeId,
+    label: label ?? null,
+    attestation_status: attestationStatus as FederationNodeView["attestation_status"],
+    ...posture,
+    first_seen: firstSeen,
+    last_seen: lastSeen,
+    last_sync: lastSync,
+    applied_policy: appliedPolicy,
+  };
+}
+
+function decodeNodeLastSync(value: unknown): FederationNodeView["last_sync"] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new FederationSyncStateStoreError("node last_sync is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const receivedAt = obj.received_at;
+  if (receivedAt !== null && typeof receivedAt !== "string") {
+    throw new FederationSyncStateStoreError("node last_sync.received_at is invalid");
+  }
+  const sentAt = obj.sent_at;
+  if (sentAt !== null && typeof sentAt !== "string") {
+    throw new FederationSyncStateStoreError("node last_sync.sent_at is invalid");
+  }
+  const lastSequence = obj.last_sequence;
+  if (
+    typeof lastSequence !== "number" ||
+    !Number.isSafeInteger(lastSequence) ||
+    lastSequence < 0
+  ) {
+    throw new FederationSyncStateStoreError("node last_sync.last_sequence is invalid");
+  }
+  return {
+    received_at: receivedAt ?? null,
+    sent_at: sentAt ?? null,
+    last_sequence: lastSequence,
+  };
+}
+
+function decodeNodeAppliedPolicy(
+  value: unknown,
+): FederationNodeView["applied_policy"] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new FederationSyncStateStoreError("node applied_policy is not an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const version = obj.version;
+  if (
+    version !== null &&
+    (typeof version !== "number" || !Number.isSafeInteger(version) || version < 0)
+  ) {
+    throw new FederationSyncStateStoreError("node applied_policy.version is invalid");
+  }
+  const hash = obj.hash;
+  if (hash !== null && typeof hash !== "string") {
+    throw new FederationSyncStateStoreError("node applied_policy.hash is invalid");
+  }
+  const hashAlgorithm = obj.hash_algorithm;
+  if (hashAlgorithm !== null && typeof hashAlgorithm !== "string") {
+    throw new FederationSyncStateStoreError(
+      "node applied_policy.hash_algorithm is invalid",
+    );
+  }
+  const appliedAt = obj.applied_at;
+  if (appliedAt !== null && typeof appliedAt !== "string") {
+    throw new FederationSyncStateStoreError("node applied_policy.applied_at is invalid");
+  }
+  const sourceEventId = obj.source_event_id;
+  if (sourceEventId !== null && typeof sourceEventId !== "string") {
+    throw new FederationSyncStateStoreError(
+      "node applied_policy.source_event_id is invalid",
+    );
+  }
+  return {
+    version: version ?? null,
+    hash: hash ?? null,
+    hash_algorithm: hashAlgorithm ?? null,
+    applied_at: appliedAt ?? null,
+    source_event_id: sourceEventId ?? null,
   };
 }
 

@@ -553,8 +553,22 @@ export interface V1FederationDeps {
   audit: FederationAudit;
   /** Joined node ids, for the status roster summary. */
   rosterNodeIds(): string[];
-  /** Record a newly joined node (status roster). */
-  recordJoin(certificate: NodeIdentityCertificate): void;
+  /**
+   * Record a newly joined node (status roster + DURABLE fleet membership).
+   * ASYNC + fail-closed (PR-A durable membership): the in-memory roster upsert is
+   * applied, then the DURABLE sync-state snapshot is persisted so the node
+   * survives a reboot and is counted for the paid node-count. THROWS if that
+   * persist fails so the caller fails closed (a join that did not durably commit
+   * its membership must not be acknowledged as fully joined). The join endpoint
+   * does NOT catch this throw: it propagates to the dashboard's top-level handler
+   * and surfaces as a generic HTTP 500, NOT a 401; either way no success/cert is
+   * returned. On that persist failure the implementation ROLLS BACK its in-memory
+   * mutations before re-throwing, so a failed join leaves NO phantom node in the
+   * roster / `summary.admitted` (consistent with the never-inflated durable
+   * basis). When no durable store is wired (in-memory rigs) the persist is a
+   * no-op and cannot throw.
+   */
+  recordJoin(certificate: NodeIdentityCertificate): Promise<void>;
   /** List federated nodes for GET /v1/nodes. */
   listNodes(): FederationNodeView[];
   /** Local append-only events available for exchange. */
@@ -2211,7 +2225,15 @@ export async function handleFederationCeremony(
     return true;
   }
 
-  deps.recordJoin(outcome.certificate);
+  // PR-A durable membership: persist the roster before acknowledging the join.
+  // A persist failure THROWS here; there is no try/catch around this call, so the
+  // throw propagates to the dashboard's top-level request handler and surfaces as
+  // a generic HTTP 500 ({"error":"Internal server error"}), NOT a 401. Either way
+  // the join is NOT acknowledged (no success response, no certificate returned),
+  // which is the fail-closed behavior we want: a join whose membership did not
+  // reach disk must not be treated as joined (the node would be silently
+  // forgotten on the next reboot and dropped from the paid count).
+  await deps.recordJoin(outcome.certificate);
   await deps.audit({
     operation,
     result: "success",

@@ -361,8 +361,11 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
       "federation-operator-cloud-provision-claim-set",
       // Durable peer-sync security state (Federation 3/3b P0): per-sender
       // accepted high-water + outbound high-water + folded revocation
-      // projection, persisted under _federation by the sync-state store. Same
-      // no-AAD derivePurposeKey blob, so the no-AAD candidate re-wraps it.
+      // projection + (PR-A durable fleet membership) the grow-only node roster
+      // (the paid node-count source), persisted under _federation by the
+      // sync-state store. Same no-AAD derivePurposeKey blob, re-wrapped by the
+      // no-AAD candidate; the roster is an additive field inside the SAME blob
+      // (no new label), so rotation coverage is unchanged.
       // Without this label a fortress that ever persisted sync-state would
       // strand it and rotateMaster would abort. MUST equal
       // FEDERATION_SYNC_STATE_STORE_HKDF_INFO (asserted in master-rotation.test).
