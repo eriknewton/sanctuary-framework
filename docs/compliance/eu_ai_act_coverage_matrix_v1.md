@@ -10,8 +10,8 @@ description: Row-by-row mapping from Sanctuary primitives to Regulation (EU) 202
 **OJ reference:** OJ L, 2024/1689, 12 July 2024
 **Full enforcement date:** 2026-08-02
 **Aligned to text version:** OJ published text
-**Last full review:** 2026-04-10
-**Next review due:** 2026-06-01
+**Last full review:** 2026-07-05
+**Next review due:** 2026-09-01
 
 ---
 
@@ -26,7 +26,7 @@ description: Row-by-row mapping from Sanctuary primitives to Regulation (EU) 202
 
 ### The 5 full rows (load-bearing spine)
 
-Every "full" row was individually verified against v0.7.0 source on 2026-04-10. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
+Every "full" row was individually verified against source. The audit-log rows (Article 12(1) and Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501); the remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied. If a claim of "full coverage" on any other row appears in a downstream document, the matrix has drifted and needs re-verification.
 
 1. **Annex IV §2(h)** — Cybersecurity measures
 2. **Article 12(1)** — Automatic logging of events over lifetime
@@ -38,7 +38,7 @@ Every "full" row was individually verified against v0.7.0 source on 2026-04-10. 
 
 - Matrix v1 is aligned to the OJ-published text of Regulation (EU) 2024/1689. It does not yet reflect any implementing acts or delegated acts that the European Commission may publish before the 2026-08-02 enforcement date. Review the `next_review_due` field and bump regulation_version whenever the aligned text changes.
 - Verbatim regulation text uses [...] elisions for length; text is never paraphrased. Clause identifiers (clause_id) are separately queryable so templates can render citations without parsing the verbatim quotes.
-- Every 'full' row was individually verified against v0.7.0 source on 2026-04-10. See per-row review_notes for verification findings and any corrections applied.
+- Every 'full' row was individually verified against source. The audit-log rows (Article 12(1), Article 15(5) first subparagraph) were re-verified against the current tree (server package v1.6.1) on 2026-07-05 to reflect the tamper-evident audit-chain hardening (PR #274 and follow-ups #290, #320, #396, #461, #501). The remaining rows carry their original 2026-04-10 verification against v0.7.0 source. See per-row review_notes for verification findings and any corrections applied.
 - NOT LEGAL ADVICE. This matrix is a technical mapping from Sanctuary primitives to regulation clause identifiers; it is not a legal interpretation of the EU AI Act.
 
 ---
@@ -625,7 +625,7 @@ See the Art. 12 post-market monitoring support row for Sanctuary's concrete cont
 
 **Evidence emitted by Sanctuary:**
 
-Every tool call in the Sanctuary runtime automatically produces an audit entry via the Principal Policy gate. Router.ts wraps all tool invocations through gate.evaluate(), which appends to the audit log on every outcome path (gate_allow, gate_allow_proxy, gate_deny, gate_escalate, gate_unclassified, injection_detected). Entries are persisted as AES-256-GCM authenticated ciphertext under an HKDF-derived audit-log key and are queryable via monitor_audit_log or exportable in CEF/OCSF via audit_export_siem. No tool call bypasses the audit path.
+Every tool call in the Sanctuary runtime automatically produces an audit entry via the Principal Policy gate. Router.ts wraps all tool invocations through gate.evaluate(), which appends to the audit log on every outcome path (gate_allow, gate_allow_proxy, gate_deny, gate_escalate, gate_unclassified, injection_detected). Entries are persisted as AES-256-GCM authenticated ciphertext under an HKDF-derived audit-log key and are linked into a tamper-evident hash chain: each persisted entry carries a sequence number and a prev_hash, and an entry_hash computed over its sequence, prev_hash, timestamp, and ciphertext. Every critical outcome is written durably (fsync plus read-after-write byte verification) before the gate returns, so a completed gate decision is on disk, not held only in memory. Entries are queryable via monitor_audit_log or exportable in CEF/OCSF via audit_export_siem. No tool call bypasses the audit path.
 
 **Evidence emitter tools:** `monitor_audit_log`, `audit_export_siem`
 
@@ -635,7 +635,7 @@ _(none — this row is fully auto-emitted)_
 
 **Review notes:**
 
-Verified against v0.7.0 source on 2026-04-10: router.ts:249 wraps every tool call through gate.evaluate(); gate.ts lines 86, 155, 186, 202, 358 append to the audit log on every outcome. CORRECTIONS APPLIED during verification: earlier drafts claimed 'Ed25519-signed entries' and 'hash-chained transcript' — neither is true. The AuditEntry schema in operational/audit-log.ts has no signature field, and entries are stored as individual encrypted files with no inter-entry hash chain. AES-256-GCM authenticated encryption provides integrity against third-party tampering; that is the accurate claim. Art. 12(1) requires the system to technically *allow* automatic recording, which is satisfied. DURABILITY CAVEAT: audit-log.ts:59 uses fire-and-forget persistence — if disk write fails, the entry lives only in memory and is lost at process exit. This is a quality-under-failure concern but does not defeat the Art. 12(1) capability claim. If v0.8.0+ adds synchronous persistence or Ed25519 signing on audit entries, update this row's prose.
+Re-verified against the current tree (server package v1.6.1) on 2026-07-05. router.ts routes every tool call through gate.evaluate(); principal-policy/gate.ts appends to the audit log on every outcome. UPDATED for the audit-chain hardening (PR #274, merged 2026-05-16, plus follow-ups #290, #320, #396, #461, #501): entries are now linked by a per-entry prev_hash chain (PersistedAuditEnvelopeV2 in operational/audit-log.ts, schema version 2) over AES-256-GCM ciphertext, and periodic checkpoint records carry a SHA-256 root over the covered entry hashes, Ed25519-signed when a signing identity is available (unsigned and marked as such otherwise). The signature binds the checkpoint root, not each individual entry; per-entry integrity is the AES-256-GCM authentication tag plus the prev_hash link. Durability is now enforced: critical gate outcomes use appendCritical, which awaits a durable write (file plus directory fsync) and a read-after-write round-trip verification and throws AuditPersistenceError on any storage, disk-full, permission, or torn-write failure. The earlier fire-and-forget caveat no longer applies to critical entries; only best-effort telemetry appends (for example injection_detected) use the un-awaited path, and those are still tracked and rethrown by flush(). Art. 12(1) requires the system to technically *allow* automatic recording, which remains satisfied and is now backed by a verifiable chain.
 
 ---
 
@@ -662,7 +662,7 @@ _(none — this row is fully auto-emitted)_
 
 **Review notes:**
 
-Verified against v0.7.0 source on 2026-04-10: audit/siem-tools.ts:18-77 registers audit_export_siem with CEF and OCSF format support and the full filter set. Classified Tier 3 (auto-allow, read-only) in loader.ts. No corrections to the original draft.
+Verified against v0.7.0 source on 2026-04-10: audit/siem-tools.ts:18-77 registers audit_export_siem with CEF and OCSF format support and the full filter set. Re-tiered to Tier 1 (operator approval required) in loader.ts on 2026-06-15: the bulk export reveals each operation's policy tier and decision, so SIEM forwarding is an operator function, not an agent auto-allow (CISO MED-1).
 
 ---
 
@@ -733,7 +733,7 @@ Row applies only to Annex III §1(a) (biometric remote identification) systems. 
 
 **Evidence emitted by Sanctuary:**
 
-Auto-filled: Sanctuary's audit log persists entries indefinitely by default (no automatic purge). Entries are exportable at any time via audit_export_siem for archival to enterprise storage.
+Auto-filled: Sanctuary's audit log persists entries by default until configured size or entry caps trigger authenticated rotation (defaults: 100,000 entries / 100 MB), at which point the oldest entries are pruned behind a master-MAC'd rotation anchor so the cut is tamper-evident. Enterprises retaining beyond those caps must archive via audit_export_siem, which is exportable at any time for archival to enterprise storage.
 
 **Evidence emitter tools:** `monitor_audit_log`, `audit_export_siem`
 
@@ -743,7 +743,7 @@ The enterprise's declared log retention policy (how long logs are kept, in which
 
 **Review notes:**
 
-Note: this row cites Article 19(1) rather than Article 12 — retention is specifically an Article 19 provider obligation, not an Article 12 logging capability. The capability to retain exists in Sanctuary (no automatic purge); the declared policy is an enterprise artefact.
+Note: this row cites Article 19(1) rather than Article 12: retention is specifically an Article 19 provider obligation, not an Article 12 logging capability. The capability to retain exists in Sanctuary; the on-disk log grows until the configured size/entry caps trigger authenticated rotation (defaults 100,000 entries / 100 MB), so a high-volume deployment must archive via audit_export_siem to satisfy a retention window beyond those caps. The declared policy is an enterprise artefact.
 
 ---
 
@@ -814,7 +814,7 @@ Sanctuary's SHR is structurally a transparency artefact — it is designed to ho
 
 **Evidence emitted by Sanctuary:**
 
-Auto-filled: signed SHR + Ed25519-signed audit trail + Concordia bridge attestations (where used) give machine-readable provenance for every tool call the agent made during the reporting period. This enables output interpretation of the form 'this agent action came from these inputs at this time, cryptographically signed and independently verifiable.'
+Auto-filled: signed SHR + tamper-evident, checkpoint-signed audit chain + Concordia bridge attestations (where used) give machine-readable provenance for every tool call the agent made during the reporting period. This enables output interpretation of the form 'this agent action came from these inputs at this time, cryptographically signed and independently verifiable.'
 
 **Evidence emitter tools:** `shr_generate`, `monitor_audit_log`, `audit_export_siem`, `bridge_verify`
 
@@ -976,7 +976,7 @@ Downgraded from full during audit (2026-04-10). Art. 15(5) requires measures 'ap
 
 **Evidence emitted by Sanctuary:**
 
-Resilience against unauthorised third-party alteration is enforced across multiple subsystems, each independently verifiable via an MCP tool call: (1) L1 state store — AES-256-GCM authenticated encryption with HKDF per-namespace keys, Merkle root per namespace, monotonic version counter per (namespace, key), and anti-rollback checks on every read; reported by monitor_health (state_integrity flag) and via version numbers returned by state_list. (2) L1 audit log — AES-256-GCM authenticated ciphertext persisted under an HKDF-derived audit-log key; confidentiality and integrity against third-party tampering (no signature-based non-repudiation — see review_notes). (3) L1 identity — Ed25519 self-custodied keypairs; signed identity operations (sign, rotate, verify) and signed SHR generation; reported by shr_generate signature block. (4) L2 execution gate — every tool call routed through router.ts -> ApprovalGate.evaluate() -> Principal Policy tier check before execution; no bypass path; reported by principal_policy_view and the audit log trail of gate_* entries. (5) L2 outbound context gating — per-provider field policies applied before any outbound call; reported by context_gate_enforcer_status.
+Resilience against unauthorised third-party alteration is enforced across multiple subsystems, each independently verifiable via an MCP tool call: (1) L1 state store — AES-256-GCM authenticated encryption with HKDF per-namespace keys, Merkle root per namespace, monotonic version counter per (namespace, key), and anti-rollback checks on every read; reported by monitor_health (state_integrity flag) and via version numbers returned by state_list. (2) L1 audit log — AES-256-GCM authenticated ciphertext persisted under an HKDF-derived audit-log key, linked into a tamper-evident hash chain (per-entry sequence plus prev_hash plus entry_hash), with periodic checkpoint records carrying a SHA-256 root over the covered entry hashes, Ed25519-signed when a signing identity is available; a rotation anchor authenticated by a master-derived MAC makes a truncation or prune of the tail detectable. Reported by monitor_health and the audit-chain verifier; integrity findings surface as a P1 anomaly. (See review_notes for the exact non-repudiation bound.) (3) L1 identity — Ed25519 self-custodied keypairs; signed identity operations (sign, rotate, verify) and signed SHR generation; reported by shr_generate signature block. (4) L2 execution gate — every tool call routed through router.ts -> ApprovalGate.evaluate() -> Principal Policy tier check before execution; no bypass path; reported by principal_policy_view and the audit log trail of gate_* entries. (5) L2 outbound context gating — per-provider field policies applied before any outbound call; reported by context_gate_enforcer_status.
 
 **Evidence emitter tools:** `sovereignty_audit`, `shr_generate`, `monitor_health`, `state_list`, `principal_policy_view`, `context_gate_enforcer_status`
 
@@ -986,7 +986,7 @@ _(none — this row is fully auto-emitted)_
 
 **Review notes:**
 
-Verified against v0.7.0 source on 2026-04-10. MAJOR CORRECTIONS APPLIED from earlier drafts: (1) Earlier drafts claimed Merkle integrity on the audit log — that is wrong. Merkle trees exist on the state store (cognitive/state-store.ts) but NOT on the audit log. (2) Earlier drafts claimed Ed25519 signatures on audit entries — that is wrong. The AuditEntry schema has no signature field; entries are AES-256-GCM ciphertext only. Ed25519 signatures exist on identity operations and SHR, not audit entries. (3) Earlier drafts claimed 'tamper-evident transcript' on the audit log — this is only true against third parties without the master key; there is no hash chain. The row still survives as full because Art. 15(5) specifies 'unauthorised third parties,' and AES-256-GCM with an HKDF-derived key protects against that threat model. Non-repudiation against a compromised-master-key insider is a different threat model not covered by Art. 15(5).
+Re-verified against the current tree (server package v1.6.1) on 2026-07-05. UPDATED for the audit-chain hardening wave (PR #274 merged 2026-05-16, plus #290, #320, #396, #461, #501). The three items earlier drafts had corrected AWAY are now present and must be stated: (1) the audit log now carries a SHA-256 root over each checkpoint's entry-hash set (computeAuditRoot in audit/chain.ts), so integrity coverage is no longer state-store-only; (2) checkpoint records are Ed25519-signed over domain-separated canonical JSON when a signing identity is available (records are marked unsigned with a reason otherwise), so there is non-repudiation at checkpoint granularity, though NOT a distinct signature on each individual entry; (3) entries are chained by prev_hash (PersistedAuditEnvelopeV2, schema version 2), so a tamper-evident transcript does now exist. The precise bound: per-entry tamper-evidence is the AES-256-GCM authentication tag plus the prev_hash link (keyed to the master); Ed25519 non-repudiation is at checkpoint granularity over the Merkle-style root, and is conditional on a signing identity being present at checkpoint time. Non-repudiation against a compromised-master-key insider who forges the checkpoint signer is still out of scope; the row survives as full because Art. 15(5) targets unauthorised third parties, and the chain plus signed checkpoint plus master-MAC'd rotation anchor are resilient against that threat model.
 
 ---
 
@@ -1192,7 +1192,7 @@ Sanctuary provides the detect-and-export half; enterprise provides the report-an
 
 **Evidence emitted by Sanctuary:**
 
-Auto-filled: Sanctuary's audit log persists entries indefinitely by default and is exportable for archival at any time via audit_export_siem in CEF/OCSF formats suitable for long-term SIEM retention.
+Auto-filled: Sanctuary's audit log persists entries by default until configured size or entry caps trigger authenticated rotation (defaults: 100,000 entries / 100 MB); it is exportable for archival at any time via audit_export_siem in CEF/OCSF formats suitable for long-term SIEM retention. A deployment whose six-month window exceeds those caps must archive via that export.
 
 **Evidence emitter tools:** `monitor_audit_log`, `audit_export_siem`
 
