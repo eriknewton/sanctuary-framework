@@ -90,7 +90,6 @@ import {
   resolveEntitlement,
   COMMUNITY_FREE_NODE_CAP,
   isLicenseRevoked,
-  readRevocationList,
   revocationVerifiability,
   persistPushedRevocationListSerialized,
   readDowngradeLog,
@@ -6186,8 +6185,20 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       const masterKey = this.shrOpts?.masterKey;
       if (storage && masterKey) {
         try {
-          const list = await readRevocationList(storage, masterKey);
-          revocationListUnreadable = list.status === "invalid";
+          // Source the banner's unverifiable determination from the SAME
+          // chokepoint enforcement uses ({@link revocationVerifiability}), NOT a
+          // parallel `readRevocationList` corrupt-only check. Enforcement drops a
+          // paid grant toward Community whenever the chokepoint reports
+          // `unverifiable` for ANY reason - corrupt, absent-after-an-established-
+          // floor (delete bypass), rolled-back-below-floor, or a transient that
+          // never clears above an established floor. A corrupt-only banner check
+          // caught only the first, so a deleted/rolled-back list was CORRECTLY
+          // dropped by enforcement but MISLABELED "revoked" in the banner instead
+          // of the operator-actionable "re-push" (revocation-list-unreadable)
+          // state. Deriving from the chokepoint makes the banner match what
+          // enforcement actually did.
+          const verifiability = await revocationVerifiability(storage, masterKey);
+          revocationListUnreadable = verifiability.status === "unverifiable";
         } catch {
           revocationListUnreadable = true;
         }

@@ -35,7 +35,9 @@ import {
 } from "../../src/entitlement/token.js";
 import { writeFleetActivation } from "../../src/entitlement/activation.js";
 import {
+  REVOCATION_LIST_META_KEY,
   signRevocationList,
+  writeRevocationList,
   type RevocationListPayload,
   type SignedRevocationList,
 } from "../../src/entitlement/revocation-list.js";
@@ -313,6 +315,57 @@ describe("PR-3 GET /api/fleet/status - the downgrade banner", () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(body.paid).toBe(false);
     expect(body.banner_state).toBe("expired");
+  });
+
+  // The banner's unverifiable determination MUST come from the SAME chokepoint
+  // enforcement uses (revocationVerifiability), not a parallel corrupt-only
+  // readRevocationList check. Enforcement drops a paid grant whose established
+  // revocation floor is un-provable (deleted or rolled back below the floor) to
+  // Community; the banner must then report the operator-actionable re-push state
+  // (revocation_list_unreadable), NOT mislabel it "revoked".
+  it("reports revocation_list_unreadable when the list is DELETED below an established floor", async () => {
+    h = await startHarness(8);
+    // A live paid license, then a genuine revocation push at v5 establishes the
+    // floor (+ the custody witness latch that survives deletion of the list).
+    await writeFleetActivation(h.storage, h.masterKey, liveLicense(), 0);
+    expect((await pushList(h, signedList([LICENSE_ID], 5), h.authToken)).status).toBe(200);
+    // Delete the on-disk revocation list. The witness latch keeps the floor at 5,
+    // so the chokepoint reports `unverifiable` (absent_below_floor): enforcement
+    // drops to Community, and the banner must say "re-push", not "revoked".
+    await h.storage.delete("_meta", REVOCATION_LIST_META_KEY);
+
+    const res = await get(h, "/api/fleet/status");
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.paid).toBe(false); // enforcement correctly dropped to Community
+    expect(body.revocation_list_unreadable).toBe(true);
+    expect(body.banner_state).toBe("revocation_list_unreadable");
+    expect(body.banner_state).not.toBe("revoked");
+  });
+
+  it("reports revocation_list_unreadable when the list is ROLLED BACK below an established floor", async () => {
+    h = await startHarness(8);
+    await writeFleetActivation(h.storage, h.masterKey, liveLicense(), 0);
+    // Establish the floor at v5 with a genuine push (raises the custody witness
+    // latch to 5, which survives any later on-disk list change).
+    expect((await pushList(h, signedList([LICENSE_ID], 5), h.authToken)).status).toBe(200);
+    // Model an on-disk ROLLBACK: replace the stored list with an OLD, genuinely
+    // master-MAC'd v1 record below the established floor. writeRevocationList's own
+    // monotonic guard reads the CURRENT on-disk version, so delete first, then
+    // write v1 - the witness latch keeps the enforcement floor at 5.
+    await h.storage.delete("_meta", REVOCATION_LIST_META_KEY);
+    await writeRevocationList(h.storage, h.masterKey, {
+      version: 1,
+      revokedLicenseIds: [LICENSE_ID],
+      issuer: "issuer-fp",
+      issuedAt: "2026-07-06T00:00:00.000Z",
+    });
+
+    const res = await get(h, "/api/fleet/status");
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.paid).toBe(false); // rolled-back-below-floor -> dropped to Community
+    expect(body.revocation_list_unreadable).toBe(true);
+    expect(body.banner_state).toBe("revocation_list_unreadable");
+    expect(body.banner_state).not.toBe("revoked");
   });
 });
 
