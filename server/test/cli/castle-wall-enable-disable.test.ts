@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -224,6 +224,158 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
+  });
+
+  it("enable WARNs (non-blocking) when no agent-origin descriptor is set (#877 boot-cut follow-up)", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+      sysextProbe: async () => "[activated enabled]",
+      agentOriginDescriptorProbe: async () => false,
+    });
+
+    // Non-blocking: the arm still proceeds (some hosts arm agent-only on purpose).
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+    expect(err.text()).toContain("no agent-origin descriptor");
+    expect(err.text()).toContain("boot-cut");
+    expect(err.text()).toContain("configure-origin");
+  });
+
+  it("enable does NOT warn about the descriptor when a valid one is set", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+      sysextProbe: async () => "[activated enabled]",
+      agentOriginDescriptorProbe: async () => true,
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+    expect(err.text()).not.toContain("no agent-origin descriptor");
+  });
+
+  it("enable --force still warns about a missing agent-origin descriptor", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    // --force bypasses the daemon + boot-service brick guards, but the
+    // descriptor warning is informational and must still fire.
+    const code = await runEnable(["--force", "--no-ttl"], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
+      agentOriginDescriptorProbe: async () => false,
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toContain("no agent-origin descriptor");
+  });
+
+  it("enable's DEFAULT descriptor probe warns when the on-disk descriptor is absent (real read path)", async () => {
+    // No agentOriginDescriptorProbe injected: exercises the production
+    // defaultAgentOriginDescriptorPresent read+validate path against a fortress
+    // with no policy/egress/agent-origin.json on disk.
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+      sysextProbe: async () => "[activated enabled]",
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).toContain("no agent-origin descriptor");
+  });
+
+  it("enable's DEFAULT descriptor probe stays silent when a valid descriptor is on disk (real read path)", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    // Write a structurally valid uid-mode descriptor where the real probe reads.
+    await mkdir(join(fortressPath, "policy", "egress"), { recursive: true });
+    await writeFile(
+      join(fortressPath, "policy", "egress", "agent-origin.json"),
+      JSON.stringify({ mode: "uid", agent_uid: 502, system_uid_allow_ceiling: 500 }),
+    );
+    const err = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+      sysextProbe: async () => "[activated enabled]",
+    });
+
+    expect(code).toBe(0);
+    expect(err.text()).not.toContain("no agent-origin descriptor");
   });
 
   it("enable accepts a boot service that targets the default fortress", async () => {

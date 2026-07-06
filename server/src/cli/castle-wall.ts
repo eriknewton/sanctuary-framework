@@ -132,6 +132,13 @@ export interface CastleWallCommandContext {
   safeModeDaemonStart?: (
     input: import("../castle-wall/runtime/macos-daemon.js").MacOSCastleWallDaemonInput,
   ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
+  /**
+   * Override the agent-origin descriptor presence probe used by the `enable`
+   * boot-cut WARNING (#877 follow-up; tests). Returns true iff a structurally
+   * valid agent-origin descriptor is set for the fortress. Defaults to reading
+   * and validating `<fortress>/policy/egress/agent-origin.json`.
+   */
+  agentOriginDescriptorProbe?: (fortressPath: string) => Promise<boolean>;
 }
 
 export interface CastleWallParsedArgs {
@@ -259,6 +266,25 @@ const EXIT_SYSEXT_DISABLED = 4;
 
 function write(stream: Writable, text: string): void {
   stream.write(text);
+}
+
+/**
+ * Default agent-origin descriptor presence probe for the `enable` boot-cut
+ * WARNING (#877 follow-up). True iff `<fortress>/policy/egress/agent-origin.json`
+ * exists, parses, and passes `validateAgentOrigin`. Fail-safe to false (missing,
+ * unreadable, malformed, or invalid all count as "no descriptor set") so the
+ * warning errs toward informing the operator rather than staying silent.
+ */
+async function defaultAgentOriginDescriptorPresent(fortressPath: string): Promise<boolean> {
+  try {
+    const raw = await readFile(
+      join(fortressPath, "policy", "egress", "agent-origin.json"),
+      "utf8",
+    );
+    return validateAgentOrigin(JSON.parse(raw)) !== null;
+  } catch {
+    return false;
+  }
 }
 
 function fingerprintFromPublicKey(publicKey: Uint8Array): string {
@@ -2701,6 +2727,31 @@ async function runArmDisarm(
     if ((await sysextProbe()) === "[activated disabled]") {
       write(err, SYSEXT_DISABLED_GUIDANCE);
       return EXIT_SYSEXT_DISABLED;
+    }
+  }
+
+  if (action === "enable") {
+    // Origin-descriptor boot-cut WARNING (#877 follow-up). With NO valid
+    // agent-origin descriptor set, the macOS OriginClassifier classifies EVERY
+    // flow `.agent`, so arming default-denies the operator's OWN SSH / Tailscale
+    // / operator shell (the boot-cut #877's runbook step prevents). This is a
+    // NON-BLOCKING warning, not a refuse: arm still proceeds (some hosts arm
+    // agent-only on purpose, and refusing here would change arm behavior for
+    // existing headless flows). Fires regardless of --force. The
+    // refuse-without-`--force` upgrade is a separate, arm-behavior-changing,
+    // drill-gated decision.
+    const originProbe =
+      ctx.agentOriginDescriptorProbe ?? defaultAgentOriginDescriptorPresent;
+    if (!(await originProbe(fortressPath))) {
+      write(
+        err,
+        "WARNING: no agent-origin descriptor is set for this fortress.\n" +
+          "Arming now classifies EVERY flow as `.agent`, so default-deny will cut\n" +
+          "your OWN SSH / Tailscale / operator shell (the boot-cut).\n" +
+          "Set one BEFORE arming, then re-run enable:\n" +
+          "  sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500\n" +
+          "Proceeding to arm anyway.\n",
+      );
     }
   }
 
