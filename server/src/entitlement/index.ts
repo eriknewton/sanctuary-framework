@@ -127,10 +127,17 @@ export {
 
 export {
   REVOCATION_VERSION_ANCHOR_META_KEY,
+  REVOCATION_READ_RETRY_ATTEMPTS,
+  REVOCATION_READ_RETRY_DELAY_MS,
+  REVOCATION_PUSH_LOCK_FILE,
   readRevocationVersionAnchor,
   writeRevocationVersionAnchor,
   effectiveRevocationVersionFloor,
+  revocationVerifiability,
+  persistPushedRevocationListSerialized,
   type RevocationVersionAnchorData,
+  type RevocationVerifiability,
+  type SerializedRevocationPushResult,
 } from "./revocation-antirollback.js";
 
 export {

@@ -50,6 +50,7 @@ import {
 } from "./activation.js";
 import { resolveEntitlement } from "./token.js";
 import { isLicenseRevoked } from "./revocation-list.js";
+import { revocationVerifiability } from "./revocation-antirollback.js";
 import {
   appendDowngradeLog,
   type DowngradeLogEntry,
@@ -307,17 +308,24 @@ export async function runFleetReResolve(args: {
     cap = resolveFleetCap(toView(resolution), capRecord.data.grandfatheredBaseline);
   }
 
-  // ── Revocation: a revoked license is forced to Community. Consult the SIGNED
-  // list by the resolved license id (only meaningful when we actually resolved a
-  // paid grant with an id). FAIL-CLOSED (coordinator-adjudicated 2026-07-06): a
-  // PRESENT-but-CORRUPT list (revocation.listReadable === false) is ALSO a
-  // drop-to-Community trigger for a paid grant - we must not keep the paid tier on
-  // the basis of a revocation list we cannot authenticate. An ABSENT list is
-  // listReadable:true and keeps the grant.
-  const revocation = await isLicenseRevoked(storage, master, licenseId);
+  // ── Revocation: a revoked license is forced to Community. This consults the
+  // SINGLE {@link revocationVerifiability} chokepoint, which fails closed UNIFORMLY
+  // on every way the revocation record can lie: CORRUPT (present, MAC fail),
+  // ABSENT-after-a-push (list deleted while the custody-MAC'd witness floor /
+  // standalone anchor proves a version-N revocation existed - the delete bypass
+  // this fix closes), and ROLLED-BACK (present below the established floor). Any of
+  // those => revocation state UNVERIFIABLE => drop a paid grant to Community. An
+  // ABSENT list with NO established floor keeps the grant (the legit case). A
+  // TRANSIENT storage error is grace (no drop). The id-on-list check (`revoked`) is
+  // consulted ONLY on a verifiably-clean list.
+  const verifiability = await revocationVerifiability(storage, master);
+  const revocationListUnverifiable = verifiability.status === "unverifiable";
   let revoked = false;
-  if (cap.paid && (revocation.revoked || !revocation.listReadable)) {
-    revoked = revocation.revoked;
+  if (verifiability.status === "clean") {
+    const status = await isLicenseRevoked(storage, master, licenseId);
+    revoked = status.revoked;
+  }
+  if (cap.paid && (revoked || revocationListUnverifiable)) {
     // Force to the community floor, preserving the (authenticated) grandfather
     // baseline so a revoked/corrupt-but-grandfathered fleet keeps its count.
     const baseline =
@@ -352,9 +360,10 @@ export async function runFleetReResolve(args: {
     await safeAppend(storage, master, entry);
   }
 
-  // Surface a revocation-list corruption as its own log row (once per pass it is
-  // seen), so the operator knows to re-push. Best-effort, never blocks.
-  if (!revocation.listReadable) {
+  // Surface an unverifiable revocation list as its own log row (once per pass it
+  // is seen), so the operator knows to re-push. Best-effort, never blocks. This
+  // now fires for the deletion + rollback cases too, not only present-corruption.
+  if (revocationListUnverifiable) {
     await safeAppend(storage, master, {
       at: nowIso().toISOString(),
       kind: "revocation_list_unreadable",
@@ -371,7 +380,7 @@ export async function runFleetReResolve(args: {
   return {
     cap,
     revoked,
-    revocationListUnreadable: !revocation.listReadable,
+    revocationListUnreadable: revocationListUnverifiable,
     grandfatherCaptured,
     transition,
   };

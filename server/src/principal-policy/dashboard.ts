@@ -91,10 +91,8 @@ import {
   COMMUNITY_FREE_NODE_CAP,
   isLicenseRevoked,
   readRevocationList,
-  writeRevocationList,
-  verifyPushedRevocationList,
-  effectiveRevocationVersionFloor,
-  writeRevocationVersionAnchor,
+  revocationVerifiability,
+  persistPushedRevocationListSerialized,
   readDowngradeLog,
   runFleetReResolve,
   resolveFleetCap as resolveFleetCapPure,
@@ -3833,16 +3831,21 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * Reads the activation record for the resolved license id, then consults
    * {@link isLicenseRevoked}.
    *
-   * FAIL-CLOSED (coordinator-adjudicated 2026-07-06): `revoked` is true when the id
-   * is on an authenticated list; `listUnverifiable` is true when the stored list is
-   * PRESENT-but-INVALID (corrupt / tamper-failed), which the caller ALSO treats as a
-   * drop-to-Community trigger - a paid grant must not survive on an unverifiable
-   * revocation list. An ABSENT list (nothing revoked) is neither: it keeps the
-   * grant. Note `isLicenseRevoked` reports `listReadable:false` ONLY for a
-   * present-corrupt list, never for an absent one, so this cleanly separates the
-   * two. A genuine READ error (storage hiccup) is caught below and returns neither
-   * flag set (fail-SAFE for a transient I/O blip, distinct from an authenticated
-   * corrupt-list verdict). Never throws.
+   * FAIL-CLOSED via the SINGLE {@link revocationVerifiability} chokepoint. `revoked`
+   * is true when the id is on an authenticated list; `listUnverifiable` is true
+   * whenever the revocation state is UNVERIFIABLE for ANY reason the chokepoint
+   * recognizes uniformly:
+   *   - CORRUPT (present, MAC/parse fail),
+   *   - ABSENT-after-a-push (list deleted while the custody-MAC'd witness floor /
+   *     standalone anchor proves a version-N revocation existed - the delete
+   *     bypass this fix closes),
+   *   - ROLLED-BACK (present but below the established floor).
+   * All three drop a paid grant toward Community. An ABSENT list with NO established
+   * floor (a fleet that never had a revocation pushed) is `clean` and keeps the
+   * grant (the legit case). A TRANSIENT storage-read error (EIO/EAGAIN, not the
+   * benign ENOENT/absent) sets NEITHER flag - grace, so a one-off IO blip does not
+   * drop a legit paid fleet (a genuine MAC failure is `corrupt`, never transient).
+   * Never throws.
    */
   private async revocationStatusForActiveLicense(
     storage: StorageBackend,
@@ -3855,10 +3858,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }> {
     try {
       const record = await readFleetActivation(storage, masterKey);
-      // The revocation-list readability is independent of the activation id: a
-      // corrupt list is a fail-closed trigger even before we resolve an id.
-      // `isLicenseRevoked` with a null id still surfaces `listReadable` for the
-      // stored list (revoked stays false for a null id).
       const baseline =
         record.status === "valid" ? record.data.grandfatheredBaseline : 0;
       let licenseId: string | null = null;
@@ -3871,11 +3870,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         licenseId =
           typeof resolution.licenseId === "string" ? resolution.licenseId : null;
       }
-      const status = await isLicenseRevoked(storage, masterKey, licenseId);
+      // THE CHOKEPOINT: one derived verdict covering absent-after-established,
+      // corrupt, and rolled-back uniformly. A `transient` verdict is grace (no
+      // drop). Only a `clean` verdict may keep the paid grant.
+      const verifiability = await revocationVerifiability(storage, masterKey);
+      const listUnverifiable = verifiability.status === "unverifiable";
+      // Only consult the id-on-list check when the list is verifiably CLEAN;
+      // otherwise `listUnverifiable` already forces the drop and the id lookup on a
+      // deleted/corrupt list is meaningless.
+      let revoked = false;
+      if (verifiability.status === "clean") {
+        const status = await isLicenseRevoked(storage, masterKey, licenseId);
+        revoked = status.revoked;
+      }
       return {
-        revoked: status.revoked,
-        // listReadable:false ONLY for a present-but-corrupt list (absent -> true).
-        listUnverifiable: !status.listReadable,
+        revoked,
+        listUnverifiable,
         grandfatheredBaseline: baseline,
       };
     } catch {
@@ -6372,29 +6382,6 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     if (issuerPublicKey === null) {
       return { ok: false, reason: "no_issuer" };
     }
-    // The monotonic floor is the EXTERNALLY-ANCHORED version, not merely the
-    // stored list's readable version. A corrupt stored list reads as version 0,
-    // but the master-MAC'd anchor still holds the true floor, so a disk attacker
-    // who trashes the list file cannot roll the floor back to 0 and re-apply an
-    // OLD genuinely-signed (lower-version) list to un-revoke licenses.
-    // `effectiveRevocationVersionFloor` returns max(storedListVersion, anchor)
-    // and never throws; guard anyway and fail SAFE toward floor 0 (the verify below
-    // still rejects any non-newer version, so a hiccup never lowers the real floor
-    // beyond what the persisted records carry).
-    let currentVersion: number;
-    try {
-      currentVersion = await effectiveRevocationVersionFloor(storage, masterKey);
-    } catch {
-      currentVersion = 0;
-    }
-    const verification = verifyPushedRevocationList(
-      signed,
-      issuerPublicKey,
-      currentVersion,
-    );
-    if (!verification.ok) {
-      return { ok: false, reason: verification.reason };
-    }
     // Capture the PRE-push resolved cap as the prior state so the immediate
     // re-resolve below observes the real paid -> Community transition (and logs
     // it) even if no scheduled tick happened to run while the license was paid.
@@ -6409,24 +6396,37 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     } catch {
       // Best-effort prior seeding; the tick still runs and fails closed.
     }
-    // BLOB BEFORE ANCHOR: persist the authenticated newer list FIRST, then advance
-    // the external version anchor. A crash between the two leaves the anchor
-    // LAGGING the list, which the max()-based floor treats as benign (never a
-    // rollback, never a false-block) - the dangerous order would false-block a
-    // legitimate re-push at the intended version on a crash.
-    await writeRevocationList(storage, masterKey, verification.payload);
-    await writeRevocationVersionAnchor(
-      storage,
-      masterKey,
-      verification.payload.version,
-    );
+    // The SINGLE serialized push path (shared with the CLI): a cross-process
+    // O_EXCL lock re-reads the effective floor INSIDE the lock and re-verifies
+    // monotonicity against it, then persists list -> anchor -> custody-MAC'd
+    // witness latch in crash-safe order. Two concurrent pushes (v6 + v7) cannot
+    // both pass against a stale floor and interleave the list vs the anchor/latch.
+    // The floor is the EXTERNALLY-ANCHORED + witness-bound version, so a corrupt or
+    // DELETED list file can never roll it back to 0.
+    let result: Awaited<ReturnType<typeof persistPushedRevocationListSerialized>>;
+    try {
+      result = await persistPushedRevocationListSerialized({
+        storage,
+        master: masterKey,
+        signed,
+        issuerPublicKey,
+      });
+    } catch {
+      // A genuine persist/IO error (or lock contention past the bounded timeout):
+      // fail closed. Nothing partially trusted - the max() floor keeps any partial
+      // write safe. Report `malformed` is wrong; surface a distinct persist error.
+      return { ok: false, reason: "malformed" };
+    }
+    if (!result.ok) {
+      return { ok: false, reason: result.reason };
+    }
     // Reconcile immediately: a now-revoked active license drops to Community and
     // the transition is logged without waiting for the hourly tick.
     void this.runFleetLicenseReResolveTick();
     return {
       ok: true,
-      version: verification.payload.version,
-      revokedCount: verification.payload.revokedLicenseIds.length,
+      version: result.version,
+      revokedCount: result.revokedCount,
     };
   }
 

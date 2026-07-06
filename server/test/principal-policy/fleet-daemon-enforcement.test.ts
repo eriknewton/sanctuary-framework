@@ -55,7 +55,13 @@ import {
   writeRevocationList,
   signRevocationList,
   verifyPushedRevocationList,
+  REVOCATION_LIST_META_KEY,
 } from "../../src/entitlement/revocation-list.js";
+import {
+  writeRevocationVersionAnchor,
+  REVOCATION_VERSION_ANCHOR_META_KEY,
+} from "../../src/entitlement/revocation-antirollback.js";
+import { raiseRevocationFloorLatch } from "../../src/core/anti-rollback.js";
 import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
 import type {
   FederationContext,
@@ -541,6 +547,73 @@ describe("PR-3 fail-closed - a CORRUPT revocation list drops a paid fleet on the
     const v = verifyPushedRevocationList(signed, issuer.publicKey, 0);
     expect(v.ok).toBe(true);
     if (v.ok) await writeRevocationList(h.storage, h.masterKey, v.payload);
+    expect((await fetchFleet(h)).nodes).toHaveLength(5);
+  });
+
+  it("THE DELETE BYPASS: DELETING the revocation list after a push keeps the fleet at Community (delete != un-revoke)", async () => {
+    // The key missing test both review families flagged. A revoked/killed license
+    // must NOT be un-revoked by a bare `rm` of the list file. Push v5 revoking the
+    // active license (list + anchor + custody-MAC'd witness latch), confirm the
+    // fleet dropped to 5, then DELETE only the list file. Because the anchor +
+    // witness latch prove a version-5 revocation existed, the enforcement path
+    // consults the floor and keeps failing closed - the fleet stays at 5.
+    h = await startHarness({ totalNodes: 8 });
+    await writeFleetActivation(h.storage, h.masterKey, liveValidLicense(25), 0);
+    expect((await fetchFleet(h)).nodes).toHaveLength(8); // paid, all 8
+
+    const signed = signRevocationList(
+      {
+        version: 5,
+        revokedLicenseIds: ["lic-daemon-e2e"],
+        issuer: "issuer-fp",
+        issuedAt: "2026-07-06T00:00:00.000Z",
+      },
+      (m) => ed25519.sign(m, issuer.privateKey),
+    );
+    const v = verifyPushedRevocationList(signed, issuer.publicKey, 0);
+    expect(v.ok).toBe(true);
+    if (v.ok) {
+      await writeRevocationList(h.storage, h.masterKey, v.payload);
+      await writeRevocationVersionAnchor(h.storage, h.masterKey, 5);
+      await raiseRevocationFloorLatch(h.storage, h.masterKey, 5);
+    }
+    expect((await fetchFleet(h)).nodes).toHaveLength(5); // revoked -> Community
+
+    // A disk attacker DELETES the list file to try to un-revoke.
+    await h.storage.delete("_meta", REVOCATION_LIST_META_KEY);
+
+    // The fleet MUST stay at 5: the floor (anchor + witness latch) proves a
+    // revocation existed, so the absent list is UNVERIFIABLE -> fail closed.
+    expect((await fetchFleet(h)).nodes).toHaveLength(5);
+  });
+
+  it("DELETE BYPASS also survives deletion of the standalone ANCHOR (witness latch alone holds)", async () => {
+    // The anchor was itself deletable (defect #2). Delete BOTH the list AND the
+    // standalone anchor; the custody-MAC'd witness latch still proves the
+    // revocation existed, so the fleet stays at Community.
+    h = await startHarness({ totalNodes: 8 });
+    await writeFleetActivation(h.storage, h.masterKey, liveValidLicense(25), 0);
+    const signed = signRevocationList(
+      {
+        version: 5,
+        revokedLicenseIds: ["lic-daemon-e2e"],
+        issuer: "issuer-fp",
+        issuedAt: "2026-07-06T00:00:00.000Z",
+      },
+      (m) => ed25519.sign(m, issuer.privateKey),
+    );
+    const v = verifyPushedRevocationList(signed, issuer.publicKey, 0);
+    if (v.ok) {
+      await writeRevocationList(h.storage, h.masterKey, v.payload);
+      await writeRevocationVersionAnchor(h.storage, h.masterKey, 5);
+      await raiseRevocationFloorLatch(h.storage, h.masterKey, 5);
+    }
+    expect((await fetchFleet(h)).nodes).toHaveLength(5);
+
+    await h.storage.delete("_meta", REVOCATION_LIST_META_KEY);
+    await h.storage.delete("_meta", REVOCATION_VERSION_ANCHOR_META_KEY);
+
+    // Only the witness latch remains; the fleet still stays at 5.
     expect((await fetchFleet(h)).nodes).toHaveLength(5);
   });
 });

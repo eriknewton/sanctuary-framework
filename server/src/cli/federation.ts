@@ -24,10 +24,8 @@ import { generateIdentityId } from "../core/identity.js";
 import {
   REVOCATION_LIST_SIGN_ACTION,
   canonicalizeRevocationListIds,
-  writeRevocationList,
-  verifyPushedRevocationList,
   effectiveRevocationVersionFloor,
-  writeRevocationVersionAnchor,
+  persistPushedRevocationListSerialized,
   readDowngradeLog,
   type RevocationListPayload,
 } from "../entitlement/index.js";
@@ -1334,52 +1332,42 @@ export async function runFederationRevokePush(args: {
       issuedAt: new Date().toISOString(),
     };
     // Sign with the operator key via the shared operator-signed message path (the
-    // SAME construction `buildRevocationListMessage` verifies), then re-verify
-    // against the pinned operator public key + the stored monotonic version
-    // BEFORE persisting, so an accidental stale/lower version is rejected here.
+    // SAME construction `buildRevocationListMessage` verifies).
     const signature = signer.signPayload(REVOCATION_LIST_SIGN_ACTION, payload);
     const signed = { payload, signature };
 
-    // The monotonic floor is the EXTERNALLY-ANCHORED version, not merely the
-    // stored list's readable version: a corrupt stored list reads as version 0,
-    // but the anchor still holds the true floor, so a corrupt file can never let
-    // an OLD signed list roll the version back. `effectiveRevocationVersionFloor`
-    // returns max(storedListVersion, anchorVersion).
-    const currentVersion = await effectiveRevocationVersionFloor(
-      signer.storage,
-      signer.masterKey,
-    );
-
-    const verification = verifyPushedRevocationList(
+    // The SINGLE serialized push path (shared with the HTTP route): a
+    // cross-process O_EXCL lock re-reads the EXTERNALLY-ANCHORED + witness-bound
+    // effective floor INSIDE the lock and re-verifies monotonicity against it, then
+    // persists list -> anchor -> custody-MAC'd witness latch in crash-safe order. A
+    // corrupt/deleted list file can never roll the floor back to 0, and two
+    // concurrent pushes cannot both pass against a stale floor.
+    const result = await persistPushedRevocationListSerialized({
+      storage: signer.storage,
+      master: signer.masterKey,
       signed,
-      signer.operatorPublicKey,
-      currentVersion,
-    );
-    if (!verification.ok) {
+      issuerPublicKey: signer.operatorPublicKey,
+    });
+    if (!result.ok) {
+      // Surface the floor observed inside the lock for the operator's not_newer.
+      const floor = await effectiveRevocationVersionFloor(
+        signer.storage,
+        signer.masterKey,
+      );
       err.write(
-        `sanctuary federation revoke-push: refusing to persist (${verification.reason}` +
-          (verification.reason === "not_newer"
-            ? `; stored version is ${currentVersion}, pushed ${version})\n`
+        `sanctuary federation revoke-push: refusing to persist (${result.reason}` +
+          (result.reason === "not_newer"
+            ? `; stored version is ${floor}, pushed ${version})\n`
             : ")\n"),
       );
       return 3;
     }
-    // BLOB BEFORE ANCHOR: persist the authenticated newer list FIRST, then advance
-    // the external version anchor. A crash between the two leaves the anchor
-    // LAGGING the list, which the max()-based floor treats as benign (never a
-    // rollback, never a false-block).
-    await writeRevocationList(signer.storage, signer.masterKey, verification.payload);
-    await writeRevocationVersionAnchor(
-      signer.storage,
-      signer.masterKey,
-      verification.payload.version,
-    );
     out.write(
       `${JSON.stringify(
         {
           revocation_list_pushed: true,
-          version: verification.payload.version,
-          revoked_count: verification.payload.revokedLicenseIds.length,
+          version: result.version,
+          revoked_count: result.revokedCount,
           issuer,
         },
         null,
