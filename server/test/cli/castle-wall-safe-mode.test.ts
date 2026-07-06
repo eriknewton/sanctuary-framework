@@ -165,4 +165,37 @@ describe("castle-wall safe-mode daemon (F1 Option C)", () => {
       expect(captured!.socketOwnerUid).toBe(selfUid);
     }
   });
+
+  // skipIf(darwin): the diagnosis path in `writeSignerHelperReadinessDiagnosis`
+  // shells out to the REAL `launchctl` (no injectable seam from this context),
+  // so the `/Background Item/` assertion only holds where launchctl reports the
+  // helper as NOT loaded. That is guaranteed on Linux CI (launchctl absent) and
+  // on any host without the signer helper registered, but NOT on a macOS box
+  // where the helper IS loaded (a live pid -> the remediation would instead be
+  // pin/custody/ready). Gating to non-darwin keeps this deterministic and off
+  // the exact reboot-drill Mac where it would spuriously go red. The pure
+  // remediation logic is exhaustively unit-tested (all platforms, injected
+  // seams) in castle-wall-signer-helper.test.ts; this test only asserts that
+  // runSafeModeDaemon WIRES the diagnosis into its start-failure path.
+  it.skipIf(process.platform === "darwin")("on daemon-start failure, appends a signer-helper boot-readiness diagnosis (design pass 2026-06-26)", async () => {
+    const fortress = await makeFortress();
+    const tok = await makeToken();
+    const err = new CaptureStream();
+
+    const code = await runSafeModeDaemon([], {
+      err,
+      platform: "darwin",
+      env: { SANCTUARY_STORAGE_PATH: fortress },
+      bootTokenPath: tok.path,
+      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+      safeModeDaemonStart: async () => {
+        throw new Error("helper unreachable in test");
+      },
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Safe-mode daemon failed to start");
+    expect(err.text()).toContain("signer helper is unreachable");
+    expect(err.text()).toMatch(/Background Item/);
+  });
 });

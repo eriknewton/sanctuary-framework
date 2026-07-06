@@ -128,6 +128,73 @@ daemon, and it is sound *because of* the split credential:
 | `sudo sanctuary castle-wall provision-boot-token` | root | Mints the boot token (root-owned `0600`) in the system custody dir. Idempotent; `--rotate` replaces an existing token. Records `boot_token_provisioned` in the boot-audit segment. `install-boot` auto-provisions it, so this is only needed for explicit rotation. |
 | `sudo sanctuary castle-wall install-boot` | root | Auto-provisions the boot token if absent, installs `/Library/LaunchDaemons/ai.sanctuaryprotocol.castle-wall.daemon.plist` (safe-mode, root), bootstraps it, and **verifies a live PID** before reporting success. Idempotent. Refuses (fail-closed) unless the trust anchor (global pin) and signer shim are present. |
 | `sudo sanctuary castle-wall uninstall-boot --yes` | root | Boots the job out and removes the plist. **Requires `--yes`** (removing it re-arms the brick). Does NOT disarm the content filter. |
+| `sanctuary castle-wall signer-helper status` | operator | Boot-readiness preflight for the ROOT SIGNER HELPER (a different LaunchDaemon than the boot service above; see the next section). Read-only, no sudo needed. Exit 0 when ready, 1 otherwise. |
+
+## Signer-helper boot readiness (separate from the safe-mode boot service above)
+
+This section documents a distinct LaunchDaemon from the safe-mode boot service
+described everywhere else in this doc: the root SIGNER HELPER
+(`ai.sanctuaryprotocol.macos.castle-wall.signer-helper`). Both are boot-started
+root LaunchDaemons, and both matter for a headless `castle-wall enable` to
+survive a reboot, but they are registered and started differently:
+
+- The **safe-mode boot service** (`ai.sanctuaryprotocol.castle-wall.daemon`,
+  everything above this section) is a plain `/Library/LaunchDaemons` plist that
+  `install-boot` writes and bootstraps directly via `launchctl bootstrap`.
+- The **signer helper** (`ai.sanctuaryprotocol.macos.castle-wall.signer-helper`)
+  is bundled inside `Sanctuary-CastleWall.app` and registered through
+  `SMAppService.daemon(...).register()` by the host app's
+  `SignerHelperManager` (Swift). It already ships `RunAtLoad` + `KeepAlive` in
+  its plist, so once the operator approves it ONCE as a Background Item in
+  System Settings (the same one-time consent pattern Little Snitch and
+  Tailscale use), launchd starts it at every subsequent boot with no login
+  required. Approved-once-then-headless is the shipped model; a
+  no-console-at-all first install is a separate, not-yet-built product
+  decision (see the design pass referenced below).
+
+The 2026-06-25 signed drill found a practical gap: after a cold reboot,
+`launchctl print system/ai.sanctuaryprotocol.macos.castle-wall.signer-helper`
+did not show the helper, and there was no CLI-visible way to tell WHY before a
+headless `castle-wall enable` attempt failed. `signer-helper status` closes
+that gap by checking, in order:
+
+1. **`launchd_job_visible`**: `launchctl print system/ai.sanctuaryprotocol.macos.castle-wall.signer-helper`
+   shows a live pid.
+2. **`xpc_reachable`**: the helper answers a `get-pubkey` XPC query through the
+   signer-client shim.
+3. **`pin_match`**: the returned key matches the root-owned global pin
+   (`/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin`).
+4. **`custody_directory`**: `/Library/Application Support/Sanctuary` is
+   root-owned and not group/other-writable.
+
+Run it directly (env-only shim resolution: set `SANCTUARY_CASTLE_SIGNER_CLIENT`
+so the `xpc_reachable` check can run; without it this standalone command reports
+NOT-READY with the XPC check skipped, unlike `enable`/`daemon`, which
+auto-discover the bundled shim):
+
+```bash
+SANCTUARY_CASTLE_SIGNER_CLIENT="/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client" \
+  sanctuary castle-wall signer-helper status
+```
+
+`enable` and `daemon` (helper-sign mode) also run this preflight internally
+when the daemon fails to start, so a failed headless arm gets a SPECIFIC
+diagnosis instead of a generic "signer helper is unreachable" message:
+approve the Background Item, re-pin (pin mismatch), or repair the custody
+directory (`sudo sanctuary castle-wall setup-shared-dir`).
+
+Full design context:
+[`Castle_Wall_Signer_Helper_Boot_Daemon_Design_Pass_2026-06-26.md`](../../../Review/Sanctuary/Castle_Wall_Signer_Helper_Boot_Daemon_Design_Pass_2026-06-26.md).
+
+**What this build does NOT prove.** `signer-helper status` reports the LIVE
+state of the machine it runs on; it does not by itself prove the helper
+survives a cold reboot. That proof requires an Erik-present drill: reboot,
+without launching the host app, confirm `launchctl print
+system/ai.sanctuaryprotocol.macos.castle-wall.signer-helper` shows the helper,
+confirm `signer-helper status` reports READY, then confirm a headless
+`castle-wall enable` succeeds over SSH. Repeat N=5 (the drill-acceptance
+rule). Until that drill is captured and coordinator-verified, treat this as
+**code-complete, reboot-drill-pending**, not as a closed W7-1 / #780 item 8.
 
 ## Install path
 

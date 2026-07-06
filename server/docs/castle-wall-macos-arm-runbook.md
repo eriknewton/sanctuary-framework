@@ -49,6 +49,25 @@ come up deny-all with no daemon) is documented in
 arm/disarm design rationale is in
 [castle-wall-headless-arm-design.md](castle-wall-headless-arm-design.md).
 
+After the one-time approval in step 3-5, verify the root signer helper
+survives a reboot with:
+
+```bash
+# Point it at the bundled signer-client shim so the XPC reachability check can
+# run. Standalone, this command is env-only: without the shim path it reports
+# NOT-READY (xpc check skipped), unlike `enable`/`daemon`, which auto-discover
+# the shim.
+SANCTUARY_CASTLE_SIGNER_CLIENT="/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client" \
+  sanctuary castle-wall signer-helper status
+```
+
+This is a separate LaunchDaemon from the boot service above (see the
+"Signer-helper boot readiness" section of castle-wall-macos-boot-service.md).
+It reports whether the helper is loaded, reachable over XPC, pin-consistent,
+and its custody directory is intact, with a specific fix for each failure.
+`enable` and `daemon` also run this check internally and surface the same
+diagnosis if the helper is unreachable at arm time.
+
 ---
 
 ## ARM: the CLI last-mile sequence (app already installed + approved)
@@ -155,6 +174,7 @@ failed arm:
 | **CWD build-SHA trap** | `enable`/`disable` fail with `deployed app <X> != CLI <Y> - rebuild + redeploy` | the CLI SHA comes from `git rev-parse HEAD` in the CURRENT WORKING DIRECTORY (or `SANCTUARY_CASTLE_BUILD_SHA`), NOT the binary. If you are inside a git worktree whose HEAD differs from the deployed app, run the arm verbs **outside any git repo**, or `export SANCTUARY_CASTLE_BUILD_SHA=<app-sha>` first. This is NOT a real rebuild need. |
 | **No reachable daemon** | `enable` refuses (deny-all brick guard) | run `sanctuary castle-wall daemon` or install the boot service; `--force` only if supervised out of band |
 | **No boot service for this fortress** | `enable` refuses (reboot-brick guard) | `sudo sanctuary castle-wall install-boot`; `--force` only if boot-survival is supervised out of band |
+| **Signer helper unreachable after reboot** | `daemon` / boot-service start fails with "the signer helper is unreachable" | run `sanctuary castle-wall signer-helper status` for a specific diagnosis (approve the Background Item in System Settings, re-pin, or repair the custody directory) |
 | **No agent-origin descriptor set** | `enable` arms, but SSH / Tailscale / your operator shell are cut (every flow classifies `.agent` and hits default-deny) | run `sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500` BEFORE `enable` (step 4); `enable` does NOT yet guard for this |
 
 ---
