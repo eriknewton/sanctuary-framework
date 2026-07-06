@@ -1137,6 +1137,17 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runProvisionBootToken(args.slice(1));
   }
 
+  if (command === "signer-helper") {
+    const sub = args[1];
+    if (sub === "status" || sub === undefined) {
+      const { runSignerHelperStatus } = await import("./cli/castle-wall-signer-helper.js");
+      return runSignerHelperStatus(args.slice(2));
+    }
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(`Unknown signer-helper subcommand: ${sub}. Try: sanctuary castle-wall signer-helper status`);
+    return 2;
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
@@ -1183,6 +1194,12 @@ function printCastleWallHelp(): void {
     install-boot     Install the daemon as a launchd safe-mode boot service (run with sudo, macOS).
                      Options: --user <name> --fortress <path> --binary <path> --signer-client <path>
     uninstall-boot   Remove the launchd boot service (run with sudo, macOS; requires --yes). Does NOT disarm the filter.
+    signer-helper status
+                     Boot-readiness preflight for the root signer-helper LaunchDaemon: checks the
+                     launchd job is loaded, the helper answers over XPC, its key matches the global
+                     pin, and the custody directory is root-owned and not group/other-writable.
+                     Exit 0 when ready, 1 otherwise. Does NOT prove reboot survival by itself; see
+                     castle-wall-macos-boot-service.md for the required Erik-present reboot drill.
 
   Options:
     --help, -h              Show this help
