@@ -220,25 +220,26 @@ describe("castle-wall enable/disable CLI verbs", () => {
       bootServiceInstalledProbe: (expectedFortressPath) =>
         bootServiceInstalled(plistPath, expectedFortressPath),
       sysextProbe: async () => "[activated enabled]",
+      // This test targets the boot-service guard, not the descriptor guard.
+      agentOriginDescriptorProbe: async () => true,
     });
 
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
   });
 
-  it("enable WARNs (non-blocking) when no agent-origin descriptor is set (#877 boot-cut follow-up)", async () => {
+  it("enable REFUSES when no agent-origin descriptor is set and no --force (#877 boot-cut guard)", async () => {
     const { fortressPath, hostAppPath, env } = await makeFixture();
     const plistPath = join(fortressPath, "boot.plist");
     await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
-    const out = new CaptureStream();
     const err = new CaptureStream();
-    const { invoke } = makeInvoker({
+    const { invoke, calls } = makeInvoker({
       enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
     });
 
     const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
-      out,
+      out: new CaptureStream(),
       err,
       env,
       platform: "darwin",
@@ -251,12 +252,13 @@ describe("castle-wall enable/disable CLI verbs", () => {
       agentOriginDescriptorProbe: async () => false,
     });
 
-    // Non-blocking: the arm still proceeds (some hosts arm agent-only on purpose).
-    expect(code).toBe(0);
-    expect(out.text()).toContain("Castle Wall armed");
-    expect(err.text()).toContain("no agent-origin descriptor");
+    // Refuses like the sibling brick-guards; nothing is armed.
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Refusing to arm");
     expect(err.text()).toContain("boot-cut");
     expect(err.text()).toContain("configure-origin");
+    expect(err.text()).toContain("--force");
+    expect(calls).toHaveLength(0);
   });
 
   it("enable does NOT warn about the descriptor when a valid one is set", async () => {
@@ -289,17 +291,18 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(err.text()).not.toContain("no agent-origin descriptor");
   });
 
-  it("enable --force still warns about a missing agent-origin descriptor", async () => {
+  it("enable --force arms agent-only despite no descriptor, with a loud warning", async () => {
     const { hostAppPath, env } = await makeFixture();
     const out = new CaptureStream();
     const err = new CaptureStream();
-    const { invoke } = makeInvoker({
+    const { invoke, calls } = makeInvoker({
       enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
     });
 
-    // --force bypasses the daemon + boot-service brick guards, but the
-    // descriptor warning is informational and must still fire.
+    // --force is the intentional agent-only lockdown escape hatch: it bypasses
+    // the daemon + boot-service brick guards AND the descriptor refuse, but the
+    // descriptor warning must still fire and the arm must proceed.
     const code = await runEnable(["--force", "--no-ttl"], {
       out,
       err,
@@ -312,10 +315,13 @@ describe("castle-wall enable/disable CLI verbs", () => {
     });
 
     expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
     expect(err.text()).toContain("no agent-origin descriptor");
+    // The arm actually reached the host app (proved it was not refused).
+    expect(calls.length).toBeGreaterThan(0);
   });
 
-  it("enable's DEFAULT descriptor probe warns when the on-disk descriptor is absent (real read path)", async () => {
+  it("enable's DEFAULT descriptor probe REFUSES when the on-disk descriptor is absent (real read path)", async () => {
     // No agentOriginDescriptorProbe injected: exercises the production
     // defaultAgentOriginDescriptorPresent read+validate path against a fortress
     // with no policy/egress/agent-origin.json on disk.
@@ -323,7 +329,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
     const plistPath = join(fortressPath, "boot.plist");
     await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
     const err = new CaptureStream();
-    const { invoke } = makeInvoker({
+    const { invoke, calls } = makeInvoker({
       enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
     });
@@ -341,8 +347,9 @@ describe("castle-wall enable/disable CLI verbs", () => {
       sysextProbe: async () => "[activated enabled]",
     });
 
-    expect(code).toBe(0);
-    expect(err.text()).toContain("no agent-origin descriptor");
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Refusing to arm");
+    expect(calls).toHaveLength(0);
   });
 
   it("enable's DEFAULT descriptor probe stays silent when a valid descriptor is on disk (real read path)", async () => {
@@ -474,6 +481,8 @@ describe("castle-wall enable/disable CLI verbs", () => {
       sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => true,
       bootServiceInstalledProbe: async () => true,
+      // This test targets the audit trail, not the descriptor guard.
+      agentOriginDescriptorProbe: async () => true,
     });
     expect(code).toBe(0);
 
@@ -540,6 +549,8 @@ describe("castle-wall enable/disable CLI verbs", () => {
       sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => true,
       bootServiceInstalledProbe: async () => true,
+      // This test targets the one-time GUI consent, not the descriptor guard.
+      agentOriginDescriptorProbe: async () => true,
     });
 
     expect(code).toBe(3);
