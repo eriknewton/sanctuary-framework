@@ -2731,26 +2731,35 @@ async function runArmDisarm(
   }
 
   if (action === "enable") {
-    // Origin-descriptor boot-cut WARNING (#877 follow-up). With NO valid
-    // agent-origin descriptor set, the macOS OriginClassifier classifies EVERY
-    // flow `.agent`, so arming default-denies the operator's OWN SSH / Tailscale
-    // / operator shell (the boot-cut #877's runbook step prevents). This is a
-    // NON-BLOCKING warning, not a refuse: arm still proceeds (some hosts arm
-    // agent-only on purpose, and refusing here would change arm behavior for
-    // existing headless flows). Fires regardless of --force. The
-    // refuse-without-`--force` upgrade is a separate, arm-behavior-changing,
-    // drill-gated decision.
+    // Origin-descriptor boot-cut guard (#877 follow-up; refuse upgrade of the
+    // #883 warning). With NO valid agent-origin descriptor set, the macOS
+    // OriginClassifier classifies EVERY flow `.agent`, so arming default-denies
+    // the operator's OWN SSH / Tailscale / operator shell (the boot-cut). Like
+    // the sibling no-daemon / no-boot-service brick guards above, this REFUSES
+    // without `--force` so the lockout is PREVENTED, not merely narrated.
+    // `--force` still arms agent-only (an intentional no-operator lockdown) but
+    // warns loudly that operator access will be cut.
     const originProbe =
       ctx.agentOriginDescriptorProbe ?? defaultAgentOriginDescriptorPresent;
     if (!(await originProbe(fortressPath))) {
+      if (!parsed.force) {
+        write(
+          err,
+          "Refusing to arm: no agent-origin descriptor is set for this fortress.\n" +
+            "Arming would classify EVERY flow as `.agent`, so default-deny would cut\n" +
+            "your OWN SSH / Tailscale / operator shell (the boot-cut).\n" +
+            "Set one first, then re-run enable:\n" +
+            "  sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500\n" +
+            "Or pass --force to arm agent-only anyway (you WILL lose operator access\n" +
+            "unless another carve-out already exists).\n",
+        );
+        return 1;
+      }
       write(
         err,
-        "WARNING: no agent-origin descriptor is set for this fortress.\n" +
-          "Arming now classifies EVERY flow as `.agent`, so default-deny will cut\n" +
-          "your OWN SSH / Tailscale / operator shell (the boot-cut).\n" +
-          "Set one BEFORE arming, then re-run enable:\n" +
-          "  sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500\n" +
-          "Proceeding to arm anyway.\n",
+        "WARNING: --force arming with no agent-origin descriptor.\n" +
+          "Every flow classifies `.agent`; your OWN SSH / Tailscale / operator shell\n" +
+          "will be cut unless another carve-out already exists. Proceeding.\n",
       );
     }
   }
