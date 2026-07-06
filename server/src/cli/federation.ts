@@ -20,6 +20,15 @@ import { join } from "node:path";
 import type { Writable } from "node:stream";
 import { loadConfig } from "../config.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
+import { generateIdentityId } from "../core/identity.js";
+import {
+  REVOCATION_LIST_SIGN_ACTION,
+  readRevocationList,
+  writeRevocationList,
+  verifyPushedRevocationList,
+  readDowngradeLog,
+  type RevocationListPayload,
+} from "../entitlement/index.js";
 import { readFileCustody } from "../storage/custody-fs.js";
 import { generateNodeKeypair } from "../mesh/lifecycle/join-approver.js";
 import { computeJoinHkdfSaltProof } from "../mesh/lifecycle/bootstrap-token.js";
@@ -1220,6 +1229,201 @@ export async function runFederationPolicyPush(args: {
   }
 }
 
+/**
+ * `sanctuary federation revoke-push`. Fleet control plane PR-3. Sign a fleet
+ * license REVOCATION LIST with this fortress's operator identity and persist it
+ * into local custody so the daemon forces a revoked license CLOSED to Community.
+ *
+ * This is issuer-LOCAL + operator-gated (mirror `provision`): the operator
+ * unlocks custody (passphrase / recovery-key, keychain-safe), the list is signed
+ * with the SAME operator key the fortress pins for license verification, verified
+ * against that pinned key + a strictly-greater monotonic version, and written to
+ * the master-MAC'd `_meta` record. NO HTTP call, NO /v1 session (so no exit 2).
+ *
+ * Flags:
+ *   --license-id <id>   a license id to revoke (repeatable; the FULL revoked set)
+ *   --version <n>       the monotonic list version (must exceed the stored one)
+ *   --passphrase / SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY   custody unlock
+ *   --fortress <path>   optional fortress override
+ *
+ * The revoked set is ABSOLUTE (a full snapshot, not a delta): pass EVERY revoked
+ * id each push. NEVER prints key material. NEVER gates security: a revoked
+ * license only loses PAID central-console management; every node's wall stays up.
+ *
+ * Exit codes: 0 signed + persisted · 1 usage (missing/invalid flags) · 3
+ * fail-closed custody / verify / persist failure.
+ */
+export async function runFederationRevokePush(args: {
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  openSigner?: typeof openOperatorSigner;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const flags = parseAdminFlags(args.argv, env);
+
+  // Collect ALL --license-id occurrences (the absolute revoked set).
+  const licenseIds: string[] = [];
+  for (let i = 0; i < args.argv.length; i += 1) {
+    if (args.argv[i] === "--license-id" && i + 1 < args.argv.length) {
+      const id = args.argv[i + 1];
+      if (typeof id === "string" && id.length > 0) licenseIds.push(id);
+    }
+  }
+  const versionRaw = ((): string | undefined => {
+    const i = args.argv.indexOf("--version");
+    return i >= 0 && i + 1 < args.argv.length ? args.argv[i + 1] : undefined;
+  })();
+  if (versionRaw === undefined) {
+    err.write(
+      "sanctuary federation revoke-push: --version <n> is required (the monotonic " +
+        "list version; must be greater than the currently stored version)\n",
+    );
+    return 1;
+  }
+  const version = Number(versionRaw);
+  if (!Number.isSafeInteger(version) || version < 1) {
+    err.write(
+      "sanctuary federation revoke-push: --version must be a positive integer\n",
+    );
+    return 1;
+  }
+
+  const openSigner = args.openSigner ?? openOperatorSigner;
+  let signer: OperatorSigner;
+  try {
+    signer = await openSigner({
+      ...(flags.passphrase !== undefined ? { passphrase: flags.passphrase } : {}),
+      ...(flags.recoveryKey !== undefined ? { recoveryKey: flags.recoveryKey } : {}),
+      ...(flags.fortressPath !== undefined ? { fortressPath: flags.fortressPath } : {}),
+    });
+  } catch (cause) {
+    if (cause instanceof OperatorSigningError) {
+      err.write(`sanctuary federation revoke-push: ${cause.message}\n`);
+      return 3;
+    }
+    err.write(`sanctuary federation revoke-push: unexpected error: ${String(cause)}\n`);
+    return 1;
+  }
+
+  try {
+    const issuer = generateIdentityId(signer.operatorPublicKey);
+    const payload: RevocationListPayload = {
+      version,
+      revokedLicenseIds: licenseIds,
+      issuer,
+      issuedAt: new Date().toISOString(),
+    };
+    // Sign with the operator key via the shared operator-signed message path (the
+    // SAME construction `buildRevocationListMessage` verifies), then re-verify
+    // against the pinned operator public key + the stored monotonic version
+    // BEFORE persisting, so an accidental stale/lower version is rejected here.
+    const signature = signer.signPayload(REVOCATION_LIST_SIGN_ACTION, payload);
+    const signed = { payload, signature };
+
+    let currentVersion = 0;
+    const stored = await readRevocationList(signer.storage, signer.masterKey);
+    if (stored.status === "valid") currentVersion = stored.payload.version;
+
+    const verification = verifyPushedRevocationList(
+      signed,
+      signer.operatorPublicKey,
+      currentVersion,
+    );
+    if (!verification.ok) {
+      err.write(
+        `sanctuary federation revoke-push: refusing to persist (${verification.reason}` +
+          (verification.reason === "not_newer"
+            ? `; stored version is ${currentVersion}, pushed ${version})\n`
+            : ")\n"),
+      );
+      return 3;
+    }
+    await writeRevocationList(signer.storage, signer.masterKey, verification.payload);
+    out.write(
+      `${JSON.stringify(
+        {
+          revocation_list_pushed: true,
+          version: verification.payload.version,
+          revoked_count: verification.payload.revokedLicenseIds.length,
+          issuer,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return 0;
+  } catch (cause) {
+    err.write(
+      `sanctuary federation revoke-push: persist failed: ${String(cause)}\n`,
+    );
+    return 3;
+  } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
+/**
+ * `sanctuary federation downgrade-log`. Fleet control plane PR-3. Print the
+ * operator-visible downgrade log: every tier/cap transition with its reason and
+ * the affected node ids, so "these N nodes left the console because the plan
+ * lapsed - their walls are still up" is answerable from the CLI. Operator-gated
+ * (custody unlock). Read-only; never prints key material; no HTTP call.
+ *
+ * Exit codes: 0 printed (even an empty log) · 3 fail-closed custody failure.
+ */
+export async function runFederationDowngradeLog(args: {
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  openSigner?: typeof openOperatorSigner;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const flags = parseAdminFlags(args.argv, env);
+
+  const openSigner = args.openSigner ?? openOperatorSigner;
+  let signer: OperatorSigner;
+  try {
+    signer = await openSigner({
+      ...(flags.passphrase !== undefined ? { passphrase: flags.passphrase } : {}),
+      ...(flags.recoveryKey !== undefined ? { recoveryKey: flags.recoveryKey } : {}),
+      ...(flags.fortressPath !== undefined ? { fortressPath: flags.fortressPath } : {}),
+    });
+  } catch (cause) {
+    if (cause instanceof OperatorSigningError) {
+      err.write(`sanctuary federation downgrade-log: ${cause.message}\n`);
+      return 3;
+    }
+    err.write(`sanctuary federation downgrade-log: unexpected error: ${String(cause)}\n`);
+    return 1;
+  }
+
+  try {
+    const log = await readDowngradeLog(signer.storage, signer.masterKey);
+    out.write(
+      `${JSON.stringify(
+        {
+          readable: log.readable,
+          entry_count: log.entries.length,
+          // Newest-first for a human scanning "what just changed".
+          entries: [...log.entries].reverse(),
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return 0;
+  } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
 interface ProvisionFlags {
   nodeId?: string;
   passphrase?: string;
@@ -2207,6 +2411,28 @@ Operator (issuer) verbs -- operator-signed, run on the home fortress:
                      before applying the version marker; failed verification is
                      rejected, never downgraded to a warning.
 
+Fleet control plane (PR-3) verbs -- custody-unlocked, run LOCALLY:
+  sanctuary federation revoke-push --version <n> [--license-id <id> ...] \\
+    [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
+  sanctuary federation downgrade-log \\
+    [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
+
+  revoke-push        SIGN + persist a fleet license REVOCATION LIST. Pass the FULL
+                     set of revoked license ids (--license-id repeats; the set is
+                     an absolute snapshot, not a delta) and a strictly-increasing
+                     --version. Signed with this fortress's operator identity and
+                     verified against the pinned key + monotonic version before it
+                     is written, so a replayed OLD list cannot un-revoke a license.
+                     A revoked license is then forced to Community (drops from the
+                     central console). NEVER gates security: every node's Castle
+                     Wall stays up. Prints only public material (never a key).
+
+  downgrade-log      PRINT the operator-visible downgrade log: every tier/cap
+                     transition with its reason and the node ids that left the
+                     central console (their walls are unaffected). Answers "these N
+                     nodes left the console because the plan lapsed" from the CLI.
+                     Read-only; prints no key material.
+
 Joiner verb -- runs on the joining node:
   Local / sovereign_tee node:
   sanctuary federation join --fortress-url <url> --bootstrap-token <json> [--master-secret <b64url>]
@@ -2278,6 +2504,12 @@ export async function runFederationCommand(args: {
   }
   if (sub === "policy-push") {
     return runFederationPolicyPush({ ...args, argv: args.argv.slice(1) });
+  }
+  if (sub === "revoke-push") {
+    return runFederationRevokePush({ ...args, argv: args.argv.slice(1) });
+  }
+  if (sub === "downgrade-log") {
+    return runFederationDowngradeLog({ ...args, argv: args.argv.slice(1) });
   }
   (args.err ?? process.stderr).write(
     `sanctuary federation: unknown subcommand "${sub}"\n\n${FEDERATION_HELP}`,

@@ -86,9 +86,20 @@ import {
   resolveActivation,
   activateFleet,
   decodeIssuerPublicKey,
+  readFleetActivation,
+  resolveEntitlement,
   COMMUNITY_FREE_NODE_CAP,
+  isLicenseRevoked,
+  readRevocationList,
+  writeRevocationList,
+  verifyPushedRevocationList,
+  readDowngradeLog,
+  runFleetReResolve,
+  resolveFleetCap as resolveFleetCapPure,
   type FleetCap,
   type ActivateFleetResult,
+  type PriorCapState,
+  type ReResolveRosterView,
 } from "../entitlement/index.js";
 import {
   buildCastleWallPosture,
@@ -804,6 +815,19 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     nodes: new Map<string, FederationNodeView>(),
   };
   private _federationRenewal: FederationNodeCertificateAutoRenewalHandle | null = null;
+  /**
+   * Fleet control plane PR-3: the scheduled license RE-RESOLVE timer. Each tick
+   * re-verifies the active license (expiry + revocation list), applies/lifts the
+   * node-count cap, auto-captures a never-activated over-cap fleet's grandfather
+   * baseline (once), and logs any tier/cap transition. `_fleetPriorCap` is the
+   * last cap observed, so a tick can tell whether anything changed and therefore
+   * whether to log a transition. Purely a MANAGEMENT-scale re-check: it touches
+   * no wall / enforcement / local-dashboard / policy-push path.
+   */
+  private _fleetReResolveTimer: ReturnType<typeof setInterval> | null = null;
+  private _fleetPriorCap: PriorCapState | null = null;
+  /** Default license re-resolve cadence: hourly (expiry/revocation are coarse). */
+  private static readonly FLEET_RE_RESOLVE_INTERVAL_MS = 60 * 60 * 1000;
   /**
    * PR-A5 cross-machine peer-sync state. `_federationAcceptedHighWater` is the
    * highest envelope high-water accepted per sender node id (whole-envelope
@@ -2109,6 +2133,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setFederationContext(ctx: FederationContext | null): void {
     this.stopFederationCertificateAutoRenewal();
+    this.stopFleetLicenseReResolve();
     if (ctx !== null) {
       assertNonIssuerContextHasNoIssuerAuthority(ctx);
     }
@@ -2141,6 +2166,84 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       renewNow: () => this.renewLocalFederationNodeCertificate(),
       config: ctx.nodeCertificateRenewal,
     });
+    this.startFleetLicenseReResolve();
+  }
+
+  /**
+   * Fleet control plane PR-3: start the scheduled license re-resolve timer. It
+   * runs one pass immediately (so a boot into an expired/revoked/over-cap state
+   * is reconciled at once) and then hourly. Idempotent: a second call clears the
+   * prior timer first. The timer is `unref`'d so it never keeps the process
+   * alive on its own.
+   */
+  private startFleetLicenseReResolve(): void {
+    this.stopFleetLicenseReResolve();
+    // Fire once now, then on the interval. Never let a tick throw escape.
+    void this.runFleetLicenseReResolveTick();
+    this._fleetReResolveTimer = setInterval(() => {
+      void this.runFleetLicenseReResolveTick();
+    }, DashboardApprovalChannel.FLEET_RE_RESOLVE_INTERVAL_MS);
+    this._fleetReResolveTimer.unref?.();
+  }
+
+  private stopFleetLicenseReResolve(): void {
+    if (this._fleetReResolveTimer !== null) {
+      clearInterval(this._fleetReResolveTimer);
+      this._fleetReResolveTimer = null;
+    }
+  }
+
+  /**
+   * One scheduled license re-resolve pass, FAIL-CLOSED and NON-THROWING. Reads
+   * the durable roster, re-verifies the license (expiry + revocation), applies
+   * auto-capture, and logs any transition via {@link runFleetReResolve}. A pass
+   * with no unlocked custody (locked/standalone) is a no-op. Never touches a
+   * node's wall.
+   */
+  private async runFleetLicenseReResolveTick(): Promise<void> {
+    try {
+      const storage = this.storage;
+      const masterKey = this.shrOpts?.masterKey;
+      if (!storage || !masterKey) return;
+      const issuerPublicKey =
+        this.resolveFleetIssuerPublicKey() ?? new Uint8Array(32);
+
+      let rosterView: ReResolveRosterView = {
+        available: false,
+        admittedCount: 0,
+        orderedNodeIds: [],
+      };
+      try {
+        const roster = buildFleetRoster(this.buildV1FederationDeps(), {
+          evictionSerial: this._federationState.evictionMaxSerial,
+          operatorPolicy: this._federationState.operatorPolicy,
+        });
+        rosterView = {
+          available: roster.available,
+          admittedCount: roster.summary.admitted,
+          orderedNodeIds: roster.nodes.map((n) => n.node_id),
+        };
+      } catch {
+        // A roster-build hiccup leaves the safe empty view (no auto-capture, no
+        // false drops); the next tick re-attempts.
+      }
+
+      const result = await runFleetReResolve({
+        storage,
+        master: masterKey,
+        issuerPublicKey,
+        now: Math.floor(Date.now() / 1000),
+        roster: rosterView,
+        prior: this._fleetPriorCap,
+      });
+      this._fleetPriorCap = {
+        tier: result.cap.tier,
+        maxNodes: result.cap.maxNodes,
+      };
+    } catch {
+      // The re-resolve pass is contracted not to throw; guard anyway so a tick
+      // failure is a no-op, never a crash and never a silent grant.
+    }
   }
 
   /**
@@ -3647,16 +3750,77 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // grandfather baseline (the record's MAC is keyed to the MASTER, not the
       // issuer), so an existing >5-node fleet is not force-capped merely because
       // the operator identity is momentarily unresolved.
-      return await resolveActivation(
+      const cap = await resolveActivation(
         storage,
         masterKey,
         issuerPublicKey ?? new Uint8Array(32),
         Math.floor(Date.now() / 1000),
       );
+      // Fleet control plane PR-3: consult the SIGNED revocation list. A paid
+      // grant whose license id is on the issuer-signed revocation list is forced
+      // CLOSED to the community floor even though its token still verifies and is
+      // in-window (refund / compromise / kill after activation). A corrupt local
+      // list is surfaced elsewhere (the re-resolve tick logs it) but never strips
+      // a paid fleet here (that would be an attacker-triggerable DoS). Consulting
+      // by license id requires re-reading the resolved id; `resolveActivation`
+      // returns only the cap, so we do a cheap revocation-only recheck that fails
+      // OPEN to the already-resolved cap on any read hiccup (never a false strip).
+      if (cap.paid) {
+        const revocation = await this.revocationStatusForActiveLicense(
+          storage,
+          masterKey,
+          issuerPublicKey ?? new Uint8Array(32),
+        );
+        if (revocation.revoked) {
+          // Preserve the authenticated grandfather baseline so a revoked fleet
+          // keeps its historical free count, but drop the PAID lift.
+          return resolveFleetCapPure(
+            { granted: false, tier: "community", reason: "invalid" },
+            revocation.grandfatheredBaseline,
+          );
+        }
+      }
+      return cap;
     } catch {
       // resolveActivation is contracted not to throw; guard anyway so an
       // unexpected error is the safe community floor, never a paid grant.
       return this.communityFloorCap();
+    }
+  }
+
+  /**
+   * Fleet control plane PR-3: resolve whether the CURRENTLY-active license is on
+   * the signed revocation list, plus the authenticated grandfather baseline to
+   * preserve if it is. Reads the activation record for the resolved license id,
+   * then consults {@link isLicenseRevoked}. Fail-SAFE toward "not revoked" on any
+   * read failure (a corrupt/unreadable list must never falsely strip a paid
+   * fleet); the corruption is surfaced by the re-resolve tick's log instead.
+   * Never throws.
+   */
+  private async revocationStatusForActiveLicense(
+    storage: StorageBackend,
+    masterKey: Uint8Array,
+    issuerPublicKey: Uint8Array,
+  ): Promise<{ revoked: boolean; grandfatheredBaseline: number }> {
+    try {
+      const record = await readFleetActivation(storage, masterKey);
+      if (record.status !== "valid") {
+        return { revoked: false, grandfatheredBaseline: 0 };
+      }
+      const resolution = resolveEntitlement({
+        token: record.data.token,
+        issuerPublicKey,
+        now: Math.floor(Date.now() / 1000),
+      });
+      const licenseId =
+        typeof resolution.licenseId === "string" ? resolution.licenseId : null;
+      const status = await isLicenseRevoked(storage, masterKey, licenseId);
+      return {
+        revoked: status.revoked,
+        grandfatheredBaseline: record.data.grandfatheredBaseline,
+      };
+    } catch {
+      return { revoked: false, grandfatheredBaseline: 0 };
     }
   }
 
@@ -4562,6 +4726,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.sessionCleanupTimer = null;
     }
     this.stopFederationCertificateAutoRenewal();
+    this.stopFleetLicenseReResolve();
     this.stopFederationGuardianBreakGlassPoll();
 
     // Clean up rate limit tracking
@@ -5607,6 +5772,30 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // kill-safety path.
         if (!this.checkAuth(req, url, res, { requireToken: true })) return;
         this.handleFleetActivate(req, res);
+      } else if (method === "GET" && url.pathname === "/api/fleet/status") {
+        // Fleet control plane PR-3: the DOWNGRADE BANNER state. Reports the
+        // current tier/cap, whether the plan is expiring/expired/revoked/over-cap
+        // and why, and that renewing restores console management. Read-only; never
+        // gates security; carries no key material. Fire-and-forget (the async
+        // handler owns writing the response), matching this dispatch's contract.
+        void this.handleFleetStatus(res);
+      } else if (method === "GET" && url.pathname === "/api/fleet/downgrade-log") {
+        // Fleet control plane PR-3: the OPERATOR-VISIBLE downgrade log. Answers
+        // "these N nodes left the console because the plan lapsed - their walls
+        // are still up" in one read. Read-only; no key material.
+        void this.handleFleetDowngradeLog(res);
+      } else if (
+        method === "POST" &&
+        url.pathname === "/api/fleet/revocation-list"
+      ) {
+        // Fleet control plane PR-3: push a SIGNED license revocation list. Like
+        // activation this changes the paid product boundary (it can DROP a
+        // license to Community), so it requires the operator bearer token and is
+        // verified against the pinned issuer key + monotonic version before it is
+        // persisted. NEVER gates security: it only removes paid MANAGEMENT
+        // capacity for a revoked license; every node's wall stays up.
+        if (!this.checkAuth(req, url, res, { requireToken: true })) return;
+        this.handleFleetRevocationListPush(req, res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
         // Decision endpoints get an additional tighter rate limit
         if (!this.checkRateLimit(req, res, "decisions")) return;
@@ -5892,6 +6081,279 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         res.end(JSON.stringify({ error: "internal_error" }));
       }
     });
+  }
+
+  /**
+   * Fleet control plane PR-3: `GET /api/fleet/status` - the DOWNGRADE BANNER
+   * state. Reports the currently-resolved tier + node cap, a plain-English banner
+   * state ("ok" | "expiring" | "expired" | "revoked" | "over_cap" |
+   * "revocation_list_unreadable"), the reason, and how many nodes are currently
+   * dropped from the central console (their walls are unaffected). Read-only;
+   * fail-closed to a community-floor banner on any read failure; NEVER gates
+   * security; carries no key material.
+   */
+  private async handleFleetStatus(res: ServerResponse): Promise<void> {
+    try {
+      const cap = await this.resolveFleetCap();
+
+      // How many nodes are out of the central console under the current cap.
+      let droppedNodes = 0;
+      let admitted = 0;
+      let revocationListUnreadable = false;
+      try {
+        const roster = buildFleetRoster(this.buildV1FederationDeps(), {
+          evictionSerial: this._federationState.evictionMaxSerial,
+          operatorPolicy: this._federationState.operatorPolicy,
+        });
+        admitted = roster.summary.admitted;
+        droppedNodes = applyFleetCap(roster, cap).droppedNodeCount;
+      } catch {
+        // Roster unavailable: report 0 dropped (honest absence), banner still valid.
+      }
+      const storage = this.storage;
+      const masterKey = this.shrOpts?.masterKey;
+      if (storage && masterKey) {
+        try {
+          const list = await readRevocationList(storage, masterKey);
+          revocationListUnreadable = list.status === "invalid";
+        } catch {
+          revocationListUnreadable = true;
+        }
+      }
+
+      const bannerState = this.classifyFleetBanner(
+        cap,
+        droppedNodes,
+        revocationListUnreadable,
+      );
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(
+        JSON.stringify({
+          tier: cap.tier,
+          paid: cap.paid,
+          max_nodes: cap.maxNodes,
+          grace_active: cap.graceActive,
+          reason: cap.reason,
+          banner_state: bannerState,
+          dropped_node_count: droppedNodes,
+          admitted_node_count: admitted,
+          revocation_list_unreadable: revocationListUnreadable,
+          // The one-click reassurance every fail-closed banner MUST carry: paid
+          // features drop, security never does.
+          security_unaffected: true,
+          renew_restores_console: !cap.paid || cap.graceActive === true,
+        }),
+      );
+    } catch {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "internal_error" }));
+    }
+  }
+
+  /**
+   * Classify the operator-facing banner state from the resolved cap + how many
+   * nodes are currently out of console. PURE-ish (reads only its arguments):
+   *  - "revocation_list_unreadable": a corrupt local revocation list (re-push);
+   *    surfaced FIRST because it means the operator's revocation intent may not be
+   *    applied.
+   *  - "revoked" / "expired": a paid plan that has been revoked or has lapsed to
+   *    Community.
+   *  - "expiring": a paid grant honored during its grace window (renew soon).
+   *  - "over_cap": Community/paid but more nodes than the cap (some out of console).
+   *  - "ok": paid + within cap, or Community within the free cap.
+   */
+  private classifyFleetBanner(
+    cap: FleetCap,
+    droppedNodes: number,
+    revocationListUnreadable: boolean,
+  ): "ok" | "expiring" | "expired" | "revoked" | "over_cap" | "revocation_list_unreadable" {
+    if (revocationListUnreadable) return "revocation_list_unreadable";
+    if (cap.graceActive === true) return "expiring";
+    if (!cap.paid) {
+      // Community floor: distinguish a lapsed/revoked/expired plan from a plain
+      // never-paid fortress by the fail-closed reason.
+      if (cap.reason === "expired") return "expired";
+      if (cap.reason === "invalid" || cap.reason === "unreadable") return "revoked";
+      if (droppedNodes > 0) return "over_cap";
+      return "ok";
+    }
+    // Paid + within window.
+    return droppedNodes > 0 ? "over_cap" : "ok";
+  }
+
+  /**
+   * Fleet control plane PR-3: `GET /api/fleet/downgrade-log` - the operator-
+   * readable, append-only log of every tier/cap transition with its reason and
+   * the affected node ids. Read-only; fail-closed to an empty log on missing
+   * custody; surfaces a `readable: false` flag when the stored log is corrupt.
+   * Carries no key material.
+   */
+  private async handleFleetDowngradeLog(res: ServerResponse): Promise<void> {
+    try {
+      const storage = this.storage;
+      const masterKey = this.shrOpts?.masterKey;
+      if (!storage || !masterKey) {
+        // No unlocked custody: honest empty log rather than a fabricated one.
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({ entries: [], readable: true, custody: false }));
+        return;
+      }
+      const log = await readDowngradeLog(storage, masterKey);
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      // Newest-first is the natural read order for an operator scanning "what
+      // just changed"; the stored log is oldest-first.
+      res.end(
+        JSON.stringify({
+          entries: [...log.entries].reverse(),
+          readable: log.readable,
+          custody: true,
+        }),
+      );
+    } catch {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "internal_error" }));
+    }
+  }
+
+  /**
+   * Fleet control plane PR-3: `POST /api/fleet/revocation-list` - accept a SIGNED
+   * revocation list `{ payload, signature }`, verify it against the PINNED issuer
+   * key + a strictly-greater monotonic version, and persist it. A revoked
+   * license is then forced to Community by the re-resolve path. Auth is enforced
+   * by the caller (operator bearer token). Response:
+   *   - 200 `{ ok: true, version, revoked_count }` on a verified, newer list.
+   *   - 400 `{ ok: false, reason }` on malformed / bad_signature / not_newer.
+   *   - 400 `{ error: "validation_error" }` on a missing body; 500 on unexpected.
+   * NEVER gates security; carries no key material; leaks no stack.
+   */
+  private handleFleetRevocationListPush(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): void {
+    let body = "";
+    let destroyed = false;
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      // 256KB is ample for a signed id list; a revocation list is small.
+      if (body.length > 262144) {
+        destroyed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      if (destroyed) return;
+      let signed: unknown;
+      try {
+        signed = JSON.parse(body);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
+      try {
+        const result = await this.applyPushedRevocationList(signed);
+        if (result.ok) {
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              version: result.version,
+              revoked_count: result.revokedCount,
+            }),
+          );
+        } else {
+          res.writeHead(400, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ ok: false, reason: result.reason }));
+        }
+      } catch {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "internal_error" }));
+      }
+    });
+  }
+
+  /**
+   * Verify + persist a pushed signed revocation list, FAIL-CLOSED. Verifies
+   * against the PINNED issuer key (the fortress's own operator identity, the same
+   * key `resolveActivation` pins) and a strictly-greater monotonic version, then
+   * persists the authenticated payload. Never throws; never persists an
+   * unverified list. After a successful push it re-runs one re-resolve tick so a
+   * now-revoked active license drops to Community immediately (not only on the
+   * next hourly tick).
+   */
+  private async applyPushedRevocationList(
+    signed: unknown,
+  ): Promise<
+    | { ok: true; version: number; revokedCount: number }
+    | { ok: false; reason: "no_custody" | "no_issuer" | "malformed" | "bad_signature" | "not_newer" }
+  > {
+    const storage = this.storage;
+    const masterKey = this.shrOpts?.masterKey;
+    if (!storage || !masterKey) {
+      return { ok: false, reason: "no_custody" };
+    }
+    const issuerPublicKey = this.resolveFleetIssuerPublicKey();
+    if (issuerPublicKey === null) {
+      return { ok: false, reason: "no_issuer" };
+    }
+    // The monotonic floor is the CURRENTLY-stored list version (0 when absent);
+    // an unreadable stored list is treated as version 0 so a corrupt file cannot
+    // pin the floor artificially high and block a legitimate newer push.
+    let currentVersion = 0;
+    try {
+      const current = await readRevocationList(storage, masterKey);
+      if (current.status === "valid") currentVersion = current.payload.version;
+    } catch {
+      currentVersion = 0;
+    }
+    const verification = verifyPushedRevocationList(
+      signed,
+      issuerPublicKey,
+      currentVersion,
+    );
+    if (!verification.ok) {
+      return { ok: false, reason: verification.reason };
+    }
+    // Capture the PRE-push resolved cap as the prior state so the immediate
+    // re-resolve below observes the real paid -> Community transition (and logs
+    // it) even if no scheduled tick happened to run while the license was paid.
+    // Without this, a boot-Community -> activate -> revoke sequence would leave
+    // `_fleetPriorCap` at Community and the paid->revoked drop would go unlogged.
+    try {
+      const prePushCap = await this.resolveFleetCap();
+      this._fleetPriorCap = {
+        tier: prePushCap.tier,
+        maxNodes: prePushCap.maxNodes,
+      };
+    } catch {
+      // Best-effort prior seeding; the tick still runs and fails closed.
+    }
+    await writeRevocationList(storage, masterKey, verification.payload);
+    // Reconcile immediately: a now-revoked active license drops to Community and
+    // the transition is logged without waiting for the hourly tick.
+    void this.runFleetLicenseReResolveTick();
+    return {
+      ok: true,
+      version: verification.payload.version,
+      revokedCount: verification.payload.revokedLicenseIds.length,
+    };
   }
 
   private serveLoginPage(res: ServerResponse): void {
