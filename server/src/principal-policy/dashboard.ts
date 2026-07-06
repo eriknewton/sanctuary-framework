@@ -3570,6 +3570,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       resolveOperatorPublicKey: () => this.resolveOperatorPublicKey(),
       rosterNodeIds: () => [...this._federationRoster],
       recordJoin: async (certificate) => {
+        // PR-A durable membership: a join ADDS a node to the roster, the
+        // authoritative source of the paid node-count. Capture the prior
+        // in-memory state so a persist failure can be rolled back cleanly (mirrors
+        // the sibling recordAcceptedHighWater, which rolls back its in-memory
+        // advance on a persist failure). `_federationState` is REPLACED wholesale
+        // by both upsertFederationNode and appendLocalFederationEvent (never
+        // mutated in place), so restoring the captured reference undoes both the
+        // node upsert and the appended `node.joined` event; `_federationRoster` is
+        // a mutated Set, so we only delete the id we added if it was not already a
+        // member.
+        const rosterHadNode = this._federationRoster.has(certificate.node_id);
+        const priorFederationState = this._federationState;
         this._federationRoster.add(certificate.node_id);
         this.upsertFederationNode(certificate.node_id, {
           attestation_status: "verified",
@@ -3579,12 +3591,23 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           node_id: certificate.node_id,
           node_mode: certificate.node_mode,
         });
-        // PR-A durable membership: a join ADDS a node to the roster, the
-        // authoritative source of the paid node-count. Persist the durable
-        // snapshot NOW so the new member survives a reboot. THROWS on a persist
-        // failure so the join endpoint fails closed (never acknowledges a join
-        // whose membership did not reach disk). Idempotent whole-snapshot write.
-        await this.persistFederationSyncState();
+        // Persist the new member BEFORE acknowledging the join. THROWS on a
+        // persist failure so the join fails closed (never acknowledges a join
+        // whose membership did not reach disk). On failure ROLL BACK the in-memory
+        // mutations first so no phantom node lingers in the roster /
+        // summary.admitted until reboot, THEN re-throw (stay fail-closed). The
+        // durable billing basis is never inflated either way (persist failed,
+        // nothing on disk); this keeps the in-memory view consistent with it.
+        // Idempotent whole-snapshot write.
+        try {
+          await this.persistFederationSyncState();
+        } catch (err) {
+          this._federationState = priorFederationState;
+          if (!rosterHadNode) {
+            this._federationRoster.delete(certificate.node_id);
+          }
+          throw err;
+        }
       },
       listNodes: () => [...this._federationState.nodes.values()],
       listFederationEvents: (since) => this.listFederationEvents(since),

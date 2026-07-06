@@ -439,4 +439,36 @@ describe("Federation 3/3b P0 - durable sync-state at the dashboard seam", () => 
     expect(rosterAfter.summary.admitted).toBe(1);
     expect(rosterAfter.summary.revoked).toBe(1);
   });
+
+  it("PR-A: a recordJoin whose persist FAILS is rejected AND leaves no phantom node in memory", async () => {
+    // recordJoin is fail-closed: if the durable persist throws, the join must be
+    // rejected (throw propagates) AND the in-memory mutations must be rolled back
+    // so no phantom node lingers in the roster / summary.admitted until reboot
+    // (mirrors recordAcceptedHighWater's in-memory rollback). This closes the
+    // divergence the gate flagged: a failed join must not inflate the in-memory
+    // count even though the durable billing basis is never inflated.
+    class ArmedFailWriteStorage extends MemoryStorage {
+      armed = false;
+      override async write(ns: string, key: string, bytes: Uint8Array): Promise<void> {
+        if (this.armed && ns === "_federation" && key === "sync-state-v1") {
+          throw new Error("disk write failed");
+        }
+        return super.write(ns, key, bytes);
+      }
+    }
+    const storage = new ArmedFailWriteStorage();
+    const boot = await buildRecipient(fortress, "linux-1", storage);
+
+    // Baseline: an empty roster (the recipient's own node is not auto-added).
+    expect(boot.deps.listNodes().map((n) => n.node_id)).toEqual([]);
+    expect(buildFleetRoster(boot.deps, { evictionSerial: 0 }).summary.admitted).toBe(0);
+
+    // Arm the write failure so the recordJoin-triggered persist throws.
+    storage.armed = true;
+    await expect(boot.deps.recordJoin(fortress.nodes["mac-1"].nodeCert)).rejects.toThrow();
+
+    // The in-memory roster is UNCHANGED: no phantom node, admitted still 0.
+    expect(boot.deps.listNodes().map((n) => n.node_id)).toEqual([]);
+    expect(buildFleetRoster(boot.deps, { evictionSerial: 0 }).summary.admitted).toBe(0);
+  });
 });
