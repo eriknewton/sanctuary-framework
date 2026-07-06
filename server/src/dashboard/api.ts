@@ -128,7 +128,50 @@ export interface APIDeps {
    * admitted" shell. It must report REAL federation state, never a guess.
    */
   fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
+  /**
+   * Fleet activation handler for `POST /api/fleet/activate` (paid fleet control
+   * plane PR-2). Receives the operator's pasted license string and returns a
+   * plain result the route serializes. Wired by the wrap CLI to a REAL handler
+   * that verifies the paste through the shipped Ed25519 entitlement core against
+   * the pinned issuer key and, on success, persists the resolved license into
+   * signed, tamper-evident fleet state (see `entitlement/activation.ts`).
+   *
+   * It is a Tier-1-class mutation (it changes the paid product boundary), so the
+   * route requires the OPERATOR BEARER TOKEN, fail-closed (never loopback-auth,
+   * never token-absent-fail-open), matching the template-init + approval gates.
+   *
+   * FAIL-CLOSED: the handler never grants on failure; an unverifiable / expired /
+   * malformed paste returns `{ ok: false }` and persists nothing. It resolves
+   * MANAGEMENT capacity only - it NEVER gates any node's Castle Wall, its local
+   * dashboard, or free policy-push. When omitted (no custody / single-machine
+   * install with no fortress unlocked), the route reports the honest
+   * `activation_unavailable` shape rather than pretending to activate.
+   */
+  activateFleetLicense?: (
+    pastedLicense: string,
+  ) => Promise<FleetActivationResult>;
 }
+
+/**
+ * The plain, serializable result of a fleet activation attempt (paid fleet
+ * control plane PR-2). Carries no key material and no secret; `tier` and the cap
+ * are public product facts the operator sees on the Activate screen.
+ */
+export type FleetActivationResult =
+  | {
+      ok: true;
+      tier: string;
+      /** Resolved node cap: null = unlimited (Team+), else the max managed nodes. */
+      max_nodes: number | null;
+    }
+  | {
+      ok: false;
+      /**
+       * Why the paste was rejected. `malformed_token` = not a decodable license;
+       * `verify_failed` = decoded but failed Ed25519 verify / expired / etc.
+       */
+      reason: "malformed_token" | "verify_failed";
+    };
 
 export interface DashboardSession {
   id: string;
@@ -504,6 +547,75 @@ export async function handleRequest(
       ? await deps.fleetRoster()
       : absentFleetRoster();
     writeJSON(res, 200, roster);
+    return true;
+  }
+
+  // ── Fleet activation (paid fleet control plane PR-2; OPERATOR mutation) ──
+  // The operator pastes a license key and this activates it: the handler
+  // verifies the paste through the shipped Ed25519 entitlement core against the
+  // pinned issuer key and, on success, persists it into signed, tamper-evident
+  // fleet state so the central roster lifts its node-count cap.
+  //
+  // AUTH (fail-closed): activation changes the PAID PRODUCT BOUNDARY, a Tier-1-
+  // class mutation, so it requires the operator BEARER TOKEN, exactly like
+  // template-init and approval decisions. The shared `isAuthorized` gate above
+  // fail-OPENS when no token is configured and honors loopback auto-auth
+  // (a co-resident wrapped agent shares loopback with the operator), neither of
+  // which is acceptable for a boundary-changing mutation, so we re-check with the
+  // stricter bearer gate here.
+  //
+  // NEVER GATES SECURITY: this only resolves MANAGEMENT capacity. It touches no
+  // wall / enforcement / local-dashboard / policy-push path. When no handler is
+  // wired (no custody / fortress not unlocked in this process), it reports the
+  // honest `activation_unavailable` shape rather than pretending to activate.
+  if (method === "POST" && path === "/api/fleet/activate") {
+    if (!isAuthorizedWithBearerToken(deps, req, url)) {
+      writeJSON(res, 401, { error: "unauthorized" });
+      return true;
+    }
+    if (!deps.activateFleetLicense) {
+      writeJSON(res, 503, {
+        error: "activation_unavailable",
+        message:
+          "fleet activation is not available on this dashboard (no unlocked " +
+          "fortress in this process). Activate via `sanctuary` on the host.",
+      });
+      return true;
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = await readJSONBody(req);
+    } catch {
+      writeJSON(res, 400, { error: "invalid_body" });
+      return true;
+    }
+    const pasted = body.license;
+    if (typeof pasted !== "string" || pasted.trim().length === 0) {
+      writeJSON(res, 400, {
+        error: "validation_error",
+        message: "license is required and must be a non-empty string",
+      });
+      return true;
+    }
+    // The handler is contracted to never throw and to fail-closed, but guard
+    // anyway so an unexpected internal error is a 500, never a leaked stack or a
+    // silent grant.
+    try {
+      const result = await deps.activateFleetLicense(pasted);
+      if (result.ok) {
+        writeJSON(res, 200, {
+          ok: true,
+          tier: result.tier,
+          max_nodes: result.max_nodes,
+        });
+      } else {
+        // A rejected paste is a 400 client error (bad license), not a server
+        // error. No secret, no stack: just the operator-facing reason.
+        writeJSON(res, 400, { ok: false, reason: result.reason });
+      }
+    } catch {
+      writeJSON(res, 500, { error: "internal_error" });
+    }
     return true;
   }
 

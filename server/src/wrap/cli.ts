@@ -80,7 +80,10 @@ import {
   PassphraseKeyringUnreachableError,
 } from "./passphrase.js";
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
-import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
+import {
+  buildEnforcedWrapFleetRosterProvider,
+  buildWrapFleetActivationHandler,
+} from "./fleet-roster-provider.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -2335,10 +2338,30 @@ export async function runWrap(
   // `sanctuary federation provision` is observed without a wrap restart. Only
   // wired when custody is established (federation records are encrypted under the
   // master key); otherwise the panel stays honestly absent.
-  const wrapFleetRoster =
+  //
+  // PR-2 (paid fleet control plane): the roster provider is the ENFORCED one -
+  // the honest disk-backed roster with the node-count cap applied from the
+  // persisted, master-MAC'd activation record (fail-closed to the community floor
+  // on any verify failure/expiry/unreadable state). The activation handler feeds
+  // `POST /api/fleet/activate`. Both resolve the pinned issuer key from the
+  // fortress's default operator identity; NEITHER gates any node's Castle Wall,
+  // its local dashboard, or free policy-push - enforcement only reshapes the
+  // CENTRAL roster presentation.
+  const wrapFleetStorage =
     wrapCustody !== undefined
-      ? buildWrapFleetRosterProvider({
-          storage: new FilesystemStorage(`${storagePath}/state`),
+      ? new FilesystemStorage(`${storagePath}/state`)
+      : undefined;
+  const wrapFleetRoster =
+    wrapCustody !== undefined && wrapFleetStorage !== undefined
+      ? buildEnforcedWrapFleetRosterProvider({
+          storage: wrapFleetStorage,
+          masterKey: wrapCustody.masterKey,
+        })
+      : undefined;
+  const wrapFleetActivate =
+    wrapCustody !== undefined && wrapFleetStorage !== undefined
+      ? buildWrapFleetActivationHandler({
+          storage: wrapFleetStorage,
           masterKey: wrapCustody.masterKey,
         })
       : undefined;
@@ -2353,6 +2376,7 @@ export async function runWrap(
         authToken: opts.authToken,
         serverVersion: opts.serverVersion,
         ...(wrapFleetRoster ? { fleetRoster: wrapFleetRoster } : {}),
+        ...(wrapFleetActivate ? { activateFleetLicense: wrapFleetActivate } : {}),
       }));
   // Multi-tenancy: honour SANCTUARY_DASHBOARD_PORT so two wraps can pick
   // distinct starting ports without both racing for 3501.

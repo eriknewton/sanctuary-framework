@@ -22,7 +22,7 @@ import {
   type DashboardHandle,
   type DashboardServerOptions,
 } from "./server.js";
-import type { ApprovalHandlers } from "./api.js";
+import type { ApprovalHandlers, FleetActivationResult } from "./api.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
 
 export { getProtectionSnapshot } from "./aggregator.js";
@@ -114,6 +114,15 @@ export interface StartDashboardOptions {
    * fleet"). See `DashboardServerOptions.fleetRoster`.
    */
   fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
+  /**
+   * Fleet activation handler (paid fleet control plane PR-2). Forwarded to the
+   * dashboard server; feeds `POST /api/fleet/activate`. When omitted the route
+   * reports the honest `activation_unavailable` shape. See
+   * `DashboardServerOptions.activateFleetLicense`.
+   */
+  activateFleetLicense?: (
+    pastedLicense: string,
+  ) => Promise<FleetActivationResult>;
 }
 
 /**
@@ -170,6 +179,9 @@ export async function startDashboard(
     ...(options.authToken ? { authToken: options.authToken } : {}),
     ...(options.approvals ? { approvals: options.approvals } : {}),
     ...(options.fleetRoster ? { fleetRoster: options.fleetRoster } : {}),
+    ...(options.activateFleetLicense
+      ? { activateFleetLicense: options.activateFleetLicense }
+      : {}),
   };
 
   const handle = await startDashboardServer(serverOpts);

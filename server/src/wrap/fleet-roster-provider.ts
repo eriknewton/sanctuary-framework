@@ -75,6 +75,13 @@ import {
   type FleetRoster,
 } from "../principal-policy/fleet-roster.js";
 import type { FederationAppliedPolicyVersion } from "../v1/federation-policy-bundle.js";
+import {
+  applyFleetCap,
+  resolveActivation,
+  activateFleet,
+  type ActivateFleetResult,
+} from "../entitlement/index.js";
+import { IdentityManager } from "../cognitive/tools.js";
 
 /**
  * The minimal federation-context shape `buildFleetRoster` actually reads:
@@ -332,5 +339,199 @@ export function buildWrapFleetRosterProvider(params: {
       evictionSerial: outcome.evictionSerial,
       operatorPolicy: outcome.operatorPolicy,
     });
+  };
+}
+
+// ── PR-2: node-count ENFORCEMENT + ACTIVATION wiring ─────────────────────────
+//
+// The two builders below turn the read-only roster provider into the ENFORCED
+// central-management surface and expose the activation handler. Both resolve the
+// pinned issuer key from the fortress's DEFAULT operator identity (the SAME key
+// `sanctuary license` signs with, since issuance and activation happen on the
+// operator's own fortress) and read the master-MAC'd activation record. Neither
+// touches any node's wall / local dashboard / policy-push: enforcement only ever
+// reshapes the CENTRAL roster presentation.
+
+/**
+ * Resolve the pinned issuer Ed25519 public key from the fortress's DEFAULT
+ * operator identity, read-only. This is the SAME identity `sanctuary license`
+ * pins as the issuer (issuance + activation are on the operator's own fortress),
+ * so a license the operator issued verifies against it. Returns null when no
+ * default identity exists or its key is malformed - the caller fails CLOSED to
+ * the community floor (a fortress with no operator identity cannot have a valid
+ * paid grant, so community is the honest, safe resolution).
+ */
+async function resolveIssuerPublicKey(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+): Promise<Uint8Array | null> {
+  try {
+    const identityManager = new IdentityManager(storage, masterKey);
+    const loadResult = await identityManager.load();
+    if (loadResult.loaded === 0) return null;
+    const identity = identityManager.getDefault();
+    if (!identity?.public_key) return null;
+    return decodeIssuerPublicKey(identity.public_key);
+  } catch {
+    // Any custody/identity read error resolves to "no pinned key" → community
+    // floor. A verify basis we cannot establish must never grant a paid tier.
+    return null;
+  }
+}
+
+/** Decode a stored base64/base64url 32-byte Ed25519 public key, or null. */
+function decodeIssuerPublicKey(b64: string): Uint8Array | null {
+  try {
+    const key = Buffer.from(b64.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+    return key.length === 32 ? new Uint8Array(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the ENFORCED wrap fleet-roster provider: the read-only disk-backed
+ * roster (`buildWrapFleetRosterProvider`) with the PR-2 node-count cap applied.
+ *
+ * Per request it (1) builds the honest roster, (2) resolves the current fleet
+ * cap from the persisted, master-MAC'd activation record re-verified against the
+ * pinned issuer key at the CURRENT clock (so expiry/grace are honored live), and
+ * (3) applies the cap - dropping nodes beyond the entitled count out of the
+ * CENTRAL roster. FAIL-CLOSED: no license / invalid / expired / unreadable all
+ * resolve to the community floor (max(5, grandfathered baseline)); a bug can only
+ * ever REMOVE paid management capacity, never grant it, and NEVER touches a
+ * node's wall or local dashboard (this path has no wall/enforcement code at all).
+ *
+ * `now` is injectable (Unix seconds) for deterministic tests; it defaults to the
+ * wall clock.
+ */
+export function buildEnforcedWrapFleetRosterProvider(params: {
+  storage: StorageBackend;
+  masterKey: Uint8Array;
+  now?: () => number;
+}): () => Promise<FleetRoster> {
+  const base = buildWrapFleetRosterProvider({
+    storage: params.storage,
+    masterKey: params.masterKey,
+  });
+  const nowSeconds = params.now ?? (() => Math.floor(Date.now() / 1000));
+
+  return async (): Promise<FleetRoster> => {
+    const roster = await base();
+    // An absent/unavailable roster has no nodes to cap; short-circuit (applyFleetCap
+    // would pass it through anyway, but skipping the activation read is cheaper and
+    // keeps the honest-absent path identical to today).
+    if (!roster.available) return roster;
+
+    const issuerPublicKey = await resolveIssuerPublicKey(
+      params.storage,
+      params.masterKey,
+    );
+    // No pinned issuer key → no possible valid paid grant → community floor.
+    // resolveActivation with a zero key would just deny; passing a real key when
+    // present lets a genuine grant lift the cap.
+    if (issuerPublicKey === null) {
+      // Community floor cap with a baseline of 0 (we cannot authenticate any
+      // activation record's baseline without knowing the issuer, but the record's
+      // MAC is keyed to the MASTER not the issuer, so resolveActivation still
+      // reads a valid grandfather baseline; use a 32-zero key so the token verify
+      // denies while the baseline is still honored).
+      const capNoIssuer = await resolveActivation(
+        params.storage,
+        params.masterKey,
+        new Uint8Array(32),
+        nowSeconds(),
+      );
+      return applyFleetCap(roster, capNoIssuer).roster;
+    }
+
+    const cap = await resolveActivation(
+      params.storage,
+      params.masterKey,
+      issuerPublicKey,
+      nowSeconds(),
+    );
+    return applyFleetCap(roster, cap).roster;
+  };
+}
+
+/**
+ * Build the fleet ACTIVATION handler for `POST /api/fleet/activate` (PR-2). The
+ * operator pastes a license; this verifies it through the shipped entitlement
+ * core against the pinned issuer key and, on success, persists it into the
+ * master-MAC'd activation record. Returns a plain, serializable result (no key
+ * material) the route forwards.
+ *
+ * GRANDFATHER BASELINE: on first activation for a fleet that already manages
+ * MORE than the free cap, the current node count is captured as the fleet's
+ * grandfathered baseline so it is never forced to Team at the cap flip. A
+ * NEW/small fleet captures 0 (the plain 5-node cap applies). We read the current
+ * count from the honest roster; when the roster is unavailable we capture 0
+ * (a fleet with no readable roster has no baseline to grandfather).
+ *
+ * FAIL-CLOSED: a malformed/unverifiable/expired paste returns `{ ok: false }`
+ * and persists nothing. It never throws (any internal error maps to a
+ * verify_failed rejection rather than a 500 leak or a silent grant). No wall /
+ * local-dashboard / policy-push path is touched.
+ */
+export function buildWrapFleetActivationHandler(params: {
+  storage: StorageBackend;
+  masterKey: Uint8Array;
+  now?: () => number;
+}): (pastedLicense: string) => Promise<
+  | { ok: true; tier: string; max_nodes: number | null }
+  | { ok: false; reason: "malformed_token" | "verify_failed" }
+> {
+  const rosterProvider = buildWrapFleetRosterProvider({
+    storage: params.storage,
+    masterKey: params.masterKey,
+  });
+  const nowSeconds = params.now ?? (() => Math.floor(Date.now() / 1000));
+
+  return async (pastedLicense: string) => {
+    const issuerPublicKey = await resolveIssuerPublicKey(
+      params.storage,
+      params.masterKey,
+    );
+    if (issuerPublicKey === null) {
+      // No pinned issuer identity → no license can verify. Reject as verify_failed
+      // (fail-closed) rather than persisting anything.
+      return { ok: false as const, reason: "verify_failed" as const };
+    }
+
+    // Grandfather baseline = current central node count on first activation, so an
+    // existing >5-node fleet keeps its count free. Best-effort + fail-safe to 0.
+    let grandfatheredBaseline = 0;
+    try {
+      const roster = await rosterProvider();
+      if (roster.available) grandfatheredBaseline = roster.nodes.length;
+    } catch {
+      grandfatheredBaseline = 0;
+    }
+
+    let result: ActivateFleetResult;
+    try {
+      result = await activateFleet({
+        storage: params.storage,
+        master: params.masterKey,
+        pastedLicense,
+        issuerPublicKey,
+        now: nowSeconds(),
+        grandfatheredBaseline,
+      });
+    } catch {
+      // activateFleet is contracted not to throw, but never let an unexpected
+      // error become a grant: fail closed.
+      return { ok: false as const, reason: "verify_failed" as const };
+    }
+
+    if (result.ok) {
+      return {
+        ok: true as const,
+        tier: result.tier,
+        max_nodes: result.cap.maxNodes,
+      };
+    }
+    return { ok: false as const, reason: result.reason };
   };
 }

@@ -16,7 +16,12 @@ import type {
   ActivityEntry,
   PendingApproval,
 } from "./aggregator.js";
-import { handleRequest, type ApprovalHandlers, type StreamEvent } from "./api.js";
+import {
+  handleRequest,
+  type ApprovalHandlers,
+  type StreamEvent,
+  type FleetActivationResult,
+} from "./api.js";
 import { sendCaughtError } from "../http/error-envelope.js";
 import type { V11Bindings } from "./v1_1/wiring.js";
 import type { FleetRoster } from "../principal-policy/fleet-roster.js";
@@ -37,6 +42,15 @@ export interface DashboardServerOptions {
    * roster / 404 (no fabricated fleet). See `APIDeps.fleetRoster`.
    */
   fleetRoster?: () => FleetRoster | Promise<FleetRoster>;
+  /**
+   * Fleet activation handler for `POST /api/fleet/activate` (paid fleet control
+   * plane PR-2). Forwarded verbatim onto the per-request `APIDeps`. When omitted
+   * the route reports the honest `activation_unavailable` shape. See
+   * `APIDeps.activateFleetLicense`.
+   */
+  activateFleetLicense?: (
+    pastedLicense: string,
+  ) => Promise<FleetActivationResult>;
 }
 
 export interface DashboardHandle {
@@ -187,6 +201,7 @@ export async function startDashboardServer(
         v11Bindings,
         loopbackAutoAuth: v11LoopbackAutoAuth,
         fleetRoster: options.fleetRoster,
+        activateFleetLicense: options.activateFleetLicense,
       };
       const served = await handleRequest(deps, req, res);
       if (!served) {
