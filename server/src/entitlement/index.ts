@@ -106,3 +106,56 @@ export {
   type FleetActivationData,
   type ActivateFleetResult,
 } from "./activation.js";
+
+export {
+  REVOCATION_LIST_SIGN_ACTION,
+  REVOCATION_LIST_META_KEY,
+  buildRevocationListMessage,
+  canonicalizeRevocationListIds,
+  signRevocationList,
+  verifyPushedRevocationList,
+  readRevocationList,
+  writeRevocationList,
+  isLicenseRevoked,
+  type RevocationListPayload,
+  type SignedRevocationList,
+  type RevocationListSigner,
+  type RevocationListVerifyReason,
+  type RevocationListVerification,
+  type RevocationStatus,
+} from "./revocation-list.js";
+
+export {
+  REVOCATION_VERSION_ANCHOR_META_KEY,
+  REVOCATION_READ_RETRY_ATTEMPTS,
+  REVOCATION_READ_RETRY_DELAY_MS,
+  REVOCATION_PUSH_LOCK_FILE,
+  readRevocationVersionAnchor,
+  writeRevocationVersionAnchor,
+  effectiveRevocationVersionFloor,
+  writableRevocationVersionFloor,
+  revocationVerifiability,
+  persistPushedRevocationListSerialized,
+  type RevocationVersionAnchorData,
+  type RevocationVerifiability,
+  type SerializedRevocationPushResult,
+} from "./revocation-antirollback.js";
+
+export {
+  DOWNGRADE_LOG_META_KEY,
+  MAX_DOWNGRADE_LOG_ENTRIES,
+  readDowngradeLog,
+  appendDowngradeLog,
+  type DowngradeTransitionKind,
+  type DowngradeLogEntry,
+  type DowngradeLogRead,
+} from "./downgrade-log.js";
+
+export {
+  diffCapTransition,
+  runFleetReResolve,
+  type PriorCapState,
+  type ReResolveRosterView,
+  type CapTransition,
+  type ReResolveResult,
+} from "./re-resolve.js";

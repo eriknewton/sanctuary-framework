@@ -791,8 +791,11 @@ export class FederationSyncStateStore {
    *      WHOLE read-modify-write in {@link writeNow}, so the merge-read and the
    *      write are atomic with respect to ANOTHER process's read-modify-write.
    *      This closes the genuine write-OVERLAP race (two processes both reading
-   *      before either writes); the lock is bounded + breaks provably-stale holders
-   *      so it cannot deadlock, and FAILS CLOSED (throws) on sustained contention.
+   *      before either writes); the lock is bounded and FAILS CLOSED (throws with a
+   *      manual-`rm` recovery hint) on sustained contention. It has NO auto-stale-
+   *      break (that read-then-unlink is a TOCTOU double-acquire; see the #871 lock
+   *      lesson), so a crashed holder wedges this path until a one-time operator
+   *      `rm` - fail-SAFE, never a fail-open double-acquire on revocation state.
    *   2. A strictly MONOTONIC merge: writeNow RE-READS the at-rest blob and UNIONs
    *      the grow-only security fields (revoked node ids, revoked root pubkeys) +
    *      takes `Math.max` of the monotonic floors (eviction serial, revocation

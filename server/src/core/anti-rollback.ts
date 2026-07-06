@@ -218,6 +218,30 @@ export interface EpochWitnessData {
    * together with the establishment latch.
    */
   baseline_schema?: number;
+  /**
+   * Monotonic floor on the HIGHEST fleet-license REVOCATION-LIST version this
+   * fortress has ever had pushed (fleet control plane PR-3, the revocation
+   * chokepoint). It is the custody-MAC'd BINDING that makes "a version-N
+   * revocation existed" survive deletion of BOTH the plain revocation-list file
+   * AND the standalone `entitlement/revocation-antirollback.ts` `_meta` anchor:
+   * once the issuer pushes a revocation list at version N, this floor is raised to
+   * `max(current, N)` in the master-MAC'd witness and NEVER lowered. The
+   * revocation ENFORCEMENT path consults it so that a list which is absent (deleted)
+   * on a fortress whose witness says a revocation was established, or which is
+   * present below this floor, or which is corrupt, is UNVERIFIABLE -> fail closed
+   * (drop paid -> Community), exactly like a corrupt list. A fortress that never
+   * pushed a revocation has no floor here, so an absent list keeps the grant (the
+   * legit case). ADDITIVE: absent reads as "no floor" (pre-PR-3 / legacy witnesses),
+   * bound into the witness MAC because the MAC covers `canonicalJson(data)`. The
+   * floor lives in the epoch-witness record, a SEPARATE deletable location from
+   * both the list file and the standalone version anchor, so laundering a deletion
+   * requires the attacker to ALSO delete the master-MAC'd witness, which the
+   * splice/rotation witnesses independently expose on any fortress with real
+   * history. The irreducible residual (delete the list + the anchor + the witness
+   * on a purely-offline, never-rotated fortress) is the SAME full-wipe residual
+   * this module already documents for Stage 1, bounded only by Stage 2/4.
+   */
+  revocation_floor?: number;
 }
 
 function epochWitnessMac(master: Uint8Array, data: EpochWitnessData): Uint8Array {
@@ -292,6 +316,10 @@ export async function readEpochWitness(
       (typeof data.baseline_schema !== "number" ||
         !Number.isSafeInteger(data.baseline_schema) ||
         data.baseline_schema < 0)) ||
+    (data.revocation_floor !== undefined &&
+      (typeof data.revocation_floor !== "number" ||
+        !Number.isSafeInteger(data.revocation_floor) ||
+        data.revocation_floor < 0)) ||
     typeof mac !== "string"
   ) {
     return { status: "invalid" };
@@ -310,6 +338,9 @@ export async function readEpochWitness(
       : {}),
     ...(data.baseline_schema !== undefined
       ? { baseline_schema: data.baseline_schema }
+      : {}),
+    ...(data.revocation_floor !== undefined
+      ? { revocation_floor: data.revocation_floor }
       : {}),
   };
   let provided: Uint8Array;
@@ -368,6 +399,14 @@ export async function writeEpochWitness(
           toWrite.baseline_schema < priorSchema)
       ) {
         toWrite = { ...toWrite, baseline_schema: priorSchema };
+      }
+      const priorRevocationFloor = current.data.revocation_floor;
+      if (
+        typeof priorRevocationFloor === "number" &&
+        (typeof toWrite.revocation_floor !== "number" ||
+          toWrite.revocation_floor < priorRevocationFloor)
+      ) {
+        toWrite = { ...toWrite, revocation_floor: priorRevocationFloor };
       }
     }
   }
@@ -490,6 +529,102 @@ export async function raiseBaselineEstablishedLatch(
     ...base,
     baseline_established: true,
     baseline_schema: Math.max(priorSchema, sealedSchema),
+    witnessed_at: now().toISOString(),
+  });
+}
+
+// ── Revocation-floor latch (fleet control plane PR-3 chokepoint) ────────────
+
+/**
+ * Read the custody-MAC'd revocation-list version FLOOR from the epoch witness.
+ * This is the BINDING the fleet revocation enforcement path consults so that a
+ * revocation list which was pushed (floor > 0) but is now ABSENT (deleted),
+ * present below the floor, or corrupt is UNVERIFIABLE -> fail closed. It threads
+ * the revocation floor through the SAME master-MAC'd witness the custody
+ * anti-rollback floor and the config-baseline latch already use (no parallel
+ * mechanism, no new freeze path).
+ *
+ * Verdicts:
+ *  - `{ floor: N }` (N > 0): the authenticated witness records a revocation was
+ *    established at version >= N. A subsequent enforcement pass whose stored list
+ *    is absent, below N, or corrupt is a deletion/rollback -> fail closed.
+ *  - `{ floor: 0 }`: the witness authenticates and no revocation floor is set
+ *    (a fortress that never had a revocation pushed, or a legacy witness). An
+ *    absent list keeps the paid grant (the legit case).
+ *  - `{ floor: 0, witnessUntrusted: true }`: NO authenticated witness exists
+ *    (absent or tampered). The caller MUST NOT read this as "no revocation was
+ *    ever established"; it composes this with the OTHER surviving revocation
+ *    signal (the standalone version anchor) exactly as the boot detector composes
+ *    witnesses, so deleting the witness to erase the floor does not launder a
+ *    deletion on a fortress whose standalone anchor still proves a push happened.
+ *
+ * HONEST RESIDUAL (do not over-claim): the ONLY way to fully erase the floor is
+ * to delete the revocation-list file AND the standalone version anchor AND the
+ * master-MAC'd epoch witness. That triple deletion is the SAME irreducible
+ * full-wipe residual this module documents for Stage 1 (a self-consistent
+ * full-tree restore), bounded only by Stage 2/4. Raising the attacker's cost from
+ * "delete one plaintext-shaped list file" to "delete the master-MAC'd witness too"
+ * is exactly the improvement the config-baseline latch already makes.
+ */
+export async function readRevocationFloorLatch(
+  storage: StorageBackend,
+  master: Uint8Array
+): Promise<{ floor: number; witnessUntrusted?: boolean }> {
+  const witness = await readEpochWitness(storage, master);
+  if (witness.status === "valid") {
+    const floor =
+      typeof witness.data.revocation_floor === "number"
+        ? witness.data.revocation_floor
+        : 0;
+    return { floor };
+  }
+  // absent (deleted/never-written) OR invalid (tampered). No trustworthy floor to
+  // read; surface that so the caller composes the standalone anchor rather than
+  // treating it as a clean "never established".
+  return { floor: 0, witnessUntrusted: true };
+}
+
+/**
+ * Raise the monotonic revocation-list version floor on the epoch witness. Called
+ * by BOTH revocation push paths (HTTP + CLI) every time an authenticated newer
+ * list is persisted, passing the pushed version, so the floor tracks forward
+ * without a rotation. Preserves the current epoch/epoch_id (it raises the floor,
+ * it does not touch the rollback floor) and routes through {@link writeEpochWitness},
+ * whose monotonic guards keep the epoch non-decreasing and never lower the floor.
+ * When NO authenticated witness exists yet (a fortress that never rotated), it
+ * establishes a fresh epoch-0 witness carrying the floor. Idempotent: a no-op when
+ * the floor is already at or above `version`. Never lowers.
+ */
+export async function raiseRevocationFloorLatch(
+  storage: StorageBackend,
+  master: Uint8Array,
+  version: number,
+  now: () => Date = () => new Date()
+): Promise<void> {
+  if (!Number.isSafeInteger(version) || version < 0) {
+    throw new Error(
+      `raiseRevocationFloorLatch: version must be a non-negative safe integer (got ${version})`
+    );
+  }
+  const witness = await readEpochWitness(storage, master);
+  if (
+    witness.status === "valid" &&
+    typeof witness.data.revocation_floor === "number" &&
+    witness.data.revocation_floor >= version
+  ) {
+    return; // already at or above this floor (monotonic), nothing to do
+  }
+  const base: EpochWitnessData =
+    witness.status === "valid"
+      ? witness.data
+      : { epoch: 0, epoch_id: "epoch-0-creation", witnessed_at: now().toISOString() };
+  const priorFloor =
+    witness.status === "valid" && typeof witness.data.revocation_floor === "number"
+      ? witness.data.revocation_floor
+      : 0;
+  await writeEpochWitness(storage, master, {
+    ...base,
+    revocation_floor: Math.max(priorFloor, version),
     witnessed_at: now().toISOString(),
   });
 }
@@ -1140,6 +1275,20 @@ export async function restoreAttest(args: {
     args.storage,
     args.master
   );
+  // Also carry the REVOCATION FLOOR across the force re-baseline (fleet control
+  // plane PR-3): a custody restore-attestation attests to a custody EPOCH restore,
+  // NOT to un-establishing a fleet revocation that genuinely happened. `force`
+  // skips writeEpochWitness's monotonic revocation_floor-preserve, so carry it
+  // explicitly (never lower it) exactly as baseline_established/baseline_schema are
+  // carried. If we dropped it, restore-attest would ZERO the revocation floor and
+  // an attacker could then delete the list+anchor -> floor 0 -> un-revoke every
+  // killed license. A wrong-master caller reads the witness as "invalid" ->
+  // { floor: 0, witnessUntrusted: true }, so it carries floor 0 (the safe
+  // direction: it does not re-assert a floor it cannot authenticate).
+  const priorRevocationFloor = await readRevocationFloorLatch(
+    args.storage,
+    args.master
+  );
   // Force-write the witness to the attested epoch (this is the one place a
   // LOWER epoch is legitimate — the operator is asserting the restore is real).
   // A caller WITHOUT the current master writes a witness keyed to its own wrong
@@ -1155,6 +1304,9 @@ export async function restoreAttest(args: {
       ...(priorLatch.established ? { baseline_established: true } : {}),
       ...(priorLatch.established && typeof priorLatch.sealedSchema === "number"
         ? { baseline_schema: priorLatch.sealedSchema }
+        : {}),
+      ...(priorRevocationFloor.floor > 0
+        ? { revocation_floor: priorRevocationFloor.floor }
         : {}),
     },
     { force: true }

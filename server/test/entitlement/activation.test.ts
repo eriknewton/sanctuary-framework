@@ -166,6 +166,76 @@ describe("activateFleet - verifies before persisting", () => {
   });
 });
 
+// ── writeFleetActivation: grandfather baseline is GROW-ONLY ───────────────────
+
+describe("writeFleetActivation - grow-only grandfather baseline", () => {
+  it("never LOWERS a previously-captured baseline (a smaller-roster re-activation cannot strip the floor)", async () => {
+    const storage = new MemoryStorage();
+    // Existing fleet captured a high floor of 12.
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 12);
+    // A paid re-activation recomputes the baseline from a transiently-SMALL live
+    // roster (0, e.g. a roster hiccup mid-recompute) - it MUST NOT overwrite 12.
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 0);
+    const record = await readFleetActivation(storage, master);
+    expect(record.status).toBe("valid");
+    if (record.status === "valid") {
+      expect(record.data.grandfatheredBaseline).toBe(12); // grew-only, held the floor
+    }
+  });
+
+  it("RAISES the baseline when the incoming value is larger (grow-only, not freeze)", async () => {
+    const storage = new MemoryStorage();
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 8);
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 20);
+    const record = await readFleetActivation(storage, master);
+    expect(record.status === "valid" && record.data.grandfatheredBaseline).toBe(20);
+  });
+
+  it("a first write (absent record) is unaffected: it persists the incoming baseline", async () => {
+    const storage = new MemoryStorage();
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 7);
+    const record = await readFleetActivation(storage, master);
+    expect(record.status === "valid" && record.data.grandfatheredBaseline).toBe(7);
+  });
+
+  it("an explicit deactivate (clear) DOES reset the floor: a fresh activate starts from the incoming baseline", async () => {
+    const storage = new MemoryStorage();
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 12);
+    // clearFleetActivation removes the whole record, so the next write sees an
+    // ABSENT record (no stored floor to compare) - the reset is explicit, never
+    // an accidental lowering.
+    await clearFleetActivation(storage);
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 3);
+    const record = await readFleetActivation(storage, master);
+    expect(record.status === "valid" && record.data.grandfatheredBaseline).toBe(3);
+  });
+
+  it("REFUSES to lower the floor when the prior record is TAMPERED (present but unreadable): fail closed, no downgrade", async () => {
+    // Round-2 fix: a tampered prior record must NEVER be read as floor 0 and thus
+    // enable a baseline DOWNGRADE. A disk attacker who corrupts the record (flips a
+    // MAC'd byte) then triggers a small-roster re-activation would otherwise strip
+    // a captured high floor. writeFleetActivation now fails closed: it throws
+    // rather than overwrite a present-but-unauthenticated record with a lower floor.
+    const storage = new MemoryStorage();
+    await writeFleetActivation(storage, master, signV2(v2Claims()), 20);
+    // Corrupt the stored record so it reads INVALID (present, MAC fails).
+    const raw = await storage.read("_meta", FLEET_ACTIVATION_META_KEY);
+    const obj = JSON.parse(new TextDecoder().decode(raw!));
+    obj.data.grandfatheredBaseline = 999; // flip a MAC'd field without re-MAC'ing
+    await storage.write(
+      "_meta",
+      FLEET_ACTIVATION_META_KEY,
+      stringToBytes(JSON.stringify(obj)),
+    );
+    expect((await readFleetActivation(storage, master)).status).toBe("invalid");
+    // A small-roster re-activation (incoming 0) must be REFUSED, not silently
+    // written as 0 (which would downgrade the real captured baseline of 20).
+    await expect(
+      writeFleetActivation(storage, master, signV2(v2Claims()), 0),
+    ).rejects.toThrow(/tampered|authenticate|downgrade/i);
+  });
+});
+
 // ── resolveActivation: re-resolve against the current clock ──────────────────
 
 describe("resolveActivation - fail-closed resolve-on-read", () => {

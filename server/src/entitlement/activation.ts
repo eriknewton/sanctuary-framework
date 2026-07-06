@@ -207,6 +207,34 @@ function isPlausibleToken(token: unknown): token is EntitlementToken {
  * master-MAC'd record. `grandfatheredBaseline` is clamped to a safe non-negative
  * integer (a malformed baseline persists as 0 - no grandfather floor - never a
  * large silent cap-lift).
+ *
+ * GROW-ONLY (fleet control plane PR-3 fix): the grandfather baseline is the
+ * PERMANENT free floor of an existing fleet; it must never be LOWERED by a write.
+ * A paid re-activation (or a concurrent auto-capture tick) recomputes the baseline
+ * from the LIVE roster, which can be transiently small (a node briefly offline, a
+ * roster hiccup mid-recompute) - blind-writing that lower value would permanently
+ * strip a previously-captured higher floor. So this reads the currently-stored
+ * (authenticated) baseline and persists `Math.max(existing, incoming)`, protecting
+ * BOTH the auto-capture path and the paid-activation path at the ONE persistence
+ * chokepoint. A LOWER baseline is only reachable by an explicit deactivation
+ * ({@link clearFleetActivation} removes the whole record, so a subsequent activate
+ * starts from an ABSENT record with no stored floor to compare against) - never by
+ * an accidental lowering write here.
+ *
+ * FAIL-CLOSED ON A TAMPERED PRIOR RECORD (round-2 fix): the three read states are
+ * treated distinctly, NOT collapsed to "floor 0":
+ *   - ABSENT: genuine first write; there is no prior floor, so `existing = 0` and
+ *     the incoming baseline stands (a first write is unaffected).
+ *   - VALID: a trustworthy prior floor; persist `max(existing, incoming)`.
+ *   - INVALID (present but tampered/unreadable/wrong-key): we CANNOT read the true
+ *     prior floor, but the record's PRESENCE proves a prior activation existed. A
+ *     tampered record must NEVER enable a baseline DOWNGRADE, so we do not silently
+ *     treat its floor as 0. We REFUSE the write (fail closed) rather than risk
+ *     lowering a floor we cannot read. The caller re-attempts after the record is
+ *     re-authenticated (a legit re-activation overwrites the whole record via the
+ *     verified paste path, which reads VALID once written), and the resolve-on-read
+ *     path already fails a tampered record to the plain community floor, so nothing
+ *     grants on the tamper in the meantime.
  */
 export async function writeFleetActivation(
   storage: StorageBackend,
@@ -215,10 +243,27 @@ export async function writeFleetActivation(
   grandfatheredBaseline: number,
   now: () => Date = () => new Date(),
 ): Promise<void> {
-  const baseline =
+  const incoming =
     Number.isSafeInteger(grandfatheredBaseline) && grandfatheredBaseline >= 0
       ? grandfatheredBaseline
       : 0;
+  // Grow-only, fail-closed on a tampered prior record. Only a VALID stored record
+  // supplies a trustworthy floor; an ABSENT record has no floor (first write); an
+  // INVALID (present-but-tampered) record must NOT be read as floor 0 - that would
+  // let a disk attacker who corrupts the record enable a baseline DOWNGRADE.
+  let existingFloor = 0;
+  const current = await readFleetActivation(storage, master);
+  if (current.status === "valid") {
+    existingFloor = current.data.grandfatheredBaseline;
+  } else if (current.status === "invalid") {
+    throw new Error(
+      "Sanctuary: refusing to overwrite a fleet activation record that is present " +
+        "but does not authenticate (tampered/unreadable); a tampered prior record " +
+        "must never enable a grandfather-baseline downgrade. Re-activate to " +
+        "re-establish an authenticated record.",
+    );
+  }
+  const baseline = Math.max(existingFloor, incoming);
   const data: FleetActivationData = {
     token,
     grandfatheredBaseline: baseline,
