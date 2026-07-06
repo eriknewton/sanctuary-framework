@@ -10,15 +10,30 @@
  * classic lost-update under genuine write OVERLAP, not just sequential completion).
  *
  * {@link withCrossProcessLock} serializes the WHOLE read-modify-write across
- * processes on filesystem backends. It mirrors the proven transparency-emit lock
- * discipline: O_EXCL create of a lockfile in the namespace directory, a
- * provably-stale break (dead holder PID or a lock acquired before the current
- * boot), a bounded wait, and a fail-CLOSED throw on sustained contention. It is
- * deadlock-free by construction: every acquire either succeeds, breaks a provably
- * dead holder, or times out and throws. It is NOT reentrant within a single
- * process; callers must already serialize their own concurrent calls (the
- * federation store does so with its in-process write chain) so a process never
- * blocks on a lock it itself holds.
+ * processes on filesystem backends. It is a PLAIN O_EXCL lock: an O_EXCL create
+ * of a lockfile in the namespace directory, a bounded wait, and a fail-CLOSED
+ * throw (with a manual-`rm` recovery hint) on sustained contention. It is NOT
+ * reentrant within a single process; callers must already serialize their own
+ * concurrent calls (the federation store does so with its in-process write chain)
+ * so a process never blocks on a lock it itself holds.
+ *
+ * ── NO AUTO-STALE-BREAK (the #871 lock lesson) ──────────────────────────────
+ * An earlier version auto-broke a "provably stale" lock (dead holder PID / a lock
+ * acquired before the current boot) by reading the lockfile and then `rm`-ing it.
+ * That read-then-unlink is a check-then-act TOCTOU (CodeQL `js/file-system-race`):
+ * two contenders can BOTH read the same stale lock, BOTH decide to break it, and
+ * the second `rm` can delete a DIFFERENT, freshly-acquired LIVE lock a winner
+ * created in between - after which two writers enter the critical section and
+ * interleave (a double-acquire). There is no POSIX primitive to make the unlink
+ * conditional on the inode still being the exact stale one, so the race cannot be
+ * closed while keeping the auto-break. Per the #871 resolution
+ * (`anti-rollback-durability-and-lock-simplify`), the convergent CORRECT fix for a
+ * millisecond-duration single-operator write path is to DELETE the auto-break and
+ * FAIL CLOSED: a crashed holder wedging the path until a one-time manual `rm` is a
+ * fail-SAFE tradeoff, strictly better than a fail-OPEN double-acquire on
+ * security-critical state (revocation-list push, federation sync-state). The
+ * thrown error names the exact lockfile so an operator can clear a genuinely-dead
+ * holder with a single `rm`.
  *
  * Non-filesystem backends (single-process in-memory rigs and tests) have no
  * cross-process surface, so the lock degrades to running the operation directly.
@@ -26,9 +41,8 @@
  * sufficient when there is only one process.
  */
 
-import { open, readFile, rm } from "node:fs/promises";
+import { open, rm } from "node:fs/promises";
 import { mkdir } from "node:fs/promises";
-import { uptime as osUptime } from "node:os";
 import { join } from "node:path";
 
 import type { StorageBackend } from "./interface.js";
@@ -60,9 +74,12 @@ export interface CrossProcessLockOptions {
  * operation runs directly (single-process; no cross-process surface).
  *
  * THROWS {@link CrossProcessLockError} if the lock cannot be acquired within the
- * bounded timeout (a different live process is holding it). The lockfile is
- * ALWAYS removed in a `finally` once held, even if `operation` throws, so a
- * thrown operation never leaves a stale lock for this process.
+ * bounded timeout (another process is holding it, OR a crashed holder left a stale
+ * lockfile). There is NO auto-stale-break (see the module header): a contended
+ * acquire fails CLOSED with a manual-`rm` hint rather than risk the read-then-
+ * unlink double-acquire race. The lockfile is ALWAYS removed in a `finally` once
+ * held, even if `operation` throws, so a thrown operation never leaves a stale
+ * lock for this process.
  */
 export async function withCrossProcessLock<T>(
   storage: StorageBackend,
@@ -106,10 +123,15 @@ export async function withCrossProcessLock<T>(
           `cross-process lock could not be acquired (${lockPath}): ${errorMessage(err)}`,
         );
       }
-      if (await breakProvablyStaleLock(lockPath)) continue;
+      // Held (by a live process OR a crashed holder). We do NOT auto-break: a
+      // read-then-unlink stale-break is a TOCTOU double-acquire (see module
+      // header). Wait out the bounded budget, then fail CLOSED with a recovery
+      // hint. A genuinely-dead holder is cleared by a one-time operator `rm`.
       if (Date.now() - started >= timeoutMs) {
         throw new CrossProcessLockError(
-          `cross-process lock ${lockPath} held by another live process >${timeoutMs}ms; refusing to proceed concurrently`,
+          `cross-process lock ${lockPath} held >${timeoutMs}ms; refusing to proceed ` +
+            `concurrently. If no other Sanctuary process is running, a prior holder ` +
+            `crashed while holding it; clear it with: rm '${lockPath}'`,
         );
       }
       await sleep(retryMs);
@@ -123,50 +145,6 @@ export async function withCrossProcessLock<T>(
   }
 }
 
-/**
- * Break a lock ONLY when staleness is provable: the holder PID is dead, or the
- * lock was acquired before the current boot (so the holder cannot still exist).
- * An unreadable/corrupt lockfile is NEVER broken (cannot prove staleness). A
- * vanished lockfile (holder released it) is treated as breakable so the acquire
- * retries immediately. Returns true when the lock was broken (or already gone).
- */
-async function breakProvablyStaleLock(lockPath: string): Promise<boolean> {
-  let holderPid: number | undefined;
-  let acquiredAtMs: number | undefined;
-  try {
-    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as {
-      pid?: unknown;
-      acquired_at?: unknown;
-    };
-    if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid)) {
-      holderPid = parsed.pid;
-    }
-    if (typeof parsed.acquired_at === "string") {
-      const t = Date.parse(parsed.acquired_at);
-      if (!Number.isNaN(t)) acquiredAtMs = t;
-    }
-  } catch (err) {
-    const code =
-      err instanceof Error && "code" in err
-        ? String((err as NodeJS.ErrnoException).code)
-        : "";
-    // Vanished: the holder released it; retry the acquire immediately.
-    if (code === "ENOENT") return true;
-    // Unreadable/corrupt: cannot PROVE staleness, so never break it.
-    return false;
-  }
-  if (holderPid === process.pid) return false;
-  const bootTimeMs = currentBootTimeMs();
-  const predatesBoot =
-    acquiredAtMs !== undefined &&
-    bootTimeMs !== undefined &&
-    acquiredAtMs < bootTimeMs;
-  const holderDead = holderPid !== undefined && !isProcessAlive(holderPid);
-  if (!predatesBoot && !holderDead) return false;
-  await rm(lockPath, { force: true });
-  return true;
-}
-
 function asFilesystemCapabilities(
   storage: StorageBackend,
 ): FilesystemStorageCapabilities | undefined {
@@ -178,29 +156,6 @@ function asFilesystemCapabilities(
     return candidate as FilesystemStorageCapabilities;
   }
   return undefined;
-}
-
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    const code =
-      err instanceof Error && "code" in err
-        ? (err as NodeJS.ErrnoException).code
-        : undefined;
-    // EPERM means the process exists but is owned by another user.
-    return code === "EPERM";
-  }
-}
-
-function currentBootTimeMs(): number | undefined {
-  try {
-    return Date.now() - osUptime() * 1000;
-  } catch {
-    return undefined;
-  }
 }
 
 function errorMessage(err: unknown): string {

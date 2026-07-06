@@ -3843,9 +3843,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * All three drop a paid grant toward Community. An ABSENT list with NO established
    * floor (a fleet that never had a revocation pushed) is `clean` and keeps the
    * grant (the legit case). A TRANSIENT storage-read error (EIO/EAGAIN, not the
-   * benign ENOENT/absent) sets NEITHER flag - grace, so a one-off IO blip does not
-   * drop a legit paid fleet (a genuine MAC failure is `corrupt`, never transient).
-   * Never throws.
+   * benign ENOENT/absent) is FLOOR-CONDITIONED grace: it sets neither flag ONLY
+   * when floor === 0 (nothing ever revoked); a transient that never clears on an
+   * ESTABLISHED floor (> 0) is itself `unverifiable` -> drop, so a killed license
+   * cannot be held paid forever by a persistently-throwing read. A genuine MAC
+   * failure, or a non-transient/unclassifiable throw (symlink/chmod-000 swap), is
+   * `corrupt`, never transient. Never throws.
    */
   private async revocationStatusForActiveLicense(
     storage: StorageBackend,

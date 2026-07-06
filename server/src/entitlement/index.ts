@@ -133,6 +133,7 @@ export {
   readRevocationVersionAnchor,
   writeRevocationVersionAnchor,
   effectiveRevocationVersionFloor,
+  writableRevocationVersionFloor,
   revocationVerifiability,
   persistPushedRevocationListSerialized,
   type RevocationVersionAnchorData,

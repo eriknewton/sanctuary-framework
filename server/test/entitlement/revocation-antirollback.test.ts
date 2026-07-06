@@ -36,6 +36,7 @@ import {
   readRevocationVersionAnchor,
   writeRevocationVersionAnchor,
   effectiveRevocationVersionFloor,
+  writableRevocationVersionFloor,
   revocationVerifiability,
   persistPushedRevocationListSerialized,
 } from "../../src/entitlement/revocation-antirollback.js";
@@ -291,8 +292,9 @@ class FlakyStorage extends MemoryStorage {
   override async read(namespace: string, key: string): Promise<Uint8Array | null> {
     if (key === this.targetKey && this.failCount > 0) {
       this.failCount -= 1;
-      const err = new Error(`injected ${this.code}`) as NodeJS.ErrnoException;
-      err.code = this.code;
+      const err = new Error(`injected ${this.code || "no-code"}`) as NodeJS.ErrnoException;
+      // An empty code simulates an error with NO `code` property (unclassifiable).
+      if (this.code) err.code = this.code;
       throw err;
     }
     return super.read(namespace, key);
@@ -300,14 +302,27 @@ class FlakyStorage extends MemoryStorage {
 }
 
 describe("revocationVerifiability - transient-read grace", () => {
-  it("a TRANSIENT IO error (EIO) is retried and does NOT drop a legit fleet (grace)", async () => {
-    // Seed a valid list, then make the list-key read throw EIO on every attempt so
-    // the bounded retry is exhausted -> `transient`, NOT `corrupt` (no drop).
+  it("a TRANSIENT IO error (EIO) with NO established floor (floor 0) is grace (does NOT drop the legit never-revoked fleet)", async () => {
+    // No revocation ever pushed (floor 0). A persistent EIO on the list read must
+    // be grace -> `transient`, NOT a drop: there is nothing to un-revoke, so a
+    // benign IO blip must not knock a legit never-revoked fleet off paid.
+    const flaky = new FlakyStorage(REVOCATION_LIST_META_KEY, 999, "EIO");
+    const v = await revocationVerifiability(flaky, master);
+    expect(v.status).toBe("transient");
+  });
+
+  it("FIX 1(b): a genuine TRANSIENT (EIO) on an ESTABLISHED floor (>0) FAILS CLOSED (unverifiable, not indefinite grace)", async () => {
+    // Seed a valid list at v4 (floor 4 established: list + anchor + witness latch),
+    // then make the list-key read throw EIO on every attempt. Pre-fix this returned
+    // `transient` (grace) and a killed license could be held paid FOREVER by making
+    // the read keep throwing a transient code. Post-fix: floor > 0 + unresolved
+    // transient -> `unverifiable` (transient_below_floor) -> the caller drops.
     const base = new MemoryStorage();
     await writeRevocationList(base, master, payload({ version: 4 }));
     await writeRevocationVersionAnchor(base, master, 4);
     await raiseRevocationFloorLatch(base, master, 4);
-    // Copy the seeded bytes into a flaky store that fails the list read forever.
+    // Copy the seeded bytes into a flaky store that fails the LIST read forever, but
+    // leaves the anchor + witness readable so the floor still resolves to 4 (> 0).
     const flaky = new FlakyStorage(REVOCATION_LIST_META_KEY, 999, "EIO");
     for (const key of [
       REVOCATION_LIST_META_KEY,
@@ -318,8 +333,56 @@ describe("revocationVerifiability - transient-read grace", () => {
       if (raw) await flaky.write("_meta", key, raw);
     }
     const v = await revocationVerifiability(flaky, master);
-    // A genuine transient must NOT be laundered into an authoritative corrupt drop.
-    expect(v.status).toBe("transient");
+    expect(v.status).toBe("unverifiable");
+    if (v.status === "unverifiable") {
+      expect(v.reason).toBe("transient_below_floor");
+      expect(v.floor).toBe(4);
+    }
+  });
+
+  it("FIX 1(a): a NON-transient read throw (EACCES - a chmod-000/symlink swap) is UNVERIFIABLE (corrupt), NEVER laundered as transient", async () => {
+    // The un-revoke bypass this closes: replace the list file with a symlink /
+    // directory / chmod-000 file so the read throws a code NOT in TRANSIENT_IO_CODES
+    // (EACCES / EPERM / EISDIR / ELOOP). Pre-fix this was mislabeled `transient`
+    // (grace) and a killed license stayed paid. Post-fix: it is `unverifiable`
+    // (corrupt) -> fail closed, exactly like a corrupt list. Floor 4 established.
+    const base = new MemoryStorage();
+    await writeRevocationList(base, master, payload({ version: 4 }));
+    await writeRevocationVersionAnchor(base, master, 4);
+    await raiseRevocationFloorLatch(base, master, 4);
+    const flaky = new FlakyStorage(REVOCATION_LIST_META_KEY, 999, "EACCES");
+    for (const key of [
+      REVOCATION_LIST_META_KEY,
+      REVOCATION_VERSION_ANCHOR_META_KEY,
+      EPOCH_WITNESS_META_KEY,
+    ]) {
+      const raw = await base.read("_meta", key);
+      if (raw) await flaky.write("_meta", key, raw);
+    }
+    const v = await revocationVerifiability(flaky, master);
+    expect(v.status).toBe("unverifiable");
+    if (v.status === "unverifiable") expect(v.reason).toBe("corrupt");
+  });
+
+  it("FIX 1(a): a NON-transient read throw with NO code (unclassifiable) is UNVERIFIABLE (corrupt), not transient", async () => {
+    // An error carrying no `code` at all is unclassifiable -> must fail closed, not
+    // launder as transient grace. Floor established so the drop is meaningful.
+    const base = new MemoryStorage();
+    await writeRevocationList(base, master, payload({ version: 4 }));
+    await writeRevocationVersionAnchor(base, master, 4);
+    await raiseRevocationFloorLatch(base, master, 4);
+    const flaky = new FlakyStorage(REVOCATION_LIST_META_KEY, 999, "");
+    for (const key of [
+      REVOCATION_LIST_META_KEY,
+      REVOCATION_VERSION_ANCHOR_META_KEY,
+      EPOCH_WITNESS_META_KEY,
+    ]) {
+      const raw = await base.read("_meta", key);
+      if (raw) await flaky.write("_meta", key, raw);
+    }
+    const v = await revocationVerifiability(flaky, master);
+    expect(v.status).toBe("unverifiable");
+    if (v.status === "unverifiable") expect(v.reason).toBe("corrupt");
   });
 
   it("a transient that CLEARS within the retry budget resolves to the real verdict", async () => {
@@ -393,5 +456,105 @@ describe("persistPushedRevocationListSerialized - concurrent pushes stay monoton
     // The floor (anchor + witness latch) never regressed below 7.
     expect(await effectiveRevocationVersionFloor(storage, master)).toBe(7);
     expect((await readRevocationFloorLatch(storage, master)).floor).toBe(7);
+  });
+});
+
+// ── FIX 2: crash before the latch must not leave the custody floor at 0 ────────
+
+/** A MemoryStorage that throws on the FIRST write to a given key (simulating a
+ *  crash mid-push) exactly once, then behaves normally. */
+class CrashOnWriteStorage extends MemoryStorage {
+  constructor(
+    private readonly targetKey: string,
+    private crashesLeft: number,
+  ) {
+    super();
+  }
+  override async write(namespace: string, key: string, value: Uint8Array): Promise<void> {
+    if (key === this.targetKey && this.crashesLeft > 0) {
+      this.crashesLeft -= 1;
+      throw new Error(`simulated crash writing ${key}`);
+    }
+    return super.write(namespace, key, value);
+  }
+}
+
+describe("persistPushedRevocationListSerialized - LATCH-FIRST crash ordering (fix #2)", () => {
+  it("raises the custody latch BEFORE the list, so a crash before the list keeps the floor established (>0, not 0)", async () => {
+    // Crash on the FIRST list write. With LATCH-FIRST ordering, the custody floor
+    // latch is already raised to the pushed version when the crash hits the list
+    // write - so the durable floor is AHEAD of the (unwritten) list, NOT 0.
+    const storage = new CrashOnWriteStorage(REVOCATION_LIST_META_KEY, 1);
+    const v5 = signRevocationList(
+      payload({ version: 5, revokedLicenseIds: ["lic-killed"] }),
+      (m) => ed25519.sign(m, issuer.privateKey),
+    );
+    await expect(
+      persistPushedRevocationListSerialized({
+        storage,
+        master,
+        signed: v5,
+        issuerPublicKey: issuer.publicKey,
+      }),
+    ).rejects.toThrow(/simulated crash/);
+
+    // The list never got written (the crash was on its write); pre-fix (latch LAST)
+    // the latch would ALSO be unwritten -> floor 0 -> a later state reads `clean` ->
+    // un-revoke. Post-fix the latch was raised FIRST -> floor is 5.
+    expect((await readRevocationFloorLatch(storage, master)).floor).toBe(5);
+    expect(await effectiveRevocationVersionFloor(storage, master)).toBe(5);
+
+    // Enforcement therefore FAILS CLOSED on the crash-interrupted state (list
+    // absent while floor 5) - the conservative, never-un-revoke direction.
+    const v = await revocationVerifiability(storage, master);
+    expect(v.status).toBe("unverifiable");
+    if (v.status === "unverifiable") expect(v.reason).toBe("absent_below_floor");
+  });
+
+  it("a RETRY of the same version after a latch-first crash COMPLETES the list write (not refused not_newer by its own latch)", async () => {
+    // Crash once on the first list write (latch already raised to 5), then a retry
+    // of the SAME v5 must succeed: the re-verify uses the WRITABLE floor (list ∪
+    // anchor = 0 here, NOT the latch = 5), so v5 is strictly-newer-than-0 and the
+    // list/anchor write completes. Pre-fix, verifying against a floor that included
+    // the latch (5) would refuse v5 as not_newer and the list would never land.
+    const storage = new CrashOnWriteStorage(REVOCATION_LIST_META_KEY, 1);
+    const v5 = signRevocationList(
+      payload({ version: 5, revokedLicenseIds: ["lic-killed"] }),
+      (m) => ed25519.sign(m, issuer.privateKey),
+    );
+    await expect(
+      persistPushedRevocationListSerialized({
+        storage,
+        master,
+        signed: v5,
+        issuerPublicKey: issuer.publicKey,
+      }),
+    ).rejects.toThrow(/simulated crash/);
+
+    // Confirm the writable floor (list ∪ anchor) is still 0 (neither landed), while
+    // the latch is 5 - the exact state that pre-fix bricked the retry.
+    expect(await writableRevocationVersionFloor(storage, master)).toBe(0);
+    expect((await readRevocationFloorLatch(storage, master)).floor).toBe(5);
+
+    // Retry (no more crashes) - it must COMPLETE.
+    const retry = await persistPushedRevocationListSerialized({
+      storage,
+      master,
+      signed: v5,
+      issuerPublicKey: issuer.publicKey,
+    });
+    expect(retry.ok).toBe(true);
+    if (retry.ok) expect(retry.version).toBe(5);
+
+    // Now fully consistent: list present at 5, floor 5, enforcement clean, and the
+    // killed license is on the list (the revocation survived the crash+retry).
+    const v = await revocationVerifiability(storage, master);
+    expect(v.status).toBe("clean");
+    const list = await readRevocationList(storage, master);
+    expect(list.status).toBe("valid");
+    if (list.status === "valid") {
+      expect(list.payload.version).toBe(5);
+      expect(list.payload.revokedLicenseIds).toContain("lic-killed");
+    }
   });
 });

@@ -1275,6 +1275,20 @@ export async function restoreAttest(args: {
     args.storage,
     args.master
   );
+  // Also carry the REVOCATION FLOOR across the force re-baseline (fleet control
+  // plane PR-3): a custody restore-attestation attests to a custody EPOCH restore,
+  // NOT to un-establishing a fleet revocation that genuinely happened. `force`
+  // skips writeEpochWitness's monotonic revocation_floor-preserve, so carry it
+  // explicitly (never lower it) exactly as baseline_established/baseline_schema are
+  // carried. If we dropped it, restore-attest would ZERO the revocation floor and
+  // an attacker could then delete the list+anchor -> floor 0 -> un-revoke every
+  // killed license. A wrong-master caller reads the witness as "invalid" ->
+  // { floor: 0, witnessUntrusted: true }, so it carries floor 0 (the safe
+  // direction: it does not re-assert a floor it cannot authenticate).
+  const priorRevocationFloor = await readRevocationFloorLatch(
+    args.storage,
+    args.master
+  );
   // Force-write the witness to the attested epoch (this is the one place a
   // LOWER epoch is legitimate — the operator is asserting the restore is real).
   // A caller WITHOUT the current master writes a witness keyed to its own wrong
@@ -1290,6 +1304,9 @@ export async function restoreAttest(args: {
       ...(priorLatch.established ? { baseline_established: true } : {}),
       ...(priorLatch.established && typeof priorLatch.sealedSchema === "number"
         ? { baseline_schema: priorLatch.sealedSchema }
+        : {}),
+      ...(priorRevocationFloor.floor > 0
+        ? { revocation_floor: priorRevocationFloor.floor }
         : {}),
     },
     { force: true }

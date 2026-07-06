@@ -316,7 +316,10 @@ export async function runFleetReResolve(args: {
   // this fix closes), and ROLLED-BACK (present below the established floor). Any of
   // those => revocation state UNVERIFIABLE => drop a paid grant to Community. An
   // ABSENT list with NO established floor keeps the grant (the legit case). A
-  // TRANSIENT storage error is grace (no drop). The id-on-list check (`revoked`) is
+  // TRANSIENT storage error is FLOOR-CONDITIONED grace: grace only when floor === 0
+  // (nothing ever revoked); a transient that never clears on an ESTABLISHED floor
+  // (> 0) is itself `unverifiable` (transient_below_floor) -> drop, because we
+  // cannot confirm the license is un-revoked. The id-on-list check (`revoked`) is
   // consulted ONLY on a verifiably-clean list.
   const verifiability = await revocationVerifiability(storage, master);
   const revocationListUnverifiable = verifiability.status === "unverifiable";

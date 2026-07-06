@@ -96,9 +96,14 @@ describe("withCrossProcessLock", () => {
     await holder;
   });
 
-  it("breaks a provably-stale lock left by a dead holder PID", async () => {
+  it("FIX 4: does NOT auto-break a stale lock (no read-then-unlink TOCTOU); fails CLOSED with a manual-rm hint", async () => {
     // Write a lockfile whose holder PID cannot exist (a never-allocated high PID),
-    // simulating a crashed process that never released its lock.
+    // simulating a crashed process that never released its lock. The OLD code
+    // auto-broke this by reading the JSON then `rm`-ing it - a check-then-act
+    // TOCTOU where two contenders can both decide "stale" and one deletes the
+    // other's freshly-acquired LIVE lock (double-acquire). The fix removes the
+    // auto-break: a stale lock is NOT broken; the acquire fails CLOSED with an
+    // operator-facing `rm` recovery hint. Fail-safe-wedge > fail-open-double-acquire.
     const { mkdir } = await import("node:fs/promises");
     const dir = storage.namespacePath(NS);
     await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -109,18 +114,48 @@ describe("withCrossProcessLock", () => {
     );
 
     let ran = false;
-    await withCrossProcessLock(
-      storage,
-      NS,
-      LOCK,
-      async () => {
-        ran = true;
-      },
-      { timeoutMs: 1_000, retryMs: 10 },
+    await expect(
+      withCrossProcessLock(
+        storage,
+        NS,
+        LOCK,
+        async () => {
+          ran = true;
+        },
+        { timeoutMs: 80, retryMs: 10 },
+      ),
+    ).rejects.toBeInstanceOf(CrossProcessLockError);
+    // The operation NEVER ran (no auto-break, no double-acquire).
+    expect(ran).toBe(false);
+    // The error hint names the exact lockfile so an operator can clear a dead holder.
+    await expect(
+      withCrossProcessLock(storage, NS, LOCK, async () => undefined, {
+        timeoutMs: 80,
+        retryMs: 10,
+      }),
+    ).rejects.toThrow(new RegExp(`rm '${lockPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'`));
+    // The stale lock is left in place (we did NOT touch another process's inode).
+    await expect(readFile(lockPath, "utf8")).resolves.toContain("2147483646");
+  });
+
+  it("clears cleanly once the stale lockfile is manually removed", async () => {
+    // The documented recovery: an operator `rm`s the crashed holder's lockfile,
+    // after which a fresh acquire succeeds normally.
+    const { mkdir } = await import("node:fs/promises");
+    const dir = storage.namespacePath(NS);
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const lockPath = join(dir, LOCK);
+    await writeFile(
+      lockPath,
+      JSON.stringify({ pid: 2_147_483_646, acquired_at: new Date().toISOString() }),
     );
+    await rm(lockPath, { force: true }); // the operator's one-time manual clear
+
+    let ran = false;
+    await withCrossProcessLock(storage, NS, LOCK, async () => {
+      ran = true;
+    });
     expect(ran).toBe(true);
-    // The lock is released again after the operation.
-    await expect(readFile(lockPath, "utf8")).rejects.toThrow();
   });
 
   it("runs directly (no lockfile) on a non-filesystem backend", async () => {
