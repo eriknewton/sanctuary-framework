@@ -82,6 +82,15 @@ import {
 import { renderPostureHomeHTML } from "./posture-home-html.js";
 import { buildFleetRoster } from "./fleet-roster.js";
 import {
+  applyFleetCap,
+  resolveActivation,
+  activateFleet,
+  decodeIssuerPublicKey,
+  COMMUNITY_FREE_NODE_CAP,
+  type FleetCap,
+  type ActivateFleetResult,
+} from "../entitlement/index.js";
+import {
   buildCastleWallPosture,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   mapPlatform,
@@ -1577,11 +1586,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // verdict is the federation layer's, never re-derived from a response
       // shape. The eviction serial is fleet context only. Read-only: this builds
       // a presentation object and drives no mutation, exposes no key material.
-      fleetRoster: () =>
-        buildFleetRoster(this.buildV1FederationDeps(), {
+      //
+      // Fleet control plane PR-B: apply the paid NODE-COUNT cap here, on the
+      // DURABLE daemon roster (`_federationState.nodes`, persisted by #888). The
+      // cap is resolved fail-closed from the signed, master-MAC'd activation
+      // record re-verified against the pinned operator issuer key at the CURRENT
+      // clock (so expiry/grace are honored live). When over the entitled count,
+      // `applyFleetCap` drops the excess nodes from THIS CENTRAL roster only -
+      // every dropped node keeps its free local wall, its local dashboard, kill
+      // safety, and free policy-push (this path has no wall/enforcement code and
+      // preserves the `policy_distribution` rail verbatim). A resolve failure can
+      // only ever REMOVE paid management capacity (community floor), never grant
+      // it and never touch a node's security. The count that drives the cap is
+      // `summary.admitted` (active, non-revoked), already computed by
+      // `buildFleetRoster` via the shared `isNodeRevoked` projection.
+      fleetRoster: async () => {
+        const roster = buildFleetRoster(this.buildV1FederationDeps(), {
           evictionSerial: this._federationState.evictionMaxSerial,
           operatorPolicy: this._federationState.operatorPolicy,
-        }),
+        });
+        const cap = await this.resolveFleetCap();
+        return applyFleetCap(roster, cap).roster;
+      },
       resolvePinnedProducerKey: () =>
         load?.status === "present" ? load.keyB64url : null,
       producerKeyExpectedButUnavailable: load?.status === "unreadable",
@@ -3553,6 +3579,163 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     }
   }
 
+  // ── Fleet control plane PR-B: node-count enforcement on the daemon roster ──
+  //
+  // The two helpers below turn the operator's persisted license into the paid
+  // node-count cap applied to the DURABLE daemon federation roster, and handle a
+  // pasted-license activation. Both fail CLOSED to the community floor and touch
+  // NO wall / enforcement / local-dashboard / policy-push / kill-safety path -
+  // enforcement only reshapes the CENTRAL roster presentation.
+
+  /**
+   * The fail-closed COMMUNITY-floor cap: the safe result whenever custody is not
+   * available in this process (no unlocked fortress → no storage/master key → no
+   * possible valid paid grant) or a resolve step fails. It is the plain 5-node
+   * free cap with baseline 0; `applyFleetCap` with this cap drops any nodes
+   * beyond 5 from the CENTRAL roster while leaving every node's wall + local
+   * surface + the policy-distribution rail untouched.
+   */
+  private communityFloorCap(): FleetCap {
+    return {
+      maxNodes: COMMUNITY_FREE_NODE_CAP,
+      paid: false,
+      tier: "community",
+      reason: "no_license",
+      graceActive: false,
+    };
+  }
+
+  /**
+   * Resolve the pinned issuer Ed25519 public key from the fortress's DEFAULT
+   * operator identity (already loaded on this channel; no per-request disk read).
+   * This is the SAME identity `sanctuary license` signs with (issuance +
+   * activation both happen on the operator's own fortress), so a license the
+   * operator issued verifies against it. Returns null when no operator identity
+   * is bound or its stored key is malformed - the caller then fails CLOSED to the
+   * community floor.
+   */
+  private resolveFleetIssuerPublicKey(): Uint8Array | null {
+    const identity = this.identityManager?.getDefault();
+    return decodeIssuerPublicKey(identity?.public_key);
+  }
+
+  /**
+   * Resolve the CURRENT node-count cap for this fleet, fail-closed. Reads the
+   * signed, master-MAC'd activation record and re-verifies the stored license
+   * against the pinned issuer key at the CURRENT clock (so expiry/grace are
+   * honored live), then maps it to a {@link FleetCap}.
+   *
+   * FAIL-CLOSED: any missing custody (no unlocked fortress: `storage`/`shrOpts`
+   * absent), missing operator identity, or resolve error returns the plain
+   * community floor - never a paid cap, never unlimited. A bug here can only ever
+   * REMOVE paid management capacity, never grant it, and NEVER touches a node's
+   * wall (this path has no wall/enforcement code at all). Never throws.
+   */
+  private async resolveFleetCap(): Promise<FleetCap> {
+    const storage = this.storage;
+    const masterKey = this.shrOpts?.masterKey;
+    if (!storage || !masterKey) {
+      // No unlocked custody in this process: no license can be authenticated →
+      // community floor. (A locked/standalone daemon centrally manages the free
+      // tier only; its nodes' walls are unaffected.)
+      return this.communityFloorCap();
+    }
+    const issuerPublicKey = this.resolveFleetIssuerPublicKey();
+    try {
+      // No pinned issuer identity → no license can verify. `resolveActivation`
+      // with a 32-zero key denies the token while STILL honoring an authenticated
+      // grandfather baseline (the record's MAC is keyed to the MASTER, not the
+      // issuer), so an existing >5-node fleet is not force-capped merely because
+      // the operator identity is momentarily unresolved.
+      return await resolveActivation(
+        storage,
+        masterKey,
+        issuerPublicKey ?? new Uint8Array(32),
+        Math.floor(Date.now() / 1000),
+      );
+    } catch {
+      // resolveActivation is contracted not to throw; guard anyway so an
+      // unexpected error is the safe community floor, never a paid grant.
+      return this.communityFloorCap();
+    }
+  }
+
+  /**
+   * Activate a pasted fleet license against the daemon's DURABLE roster (fleet
+   * control plane PR-B). Verifies the paste through the shipped Ed25519
+   * entitlement core against the pinned issuer key and, on success, persists it
+   * into the signed, master-MAC'd activation record so the central roster lifts
+   * its node-count cap.
+   *
+   * GRANDFATHER BASELINE: on first activation for a fleet already managing more
+   * than the free cap, the CURRENT active node count is captured so the fleet is
+   * never force-capped at the cap flip. The count is `summary.admitted` (active,
+   * non-revoked) from the SAME durable federation-backed roster the console
+   * shows - NOT a wrap provider (whose roster is empty by construction, the
+   * defect PR-B fixes). A new/small fleet captures 0 (the plain 5-node cap).
+   *
+   * FAIL-CLOSED: no custody / no operator identity → `verify_failed`, persists
+   * nothing. A malformed / unverifiable / expired paste is rejected and persists
+   * nothing. Never throws (an unexpected internal error maps to `verify_failed`,
+   * never a silent grant). Touches no wall / local-dashboard / policy-push path.
+   */
+  private async activateFleetLicense(
+    pastedLicense: string,
+  ): Promise<
+    | { ok: true; tier: string; max_nodes: number | null }
+    | { ok: false; reason: "malformed_token" | "verify_failed" }
+  > {
+    const storage = this.storage;
+    const masterKey = this.shrOpts?.masterKey;
+    if (!storage || !masterKey) {
+      // No unlocked custody: cannot persist a signed activation record. Reject
+      // fail-closed rather than pretend to activate.
+      return { ok: false, reason: "verify_failed" };
+    }
+    const issuerPublicKey = this.resolveFleetIssuerPublicKey();
+    if (issuerPublicKey === null) {
+      // No pinned operator identity → no license can verify. Reject fail-closed.
+      return { ok: false, reason: "verify_failed" };
+    }
+
+    // Grandfather baseline = the CURRENT active (admitted, non-revoked) node
+    // count on the durable roster, captured only when it exceeds the free cap.
+    // Best-effort + fail-safe to 0 (never grandfather a count we cannot read).
+    let grandfatheredBaseline = 0;
+    try {
+      const roster = buildFleetRoster(this.buildV1FederationDeps(), {
+        evictionSerial: this._federationState.evictionMaxSerial,
+        operatorPolicy: this._federationState.operatorPolicy,
+      });
+      if (roster.available && roster.summary.admitted > COMMUNITY_FREE_NODE_CAP) {
+        grandfatheredBaseline = roster.summary.admitted;
+      }
+    } catch {
+      grandfatheredBaseline = 0;
+    }
+
+    let result: ActivateFleetResult;
+    try {
+      result = await activateFleet({
+        storage,
+        master: masterKey,
+        pastedLicense,
+        issuerPublicKey,
+        now: Math.floor(Date.now() / 1000),
+        grandfatheredBaseline,
+      });
+    } catch {
+      // activateFleet is contracted not to throw; never let an unexpected error
+      // become a grant: fail closed.
+      return { ok: false, reason: "verify_failed" };
+    }
+
+    if (result.ok) {
+      return { ok: true, tier: result.tier, max_nodes: result.cap.maxNodes };
+    }
+    return { ok: false, reason: result.reason };
+  }
+
   /**
    * Federation PR-A3: dependency bundle for the /v1/federation endpoints.
    * Reads live context + operator key each request. Audit writes route to the
@@ -5404,6 +5587,26 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         this.handleProxyServers(res);
       } else if (method === "POST" && url.pathname === "/api/proxy/servers") {
         this.handleProxyServersUpdate(req, res);
+      } else if (method === "POST" && url.pathname === "/api/fleet/activate") {
+        // Fleet control plane PR-B: the operator pastes a license key and this
+        // activates it - verifies the paste through the shipped Ed25519
+        // entitlement core against the pinned issuer key and, on success,
+        // persists it into signed, tamper-evident fleet state so the CENTRAL
+        // roster lifts its node-count cap.
+        //
+        // AUTH (fail-closed): activation changes the PAID PRODUCT BOUNDARY, a
+        // Tier-1-class mutation, so it requires the operator BEARER TOKEN. The
+        // default-deny gate above already re-checks every non-GET route with
+        // `{ requireToken: true }` (fail-closed: denies when no token is
+        // configured, never honors loopback auto-auth or a session), but we make
+        // that explicit here so this billing-critical mutation carries its own
+        // local, unmissable gate independent of the shared exempt-set logic.
+        //
+        // NEVER GATES SECURITY: the handler resolves MANAGEMENT capacity only. It
+        // touches no wall / enforcement / local-dashboard / policy-push /
+        // kill-safety path.
+        if (!this.checkAuth(req, url, res, { requireToken: true })) return;
+        this.handleFleetActivate(req, res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
         // Decision endpoints get an additional tighter rate limit
         if (!this.checkRateLimit(req, res, "decisions")) return;
@@ -5596,6 +5799,98 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         "Cache-Control": "no-store",
       });
       res.end(JSON.stringify({ error: "Unlock failed" }));
+    });
+  }
+
+  /**
+   * Fleet control plane PR-B: `POST /api/fleet/activate`. The operator pastes a
+   * license blob in `{ "license": "<paste>" }`; this streams + parses the body,
+   * hands the paste to {@link activateFleetLicense} (verify → persist), and
+   * serializes the plain result. Auth is enforced by the caller (operator bearer
+   * token, `{ requireToken: true }`, fail-closed); this handler carries no key
+   * material and leaks no stack.
+   *
+   * Response shape:
+   *   - 200 `{ ok: true, tier, max_nodes }` on a verified paste (`max_nodes` null
+   *     = unlimited / Team+).
+   *   - 400 `{ ok: false, reason }` on a rejected paste (bad license is a client
+   *     error, never a 500 leak, never a silent grant).
+   *   - 400 `{ error: "validation_error" }` when the `license` field is missing
+   *     or empty; 400 `{ error: "Invalid JSON body" }` on unparseable JSON.
+   *   - 500 `{ error: "internal_error" }` on an unexpected throw (no grant leaked).
+   *
+   * NEVER GATES SECURITY: resolves MANAGEMENT capacity only; touches no wall /
+   * enforcement / local-dashboard / policy-push / kill-safety path.
+   */
+  private handleFleetActivate(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): void {
+    let body = "";
+    let destroyed = false;
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      // Size limit: 16KB is ample for a base64url license token paste.
+      if (body.length > 16384) {
+        destroyed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      if (destroyed) return;
+      let pasted: string;
+      try {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        const license = parsed.license;
+        if (typeof license !== "string" || license.trim().length === 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "validation_error",
+              message: "license is required and must be a non-empty string",
+            }),
+          );
+          return;
+        }
+        pasted = license;
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
+
+      // The handler is contracted to never throw and to fail-closed, but guard
+      // anyway so an unexpected internal error is a 500, never a leaked stack or
+      // a silent grant.
+      try {
+        const result = await this.activateFleetLicense(pasted);
+        if (result.ok) {
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              tier: result.tier,
+              max_nodes: result.max_nodes,
+            }),
+          );
+        } else {
+          // A rejected paste is a 400 client error (bad license), not a server
+          // error. No secret, no stack: just the operator-facing reason.
+          res.writeHead(400, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ ok: false, reason: result.reason }));
+        }
+      } catch {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "internal_error" }));
+      }
     });
   }
 

@@ -1,10 +1,21 @@
 /**
- * Fleet entitlement (S1 scaffold): offline Ed25519 entitlement-token verify
- * and tier resolution, fail-closed to the community tier.
+ * Fleet entitlement: offline Ed25519 entitlement-token verify + tier resolution
+ * (fail-closed to the community tier), the issuer license ledger (PR-1), and the
+ * activation + node-count enforcement gate (PR-B, on the daemon federation
+ * roster).
  *
  * This barrel is the module surface consumers import; do not reach into the
- * internal files. S1 ships the verify/resolve core + tier model only, NOT
- * the full paid fleet control plane (issuance, billing, revocation).
+ * internal files. Layers:
+ *   - verify/resolve core + tier model (`token.ts`, `tier.ts`).
+ *   - issuer license ledger (`ledger.ts`, `ledger-io.ts`, `ledger-antirollback.ts`)
+ *     - the Erik-operated sell side (PR-1).
+ *   - activation + enforcement (`activation.ts`, `fleet-cap.ts`) - the operator
+ *     pastes a license, it is verified + persisted in signed tamper-evident
+ *     state, and the CENTRAL fleet roster (the daemon's durable federation
+ *     roster) enforces the node-count cap. Payment processing / self-serve
+ *     remains out of scope. Enforcement is fail-closed to community on any
+ *     failure and NEVER gates a node's Castle Wall, its local dashboard, kill
+ *     safety, or free policy-push (PR-B).
  */
 
 export {
@@ -72,3 +83,26 @@ export {
   type LedgerGenerationAnchorData,
   type LedgerFreshnessVerdict,
 } from "./ledger-antirollback.js";
+
+export {
+  COMMUNITY_FREE_NODE_CAP,
+  resolveFleetCap,
+  applyFleetCap,
+  type FleetCap,
+  type FleetCapReason,
+  type ResolvedEntitlementView,
+  type CappedFleetRoster,
+} from "./fleet-cap.js";
+
+export {
+  FLEET_ACTIVATION_META_KEY,
+  readFleetActivation,
+  writeFleetActivation,
+  clearFleetActivation,
+  activateFleet,
+  resolveActivation,
+  decodeLicense,
+  decodeIssuerPublicKey,
+  type FleetActivationData,
+  type ActivateFleetResult,
+} from "./activation.js";
