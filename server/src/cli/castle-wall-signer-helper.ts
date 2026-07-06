@@ -20,11 +20,11 @@
  * `castle-wall enable`. This module makes that boot-readiness state explicit,
  * inspectable, and testable:
  *
- *   1. `castle-wall signer-helper status` — reports each precondition
+ *   1. `castle-wall signer-helper status`: reports each precondition
  *      (launchd job visible, XPC answers publicKey, key matches the
  *      root-owned global pin, custody directory is root-owned and not
  *      group/other-writable) and an overall verdict.
- *   2. `assessSignerHelperReadiness` — the pure decision logic behind (1),
+ *   2. `assessSignerHelperReadiness`, the pure decision logic behind (1),
  *      reused by the `enable`/`daemon` (helper-sign mode) preflight gate in
  *      `castle-wall.ts` so a headless arm fails LOUD, with a specific
  *      diagnosis (open the app and approve the Background Item, versus
@@ -99,7 +99,7 @@ export interface SignerHelperReadinessInputs {
   execFileFn: (cmd: string, args: string[]) => ExecResult;
   /**
    * Query the running helper's public key over XPC (via the signer-client
-   * shim). Absent/undefined when no shim is resolvable at all — that alone
+   * shim). Absent/undefined when no shim is resolvable at all; that alone
    * does not fail the check if the launchd job is also absent (the
    * remediation should point at "approve the Background Item" first).
    */
@@ -125,7 +125,7 @@ export function parseLaunchctlPrintForPid(printed: ExecResult): number | null {
 }
 
 function fingerprint(publicKey: Uint8Array): string {
-  // Local, dependency-free fingerprint (first 8 bytes hex) — good enough for a
+  // Local, dependency-free fingerprint (first 8 bytes hex), good enough for a
   // preflight equality check; the CLI's sha256-based fingerprint is used for
   // operator display in `status`/`re-pin`. This module compares full raw bytes
   // (see `bytesEqual`), never the fingerprint, so this helper is display-only.
@@ -407,11 +407,19 @@ export function buildHelperPublicKeyQuery(
  * print each check plus the overall verdict. Exit code 0 when ready, 1
  * otherwise (so a drill harness or `enable` preflight can script off it).
  *
- * The signer-client shim path resolution intentionally mirrors `castle-wall
- * status`'s handling in `castle-wall.ts` (env override, else undefined on a
- * non-darwin platform) rather than importing the private
- * `resolveSignerClientPath` helper, keeping this module independently
- * testable and free of a circular import back into `castle-wall.ts`.
+ * Shim-path resolution here is deliberately env-only (`SANCTUARY_CASTLE_SIGNER_CLIENT`,
+ * or the injected `ctx.signerClientPath`), to keep this module independently
+ * testable and free of a static import back into `castle-wall.ts`. NOTE this is
+ * NARROWER than `castle-wall status` / the `enable`/`daemon` preflight, which
+ * additionally AUTO-DISCOVER the bundled `/Applications` shim via the
+ * security-checked `resolveSignerClientPath`. Consequence: when the operator has
+ * not set the env var, this command cannot reach the helper over XPC, so the
+ * `xpc_reachable` check is SKIPPED and the verdict is NOT-READY (conservative,
+ * never a false READY). Set `SANCTUARY_CASTLE_SIGNER_CLIENT` to the bundled
+ * signer-client shim before running this as a standalone drill check, or rely on
+ * the `enable`/`daemon` preflight, which auto-discovers. Wiring auto-discovery
+ * into this command (share `resolveSignerClientPath` via a small extracted
+ * module) is a tracked follow-up.
  */
 export async function runSignerHelperStatus(
   _argv: string[] = [],

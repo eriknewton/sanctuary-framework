@@ -166,16 +166,18 @@ describe("castle-wall safe-mode daemon (F1 Option C)", () => {
     }
   });
 
-  it("on daemon-start failure, appends a signer-helper boot-readiness diagnosis (design pass 2026-06-26)", async () => {
-    // Boot-readiness preflight: when the safe-mode daemon fails to start in
-    // helper-sign mode, the operator gets a SPECIFIC diagnosis (approve the
-    // Background Item / pin mismatch / repair custody dir), not only the
-    // generic "signer helper is unreachable" line. The preflight diagnosis
-    // shells out to the REAL `launchctl` binary (it is not test-injectable
-    // from this context), which on any machine that has not registered the
-    // signer helper reports the job as not loaded - so the guidance is
-    // expected to point at the Background Item approval on a normal dev/CI
-    // box, which is exactly the case this test exercises.
+  // skipIf(darwin): the diagnosis path in `writeSignerHelperReadinessDiagnosis`
+  // shells out to the REAL `launchctl` (no injectable seam from this context),
+  // so the `/Background Item/` assertion only holds where launchctl reports the
+  // helper as NOT loaded. That is guaranteed on Linux CI (launchctl absent) and
+  // on any host without the signer helper registered, but NOT on a macOS box
+  // where the helper IS loaded (a live pid -> the remediation would instead be
+  // pin/custody/ready). Gating to non-darwin keeps this deterministic and off
+  // the exact reboot-drill Mac where it would spuriously go red. The pure
+  // remediation logic is exhaustively unit-tested (all platforms, injected
+  // seams) in castle-wall-signer-helper.test.ts; this test only asserts that
+  // runSafeModeDaemon WIRES the diagnosis into its start-failure path.
+  it.skipIf(process.platform === "darwin")("on daemon-start failure, appends a signer-helper boot-readiness diagnosis (design pass 2026-06-26)", async () => {
     const fortress = await makeFortress();
     const tok = await makeToken();
     const err = new CaptureStream();

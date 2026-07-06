@@ -53,7 +53,12 @@ After the one-time approval in step 3-5, verify the root signer helper
 survives a reboot with:
 
 ```bash
-sanctuary castle-wall signer-helper status
+# Point it at the bundled signer-client shim so the XPC reachability check can
+# run. Standalone, this command is env-only: without the shim path it reports
+# NOT-READY (xpc check skipped), unlike `enable`/`daemon`, which auto-discover
+# the shim.
+SANCTUARY_CASTLE_SIGNER_CLIENT="/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client" \
+  sanctuary castle-wall signer-helper status
 ```
 
 This is a separate LaunchDaemon from the boot service above (see the

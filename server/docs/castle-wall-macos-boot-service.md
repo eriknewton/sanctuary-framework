@@ -167,10 +167,14 @@ that gap by checking, in order:
 4. **`custody_directory`**: `/Library/Application Support/Sanctuary` is
    root-owned and not group/other-writable.
 
-Run it directly:
+Run it directly (env-only shim resolution: set `SANCTUARY_CASTLE_SIGNER_CLIENT`
+so the `xpc_reachable` check can run; without it this standalone command reports
+NOT-READY with the XPC check skipped, unlike `enable`/`daemon`, which
+auto-discover the bundled shim):
 
 ```bash
-sanctuary castle-wall signer-helper status
+SANCTUARY_CASTLE_SIGNER_CLIENT="/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client" \
+  sanctuary castle-wall signer-helper status
 ```
 
 `enable` and `daemon` (helper-sign mode) also run this preflight internally
