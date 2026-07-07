@@ -335,5 +335,38 @@ describe("castle-wall/provision/rehome", () => {
       expect(restoreResult.steps[0]?.status).toBe("conflict");
       expect(ops.restoreCustodyCalls).toEqual([]);
     });
+
+    it("FIX (round 5, R2-5): a restoreCustody THROW on the conflict branch keeps status 'conflict' + conflictPath (never relabeled 'failed'), folding the custody error into the note", async () => {
+      const singleAdapter: AgentRehomeAdapter = {
+        harnessId: "test-conflict-custody-throw",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.hermes/.env`, destRelativePath: ".hermes/.env", isSecret: true },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const src = `${OPERATOR_HOME}/.hermes/.env`;
+      const conflictPath = `${src}.restored-conflict`;
+      const ops = mockOps(new Set([src]), {
+        restore: async () => ({ restored: false, conflictPath }),
+        restoreCustody: async () => {
+          throw new Error("chown: operation not permitted");
+        },
+      });
+      const plan = planRehome(singleAdapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+
+      const restoreResult = await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
+
+      const step = restoreResult.steps[0];
+      // The custody handback failed, but the step must NOT be relabeled
+      // "failed" (which would DROP conflictPath and lose the "your recreated
+      // file is safe; recovered data is at <path>" guidance). It stays
+      // "conflict" with conflictPath, and the custody error is folded in.
+      expect(step?.status).toBe("conflict");
+      expect(step?.conflictPath).toBe(conflictPath);
+      expect(step?.error).toMatch(/custody handback to the operator failed/);
+      expect(step?.error).toMatch(/chown: operation not permitted/);
+      expect(restoreResult.fullyRestored).toBe(false);
+    });
   });
 });

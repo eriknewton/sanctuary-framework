@@ -1130,94 +1130,99 @@ async function maybeRunAutoProvisionForWrap(
  *     complete.
  *   - armed / skipped-already-dedicated: quiet single-line confirmation.
  */
-function renderAutoProvisionOutcome(summary: AutoProvisionSummary): void {
-  if (!summary.ran || summary.outcome === undefined) return;
+/**
+ * Pure (exported for the seam, fix round-5 R2-2/R2-3): the operator-facing
+ * lines for a `ProvisionFlowOutcome`. Split out from the printer so every
+ * branch -- the silent-vs-loud framing, the non-TTY reason surfacing (R2-3),
+ * and the daemon-still-live loud override (R2-2) -- is unit-testable without
+ * spying on `console`. Returns `[]` when there is nothing to print. The
+ * render being untested is exactly how R2-2/R2-3 survived; this closes that.
+ */
+export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): string[] {
+  if (!summary.ran || summary.outcome === undefined) return [];
   const outcome = summary.outcome;
   switch (outcome.kind) {
     case "armed":
-      // SAFETY: stderr is the operator-facing CLI channel for this
-      // subcommand; this line prints only the outcome kind and the new
-      // account's uid, never secrets or key material.
-      console.error(`  Dedicated agent account provisioned and Castle Wall armed (uid ${outcome.uid}).`);
-      return;
+      return [`  Dedicated agent account provisioned and Castle Wall armed (uid ${outcome.uid}).`];
     case "skipped-already-dedicated":
+      // The orchestrator already printed the "already a verified dedicated
+      // account ..." line via `print` at plan-and-print time; nothing to add.
+      return [];
     case "skipped-non-tty-cooperative-only":
-      // Already printed by the orchestration's own plan-and-print /
-      // reason line via `print`; nothing further to add here.
-      return;
+      // FIX (round 5 / R2-3): the orchestrator printed only the forward-looking
+      // Plan line, NOT this outcome's reason, so the "re-run interactively to
+      // provision the account and arm the wall" guidance was silently dropped.
+      // Surface the reason here.
+      return [`  ${outcome.reason}`];
     case "declined-by-operator":
-      // SAFETY: stderr is the operator-facing CLI channel for this
-      // subcommand; a fixed, safe string with no interpolated data.
-      console.error("  Account provisioning declined; the cooperative wrap above still applies.");
-      return;
+      return ["  Account provisioning declined; the cooperative wrap above still applies."];
     case "armed-then-rolled-back":
-      // SAFETY: stderr is the operator-facing CLI channel for this
-      // subcommand; `outcome.reason` is the orchestrator's own
-      // human-readable, secret-free reason string (endpoint names only).
-      console.error(
+      return [
         `  Note: Castle Wall armed then was fast-disarmed (${outcome.reason}). ` +
           `The agent still runs under its dedicated, re-homed account; only enforcement came down. ` +
           // FIX (round 5, item N5): honest -- the post-arm re-check proves
           // DNS-resolvability + credential readability, not allow-list
           // correctness, so do not tell the operator to "fix the allow-list".
           `Re-run 'sanctuary protect --hermes' once the connectivity re-check passes (see the reason above).`,
-      );
-      return;
+      ];
     case "armed-rollback-failed":
-      // SAFETY: stderr is the operator-facing CLI channel for this
-      // subcommand; `outcome.reason`/`outcome.disarmError` are the
-      // orchestrator's own human-readable, secret-free strings (endpoint
-      // names, disarm error text) -- never secrets or key material.
-      console.error(
+      return [
         `  WARNING: Castle Wall is ARMED (uid ${outcome.uid}) and the automatic rollback FAILED (${outcome.reason}). ` +
           `The disarm attempt itself also failed: ${outcome.disarmError}. ` +
           `The agent may be unreachable behind the wall. Run 'sudo sanctuary castle-wall disable' manually now, ` +
           `then investigate before re-running 'sanctuary protect --hermes'.`,
-      );
-      return;
+      ];
     case "aborted":
-      renderAbortedProvisionOutcome(outcome);
-      return;
+      return abortedProvisionLines(outcome);
   }
 }
 
-function renderAbortedProvisionOutcome(
-  outcome: Extract<ProvisionFlowOutcome, { kind: "aborted" }>,
-): void {
+function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "aborted" }>): string[] {
   const backupNote =
     outcome.backupPaths !== undefined && outcome.backupPaths.length > 0
       ? ` Backup copies remain at: ${outcome.backupPaths.join(", ")}.`
       : "";
+  // FIX (round 5 / R2-2): a failed daemon teardown means a root LaunchDaemon
+  // may STILL BE LIVE regardless of whether the re-home restore succeeded, so
+  // it gets the LOUD frame -- never the soft "Note: ... re-run to retry" line
+  // the rolledBack===true branch below would otherwise emit (which would
+  // directly contradict the manual-recovery note already folded into
+  // `outcome.reason`).
+  if (outcome.daemonTeardownFailed) {
+    return [
+      `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}).` +
+        ` A root harness LaunchDaemon may still be running under the dedicated account.${backupNote}` +
+        ` Do not re-run until you have torn it down (see the note above) and recovered any files.`,
+    ];
+  }
   if (outcome.rolledBack === true) {
-    // SAFETY: stderr is the operator-facing CLI channel for this
-    // subcommand; `outcome.stage`/`outcome.reason` are the orchestrator's
-    // own human-readable, secret-free strings (stage names, endpoint
-    // names) -- never secrets or key material.
-    console.error(
+    return [
       `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
         `Re-homed paths were restored to your account. Re-run 'sanctuary protect --hermes' to retry.`,
-    );
-    return;
+    ];
   }
   if (outcome.rolledBack === "partial") {
-    // SAFETY: stderr is the operator-facing CLI channel for this
-    // subcommand; `backupNote` carries only filesystem paths this process
-    // itself wrote as root-only backups, never secret contents.
-    console.error(
+    return [
       `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
         `Only SOME of your re-homed files were restored; the rest need manual recovery.${backupNote} ` +
         `Do not re-run until you have recovered the remaining files.`,
-    );
-    return;
+    ];
   }
-  // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
-  // `backupNote` carries only filesystem paths this process itself wrote
-  // as root-only backups, never secret contents.
-  console.error(
+  return [
     `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
       `The restore of your re-homed files FAILED; manual recovery is required.${backupNote} ` +
       `Do not re-run until you have recovered your files.`,
-  );
+  ];
+}
+
+function renderAutoProvisionOutcome(summary: AutoProvisionSummary): void {
+  for (const line of renderAutoProvisionOutcomeLines(summary)) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+    // every line comes from renderAutoProvisionOutcomeLines, which interpolates
+    // only outcome metadata (stage / reason / uid / backup paths this process
+    // itself wrote) -- never secrets or key material.
+    console.error(line);
+  }
 }
 
 export interface RunWrapDeps {

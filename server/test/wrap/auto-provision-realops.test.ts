@@ -1035,3 +1035,59 @@ describe("wrap/auto-provision real-ops chokepoint: dscl -search parser (fix roun
     expect(parseDsclSearchAccountNames("    501\n)\n")).toEqual([]);
   });
 });
+
+describe("wrap/auto-provision real-ops chokepoint: round-2 symlink residuals (R2-1 restore, R2-4 probe)", () => {
+  it("FIX R2-1: restore() reverse-moves a re-homed credential that is a (dangling-at-dest) symlink, faithfully restoring the original link (not a plain file), never stranding it", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-r2-1-"));
+    try {
+      const destPath = join(tmpRoot, "dest", "config.yaml");
+      const sourcePath = join(tmpRoot, "source", "config.yaml");
+      await mkdir(join(tmpRoot, "dest"), { recursive: true });
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      // A relative symlink `rename`'d onto the agent home dangles there
+      // (./real.txt does not resolve under dest/). access() FOLLOWS it to
+      // ENOENT and skips the reverse-move; lstat (R2-1 fix) sees the link.
+      await symlink("./real.txt", destPath);
+
+      const result = await realRehomeOps().restore(destPath, sourcePath);
+
+      // The link is faithfully restored to sourcePath as a SYMLINK (not a
+      // plain file from the backup), reported restored:true, and the moved
+      // link is gone from destPath (never stranded under the agent home).
+      expect(result.restored).toBe(true);
+      const st = await lstat(sourcePath);
+      expect(st.isSymbolicLink()).toBe(true);
+      expect(await readlink(sourcePath)).toBe("./real.txt");
+      await expect(lstat(destPath)).rejects.toThrow();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX R2-4: a re-homed credential leaf that is a SYMLINK fails the credential probe -- its secret data did not physically move onto the isolated account", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-r2-4-"));
+    try {
+      const accountHome = join(tmpRoot, "agent-home");
+      const hermesDir = join(accountHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      // The real secret lives OUTSIDE the account home; the "moved" credential
+      // is only a symlink to it (move()'s rename relocated the LINK, not the
+      // data). Even though the link target is readable, the secret is not on
+      // the isolated account, so the probe must fail closed.
+      const elsewhere = join(tmpRoot, "elsewhere.env");
+      await writeFile(elsewhere, "LLM_KEY=abc");
+      await chmod(elsewhere, 0o600);
+      await symlink(elsewhere, join(hermesDir, ".env"));
+
+      const targetUid = process.getuid?.() ?? 0;
+      const targetGid = process.getgid?.() ?? 0;
+      const envTarget = hermesEndpointProbes(accountHome, targetUid, targetGid).find(
+        (t) => t.name.includes("moved credential") && t.name.includes(".hermes/.env"),
+      );
+      expect(envTarget).toBeDefined();
+      expect(await envTarget!.probe()).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});

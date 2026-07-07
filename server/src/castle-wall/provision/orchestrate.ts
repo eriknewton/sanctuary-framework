@@ -132,6 +132,15 @@ export type ProvisionFlowOutcome =
       reason: string;
       rolledBack: boolean | "partial";
       backupPaths?: string[];
+      /**
+       * FIX (round 5 / R2-2): true when a post-install abort could NOT tear
+       * the harness daemon down (a root LaunchDaemon may still be live). The
+       * CLI renderer keys the LOUD warning frame on this independently of
+       * `rolledBack`, so a clean re-home restore (`rolledBack: true`) with a
+       * failed daemon teardown is never softened into a "Note: ... re-run to
+       * retry" line that contradicts its own embedded manual-recovery note.
+       */
+      daemonTeardownFailed?: boolean;
     }
   | { kind: "armed-then-rolled-back"; uid: number; reason: string }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
@@ -282,6 +291,7 @@ export async function runProvisionFlow(
       reason: withDaemonTeardownNote((err as Error).message, td.daemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined,
     };
   }
 
@@ -307,6 +317,7 @@ export async function runProvisionFlow(
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined,
     };
   }
 
@@ -322,6 +333,7 @@ export async function runProvisionFlow(
       reason: withDaemonTeardownNote(existenceCheck.reason, td.daemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined,
     };
   }
 
@@ -338,6 +350,7 @@ export async function runProvisionFlow(
       reason: withDaemonTeardownNote(armResult.error, td.daemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined,
     };
   }
 

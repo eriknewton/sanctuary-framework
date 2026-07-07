@@ -271,7 +271,19 @@ function credentialReadableProbe(
           return false;
         }
       }
-      const st = await stat(path);
+      // FIX (round 5 / R2-4): lstat (no-follow) the leaf and fail closed if
+      // it is a symlink. A re-homed credential must be a REAL file/dir
+      // physically resident on the dedicated account -- if the leaf is a
+      // symlink, `move`'s `rename` relocated only the LINK and the secret
+      // data still lives at the (operator-owned, or now-dangling) target the
+      // agent cannot read. A root `stat` would FOLLOW the link and report the
+      // target's bits, greening verify over a re-home that never actually
+      // moved the secret onto the isolated account. lstat === stat for a real
+      // file/dir, so this only tightens the symlink case.
+      const st = await lstat(path);
+      if (st.isSymbolicLink()) {
+        return false;
+      }
       return credentialReadableAsUidDecision(
         { uid: st.uid, gid: st.gid, mode: st.mode, isDirectory: st.isDirectory() },
         targetUid,
@@ -1237,7 +1249,17 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
      * conflict sibling is never clobbered either.
      */
     restore: async (destPath: string, sourcePath: string): Promise<{ restored: boolean; conflictPath?: string }> => {
-      const destExists = await pathExists(destPath);
+      // FIX (round 5 / R2-1): no-follow. `pathExists` (access) FOLLOWS a
+      // symlink, so a re-homed credential that is a DANGLING symlink at
+      // destPath (a relative dotfile symlink whose target no longer resolves
+      // once `rename`'d onto the agent home) read as "does not exist", the
+      // F2 reverse-move was skipped, the symlink was stranded under the agent
+      // home, and the backup-copy fallback restored a PLAIN FILE over the
+      // operator's original symlink while reporting a clean restore. lstat
+      // (no-follow) sees the moved name so the reverse-move faithfully
+      // restores the original link. round-5(b) converted the sibling/conflict
+      // checks; this destExists check was the one it missed.
+      const destExists = await pathExistsNoFollow(destPath);
       await mkdir(dirname(sourcePath), { recursive: true, mode: 0o700 });
       if (destExists) {
         // FIX (round 5, item b): no-follow check -- a symlink recreated at
@@ -1256,7 +1278,12 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
           return { restored: false, conflictPath };
         }
         await rename(destPath, sourcePath);
-        return { restored: await pathExists(sourcePath) };
+        // FIX (round 5 / R2-1): no-follow. The restore succeeds when a NAME
+        // lands at sourcePath (the reverse-move/copy completed); whether a
+        // restored symlink's target resolves is the operator's home's concern,
+        // not restore's. `pathExists` (follow) would report a faithfully
+        // restored-but-relative symlink as `restored: false`.
+        return { restored: await pathExistsNoFollow(sourcePath) };
       }
       // destPath is already gone (unusual: implies a partial rollback
       // already ran). Fall back to the M4 backup copy, if this path had one.
@@ -1285,7 +1312,12 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
         } else {
           await copyFile(backupPath, sourcePath);
         }
-        return { restored: await pathExists(sourcePath) };
+        // FIX (round 5 / R2-1): no-follow. The restore succeeds when a NAME
+        // lands at sourcePath (the reverse-move/copy completed); whether a
+        // restored symlink's target resolves is the operator's home's concern,
+        // not restore's. `pathExists` (follow) would report a faithfully
+        // restored-but-relative symlink as `restored: false`.
+        return { restored: await pathExistsNoFollow(sourcePath) };
       }
       return { restored: false };
     },

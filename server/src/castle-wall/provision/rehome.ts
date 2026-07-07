@@ -330,15 +330,32 @@ export async function restoreRehomeSteps(
           // `conflictPath`, NOT `sourcePath` -- `sourcePath` holds the
           // operator's already-owned recreated file, which must never be
           // touched) back to the operator for secret entries.
+          //
+          // FIX (round 5 / R2-5): the custody handback runs in its OWN
+          // try/catch. If it were left in the outer try, a handback failure
+          // would fall to the outer catch and relabel this step
+          // "conflict" -> "failed", DROPPING conflictPath -- so the operator
+          // would lose the "your recreated file is safe; recovered data is at
+          // <conflictPath>" guidance over a mere chown failure. Keep status
+          // "conflict" + conflictPath; fold any handback error into the note.
+          let custodyError: string | undefined;
           if (result.entry.isSecret) {
-            await ops.restoreCustody(conflictPath, operatorUidGid.uid, operatorUidGid.gid);
+            try {
+              await ops.restoreCustody(conflictPath, operatorUidGid.uid, operatorUidGid.gid);
+            } catch (custodyErr) {
+              custodyError = (custodyErr as Error).message;
+            }
           }
           steps.push({
             entry: result.entry,
             sourcePath: result.entry.sourcePath,
             status: "conflict",
             conflictPath,
-            error: `source path was recreated during re-home; restored data was placed at ${conflictPath} instead of overwriting it`,
+            error:
+              `source path was recreated during re-home; restored data was placed at ${conflictPath} instead of overwriting it` +
+              (custodyError !== undefined
+                ? ` (custody handback to the operator failed: ${custodyError}; the recovered data at ${conflictPath} may need a manual chown)`
+                : ""),
           });
         } else {
           steps.push({
