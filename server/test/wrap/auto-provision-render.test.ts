@@ -140,4 +140,30 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/^ {2}WARNING:/);
     expect(out[0]).toMatch(/restore of your re-homed files FAILED/);
   });
+
+  it("FIX R4-2: a rehome-stage neutral abort with accountCreated:true does NOT falsely claim 'No dedicated account was created' (an orphaned account exists)", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "rehome",
+        reason: "backup destination not writable",
+        rolledBack: true,
+        rehomeAttempted: false,
+        accountCreated: true,
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/^ {2}Note:/);
+    expect(out[0]).not.toMatch(/No dedicated account was created/);
+    expect(out[0]).toMatch(/The dedicated account was created but no files were moved/);
+  });
+
+  it("FIX R4-2: a pre-create neutral abort (accountCreated falsy) DOES say 'No dedicated account was created'", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "aborted", stage: "root-check", reason: "requires root", rolledBack: false, rehomeAttempted: false },
+    });
+    expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
+  });
 });

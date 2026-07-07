@@ -1152,4 +1152,26 @@ describe("wrap/auto-provision real-ops chokepoint: backup() shape handling (fix 
       await rm(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it("FIX R4-1: backup() of a SYMLINK secret is IDEMPOTENT across retries (a leftover .bak from a prior aborted run does not EEXIST-abort the retry)", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-backup-symlink-idem-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const realDir = join(tmpRoot, "real");
+      await mkdir(realDir, { recursive: true });
+      const linkSrc = join(tmpRoot, "link-creds");
+      await symlink(realDir, linkSrc);
+
+      const ops = realRehomeOps({ backupRoot });
+      const first = await ops.backup(linkSrc);
+      // Second backup (the "re-run to retry" path) must NOT reject with EEXIST
+      // -- the file/dir branches overwrite silently; the symlink branch now
+      // removes any stale .bak before re-linking.
+      const second = await ops.backup(linkSrc);
+      expect(second.backupPath).toBe(first.backupPath);
+      expect((await lstat(second.backupPath)).isSymbolicLink()).toBe(true);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });

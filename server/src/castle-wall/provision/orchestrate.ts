@@ -154,6 +154,16 @@ export type ProvisionFlowOutcome =
        * framing) for backward compatibility.
        */
       rehomeAttempted?: boolean;
+      /**
+       * FIX (round 5 / R4-2): true when THIS run created the dedicated account
+       * before aborting (create-account succeeded, then a later stage failed --
+       * e.g. re-home threw before moving anything). The neutral "nothing was
+       * changed" render frame keys on this so it never falsely claims "No
+       * dedicated account was created" while an orphaned hidden account exists.
+       * `rehomeAttempted` only tracks whether a MOVE happened, which is the
+       * wrong signal for the account's existence.
+       */
+      accountCreated?: boolean;
     }
   | { kind: "armed-then-rolled-back"; uid: number; reason: string }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
@@ -172,6 +182,12 @@ export async function runProvisionFlow(
   // below. Empty when `alreadyDedicated` skipped create + re-home (fix F6:
   // there is nothing to restore in that path, since neither step ran).
   let rehomeResults: RehomeStepResult[] = [];
+  // FIX (round 5 / R4-2): true once THIS run's create-account succeeds, so an
+  // abort at a later stage can tell the operator an orphaned hidden account
+  // exists rather than falsely claiming "no account was created". Stays false
+  // on the alreadyDedicated path (the account pre-existed; we did not create
+  // it) and for every pre-create abort.
+  let accountCreated = false;
 
   // FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): `alreadyDedicated`
   // used to short-circuit straight to "done" -- reporting "already a
@@ -251,6 +267,7 @@ export async function runProvisionFlow(
     try {
       const created = await ops.createAccount();
       uid = created.uid;
+      accountCreated = true;
       ops.print(`Account "${ctx.accountName}" ready at uid ${uid}.`);
     } catch (err) {
       return {
@@ -294,6 +311,10 @@ export async function runProvisionFlow(
         // an empty-partialResults rehome throw moved nothing, so the CLI
         // shows the neutral "nothing changed" frame, not a restore claim.
         rehomeAttempted: partialResults.length > 0,
+        // FIX (round 5 / R4-2): create-account already succeeded by the time
+        // re-home runs, so an orphaned hidden account exists even when nothing
+        // moved -- the neutral frame must not claim "no account was created".
+        accountCreated,
       };
     }
   }
@@ -317,6 +338,7 @@ export async function runProvisionFlow(
       backupPaths: td.backupPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.length > 0,
+      accountCreated,
     };
   }
 
@@ -344,6 +366,7 @@ export async function runProvisionFlow(
       backupPaths: td.backupPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.length > 0,
+      accountCreated,
     };
   }
 
@@ -361,6 +384,7 @@ export async function runProvisionFlow(
       backupPaths: td.backupPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.length > 0,
+      accountCreated,
     };
   }
 
@@ -379,6 +403,7 @@ export async function runProvisionFlow(
       backupPaths: td.backupPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.length > 0,
+      accountCreated,
     };
   }
 

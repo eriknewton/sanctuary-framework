@@ -1202,9 +1202,17 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
   // the `rolledBack === false` branch below would otherwise print. This is the
   // common no-sudo first attempt (stage "root-check").
   if (outcome.rehomeAttempted === false) {
+    // FIX (round 5 / R4-2): key the account clause on `accountCreated`, not on
+    // `rehomeAttempted` (which only tracks whether a MOVE happened). At the
+    // rehome stage create-account has already succeeded, so an orphaned hidden
+    // account exists even though nothing moved -- claiming "no account was
+    // created" there would be a false all-clear.
+    const accountClause = outcome.accountCreated
+      ? `The dedicated account was created but no files were moved (it will be reused on the next run).`
+      : `No dedicated account was created and nothing was moved.`;
     return [
       `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
-        `No dedicated account was created and nothing was moved; the cooperative wrap above still applies. ` +
+        `${accountClause} The cooperative wrap above still applies. ` +
         `Re-run 'sanctuary protect --hermes' once the cause above is resolved.`,
     ];
   }

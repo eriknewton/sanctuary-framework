@@ -29,7 +29,7 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, stat, lstat, readlink, symlink, cp } from "node:fs/promises";
+import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, stat, lstat, readlink, symlink, rm, cp } from "node:fs/promises";
 import { dirname, relative, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
@@ -1208,6 +1208,15 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
         // original link on abort (R2-1), so this backup only needs to restore
         // the link if destPath is ever gone. No chmod: a symlink's own mode is
         // irrelevant and must never be dereferenced.
+        //
+        // FIX (round 5 / R4-1): idempotent write. `symlink()` has no overwrite
+        // option and throws EEXIST if a `.bak` from a prior aborted run is
+        // still present (the file/dir branches below overwrite silently via
+        // copyFile/cp), which would break the advertised "re-run to retry"
+        // recovery loop for symlink-shaped secrets. The backup is always
+        // re-derived from the current source (which must exist for backup to
+        // run), so removing a stale prior backup first is safe.
+        await rm(backupPath, { force: true, recursive: true });
         await symlink(await readlink(path), backupPath);
       } else if (st.isDirectory()) {
         // FIX F2 (2026-07-07 fix-round): the M4 custody copy for a
