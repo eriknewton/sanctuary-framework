@@ -53,6 +53,7 @@ import {
   planAgentHarnessDaemonInstall,
   installAgentHarnessDaemon,
   uninstallAgentHarnessDaemon,
+  agentHarnessDaemonStatus,
   type HarnessDaemonOps,
 } from "../egress-gate/harness-daemon.js";
 
@@ -482,6 +483,21 @@ export function hermesEndpointProbes(
       probe: credentialReadableProbe(`${newAccountHome}/${destRelativePath}`, targetUid, targetGid, traverseFrom),
     });
   }
+  // FIX (round 5 / R7-2): a FRESH provision that re-homed ZERO secrets (an
+  // EXPLICIT empty moved-set -- distinct from `undefined`, the alreadyDedicated
+  // path that falls back to the full adapter set above) must NOT arm with a
+  // vacuous credential gate. The R6-5 `?? full` fallback does not catch this,
+  // because `[] ?? full` is `[]` (an empty array is not nullish), so the loop
+  // above would add zero credential probes and verify would pass on the DNS
+  // probes alone -- arming over an agent with no secrets to confine. Push a
+  // synthetic fail-closed probe so verify aborts instead (a Hermes install
+  // with none of its secret files present is not a valid armed state).
+  if (credentialDestPaths !== undefined && credentialDestPaths.length === 0) {
+    targets.push({
+      name: "no credential was re-homed onto the account (nothing to confine)",
+      probe: async () => false,
+    });
+  }
   return targets;
 }
 
@@ -894,7 +910,14 @@ export async function runAutoProvisionForWrap(
         programArguments: resolved.programArguments,
         fortressPath: process.env.SANCTUARY_STORAGE_PATH,
       });
-      await installAgentHarnessDaemon(plan, realHarnessDaemonOps());
+      // FIX (round 5 / R7-1): report whether THIS run actually stood the daemon
+      // up (vs found it already loaded), so the orchestrator tears down on
+      // abort iff we bootstrapped it -- never keying on `alreadyDedicated`
+      // (which does not track daemon presence). Check status BEFORE installing.
+      const daemonOps = realHarnessDaemonOps();
+      const before = await agentHarnessDaemonStatus(daemonOps);
+      await installAgentHarnessDaemon(plan, daemonOps);
+      return { bootstrappedThisRun: !before.installed };
     },
     // FIX (round 5, item N3): tear the harness daemon back down on a
     // post-install abort. `installHarnessDaemon` bootstraps a LIVE root

@@ -1261,4 +1261,13 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
     const credTargets = targets.filter((t) => t.name.includes("moved credential"));
     expect(credTargets).toHaveLength(6);
   });
+
+  it("FIX R7-2: a FRESH provision that re-homed ZERO secrets (explicit empty moved-set []) adds a synthetic FAIL-CLOSED probe, so verify aborts instead of arming with a vacuous credential gate", async () => {
+    const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502, []);
+    // No per-credential probes (nothing moved), but a synthetic guard probe.
+    expect(targets.filter((t) => t.name.includes("moved credential"))).toHaveLength(0);
+    const guard = targets.find((t) => t.name.includes("nothing to confine"));
+    expect(guard).toBeDefined();
+    expect(await guard!.probe()).toBe(false);
+  });
 });

@@ -64,8 +64,19 @@ export interface ProvisionFlowOps {
   createAccount(): Promise<{ plan: AccountProvisionPlan; uid: number }>;
   /** Build + execute the re-home plan. Returns per-step results (for rollback). */
   rehome(uid: number, gid: number): Promise<{ plan: RehomePlan; results: RehomeStepResult[] }>;
-  /** Install the harness daemon for the given uid. */
-  installHarnessDaemon(uid: number): Promise<void>;
+  /**
+   * Install the harness daemon for the given uid. Returns whether THIS run
+   * actually bootstrapped a NEW daemon (vs found one already loaded).
+   *
+   * FIX (round 5 / R7-1): the teardown-on-abort decision (N3/R6-3) must key on
+   * "did this run stand the daemon up", NOT on `alreadyDedicated`.
+   * `alreadyDedicated` is set from the ACCOUNT shape (name/IsHidden/shell), not
+   * daemon presence, so a re-run after a prior account-created-but-
+   * daemon-install-failed provision installs a FRESH daemon on the
+   * alreadyDedicated path -- and gating teardown on `!alreadyDedicated` would
+   * strand it. `bootstrappedThisRun` is the honest signal.
+   */
+  installHarnessDaemon(uid: number): Promise<{ bootstrappedThisRun: boolean }>;
   /**
    * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
    * bootstraps a LIVE root LaunchDaemon; every post-install abort branch
@@ -220,6 +231,15 @@ export async function runProvisionFlow(
   // on the alreadyDedicated path (the account pre-existed; we did not create
   // it) and for every pre-create abort.
   let accountCreated = false;
+  // FIX (round 5 / R7-1): true once THIS run actually bootstrapped a NEW
+  // harness daemon (install returned bootstrappedThisRun). The post-install
+  // abort branches tear the daemon down iff this is set -- never key on
+  // `alreadyDedicated` (which does not track daemon presence), so a fresh
+  // daemon installed on the alreadyDedicated re-run path is not stranded, and
+  // a genuinely pre-existing daemon is never booted out. (No initializer: the
+  // install-daemon try assigns it and the catch returns, so every later read
+  // is definitely-assigned; a dead `= false` initializer trips no-useless-assignment.)
+  let daemonBootstrappedThisRun: boolean;
 
   // FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): `alreadyDedicated`
   // used to short-circuit straight to "done" -- reporting "already a
@@ -357,12 +377,16 @@ export async function runProvisionFlow(
   // NOT yet armed. A failure here means we already moved secrets -- restore
   // them before reporting the abort (never leave a half-provisioned agent).
   try {
-    await ops.installHarnessDaemon(uid);
+    const install = await ops.installHarnessDaemon(uid);
+    daemonBootstrappedThisRun = install.bootstrappedThisRun;
     ops.print("Harness daemon installed; agent now runs under the dedicated account.");
   } catch (err) {
     // FIX (round 5, item N3): the install may have partially bootstrapped the
     // daemon before throwing; tear it back down (idempotent) before restoring
-    // the re-home, so an abort never leaves a live daemon behind.
+    // the re-home, so an abort never leaves a live daemon behind. The throw
+    // gives us no bootstrappedThisRun signal, so fall back to the
+    // !alreadyDedicated heuristic: a fresh install attempt is cleaned up; a
+    // re-bootstrap that threw over a pre-existing daemon leaves it in place.
     const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
     return {
       kind: "aborted",
@@ -390,7 +414,7 @@ export async function runProvisionFlow(
     // succeeded above); tear it down before restoring the re-home so this
     // fail-closed abort does not leave the daemon running under the dedicated
     // account.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun);
     return {
       kind: "aborted",
       stage: "verify-before-arm",
@@ -401,7 +425,7 @@ export async function runProvisionFlow(
         // it does NOT run as the agent uid or prove end-to-end reachability, so
         // "re-homed agent could not reach" overclaimed.
         `pre-arm check could not confirm DNS-resolvability + moved-credential readability for: ${unreachable.join(", ")}. ` +
-          describeRestoreForReason(td.rolledBack),
+          describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
         td.daemonTeardownError,
       ),
       rolledBack: td.rolledBack,
@@ -419,7 +443,7 @@ export async function runProvisionFlow(
   const existenceCheck = await ops.checkUidExistence(uid);
   if (!existenceCheck.ok) {
     // FIX (round 5, item N3): daemon is live; tear it down on this abort.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun);
     return {
       kind: "aborted",
       stage: "uid-existence-gate",
@@ -440,7 +464,7 @@ export async function runProvisionFlow(
     // FIX (round 5, item N3): arming failed but the daemon is live; tear it
     // down on this abort (the wall never armed, so there is nothing to
     // disarm -- only the daemon to remove).
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun);
     return {
       kind: "aborted",
       stage: "arm",
@@ -506,7 +530,20 @@ export async function runProvisionFlow(
   return { kind: "armed", uid };
 }
 
-function describeRestoreForReason(rolledBack: boolean | "partial"): string {
+function describeRestoreForReason(
+  rolledBack: boolean | "partial",
+  conflictPaths: string[] = [],
+  failedPaths: string[] = [],
+): string {
+  // FIX (round 5 / R7-3): a conflict-only restore is NOT a failure (the R5-2
+  // conflict-safe render). `rolledBack` alone is `false` for a pure conflict
+  // (restoredCount 0), so without conflict-awareness this said "The restore
+  // FAILED ..." inside the abort reason -- directly contradicting the CLI's
+  // conflict-safe frame. When conflicts occurred with NO genuine failure, say
+  // so honestly and never claim a failure.
+  if (conflictPaths.length > 0 && failedPaths.length === 0) {
+    return "Files you recreated during provisioning were left intact; the previously re-homed copy is preserved at a .restored-conflict sibling (reconcile manually; do not overwrite from the backup).";
+  }
   if (rolledBack === true) return "The re-homed paths were restored to the operator.";
   if (rolledBack === "partial") {
     return "Only SOME re-homed paths were restored; the rest require manual recovery (see the backup path(s) above).";

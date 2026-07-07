@@ -59,7 +59,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
       results: REHOME_RESULTS,
     })),
-    installHarnessDaemon: vi.fn(async () => undefined),
+    installHarnessDaemon: vi.fn(async () => ({ bootstrappedThisRun: true })),
     uninstallHarnessDaemon: vi.fn(async () => undefined),
     preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
     checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: AGENT_UID })),
@@ -257,6 +257,7 @@ describe("castle-wall/provision/orchestrate", () => {
     const ops = happyPathOps({
       installHarnessDaemon: vi.fn(async () => {
         callOrder.push("install-daemon");
+        return { bootstrappedThisRun: true };
       }),
       preArmEndpoints: vi.fn(() => {
         callOrder.push("pre-arm-verify");
@@ -505,15 +506,30 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(result).toMatchObject({ kind: "aborted", stage: "uid-existence-gate", rehomeAttempted: false });
   });
 
-  it("FIX (round 5, R6-3): an alreadyDedicated re-run abort does NOT tear down the PRE-EXISTING harness daemon (booting it out over a transient failure would destroy working infrastructure)", async () => {
+  it("FIX (round 5, R6-3): an abort does NOT tear down a daemon that GENUINELY PRE-EXISTED (installHarnessDaemon reports bootstrappedThisRun:false) -- booting out working infrastructure over a transient failure would be destructive", async () => {
     const ops = happyPathOps({
+      // The daemon was already loaded -> this run bootstrapped nothing.
+      installHarnessDaemon: vi.fn(async () => ({ bootstrappedThisRun: false })),
       preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
     });
     const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
     expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm" });
     expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
-    // Contrast: the existing N3 test proves a FRESH-provision abort DOES tear
-    // the daemon down (this run stood it up).
+  });
+
+  it("FIX (round 5, R7-1): an alreadyDedicated abort DOES tear the daemon down when THIS RUN bootstrapped it (bootstrappedThisRun:true) -- a fresh daemon on the alreadyDedicated path must not be stranded", async () => {
+    const ops = happyPathOps({
+      // alreadyDedicated (account shape verified) but the daemon did NOT
+      // pre-exist -- this run stood it up (e.g. a prior run created the account
+      // then failed at install-daemon; account persists, daemon did not).
+      installHarnessDaemon: vi.fn(async () => ({ bootstrappedThisRun: true })),
+      preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+    });
+    const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm" });
+    // The freshly-installed daemon MUST be torn down (not stranded with a
+    // false "nothing was changed" all-clear).
+    expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
   });
 
   it("FIX (round 5, R6-4): the verify-before-arm abort reason is honest (no 're-homed agent could not reach' overclaim -- matches the post-arm phrasing)", async () => {
@@ -525,5 +541,35 @@ describe("castle-wall/provision/orchestrate", () => {
     const reason = (result as { reason: string }).reason;
     expect(reason).not.toMatch(/re-homed agent could not reach/);
     expect(reason).toMatch(/pre-arm check could not confirm DNS-resolvability/);
+  });
+
+  it("FIX (round 5, R7-2): a fresh provision that re-homed ZERO secrets fails the pre-arm verify (the synthetic guard probe), never arming with a vacuous credential gate", async () => {
+    // Real probe wiring is exercised by the realops seam; here drive the
+    // orchestrator with an empty pre-arm list shape via a false guard probe to
+    // confirm the flow aborts at verify-before-arm rather than arming.
+    const ops = happyPathOps({
+      preArmEndpoints: vi.fn(() => [{ name: "no credential was re-homed onto the account (nothing to confine)", probe: async () => false }]),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm" });
+    expect(ops.arm).not.toHaveBeenCalled();
+  });
+
+  it("FIX (round 5, R7-3): a verify-before-arm abort whose restore hit a CONFLICT-only outcome does NOT say 'restore FAILED' in its reason (matches the R5-2 conflict-safe render)", async () => {
+    const ops = happyPathOps({
+      preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+      restoreRehome: vi.fn(async () => ({
+        fullyRestored: false,
+        restoredCount: 0,
+        attemptedCount: 1,
+        backupPaths: ["/root/backup/.hermes/.env.bak"],
+        conflictPaths: ["/Users/op/.hermes/.env.restored-conflict"],
+        failedPaths: [],
+      })),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    const reason = (result as { reason: string }).reason;
+    expect(reason).not.toMatch(/restore FAILED/);
+    expect(reason).toMatch(/left intact|reconcile/i);
   });
 });
