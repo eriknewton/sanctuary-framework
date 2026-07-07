@@ -98,6 +98,16 @@ export interface StandaloneDashboardOptions {
   passphrase?: string;
   port?: number;
   host?: string;
+  /**
+   * TEST-ONLY. Bind port for the HABEAS local distress listener (127.0.0.1:8741
+   * in production). Production callers leave this undefined so the listener
+   * takes the fixed reserved port. Tests pass `0` so every parallel dashboard
+   * instance gets its own ephemeral distress port and no two contend on the
+   * fixed 8741 under parallel-suite load. Unlike the dashboard HTTP `port`, the
+   * distress port is never baked into a URL, so an ephemeral bind is fully
+   * transparent to the systems under test.
+   */
+  distressPort?: number;
   configPath?: string;
   /**
    * Resolve a tenant by the human-readable name printed by `sanctuary agents`
@@ -1176,6 +1186,9 @@ async function wireUnlockedDeps(args: {
       auditLog,
       localSecret,
       identityId: fortressIdFromStoragePath(config.storage_path),
+      // undefined in production → the listener binds the fixed HABEAS port
+      // (8741). Tests pass 0 for an ephemeral, contention-free bind.
+      port: options.distressPort,
     });
     await distressListener.start();
   } catch (err) {

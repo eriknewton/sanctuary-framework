@@ -69,7 +69,7 @@ async function startOnFreePort(
 ): Promise<{ dashboard: DashboardApprovalChannel; port: number }> {
   return bindWithRetry(async () => {
     const port = randomTestPort();
-    const dashboard = await startStandaloneDashboard({ ...options, port });
+    const dashboard = await startStandaloneDashboard({ distressPort: 0, ...options, port });
     return { dashboard, port };
   });
 }

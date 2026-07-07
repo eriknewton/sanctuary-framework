@@ -41,6 +41,8 @@ async function startDashboardOnFreePort(
       // target (SANCTUARY_RECOVERY_OUT, set per-test) so the gate is satisfied
       // deterministically. Individual tests may still override noConfirm.
       noConfirm: true,
+      // Ephemeral distress port so parallel dashboards never contend on 8741.
+      distressPort: 0,
       ...options,
       discoveryOptions: options.discoveryOptions ?? isolatedDiscoveryOptions,
       port,
@@ -136,6 +138,7 @@ describe("Standalone Dashboard", () => {
         passphrase: "test-passphrase-remote-refuse",
         host: "0.0.0.0",
         port: randomTestPort(),
+        distressPort: 0,
         noConfirm: true,
         discoveryOptions: isolatedDiscoveryOptions,
       })
@@ -278,6 +281,7 @@ describe("Standalone Dashboard", () => {
       dashboard2 = await startStandaloneDashboard({
         port: randomTestPort(),
         host: "127.0.0.1",
+        distressPort: 0,
         discoveryOptions: isolatedDiscoveryOptions,
       });
       // If we get here, clean up and fail
