@@ -58,7 +58,7 @@ export interface OperatorAuditSummary {
   entries: Array<{
     timestamp: string;
     operation: string;
-    result: "success" | "failure";
+    result: "success" | "failure" | "pending";
     details?: Record<string, unknown>;
   }>;
   total: number;

@@ -149,7 +149,12 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
 
   // ---- file-grant (Governed File-Grant v1, 2026-07-07) ----
   "file-grant mint":   { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in mintFileGrant (success and rolled-back-failure paths); reconciles expired grants on this touch" },
-  "file-grant list":   { classification: "read-only", notes: "read-only projection; emits a file_grant_list access audit (Tier-3 auto-allow + audit, recordFileGrantListAudit)" },
+  // R3-2: `list` was misclassified as read-only. `cmdList` calls
+  // `reconcileFileGrantTree` before listing -- a safe-direction MUTATOR side
+  // effect (scrubs expired tree entries, flips expired status, emits
+  // `file_grant_revoke`/`expired_ttl_scrub` audits) -- so it is not purely a
+  // read. It also still emits its own `file_grant_list` access audit.
+  "file-grant list":   { classification: "mutator", auditOverride: true, notes: "safe-direction mutator: calls reconcileFileGrantTree before listing (scrubs expired tree entries, flips expired status, emits file_grant_revoke/expired_ttl_scrub audits); also emits its own file_grant_list access audit (Tier-3 auto-allow + audit, recordFileGrantListAudit)" },
   "file-grant revoke": { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in revokeFileGrant (success, not-found, and scrub-failure paths); reconciles expired grants on this touch" },
 
   // ---- intelligence ----
@@ -275,6 +280,14 @@ function extractSubcommands(filePath: string, content: string, parentCommand: st
     if (["keychain", "fallback-file", "not-initialized"].includes(verb)) continue;
     if (["openclaw", "hermes", "claude-code", "cursor", "cline", "generic"].includes(verb) &&
         parentCommand === "wrap") continue;
+    // R3-2: this scanner is a line-scanner, not a parser -- it matches every
+    // `case "..."` in the file, not only the ones in the top-level dispatcher
+    // switch. `cli/file-grant.ts`'s `enforcementLine()` helper has its own
+    // nested `switch (enforcement)` with these three case labels; they are
+    // NOT CLI subcommands, so skip them for this parent command specifically
+    // (narrow, file-grant-scoped -- does not touch extraction for any other
+    // CLI surface).
+    if (["met", "unmet", "unverified"].includes(verb) && parentCommand === "file-grant") continue;
     // Skip nested leaf verbs - they'll be added via nestedToAdd
     if (nestedSkip?.has(verb)) continue;
 

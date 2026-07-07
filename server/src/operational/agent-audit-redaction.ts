@@ -58,7 +58,12 @@ export const AGENT_AUDIT_VIEW_FIELDS = [
 export interface AgentAuditView {
   timestamp: string;
   operation: string;
-  result: "success" | "failure";
+  /**
+   * `"pending"` is a durable, pre-access audit state (currently only the
+   * governed file-grant mint's pre-placement audit) -- honest to expose as-is
+   * since it reveals only literal completion state, no policy internals.
+   */
+  result: "success" | "failure" | "pending";
   has_details: boolean;
 }
 

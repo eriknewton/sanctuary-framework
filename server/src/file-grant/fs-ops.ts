@@ -39,7 +39,6 @@
  */
 
 import { mkdir, lstat, readFile, realpath as fsRealpath, rm, stat, symlink } from "node:fs/promises";
-import { chownSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import type { FsOps } from "./types.js";
@@ -102,41 +101,23 @@ export class PosixFileGrantFsOps implements FsOps {
     const agentSubdir = dirname(dest);
     await mkdir(agentSubdir, { recursive: true, mode: AGENT_SUBDIR_MODE });
 
-    // Best-effort restrict the per-agent subdirectory to the dedicated agent
-    // uid when one is configured and distinct from the running PROCESS uid
-    // (this is chown MECHANICS -- "does this process need to hand the subdir
-    // to another uid" -- not the enforcement-honesty check, which lives in
-    // `mint.ts` and compares the agent uid to the SOURCE file's owner).
-    //
-    // Handing the subdir to a DIFFERENT uid needs privilege (root / CAP_CHOWN).
-    // A NON-root operator mint would otherwise EPERM here and roll the whole
-    // grant back (R2-5) -- which is wrong: v1 must still RECORD the grant + place
-    // the symlink on a real uid-split box even when it cannot apply the
-    // ownership primitive. The enforcement label is already the honest
-    // `unverified` ("configured; primitive not applied", build spec section 10),
-    // never `met`, so skipping the chown does not overclaim. So PRIVILEGE-GATE
-    // it: attempt the chown only when running as root, and even then treat an
-    // EPERM (restricted container / userns without CAP_CHOWN) as "primitive not
-    // applied" rather than a fatal mint failure. Any OTHER chown error is
-    // unexpected and stays fatal (fail-closed), as do all other `place` errors
-    // (mkdir / symlink).
-    const originPath = agentOriginDescriptorPath(this.fortressPath);
-    const agentUid = await this.readConfiguredAgentUid(originPath);
-    const processUid = process.getuid?.() ?? null;
-    if (
-      agentUid !== null &&
-      processUid !== null &&
-      agentUid !== processUid &&
-      processUid === 0
-    ) {
-      try {
-        chownSync(agentSubdir, agentUid, -1);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code !== "EPERM") throw err;
-        // EPERM even as root: primitive not applied; the honest `unverified`
-        // enforcement label already reflects that, so do not fail the mint.
-      }
-    }
+    // R3-3: v1 NEVER cross-uid chowns the per-agent subdirectory. Earlier
+    // drafts attempted a best-effort root-only chown of `agentSubdir` to the
+    // dedicated agent uid, but v1 never applies the functional cross-uid read
+    // primitive anyway (enforcement always reports the honest `unverified`
+    // until the deferred acceptance drill actually wires up the real ACL /
+    // ownership primitive + an on-hardware read-verification probe -- see the
+    // module doc comment above), so the chown accomplished nothing useful in
+    // v1 while creating a REAL operational cost: it left the subdir owned by
+    // the agent uid, mode 0700, which then blocks a non-root operator
+    // `revoke`/reconcile-scrub from unlinking the entry (EACCES) and forces
+    // root just to remove a v1 grant that was never functionally enforced in
+    // the first place. `place()` now leaves `agentSubdir` operator-owned (the
+    // process uid, from `mkdir` above) and places a plain symlink into it. The
+    // deferred drill-build is what applies the real ACL/ownership primitive
+    // AND the read-verification probe that flips enforcement to `met`; that
+    // build owns re-introducing any ownership change, gated behind the
+    // verification that makes it honest.
 
     // Remove a stale entry at the same path before re-linking (mint always
     // allocates a fresh grant_id, so collisions are not expected in normal

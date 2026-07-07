@@ -21,22 +21,30 @@
  *      (tombstone on remove failure) exactly like step 6, writes a best-effort
  *      failure audit, and throws `FileGrantMintFailedError`. No phantom active
  *      grant survives a put()-throw.
- *   5b. DURABLE pre-placement audit. Access must never be live without a
- *      preceding audit entry (Invariant #5 + audit-write-completeness), so the
- *      authoritative mint audit is written HERE, before `place`, and is NOT
- *      best-effort: if it throws, `place` has not run (no access exists), so the
- *      record is rolled back and the mint fails closed.
+ *   5b. DURABLE pre-placement audit, `result: "pending"`. Access must never be
+ *      live without a preceding audit entry (Invariant #5 + audit-write-
+ *      completeness), so the authoritative mint audit is written HERE, before
+ *      `place`, and is NOT best-effort: if it throws, `place` has not run (no
+ *      access exists), so the record is rolled back and the mint fails closed.
+ *      It is recorded as `"pending"`, not `"success"`, because `place` has not
+ *      yet run: a consumer filtering `operation:"file_grant", result:"success"`
+ *      must only ever count CONFIRMED-live grants (R3-1), so this entry alone
+ *      must never read as a completed success.
  *   6. Place the tree entry (`fsOps.place`) -- the LAST fallible, access-
  *      conferring step. If it throws: scrub any partial entry, roll back the
  *      persisted record under a GUARDED remove (on remove failure persist a
  *      terminal `revoked` tombstone so no dangling `active` survives), write a
- *      best-effort failure audit, and throw `FileGrantMintFailedError`. So a
- *      failed mint leaves NO active grant AND NO tree entry (Invariant #5c).
+ *      best-effort `"failure"` audit, and throw `FileGrantMintFailedError`. So a
+ *      failed mint leaves NO active grant, NO tree entry (Invariant #5c), and
+ *      NO final `result:"success"` file_grant audit -- only `"pending"` then
+ *      `"failure"`.
  *   7. Once `place` has succeeded, access is LIVE and already durably audited
- *      (step 5b). The only remaining step is a BEST-EFFORT post-place
- *      confirmation audit: a throw there is swallowed, it must NEVER roll a live
- *      grant back and report failure (the fail-OPEN + false-rollback bug this
- *      ordering exists to prevent), and the grant is never left unaudited.
+ *      (step 5b, `"pending"`). The only remaining step is a BEST-EFFORT
+ *      post-place confirmation audit with `result: "success"`: a throw there is
+ *      swallowed, it must NEVER roll a live grant back and report failure (the
+ *      fail-OPEN + false-rollback bug this ordering exists to prevent), and the
+ *      grant is never left unaudited. A successful mint thus yields the
+ *      `"pending"` -> `"success"` sequence for `file_grant`.
  *
  * The `enforcement` verdict is honest: it is `met` only when a distinct agent
  * uid's read access has actually been verified; a bare uid split reports
@@ -282,6 +290,15 @@ async function rollbackGrantRecord(
  * throw here PROPAGATES so mint (step 5b) can roll back and fail closed --
  * access is never conferred without this audit having been written. A missing
  * `auditLog` (unit tests with no audit wiring) is a no-op.
+ *
+ * `result` is `"pending"`, not `"success"`: at this point `place()` has not
+ * yet run, so the grant is durably audited but NOT yet confirmed live. If
+ * `place()` subsequently fails, the mint rolls back and writes a `"failure"`
+ * audit (step 6) -- it never leaves behind a `"success"`-shaped entry for a
+ * grant that never went live. Only the POST-place confirmation (step 7) ever
+ * writes `result: "success"` for `file_grant`, so a consumer filtering
+ * `operation:"file_grant", result:"success"` counts only CONFIRMED-live
+ * grants (R3-1).
  */
 async function durableMintAudit(
   auditLog: AuditLog | undefined,
@@ -292,7 +309,7 @@ async function durableMintAudit(
     layer: "l1",
     operation: "file_grant",
     identity_id: entry.identity_id,
-    result: "success",
+    result: "pending",
     details: entry.details,
   });
 }

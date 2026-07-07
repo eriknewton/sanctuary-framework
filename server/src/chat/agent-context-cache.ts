@@ -326,7 +326,7 @@ interface BuildSnapshotInputs {
   recentEntries: ReadonlyArray<{
     timestamp: string;
     operation: string;
-    result: "success" | "failure";
+    result: "success" | "failure" | "pending";
     details?: Record<string, unknown>;
   }>;
   nowMs: number;
@@ -434,7 +434,7 @@ function deriveCurrentWorkSummary(
     | {
         timestamp: string;
         operation: string;
-        result: "success" | "failure";
+        result: "success" | "failure" | "pending";
       }
     | undefined,
 ): string | null {

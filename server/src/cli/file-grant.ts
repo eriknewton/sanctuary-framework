@@ -554,23 +554,34 @@ async function cmdRevoke(
     reconciledBy: boot.primary.identity_id,
   });
 
-  const result = await revokeFileGrant(grantId, boot.primary.identity_id, {
-    fsOps: boot.fsOps,
-    store: boot.grantStore,
-    now: new Date(),
-    auditLog: boot.auditLog,
-  });
+  // R3-3: mirror cmdMint's try/catch so a revokeFileGrant error (e.g. a
+  // scrub/removeEntry failure) surfaces as a clean operator-facing message
+  // and a non-zero exit, not an unhandled stack trace.
+  try {
+    const result = await revokeFileGrant(grantId, boot.primary.identity_id, {
+      fsOps: boot.fsOps,
+      store: boot.grantStore,
+      now: new Date(),
+      auditLog: boot.auditLog,
+    });
 
-  if (!result.found) {
-    write(err, `No such grant: ${grantId}\n`);
+    if (!result.found) {
+      write(err, `No such grant: ${grantId}\n`);
+      return 1;
+    }
+
+    write(
+      out,
+      result.alreadyRevoked
+        ? `Grant ${grantId} was already revoked.\n`
+        : `Grant ${grantId} revoked.\n`
+    );
+    return 0;
+  } catch (revokeErr) {
+    write(
+      err,
+      `Error: revoke did not complete cleanly. ${(revokeErr as Error).message}\n`
+    );
     return 1;
   }
-
-  write(
-    out,
-    result.alreadyRevoked
-      ? `Grant ${grantId} was already revoked.\n`
-      : `Grant ${grantId} revoked.\n`
-  );
-  return 0;
 }

@@ -3,17 +3,20 @@
  *
  * Exercises the production `PosixFileGrantFsOps` wiring against a real
  * temp directory (mkdtemp, matching the repo's safe temp-dir pattern in
- * `egress-gate/pf-anchor.ts`). This deliberately stays in the same-uid /
- * no-agent-origin-descriptor lane: no chown-to-a-different-uid is attempted
- * (that requires root and is out of scope for CI; see the module's own
- * doc-comment). Every OTHER file-grant test uses the injected `FakeFsOps`
- * fake per the build spec's testability shape -- this file is the one place
- * that proves the real implementation's plumbing (realpath / place /
- * removeEntry / no-descriptor-configured uid resolution) actually works.
+ * `egress-gate/pf-anchor.ts`). R3-3: `place()` never chowns the per-agent
+ * subdirectory to a different uid at all (v1 never applies the functional
+ * cross-uid read primitive, so a chown accomplished nothing useful and only
+ * blocked a non-root operator's later revoke -- see the module's own
+ * doc-comment), so every placement here -- same-uid or a configured uid
+ * split -- stays operator-owned. Every OTHER file-grant test uses the
+ * injected `FakeFsOps` fake per the build spec's testability shape -- this
+ * file is the one place that proves the real implementation's plumbing
+ * (realpath / place / removeEntry / no-descriptor-configured uid resolution)
+ * actually works.
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -100,16 +103,17 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     await expect(fsOps.removeEntry("../../etc/passwd")).rejects.toThrow(/escapes the grant-tree root/);
   });
 
-  it("place() still records the grant on a NON-root uid-split box (chown is privilege-gated, not fatal) (R2-5)", async () => {
+  it("place() records the grant on a uid-split box WITHOUT chowning the subdir (R2-5 + R3-3)", async () => {
     const processUid = process.getuid?.();
     if (processUid === undefined) return; // POSIX-only path
 
-    // Configure a dedicated agent uid DISTINCT from the running process uid, so
-    // place() would attempt a cross-uid chown. On a NON-root operator that chown
-    // is skipped (privilege-gated) rather than EPERM-ing the whole mint; on a
-    // root runner it succeeds. Either way place() must NOT throw and the symlink
-    // must still be placed (grant recordable on the target host; enforcement
-    // stays the honest `unverified`).
+    // Configure a dedicated agent uid DISTINCT from the running process uid.
+    // R3-3: v1 never applies a cross-uid chown at all (it never applied the
+    // functional read primitive anyway, so the chown accomplished nothing
+    // useful and only made the subdir agent-owned/0700, blocking a non-root
+    // operator revoke). place() must NOT throw, must place the symlink, and
+    // must leave the per-agent subdir OPERATOR-owned (the running process
+    // uid), never chowned to the configured agent uid.
     const originDir = join(fortressDir, "policy", "egress");
     await mkdir(originDir, { recursive: true });
     await writeFile(
@@ -132,13 +136,21 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     // The symlink was placed and resolves to the source.
     const placedPath = join(fortressDir, "grants", "agent-1", "fg_r2_5");
     expect(await readFile(placedPath, "utf-8")).toBe("operator data");
+
+    // R3-3: the per-agent subdir stays operator-owned; no chown to the
+    // configured (and here nonexistent) agent uid was attempted.
+    const agentSubdir = join(fortressDir, "grants", "agent-1");
+    const subdirStat = await stat(agentSubdir);
+    expect(subdirStat.uid).toBe(processUid);
   });
 
-  it("place() still FAILS CLOSED on a non-chown filesystem error (R2-5 relaxes chown-EPERM only)", async () => {
+  it("place() still FAILS CLOSED on a genuine filesystem error (R3-3: no chown left to relax)", async () => {
     // Put a FILE where the grants tree root must be a directory, so
     // ensureTreeRoot (mkdir) fails with EEXIST. This is a genuine placement
-    // error, not a privilege/chown skip, so place() must still throw -- the R2-5
-    // relaxation is chown-EPERM only, never a blanket swallow of place() errors.
+    // error, so place() must still throw. R3-3 removed the chown entirely (it
+    // is never attempted, privilege-gated or otherwise), so there is no
+    // remaining error class place() swallows: every mkdir/realpath/symlink
+    // failure stays fatal (fail-closed).
     await writeFile(join(fortressDir, "grants"), "not a directory");
     const source = join(sourceDir, "granted.txt");
     await writeFile(source, "operator data");

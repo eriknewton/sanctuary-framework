@@ -62,6 +62,11 @@ describe("file-grant fail-closed mint: rollback leaves no object AND no tree ent
     // The failure is still audited.
     const { entries } = await auditLog.query({ operation_type: "file_grant" });
     expect(entries.some((e) => e.result === "failure")).toBe(true);
+    // R3-1: a failed placement NEVER leaves a final `result:"success"`
+    // file_grant audit for a grant that never went live -- only the durable
+    // pre-place `"pending"` (step 5b) followed by `"failure"` (step 6).
+    expect(entries.some((e) => e.result === "success")).toBe(false);
+    expect(entries.some((e) => e.result === "pending")).toBe(true);
   });
 
   it("place() recording a partial entry THEN throwing is scrubbed (no tree entry survives)", async () => {
@@ -190,6 +195,44 @@ describe("file-grant mint: audit precedes access (R2-3a)", () => {
     expect(fsOps.placed).toHaveLength(0);
     // And no active grant survives.
     expect((await grantStore.list()).some((g) => g.status === "active")).toBe(false);
+  });
+});
+
+describe("file-grant mint: pending -> success audit sequence (R3-1)", () => {
+  it("a successful mint writes a durable pre-place 'pending' audit, then a 'success' confirmation", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
+
+    const { grant } = await mintFileGrant(baseParams(), {
+      fsOps,
+      store: grantStore,
+      now: NOW,
+      auditLog,
+    });
+
+    const { entries } = await auditLog.query({ operation_type: "file_grant" });
+    expect(entries).toHaveLength(2);
+
+    // Step 5b: the durable pre-place audit, written BEFORE place() ran.
+    expect(entries[0]!.result).toBe("pending");
+    expect(entries[0]!.details?.["phase"]).toBe("recorded");
+    expect(entries[0]!.details?.["grant_id"]).toBe(grant.grant_id);
+
+    // Step 7: the best-effort post-place confirmation, written AFTER place()
+    // succeeded. Only THIS entry -- never the pre-place one -- reports
+    // "success", so a consumer filtering operation:"file_grant",
+    // result:"success" counts only confirmed-live grants.
+    expect(entries[1]!.result).toBe("success");
+    expect(entries[1]!.details?.["phase"]).toBe("placed");
+    expect(entries[1]!.details?.["grant_id"]).toBe(grant.grant_id);
+
+    // Exactly one confirmed-success entry for this grant; the pending entry
+    // never reads as success.
+    expect(
+      entries.filter(
+        (e) => e.result === "success" && e.details?.["grant_id"] === grant.grant_id
+      )
+    ).toHaveLength(1);
   });
 });
 
