@@ -96,6 +96,26 @@ export const NON_RELAXABLE_CLOUD_TIER1_OPERATIONS = [
   "federation_node_join",
 ] as const;
 
+/**
+ * Governed File-Grant v1 (2026-07-07, must-fix #1): minting a box-local
+ * file-read grant is an exposure of operator data to the agent, the same
+ * class of trust-boundary change as the operator-cloud custody operations
+ * above. A hand-authored policy must NEVER be able to relax `file_grant`
+ * into Tier 3 or auto-approve -- that is the exact `state_export`-class bug
+ * the build spec forbids. A sibling set (rather than folding into
+ * `NON_RELAXABLE_CLOUD_TIER1_OPERATIONS`) keeps the naming honest: this is
+ * not a cloud-custody operation. Spread into the SAME two force-lists as the
+ * cloud set (this one, and `gate.ts`'s runtime mirror) so both enforcement
+ * points cannot drift apart; a drift guard test pins the relationship
+ * (mirrors `test/principal-policy/operator-cloud-tier1.test.ts`).
+ *
+ * `file_grant_revoke` and `file_grant_list` are deliberately NOT here: they
+ * are safe-direction (revoke reduces access; list is read-only) and are
+ * wired Tier-3 auto-allow in `DEFAULT_POLICY.tier3_always_allow` below, not
+ * force-pinned.
+ */
+export const NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS = ["file_grant"] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -107,6 +127,7 @@ const FORCED_TIER1_OPERATIONS = [
   "compliance_generate_eu_ai_act_bundle",
   "memory_delete",
   ...NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -537,6 +558,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     "sanctuary_events_close",
     "sanctuary_audit_search",
     "sanctuary_distress", // HABEAS PORT: guaranteed distress lane - always allowed, always audited
+    // Governed File-Grant v1 (2026-07-07): revoke is safe-direction (it only
+    // reduces access) and list is read-only, so both auto-allow+audit at
+    // Tier 3. The mint operation (file_grant) is force-pinned Tier 1 via
+    // NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS above, never here.
+    "file_grant_revoke",
+    "file_grant_list",
   ],
   approval_channel: DEFAULT_CHANNEL,
   approval_redirect: DEFAULT_APPROVAL_REDIRECT,

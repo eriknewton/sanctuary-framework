@@ -1,7 +1,7 @@
 # server/src - Module Map
 
 This is the first thing to read before you touch the Sanctuary server. `server/src` is the
-TypeScript MCP server: 57 module directories plus a small set of root files. It is the in-process
+TypeScript MCP server: 58 module directories plus a small set of root files. It is the in-process
 "fortress" runtime - crypto core, the four sovereignty layers, enforcement surfaces, networking,
 identity, and the operator CLI. The native OS-level enforcers (Rust/Swift) live OUTSIDE this tree
 (see "Adjacent out-of-scope systems").
@@ -34,17 +34,18 @@ edit the wire token.
 
 ---
 
-## MODULE INDEX TABLE (57 modules)
+## MODULE INDEX TABLE (58 modules)
 
-All 57 module directories under `server/src` are listed. Status legend: **canonical** = a real,
+All 58 module directories under `server/src` are listed. Status legend: **canonical** = a real,
 wired subsystem; **thin/utility** = honestly one or two files; **default-off-allocated** = real code,
 deliberately unwired or off by default (not dead, not shipped-as-enforcing); **versioned-frozen** =
 a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a thin re-export
-`index.ts` (49 of 57 do today).
+`index.ts` (50 of 58 do today).
 
 | Module | Subject area | Status | What it owns | Distinct from | Barrel? | Do-not-touch |
 |--------|-------------|--------|--------------|---------------|---------|--------------|
 | principal-policy | Cognitive (runtime approval) | canonical | The runtime human-in-the-loop approval gate: Tier 1/2/3 classification, baseline anomaly, approval channels, unified inbox/aggregator. `dashboard.ts` (the daemon `DashboardApprovalChannel`) also hosts the fleet console: it builds the durable federation roster via `fleet-roster.ts` and, PR-B, applies the paid node-count cap (`entitlement/applyFleetCap` over `resolveActivation`) to that roster + serves operator-bearer-gated `POST /api/fleet/activate` (`handleFleetActivate` → `activateFleetLicense`). Enforcement is fail-closed to the community floor and NEVER gates a node's wall/local-dashboard/policy-push/kill-safety | policy-engine (asks no human); `entitlement/` (the cap/activation core the daemon roster consumes) | Yes | tool names `principal_policy_view`/`principal_baseline_view`; tier tokens `tier1_always_approve`/`tier2_anomaly`/`tier3_always_allow`; `auto_deny=true` (SEC-002); frozen policy file `principal-policy.yaml`; `normalized_args_hash` amplification key; operator-bearer-gated route `POST /api/fleet/activate` |
+| file-grant | Cognitive (box-local governed file access) | canonical (v1: box-local, read-only) | Governed File-Grant v1: a `FileGrant` record persisted in the StateStore's `_file_grants` namespace (encrypted, signed, monotonic-versioned); a pure `planGrantTree` planner + injected `FsOps` interface (real POSIX impl in `fs-ops.ts`) that place/scrub grant-tree entries under the dedicated agent uid's tree; mint/revoke/list orchestration (`mint.ts`/`revoke.ts`/`list.ts`) pure over an injected clock; `sanctuary file-grant mint\|list\|revoke` CLI (`cli/file-grant.ts`). Enforcement is real POSIX ownership where the agent uid differs from the operator uid; on a same-uid box mint still records the grant but reports `enforcement: "unmet"` (Invariant #5 honesty, never claims "governed" without a real uid split) | principal-policy (owns the `NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS` sibling const `file_grant` is spread into; this module does not touch the force-lists itself); the OUT-of-scope daily-driver pull surface / `request_file_access` / write-mode grants / synced-folder copies (deliberately NOT built in v1 - see the build spec section 8) | Yes | `mode` is immutable `"read"` in v1 (any other value is a hard schema reject, `FileGrantModeRejectedError`); namespace `_file_grants` (reserved - the agent-facing `state_read`/`state_list`/`state_delete`/`state_export` MCP tools reject it via the reserved-namespace firewall in `cognitive/tools.ts`, same posture as `_audit`/`_identities`); op strings `file_grant` (force-pinned Tier 1)/`file_grant_revoke`/`file_grant_list` (Tier 3) |
 | policy-engine | Cognitive (declarative authoring) | canonical | English-to-rules compiler (authoring-time) + automated machine gates: slot/egress/budget/commitment-boundary + signed gate-receipts, no human prompt | principal-policy (the human gate) | Yes | tool `soft_warn`; 4 PolicySlot tokens `memory/credentials/plans/outputs`; `COMPILED_POLICY_SCHEMA_VERSION`; egress/budget `event_class` tokens; `GATE_REASON_CODES`; `is_sentinel` flag; gates forbid network/LLM imports (structural test) |
 | sentinel | Operational (Sentinels) | canonical | Rule-based behavioral-watcher framework: base class + per-fortress dispatcher + encrypted finding store + registry + concrete watchers under `sentinel/sentinels/` | anomaly-detection (learned drift); `policy-engine/sentinel-role.ts` (a capability flag) | Yes | route `/api/sentinels` (+`/subscribed`,`/findings`); `sentinel_id` tokens (egress-volume, credential-usage, etc.); audit ops `sentinel_finding_emitted`/`_evaluation_failed`; `sentinel-subscriptions.json`. Inner `sentinels/ebpf/*.rs` is a placeholder, NOT the daemon |
 | auto-trigger | Operational (Sentinels) | canonical | Nu-1 escalation ladder: routes findings through a 3-rung escalation (inbox / auto+cancel / fire-now); persists tuned thresholds; promotion recommendations | sentinel/anomaly/honeypot (they detect; this decides) | Yes | route `/api/auto-trigger`; rule-id wire format `sentinel__`/`anomaly__`/`honeypot__` (this IS the AAD); HKDF `l2-auto-trigger-rules-v1`; `AUTO_TRIGGER_AUDIT_OPS` |
@@ -102,7 +103,7 @@ a versioned wire/route surface that is frozen. "Barrel?" = does the dir expose a
 | reputation | Verifiable-Reputation | canonical | Heralds / Verifiable Reputation: Ed25519-signed EAS-compatible attestations of interaction OUTCOMES; queries return aggregates only; sovereignty-tier weighting; export/import; trust bootstrapping (escrow + guarantees) | l2 audit log (l4 = portable cross-agent; l2 = local operation log); l1 attestations | No | tools reputation_record/query/export/import/query_weighted, bootstrap_create_escrow/provide_guarantee, reputation_publish; HKDF `l4-reputation`/`identity-encryption`; EAS format; `sovereignty_tier` enum + `TIER_WEIGHTS`; `reputation_publish` emits frozen display labels 'L1'..'L4' + 'Cognitive Sovereignty' etc. (user-visible, NOT renamable); queries-return-aggregates invariant |
 | cli | CLI | canonical | The per-subcommand handler library for the `sanctuary` binary: one `run*Command` per subcommand (status, doctor, audit, identity, federation, transparency, secrets, sentinel, anomaly, policy, etc.) + the large `castle-wall.ts` command + the `agents/` multi-tenant sub-CLI | root `cli.ts` (the FILE = the argv router that lazy-imports these handlers) | No (sub-barrels only) | `TOP_LEVEL_SUBCOMMANDS` string array (the public command surface); basename-dispatched bins `verify-exit-bundle`/`import-exit-bundle`/`verify-transparency`; `cli/transparency.ts` anchoring-off-by-default; many dynamic-import path strings `./cli/<name>.js` (a rename grep must cover them) |
 
-Gaps note: none. All 57 module directories under `server/src` (verified by `ls`) have a row above,
+Gaps note: none. All 58 module directories under `server/src` (verified by `ls`) have a row above,
 and every row maps to a real directory (verified by diff). No best-effort placeholder rows were needed.
 
 **Two reading notes.** (1) The `default-off-allocated` modules - `composition`, `substrate`,
@@ -373,7 +374,8 @@ not its internal file layout. Deep imports are the documented exception (used wh
 deliberately partial - e.g. `core/` re-exports only the primitives and keeps the master-key security
 trio out of the barrel on purpose; `contracts/` uses per-version barrels with no top-level barrel).
 
-**Status today: 49 of 57 modules have a barrel** (backfilled 2026-06-14). This is additive (adding a
+**Status today: 50 of 58 modules have a barrel** (backfilled 2026-06-14; file-grant added its own
+2026-07-07). This is additive (adding a
 barrel never changes existing deep-import call sites). The 8 without one are intentional or deferred:
 the four layer dirs (`cognitive`, `operational`, `disclosure`, `reputation`) get theirs in a
 follow-up; `operational`'s in particular shrinks that follow-up's blast radius (100+ files reach

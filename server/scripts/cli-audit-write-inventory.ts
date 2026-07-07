@@ -147,6 +147,11 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   // ---- identity ----
   "identity show": { classification: "read-only" },
 
+  // ---- file-grant (Governed File-Grant v1, 2026-07-07) ----
+  "file-grant mint":   { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in mintFileGrant (success and rolled-back-failure paths)" },
+  "file-grant list":   { classification: "read-only" },
+  "file-grant revoke": { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in revokeFileGrant (success, not-found, and scrub-failure paths)" },
+
   // ---- intelligence ----
   "intelligence diagnose": { classification: "read-only" },
 
@@ -223,6 +228,7 @@ function deriveParentCommand(filePath: string): string | null {
   if (base.endsWith("cli/did-web")) return "did-web";
   if (base.endsWith("cli/auto-trigger")) return "auto-trigger";
   if (base.endsWith("cli/identity")) return "identity";
+  if (base.endsWith("cli/file-grant")) return "file-grant";
   if (base.endsWith("cli/intelligence")) return "intelligence";
   if (base.endsWith("cli/inbox")) return "inbox";
   if (base.endsWith("cli/policy")) return "policy";

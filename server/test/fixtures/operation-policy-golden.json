@@ -61,6 +61,8 @@
     "federation_peers",
     "federation_status",
     "federation_trust_evaluate",
+    "file_grant_list",
+    "file_grant_revoke",
     "governor_status",
     "handshake_abort",
     "handshake_complete",
