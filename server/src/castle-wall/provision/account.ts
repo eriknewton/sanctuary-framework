@@ -49,6 +49,18 @@ export interface AccountProvisionOptions {
   ceiling: number;
   /** Human-readable full name / comment field for the account. */
   comment?: string;
+  /**
+   * FIX F7 (HIGH/PLAUSIBLE, Codex second family, 2026-07-07 fix-round): the
+   * account's `NFSHomeDirectory`, set at create time to the SAME path the
+   * re-home step moves secrets onto (`/var/sanctuary-agents/<accountName>`).
+   * Without this, `sysadminctl -addUser` defaults the new account's
+   * directory-service home to something else entirely, so the confined
+   * harness (running as this account) resolves `~/.hermes` to a directory
+   * that never received the moved secrets -- the agent cannot find its own
+   * config even though the wall arms successfully. Required (not optional):
+   * `planAccountCreate` throws if this is absent for a `create` plan.
+   */
+  homeDirectory: string;
 }
 
 /** Filesystem/directory-service operations, injected so tests never touch the host. */
@@ -64,10 +76,12 @@ export interface AccountProvisionOps {
   /**
    * Create the hidden, no-login service account with the given uid. Must
    * set `IsHidden=1`, `UserShell=/usr/bin/false`, no admin group membership,
-   * and no interactive password (service-account shape). Production backing
-   * is `sysadminctl -addUser` + `dscl`; drill-only, never invoked by tests.
+   * and no interactive password (service-account shape), AND (fix F7) set
+   * `NFSHomeDirectory` to `homeDirectory` so the account's directory-service
+   * home matches the re-home target. Production backing is
+   * `sysadminctl -addUser` + `dscl`; drill-only, never invoked by tests.
    */
-  createUser(accountName: string, uid: number, comment: string | undefined): Promise<void>;
+  createUser(accountName: string, uid: number, comment: string | undefined, homeDirectory: string): Promise<void>;
 }
 
 /** A planned account-provision step. Pure. */
@@ -112,7 +126,7 @@ export function planAccountCreate(
   options: AccountProvisionOptions,
   probe: { existingUid: number | undefined; highestAssignedUid: number },
 ): AccountProvisionPlan {
-  const { accountName, ceiling } = options;
+  const { accountName, ceiling, homeDirectory } = options;
 
   if (!SAFE_SERVICE_ACCOUNT_RE.test(accountName)) {
     throw new Error(`Account name is not a safe service-account name (got: ${JSON.stringify(accountName)}).`);
@@ -122,6 +136,13 @@ export function planAccountCreate(
   }
   if (!Number.isSafeInteger(ceiling) || ceiling < 1) {
     throw new Error(`Ceiling must be a positive integer (got: ${ceiling}).`);
+  }
+  // FIX F7: the account MUST be created with its NFSHomeDirectory bound to
+  // the re-home target, or the confined harness cannot find its moved
+  // secrets. Refuse to plan a `create` without one rather than silently
+  // falling back to whatever sysadminctl would otherwise default to.
+  if (!homeDirectory.startsWith("/") || homeDirectory.includes("..")) {
+    throw new Error(`Home directory must be an absolute path with no ".." segments (got: ${JSON.stringify(homeDirectory)}).`);
   }
 
   if (probe.existingUid !== undefined) {
@@ -163,7 +184,8 @@ export async function executeAccountProvisionPlan(
   if (plan.action === "skip") {
     return { uid: plan.uid };
   }
-  await ops.createUser(plan.accountName, plan.uid, options.comment);
+  // FIX F7: bind NFSHomeDirectory to the re-home target at create time.
+  await ops.createUser(plan.accountName, plan.uid, options.comment, options.homeDirectory);
   return { uid: plan.uid };
 }
 

@@ -69,15 +69,37 @@ export interface RehomeOps {
    * implementations MUST write in a way that is never operator-readable
    * plaintext (fix M4): root-only permissions plus encryption or a
    * dedicated keychain entry, never a bare copy under a world- or
-   * operator-readable directory.
+   * operator-readable directory. FIX F2 (2026-07-07 fix-round): this MUST
+   * be a real recursive copy for a directory-shaped path (mode 0700 on the
+   * directory), not an empty placeholder dir -- the custody copy is only a
+   * genuine backup if it actually contains the data.
    */
   backup(path: string): Promise<{ backupPath: string }>;
   /** Move (not copy) the file tree from `sourcePath` to `destPath`, creating parent dirs as needed. */
   move(sourcePath: string, destPath: string): Promise<void>;
   /** chown the path (recursively, if a directory) to the given uid/gid. */
   chown(path: string, uid: number, gid: number): Promise<void>;
-  /** Restore a path from a prior backup (used by `unprovision`). */
-  restore(backupPath: string, destPath: string): Promise<void>;
+  /**
+   * Restore a path back to `sourcePath` (used by `unprovision` and by the
+   * orchestrator's fail-closed abort path). FIX F2 (2026-07-07 fix-round):
+   * production implementations MUST prefer a REVERSE-MOVE of `destPath`
+   * (the path the data actually lives at post-move -- `move` used `rename`,
+   * so the data is intact there) back to `sourcePath`; the `backupPath` is
+   * the M4 custody copy, used only when `destPath` itself is gone. This is
+   * correct for files AND directories, closing the prior defect where a
+   * directory-shaped secret's restore silently produced an empty directory.
+   * Returns whether the restore actually reproduced the data at
+   * `sourcePath`, so callers never report a false "rolled back" on a
+   * restore that quietly no-op'd or partially failed.
+   */
+  restore(destPath: string, sourcePath: string): Promise<{ restored: boolean }>;
+  /**
+   * Restore custody of a restored secret path to the operator (fix F3):
+   * chmod 0600 (file) / 0700 (dir) and chown back to the operator's
+   * uid/gid. Called only for `isSecret` entries, only after a successful
+   * restore.
+   */
+  restoreCustody(path: string, operatorUid: number, operatorGid: number): Promise<void>;
 }
 
 /** A single planned move, with its backup companion. */
@@ -170,24 +192,82 @@ export async function executeRehomePlan(
   return results;
 }
 
+/** Per-step outcome of {@link restoreRehomeSteps} (fix F2/F5: honest, not a hardcoded success). */
+export interface RestoreStepOutcome {
+  entry: RehomePathEntry;
+  sourcePath: string;
+  status: "restored" | "skipped-absent" | "failed";
+  error?: string;
+}
+
+/** Aggregate result of {@link restoreRehomeSteps}. */
+export interface RestoreRehomeResult {
+  steps: RestoreStepOutcome[];
+  /** True only when every non-skipped step reported `restored` (fix F2/F5: never claim a clean rollback on a partial restore). */
+  fullyRestored: boolean;
+}
+
 /**
- * Reverse a set of executed re-home steps using their recorded backups
- * (H2-a: this PR's `unprovision` scope -- daemon-uninstall + disarm +
- * restore-backup). Restores every step that has a `backupPath`
- * (secret paths); non-secret moved paths without a backup are restored via
- * the same `move`-back semantics using `ops.restore`, which production
- * implementations back with a plain reverse-move when no encrypted backup
- * exists. Idempotent: a step already `skipped-absent` is a no-op here too.
+ * Reverse a set of executed re-home steps (H2-a: this PR's `unprovision`
+ * scope -- daemon-uninstall + disarm + restore-backup).
+ *
+ * FIX F2 (2026-07-07 fix-round): restore is now a REVERSE-MOVE of `destPath`
+ * back to `sourcePath` -- correct for files AND directories, since `move`
+ * used `rename` and the data is intact at `destPath`. This closes the prior
+ * defect where a directory-shaped secret (e.g. `.hermes/google-mcp-creds/`)
+ * restored from an empty placeholder backup, silently stranding the real
+ * data at `destPath` while reporting success. The `backupPath` (the M4
+ * custody copy) is the ops layer's fallback source if `destPath` is somehow
+ * already gone; the ops implementation decides that, this function always
+ * passes `destPath` as the "restore from" argument, matching the updated
+ * `RehomeOps.restore` contract.
+ *
+ * FIX F3: after a successful restore of a secret entry, custody is handed
+ * back to the operator (chmod 0600/0700 + chown to `operatorUidGid`).
+ *
+ * Fail-loud per step, never throws: every step is attempted (a failure on
+ * one path must not stop the rest of the operator's secrets from being
+ * restored), and the per-step + aggregate outcome tells the caller EXACTLY
+ * what did and did not come back, so `orchestrate.ts` can report
+ * `rolledBack: false`/`"partial"` honestly instead of a hardcoded `true`.
  */
 export async function restoreRehomeSteps(
   results: RehomeStepResult[],
   ops: RehomeOps,
-): Promise<void> {
+  operatorUidGid: { uid: number; gid: number },
+): Promise<RestoreRehomeResult> {
+  const steps: RestoreStepOutcome[] = [];
   for (const result of results) {
-    if (result.status === "skipped-absent") continue;
-    const source = result.backupPath ?? result.destPath;
-    await ops.restore(source, result.entry.sourcePath);
+    if (result.status === "skipped-absent") {
+      steps.push({ entry: result.entry, sourcePath: result.entry.sourcePath, status: "skipped-absent" });
+      continue;
+    }
+    try {
+      const { restored } = await ops.restore(result.destPath, result.entry.sourcePath);
+      if (!restored) {
+        steps.push({
+          entry: result.entry,
+          sourcePath: result.entry.sourcePath,
+          status: "failed",
+          error: "restore reported no data reproduced at the source path",
+        });
+        continue;
+      }
+      if (result.entry.isSecret) {
+        await ops.restoreCustody(result.entry.sourcePath, operatorUidGid.uid, operatorUidGid.gid);
+      }
+      steps.push({ entry: result.entry, sourcePath: result.entry.sourcePath, status: "restored" });
+    } catch (err) {
+      steps.push({
+        entry: result.entry,
+        sourcePath: result.entry.sourcePath,
+        status: "failed",
+        error: (err as Error).message,
+      });
+    }
   }
+  const fullyRestored = steps.every((s) => s.status !== "failed");
+  return { steps, fullyRestored };
 }
 
 // ── Hermes v1 adapter ──────────────────────────────────────────────────

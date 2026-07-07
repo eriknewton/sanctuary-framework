@@ -52,10 +52,10 @@ describe("castle-wall/provision/verify", () => {
       expect(result.results.find((r) => r.name === "Telegram")?.reachable).toBe(false);
     });
 
-    it("returns allReachable true for an empty target list (vacuously true, caller decides whether that is meaningful)", async () => {
+    it("fix F1 (BLOCKER): an empty target list fails CLOSED, not vacuously true -- an empty probe list must never let the flow arm unverified", async () => {
       const result = await verifyReachabilityBeforeArm([]);
-      expect(result.allReachable).toBe(true);
-      expect(result.results).toEqual([]);
+      expect(result.allReachable).toBe(false);
+      expect(result.results).toEqual([{ name: "(no endpoints configured)", reachable: false }]);
     });
   });
 

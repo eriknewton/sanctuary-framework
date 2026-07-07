@@ -14,16 +14,27 @@ import {
 } from "../../../src/castle-wall/provision/unprovision.js";
 import type { RehomeOps, RehomeStepResult } from "../../../src/castle-wall/provision/rehome.js";
 
-function mockRehomeOps(overrides: Partial<RehomeOps> = {}): RehomeOps & { restores: string[] } {
+const OPERATOR_UID_GID = { uid: 501, gid: 501 };
+
+function mockRehomeOps(overrides: Partial<RehomeOps> = {}): RehomeOps & {
+  restores: string[];
+  restoreCustodyCalls: Array<{ path: string; uid: number; gid: number }>;
+} {
   const restores: string[] = [];
+  const restoreCustodyCalls: Array<{ path: string; uid: number; gid: number }> = [];
   return {
     restores,
+    restoreCustodyCalls,
     pathExists: async () => true,
     backup: async (path) => ({ backupPath: `${path}.bak` }),
     move: async () => undefined,
     chown: async () => undefined,
-    restore: async (backupPath) => {
-      restores.push(backupPath);
+    restore: async (destPath) => {
+      restores.push(destPath);
+      return { restored: true };
+    },
+    restoreCustody: async (path, uid, gid) => {
+      restoreCustodyCalls.push({ path, uid, gid });
     },
     ...overrides,
   };
@@ -55,12 +66,19 @@ describe("castle-wall/provision/unprovision", () => {
       rehomeResults: SAMPLE_RESULTS,
       rehomeOps,
       unprovisionOps,
+      operatorUidGid: OPERATOR_UID_GID,
     });
 
     expect(callOrder).toEqual(["disarm", "uninstall-daemon"]);
-    expect(rehomeOps.restores).toEqual(["/root/.sanctuary-rehome-backups/.hermes/.env.bak"]);
+    // FIX F2: restore is now a REVERSE-MOVE from destPath (where the data
+    // actually is), not the shallow backupPath.
+    expect(rehomeOps.restores).toEqual(["/var/sanctuary-agents/sanctuary-hermes/.hermes/.env"]);
     expect(unprovisionFullyOk(outcomes)).toBe(true);
     expect(outcomes.map((o) => o.step)).toEqual(["disarm", "uninstall-daemon", "restore-rehome"]);
+    // Fix F3: custody handed back to the operator for the restored secret.
+    expect(rehomeOps.restoreCustodyCalls).toEqual([
+      { path: "/Users/operator/.hermes/.env", uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid },
+    ]);
   });
 
   it("still attempts later steps when an earlier step fails (fail-loud, not fail-stop)", async () => {
@@ -76,6 +94,7 @@ describe("castle-wall/provision/unprovision", () => {
       rehomeResults: SAMPLE_RESULTS,
       rehomeOps,
       unprovisionOps,
+      operatorUidGid: OPERATOR_UID_GID,
     });
 
     expect(unprovisionFullyOk(outcomes)).toBe(false);
@@ -89,7 +108,7 @@ describe("castle-wall/provision/unprovision", () => {
     expect(restoreOutcome?.ok).toBe(true);
   });
 
-  it("reports restore-rehome failure without masking it as success", async () => {
+  it("reports restore-rehome failure without masking it as success (a throw from restore)", async () => {
     const unprovisionOps: UnprovisionOps = {
       disarm: async () => undefined,
       uninstallHarnessDaemon: async () => undefined,
@@ -104,12 +123,35 @@ describe("castle-wall/provision/unprovision", () => {
       rehomeResults: SAMPLE_RESULTS,
       rehomeOps,
       unprovisionOps,
+      operatorUidGid: OPERATOR_UID_GID,
     });
 
     expect(unprovisionFullyOk(outcomes)).toBe(false);
     const restoreOutcome = outcomes.find((o) => o.step === "restore-rehome");
     expect(restoreOutcome?.ok).toBe(false);
     expect(restoreOutcome?.error).toMatch(/backup file missing/);
+  });
+
+  it("fix F2/F5: reports restore-rehome failure honestly when restore resolves {restored: false} (no throw, still not success)", async () => {
+    const unprovisionOps: UnprovisionOps = {
+      disarm: async () => undefined,
+      uninstallHarnessDaemon: async () => undefined,
+    };
+    const rehomeOps = mockRehomeOps({
+      restore: async () => ({ restored: false }),
+    });
+
+    const outcomes = await unprovision({
+      rehomeResults: SAMPLE_RESULTS,
+      rehomeOps,
+      unprovisionOps,
+      operatorUidGid: OPERATOR_UID_GID,
+    });
+
+    expect(unprovisionFullyOk(outcomes)).toBe(false);
+    const restoreOutcome = outcomes.find((o) => o.step === "restore-rehome");
+    expect(restoreOutcome?.ok).toBe(false);
+    expect(restoreOutcome?.error).toMatch(/\/Users\/operator\/\.hermes\/\.env/);
   });
 
   it("H2-b guard: this module exposes no account-deletion function (account removal is a separate, out-of-scope PR)", async () => {

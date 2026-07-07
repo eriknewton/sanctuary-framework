@@ -85,6 +85,7 @@ import {
   runAutoProvisionForWrap,
   type AutoProvisionSummary,
 } from "./auto-provision.js";
+import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -1088,6 +1089,101 @@ async function maybeRunAutoProvisionForWrap(
     );
     return { ran: true };
   }
+}
+
+/**
+ * FIX F5 (HIGH, 2026-07-07 fix-round, absorbs the earlier F4 messaging nit):
+ * render EVERY `ProvisionFlowOutcome` at the CLI, not just the ones that
+ * happen to reach a catch block. Before this fix both wrap call sites
+ * ignored the returned outcome entirely: on a real abort (e.g. `launchctl
+ * bootstrap` failing after re-home) the wrap printed its normal success
+ * banner and the structured abort -- stage, reason, backup path, whether
+ * anything was actually restored -- was silently dropped. Every branch here
+ * is a distinct, accurate line:
+ *   - declined / non-tty: informational only, never "retry provisioning"
+ *     phrasing (the operator did not fail at anything).
+ *   - aborted with rolledBack === true: clean recovery, still surfaced so
+ *     the operator knows provisioning did not complete this run.
+ *   - aborted with rolledBack === false / "partial": LOUD manual-recovery
+ *     guidance with the backup path(s), since the operator's secrets may be
+ *     stranded under the new account's home.
+ *   - armed-then-rolled-back: the wall came down after a failed post-arm
+ *     check; the agent stays re-homed and the operator is told plainly.
+ *   - armed / skipped-already-dedicated: quiet single-line confirmation.
+ */
+function renderAutoProvisionOutcome(summary: AutoProvisionSummary): void {
+  if (!summary.ran || summary.outcome === undefined) return;
+  const outcome = summary.outcome;
+  switch (outcome.kind) {
+    case "armed":
+      // SAFETY: stderr is the operator-facing CLI channel for this
+      // subcommand; this line prints only the outcome kind and the new
+      // account's uid, never secrets or key material.
+      console.error(`  Dedicated agent account provisioned and Castle Wall armed (uid ${outcome.uid}).`);
+      return;
+    case "skipped-already-dedicated":
+    case "skipped-non-tty-cooperative-only":
+      // Already printed by the orchestration's own plan-and-print /
+      // reason line via `print`; nothing further to add here.
+      return;
+    case "declined-by-operator":
+      // SAFETY: stderr is the operator-facing CLI channel for this
+      // subcommand; a fixed, safe string with no interpolated data.
+      console.error("  Account provisioning declined; the cooperative wrap above still applies.");
+      return;
+    case "armed-then-rolled-back":
+      // SAFETY: stderr is the operator-facing CLI channel for this
+      // subcommand; `outcome.reason` is the orchestrator's own
+      // human-readable, secret-free reason string (endpoint names only).
+      console.error(
+        `  Note: Castle Wall armed then was fast-disarmed (${outcome.reason}). ` +
+          `The agent still runs under its dedicated, re-homed account; only enforcement came down. ` +
+          `Re-run 'sanctuary protect --hermes' once the allow-list is fixed.`,
+      );
+      return;
+    case "aborted":
+      renderAbortedProvisionOutcome(outcome);
+      return;
+  }
+}
+
+function renderAbortedProvisionOutcome(
+  outcome: Extract<ProvisionFlowOutcome, { kind: "aborted" }>,
+): void {
+  const backupNote =
+    outcome.backupPaths !== undefined && outcome.backupPaths.length > 0
+      ? ` Backup copies remain at: ${outcome.backupPaths.join(", ")}.`
+      : "";
+  if (outcome.rolledBack === true) {
+    // SAFETY: stderr is the operator-facing CLI channel for this
+    // subcommand; `outcome.stage`/`outcome.reason` are the orchestrator's
+    // own human-readable, secret-free strings (stage names, endpoint
+    // names) -- never secrets or key material.
+    console.error(
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `Re-homed paths were restored to your account. Re-run 'sanctuary protect --hermes' to retry.`,
+    );
+    return;
+  }
+  if (outcome.rolledBack === "partial") {
+    // SAFETY: stderr is the operator-facing CLI channel for this
+    // subcommand; `backupNote` carries only filesystem paths this process
+    // itself wrote as root-only backups, never secret contents.
+    console.error(
+      `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `Only SOME of your re-homed files were restored; the rest need manual recovery.${backupNote} ` +
+        `Do not re-run until you have recovered the remaining files.`,
+    );
+    return;
+  }
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+  // `backupNote` carries only filesystem paths this process itself wrote
+  // as root-only backups, never secret contents.
+  console.error(
+    `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+      `The restore of your re-homed files FAILED; manual recovery is required.${backupNote} ` +
+      `Do not re-run until you have recovered your files.`,
+  );
 }
 
 export interface RunWrapDeps {
@@ -2365,7 +2461,7 @@ export async function runWrap(
     // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
     // decline / non-TTY skip / mid-flow abort here never reverts anything
     // already done above (fix H4 -- the cooperative wrap always completes).
-    await maybeRunAutoProvisionForWrap(agentConfig, options, deps);
+    renderAutoProvisionOutcome(await maybeRunAutoProvisionForWrap(agentConfig, options, deps));
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
     printWrapSuccessNoDashboard({
       toolName,
@@ -2658,7 +2754,7 @@ export async function runWrap(
   // Auto-provision Step 2 (Build 1): see the matching call + comment in the
   // --no-dashboard branch above. Runs after the cooperative wrap (config +
   // identity + dashboard) has fully completed; never reverts it.
-  await maybeRunAutoProvisionForWrap(agentConfig, options, deps);
+  renderAutoProvisionOutcome(await maybeRunAutoProvisionForWrap(agentConfig, options, deps));
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 

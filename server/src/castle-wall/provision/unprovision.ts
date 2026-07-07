@@ -39,6 +39,8 @@ export interface UnprovisionInput {
   rehomeResults: RehomeStepResult[];
   rehomeOps: RehomeOps;
   unprovisionOps: UnprovisionOps;
+  /** The operator's uid/gid, so restored secrets get their custody handed back (fix F3). */
+  operatorUidGid: { uid: number; gid: number };
 }
 
 /** Outcome of one rollback step, for reporting. */
@@ -79,8 +81,27 @@ export async function unprovision(input: UnprovisionInput): Promise<UnprovisionS
   }
 
   try {
-    await restoreRehomeSteps(input.rehomeResults, input.rehomeOps);
-    outcomes.push({ step: "restore-rehome", ok: true });
+    // FIX F2/F5 (2026-07-07 fix-round): `restoreRehomeSteps` now reports
+    // whether it ACTUALLY restored every path, rather than this block
+    // inferring success from "did not throw". A partial restore (some
+    // paths came back, some did not) must surface as `ok: false` with the
+    // per-step detail, never a blanket "restore-rehome: ok".
+    const restoreResult = await restoreRehomeSteps(input.rehomeResults, input.rehomeOps, input.operatorUidGid);
+    if (restoreResult.fullyRestored) {
+      outcomes.push({ step: "restore-rehome", ok: true });
+    } else {
+      const failed = restoreResult.steps.filter((s) => s.status === "failed");
+      outcomes.push({
+        step: "restore-rehome",
+        ok: false,
+        error:
+          failed.length > 0
+            ? `${failed.length} path(s) did not restore: ${failed
+                .map((s) => `${s.sourcePath} (${s.error ?? "unknown error"})`)
+                .join(", ")}`
+            : "restore did not complete for all paths",
+      });
+    }
   } catch (err) {
     outcomes.push({ step: "restore-rehome", ok: false, error: (err as Error).message });
   }

@@ -65,7 +65,12 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     arm: vi.fn(async () => ({ ok: true as const })),
     postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
     disarm: vi.fn(async () => undefined),
-    restoreRehome: vi.fn(async () => undefined),
+    restoreRehome: vi.fn(async () => ({
+      fullyRestored: true,
+      restoredCount: REHOME_RESULTS.length,
+      attemptedCount: REHOME_RESULTS.length,
+      backupPaths: REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
+    })),
     ...overrides,
   };
 }
@@ -84,12 +89,32 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.restoreRehome).not.toHaveBeenCalled();
   });
 
-  it("step 1 (detect): skips straight through when already dedicated, no mutation attempted", async () => {
+  it("fix F6: already-dedicated (VERIFIED) skips ONLY create + re-home, but still reaches daemon-install, verify, uid-gate, and arm", async () => {
     const ops = happyPathOps();
     const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
-    expect(result.kind).toBe("skipped-already-dedicated");
+    // Fix F6: this must NEVER short-circuit to a bare "skipped" outcome --
+    // it must actually reach arm, exactly like the fresh-provision path.
+    expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
     expect(ops.createAccount).not.toHaveBeenCalled();
+    expect(ops.rehome).not.toHaveBeenCalled();
     expect(ops.confirm).not.toHaveBeenCalled();
+    // But daemon-install, verify, uid-gate, and arm ALL still ran.
+    expect(ops.installHarnessDaemon).toHaveBeenCalledWith(AGENT_UID);
+    expect(ops.checkUidExistence).toHaveBeenCalledWith(AGENT_UID);
+    expect(ops.arm).toHaveBeenCalledWith(AGENT_UID, CEILING);
+  });
+
+  it("fix F6: an already-dedicated abort mid-flow (e.g. daemon-install fails) does not attempt a restore (nothing was re-homed this run)", async () => {
+    const ops = happyPathOps({
+      installHarnessDaemon: vi.fn(async () => {
+        throw new Error("launchctl bootstrap exited 5");
+      }),
+    });
+    const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+    // restoreRehome IS still called (with an empty array) so the reported
+    // rolledBack is trivially/honestly true; nothing was actually moved.
+    expect(ops.restoreRehome).toHaveBeenCalledWith([]);
   });
 
   it("fix H4: non-TTY skips provisioning (cooperative-wrap-only) WITHOUT ever confirming or mutating", async () => {
@@ -215,7 +240,26 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.restoreRehome).not.toHaveBeenCalled();
   });
 
-  it("a restore failure during rollback does not mask the original abort reason", async () => {
+  it("fix F1 (BLOCKER): an empty pre-arm endpoint list REFUSES to arm (fail-closed, not vacuous-true)", async () => {
+    const ops = happyPathOps({
+      preArmEndpoints: vi.fn(() => []),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm", rolledBack: true });
+    expect(ops.arm).not.toHaveBeenCalled();
+    expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
+  });
+
+  it("fix F1 (BLOCKER): an empty post-arm endpoint list fast-disarms rather than reporting a clean arm", async () => {
+    const ops = happyPathOps({
+      postArmEndpoints: vi.fn(() => []),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "armed-then-rolled-back", uid: AGENT_UID });
+    expect(ops.disarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("a restore failure during rollback does not mask the original abort reason, and reports rolledBack: false honestly (fix F2/F5)", async () => {
     const ops = happyPathOps({
       installHarnessDaemon: vi.fn(async () => {
         throw new Error("launchctl bootstrap exited 5");
@@ -225,9 +269,31 @@ describe("castle-wall/provision/orchestrate", () => {
       }),
     });
     const result = await runProvisionFlow(baseCtx(), ops);
-    expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon", rolledBack: true });
+    // FIX F2/F5: a restore that THROWS is a failed restore, not a hardcoded
+    // clean rollback -- rolledBack must be false, never true, and the
+    // ORIGINAL abort reason (the daemon-install failure) must still survive.
+    expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon", rolledBack: false });
     if (result.kind === "aborted") {
       expect(result.reason).toMatch(/launchctl bootstrap exited 5/);
+    }
+  });
+
+  it("fix F2/F5: a PARTIAL restore (some but not all paths recovered) reports rolledBack: 'partial', not a clean true", async () => {
+    const ops = happyPathOps({
+      installHarnessDaemon: vi.fn(async () => {
+        throw new Error("launchctl bootstrap exited 5");
+      }),
+      restoreRehome: vi.fn(async () => ({
+        fullyRestored: false,
+        restoredCount: 1,
+        attemptedCount: 2,
+        backupPaths: ["/root/backup/.hermes/.env.bak"],
+      })),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon", rolledBack: "partial" });
+    if (result.kind === "aborted") {
+      expect(result.backupPaths).toEqual(["/root/backup/.hermes/.env.bak"]);
     }
   });
 });

@@ -49,6 +49,21 @@ export interface ConnectivityVerifyResult {
 }
 
 async function probeAll(targets: EndpointProbeTarget[]): Promise<ConnectivityVerifyResult> {
+  // FIX F1 (BLOCKER, 2026-07-07 fix-round): an empty target list must never
+  // resolve `allReachable: true` by vacuous truth. `Array.prototype.every`
+  // on `[]` is `true`, which let a caller that (accidentally or otherwise)
+  // supplies no probes sail through both the pre-arm and post-arm gates
+  // unconditionally -- verification became a decorative no-op that always
+  // reported success. Fail-closed instead: no endpoints configured means
+  // nothing was actually verified, so report a single synthetic unreachable
+  // result and force the orchestrator's abort/fast-disarm branch.
+  if (targets.length === 0) {
+    return {
+      allReachable: false,
+      results: [{ name: "(no endpoints configured)", reachable: false }],
+    };
+  }
+
   const results: EndpointProbeResult[] = [];
   for (const target of targets) {
     let reachable: boolean;

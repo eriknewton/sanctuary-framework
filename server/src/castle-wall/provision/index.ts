@@ -9,6 +9,7 @@ export type {
   RunAsIdentity,
   DetectProvisionNeedInput,
   ProvisionNeedResult,
+  AccountShapeVerdict,
 } from "./detect.js";
 export { detectProvisionNeed } from "./detect.js";
 
@@ -44,6 +45,8 @@ export type {
   RehomeStep,
   RehomePlan,
   RehomeStepResult,
+  RestoreStepOutcome,
+  RestoreRehomeResult,
 } from "./rehome.js";
 
 export {

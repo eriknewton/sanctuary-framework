@@ -22,9 +22,25 @@
  *      (backup-first, `unprovision`) while an unconfined agent is not a
  *      recoverable state once egress has already happened.
  *
- * If the agent already runs at a DEDICATED non-login uid >= ceiling, this
- * reports `alreadyDedicated: true` so the orchestrator can skip straight to
- * daemon-install + arm (step 1 of the target flow) without re-provisioning.
+ * FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): a uid alone was
+ * too loose a signal for "already dedicated". A stale prior service account,
+ * or Hermes simply running at some other non-console uid with the wall
+ * DISABLED, satisfied the old `uid >= ceiling && uid !== consoleOwnerUid`
+ * test and made the orchestrator skip straight to "done" -- reporting
+ * "already a dedicated account" while nothing was actually confined (no
+ * daemon, no verify, no uid-gate, no arm). `alreadyDedicated` is now trusted
+ * ONLY when the resolved uid's account NAME matches the expected dedicated
+ * service-account shape (`sanctuary-<agentId>`, hidden / no-login /
+ * non-admin); this requires an injected probe (`resolveAccountShape`) run by
+ * the caller, since name/shape resolution needs directory-service access
+ * this pure module does not perform itself. Any other non-console uid >=
+ * ceiling is now `dedicatedAccountVerified: false` -- NOT already-dedicated
+ * -- and provisions. `alreadyDedicated` in the result still means "the
+ * orchestrator may skip create + re-home", but the orchestrator (see
+ * orchestrate.ts) NEVER short-circuits past daemon-install + uid-gate +
+ * verify + arm even when this is true -- skipping straight to "done" was
+ * exactly the defect. Fail-closed: when in doubt (name/shape probe
+ * indeterminate), treat as NOT dedicated and run the full flow.
  */
 
 /** A resolved run-as identity, however it was determined. */
@@ -32,6 +48,14 @@ export interface RunAsIdentity {
   uid: number;
   source: "harness-config" | "running-process";
 }
+
+/**
+ * The account-name/shape verdict for a resolved uid (fix F6). Only a
+ * `verified-dedicated` shape counts as genuinely already-provisioned; any
+ * other shape (or indeterminate) means the uid, however plausible, is NOT
+ * trusted as the dedicated service account.
+ */
+export type AccountShapeVerdict = "verified-dedicated" | "not-dedicated" | "indeterminate";
 
 /** Inputs to {@link detectProvisionNeed}, every field independently mockable. */
 export interface DetectProvisionNeedInput {
@@ -53,19 +77,34 @@ export interface DetectProvisionNeedInput {
   consoleOwnerUid: number;
   /** The ceiling below which uids are reserved for system/operator use. */
   ceiling: number;
+  /**
+   * FIX F6: the account-name/shape verdict for whichever uid was resolved
+   * (harness-config or running-process), supplied by the caller's directory-
+   * service probe (e.g. does the account at this uid have the name
+   * `sanctuary-<agentId>`, `IsHidden=1`, a no-login shell, and no admin
+   * group membership?). Only called by the caller when a uid was actually
+   * resolved AND that uid clears the ceiling/console-owner test; leave
+   * `undefined` (or omit) to get the fail-closed `"indeterminate"` default,
+   * which this function treats as NOT dedicated.
+   */
+  accountShapeVerdict?: AccountShapeVerdict;
 }
 
 /** Result of {@link detectProvisionNeed}. */
 export interface ProvisionNeedResult {
   /**
    * True when the flow should provision (or re-provision) a dedicated
-   * account. False only when the agent is confirmed already dedicated.
+   * account. False only when the agent is confirmed already dedicated
+   * (fix F6: confirmed by NAME/SHAPE, not uid alone).
    */
   needsProvisioning: boolean;
   /**
-   * True when an existing run-as uid was resolved and it is ALREADY a
-   * dedicated non-login uid >= ceiling: the orchestrator can skip create +
-   * re-home and go straight to daemon-install + arm.
+   * True when an existing run-as uid was resolved, is >= ceiling and
+   * distinct from the console owner, AND (fix F6) the account-shape probe
+   * VERIFIED it is the genuine `sanctuary-<agentId>` dedicated service
+   * account. The orchestrator may then skip create + re-home, but MUST
+   * still run daemon-install + uid-gate + verify + arm (see orchestrate.ts)
+   * -- this field never means "skip straight to done".
    */
   alreadyDedicated: boolean;
   /** The identity that was resolved, when one was. */
@@ -76,36 +115,44 @@ export interface ProvisionNeedResult {
 
 /**
  * Decide whether provisioning is needed. Fail-closed default = provision
- * (fix H3): only an AFFIRMATIVELY resolved dedicated uid >= ceiling skips
- * provisioning. Any ambiguity, absence of signal, or a resolved uid that is
- * NOT dedicated (shared with the operator, or below ceiling) provisions.
+ * (fix H3): only an AFFIRMATIVELY resolved dedicated uid >= ceiling AND
+ * (fix F6) a VERIFIED account name/shape skips provisioning. Any ambiguity,
+ * absence of signal, a resolved uid that is NOT dedicated (shared with the
+ * operator, or below ceiling), or a uid that clears the ceiling test but
+ * whose account shape is NOT verified (or indeterminate) provisions.
  */
 export function detectProvisionNeed(input: DetectProvisionNeedInput): ProvisionNeedResult {
-  const { harnessConfiguredUid, runningAgentUid, consoleOwnerUid, ceiling } = input;
+  const { harnessConfiguredUid, runningAgentUid, consoleOwnerUid, ceiling, accountShapeVerdict } = input;
 
   // Primary signal: harness config declares a run-as identity.
   if (harnessConfiguredUid !== undefined) {
-    const dedicated = harnessConfiguredUid >= ceiling && harnessConfiguredUid !== consoleOwnerUid;
+    const uidLooksDedicated = harnessConfiguredUid >= ceiling && harnessConfiguredUid !== consoleOwnerUid;
+    const verified = uidLooksDedicated && accountShapeVerdict === "verified-dedicated";
     return {
-      needsProvisioning: !dedicated,
-      alreadyDedicated: dedicated,
+      needsProvisioning: !verified,
+      alreadyDedicated: verified,
       resolved: { uid: harnessConfiguredUid, source: "harness-config" },
-      reason: dedicated
-        ? `harness config already runs as dedicated uid ${harnessConfiguredUid} (>= ceiling ${ceiling}, distinct from console owner ${consoleOwnerUid}).`
-        : `harness config runs as uid ${harnessConfiguredUid}, which is not a dedicated account (ceiling ${ceiling}, console owner ${consoleOwnerUid}).`,
+      reason: verified
+        ? `harness config already runs as VERIFIED dedicated uid ${harnessConfiguredUid} (>= ceiling ${ceiling}, distinct from console owner ${consoleOwnerUid}, account name/shape confirmed).`
+        : uidLooksDedicated
+          ? `harness config runs as uid ${harnessConfiguredUid} (>= ceiling ${ceiling}, distinct from console owner ${consoleOwnerUid}), but the account name/shape is NOT verified as the dedicated service account (fix F6: uid alone is not trusted) -- provisioning.`
+          : `harness config runs as uid ${harnessConfiguredUid}, which is not a dedicated account (ceiling ${ceiling}, console owner ${consoleOwnerUid}).`,
     };
   }
 
   // Secondary signal: a running agent's ruid vs the console owner.
   if (runningAgentUid !== undefined) {
-    const dedicated = runningAgentUid >= ceiling && runningAgentUid !== consoleOwnerUid;
+    const uidLooksDedicated = runningAgentUid >= ceiling && runningAgentUid !== consoleOwnerUid;
+    const verified = uidLooksDedicated && accountShapeVerdict === "verified-dedicated";
     return {
-      needsProvisioning: !dedicated,
-      alreadyDedicated: dedicated,
+      needsProvisioning: !verified,
+      alreadyDedicated: verified,
       resolved: { uid: runningAgentUid, source: "running-process" },
-      reason: dedicated
-        ? `running agent already runs as dedicated uid ${runningAgentUid} (>= ceiling ${ceiling}, distinct from console owner ${consoleOwnerUid}).`
-        : `running agent runs as uid ${runningAgentUid}, which matches or is below the console/ceiling boundary (ceiling ${ceiling}, console owner ${consoleOwnerUid}) -- treating as shared with the operator.`,
+      reason: verified
+        ? `running agent already runs as VERIFIED dedicated uid ${runningAgentUid} (>= ceiling ${ceiling}, distinct from console owner ${consoleOwnerUid}, account name/shape confirmed).`
+        : uidLooksDedicated
+          ? `running agent runs as uid ${runningAgentUid} (>= ceiling ${ceiling}, distinct from console owner ${consoleOwnerUid}), but the account name/shape is NOT verified as the dedicated service account (fix F6: a stale or foreign uid is not trusted) -- provisioning.`
+          : `running agent runs as uid ${runningAgentUid}, which matches or is below the console/ceiling boundary (ceiling ${ceiling}, console owner ${consoleOwnerUid}) -- treating as shared with the operator.`,
     };
   }
 

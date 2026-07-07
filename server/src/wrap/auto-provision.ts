@@ -29,8 +29,9 @@
 import { platform as osPlatform, userInfo, homedir } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, access, stat } from "node:fs/promises";
+import { mkdir, rename, copyFile, chmod, chown as fsChown, access, stat, cp } from "node:fs/promises";
 import { dirname } from "node:path";
+import { connect as netConnect } from "node:net";
 
 import {
   detectProvisionNeed,
@@ -45,6 +46,7 @@ import {
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
   type RehomeStepResult,
+  type EndpointProbeTarget,
 } from "../castle-wall/provision/index.js";
 import {
   planAgentHarnessDaemonInstall,
@@ -58,6 +60,80 @@ const execFileAsync = promisify(execFile);
 const PROVISION_CEILING = 500;
 const NEW_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
 const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
+
+// FIX F1 (BLOCKER, 2026-07-07 fix-round): the real endpoint hosts Hermes
+// needs to reach, so `preArmEndpoints`/`postArmEndpoints` below supply a
+// non-empty, meaningful probe list instead of `[]`. `verify.ts`'s fail-closed
+// empty-list guard means an empty list here would abort/disarm every real
+// run, so this list must stay accurate as Hermes' real dependencies. TCP
+// connect on 443 only -- this proves network reachability as the new uid,
+// not HTTP-level auth; that matches what `verifyReachabilityBeforeArm` /
+// `verifyReachabilityAfterArm` actually claim to prove (re-home + allow-list
+// reachability, never application-level success).
+const HERMES_ENDPOINT_HOSTS: ReadonlyArray<{ name: string; host: string; port: number }> = Object.freeze([
+  { name: "LLM (Venice)", host: "api.venice.ai", port: 443 },
+  { name: "Telegram Bot API", host: "api.telegram.org", port: 443 },
+  { name: "Google MCP (Workspace APIs)", host: "www.googleapis.com", port: 443 },
+]);
+
+const PROBE_CONNECT_TIMEOUT_MS = 5000;
+
+/** TCP-connect reachability probe for one host:port. Fail-closed: any error or timeout resolves false, never throws. */
+function tcpConnectProbe(host: string, port: number): () => Promise<boolean> {
+  return () =>
+    new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(ok);
+      };
+      const socket = netConnect({ host, port, timeout: PROBE_CONNECT_TIMEOUT_MS });
+      socket.once("connect", () => finish(true));
+      socket.once("timeout", () => finish(false));
+      socket.once("error", () => finish(false));
+    });
+}
+
+/**
+ * "Moved credential files are readable as the new uid" probe (fix F1). Runs
+ * `stat` as an unprivileged check from the CURRENT process (which, by the
+ * time this is called post-re-home, is the harness daemon's already-dropped
+ * uid in the real drill path); a file that exists but is not readable at the
+ * calling uid throws EACCES, which this treats as unreachable (fail-closed).
+ * A wholly absent path (nothing to check because the harness never used that
+ * credential) is NOT treated as a failure -- only an existing-but-unreadable
+ * path fails the probe.
+ */
+function credentialReadableProbe(path: string): () => Promise<boolean> {
+  return async () => {
+    try {
+      await access(path);
+      return true;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // Absence is not a reachability failure: not every optional credential
+      // path is populated on every install (matches rehome.ts's own
+      // skipped-absent handling). Only a genuine permission/access failure
+      // on a path that DOES exist counts as unreachable.
+      return code === "ENOENT";
+    }
+  };
+}
+
+/** Build the real, injected pre-arm/post-arm endpoint probe list for Hermes. */
+function hermesEndpointProbes(newAccountHome: string): EndpointProbeTarget[] {
+  const targets: EndpointProbeTarget[] = HERMES_ENDPOINT_HOSTS.map(({ name, host, port }) => ({
+    name,
+    probe: tcpConnectProbe(host, port),
+  }));
+  targets.push({
+    name: "moved credentials readable (.hermes/.env)",
+    probe: credentialReadableProbe(`${newAccountHome}/.hermes/.env`),
+  });
+  return targets;
+}
 
 /** Options threaded in from `runWrap` for the Hermes v1 auto-provision call. */
 export interface RunAutoProvisionForWrapOptions {
@@ -104,18 +180,32 @@ export async function runAutoProvisionForWrap(
   const operatorHome = homedir();
   const newAccountHome = `${NEW_ACCOUNT_HOME_BASE}/${accountName}`;
 
-  const consoleOwnerUid = userInfo().uid;
+  const consoleOwnerInfo = userInfo();
+  const consoleOwnerUid = consoleOwnerInfo.uid;
+  const consoleOwnerGid = consoleOwnerInfo.gid;
+  const harnessConfiguredUid = await readHarnessConfiguredUid();
+  const runningAgentUid = await readRunningHermesGatewayUid();
+  // FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): the resolved
+  // uid alone is NOT enough to trust "already dedicated" -- a stale prior
+  // service account, or Hermes running at some other non-console uid with
+  // the wall disabled, used to satisfy the ceiling/console-owner test and
+  // short-circuit this ENTIRE function to a bare "already dedicated" return
+  // BEFORE runProvisionFlow ever ran daemon-install/verify/uid-gate/arm.
+  // That short-circuit is now removed: this function ALWAYS calls
+  // runProvisionFlow, and the orchestrator itself (not this caller) decides
+  // whether to skip create+rehome based on a VERIFIED account shape.
+  const candidateUid = harnessConfiguredUid ?? runningAgentUid;
+  const accountShapeVerdict =
+    candidateUid !== undefined && candidateUid >= PROVISION_CEILING && candidateUid !== consoleOwnerUid
+      ? await resolveAccountShapeVerdict(accountName, candidateUid)
+      : undefined;
   const detectResult = detectProvisionNeed({
-    harnessConfiguredUid: await readHarnessConfiguredUid(),
-    runningAgentUid: await readRunningHermesGatewayUid(),
+    harnessConfiguredUid,
+    runningAgentUid,
     consoleOwnerUid,
     ceiling: PROVISION_CEILING,
+    accountShapeVerdict,
   });
-
-  if (!detectResult.needsProvisioning) {
-    print(`Agent already runs as a dedicated account: ${detectResult.reason}`);
-    return { ran: true, outcome: { kind: "skipped-already-dedicated", reason: detectResult.reason } };
-  }
 
   // Privileged-path root check (matches the established pattern in
   // cli/castle-wall.ts's `setup-shared-dir` / `install-boot`: privileged
@@ -148,8 +238,11 @@ export async function runAutoProvisionForWrap(
     print,
     createAccount: async () => {
       const { planAndCreateAccount } = await import("../castle-wall/provision/account.js");
+      // FIX F7: bind the account's home to the re-home target at create
+      // time, so the confined harness resolves ~/.hermes to where the
+      // secrets actually get moved.
       return planAndCreateAccount(
-        { accountName, ceiling: PROVISION_CEILING },
+        { accountName, ceiling: PROVISION_CEILING, homeDirectory: newAccountHome },
         realAccountProvisionOps(),
       );
     },
@@ -173,7 +266,11 @@ export async function runAutoProvisionForWrap(
       // gate before arming.
       void uid;
     },
-    preArmEndpoints: () => [],
+    // FIX F1 (BLOCKER): non-empty, meaningful real probe list -- see
+    // `hermesEndpointProbes` above. An empty list here would now abort/
+    // fast-disarm every real run (verify.ts's fail-closed empty-list guard),
+    // so this MUST stay wired to the real endpoints.
+    preArmEndpoints: () => hermesEndpointProbes(newAccountHome),
     checkUidExistence: async (uid) => {
       const { checkUidExistenceBeforeArm } = await import("../castle-wall/provision/uid-gate.js");
       return checkUidExistenceBeforeArm(accountName, uid, realUidExistenceOps());
@@ -183,13 +280,26 @@ export async function runAutoProvisionForWrap(
       const code = await runEnable([`--agent-uid=${uid}`, `--ceiling=${ceiling}`, "--no-ttl"]);
       return code === 0 ? { ok: true } : { ok: false, error: `castle-wall enable exited ${code}` };
     },
-    postArmEndpoints: () => [],
+    postArmEndpoints: () => hermesEndpointProbes(newAccountHome),
     disarm: async () => {
       const { runDisable } = await import("../cli/castle-wall.js");
       await runDisable([]);
     },
     restoreRehome: async (results: RehomeStepResult[]) => {
-      await restoreRehomeSteps(results, realRehomeOps());
+      // FIX F2/F3 (2026-07-07 fix-round): thread the OPERATOR's uid/gid
+      // (the console-session owner this whole flow is provisioning away
+      // from) so restored secrets are handed back with correct custody, and
+      // report what ACTUALLY restored rather than assuming success.
+      const restoreResult = await restoreRehomeSteps(results, realRehomeOps(), {
+        uid: consoleOwnerUid,
+        gid: consoleOwnerGid,
+      });
+      return {
+        fullyRestored: restoreResult.fullyRestored,
+        restoredCount: restoreResult.steps.filter((s) => s.status === "restored").length,
+        attemptedCount: restoreResult.steps.filter((s) => s.status !== "skipped-absent").length,
+        backupPaths: results.filter((r) => r.backupPath !== undefined).map((r) => r.backupPath!),
+      };
     },
   };
 
@@ -244,6 +354,63 @@ async function readRunningHermesGatewayUid(): Promise<number | undefined> {
   }
 }
 
+/**
+ * FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): verify that the
+ * account at `candidateUid` is GENUINELY the expected `sanctuary-<agentId>`
+ * dedicated service account, not merely some other non-console uid >=
+ * ceiling (a stale prior service account, or any other daemon/service
+ * account happens to satisfy the uid test). Checks, ALL of which must hold:
+ *   - the account NAME at this uid is exactly `expectedAccountName`
+ *     (`sanctuary-<agentId>`), read via `dscl . -search /Users UniqueID` so
+ *     the name<->uid binding comes from the directory service, not assumed;
+ *   - `IsHidden` is `1`;
+ *   - the login shell is `/usr/bin/false` (no-login shape).
+ * Any dscl failure, any missing field, or any mismatch resolves
+ * `"indeterminate"`/`"not-dedicated"` -- fail-closed, never `"verified-dedicated"`
+ * on an ambiguous read.
+ */
+async function resolveAccountShapeVerdict(
+  expectedAccountName: string,
+  candidateUid: number,
+): Promise<"verified-dedicated" | "not-dedicated" | "indeterminate"> {
+  try {
+    const { stdout: searchOut } = await execFileAsync("/usr/bin/dscl", [
+      ".",
+      "-search",
+      "/Users",
+      "UniqueID",
+      String(candidateUid),
+    ]);
+    // Output shape: "<accountName>  UniqueID = <uid>\n" per matching record.
+    const nameMatch = /^(\S+)\s+UniqueID\s*=\s*\d+/m.exec(searchOut);
+    if (!nameMatch || nameMatch[1] !== expectedAccountName) {
+      return "not-dedicated";
+    }
+    const { stdout: hiddenOut } = await execFileAsync("/usr/bin/dscl", [
+      ".",
+      "-read",
+      `/Users/${expectedAccountName}`,
+      "IsHidden",
+    ]);
+    if (!/IsHidden:\s*1/.test(hiddenOut)) {
+      return "not-dedicated";
+    }
+    const { stdout: shellOut } = await execFileAsync("/usr/bin/dscl", [
+      ".",
+      "-read",
+      `/Users/${expectedAccountName}`,
+      "UserShell",
+    ]);
+    if (!/UserShell:\s*\/usr\/bin\/false/.test(shellOut)) {
+      return "not-dedicated";
+    }
+    return "verified-dedicated";
+  } catch {
+    // Fail-closed: any probe error is indeterminate, never verified.
+    return "indeterminate";
+  }
+}
+
 async function confirmOnTty(promptText: string): Promise<boolean> {
   const readline = await import("node:readline/promises");
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -275,12 +442,26 @@ function realAccountProvisionOps() {
       }
       return highest;
     },
-    createUser: async (accountName: string, uid: number, comment: string | undefined): Promise<void> => {
+    createUser: async (
+      accountName: string,
+      uid: number,
+      comment: string | undefined,
+      homeDirectory: string,
+    ): Promise<void> => {
       // Drill-only: real account creation happens exclusively in an
       // Erik-present console ceremony on real hardware. This build never
       // invokes this path in CI or in any automated run; it exists so the
       // production ops object satisfies the AccountProvisionOps interface
       // for the orchestration to call end to end during the drill.
+      //
+      // FIX F7 (HIGH/PLAUSIBLE, Codex second family, 2026-07-07 fix-round):
+      // `-home` binds NFSHomeDirectory to the re-home target at create
+      // time, so the confined harness (running as this account) resolves
+      // ~/.hermes to where the secrets actually get moved, instead of
+      // whatever sysadminctl would otherwise default the home to. Verified
+      // with an explicit `dscl -create NFSHomeDirectory` follow-up (belt
+      // and suspenders: `-home` is documented sysadminctl behavior, but the
+      // dscl write makes the binding explicit and independently checkable).
       await execFileAsync("/usr/sbin/sysadminctl", [
         "-addUser",
         accountName,
@@ -288,11 +469,50 @@ function realAccountProvisionOps() {
         String(uid),
         "-shell",
         "/usr/bin/false",
+        "-home",
+        homeDirectory,
         ...(comment ? ["-fullName", comment] : []),
       ]);
       await execFileAsync("/usr/bin/dscl", [".", "-create", `/Users/${accountName}`, "IsHidden", "1"]);
+      await execFileAsync("/usr/bin/dscl", [
+        ".",
+        "-create",
+        `/Users/${accountName}`,
+        "NFSHomeDirectory",
+        homeDirectory,
+      ]);
     },
   };
+}
+
+/** Recursively chmod a file or directory tree (files 0600, dirs 0700), matching custody mode for both shapes. */
+async function chmodRecursive(path: string): Promise<void> {
+  const st = await stat(path);
+  if (st.isDirectory()) {
+    await chmod(path, 0o700);
+    const { readdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const entries = await readdir(path);
+    for (const entry of entries) {
+      await chmodRecursive(join(path, entry));
+    }
+  } else {
+    await chmod(path, 0o600);
+  }
+}
+
+/** Recursively chown a file or directory tree to uid/gid. */
+async function chownRecursive(path: string, uid: number, gid: number): Promise<void> {
+  await fsChown(path, uid, gid);
+  const st = await stat(path);
+  if (st.isDirectory()) {
+    const { readdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const entries = await readdir(path);
+    for (const entry of entries) {
+      await chownRecursive(join(path, entry), uid, gid);
+    }
+  }
 }
 
 function realRehomeOps() {
@@ -310,13 +530,12 @@ function realRehomeOps() {
       await mkdir(dirname(backupPath), { recursive: true, mode: 0o700 });
       const st = await stat(path);
       if (st.isDirectory()) {
-        // Directory backups are handled by the caller's move step via a
-        // recursive copy in production; kept minimal here since Hermes v1's
-        // secret paths are predominantly files. A directory-shaped secret
-        // path (e.g. google-mcp-creds/) still gets its parent created
-        // root-only; the fail-closed contract is the permission mode, not
-        // the recursion strategy.
-        await mkdir(backupPath, { recursive: true, mode: 0o700 });
+        // FIX F2 (2026-07-07 fix-round): the M4 custody copy for a
+        // directory-shaped secret (e.g. `.hermes/google-mcp-creds/`,
+        // `.workspace-mcp/cli-tokens/`) must be a REAL recursive copy, not
+        // an empty placeholder directory -- an empty backup is not a backup.
+        await cp(path, backupPath, { recursive: true, mode: 0o700 });
+        await chmodRecursive(backupPath);
       } else {
         await copyFile(path, backupPath);
         await chmod(backupPath, 0o600);
@@ -328,11 +547,46 @@ function realRehomeOps() {
       await rename(sourcePath, destPath);
     },
     chown: async (path: string, uid: number, gid: number): Promise<void> => {
-      await fsChown(path, uid, gid);
+      await chownRecursive(path, uid, gid);
     },
-    restore: async (backupPath: string, destPath: string): Promise<void> => {
-      await mkdir(dirname(destPath), { recursive: true, mode: 0o700 });
-      await copyFile(backupPath, destPath);
+    /**
+     * FIX F2 (2026-07-07 fix-round): restore is a REVERSE-MOVE of `destPath`
+     * (where `move`'s `rename` actually put the data) back to `sourcePath` --
+     * correct for files AND directories, closing the defect where
+     * `copyFile` on a directory threw and the M4 backup (previously an
+     * empty placeholder dir) could not stand in for it either. Falls back
+     * to the M4 backup copy ONLY if `destPath` itself is already gone
+     * (e.g. a prior partial rollback already moved it), so a legitimate
+     * custody copy is never left unused when it is the only remaining copy.
+     * Reports whether data actually ended up at `sourcePath` -- never
+     * assumes success.
+     */
+    restore: async (destPath: string, sourcePath: string): Promise<{ restored: boolean }> => {
+      const destExists = await pathExists(destPath);
+      await mkdir(dirname(sourcePath), { recursive: true, mode: 0o700 });
+      if (destExists) {
+        await rename(destPath, sourcePath);
+        return { restored: await pathExists(sourcePath) };
+      }
+      // destPath is already gone (unusual: implies a partial rollback
+      // already ran). Fall back to the M4 backup copy, if this path had one.
+      const backupRoot = "/var/root/.sanctuary-rehome-backups";
+      const backupPath = `${backupRoot}${sourcePath}.bak`;
+      if (await pathExists(backupPath)) {
+        const st = await stat(backupPath);
+        if (st.isDirectory()) {
+          await cp(backupPath, sourcePath, { recursive: true });
+        } else {
+          await copyFile(backupPath, sourcePath);
+        }
+        return { restored: await pathExists(sourcePath) };
+      }
+      return { restored: false };
+    },
+    /** Fix F3: hand custody of a restored secret back to the operator. */
+    restoreCustody: async (path: string, operatorUid: number, operatorGid: number): Promise<void> => {
+      await chmodRecursive(path);
+      await chownRecursive(path, operatorUid, operatorGid);
     },
   };
 }

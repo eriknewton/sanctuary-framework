@@ -18,22 +18,38 @@ import {
 
 const OPERATOR_HOME = "/Users/operator";
 const NEW_ACCOUNT_HOME = "/var/sanctuary-agents/sanctuary-hermes";
+const OPERATOR_UID_GID = { uid: 501, gid: 501 };
 
-function mockOps(existingPaths: Set<string>, overrides: Partial<RehomeOps> = {}): RehomeOps & {
+/**
+ * In-memory filesystem-tree simulation so restore tests can assert that
+ * data ACTUALLY moves, not merely that a function was called with the right
+ * arguments. `contents` maps a path to its "file contents" (a directory is
+ * represented by keying every file under it, e.g. `<dir>/token.json`).
+ */
+function mockOps(
+  existingPaths: Set<string>,
+  overrides: Partial<RehomeOps> = {},
+): RehomeOps & {
   backups: string[];
   moves: Array<{ from: string; to: string }>;
   chowns: Array<{ path: string; uid: number; gid: number }>;
-  restores: Array<{ backupPath: string; destPath: string }>;
+  restores: Array<{ destPath: string; sourcePath: string }>;
+  restoreCustodyCalls: Array<{ path: string; uid: number; gid: number }>;
+  contents: Map<string, string>;
 } {
   const backups: string[] = [];
   const moves: Array<{ from: string; to: string }> = [];
   const chowns: Array<{ path: string; uid: number; gid: number }> = [];
-  const restores: Array<{ backupPath: string; destPath: string }> = [];
+  const restores: Array<{ destPath: string; sourcePath: string }> = [];
+  const restoreCustodyCalls: Array<{ path: string; uid: number; gid: number }> = [];
+  const contents = new Map<string, string>();
   return {
     backups,
     moves,
     chowns,
     restores,
+    restoreCustodyCalls,
+    contents,
     pathExists: async (path) => existingPaths.has(path),
     backup: async (path) => {
       const backupPath = `/root/.sanctuary-rehome-backups${path}.bak`;
@@ -46,8 +62,21 @@ function mockOps(existingPaths: Set<string>, overrides: Partial<RehomeOps> = {})
     chown: async (path, uid, gid) => {
       chowns.push({ path, uid, gid });
     },
-    restore: async (backupPath, destPath) => {
-      restores.push({ backupPath, destPath });
+    restore: async (destPath, sourcePath) => {
+      restores.push({ destPath, sourcePath });
+      // Simulate a reverse-move: reproduce whatever "content" is recorded at
+      // destPath (the real path the data lives at post-move) back onto
+      // sourcePath, mirroring the production reverse-rename semantics.
+      const data = contents.get(destPath);
+      if (data !== undefined) {
+        contents.set(sourcePath, data);
+        contents.delete(destPath);
+        return { restored: true };
+      }
+      return { restored: false };
+    },
+    restoreCustody: async (path, uid, gid) => {
+      restoreCustodyCalls.push({ path, uid, gid });
     },
     ...overrides,
   };
@@ -154,7 +183,7 @@ describe("castle-wall/provision/rehome", () => {
   });
 
   describe("restoreRehomeSteps", () => {
-    it("restores every moved step from its backup (or dest, when no backup) and skips absent steps", async () => {
+    it("restores every moved step via a REVERSE-MOVE from destPath (fix F2: not the shallow backup) and skips absent steps", async () => {
       const plan = planRehome(hermesRehomeAdapter, {
         operatorHome: OPERATOR_HOME,
         newAccountHome: NEW_ACCOUNT_HOME,
@@ -162,9 +191,98 @@ describe("castle-wall/provision/rehome", () => {
       const allPaths = new Set(plan.steps.map((s) => s.entry.sourcePath));
       const ops = mockOps(allPaths);
       const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+      // Simulate the real data living at destPath post-move (this is what
+      // `move` = `rename` guarantees in production).
+      for (const r of results) {
+        if (r.status === "moved") ops.contents.set(r.destPath, `data-for-${r.destPath}`);
+      }
 
-      await restoreRehomeSteps(results, ops);
+      const restoreResult = await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
       expect(ops.restores.length).toBe(results.filter((r) => r.status === "moved").length);
+      // The restore call must pass destPath (where the data actually is),
+      // not backupPath (the M4 custody copy) -- fix F2's reverse-move.
+      for (const r of results.filter((x) => x.status === "moved")) {
+        expect(ops.restores.some((call) => call.destPath === r.destPath && call.sourcePath === r.entry.sourcePath)).toBe(
+          true,
+        );
+      }
+      expect(restoreResult.fullyRestored).toBe(true);
+      expect(restoreResult.steps.filter((s) => s.status === "restored").length).toBe(
+        results.filter((r) => r.status === "moved").length,
+      );
+    });
+
+    it("fix F2: a directory-shaped secret's restore reproduces the actual contents (not an empty dir) and returns them to the operator", async () => {
+      // Ground this in the exact defect: `.hermes/google-mcp-creds/` is a
+      // directory-shaped secret in the real Hermes adapter. This test
+      // exercises restore for a directory entry and asserts the DATA (not
+      // just an empty placeholder) comes back to the operator's source path.
+      const dirAdapter: AgentRehomeAdapter = {
+        harnessId: "test-dir",
+        pathsToRehome: (home) => [
+          {
+            sourcePath: `${home}/.hermes/google-mcp-creds`,
+            destRelativePath: ".hermes/google-mcp-creds",
+            isSecret: true,
+          },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const plan = planRehome(dirAdapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const sourceDir = `${OPERATOR_HOME}/.hermes/google-mcp-creds`;
+      const ops = mockOps(new Set([sourceDir]));
+      const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+      expect(results[0]?.status).toBe("moved");
+      const destDir = results[0]!.destPath;
+      // The directory's real content now lives at destPath (a real `rename`
+      // moves the whole tree, unlike the old shallow `mkdir` backup).
+      ops.contents.set(destDir, "oauth-refresh-token-contents");
+
+      const restoreResult = await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
+
+      expect(restoreResult.fullyRestored).toBe(true);
+      expect(ops.contents.get(sourceDir)).toBe("oauth-refresh-token-contents");
+      expect(ops.contents.has(destDir)).toBe(false);
+      // Fix F3: custody handed back to the operator for the restored secret.
+      expect(ops.restoreCustodyCalls).toEqual([
+        { path: sourceDir, uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid },
+      ]);
+    });
+
+    it("fix F2/F5: reports a FAILED restore (not a hardcoded success) when the ops layer cannot reproduce the data", async () => {
+      const plan = planRehome(hermesRehomeAdapter, {
+        operatorHome: OPERATOR_HOME,
+        newAccountHome: NEW_ACCOUNT_HOME,
+      });
+      const allPaths = new Set(plan.steps.map((s) => s.entry.sourcePath));
+      const ops = mockOps(allPaths, {
+        restore: async () => ({ restored: false }),
+      });
+      const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+
+      const restoreResult = await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
+      expect(restoreResult.fullyRestored).toBe(false);
+      expect(restoreResult.steps.every((s) => s.status === "skipped-absent" || s.status === "failed")).toBe(true);
+    });
+
+    it("fix F3: restore hands custody (chmod/chown) back to the operator for secret entries only", async () => {
+      const plan = planRehome(hermesRehomeAdapter, {
+        operatorHome: OPERATOR_HOME,
+        newAccountHome: NEW_ACCOUNT_HOME,
+      });
+      const allPaths = new Set(plan.steps.map((s) => s.entry.sourcePath));
+      const ops = mockOps(allPaths);
+      const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+      for (const r of results) {
+        if (r.status === "moved") ops.contents.set(r.destPath, "secret-data");
+      }
+
+      await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
+      const movedCount = results.filter((r) => r.status === "moved" && r.entry.isSecret).length;
+      expect(ops.restoreCustodyCalls.length).toBe(movedCount);
+      expect(ops.restoreCustodyCalls.every((c) => c.uid === OPERATOR_UID_GID.uid && c.gid === OPERATOR_UID_GID.gid)).toBe(
+        true,
+      );
     });
   });
 });
