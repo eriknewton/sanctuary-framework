@@ -166,4 +166,42 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     });
     expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
   });
+
+  it("FIX R5-2: a restore CONFLICT (conflictPaths set) renders a data-safe Note, surfaces the conflict path, and NEVER says 'restore FAILED' or overwrite-from-backup", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "install-daemon",
+        reason: "launchctl bootstrap exited 5",
+        rolledBack: false,
+        rehomeAttempted: true,
+        backupPaths: ["/var/root/.sanctuary-rehome-backups/x.bak"],
+        conflictPaths: ["/Users/op/.hermes/.env.restored-conflict"],
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/^ {2}Note:/);
+    expect(out[0]).not.toMatch(/restore of your re-homed files FAILED/);
+    expect(out[0]).toContain("/Users/op/.hermes/.env.restored-conflict");
+    expect(out[0]).toMatch(/reconcile/i);
+    expect(out[0]).toMatch(/do NOT overwrite/);
+  });
+
+  it("FIX R5-2: a daemon-teardown failure WITH a conflict still WARNs (daemon live) but also surfaces the conflict path and no overwrite-from-backup", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "verify-before-arm",
+        reason: "unreachable",
+        rolledBack: false,
+        daemonTeardownFailed: true,
+        conflictPaths: ["/Users/op/.hermes/.env.restored-conflict"],
+      },
+    });
+    expect(out[0]).toMatch(/^ {2}WARNING:/);
+    expect(out[0]).toContain("/Users/op/.hermes/.env.restored-conflict");
+    expect(out[0]).toMatch(/do NOT overwrite/);
+  });
 });

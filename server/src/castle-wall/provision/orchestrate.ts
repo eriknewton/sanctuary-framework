@@ -98,6 +98,15 @@ export interface ProvisionFlowOps {
     restoredCount: number;
     attemptedCount: number;
     backupPaths: string[];
+    /**
+     * FIX (round 5 / R5-2): the sibling paths where a RECREATED-source R6
+     * conflict left the recovered re-homed data. A conflict is NOT a failed
+     * restore -- the operator's recreated file is intact and the re-homed copy
+     * is safe here -- so the orchestrator must surface these instead of
+     * collapsing them into a false "restore FAILED" that misdirects the
+     * operator to overwrite their newer file from the stale backup.
+     */
+    conflictPaths: string[];
   }>;
 }
 
@@ -164,6 +173,14 @@ export type ProvisionFlowOutcome =
        * wrong signal for the account's existence.
        */
       accountCreated?: boolean;
+      /**
+       * FIX (round 5 / R5-2): sibling paths holding recovered re-homed data
+       * after a RECREATED-source R6 conflict during restore. Non-empty means
+       * the operator's recreated file(s) are intact and the re-homed copy is
+       * safe at these paths -- the CLI renders reconcile-manually guidance and
+       * must NEVER tell the operator to overwrite from the stale backup.
+       */
+      conflictPaths?: string[];
     }
   | { kind: "armed-then-rolled-back"; uid: number; reason: string }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
@@ -307,10 +324,11 @@ export async function runProvisionFlow(
         // rolledBack: true (nothing to roll back), which is the honest state.
         rolledBack: restore.rolledBack,
         backupPaths: restore.backupPaths,
+        conflictPaths: restore.conflictPaths,
         // FIX (round 5 / R3-2): only "attempted" if a move actually landed;
         // an empty-partialResults rehome throw moved nothing, so the CLI
         // shows the neutral "nothing changed" frame, not a restore claim.
-        rehomeAttempted: partialResults.length > 0,
+        rehomeAttempted: partialResults.some((r) => r.status === "moved"),
         // FIX (round 5 / R4-2): create-account already succeeded by the time
         // re-home runs, so an orphaned hidden account exists even when nothing
         // moved -- the neutral frame must not claim "no account was created".
@@ -336,8 +354,9 @@ export async function runProvisionFlow(
       reason: withDaemonTeardownNote((err as Error).message, td.daemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.length > 0,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
   }
@@ -364,8 +383,9 @@ export async function runProvisionFlow(
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.length > 0,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
   }
@@ -382,8 +402,9 @@ export async function runProvisionFlow(
       reason: withDaemonTeardownNote(existenceCheck.reason, td.daemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.length > 0,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
   }
@@ -401,8 +422,9 @@ export async function runProvisionFlow(
       reason: withDaemonTeardownNote(armResult.error, td.daemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.length > 0,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
   }
@@ -478,17 +500,24 @@ function describeRestoreForReason(rolledBack: boolean | "partial"): string {
 async function safeRestore(
   ops: ProvisionFlowOps,
   results: RehomeStepResult[],
-): Promise<{ rolledBack: boolean | "partial"; backupPaths: string[] }> {
+): Promise<{ rolledBack: boolean | "partial"; backupPaths: string[]; conflictPaths: string[] }> {
   try {
-    const { fullyRestored, restoredCount, backupPaths } = await ops.restoreRehome(results);
+    const { fullyRestored, restoredCount, backupPaths, conflictPaths } = await ops.restoreRehome(results);
     const rolledBack: boolean | "partial" = fullyRestored ? true : restoredCount > 0 ? "partial" : false;
-    return { rolledBack, backupPaths };
+    // FIX (round 5 / R5-2): surface R6 conflict paths so the caller/CLI can
+    // report "recovered data is safe at <conflictPath>; reconcile manually"
+    // instead of a false "restore FAILED / overwrite from the stale backup".
+    return { rolledBack, backupPaths, conflictPaths: conflictPaths ?? [] };
   } catch {
     // Best-effort call, but the OUTCOME must be honest: a restore that threw
     // is a failed restore, not a successful one. The original abort reason
     // this was invoked from is preserved by the caller; this function only
     // ever reports on the restore itself.
-    return { rolledBack: false, backupPaths: results.filter((r) => r.backupPath).map((r) => r.backupPath!) };
+    return {
+      rolledBack: false,
+      backupPaths: results.filter((r) => r.backupPath).map((r) => r.backupPath!),
+      conflictPaths: [],
+    };
   }
 }
 
@@ -505,7 +534,12 @@ async function safeRestore(
 async function teardownDaemonAndRestore(
   ops: ProvisionFlowOps,
   results: RehomeStepResult[],
-): Promise<{ rolledBack: boolean | "partial"; backupPaths: string[]; daemonTeardownError?: string }> {
+): Promise<{
+  rolledBack: boolean | "partial";
+  backupPaths: string[];
+  conflictPaths: string[];
+  daemonTeardownError?: string;
+}> {
   let daemonTeardownError: string | undefined;
   try {
     await ops.uninstallHarnessDaemon();
@@ -513,7 +547,12 @@ async function teardownDaemonAndRestore(
     daemonTeardownError = (err as Error).message;
   }
   const restore = await safeRestore(ops, results);
-  return { rolledBack: restore.rolledBack, backupPaths: restore.backupPaths, daemonTeardownError };
+  return {
+    rolledBack: restore.rolledBack,
+    backupPaths: restore.backupPaths,
+    conflictPaths: restore.conflictPaths,
+    daemonTeardownError,
+  };
 }
 
 /**

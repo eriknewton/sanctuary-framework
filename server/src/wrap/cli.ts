@@ -1182,6 +1182,15 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
     outcome.backupPaths !== undefined && outcome.backupPaths.length > 0
       ? ` Backup copies remain at: ${outcome.backupPaths.join(", ")}.`
       : "";
+  // FIX (round 5 / R5-2): an R6 restore CONFLICT means the operator recreated
+  // a re-homed file during provisioning; their recreated file was left intact
+  // and the previously re-homed copy is preserved at conflictPaths. This is
+  // NOT a failed restore and the operator must NOT be told to overwrite from
+  // the stale backup (that would destroy their newer file).
+  const conflictNote =
+    outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0
+      ? ` Your file(s) recreated during provisioning were left intact; the previously re-homed copy is preserved at: ${outcome.conflictPaths.join(", ")} -- reconcile these by hand, and do NOT overwrite them from the backup.`
+      : "";
   // FIX (round 5 / R2-2): a failed daemon teardown means a root LaunchDaemon
   // may STILL BE LIVE regardless of whether the re-home restore succeeded, so
   // it gets the LOUD frame -- never the soft "Note: ... re-run to retry" line
@@ -1191,8 +1200,20 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
   if (outcome.daemonTeardownFailed) {
     return [
       `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}).` +
-        ` A root harness LaunchDaemon may still be running under the dedicated account.${backupNote}` +
+        ` A root harness LaunchDaemon may still be running under the dedicated account.${backupNote}${conflictNote}` +
         ` Do not re-run until you have torn it down (see the note above) and recovered any files.`,
+    ];
+  }
+  // FIX (round 5 / R5-2): surface a restore conflict as its own honest frame
+  // (data is safe at conflictPaths) BEFORE the rolledBack branches, which would
+  // otherwise render a pure conflict (restoredCount 0 -> rolledBack false) as
+  // "restore FAILED / recover from backup" -- a false alarm that also
+  // misdirects the operator to clobber their newer recreated file.
+  if (outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0) {
+    return [
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}).` +
+        conflictNote +
+        ` The cooperative wrap above still applies. Reconcile the file(s) above, then re-run 'sanctuary protect --hermes'.`,
     ];
   }
   // FIX (round 5 / R3-2): a pre-re-home abort (root-check, operator-identity,

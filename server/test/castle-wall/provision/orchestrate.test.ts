@@ -71,6 +71,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       restoredCount: REHOME_RESULTS.length,
       attemptedCount: REHOME_RESULTS.length,
       backupPaths: REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
+      conflictPaths: [],
     })),
     ...overrides,
   };
@@ -456,6 +457,7 @@ describe("castle-wall/provision/orchestrate", () => {
         restoredCount: 1,
         attemptedCount: 2,
         backupPaths: ["/root/backup/.hermes/.env.bak"],
+        conflictPaths: [],
       })),
     });
     const result = await runProvisionFlow(baseCtx(), ops);
@@ -463,5 +465,43 @@ describe("castle-wall/provision/orchestrate", () => {
     if (result.kind === "aborted") {
       expect(result.backupPaths).toEqual(["/root/backup/.hermes/.env.bak"]);
     }
+  });
+
+  it("FIX (round 5, R5-2): a post-install abort whose restore hit an R6 CONFLICT carries conflictPaths onto the outcome (so the CLI surfaces it, not a false 'restore FAILED')", async () => {
+    const ops = happyPathOps({
+      installHarnessDaemon: vi.fn(async () => {
+        throw new Error("launchctl bootstrap exited 5");
+      }),
+      restoreRehome: vi.fn(async () => ({
+        fullyRestored: false,
+        restoredCount: 0,
+        attemptedCount: 1,
+        backupPaths: ["/root/backup/.hermes/.env.bak"],
+        conflictPaths: ["/Users/operator/.hermes/.env.restored-conflict"],
+      })),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+    expect((result as { conflictPaths?: string[] }).conflictPaths).toEqual([
+      "/Users/operator/.hermes/.env.restored-conflict",
+    ]);
+  });
+
+  it("FIX (round 5, R5-3): an abort where every re-home entry was skipped-absent reports rehomeAttempted:false (nothing MOVED, so no false 'restored' claim)", async () => {
+    const ops = happyPathOps({
+      rehome: vi.fn(async () => ({
+        plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
+        results: [
+          {
+            entry: { sourcePath: "/Users/op/.hermes/.env", destRelativePath: ".hermes/.env", isSecret: true },
+            destPath: "/var/sanctuary-agents/sanctuary-hermes/.hermes/.env",
+            status: "skipped-absent" as const,
+          },
+        ],
+      })),
+      checkUidExistence: vi.fn(async () => ({ ok: false as const, accountName: "sanctuary-hermes", reason: "account does not exist" })),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "uid-existence-gate", rehomeAttempted: false });
   });
 });

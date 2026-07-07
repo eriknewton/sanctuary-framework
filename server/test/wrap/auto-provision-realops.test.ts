@@ -1165,11 +1165,38 @@ describe("wrap/auto-provision real-ops chokepoint: backup() shape handling (fix 
       const ops = realRehomeOps({ backupRoot });
       const first = await ops.backup(linkSrc);
       // Second backup (the "re-run to retry" path) must NOT reject with EEXIST
-      // -- the file/dir branches overwrite silently; the symlink branch now
-      // removes any stale .bak before re-linking.
+      // -- the rm-first (R5-1) makes every branch idempotent.
       const second = await ops.backup(linkSrc);
       expect(second.backupPath).toBe(first.backupPath);
       expect((await lstat(second.backupPath)).isSymbolicLink()).toBe(true);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX R5-1: backup() FILE branch never FOLLOWS a stale symlink .bak (cross-shape retry) -- no secret-through-link leak, no victim clobber", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-backup-file-stalelink-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const victim = join(tmpRoot, "victim.txt");
+      await writeFile(victim, "OPERATOR-DATA-MUST-SURVIVE");
+      await chmod(victim, 0o644);
+      const srcFile = join(tmpRoot, "secret.env");
+      await writeFile(srcFile, "SUPER-SECRET-LLM-KEY");
+      // A stale symlink .bak left by a prior run when the secret was a symlink
+      // (nothing cleans up the backup root). copyFile would FOLLOW it.
+      const backupPath = `${backupRoot}${srcFile}.bak`;
+      await mkdir(dirname(backupPath), { recursive: true });
+      await symlink(victim, backupPath);
+
+      const { backupPath: returned } = await realRehomeOps({ backupRoot }).backup(srcFile);
+
+      // The backup is now a REAL file holding the secret (not a symlink); the
+      // secret was NOT written through the link, and the victim is untouched.
+      expect((await lstat(returned)).isSymbolicLink()).toBe(false);
+      expect(await readFile(returned, "utf8")).toBe("SUPER-SECRET-LLM-KEY");
+      expect(await readFile(victim, "utf8")).toBe("OPERATOR-DATA-MUST-SURVIVE");
+      expect((await stat(victim)).mode & 0o777).toBe(0o644);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }

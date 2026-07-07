@@ -858,6 +858,13 @@ export async function runAutoProvisionForWrap(
         restoredCount: restoreResult.steps.filter((s) => s.status === "restored").length,
         attemptedCount: restoreResult.steps.filter((s) => s.status !== "skipped-absent").length,
         backupPaths: results.filter((r) => r.backupPath !== undefined).map((r) => r.backupPath!),
+        // FIX (round 5 / R5-2): surface R6 conflict paths (recreated-source
+        // restores) so the orchestrator/CLI report "recovered data is safe at
+        // <conflictPath>; reconcile manually" instead of a false "restore
+        // FAILED / overwrite from the stale backup".
+        conflictPaths: restoreResult.steps
+          .filter((s) => s.status === "conflict" && s.conflictPath !== undefined)
+          .map((s) => s.conflictPath!),
       };
     },
   };
@@ -1194,6 +1201,17 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       // after the copy, closing the umask-dependent window.
       const backupPath = `${backupRoot}${path}.bak`;
       await mkdir(dirname(backupPath), { recursive: true, mode: 0o700 });
+      // FIX (round 5 / R5-1, generalizing R4-1): remove any pre-existing name
+      // at backupPath BEFORE writing, for ALL shapes. Nothing cleans up the
+      // backup root, so a `.bak` from a prior aborted run survives; if it is a
+      // stale SYMLINK, `copyFile`/`cp` (file/dir branches) FOLLOW it -- writing
+      // the secret's plaintext THROUGH the link to its old (possibly
+      // operator-readable) target and clobbering whatever lived there (M4 /
+      // AGENTS.md #6 leak + data-loss), while `symlink()` throws EEXIST. A
+      // single no-follow rm-first makes every branch idempotent AND never
+      // follows a stale link. Safe: the backup is always re-derived from the
+      // current source (which must exist for backup to run).
+      await rm(backupPath, { force: true, recursive: true });
       // FIX (round 5 / R3-1): decide the shape by `lstat` (no-follow), not
       // `stat`. A symlinked secret must be backed up as the LINK itself, never
       // dereferenced -- otherwise `stat` reports a symlink-to-directory as a
@@ -1208,15 +1226,6 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
         // original link on abort (R2-1), so this backup only needs to restore
         // the link if destPath is ever gone. No chmod: a symlink's own mode is
         // irrelevant and must never be dereferenced.
-        //
-        // FIX (round 5 / R4-1): idempotent write. `symlink()` has no overwrite
-        // option and throws EEXIST if a `.bak` from a prior aborted run is
-        // still present (the file/dir branches below overwrite silently via
-        // copyFile/cp), which would break the advertised "re-run to retry"
-        // recovery loop for symlink-shaped secrets. The backup is always
-        // re-derived from the current source (which must exist for backup to
-        // run), so removing a stale prior backup first is safe.
-        await rm(backupPath, { force: true, recursive: true });
         await symlink(await readlink(path), backupPath);
       } else if (st.isDirectory()) {
         // FIX F2 (2026-07-07 fix-round): the M4 custody copy for a
