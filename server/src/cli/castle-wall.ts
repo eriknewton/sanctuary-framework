@@ -164,6 +164,20 @@ export interface CastleWallParsedArgs {
    * error instead of silently falling back to the raw dump.
    */
   ruleMissingValue?: boolean;
+  /**
+   * `enable --agent-uid=<uid>` (Build 3, one-command arm): fold
+   * `configure-origin uid` into `enable` so an operator can configure-then-arm
+   * in one command. Raw string, parsed/validated downstream via
+   * `validateAgentOrigin` - never trust this as a well-formed uid on its own.
+   * Explicit-flag-only; never auto-derived.
+   */
+  agentUid?: string;
+  /**
+   * `enable --ceiling=<uid>` (Build 3): optional system-uid allow-ceiling
+   * paired with `--agent-uid`. Defaults to 500 (matching `configure-origin`)
+   * when `--agent-uid` is given but `--ceiling` is not.
+   */
+  ceiling?: string;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -281,10 +295,7 @@ function write(stream: Writable, text: string): void {
  */
 async function defaultAgentOriginDescriptorPresent(fortressPath: string): Promise<boolean> {
   try {
-    const raw = await readFile(
-      join(fortressPath, "policy", "egress", "agent-origin.json"),
-      "utf8",
-    );
+    const raw = await readFile(agentOriginDescriptorPath(fortressPath), "utf8");
     return validateAgentOrigin(JSON.parse(raw)) !== null;
   } catch {
     return false;
@@ -2066,6 +2077,73 @@ function perRuleGroupRecord(group: PerRuleGroup): Record<string, unknown> {
   };
 }
 
+/** Filesystem path of the agent-origin descriptor within a fortress. */
+function agentOriginDescriptorPath(fortressPath: string): string {
+  return join(fortressPath, "policy", "egress", "agent-origin.json");
+}
+
+/**
+ * Strict uid/ceiling flag parse (shared chokepoint for `--agent-uid` /
+ * `--ceiling` in BOTH `configure-origin` and the `enable` fold-in). Returns a
+ * number ONLY when the ENTIRE string is decimal digits; anything else returns
+ * null so the caller fails closed. `parseInt` is NOT usable here: it silently
+ * truncates, so `parseInt("501abc",10)===501`, `parseInt("502.9",10)===502`,
+ * `parseInt("1e10",10)===1` - each a WRONG-but-plausible uid that could fail
+ * OPEN (leave the agent unconfined) or cut a system daemon. Rejecting the whole
+ * token is the only safe read of an operator-supplied uid.
+ */
+function parseUidFlag(value: string): number | null {
+  if (!/^\d+$/.test(value)) {
+    return null;
+  }
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * Shared build+validate+write path for the agent-origin descriptor (DRY
+ * chokepoint used by BOTH `configure-origin` and `enable --agent-uid`; do not
+ * copy-paste this logic into a second call site). Validates the candidate via
+ * {@link validateAgentOrigin} BEFORE writing anything - a structurally invalid
+ * candidate (e.g. uid mode missing `agent_uid`) is rejected and nothing is
+ * written or overwritten on disk, preserving the fail-closed invariant that a
+ * half-built descriptor must never reach the filesystem (see the file-level
+ * doc comment in `agent-origin.ts`).
+ */
+async function writeAgentOriginDescriptor(
+  fortressPath: string,
+  candidate: Record<string, unknown>,
+): Promise<
+  | { ok: true; validated: ReturnType<typeof validateAgentOrigin> & object; path: string }
+  | { ok: false; error: string }
+> {
+  const validated = validateAgentOrigin(candidate);
+  if (validated === null) {
+    return {
+      ok: false,
+      error:
+        "agent-origin descriptor is invalid (uid mode requires agent_uid a positive integer >= the ceiling; root/0 and sub-ceiling uids are rejected).",
+    };
+  }
+
+  const originPath = agentOriginDescriptorPath(fortressPath);
+  try {
+    await mkdir(join(fortressPath, "policy", "egress"), {
+      recursive: true,
+      mode: 0o700,
+    });
+    await writeFile(originPath, JSON.stringify(validated, null, 2) + "\n", {
+      mode: 0o600,
+    });
+    return { ok: true, validated, path: originPath };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 export async function runConfigureOrigin(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {}
@@ -2075,7 +2153,6 @@ export async function runConfigureOrigin(
   const env = ctx.env ?? process.env;
   const parsed = parseCastleWallArgs(argv);
   const fortressPath = resolveFortressArg(parsed.fortress, env);
-  const originPath = join(fortressPath, "policy", "egress", "agent-origin.json");
 
   // Parse remaining positional args: configure-origin <mode> [options]
   // Usage:
@@ -2095,9 +2172,17 @@ export async function runConfigureOrigin(
     return match ? match.slice(prefix.length) : undefined;
   };
 
+  // Strict parse (no truncation) of --ceiling; applies to both modes.
+  const ceilingStr = getFlag("ceiling") ?? "500";
+  const ceiling = parseUidFlag(ceilingStr);
+  if (ceiling === null) {
+    write(err, `Error: --ceiling must be a plain non-negative integer, got '${ceilingStr}'.\n`);
+    return 1;
+  }
+
   const candidate: Record<string, unknown> = {
     mode: modeArg,
-    system_uid_allow_ceiling: parseInt(getFlag("ceiling") ?? "500", 10),
+    system_uid_allow_ceiling: ceiling,
   };
 
   if (modeArg === "uid") {
@@ -2106,7 +2191,15 @@ export async function runConfigureOrigin(
       write(err, "Error: uid mode requires --agent-uid=<uid>\n");
       return 2;
     }
-    candidate.agent_uid = parseInt(uidStr, 10);
+    // Strict parse (no truncation): a wrong-but-plausible uid can fail open or
+    // cut a system daemon. The semantic floor (>= 1 and >= ceiling) is enforced
+    // in validateAgentOrigin (the shared chokepoint) via writeAgentOriginDescriptor.
+    const agentUid = parseUidFlag(uidStr);
+    if (agentUid === null) {
+      write(err, `Error: --agent-uid must be a plain positive integer, got '${uidStr}'.\n`);
+      return 1;
+    }
+    candidate.agent_uid = agentUid;
   } else {
     const signingId = getFlag("signing-id");
     const teamId = getFlag("team-id");
@@ -2123,28 +2216,16 @@ export async function runConfigureOrigin(
     }
   }
 
-  const validated = validateAgentOrigin(candidate);
-  if (validated === null) {
-    write(err, "Error: agent-origin descriptor is structurally invalid.\n");
+  const result = await writeAgentOriginDescriptor(fortressPath, candidate);
+  if (!result.ok) {
+    write(err, `Error: ${result.error}\n`);
     return 1;
   }
 
-  try {
-    await mkdir(join(fortressPath, "policy", "egress"), {
-      recursive: true,
-      mode: 0o700,
-    });
-    await writeFile(originPath, JSON.stringify(validated, null, 2) + "\n", {
-      mode: 0o600,
-    });
-    write(out, `Agent origin configured: mode=${validated.mode}\n`);
-    write(out, `Written to: ${originPath}\n`);
-    write(out, "Run 'sanctuary castle-wall reload' to apply.\n");
-    return 0;
-  } catch (error) {
-    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
-  }
+  write(out, `Agent origin configured: mode=${result.validated.mode}\n`);
+  write(out, `Written to: ${result.path}\n`);
+  write(out, "Run 'sanctuary castle-wall reload' to apply.\n");
+  return 0;
 }
 
 const HOST_APP_RELATIVE_BINARY =
@@ -2796,13 +2877,67 @@ async function runArmDisarm(
     }
   }
 
+  if (action === "enable" && parsed.agentUid !== undefined) {
+    // One-command arm (Build 3, 2026-07-06): fold `configure-origin uid` into
+    // `enable` so an operator can configure-then-arm in a single command.
+    // Explicit `--agent-uid` ONLY - never auto-derived (a wrong-uid inference
+    // could cut the operator; that inference is the deliberately-deferred
+    // Build 3b). Validate + write BEFORE the origin-descriptor guard below so
+    // a freshly-written descriptor satisfies that guard in the same run. Uses
+    // the SAME build/validate/write chokepoint as `configure-origin` -
+    // `writeAgentOriginDescriptor` - so the two entry points cannot drift.
+    // Fail-closed: an invalid/malformed uid or ceiling is rejected here and
+    // `enable` returns non-zero WITHOUT arming, matching the #884 hard-refuse
+    // floor (it never falls through to "no descriptor, proceed anyway").
+    // Strict parse (no truncation) - a wrong-but-plausible uid can fail OPEN
+    // (agent unconfined) or cut a system daemon. The semantic floor (>= 1 and
+    // >= ceiling) is enforced in validateAgentOrigin (the shared chokepoint).
+    const agentUid = parseUidFlag(parsed.agentUid);
+    if (agentUid === null) {
+      write(
+        err,
+        `Refusing to arm: --agent-uid must be a plain positive integer, got '${parsed.agentUid}'. Not arming.\n`,
+      );
+      return 1;
+    }
+    const ceilingStr = parsed.ceiling ?? "500";
+    const ceiling = parseUidFlag(ceilingStr);
+    if (ceiling === null) {
+      write(
+        err,
+        `Refusing to arm: --ceiling must be a plain non-negative integer, got '${ceilingStr}'. Not arming.\n`,
+      );
+      return 1;
+    }
+    const candidate: Record<string, unknown> = {
+      mode: "uid",
+      agent_uid: agentUid,
+      system_uid_allow_ceiling: ceiling,
+    };
+    const result = await writeAgentOriginDescriptor(fortressPath, candidate);
+    if (!result.ok) {
+      write(
+        err,
+        `Refusing to arm: --agent-uid=${parsed.agentUid} --ceiling=${ceiling} produced an invalid agent-origin descriptor (${result.error}). ` +
+          `agent_uid must be a positive integer >= the ceiling (root/0 and sub-ceiling uids are rejected). Not arming.\n`,
+      );
+      return 1;
+    }
+    write(
+      out,
+      `Agent origin configured: mode=uid agent_uid=${result.validated.agent_uid} ceiling=${result.validated.system_uid_allow_ceiling}\n`,
+    );
+  }
+
   if (action === "enable") {
     // Origin-descriptor boot-cut guard (#877 follow-up; refuse upgrade of the
     // #883 warning). With NO valid agent-origin descriptor set, the macOS
     // OriginClassifier classifies EVERY flow `.agent`, so arming default-denies
     // the operator's OWN SSH / Tailscale / operator shell (the boot-cut). Like
     // the sibling no-daemon / no-boot-service brick guards above, this REFUSES
-    // without `--force` so the lockout is PREVENTED, not merely narrated.
+    // without `--force` so the lockout is PREVENTED, not merely narrated. When
+    // `--agent-uid` was passed above, the descriptor we just wrote satisfies
+    // this guard directly (no `--force` needed for the one-command path).
     // `--force` still arms agent-only (an intentional no-operator lockdown) but
     // warns loudly that operator access will be cut.
     const originProbe =
@@ -3038,6 +3173,10 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.scope = parseScope(argv[++i]);
     } else if (arg === "--force") {
       parsed.force = true;
+    } else if (arg.startsWith("--agent-uid=")) {
+      parsed.agentUid = arg.slice("--agent-uid=".length);
+    } else if (arg.startsWith("--ceiling=")) {
+      parsed.ceiling = arg.slice("--ceiling=".length);
     } else if (arg === "--accept-broken-chain") {
       parsed.acceptBrokenChain = true;
     } else if (arg === "--by-rule") {

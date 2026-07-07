@@ -106,6 +106,55 @@ describe("castle-wall/allowlist/agent-origin : validateAgentOrigin", () => {
     ).toBeNull();
   });
 
+  // --- Floor invariant (uid mode): agent_uid must be >= 1 AND >= ceiling ---
+
+  it("rejects agent_uid 0 (root can never be the confined agent)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 0,
+        system_uid_allow_ceiling: 0,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects an agent_uid strictly below the system-uid ceiling", () => {
+    // uid inside the system-daemon allow band is nonsensical/dangerous.
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 100,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("accepts agent_uid EQUAL to the ceiling (boundary is allowed, not strictly-below)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: 500,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: 500,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("accepts the real Mini2 shape (agent_uid 502 >= ceiling 500)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: 502,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: 502,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
   it("rejects a nat descriptor with neither signing id nor team id", () => {
     expect(
       validateAgentOrigin({ mode: "nat", system_uid_allow_ceiling: 500 })
