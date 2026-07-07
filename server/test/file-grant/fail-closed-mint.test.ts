@@ -59,14 +59,23 @@ describe("file-grant fail-closed mint: rollback leaves no object AND no tree ent
     expect(await grantStore.list()).toHaveLength(0);
     // Nothing was placed at all.
     expect(fsOps.placed).toHaveLength(0);
-    // The failure is still audited.
+    // R3-1 / round 4: the durable pre-place record is written under the
+    // DISTINCT `file_grant_recorded` operation, not `file_grant`, and it DID
+    // succeed at recording (place() had not run yet, but recording itself
+    // never failed).
+    const { entries: recordedEntries } = await auditLog.query({
+      operation_type: "file_grant_recorded",
+    });
+    expect(recordedEntries).toHaveLength(1);
+    expect(recordedEntries[0]!.result).toBe("success");
+    // The failure is still audited under `file_grant`.
     const { entries } = await auditLog.query({ operation_type: "file_grant" });
     expect(entries.some((e) => e.result === "failure")).toBe(true);
-    // R3-1: a failed placement NEVER leaves a final `result:"success"`
-    // file_grant audit for a grant that never went live -- only the durable
-    // pre-place `"pending"` (step 5b) followed by `"failure"` (step 6).
+    // A failed placement NEVER leaves a final `result:"success"` `file_grant`
+    // audit for a grant that never went live -- the pre-place record above is
+    // a DISTINCT operation, so it can never be mistaken for a confirmed-live
+    // `file_grant` success.
     expect(entries.some((e) => e.result === "success")).toBe(false);
-    expect(entries.some((e) => e.result === "pending")).toBe(true);
   });
 
   it("place() recording a partial entry THEN throwing is scrubbed (no tree entry survives)", async () => {
@@ -198,8 +207,8 @@ describe("file-grant mint: audit precedes access (R2-3a)", () => {
   });
 });
 
-describe("file-grant mint: pending -> success audit sequence (R3-1)", () => {
-  it("a successful mint writes a durable pre-place 'pending' audit, then a 'success' confirmation", async () => {
+describe("file-grant mint: file_grant_recorded -> file_grant audit sequence (R3-1, revised round 4)", () => {
+  it("a successful mint writes a durable 'file_grant_recorded' audit, then a 'file_grant' success confirmation", async () => {
     const { grantStore, auditLog } = makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
@@ -210,24 +219,31 @@ describe("file-grant mint: pending -> success audit sequence (R3-1)", () => {
       auditLog,
     });
 
-    const { entries } = await auditLog.query({ operation_type: "file_grant" });
-    expect(entries).toHaveLength(2);
-
-    // Step 5b: the durable pre-place audit, written BEFORE place() ran.
-    expect(entries[0]!.result).toBe("pending");
-    expect(entries[0]!.details?.["phase"]).toBe("recorded");
-    expect(entries[0]!.details?.["grant_id"]).toBe(grant.grant_id);
+    // Step 5b: the durable pre-place audit, written BEFORE place() ran, under
+    // the DISTINCT `file_grant_recorded` operation (round 4: reverted from a
+    // `file_grant`/`"pending"` entry -- see mint.ts's module doc comment for
+    // why a distinct operation, not a third shared `result` value, is the
+    // fix). It reports `"success"` honestly: recording itself succeeded.
+    const { entries: recordedEntries } = await auditLog.query({
+      operation_type: "file_grant_recorded",
+    });
+    expect(recordedEntries).toHaveLength(1);
+    expect(recordedEntries[0]!.result).toBe("success");
+    expect(recordedEntries[0]!.details?.["phase"]).toBe("recorded");
+    expect(recordedEntries[0]!.details?.["grant_id"]).toBe(grant.grant_id);
 
     // Step 7: the best-effort post-place confirmation, written AFTER place()
-    // succeeded. Only THIS entry -- never the pre-place one -- reports
-    // "success", so a consumer filtering operation:"file_grant",
-    // result:"success" counts only confirmed-live grants.
-    expect(entries[1]!.result).toBe("success");
-    expect(entries[1]!.details?.["phase"]).toBe("placed");
-    expect(entries[1]!.details?.["grant_id"]).toBe(grant.grant_id);
+    // succeeded, under `file_grant`. Only THIS operation's `"success"` entry
+    // means a consumer filtering operation:"file_grant", result:"success"
+    // counts only confirmed-live grants -- the pre-place record above is a
+    // different operation entirely, so it can never be conflated with it.
+    const { entries } = await auditLog.query({ operation_type: "file_grant" });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.result).toBe("success");
+    expect(entries[0]!.details?.["phase"]).toBe("placed");
+    expect(entries[0]!.details?.["grant_id"]).toBe(grant.grant_id);
 
-    // Exactly one confirmed-success entry for this grant; the pending entry
-    // never reads as success.
+    // Exactly one confirmed-success `file_grant` entry for this grant.
     expect(
       entries.filter(
         (e) => e.result === "success" && e.details?.["grant_id"] === grant.grant_id

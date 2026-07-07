@@ -41,15 +41,7 @@ export interface AuditEntry {
   layer: "l1" | "l2" | "l3" | "l4";
   operation: string;
   identity_id: string;
-  /**
-   * `"pending"` marks a durable, pre-access audit entry for an operation whose
-   * outcome is not yet known (currently only the governed file-grant mint's
-   * pre-placement audit, `src/file-grant/mint.ts`). A consumer that filters
-   * for a completed, confirmed outcome MUST treat `"pending"` as neither
-   * `"success"` nor `"failure"` -- it is a placeholder that a later entry for
-   * the same operation resolves.
-   */
-  result: "success" | "failure" | "pending";
+  result: "success" | "failure";
   details?: Record<string, unknown>;
   contributors?: PluginContribution[];
 }

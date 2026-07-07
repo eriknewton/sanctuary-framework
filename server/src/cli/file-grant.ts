@@ -544,20 +544,24 @@ async function cmdRevoke(
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
-  // Reconcile on this mutating touch too, so a listed-but-expired grant's tree
-  // entry is scrubbed even if the operator only ever revokes.
-  await reconcileFileGrantTree({
-    store: boot.grantStore,
-    fsOps: boot.fsOps,
-    now: new Date(),
-    auditLog: boot.auditLog,
-    reconciledBy: boot.primary.identity_id,
-  });
-
-  // R3-3: mirror cmdMint's try/catch so a revokeFileGrant error (e.g. a
-  // scrub/removeEntry failure) surfaces as a clean operator-facing message
-  // and a non-zero exit, not an unhandled stack trace.
+  // R3-3 (round 4 completion): the revoke-time reconcile is now INSIDE the
+  // same clean try/catch as `revokeFileGrant` below, not a bare `await`
+  // beside it. `reconcileFileGrantTree` can throw a genuine scrub error
+  // (ENOTDIR/EACCES) while scrubbing an UNRELATED expired/revoked grant's
+  // tree entry -- that throw has nothing to do with the grant the operator
+  // is actually revoking, but it still must never surface as an unhandled
+  // rejection. Mirrors cmdMint's existing try/catch pattern.
   try {
+    // Reconcile on this mutating touch too, so a listed-but-expired grant's
+    // tree entry is scrubbed even if the operator only ever revokes.
+    await reconcileFileGrantTree({
+      store: boot.grantStore,
+      fsOps: boot.fsOps,
+      now: new Date(),
+      auditLog: boot.auditLog,
+      reconciledBy: boot.primary.identity_id,
+    });
+
     const result = await revokeFileGrant(grantId, boot.primary.identity_id, {
       fsOps: boot.fsOps,
       store: boot.grantStore,

@@ -21,30 +21,63 @@
  *      (tombstone on remove failure) exactly like step 6, writes a best-effort
  *      failure audit, and throws `FileGrantMintFailedError`. No phantom active
  *      grant survives a put()-throw.
- *   5b. DURABLE pre-placement audit, `result: "pending"`. Access must never be
- *      live without a preceding audit entry (Invariant #5 + audit-write-
- *      completeness), so the authoritative mint audit is written HERE, before
- *      `place`, and is NOT best-effort: if it throws, `place` has not run (no
- *      access exists), so the record is rolled back and the mint fails closed.
- *      It is recorded as `"pending"`, not `"success"`, because `place` has not
- *      yet run: a consumer filtering `operation:"file_grant", result:"success"`
- *      must only ever count CONFIRMED-live grants (R3-1), so this entry alone
- *      must never read as a completed success.
+ *   5b. DURABLE pre-placement audit, a DISTINCT operation
+ *      `operation: "file_grant_recorded"`, `result: "success"` (round 4:
+ *      reverted from the round-3 widened `result: "pending"` -- see below).
+ *      Access must never be live without a preceding audit entry (Invariant
+ *      #5 + audit-write-completeness), so the authoritative mint audit is
+ *      written HERE, before `place`, and is NOT best-effort: if it throws,
+ *      `place` has not run (no access exists), so the record is rolled back
+ *      and the mint fails closed. It succeeded at RECORDING (hence
+ *      `result: "success"` is honest), but it is a DIFFERENT operation than
+ *      `file_grant` -- a consumer filtering `operation:"file_grant",
+ *      result:"success"` must only ever count CONFIRMED-live grants (R3-1),
+ *      so this pre-place record, being a distinct op, can never be mistaken
+ *      for one.
  *   6. Place the tree entry (`fsOps.place`) -- the LAST fallible, access-
  *      conferring step. If it throws: scrub any partial entry, roll back the
  *      persisted record under a GUARDED remove (on remove failure persist a
  *      terminal `revoked` tombstone so no dangling `active` survives), write a
- *      best-effort `"failure"` audit, and throw `FileGrantMintFailedError`. So a
- *      failed mint leaves NO active grant, NO tree entry (Invariant #5c), and
- *      NO final `result:"success"` file_grant audit -- only `"pending"` then
- *      `"failure"`.
+ *      best-effort `operation: "file_grant", result: "failure"` audit, and
+ *      throw `FileGrantMintFailedError`. So a failed mint leaves NO active
+ *      grant, NO tree entry (Invariant #5c), and NO `file_grant` audit with
+ *      `result:"success"` -- only `file_grant_recorded`(success) then
+ *      `file_grant`(failure).
  *   7. Once `place` has succeeded, access is LIVE and already durably audited
- *      (step 5b, `"pending"`). The only remaining step is a BEST-EFFORT
- *      post-place confirmation audit with `result: "success"`: a throw there is
- *      swallowed, it must NEVER roll a live grant back and report failure (the
- *      fail-OPEN + false-rollback bug this ordering exists to prevent), and the
- *      grant is never left unaudited. A successful mint thus yields the
- *      `"pending"` -> `"success"` sequence for `file_grant`.
+ *      (step 5b, `file_grant_recorded`/success). The only remaining step is a
+ *      BEST-EFFORT post-place confirmation audit, `operation: "file_grant",
+ *      result: "success"`: a throw there is swallowed, it must NEVER roll a
+ *      live grant back and report failure (the fail-OPEN + false-rollback bug
+ *      this ordering exists to prevent), and the grant is never left
+ *      unaudited. A successful mint thus yields the `file_grant_recorded`
+ *      (success) -> `file_grant`(success) sequence.
+ *
+ * ROUND 4 (revert of round 3's `AuditEntry.result` widening): round 3 widened
+ * the SHARED `AuditEntry.result` (`operational/audit-log.ts`) from
+ * `"success" | "failure"` to add a third `"pending"` value so the pre-place
+ * audit could stay under the SAME `file_grant` operation name. That widening
+ * fanned out to every consumer of the global `result` field -- the SIEM
+ * export formatters (`audit/siem-formatter.ts`) treat any non-`"failure"`
+ * result as an allowed/successful event, so a `pending` `file_grant` exported
+ * as ALLOWED; the chat agent-context-cache rendered a `pending` entry as
+ * "performed" (an overclaim of completion); and the posture routes' result
+ * filter bucket had no honest third bucket for it. A single-value addition to
+ * a globally-shared enum is a large, hard-to-fully-audit surface. This
+ * revision REDUCES that surface instead: `AuditEntry.result` stays exactly
+ * 2-valued everywhere, and the pre-place record uses a DISTINCT operation
+ * name (`file_grant_recorded`) rather than a third result value. `result` is
+ * always literally true (recording either succeeded or the mint already
+ * failed closed before this point), so every consumer of `result` keeps its
+ * original, already-correct 2-valued assumption; the "this is a not-yet-
+ * confirmed record" signal now lives entirely in the operation NAME, which
+ * every consumer already treats as an opaque string with no assumed
+ * exhaustiveness. `file_grant_recorded` is never dispatched to the approval
+ * gate (`ApprovalGate.evaluate`/`classifyOperation`) -- it is only ever an
+ * audit-log `operation` field value produced directly via
+ * `auditLog.appendCritical`, so it needs no tier wiring; the non-relaxable
+ * Tier-1 wiring for the real `file_grant` mint operation
+ * (`NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS` in
+ * `principal-policy/loader.ts` + `gate.ts`'s runtime mirror) is unchanged.
  *
  * The `enforcement` verdict is honest: it is `met` only when a distinct agent
  * uid's read access has actually been verified; a bare uid split reports
@@ -291,14 +324,20 @@ async function rollbackGrantRecord(
  * access is never conferred without this audit having been written. A missing
  * `auditLog` (unit tests with no audit wiring) is a no-op.
  *
- * `result` is `"pending"`, not `"success"`: at this point `place()` has not
- * yet run, so the grant is durably audited but NOT yet confirmed live. If
- * `place()` subsequently fails, the mint rolls back and writes a `"failure"`
- * audit (step 6) -- it never leaves behind a `"success"`-shaped entry for a
- * grant that never went live. Only the POST-place confirmation (step 7) ever
- * writes `result: "success"` for `file_grant`, so a consumer filtering
- * `operation:"file_grant", result:"success"` counts only CONFIRMED-live
- * grants (R3-1).
+ * `operation` is the DISTINCT `"file_grant_recorded"` -- NOT `"file_grant"` --
+ * with `result: "success"` (round 4: reverted from a `"file_grant"`/`"pending"`
+ * entry; see the module doc comment for why a distinct operation name, not a
+ * third shared `result` value, is the correct fix). `result: "success"` is
+ * honest here: recording the grant durably DID succeed (that is precisely
+ * what this append proves by not throwing). What has NOT yet happened is
+ * `place()` -- access is not yet live. Using a distinct operation name keeps
+ * that distinction legible without touching the shared, 2-valued
+ * `AuditEntry.result` type: only the POST-place confirmation (step 7) ever
+ * writes `operation: "file_grant", result: "success"`, so a consumer
+ * filtering `operation:"file_grant", result:"success"` counts only
+ * CONFIRMED-live grants (R3-1), and a consumer that has never heard of
+ * `file_grant_recorded` simply does not match it -- no fanout, no third enum
+ * value to special-case.
  */
 async function durableMintAudit(
   auditLog: AuditLog | undefined,
@@ -307,9 +346,9 @@ async function durableMintAudit(
   if (!auditLog) return;
   await auditLog.appendCritical({
     layer: "l1",
-    operation: "file_grant",
+    operation: "file_grant_recorded",
     identity_id: entry.identity_id,
-    result: "pending",
+    result: "success",
     details: entry.details,
   });
 }

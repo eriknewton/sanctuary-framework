@@ -1,5 +1,6 @@
 /**
- * `sanctuary file-grant revoke` CLI error-handling test (R3-3).
+ * `sanctuary file-grant revoke` CLI error-handling test (R3-3, completed
+ * round 4).
  *
  * `revokeFileGrant` (src/file-grant/revoke.ts) deliberately PROPAGATES a tree
  * scrub failure (see its own doc comment: the persisted record is marked
@@ -11,13 +12,26 @@
  * message and a non-zero exit code -- unlike `cmdMint`, which already wraps
  * `mintFileGrant` in exactly this pattern.
  *
- * This test proves the fix end-to-end: seed a real (keychain-free) fortress
- * and identity, seed an ACTIVE file-grant record directly (bypassing the
+ * R3-3 was only PARTIALLY applied: it wrapped `revokeFileGrant` in the clean
+ * try/catch, but left the `reconcileFileGrantTree(...)` call that runs
+ * immediately before it as a bare, unguarded `await` beside the try block.
+ * `reconcileFileGrantTree` can throw the SAME class of genuine filesystem
+ * error (ENOTDIR/EACCES) while scrubbing an UNRELATED expired or revoked
+ * grant's tree entry -- unrelated to the grant the operator is actually
+ * revoking -- and that throw was still unhandled. Round 4 moves the
+ * reconcile call inside the same try/catch.
+ *
+ * This file proves both paths end-to-end: seed a real (keychain-free)
+ * fortress and identity, seed file-grant records directly (bypassing the
  * interactive Tier-1 mint approval prompt, which auto-denies in a
- * non-interactive test process), force the tree scrub to fail with a genuine
+ * non-interactive test process), force a tree scrub to fail with a genuine
  * filesystem error (ENOTDIR, not ENOENT -- the same real-error class
  * `test/file-grant/fs-ops.test.ts` uses), and assert `runFileGrantCommand`
  * resolves (never rejects) with a non-zero code and a clean error line.
+ *   1. `revokeFileGrant`'s OWN scrub, on the grant being revoked, fails.
+ *   2. The revoke-time `reconcileFileGrantTree` call's scrub, on a
+ *      DIFFERENT, unrelated expired grant, fails -- before `revokeFileGrant`
+ *      for the actual target grant is ever reached.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -231,6 +245,95 @@ describe("sanctuary file-grant revoke: clean error on a scrub failure (R3-3)", (
     // No raw Node stack-trace leakage (a thrown, unhandled error's message
     // would otherwise include the bare ENOTDIR errno text with no operator
     // framing at all).
+    expect(err.text).not.toContain("at process.processTicksAndRejections");
+  });
+
+  it("a reconcile-time scrub error on an UNRELATED expired grant also resolves with a clean non-zero exit (round 4, R3-3 completion)", async () => {
+    // Same fortress/identity seeding as the previous test.
+    const stateStoragePath = join(fortressPath, "state");
+    const storage = new FilesystemStorage(stateStoragePath);
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    const identityManager = new IdentityManager(storage, masterKey);
+    await identityManager.load();
+    const { createIdentity } = await import("../../src/core/identity.js");
+    const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
+    const { storedIdentity } = createIdentity("operator", identityEncKey, "recovery-key");
+    await identityManager.save(storedIdentity);
+    await identityManager.setPrimary(storedIdentity.identity_id);
+
+    const stateStore = new StateStore(storage, masterKey);
+    const grantStore = new FileGrantStore(stateStore, {
+      identityId: storedIdentity.identity_id,
+      encryptedPrivateKey: storedIdentity.encrypted_private_key,
+      identityEncryptionKey: identityEncKey,
+    });
+
+    // Grant A: EXPIRED (active status, but expires_at already in the past),
+    // so `reconcileFileGrantTree`'s plan puts its tree entry in `toScrub`.
+    // This is the reconcile call `cmdRevoke` makes BEFORE it ever touches the
+    // grant the operator actually asked to revoke.
+    const expiredGrantId = "fg_expired_scrub01";
+    const expiredGrant: FileGrant = {
+      grant_id: expiredGrantId,
+      schema_version: FILE_GRANT_SCHEMA_VERSION,
+      subject_agent_id: "agent-expired",
+      scope: { kind: "file", path: "/tmp/does-not-matter-either.txt" },
+      mode: "read",
+      created_by: storedIdentity.identity_id,
+      created_at: new Date(Date.now() - 60_000).toISOString(),
+      expires_at: new Date(Date.now() - 30_000).toISOString(),
+      status: "active",
+      revoked_at: null,
+      tree_entry: `agent-expired/${expiredGrantId}`,
+      audit_refs: [],
+    };
+    await grantStore.put(expiredGrant);
+
+    // Grant B: the operator's actual revoke TARGET -- unrelated, unexpired,
+    // and never reached because the reconcile above throws first.
+    const targetGrantId = "fg_revoke_target01";
+    const targetGrant: FileGrant = {
+      grant_id: targetGrantId,
+      schema_version: FILE_GRANT_SCHEMA_VERSION,
+      subject_agent_id: "agent-target",
+      scope: { kind: "file", path: "/tmp/also-does-not-matter.txt" },
+      mode: "read",
+      created_by: storedIdentity.identity_id,
+      created_at: new Date().toISOString(),
+      expires_at: null,
+      status: "active",
+      revoked_at: null,
+      tree_entry: `agent-target/${targetGrantId}`,
+      audit_refs: [],
+    };
+    await grantStore.put(targetGrant);
+
+    const grantsRoot = join(fortressPath, "grants");
+    await mkdir(grantsRoot, { recursive: true, mode: 0o711 });
+    // A FILE where the EXPIRED grant's per-agent subdirectory must be a
+    // directory, so `reconcileFileGrantTree`'s own scrub (removeEntry on the
+    // expired entry) fails with a genuine ENOTDIR -- unrelated to the grant
+    // actually being revoked.
+    await writeFile(join(grantsRoot, "agent-expired"), "not a directory");
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+
+    // Revoking the UNRELATED target grant must still resolve cleanly (never
+    // reject), even though the reconcile it triggers throws while scrubbing
+    // a completely different grant's tree entry.
+    const code = await runFileGrantCommand({
+      argv: ["revoke", "--grant", targetGrantId, "--fortress", fortressPath],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+    });
+
+    expect(code).toBe(1);
+    expect(err.text).toContain("Error: revoke did not complete cleanly.");
     expect(err.text).not.toContain("at process.processTicksAndRejections");
   });
 });
