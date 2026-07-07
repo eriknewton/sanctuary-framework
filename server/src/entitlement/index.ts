@@ -159,3 +159,20 @@ export {
   type CapTransition,
   type ReResolveResult,
 } from "./re-resolve.js";
+
+export {
+  COMPLIANCE_ATTESTATION_SCHEMA,
+  CLAIMS_SCOPE_DISCLAIMER,
+  buildAttestationBody,
+  serializeSignedAttestation,
+  verifySignedAttestation,
+  type AttestationLicenseStatus,
+  type AttestationLicenseView,
+  type AttestationPostureView,
+  type AttestationInputs,
+  type AttestationBody,
+  type SignedAttestation,
+  type AttestationSigner,
+  type AttestationVerifyReason,
+  type AttestationVerification,
+} from "./compliance-attestation.js";
