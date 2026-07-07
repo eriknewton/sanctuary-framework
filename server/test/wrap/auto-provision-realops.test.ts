@@ -1202,3 +1202,63 @@ describe("wrap/auto-provision real-ops chokepoint: backup() shape handling (fix 
     }
   });
 });
+
+describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory recursion (fix round-5 R6-1/R6-5)", () => {
+  it("FIX R6-1: a DIRECTORY credential containing an INNER symlink fails the probe (the inner secret did not physically move onto the account)", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-r6-1-"));
+    try {
+      const accountHome = join(tmpRoot, "agent-home");
+      const credsDir = join(accountHome, ".hermes", "google-mcp-creds");
+      await mkdir(credsDir, { recursive: true });
+      const elsewhere = join(tmpRoot, "outside-token.json");
+      await writeFile(elsewhere, "operator-token");
+      // An inner secret file that is a symlink OUT of the moved tree.
+      await symlink(elsewhere, join(credsDir, "token.json"));
+
+      const targetUid = process.getuid?.() ?? 0;
+      const targetGid = process.getgid?.() ?? 0;
+      const t = hermesEndpointProbes(accountHome, targetUid, targetGid, [".hermes/google-mcp-creds"]).find((x) =>
+        x.name.includes("google-mcp-creds"),
+      );
+      expect(t).toBeDefined();
+      expect(await t!.probe()).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX R6-1: a DIRECTORY credential whose inner files are all real + readable passes the probe", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-r6-1b-"));
+    try {
+      const accountHome = join(tmpRoot, "agent-home");
+      const credsDir = join(accountHome, ".hermes", "google-mcp-creds");
+      await mkdir(credsDir, { recursive: true });
+      await writeFile(join(credsDir, "token.json"), "{}");
+      await chmod(join(credsDir, "token.json"), 0o600);
+      await chmod(credsDir, 0o700);
+
+      const targetUid = process.getuid?.() ?? 0;
+      const targetGid = process.getgid?.() ?? 0;
+      const t = hermesEndpointProbes(accountHome, targetUid, targetGid, [".hermes/google-mcp-creds"]).find((x) =>
+        x.name.includes("google-mcp-creds"),
+      );
+      expect(await t!.probe()).toBe(true);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX R6-5: hermesEndpointProbes probes ONLY the supplied moved-credential list -- an absent/skipped credential is never probed, so a partial-credential install can arm", () => {
+    // Only .env moved this run; the other five were skipped-absent.
+    const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502, [".hermes/.env"]);
+    const credTargets = targets.filter((t) => t.name.includes("moved credential"));
+    expect(credTargets).toHaveLength(1);
+    expect(credTargets[0]!.name).toContain(".hermes/.env");
+  });
+
+  it("FIX R6-5: with no explicit moved-list (alreadyDedicated path), it falls back to the full adapter set (the account is presumed complete)", () => {
+    const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502);
+    const credTargets = targets.filter((t) => t.name.includes("moved credential"));
+    expect(credTargets).toHaveLength(6);
+  });
+});

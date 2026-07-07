@@ -204,4 +204,24 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toContain("/Users/op/.hermes/.env.restored-conflict");
     expect(out[0]).toMatch(/do NOT overwrite/);
   });
+
+  it("FIX R6-2: a conflict co-occurring with a GENUINE failure (failedPaths set) stays LOUD (WARNING) and surfaces BOTH the backup and the conflict path -- the conflict never masks the failure", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "install-daemon",
+        reason: "boom",
+        rolledBack: false,
+        rehomeAttempted: true,
+        backupPaths: ["/var/root/x.bak"],
+        conflictPaths: ["/Users/op/.hermes/.env.restored-conflict"],
+        failedPaths: ["/Users/op/.hermes/auth.json"],
+      },
+    });
+    expect(out[0]).toMatch(/^ {2}WARNING:/);
+    expect(out[0]).toMatch(/restore of your re-homed files FAILED/);
+    expect(out[0]).toContain("/var/root/x.bak");
+    expect(out[0]).toContain("/Users/op/.hermes/.env.restored-conflict");
+  });
 });

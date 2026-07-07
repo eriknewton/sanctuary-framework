@@ -107,6 +107,14 @@ export interface ProvisionFlowOps {
      * operator to overwrite their newer file from the stale backup.
      */
     conflictPaths: string[];
+    /**
+     * FIX (round 5 / R6-2): source paths whose restore GENUINELY failed
+     * (status "failed", not "conflict"). Threaded separately so the CLI can
+     * distinguish a pure-conflict abort (all data safe) from a conflict that
+     * co-occurs with a real failure -- the latter must stay LOUD and surface
+     * the backup path, never be softened by the conflict frame.
+     */
+    failedPaths: string[];
   }>;
 }
 
@@ -181,6 +189,13 @@ export type ProvisionFlowOutcome =
        * must NEVER tell the operator to overwrite from the stale backup.
        */
       conflictPaths?: string[];
+      /**
+       * FIX (round 5 / R6-2): source paths whose restore GENUINELY failed
+       * (distinct from a safe conflict). Non-empty means the CLI keeps the
+       * LOUD manual-recovery frame + backup path even when conflicts also
+       * occurred -- a conflict never masks a real failure.
+       */
+      failedPaths?: string[];
     }
   | { kind: "armed-then-rolled-back"; uid: number; reason: string }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
@@ -325,6 +340,7 @@ export async function runProvisionFlow(
         rolledBack: restore.rolledBack,
         backupPaths: restore.backupPaths,
         conflictPaths: restore.conflictPaths,
+        failedPaths: restore.failedPaths,
         // FIX (round 5 / R3-2): only "attempted" if a move actually landed;
         // an empty-partialResults rehome throw moved nothing, so the CLI
         // shows the neutral "nothing changed" frame, not a restore claim.
@@ -347,7 +363,7 @@ export async function runProvisionFlow(
     // FIX (round 5, item N3): the install may have partially bootstrapped the
     // daemon before throwing; tear it back down (idempotent) before restoring
     // the re-home, so an abort never leaves a live daemon behind.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults);
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
     return {
       kind: "aborted",
       stage: "install-daemon",
@@ -355,6 +371,7 @@ export async function runProvisionFlow(
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
@@ -373,17 +390,24 @@ export async function runProvisionFlow(
     // succeeded above); tear it down before restoring the re-home so this
     // fail-closed abort does not leave the daemon running under the dedicated
     // account.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults);
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
     return {
       kind: "aborted",
       stage: "verify-before-arm",
       reason: withDaemonTeardownNote(
-        `re-homed agent could not reach: ${unreachable.join(", ")}. ` + describeRestoreForReason(td.rolledBack),
+        // FIX (round 5 / R6-4): honest phrasing, matching the post-arm reason
+        // (round-5 item c). The pre-arm check proves DNS-resolvability of each
+        // endpoint host + each moved credential present-and-readable-by-uid --
+        // it does NOT run as the agent uid or prove end-to-end reachability, so
+        // "re-homed agent could not reach" overclaimed.
+        `pre-arm check could not confirm DNS-resolvability + moved-credential readability for: ${unreachable.join(", ")}. ` +
+          describeRestoreForReason(td.rolledBack),
         td.daemonTeardownError,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
@@ -395,7 +419,7 @@ export async function runProvisionFlow(
   const existenceCheck = await ops.checkUidExistence(uid);
   if (!existenceCheck.ok) {
     // FIX (round 5, item N3): daemon is live; tear it down on this abort.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults);
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
     return {
       kind: "aborted",
       stage: "uid-existence-gate",
@@ -403,6 +427,7 @@ export async function runProvisionFlow(
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
@@ -415,7 +440,7 @@ export async function runProvisionFlow(
     // FIX (round 5, item N3): arming failed but the daemon is live; tear it
     // down on this abort (the wall never armed, so there is nothing to
     // disarm -- only the daemon to remove).
-    const td = await teardownDaemonAndRestore(ops, rehomeResults);
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
     return {
       kind: "aborted",
       stage: "arm",
@@ -423,6 +448,7 @@ export async function runProvisionFlow(
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
@@ -500,23 +526,27 @@ function describeRestoreForReason(rolledBack: boolean | "partial"): string {
 async function safeRestore(
   ops: ProvisionFlowOps,
   results: RehomeStepResult[],
-): Promise<{ rolledBack: boolean | "partial"; backupPaths: string[]; conflictPaths: string[] }> {
+): Promise<{ rolledBack: boolean | "partial"; backupPaths: string[]; conflictPaths: string[]; failedPaths: string[] }> {
   try {
-    const { fullyRestored, restoredCount, backupPaths, conflictPaths } = await ops.restoreRehome(results);
+    const { fullyRestored, restoredCount, backupPaths, conflictPaths, failedPaths } = await ops.restoreRehome(results);
     const rolledBack: boolean | "partial" = fullyRestored ? true : restoredCount > 0 ? "partial" : false;
-    // FIX (round 5 / R5-2): surface R6 conflict paths so the caller/CLI can
-    // report "recovered data is safe at <conflictPath>; reconcile manually"
-    // instead of a false "restore FAILED / overwrite from the stale backup".
-    return { rolledBack, backupPaths, conflictPaths: conflictPaths ?? [] };
+    // FIX (round 5 / R5-2, R6-2): surface R6 conflict paths AND genuine
+    // failures separately, so the CLI can report "recovered data is safe at
+    // <conflictPath>; reconcile manually" for a pure conflict, but keep the
+    // LOUD "restore FAILED / backup at X" frame whenever a real failure also
+    // occurred (a conflict must never mask a failure).
+    return { rolledBack, backupPaths, conflictPaths: conflictPaths ?? [], failedPaths: failedPaths ?? [] };
   } catch {
     // Best-effort call, but the OUTCOME must be honest: a restore that threw
     // is a failed restore, not a successful one. The original abort reason
     // this was invoked from is preserved by the caller; this function only
-    // ever reports on the restore itself.
+    // ever reports on the restore itself. A throw means EVERY attempted path
+    // failed to restore, so surface them all as failedPaths (R6-2).
     return {
       rolledBack: false,
       backupPaths: results.filter((r) => r.backupPath).map((r) => r.backupPath!),
       conflictPaths: [],
+      failedPaths: results.filter((r) => r.status === "moved").map((r) => r.entry.sourcePath),
     };
   }
 }
@@ -534,23 +564,34 @@ async function safeRestore(
 async function teardownDaemonAndRestore(
   ops: ProvisionFlowOps,
   results: RehomeStepResult[],
+  tearDownDaemon: boolean,
 ): Promise<{
   rolledBack: boolean | "partial";
   backupPaths: string[];
   conflictPaths: string[];
+  failedPaths: string[];
   daemonTeardownError?: string;
 }> {
+  // FIX (round 5 / R6-3): only tear the daemon down when THIS run stood it up
+  // (the fresh-provision path). On the alreadyDedicated re-run path the harness
+  // daemon PRE-EXISTED a prior successful provision, so booting it out over a
+  // transient verify/arm failure would destroy working infrastructure -- and
+  // the subsequent neutral "nothing was changed" frame would be a lie. Leave a
+  // pre-existing daemon in place.
   let daemonTeardownError: string | undefined;
-  try {
-    await ops.uninstallHarnessDaemon();
-  } catch (err) {
-    daemonTeardownError = (err as Error).message;
+  if (tearDownDaemon) {
+    try {
+      await ops.uninstallHarnessDaemon();
+    } catch (err) {
+      daemonTeardownError = (err as Error).message;
+    }
   }
   const restore = await safeRestore(ops, results);
   return {
     rolledBack: restore.rolledBack,
     backupPaths: restore.backupPaths,
     conflictPaths: restore.conflictPaths,
+    failedPaths: restore.failedPaths,
     daemonTeardownError,
   };
 }

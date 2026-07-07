@@ -1209,7 +1209,13 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
   // otherwise render a pure conflict (restoredCount 0 -> rolledBack false) as
   // "restore FAILED / recover from backup" -- a false alarm that also
   // misdirects the operator to clobber their newer recreated file.
-  if (outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0) {
+  //
+  // FIX (round 5 / R6-2): ONLY when there is no GENUINE failure. If a real
+  // restore failure co-occurs with a conflict, fall through to the LOUD
+  // rolledBack frames below (which now also carry `conflictNote`), so a
+  // conflict never masks a failure that needs backup recovery.
+  const hasGenuineFailure = outcome.failedPaths !== undefined && outcome.failedPaths.length > 0;
+  if (outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0 && !hasGenuineFailure) {
     return [
       `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}).` +
         conflictNote +
@@ -1246,13 +1252,13 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
   if (outcome.rolledBack === "partial") {
     return [
       `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
-        `Only SOME of your re-homed files were restored; the rest need manual recovery.${backupNote} ` +
+        `Only SOME of your re-homed files were restored; the rest need manual recovery.${backupNote}${conflictNote} ` +
         `Do not re-run until you have recovered the remaining files.`,
     ];
   }
   return [
     `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
-      `The restore of your re-homed files FAILED; manual recovery is required.${backupNote} ` +
+      `The restore of your re-homed files FAILED; manual recovery is required.${backupNote}${conflictNote} ` +
       `Do not re-run until you have recovered your files.`,
   ];
 }

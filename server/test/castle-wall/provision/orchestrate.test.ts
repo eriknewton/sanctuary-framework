@@ -504,4 +504,26 @@ describe("castle-wall/provision/orchestrate", () => {
     const result = await runProvisionFlow(baseCtx(), ops);
     expect(result).toMatchObject({ kind: "aborted", stage: "uid-existence-gate", rehomeAttempted: false });
   });
+
+  it("FIX (round 5, R6-3): an alreadyDedicated re-run abort does NOT tear down the PRE-EXISTING harness daemon (booting it out over a transient failure would destroy working infrastructure)", async () => {
+    const ops = happyPathOps({
+      preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+    });
+    const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm" });
+    expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
+    // Contrast: the existing N3 test proves a FRESH-provision abort DOES tear
+    // the daemon down (this run stood it up).
+  });
+
+  it("FIX (round 5, R6-4): the verify-before-arm abort reason is honest (no 're-homed agent could not reach' overclaim -- matches the post-arm phrasing)", async () => {
+    const ops = happyPathOps({
+      preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm" });
+    const reason = (result as { reason: string }).reason;
+    expect(reason).not.toMatch(/re-homed agent could not reach/);
+    expect(reason).toMatch(/pre-arm check could not confirm DNS-resolvability/);
+  });
 });

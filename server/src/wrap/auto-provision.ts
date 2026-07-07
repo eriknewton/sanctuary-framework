@@ -284,11 +284,27 @@ function credentialReadableProbe(
       if (st.isSymbolicLink()) {
         return false;
       }
-      return credentialReadableAsUidDecision(
+      const leafOk = credentialReadableAsUidDecision(
         { uid: st.uid, gid: st.gid, mode: st.mode, isDirectory: st.isDirectory() },
         targetUid,
         targetGid,
       );
+      if (!leafOk) {
+        return false;
+      }
+      // FIX (round 5 / R6-1): for a DIRECTORY credential, the leaf's own bits
+      // are not enough -- the SECRET lives in the files INSIDE it. R2-4 only
+      // rejected a symlink AT the leaf; a directory whose inner secret file is
+      // a symlink out of the moved tree (e.g. `google-mcp-creds/token.json` ->
+      // an operator-owned file) still passed, so verify greenlit an
+      // armed-but-bricked re-home the agent uid cannot actually read. Recurse:
+      // reject any inner symlink (its data did not physically move onto the
+      // account) and require every inner file readable + every inner dir
+      // traversable by the target uid.
+      if (st.isDirectory()) {
+        return directoryTreeReadableByUid(path, targetUid, targetGid);
+      }
+      return true;
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code === "ENOENT") {
@@ -303,6 +319,50 @@ function credentialReadableProbe(
       return false;
     }
   };
+}
+
+/**
+ * FIX (round 5 / R6-1): recursively confirm every entry inside a moved
+ * DIRECTORY credential is readable BY THE TARGET UID and physically present on
+ * the isolated account. Fail-closed (no-follow) on: any stat/readdir error, ANY
+ * symbolic link (its data lives outside the moved tree the agent cannot read --
+ * the R2-4 rationale one level down), an inner directory the target uid cannot
+ * traverse, or an inner regular file it cannot read. Exported so the seam can
+ * drive the inner-symlink case directly.
+ */
+export async function directoryTreeReadableByUid(
+  dir: string,
+  targetUid: number,
+  targetGid?: number,
+): Promise<boolean> {
+  const { readdir } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  let entries: string[];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return false;
+  }
+  for (const name of entries) {
+    const child = join(dir, name);
+    let st;
+    try {
+      st = await lstat(child);
+    } catch {
+      return false;
+    }
+    if (st.isSymbolicLink()) {
+      return false;
+    }
+    const bits = { uid: st.uid, gid: st.gid, mode: st.mode, isDirectory: st.isDirectory() };
+    if (!credentialReadableAsUidDecision(bits, targetUid, targetGid)) {
+      return false;
+    }
+    if (st.isDirectory() && !(await directoryTreeReadableByUid(child, targetUid, targetGid))) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -385,7 +445,12 @@ export function allHermesCredentialDestPaths(): string[] {
  * a real disposable tmpdir and assert an unreadable non-.env credential
  * fails the aggregate verify, not just `.hermes/.env`.
  */
-export function hermesEndpointProbes(newAccountHome: string, targetUid: number, targetGid: number): EndpointProbeTarget[] {
+export function hermesEndpointProbes(
+  newAccountHome: string,
+  targetUid: number,
+  targetGid: number,
+  credentialDestPaths?: string[],
+): EndpointProbeTarget[] {
   const targets: EndpointProbeTarget[] = HERMES_ENDPOINT_HOSTS.map(({ name, host }) => ({
     name: `${name} (DNS-resolves)`,
     probe: dnsResolvesProbe(host),
@@ -400,8 +465,18 @@ export function hermesEndpointProbes(newAccountHome: string, targetUid: number, 
   // requiring the target uid can traverse each one -- so a root-owned,
   // non-traversable intermediate directory fails the probe instead of
   // sailing through on root's ancestor-bypassing `stat()`.
+  //
+  // FIX (round 5, item R6-5): probe the credentials re-home ACTUALLY moved,
+  // not the full static adapter list. A legitimate partial Hermes install
+  // (e.g. no Google Workspace MCP, so `google-mcp-creds`/`cli-tokens`/
+  // `credentials` are `skipped-absent`) would otherwise fail verify on the
+  // absent-credential probes and could NEVER arm. `credentialDestPaths` is
+  // the `moved` set threaded from the re-home results; it falls back to the
+  // full adapter list only when unknown (the alreadyDedicated path, where the
+  // account is presumed already complete).
+  const destPaths = credentialDestPaths ?? allHermesCredentialDestPaths();
   const traverseFrom = dirname(newAccountHome);
-  for (const destRelativePath of allHermesCredentialDestPaths()) {
+  for (const destRelativePath of destPaths) {
     targets.push({
       name: `moved credential present + readable by agent uid (${destRelativePath})`,
       probe: credentialReadableProbe(`${newAccountHome}/${destRelativePath}`, targetUid, targetGid, traverseFrom),
@@ -424,11 +499,15 @@ export function hermesEndpointProbes(newAccountHome: string, targetUid: number, 
 function resolveEndpointProbes(
   newAccountHome: string,
   targetUidGid: { uid: number; gid: number } | undefined,
+  movedCredentialDestPaths?: string[],
 ): EndpointProbeTarget[] {
   if (targetUidGid === undefined) {
     return [];
   }
-  return hermesEndpointProbes(newAccountHome, targetUidGid.uid, targetUidGid.gid);
+  // FIX (round 5 / R6-5): pass the credentials re-home actually moved (or
+  // undefined on the alreadyDedicated path, where the full adapter set is the
+  // right expectation).
+  return hermesEndpointProbes(newAccountHome, targetUidGid.uid, targetUidGid.gid, movedCredentialDestPaths);
 }
 
 /**
@@ -741,6 +820,13 @@ export async function runAutoProvisionForWrap(
   // the correct, always-populated capture point. `resolvedAgentUidGid`
   // starts undefined and is set exactly once per run.
   let resolvedAgentUidGid: { uid: number; gid: number } | undefined;
+  // FIX (round 5 / R6-5): the dest-relative paths re-home ACTUALLY moved this
+  // run (moved + isSecret entries). Threaded into the endpoint probes so a
+  // legitimately-absent (skipped-absent) credential is never probed. Stays
+  // undefined on the alreadyDedicated path (re-home did not run), where the
+  // probe falls back to the full adapter set (the account is presumed
+  // complete).
+  let movedCredentialDestPaths: string[] | undefined;
 
   const ops: ProvisionFlowOps = {
     confirm: (promptText) => confirmOnTty(promptText),
@@ -785,6 +871,13 @@ export async function runAutoProvisionForWrap(
         // secrets under the new account with nothing restored.
         throw new RehomeExecutionError(err instanceof Error ? err.message : String(err), results, { cause: err });
       }
+      // FIX (round 5 / R6-5): capture exactly the secret credentials that
+      // MOVED (never skipped-absent), so the endpoint probes verify only what
+      // this run actually placed on the account -- a partial-credential
+      // install (some sources legitimately absent) can still arm.
+      movedCredentialDestPaths = results
+        .filter((r) => r.status === "moved" && r.entry.isSecret)
+        .map((r) => r.entry.destRelativePath);
       return { plan, results };
     },
     installHarnessDaemon: async (uid) => {
@@ -818,7 +911,7 @@ export async function runAutoProvisionForWrap(
     // somehow still undefined, fail closed to an unreachable synthetic probe
     // rather than defaulting to the CONSOLE owner's uid, which would silently
     // check readability against the wrong identity.
-    preArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid),
+    preArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, movedCredentialDestPaths),
     checkUidExistence: async (uid) => {
       const { checkUidExistenceBeforeArm } = await import("../castle-wall/provision/uid-gate.js");
       return checkUidExistenceBeforeArm(accountName, uid, realUidExistenceOps());
@@ -828,7 +921,7 @@ export async function runAutoProvisionForWrap(
       const code = await runEnable([`--agent-uid=${uid}`, `--ceiling=${ceiling}`, "--no-ttl"]);
       return code === 0 ? { ok: true } : { ok: false, error: `castle-wall enable exited ${code}` };
     },
-    postArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid),
+    postArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, movedCredentialDestPaths),
     // FIX G1 (HIGH, 2026-07-07 re-gate 3 / fix-round 3): see
     // `disarmExitCodeDecision` above for the full rationale -- `runDisable`
     // returns (does not throw) a nonzero code on failure, and this closure
@@ -865,6 +958,10 @@ export async function runAutoProvisionForWrap(
         conflictPaths: restoreResult.steps
           .filter((s) => s.status === "conflict" && s.conflictPath !== undefined)
           .map((s) => s.conflictPath!),
+        // FIX (round 5 / R6-2): the GENUINELY-failed source paths (status
+        // "failed", distinct from a safe "conflict"), so the CLI keeps the
+        // loud manual-recovery frame even when conflicts also occur.
+        failedPaths: restoreResult.steps.filter((s) => s.status === "failed").map((s) => s.sourcePath),
       };
     },
   };
