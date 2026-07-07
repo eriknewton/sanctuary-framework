@@ -23,6 +23,7 @@ import {
   extractOperationName,
   FORCED_TIER3_OPERATIONS,
   NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
+  NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS,
 } from "./loader.js";
 import type { AuditLog } from "../operational/audit-log.js";
 import { InjectionDetector, type DetectionResult } from "../security/injection-detector.js";
@@ -50,15 +51,16 @@ export type InjectionAlertCallback = (alert: {
 export type ProxyTierResolver = (toolName: string) => (1 | 2 | 3) | null;
 
 // Runtime-classifier non-relaxable Tier-1 set. `memory_delete` plus the
-// operator-cloud cloud-custody operations, which are spread from the SINGLE
-// SOURCE OF TRUTH in loader.ts so this list and the loader's
-// FORCED_TIER1_OPERATIONS cannot drift apart (Operator Cloud Slice 2 MED-1; a
-// drift guard test pins the relationship). classifyRiskTier checks this list
-// first, so even a policy file that lists these under Tier 3 still classifies
-// them Tier 1 at runtime.
+// operator-cloud cloud-custody operations, plus the Governed File-Grant v1
+// mint operation, all spread from the SINGLE SOURCE OF TRUTH in loader.ts so
+// this list and the loader's FORCED_TIER1_OPERATIONS cannot drift apart
+// (Operator Cloud Slice 2 MED-1; a drift guard test pins the relationship).
+// classifyRiskTier checks this list first, so even a policy file that lists
+// these under Tier 3 still classifies them Tier 1 at runtime.
 const FORCED_TIER1_OPERATIONS = [
   "memory_delete",
   ...NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS,
 ] as const;
 
 /**

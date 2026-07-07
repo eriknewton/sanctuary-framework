@@ -260,6 +260,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "file-grant") {
+    const { runFileGrantCommand } = await import("./cli/file-grant.js");
+    const code = await runFileGrantCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "license") {
     const { runLicenseCommand } = await import("./cli/license.js");
     const code = await runLicenseCommand({ argv: args.slice(1) });

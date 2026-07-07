@@ -131,9 +131,21 @@ describe("default policy YAML — drift guard", () => {
     // End-to-end: generate → parse → validate must yield the canonical tiers.
     // (parsePolicy force-adds FORCED_TIER1 / merges FORCED_TIER3, but since the
     // YAML now lists every canonical op, the result is exactly the canonical set.)
+    //
+    // DELIBERATE EXCEPTION (Governed File-Grant v1, 2026-07-07, must-fix #1):
+    // unlike the operator-cloud ops, `file_grant` is intentionally ABSENT from
+    // the literal `DEFAULT_POLICY.tier1_always_approve` array -- the build spec
+    // explicitly forbids adding it there (that is the relaxable `state_export`-
+    // class list). It reaches Tier 1 ONLY via the separate
+    // `NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS` force-list, spread into BOTH
+    // `enforceForcedTiers` (loader-side) and the gate's own runtime
+    // `FORCED_TIER1_OPERATIONS` (gate.ts) -- so `parsed.tier1_always_approve`
+    // legitimately gains it via force-merge even though the canonical array does
+    // not literally list it. See test/file-grant/non-relaxable-tier1.test.ts for
+    // the drift guard proving both force-lists actually carry it.
     const parsed = parsePolicy(yaml);
     expect(new Set(parsed.tier1_always_approve)).toEqual(
-      new Set(DEFAULT_POLICY.tier1_always_approve),
+      new Set([...DEFAULT_POLICY.tier1_always_approve, "file_grant"]),
     );
     expect(new Set(parsed.tier3_always_allow)).toEqual(
       new Set(DEFAULT_POLICY.tier3_always_allow),

@@ -102,6 +102,7 @@ approval_channel:
       "memory_delete",
       "operator_cloud_provision",
       "federation_node_join",
+      "file_grant",
     ]);
     expect(policy.approval_channel.type).toBe("stderr");
   });
@@ -125,6 +126,7 @@ approval_channel:
       "memory_delete",
       "operator_cloud_provision",
       "federation_node_join",
+      "file_grant",
     ]);
   });
 
