@@ -107,14 +107,35 @@ export class PosixFileGrantFsOps implements FsOps {
     // (this is chown MECHANICS -- "does this process need to hand the subdir
     // to another uid" -- not the enforcement-honesty check, which lives in
     // `mint.ts` and compares the agent uid to the SOURCE file's owner).
-    // chownSync to a DIFFERENT uid than the current process requires root; an
-    // EPERM here is a real fail-closed signal (mint.ts rolls back on any throw
-    // from place()), never silently swallowed.
+    //
+    // Handing the subdir to a DIFFERENT uid needs privilege (root / CAP_CHOWN).
+    // A NON-root operator mint would otherwise EPERM here and roll the whole
+    // grant back (R2-5) -- which is wrong: v1 must still RECORD the grant + place
+    // the symlink on a real uid-split box even when it cannot apply the
+    // ownership primitive. The enforcement label is already the honest
+    // `unverified` ("configured; primitive not applied", build spec section 10),
+    // never `met`, so skipping the chown does not overclaim. So PRIVILEGE-GATE
+    // it: attempt the chown only when running as root, and even then treat an
+    // EPERM (restricted container / userns without CAP_CHOWN) as "primitive not
+    // applied" rather than a fatal mint failure. Any OTHER chown error is
+    // unexpected and stays fatal (fail-closed), as do all other `place` errors
+    // (mkdir / symlink).
     const originPath = agentOriginDescriptorPath(this.fortressPath);
     const agentUid = await this.readConfiguredAgentUid(originPath);
     const processUid = process.getuid?.() ?? null;
-    if (agentUid !== null && processUid !== null && agentUid !== processUid) {
-      chownSync(agentSubdir, agentUid, -1);
+    if (
+      agentUid !== null &&
+      processUid !== null &&
+      agentUid !== processUid &&
+      processUid === 0
+    ) {
+      try {
+        chownSync(agentSubdir, agentUid, -1);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "EPERM") throw err;
+        // EPERM even as root: primitive not applied; the honest `unverified`
+        // enforcement label already reflects that, so do not fail the mint.
+      }
     }
 
     // Remove a stale entry at the same path before re-linking (mint always

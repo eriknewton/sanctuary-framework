@@ -198,9 +198,13 @@ export class FileGrantModeRejectedError extends Error {
 }
 
 /**
- * Thrown when a mint fails after the grant object was persisted (tree
- * placement threw). The caller has already rolled back the persisted object
- * before this is thrown, so no phantom grant survives (Invariant #5c).
+ * Thrown when a mint does not complete (the record persist, the pre-placement
+ * audit, or the tree placement threw). Before this is thrown mint attempts a
+ * GUARDED rollback of the persisted record (remove, then a terminal `revoked`
+ * tombstone if the remove itself fails), so no grant should remain listable as
+ * `active`. The rollback is best-effort -- if the store is unreachable for both
+ * delete and write the wording deliberately does NOT assert a phantom is
+ * impossible, only that a rollback was attempted (Invariant #5c).
  */
 export class FileGrantMintFailedError extends Error {
   constructor(
@@ -208,8 +212,10 @@ export class FileGrantMintFailedError extends Error {
     public readonly cause: unknown
   ) {
     super(
-      `Governed File-Grant mint failed for ${grantId}: tree placement did not ` +
-        `succeed. The grant record has been rolled back; no phantom grant exists. ` +
+      `Governed File-Grant mint failed for ${grantId}: the mint did not ` +
+        `complete. A best-effort rollback of the grant record was attempted ` +
+        `(remove, then a revoked tombstone if the remove failed); no grant ` +
+        `should remain listable as active. ` +
         `Cause: ${cause instanceof Error ? cause.message : String(cause)}`
     );
     this.name = "FileGrantMintFailedError";

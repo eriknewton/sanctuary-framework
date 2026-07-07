@@ -113,4 +113,21 @@ describe("file-grant StateStore round-trip", () => {
     const { grantStore } = makeStore();
     expect(await grantStore.get("fg_doesnotexist000")).toBeNull();
   });
+
+  it("lists ALL grants past the 100-key default page (R2-6)", async () => {
+    const { grantStore } = makeStore();
+    // The underlying stateStore.list() caps each call at limit=100. A grant set
+    // larger than one page must still be fully listed (and therefore fully
+    // reconciled) -- grants 101+ must never be silently dropped.
+    const COUNT = 101;
+    for (let i = 0; i < COUNT; i++) {
+      const id = `fg_${i.toString(16).padStart(16, "0")}`;
+      await grantStore.put(makeGrant({ grant_id: id, tree_entry: `agent-1/${id}` }));
+    }
+
+    const listed = await grantStore.list();
+    expect(listed).toHaveLength(COUNT);
+    // No duplicates: every grant_id appears exactly once across the pages.
+    expect(new Set(listed.map((g) => g.grant_id)).size).toBe(COUNT);
+  });
 });

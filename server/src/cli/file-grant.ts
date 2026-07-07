@@ -443,8 +443,8 @@ async function cmdMint(
   } catch (mintErr) {
     write(
       err,
-      `Error: mint failed; the grant was rolled back (no active grant, no access). ` +
-        `${(mintErr as Error).message}\n`
+      `Error: mint did not complete; a best-effort rollback was attempted, so no ` +
+        `grant should remain active. ${(mintErr as Error).message}\n`
     );
     return 1;
   }
@@ -482,6 +482,22 @@ async function cmdList(
 
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
+
+  // Reconcile on this list touch too (R2-4). `list` already audits (Fix 6), so
+  // it is no longer purely read-only; reconciling here (safe-direction cleanup:
+  // reconcile only ever REDUCES access) means ANY list/mint/revoke touch scrubs
+  // an expired grant's tree entry, so a mint-once-then-only-list box never keeps
+  // an expired symlink alive. HONEST BOUND: a fully-idle box (one that never
+  // mints, revokes, OR lists) still relies on an out-of-band sweep -- the
+  // exported `reconcileFileGrantTree` is the reusable entry point a future
+  // `file-grant sweep` / cron calls to cover that case.
+  await reconcileFileGrantTree({
+    store: boot.grantStore,
+    fsOps: boot.fsOps,
+    now: new Date(),
+    auditLog: boot.auditLog,
+    reconciledBy: boot.primary.identity_id,
+  });
 
   const filter = agentFilter ? { subjectAgentId: agentFilter } : undefined;
   const grants = await listFileGrants(boot.grantStore, new Date(), filter);

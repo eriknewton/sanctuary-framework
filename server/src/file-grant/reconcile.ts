@@ -56,10 +56,33 @@ export async function reconcileFileGrantTree(
   const grants = await deps.store.list();
   const plan = planGrantTree(grants, deps.now);
 
+  // SAFETY-CRITICAL, FIRST: scrub every tree entry the plan says must not be
+  // present (revoked + expired grants). Removing access is the safety-critical
+  // action; the persisted-status flip below is only bookkeeping. So the scrub
+  // runs FIRST and INDEPENDENTLY of the status write -- a status-write throw
+  // must never skip an access scrub (the fail-open R2-2 closes). It is also
+  // best-effort PER ENTRY: one entry's scrub failure must not prevent removing
+  // another's. `removeEntry` is idempotent (re-scrubbing an absent entry is a
+  // no-op). Any scrub error is remembered and surfaced only AFTER best-effort
+  // removal of every entry AND the bookkeeping flip below.
+  const scrubbed: string[] = [];
+  let firstScrubError: unknown = null;
+  for (const entry of plan.toScrub) {
+    try {
+      await deps.fsOps.removeEntry(entry.relative_tree_entry);
+      scrubbed.push(entry.relative_tree_entry);
+    } catch (err) {
+      if (firstScrubError === null) firstScrubError = err;
+    }
+  }
+
+  // BOOKKEEPING, SECOND: flip persisted status for grants that have aged past
+  // their TTL but whose record still says "active". This runs AFTER access has
+  // already been removed, so a status-write failure here can no longer leave
+  // expired access live; the throw is still surfaced to the caller (the record
+  // may lag at "active"), but the tree entry is already gone.
+  // `reviseGrantForExpiry` is a no-op for revoked or not-yet-expired grants.
   const expired: string[] = [];
-  // Flip persisted status for grants that have aged past their TTL but whose
-  // record still says "active". `reviseGrantForExpiry` is a no-op for revoked
-  // or not-yet-expired grants, so this only touches the ones that changed.
   for (const grant of grants) {
     if (grant.status === "active" && isGrantExpired(grant, deps.now)) {
       await deps.store.put(reviseGrantForExpiry(grant, deps.now));
@@ -68,11 +91,10 @@ export async function reconcileFileGrantTree(
     }
   }
 
-  const scrubbed: string[] = [];
-  for (const entry of plan.toScrub) {
-    await deps.fsOps.removeEntry(entry.relative_tree_entry);
-    scrubbed.push(entry.relative_tree_entry);
-  }
+  // Surface a scrub failure now -- only after best-effort access removal AND the
+  // status flip, so neither the remaining scrubs nor the bookkeeping are skipped
+  // by an early throw.
+  if (firstScrubError !== null) throw firstScrubError;
 
   return { expired, scrubbed };
 }
@@ -82,6 +104,11 @@ async function appendExpiryAudit(
   grant: FileGrant
 ): Promise<void> {
   try {
+    // Auto-expiry reuses the `file_grant_revoke` audit operation (not a new
+    // op string): TTL expiry, like revoke, is a safe-direction access
+    // REDUCTION, and reusing the op keeps the CLI audit-write inventory small.
+    // The distinct `reason: "expired_ttl_scrub"` (vs revoke's absence of it)
+    // disambiguates an auto-expiry from an operator revoke in the trail.
     await deps.auditLog?.appendCritical({
       layer: "l1",
       operation: "file_grant_revoke",

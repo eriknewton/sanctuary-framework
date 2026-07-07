@@ -50,11 +50,30 @@ export class FileGrantStore {
   }
 
   async list(): Promise<FileGrant[]> {
-    const { keys } = await this.stateStore.list(FILE_GRANT_NAMESPACE);
+    // Page through EVERY key. `stateStore.list` caps each call at `limit`
+    // (default 100), so a single unpaged call would silently drop grants 101+
+    // -- leaving them not just unlisted but UNRECONCILED (an expired 101st
+    // grant's tree entry would never be scrubbed). Loop until we have seen all
+    // `total` keys. (R2-6.)
+    const PAGE_SIZE = 100;
     const grants: FileGrant[] = [];
-    for (const { key } of keys) {
-      const grant = await this.get(key);
-      if (grant) grants.push(grant);
+    let offset = 0;
+    for (;;) {
+      const { keys, total } = await this.stateStore.list(
+        FILE_GRANT_NAMESPACE,
+        undefined,
+        undefined,
+        PAGE_SIZE,
+        offset
+      );
+      for (const { key } of keys) {
+        const grant = await this.get(key);
+        if (grant) grants.push(grant);
+      }
+      offset += keys.length;
+      // Stop when we have covered every key, or defensively if a page came back
+      // empty (never advance forever on an unexpected empty page).
+      if (keys.length === 0 || offset >= total) break;
     }
     return grants;
   }

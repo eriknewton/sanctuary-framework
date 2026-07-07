@@ -13,7 +13,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -98,5 +98,53 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
   it("removeEntry() rejects a traversing tree entry", async () => {
     const fsOps = new PosixFileGrantFsOps(fortressDir);
     await expect(fsOps.removeEntry("../../etc/passwd")).rejects.toThrow(/escapes the grant-tree root/);
+  });
+
+  it("place() still records the grant on a NON-root uid-split box (chown is privilege-gated, not fatal) (R2-5)", async () => {
+    const processUid = process.getuid?.();
+    if (processUid === undefined) return; // POSIX-only path
+
+    // Configure a dedicated agent uid DISTINCT from the running process uid, so
+    // place() would attempt a cross-uid chown. On a NON-root operator that chown
+    // is skipped (privilege-gated) rather than EPERM-ing the whole mint; on a
+    // root runner it succeeds. Either way place() must NOT throw and the symlink
+    // must still be placed (grant recordable on the target host; enforcement
+    // stays the honest `unverified`).
+    const originDir = join(fortressDir, "policy", "egress");
+    await mkdir(originDir, { recursive: true });
+    await writeFile(
+      join(originDir, "agent-origin.json"),
+      JSON.stringify({
+        mode: "uid",
+        agent_uid: processUid + 1000,
+        system_uid_allow_ceiling: 1,
+      }),
+    );
+
+    const source = join(sourceDir, "granted.txt");
+    await writeFile(source, "operator data");
+    const fsOps = new PosixFileGrantFsOps(fortressDir);
+    const canonical = await fsOps.realpath(source);
+
+    // Must NOT throw even though a distinct agent uid is configured.
+    await expect(fsOps.place(canonical, "agent-1/fg_r2_5")).resolves.toBeUndefined();
+
+    // The symlink was placed and resolves to the source.
+    const placedPath = join(fortressDir, "grants", "agent-1", "fg_r2_5");
+    expect(await readFile(placedPath, "utf-8")).toBe("operator data");
+  });
+
+  it("place() still FAILS CLOSED on a non-chown filesystem error (R2-5 relaxes chown-EPERM only)", async () => {
+    // Put a FILE where the grants tree root must be a directory, so
+    // ensureTreeRoot (mkdir) fails with EEXIST. This is a genuine placement
+    // error, not a privilege/chown skip, so place() must still throw -- the R2-5
+    // relaxation is chown-EPERM only, never a blanket swallow of place() errors.
+    await writeFile(join(fortressDir, "grants"), "not a directory");
+    const source = join(sourceDir, "granted.txt");
+    await writeFile(source, "operator data");
+    const fsOps = new PosixFileGrantFsOps(fortressDir);
+    const canonical = await fsOps.realpath(source);
+
+    await expect(fsOps.place(canonical, "agent-1/fg_fatal")).rejects.toThrow();
   });
 });

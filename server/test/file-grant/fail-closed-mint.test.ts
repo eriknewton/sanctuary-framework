@@ -6,9 +6,13 @@
  *   - place() throws -> full rollback, NO active grant object AND NO tree
  *     entry survives (both the throws-before-recording and the
  *     records-then-throws partial-placement cases).
- *   - a throw AFTER place() succeeds (a broken success audit) -> mint still
- *     reports SUCCESS with a live, recorded grant; it is never rolled back and
- *     reported as a failure (the fail-OPEN + false-rollback bug, Fix 1).
+ *   - a broken POST-PLACE confirmation audit -> mint still reports SUCCESS with
+ *     a live, recorded grant; it is never rolled back and reported as a failure
+ *     (the fail-OPEN + false-rollback bug, Fix 1 + R2-3b).
+ *   - a put() that DURABLY commits then throws -> the committed record is rolled
+ *     back; no phantom `active` grant survives (R2-1).
+ *   - a DURABLE pre-placement audit failure -> mint fails closed BEFORE place();
+ *     access is never live without a preceding audit entry (R2-3a).
  *   - store.remove throwing during rollback -> no dangling `active` grant
  *     survives; a terminal `revoked` tombstone is persisted (Fix 2).
  *   - enforcement is HONEST: a same-owner box (incl. the sudo / source-owner
@@ -101,14 +105,18 @@ describe("file-grant fail-closed mint: rollback leaves no object AND no tree ent
   });
 });
 
-describe("file-grant mint: a throw AFTER place() succeeds never becomes a false failure (Fix 1)", () => {
-  it("a broken success audit does NOT roll back a live grant; mint reports success", async () => {
+describe("file-grant mint: a throw AFTER place() succeeds never becomes a false failure (Fix 1 + R2-3b)", () => {
+  it("a broken POST-PLACE confirmation audit does NOT roll back a live grant; mint reports success", async () => {
     const { grantStore } = makeFileGrantTestStore();
     const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
-    // Audit that throws ONLY on the post-placement success append.
+    // Audit that throws ONLY on the post-placement CONFIRMATION append (phase
+    // "placed"). The DURABLE pre-placement audit (phase "recorded") succeeds, so
+    // the grant is audited BEFORE access is conferred (R2-3); a broken
+    // confirmation must never roll back the already-live, already-audited grant
+    // and report failure (the fail-OPEN + false-rollback bug, R2-3b).
     const throwingAudit = {
-      appendCritical: async (entry: { result: string }) => {
-        if (entry.result === "success") throw new Error("audit ENOSPC after place");
+      appendCritical: async (entry: { result: string; details?: { phase?: string } }) => {
+        if (entry.details?.phase === "placed") throw new Error("audit ENOSPC after place");
         return undefined as unknown as void;
       },
     } as unknown as AuditLog;
@@ -127,6 +135,61 @@ describe("file-grant mint: a throw AFTER place() succeeds never becomes a false 
     const persisted = await grantStore.get(result.grant.grant_id);
     expect(persisted).not.toBeNull();
     expect(persisted!.status).toBe("active");
+  });
+});
+
+describe("file-grant mint: a put() that commits then throws leaves no phantom (R2-1)", () => {
+  it("a persists-then-throws put() rolls the committed record back; no active grant survives", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    // A store whose put() DURABLY writes to the real grantStore and THEN throws,
+    // modeling StateStore.write committing before a post-commit await
+    // (rememberWriterPublicKey / observeVersion / rename->fsyncDir) throws. The
+    // put()-catch must NOT assume nothing persisted: it must roll the committed
+    // record back, exactly like the placement-failure path.
+    const persistsThenThrows: FileGrantRecordStore = {
+      put: async (grant) => {
+        await grantStore.put(grant); // durable commit
+        throw new Error("post-commit fsyncDir threw after write committed");
+      },
+      remove: (grantId) => grantStore.remove(grantId),
+    };
+    const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
+
+    await expect(
+      mintFileGrant(baseParams(), { fsOps, store: persistsThenThrows, now: NOW, auditLog }),
+    ).rejects.toBeInstanceOf(FileGrantMintFailedError);
+
+    // The phantom committed record was rolled back: nothing listable as active.
+    const listed = await grantStore.list();
+    expect(listed.some((g) => g.status === "active")).toBe(false);
+    // place() never ran (put threw before placement).
+    expect(fsOps.placed).toHaveLength(0);
+  });
+});
+
+describe("file-grant mint: audit precedes access (R2-3a)", () => {
+  it("a pre-placement audit failure fails closed: no live access, no active grant", async () => {
+    const { grantStore } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
+    // Audit that throws on the DURABLE pre-placement append (phase "recorded").
+    // Access must NEVER be conferred without a preceding audit entry, so mint
+    // must fail BEFORE place() -- no symlink, no active grant, no
+    // live-access-without-audit.
+    const preAuditThrows = {
+      appendCritical: async (entry: { result: string; details?: { phase?: string } }) => {
+        if (entry.details?.phase === "recorded") throw new Error("audit ENOSPC before place");
+        return undefined as unknown as void;
+      },
+    } as unknown as AuditLog;
+
+    await expect(
+      mintFileGrant(baseParams(), { fsOps, store: grantStore, now: NOW, auditLog: preAuditThrows }),
+    ).rejects.toBeInstanceOf(FileGrantMintFailedError);
+
+    // Access was NEVER conferred (place did not run): no live-access-without-audit.
+    expect(fsOps.placed).toHaveLength(0);
+    // And no active grant survives.
+    expect((await grantStore.list()).some((g) => g.status === "active")).toBe(false);
   });
 });
 
