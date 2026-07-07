@@ -82,6 +82,10 @@ import {
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
 import {
+  runAutoProvisionForWrap,
+  type AutoProvisionSummary,
+} from "./auto-provision.js";
+import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../dashboard/v1_1/wiring.js";
@@ -210,6 +214,18 @@ export interface WrapOptions {
    * (exit 2) rather than silently continuing without anchoring.
    */
   anchorTransparency?: boolean;
+  /**
+   * Auto-provision Step 2 (Build 1): pre-answers the CHOICE of whether to
+   * provision a dedicated agent OS account, when `protect` detects the
+   * agent is running on a shared (operator) account. Fix L2: this pre-
+   * answers the choice ONLY -- the privileged mutation (create account,
+   * re-home, install daemon, arm) still prints its plan and, on a TTY,
+   * still asks its own single confirm. `--provision-agent-account` sets
+   * this true; `--no-provision-agent-account` sets it false (an explicit
+   * decline, skipping straight to "cooperative wrap only"). Unset (neither
+   * flag passed) leaves the interactive prompt as the sole decision point.
+   */
+  provisionAgentAccount?: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1027,7 +1043,62 @@ async function probeEnforcementObservedIfArmed(
   return probeCastleWallEnforcementObserved(auditLog, storagePath);
 }
 
+/**
+ * Auto-provision Step 2 (Build 1): gate + invoke the one-flow orchestration
+ * (castle-wall/provision) from `runWrap`. v1 scope (D1/D2 resolved): Hermes
+ * on darwin only; a dry run never provisions (fix: dry-run must remain
+ * write-free, matching the existing `options.dryRun` early-return above).
+ * `--unwrap` never reaches this call (the unwrap branch returns at the top
+ * of `runWrap`).
+ *
+ * Fix H4: when provisioning is skipped because this run is non-interactive
+ * (no TTY), the cooperative wrap this function is called from has ALREADY
+ * completed its own writes by the time this runs -- this call only adds a
+ * status line, it never blocks or reverts the wrap that already happened.
+ * Any error thrown by the auto-provision flow is caught here and reported
+ * as a note, never allowed to turn an otherwise-successful cooperative wrap
+ * into a hard CLI failure (the wall staying un-armed is exactly the state
+ * the honesty gate already renders correctly via `castleWallArmed`).
+ */
+async function maybeRunAutoProvisionForWrap(
+  agentConfig: { platform: AgentPlatform },
+  options: WrapOptions,
+  deps: RunWrapDeps,
+): Promise<AutoProvisionSummary> {
+  if (agentConfig.platform !== "hermes" || options.dryRun) {
+    return { ran: false };
+  }
+  const runner = deps.runAutoProvisionForWrap ?? runAutoProvisionForWrap;
+  try {
+    return await runner({
+      isTty: process.stdin.isTTY === true,
+      preAnsweredProvision: options.provisionAgentAccount,
+      // SAFETY: stderr is the operator-facing CLI channel for this
+      // subcommand; this prints the plan-and-print + progress lines from
+      // the auto-provision flow (account plan, re-home summary, arm
+      // result), never secrets or key material.
+      print: (line) => console.error(`  ${line}`),
+    });
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this
+    // subcommand; never surface secrets or key material here.
+    console.error(
+      `  Note: automatic account provisioning did not complete (${(err as Error).message}). ` +
+        `The cooperative wrap above still applies; re-run 'sanctuary protect' to retry provisioning.`,
+    );
+    return { ran: true };
+  }
+}
+
 export interface RunWrapDeps {
+  /**
+   * Override the auto-provision entry point (for tests). Production
+   * callers leave this undefined and get the real
+   * `wrap/auto-provision.ts:runAutoProvisionForWrap`, which is the ONLY
+   * caller of the privileged (drill-only) account-creation / re-home /
+   * daemon-install / arm side effects.
+   */
+  runAutoProvisionForWrap?: typeof runAutoProvisionForWrap;
   /** Override dashboard starter (for tests). */
   startDashboard?: DashboardStarter;
   /** Override browser opener (for tests). */
@@ -2288,6 +2359,13 @@ export async function runWrap(
     }
 
     failIfAnchorOptInDropped();
+    // Auto-provision Step 2 (Build 1): after the cooperative wrap above has
+    // fully completed (config rewritten, identity bootstrapped, agent
+    // record persisted), offer to provision the dedicated agent account and
+    // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
+    // decline / non-TTY skip / mid-flow abort here never reverts anything
+    // already done above (fix H4 -- the cooperative wrap always completes).
+    await maybeRunAutoProvisionForWrap(agentConfig, options, deps);
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
     printWrapSuccessNoDashboard({
       toolName,
@@ -2576,6 +2654,11 @@ export async function runWrap(
   }
 
   failIfAnchorOptInDropped();
+
+  // Auto-provision Step 2 (Build 1): see the matching call + comment in the
+  // --no-dashboard branch above. Runs after the cooperative wrap (config +
+  // identity + dashboard) has fully completed; never reverts it.
+  await maybeRunAutoProvisionForWrap(agentConfig, options, deps);
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
@@ -3793,6 +3876,8 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--no-dashboard",
   "--allow-plaintext-remote",
   "--anchor-transparency",
+  "--provision-agent-account",
+  "--no-provision-agent-account",
   "--help",
   "-h",
 ]);
@@ -3892,6 +3977,12 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--anchor-transparency":
         options.anchorTransparency = true;
+        break;
+      case "--provision-agent-account":
+        options.provisionAgentAccount = true;
+        break;
+      case "--no-provision-agent-account":
+        options.provisionAgentAccount = false;
         break;
       case "--fortress":
         options.fortress = argv[++i];
