@@ -86,6 +86,7 @@ import {
   type AutoProvisionSummary,
 } from "./auto-provision.js";
 import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
+import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -1081,6 +1082,20 @@ async function maybeRunAutoProvisionForWrap(
       print: (line) => console.error(`  ${line}`),
     });
   } catch (err) {
+    // FIX (round 5 / R8-2): a held provision lock means the flow body NEVER
+    // ran (another `sanctuary protect` is mid-provision), so this run mutated
+    // NOTHING. Classify it honestly -- the generic "may have PARTIALLY applied"
+    // warning below would falsely tell the operator to consider disarming a
+    // wall this run never touched.
+    if (err instanceof ProvisionLockHeldError) {
+      // SAFETY: stderr is the operator-facing CLI channel; a fixed, safe
+      // string plus the lock error message (a lock-path only, no secrets).
+      console.error(
+        `  Note: another 'sanctuary protect' provisioning run is already in progress (${(err as Error).message}); ` +
+          `this run made NO account, re-home, or Castle Wall changes. Wait for it to finish, then re-run if needed.`,
+      );
+      return { ran: true };
+    }
     // FIX (round 5, item N5): a throw reaching here can surface AFTER
     // privileged side effects already landed -- e.g. `withProvisionLock`'s
     // finally re-throws a non-ENOENT lock-release error even when

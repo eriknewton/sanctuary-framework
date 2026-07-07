@@ -65,18 +65,29 @@ export interface ProvisionFlowOps {
   /** Build + execute the re-home plan. Returns per-step results (for rollback). */
   rehome(uid: number, gid: number): Promise<{ plan: RehomePlan; results: RehomeStepResult[] }>;
   /**
-   * Install the harness daemon for the given uid. Returns whether THIS run
-   * actually bootstrapped a NEW daemon (vs found one already loaded).
+   * Install the harness daemon for the given uid. Returns a discriminated
+   * result (mirroring `arm`) rather than throwing on failure, so the
+   * teardown-on-abort decision always has the honest daemon-presence signals:
+   *   - ok: whether the install succeeded.
+   *   - bootstrappedThisRun (success): did THIS run stand up a NEW daemon
+   *     (vs find one already loaded)?
+   *   - daemonPreexisted (failure): was a daemon already loaded BEFORE this
+   *     run's install attempt? On failure the caller tears down iff
+   *     `!daemonPreexisted` (a fresh daemon this attempt left live must be
+   *     removed; a genuinely pre-existing one must be preserved -- R6-3).
    *
-   * FIX (round 5 / R7-1): the teardown-on-abort decision (N3/R6-3) must key on
-   * "did this run stand the daemon up", NOT on `alreadyDedicated`.
-   * `alreadyDedicated` is set from the ACCOUNT shape (name/IsHidden/shell), not
-   * daemon presence, so a re-run after a prior account-created-but-
-   * daemon-install-failed provision installs a FRESH daemon on the
-   * alreadyDedicated path -- and gating teardown on `!alreadyDedicated` would
-   * strand it. `bootstrappedThisRun` is the honest signal.
+   * FIX (round 5 / R7-1, R8-1): the teardown decision (N3/R6-3) must key on
+   * "did this run stand the daemon up", NOT on `alreadyDedicated` (which is set
+   * from the ACCOUNT shape, not daemon presence). R7-1 fixed the
+   * install-SUCCESS-then-later-abort branches; R8-1 makes install FAILURE carry
+   * the same honest signal (a throwing op left the install-abort branch on the
+   * stale `!alreadyDedicated` heuristic, stranding a fresh daemon on the
+   * alreadyDedicated path). A result object closes the whole daemon-lifecycle
+   * teardown decision on one honest signal instead of per-branch heuristics.
    */
-  installHarnessDaemon(uid: number): Promise<{ bootstrappedThisRun: boolean }>;
+  installHarnessDaemon(
+    uid: number,
+  ): Promise<{ ok: true; bootstrappedThisRun: boolean } | { ok: false; error: string; daemonPreexisted: boolean }>;
   /**
    * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
    * bootstraps a LIVE root LaunchDaemon; every post-install abort branch
@@ -231,15 +242,6 @@ export async function runProvisionFlow(
   // on the alreadyDedicated path (the account pre-existed; we did not create
   // it) and for every pre-create abort.
   let accountCreated = false;
-  // FIX (round 5 / R7-1): true once THIS run actually bootstrapped a NEW
-  // harness daemon (install returned bootstrappedThisRun). The post-install
-  // abort branches tear the daemon down iff this is set -- never key on
-  // `alreadyDedicated` (which does not track daemon presence), so a fresh
-  // daemon installed on the alreadyDedicated re-run path is not stranded, and
-  // a genuinely pre-existing daemon is never booted out. (No initializer: the
-  // install-daemon try assigns it and the catch returns, so every later read
-  // is definitely-assigned; a dead `= false` initializer trips no-useless-assignment.)
-  let daemonBootstrappedThisRun: boolean;
 
   // FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): `alreadyDedicated`
   // used to short-circuit straight to "done" -- reporting "already a
@@ -376,22 +378,19 @@ export async function runProvisionFlow(
   // Step 6: install the harness daemon. Agent now runs at ruid = uid; wall
   // NOT yet armed. A failure here means we already moved secrets -- restore
   // them before reporting the abort (never leave a half-provisioned agent).
-  try {
-    const install = await ops.installHarnessDaemon(uid);
-    daemonBootstrappedThisRun = install.bootstrappedThisRun;
-    ops.print("Harness daemon installed; agent now runs under the dedicated account.");
-  } catch (err) {
-    // FIX (round 5, item N3): the install may have partially bootstrapped the
-    // daemon before throwing; tear it back down (idempotent) before restoring
-    // the re-home, so an abort never leaves a live daemon behind. The throw
-    // gives us no bootstrappedThisRun signal, so fall back to the
-    // !alreadyDedicated heuristic: a fresh install attempt is cleaned up; a
-    // re-bootstrap that threw over a pre-existing daemon leaves it in place.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, !ctx.detectResult.alreadyDedicated);
+  const install = await ops.installHarnessDaemon(uid);
+  if (!install.ok) {
+    // FIX (round 5, item N3 / R8-1): a failed install may have left a fresh
+    // daemon live (the belt-and-suspenders bootstrap-then-verify path). Tear it
+    // down iff this attempt stood one up -- `!daemonPreexisted` is the honest
+    // signal (never the `!alreadyDedicated` heuristic, which does not track
+    // daemon presence): a fresh daemon this attempt left live is removed; a
+    // genuinely pre-existing daemon (R6-3) is preserved.
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, !install.daemonPreexisted);
     return {
       kind: "aborted",
       stage: "install-daemon",
-      reason: withDaemonTeardownNote((err as Error).message, td.daemonTeardownError),
+      reason: withDaemonTeardownNote(install.error, td.daemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
@@ -401,6 +400,11 @@ export async function runProvisionFlow(
       accountCreated,
     };
   }
+  // FIX (round 5 / R7-1): the honest "did this run stand the daemon up" signal
+  // -- the post-install abort branches key their teardown on it (never on
+  // `alreadyDedicated`, which does not track daemon presence).
+  const daemonBootstrappedThisRun = install.bootstrappedThisRun;
+  ops.print("Harness daemon installed; agent now runs under the dedicated account.");
 
   // Step 7: verify BEFORE arming (fix B2 ordering). FIX G5 (2026-07-07
   // re-gate 3): this proves DNS-resolvability + every moved credential

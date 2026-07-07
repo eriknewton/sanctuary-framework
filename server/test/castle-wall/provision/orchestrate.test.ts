@@ -59,7 +59,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       plan: { harnessId: "hermes", steps: [], requiresInteractiveReconsent: false },
       results: REHOME_RESULTS,
     })),
-    installHarnessDaemon: vi.fn(async () => ({ bootstrappedThisRun: true })),
+    installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
     uninstallHarnessDaemon: vi.fn(async () => undefined),
     preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
     checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: AGENT_UID })),
@@ -129,9 +129,7 @@ describe("castle-wall/provision/orchestrate", () => {
 
   it("fix F6: an already-dedicated abort mid-flow (e.g. daemon-install fails) does not attempt a restore (nothing was re-homed this run)", async () => {
     const ops = happyPathOps({
-      installHarnessDaemon: vi.fn(async () => {
-        throw new Error("launchctl bootstrap exited 5");
-      }),
+      installHarnessDaemon: vi.fn(async () => ({ ok: false as const, error: "launchctl bootstrap exited 5", daemonPreexisted: false })),
     });
     const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
     expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
@@ -241,9 +239,7 @@ describe("castle-wall/provision/orchestrate", () => {
 
   it("fail-closed: daemon install failure restores the backup and aborts before verify/arm", async () => {
     const ops = happyPathOps({
-      installHarnessDaemon: vi.fn(async () => {
-        throw new Error("launchctl bootstrap exited 5");
-      }),
+      installHarnessDaemon: vi.fn(async () => ({ ok: false as const, error: "launchctl bootstrap exited 5", daemonPreexisted: false })),
     });
     const result = await runProvisionFlow(baseCtx(), ops);
     expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon", rolledBack: true });
@@ -257,7 +253,7 @@ describe("castle-wall/provision/orchestrate", () => {
     const ops = happyPathOps({
       installHarnessDaemon: vi.fn(async () => {
         callOrder.push("install-daemon");
-        return { bootstrappedThisRun: true };
+        return { ok: true as const, bootstrappedThisRun: true };
       }),
       preArmEndpoints: vi.fn(() => {
         callOrder.push("pre-arm-verify");
@@ -431,9 +427,7 @@ describe("castle-wall/provision/orchestrate", () => {
 
   it("a restore failure during rollback does not mask the original abort reason, and reports rolledBack: false honestly (fix F2/F5)", async () => {
     const ops = happyPathOps({
-      installHarnessDaemon: vi.fn(async () => {
-        throw new Error("launchctl bootstrap exited 5");
-      }),
+      installHarnessDaemon: vi.fn(async () => ({ ok: false as const, error: "launchctl bootstrap exited 5", daemonPreexisted: false })),
       restoreRehome: vi.fn(async () => {
         throw new Error("restore also failed");
       }),
@@ -450,9 +444,7 @@ describe("castle-wall/provision/orchestrate", () => {
 
   it("fix F2/F5: a PARTIAL restore (some but not all paths recovered) reports rolledBack: 'partial', not a clean true", async () => {
     const ops = happyPathOps({
-      installHarnessDaemon: vi.fn(async () => {
-        throw new Error("launchctl bootstrap exited 5");
-      }),
+      installHarnessDaemon: vi.fn(async () => ({ ok: false as const, error: "launchctl bootstrap exited 5", daemonPreexisted: false })),
       restoreRehome: vi.fn(async () => ({
         fullyRestored: false,
         restoredCount: 1,
@@ -470,9 +462,7 @@ describe("castle-wall/provision/orchestrate", () => {
 
   it("FIX (round 5, R5-2): a post-install abort whose restore hit an R6 CONFLICT carries conflictPaths onto the outcome (so the CLI surfaces it, not a false 'restore FAILED')", async () => {
     const ops = happyPathOps({
-      installHarnessDaemon: vi.fn(async () => {
-        throw new Error("launchctl bootstrap exited 5");
-      }),
+      installHarnessDaemon: vi.fn(async () => ({ ok: false as const, error: "launchctl bootstrap exited 5", daemonPreexisted: false })),
       restoreRehome: vi.fn(async () => ({
         fullyRestored: false,
         restoredCount: 0,
@@ -509,7 +499,7 @@ describe("castle-wall/provision/orchestrate", () => {
   it("FIX (round 5, R6-3): an abort does NOT tear down a daemon that GENUINELY PRE-EXISTED (installHarnessDaemon reports bootstrappedThisRun:false) -- booting out working infrastructure over a transient failure would be destructive", async () => {
     const ops = happyPathOps({
       // The daemon was already loaded -> this run bootstrapped nothing.
-      installHarnessDaemon: vi.fn(async () => ({ bootstrappedThisRun: false })),
+      installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: false })),
       preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
     });
     const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
@@ -522,7 +512,7 @@ describe("castle-wall/provision/orchestrate", () => {
       // alreadyDedicated (account shape verified) but the daemon did NOT
       // pre-exist -- this run stood it up (e.g. a prior run created the account
       // then failed at install-daemon; account persists, daemon did not).
-      installHarnessDaemon: vi.fn(async () => ({ bootstrappedThisRun: true })),
+      installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
       preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
     });
     const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
@@ -530,6 +520,34 @@ describe("castle-wall/provision/orchestrate", () => {
     // The freshly-installed daemon MUST be torn down (not stranded with a
     // false "nothing was changed" all-clear).
     expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+  });
+
+  it("FIX (round 5, R8-1): an install-daemon FAILURE that left a FRESH daemon live (daemonPreexisted:false) tears it down -- even on the alreadyDedicated path", async () => {
+    const ops = happyPathOps({
+      installHarnessDaemon: vi.fn(async () => ({
+        ok: false as const,
+        error: "launchctl bootstrap exited 5 (service left live)",
+        daemonPreexisted: false,
+      })),
+    });
+    const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+    // The fresh daemon this attempt left live MUST be torn down (the pre-R8-1
+    // !alreadyDedicated heuristic stranded it here).
+    expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+  });
+
+  it("FIX (round 5, R8-1): an install-daemon FAILURE over a genuinely PRE-EXISTING daemon (daemonPreexisted:true) does NOT tear it down (R6-3 preserve)", async () => {
+    const ops = happyPathOps({
+      installHarnessDaemon: vi.fn(async () => ({
+        ok: false as const,
+        error: "plist refresh writeFile failed",
+        daemonPreexisted: true,
+      })),
+    });
+    const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+    expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
   });
 
   it("FIX (round 5, R6-4): the verify-before-arm abort reason is honest (no 're-homed agent could not reach' overclaim -- matches the post-arm phrasing)", async () => {

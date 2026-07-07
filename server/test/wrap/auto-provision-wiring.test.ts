@@ -189,4 +189,22 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     ).resolves.toBeUndefined();
     expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
   });
+
+  it("FIX (round 5, R8-2): a ProvisionLockHeldError is reported as an HONEST no-mutation note, not the generic 'may have partially applied / consider disarming' warning", async () => {
+    const { ProvisionLockHeldError } = await import("../../src/castle-wall/provision/index.js");
+    await installHermesFixture();
+    setTty(true);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => {
+      throw new ProvisionLockHeldError("/var/run/sanctuary-provision.lock");
+    });
+    await expect(
+      runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap })),
+    ).resolves.toBeUndefined();
+    const printed = stderrSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    // Honest: another provisioning run is in progress; THIS run changed nothing.
+    expect(printed).toMatch(/another 'sanctuary protect' provisioning run is already in progress/);
+    expect(printed).toMatch(/made NO account, re-home, or Castle Wall changes/);
+    // Must NOT emit the partial-apply / disarm warning for a lock-held no-op.
+    expect(printed).not.toMatch(/may have PARTIALLY applied/);
+  });
 });

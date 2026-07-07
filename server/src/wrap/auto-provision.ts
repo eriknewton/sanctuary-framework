@@ -904,20 +904,31 @@ export async function runAutoProvisionForWrap(
       // and `arm`'s `--agent-uid=<uid>` below, which both treat uid===gid
       // for this dedicated service account).
       resolvedAgentUidGid = { uid, gid: uid };
-      const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists });
-      const plan = planAgentHarnessDaemonInstall({
-        agentAccount: accountName,
-        programArguments: resolved.programArguments,
-        fortressPath: process.env.SANCTUARY_STORAGE_PATH,
-      });
-      // FIX (round 5 / R7-1): report whether THIS run actually stood the daemon
-      // up (vs found it already loaded), so the orchestrator tears down on
-      // abort iff we bootstrapped it -- never keying on `alreadyDedicated`
-      // (which does not track daemon presence). Check status BEFORE installing.
+      // FIX (round 5 / R7-1, R8-1): report the honest daemon-presence signals
+      // and NEVER throw -- return a discriminated result so the orchestrator's
+      // teardown decision keys on "did this attempt stand the daemon up" for
+      // both success and failure. Capture the pre-install status FIRST.
       const daemonOps = realHarnessDaemonOps();
-      const before = await agentHarnessDaemonStatus(daemonOps);
-      await installAgentHarnessDaemon(plan, daemonOps);
-      return { bootstrappedThisRun: !before.installed };
+      let before: { installed: boolean };
+      try {
+        before = await agentHarnessDaemonStatus(daemonOps);
+      } catch {
+        // Status probe itself failed: assume no pre-existing daemon (fail
+        // toward tearing down anything this attempt leaves live).
+        before = { installed: false };
+      }
+      try {
+        const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists });
+        const plan = planAgentHarnessDaemonInstall({
+          agentAccount: accountName,
+          programArguments: resolved.programArguments,
+          fortressPath: process.env.SANCTUARY_STORAGE_PATH,
+        });
+        await installAgentHarnessDaemon(plan, daemonOps);
+        return { ok: true as const, bootstrappedThisRun: !before.installed };
+      } catch (err) {
+        return { ok: false as const, error: (err as Error).message, daemonPreexisted: before.installed };
+      }
     },
     // FIX (round 5, item N3): tear the harness daemon back down on a
     // post-install abort. `installHarnessDaemon` bootstraps a LIVE root
