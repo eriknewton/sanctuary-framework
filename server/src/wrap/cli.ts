@@ -1195,6 +1195,19 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
         ` Do not re-run until you have torn it down (see the note above) and recovered any files.`,
     ];
   }
+  // FIX (round 5 / R3-2): a pre-re-home abort (root-check, operator-identity,
+  // detect, create-account, or a rehome that moved nothing) has NOTHING to
+  // restore. Render a neutral "nothing was changed; safe to re-run" line --
+  // never the "restore of your re-homed files FAILED / do not re-run" alarm
+  // the `rolledBack === false` branch below would otherwise print. This is the
+  // common no-sudo first attempt (stage "root-check").
+  if (outcome.rehomeAttempted === false) {
+    return [
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `No dedicated account was created and nothing was moved; the cooperative wrap above still applies. ` +
+        `Re-run 'sanctuary protect --hermes' once the cause above is resolved.`,
+    ];
+  }
   if (outcome.rolledBack === true) {
     return [
       `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +

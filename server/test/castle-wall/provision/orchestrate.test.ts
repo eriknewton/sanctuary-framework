@@ -195,6 +195,47 @@ describe("castle-wall/provision/orchestrate", () => {
     const result = await runProvisionFlow(baseCtx(), ops);
     expect(result).toMatchObject({ kind: "aborted", stage: "rehome", rolledBack: true });
     expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+    // FIX (round 5, R3-2): nothing moved -> rehomeAttempted:false so the CLI
+    // shows the neutral "nothing changed" frame, not a restore claim/alarm.
+    expect((result as { rehomeAttempted?: boolean }).rehomeAttempted).toBe(false);
+  });
+
+  it("FIX (round 5, R3-2): a create-account abort reports rehomeAttempted:false (no account, nothing moved -> neutral CLI frame, not a false 'restore FAILED')", async () => {
+    const ops = happyPathOps({
+      createAccount: vi.fn(async () => {
+        throw new Error("sysadminctl -addUser failed");
+      }),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "create-account", rehomeAttempted: false });
+    expect(ops.rehome).not.toHaveBeenCalled();
+  });
+
+  it("FIX (round 5, R3-2): a post-install abort AFTER a real re-home reports rehomeAttempted:true (there ARE moved paths to reason about)", async () => {
+    const ops = happyPathOps({
+      preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm", rehomeAttempted: true });
+  });
+
+  it("FIX (round 5, R3-3): armed-rollback-failed reason does NOT claim 'Fast-disarmed' (the disarm failed); armed-then-rolled-back DOES", async () => {
+    const failOps = happyPathOps({
+      postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+      disarm: vi.fn(async () => {
+        throw new Error("castle-wall disable exited 1");
+      }),
+    });
+    const failResult = await runProvisionFlow(baseCtx(), failOps);
+    expect(failResult).toMatchObject({ kind: "armed-rollback-failed", uid: AGENT_UID });
+    expect((failResult as { reason: string }).reason).not.toMatch(/Fast-disarmed/);
+
+    const okOps = happyPathOps({
+      postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+    });
+    const okResult = await runProvisionFlow(baseCtx(), okOps);
+    expect(okResult).toMatchObject({ kind: "armed-then-rolled-back", uid: AGENT_UID });
+    expect((okResult as { reason: string }).reason).toMatch(/Fast-disarmed rather than leave a bricked agent/);
   });
 
   it("fail-closed: daemon install failure restores the backup and aborts before verify/arm", async () => {

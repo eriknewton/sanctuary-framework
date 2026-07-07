@@ -1091,3 +1091,65 @@ describe("wrap/auto-provision real-ops chokepoint: round-2 symlink residuals (R2
     }
   });
 });
+
+describe("wrap/auto-provision real-ops chokepoint: backup() shape handling (fix round-5 R3-1)", () => {
+  it("FIX R3-1: backup of a DIRECTORY-shaped secret makes a REAL recursive copy (no ERR_OUT_OF_RANGE from an invalid fs.cp mode arg)", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-backup-dir-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const srcDir = join(tmpRoot, "creds-dir");
+      await mkdir(srcDir, { recursive: true });
+      await writeFile(join(srcDir, "token.json"), "oauth-token");
+
+      // Pre-fix this threw `ERR_OUT_OF_RANGE` (fs.cp mode:0o700 is an invalid
+      // copy-flag), so the directory-backup branch was dead on arrival.
+      const { backupPath } = await realRehomeOps({ backupRoot }).backup(srcDir);
+
+      expect(await readFile(join(backupPath, "token.json"), "utf8")).toBe("oauth-token");
+      // M4 custody modes: dir 0700, file inside 0600.
+      expect((await stat(backupPath)).mode & 0o777).toBe(0o700);
+      expect((await stat(join(backupPath, "token.json"))).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX R3-1: backup of a FILE secret still copies + chmods 0600 (file branch unchanged)", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-backup-file-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const srcFile = join(tmpRoot, "secret.env");
+      await writeFile(srcFile, "LLM_KEY=abc");
+      const { backupPath } = await realRehomeOps({ backupRoot }).backup(srcFile);
+      expect(await readFile(backupPath, "utf8")).toBe("LLM_KEY=abc");
+      expect((await stat(backupPath)).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX R3-1: backup of a SYMLINK secret preserves the LINK (no dereference into operator space, no recursive copy of the target)", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-backup-symlink-"));
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      // A symlink-to-directory: stat() reports it as a directory, so the
+      // pre-fix (stat-based) branch would have recursively copied the target
+      // OUT of custody. lstat (R3-1) sees the link and copies the link only.
+      const realDir = join(tmpRoot, "real-creds");
+      await mkdir(realDir, { recursive: true });
+      await writeFile(join(realDir, "t.json"), "data");
+      const linkSrc = join(tmpRoot, "link-creds");
+      await symlink(realDir, linkSrc);
+
+      const { backupPath } = await realRehomeOps({ backupRoot }).backup(linkSrc);
+
+      const st = await lstat(backupPath);
+      expect(st.isSymbolicLink()).toBe(true);
+      expect(await readlink(backupPath)).toBe(realDir);
+      // The backup is the link itself -- NOT a directory copy of the target.
+      expect(st.isDirectory()).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});

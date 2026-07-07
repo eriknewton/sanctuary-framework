@@ -105,4 +105,39 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/root harness LaunchDaemon may still be running/);
     expect(out[0]).not.toMatch(/Re-homed paths were restored to your account\. Re-run/);
   });
+
+  it("FIX R2-2: succeeded daemon teardown (daemonTeardownFailed:false) with rolledBack:true uses the soft Note frame (no false loud warning)", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "aborted", stage: "verify-before-arm", reason: "re-homed agent could not reach: X.", rolledBack: true, daemonTeardownFailed: false, rehomeAttempted: true },
+    });
+    expect(out[0]).toMatch(/^ {2}Note:/);
+  });
+
+  it("FIX R3-2: a pre-re-home abort (rehomeAttempted:false) renders a NEUTRAL 'nothing was changed' Note, never the 'restore FAILED' alarm (the common no-sudo first attempt)", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "root-check",
+        reason: "auto-provisioning requires root; re-run with sudo.",
+        rolledBack: false,
+        rehomeAttempted: false,
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/^ {2}Note:/);
+    expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
+    expect(out[0]).not.toMatch(/restore of your re-homed files FAILED/);
+    expect(out[0]).not.toMatch(/WARNING/);
+  });
+
+  it("FIX R3-2: rolledBack:false WITHOUT rehomeAttempted:false still shows the LOUD restore-failed frame (a genuine failed restore after a real re-home)", () => {
+    const out = lines({
+      ran: true,
+      outcome: { kind: "aborted", stage: "verify-before-arm", reason: "boom", rolledBack: false, rehomeAttempted: true },
+    });
+    expect(out[0]).toMatch(/^ {2}WARNING:/);
+    expect(out[0]).toMatch(/restore of your re-homed files FAILED/);
+  });
 });

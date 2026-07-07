@@ -141,6 +141,19 @@ export type ProvisionFlowOutcome =
        * retry" line that contradicts its own embedded manual-recovery note.
        */
       daemonTeardownFailed?: boolean;
+      /**
+       * FIX (round 5 / R3-2): false when this abort fired BEFORE any re-home
+       * path was moved (root-check, operator-identity, detect, create-account,
+       * or a rehome that threw before moving anything), so there is genuinely
+       * NOTHING to restore. The CLI renderer emits a neutral "nothing was
+       * changed; safe to re-run" line for these, instead of the false
+       * "restore of your re-homed files FAILED; do not re-run" alarm the
+       * `rolledBack === false` branch would otherwise print (the N7 false-alarm
+       * class, which the round-5 N7 fix only closed for the one rehome stage).
+       * Undefined is treated as "re-home may have run" (use the rolledBack
+       * framing) for backward compatibility.
+       */
+      rehomeAttempted?: boolean;
     }
   | { kind: "armed-then-rolled-back"; uid: number; reason: string }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
@@ -188,6 +201,7 @@ export async function runProvisionFlow(
       stage: "detect",
       reason: "detectResult.alreadyDedicated is true but no uid was resolved; refusing to proceed.",
       rolledBack: false,
+      rehomeAttempted: false,
     };
   }
 
@@ -239,7 +253,13 @@ export async function runProvisionFlow(
       uid = created.uid;
       ops.print(`Account "${ctx.accountName}" ready at uid ${uid}.`);
     } catch (err) {
-      return { kind: "aborted", stage: "create-account", reason: (err as Error).message, rolledBack: false };
+      return {
+        kind: "aborted",
+        stage: "create-account",
+        reason: (err as Error).message,
+        rolledBack: false,
+        rehomeAttempted: false,
+      };
     }
 
     // Step 5: re-home (backup-first, reversible).
@@ -270,6 +290,10 @@ export async function runProvisionFlow(
         // rolledBack: true (nothing to roll back), which is the honest state.
         rolledBack: restore.rolledBack,
         backupPaths: restore.backupPaths,
+        // FIX (round 5 / R3-2): only "attempted" if a move actually landed;
+        // an empty-partialResults rehome throw moved nothing, so the CLI
+        // shows the neutral "nothing changed" frame, not a restore claim.
+        rehomeAttempted: partialResults.length > 0,
       };
     }
   }
@@ -292,6 +316,7 @@ export async function runProvisionFlow(
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.length > 0,
     };
   }
 
@@ -318,6 +343,7 @@ export async function runProvisionFlow(
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.length > 0,
     };
   }
 
@@ -334,6 +360,7 @@ export async function runProvisionFlow(
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.length > 0,
     };
   }
 
@@ -351,6 +378,7 @@ export async function runProvisionFlow(
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.length > 0,
     };
   }
 
@@ -367,11 +395,15 @@ export async function runProvisionFlow(
     // Report what actually failed the re-check, and name the still-open
     // question (is the allow-list correct?) as the drill's job -- never assert
     // "the allow-list blocks" from a probe that cannot show it.
-    const reason =
+    // FIX (round 5 / R3-3): the "Fast-disarmed ..." clause is NOT part of the
+    // shared base reason. It asserts a COMPLETED disarm, which is true only on
+    // the armed-then-rolled-back path; on armed-rollback-failed the disarm
+    // threw, so reusing it would directly contradict the disarmError we report.
+    // Append it only where the disarm actually succeeded.
+    const baseReason =
       `post-arm connectivity re-check failed for: ${unreachable.join(", ")}. ` +
       `This re-check proves DNS-resolvability and moved-credential readability only, not allow-list ` +
-      `correctness (the Erik-present drill confirms end-to-end reachability as the agent uid). ` +
-      `Fast-disarmed rather than leave a bricked agent.`;
+      `correctness (the Erik-present drill confirms end-to-end reachability as the agent uid).`;
     // FIX R5 (HIGH, 2026-07-07 fix-round 2): `disarm()` can itself fail (the
     // exact scenario this rollback exists for -- something about this host
     // is already unhealthy). The pre-fix-round-2 code left this call
@@ -385,14 +417,16 @@ export async function runProvisionFlow(
       return {
         kind: "armed-rollback-failed",
         uid,
-        reason,
+        // No "Fast-disarmed" claim: the disarm FAILED (see disarmError). The
+        // wall is still ARMED; the CLI render says so loudly.
+        reason: baseReason,
         disarmError: (disarmErr as Error).message,
       };
     }
     return {
       kind: "armed-then-rolled-back",
       uid,
-      reason,
+      reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.`,
     };
   }
 

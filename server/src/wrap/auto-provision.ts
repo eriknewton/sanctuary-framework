@@ -29,7 +29,7 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, stat, lstat, cp } from "node:fs/promises";
+import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, stat, lstat, readlink, symlink, cp } from "node:fs/promises";
 import { dirname, relative, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
@@ -670,6 +670,10 @@ export async function runAutoProvisionForWrap(
         stage: "root-check",
         reason: "auto-provisioning requires root; re-run with sudo.",
         rolledBack: false,
+        // FIX (round 5 / R3-2): nothing was created or moved, so the CLI must
+        // NOT print a "restore of your re-homed files FAILED / do not re-run"
+        // alarm -- this is the common no-sudo first attempt.
+        rehomeAttempted: false,
       },
     };
   }
@@ -696,6 +700,8 @@ export async function runAutoProvisionForWrap(
         stage: "root-check",
         reason: "could not resolve the operator's identity under sudo; refusing to provision.",
         rolledBack: false,
+        // FIX (round 5 / R3-2): nothing created or moved -> neutral CLI frame.
+        rehomeAttempted: false,
       },
     };
   }
@@ -1188,13 +1194,36 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       // after the copy, closing the umask-dependent window.
       const backupPath = `${backupRoot}${path}.bak`;
       await mkdir(dirname(backupPath), { recursive: true, mode: 0o700 });
-      const st = await stat(path);
-      if (st.isDirectory()) {
+      // FIX (round 5 / R3-1): decide the shape by `lstat` (no-follow), not
+      // `stat`. A symlinked secret must be backed up as the LINK itself, never
+      // dereferenced -- otherwise `stat` reports a symlink-to-directory as a
+      // directory and the recursive copy below would follow it into
+      // operator-owned space (and `cp` with dereference:false would instead
+      // produce a data-less symlink "backup"). This matches the PR's pervasive
+      // lstat/no-follow symlink posture (N2, R2-1, R2-4).
+      const st = await lstat(path);
+      if (st.isSymbolicLink()) {
+        // Preserve the link faithfully (target string only); a symlinked
+        // credential is rejected at verify (R2-4) and reverse-moved as the
+        // original link on abort (R2-1), so this backup only needs to restore
+        // the link if destPath is ever gone. No chmod: a symlink's own mode is
+        // irrelevant and must never be dereferenced.
+        await symlink(await readlink(path), backupPath);
+      } else if (st.isDirectory()) {
         // FIX F2 (2026-07-07 fix-round): the M4 custody copy for a
         // directory-shaped secret (e.g. `.hermes/google-mcp-creds/`,
         // `.workspace-mcp/cli-tokens/`) must be a REAL recursive copy, not
         // an empty placeholder directory -- an empty backup is not a backup.
-        await cp(path, backupPath, { recursive: true, mode: 0o700 });
+        //
+        // FIX (round 5 / R3-1): `cp`'s `mode` option is a COPYFILE_* copy-flag
+        // bitmask constrained to 0-7, NOT a permission mode -- passing 0o700
+        // (448) threw `ERR_OUT_OF_RANGE` synchronously before any bytes copied,
+        // so the directory-backup branch was dead on every supported Node and
+        // no real directory backup was ever produced. The mode is set by the
+        // `chmodRecursive` immediately below (dirs 0700 / files 0600), which is
+        // the documented M4 "explicit chmod after copy" intent, so the invalid
+        // `mode` argument is simply dropped.
+        await cp(path, backupPath, { recursive: true });
         await chmodRecursive(backupPath);
       } else {
         await copyFile(path, backupPath);
