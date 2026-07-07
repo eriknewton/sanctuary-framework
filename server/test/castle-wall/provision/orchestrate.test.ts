@@ -261,6 +261,36 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(ops.restoreRehome).not.toHaveBeenCalled();
   });
 
+  it("FIX G1 (re-gate 3): a non-throwing-but-nonzero disarm, wired through the REAL disarmExitCodeDecision chokepoint, yields armed-rollback-failed -- never armed-then-rolled-back", async () => {
+    // This wires the mock `disarm` op the SAME way `wrap/auto-provision.ts`'s
+    // real closure does: call the injected "runDisable", get back a number
+    // (never a throw from runDisable itself), run it through the real,
+    // exported `throwIfDisarmFailed`-equivalent chokepoint decision, and
+    // throw only if that decision says so. Before the G1 fix, the
+    // production closure never made this call at all -- it discarded the
+    // code -- so this test proves the WIRED-UP real decision logic, not a
+    // hand-rolled throw, is what routes this outcome.
+    const { disarmExitCodeDecision } = await import("../../../src/wrap/auto-provision.js");
+    const runDisableThatFailsWithoutThrowing = async (): Promise<number> => 1;
+    const ops = happyPathOps({
+      postArmEndpoints: vi.fn(() => [{ name: "Gmail", probe: async () => false }]),
+      disarm: vi.fn(async () => {
+        const code = await runDisableThatFailsWithoutThrowing();
+        const err = disarmExitCodeDecision(code);
+        if (err !== undefined) {
+          throw err;
+        }
+      }),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({
+      kind: "armed-rollback-failed",
+      uid: AGENT_UID,
+      disarmError: "castle-wall disable exited 1",
+    });
+    expect(ops.disarm).toHaveBeenCalledTimes(1);
+  });
+
   it("fix F1 (BLOCKER): an empty pre-arm endpoint list REFUSES to arm (fail-closed, not vacuous-true)", async () => {
     const ops = happyPathOps({
       preArmEndpoints: vi.fn(() => []),

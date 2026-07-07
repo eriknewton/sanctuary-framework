@@ -204,6 +204,19 @@ export class RehomeExecutionError extends Error {
  * partial move instead of losing it to an empty array. The ORIGINAL error's
  * message is preserved (via `Error.cause` and by folding it into the new
  * error's own message) so existing failure-reason matching keeps working.
+ *
+ * FIX G3 (HIGH, 2026-07-07 re-gate 3 / fix-round 3): the R3 fix above still
+ * had a one-step-short gap -- `move` -> `chown` -> `push-to-results` left a
+ * STRADDLING window: if `chown` throws AFTER `move` already renamed the path
+ * onto the new account's home, the entry was never pushed to `results`
+ * before the throw, so `RehomeExecutionError.partialResults` omitted it
+ * entirely. `safeRestore` (orchestrate.ts) then had no record of that path
+ * at all -- the secret was stranded, moved-but-not-chowned, under the new
+ * (not-yet-armed) account, with no backup path surfaced to the operator.
+ * The fix records the `moved` result IMMEDIATELY after `move()` succeeds,
+ * BEFORE `chown` runs, so a chown failure still has the entry already
+ * captured in `results` (and therefore in `partialResults`) and
+ * `safeRestore` can recover it via `destPath` like any other moved entry.
  */
 export async function executeRehomePlan(
   plan: RehomePlan,
@@ -224,8 +237,11 @@ export async function executeRehomePlan(
         backupPath = backup.backupPath;
       }
       await ops.move(step.entry.sourcePath, step.destPath);
+      // FIX G3: record the moved result NOW, before chown -- a chown failure
+      // below must not strand this entry outside `results`/`partialResults`.
+      const stepResult: RehomeStepResult = { entry: step.entry, destPath: step.destPath, status: "moved", backupPath };
+      results.push(stepResult);
       await ops.chown(step.destPath, newAccountUidGid.uid, newAccountUidGid.gid);
-      results.push({ entry: step.entry, destPath: step.destPath, status: "moved", backupPath });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       throw new RehomeExecutionError(message, results, { cause: err });

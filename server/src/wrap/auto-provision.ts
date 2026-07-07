@@ -111,6 +111,36 @@ export function dnsResolvesProbe(host: string): () => Promise<boolean> {
 }
 
 /**
+ * FIX G1 (HIGH, 2026-07-07 re-gate 3 / fix-round 3): pure decision logic
+ * behind the `disarm` op's exit-code check (chokepoint seam, mirroring the
+ * existing R1/R2 pattern of exporting the pure decision behind a real-ops
+ * closure so the unit suite can drive every branch directly). `runDisable`
+ * (`cli/castle-wall.js`) RETURNS a numeric exit code on failure -- it does
+ * NOT throw -- exactly like `runEnable`, which `arm` above already checks
+ * via `code === 0`. Before this fix, `disarm`'s closure discarded the
+ * returned code entirely, so a FAILED disable resolved WITHOUT throwing;
+ * `orchestrate.ts`'s post-arm rollback only routes to the loud
+ * `armed-rollback-failed` outcome when `ops.disarm()` THROWS, so a silently-
+ * swallowed failure instead fell through to `armed-then-rolled-back`
+ * ("only enforcement came down, agent still runs") while the wall could
+ * STILL BE ARMED -- a falsely-green drill, exactly the outcome the re-gate
+ * exists to catch. Returns the `Error` to throw on a nonzero code, or
+ * `undefined` on success (code 0) -- never throws itself, so it stays a
+ * pure value-in/value-out decision the caller chooses to throw.
+ */
+export function disarmExitCodeDecision(code: number): Error | undefined {
+  return code === 0 ? undefined : new Error(`castle-wall disable exited ${code}`);
+}
+
+/** Throws iff {@link disarmExitCodeDecision} decides the exit code is a failure. */
+function throwIfDisarmFailed(code: number): void {
+  const err = disarmExitCodeDecision(code);
+  if (err !== undefined) {
+    throw err;
+  }
+}
+
+/**
  * Pure decision logic behind "is this moved credential path readable by the
  * target uid" (fix R1 chokepoint seam): given a `stat` result (or `undefined`
  * for ENOENT) and the target uid, decide whether the credential counts as
@@ -192,16 +222,53 @@ function credentialReadableProbe(path: string, targetUid: number, targetGid?: nu
   };
 }
 
-/** Build the real, injected pre-arm/post-arm endpoint probe list for Hermes. */
-function hermesEndpointProbes(newAccountHome: string, targetUid: number, targetGid: number): EndpointProbeTarget[] {
+/**
+ * FIX G5 (MEDIUM, 2026-07-07 re-gate 3 / fix-round 3): every moved-credential
+ * dest-relative path the Hermes re-home adapter actually moves (fix-round 2's
+ * `HERMES_ENDPOINT_HOSTS`/probe list checked ONLY `.hermes/.env`, while the
+ * doc comments above claimed "each moved credential present-and-readable").
+ * `auth.json`, `config.yaml`, the Google OAuth credentials, and the
+ * workspace-mcp tokens could be moved-but-unreadable-by-uid while DNS +
+ * `.env` still passed, so verify went green over a broken re-home. Derived
+ * DIRECTLY from `hermesRehomeAdapter.pathsToRehome`'s `isSecret` entries
+ * (rather than a second, hand-maintained list) so this can never silently
+ * drift out of sync with what re-home actually moves; the adapter takes an
+ * `operatorHome` argument only to build its (unused here) `sourcePath`, so
+ * an empty string is passed and only `destRelativePath` is read.
+ *
+ * Exported (fix chokepoint, 2026-07-07 re-gate 3) so the real-ops unit suite
+ * can assert this list stays in lockstep with `hermesRehomeAdapter` and
+ * covers every secret path, not just `.env`.
+ */
+export function allHermesCredentialDestPaths(): string[] {
+  return hermesRehomeAdapter
+    .pathsToRehome("")
+    .filter((entry) => entry.isSecret)
+    .map((entry) => entry.destRelativePath);
+}
+
+/**
+ * Build the real, injected pre-arm/post-arm endpoint probe list for Hermes.
+ * Exported (fix chokepoint, 2026-07-07 re-gate 3) so the real-ops unit suite
+ * can drive the FULL probe list (DNS hosts + every credential path) against
+ * a real disposable tmpdir and assert an unreadable non-.env credential
+ * fails the aggregate verify, not just `.hermes/.env`.
+ */
+export function hermesEndpointProbes(newAccountHome: string, targetUid: number, targetGid: number): EndpointProbeTarget[] {
   const targets: EndpointProbeTarget[] = HERMES_ENDPOINT_HOSTS.map(({ name, host }) => ({
     name: `${name} (DNS-resolves)`,
     probe: dnsResolvesProbe(host),
   }));
-  targets.push({
-    name: "moved credentials present + readable by agent uid (.hermes/.env)",
-    probe: credentialReadableProbe(`${newAccountHome}/.hermes/.env`, targetUid, targetGid),
-  });
+  // FIX G5: probe EVERY moved credential path for readable-by-target-uid,
+  // not just `.hermes/.env` -- fail-closed if any is unreadable, so a
+  // broken re-home of a non-.env credential can no longer sail through
+  // verify while only the .env probe was checked.
+  for (const destRelativePath of allHermesCredentialDestPaths()) {
+    targets.push({
+      name: `moved credential present + readable by agent uid (${destRelativePath})`,
+      probe: credentialReadableProbe(`${newAccountHome}/${destRelativePath}`, targetUid, targetGid),
+    });
+  }
   return targets;
 }
 
@@ -265,6 +332,19 @@ export interface OperatorIdentity {
  * non-negative integers, and (when present) `SUDO_USER` must match a safe
  * account-name shape; any other combination resolves `undefined` (never a
  * fabricated or root-fallback identity).
+ *
+ * FIX G4 (MEDIUM, 2026-07-07 re-gate 3 / fix-round 3): a ROOT sudo context
+ * (e.g. `sudo su -` then running `sanctuary protect --hermes` from that root
+ * shell) sets `SUDO_UID=0`/`SUDO_GID=0` (and often `SUDO_USER=root`). The
+ * pre-fix code accepted uid/gid `0` as a perfectly well-formed "operator"
+ * identity, which resolves the operator's home to `/var/root` and custody
+ * to `0:0` -- reintroducing the EXACT root-home path this whole R2 fix
+ * exists to fail closed against (re-home would look for secrets under
+ * `/var/root/.hermes/...`, never where they actually live, and any restored
+ * secret would be chowned back to root instead of a real operator account).
+ * Reject uid `0`, gid `0`, and `SUDO_USER === "root"` outright -- fail closed
+ * to the same `undefined` the caller already treats as "abort at the
+ * root-check stage", never silently resolving root as the operator.
  */
 export function resolveSudoIdentityDecision(env: {
   SUDO_UID?: string;
@@ -281,6 +361,11 @@ export function resolveSudoIdentityDecision(env: {
   const uid = Number(SUDO_UID);
   const gid = Number(SUDO_GID);
   if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid)) {
+    return undefined;
+  }
+  // FIX G4: a root sudo context is never a valid "operator" -- fail closed
+  // rather than resolve /var/root + custody 0:0.
+  if (uid === 0 || gid === 0 || SUDO_USER === "root") {
     return undefined;
   }
   if (SUDO_USER !== undefined && !/^[a-zA-Z0-9._-]+$/.test(SUDO_USER)) {
@@ -534,9 +619,16 @@ export async function runAutoProvisionForWrap(
       return code === 0 ? { ok: true } : { ok: false, error: `castle-wall enable exited ${code}` };
     },
     postArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid),
+    // FIX G1 (HIGH, 2026-07-07 re-gate 3 / fix-round 3): see
+    // `disarmExitCodeDecision` above for the full rationale -- `runDisable`
+    // returns (does not throw) a nonzero code on failure, and this closure
+    // must throw in that case so `orchestrate.ts`'s already-wired catch
+    // routes it to `armed-rollback-failed` instead of silently falling
+    // through to `armed-then-rolled-back`.
     disarm: async () => {
       const { runDisable } = await import("../cli/castle-wall.js");
-      await runDisable([]);
+      const code = await runDisable([]);
+      throwIfDisarmFailed(code);
     },
     restoreRehome: async (results: RehomeStepResult[]) => {
       // FIX F2/F3 (2026-07-07 fix-round): thread the OPERATOR's uid/gid
@@ -742,6 +834,37 @@ function realAccountProvisionOps() {
   };
 }
 
+/**
+ * FIX G2 (HIGH, 2026-07-07 re-gate 3 / fix-round 3): find a conflict-sibling
+ * path that does NOT already exist, trying `${sourcePath}.restored-conflict`
+ * first, then `.restored-conflict.1`, `.restored-conflict.2`, ... . The R6
+ * fix (fix-round 2) stopped `restore` from overwriting a RECREATED
+ * `sourcePath`, but the conflict-sibling target it restored into
+ * (`${sourcePath}.restored-conflict`) was itself unguarded: a PRE-EXISTING
+ * conflict sibling (left over from a prior aborted run, or planted by the
+ * operator/some other process) was silently clobbered by the rename/copy --
+ * the exact R6 defect, one path over, while still reporting a "handled
+ * safely" `{ restored: false, conflictPath }` outcome. Bounded at 1000
+ * suffixes (fail-closed: this is a real-ops path, not a place to spin
+ * forever on a pathological directory full of stale conflict files).
+ */
+async function findUniqueConflictPath(sourcePath: string): Promise<string> {
+  const base = `${sourcePath}.restored-conflict`;
+  if (!(await pathExists(base))) {
+    return base;
+  }
+  const MAX_SUFFIX = 1000;
+  for (let i = 1; i <= MAX_SUFFIX; i++) {
+    const candidate = `${base}.${i}`;
+    if (!(await pathExists(candidate))) {
+      return candidate;
+    }
+  }
+  throw new Error(
+    `could not find a free conflict-sibling path for ${sourcePath} after ${MAX_SUFFIX} attempts; refusing to overwrite`,
+  );
+}
+
 /** Recursively chmod a file or directory tree (files 0600, dirs 0700), matching custody mode for both shapes. */
 async function chmodRecursive(path: string): Promise<void> {
   const st = await stat(path);
@@ -841,6 +964,17 @@ export function realRehomeOps() {
      * `.restored-conflict` sibling path instead of overwriting -- the
      * operator's recreated data is never destroyed, and the caller can see
      * from the returned `conflictPath` that this needs manual reconciliation.
+     *
+     * FIX G2 (HIGH, 2026-07-07 re-gate 3 / fix-round 3): the R6 conflict-
+     * sibling TARGET (`${sourcePath}.restored-conflict`) was itself
+     * unguarded -- a PRE-EXISTING file at that exact path (a prior aborted
+     * run's conflict copy, or anything else living there) was silently
+     * overwritten by the rename/copy below, the exact R6 defect one path
+     * over, while still reporting a "handled safely" outcome. Both the
+     * rename branch and the backup-copy fallback branch now resolve a
+     * UNIQUE, does-not-yet-exist conflict path via
+     * {@link findUniqueConflictPath} before writing, so a pre-existing
+     * conflict sibling is never clobbered either.
      */
     restore: async (destPath: string, sourcePath: string): Promise<{ restored: boolean; conflictPath?: string }> => {
       const destExists = await pathExists(destPath);
@@ -853,7 +987,8 @@ export function realRehomeOps() {
           // conflict path alongside it instead, and report the conflict
           // (never a bare "restored: true") so the caller surfaces loud
           // manual-recovery guidance.
-          const conflictPath = `${sourcePath}.restored-conflict`;
+          // FIX G2: the conflict path itself must not already be occupied.
+          const conflictPath = await findUniqueConflictPath(sourcePath);
           await rename(destPath, conflictPath);
           return { restored: false, conflictPath };
         }
@@ -869,7 +1004,8 @@ export function realRehomeOps() {
         if (sourceConflict) {
           // Same conflict guard for the backup-copy fallback: never
           // overwrite a recreated source with the backup copy either.
-          const conflictPath = `${sourcePath}.restored-conflict`;
+          // FIX G2: nor a pre-existing conflict sibling at that path.
+          const conflictPath = await findUniqueConflictPath(sourcePath);
           const st = await stat(backupPath);
           if (st.isDirectory()) {
             await cp(backupPath, conflictPath, { recursive: true });

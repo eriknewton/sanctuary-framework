@@ -266,9 +266,11 @@ export async function runProvisionFlow(
     };
   }
 
-  // Step 7: verify BEFORE arming (fix B2 ordering) -- unfiltered
-  // reachability as the new uid. This proves re-home correctness, NOT
-  // allow-list correctness (the wall is not armed yet).
+  // Step 7: verify BEFORE arming (fix B2 ordering). FIX G5 (2026-07-07
+  // re-gate 3): this proves DNS-resolvability + every moved credential
+  // present-and-readable-by-target-uid (see verify.ts's module doc), NOT
+  // reachability "as the new uid" (this process never crosses a uid
+  // boundary) and NOT allow-list correctness (the wall is not armed yet).
   const preArmVerify: ConnectivityVerifyResult = await verifyReachabilityBeforeArm(ops.preArmEndpoints());
   if (!preArmVerify.allReachable) {
     const unreachable = preArmVerify.results.filter((r) => !r.reachable).map((r) => r.name);

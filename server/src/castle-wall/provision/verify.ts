@@ -9,19 +9,35 @@
  * gate" before arming (arming is what creates the gate). So this module
  * splits verification into two distinct, honestly-scoped checks:
  *
- *   - `verifyReachabilityBeforeArm` (post-daemon, PRE-arm): the re-homed
- *     agent, now running as the new uid via the just-installed harness
- *     daemon, is confirmed to reach its endpoints UNFILTERED. This proves
- *     re-home correctness (secrets, DNS, network reachability as the new
- *     identity) -- it proves NOTHING about allow-list correctness, because
- *     the wall is not yet armed. Any "through the gate" framing here would
- *     overclaim; this function's return value and doc comments never use
- *     that language.
+ *   - `verifyReachabilityBeforeArm` (post-daemon, PRE-arm)
  *   - `verifyReachabilityAfterArm` (POST-arm): after `enable --agent-uid`
- *     succeeds, re-check the SAME endpoints now that the wall is enforcing.
- *     Allow-list correctness is only provable at this point. On failure,
- *     the orchestrator fast-disarms (`disable`) rather than leaving a
- *     bricked-but-armed agent.
+ *     succeeds, re-probe the SAME endpoint list now that the wall is
+ *     enforcing. On failure, the orchestrator fast-disarms (`disable`)
+ *     rather than leaving a bricked-but-armed agent.
+ *
+ * FIX G5 (MEDIUM, 2026-07-07 re-gate 3 / fix-round 3): the doc block above
+ * previously claimed both phases prove the agent "running as the new uid"
+ * reaches its endpoints, including "network reachability as the new
+ * identity." That overclaimed what the REAL probe list (built in
+ * `wrap/auto-provision.ts`'s `hermesEndpointProbes`) actually proves: this
+ * whole module runs in-process inside the ROOT `sanctuary protect` process
+ * -- no setuid/seteuid/launchctl-asuser boundary crosses before either probe
+ * call runs, so nothing here executes AS the re-homed agent's uid. What the
+ * real probe list honestly proves, per phase:
+ *   - each configured Hermes endpoint hostname (LLM, Telegram, Google MCP)
+ *     is DNS-resolvable from this host/network right now (name resolution
+ *     is not uid-scoped, so this is a true statement regardless of caller);
+ *   - EVERY moved Hermes credential path (not just one) is present on disk
+ *     and its owner/mode bits mark it readable BY THE TARGET UID, checked
+ *     via `stat`, never assumed via a root `access()` call that would
+ *     bypass the very permission bits this probe exists to check.
+ * This module's `EndpointProbeTarget.probe` is an injected black box --
+ * `verify.ts` itself has no opinion on what a probe checks -- so this
+ * comment describes what the SHIPPED probe list actually proves, not a
+ * property `verify.ts` itself guarantees. Proving the re-homed agent,
+ * running AS the new uid, actually reaches these hosts end-to-end through
+ * the enforcing wall is the Erik-present drill's job, never this module's
+ * or the probe list's.
  *
  * Both functions share the same shape (probe a list of named endpoints,
  * report per-endpoint pass/fail) so the orchestrator can reuse one
@@ -80,11 +96,16 @@ async function probeAll(targets: EndpointProbeTarget[]): Promise<ConnectivityVer
 }
 
 /**
- * Pre-arm reachability check (post-daemon-install). Proves the re-homed
- * agent reaches its endpoints as the new uid, UNFILTERED. Does not, and
- * cannot, prove allow-list correctness -- the wall is not armed yet. On
- * `allReachable: false` the orchestrator must STOP before arming and
- * surface the failure + the backup/restore path (fix B2 ordering).
+ * Pre-arm probe pass (post-daemon-install). Runs whatever `targets` the
+ * caller supplies -- per the module doc's FIX G5 note, the SHIPPED Hermes
+ * probe list proves DNS-resolvability of each endpoint hostname plus
+ * each moved credential's presence-and-readable-by-target-uid (via `stat`),
+ * NOT that the re-homed agent, running as the new uid, actually reaches
+ * these hosts end-to-end -- this module has no way to elevate to that uid
+ * and cannot prove it. Does not, and cannot, prove allow-list correctness
+ * either -- the wall is not armed yet. On `allReachable: false` the
+ * orchestrator must STOP before arming and surface the failure + the
+ * backup/restore path (fix B2 ordering).
  */
 export async function verifyReachabilityBeforeArm(
   targets: EndpointProbeTarget[],
@@ -93,11 +114,15 @@ export async function verifyReachabilityBeforeArm(
 }
 
 /**
- * Post-arm reachability re-check. Proves the allow-list the wall just
- * started enforcing actually permits the agent's real traffic. On
- * `allReachable: false` the orchestrator must fast-disarm (`disable`) and
- * surface the failure, rather than leaving a bricked-but-armed agent (fix
- * B2's disarm-rollback).
+ * Post-arm re-probe of the SAME target list, now that the wall is
+ * enforcing. Re-running the same DNS-resolvability + moved-credential-
+ * readable probes after arming does not newly prove allow-list correctness
+ * either (see the module doc's FIX G5 note) -- it re-confirms the same
+ * narrow preconditions still hold post-arm. On `allReachable: false` the
+ * orchestrator must fast-disarm (`disable`) and surface the failure, rather
+ * than leaving a bricked-but-armed agent (fix B2's disarm-rollback). Proving
+ * the allow-list actually permits the re-homed agent's real traffic, as the
+ * new uid, is the Erik-present drill's job.
  */
 export async function verifyReachabilityAfterArm(
   targets: EndpointProbeTarget[],

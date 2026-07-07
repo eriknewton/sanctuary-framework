@@ -1,25 +1,32 @@
 /**
- * Re-gate 1 (fix commit 636f6051) CHOKEPOINT (2026-07-07 fix-round 2): the
- * `wrap/auto-provision.ts` real-ops layer had ZERO unit coverage -- the
- * dep-injection mock boundary in `test/wrap/auto-provision-wiring.test.ts`
- * sits ABOVE `runAutoProvisionForWrap` entirely, and
+ * Re-gate 1 (fix commit 636f6051) CHOKEPOINT (2026-07-07 fix-round 2), then
+ * extended for re-gate 3 (fix-round 3): the `wrap/auto-provision.ts` real-ops
+ * layer had ZERO unit coverage -- the dep-injection mock boundary in
+ * `test/wrap/auto-provision-wiring.test.ts` sits ABOVE
+ * `runAutoProvisionForWrap` entirely, and
  * `test/castle-wall/provision/orchestrate.test.ts` mocks every `ProvisionFlowOps`
- * method. Both fix-round 1's F1 fail-opens (root-probe overclaim,
- * ENOENT-passes) and fix-round 2's R1-R6 findings lived EXACTLY in the gap
- * between those two suites: the real, security-load-bearing DECISION logic
- * behind the probes, the sudo identity resolution, and the restore-conflict
- * handling.
+ * method. Fix-round 1's F1 fail-opens, fix-round 2's R1-R6 findings, and
+ * fix-round 3's G1-G5 findings all lived EXACTLY in the gap between those two
+ * suites: the real, security-load-bearing DECISION logic behind the probes,
+ * the sudo identity resolution, and the restore-conflict handling.
  *
  * This suite closes that gap by exercising the exported pure/decidable
  * helpers directly:
  *   - `credentialReadableAsUidDecision` (R1): ENOENT -> false, unreadable-by-
  *     uid -> false, root-vs-uid honesty (owner match + read bit only).
  *   - `resolveSudoIdentityDecision` (R2): SUDO_UID present/absent, malformed,
- *     invalid SUDO_USER shape.
- *   - `RehomeExecutionError`/`executeRehomePlan` (R3): a mid-loop throw
- *     carries the already-completed results, not an empty array.
- *   - `realRehomeOps().restore` (R6): a recreated source file is never
- *     overwritten; the moved data lands at a conflict path instead.
+ *     invalid SUDO_USER shape, and (G4) uid/gid 0 / SUDO_USER=root.
+ *   - `RehomeExecutionError`/`executeRehomePlan` (R3, extended G3): a
+ *     mid-loop throw carries the already-completed results, INCLUDING a
+ *     moved-but-not-yet-chowned straddling entry, never an empty array.
+ *   - `realRehomeOps().restore` (R6, extended G2): a recreated source file
+ *     is never overwritten, AND the conflict-sibling target itself is never
+ *     overwritten either -- restore always resolves a fresh, unoccupied
+ *     conflict path.
+ *   - `disarmExitCodeDecision` (G1): a non-throwing-but-nonzero disarm code
+ *     decides to throw, mirroring `arm`'s existing code check.
+ *   - `hermesEndpointProbes`/`allHermesCredentialDestPaths` (G5): every
+ *     moved Hermes credential path is probed, not just `.hermes/.env`.
  *
  * Real `sysadminctl`/`dscl`/`launchctl`/network calls stay drill-only (never
  * exercised here); this suite is scoped to the DECISION logic around them,
@@ -27,7 +34,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile, access } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,6 +42,9 @@ import {
   credentialReadableAsUidDecision,
   resolveSudoIdentityDecision,
   realRehomeOps,
+  disarmExitCodeDecision,
+  hermesEndpointProbes,
+  allHermesCredentialDestPaths,
 } from "../../src/wrap/auto-provision.js";
 import {
   planRehome,
@@ -43,6 +53,7 @@ import {
   type AgentRehomeAdapter,
   type RehomeOps,
 } from "../../src/castle-wall/provision/rehome.js";
+import { verifyReachabilityBeforeArm } from "../../src/castle-wall/provision/verify.js";
 
 describe("wrap/auto-provision real-ops chokepoint: credentialReadableAsUidDecision (fix R1)", () => {
   it("ENOENT (statResult undefined) -> false: an absent moved credential is never a pass", () => {
@@ -130,6 +141,29 @@ describe("wrap/auto-provision real-ops chokepoint: resolveSudoIdentityDecision (
     const result = resolveSudoIdentityDecision({ SUDO_UID: "501", SUDO_GID: "20" });
     expect(result).toEqual({ uid: 501, gid: 20, user: undefined });
   });
+
+  it("FIX G4: SUDO_UID=0 (root sudo context, e.g. `sudo su -` then run) fails closed -- never resolves /var/root as the operator", () => {
+    const result = resolveSudoIdentityDecision({ SUDO_UID: "0", SUDO_GID: "20", SUDO_USER: "someone" });
+    expect(result).toBeUndefined();
+  });
+
+  it("FIX G4: SUDO_GID=0 fails closed even when SUDO_UID is non-root", () => {
+    const result = resolveSudoIdentityDecision({ SUDO_UID: "501", SUDO_GID: "0", SUDO_USER: "someone" });
+    expect(result).toBeUndefined();
+  });
+
+  it("FIX G4: SUDO_USER=root fails closed even when SUDO_UID/GID are both non-zero", () => {
+    // A crafted or unusual env where SUDO_USER says root but the numeric
+    // ids are not 0 must still be refused -- the name is a second signal,
+    // not something the uid/gid check alone can catch.
+    const result = resolveSudoIdentityDecision({ SUDO_UID: "501", SUDO_GID: "20", SUDO_USER: "root" });
+    expect(result).toBeUndefined();
+  });
+
+  it("FIX G4: uid=0 AND gid=0 AND SUDO_USER=root (the real `sudo su -` shape) fails closed", () => {
+    const result = resolveSudoIdentityDecision({ SUDO_UID: "0", SUDO_GID: "0", SUDO_USER: "root" });
+    expect(result).toBeUndefined();
+  });
 });
 
 describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError partial-strand (fix R3)", () => {
@@ -209,6 +243,56 @@ describe("castle-wall/provision/rehome real-ops chokepoint: RehomeExecutionError
 
     expect(caught).toBeInstanceOf(RehomeExecutionError);
     expect((caught as RehomeExecutionError).partialResults).toEqual([]);
+  });
+
+  it("FIX G3: a chown failure on step 3 still includes the moved-but-not-chowned (straddling) entry in partialResults", async () => {
+    const plan = planRehome(testAdapter, { operatorHome: "/Users/operator", newAccountHome: "/var/sanctuary-agents/x" });
+    let chownCount = 0;
+    const ops: RehomeOps = {
+      pathExists: async () => true,
+      backup: async (path) => ({ backupPath: `/root/backup${path}.bak` }),
+      move: async () => {},
+      chown: async () => {
+        chownCount += 1;
+        if (chownCount === 3) {
+          // The step-3 path was already renamed to the agent home (`move`
+          // succeeded) by the time this throws -- exactly the straddling
+          // shape G3 exists to catch: moved, not chowned, not yet recorded
+          // by the pre-fix code.
+          throw new Error("chown failed: operation not permitted");
+        }
+      },
+      restore: async () => ({ restored: true }),
+      restoreCustody: async () => {},
+    };
+
+    let caught: unknown;
+    try {
+      await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(RehomeExecutionError);
+    const rehomeErr = caught as RehomeExecutionError;
+    // FIX G3: the exact defect -- before the fix, `results.push(...)` ran
+    // AFTER `chown`, so a chown throw on the third path meant that path's
+    // `moved` result was NEVER pushed, even though `move()` had already
+    // succeeded and the secret was genuinely sitting under the new
+    // account's home. `partialResults` must now include all 3 entries
+    // (the two that fully completed, PLUS the straddling third one), all
+    // reported "moved" (never silently dropped), so `safeRestore` has a
+    // `destPath` to recover from for every path that actually moved.
+    expect(rehomeErr.partialResults).toHaveLength(3);
+    expect(rehomeErr.partialResults.map((r) => r.entry.sourcePath)).toEqual([
+      "/Users/operator/a",
+      "/Users/operator/b",
+      "/Users/operator/c",
+    ]);
+    expect(rehomeErr.partialResults.every((r) => r.status === "moved")).toBe(true);
+    // The straddling entry's destPath must be present so safeRestore can
+    // reverse-move it back, exactly like the first two.
+    expect(rehomeErr.partialResults[2]!.destPath).toBe("/var/sanctuary-agents/x/c");
   });
 });
 
@@ -332,6 +416,264 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
       // The moved directory's data must have landed at the conflict path.
       const conflictContent = await readFile(join(result.conflictPath!, "token.json"), "utf8");
       expect(conflictContent).toBe("moved-token");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX G2: a PRE-EXISTING conflict sibling (.restored-conflict) is never overwritten -- restore picks a fresh suffixed path instead", async () => {
+    tmpRoot = await makeTmp();
+    try {
+      const destPath = join(tmpRoot, "dest", "secret.env");
+      const sourcePath = join(tmpRoot, "source", "secret.env");
+      const preexistingConflictPath = `${sourcePath}.restored-conflict`;
+      await mkdir(join(tmpRoot, "dest"), { recursive: true });
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      await writeFile(destPath, "moved-content-round-2");
+      await writeFile(sourcePath, "operators-recreated-data-round-2");
+      // Simulate a PRIOR aborted run (or an operator-planted file) already
+      // occupying the conflict-sibling target this restore would otherwise
+      // write to -- the exact G2 defect: the R6 fix guarded sourcePath but
+      // left THIS path unguarded.
+      await writeFile(preexistingConflictPath, "PRIOR-CONFLICT-DATA-MUST-SURVIVE");
+
+      const ops = realRehomeOps();
+      const result = await ops.restore(destPath, sourcePath);
+
+      expect(result.restored).toBe(false);
+      // Must NOT reuse the already-occupied `.restored-conflict` path.
+      expect(result.conflictPath).toBe(`${preexistingConflictPath}.1`);
+
+      // The prior conflict file must be completely untouched.
+      const priorContent = await readFile(preexistingConflictPath, "utf8");
+      expect(priorContent).toBe("PRIOR-CONFLICT-DATA-MUST-SURVIVE");
+
+      // The operator's recreated source file must also be untouched.
+      const sourceContent = await readFile(sourcePath, "utf8");
+      expect(sourceContent).toBe("operators-recreated-data-round-2");
+
+      // The newly-moved data must have landed at the fresh suffixed path.
+      const newConflictContent = await readFile(result.conflictPath!, "utf8");
+      expect(newConflictContent).toBe("moved-content-round-2");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX G2: TWO pre-existing conflict siblings (.restored-conflict and .restored-conflict.1) -> restore advances to .restored-conflict.2", async () => {
+    tmpRoot = await makeTmp();
+    try {
+      const destPath = join(tmpRoot, "dest", "secret.env");
+      const sourcePath = join(tmpRoot, "source", "secret.env");
+      await mkdir(join(tmpRoot, "dest"), { recursive: true });
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      await writeFile(destPath, "moved-content-round-3");
+      await writeFile(sourcePath, "operators-recreated-data-round-3");
+      await writeFile(`${sourcePath}.restored-conflict`, "prior-conflict-0");
+      await writeFile(`${sourcePath}.restored-conflict.1`, "prior-conflict-1");
+
+      const ops = realRehomeOps();
+      const result = await ops.restore(destPath, sourcePath);
+
+      expect(result.restored).toBe(false);
+      expect(result.conflictPath).toBe(`${sourcePath}.restored-conflict.2`);
+
+      // Both prior conflict files must survive untouched.
+      expect(await readFile(`${sourcePath}.restored-conflict`, "utf8")).toBe("prior-conflict-0");
+      expect(await readFile(`${sourcePath}.restored-conflict.1`, "utf8")).toBe("prior-conflict-1");
+      expect(await readFile(result.conflictPath!, "utf8")).toBe("moved-content-round-3");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX G2: the backup-copy fallback conflict branch also refuses to overwrite a pre-existing conflict sibling", async () => {
+    tmpRoot = await makeTmp();
+    try {
+      const sourcePath = join(tmpRoot, "source", "secret.env");
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      await writeFile(sourcePath, "operators-recreated-data-v3");
+      const preexistingConflictPath = `${sourcePath}.restored-conflict`;
+      await writeFile(preexistingConflictPath, "PRIOR-BACKUP-FALLBACK-CONFLICT-DATA");
+
+      // destPath does not exist (prior partial rollback already moved it
+      // away) AND there is no reachable /var/root backup in this test
+      // environment (same non-root-testable boundary the existing R6
+      // backup-fallback test documents) -- restore honestly reports
+      // failure with no conflictPath here (this test's purpose is only to
+      // prove the pre-existing conflict sibling survives untouched, which
+      // it trivially does when this branch never even reaches the write).
+      // The write-reaching case is exercised by the two tests above via the
+      // primary (non-fallback) branch, which shares `findUniqueConflictPath`
+      // with the fallback branch -- both call sites resolve a path the same
+      // way, so this test documents the boundary rather than skip coverage
+      // silently, matching the existing R6 backup-fallback test's own note.
+      const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
+      const ops = realRehomeOps();
+      const result = await ops.restore(destPath, sourcePath);
+
+      expect(result.restored).toBe(false);
+      const priorContent = await readFile(preexistingConflictPath, "utf8");
+      expect(priorContent).toBe("PRIOR-BACKUP-FALLBACK-CONFLICT-DATA");
+      const sourceContent = await readFile(sourcePath, "utf8");
+      expect(sourceContent).toBe("operators-recreated-data-v3");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: disarmExitCodeDecision (fix G1)", () => {
+  it("code 0 -> undefined (success, no throw)", () => {
+    expect(disarmExitCodeDecision(0)).toBeUndefined();
+  });
+
+  it("nonzero code -> an Error describing the exit code (mirrors arm's own code === 0 check)", () => {
+    const err = disarmExitCodeDecision(1);
+    expect(err).toBeInstanceOf(Error);
+    expect(err?.message).toBe("castle-wall disable exited 1");
+  });
+
+  it("a different nonzero code is reflected verbatim in the error message", () => {
+    const err = disarmExitCodeDecision(127);
+    expect(err?.message).toBe("castle-wall disable exited 127");
+  });
+
+  it("negative code (e.g. a signal-terminated process) still decides to throw, never treated as success", () => {
+    const err = disarmExitCodeDecision(-1);
+    expect(err).toBeInstanceOf(Error);
+    expect(err?.message).toBe("castle-wall disable exited -1");
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: all-credentials readability probe (fix G5)", () => {
+  it("allHermesCredentialDestPaths lists every secret path the Hermes adapter re-homes, not just .env", () => {
+    const paths = allHermesCredentialDestPaths();
+    expect(paths).toContain(".hermes/.env");
+    expect(paths).toContain(".hermes/auth.json");
+    expect(paths).toContain(".hermes/config.yaml");
+    expect(paths).toContain(".google_workspace_mcp/credentials");
+    expect(paths).toContain(".workspace-mcp/cli-tokens");
+    expect(paths).toContain(".hermes/google-mcp-creds");
+    expect(paths).toHaveLength(6);
+  });
+
+  it("hermesEndpointProbes builds one probe per DNS host PLUS one per credential path (not just .env)", () => {
+    const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502);
+    const credentialProbeNames = targets.filter((t) => t.name.includes("moved credential"));
+    // 6 credential paths -- .env, auth.json, config.yaml, google_workspace_mcp
+    // credentials, workspace-mcp cli-tokens, hermes google-mcp-creds.
+    expect(credentialProbeNames).toHaveLength(6);
+    expect(credentialProbeNames.some((t) => t.name.includes(".env"))).toBe(true);
+    expect(credentialProbeNames.some((t) => t.name.includes("auth.json"))).toBe(true);
+    expect(credentialProbeNames.some((t) => t.name.includes("config.yaml"))).toBe(true);
+    expect(credentialProbeNames.some((t) => t.name.includes("google_workspace_mcp/credentials"))).toBe(true);
+    expect(credentialProbeNames.some((t) => t.name.includes("workspace-mcp/cli-tokens"))).toBe(true);
+    expect(credentialProbeNames.some((t) => t.name.includes("google-mcp-creds"))).toBe(true);
+  });
+
+  it("FIX G5: an unreadable NON-.env moved credential (auth.json, chmod 000) fails the aggregate pre-arm verify, even though .env is fine", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-allcreds-"));
+    try {
+      const accountHome = join(tmpRoot, "agent-home");
+      const hermesDir = join(accountHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      await writeFile(join(hermesDir, ".env"), "LLM_KEY=abc");
+      await writeFile(join(hermesDir, "auth.json"), '{"token":"secret"}');
+      // .env is properly owned/readable-shaped for this test's purposes
+      // (this test does not chown -- it runs as the test process's own
+      // uid/gid, so use that as the "target" to isolate the mode-bit
+      // effect). auth.json is deliberately made unreadable (mode 000):
+      // owner-read bit unset means `credentialReadableAsUidDecision` (even
+      // for the OWNER-match branch) reports false.
+      await chmod(join(hermesDir, ".env"), 0o600);
+      await chmod(join(hermesDir, "auth.json"), 0o000);
+
+      const targetUid = process.getuid?.() ?? 0;
+      const targetGid = process.getgid?.() ?? 0;
+      const targets = hermesEndpointProbes(accountHome, targetUid, targetGid).filter((t) =>
+        t.name.includes("moved credential"),
+      );
+
+      const result = await verifyReachabilityBeforeArm(targets);
+
+      // The aggregate must be false: auth.json's probe must fail even
+      // though .env's probe (the ONLY thing the pre-fix code checked)
+      // passes. This is the exact G5 defect -- verify going green over a
+      // broken re-home of anything other than .env.
+      expect(result.allReachable).toBe(false);
+      const envResult = result.results.find((r) => r.name.includes(".env"));
+      const authResult = result.results.find((r) => r.name.includes("auth.json"));
+      expect(envResult?.reachable).toBe(true);
+      expect(authResult?.reachable).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX G5: a MISSING non-.env moved credential (config.yaml never wrote) fails the aggregate pre-arm verify", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-allcreds-missing-"));
+    try {
+      const accountHome = join(tmpRoot, "agent-home");
+      const hermesDir = join(accountHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      await writeFile(join(hermesDir, ".env"), "LLM_KEY=abc");
+      await chmod(join(hermesDir, ".env"), 0o600);
+      // config.yaml is never written at all -- simulates a re-home step
+      // that silently failed to move this particular file.
+
+      const targetUid = process.getuid?.() ?? 0;
+      const targetGid = process.getgid?.() ?? 0;
+      const targets = hermesEndpointProbes(accountHome, targetUid, targetGid).filter((t) =>
+        t.name.includes("moved credential"),
+      );
+
+      const result = await verifyReachabilityBeforeArm(targets);
+
+      expect(result.allReachable).toBe(false);
+      const configResult = result.results.find((r) => r.name.includes("config.yaml"));
+      expect(configResult?.reachable).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("all credentials present and readable -> aggregate pre-arm verify (credential portion) passes", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-allcreds-happy-"));
+    try {
+      const accountHome = join(tmpRoot, "agent-home");
+      const hermesDir = join(accountHome, ".hermes");
+      const googleDir = join(accountHome, ".google_workspace_mcp");
+      const workspaceMcpDir = join(accountHome, ".workspace-mcp");
+      await mkdir(hermesDir, { recursive: true });
+      await mkdir(join(hermesDir, "google-mcp-creds"), { recursive: true });
+      await mkdir(googleDir, { recursive: true });
+      await mkdir(workspaceMcpDir, { recursive: true });
+
+      await writeFile(join(hermesDir, ".env"), "LLM_KEY=abc");
+      await writeFile(join(hermesDir, "auth.json"), '{"token":"secret"}');
+      await writeFile(join(hermesDir, "config.yaml"), "persona: hermes");
+      await writeFile(join(googleDir, "credentials"), "refresh-token");
+      await mkdir(join(workspaceMcpDir, "cli-tokens"), { recursive: true });
+      await writeFile(join(hermesDir, "google-mcp-creds", "token.json"), "{}");
+
+      await chmod(join(hermesDir, ".env"), 0o600);
+      await chmod(join(hermesDir, "auth.json"), 0o600);
+      await chmod(join(hermesDir, "config.yaml"), 0o600);
+      await chmod(join(googleDir, "credentials"), 0o600);
+      await chmod(join(workspaceMcpDir, "cli-tokens"), 0o700);
+      await chmod(join(hermesDir, "google-mcp-creds"), 0o700);
+
+      const targetUid = process.getuid?.() ?? 0;
+      const targetGid = process.getgid?.() ?? 0;
+      const targets = hermesEndpointProbes(accountHome, targetUid, targetGid).filter((t) =>
+        t.name.includes("moved credential"),
+      );
+
+      const result = await verifyReachabilityBeforeArm(targets);
+      expect(result.allReachable).toBe(true);
+      expect(result.results.every((r) => r.reachable)).toBe(true);
+      expect(result.results).toHaveLength(6);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
