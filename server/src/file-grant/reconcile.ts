@@ -1,0 +1,100 @@
+/**
+ * Governed File-Grant v1 -- grant-tree reconcile (build spec sections 6-7).
+ *
+ * This is the step that makes the pure `planGrantTree` planner LOAD-BEARING at
+ * runtime and gives the TTL real teeth: without it, an expired grant's tree
+ * entry lingers on disk (on a uid-split box, agent read access would outlive
+ * the stated TTL) and `list` would only PROJECT "expired" for display while
+ * the persisted record still said "active".
+ *
+ * `reconcileFileGrantTree`:
+ *   1. loads the live grant set,
+ *   2. computes the desired tree contents with `planGrantTree` (the same pure
+ *      planner unit-tested with fixtures),
+ *   3. flips every persisted `active` grant whose TTL has passed to `expired`
+ *      via the pure `reviseGrantForExpiry` transition, and
+ *   4. scrubs every tree entry the plan says must not be present (revoked +
+ *      expired grants), idempotently (a revoke already scrubbed its own entry;
+ *      re-scrubbing an absent entry is a no-op).
+ *
+ * It is wired into the mutating CLI touches (mint / revoke), so ordinary use
+ * keeps the tree converged; it is also exported standalone for a future
+ * `file-grant sweep` / cron. It never PLACES entries (v1 only places at mint),
+ * so it can only ever REDUCE access -- safe to run on any touch.
+ */
+
+import type { AuditLog } from "../operational/audit-log.js";
+import { isGrantExpired, reviseGrantForExpiry } from "./lifecycle.js";
+import { planGrantTree } from "./planner.js";
+import type { FileGrant, FsOps } from "./types.js";
+
+export interface ReconcileFileGrantStore {
+  list(): Promise<FileGrant[]>;
+  put(grant: FileGrant): Promise<void>;
+}
+
+export interface ReconcileFileGrantDeps {
+  store: ReconcileFileGrantStore;
+  fsOps: Pick<FsOps, "removeEntry">;
+  /** Injected clock reading. Never `new Date()` inside this module. */
+  now: Date;
+  auditLog?: AuditLog;
+  /** Identity recorded on the expiry audit entries. Defaults to "system". */
+  reconciledBy?: string;
+}
+
+export interface ReconcileFileGrantResult {
+  /** grant ids whose persisted status was flipped active -> expired. */
+  expired: string[];
+  /** relative tree entries that were scrubbed (revoked or expired grants). */
+  scrubbed: string[];
+}
+
+export async function reconcileFileGrantTree(
+  deps: ReconcileFileGrantDeps
+): Promise<ReconcileFileGrantResult> {
+  const grants = await deps.store.list();
+  const plan = planGrantTree(grants, deps.now);
+
+  const expired: string[] = [];
+  // Flip persisted status for grants that have aged past their TTL but whose
+  // record still says "active". `reviseGrantForExpiry` is a no-op for revoked
+  // or not-yet-expired grants, so this only touches the ones that changed.
+  for (const grant of grants) {
+    if (grant.status === "active" && isGrantExpired(grant, deps.now)) {
+      await deps.store.put(reviseGrantForExpiry(grant, deps.now));
+      expired.push(grant.grant_id);
+      await appendExpiryAudit(deps, grant);
+    }
+  }
+
+  const scrubbed: string[] = [];
+  for (const entry of plan.toScrub) {
+    await deps.fsOps.removeEntry(entry.relative_tree_entry);
+    scrubbed.push(entry.relative_tree_entry);
+  }
+
+  return { expired, scrubbed };
+}
+
+async function appendExpiryAudit(
+  deps: ReconcileFileGrantDeps,
+  grant: FileGrant
+): Promise<void> {
+  try {
+    await deps.auditLog?.appendCritical({
+      layer: "l1",
+      operation: "file_grant_revoke",
+      identity_id: deps.reconciledBy ?? "system",
+      result: "success",
+      details: {
+        grant_id: grant.grant_id,
+        subject_agent_id: grant.subject_agent_id,
+        reason: "expired_ttl_scrub",
+      },
+    });
+  } catch {
+    // Best-effort: an audit failure must not abort a reconcile that is
+    // reducing (never expanding) access.
+  }
+}

@@ -8,7 +8,39 @@
  * place, so deterministic tests just pass different `now` values.
  */
 
-import type { FileGrant, FileGrantStatus } from "./types.js";
+import type { FileGrant, FileGrantEnforcement, FileGrantStatus } from "./types.js";
+
+/**
+ * Pure honesty verdict for a grant's enforcement, given the resolved uids and
+ * whether an agent-uid readability probe has actually confirmed access. This
+ * is the single place the `met`/`unverified`/`unmet` decision is made, so the
+ * "never overclaim from a uid-split alone" rule (Invariant #5, build spec
+ * section 10) is enforced in ONE testable function rather than scattered
+ * comparisons.
+ *
+ * - `agentUid === null`                    -> `unmet` (no dedicated agent
+ *   account on this host, nothing to enforce with).
+ * - `sourceOwnerUid === null`              -> `unmet` (cannot establish a
+ *   boundary without knowing who owns the source).
+ * - `agentUid === sourceOwnerUid`          -> `unmet` (the agent uid already
+ *   owns / can read the source; the grant confers nothing new, so there is no
+ *   boundary to enforce). This is the case a `sudo` mint would otherwise
+ *   falsely report as enforced if the comparison used `process.getuid()`.
+ * - a real, distinct boundary but NOT `readVerified` -> `unverified`
+ *   (configured; on-hardware read-scope not yet verified -- the deferred
+ *   drill). v1's autonomous path always lands here for a uid split.
+ * - a real, distinct boundary AND `readVerified` -> `met`.
+ */
+export function determineEnforcement(params: {
+  agentUid: number | null;
+  sourceOwnerUid: number | null;
+  readVerified: boolean;
+}): FileGrantEnforcement {
+  const { agentUid, sourceOwnerUid, readVerified } = params;
+  if (agentUid === null || sourceOwnerUid === null) return "unmet";
+  if (agentUid === sourceOwnerUid) return "unmet";
+  return readVerified ? "met" : "unverified";
+}
 
 const DURATION_RE = /^(\d+)([smhd])$/;
 

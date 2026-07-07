@@ -30,14 +30,20 @@ export function makeFileGrantTestStore() {
 }
 
 export interface FakeFsOpsOptions {
-  /** If set, `place()` throws this on every call (fail-closed test). */
+  /** If set, `place()` throws this BEFORE recording (nothing is placed). */
   placeThrows?: Error;
+  /**
+   * If set, `place()` RECORDS the placement (a partial tree entry now exists on
+   * a real box) and THEN throws. Used to prove mint scrubs a partial entry on
+   * a failed placement (no tree entry survives a failed mint).
+   */
+  placeRecordsThenThrows?: Error;
   /** If set, `removeEntry()` throws this on every call. */
   removeThrows?: Error;
   /** The dedicated agent uid `agentUid()` reports, or null for "no uid-split origin configured". */
   agentUid?: number | null;
-  /** The uid `operatorUid()` reports. */
-  operatorUid?: number | null;
+  /** The uid `sourceOwnerUid()` reports (the owner of the source file). */
+  sourceOwnerUid?: number | null;
 }
 
 /** In-memory fake `FsOps`: records every call, never touches the real filesystem. */
@@ -53,6 +59,10 @@ export class FakeFsOps implements FsOps {
 
   async place(canonicalSrc: string, relativeTreeEntry: string): Promise<void> {
     if (this.opts.placeThrows) throw this.opts.placeThrows;
+    if (this.opts.placeRecordsThenThrows) {
+      this.placed.push({ src: canonicalSrc, dest: relativeTreeEntry });
+      throw this.opts.placeRecordsThenThrows;
+    }
     this.placed.push({ src: canonicalSrc, dest: relativeTreeEntry });
   }
 
@@ -65,7 +75,7 @@ export class FakeFsOps implements FsOps {
     return this.opts.agentUid ?? null;
   }
 
-  async operatorUid(): Promise<number | null> {
-    return this.opts.operatorUid ?? 501;
+  async sourceOwnerUid(_canonicalPath: string): Promise<number | null> {
+    return this.opts.sourceOwnerUid ?? 501;
   }
 }

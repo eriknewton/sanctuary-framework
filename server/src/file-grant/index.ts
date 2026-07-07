@@ -12,6 +12,8 @@ export {
   FILE_GRANT_DEFAULTS,
   FileGrantModeRejectedError,
   FileGrantMintFailedError,
+  FileGrantAgentIdRejectedError,
+  isSafeFileGrantAgentId,
 } from "./types.js";
 export type {
   FileGrant,
@@ -34,7 +36,15 @@ export {
   projectGrantStatus,
   reviseGrantForRevoke,
   reviseGrantForExpiry,
+  determineEnforcement,
 } from "./lifecycle.js";
+
+export { reconcileFileGrantTree } from "./reconcile.js";
+export type {
+  ReconcileFileGrantDeps,
+  ReconcileFileGrantResult,
+  ReconcileFileGrantStore,
+} from "./reconcile.js";
 
 export { FileGrantStore } from "./store.js";
 export type { FileGrantWriteIdentity } from "./store.js";
@@ -54,7 +64,7 @@ export type {
   FileGrantRevokeStore,
 } from "./revoke.js";
 
-export { listFileGrants } from "./list.js";
+export { listFileGrants, recordFileGrantListAudit } from "./list.js";
 export type { FileGrantListStore, ProjectedFileGrant } from "./list.js";
 
 export { PosixFileGrantFsOps } from "./fs-ops.js";

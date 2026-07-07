@@ -36,13 +36,20 @@ export interface FileGrantScope {
 
 /**
  * The persisted grant record (build spec section 3.1). Written to the
- * StateStore's `_file_grants` namespace as an encrypted, signed, monotonic-
- * versioned entry, so `state_read`/`state_list`/`state_export`/`state_delete`
- * reach it at the store-method level (AGENTS.md Invariant #2). Agent-facing
- * MCP tools reject reads of any `_`-prefixed namespace (the reserved-
- * namespace firewall in cognitive/tools.ts already covers `_file_grants` via
- * its catch-all), so the record is never a policy-inference oracle for the
- * agent it describes.
+ * StateStore's `_file_grants` namespace through the SAME encrypted, signed,
+ * monotonic-versioned machinery every other piece of Sanctuary state uses.
+ *
+ * Operator-facing inspect / delete story (AGENTS.md Invariant #2): the
+ * operator inspects grants with `sanctuary file-grant list`, ends access with
+ * `sanctuary file-grant revoke` (marks the record revoked, scrubs the tree
+ * entry, audits), and can read/delete the underlying record directly through
+ * the StateStore methods (`store.read`/`store.list`/`store.delete` on the
+ * `_file_grants` namespace). The record is NOT reachable through the
+ * agent-facing `state_read`/`state_list`/`state_export`/`state_delete` MCP
+ * tools: those correctly REJECT any `_`-prefixed namespace via the
+ * reserved-namespace firewall in cognitive/tools.ts (same posture as `_audit`
+ * and `_identities`), so a grant, which describes exactly what an agent may
+ * read, is never a policy-inference oracle for the agent it describes.
  */
 export interface FileGrant {
   grant_id: string;
@@ -99,12 +106,41 @@ export interface FsOps {
   removeEntry(relativeTreeEntry: string): Promise<void>;
   /** The dedicated agent uid for `subjectAgentId`, or null if no uid-split origin is configured. */
   agentUid(subjectAgentId: string): Promise<number | null>;
-  /** The operator's own uid, or null on a platform without POSIX uids. */
-  operatorUid(): Promise<number | null>;
+  /**
+   * The uid that OWNS the canonical source file/dir (from `stat`), or null on
+   * a platform without POSIX uids. The same-uid honesty check is derived from
+   * the source owner, NEVER from `process.getuid()`: running the mint under
+   * `sudo` must not let a same-uid box (agent uid == the file's owner) print a
+   * false "enforced" -- the boundary that matters is "can the agent uid read
+   * the operator's file", which is a property of the FILE's ownership, not of
+   * the minting process's effective uid.
+   */
+  sourceOwnerUid(canonicalPath: string): Promise<number | null>;
 }
 
-/** Whether POSIX ownership on the grant tree actually confines the agent uid. */
-export type FileGrantEnforcement = "met" | "unmet";
+/**
+ * Whether the box-local read-scope boundary is actually enforced for a grant.
+ *
+ * - `met`       the agent uid is distinct from the source-file owner AND an
+ *               agent-uid readability probe has CONFIRMED the placed entry is
+ *               readable by that uid (the real primitive applied and was
+ *               verified). Only produced on a real dedicated-uid host with the
+ *               privilege to apply + verify the primitive; v1's autonomous /
+ *               CI path never fabricates it.
+ * - `unverified` a real boundary exists (dedicated agent uid, distinct from
+ *               the source owner) but on-hardware read-scope has NOT been
+ *               verified. v1 records the grant and places the tree entry; the
+ *               functional cross-uid read primitive (POSIX ACL / ownership)
+ *               and its readability verification are the separate Erik-present
+ *               acceptance drill (build spec section 8). This is the honest
+ *               "configured, on-hardware read-scope not yet verified" label --
+ *               v1 must NEVER upgrade it to "met" from a uid-split alone.
+ * - `unmet`     no dedicated agent uid is configured, or the agent uid equals
+ *               the source-file owner (the agent already owns / can read the
+ *               source, so there is no boundary to enforce). Nothing is
+ *               enforced and v1 says so.
+ */
+export type FileGrantEnforcement = "met" | "unverified" | "unmet";
 
 /** Pure planner output (section 6): what the grant tree SHOULD contain right now. */
 export interface TreePlanEntry {
@@ -115,6 +151,39 @@ export interface TreePlanEntry {
 export interface TreePlan {
   toPlace: TreePlanEntry[];
   toScrub: TreePlanEntry[];
+}
+
+/**
+ * A `subject_agent_id` is used as a single path segment under the grant-tree
+ * root (`tree_entry = "<agentId>/<grantId>"`), so it MUST be a safe slug: a
+ * hostile `--agent ../../../../tmp/x` must not escape the root. Accept only a
+ * conservative slug (letters, digits, `_`, `-`, `.`), and additionally reject
+ * any value that could traverse or hide: a `..` sequence, a leading `.`
+ * (dotfile / `.`/`..`), a path separator, or the empty string. Directory
+ * containment is ALSO re-checked at the filesystem layer (`place` /
+ * `removeEntry` resolve-and-verify under the root); this is defence in depth,
+ * not the only guard.
+ */
+export function isSafeFileGrantAgentId(agentId: string): boolean {
+  if (typeof agentId !== "string" || agentId.length === 0) return false;
+  if (agentId.length > 128) return false;
+  if (agentId.startsWith(".")) return false;
+  if (agentId.includes("..")) return false;
+  if (agentId.includes("/") || agentId.includes("\\")) return false;
+  return /^[A-Za-z0-9._-]+$/.test(agentId);
+}
+
+/** Thrown when a mint is attempted with an unsafe (path-traversing) subject agent id. */
+export class FileGrantAgentIdRejectedError extends Error {
+  constructor(agentId: string) {
+    super(
+      `Governed File-Grant: subject agent id "${agentId}" is not a safe slug. ` +
+        `An agent id must be non-empty letters/digits/[._-] with no path ` +
+        `separators, no "..", and no leading dot (it is used as a grant-tree ` +
+        `path segment and must not escape the tree root).`
+    );
+    this.name = "FileGrantAgentIdRejectedError";
+  }
 }
 
 /** Thrown when a mint is attempted with any mode other than "read" (v1 hard reject). */

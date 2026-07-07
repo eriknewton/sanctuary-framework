@@ -1,33 +1,47 @@
 /**
  * Governed File-Grant v1 -- mint orchestration (build spec sections 3-5).
  *
- * `mintFileGrant` is the ONE function that turns a mint request into a
- * persisted `FileGrant` plus (best-effort, POSIX-enforced) tree placement.
- * Every side effect is reached through an injected dependency so the
- * fail-closed / rollback / same-uid-honesty behavior (Invariant #5) is
- * unit-testable with zero real host state:
+ * `mintFileGrant` turns a mint request into a persisted `FileGrant` plus a
+ * box-local tree placement. Every side effect is reached through an injected
+ * dependency so the fail-closed / rollback / same-uid-honesty behavior
+ * (Invariant #5) is unit-testable with zero real host state. The ordering is
+ * chosen so the access-conferring step (`place`) is the LAST fallible step,
+ * and NOTHING after it can turn a live grant into a reported failure:
  *
  *   1. Validate `mode === "read"` (v1 hard reject otherwise).
- *   2. Canonicalize the source path via `fsOps.realpath`.
- *   3. Persist the grant object FIRST (`store.put`).
- *   4. Place the tree entry SECOND (`fsOps.place`).
- *   5. If placement throws, ROLL BACK the persisted object (`store.remove`)
- *      before rethrowing, so a "phantom" grant (object exists, no tree
- *      entry, or vice versa) never survives a failed mint.
- *   6. Report `enforcement: "unmet"` (never claim "governed") when the
- *      agent uid is unknown or equals the operator's own uid -- a same-uid
- *      box has no POSIX isolation to enforce with.
+ *   2. Validate `subjectAgentId` is a safe slug (no path traversal) BEFORE any
+ *      persistence or placement.
+ *   3. Canonicalize the source path via `fsOps.realpath`.
+ *   4. Read the uids and compute the honest `enforcement` verdict BEFORE
+ *      placement (derived from the SOURCE-file owner, never `process.getuid()`).
+ *   5. Persist the grant object (`store.put`). A throw here fails closed: no
+ *      access has been conferred; a best-effort failure audit is written and a
+ *      typed `FileGrantMintFailedError` is thrown.
+ *   6. Place the tree entry (`fsOps.place`) -- the LAST fallible, access-
+ *      conferring step. If it throws: scrub any partial entry, roll back the
+ *      persisted record under a GUARDED remove (on remove failure persist a
+ *      terminal `revoked` tombstone so no dangling `active` survives), write a
+ *      best-effort failure audit, and throw `FileGrantMintFailedError`. So a
+ *      failed mint leaves NO active grant AND NO tree entry (Invariant #5c).
+ *   7. Once `place` has succeeded, access is LIVE. The only remaining step is
+ *      a BEST-EFFORT success audit: a throw there is logged and swallowed, it
+ *      must NEVER roll a live grant back and report failure (the fail-OPEN +
+ *      false-rollback bug this ordering exists to prevent).
  *
- * Every mint (success or rolled-back failure) appends an audit entry.
+ * The `enforcement` verdict is honest: it is `met` only when a distinct agent
+ * uid's read access has actually been verified; a bare uid split reports
+ * `unverified`, and a same-owner / no-uid box reports `unmet`.
  */
 
 import { randomBytes } from "node:crypto";
 import type { AuditLog } from "../operational/audit-log.js";
-import { computeExpiresAt } from "./lifecycle.js";
+import { computeExpiresAt, determineEnforcement } from "./lifecycle.js";
 import {
+  FileGrantAgentIdRejectedError,
   FileGrantModeRejectedError,
   FileGrantMintFailedError,
   FILE_GRANT_SCHEMA_VERSION,
+  isSafeFileGrantAgentId,
   type FileGrant,
   type FileGrantEnforcement,
   type FileGrantScope,
@@ -72,14 +86,35 @@ export async function mintFileGrant(
   params: MintFileGrantParams,
   deps: MintFileGrantDeps
 ): Promise<MintFileGrantResult> {
+  // Step 1 + 2: reject before ANY persistence or placement.
   if (params.mode !== "read") {
     throw new FileGrantModeRejectedError(params.mode);
   }
+  if (!isSafeFileGrantAgentId(params.subjectAgentId)) {
+    throw new FileGrantAgentIdRejectedError(params.subjectAgentId);
+  }
 
+  // Step 3: canonicalize the source path (throws if it does not exist; no
+  // state has been persisted yet, so the throw simply fails the mint closed).
   const canonicalPath = await deps.fsOps.realpath(params.scope.path);
   const grantId = generateFileGrantId();
   const treeEntry = `${params.subjectAgentId}/${grantId}`;
   const expiresAt = computeExpiresAt(params.ttlSeconds, deps.now);
+
+  // Step 4: resolve the uids and compute the HONEST enforcement verdict BEFORE
+  // placement. The same-uid check compares the agent uid against the SOURCE
+  // file's owner (never `process.getuid()`), so a `sudo` mint cannot fabricate
+  // a false "enforced". v1 has no autonomous agent-uid readability probe, so
+  // `readVerified` is always false here: a real uid split reports `unverified`
+  // (configured; on-hardware read-scope is the deferred acceptance drill),
+  // never `met`.
+  const agentUid = await deps.fsOps.agentUid(params.subjectAgentId);
+  const sourceOwnerUid = await deps.fsOps.sourceOwnerUid(canonicalPath);
+  const enforcement: FileGrantEnforcement = determineEnforcement({
+    agentUid,
+    sourceOwnerUid,
+    readVerified: false,
+  });
 
   const grant: FileGrant = {
     grant_id: grantId,
@@ -96,17 +131,56 @@ export async function mintFileGrant(
     audit_refs: [],
   };
 
-  // Persist first, place second: if placement fails the persisted object is
-  // rolled back so no phantom grant (record with no tree entry) survives.
-  await deps.store.put(grant);
+  // Step 5: persist the record. A failure here confers no access; fail closed.
+  try {
+    await deps.store.put(grant);
+  } catch (putErr) {
+    await bestEffortAudit(deps.auditLog, {
+      identity_id: params.createdBy,
+      result: "failure",
+      details: {
+        grant_id: grantId,
+        subject_agent_id: params.subjectAgentId,
+        reason: "record_persist_failed",
+      },
+    });
+    throw new FileGrantMintFailedError(grantId, putErr);
+  }
 
+  // Step 6: place the tree entry -- the LAST fallible, access-conferring step.
   try {
     await deps.fsOps.place(canonicalPath, treeEntry);
   } catch (placeErr) {
-    await deps.store.remove(grantId);
-    await deps.auditLog?.appendCritical({
-      layer: "l1",
-      operation: "file_grant",
+    // Scrub any partial entry `place` may have created, then roll the record
+    // back under a GUARDED remove so a failed mint leaves NO active grant AND
+    // NO tree entry (Invariant #5c). None of the cleanup steps may suppress
+    // the `FileGrantMintFailedError` the caller must see.
+    try {
+      await deps.fsOps.removeEntry(treeEntry);
+    } catch {
+      // Best-effort: the record rollback below is what makes the grant dead;
+      // a lingering tree entry with no active record confers access to nobody
+      // the planner will re-place, and a later reconcile/revoke scrubs it.
+    }
+    try {
+      await deps.store.remove(grantId);
+    } catch {
+      // Guarded rollback (Fix 2): if the delete itself fails, do not leave a
+      // dangling `active` record. Persist a terminal `revoked` tombstone so no
+      // grant is ever listable as active after a failed mint.
+      try {
+        await deps.store.put({
+          ...grant,
+          status: "revoked",
+          revoked_at: deps.now.toISOString(),
+        });
+      } catch {
+        // Best-effort: the store is unavailable for both delete and write;
+        // there is nothing more to persist. The failure audit + thrown error
+        // still surface the problem to the caller.
+      }
+    }
+    await bestEffortAudit(deps.auditLog, {
       identity_id: params.createdBy,
       result: "failure",
       details: {
@@ -118,16 +192,11 @@ export async function mintFileGrant(
     throw new FileGrantMintFailedError(grantId, placeErr);
   }
 
-  const agentUid = await deps.fsOps.agentUid(params.subjectAgentId);
-  const operatorUid = await deps.fsOps.operatorUid();
-  const enforcement: FileGrantEnforcement =
-    agentUid !== null && operatorUid !== null && agentUid !== operatorUid
-      ? "met"
-      : "unmet";
-
-  await deps.auditLog?.appendCritical({
-    layer: "l1",
-    operation: "file_grant",
+  // Step 7: access is LIVE. The success audit is BEST-EFFORT: a throw here
+  // (e.g. audit-log ENOSPC/EACCES) must NEVER roll back a live grant and
+  // report failure -- that would be the fail-OPEN + false-rollback bug. The
+  // persisted `active` record is the durable evidence even if this line fails.
+  await bestEffortAudit(deps.auditLog, {
     identity_id: params.createdBy,
     result: "success",
     details: {
@@ -140,4 +209,31 @@ export async function mintFileGrant(
   });
 
   return { grant, enforcement };
+}
+
+/**
+ * Append a `file_grant` audit entry, swallowing any error. Used for the
+ * post-placement success audit (a throw must not roll back a live grant) and
+ * for the rollback-path failure audit (a throw must not suppress the
+ * `FileGrantMintFailedError` the caller needs to see).
+ */
+async function bestEffortAudit(
+  auditLog: AuditLog | undefined,
+  entry: {
+    identity_id: string;
+    result: "success" | "failure";
+    details: Record<string, unknown>;
+  }
+): Promise<void> {
+  try {
+    await auditLog?.appendCritical({
+      layer: "l1",
+      operation: "file_grant",
+      identity_id: entry.identity_id,
+      result: entry.result,
+      details: entry.details,
+    });
+  } catch {
+    // Best-effort audit only; the caller's success/failure outcome stands.
+  }
 }

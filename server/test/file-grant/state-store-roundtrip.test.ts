@@ -1,19 +1,24 @@
 /**
- * Governed File-Grant v1 -- StateStore round-trip (DoD gate 3).
+ * Governed File-Grant v1 -- inspect / export / delete round-trip (DoD gate 3,
+ * AGENTS.md Invariant #2).
  *
- * Writes a FileGrant to `_file_grants` via `FileGrantStore` (which calls the
- * StateStore's own `write`/`read`/`list`/`delete` methods directly, the
- * exact same encrypted/signed/monotonic-versioned machinery every other
- * piece of Sanctuary state goes through), proving AGENTS.md Invariant #2
- * (inspect/export/delete) over REAL store code with `MemoryStorage`. This
- * deliberately exercises the StateStore methods directly rather than the
- * agent-facing `state_read`/`state_list`/`state_delete` MCP tool handlers in
- * cognitive/tools.ts, which correctly reject any `_`-prefixed namespace
- * (including `_file_grants`) via the reserved-namespace firewall -- the same
- * posture as `_audit`/`_identities`/every other internal namespace. A grant
- * describes exactly what an agent can read; it must not be agent-readable
- * through the generic state tools (that would be a policy-inference leak),
- * so THIS is the correct level to prove the invariant at.
+ * Proves the operator's HONEST inspect/export/delete story over real store
+ * code with `MemoryStorage`:
+ *   - the record round-trips through the SAME encrypted/signed/monotonic-
+ *     versioned StateStore machinery every other piece of Sanctuary state uses
+ *     (write/read/list/delete on the `_file_grants` namespace); and
+ *   - the operator inspects grants through the operator-facing `file-grant
+ *     list` projection path (`listFileGrants`), not through the agent-facing
+ *     `state_*` MCP tools.
+ *
+ * It does NOT claim the record is reachable through the agent-facing
+ * `state_read`/`state_list`/`state_export` MCP tools: those correctly REJECT
+ * any `_`-prefixed namespace (including `_file_grants`) via the reserved-
+ * namespace firewall in cognitive/tools.ts -- the same posture as
+ * `_audit`/`_identities`. A grant describes exactly what an agent may read, so
+ * it must not be agent-readable through the generic state tools (that would be
+ * a policy-inference leak). Invariant #2 is satisfied by the OPERATOR-facing
+ * surfaces exercised here, not by agent reachability.
  */
 
 import { describe, expect, it } from "vitest";
@@ -27,6 +32,7 @@ import {
   FileGrantStore,
   FILE_GRANT_NAMESPACE,
   FILE_GRANT_SCHEMA_VERSION,
+  listFileGrants,
   type FileGrant,
 } from "../../src/file-grant/index.js";
 
@@ -88,6 +94,19 @@ describe("file-grant StateStore round-trip", () => {
     expect(await grantStore.get(grant.grant_id)).toBeNull();
     const rawAfterDelete = await stateStore.read(FILE_GRANT_NAMESPACE, grant.grant_id);
     expect(rawAfterDelete).toBeNull();
+  });
+
+  it("the operator inspects a grant through the file-grant list path (not the agent state_* tools)", async () => {
+    const { grantStore } = makeStore();
+    const grant = makeGrant();
+    await grantStore.put(grant);
+
+    // This is the operator-facing inspection surface `sanctuary file-grant
+    // list` renders from -- the honest Invariant #2 read path for grants.
+    const projected = await listFileGrants(grantStore, new Date("2026-07-07T12:00:00.000Z"));
+    expect(projected).toHaveLength(1);
+    expect(projected[0]!.grant_id).toBe(grant.grant_id);
+    expect(projected[0]!.projected_status).toBe("active");
   });
 
   it("get returns null for an absent grant id", async () => {

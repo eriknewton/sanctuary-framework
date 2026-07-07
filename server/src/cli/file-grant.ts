@@ -45,6 +45,8 @@ import {
   mintFileGrant,
   revokeFileGrant,
   listFileGrants,
+  recordFileGrantListAudit,
+  reconcileFileGrantTree,
   parseFileGrantTtlDuration,
 } from "../file-grant/index.js";
 
@@ -100,11 +102,13 @@ Description:
   Mints a grant recording that <agent-id> may read <abs-path>. This is a
   FORCED Tier-1 operation: no hand-authored policy can relax it, and it
   requires an explicit yes/no approval on this terminal before it takes
-  effect. The grant is persisted as an encrypted, signed, monotonic-
-  versioned state object; enforcement (real POSIX ownership on a per-agent
-  grant tree) is live only where a dedicated agent uid exists on this host.
-  On a same-uid box the grant is still recorded, but the CLI honestly reports
-  "enforcement: unmet" rather than claiming the file is governed.
+  effect. The grant is persisted as an encrypted, signed, monotonic-versioned
+  state object and a tree entry is placed. v1 reports an HONEST enforcement
+  label and never overclaims: "unmet" when the agent uid already owns the
+  source or no dedicated agent account exists (nothing to enforce);
+  "configured" when a real uid split exists but the on-hardware read-scope has
+  not yet been verified (the functional read primitive + its verification are
+  the separate acceptance drill); "met" only once that verification passes.
 
 Options:
   --agent <id>        The agent identity this grant is for. Required.
@@ -158,6 +162,11 @@ Description:
   Marks the grant revoked and scrubs its tree entry. Safe-direction
   (Tier-3, auto-allow): revoking only ever reduces access. Idempotent:
   revoking an already-revoked grant is a no-op success.
+
+  Revoke is the operator's DELETE-access story: it removes the placed tree
+  entry (ending access) and audits the change. The grant record itself is
+  retained as "revoked" for the audit trail; to also purge the underlying
+  record, delete it from the "_file_grants" state namespace directly.
 
 Options:
   --grant <id>        The grant to revoke. Required.
@@ -383,6 +392,16 @@ async function cmdMint(
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
+  // Reconcile the tree on this mutating touch: scrub any expired grant's tree
+  // entry and flip its persisted status, so access never outlives its TTL.
+  await reconcileFileGrantTree({
+    store: boot.grantStore,
+    fsOps: boot.fsOps,
+    now: new Date(),
+    auditLog: boot.auditLog,
+    reconciledBy: boot.primary.identity_id,
+  });
+
   const policy = await loadPrincipalPolicy(boot.config.storage_path);
   const baseline = new BaselineTracker(boot.storage, boot.masterKey);
   const channel = new CliPromptApprovalChannel();
@@ -419,16 +438,36 @@ async function cmdMint(
     write(out, `  subject_agent_id: ${grant.subject_agent_id}\n`);
     write(out, `  scope: ${grant.scope.kind} ${grant.scope.path}\n`);
     write(out, `  expires_at: ${grant.expires_at ?? "standing (no expiry)"}\n`);
-    write(
-      out,
-      enforcement === "met"
-        ? "  enforcement: met (a dedicated agent account confines this tree)\n"
-        : "  enforcement: unmet (grant recorded; enforcement requires the dedicated agent account, not yet present on this host)\n"
-    );
+    write(out, `  ${enforcementLine(enforcement)}\n`);
     return 0;
   } catch (mintErr) {
-    write(err, `Error: mint failed and was rolled back. ${(mintErr as Error).message}\n`);
+    write(
+      err,
+      `Error: mint failed; the grant was rolled back (no active grant, no access). ` +
+        `${(mintErr as Error).message}\n`
+    );
     return 1;
+  }
+}
+
+/** Honest, never-overclaiming enforcement line for the mint output. */
+function enforcementLine(enforcement: "met" | "unverified" | "unmet"): string {
+  switch (enforcement) {
+    case "met":
+      return "enforcement: met (agent-uid read-scope verified on this host)";
+    case "unverified":
+      return (
+        "enforcement: configured (grant recorded and tree entry placed; the " +
+        "agent-uid read-scope has NOT been verified on this hardware -- the " +
+        "functional read primitive and its verification are the acceptance drill)"
+      );
+    case "unmet":
+    default:
+      return (
+        "enforcement: unmet (grant recorded, but there is no boundary to " +
+        "enforce -- the agent uid already owns the source, or no dedicated " +
+        "agent account is present on this host)"
+      );
   }
 }
 
@@ -444,10 +483,14 @@ async function cmdList(
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
-  const grants = await listFileGrants(
-    boot.grantStore,
-    new Date(),
-    agentFilter ? { subjectAgentId: agentFilter } : undefined
+  const filter = agentFilter ? { subjectAgentId: agentFilter } : undefined;
+  const grants = await listFileGrants(boot.grantStore, new Date(), filter);
+  // Tier-3 auto-allow AND audited (build spec section 3.2): record the access.
+  await recordFileGrantListAudit(
+    boot.auditLog,
+    boot.primary.identity_id,
+    filter,
+    grants.length
   );
 
   if (json) {
@@ -484,6 +527,16 @@ async function cmdRevoke(
 
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
+
+  // Reconcile on this mutating touch too, so a listed-but-expired grant's tree
+  // entry is scrubbed even if the operator only ever revokes.
+  await reconcileFileGrantTree({
+    store: boot.grantStore,
+    fsOps: boot.fsOps,
+    now: new Date(),
+    auditLog: boot.auditLog,
+    reconciledBy: boot.primary.identity_id,
+  });
 
   const result = await revokeFileGrant(grantId, boot.primary.identity_id, {
     fsOps: boot.fsOps,

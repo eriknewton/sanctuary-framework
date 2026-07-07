@@ -148,9 +148,9 @@ const COMMAND_TABLE: Record<string, CommandSpec> = {
   "identity show": { classification: "read-only" },
 
   // ---- file-grant (Governed File-Grant v1, 2026-07-07) ----
-  "file-grant mint":   { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in mintFileGrant (success and rolled-back-failure paths)" },
-  "file-grant list":   { classification: "read-only" },
-  "file-grant revoke": { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in revokeFileGrant (success, not-found, and scrub-failure paths)" },
+  "file-grant mint":   { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in mintFileGrant (success and rolled-back-failure paths); reconciles expired grants on this touch" },
+  "file-grant list":   { classification: "read-only", notes: "read-only projection; emits a file_grant_list access audit (Tier-3 auto-allow + audit, recordFileGrantListAudit)" },
+  "file-grant revoke": { classification: "mutator", auditOverride: true, notes: "AuditLog.appendCritical in revokeFileGrant (success, not-found, and scrub-failure paths); reconciles expired grants on this touch" },
 
   // ---- intelligence ----
   "intelligence diagnose": { classification: "read-only" },

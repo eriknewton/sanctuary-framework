@@ -67,9 +67,36 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     expect(await fsOps.agentUid("agent-1")).toBeNull();
   });
 
-  it("operatorUid reflects the current process uid", async () => {
+  it("sourceOwnerUid reflects the OWNER of the source file (not process.getuid())", async () => {
+    const source = join(sourceDir, "owned.txt");
+    await writeFile(source, "data");
     const fsOps = new PosixFileGrantFsOps(fortressDir);
+    // In this single-uid CI lane the file's owner is the running uid, but the
+    // key property is that the value comes from stat(source), not the process.
     const expected = process.getuid?.() ?? null;
-    expect(await fsOps.operatorUid()).toBe(expected);
+    expect(await fsOps.sourceOwnerUid(await fsOps.realpath(source))).toBe(expected);
+  });
+
+  it("sourceOwnerUid returns null for a vanished path (fails toward unmet, never throws)", async () => {
+    const fsOps = new PosixFileGrantFsOps(fortressDir);
+    expect(await fsOps.sourceOwnerUid(join(sourceDir, "does-not-exist"))).toBeNull();
+  });
+
+  it("place() rejects a traversing tree entry and creates nothing outside the root", async () => {
+    const source = join(sourceDir, "granted.txt");
+    await writeFile(source, "operator data");
+    const fsOps = new PosixFileGrantFsOps(fortressDir);
+    const canonical = await fsOps.realpath(source);
+
+    await expect(fsOps.place(canonical, "../escape/pwned")).rejects.toThrow(/escapes the grant-tree root/);
+
+    // Nothing was created at the escaped location.
+    const escaped = join(fortressDir, "escape", "pwned");
+    await expect(readFile(escaped, "utf-8")).rejects.toThrow();
+  });
+
+  it("removeEntry() rejects a traversing tree entry", async () => {
+    const fsOps = new PosixFileGrantFsOps(fortressDir);
+    await expect(fsOps.removeEntry("../../etc/passwd")).rejects.toThrow(/escapes the grant-tree root/);
   });
 });

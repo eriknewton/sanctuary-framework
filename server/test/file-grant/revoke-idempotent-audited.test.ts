@@ -14,7 +14,7 @@ import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
 describe("file-grant revoke: idempotent + audited", () => {
   it("revoking an active grant marks it revoked, scrubs the tree entry, and audits", async () => {
     const { grantStore, auditLog } = makeFileGrantTestStore();
-    const fsOps = new FakeFsOps({ agentUid: 502, operatorUid: 501 });
+    const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
       {
@@ -49,7 +49,7 @@ describe("file-grant revoke: idempotent + audited", () => {
 
   it("double-revoke is a no-op success, not an error", async () => {
     const { grantStore, auditLog } = makeFileGrantTestStore();
-    const fsOps = new FakeFsOps({ agentUid: 502, operatorUid: 501 });
+    const fsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
       {
@@ -106,7 +106,7 @@ describe("file-grant revoke: idempotent + audited", () => {
 
   it("propagates a scrub failure but keeps the record revoked (never resurrected to active)", async () => {
     const { grantStore, auditLog } = makeFileGrantTestStore();
-    const mintFsOps = new FakeFsOps({ agentUid: 502, operatorUid: 501 });
+    const mintFsOps = new FakeFsOps({ agentUid: 502, sourceOwnerUid: 501 });
 
     const { grant } = await mintFileGrant(
       {

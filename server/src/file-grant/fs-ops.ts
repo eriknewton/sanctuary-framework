@@ -7,32 +7,40 @@
  * mint, revoke, list) takes an injected `FsOps` and is tested with a fake;
  * this implementation is what production wiring passes in.
  *
- * ENFORCEMENT HONESTY (Invariant #5, build spec section 4): POSIX ownership
- * only confines the agent when the agent runs as its OWN dedicated uid
- * (`castle-wall/allowlist/agent-origin.ts`'s uid-mode descriptor), distinct
- * from the operator's uid. On a same-uid box there is nothing to enforce --
- * `agentUid()` returns null (or a uid equal to the operator's), and
- * `mint.ts` reports `enforcement: "unmet"` rather than claiming the grant is
- * governed.
+ * ENFORCEMENT HONESTY (Invariant #5, build spec section 4 + 10): the box-local
+ * read-scope boundary is real only when the agent runs as its OWN dedicated
+ * uid (`castle-wall/allowlist/agent-origin.ts`'s uid-mode descriptor), distinct
+ * from the uid that OWNS the source file. The same-uid decision is derived
+ * from the SOURCE file's owner (`sourceOwnerUid`, via `stat`), NEVER from
+ * `process.getuid()`, so a `sudo` mint cannot fabricate a false "enforced".
  *
- * TRAVERSAL NOTE: for the per-agent subtree's restrictive ownership to
- * actually confine the agent uid on disk, every ancestor directory up to the
- * tree root needs execute ("traverse") permission for that uid, while the
- * per-agent leaf directory stays owned and mode-restricted to only that uid.
- * `ensureTreeRoot` sets the root to `0711` (owner rwx, group/other --x) for
- * exactly that reason: it is traversable but not listable/writable by
- * anyone except the operator. Actually chowning a leaf to a DIFFERENT uid
- * than the current process requires root (or CAP_CHOWN); on a real
- * dedicated-uid box this mint path is expected to run with that privilege.
- * A same-uid box never attempts the cross-uid chown at all (there is no
- * different uid to chown to). Full on-hardware validation of this ownership
- * boundary is the separate, later Erik-present acceptance drill (build spec
- * section 8) -- this module ships the mechanism, not that proof.
+ * DEFERRED FUNCTIONAL PRIMITIVE (v1 = build-spec option B, honest label):
+ * conferring cross-uid read on a distinct agent uid needs a real primitive
+ * (POSIX.1e ACL via `setfacl`, or a cross-uid chown) AND a readability probe
+ * to confirm it, and BOTH are host-specific in ways that cannot be applied or
+ * verified in autonomous CI: `setfacl` semantics diverge between Linux and
+ * macOS (macOS has no `setfacl`; its ACL model is entirely different), a
+ * cross-uid chown requires root/CAP_CHOWN, and verifying "the agent uid can
+ * read the placed entry" requires reading AS that uid (a second uid or root
+ * `seteuid`). None of those are available to a non-root, single-uid CI run.
+ * So v1 ships the RECORDS + the tree placement + the honest label: a real uid
+ * split reports `enforcement: "unverified"` ("configured; on-hardware
+ * read-scope not yet verified"), NEVER `met`. Applying the ACL primitive and
+ * running the agent-uid readability probe is the separate Erik-present
+ * acceptance drill (build spec section 8), where `met` is produced. This
+ * module therefore never claims read access it has not verified.
+ *
+ * TRAVERSAL NOTE: `ensureTreeRoot` sets the root to `0711` (owner rwx,
+ * group/other --x) so a future chowned per-agent leaf stays reachable while
+ * the root itself is not listable by non-owners. NOTE the root currently
+ * lives under the operator fortress (`<fortressPath>/grants/`); relocating it
+ * to a fully agent-traversable path is part of the same deferred drill-build,
+ * and until then the `unverified` label is what keeps v1 honest.
  */
 
-import { mkdir, lstat, readFile, realpath as fsRealpath, rm, symlink } from "node:fs/promises";
+import { mkdir, lstat, readFile, realpath as fsRealpath, rm, stat, symlink } from "node:fs/promises";
 import { chownSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import type { FsOps } from "./types.js";
 
@@ -65,25 +73,47 @@ export class PosixFileGrantFsOps implements FsOps {
     await mkdir(this.treeRoot(), { recursive: true, mode: TREE_ROOT_MODE });
   }
 
+  /**
+   * Resolve a relative tree-entry to an absolute path and REJECT it unless it
+   * stays strictly under the tree root. Defence in depth behind the mint-level
+   * agent-id slug check (`isSafeFileGrantAgentId`): a `..`-bearing entry (or a
+   * symlinked/absolute component) must never let a placement or scrub touch a
+   * path outside the grant tree.
+   */
+  private resolveUnderRoot(relativeTreeEntry: string): string {
+    const root = resolve(this.treeRoot());
+    const dest = resolve(root, relativeTreeEntry);
+    if (dest !== root && !dest.startsWith(root + sep)) {
+      throw new Error(
+        `Governed File-Grant: tree entry "${relativeTreeEntry}" escapes the ` +
+          `grant-tree root; refusing to touch a path outside the tree.`
+      );
+    }
+    return dest;
+  }
+
   async realpath(path: string): Promise<string> {
     return fsRealpath(path);
   }
 
   async place(canonicalSrc: string, relativeTreeEntry: string): Promise<void> {
+    const dest = this.resolveUnderRoot(relativeTreeEntry);
     await this.ensureTreeRoot();
-    const dest = join(this.treeRoot(), relativeTreeEntry);
     const agentSubdir = dirname(dest);
     await mkdir(agentSubdir, { recursive: true, mode: AGENT_SUBDIR_MODE });
 
     // Best-effort restrict the per-agent subdirectory to the dedicated agent
-    // uid when one is configured and distinct from the process's own uid.
-    // chownSync to a DIFFERENT uid than the current process requires root;
-    // an EPERM here is a real fail-closed signal (mint.ts rolls back on
-    // any throw from place()), never silently swallowed.
+    // uid when one is configured and distinct from the running PROCESS uid
+    // (this is chown MECHANICS -- "does this process need to hand the subdir
+    // to another uid" -- not the enforcement-honesty check, which lives in
+    // `mint.ts` and compares the agent uid to the SOURCE file's owner).
+    // chownSync to a DIFFERENT uid than the current process requires root; an
+    // EPERM here is a real fail-closed signal (mint.ts rolls back on any throw
+    // from place()), never silently swallowed.
     const originPath = agentOriginDescriptorPath(this.fortressPath);
     const agentUid = await this.readConfiguredAgentUid(originPath);
-    const operatorUid = process.getuid?.() ?? null;
-    if (agentUid !== null && operatorUid !== null && agentUid !== operatorUid) {
+    const processUid = process.getuid?.() ?? null;
+    if (agentUid !== null && processUid !== null && agentUid !== processUid) {
       chownSync(agentSubdir, agentUid, -1);
     }
 
@@ -99,7 +129,7 @@ export class PosixFileGrantFsOps implements FsOps {
   }
 
   async removeEntry(relativeTreeEntry: string): Promise<void> {
-    const dest = join(this.treeRoot(), relativeTreeEntry);
+    const dest = this.resolveUnderRoot(relativeTreeEntry);
     try {
       const st = await lstat(dest);
       if (st) {
@@ -115,8 +145,17 @@ export class PosixFileGrantFsOps implements FsOps {
     return this.readConfiguredAgentUid(agentOriginDescriptorPath(this.fortressPath));
   }
 
-  async operatorUid(): Promise<number | null> {
-    return process.getuid?.() ?? null;
+  async sourceOwnerUid(canonicalPath: string): Promise<number | null> {
+    if (process.getuid === undefined) return null;
+    try {
+      const st = await stat(canonicalPath);
+      return st.uid;
+    } catch {
+      // The path was realpath'd moments earlier; a stat failure here means it
+      // vanished or became unreadable. Return null so the enforcement verdict
+      // fails toward "unmet" (no false "enforced") rather than throwing.
+      return null;
+    }
   }
 
   /**
