@@ -37,6 +37,7 @@ export {
   executeRehomePlan,
   restoreRehomeSteps,
   hermesRehomeAdapter,
+  RehomeExecutionError,
 } from "./rehome.js";
 export type {
   AgentRehomeAdapter,

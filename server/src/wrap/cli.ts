@@ -1109,6 +1109,11 @@ async function maybeRunAutoProvisionForWrap(
  *     stranded under the new account's home.
  *   - armed-then-rolled-back: the wall came down after a failed post-arm
  *     check; the agent stays re-homed and the operator is told plainly.
+ *   - armed-rollback-failed (fix R5, 2026-07-07 fix-round 2): the wall
+ *     stayed ARMED after a failed post-arm check AND the fast-disarm rollback
+ *     itself failed. LOUDEST manual-recovery guidance of any branch: the
+ *     operator must disarm by hand, since the automatic rollback did not
+ *     complete.
  *   - armed / skipped-already-dedicated: quiet single-line confirmation.
  */
 function renderAutoProvisionOutcome(summary: AutoProvisionSummary): void {
@@ -1139,6 +1144,18 @@ function renderAutoProvisionOutcome(summary: AutoProvisionSummary): void {
         `  Note: Castle Wall armed then was fast-disarmed (${outcome.reason}). ` +
           `The agent still runs under its dedicated, re-homed account; only enforcement came down. ` +
           `Re-run 'sanctuary protect --hermes' once the allow-list is fixed.`,
+      );
+      return;
+    case "armed-rollback-failed":
+      // SAFETY: stderr is the operator-facing CLI channel for this
+      // subcommand; `outcome.reason`/`outcome.disarmError` are the
+      // orchestrator's own human-readable, secret-free strings (endpoint
+      // names, disarm error text) -- never secrets or key material.
+      console.error(
+        `  WARNING: Castle Wall is ARMED (uid ${outcome.uid}) and the automatic rollback FAILED (${outcome.reason}). ` +
+          `The disarm attempt itself also failed: ${outcome.disarmError}. ` +
+          `The agent may be unreachable behind the wall. Run 'sudo sanctuary castle-wall disable' manually now, ` +
+          `then investigate before re-running 'sanctuary protect --hermes'.`,
       );
       return;
     case "aborted":

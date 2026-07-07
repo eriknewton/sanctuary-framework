@@ -91,14 +91,22 @@ export async function unprovision(input: UnprovisionInput): Promise<UnprovisionS
       outcomes.push({ step: "restore-rehome", ok: true });
     } else {
       const failed = restoreResult.steps.filter((s) => s.status === "failed");
+      // FIX R6 (2026-07-07 fix-round 2): a "conflict" step (the source path
+      // was recreated during re-home) is a distinct, non-destructive outcome
+      // from a bare failure -- surface it by name with its conflict path so
+      // the operator knows their recreated file is safe and where the
+      // recovered data actually landed.
+      const conflicts = restoreResult.steps.filter((s) => s.status === "conflict");
+      const details = [
+        ...failed.map((s) => `${s.sourcePath} (${s.error ?? "unknown error"})`),
+        ...conflicts.map((s) => `${s.sourcePath} (recreated during re-home; recovered data at ${s.conflictPath})`),
+      ];
       outcomes.push({
         step: "restore-rehome",
         ok: false,
         error:
-          failed.length > 0
-            ? `${failed.length} path(s) did not restore: ${failed
-                .map((s) => `${s.sourcePath} (${s.error ?? "unknown error"})`)
-                .join(", ")}`
+          details.length > 0
+            ? `${details.length} path(s) did not restore cleanly: ${details.join(", ")}`
             : "restore did not complete for all paths",
       });
     }

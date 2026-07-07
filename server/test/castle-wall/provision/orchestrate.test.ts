@@ -97,11 +97,32 @@ describe("castle-wall/provision/orchestrate", () => {
     expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
     expect(ops.createAccount).not.toHaveBeenCalled();
     expect(ops.rehome).not.toHaveBeenCalled();
-    expect(ops.confirm).not.toHaveBeenCalled();
+    // FIX R4 (HIGH, 2026-07-07 fix-round 2): arming IS a privileged mutation
+    // on the already-dedicated path too, so the confirm ceremony MUST still
+    // run here -- the F6 fix's removal of the "skip straight to done" defect
+    // must not itself skip the confirm gate.
+    expect(ops.confirm).toHaveBeenCalledTimes(1);
     // But daemon-install, verify, uid-gate, and arm ALL still ran.
     expect(ops.installHarnessDaemon).toHaveBeenCalledWith(AGENT_UID);
     expect(ops.checkUidExistence).toHaveBeenCalledWith(AGENT_UID);
     expect(ops.arm).toHaveBeenCalledWith(AGENT_UID, CEILING);
+  });
+
+  it("fix R4: already-dedicated on a non-TTY run refuses (no confirm ceremony possible) rather than arming silently", async () => {
+    const ops = happyPathOps();
+    const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED, isTty: false }), ops);
+    expect(result.kind).toBe("skipped-non-tty-cooperative-only");
+    expect(ops.confirm).not.toHaveBeenCalled();
+    expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+    expect(ops.arm).not.toHaveBeenCalled();
+  });
+
+  it("fix R4: already-dedicated with the interactive confirm declined stops before arming", async () => {
+    const ops = happyPathOps({ confirm: vi.fn(async () => false) });
+    const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+    expect(result.kind).toBe("declined-by-operator");
+    expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+    expect(ops.arm).not.toHaveBeenCalled();
   });
 
   it("fix F6: an already-dedicated abort mid-flow (e.g. daemon-install fails) does not attempt a restore (nothing was re-homed this run)", async () => {

@@ -37,6 +37,7 @@
 import type { ProvisionNeedResult } from "./detect.js";
 import type { AccountProvisionPlan } from "./account.js";
 import type { RehomePlan, RehomeStepResult } from "./rehome.js";
+import { RehomeExecutionError } from "./rehome.js";
 import type { ConnectivityVerifyResult, EndpointProbeTarget } from "./verify.js";
 import { verifyReachabilityAfterArm, verifyReachabilityBeforeArm } from "./verify.js";
 import type { UidExistenceCheckResult } from "./uid-gate.js";
@@ -98,6 +99,18 @@ export interface ProvisionFlowOps {
  * came back, which must render loud manual-recovery guidance at the CLI
  * layer, never be collapsed into a clean `true`. `backupPath` threads the
  * custody-copy location through so the CLI can print it for manual recovery.
+ *
+ * FIX R5 (HIGH, 2026-07-07 fix-round 2): `armed-rollback-failed` is a
+ * distinct terminal outcome for the case where the post-arm connectivity
+ * re-check fails AND the fast-disarm rollback ITSELF fails. Before this fix,
+ * `ops.disarm()` in that branch was uncaught: a throw there propagated out of
+ * `runProvisionFlow` entirely, the CLI's generic catch swallowed it into no
+ * outcome at all, and the wrap's own success banner still printed -- an
+ * operator could be left with an ARMED wall over a half-provisioned agent
+ * and a stray disarm failure with no loud "manual recovery required"
+ * message. This outcome carries `uid` (which account is affected) and
+ * `disarmError` (why disarm failed) so `renderAutoProvisionOutcome` can print
+ * unambiguous manual-recovery guidance.
  */
 export type ProvisionFlowOutcome =
   | { kind: "skipped-already-dedicated"; reason: string }
@@ -111,7 +124,8 @@ export type ProvisionFlowOutcome =
       rolledBack: boolean | "partial";
       backupPaths?: string[];
     }
-  | { kind: "armed-then-rolled-back"; uid: number; reason: string };
+  | { kind: "armed-then-rolled-back"; uid: number; reason: string }
+  | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
 
 /**
  * Run the full one-flow orchestration. Every fail-closed branch below is
@@ -138,56 +152,69 @@ export async function runProvisionFlow(
   // it falls through to the SAME daemon-install -> verify -> uid-gate -> arm
   // -> post-arm-verify sequence as the fresh-provision path, never
   // returning "skipped-already-dedicated" as a terminal state on its own.
+  //
+  // FIX R4 (HIGH, 2026-07-07 fix-round 2): the F6 fix above introduced a
+  // regression -- the plan-and-print / non-TTY-refusal / one-confirm
+  // ceremony (steps 2-3) lived ONLY in the `else` (fresh-provision) branch,
+  // so `alreadyDedicated` fell straight through to install-daemon -> verify
+  // -> uid-gate -> ARM with no confirm and no non-TTY refusal. Arming IS a
+  // privileged mutation regardless of which branch reaches it, so the
+  // ceremony now runs UNCONDITIONALLY, before either branch's mutations,
+  // restoring the ratified "ONE safety-confirm" + "non-TTY refuses
+  // privileged steps" invariants for both paths.
+  if (ctx.detectResult.alreadyDedicated && ctx.detectResult.resolved === undefined) {
+    // Defensive: `alreadyDedicated` without a resolved uid is a caller
+    // contract violation. Fail closed rather than dereference undefined.
+    return {
+      kind: "aborted",
+      stage: "detect",
+      reason: "detectResult.alreadyDedicated is true but no uid was resolved; refusing to proceed.",
+      rolledBack: false,
+    };
+  }
+
+  // Step 2: plan-and-print. No mutation yet, either branch.
+  ops.print(
+    ctx.detectResult.alreadyDedicated
+      ? `Agent already runs as a verified dedicated account (uid ${ctx.detectResult.resolved!.uid}): ` +
+          `${ctx.detectResult.reason} Skipping account creation and re-home; still installing the harness ` +
+          `daemon, verifying, and arming.`
+      : `Plan: create hidden account "${ctx.accountName}" (no login), move Hermes config/secrets onto it, ` +
+          `install the ai.sanctuaryprotocol.agent-harness LaunchDaemon, then arm with ` +
+          `--agent-uid=<new uid> --ceiling=${ctx.ceiling}.`,
+  );
+
+  // Step 3: ONE confirm, scoped to the privileged sub-steps only (fix H4;
+  // fix R4 extends this ceremony to the alreadyDedicated branch, since arm
+  // is a privileged mutation on BOTH paths). Non-TTY refusal applies HERE
+  // ONLY -- the caller (wrap/cli.ts) is responsible for letting the
+  // cooperative wrap itself still complete; this function just reports that
+  // provisioning was skipped so the caller knows to print the
+  // "cooperative-only, re-run interactively" message.
+  if (!ctx.isTty) {
+    return {
+      kind: "skipped-non-tty-cooperative-only",
+      reason:
+        "provisioning requires an interactive confirm and this run is non-interactive (no TTY); " +
+        "the cooperative wrap still completed. Re-run interactively to provision the account and arm the wall.",
+    };
+  }
+
+  // `--provision-agent-account[=name]` (fix L2) pre-answers the CHOICE
+  // only -- it does NOT skip the confirm. If the operator pre-declined,
+  // stop before printing the confirm prompt at all.
+  if (ctx.preAnsweredProvision === false) {
+    return { kind: "declined-by-operator" };
+  }
+
+  const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ");
+  if (!proceed) {
+    return { kind: "declined-by-operator" };
+  }
+
   if (ctx.detectResult.alreadyDedicated) {
-    if (ctx.detectResult.resolved === undefined) {
-      // Defensive: `alreadyDedicated` without a resolved uid is a caller
-      // contract violation. Fail closed rather than dereference undefined.
-      return {
-        kind: "aborted",
-        stage: "detect",
-        reason: "detectResult.alreadyDedicated is true but no uid was resolved; refusing to proceed.",
-        rolledBack: false,
-      };
-    }
-    uid = ctx.detectResult.resolved.uid;
-    ops.print(
-      `Agent already runs as a verified dedicated account (uid ${uid}): ${ctx.detectResult.reason} ` +
-        `Skipping account creation and re-home; still installing the harness daemon, verifying, and arming.`,
-    );
+    uid = ctx.detectResult.resolved!.uid;
   } else {
-    // Step 2: plan-and-print. No mutation yet.
-    ops.print(
-      `Plan: create hidden account "${ctx.accountName}" (no login), move Hermes config/secrets onto it, ` +
-        `install the ai.sanctuaryprotocol.agent-harness LaunchDaemon, then arm with ` +
-        `--agent-uid=<new uid> --ceiling=${ctx.ceiling}.`,
-    );
-
-    // Step 3: ONE confirm, scoped to the privileged sub-steps only (fix H4).
-    // Non-TTY refusal applies HERE ONLY -- the caller (wrap/cli.ts) is
-    // responsible for letting the cooperative wrap itself still complete;
-    // this function just reports that provisioning was skipped so the caller
-    // knows to print the "cooperative-only, re-run interactively" message.
-    if (!ctx.isTty) {
-      return {
-        kind: "skipped-non-tty-cooperative-only",
-        reason:
-          "provisioning requires an interactive confirm and this run is non-interactive (no TTY); " +
-          "the cooperative wrap still completed. Re-run interactively to provision the account and arm the wall.",
-      };
-    }
-
-    // `--provision-agent-account[=name]` (fix L2) pre-answers the CHOICE
-    // only -- it does NOT skip the confirm. If the operator pre-declined,
-    // stop before printing the confirm prompt at all.
-    if (ctx.preAnsweredProvision === false) {
-      return { kind: "declined-by-operator" };
-    }
-
-    const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ");
-    if (!proceed) {
-      return { kind: "declined-by-operator" };
-    }
-
     // Step 4: create the dedicated hidden service account.
     try {
       const created = await ops.createAccount();
@@ -203,7 +230,22 @@ export async function runProvisionFlow(
       rehomeResults = rehomed.results;
       ops.print(`Re-homed ${rehomeResults.filter((r) => r.status === "moved").length} path(s) onto the new account.`);
     } catch (err) {
-      return { kind: "aborted", stage: "rehome", reason: (err as Error).message, rolledBack: false };
+      // FIX R3 (HIGH, 2026-07-07 fix-round 2): a rehome failure can be a
+      // PARTIAL failure -- some paths already moved (and were backed up)
+      // before the step that threw. `RehomeExecutionError` (rehome.ts)
+      // carries those already-completed results; route them through
+      // `safeRestore` exactly like every other post-move abort below,
+      // instead of reporting `rolledBack: false` with an empty backup-path
+      // list while secrets actually sit un-restored under the new account.
+      const partialResults = err instanceof RehomeExecutionError ? err.partialResults : [];
+      const restore = await safeRestore(ops, partialResults);
+      return {
+        kind: "aborted",
+        stage: "rehome",
+        reason: (err as Error).message,
+        rolledBack: partialResults.length > 0 ? restore.rolledBack : false,
+        backupPaths: restore.backupPaths,
+      };
     }
   }
 
@@ -274,11 +316,28 @@ export async function runProvisionFlow(
   const postArmVerify: ConnectivityVerifyResult = await verifyReachabilityAfterArm(ops.postArmEndpoints());
   if (!postArmVerify.allReachable) {
     const unreachable = postArmVerify.results.filter((r) => !r.reachable).map((r) => r.name);
-    await ops.disarm();
+    const reason = `post-arm check found the allow-list blocks: ${unreachable.join(", ")}. Fast-disarmed rather than leave a bricked agent.`;
+    // FIX R5 (HIGH, 2026-07-07 fix-round 2): `disarm()` can itself fail (the
+    // exact scenario this rollback exists for -- something about this host
+    // is already unhealthy). The pre-fix-round-2 code left this call
+    // uncaught: a throw here propagated past this function's return
+    // entirely, the CLI's generic catch swallowed it into NO outcome, and
+    // the wrap's own success banner still printed over an ARMED wall with a
+    // FAILED rollback. Catch it and return a distinct, loud outcome instead.
+    try {
+      await ops.disarm();
+    } catch (disarmErr) {
+      return {
+        kind: "armed-rollback-failed",
+        uid,
+        reason,
+        disarmError: (disarmErr as Error).message,
+      };
+    }
     return {
       kind: "armed-then-rolled-back",
       uid,
-      reason: `post-arm check found the allow-list blocks: ${unreachable.join(", ")}. Fast-disarmed rather than leave a bricked agent.`,
+      reason,
     };
   }
 

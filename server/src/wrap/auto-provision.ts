@@ -26,12 +26,12 @@
  * invariant #5.
  */
 
-import { platform as osPlatform, userInfo, homedir } from "node:os";
+import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, rename, copyFile, chmod, chown as fsChown, access, stat, cp } from "node:fs/promises";
 import { dirname } from "node:path";
-import { connect as netConnect } from "node:net";
+import { resolve as dnsResolve } from "node:dns/promises";
 
 import {
   detectProvisionNeed,
@@ -61,78 +61,290 @@ const PROVISION_CEILING = 500;
 const NEW_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
 const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
 
-// FIX F1 (BLOCKER, 2026-07-07 fix-round): the real endpoint hosts Hermes
+// FIX R1 (BLOCKER, 2026-07-07 fix-round 2): the real endpoint hosts Hermes
 // needs to reach, so `preArmEndpoints`/`postArmEndpoints` below supply a
 // non-empty, meaningful probe list instead of `[]`. `verify.ts`'s fail-closed
 // empty-list guard means an empty list here would abort/disarm every real
-// run, so this list must stay accurate as Hermes' real dependencies. TCP
-// connect on 443 only -- this proves network reachability as the new uid,
-// not HTTP-level auth; that matches what `verifyReachabilityBeforeArm` /
-// `verifyReachabilityAfterArm` actually claim to prove (re-home + allow-list
-// reachability, never application-level success).
-const HERMES_ENDPOINT_HOSTS: ReadonlyArray<{ name: string; host: string; port: number }> = Object.freeze([
-  { name: "LLM (Venice)", host: "api.venice.ai", port: 443 },
-  { name: "Telegram Bot API", host: "api.telegram.org", port: 443 },
-  { name: "Google MCP (Workspace APIs)", host: "www.googleapis.com", port: 443 },
+// run, so this list must stay accurate as Hermes' real dependencies.
+//
+// Re-gate 1 (commit 636f6051) found the PRIOR probe overclaimed: it ran a
+// root TCP connect and called that "the re-homed agent can reach this
+// endpoint" -- a root socket connecting proves nothing about what the new,
+// unprivileged uid can reach, because this whole module runs in-process
+// inside the ROOT `sanctuary protect` process (no setuid/seteuid/launchctl
+// asuser boundary crosses before the probe runs). The fix is HONESTY, not a
+// weaker check: this module now only claims what root can actually prove
+// from here -- (1) the hostname resolves via DNS (name resolution does not
+// depend on the calling uid, so this is a true statement about ANY caller,
+// not an overclaim), and (2) each moved credential is genuinely present and
+// readable BY THE TARGET UID (checked via `stat`, not assumed via a root
+// `access()` call -- see `credentialReadableAsUidDecision` below). Proving that the
+// re-homed agent, running AS the new uid, actually reaches these hosts
+// end-to-end is the Erik-present drill's job, never this module's.
+const HERMES_ENDPOINT_HOSTS: ReadonlyArray<{ name: string; host: string }> = Object.freeze([
+  { name: "LLM (Venice)", host: "api.venice.ai" },
+  { name: "Telegram Bot API", host: "api.telegram.org" },
+  { name: "Google MCP (Workspace APIs)", host: "www.googleapis.com" },
 ]);
 
-const PROBE_CONNECT_TIMEOUT_MS = 5000;
-
-/** TCP-connect reachability probe for one host:port. Fail-closed: any error or timeout resolves false, never throws. */
-function tcpConnectProbe(host: string, port: number): () => Promise<boolean> {
-  return () =>
-    new Promise<boolean>((resolve) => {
-      let settled = false;
-      const finish = (ok: boolean) => {
-        if (settled) return;
-        settled = true;
-        socket.destroy();
-        resolve(ok);
-      };
-      const socket = netConnect({ host, port, timeout: PROBE_CONNECT_TIMEOUT_MS });
-      socket.once("connect", () => finish(true));
-      socket.once("timeout", () => finish(false));
-      socket.once("error", () => finish(false));
-    });
+/**
+ * DNS-resolves-only reachability probe for one hostname (fix R1). This is
+ * deliberately NOT a TCP connect: a TCP connect made by this (root) process
+ * proves nothing about whether the re-homed agent, running as a DIFFERENT
+ * (unprivileged) uid, can reach the same host -- a root socket is not
+ * uid-scoped and would silently overclaim end-to-end reachability. DNS
+ * resolution is not uid-scoped either, so it makes no false claim: it only
+ * confirms the hostname is resolvable from this host/network right now,
+ * which is a real (if narrow) precondition for the agent reaching it later.
+ * Fail-closed: any resolution error (including timeout) resolves false,
+ * never throws.
+ */
+export function dnsResolvesProbe(host: string): () => Promise<boolean> {
+  return async () => {
+    try {
+      const addresses = await dnsResolve(host);
+      return addresses.length > 0;
+    } catch {
+      return false;
+    }
+  };
 }
 
 /**
- * "Moved credential files are readable as the new uid" probe (fix F1). Runs
- * `stat` as an unprivileged check from the CURRENT process (which, by the
- * time this is called post-re-home, is the harness daemon's already-dropped
- * uid in the real drill path); a file that exists but is not readable at the
- * calling uid throws EACCES, which this treats as unreachable (fail-closed).
- * A wholly absent path (nothing to check because the harness never used that
- * credential) is NOT treated as a failure -- only an existing-but-unreadable
- * path fails the probe.
+ * Pure decision logic behind "is this moved credential path readable by the
+ * target uid" (fix R1 chokepoint seam): given a `stat` result (or `undefined`
+ * for ENOENT) and the target uid, decide whether the credential counts as
+ * present-and-readable. Exported so the real-ops unit-test suite can drive
+ * every branch (ENOENT, owner match, group/other read bits, owner mismatch
+ * with no read bits) without touching a real filesystem.
+ *
+ * Fail-closed semantics:
+ *   - `undefined` (ENOENT: the path does not exist) -> `false`. This is a
+ *     deliberate tightening from the pre-fix-round-2 probe, which treated an
+ *     ABSENT moved credential as "reachable" -- exactly the F7/R1 symptom
+ *     this probe exists to catch. A credential that was supposed to move but
+ *     did not must fail the probe, not pass it.
+ *   - owner uid matches AND the owner-read bit (0400) is set -> `true`.
+ *   - owner uid does NOT match, but the file is world-readable (0004) or the
+ *     target uid's group matches the file's gid and the group-read bit
+ *     (0040) is set -> `true` (matches the real access(2) semantics closely
+ *     enough for a fail-closed decision; production custody always chowns to
+ *     the target uid, so the owner-match branch is the one that actually
+ *     fires post-re-home -- this branch exists so the seam is honest about
+ *     what POSIX permission bits actually allow, not merely what today's
+ *     custody code happens to write).
+ *   - anything else -> `false`.
  */
-function credentialReadableProbe(path: string): () => Promise<boolean> {
+export function credentialReadableAsUidDecision(
+  statResult: { uid: number; gid: number; mode: number } | undefined,
+  targetUid: number,
+  targetGid?: number,
+): boolean {
+  if (statResult === undefined) {
+    return false;
+  }
+  const { uid, gid, mode } = statResult;
+  const OWNER_READ = 0o400;
+  const GROUP_READ = 0o040;
+  const OTHER_READ = 0o004;
+  if (uid === targetUid) {
+    return (mode & OWNER_READ) !== 0;
+  }
+  if (targetGid !== undefined && gid === targetGid && (mode & GROUP_READ) !== 0) {
+    return true;
+  }
+  return (mode & OTHER_READ) !== 0;
+}
+
+/**
+ * "Moved credential file is present and readable by the target (re-homed
+ * agent's) uid" probe (fix R1, replaces the fix-round-1 `access()`-based
+ * probe). Uses `stat` (not `access`, which as root would report every file
+ * "accessible" regardless of mode -- root bypasses the permission bits
+ * `access()` would otherwise check) so the decision is driven by the actual
+ * owner/mode bits via `credentialReadableAsUidDecision`, never by root's own
+ * unrestricted read capability. ENOENT resolves `false` (fail-closed: an
+ * absent moved credential is exactly the F7 symptom this probe backstops,
+ * never a silent pass).
+ */
+function credentialReadableProbe(path: string, targetUid: number, targetGid?: number): () => Promise<boolean> {
   return async () => {
     try {
-      await access(path);
-      return true;
+      const st = await stat(path);
+      return credentialReadableAsUidDecision(
+        { uid: st.uid, gid: st.gid, mode: st.mode },
+        targetUid,
+        targetGid,
+      );
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
-      // Absence is not a reachability failure: not every optional credential
-      // path is populated on every install (matches rehome.ts's own
-      // skipped-absent handling). Only a genuine permission/access failure
-      // on a path that DOES exist counts as unreachable.
-      return code === "ENOENT";
+      if (code === "ENOENT") {
+        // Fail-closed (fix R1): the fix-round-1 probe treated ENOENT as
+        // "reachable" (true), which fail-opened on the exact defect it was
+        // meant to backstop -- a credential that should have moved but did
+        // not. An absent credential is never a pass.
+        return false;
+      }
+      // Any other stat error (permission denied on a parent directory, etc.)
+      // is fail-closed the same way: unknown state is never a pass.
+      return false;
     }
   };
 }
 
 /** Build the real, injected pre-arm/post-arm endpoint probe list for Hermes. */
-function hermesEndpointProbes(newAccountHome: string): EndpointProbeTarget[] {
-  const targets: EndpointProbeTarget[] = HERMES_ENDPOINT_HOSTS.map(({ name, host, port }) => ({
-    name,
-    probe: tcpConnectProbe(host, port),
+function hermesEndpointProbes(newAccountHome: string, targetUid: number, targetGid: number): EndpointProbeTarget[] {
+  const targets: EndpointProbeTarget[] = HERMES_ENDPOINT_HOSTS.map(({ name, host }) => ({
+    name: `${name} (DNS-resolves)`,
+    probe: dnsResolvesProbe(host),
   }));
   targets.push({
-    name: "moved credentials readable (.hermes/.env)",
-    probe: credentialReadableProbe(`${newAccountHome}/.hermes/.env`),
+    name: "moved credentials present + readable by agent uid (.hermes/.env)",
+    probe: credentialReadableProbe(`${newAccountHome}/.hermes/.env`, targetUid, targetGid),
   });
   return targets;
+}
+
+/**
+ * FIX R1: fail-closed wrapper around `hermesEndpointProbes` for the
+ * (should-never-happen) case where the target agent uid/gid has not been
+ * resolved yet when the orchestrator calls `preArmEndpoints`/
+ * `postArmEndpoints`. Returning `[]` here would trigger `verify.ts`'s own
+ * fail-closed empty-list guard (abort/fast-disarm), which is the correct
+ * outcome -- silently falling back to the CONSOLE owner's uid would instead
+ * make the credential-readable probe check the WRONG identity and could
+ * fail-open by reporting "readable" against an identity nothing was actually
+ * re-homed to.
+ */
+function resolveEndpointProbes(
+  newAccountHome: string,
+  targetUidGid: { uid: number; gid: number } | undefined,
+): EndpointProbeTarget[] {
+  if (targetUidGid === undefined) {
+    return [];
+  }
+  return hermesEndpointProbes(newAccountHome, targetUidGid.uid, targetUidGid.gid);
+}
+
+/**
+ * FIX R2 (HIGH, 2026-07-07 fix-round 2): the operator's resolved identity
+ * when this process is running under `sudo` (which it must be, given the
+ * root check just above every call site of this type). Under sudo,
+ * `os.homedir()`/`os.userInfo()` report ROOT (`/var/root`, uid/gid 0), not
+ * the operator who typed `sudo sanctuary protect --hermes` -- see
+ * `resolveSudoIdentityDecision` below for the pure decision logic this
+ * wraps.
+ */
+export interface OperatorIdentity {
+  uid: number;
+  gid: number;
+  home: string;
+}
+
+/**
+ * Pure decision logic behind sudo-aware operator-identity resolution (fix R2
+ * chokepoint seam): given the raw env values `sudo` sets
+ * (`SUDO_UID`/`SUDO_GID`/`SUDO_USER`) and a name-validity check, decide
+ * whether the operator identity is resolvable and, if so, from which env
+ * vars. Exported so the real-ops unit-test suite can drive every branch
+ * (both present, one missing, malformed) without touching a real process
+ * environment or `dscl`.
+ *
+ * FIX R2: the pre-fix-round-2 code called `homedir()`/`userInfo()`
+ * unconditionally, which under `sudo sanctuary protect --hermes` (this
+ * function's only supported invocation shape, per the root check above every
+ * caller) resolves to root's own identity (`/var/root`, 0/0) -- NOT the
+ * operator. Two concrete failures followed: (1) the re-home SOURCE path
+ * resolved to `/var/root/.hermes/...`, which is never where the operator's
+ * real Hermes config lives, so re-home silently found nothing to move and
+ * the wall armed over un-re-homed secrets; (2) F3's custody handback chowned
+ * restored secrets to root, leaving the operator unable to read their own
+ * recovered `.env` after a failed/aborted run.
+ *
+ * Fail-closed: `SUDO_UID`/`SUDO_GID` must both be present and parse as
+ * non-negative integers, and (when present) `SUDO_USER` must match a safe
+ * account-name shape; any other combination resolves `undefined` (never a
+ * fabricated or root-fallback identity).
+ */
+export function resolveSudoIdentityDecision(env: {
+  SUDO_UID?: string;
+  SUDO_GID?: string;
+  SUDO_USER?: string;
+}): { uid: number; gid: number; user?: string } | undefined {
+  const { SUDO_UID, SUDO_GID, SUDO_USER } = env;
+  if (SUDO_UID === undefined || SUDO_GID === undefined) {
+    return undefined;
+  }
+  if (!/^\d+$/.test(SUDO_UID) || !/^\d+$/.test(SUDO_GID)) {
+    return undefined;
+  }
+  const uid = Number(SUDO_UID);
+  const gid = Number(SUDO_GID);
+  if (!Number.isSafeInteger(uid) || !Number.isSafeInteger(gid)) {
+    return undefined;
+  }
+  if (SUDO_USER !== undefined && !/^[a-zA-Z0-9._-]+$/.test(SUDO_USER)) {
+    // A SUDO_USER value that fails the safe-name shape is refused outright
+    // (fail-closed), even though uid/gid alone would be enough to chown
+    // with: an unparseable SUDO_USER is a signal something about this
+    // invocation is not a normal sudo call, and the home-directory lookup
+    // below needs a trustworthy name to pass to `dscl`.
+    return undefined;
+  }
+  return { uid, gid, user: SUDO_USER };
+}
+
+/**
+ * Resolve the operator's identity + home directory, sudo-aware (fix R2).
+ * Fails closed (returns `undefined`) if `SUDO_UID`/`SUDO_GID` are absent or
+ * malformed, or if the operator's home directory cannot be looked up via
+ * `dscl` -- callers must refuse to proceed rather than fall back to root's
+ * own `homedir()`/`userInfo()`.
+ */
+async function resolveOperatorIdentity(): Promise<OperatorIdentity | undefined> {
+  const sudoIdentity = resolveSudoIdentityDecision(process.env);
+  if (sudoIdentity === undefined) {
+    return undefined;
+  }
+  // Prefer resolving the home directory by NAME via dscl (matches the
+  // established pattern in cli/castle-wall-boot.ts's `deriveOperatorHome`);
+  // SUDO_USER may be absent on some invocations even when SUDO_UID/GID are
+  // set, so fall back to looking the account up by uid.
+  const home = await lookupHomeDirectory(sudoIdentity.user, sudoIdentity.uid);
+  if (home === undefined) {
+    return undefined;
+  }
+  return { uid: sudoIdentity.uid, gid: sudoIdentity.gid, home };
+}
+
+/** Look up a NFSHomeDirectory by account name (preferred) or uid, via dscl. Fail-closed: any error or unparsed output resolves undefined. */
+async function lookupHomeDirectory(user: string | undefined, uid: number): Promise<string | undefined> {
+  try {
+    if (user !== undefined) {
+      const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-read", `/Users/${user}`, "NFSHomeDirectory"]);
+      const match = /NFSHomeDirectory:\s*(\S+)/.exec(stdout);
+      if (match) return match[1];
+    }
+    const { stdout: searchOut } = await execFileAsync("/usr/bin/dscl", [
+      ".",
+      "-search",
+      "/Users",
+      "UniqueID",
+      String(uid),
+    ]);
+    const nameMatch = /^(\S+)\s+UniqueID\s*=\s*\d+/m.exec(searchOut);
+    if (!nameMatch) return undefined;
+    const { stdout } = await execFileAsync("/usr/bin/dscl", [
+      ".",
+      "-read",
+      `/Users/${nameMatch[1]}`,
+      "NFSHomeDirectory",
+    ]);
+    const match = /NFSHomeDirectory:\s*(\S+)/.exec(stdout);
+    return match?.[1];
+  } catch {
+    return undefined;
+  }
 }
 
 /** Options threaded in from `runWrap` for the Hermes v1 auto-provision call. */
@@ -145,6 +357,8 @@ export interface RunAutoProvisionForWrapOptions {
   print?: (line: string) => void;
   /** Override for `process.getuid` (tests only; production leaves this undefined). */
   getuid?: () => number;
+  /** Override for the resolved operator identity (tests only; production leaves this undefined and resolves via SUDO_UID/GID/USER). */
+  resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
 }
 
 /**
@@ -177,12 +391,64 @@ export async function runAutoProvisionForWrap(
   const print = options.print ?? ((line: string) => console.error(line));
   const agentId = "hermes";
   const accountName = deriveAgentAccountName(agentId);
-  const operatorHome = homedir();
   const newAccountHome = `${NEW_ACCOUNT_HOME_BASE}/${accountName}`;
 
-  const consoleOwnerInfo = userInfo();
-  const consoleOwnerUid = consoleOwnerInfo.uid;
-  const consoleOwnerGid = consoleOwnerInfo.gid;
+  // Privileged-path root check (matches the established pattern in
+  // cli/castle-wall.ts's `setup-shared-dir` / `install-boot`: privileged
+  // subcommands check `getuid?.() !== 0` up front and instruct the operator
+  // to re-run with sudo, rather than let a root-only fs/exec op fail with a
+  // raw, confusing EACCES deep in the flow). `sanctuary protect` itself runs
+  // fine as the operator; only the PRIVILEGED sub-steps (create account,
+  // re-home, install daemon, arm) need root. Checking here -- before the
+  // plan-and-print / confirm ceremony, and BEFORE the operator-identity
+  // resolution below (which only makes sense once we know we are actually
+  // running as root under sudo) -- gives the operator the correct
+  // instruction immediately instead of a failure after they have already
+  // said yes.
+  const getuid = options.getuid ?? process.getuid?.bind(process);
+  if (getuid?.() !== 0) {
+    print(
+      "Provisioning a dedicated agent account requires root. Re-run: sudo sanctuary protect --hermes",
+    );
+    return {
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "root-check",
+        reason: "auto-provisioning requires root; re-run with sudo.",
+        rolledBack: false,
+      },
+    };
+  }
+
+  // FIX R2 (HIGH, 2026-07-07 fix-round 2): this flow only ever runs under
+  // `sudo sanctuary protect --hermes` (just confirmed above). Under sudo,
+  // `os.homedir()`/`os.userInfo()` report ROOT (`/var/root`, 0/0), not the
+  // operator who typed the command. Resolve the operator's real identity
+  // from SUDO_UID/SUDO_GID/SUDO_USER (or fail closed) BEFORE this function
+  // does anything else that depends on "whose home directory" or "whose
+  // uid/gid" -- re-home source resolution and F3 custody handback both
+  // depend on this being right, not on root's own identity.
+  const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
+  const operatorIdentity = await resolveIdentity();
+  if (operatorIdentity === undefined) {
+    print(
+      "Could not determine the operator account under sudo (SUDO_UID/SUDO_GID unset or unresolvable). " +
+        "Run via 'sudo sanctuary protect --hermes' from an interactive operator shell, not a raw root shell.",
+    );
+    return {
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "root-check",
+        reason: "could not resolve the operator's identity under sudo; refusing to provision.",
+        rolledBack: false,
+      },
+    };
+  }
+  const operatorHome = operatorIdentity.home;
+  const consoleOwnerUid = operatorIdentity.uid;
+  const consoleOwnerGid = operatorIdentity.gid;
   const harnessConfiguredUid = await readHarnessConfiguredUid();
   const runningAgentUid = await readRunningHermesGatewayUid();
   // FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): the resolved
@@ -207,31 +473,15 @@ export async function runAutoProvisionForWrap(
     accountShapeVerdict,
   });
 
-  // Privileged-path root check (matches the established pattern in
-  // cli/castle-wall.ts's `setup-shared-dir` / `install-boot`: privileged
-  // subcommands check `getuid?.() !== 0` up front and instruct the operator
-  // to re-run with sudo, rather than let a root-only fs/exec op fail with a
-  // raw, confusing EACCES deep in the flow). `sanctuary protect` itself runs
-  // fine as the operator; only the PRIVILEGED sub-steps (create account,
-  // re-home, install daemon, arm) need root. Checking here -- before the
-  // plan-and-print / confirm ceremony -- gives the operator the correct
-  // instruction immediately instead of a failure after they have already
-  // said yes.
-  const getuid = options.getuid ?? process.getuid?.bind(process);
-  if (getuid?.() !== 0) {
-    print(
-      "Provisioning a dedicated agent account requires root. Re-run: sudo sanctuary protect --hermes",
-    );
-    return {
-      ran: true,
-      outcome: {
-        kind: "aborted",
-        stage: "root-check",
-        reason: "auto-provisioning requires root; re-run with sudo.",
-        rolledBack: false,
-      },
-    };
-  }
+  // FIX R1: `preArmEndpoints`/`postArmEndpoints` are nullary in
+  // `ProvisionFlowOps` (the orchestrator calls them with no arguments), but
+  // the credential-readable-by-uid probe needs to know the TARGET uid/gid to
+  // check readability against. `installHarnessDaemon(uid)` is called by the
+  // orchestrator on EVERY path (fresh-provision and already-dedicated alike)
+  // strictly before either endpoint-probe call (steps 6 -> 7/10), so it is
+  // the correct, always-populated capture point. `resolvedAgentUidGid`
+  // starts undefined and is set exactly once per run.
+  let resolvedAgentUidGid: { uid: number; gid: number } | undefined;
 
   const ops: ProvisionFlowOps = {
     confirm: (promptText) => confirmOnTty(promptText),
@@ -252,6 +502,13 @@ export async function runAutoProvisionForWrap(
       return { plan, results };
     },
     installHarnessDaemon: async (uid) => {
+      // FIX R1: capture the target uid/gid here (see the comment above the
+      // `ops` object) so the endpoint probes below can check
+      // credential-readable-by-uid honestly instead of guessing. The new
+      // account's uid and gid are the same value (see `rehome`'s call site
+      // and `arm`'s `--agent-uid=<uid>` below, which both treat uid===gid
+      // for this dedicated service account).
+      resolvedAgentUidGid = { uid, gid: uid };
       const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists });
       const plan = planAgentHarnessDaemonInstall({
         agentAccount: accountName,
@@ -259,18 +516,14 @@ export async function runAutoProvisionForWrap(
         fortressPath: process.env.SANCTUARY_STORAGE_PATH,
       });
       await installAgentHarnessDaemon(plan, realHarnessDaemonOps());
-      // uid is accepted for interface symmetry with the orchestrator's
-      // per-uid signature; the daemon plist itself pins the account NAME
-      // (UserName), and the account name <-> uid binding was just verified
-      // by the create step above and is re-verified by the uid-existence
-      // gate before arming.
-      void uid;
     },
-    // FIX F1 (BLOCKER): non-empty, meaningful real probe list -- see
-    // `hermesEndpointProbes` above. An empty list here would now abort/
-    // fast-disarm every real run (verify.ts's fail-closed empty-list guard),
-    // so this MUST stay wired to the real endpoints.
-    preArmEndpoints: () => hermesEndpointProbes(newAccountHome),
+    // FIX R1 (BLOCKER, fix-round 2): honest, fail-closed probe list -- see
+    // `hermesEndpointProbes` above. `resolvedAgentUidGid` is always set by
+    // `installHarnessDaemon` before this is called (steps 6 -> 7); if it is
+    // somehow still undefined, fail closed to an unreachable synthetic probe
+    // rather than defaulting to the CONSOLE owner's uid, which would silently
+    // check readability against the wrong identity.
+    preArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid),
     checkUidExistence: async (uid) => {
       const { checkUidExistenceBeforeArm } = await import("../castle-wall/provision/uid-gate.js");
       return checkUidExistenceBeforeArm(accountName, uid, realUidExistenceOps());
@@ -280,7 +533,7 @@ export async function runAutoProvisionForWrap(
       const code = await runEnable([`--agent-uid=${uid}`, `--ceiling=${ceiling}`, "--no-ttl"]);
       return code === 0 ? { ok: true } : { ok: false, error: `castle-wall enable exited ${code}` };
     },
-    postArmEndpoints: () => hermesEndpointProbes(newAccountHome),
+    postArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid),
     disarm: async () => {
       const { runDisable } = await import("../cli/castle-wall.js");
       await runDisable([]);
@@ -290,6 +543,10 @@ export async function runAutoProvisionForWrap(
       // (the console-session owner this whole flow is provisioning away
       // from) so restored secrets are handed back with correct custody, and
       // report what ACTUALLY restored rather than assuming success.
+      // FIX R2 (HIGH, fix-round 2): under sudo, `consoleOwnerUid`/
+      // `consoleOwnerGid` (below) are resolved from the SUDO-aware operator
+      // identity, not the raw root identity `userInfo()` would otherwise
+      // report -- see the `operatorIdentity` resolution above.
       const restoreResult = await restoreRehomeSteps(results, realRehomeOps(), {
         uid: consoleOwnerUid,
         gid: consoleOwnerGid,
@@ -515,7 +772,15 @@ async function chownRecursive(path: string, uid: number, gid: number): Promise<v
   }
 }
 
-function realRehomeOps() {
+/**
+ * Exported (fix chokepoint, 2026-07-07 fix-round 2) so the real-ops unit
+ * suite can exercise the ACTUAL restore-conflict decision logic (R6) against
+ * a real, disposable tmpdir -- not a mock standing in for it. `backup`/
+ * `move`'s hardcoded root-owned backup path (`/var/root/...`) is untouched
+ * by the restore-conflict test (it never reaches that fallback branch when
+ * `destPath` exists), so this is safely testable without root.
+ */
+export function realRehomeOps() {
   return {
     pathExists,
     backup: async (path: string): Promise<{ backupPath: string }> => {
@@ -560,11 +825,38 @@ function realRehomeOps() {
      * custody copy is never left unused when it is the only remaining copy.
      * Reports whether data actually ended up at `sourcePath` -- never
      * assumes success.
+     *
+     * FIX R6 (HIGH, 2026-07-07 fix-round 2): `rename(destPath, sourcePath)`
+     * SILENTLY overwrites a FILE that already exists at `sourcePath` -- if
+     * the operator (or some other process) recreated a file at the original
+     * path while it was re-homed, the prior code clobbered it without
+     * warning and then reported a clean `restored: true`, because
+     * `pathExists(sourcePath)` is trivially true after ANY successful
+     * rename, overwrite or not. (A recreated DIRECTORY at `sourcePath` used
+     * to fail loud via `rename`'s ENOTEMPTY instead of overwriting, which
+     * was an acceptable stopgap; the fix below now handles files AND
+     * directories the same, consistent way instead of relying on that
+     * incidental ENOTEMPTY behavior.) The fix checks `sourcePath` for a
+     * conflict BEFORE the rename and, on conflict, restores to a
+     * `.restored-conflict` sibling path instead of overwriting -- the
+     * operator's recreated data is never destroyed, and the caller can see
+     * from the returned `conflictPath` that this needs manual reconciliation.
      */
-    restore: async (destPath: string, sourcePath: string): Promise<{ restored: boolean }> => {
+    restore: async (destPath: string, sourcePath: string): Promise<{ restored: boolean; conflictPath?: string }> => {
       const destExists = await pathExists(destPath);
       await mkdir(dirname(sourcePath), { recursive: true, mode: 0o700 });
       if (destExists) {
+        const sourceConflict = await pathExists(sourcePath);
+        if (sourceConflict) {
+          // FIX R6: never overwrite operator data that was recreated at the
+          // original path while it was re-homed. Restore the moved data to a
+          // conflict path alongside it instead, and report the conflict
+          // (never a bare "restored: true") so the caller surfaces loud
+          // manual-recovery guidance.
+          const conflictPath = `${sourcePath}.restored-conflict`;
+          await rename(destPath, conflictPath);
+          return { restored: false, conflictPath };
+        }
         await rename(destPath, sourcePath);
         return { restored: await pathExists(sourcePath) };
       }
@@ -573,6 +865,19 @@ function realRehomeOps() {
       const backupRoot = "/var/root/.sanctuary-rehome-backups";
       const backupPath = `${backupRoot}${sourcePath}.bak`;
       if (await pathExists(backupPath)) {
+        const sourceConflict = await pathExists(sourcePath);
+        if (sourceConflict) {
+          // Same conflict guard for the backup-copy fallback: never
+          // overwrite a recreated source with the backup copy either.
+          const conflictPath = `${sourcePath}.restored-conflict`;
+          const st = await stat(backupPath);
+          if (st.isDirectory()) {
+            await cp(backupPath, conflictPath, { recursive: true });
+          } else {
+            await copyFile(backupPath, conflictPath);
+          }
+          return { restored: false, conflictPath };
+        }
         const st = await stat(backupPath);
         if (st.isDirectory()) {
           await cp(backupPath, sourcePath, { recursive: true });

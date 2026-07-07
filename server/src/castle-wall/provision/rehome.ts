@@ -91,8 +91,15 @@ export interface RehomeOps {
    * Returns whether the restore actually reproduced the data at
    * `sourcePath`, so callers never report a false "rolled back" on a
    * restore that quietly no-op'd or partially failed.
+   *
+   * FIX R6 (HIGH, 2026-07-07 fix-round 2): if `sourcePath` was RECREATED
+   * (by the operator or some other process) while the secret was re-homed,
+   * production implementations MUST NOT silently overwrite it -- they must
+   * restore the moved data to a conflict path instead and return
+   * `conflictPath` (with `restored: false`), so the caller reports a
+   * manual-recovery outcome rather than a false clean restore.
    */
-  restore(destPath: string, sourcePath: string): Promise<{ restored: boolean }>;
+  restore(destPath: string, sourcePath: string): Promise<{ restored: boolean; conflictPath?: string }>;
   /**
    * Restore custody of a restored secret path to the operator (fix F3):
    * chmod 0600 (file) / 0700 (dir) and chown back to the operator's
@@ -153,6 +160,29 @@ export interface RehomeStepResult {
 }
 
 /**
+ * FIX R3 (HIGH, 2026-07-07 fix-round 2): thrown by {@link executeRehomePlan}
+ * when a step fails mid-loop, carrying the results ALREADY accumulated for
+ * every step that completed before the failing one. Before this fix, a
+ * mid-loop throw (e.g. `chown` failing on path 3 of 6) discarded the
+ * already-moved entries' results entirely -- the function's local `results`
+ * array simply never returned. The orchestrator's rehome-abort branch then
+ * had an empty `rehomeResults`, so `safeRestore` had nothing to restore and
+ * the already-moved secrets (backed up, but now sitting at `destPath` under
+ * the not-yet-armed new account) were left with no recorded backup path for
+ * the operator to recover from. `partialResults` closes that gap: the
+ * orchestrator (via its caller) can now `safeRestore` exactly what actually
+ * moved, not an empty array.
+ */
+export class RehomeExecutionError extends Error {
+  readonly partialResults: RehomeStepResult[];
+  constructor(message: string, partialResults: RehomeStepResult[], options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "RehomeExecutionError";
+    this.partialResults = partialResults;
+  }
+}
+
+/**
  * Execute a re-home plan against injected ops. Backup-first (fix M4: every
  * secret path is backed up via `ops.backup` -- root-only, reversible --
  * BEFORE it is moved), then move, then chown to the new account. A source
@@ -167,6 +197,13 @@ export interface RehomeStepResult {
  * attempt automatic rollback-on-partial-failure itself; that is the
  * orchestrator's job (fix: never arm a half-configured state), and
  * `unprovisionRestore` below reverses whatever DID complete.
+ *
+ * FIX R3 (HIGH, 2026-07-07 fix-round 2): a mid-loop throw is now caught here
+ * and re-thrown as a {@link RehomeExecutionError} carrying the `results`
+ * accumulated so far, so the caller/orchestrator can `safeRestore` the
+ * partial move instead of losing it to an empty array. The ORIGINAL error's
+ * message is preserved (via `Error.cause` and by folding it into the new
+ * error's own message) so existing failure-reason matching keeps working.
  */
 export async function executeRehomePlan(
   plan: RehomePlan,
@@ -175,29 +212,42 @@ export async function executeRehomePlan(
 ): Promise<RehomeStepResult[]> {
   const results: RehomeStepResult[] = [];
   for (const step of plan.steps) {
-    const exists = await ops.pathExists(step.entry.sourcePath);
-    if (!exists) {
-      results.push({ entry: step.entry, destPath: step.destPath, status: "skipped-absent" });
-      continue;
+    try {
+      const exists = await ops.pathExists(step.entry.sourcePath);
+      if (!exists) {
+        results.push({ entry: step.entry, destPath: step.destPath, status: "skipped-absent" });
+        continue;
+      }
+      let backupPath: string | undefined;
+      if (step.entry.isSecret) {
+        const backup = await ops.backup(step.entry.sourcePath);
+        backupPath = backup.backupPath;
+      }
+      await ops.move(step.entry.sourcePath, step.destPath);
+      await ops.chown(step.destPath, newAccountUidGid.uid, newAccountUidGid.gid);
+      results.push({ entry: step.entry, destPath: step.destPath, status: "moved", backupPath });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new RehomeExecutionError(message, results, { cause: err });
     }
-    let backupPath: string | undefined;
-    if (step.entry.isSecret) {
-      const backup = await ops.backup(step.entry.sourcePath);
-      backupPath = backup.backupPath;
-    }
-    await ops.move(step.entry.sourcePath, step.destPath);
-    await ops.chown(step.destPath, newAccountUidGid.uid, newAccountUidGid.gid);
-    results.push({ entry: step.entry, destPath: step.destPath, status: "moved", backupPath });
   }
   return results;
 }
 
-/** Per-step outcome of {@link restoreRehomeSteps} (fix F2/F5: honest, not a hardcoded success). */
+/**
+ * Per-step outcome of {@link restoreRehomeSteps} (fix F2/F5: honest, not a
+ * hardcoded success). FIX R6 (2026-07-07 fix-round 2): `"conflict"` is a
+ * distinct status from `"failed"` -- it means the source path was RECREATED
+ * while re-homed and the moved data was restored to `conflictPath` instead
+ * of overwriting it, never a bare unexplained failure. `conflictPath` is set
+ * only for this status.
+ */
 export interface RestoreStepOutcome {
   entry: RehomePathEntry;
   sourcePath: string;
-  status: "restored" | "skipped-absent" | "failed";
+  status: "restored" | "skipped-absent" | "failed" | "conflict";
   error?: string;
+  conflictPath?: string;
 }
 
 /** Aggregate result of {@link restoreRehomeSteps}. */
@@ -243,14 +293,31 @@ export async function restoreRehomeSteps(
       continue;
     }
     try {
-      const { restored } = await ops.restore(result.destPath, result.entry.sourcePath);
+      const { restored, conflictPath } = await ops.restore(result.destPath, result.entry.sourcePath);
       if (!restored) {
-        steps.push({
-          entry: result.entry,
-          sourcePath: result.entry.sourcePath,
-          status: "failed",
-          error: "restore reported no data reproduced at the source path",
-        });
+        // FIX R6 (2026-07-07 fix-round 2): a `conflictPath` means the ops
+        // layer detected a recreated file/dir at `sourcePath` and restored
+        // to a sibling conflict path instead of overwriting it -- report
+        // this as its own `"conflict"` status, never folded into the
+        // generic `"failed"` bucket, so the operator sees "your recreated
+        // file is safe, the recovered data is at <conflictPath>" rather than
+        // an unexplained failure.
+        steps.push(
+          conflictPath !== undefined
+            ? {
+                entry: result.entry,
+                sourcePath: result.entry.sourcePath,
+                status: "conflict",
+                conflictPath,
+                error: `source path was recreated during re-home; restored data was placed at ${conflictPath} instead of overwriting it`,
+              }
+            : {
+                entry: result.entry,
+                sourcePath: result.entry.sourcePath,
+                status: "failed",
+                error: "restore reported no data reproduced at the source path",
+              },
+        );
         continue;
       }
       if (result.entry.isSecret) {
@@ -266,7 +333,10 @@ export async function restoreRehomeSteps(
       });
     }
   }
-  const fullyRestored = steps.every((s) => s.status !== "failed");
+  // FIX R6: "conflict" is not a clean restore either -- the operator's
+  // secret is not back at its original path (it is at conflictPath), so
+  // fullyRestored must be false for a conflict just as for a failure.
+  const fullyRestored = steps.every((s) => s.status !== "failed" && s.status !== "conflict");
   return { steps, fullyRestored };
 }
 
