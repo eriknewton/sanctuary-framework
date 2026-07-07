@@ -8,10 +8,22 @@
  *    fleet roster reported by a reachable local daemon, or honest zeros when
  *    unreachable), sign it with the DEFAULT operator identity, and print/write
  *    the signed document.
- *  - `verify <file|-> [--json]`  -  OFFLINE verify: recompute the canonical
- *    signing bytes, check the embedded `public_key` against `signature`, and
- *    report the attested posture. Needs NO custody unlock - the signature is
- *    checkable offline by design.
+ *  - `verify <file|-> [--json] [--operator-key <base64url>|--pin <base64url>]`
+ *    -  OFFLINE verify: recompute the canonical signing bytes and check
+ *    `signature`. Needs NO custody unlock - the signature is checkable
+ *    offline by design.
+ *
+ *    IDENTITY PROVENANCE (the A1 honesty fix, 2026-07-07): a doc signed by
+ *    ANY key is internally self-consistent, so verifying ONLY against the
+ *    document's OWN embedded `public_key` proves nothing about WHO signed
+ *    it - an attacker can sign a fake posture with their OWN key and embed
+ *    it. `verify` therefore prints "VALID signed compliance attestation"
+ *    ONLY when the caller supplies `--operator-key`/`--pin` (an
+ *    independently-known operator public key) AND it matches the embedded
+ *    key AND the signature checks out against that pinned key. Without a
+ *    pin, `verify` prints "well-formed, self-consistent, provenance
+ *    UNVERIFIED" - never "VALID" - because nothing outside the document
+ *    itself was checked.
  *
  * ── THE SINGLE MOST IMPORTANT INVARIANT (see `entitlement/compliance-attestation.ts`) ──
  * The exported document is an OPERATOR SELF-ATTESTATION of this fortress's OWN
@@ -28,6 +40,7 @@
 
 import type { Writable } from "node:stream";
 import { writeFile } from "node:fs/promises";
+import { fromBase64urlStrict } from "../core/encoding.js";
 import {
   buildAttestationBody,
   serializeSignedAttestation,
@@ -42,6 +55,8 @@ import { generateIdentityId } from "../core/identity.js";
 import { resolveEntitlement, type EntitlementClaimsV2 } from "../entitlement/token.js";
 import { readFleetActivation } from "../entitlement/activation.js";
 import { resolveFleetCap } from "../entitlement/fleet-cap.js";
+import { isLicenseRevoked } from "../entitlement/revocation-list.js";
+import { revocationVerifiability } from "../entitlement/revocation-antirollback.js";
 import { openIssuer } from "./custody-unlock.js";
 
 function write(stream: Writable, text: string): void {
@@ -60,23 +75,27 @@ function hasFlag(argv: string[], name: string): boolean {
 /**
  * Best-effort read of the local daemon's `GET /api/fleet/status` for the
  * central-roster posture (node counts, eviction serial, policy-distribution
- * rollup are NOT on that response today - see the honest-zeros note below).
+ * rollup are NOT on that response today - see the honest-`null` note below).
  * Injected as `fetchPosture` so tests never need a real daemon or network.
  *
  * The daemon route is a READ (no operator-bearer gate); it is a CONVENIENCE
  * source for the roster-derived fields, not a trust boundary the attestation
  * relies on for its signature - the signature covers whatever posture this
- * function returns, honest zeros included. Any failure (daemon unreachable,
- * non-200, malformed body) resolves to the honest "roster_unavailable" branch
- * -  never a fabricated count.
+ * function returns, honest `null`s included for anything unmeasured. Any
+ * failure (daemon unreachable, non-200, malformed body) resolves to the
+ * honest "roster_unavailable" branch - never a fabricated count.
  */
 export type PostureFetcher = () => Promise<{
   centralNodesTotal: number;
   admitted: number;
-  revoked: number;
-  untrusted: number;
-  evictionSerial: number;
-  policyDistribution: { inSync: number; drifted: number; unknown: number };
+  /** null = this source does not measure it (the A3 fix: never a stand-in 0). */
+  revoked: number | null;
+  /** null = this source does not measure it (the A3 fix: never a stand-in 0). */
+  untrusted: number | null;
+  /** null = this source does not measure it (the A3 fix: never a stand-in 0). */
+  evictionSerial: number | null;
+  /** null = this source does not measure it - never a zero-filled rollup. */
+  policyDistribution: { inSync: number; drifted: number; unknown: number } | null;
   bannerState: string;
 } | null>;
 
@@ -86,7 +105,7 @@ const DEFAULT_DASHBOARD_URL = "http://127.0.0.1:3502";
  * The DEFAULT posture fetcher: a best-effort unauthenticated GET against the
  * local daemon's read-only fleet-status route. Returns null (never throws) on
  * ANY failure so the caller can fall back to the honest roster-unavailable
- * zeros - a daemon that is down, slow, or returns something unexpected must
+ * branch - a daemon that is down, slow, or returns something unexpected must
  * never block or corrupt an attestation export.
  */
 async function fetchDaemonPosture(
@@ -105,16 +124,19 @@ async function fetchDaemonPosture(
     // The shipped `/api/fleet/status` response does not carry revoked/untrusted
     // counts, the eviction serial, or the policy-distribution rollup (it is a
     // BANNER endpoint, not a full roster dump). Report what it honestly gives
-    // us (admitted count + banner) and honest zeros for the rest rather than
-    // fabricating precision the endpoint does not provide; a future daemon
-    // route (spec §2c) can widen this without changing the attestation shape.
+    // us (admitted count + banner) and an explicit `null` (NOT a zero) for the
+    // rest, so a reader can distinguish "measured zero" from "never measured"
+    // (the A3 fix - do NOT fabricate precision the endpoint does not provide).
+    // A future daemon route (spec §2c) can widen this by wiring the real
+    // `buildFleetRoster` rollup without changing the attestation shape (that
+    // richer wiring is a flagged follow-up, not required for this fix).
     return {
       centralNodesTotal: admitted,
       admitted,
-      revoked: 0,
-      untrusted: 0,
-      evictionSerial: 0,
-      policyDistribution: { inSync: 0, drifted: 0, unknown: 0 },
+      revoked: null,
+      untrusted: null,
+      evictionSerial: null,
+      policyDistribution: null,
       bannerState,
     };
   } catch {
@@ -216,26 +238,63 @@ async function runExport(
         now,
       });
     }
+    // ── Revocation-aware resolution (the A2 fix). A license can be VALID by
+    // its own token claims (in-window, well-signed) yet have been REVOKED by
+    // the issuer afterward (refund, compromise, kill) - the revocation rail
+    // is a SEPARATE signed record `resolveEntitlement` never consults. This
+    // mirrors the SAME fail-closed logic `runFleetReResolve` uses (re-
+    // resolve.ts) so export can never sign a REVOKED-but-in-window license as
+    // "active": consult the single {@link revocationVerifiability} chokepoint
+    // (present-clean / absent / CORRUPT-or-unverifiable) and, on a clean
+    // list, {@link isLicenseRevoked} for this specific license id. Any of
+    // "revoked" OR "the revocation list itself is unverifiable" forces the
+    // resolution to community/revoked - this is READ-ONLY (no write, no log
+    // append, no wall/enforcement touch): export never mutates fleet state.
+    const licenseIdForRevocationCheck =
+      typeof resolution.licenseId === "string" ? resolution.licenseId : null;
+    const verifiability = await revocationVerifiability(issuer.storage, issuer.masterKey);
+    let revoked = false;
+    if (verifiability.status === "clean") {
+      const status = await isLicenseRevoked(
+        issuer.storage,
+        issuer.masterKey,
+        licenseIdForRevocationCheck,
+      );
+      revoked = status.revoked;
+    }
+    const revocationListUnverifiable = verifiability.status === "unverifiable";
+    const effectiveResolution =
+      resolution.granted && (revoked || revocationListUnverifiable)
+        ? resolveEntitlement({ token: undefined, issuerPublicKey: issuer.issuerPublicKey, now })
+        : resolution;
+    const effectiveClaims =
+      resolution.granted && (revoked || revocationListUnverifiable) ? null : claims;
+
     const grandfatheredBaseline =
       record.status === "valid" ? record.data.grandfatheredBaseline : 0;
     const cap = resolveFleetCap(
       {
-        granted: resolution.granted,
-        tier: resolution.tier,
-        ...(resolution.entitledCount !== undefined
-          ? { entitledCount: resolution.entitledCount }
+        granted: effectiveResolution.granted,
+        tier: effectiveResolution.tier,
+        ...(effectiveResolution.entitledCount !== undefined
+          ? { entitledCount: effectiveResolution.entitledCount }
           : {}),
-        ...(resolution.pricingUnit !== undefined
-          ? { pricingUnit: resolution.pricingUnit }
+        ...(effectiveResolution.pricingUnit !== undefined
+          ? { pricingUnit: effectiveResolution.pricingUnit }
           : {}),
-        ...(resolution.graceActive !== undefined
-          ? { graceActive: resolution.graceActive }
+        ...(effectiveResolution.graceActive !== undefined
+          ? { graceActive: effectiveResolution.graceActive }
           : {}),
-        ...(resolution.reason !== undefined ? { reason: resolution.reason } : {}),
+        ...(effectiveResolution.reason !== undefined
+          ? { reason: effectiveResolution.reason }
+          : {}),
       },
       grandfatheredBaseline,
     );
-    const licenseView = buildLicenseView({ resolution, claims });
+    const licenseView = buildLicenseView({
+      resolution: effectiveResolution,
+      claims: effectiveClaims,
+    });
 
     let roster: Awaited<ReturnType<PostureFetcher>>;
     try {
@@ -259,14 +318,18 @@ async function runExport(
           bannerState: roster.bannerState,
         }
       : {
+          // No posture source reachable at all: centralNodesTotal/admitted
+          // are honestly 0 (a MEASURED fact - no roster was found), but
+          // revoked/untrusted/evictionSerial/policyDistribution are `null`
+          // (NOT measured-zero, the A3 fix) because nothing was checked.
           centralNodesTotal: 0,
           admitted: 0,
-          revoked: 0,
-          untrusted: 0,
+          revoked: null,
+          untrusted: null,
           maxNodes: cap.maxNodes,
           overCap: false,
-          evictionSerial: 0,
-          policyDistribution: { inSync: 0, drifted: 0, unknown: 0 },
+          evictionSerial: null,
+          policyDistribution: null,
           bannerState: "roster_unavailable",
         };
 
@@ -314,6 +377,28 @@ async function runVerify(
     return 1;
   }
 
+  // The independently-pinned operator public key (A1 fix): supplied by the
+  // caller from OUTSIDE this document (their own record of the operator's
+  // identity), never read from the document itself. Absent this flag, verify
+  // can only prove self-consistency, never identity provenance.
+  const pinRaw = flagValue(argv, "--operator-key") ?? flagValue(argv, "--pin");
+  let pinnedOperatorKey: Uint8Array | undefined;
+  if (pinRaw !== undefined) {
+    try {
+      pinnedOperatorKey = fromBase64urlStrict(pinRaw);
+    } catch {
+      write(err, "attest verify: --operator-key/--pin is not valid base64url\n");
+      return 1;
+    }
+    if (pinnedOperatorKey.length !== 32) {
+      write(
+        err,
+        "attest verify: --operator-key/--pin must decode to a 32-byte Ed25519 public key\n",
+      );
+      return 1;
+    }
+  }
+
   let raw: string;
   try {
     if (target === "-") {
@@ -335,7 +420,10 @@ async function runVerify(
     return 1;
   }
 
-  const result = verifySignedAttestation(parsed);
+  const result = verifySignedAttestation(
+    parsed,
+    pinnedOperatorKey !== undefined ? { pinnedOperatorKey } : undefined,
+  );
   if (!result.ok) {
     if (asJson) {
       write(out, JSON.stringify({ ok: false, reason: result.reason }, null, 2) + "\n");
@@ -348,17 +436,41 @@ async function runVerify(
   if (asJson) {
     write(
       out,
-      JSON.stringify({ ok: true, attestation: result.attestation }, null, 2) + "\n",
+      JSON.stringify(
+        { ok: true, provenance: result.provenance, attestation: result.attestation },
+        null,
+        2,
+      ) + "\n",
     );
-  } else {
+  } else if (result.provenance === "verified") {
+    // ONLY this branch (pinned key matched + signature verified against it)
+    // may say "VALID": identity provenance was actually established against a
+    // key the caller trusts from outside the document.
     write(out, "VALID signed compliance attestation.\n");
     write(
       out,
-      "NOTE: this proves the document is self-consistent (unaltered since " +
-        "signing) and was signed by the holder of the embedded public key. It " +
-        "does NOT by itself prove that key belongs to a specific operator - " +
-        "pin `public_key` against the operator's independently known identity " +
-        "to establish that.\n\n",
+      "Provenance VERIFIED: the signature checks out against the operator " +
+        "key you pinned with --operator-key/--pin.\n\n",
+    );
+    write(out, `${JSON.stringify(result.attestation, null, 2)}\n`);
+  } else {
+    // No pinned key was supplied: the document is well-formed and internally
+    // consistent (unaltered since signing) but nothing outside the document
+    // was checked - a doc signed by ANY key, including an attacker's own,
+    // reaches this branch identically. NEVER print "VALID" here.
+    write(
+      out,
+      "well-formed, self-consistent, provenance UNVERIFIED (pin the operator " +
+        "key with --operator-key/--pin to verify provenance).\n",
+    );
+    write(
+      out,
+      "NOTE: this proves the document is unaltered since signing and was " +
+        "signed by the holder of the embedded public key. It does NOT prove " +
+        "that key belongs to a specific operator - a doc signed by ANY key " +
+        "(including an attacker's own) reaches this same result. Pin the " +
+        "operator's independently known public key with --operator-key/--pin " +
+        "to establish provenance.\n\n",
     );
     write(out, `${JSON.stringify(result.attestation, null, 2)}\n`);
   }
@@ -372,12 +484,18 @@ ${CLAIMS_SCOPE_DISCLAIMER}
 Usage:
   sanctuary fleet attest export [--json] [--fortress <path>] [--out <file>] \\
       [--dashboard-url <url>]
-  sanctuary fleet attest verify <file|-> [--json]
+  sanctuary fleet attest verify <file|-> [--json] \\
+      [--operator-key <base64url>|--pin <base64url>]
 
 Custody (export only): set SANCTUARY_PASSPHRASE or --passphrase (or
 SANCTUARY_RECOVERY_KEY). export signs with the DEFAULT operator identity, the
 SAME key 'sanctuary license issue' signs licenses with. verify is OFFLINE and
 needs no custody unlock.
+
+verify prints "VALID" ONLY when --operator-key/--pin (an independently known
+operator public key) is supplied and matches the document. Without a pin,
+verify prints "well-formed, self-consistent, provenance UNVERIFIED" - a doc
+signed by ANY key looks identical without a pin, so this is never "VALID".
 `;
 
 async function runAttestCommand(

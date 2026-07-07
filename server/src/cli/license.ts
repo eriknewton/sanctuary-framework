@@ -212,6 +212,7 @@ async function runIssue(
       ...(flags.passphrase !== undefined ? { passphrase: flags.passphrase } : {}),
       ...(flags.recoveryKey !== undefined ? { recoveryKey: flags.recoveryKey } : {}),
       ...(flags.fortressPath !== undefined ? { fortressPath: flags.fortressPath } : {}),
+      operationLabel: "license issuance",
     });
   } catch (e) {
     write(err, `issue: ${(e as Error).message}\n`);
@@ -370,6 +371,7 @@ async function runList(
         ...(passphrase !== undefined ? { passphrase } : {}),
         ...(recoveryKey !== undefined ? { recoveryKey } : {}),
         ...(fortress !== undefined ? { fortressPath: fortress } : {}),
+        operationLabel: "license issuance",
       });
     } catch (e) {
       write(err, `list: ${(e as Error).message}\n`);
@@ -509,6 +511,7 @@ async function runRevoke(
       ...(passphrase !== undefined ? { passphrase } : {}),
       ...(recoveryKey !== undefined ? { recoveryKey } : {}),
       ...(fortressPath !== undefined ? { fortressPath } : {}),
+      operationLabel: "license issuance",
     });
   } catch (e) {
     write(err, `revoke: ${(e as Error).message}\n`);

@@ -17,6 +17,17 @@
  *
  * Fail-closed (throws) on: no fortress unlockable, no DEFAULT operator
  * identity, malformed identity public key.
+ *
+ * ── A4 fix (2026-07-07): operation-label parity ─────────────────────────────
+ * The pre-extraction `license.ts` unlock said "license issuance requires a
+ * default operator identity..." on a no-identity fortress. This module is now
+ * shared by a SECOND caller (`fleet attest export`) that is not issuing a
+ * license, so the message needed a caller-supplied noun phrase rather than a
+ * hardcoded "license issuance." `opts.operationLabel` (default: "this
+ * operation") lets each caller supply its own phrase; `license.ts` passes
+ * "license issuance" so its existing callers (`issue`/`revoke`/verified
+ * `list`) see the EXACT original wording, byte-for-byte, while `fleet.ts`
+ * gets a generic phrase appropriate to `attest export`.
  */
 
 import { mkdir } from "node:fs/promises";
@@ -43,6 +54,10 @@ export async function openVerifier(opts: {
   passphrase?: string;
   recoveryKey?: string;
   fortressPath?: string;
+  /** Noun phrase describing the calling operation, used ONLY in the
+   * no-default-identity error message (e.g. "license issuance"). Defaults to
+   * the generic "this operation" (see the A4 fix note above). */
+  operationLabel?: string;
 }): Promise<{
   issuerId: string;
   issuerPublicKey: Uint8Array;
@@ -74,6 +89,7 @@ export async function openVerifier(opts: {
     storagePathHint: config.storage_path,
   });
 
+  const operationLabel = opts.operationLabel ?? "this operation";
   const identityManager = new IdentityManager(storage, masterKey);
   const loadResult = await identityManager.load();
   if (loadResult.loaded === 0) {
@@ -81,7 +97,7 @@ export async function openVerifier(opts: {
     throw new Error(
       loadResult.total > 0
         ? "operator identity files found but none could be decrypted (wrong passphrase?)"
-        : "no operator identity in this fortress: this operation requires a " +
+        : `no operator identity in this fortress: ${operationLabel} requires a ` +
           "default operator identity (run `sanctuary identity create`, or " +
           "re-run `sanctuary init` without --no-identity)",
     );
@@ -120,6 +136,8 @@ export async function openIssuer(opts: {
   passphrase?: string;
   recoveryKey?: string;
   fortressPath?: string;
+  /** See {@link openVerifier}'s `operationLabel` (the A4 fix). */
+  operationLabel?: string;
 }): Promise<{
   sign: IssuerSigner;
   issuerId: string;

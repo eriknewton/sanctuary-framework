@@ -262,7 +262,10 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
     expect(out.text).not.toMatch(/passphrase/i);
     expect(out.text).not.toMatch(/recovery/i);
 
-    // Independent OFFLINE verify of the printed document (no custody).
+    // Independent OFFLINE verify of the printed document (no custody, no
+    // pinned key). The A1 fix: without --operator-key/--pin, verify proves
+    // self-consistency ONLY and must NEVER print "VALID" - a doc signed by
+    // ANY key (including an attacker's own) looks identical here.
     const tmpFile = join(tmp, "attestation.json");
     await writeFile(tmpFile, out.text, "utf8");
     const verifyOut = new StringWritable();
@@ -274,7 +277,65 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
       env: {},
     });
     expect(verifyCode).toBe(0);
-    expect(verifyOut.text).toContain("VALID");
+    expect(verifyOut.text).not.toContain("VALID");
+    expect(verifyOut.text).toMatch(/self-consistent/i);
+    expect(verifyOut.text).toMatch(/provenance UNVERIFIED/i);
+
+    // Pinning the ACTUAL operator's public key (embedded in the just-printed
+    // document, standing in for an independently-known identity) makes
+    // verify report "VALID".
+    const pinnedKey = doc.public_key;
+    const pinnedOut = new StringWritable();
+    const pinnedCode = await runFleetCommand({
+      argv: ["attest", "verify", tmpFile, "--operator-key", pinnedKey],
+      out: pinnedOut,
+      err: new StringWritable(),
+      env: {},
+    });
+    expect(pinnedCode).toBe(0);
+    expect(pinnedOut.text).toContain("VALID");
+  });
+
+  it("A4 companion test: export on a NO-IDENTITY fortress gets the GENERIC operation-label message, distinct from license's exact wording", async () => {
+    // Confirms the A4 fix's other half: `fleet attest export` is a NEW caller
+    // of the shared custody-unlock helper, so it must NOT inherit `license
+    // issue`'s exact original wording ("license issuance requires...") -
+    // it gets the generic default ("this operation requires...").
+    const fortressPath = join(tmp, "f-no-identity");
+    const result = await (
+      await import("../../src/wrap/init.js")
+    ).runInit(
+      { fortress: fortressPath, noConfirm: true, noPin: true, noIdentity: true },
+      {
+        recoveryKeychain: {
+          home: "/tmp/sanctuary-test-home",
+          platformOverride: "darwin",
+          exec: makeRecoveryKeychainMock().exec,
+        },
+      },
+    );
+    const recoveryFile = await readFile(result.recoveryKeyDisclosurePath, "utf-8");
+    const recoveryKey = extractRecoveryKey(recoveryFile);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+
+    const out = new StringWritable();
+    const err = new StringWritable();
+    const code = await runFleetCommand({
+      argv: ["attest", "export", "--fortress", fortressPath],
+      out,
+      err,
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      fetchPosture: NO_DAEMON,
+    });
+    expect(code).toBe(1);
+    expect(out.text).toBe("");
+    expect(err.text).toBe(
+      "attest export: no operator identity in this fortress: this operation " +
+        "requires a default operator identity (run `sanctuary identity " +
+        "create`, or re-run `sanctuary init` without --no-identity)\n",
+    );
+    // Never the license CLI's exact wording - the two callers must diverge.
+    expect(err.text).not.toContain("license issuance requires");
   });
 
   it("export on a fortress with an ACTIVE license attests the paid tier + entitled nodes", async () => {
@@ -359,6 +420,131 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
     expect(doc.attestation.license.features).toEqual(["policy-dist", "roster"]);
   });
 
+  it("THE CORE A2 REGRESSION TEST: export never attests a REVOKED in-window license as 'active' - it attests community", async () => {
+    // Before the fix, `attest export` called resolveEntitlement/resolveFleetCap
+    // directly and never consulted the revocation rail, so a paid, in-window,
+    // well-signed license that had been REVOKED (refund/compromise/kill) still
+    // attested "active" - a signed FALSE compliance claim. This drives a real
+    // revoke-push through the shipped `federation revoke-push` CLI (the same
+    // operator identity signs the revocation list) and asserts export now
+    // reports community/revoked, never active.
+    const fortressPath = join(tmp, "f-revoked");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+    const env = { SANCTUARY_RECOVERY_KEY: recoveryKey };
+
+    const issueOut = new StringWritable();
+    const issueCode = await runLicenseCommand({
+      argv: [
+        "issue", "--fortress", fortressPath, "--tier", "fleet",
+        "--subject", "doomed-fleet", "--nodes", "25", "--expires", FUTURE,
+        "--features", "roster,policy-dist",
+      ],
+      out: issueOut,
+      err: new StringWritable(),
+      env,
+    });
+    expect(issueCode).toBe(0);
+    const licenseToken = issueOut.text.trim();
+
+    // The license id is public (embedded in the token's own claims, the same
+    // artifact the operator pastes into Activate) - decode it to revoke it.
+    const decodedTokenJson = Buffer.from(
+      licenseToken.replace(/-/g, "+").replace(/_/g, "/"),
+      "base64",
+    ).toString("utf8");
+    const decodedToken = JSON.parse(decodedTokenJson) as {
+      claims: { licenseId: string };
+    };
+    const licenseId = decodedToken.claims.licenseId;
+    expect(typeof licenseId).toBe("string");
+
+    // Activate it (mirrors the operator pasting the license into the console).
+    const { activateFleet } = await import("../../src/entitlement/activation.js");
+    const { FilesystemStorage } = await import("../../src/storage/filesystem.js");
+    const { resolveCliMasterKey } = await import("../../src/core/master-custody.js");
+    const { IdentityManager } = await import("../../src/cognitive/tools.js");
+
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveCliMasterKey(storage, {
+      recoveryKey,
+      storagePathHint: fortressPath,
+    });
+    try {
+      const idMgr = new IdentityManager(storage, masterKey);
+      await idMgr.load();
+      const identity = idMgr.getDefault();
+      if (!identity) throw new Error("no default identity");
+      const b64 = identity.public_key.replace(/-/g, "+").replace(/_/g, "/");
+      const issuerPublicKey = new Uint8Array(Buffer.from(b64, "base64"));
+
+      const activateResult = await activateFleet({
+        storage,
+        master: masterKey,
+        pastedLicense: licenseToken,
+        issuerPublicKey,
+        now: Math.floor(Date.now() / 1000),
+      });
+      expect(activateResult.ok).toBe(true);
+    } finally {
+      masterKey.fill(0);
+    }
+
+    // BEFORE revocation: export attests this license as active (sanity, mirrors
+    // the prior test).
+    const preRevokeOut = new StringWritable();
+    const preRevokeCode = await runFleetCommand({
+      argv: ["attest", "export", "--fortress", fortressPath],
+      out: preRevokeOut,
+      err: new StringWritable(),
+      env,
+      fetchPosture: NO_DAEMON,
+    });
+    expect(preRevokeCode).toBe(0);
+    const preRevokeDoc = JSON.parse(preRevokeOut.text) as {
+      attestation: { license: { status: string; tier: string } };
+    };
+    expect(preRevokeDoc.attestation.license.status).toBe("active");
+
+    // Push a signed revocation list naming this license id (the SAME operator
+    // identity signs it, via the shipped `federation revoke-push` CLI).
+    const { runFederationCommand } = await import("../../src/cli/federation.js");
+    const revokeCode = await runFederationCommand({
+      argv: [
+        "revoke-push", "--fortress", fortressPath,
+        "--version", "1",
+        "--license-id", licenseId,
+      ],
+      out: new StringWritable(),
+      err: new StringWritable(),
+      env,
+    });
+    expect(revokeCode).toBe(0);
+
+    // AFTER revocation: export must NEVER attest this as active - it must
+    // fall back to community/revoked, the fail-closed direction the re-resolve
+    // rail already enforces (this closes the SAME gap for export).
+    const postRevokeOut = new StringWritable();
+    const postRevokeErr = new StringWritable();
+    const postRevokeCode = await runFleetCommand({
+      argv: ["attest", "export", "--fortress", fortressPath],
+      out: postRevokeOut,
+      err: postRevokeErr,
+      env,
+      fetchPosture: NO_DAEMON,
+    });
+    expect(postRevokeCode).toBe(0);
+    expect(postRevokeErr.text).toBe("");
+    const postRevokeDoc = JSON.parse(postRevokeOut.text) as {
+      attestation: {
+        license: { status: string; tier: string; license_id: string | null };
+      };
+    };
+    expect(postRevokeDoc.attestation.license.status).not.toBe("active");
+    expect(postRevokeDoc.attestation.license.status).toBe("community");
+    expect(postRevokeDoc.attestation.license.tier).toBe("community");
+  });
+
   it("verify on a TAMPERED document exits non-zero", async () => {
     const fortressPath = join(tmp, "f3");
     const recoveryKey = await seedFortressWithIdentity(fortressPath);
@@ -418,7 +604,10 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
       stdin,
     });
     expect(verifyCode).toBe(0);
-    expect(verifyOut.text).toContain("VALID");
+    // No --operator-key/--pin supplied here: the A1 fix means this is NEVER
+    // "VALID" (self-consistency only, provenance unverified).
+    expect(verifyOut.text).not.toContain("VALID");
+    expect(verifyOut.text).toMatch(/self-consistent/i);
   });
 
   it("export --out writes the document to a file in addition to stdout", async () => {
@@ -465,7 +654,73 @@ describe("sanctuary fleet attest - end-to-end (keychain-free fortress)", () => {
       env: {},
     });
     expect(verifyCode).toBe(0);
-    const parsed = JSON.parse(verifyOut.text) as { ok: boolean };
+    const parsed = JSON.parse(verifyOut.text) as { ok: boolean; provenance?: string };
     expect(parsed.ok).toBe(true);
+    // No --operator-key/--pin: JSON mode must also report the honest
+    // provenance level rather than silently implying identity was checked.
+    expect(parsed.provenance).toBe("self_consistent");
+  });
+
+  it("verify --json --operator-key reports provenance 'verified' when the pinned key matches", async () => {
+    const fortressPath = join(tmp, "f7");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+
+    const out = new StringWritable();
+    await runFleetCommand({
+      argv: ["attest", "export", "--fortress", fortressPath],
+      out,
+      err: new StringWritable(),
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      fetchPosture: NO_DAEMON,
+    });
+    const doc = JSON.parse(out.text) as { public_key: string };
+    const tmpFile = join(tmp, "doc.json");
+    await writeFile(tmpFile, out.text, "utf8");
+
+    const verifyOut = new StringWritable();
+    const verifyCode = await runFleetCommand({
+      argv: ["attest", "verify", tmpFile, "--json", "--operator-key", doc.public_key],
+      out: verifyOut,
+      err: new StringWritable(),
+      env: {},
+    });
+    expect(verifyCode).toBe(0);
+    const parsed = JSON.parse(verifyOut.text) as { ok: boolean; provenance?: string };
+    expect(parsed.ok).toBe(true);
+    expect(parsed.provenance).toBe("verified");
+  });
+
+  it("verify --operator-key with a key that does NOT match the document fails, never reports VALID (the A1 regression test)", async () => {
+    const fortressPath = join(tmp, "f8");
+    const recoveryKey = await seedFortressWithIdentity(fortressPath);
+    delete process.env.SANCTUARY_STORAGE_PATH;
+
+    const out = new StringWritable();
+    await runFleetCommand({
+      argv: ["attest", "export", "--fortress", fortressPath],
+      out,
+      err: new StringWritable(),
+      env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      fetchPosture: NO_DAEMON,
+    });
+    const tmpFile = join(tmp, "doc.json");
+    await writeFile(tmpFile, out.text, "utf8");
+
+    // An UNRELATED public key (not the operator's) - simulates a caller who
+    // pinned the wrong identity, or an attacker's document signed with a
+    // key that isn't the pinned/known operator key.
+    const wrongKey = "A".repeat(43); // 32 zero-ish bytes, base64url, wrong on purpose
+    const verifyOut = new StringWritable();
+    const verifyErr = new StringWritable();
+    const verifyCode = await runFleetCommand({
+      argv: ["attest", "verify", tmpFile, "--operator-key", wrongKey],
+      out: verifyOut,
+      err: verifyErr,
+      env: {},
+    });
+    expect(verifyCode).not.toBe(0);
+    expect(verifyOut.text).not.toContain("VALID");
+    expect(verifyErr.text).toMatch(/FAILED|operator_key_mismatch/);
   });
 });

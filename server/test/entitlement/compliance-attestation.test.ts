@@ -192,6 +192,109 @@ describe("buildAttestationBody - branch mapping", () => {
   });
 });
 
+describe("unmeasured posture fields (the A3 fix): null != measured-zero", () => {
+  it("a posture source that does not measure revoked/untrusted/evictionSerial/policyDistribution signs explicit nulls, never a fabricated zero", () => {
+    // This is the SHAPE the daemon's banner-only `/api/fleet/status` source
+    // produces today: it measures admitted/centralNodesTotal but does NOT
+    // measure revoked, untrusted, the eviction serial, or the
+    // policy-distribution rollup. Before the fix these were zero-filled,
+    // which reads as "measured, and the true count is zero" - a real fleet
+    // with actual drift/revocations would sign a FALSE "no drift, none
+    // revoked" claim. After the fix they must be `null`.
+    const unmeasuredPosture: AttestationPostureView = {
+      centralNodesTotal: 10,
+      admitted: 10,
+      revoked: null,
+      untrusted: null,
+      maxNodes: 25,
+      overCap: false,
+      evictionSerial: null,
+      policyDistribution: null,
+      bannerState: "ok",
+    };
+    const body = buildAttestationBody(inputs({ posture: unmeasuredPosture }));
+
+    expect(body.posture.revoked).toBeNull();
+    expect(body.posture.untrusted).toBeNull();
+    expect(body.posture.eviction_serial).toBeNull();
+    expect(body.posture.policy_distribution).toBeNull();
+
+    // Never a zero standing in for "unavailable": null is strictly typeof
+    // "object" for policy_distribution and the other fields are `null`, not
+    // `0` - a naive `!field` truthiness check would conflate them, but an
+    // explicit `field === null` check (what an honest reader must do) does
+    // NOT collapse into "the count is zero."
+    expect(body.posture.revoked).not.toBe(0);
+    expect(body.posture.untrusted).not.toBe(0);
+    expect(body.posture.eviction_serial).not.toBe(0);
+  });
+
+  it("distinguishes an EXPLICITLY-measured zero from an unmeasured null on the SAME document shape", () => {
+    // A fleet that genuinely has zero revocations (measured, verified) must
+    // still be able to say so - `0` remains a legitimate, honest value when
+    // the source DOES measure it. The two bodies below must NOT be equal.
+    const measuredZeroPosture: AttestationPostureView = {
+      ...BASE_POSTURE,
+      revoked: 0,
+      untrusted: 0,
+      evictionSerial: 0,
+      policyDistribution: { inSync: 5, drifted: 0, unknown: 0 },
+    };
+    const unmeasuredPosture: AttestationPostureView = {
+      ...BASE_POSTURE,
+      revoked: null,
+      untrusted: null,
+      evictionSerial: null,
+      policyDistribution: null,
+    };
+    const measuredBody = buildAttestationBody(inputs({ posture: measuredZeroPosture }));
+    const unmeasuredBody = buildAttestationBody(inputs({ posture: unmeasuredPosture }));
+
+    expect(measuredBody.posture.revoked).toBe(0);
+    expect(unmeasuredBody.posture.revoked).toBeNull();
+    expect(measuredBody.posture).not.toEqual(unmeasuredBody.posture);
+  });
+
+  it("a roster-unavailable posture with unmeasured fields still carries a non-empty claims_scope", () => {
+    const unavailablePosture: AttestationPostureView = {
+      centralNodesTotal: 0,
+      admitted: 0,
+      revoked: null,
+      untrusted: null,
+      maxNodes: null,
+      overCap: false,
+      evictionSerial: null,
+      policyDistribution: null,
+      bannerState: "roster_unavailable",
+    };
+    const body = buildAttestationBody(inputs({ posture: unavailablePosture }));
+    expect(body.posture.revoked).toBeNull();
+    expect(body.posture.policy_distribution).toBeNull();
+    expect(body.claims_scope.length).toBeGreaterThan(0);
+  });
+
+  it("a signed document with unmeasured (null) posture fields still round-trips through sign+verify", () => {
+    const { sign, publicKey } = inMemorySigner();
+    const unmeasuredPosture: AttestationPostureView = {
+      ...BASE_POSTURE,
+      revoked: null,
+      untrusted: null,
+      evictionSerial: null,
+      policyDistribution: null,
+    };
+    const body = buildAttestationBody(
+      inputs({ license: ACTIVE_LICENSE, posture: unmeasuredPosture }),
+    );
+    const doc = serializeSignedAttestation(body, sign, publicKey);
+    const result = verifySignedAttestation(doc, { pinnedOperatorKey: publicKey });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.attestation.posture.revoked).toBeNull();
+      expect(result.attestation.posture.policy_distribution).toBeNull();
+    }
+  });
+});
+
 describe("overclaim guard (BLOCKER if this fails)", () => {
   // Phrases that would constitute an OVERCLAIM if present as a bare positive
   // assertion (not preceded by a negation like "NOT" / "never"). We assert
@@ -250,7 +353,7 @@ function inMemorySigner(): { sign: AttestationSigner; publicKey: Uint8Array } {
 }
 
 describe("sign + verify round-trip (fresh in-memory identity, no custody)", () => {
-  it("a signed document verifies ok:true and echoes the attested body", () => {
+  it("a signed document verifies ok:true and echoes the attested body (unpinned = self_consistent)", () => {
     const { sign, publicKey } = inMemorySigner();
     const body = buildAttestationBody(inputs({ license: ACTIVE_LICENSE }));
     const doc = serializeSignedAttestation(body, sign, publicKey);
@@ -260,6 +363,9 @@ describe("sign + verify round-trip (fresh in-memory identity, no custody)", () =
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.attestation).toEqual(body);
+      // A1: without a pinned key, verify proves self-consistency ONLY, never
+      // identity provenance - this is NOT a "VALID" result at the CLI layer.
+      expect(result.provenance).toBe("self_consistent");
     }
   });
 
@@ -324,6 +430,96 @@ describe("sign + verify round-trip (fresh in-memory identity, no custody)", () =
     expect(serialized).not.toMatch(/encrypted_private_key/i);
     expect(serialized).not.toMatch(/passphrase/i);
     expect(serialized).not.toMatch(/recovery/i);
+  });
+});
+
+describe("verifySignedAttestation - pinned operator key (the A1 fix)", () => {
+  it("a doc signed by the PINNED key verifies ok:true with provenance 'verified'", () => {
+    const { sign, publicKey } = inMemorySigner();
+    const body = buildAttestationBody(inputs({ license: ACTIVE_LICENSE }));
+    const doc = serializeSignedAttestation(body, sign, publicKey);
+
+    const result = verifySignedAttestation(doc, { pinnedOperatorKey: publicKey });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.provenance).toBe("verified");
+      expect(result.attestation).toEqual(body);
+    }
+  });
+
+  it("THE CORE A1 REGRESSION TEST: a doc signed by a NON-pinned (attacker's own) key is NEVER reported ok/VALID", () => {
+    // The exact attack the gate flagged: an attacker signs a FAKE posture
+    // with THEIR OWN key and embeds that key in the document. Before the
+    // fix, `verifySignedAttestation` only checked the signature against the
+    // document's OWN embedded key, so this would report `ok: true`. With an
+    // operator key pinned from OUTSIDE the document, it must now fail.
+    const operator = inMemorySigner();
+    const attacker = inMemorySigner();
+    const fakePosture: AttestationPostureView = {
+      ...BASE_POSTURE,
+      revoked: 0,
+      untrusted: 0,
+      bannerState: "ok",
+    };
+    const attackerBody = buildAttestationBody(
+      inputs({ license: ACTIVE_LICENSE, posture: fakePosture }),
+    );
+    // Attacker signs with their OWN key and embeds their OWN public key -
+    // exactly what `serializeSignedAttestation` does for a legitimate
+    // operator, so the resulting document is fully self-consistent.
+    const attackerDoc = serializeSignedAttestation(
+      attackerBody,
+      attacker.sign,
+      attacker.publicKey,
+    );
+
+    // The verifier pins the REAL operator's key (known independently, e.g.
+    // from the fortress record) - NOT the attacker's embedded key.
+    const result = verifySignedAttestation(attackerDoc, {
+      pinnedOperatorKey: operator.publicKey,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("operator_key_mismatch");
+    }
+
+    // Sanity: the SAME document, unpinned, still "verifies" as self-consistent
+    // (proves the fix does not break the existing self-consistency check) -
+    // but that branch reports `self_consistent`, never `verified`, so a CLI
+    // that gates "VALID" on `provenance === "verified"` never overclaims.
+    const unpinned = verifySignedAttestation(attackerDoc);
+    expect(unpinned.ok).toBe(true);
+    if (unpinned.ok) {
+      expect(unpinned.provenance).toBe("self_consistent");
+    }
+  });
+
+  it("a pinned key that does not match the embedded key fails BEFORE the crypto check (mismatch, not signature_invalid)", () => {
+    const signerA = inMemorySigner();
+    const signerB = inMemorySigner();
+    const body = buildAttestationBody(inputs({ license: ACTIVE_LICENSE }));
+    const doc = serializeSignedAttestation(body, signerA.sign, signerA.publicKey);
+
+    const result = verifySignedAttestation(doc, { pinnedOperatorKey: signerB.publicKey });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("operator_key_mismatch");
+    }
+  });
+
+  it("a wrong-length pinned key fails as a mismatch, never throws", () => {
+    const { sign, publicKey } = inMemorySigner();
+    const body = buildAttestationBody(inputs({ license: ACTIVE_LICENSE }));
+    const doc = serializeSignedAttestation(body, sign, publicKey);
+
+    expect(() =>
+      verifySignedAttestation(doc, { pinnedOperatorKey: new Uint8Array(16) }),
+    ).not.toThrow();
+    const result = verifySignedAttestation(doc, { pinnedOperatorKey: new Uint8Array(16) });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe("operator_key_mismatch");
+    }
   });
 });
 

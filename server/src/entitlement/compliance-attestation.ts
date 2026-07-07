@@ -35,12 +35,16 @@
  * plus the embedded PUBLIC key (never private material, AGENTS.md #6).
  *
  * `verifySignedAttestation` is PURE (no I/O, no custody): it recomputes the
- * canonical bytes and checks the embedded public key against the embedded
- * signature. This proves SELF-CONSISTENCY (the document was not altered after
- * signing) - it does NOT prove WHO the operator is. A verifier that cares about
- * identity provenance must independently pin the operator's public key and
- * compare it to the embedded one; `verifySignedAttestation`'s reason strings
- * and the CLI `verify` output say this explicitly.
+ * canonical bytes and checks the signature. Given an independently-pinned
+ * operator public key (`opts.pinnedOperatorKey`), it ALSO requires the
+ * embedded `doc.public_key` to equal the pinned key before verifying the
+ * signature against it, reporting `provenance: "verified"` - this is the ONLY
+ * result the CLI may call "VALID" (AGENTS.md honesty invariant, A1 fix
+ * 2026-07-07). Without a pinned key it falls back to checking the signature
+ * against the document's OWN embedded key, proving SELF-CONSISTENCY only (the
+ * document was not altered after signing) - it does NOT prove WHO the
+ * operator is, and `provenance: "self_consistent"` says so explicitly so no
+ * caller can print "VALID" for a doc signed by an unpinned, unknown key.
  */
 
 import { canonicalJson } from "../audit/chain.js";
@@ -93,26 +97,48 @@ export interface AttestationLicenseView {
   status: AttestationLicenseStatus;
 }
 
-/** The roster/posture facts the attestation reports (already computed). */
+/**
+ * The roster/posture facts the attestation reports (already computed).
+ *
+ * ── MEASURED VS UNAVAILABLE (the A3 honesty fix, 2026-07-07) ────────────────
+ * `revoked`, `untrusted`, `evictionSerial`, and `policyDistribution` are
+ * `null` when the posture SOURCE does not measure them (today's
+ * `/api/fleet/status` daemon route is a banner endpoint that only reports
+ * `admitted_node_count` + a banner string - it does NOT measure these).
+ * `null` here means "not measured by this source," and is DISTINCT from a
+ * measured value of `0` ("measured, and the true count is zero"). A caller
+ * must never zero-fill an unmeasured field: doing so signs FALSE PRECISION
+ * into a document that reads as "no drift, none revoked" when the truth is
+ * "we never checked." `centralNodesTotal` and `admitted` are always numbers
+ * because the shipped source DOES measure them (or the caller has no roster
+ * at all, in which case the whole view honestly reports `bannerState:
+ * "roster_unavailable"` with admitted/centralNodesTotal at 0, which IS a
+ * measured fact: no roster was found).
+ */
 export interface AttestationPostureView {
   /** Total nodes in the CENTRAL roster after any cap has been applied. */
   centralNodesTotal: number;
   admitted: number;
-  revoked: number;
-  untrusted: number;
+  /** null = not measured by the posture source (see the type doc above). */
+  revoked: number | null;
+  /** null = not measured by the posture source (see the type doc above). */
+  untrusted: number | null;
   /** Resolved node-count cap; null = unlimited. */
   maxNodes: number | null;
   /** True when the (capped) roster total exceeds maxNodes (should not happen
    * post-cap, but reported honestly if the caller observes it pre-cap). */
   overCap: boolean;
-  /** The fleet-wide eviction serial (see `fleet-roster.ts`). */
-  evictionSerial: number;
-  /** Signed-policy-distribution rollup (see `fleet-roster.ts`). */
+  /** The fleet-wide eviction serial (see `fleet-roster.ts`); null = not
+   * measured by the posture source (see the type doc above). */
+  evictionSerial: number | null;
+  /** Signed-policy-distribution rollup (see `fleet-roster.ts`); null = not
+   * measured by the posture source (see the type doc above) - never a
+   * zero-filled `{0,0,0}` standing in for "we never checked." */
   policyDistribution: {
     inSync: number;
     drifted: number;
     unknown: number;
-  };
+  } | null;
   /** Operator-facing banner state, when the roster/roster-fetch is unavailable
    * this is "roster_unavailable" and the numeric counts are honest zeros. */
   bannerState: string;
@@ -148,16 +174,21 @@ export interface AttestationBody {
   posture: {
     central_nodes_total: number;
     admitted: number;
-    revoked: number;
-    untrusted: number;
+    /** null = not measured by the posture source; NEVER a stand-in zero. */
+    revoked: number | null;
+    /** null = not measured by the posture source; NEVER a stand-in zero. */
+    untrusted: number | null;
     max_nodes: number | null;
     over_cap: boolean;
-    eviction_serial: number;
+    /** null = not measured by the posture source; NEVER a stand-in zero. */
+    eviction_serial: number | null;
+    /** null = not measured by the posture source; NEVER a zero-filled
+     * `{in_sync:0,drifted:0,unknown:0}` standing in for "we never checked." */
     policy_distribution: {
       in_sync: number;
       drifted: number;
       unknown: number;
-    };
+    } | null;
     banner_state: string;
   };
   claims_scope: string;
@@ -184,7 +215,11 @@ export type AttestationSigner = (message: Uint8Array) => Uint8Array;
  * I/O, no crypto, no custody. Every branch (paid/active, grace, community,
  * over-cap, roster-unavailable) maps honestly - a caller who cannot resolve
  * the roster passes honest zeros with `bannerState: "roster_unavailable"`
- * rather than this function guessing or fabricating a count.
+ * rather than this function guessing or fabricating a count. `null` posture
+ * fields (`revoked`, `untrusted`, `eviction_serial`, `policy_distribution`)
+ * pass straight through as `null`, never coerced to a zero (the A3 fix): a
+ * source that does not measure a field must sign "not measured," not
+ * "measured, and it is zero."
  *
  * `claims_scope` is ALWAYS the same disclaimer text: it does not vary by
  * branch, because the honesty invariant applies uniformly regardless of tier
@@ -214,11 +249,16 @@ export function buildAttestationBody(inputs: AttestationInputs): AttestationBody
       max_nodes: posture.maxNodes,
       over_cap: posture.overCap,
       eviction_serial: posture.evictionSerial,
-      policy_distribution: {
-        in_sync: posture.policyDistribution.inSync,
-        drifted: posture.policyDistribution.drifted,
-        unknown: posture.policyDistribution.unknown,
-      },
+      // null (not measured by the source) passes straight through - NEVER
+      // coerced to a zero-filled object (the A3 fix).
+      policy_distribution:
+        posture.policyDistribution === null
+          ? null
+          : {
+              in_sync: posture.policyDistribution.inSync,
+              drifted: posture.policyDistribution.drifted,
+              unknown: posture.policyDistribution.unknown,
+            },
       banner_state: posture.bannerState,
     },
     claims_scope: CLAIMS_SCOPE_DISCLAIMER,
@@ -259,30 +299,67 @@ export type AttestationVerifyReason =
   | "malformed"
   | "bad_public_key"
   | "bad_signature_encoding"
-  | "signature_invalid";
+  | "signature_invalid"
+  | "operator_key_mismatch";
+
+/**
+ * How strongly a passing verification establishes WHO signed the document:
+ *
+ *  - `"verified"`: an independently-pinned operator public key was supplied
+ *    AND matched `doc.public_key` AND the signature checked out against that
+ *    SAME pinned key. This is the only level that may be reported as "VALID"
+ *    identity-provenance-wise - the caller trusted a key from OUTSIDE the
+ *    document, not a claim the document makes about itself.
+ *  - `"self_consistent"`: no pinned key was supplied (or none is available),
+ *    so the document was checked ONLY against its OWN embedded
+ *    `doc.public_key`. This proves the document is internally consistent
+ *    (unaltered since signing) and NOTHING about who signed it - an attacker
+ *    can sign a fake posture with THEIR OWN key, embed that key, and this
+ *    branch will still report success. Never render this as "VALID" without
+ *    the accompanying provenance caveat (see the CLI `verify` verb).
+ */
+export type AttestationVerifyProvenance = "verified" | "self_consistent";
 
 /** The outcome of an offline attestation verification. */
 export type AttestationVerification =
-  | { ok: true; attestation: AttestationBody }
+  | {
+      ok: true;
+      attestation: AttestationBody;
+      provenance: AttestationVerifyProvenance;
+    }
   | { ok: false; reason: AttestationVerifyReason };
 
 /**
  * Verify a signed attestation document OFFLINE. PURE (no I/O, no custody, no
  * network): recomputes `canonicalJson(doc.attestation)` and checks
- * `doc.signature` against the EMBEDDED `doc.public_key`. FAIL-CLOSED: any
- * malformed shape, non-canonical signature encoding, wrong-length key, or a
- * signature that does not verify returns `{ ok: false, reason }` - it NEVER
- * throws and NEVER reports `ok: true` on a mismatch.
+ * `doc.signature`. FAIL-CLOSED: any malformed shape, non-canonical signature
+ * encoding, wrong-length key, a signature that does not verify, or (when a
+ * pinned key is supplied) a public-key mismatch returns `{ ok: false, reason
+ * }` - it NEVER throws and NEVER reports `ok: true` on a mismatch.
  *
- * IMPORTANT (identity provenance, not just self-consistency): a passing
- * verify proves the document was signed by the holder of the EMBEDDED key and
- * has not been altered since - it does NOT prove that key belongs to any
- * particular operator. A caller who needs identity provenance must
- * additionally compare `doc.public_key` against the operator's independently
- * pinned identity (the CLI `verify` verb prints this caveat).
+ * ── IDENTITY PROVENANCE (the A1 fix) ─────────────────────────────────────
+ * `opts.pinnedOperatorKey`, when supplied, is an INDEPENDENTLY-KNOWN operator
+ * public key (e.g. from `--operator-key`/`--pin`, or the fortress's own
+ * identity) that the caller trusts from OUTSIDE this document. When present:
+ *   - the embedded `doc.public_key` MUST equal the pinned key byte-for-byte
+ *     (mismatch -> `{ ok: false, reason: "operator_key_mismatch" }`, checked
+ *     BEFORE the signature so a wrong-key document never even reaches the
+ *     crypto check);
+ *   - the signature is verified against the PINNED key (not merely the
+ *     embedded one - though they are equal at this point, verifying against
+ *     the pinned key keeps the trust root explicit);
+ *   - success reports `provenance: "verified"`.
+ * Without a pinned key, verification falls back to checking the signature
+ * against the document's OWN embedded key and reports `provenance:
+ * "self_consistent"` - this proves the document was not altered since
+ * signing and NOTHING about who signed it (an attacker can self-sign a fake
+ * posture with their own key). Callers (the CLI `verify` verb) MUST NOT print
+ * "VALID" for a `self_consistent` result; only a `verified` result may be
+ * called "VALID".
  */
 export function verifySignedAttestation(
   doc: unknown,
+  opts?: { pinnedOperatorKey?: Uint8Array },
 ): AttestationVerification {
   if (typeof doc !== "object" || doc === null) {
     return { ok: false, reason: "malformed" };
@@ -314,6 +391,13 @@ export function verifySignedAttestation(
     return { ok: false, reason: "bad_public_key" };
   }
 
+  const pinned = opts?.pinnedOperatorKey;
+  if (pinned !== undefined) {
+    if (pinned.length !== 32 || !timingSafeEqualBytes(pinned, publicKey)) {
+      return { ok: false, reason: "operator_key_mismatch" };
+    }
+  }
+
   let sigBytes: Uint8Array;
   try {
     sigBytes = fromBase64urlStrict(signature);
@@ -325,10 +409,27 @@ export function verifySignedAttestation(
   }
 
   const message = new TextEncoder().encode(canonicalJson(attestation));
-  if (!verifyEd25519(message, sigBytes, publicKey)) {
+  const verifyKey = pinned ?? publicKey;
+  if (!verifyEd25519(message, sigBytes, verifyKey)) {
     return { ok: false, reason: "signature_invalid" };
   }
-  return { ok: true, attestation: attestation as AttestationBody };
+  return {
+    ok: true,
+    attestation: attestation as AttestationBody,
+    provenance: pinned !== undefined ? "verified" : "self_consistent",
+  };
+}
+
+/** Constant-time byte comparison (avoids leaking key-match timing). Both
+ * inputs are PUBLIC keys (never secret material), so this is a defense-in-
+ * depth hygiene choice rather than a security-critical requirement. */
+function timingSafeEqualBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
 }
 
 /**

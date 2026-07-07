@@ -248,6 +248,54 @@ describe("sanctuary license — help + arg validation (no fortress needed)", () 
     expect(err.text).toMatch(/unlocked operator identity is required|keychain/);
     expect(out.text).toBe("");
   });
+
+  it("THE A4 REGRESSION TEST: issue on a fortress with NO default operator identity keeps the EXACT original message, unchanged by the custody-unlock extraction", async () => {
+    // Before PR-1's custody-unlock was extracted to a shared cli/custody-unlock.ts
+    // (so `fleet attest export` could reuse the SAME unlock path), this message
+    // was hardcoded inline in license.ts as "license issuance requires a default
+    // operator identity...". The extraction generalized it to "this operation
+    // requires..." for the new `fleet` caller, which silently changed the
+    // license CLI's own wording - the A4 fix threads an operationLabel through
+    // so `issue`/`revoke`/verified `list` see this EXACT original text, byte
+    // for byte, while only the NEW `fleet attest` caller gets the generic text.
+    let tmp: string | undefined;
+    try {
+      tmp = await mkdtemp(join(tmpdir(), "sanctuary-license-no-identity-test-"));
+      const fortressPath = join(tmp, "f");
+      const result = await runInit({
+        fortress: fortressPath,
+        noConfirm: true,
+        noPin: true,
+        noIdentity: true, // NO default operator identity minted
+      });
+      const recoveryFile = await readFile(result.recoveryKeyDisclosurePath, "utf-8");
+      const recoveryKey = extractRecoveryKey(recoveryFile);
+      delete process.env.SANCTUARY_STORAGE_PATH;
+
+      const out = new StringWritable();
+      const err = new StringWritable();
+      const code = await runLicenseCommand({
+        argv: [
+          "issue", "--fortress", fortressPath, "--tier", "fleet",
+          "--subject", "x", "--nodes", "5", "--expires", FUTURE,
+        ],
+        out,
+        err,
+        env: { SANCTUARY_RECOVERY_KEY: recoveryKey },
+      });
+      expect(code).toBe(1);
+      expect(err.text).toBe(
+        "issue: no operator identity in this fortress: license issuance requires a " +
+          "default operator identity (run `sanctuary identity create`, or " +
+          "re-run `sanctuary init` without --no-identity)\n",
+      );
+      expect(out.text).toBe("");
+    } finally {
+      delete process.env.SANCTUARY_STORAGE_PATH;
+      delete process.env.SANCTUARY_RECOVERY_KEY;
+      if (tmp) await rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("sanctuary license — end-to-end (keychain-free fortress)", () => {
