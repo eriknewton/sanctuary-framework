@@ -385,6 +385,181 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(err.text()).not.toContain("no agent-origin descriptor");
   });
 
+  // --- Build 3: `enable --agent-uid=<uid> [--ceiling=<uid>]` one-command arm ---
+  // Folds `configure-origin uid` into `enable` via the shared
+  // `writeAgentOriginDescriptor` chokepoint. These tests exercise the fold
+  // directly through `runEnable`; they inject `platform: "darwin"` (a plain
+  // string, not a real OS check) so they run identically on Linux CI.
+
+  it("enable --agent-uid writes a valid descriptor then proceeds to arm", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=502"],
+      {
+        out,
+        err: new CaptureStream(),
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceInstalledProbe: (expectedFortressPath) =>
+          bootServiceInstalled(plistPath, expectedFortressPath),
+        sysextProbe: async () => "[activated enabled]",
+        // No agentOriginDescriptorProbe override: exercises the REAL
+        // read-back path, proving the descriptor this command just wrote
+        // satisfies the very guard that follows it.
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Agent origin configured: mode=uid agent_uid=502 ceiling=500");
+    expect(out.text()).toContain("Castle Wall armed");
+
+    const raw = await readFile(
+      join(fortressPath, "policy", "egress", "agent-origin.json"),
+      "utf8",
+    );
+    expect(JSON.parse(raw)).toEqual({
+      mode: "uid",
+      agent_uid: 502,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("enable --agent-uid honors --ceiling", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=502", "--ceiling=600"],
+      {
+        out: new CaptureStream(),
+        err: new CaptureStream(),
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceInstalledProbe: (expectedFortressPath) =>
+          bootServiceInstalled(plistPath, expectedFortressPath),
+        sysextProbe: async () => "[activated enabled]",
+      },
+    );
+
+    expect(code).toBe(0);
+    const raw = await readFile(
+      join(fortressPath, "policy", "egress", "agent-origin.json"),
+      "utf8",
+    );
+    expect(JSON.parse(raw).system_uid_allow_ceiling).toBe(600);
+  });
+
+  it("enable --agent-uid rejects a malformed uid fail-closed and does NOT arm", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=not-a-number"],
+      {
+        out: new CaptureStream(),
+        err,
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceInstalledProbe: (expectedFortressPath) =>
+          bootServiceInstalled(plistPath, expectedFortressPath),
+        sysextProbe: async () => "[activated enabled]",
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Refusing to arm");
+    expect(err.text()).toContain("--agent-uid=not-a-number");
+    expect(calls).toHaveLength(0);
+
+    // No half-built descriptor was written to disk (fail-closed: validate
+    // before write, never a partially-trusted candidate on disk).
+    await expect(
+      readFile(join(fortressPath, "policy", "egress", "agent-origin.json"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  it("enable with NO --agent-uid and no descriptor on disk still REFUSES unless --force (#884 floor preserved)", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    // No --agent-uid at all: the fold-in step must be a no-op, leaving the
+    // pre-existing #884 hard-refuse floor completely unchanged.
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+      sysextProbe: async () => "[activated enabled]",
+      // Real read-back path (no override): no descriptor exists on disk.
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Refusing to arm");
+    expect(err.text()).toContain("no agent-origin descriptor is set");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("enable with NO --agent-uid and no descriptor on disk arms under --force (unchanged #884 escape hatch)", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(["--fortress", fortressPath, "--force", "--no-ttl"], {
+      out,
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      sysextProbe: async () => "[activated enabled]",
+    });
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+    expect(err.text()).toContain("no agent-origin descriptor");
+    expect(calls.length).toBeGreaterThan(0);
+  });
+
   it("enable accepts a boot service that targets the default fortress", async () => {
     const defaultFortressPath = join(homedir(), ".sanctuary");
     const plistDir = await mkdtemp(join(tmpdir(), "sanctuary-cw-default-boot-"));
@@ -841,6 +1016,15 @@ describe("castle-wall enable/disable CLI verbs", () => {
   it("parseCastleWallArgs understands --force", () => {
     expect(parseCastleWallArgs(["--force"]).force).toBe(true);
     expect(parseCastleWallArgs([]).force).toBeUndefined();
+  });
+
+  it("parseCastleWallArgs understands --agent-uid and --ceiling", () => {
+    expect(parseCastleWallArgs(["--agent-uid=502"]).agentUid).toBe("502");
+    expect(parseCastleWallArgs(["--agent-uid=502", "--ceiling=600"]).ceiling).toBe(
+      "600",
+    );
+    expect(parseCastleWallArgs([]).agentUid).toBeUndefined();
+    expect(parseCastleWallArgs([]).ceiling).toBeUndefined();
   });
 
   it("enable requires an explicit dead-man TTL mode", async () => {

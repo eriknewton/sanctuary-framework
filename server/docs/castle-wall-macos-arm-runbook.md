@@ -76,6 +76,13 @@ Once the app is installed and the sysext is approved + toggled ON and consent is
 granted, arming is a short, SSH-safe CLI sequence. Every verb and flag below was
 verified against `server/src/cli/castle-wall.ts`.
 
+**Recommended: one-command configure-then-arm.** `enable --agent-uid=<uid>`
+folds `configure-origin uid --agent-uid=<uid>` into `enable`: it validates and
+writes the agent-origin descriptor, THEN arms, in a single command. This is the
+same descriptor `configure-origin` writes (same validation, same file), just
+folded into one step so you do not need to remember to run `configure-origin`
+first on a multi-user host.
+
 ```bash
 # 1. Provision the local pinned keypair (first install only).
 sanctuary castle-wall provision-pin
@@ -92,26 +99,33 @@ sudo sanctuary castle-wall install-boot
 #    boot service installed in step 2. 'enable' refuses if no daemon is reachable.
 sanctuary castle-wall daemon
 
-# 4. Set the agent-origin descriptor BEFORE arming (CRITICAL on a multi-user host).
+# 4. Configure the agent-origin descriptor AND arm, in one command.
 #    Without a descriptor the classifier routes EVERY flow - sshd, Tailscale, and
 #    your own operator shell - to default-deny + allowlist (verified: with no
-#    descriptor even a root/ruid-0 flow classifies `.agent`). Arming then cuts
-#    SSH/Tailscale unless each is explicitly allowlisted - this is the 2026-06-26
-#    Mini1 "arming cut SSH" boot-cut. In uid mode, real uids BELOW --ceiling
-#    classify as operator (allowed); the dedicated agent-account uid is the
-#    confined side. Verify uids first: `id <agent-user>`, and confirm daemon uids
-#    (e.g. `id _sshd`) sit below the ceiling.
-sanctuary castle-wall configure-origin uid --agent-uid=<agent-account-uid> --ceiling=500
-
-# 5. Arm the content filter. You MUST choose a dead-man TTL mode:
+#    descriptor even a root/ruid-0 flow classifies `.agent`). In uid mode, real
+#    uids BELOW --ceiling classify as operator (allowed); the dedicated
+#    agent-account uid is the confined side. Verify uids first: `id <agent-user>`,
+#    and confirm daemon uids (e.g. `id _sshd`) sit below the ceiling.
+#    You MUST also choose a dead-man TTL mode:
 #      --no-ttl        durable arming (stays armed until you disarm)
 #      --ttl <dur>     drill arming (auto-disarms after the TTL; e.g. --ttl 15m)
+sanctuary castle-wall enable --agent-uid=<agent-account-uid> --ceiling=500 --no-ttl
+```
+
+The two-step form still works (and is what the one-command form does
+internally): run `configure-origin` first, then `enable` with no `--agent-uid`.
+Use the two-step form when reconfiguring an ALREADY-armed fortress (`enable`
+only ever runs at arm time; `configure-origin` + `reload` is the path to change
+the descriptor without a full disarm/arm cycle):
+
+```bash
+sanctuary castle-wall configure-origin uid --agent-uid=<agent-account-uid> --ceiling=500
 sanctuary castle-wall enable --no-ttl
 #    or, for a bounded drill window:
 # sanctuary castle-wall enable --ttl 15m
 ```
 
-`enable` fires four honest gates before it will report armed, and refuses (never
+`enable` fires five honest gates before it will report armed, and refuses (never
 fake-arms) if any fail:
 - a reachable policy daemon (else deny-all brick risk; `--force` overrides if the
   daemon is supervised out of band),
@@ -119,12 +133,16 @@ fake-arms) if any fail:
   overrides),
 - a TTL mode chosen (`--ttl` or `--no-ttl`; exit code 2 if you pass neither),
 - the sysext toggled ON (exit code 4 if not) and content-filter consent granted
-  (exit code 3 if not).
+  (exit code 3 if not),
+- a valid agent-origin descriptor present (either written by `--agent-uid` in
+  this same command, or already on disk from a prior `configure-origin`); with
+  neither, `enable` REFUSES to arm (`--force` overrides, with a loud warning that
+  operator SSH/Tailscale access will be cut).
 
-Note: `enable` does NOT yet gate on the agent-origin descriptor (step 4 above). If
-you skip `configure-origin`, arming still succeeds but classifies every flow as
-`.agent`, cutting SSH / Tailscale / operator traffic that is not in the allowlist.
-Always run step 4 before `enable` on a remote or multi-user host.
+`--agent-uid` is an explicit flag only: the uid is never auto-derived or
+guessed. Passing a malformed or non-numeric uid is rejected fail-closed (the
+command errors out and does NOT arm); it never falls back to arming without a
+descriptor.
 
 ---
 
@@ -175,7 +193,7 @@ failed arm:
 | **No reachable daemon** | `enable` refuses (deny-all brick guard) | run `sanctuary castle-wall daemon` or install the boot service; `--force` only if supervised out of band |
 | **No boot service for this fortress** | `enable` refuses (reboot-brick guard) | `sudo sanctuary castle-wall install-boot`; `--force` only if boot-survival is supervised out of band |
 | **Signer helper unreachable after reboot** | `daemon` / boot-service start fails with "the signer helper is unreachable" | run `sanctuary castle-wall signer-helper status` for a specific diagnosis (approve the Background Item in System Settings, re-pin, or repair the custody directory) |
-| **No agent-origin descriptor set** | `enable` arms, but SSH / Tailscale / your operator shell are cut (every flow classifies `.agent` and hits default-deny) | run `sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500` BEFORE `enable` (step 4); `enable` does NOT yet guard for this |
+| **No agent-origin descriptor set** | `enable` REFUSES to arm (would otherwise cut SSH / Tailscale / your operator shell: every flow classifies `.agent` and hits default-deny) | run `sanctuary castle-wall enable --agent-uid=<uid> --ceiling=500 --no-ttl` (one command), or `configure-origin uid --agent-uid=<uid> --ceiling=500` first then plain `enable`; `--force` overrides with a loud warning (you WILL lose operator access unless another carve-out exists) |
 
 ---
 
