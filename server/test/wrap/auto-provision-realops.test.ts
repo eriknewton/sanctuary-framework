@@ -666,6 +666,35 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
       await rm(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it("FIX R9-1: the backup-copy FALLBACK restores a SYMLINK backup faithfully as a LINK (no dereference to a plain file) -- the last follow-semantics branch", async () => {
+    tmpRoot = await makeTmp();
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const sourcePath = join(tmpRoot, "source", "secret.env");
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      // A live target the operator's symlinked credential pointed at.
+      const realTarget = join(tmpRoot, "real-secret.env");
+      await writeFile(realTarget, "SHARED-ROTATING-SECRET");
+      // The backup is a SYMLINK (exactly what backup() stores for a symlinked
+      // secret). destPath is gone -> the fallback branch handles it.
+      const backupPath = `${backupRoot}${sourcePath}.bak`;
+      await mkdir(dirname(backupPath), { recursive: true });
+      await symlink(realTarget, backupPath);
+      const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
+
+      const result = await realRehomeOps({ backupRoot }).restore(destPath, sourcePath);
+
+      expect(result.restored).toBe(true);
+      // The credential must round-trip as a SYMLINK, NOT a dereferenced plain
+      // file (which would silently stop tracking the shared/rotating target).
+      const st = await lstat(sourcePath);
+      expect(st.isSymbolicLink()).toBe(true);
+      expect(await readlink(sourcePath)).toBe(realTarget);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("wrap/auto-provision real-ops chokepoint: disarmExitCodeDecision (fix G1)", () => {

@@ -29,7 +29,7 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, stat, lstat, readlink, symlink, rm, cp } from "node:fs/promises";
+import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, lstat, readlink, symlink, rm, cp } from "node:fs/promises";
 import { dirname, relative, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
@@ -1469,35 +1469,47 @@ export function realRehomeOps(opts?: { backupRoot?: string }) {
       // (defaults to the production /var/root location), so this fallback
       // branch is now reachable by the seam against a disposable tmpdir.
       const backupPath = `${backupRoot}${sourcePath}.bak`;
-      if (await pathExists(backupPath)) {
-        const sourceConflict = await pathExistsNoFollow(sourcePath);
-        if (sourceConflict) {
-          // Same conflict guard for the backup-copy fallback: never
-          // overwrite a recreated source with the backup copy either.
-          // FIX G2: nor a pre-existing conflict sibling at that path.
-          const conflictPath = await findUniqueConflictPath(sourcePath);
-          const st = await stat(backupPath);
-          if (st.isDirectory()) {
-            await cp(backupPath, conflictPath, { recursive: true });
-          } else {
-            await copyFile(backupPath, conflictPath);
-          }
-          return { restored: false, conflictPath };
-        }
-        const st = await stat(backupPath);
-        if (st.isDirectory()) {
-          await cp(backupPath, sourcePath, { recursive: true });
-        } else {
-          await copyFile(backupPath, sourcePath);
-        }
-        // FIX (round 5 / R2-1): no-follow. The restore succeeds when a NAME
-        // lands at sourcePath (the reverse-move/copy completed); whether a
-        // restored symlink's target resolves is the operator's home's concern,
-        // not restore's. `pathExists` (follow) would report a faithfully
-        // restored-but-relative symlink as `restored: false`.
-        return { restored: await pathExistsNoFollow(sourcePath) };
+      // FIX (round 5 / R9-1): resolve the backup's shape with a SINGLE no-follow
+      // `lstat`. If it cannot be lstat'd (absent, or unreadable -- e.g. the
+      // production `/var/root/...` root-only backup root read as a non-root
+      // test/process), there is no usable backup: return `{restored:false}`
+      // cleanly (matching the pre-fix access()-fails-closed behavior) rather
+      // than throwing. A symlink backup (which backup() deliberately stores for
+      // a symlinked secret) is round-tripped faithfully via readlink/symlink --
+      // the pre-fix `stat`/`copyFile` FOLLOWED the link and materialized the
+      // target's contents as a PLAIN FILE at the restore target, silently
+      // losing the link (contradicting backup()'s no-dereference contract and
+      // the R2-1 faithful-link guarantee) while still reporting restored:true.
+      // This was the last follow-semantics branch left after round-5(b)/R2-1.
+      let backupStat;
+      try {
+        backupStat = await lstat(backupPath);
+      } catch {
+        return { restored: false };
       }
-      return { restored: false };
+      const restoreBackupTo = async (target: string): Promise<void> => {
+        if (backupStat.isSymbolicLink()) {
+          await symlink(await readlink(backupPath), target);
+        } else if (backupStat.isDirectory()) {
+          await cp(backupPath, target, { recursive: true });
+        } else {
+          await copyFile(backupPath, target);
+        }
+      };
+      const sourceConflict = await pathExistsNoFollow(sourcePath);
+      if (sourceConflict) {
+        // Same conflict guard for the backup-copy fallback: never overwrite a
+        // recreated source (FIX R6) nor a pre-existing conflict sibling
+        // (FIX G2) -- restore the backup to a fresh conflict path instead.
+        const conflictPath = await findUniqueConflictPath(sourcePath);
+        await restoreBackupTo(conflictPath);
+        return { restored: false, conflictPath };
+      }
+      await restoreBackupTo(sourcePath);
+      // FIX (round 5 / R2-1): no-follow -- the restore succeeds when a NAME
+      // lands at sourcePath (the copy/link completed); whether a restored
+      // symlink's target resolves is the operator's home's concern.
+      return { restored: await pathExistsNoFollow(sourcePath) };
     },
     /** Fix F3: hand custody of a restored secret back to the operator. */
     restoreCustody: async (path: string, operatorUid: number, operatorGid: number): Promise<void> => {
