@@ -6479,18 +6479,36 @@ export class DashboardApprovalChannel implements ApprovalChannel {
 
   /**
    * Fleet control plane, Add-Machine slice: resolve the pure enrollment
-   * headroom view by composing SHIPPED parts only (the existing private
+   * headroom view AND a "was the active-node count reliably derived" signal,
+   * by composing SHIPPED parts only (the existing private
    * {@link resolveFleetCap} plus the durable roster via
    * `buildFleetRoster(...)`, as {@link activateFleetLicense} already does),
-   * and feed both into the pure {@link computeFleetCapacityView}. Never
-   * throws: a roster read failure
-   * reports `active_nodes: 0` (honest absence, matches the status handler's
-   * roster-unavailable branch), and `resolveFleetCap` itself is already
-   * fail-closed to the community floor.
+   * and feeding both into the pure {@link computeFleetCapacityView}.
+   *
+   * `rosterCountReliable` distinguishes two different "no active count"
+   * shapes that must NOT be treated the same by every caller:
+   *  - `buildFleetRoster` returns normally with `available: false`
+   *    (federation genuinely not provisioned on this fortress): there IS no
+   *    fleet, so `active_nodes: 0` is an honest count. `rosterCountReliable`
+   *    is `true` here.
+   *  - `buildFleetRoster` THROWS (an unexpected derivation failure, e.g. a
+   *    transient revocation-state read error) while federation IS
+   *    provisioned/enabled: the real roster size is UNKNOWN, not zero.
+   *    `rosterCountReliable` is `false` here, and `active_nodes: 0` in the
+   *    returned view must be read as "unavailable", never as "genuinely
+   *    empty".
+   *
+   * Never throws: `resolveFleetCap` itself is already fail-closed to the
+   * community floor, and a roster derivation failure is caught and reported
+   * via `rosterCountReliable`, not re-thrown.
    */
-  private async computeFleetCapacity(): Promise<FleetCapacityView> {
+  private async computeFleetCapacityWithReliability(): Promise<{
+    view: FleetCapacityView;
+    rosterCountReliable: boolean;
+  }> {
     const cap = await this.resolveFleetCap();
     let activeNodes = 0;
+    let rosterCountReliable = true;
     try {
       const roster = buildFleetRoster(this.buildV1FederationDeps(), {
         evictionSerial: this._federationState.evictionMaxSerial,
@@ -6500,11 +6518,31 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         activeNodes = roster.summary.admitted;
       }
     } catch {
-      // Roster unavailable: report 0 active (honest absence); the cap itself
-      // is still the real fail-closed resolution.
+      // Roster derivation failed while federation is (or may be) provisioned:
+      // the true count is UNKNOWN, not zero. Callers that gate a mutation
+      // (e.g. the enroll-token mint pre-check) must fail closed on this
+      // signal rather than read active_nodes as "0 active, plenty of room".
       activeNodes = 0;
+      rosterCountReliable = false;
     }
-    return computeFleetCapacityView(cap, activeNodes);
+    return {
+      view: computeFleetCapacityView(cap, activeNodes),
+      rosterCountReliable,
+    };
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: resolve the pure enrollment
+   * headroom view for READ-ONLY display surfaces (`GET /api/fleet/capacity`).
+   * A roster derivation failure still reports `active_nodes: 0` here (honest
+   * absence for a status panel); see
+   * {@link computeFleetCapacityWithReliability} for the reliability signal the
+   * enroll-token MINT gate uses to fail closed instead of proceeding as if 0
+   * nodes were active. Never throws.
+   */
+  private async computeFleetCapacity(): Promise<FleetCapacityView> {
+    const { view } = await this.computeFleetCapacityWithReliability();
+    return view;
   }
 
   /**
@@ -6562,6 +6600,14 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    *   - 409 `{ error: "at_capacity", active_nodes, max_nodes, message }` when
    *     the fleet is at its finite paid node cap (fail-closed courtesy; see
    *     above).
+   *   - 503 `{ error: "capacity_unavailable", message }` when the durable
+   *     roster's active-node count could not be reliably derived (e.g. a
+   *     roster-derivation throw). This is the fail-closed branch for the
+   *     MINT gate specifically: an unreliable count must never be read as
+   *     "0 active, plenty of room" (that would be fail-open on a paid
+   *     enrollment gate). `GET /api/fleet/capacity` is unaffected and may
+   *     still display `active_nodes: 0` on the same underlying condition;
+   *     that surface is read-only and never mints.
    *   - 409 `{ error: "federation_not_provisioned" }` when federation is not
    *     enabled/provisioned on this fortress, or this fortress cannot mint
    *     (a non-issuer context, e.g. an operator_cloud or joiner node): never
@@ -6630,7 +6676,36 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // Capacity pre-check FIRST: an operator at cap should never even
         // reach the ceremony. Advisory UX only (see doc comment above); the
         // real enforcement is applyFleetCap on the central roster, untouched.
-        const capacity = await this.computeFleetCapacity();
+        //
+        // Fail-closed exception (MEDIUM finding fix): this MINT path, unlike
+        // the read-only GET /api/fleet/capacity panel, must NOT proceed as if
+        // the roster were genuinely empty when the roster count could not be
+        // reliably derived (buildFleetRoster threw). Reading an unreliable
+        // "0 active" as real headroom would mint a token even when the true
+        // roster is at or over cap, fail-OPEN on a paid enrollment gate. So
+        // when the count is unreliable, refuse to mint rather than guess.
+        const { view: capacity, rosterCountReliable } =
+          await this.computeFleetCapacityWithReliability();
+        if (!rosterCountReliable) {
+          res.writeHead(503, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(
+            JSON.stringify({
+              error: "capacity_unavailable",
+              message:
+                "Cannot determine current fleet node count; refusing to mint an enrollment token. Try again shortly.",
+            }),
+          );
+          void this.buildV1FederationDeps().audit({
+            operation: "fleet_enroll_token_mint",
+            result: "failure",
+            identityId: nodeId,
+            details: { reason: "capacity_unavailable" },
+          });
+          return;
+        }
         if (capacity.at_capacity && capacity.max_nodes !== null) {
           res.writeHead(409, {
             "Content-Type": "application/json",

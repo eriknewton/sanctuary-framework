@@ -190,6 +190,28 @@ async function getCapacity(h: Harness, token?: string): Promise<Response> {
   });
 }
 
+/**
+ * Poison the durable roster so `buildFleetRoster`'s unguarded
+ * `deps.listNodes()` call throws (a genuine derivation failure), rather than
+ * returning `available: false` (honest absence) or an empty node list. This
+ * is the fail-open reproduction case: a naive mint pre-check would read the
+ * caught failure as `active_nodes: 0` and mint anyway even though the real
+ * roster is unknown, possibly at or over cap.
+ */
+function poisonRoster(h: Harness): void {
+  const dash = h.dashboard as unknown as {
+    _federationState: { nodes: unknown; revoked: Set<string> };
+  };
+  dash._federationState = {
+    ...dash._federationState,
+    nodes: {
+      values: () => {
+        throw new Error("simulated roster derivation failure");
+      },
+    },
+  };
+}
+
 async function enrollToken(
   h: Harness,
   body: unknown,
@@ -401,6 +423,45 @@ describe("POST /api/fleet/enroll-token - auth + capacity pre-check + mint", () =
     expect(res.status).toBe(409);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("federation_not_provisioned");
+  });
+});
+
+describe("POST /api/fleet/enroll-token - fails closed when the roster count is unreliable", () => {
+  it("returns 503 capacity_unavailable and does NOT mint when buildFleetRoster throws", async () => {
+    h = await startHarness({ totalNodes: 3 });
+    poisonRoster(h);
+    const res = await enrollToken(
+      h,
+      { node_id: "node-new", node_mode: "local" },
+      h.authToken,
+    );
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as { error: string; message: string };
+    expect(body.error).toBe("capacity_unavailable");
+    expect(body.message.length).toBeGreaterThan(0);
+    // No bootstrap token shape leaked on the fail-closed path.
+    expect(JSON.stringify(body)).not.toMatch(/bootstrap_token|signature/i);
+  });
+
+  it("a genuine 0-active roster (no poison) still mints - real headroom is not blocked", async () => {
+    h = await startHarness({ totalNodes: 0 });
+    const res = await enrollToken(
+      h,
+      { node_id: "node-new", node_mode: "local" },
+      h.authToken,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean };
+    expect(body.ok).toBe(true);
+  });
+
+  it("GET /api/fleet/capacity is unaffected by the roster poison (read-only surface may still show active_nodes: 0)", async () => {
+    h = await startHarness({ totalNodes: 3 });
+    poisonRoster(h);
+    const res = await getCapacity(h, h.authToken);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { active_nodes: number };
+    expect(body.active_nodes).toBe(0);
   });
 });
 
