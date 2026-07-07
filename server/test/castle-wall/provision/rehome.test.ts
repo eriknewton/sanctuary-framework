@@ -284,5 +284,56 @@ describe("castle-wall/provision/rehome", () => {
         true,
       );
     });
+
+    it("FIX (round 5, N6): a CONFLICT outcome for a secret hands custody of the RECOVERED data (at conflictPath) back to the operator, never the untouched source", async () => {
+      const singleAdapter: AgentRehomeAdapter = {
+        harnessId: "test-conflict",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.hermes/.env`, destRelativePath: ".hermes/.env", isSecret: true },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const src = `${OPERATOR_HOME}/.hermes/.env`;
+      const conflictPath = `${src}.restored-conflict`;
+      const ops = mockOps(new Set([src]), {
+        restore: async () => ({ restored: false, conflictPath }),
+      });
+      const plan = planRehome(singleAdapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+
+      const restoreResult = await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
+
+      expect(restoreResult.fullyRestored).toBe(false);
+      expect(restoreResult.steps[0]?.status).toBe("conflict");
+      expect(restoreResult.steps[0]?.conflictPath).toBe(conflictPath);
+      // The recovered data at conflictPath was reverse-moved from the
+      // agent-owned re-home destination; custody handback must target THAT
+      // path (so the operator can read it), NOT the operator's untouched
+      // recreated source. Before N6 no handback happened at all.
+      expect(ops.restoreCustodyCalls).toEqual([
+        { path: conflictPath, uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid },
+      ]);
+    });
+
+    it("FIX (round 5, N6): a CONFLICT outcome for a NON-secret entry does not hand custody back (secret-only)", async () => {
+      const nonSecretAdapter: AgentRehomeAdapter = {
+        harnessId: "test-conflict-nonsecret",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.config/plain`, destRelativePath: ".config/plain", isSecret: false },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const src = `${OPERATOR_HOME}/.config/plain`;
+      const ops = mockOps(new Set([src]), {
+        restore: async () => ({ restored: false, conflictPath: `${src}.restored-conflict` }),
+      });
+      const plan = planRehome(nonSecretAdapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+
+      const restoreResult = await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
+
+      expect(restoreResult.steps[0]?.status).toBe("conflict");
+      expect(ops.restoreCustodyCalls).toEqual([]);
+    });
   });
 });

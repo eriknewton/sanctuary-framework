@@ -101,10 +101,13 @@ export interface RehomeOps {
    */
   restore(destPath: string, sourcePath: string): Promise<{ restored: boolean; conflictPath?: string }>;
   /**
-   * Restore custody of a restored secret path to the operator (fix F3):
-   * chmod 0600 (file) / 0700 (dir) and chown back to the operator's
-   * uid/gid. Called only for `isSecret` entries, only after a successful
-   * restore.
+   * Restore custody of a recovered secret path to the operator (fix F3):
+   * chmod 0600 (file) / 0700 (dir) and chown back to the operator's uid/gid.
+   * Called for `isSecret` entries after a successful restore (on the restored
+   * `sourcePath`) AND, per fix (round 5, item N6), on the CONFLICT branch (on
+   * the `conflictPath`, since the recovered data was reverse-moved from the
+   * agent-owned re-home destination and would otherwise be left unreadable by
+   * the operator it is being handed back to).
    */
   restoreCustody(path: string, operatorUid: number, operatorGid: number): Promise<void>;
 }
@@ -318,22 +321,33 @@ export async function restoreRehomeSteps(
         // generic `"failed"` bucket, so the operator sees "your recreated
         // file is safe, the recovered data is at <conflictPath>" rather than
         // an unexplained failure.
-        steps.push(
-          conflictPath !== undefined
-            ? {
-                entry: result.entry,
-                sourcePath: result.entry.sourcePath,
-                status: "conflict",
-                conflictPath,
-                error: `source path was recreated during re-home; restored data was placed at ${conflictPath} instead of overwriting it`,
-              }
-            : {
-                entry: result.entry,
-                sourcePath: result.entry.sourcePath,
-                status: "failed",
-                error: "restore reported no data reproduced at the source path",
-              },
-        );
+        if (conflictPath !== undefined) {
+          // FIX (round 5, item N6): the recovered data now sitting at
+          // `conflictPath` was reverse-moved from the AGENT-owned re-home
+          // destination, so it is owned by the agent uid, not the operator.
+          // Without a custody handback the operator is pointed at a recovered
+          // secret they cannot read. Hand custody of the RECOVERED data (at
+          // `conflictPath`, NOT `sourcePath` -- `sourcePath` holds the
+          // operator's already-owned recreated file, which must never be
+          // touched) back to the operator for secret entries.
+          if (result.entry.isSecret) {
+            await ops.restoreCustody(conflictPath, operatorUidGid.uid, operatorUidGid.gid);
+          }
+          steps.push({
+            entry: result.entry,
+            sourcePath: result.entry.sourcePath,
+            status: "conflict",
+            conflictPath,
+            error: `source path was recreated during re-home; restored data was placed at ${conflictPath} instead of overwriting it`,
+          });
+        } else {
+          steps.push({
+            entry: result.entry,
+            sourcePath: result.entry.sourcePath,
+            status: "failed",
+            error: "restore reported no data reproduced at the source path",
+          });
+        }
         continue;
       }
       if (result.entry.isSecret) {

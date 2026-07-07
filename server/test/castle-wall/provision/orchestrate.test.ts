@@ -60,6 +60,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       results: REHOME_RESULTS,
     })),
     installHarnessDaemon: vi.fn(async () => undefined),
+    uninstallHarnessDaemon: vi.fn(async () => undefined),
     preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
     checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: AGENT_UID })),
     arm: vi.fn(async () => ({ ok: true as const })),
@@ -182,11 +183,17 @@ describe("castle-wall/provision/orchestrate", () => {
   it("fail-closed: re-home failure aborts, no daemon install attempted", async () => {
     const ops = happyPathOps({
       rehome: vi.fn(async () => {
-        throw new Error("chown failed: operation not permitted");
+        // A PLAIN (non-RehomeExecutionError) throw means nothing moved yet
+        // (in production the only plain-error path is the pre-move base-dir
+        // setup; a post-move failure re-throws RehomeExecutionError carrying
+        // the moved results). FIX (round 5, N7): nothing moved = trivially
+        // rolled back, so rolledBack is true here -- the pre-fix code forced
+        // false and produced a spurious "restore FAILED / do not re-run" alarm.
+        throw new Error("could not normalize the agent-home base directory");
       }),
     });
     const result = await runProvisionFlow(baseCtx(), ops);
-    expect(result).toMatchObject({ kind: "aborted", stage: "rehome", rolledBack: false });
+    expect(result).toMatchObject({ kind: "aborted", stage: "rehome", rolledBack: true });
     expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
   });
 
@@ -259,6 +266,75 @@ describe("castle-wall/provision/orchestrate", () => {
     // Post-arm rollback is a fast DISARM, not a re-home restore: the agent
     // stays on its dedicated, re-homed account; only enforcement comes down.
     expect(ops.restoreRehome).not.toHaveBeenCalled();
+    // FIX (round 5, item c): the reason must be HONEST about what the post-arm
+    // re-check can and cannot prove (DNS-resolvability + credential readability,
+    // NOT allow-list correctness), so it must not assert "the allow-list blocks".
+    const reason = (result as { reason: string }).reason;
+    expect(reason).not.toMatch(/allow-list blocks/);
+    expect(reason).toMatch(/post-arm connectivity re-check failed/);
+    expect(reason).toMatch(/not allow-list correctness/);
+    // Post-arm rollback leaves the daemon running (agent stays re-homed); the
+    // daemon is only torn down on PRE-arm aborts (N3).
+    expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
+  });
+
+  it("FIX (round 5, N3): a verify-before-arm abort tears the LIVE harness daemon down (not just restore re-home) before reporting the abort", async () => {
+    const ops = happyPathOps({
+      preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm", rolledBack: true });
+    // The daemon was bootstrapped by install-daemon and MUST be torn down on
+    // this fail-closed abort, or a live root LaunchDaemon is left running
+    // under the dedicated account while the flow reports a clean rollback.
+    expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+    expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
+  });
+
+  it("FIX (round 5, N3): the uid-existence-gate and arm aborts also tear the daemon down", async () => {
+    const uidGateOps = happyPathOps({
+      checkUidExistence: vi.fn(async () => ({ ok: false as const, accountName: "sanctuary-hermes", reason: "account does not exist" })),
+    });
+    await runProvisionFlow(baseCtx(), uidGateOps);
+    expect(uidGateOps.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+
+    const armOps = happyPathOps({
+      arm: vi.fn(async () => ({ ok: false as const, error: "no agent-origin descriptor" })),
+    });
+    await runProvisionFlow(baseCtx(), armOps);
+    expect(armOps.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+  });
+
+  it("FIX (round 5, N3): a FAILED daemon teardown on abort is surfaced LOUDLY in the reason (never silently swallowed)", async () => {
+    const ops = happyPathOps({
+      preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+      uninstallHarnessDaemon: vi.fn(async () => {
+        throw new Error("launchctl bootout failed: Operation not permitted");
+      }),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm" });
+    const reason = (result as { reason: string }).reason;
+    expect(reason).toMatch(/could NOT be torn down automatically/);
+    expect(reason).toMatch(/launchctl bootout failed: Operation not permitted/);
+    // A teardown failure must not prevent the re-home restore from being attempted.
+    expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
+  });
+
+  it("FIX (round 5, N7): a rehome failure BEFORE any move (empty partialResults) reports rolledBack:true (nothing moved = trivially rolled back), not a false 'restore FAILED'", async () => {
+    const { RehomeExecutionError } = await import("../../../src/castle-wall/provision/rehome.js");
+    const ops = happyPathOps({
+      rehome: vi.fn(async () => {
+        throw new RehomeExecutionError("backup destination not root-only writable", []);
+      }),
+    });
+    const result = await runProvisionFlow(baseCtx(), ops);
+    // The pre-fix code special-cased empty partialResults to rolledBack:false,
+    // producing a false "restore FAILED / do not re-run" warning when nothing
+    // was ever moved. Nothing moved = trivially rolled back.
+    expect(result).toMatchObject({ kind: "aborted", stage: "rehome", rolledBack: true });
+    // No daemon was installed yet at the rehome stage, so it is not torn down here.
+    expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
   });
 
   it("FIX G1 (re-gate 3): a non-throwing-but-nonzero disarm, wired through the REAL disarmExitCodeDecision chokepoint, yields armed-rollback-failed -- never armed-then-rolled-back", async () => {

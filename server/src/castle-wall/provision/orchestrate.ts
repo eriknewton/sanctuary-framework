@@ -66,6 +66,15 @@ export interface ProvisionFlowOps {
   rehome(uid: number, gid: number): Promise<{ plan: RehomePlan; results: RehomeStepResult[] }>;
   /** Install the harness daemon for the given uid. */
   installHarnessDaemon(uid: number): Promise<void>;
+  /**
+   * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
+   * bootstraps a LIVE root LaunchDaemon; every post-install abort branch
+   * (verify-before-arm, uid-existence-gate, arm) MUST tear it back down, or a
+   * fail-closed abort leaves the daemon running under the dedicated account
+   * while the flow reports a clean rollback. Idempotent + fail-loud (matches
+   * the shipped `uninstallAgentHarnessDaemon` teardown semantics).
+   */
+  uninstallHarnessDaemon(): Promise<void>;
   /** Endpoints to probe before arming (LLM / Telegram / Gmail, etc). */
   preArmEndpoints(): EndpointProbeTarget[];
   /** Hard existence + uid-match check immediately before arming (fix H1). */
@@ -243,7 +252,14 @@ export async function runProvisionFlow(
         kind: "aborted",
         stage: "rehome",
         reason: (err as Error).message,
-        rolledBack: partialResults.length > 0 ? restore.rolledBack : false,
+        // FIX (round 5, item N7): use the restore result unconditionally.
+        // The pre-fix `partialResults.length > 0 ? ... : false` forced
+        // `rolledBack: false` when rehome failed BEFORE any move (empty
+        // partialResults), which made the CLI print a false "restore FAILED /
+        // manual recovery required / do not re-run" alarm even though nothing
+        // was ever moved. safeRestore([]) trivially reports fullyRestored ->
+        // rolledBack: true (nothing to roll back), which is the honest state.
+        rolledBack: restore.rolledBack,
         backupPaths: restore.backupPaths,
       };
     }
@@ -256,13 +272,16 @@ export async function runProvisionFlow(
     await ops.installHarnessDaemon(uid);
     ops.print("Harness daemon installed; agent now runs under the dedicated account.");
   } catch (err) {
-    const restore = await safeRestore(ops, rehomeResults);
+    // FIX (round 5, item N3): the install may have partially bootstrapped the
+    // daemon before throwing; tear it back down (idempotent) before restoring
+    // the re-home, so an abort never leaves a live daemon behind.
+    const td = await teardownDaemonAndRestore(ops, rehomeResults);
     return {
       kind: "aborted",
       stage: "install-daemon",
-      reason: (err as Error).message,
-      rolledBack: restore.rolledBack,
-      backupPaths: restore.backupPaths,
+      reason: withDaemonTeardownNote((err as Error).message, td.daemonTeardownError),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
     };
   }
 
@@ -274,15 +293,20 @@ export async function runProvisionFlow(
   const preArmVerify: ConnectivityVerifyResult = await verifyReachabilityBeforeArm(ops.preArmEndpoints());
   if (!preArmVerify.allReachable) {
     const unreachable = preArmVerify.results.filter((r) => !r.reachable).map((r) => r.name);
-    const restore = await safeRestore(ops, rehomeResults);
+    // FIX (round 5, item N3): the daemon is LIVE by now (install-daemon
+    // succeeded above); tear it down before restoring the re-home so this
+    // fail-closed abort does not leave the daemon running under the dedicated
+    // account.
+    const td = await teardownDaemonAndRestore(ops, rehomeResults);
     return {
       kind: "aborted",
       stage: "verify-before-arm",
-      reason:
-        `re-homed agent could not reach: ${unreachable.join(", ")}. ` +
-        describeRestoreForReason(restore.rolledBack),
-      rolledBack: restore.rolledBack,
-      backupPaths: restore.backupPaths,
+      reason: withDaemonTeardownNote(
+        `re-homed agent could not reach: ${unreachable.join(", ")}. ` + describeRestoreForReason(td.rolledBack),
+        td.daemonTeardownError,
+      ),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
     };
   }
 
@@ -290,26 +314,30 @@ export async function runProvisionFlow(
   // arming, hard-check the account still exists at exactly this uid.
   const existenceCheck = await ops.checkUidExistence(uid);
   if (!existenceCheck.ok) {
-    const restore = await safeRestore(ops, rehomeResults);
+    // FIX (round 5, item N3): daemon is live; tear it down on this abort.
+    const td = await teardownDaemonAndRestore(ops, rehomeResults);
     return {
       kind: "aborted",
       stage: "uid-existence-gate",
-      reason: existenceCheck.reason,
-      rolledBack: restore.rolledBack,
-      backupPaths: restore.backupPaths,
+      reason: withDaemonTeardownNote(existenceCheck.reason, td.daemonTeardownError),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
     };
   }
 
   // Step 9: arm via the shipped `enable --agent-uid=N --ceiling` (step 1).
   const armResult = await ops.arm(uid, ctx.ceiling);
   if (!armResult.ok) {
-    const restore = await safeRestore(ops, rehomeResults);
+    // FIX (round 5, item N3): arming failed but the daemon is live; tear it
+    // down on this abort (the wall never armed, so there is nothing to
+    // disarm -- only the daemon to remove).
+    const td = await teardownDaemonAndRestore(ops, rehomeResults);
     return {
       kind: "aborted",
       stage: "arm",
-      reason: armResult.error,
-      rolledBack: restore.rolledBack,
-      backupPaths: restore.backupPaths,
+      reason: withDaemonTeardownNote(armResult.error, td.daemonTeardownError),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
     };
   }
 
@@ -318,7 +346,19 @@ export async function runProvisionFlow(
   const postArmVerify: ConnectivityVerifyResult = await verifyReachabilityAfterArm(ops.postArmEndpoints());
   if (!postArmVerify.allReachable) {
     const unreachable = postArmVerify.results.filter((r) => !r.reachable).map((r) => r.name);
-    const reason = `post-arm check found the allow-list blocks: ${unreachable.join(", ")}. Fast-disarmed rather than leave a bricked agent.`;
+    // FIX (round 5, item c): honesty. The post-arm re-check runs the SAME
+    // probe list as pre-arm (DNS-resolvability + moved-credential readability);
+    // it does NOT and cannot prove the allow-list is what blocked anything (a
+    // failed DNS lookup, a vanished credential, or a transient network fault
+    // all fail these probes without the wall's allow-list being the cause).
+    // Report what actually failed the re-check, and name the still-open
+    // question (is the allow-list correct?) as the drill's job -- never assert
+    // "the allow-list blocks" from a probe that cannot show it.
+    const reason =
+      `post-arm connectivity re-check failed for: ${unreachable.join(", ")}. ` +
+      `This re-check proves DNS-resolvability and moved-credential readability only, not allow-list ` +
+      `correctness (the Erik-present drill confirms end-to-end reachability as the agent uid). ` +
+      `Fast-disarmed rather than leave a bricked agent.`;
     // FIX R5 (HIGH, 2026-07-07 fix-round 2): `disarm()` can itself fail (the
     // exact scenario this rollback exists for -- something about this host
     // is already unhealthy). The pre-fix-round-2 code left this call
@@ -378,4 +418,45 @@ async function safeRestore(
     // ever reports on the restore itself.
     return { rolledBack: false, backupPaths: results.filter((r) => r.backupPath).map((r) => r.backupPath!) };
   }
+}
+
+/**
+ * FIX (round 5, item N3): tear the (already-bootstrapped, LIVE) harness daemon
+ * back down THEN restore the re-home, for every post-install abort branch.
+ * Before this, a fail-closed abort after `installHarnessDaemon` succeeded left
+ * a root LaunchDaemon running under the dedicated account while the outcome
+ * reported a clean re-home rollback. Best-effort + fail-loud: a teardown
+ * failure is captured (folded into the abort reason by
+ * {@link withDaemonTeardownNote}) but never prevents the re-home restore from
+ * being attempted, and never throws.
+ */
+async function teardownDaemonAndRestore(
+  ops: ProvisionFlowOps,
+  results: RehomeStepResult[],
+): Promise<{ rolledBack: boolean | "partial"; backupPaths: string[]; daemonTeardownError?: string }> {
+  let daemonTeardownError: string | undefined;
+  try {
+    await ops.uninstallHarnessDaemon();
+  } catch (err) {
+    daemonTeardownError = (err as Error).message;
+  }
+  const restore = await safeRestore(ops, results);
+  return { rolledBack: restore.rolledBack, backupPaths: restore.backupPaths, daemonTeardownError };
+}
+
+/**
+ * Fold a harness-daemon teardown failure (fix, round 5 item N3) into an abort
+ * reason as LOUD manual-recovery guidance -- the operator must know a root
+ * LaunchDaemon may still be live so they can remove it by hand. Returns the
+ * reason unchanged when teardown succeeded.
+ */
+function withDaemonTeardownNote(reason: string, daemonTeardownError?: string): string {
+  if (daemonTeardownError === undefined) {
+    return reason;
+  }
+  return (
+    `${reason} (NOTE: the harness daemon could NOT be torn down automatically: ${daemonTeardownError}. ` +
+    `It may still be running under the dedicated account -- run 'sudo sanctuary castle-wall disable' and remove ` +
+    `the ai.sanctuaryprotocol.agent-harness LaunchDaemon manually before re-running.)`
+  );
 }

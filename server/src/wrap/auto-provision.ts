@@ -29,8 +29,8 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, access, stat, cp } from "node:fs/promises";
-import { dirname } from "node:path";
+import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, stat, lstat, cp } from "node:fs/promises";
+import { dirname, relative, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
 import {
@@ -39,6 +39,7 @@ import {
   hermesRehomeAdapter,
   planRehome,
   executeRehomePlan,
+  RehomeExecutionError,
   restoreRehomeSteps,
   resolveHermesGatewayArgv,
   runProvisionFlow,
@@ -154,18 +155,79 @@ function throwIfDisarmFailed(code: number): void {
  *     ABSENT moved credential as "reachable" -- exactly the F7/R1 symptom
  *     this probe exists to catch. A credential that was supposed to move but
  *     did not must fail the probe, not pass it.
- *   - owner uid matches AND the owner-read bit (0400) is set -> `true`.
- *   - owner uid does NOT match, but the file is world-readable (0004) or the
- *     target uid's group matches the file's gid and the group-read bit
- *     (0040) is set -> `true` (matches the real access(2) semantics closely
- *     enough for a fail-closed decision; production custody always chowns to
- *     the target uid, so the owner-match branch is the one that actually
- *     fires post-re-home -- this branch exists so the seam is honest about
- *     what POSIX permission bits actually allow, not merely what today's
- *     custody code happens to write).
+ *   - the single applicable POSIX permission class (owner if the uid matches,
+ *     else group if the gid matches, else other) has its read bit set ->
+ *     readable. The class is resolved FIRST and only that class's bits are
+ *     consulted: POSIX makes the first matching class authoritative (a group
+ *     member does not additionally inherit "other" bits), so this never falls
+ *     through from a group match with the group-read bit clear into the
+ *     world-readable check. Production custody always chowns to the target
+ *     uid, so the owner-match branch is the one that actually fires
+ *     post-re-home; the group/other branches exist so the seam is honest
+ *     about what POSIX permission bits actually allow.
+ *   - FIX (round 5, item a): a DIRECTORY-shaped credential (e.g.
+ *     `.hermes/google-mcp-creds/`, `.workspace-mcp/cli-tokens/`) additionally
+ *     requires the EXECUTE/traverse bit of the applicable class. A directory
+ *     with the read bit but not the execute bit (e.g. mode 0600) is only
+ *     listable-if-you-can-enter; the agent CANNOT enter it to open the
+ *     credential files inside, so a read-only directory must fail the probe.
+ *     Files need read alone; dirs need read AND execute.
  *   - anything else -> `false`.
  */
 export function credentialReadableAsUidDecision(
+  statResult: { uid: number; gid: number; mode: number; isDirectory?: boolean } | undefined,
+  targetUid: number,
+  targetGid?: number,
+): boolean {
+  if (statResult === undefined) {
+    return false;
+  }
+  const { uid, gid, mode, isDirectory } = statResult;
+  const cls = applicablePermClass({ uid, gid }, targetUid, targetGid);
+  if ((mode & cls.read) === 0) {
+    return false;
+  }
+  // FIX (round 5, item a): a directory the agent cannot traverse (no execute
+  // bit for its class) cannot yield its contents even though its read bit is
+  // set -- fail closed. Files are readable on the read bit alone.
+  if (isDirectory === true) {
+    return (mode & cls.exec) !== 0;
+  }
+  return true;
+}
+
+/**
+ * Resolve the single applicable POSIX permission-bit pair (read + execute)
+ * for `targetUid`/`targetGid` against a file owned by `uid`/`gid`. Owner ->
+ * group -> other, first match wins (a group member never additionally
+ * inherits "other" bits). Shared by {@link credentialReadableAsUidDecision}
+ * and {@link pathTraversableByUidDecision} so both agree on which class
+ * governs.
+ */
+function applicablePermClass(
+  owner: { uid: number; gid: number },
+  targetUid: number,
+  targetGid?: number,
+): { read: number; exec: number } {
+  if (owner.uid === targetUid) {
+    return { read: 0o400, exec: 0o100 };
+  }
+  if (targetGid !== undefined && owner.gid === targetGid) {
+    return { read: 0o040, exec: 0o010 };
+  }
+  return { read: 0o004, exec: 0o001 };
+}
+
+/**
+ * FIX (round 5, item N1): pure decision for "can the target uid TRAVERSE
+ * (enter) this directory" -- the execute bit of its applicable POSIX class.
+ * A root `stat()` of a deep credential leaf bypasses ancestor DAC, so the
+ * readable-by-uid probe would otherwise go green over a re-home whose
+ * intermediate directories the agent cannot actually enter (e.g. a root-owned
+ * 0700 `.hermes/` the agent has no execute bit on). Exported so the seam can
+ * drive every class/bit combination directly.
+ */
+export function pathTraversableByUidDecision(
   statResult: { uid: number; gid: number; mode: number } | undefined,
   targetUid: number,
   targetGid?: number,
@@ -173,17 +235,8 @@ export function credentialReadableAsUidDecision(
   if (statResult === undefined) {
     return false;
   }
-  const { uid, gid, mode } = statResult;
-  const OWNER_READ = 0o400;
-  const GROUP_READ = 0o040;
-  const OTHER_READ = 0o004;
-  if (uid === targetUid) {
-    return (mode & OWNER_READ) !== 0;
-  }
-  if (targetGid !== undefined && gid === targetGid && (mode & GROUP_READ) !== 0) {
-    return true;
-  }
-  return (mode & OTHER_READ) !== 0;
+  const cls = applicablePermClass(statResult, targetUid, targetGid);
+  return (statResult.mode & cls.exec) !== 0;
 }
 
 /**
@@ -197,12 +250,30 @@ export function credentialReadableAsUidDecision(
  * absent moved credential is exactly the F7 symptom this probe backstops,
  * never a silent pass).
  */
-function credentialReadableProbe(path: string, targetUid: number, targetGid?: number): () => Promise<boolean> {
+function credentialReadableProbe(
+  path: string,
+  targetUid: number,
+  targetGid?: number,
+  traverseFrom?: string,
+): () => Promise<boolean> {
   return async () => {
     try {
+      // FIX (round 5, item N1): before trusting the leaf's own owner/mode
+      // bits, confirm the target uid can TRAVERSE every ancestor directory
+      // from `traverseFrom` down to the leaf's parent. This process runs as
+      // ROOT, and root's `stat()` bypasses ancestor DAC, so without this walk
+      // a root-owned non-traversable intermediate dir (the exact shape
+      // `move()`'s recursive mkdir creates) would let verify go green over a
+      // re-home the agent cannot actually reach.
+      if (traverseFrom !== undefined) {
+        const traversable = await ancestorsTraversableByUid(path, traverseFrom, targetUid, targetGid);
+        if (!traversable) {
+          return false;
+        }
+      }
       const st = await stat(path);
       return credentialReadableAsUidDecision(
-        { uid: st.uid, gid: st.gid, mode: st.mode },
+        { uid: st.uid, gid: st.gid, mode: st.mode, isDirectory: st.isDirectory() },
         targetUid,
         targetGid,
       );
@@ -220,6 +291,54 @@ function credentialReadableProbe(path: string, targetUid: number, targetGid?: nu
       return false;
     }
   };
+}
+
+/**
+ * FIX (round 5, item N1): every directory from `traverseFrom` down to the
+ * leaf's PARENT (inclusive) must be enterable by the target uid, or the agent
+ * cannot open the credential even though root can `stat()` it. `lstat` (no
+ * follow) is used so a symlink smuggled in as an ancestor is treated as a
+ * non-directory and fails closed rather than being silently followed out of
+ * the account home. Exported so the seam can drive the ancestor-walk directly.
+ * Returns false (fail-closed) on any stat error, a non-directory ancestor, a
+ * leaf that is not under `traverseFrom`, or any ancestor the target uid cannot
+ * traverse.
+ */
+export async function ancestorsTraversableByUid(
+  leafPath: string,
+  traverseFrom: string,
+  targetUid: number,
+  targetGid?: number,
+): Promise<boolean> {
+  const parent = dirname(leafPath);
+  const rel = relative(traverseFrom, parent);
+  // A leaf outside `traverseFrom` (rel starts with "..") is not something we
+  // can reason about -- fail closed rather than skip the check.
+  if (rel.startsWith("..")) {
+    return false;
+  }
+  const segments = rel.length === 0 ? [] : rel.split(sep);
+  const chain: string[] = [traverseFrom];
+  let current = traverseFrom;
+  for (const seg of segments) {
+    current = `${current}/${seg}`;
+    chain.push(current);
+  }
+  for (const dir of chain) {
+    let st;
+    try {
+      st = await lstat(dir);
+    } catch {
+      return false;
+    }
+    if (!st.isDirectory()) {
+      return false;
+    }
+    if (!pathTraversableByUidDecision({ uid: st.uid, gid: st.gid, mode: st.mode }, targetUid, targetGid)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -263,10 +382,17 @@ export function hermesEndpointProbes(newAccountHome: string, targetUid: number, 
   // not just `.hermes/.env` -- fail-closed if any is unreadable, so a
   // broken re-home of a non-.env credential can no longer sail through
   // verify while only the .env probe was checked.
+  //
+  // FIX (round 5, item N1): the probe walks every ancestor from the
+  // account-home BASE (`dirname(newAccountHome)`) down to each credential,
+  // requiring the target uid can traverse each one -- so a root-owned,
+  // non-traversable intermediate directory fails the probe instead of
+  // sailing through on root's ancestor-bypassing `stat()`.
+  const traverseFrom = dirname(newAccountHome);
   for (const destRelativePath of allHermesCredentialDestPaths()) {
     targets.push({
       name: `moved credential present + readable by agent uid (${destRelativePath})`,
-      probe: credentialReadableProbe(`${newAccountHome}/${destRelativePath}`, targetUid, targetGid),
+      probe: credentialReadableProbe(`${newAccountHome}/${destRelativePath}`, targetUid, targetGid, traverseFrom),
     });
   }
   return targets;
@@ -402,6 +528,34 @@ async function resolveOperatorIdentity(): Promise<OperatorIdentity | undefined> 
   return { uid: sudoIdentity.uid, gid: sudoIdentity.gid, home };
 }
 
+/**
+ * FIX (round 5, item N4): parse the record names out of `dscl . -search
+ * /Users UniqueID <n>` output. `dscl -search` emits the matched attribute in
+ * the PARENTHESIZED, multi-line plist form, e.g.
+ *
+ *   eriknewton\t\tUniqueID = (
+ *       501
+ *   )
+ *
+ * The pre-fix parser was `/^(\S+)\s+UniqueID\s*=\s*\d+/m`, which requires the
+ * uid digits on the SAME line as `UniqueID =` and therefore NEVER matched the
+ * real `= (` form: every uid-fallback home lookup and every
+ * `resolveAccountShapeVerdict` account-name check silently missed. This
+ * parser matches the record-name line (`name  UniqueID =`) whether the value
+ * is parenthesized-multiline or single-line, and returns ALL matched record
+ * names (a `-search` can in principle return more than one record). Exported
+ * so the seam can drive it against captured real dscl output.
+ */
+export function parseDsclSearchAccountNames(stdout: string): string[] {
+  const names: string[] = [];
+  const re = /^(\S+)\s+UniqueID\s*=/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stdout)) !== null) {
+    names.push(m[1]);
+  }
+  return names;
+}
+
 /** Look up a NFSHomeDirectory by account name (preferred) or uid, via dscl. Fail-closed: any error or unparsed output resolves undefined. */
 async function lookupHomeDirectory(user: string | undefined, uid: number): Promise<string | undefined> {
   try {
@@ -417,12 +571,14 @@ async function lookupHomeDirectory(user: string | undefined, uid: number): Promi
       "UniqueID",
       String(uid),
     ]);
-    const nameMatch = /^(\S+)\s+UniqueID\s*=\s*\d+/m.exec(searchOut);
-    if (!nameMatch) return undefined;
+    // FIX (round 5, item N4): parse the parenthesized dscl -search output
+    // shape (the pre-fix same-line-digits regex never matched it).
+    const [accountName] = parseDsclSearchAccountNames(searchOut);
+    if (accountName === undefined) return undefined;
     const { stdout } = await execFileAsync("/usr/bin/dscl", [
       ".",
       "-read",
-      `/Users/${nameMatch[1]}`,
+      `/Users/${accountName}`,
       "NFSHomeDirectory",
     ]);
     const match = /NFSHomeDirectory:\s*(\S+)/.exec(stdout);
@@ -582,8 +738,35 @@ export async function runAutoProvisionForWrap(
       );
     },
     rehome: async (uid, gid) => {
+      // FIX (round 5, item N1): the shared agent-home BASE
+      // (`/var/sanctuary-agents`) must be root-owned and world-TRAVERSABLE
+      // (0711) so each dedicated agent can reach its own home, but never
+      // listable/writable by non-root. Normalize it BEFORE the moves --
+      // `move()`'s recursive mkdir would otherwise create it 0700 root-owned,
+      // leaving the agent unable to even traverse into its own home.
+      await mkdir(NEW_ACCOUNT_HOME_BASE, { recursive: true, mode: 0o711 });
+      await chmod(NEW_ACCOUNT_HOME_BASE, 0o711);
+      const rehomeOps = realRehomeOps();
       const plan = planRehome(hermesRehomeAdapter, { operatorHome, newAccountHome });
-      const results = await executeRehomePlan(plan, realRehomeOps(), { uid, gid });
+      const results = await executeRehomePlan(plan, rehomeOps, { uid, gid });
+      // FIX (round 5, item N1): chown the agent's WHOLE home tree (the home
+      // dir + every intermediate credential dir `move()`'s mkdir created
+      // root-owned + the leaves) to the agent, so it can traverse to and read
+      // its re-homed secrets. Per-leaf chown only covered the leaves, never
+      // the ancestor dirs, so the agent had no traverse bit on `.hermes/` etc.
+      try {
+        await rehomeOps.chown(newAccountHome, uid, gid);
+      } catch (err) {
+        // The moves ALREADY succeeded by now; a failure chowning the home
+        // tree must NOT discard the moved results (the orchestrator's
+        // `safeRestore` needs them to reverse the move). Re-throw as a
+        // RehomeExecutionError carrying the completed `results`, exactly like
+        // executeRehomePlan's own mid-loop throw (the G3 straddling-entry
+        // pattern) -- otherwise a plain throw here would reach the
+        // orchestrator as an empty-partialResults abort and strand the moved
+        // secrets under the new account with nothing restored.
+        throw new RehomeExecutionError(err instanceof Error ? err.message : String(err), results, { cause: err });
+      }
       return { plan, results };
     },
     installHarnessDaemon: async (uid) => {
@@ -601,6 +784,15 @@ export async function runAutoProvisionForWrap(
         fortressPath: process.env.SANCTUARY_STORAGE_PATH,
       });
       await installAgentHarnessDaemon(plan, realHarnessDaemonOps());
+    },
+    // FIX (round 5, item N3): tear the harness daemon back down on a
+    // post-install abort. `installHarnessDaemon` bootstraps a LIVE root
+    // LaunchDaemon (it runs `launchctl bootstrap system <plist>`); before
+    // this op, the orchestrator's post-install abort branches restored the
+    // re-home but left that daemon running under the dedicated account while
+    // reporting a clean rollback. Reuses the shipped fail-loud uninstaller.
+    uninstallHarnessDaemon: async () => {
+      await uninstallAgentHarnessDaemon(realHarnessDaemonOps());
     },
     // FIX R1 (BLOCKER, fix-round 2): honest, fail-closed probe list -- see
     // `hermesEndpointProbes` above. `resolvedAgentUidGid` is always set by
@@ -680,6 +872,26 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
+/**
+ * FIX (round 5, item b): no-follow existence check. `access()`/`stat()`
+ * FOLLOW symlinks, so a DANGLING symlink (a symlink whose target does not
+ * exist) reads as "does not exist" -- which let `findUniqueConflictPath` and
+ * the restore-conflict guard treat a symlink-occupied path as free and then
+ * clobber the symlink with a rename/copy. `lstat` does NOT follow the final
+ * component, so ANY name present at `path` (a real file/dir, a live symlink,
+ * or a dangling symlink) counts as occupied. Fail-closed: a name we cannot
+ * even `lstat` for any reason other than ENOENT is treated as present (never
+ * assume a path is free on an ambiguous error before we overwrite it).
+ */
+async function pathExistsNoFollow(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+}
+
 async function readHarnessConfiguredUid(): Promise<number | undefined> {
   // v1: the Hermes gateway plist (a per-user LaunchAgent today) declares no
   // UserName/uid pin, so there is no config-declared identity to read yet.
@@ -730,9 +942,14 @@ async function resolveAccountShapeVerdict(
       "UniqueID",
       String(candidateUid),
     ]);
-    // Output shape: "<accountName>  UniqueID = <uid>\n" per matching record.
-    const nameMatch = /^(\S+)\s+UniqueID\s*=\s*\d+/m.exec(searchOut);
-    if (!nameMatch || nameMatch[1] !== expectedAccountName) {
+    // FIX (round 5, item N4): dscl -search emits the parenthesized multi-line
+    // form (`<name>\t\tUniqueID = (\n  <uid>\n)`); the pre-fix same-line-digit
+    // regex never matched it, so this verdict ALWAYS fell to "not-dedicated"
+    // and the alreadyDedicated fast-path could never confirm a genuinely
+    // dedicated account. Parse the real shape and require the expected account
+    // name to be among the matched records.
+    const searchedNames = parseDsclSearchAccountNames(searchOut);
+    if (!searchedNames.includes(expectedAccountName)) {
       return "not-dedicated";
     }
     const { stdout: hiddenOut } = await execFileAsync("/usr/bin/dscl", [
@@ -847,16 +1064,24 @@ function realAccountProvisionOps() {
  * safely" `{ restored: false, conflictPath }` outcome. Bounded at 1000
  * suffixes (fail-closed: this is a real-ops path, not a place to spin
  * forever on a pathological directory full of stale conflict files).
+ *
+ * FIX (round 5, item b): existence is checked with {@link pathExistsNoFollow}
+ * (`lstat`, no symlink follow), not `access()`. A DANGLING symlink at the
+ * conflict target otherwise read as "free" under `access()` and got clobbered
+ * by the rename/copy -- the exact G2 defect, one indirection over. Any
+ * symlink at a candidate path (live or dangling) now counts as occupied, so
+ * the moved data lands on a genuinely free name and never destroys a symlink
+ * an operator or prior run left behind.
  */
 async function findUniqueConflictPath(sourcePath: string): Promise<string> {
   const base = `${sourcePath}.restored-conflict`;
-  if (!(await pathExists(base))) {
+  if (!(await pathExistsNoFollow(base))) {
     return base;
   }
   const MAX_SUFFIX = 1000;
   for (let i = 1; i <= MAX_SUFFIX; i++) {
     const candidate = `${base}.${i}`;
-    if (!(await pathExists(candidate))) {
+    if (!(await pathExistsNoFollow(candidate))) {
       return candidate;
     }
   }
@@ -865,9 +1090,25 @@ async function findUniqueConflictPath(sourcePath: string): Promise<string> {
   );
 }
 
-/** Recursively chmod a file or directory tree (files 0600, dirs 0700), matching custody mode for both shapes. */
+/**
+ * Recursively chmod a file or directory tree (files 0600, dirs 0700),
+ * matching custody mode for both shapes.
+ *
+ * FIX (round 5, item N2): symlink-safe. The pre-fix helper used `stat`
+ * (follows symlinks) and `readdir` on a path that could itself be a
+ * symlink-to-directory, so a symlink smuggled into a moved/restored secret
+ * tree let a ROOT chmod escape the tree and alter an arbitrary operator file,
+ * or recurse through the link's target. Now every entry is `lstat`'d first:
+ * a symlink is SKIPPED entirely (its own permission bits are irrelevant on
+ * Linux and must never be dereferenced), and recursion only descends into a
+ * REAL directory, never a symlink-to-directory.
+ */
 async function chmodRecursive(path: string): Promise<void> {
-  const st = await stat(path);
+  const st = await lstat(path);
+  if (st.isSymbolicLink()) {
+    // Never chmod a symlink's target, never recurse through it.
+    return;
+  }
   if (st.isDirectory()) {
     await chmod(path, 0o700);
     const { readdir } = await import("node:fs/promises");
@@ -881,10 +1122,24 @@ async function chmodRecursive(path: string): Promise<void> {
   }
 }
 
-/** Recursively chown a file or directory tree to uid/gid. */
+/**
+ * Recursively chown a file or directory tree to uid/gid.
+ *
+ * FIX (round 5, item N2): symlink-safe. `fs.chown`/`fs.stat` FOLLOW symlinks,
+ * so the pre-fix helper let a ROOT chown of a moved/restored tree dereference
+ * a symlink and re-own an arbitrary operator file OUTSIDE the tree, or recurse
+ * through a symlink-to-directory. Now every entry is `lstat`'d: a symlink is
+ * chowned via `lchown` (the LINK itself, never its target) and never recursed
+ * into; recursion only descends into a REAL directory.
+ */
 async function chownRecursive(path: string, uid: number, gid: number): Promise<void> {
+  const st = await lstat(path);
+  if (st.isSymbolicLink()) {
+    // Chown the link itself (never its target); do not recurse through it.
+    await lchown(path, uid, gid);
+    return;
+  }
   await fsChown(path, uid, gid);
-  const st = await stat(path);
   if (st.isDirectory()) {
     const { readdir } = await import("node:fs/promises");
     const { join } = await import("node:path");
@@ -898,12 +1153,18 @@ async function chownRecursive(path: string, uid: number, gid: number): Promise<v
 /**
  * Exported (fix chokepoint, 2026-07-07 fix-round 2) so the real-ops unit
  * suite can exercise the ACTUAL restore-conflict decision logic (R6) against
- * a real, disposable tmpdir -- not a mock standing in for it. `backup`/
- * `move`'s hardcoded root-owned backup path (`/var/root/...`) is untouched
- * by the restore-conflict test (it never reaches that fallback branch when
- * `destPath` exists), so this is safely testable without root.
+ * a real, disposable tmpdir -- not a mock standing in for it.
+ *
+ * FIX (round 5, item d): the backup root is injectable via `opts.backupRoot`,
+ * defaulting to the production `/var/root/...` location. This is a test-only
+ * seam: the real-ops unit suite points it at a disposable tmpdir so the
+ * backup-copy FALLBACK conflict branch (destPath gone, backup present, source
+ * recreated) can be exercised end-to-end WITHOUT root, which the previous seam
+ * could only document as a non-root-testable boundary. Production callers pass
+ * no argument and get the root-only backup root unchanged.
  */
-export function realRehomeOps() {
+export function realRehomeOps(opts?: { backupRoot?: string }) {
+  const backupRoot = opts?.backupRoot ?? "/var/root/.sanctuary-rehome-backups";
   return {
     pathExists,
     backup: async (path: string): Promise<{ backupPath: string }> => {
@@ -913,7 +1174,6 @@ export function realRehomeOps() {
       // produce (AGENTS.md invariant #6). `copyFile` does not accept a mode
       // argument, so the mode is set explicitly with `chmod` immediately
       // after the copy, closing the umask-dependent window.
-      const backupRoot = "/var/root/.sanctuary-rehome-backups";
       const backupPath = `${backupRoot}${path}.bak`;
       await mkdir(dirname(backupPath), { recursive: true, mode: 0o700 });
       const st = await stat(path);
@@ -980,7 +1240,10 @@ export function realRehomeOps() {
       const destExists = await pathExists(destPath);
       await mkdir(dirname(sourcePath), { recursive: true, mode: 0o700 });
       if (destExists) {
-        const sourceConflict = await pathExists(sourcePath);
+        // FIX (round 5, item b): no-follow check -- a symlink recreated at
+        // sourcePath (dangling or live) is a conflict, never a "free" path we
+        // silently overwrite by following it elsewhere.
+        const sourceConflict = await pathExistsNoFollow(sourcePath);
         if (sourceConflict) {
           // FIX R6: never overwrite operator data that was recreated at the
           // original path while it was re-homed. Restore the moved data to a
@@ -997,10 +1260,12 @@ export function realRehomeOps() {
       }
       // destPath is already gone (unusual: implies a partial rollback
       // already ran). Fall back to the M4 backup copy, if this path had one.
-      const backupRoot = "/var/root/.sanctuary-rehome-backups";
+      // FIX (round 5, item d): `backupRoot` is the injectable closure value
+      // (defaults to the production /var/root location), so this fallback
+      // branch is now reachable by the seam against a disposable tmpdir.
       const backupPath = `${backupRoot}${sourcePath}.bak`;
       if (await pathExists(backupPath)) {
-        const sourceConflict = await pathExists(sourcePath);
+        const sourceConflict = await pathExistsNoFollow(sourcePath);
         if (sourceConflict) {
           // Same conflict guard for the backup-copy fallback: never
           // overwrite a recreated source with the backup copy either.

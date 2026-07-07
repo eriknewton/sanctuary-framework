@@ -34,12 +34,15 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 import {
   credentialReadableAsUidDecision,
+  pathTraversableByUidDecision,
+  ancestorsTraversableByUid,
+  parseDsclSearchAccountNames,
   resolveSudoIdentityDecision,
   realRehomeOps,
   disarmExitCodeDecision,
@@ -93,6 +96,41 @@ describe("wrap/auto-provision real-ops chokepoint: credentialReadableAsUidDecisi
   it("owner uid does NOT match, no matching group, no other-read -> false", () => {
     const result = credentialReadableAsUidDecision({ uid: 0, gid: 0, mode: 0o640 }, 502, 999);
     expect(result).toBe(false);
+  });
+
+  // FIX (round 5, item a): a directory-shaped credential needs the EXECUTE
+  // (traverse) bit of its applicable class, not just the read bit -- a
+  // read-only directory can be listed but not ENTERED, so the agent cannot
+  // open the credential files inside it.
+  it("FIX round-5(a): a DIRECTORY with owner read but NO owner-execute (mode 0600) -> false (unenterable)", () => {
+    expect(credentialReadableAsUidDecision({ uid: 502, gid: 502, mode: 0o600, isDirectory: true }, 502)).toBe(false);
+  });
+
+  it("FIX round-5(a): a DIRECTORY with owner read AND owner-execute (mode 0700) -> true (enterable)", () => {
+    expect(credentialReadableAsUidDecision({ uid: 502, gid: 502, mode: 0o700, isDirectory: true }, 502)).toBe(true);
+  });
+
+  it("FIX round-5(a): a DIRECTORY at mode 0500 (r-x, no write) is still enterable+readable -> true", () => {
+    expect(credentialReadableAsUidDecision({ uid: 502, gid: 502, mode: 0o500, isDirectory: true }, 502)).toBe(true);
+  });
+
+  it("FIX round-5(a): a FILE at mode 0600 stays readable on the read bit alone (execute bit irrelevant for files)", () => {
+    expect(credentialReadableAsUidDecision({ uid: 502, gid: 502, mode: 0o600, isDirectory: false }, 502)).toBe(true);
+  });
+
+  it("FIX round-5(a): a group-owned DIRECTORY needs group-execute too (mode 0640 = group r, no group x) -> false", () => {
+    expect(credentialReadableAsUidDecision({ uid: 0, gid: 20, mode: 0o640, isDirectory: true }, 502, 20)).toBe(false);
+  });
+
+  it("FIX round-5(a): a group-owned DIRECTORY with group r+x (mode 0650) -> true", () => {
+    expect(credentialReadableAsUidDecision({ uid: 0, gid: 20, mode: 0o650, isDirectory: true }, 502, 20)).toBe(true);
+  });
+
+  // POSIX class-exclusivity: a group member does NOT additionally inherit the
+  // "other" bits. Before round 5, a group match with the group-read bit clear
+  // fell through to the world-readable check and could overclaim readable.
+  it("FIX round-5(a): group class is authoritative -- group match with NO group-read bit does NOT fall through to other-read (mode 0604, gid match) -> false", () => {
+    expect(credentialReadableAsUidDecision({ uid: 0, gid: 20, mode: 0o604 }, 502, 20)).toBe(false);
   });
 });
 
@@ -521,6 +559,113 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
       await rm(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it("FIX round-5(b): a DANGLING symlink occupying the .restored-conflict target is never clobbered -- restore advances to .restored-conflict.1 (access() would have followed it and read it as free)", async () => {
+    tmpRoot = await makeTmp();
+    try {
+      const destPath = join(tmpRoot, "dest", "secret.env");
+      const sourcePath = join(tmpRoot, "source", "secret.env");
+      const conflictBase = `${sourcePath}.restored-conflict`;
+      await mkdir(join(tmpRoot, "dest"), { recursive: true });
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      await writeFile(destPath, "moved-content-symlink-round");
+      await writeFile(sourcePath, "operators-recreated-data-symlink-round");
+      // A DANGLING symlink: its target does not exist, so access()/stat()
+      // (which follow symlinks) would report the conflict base as "does not
+      // exist" and the pre-fix code would rename onto it, destroying it.
+      // lstat (round-5 fix) sees the symlink itself and treats it as occupied.
+      await symlink(join(tmpRoot, "nonexistent-target"), conflictBase);
+
+      const ops = realRehomeOps();
+      const result = await ops.restore(destPath, sourcePath);
+
+      expect(result.restored).toBe(false);
+      expect(result.conflictPath).toBe(`${conflictBase}.1`);
+
+      // The dangling symlink must still be present and untouched.
+      const linkStat = await lstat(conflictBase);
+      expect(linkStat.isSymbolicLink()).toBe(true);
+      expect(await readlink(conflictBase)).toBe(join(tmpRoot, "nonexistent-target"));
+
+      expect(await readFile(sourcePath, "utf8")).toBe("operators-recreated-data-symlink-round");
+      expect(await readFile(result.conflictPath!, "utf8")).toBe("moved-content-symlink-round");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX round-5(d): backup-copy FALLBACK restore (destPath gone) with an injected backupRoot restores cleanly when there is no conflict", async () => {
+    tmpRoot = await makeTmp();
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const sourcePath = join(tmpRoot, "source", "secret.env");
+      const backupPath = `${backupRoot}${sourcePath}.bak`;
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      await mkdir(dirname(backupPath), { recursive: true });
+      await writeFile(backupPath, "backup-copy-content");
+
+      const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
+      const ops = realRehomeOps({ backupRoot });
+      const result = await ops.restore(destPath, sourcePath);
+
+      expect(result.restored).toBe(true);
+      expect(result.conflictPath).toBeUndefined();
+      expect(await readFile(sourcePath, "utf8")).toBe("backup-copy-content");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX round-5(d): backup-copy FALLBACK CONFLICT branch (now reachable via injected backupRoot) restores the backup to a fresh conflict path and NEVER overwrites the recreated source", async () => {
+    tmpRoot = await makeTmp();
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const sourcePath = join(tmpRoot, "source", "secret.env");
+      const backupPath = `${backupRoot}${sourcePath}.bak`;
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      await mkdir(dirname(backupPath), { recursive: true });
+      await writeFile(backupPath, "backup-copy-content-must-not-be-lost");
+      await writeFile(sourcePath, "operators-recreated-data-fallback-conflict");
+
+      const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
+      const ops = realRehomeOps({ backupRoot });
+      const result = await ops.restore(destPath, sourcePath);
+
+      expect(result.restored).toBe(false);
+      expect(result.conflictPath).toBe(`${sourcePath}.restored-conflict`);
+      expect(await readFile(sourcePath, "utf8")).toBe("operators-recreated-data-fallback-conflict");
+      expect(await readFile(result.conflictPath!, "utf8")).toBe("backup-copy-content-must-not-be-lost");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX round-5(d): backup-copy FALLBACK CONFLICT branch also refuses to overwrite a PRE-EXISTING conflict sibling (advances to .restored-conflict.1)", async () => {
+    tmpRoot = await makeTmp();
+    try {
+      const backupRoot = join(tmpRoot, "backups");
+      const sourcePath = join(tmpRoot, "source", "secret.env");
+      const backupPath = `${backupRoot}${sourcePath}.bak`;
+      const preexistingConflictPath = `${sourcePath}.restored-conflict`;
+      await mkdir(join(tmpRoot, "source"), { recursive: true });
+      await mkdir(dirname(backupPath), { recursive: true });
+      await writeFile(backupPath, "backup-copy-content-round-2");
+      await writeFile(sourcePath, "operators-recreated-data-fallback-round-2");
+      await writeFile(preexistingConflictPath, "PRIOR-FALLBACK-CONFLICT-DATA");
+
+      const destPath = join(tmpRoot, "dest-that-does-not-exist", "secret.env");
+      const ops = realRehomeOps({ backupRoot });
+      const result = await ops.restore(destPath, sourcePath);
+
+      expect(result.restored).toBe(false);
+      expect(result.conflictPath).toBe(`${preexistingConflictPath}.1`);
+      expect(await readFile(preexistingConflictPath, "utf8")).toBe("PRIOR-FALLBACK-CONFLICT-DATA");
+      expect(await readFile(sourcePath, "utf8")).toBe("operators-recreated-data-fallback-round-2");
+      expect(await readFile(result.conflictPath!, "utf8")).toBe("backup-copy-content-round-2");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("wrap/auto-provision real-ops chokepoint: disarmExitCodeDecision (fix G1)", () => {
@@ -638,6 +783,54 @@ describe("wrap/auto-provision real-ops chokepoint: all-credentials readability p
     }
   });
 
+  it("FIX round-5(a): a DIRECTORY-shaped moved credential at mode 0600 (readable but NOT traversable) fails the aggregate pre-arm verify end-to-end", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-dir-noexec-"));
+    try {
+      const accountHome = join(tmpRoot, "agent-home");
+      const hermesDir = join(accountHome, ".hermes");
+      const googleDir = join(accountHome, ".google_workspace_mcp");
+      const workspaceMcpDir = join(accountHome, ".workspace-mcp");
+      await mkdir(hermesDir, { recursive: true });
+      await mkdir(join(hermesDir, "google-mcp-creds"), { recursive: true });
+      await mkdir(googleDir, { recursive: true });
+      await mkdir(workspaceMcpDir, { recursive: true });
+      await mkdir(join(workspaceMcpDir, "cli-tokens"), { recursive: true });
+
+      await writeFile(join(hermesDir, ".env"), "LLM_KEY=abc");
+      await writeFile(join(hermesDir, "auth.json"), '{"token":"secret"}');
+      await writeFile(join(hermesDir, "config.yaml"), "persona: hermes");
+      await writeFile(join(googleDir, "credentials"), "refresh-token");
+
+      await chmod(join(hermesDir, ".env"), 0o600);
+      await chmod(join(hermesDir, "auth.json"), 0o600);
+      await chmod(join(hermesDir, "config.yaml"), 0o600);
+      await chmod(join(googleDir, "credentials"), 0o600);
+      await chmod(join(workspaceMcpDir, "cli-tokens"), 0o700);
+      // A DIRECTORY credential at mode 0600 (read, no execute): the agent
+      // could not enter it to reach the files inside. Pre-round-5 the
+      // read-bit-only decision reported this readable and verify went green.
+      await chmod(join(hermesDir, "google-mcp-creds"), 0o600);
+
+      const targetUid = process.getuid?.() ?? 0;
+      const targetGid = process.getgid?.() ?? 0;
+      const targets = hermesEndpointProbes(accountHome, targetUid, targetGid).filter((t) =>
+        t.name.includes("moved credential"),
+      );
+
+      const result = await verifyReachabilityBeforeArm(targets);
+
+      expect(result.allReachable).toBe(false);
+      const dirResult = result.results.find((r) => r.name.includes("google-mcp-creds"));
+      expect(dirResult?.reachable).toBe(false);
+      const envResult = result.results.find((r) => r.name.includes(".env"));
+      expect(envResult?.reachable).toBe(true);
+    } finally {
+      // Restore traversability so recursive cleanup can enter the dir.
+      await chmod(join(tmpRoot, "agent-home", ".hermes", "google-mcp-creds"), 0o700).catch(() => {});
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
   it("all credentials present and readable -> aggregate pre-arm verify (credential portion) passes", async () => {
     const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-allcreds-happy-"));
     try {
@@ -677,5 +870,168 @@ describe("wrap/auto-provision real-ops chokepoint: all-credentials readability p
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: ancestor traversability (fix round-5 N1)", () => {
+  it("pathTraversableByUidDecision: owner match with owner-execute bit -> true; without it -> false", () => {
+    expect(pathTraversableByUidDecision({ uid: 502, gid: 502, mode: 0o700 }, 502)).toBe(true);
+    expect(pathTraversableByUidDecision({ uid: 502, gid: 502, mode: 0o600 }, 502)).toBe(false);
+  });
+
+  it("pathTraversableByUidDecision: a root-owned 0700 dir is NOT traversable by a non-owner uid (the exact N1 shape)", () => {
+    // Root-owned (uid 0) 0700 dir, target is the agent (502): agent falls in
+    // the OTHER class, which has no execute bit in 0700 -> not traversable.
+    expect(pathTraversableByUidDecision({ uid: 0, gid: 0, mode: 0o700 }, 502)).toBe(false);
+    // A world-traversable base (0711) IS traversable by the agent (other-x set).
+    expect(pathTraversableByUidDecision({ uid: 0, gid: 0, mode: 0o711 }, 502)).toBe(true);
+  });
+
+  it("pathTraversableByUidDecision: group class is authoritative (group match, group-exec set/clear)", () => {
+    expect(pathTraversableByUidDecision({ uid: 0, gid: 20, mode: 0o710 }, 502, 20)).toBe(true);
+    expect(pathTraversableByUidDecision({ uid: 0, gid: 20, mode: 0o700 }, 502, 20)).toBe(false);
+    expect(pathTraversableByUidDecision(undefined, 502)).toBe(false);
+  });
+
+  it("ancestorsTraversableByUid: all ancestors traversable -> true; a non-traversable intermediate dir -> false", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-ancestors-"));
+    try {
+      const base = join(tmpRoot, "base");
+      const home = join(base, "agent-home");
+      const hermes = join(home, ".hermes");
+      const leaf = join(hermes, ".env");
+      await mkdir(hermes, { recursive: true });
+      await writeFile(leaf, "x");
+      const uid = process.getuid?.() ?? 0;
+      const gid = process.getgid?.() ?? 0;
+
+      // All dirs are owner-traversable (default mkdir mode has owner-x).
+      expect(await ancestorsTraversableByUid(leaf, base, uid, gid)).toBe(true);
+
+      // Make the intermediate `.hermes` non-traversable (0600, no owner-x).
+      await chmod(hermes, 0o600);
+      expect(await ancestorsTraversableByUid(leaf, base, uid, gid)).toBe(false);
+    } finally {
+      await chmod(join(tmpRoot, "base", "agent-home", ".hermes"), 0o700).catch(() => {});
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("ancestorsTraversableByUid: a leaf NOT under traverseFrom fails closed (never silently skips the check)", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-ancestors-esc-"));
+    try {
+      const base = join(tmpRoot, "base");
+      await mkdir(base, { recursive: true });
+      const uid = process.getuid?.() ?? 0;
+      // Leaf outside base -> ".." relative -> fail closed.
+      expect(await ancestorsTraversableByUid(join(tmpRoot, "elsewhere", "x"), base, uid)).toBe(false);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("FIX round-5(N1): a leaf under a root-shape non-traversable intermediate dir fails the credential probe end-to-end even though the leaf's own bits are fine", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-n1-e2e-"));
+    try {
+      const accountHome = join(tmpRoot, "agent-home");
+      const hermesDir = join(accountHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      await writeFile(join(hermesDir, ".env"), "LLM_KEY=abc");
+      await chmod(join(hermesDir, ".env"), 0o600);
+      // The intermediate `.hermes` is non-traversable (0600): the agent cannot
+      // enter it to open `.env`, even though `.env`'s own bits are fine and a
+      // root stat() of the leaf would report it readable.
+      await chmod(hermesDir, 0o600);
+
+      const targetUid = process.getuid?.() ?? 0;
+      const targetGid = process.getgid?.() ?? 0;
+      const envTarget = hermesEndpointProbes(accountHome, targetUid, targetGid).find(
+        (t) => t.name.includes("moved credential") && t.name.includes(".hermes/.env"),
+      );
+      expect(envTarget).toBeDefined();
+      expect(await envTarget!.probe()).toBe(false);
+    } finally {
+      await chmod(join(tmpRoot, "agent-home", ".hermes"), 0o700).catch(() => {});
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: symlink-safe recursive chmod/chown (fix round-5 N2)", () => {
+  it("restoreCustody (chmodRecursive) NEVER follows a symlink out of the tree -- an outside file's mode is untouched", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-n2-chmod-"));
+    try {
+      const tree = join(tmpRoot, "tree");
+      const outside = join(tmpRoot, "outside.txt");
+      await mkdir(tree, { recursive: true });
+      await writeFile(join(tree, "file.txt"), "in-tree");
+      await writeFile(outside, "outside-secret");
+      await chmod(outside, 0o644);
+      // A symlink INSIDE the tree pointing at a file OUTSIDE it.
+      await symlink(outside, join(tree, "escape-link"));
+
+      const uid = process.getuid?.() ?? 0;
+      const gid = process.getgid?.() ?? 0;
+      // restoreCustody runs chmodRecursive + chownRecursive on the tree.
+      await realRehomeOps().restoreCustody(tree, uid, gid);
+
+      // The outside file's mode MUST be unchanged (0644): the pre-fix
+      // stat-follows-symlink code would have chmod'd it to 0600 through the
+      // link. The symlink itself must survive.
+      expect((await stat(outside)).mode & 0o777).toBe(0o644);
+      expect((await lstat(join(tree, "escape-link"))).isSymbolicLink()).toBe(true);
+      // In-tree file is custody-moded 0600.
+      expect((await stat(join(tree, "file.txt"))).mode & 0o777).toBe(0o600);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("restoreCustody NEVER recurses THROUGH a symlink-to-directory -- files under the outside dir are untouched", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-realops-n2-recurse-"));
+    try {
+      const tree = join(tmpRoot, "tree");
+      const outsideDir = join(tmpRoot, "outsidedir");
+      await mkdir(tree, { recursive: true });
+      await mkdir(outsideDir, { recursive: true });
+      await writeFile(join(outsideDir, "secret.txt"), "must-stay");
+      await chmod(join(outsideDir, "secret.txt"), 0o644);
+      // A symlink-to-directory inside the tree.
+      await symlink(outsideDir, join(tree, "linkdir"));
+
+      const uid = process.getuid?.() ?? 0;
+      const gid = process.getgid?.() ?? 0;
+      await realRehomeOps().restoreCustody(tree, uid, gid);
+
+      // The file under the outside dir must be untouched (0644): the pre-fix
+      // code would have readdir'd through the symlink-to-dir and chmod'd it.
+      expect((await stat(join(outsideDir, "secret.txt"))).mode & 0o777).toBe(0o644);
+      expect((await lstat(join(tree, "linkdir"))).isSymbolicLink()).toBe(true);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: dscl -search parser (fix round-5 N4)", () => {
+  it("parses the account name from the real PARENTHESIZED multi-line dscl -search output (the pre-fix regex never matched this)", () => {
+    const realOutput = "eriknewton\t\tUniqueID = (\n    501\n)\n";
+    expect(parseDsclSearchAccountNames(realOutput)).toEqual(["eriknewton"]);
+  });
+
+  it("also parses the single-line form (name  UniqueID = 501)", () => {
+    expect(parseDsclSearchAccountNames("sanctuary-hermes  UniqueID = 502\n")).toEqual(["sanctuary-hermes"]);
+  });
+
+  it("returns every matched record name when a -search returns more than one", () => {
+    const twoRecords = "first\t\tUniqueID = (\n    501\n)\nsecond\t\tUniqueID = (\n    501\n)\n";
+    expect(parseDsclSearchAccountNames(twoRecords)).toEqual(["first", "second"]);
+  });
+
+  it("returns [] on output with no UniqueID record line (fail-closed: no fabricated name)", () => {
+    expect(parseDsclSearchAccountNames("")).toEqual([]);
+    expect(parseDsclSearchAccountNames("NFSHomeDirectory: /Users/x\n")).toEqual([]);
+    // The value lines inside the parentheses must NOT be mistaken for names.
+    expect(parseDsclSearchAccountNames("    501\n)\n")).toEqual([]);
   });
 });

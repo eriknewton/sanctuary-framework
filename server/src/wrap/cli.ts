@@ -1081,11 +1081,25 @@ async function maybeRunAutoProvisionForWrap(
       print: (line) => console.error(`  ${line}`),
     });
   } catch (err) {
+    // FIX (round 5, item N5): a throw reaching here can surface AFTER
+    // privileged side effects already landed -- e.g. `withProvisionLock`'s
+    // finally re-throws a non-ENOENT lock-release error even when
+    // `runProvisionFlow` already created the account, re-homed the secrets, or
+    // ARMED the wall. The pre-fix copy asserted provisioning "did not
+    // complete" and told the operator to blindly re-run, which is wrong (and
+    // unsafe) if the wall is in fact armed over a half-provisioned agent. The
+    // catch cannot know how far the flow got, so it must not claim a
+    // completion state: warn that it may have PARTIALLY applied and that the
+    // armed state must be checked before re-running.
+    //
     // SAFETY: stderr / stdout is the operator-facing CLI channel for this
     // subcommand; never surface secrets or key material here.
     console.error(
-      `  Note: automatic account provisioning did not complete (${(err as Error).message}). ` +
-        `The cooperative wrap above still applies; re-run 'sanctuary protect' to retry provisioning.`,
+      `  WARNING: automatic account provisioning raised an error (${(err as Error).message}). ` +
+        `It may have PARTIALLY applied -- the dedicated account, the re-home, or an armed Castle Wall could ` +
+        `already be in place. The cooperative wrap above still applies. Do NOT assume nothing happened: check ` +
+        `whether Castle Wall is armed before re-running, and run 'sudo sanctuary castle-wall disable' if it is ` +
+        `enforcing over a half-provisioned agent.`,
     );
     return { ran: true };
   }
@@ -1143,7 +1157,10 @@ function renderAutoProvisionOutcome(summary: AutoProvisionSummary): void {
       console.error(
         `  Note: Castle Wall armed then was fast-disarmed (${outcome.reason}). ` +
           `The agent still runs under its dedicated, re-homed account; only enforcement came down. ` +
-          `Re-run 'sanctuary protect --hermes' once the allow-list is fixed.`,
+          // FIX (round 5, item N5): honest -- the post-arm re-check proves
+          // DNS-resolvability + credential readability, not allow-list
+          // correctness, so do not tell the operator to "fix the allow-list".
+          `Re-run 'sanctuary protect --hermes' once the connectivity re-check passes (see the reason above).`,
       );
       return;
     case "armed-rollback-failed":
