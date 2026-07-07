@@ -96,10 +96,12 @@ import {
   readDowngradeLog,
   runFleetReResolve,
   resolveFleetCap as resolveFleetCapPure,
+  computeFleetCapacityView,
   type FleetCap,
   type ActivateFleetResult,
   type PriorCapState,
   type ReResolveRosterView,
+  type FleetCapacityView,
 } from "../entitlement/index.js";
 import {
   buildCastleWallPosture,
@@ -128,6 +130,7 @@ import {
   federationContextHasIssuerAuthority,
   federationEventHash,
   validateFederationEventHash,
+  JoinCeremony,
   type FederationAppendOptions,
   type FederationAppendResult,
   type FederationContext,
@@ -137,6 +140,8 @@ import {
   type FederationSyncCursor,
   type V1FederationDeps,
 } from "../v1/federation.js";
+import type { NodeMode } from "../mesh/constants.js";
+import type { BootstrapToken } from "../mesh/lifecycle/types.js";
 import {
   deriveNodePosture,
   NODE_TRUST_BOUNDARY_VERSION,
@@ -5873,6 +5878,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // capacity for a revoked license; every node's wall stays up.
         if (!this.checkAuth(req, url, res, { requireToken: true })) return;
         this.handleFleetRevocationListPush(req, res);
+      } else if (method === "GET" && url.pathname === "/api/fleet/capacity") {
+        // Fleet control plane, Add-Machine slice: the honest "enrollment
+        // headroom" read the Add-Machine UI needs before it invites a node.
+        // Read-only; fail-closed to the community floor on any read failure;
+        // never gates security; carries no key material.
+        void this.handleFleetCapacity(res);
+      } else if (
+        method === "POST" &&
+        url.pathname === "/api/fleet/enroll-token"
+      ) {
+        // Fleet control plane, Add-Machine slice: the dashboard-side "Add a
+        // machine" button. Mints a bootstrap token through the SAME ceremony
+        // primitive the CLI's `sanctuary federation authorize` drives. Changes
+        // fleet membership intent, so gate it with the operator bearer token
+        // exactly like `/api/fleet/activate` and `/api/fleet/revocation-list`
+        // (the default-deny gate above already re-checks every non-GET route
+        // with `{ requireToken: true }`; made explicit and local here too).
+        // NEVER GATES SECURITY: the at-capacity pre-check is advisory
+        // MANAGEMENT-CAPACITY UX, not enforcement; it touches no wall /
+        // enforcement / local-dashboard / policy-push / kill-safety path.
+        if (!this.checkAuth(req, url, res, { requireToken: true })) return;
+        this.handleFleetEnrollToken(req, res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
         // Decision endpoints get an additional tighter rate limit
         if (!this.checkRateLimit(req, res, "decisions")) return;
@@ -6448,6 +6475,247 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       version: result.version,
       revokedCount: result.revokedCount,
     };
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: resolve the pure enrollment
+   * headroom view by composing SHIPPED parts only (the existing private
+   * {@link resolveFleetCap} plus the durable roster via
+   * `buildFleetRoster(...)`, as {@link activateFleetLicense} already does),
+   * and feed both into the pure {@link computeFleetCapacityView}. Never
+   * throws: a roster read failure
+   * reports `active_nodes: 0` (honest absence, matches the status handler's
+   * roster-unavailable branch), and `resolveFleetCap` itself is already
+   * fail-closed to the community floor.
+   */
+  private async computeFleetCapacity(): Promise<FleetCapacityView> {
+    const cap = await this.resolveFleetCap();
+    let activeNodes = 0;
+    try {
+      const roster = buildFleetRoster(this.buildV1FederationDeps(), {
+        evictionSerial: this._federationState.evictionMaxSerial,
+        operatorPolicy: this._federationState.operatorPolicy,
+      });
+      if (roster.available) {
+        activeNodes = roster.summary.admitted;
+      }
+    } catch {
+      // Roster unavailable: report 0 active (honest absence); the cap itself
+      // is still the real fail-closed resolution.
+      activeNodes = 0;
+    }
+    return computeFleetCapacityView(cap, activeNodes);
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: `GET /api/fleet/capacity`. The
+   * honest "enrollment headroom" read the Add-Machine UI needs before it
+   * invites a node: tier, max_nodes (null = unlimited), active_nodes,
+   * remaining headroom, and whether the fleet is at capacity. Read-only, no
+   * bearer mutation, no key material. NEVER GATES SECURITY: advisory
+   * management-capacity UX only; touches no wall / enforcement /
+   * local-dashboard / policy-push / kill-safety path. Never throws.
+   */
+  private async handleFleetCapacity(res: ServerResponse): Promise<void> {
+    try {
+      const view = await this.computeFleetCapacity();
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify(view));
+    } catch {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "internal_error" }));
+    }
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: `POST /api/fleet/enroll-token`.
+   * The dashboard-side "Add a machine" button. Body: `{ node_id: string,
+   * node_mode: "local" | "operator_cloud" | "sovereign_tee" }`.
+   *
+   * This is a THIN in-process wrapper over the SAME ceremony primitive
+   * `runFederationAuthorize` drives over HTTP (`JoinCeremony.authorizeInit`,
+   * the daemon-side entry the `/v1/federation/authorize/init` route
+   * dispatches to). It mints the SAME bootstrap-token artifact the CLI verb
+   * prints to stdout (a public signed authorization to submit a JoinRequest),
+   * NOT membership and NOT a secret (AGENTS.md #6: no private key, no master,
+   * no passphrase in the response).
+   *
+   * CAPACITY PRE-CHECK (the product point of this slice): before minting,
+   * resolves the SAME capacity view as `GET /api/fleet/capacity`. If
+   * `at_capacity` and the cap is finite, returns 409 `at_capacity`. This is
+   * advisory MANAGEMENT-CAPACITY UX, not enforcement (the real node-count
+   * enforcement is the already-shipped `applyFleetCap` on the central
+   * roster). It never touches the wall/enforcement/policy-push path, and a
+   * bug here can only ever over-block enrollment, never over-admit a node.
+   *
+   * AUTH: gated by the operator bearer token by the caller (matches
+   * `/api/fleet/activate` and `/api/fleet/revocation-list`).
+   *
+   * Response shape:
+   *   - 200 `{ ok: true, bootstrap_token }` on a successful mint.
+   *   - 400 `{ error: "validation_error" }` on a missing/malformed `node_id`
+   *     or `node_mode`, or `{ error: "Invalid JSON body" }` on unparseable
+   *     JSON.
+   *   - 409 `{ error: "at_capacity", active_nodes, max_nodes, message }` when
+   *     the fleet is at its finite paid node cap (fail-closed courtesy; see
+   *     above).
+   *   - 409 `{ error: "federation_not_provisioned" }` when federation is not
+   *     enabled/provisioned on this fortress, or this fortress cannot mint
+   *     (a non-issuer context, e.g. an operator_cloud or joiner node): never
+   *     a fabricated token, never a silent success (AGENTS.md #5).
+   *   - 500 `{ error: "internal_error" }` on an unexpected throw (no key
+   *     material leaked; no stack).
+   */
+  private handleFleetEnrollToken(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): void {
+    let body = "";
+    let destroyed = false;
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      // 4KB is ample for { node_id, node_mode }.
+      if (body.length > 4096) {
+        destroyed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      if (destroyed) return;
+      let nodeId: string;
+      let nodeMode: NodeMode;
+      try {
+        const parsed = JSON.parse(body) as Record<string, unknown>;
+        const rawNodeId = parsed.node_id;
+        const rawNodeMode = parsed.node_mode;
+        if (typeof rawNodeId !== "string" || rawNodeId.trim().length === 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "validation_error",
+              message: "node_id is required and must be a non-empty string",
+            }),
+          );
+          return;
+        }
+        if (
+          rawNodeMode !== "local" &&
+          rawNodeMode !== "operator_cloud" &&
+          rawNodeMode !== "sovereign_tee"
+        ) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              error: "validation_error",
+              message:
+                "node_mode must be one of local, operator_cloud, sovereign_tee",
+            }),
+          );
+          return;
+        }
+        nodeId = rawNodeId;
+        nodeMode = rawNodeMode;
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
+
+      try {
+        // Capacity pre-check FIRST: an operator at cap should never even
+        // reach the ceremony. Advisory UX only (see doc comment above); the
+        // real enforcement is applyFleetCap on the central roster, untouched.
+        const capacity = await this.computeFleetCapacity();
+        if (capacity.at_capacity && capacity.max_nodes !== null) {
+          res.writeHead(409, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(
+            JSON.stringify({
+              error: "at_capacity",
+              active_nodes: capacity.active_nodes,
+              max_nodes: capacity.max_nodes,
+              message:
+                `This fleet is at its paid node cap (${capacity.max_nodes}). ` +
+                "Upgrade your plan or remove a node from the console to " +
+                "enroll another. Every existing node keeps its Castle Wall protection.",
+            }),
+          );
+          void this.buildV1FederationDeps().audit({
+            operation: "fleet_enroll_token_mint",
+            result: "failure",
+            identityId: nodeId,
+            details: { reason: "at_capacity" },
+          });
+          return;
+        }
+
+        const ctx = this._federationContext;
+        if (
+          !this._federationEnabled ||
+          ctx === null ||
+          !federationContextHasIssuerAuthority(ctx)
+        ) {
+          // Federation disabled/unprovisioned, or this fortress cannot mint
+          // (e.g. a non-issuer joiner/operator_cloud context): fail closed,
+          // never a fabricated token.
+          res.writeHead(409, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ error: "federation_not_provisioned" }));
+          void this.buildV1FederationDeps().audit({
+            operation: "fleet_enroll_token_mint",
+            result: "failure",
+            identityId: nodeId,
+            details: { reason: "federation_not_provisioned" },
+          });
+          return;
+        }
+
+        let bootstrapToken: BootstrapToken;
+        try {
+          bootstrapToken = new JoinCeremony(ctx).authorizeInit({
+            intendedNodeId: nodeId,
+            intendedNodeMode: nodeMode,
+          });
+        } catch {
+          res.writeHead(409, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ error: "federation_not_provisioned" }));
+          void this.buildV1FederationDeps().audit({
+            operation: "fleet_enroll_token_mint",
+            result: "failure",
+            identityId: nodeId,
+            details: { reason: "mint_unavailable" },
+          });
+          return;
+        }
+
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({ ok: true, bootstrap_token: bootstrapToken }));
+        void this.buildV1FederationDeps().audit({
+          operation: "fleet_enroll_token_mint",
+          result: "success",
+          identityId: nodeId,
+          details: { node_mode: nodeMode, nonce: bootstrapToken.nonce },
+        });
+      } catch {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "internal_error" }));
+      }
+    });
   }
 
   private serveLoginPage(res: ServerResponse): void {
