@@ -1175,9 +1175,11 @@ function printCastleWallHelp(): void {
                                       One-command arm: configure the agent-origin descriptor
                                       (same effect as 'configure-origin uid --agent-uid=<uid>')
                                       THEN arm, in a single command. --ceiling defaults to 500.
-                                      Explicit flag only - the uid is never auto-derived. Without
-                                      --agent-uid, behavior is unchanged: enable still refuses to
-                                      arm with no agent-origin descriptor already on disk unless
+                                      The uid must be a plain positive integer AND >= the ceiling
+                                      (root/0 and sub-ceiling uids are rejected; non-numeric values
+                                      are never truncated). Explicit flag only - never auto-derived.
+                                      Without --agent-uid, behavior is unchanged: enable still refuses
+                                      to arm with no agent-origin descriptor already on disk unless
                                       --force (use 'configure-origin' first, or pass --agent-uid).
     disable          Disarm the content filter headlessly (macOS; unconditional dead-man lever).
     setup-shared-dir Create the privileged shared dir for the pinned key (run with sudo, macOS).

@@ -106,6 +106,12 @@ sanctuary castle-wall daemon
 #    uids BELOW --ceiling classify as operator (allowed); the dedicated
 #    agent-account uid is the confined side. Verify uids first: `id <agent-user>`,
 #    and confirm daemon uids (e.g. `id _sshd`) sit below the ceiling.
+#    --agent-uid MUST be a plain positive integer AND >= --ceiling: root/0 can
+#    never be the confined agent (it would cut every system daemon), and a uid
+#    inside the system-daemon band (< ceiling) is rejected. A non-numeric or
+#    fractional value (e.g. 501abc, 502.9) is rejected outright - it is NEVER
+#    truncated to a plausible-but-wrong uid. Any of these fails closed: the
+#    command refuses and does NOT arm.
 #    You MUST also choose a dead-man TTL mode:
 #      --no-ttl        durable arming (stays armed until you disarm)
 #      --ttl <dur>     drill arming (auto-disarms after the TTL; e.g. --ttl 15m)
@@ -140,9 +146,13 @@ fake-arms) if any fail:
   operator SSH/Tailscale access will be cut).
 
 `--agent-uid` is an explicit flag only: the uid is never auto-derived or
-guessed. Passing a malformed or non-numeric uid is rejected fail-closed (the
-command errors out and does NOT arm); it never falls back to arming without a
-descriptor.
+guessed. The value must be a plain positive integer AND `>= --ceiling` (root/0
+and any uid below the ceiling are rejected); a non-numeric or fractional value
+is rejected outright rather than silently truncated to a plausible-but-wrong
+uid. Any of these is rejected fail-closed: the command errors out and does NOT
+arm; it never falls back to arming without a descriptor. `configure-origin`
+enforces the identical rules (both entry points share one validation
+chokepoint).
 
 ---
 
@@ -194,6 +204,7 @@ failed arm:
 | **No boot service for this fortress** | `enable` refuses (reboot-brick guard) | `sudo sanctuary castle-wall install-boot`; `--force` only if boot-survival is supervised out of band |
 | **Signer helper unreachable after reboot** | `daemon` / boot-service start fails with "the signer helper is unreachable" | run `sanctuary castle-wall signer-helper status` for a specific diagnosis (approve the Background Item in System Settings, re-pin, or repair the custody directory) |
 | **No agent-origin descriptor set** | `enable` REFUSES to arm (would otherwise cut SSH / Tailscale / your operator shell: every flow classifies `.agent` and hits default-deny) | run `sanctuary castle-wall enable --agent-uid=<uid> --ceiling=500 --no-ttl` (one command), or `configure-origin uid --agent-uid=<uid> --ceiling=500` first then plain `enable`; `--force` overrides with a loud warning (you WILL lose operator access unless another carve-out exists) |
+| **Bad `--agent-uid` / `--ceiling`** | `enable` / `configure-origin` REFUSE (return 1) and do NOT arm/write | the uid must be a plain positive integer AND `>= --ceiling`. Root/0 is rejected (would cut every system daemon); a uid below the ceiling is rejected (inside the system-daemon band). Non-numeric or fractional values (e.g. `501abc`, `502.9`) are rejected, never truncated. Verify with `id <agent-user>` and use a uid at or above the ceiling. |
 
 ---
 

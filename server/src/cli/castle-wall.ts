@@ -2083,6 +2083,24 @@ function agentOriginDescriptorPath(fortressPath: string): string {
 }
 
 /**
+ * Strict uid/ceiling flag parse (shared chokepoint for `--agent-uid` /
+ * `--ceiling` in BOTH `configure-origin` and the `enable` fold-in). Returns a
+ * number ONLY when the ENTIRE string is decimal digits; anything else returns
+ * null so the caller fails closed. `parseInt` is NOT usable here: it silently
+ * truncates, so `parseInt("501abc",10)===501`, `parseInt("502.9",10)===502`,
+ * `parseInt("1e10",10)===1` - each a WRONG-but-plausible uid that could fail
+ * OPEN (leave the agent unconfined) or cut a system daemon. Rejecting the whole
+ * token is the only safe read of an operator-supplied uid.
+ */
+function parseUidFlag(value: string): number | null {
+  if (!/^\d+$/.test(value)) {
+    return null;
+  }
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
  * Shared build+validate+write path for the agent-origin descriptor (DRY
  * chokepoint used by BOTH `configure-origin` and `enable --agent-uid`; do not
  * copy-paste this logic into a second call site). Validates the candidate via
@@ -2101,7 +2119,11 @@ async function writeAgentOriginDescriptor(
 > {
   const validated = validateAgentOrigin(candidate);
   if (validated === null) {
-    return { ok: false, error: "agent-origin descriptor is structurally invalid." };
+    return {
+      ok: false,
+      error:
+        "agent-origin descriptor is invalid (uid mode requires agent_uid a positive integer >= the ceiling; root/0 and sub-ceiling uids are rejected).",
+    };
   }
 
   const originPath = agentOriginDescriptorPath(fortressPath);
@@ -2150,9 +2172,17 @@ export async function runConfigureOrigin(
     return match ? match.slice(prefix.length) : undefined;
   };
 
+  // Strict parse (no truncation) of --ceiling; applies to both modes.
+  const ceilingStr = getFlag("ceiling") ?? "500";
+  const ceiling = parseUidFlag(ceilingStr);
+  if (ceiling === null) {
+    write(err, `Error: --ceiling must be a plain non-negative integer, got '${ceilingStr}'.\n`);
+    return 1;
+  }
+
   const candidate: Record<string, unknown> = {
     mode: modeArg,
-    system_uid_allow_ceiling: parseInt(getFlag("ceiling") ?? "500", 10),
+    system_uid_allow_ceiling: ceiling,
   };
 
   if (modeArg === "uid") {
@@ -2161,7 +2191,15 @@ export async function runConfigureOrigin(
       write(err, "Error: uid mode requires --agent-uid=<uid>\n");
       return 2;
     }
-    candidate.agent_uid = parseInt(uidStr, 10);
+    // Strict parse (no truncation): a wrong-but-plausible uid can fail open or
+    // cut a system daemon. The semantic floor (>= 1 and >= ceiling) is enforced
+    // in validateAgentOrigin (the shared chokepoint) via writeAgentOriginDescriptor.
+    const agentUid = parseUidFlag(uidStr);
+    if (agentUid === null) {
+      write(err, `Error: --agent-uid must be a plain positive integer, got '${uidStr}'.\n`);
+      return 1;
+    }
+    candidate.agent_uid = agentUid;
   } else {
     const signingId = getFlag("signing-id");
     const teamId = getFlag("team-id");
@@ -2848,19 +2886,40 @@ async function runArmDisarm(
     // a freshly-written descriptor satisfies that guard in the same run. Uses
     // the SAME build/validate/write chokepoint as `configure-origin` -
     // `writeAgentOriginDescriptor` - so the two entry points cannot drift.
-    // Fail-closed: an invalid/malformed uid is rejected here and `enable`
-    // returns non-zero WITHOUT arming, matching the #884 hard-refuse floor
-    // (it never falls through to "no descriptor, proceed anyway").
+    // Fail-closed: an invalid/malformed uid or ceiling is rejected here and
+    // `enable` returns non-zero WITHOUT arming, matching the #884 hard-refuse
+    // floor (it never falls through to "no descriptor, proceed anyway").
+    // Strict parse (no truncation) - a wrong-but-plausible uid can fail OPEN
+    // (agent unconfined) or cut a system daemon. The semantic floor (>= 1 and
+    // >= ceiling) is enforced in validateAgentOrigin (the shared chokepoint).
+    const agentUid = parseUidFlag(parsed.agentUid);
+    if (agentUid === null) {
+      write(
+        err,
+        `Refusing to arm: --agent-uid must be a plain positive integer, got '${parsed.agentUid}'. Not arming.\n`,
+      );
+      return 1;
+    }
+    const ceilingStr = parsed.ceiling ?? "500";
+    const ceiling = parseUidFlag(ceilingStr);
+    if (ceiling === null) {
+      write(
+        err,
+        `Refusing to arm: --ceiling must be a plain non-negative integer, got '${ceilingStr}'. Not arming.\n`,
+      );
+      return 1;
+    }
     const candidate: Record<string, unknown> = {
       mode: "uid",
-      agent_uid: parseInt(parsed.agentUid, 10),
-      system_uid_allow_ceiling: parseInt(parsed.ceiling ?? "500", 10),
+      agent_uid: agentUid,
+      system_uid_allow_ceiling: ceiling,
     };
     const result = await writeAgentOriginDescriptor(fortressPath, candidate);
     if (!result.ok) {
       write(
         err,
-        `Refusing to arm: --agent-uid=${parsed.agentUid} produced an invalid agent-origin descriptor (${result.error}).\n`,
+        `Refusing to arm: --agent-uid=${parsed.agentUid} --ceiling=${ceiling} produced an invalid agent-origin descriptor (${result.error}). ` +
+          `agent_uid must be a positive integer >= the ceiling (root/0 and sub-ceiling uids are rejected). Not arming.\n`,
       );
       return 1;
     }

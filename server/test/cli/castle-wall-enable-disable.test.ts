@@ -444,8 +444,9 @@ describe("castle-wall enable/disable CLI verbs", () => {
       status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
     });
 
+    // agent_uid must be >= ceiling (the floor invariant), so use 650/600.
     const code = await runEnable(
-      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=502", "--ceiling=600"],
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=650", "--ceiling=600"],
       {
         out: new CaptureStream(),
         err: new CaptureStream(),
@@ -493,11 +494,172 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     expect(code).toBe(1);
     expect(err.text()).toContain("Refusing to arm");
-    expect(err.text()).toContain("--agent-uid=not-a-number");
+    expect(err.text()).toContain("not-a-number");
+    expect(err.text()).toContain("plain positive integer");
     expect(calls).toHaveLength(0);
 
     // No half-built descriptor was written to disk (fail-closed: validate
     // before write, never a partially-trusted candidate on disk).
+    await expect(
+      readFile(join(fortressPath, "policy", "egress", "agent-origin.json"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  it("enable --agent-uid=0 is REFUSED (root can never be the confined agent) and does NOT arm", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=0", "--ceiling=0"],
+      {
+        out: new CaptureStream(),
+        err,
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceInstalledProbe: (expectedFortressPath) =>
+          bootServiceInstalled(plistPath, expectedFortressPath),
+        sysextProbe: async () => "[activated enabled]",
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Refusing to arm");
+    expect(calls).toHaveLength(0);
+    await expect(
+      readFile(join(fortressPath, "policy", "egress", "agent-origin.json"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  it("enable --agent-uid below --ceiling is REFUSED and does NOT arm", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=100", "--ceiling=500"],
+      {
+        out: new CaptureStream(),
+        err,
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceInstalledProbe: (expectedFortressPath) =>
+          bootServiceInstalled(plistPath, expectedFortressPath),
+        sysextProbe: async () => "[activated enabled]",
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("Refusing to arm");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("enable --agent-uid EQUAL to --ceiling is accepted (boundary) and arms", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const out = new CaptureStream();
+    const { invoke } = makeInvoker({
+      enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+    });
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=500", "--ceiling=500"],
+      {
+        out,
+        err: new CaptureStream(),
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceInstalledProbe: (expectedFortressPath) =>
+          bootServiceInstalled(plistPath, expectedFortressPath),
+        sysextProbe: async () => "[activated enabled]",
+      },
+    );
+
+    expect(code).toBe(0);
+    expect(out.text()).toContain("Castle Wall armed");
+    const raw = await readFile(
+      join(fortressPath, "policy", "egress", "agent-origin.json"),
+      "utf8",
+    );
+    expect(JSON.parse(raw)).toEqual({
+      mode: "uid",
+      agent_uid: 500,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("enable rejects a truncation-prone --agent-uid (501abc) fail-closed, NOT silently 501", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=501abc"],
+      {
+        out: new CaptureStream(),
+        err,
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceInstalledProbe: (expectedFortressPath) =>
+          bootServiceInstalled(plistPath, expectedFortressPath),
+        sysextProbe: async () => "[activated enabled]",
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("plain positive integer");
+    expect(calls).toHaveLength(0);
+    await expect(
+      readFile(join(fortressPath, "policy", "egress", "agent-origin.json"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  it("enable rejects a truncation-prone --ceiling (500abc) fail-closed and does NOT arm", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(`${fortressPath}/`));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(
+      ["--fortress", fortressPath, "--no-ttl", "--agent-uid=502", "--ceiling=500abc"],
+      {
+        out: new CaptureStream(),
+        err,
+        env,
+        platform: "darwin",
+        hostAppCandidates: [hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceInstalledProbe: (expectedFortressPath) =>
+          bootServiceInstalled(plistPath, expectedFortressPath),
+        sysextProbe: async () => "[activated enabled]",
+      },
+    );
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("--ceiling");
+    expect(calls).toHaveLength(0);
     await expect(
       readFile(join(fortressPath, "policy", "egress", "agent-origin.json"), "utf8"),
     ).rejects.toThrow();

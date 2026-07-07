@@ -63,6 +63,21 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
     if (!isNonNegativeInt(c.agent_uid)) {
       return null;
     }
+    // Floor invariant (fail-closed semantic reject): the confined agent uid must
+    // be a real, above-the-system-band account.
+    //  - `agent_uid < 1` (i.e. 0 / root) can NEVER be the confined agent:
+    //    classifying root `.agent` would default-deny every system daemon
+    //    (sshd, Tailscale, ...), the exact boot-cut this descriptor prevents.
+    //  - `agent_uid < system_uid_allow_ceiling` places the agent INSIDE the
+    //    system-daemon allow band, which is nonsensical (uids below the ceiling
+    //    classify operator/allowed) and dangerous. Equal is allowed: `uid ==
+    //    ceiling` is the boundary, not "strictly below".
+    // A wrong uid can otherwise fail OPEN (agent unconfined) or cut a system
+    // daemon; rejecting here protects `configure-origin`, the `enable` fold-in,
+    // the #884 read-back guard, and any future caller at the one chokepoint.
+    if (c.agent_uid < 1 || c.agent_uid < systemUidAllowCeiling) {
+      return null;
+    }
     return {
       mode: "uid",
       agent_uid: c.agent_uid,
