@@ -1292,7 +1292,18 @@ export async function runDaemon(
     return runSafeModeDaemon(argv, ctx);
   }
 
-  const storagePath = resolveStoragePath(env);
+  // Honor the subcommand-level `--fortress <path>` flag, exactly like the
+  // sibling custody verbs (provision-pin, re-pin, audit-*). Before this the
+  // daemon resolved with `resolveStoragePath(env)`, which reads
+  // SANCTUARY_STORAGE_PATH only, so it silently DROPPED a trailing
+  // `--fortress` (the top-level extractor stops at the subcommand boundary
+  // and never sees it) and armed against the DEFAULT/home fortress instead of
+  // the operator-named one - a "never silently degrade" footgun (wrong-fortress
+  // unlock failures, or arming the wrong fortress). resolveFortressArg falls
+  // back to resolveStoragePath(env) when no flag is given, preserving prior
+  // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
+  // SANCTUARY_STORAGE_PATH upstream in cli.ts).
+  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
   const localSign = env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
   const launchdBoot = argv.includes("--launchd");
 
