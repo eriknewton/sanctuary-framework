@@ -710,5 +710,69 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.ensurePolicyDaemon).not.toHaveBeenCalled();
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
     });
+
+    // ── P0 (disarm-first ordering on the arm-STAGE abort) ─────────────────────
+    // `arm` returning ok:false does NOT imply the content filter is off (macOS
+    // Tahoe can SAVE the NE config ENABLED then report non-zero). Booting a
+    // FRESHLY-INSTALLED policy daemon out in that state = filter-on/daemon-down
+    // = deny-all lockout. So we DISARM FIRST, and only tear the fresh daemon
+    // down once disarm confirms the filter is off.
+    it("P0: arm ok:false with a FRESHLY-INSTALLED daemon disarms FIRST, THEN tears the policy daemon down (order: filter-off before daemon-down)", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
+      // Disarm was attempted and succeeded, so the fresh daemon IS torn down...
+      expect(ops.disarm).toHaveBeenCalledTimes(1);
+      expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
+      // ...and STRICTLY in filter-off-THEN-daemon-down order.
+      const disarmOrder = (ops.disarm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const teardownOrder = (ops.teardownPolicyDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      expect(disarmOrder).toBeLessThan(teardownOrder);
+      // A confirmed disarm is not flagged "may be armed", but the outcome is NOT
+      // a bare clean rollback -- it records that the wall was disarmed and tells
+      // the operator to confirm with `status`.
+      expect((result as { wallMayBeArmed?: boolean }).wallMayBeArmed).toBeUndefined();
+      expect((result as { reason: string }).reason).toMatch(/disarmed as part of this rollback|castle-wall status/i);
+    });
+
+    it("P0 honesty gap: arm ok:false + fresh daemon + disarm THROWS leaves the policy daemon UP (never boots it out into a lockout), sets wallMayBeArmed, and is NOT a clean rollback", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        // Disarm cannot confirm the filter is off (e.g. Tahoe corroboration
+        // affirmatively still shows enabled, or the disable save itself failed).
+        disarm: vi.fn(async () => {
+          throw new Error("castle-wall disable exited 1");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm", wallMayBeArmed: true });
+      expect(ops.disarm).toHaveBeenCalledTimes(1);
+      // CRITICAL: the freshly-installed policy daemon is LEFT RUNNING -- booting
+      // it out with the filter possibly ON is the exact deny-all lockout.
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+      // The harness daemon (not the wall) is still torn down normally.
+      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      const reason = (result as { reason: string }).reason;
+      expect(reason).toMatch(/MAY STILL BE ARMED/);
+      expect(reason).toMatch(/castle-wall disable/);
+    });
+
+    it("P0: the disarm-first guard is scoped to a FRESH install -- an arm ok:false over an ALREADY-reachable (freshlyInstalled:false) wall does NOT disarm and does NOT tear the wall down", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
+      // Nothing this run stood up -> no disarm, no wall teardown (leaving the
+      // pre-existing wall untouched; filter-on + daemon-up is recoverable).
+      expect(ops.disarm).not.toHaveBeenCalled();
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+      expect((result as { wallMayBeArmed?: boolean }).wallMayBeArmed).toBeUndefined();
+    });
   });
 });

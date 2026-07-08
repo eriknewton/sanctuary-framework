@@ -270,6 +270,21 @@ export type ProvisionFlowOutcome =
        * occurred -- a conflict never masks a real failure.
        */
       failedPaths?: string[];
+      /**
+       * Bug B P0 (disarm-first): true ONLY on an ARM-stage abort where a policy
+       * daemon was freshly installed this run AND `ops.disarm()` could NOT
+       * confirm the content filter is off. `arm` returning ok:false does NOT
+       * imply the filter is off -- on macOS Tahoe the host app can SAVE the NE
+       * config ENABLED then report non-zero because its post-change status
+       * corroboration timed out. Booting a FRESHLY-INSTALLED policy daemon out
+       * in that state would be filter-on + daemon-down = the exact deny-all
+       * lockout this feature prevents, so the freshly-installed policy daemon is
+       * deliberately LEFT RUNNING (filter-on + daemon-up is enforcing and
+       * RECOVERABLE). The CLI renderer keys a LOUD "the wall may still be armed;
+       * run 'sanctuary castle-wall disable'" frame on this and NEVER softens it
+       * into a clean "rolled back; re-run" line (the honesty gap the P0 flagged).
+       */
+      wallMayBeArmed?: boolean;
     }
   | { kind: "armed-then-rolled-back"; uid: number; reason: string }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
@@ -580,26 +595,59 @@ export async function runProvisionFlow(
   // Step 9: arm via the shipped `enable --agent-uid=N --ceiling` (step 1).
   const armResult = await ops.arm(uid, ctx.ceiling);
   if (!armResult.ok) {
-    // FIX (round 5, item N3): arming failed but the daemon is live; tear it
-    // down on this abort (the wall never armed, so there is nothing to
-    // disarm -- only the daemon to remove). Bug B: also tear down a
-    // freshly-installed policy daemon. Note the filter is NOT armed here (arm
-    // failed), so tearing the boot service down cannot create a lockout.
-    const td = await teardownDaemonAndRestore(
-      ops,
-      rehomeResults,
-      daemonBootstrappedThisRun,
-      policyDaemonFreshlyInstalled,
-    );
+    // FIX (round 5, item N3): arming failed but the harness daemon is live;
+    // tear it down on this abort.
+    //
+    // Bug B P0 (disarm-first ordering): `arm` returning ok:false does NOT imply
+    // the content filter is off. On macOS Tahoe the host app can SAVE the NE
+    // config ENABLED and THEN return non-zero because its own post-change
+    // status corroboration timed out (or a build-sha check tripped after the
+    // save) -- so the filter may be ON. Booting a FRESHLY-INSTALLED policy
+    // daemon out in that state is filter-on + daemon-down = the exact deny-all
+    // lockout (SSH included) this feature exists to prevent. So when a policy
+    // daemon was freshly installed this run, DISARM FIRST -- the unconditional
+    // dead-man lever, which reliably saves the NE config DISABLED and returns 0
+    // even when its own corroboration is inconclusive, and throws ONLY when the
+    // filter may still be enabled -- to GUARANTEE the filter is off BEFORE the
+    // daemon is torn down. Order is ALWAYS filter-off THEN daemon-down.
+    let tearDownPolicyDaemon = policyDaemonFreshlyInstalled;
+    let wallMayBeArmed = false;
+    let disarmNote: string | undefined;
+    if (policyDaemonFreshlyInstalled) {
+      try {
+        await ops.disarm();
+        // Disarm did not throw => the filter is confirmed off (NE save-disabled
+        // succeeded / provider fail-open). Safe to tear the fresh daemon down.
+        // Still note that the wall was disarmed during rollback so the operator
+        // can confirm -- this is not a bare "nothing happened" clean rollback.
+        disarmNote =
+          "The content filter was disarmed as part of this rollback; confirm it is off with 'sanctuary castle-wall status'.";
+      } catch (disarmErr) {
+        // Disarm could NOT confirm the filter is off. Do NOT boot the fresh
+        // policy daemon out -- leave it UP (filter-on + daemon-up is enforcing
+        // and RECOVERABLE, never the deny-all lockout) and surface loudly.
+        tearDownPolicyDaemon = false;
+        wallMayBeArmed = true;
+        disarmNote = (disarmErr as Error).message;
+      }
+    }
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun, tearDownPolicyDaemon);
     return {
       kind: "aborted",
       stage: "arm",
-      reason: withDaemonTeardownNote(armResult.error, td.daemonTeardownError, td.policyDaemonTeardownError),
+      reason: withArmWallStateNote(
+        withDaemonTeardownNote(armResult.error, td.daemonTeardownError, td.policyDaemonTeardownError),
+        wallMayBeArmed,
+        disarmNote,
+      ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
       daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
+      // P0 honesty gap: when the filter may still be armed (disarm could not
+      // confirm), the CLI must NOT render a clean "rolled back; re-run" line.
+      wallMayBeArmed: wallMayBeArmed ? true : undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
@@ -809,4 +857,29 @@ function withDaemonTeardownNote(
     return reason;
   }
   return `${reason} (NOTE: ${notes.join(" ")})`;
+}
+
+/**
+ * Bug B P0 (disarm-first): fold the arm-abort wall-state note into the reason.
+ * When `wallMayBeArmed` (disarm could NOT confirm the filter is off), this is a
+ * LOUD manual-recovery warning -- the freshly-installed policy daemon was left
+ * running to avoid a lockout and the operator must run `castle-wall disable`.
+ * When disarm succeeded, `disarmNote` is a milder "the wall was disarmed during
+ * rollback; confirm with status" line so the outcome is never a bare clean
+ * rollback that hides the wall was touched. Returns the reason unchanged when
+ * no policy daemon was freshly installed (no disarm was attempted).
+ */
+function withArmWallStateNote(reason: string, wallMayBeArmed: boolean, disarmNote?: string): string {
+  if (disarmNote === undefined) {
+    return reason;
+  }
+  if (wallMayBeArmed) {
+    return (
+      `${reason} (WALL-STATE WARNING: arming reported a failure but the content filter MAY STILL BE ARMED and ` +
+      `disarm could not confirm it is off: ${disarmNote}. The freshly-installed Castle Wall policy daemon was LEFT ` +
+      `RUNNING to avoid a deny-all lockout (filter-on + daemon-up is enforcing and recoverable, unlike filter-on + ` +
+      `daemon-down). Run 'sudo sanctuary castle-wall disable' to confirm the filter is off before re-running.)`
+    );
+  }
+  return `${reason} (${disarmNote})`;
 }
