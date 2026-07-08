@@ -37,6 +37,7 @@ import {
   type PerRuleGroup,
 } from "../castle-wall/audit/per-rule-report.js";
 import { frame, parseFrame } from "../castle-wall/ipc/framing.js";
+import { writeGlobalPinIfUnestablished } from "../castle-wall/global-pin/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
   BOOT_TOKEN_LENGTH,
@@ -643,101 +644,57 @@ async function writeGlobalPinnedPublicKey(
   publicKey: Uint8Array,
   globalPinPath: string = CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
 ): Promise<void> {
-  // Fail-open fix (2026-07-07, drill-confirmed on real hardware): the
-  // ORIGINAL guard here was a try/catch that treated EACCES/EPERM on write as
-  // "the root signer helper owns this file, skip." That holds for an
-  // operator-UID provision-pin, but fails OPEN under root:
-  // `sanctuary protect --hermes --provision-agent-account` runs the whole
-  // wrap (including provision-pin) under `sudo` because OS-account creation
-  // needs root, so a root-euid write to the root:wheel 0644 global pin
-  // SUCCEEDS - silently clobbering the signer helper's pin with a
+  // Fail-open fix (2026-07-07, drill-confirmed on real hardware): the ORIGINAL
+  // guard here treated an EACCES/EPERM on write as "the root signer helper owns
+  // this file, skip." That holds for an operator-UID provision-pin, but fails
+  // OPEN under root: `sanctuary protect --hermes --provision-agent-account`
+  // runs the whole wrap (including provision-pin) under `sudo` because
+  // OS-account creation needs root, so a root-euid write to the root:wheel 0644
+  // global pin SUCCEEDS - silently clobbering the signer helper's pin with a
   // fortress-local key and breaking arm/enforcement until a manual re-pin.
   //
-  // The fix makes the ownership check EXPLICIT and euid-independent: read the
-  // existing pin (if any) and compare bytes BEFORE ever attempting a write,
-  // instead of inferring "someone else owns this" from whether the write
-  // itself failed.
+  // The global-pin immutability invariant ("only re-pin migrates the pin") is
+  // now enforced in ONE shared chokepoint - `writeGlobalPinIfUnestablished` -
+  // that reads-and-compares BEFORE any write, so a second writer (the local-sign
+  // daemon) cannot reintroduce the fail-open on a different path. This function
+  // supplies the CLI-specific fresh write (exclusive-create) + refusal guidance.
   const emitRePinGuidance = () =>
     console.warn(
       `[castle-wall] global pin ${globalPinPath} already exists and is owned by the root signer helper (A2); provision-pin does not overwrite it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
     );
 
-  let existing: Buffer | undefined;
   try {
-    existing = await readFile(globalPinPath);
-  } catch (readError) {
-    const readCode =
-      readError instanceof Error && "code" in readError
-        ? (readError as NodeJS.ErrnoException).code
-        : undefined;
-    if (readCode !== "ENOENT") {
-      // Present but unreadable for a reason other than absence (e.g. EACCES
-      // reading a root-owned file as an operator-UID caller). Fail CLOSED:
-      // we cannot prove it is safe to write, so never attempt it.
-      emitRePinGuidance();
-      return;
-    }
-    // ENOENT: no existing global pin. Fall through to the exclusive-create
-    // write below - the one case provision-pin legitimately establishes the
-    // anchor (fresh install / cooperative-only, no signer helper yet).
-  }
-
-  if (existing !== undefined) {
-    if (existing.equals(Buffer.from(publicKey))) {
-      // Idempotent: the key already pinned is byte-identical. No write, no
-      // warning - this is not an error condition.
-      return;
-    }
-    // A DIFFERENT key is already pinned globally. Under A2 this file is
-    // root:wheel 0644, owned by the signer helper; provision-pin must NEVER
-    // overwrite it, at ANY euid - this refusal is the fix itself. (The old
-    // EACCES/EPERM-on-write guard below only protected an operator-UID
-    // caller; a root-euid caller sailed straight through it.)
-    emitRePinGuidance();
-    return;
-  }
-
-  try {
-    // A2/B2 (F-A2-1): do NOT `mkdir` the custody directory here. This runs as
-    // the operator-UID (or, under auto-provision, root-euid) provision-pin
-    // CLI; creating the directory operator-owned is exactly the gap the
-    // helper-as-signer design closes (an operator-owned dir lets same-UID
-    // malware swap the key + pin). The root signer helper creates + owns the
-    // directory. Best-effort write only IF the dir already exists and no pin
-    // is there yet - never bring the directory into being here.
-    //
-    // Exclusive create ("wx") closes the read-then-write TOCTOU above: if
-    // something else (e.g. the signer helper) creates the file between our
-    // readFile and this write, EEXIST tells us so and we treat it exactly
-    // like the "already exists" case above - refuse, do not clobber.
-    await writeFile(globalPinPath, publicKey, { mode: 0o644, flag: "wx" });
-    await chmod(globalPinPath, 0o644);
+    await writeGlobalPinIfUnestablished(publicKey, {
+      path: globalPinPath,
+      onRefuse: emitRePinGuidance,
+      // A2/B2 (F-A2-1): do NOT `mkdir` the custody directory here. This runs as
+      // the operator-UID (or, under auto-provision, root-euid) provision-pin
+      // CLI; creating the directory operator-owned is exactly the gap the
+      // helper-as-signer design closes (an operator-owned dir lets same-UID
+      // malware swap the key + pin). The root signer helper creates + owns the
+      // directory. The exclusive-create ("wx") flag closes the read-then-write
+      // TOCTOU inside the chokepoint (EEXIST there is turned into a refusal).
+      freshWrite: async (path, key) => {
+        await writeFile(path, key, { mode: 0o644, flag: "wx" });
+        await chmod(path, 0o644);
+      },
+    });
   } catch (error) {
+    // Reached only when the fresh write threw a NON-EEXIST error (the chokepoint
+    // handled EEXIST as a refusal). SAFETY: provision-pin diagnostics are
+    // operator-facing CLI stderr output. These carry CLI-specific guidance:
+    //   - ENOENT: the custody directory does not exist yet (only the root
+    //     helper creates it) - fresh install, no shared pin to migrate. Emit a
+    //     quiet, non-action-implying line so a first-time installer is not told
+    //     to "migrate the trust anchor" that does not exist. (audit-C MED-1 /
+    //     audit-D omit noise on fresh wrap.)
+    //   - EACCES/EPERM: the parent directory is not writable (e.g. root-owned
+    //     dir, no pin file yet) for an operator-UID caller - `re-pin` migrates
+    //     the trust anchor to the signer helper.
     const code =
       error instanceof Error && "code" in error
         ? (error as NodeJS.ErrnoException).code
         : undefined;
-    // SAFETY: provision-pin diagnostics are operator-facing CLI stderr
-    // output. Under A2 the global pin is root:wheel 0644 and owned by the
-    // signer helper; an operator-UID provision-pin CANNOT (and must not)
-    // overwrite it, and the directory may not exist yet (ENOENT) because only
-    // the helper creates it. These mean different things to the operator, so
-    // the guidance differs:
-    //   - EEXIST: lost the create race - something else just wrote the file
-    //     between our read above and this write. Same refusal as the
-    //     "already exists" branch above.
-    //   - ENOENT: fresh install, no root signer helper yet, no shared pin
-    //     exists. There is nothing to migrate. Emit a quiet, non-action-
-    //     implying line so a first-time installer is not told to "migrate
-    //     the trust anchor" that does not exist. (audit-C MED-1 / audit-D
-    //     omit noise on fresh wrap.)
-    //   - EACCES/EPERM: retained for the operator-UID case where the parent
-    //     directory itself is not writable (e.g. root-owned dir, no pin file
-    //     yet) - `re-pin` migrates the trust anchor to the signer helper.
-    if (code === "EEXIST") {
-      emitRePinGuidance();
-      return;
-    }
     if (code === "ENOENT") {
       console.warn(
         `[castle-wall] shared pin not provisioned (root signer helper not installed); nothing to do for a cooperative-only install.`,
