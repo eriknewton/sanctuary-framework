@@ -362,14 +362,16 @@ export async function runObserveCandidates(
     return 0;
   }
 
-  write(out, "Destination            Agent            Times  First seen            Last seen             Note\n");
+  const col = (value: string, width: number): string => `${value.padEnd(width)}  `;
+  write(out, `${col("Destination", 22)}${col("Agent", 15)}${col("Times", 5)}${col("First seen", 20)}${col("Last seen", 20)}Note\n`);
   for (const candidate of candidates) {
     const note = candidate.exfil_risk ? "EXFIL-RISK, not pre-selected" : "";
     write(
       out,
-      `${destinationLabel(candidate).padEnd(24)}${candidate.agent_template.padEnd(17)}${String(
-        candidate.times_seen,
-      ).padEnd(7)}${candidate.first_seen.padEnd(22)}${candidate.last_seen.padEnd(22)}${note}\n`,
+      `${col(destinationLabel(candidate), 22)}${col(candidate.agent_template, 15)}${col(
+        String(candidate.times_seen),
+        5,
+      )}${col(candidate.first_seen, 20)}${col(candidate.last_seen, 20)}${note}\n`,
     );
   }
   write(
