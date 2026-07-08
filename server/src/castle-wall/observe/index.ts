@@ -27,6 +27,8 @@ export { flowEventsFromAuditEntries } from "./adapter.js";
 
 export {
   naiveRegisteredDomain,
+  widenableRegisteredDomain,
+  REFUSED_MULTI_LABEL_PUBLIC_SUFFIXES,
   synthesizeCandidateRule,
   synthesizeCandidateRules,
 } from "./synthesize.js";
@@ -35,7 +37,7 @@ export type { SynthesizeCandidateRulesResult } from "./synthesize.js";
 export { ObserveStore } from "./store.js";
 export type { ObserveWriteIdentity } from "./store.js";
 
-export { promoteCandidates } from "./promote.js";
+export { promoteCandidates, describeEffectiveRule } from "./promote.js";
 export type {
   PromoteSelectionRow,
   PromotePublishResult,
@@ -43,4 +45,5 @@ export type {
   PromoteDeps,
   PromoteDroppedReason,
   PromoteOutcome,
+  VerifiedManifestRead,
 } from "./promote.js";

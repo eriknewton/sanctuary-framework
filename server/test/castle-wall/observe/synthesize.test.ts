@@ -10,6 +10,8 @@ import {
   synthesizeCandidateRule,
   synthesizeCandidateRules,
   naiveRegisteredDomain,
+  widenableRegisteredDomain,
+  REFUSED_MULTI_LABEL_PUBLIC_SUFFIXES,
 } from "../../../src/castle-wall/observe/synthesize.js";
 import { validateRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { CandidateObservation } from "../../../src/castle-wall/observe/types.js";
@@ -103,6 +105,46 @@ describe("synthesizeCandidateRule (D-Q2 explicit opt-in: per_template_etld1)", (
   it("returns null for a single-label host (no domain to widen to)", () => {
     const rule = synthesizeCandidateRule(candidate({ host: "localhost" }), CREATED_AT, "per_template_etld1");
     expect(rule).toBeNull();
+  });
+
+  it("REFUSES a widening that lands on a known multi-label public suffix (co.uk), never signs *.co.uk (FIX 3)", () => {
+    const rule = synthesizeCandidateRule(candidate({ host: "shop.foo.co.uk" }), CREATED_AT, "per_template_etld1");
+    expect(rule).toBeNull();
+  });
+
+  it("REFUSES another public-suffix widening (com.au)", () => {
+    const rule = synthesizeCandidateRule(candidate({ host: "www.acme.com.au" }), CREATED_AT, "per_template_etld1");
+    expect(rule).toBeNull();
+  });
+
+  it("still allows a legitimate two-label registered domain widening (example.com)", () => {
+    const rule = synthesizeCandidateRule(candidate({ host: "api.example.com" }), CREATED_AT, "per_template_etld1");
+    expect(rule).not.toBeNull();
+    expect(rule!.match.host_pattern).toBe("*.example.com");
+  });
+});
+
+describe("widenableRegisteredDomain (public-suffix refusal chokepoint, FIX 3)", () => {
+  it("returns the registered domain for a legitimate host", () => {
+    expect(widenableRegisteredDomain("api.example.com")).toBe("example.com");
+  });
+
+  it("returns null when the naive result is a known multi-label public suffix", () => {
+    expect(widenableRegisteredDomain("shop.foo.co.uk")).toBeNull();
+    expect(widenableRegisteredDomain("www.acme.com.au")).toBeNull();
+    expect(widenableRegisteredDomain("site.co.jp")).toBeNull();
+  });
+
+  it("returns null for an IP literal or single-label host", () => {
+    expect(widenableRegisteredDomain("203.0.113.5")).toBeNull();
+    expect(widenableRegisteredDomain("localhost")).toBeNull();
+  });
+
+  it("every entry in the refusal set is exactly two dot-separated labels (matches the naive heuristic's output shape)", () => {
+    for (const suffix of REFUSED_MULTI_LABEL_PUBLIC_SUFFIXES) {
+      expect(suffix.split(".").length, `suffix ${suffix} must be two labels`).toBe(2);
+    }
+    expect(REFUSED_MULTI_LABEL_PUBLIC_SUFFIXES.size).toBeGreaterThan(0);
   });
 });
 

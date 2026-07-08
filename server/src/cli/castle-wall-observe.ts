@@ -58,8 +58,11 @@ import {
   type ManifestSigner,
   type ManifestStorage,
 } from "../castle-wall/runtime/manifest-publisher.js";
-import type { AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../castle-wall/allowlist/manifest.js";
+import {
+  verifyManifestSignature,
+  verifyAndParseRules,
+} from "../castle-wall/allowlist/parse.js";
 import {
   ObserveStore,
   flowEventsFromAuditEntries,
@@ -68,6 +71,7 @@ import {
   type CandidateObservation,
   type ObserveGranularity,
   type PromoteSelectionRow,
+  type VerifiedManifestRead,
 } from "../castle-wall/observe/index.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
@@ -422,16 +426,17 @@ function formatApprovalPrompt(request: ApprovalRequest): string {
   );
 }
 
-class FilesystemManifestStorage implements ManifestStorage {
+export class FilesystemManifestStorage implements ManifestStorage {
   constructor(private readonly egressDir: string) {}
 
-  private get rulesDir(): string {
-    return join(this.egressDir, "rules");
-  }
-
   async writeRule(filename: string, bytes: Uint8Array): Promise<void> {
-    await mkdir(this.rulesDir, { recursive: true, mode: 0o700 });
-    await writeFile(join(this.rulesDir, filename), bytes, { mode: 0o600 });
+    // Rule files live DIRECTLY in the egress dir next to manifest.json, so
+    // each manifest entry's `file` field (a bare `<id>.json`, defined
+    // relative to the manifest's own directory) points at the actual file
+    // the verifier reads. This keeps the published tree self-consistent:
+    // `readVerifiedManifest` reads `join(egressDir, entry.file)`.
+    await mkdir(this.egressDir, { recursive: true, mode: 0o700 });
+    await writeFile(join(this.egressDir, filename), bytes, { mode: 0o600 });
   }
 
   async atomicRenameManifest(bytes: Uint8Array): Promise<void> {
@@ -445,8 +450,15 @@ class FilesystemManifestStorage implements ManifestStorage {
   }
 
   async listRules(): Promise<string[]> {
+    // Return only candidate rule files: `*.json` that are neither the
+    // manifest itself nor a dotfile (temp `.manifest.json.*.tmp`). This keeps
+    // the publisher's orphan-cleanup from ever touching manifest.json or a
+    // stray temp file.
     try {
-      return await readdir(this.rulesDir);
+      const names = await readdir(this.egressDir);
+      return names.filter(
+        (name) => name.endsWith(".json") && name !== "manifest.json" && !name.startsWith("."),
+      );
     } catch (error) {
       if (isEnoent(error)) return [];
       throw error;
@@ -454,44 +466,111 @@ class FilesystemManifestStorage implements ManifestStorage {
   }
 
   async removeRule(filename: string): Promise<void> {
-    await rm(join(this.rulesDir, filename), { force: true });
+    await rm(join(this.egressDir, filename), { force: true });
   }
 }
 
-/** Read the currently-published ruleset off disk so promote can carry it forward into the re-signed manifest. A self-managed read of our own last publish -- not a trust-boundary crossing, so this does not re-verify the Ed25519 signature (that check matters for the DAEMON's consumption of the manifest, not for this read-modify-write cycle). A missing manifest (fresh install) is an empty ruleset, not an error. A rule file that cannot be read is dropped with a loud warning rather than aborting the whole promote. */
-async function readExistingRules(egressDir: string, err: Writable): Promise<AllowlistRule[]> {
+/**
+ * Read + CRYPTOGRAPHICALLY VERIFY the currently-published signed manifest so
+ * promote can carry the existing ruleset forward into the re-signed manifest
+ * WITHOUT laundering an unverified on-disk rule (two-family gate FIX 1).
+ *
+ * FAIL-CLOSED: this uses the shipped `verifyManifestSignature` (Ed25519
+ * against the pinned public key) + `verifyAndParseRules` (per-rule sha256 +
+ * `validateRule`). Any failure -- unreadable/corrupt manifest JSON, a bad
+ * signature, a missing referenced rule file, a sha256 mismatch, or a rule
+ * that fails validateRule -- returns `tampered`, which makes promote ABORT
+ * and change nothing. We NEVER silently drop-and-continue on a bad manifest:
+ * a tampered manifest (e.g. an attacker who can write the egress dir plants a
+ * broad rule the daemon already rejects for a bad signature) must stop the
+ * promote, never get re-signed under the good pinned key.
+ *
+ * `digest` is a compare-and-set token (sha256 of the raw manifest.json
+ * bytes) promote re-checks immediately before publish to close the
+ * read-then-publish lost-update window (FIX 2).
+ *
+ * A genuinely-absent manifest (fresh install) is `absent`, not tampered.
+ */
+export async function readVerifiedManifest(
+  egressDir: string,
+  pinnedPublicKey: Uint8Array,
+): Promise<VerifiedManifestRead> {
   const manifestPath = join(egressDir, "manifest.json");
-  let raw: string;
+  let rawBytes: Buffer;
   try {
-    raw = await readFile(manifestPath, "utf8");
+    rawBytes = await readFile(manifestPath);
   } catch (error) {
-    if (isEnoent(error)) return [];
-    throw error;
+    if (isEnoent(error)) return { status: "absent" };
+    return { status: "tampered", reason: `manifest unreadable: ${(error as Error).message}` };
   }
+
+  const digest = createHash("sha256").update(rawBytes).digest("hex");
 
   let signed: SignedManifest;
   try {
-    signed = JSON.parse(raw) as SignedManifest;
-  } catch {
-    write(err, `Warning: ${manifestPath} is not valid JSON; treating the existing ruleset as empty.\n`);
-    return [];
+    signed = JSON.parse(rawBytes.toString("utf8")) as SignedManifest;
+  } catch (error) {
+    return { status: "tampered", reason: `manifest is not valid JSON: ${(error as Error).message}` };
+  }
+  if (!signed || typeof signed !== "object" || !signed.manifest || !signed.signature) {
+    return { status: "tampered", reason: "manifest is missing its manifest/signature envelope" };
   }
 
-  const rules: AllowlistRule[] = [];
-  for (const entry of signed.manifest?.rules ?? []) {
+  const sigResult = verifyManifestSignature(signed, pinnedPublicKey);
+  if (!sigResult.ok) {
+    return { status: "tampered", reason: `manifest signature verification failed: ${sigResult.error}` };
+  }
+
+  // Load every referenced rule file's bytes, keyed by the manifest's own
+  // `file` field, then re-verify sha256 + validateRule via the shipped
+  // verifier. A missing file is a tamper, not a silent drop.
+  const ruleFiles = new Map<string, Uint8Array>();
+  for (const entry of signed.manifest.rules) {
     try {
-      const bytes = await readFile(join(egressDir, "rules", entry.file), "utf8");
-      rules.push(JSON.parse(bytes) as AllowlistRule);
+      const bytes = await readFile(join(egressDir, entry.file));
+      ruleFiles.set(entry.file, new Uint8Array(bytes));
     } catch (error) {
-      write(
-        err,
-        `Warning: could not read existing rule file ${entry.file} (${
-          (error as Error).message
-        }); it will be DROPPED from the republished manifest unless re-authored.\n`,
-      );
+      return {
+        status: "tampered",
+        reason: `referenced rule file ${entry.file} is unreadable: ${(error as Error).message}`,
+      };
     }
   }
-  return rules;
+
+  const rulesResult = verifyAndParseRules(signed, ruleFiles);
+  if (!rulesResult.ok) {
+    return {
+      status: "tampered",
+      reason: `manifest rule verification failed: ${rulesResult.error}${
+        rulesResult.issues ? ` (${rulesResult.issues.join("; ")})` : ""
+      }`,
+    };
+  }
+
+  return { status: "ok", rules: [...rulesResult.value], digest };
+}
+
+/** Load the pinned Castle Wall public key (32 raw bytes) used to verify the on-disk manifest. */
+async function loadPinnedPublicKey(fortressPath: string, err: Writable): Promise<Uint8Array | null> {
+  const pubPath = join(fortressPath, CASTLE_PINNED_PUBKEY);
+  try {
+    const pub = await readFile(pubPath);
+    if (pub.length !== 32) {
+      write(err, `Error: pinned public key at ${pubPath} must be 32 bytes (found ${pub.length}).\n`);
+      return null;
+    }
+    return new Uint8Array(pub);
+  } catch (error) {
+    if (isEnoent(error)) {
+      write(
+        err,
+        "Error: no Castle Wall pinned signing key found. Run `sanctuary castle-wall provision-pin` first.\n",
+      );
+      return null;
+    }
+    write(err, `Error loading the Castle Wall pinned public key: ${(error as Error).message}\n`);
+    return null;
+  }
 }
 
 async function loadPinnedManifestSigner(
@@ -583,6 +662,17 @@ export async function runObservePromote(
         write(err, `Warning: no pending candidate matches ${destination}\n`);
         continue;
       }
+      // FIX 4: a bare host:port can match candidates from more than one agent
+      // template or protocol. Echo exactly which (template, protocol) rows a
+      // --destination selected so the fan-out is visible BEFORE the approval
+      // prompt (the approval context itself also lists every synthesized rule
+      // + its scope, so the human sees each grant before approving).
+      if (matches.length > 1) {
+        const rows = matches
+          .map(([, candidate]) => `${candidate.agent_template}/${candidate.protocol}`)
+          .join(", ");
+        write(out, `Note: ${destination} matches ${matches.length} candidate row(s): ${rows}\n`);
+      }
       for (const [key, candidate] of matches) {
         if (candidate.exfil_risk && !includeRisky) {
           write(
@@ -602,13 +692,9 @@ export async function runObservePromote(
   }
 
   const egressDir = join(boot.fortressPath, "policy", "egress");
-  let currentRules: AllowlistRule[];
-  try {
-    currentRules = await readExistingRules(egressDir, err);
-  } catch (error) {
-    write(err, `Error reading the existing ruleset: ${(error as Error).message}\n`);
-    return 1;
-  }
+
+  const pinnedPublicKey = await loadPinnedPublicKey(boot.fortressPath, err);
+  if (!pinnedPublicKey) return 1;
 
   const signer = await loadPinnedManifestSigner(boot.fortressPath, boot.masterKey, err);
   if (!signer) return 1;
@@ -622,7 +708,7 @@ export async function runObservePromote(
   const gate = new ApprovalGate(policy, baseline, channel, boot.auditLog);
 
   const outcome = await promoteCandidates(selection, candidatesByKey, {
-    currentRules,
+    readVerifiedManifest: () => readVerifiedManifest(egressDir, pinnedPublicKey),
     approve: (operation, context) => gate.evaluate(operation, context),
     publish: (rules) =>
       publishSignedManifest(
@@ -648,6 +734,23 @@ export async function runObservePromote(
   if (outcome.status === "no_candidates") {
     write(err, "No valid candidates to promote (not found, or the synthesized rule failed validation).\n");
     for (const dropped of outcome.dropped) write(err, `  ${dropped.key}: ${dropped.reason}\n`);
+    return 1;
+  }
+  if (outcome.status === "tampered_manifest") {
+    write(
+      err,
+      `Aborted: the existing Castle Wall manifest did not verify against the pinned key (${outcome.reason}). ` +
+        `Nothing changed. Refusing to re-sign an unverified ruleset; investigate ${join(egressDir, "manifest.json")} ` +
+        `before promoting.\n`,
+    );
+    return 1;
+  }
+  if (outcome.status === "manifest_changed") {
+    write(
+      err,
+      "Aborted: the Castle Wall manifest changed while you were reviewing this promote. Nothing changed. " +
+        "Re-run `sanctuary castle-wall observe promote` so your approval applies to the current ruleset.\n",
+    );
     return 1;
   }
   if (outcome.status === "denied") {

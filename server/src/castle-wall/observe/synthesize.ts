@@ -41,6 +41,52 @@ export function naiveRegisteredDomain(host: string): string | null {
   return labels.slice(-2).join(".");
 }
 
+/**
+ * A small BUILT-IN set of common two-label public suffixes under which the
+ * naive last-two-labels heuristic would produce a public-suffix-WIDE grant
+ * (e.g. `foo.co.uk` -> `co.uk` -> `*.co.uk` allows every `.co.uk` site).
+ * This is NOT a full public-suffix list (no PSL dependency) -- it is a
+ * deliberately conservative deny-list of the most common multi-label
+ * suffixes, so that an explicit `per_template_etld1` widening REFUSES to
+ * synthesize a rule when the naive registered domain lands on one of these
+ * (two-family gate FIX 3). The candidate is then dropped, never offered for
+ * promote, rather than silently signing a suffix-wide grant. An operator who
+ * genuinely wants such a host promotes it at the exact-host default instead.
+ */
+export const REFUSED_MULTI_LABEL_PUBLIC_SUFFIXES: ReadonlySet<string> = new Set([
+  "co.uk", "org.uk", "me.uk", "net.uk", "ac.uk", "gov.uk", "sch.uk", "ltd.uk", "plc.uk", "nhs.uk",
+  "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au", "asn.au",
+  "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "geek.nz",
+  "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "gr.jp",
+  "com.br", "net.br", "org.br", "gov.br", "edu.br",
+  "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in", "gov.in",
+  "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+  "co.za", "org.za", "gov.za", "net.za",
+  "com.mx", "org.mx", "gob.mx", "edu.mx",
+  "co.kr", "or.kr", "ne.kr", "go.kr",
+  "com.sg", "edu.sg", "gov.sg", "org.sg",
+  "com.hk", "org.hk", "gov.hk", "edu.hk",
+  "com.tr", "gov.tr", "org.tr", "net.tr",
+  "com.tw", "org.tw", "gov.tw", "edu.tw",
+  "co.il", "org.il", "gov.il", "ac.il",
+  "com.ar", "gob.ar", "org.ar", "net.ar",
+]);
+
+/**
+ * The registered domain a `per_template_etld1` widening would grant `*.` of,
+ * or `null` when that widening MUST be refused: an IP literal / single-label
+ * host (no domain to widen to), or a naive result that lands on a known
+ * multi-label public suffix (a suffix-wide grant the operator did not ask
+ * for). This is the single chokepoint both the synthesis path and its tests
+ * consult, so the refusal cannot drift between them.
+ */
+export function widenableRegisteredDomain(host: string): string | null {
+  const domain = naiveRegisteredDomain(host);
+  if (domain === null) return null;
+  if (REFUSED_MULTI_LABEL_PUBLIC_SUFFIXES.has(domain)) return null;
+  return domain;
+}
+
 function stableCandidateRuleId(
   observation: CandidateObservation,
   granularity: ObserveGranularity,
@@ -70,7 +116,11 @@ function buildMatch(
     // hostname to widen (adversarial review L2: the widening effect must be
     // visible and honest, never a silent scope change to a different axis).
     if (!observation.host) return null;
-    const registeredDomain = naiveRegisteredDomain(observation.host);
+    // REFUSE a widening that would land on a known multi-label public suffix
+    // (e.g. `foo.co.uk` -> `*.co.uk`): that is a suffix-wide grant the
+    // operator never asked for (two-family gate FIX 3). `null` here drops
+    // the candidate rather than signing an over-broad rule.
+    const registeredDomain = widenableRegisteredDomain(observation.host);
     if (!registeredDomain) return null;
     return {
       host: [registeredDomain],

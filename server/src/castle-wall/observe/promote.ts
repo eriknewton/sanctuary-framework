@@ -12,13 +12,34 @@
  * every selected destination stays denied (adversarial review finding H1
  * and H2; CI DoD tests 3 and 5).
  *
- * A candidate that cannot synthesize a valid rule (fails `validateRule`) is
- * dropped BEFORE the approval gate is even asked -- it is never offered,
- * and a bad row never blocks promoting the rest of a clean selection
- * (CI DoD test 2).
+ * TRUST-BOUNDARY HARDENING (two-family gate fix-round, 2026-07-07):
+ *   - The existing ruleset carried forward into the re-signed manifest is
+ *     read through `deps.readVerifiedManifest`, which MUST verify the
+ *     on-disk manifest's Ed25519 signature against the pinned key AND
+ *     re-validate every referenced rule (sig / sha256 / validateRule). A
+ *     tampered or unreadable manifest ABORTS the promote and fails closed
+ *     (FIX 1). We never launder an unverified on-disk rule into a freshly
+ *     signed manifest, and never let an unverified rule shadow a verified
+ *     one on an id collision.
+ *   - The authoritative read+verify happens twice: once for the BASIS
+ *     (pre-approval, to compute the candidate set + approval context) and
+ *     again IMMEDIATELY BEFORE publish (post-approval). If the on-disk
+ *     manifest digest changed between the two, promote ABORTS (a
+ *     compare-and-set), so a concurrent manifest update (e.g. a baseline
+ *     deny rule added by another path) is never silently overwritten by a
+ *     stale merged set (FIX 2, the read-then-publish lost-update window).
+ *   - The approval context carries each synthesized rule's EFFECTIVE match
+ *     + scope (what actually gets signed), not the raw observed
+ *     host:port -- so a widening granularity (`per_template_etld1`) can
+ *     never sign a broader grant than the human saw (FIX 3).
+ *
+ * A candidate that cannot synthesize a valid rule (fails `validateRule`, or
+ * is a refused public-suffix widening) is dropped BEFORE the approval gate
+ * is even asked -- it is never offered, and a bad row never blocks
+ * promoting the rest of a clean selection (CI DoD test 2).
  */
 
-import type { AllowlistRule } from "../allowlist/schema.js";
+import type { AllowlistRule, RuleMatch, RuleScope } from "../allowlist/schema.js";
 import { synthesizeCandidateRule } from "./synthesize.js";
 import {
   DEFAULT_OBSERVE_GRANULARITY,
@@ -37,21 +58,45 @@ export interface PromotePublishResult {
   removed_rule_filenames: string[];
 }
 
+/**
+ * The result of reading + cryptographically verifying the current on-disk
+ * signed manifest.
+ *   - `ok`: signature verified against the pinned key AND every referenced
+ *     rule re-validated (sha256 + validateRule); `rules` are the verified
+ *     carry-forward set and `digest` is a compare-and-set token over the
+ *     signed-manifest bytes.
+ *   - `absent`: no manifest exists yet (fresh install) -- an empty ruleset.
+ *   - `tampered`: the manifest exists but does NOT verify (bad signature,
+ *     unreadable/corrupt JSON, missing rule file, sha256 mismatch, or a
+ *     rule that fails validateRule). Promote MUST fail closed on this.
+ */
+export type VerifiedManifestRead =
+  | { status: "ok"; rules: AllowlistRule[]; digest: string }
+  | { status: "absent" }
+  | { status: "tampered"; reason: string };
+
 /** Narrow approval-gate surface `promoteCandidates` needs; `ApprovalGate.evaluate` satisfies it. */
 export interface PromoteApprover {
   (operation: string, context: Record<string, unknown>): Promise<{ allowed: boolean; reason?: string }>;
 }
 
 export interface PromoteDeps {
-  /** The full live ruleset BEFORE promote, read fresh (never a stale cache). */
-  currentRules: readonly AllowlistRule[];
+  /**
+   * Read + cryptographically VERIFY the current on-disk signed manifest.
+   * Called twice: once for the basis (pre-approval) and again immediately
+   * before publish (post-approval, for the compare-and-set). MUST verify the
+   * Ed25519 signature against the pinned key and re-validate every rule; a
+   * manifest that does not verify returns `tampered` and aborts the promote.
+   */
+  readVerifiedManifest: () => Promise<VerifiedManifestRead>;
   /** Tier-1 approval call. Never invoked when there is nothing valid to promote. */
   approve: PromoteApprover;
   /**
    * Re-signs + atomically publishes the FULL merged ruleset. Invoked ONLY
-   * after `approve()` returns `allowed: true` -- never before, never on a
-   * denial. Wraps `runtime/manifest-publisher.ts`'s `publishSignedManifest`
-   * in production; a test double in unit tests.
+   * after `approve()` returns `allowed: true` AND the publish-time
+   * compare-and-set passes -- never before, never on a denial, never on a
+   * tampered/changed manifest. Wraps `runtime/manifest-publisher.ts`'s
+   * `publishSignedManifest` in production; a test double in unit tests.
    */
   publish: (rules: AllowlistRule[]) => Promise<PromotePublishResult>;
   /**
@@ -78,6 +123,17 @@ export type PromoteOutcome =
       dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
     }
   | {
+      /** The on-disk manifest failed verification at basis or publish time. Nothing changed. */
+      status: "tampered_manifest";
+      reason: string;
+      dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
+    }
+  | {
+      /** The on-disk manifest changed between the approval basis and publish. Nothing changed. */
+      status: "manifest_changed";
+      dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
+    }
+  | {
       status: "denied";
       reason: string;
       dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
@@ -90,6 +146,50 @@ export type PromoteOutcome =
       publish: PromotePublishResult;
     };
 
+/** Stable compare-and-set token for an absent manifest (fresh install). */
+const ABSENT_DIGEST = "absent";
+
+function digestOf(read: VerifiedManifestRead): string {
+  return read.status === "ok" ? read.digest : ABSENT_DIGEST;
+}
+
+function verifiedRulesOf(read: VerifiedManifestRead): AllowlistRule[] {
+  return read.status === "ok" ? read.rules : [];
+}
+
+/**
+ * Compact, human-legible description of a synthesized rule's EFFECTIVE match
+ * + scope, for the Tier-1 approval context. This is what actually gets
+ * signed, so the human approves the real effect (FIX 3), not the raw
+ * observed destination. Kept a scalar STRING (not a nested object/array) so
+ * it survives the approval gate's `summarizeArgs`, which collapses
+ * objects/arrays to a shape summary but passes strings through.
+ */
+export function describeEffectiveRule(match: RuleMatch, scope: RuleScope): string {
+  const parts: string[] = [];
+  const axis = (label: string, value: string | string[] | undefined): void => {
+    if (value === undefined) return;
+    parts.push(`${label}=${Array.isArray(value) ? value.join(",") : value}`);
+  };
+  axis("host", match.host);
+  axis("host_pattern", match.host_pattern);
+  axis("ip", match.ip);
+  axis("cidr", match.cidr);
+  if (match.port !== undefined) {
+    parts.push(`port=${Array.isArray(match.port) ? match.port.join(",") : match.port}`);
+  }
+  if (match.protocol !== undefined) parts.push(match.protocol);
+  const scopeDesc = scope.agent_ids?.length
+    ? `agent:${scope.agent_ids.join(",")}`
+    : scope.template_ids?.length
+      ? `template:${scope.template_ids.join(",")}`
+      : "all-agents";
+  return `allow ${parts.join(" ")} scope=${scopeDesc}`;
+}
+
+/** Max synthesized-match lines put into the approval context before summarizing the tail. */
+const MAX_APPROVAL_RULE_LINES = 25;
+
 export async function promoteCandidates(
   selection: readonly PromoteSelectionRow[],
   candidatesByKey: ReadonlyMap<string, CandidateObservation>,
@@ -97,6 +197,17 @@ export async function promoteCandidates(
 ): Promise<PromoteOutcome> {
   const dropped: Array<{ key: string; reason: PromoteDroppedReason }> = [];
   const createdAt = deps.now.toISOString();
+
+  // ── Basis read + verify (FIX 1 fail-closed on tamper) ───────────────────
+  // Fail closed BEFORE synthesizing anything: a tampered on-disk manifest
+  // must stop the promote, never be laundered into a freshly signed one.
+  const basis = await deps.readVerifiedManifest();
+  if (basis.status === "tampered") {
+    return { status: "tampered_manifest", reason: basis.reason, dropped };
+  }
+  const basisDigest = digestOf(basis);
+  const basisRules = verifiedRulesOf(basis);
+  const basisIds = new Set(basisRules.map((rule) => rule.id));
 
   const promotable: Array<{ key: string; observation: CandidateObservation; rule: AllowlistRule }> = [];
   for (const row of selection) {
@@ -119,12 +230,18 @@ export async function promoteCandidates(
     return { status: "no_candidates", dropped };
   }
 
-  const approval = await deps.approve("castle_wall_observe_promote", {
-    candidate_count: promotable.length,
-    destinations: promotable.map(
-      (row) => `${row.observation.host ?? row.observation.ip}:${row.observation.port}/${row.observation.protocol}`,
-    ),
+  // ── Approval context: the SYNTHESIZED effective matches (FIX 3) ─────────
+  // Each `rule_N` is the exact match+scope that will be signed if approved.
+  const approvalContext: Record<string, unknown> = { candidate_count: promotable.length };
+  const shown = promotable.slice(0, MAX_APPROVAL_RULE_LINES);
+  shown.forEach((row, i) => {
+    approvalContext[`rule_${i + 1}`] = describeEffectiveRule(row.rule.match, row.rule.scope);
   });
+  if (promotable.length > shown.length) {
+    approvalContext["rules_omitted"] = `${promotable.length - shown.length} more (run promote with a smaller selection to review each)`;
+  }
+
+  const approval = await deps.approve("castle_wall_observe_promote", approvalContext);
 
   if (!approval.allowed) {
     // THE RED-LINE INVARIANT: no publish() call below this line on the
@@ -133,9 +250,33 @@ export async function promoteCandidates(
     return { status: "denied", reason: approval.reason ?? "not approved", dropped };
   }
 
-  const existingIds = new Set(deps.currentRules.map((rule) => rule.id));
+  // ── Publish-time re-read + verify + compare-and-set (FIX 1 + FIX 2) ─────
+  // Re-verify the on-disk manifest AFTER approval (approval may block on
+  // human input). If it no longer verifies, or if its digest changed since
+  // the basis we approved against, ABORT and fail closed -- never publish a
+  // stale merged set that could drop a concurrently-added rule.
+  const atPublish = await deps.readVerifiedManifest();
+  if (atPublish.status === "tampered") {
+    return { status: "tampered_manifest", reason: atPublish.reason, dropped };
+  }
+  if (digestOf(atPublish) !== basisDigest) {
+    return { status: "manifest_changed", dropped };
+  }
+  const currentRules = verifiedRulesOf(atPublish);
+
+  // Merge: the VERIFIED carry-forward rules first, then the freshly
+  // synthesized + validated added rules whose id is not already present.
+  // Both sides are trustworthy (currentRules are cryptographically verified;
+  // addedRules are validateRule-clean), and ids are content-derived, so a
+  // collision means identical content -- keeping the existing verified rule
+  // is the safe direction and a synthesized rule can never shadow it.
+  const existingIds = new Set(currentRules.map((rule) => rule.id));
+  // Defensive: the publish-time set must be digest-equal to the basis, so
+  // basisIds and existingIds agree; kept distinct only to make the invariant
+  // explicit for a future reader.
+  void basisIds;
   const addedRules = promotable.filter((row) => !existingIds.has(row.rule.id)).map((row) => row.rule);
-  const mergedRules = [...deps.currentRules, ...addedRules];
+  const mergedRules = [...currentRules, ...addedRules];
   const publishResult = await deps.publish(mergedRules);
 
   for (const row of promotable) {

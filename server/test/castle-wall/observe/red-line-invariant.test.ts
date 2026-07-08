@@ -80,7 +80,7 @@ describe("THE RED-LINE INVARIANT: observing never becomes allowing", () => {
       [{ key: key! }],
       candidatesByKey,
       {
-        currentRules: [],
+        readVerifiedManifest: async () => ({ status: "ok", rules: [], digest: "digest-empty" }),
         approve: async () => ({ allowed: false, reason: "operator declined" }),
         publish: publishSpy,
         now: new Date("2026-07-07T12:00:00.000Z"),
@@ -102,7 +102,7 @@ describe("THE RED-LINE INVARIANT: observing never becomes allowing", () => {
       [{ key: "does-not-exist" }],
       new Map(),
       {
-        currentRules: [],
+        readVerifiedManifest: async () => ({ status: "ok", rules: [], digest: "digest-empty" }),
         approve: async () => {
           approveCalled = true;
           return { allowed: true };
