@@ -28,7 +28,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtemp, rm, cp, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, cp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,6 +72,7 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
   let originalHome: string | undefined;
   let originalStoragePath: string | undefined;
   let originalIsTty: boolean | undefined;
+  let originalArgv1: string | undefined;
   let stderrSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(async () => {
@@ -79,6 +80,7 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     originalHome = process.env.HOME;
     originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
     originalIsTty = process.stdin.isTTY;
+    originalArgv1 = process.argv[1];
     process.env.HOME = tmpHome;
     process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
     // SAFETY: stdout is not a real console; silencing the operator-facing
@@ -98,6 +100,8 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
       value: originalIsTty,
       configurable: true,
     });
+    if (originalArgv1 === undefined) process.argv.splice(1, 1);
+    else process.argv[1] = originalArgv1;
     await rm(tmpHome, { recursive: true, force: true });
   });
 
@@ -175,6 +179,34 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     );
     expect(runAutoProvisionForWrap).toHaveBeenCalledWith(
       expect.objectContaining({ isTty: false, preAnsweredProvision: false }),
+    );
+  });
+
+  it("passes the actually-running CLI path into auto-provision so install-boot can receive --binary", async () => {
+    await installHermesFixture();
+    setTty(true);
+    const cliPath = join(tmpHome, "bin", "sanctuary");
+    await mkdir(dirname(cliPath), { recursive: true });
+    await writeFile(cliPath, "#!/usr/bin/env node\n");
+    process.argv[1] = cliPath;
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    await runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap }));
+    expect(runAutoProvisionForWrap).toHaveBeenCalledWith(
+      expect.objectContaining({ cliBinary: cliPath }),
+    );
+  });
+
+  it("prefers --dev-dist as the auto-provision CLI binary for dogfood installs", async () => {
+    await installHermesFixture();
+    setTty(true);
+    const devDist = join(tmpHome, "dist", "cli.js");
+    await mkdir(dirname(devDist), { recursive: true });
+    await writeFile(devDist, "#!/usr/bin/env node\n");
+    process.argv[1] = join(tmpHome, "bin", "sanctuary");
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    await runWrap(options({ hermes: true, devDist }), baseDeps({ runAutoProvisionForWrap }));
+    expect(runAutoProvisionForWrap).toHaveBeenCalledWith(
+      expect.objectContaining({ cliBinary: devDist }),
     );
   });
 

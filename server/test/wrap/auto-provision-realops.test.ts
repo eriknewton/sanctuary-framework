@@ -49,6 +49,7 @@ import {
   hermesEndpointProbes,
   allHermesCredentialDestPaths,
   resolveWallFortressPath,
+  policyDaemonInstallBootArgs,
 } from "../../src/wrap/auto-provision.js";
 import {
   planRehome,
@@ -741,6 +742,17 @@ describe("wrap/auto-provision real-ops chokepoint: resolveWallFortressPath (Bug 
 
   it("strips a trailing slash on the operator home before appending .sanctuary", () => {
     expect(resolveWallFortressPath({}, "/Users/erik/")).toBe("/Users/erik/.sanctuary");
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: policy daemon install-boot binary resolution", () => {
+  it("passes the running CLI binary explicitly to install-boot so bundled installs do not rely on import.meta.url layout", () => {
+    expect(policyDaemonInstallBootArgs("/Users/erik/.sanctuary", "/opt/sanctuary/dist/cli.js")).toEqual([
+      "--fortress",
+      "/Users/erik/.sanctuary",
+      "--binary",
+      "/opt/sanctuary/dist/cli.js",
+    ]);
   });
 });
 
