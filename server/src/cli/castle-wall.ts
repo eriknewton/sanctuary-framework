@@ -144,6 +144,21 @@ export interface CastleWallCommandContext {
    * and validating `<fortress>/policy/egress/agent-origin.json`.
    */
   agentOriginDescriptorProbe?: (fortressPath: string) => Promise<boolean>;
+  /**
+   * Bug B P1 (disarm-first, fail-open sub-case): out-callback that surfaces,
+   * ALONGSIDE the numeric exit code, whether a `disable` AFFIRMATIVELY confirmed
+   * the NE preference is OFF. This is needed because `runDisable` returns 0 in
+   * THREE distinct meanings and the exit code alone collapses them: (B)
+   * confirmed disabled, (C) NE saved-disabled but post-change corroboration was
+   * inconclusive (still off -- the save is authoritative), and (A) the disable
+   * host-app invoke FAILED but the dead-man lease-revoke succeeded (fail-open
+   * NOW, but the NE preference may STILL be enabled -- a reboot-brick risk if a
+   * caller then removes the daemon). Fires with `false` on case A and `true` on
+   * B/C, immediately before the corresponding `return 0`. Never fires on the
+   * throwing (non-zero) paths. Only the auto-provision arm-abort rollback reads
+   * it; every other caller ignores it and the exit-code contract is unchanged.
+   */
+  onDisableNeConfirmedOff?: (neConfirmedOff: boolean) => void;
 }
 
 export interface CastleWallParsedArgs {
@@ -3073,6 +3088,12 @@ async function runArmDisarm(
         err,
       );
       write(out, "Castle Wall disarmed: provider dead-man lease revoked (NE preference disable best-effort did not complete).\n");
+      // Bug B P1 (case A): the provider is fail-OPEN now (lease revoked), but the
+      // NE preference disable did NOT complete -- it may STILL be enabled. This
+      // is NOT a confirmed filter-off; a caller must not treat it as safe to
+      // remove the policy daemon (reboot could come up enabled + no daemon =
+      // deny-all).
+      ctx.onDisableNeConfirmedOff?.(false);
       return 0;
     }
     write(err, `castle-wall ${action} failed: ${detail}\n`);
@@ -3174,6 +3195,14 @@ async function runArmDisarm(
       out,
       "Castle Wall disarmed: content filter disabled (host app confirmed the save; status corroboration pending).\n",
     );
+  }
+  // Bug B P1 (cases B/C): reaching here on a disable means the NE save-disabled
+  // host-app invoke SUCCEEDED (the case-A save-failed path returned earlier), so
+  // the NE preference is confirmed OFF -- whether corroboration positively
+  // confirmed it (B) or was inconclusive on Tahoe (C, the save is authoritative).
+  // Safe for a caller to remove the policy daemon.
+  if (action === "disable") {
+    ctx.onDisableNeConfirmedOff?.(true);
   }
   return 0;
 }

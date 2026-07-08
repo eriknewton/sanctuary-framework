@@ -157,8 +157,28 @@ export interface ProvisionFlowOps {
   arm(uid: number, ceiling: number): Promise<{ ok: true } | { ok: false; error: string }>;
   /** Endpoints to re-probe after arming (same list, post-arm). */
   postArmEndpoints(): EndpointProbeTarget[];
-  /** Fast disarm, used only when the post-arm re-check fails (fix B2 rollback). */
-  disarm(): Promise<void>;
+  /**
+   * Disarm the content filter (the unconditional dead-man `castle-wall
+   * disable`). Used by the post-arm re-check rollback (fix B2) AND, Bug B P1, by
+   * the arm-abort branch's disarm-first ordering before tearing a
+   * freshly-installed policy daemon down.
+   *
+   * THROWS when the disarm hard-fails (the dead-man lever itself failed).
+   * On success (no throw) it returns `neConfirmedOff`:
+   *   - `true`  -> the NE preference was AFFIRMATIVELY saved OFF (confirmed, or
+   *     saved-disabled with only inconclusive corroboration -- the save is
+   *     authoritative). Safe to remove a freshly-installed policy daemon.
+   *   - `false` -> the disable did NOT confirm the NE preference is off (the
+   *     fail-open-after-lease-revoke sub-case: the provider is fail-OPEN now, so
+   *     it is NOT enforcing, but the NE preference may STILL be enabled and a
+   *     reboot could come up enabled with no daemon = deny-all). Must be treated
+   *     exactly like a disarm that could not confirm: leave the daemon UP.
+   *
+   * IMPORTANT: a non-throwing disarm guarantees the filter is NOT ENFORCING
+   * right now; it does NOT by itself guarantee the NE preference is off -- that
+   * is exactly what `neConfirmedOff` distinguishes.
+   */
+  disarm(): Promise<{ neConfirmedOff: boolean }>;
   /**
    * Restore re-home from backup, used on a fail-closed abort between create
    * and arm. FIX F2/F5 (2026-07-07 fix-round): returns whether the restore
@@ -598,35 +618,56 @@ export async function runProvisionFlow(
     // FIX (round 5, item N3): arming failed but the harness daemon is live;
     // tear it down on this abort.
     //
-    // Bug B P0 (disarm-first ordering): `arm` returning ok:false does NOT imply
-    // the content filter is off. On macOS Tahoe the host app can SAVE the NE
-    // config ENABLED and THEN return non-zero because its own post-change
-    // status corroboration timed out (or a build-sha check tripped after the
-    // save) -- so the filter may be ON. Booting a FRESHLY-INSTALLED policy
-    // daemon out in that state is filter-on + daemon-down = the exact deny-all
-    // lockout (SSH included) this feature exists to prevent. So when a policy
-    // daemon was freshly installed this run, DISARM FIRST -- the unconditional
-    // dead-man lever, which reliably saves the NE config DISABLED and returns 0
-    // even when its own corroboration is inconclusive, and throws ONLY when the
-    // filter may still be enabled -- to GUARANTEE the filter is off BEFORE the
-    // daemon is torn down. Order is ALWAYS filter-off THEN daemon-down.
-    let tearDownPolicyDaemon = policyDaemonFreshlyInstalled;
+    // Bug B P0/P1 (disarm-first ordering + confirmed-off teardown): `arm`
+    // returning ok:false does NOT imply the content filter is off. On macOS
+    // Tahoe the host app can SAVE the NE config ENABLED and THEN return non-zero
+    // because its own post-change status corroboration timed out (or a build-sha
+    // check tripped after the save) -- so the filter may be ON. Booting a
+    // FRESHLY-INSTALLED policy daemon out in that state is filter-on +
+    // daemon-down = the exact deny-all lockout (SSH included) this feature
+    // exists to prevent. So when a policy daemon was freshly installed this run,
+    // DISARM FIRST, and tear the daemon down ONLY when disarm AFFIRMATIVELY
+    // CONFIRMS the NE preference is off. Order is ALWAYS filter-off THEN
+    // daemon-down.
+    //
+    // P1 refinement: a non-throwing disarm guarantees the filter is not
+    // ENFORCING now, but NOT that the NE preference is off. The
+    // fail-open-after-lease-revoke sub-case returns success while the NE
+    // preference may STILL be enabled -- removing the daemon there risks a
+    // reboot-brick (the provider could come up enabled + no daemon = deny-all).
+    // So the teardown condition is `neConfirmedOff === true`, never merely
+    // "disarm did not throw". Both a throw AND a non-throwing-but-not-confirmed
+    // disarm leave the daemon UP + set wallMayBeArmed.
+    let tearDownPolicyDaemon = false;
     let wallMayBeArmed = false;
     let disarmNote: string | undefined;
     if (policyDaemonFreshlyInstalled) {
       try {
-        await ops.disarm();
-        // Disarm did not throw => the filter is confirmed off (NE save-disabled
-        // succeeded / provider fail-open). Safe to tear the fresh daemon down.
-        // Still note that the wall was disarmed during rollback so the operator
-        // can confirm -- this is not a bare "nothing happened" clean rollback.
-        disarmNote =
-          "The content filter was disarmed as part of this rollback; confirm it is off with 'sanctuary castle-wall status'.";
+        const disarmResult = await ops.disarm();
+        if (disarmResult.neConfirmedOff) {
+          // NE preference AFFIRMATIVELY off (saved disabled -- confirmed, or
+          // saved with inconclusive corroboration where the save is
+          // authoritative). Safe to tear the fresh daemon down. Note the wall
+          // was disarmed during rollback so the operator can confirm -- not a
+          // bare "nothing happened" clean rollback.
+          tearDownPolicyDaemon = true;
+          disarmNote =
+            "The content filter was disarmed as part of this rollback; confirm it is off with 'sanctuary castle-wall status'.";
+        } else {
+          // Disarm succeeded as a dead-man lever (not ENFORCING now) but did NOT
+          // confirm the NE preference is off (fail-open after lease revoke). The
+          // NE preference may still be enabled -> a reboot could come up enabled
+          // with no daemon (deny-all). Treat exactly like disarm-uncertain:
+          // leave the fresh daemon UP (not-enforcing + daemon-up is recoverable)
+          // and surface loudly.
+          wallMayBeArmed = true;
+          disarmNote =
+            "disarm reported success as a dead-man lever but did NOT confirm the NE preference is off (fail-open after lease revoke); the wall may still be enabled at the preference level";
+        }
       } catch (disarmErr) {
-        // Disarm could NOT confirm the filter is off. Do NOT boot the fresh
-        // policy daemon out -- leave it UP (filter-on + daemon-up is enforcing
-        // and RECOVERABLE, never the deny-all lockout) and surface loudly.
-        tearDownPolicyDaemon = false;
+        // Disarm hard-failed: it could NOT confirm the filter is off. Do NOT
+        // boot the fresh policy daemon out -- leave it UP (filter-on + daemon-up
+        // is enforcing and RECOVERABLE, never the deny-all lockout).
         wallMayBeArmed = true;
         disarmNote = (disarmErr as Error).message;
       }

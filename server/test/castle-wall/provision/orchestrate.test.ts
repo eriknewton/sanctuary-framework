@@ -70,7 +70,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: AGENT_UID })),
     arm: vi.fn(async () => ({ ok: true as const })),
     postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
-    disarm: vi.fn(async () => undefined),
+    disarm: vi.fn(async () => ({ neConfirmedOff: true as const })),
     restoreRehome: vi.fn(async () => ({
       fullyRestored: true,
       restoredCount: REHOME_RESULTS.length,
@@ -400,6 +400,7 @@ describe("castle-wall/provision/orchestrate", () => {
         if (err !== undefined) {
           throw err;
         }
+        return { neConfirmedOff: true };
       }),
     });
     const result = await runProvisionFlow(baseCtx(), ops);
@@ -758,6 +759,27 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
       const reason = (result as { reason: string }).reason;
       expect(reason).toMatch(/MAY STILL BE ARMED/);
+      expect(reason).toMatch(/castle-wall disable/);
+    });
+
+    it("P1 (fail-open-after-lease-revoke): arm ok:false + fresh daemon + disarm returns neConfirmedOff:FALSE leaves the daemon UP (never a reboot-brick) + sets wallMayBeArmed, even though disarm did NOT throw", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        // Disarm did NOT throw (it succeeded as a dead-man lever, fail-open),
+        // but the NE preference was NOT confirmed off -- the exact P1 sub-case.
+        disarm: vi.fn(async () => ({ neConfirmedOff: false })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm", wallMayBeArmed: true });
+      expect(ops.disarm).toHaveBeenCalledTimes(1);
+      // CRITICAL: a non-throwing-but-not-confirmed disarm must NOT tear the fresh
+      // daemon down -- removing it while the NE preference may still be enabled
+      // risks a reboot-brick (provider up enabled + no daemon = deny-all).
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+      const reason = (result as { reason: string }).reason;
+      expect(reason).toMatch(/MAY STILL BE ARMED/);
+      expect(reason).toMatch(/fail-open after lease revoke/);
       expect(reason).toMatch(/castle-wall disable/);
     });
 

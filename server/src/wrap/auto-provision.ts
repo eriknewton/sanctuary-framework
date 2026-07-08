@@ -1131,8 +1131,23 @@ export async function runAutoProvisionForWrap(
       // Bug B (consistency): disarm the SAME fortress the arm targeted (see the
       // arm op above) so the fast post-arm rollback lever cannot miss the wall
       // it just armed on a non-default fortress.
-      const code = await runDisable(["--fortress", wallFortressPath]);
+      //
+      // Bug B P1: capture whether the disable AFFIRMATIVELY confirmed the NE
+      // preference is OFF, surfaced alongside the exit code via the
+      // onDisableNeConfirmedOff out-callback (runDisable's numeric contract is
+      // unchanged for every other caller). A non-throwing disarm alone is NOT
+      // sufficient to remove a freshly-installed policy daemon -- the
+      // fail-open-after-lease-revoke sub-case returns success while the NE
+      // preference may still be enabled -- so the orchestrator tears the fresh
+      // daemon down only when `neConfirmedOff === true`.
+      let neConfirmedOff = false;
+      const code = await runDisable(["--fortress", wallFortressPath], {
+        onDisableNeConfirmedOff: (confirmed) => {
+          neConfirmedOff = confirmed;
+        },
+      });
       throwIfDisarmFailed(code);
+      return { neConfirmedOff };
     },
     restoreRehome: async (results: RehomeStepResult[]) => {
       // FIX F2/F3 (2026-07-07 fix-round): thread the OPERATOR's uid/gid
