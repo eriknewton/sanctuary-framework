@@ -1154,6 +1154,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return 2;
   }
 
+  if (command === "observe") {
+    const { runObserveCommand } = await import("./cli/castle-wall-observe.js");
+    return runObserveCommand({ argv: args.slice(1) });
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`
@@ -1216,6 +1221,13 @@ function printCastleWallHelp(): void {
                      pin, and the custody directory is root-owned and not group/other-writable.
                      Exit 0 when ready, 1 otherwise. Does NOT prove reboot survival by itself; see
                      castle-wall-macos-boot-service.md for the required Erik-present reboot drill.
+    observe start|status|candidates|promote|discard
+                     Observe / Learn Allow-List v1: the wall stays armed and default-deny the
+                     whole time; observe mode records denied novel destinations for review
+                     instead of nagging per-flow. 'promote' is Tier-1 FORCED (requires the same
+                     approval gate as state_export / key rotation) and is the ONLY verb that can
+                     ever widen the live ruleset. Run 'sanctuary castle-wall observe --help' for
+                     command-specific options.
 
   Options:
     --help, -h              Show this help

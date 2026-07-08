@@ -116,6 +116,25 @@ export const NON_RELAXABLE_CLOUD_TIER1_OPERATIONS = [
  */
 export const NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS = ["file_grant"] as const;
 
+/**
+ * Castle Wall Observe / Learn Allow-List v1 (2026-07-07): promoting an
+ * observed destination into a live allow rule widens what a wrapped agent
+ * may reach off-box -- the same class of trust-boundary change as the
+ * operator-cloud and file-grant operations above. A hand-authored policy
+ * must NEVER be able to relax `castle_wall_observe_promote` into Tier 3 or
+ * auto-approve (adversarial review findings H1/H2: no auto-promote, no
+ * implicit allow). Observe-mode start/status/candidates/discard are NOT
+ * here: they never widen the live ruleset (start/discard are safe-direction
+ * or reversible; status/candidates are read-only), so they are Tier-3
+ * auto-allow in `DEFAULT_POLICY.tier3_always_allow` below, not force-pinned.
+ * Spread into the SAME two force-lists as the cloud/file-grant sets (this
+ * one, and `gate.ts`'s runtime mirror) so both enforcement points cannot
+ * drift apart; a drift guard test pins the relationship.
+ */
+export const NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS = [
+  "castle_wall_observe_promote",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -128,6 +147,7 @@ const FORCED_TIER1_OPERATIONS = [
   "memory_delete",
   ...NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
   ...NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -486,6 +506,13 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // external channel).
     "memory_insert",
     "memory_delete",
+    // Castle Wall Observe / Learn Allow-List v1 (2026-07-07): promoting an
+    // observed destination into a live allow rule is a wall-widening policy
+    // mutation, the same class as file_grant / operator_cloud_provision
+    // above. ALSO force-pinned via
+    // NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS so a hand-authored
+    // policy cannot relax it.
+    "castle_wall_observe_promote",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [
@@ -564,6 +591,18 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS above, never here.
     "file_grant_revoke",
     "file_grant_list",
+    // Castle Wall Observe / Learn Allow-List v1 (2026-07-07): starting/
+    // stopping observe mode never widens the live ruleset (it only toggles
+    // whether denied novel destinations are coalesced into the candidate
+    // store instead of nagging per-flow), status/candidates are read-only,
+    // and discard is safe-direction (it only ever drops a candidate, never
+    // adds a rule). All four auto-allow+audit at Tier 3. The promote
+    // operation (castle_wall_observe_promote) is force-pinned Tier 1 via
+    // NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS above, never here.
+    "castle_wall_observe_start",
+    "castle_wall_observe_status",
+    "castle_wall_observe_candidates",
+    "castle_wall_observe_discard",
   ],
   approval_channel: DEFAULT_CHANNEL,
   approval_redirect: DEFAULT_APPROVAL_REDIRECT,
