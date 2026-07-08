@@ -547,7 +547,22 @@ export async function readVerifiedManifest(
     };
   }
 
-  return { status: "ok", rules: [...rulesResult.value], digest };
+  // Carry the signature-VERIFIED manifest-level descriptors forward (#897 P1).
+  // Both `agent_origin` and `operator_baseline` live INSIDE `signed.manifest`,
+  // so they are covered by the Ed25519 signature `verifyManifestSignature` just
+  // checked -- reading them here is exactly as trustworthy as the rules, and an
+  // attacker who plants either on disk breaks the signature and lands in the
+  // `tampered` branch above (no laundering vector). Each field is set only when
+  // the source manifest carried it, so an absent descriptor stays absent and
+  // the re-signed canonical bytes match a manifest built without it.
+  const read: VerifiedManifestRead = { status: "ok", rules: [...rulesResult.value], digest };
+  if (signed.manifest.agent_origin !== undefined) {
+    read.agentOrigin = signed.manifest.agent_origin;
+  }
+  if (signed.manifest.operator_baseline !== undefined) {
+    read.operatorBaseline = signed.manifest.operator_baseline;
+  }
+  return read;
 }
 
 /** Load the pinned Castle Wall public key (32 raw bytes) used to verify the on-disk manifest. */
@@ -710,9 +725,23 @@ export async function runObservePromote(
   const outcome = await promoteCandidates(selection, candidatesByKey, {
     readVerifiedManifest: () => readVerifiedManifest(egressDir, pinnedPublicKey),
     approve: (operation, context) => gate.evaluate(operation, context),
-    publish: (rules) =>
+    publish: (rules, descriptors) =>
       publishSignedManifest(
-        { fortressId, issuedAt: new Date().toISOString(), rules, signer },
+        {
+          fortressId,
+          issuedAt: new Date().toISOString(),
+          rules,
+          signer,
+          // Carry the VERIFIED manifest-level descriptors through so a re-sign
+          // preserves operator_baseline + agent_origin (#897 P1). buildSignedManifest
+          // re-runs each through its fail-closed validator (idempotent for an
+          // already-signed descriptor), so a carried-forward value is emitted
+          // faithfully and a malformed one would still be dropped.
+          ...(descriptors.agentOrigin !== undefined ? { agentOrigin: descriptors.agentOrigin } : {}),
+          ...(descriptors.operatorBaseline !== undefined
+            ? { operatorBaseline: descriptors.operatorBaseline }
+            : {}),
+        },
         manifestStorage,
       ),
     auditPromotedCandidate: async (row) => {
