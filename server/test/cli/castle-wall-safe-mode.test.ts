@@ -166,6 +166,47 @@ describe("castle-wall safe-mode daemon (F1 Option C)", () => {
     }
   });
 
+  // skipIf(non-darwin): `castle-wall daemon --safe-mode` is macOS-only
+  // (runSafeModeDaemon returns early on non-darwin), so this regression guard is
+  // scoped to darwin. Gating it keeps the Linux CI passing count - and therefore
+  // .test-baseline - unchanged, while still exercising the fix where the
+  // safe-mode daemon actually runs. Mirrors the runDaemon --fortress test.
+  it.skipIf(process.platform !== "darwin")("safe-mode daemon honors the --fortress flag over a stale SANCTUARY_STORAGE_PATH", async () => {
+    // Regression: runSafeModeDaemon resolved with resolveStoragePath(env)
+    // (SANCTUARY_STORAGE_PATH only) and dropped its argv, so
+    // `castle-wall daemon --safe-mode --fortress <path>` silently armed against
+    // the DEFAULT/home fortress instead of the operator-named one - the same
+    // footgun runDaemon had. Proven at the daemon-start seam (no live boot): the
+    // injected safeModeDaemonStart captures the fortressPath it was wired with,
+    // then throws so the run returns before the never-resolving SIGTERM wait.
+    const flagFortress = await makeFortress();
+    const staleStoragePath = await makeFortress();
+    const tok = await makeToken();
+    const err = new CaptureStream();
+    let captured: MacOSCastleWallDaemonInput | undefined;
+
+    const code = await runSafeModeDaemon(["--safe-mode", "--fortress", flagFortress], {
+      err,
+      platform: "darwin",
+      // Stale path that, if (wrongly) honored, would be armed instead.
+      env: { SANCTUARY_STORAGE_PATH: staleStoragePath },
+      bootTokenPath: tok.path,
+      signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+      safeModeDaemonStart: async (input) => {
+        captured = input;
+        throw STOP_AFTER_CAPTURE;
+      },
+    });
+
+    // The capture-throw is handled as a start failure (returns 1); the point is
+    // WHICH fortress the safe-mode path wired up.
+    expect(code).toBe(1);
+    expect(captured).toBeDefined();
+    // The flag-named fortress won, NOT the stale env path.
+    expect(captured!.fortressPath).toBe(flagFortress);
+    expect(captured!.fortressPath).not.toBe(staleStoragePath);
+  });
+
   // skipIf(darwin): the diagnosis path in `writeSignerHelperReadinessDiagnosis`
   // shells out to the REAL `launchctl` (no injectable seam from this context),
   // so the `/Background Item/` assertion only holds where launchctl reports the
