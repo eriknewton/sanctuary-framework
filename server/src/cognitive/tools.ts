@@ -127,6 +127,7 @@ const RESERVED_NAMESPACE_PREFIXES = [
   "_fortress_mode",
   "_facade",
   "_file_grants",
+  "_castle_wall_observe",
 ] as const;
 
 /**

@@ -913,6 +913,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     // operator CLI
     "cli/audit.ts",
     "cli/castle-wall.ts",
+    "cli/castle-wall-observe.ts",
     // compliance report generation — operator artifact
     "compliance/eu_ai_act/generator.ts",
     // operator chat context / concierge — human operator surface
@@ -1182,6 +1183,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       kind: "operator-batch",
       reason:
         "operator CLI castle-wall audit dump: one-shot full read per invocation; wants a single full re-verify.",
+    },
+    {
+      module: "cli/castle-wall-observe.ts",
+      fn: "runObserveCandidates",
+      kind: "operator-batch",
+      reason:
+        "operator CLI castle-wall observe candidates: one-shot re-fold of denied-flow audit entries into the candidate store per invocation; wants a single full re-verify, not a warm view (observe review is human-paced, not the SSE board).",
     },
     {
       module: "exit/bundle.ts",

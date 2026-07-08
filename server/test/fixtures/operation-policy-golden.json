@@ -2,6 +2,7 @@
   "tier1_always_approve": [
     "audit_export_siem",
     "bootstrap_provide_guarantee",
+    "castle_wall_observe_promote",
     "compliance_generate_eu_ai_act_bundle",
     "context_gate_apply_template",
     "context_gate_set_policy",
@@ -51,6 +52,10 @@
     "bridge_attest",
     "bridge_commit",
     "bridge_verify",
+    "castle_wall_observe_candidates",
+    "castle_wall_observe_discard",
+    "castle_wall_observe_start",
+    "castle_wall_observe_status",
     "compliance_eu_ai_act_annex_iii_classify",
     "context_gate_filter",
     "context_gate_list_policies",
