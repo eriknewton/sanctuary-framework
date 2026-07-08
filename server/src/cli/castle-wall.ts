@@ -2652,7 +2652,7 @@ function validateHeadlessBuildIdentity(
   return null;
 }
 
-function defaultDaemonProbe(socketPath: string): Promise<boolean> {
+export function defaultDaemonProbe(socketPath: string): Promise<boolean> {
   return new Promise((resolvePromise) => {
     let settled = false;
     const socket = createConnection(socketPath);
