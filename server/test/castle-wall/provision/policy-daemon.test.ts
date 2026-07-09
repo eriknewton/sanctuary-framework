@@ -18,22 +18,49 @@ function state(overrides: Partial<PolicyDaemonState> = {}): PolicyDaemonState {
   return {
     socketReachable: false,
     bootServiceForThisFortress: false,
+    bootServiceReadyForThisFortress: false,
     bootServiceForAnyFortress: false,
     ...overrides,
   };
 }
 
 describe("castle-wall/provision/policy-daemon: resolvePolicyDaemonAction", () => {
-  it("noop when the socket already answers (the stock-box case: a boot daemon already serves this fortress)", () => {
-    expect(resolvePolicyDaemonAction(state({ socketReachable: true }))).toBe("noop");
+  it("install-fresh when the socket answers but NO persistent boot service exists (Bug D transient daemon)", () => {
+    expect(resolvePolicyDaemonAction(state({ socketReachable: true }))).toBe("install-fresh");
   });
 
-  it("noop wins even if a boot service also exists (an answering socket is authoritative)", () => {
+  it("noop only when the socket answers AND a matching boot service is ready", () => {
     expect(
       resolvePolicyDaemonAction(
-        state({ socketReachable: true, bootServiceForThisFortress: true, bootServiceForAnyFortress: true }),
+        state({
+          socketReachable: true,
+          bootServiceForThisFortress: true,
+          bootServiceReadyForThisFortress: true,
+          bootServiceForAnyFortress: true,
+        }),
       ),
     ).toBe("noop");
+  });
+
+  it("restart-existing when the socket answers but the matching boot service is not ready (Bug D)", () => {
+    expect(
+      resolvePolicyDaemonAction(
+        state({
+          socketReachable: true,
+          bootServiceForThisFortress: true,
+          bootServiceReadyForThisFortress: false,
+          bootServiceForAnyFortress: true,
+        }),
+      ),
+    ).toBe("restart-existing");
+  });
+
+  it("refuses when the socket answers but the singleton boot service targets a different fortress", () => {
+    expect(
+      resolvePolicyDaemonAction(
+        state({ socketReachable: true, bootServiceForThisFortress: false, bootServiceForAnyFortress: true }),
+      ),
+    ).toBe("refuse-conflict");
   });
 
   it("install-fresh when the socket is down and NO boot service exists for any fortress (fresh box)", () => {

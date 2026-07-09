@@ -49,6 +49,7 @@ import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import {
   CASTLE_WALL_BOOT_PLIST_PATH,
   bootServiceInstalled,
+  bootServiceReady,
 } from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
 import type {
@@ -98,11 +99,16 @@ export interface CastleWallCommandContext {
   /** Override the daemon-socket reachability probe (tests). */
   daemonProbe?: (socketPath: string) => Promise<boolean>;
   /**
-   * Override the persistent-boot-service presence probe used by the `enable`
-   * composition guard (#450 item 5; tests). Defaults to {@link bootServiceInstalled},
-   * which validates the LaunchDaemon plist is the well-formed boot-survival unit
-   * (correct label + RunAtLoad + --safe-mode), not merely that a file exists.
-   * Returns true iff a persistent boot-survival service is installed.
+   * Override the persistent-boot-service readiness probe used by the `enable`
+   * composition guard (#450 item 5; tests). Defaults to {@link bootServiceReady},
+   * which validates the LaunchDaemon plist, stable loaded launchd job, enabled
+   * state, and expected fortress binding. Returns true iff the boot-survival
+   * service is ready for reboot.
+   */
+  bootServiceReadyProbe?: (expectedFortressPath?: string) => Promise<boolean>;
+  /**
+   * Override the installed-plist probe used only for diagnostic wording when
+   * readiness fails. Defaults to {@link bootServiceInstalled}.
    */
   bootServiceInstalledProbe?: (expectedFortressPath?: string) => Promise<boolean>;
   /**
@@ -2882,20 +2888,34 @@ async function runArmDisarm(
   }
 
   if (action === "enable" && !parsed.force) {
-    // Composition guard (#450 item 5): "arming implies a persistent BOOT service
-    // is installed." The daemon-reachability gate above only proves a daemon is
-    // up NOW - a manually-started daemon passes it, yet leaves the box with an
-    // armed filter and NO boot daemon, so the NEXT REBOOT comes up deny-all with
-    // SSH locked out (the exact F1 boot-cut). Require the persistent boot service
-    // to exist so you cannot arm into the reboot-brick state. --force overrides
-    // (a boot-survival service supervised out-of-band).
-    const bootProbe =
+    // Composition guard (#450 item 5): "arming implies a READY persistent BOOT
+    // service." The daemon-reachability gate above only proves a daemon is up
+    // NOW - a manually-started daemon passes it, and even a matching plist can be
+    // disabled/unloaded. Require the persistent boot service to be strictly
+    // installed, loaded for this fortress, enabled, and stable so you cannot arm
+    // into the reboot-brick state. --force overrides (a boot-survival service
+    // supervised out-of-band).
+    const bootReadyProbe =
+      ctx.bootServiceReadyProbe ??
+      ((expectedFortressPath?: string) =>
+        bootServiceReady(CASTLE_WALL_BOOT_PLIST_PATH, expectedFortressPath));
+    const bootInstalledProbe =
       ctx.bootServiceInstalledProbe ??
       ((expectedFortressPath?: string) =>
         bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH, expectedFortressPath));
-    if (!(await bootProbe(fortressPath))) {
-      const bootServiceExists = await bootProbe();
-      if (bootServiceExists) {
+    if (!(await bootReadyProbe(fortressPath))) {
+      if (await bootInstalledProbe(fortressPath)) {
+        write(
+          err,
+          `Refusing to arm: the Castle Wall boot service for this fortress is installed but not ready/enabled/loaded (${fortressPath}).\n` +
+            "A disabled or unloaded boot service does not survive reboot; arming would make\n" +
+            "the NEXT REBOOT come up deny-all with no daemon for this fortress.\n" +
+            "Repair it first:  sudo sanctuary castle-wall install-boot --fortress <path>\n" +
+            "Or pass --force if a boot-survival service is supervised out-of-band.\n",
+        );
+        return 1;
+      }
+      if (await bootInstalledProbe()) {
         write(
           err,
           `Refusing to arm: the installed Castle Wall boot service targets a different fortress than this command (${fortressPath}).\n` +
@@ -2908,7 +2928,7 @@ async function runArmDisarm(
       }
       write(
         err,
-        "Refusing to arm: no persistent Castle Wall boot service is installed.\n" +
+        "Refusing to arm: no persistent Castle Wall boot service is installed, loaded, enabled, and ready for this fortress.\n" +
           "Reachability of a daemon NOW does not survive a reboot - arming without the\n" +
           "boot service means the NEXT REBOOT comes up deny-all with no daemon (SSH\n" +
           "locked out, the F1 boot-cut).\n" +

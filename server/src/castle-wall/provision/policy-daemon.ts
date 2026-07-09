@@ -36,6 +36,12 @@ export interface PolicyDaemonState {
    */
   bootServiceForThisFortress: boolean;
   /**
+   * Whether the matching singleton boot service is installed AND currently
+   * certified live/stable under launchd. A socket can be reachable because a
+   * transient/manual daemon is running; only this field can justify a no-op.
+   */
+  bootServiceReadyForThisFortress: boolean;
+  /**
    * Whether ANY well-formed singleton boot service is installed (for this
    * fortress OR a different one). `bootServiceForThisFortress` implies this.
    */
@@ -45,15 +51,21 @@ export interface PolicyDaemonState {
 /**
  * The one action the flow must take to ensure a reachable policy daemon for the
  * target fortress before arming.
- *   - "noop": the socket already answers; nothing to do, nothing to tear down.
+ *   - "noop": the socket already answers AND a matching persistent boot
+ *     service is installed and certified live for this fortress; nothing to
+ *     do, nothing to tear down.
  *   - "install-fresh": NO boot service exists for ANY fortress -> stand up the
- *     singleton boot service for THIS fortress. THIS run created the machine's
- *     wall from nothing, so a later abort MUST tear it back down (restoring the
- *     prior "no wall" state).
- *   - "restart-existing": a boot service for THIS fortress is installed but its
- *     socket is not reachable -> (re)bootstrap + verify it. It PRE-EXISTED, so a
- *     later abort must NOT tear it down (booting out working infrastructure over
- *     a transient failure is destructive -- R6-3 rationale, one wall over).
+ *     singleton boot service for THIS fortress. This also covers the Bug D
+ *     transient-daemon state: a daemon answers NOW, but no persistent boot
+ *     service exists, so arming would still fail the reboot-survival guard.
+ *     THIS run created the machine's persistent wall from nothing, so a later
+ *     abort MUST tear it back down (restoring the prior "no wall" state).
+ *   - "restart-existing": a boot service for THIS fortress is installed but it
+ *     is not ready/live enough to no-op (including the Bug D shape where a
+ *     transient daemon answers the socket while launchd is stopped) ->
+ *     (re)bootstrap + verify it. It PRE-EXISTED, so a later abort must NOT tear
+ *     it down (booting out working infrastructure over a transient failure is
+ *     destructive -- R6-3 rationale, one wall over).
  *   - "refuse-conflict": a boot service is installed for a DIFFERENT fortress ->
  *     REFUSE (one machine runs one wall; do not swap). The flow rolls back.
  */
@@ -65,13 +77,13 @@ export type PolicyDaemonAction =
 
 /**
  * Map the observed policy-daemon state to the single action the flow must take.
- * Pure: no I/O. Fail-closed ordering -- reachability wins first (an answering
- * socket is authoritative regardless of boot-service state), then a genuinely
- * fresh box installs, then a stopped this-fortress service restarts, and only a
- * DIFFERENT-fortress service left over reaches the refuse branch.
+ * Pure: no I/O. Fail-closed ordering -- a matching persistent boot service is
+ * mandatory even when the socket answers NOW. A transient/manual daemon without
+ * a matching, ready boot service cannot satisfy the arm guard, so it must drive
+ * install-boot before arming.
  */
 export function resolvePolicyDaemonAction(state: PolicyDaemonState): PolicyDaemonAction {
-  if (state.socketReachable) {
+  if (state.socketReachable && state.bootServiceReadyForThisFortress) {
     return "noop";
   }
   if (!state.bootServiceForAnyFortress) {
