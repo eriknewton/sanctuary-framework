@@ -50,6 +50,10 @@ import {
   allHermesCredentialDestPaths,
   resolveWallFortressPath,
   policyDaemonInstallBootArgs,
+  resolvePolicyDaemonActionForAutoProvision,
+  runLaunchctlWithTimeout,
+  LAUNCHCTL_TIMEOUT_MS,
+  LAUNCHCTL_KILL_SIGNAL,
 } from "../../src/wrap/auto-provision.js";
 import {
   planRehome,
@@ -753,6 +757,71 @@ describe("wrap/auto-provision real-ops chokepoint: policy daemon install-boot bi
       "--binary",
       "/opt/sanctuary/dist/cli.js",
     ]);
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: policy daemon action wiring", () => {
+  it("does not noop for a reachable socket when launchd is loaded for a different fortress (Bug E)", () => {
+    const action = resolvePolicyDaemonActionForAutoProvision({
+      socketReachable: true,
+      diskForThisFortress: true,
+      readyForThisFortress: false,
+      plistPresent: true,
+      loadedState: { loaded: true, fortressPath: "/Users/other/.sanctuary" },
+      fortressPath: "/Users/operator/.sanctuary",
+    });
+
+    expect(action).toBe("refuse-conflict");
+  });
+
+  it("noops only for the same-fortress loaded service plus reachable socket when the stable-pid sample missed", () => {
+    const action = resolvePolicyDaemonActionForAutoProvision({
+      socketReachable: true,
+      diskForThisFortress: true,
+      readyForThisFortress: false,
+      plistPresent: true,
+      loadedState: { loaded: true, fortressPath: "/Users/operator/.sanctuary" },
+      fortressPath: "/Users/operator/.sanctuary",
+    });
+
+    expect(action).toBe("noop");
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: bounded launchctl wrapper", () => {
+  it("passes timeout and SIGKILL to execFileAsync and maps a never-returning launchctl to failure", async () => {
+    let observed:
+      | { file: string; args: string[]; options: { timeout: number; killSignal: NodeJS.Signals } }
+      | undefined;
+    const neverReturningLaunchctl = async (
+      file: string,
+      args: string[],
+      options: { timeout: number; killSignal: NodeJS.Signals },
+    ): Promise<{ stdout: string; stderr: string }> => {
+      observed = { file, args, options };
+      const error = new Error("spawn /bin/launchctl ETIMEDOUT") as Error & {
+        code: string;
+        stdout: string;
+        stderr: string;
+      };
+      error.code = "ETIMEDOUT";
+      error.stdout = "";
+      error.stderr = "";
+      throw error;
+    };
+
+    const result = await runLaunchctlWithTimeout(
+      ["bootout", "system/ai.sanctuaryprotocol.agent-harness"],
+      neverReturningLaunchctl,
+    );
+
+    expect(observed).toEqual({
+      file: "/bin/launchctl",
+      args: ["bootout", "system/ai.sanctuaryprotocol.agent-harness"],
+      options: { timeout: LAUNCHCTL_TIMEOUT_MS, killSignal: LAUNCHCTL_KILL_SIGNAL },
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("ETIMEDOUT");
   });
 });
 

@@ -380,6 +380,37 @@ describe("egress-gate/harness-daemon", () => {
       expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
     });
 
+    it("rejects a harness whose running pid changes between stability samples", async () => {
+      let prints = 0;
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            prints += 1;
+            if (prints === 1) {
+              return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+            }
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = ${4241 + prints}\n}\n`,
+              stderr: "",
+            });
+          }
+          if (args[0] === "bootstrap") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "bootout") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+
+      await expect(
+        installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
+      ).rejects.toThrow(/did not report a stable running pid/);
+      expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
+    });
+
     it("uninstall boots out then removes the plist (idempotent when not loaded)", async () => {
       const ops = mockOps({
         runLaunchctl: (args) => {

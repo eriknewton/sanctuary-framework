@@ -49,6 +49,7 @@ import {
   type ProvisionFlowOutcome,
   type RehomeStepResult,
   type EndpointProbeTarget,
+  type PolicyDaemonAction,
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
@@ -67,8 +68,8 @@ const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
 
 /** Budget for polling the policy-daemon socket to become reachable after install-boot (Bug B). */
 const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
-const LAUNCHCTL_TIMEOUT_MS = 15_000;
-const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
+export const LAUNCHCTL_TIMEOUT_MS = 15_000;
+export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
 /**
  * Bug B (consistency): resolve the fortress path whose Castle Wall the
@@ -788,6 +789,32 @@ export function policyDaemonInstallBootArgs(
   return args;
 }
 
+export interface AutoProvisionPolicyDaemonSignals {
+  socketReachable: boolean;
+  diskForThisFortress: boolean;
+  readyForThisFortress: boolean;
+  plistPresent: boolean;
+  loadedState: { loaded: boolean; fortressPath: string | null };
+  fortressPath: string;
+}
+
+export function resolvePolicyDaemonActionForAutoProvision(
+  signals: AutoProvisionPolicyDaemonSignals,
+): PolicyDaemonAction {
+  const loadedForThisFortress =
+    signals.loadedState.loaded && signals.loadedState.fortressPath === pathResolve(signals.fortressPath);
+  const forThisFortress =
+    signals.diskForThisFortress && (!signals.loadedState.loaded || loadedForThisFortress);
+  const forAnyFortress = signals.plistPresent || signals.loadedState.loaded;
+  return resolvePolicyDaemonAction({
+    socketReachable: signals.socketReachable,
+    bootServiceForThisFortress: forThisFortress,
+    bootServiceReadyForThisFortress: signals.readyForThisFortress,
+    bootServiceLoadedForThisFortress: signals.diskForThisFortress && loadedForThisFortress,
+    bootServiceForAnyFortress: forAnyFortress,
+  });
+}
+
 /**
  * Entry point called from `runWrap`. Gated by the caller to Hermes +
  * darwin; this function itself is defensive and no-ops (returns
@@ -1059,17 +1086,13 @@ export async function runAutoProvisionForWrap(
         bootServicePlistPresent(CASTLE_WALL_BOOT_PLIST_PATH),
       ]);
       const loadedState = bootServiceLoadState();
-      const loadedForThisFortress =
-        loadedState.loaded && loadedState.fortressPath === pathResolve(fortressPath);
-      const forThisFortress =
-        diskForThisFortress && (!loadedState.loaded || loadedForThisFortress);
-      const forAnyFortress = plistPresent || loadedState.loaded;
-      const action = resolvePolicyDaemonAction({
+      const action = resolvePolicyDaemonActionForAutoProvision({
         socketReachable,
-        bootServiceForThisFortress: forThisFortress,
-        bootServiceReadyForThisFortress: readyForThisFortress,
-        bootServiceLoadedForThisFortress: diskForThisFortress && loadedForThisFortress,
-        bootServiceForAnyFortress: forAnyFortress,
+        diskForThisFortress,
+        readyForThisFortress,
+        plistPresent,
+        loadedState,
+        fortressPath,
       });
       if (action === "noop") {
         return { ok: true as const, freshlyInstalled: false };
@@ -1772,6 +1795,30 @@ function realUidExistenceOps() {
   };
 }
 
+type BoundedLaunchctlExecFile = (
+  file: string,
+  args: string[],
+  options: { timeout: number; killSignal: NodeJS.Signals },
+) => Promise<{ stdout: string; stderr: string }>;
+
+export async function runLaunchctlWithTimeout(
+  args: readonly string[],
+  execFileFn: BoundedLaunchctlExecFile = execFileAsync as BoundedLaunchctlExecFile,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileFn("/bin/launchctl", [...args], {
+      timeout: LAUNCHCTL_TIMEOUT_MS,
+      killSignal: LAUNCHCTL_KILL_SIGNAL,
+    });
+    return { code: 0, stdout, stderr };
+  } catch (err) {
+    const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
+    const code = typeof e.code === "number" ? e.code : 1;
+    const errorText = typeof e.code === "string" ? `${e.code}: ${e.message ?? String(err)}` : String(err);
+    return { code, stdout: e.stdout ?? "", stderr: [e.stderr ?? "", errorText].filter(Boolean).join("\n") };
+  }
+}
+
 function realHarnessDaemonOps(): HarnessDaemonOps {
   return {
     writeFile: async (path, content, mode) => {
@@ -1785,18 +1832,7 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
       });
     },
     runLaunchctl: async (args) => {
-      try {
-        const { stdout, stderr } = await execFileAsync("/bin/launchctl", [...args], {
-          timeout: LAUNCHCTL_TIMEOUT_MS,
-          killSignal: LAUNCHCTL_KILL_SIGNAL,
-        });
-        return { code: 0, stdout, stderr };
-      } catch (err) {
-        const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
-        const code = typeof e.code === "number" ? e.code : 1;
-        const errorText = typeof e.code === "string" ? `${e.code}: ${e.message ?? String(err)}` : String(err);
-        return { code, stdout: e.stdout ?? "", stderr: e.stderr ?? errorText };
-      }
+      return runLaunchctlWithTimeout(args);
     },
     sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   };

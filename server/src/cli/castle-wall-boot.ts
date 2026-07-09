@@ -85,8 +85,8 @@ import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.
 
 export const CASTLE_WALL_BOOT_LABEL = "ai.sanctuaryprotocol.castle-wall.daemon";
 export const CASTLE_WALL_BOOT_PLIST_PATH = `/Library/LaunchDaemons/${CASTLE_WALL_BOOT_LABEL}.plist`;
-const LAUNCHCTL_TIMEOUT_MS = 15_000;
-const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
+export const LAUNCHCTL_TIMEOUT_MS = 15_000;
+export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH =
   "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
 const SAFE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
