@@ -186,6 +186,47 @@ describe("egress-gate/harness-daemon", () => {
       ]);
     });
 
+    it("waits for launchd to report the first pid after accepting bootstrap", async () => {
+      let prints = 0;
+      const calls: string[][] = [];
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          calls.push([...args]);
+          if (args[0] === "print") {
+            prints += 1;
+            if (prints === 1) {
+              return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+            }
+            if (prints <= 3) {
+              return Promise.resolve({
+                code: 0,
+                stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tstate = not running\n}\n`,
+                stderr: "",
+              });
+            }
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n\tstate = running\n}\n`,
+              stderr: "",
+            });
+          }
+          if (args[0] === "bootstrap") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "bootout") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+
+      await installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops);
+
+      expect(ops.removals).toEqual([]);
+      expect(calls.filter((args) => args[0] === "print")).toHaveLength(6);
+      expect(calls.some((args) => args[0] === "bootout")).toBe(false);
+    });
+
     it("removes the just-written plist when a fresh-install bootstrap fails (no half-installed unit)", async () => {
       const ops = mockOps({
         runLaunchctl: (args) => {

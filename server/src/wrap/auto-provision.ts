@@ -71,6 +71,11 @@ const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
 export const LAUNCHCTL_TIMEOUT_MS = 15_000;
 export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
+/** Dedicated harness daemon logs must be writable by the agent uid, not the operator-only fortress. */
+export function resolveHarnessDaemonLogDir(newAccountHome: string): string {
+  return `${newAccountHome.replace(/\/+$/, "")}/logs`;
+}
+
 /**
  * Bug B (consistency): resolve the fortress path whose Castle Wall the
  * auto-provision flow ensures a policy daemon for AND arms. This flow ONLY runs
@@ -762,6 +767,8 @@ export interface RunAutoProvisionForWrapOptions {
   cliBinary?: string;
   /** Print function for operator-facing output (defaults to console.error, matching the rest of wrap/cli.ts's stderr convention). */
   print?: (line: string) => void;
+  /** Stop the wrap-started transient Castle Wall daemon before installing the persistent boot service. */
+  stopTransientCastleWallDaemon?: () => Promise<void>;
   /** Override for `process.getuid` (tests only; production leaves this undefined). */
   getuid?: () => number;
   /** Override for the resolved operator identity (tests only; production leaves this undefined and resolves via SUDO_UID/GID/USER). */
@@ -967,6 +974,10 @@ export async function runAutoProvisionForWrap(
       await mkdir(NEW_ACCOUNT_HOME_BASE, { recursive: true, mode: 0o711 });
       await chmod(NEW_ACCOUNT_HOME_BASE, 0o711);
       const rehomeOps = realRehomeOps();
+      const staleRuntimeConflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, newAccountHome);
+      if (staleRuntimeConflictPath !== undefined) {
+        print(`Moved stale Hermes runtime destination aside at ${staleRuntimeConflictPath}.`);
+      }
       const plan = planRehome(hermesRehomeAdapter, { operatorHome, newAccountHome });
       const results = await executeRehomePlan(plan, rehomeOps, { uid, gid });
       // FIX (round 5, item N1): chown the agent's WHOLE home tree (the home
@@ -1018,11 +1029,17 @@ export async function runAutoProvisionForWrap(
         before = { known: false, installed: false };
       }
       try {
-        const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists });
+        const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists }, { agentHome: newAccountHome });
+        const harnessLogDir = resolveHarnessDaemonLogDir(newAccountHome);
+        await mkdir(harnessLogDir, { recursive: true, mode: 0o700 });
+        await chmod(harnessLogDir, 0o700);
+        await fsChown(harnessLogDir, uid, uid);
         const plan = planAgentHarnessDaemonInstall({
           agentAccount: accountName,
           programArguments: resolved.programArguments,
           fortressPath: process.env.SANCTUARY_STORAGE_PATH,
+          logDir: harnessLogDir,
+          environment: resolved.environment,
         });
         await installAgentHarnessDaemon(plan, daemonOps);
         return { ok: true as const, bootstrappedThisRun: before.known && !before.installed };
@@ -1115,6 +1132,17 @@ export async function runAutoProvisionForWrap(
       // when NO wall existed before this run, so an abort tears down exactly
       // what this run created and never a pre-existing wall.
       const freshlyInstalled = action === "install-fresh";
+      try {
+        await options.stopTransientCastleWallDaemon?.();
+      } catch (err) {
+        return {
+          ok: false as const,
+          freshlyInstalled: false,
+          error:
+            `could not stop the transient Castle Wall daemon before installing the persistent boot service: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
       const code = await runInstallBoot(
         policyDaemonInstallBootArgs(fortressPath, options.cliBinary),
         { env: process.env },
@@ -1288,6 +1316,38 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Paths for the non-secret Hermes runtime tree that may be left behind by an aborted dedicated-account run. */
+export function hermesRuntimeRehomePaths(
+  operatorHome: string,
+  newAccountHome: string,
+): { sourcePath: string; destPath: string } {
+  const operatorBase = operatorHome.replace(/\/+$/, "");
+  const accountBase = newAccountHome.replace(/\/+$/, "");
+  return {
+    sourcePath: `${operatorBase}/.hermes/hermes-agent`,
+    destPath: `${accountBase}/.hermes/hermes-agent`,
+  };
+}
+
+/**
+ * Retry cleanup for the Hermes runtime code tree only. If a previous aborted
+ * run left a duplicate non-secret runtime at the dedicated-account
+ * destination while the operator source is also present, move the stale
+ * destination aside before `rename(source, dest)`.
+ */
+export async function moveAsideStaleHermesRuntimeDestination(
+  operatorHome: string,
+  newAccountHome: string,
+): Promise<string | undefined> {
+  const { sourcePath, destPath } = hermesRuntimeRehomePaths(operatorHome, newAccountHome);
+  if (!(await pathExists(sourcePath)) || !(await pathExistsNoFollow(destPath))) {
+    return undefined;
+  }
+  const conflictPath = await findUniqueConflictPath(destPath);
+  await rename(destPath, conflictPath);
+  return conflictPath;
 }
 
 /**

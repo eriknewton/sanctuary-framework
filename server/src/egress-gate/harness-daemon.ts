@@ -32,6 +32,7 @@ export const AGENT_HARNESS_DAEMON_LABEL = "ai.sanctuaryprotocol.agent-harness";
 export const AGENT_HARNESS_DAEMON_PLIST_PATH = `/Library/LaunchDaemons/${AGENT_HARNESS_DAEMON_LABEL}.plist`;
 
 const HARNESS_DAEMON_STABILITY_SAMPLES = 3;
+const HARNESS_DAEMON_STARTUP_ATTEMPTS = 30;
 const HARNESS_DAEMON_STABILITY_INTERVAL_MS = 500;
 
 type LaunchctlResult = { code: number; stdout: string; stderr: string };
@@ -340,19 +341,25 @@ export async function agentHarnessDaemonStatus(ops: HarnessDaemonOps): Promise<H
 async function agentHarnessDaemonStableRunning(ops: HarnessDaemonOps): Promise<boolean> {
   const sleep = ops.sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let expectedPid: number | undefined;
-  for (let i = 0; i < HARNESS_DAEMON_STABILITY_SAMPLES; i++) {
+  let stableSamples = 0;
+  for (let i = 0; i < HARNESS_DAEMON_STARTUP_ATTEMPTS; i++) {
     if (i > 0) await sleep(HARNESS_DAEMON_STABILITY_INTERVAL_MS);
     const status = await agentHarnessDaemonStatus(ops);
-    if (!status.known || !status.running || status.pid === undefined) {
+    if (!status.known) {
       return false;
     }
-    if (expectedPid === undefined) {
-      expectedPid = status.pid;
-    } else if (status.pid !== expectedPid) {
+    if (!status.running || status.pid === undefined) {
+      if (expectedPid !== undefined) return false;
+      continue;
+    }
+    if (expectedPid !== undefined && status.pid !== expectedPid) {
       return false;
     }
+    expectedPid = status.pid;
+    stableSamples += 1;
+    if (stableSamples >= HARNESS_DAEMON_STABILITY_SAMPLES) return true;
   }
-  return expectedPid !== undefined;
+  return false;
 }
 
 function launchctlPrintWasNotLoaded(result: LaunchctlResult): boolean {

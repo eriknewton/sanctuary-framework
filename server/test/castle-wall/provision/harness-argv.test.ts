@@ -1,8 +1,7 @@
 /**
  * Tests for Hermes gateway argv resolution (D1: the headless
  * `ai.hermes.gateway` egress-making process, never a GUI .app): resolves to
- * the first existing absolute python3 candidate, fail-closed (throws) when
- * none exist.
+ * the re-homed Hermes runtime tree, fail-closed (throws) when it is absent.
  */
 
 import { describe, it, expect } from "vitest";
@@ -14,32 +13,49 @@ function mockOps(existing: Set<string>): HarnessArgvOps {
 }
 
 describe("castle-wall/provision/harness-argv", () => {
-  it("resolves to the first existing candidate interpreter with the hermes_cli gateway args", async () => {
-    const ops = mockOps(new Set(["/opt/homebrew/bin/python3"]));
-    const resolved = await resolveHermesGatewayArgv(ops);
+  const agentHome = "/var/sanctuary-agents/sanctuary-hermes";
+  const hermesAgentDir = `${agentHome}/.hermes/hermes-agent`;
+  const systemPython = "/opt/homebrew/bin/python3";
+  const mainModule = `${hermesAgentDir}/hermes_cli/main.py`;
+  const sitePackages = `${hermesAgentDir}/venv/lib/python3.11/site-packages`;
+
+  it("resolves the re-homed Hermes runtime with the hermes_cli gateway args and launchd env", async () => {
+    const ops = mockOps(new Set([systemPython, mainModule, sitePackages]));
+    const resolved = await resolveHermesGatewayArgv(ops, { agentHome });
     expect(resolved.harnessId).toBe("hermes");
     expect(resolved.programArguments).toEqual([
-      "/opt/homebrew/bin/python3",
+      systemPython,
       "-m",
       "hermes_cli.main",
       "gateway",
+      "run",
+      "--accept-hooks",
     ]);
-  });
-
-  it("prefers /usr/local/bin/python3 over later candidates when multiple exist", async () => {
-    const ops = mockOps(new Set(["/usr/local/bin/python3", "/usr/bin/python3"]));
-    const resolved = await resolveHermesGatewayArgv(ops);
-    expect(resolved.programArguments[0]).toBe("/usr/local/bin/python3");
+    expect(resolved.environment).toEqual({
+      HERMES_ACCEPT_HOOKS: "1",
+      HOME: agentHome,
+      PYTHONPATH: `${hermesAgentDir}:${sitePackages}`,
+    });
   });
 
   it("every resolved program path is absolute (never a relative/guessed path)", async () => {
-    const ops = mockOps(new Set(["/usr/bin/python3"]));
-    const resolved = await resolveHermesGatewayArgv(ops);
+    const ops = mockOps(new Set([systemPython, mainModule, sitePackages]));
+    const resolved = await resolveHermesGatewayArgv(ops, { agentHome });
     expect(resolved.programArguments[0]?.startsWith("/")).toBe(true);
   });
 
-  it("fail-closed: throws when no candidate interpreter exists (never installs with a guessed path)", async () => {
-    const ops = mockOps(new Set());
-    await expect(resolveHermesGatewayArgv(ops)).rejects.toThrow(/Could not resolve/);
+  it("fail-closed: throws when the re-homed runtime is absent (never guesses a global python)", async () => {
+    const ops = mockOps(new Set(["/opt/homebrew/bin/python3"]));
+    await expect(resolveHermesGatewayArgv(ops, { agentHome })).rejects.toThrow(/re-homed Hermes runtime/);
+  });
+
+  it("fail-closed: throws when system Python exists but hermes_cli is absent", async () => {
+    const ops = mockOps(new Set([systemPython, sitePackages]));
+    await expect(resolveHermesGatewayArgv(ops, { agentHome })).rejects.toThrow(/re-homed Hermes runtime/);
+  });
+
+  it("fail-closed: throws when the runtime exists but site-packages are absent", async () => {
+    const ops = mockOps(new Set([systemPython, mainModule]));
+    await expect(resolveHermesGatewayArgv(ops, { agentHome })).rejects.toThrow(/site-packages/);
   });
 });

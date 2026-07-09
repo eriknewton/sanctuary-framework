@@ -196,6 +196,31 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     );
   });
 
+  it("passes a transient Castle Wall daemon stop hook into auto-provision before install-boot", async () => {
+    await installHermesFixture();
+    setTty(true);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    await runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap }));
+    expect(runAutoProvisionForWrap).toHaveBeenCalledWith(
+      expect.objectContaining({ stopTransientCastleWallDaemon: expect.any(Function) }),
+    );
+  });
+
+  it("threads an armed auto-provision outcome into the final no-dashboard Castle Wall banner", async () => {
+    await installHermesFixture();
+    setTty(true);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({
+      ran: true,
+      outcome: { kind: "armed", uid: 503 },
+    }));
+    await runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap }));
+
+    const stderr = stderrSpy.mock.calls.flat().join("\n");
+    expect(stderr).toContain("Dedicated agent account provisioned and Castle Wall armed (uid 503)");
+    expect(stderr).not.toContain("Castle Wall NOT ARMED");
+    expect(stderr).toContain("Castle Wall daemon started (enforcement not confirmed)");
+  });
+
   it("prefers --dev-dist as the auto-provision CLI binary for dogfood installs", async () => {
     await installHermesFixture();
     setTty(true);

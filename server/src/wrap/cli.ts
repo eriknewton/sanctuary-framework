@@ -1073,6 +1073,7 @@ async function maybeRunAutoProvisionForWrap(
   agentConfig: { platform: AgentPlatform },
   options: WrapOptions,
   deps: RunWrapDeps,
+  stopTransientCastleWallDaemon?: () => Promise<void>,
 ): Promise<AutoProvisionSummary> {
   if (agentConfig.platform !== "hermes" || options.dryRun) {
     return { ran: false };
@@ -1083,6 +1084,7 @@ async function maybeRunAutoProvisionForWrap(
       isTty: process.stdin.isTTY === true,
       preAnsweredProvision: options.provisionAgentAccount,
       cliBinary: resolveAutoProvisionCliBinary(options),
+      stopTransientCastleWallDaemon,
       // SAFETY: stderr is the operator-facing CLI channel for this
       // subcommand; this prints the plan-and-print + progress lines from
       // the auto-provision flow (account plan, re-home summary, arm
@@ -1865,6 +1867,11 @@ export async function runWrap(
     });
     registerCastleWallCleanup();
   };
+  const stopTransientCastleWallDaemonForAutoProvision = async () => {
+    const daemon = castleWallDaemon;
+    castleWallDaemon = undefined;
+    await daemon?.stop();
+  };
 
   // v1.2.1 (Finding GGG): plaintext passphrase backup file is now opt-in.
   // Default: Keychain-only on macOS. The plaintext file is written ONLY when
@@ -2585,7 +2592,14 @@ export async function runWrap(
     // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
     // decline / non-TTY skip / mid-flow abort here never reverts anything
     // already done above (fix H4 -- the cooperative wrap always completes).
-    renderAutoProvisionOutcome(await maybeRunAutoProvisionForWrap(agentConfig, options, deps));
+    const autoProvisionSummary = await maybeRunAutoProvisionForWrap(
+      agentConfig,
+      options,
+      deps,
+      stopTransientCastleWallDaemonForAutoProvision,
+    );
+    renderAutoProvisionOutcome(autoProvisionSummary);
+    const castleWallArmedByAutoProvision = autoProvisionSummary.outcome?.kind === "armed";
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
     printWrapSuccessNoDashboard({
       toolName,
@@ -2600,7 +2614,7 @@ export async function runWrap(
       // ran warnCastleWallDaemonNotStarted and left it undefined. Daemon
       // start alone never renders "protected"; that needs the F4 evidence
       // signal below.
-      castleWallArmed: castleWallDaemon !== undefined,
+      castleWallArmed: castleWallDaemon !== undefined || castleWallArmedByAutoProvision,
       castleWallEnforcementObserved: ndEnforcementObserved,
       // 2026-07-02 hardening: the dead-pin warning must survive to the
       // terminal-final success surface, not only the mid-flow warning.
@@ -2878,7 +2892,14 @@ export async function runWrap(
   // Auto-provision Step 2 (Build 1): see the matching call + comment in the
   // --no-dashboard branch above. Runs after the cooperative wrap (config +
   // identity + dashboard) has fully completed; never reverts it.
-  renderAutoProvisionOutcome(await maybeRunAutoProvisionForWrap(agentConfig, options, deps));
+  const autoProvisionSummary = await maybeRunAutoProvisionForWrap(
+    agentConfig,
+    options,
+    deps,
+    stopTransientCastleWallDaemonForAutoProvision,
+  );
+  renderAutoProvisionOutcome(autoProvisionSummary);
+  const castleWallArmedByAutoProvision = autoProvisionSummary.outcome?.kind === "armed";
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
@@ -2950,7 +2971,7 @@ export async function runWrap(
     // Honest arm outcome: defined only when startCastleWallForWrap succeeded.
     // Daemon start alone never renders "protected"; that needs the F4
     // evidence signal below.
-    castleWallArmed: castleWallDaemon !== undefined,
+    castleWallArmed: castleWallDaemon !== undefined || castleWallArmedByAutoProvision,
     castleWallEnforcementObserved: enforcementObserved,
     // 2026-07-02 hardening: the dead-pin warning must survive to the
     // terminal-final success surface, not only the mid-flow warning.

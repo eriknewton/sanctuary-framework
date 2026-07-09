@@ -49,6 +49,9 @@ import {
   hermesEndpointProbes,
   allHermesCredentialDestPaths,
   resolveWallFortressPath,
+  resolveHarnessDaemonLogDir,
+  hermesRuntimeRehomePaths,
+  moveAsideStaleHermesRuntimeDestination,
   policyDaemonInstallBootArgs,
   resolvePolicyDaemonActionForAutoProvision,
   runLaunchctlWithTimeout,
@@ -703,6 +706,48 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
   });
 });
 
+describe("wrap/auto-provision real-ops chokepoint: stale Hermes runtime retry cleanup", () => {
+  it("moves a stale non-secret Hermes runtime destination aside when the operator source also exists", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-stale-hermes-runtime-"));
+    try {
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const { sourcePath, destPath } = hermesRuntimeRehomePaths(operatorHome, accountHome);
+      await mkdir(sourcePath, { recursive: true });
+      await mkdir(destPath, { recursive: true });
+      await writeFile(join(sourcePath, "source.txt"), "operator-runtime");
+      await writeFile(join(destPath, "stale.txt"), "stale-runtime");
+
+      const conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome);
+
+      expect(conflictPath).toBe(`${destPath}.restored-conflict`);
+      await expect(access(destPath)).rejects.toThrow();
+      expect(await readFile(join(sourcePath, "source.txt"), "utf8")).toBe("operator-runtime");
+      expect(await readFile(join(conflictPath!, "stale.txt"), "utf8")).toBe("stale-runtime");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does nothing when the operator Hermes runtime source is absent", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-stale-hermes-runtime-"));
+    try {
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const { destPath } = hermesRuntimeRehomePaths(operatorHome, accountHome);
+      await mkdir(destPath, { recursive: true });
+      await writeFile(join(destPath, "stale.txt"), "stale-runtime");
+
+      const conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome);
+
+      expect(conflictPath).toBeUndefined();
+      expect(await readFile(join(destPath, "stale.txt"), "utf8")).toBe("stale-runtime");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("wrap/auto-provision real-ops chokepoint: disarmExitCodeDecision (fix G1)", () => {
   it("code 0 -> undefined (success, no throw)", () => {
     expect(disarmExitCodeDecision(0)).toBeUndefined();
@@ -746,6 +791,20 @@ describe("wrap/auto-provision real-ops chokepoint: resolveWallFortressPath (Bug 
 
   it("strips a trailing slash on the operator home before appending .sanctuary", () => {
     expect(resolveWallFortressPath({}, "/Users/erik/")).toBe("/Users/erik/.sanctuary");
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: resolveHarnessDaemonLogDir", () => {
+  it("anchors harness daemon logs under the dedicated account home, not the operator fortress", () => {
+    expect(resolveHarnessDaemonLogDir("/var/sanctuary-agents/sanctuary-hermes")).toBe(
+      "/var/sanctuary-agents/sanctuary-hermes/logs",
+    );
+  });
+
+  it("strips a trailing slash before appending logs", () => {
+    expect(resolveHarnessDaemonLogDir("/var/sanctuary-agents/sanctuary-hermes/")).toBe(
+      "/var/sanctuary-agents/sanctuary-hermes/logs",
+    );
   });
 });
 
