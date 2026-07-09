@@ -42,6 +42,14 @@ export interface PolicyDaemonState {
    */
   bootServiceReadyForThisFortress: boolean;
   /**
+   * Whether launchd reports the singleton boot service loaded for THIS fortress.
+   * This is weaker than `bootServiceReadyForThisFortress`: it does not prove a
+   * stable pid across the sample window, but paired with a reachable socket and
+   * a matching installed plist it is enough to avoid destructively booting out
+   * an already-serving same-fortress wall.
+   */
+  bootServiceLoadedForThisFortress: boolean;
+  /**
    * Whether ANY well-formed singleton boot service is installed (for this
    * fortress OR a different one). `bootServiceForThisFortress` implies this.
    */
@@ -52,8 +60,8 @@ export interface PolicyDaemonState {
  * The one action the flow must take to ensure a reachable policy daemon for the
  * target fortress before arming.
  *   - "noop": the socket already answers AND a matching persistent boot
- *     service is installed and certified live for this fortress; nothing to
- *     do, nothing to tear down.
+ *     service is installed and launchd reports it loaded for this fortress
+ *     (or certifies it stable); nothing to do, nothing to tear down.
  *   - "install-fresh": NO boot service exists for ANY fortress -> stand up the
  *     singleton boot service for THIS fortress. This also covers the Bug D
  *     transient-daemon state: a daemon answers NOW, but no persistent boot
@@ -79,11 +87,15 @@ export type PolicyDaemonAction =
  * Map the observed policy-daemon state to the single action the flow must take.
  * Pure: no I/O. Fail-closed ordering -- a matching persistent boot service is
  * mandatory even when the socket answers NOW. A transient/manual daemon without
- * a matching, ready boot service cannot satisfy the arm guard, so it must drive
+ * a matching, loaded boot service cannot satisfy the arm guard, so it must drive
  * install-boot before arming.
  */
 export function resolvePolicyDaemonAction(state: PolicyDaemonState): PolicyDaemonAction {
-  if (state.socketReachable && state.bootServiceReadyForThisFortress) {
+  if (
+    state.socketReachable &&
+    state.bootServiceForThisFortress &&
+    (state.bootServiceReadyForThisFortress || state.bootServiceLoadedForThisFortress)
+  ) {
     return "noop";
   }
   if (!state.bootServiceForAnyFortress) {

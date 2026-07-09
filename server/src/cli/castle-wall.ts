@@ -344,16 +344,24 @@ async function writeSignerHelperReadinessDiagnosis(
   },
 ): Promise<void> {
   try {
-    const { assessSignerHelperReadiness, buildHelperPublicKeyQuery } = await import(
-      "./castle-wall-signer-helper.js"
-    );
+    const {
+      assessSignerHelperReadiness,
+      buildHelperPublicKeyQuery,
+      SIGNER_HELPER_LAUNCHCTL_KILL_SIGNAL,
+      SIGNER_HELPER_LAUNCHCTL_TIMEOUT_MS,
+    } = await import("./castle-wall-signer-helper.js");
     const readiness = await assessSignerHelperReadiness({
       execFileFn: (cmd, cmdArgs) => {
-        const result = nodeSpawnSync(cmd, cmdArgs, { encoding: "utf8" });
+        const result = nodeSpawnSync(cmd, cmdArgs, {
+          encoding: "utf8",
+          timeout: SIGNER_HELPER_LAUNCHCTL_TIMEOUT_MS,
+          killSignal: SIGNER_HELPER_LAUNCHCTL_KILL_SIGNAL,
+        });
+        const errorText = result.error ? `${result.error.name}: ${result.error.message}` : "";
         return {
           code: result.status ?? 1,
           stdout: result.stdout ?? "",
-          stderr: result.stderr ?? "",
+          stderr: [result.stderr ?? "", errorText].filter(Boolean).join("\n"),
         };
       },
       queryHelperPublicKey: buildHelperPublicKeyQuery(opts.signerClientPath, opts.signerClientInvoke),

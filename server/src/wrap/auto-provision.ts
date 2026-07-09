@@ -67,6 +67,8 @@ const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
 
 /** Budget for polling the policy-daemon socket to become reachable after install-boot (Bug B). */
 const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
+const LAUNCHCTL_TIMEOUT_MS = 15_000;
+const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
 /**
  * Bug B (consistency): resolve the fortress path whose Castle Wall the
@@ -980,13 +982,13 @@ export async function runAutoProvisionForWrap(
       // teardown decision keys on "did this attempt stand the daemon up" for
       // both success and failure. Capture the pre-install status FIRST.
       const daemonOps = realHarnessDaemonOps();
-      let before: { installed: boolean };
+      let before: { known: boolean; installed: boolean };
       try {
         before = await agentHarnessDaemonStatus(daemonOps);
       } catch {
-        // Status probe itself failed: assume no pre-existing daemon (fail
-        // toward tearing down anything this attempt leaves live).
-        before = { installed: false };
+        // Status probe itself failed: preserve any possible pre-existing daemon.
+        // A fresh install cannot be proven when launchd state is unknown.
+        before = { known: false, installed: false };
       }
       try {
         const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists });
@@ -996,9 +998,13 @@ export async function runAutoProvisionForWrap(
           fortressPath: process.env.SANCTUARY_STORAGE_PATH,
         });
         await installAgentHarnessDaemon(plan, daemonOps);
-        return { ok: true as const, bootstrappedThisRun: !before.installed };
+        return { ok: true as const, bootstrappedThisRun: before.known && !before.installed };
       } catch (err) {
-        return { ok: false as const, error: (err as Error).message, daemonPreexisted: before.installed };
+        return {
+          ok: false as const,
+          error: (err as Error).message,
+          daemonPreexisted: before.installed || !before.known,
+        };
       }
     },
     // FIX (round 5, item N3): tear the harness daemon back down on a
@@ -1037,12 +1043,15 @@ export async function runAutoProvisionForWrap(
       //    is necessary but not sufficient; the no-op case requires BOTH a
       //    reachable socket and a matching boot service for this fortress.
       //    `bootServiceInstalled(plist, fortress)` confirms a well-formed unit
-      //    targets THIS fortress; `bootServiceReady` additionally confirms the
-      //    singleton launchd service is stably live. A matching-but-stopped or
-      //    nonfunctional plist must restart, not no-op. The occupancy check
-      //    treats either a singleton plist path OR a loaded singleton launchd
-      //    label as "some wall exists." If that state is unverifiable, treat it
-      //    as a conflict rather than silently overwriting unknown wall state.
+      //    targets THIS fortress; `bootServiceLoadState` confirms the singleton
+      //    launchd label is loaded for THIS fortress; `bootServiceReady`
+      //    additionally confirms a stable pid. A matching-but-stopped plist must
+      //    restart, not no-op. A matching loaded service whose socket already
+      //    answers must NOT be destructively booted out just because the stable
+      //    sample window missed. The occupancy check treats either a singleton
+      //    plist path OR a loaded singleton launchd label as "some wall exists."
+      //    If that state is unverifiable, treat it as a conflict rather than
+      //    silently overwriting unknown wall state.
       const socketReachable = await defaultDaemonProbe(socketPath);
       const [diskForThisFortress, readyForThisFortress, plistPresent] = await Promise.all([
         bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH, fortressPath),
@@ -1059,6 +1068,7 @@ export async function runAutoProvisionForWrap(
         socketReachable,
         bootServiceForThisFortress: forThisFortress,
         bootServiceReadyForThisFortress: readyForThisFortress,
+        bootServiceLoadedForThisFortress: diskForThisFortress && loadedForThisFortress,
         bootServiceForAnyFortress: forAnyFortress,
       });
       if (action === "noop") {
@@ -1776,13 +1786,19 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
     },
     runLaunchctl: async (args) => {
       try {
-        const { stdout, stderr } = await execFileAsync("/bin/launchctl", [...args]);
+        const { stdout, stderr } = await execFileAsync("/bin/launchctl", [...args], {
+          timeout: LAUNCHCTL_TIMEOUT_MS,
+          killSignal: LAUNCHCTL_KILL_SIGNAL,
+        });
         return { code: 0, stdout, stderr };
       } catch (err) {
-        const e = err as { code?: number; stdout?: string; stderr?: string };
-        return { code: e.code ?? 1, stdout: e.stdout ?? "", stderr: e.stderr ?? String(err) };
+        const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
+        const code = typeof e.code === "number" ? e.code : 1;
+        const errorText = typeof e.code === "string" ? `${e.code}: ${e.message ?? String(err)}` : String(err);
+        return { code, stdout: e.stdout ?? "", stderr: e.stderr ?? errorText };
       }
     },
+    sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   };
 }
 

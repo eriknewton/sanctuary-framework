@@ -44,6 +44,8 @@ import { HelperSignerClient, type ShimInvoker } from "../castle-wall/runtime/hel
 
 /** Launchd label of the root signer helper (mirrors Swift `SignerConstants.signerHelperIdentifier`). */
 export const CASTLE_SIGNER_HELPER_LABEL = "ai.sanctuaryprotocol.macos.castle-wall.signer-helper";
+export const SIGNER_HELPER_LAUNCHCTL_TIMEOUT_MS = 15_000;
+export const SIGNER_HELPER_LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 
 /** Root-owned custody directory holding the trust-anchor pin + the helper's private key. */
 export const CASTLE_SIGNER_HELPER_CUSTODY_DIR = "/Library/Application Support/Sanctuary";
@@ -347,11 +349,16 @@ function write(stream: Writable, text: string): void {
 }
 
 function defaultExecFile(cmd: string, args: string[]): ExecResult {
-  const result = spawnSync(cmd, args, { encoding: "utf8" });
+  const result = spawnSync(cmd, args, {
+    encoding: "utf8",
+    timeout: SIGNER_HELPER_LAUNCHCTL_TIMEOUT_MS,
+    killSignal: SIGNER_HELPER_LAUNCHCTL_KILL_SIGNAL,
+  });
+  const errorText = result.error ? `${result.error.name}: ${result.error.message}` : "";
   return {
     code: result.status ?? 1,
     stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
+    stderr: [result.stderr ?? "", errorText].filter(Boolean).join("\n"),
   };
 }
 

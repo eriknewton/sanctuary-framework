@@ -19,6 +19,7 @@ function state(overrides: Partial<PolicyDaemonState> = {}): PolicyDaemonState {
     socketReachable: false,
     bootServiceForThisFortress: false,
     bootServiceReadyForThisFortress: false,
+    bootServiceLoadedForThisFortress: false,
     bootServiceForAnyFortress: false,
     ...overrides,
   };
@@ -29,26 +30,42 @@ describe("castle-wall/provision/policy-daemon: resolvePolicyDaemonAction", () =>
     expect(resolvePolicyDaemonAction(state({ socketReachable: true }))).toBe("install-fresh");
   });
 
-  it("noop only when the socket answers AND a matching boot service is ready", () => {
+  it("noop when the socket answers AND a matching boot service is ready", () => {
     expect(
       resolvePolicyDaemonAction(
         state({
           socketReachable: true,
           bootServiceForThisFortress: true,
           bootServiceReadyForThisFortress: true,
+          bootServiceLoadedForThisFortress: true,
           bootServiceForAnyFortress: true,
         }),
       ),
     ).toBe("noop");
   });
 
-  it("restart-existing when the socket answers but the matching boot service is not ready (Bug D)", () => {
+  it("noop when the socket answers and a matching boot service is loaded, even if the stable-pid sample missed (Bug E)", () => {
     expect(
       resolvePolicyDaemonAction(
         state({
           socketReachable: true,
           bootServiceForThisFortress: true,
           bootServiceReadyForThisFortress: false,
+          bootServiceLoadedForThisFortress: true,
+          bootServiceForAnyFortress: true,
+        }),
+      ),
+    ).toBe("noop");
+  });
+
+  it("restart-existing when the socket answers but the matching boot service is not loaded (Bug D)", () => {
+    expect(
+      resolvePolicyDaemonAction(
+        state({
+          socketReachable: true,
+          bootServiceForThisFortress: true,
+          bootServiceReadyForThisFortress: false,
+          bootServiceLoadedForThisFortress: false,
           bootServiceForAnyFortress: true,
         }),
       ),
