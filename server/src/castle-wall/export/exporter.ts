@@ -29,7 +29,11 @@ import {
   ENFORCEMENT_EXPORT_ENABLED,
   ENFORCEMENT_EXPORT_REFUSED,
 } from "./audit-ops.js";
-import type { EnforcementExportConfig } from "./config.js";
+import {
+  EnforcementExportConfigError,
+  validatePinnedUrl,
+  type EnforcementExportConfig,
+} from "./config.js";
 import {
   FileExportSink,
   HttpCollectorSink,
@@ -123,6 +127,18 @@ export class EnforcementExporter {
       // config; the guard keeps the invariant explicit and fails closed if a
       // caller constructs a config object by hand.
       return this.refuseEnable("no pinned destination_url");
+    }
+    // Re-assert the FULL transport invariant at the arming boundary, not just
+    // presence: https-only (or loopback) + no embedded userinfo credential. This
+    // fails closed even for a hand-built config that bypassed validateExportConfig,
+    // and it runs BEFORE the pinned URL reaches the approval context / audit
+    // detail, so a credentialed URL can never be logged (must-never #6).
+    try {
+      validatePinnedUrl(config.destination_url);
+    } catch (err) {
+      const reason =
+        err instanceof EnforcementExportConfigError ? err.message : "invalid destination_url";
+      return this.refuseEnable(reason);
     }
 
     // Tier-1 gate. The approval context shows the human EXACTLY where events

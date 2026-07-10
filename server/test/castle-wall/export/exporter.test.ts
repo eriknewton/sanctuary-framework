@@ -23,6 +23,7 @@ import {
   mapAuditEntryToEnforcementEvent,
   mapEntriesToEnforcementEvents,
   validateExportConfig,
+  validatePinnedUrl,
   type EnforcementExportConfig,
   type ExportApprover,
 } from "../../../src/castle-wall/export/index.js";
@@ -302,6 +303,20 @@ describe("validateExportConfig", () => {
       validateExportConfig({ sink: "file", destination_url: "https://collector.example/x" }),
     ).toThrow(/only valid with sink/);
   });
+
+  it("rejects a userinfo-credentialed URL (MED-1: no secret can hide in the pinned URL)", () => {
+    // Direct validator AND through the config load path both reject it.
+    expect(() => validatePinnedUrl("https://ingest-key:SECRET@collector.example/x")).toThrow(
+      /must not embed credentials/,
+    );
+    expect(() =>
+      validateExportConfig({
+        sink: "http",
+        enabled: true,
+        destination_url: "https://ingest-key:SECRET@collector.example/x",
+      }),
+    ).toThrow(/must not embed credentials/);
+  });
 });
 
 // ── Default sink: no network ──────────────────────────────────────────────────
@@ -362,6 +377,49 @@ describe("HTTP push refuses without opt-in + pinned destination + Tier-1 approva
     expect(outcome.status).toBe("refused");
     expect(audits).toContain(ENFORCEMENT_EXPORT_REFUSED);
     expect(exporter.touchesNetwork()).toBeNull();
+  });
+
+  it("enable() re-validates and refuses a hand-built plaintext-http config (MED-2)", async () => {
+    // Bypasses validateExportConfig by constructing the config object directly.
+    const approve = vi.fn(async () => ({ allowed: true as const }));
+    const fetchSpy = vi.fn();
+    const exporter = new EnforcementExporter({
+      config: { sink: "http", enabled: true, destination_url: "http://attacker.example/x" },
+      approve,
+      audit: noopAudit,
+      fetchImpl: fetchSpy as unknown as typeof fetch,
+    });
+    const outcome = await exporter.enable();
+    expect(outcome.status).toBe("refused");
+    if (outcome.status === "refused") expect(outcome.reason).toMatch(/https/);
+    // Refused BEFORE the Tier-1 gate and BEFORE any push: arms nothing.
+    expect(approve).not.toHaveBeenCalled();
+    expect(exporter.touchesNetwork()).toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("enable() refuses a hand-built userinfo-credentialed config and never logs the secret (MED-1/MED-2)", async () => {
+    const approve = vi.fn(async () => ({ allowed: true as const }));
+    const auditDetails: Record<string, unknown>[] = [];
+    const exporter = new EnforcementExporter({
+      config: {
+        sink: "http",
+        enabled: true,
+        destination_url: "https://ingest-key:SECRET@collector.example/x",
+      },
+      approve,
+      audit: async (_op, details) => {
+        auditDetails.push(details);
+      },
+    });
+    const outcome = await exporter.enable();
+    expect(outcome.status).toBe("refused");
+    // The credential is refused BEFORE reaching the approval context or any audit
+    // detail: the secret must appear in NO logged surface.
+    expect(approve).not.toHaveBeenCalled();
+    const loggedContext = JSON.stringify(auditDetails);
+    expect(loggedContext).not.toContain("SECRET");
+    expect(loggedContext).not.toContain("ingest-key");
   });
 
   it("refuses when the Tier-1 approval is denied (arms nothing)", async () => {

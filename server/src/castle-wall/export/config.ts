@@ -61,8 +61,20 @@ export function defaultExportConfig(): EnforcementExportConfig {
   return { sink: DEFAULT_EXPORT_SINK, enabled: false };
 }
 
-/** True iff `url` is a well-formed http(s) URL whose non-loopback form is https. */
-function validatePinnedUrl(url: string): void {
+/**
+ * Assert `url` is a well-formed http(s) collector URL: https (or loopback http),
+ * and carrying NO embedded userinfo credential. Throws on any violation.
+ *
+ * Exported so the exporter's arming boundary (`enable()`) can re-assert the same
+ * transport invariant regardless of how the config object was constructed
+ * (defense in depth), not only the load-time `validateExportConfig` path.
+ *
+ * The no-userinfo rule closes a secret-exposure surface (AGENTS.md must-never
+ * #6): a `https://key:SECRET@host` URL would otherwise be logged verbatim into
+ * the Tier-1 approval context and the `enforcement_export_enabled` audit detail.
+ * Collector auth must be handled out of band, never embedded in the pinned URL.
+ */
+export function validatePinnedUrl(url: string): void {
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -71,6 +83,14 @@ function validatePinnedUrl(url: string): void {
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
     throw new EnforcementExportConfigError("destination_url must be http or https");
+  }
+  // Reject an embedded credential BEFORE it can reach any log line or approval
+  // context. Fail closed: the pinned URL is metadata that is logged, so it must
+  // carry no secret.
+  if (parsed.username !== "" || parsed.password !== "") {
+    throw new EnforcementExportConfigError(
+      "destination_url must not embed credentials (userinfo); handle collector auth out of band",
+    );
   }
   const host = parsed.hostname;
   const isLoopback = host === "127.0.0.1" || host === "::1" || host === "localhost";

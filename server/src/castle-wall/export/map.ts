@@ -23,6 +23,7 @@ import {
   DISTRESS_DETAIL_MAX_CHARS,
   DISTRESS_REASONS,
   DISTRESS_SEVERITIES,
+  SANCTUARY_DISTRESS_OPERATION,
   type DistressReason,
   type DistressSeverity,
 } from "../../distress/tools.js";
@@ -49,8 +50,8 @@ const POLICY_CHANGE_OPERATIONS: ReadonlyMap<string, PolicyChangeType> = new Map(
   ["operator_decision", "operator_decision"],
 ]);
 
-/** Stored operation tag for a distress emission. */
-const DISTRESS_OPERATION = "sanctuary_distress";
+/** Stored operation tag for a distress emission (the shared source constant, so a rename cannot drift). */
+const DISTRESS_OPERATION = SANCTUARY_DISTRESS_OPERATION;
 
 /**
  * The agent-redaction sentinel. If an upstream (mis)use handed us an
