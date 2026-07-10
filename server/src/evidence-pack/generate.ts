@@ -17,6 +17,7 @@ import type { AuditEntry } from "../operational/audit-log.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { renderMarkdownDocumentsToPdf } from "../compliance/eu_ai_act/pdf.js";
 import type {
+  DiscreteExportsStatus,
   EvidencePack,
   EvidencePackFile,
   EvidencePackInput,
@@ -36,6 +37,12 @@ export const REPORT_FILENAME = "01_evidence_pack.md";
 export const MANIFEST_FILENAME = "00_pack_manifest.json";
 /** Basename of the rendered PDF. */
 export const PDF_FILENAME = "evidence-pack.pdf";
+/** Basename of the gathered transparency-checkpoint bundle (slice 2). */
+export const TRANSPARENCY_BUNDLE_FILENAME = "transparency-bundle.json";
+/** Basename of the gathered audit-chain JSONL export (slice 2). */
+export const AUDIT_CHAIN_FILENAME = "audit-chain.jsonl";
+/** Basename of the gathered public-anchor evidence (slice 2). */
+export const ANCHOR_EVIDENCE_FILENAME = "anchor-evidence.json";
 
 /** Already-resolved inputs the generator needs (see module doc-comment). */
 export interface BuildEvidencePackDeps {
@@ -66,6 +73,36 @@ export function buildEvidencePack(
     lastEntryAt: aggregation.last_entry_at,
   });
 
+  // Resolve which discrete verification exports are present, so the appendix
+  // references concrete files and states honestly why any is absent.
+  const ex = input.discrete_exports ?? {};
+  const discreteStatus: DiscreteExportsStatus = {
+    transparency: ex.transparency_bundle_json
+      ? { included: true, filename: TRANSPARENCY_BUNDLE_FILENAME }
+      : {
+          included: false,
+          reason:
+            ex.transparency_absent_reason ??
+            "no signed transparency checkpoints were available to export from this fortress.",
+        },
+    audit_chain: ex.audit_chain_jsonl
+      ? { included: true, filename: AUDIT_CHAIN_FILENAME }
+      : {
+          included: false,
+          reason:
+            ex.audit_chain_absent_reason ??
+            "the audit-chain export could not be produced.",
+        },
+    anchor: ex.anchor_evidence_json
+      ? { included: true, filename: ANCHOR_EVIDENCE_FILENAME }
+      : {
+          included: false,
+          reason:
+            ex.anchor_absent_reason ??
+            "public transparency anchoring is opt-in and is not enabled on this install.",
+        },
+  };
+
   const sections = renderSections({
     input,
     window,
@@ -74,6 +111,7 @@ export function buildEvidencePack(
     productName: PRODUCT_NAME,
     aggregation,
     shortfall,
+    discreteExports: discreteStatus,
   });
 
   // The signed Markdown report concatenates every section with a horizontal
@@ -91,6 +129,35 @@ export function buildEvidencePack(
     ds
   );
   const files: EvidencePackFile[] = [reportFile];
+
+  // Sign each gathered discrete export into the manifest so the whole output
+  // directory is tamper-evident under one manifest. The transparency bundle
+  // ALSO carries its own Castle Wall signatures, verifiable independently.
+  if (ex.transparency_bundle_json) {
+    files.push(
+      signFile(
+        TRANSPARENCY_BUNDLE_FILENAME,
+        ex.transparency_bundle_json,
+        "application/json",
+        ds
+      )
+    );
+  }
+  if (ex.audit_chain_jsonl) {
+    files.push(
+      signFile(AUDIT_CHAIN_FILENAME, ex.audit_chain_jsonl, "application/jsonl", ds)
+    );
+  }
+  if (ex.anchor_evidence_json) {
+    files.push(
+      signFile(
+        ANCHOR_EVIDENCE_FILENAME,
+        ex.anchor_evidence_json,
+        "application/json",
+        ds
+      )
+    );
+  }
 
   const manifest = buildPackManifest({
     productName: PRODUCT_NAME,

@@ -17,13 +17,32 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { Writable } from "node:stream";
 import { createSanctuaryServer } from "../index.js";
+import type { SanctuaryConfig } from "../config.js";
+import type { StoredIdentity } from "../core/identity.js";
 import type { AuditEntry } from "../operational/audit-log.js";
+import type { StorageBackend } from "../storage/interface.js";
+import { FilesystemStorage } from "../storage/filesystem.js";
+import { StateStore } from "../cognitive/state-store.js";
+import { derivePurposeKey } from "../core/key-derivation.js";
+import { ObserveStore } from "../castle-wall/observe/index.js";
+import { readPersistedLocalAgents } from "../hub/agent-registry-persistence.js";
+import { SovereigntyProfileStore } from "../sovereignty-profile.js";
+import { readPersistedCheckpoints } from "../transparency/emitter.js";
+import {
+  TRANSPARENCY_BUNDLE_FORMAT,
+  type TransparencyBundle,
+} from "../transparency/checkpoint.js";
+import { exportAuditChain } from "../cli/audit-chain-export.js";
 import type {
   CustodyFacts,
+  EvidencePackDiscreteExports,
   EvidencePackInput,
+  InventorySnapshot,
   RetentionFacts,
 } from "./types.js";
+import { buildInventorySnapshot, type ProxyServerView } from "./inventory.js";
 import {
   buildEvidencePack,
   MANIFEST_FILENAME,
@@ -32,6 +51,124 @@ import {
   REPORT_FILENAME,
 } from "./generate.js";
 import { currentQuarter, parseQuarterLabel, quarterLabel } from "./quarter.js";
+
+/**
+ * Enumerate the AI-tool inventory from the fortress's persisted state,
+ * READ-ONLY and with NO live upstream connections or network: wrapped-harness
+ * records from the plaintext hub registry file, configured MCP tool servers
+ * from the sovereignty profile, and observed egress destinations from the
+ * encrypted observe store. Each source is best-effort: a read failure yields an
+ * empty source, and the section renderer then prints its honest coverage-basis
+ * note and placeholder. Never establishes a live connection during pack
+ * generation.
+ */
+async function gatherInventory(
+  config: SanctuaryConfig,
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  signer: StoredIdentity
+): Promise<InventorySnapshot> {
+  const agentRecords = (() => {
+    try {
+      return readPersistedLocalAgents(config.storage_path);
+    } catch {
+      return [];
+    }
+  })();
+
+  const proxyServers: ProxyServerView[] = await (async () => {
+    try {
+      const profileStore = new SovereigntyProfileStore(storage, masterKey);
+      await profileStore.load();
+      return (profileStore.get().upstream_servers ?? []).map((u) => ({
+        name: u.name,
+        transport: u.transport.type,
+        enabled: u.enabled,
+      }));
+    } catch {
+      return [];
+    }
+  })();
+
+  const observedDestinations = await (async () => {
+    try {
+      const stateStore = new StateStore(storage, masterKey);
+      const observeStore = new ObserveStore(stateStore, {
+        identityId: signer.identity_id,
+        encryptedPrivateKey: signer.encrypted_private_key,
+        identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
+      });
+      return [...(await observeStore.listCandidates()).values()];
+    } catch {
+      return [];
+    }
+  })();
+
+  return buildInventorySnapshot({
+    agentRecords,
+    proxyServers,
+    observedDestinations,
+  });
+}
+
+/**
+ * Gather the discrete third-party verification exports from persisted state,
+ * offline: the signed transparency-checkpoint bundle (assembled from the
+ * shipped `readPersistedCheckpoints`; requires a single signing key across the
+ * checkpoints), and the audit-chain JSONL export (from the shipped
+ * `exportAuditChain`). Public-anchor evidence is opt-in / default-off and is
+ * reported absent unless a later slice wires it. Each absent export carries an
+ * honest reason string. Never contacts the network.
+ */
+async function gatherDiscreteExports(
+  storage: StorageBackend,
+  generatedAt: string
+): Promise<EvidencePackDiscreteExports> {
+  const out: EvidencePackDiscreteExports = {};
+
+  try {
+    const checkpoints = await readPersistedCheckpoints(storage);
+    if (checkpoints.length === 0) {
+      out.transparency_absent_reason =
+        "no signed transparency checkpoints have been emitted on this fortress yet.";
+    } else {
+      const keys = new Set(checkpoints.map((c) => c.public_key));
+      if (keys.size !== 1) {
+        out.transparency_absent_reason =
+          "the checkpoints carry more than one signing key; a single-key bundle could not be assembled. Investigate the key history before publishing.";
+      } else {
+        const bundle: TransparencyBundle = {
+          format: TRANSPARENCY_BUNDLE_FORMAT,
+          exported_at: generatedAt,
+          public_key: [...keys][0]!,
+          checkpoints,
+        };
+        out.transparency_bundle_json = JSON.stringify(bundle, null, 2);
+      }
+    }
+  } catch (e) {
+    out.transparency_absent_reason = `the transparency bundle could not be gathered: ${(e as Error).message}`;
+  }
+
+  try {
+    const chunks: Buffer[] = [];
+    const sink = new Writable({
+      write(chunk, _enc, cb) {
+        chunks.push(Buffer.from(chunk));
+        cb();
+      },
+    });
+    await exportAuditChain(storage, sink);
+    out.audit_chain_jsonl = Buffer.concat(chunks).toString("utf8");
+  } catch (e) {
+    out.audit_chain_absent_reason = `the audit-chain export could not be gathered: ${(e as Error).message}`;
+  }
+
+  out.anchor_absent_reason =
+    "public transparency anchoring (Sigstore/Rekor) is opt-in and is not enabled on this install.";
+
+  return out;
+}
 
 interface EvidencePackCliOptions {
   subcommand: "generate" | "help";
@@ -151,9 +288,10 @@ export async function runEvidencePack(args: string[]): Promise<void> {
 
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error("[sanctuary evidence-pack] Starting Sanctuary server instance...");
-  const { identityManager, masterKey, auditLog } = await createSanctuaryServer({
-    passphrase: opts.passphrase ?? process.env.SANCTUARY_PASSPHRASE,
-  });
+  const { config, identityManager, masterKey, auditLog } =
+    await createSanctuaryServer({
+      passphrase: opts.passphrase ?? process.env.SANCTUARY_PASSPHRASE,
+    });
 
   const signer = identityManager.getDefault();
   if (!signer) {
@@ -162,6 +300,12 @@ export async function runEvidencePack(args: string[]): Promise<void> {
         "identity_set_primary before generating an evidence pack."
     );
   }
+
+  // Read-only storage handle onto the same fortress state dir, for the
+  // inventory + discrete-export enumeration (no live connections, no network).
+  const storage: StorageBackend = new FilesystemStorage(
+    `${config.storage_path}/state`
+  );
 
   // Pull the full retained audit history (oldest first). The aggregation layer
   // filters to the quarter window; the earliest retained entry drives the
@@ -184,10 +328,19 @@ export async function runEvidencePack(args: string[]): Promise<void> {
     no_outbound_by_default: true,
   };
 
+  // Slice 2: enumerate the real AI-tool inventory and gather the discrete
+  // third-party verification exports, both READ-ONLY from persisted state.
+  const generatedAt = new Date().toISOString();
+  const inventory = await gatherInventory(config, storage, masterKey, signer);
+  const discreteExports = await gatherDiscreteExports(storage, generatedAt);
+
   const input: EvidencePackInput = {
     firm_name: opts.firmName,
     quarter,
+    generated_at_override: generatedAt,
     custody,
+    inventory,
+    discrete_exports: discreteExports,
   };
 
   const pack = buildEvidencePack(input, {
