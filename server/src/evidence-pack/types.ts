@@ -17,6 +17,8 @@
  * carrier questionnaire, or outside-counsel guideline.
  */
 
+import type { ReadOutcome } from "./read-outcome.js";
+
 /**
  * A calendar quarter, e.g. `{ year: 2026, quarter: 3 }` for 2026-Q3 (July,
  * August, September). Quarter is 1..4.
@@ -66,6 +68,15 @@ export interface QuarterWindow {
  * emits a `gate_escalate:` op (escalations resolve to approve/deny), so a row
  * for it would advertise a capability that does not exist.
  *
+ * UNMAPPED-OP GUARD (honesty chokepoint): a `gate_`-shaped control-point
+ * decision operation that is NOT explicitly mapped must surface as
+ * `uncategorized`, NEVER silently fall into `other` or a flattering allow/deny
+ * bucket. This closes the slice-1 root cause (the live `gate_approve:` op was
+ * unmapped and vanished into `other`): a future daemon that emits a new
+ * `gate_*` decision op is surfaced as "uncategorized (N)" for investigation
+ * rather than miscounted. `other` remains for genuine non-decision operations
+ * (identity ops, state writes, heartbeats).
+ *
  * HONESTY BOUND (spec risk #11): these counts reflect enforcement decisions
  * at the control point, not a supervising attorney's per-matter review. The
  * PDF wording says so and leans on the policy/attestation layer (a later
@@ -79,6 +90,7 @@ export type DecisionCategory =
   | "denied"
   | "injection_blocked"
   | "unclassified"
+  | "uncategorized"
   | "other";
 
 /**
@@ -215,40 +227,20 @@ export interface InventoryObservedDestinationRow {
 }
 
 /**
- * The read outcome for ONE inventory source, threaded from the CLI's gather
- * step through to the renderer (slice-2 MED-2 fix). This is the SAME
- * "distinguish could-not-read from genuinely-empty" discipline the discrete
- * exports already use: a `read_ok: false` source must NEVER render as an
- * affirmative "none configured / recorded" census claim to an underwriter.
- */
-export interface InventorySection<T> {
-  /**
-   * True when the underlying store was read successfully. `rows` may still be
-   * empty, which then means a GENUINE "none" (a safe census statement). False
-   * means the store could not be read at all, so the section is INCOMPLETE and
-   * the report says so with `reason` rather than asserting absence.
-   */
-  read_ok: boolean;
-  /** The enumerated rows (empty when the store is genuinely empty OR unread). */
-  rows: T[];
-  /** When `read_ok` is false, a lay-reader reason the store could not be read. */
-  reason?: string;
-}
-
-/**
- * The inventory snapshot fed into the pack. Each source carries its own read
- * outcome so the renderer can print honest language PER SOURCE: a table when
- * rows exist, a genuine "none configured/recorded" only when the store was
- * read successfully and was empty, and an explicit "could not be read; this
- * section is incomplete" (with the reason) on a read failure. Never present the
- * inventory as exhaustive (spec risk #1): browser ChatGPT, Copilot inside
+ * The inventory snapshot fed into the pack. Each source is a {@link ReadOutcome}
+ * over its row list, so the renderer prints honest language PER SOURCE through
+ * the typed chokepoint: a table when the read is `populated`, a genuine "none
+ * configured/recorded" ONLY when the read is `empty_verified` (a definitive
+ * negative gated on a Complete witness), and an explicit "could not be read;
+ * this section is incomplete" (with the reason) on `read_failed`. Never present
+ * the inventory as exhaustive (spec risk #1): browser ChatGPT, Copilot inside
  * Office, and phones are invisible to Sanctuary's inventory even on a clean
  * read.
  */
 export interface InventorySnapshot {
-  agents: InventorySection<InventoryAgentRow>;
-  mcp_servers: InventorySection<InventoryMcpServerRow>;
-  observed_destinations: InventorySection<InventoryObservedDestinationRow>;
+  agents: ReadOutcome<InventoryAgentRow[]>;
+  mcp_servers: ReadOutcome<InventoryMcpServerRow[]>;
+  observed_destinations: ReadOutcome<InventoryObservedDestinationRow[]>;
 }
 
 /**
@@ -280,28 +272,17 @@ export type EvidencePackContentType =
  * withheld.
  */
 export interface EvidencePackDiscreteExports {
-  /** The `SANCTUARY_TRANSPARENCY_BUNDLE_V1` JSON, when checkpoints exist. */
-  transparency_bundle_json?: string;
-  /** Why the transparency bundle is absent (e.g. no checkpoints emitted yet). */
-  transparency_absent_reason?: string;
+  /**
+   * The `SANCTUARY_TRANSPARENCY_BUNDLE_V1` JSON as a {@link ReadOutcome}:
+   * `populated` when checkpoints exist and a single-key bundle was assembled,
+   * `empty_verified` when the fortress genuinely has no checkpoints yet, and
+   * `read_failed` when the checkpoints could not be gathered.
+   */
+  transparency: ReadOutcome<string>;
   /** The audit-chain JSONL export (entry + checkpoint/anchor records). */
-  audit_chain_jsonl?: string;
-  /** Why the audit-chain export is absent, when it could not be produced. */
-  audit_chain_absent_reason?: string;
-  /** The public-anchor (Rekor) evidence JSON, when anchoring is enabled. */
-  anchor_evidence_json?: string;
-  /** Why the anchor evidence is absent (default: anchoring is opt-in / off). */
-  anchor_absent_reason?: string;
-}
-
-/**
- * Which discrete exports were actually included, threaded into the verification
- * appendix so it lists concrete files + honest "not included because" notes.
- */
-export interface DiscreteExportsStatus {
-  transparency: { included: boolean; reason?: string; filename?: string };
-  audit_chain: { included: boolean; reason?: string; filename?: string };
-  anchor: { included: boolean; reason?: string; filename?: string };
+  audit_chain: ReadOutcome<string>;
+  /** The public-anchor (Rekor) evidence JSON (opt-in; typically empty_verified). */
+  anchor: ReadOutcome<string>;
 }
 
 /** Input to {@link buildEvidencePack}. */
@@ -314,8 +295,12 @@ export interface EvidencePackInput {
   generated_at_override?: string;
   /** Optional inventory snapshot (see {@link InventorySnapshot}). */
   inventory?: InventorySnapshot;
-  /** Per-install custody facts for the data-boundary statement. */
-  custody?: CustodyFacts;
+  /**
+   * Per-install custody facts for the data-boundary statement, as a
+   * {@link ReadOutcome} so a future custody-detection read failure renders
+   * incomplete-with-reason rather than a definitive claim.
+   */
+  custody?: ReadOutcome<CustodyFacts>;
   /**
    * Optional discrete third-party verification exports gathered alongside the
    * pack (slice 2). When present, each export is signed into the manifest and
@@ -356,16 +341,25 @@ export interface EvidencePackManifest {
     sha256: string;
     signature: string;
   }>;
-  /** The covered-window shortfall disclosure, machine-readable. */
-  coverage: {
-    covered_from: string;
-    /** Exclusive upper bound of demonstrable coverage = min(quarter end, generation instant). */
-    covered_to_exclusive: string;
-    shortfall: boolean;
-    /** True when the quarter had not ended at generation time (partial quarter). */
-    in_progress_quarter: boolean;
-    retention_at_cap: boolean;
-  };
+  /**
+   * The covered-window shortfall disclosure, machine-readable. It is a UNION
+   * so a read failure can never serialize a false "shortfall: false" into the
+   * SIGNED manifest: when the audit log could not be read, `determinable` is
+   * `false` and only a reason is present. A reader/verifier that sees
+   * `determinable: false` knows coverage could not be computed.
+   */
+  coverage:
+    | {
+        determinable: true;
+        covered_from: string;
+        /** Exclusive upper bound of demonstrable coverage = min(quarter end, generation instant). */
+        covered_to_exclusive: string;
+        shortfall: boolean;
+        /** True when the quarter had not ended at generation time (partial quarter). */
+        in_progress_quarter: boolean;
+        retention_at_cap: boolean;
+      }
+    | { determinable: false; reason: string };
   manifest_signature: string;
   disclaimer: string;
 }
@@ -377,8 +371,14 @@ export interface EvidencePack {
   files: EvidencePackFile[];
   /** The rendered PDF bytes. NOT cryptographically signed; verify the manifest. */
   pdf: Uint8Array;
-  /** The quarter aggregation (returned for programmatic callers / tests). */
-  aggregation: QuarterAggregation;
-  /** The shortfall report (returned for programmatic callers / tests). */
-  shortfall: ShortfallReport;
+  /**
+   * The quarter aggregation as a {@link ReadOutcome} (for programmatic callers
+   * / tests). `read_failed` when the audit log could not be read.
+   */
+  aggregation: ReadOutcome<QuarterAggregation>;
+  /**
+   * The shortfall report as a {@link ReadOutcome}. `read_failed` when the audit
+   * log could not be read, so the covered-window bound is indeterminable.
+   */
+  shortfall: ReadOutcome<ShortfallReport>;
 }

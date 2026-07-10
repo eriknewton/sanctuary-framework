@@ -112,8 +112,12 @@ describe("aggregateQuarter", () => {
     expect(categorizeEntry(entry(at, "gate_allow_proxy:t"))).toBe("allowed_proxy");
     expect(categorizeEntry(entry(at, "gate_injection_block:t"))).toBe("injection_blocked");
     expect(categorizeEntry(entry(at, "gate_unclassified:t"))).toBe("unclassified");
-    // No escalated category exists (no gate_escalate producer); a stray op is "other".
-    expect(categorizeEntry(entry(at, "gate_escalate:t"))).toBe("other");
+    // UNMAPPED-OP GUARD: an unknown gate-shaped op is surfaced as
+    // "uncategorized", never hidden in "other" or a flattering bucket.
+    expect(categorizeEntry(entry(at, "gate_escalate:t"))).toBe("uncategorized");
+    expect(categorizeEntry(entry(at, "gate_frobnicate:t"))).toBe("uncategorized");
+    // A genuine non-gate operation is "other".
+    expect(categorizeEntry(entry(at, "state_write:t"))).toBe("other");
   });
 
   it("HIGH-1: gate_approve is counted as human_approved in the aggregation, not other", () => {

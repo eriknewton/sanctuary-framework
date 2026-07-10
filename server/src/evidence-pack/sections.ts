@@ -23,14 +23,21 @@
 
 import type {
   CustodyFacts,
-  DiscreteExportsStatus,
   EvidencePackInput,
+  InventoryAgentRow,
+  InventoryMcpServerRow,
+  InventoryObservedDestinationRow,
   InventorySnapshot,
   QuarterAggregation,
   ShortfallReport,
 } from "./types.js";
 import type { QuarterWindow } from "./types.js";
 import { emptyInventorySnapshot } from "./inventory.js";
+import {
+  claimFromCompleteRead,
+  foldOutcome,
+  type ReadOutcome,
+} from "./read-outcome.js";
 
 /** One rendered section: a title (PDF page heading) plus its Markdown body. */
 export interface PackSection {
@@ -71,8 +78,15 @@ function renderCover(
   generatedAt: string,
   signerDid: string,
   productName: string,
-  shortfall: ShortfallReport
+  shortfall: ReadOutcome<ShortfallReport>
 ): PackSection {
+  // The covered-through line and any partial-quarter banner are DEFINITIVE
+  // coverage claims, so they may only be drawn from a completed audit read.
+  const coveredThrough = foldOutcome(shortfall, {
+    populated: (s) => `${s.covered_to_exclusive} (exclusive)`,
+    emptyVerified: () => "could not be determined",
+    readFailed: () => "could not be determined (the audit log could not be read)",
+  });
   const body = [
     `# ${productName}`,
     "",
@@ -82,21 +96,33 @@ function renderCover(
     "",
     `**Generated:** ${generatedAt}`,
     "",
-    `**Coverage attested through:** ${shortfall.covered_to_exclusive} (exclusive)`,
+    `**Coverage attested through:** ${coveredThrough}`,
     "",
     `**Signer identity:** ${signerDid}`,
     "",
   ];
-  if (shortfall.in_progress_quarter) {
-    body.push(
-      "> PARTIAL QUARTER: this report was generated before " +
-        window.label +
-        " ended. It covers only the portion of the quarter through the " +
-        "generation time above, NOT the full quarter. Regenerate after the " +
-        "quarter closes for a complete report.",
-      ""
-    );
-  }
+  const banner = foldOutcome(shortfall, {
+    populated: (s) =>
+      s.in_progress_quarter
+        ? [
+            "> PARTIAL QUARTER: this report was generated before " +
+              window.label +
+              " ended. It covers only the portion of the quarter through the " +
+              "generation time above, NOT the full quarter. Regenerate after " +
+              "the quarter closes for a complete report.",
+            "",
+          ]
+        : [],
+    emptyVerified: () => [],
+    readFailed: (reason) => [
+      "> COVERAGE UNAVAILABLE: the audit log could not be read, so the covered " +
+        "window could not be computed for this quarter. This report makes NO " +
+        "coverage claim. Reason: " +
+        reason,
+      "",
+    ],
+  });
+  body.push(...banner);
   body.push(
     "This document answers, one for one, the five questions a legal " +
       "malpractice carrier now asks about AI use, and gives a third party " +
@@ -112,25 +138,27 @@ function renderCover(
 
 // ── Section 2: executive summary ─────────────────────────────────────
 
+function outcomeRowCount<T>(outcome: ReadOutcome<T[]>): number {
+  return outcome.status === "populated" ? outcome.value.length : 0;
+}
+
+function anyInventoryReadFailed(inv: InventorySnapshot): boolean {
+  return (
+    inv.agents.status === "read_failed" ||
+    inv.mcp_servers.status === "read_failed" ||
+    inv.observed_destinations.status === "read_failed"
+  );
+}
+
 function renderExecutiveSummary(
-  agg: QuarterAggregation,
-  shortfall: ShortfallReport,
+  aggregation: ReadOutcome<QuarterAggregation>,
+  shortfall: ReadOutcome<ShortfallReport>,
   inv: InventorySnapshot
 ): PackSection {
   const machines = "1 (this Sanctuary install)";
-  const c = agg.by_category;
-  const toolCount = inv.agents.rows.length + inv.mcp_servers.rows.length;
-  const anyReadFailed =
-    !inv.agents.read_ok ||
-    !inv.mcp_servers.read_ok ||
-    !inv.observed_destinations.read_ok;
-  const humanApproved = c.human_approved;
-  const humanDenied = c.human_denied;
-  const humanReviewed = humanApproved + humanDenied;
-  const autoAllowed = c.allowed + c.allowed_proxy;
-  const blendedDenied = c.denied;
-  const autoBlocked = c.injection_blocked;
-  const readNote = anyReadFailed
+  const toolCount =
+    outcomeRowCount(inv.agents) + outcomeRowCount(inv.mcp_servers);
+  const readNote = anyInventoryReadFailed(inv)
     ? " One or more inventory sources could not be read this period, so this " +
       "count is incomplete; see the inventory section."
     : "";
@@ -146,6 +174,41 @@ function renderExecutiveSummary(
         "see; see the inventory section for coverage limits)." +
         readNote;
 
+  // The decision-count bullets are DEFINITIVE claims (e.g. "0 denied"), so they
+  // may only be drawn from a completed audit read. A read failure prints an
+  // honest "could not be computed" bullet instead of a flattering zero.
+  const decisionBullets = foldOutcome(aggregation, {
+    populated: (agg) => {
+      const c = agg.by_category;
+      const bullets = [
+        `- **Actions reviewed by a human at the control point:** ${c.human_approved + c.human_denied} ` +
+          `(${c.human_approved} approved, ${c.human_denied} denied through the inbox).`,
+        `- **Automated decisions:** ${c.allowed + c.allowed_proxy} allowed, ${c.injection_blocked} blocked as ` +
+          "prompt injection.",
+        `- **Denied (automated policy or human control point):** ${c.denied} ` +
+          "(these share one audit operation and cannot be split here; see section 6).",
+        `- **Total recorded control-point decisions in the quarter:** ${agg.total_in_window}.`,
+      ];
+      if (c.uncategorized > 0) {
+        bullets.push(
+          `- **Uncategorized control-point operations:** ${c.uncategorized} ` +
+            "(recorded gate operations this report version does not classify; " +
+            "surfaced, not folded into a decision total - see section 6)."
+        );
+      }
+      return bullets;
+    },
+    emptyVerified: () => [
+      "- **Control-point decision counts:** could not be computed for this quarter.",
+    ],
+    readFailed: (reason) => [
+      "- **Control-point decision counts:** could NOT be computed for this " +
+        "quarter because the audit log could not be read, so no approval, " +
+        "denial, or total counts are asserted. Reason: " +
+        reason,
+    ],
+  });
+
   const lines = [
     "# Executive summary",
     "",
@@ -153,20 +216,22 @@ function renderExecutiveSummary(
     "",
     `- **Machines covered:** ${machines}.`,
     `- ${toolLine}`,
-    `- **Actions reviewed by a human at the control point:** ${humanReviewed} ` +
-      `(${humanApproved} approved, ${humanDenied} denied through the inbox).`,
-    `- **Automated decisions:** ${autoAllowed} allowed, ${autoBlocked} blocked as ` +
-      "prompt injection.",
-    `- **Denied (automated policy or human control point):** ${blendedDenied} ` +
-      "(these share one audit operation and cannot be split here; see section 6).",
-    `- **Total recorded control-point decisions in the quarter:** ${agg.total_in_window}.`,
+    ...decisionBullets,
     "- **Unresolved incidents:** none surfaced by this preview " +
       "(the incident-response section is a labeled placeholder in this build).",
     "",
   ];
-  if (shortfall.shortfall) {
-    lines.push("> COVERAGE NOTICE: " + shortfall.explanation, "");
-  }
+  const coverageNotice = foldOutcome(shortfall, {
+    populated: (s) => (s.shortfall ? ["> COVERAGE NOTICE: " + s.explanation, ""] : []),
+    emptyVerified: () => [],
+    readFailed: (reason) => [
+      "> COVERAGE NOTICE: the covered window could not be computed (the audit " +
+        "log could not be read): " +
+        reason,
+      "",
+    ],
+  });
+  lines.push(...coverageNotice);
   lines.push(
     "These counts reflect enforcement decisions at Sanctuary's control " +
       "point. They show that a human was in the loop for gated actions; they " +
@@ -197,25 +262,23 @@ function renderInventory(inv: InventorySnapshot): PackSection {
     "",
   ];
 
-  // Wrapped AI harnesses.
+  // Wrapped AI harnesses. The definitive "none recorded" line is emitted ONLY
+  // from a Complete witness (empty_verified); a read failure prints the honest
+  // incomplete note. This is the typed chokepoint - see read-outcome.ts.
   lines.push("## Wrapped AI harnesses");
   lines.push("");
-  if (!inv.agents.read_ok) {
-    lines.push(incompleteNote("wrapped-harness", inv.agents.reason));
-  } else if (inv.agents.rows.length === 0) {
-    lines.push(
-      "No wrapped AI harnesses are recorded in the hub agent registry on this fortress."
-    );
-  } else {
-    lines.push("| Agent | Harness | Model | Wrapped | Status |");
-    lines.push("|---|---|---|---|---|");
-    for (const a of inv.agents.rows) {
-      const model = [a.model_vendor, a.model_id].filter(Boolean).join(" / ") || "-";
-      lines.push(
-        `| ${a.agent_id} | ${a.harness} | ${model} | ${a.wrapped_at ?? "-"} | ${a.status ?? "-"} |`
-      );
-    }
-  }
+  lines.push(
+    ...foldOutcome(inv.agents, {
+      populated: (rows) => agentTable(rows),
+      emptyVerified: (witness) => [
+        claimFromCompleteRead(
+          witness,
+          "No wrapped AI harnesses are recorded in the hub agent registry on this fortress."
+        ),
+      ],
+      readFailed: (reason) => [incompleteNote("wrapped-harness", reason)],
+    })
+  );
   lines.push("");
 
   // Configured MCP tool servers.
@@ -227,42 +290,37 @@ function renderInventory(inv: InventorySnapshot): PackSection {
       "live connection to probe them during generation."
   );
   lines.push("");
-  if (!inv.mcp_servers.read_ok) {
-    lines.push(incompleteNote("MCP tool server", inv.mcp_servers.reason));
-  } else if (inv.mcp_servers.rows.length === 0) {
-    lines.push("No MCP tool servers are configured on this fortress.");
-  } else {
-    lines.push("| Server | Transport | Enabled | State | Tools |");
-    lines.push("|---|---|---|---|---|");
-    for (const s of inv.mcp_servers.rows) {
-      const enabled = s.enabled === undefined ? "-" : s.enabled ? "yes" : "no";
-      lines.push(
-        `| ${s.name} | ${s.transport ?? "-"} | ${enabled} | ${s.connection_state ?? "-"} | ${s.tool_count ?? "-"} |`
-      );
-    }
-  }
+  lines.push(
+    ...foldOutcome(inv.mcp_servers, {
+      populated: (rows) => mcpTable(rows),
+      emptyVerified: (witness) => [
+        claimFromCompleteRead(
+          witness,
+          "No MCP tool servers are configured on this fortress."
+        ),
+      ],
+      readFailed: (reason) => [incompleteNote("MCP tool server", reason)],
+    })
+  );
   lines.push("");
 
   // Observed egress destinations.
   lines.push("## Observed egress destinations (enforced machines only)");
   lines.push("");
-  if (!inv.observed_destinations.read_ok) {
-    lines.push(
-      incompleteNote("observed egress destination", inv.observed_destinations.reason)
-    );
-  } else if (inv.observed_destinations.rows.length === 0) {
-    lines.push(
-      "No observed egress destinations are recorded on this fortress."
-    );
-  } else {
-    lines.push("| Destination | Port | Protocol | Seen | Exfil risk |");
-    lines.push("|---|---|---|---|---|");
-    for (const d of inv.observed_destinations.rows) {
-      lines.push(
-        `| ${d.host} | ${d.port ?? "-"} | ${d.protocol ?? "-"} | ${d.times_seen ?? "-"} | ${d.exfil_risk ? "yes" : "no"} |`
-      );
-    }
-  }
+  lines.push(
+    ...foldOutcome(inv.observed_destinations, {
+      populated: (rows) => destinationTable(rows),
+      emptyVerified: (witness) => [
+        claimFromCompleteRead(
+          witness,
+          "No observed egress destinations are recorded on this fortress."
+        ),
+      ],
+      readFailed: (reason) => [
+        incompleteNote("observed egress destination", reason),
+      ],
+    })
+  );
   lines.push("");
   // Closing reinforcement (printed whether the tables above are empty or full):
   // a POPULATED inventory is still not a complete picture, so a reader who
@@ -290,13 +348,52 @@ function renderInventory(inv: InventorySnapshot): PackSection {
  * Honest wording for a source whose store could NOT be read. It must never read
  * as an affirmative "none exist" census claim (slice-2 HIGH-1): a read failure
  * is disclosed as incomplete, with the reason, distinct from a genuine empty.
+ * There is no code path from a `read_failed` outcome to a definitive-negative
+ * line (that requires a Complete witness via {@link claimFromCompleteRead}), so
+ * this note is the ONLY thing a failed inventory read can render.
  */
-function incompleteNote(sourceLabel: string, reason: string | undefined): string {
-  const base =
+function incompleteNote(sourceLabel: string, reason: string): string {
+  return (
     `The ${sourceLabel} inventory could not be read for this period, so this ` +
     "section is INCOMPLETE. This is NOT a statement that none exist. " +
-    PLACEHOLDER_BADGE;
-  return reason ? `${base} Reason: ${reason}` : base;
+    PLACEHOLDER_BADGE +
+    ` Reason: ${reason}`
+  );
+}
+
+function agentTable(rows: InventoryAgentRow[]): string[] {
+  const out = ["| Agent | Harness | Model | Wrapped | Status |", "|---|---|---|---|---|"];
+  for (const a of rows) {
+    const model = [a.model_vendor, a.model_id].filter(Boolean).join(" / ") || "-";
+    out.push(
+      `| ${a.agent_id} | ${a.harness} | ${model} | ${a.wrapped_at ?? "-"} | ${a.status ?? "-"} |`
+    );
+  }
+  return out;
+}
+
+function mcpTable(rows: InventoryMcpServerRow[]): string[] {
+  const out = ["| Server | Transport | Enabled | State | Tools |", "|---|---|---|---|---|"];
+  for (const s of rows) {
+    const enabled = s.enabled === undefined ? "-" : s.enabled ? "yes" : "no";
+    out.push(
+      `| ${s.name} | ${s.transport ?? "-"} | ${enabled} | ${s.connection_state ?? "-"} | ${s.tool_count ?? "-"} |`
+    );
+  }
+  return out;
+}
+
+function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
+  const out = [
+    "| Destination | Port | Protocol | Seen | Exfil risk |",
+    "|---|---|---|---|---|",
+  ];
+  for (const d of rows) {
+    out.push(
+      `| ${d.host} | ${d.port ?? "-"} | ${d.protocol ?? "-"} | ${d.times_seen ?? "-"} | ${d.exfil_risk ? "yes" : "no"} |`
+    );
+  }
+  return out;
 }
 
 // ── Section 4: written governance policy (CNA Q2) ────────────────────
@@ -346,9 +443,23 @@ function renderTrainingAttestations(): PackSection {
 
 // ── Section 6: human review of AI actions (CNA Q4) ───────────────────
 
-function renderHumanReview(agg: QuarterAggregation): PackSection {
-  const c = agg.by_category;
-  const body = [
+/** Honest language for a decision-count section when the audit read failed. */
+function countsUnavailable(reason: string): string[] {
+  return [
+    "The control-point decision counts could not be computed for this quarter " +
+      "because the audit log could not be read, so this section asserts NO " +
+      "approval, denial, or automated-decision counts (in particular it does " +
+      "NOT claim there were none). " +
+      PLACEHOLDER_BADGE +
+      ` Reason: ${reason}`,
+    "",
+  ];
+}
+
+function renderHumanReview(
+  aggregation: ReadOutcome<QuarterAggregation>
+): PackSection {
+  const lead = [
     "# Human review of AI actions at the control point",
     "",
     "_Answers CNA Question 4: how is AI output reviewed._",
@@ -360,53 +471,80 @@ function renderHumanReview(agg: QuarterAggregation): PackSection {
       "without a human, so this section never presents an automated decision as " +
       "human oversight, or the reverse.",
     "",
-    "## Decisions a human made",
-    "",
-    "| Outcome | Count |",
-    "|---|---|",
-    `| Human-approved at the control point | ${c.human_approved} |`,
-    `| Human-denied through the cross-harness inbox | ${c.human_denied} |`,
-    "",
-    "## Decisions the automated tiers made (no human)",
-    "",
-    "| Outcome | Count |",
-    "|---|---|",
-    `| Auto-allowed (low-risk tier) | ${c.allowed} |`,
-    `| Auto-allowed via proxy | ${c.allowed_proxy} |`,
-    `| Blocked as prompt injection | ${c.injection_blocked} |`,
-    `| Unclassified | ${c.unclassified} |`,
-    "",
-    "## Denials (blended - see note)",
-    "",
-    "| Outcome | Count |",
-    "|---|---|",
-    `| Denied (automated policy OR human control point) | ${c.denied} |`,
-    "",
-    "NOTE on the denial count: Sanctuary writes the SAME audit operation for a " +
-      "human control-point denial and for an automated policy / invalid-proof / " +
-      "channel-failure denial, so this report cannot split them from the log " +
-      "alone. It is therefore shown as a single blended figure and is NOT " +
-      "claimed to be purely automated enforcement. The per-entry audit log " +
-      "distinguishes them for an auditor who reconciles against it.",
-    "",
-    "This measures human review of AI ACTIONS at Sanctuary's control point. " +
-      "It shows a human was in the loop for gated actions; it does not, on " +
-      "its own, establish that the supervising attorney reviewed the work " +
-      "product of each matter. The policy and attestation layer carries the " +
-      "professional-responsibility half of this question.",
-    "",
-  ].join("\n");
-  return { title: "Human review of AI actions", markdown: body };
+  ];
+  const body = foldOutcome(aggregation, {
+    populated: (agg) => {
+      const c = agg.by_category;
+      const rows = [
+        "## Decisions a human made",
+        "",
+        "| Outcome | Count |",
+        "|---|---|",
+        `| Human-approved at the control point | ${c.human_approved} |`,
+        `| Human-denied through the cross-harness inbox | ${c.human_denied} |`,
+        "",
+        "## Decisions the automated tiers made (no human)",
+        "",
+        "| Outcome | Count |",
+        "|---|---|",
+        `| Auto-allowed (low-risk tier) | ${c.allowed} |`,
+        `| Auto-allowed via proxy | ${c.allowed_proxy} |`,
+        `| Blocked as prompt injection | ${c.injection_blocked} |`,
+        `| Unclassified | ${c.unclassified} |`,
+        "",
+        "## Denials (blended - see note)",
+        "",
+        "| Outcome | Count |",
+        "|---|---|",
+        `| Denied (automated policy OR human control point) | ${c.denied} |`,
+        "",
+        "NOTE on the denial count: Sanctuary writes the SAME audit operation for a " +
+          "human control-point denial and for an automated policy / invalid-proof / " +
+          "channel-failure denial, so this report cannot split them from the log " +
+          "alone. It is therefore shown as a single blended figure and is NOT " +
+          "claimed to be purely automated enforcement. The per-entry audit log " +
+          "distinguishes them for an auditor who reconciles against it.",
+        "",
+      ];
+      if (c.uncategorized > 0) {
+        rows.push(
+          "## Uncategorized control-point operations",
+          "",
+          `${c.uncategorized} recorded gate operation(s) matched a control-point ` +
+            "decision shape that this report version does NOT classify. They are " +
+            "surfaced here rather than folded into an allow/deny total or hidden " +
+            "in 'other'. Investigate before relying on the decision counts (this " +
+            "usually means a newer Sanctuary daemon emitted a decision op this " +
+            "pack does not yet map).",
+          ""
+        );
+      }
+      rows.push(
+        "This measures human review of AI ACTIONS at Sanctuary's control point. " +
+          "It shows a human was in the loop for gated actions; it does not, on " +
+          "its own, establish that the supervising attorney reviewed the work " +
+          "product of each matter. The policy and attestation layer carries the " +
+          "professional-responsibility half of this question.",
+        ""
+      );
+      return rows;
+    },
+    emptyVerified: () => countsUnavailable("the audit read returned no result."),
+    readFailed: (reason) => countsUnavailable(reason),
+  });
+  return {
+    title: "Human review of AI actions",
+    markdown: [...lead, ...body].join("\n"),
+  };
 }
 
 // ── Section 7: access-log and enforcement summary ────────────────────
 
 function renderAccessLog(
-  agg: QuarterAggregation,
-  shortfall: ShortfallReport
+  aggregation: ReadOutcome<QuarterAggregation>,
+  shortfall: ReadOutcome<ShortfallReport>
 ): PackSection {
-  const c = agg.by_category;
-  const lines = [
+  const lead = [
     "# Access-log and enforcement summary",
     "",
     "_Supports CNA Question 4 and an outside-counsel audit-log ask._",
@@ -416,31 +554,53 @@ function renderAccessLog(
       "omitted: an action that cannot hide in audit silence is the core " +
       "honesty property of this product.",
     "",
-    "| Decision | Count |",
-    "|---|---|",
-    `| Auto-allowed | ${c.allowed} |`,
-    `| Auto-allowed via proxy | ${c.allowed_proxy} |`,
-    `| Human-approved at the control point | ${c.human_approved} |`,
-    `| Denied (automated policy or human control point) | ${c.denied} |`,
-    `| Human-denied through the cross-harness inbox | ${c.human_denied} |`,
-    `| Blocked as prompt injection | ${c.injection_blocked} |`,
-    `| Unclassified | ${c.unclassified} |`,
-    `| Other recorded operations | ${c.other} |`,
-    "",
-    `Covered window attested for this quarter: ${shortfall.covered_from} to ${shortfall.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter.`,
-    "",
   ];
-  if (shortfall.shortfall) {
-    lines.push("> COVERAGE NOTICE: " + shortfall.explanation, "");
-  }
-  return { title: "Access-log and enforcement summary", markdown: lines.join("\n") };
+  const table = foldOutcome(aggregation, {
+    populated: (agg) => {
+      const c = agg.by_category;
+      const rows = [
+        "| Decision | Count |",
+        "|---|---|",
+        `| Auto-allowed | ${c.allowed} |`,
+        `| Auto-allowed via proxy | ${c.allowed_proxy} |`,
+        `| Human-approved at the control point | ${c.human_approved} |`,
+        `| Denied (automated policy or human control point) | ${c.denied} |`,
+        `| Human-denied through the cross-harness inbox | ${c.human_denied} |`,
+        `| Blocked as prompt injection | ${c.injection_blocked} |`,
+        `| Unclassified | ${c.unclassified} |`,
+        `| Uncategorized (surfaced, not folded) | ${c.uncategorized} |`,
+        `| Other recorded operations | ${c.other} |`,
+        "",
+      ];
+      return rows;
+    },
+    emptyVerified: () => countsUnavailable("the audit read returned no result."),
+    readFailed: (reason) => countsUnavailable(reason),
+  });
+  const window = foldOutcome(shortfall, {
+    populated: (s) => [
+      `Covered window attested for this quarter: ${s.covered_from} to ${s.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter.`,
+      "",
+      ...(s.shortfall ? ["> COVERAGE NOTICE: " + s.explanation, ""] : []),
+    ],
+    emptyVerified: () => [],
+    readFailed: (reason) => [
+      "Covered window: could NOT be determined for this quarter because the " +
+        "audit log could not be read. This report makes no coverage claim. " +
+        `Reason: ${reason}`,
+      "",
+    ],
+  });
+  return {
+    title: "Access-log and enforcement summary",
+    markdown: [...lead, ...table, ...window].join("\n"),
+  };
 }
 
 // ── Section 8: data boundary and custody statement ───────────────────
 
-function renderCustody(custody: CustodyFacts | undefined): PackSection {
-  const noOutbound = custody?.no_outbound_by_default !== false;
-  const body = [
+function renderCustody(custody: ReadOutcome<CustodyFacts>): PackSection {
+  const lead = [
     "# Data boundary and custody statement",
     "",
     "_Supports an outside-counsel data-handling ask._",
@@ -450,14 +610,34 @@ function renderCustody(custody: CustodyFacts | undefined): PackSection {
       "firm's own master key, and no state data leaves the local machine " +
       "except through an explicit, human-approved export.",
     "",
-    "| Fact | This install |",
-    "|---|---|",
-    `| Master-key custody | ${fmtCustodyMode(custody)} |`,
-    `| Outbound denied by default | ${noOutbound ? "yes" : "no"} |`,
-    "| Data export | requires human (Tier 1) approval |",
-    "",
-  ].join("\n");
-  return { title: "Data boundary and custody", markdown: body };
+  ];
+  const table = foldOutcome(custody, {
+    populated: (facts) => [
+      "| Fact | This install |",
+      "|---|---|",
+      `| Master-key custody | ${fmtCustodyMode(facts)} |`,
+      `| Outbound denied by default | ${facts.no_outbound_by_default ? "yes" : "no"} |`,
+      "| Data export | requires human (Tier 1) approval |",
+      "",
+    ],
+    emptyVerified: () => [
+      "Per-install custody facts were not supplied for this pack; the " +
+        "architectural statement above still holds.",
+      "",
+    ],
+    readFailed: (reason) => [
+      "The per-install custody facts could not be read for this pack, so the " +
+        "table below is omitted (the architectural statement above still " +
+        "holds). " +
+        PLACEHOLDER_BADGE +
+        ` Reason: ${reason}`,
+      "",
+    ],
+  });
+  return {
+    title: "Data boundary and custody",
+    markdown: [...lead, ...table].join("\n"),
+  };
 }
 
 // ── Section 9: incident response (CNA Q5) ────────────────────────────
@@ -480,9 +660,22 @@ function renderIncidentResponse(): PackSection {
 
 // ── Section 10: verification instructions ────────────────────────────
 
+/** One discrete export's outcome + its output filename, for the appendix. */
+export interface DiscreteExportView {
+  outcome: ReadOutcome<string>;
+  filename: string;
+}
+
+/** The three discrete exports threaded into the verification appendix. */
+export interface DiscreteExportsView {
+  transparency: DiscreteExportView;
+  audit_chain: DiscreteExportView;
+  anchor: DiscreteExportView;
+}
+
 function renderVerification(
   signerDid: string,
-  discreteExports: DiscreteExportsStatus
+  discreteExports: DiscreteExportsView
 ): PackSection {
   const body = [
     "# Verifying this pack as a third party",
@@ -517,58 +710,73 @@ function renderVerification(
     "",
     "### Transparency checkpoint bundle",
     "",
+    ...foldOutcome(discreteExports.transparency.outcome, {
+      populated: () => [
+        `Included as \`${discreteExports.transparency.filename}\`. Verify it ` +
+          "offline with the shipped standalone tool, pinning the Castle Wall " +
+          "public key you obtained out of band:",
+        "",
+        "```",
+        `verify-transparency --input ${discreteExports.transparency.filename} --public-key <castle-wall-public-key>`,
+        "```",
+        "",
+        "A PASS (exit 0) confirms the signed checkpoint chain. A stale but " +
+          "genesis-rooted bundle can still pass offline verification; only " +
+          "public anchoring (below) plus a pinned log key adds freshness and " +
+          "fork detection.",
+        "",
+      ],
+      emptyVerified: () => [
+        "Not included: this fortress has emitted no signed transparency " +
+          "checkpoints yet. When it has, this pack includes the bundle and the " +
+          "one-line verify command above.",
+        "",
+      ],
+      readFailed: (reason) => [
+        `Not included: the transparency bundle could not be gathered. ${reason}`,
+        "",
+      ],
+    }),
+    "### Audit-chain export",
+    "",
+    ...foldOutcome(discreteExports.audit_chain.outcome, {
+      populated: () => [
+        `Included as \`${discreteExports.audit_chain.filename}\` (JSONL: entry ` +
+          "records plus checkpoint and rotation anchors). Verify its hash chain " +
+          "with the shipped audit-chain verifier; the export carries encrypted " +
+          "payload bytes only (no plaintext content is exposed).",
+        "",
+      ],
+      emptyVerified: () => [
+        "Not included: the audit-chain export was empty for this fortress.",
+        "",
+      ],
+      readFailed: (reason) => [
+        `Not included: the audit-chain export could not be gathered. ${reason}`,
+        "",
+      ],
+    }),
+    "### Public-anchor (Rekor) evidence",
+    "",
+    ...foldOutcome(discreteExports.anchor.outcome, {
+      populated: () => [
+        `Included as \`${discreteExports.anchor.filename}\`. It lets an auditor ` +
+          "confirm the checkpoints were publicly anchored (freshness and fork " +
+          "detection). It contains salted commitments handed over deliberately, " +
+          "never content.",
+        "",
+      ],
+      emptyVerified: () => [
+        "Not included: public transparency anchoring (Sigstore/Rekor) is opt-in " +
+          "and is not enabled on this install.",
+        "",
+      ],
+      readFailed: (reason) => [
+        `Not included: the anchor evidence could not be gathered. ${reason}`,
+        "",
+      ],
+    }),
   ];
-
-  if (discreteExports.transparency.included) {
-    body.push(
-      `Included as \`${discreteExports.transparency.filename}\`. Verify it ` +
-        "offline with the shipped standalone tool, pinning the Castle Wall " +
-        "public key you obtained out of band:",
-      "",
-      "```",
-      `verify-transparency --input ${discreteExports.transparency.filename} --public-key <castle-wall-public-key>`,
-      "```",
-      "",
-      "A PASS (exit 0) confirms the signed checkpoint chain. A stale but " +
-        "genesis-rooted bundle can still pass offline verification; only " +
-        "public anchoring (below) plus a pinned log key adds freshness and " +
-        "fork detection.",
-      ""
-    );
-  } else {
-    body.push(
-      `Not included: ${discreteExports.transparency.reason} When a fortress ` +
-        "has emitted enforcement checkpoints, this pack includes the bundle " +
-        "and the one-line verify command above.",
-      ""
-    );
-  }
-
-  body.push("### Audit-chain export", "");
-  if (discreteExports.audit_chain.included) {
-    body.push(
-      `Included as \`${discreteExports.audit_chain.filename}\` (JSONL: entry ` +
-        "records plus checkpoint and rotation anchors). Verify its hash chain " +
-        "with the shipped audit-chain verifier; the export carries encrypted " +
-        "payload bytes only (no plaintext content is exposed).",
-      ""
-    );
-  } else {
-    body.push(`Not included: ${discreteExports.audit_chain.reason}`, "");
-  }
-
-  body.push("### Public-anchor (Rekor) evidence", "");
-  if (discreteExports.anchor.included) {
-    body.push(
-      `Included as \`${discreteExports.anchor.filename}\`. It lets an auditor ` +
-        "confirm the checkpoints were publicly anchored (freshness and fork " +
-        "detection). It contains salted commitments handed over deliberately, " +
-        "never content.",
-      ""
-    );
-  } else {
-    body.push(`Not included: ${discreteExports.anchor.reason}`, "");
-  }
 
   return { title: "Verifying this pack", markdown: body.join("\n") };
 }
@@ -644,11 +852,13 @@ export function renderSections(params: {
   generatedAt: string;
   signerDid: string;
   productName: string;
-  aggregation: QuarterAggregation;
-  shortfall: ShortfallReport;
-  discreteExports: DiscreteExportsStatus;
+  aggregation: ReadOutcome<QuarterAggregation>;
+  shortfall: ReadOutcome<ShortfallReport>;
+  custody: ReadOutcome<CustodyFacts>;
+  inventory?: InventorySnapshot;
+  discreteExports: DiscreteExportsView;
 }): PackSection[] {
-  const inv = params.input.inventory ?? emptyInventorySnapshot();
+  const inv = params.inventory ?? emptyInventorySnapshot();
   return [
     renderCover(
       params.input,
@@ -664,7 +874,7 @@ export function renderSections(params: {
     renderTrainingAttestations(),
     renderHumanReview(params.aggregation),
     renderAccessLog(params.aggregation, params.shortfall),
-    renderCustody(params.input.custody),
+    renderCustody(params.custody),
     renderIncidentResponse(),
     renderVerification(params.signerDid, params.discreteExports),
     renderScopeAndLimits(),

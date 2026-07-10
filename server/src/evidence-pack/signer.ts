@@ -23,7 +23,6 @@ import type {
   EvidencePackFile,
   EvidencePackManifest,
   QuarterWindow,
-  ShortfallReport,
 } from "./types.js";
 import { PACK_DISCLAIMER } from "./sections.js";
 
@@ -106,7 +105,8 @@ export function buildPackManifest(params: {
   generatedAt: string;
   signer: StoredIdentity;
   files: EvidencePackFile[];
-  shortfall: ShortfallReport;
+  /** The machine-readable coverage union (determinable, or not with a reason). */
+  coverage: EvidencePackManifest["coverage"];
   ds: PackSigner;
 }): EvidencePackManifest {
   const body: Omit<EvidencePackManifest, "manifest_signature"> = {
@@ -128,13 +128,7 @@ export function buildPackManifest(params: {
       sha256: f.sha256,
       signature: f.signature,
     })),
-    coverage: {
-      covered_from: params.shortfall.covered_from,
-      covered_to_exclusive: params.shortfall.covered_to_exclusive,
-      shortfall: params.shortfall.shortfall,
-      in_progress_quarter: params.shortfall.in_progress_quarter,
-      retention_at_cap: params.shortfall.retention_at_cap,
-    },
+    coverage: params.coverage,
     disclaimer: PACK_DISCLAIMER,
   };
 

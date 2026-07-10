@@ -43,8 +43,33 @@ const ALL_CATEGORIES: DecisionCategory[] = [
   "denied",
   "injection_blocked",
   "unclassified",
+  "uncategorized",
   "other",
 ];
+
+/**
+ * The EXPLICIT gate-decision op-prefix -> category map. This is the single
+ * source of truth the exhaustiveness test checks against the ops actually
+ * emitted by `principal-policy/gate.ts`: adding a new `gate_*` decision op to
+ * the gate without adding it here fails that test, so a new op can never
+ * silently vanish into `other` or a flattering bucket.
+ *
+ * `gate_approve` (the live interactive channel decision) and the two-phase
+ * `gate_approval_proof` are human approvals; `gate_deny` is the blended denial
+ * (human OR automated policy/invalid-proof/channel-failure - not separable from
+ * the op alone); the rest are automated. There is no `gate_escalate` producer.
+ */
+export const GATE_DECISION_OP_CATEGORIES: Readonly<
+  Record<string, DecisionCategory>
+> = {
+  gate_allow: "allowed",
+  gate_allow_proxy: "allowed_proxy",
+  gate_approve: "human_approved",
+  gate_approval_proof: "human_approved",
+  gate_deny: "denied",
+  gate_injection_block: "injection_blocked",
+  gate_unclassified: "unclassified",
+};
 
 /**
  * Map one audit entry to a decision category. The gate encodes the decision in
@@ -52,41 +77,23 @@ const ALL_CATEGORIES: DecisionCategory[] = [
  * resolution encodes it in the entry result (success = approved, failure =
  * denied).
  *
- * Verified against the FULL set of `operation:` producers in
- * `principal-policy/gate.ts` (HIGH-1): `gate_allow`, `gate_allow_proxy`,
- * `gate_injection_block`, `gate_unclassified` are automated; `gate_approve`
- * (the live interactive channel decision) and `gate_approval_proof` (the
- * two-phase re-presented proof) are human approvals; `gate_deny` is the shared
- * denial op (human OR automated) kept as the blended `denied`. There is no
- * `gate_escalate` producer, so it is intentionally NOT a case.
+ * UNMAPPED-OP GUARD: a `gate_`-shaped op NOT in {@link GATE_DECISION_OP_CATEGORIES}
+ * is a control-point decision this version does not classify, so it returns
+ * `uncategorized` (surfaced honestly for investigation) rather than falling
+ * into `other` or inflating an automated count. Only genuine non-`gate_`
+ * operations (identity ops, state writes, heartbeats) return `other`.
  */
 export function categorizeEntry(entry: AuditEntry): DecisionCategory {
   if (entry.operation === CROSS_HARNESS_APPROVAL_RESOLVED) {
     return entry.result === "success" ? "human_approved" : "human_denied";
   }
   const prefix = entry.operation.split(":", 1)[0] ?? "";
-  switch (prefix) {
-    case "gate_allow":
-      return "allowed";
-    case "gate_allow_proxy":
-      return "allowed_proxy";
-    // Human approvals: the interactive channel `gate_${decision}:` with
-    // decision="approve", and the two-phase re-presented-envelope proof.
-    case "gate_approve":
-    case "gate_approval_proof":
-      return "human_approved";
-    // Blended denial: the gate writes gate_deny: for a human control-point
-    // denial AND for automated policy / invalid-proof / channel-failure
-    // denials. Not attributable to human-vs-automated from the op alone.
-    case "gate_deny":
-      return "denied";
-    case "gate_injection_block":
-      return "injection_blocked";
-    case "gate_unclassified":
-      return "unclassified";
-    default:
-      return "other";
-  }
+  const mapped = GATE_DECISION_OP_CATEGORIES[prefix];
+  if (mapped !== undefined) return mapped;
+  // A gate-shaped op we do not explicitly map is a decision we cannot classify:
+  // surface it, never hide it in `other` or a flattering bucket.
+  if (prefix.startsWith("gate_")) return "uncategorized";
+  return "other";
 }
 
 /**

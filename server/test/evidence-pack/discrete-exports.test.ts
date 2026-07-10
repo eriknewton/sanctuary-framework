@@ -37,7 +37,12 @@ import {
   TRANSPARENCY_BUNDLE_FILENAME,
   AUDIT_CHAIN_FILENAME,
   ANCHOR_EVIDENCE_FILENAME,
+  type BuildEvidencePackDeps,
 } from "../../src/evidence-pack/generate.js";
+import { populated, emptyVerified } from "../../src/evidence-pack/read-outcome.js";
+import type {
+  AuditEntry,
+} from "../../src/operational/audit-log.js";
 import type {
   EvidencePackInput,
   RetentionFacts,
@@ -63,6 +68,10 @@ const RETENTION: RetentionFacts = {
   retained_total: 1,
   earliest_retained_at: "2026-06-01T00:00:00.000Z",
 };
+
+function deps(entries: AuditEntry[] = []): BuildEvidencePackDeps {
+  return { audit: populated({ entries, retention: RETENTION }), signer, masterKey };
+}
 
 function baseInput(): EvidencePackInput {
   return {
@@ -137,12 +146,12 @@ describe("evidence pack discrete exports", () => {
       {
         ...baseInput(),
         discrete_exports: {
-          transparency_bundle_json: fixtureTransparencyBundleJson(),
-          audit_chain_jsonl: '{"kind":"entry","sequence":1}\n',
-          anchor_evidence_json: '{"anchored":true}',
+          transparency: populated(fixtureTransparencyBundleJson()),
+          audit_chain: populated('{"kind":"entry","sequence":1}\n'),
+          anchor: populated('{"anchored":true}'),
         },
       },
-      { entries: [], retention: RETENTION, signer, masterKey }
+      deps()
     );
 
     const names = pack.manifest.files.map((f) => f.filename);
@@ -165,11 +174,12 @@ describe("evidence pack discrete exports", () => {
       {
         ...baseInput(),
         discrete_exports: {
-          transparency_bundle_json: fixtureTransparencyBundleJson(),
-          audit_chain_jsonl: "{}\n",
+          transparency: populated(fixtureTransparencyBundleJson()),
+          audit_chain: populated("{}\n"),
+          anchor: emptyVerified(),
         },
       },
-      { entries: [], retention: RETENTION, signer, masterKey }
+      deps()
     );
     const report = pack.files[0]!.content;
     expect(report).toContain(
@@ -181,12 +191,7 @@ describe("evidence pack discrete exports", () => {
   });
 
   it("states an honest reason when an export is absent, not conditional language", () => {
-    const pack = buildEvidencePack(baseInput(), {
-      entries: [],
-      retention: RETENTION,
-      signer,
-      masterKey,
-    });
+    const pack = buildEvidencePack(baseInput(), deps());
     const report = pack.files[0]!.content;
     expect(report).toContain("Not included:");
     // Anchor default reason (opt-in / off) is disclosed.
@@ -200,8 +205,15 @@ describe("evidence pack discrete exports", () => {
   it("gathers a transparency bundle that validates OFFLINE with the shipped verifier (PASS)", () => {
     const bundleJson = fixtureTransparencyBundleJson(3);
     const pack = buildEvidencePack(
-      { ...baseInput(), discrete_exports: { transparency_bundle_json: bundleJson } },
-      { entries: [], retention: RETENTION, signer, masterKey }
+      {
+        ...baseInput(),
+        discrete_exports: {
+          transparency: populated(bundleJson),
+          audit_chain: emptyVerified(),
+          anchor: emptyVerified(),
+        },
+      },
+      deps()
     );
     // The bundle the pack carries is the exact bytes we can verify offline.
     const carried = pack.manifest.files.find(
