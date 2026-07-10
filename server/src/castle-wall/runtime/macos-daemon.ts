@@ -1,8 +1,10 @@
+import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { getServers } from "node:dns";
 import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 
 import { bytesToString, toBase64url } from "../../core/encoding.js";
 import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.js";
@@ -51,6 +53,12 @@ import {
   CASTLE_WALL_HEARTBEAT_OPERATION,
   CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
 } from "../constants.js";
+import {
+  EGRESS_PROBE_FAILED_AUDIT_OP,
+  asUidTlsProbeArgv,
+} from "../provision/egress.js";
+
+const execFileAsync = promisify(execFile);
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
@@ -85,6 +93,41 @@ export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE =
  * daemon always lands at least one heartbeat inside the window.
  */
 export const CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS = 45 as const;
+
+/**
+ * Default cadence (seconds) of the periodic as-agent-uid egress liveness
+ * probe (confined-agent egress design MED-3, secondary signal): 6 hours.
+ * Deliberately order-of-hours -- the probe spawns real as-uid processes and
+ * makes real TLS connects; the PRIMARY runtime signal (the deny-spike
+ * sentinel over already-recorded audit denials) carries the minutes-scale
+ * latency, this probe only backstops endpoints the harness is not currently
+ * calling at all.
+ */
+export const CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS = 21_600 as const;
+
+/**
+ * Resolve the as-agent-uid egress probe: the injected one (tests), else the
+ * real `sudo -n -u '#<uid>' curl` probe IFF this daemon runs as root on
+ * darwin (only root can genuinely change the real uid the wall keys on),
+ * else undefined (timer stays off; a probe that cannot change uid would
+ * report THIS process's reachability and alarm falsely).
+ */
+function resolveAgentEgressProbe(
+  input: MacOSCastleWallDaemonInput,
+): ((uid: number, host: string, port: number) => Promise<boolean>) | undefined {
+  if (input.agentEgressProbe !== undefined) return input.agentEgressProbe;
+  if ((input.platform ?? process.platform) !== "darwin") return undefined;
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) return undefined;
+  return async (uid, host, port) => {
+    const { file, args } = asUidTlsProbeArgv(uid, host, port);
+    try {
+      await execFileAsync(file, args);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+}
 
 /**
  * launchd label of the safe-mode boot daemon. Mirror of `CASTLE_WALL_BOOT_LABEL`
@@ -211,6 +254,25 @@ export interface MacOSCastleWallDaemonInput {
    * not bloat the audit chain. Tests inject a small value for determinism.
    */
   auditHeartbeatIntervalSeconds?: number;
+  /**
+   * Interval (seconds) of the periodic AS-AGENT-UID egress liveness probe
+   * (confined-agent egress design 2026-07-10, MED-3 secondary signal).
+   * Order-of-hours by default (21600s = 6h): for each `provisioned-*` allow
+   * rule in the loaded manifest (uid mode only), a probe process running as
+   * the agent uid attempts a TLS connect; a failure appends an
+   * `egress_probe_failed` audit entry that the agent-egress sentinel
+   * surfaces as an operator alert. Tests inject a small value.
+   */
+  agentEgressProbeIntervalSeconds?: number;
+  /**
+   * Injected as-uid egress probe (tests; also the ONLY way the probe runs on
+   * a non-root / non-darwin daemon). Resolve true iff a process running as
+   * `uid` completes a TLS connect to `host:port`. When absent, a real
+   * `sudo -n -u '#<uid>' curl` probe is used IFF this daemon runs as root on
+   * darwin; otherwise the timer stays OFF (no false alarms from a probe that
+   * cannot actually change uid).
+   */
+  agentEgressProbe?: (uid: number, host: string, port: number) => Promise<boolean>;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -354,6 +416,15 @@ export async function startMacOSCastleWallDaemon(
     if (!auditHeartbeat) return;
     clearInterval(auditHeartbeat);
     auditHeartbeat = undefined;
+  };
+  const agentEgressProbeIntervalSeconds =
+    input.agentEgressProbeIntervalSeconds ??
+    CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS;
+  let agentEgressProbeTimer: NodeJS.Timeout | undefined;
+  const stopAgentEgressProbeTimer = (): void => {
+    if (!agentEgressProbeTimer) return;
+    clearInterval(agentEgressProbeTimer);
+    agentEgressProbeTimer = undefined;
   };
 
   const consumer = new MacOSFlowEventConsumer({
@@ -606,9 +677,73 @@ export async function startMacOSCastleWallDaemon(
       void emitAuditHeartbeat();
     }, auditHeartbeatIntervalSeconds * 1000);
     auditHeartbeat.unref();
+
+    // Confined-agent egress MED-3 (secondary signal): periodic AS-AGENT-UID
+    // egress liveness probe over the provisioned-* allow rules in the loaded
+    // manifest. Refuse-to-arm protects the ARM moment; this timer bounds
+    // RUNTIME silent degradation (a rotated host, a harness update, a broken
+    // path) to the probe interval: a failed probe appends one
+    // `egress_probe_failed` audit entry (result: failure) that the
+    // agent-egress sentinel raises as an operator alert. Observation only --
+    // it never mutates policy or enforcement. The timer only runs when a
+    // probe is available (injected, or root-on-darwin for the real
+    // `sudo -u '#<uid>'` probe): a probe that cannot actually change uid
+    // would report the DAEMON's reachability and alarm falsely.
+    const agentEgressProbe = resolveAgentEgressProbe(input);
+    if (agentEgressProbe !== undefined) {
+      const emitAgentEgressProbe = async (): Promise<void> => {
+        try {
+          const origin = manifestState.signed.manifest.agent_origin;
+          if (!origin || origin.mode !== "uid" || typeof origin.agent_uid !== "number") {
+            return;
+          }
+          const provisioned = manifestState.rules.filter(
+            (rule) => rule.disposition === "allow" && rule.id.startsWith("provisioned-"),
+          );
+          for (const rule of provisioned) {
+            const hostAxis = rule.match.host;
+            const host = Array.isArray(hostAxis) ? hostAxis[0] : hostAxis;
+            if (typeof host !== "string" || host.length === 0) continue;
+            const portAxis = rule.match.port;
+            const port = Array.isArray(portAxis) ? portAxis[0] : portAxis;
+            const destPort = typeof port === "number" ? port : 443;
+            let reachable = false;
+            try {
+              reachable = await agentEgressProbe(origin.agent_uid, host, destPort);
+            } catch {
+              reachable = false;
+            }
+            if (!reachable) {
+              await input.auditLog.append(
+                "l1",
+                EGRESS_PROBE_FAILED_AUDIT_OP,
+                input.fortressId,
+                {
+                  host,
+                  port: destPort,
+                  agent_uid: origin.agent_uid,
+                  rule_id: rule.id,
+                  source: auditSource,
+                },
+                "failure",
+              );
+              await input.auditLog.flush();
+            }
+          }
+        } catch {
+          // The probe must never crash the daemon or take down enforcement;
+          // a missed probe cycle is bounded by the next interval tick.
+        }
+      };
+      agentEgressProbeTimer = setInterval(() => {
+        void emitAgentEgressProbe();
+      }, agentEgressProbeIntervalSeconds * 1000);
+      agentEgressProbeTimer.unref();
+    }
   } catch (err) {
     stopLeaseHeartbeat();
     stopAuditHeartbeat();
+    stopAgentEgressProbeTimer();
     if (activeConfigWritten) {
       await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
     }
@@ -694,6 +829,7 @@ export async function startMacOSCastleWallDaemon(
         // Stop the audit liveness heartbeat in the SAME teardown that stops the
         // IPC lease heartbeat, so a stopped daemon stops claiming liveness.
         stopAuditHeartbeat();
+        stopAgentEgressProbeTimer();
         await listener.broadcastArmLease(buildArmLease({
           armed: false,
           ttlSeconds: null,

@@ -5,7 +5,7 @@ import {
 } from "node:child_process";
 import { createConnection } from "node:net";
 import { createHash, randomBytes as nodeRandomBytes } from "node:crypto";
-import { chmod, mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -46,6 +46,9 @@ import {
   safeModeAuditStoragePath,
 } from "../castle-wall/boot/boot-token.js";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
+import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schema.js";
+import { HABEAS_RULE_ID_PREFIX } from "../castle-wall/allowlist/habeas-port.js";
+import { EGRESS_PROVISION_REFUSED_AUDIT_OP } from "../castle-wall/provision/egress.js";
 import {
   CASTLE_WALL_BOOT_PLIST_PATH,
   bootServiceInstalled,
@@ -165,6 +168,14 @@ export interface CastleWallCommandContext {
    * it; every other caller ignores it and the exit-code contract is unchanged.
    */
   onDisableNeConfirmedOff?: (neConfirmedOff: boolean) => void;
+  /**
+   * Override the agent-matchable-allow-rule counter used by the `enable`
+   * no-egress brick guard (confined-agent egress design, section 5 layer 2;
+   * tests). Defaults to {@link countAgentMatchableAllowRules}, which reads
+   * `<fortress>/policy/egress/rules/*.json` and counts allow-disposition
+   * rules an agent-classified flow could match.
+   */
+  egressAllowRuleCountProbe?: (fortressPath: string) => Promise<number>;
 }
 
 export interface CastleWallParsedArgs {
@@ -200,6 +211,17 @@ export interface CastleWallParsedArgs {
    * when `--agent-uid` is given but `--ceiling` is not.
    */
   ceiling?: string;
+  /**
+   * `enable --allow-no-egress` (confined-agent egress design, section 5
+   * layer 2): explicit override for the standing no-egress brick guard.
+   * Arming a uid-mode wall whose manifest source carries ZERO
+   * agent-matchable allow rules confines the agent into total
+   * non-functionality; a deliberate deny-all quarantine is legitimate but
+   * must be ASKED FOR, never the accident. Deliberately NOT covered by
+   * `--force` (whose meaning is "the daemon/boot service is supervised
+   * out-of-band", a different assertion). The override is audited.
+   */
+  allowNoEgress?: boolean;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -1957,20 +1979,29 @@ export async function runSetupSharedDir(
   return 0;
 }
 
-export async function runReload(
-  argv: string[] = [],
-  ctx: CastleWallCommandContext = {}
-): Promise<number> {
-  const out = ctx.out ?? process.stdout;
-  const err = ctx.err ?? process.stderr;
-  const env = ctx.env ?? process.env;
-  const parsed = parseCastleWallArgs(argv);
-  const fortressPath = resolveFortressArg(parsed.fortress, env);
-  const socketPath = resolveCastleWallSocketPath({
-    platform: ctx.platform ?? process.platform,
-    fortressPath,
-  }).path;
+/** Result of {@link requestPolicyReload}. */
+export interface PolicyReloadResult {
+  ok: boolean;
+  loadedRuleCount?: number;
+  error?: string;
+  /** True when the failure was an unreachable daemon socket (no daemon running). */
+  socketUnavailable?: boolean;
+}
 
+/**
+ * Ask the running Castle Wall policy daemon for this fortress to re-read,
+ * re-compose, re-sign, and broadcast its manifest. FAIL-CLOSED result shape:
+ * an unreachable socket is `ok: false` (with `socketUnavailable: true`),
+ * never a silent success -- callers that REQUIRE a confirmed reload (the
+ * confined-agent egress provisioning step) must treat anything but
+ * `ok: true` as a refusal. The lenient "no daemon running" UX belongs to
+ * `runReload`'s CLI rendering, not to this primitive.
+ */
+export async function requestPolicyReload(
+  fortressPath: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<PolicyReloadResult> {
+  const socketPath = resolveCastleWallSocketPath({ platform, fortressPath }).path;
   try {
     const reply = await sendCastleWallMessage<PolicyReloadResponse>(
       socketPath,
@@ -1982,22 +2013,45 @@ export async function runReload(
       "policy_reload_response",
     );
     if (!reply.ok) {
-      write(err, `Error: ${reply.error ?? "policy reload failed"}\n`);
-      return 1;
+      return { ok: false, error: reply.error ?? "policy reload failed" };
     }
-    write(out, `Castle Wall policy reloaded (${reply.loaded_rule_count} rules).\n`);
-    return 0;
+    return { ok: true, loadedRuleCount: reply.loaded_rule_count };
   } catch (error) {
     if (isSocketUnavailable(error)) {
-      write(
-        out,
-        `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
-      );
-      return 0;
+      return {
+        ok: false,
+        socketUnavailable: true,
+        error: `no Castle Wall daemon reachable at ${socketPath}`,
+      };
     }
-    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+export async function runReload(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {}
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+
+  const result = await requestPolicyReload(fortressPath, ctx.platform ?? process.platform);
+  if (result.ok) {
+    write(out, `Castle Wall policy reloaded (${result.loadedRuleCount} rules).\n`);
+    return 0;
+  }
+  if (result.socketUnavailable) {
+    write(
+      out,
+      `No Castle Wall daemon running for fortress ${fortressIdLabel(fortressPath)}. Run 'sanctuary wrap' to start one.\n`,
+    );
+    return 0;
+  }
+  write(err, `Error: ${result.error ?? "policy reload failed"}\n`);
+  return 1;
 }
 
 export async function runApprove(
@@ -2163,6 +2217,66 @@ function perRuleGroupRecord(group: PerRuleGroup): Record<string, unknown> {
 /** Filesystem path of the agent-origin descriptor within a fortress. */
 function agentOriginDescriptorPath(fortressPath: string): string {
   return join(fortressPath, "policy", "egress", "agent-origin.json");
+}
+
+/**
+ * Best-effort read of the fortress's agent-origin MODE ("uid" | "nat"), or
+ * null when the descriptor is absent, unreadable, or invalid. Used by the
+ * no-egress brick guard, which is uid-mode-only: descriptor ABSENCE is
+ * already handled (refused or --force-acknowledged) by the origin-descriptor
+ * boot-cut guard just above it, so null here means "guard does not apply",
+ * never a silent fail-open of a state some other guard owns.
+ */
+async function readAgentOriginModeBestEffort(
+  fortressPath: string,
+): Promise<"uid" | "nat" | null> {
+  try {
+    const raw = await readFile(agentOriginDescriptorPath(fortressPath), "utf8");
+    const validated = validateAgentOrigin(JSON.parse(raw));
+    if (validated === null) return null;
+    return validated.mode === "uid" ? "uid" : "nat";
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Count the allow-disposition rules in the fortress's persisted manifest
+ * source (`policy/egress/rules/*.json`) that an AGENT-classified flow could
+ * ever match (the no-egress brick guard's input; confined-agent egress
+ * design section 5 layer 2).
+ *
+ * Honest scope of "agent-matchable": every on-disk allow rule counts except
+ * rules claiming the reserved habeas distress ids (those are scoped to a
+ * synthetic agent id no wrapped agent is ever assigned, so they grant the
+ * agent nothing). Rules scoped to specific agent_ids/template_ids still
+ * count -- this generic guard cannot know the harness's ids (the
+ * endpoint-specific static check in the provision flow can, and does).
+ * Fail-closed reads: an unreadable directory or an unparseable/invalid rule
+ * file contributes ZERO (the enforcing daemon would refuse such a ruleset,
+ * so it cannot be the agent's egress path).
+ */
+export async function countAgentMatchableAllowRules(fortressPath: string): Promise<number> {
+  const rulesDir = join(fortressPath, "policy", "egress", "rules");
+  let filenames: string[] = [];
+  try {
+    filenames = (await readdir(rulesDir)).filter((name) => name.endsWith(".json"));
+  } catch {
+    return 0;
+  }
+  let count = 0;
+  for (const filename of filenames) {
+    try {
+      const parsed = JSON.parse(await readFile(join(rulesDir, filename), "utf8")) as AllowlistRule;
+      if (validateRule(parsed).length > 0) continue;
+      if (parsed.disposition !== "allow") continue;
+      if (parsed.id.startsWith(HABEAS_RULE_ID_PREFIX)) continue;
+      count += 1;
+    } catch {
+      continue;
+    }
+  }
+  return count;
 }
 
 /**
@@ -2717,10 +2831,17 @@ export function defaultDaemonProbe(socketPath: string): Promise<boolean> {
  * decryptable audit log (the authoritative filter_started/filter_stopped
  * events come from the daemon path). A failed write degrades to a warning.
  */
-async function appendArmAuditBestEffort(
-  action: "enable" | "disable",
-  verifiedState: string,
-  forced: boolean,
+/**
+ * Best-effort CLI-side Castle Wall audit append (shared chokepoint): opens
+ * the fortress audit log with the resolved master key, writes ONE entry with
+ * the given operation string, and warns (never throws) when the write cannot
+ * complete. Used by the arm/disarm audit below and by the confined-agent
+ * egress flow's `egress_provisioned` / `egress_provision_refused` records
+ * (distinct LOCAL operation values, never a widened shared enum).
+ */
+export async function appendCastleWallCliAuditBestEffort(
+  operation: string,
+  details: Record<string, unknown>,
   fortressPath: string,
   env: NodeJS.ProcessEnv,
   err: Writable,
@@ -2731,14 +2852,9 @@ async function appendArmAuditBestEffort(
     const auditLog = new AuditLog(storage, masterKey);
     await auditLog.append(
       "l1",
-      action === "enable" ? "wall_armed" : "wall_disarmed",
+      operation,
       fortressIdFromStoragePath(fortressPath),
-      {
-        source: "castle-wall-cli",
-        action,
-        verified_state: verifiedState,
-        forced,
-      },
+      details,
       "success",
     );
     await auditLog.flush();
@@ -2746,11 +2862,35 @@ async function appendArmAuditBestEffort(
   } catch (error) {
     write(
       err,
-      `Warning: filter state changed but the audit entry could not be written (${
+      `Warning: the '${operation}' audit entry could not be written (${
         error instanceof Error ? error.message : String(error)
       }). Corroborate via 'sanctuary castle-wall audit-dump' once the fortress key is available.\n`,
     );
   }
+}
+
+async function appendArmAuditBestEffort(
+  action: "enable" | "disable",
+  verifiedState: string,
+  forced: boolean,
+  fortressPath: string,
+  env: NodeJS.ProcessEnv,
+  err: Writable,
+  extraDetails: Record<string, unknown> = {},
+): Promise<void> {
+  await appendCastleWallCliAuditBestEffort(
+    action === "enable" ? "wall_armed" : "wall_disarmed",
+    {
+      source: "castle-wall-cli",
+      action,
+      verified_state: verifiedState,
+      forced,
+      ...extraDetails,
+    },
+    fortressPath,
+    env,
+    err,
+  );
 }
 
 function leaseStatusPath(fortressPath: string): string {
@@ -3073,6 +3213,61 @@ async function runArmDisarm(
     }
   }
 
+  // Standing no-egress brick guard (confined-agent egress design 2026-07-10,
+  // section 5 layer 2). When arming in uid mode over a manifest source with
+  // ZERO agent-matchable allow rules, the confined agent is walled off from
+  // EVERYTHING it needs (the 2026-07-09 drill finding: the CoS armed
+  // "successfully" and could not reach even its own endpoints). A deliberate
+  // deny-all quarantine is a legitimate posture, but it must be ASKED FOR via
+  // the explicit `--allow-no-egress` override (audited), never the accident.
+  // Deliberately NOT covered by --force (that flag asserts out-of-band
+  // daemon/boot supervision, a different statement). This guard is GENERIC
+  // (the CLI does not know harness endpoints); the endpoint-specific static +
+  // as-uid verification lives in the auto-provision flow.
+  let allowNoEgressOverrideUsed = false;
+  if (action === "enable") {
+    const originMode = await readAgentOriginModeBestEffort(fortressPath);
+    if (originMode === "uid") {
+      const countProbe = ctx.egressAllowRuleCountProbe ?? countAgentMatchableAllowRules;
+      const agentAllowRules = await countProbe(fortressPath);
+      if (agentAllowRules === 0) {
+        if (!parsed.allowNoEgress) {
+          write(
+            err,
+            "Refusing to arm: this fortress has ZERO agent-matchable allow rules, so the\n" +
+              "confined agent would be default-denied for EVERYTHING (including its own\n" +
+              "endpoints) -- confined into non-functionality, silently.\n" +
+              "Provision its egress first: sudo sanctuary protect --hermes (publishes the\n" +
+              "harness's signed allow rules), or add allow rules to\n" +
+              `${join(fortressPath, "policy", "egress", "rules")} and reload.\n` +
+              "Or pass --allow-no-egress to arm a deliberate deny-all quarantine (audited).\n",
+          );
+          await appendCastleWallCliAuditBestEffort(
+            EGRESS_PROVISION_REFUSED_AUDIT_OP,
+            {
+              source: "castle-wall-cli",
+              guard: "no-egress-brick",
+              agent_origin_mode: "uid",
+              agent_matchable_allow_rules: 0,
+              disarm_outcome: "not-armed",
+            },
+            fortressPath,
+            env,
+            err,
+          );
+          return 1;
+        }
+        allowNoEgressOverrideUsed = true;
+        write(
+          err,
+          "WARNING: --allow-no-egress: arming a uid-mode wall with ZERO agent-matchable\n" +
+            "allow rules. The confined agent will be default-denied for everything (a\n" +
+            "deliberate quarantine posture). This override is audited.\n",
+        );
+      }
+    }
+  }
+
   const resolved = await resolveHostAppBinary(env, ctx);
   if ("error" in resolved) {
     write(err, `${resolved.error}\n`);
@@ -3214,6 +3409,9 @@ async function runArmDisarm(
     fortressPath,
     env,
     err,
+    // The --allow-no-egress override is audited (design section 5 layer 2):
+    // the wall_armed record carries the explicit quarantine consent.
+    allowNoEgressOverrideUsed ? { allow_no_egress_override: true } : {},
   );
 
   if (action === "enable") {
@@ -3295,6 +3493,8 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.scope = parseScope(argv[++i]);
     } else if (arg === "--force") {
       parsed.force = true;
+    } else if (arg === "--allow-no-egress") {
+      parsed.allowNoEgress = true;
     } else if (arg.startsWith("--agent-uid=")) {
       parsed.agentUid = arg.slice("--agent-uid=".length);
     } else if (arg.startsWith("--ceiling=")) {

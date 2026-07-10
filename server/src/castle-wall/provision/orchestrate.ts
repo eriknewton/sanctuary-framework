@@ -41,6 +41,18 @@ import { RehomeExecutionError } from "./rehome.js";
 import type { ConnectivityVerifyResult, EndpointProbeTarget } from "./verify.js";
 import { verifyReachabilityAfterArm, verifyReachabilityBeforeArm } from "./verify.js";
 import type { UidExistenceCheckResult } from "./uid-gate.js";
+import type {
+  AgentEgressVerifyReport,
+  EndpointStaticCheck,
+  HarnessEndpointSet,
+} from "./egress.js";
+import {
+  EGRESS_PROVISIONED_AUDIT_OP,
+  EGRESS_PROVISION_REFUSED_AUDIT_OP,
+  renderAgentEgressReportLines,
+  renderEgressPlanLines,
+  renderEndpointCheckLines,
+} from "./egress.js";
 
 /** Everything the orchestrator needs to decide + print, resolved once up front. */
 export interface ProvisionFlowContext {
@@ -60,6 +72,15 @@ export interface ProvisionFlowContext {
    * probed at the default socket.
    */
   fortressPath: string;
+  /**
+   * The harness's declared endpoint set (design doc
+   * Confined_Agent_Egress_Design_2026-07-10.md section 3.1). Used here for
+   * the Tier-1 confirm plan-print ONLY (every grant named before the one
+   * confirm, messaging hosts marked exfil-risk, broad gateways marked broad);
+   * the provisioning + probes consume the SAME set through the injected ops
+   * so the granted set and the printed set can never drift.
+   */
+  harnessEndpoints: HarnessEndpointSet;
 }
 
 /** The injected, side-effecting steps. Each corresponds to one stage of the target flow. */
@@ -149,6 +170,51 @@ export interface ProvisionFlowOps {
    * REFUSE to swap.
    */
   teardownPolicyDaemon(): Promise<void>;
+  /**
+   * Provision-egress step (design section 5 layer 1, runs AFTER
+   * ensure-policy-daemon and BEFORE arm): publish the harness's
+   * provenance-tagged allow rules into the signed manifest source (the
+   * reachable policy daemon re-signs and broadcasts), then STATICALLY verify
+   * every declared endpoint evaluates to an allow through the same TS
+   * matcher the enforcement paths use, plus the #380 derived-DNS presence.
+   * Returns a discriminated result (never throws) so the abort branch always
+   * has the per-endpoint table to print. `ok: false` MUST abort before arm
+   * (fail-closed: arming over an unprovisioned/unverified egress path is the
+   * exact silent-brick this feature exists to prevent).
+   */
+  provisionEgress(): Promise<
+    | { ok: true; ruleIds: string[]; checks: EndpointStaticCheck[]; dnsRulePresent: boolean }
+    | { ok: false; error: string; checks?: EndpointStaticCheck[]; dnsRulePresent?: boolean }
+  >;
+  /**
+   * Remove every provisioned egress rule this flow's harness owns from the
+   * signed manifest source (verified: no `provisioned-<harness>-*` rule
+   * survives). Used on abort/rollback after `provisionEgress` succeeded so a
+   * failed provision run never leaves orphan grants (design section 6; a
+   * stale allow surviving teardown would combine with any future evaluator
+   * widening into a standing grant). Idempotent + fail-loud.
+   */
+  scrubProvisionedEgress(): Promise<void>;
+  /**
+   * Post-arm as-uid egress verification (design section 5, the check the
+   * 2026-07-09 drill proved DNS-only probes cannot make): a probe process
+   * running AS THE AGENT UID (real uid; the wall keys on ruid) completes a
+   * TCP+TLS connect to each declared endpoint through the ARMED wall, and
+   * the non-listed negative control stays BLOCKED. Failure triggers the
+   * existing fix-B2 fast-disarm rollback.
+   */
+  verifyAgentEgressAfterArm(uid: number): Promise<AgentEgressVerifyReport>;
+  /**
+   * Append one egress audit record through the existing audit-event path
+   * with a DISTINCT operation string (local values, never a widened shared
+   * enum): `egress_provisioned` on success, `egress_provision_refused` on
+   * refusal. MUST be best-effort and never throw (an audit-write failure
+   * must not mask the outcome it records).
+   */
+  auditEgress(
+    operation: typeof EGRESS_PROVISIONED_AUDIT_OP | typeof EGRESS_PROVISION_REFUSED_AUDIT_OP,
+    details: Record<string, unknown>,
+  ): Promise<void>;
   /** Endpoints to probe before arming (LLM / Telegram / Gmail, etc). */
   preArmEndpoints(): EndpointProbeTarget[];
   /** Hard existence + uid-match check immediately before arming (fix H1). */
@@ -307,7 +373,23 @@ export type ProvisionFlowOutcome =
       wallMayBeArmed?: boolean;
     }
   | { kind: "armed-then-rolled-back"; uid: number; reason: string }
-  | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
+  | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string }
+  /**
+   * Egress-provision outcome vocabulary (design section 5): a DISTINCT local
+   * variant, never a widened shared enum (the file-grant round-4 lesson).
+   * The wall ARMED, but the post-arm AS-UID egress verification failed (an
+   * endpoint unreachable as the agent uid, or the negative control
+   * reachable), so the flow fast-disarmed (fix B2) and scrubbed the
+   * provisioned rules rather than leave a confined-into-silence agent or an
+   * unverified grant. The agent stays re-homed under its dedicated account.
+   */
+  | {
+      kind: "egress-unprovisioned-rolled-back";
+      uid: number;
+      reason: string;
+      /** False when the provisioned-rule scrub after fast-disarm could not be confirmed. */
+      scrubbed: boolean;
+    };
 
 /**
  * Run the full one-flow orchestration. Every fail-closed branch below is
@@ -372,6 +454,14 @@ export async function runProvisionFlow(
           `install the ai.sanctuaryprotocol.agent-harness LaunchDaemon, then arm with ` +
           `--agent-uid=<new uid> --ceiling=${ctx.ceiling}.`,
   );
+  // Egress-grant plan (design section 3.1(b)): every allow rule this flow will
+  // provision is NAMED before the one confirm, with the exfil-risk marking on
+  // messaging hosts (the operator signs that grant knowingly) and the
+  // broad-authority marking on shared gateways (MED-1). Printed on BOTH
+  // branches -- the alreadyDedicated path provisions egress too.
+  for (const line of renderEgressPlanLines(ctx.harnessEndpoints)) {
+    ops.print(line);
+  }
 
   // Step 3: ONE confirm, scoped to the privileged sub-steps only (fix H4;
   // fix R4 extends this ceremony to the alreadyDedicated branch, since arm
@@ -542,6 +632,71 @@ export async function runProvisionFlow(
       : "Castle Wall policy daemon reachable for this fortress; ready to arm.",
   );
 
+  // Step 6.7 (confined-agent egress, design section 5 layer 1): provision the
+  // harness's signed egress allow rules and statically verify them BEFORE
+  // arming. The policy daemon is reachable by construction (step 6.5 just
+  // passed), so the publish rides the existing pinned-signer reload path.
+  // Failure aborts before arm -- arming a wall the agent cannot function
+  // behind is the exact confine-into-silence outcome this step exists to
+  // prevent -- and emits the DISTINCT `egress_provision_refused` audit op so
+  // a fleet operator can prove the refusal happened and why.
+  let egressProvisionedThisRun = false;
+  let provisionedEgressRuleIds: string[] = [];
+  const egress = await ops.provisionEgress();
+  if (egress.checks !== undefined) {
+    for (const line of renderEndpointCheckLines(egress.checks)) {
+      ops.print(line);
+    }
+  }
+  if (!egress.ok) {
+    await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
+      stage: "provision-egress",
+      harness: ctx.agentId,
+      agent_uid: uid,
+      declared_endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
+      checks: egress.checks ?? [],
+      dns_rule_present: egress.dnsRulePresent ?? false,
+      error: egress.error,
+      disarm_outcome: "not-armed",
+    });
+    // The publish may have PARTIALLY landed before the static verify failed;
+    // scrub so a refused run never leaves orphan grants (design section 6).
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      daemonBootstrappedThisRun,
+      policyDaemonFreshlyInstalled,
+      true,
+    );
+    return {
+      kind: "aborted",
+      stage: "provision-egress",
+      reason: withDaemonTeardownNote(
+        `refusing to arm: the egress path for the confined agent could not be provisioned and verified ` +
+          `(${egress.error}). The wall was NOT armed; the agent would have been confined into ` +
+          `non-functionality. ` +
+          describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
+        td.daemonTeardownError,
+        td.policyDaemonTeardownError,
+        td.egressScrubError,
+      ),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
+      daemonTeardownFailed:
+        td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      accountCreated,
+    };
+  }
+  egressProvisionedThisRun = true;
+  provisionedEgressRuleIds = egress.ruleIds;
+  ops.print(
+    `Egress provisioned: ${egress.ruleIds.length} signed allow rule(s) published for the agent ` +
+      `(${egress.ruleIds.join(", ")}); scoped DNS allow derived.`,
+  );
+
   // Step 7: verify BEFORE arming (fix B2 ordering). FIX G5 (2026-07-07
   // re-gate 3): this proves DNS-resolvability + every moved credential
   // present-and-readable-by-target-uid (see verify.ts's module doc), NOT
@@ -553,12 +708,14 @@ export async function runProvisionFlow(
     // FIX (round 5, item N3): the daemon is LIVE by now (install-daemon
     // succeeded above); tear it down before restoring the re-home so this
     // fail-closed abort does not leave the daemon running under the dedicated
-    // account.
+    // account. Egress rules provisioned this run are scrubbed too (no orphan
+    // grants on a failed run, design section 6).
     const td = await teardownDaemonAndRestore(
       ops,
       rehomeResults,
       daemonBootstrappedThisRun,
       policyDaemonFreshlyInstalled,
+      egressProvisionedThisRun,
     );
     return {
       kind: "aborted",
@@ -573,6 +730,7 @@ export async function runProvisionFlow(
           describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
         td.daemonTeardownError,
         td.policyDaemonTeardownError,
+        td.egressScrubError,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
@@ -590,17 +748,24 @@ export async function runProvisionFlow(
   if (!existenceCheck.ok) {
     // FIX (round 5, item N3): daemon is live; tear it down on this abort. Bug B:
     // also tear down a freshly-installed policy daemon (untouched if it
-    // pre-existed or was already reachable).
+    // pre-existed or was already reachable). Provisioned egress rules are
+    // scrubbed (no orphan grants on a failed run).
     const td = await teardownDaemonAndRestore(
       ops,
       rehomeResults,
       daemonBootstrappedThisRun,
       policyDaemonFreshlyInstalled,
+      egressProvisionedThisRun,
     );
     return {
       kind: "aborted",
       stage: "uid-existence-gate",
-      reason: withDaemonTeardownNote(existenceCheck.reason, td.daemonTeardownError, td.policyDaemonTeardownError),
+      reason: withDaemonTeardownNote(
+        existenceCheck.reason,
+        td.daemonTeardownError,
+        td.policyDaemonTeardownError,
+        td.egressScrubError,
+      ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
@@ -671,12 +836,23 @@ export async function runProvisionFlow(
         disarmNote = (disarmErr as Error).message;
       }
     }
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun, tearDownPolicyDaemon);
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      daemonBootstrappedThisRun,
+      tearDownPolicyDaemon,
+      egressProvisionedThisRun,
+    );
     return {
       kind: "aborted",
       stage: "arm",
       reason: withArmWallStateNote(
-        withDaemonTeardownNote(armResult.error, td.daemonTeardownError, td.policyDaemonTeardownError),
+        withDaemonTeardownNote(
+          armResult.error,
+          td.daemonTeardownError,
+          td.policyDaemonTeardownError,
+          td.egressScrubError,
+        ),
         wallMayBeArmed,
         disarmNote,
       ),
@@ -734,14 +910,106 @@ export async function runProvisionFlow(
         disarmError: (disarmErr as Error).message,
       };
     }
+    // No orphan grants on a rolled-back run (design section 6): scrub the
+    // egress rules this run provisioned. Best-effort + fail-loud (folded into
+    // the reason); the wall is already down, so a surviving rule is inert
+    // until a future arm, but it must still be surfaced, never silent.
+    const scrubNote = await scrubEgressBestEffort(ops, egressProvisionedThisRun);
     return {
       kind: "armed-then-rolled-back",
       uid,
-      reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.`,
+      reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.${scrubNote}`,
     };
   }
 
+  // Step 11 (confined-agent egress, design section 5): the REAL post-arm
+  // egress check, run AS THE AGENT UID through the ARMED wall -- the check
+  // the 2026-07-09 drill proved the DNS-only probes above cannot make
+  // ((a) static without (b) dynamic is theater). Every declared endpoint
+  // must complete a TCP+TLS connect as the agent uid, and the non-listed
+  // negative control must stay BLOCKED. Any failure triggers the same fix-B2
+  // fast-disarm rollback as step 10, plus the provisioned-rule scrub, and is
+  // reported as the DISTINCT local outcome `egress-unprovisioned-rolled-back`.
+  const egressVerify = await ops.verifyAgentEgressAfterArm(uid);
+  for (const line of renderAgentEgressReportLines(egressVerify)) {
+    ops.print(line);
+  }
+  if (!egressVerify.ok) {
+    const failedRows = egressVerify.rows.filter((r) => !r.pass).map((r) => r.name);
+    const egressBaseReason =
+      `post-arm as-uid egress verification failed for: ${failedRows.join(", ")}. ` +
+      `A process running as the agent uid must reach every declared endpoint through the armed wall ` +
+      `and must NOT reach the negative control; anything less confines the agent into ` +
+      `non-functionality or proves nothing about confinement.`;
+    let disarmed = false;
+    try {
+      await ops.disarm();
+      disarmed = true;
+    } catch (disarmErr) {
+      await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
+        stage: "post-arm-as-uid-verify",
+        harness: ctx.agentId,
+        agent_uid: uid,
+        declared_endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
+        probe_rows: egressVerify.rows,
+        disarm_outcome: "disarm-failed",
+      });
+      return {
+        kind: "armed-rollback-failed",
+        uid,
+        reason: egressBaseReason,
+        disarmError: (disarmErr as Error).message,
+      };
+    }
+    const scrubNote = await scrubEgressBestEffort(ops, egressProvisionedThisRun);
+    await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
+      stage: "post-arm-as-uid-verify",
+      harness: ctx.agentId,
+      agent_uid: uid,
+      declared_endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
+      probe_rows: egressVerify.rows,
+      disarm_outcome: "fast-disarmed",
+      rules_scrubbed: scrubNote === "",
+    });
+    return {
+      kind: "egress-unprovisioned-rolled-back",
+      uid,
+      reason: `${egressBaseReason} Fast-disarmed rather than leave a bricked-or-unconfined agent.${scrubNote}`,
+      scrubbed: disarmed && scrubNote === "",
+    };
+  }
+
+  await ops.auditEgress(EGRESS_PROVISIONED_AUDIT_OP, {
+    harness: ctx.agentId,
+    agent_uid: uid,
+    rule_ids: provisionedEgressRuleIds,
+    endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
+    probe_rows: egressVerify.rows,
+  });
   return { kind: "armed", uid };
+}
+
+/**
+ * Best-effort provisioned-rule scrub for the rolled-back branches. Returns
+ * "" on success (or when nothing was provisioned this run), or a loud
+ * manual-recovery note to append to the outcome reason on failure. Never
+ * throws.
+ */
+async function scrubEgressBestEffort(
+  ops: ProvisionFlowOps,
+  egressProvisionedThisRun: boolean,
+): Promise<string> {
+  if (!egressProvisionedThisRun) return "";
+  try {
+    await ops.scrubProvisionedEgress();
+    return "";
+  } catch (err) {
+    return (
+      ` (NOTE: the provisioned egress allow rules could NOT be scrubbed automatically: ` +
+      `${(err as Error).message}. They are inert while the wall is disarmed, but remove the ` +
+      `provisioned-* rule files under <fortress>/policy/egress/rules/ before re-arming manually.)`
+    );
+  }
 }
 
 function describeRestoreForReason(
@@ -817,6 +1085,7 @@ async function teardownDaemonAndRestore(
   results: RehomeStepResult[],
   tearDownDaemon: boolean,
   tearDownPolicyDaemon: boolean,
+  scrubEgress = false,
 ): Promise<{
   rolledBack: boolean | "partial";
   backupPaths: string[];
@@ -824,6 +1093,7 @@ async function teardownDaemonAndRestore(
   failedPaths: string[];
   daemonTeardownError?: string;
   policyDaemonTeardownError?: string;
+  egressScrubError?: string;
 }> {
   // FIX (round 5 / R6-3): only tear the harness daemon down when THIS run stood
   // it up (the fresh-provision path). On the alreadyDedicated re-run path the
@@ -856,6 +1126,17 @@ async function teardownDaemonAndRestore(
       policyDaemonTeardownError = (err as Error).message;
     }
   }
+  // Confined-agent egress (design section 6): rules this run provisioned are
+  // scrubbed on abort so a failed run never leaves orphan grants. Best-effort
+  // + fail-loud (folded into the abort reason), never blocks the restore.
+  let egressScrubError: string | undefined;
+  if (scrubEgress) {
+    try {
+      await ops.scrubProvisionedEgress();
+    } catch (err) {
+      egressScrubError = (err as Error).message;
+    }
+  }
   const restore = await safeRestore(ops, results);
   return {
     rolledBack: restore.rolledBack,
@@ -864,6 +1145,7 @@ async function teardownDaemonAndRestore(
     failedPaths: restore.failedPaths,
     daemonTeardownError,
     policyDaemonTeardownError,
+    egressScrubError,
   };
 }
 
@@ -878,6 +1160,7 @@ function withDaemonTeardownNote(
   reason: string,
   daemonTeardownError?: string,
   policyDaemonTeardownError?: string,
+  egressScrubError?: string,
 ): string {
   const notes: string[] = [];
   if (daemonTeardownError !== undefined) {
@@ -891,6 +1174,12 @@ function withDaemonTeardownNote(
     notes.push(
       `the freshly-installed Castle Wall policy (boot) daemon could NOT be torn down automatically: ${policyDaemonTeardownError}. ` +
         `A root LaunchDaemon may still be running -- run 'sudo sanctuary castle-wall uninstall-boot --yes' to remove it before re-running.`,
+    );
+  }
+  if (egressScrubError !== undefined) {
+    notes.push(
+      `the provisioned egress allow rules could NOT be scrubbed automatically: ${egressScrubError}. ` +
+        `Remove the provisioned-* rule files under <fortress>/policy/egress/rules/ before re-arming manually.`,
     );
   }
   if (notes.length === 0) {

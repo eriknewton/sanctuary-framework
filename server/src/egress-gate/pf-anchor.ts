@@ -8,8 +8,12 @@
  * drops ALL agent-uid loopback traffic except TCP to the gate port. The
  * exact per-uid pass/block shape was PROVEN on Tahoe (macOS 26.5.1) on
  * 2026-07-02, N=3, coordinator-verified (drill-evidence-2026-07-01/
- * unified-protect-keystone/RESULTS.md). Drill acceptance for THIS composed
- * build is PENDING, and the non-Tahoe macOS leg is still owed.
+ * unified-protect-keystone/RESULTS.md). The COMPOSED build (this module's
+ * armPfAnchor / checkPfAnchorLiveness / disarmPfAnchor plus the gate) was
+ * then drilled PASS N=3 on BOTH macOS families on 2026-07-03 (Tahoe 26.5.1
+ * arm64 + Sonoma 14.6.1 x86_64); see
+ * docs/audit/unified-protect-enforcement-status.md for the captured evidence
+ * and the legs still owed (sysext-armed full-design console drills, Slice 4).
  *
  * The anchor text is generated from the SAME `ExclusiveEgressGatePolicy`
  * that derives the NEFilter manifest allow rule (single source, Slice 8);

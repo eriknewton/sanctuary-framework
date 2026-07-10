@@ -32,6 +32,19 @@ export interface UnprovisionOps {
   uninstallHarnessDaemon(): Promise<void>;
   /** Disarm the wall (production: `runDisable` / `castle-wall disable`). Unconditional, no preconditions. */
   disarm(): Promise<void>;
+  /**
+   * Remove every `provisioned-<harness>-*` egress allow rule from the signed
+   * manifest source and VERIFY none survive (production:
+   * `scrubProvisionedEgressRules`, egress.ts). Rules follow the AGENT
+   * lifecycle, not the arm lifecycle (design section 6): a bare disarm keeps
+   * them (inert while disarmed, correct again at re-arm), but unprovision
+   * removes the agent's provisioning, so its grants must not survive as
+   * orphans. Ordering note (review L2): account REMOVAL is explicitly out of
+   * scope here (a separate, Erik-present build); when that build lands, this
+   * scrub MUST run before the account deletion so a stale allow never
+   * outlives the account. Idempotent + fail-loud.
+   */
+  scrubProvisionedEgressRules(): Promise<void>;
 }
 
 /** What to roll back: the daemon/disarm ops plus the re-home steps to restore. */
@@ -45,7 +58,7 @@ export interface UnprovisionInput {
 
 /** Outcome of one rollback step, for reporting. */
 export interface UnprovisionStepOutcome {
-  step: "disarm" | "uninstall-daemon" | "restore-rehome";
+  step: "disarm" | "uninstall-daemon" | "scrub-egress-rules" | "restore-rehome";
   ok: boolean;
   error?: string;
 }
@@ -78,6 +91,18 @@ export async function unprovision(input: UnprovisionInput): Promise<UnprovisionS
     outcomes.push({ step: "uninstall-daemon", ok: true });
   } catch (err) {
     outcomes.push({ step: "uninstall-daemon", ok: false, error: (err as Error).message });
+  }
+
+  // Confined-agent egress (design section 6): scrub the harness's
+  // provisioned allow rules so unprovision never leaves orphan grants in the
+  // signed manifest source. Runs AFTER disarm (the wall stops enforcing
+  // first) and after daemon teardown; fail-loud per step like every other
+  // rollback action here.
+  try {
+    await input.unprovisionOps.scrubProvisionedEgressRules();
+    outcomes.push({ step: "scrub-egress-rules", ok: true });
+  } catch (err) {
+    outcomes.push({ step: "scrub-egress-rules", ok: false, error: (err as Error).message });
   }
 
   try {

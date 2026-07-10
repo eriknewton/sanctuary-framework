@@ -50,6 +50,16 @@ import {
   type RehomeStepResult,
   type EndpointProbeTarget,
   type PolicyDaemonAction,
+  HERMES_ENDPOINT_SET,
+  publishProvisionedEgressRules,
+  readEgressRulesFromDisk,
+  verifyProvisionedEgressStatically,
+  scrubProvisionedEgressRules,
+  buildAgentEgressProbeSpecs,
+  buildAgentEgressReport,
+  asUidTlsProbeArgv,
+  asUidProbeReachableDecision,
+  type AgentEgressVerifyReport,
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
@@ -145,11 +155,17 @@ async function pollSocketReachable(
 // `access()` call -- see `credentialReadableAsUidDecision` below). Proving that the
 // re-homed agent, running AS the new uid, actually reaches these hosts
 // end-to-end is the Erik-present drill's job, never this module's.
-const HERMES_ENDPOINT_HOSTS: ReadonlyArray<{ name: string; host: string }> = Object.freeze([
-  { name: "LLM (Venice)", host: "api.venice.ai" },
-  { name: "Telegram Bot API", host: "api.telegram.org" },
-  { name: "Google MCP (Workspace APIs)", host: "www.googleapis.com" },
-]);
+// ONE LIST, TWO CONSUMERS (confined-agent egress design, section 3.1): the
+// DNS-probe host list is DERIVED from the same `HarnessEndpointSet` the
+// rule-provisioning step publishes signed allow rules from
+// (`castle-wall/provision/egress.ts`), so the granted set and the probed set
+// can never drift. MED-1: the previous hand-maintained copy of this list
+// carried `www.googleapis.com`, Google's SHARED multi-API gateway; the
+// endpoint set now declares the PER-SERVICE Google hosts instead (Gmail,
+// Calendar, OAuth) -- see HERMES_ENDPOINT_SET for the honesty notes.
+const HERMES_ENDPOINT_HOSTS: ReadonlyArray<{ name: string; host: string }> = Object.freeze(
+  HERMES_ENDPOINT_SET.endpoints.map(({ name, host }) => ({ name, host })),
+);
 
 /**
  * DNS-resolves-only reachability probe for one hostname (fix R1). This is
@@ -1199,6 +1215,105 @@ export async function runAutoProvisionForWrap(
         throw new Error(`castle-wall uninstall-boot exited ${code}`);
       }
     },
+    // Confined-agent egress (design section 5 layer 1): publish the Hermes
+    // endpoint set as provenance-tagged signed allow rules through the
+    // reachable policy daemon's pinned-signer reload path, then STATICALLY
+    // verify each declared endpoint evaluates to an allow against the rules
+    // READ BACK from the persisted signing source (never in-memory intent),
+    // plus the #380 derived-DNS presence. Fail-closed: any publish, reload,
+    // or verify failure returns ok:false and the orchestrator aborts before
+    // arm.
+    provisionEgress: async () => {
+      const { requestPolicyReload } = await import("../cli/castle-wall.js");
+      const reloadPolicy = async () => {
+        const result = await requestPolicyReload(wallFortressPath, "darwin");
+        return result.ok ? { ok: true as const } : { ok: false as const, error: result.error };
+      };
+      const published = await publishProvisionedEgressRules({
+        fortressPath: wallFortressPath,
+        endpointSet: HERMES_ENDPOINT_SET,
+        reloadPolicy,
+      });
+      if (!published.ok) {
+        return { ok: false as const, error: published.error };
+      }
+      let staticVerify;
+      try {
+        const persistedRules = await readEgressRulesFromDisk(wallFortressPath);
+        const { getServers } = await import("node:dns");
+        staticVerify = verifyProvisionedEgressStatically(
+          persistedRules,
+          HERMES_ENDPOINT_SET,
+          getServers(),
+          new Date().toISOString(),
+        );
+      } catch (err) {
+        return {
+          ok: false as const,
+          error: `static egress verification could not read back the persisted ruleset: ${(err as Error).message}`,
+        };
+      }
+      if (!staticVerify.ok) {
+        const failed = staticVerify.checks.filter((c) => !c.allowed).map((c) => c.name);
+        return {
+          ok: false as const,
+          error:
+            `static egress verification failed: ` +
+            (failed.length > 0 ? `no allow match for ${failed.join(", ")}; ` : "") +
+            (staticVerify.dnsRulePresent
+              ? ""
+              : "the scoped DNS allow (#380) could not be derived (resolver set unknown or no hostname allows)"),
+          checks: staticVerify.checks,
+          dnsRulePresent: staticVerify.dnsRulePresent,
+        };
+      }
+      return {
+        ok: true as const,
+        ruleIds: published.ruleIds,
+        checks: staticVerify.checks,
+        dnsRulePresent: staticVerify.dnsRulePresent,
+      };
+    },
+    // Scrub every provisioned-hermes-* rule from the signing source (verified
+    // read-back) and best-effort propagate to a still-running daemon. Used on
+    // abort/rollback so a failed run never leaves orphan grants.
+    scrubProvisionedEgress: async () => {
+      const { requestPolicyReload } = await import("../cli/castle-wall.js");
+      await scrubProvisionedEgressRules({
+        fortressPath: wallFortressPath,
+        harnessId: agentId,
+        reloadPolicy: async () => {
+          const result = await requestPolicyReload(wallFortressPath, "darwin");
+          return result.ok ? { ok: true as const } : { ok: false as const, error: result.error };
+        },
+      });
+    },
+    // Post-arm as-uid egress verification (design section 5): spawn a probe
+    // process under the AGENT uid (`sudo -n -u '#<uid>'`; the wall and the
+    // classifier key on the REAL uid) that completes a TCP+TLS connect to
+    // each declared endpoint through the ARMED wall, plus the non-listed
+    // negative control which must stay BLOCKED. Fail-closed: a spawn error,
+    // nonzero exit, or timeout reads as blocked, and an empty declared set
+    // fails the report outright (F1 parity).
+    verifyAgentEgressAfterArm: async (uid) => runAgentEgressProbesAsUid(uid, execFileAsync),
+    // Egress audit records (distinct LOCAL operation strings) through the
+    // same best-effort CLI audit path the arm/disarm records use. Never
+    // throws: an audit-write failure must not mask the outcome it records.
+    auditEgress: async (operation, details) => {
+      try {
+        const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+        await appendCastleWallCliAuditBestEffort(
+          operation,
+          { source: "sanctuary-protect", ...details },
+          wallFortressPath,
+          process.env,
+          process.stderr,
+        );
+      } catch {
+        // Best-effort by contract (the helper itself already warns; this
+        // catch covers the dynamic import failing).
+      }
+    },
     // FIX R1 (BLOCKER, fix-round 2): honest, fail-closed probe list -- see
     // `hermesEndpointProbes` above. `resolvedAgentUidGid` is always set by
     // `installHarnessDaemon` before this is called (steps 6 -> 7); if it is
@@ -1299,6 +1414,9 @@ export async function runAutoProvisionForWrap(
         isTty: options.isTty,
         preAnsweredProvision: options.preAnsweredProvision,
         fortressPath: wallFortressPath,
+        // Confined-agent egress: the SAME endpoint set the provisioning +
+        // probes consume, threaded for the Tier-1 confirm plan-print.
+        harnessEndpoints: HERMES_ENDPOINT_SET,
       },
       ops,
     ),
@@ -1308,6 +1426,43 @@ export async function runAutoProvisionForWrap(
 }
 
 // ── Real op implementations (drill-only side effects; never exercised by CI) ──
+
+/**
+ * Run the post-arm as-uid egress probes (confined-agent egress design,
+ * section 5): for each declared Hermes endpoint plus the negative control,
+ * spawn `sudo -n -u '#<uid>' curl https://<host>:<port>/` and decide
+ * reachability from the exit code (0 = reachable; anything else, including a
+ * spawn failure, = blocked/unverified -- fail-closed). This whole module
+ * runs as ROOT under `sudo sanctuary protect`, so `sudo -u` genuinely
+ * changes the REAL uid the wall keys on; `-n` (non-interactive) means a
+ * sudoers surprise fails loudly instead of hanging on a prompt. Exported for
+ * the unit suite, which drives it with an injected execFile and never spawns
+ * real processes.
+ */
+export async function runAgentEgressProbesAsUid(
+  uid: number,
+  execFileFn: (
+    file: string,
+    args: string[],
+  ) => Promise<{ stdout: string; stderr: string }>,
+): Promise<AgentEgressVerifyReport> {
+  const specs = buildAgentEgressProbeSpecs(HERMES_ENDPOINT_SET);
+  const observed: boolean[] = [];
+  for (const spec of specs) {
+    const { file, args } = asUidTlsProbeArgv(uid, spec.host, spec.port);
+    let reachable: boolean;
+    try {
+      await execFileFn(file, args);
+      // execFile resolves only on exit code 0.
+      reachable = asUidProbeReachableDecision(0);
+    } catch {
+      // Nonzero exit, signal death, or spawn failure: blocked/unverified.
+      reachable = false;
+    }
+    observed.push(reachable);
+  }
+  return buildAgentEgressReport(specs, observed);
+}
 
 async function pathExists(path: string): Promise<boolean> {
   try {

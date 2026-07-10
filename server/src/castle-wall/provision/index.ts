@@ -82,3 +82,42 @@ export type {
 
 export { resolvePolicyDaemonAction } from "./policy-daemon.js";
 export type { PolicyDaemonState, PolicyDaemonAction } from "./policy-daemon.js";
+
+export {
+  HERMES_ENDPOINT_SET,
+  EGRESS_PROVISIONED_AUDIT_OP,
+  EGRESS_PROVISION_REFUSED_AUDIT_OP,
+  EGRESS_PROBE_FAILED_AUDIT_OP,
+  AGENT_EGRESS_NEGATIVE_CONTROL_HOST,
+  provisionedRuleIdPrefix,
+  provisionedRuleId,
+  endpointIsMessagingExfilRisk,
+  buildProvisionedEgressRules,
+  renderEgressPlanLines,
+  renderEndpointCheckLines,
+  renderAgentEgressReportLines,
+  verifyProvisionedEgressStatically,
+  egressRulesDir,
+  readEgressRulesFromDisk,
+  publishProvisionedEgressRules,
+  scrubProvisionedEgressRules,
+  buildAgentEgressProbeSpecs,
+  buildAgentEgressReport,
+  asUidTlsProbeArgv,
+  asUidProbeReachableDecision,
+} from "./egress.js";
+export type {
+  HarnessEndpoint,
+  HarnessEndpointSet,
+  HarnessEndpointRiskClass,
+  EndpointStaticCheck,
+  StaticEgressVerifyResult,
+  PolicyReloadTrigger,
+  PublishProvisionedEgressInput,
+  PublishProvisionedEgressResult,
+  ScrubProvisionedEgressInput,
+  ScrubProvisionedEgressResult,
+  AgentEgressProbeSpec,
+  AgentEgressProbeRow,
+  AgentEgressVerifyReport,
+} from "./egress.js";

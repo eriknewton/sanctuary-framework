@@ -61,9 +61,22 @@ public enum AllowlistEvaluator {
             return .allow(matchedRuleId: baselineRuleId(flow: flow, operatorBaseline: operatorBaseline))
         }
 
+        // HIGH-1 hardening (confined-agent egress design 2026-07-10,
+        // adversarial-review must-fix): in UID mode, `.unattributed` is the
+        // FAIL-CLOSED bucket and must NEVER earn an allow-disposition match.
+        // Publishing unscoped agent allow rules (the egress provisioning
+        // build) would otherwise invert it to fail-OPEN for exfil-capable
+        // hosts -- any flow whose audit token fails to decode would inherit
+        // the agent's grants. Deny rules keep applying and prompt rules keep
+        // surfacing for operator decision; the bucket simply stops
+        // benefiting from allows. KEYED ON UID-MODE classification: NAT
+        // mode, where `.unattributed` flows are common (unsigned processes),
+        // keeps its existing semantics unchanged. No wire or schema change.
+        let suppressAllowMatches = origin == .unattributed && agentOrigin?.mode == .uid
+
         // `.agent` and `.unattributed` route to the unchanged default-deny +
         // allowlist evaluation. Default-deny on no match is preserved.
-        return evaluate(flow: flow, rules: rules)
+        return evaluate(flow: flow, rules: rules, suppressAllowMatches: suppressAllowMatches)
     }
 
     static func baselineRuleId(
@@ -97,9 +110,16 @@ public enum AllowlistEvaluator {
     }
 
     /// Evaluate a flow against the current manifest snapshot.
+    ///
+    /// `suppressAllowMatches` (HIGH-1 hardening, default `false` so every
+    /// existing caller is unchanged): when `true`, allow-disposition rules
+    /// never match-through -- deny rules keep applying, prompt rules keep
+    /// surfacing, and the default-deny floor is preserved. Set ONLY for
+    /// uid-mode `.unattributed` flows by the origin-gated overload above.
     public static func evaluate(
         flow: FilterFlowDescriptor,
-        rules: [ManifestRule]
+        rules: [ManifestRule],
+        suppressAllowMatches: Bool = false
     ) -> EvaluationOutcome {
         var firstAllow: ManifestRule?
         var firstPrompt: ManifestRule?
@@ -109,7 +129,7 @@ public enum AllowlistEvaluator {
             case "deny":
                 return .drop(matchedRuleId: rule.id)
             case "allow":
-                if firstAllow == nil { firstAllow = rule }
+                if !suppressAllowMatches, firstAllow == nil { firstAllow = rule }
             case "prompt":
                 if firstPrompt == nil { firstPrompt = rule }
             default:
