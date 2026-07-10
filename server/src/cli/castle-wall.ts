@@ -1292,7 +1292,18 @@ export async function runDaemon(
     return runSafeModeDaemon(argv, ctx);
   }
 
-  const storagePath = resolveStoragePath(env);
+  // Honor the subcommand-level `--fortress <path>` flag, exactly like the
+  // sibling custody verbs (provision-pin, re-pin, audit-*). Before this the
+  // daemon resolved with `resolveStoragePath(env)`, which reads
+  // SANCTUARY_STORAGE_PATH only, so it silently DROPPED a trailing
+  // `--fortress` (the top-level extractor stops at the subcommand boundary
+  // and never sees it) and armed against the DEFAULT/home fortress instead of
+  // the operator-named one - a "never silently degrade" footgun (wrong-fortress
+  // unlock failures, or arming the wrong fortress). resolveFortressArg falls
+  // back to resolveStoragePath(env) when no flag is given, preserving prior
+  // env-var behavior (SANCTUARY_FORTRESS_PATH is promoted to
+  // SANCTUARY_STORAGE_PATH upstream in cli.ts).
+  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
   const localSign = env.SANCTUARY_CASTLE_LOCAL_SIGN === "1";
   const launchdBoot = argv.includes("--launchd");
 
@@ -1652,7 +1663,7 @@ export async function runDaemon(
  * throughout, so an unattended reboot can no longer brick the box.
  */
 export async function runSafeModeDaemon(
-  _argv: string[] = [],
+  argv: string[] = [],
   ctx: CastleWallCommandContext = {},
 ): Promise<number> {
   const out = ctx.out ?? process.stdout;
@@ -1675,7 +1686,14 @@ export async function runSafeModeDaemon(
     return 1;
   }
 
-  const storagePath = resolveStoragePath(env);
+  // Honor the subcommand-level `--fortress <path>` flag, matching runDaemon and
+  // the other custody verbs. `castle-wall daemon --safe-mode --fortress <path>`
+  // routes here with the full argv, so without this the safe-mode boot path
+  // silently dropped `--fortress` and armed against the default/home fortress -
+  // the same footgun runDaemon had. resolveFortressArg falls back to
+  // resolveStoragePath(env) when no flag is given, so the launchd boot path
+  // (SANCTUARY_STORAGE_PATH set in the plist, no flag) is unchanged.
+  const storagePath = resolveFortressArg(parseCastleWallArgs(argv).fortress, env);
   const fortressId = fortressIdFromStoragePath(storagePath);
 
   // 1. Boot token (the only secret safe mode holds). Fail-closed on absence or

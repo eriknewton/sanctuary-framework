@@ -171,6 +171,61 @@ describe("castle-wall CLI verbs", () => {
     expect(out.text().trim()).toBe(fingerprint(pub));
   });
 
+  // skipIf(non-darwin): `castle-wall daemon` is macOS-only (runDaemon returns
+  // early on non-darwin hosts), so this regression guard is scoped to darwin.
+  // Gating it keeps the Linux CI passing count - and therefore .test-baseline -
+  // unchanged, while still exercising the fix on the platform where the daemon
+  // actually runs.
+  it.skipIf(process.platform !== "darwin")("daemon honors the --fortress flag over a stale SANCTUARY_STORAGE_PATH", async () => {
+    // Regression: `runDaemon` resolved its target with `resolveStoragePath(env)`
+    // (SANCTUARY_STORAGE_PATH only), so a trailing `castle-wall daemon
+    // --fortress <path>` was silently DROPPED - the top-level extractor stops at
+    // the subcommand boundary and never sees it - and the daemon armed against
+    // the DEFAULT/home fortress instead of the operator-named one. It must honor
+    // the flag, like every sibling custody verb (provision-pin, re-pin, audit-*).
+    //
+    // Proven at the pin-read seam (no live daemon boot): the flag-named fortress
+    // holds a deliberately malformed 16-byte pinned pubkey and the stale env path
+    // holds NO pinned key. The fixed daemon reads the FLAG path and exits with the
+    // size error; the old (buggy) daemon read the stale path and would exit with
+    // "No pinned key found". The two outcomes are mutually exclusive, so the size
+    // error uniquely proves the flag path won.
+    const { fortressPath } = await makeFortress();
+    // Malformed pin in the FLAG fortress: triggers the 32-byte guard, which
+    // exits BEFORE any passphrase resolution / master establishment / host-app
+    // launch - i.e. before the daemon actually boots anything.
+    await writeFile(
+      join(fortressPath, "castle-pinned-pubkey.bin"),
+      Buffer.alloc(16, 7),
+      { mode: 0o600 },
+    );
+
+    // A DIFFERENT directory pointed at by SANCTUARY_STORAGE_PATH with NO pinned
+    // key. If the daemon (wrongly) honored the env path it would fail with the
+    // distinct "No pinned key found" message instead.
+    const staleStoragePath = await mkdtemp(join(tmpdir(), "sanctuary-cw-daemon-stale-"));
+    tempDirs.push(staleStoragePath);
+
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const code = await runDaemon(["--fortress", fortressPath], {
+      out,
+      err,
+      platform: "darwin",
+      env: {
+        SANCTUARY_STORAGE_PATH: staleStoragePath,
+        // Local-sign mode reads the per-fortress pin directly, keeping the seam
+        // deterministic (no root-owned global pin lookup).
+        SANCTUARY_CASTLE_LOCAL_SIGN: "1",
+      },
+    });
+
+    expect(code).toBe(1);
+    // The flag-named fortress was read (its 16-byte pin), NOT the stale env path.
+    expect(err.text()).toContain("Pinned public key must be 32 bytes (found 16)");
+    expect(err.text()).not.toContain("No pinned key found");
+  });
+
   it("status with pinned key", async () => {
     const { fortressPath } = await makeFortress();
     const pub = Buffer.from(new Uint8Array(32).fill(3));
