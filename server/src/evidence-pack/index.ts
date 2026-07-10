@@ -7,8 +7,10 @@
  * The quarterly law-firm evidence pack (slice 1, the walking skeleton).
  * Consumers import the module surface here, not the internal file layout.
  *
- * What this module owns: the calendar-quarter aggregation of audit activity
- * (the main NEW code; the shipped log counts by size, not by period),
+ * What this module owns: the typed read-outcome chokepoint (`read-outcome.ts`)
+ * that makes a false-census / overclaim state unrepresentable, the
+ * calendar-quarter aggregation of audit activity (the main NEW code; the
+ * shipped log counts by size, not by period) with the unmapped-op guard,
  * covered-window shortfall detection over the FIFO retention posture, the
  * CNA-mapped section renderers with honest coverage-basis language, the signed
  * manifest (reusing the EU AI Act bundle's signing discipline), and the PDF
@@ -17,15 +19,39 @@
 
 export * from "./types.js";
 export {
+  populated,
+  emptyVerified,
+  readFailed,
+  isComplete,
+  claimFromCompleteRead,
+  foldOutcome,
+} from "./read-outcome.js";
+export type {
+  ReadOutcome,
+  Complete,
+  Populated,
+  EmptyVerified,
+  ReadFailed,
+} from "./read-outcome.js";
+export {
   parseQuarterLabel,
   quarterLabel,
   currentQuarter,
   quarterWindow,
   isInWindow,
 } from "./quarter.js";
-export { aggregateQuarter, categorizeEntry, detectShortfall } from "./aggregate.js";
+export {
+  aggregateQuarter,
+  categorizeEntry,
+  detectShortfall,
+  GATE_DECISION_OP_CATEGORIES,
+} from "./aggregate.js";
 export { renderSections, PACK_DISCLAIMER } from "./sections.js";
-export type { PackSection } from "./sections.js";
+export type {
+  PackSection,
+  DiscreteExportView,
+  DiscreteExportsView,
+} from "./sections.js";
 export { buildInventorySnapshot, emptyInventorySnapshot } from "./inventory.js";
 export type {
   InventorySources,
@@ -42,7 +68,7 @@ export {
   AUDIT_CHAIN_FILENAME,
   ANCHOR_EVIDENCE_FILENAME,
 } from "./generate.js";
-export type { BuildEvidencePackDeps } from "./generate.js";
+export type { BuildEvidencePackDeps, AuditReadData } from "./generate.js";
 export {
   makePackSigner,
   signFile,

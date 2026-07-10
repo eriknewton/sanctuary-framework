@@ -4,25 +4,35 @@
  * Copyright 2026 Erik Newton
  * SPDX-License-Identifier: Apache-2.0
  *
- * Assembles the quarterly evidence pack (slice 1, the walking skeleton) from
- * already-resolved inputs: the quarter's audit entries, the retention facts,
- * and the fortress primary identity. This function is pure over its deps (it
- * performs no I/O and no server boot), so tests drive the real aggregation,
- * shortfall, rendering, PDF, and signing paths with synthetic fixtures and
- * never touch a real fortress. The CLI (`cli.ts`) resolves the deps from a
- * running server and writes the result to disk.
+ * Assembles the quarterly evidence pack from already-resolved inputs, each of
+ * which arrives as a typed {@link ReadOutcome} so a failed or absent read can
+ * never render as a definitive claim (see `read-outcome.ts`). This function is
+ * pure over its deps (no I/O, no server boot), so tests drive the real
+ * aggregation, shortfall, rendering, PDF, and signing paths with synthetic
+ * fixtures and never touch a real fortress. The CLI (`cli.ts`) resolves the
+ * deps from a running server and writes the result to disk.
  */
 
 import type { AuditEntry } from "../operational/audit-log.js";
 import type { StoredIdentity } from "../core/identity.js";
 import { renderMarkdownDocumentsToPdf } from "../compliance/eu_ai_act/pdf.js";
 import type {
-  DiscreteExportsStatus,
+  CustodyFacts,
   EvidencePack,
   EvidencePackFile,
   EvidencePackInput,
+  EvidencePackManifest,
+  QuarterAggregation,
   RetentionFacts,
+  ShortfallReport,
 } from "./types.js";
+import {
+  emptyVerified,
+  foldOutcome,
+  populated,
+  readFailed,
+  type ReadOutcome,
+} from "./read-outcome.js";
 import { quarterWindow } from "./quarter.js";
 import { aggregateQuarter, detectShortfall } from "./aggregate.js";
 import { renderSections } from "./sections.js";
@@ -44,64 +54,87 @@ export const AUDIT_CHAIN_FILENAME = "audit-chain.jsonl";
 /** Basename of the gathered public-anchor evidence (slice 2). */
 export const ANCHOR_EVIDENCE_FILENAME = "anchor-evidence.json";
 
+/** The result of reading the audit log for the pack (one read: entries + retention). */
+export interface AuditReadData {
+  entries: readonly AuditEntry[];
+  retention: RetentionFacts;
+}
+
 /** Already-resolved inputs the generator needs (see module doc-comment). */
 export interface BuildEvidencePackDeps {
-  /** Every retained audit entry the quarter may draw from (the CLI passes all). */
-  entries: readonly AuditEntry[];
-  /** Retention posture, for covered-window shortfall detection. */
-  retention: RetentionFacts;
+  /**
+   * The audit-log read as a {@link ReadOutcome}: `populated` with the entries +
+   * retention when the log was read, or `read_failed` with a reason. On
+   * `read_failed`, the decision-count and coverage sections render
+   * incomplete-with-reason and the manifest coverage is marked non-determinable
+   * - never a false "no denials" or "full quarter covered".
+   */
+  audit: ReadOutcome<AuditReadData>;
   /** The fortress primary identity used to sign every emitted file. */
   signer: StoredIdentity;
   /** The fortress master key (used transiently for signing only). */
   masterKey: Uint8Array;
 }
 
+/** Default (not-collected) discrete exports: all verified-empty. */
+function defaultDiscreteExports(): {
+  transparency: ReadOutcome<string>;
+  audit_chain: ReadOutcome<string>;
+  anchor: ReadOutcome<string>;
+} {
+  return {
+    transparency: emptyVerified(),
+    audit_chain: emptyVerified(),
+    anchor: emptyVerified(),
+  };
+}
+
 /**
- * Build the complete in-memory evidence pack: the quarter aggregation, the
- * covered-window shortfall disclosure, the signed Markdown report, the signed
- * manifest, and the rendered PDF.
+ * Build the complete in-memory evidence pack. Every read-dependent claim flows
+ * through a {@link ReadOutcome}, so a `read_failed` source renders incomplete
+ * language and NEVER a definitive negative.
  */
 export function buildEvidencePack(
   input: EvidencePackInput,
   deps: BuildEvidencePackDeps
 ): EvidencePack {
   const window = quarterWindow(input.quarter);
-  const aggregation = aggregateQuarter(deps.entries, window);
   const generatedAt = input.generated_at_override ?? new Date().toISOString();
-  const shortfall = detectShortfall(window, deps.retention, {
-    generatedAt,
-    lastEntryAt: aggregation.last_entry_at,
-  });
 
-  // Resolve which discrete verification exports are present, so the appendix
-  // references concrete files and states honestly why any is absent.
-  const ex = input.discrete_exports ?? {};
-  const discreteStatus: DiscreteExportsStatus = {
-    transparency: ex.transparency_bundle_json
-      ? { included: true, filename: TRANSPARENCY_BUNDLE_FILENAME }
-      : {
-          included: false,
-          reason:
-            ex.transparency_absent_reason ??
-            "no signed transparency checkpoints were available to export from this fortress.",
-        },
-    audit_chain: ex.audit_chain_jsonl
-      ? { included: true, filename: AUDIT_CHAIN_FILENAME }
-      : {
-          included: false,
-          reason:
-            ex.audit_chain_absent_reason ??
-            "the audit-chain export could not be produced.",
-        },
-    anchor: ex.anchor_evidence_json
-      ? { included: true, filename: ANCHOR_EVIDENCE_FILENAME }
-      : {
-          included: false,
-          reason:
-            ex.anchor_absent_reason ??
-            "public transparency anchoring is opt-in and is not enabled on this install.",
-        },
-  };
+  // Derive the aggregation + shortfall from the audit read. Both are
+  // read_failed exactly when the audit read is - a failed read can never
+  // produce a zero-count aggregation or a "full quarter covered" bound.
+  const aggregation = foldOutcome<AuditReadData, ReadOutcome<QuarterAggregation>>(
+    deps.audit,
+    {
+      populated: (data) => populated(aggregateQuarter(data.entries, window)),
+      emptyVerified: () =>
+        readFailed("the audit log read returned no verifiable result."),
+      readFailed: (reason) => readFailed(reason),
+    }
+  );
+  const shortfall = foldOutcome<AuditReadData, ReadOutcome<ShortfallReport>>(
+    deps.audit,
+    {
+      populated: (data) => {
+        const lastEntryAt =
+          aggregation.status === "populated"
+            ? aggregation.value.last_entry_at
+            : null;
+        return populated(
+          detectShortfall(window, data.retention, { generatedAt, lastEntryAt })
+        );
+      },
+      emptyVerified: () =>
+        readFailed("the audit log read returned no verifiable result."),
+      readFailed: (reason) => readFailed(reason),
+    }
+  );
+
+  const custody: ReadOutcome<CustodyFacts> =
+    input.custody ?? readFailed("custody facts were not supplied for this pack.");
+  const inventory = input.inventory;
+  const discrete = input.discrete_exports ?? defaultDiscreteExports();
 
   const sections = renderSections({
     input,
@@ -111,15 +144,20 @@ export function buildEvidencePack(
     productName: PRODUCT_NAME,
     aggregation,
     shortfall,
-    discreteExports: discreteStatus,
+    custody,
+    inventory,
+    discreteExports: {
+      transparency: { outcome: discrete.transparency, filename: TRANSPARENCY_BUNDLE_FILENAME },
+      audit_chain: { outcome: discrete.audit_chain, filename: AUDIT_CHAIN_FILENAME },
+      anchor: { outcome: discrete.anchor, filename: ANCHOR_EVIDENCE_FILENAME },
+    },
   });
 
   // The signed Markdown report concatenates every section with a horizontal
   // rule between them. This is the artifact the manifest signs; the PDF is a
   // human-readable render of the same sections.
-  const reportMarkdown = sections
-    .map((s) => s.markdown)
-    .join("\n\n---\n\n") + "\n";
+  const reportMarkdown =
+    sections.map((s) => s.markdown).join("\n\n---\n\n") + "\n";
 
   const ds = makePackSigner(deps.signer, deps.masterKey);
   const reportFile: EvidencePackFile = signFile(
@@ -130,34 +168,45 @@ export function buildEvidencePack(
   );
   const files: EvidencePackFile[] = [reportFile];
 
-  // Sign each gathered discrete export into the manifest so the whole output
-  // directory is tamper-evident under one manifest. The transparency bundle
-  // ALSO carries its own Castle Wall signatures, verifiable independently.
-  if (ex.transparency_bundle_json) {
+  // Sign each gathered discrete export into the manifest (only the populated
+  // ones) so the whole output directory is tamper-evident under one manifest.
+  // The transparency bundle ALSO carries its own Castle Wall signatures.
+  if (discrete.transparency.status === "populated") {
     files.push(
-      signFile(
-        TRANSPARENCY_BUNDLE_FILENAME,
-        ex.transparency_bundle_json,
-        "application/json",
-        ds
-      )
+      signFile(TRANSPARENCY_BUNDLE_FILENAME, discrete.transparency.value, "application/json", ds)
     );
   }
-  if (ex.audit_chain_jsonl) {
+  if (discrete.audit_chain.status === "populated") {
     files.push(
-      signFile(AUDIT_CHAIN_FILENAME, ex.audit_chain_jsonl, "application/jsonl", ds)
+      signFile(AUDIT_CHAIN_FILENAME, discrete.audit_chain.value, "application/jsonl", ds)
     );
   }
-  if (ex.anchor_evidence_json) {
+  if (discrete.anchor.status === "populated") {
     files.push(
-      signFile(
-        ANCHOR_EVIDENCE_FILENAME,
-        ex.anchor_evidence_json,
-        "application/json",
-        ds
-      )
+      signFile(ANCHOR_EVIDENCE_FILENAME, discrete.anchor.value, "application/json", ds)
     );
   }
+
+  // Manifest coverage: a machine-readable UNION so a failed audit read cannot
+  // serialize a false "shortfall: false" - it serializes determinable:false.
+  const coverage = foldOutcome<ShortfallReport, EvidencePackManifest["coverage"]>(
+    shortfall,
+    {
+      populated: (s) => ({
+        determinable: true,
+        covered_from: s.covered_from,
+        covered_to_exclusive: s.covered_to_exclusive,
+        shortfall: s.shortfall,
+        in_progress_quarter: s.in_progress_quarter,
+        retention_at_cap: s.retention_at_cap,
+      }),
+      emptyVerified: () => ({
+        determinable: false,
+        reason: "the coverage window could not be determined.",
+      }),
+      readFailed: (reason) => ({ determinable: false, reason }),
+    }
+  );
 
   const manifest = buildPackManifest({
     productName: PRODUCT_NAME,
@@ -166,7 +215,7 @@ export function buildEvidencePack(
     generatedAt,
     signer: deps.signer,
     files,
-    shortfall,
+    coverage,
     ds,
   });
 

@@ -34,9 +34,14 @@ import type {
   InventoryAgentRow,
   InventoryMcpServerRow,
   InventoryObservedDestinationRow,
-  InventorySection,
   InventorySnapshot,
 } from "./types.js";
+import {
+  emptyVerified,
+  populated,
+  readFailed,
+  type ReadOutcome,
+} from "./read-outcome.js";
 
 /**
  * A configured upstream MCP server as read from the sovereignty profile.
@@ -117,45 +122,51 @@ function destinationRow(
 }
 
 /**
- * Map one source read outcome to an {@link InventorySection}, preserving the
- * read_ok / reason so the renderer can distinguish a genuine empty from a read
- * failure. A read failure yields NO rows (never a partial list presented as
- * complete). An undefined source is treated as a successful empty read.
+ * Map one source read outcome to a {@link ReadOutcome} over its row list,
+ * preserving the failure/empty distinction so the renderer prints honest
+ * language through the typed chokepoint. A read failure yields `read_failed`
+ * with the reason (NEVER a partial list presented as complete); a successful
+ * empty read yields `empty_verified` (the only state from which the renderer
+ * may assert a definitive "none"); a non-empty read yields `populated` with
+ * sorted rows. An undefined (not-collected) source is treated as a successful
+ * empty read.
  */
-function toSection<TRaw, TRow>(
+function toOutcome<TRaw, TRow>(
   read: InventorySourceRead<TRaw> | undefined,
   map: (raw: TRaw) => TRow,
   sort: (a: TRow, b: TRow) => number
-): InventorySection<TRow> {
+): ReadOutcome<TRow[]> {
   if (read === undefined) {
-    return { read_ok: true, rows: [] };
+    return emptyVerified();
   }
   if (!read.ok) {
-    return { read_ok: false, rows: [], reason: read.reason };
+    return readFailed(read.reason ?? "the source could not be read.");
+  }
+  if (read.records.length === 0) {
+    return emptyVerified();
   }
   const rows = read.records.map(map);
   rows.sort(sort);
-  return { read_ok: true, rows };
+  return populated(rows);
 }
 
 /**
  * Build an {@link InventorySnapshot} from the source read outcomes. Each output
- * section carries its own read_ok so the renderer prints honest language per
- * source. This function NEVER asserts completeness and NEVER presents a partial
- * read as a full one; it only shapes the rows Sanctuary actually read, sorted
- * for stable, deterministic output.
+ * section is a {@link ReadOutcome} so the renderer prints honest language per
+ * source through the typed chokepoint. This function NEVER asserts completeness
+ * and NEVER presents a partial read as a full one.
  */
 export function buildInventorySnapshot(
   sources: InventorySources
 ): InventorySnapshot {
   return {
-    agents: toSection(sources.agents, agentRow, (a, b) =>
+    agents: toOutcome(sources.agents, agentRow, (a, b) =>
       a.agent_id.localeCompare(b.agent_id)
     ),
-    mcp_servers: toSection(sources.proxyServers, mcpServerRow, (a, b) =>
+    mcp_servers: toOutcome(sources.proxyServers, mcpServerRow, (a, b) =>
       a.name.localeCompare(b.name)
     ),
-    observed_destinations: toSection(
+    observed_destinations: toOutcome(
       sources.observedDestinations,
       destinationRow,
       (a, b) => a.host.localeCompare(b.host) || (a.port ?? 0) - (b.port ?? 0)
@@ -163,11 +174,11 @@ export function buildInventorySnapshot(
   };
 }
 
-/** An all-sections successful-empty snapshot (for callers that pass no inventory). */
+/** An all-sources verified-empty snapshot (for callers that pass no inventory). */
 export function emptyInventorySnapshot(): InventorySnapshot {
   return {
-    agents: { read_ok: true, rows: [] },
-    mcp_servers: { read_ok: true, rows: [] },
-    observed_destinations: { read_ok: true, rows: [] },
+    agents: emptyVerified(),
+    mcp_servers: emptyVerified(),
+    observed_destinations: emptyVerified(),
   };
 }

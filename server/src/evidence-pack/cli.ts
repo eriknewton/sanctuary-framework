@@ -50,11 +50,18 @@ import {
   type ProxyServerView,
 } from "./inventory.js";
 import {
+  emptyVerified,
+  populated,
+  readFailed,
+  type ReadOutcome,
+} from "./read-outcome.js";
+import {
   buildEvidencePack,
   MANIFEST_FILENAME,
   PDF_FILENAME,
   PRODUCT_NAME,
   REPORT_FILENAME,
+  type AuditReadData,
 } from "./generate.js";
 import { currentQuarter, parseQuarterLabel, quarterLabel } from "./quarter.js";
 
@@ -146,50 +153,52 @@ async function gatherDiscreteExports(
   storage: StorageBackend,
   generatedAt: string
 ): Promise<EvidencePackDiscreteExports> {
-  const out: EvidencePackDiscreteExports = {};
-
-  try {
-    const checkpoints = await readPersistedCheckpoints(storage);
-    if (checkpoints.length === 0) {
-      out.transparency_absent_reason =
-        "no signed transparency checkpoints have been emitted on this fortress yet.";
-    } else {
+  const transparency: ReadOutcome<string> = await (async () => {
+    try {
+      const checkpoints = await readPersistedCheckpoints(storage);
+      if (checkpoints.length === 0) {
+        return emptyVerified();
+      }
       const keys = new Set(checkpoints.map((c) => c.public_key));
       if (keys.size !== 1) {
-        out.transparency_absent_reason =
-          "the checkpoints carry more than one signing key; a single-key bundle could not be assembled. Investigate the key history before publishing.";
-      } else {
-        const bundle: TransparencyBundle = {
-          format: TRANSPARENCY_BUNDLE_FORMAT,
-          exported_at: generatedAt,
-          public_key: [...keys][0]!,
-          checkpoints,
-        };
-        out.transparency_bundle_json = JSON.stringify(bundle, null, 2);
+        return readFailed(
+          "the checkpoints carry more than one signing key; a single-key bundle could not be assembled. Investigate the key history before publishing."
+        );
       }
+      const bundle: TransparencyBundle = {
+        format: TRANSPARENCY_BUNDLE_FORMAT,
+        exported_at: generatedAt,
+        public_key: [...keys][0]!,
+        checkpoints,
+      };
+      return populated(JSON.stringify(bundle, null, 2));
+    } catch (e) {
+      return readFailed(`the transparency bundle could not be gathered: ${(e as Error).message}`);
     }
-  } catch (e) {
-    out.transparency_absent_reason = `the transparency bundle could not be gathered: ${(e as Error).message}`;
-  }
+  })();
 
-  try {
-    const chunks: Buffer[] = [];
-    const sink = new Writable({
-      write(chunk, _enc, cb) {
-        chunks.push(Buffer.from(chunk));
-        cb();
-      },
-    });
-    await exportAuditChain(storage, sink);
-    out.audit_chain_jsonl = Buffer.concat(chunks).toString("utf8");
-  } catch (e) {
-    out.audit_chain_absent_reason = `the audit-chain export could not be gathered: ${(e as Error).message}`;
-  }
+  const audit_chain: ReadOutcome<string> = await (async () => {
+    try {
+      const chunks: Buffer[] = [];
+      const sink = new Writable({
+        write(chunk, _enc, cb) {
+          chunks.push(Buffer.from(chunk));
+          cb();
+        },
+      });
+      await exportAuditChain(storage, sink);
+      const jsonl = Buffer.concat(chunks).toString("utf8");
+      return jsonl.length > 0 ? populated(jsonl) : emptyVerified();
+    } catch (e) {
+      return readFailed(`the audit-chain export could not be gathered: ${(e as Error).message}`);
+    }
+  })();
 
-  out.anchor_absent_reason =
-    "public transparency anchoring (Sigstore/Rekor) is opt-in and is not enabled on this install.";
+  // Public anchoring is opt-in / default-off; a not-enabled install is a
+  // verified empty, not a read failure.
+  const anchor: ReadOutcome<string> = emptyVerified();
 
-  return out;
+  return { transparency, audit_chain, anchor };
 }
 
 interface EvidencePackCliOptions {
@@ -329,28 +338,36 @@ export async function runEvidencePack(args: string[]): Promise<void> {
     `${config.storage_path}/state`
   );
 
-  // Pull the full retained audit history (oldest first). The aggregation layer
-  // filters to the quarter window; the earliest retained entry drives the
-  // covered-window shortfall disclosure.
-  const { entries, total } = await auditLog.query({ limit: 1_000_000 });
-  const retentionConfig = auditLog.getRetentionConfig();
-  const earliest: string | null =
-    entries.length > 0 ? (entries[0] as AuditEntry).timestamp : null;
-  const retention: RetentionFacts = {
-    max_entries: retentionConfig.maxEntries,
-    retained_total: total,
-    earliest_retained_at: earliest,
-  };
+  // Pull the full retained audit history (oldest first) as a typed read
+  // outcome: a query failure becomes `read_failed` so the decision-count and
+  // coverage sections render incomplete-with-reason instead of a false "no
+  // denials" / "full quarter covered".
+  const audit: ReadOutcome<AuditReadData> = await (async () => {
+    try {
+      const { entries, total } = await auditLog.query({ limit: 1_000_000 });
+      const retentionConfig = auditLog.getRetentionConfig();
+      const earliest: string | null =
+        entries.length > 0 ? (entries[0] as AuditEntry).timestamp : null;
+      const retention: RetentionFacts = {
+        max_entries: retentionConfig.maxEntries,
+        retained_total: total,
+        earliest_retained_at: earliest,
+      };
+      return populated({ entries, retention });
+    } catch (e) {
+      return readFailed(`the audit log could not be read: ${(e as Error).message}`);
+    }
+  })();
 
   // Custody facts: no-outbound-by-default is true by architecture. The precise
-  // master-key custody mode is not yet surfaced by the server API, so slice 1
-  // reports it as unknown rather than guessing.
-  const custody: CustodyFacts = {
+  // master-key custody mode is not yet surfaced by the server API, so it is
+  // reported as unknown rather than guessing.
+  const custody: ReadOutcome<CustodyFacts> = populated({
     custody_mode: "unknown",
     no_outbound_by_default: true,
-  };
+  });
 
-  // Slice 2: enumerate the real AI-tool inventory and gather the discrete
+  // Enumerate the real AI-tool inventory and gather the discrete
   // third-party verification exports, both READ-ONLY from persisted state.
   const generatedAt = new Date().toISOString();
   const inventory = await gatherInventory(config, storage, masterKey, signer);
@@ -365,12 +382,7 @@ export async function runEvidencePack(args: string[]): Promise<void> {
     discrete_exports: discreteExports,
   };
 
-  const pack = buildEvidencePack(input, {
-    entries,
-    retention,
-    signer,
-    masterKey,
-  });
+  const pack = buildEvidencePack(input, { audit, signer, masterKey });
 
   await mkdir(outputDir, { recursive: true });
   await writeFile(
@@ -383,30 +395,53 @@ export async function runEvidencePack(args: string[]): Promise<void> {
   }
   await writeFile(join(outputDir, PDF_FILENAME), pack.pdf);
 
-  const shortfallLine = pack.shortfall.shortfall
-    ? "YES - disclosed in the report"
-    : "no";
   const summaryLines = [
     "",
     `[sanctuary evidence-pack] ${PRODUCT_NAME} generation complete.`,
     "",
   ];
-  if (pack.shortfall.in_progress_quarter) {
+  const sf = pack.shortfall;
+  if (sf.status === "read_failed") {
+    summaryLines.push(
+      `  WARNING: the audit log could not be read, so coverage and decision`,
+      `  counts could NOT be computed and are NOT asserted in the report.`,
+      `  Reason: ${sf.reason}`,
+      ""
+    );
+  } else if (sf.status === "populated" && sf.value.in_progress_quarter) {
     summaryLines.push(
       `  WARNING: ${label} is still IN PROGRESS. This pack covers only through`,
-      `  ${pack.shortfall.covered_to_exclusive} (the generation time), NOT the full`,
+      `  ${sf.value.covered_to_exclusive} (the generation time), NOT the full`,
       "  quarter. Do not present it to an insurer or client as a complete-quarter",
       "  report; regenerate after the quarter closes. The report is stamped PARTIAL.",
       ""
     );
   }
+  const coverageLine =
+    sf.status === "populated"
+      ? `${sf.value.covered_from} to ${sf.value.covered_to_exclusive} (exclusive)`
+      : "could not be determined (audit log unreadable)";
+  const shortfallLine =
+    sf.status === "populated"
+      ? sf.value.shortfall
+        ? "YES - disclosed in the report"
+        : "no"
+      : "indeterminate (audit log unreadable)";
+  const decisionsLine =
+    pack.aggregation.status === "populated"
+      ? String(pack.aggregation.value.total_in_window)
+      : "not computed (audit log unreadable)";
+  const partialTag =
+    sf.status === "populated" && sf.value.in_progress_quarter
+      ? " (PARTIAL - in progress)"
+      : "";
   summaryLines.push(
     `  Output directory: ${outputDir}`,
     `  Firm:             ${opts.firmName}`,
-    `  Quarter:          ${label}${pack.shortfall.in_progress_quarter ? " (PARTIAL - in progress)" : ""}`,
-    `  Covered window:   ${pack.shortfall.covered_from} to ${pack.shortfall.covered_to_exclusive} (exclusive)`,
+    `  Quarter:          ${label}${partialTag}`,
+    `  Covered window:   ${coverageLine}`,
     `  Covered-window shortfall: ${shortfallLine}`,
-    `  Control-point decisions in quarter: ${pack.aggregation.total_in_window}`,
+    `  Control-point decisions in quarter: ${decisionsLine}`,
     `  Signer:           ${pack.manifest.signer.did}`,
     "",
     "  NOT LEGAL ADVICE. Have the policy/attestation content reviewed by a",

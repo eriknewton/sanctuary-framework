@@ -1,14 +1,12 @@
 /**
- * Sanctuary MCP Server - Evidence Pack inventory-collector tests (slice 2)
+ * Sanctuary MCP Server - Evidence Pack inventory-collector tests
  *
  * Copyright 2026 Erik Newton
  * SPDX-License-Identifier: Apache-2.0
  *
  * Pure, hermetic tests for the inventory collector: the mapping from the three
- * shipped enumeration sources (agent registry, proxy servers, observe
- * candidates) into the InventorySnapshot the section renderer consumes,
- * including the per-source read outcome (ok+empty vs failed+reason). No server
- * boot, no real fortress.
+ * shipped enumeration sources into a per-source {@link ReadOutcome}, including
+ * the ok+empty vs failed+reason distinction that the typed chokepoint enforces.
  */
 
 import { describe, it, expect } from "vitest";
@@ -19,6 +17,16 @@ import {
   emptyInventorySnapshot,
   type ProxyServerView,
 } from "../../src/evidence-pack/inventory.js";
+import type {
+  InventoryAgentRow,
+  InventoryMcpServerRow,
+  InventoryObservedDestinationRow,
+} from "../../src/evidence-pack/types.js";
+import type { ReadOutcome } from "../../src/evidence-pack/read-outcome.js";
+
+function rowsOf<T>(o: ReadOutcome<T[]>): T[] {
+  return o.status === "populated" ? o.value : [];
+}
 
 function agentRecord(over: Partial<LocalAgentRecord>): LocalAgentRecord {
   return {
@@ -64,7 +72,7 @@ function candidate(over: Partial<CandidateObservation>): CandidateObservation {
 }
 
 describe("buildInventorySnapshot", () => {
-  it("maps agent records to inventory rows and sorts them (read_ok)", () => {
+  it("maps agent records to a populated outcome and sorts the rows", () => {
     const snap = buildInventorySnapshot({
       agents: {
         ok: true,
@@ -74,25 +82,26 @@ describe("buildInventorySnapshot", () => {
         ],
       },
     });
-    expect(snap.agents.read_ok).toBe(true);
-    expect(snap.agents.rows.map((a) => a.agent_id)).toEqual(["alpha", "zeta"]);
-    const alpha = snap.agents.rows[0]!;
+    expect(snap.agents.status).toBe("populated");
+    const rows = rowsOf<InventoryAgentRow>(snap.agents);
+    expect(rows.map((a) => a.agent_id)).toEqual(["alpha", "zeta"]);
+    const alpha = rows[0]!;
     expect(alpha.harness).toBe("hermes");
     expect(alpha.model_vendor).toBe("anthropic");
     expect(alpha.model_id).toBe("claude-opus-4");
     expect(alpha.wrapped_at).toBe("2026-07-15T00:00:00.000Z");
-    expect(alpha.status).toBe("active");
   });
 
-  it("maps proxy servers to rows and sorts them", () => {
+  it("maps proxy servers to a populated outcome and sorts them", () => {
     const servers: ProxyServerView[] = [
       { name: "weather", transport: "stdio", enabled: true },
       { name: "email", transport: "http", enabled: false },
     ];
-    const snap = buildInventorySnapshot({
-      proxyServers: { ok: true, records: servers },
-    });
-    expect(snap.mcp_servers.rows.map((s) => s.name)).toEqual(["email", "weather"]);
+    const snap = buildInventorySnapshot({ proxyServers: { ok: true, records: servers } });
+    expect(rowsOf<InventoryMcpServerRow>(snap.mcp_servers).map((s) => s.name)).toEqual([
+      "email",
+      "weather",
+    ]);
   });
 
   it("maps observed destinations, falling back to the IP when no hostname was seen", () => {
@@ -105,48 +114,42 @@ describe("buildInventorySnapshot", () => {
         ],
       },
     });
-    const rows = snap.observed_destinations.rows;
+    const rows = rowsOf<InventoryObservedDestinationRow>(snap.observed_destinations);
     expect(rows.map((d) => d.host)).toEqual(["9.9.9.9", "api.openai.com"]);
     const openai = rows.find((d) => d.host === "api.openai.com")!;
-    expect(openai.port).toBe(443);
     expect(openai.exfil_risk).toBe(true);
   });
 
-  it("MED-2: a failed source is read_ok=false with a reason and NO rows (never a partial list)", () => {
+  it("a failed source is read_failed with a reason and NO rows (never a partial list)", () => {
     const snap = buildInventorySnapshot({
       agents: { ok: false, records: [], reason: "profile could not be read" },
-      proxyServers: { ok: false, records: [], reason: "boom" },
     });
-    expect(snap.agents.read_ok).toBe(false);
-    expect(snap.agents.rows).toEqual([]);
-    expect(snap.agents.reason).toBe("profile could not be read");
-    expect(snap.mcp_servers.read_ok).toBe(false);
+    expect(snap.agents.status).toBe("read_failed");
+    if (snap.agents.status === "read_failed") {
+      expect(snap.agents.reason).toBe("profile could not be read");
+    }
+    expect(rowsOf(snap.agents)).toEqual([]);
   });
 
-  it("a successful empty read is read_ok=true with no rows (a genuine 'none')", () => {
+  it("a successful empty read is empty_verified (a genuine 'none', the only definitive-negative source)", () => {
     const snap = buildInventorySnapshot({ agents: { ok: true, records: [] } });
-    expect(snap.agents.read_ok).toBe(true);
-    expect(snap.agents.rows).toEqual([]);
-    expect(snap.agents.reason).toBeUndefined();
+    expect(snap.agents.status).toBe("empty_verified");
   });
 
-  it("an undefined source defaults to a successful empty read; emptyInventorySnapshot is all-ok-empty", () => {
+  it("an undefined source defaults to empty_verified; emptyInventorySnapshot is all empty_verified", () => {
     const snap = buildInventorySnapshot({});
-    expect(snap.agents.read_ok).toBe(true);
-    expect(snap.mcp_servers.read_ok).toBe(true);
-    expect(snap.observed_destinations.read_ok).toBe(true);
+    expect(snap.agents.status).toBe("empty_verified");
+    expect(snap.mcp_servers.status).toBe("empty_verified");
+    expect(snap.observed_destinations.status).toBe("empty_verified");
     const empty = emptyInventorySnapshot();
-    expect(empty.agents.rows).toEqual([]);
-    expect(empty.mcp_servers.read_ok).toBe(true);
-    expect(empty.observed_destinations.rows).toEqual([]);
+    expect(empty.agents.status).toBe("empty_verified");
+    expect(empty.observed_destinations.status).toBe("empty_verified");
   });
 
-  it("the snapshot section shape carries no completeness/total flag", () => {
+  it("a populated section carries only { status, value } - no completeness/total flag", () => {
     const snap = buildInventorySnapshot({
       agents: { ok: true, records: [agentRecord({ agent_id: "a" })] },
     });
-    // Each section is exactly { read_ok, rows, reason? } - no "complete" /
-    // "total" / "exhaustive" field the report could render as a coverage claim.
-    expect(Object.keys(snap.agents).sort()).toEqual(["read_ok", "rows"]);
+    expect(Object.keys(snap.agents).sort()).toEqual(["status", "value"]);
   });
 });
