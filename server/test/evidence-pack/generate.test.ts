@@ -238,22 +238,29 @@ describe("buildEvidencePack", () => {
       {
         ...baseInput(),
         inventory: {
-          agents: [
-            {
-              agent_id: "coding-bot",
-              harness: "claude_code",
-              model_vendor: "anthropic",
-              model_id: "claude-opus-4",
-              wrapped_at: "2026-07-15T00:00:00.000Z",
-              status: "active",
-            },
-          ],
-          mcp_servers: [
-            { name: "filesystem", transport: "stdio", enabled: true },
-          ],
-          observed_destinations: [
-            { host: "api.openai.com", port: 443, protocol: "tcp", times_seen: 3, exfil_risk: false },
-          ],
+          agents: {
+            read_ok: true,
+            rows: [
+              {
+                agent_id: "coding-bot",
+                harness: "claude_code",
+                model_vendor: "anthropic",
+                model_id: "claude-opus-4",
+                wrapped_at: "2026-07-15T00:00:00.000Z",
+                status: "active",
+              },
+            ],
+          },
+          mcp_servers: {
+            read_ok: true,
+            rows: [{ name: "filesystem", transport: "stdio", enabled: true }],
+          },
+          observed_destinations: {
+            read_ok: true,
+            rows: [
+              { host: "api.openai.com", port: 443, protocol: "tcp", times_seen: 3, exfil_risk: false },
+            ],
+          },
         },
       },
       { entries: [], retention: FULL_COVERAGE, signer, masterKey }
@@ -269,5 +276,48 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("never be read as an exhaustive list");
     expect(report).toContain("What is NOT in this inventory");
     expect(report).toContain("NOT a complete census");
+    // LOW-1: the closing note also warns of stale over-inclusion.
+    expect(report).toContain("since decommissioned");
+  });
+
+  it("HIGH-1: an MCP read FAILURE renders incomplete-with-reason, never an affirmative 'none configured'", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: { read_ok: true, rows: [] },
+          mcp_servers: {
+            read_ok: false,
+            rows: [],
+            reason: "the sovereignty profile could not be read: decrypt failed",
+          },
+          observed_destinations: { read_ok: true, rows: [] },
+        },
+      },
+      { entries: [], retention: FULL_COVERAGE, signer, masterKey }
+    );
+    const report = pack.files[0]!.content;
+    // The false census statement must NOT appear when the read failed.
+    expect(report).not.toContain("No MCP tool servers are configured on this fortress.");
+    // Instead: honest incomplete language + the reason.
+    expect(report).toContain("could not be read for this period, so this section is INCOMPLETE");
+    expect(report).toContain("NOT a statement that none exist");
+    expect(report).toContain("decrypt failed");
+    // A genuinely-empty (read_ok) source DOES get the affirmative census line.
+    expect(report).toContain("No wrapped AI harnesses are recorded");
+    // The exec summary flags the incomplete read.
+    expect(report).toContain("could not be read this period");
+  });
+
+  it("MED-1: the executive summary says 'configured', never 'connected', for MCP servers", () => {
+    const pack = buildEvidencePack(baseInput(), {
+      entries: [],
+      retention: FULL_COVERAGE,
+      signer,
+      masterKey,
+    });
+    const report = pack.files[0]!.content;
+    expect(report).toContain("configured AI tool servers");
+    expect(report).not.toContain("connected AI tool servers");
   });
 });

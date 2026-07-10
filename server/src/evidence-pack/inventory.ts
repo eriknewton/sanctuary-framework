@@ -34,15 +34,17 @@ import type {
   InventoryAgentRow,
   InventoryMcpServerRow,
   InventoryObservedDestinationRow,
+  InventorySection,
   InventorySnapshot,
 } from "./types.js";
 
 /**
- * A connected upstream MCP server as seen by the proxy router. Mirrors the
- * fields `GET /api/proxy/servers` exposes (name, transport, enabled,
- * connection state, tool count); defined here so the pure collector does not
- * couple to the proxy module's internal types. The CLI maps the proxy router's
- * output into this shape.
+ * A configured upstream MCP server as read from the sovereignty profile.
+ * Mirrors the fields `GET /api/proxy/servers` exposes (name, transport,
+ * enabled, connection state, tool count); defined here so the pure collector
+ * does not couple to the proxy module's internal types. The CLI populates only
+ * the configured fields (name/transport/enabled) because pack generation does
+ * NOT open a live connection to probe state or tool counts.
  */
 export interface ProxyServerView {
   name: string;
@@ -52,14 +54,26 @@ export interface ProxyServerView {
   tool_count?: number;
 }
 
-/** Raw enumeration sources fed into {@link buildInventorySnapshot}. */
+/**
+ * The read outcome for one source: whether the store was read successfully,
+ * the raw records read (empty when genuinely none OR unread), and a reason on
+ * failure. Undefined for a source means "not collected" and is treated as a
+ * successful empty read (see {@link buildInventorySnapshot}).
+ */
+export interface InventorySourceRead<T> {
+  ok: boolean;
+  records: readonly T[];
+  reason?: string;
+}
+
+/** Raw enumeration sources + their read outcomes, fed into {@link buildInventorySnapshot}. */
 export interface InventorySources {
-  /** Wrapped-harness / agent records from the hub registry (or empty). */
-  agentRecords?: readonly LocalAgentRecord[];
-  /** Connected MCP servers from the proxy router (or empty). */
-  proxyServers?: readonly ProxyServerView[];
-  /** Observed egress destinations from the observe engine (or empty). */
-  observedDestinations?: readonly CandidateObservation[];
+  /** Wrapped-harness / agent records from the hub registry. */
+  agents?: InventorySourceRead<LocalAgentRecord>;
+  /** Configured MCP servers from the sovereignty profile. */
+  proxyServers?: InventorySourceRead<ProxyServerView>;
+  /** Observed egress destinations from the observe engine. */
+  observedDestinations?: InventorySourceRead<CandidateObservation>;
 }
 
 /** Map one `LocalAgentRecord` to the inventory row shape. */
@@ -103,37 +117,57 @@ function destinationRow(
 }
 
 /**
- * Build an {@link InventorySnapshot} from the raw enumeration sources. Any
- * absent/empty source yields an absent section (the renderer then prints its
- * honest placeholder + coverage-basis note). This function NEVER asserts
- * completeness; it only shapes the rows Sanctuary can actually see. Rows are
- * sorted for stable, deterministic output.
+ * Map one source read outcome to an {@link InventorySection}, preserving the
+ * read_ok / reason so the renderer can distinguish a genuine empty from a read
+ * failure. A read failure yields NO rows (never a partial list presented as
+ * complete). An undefined source is treated as a successful empty read.
+ */
+function toSection<TRaw, TRow>(
+  read: InventorySourceRead<TRaw> | undefined,
+  map: (raw: TRaw) => TRow,
+  sort: (a: TRow, b: TRow) => number
+): InventorySection<TRow> {
+  if (read === undefined) {
+    return { read_ok: true, rows: [] };
+  }
+  if (!read.ok) {
+    return { read_ok: false, rows: [], reason: read.reason };
+  }
+  const rows = read.records.map(map);
+  rows.sort(sort);
+  return { read_ok: true, rows };
+}
+
+/**
+ * Build an {@link InventorySnapshot} from the source read outcomes. Each output
+ * section carries its own read_ok so the renderer prints honest language per
+ * source. This function NEVER asserts completeness and NEVER presents a partial
+ * read as a full one; it only shapes the rows Sanctuary actually read, sorted
+ * for stable, deterministic output.
  */
 export function buildInventorySnapshot(
   sources: InventorySources
 ): InventorySnapshot {
-  const snapshot: InventorySnapshot = {};
+  return {
+    agents: toSection(sources.agents, agentRow, (a, b) =>
+      a.agent_id.localeCompare(b.agent_id)
+    ),
+    mcp_servers: toSection(sources.proxyServers, mcpServerRow, (a, b) =>
+      a.name.localeCompare(b.name)
+    ),
+    observed_destinations: toSection(
+      sources.observedDestinations,
+      destinationRow,
+      (a, b) => a.host.localeCompare(b.host) || (a.port ?? 0) - (b.port ?? 0)
+    ),
+  };
+}
 
-  const agents = (sources.agentRecords ?? []).map(agentRow);
-  if (agents.length > 0) {
-    agents.sort((a, b) => a.agent_id.localeCompare(b.agent_id));
-    snapshot.agents = agents;
-  }
-
-  const servers = (sources.proxyServers ?? []).map(mcpServerRow);
-  if (servers.length > 0) {
-    servers.sort((a, b) => a.name.localeCompare(b.name));
-    snapshot.mcp_servers = servers;
-  }
-
-  const destinations = (sources.observedDestinations ?? []).map(destinationRow);
-  if (destinations.length > 0) {
-    destinations.sort(
-      (a, b) =>
-        a.host.localeCompare(b.host) || (a.port ?? 0) - (b.port ?? 0)
-    );
-    snapshot.observed_destinations = destinations;
-  }
-
-  return snapshot;
+/** An all-sections successful-empty snapshot (for callers that pass no inventory). */
+export function emptyInventorySnapshot(): InventorySnapshot {
+  return {
+    agents: { read_ok: true, rows: [] },
+    mcp_servers: { read_ok: true, rows: [] },
+    observed_destinations: { read_ok: true, rows: [] },
+  };
 }

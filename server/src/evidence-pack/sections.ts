@@ -30,6 +30,7 @@ import type {
   ShortfallReport,
 } from "./types.js";
 import type { QuarterWindow } from "./types.js";
+import { emptyInventorySnapshot } from "./inventory.js";
 
 /** One rendered section: a title (PDF page heading) plus its Markdown body. */
 export interface PackSection {
@@ -118,22 +119,32 @@ function renderExecutiveSummary(
 ): PackSection {
   const machines = "1 (this Sanctuary install)";
   const c = agg.by_category;
-  const toolCount = (inv.agents?.length ?? 0) + (inv.mcp_servers?.length ?? 0);
+  const toolCount = inv.agents.rows.length + inv.mcp_servers.rows.length;
+  const anyReadFailed =
+    !inv.agents.read_ok ||
+    !inv.mcp_servers.read_ok ||
+    !inv.observed_destinations.read_ok;
   const humanApproved = c.human_approved;
   const humanDenied = c.human_denied;
   const humanReviewed = humanApproved + humanDenied;
   const autoAllowed = c.allowed + c.allowed_proxy;
   const blendedDenied = c.denied;
   const autoBlocked = c.injection_blocked;
+  const readNote = anyReadFailed
+    ? " One or more inventory sources could not be read this period, so this " +
+      "count is incomplete; see the inventory section."
+    : "";
   const toolLine =
     toolCount === 0
-      ? "**AI tools inventoried:** 0 in this preview " +
-        "(live enumeration of wrapped harnesses and connected AI tool servers " +
-        "is wired in a later slice; see the inventory section for the coverage " +
-        "basis - this is NOT a claim that the firm uses no AI tools)."
+      ? "**AI tools inventoried:** 0 " +
+        "(wrapped harnesses and configured AI tool servers this install can " +
+        "see; see the inventory section for the coverage basis - this is NOT " +
+        "a claim that the firm uses no AI tools)." +
+        readNote
       : `**AI tools inventoried:** ${toolCount} ` +
-        "(wrapped harnesses and connected AI tool servers this install can " +
-        "see; see the inventory section for coverage limits).";
+        "(wrapped harnesses and configured AI tool servers this install can " +
+        "see; see the inventory section for coverage limits)." +
+        readNote;
 
   const lines = [
     "# Executive summary",
@@ -186,18 +197,19 @@ function renderInventory(inv: InventorySnapshot): PackSection {
     "",
   ];
 
-  const agents = inv.agents ?? [];
+  // Wrapped AI harnesses.
   lines.push("## Wrapped AI harnesses");
   lines.push("");
-  if (agents.length === 0) {
+  if (!inv.agents.read_ok) {
+    lines.push(incompleteNote("wrapped-harness", inv.agents.reason));
+  } else if (inv.agents.rows.length === 0) {
     lines.push(
-      "This preview did not enumerate wrapped harnesses from the hub agent " +
-        "registry. " + PLACEHOLDER_BADGE
+      "No wrapped AI harnesses are recorded in the hub agent registry on this fortress."
     );
   } else {
     lines.push("| Agent | Harness | Model | Wrapped | Status |");
     lines.push("|---|---|---|---|---|");
-    for (const a of agents) {
+    for (const a of inv.agents.rows) {
       const model = [a.model_vendor, a.model_id].filter(Boolean).join(" / ") || "-";
       lines.push(
         `| ${a.agent_id} | ${a.harness} | ${model} | ${a.wrapped_at ?? "-"} | ${a.status ?? "-"} |`
@@ -206,7 +218,7 @@ function renderInventory(inv: InventorySnapshot): PackSection {
   }
   lines.push("");
 
-  const servers = inv.mcp_servers ?? [];
+  // Configured MCP tool servers.
   lines.push("## Configured AI tool servers (MCP)");
   lines.push("");
   lines.push(
@@ -215,14 +227,14 @@ function renderInventory(inv: InventorySnapshot): PackSection {
       "live connection to probe them during generation."
   );
   lines.push("");
-  if (servers.length === 0) {
-    lines.push(
-      "No MCP tool servers are configured on this fortress. " + PLACEHOLDER_BADGE
-    );
+  if (!inv.mcp_servers.read_ok) {
+    lines.push(incompleteNote("MCP tool server", inv.mcp_servers.reason));
+  } else if (inv.mcp_servers.rows.length === 0) {
+    lines.push("No MCP tool servers are configured on this fortress.");
   } else {
     lines.push("| Server | Transport | Enabled | State | Tools |");
     lines.push("|---|---|---|---|---|");
-    for (const s of servers) {
+    for (const s of inv.mcp_servers.rows) {
       const enabled = s.enabled === undefined ? "-" : s.enabled ? "yes" : "no";
       lines.push(
         `| ${s.name} | ${s.transport ?? "-"} | ${enabled} | ${s.connection_state ?? "-"} | ${s.tool_count ?? "-"} |`
@@ -231,18 +243,21 @@ function renderInventory(inv: InventorySnapshot): PackSection {
   }
   lines.push("");
 
-  const dests = inv.observed_destinations ?? [];
+  // Observed egress destinations.
   lines.push("## Observed egress destinations (enforced machines only)");
   lines.push("");
-  if (dests.length === 0) {
+  if (!inv.observed_destinations.read_ok) {
     lines.push(
-      "This preview did not include observed egress destinations. " +
-        PLACEHOLDER_BADGE
+      incompleteNote("observed egress destination", inv.observed_destinations.reason)
+    );
+  } else if (inv.observed_destinations.rows.length === 0) {
+    lines.push(
+      "No observed egress destinations are recorded on this fortress."
     );
   } else {
     lines.push("| Destination | Port | Protocol | Seen | Exfil risk |");
     lines.push("|---|---|---|---|---|");
-    for (const d of dests) {
+    for (const d of inv.observed_destinations.rows) {
       lines.push(
         `| ${d.host} | ${d.port ?? "-"} | ${d.protocol ?? "-"} | ${d.times_seen ?? "-"} | ${d.exfil_risk ? "yes" : "no"} |`
       );
@@ -251,18 +266,37 @@ function renderInventory(inv: InventorySnapshot): PackSection {
   lines.push("");
   // Closing reinforcement (printed whether the tables above are empty or full):
   // a POPULATED inventory is still not a complete picture, so a reader who
-  // skips the coverage-basis header still sees the invisibility bound right
-  // after the rows. This must never be dropped (paramount honesty rule).
+  // skips the coverage-basis header still sees the bound right after the rows.
+  // This must never be dropped (paramount honesty rule). It warns in BOTH
+  // directions: under-inclusion (tools Sanctuary cannot see) and over-inclusion
+  // (a stale persisted row for a since-removed tool).
   lines.push(
-    "What is NOT in this inventory: any AI tool Sanctuary does not wrap or " +
-      "observe. A populated list above is the AI use Sanctuary can see on this " +
-      "install, NOT a complete census of the firm's AI use. Browser-based AI " +
-      "(ChatGPT in a browser tab), AI embedded in other applications, and use " +
-      "on phones or unmanaged machines do not appear here and are covered by " +
-      "the written policy and per-attorney attestations, not by this list."
+    "What is NOT in this inventory, and what may be stale: any AI tool " +
+      "Sanctuary does not wrap or observe is absent (browser-based AI such as " +
+      "ChatGPT in a browser tab, AI embedded in other applications, and use on " +
+      "phones or unmanaged machines), so a populated list above is the AI use " +
+      "Sanctuary can see on this install, NOT a complete census of the firm's " +
+      "AI use. Conversely, the rows reflect the LAST PERSISTED configuration " +
+      "and may still list a tool the firm has since decommissioned; this is " +
+      "not a point-in-time liveness attestation. Reconcile against current " +
+      "configuration, and rely on the written policy and per-attorney " +
+      "attestations for unmanaged use."
   );
   lines.push("");
   return { title: "AI tool inventory", markdown: lines.join("\n") };
+}
+
+/**
+ * Honest wording for a source whose store could NOT be read. It must never read
+ * as an affirmative "none exist" census claim (slice-2 HIGH-1): a read failure
+ * is disclosed as incomplete, with the reason, distinct from a genuine empty.
+ */
+function incompleteNote(sourceLabel: string, reason: string | undefined): string {
+  const base =
+    `The ${sourceLabel} inventory could not be read for this period, so this ` +
+    "section is INCOMPLETE. This is NOT a statement that none exist. " +
+    PLACEHOLDER_BADGE;
+  return reason ? `${base} Reason: ${reason}` : base;
 }
 
 // ── Section 4: written governance policy (CNA Q2) ────────────────────
@@ -614,7 +648,7 @@ export function renderSections(params: {
   shortfall: ShortfallReport;
   discreteExports: DiscreteExportsStatus;
 }): PackSection[] {
-  const inv = params.input.inventory ?? {};
+  const inv = params.input.inventory ?? emptyInventorySnapshot();
   return [
     renderCover(
       params.input,
