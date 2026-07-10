@@ -38,6 +38,20 @@ const REHOME_RESULTS: RehomeStepResult[] = [
 
 const FORTRESS_PATH = "/Users/operator/.sanctuary";
 
+/** Minimal harness endpoint set for the confined-agent egress steps. */
+const TEST_ENDPOINT_SET = {
+  harnessId: "hermes",
+  endpoints: [
+    {
+      name: "LLM (Venice)",
+      host: "api.venice.ai",
+      port: 443,
+      protocol: "tcp" as const,
+      riskClass: "standard" as const,
+    },
+  ],
+};
+
 function baseCtx(overrides: Partial<ProvisionFlowContext> = {}): ProvisionFlowContext {
   return {
     agentId: "hermes",
@@ -46,7 +60,33 @@ function baseCtx(overrides: Partial<ProvisionFlowContext> = {}): ProvisionFlowCo
     detectResult: NEEDS_PROVISIONING,
     isTty: true,
     fortressPath: FORTRESS_PATH,
+    harnessEndpoints: TEST_ENDPOINT_SET,
     ...overrides,
+  };
+}
+
+/** A passing as-uid egress report matching TEST_ENDPOINT_SET + the negative control. */
+function passingEgressReport() {
+  return {
+    ok: true,
+    rows: [
+      {
+        name: "LLM (Venice)",
+        host: "api.venice.ai",
+        port: 443,
+        expected: "reachable" as const,
+        observed: "reachable" as const,
+        pass: true,
+      },
+      {
+        name: "negative control (non-listed host must be blocked)",
+        host: "example.com",
+        port: 443,
+        expected: "blocked" as const,
+        observed: "blocked" as const,
+        pass: true,
+      },
+    ],
   };
 }
 
@@ -54,6 +94,15 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
   return {
     confirm: vi.fn(async () => true),
     print: vi.fn(),
+    provisionEgress: vi.fn(async () => ({
+      ok: true as const,
+      ruleIds: ["provisioned-hermes-abc123def456"],
+      checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
+      dnsRulePresent: true,
+    })),
+    scrubProvisionedEgress: vi.fn(async () => undefined),
+    verifyAgentEgressAfterArm: vi.fn(async () => passingEgressReport()),
+    auditEgress: vi.fn(async () => undefined),
     createAccount: vi.fn(async () => ({
       plan: { action: "create", accountName: "sanctuary-hermes", uid: AGENT_UID },
       uid: AGENT_UID,
@@ -795,6 +844,246 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.disarm).not.toHaveBeenCalled();
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
       expect((result as { wallMayBeArmed?: boolean }).wallMayBeArmed).toBeUndefined();
+    });
+  });
+
+  // ── Confined-agent egress (design 2026-07-10): provision-egress step,
+  //    refuse-to-arm, post-arm as-uid verify, scrub, audit ops ──────────────
+  describe("confined-agent egress: provision + verify + refuse-to-arm", () => {
+    it("happy path: provisionEgress runs AFTER ensure-policy-daemon and BEFORE arm; as-uid verify runs AFTER arm; egress_provisioned is audited with the rule ids", async () => {
+      const ops = happyPathOps();
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      const order = (fn: unknown) => (fn as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      expect(order(ops.ensurePolicyDaemon)).toBeLessThan(order(ops.provisionEgress));
+      expect(order(ops.provisionEgress)).toBeLessThan(order(ops.arm));
+      expect(order(ops.arm)).toBeLessThan(order(ops.verifyAgentEgressAfterArm));
+      expect(ops.verifyAgentEgressAfterArm).toHaveBeenCalledWith(AGENT_UID);
+      expect(ops.auditEgress).toHaveBeenCalledTimes(1);
+      expect(ops.auditEgress).toHaveBeenCalledWith(
+        "egress_provisioned",
+        expect.objectContaining({
+          harness: "hermes",
+          agent_uid: AGENT_UID,
+          rule_ids: ["provisioned-hermes-abc123def456"],
+        }),
+      );
+      expect(ops.scrubProvisionedEgress).not.toHaveBeenCalled();
+    });
+
+    it("refuse-to-arm (fail-closed): provisionEgress ok:false aborts at 'provision-egress' BEFORE arm, scrubs any partial publish, and audits egress_provision_refused", async () => {
+      const ops = happyPathOps({
+        provisionEgress: vi.fn(async () => ({
+          ok: false as const,
+          error: "static egress verification failed: no allow match for LLM (Venice)",
+          checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: false }],
+          dnsRulePresent: true,
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "provision-egress", rolledBack: true });
+      expect(ops.arm).not.toHaveBeenCalled();
+      // A partial publish must never survive a refused run (no orphan grants).
+      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.auditEgress).toHaveBeenCalledWith(
+        "egress_provision_refused",
+        expect.objectContaining({ stage: "provision-egress", disarm_outcome: "not-armed" }),
+      );
+      const reason = (result as { reason: string }).reason;
+      // The operator sees the refusal named as fail-closed (the wall was NOT
+      // armed over a non-functional agent) and what failed.
+      expect(reason).toMatch(/refusing to arm/i);
+      expect(reason).toMatch(/could not be provisioned and verified/);
+      // The per-endpoint table was printed.
+      const printed = (ops.print as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(printed.some((line) => /\[FAIL\] LLM \(Venice\)/.test(line))).toBe(true);
+    });
+
+    it("post-arm as-uid verify failure fast-disarms, scrubs the provisioned rules, audits egress_provision_refused, and returns the DISTINCT egress-unprovisioned-rolled-back outcome", async () => {
+      const failingReport = {
+        ok: false,
+        rows: [
+          {
+            name: "LLM (Venice)",
+            host: "api.venice.ai",
+            port: 443,
+            expected: "reachable" as const,
+            observed: "blocked" as const,
+            pass: false,
+          },
+        ],
+      };
+      const ops = happyPathOps({
+        verifyAgentEgressAfterArm: vi.fn(async () => failingReport),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({
+        kind: "egress-unprovisioned-rolled-back",
+        uid: AGENT_UID,
+        scrubbed: true,
+      });
+      expect(ops.disarm).toHaveBeenCalledTimes(1);
+      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      // Fast-disarm ordering: filter off BEFORE the rule scrub.
+      const disarmOrder = (ops.disarm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const scrubOrder = (ops.scrubProvisionedEgress as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      expect(disarmOrder).toBeLessThan(scrubOrder);
+      expect(ops.auditEgress).toHaveBeenCalledWith(
+        "egress_provision_refused",
+        expect.objectContaining({
+          stage: "post-arm-as-uid-verify",
+          disarm_outcome: "fast-disarmed",
+        }),
+      );
+      // The agent stays re-homed: no restore on this rollback.
+      expect(ops.restoreRehome).not.toHaveBeenCalled();
+      const reason = (result as { reason: string }).reason;
+      expect(reason).toMatch(/post-arm as-uid egress verification failed/);
+      expect(reason).toMatch(/Fast-disarmed/);
+    });
+
+    it("post-arm as-uid verify failure where the NEGATIVE CONTROL was reachable also rolls back (a reachable non-listed host proves nothing is confined)", async () => {
+      const report = {
+        ok: false,
+        rows: [
+          {
+            name: "LLM (Venice)",
+            host: "api.venice.ai",
+            port: 443,
+            expected: "reachable" as const,
+            observed: "reachable" as const,
+            pass: true,
+          },
+          {
+            name: "negative control (non-listed host must be blocked)",
+            host: "example.com",
+            port: 443,
+            expected: "blocked" as const,
+            observed: "reachable" as const,
+            pass: false,
+          },
+        ],
+      };
+      const ops = happyPathOps({ verifyAgentEgressAfterArm: vi.fn(async () => report) });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "egress-unprovisioned-rolled-back", uid: AGENT_UID });
+      expect(ops.disarm).toHaveBeenCalledTimes(1);
+      expect((result as { reason: string }).reason).toMatch(/negative control/);
+    });
+
+    it("post-arm as-uid verify failure + disarm THROW routes to armed-rollback-failed (the wall is still up; loud manual recovery)", async () => {
+      const ops = happyPathOps({
+        verifyAgentEgressAfterArm: vi.fn(async () => ({
+          ok: false,
+          rows: [
+            {
+              name: "LLM (Venice)",
+              host: "api.venice.ai",
+              port: 443,
+              expected: "reachable" as const,
+              observed: "blocked" as const,
+              pass: false,
+            },
+          ],
+        })),
+        disarm: vi.fn(async () => {
+          throw new Error("castle-wall disable exited 1");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({
+        kind: "armed-rollback-failed",
+        uid: AGENT_UID,
+        disarmError: "castle-wall disable exited 1",
+      });
+      expect(ops.auditEgress).toHaveBeenCalledWith(
+        "egress_provision_refused",
+        expect.objectContaining({ disarm_outcome: "disarm-failed" }),
+      );
+    });
+
+    it("a later abort (uid-existence-gate) after a successful provisionEgress scrubs the provisioned rules (no orphan grants on a failed run)", async () => {
+      const ops = happyPathOps({
+        checkUidExistence: vi.fn(async () => ({
+          ok: false as const,
+          accountName: "sanctuary-hermes",
+          reason: "account does not exist",
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "uid-existence-gate" });
+      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+    });
+
+    it("a FAILED egress scrub on abort is surfaced LOUDLY in the reason, never silently swallowed", async () => {
+      const ops = happyPathOps({
+        checkUidExistence: vi.fn(async () => ({
+          ok: false as const,
+          accountName: "sanctuary-hermes",
+          reason: "account does not exist",
+        })),
+        scrubProvisionedEgress: vi.fn(async () => {
+          throw new Error("EACCES: rules dir not writable");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      const reason = (result as { reason: string }).reason;
+      expect(reason).toMatch(/provisioned egress allow rules could NOT be scrubbed/);
+      expect(reason).toMatch(/EACCES: rules dir not writable/);
+    });
+
+    it("an abort BEFORE provisionEgress (ensure-policy-daemon) does NOT scrub (nothing was provisioned this run)", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({
+          ok: false as const,
+          error: "socket never became reachable",
+          freshlyInstalled: false,
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon" });
+      expect(ops.provisionEgress).not.toHaveBeenCalled();
+      expect(ops.scrubProvisionedEgress).not.toHaveBeenCalled();
+    });
+
+    it("the Tier-1 confirm plan-print names every egress grant BEFORE the confirm, with the exfil-risk marking on messaging hosts", async () => {
+      const ops = happyPathOps({ confirm: vi.fn(async () => false) });
+      const ctx = baseCtx({
+        harnessEndpoints: {
+          harnessId: "hermes",
+          endpoints: [
+            ...TEST_ENDPOINT_SET.endpoints,
+            {
+              name: "Telegram Bot API",
+              host: "api.telegram.org",
+              port: 443,
+              protocol: "tcp" as const,
+              riskClass: "standard" as const,
+            },
+          ],
+        },
+      });
+      const result = await runProvisionFlow(ctx, ops);
+      // Declined AFTER the plan-print: the grants were named before consent.
+      expect(result.kind).toBe("declined-by-operator");
+      const printed = (ops.print as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+      expect(printed.some((line) => line.includes("Egress grants to provision"))).toBe(true);
+      expect(printed.some((line) => line.includes("api.venice.ai:443/tcp"))).toBe(true);
+      const telegramLine = printed.find((line) => line.includes("api.telegram.org"));
+      expect(telegramLine).toBeDefined();
+      expect(telegramLine).toMatch(/EXFIL-RISK/);
+      const orderConfirm = (ops.confirm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const printCalls = (ops.print as ReturnType<typeof vi.fn>).mock.invocationCallOrder;
+      expect(Math.min(...printCalls)).toBeLessThan(orderConfirm);
+    });
+
+    it("armed-then-rolled-back (post-arm DNS/credential re-check failure) also scrubs the provisioned rules", async () => {
+      const ops = happyPathOps({
+        postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "armed-then-rolled-back", uid: AGENT_UID });
+      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
     });
   });
 });

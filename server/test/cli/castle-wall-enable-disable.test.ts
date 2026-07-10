@@ -257,6 +257,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       daemonProbe: async () => true,
       bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       // This test targets the boot-service guard, not the descriptor guard.
       agentOriginDescriptorProbe: async () => true,
     });
@@ -339,6 +340,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       daemonProbe: async () => true,
       bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       agentOriginDescriptorProbe: async () => false,
     });
 
@@ -372,6 +374,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       daemonProbe: async () => true,
       bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       agentOriginDescriptorProbe: async () => true,
     });
 
@@ -400,6 +403,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       agentOriginDescriptorProbe: async () => false,
     });
 
@@ -433,6 +437,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       daemonProbe: async () => true,
       bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
     });
 
     expect(code).toBe(1);
@@ -466,6 +471,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       daemonProbe: async () => true,
       bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
     });
 
     expect(code).toBe(0);
@@ -500,6 +506,11 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+        // These tests are not about the no-egress brick guard; report one
+        // agent-matchable allow rule so the guard stays out of the way (the
+        // guard's own behavior has dedicated tests below).
+        egressAllowRuleCountProbe: async () => 1,
         // No agentOriginDescriptorProbe override: exercises the REAL
         // read-back path, proving the descriptor this command just wrote
         // satisfies the very guard that follows it.
@@ -543,6 +554,11 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+        // These tests are not about the no-egress brick guard; report one
+        // agent-matchable allow rule so the guard stays out of the way (the
+        // guard's own behavior has dedicated tests below).
+        egressAllowRuleCountProbe: async () => 1,
       },
     );
 
@@ -573,6 +589,11 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+        // These tests are not about the no-egress brick guard; report one
+        // agent-matchable allow rule so the guard stays out of the way (the
+        // guard's own behavior has dedicated tests below).
+        egressAllowRuleCountProbe: async () => 1,
       },
     );
 
@@ -608,6 +629,11 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+        // These tests are not about the no-egress brick guard; report one
+        // agent-matchable allow rule so the guard stays out of the way (the
+        // guard's own behavior has dedicated tests below).
+        egressAllowRuleCountProbe: async () => 1,
       },
     );
 
@@ -638,6 +664,11 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+        // These tests are not about the no-egress brick guard; report one
+        // agent-matchable allow rule so the guard stays out of the way (the
+        // guard's own behavior has dedicated tests below).
+        egressAllowRuleCountProbe: async () => 1,
       },
     );
 
@@ -668,6 +699,11 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+        // These tests are not about the no-egress brick guard; report one
+        // agent-matchable allow rule so the guard stays out of the way (the
+        // guard's own behavior has dedicated tests below).
+        egressAllowRuleCountProbe: async () => 1,
       },
     );
 
@@ -703,6 +739,11 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+        // These tests are not about the no-egress brick guard; report one
+        // agent-matchable allow rule so the guard stays out of the way (the
+        // guard's own behavior has dedicated tests below).
+        egressAllowRuleCountProbe: async () => 1,
       },
     );
 
@@ -733,6 +774,11 @@ describe("castle-wall enable/disable CLI verbs", () => {
         daemonProbe: async () => true,
         bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
+        // These tests are not about the no-egress brick guard; report one
+        // agent-matchable allow rule so the guard stays out of the way (the
+        // guard's own behavior has dedicated tests below).
+        egressAllowRuleCountProbe: async () => 1,
       },
     );
 
@@ -766,6 +812,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       daemonProbe: async () => true,
       bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       // Real read-back path (no override): no descriptor exists on disk.
     });
 
@@ -792,6 +839,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
     });
 
     expect(code).toBe(0);
@@ -839,6 +887,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       bootServiceReadyProbe: async () => {
         throw new Error("boot-service probe must not run under --force");
       },
@@ -865,6 +914,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       daemonProbe: async () => {
         throw new Error("probe must not run under --force");
       },
@@ -893,6 +943,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       daemonProbe: async () => true,
       bootServiceReadyProbe: async () => true,
       // This test targets the audit trail, not the descriptor guard.
@@ -961,6 +1012,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       daemonProbe: async () => true,
       bootServiceReadyProbe: async () => true,
       // This test targets the one-time GUI consent, not the descriptor guard.
@@ -1072,6 +1124,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
     });
 
     expect(code).toBe(1);
@@ -1093,6 +1146,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
     });
 
     expect(code).toBe(1);
@@ -1121,6 +1175,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
     });
 
     expect(code).toBe(1);
@@ -1307,6 +1362,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       daemonProbe: async () => true,
       bootServiceReadyProbe: async () => true,
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
     });
 
     expect(code).toBe(2);
@@ -1384,6 +1440,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       platform: "darwin",
       hostAppCandidates: [hostAppPath],
       sysextProbe: async () => "[activated enabled]",
+      egressAllowRuleCountProbe: async () => 1,
       reportPathFactory: () => reportPath,
       runningAppController: {
         isRunning: async () => false,
@@ -1415,6 +1472,231 @@ describe("castle-wall enable/disable CLI verbs", () => {
       `--report-file=${reportPath}`,
     ]);
     expect(openArgs[1]!.slice(-2)).toEqual(["status", `--report-file=${reportPath}`]);
+  });
+
+  // ── Confined-agent egress (design 2026-07-10, section 5 layer 2): the
+  //    standing no-egress brick guard on `enable` in uid mode ────────────────
+  describe("no-egress brick guard (uid mode)", () => {
+    async function writeUidDescriptor(fortressPath: string): Promise<void> {
+      await mkdir(join(fortressPath, "policy", "egress"), { recursive: true });
+      await writeFile(
+        join(fortressPath, "policy", "egress", "agent-origin.json"),
+        JSON.stringify({ mode: "uid", agent_uid: 502, system_uid_allow_ceiling: 500 }),
+      );
+    }
+
+    function guardCtx(
+      fixture: { fortressPath: string; hostAppPath: string; env: Record<string, string> },
+      plistPath: string,
+      err: CaptureStream,
+      invoke: HostAppInvoker,
+      extras: Record<string, unknown> = {},
+    ) {
+      return {
+        out: new CaptureStream(),
+        err,
+        env: fixture.env,
+        platform: "darwin" as const,
+        hostAppCandidates: [fixture.hostAppPath],
+        hostAppInvoke: invoke,
+        daemonProbe: async () => true,
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fixture.fortressPath),
+        sysextProbe: async () => "[activated enabled]" as const,
+        ...extras,
+      };
+    }
+
+    it("REFUSES to arm a uid-mode wall with ZERO agent-matchable allow rules (real disk read: empty rules dir) and names --allow-no-egress", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const err = new CaptureStream();
+      const { invoke, calls } = makeInvoker({});
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl"],
+        guardCtx(fixture, plistPath, err, invoke),
+      );
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("ZERO agent-matchable allow rules");
+      expect(err.text()).toContain("--allow-no-egress");
+      // The wall was NEVER armed (no host-app invoke at all).
+      expect(calls).toHaveLength(0);
+    });
+
+    it("the refusal is AUDITED as egress_provision_refused (queryable proof the guard fired)", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const err = new CaptureStream();
+      const { invoke } = makeInvoker({});
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl"],
+        guardCtx(fixture, plistPath, err, invoke),
+      );
+      expect(code).toBe(1);
+
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const { establishMaster } = await import("../../src/core/master-custody.js");
+      const { masterKey } = await establishMaster({
+        storage,
+        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fixture.fortressPath,
+      });
+      const auditLog = new AuditLog(storage, masterKey);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
+      const refusal = entries.find((e) => e.operation === "egress_provision_refused");
+      expect(refusal).toBeDefined();
+      expect(refusal?.details).toMatchObject({
+        guard: "no-egress-brick",
+        agent_matchable_allow_rules: 0,
+      });
+    });
+
+    it("--allow-no-egress overrides the guard (deliberate quarantine), warns loudly, arms, and the override is audited on wall_armed", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const err = new CaptureStream();
+      const { invoke } = makeInvoker({
+        enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+        status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+      });
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl", "--allow-no-egress"],
+        guardCtx(fixture, plistPath, err, invoke),
+      );
+
+      expect(code).toBe(0);
+      expect(err.text()).toContain("--allow-no-egress");
+      expect(err.text()).toContain("deliberate quarantine");
+
+      const storage = new FilesystemStorage(join(fixture.fortressPath, "state"));
+      const { establishMaster } = await import("../../src/core/master-custody.js");
+      const { masterKey } = await establishMaster({
+        storage,
+        recoveryKey: fixture.env.SANCTUARY_RECOVERY_KEY!,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+        storagePathHint: fixture.fortressPath,
+      });
+      const auditLog = new AuditLog(storage, masterKey);
+      const { entries } = await auditLog.query({ layer: "l1", limit: 100 });
+      const armed = entries.find((e) => e.operation === "wall_armed");
+      expect(armed).toBeDefined();
+      expect(armed?.details).toMatchObject({ allow_no_egress_override: true });
+    });
+
+    it("arms WITHOUT the override when an agent-matchable allow rule exists on disk (real countAgentMatchableAllowRules path)", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      // A real, valid allow rule in the rules dir.
+      const rulesDir = join(fixture.fortressPath, "policy", "egress", "rules");
+      await mkdir(rulesDir, { recursive: true });
+      await writeFile(
+        join(rulesDir, "provisioned-hermes-abc123def456.json"),
+        JSON.stringify({
+          id: "provisioned-hermes-abc123def456",
+          schema_version: 1,
+          created_at: "2026-07-10T00:00:00Z",
+          match: { host: ["api.venice.ai"], port: [443], protocol: "tcp" },
+          scope: {},
+          disposition: "allow",
+          derived: true,
+        }),
+      );
+      const err = new CaptureStream();
+      const { invoke } = makeInvoker({
+        enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+        status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+      });
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl"],
+        guardCtx(fixture, plistPath, err, invoke),
+      );
+
+      expect(code).toBe(0);
+      expect(err.text()).not.toContain("ZERO agent-matchable allow rules");
+    });
+
+    it("deny-only and reserved-habeas rules do NOT satisfy the guard (they grant the agent nothing)", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await writeUidDescriptor(fixture.fortressPath);
+      const rulesDir = join(fixture.fortressPath, "policy", "egress", "rules");
+      await mkdir(rulesDir, { recursive: true });
+      await writeFile(
+        join(rulesDir, "deny-everything-extra.json"),
+        JSON.stringify({
+          id: "deny-everything-extra",
+          schema_version: 1,
+          created_at: "2026-07-10T00:00:00Z",
+          match: { host: ["api.evil.example"], port: [443], protocol: "tcp" },
+          scope: {},
+          disposition: "deny",
+        }),
+      );
+      await writeFile(
+        join(rulesDir, "reserved_habeas_distress_webhook.json"),
+        JSON.stringify({
+          id: "reserved_habeas_distress_webhook",
+          schema_version: 1,
+          created_at: "2026-07-10T00:00:00Z",
+          match: { host: ["hooks.example.com"], port: [443], protocol: "tcp" },
+          scope: { agent_ids: ["sanctuary-distress-daemon"] },
+          disposition: "allow",
+        }),
+      );
+      const err = new CaptureStream();
+      const { invoke, calls } = makeInvoker({});
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl"],
+        guardCtx(fixture, plistPath, err, invoke),
+      );
+
+      expect(code).toBe(1);
+      expect(err.text()).toContain("ZERO agent-matchable allow rules");
+      expect(calls).toHaveLength(0);
+    });
+
+    it("the guard does NOT fire for a NAT-mode descriptor (uid-mode-only by design)", async () => {
+      const fixture = await makeFixture();
+      const plistPath = join(fixture.fortressPath, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(`${fixture.fortressPath}/`));
+      await mkdir(join(fixture.fortressPath, "policy", "egress"), { recursive: true });
+      await writeFile(
+        join(fixture.fortressPath, "policy", "egress", "agent-origin.json"),
+        JSON.stringify({
+          mode: "nat",
+          egress_helper_signing_id: "ai.sanctuaryprotocol.egress-helper",
+          system_uid_allow_ceiling: 500,
+        }),
+      );
+      const err = new CaptureStream();
+      const { invoke } = makeInvoker({
+        enable: { stdout: reportLine("enable", "enabled", true), exitCode: 0 },
+        status: { stdout: reportLine("status", "enabled", true), exitCode: 0 },
+      });
+
+      const code = await runEnable(
+        ["--fortress", fixture.fortressPath, "--no-ttl"],
+        guardCtx(fixture, plistPath, err, invoke),
+      );
+
+      expect(code).toBe(0);
+      expect(err.text()).not.toContain("ZERO agent-matchable allow rules");
+    });
   });
 });
 

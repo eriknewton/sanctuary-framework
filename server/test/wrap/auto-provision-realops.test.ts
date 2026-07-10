@@ -57,7 +57,9 @@ import {
   runLaunchctlWithTimeout,
   LAUNCHCTL_TIMEOUT_MS,
   LAUNCHCTL_KILL_SIGNAL,
+  runAgentEgressProbesAsUid,
 } from "../../src/wrap/auto-provision.js";
+import { HERMES_ENDPOINT_SET } from "../../src/castle-wall/provision/egress.js";
 import {
   planRehome,
   executeRehomePlan,
@@ -1470,5 +1472,53 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
     const guard = targets.find((t) => t.name.includes("nothing to confine"));
     expect(guard).toBeDefined();
     expect(await guard!.probe()).toBe(false);
+  });
+});
+
+describe("confined-agent egress: runAgentEgressProbesAsUid (injected execFile, never a real spawn)", () => {
+  it("spawns one sudo -u '#<uid>' curl probe per declared endpoint plus the negative control, and passes when endpoints resolve and the control rejects", async () => {
+    const spawned: Array<{ file: string; args: string[] }> = [];
+    const execFileFn = async (file: string, args: string[]) => {
+      spawned.push({ file, args });
+      const url = args[args.length - 1]!;
+      if (url.includes("example.com")) {
+        // Negative control: the wall blocks it (curl exits nonzero -> reject).
+        throw Object.assign(new Error("curl: (7) Failed to connect"), { code: 7 });
+      }
+      return { stdout: "", stderr: "" };
+    };
+    const report = await runAgentEgressProbesAsUid(503, execFileFn);
+    expect(report.ok).toBe(true);
+    expect(spawned).toHaveLength(HERMES_ENDPOINT_SET.endpoints.length + 1);
+    for (const call of spawned) {
+      expect(call.file).toBe("/usr/bin/sudo");
+      expect(call.args).toContain("#503");
+      expect(call.args).toContain("-n");
+    }
+  });
+
+  it("fails (fail-closed) when an endpoint probe rejects: the agent would be confined into silence", async () => {
+    const execFileFn = async (_file: string, args: string[]) => {
+      const url = args[args.length - 1]!;
+      if (url.includes("api.venice.ai") || url.includes("example.com")) {
+        throw new Error("blocked");
+      }
+      return { stdout: "", stderr: "" };
+    };
+    const report = await runAgentEgressProbesAsUid(503, execFileFn);
+    expect(report.ok).toBe(false);
+    const venice = report.rows.find((r) => r.host === "api.venice.ai")!;
+    expect(venice.pass).toBe(false);
+    expect(venice.observed).toBe("blocked");
+  });
+
+  it("fails when the NEGATIVE CONTROL is reachable (the wall is not confining the agent at all)", async () => {
+    const execFileFn = async () => ({ stdout: "", stderr: "" });
+    const report = await runAgentEgressProbesAsUid(503, execFileFn);
+    expect(report.ok).toBe(false);
+    const control = report.rows[report.rows.length - 1]!;
+    expect(control.expected).toBe("blocked");
+    expect(control.observed).toBe("reachable");
+    expect(control.pass).toBe(false);
   });
 });

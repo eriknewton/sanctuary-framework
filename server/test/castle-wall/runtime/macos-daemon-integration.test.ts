@@ -846,4 +846,94 @@ describe("Castle Wall macOS daemon integration", () => {
       await handle.stop();
     }
   });
+
+  it("MED-3: the periodic as-agent-uid egress probe appends egress_probe_failed for an unreachable provisioned endpoint (injected probe, uid-mode origin)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    // uid-mode agent-origin + one provisioned rule in the signing source.
+    const egressDir = join(fortressPath, "policy", "egress");
+    const rulesDir = join(egressDir, "rules");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(rulesDir, { recursive: true });
+    await writeFile(
+      join(egressDir, "agent-origin.json"),
+      JSON.stringify({ mode: "uid", agent_uid: 503, system_uid_allow_ceiling: 500 }),
+    );
+    await writeFile(
+      join(rulesDir, "provisioned-hermes-aaaaaaaaaaaa.json"),
+      JSON.stringify({
+        id: "provisioned-hermes-aaaaaaaaaaaa",
+        schema_version: 1,
+        created_at: "2026-07-10T00:00:00Z",
+        match: { host: ["api.venice.ai"], port: [443], protocol: "tcp" },
+        scope: {},
+        disposition: "allow",
+        derived: true,
+      }),
+    );
+
+    const probeCalls: Array<{ uid: number; host: string; port: number }> = [];
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-egress-probe",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      listenerFactory: fakeListenerFactory,
+      agentEgressProbeIntervalSeconds: 0.05,
+      agentEgressProbe: async (uid, host, port) => {
+        probeCalls.push({ uid, host, port });
+        return false;
+      },
+    });
+    try {
+      await wait(200);
+    } finally {
+      await handle.stop();
+    }
+
+    // The probe ran AS the configured agent uid against the provisioned host.
+    expect(probeCalls.length).toBeGreaterThan(0);
+    expect(probeCalls[0]).toEqual({ uid: 503, host: "api.venice.ai", port: 443 });
+
+    const { entries } = await auditLog.query({ layer: "l1", limit: 200 });
+    const failures = entries.filter((e) => e.operation === "egress_probe_failed");
+    expect(failures.length).toBeGreaterThan(0);
+    expect(failures[0]!.details).toMatchObject({
+      host: "api.venice.ai",
+      port: 443,
+      agent_uid: 503,
+      rule_id: "provisioned-hermes-aaaaaaaaaaaa",
+    });
+    expect(failures[0]!.result).toBe("failure");
+  });
+
+  it("MED-3: the egress probe timer stays quiet with NO uid-mode agent-origin (nothing to probe as)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const probeCalls: string[] = [];
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-egress-probe-quiet",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      listenerFactory: fakeListenerFactory,
+      agentEgressProbeIntervalSeconds: 0.05,
+      agentEgressProbe: async (_uid, host) => {
+        probeCalls.push(host);
+        return false;
+      },
+    });
+    try {
+      await wait(150);
+    } finally {
+      await handle.stop();
+    }
+    expect(probeCalls).toEqual([]);
+    const { entries } = await auditLog.query({ layer: "l1", limit: 200 });
+    expect(entries.filter((e) => e.operation === "egress_probe_failed")).toEqual([]);
+  });
 });

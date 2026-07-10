@@ -897,6 +897,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "anomaly-detection/feature-extractors/time-of-day-activity.ts",
     "anomaly-detection/feature-extractors/tool-call-sequence.ts",
     // sentinels — internal background watchers
+    "sentinel/sentinels/agent-egress-watcher.ts",
     "sentinel/sentinels/credential-usage-watcher.ts",
     "sentinel/sentinels/cross-agent-chatter-watcher.ts",
     "sentinel/sentinels/egress-volume-watcher.ts",
@@ -1254,6 +1255,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       kind: "operator-background",
       reason:
         "anomaly feature extractor: windowed read on the anomaly pipeline cadence; internal scoring, not the SSE board.",
+    },
+    {
+      module: "sentinel/sentinels/agent-egress-watcher.ts",
+      fn: "evaluate",
+      kind: "operator-background",
+      reason:
+        "sentinel background watcher (confined-agent egress MED-3): windowed l1 read of egress denials + probe failures on its own cadence; internal scoring, not the SSE board.",
     },
     {
       module: "sentinel/sentinels/credential-usage-watcher.ts",
