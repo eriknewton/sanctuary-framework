@@ -23,6 +23,7 @@
 
 import type {
   CustodyFacts,
+  DiscreteExportsStatus,
   EvidencePackInput,
   InventorySnapshot,
   QuarterAggregation,
@@ -206,19 +207,25 @@ function renderInventory(inv: InventorySnapshot): PackSection {
   lines.push("");
 
   const servers = inv.mcp_servers ?? [];
-  lines.push("## Connected AI tool servers (MCP)");
+  lines.push("## Configured AI tool servers (MCP)");
+  lines.push("");
+  lines.push(
+    "The upstream MCP tool servers this fortress is configured to gateway. " +
+      "State and tool counts reflect configuration; the pack does not open a " +
+      "live connection to probe them during generation."
+  );
   lines.push("");
   if (servers.length === 0) {
     lines.push(
-      "This preview did not enumerate connected MCP servers. " +
-        PLACEHOLDER_BADGE
+      "No MCP tool servers are configured on this fortress. " + PLACEHOLDER_BADGE
     );
   } else {
-    lines.push("| Server | Transport | State | Tools |");
-    lines.push("|---|---|---|---|");
+    lines.push("| Server | Transport | Enabled | State | Tools |");
+    lines.push("|---|---|---|---|---|");
     for (const s of servers) {
+      const enabled = s.enabled === undefined ? "-" : s.enabled ? "yes" : "no";
       lines.push(
-        `| ${s.name} | ${s.transport ?? "-"} | ${s.connection_state ?? "-"} | ${s.tool_count ?? "-"} |`
+        `| ${s.name} | ${s.transport ?? "-"} | ${enabled} | ${s.connection_state ?? "-"} | ${s.tool_count ?? "-"} |`
       );
     }
   }
@@ -241,6 +248,19 @@ function renderInventory(inv: InventorySnapshot): PackSection {
       );
     }
   }
+  lines.push("");
+  // Closing reinforcement (printed whether the tables above are empty or full):
+  // a POPULATED inventory is still not a complete picture, so a reader who
+  // skips the coverage-basis header still sees the invisibility bound right
+  // after the rows. This must never be dropped (paramount honesty rule).
+  lines.push(
+    "What is NOT in this inventory: any AI tool Sanctuary does not wrap or " +
+      "observe. A populated list above is the AI use Sanctuary can see on this " +
+      "install, NOT a complete census of the firm's AI use. Browser-based AI " +
+      "(ChatGPT in a browser tab), AI embedded in other applications, and use " +
+      "on phones or unmanaged machines do not appear here and are covered by " +
+      "the written policy and per-attorney attestations, not by this list."
+  );
   lines.push("");
   return { title: "AI tool inventory", markdown: lines.join("\n") };
 }
@@ -426,14 +446,19 @@ function renderIncidentResponse(): PackSection {
 
 // ── Section 10: verification instructions ────────────────────────────
 
-function renderVerification(signerDid: string): PackSection {
+function renderVerification(
+  signerDid: string,
+  discreteExports: DiscreteExportsStatus
+): PackSection {
   const body = [
     "# Verifying this pack as a third party",
     "",
     "_For an underwriter or a client's auditor who does not trust the vendor._",
     "",
-    "Each Markdown file in this pack is individually SHA-256 hashed and " +
-      "Ed25519-signed with the firm's primary identity; the signatures and " +
+    "## 1. Pack integrity (firm identity)",
+    "",
+    "Each Markdown and export file in this pack is individually SHA-256 hashed " +
+      "and Ed25519-signed with the firm's primary identity; the signatures and " +
       "hashes are recorded in `00_pack_manifest.json`. To verify a file " +
       "without any Sanctuary software:",
     "",
@@ -447,15 +472,71 @@ function renderVerification(signerDid: string): PackSection {
       "cryptographically signed (this is deliberate). Integrity lives in the " +
       "signed Markdown files and the manifest, not in the PDF.",
     "",
-    "Where the discrete evidence exports are included alongside this pack " +
-      "(the signed transparency checkpoint bundle, any public-anchor evidence, " +
-      "and the audit-chain export), an auditor can independently confirm the " +
-      "recorded enforcement history with the shipped standalone " +
-      "`verify-transparency` tool, on a separate machine, using only the " +
-      "bundle and an out-of-band copy of the public key.",
+    "## 2. Independent enforcement-history verification (no vendor contact)",
     "",
-  ].join("\n");
-  return { title: "Verifying this pack", markdown: body };
+    "The pack gathers the discrete, independently-verifiable exports below so " +
+      "you can confirm the recorded enforcement history on a separate machine, " +
+      "offline, using only these files and an out-of-band copy of the relevant " +
+      "public key. Note the DISTINCT keys: the transparency bundle is signed by " +
+      "the Castle Wall signer key, not the firm identity above; do not conflate " +
+      "them.",
+    "",
+    "### Transparency checkpoint bundle",
+    "",
+  ];
+
+  if (discreteExports.transparency.included) {
+    body.push(
+      `Included as \`${discreteExports.transparency.filename}\`. Verify it ` +
+        "offline with the shipped standalone tool, pinning the Castle Wall " +
+        "public key you obtained out of band:",
+      "",
+      "```",
+      `verify-transparency --input ${discreteExports.transparency.filename} --public-key <castle-wall-public-key>`,
+      "```",
+      "",
+      "A PASS (exit 0) confirms the signed checkpoint chain. A stale but " +
+        "genesis-rooted bundle can still pass offline verification; only " +
+        "public anchoring (below) plus a pinned log key adds freshness and " +
+        "fork detection.",
+      ""
+    );
+  } else {
+    body.push(
+      `Not included: ${discreteExports.transparency.reason} When a fortress ` +
+        "has emitted enforcement checkpoints, this pack includes the bundle " +
+        "and the one-line verify command above.",
+      ""
+    );
+  }
+
+  body.push("### Audit-chain export", "");
+  if (discreteExports.audit_chain.included) {
+    body.push(
+      `Included as \`${discreteExports.audit_chain.filename}\` (JSONL: entry ` +
+        "records plus checkpoint and rotation anchors). Verify its hash chain " +
+        "with the shipped audit-chain verifier; the export carries encrypted " +
+        "payload bytes only (no plaintext content is exposed).",
+      ""
+    );
+  } else {
+    body.push(`Not included: ${discreteExports.audit_chain.reason}`, "");
+  }
+
+  body.push("### Public-anchor (Rekor) evidence", "");
+  if (discreteExports.anchor.included) {
+    body.push(
+      `Included as \`${discreteExports.anchor.filename}\`. It lets an auditor ` +
+        "confirm the checkpoints were publicly anchored (freshness and fork " +
+        "detection). It contains salted commitments handed over deliberately, " +
+        "never content.",
+      ""
+    );
+  } else {
+    body.push(`Not included: ${discreteExports.anchor.reason}`, "");
+  }
+
+  return { title: "Verifying this pack", markdown: body.join("\n") };
 }
 
 // ── Section 11: scope and limits (mandatory) ─────────────────────────
@@ -531,6 +612,7 @@ export function renderSections(params: {
   productName: string;
   aggregation: QuarterAggregation;
   shortfall: ShortfallReport;
+  discreteExports: DiscreteExportsStatus;
 }): PackSection[] {
   const inv = params.input.inventory ?? {};
   return [
@@ -550,7 +632,7 @@ export function renderSections(params: {
     renderAccessLog(params.aggregation, params.shortfall),
     renderCustody(params.input.custody),
     renderIncidentResponse(),
-    renderVerification(params.signerDid),
+    renderVerification(params.signerDid, params.discreteExports),
     renderScopeAndLimits(),
     renderPerMachineAppendix(),
   ];

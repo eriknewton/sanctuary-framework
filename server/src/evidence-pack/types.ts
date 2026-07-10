@@ -240,6 +240,48 @@ export interface CustodyFacts {
   no_outbound_by_default: boolean;
 }
 
+/** MIME type of an emitted pack file. */
+export type EvidencePackContentType =
+  | "text/markdown"
+  | "application/json"
+  | "application/jsonl";
+
+/**
+ * The discrete, independently-verifiable exports the evidence pack gathers so a
+ * third party can confirm the recorded enforcement history WITHOUT contacting
+ * the vendor: the signed transparency-checkpoint bundle (verifiable offline
+ * with the shipped `verify-transparency` tool under the Castle Wall signer
+ * key), the audit-chain JSONL export (verifiable with the audit-chain
+ * verifier), and, where public anchoring is enabled, the Rekor anchor
+ * evidence. Each is optional; an absent export carries a reason string so the
+ * appendix states honestly why it is not included rather than implying it was
+ * withheld.
+ */
+export interface EvidencePackDiscreteExports {
+  /** The `SANCTUARY_TRANSPARENCY_BUNDLE_V1` JSON, when checkpoints exist. */
+  transparency_bundle_json?: string;
+  /** Why the transparency bundle is absent (e.g. no checkpoints emitted yet). */
+  transparency_absent_reason?: string;
+  /** The audit-chain JSONL export (entry + checkpoint/anchor records). */
+  audit_chain_jsonl?: string;
+  /** Why the audit-chain export is absent, when it could not be produced. */
+  audit_chain_absent_reason?: string;
+  /** The public-anchor (Rekor) evidence JSON, when anchoring is enabled. */
+  anchor_evidence_json?: string;
+  /** Why the anchor evidence is absent (default: anchoring is opt-in / off). */
+  anchor_absent_reason?: string;
+}
+
+/**
+ * Which discrete exports were actually included, threaded into the verification
+ * appendix so it lists concrete files + honest "not included because" notes.
+ */
+export interface DiscreteExportsStatus {
+  transparency: { included: boolean; reason?: string; filename?: string };
+  audit_chain: { included: boolean; reason?: string; filename?: string };
+  anchor: { included: boolean; reason?: string; filename?: string };
+}
+
 /** Input to {@link buildEvidencePack}. */
 export interface EvidencePackInput {
   /** Firm name for the cover page. */
@@ -252,13 +294,20 @@ export interface EvidencePackInput {
   inventory?: InventorySnapshot;
   /** Per-install custody facts for the data-boundary statement. */
   custody?: CustodyFacts;
+  /**
+   * Optional discrete third-party verification exports gathered alongside the
+   * pack (slice 2). When present, each export is signed into the manifest and
+   * the verification appendix references the concrete file plus exact
+   * instructions instead of conditional language.
+   */
+  discrete_exports?: EvidencePackDiscreteExports;
 }
 
 /** One emitted file in the evidence pack. */
 export interface EvidencePackFile {
   filename: string;
   content: string;
-  content_type: "text/markdown" | "application/json";
+  content_type: EvidencePackContentType;
   /** Lowercase hex SHA-256 of the content bytes. */
   sha256: string;
   /** Base64url Ed25519 signature over the SHA-256 digest, signer's primary identity. */
@@ -281,7 +330,7 @@ export interface EvidencePackManifest {
   };
   files: Array<{
     filename: string;
-    content_type: "text/markdown" | "application/json";
+    content_type: EvidencePackContentType;
     sha256: string;
     signature: string;
   }>;

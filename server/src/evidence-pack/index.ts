@@ -26,12 +26,17 @@ export {
 export { aggregateQuarter, categorizeEntry, detectShortfall } from "./aggregate.js";
 export { renderSections, PACK_DISCLAIMER } from "./sections.js";
 export type { PackSection } from "./sections.js";
+export { buildInventorySnapshot } from "./inventory.js";
+export type { InventorySources, ProxyServerView } from "./inventory.js";
 export {
   buildEvidencePack,
   PRODUCT_NAME,
   REPORT_FILENAME,
   MANIFEST_FILENAME,
   PDF_FILENAME,
+  TRANSPARENCY_BUNDLE_FILENAME,
+  AUDIT_CHAIN_FILENAME,
+  ANCHOR_EVIDENCE_FILENAME,
 } from "./generate.js";
 export type { BuildEvidencePackDeps } from "./generate.js";
 export {

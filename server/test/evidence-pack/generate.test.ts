@@ -232,4 +232,42 @@ describe("buildEvidencePack", () => {
     expect(pack.manifest.coverage.covered_to_exclusive).not.toBe("2026-10-01T00:00:00.000Z");
     expect(pack.files[0]!.content).toContain("PARTIAL QUARTER");
   });
+
+  it("slice 2: a POPULATED inventory still prints the coverage-basis + never-complete language", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: [
+            {
+              agent_id: "coding-bot",
+              harness: "claude_code",
+              model_vendor: "anthropic",
+              model_id: "claude-opus-4",
+              wrapped_at: "2026-07-15T00:00:00.000Z",
+              status: "active",
+            },
+          ],
+          mcp_servers: [
+            { name: "filesystem", transport: "stdio", enabled: true },
+          ],
+          observed_destinations: [
+            { host: "api.openai.com", port: 443, protocol: "tcp", times_seen: 3, exfil_risk: false },
+          ],
+        },
+      },
+      { entries: [], retention: FULL_COVERAGE, signer, masterKey }
+    );
+    const report = pack.files[0]!.content;
+    // The enumerated rows are actually rendered.
+    expect(report).toContain("coding-bot");
+    expect(report).toContain("filesystem");
+    expect(report).toContain("api.openai.com");
+    // ...and the paramount honesty language is STILL present with a full list.
+    expect(report).toContain("Coverage basis");
+    expect(report).toContain("INVISIBLE to this inventory");
+    expect(report).toContain("never be read as an exhaustive list");
+    expect(report).toContain("What is NOT in this inventory");
+    expect(report).toContain("NOT a complete census");
+  });
 });
