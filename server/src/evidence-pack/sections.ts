@@ -68,7 +68,8 @@ function renderCover(
   window: QuarterWindow,
   generatedAt: string,
   signerDid: string,
-  productName: string
+  productName: string,
+  shortfall: ShortfallReport
 ): PackSection {
   const body = [
     `# ${productName}`,
@@ -79,8 +80,22 @@ function renderCover(
     "",
     `**Generated:** ${generatedAt}`,
     "",
+    `**Coverage attested through:** ${shortfall.covered_to_exclusive} (exclusive)`,
+    "",
     `**Signer identity:** ${signerDid}`,
     "",
+  ];
+  if (shortfall.in_progress_quarter) {
+    body.push(
+      "> PARTIAL QUARTER: this report was generated before " +
+        window.label +
+        " ended. It covers only the portion of the quarter through the " +
+        "generation time above, NOT the full quarter. Regenerate after the " +
+        "quarter closes for a complete report.",
+      ""
+    );
+  }
+  body.push(
     "This document answers, one for one, the five questions a legal " +
       "malpractice carrier now asks about AI use, and gives a third party " +
       "the instructions to verify the underlying evidence without trusting " +
@@ -88,9 +103,9 @@ function renderCover(
     "",
     "## Disclaimer",
     "",
-    PACK_DISCLAIMER,
-  ].join("\n");
-  return { title: productName, markdown: body };
+    PACK_DISCLAIMER
+  );
+  return { title: productName, markdown: body.join("\n") };
 }
 
 // ── Section 2: executive summary ─────────────────────────────────────
@@ -101,11 +116,23 @@ function renderExecutiveSummary(
   inv: InventorySnapshot
 ): PackSection {
   const machines = "1 (this Sanctuary install)";
-  const toolCount =
-    (inv.agents?.length ?? 0) + (inv.mcp_servers?.length ?? 0);
-  const humanApproved = agg.by_category.human_approved;
-  const denied = agg.by_category.denied + agg.by_category.human_denied;
-  const autoBlocked = agg.by_category.injection_blocked;
+  const c = agg.by_category;
+  const toolCount = (inv.agents?.length ?? 0) + (inv.mcp_servers?.length ?? 0);
+  const humanApproved = c.human_approved;
+  const humanDenied = c.human_denied;
+  const humanReviewed = humanApproved + humanDenied;
+  const autoAllowed = c.allowed + c.allowed_proxy;
+  const blendedDenied = c.denied;
+  const autoBlocked = c.injection_blocked;
+  const toolLine =
+    toolCount === 0
+      ? "**AI tools inventoried:** 0 in this preview " +
+        "(live enumeration of wrapped harnesses and connected AI tool servers " +
+        "is wired in a later slice; see the inventory section for the coverage " +
+        "basis - this is NOT a claim that the firm uses no AI tools)."
+      : `**AI tools inventoried:** ${toolCount} ` +
+        "(wrapped harnesses and connected AI tool servers this install can " +
+        "see; see the inventory section for coverage limits).";
 
   const lines = [
     "# Executive summary",
@@ -113,21 +140,20 @@ function renderExecutiveSummary(
     "In plain terms, for the reporting quarter:",
     "",
     `- **Machines covered:** ${machines}.`,
-    `- **AI tools inventoried:** ${toolCount} ` +
-      "(wrapped harnesses and connected AI tool servers this install can see; " +
-      "see the inventory section for coverage limits).",
-    `- **Actions reviewed by a human at the control point:** ${humanApproved}.`,
-    `- **Actions blocked or denied:** ${denied} denied, ${autoBlocked} auto-blocked.`,
+    `- ${toolLine}`,
+    `- **Actions reviewed by a human at the control point:** ${humanReviewed} ` +
+      `(${humanApproved} approved, ${humanDenied} denied through the inbox).`,
+    `- **Automated decisions:** ${autoAllowed} allowed, ${autoBlocked} blocked as ` +
+      "prompt injection.",
+    `- **Denied (automated policy or human control point):** ${blendedDenied} ` +
+      "(these share one audit operation and cannot be split here; see section 6).",
     `- **Total recorded control-point decisions in the quarter:** ${agg.total_in_window}.`,
     "- **Unresolved incidents:** none surfaced by this preview " +
       "(the incident-response section is a labeled placeholder in this build).",
     "",
   ];
   if (shortfall.shortfall) {
-    lines.push(
-      "> COVERAGE NOTICE: " + shortfall.explanation,
-      ""
-    );
+    lines.push("> COVERAGE NOTICE: " + shortfall.explanation, "");
   }
   lines.push(
     "These counts reflect enforcement decisions at Sanctuary's control " +
@@ -275,14 +301,39 @@ function renderHumanReview(agg: QuarterAggregation): PackSection {
     "",
     "Every high-risk (Tier 1) action requires a human approval before it " +
       "runs, and each approval or denial is recorded in the tamper-evident " +
-      "audit log with a timestamp. For the reporting quarter:",
+      "audit log with a timestamp. The counts below separate decisions a HUMAN " +
+      "made at the control point from decisions the automated policy tiers made " +
+      "without a human, so this section never presents an automated decision as " +
+      "human oversight, or the reverse.",
+    "",
+    "## Decisions a human made",
     "",
     "| Outcome | Count |",
     "|---|---|",
     `| Human-approved at the control point | ${c.human_approved} |`,
-    `| Human-denied at the control point | ${c.human_denied} |`,
-    `| Escalated for human decision | ${c.escalated} |`,
-    `| Denied by policy | ${c.denied} |`,
+    `| Human-denied through the cross-harness inbox | ${c.human_denied} |`,
+    "",
+    "## Decisions the automated tiers made (no human)",
+    "",
+    "| Outcome | Count |",
+    "|---|---|",
+    `| Auto-allowed (low-risk tier) | ${c.allowed} |`,
+    `| Auto-allowed via proxy | ${c.allowed_proxy} |`,
+    `| Blocked as prompt injection | ${c.injection_blocked} |`,
+    `| Unclassified | ${c.unclassified} |`,
+    "",
+    "## Denials (blended - see note)",
+    "",
+    "| Outcome | Count |",
+    "|---|---|",
+    `| Denied (automated policy OR human control point) | ${c.denied} |`,
+    "",
+    "NOTE on the denial count: Sanctuary writes the SAME audit operation for a " +
+      "human control-point denial and for an automated policy / invalid-proof / " +
+      "channel-failure denial, so this report cannot split them from the log " +
+      "alone. It is therefore shown as a single blended figure and is NOT " +
+      "claimed to be purely automated enforcement. The per-entry audit log " +
+      "distinguishes them for an auditor who reconciles against it.",
     "",
     "This measures human review of AI ACTIONS at Sanctuary's control point. " +
       "It shows a human was in the loop for gated actions; it does not, on " +
@@ -313,16 +364,16 @@ function renderAccessLog(
     "",
     "| Decision | Count |",
     "|---|---|",
-    `| Allowed | ${c.allowed} |`,
-    `| Allowed via proxy | ${c.allowed_proxy} |`,
-    `| Denied by policy | ${c.denied} |`,
-    `| Human-denied | ${c.human_denied} |`,
+    `| Auto-allowed | ${c.allowed} |`,
+    `| Auto-allowed via proxy | ${c.allowed_proxy} |`,
+    `| Human-approved at the control point | ${c.human_approved} |`,
+    `| Denied (automated policy or human control point) | ${c.denied} |`,
+    `| Human-denied through the cross-harness inbox | ${c.human_denied} |`,
     `| Blocked as prompt injection | ${c.injection_blocked} |`,
-    `| Escalated | ${c.escalated} |`,
     `| Unclassified | ${c.unclassified} |`,
     `| Other recorded operations | ${c.other} |`,
     "",
-    `Covered window for this quarter: ${shortfall.covered_from} to ${shortfall.covered_to_exclusive} (end exclusive).`,
+    `Covered window attested for this quarter: ${shortfall.covered_from} to ${shortfall.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter.`,
     "",
   ];
   if (shortfall.shortfall) {
@@ -429,9 +480,17 @@ function renderScopeAndLimits(): PackSection {
       "verification; only opt-in public anchoring plus a pinned log key gives " +
       "an auditor freshness and fork detection.",
     "- **Self-reported binary hash; no remote attestation.**",
-    "- **Retention window.** Audit retention is size/count-based (FIFO), not " +
-      "time-based, so a busy fortress can prune early-quarter entries; this " +
-      "report detects and discloses any covered-window shortfall above.",
+    "- **Covered window (both ends).** Audit retention is size/count-based " +
+      "(FIFO), not time-based, so a busy fortress can prune early-quarter " +
+      "entries (start-side shortfall); and a report generated before the " +
+      "quarter closes can only attest coverage through its generation time " +
+      "(end-side / partial-quarter shortfall). This report detects and " +
+      "discloses both above and states the real covered-through instant, " +
+      "never assuming coverage to the quarter end.",
+    "- **Human vs automated decisions are separated.** Human control-point " +
+      "approvals/denials are counted apart from automated-tier decisions. The " +
+      "denial figure is blended (one shared audit operation) and is not " +
+      "claimed to be purely automated enforcement.",
     "- **Human-review counts** reflect the control-point operator gate, not " +
       "a supervising attorney's per-matter review.",
     "- **Attestations prove acknowledgment, not competence.**",
@@ -480,7 +539,8 @@ export function renderSections(params: {
       params.window,
       params.generatedAt,
       params.signerDid,
-      params.productName
+      params.productName,
+      params.shortfall
     ),
     renderExecutiveSummary(params.aggregation, params.shortfall, inv),
     renderInventory(inv),

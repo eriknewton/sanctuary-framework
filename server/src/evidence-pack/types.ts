@@ -51,6 +51,21 @@ export interface QuarterWindow {
  * approvals, from the entry `result`. `other` is every operation that is not
  * an enforcement-decision record (identity ops, state writes, heartbeats).
  *
+ * HUMAN vs AUTOMATED (honesty, HIGH-1 fix): the interactive control-point
+ * approval channel writes `gate_approve:` (a human approved) and `gate_deny:`
+ * (a human denied) via `principal-policy/gate.ts`, while the automated tiers
+ * write `gate_allow:` / `gate_allow_proxy:` / `gate_injection_block:` /
+ * `gate_unclassified:` (no human). `gate_approve` and the two-phase
+ * `gate_approval_proof` both map to `human_approved`. `gate_deny:` is
+ * DELIBERATELY a blended `denied`: the gate emits the SAME `gate_deny:` op
+ * string for a human control-point denial, an invalid-proof denial, and an
+ * approval-channel-failure denial, so this layer cannot separate them from the
+ * operation alone and must NOT render `denied` as purely-automated policy
+ * enforcement. The only unambiguous human denial is the cross-harness inbox
+ * resolution (`human_denied`). There is no `escalated` category: no code path
+ * emits a `gate_escalate:` op (escalations resolve to approve/deny), so a row
+ * for it would advertise a capability that does not exist.
+ *
  * HONESTY BOUND (spec risk #11): these counts reflect enforcement decisions
  * at the control point, not a supervising attorney's per-matter review. The
  * PDF wording says so and leans on the policy/attestation layer (a later
@@ -62,7 +77,6 @@ export type DecisionCategory =
   | "human_approved"
   | "human_denied"
   | "denied"
-  | "escalated"
   | "injection_blocked"
   | "unclassified"
   | "other";
@@ -114,16 +128,41 @@ export interface RetentionFacts {
  * the pack must disclose it rather than let an auditor discover it.
  */
 export interface ShortfallReport {
-  /** True when the covered window does not reach the quarter start. */
+  /**
+   * True when the covered window does not demonstrably span the full quarter,
+   * for EITHER reason: the start is uncovered (earliest retained entry is after
+   * the quarter start) OR the end is uncovered (the quarter is still in
+   * progress at generation time). Both must be disclosed, never silently
+   * passed.
+   */
   shortfall: boolean;
   /**
    * The instant from which coverage is demonstrable for this quarter: the
    * later of the quarter start and the earliest retained entry. Equal to the
-   * quarter start when there is no shortfall.
+   * quarter start when the start is fully covered.
    */
   covered_from: string;
-  /** The quarter end (exclusive) - coverage always reaches the generation-day tail within the window. */
+  /**
+   * The exclusive upper bound of DEMONSTRABLE coverage (HIGH-2 fix). This is
+   * `min(quarter end, generation instant)`: the pack can never attest coverage
+   * of a period after the moment it was generated, so an in-progress quarter
+   * caps this at the generation time rather than the (future) quarter end. It
+   * is NOT unconditionally the quarter end.
+   */
   covered_to_exclusive: string;
+  /**
+   * True when the quarter had not ended at generation time (the report covers a
+   * PARTIAL quarter). The default one-command CLI targets the current quarter,
+   * so this is the common case and must be stamped prominently.
+   */
+  in_progress_quarter: boolean;
+  /**
+   * Timestamp of the last audit entry actually observed inside the covered
+   * window, or null when the window held no entries. Surfaced so an auditor
+   * sees the real tail of recorded activity rather than inferring coverage to
+   * the quarter end.
+   */
+  last_entry_at: string | null;
   /**
    * True when the retained log is at or above its FIFO cap, which means
    * pruning is actively occurring and early-quarter entries were LIKELY
@@ -131,7 +170,7 @@ export interface ShortfallReport {
    * Distinguishing these two causes keeps the disclosure honest.
    */
   retention_at_cap: boolean;
-  /** A one-line, lay-reader explanation suitable for printing in the PDF. */
+  /** A lay-reader explanation suitable for printing in the PDF. */
   explanation: string;
 }
 
@@ -249,8 +288,11 @@ export interface EvidencePackManifest {
   /** The covered-window shortfall disclosure, machine-readable. */
   coverage: {
     covered_from: string;
+    /** Exclusive upper bound of demonstrable coverage = min(quarter end, generation instant). */
     covered_to_exclusive: string;
     shortfall: boolean;
+    /** True when the quarter had not ended at generation time (partial quarter). */
+    in_progress_quarter: boolean;
     retention_at_cap: boolean;
   };
   manifest_signature: string;

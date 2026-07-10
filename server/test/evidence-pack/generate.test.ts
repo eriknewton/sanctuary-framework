@@ -173,4 +173,63 @@ describe("buildEvidencePack", () => {
     expect(pdf).toContain("AI tool inventory");
     expect(pdf).toContain("Scope and limits");
   });
+
+  it("HIGH-1: counts live gate_approve as human review and never labels human denials as automated policy", () => {
+    const pack = buildEvidencePack(baseInput(), {
+      entries: [
+        entry("2026-08-01T00:00:00.000Z", "gate_approve:tool_a"),
+        entry("2026-08-02T00:00:00.000Z", "gate_approve:tool_b"),
+        entry("2026-08-03T00:00:00.000Z", "gate_deny:tool_c", "failure"),
+        entry("2026-08-04T00:00:00.000Z", "gate_allow:tool_d"),
+      ],
+      retention: FULL_COVERAGE,
+      signer,
+      masterKey,
+    });
+    expect(pack.aggregation.by_category.human_approved).toBe(2);
+    expect(pack.aggregation.by_category.other).toBe(0);
+    const report = pack.files[0]!.content;
+    // Human review section shows the 2 human approvals.
+    expect(report).toContain("Human-approved at the control point | 2");
+    // The blended-denial honesty note is present; denials are not called purely automated.
+    expect(report).toContain("automated policy OR human control point");
+    expect(report).not.toContain("Denied by policy");
+  });
+
+  it("MED-1: renders no phantom Escalated row", () => {
+    const pack = buildEvidencePack(baseInput(), {
+      entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+      retention: FULL_COVERAGE,
+      signer,
+      masterKey,
+    });
+    expect(pack.files[0]!.content).not.toContain("Escalated");
+  });
+
+  it("HIGH-2: an in-progress quarter is stamped PARTIAL, shortfall:true, covered_to capped at generation time", () => {
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-15T12:00:00.000Z", // mid-Q3
+        custody: { custody_mode: "passphrase", no_outbound_by_default: true },
+      },
+      {
+        entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+        retention: {
+          max_entries: 100_000,
+          retained_total: 3,
+          earliest_retained_at: "2026-06-01T00:00:00.000Z", // start covered
+        },
+        signer,
+        masterKey,
+      }
+    );
+    expect(pack.manifest.coverage.in_progress_quarter).toBe(true);
+    expect(pack.manifest.coverage.shortfall).toBe(true);
+    // covered_to is the generation instant, NOT the future quarter end (2026-10-01).
+    expect(pack.manifest.coverage.covered_to_exclusive).toBe("2026-08-15T12:00:00.000Z");
+    expect(pack.manifest.coverage.covered_to_exclusive).not.toBe("2026-10-01T00:00:00.000Z");
+    expect(pack.files[0]!.content).toContain("PARTIAL QUARTER");
+  });
 });

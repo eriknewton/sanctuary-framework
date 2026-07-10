@@ -1814,19 +1814,6 @@ export class AuditLog {
    * 2026-06-16; fail-closed — never a leak, but `count` was incomplete).
    * `total` reflects the post-filter population so callers can detect truncation.
    */
-  /**
-   * Read-only view of the configured FIFO retention caps. Exposed for
-   * calendar-period reporters (the law-firm evidence pack) that must disclose
-   * a covered-window shortfall when size-based retention may have pruned
-   * early-period entries. Returns configuration only; no entries, no keys.
-   */
-  getRetentionConfig(): { maxEntries: number; maxTotalSizeBytes: number } {
-    return {
-      maxEntries: this.maxEntries,
-      maxTotalSizeBytes: this.maxTotalSizeBytes,
-    };
-  }
-
   async query(options: {
     since?: string;
     layer?: AuditEntry["layer"];
@@ -1881,6 +1868,19 @@ export class AuditLog {
     const entries = filtered.slice(-limit); // Most recent entries
 
     return { entries, total, integrity_findings: [...this.integrityFindings] };
+  }
+
+  /**
+   * Read-only view of the configured FIFO retention caps. Exposed for
+   * calendar-period reporters (the law-firm evidence pack) that must disclose
+   * a covered-window shortfall when size-based retention may have pruned
+   * early-period entries. Returns configuration only; no entries, no keys.
+   */
+  getRetentionConfig(): { maxEntries: number; maxTotalSizeBytes: number } {
+    return {
+      maxEntries: this.maxEntries,
+      maxTotalSizeBytes: this.maxTotalSizeBytes,
+    };
   }
 
   /**
