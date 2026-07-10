@@ -66,6 +66,9 @@ beforeEach(async () => {
 const RETENTION: RetentionFacts = {
   max_entries: 100_000,
   retained_total: 1,
+  max_total_size_bytes: 100 * 1024 * 1024,
+  retained_total_size_bytes: 0,
+  ever_pruned: false,
   earliest_retained_at: "2026-06-01T00:00:00.000Z",
 };
 

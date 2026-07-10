@@ -110,7 +110,7 @@ export function buildPackManifest(params: {
   ds: PackSigner;
 }): EvidencePackManifest {
   const body: Omit<EvidencePackManifest, "manifest_signature"> = {
-    pack_version: "1.0",
+    pack_version: "0.1-preview",
     slice: "walking-skeleton-v1",
     product_name: params.productName,
     firm_name: params.firmName,

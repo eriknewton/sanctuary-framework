@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
@@ -26,14 +26,33 @@ import {
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GATE_TS = join(HERE, "..", "..", "src", "principal-policy", "gate.ts");
+const PRINCIPAL_POLICY_DIR = join(HERE, "..", "..", "src", "principal-policy");
 
-/** Extract the set of `gate_*` audit-operation prefixes emitted in gate.ts. */
+/** Recursively list every .ts file under a directory. */
+function tsFilesUnder(dir: string): string[] {
+  const out: string[] = [];
+  for (const ent of readdirSync(dir, { withFileTypes: true })) {
+    const p = join(dir, ent.name);
+    if (ent.isDirectory()) out.push(...tsFilesUnder(p));
+    else if (ent.name.endsWith(".ts")) out.push(p);
+  }
+  return out;
+}
+
+/**
+ * Extract the set of `gate_*` audit-operation prefixes emitted across the WHOLE
+ * `principal-policy/` tree (L2-L3: a future `gate_*` producer added in another
+ * module must not evade this build-time completeness gate), plus the dynamic
+ * `gate_${decision}:` producer's union members derived from gate.ts.
+ */
 function emittedGateOpPrefixes(): Set<string> {
   const src = readFileSync(GATE_TS, "utf8");
   const prefixes = new Set<string>();
-  // Literal producers, e.g. `operation: `gate_allow:${...}``.
-  for (const m of src.matchAll(/operation:\s*`(gate_[a-z_]+):/g)) {
-    prefixes.add(m[1]!);
+  // Literal producers, e.g. `operation: `gate_allow:${...}``, across the tree.
+  for (const file of tsFilesUnder(PRINCIPAL_POLICY_DIR)) {
+    for (const m of readFileSync(file, "utf8").matchAll(/operation:\s*`(gate_[a-z_]+):/g)) {
+      prefixes.add(m[1]!);
+    }
   }
   // The dynamic producer `operation: `gate_${response.decision}:...``. Rather
   // than hardcode {approve, deny}, DERIVE the decision union members from the

@@ -87,16 +87,40 @@ describe("aggregateQuarter", () => {
     expect(agg.by_category.injection_blocked).toBe(1);
   });
 
-  it("categorizes cross-harness approvals by result", () => {
+  it("HIGH-1: cross-harness approval resolution is OBSERVATIONAL (other), not a second human decision", () => {
+    // De-dup: this op is paired with a gate_approve/gate_deny for the SAME
+    // decision, so counting it would double the human-review figure.
     expect(
       categorizeEntry(entry("2026-08-01T00:00:00.000Z", "cross_harness_approval_resolved", "success"))
-    ).toBe("human_approved");
+    ).toBe("other");
     expect(
       categorizeEntry(entry("2026-08-01T00:00:00.000Z", "cross_harness_approval_resolved", "failure"))
-    ).toBe("human_denied");
+    ).toBe("other");
     expect(
       categorizeEntry(entry("2026-08-01T00:00:00.000Z", "identity_create"))
     ).toBe("other");
+  });
+
+  it("HIGH-1: the approval-inbox scenario (both ops for one approval) counts ONE human approval", () => {
+    // One human approval via the cross-harness inbox writes BOTH ops.
+    const agg = aggregateQuarter(
+      [
+        entry("2026-08-10T00:00:00.000Z", "gate_approve:tool_a"),
+        entry("2026-08-10T00:00:00.000Z", "cross_harness_approval_resolved", "success"),
+      ],
+      Q3_2026
+    );
+    expect(agg.by_category.human_approved).toBe(1);
+    // One human denial likewise counts once (gate_deny), not twice.
+    const agg2 = aggregateQuarter(
+      [
+        entry("2026-08-11T00:00:00.000Z", "gate_deny:tool_b", "failure"),
+        entry("2026-08-11T00:00:00.000Z", "cross_harness_approval_resolved", "failure"),
+      ],
+      Q3_2026
+    );
+    expect(agg2.by_category.denied).toBe(1);
+    expect(agg2.by_category.human_denied).toBe(0);
   });
 
   it("HIGH-1: maps the LIVE gate op strings to the right human/automated bucket", () => {
@@ -157,90 +181,124 @@ describe("aggregateQuarter", () => {
 
 describe("detectShortfall", () => {
   const cap = 100_000;
-  // A generation instant AFTER Q3 ends, so these tests isolate START-side
-  // behavior (the quarter is complete, no in-progress shortfall).
   const AFTER_Q3 = "2026-11-01T00:00:00.000Z";
   const complete = { generatedAt: AFTER_Q3, lastEntryAt: null };
 
-  it("reports no shortfall when the earliest entry precedes the quarter AND the quarter is complete", () => {
-    const retention: RetentionFacts = {
+  function ret(over: Partial<RetentionFacts>): RetentionFacts {
+    return {
       max_entries: cap,
       retained_total: 10,
+      max_total_size_bytes: 100 * 1024 * 1024,
+      retained_total_size_bytes: 0,
+      ever_pruned: false,
       earliest_retained_at: "2026-06-15T00:00:00.000Z",
+      ...over,
     };
-    const r = detectShortfall(Q3_2026, retention, complete);
+  }
+
+  it("reports no shortfall when the earliest entry precedes the quarter AND the quarter is complete", () => {
+    const r = detectShortfall(Q3_2026, ret({ earliest_retained_at: "2026-06-15T00:00:00.000Z" }), complete);
     expect(r.shortfall).toBe(false);
     expect(r.in_progress_quarter).toBe(false);
     expect(r.covered_from).toBe(Q3_2026.start_inclusive);
-    // A complete quarter's coverage reaches the quarter end, not beyond.
     expect(r.covered_to_exclusive).toBe(Q3_2026.end_exclusive);
   });
 
-  it("reports a shortfall with retention_at_cap when the log is full and starts mid-quarter", () => {
-    const retention: RetentionFacts = {
-      max_entries: cap,
-      retained_total: cap,
-      earliest_retained_at: "2026-08-01T00:00:00.000Z",
-    };
-    const r = detectShortfall(Q3_2026, retention, complete);
+  it("reports a shortfall with retention_at_cap when the entry cap is full and starts mid-quarter", () => {
+    const r = detectShortfall(
+      Q3_2026,
+      ret({ retained_total: cap, earliest_retained_at: "2026-08-01T00:00:00.000Z", ever_pruned: true }),
+      complete
+    );
     expect(r.shortfall).toBe(true);
     expect(r.retention_at_cap).toBe(true);
     expect(r.covered_from).toBe("2026-08-01T00:00:00.000Z");
     expect(r.explanation).toMatch(/pruned/i);
   });
 
-  it("reports a shortfall attributed to inactivity when the log is below its cap", () => {
-    const retention: RetentionFacts = {
-      max_entries: cap,
-      retained_total: 42,
-      earliest_retained_at: "2026-08-01T00:00:00.000Z",
-    };
-    const r = detectShortfall(Q3_2026, retention, complete);
+  it("HIGH-5: a SIZE-cap prune below the entry cap is treated as a possible pruning shortfall", () => {
+    // retained_total (42) is far below max_entries, but the on-disk size is at
+    // the 100 MB cap -> size-based pruning; must NOT affirm "not pruned".
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        retained_total: 42,
+        retained_total_size_bytes: 100 * 1024 * 1024,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: true,
+      }),
+      complete
+    );
+    expect(r.shortfall).toBe(true);
+    expect(r.retention_at_cap).toBe(true); // size cap counts
+    expect(r.explanation).toMatch(/pruned/i);
+    expect(r.explanation).not.toMatch(/no recorded activity/i);
+  });
+
+  it("affirms genuine inactivity ONLY when the log never pruned AND is below both caps", () => {
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        retained_total: 42,
+        retained_total_size_bytes: 10,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: false,
+      }),
+      complete
+    );
     expect(r.shortfall).toBe(true);
     expect(r.retention_at_cap).toBe(false);
     expect(r.explanation).toMatch(/no recorded activity/i);
   });
 
+  it("HIGH-5: below both caps but ever_pruned true (or unknown) does NOT affirm 'not pruned'", () => {
+    const rUnknown = detectShortfall(
+      Q3_2026,
+      ret({ retained_total: 42, retained_total_size_bytes: 10, earliest_retained_at: "2026-08-01T00:00:00.000Z", ever_pruned: null }),
+      complete
+    );
+    expect(rUnknown.explanation).not.toMatch(/no recorded activity/i);
+    expect(rUnknown.explanation).toMatch(/cannot be ruled out|pruned/i);
+  });
+
+  it("M1: the whole retained window post-dating the quarter reports ZERO covered, not a backwards window", () => {
+    // Reporting Q3 but the earliest surviving entry is in Q4 (after quarter end).
+    const r = detectShortfall(
+      Q3_2026,
+      ret({ retained_total: 5, earliest_retained_at: "2026-11-01T00:00:00.000Z", ever_pruned: true }),
+      complete
+    );
+    expect(r.shortfall).toBe(true);
+    // covered_from is NOT the out-of-quarter date; it stays the quarter start.
+    expect(r.covered_from).toBe(Q3_2026.start_inclusive);
+    expect(r.explanation).toMatch(/NONE of this quarter is covered/);
+  });
+
   it("reports a shortfall when the log holds no retained entries", () => {
-    const retention: RetentionFacts = {
-      max_entries: cap,
-      retained_total: 0,
-      earliest_retained_at: null,
-    };
-    const r = detectShortfall(Q3_2026, retention, complete);
+    const r = detectShortfall(Q3_2026, ret({ retained_total: 0, earliest_retained_at: null }), complete);
     expect(r.shortfall).toBe(true);
   });
 
-  it("HIGH-2: an in-progress quarter yields shortfall:true and caps covered_to at the generation instant", () => {
-    // Generated mid-Q3: the start is fully covered, but the END is not.
+  it("HIGH-2: an in-progress quarter caps covered_to at the generation instant", () => {
     const genMid = "2026-08-15T12:00:00.000Z";
-    const retention: RetentionFacts = {
-      max_entries: cap,
-      retained_total: 10,
-      earliest_retained_at: "2026-06-01T00:00:00.000Z", // start fully covered
-    };
-    const r = detectShortfall(Q3_2026, retention, {
-      generatedAt: genMid,
-      lastEntryAt: "2026-08-15T11:00:00.000Z",
-    });
+    const r = detectShortfall(
+      Q3_2026,
+      ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+      { generatedAt: genMid, lastEntryAt: "2026-08-15T11:00:00.000Z" }
+    );
     expect(r.shortfall).toBe(true);
     expect(r.in_progress_quarter).toBe(true);
-    // covered_to is the generation instant, NOT the (future) quarter end.
     expect(r.covered_to_exclusive).toBe(genMid);
     expect(r.covered_to_exclusive).not.toBe(Q3_2026.end_exclusive);
     expect(r.explanation).toMatch(/PARTIAL QUARTER/);
   });
 
   it("HIGH-2: covered_to is the quarter end (never beyond) for a completed quarter generated later", () => {
-    const retention: RetentionFacts = {
-      max_entries: cap,
-      retained_total: 10,
-      earliest_retained_at: "2026-06-01T00:00:00.000Z",
-    };
-    const r = detectShortfall(Q3_2026, retention, {
-      generatedAt: "2026-12-01T00:00:00.000Z",
-      lastEntryAt: "2026-09-20T00:00:00.000Z",
-    });
+    const r = detectShortfall(
+      Q3_2026,
+      ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+      { generatedAt: "2026-12-01T00:00:00.000Z", lastEntryAt: "2026-09-20T00:00:00.000Z" }
+    );
     expect(r.in_progress_quarter).toBe(false);
     expect(r.covered_to_exclusive).toBe(Q3_2026.end_exclusive);
   });

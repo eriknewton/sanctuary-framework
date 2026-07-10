@@ -80,10 +80,12 @@ function renderCover(
   productName: string,
   shortfall: ReadOutcome<ShortfallReport>
 ): PackSection {
-  // The covered-through line and any partial-quarter banner are DEFINITIVE
-  // coverage claims, so they may only be drawn from a completed audit read.
-  const coveredThrough = foldOutcome(shortfall, {
-    populated: (s) => `${s.covered_to_exclusive} (exclusive)`,
+  // The covered SPAN and any shortfall/partial banner are DEFINITIVE coverage
+  // claims, so they may only be drawn from a completed audit read. The cover
+  // shows BOTH bounds (not just the end) so a cover-only reader is not misled
+  // when early entries were pruned in a completed quarter (MED-1).
+  const coveredSpan = foldOutcome(shortfall, {
+    populated: (s) => `${s.covered_from} to ${s.covered_to_exclusive} (exclusive)`,
     emptyVerified: () => "could not be determined",
     readFailed: () => "could not be determined (the audit log could not be read)",
   });
@@ -96,23 +98,34 @@ function renderCover(
     "",
     `**Generated:** ${generatedAt}`,
     "",
-    `**Coverage attested through:** ${coveredThrough}`,
+    `**Coverage (signed span this report backs):** ${coveredSpan}`,
     "",
-    `**Signer identity:** ${signerDid}`,
+    `**Signer identity (the firm's own key):** ${signerDid}`,
     "",
   ];
   const banner = foldOutcome(shortfall, {
-    populated: (s) =>
-      s.in_progress_quarter
-        ? [
-            "> PARTIAL QUARTER: this report was generated before " +
-              window.label +
-              " ended. It covers only the portion of the quarter through the " +
-              "generation time above, NOT the full quarter. Regenerate after " +
-              "the quarter closes for a complete report.",
-            "",
-          ]
-        : [],
+    populated: (s) => {
+      if (s.in_progress_quarter) {
+        return [
+          "> PARTIAL QUARTER: this report was generated before " +
+            window.label +
+            " ended. It covers only the portion of the quarter through " +
+            s.covered_to_exclusive +
+            ", NOT the full quarter. Regenerate after the quarter closes for a " +
+            "complete report.",
+          "",
+        ];
+      }
+      if (s.shortfall) {
+        return [
+          "> COVERAGE NOTICE: the signed span above does NOT reach the quarter " +
+            "start; earlier-quarter access history is not in the retained log. " +
+            "See the access-log section for details.",
+          "",
+        ];
+      }
+      return [];
+    },
     emptyVerified: () => [],
     readFailed: (reason) => [
       "> COVERAGE UNAVAILABLE: the audit log could not be read, so the covered " +
@@ -124,10 +137,19 @@ function renderCover(
   });
   body.push(...banner);
   body.push(
-    "This document answers, one for one, the five questions a legal " +
-      "malpractice carrier now asks about AI use, and gives a third party " +
-      "the instructions to verify the underlying evidence without trusting " +
-      "the vendor.",
+    // HIGH-4: honest evidence-toward framing. Three of the five CNA sections are
+    // labeled placeholders in this build, and every file is self-signed with the
+    // FIRM's key (not vendor-independent), so the cover must not claim the doc
+    // "answers, one for one" all five, nor "without trusting the vendor".
+    "This document is organized around the five questions a malpractice " +
+      "carrier's AI supplement commonly asks (Sanctuary's reading of the CNA " +
+      "supplement, not a carrier-endorsed format). It presents the evidence " +
+      "Sanctuary can produce for each; sections marked NOT YET INCLUDED are " +
+      "flagged in place (in this build the governance-policy, training, and " +
+      "incident-response sections are placeholders). It also gives instructions " +
+      "to check the signed files for tampering since the firm signed them and, " +
+      "where a transparency bundle is included, to verify the enforcement " +
+      "history against a vendor-independent key.",
     "",
     "## Disclaimer",
     "",
@@ -205,7 +227,7 @@ function renderExecutiveSummary(
         `- **Actions reviewed by a human at the control point:** ${c.human_approved + c.human_denied} ` +
           `(${c.human_approved} approved, ${c.human_denied} denied through the inbox).`,
         `- **Automated decisions:** ${c.allowed + c.allowed_proxy} allowed, ${c.injection_blocked} blocked as ` +
-          "prompt injection.",
+          `prompt injection, ${c.unclassified} unclassified.`,
         `- **Denied (automated policy or human control point):** ${c.denied} ` +
           "(these share one audit operation and cannot be split here; see section 6).",
         `- **Total recorded audit operations in the quarter:** ${agg.total_in_window} ` +
@@ -237,11 +259,14 @@ function renderExecutiveSummary(
     "",
     "In plain terms, for the reporting quarter:",
     "",
-    `- **Machines covered:** ${machines}.`,
+    `- **Machines covered by this report:** ${machines}; it does not enumerate other firm machines.`,
     `- ${toolLine}`,
     ...decisionBullets,
-    "- **Unresolved incidents:** none surfaced by this preview " +
-      "(the incident-response section is a labeled placeholder in this build).",
+    // HIGH-3: never a flattering "none" from an unread source. Incident response
+    // is a placeholder in this build; make no claim in either direction.
+    "- **Incidents:** not assessed in this build. Incident-response reporting is " +
+      "a labeled placeholder (section 9); this report makes no claim, in either " +
+      "direction, about incidents this quarter.",
     "",
   ];
   const coverageNotice = foldOutcome(shortfall, {
@@ -336,7 +361,14 @@ function renderInventory(inv: InventorySnapshot): PackSection {
       emptyVerified: (witness) => [
         claimFromCompleteRead(
           witness,
-          "No observed egress destinations are recorded on this fortress."
+          // L1-MED-6: a bare "none recorded" reads as "nothing exfiltrated" on a
+          // host that does not observe egress at all (Windows, or un-walled
+          // macOS). Egress observation records only on enforced machines, so
+          // absence here is NOT evidence that no data left the machine.
+          "No egress destinations were recorded. Egress observation records " +
+            "only on enforced machines with the observe engine armed; on a " +
+            "host without it, nothing is recorded regardless of activity. " +
+            "Absence here is NOT evidence that no data left the machine."
         ),
       ],
       readFailed: (reason) => [
@@ -425,7 +457,7 @@ function renderGovernancePolicy(): PackSection {
   const body = [
     "# Written governance policy",
     "",
-    "_Answers CNA Question 2: is there a written AI governance policy._",
+    "_Maps to CNA Question 2 (written AI governance policy), delivered by the policy/attestation layer; NOT included in this build._",
     "",
     "The signed, versioned AI-use policy and its per-attorney mapping to " +
       "professional-responsibility duties are delivered by the policy and " +
@@ -449,7 +481,7 @@ function renderTrainingAttestations(): PackSection {
   const body = [
     "# Training attestations",
     "",
-    "_Answers CNA Question 3: is there AI training._",
+    "_Maps to CNA Question 3 (AI training), delivered by the policy/attestation layer; NOT included in this build._",
     "",
     "Per-attorney training attestations (a firm-signed, tamper-evident record " +
       "that attorney X acknowledged policy version Y on date Z) are captured " +
@@ -487,12 +519,15 @@ function renderHumanReview(
     "",
     "_Answers CNA Question 4: how is AI output reviewed._",
     "",
-    "Every high-risk (Tier 1) action requires a human approval before it " +
-      "runs, and each approval or denial is recorded in the tamper-evident " +
-      "audit log with a timestamp. The counts below separate decisions a HUMAN " +
-      "made at the control point from decisions the automated policy tiers made " +
-      "without a human, so this section never presents an automated decision as " +
-      "human oversight, or the reverse.",
+    "In Sanctuary's design, actions classified Tier 1 require a human approval " +
+      "before they run, and each approval or denial is recorded in the " +
+      "tamper-evident audit log with a timestamp. (Whether a given action was " +
+      "Tier 1 depends on the operator's policy configuration, which this report " +
+      "does not itself attest.) The counts below reflect the approvals and " +
+      "denials actually recorded in this install's audit log, separating " +
+      "decisions a HUMAN made at the control point from decisions the automated " +
+      "policy tiers made without a human, so this section never presents an " +
+      "automated decision as human oversight, or the reverse.",
     "",
   ];
   const body = foldOutcome(aggregation, {
@@ -572,10 +607,10 @@ function renderAccessLog(
     "",
     "_Supports CNA Question 4 and an outside-counsel audit-log ask._",
     "",
-    "Sanctuary records every gated action and every denial in a hash-chained, " +
-      "signed audit log. Denials are first-class rows here and are never " +
-      "omitted: an action that cannot hide in audit silence is the core " +
-      "honesty property of this product.",
+    "Sanctuary records gated actions and denials in a hash-chained, signed " +
+      "audit log, and denials are first-class rows here, not omitted. " +
+      "(Per-entry detail is subject to the retention limits described in Scope " +
+      "and limits.)",
     "",
   ];
   const table = foldOutcome(aggregation, {
@@ -628,21 +663,41 @@ function renderCustody(custody: ReadOutcome<CustodyFacts>): PackSection {
     "",
     "_Supports an outside-counsel data-handling ask._",
     "",
-    "The firm holds the keys; the vendor cannot read the firm's data. By " +
-      "architecture, Sanctuary stores state encrypted at rest under the " +
-      "firm's own master key, and no state data leaves the local machine " +
-      "except through an explicit, human-approved export.",
+    // MED-3 / LOW-1: tie the lead to ARCHITECTURE (conditional on the read),
+    // not an asserted per-install fact, so it does not contradict a custody row
+    // that reads "not reported by this install".
+    "By architecture, Sanctuary is designed so the master key is held by the " +
+      "firm and never received by the vendor, state is stored encrypted at rest " +
+      "under that key, and state data Sanctuary holds leaves the local machine " +
+      "only through an explicit, human-approved export. The per-install specifics " +
+      "this pack could read are shown below (a value of 'not reported' or 'not " +
+      "determinable' means the pack did not probe it, not that the property is " +
+      "absent).",
     "",
   ];
   const table = foldOutcome(custody, {
-    populated: (facts) => [
-      "| Fact | This install |",
-      "|---|---|",
-      `| Master-key custody | ${fmtCustodyMode(facts)} |`,
-      `| Outbound denied by default | ${facts.no_outbound_by_default ? "yes" : "no"} |`,
-      "| Data export | requires human (Tier 1) approval |",
-      "",
-    ],
+    populated: (facts) => {
+      // HIGH-2: the outbound row is a ReadOutcome, so an un-probed/un-walled
+      // install renders "not determinable for this install", NEVER a false "yes".
+      const outboundRow = foldOutcome(facts.outbound_denied_by_default, {
+        populated: (denied) =>
+          denied
+            ? "yes, for traffic routed through Sanctuary's gateway (this does " +
+              "NOT deny egress from other applications, e.g. a browser or " +
+              "Office add-in)"
+            : "no",
+        emptyVerified: () => "not determinable for this install",
+        readFailed: () => "not determinable for this install (not probed)",
+      });
+      return [
+        "| Fact | This install |",
+        "|---|---|",
+        `| Master-key custody | ${fmtCustodyMode(facts)} |`,
+        `| Sanctuary-gateway outbound denied by default | ${outboundRow} |`,
+        "| Data export | requires human (Tier 1) approval |",
+        "",
+      ];
+    },
     emptyVerified: () => [
       "Per-install custody facts were not supplied for this pack; the " +
         "architectural statement above still holds.",
@@ -669,7 +724,7 @@ function renderIncidentResponse(): PackSection {
   const body = [
     "# Incident response",
     "",
-    "_Answers CNA Question 5: what is the AI incident response._",
+    "_Maps to CNA Question 5 (AI incident response), delivered by the incident-response layer; NOT included in this build._",
     "",
     "The incident-response runbook, the named human who helps fill in the " +
       "carrier questionnaire, and the quarter's summary of security findings " +
@@ -716,20 +771,48 @@ function renderVerification(
       "confirm it matches the `sha256` recorded for that file in the manifest.",
     "2. Verify the Ed25519 signature over that SHA-256 digest against the " +
       `signer public key in the manifest (signer: ${signerDid}).`,
-    "3. Verify the manifest's own `manifest_signature` over its canonical body.",
+    "3. (Optional) Verify the manifest's own `manifest_signature`. Reproduce the " +
+      "canonical body EXACTLY: take the manifest JSON, DROP the " +
+      "`manifest_signature` field, sort ALL object keys recursively in ASCII " +
+      "order, serialize with NO whitespace, then Ed25519-verify " +
+      "`manifest_signature` over the SHA-256 digest of that canonical string, " +
+      "using the same signer public key. (Steps 1 and 2 are the primary, " +
+      "tool-free integrity checks; this manifest self-signature is a " +
+      "belt-and-suspenders check and depends on reproducing the canonicalization " +
+      "above.)",
     "",
     "IMPORTANT: the rendered PDF is a human-readable copy and is NOT itself " +
       "cryptographically signed (this is deliberate). Integrity lives in the " +
-      "signed Markdown files and the manifest, not in the PDF.",
+      "signed Markdown files and the manifest, not in the PDF. Section 1 " +
+      "confirms the files are unaltered since the firm signed them; it does " +
+      "NOT, by itself, prove the underlying figures are complete or accurate " +
+      "(they rest on the firm's honest use of its own signing key). Independent " +
+      "assurance of the enforcement history comes only from the transparency " +
+      "bundle in step 2, where included.",
     "",
-    "## 2. Independent enforcement-history verification (no vendor contact)",
+    "## 2. Checking the discrete exports (firm-independent, where included)",
     "",
-    "The pack gathers the discrete, independently-verifiable exports below so " +
-      "you can confirm the recorded enforcement history on a separate machine, " +
-      "offline, using only these files and an out-of-band copy of the relevant " +
-      "public key. Note the DISTINCT keys: the transparency bundle is signed by " +
-      "the Castle Wall signer key, not the firm identity above; do not conflate " +
-      "them.",
+    // MED-1 / LOW-3: gate the framing on whether ANY export is actually present,
+    // and state that a tool is required (not "only these files and a key").
+    ...(discreteExports.transparency.outcome.status === "populated" ||
+    discreteExports.audit_chain.outcome.status === "populated" ||
+    discreteExports.anchor.outcome.status === "populated"
+      ? [
+          "The pack gathered the discrete exports below so you can confirm the " +
+            "recorded enforcement history on a separate machine, offline, using " +
+            "these files, an out-of-band copy of the relevant public key, AND " +
+            "the open-source offline verifier named per export. Note the " +
+            "DISTINCT keys: the transparency bundle is signed by the Castle Wall " +
+            "signer key, not the firm identity above; do not conflate them. " +
+            "Independence here is from the VENDOR, not from the firm.",
+        ]
+      : [
+          "For this period the pack contains NONE of the discrete " +
+            "enforcement-history exports below (each reads 'Not included'), so " +
+            "there is no firm-independent enforcement-history verification in " +
+            "this pack; integrity is limited to the firm-signed files and " +
+            "manifest in section 1.",
+        ]),
     "",
     "### Transparency checkpoint bundle",
     "",
@@ -766,8 +849,16 @@ function renderVerification(
       populated: () => [
         `Included as \`${discreteExports.audit_chain.filename}\` (JSONL: entry ` +
           "records plus checkpoint and rotation anchors). Verify its hash chain " +
-          "with the shipped audit-chain verifier; the export carries encrypted " +
-          "payload bytes only (no plaintext content is exposed).",
+          "with the audit-chain verifier that ships in the open-source Sanctuary " +
+          "CLI (this requires installing that CLI; it is not a standalone " +
+          "binary):",
+        "",
+        "```",
+        `sanctuary audit-chain verify --input ${discreteExports.audit_chain.filename}`,
+        "```",
+        "",
+        "The export carries encrypted payload bytes only (no plaintext content " +
+          "is exposed).",
         "",
       ],
       emptyVerified: () => [
