@@ -60,8 +60,11 @@ export function buildEvidencePack(
 ): EvidencePack {
   const window = quarterWindow(input.quarter);
   const aggregation = aggregateQuarter(deps.entries, window);
-  const shortfall = detectShortfall(window, deps.retention);
   const generatedAt = input.generated_at_override ?? new Date().toISOString();
+  const shortfall = detectShortfall(window, deps.retention, {
+    generatedAt,
+    lastEntryAt: aggregation.last_entry_at,
+  });
 
   const sections = renderSections({
     input,
