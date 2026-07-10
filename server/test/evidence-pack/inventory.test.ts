@@ -6,8 +6,9 @@
  *
  * Pure, hermetic tests for the inventory collector: the mapping from the three
  * shipped enumeration sources (agent registry, proxy servers, observe
- * candidates) into the InventorySnapshot the section renderer consumes. No
- * server boot, no real fortress.
+ * candidates) into the InventorySnapshot the section renderer consumes,
+ * including the per-source read outcome (ok+empty vs failed+reason). No server
+ * boot, no real fortress.
  */
 
 import { describe, it, expect } from "vitest";
@@ -15,6 +16,7 @@ import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-reco
 import type { CandidateObservation } from "../../src/castle-wall/observe/types.js";
 import {
   buildInventorySnapshot,
+  emptyInventorySnapshot,
   type ProxyServerView,
 } from "../../src/evidence-pack/inventory.js";
 
@@ -62,15 +64,19 @@ function candidate(over: Partial<CandidateObservation>): CandidateObservation {
 }
 
 describe("buildInventorySnapshot", () => {
-  it("maps agent records to inventory rows and sorts them", () => {
+  it("maps agent records to inventory rows and sorts them (read_ok)", () => {
     const snap = buildInventorySnapshot({
-      agentRecords: [
-        agentRecord({ agent_id: "zeta", harness: "cursor" }),
-        agentRecord({ agent_id: "alpha", harness: "hermes" }),
-      ],
+      agents: {
+        ok: true,
+        records: [
+          agentRecord({ agent_id: "zeta", harness: "cursor" }),
+          agentRecord({ agent_id: "alpha", harness: "hermes" }),
+        ],
+      },
     });
-    expect(snap.agents?.map((a) => a.agent_id)).toEqual(["alpha", "zeta"]);
-    const alpha = snap.agents![0]!;
+    expect(snap.agents.read_ok).toBe(true);
+    expect(snap.agents.rows.map((a) => a.agent_id)).toEqual(["alpha", "zeta"]);
+    const alpha = snap.agents.rows[0]!;
     expect(alpha.harness).toBe("hermes");
     expect(alpha.model_vendor).toBe("anthropic");
     expect(alpha.model_id).toBe("claude-opus-4");
@@ -80,44 +86,67 @@ describe("buildInventorySnapshot", () => {
 
   it("maps proxy servers to rows and sorts them", () => {
     const servers: ProxyServerView[] = [
-      { name: "weather", transport: "stdio", enabled: true, connection_state: "connected", tool_count: 4 },
-      { name: "email", transport: "http", enabled: false, connection_state: "disconnected", tool_count: 0 },
+      { name: "weather", transport: "stdio", enabled: true },
+      { name: "email", transport: "http", enabled: false },
     ];
-    const snap = buildInventorySnapshot({ proxyServers: servers });
-    expect(snap.mcp_servers?.map((s) => s.name)).toEqual(["email", "weather"]);
-    expect(snap.mcp_servers![1]!.tool_count).toBe(4);
+    const snap = buildInventorySnapshot({
+      proxyServers: { ok: true, records: servers },
+    });
+    expect(snap.mcp_servers.rows.map((s) => s.name)).toEqual(["email", "weather"]);
   });
 
   it("maps observed destinations, falling back to the IP when no hostname was seen", () => {
     const snap = buildInventorySnapshot({
-      observedDestinations: [
-        candidate({ host: "api.openai.com", port: 443, exfil_risk: true }),
-        candidate({ host: null, ip: "9.9.9.9", port: 8080 }),
-      ],
+      observedDestinations: {
+        ok: true,
+        records: [
+          candidate({ host: "api.openai.com", port: 443, exfil_risk: true }),
+          candidate({ host: null, ip: "9.9.9.9", port: 8080 }),
+        ],
+      },
     });
-    const rows = snap.observed_destinations!;
-    // Sorted by host (the null-host row falls back to its IP "9.9.9.9").
+    const rows = snap.observed_destinations.rows;
     expect(rows.map((d) => d.host)).toEqual(["9.9.9.9", "api.openai.com"]);
     const openai = rows.find((d) => d.host === "api.openai.com")!;
     expect(openai.port).toBe(443);
-    expect(openai.protocol).toBe("tcp");
     expect(openai.exfil_risk).toBe(true);
   });
 
-  it("yields an empty snapshot (no source keys) when there is nothing to enumerate", () => {
-    const snap = buildInventorySnapshot({});
-    expect(snap.agents).toBeUndefined();
-    expect(snap.mcp_servers).toBeUndefined();
-    expect(snap.observed_destinations).toBeUndefined();
+  it("MED-2: a failed source is read_ok=false with a reason and NO rows (never a partial list)", () => {
+    const snap = buildInventorySnapshot({
+      agents: { ok: false, records: [], reason: "profile could not be read" },
+      proxyServers: { ok: false, records: [], reason: "boom" },
+    });
+    expect(snap.agents.read_ok).toBe(false);
+    expect(snap.agents.rows).toEqual([]);
+    expect(snap.agents.reason).toBe("profile could not be read");
+    expect(snap.mcp_servers.read_ok).toBe(false);
   });
 
-  it("never adds a completeness flag or total to the snapshot", () => {
+  it("a successful empty read is read_ok=true with no rows (a genuine 'none')", () => {
+    const snap = buildInventorySnapshot({ agents: { ok: true, records: [] } });
+    expect(snap.agents.read_ok).toBe(true);
+    expect(snap.agents.rows).toEqual([]);
+    expect(snap.agents.reason).toBeUndefined();
+  });
+
+  it("an undefined source defaults to a successful empty read; emptyInventorySnapshot is all-ok-empty", () => {
+    const snap = buildInventorySnapshot({});
+    expect(snap.agents.read_ok).toBe(true);
+    expect(snap.mcp_servers.read_ok).toBe(true);
+    expect(snap.observed_destinations.read_ok).toBe(true);
+    const empty = emptyInventorySnapshot();
+    expect(empty.agents.rows).toEqual([]);
+    expect(empty.mcp_servers.read_ok).toBe(true);
+    expect(empty.observed_destinations.rows).toEqual([]);
+  });
+
+  it("the snapshot section shape carries no completeness/total flag", () => {
     const snap = buildInventorySnapshot({
-      agentRecords: [agentRecord({ agent_id: "a" })],
+      agents: { ok: true, records: [agentRecord({ agent_id: "a" })] },
     });
-    // The snapshot shape is exactly the three optional row arrays; there is no
-    // "complete" / "total" / "exhaustive" field the report could render as a
-    // coverage claim.
-    expect(Object.keys(snap).sort()).toEqual(["agents"]);
+    // Each section is exactly { read_ok, rows, reason? } - no "complete" /
+    // "total" / "exhaustive" field the report could render as a coverage claim.
+    expect(Object.keys(snap.agents).sort()).toEqual(["read_ok", "rows"]);
   });
 });

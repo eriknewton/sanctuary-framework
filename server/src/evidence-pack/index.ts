@@ -26,8 +26,12 @@ export {
 export { aggregateQuarter, categorizeEntry, detectShortfall } from "./aggregate.js";
 export { renderSections, PACK_DISCLAIMER } from "./sections.js";
 export type { PackSection } from "./sections.js";
-export { buildInventorySnapshot } from "./inventory.js";
-export type { InventorySources, ProxyServerView } from "./inventory.js";
+export { buildInventorySnapshot, emptyInventorySnapshot } from "./inventory.js";
+export type {
+  InventorySources,
+  InventorySourceRead,
+  ProxyServerView,
+} from "./inventory.js";
 export {
   buildEvidencePack,
   PRODUCT_NAME,

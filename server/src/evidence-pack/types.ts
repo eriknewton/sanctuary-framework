@@ -215,18 +215,40 @@ export interface InventoryObservedDestinationRow {
 }
 
 /**
- * The inventory snapshot fed into the pack. Every field is optional: slice 1's
- * CLI does not yet enumerate live sources (the server surface that exposes the
- * registry / proxy / observe stores is a follow-on), so the inventory section
- * renders the honest per-machine coverage-basis statement and a clearly
- * labeled placeholder when a source is absent. Never present the inventory as
- * exhaustive (spec risk #1): browser ChatGPT, Copilot inside Office, and
- * phones are invisible to Sanctuary's inventory.
+ * The read outcome for ONE inventory source, threaded from the CLI's gather
+ * step through to the renderer (slice-2 MED-2 fix). This is the SAME
+ * "distinguish could-not-read from genuinely-empty" discipline the discrete
+ * exports already use: a `read_ok: false` source must NEVER render as an
+ * affirmative "none configured / recorded" census claim to an underwriter.
+ */
+export interface InventorySection<T> {
+  /**
+   * True when the underlying store was read successfully. `rows` may still be
+   * empty, which then means a GENUINE "none" (a safe census statement). False
+   * means the store could not be read at all, so the section is INCOMPLETE and
+   * the report says so with `reason` rather than asserting absence.
+   */
+  read_ok: boolean;
+  /** The enumerated rows (empty when the store is genuinely empty OR unread). */
+  rows: T[];
+  /** When `read_ok` is false, a lay-reader reason the store could not be read. */
+  reason?: string;
+}
+
+/**
+ * The inventory snapshot fed into the pack. Each source carries its own read
+ * outcome so the renderer can print honest language PER SOURCE: a table when
+ * rows exist, a genuine "none configured/recorded" only when the store was
+ * read successfully and was empty, and an explicit "could not be read; this
+ * section is incomplete" (with the reason) on a read failure. Never present the
+ * inventory as exhaustive (spec risk #1): browser ChatGPT, Copilot inside
+ * Office, and phones are invisible to Sanctuary's inventory even on a clean
+ * read.
  */
 export interface InventorySnapshot {
-  agents?: InventoryAgentRow[];
-  mcp_servers?: InventoryMcpServerRow[];
-  observed_destinations?: InventoryObservedDestinationRow[];
+  agents: InventorySection<InventoryAgentRow>;
+  mcp_servers: InventorySection<InventoryMcpServerRow>;
+  observed_destinations: InventorySection<InventoryObservedDestinationRow>;
 }
 
 /**

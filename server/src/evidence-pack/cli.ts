@@ -27,7 +27,9 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { StateStore } from "../cognitive/state-store.js";
 import { derivePurposeKey } from "../core/key-derivation.js";
 import { ObserveStore } from "../castle-wall/observe/index.js";
+import type { CandidateObservation } from "../castle-wall/observe/types.js";
 import { readPersistedLocalAgents } from "../hub/agent-registry-persistence.js";
+import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import { SovereigntyProfileStore } from "../sovereignty-profile.js";
 import { readPersistedCheckpoints } from "../transparency/emitter.js";
 import {
@@ -42,7 +44,11 @@ import type {
   InventorySnapshot,
   RetentionFacts,
 } from "./types.js";
-import { buildInventorySnapshot, type ProxyServerView } from "./inventory.js";
+import {
+  buildInventorySnapshot,
+  type InventorySourceRead,
+  type ProxyServerView,
+} from "./inventory.js";
 import {
   buildEvidencePack,
   MANIFEST_FILENAME,
@@ -57,10 +63,11 @@ import { currentQuarter, parseQuarterLabel, quarterLabel } from "./quarter.js";
  * READ-ONLY and with NO live upstream connections or network: wrapped-harness
  * records from the plaintext hub registry file, configured MCP tool servers
  * from the sovereignty profile, and observed egress destinations from the
- * encrypted observe store. Each source is best-effort: a read failure yields an
- * empty source, and the section renderer then prints its honest coverage-basis
- * note and placeholder. Never establishes a live connection during pack
- * generation.
+ * encrypted observe store. Each source captures its READ OUTCOME (ok + records,
+ * or failed + reason) so the renderer distinguishes a genuine empty ("none
+ * recorded") from a read failure ("could not be read; incomplete") and NEVER
+ * renders a failed read as an affirmative census claim (slice-2 MED-2 / HIGH-1).
+ * Never establishes a live connection during pack generation.
  */
 async function gatherInventory(
   config: SanctuaryConfig,
@@ -68,47 +75,62 @@ async function gatherInventory(
   masterKey: Uint8Array,
   signer: StoredIdentity
 ): Promise<InventorySnapshot> {
-  const agentRecords = (() => {
+  const agents: InventorySourceRead<LocalAgentRecord> = (() => {
     try {
-      return readPersistedLocalAgents(config.storage_path);
-    } catch {
-      return [];
+      return { ok: true, records: readPersistedLocalAgents(config.storage_path) };
+    } catch (e) {
+      return {
+        ok: false,
+        records: [],
+        reason: `the hub agent registry could not be read: ${(e as Error).message}`,
+      };
     }
   })();
 
-  const proxyServers: ProxyServerView[] = await (async () => {
+  const proxyServers: InventorySourceRead<ProxyServerView> = await (async () => {
     try {
       const profileStore = new SovereigntyProfileStore(storage, masterKey);
       await profileStore.load();
-      return (profileStore.get().upstream_servers ?? []).map((u) => ({
-        name: u.name,
-        transport: u.transport.type,
-        enabled: u.enabled,
-      }));
-    } catch {
-      return [];
+      return {
+        ok: true,
+        records: (profileStore.get().upstream_servers ?? []).map((u) => ({
+          name: u.name,
+          transport: u.transport.type,
+          enabled: u.enabled,
+        })),
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        records: [],
+        reason: `the sovereignty profile could not be read: ${(e as Error).message}`,
+      };
     }
   })();
 
-  const observedDestinations = await (async () => {
-    try {
-      const stateStore = new StateStore(storage, masterKey);
-      const observeStore = new ObserveStore(stateStore, {
-        identityId: signer.identity_id,
-        encryptedPrivateKey: signer.encrypted_private_key,
-        identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
-      });
-      return [...(await observeStore.listCandidates()).values()];
-    } catch {
-      return [];
-    }
-  })();
+  const observedDestinations: InventorySourceRead<CandidateObservation> =
+    await (async () => {
+      try {
+        const stateStore = new StateStore(storage, masterKey);
+        const observeStore = new ObserveStore(stateStore, {
+          identityId: signer.identity_id,
+          encryptedPrivateKey: signer.encrypted_private_key,
+          identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
+        });
+        return {
+          ok: true,
+          records: [...(await observeStore.listCandidates()).values()],
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          records: [],
+          reason: `the observe store could not be read: ${(e as Error).message}`,
+        };
+      }
+    })();
 
-  return buildInventorySnapshot({
-    agentRecords,
-    proxyServers,
-    observedDestinations,
-  });
+  return buildInventorySnapshot({ agents, proxyServers, observedDestinations });
 }
 
 /**
