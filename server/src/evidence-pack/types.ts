@@ -53,20 +53,25 @@ export interface QuarterWindow {
  * approvals, from the entry `result`. `other` is every operation that is not
  * an enforcement-decision record (identity ops, state writes, heartbeats).
  *
- * HUMAN vs AUTOMATED (honesty, HIGH-1 fix): the interactive control-point
- * approval channel writes `gate_approve:` (a human approved) and `gate_deny:`
- * (a human denied) via `principal-policy/gate.ts`, while the automated tiers
- * write `gate_allow:` / `gate_allow_proxy:` / `gate_injection_block:` /
- * `gate_unclassified:` (no human). `gate_approve` and the two-phase
- * `gate_approval_proof` both map to `human_approved`. `gate_deny:` is
- * DELIBERATELY a blended `denied`: the gate emits the SAME `gate_deny:` op
- * string for a human control-point denial, an invalid-proof denial, and an
- * approval-channel-failure denial, so this layer cannot separate them from the
- * operation alone and must NOT render `denied` as purely-automated policy
- * enforcement. The only unambiguous human denial is the cross-harness inbox
- * resolution (`human_denied`). There is no `escalated` category: no code path
- * emits a `gate_escalate:` op (escalations resolve to approve/deny), so a row
- * for it would advertise a capability that does not exist.
+ * HUMAN vs AUTOMATED via `details.decided_by` (round-2 N1 fix): the gate writes
+ * `decided_by: response.decided_by` on `gate_approve:` and `gate_deny:` (see
+ * `principal-policy/gate.ts`). A value of "human" is a genuine control-point
+ * human decision (inbox OR interactive); every other value (timeout/auto/
+ * stderr/channel_failure, or an invalid-proof deny with no decided_by) is NOT
+ * human. So `gate_approve` + decided_by "human" -> `human_approved` (else the
+ * action ran on an automated approval -> `allowed`), and `gate_deny` +
+ * decided_by "human" -> `human_denied` (else automated policy/invalid-proof/
+ * channel-failure -> `denied`). The two-phase `gate_approval_proof` maps to
+ * `human_approved` unconditionally (its approval was made by a human at mint
+ * time). This is the SINGLE counted source for a human decision; the paired
+ * `cross_harness_approval_resolved` op is observational (`other`), so one human
+ * decision through the inbox counts EXACTLY ONCE in both directions (no double
+ * count of round-1, no structurally-zero `human_denied` of round-2). The
+ * automated tiers write `gate_allow:` / `gate_allow_proxy:` /
+ * `gate_injection_block:` / `gate_unclassified:` (no human). There is no
+ * `escalated` category: no code path emits a `gate_escalate:` op (escalations
+ * resolve to approve/deny), so a row for it would advertise a capability that
+ * does not exist.
  *
  * UNMAPPED-OP GUARD (honesty chokepoint): a `gate_`-shaped control-point
  * decision operation that is NOT explicitly mapped must surface as
@@ -198,6 +203,13 @@ export interface ShortfallReport {
    * Distinguishing these two causes keeps the disclosure honest.
    */
   retention_at_cap: boolean;
+  /**
+   * True when the ENTIRE retained window post-dates the quarter, so ZERO of the
+   * quarter is covered even though the nominal signed span reaches the quarter
+   * start (round-2 N2). Lets the cover banner state "none of this quarter is
+   * covered" precisely rather than the generic "does not reach the start".
+   */
+  zero_of_quarter_covered: boolean;
   /** A lay-reader explanation suitable for printing in the PDF. */
   explanation: string;
 }

@@ -59,9 +59,19 @@ beforeEach(async () => {
 function entry(
   timestamp: string,
   operation: string,
+  result: "success" | "failure" = "success",
+  details?: Record<string, unknown>
+): AuditEntry {
+  return { timestamp, layer: "l2", operation, identity_id: "agent-a", result, details };
+}
+
+/** A gate entry marked as a HUMAN control-point decision (decided_by human). */
+function humanEntry(
+  timestamp: string,
+  operation: string,
   result: "success" | "failure" = "success"
 ): AuditEntry {
-  return { timestamp, layer: "l2", operation, identity_id: "agent-a", result };
+  return entry(timestamp, operation, result, { decided_by: "human" });
 }
 
 const FULL_COVERAGE: RetentionFacts = {
@@ -169,6 +179,23 @@ describe("buildEvidencePack", () => {
     expect(pack.files[0]!.content).toContain("COVERAGE NOTICE");
   });
 
+  it("N2: an all-post-quarter completed quarter cover banner says NONE covered, not the generic 'does not reach the start'", () => {
+    const pack = buildEvidencePack(
+      baseInput(), // generated_at 2026-10-02 (Q3 complete)
+      deps([], {
+        max_entries: 100_000,
+        retained_total: 5,
+        max_total_size_bytes: 100 * 1024 * 1024,
+        retained_total_size_bytes: 0,
+        ever_pruned: true,
+        earliest_retained_at: "2026-11-01T00:00:00.000Z", // entirely after Q3
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("NONE of this quarter is covered");
+    expect(report).not.toContain("does NOT reach the quarter start");
+  });
+
   it("prints the honest coverage-basis and scope-and-limits language", () => {
     const pack = buildEvidencePack(
       baseInput(),
@@ -192,22 +219,25 @@ describe("buildEvidencePack", () => {
     expect(pdf).toContain("Scope and limits");
   });
 
-  it("counts live gate_approve as human review and never labels human denials as automated policy", () => {
+  it("N1: counts human approvals AND human denials by decided_by; automated denials stay 'by policy'", () => {
     const pack = buildEvidencePack(
       baseInput(),
       deps([
-        entry("2026-08-01T00:00:00.000Z", "gate_approve:tool_a"),
-        entry("2026-08-02T00:00:00.000Z", "gate_approve:tool_b"),
-        entry("2026-08-03T00:00:00.000Z", "gate_deny:tool_c", "failure"),
-        entry("2026-08-04T00:00:00.000Z", "gate_allow:tool_d"),
+        humanEntry("2026-08-01T00:00:00.000Z", "gate_approve:tool_a"),
+        humanEntry("2026-08-02T00:00:00.000Z", "gate_approve:tool_b"),
+        humanEntry("2026-08-03T00:00:00.000Z", "gate_deny:tool_c", "failure"), // human denial
+        entry("2026-08-04T00:00:00.000Z", "gate_deny:tool_e", "failure"), // automated denial
+        entry("2026-08-05T00:00:00.000Z", "gate_allow:tool_d"),
       ])
     );
     expect(agg(pack).by_category.human_approved).toBe(2);
-    expect(agg(pack).by_category.other).toBe(0);
+    expect(agg(pack).by_category.human_denied).toBe(1); // N1: real, not always 0
+    expect(agg(pack).by_category.denied).toBe(1); // the automated one only
     const report = pack.files[0]!.content;
-    expect(report).toContain("Human-approved at the control point | 2");
-    expect(report).toContain("automated policy OR human control point");
-    expect(report).not.toContain("Denied by policy");
+    expect(report).toContain("| Human-approved | 2 |");
+    expect(report).toContain("| Human-denied | 1 |");
+    expect(report).toContain("Denied by automated policy (no human) | 1");
+    expect(report).not.toContain("Denied by policy |"); // old wrong wording
   });
 
   it("renders no phantom Escalated row", () => {
@@ -373,7 +403,7 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("decrypt failed");
     expect(report).toContain("COVERAGE UNAVAILABLE");
     // It never claims zero denials or full coverage.
-    expect(report).not.toContain("Denied (automated policy OR human control point) | 0");
+    expect(report).not.toContain("Denied by automated policy (no human) | 0");
     expect(report).not.toMatch(/Covered window attested for this quarter/);
   });
 
@@ -462,5 +492,15 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("Maps to CNA Question 5");
     expect(report).not.toContain("Answers CNA Question 2");
     expect(report).not.toContain("Answers CNA Question 5");
+  });
+
+  it("round-2 wording: 'vendor-independent' (not 'firm-independent'); data-export is an architecture property", () => {
+    const pack = buildEvidencePack(baseInput(), deps([])); // no discrete exports
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("firm-independent");
+    expect(report).toContain("vendor-independent");
+    // Data-export is labeled a product property, not a per-install table value.
+    expect(report).toContain("a product property, not a per-install read");
+    expect(report).not.toContain("| Data export | requires human (Tier 1) approval |");
   });
 });

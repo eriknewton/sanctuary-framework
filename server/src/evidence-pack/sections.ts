@@ -116,6 +116,15 @@ function renderCover(
           "",
         ];
       }
+      if (s.zero_of_quarter_covered) {
+        return [
+          "> COVERAGE NOTICE: NONE of this quarter is covered; no entries from " +
+            window.label +
+            " survive in the retained log. See the access-log section for " +
+            "details.",
+          "",
+        ];
+      }
       if (s.shortfall) {
         return [
           "> COVERAGE NOTICE: the signed span above does NOT reach the quarter " +
@@ -225,11 +234,9 @@ function renderExecutiveSummary(
       const c = agg.by_category;
       const bullets = [
         `- **Actions reviewed by a human at the control point:** ${c.human_approved + c.human_denied} ` +
-          `(${c.human_approved} approved, ${c.human_denied} denied through the inbox).`,
-        `- **Automated decisions:** ${c.allowed + c.allowed_proxy} allowed, ${c.injection_blocked} blocked as ` +
-          `prompt injection, ${c.unclassified} unclassified.`,
-        `- **Denied (automated policy or human control point):** ${c.denied} ` +
-          "(these share one audit operation and cannot be split here; see section 6).",
+          `(${c.human_approved} approved, ${c.human_denied} denied by an operator).`,
+        `- **Automated decisions:** ${c.allowed + c.allowed_proxy} allowed, ${c.denied} denied by policy, ` +
+          `${c.injection_blocked} blocked as prompt injection, ${c.unclassified} unclassified.`,
         `- **Total recorded audit operations in the quarter:** ${agg.total_in_window} ` +
           `(${agg.total_in_window - c.other} control-point decisions + ${c.other} ` +
           "other recorded operations that are not control-point decisions).",
@@ -534,12 +541,12 @@ function renderHumanReview(
     populated: (agg) => {
       const c = agg.by_category;
       const rows = [
-        "## Decisions a human made",
+        "## Decisions a human made at the control point",
         "",
         "| Outcome | Count |",
         "|---|---|",
-        `| Human-approved at the control point | ${c.human_approved} |`,
-        `| Human-denied through the cross-harness inbox | ${c.human_denied} |`,
+        `| Human-approved | ${c.human_approved} |`,
+        `| Human-denied | ${c.human_denied} |`,
         "",
         "## Decisions the automated tiers made (no human)",
         "",
@@ -547,21 +554,19 @@ function renderHumanReview(
         "|---|---|",
         `| Auto-allowed (low-risk tier) | ${c.allowed} |`,
         `| Auto-allowed via proxy | ${c.allowed_proxy} |`,
+        `| Denied by automated policy (no human) | ${c.denied} |`,
         `| Blocked as prompt injection | ${c.injection_blocked} |`,
         `| Unclassified | ${c.unclassified} |`,
         "",
-        "## Denials (blended - see note)",
-        "",
-        "| Outcome | Count |",
-        "|---|---|",
-        `| Denied (automated policy OR human control point) | ${c.denied} |`,
-        "",
-        "NOTE on the denial count: Sanctuary writes the SAME audit operation for a " +
-          "human control-point denial and for an automated policy / invalid-proof / " +
-          "channel-failure denial, so this report cannot split them from the log " +
-          "alone. It is therefore shown as a single blended figure and is NOT " +
-          "claimed to be purely automated enforcement. The per-entry audit log " +
-          "distinguishes them for an auditor who reconciles against it.",
+        "NOTE on human vs automated: Sanctuary writes the SAME audit operation " +
+          "(`gate_approve:` / `gate_deny:`) for a human control-point decision and " +
+          "for an automated one, but each entry records WHO decided (the gate's " +
+          "`decided_by` field). This report attributes a decision to the human " +
+          "rows only when that field is 'human' (an operator approved or denied, " +
+          "via the inbox or the interactive channel); automated policy, " +
+          "invalid-proof, channel-failure, and timeout decisions are counted as " +
+          "automated. So a human approval or denial is counted exactly once, in " +
+          "the human row.",
         "",
       ];
       if (c.uncategorized > 0) {
@@ -622,8 +627,8 @@ function renderAccessLog(
         `| Auto-allowed | ${c.allowed} |`,
         `| Auto-allowed via proxy | ${c.allowed_proxy} |`,
         `| Human-approved at the control point | ${c.human_approved} |`,
-        `| Denied (automated policy or human control point) | ${c.denied} |`,
-        `| Human-denied through the cross-harness inbox | ${c.human_denied} |`,
+        `| Denied by automated policy (no human) | ${c.denied} |`,
+        `| Human-denied at the control point | ${c.human_denied} |`,
         `| Blocked as prompt injection | ${c.injection_blocked} |`,
         `| Unclassified | ${c.unclassified} |`,
         `| Uncategorized (surfaced, not folded) | ${c.uncategorized} |`,
@@ -694,7 +699,9 @@ function renderCustody(custody: ReadOutcome<CustodyFacts>): PackSection {
         "|---|---|",
         `| Master-key custody | ${fmtCustodyMode(facts)} |`,
         `| Sanctuary-gateway outbound denied by default | ${outboundRow} |`,
-        "| Data export | requires human (Tier 1) approval |",
+        "",
+        "By architecture (a product property, not a per-install read), export of " +
+          "Sanctuary state is a Tier-1 operation that requires human approval.",
         "",
       ];
     },
@@ -790,7 +797,7 @@ function renderVerification(
       "assurance of the enforcement history comes only from the transparency " +
       "bundle in step 2, where included.",
     "",
-    "## 2. Checking the discrete exports (firm-independent, where included)",
+    "## 2. Checking the discrete exports (vendor-independent, where included)",
     "",
     // MED-1 / LOW-3: gate the framing on whether ANY export is actually present,
     // and state that a tool is required (not "only these files and a key").
@@ -809,7 +816,7 @@ function renderVerification(
       : [
           "For this period the pack contains NONE of the discrete " +
             "enforcement-history exports below (each reads 'Not included'), so " +
-            "there is no firm-independent enforcement-history verification in " +
+            "there is no vendor-independent enforcement-history verification in " +
             "this pack; integrity is limited to the firm-signed files and " +
             "manifest in section 1.",
         ]),
@@ -924,10 +931,11 @@ function renderScopeAndLimits(): PackSection {
       "(end-side / partial-quarter shortfall). This report detects and " +
       "discloses both above and states the real covered-through instant, " +
       "never assuming coverage to the quarter end.",
-    "- **Human vs automated decisions are separated.** Human control-point " +
-      "approvals/denials are counted apart from automated-tier decisions. The " +
-      "denial figure is blended (one shared audit operation) and is not " +
-      "claimed to be purely automated enforcement.",
+    "- **Human vs automated decisions are separated by the gate's `decided_by` " +
+      "field.** Human control-point approvals AND denials (an operator decided, " +
+      "via the inbox or the interactive channel) are counted in the human rows; " +
+      "automated policy, invalid-proof, channel-failure, and timeout decisions " +
+      "are counted as automated. Each decision is counted exactly once.",
     "- **Human-review counts** reflect the control-point operator gate, not " +
       "a supervising attorney's per-matter review.",
     "- **Attestations prove acknowledgment, not competence.**",

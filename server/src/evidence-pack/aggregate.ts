@@ -65,10 +65,14 @@ const ALL_CATEGORIES: DecisionCategory[] = [
  * the gate without adding it here fails that test, so a new op can never
  * silently vanish into `other` or a flattering bucket.
  *
- * `gate_approve` (the live interactive channel decision) and the two-phase
- * `gate_approval_proof` are human approvals; `gate_deny` is the blended denial
- * (human OR automated policy/invalid-proof/channel-failure - not separable from
- * the op alone); the rest are automated. There is no `gate_escalate` producer.
+ * These are the PRIMARY categories; at runtime `categorizeEntry` refines
+ * `gate_approve`/`gate_deny` by `details.decided_by` (a "human" decision ->
+ * `human_approved`/`human_denied`; otherwise `allowed`/`denied`). The map entries
+ * exist so the exhaustiveness test sees every emitted `gate_*` op mapped to a
+ * real bucket (never `uncategorized`/`other`). `gate_approval_proof` is a human
+ * approval; the automated tiers are `gate_allow`/`gate_allow_proxy`/
+ * `gate_injection_block`/`gate_unclassified`. There is no `gate_escalate`
+ * producer.
  */
 export const GATE_DECISION_OP_CATEGORIES: Readonly<
   Record<string, DecisionCategory>
@@ -102,6 +106,24 @@ export function categorizeEntry(entry: AuditEntry): DecisionCategory {
     return "other";
   }
   const prefix = entry.operation.split(":", 1)[0] ?? "";
+  // HUMAN vs AUTOMATED via the gate's own `details.decided_by` (round-2 N1 fix):
+  // `principal-policy/gate.ts` writes `decided_by: response.decided_by` on
+  // gate_approve/gate_deny, where "human" is a genuine control-point human
+  // decision (inbox OR interactive) and every other value
+  // (timeout/auto/stderr/channel_failure, or an invalid-proof deny with no
+  // decided_by) is NOT human. This is the SINGLE counted source for a human
+  // decision (the paired cross_harness op is observational), so one human
+  // decision counts exactly once, in BOTH directions. gate_deny sourced this way
+  // is the only unambiguous human-denial signal (the cross-harness aggregator op
+  // was routed to `other` in round-1); without this, `human_denied` was
+  // structurally always 0.
+  const decidedByHuman = entry.details?.decided_by === "human";
+  if (prefix === "gate_approve") {
+    return decidedByHuman ? "human_approved" : "allowed";
+  }
+  if (prefix === "gate_deny") {
+    return decidedByHuman ? "human_denied" : "denied";
+  }
   const mapped = GATE_DECISION_OP_CATEGORIES[prefix];
   if (mapped !== undefined) return mapped;
   // A gate-shaped op we do not explicitly map is a decision we cannot classify:
@@ -206,9 +228,11 @@ export function detectShortfall(
   let coveredFrom: string;
   let startShortfall: boolean;
   let startExplanation: string;
+  let zeroOfQuarterCovered = false;
   if (earliestMs === null) {
     coveredFrom = window.start_inclusive;
     startShortfall = true;
+    zeroOfQuarterCovered = true;
     startExplanation =
       "The audit log holds no retained entries, so this quarter has no " +
       "covered access history. Confirm the fortress was recording during " +
@@ -219,6 +243,7 @@ export function detectShortfall(
     // that zero of the quarter is covered.
     coveredFrom = window.start_inclusive;
     startShortfall = true;
+    zeroOfQuarterCovered = true;
     startExplanation =
       "NONE of this quarter is covered: the earliest retained audit entry (" +
       retention.earliest_retained_at! +
@@ -289,6 +314,7 @@ export function detectShortfall(
     in_progress_quarter: inProgress,
     last_entry_at: params.lastEntryAt,
     retention_at_cap: retentionAtCap,
+    zero_of_quarter_covered: zeroOfQuarterCovered,
     explanation: parts.join(" "),
   };
 }
