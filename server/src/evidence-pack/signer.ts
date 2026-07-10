@@ -132,6 +132,7 @@ export function buildPackManifest(params: {
       covered_from: params.shortfall.covered_from,
       covered_to_exclusive: params.shortfall.covered_to_exclusive,
       shortfall: params.shortfall.shortfall,
+      in_progress_quarter: params.shortfall.in_progress_quarter,
       retention_at_cap: params.shortfall.retention_at_cap,
     },
     disclaimer: PACK_DISCLAIMER,

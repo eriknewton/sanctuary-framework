@@ -211,24 +211,35 @@ export async function runEvidencePack(args: string[]): Promise<void> {
   const shortfallLine = pack.shortfall.shortfall
     ? "YES - disclosed in the report"
     : "no";
-  const summary = [
+  const summaryLines = [
     "",
     `[sanctuary evidence-pack] ${PRODUCT_NAME} generation complete.`,
     "",
+  ];
+  if (pack.shortfall.in_progress_quarter) {
+    summaryLines.push(
+      `  WARNING: ${label} is still IN PROGRESS. This pack covers only through`,
+      `  ${pack.shortfall.covered_to_exclusive} (the generation time), NOT the full`,
+      "  quarter. Do not present it to an insurer or client as a complete-quarter",
+      "  report; regenerate after the quarter closes. The report is stamped PARTIAL.",
+      ""
+    );
+  }
+  summaryLines.push(
     `  Output directory: ${outputDir}`,
     `  Firm:             ${opts.firmName}`,
-    `  Quarter:          ${label}`,
-    `  Covered window:   ${pack.shortfall.covered_from} to ${pack.shortfall.covered_to_exclusive}`,
+    `  Quarter:          ${label}${pack.shortfall.in_progress_quarter ? " (PARTIAL - in progress)" : ""}`,
+    `  Covered window:   ${pack.shortfall.covered_from} to ${pack.shortfall.covered_to_exclusive} (exclusive)`,
     `  Covered-window shortfall: ${shortfallLine}`,
     `  Control-point decisions in quarter: ${pack.aggregation.total_in_window}`,
     `  Signer:           ${pack.manifest.signer.did}`,
     "",
     "  NOT LEGAL ADVICE. Have the policy/attestation content reviewed by a",
     "  licensed attorney before first use.",
-    "",
-  ].join("\n");
+    ""
+  );
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
-  console.error(summary);
+  console.error(summaryLines.join("\n"));
 
   // Stdout: just the output directory path (for scripting).
   // SAFETY: stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
