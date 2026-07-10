@@ -127,6 +127,22 @@ export interface RetentionFacts {
   /** Total entries currently retained across all time (all quarters). */
   retained_total: number;
   /**
+   * Configured maximum total on-disk size in bytes (the OTHER FIFO cap). Audit
+   * retention prunes on EITHER cap: 100,000 entries OR 100 MB by default (sweep
+   * HIGH-5). 0/absent means the size cap is not known to this reporter.
+   */
+  max_total_size_bytes: number;
+  /** Total on-disk size in bytes of the retained audit log, or null if unread. */
+  retained_total_size_bytes: number | null;
+  /**
+   * True when the audit log has EVER pruned entries (a rotation anchor exists).
+   * This is the definitive discriminator between "genuine inactivity before the
+   * earliest retained entry" (never pruned) and "earlier entries were pruned"
+   * (sweep HIGH-5): pruning is FIFO-on-overflow, so a log that never pruned has
+   * its true earliest entry retained. Null when this fact could not be read.
+   */
+  ever_pruned: boolean | null;
+  /**
    * Timestamp of the EARLIEST retained audit entry across all time, or null
    * when the log is empty. If this is later than the quarter start, entries
    * from before it are not available for this quarter.
@@ -250,8 +266,16 @@ export interface InventorySnapshot {
 export interface CustodyFacts {
   /** How the fortress master key is held. */
   custody_mode: "passphrase" | "keychain" | "unknown";
-  /** Whether outbound is denied by default (true today by architecture). */
-  no_outbound_by_default: boolean;
+  /**
+   * Whether OUTBOUND is denied by default FOR THIS INSTALL, as a
+   * {@link ReadOutcome} (sweep HIGH-2). This must never be a hardcoded "yes":
+   * on a Windows or wrap-only (un-walled) host no machine-level egress
+   * enforcement is armed, so a definitive "yes" would be a false security fact
+   * in a signed document. When the pack does not probe the install's actual
+   * egress/wall posture, this is `read_failed` and renders "not determinable
+   * for this install", never an affirmative claim.
+   */
+  outbound_denied_by_default: ReadOutcome<boolean>;
 }
 
 /** MIME type of an emitted pack file. */
@@ -323,7 +347,7 @@ export interface EvidencePackFile {
 
 /** Signed manifest for the evidence pack (mirrors the EU AI Act bundle pattern). */
 export interface EvidencePackManifest {
-  pack_version: "1.0";
+  pack_version: "0.1-preview";
   slice: "walking-skeleton-v1";
   product_name: string;
   firm_name: string;

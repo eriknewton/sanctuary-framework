@@ -31,6 +31,17 @@ import { isInWindow } from "./quarter.js";
  * Tier-1 approval is resolved. Mirrored here (not imported) so this pure layer
  * does not couple to the aggregator's internals; it is a wire-string constant,
  * not behavior. Kept in lockstep with `APPROVAL_AGGREGATOR_AUDIT_OPS.RESOLVED`.
+ *
+ * DE-DUP (sweep HIGH-1): this op is DELIBERATELY treated as observational
+ * (`other`), NOT a human decision count. When the cross-harness approval inbox
+ * is enabled (`approval_redirect.enabled`), a single human approval writes BOTH
+ * `cross_harness_approval_resolved` (the aggregator) AND `gate_approve:` /
+ * `gate_deny:` (the gate, which is written on EVERY gated Tier-1 path whether
+ * redirect is on or off). Counting both would roughly DOUBLE the "human
+ * reviewed" figure and inflate `total_in_window` and the denial rows. The gate
+ * op is the single source of truth for a human control-point decision; the
+ * aggregator op is a paired observation of the same decision, so it is not
+ * counted a second time.
  */
 const CROSS_HARNESS_APPROVAL_RESOLVED = "cross_harness_approval_resolved";
 
@@ -84,8 +95,11 @@ export const GATE_DECISION_OP_CATEGORIES: Readonly<
  * operations (identity ops, state writes, heartbeats) return `other`.
  */
 export function categorizeEntry(entry: AuditEntry): DecisionCategory {
+  // De-dup (HIGH-1): the cross-harness approval resolution is a paired
+  // OBSERVATION of a decision the gate already recorded (gate_approve/gate_deny),
+  // so it is `other`, never a second human-decision count.
   if (entry.operation === CROSS_HARNESS_APPROVAL_RESOLVED) {
-    return entry.result === "success" ? "human_approved" : "human_denied";
+    return "other";
   }
   const prefix = entry.operation.split(":", 1)[0] ?? "";
   const mapped = GATE_DECISION_OP_CATEGORIES[prefix];
@@ -173,8 +187,14 @@ export function detectShortfall(
     retention.earliest_retained_at === null
       ? null
       : new Date(retention.earliest_retained_at).getTime();
-  const retentionAtCap =
+  // Either FIFO cap counts as "at cap" (sweep HIGH-5): entries OR total size.
+  const atEntryCap =
     retention.max_entries > 0 && retention.retained_total >= retention.max_entries;
+  const atSizeCap =
+    retention.max_total_size_bytes > 0 &&
+    retention.retained_total_size_bytes !== null &&
+    retention.retained_total_size_bytes >= retention.max_total_size_bytes;
+  const retentionAtCap = atEntryCap || atSizeCap;
 
   // END SIDE: coverage can never extend past the moment the report was made.
   const inProgress = generatedMs < quarterEndMs;
@@ -193,22 +213,47 @@ export function detectShortfall(
       "The audit log holds no retained entries, so this quarter has no " +
       "covered access history. Confirm the fortress was recording during " +
       "the reporting period.";
+  } else if (earliestMs >= quarterEndMs) {
+    // M1: the entire retained window post-dates the quarter (all in-quarter
+    // entries pruned). Do NOT cite an out-of-quarter covered_from; state plainly
+    // that zero of the quarter is covered.
+    coveredFrom = window.start_inclusive;
+    startShortfall = true;
+    startExplanation =
+      "NONE of this quarter is covered: the earliest retained audit entry (" +
+      retention.earliest_retained_at! +
+      ") is at or after the quarter end, so no entries from this quarter " +
+      "survive in the retained log. The counts above are therefore zero for " +
+      "this quarter. This almost always means earlier entries were pruned by " +
+      "size/count (FIFO) retention; raise the retention cap or export monthly " +
+      "snapshots.";
   } else if (earliestMs > quarterStartMs) {
     coveredFrom = retention.earliest_retained_at!;
     startShortfall = true;
-    startExplanation = retentionAtCap
-      ? "The retained audit window begins after the quarter start AND the log " +
-        "is at its retention cap, so earlier-quarter entries were likely " +
-        "pruned by size-based (FIFO) retention. This report covers access " +
-        "history from " +
+    // The DEFINITIVE discriminator is whether the log ever pruned (a rotation
+    // anchor). Only affirm "genuine inactivity, not pruning" when we KNOW the
+    // log never pruned AND it is below both caps; otherwise do not reassure.
+    const neverPruned =
+      retention.ever_pruned === false && !retentionAtCap;
+    startExplanation = neverPruned
+      ? "The earliest retained audit entry is after the quarter start, and the " +
+        "log has never pruned entries (it is below both its entry and size " +
+        "retention caps), so this reflects that the fortress had no recorded " +
+        "activity before " +
         coveredFrom +
-        " onward. Raise the retention cap or export monthly snapshots to " +
-        "cover the full quarter."
-      : "The earliest retained audit entry is after the quarter start, but " +
-        "the log is below its retention cap, so this reflects that the " +
-        "fortress had no recorded activity before " +
+        ", not that entries were pruned. Coverage begins at that instant."
+      : "The retained audit window begins after the quarter start, and " +
+        (retentionAtCap
+          ? "the log is at a retention cap (entries or size), "
+          : retention.ever_pruned === true
+            ? "the log has pruned entries at least once, "
+            : "size-based pruning of large early entries cannot be ruled out, ") +
+        "so earlier-quarter entries may have been pruned by size/count (FIFO) " +
+        "retention. This report covers access history from " +
         coveredFrom +
-        " (not that entries were pruned). Coverage begins at that instant.";
+        " onward; whether the gap is pruning or genuine inactivity cannot be " +
+        "affirmed here. Raise the retention cap or export monthly snapshots to " +
+        "cover the full quarter.";
   } else {
     coveredFrom = window.start_inclusive;
     startShortfall = false;

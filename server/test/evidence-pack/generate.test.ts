@@ -67,6 +67,9 @@ function entry(
 const FULL_COVERAGE: RetentionFacts = {
   max_entries: 100_000,
   retained_total: 3,
+  max_total_size_bytes: 100 * 1024 * 1024,
+  retained_total_size_bytes: 0,
+  ever_pruned: false,
   earliest_retained_at: "2026-06-01T00:00:00.000Z",
 };
 
@@ -84,7 +87,10 @@ function baseInput(): EvidencePackInput {
     firm_name: "Acme Law LLP",
     quarter: { year: 2026, quarter: 3 },
     generated_at_override: "2026-10-02T00:00:00.000Z",
-    custody: populated({ custody_mode: "passphrase", no_outbound_by_default: true }),
+    custody: populated({
+      custody_mode: "passphrase",
+      outbound_denied_by_default: populated(true),
+    }),
   };
 }
 
@@ -152,6 +158,9 @@ describe("buildEvidencePack", () => {
       deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
         max_entries: 100,
         retained_total: 100, // at cap -> pruning likely
+        max_total_size_bytes: 100 * 1024 * 1024,
+        retained_total_size_bytes: 0,
+        ever_pruned: true,
         earliest_retained_at: "2026-08-01T00:00:00.000Z",
       })
     );
@@ -215,11 +224,17 @@ describe("buildEvidencePack", () => {
         firm_name: "Acme Law LLP",
         quarter: { year: 2026, quarter: 3 },
         generated_at_override: "2026-08-15T12:00:00.000Z", // mid-Q3
-        custody: populated({ custody_mode: "passphrase", no_outbound_by_default: true }),
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
       },
       deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
         max_entries: 100_000,
         retained_total: 3,
+        max_total_size_bytes: 100 * 1024 * 1024,
+        retained_total_size_bytes: 0,
+        ever_pruned: false,
         earliest_retained_at: "2026-06-01T00:00:00.000Z",
       })
     );
@@ -387,5 +402,65 @@ describe("buildEvidencePack", () => {
     expect(agg(pack).by_category.other).toBe(0);
     const report = pack.files[0]!.content;
     expect(report).toContain("Uncategorized control-point operations");
+  });
+
+  it("HIGH-2: an un-probed outbound posture renders 'not determinable', NEVER a hardcoded 'yes'", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        custody: populated({
+          custody_mode: "unknown",
+          outbound_denied_by_default: readFailed("not probed by this build"),
+        }),
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("not determinable for this install");
+    // The custody row must not assert a definitive "denied by default | yes".
+    expect(report).not.toMatch(/outbound denied by default \| yes/i);
+  });
+
+  it("HIGH-2: a probed outbound=true scopes the claim to Sanctuary's gateway, not machine-level", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("Sanctuary-gateway outbound denied by default");
+    expect(report).toContain("does NOT deny egress from other applications");
+  });
+
+  it("HIGH-3: the incident line is 'not assessed', NEVER a flattering 'none surfaced'", () => {
+    const pack = buildEvidencePack(baseInput(), deps([]));
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("Unresolved incidents:** none");
+    expect(report).not.toContain("none surfaced");
+    expect(report).toContain("Incidents:** not assessed in this build");
+  });
+
+  it("HIGH-4: the cover uses evidence-toward framing, not 'answers, one for one' + 'without trusting the vendor'", () => {
+    const pack = buildEvidencePack(baseInput(), deps([]));
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("answers, one for one, the five questions");
+    expect(report).not.toContain("verify the underlying evidence without trusting");
+    expect(report).toContain("organized around the five questions");
+    // Placeholder sections are named on the cover.
+    expect(report).toContain("governance-policy, training, and incident-response sections are placeholders");
+  });
+
+  it("HIGH-4: placeholder CNA subtitles say 'Maps to' + 'NOT included', not 'Answers'", () => {
+    const pack = buildEvidencePack(baseInput(), deps([]));
+    const report = pack.files[0]!.content;
+    expect(report).toContain("Maps to CNA Question 2");
+    expect(report).toContain("Maps to CNA Question 5");
+    expect(report).not.toContain("Answers CNA Question 2");
+    expect(report).not.toContain("Answers CNA Question 5");
   });
 });

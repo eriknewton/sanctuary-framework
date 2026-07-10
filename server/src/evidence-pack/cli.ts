@@ -346,11 +346,22 @@ export async function runEvidencePack(args: string[]): Promise<void> {
     try {
       const { entries, total } = await auditLog.query({ limit: 1_000_000 });
       const retentionConfig = auditLog.getRetentionConfig();
+      // Read the on-disk usage + ever-pruned so the shortfall detector can tell
+      // size-cap pruning from genuine inactivity (sweep HIGH-5). Best-effort.
+      let usage: { totalSizeBytes: number; everPruned: boolean | null };
+      try {
+        usage = await auditLog.getRetentionUsage();
+      } catch {
+        usage = { totalSizeBytes: 0, everPruned: null };
+      }
       const earliest: string | null =
         entries.length > 0 ? (entries[0] as AuditEntry).timestamp : null;
       const retention: RetentionFacts = {
         max_entries: retentionConfig.maxEntries,
         retained_total: total,
+        max_total_size_bytes: retentionConfig.maxTotalSizeBytes,
+        retained_total_size_bytes: usage.totalSizeBytes,
+        ever_pruned: usage.everPruned,
         earliest_retained_at: earliest,
       };
       return populated({ entries, retention });
@@ -359,12 +370,18 @@ export async function runEvidencePack(args: string[]): Promise<void> {
     }
   })();
 
-  // Custody facts: no-outbound-by-default is true by architecture. The precise
-  // master-key custody mode is not yet surfaced by the server API, so it is
-  // reported as unknown rather than guessing.
+  // Custody facts. Master-key custody mode is not yet surfaced by the server
+  // API, so it is reported as unknown rather than guessed. The per-install
+  // outbound-enforcement posture is NOT probed by this build (it would require
+  // reading the wall/pf/system-extension state), so it is a `read_failed`
+  // outcome that renders "not determinable for this install" - NEVER a hardcoded
+  // "yes", which would be a false security fact on an un-walled host (HIGH-2).
   const custody: ReadOutcome<CustodyFacts> = populated({
     custody_mode: "unknown",
-    no_outbound_by_default: true,
+    outbound_denied_by_default: readFailed(
+      "this pack does not probe machine-level egress/wall enforcement, so the " +
+        "outbound-enforcement posture was not determined for this install."
+    ),
   });
 
   // Enumerate the real AI-tool inventory and gather the discrete
