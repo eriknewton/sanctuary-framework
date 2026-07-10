@@ -35,12 +35,27 @@ function emittedGateOpPrefixes(): Set<string> {
   for (const m of src.matchAll(/operation:\s*`(gate_[a-z_]+):/g)) {
     prefixes.add(m[1]!);
   }
-  // The dynamic producer `operation: `gate_${response.decision}:...``, where
-  // `decision` is typed `"approve" | "deny"` (gate.ts). Both expansions must be
-  // categorized.
+  // The dynamic producer `operation: `gate_${response.decision}:...``. Rather
+  // than hardcode {approve, deny}, DERIVE the decision union members from the
+  // gate's own type declaration (`decision: "approve" | "deny";`), so a future
+  // widening of that union is caught here (LOW-2 fix): the new value is added
+  // to the expected set and the exhaustiveness assertion then fails until it is
+  // categorized in GATE_DECISION_OP_CATEGORIES.
   if (/operation:\s*`gate_\$\{[^}]*decision[^}]*\}:/.test(src)) {
-    prefixes.add("gate_approve");
-    prefixes.add("gate_deny");
+    const members = new Set<string>();
+    for (const decl of src.matchAll(/\bdecision:\s*((?:"[a-z_]+"\s*\|?\s*)+);/g)) {
+      for (const lit of decl[1]!.matchAll(/"([a-z_]+)"/g)) {
+        members.add(lit[1]!);
+      }
+    }
+    if (members.size === 0) {
+      throw new Error(
+        "op-exhaustiveness: found the dynamic `gate_${...decision...}:` producer " +
+          "but could not parse the `decision:` union members from gate.ts; " +
+          "update this test's parser."
+      );
+    }
+    for (const member of members) prefixes.add(`gate_${member}`);
   }
   return prefixes;
 }
