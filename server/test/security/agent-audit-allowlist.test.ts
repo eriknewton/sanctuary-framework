@@ -921,6 +921,10 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "cli/castle-wall.ts",
     // compliance report generation — operator artifact
     "compliance/eu_ai_act/generator.ts",
+    // law-firm evidence pack — operator artifact. The CLI reads the full audit
+    // history to COUNT quarter activity; only aggregate counts/categories/
+    // timestamps are emitted into the pack, never raw entry `details`.
+    "evidence-pack/cli.ts",
     // operator chat context / concierge — human operator surface
     "chat/agent-context-cache.ts",
     "concierge/sanctuary-context-reader.ts",
@@ -1215,6 +1219,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       kind: "operator-batch",
       reason:
         "EU AI Act report generator: effectively-unbounded period read, run once when generating the operator compliance artifact; one full re-verify is desired.",
+    },
+    {
+      module: "evidence-pack/cli.ts",
+      fn: "runEvidencePack",
+      kind: "operator-batch",
+      reason:
+        "law-firm evidence pack CLI: one full retained-history read per invocation to aggregate a calendar quarter; one full re-verify is the desired honest behavior, not a warm view, and only aggregate counts leave the generator.",
     },
     // ── operator-background: internal analyzers / sentinels on own schedule ──
     {
