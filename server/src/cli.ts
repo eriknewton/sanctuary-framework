@@ -219,6 +219,12 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args[0] === "evidence-pack") {
+    const { runEvidencePack } = await import("./evidence-pack/cli.js");
+    await runEvidencePack(args.slice(1));
+    return;
+  }
+
   if (args[0] === "castle-wall") {
     const code = await runCastleWallCommand(args.slice(1));
     drainAndExit(code);
