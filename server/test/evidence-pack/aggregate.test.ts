@@ -29,9 +29,15 @@ function entry(
   timestamp: string,
   operation: string,
   result: "success" | "failure" = "success",
-  identity = "agent-a"
+  identity = "agent-a",
+  details?: Record<string, unknown>
 ): AuditEntry {
-  return { timestamp, layer: "l2", operation, identity_id: identity, result };
+  return { timestamp, layer: "l2", operation, identity_id: identity, result, details };
+}
+
+/** A gate entry whose decided_by field marks it a HUMAN control-point decision. */
+function humanEntry(timestamp: string, operation: string, result: "success" | "failure" = "success"): AuditEntry {
+  return entry(timestamp, operation, result, "agent-a", { decided_by: "human" });
 }
 
 describe("quarter window", () => {
@@ -102,59 +108,76 @@ describe("aggregateQuarter", () => {
   });
 
   it("HIGH-1: the approval-inbox scenario (both ops for one approval) counts ONE human approval", () => {
-    // One human approval via the cross-harness inbox writes BOTH ops.
+    // One human approval via the cross-harness inbox writes BOTH ops: the
+    // aggregator op (observational) + gate_approve (decided_by human).
     const agg = aggregateQuarter(
       [
-        entry("2026-08-10T00:00:00.000Z", "gate_approve:tool_a"),
+        humanEntry("2026-08-10T00:00:00.000Z", "gate_approve:tool_a"),
         entry("2026-08-10T00:00:00.000Z", "cross_harness_approval_resolved", "success"),
       ],
       Q3_2026
     );
     expect(agg.by_category.human_approved).toBe(1);
-    // One human denial likewise counts once (gate_deny), not twice.
-    const agg2 = aggregateQuarter(
+  });
+
+  it("N1: the inbox-DENIAL scenario counts EXACTLY ONE human_denied (no double count, not structurally zero)", () => {
+    // One human denial via the inbox writes BOTH the aggregator op (failure,
+    // observational) AND gate_deny with decided_by "human".
+    const agg = aggregateQuarter(
       [
-        entry("2026-08-11T00:00:00.000Z", "gate_deny:tool_b", "failure"),
+        humanEntry("2026-08-11T00:00:00.000Z", "gate_deny:tool_b", "failure"),
         entry("2026-08-11T00:00:00.000Z", "cross_harness_approval_resolved", "failure"),
       ],
       Q3_2026
     );
-    expect(agg2.by_category.denied).toBe(1);
-    expect(agg2.by_category.human_denied).toBe(0);
+    expect(agg.by_category.human_denied).toBe(1); // real producer, not always 0
+    expect(agg.by_category.denied).toBe(0); // not double-counted as automated
+    expect(agg.by_category.other).toBe(1); // the aggregator op only
   });
 
-  it("HIGH-1: maps the LIVE gate op strings to the right human/automated bucket", () => {
+  it("N1: an AUTOMATED gate_deny (no human decided_by) stays `denied`, not human_denied", () => {
+    const autoDeny = entry("2026-08-12T00:00:00.000Z", "gate_deny:x", "failure", "system", {
+      decided_by: "channel_failure",
+    });
+    const invalidProof = entry("2026-08-12T00:00:00.000Z", "gate_deny:y", "failure"); // no decided_by
+    const agg = aggregateQuarter([autoDeny, invalidProof], Q3_2026);
+    expect(agg.by_category.denied).toBe(2);
+    expect(agg.by_category.human_denied).toBe(0);
+  });
+
+  it("maps the LIVE gate op strings to the right human/automated bucket via decided_by", () => {
     const at = "2026-08-01T00:00:00.000Z";
-    // The live interactive human-approval op (gate_${decision}: with approve)
-    // must be a HUMAN approval, not dropped into "other".
-    expect(categorizeEntry(entry(at, "gate_approve:some_tool"))).toBe("human_approved");
-    expect(categorizeEntry(entry(at, "gate_approval_proof:some_tool"))).toBe("human_approved");
-    // gate_deny is the blended denial (human or automated); it stays "denied".
+    // Human control-point decisions are attributed by decided_by "human".
+    expect(categorizeEntry(humanEntry(at, "gate_approve:some_tool"))).toBe("human_approved");
+    expect(categorizeEntry(humanEntry(at, "gate_deny:some_tool", "failure"))).toBe("human_denied");
+    // gate_approve/gate_deny WITHOUT a human decided_by are automated.
+    expect(categorizeEntry(entry(at, "gate_approve:some_tool"))).toBe("allowed");
     expect(categorizeEntry(entry(at, "gate_deny:some_tool", "failure"))).toBe("denied");
+    // Two-phase proof consumption is a human approval by construction.
+    expect(categorizeEntry(entry(at, "gate_approval_proof:some_tool"))).toBe("human_approved");
     // Automated tiers.
     expect(categorizeEntry(entry(at, "gate_allow:t"))).toBe("allowed");
     expect(categorizeEntry(entry(at, "gate_allow_proxy:t"))).toBe("allowed_proxy");
     expect(categorizeEntry(entry(at, "gate_injection_block:t"))).toBe("injection_blocked");
     expect(categorizeEntry(entry(at, "gate_unclassified:t"))).toBe("unclassified");
-    // UNMAPPED-OP GUARD: an unknown gate-shaped op is surfaced as
-    // "uncategorized", never hidden in "other" or a flattering bucket.
+    // UNMAPPED-OP GUARD: an unknown gate-shaped op is surfaced as "uncategorized".
     expect(categorizeEntry(entry(at, "gate_escalate:t"))).toBe("uncategorized");
     expect(categorizeEntry(entry(at, "gate_frobnicate:t"))).toBe("uncategorized");
     // A genuine non-gate operation is "other".
     expect(categorizeEntry(entry(at, "state_write:t"))).toBe("other");
   });
 
-  it("HIGH-1: gate_approve is counted as human_approved in the aggregation, not other", () => {
+  it("a human gate_approve is counted as human_approved in the aggregation, not other", () => {
     const agg = aggregateQuarter(
       [
-        entry("2026-08-10T00:00:00.000Z", "gate_approve:tool_a"),
-        entry("2026-08-11T00:00:00.000Z", "gate_approve:tool_b"),
-        entry("2026-08-12T00:00:00.000Z", "gate_deny:tool_c", "failure"),
+        humanEntry("2026-08-10T00:00:00.000Z", "gate_approve:tool_a"),
+        humanEntry("2026-08-11T00:00:00.000Z", "gate_approve:tool_b"),
+        humanEntry("2026-08-12T00:00:00.000Z", "gate_deny:tool_c", "failure"),
       ],
       Q3_2026
     );
     expect(agg.by_category.human_approved).toBe(2);
-    expect(agg.by_category.denied).toBe(1);
+    expect(agg.by_category.human_denied).toBe(1);
     expect(agg.by_category.other).toBe(0);
   });
 
