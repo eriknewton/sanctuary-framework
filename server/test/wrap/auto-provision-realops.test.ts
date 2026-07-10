@@ -1476,6 +1476,9 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
 });
 
 describe("confined-agent egress: runAgentEgressProbesAsUid (injected execFile, never a real spawn)", () => {
+  // No-op sleep so MED-3 retries add zero wall-clock delay in tests.
+  const noSleep = { sleep: async () => {} };
+
   it("spawns one sudo -u '#<uid>' curl probe per declared endpoint plus the negative control, and passes when endpoints resolve and the control rejects", async () => {
     const spawned: Array<{ file: string; args: string[] }> = [];
     const execFileFn = async (file: string, args: string[]) => {
@@ -1487,13 +1490,17 @@ describe("confined-agent egress: runAgentEgressProbesAsUid (injected execFile, n
       }
       return { stdout: "", stderr: "" };
     };
-    const report = await runAgentEgressProbesAsUid(503, execFileFn);
+    const report = await runAgentEgressProbesAsUid(503, execFileFn, noSleep);
     expect(report.ok).toBe(true);
     expect(spawned).toHaveLength(HERMES_ENDPOINT_SET.endpoints.length + 1);
     for (const call of spawned) {
       expect(call.file).toBe("/usr/bin/sudo");
       expect(call.args).toContain("#503");
       expect(call.args).toContain("-n");
+      // MED-2: every probe forces the DIRECT path (no proxy).
+      expect(call.args).toContain("--noproxy");
+      const idx = call.args.indexOf("--noproxy");
+      expect(call.args[idx + 1]).toBe("*");
     }
   });
 
@@ -1505,7 +1512,7 @@ describe("confined-agent egress: runAgentEgressProbesAsUid (injected execFile, n
       }
       return { stdout: "", stderr: "" };
     };
-    const report = await runAgentEgressProbesAsUid(503, execFileFn);
+    const report = await runAgentEgressProbesAsUid(503, execFileFn, noSleep);
     expect(report.ok).toBe(false);
     const venice = report.rows.find((r) => r.host === "api.venice.ai")!;
     expect(venice.pass).toBe(false);
@@ -1514,11 +1521,75 @@ describe("confined-agent egress: runAgentEgressProbesAsUid (injected execFile, n
 
   it("fails when the NEGATIVE CONTROL is reachable (the wall is not confining the agent at all)", async () => {
     const execFileFn = async () => ({ stdout: "", stderr: "" });
-    const report = await runAgentEgressProbesAsUid(503, execFileFn);
+    const report = await runAgentEgressProbesAsUid(503, execFileFn, noSleep);
     expect(report.ok).toBe(false);
     const control = report.rows[report.rows.length - 1]!;
     expect(control.expected).toBe("blocked");
     expect(control.observed).toBe("reachable");
+    expect(control.pass).toBe(false);
+  });
+
+  it("MED-3: a POSITIVE reachability check that flakes once then succeeds PASSES (bounded retry), and the whole run passes", async () => {
+    const attemptsPerUrl = new Map<string, number>();
+    const execFileFn = async (_file: string, args: string[]) => {
+      const url = args[args.length - 1]!;
+      const n = (attemptsPerUrl.get(url) ?? 0) + 1;
+      attemptsPerUrl.set(url, n);
+      if (url.includes("example.com")) {
+        // Negative control stays blocked.
+        throw new Error("blocked");
+      }
+      // api.venice.ai flakes on its FIRST attempt, succeeds on the second.
+      if (url.includes("api.venice.ai") && n === 1) {
+        throw new Error("transient network flake");
+      }
+      return { stdout: "", stderr: "" };
+    };
+    const report = await runAgentEgressProbesAsUid(503, execFileFn, {
+      reachableAttempts: 3,
+      sleep: async () => {},
+    });
+    expect(report.ok).toBe(true);
+    // Venice was retried (2 attempts); a healthy endpoint took just 1.
+    expect(attemptsPerUrl.get("https://api.venice.ai:443/")).toBe(2);
+    expect(attemptsPerUrl.get("https://api.telegram.org:443/")).toBe(1);
+  });
+
+  it("MED-3: a POSITIVE check that fails ALL attempts still fails (retry is bounded, not infinite)", async () => {
+    const attempts = new Map<string, number>();
+    const execFileFn = async (_file: string, args: string[]) => {
+      const url = args[args.length - 1]!;
+      attempts.set(url, (attempts.get(url) ?? 0) + 1);
+      if (url.includes("api.venice.ai")) throw new Error("hard-down");
+      if (url.includes("example.com")) throw new Error("blocked");
+      return { stdout: "", stderr: "" };
+    };
+    const report = await runAgentEgressProbesAsUid(503, execFileFn, {
+      reachableAttempts: 3,
+      sleep: async () => {},
+    });
+    expect(report.ok).toBe(false);
+    // Exactly the bounded number of attempts, never more.
+    expect(attempts.get("https://api.venice.ai:443/")).toBe(3);
+  });
+
+  it("MED-3 asymmetry: the NEGATIVE control is NEVER retried (a reachable control is a single-assertion security failure)", async () => {
+    const attempts = new Map<string, number>();
+    const execFileFn = async (_file: string, args: string[]) => {
+      const url = args[args.length - 1]!;
+      attempts.set(url, (attempts.get(url) ?? 0) + 1);
+      // The negative control is REACHABLE (the confinement is broken).
+      return { stdout: "", stderr: "" };
+    };
+    const report = await runAgentEgressProbesAsUid(503, execFileFn, {
+      reachableAttempts: 3,
+      sleep: async () => {},
+    });
+    expect(report.ok).toBe(false);
+    // The control was probed EXACTLY once -- never retried, so a broken
+    // confinement can never be masked by a lucky later attempt.
+    expect(attempts.get("https://example.com:443/")).toBe(1);
+    const control = report.rows[report.rows.length - 1]!;
     expect(control.pass).toBe(false);
   });
 });

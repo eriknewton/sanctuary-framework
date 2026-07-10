@@ -504,6 +504,89 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         XCTAssertNil(engine.agentOrigin, "rejected envelope must not install agent_origin")
     }
 
+    // MARK: - PR-905-review BLOCKER: install ordering closes the boot window
+
+    func testApplyManifestUpdated_installsOriginBEFORE_rulesGoLive() throws {
+        // BLOCKER regression: provisioned allow rules must NEVER be evaluable
+        // while `_agentOrigin` is still nil. `store.update` fires its observers
+        // the instant the new rules become the live snapshot; capture the
+        // engine's origin AT THAT MOMENT and assert it is already installed.
+        // Before the reorder fix, the origin was installed AFTER store.update,
+        // so this observer would have seen a nil origin with live allow rules
+        // (the fail-open window the `== .uid` predicate then walked into).
+        let wire = AgentOriginWire(mode: .uid, agentUid: 600, systemUidAllowCeiling: 500)
+        let signed = try makeSignedManifestUpdatedBody(
+            rules: [sampleAllowRule()],
+            agentOrigin: wire
+        )
+        let engine = FlowEvaluatorEngine()
+
+        var originAtRulesLive: AgentOriginDescriptor??
+        var ruleCountAtObserve = -1
+        _ = engine.manifestStore.addObserver { snapshot in
+            originAtRulesLive = engine.agentOrigin
+            ruleCountAtObserve = snapshot.rules.count
+        }
+
+        let snapshot = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: signed.publicKey,
+            engine: engine
+        )
+        XCTAssertNotNil(snapshot)
+        // The observer fired with the new rules live...
+        XCTAssertEqual(ruleCountAtObserve, 1)
+        // ...and the origin was ALREADY installed at that exact point (no
+        // nil-origin-with-live-allow-rules window).
+        XCTAssertEqual(originAtRulesLive??.mode, .uid)
+        XCTAssertEqual(originAtRulesLive??.agentUid, 600)
+    }
+
+    func testRecoverPersistedManifest_installsOriginBEFORE_rulesGoLive() throws {
+        // Same window on the RESTART-recovery path (the one that runs on every
+        // boot). Persist a uid-mode manifest, then recover it into a fresh
+        // engine and assert the origin is installed by the time the recovered
+        // rules go live.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathComponent("last-valid-manifest.json")
+        let wire = AgentOriginWire(mode: .uid, agentUid: 600, systemUidAllowCeiling: 500)
+        let signed = try makeSignedManifestUpdatedBody(
+            rules: [sampleAllowRule()],
+            agentOrigin: wire
+        )
+        let seedStore = ManifestStore(lastValidManifestURL: url)
+        XCTAssertNotNil(IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(signed.body),
+            store: seedStore,
+            cache: FlowCache(capacity: 8),
+            pinnedPublicKey: signed.publicKey
+        ))
+
+        let restartedEngine = FlowEvaluatorEngine(
+            manifestStore: ManifestStore(lastValidManifestURL: url)
+        )
+        var originAtRulesLive: AgentOriginDescriptor??
+        var ruleCountAtObserve = -1
+        _ = restartedEngine.manifestStore.addObserver { snapshot in
+            originAtRulesLive = restartedEngine.agentOrigin
+            ruleCountAtObserve = snapshot.rules.count
+        }
+
+        let recovered = IPCBridgeNotifications.recoverPersistedManifest(
+            store: restartedEngine.manifestStore,
+            cache: restartedEngine.flowCache,
+            pinnedPublicKey: signed.publicKey,
+            engine: restartedEngine
+        )
+        XCTAssertNotNil(recovered)
+        XCTAssertEqual(ruleCountAtObserve, 1)
+        XCTAssertEqual(originAtRulesLive??.mode, .uid)
+        XCTAssertEqual(originAtRulesLive??.agentUid, 600)
+    }
+
     func testUnusableAgentOriginIsIgnoredFailClosed() throws {
         // A signed-but-structurally-unusable UID descriptor (no agent_uid)
         // must NOT install; the engine stays classify-all-agent.

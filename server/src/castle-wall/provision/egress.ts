@@ -673,6 +673,14 @@ export function renderAgentEgressReportLines(report: AgentEgressVerifyReport): s
  * through the armed wall; a wall block surfaces as a connect timeout/reset
  * (nonzero exit). `--fail` is deliberately absent: an HTTP-level error (403,
  * 404) still proves reachability.
+ *
+ * MED-2 (PR-905 review): `--noproxy '*'` disables ALL proxy use for this
+ * probe. Without it, if the agent account's environment carries
+ * HTTP(S)_PROXY (or curl's `.curlrc` sets one), curl could reach the endpoint
+ * THROUGH a proxy and report exit 0 while the DIRECT path the Castle Wall
+ * actually governs is blocked -- a false PASS that would bless a broken
+ * egress path. The wall enforces the direct connection, so the probe MUST
+ * test the direct connection. `'*'` bypasses the proxy for every host.
  */
 export function asUidTlsProbeArgv(
   uid: number,
@@ -689,6 +697,11 @@ export function asUidTlsProbeArgv(
       "-u",
       `#${uid}`,
       "/usr/bin/curl",
+      // MED-2: force the DIRECT path (never a proxy), matching what the wall
+      // governs. A proxied success would be a false PASS over a blocked
+      // direct path.
+      "--noproxy",
+      "*",
       "--silent",
       "--show-error",
       "--max-time",

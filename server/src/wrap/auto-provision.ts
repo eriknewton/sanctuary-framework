@@ -1427,6 +1427,21 @@ export async function runAutoProvisionForWrap(
 
 // ── Real op implementations (drill-only side effects; never exercised by CI) ──
 
+/** Tuning + test seams for {@link runAgentEgressProbesAsUid}. */
+export interface AgentEgressProbeOptions {
+  /**
+   * MED-3 (PR-905 review): max attempts for a POSITIVE-reachability probe
+   * before declaring it failed. A single transient network flake against one
+   * of the real endpoints must NOT roll back the whole provision, so the
+   * reachability checks get a bounded retry. Default 3.
+   */
+  reachableAttempts?: number;
+  /** Backoff between reachability retries (ms). Default 500. */
+  backoffMs?: number;
+  /** Sleep seam (tests inject a no-op so retries add no wall-clock delay). */
+  sleep?: (ms: number) => Promise<void>;
+}
+
 /**
  * Run the post-arm as-uid egress probes (confined-agent egress design,
  * section 5): for each declared Hermes endpoint plus the negative control,
@@ -1438,6 +1453,14 @@ export async function runAutoProvisionForWrap(
  * sudoers surprise fails loudly instead of hanging on a prompt. Exported for
  * the unit suite, which drives it with an injected execFile and never spawns
  * real processes.
+ *
+ * MED-3 (PR-905 review) asymmetric retry: the POSITIVE reachability checks
+ * are flake-prone (one transient network blip against a real endpoint should
+ * not brick the provision), so each gets a bounded retry (default 3 attempts,
+ * short backoff). The NEGATIVE control (a non-listed host must be BLOCKED) is
+ * a SECURITY assertion and is single-shot, NEVER retried: one reachable
+ * observation of the negative control is a real confinement failure, and
+ * retrying could only mask it.
  */
 export async function runAgentEgressProbesAsUid(
   uid: number,
@@ -1445,19 +1468,33 @@ export async function runAgentEgressProbesAsUid(
     file: string,
     args: string[],
   ) => Promise<{ stdout: string; stderr: string }>,
+  options: AgentEgressProbeOptions = {},
 ): Promise<AgentEgressVerifyReport> {
+  const reachableAttempts = Math.max(1, options.reachableAttempts ?? 3);
+  const backoffMs = options.backoffMs ?? 500;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const specs = buildAgentEgressProbeSpecs(HERMES_ENDPOINT_SET);
   const observed: boolean[] = [];
   for (const spec of specs) {
     const { file, args } = asUidTlsProbeArgv(uid, spec.host, spec.port);
-    let reachable: boolean;
-    try {
-      await execFileFn(file, args);
-      // execFile resolves only on exit code 0.
-      reachable = asUidProbeReachableDecision(0);
-    } catch {
-      // Nonzero exit, signal death, or spawn failure: blocked/unverified.
-      reachable = false;
+    // MED-3: retry ONLY the flake-prone positive-reachability checks; the
+    // negative control (expected "blocked") stays single-shot so a security
+    // failure is never retried away.
+    const attempts = spec.expected === "reachable" ? reachableAttempts : 1;
+    let reachable = false;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await execFileFn(file, args);
+        // execFile resolves only on exit code 0.
+        reachable = asUidProbeReachableDecision(0);
+        break;
+      } catch {
+        // Nonzero exit, signal death, or spawn failure: blocked/unverified.
+        reachable = false;
+      }
+      if (attempt < attempts) {
+        await sleep(backoffMs);
+      }
     }
     observed.push(reachable);
   }

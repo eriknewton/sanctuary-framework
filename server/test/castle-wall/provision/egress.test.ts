@@ -381,6 +381,15 @@ describe("castle-wall/provision/egress: as-uid probe helpers", () => {
     expect(() => asUidTlsProbeArgv(0, "h", 443)).toThrow(/positive integer uid/);
     expect(() => asUidTlsProbeArgv(-1, "h", 443)).toThrow(/positive integer uid/);
   });
+
+  it("MED-2: the probe forces the DIRECT path with --noproxy '*' (a proxied success would falsely PASS over a blocked direct path)", () => {
+    const { args } = asUidTlsProbeArgv(503, "api.venice.ai", 443);
+    const idx = args.indexOf("--noproxy");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe("*");
+    // The proxy override sits inside the curl argv (after /usr/bin/curl).
+    expect(args.indexOf("/usr/bin/curl")).toBeLessThan(idx);
+  });
 });
 
 describe("castle-wall/provision/egress: derived-DNS interaction", () => {

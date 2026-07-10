@@ -587,9 +587,11 @@ final class AllowlistEvaluatorTests: XCTestCase {
     }
 
     func testHigh1_natMode_unattributedKeepsExistingSemantics() {
-        // KEYED ON UID MODE: NAT mode, where `.unattributed` flows are
-        // common (unsigned processes), keeps its existing rule-loop
-        // semantics unchanged.
+        // A POSITIVELY-resolved NAT mode is the ONLY case that keeps the allow
+        // for an `.unattributed` flow: NAT-mode unattributed flows are common
+        // unsigned operator-software, and the documented NAT rationale keeps
+        // their existing rule-loop semantics. Every non-NAT case (uid mode AND
+        // nil descriptor) suppresses.
         let r = rule(host: .single("api.anthropic.com"), disposition: "allow")
         let outcome = AllowlistEvaluator.evaluate(
             flow: originFlow(ruid: 0, unattributed: true),
@@ -599,17 +601,22 @@ final class AllowlistEvaluatorTests: XCTestCase {
         XCTAssertEqual(outcome, .allow(matchedRuleId: "r-1"))
     }
 
-    func testHigh1_noDescriptor_unattributedKeepsExistingSemantics() {
-        // No descriptor delivered: not uid mode, so the hardening does not
-        // key in (there are no uid-mode agent grants to inherit in that
-        // state; the machine-wide default-deny posture is unchanged).
+    func testHigh1_noDescriptor_unattributedSuppressesAllowFailClosed() {
+        // PR-905-review BLOCKER: a NIL descriptor is REACHABLE -- provisioned
+        // allow rules go live (store.update) before the origin descriptor
+        // installs, so on every boot / manifest apply there is a window with
+        // rules live and `_agentOrigin == nil`. An `.unattributed` flow in
+        // that window must NOT earn the provisioned allow; the fail-closed
+        // bucket stays closed. The `!= .nat` predicate suppresses here (nil is
+        // not positively NAT); the old `== .uid` predicate fail-OPENed on this
+        // exact case. Only a POSITIVELY-resolved NAT mode keeps the allow.
         let r = rule(host: .single("api.anthropic.com"), disposition: "allow")
         let outcome = AllowlistEvaluator.evaluate(
             flow: originFlow(ruid: 0, unattributed: true),
             rules: [r],
             agentOrigin: nil
         )
-        XCTAssertEqual(outcome, .allow(matchedRuleId: "r-1"))
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
     // NAT mode
