@@ -142,11 +142,48 @@ function outcomeRowCount<T>(outcome: ReadOutcome<T[]>): number {
   return outcome.status === "populated" ? outcome.value.length : 0;
 }
 
-function anyInventoryReadFailed(inv: InventorySnapshot): boolean {
-  return (
+/**
+ * The exec-summary "AI tools inventoried" line. The tool count is a DEFINITIVE
+ * number, so it is emitted ONLY when both tool sources (wrapped harnesses +
+ * configured MCP servers) were read to completion; a `read_failed` on either
+ * renders "could not be fully determined" instead of a bare "0", and the "0"
+ * wording itself is gated through {@link claimFromCompleteRead} on a Complete
+ * witness. This is the MED-1 fix: a failed read can never print as a definitive
+ * zero via the type, not merely via adjacent prose.
+ */
+function toolInventoryLine(inv: InventorySnapshot): string {
+  if (
     inv.agents.status === "read_failed" ||
-    inv.mcp_servers.status === "read_failed" ||
+    inv.mcp_servers.status === "read_failed"
+  ) {
+    return (
+      "**AI tools inventoried:** could not be fully determined this period " +
+      "(one or more inventory sources could not be read; see the inventory " +
+      "section for which and why). This is NOT a count of zero."
+    );
+  }
+  // Both tool sources are Complete here (TS narrows out `read_failed`).
+  const count = outcomeRowCount(inv.agents) + outcomeRowCount(inv.mcp_servers);
+  const destNote =
     inv.observed_destinations.status === "read_failed"
+      ? " (Note: the observed-egress-destination source could not be read; " +
+        "see the inventory section.)"
+      : "";
+  if (count === 0) {
+    return (
+      claimFromCompleteRead(
+        inv.agents,
+        "**AI tools inventoried:** 0 (wrapped harnesses and configured AI tool " +
+          "servers this install can see; see the inventory section for the " +
+          "coverage basis - this is NOT a claim that the firm uses no AI tools)."
+      ) + destNote
+    );
+  }
+  return (
+    `**AI tools inventoried:** ${count} ` +
+    "(wrapped harnesses and configured AI tool servers this install can see; " +
+    "see the inventory section for coverage limits)." +
+    destNote
   );
 }
 
@@ -156,23 +193,7 @@ function renderExecutiveSummary(
   inv: InventorySnapshot
 ): PackSection {
   const machines = "1 (this Sanctuary install)";
-  const toolCount =
-    outcomeRowCount(inv.agents) + outcomeRowCount(inv.mcp_servers);
-  const readNote = anyInventoryReadFailed(inv)
-    ? " One or more inventory sources could not be read this period, so this " +
-      "count is incomplete; see the inventory section."
-    : "";
-  const toolLine =
-    toolCount === 0
-      ? "**AI tools inventoried:** 0 " +
-        "(wrapped harnesses and configured AI tool servers this install can " +
-        "see; see the inventory section for the coverage basis - this is NOT " +
-        "a claim that the firm uses no AI tools)." +
-        readNote
-      : `**AI tools inventoried:** ${toolCount} ` +
-        "(wrapped harnesses and configured AI tool servers this install can " +
-        "see; see the inventory section for coverage limits)." +
-        readNote;
+  const toolLine = toolInventoryLine(inv);
 
   // The decision-count bullets are DEFINITIVE claims (e.g. "0 denied"), so they
   // may only be drawn from a completed audit read. A read failure prints an
@@ -187,7 +208,9 @@ function renderExecutiveSummary(
           "prompt injection.",
         `- **Denied (automated policy or human control point):** ${c.denied} ` +
           "(these share one audit operation and cannot be split here; see section 6).",
-        `- **Total recorded control-point decisions in the quarter:** ${agg.total_in_window}.`,
+        `- **Total recorded audit operations in the quarter:** ${agg.total_in_window} ` +
+          `(${agg.total_in_window - c.other} control-point decisions + ${c.other} ` +
+          "other recorded operations that are not control-point decisions).",
       ];
       if (c.uncategorized > 0) {
         bullets.push(

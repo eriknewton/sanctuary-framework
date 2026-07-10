@@ -52,6 +52,29 @@ export type Complete<T> = Populated<T> | EmptyVerified;
 /** The outcome of reading one data source the report renders from. */
 export type ReadOutcome<T> = Complete<T> | ReadFailed;
 
+// ── SOURCE-COMPILED DURABILITY GUARD ─────────────────────────────────
+//
+// The whole point of the chokepoint is that a definitive negative cannot be
+// asserted from a `read_failed` outcome, because `ReadFailed` is not a
+// `Complete<T>` (see {@link claimFromCompleteRead}). That invariant must be
+// enforced by the REAL typecheck. `server/tsconfig.json` typechecks `src/**`
+// only and EXCLUDES `test/`, and vitest does not typecheck, so a guard living
+// in a test file fires nowhere. This guard therefore lives HERE, in `src`, so
+// `npm run typecheck` (= `tsc --noEmit` over `src/**`, which CI runs) fails to
+// compile the moment `Complete<T>` is ever widened to admit `ReadFailed`.
+//
+// Mechanism: if `Complete<T>` is loosened to include `ReadFailed`, the
+// conditional resolves to `never`, so `_assertReadFailedExcludedFromComplete`
+// can no longer be initialized with `true` and `tsc` errors (TS2322). Verified
+// by injection: weakening `Complete<T>` makes `npm run typecheck` FAIL. This is
+// the durable, CI-enforced tripwire.
+type ReadFailedExcludedFromComplete = ReadFailed extends Complete<unknown>
+  ? never
+  : true;
+const _assertReadFailedExcludedFromComplete: ReadFailedExcludedFromComplete = true;
+// Reference it so an unused-locals rule cannot strip the guard.
+void _assertReadFailedExcludedFromComplete;
+
 /** Construct a populated outcome. */
 export const populated = <T>(value: T): Populated<T> => ({
   status: "populated",
@@ -76,13 +99,17 @@ export function isComplete<T>(outcome: ReadOutcome<T>): outcome is Complete<T> {
  * The ONE gate for a DEFINITIVE claim of absence or completeness ("none
  * configured", "full quarter covered", "no denials this quarter"). It REQUIRES
  * a {@link Complete} witness, so a `read_failed` outcome CANNOT reach it:
- * passing a {@link ReadOutcome} that might be `read_failed` is a COMPILE error,
- * because `ReadFailed` is not assignable to `Complete<T>`. A caller must first
- * narrow the outcome (handling the read-failed arm) before it can assert the
- * negative. This is the structural chokepoint: the false-census claim is
- * unrepresentable, not merely untested.
+ * passing a {@link ReadOutcome} that might be `read_failed` here is a COMPILE
+ * error over `src/**` (which `npm run typecheck` compiles and CI runs), because
+ * `ReadFailed` is not assignable to `Complete<T>`. A caller must first narrow
+ * the outcome (handling the read-failed arm) before it can assert the negative.
+ * This is the structural chokepoint: the false-census claim is unrepresentable,
+ * not merely untested.
  *
- * The witness value is not otherwise used; its TYPE is the proof.
+ * The witness value is not otherwise used; its TYPE is the proof. The invariant
+ * that keeps this gate load-bearing (`Complete<T>` never admitting `ReadFailed`)
+ * is itself enforced by the source-compiled
+ * `_assertReadFailedExcludedFromComplete` guard above.
  */
 export function claimFromCompleteRead<T>(
   _completeRead: Complete<T>,

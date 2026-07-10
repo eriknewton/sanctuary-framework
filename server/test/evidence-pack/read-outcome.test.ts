@@ -12,6 +12,9 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import {
   populated,
   emptyVerified,
@@ -58,14 +61,32 @@ describe("read-outcome primitives", () => {
     );
   });
 
-  it("CHOKEPOINT (compile-time): a read_failed cannot be used to assert a definitive negative", () => {
-    // This @ts-expect-error IS the guarantee: passing a read_failed outcome to
-    // claimFromCompleteRead must be a TYPE error (ReadFailed is not a
-    // Complete<T>). If a future edit weakens Complete to admit ReadFailed, this
-    // directive becomes unused and `tsc --noEmit` fails - the chokepoint holds
-    // by the type checker, not by a runtime assertion.
+  it("CHOKEPOINT: a read_failed cannot be used to assert a definitive negative", () => {
+    // SECONDARY documentation of the guarantee. NOTE: this @ts-expect-error is
+    // NOT the durable tripwire - `server/tsconfig.json` EXCLUDES `test/` from
+    // typechecking and vitest does not typecheck, so `npm run typecheck` never
+    // compiles this file. The REAL, CI-enforced guard lives in `src` at
+    // `read-outcome.ts` (`_assertReadFailedExcludedFromComplete`), which
+    // `tsc --noEmit` over `src/**` DOES compile and which fails to compile if
+    // `Complete<T>` is ever widened to admit `ReadFailed`. This directive is
+    // kept as readable documentation of the intent; if a test-scoped typecheck
+    // is later wired in, it also becomes a live second tripwire.
     // @ts-expect-error read_failed is not a Complete<T> witness.
     claimFromCompleteRead(readFailed("db down"), "No servers configured.");
     expect(true).toBe(true);
+  });
+
+  it("HIGH-1: the DURABLE src-compiled guard exists in read-outcome.ts (the CI-enforced tripwire)", () => {
+    // The real durability guarantee lives in `src` so `npm run typecheck`
+    // (which excludes `test/`) compiles it. This test ensures the guard cannot
+    // be silently deleted: if it goes, this fails, pointing back to the src file
+    // that must fail to compile when Complete<T> is widened to admit ReadFailed.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const src = readFileSync(
+      join(here, "..", "..", "src", "evidence-pack", "read-outcome.ts"),
+      "utf8"
+    );
+    expect(src).toContain("_assertReadFailedExcludedFromComplete");
+    expect(src).toContain("ReadFailed extends Complete<unknown>");
   });
 });

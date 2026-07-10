@@ -286,8 +286,8 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("decrypt failed");
     // A genuinely-empty (empty_verified) source DOES get the affirmative census line.
     expect(report).toContain("No wrapped AI harnesses are recorded");
-    // The exec summary flags the incomplete read.
-    expect(report).toContain("could not be read this period");
+    // The exec summary flags the incomplete read (MCP source failed).
+    expect(report).toContain("could not be fully determined this period");
   });
 
   it("the executive summary says 'configured', never 'connected', for MCP servers", () => {
@@ -295,6 +295,50 @@ describe("buildEvidencePack", () => {
     const report = pack.files[0]!.content;
     expect(report).toContain("configured AI tool servers");
     expect(report).not.toContain("connected AI tool servers");
+  });
+
+  it("MED-1: a failed inventory read never prints 'AI tools inventoried: 0' (routed through the gate)", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: readFailed("registry read failed"),
+          mcp_servers: readFailed("profile read failed"),
+          observed_destinations: readFailed("observe read failed"),
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    // No bare definitive zero for a failed read, in any form.
+    expect(report).not.toContain("AI tools inventoried:** 0");
+    expect(report).not.toContain("AI tools inventoried: 0");
+    // Instead: "could not be fully determined", explicitly NOT a zero.
+    expect(report).toContain("could not be fully determined this period");
+    expect(report).toContain("This is NOT a count of zero.");
+  });
+
+  it("MED-1: an all-empty_verified inventory DOES print the definitive gated 0", () => {
+    const pack = buildEvidencePack(baseInput(), deps([]));
+    const report = pack.files[0]!.content;
+    // baseInput has no inventory -> emptyInventorySnapshot (all empty_verified).
+    expect(report).toContain("AI tools inventoried:** 0");
+    expect(report).toContain("NOT a claim that the firm uses no AI tools");
+  });
+
+  it("LOW-1: the total bullet is labeled 'audit operations' and splits out non-decision 'other'", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([
+        entry("2026-08-01T00:00:00.000Z", "gate_allow:x"),
+        entry("2026-08-02T00:00:00.000Z", "identity_create"), // 'other'
+      ])
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("Total recorded audit operations in the quarter");
+    expect(report).not.toContain("Total recorded control-point decisions in the quarter");
+    // Splits 2 total into 1 control-point decision + 1 other.
+    expect(report).toContain("1 control-point decisions + 1 other recorded operations");
   });
 
   it("CHOKEPOINT: a read_failed audit source never renders a definitive negative", () => {
