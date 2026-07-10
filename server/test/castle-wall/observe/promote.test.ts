@@ -20,6 +20,7 @@ import type { VerifiedManifestRead } from "../../../src/castle-wall/observe/prom
 import { candidateKey, type CandidateObservation } from "../../../src/castle-wall/observe/types.js";
 import { validateRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
+import type { AgentOrigin, OperatorBaseline } from "../../../src/castle-wall/allowlist/manifest.js";
 
 function candidate(overrides: Partial<CandidateObservation> = {}): CandidateObservation {
   return {
@@ -389,5 +390,63 @@ describe("promoteCandidates: FIX 3 -- approval context shows the synthesized eff
     if (outcome.status !== "no_candidates") throw new Error("unreachable");
     expect(outcome.dropped).toEqual([{ key: candidateKey(a), reason: "failed_validation" }]);
     expect(approveCalled).toBe(false);
+  });
+});
+
+describe("promoteCandidates: #897 P1 -- carries verified manifest-level descriptors into publish", () => {
+  const agentOrigin: AgentOrigin = { mode: "uid", agent_uid: 550, system_uid_allow_ceiling: 500 };
+  const operatorBaseline: OperatorBaseline = {
+    essentials: [{ name: "tailscale", signing_id: "io.tailscale.ipn.macos" }],
+  };
+
+  it("passes the verified agent_origin + operator_baseline from the read through to publish", async () => {
+    const a = candidate();
+    const candidatesByKey = byKeyMap([a]);
+    let capturedRules: AllowlistRule[] | null = null;
+    let capturedDescriptors: unknown = "unset";
+
+    const outcome = await promoteCandidates([{ key: candidateKey(a) }], candidatesByKey, {
+      readVerifiedManifest: manifest({
+        status: "ok",
+        rules: [],
+        digest: "digest-with-descriptors",
+        agentOrigin,
+        operatorBaseline,
+      }),
+      approve: async () => ({ allowed: true }),
+      publish: async (rules, descriptors) => {
+        capturedRules = rules;
+        capturedDescriptors = descriptors;
+        return { written_rule_filenames: rules.map((r) => r.id), removed_rule_filenames: [] };
+      },
+      now: NOW,
+    });
+
+    expect(outcome.status).toBe("promoted");
+    // The descriptors reach publish verbatim (they come from the SAME verified
+    // read the carry-forward rules come from -- never raw on-disk bytes).
+    expect(capturedDescriptors).toEqual({ agentOrigin, operatorBaseline });
+    expect(capturedRules).not.toBeNull();
+  });
+
+  it("passes an EMPTY descriptor set when the verified manifest carried none (absent stays absent)", async () => {
+    const a = candidate();
+    const candidatesByKey = byKeyMap([a]);
+    let capturedDescriptors: unknown = "unset";
+
+    await promoteCandidates([{ key: candidateKey(a) }], candidatesByKey, {
+      readVerifiedManifest: manifest(OK_EMPTY),
+      approve: async () => ({ allowed: true }),
+      publish: async (rules, descriptors) => {
+        capturedDescriptors = descriptors;
+        return { written_rule_filenames: rules.map((r) => r.id), removed_rule_filenames: [] };
+      },
+      now: NOW,
+    });
+
+    // No descriptors on the source manifest -> an empty descriptor set, so
+    // buildSignedManifest omits both fields and the canonical bytes are
+    // unchanged (no accidental null/undefined descriptor injected).
+    expect(capturedDescriptors).toEqual({});
   });
 });

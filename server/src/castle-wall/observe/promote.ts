@@ -40,6 +40,7 @@
  */
 
 import type { AllowlistRule, RuleMatch, RuleScope } from "../allowlist/schema.js";
+import type { AgentOrigin, OperatorBaseline } from "../allowlist/manifest.js";
 import { synthesizeCandidateRule } from "./synthesize.js";
 import {
   DEFAULT_OBSERVE_GRANULARITY,
@@ -59,19 +60,52 @@ export interface PromotePublishResult {
 }
 
 /**
+ * The signature-VERIFIED manifest-level descriptors carried forward on a
+ * re-sign. Both live INSIDE the signed `manifest` body (not a separate rule
+ * file), so they ride the same pinned-key Ed25519 signature the rules do; a
+ * value here is therefore only ever read off a signature-checked manifest,
+ * NEVER raw on-disk bytes. Absent when the source manifest omitted the field.
+ *
+ * WHY CARRYING THEM FORWARD MATTERS (#897 P1, fail-closed correctness):
+ * dropping these on a re-sign is strictly MORE denying -- an absent
+ * `agent_origin` makes the macOS sysext classify every flow `.agent`
+ * (machine-wide default-deny), and an absent `operator_baseline` falls back to
+ * the UID-only baseline -- so a silent drop severs the operator's own
+ * system-essential connectivity even though the Tier-1 approval only reviewed
+ * the newly-added allow rules. Carrying them forward keeps a re-signed
+ * manifest faithful to what the operator already signed.
+ */
+export interface ManifestDescriptors {
+  agentOrigin?: AgentOrigin;
+  operatorBaseline?: OperatorBaseline;
+}
+
+/**
  * The result of reading + cryptographically verifying the current on-disk
  * signed manifest.
  *   - `ok`: signature verified against the pinned key AND every referenced
  *     rule re-validated (sha256 + validateRule); `rules` are the verified
- *     carry-forward set and `digest` is a compare-and-set token over the
- *     signed-manifest bytes.
+ *     carry-forward set, `agentOrigin`/`operatorBaseline` are the verified
+ *     manifest-level descriptors carried forward alongside them, and `digest`
+ *     is a compare-and-set token over the signed-manifest bytes.
  *   - `absent`: no manifest exists yet (fresh install) -- an empty ruleset.
  *   - `tampered`: the manifest exists but does NOT verify (bad signature,
  *     unreadable/corrupt JSON, missing rule file, sha256 mismatch, or a
  *     rule that fails validateRule). Promote MUST fail closed on this.
  */
 export type VerifiedManifestRead =
-  | { status: "ok"; rules: AllowlistRule[]; digest: string }
+  | {
+      status: "ok";
+      rules: AllowlistRule[];
+      digest: string;
+      /**
+       * The signature-VERIFIED manifest-level descriptors (both optional).
+       * Set only when the source manifest carried them, so a re-sign preserves
+       * them; omitted otherwise (keeps the re-signed canonical bytes identical).
+       */
+      agentOrigin?: AgentOrigin;
+      operatorBaseline?: OperatorBaseline;
+    }
   | { status: "absent" }
   | { status: "tampered"; reason: string };
 
@@ -92,13 +126,14 @@ export interface PromoteDeps {
   /** Tier-1 approval call. Never invoked when there is nothing valid to promote. */
   approve: PromoteApprover;
   /**
-   * Re-signs + atomically publishes the FULL merged ruleset. Invoked ONLY
-   * after `approve()` returns `allowed: true` AND the publish-time
-   * compare-and-set passes -- never before, never on a denial, never on a
-   * tampered/changed manifest. Wraps `runtime/manifest-publisher.ts`'s
+   * Re-signs + atomically publishes the FULL merged ruleset PLUS the verified
+   * manifest-level descriptors carried forward from the current manifest (#897
+   * P1). Invoked ONLY after `approve()` returns `allowed: true` AND the
+   * publish-time compare-and-set passes -- never before, never on a denial,
+   * never on a tampered/changed manifest. Wraps `runtime/manifest-publisher.ts`'s
    * `publishSignedManifest` in production; a test double in unit tests.
    */
-  publish: (rules: AllowlistRule[]) => Promise<PromotePublishResult>;
+  publish: (rules: AllowlistRule[], descriptors: ManifestDescriptors) => Promise<PromotePublishResult>;
   /**
    * Best-effort per-candidate audit append, one call per promoted
    * candidate. A throw here must NEVER be reported as "promote failed" --
@@ -155,6 +190,21 @@ function digestOf(read: VerifiedManifestRead): string {
 
 function verifiedRulesOf(read: VerifiedManifestRead): AllowlistRule[] {
   return read.status === "ok" ? read.rules : [];
+}
+
+/**
+ * The verified manifest-level descriptors to carry forward. Sourced ONLY from
+ * an `ok` (signature-verified) read; an absent/tampered read carries nothing.
+ * Each field is copied only when the source manifest set it, so an absent
+ * descriptor stays absent (the re-signed canonical bytes match a manifest
+ * built without it).
+ */
+function verifiedDescriptorsOf(read: VerifiedManifestRead): ManifestDescriptors {
+  if (read.status !== "ok") return {};
+  const out: ManifestDescriptors = {};
+  if (read.agentOrigin !== undefined) out.agentOrigin = read.agentOrigin;
+  if (read.operatorBaseline !== undefined) out.operatorBaseline = read.operatorBaseline;
+  return out;
 }
 
 /**
@@ -263,6 +313,14 @@ export async function promoteCandidates(
     return { status: "manifest_changed", dropped };
   }
   const currentRules = verifiedRulesOf(atPublish);
+  // Carry the signature-VERIFIED manifest-level descriptors forward from the
+  // SAME verified publish-time read the rules come from -- never raw on-disk
+  // bytes -- so the re-signed manifest preserves them (#897 P1). This rides the
+  // identical laundering-safe path as the rules: `atPublish` is only `ok` after
+  // the pinned-key signature + per-rule verification, and the descriptors live
+  // under that signature, so a planted descriptor breaks the signature and
+  // lands in the `tampered` abort above rather than getting re-signed.
+  const descriptors = verifiedDescriptorsOf(atPublish);
 
   // Merge: the VERIFIED carry-forward rules first, then the freshly
   // synthesized + validated added rules whose id is not already present.
@@ -277,7 +335,7 @@ export async function promoteCandidates(
   void basisIds;
   const addedRules = promotable.filter((row) => !existingIds.has(row.rule.id)).map((row) => row.rule);
   const mergedRules = [...currentRules, ...addedRules];
-  const publishResult = await deps.publish(mergedRules);
+  const publishResult = await deps.publish(mergedRules, descriptors);
 
   for (const row of promotable) {
     if (!deps.auditPromotedCandidate) continue;
