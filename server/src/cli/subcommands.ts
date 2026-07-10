@@ -16,6 +16,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "distress",
   "doctor",
   "erc8004",
+  "evidence-pack",
   "exit",
   "export-passphrase",
   "federation",

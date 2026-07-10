@@ -317,9 +317,14 @@ class PdfBuilder {
   private currentPage: PageAccumulator;
   private cursorY: number = BODY_TOP_Y;
   private readonly manifestDigest: string;
+  private readonly footerLabelPrefix: string;
 
-  constructor(manifestDigest: string) {
+  constructor(
+    manifestDigest: string,
+    footerLabelPrefix = "Sanctuary EU AI Act Compliance Bundle"
+  ) {
     this.manifestDigest = manifestDigest;
+    this.footerLabelPrefix = footerLabelPrefix;
     this.currentPage = { operators: [], pageNumber: 1 };
     this.pages.push(this.currentPage);
   }
@@ -441,8 +446,7 @@ class PdfBuilder {
     const totalPages = this.pages.length;
     const digestShort = this.manifestDigest.slice(0, 16) + "...";
     const leftFooter =
-      "Sanctuary EU AI Act Compliance Bundle | Manifest SHA-256: " +
-      digestShort;
+      this.footerLabelPrefix + " | Manifest SHA-256: " + digestShort;
 
     // Width guard: compute the longest possible page label (i.e. the
     // final page, which has the widest N-of-M number) and assert the
@@ -677,4 +681,38 @@ function titleForFilename(filename: string): string {
 function syntheticManifestIdentifier(bundle: ComplianceBundle): string {
   const first = bundle.manifest.files[0]?.sha256 ?? "0".repeat(64);
   return first;
+}
+
+// ── Generic Markdown -> PDF entry point ──────────────────────────────
+
+/**
+ * One document to render into the PDF: a title (rendered as a bold page
+ * heading, each document starting a fresh page) and its Markdown body.
+ */
+export interface PdfDocument {
+  title: string;
+  markdown: string;
+}
+
+/**
+ * Render an ordered list of Markdown documents to a single multi-page PDF,
+ * reusing the same zero-dependency writer, Courier typography, page geometry,
+ * and per-page footer as {@link renderBundleToPdf}. This is the generic entry
+ * point for callers outside the EU AI Act bundle (for example the law-firm
+ * evidence pack), so the PDF writer is reused rather than reinvented.
+ *
+ * `footerLabel` sets the per-page footer prefix; `footerDigest` is the short
+ * identifier shown after it (a manifest content hash). NOT CRYPTOGRAPHICALLY
+ * SIGNED: the PDF is a human-readable render of separately-signed artifacts;
+ * verify integrity against the signed files and manifest, not against the PDF.
+ */
+export function renderMarkdownDocumentsToPdf(
+  documents: PdfDocument[],
+  options: { footerLabel: string; footerDigest: string }
+): Uint8Array {
+  const builder = new PdfBuilder(options.footerDigest, options.footerLabel);
+  for (const doc of documents) {
+    builder.writeDocument(doc.title, markdownToLines(doc.markdown));
+  }
+  return builder.build();
 }
