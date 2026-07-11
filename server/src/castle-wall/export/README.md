@@ -61,11 +61,49 @@ an explicit allowlist and **never** spreads or serializes the raw audit
   (audits a refusal and re-throws). It never falls back to a file and never
   silently drops a batch while reporting success (must-never #5).
 
+## Streaming consumer + durable cursor
+
+`stream.ts` drives the exporter off `AuditLog.streamVerifiedChain` (the
+tamper-evident, strict-verified source). It buffers mapped events DURING the
+verified pass but delivers them only AFTER the `await` resolves clean, so a
+tampered chain rejects before a single event leaves the host, and a torn-read
+retry (`reset()`) discards the partial pass.
+
+- **Durable cursor** (`cursor.ts`, `FileExportCursorStore` at
+  `<fortress>/state/cortex-export-cursor.json`): a run forwards only entries
+  whose chain sequence is STRICTLY ABOVE the persisted cursor. The cursor is
+  persisted (atomic temp+rename) only AFTER a batch is confirmed delivered by the
+  fail-loud sink, so a crash can only leave it BEHIND the delivered frontier. That
+  is the fail-safe direction: re-scan + re-deliver, never skip. The contract is
+  at-least-once with **no gap** and **no re-send storm** (a lost cursor write
+  re-sends at most the already-delivered tail of one batch; a collector dedupes on
+  event identity).
+- **Bounded retry, still fail closed**: a transient sink failure is retried up to
+  a bounded budget with backoff. The retried payload is the SAME already-mapped
+  metadata batch through the SAME sink (no re-mapping, no fallback to a different
+  lane). After the budget is exhausted the streamer records `_retry_exhausted` and
+  RE-THROWS, leaving the cursor un-advanced so the batch is re-attempted next run.
+  It never silently drops and never reports success on failure.
+
+## Operator config file + CLI
+
+- **Config file** (`config-loader.ts`): `<fortress>/policy/egress/cortex-export.json`,
+  operator-owned (the agent cannot read or write it). Missing file = the safe
+  default (file sink, no network). Present-but-invalid = throws (fail closed).
+  Validation reuses the pure `config.ts` (https-only, no userinfo, pinned).
+- **CLI** (`cli/cortex-export.ts`, `sanctuary cortex-export run`): reads the
+  config, arms the exporter, and runs one streaming pass. The default (file sink)
+  needs no approval and touches no network; the outbound push prompts for the
+  Tier-1 approval before it arms. `enforcement_export_enabled` is force-pinned
+  Tier-1 (`NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS`) so a hand-authored
+  policy cannot relax the push out of the approval gate.
+
 ## Audit lifecycle (distinct local ops)
 
 `enforcement_export_enabled` / `enforcement_export_emitted` /
-`enforcement_export_refused` (see `audit-ops.ts`). These are distinct **local**
-audit `operation` strings; none widens a shared/global enum.
+`enforcement_export_refused` / `enforcement_export_cursor_advanced` /
+`enforcement_export_retry_exhausted` (see `audit-ops.ts`). These are distinct
+**local** audit `operation` strings; none widens a shared/global enum.
 
 ## Provenance
 
