@@ -310,6 +310,60 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("since decommissioned");
   });
 
+  it("HIGH-1 (sample-render): the egress table cannot be read as a breach admission", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: emptyVerified(),
+          mcp_servers: emptyVerified(),
+          observed_destinations: populated([
+            { host: "paste.example-exfil.ru", port: 443, protocol: "tcp", times_seen: 2, exfil_risk: true },
+            { host: "api.anthropic.com", port: 443, protocol: "tcp", times_seen: 812, exfil_risk: false },
+          ]),
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    // The bare, misreadable jargon is gone.
+    expect(report).not.toContain("Exfil risk");
+    expect(report).not.toMatch(/paste\.example-exfil\.ru.*\| yes \|/);
+    // Replaced by a classification column + values that read as a category.
+    expect(report).toContain("Destination risk class");
+    expect(report).toContain("elevated (review)");
+    expect(report).toContain("standard");
+    // And an unmissable legend defining it as NOT a finding of exfiltration.
+    expect(report).toContain("NOT a finding that any data left the firm");
+    expect(report).toContain("NOT a confirmed exfiltration");
+  });
+
+  it("MED-1 (sample-render): the tool count carries an active/recorded denominator", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: populated([
+            { agent_id: "live-bot", harness: "claude_code", status: "active" },
+            { agent_id: "old-bot", harness: "generic_mcp", status: "retired" },
+          ]),
+          mcp_servers: populated([
+            { name: "filesystem", transport: "stdio", enabled: true },
+            { name: "legacy", transport: "stdio", enabled: false },
+          ]),
+          observed_destinations: emptyVerified(),
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    // 4 recorded (2 agents + 2 servers), 2 active (one agent active, one server enabled).
+    expect(report).toContain("AI tools inventoried:** 4 recorded, of which 2 active");
+    expect(report).toContain("NOT a count of live tools");
+    // The bare "inventoried: 4 (" form is gone.
+    expect(report).not.toMatch(/AI tools inventoried:\*\* 4 \(/);
+  });
+
   it("an MCP read FAILURE renders incomplete-with-reason, never an affirmative 'none configured'", () => {
     const pack = buildEvidencePack(
       {

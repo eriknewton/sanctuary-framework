@@ -169,10 +169,6 @@ function renderCover(
 
 // ── Section 2: executive summary ─────────────────────────────────────
 
-function outcomeRowCount<T>(outcome: ReadOutcome<T[]>): number {
-  return outcome.status === "populated" ? outcome.value.length : 0;
-}
-
 /**
  * The exec-summary "AI tools inventoried" line. The tool count is a DEFINITIVE
  * number, so it is emitted ONLY when both tool sources (wrapped harnesses +
@@ -194,7 +190,17 @@ function toolInventoryLine(inv: InventorySnapshot): string {
     );
   }
   // Both tool sources are Complete here (TS narrows out `read_failed`).
-  const count = outcomeRowCount(inv.agents) + outcomeRowCount(inv.mcp_servers);
+  const agentRows = inv.agents.status === "populated" ? inv.agents.value : [];
+  const mcpRows =
+    inv.mcp_servers.status === "populated" ? inv.mcp_servers.value : [];
+  const count = agentRows.length + mcpRows.length;
+  // MED-1 (sample-render): the flat count silently includes a RETIRED harness
+  // and a DISABLED server as if they were live tools. Carry the denominator: an
+  // agent is active only when its status is explicitly "active", an MCP server
+  // only when it is enabled.
+  const active =
+    agentRows.filter((a) => a.status === "active").length +
+    mcpRows.filter((s) => s.enabled === true).length;
   const destNote =
     inv.observed_destinations.status === "read_failed"
       ? " (Note: the observed-egress-destination source could not be read; " +
@@ -211,9 +217,10 @@ function toolInventoryLine(inv: InventorySnapshot): string {
     );
   }
   return (
-    `**AI tools inventoried:** ${count} ` +
-    "(wrapped harnesses and configured AI tool servers this install can see; " +
-    "see the inventory section for coverage limits)." +
+    `**AI tools inventoried:** ${count} recorded, of which ${active} active ` +
+    "(this is CONFIGURED inventory - wrapped harnesses and configured AI tool " +
+    "servers, including any retired harness or disabled server - NOT a count of " +
+    "live tools; see the inventory section)." +
     destNote
   );
 }
@@ -446,13 +453,28 @@ function mcpTable(rows: InventoryMcpServerRow[]): string[] {
 }
 
 function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
+  // HIGH-1 (sample-render): the column was a bare "Exfil risk: yes/no", which a
+  // non-technical underwriter can misread as the firm SELF-REPORTING that data
+  // was exfiltrated - especially next to an incident section that says "not
+  // assessed". It is actually a heuristic CLASSIFICATION of the destination, not
+  // a finding that anything left the firm. Relabel to a risk CLASS and define it
+  // in an unmissable legend before the table.
   const out = [
-    "| Destination | Port | Protocol | Seen | Exfil risk |",
+    "Legend - Destination risk class: a heuristic CATEGORY of the destination " +
+      "itself (for example, a messaging or paste host that could be misused for " +
+      'exfiltration is "elevated"; a routine AI/API endpoint is "standard"). It ' +
+      "is NOT a finding that any data left the firm, NOT a confirmed " +
+      "exfiltration, and NOT a legal conclusion. See the Incident response " +
+      "section for incident status. An 'elevated' row means only that this " +
+      "destination is worth a human review.",
+    "",
+    "| Destination | Port | Protocol | Seen | Destination risk class |",
     "|---|---|---|---|---|",
   ];
   for (const d of rows) {
+    const riskClass = d.exfil_risk ? "elevated (review)" : "standard";
     out.push(
-      `| ${d.host} | ${d.port ?? "-"} | ${d.protocol ?? "-"} | ${d.times_seen ?? "-"} | ${d.exfil_risk ? "yes" : "no"} |`
+      `| ${d.host} | ${d.port ?? "-"} | ${d.protocol ?? "-"} | ${d.times_seen ?? "-"} | ${riskClass} |`
     );
   }
   return out;
