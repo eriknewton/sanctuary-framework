@@ -171,3 +171,39 @@ export const CASTLE_WALL_REQUEST_ID_NONCE_BYTES = 16 as const;
 
 /** JSON-RPC method namespace for IPC messages. Subsequent PRs add concrete methods. */
 export const CASTLE_WALL_IPC_NAMESPACE = "castle-wall" as const;
+
+/**
+ * Client-side deadline (ms) for a `policy_reload_request`, used by the CLI
+ * reload path (`requestPolicyReload`). A policy reload RE-SIGNS the recomposed
+ * ruleset through the root signer helper (a cold code-signed shim spawn + XPC
+ * round-trip on a freshly-booted box), so it is fundamentally slower than a
+ * status/drain query. This deadline MUST exceed the daemon's own worst-case
+ * internal reload budget (the helper-sign shim timeout plus the reload broadcast
+ * backstop, {@link CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS} +
+ * {@link CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS}) with headroom, so a healthy
+ * reload returns `ok:true` in time and a genuine daemon-side stall surfaces as a
+ * fast, SPECIFIC `ok:false` from the daemon rather than a generic client-side
+ * timeout. Regression origin: the generic 5s CLI socket deadline was SHORTER
+ * than the 10s helper-sign shim timeout, so the first cold egress reload timed
+ * out client-side (Mini1 egress drill 2026-07-12) even though the daemon was
+ * healthy and still signing.
+ */
+export const CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS = 20_000 as const;
+
+/**
+ * Daemon-side backstop deadline (ms) for the compose+sign phase of a policy
+ * reload (`reloadPolicy` -> `loadManifestState`). The helper-sign shim already
+ * self-bounds at its own timeout; this is an independent ceiling over the WHOLE
+ * phase (custody reads + compose + sign) so no await in the reload handler can
+ * exceed the client deadline silently. On breach the reload returns a specific
+ * `ok:false` ("signer helper did not respond ...") instead of hanging.
+ */
+export const CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS = 12_000 as const;
+
+/**
+ * Daemon-side backstop deadline (ms) for the broadcast phase of a policy reload
+ * (fanning the freshly-signed manifest to sysext subscribers). A wedged
+ * subscriber write must not hang the reload; on breach the reload returns a
+ * specific `ok:false` ("manifest broadcast did not complete ...").
+ */
+export const CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS = 3_000 as const;

@@ -52,6 +52,8 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   CASTLE_WALL_HEARTBEAT_OPERATION,
   CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+  CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS,
+  CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS,
 } from "../constants.js";
 import {
   EGRESS_PROBE_FAILED_AUDIT_OP,
@@ -273,6 +275,22 @@ export interface MacOSCastleWallDaemonInput {
    * cannot actually change uid).
    */
   agentEgressProbe?: (uid: number, host: string, port: number) => Promise<boolean>;
+  /**
+   * Backstop deadline (ms) for the compose+sign phase of a `policy_reload`
+   * (drill-found hang guard, 2026-07-12). Bounds custody reads + compose + the
+   * helper re-sign so the reload can NEVER exceed the client's request deadline
+   * silently; on breach the reload returns a specific `ok:false` rather than
+   * hanging. Defaults to {@link CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS}. Tests
+   * inject a small value to assert the bounded refusal deterministically.
+   */
+  reloadSignDeadlineMs?: number;
+  /**
+   * Backstop deadline (ms) for the broadcast phase of a `policy_reload`. Bounds
+   * the manifest fan-out to sysext subscribers so a wedged subscriber write
+   * cannot hang the reload. Defaults to
+   * {@link CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS}. Tests inject a small value.
+   */
+  reloadBroadcastDeadlineMs?: number;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -329,6 +347,10 @@ export async function startMacOSCastleWallDaemon(
 
   const auditSource = input.auditSource ?? "sanctuary-wrap";
   const daemonMode: "safe" | "full" = input.daemonMode ?? "full";
+  const reloadSignDeadlineMs =
+    input.reloadSignDeadlineMs ?? CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS;
+  const reloadBroadcastDeadlineMs =
+    input.reloadBroadcastDeadlineMs ?? CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS;
 
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
@@ -755,27 +777,48 @@ export async function startMacOSCastleWallDaemon(
     request?: PolicyReloadRequest,
   ): Promise<PolicyReloadResponse> {
     try {
-      const reloadedOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
-      const reloadedBaseline = await resolveOperatorBaseline(
-        input.fortressPath,
-        input.operatorBaseline,
+      // Drill-found hang guard (Mini1 egress drill 2026-07-12): a policy reload
+      // RE-SIGNS the recomposed ruleset through the root signer helper. Every
+      // await here is bounded by an internal deadline strictly shorter than the
+      // client's request deadline, so a stalled helper (or wedged subscriber
+      // write) surfaces as a FAST, SPECIFIC `ok:false` from the daemon rather
+      // than the client giving up with a generic "IPC request timed out". A
+      // bounded specific refusal preserves the fail-closed refuse-to-arm while
+      // telling the operator exactly which stage stalled.
+      manifestState = await withReloadDeadline(
+        (async () => {
+          const reloadedOrigin = await resolveAgentOrigin(
+            input.fortressPath,
+            input.agentOrigin,
+          );
+          const reloadedBaseline = await resolveOperatorBaseline(
+            input.fortressPath,
+            input.operatorBaseline,
+          );
+          const reloadedGate = await resolveExclusiveEgressGate(
+            input.fortressPath,
+            input.exclusiveEgressGate,
+          );
+          return await loadManifestState({
+            fortressPath: input.fortressPath,
+            fortressId: input.fortressId,
+            signer,
+            agentOrigin: reloadedOrigin,
+            operatorBaseline: reloadedBaseline,
+            exclusiveEgressGate: reloadedGate,
+            ...(input.globalPinnedPublicKeyPath
+              ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
+              : {}),
+          });
+        })(),
+        reloadSignDeadlineMs,
+        `signer helper did not respond within ${reloadSignDeadlineMs}ms during policy reload`,
       );
-      const reloadedGate = await resolveExclusiveEgressGate(
-        input.fortressPath,
-        input.exclusiveEgressGate,
+      const emitted = await withReloadDeadline(
+        listener.broadcastManifestUpdate(),
+        reloadBroadcastDeadlineMs,
+        `manifest broadcast did not complete within ${reloadBroadcastDeadlineMs}ms during policy reload`,
       );
-      manifestState = await loadManifestState({
-        fortressPath: input.fortressPath,
-        fortressId: input.fortressId,
-        signer,
-        agentOrigin: reloadedOrigin,
-        operatorBaseline: reloadedBaseline,
-        exclusiveEgressGate: reloadedGate,
-        ...(input.globalPinnedPublicKeyPath
-          ? { globalPinnedPublicKeyPath: input.globalPinnedPublicKeyPath }
-          : {}),
-      });
-      const emitted = await listener.broadcastManifestUpdate();
       await input.auditLog.append(
         "l1",
         "policy_loaded",
@@ -876,6 +919,46 @@ function buildArmLease(input: {
     heartbeat_interval_seconds: input.heartbeatIntervalSeconds,
     updated_at: new Date().toISOString(),
   };
+}
+
+/**
+ * Race `op` against a deadline. Resolves with `op`'s value when it settles
+ * first; rejects with a specific-reason Error on timeout. The underlying `op`
+ * is NOT cancelled (the helper-sign shim already self-terminates at its own
+ * timeout, and a late-settling `op` is simply dropped): the point is that the
+ * caller returns PROMPTLY with a specific reason rather than blocking until a
+ * downstream client's own generic deadline fires. Fail-closed: a timeout is an
+ * error, so a `reloadPolicy` that times out here returns `ok:false`, never a
+ * silent partial success.
+ */
+function withReloadDeadline<T>(
+  op: Promise<T>,
+  deadlineMs: number,
+  timeoutReason: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(timeoutReason));
+    }, deadlineMs);
+    timer.unref?.();
+    op.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
 }
 
 const AGENT_ORIGIN_FILENAME = "agent-origin.json";

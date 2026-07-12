@@ -55,6 +55,7 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import { CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS } from "../castle-wall/constants.js";
 import type {
   CastleWallMessage,
   DecisionResponse,
@@ -2003,14 +2004,22 @@ export async function requestPolicyReload(
 ): Promise<PolicyReloadResult> {
   const socketPath = resolveCastleWallSocketPath({ platform, fortressPath }).path;
   try {
+    // The daemon recomposes + re-signs from `policy/egress/rules/`, so no
+    // `manifest_path` is sent (it was a fabricated, non-existent path the daemon
+    // ignored). A reload re-signs through the root helper, which is far slower
+    // than a status query (especially the first cold reload on a freshly-booted
+    // box), so it gets a dedicated, longer client deadline that comfortably
+    // exceeds the daemon's own internal reload budget. Without it the generic 5s
+    // socket deadline fired BEFORE a healthy daemon finished signing and the
+    // reload was reported as a spurious timeout (Mini1 egress drill 2026-07-12).
     const reply = await sendCastleWallMessage<PolicyReloadResponse>(
       socketPath,
       {
         type: "policy_reload_request",
         request_id: nodeRandomBytes(16).toString("hex"),
-        manifest_path: join(fortressPath, "policy", "egress", "manifest.json"),
       },
       "policy_reload_response",
+      CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
     );
     if (!reply.ok) {
       return { ok: false, error: reply.error ?? "policy reload failed" };
@@ -3588,6 +3597,7 @@ async function sendCastleWallMessage<T extends CastleWallMessage>(
   socketPath: string,
   message: CastleWallMessage,
   expectedType: T["type"],
+  timeoutMs = 5_000,
 ): Promise<T> {
   return await new Promise<T>((resolvePromise, reject) => {
     const socket = createConnection(socketPath);
@@ -3595,7 +3605,7 @@ async function sendCastleWallMessage<T extends CastleWallMessage>(
     let settled = false;
     const timer = setTimeout(() => {
       finish(new Error("Castle Wall IPC request timed out"));
-    }, 5_000);
+    }, timeoutMs);
     const finish = (result: T | Error) => {
       if (settled) return;
       settled = true;
