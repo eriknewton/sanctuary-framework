@@ -14,19 +14,23 @@
  * from the SOURCE file's owner (`sourceOwnerUid`, via `stat`), NEVER from
  * `process.getuid()`, so a `sudo` mint cannot fabricate a false "enforced".
  *
- * FUNCTIONAL PRIMITIVE: `grantAgentRead` applies the platform ACL operation
- * and `probeAgentRead` verifies readability by running a bounded probe as the
- * agent uid. The orchestration layer treats the ACL result as necessary but
- * not sufficient: `met` is produced only after a same-operation probe returns
- * true. Unsupported platforms, missing privilege, ACL command failures, probe
- * failures, and probe timeouts all fail closed to `unverified` or `unmet`.
+ * FUNCTIONAL PRIMITIVE: `grantAgentRead` resolves the source path before this
+ * module sees it, applies the platform ACL operation to that canonical source
+ * path, and applies execute-only traversal ACLs to grant-tree ancestors. The
+ * grant tree is the agent's reach path, not a second path-scoped boundary.
+ * POSIX read ACLs are inode-scoped: the same uid can read the same file
+ * through any other path it can reach. `probeAgentRead` verifies readability
+ * by running a bounded read through the grant tree as the agent uid.
  *
  * TRAVERSAL NOTE: `ensureTreeRoot` sets the root to `0711` (owner rwx,
  * group/other --x) so a future chowned per-agent leaf stays reachable while
  * the root itself is not listable by non-owners. NOTE the root currently
  * lives under the operator fortress (`<fortressPath>/grants/`). The ACL
  * primitive grants execute-only traversal on the grant-tree ancestors and
- * read/traverse on the leaf, then the probe proves the effective result.
+ * read/traverse on the canonical source leaf, then the probe proves the
+ * effective reach-path result. The execute-only ancestor ACLs are idempotent
+ * and information-free, so per-grant revoke leaves them in place. Only the
+ * per-grant source leaf read ACE is removed from persisted grant metadata.
  */
 
 import { execFile as nodeExecFile } from "node:child_process";
@@ -36,6 +40,8 @@ import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import type {
   FileGrantAclResult,
   FileGrantAclStatus,
+  FileGrantGrantedReadAce,
+  FileGrantRemoveEntryResult,
   FileGrantRemoveEntryOptions,
   FsOps,
 } from "./types.js";
@@ -146,7 +152,8 @@ function ancestorDirectories(root: string, dest: string): string[] {
 export function buildLinuxGrantAgentReadCommands(
   treeRoot: string,
   relativeTreeEntry: string,
-  agentUid: number
+  agentUid: number,
+  sourceRealpath: string
 ): FileGrantExecCommand[] {
   const uid = uidToken(agentUid);
   const { root, dest } = resolveTreeEntryUnderRoot(treeRoot, relativeTreeEntry);
@@ -155,31 +162,23 @@ export function buildLinuxGrantAgentReadCommands(
       file: "setfacl",
       args: ["-m", `u:${uid}:--x`, dir],
     })),
-    { file: "setfacl", args: ["-m", `u:${uid}:rX`, dest] },
+    { file: "setfacl", args: ["-m", `u:${uid}:rX`, sourceRealpath] },
   ];
 }
 
 export function buildLinuxRevokeAgentReadCommands(
-  treeRoot: string,
-  relativeTreeEntry: string,
   agentUid: number,
-  leafAclTarget?: string
+  sourceRealpath: string
 ): FileGrantExecCommand[] {
   const uid = uidToken(agentUid);
-  const { root, dest } = resolveTreeEntryUnderRoot(treeRoot, relativeTreeEntry);
-  const leaf = leafAclTarget ?? dest;
-  return [
-    { file: "setfacl", args: ["-x", `u:${uid}`, leaf] },
-    ...ancestorDirectories(root, dest)
-      .reverse()
-      .map((dir) => ({ file: "setfacl", args: ["-x", `u:${uid}`, dir] })),
-  ];
+  return [{ file: "setfacl", args: ["-x", `u:${uid}`, sourceRealpath] }];
 }
 
 export function buildMacGrantAgentReadCommands(
   treeRoot: string,
   relativeTreeEntry: string,
-  principal: string
+  principal: string,
+  sourceRealpath: string
 ): FileGrantExecCommand[] {
   const { root, dest } = resolveTreeEntryUnderRoot(treeRoot, relativeTreeEntry);
   return [
@@ -187,27 +186,15 @@ export function buildMacGrantAgentReadCommands(
       file: "chmod",
       args: ["+a", `user:${principal} allow execute`, dir],
     })),
-    { file: "chmod", args: ["+a", `user:${principal} allow read,execute`, dest] },
+    { file: "chmod", args: ["+a", `user:${principal} allow read,execute`, sourceRealpath] },
   ];
 }
 
 export function buildMacRevokeAgentReadCommands(
-  treeRoot: string,
-  relativeTreeEntry: string,
   principal: string,
-  leafAclTarget?: string
+  sourceRealpath: string
 ): FileGrantExecCommand[] {
-  const { root, dest } = resolveTreeEntryUnderRoot(treeRoot, relativeTreeEntry);
-  const leaf = leafAclTarget ?? dest;
-  return [
-    { file: "chmod", args: ["-a", `user:${principal} allow read,execute`, leaf] },
-    ...ancestorDirectories(root, dest)
-      .reverse()
-      .map((dir) => ({
-        file: "chmod",
-        args: ["-a", `user:${principal} allow execute`, dir],
-      })),
-  ];
+  return [{ file: "chmod", args: ["-a", `user:${principal} allow read,execute`, sourceRealpath] }];
 }
 
 export function buildAgentReadProbeCommand(
@@ -303,23 +290,11 @@ export class PosixFileGrantFsOps implements FsOps {
     const agentSubdir = dirname(dest);
     await mkdir(agentSubdir, { recursive: true, mode: AGENT_SUBDIR_MODE });
 
-    // R3-3: v1 NEVER cross-uid chowns the per-agent subdirectory. Earlier
-    // drafts attempted a best-effort root-only chown of `agentSubdir` to the
-    // dedicated agent uid, but v1 never applies the functional cross-uid read
-    // primitive anyway (enforcement always reports the honest `unverified`
-    // until the deferred acceptance drill actually wires up the real ACL /
-    // ownership primitive + an on-hardware read-verification probe -- see the
-    // module doc comment above), so the chown accomplished nothing useful in
-    // v1 while creating a REAL operational cost: it left the subdir owned by
-    // the agent uid, mode 0700, which then blocks a non-root operator
-    // `revoke`/reconcile-scrub from unlinking the entry (EACCES) and forces
-    // root just to remove a v1 grant that was never functionally enforced in
-    // the first place. `place()` now leaves `agentSubdir` operator-owned (the
-    // process uid, from `mkdir` above) and places a plain symlink into it. The
-    // deferred drill-build is what applies the real ACL/ownership primitive
-    // AND the read-verification probe that flips enforcement to `met`; that
-    // build owns re-introducing any ownership change, gated behind the
-    // verification that makes it honest.
+    // The per-agent subdirectory stays operator-owned so a non-root operator
+    // can always unlink the grant-tree symlink during revoke. The read grant
+    // itself is the explicit POSIX ACL applied to the canonical source inode,
+    // plus execute-only traversal ACLs on grant-tree ancestors. The grant tree
+    // is the reach path, not a path-scoped read boundary.
 
     // Remove a stale entry at the same path before re-linking (mint always
     // allocates a fresh grant_id, so collisions are not expected in normal
@@ -334,9 +309,10 @@ export class PosixFileGrantFsOps implements FsOps {
 
   async grantAgentRead(
     relativeTreeEntry: string,
-    agentUid: number
+    agentUid: number,
+    sourceRealpath: string
   ): Promise<FileGrantAclResult> {
-    return this.applyAgentReadAcl(relativeTreeEntry, agentUid, "grant");
+    return this.applyAgentReadAcl(relativeTreeEntry, agentUid, sourceRealpath);
   }
 
   async probeAgentRead(relativeTreeEntry: string, agentUid: number): Promise<boolean> {
@@ -359,29 +335,31 @@ export class PosixFileGrantFsOps implements FsOps {
   async removeEntry(
     relativeTreeEntry: string,
     options: FileGrantRemoveEntryOptions = {}
-  ): Promise<void> {
+  ): Promise<FileGrantRemoveEntryResult> {
     const dest = this.resolveUnderRoot(relativeTreeEntry);
+    const aclRemoval = await this.removePersistedAgentReadAcl(options.grantedReadAce);
+    let treeEntryRemoved = false;
     try {
       const st = await lstat(dest);
       if (st) {
-        await this.removeAgentReadAclIfConfigured(
-          relativeTreeEntry,
-          options.canonicalAclTarget
-        );
         await rm(dest, { force: true });
+        treeEntryRemoved = true;
       }
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-        if (options.canonicalAclTarget) {
-          await this.removeAgentReadAclIfConfigured(
-            relativeTreeEntry,
-            options.canonicalAclTarget
-          );
-        }
-        return;
+        return {
+          treeEntryRemoved,
+          aclRemoval,
+          scrubbed: aclRemoval.status !== "failed",
+        };
       }
       throw err;
     }
+    return {
+      treeEntryRemoved,
+      aclRemoval,
+      scrubbed: aclRemoval.status !== "failed",
+    };
   }
 
   async agentUid(_subjectAgentId: string): Promise<number | null> {
@@ -422,8 +400,7 @@ export class PosixFileGrantFsOps implements FsOps {
   private async applyAgentReadAcl(
     relativeTreeEntry: string,
     agentUid: number,
-    mode: "grant" | "revoke",
-    leafAclTarget?: string
+    sourceRealpath: string
   ): Promise<FileGrantAclResult> {
     if (this.platform !== "linux" && this.platform !== "darwin") {
       return {
@@ -434,34 +411,35 @@ export class PosixFileGrantFsOps implements FsOps {
     }
 
     try {
+      const macPrincipal =
+        this.platform === "darwin" ? await this.resolveMacPrincipal(agentUid) : undefined;
       const commands =
         this.platform === "linux"
-          ? mode === "grant"
-            ? buildLinuxGrantAgentReadCommands(this.treeRoot(), relativeTreeEntry, agentUid)
-            : buildLinuxRevokeAgentReadCommands(
-                this.treeRoot(),
-                relativeTreeEntry,
-                agentUid,
-                leafAclTarget
-              )
-          : mode === "grant"
-            ? buildMacGrantAgentReadCommands(
-                this.treeRoot(),
-                relativeTreeEntry,
-                await this.resolveMacPrincipal(agentUid)
-              )
-            : buildMacRevokeAgentReadCommands(
-                this.treeRoot(),
-                relativeTreeEntry,
-                await this.resolveMacPrincipal(agentUid),
-                leafAclTarget
-              );
+          ? buildLinuxGrantAgentReadCommands(
+              this.treeRoot(),
+              relativeTreeEntry,
+              agentUid,
+              sourceRealpath
+            )
+          : buildMacGrantAgentReadCommands(
+              this.treeRoot(),
+              relativeTreeEntry,
+              macPrincipal!,
+              sourceRealpath
+            );
       await this.runCommands(commands);
-      return { status: "applied", platform: this.platform };
+      return {
+        status: "applied",
+        platform: this.platform,
+        grantedReadAce: {
+          agent_uid: agentUid,
+          platform: this.platform,
+          source_realpath: sourceRealpath,
+          ...(macPrincipal ? { mac_principal: macPrincipal } : {}),
+        },
+      };
     } catch (err) {
-      if (mode === "grant") {
-        await this.bestEffortRemoveAgentReadAcl(relativeTreeEntry, agentUid);
-      }
+      await this.bestEffortRemoveAgentReadAcl(agentUid, sourceRealpath);
       return {
         status: classifyAclFailure(err),
         platform: this.platform,
@@ -470,21 +448,16 @@ export class PosixFileGrantFsOps implements FsOps {
     }
   }
 
-  private async bestEffortRemoveAgentReadAcl(
-    relativeTreeEntry: string,
-    agentUid: number
-  ): Promise<void> {
+  private async bestEffortRemoveAgentReadAcl(agentUid: number, sourceRealpath: string): Promise<void> {
     if (this.platform !== "linux" && this.platform !== "darwin") return;
     let commands: FileGrantExecCommand[];
     try {
+      const macPrincipal =
+        this.platform === "darwin" ? await this.resolveMacPrincipal(agentUid) : undefined;
       commands =
         this.platform === "linux"
-          ? buildLinuxRevokeAgentReadCommands(this.treeRoot(), relativeTreeEntry, agentUid)
-          : buildMacRevokeAgentReadCommands(
-              this.treeRoot(),
-              relativeTreeEntry,
-              await this.resolveMacPrincipal(agentUid)
-            );
+          ? buildLinuxRevokeAgentReadCommands(agentUid, sourceRealpath)
+          : buildMacRevokeAgentReadCommands(macPrincipal!, sourceRealpath);
     } catch {
       return;
     }
@@ -498,26 +471,45 @@ export class PosixFileGrantFsOps implements FsOps {
     }
   }
 
-  private async removeAgentReadAclIfConfigured(
-    relativeTreeEntry: string,
-    leafAclTarget?: string
-  ): Promise<void> {
-    const subjectAgentId = relativeTreeEntry.split(/[\\/]/)[0];
-    if (!subjectAgentId) return;
-    const agentUid = await this.agentUid(subjectAgentId);
-    if (agentUid === null) return;
-    const result = await this.applyAgentReadAcl(
-      relativeTreeEntry,
-      agentUid,
-      "revoke",
-      leafAclTarget
-    );
-    if (result.status === "unsupported_platform") return;
-    if (result.status !== "applied") {
-      throw new Error(
-        `Governed File-Grant: failed to remove ACL for ${relativeTreeEntry}: ` +
-          `${result.status}${result.reason ? ` (${result.reason})` : ""}`
-      );
+  private async removePersistedAgentReadAcl(
+    grantedReadAce: FileGrantGrantedReadAce | null | undefined
+  ): Promise<FileGrantRemoveEntryResult["aclRemoval"]> {
+    if (!grantedReadAce) return { status: "not_applicable" };
+    if (grantedReadAce.platform !== "linux" && grantedReadAce.platform !== "darwin") {
+      return {
+        status: "unsupported_platform",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+      };
+    }
+    try {
+      const commands =
+        grantedReadAce.platform === "linux"
+          ? buildLinuxRevokeAgentReadCommands(
+              grantedReadAce.agent_uid,
+              grantedReadAce.source_realpath
+            )
+          : buildMacRevokeAgentReadCommands(
+              grantedReadAce.mac_principal ??
+                (await this.resolveMacPrincipal(grantedReadAce.agent_uid)),
+              grantedReadAce.source_realpath
+            );
+      await this.runCommands(commands);
+      return {
+        status: "removed",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+      };
+    } catch (err) {
+      return {
+        status: "failed",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+        reason: errorText(err),
+      };
     }
   }
 

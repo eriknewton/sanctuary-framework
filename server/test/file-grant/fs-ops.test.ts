@@ -3,12 +3,11 @@
  *
  * Exercises the production `PosixFileGrantFsOps` wiring against a real
  * temp directory (mkdtemp, matching the repo's safe temp-dir pattern in
- * `egress-gate/pf-anchor.ts`). R3-3: `place()` never chowns the per-agent
- * subdirectory to a different uid at all (v1 never applies the functional
- * cross-uid read primitive, so a chown accomplished nothing useful and only
- * blocked a non-root operator's later revoke -- see the module's own
- * doc-comment), so every placement here -- same-uid or a configured uid
- * split -- stays operator-owned. Every OTHER file-grant test uses the
+ * `egress-gate/pf-anchor.ts`). `place()` never chowns the per-agent
+ * subdirectory to a different uid at all. The read primitive is the explicit
+ * source-inode ACL plus execute-only grant-tree ancestor traversal, so
+ * placement stays operator-owned and non-root revoke can unlink it. Every
+ * OTHER file-grant test uses the
  * injected `FakeFsOps` fake per the build spec's testability shape -- this
  * file is the one place that proves the real implementation's plumbing
  * (realpath / place / removeEntry / no-descriptor-configured uid resolution)
@@ -58,11 +57,20 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     const content = await readFile(placedPath, "utf-8");
     expect(content).toBe("operator data");
 
-    await fsOps.removeEntry("agent-1/fg_abc123");
+    const removed = await fsOps.removeEntry("agent-1/fg_abc123");
+    expect(removed).toEqual({
+      treeEntryRemoved: true,
+      aclRemoval: { status: "not_applicable" },
+      scrubbed: true,
+    });
     await expect(readFile(placedPath, "utf-8")).rejects.toThrow();
 
     // Idempotent: removing an already-absent entry does not throw.
-    await expect(fsOps.removeEntry("agent-1/fg_abc123")).resolves.toBeUndefined();
+    await expect(fsOps.removeEntry("agent-1/fg_abc123")).resolves.toEqual({
+      treeEntryRemoved: false,
+      aclRemoval: { status: "not_applicable" },
+      scrubbed: true,
+    });
   });
 
   it("agentUid resolves null when no agent-origin descriptor is configured (honest same-uid default)", async () => {
@@ -108,12 +116,11 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     if (processUid === undefined) return; // POSIX-only path
 
     // Configure a dedicated agent uid DISTINCT from the running process uid.
-    // R3-3: v1 never applies a cross-uid chown at all (it never applied the
-    // functional read primitive anyway, so the chown accomplished nothing
-    // useful and only made the subdir agent-owned/0700, blocking a non-root
-    // operator revoke). place() must NOT throw, must place the symlink, and
-    // must leave the per-agent subdir OPERATOR-owned (the running process
-    // uid), never chowned to the configured agent uid.
+    // v1 never applies a cross-uid chown at all. The source-inode ACL carries
+    // the read grant, while the grant-tree symlink stays operator-owned.
+    // place() must NOT throw, must place the symlink, and must leave the
+    // per-agent subdir OPERATOR-owned (the running process uid), never chowned
+    // to the configured agent uid.
     const originDir = join(fortressDir, "policy", "egress");
     await mkdir(originDir, { recursive: true });
     await writeFile(

@@ -90,11 +90,15 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
       auditLog,
     });
 
-    expect(fsOps.removedAcls).toContainEqual({ entry: grant.tree_entry, uid: 502 });
+    expect(fsOps.removedAcls).toContainEqual({
+      entry: grant.tree_entry,
+      uid: 502,
+      sourceRealpath: grant.scope.path,
+    });
     expect(fsOps.scrubbed).toContain(grant.tree_entry);
     expect(fsOps.removeOptions).toContainEqual({
       entry: grant.tree_entry,
-      options: { canonicalAclTarget: grant.scope.path },
+      options: { grantedReadAce: grant.granted_read_ace },
     });
   });
 

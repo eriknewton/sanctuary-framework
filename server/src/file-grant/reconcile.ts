@@ -26,7 +26,7 @@
 import type { AuditLog } from "../operational/audit-log.js";
 import { isGrantExpired, reviseGrantForExpiry } from "./lifecycle.js";
 import { planGrantTree } from "./planner.js";
-import type { FileGrant, FsOps } from "./types.js";
+import type { FileGrant, FileGrantAclRemovalResult, FsOps } from "./types.js";
 
 export interface ReconcileFileGrantStore {
   list(): Promise<FileGrant[]>;
@@ -68,14 +68,25 @@ export async function reconcileFileGrantTree(
   // removal of every entry AND the bookkeeping flip below.
   const scrubbed: string[] = [];
   let firstScrubError: unknown = null;
+  const aclFailureByGrantId = new Map<string, FileGrantAclRemovalResult>();
   for (const entry of plan.toScrub) {
     try {
       const grant = grantsById.get(entry.grant_id);
-      await deps.fsOps.removeEntry(
+      const removeResult = await deps.fsOps.removeEntry(
         entry.relative_tree_entry,
-        grant ? { canonicalAclTarget: grant.scope.path } : undefined
+        grant ? { grantedReadAce: grant.granted_read_ace ?? null } : undefined
       );
-      scrubbed.push(entry.relative_tree_entry);
+      if (removeResult.scrubbed) {
+        scrubbed.push(entry.relative_tree_entry);
+      } else {
+        aclFailureByGrantId.set(entry.grant_id, removeResult.aclRemoval);
+        if (firstScrubError === null) {
+          firstScrubError = new Error(
+            `Governed File-Grant: failed to remove ACL for ` +
+              `${entry.relative_tree_entry}: ${removeResult.aclRemoval.reason ?? "unknown"}`
+          );
+        }
+      }
     } catch (err) {
       if (firstScrubError === null) firstScrubError = err;
     }
@@ -92,7 +103,7 @@ export async function reconcileFileGrantTree(
     if (grant.status === "active" && isGrantExpired(grant, deps.now)) {
       await deps.store.put(reviseGrantForExpiry(grant, deps.now));
       expired.push(grant.grant_id);
-      await appendExpiryAudit(deps, grant);
+      await appendExpiryAudit(deps, grant, aclFailureByGrantId.get(grant.grant_id));
     }
   }
 
@@ -106,7 +117,8 @@ export async function reconcileFileGrantTree(
 
 async function appendExpiryAudit(
   deps: ReconcileFileGrantDeps,
-  grant: FileGrant
+  grant: FileGrant,
+  aclFailure?: FileGrantAclRemovalResult
 ): Promise<void> {
   try {
     // Auto-expiry reuses the `file_grant_revoke` audit operation (not a new
@@ -118,11 +130,12 @@ async function appendExpiryAudit(
       layer: "l1",
       operation: "file_grant_revoke",
       identity_id: deps.reconciledBy ?? "system",
-      result: "success",
+      result: aclFailure ? "failure" : "success",
       details: {
         grant_id: grant.grant_id,
         subject_agent_id: grant.subject_agent_id,
-        reason: "expired_ttl_scrub",
+        reason: aclFailure ? "expired_ttl_acl_removal_failed" : "expired_ttl_scrub",
+        ...(aclFailure ? { acl_removal: aclFailure } : {}),
       },
     });
   } catch {

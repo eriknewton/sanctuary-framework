@@ -13,7 +13,9 @@ import { AuditLog } from "../../src/operational/audit-log.js";
 import { FileGrantStore } from "../../src/file-grant/store.js";
 import type {
   FileGrantAclResult,
+  FileGrantGrantedReadAce,
   FileGrantRemoveEntryOptions,
+  FileGrantRemoveEntryResult,
   FsOps,
 } from "../../src/file-grant/types.js";
 
@@ -44,7 +46,7 @@ export interface FakeFsOpsOptions {
   placeRecordsThenThrows?: Error;
   /** If set, `removeEntry()` throws this on every call. */
   removeThrows?: Error;
-  /** If set, ACL cleanup during `removeEntry()` throws this before the tree entry is scrubbed. */
+  /** If set, ACL cleanup during `removeEntry()` reports this while the tree entry is scrubbed. */
   removeAclThrows?: Error;
   /** The dedicated agent uid `agentUid()` reports, or null for "no uid-split origin configured". */
   agentUid?: number | null;
@@ -64,9 +66,9 @@ export interface FakeFsOpsOptions {
 export class FakeFsOps implements FsOps {
   placed: Array<{ src: string; dest: string }> = [];
   scrubbed: string[] = [];
-  grantedReads: Array<{ entry: string; uid: number }> = [];
+  grantedReads: Array<{ entry: string; uid: number; sourceRealpath: string }> = [];
   probedReads: Array<{ entry: string; uid: number }> = [];
-  removedAcls: Array<{ entry: string; uid: number }> = [];
+  removedAcls: Array<{ entry: string; uid: number; sourceRealpath: string }> = [];
   removeOptions: Array<{ entry: string; options?: FileGrantRemoveEntryOptions }> = [];
   events: string[] = [];
 
@@ -88,9 +90,10 @@ export class FakeFsOps implements FsOps {
 
   async grantAgentRead(
     relativeTreeEntry: string,
-    agentUid: number
+    agentUid: number,
+    sourceRealpath: string
   ): Promise<FileGrantAclResult> {
-    this.events.push(`grant:${relativeTreeEntry}:${agentUid}`);
+    this.events.push(`grant:${relativeTreeEntry}:${agentUid}:${sourceRealpath}`);
     if (this.opts.grantAgentReadThrows) throw this.opts.grantAgentReadThrows;
     const result =
       this.opts.grantAgentReadResult ??
@@ -100,7 +103,19 @@ export class FakeFsOps implements FsOps {
         reason: "fake default",
       } satisfies FileGrantAclResult);
     if (result.status === "applied") {
-      this.grantedReads.push({ entry: relativeTreeEntry, uid: agentUid });
+      const grantedReadAce: FileGrantGrantedReadAce =
+        result.grantedReadAce ??
+        ({
+          agent_uid: agentUid,
+          platform: result.platform,
+          source_realpath: sourceRealpath,
+        } satisfies FileGrantGrantedReadAce);
+      this.grantedReads.push({
+        entry: relativeTreeEntry,
+        uid: agentUid,
+        sourceRealpath: grantedReadAce.source_realpath,
+      });
+      return { ...result, grantedReadAce };
     }
     return result;
   }
@@ -115,19 +130,45 @@ export class FakeFsOps implements FsOps {
   async removeEntry(
     relativeTreeEntry: string,
     options?: FileGrantRemoveEntryOptions
-  ): Promise<void> {
+  ): Promise<FileGrantRemoveEntryResult> {
     this.events.push(`remove:${relativeTreeEntry}`);
     this.removeOptions.push(
       options === undefined ? { entry: relativeTreeEntry } : { entry: relativeTreeEntry, options }
     );
-    if (this.opts.removeThrows) throw this.opts.removeThrows;
-    const matchingAcl = this.grantedReads.find((entry) => entry.entry === relativeTreeEntry);
-    if (matchingAcl) {
-      if (this.opts.removeAclThrows) throw this.opts.removeAclThrows;
-      this.removedAcls.push({ entry: relativeTreeEntry, uid: matchingAcl.uid });
-      this.events.push(`acl-removed:${relativeTreeEntry}:${matchingAcl.uid}`);
+    const ace = options?.grantedReadAce ?? null;
+    let aclRemoval: FileGrantRemoveEntryResult["aclRemoval"] = { status: "not_applicable" };
+    if (ace) {
+      if (this.opts.removeAclThrows) {
+        aclRemoval = {
+          status: "failed",
+          agent_uid: ace.agent_uid,
+          platform: ace.platform,
+          source_realpath: ace.source_realpath,
+          reason: this.opts.removeAclThrows.message,
+        };
+        this.events.push(`acl-remove-failed:${relativeTreeEntry}:${ace.agent_uid}`);
+      } else {
+        this.removedAcls.push({
+          entry: relativeTreeEntry,
+          uid: ace.agent_uid,
+          sourceRealpath: ace.source_realpath,
+        });
+        aclRemoval = {
+          status: "removed",
+          agent_uid: ace.agent_uid,
+          platform: ace.platform,
+          source_realpath: ace.source_realpath,
+        };
+        this.events.push(`acl-removed:${relativeTreeEntry}:${ace.agent_uid}`);
+      }
     }
+    if (this.opts.removeThrows) throw this.opts.removeThrows;
     this.scrubbed.push(relativeTreeEntry);
+    return {
+      treeEntryRemoved: true,
+      aclRemoval,
+      scrubbed: aclRemoval.status !== "failed",
+    };
   }
 
   async agentUid(_subjectAgentId: string): Promise<number | null> {

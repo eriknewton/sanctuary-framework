@@ -18,7 +18,7 @@
 
 import type { AuditLog } from "../operational/audit-log.js";
 import { reviseGrantForRevoke } from "./lifecycle.js";
-import type { FileGrant, FsOps } from "./types.js";
+import type { FileGrant, FileGrantRemoveEntryResult, FsOps } from "./types.js";
 
 export interface FileGrantRevokeStore {
   get(grantId: string): Promise<FileGrant | null>;
@@ -37,6 +37,9 @@ export interface RevokeFileGrantResult {
   found: boolean;
   alreadyRevoked: boolean;
   grant: FileGrant | null;
+  treeEntryRemoved: boolean;
+  scrubbed: boolean;
+  aclRemoval: FileGrantRemoveEntryResult["aclRemoval"] | null;
 }
 
 export async function revokeFileGrant(
@@ -53,7 +56,14 @@ export async function revokeFileGrant(
       result: "failure",
       details: { grant_id: grantId, reason: "not_found" },
     });
-    return { found: false, alreadyRevoked: false, grant: null };
+    return {
+      found: false,
+      alreadyRevoked: false,
+      grant: null,
+      treeEntryRemoved: false,
+      scrubbed: false,
+      aclRemoval: null,
+    };
   }
 
   const alreadyRevoked = existing.status === "revoked";
@@ -62,9 +72,10 @@ export async function revokeFileGrant(
     await deps.store.put(revised);
   }
 
+  let removeResult: FileGrantRemoveEntryResult;
   try {
-    await deps.fsOps.removeEntry(existing.tree_entry, {
-      canonicalAclTarget: existing.scope.path,
+    removeResult = await deps.fsOps.removeEntry(existing.tree_entry, {
+      grantedReadAce: existing.granted_read_ace ?? null,
     });
   } catch (scrubErr) {
     await deps.auditLog?.appendCritical({
@@ -81,13 +92,58 @@ export async function revokeFileGrant(
     throw scrubErr;
   }
 
+  if (removeResult.scrubbed && revised.granted_read_ace) {
+    try {
+      await deps.store.put({ ...revised, granted_read_ace: null });
+    } catch {
+      // Best-effort cleanup of stale ACE metadata after confirmed removal.
+      // The grant is already revoked and the successful scrub is still true.
+    }
+  }
+
+  if (!removeResult.scrubbed) {
+    await deps.auditLog?.appendCritical({
+      layer: "l1",
+      operation: "file_grant_revoke",
+      identity_id: revokedBy,
+      result: "failure",
+      details: {
+        grant_id: grantId,
+        already_revoked: alreadyRevoked,
+        reason: "acl_removal_failed",
+        tree_entry_removed: removeResult.treeEntryRemoved,
+        acl_removal: removeResult.aclRemoval,
+      },
+    });
+    return {
+      found: true,
+      alreadyRevoked,
+      grant: revised,
+      treeEntryRemoved: removeResult.treeEntryRemoved,
+      scrubbed: false,
+      aclRemoval: removeResult.aclRemoval,
+    };
+  }
+
   await deps.auditLog?.appendCritical({
     layer: "l1",
     operation: "file_grant_revoke",
     identity_id: revokedBy,
     result: "success",
-    details: { grant_id: grantId, already_revoked: alreadyRevoked },
+    details: {
+      grant_id: grantId,
+      already_revoked: alreadyRevoked,
+      tree_entry_removed: removeResult.treeEntryRemoved,
+      acl_removal: removeResult.aclRemoval,
+    },
   });
 
-  return { found: true, alreadyRevoked, grant: revised };
+  return {
+    found: true,
+    alreadyRevoked,
+    grant: revised.granted_read_ace ? { ...revised, granted_read_ace: null } : revised,
+    treeEntryRemoved: removeResult.treeEntryRemoved,
+    scrubbed: true,
+    aclRemoval: removeResult.aclRemoval,
+  };
 }

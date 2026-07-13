@@ -1,9 +1,10 @@
 /**
- * Governed File-Grant read-scope enforcement primitive.
+ * Governed File-Grant source-inode ACL plus grant-tree read probe primitive.
  *
  * These tests use the injected fake FsOps only. They prove that `met` is only
  * reachable from an ACL apply result plus a same-operation agent-uid probe
- * returning true, and that every edge fails closed to `unverified` or `unmet`.
+ * through the grant tree returning true, and that every edge fails closed to
+ * `unverified` or `unmet`.
  */
 
 import { describe, expect, it } from "vitest";
@@ -42,9 +43,14 @@ describe("file-grant ACL/probe enforcement honesty", () => {
     });
 
     expect(enforcement).toBe("met");
+    expect(grant.granted_read_ace).toEqual({
+      agent_uid: 502,
+      platform: process.platform,
+      source_realpath: "/tmp/example.txt",
+    });
     expect(fsOps.events).toEqual([
       `place:${grant.tree_entry}`,
-      `grant:${grant.tree_entry}:502`,
+      `grant:${grant.tree_entry}:502:/tmp/example.txt`,
       `probe:${grant.tree_entry}:502`,
     ]);
   });
@@ -58,13 +64,18 @@ describe("file-grant ACL/probe enforcement honesty", () => {
       probeAgentReadResult: false,
     });
 
-    const { enforcement } = await mintFileGrant(baseParams(), {
+    const { grant, enforcement } = await mintFileGrant(baseParams(), {
       fsOps,
       store: grantStore,
       now: NOW,
     });
 
     expect(enforcement).toBe("unverified");
+    expect(grant.granted_read_ace).toEqual({
+      agent_uid: 502,
+      platform: process.platform,
+      source_realpath: "/tmp/example.txt",
+    });
     expect(fsOps.probedReads).toHaveLength(1);
   });
 

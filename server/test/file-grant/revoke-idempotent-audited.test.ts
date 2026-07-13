@@ -78,11 +78,15 @@ describe("file-grant revoke: idempotent + audited", () => {
       auditLog,
     });
 
-    expect(fsOps.removedAcls).toContainEqual({ entry: grant.tree_entry, uid: 502 });
+    expect(fsOps.removedAcls).toContainEqual({
+      entry: grant.tree_entry,
+      uid: 502,
+      sourceRealpath: grant.scope.path,
+    });
     expect(fsOps.scrubbed).toContain(grant.tree_entry);
     expect(fsOps.removeOptions).toContainEqual({
       entry: grant.tree_entry,
-      options: { canonicalAclTarget: grant.scope.path },
+      options: { grantedReadAce: grant.granted_read_ace },
     });
     expect(fsOps.events.slice(-2)).toEqual([
       `remove:${grant.tree_entry}`,
@@ -179,7 +183,48 @@ describe("file-grant revoke: idempotent + audited", () => {
     expect(persisted!.status).toBe("revoked");
   });
 
-  it("propagates an ACL removal failure and keeps the record revoked", async () => {
+  it("removes the ACE for the persisted uid even if the current descriptor drifts", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const mintFsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      probeAgentReadResult: true,
+    });
+
+    const { grant } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: "/tmp/example.txt" },
+        mode: "read",
+        ttlSeconds: 3600,
+        createdBy: "operator-1",
+      },
+      { fsOps: mintFsOps, store: grantStore, now: new Date(), auditLog },
+    );
+
+    const revokeFsOps = new FakeFsOps({ agentUid: 777, sourceOwnerUid: 501 });
+    const result = await revokeFileGrant(grant.grant_id, "operator-1", {
+      fsOps: revokeFsOps,
+      store: grantStore,
+      now: new Date(),
+      auditLog,
+    });
+
+    expect(result.scrubbed).toBe(true);
+    expect(revokeFsOps.removedAcls).toContainEqual({
+      entry: grant.tree_entry,
+      uid: 502,
+      sourceRealpath: "/tmp/example.txt",
+    });
+    expect(revokeFsOps.removedAcls).not.toContainEqual({
+      entry: grant.tree_entry,
+      uid: 777,
+      sourceRealpath: "/tmp/example.txt",
+    });
+  });
+
+  it("reports ACL removal failure honestly while still unlinking the tree entry", async () => {
     const { grantStore, auditLog } = makeFileGrantTestStore();
     const fsOps = new FakeFsOps({
       agentUid: 502,
@@ -200,17 +245,23 @@ describe("file-grant revoke: idempotent + audited", () => {
       { fsOps, store: grantStore, now: new Date(), auditLog },
     );
 
-    await expect(
-      revokeFileGrant(grant.grant_id, "operator-1", {
-        fsOps,
-        store: grantStore,
-        now: new Date(),
-        auditLog,
-      }),
-    ).rejects.toThrow(/acl removal failed/);
+    const result = await revokeFileGrant(grant.grant_id, "operator-1", {
+      fsOps,
+      store: grantStore,
+      now: new Date(),
+      auditLog,
+    });
 
     const persisted = await grantStore.get(grant.grant_id);
     expect(persisted!.status).toBe("revoked");
-    expect(fsOps.scrubbed).not.toContain(grant.tree_entry);
+    expect(persisted!.granted_read_ace).toEqual(grant.granted_read_ace);
+    expect(result.scrubbed).toBe(false);
+    expect(result.treeEntryRemoved).toBe(true);
+    expect(result.aclRemoval?.status).toBe("failed");
+    expect(fsOps.scrubbed).toContain(grant.tree_entry);
+
+    const { entries } = await auditLog.query({ operation_type: "file_grant_revoke" });
+    expect(entries.at(-1)!.result).toBe("failure");
+    expect(entries.at(-1)!.details.reason).toBe("acl_removal_failed");
   });
 });
