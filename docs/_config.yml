@@ -1,5 +1,5 @@
 title: Sanctuary Protocol
-description: A kernel-level firewall and sovereignty substrate for AI agents. Real egress enforcement, encrypted state, approval gates, and portable receipts. One MCP server, runnable with npx.
+description: Security for AI agents with no vendor in the path. Kernel-enforced egress control on macOS and Linux, keys only the operator holds, tamper-evident audit. One command protects Claude Code, Cursor, or any MCP harness.
 url: "https://sanctuaryprotocol.ai"
 baseurl: ""
 

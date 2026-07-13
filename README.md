@@ -16,7 +16,9 @@ npx @sanctuary-framework/mcp-server protect --claude-code
 
 That one command puts the wall, the keys, the audit trail, and the dashboard around the agent you already use. You keep your harness; Sanctuary adds the protection underneath.
 
-**Under the hood:** a kernel-level wall that holds even when a prompt-injected agent tries to misbehave (Linux today, macOS in progress), cryptographic identity and encrypted state the platform running your agent cannot read, and full data portability so you are never trapped in one vendor. It composes with Concordia (agent negotiation) and Verascore (portable reputation), each in its own repo and neither required.
+**Under the hood:** a kernel-level wall that holds even when a prompt-injected agent tries to misbehave, enforced on Linux and macOS today (drilled on real hardware, signed and notarized, survives reboot; Windows roadmapped), cryptographic identity and encrypted state the platform running your agent cannot read, and full data portability so you are never trapped in one vendor. It composes with Concordia (agent negotiation) and Verascore (portable reputation), each in its own repo and neither required.
+
+**The claim underneath everything: custody.** Plenty of tools can sandbox an agent when the agent, or its harness, chooses to run inside one. Sanctuary is built for the harder promise: the wall is imposed by the operator and does not depend on the agent's cooperation, the keys never leave hardware you control, and no vendor, including us, sits in the path or can decrypt your state. Every public capability claim traces to a proven row in the [Assurance Matrix](ASSURANCE_MATRIX.md), with its limits stated on the row.
 
 Why this exists: [What Sovereign Actually Means](https://sanctuaryprotocol.ai/2026/03/30/what-sovereign-actually-means.html).
 
@@ -54,7 +56,7 @@ Prints the passphrase to stdout after a confirmation prompt. Store it in a passw
 
 ## Release status
 
-`main` is the development branch. The current stable release is **v1.6.1** on the npm `latest` channel (cut 2026-07-01). v1.6.1 is a patch release that restores the bare `npx @sanctuary-framework/mcp-server` install form (broken since v1.4.0), makes the wrap write a version-pinned MCP entry into harness configs, and gates the first-run "protected" banner on real enforcement evidence; see the [v1.6.1 release notes](docs/releases/v1.6.1.md). v1.6.0 makes the conversational concierge the single default dashboard surface, hardens the dashboard status surface so the sovereignty score and layer cards reflect a real enforcement verdict and never show green on mere config presence, and adds honest install-time messaging for the setup flow and the Hermes wrap path plus a Castle Wall arming runbook for macOS. The macOS Castle Wall bounds are unchanged: per-uid allow/deny plus boot-survival plus WAN-containment are proven; there is no per-flow rule-attributed audit trail. See the [v1.6.0 release notes](docs/releases/v1.6.0.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
+`main` is the development branch. The current stable release is **v1.6.1** on the npm `latest` channel (cut 2026-07-01). v1.6.1 is a patch release that restores the bare `npx @sanctuary-framework/mcp-server` install form (broken since v1.4.0), makes the wrap write a version-pinned MCP entry into harness configs, and gates the first-run "protected" banner on real enforcement evidence; see the [v1.6.1 release notes](docs/releases/v1.6.1.md). v1.6.0 makes the conversational concierge the single default dashboard surface, hardens the dashboard status surface so the security score and layer cards reflect a real enforcement verdict and never show green on mere config presence, and adds honest install-time messaging for the setup flow and the Hermes wrap path plus a Castle Wall arming runbook for macOS. The macOS Castle Wall bounds are unchanged: per-uid allow/deny plus boot-survival plus WAN-containment are proven; there is no per-flow rule-attributed audit trail. See the [v1.6.0 release notes](docs/releases/v1.6.0.md) and [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ```bash
 npm install -g @sanctuary-framework/mcp-server
@@ -80,6 +82,8 @@ Current capability summary:
 Trust and security claims are tracked in the [Sanctuary Assurance Matrix](ASSURANCE_MATRIX.md). Public-facing claims trace to `proven` or `partial` rows in that matrix; the platform, gap, and next-proof limits named on each row are preserved.
 
 Roadmap shape: with the Mac Castle Wall per-uid allow/deny plus reboot-survival demonstration proven, the current focus is the per-flow rule-attributed audit trail (still the real gap), the Castle Wall Windows backend, and the fleet / operator-cloud surfaces. See [ROADMAP.md](ROADMAP.md).
+
+Supply-chain posture: release binaries for the macOS enforcement path are Dev-ID-signed and notarized, the CLI update path verifies a signed release manifest before applying an update, and every commit to main passes a structural typecheck-plus-test-baseline gate locally and again in CI. Mechanisms and their history: [CHANGELOG.md](CHANGELOG.md) and [docs/audit/](docs/audit/).
 
 ---
 
@@ -291,7 +295,7 @@ The operator remains the custody root in every mode. Commodity operator-cloud mo
 
 ## The Castle Architecture
 
-Sanctuary installs the substrate sovereignty used to come with. Architecturally it ships as five named mechanisms.
+Sanctuary installs the protections your body used to provide by default: a perimeter, custody, memory, and a record of what happened. Architecturally it ships as five named mechanisms.
 
 **Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped (Phase 1, 2026-05-06). macOS backend (signed system extension + content-filter provider) has a proven per-uid allow/deny egress-enforcement demonstration captured on a real host (drill 2026-06-11): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected. That is a demonstration on one host and one OS version, not reboot-survival and not an audited per-rule-per-flow trail. Windows on the roadmap.
 
@@ -376,7 +380,7 @@ For AI coding agents handling install failures, here are the common cases.
 - The protect command may have failed to write to the Keychain (typically a permissions prompt the operator dismissed). Rerun the protect command and approve the Keychain prompt when it appears.
 
 **Install Step 3 (b) on Linux or Windows:**
-- The keychain check is macOS-specific. On Linux, Sanctuary uses Secret Service when available and falls back to an encrypted file at `~/.sanctuary/passphrase.enc`. Windows Credential Manager support is queued on the v1.0.x patch track. Test the fallback with `test -f ~/.sanctuary/passphrase.enc && echo "passphrase=ok"`.
+- The keychain check is macOS-specific. On Linux, Sanctuary uses Secret Service when available and falls back to an encrypted file at `~/.sanctuary/passphrase.enc`. Windows Credential Manager support is queued on the patch track. Test the fallback with `test -f ~/.sanctuary/passphrase.enc && echo "passphrase=ok"`.
 
 **Install Step 3 (c) "identities=ok" check fails:**
 - Confirm protect completed without error. If it did, check `~/.sanctuary/identities/` for `.enc` files. If absent, the protect command exited early; rerun with `--dry-run` to see what it would do, then without to retry.
