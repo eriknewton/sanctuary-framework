@@ -122,7 +122,7 @@
 6	server/src/castle-wall/runtime/macos-ipc-listener.ts
 2	server/src/castle-wall/runtime/producer-signature.ts
 1	server/src/cli/agents/cli.ts
-12	server/src/cli/castle-wall-boot.ts
+10	server/src/cli/castle-wall-boot.ts
 1	server/src/cli/did-web.ts
 2	server/src/cli/distress.ts
 1	server/src/cli/nodes.ts
