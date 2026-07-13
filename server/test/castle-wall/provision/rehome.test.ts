@@ -84,17 +84,23 @@ function mockOps(
 
 describe("castle-wall/provision/rehome", () => {
   describe("hermesRehomeAdapter", () => {
-    it("enumerates the Mini2-D2-grounded file-based secret paths, all marked isSecret", () => {
+    it("enumerates the Mini2-D2-grounded runtime + file-based secret paths", () => {
       const entries = hermesRehomeAdapter.pathsToRehome(OPERATOR_HOME);
       expect(entries.length).toBeGreaterThan(0);
-      expect(entries.every((e) => e.isSecret)).toBe(true);
       const sourcePaths = entries.map((e) => e.sourcePath);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/.env`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/auth.json`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/config.yaml`);
+      expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/hermes-agent`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.google_workspace_mcp/credentials`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.workspace-mcp/cli-tokens`);
       expect(sourcePaths).toContain(`${OPERATOR_HOME}/.hermes/google-mcp-creds`);
+      expect(entries.find((e) => e.destRelativePath === ".hermes/hermes-agent")?.isSecret).toBe(false);
+      expect(
+        entries
+          .filter((e) => e.destRelativePath !== ".hermes/hermes-agent")
+          .every((e) => e.isSecret),
+      ).toBe(true);
     });
 
     it("requires no interactive re-consent in v1 (file-portable Google refresh tokens, calendar:readonly scope)", () => {
@@ -126,11 +132,14 @@ describe("castle-wall/provision/rehome", () => {
       const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
 
       expect(results.every((r) => r.status === "moved")).toBe(true);
-      expect(ops.backups.length).toBe(plan.steps.length);
+      expect(ops.backups.length).toBe(plan.steps.filter((s) => s.entry.isSecret).length);
       expect(ops.moves.length).toBe(plan.steps.length);
       expect(ops.chowns.every((c) => c.uid === 502 && c.gid === 502)).toBe(true);
-      // Every moved secret step recorded a backupPath (M4: reversibility).
-      expect(results.every((r) => r.status !== "moved" || r.backupPath !== undefined)).toBe(true);
+      // Every moved secret step recorded a backupPath (M4: reversibility);
+      // non-secret runtime code is reverse-moved on rollback but not backed up.
+      expect(
+        results.every((r) => r.status !== "moved" || !r.entry.isSecret || r.backupPath !== undefined),
+      ).toBe(true);
     });
 
     it("marks a source path that does not exist as skipped-absent, with no backup/move/chown", async () => {
@@ -285,6 +294,28 @@ describe("castle-wall/provision/rehome", () => {
       );
     });
 
+    it("restores non-secret runtime trees by chowning back to the operator without restoreCustody chmod", async () => {
+      const runtimeAdapter: AgentRehomeAdapter = {
+        harnessId: "test-runtime-restore",
+        pathsToRehome: (home) => [
+          { sourcePath: `${home}/.hermes/hermes-agent`, destRelativePath: ".hermes/hermes-agent", isSecret: false },
+        ],
+        requiresInteractiveReconsent: () => false,
+      };
+      const src = `${OPERATOR_HOME}/.hermes/hermes-agent`;
+      const ops = mockOps(new Set([src]));
+      const plan = planRehome(runtimeAdapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
+      const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+      ops.chowns.length = 0;
+      ops.contents.set(results[0]!.destPath, "runtime-tree");
+
+      const restoreResult = await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
+
+      expect(restoreResult.fullyRestored).toBe(true);
+      expect(ops.restoreCustodyCalls).toEqual([]);
+      expect(ops.chowns).toEqual([{ path: src, uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid }]);
+    });
+
     it("FIX (round 5, N6): a CONFLICT outcome for a secret hands custody of the RECOVERED data (at conflictPath) back to the operator, never the untouched source", async () => {
       const singleAdapter: AgentRehomeAdapter = {
         harnessId: "test-conflict",
@@ -315,7 +346,7 @@ describe("castle-wall/provision/rehome", () => {
       ]);
     });
 
-    it("FIX (round 5, N6): a CONFLICT outcome for a NON-secret entry does not hand custody back (secret-only)", async () => {
+    it("a CONFLICT outcome for a NON-secret entry chowns the recovered data back without restoreCustody chmod", async () => {
       const nonSecretAdapter: AgentRehomeAdapter = {
         harnessId: "test-conflict-nonsecret",
         pathsToRehome: (home) => [
@@ -324,16 +355,19 @@ describe("castle-wall/provision/rehome", () => {
         requiresInteractiveReconsent: () => false,
       };
       const src = `${OPERATOR_HOME}/.config/plain`;
+      const conflictPath = `${src}.restored-conflict`;
       const ops = mockOps(new Set([src]), {
-        restore: async () => ({ restored: false, conflictPath: `${src}.restored-conflict` }),
+        restore: async () => ({ restored: false, conflictPath }),
       });
       const plan = planRehome(nonSecretAdapter, { operatorHome: OPERATOR_HOME, newAccountHome: NEW_ACCOUNT_HOME });
       const results = await executeRehomePlan(plan, ops, { uid: 502, gid: 502 });
+      ops.chowns.length = 0;
 
       const restoreResult = await restoreRehomeSteps(results, ops, OPERATOR_UID_GID);
 
       expect(restoreResult.steps[0]?.status).toBe("conflict");
       expect(ops.restoreCustodyCalls).toEqual([]);
+      expect(ops.chowns).toEqual([{ path: conflictPath, uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid }]);
     });
 
     it("FIX (round 5, R2-5): a restoreCustody THROW on the conflict branch keeps status 'conflict' + conflictPath (never relabeled 'failed'), folding the custody error into the note", async () => {

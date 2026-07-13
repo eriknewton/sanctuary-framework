@@ -769,6 +769,29 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(f.err.text()).toContain("NOT yet closed");
     });
 
+    it("reports when cleanup bootout after a failed bootstrap cannot complete", async () => {
+      const f = await makeInstallFixture();
+      let bootstrapped = false;
+      const stuckCleanupExec = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "bootstrap") {
+          bootstrapped = true;
+        }
+        if (bootstrapped && cmd === "launchctl" && args[0] === "print") {
+          return { code: 0, stdout: "\tstate = not running\n", stderr: "" };
+        }
+        if (bootstrapped && cmd === "launchctl" && args[0] === "bootout") {
+          return { code: 1, stdout: "", stderr: "ETIMEDOUT: launchctl bootout timed out" };
+        }
+        return f.fake.execFileFn(cmd, args);
+      };
+
+      const code = await runInstallBoot(f.argv, { ...f.ctx, execFileFn: stuckCleanupExec });
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("launchctl bootout after failed bootstrap did not complete");
+      expect(f.err.text()).toContain("ETIMEDOUT");
+      expect(f.err.text()).toContain("Could not prove the failed unit was booted out");
+    });
+
     it("does NOT certify a crash-looping service that flaps between pids (2026-06-14 false-PASS)", async () => {
       const f = await makeInstallFixture();
       // Bootstrap accepted; `print` returns a DIFFERENT pid each read, modelling a
@@ -947,6 +970,24 @@ describe("castle-wall boot service (F1 Option C)", () => {
           (c) => c.cmd === "launchctl" && (c.args[0] === "bootout" || c.args[0] === "bootstrap"),
         ),
       ).toBe(false);
+    });
+
+    it("fails closed when launchctl bootout times out and never attempts bootstrap (Bug E)", async () => {
+      const f = await makeInstallFixture();
+      const calls: Array<{ cmd: string; args: string[] }> = [];
+      const timeoutBootoutExec = (cmd: string, args: string[]): ExecFileResult => {
+        calls.push({ cmd, args });
+        if (cmd === "launchctl" && args[0] === "bootout") {
+          return { code: 1, stdout: "", stderr: "Error: spawnSync launchctl ETIMEDOUT" };
+        }
+        return f.fake.execFileFn(cmd, args);
+      };
+
+      const code = await runInstallBoot(f.argv, { ...f.ctx, execFileFn: timeoutBootoutExec });
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("launchctl bootout failed");
+      expect(f.err.text()).toContain("ETIMEDOUT");
+      expect(calls.some((c) => c.cmd === "launchctl" && c.args[0] === "bootstrap")).toBe(false);
     });
 
     it("surfaces a bootstrap failure instead of claiming success", async () => {

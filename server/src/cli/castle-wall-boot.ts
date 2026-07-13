@@ -85,6 +85,8 @@ import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.
 
 export const CASTLE_WALL_BOOT_LABEL = "ai.sanctuaryprotocol.castle-wall.daemon";
 export const CASTLE_WALL_BOOT_PLIST_PATH = `/Library/LaunchDaemons/${CASTLE_WALL_BOOT_LABEL}.plist`;
+export const LAUNCHCTL_TIMEOUT_MS = 15_000;
+export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH =
   "/Library/Application Support/Sanctuary/castle-pinned-pubkey.bin";
 const SAFE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
@@ -132,11 +134,16 @@ function write(stream: Writable, text: string): void {
 }
 
 function defaultExecFile(cmd: string, args: string[]): ExecFileResult {
-  const result = spawnSync(cmd, args, { encoding: "utf8" });
+  const result = spawnSync(cmd, args, {
+    encoding: "utf8",
+    timeout: LAUNCHCTL_TIMEOUT_MS,
+    killSignal: LAUNCHCTL_KILL_SIGNAL,
+  });
+  const errorText = result.error ? `${result.error.name}: ${result.error.message}` : "";
   return {
     code: result.status ?? 1,
     stdout: result.stdout ?? "",
-    stderr: result.stderr ?? "",
+    stderr: [result.stderr ?? "", errorText].filter(Boolean).join("\n"),
   };
 }
 
@@ -789,6 +796,25 @@ function launchctlResultWasNotLoaded(result: ExecFileResult): boolean {
   );
 }
 
+function bootOutFailedCastleWallUnit(
+  execFileFn: (cmd: string, args: string[]) => ExecFileResult,
+  err: Writable,
+  plistPath: string,
+): boolean {
+  const bootout = execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+  if (bootout.code === 0 || launchctlResultWasNotLoaded(bootout)) {
+    return true;
+  }
+  write(
+    err,
+    `launchctl bootout after failed bootstrap did not complete (exit ${bootout.code}): ${
+      bootout.stderr.trim() || bootout.stdout.trim()
+    }\n` +
+      `The failed unit may still be loaded; ${plistPath} is left installed for manual recovery.\n`,
+  );
+  return false;
+}
+
 /**
  * Resolve the daemon argv when --binary is not given. Only resolvable from a
  * built dist tree (the npm-installed CLI); in dev/test contexts callers must
@@ -1198,7 +1224,15 @@ export async function runInstallBoot(
 
   // Replace-or-load: with any disabled override repaired first, boot out any
   // previous instance (ignore "not loaded"), then bootstrap the new unit.
-  execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+  const bootout = execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+  if (bootout.code !== 0 && !launchctlResultWasNotLoaded(bootout)) {
+    write(
+      err,
+      `launchctl bootout failed (exit ${bootout.code}): ${bootout.stderr.trim() || bootout.stdout.trim()}\n` +
+        `Leaving ${plistPath} installed but not re-bootstrapping; fix launchd state and re-run install-boot.\n`,
+    );
+    return 1;
+  }
   const bootstrap = execFileFn("launchctl", ["bootstrap", "system", plistPath]);
   if (bootstrap.code !== 0) {
     write(
@@ -1216,24 +1250,24 @@ export async function runInstallBoot(
   if (!(await bootServiceReady(plistPath, fortressPath, execFileFn, sleepFn))) {
     // Stop the throttled crash loop we just bootstrapped so it does not churn
     // forever; the plist stays on disk for inspection and re-run.
-    execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+    const bootedOut = bootOutFailedCastleWallUnit(execFileFn, err, plistPath);
     write(
       err,
       `Bootstrap was accepted but system/${CASTLE_WALL_BOOT_LABEL} did not stay running.\n` +
         `The daemon failed to start or is crash-looping (likely node is not resolvable on the daemon PATH, the signer helper is unreachable, or the boot token is unreadable). Inspect:\n` +
         `  sudo launchctl print system/${CASTLE_WALL_BOOT_LABEL}\n` +
         `  tail -n 50 ${join(logDir, "castle-wall-daemon.err.log")}\n` +
-        `Booted the failed unit out. Not certifying the boot service; the brick condition is NOT yet closed.\n`,
+        `${bootedOut ? "Booted the failed unit out." : "Could not prove the failed unit was booted out."} Not certifying the boot service; the brick condition is NOT yet closed.\n`,
     );
     return 1;
   }
   const pid = serviceRunningPid(execFileFn);
   if (pid === null) {
-    execFileFn("launchctl", ["bootout", `system/${CASTLE_WALL_BOOT_LABEL}`]);
+    const bootedOut = bootOutFailedCastleWallUnit(execFileFn, err, plistPath);
     write(
       err,
       `Bootstrap was accepted but system/${CASTLE_WALL_BOOT_LABEL} vanished before certification completed.\n` +
-        "Booted the failed unit out. Not certifying the boot service; the brick condition is NOT yet closed.\n",
+        `${bootedOut ? "Booted the failed unit out." : "Could not prove the failed unit was booted out."} Not certifying the boot service; the brick condition is NOT yet closed.\n`,
     );
     return 1;
   }

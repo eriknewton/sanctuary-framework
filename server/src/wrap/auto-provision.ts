@@ -49,6 +49,7 @@ import {
   type ProvisionFlowOutcome,
   type RehomeStepResult,
   type EndpointProbeTarget,
+  type PolicyDaemonAction,
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
@@ -67,6 +68,13 @@ const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
 
 /** Budget for polling the policy-daemon socket to become reachable after install-boot (Bug B). */
 const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
+export const LAUNCHCTL_TIMEOUT_MS = 15_000;
+export const LAUNCHCTL_KILL_SIGNAL = "SIGKILL";
+
+/** Dedicated harness daemon logs must be writable by the agent uid, not the operator-only fortress. */
+export function resolveHarnessDaemonLogDir(newAccountHome: string): string {
+  return `${newAccountHome.replace(/\/+$/, "")}/logs`;
+}
 
 /**
  * Bug B (consistency): resolve the fortress path whose Castle Wall the
@@ -759,6 +767,8 @@ export interface RunAutoProvisionForWrapOptions {
   cliBinary?: string;
   /** Print function for operator-facing output (defaults to console.error, matching the rest of wrap/cli.ts's stderr convention). */
   print?: (line: string) => void;
+  /** Stop the wrap-started transient Castle Wall daemon before installing the persistent boot service. */
+  stopTransientCastleWallDaemon?: () => Promise<void>;
   /** Override for `process.getuid` (tests only; production leaves this undefined). */
   getuid?: () => number;
   /** Override for the resolved operator identity (tests only; production leaves this undefined and resolves via SUDO_UID/GID/USER). */
@@ -784,6 +794,32 @@ export function policyDaemonInstallBootArgs(
     args.push("--binary", cliBinary);
   }
   return args;
+}
+
+export interface AutoProvisionPolicyDaemonSignals {
+  socketReachable: boolean;
+  diskForThisFortress: boolean;
+  readyForThisFortress: boolean;
+  plistPresent: boolean;
+  loadedState: { loaded: boolean; fortressPath: string | null };
+  fortressPath: string;
+}
+
+export function resolvePolicyDaemonActionForAutoProvision(
+  signals: AutoProvisionPolicyDaemonSignals,
+): PolicyDaemonAction {
+  const loadedForThisFortress =
+    signals.loadedState.loaded && signals.loadedState.fortressPath === pathResolve(signals.fortressPath);
+  const forThisFortress =
+    signals.diskForThisFortress && (!signals.loadedState.loaded || loadedForThisFortress);
+  const forAnyFortress = signals.plistPresent || signals.loadedState.loaded;
+  return resolvePolicyDaemonAction({
+    socketReachable: signals.socketReachable,
+    bootServiceForThisFortress: forThisFortress,
+    bootServiceReadyForThisFortress: signals.readyForThisFortress,
+    bootServiceLoadedForThisFortress: signals.diskForThisFortress && loadedForThisFortress,
+    bootServiceForAnyFortress: forAnyFortress,
+  });
 }
 
 /**
@@ -938,6 +974,10 @@ export async function runAutoProvisionForWrap(
       await mkdir(NEW_ACCOUNT_HOME_BASE, { recursive: true, mode: 0o711 });
       await chmod(NEW_ACCOUNT_HOME_BASE, 0o711);
       const rehomeOps = realRehomeOps();
+      const staleRuntimeConflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, newAccountHome);
+      if (staleRuntimeConflictPath !== undefined) {
+        print(`Moved stale Hermes runtime destination aside at ${staleRuntimeConflictPath}.`);
+      }
       const plan = planRehome(hermesRehomeAdapter, { operatorHome, newAccountHome });
       const results = await executeRehomePlan(plan, rehomeOps, { uid, gid });
       // FIX (round 5, item N1): chown the agent's WHOLE home tree (the home
@@ -980,25 +1020,35 @@ export async function runAutoProvisionForWrap(
       // teardown decision keys on "did this attempt stand the daemon up" for
       // both success and failure. Capture the pre-install status FIRST.
       const daemonOps = realHarnessDaemonOps();
-      let before: { installed: boolean };
+      let before: { known: boolean; installed: boolean };
       try {
         before = await agentHarnessDaemonStatus(daemonOps);
       } catch {
-        // Status probe itself failed: assume no pre-existing daemon (fail
-        // toward tearing down anything this attempt leaves live).
-        before = { installed: false };
+        // Status probe itself failed: preserve any possible pre-existing daemon.
+        // A fresh install cannot be proven when launchd state is unknown.
+        before = { known: false, installed: false };
       }
       try {
-        const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists });
+        const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists }, { agentHome: newAccountHome });
+        const harnessLogDir = resolveHarnessDaemonLogDir(newAccountHome);
+        await mkdir(harnessLogDir, { recursive: true, mode: 0o700 });
+        await chmod(harnessLogDir, 0o700);
+        await fsChown(harnessLogDir, uid, uid);
         const plan = planAgentHarnessDaemonInstall({
           agentAccount: accountName,
           programArguments: resolved.programArguments,
           fortressPath: process.env.SANCTUARY_STORAGE_PATH,
+          logDir: harnessLogDir,
+          environment: resolved.environment,
         });
         await installAgentHarnessDaemon(plan, daemonOps);
-        return { ok: true as const, bootstrappedThisRun: !before.installed };
+        return { ok: true as const, bootstrappedThisRun: before.known && !before.installed };
       } catch (err) {
-        return { ok: false as const, error: (err as Error).message, daemonPreexisted: before.installed };
+        return {
+          ok: false as const,
+          error: (err as Error).message,
+          daemonPreexisted: before.installed || !before.known,
+        };
       }
     },
     // FIX (round 5, item N3): tear the harness daemon back down on a
@@ -1037,12 +1087,15 @@ export async function runAutoProvisionForWrap(
       //    is necessary but not sufficient; the no-op case requires BOTH a
       //    reachable socket and a matching boot service for this fortress.
       //    `bootServiceInstalled(plist, fortress)` confirms a well-formed unit
-      //    targets THIS fortress; `bootServiceReady` additionally confirms the
-      //    singleton launchd service is stably live. A matching-but-stopped or
-      //    nonfunctional plist must restart, not no-op. The occupancy check
-      //    treats either a singleton plist path OR a loaded singleton launchd
-      //    label as "some wall exists." If that state is unverifiable, treat it
-      //    as a conflict rather than silently overwriting unknown wall state.
+      //    targets THIS fortress; `bootServiceLoadState` confirms the singleton
+      //    launchd label is loaded for THIS fortress; `bootServiceReady`
+      //    additionally confirms a stable pid. A matching-but-stopped plist must
+      //    restart, not no-op. A matching loaded service whose socket already
+      //    answers must NOT be destructively booted out just because the stable
+      //    sample window missed. The occupancy check treats either a singleton
+      //    plist path OR a loaded singleton launchd label as "some wall exists."
+      //    If that state is unverifiable, treat it as a conflict rather than
+      //    silently overwriting unknown wall state.
       const socketReachable = await defaultDaemonProbe(socketPath);
       const [diskForThisFortress, readyForThisFortress, plistPresent] = await Promise.all([
         bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH, fortressPath),
@@ -1050,16 +1103,13 @@ export async function runAutoProvisionForWrap(
         bootServicePlistPresent(CASTLE_WALL_BOOT_PLIST_PATH),
       ]);
       const loadedState = bootServiceLoadState();
-      const loadedForThisFortress =
-        loadedState.loaded && loadedState.fortressPath === pathResolve(fortressPath);
-      const forThisFortress =
-        diskForThisFortress && (!loadedState.loaded || loadedForThisFortress);
-      const forAnyFortress = plistPresent || loadedState.loaded;
-      const action = resolvePolicyDaemonAction({
+      const action = resolvePolicyDaemonActionForAutoProvision({
         socketReachable,
-        bootServiceForThisFortress: forThisFortress,
-        bootServiceReadyForThisFortress: readyForThisFortress,
-        bootServiceForAnyFortress: forAnyFortress,
+        diskForThisFortress,
+        readyForThisFortress,
+        plistPresent,
+        loadedState,
+        fortressPath,
       });
       if (action === "noop") {
         return { ok: true as const, freshlyInstalled: false };
@@ -1082,6 +1132,17 @@ export async function runAutoProvisionForWrap(
       // when NO wall existed before this run, so an abort tears down exactly
       // what this run created and never a pre-existing wall.
       const freshlyInstalled = action === "install-fresh";
+      try {
+        await options.stopTransientCastleWallDaemon?.();
+      } catch (err) {
+        return {
+          ok: false as const,
+          freshlyInstalled: false,
+          error:
+            `could not stop the transient Castle Wall daemon before installing the persistent boot service: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
       const code = await runInstallBoot(
         policyDaemonInstallBootArgs(fortressPath, options.cliBinary),
         { env: process.env },
@@ -1255,6 +1316,38 @@ async function pathExists(path: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Paths for the non-secret Hermes runtime tree that may be left behind by an aborted dedicated-account run. */
+export function hermesRuntimeRehomePaths(
+  operatorHome: string,
+  newAccountHome: string,
+): { sourcePath: string; destPath: string } {
+  const operatorBase = operatorHome.replace(/\/+$/, "");
+  const accountBase = newAccountHome.replace(/\/+$/, "");
+  return {
+    sourcePath: `${operatorBase}/.hermes/hermes-agent`,
+    destPath: `${accountBase}/.hermes/hermes-agent`,
+  };
+}
+
+/**
+ * Retry cleanup for the Hermes runtime code tree only. If a previous aborted
+ * run left a duplicate non-secret runtime at the dedicated-account
+ * destination while the operator source is also present, move the stale
+ * destination aside before `rename(source, dest)`.
+ */
+export async function moveAsideStaleHermesRuntimeDestination(
+  operatorHome: string,
+  newAccountHome: string,
+): Promise<string | undefined> {
+  const { sourcePath, destPath } = hermesRuntimeRehomePaths(operatorHome, newAccountHome);
+  if (!(await pathExists(sourcePath)) || !(await pathExistsNoFollow(destPath))) {
+    return undefined;
+  }
+  const conflictPath = await findUniqueConflictPath(destPath);
+  await rename(destPath, conflictPath);
+  return conflictPath;
 }
 
 /**
@@ -1762,6 +1855,30 @@ function realUidExistenceOps() {
   };
 }
 
+type BoundedLaunchctlExecFile = (
+  file: string,
+  args: string[],
+  options: { timeout: number; killSignal: NodeJS.Signals },
+) => Promise<{ stdout: string; stderr: string }>;
+
+export async function runLaunchctlWithTimeout(
+  args: readonly string[],
+  execFileFn: BoundedLaunchctlExecFile = execFileAsync as BoundedLaunchctlExecFile,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileFn("/bin/launchctl", [...args], {
+      timeout: LAUNCHCTL_TIMEOUT_MS,
+      killSignal: LAUNCHCTL_KILL_SIGNAL,
+    });
+    return { code: 0, stdout, stderr };
+  } catch (err) {
+    const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
+    const code = typeof e.code === "number" ? e.code : 1;
+    const errorText = typeof e.code === "string" ? `${e.code}: ${e.message ?? String(err)}` : String(err);
+    return { code, stdout: e.stdout ?? "", stderr: [e.stderr ?? "", errorText].filter(Boolean).join("\n") };
+  }
+}
+
 function realHarnessDaemonOps(): HarnessDaemonOps {
   return {
     writeFile: async (path, content, mode) => {
@@ -1775,14 +1892,9 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
       });
     },
     runLaunchctl: async (args) => {
-      try {
-        const { stdout, stderr } = await execFileAsync("/bin/launchctl", [...args]);
-        return { code: 0, stdout, stderr };
-      } catch (err) {
-        const e = err as { code?: number; stdout?: string; stderr?: string };
-        return { code: e.code ?? 1, stdout: e.stdout ?? "", stderr: e.stderr ?? String(err) };
-      }
+      return runLaunchctlWithTimeout(args);
     },
+    sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
   };
 }
 

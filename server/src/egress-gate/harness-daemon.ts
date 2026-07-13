@@ -31,6 +31,12 @@ export const AGENT_HARNESS_DAEMON_LABEL = "ai.sanctuaryprotocol.agent-harness";
 /** Canonical install path of the daemon plist. */
 export const AGENT_HARNESS_DAEMON_PLIST_PATH = `/Library/LaunchDaemons/${AGENT_HARNESS_DAEMON_LABEL}.plist`;
 
+const HARNESS_DAEMON_STABILITY_SAMPLES = 3;
+const HARNESS_DAEMON_STARTUP_ATTEMPTS = 30;
+const HARNESS_DAEMON_STABILITY_INTERVAL_MS = 500;
+
+type LaunchctlResult = { code: number; stdout: string; stderr: string };
+
 /**
  * Env names that must NEVER appear in a world-readable plist. Kept in
  * lockstep with `FORBIDDEN_PLIST_ENV` in `cli/castle-wall-boot.ts`
@@ -182,7 +188,9 @@ export interface HarnessDaemonOps {
   /** Remove the file at `path` (ENOENT is not an error). */
   removeFile(path: string): Promise<void>;
   /** Run launchctl with argv (never a shell). */
-  runLaunchctl(args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }>;
+  runLaunchctl(args: readonly string[]): Promise<LaunchctlResult>;
+  /** Sleep between launchd stability samples. Tests inject a no-op. */
+  sleepMs?: (ms: number) => Promise<void>;
 }
 
 /** A planned install: the plist content plus where it goes. Pure. */
@@ -228,8 +236,18 @@ export async function installAgentHarnessDaemon(
   ops: HarnessDaemonOps,
 ): Promise<void> {
   const existing = await agentHarnessDaemonStatus(ops);
+  if (!existing.known) {
+    throw new Error(
+      `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL} did not return a trustworthy status; refusing to install or remove plist`,
+    );
+  }
   await ops.writeFile(plan.plistPath, plan.plistContent, 0o644);
   if (existing.installed) {
+    if (!(await agentHarnessDaemonStableRunning(ops))) {
+      throw new Error(
+        `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL} did not report a stable running pid`,
+      );
+    }
     return;
   }
   const result = await ops.runLaunchctl(plan.bootstrapArgs);
@@ -238,12 +256,26 @@ export async function installAgentHarnessDaemon(
     // if launchd NOW reports the service bootstrapped, the plist we just
     // wrote is the unit a live service depends on -- leave it in place.
     const after = await agentHarnessDaemonStatus(ops);
-    if (!after.installed) {
+    if (after.known && !after.installed) {
       await ops.removeFile(plan.plistPath).catch(() => undefined);
     }
     throw new Error(
       `launchctl ${plan.bootstrapArgs.join(" ")} exited ${result.code}: ${result.stderr.trim()}`,
     );
+  }
+  if (!(await agentHarnessDaemonStableRunning(ops))) {
+    const message = `launchctl ${plan.bootstrapArgs.join(" ")} accepted the job, but system/${AGENT_HARNESS_DAEMON_LABEL} did not report a stable running pid`;
+    try {
+      await uninstallAgentHarnessDaemon(ops);
+    } catch (cleanupError) {
+      throw new Error(
+        `${message}; cleanup failed: ${
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+        }; leaving ${plan.plistPath} installed for manual recovery`,
+        { cause: cleanupError },
+      );
+    }
+    throw new Error(message);
   }
 }
 
@@ -273,6 +305,8 @@ export async function uninstallAgentHarnessDaemon(ops: HarnessDaemonOps): Promis
 
 /** Status of the harness daemon as launchd reports it. */
 export interface HarnessDaemonStatus {
+  /** False when launchctl itself failed or timed out and status is unknowable. */
+  known: boolean;
   /** True when launchd knows the service (bootstrapped). */
   installed: boolean;
   /** True when the service has a running pid. */
@@ -282,22 +316,64 @@ export interface HarnessDaemonStatus {
 
 /**
  * Query `launchctl print system/<label>` and parse the state. Fail-closed
- * for POSTURE purposes: any error or unparseable output reports
- * `{ installed: false, running: false }`; never guess "running".
+ * for POSTURE purposes: an absent service is known-not-installed, but a
+ * launchctl error/timeout is unknown so callers preserve existing state rather
+ * than booting out or deleting a possibly live unit.
  */
 export async function agentHarnessDaemonStatus(ops: HarnessDaemonOps): Promise<HarnessDaemonStatus> {
-  let result: { code: number; stdout: string; stderr: string };
+  let result: LaunchctlResult;
   try {
     result = await ops.runLaunchctl(["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
   } catch {
-    return { installed: false, running: false };
+    return { known: false, installed: false, running: false };
   }
   if (result.code !== 0) {
-    return { installed: false, running: false };
+    return launchctlPrintWasNotLoaded(result)
+      ? { known: true, installed: false, running: false }
+      : { known: false, installed: false, running: false };
   }
   const pidMatch = /^\s*pid\s*=\s*(\d+)\s*$/m.exec(result.stdout);
   if (pidMatch) {
-    return { installed: true, running: true, pid: Number(pidMatch[1]) };
+    return { known: true, installed: true, running: true, pid: Number(pidMatch[1]) };
   }
-  return { installed: true, running: false };
+  return { known: true, installed: true, running: false };
+}
+
+async function agentHarnessDaemonStableRunning(ops: HarnessDaemonOps): Promise<boolean> {
+  const sleep = ops.sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let expectedPid: number | undefined;
+  let stableSamples = 0;
+  for (let i = 0; i < HARNESS_DAEMON_STARTUP_ATTEMPTS; i++) {
+    if (i > 0) await sleep(HARNESS_DAEMON_STABILITY_INTERVAL_MS);
+    const status = await agentHarnessDaemonStatus(ops);
+    if (!status.known) {
+      return false;
+    }
+    if (!status.running || status.pid === undefined) {
+      if (expectedPid !== undefined) return false;
+      continue;
+    }
+    if (expectedPid !== undefined && status.pid !== expectedPid) {
+      return false;
+    }
+    expectedPid = status.pid;
+    stableSamples += 1;
+    if (stableSamples >= HARNESS_DAEMON_STABILITY_SAMPLES) return true;
+  }
+  return false;
+}
+
+function launchctlPrintWasNotLoaded(result: LaunchctlResult): boolean {
+  if (result.code === 0) return false;
+  const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return (
+    result.code === 3 ||
+    result.code === 113 ||
+    text.includes("no such process") ||
+    text.includes("no such service") ||
+    text.includes("could not find service") ||
+    text.includes("service not loaded") ||
+    text.includes("not loaded") ||
+    text.includes("does not exist")
+  );
 }

@@ -36,6 +36,7 @@ function mockOps(overrides: Partial<HarnessDaemonOps> = {}): HarnessDaemonOps & 
   const writes: Array<{ path: string; content: string; mode: number }> = [];
   const removals: string[] = [];
   const launchctl: string[][] = [];
+  let installed = false;
   return {
     writes,
     removals,
@@ -51,11 +52,30 @@ function mockOps(overrides: Partial<HarnessDaemonOps> = {}): HarnessDaemonOps & 
     runLaunchctl(args) {
       launchctl.push([...args]);
       if (args[0] === "print") {
-        // Default: launchd does not know the service (fresh-install path).
-        return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+        return installed
+          ? Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n\tstate = running\n}\n`,
+              stderr: "",
+            })
+          : Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+      }
+      if (args[0] === "bootstrap") {
+        installed = true;
+        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+      }
+      if (args[0] === "bootout") {
+        const wasInstalled = installed;
+        installed = false;
+        return Promise.resolve(
+          wasInstalled
+            ? { code: 0, stdout: "", stderr: "" }
+            : { code: 3, stdout: "", stderr: "No such service" },
+        );
       }
       return Promise.resolve({ code: 0, stdout: "", stderr: "" });
     },
+    sleepMs: async () => {},
     ...overrides,
   };
 }
@@ -160,7 +180,51 @@ describe("egress-gate/harness-daemon", () => {
       expect(ops.launchctl).toEqual([
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
+        ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
       ]);
+    });
+
+    it("waits for launchd to report the first pid after accepting bootstrap", async () => {
+      let prints = 0;
+      const calls: string[][] = [];
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          calls.push([...args]);
+          if (args[0] === "print") {
+            prints += 1;
+            if (prints === 1) {
+              return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+            }
+            if (prints <= 3) {
+              return Promise.resolve({
+                code: 0,
+                stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tstate = not running\n}\n`,
+                stderr: "",
+              });
+            }
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n\tstate = running\n}\n`,
+              stderr: "",
+            });
+          }
+          if (args[0] === "bootstrap") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "bootout") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+
+      await installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops);
+
+      expect(ops.removals).toEqual([]);
+      expect(calls.filter((args) => args[0] === "print")).toHaveLength(6);
+      expect(calls.some((args) => args[0] === "bootout")).toBe(false);
     });
 
     it("removes the just-written plist when a fresh-install bootstrap fails (no half-installed unit)", async () => {
@@ -176,6 +240,23 @@ describe("egress-gate/harness-daemon", () => {
         installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
       ).rejects.toThrow(/exited 5/);
       expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
+    });
+
+    it("refuses to write or bootstrap when launchctl status is unknown (preserve possible pre-existing daemon)", async () => {
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            return Promise.resolve({ code: 1, stdout: "", stderr: "ETIMEDOUT: launchctl print timed out" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+
+      await expect(
+        installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
+      ).rejects.toThrow(/did not return a trustworthy status/);
+      expect(ops.writes).toEqual([]);
+      expect(ops.removals).toEqual([]);
     });
 
     it("re-install over an already-bootstrapped service refreshes the plist and never bootstraps or rolls back (boot persistence preserved)", async () => {
@@ -204,29 +285,59 @@ describe("egress-gate/harness-daemon", () => {
       await installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops);
       // Plist bytes refreshed, no second bootstrap attempted, nothing removed.
       expect(ops.writes).toHaveLength(1);
-      expect(calls).toEqual([["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`]]);
+      expect(calls).toEqual([
+        ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+      ]);
       expect(ops.removals).toEqual([]);
     });
 
-    it("never removes the plist when a failed bootstrap turns out to be an already-bootstrapped service (post-check belt-and-suspenders)", async () => {
-      // The pre-check is fail-closed (an erring `launchctl print` reports
-      // not-installed), so a bootstrap can still fail against an
-      // already-bootstrapped service. The rollback must then leave the unit
-      // file in place: removing it would strand the live service with no
-      // boot persistence.
+    it("bootstrap accepted but crash-looping harness does NOT report installed success", async () => {
+      let printed = false;
+      const calls: string[][] = [];
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          calls.push([...args]);
+          if (args[0] === "print" && !printed) {
+            printed = true;
+            return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+          }
+          if (args[0] === "bootstrap") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "print") {
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tstate = not running\n}\n`,
+              stderr: "",
+            });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+
+      await expect(
+        installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
+      ).rejects.toThrow(/did not report a stable running pid/);
+      expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
+      expect(calls.some((args) => args[0] === "bootout")).toBe(true);
+    });
+
+    it("never removes the plist when post-bootstrap-failure status is unknown", async () => {
+      // The pre-check saw a genuinely absent service, but after bootstrap
+      // failed launchctl itself became untrustworthy. Preserve the plist rather
+      // than deleting the unit file for a possibly live service.
       let prints = 0;
       const ops = mockOps({
         runLaunchctl: (args) => {
           if (args[0] === "print") {
             prints += 1;
             if (prints === 1) {
-              return Promise.reject(new Error("launchctl print flaked"));
+              return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
             }
-            return Promise.resolve({
-              code: 0,
-              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n}\n`,
-              stderr: "",
-            });
+            return Promise.resolve({ code: 1, stdout: "", stderr: "ETIMEDOUT: launchctl print timed out" });
           }
           return Promise.resolve({
             code: 5,
@@ -239,6 +350,106 @@ describe("egress-gate/harness-daemon", () => {
         installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
       ).rejects.toThrow(/exited 5/);
       expect(ops.removals).toEqual([]);
+    });
+
+    it("bootstrap accepted but unstable harness only removes plist after successful cleanup bootout", async () => {
+      let prints = 0;
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            prints += 1;
+            if (prints === 1) {
+              return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+            }
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tstate = not running\n}\n`,
+              stderr: "",
+            });
+          }
+          if (args[0] === "bootstrap") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "bootout") {
+            return Promise.resolve({ code: 5, stdout: "", stderr: "Input/output error" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+
+      await expect(
+        installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
+      ).rejects.toThrow(/cleanup failed/);
+      expect(ops.removals).toEqual([]);
+    });
+
+    it("requires every stability sample to report the same running pid", async () => {
+      let prints = 0;
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            prints += 1;
+            if (prints === 1) {
+              return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+            }
+            if (prints === 3) {
+              return Promise.resolve({
+                code: 0,
+                stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tstate = not running\n}\n`,
+                stderr: "",
+              });
+            }
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n}\n`,
+              stderr: "",
+            });
+          }
+          if (args[0] === "bootstrap") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "bootout") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+
+      await expect(
+        installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
+      ).rejects.toThrow(/did not report a stable running pid/);
+      expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
+    });
+
+    it("rejects a harness whose running pid changes between stability samples", async () => {
+      let prints = 0;
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            prints += 1;
+            if (prints === 1) {
+              return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+            }
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = ${4241 + prints}\n}\n`,
+              stderr: "",
+            });
+          }
+          if (args[0] === "bootstrap") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "bootout") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+
+      await expect(
+        installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
+      ).rejects.toThrow(/did not report a stable running pid/);
+      expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
     });
 
     it("uninstall boots out then removes the plist (idempotent when not loaded)", async () => {
@@ -300,6 +511,7 @@ describe("egress-gate/harness-daemon", () => {
           }),
       });
       expect(await agentHarnessDaemonStatus(ops)).toEqual({
+        known: true,
         installed: true,
         running: true,
         pid: 4242,
@@ -315,22 +527,30 @@ describe("egress-gate/harness-daemon", () => {
             stderr: "",
           }),
       });
-      expect(await agentHarnessDaemonStatus(ops)).toEqual({ installed: true, running: false });
+      expect(await agentHarnessDaemonStatus(ops)).toEqual({ known: true, installed: true, running: false });
     });
 
-    it("reports not-installed on a non-zero launchctl exit", async () => {
+    it("reports known-not-installed on a launchctl not-loaded exit", async () => {
       const ops = mockOps({
         runLaunchctl: () =>
           Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" }),
       });
-      expect(await agentHarnessDaemonStatus(ops)).toEqual({ installed: false, running: false });
+      expect(await agentHarnessDaemonStatus(ops)).toEqual({ known: true, installed: false, running: false });
     });
 
-    it("reports not-installed when launchctl itself fails (never guess running)", async () => {
+    it("reports unknown when launchctl itself fails (never guess absent or running)", async () => {
       const ops = mockOps({
         runLaunchctl: () => Promise.reject(new Error("spawn launchctl ENOENT")),
       });
-      expect(await agentHarnessDaemonStatus(ops)).toEqual({ installed: false, running: false });
+      expect(await agentHarnessDaemonStatus(ops)).toEqual({ known: false, installed: false, running: false });
+    });
+
+    it("reports unknown on a non-not-loaded launchctl failure", async () => {
+      const ops = mockOps({
+        runLaunchctl: () =>
+          Promise.resolve({ code: 1, stdout: "", stderr: "ETIMEDOUT: launchctl print timed out" }),
+      });
+      expect(await agentHarnessDaemonStatus(ops)).toEqual({ known: false, installed: false, running: false });
     });
   });
 });

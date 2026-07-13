@@ -1216,6 +1216,32 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(err.text()).toContain("SANCTUARY_CASTLE_HOSTAPP is set but");
   });
 
+  it("trusts an operator-owned host app when running as root via sudo", async () => {
+    const { hostAppPath, env } = await makeFixture();
+    const out = new CaptureStream();
+    const err = new CaptureStream();
+    const operatorUid = process.getuid?.();
+    expect(operatorUid).toBeDefined();
+    const { invoke, calls } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+    });
+
+    const code = await runDisable([], {
+      out,
+      err,
+      env: { ...env, SUDO_UID: String(operatorUid) },
+      platform: "darwin",
+      getuid: () => 0,
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+    });
+
+    expect(code).toBe(0);
+    expect(calls[0]?.[0]).toBe(hostAppPath);
+    expect(out.text()).toContain("Castle Wall disarmed");
+  });
+
   it("disarm succeeds with a warning when the audit log cannot be written", async () => {
     const { hostAppPath, env } = await makeFixture();
     const out = new CaptureStream();

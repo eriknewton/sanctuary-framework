@@ -344,16 +344,24 @@ async function writeSignerHelperReadinessDiagnosis(
   },
 ): Promise<void> {
   try {
-    const { assessSignerHelperReadiness, buildHelperPublicKeyQuery } = await import(
-      "./castle-wall-signer-helper.js"
-    );
+    const {
+      assessSignerHelperReadiness,
+      buildHelperPublicKeyQuery,
+      SIGNER_HELPER_LAUNCHCTL_KILL_SIGNAL,
+      SIGNER_HELPER_LAUNCHCTL_TIMEOUT_MS,
+    } = await import("./castle-wall-signer-helper.js");
     const readiness = await assessSignerHelperReadiness({
       execFileFn: (cmd, cmdArgs) => {
-        const result = nodeSpawnSync(cmd, cmdArgs, { encoding: "utf8" });
+        const result = nodeSpawnSync(cmd, cmdArgs, {
+          encoding: "utf8",
+          timeout: SIGNER_HELPER_LAUNCHCTL_TIMEOUT_MS,
+          killSignal: SIGNER_HELPER_LAUNCHCTL_KILL_SIGNAL,
+        });
+        const errorText = result.error ? `${result.error.name}: ${result.error.message}` : "";
         return {
           code: result.status ?? 1,
           stdout: result.stdout ?? "",
-          stderr: result.stderr ?? "",
+          stderr: [result.stderr ?? "", errorText].filter(Boolean).join("\n"),
         };
       },
       queryHelperPublicKey: buildHelperPublicKeyQuery(opts.signerClientPath, opts.signerClientInvoke),
@@ -804,8 +812,11 @@ function defaultSignerClientCandidates(env: NodeJS.ProcessEnv): string[] {
  *
  * The DEFAULT discovery predicate is `isOwnerTrustedExecutable` (the same
  * owner-trust check `resolveHostAppBinary` uses to guard the arming surface):
- * a probed candidate must be a regular file owned by root or the current uid,
- * so a binary an attacker dropped at a user-writable probed path is rejected.
+ * a probed candidate must be a regular file owned by root, the current uid, or
+ * (for a root process launched via sudo) SUDO_UID. The sudo case is required
+ * for `sudo sanctuary protect --hermes`: privileged account/launchd steps run
+ * as root, while the installed and user-consented Castle Wall app can be owned
+ * by the operator who invoked sudo.
  * This brings the signer-client surface to PARITY with the host-app surface.
  * NOTE: stronger same-UID hardening (designated-requirement / codesign
  * validation) is a broader follow-up that, if pursued, must apply UNIFORMLY to
@@ -824,7 +835,7 @@ async function resolveSignerClientPath(
   if (platform !== "darwin") return undefined;
   const getuid = ctx.getuid ?? process.getuid?.bind(process);
   const exists =
-    ctx.fileExistsFn ?? ((path: string) => isOwnerTrustedExecutable(path, getuid));
+    ctx.fileExistsFn ?? ((path: string) => isOwnerTrustedExecutable(path, getuid, env));
   const candidates = ctx.signerClientCandidates ?? defaultSignerClientCandidates(env);
   for (const candidate of candidates) {
     if (await exists(candidate)) return candidate;
@@ -2319,12 +2330,23 @@ function defaultHostAppCandidates(env: NodeJS.ProcessEnv): string[] {
 async function isOwnerTrustedExecutable(
   path: string,
   getuid: (() => number) | undefined,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<boolean> {
   try {
     const info = await stat(path);
     if (!info.isFile()) return false;
     const uid = getuid?.();
-    return info.uid === 0 || (uid !== undefined && info.uid === uid);
+    const trusted = new Set<number>([0]);
+    if (uid !== undefined) {
+      trusted.add(uid);
+      if (uid === 0 && env.SUDO_UID !== undefined && /^\d+$/.test(env.SUDO_UID)) {
+        const sudoUid = Number(env.SUDO_UID);
+        if (Number.isSafeInteger(sudoUid) && sudoUid > 0) {
+          trusted.add(sudoUid);
+        }
+      }
+    }
+    return trusted.has(info.uid);
   } catch {
     return false;
   }
@@ -2344,7 +2366,7 @@ async function resolveHostAppBinary(
   const getuid = ctx.getuid ?? process.getuid?.bind(process);
   const override = env.SANCTUARY_CASTLE_HOSTAPP;
   if (override) {
-    if (await isOwnerTrustedExecutable(override, getuid)) {
+    if (await isOwnerTrustedExecutable(override, getuid, env)) {
       return { path: override };
     }
     return {
@@ -2353,7 +2375,7 @@ async function resolveHostAppBinary(
   }
   const candidates = ctx.hostAppCandidates ?? defaultHostAppCandidates(env);
   for (const candidate of candidates) {
-    if (await isOwnerTrustedExecutable(candidate, getuid)) {
+    if (await isOwnerTrustedExecutable(candidate, getuid, env)) {
       return { path: candidate };
     }
   }

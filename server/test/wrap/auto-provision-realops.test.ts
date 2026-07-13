@@ -49,7 +49,14 @@ import {
   hermesEndpointProbes,
   allHermesCredentialDestPaths,
   resolveWallFortressPath,
+  resolveHarnessDaemonLogDir,
+  hermesRuntimeRehomePaths,
+  moveAsideStaleHermesRuntimeDestination,
   policyDaemonInstallBootArgs,
+  resolvePolicyDaemonActionForAutoProvision,
+  runLaunchctlWithTimeout,
+  LAUNCHCTL_TIMEOUT_MS,
+  LAUNCHCTL_KILL_SIGNAL,
 } from "../../src/wrap/auto-provision.js";
 import {
   planRehome,
@@ -699,6 +706,48 @@ describe("wrap/auto-provision real-ops chokepoint: realRehomeOps().restore confl
   });
 });
 
+describe("wrap/auto-provision real-ops chokepoint: stale Hermes runtime retry cleanup", () => {
+  it("moves a stale non-secret Hermes runtime destination aside when the operator source also exists", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-stale-hermes-runtime-"));
+    try {
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const { sourcePath, destPath } = hermesRuntimeRehomePaths(operatorHome, accountHome);
+      await mkdir(sourcePath, { recursive: true });
+      await mkdir(destPath, { recursive: true });
+      await writeFile(join(sourcePath, "source.txt"), "operator-runtime");
+      await writeFile(join(destPath, "stale.txt"), "stale-runtime");
+
+      const conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome);
+
+      expect(conflictPath).toBe(`${destPath}.restored-conflict`);
+      await expect(access(destPath)).rejects.toThrow();
+      expect(await readFile(join(sourcePath, "source.txt"), "utf8")).toBe("operator-runtime");
+      expect(await readFile(join(conflictPath!, "stale.txt"), "utf8")).toBe("stale-runtime");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does nothing when the operator Hermes runtime source is absent", async () => {
+    const tmpRoot = await mkdtemp(join(tmpdir(), "sanctuary-stale-hermes-runtime-"));
+    try {
+      const operatorHome = join(tmpRoot, "operator");
+      const accountHome = join(tmpRoot, "account");
+      const { destPath } = hermesRuntimeRehomePaths(operatorHome, accountHome);
+      await mkdir(destPath, { recursive: true });
+      await writeFile(join(destPath, "stale.txt"), "stale-runtime");
+
+      const conflictPath = await moveAsideStaleHermesRuntimeDestination(operatorHome, accountHome);
+
+      expect(conflictPath).toBeUndefined();
+      expect(await readFile(join(destPath, "stale.txt"), "utf8")).toBe("stale-runtime");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("wrap/auto-provision real-ops chokepoint: disarmExitCodeDecision (fix G1)", () => {
   it("code 0 -> undefined (success, no throw)", () => {
     expect(disarmExitCodeDecision(0)).toBeUndefined();
@@ -745,6 +794,20 @@ describe("wrap/auto-provision real-ops chokepoint: resolveWallFortressPath (Bug 
   });
 });
 
+describe("wrap/auto-provision real-ops chokepoint: resolveHarnessDaemonLogDir", () => {
+  it("anchors harness daemon logs under the dedicated account home, not the operator fortress", () => {
+    expect(resolveHarnessDaemonLogDir("/var/sanctuary-agents/sanctuary-hermes")).toBe(
+      "/var/sanctuary-agents/sanctuary-hermes/logs",
+    );
+  });
+
+  it("strips a trailing slash before appending logs", () => {
+    expect(resolveHarnessDaemonLogDir("/var/sanctuary-agents/sanctuary-hermes/")).toBe(
+      "/var/sanctuary-agents/sanctuary-hermes/logs",
+    );
+  });
+});
+
 describe("wrap/auto-provision real-ops chokepoint: policy daemon install-boot binary resolution", () => {
   it("passes the running CLI binary explicitly to install-boot so bundled installs do not rely on import.meta.url layout", () => {
     expect(policyDaemonInstallBootArgs("/Users/erik/.sanctuary", "/opt/sanctuary/dist/cli.js")).toEqual([
@@ -753,6 +816,71 @@ describe("wrap/auto-provision real-ops chokepoint: policy daemon install-boot bi
       "--binary",
       "/opt/sanctuary/dist/cli.js",
     ]);
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: policy daemon action wiring", () => {
+  it("does not noop for a reachable socket when launchd is loaded for a different fortress (Bug E)", () => {
+    const action = resolvePolicyDaemonActionForAutoProvision({
+      socketReachable: true,
+      diskForThisFortress: true,
+      readyForThisFortress: false,
+      plistPresent: true,
+      loadedState: { loaded: true, fortressPath: "/Users/other/.sanctuary" },
+      fortressPath: "/Users/operator/.sanctuary",
+    });
+
+    expect(action).toBe("refuse-conflict");
+  });
+
+  it("noops only for the same-fortress loaded service plus reachable socket when the stable-pid sample missed", () => {
+    const action = resolvePolicyDaemonActionForAutoProvision({
+      socketReachable: true,
+      diskForThisFortress: true,
+      readyForThisFortress: false,
+      plistPresent: true,
+      loadedState: { loaded: true, fortressPath: "/Users/operator/.sanctuary" },
+      fortressPath: "/Users/operator/.sanctuary",
+    });
+
+    expect(action).toBe("noop");
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: bounded launchctl wrapper", () => {
+  it("passes timeout and SIGKILL to execFileAsync and maps a never-returning launchctl to failure", async () => {
+    let observed:
+      | { file: string; args: string[]; options: { timeout: number; killSignal: NodeJS.Signals } }
+      | undefined;
+    const neverReturningLaunchctl = async (
+      file: string,
+      args: string[],
+      options: { timeout: number; killSignal: NodeJS.Signals },
+    ): Promise<{ stdout: string; stderr: string }> => {
+      observed = { file, args, options };
+      const error = new Error("spawn /bin/launchctl ETIMEDOUT") as Error & {
+        code: string;
+        stdout: string;
+        stderr: string;
+      };
+      error.code = "ETIMEDOUT";
+      error.stdout = "";
+      error.stderr = "";
+      throw error;
+    };
+
+    const result = await runLaunchctlWithTimeout(
+      ["bootout", "system/ai.sanctuaryprotocol.agent-harness"],
+      neverReturningLaunchctl,
+    );
+
+    expect(observed).toEqual({
+      file: "/bin/launchctl",
+      args: ["bootout", "system/ai.sanctuaryprotocol.agent-harness"],
+      options: { timeout: LAUNCHCTL_TIMEOUT_MS, killSignal: LAUNCHCTL_KILL_SIGNAL },
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain("ETIMEDOUT");
   });
 });
 

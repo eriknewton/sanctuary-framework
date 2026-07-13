@@ -293,6 +293,8 @@ export interface RestoreRehomeResult {
  *
  * FIX F3: after a successful restore of a secret entry, custody is handed
  * back to the operator (chmod 0600/0700 + chown to `operatorUidGid`).
+ * Non-secret runtime trees are chowned back without chmod normalization, so
+ * executable bits and virtualenv layout survive rollback.
  *
  * Fail-loud per step, never throws: every step is attempted (a failure on
  * one path must not stop the rest of the operator's secrets from being
@@ -345,6 +347,12 @@ export async function restoreRehomeSteps(
             } catch (custodyErr) {
               custodyError = (custodyErr as Error).message;
             }
+          } else {
+            try {
+              await ops.chown(conflictPath, operatorUidGid.uid, operatorUidGid.gid);
+            } catch (custodyErr) {
+              custodyError = (custodyErr as Error).message;
+            }
           }
           steps.push({
             entry: result.entry,
@@ -369,6 +377,8 @@ export async function restoreRehomeSteps(
       }
       if (result.entry.isSecret) {
         await ops.restoreCustody(result.entry.sourcePath, operatorUidGid.uid, operatorUidGid.gid);
+      } else {
+        await ops.chown(result.entry.sourcePath, operatorUidGid.uid, operatorUidGid.gid);
       }
       steps.push({ entry: result.entry, sourcePath: result.entry.sourcePath, status: "restored" });
     } catch (err) {
@@ -395,6 +405,8 @@ export async function restoreRehomeSteps(
  * secrets in 0600 files, never the login keychain:
  *   - `~/.hermes/.env`, `~/.hermes/auth.json`, `~/.hermes/config.yaml`
  *     (LLM / Telegram / persona config -- secrets)
+ *   - `~/.hermes/hermes-agent/` (runtime code; not a secret, but the confined
+ *     LaunchDaemon needs it under the dedicated account to import `hermes_cli`)
  *   - `~/.google_workspace_mcp/credentials` (file-based Google OAuth -- secret)
  *   - `~/.workspace-mcp/cli-tokens/mcp-oauth-token*` (secret)
  *   - `~/.hermes/google-mcp-creds/` (secret)
@@ -411,6 +423,11 @@ export const hermesRehomeAdapter: AgentRehomeAdapter = {
       { sourcePath: join(".hermes", ".env"), destRelativePath: ".hermes/.env", isSecret: true },
       { sourcePath: join(".hermes", "auth.json"), destRelativePath: ".hermes/auth.json", isSecret: true },
       { sourcePath: join(".hermes", "config.yaml"), destRelativePath: ".hermes/config.yaml", isSecret: true },
+      {
+        sourcePath: join(".hermes", "hermes-agent"),
+        destRelativePath: ".hermes/hermes-agent",
+        isSecret: false,
+      },
       {
         sourcePath: join(".google_workspace_mcp", "credentials"),
         destRelativePath: ".google_workspace_mcp/credentials",
