@@ -52,7 +52,10 @@ final class ExtensionDispatcherTests: XCTestCase {
             destinationPort: port,
             networkProtocol: .tcp,
             hostnameSource: host != nil ? "sni" : nil,
-            opaqueDestination: host == nil
+            opaqueDestination: host == nil,
+            // Attributed agent flow: these fixtures exercise the allowlist
+            // allow-path, not the #905 unattributed fail-closed suppression.
+            sourceUnattributed: false
         )
     }
 
