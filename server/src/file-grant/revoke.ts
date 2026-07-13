@@ -111,6 +111,7 @@ export async function revokeFileGrant(
         grant_id: grantId,
         already_revoked: alreadyRevoked,
         reason: "acl_removal_failed",
+        retryable: true,
         tree_entry_removed: removeResult.treeEntryRemoved,
         acl_removal: removeResult.aclRemoval,
       },

@@ -70,6 +70,11 @@ const TREE_ROOT_MODE = 0o711;
 const AGENT_SUBDIR_MODE = 0o700;
 export const FILE_GRANT_ACL_COMMAND_TIMEOUT_MS = 2_000;
 const EXEC_MAX_BUFFER_BYTES = 64 * 1024;
+const FILE_GRANT_PIN_SOURCE_OPEN_FLAGS =
+  fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
+const POSIX_MODE_TYPE_MASK = 0o170000;
+const POSIX_MODE_TYPE_REGULAR = 0o100000;
+const POSIX_MODE_TYPE_DIRECTORY = 0o040000;
 
 export interface FileGrantExecCommand {
   file: string;
@@ -85,9 +90,18 @@ export interface FileGrantExecRunner {
   execFile(command: FileGrantExecCommand, timeoutMs: number): Promise<FileGrantExecResult>;
 }
 
+export interface FileGrantOpenedFileStats {
+  dev: bigint | number;
+  ino: bigint | number;
+  uid?: bigint | number;
+  mode?: bigint | number;
+  isFile?(): boolean;
+  isDirectory?(): boolean;
+}
+
 export interface FileGrantOpenedFile {
   readonly fd?: number;
-  stat(options: { bigint: true }): Promise<{ dev: bigint | number; ino: bigint | number; uid?: bigint | number }>;
+  stat(options: { bigint: true }): Promise<FileGrantOpenedFileStats>;
   close(): Promise<void>;
 }
 
@@ -312,6 +326,21 @@ function ownerUidFromStats(stats: { uid?: bigint | number }): number | null {
   return Number.isSafeInteger(uid) && uid >= 0 ? uid : null;
 }
 
+function sourceKindFromStats(stats: FileGrantOpenedFileStats): "regular_file" | "directory" | "special" | "unknown" {
+  if (typeof stats.isFile === "function" && stats.isFile()) return "regular_file";
+  if (typeof stats.isDirectory === "function" && stats.isDirectory()) return "directory";
+  if (stats.mode === undefined) return "unknown";
+  const modeType = Number(stats.mode) & POSIX_MODE_TYPE_MASK;
+  if (modeType === POSIX_MODE_TYPE_REGULAR) return "regular_file";
+  if (modeType === POSIX_MODE_TYPE_DIRECTORY) return "directory";
+  return "special";
+}
+
+function isSupportedPinnedSource(stats: FileGrantOpenedFileStats): boolean {
+  const sourceKind = sourceKindFromStats(stats);
+  return sourceKind === "regular_file" || sourceKind === "directory";
+}
+
 function sameSourceIdentity(
   left: FileGrantSourceIdentity,
   right: FileGrantSourceIdentity
@@ -337,6 +366,23 @@ function hasPersistedSourceIdentity(
   ace: FileGrantGrantedReadAce
 ): ace is FileGrantGrantedReadAce & FileGrantSourceIdentity {
   return typeof ace.source_dev === "string" && typeof ace.source_ino === "string";
+}
+
+function shouldKeepTreeEntryUntilConfirmedAclRemoval(
+  grantedReadAce: FileGrantGrantedReadAce | null | undefined,
+  aclRemoval: FileGrantRemoveEntryResult["aclRemoval"]
+): boolean {
+  return grantedReadAce?.platform === "darwin" && aclRemoval.status !== "removed";
+}
+
+function didScrubConfirmedAclTarget(
+  grantedReadAce: FileGrantGrantedReadAce | null | undefined,
+  aclRemoval: FileGrantRemoveEntryResult["aclRemoval"]
+): boolean {
+  if (grantedReadAce?.platform === "darwin") {
+    return aclRemoval.status === "removed";
+  }
+  return aclRemoval.status !== "failed";
 }
 
 async function closeBestEffort(handle: { close(): Promise<void> }): Promise<void> {
@@ -397,11 +443,17 @@ export class PosixFileGrantFsOps implements FsOps {
   }
 
   async pinSource(canonicalPath: string): Promise<FileGrantPinnedSource> {
-    const handle = await fsOpen(canonicalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const handle = await fsOpen(canonicalPath, FILE_GRANT_PIN_SOURCE_OPEN_FLAGS);
     let closed = false;
-    let stats: { dev: bigint | number; ino: bigint | number; uid?: bigint | number };
+    let stats: FileGrantOpenedFileStats;
     try {
       stats = await handle.stat({ bigint: true });
+      if (!isSupportedPinnedSource(stats)) {
+        throw new Error(
+          `Governed File-Grant: source "${canonicalPath}" is ${sourceKindFromStats(stats)}, ` +
+            `not a regular file or directory; refusing to grant a special file.`
+        );
+      }
     } catch (err) {
       await closeBestEffort(handle);
       throw err;
@@ -478,7 +530,15 @@ export class PosixFileGrantFsOps implements FsOps {
     options: FileGrantRemoveEntryOptions = {}
   ): Promise<FileGrantRemoveEntryResult> {
     const dest = this.resolveUnderRoot(relativeTreeEntry);
-    const aclRemoval = await this.removePersistedAgentReadAcl(options.grantedReadAce, dest);
+    const grantedReadAce = options.grantedReadAce ?? null;
+    const aclRemoval = await this.removePersistedAgentReadAcl(grantedReadAce, dest);
+    if (shouldKeepTreeEntryUntilConfirmedAclRemoval(grantedReadAce, aclRemoval)) {
+      return {
+        treeEntryRemoved: false,
+        aclRemoval,
+        scrubbed: false,
+      };
+    }
     let treeEntryRemoved = false;
     try {
       const st = await lstat(dest);
@@ -491,7 +551,7 @@ export class PosixFileGrantFsOps implements FsOps {
         return {
           treeEntryRemoved,
           aclRemoval,
-          scrubbed: aclRemoval.status !== "failed",
+          scrubbed: didScrubConfirmedAclTarget(grantedReadAce, aclRemoval),
         };
       }
       throw err;
@@ -499,7 +559,7 @@ export class PosixFileGrantFsOps implements FsOps {
     return {
       treeEntryRemoved,
       aclRemoval,
-      scrubbed: aclRemoval.status !== "failed",
+      scrubbed: didScrubConfirmedAclTarget(grantedReadAce, aclRemoval),
     };
   }
 
@@ -815,11 +875,11 @@ export class PosixFileGrantFsOps implements FsOps {
     } catch (err) {
       if (isMissingPathError(err)) {
         return {
-          status: "removed",
+          status: "failed",
           agent_uid: grantedReadAce.agent_uid,
           platform: grantedReadAce.platform,
           source_realpath: grantedReadAce.source_realpath,
-          reason: "trusted macOS ACL hard link already absent",
+          reason: "trusted macOS ACL hard link absent; cannot confirm ACE removal",
         };
       }
       return {

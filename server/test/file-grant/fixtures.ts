@@ -279,11 +279,18 @@ export class FakeFsOps implements FsOps {
       }
     }
     if (this.opts.removeThrows) throw this.opts.removeThrows;
+    if (ace?.platform === "darwin" && aclRemoval.status !== "removed") {
+      return {
+        treeEntryRemoved: false,
+        aclRemoval,
+        scrubbed: false,
+      };
+    }
     this.scrubbed.push(relativeTreeEntry);
     return {
       treeEntryRemoved: true,
       aclRemoval,
-      scrubbed: aclRemoval.status !== "failed",
+      scrubbed: ace?.platform === "darwin" ? aclRemoval.status === "removed" : aclRemoval.status !== "failed",
     };
   }
 

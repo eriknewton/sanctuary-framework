@@ -15,11 +15,30 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { execFile as nodeExecFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { PosixFileGrantFsOps } from "../../src/file-grant/fs-ops.js";
+import { mintFileGrant } from "../../src/file-grant/mint.js";
+import {
+  PosixFileGrantFsOps,
+  type FileGrantExecCommand,
+  type FileGrantMacAclLinkOps,
+} from "../../src/file-grant/fs-ops.js";
+import { makeFileGrantTestStore } from "./fixtures.js";
+
+function execFile(file: string, args: string[]): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    nodeExecFile(file, args, (error) => {
+      if (error) {
+        rejectPromise(error);
+        return;
+      }
+      resolvePromise();
+    });
+  });
+}
 
 describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
   let fortressDir: string;
@@ -165,5 +184,64 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     const canonical = await fsOps.realpath(source);
 
     await expect(fsOps.place(canonical, "agent-1/fg_fatal")).rejects.toThrow();
+  });
+
+  it("mint refuses a FIFO before any hard link, ACE, probe, or grant record", async () => {
+    if (process.platform === "win32" || process.getuid === undefined) return;
+
+    const originDir = join(fortressDir, "policy", "egress");
+    await mkdir(originDir, { recursive: true });
+    await writeFile(
+      join(originDir, "agent-origin.json"),
+      JSON.stringify({
+        mode: "uid",
+        agent_uid: process.getuid() + 1,
+        system_uid_allow_ceiling: 1,
+      })
+    );
+
+    const fifo = join(sourceDir, "source.fifo");
+    await execFile("mkfifo", [fifo]);
+    const commands: FileGrantExecCommand[] = [];
+    const hardLinks: Array<{ existingPath: string; newPath: string }> = [];
+    const macAclLinkOps: FileGrantMacAclLinkOps = {
+      link: async (existingPath, newPath) => {
+        hardLinks.push({ existingPath, newPath });
+      },
+      open: async () => {
+        throw new Error("unexpected macOS ACL hard-link open");
+      },
+      rm: async () => {},
+    };
+    const fsOps = new PosixFileGrantFsOps(fortressDir, {
+      platform: "darwin",
+      macAclLinkOps,
+      execRunner: {
+        execFile: async (command) => {
+          commands.push(command);
+          if (command.file === "id") return { stdout: "agentuser\n", stderr: "" };
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+    const { grantStore } = makeFileGrantTestStore();
+
+    await expect(
+      mintFileGrant(
+        {
+          subjectAgentId: "agent-1",
+          scope: { kind: "file", path: fifo },
+          mode: "read",
+          ttlSeconds: 3600,
+          createdBy: "operator-1",
+        },
+        { fsOps, store: grantStore, now: new Date("2026-07-13T00:00:00.000Z") }
+      )
+    ).rejects.toThrow(/not a regular file or directory/);
+
+    expect(await grantStore.list()).toHaveLength(0);
+    expect(commands).toHaveLength(0);
+    expect(hardLinks).toHaveLength(0);
+    await expect(stat(join(fortressDir, "grants"))).rejects.toThrow();
   });
 });
