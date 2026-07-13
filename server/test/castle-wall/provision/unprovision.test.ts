@@ -59,6 +59,9 @@ describe("castle-wall/provision/unprovision", () => {
       uninstallHarnessDaemon: async () => {
         callOrder.push("uninstall-daemon");
       },
+      scrubProvisionedEgressRules: async () => {
+        callOrder.push("scrub-egress-rules");
+      },
     };
     const rehomeOps = mockRehomeOps();
 
@@ -69,12 +72,12 @@ describe("castle-wall/provision/unprovision", () => {
       operatorUidGid: OPERATOR_UID_GID,
     });
 
-    expect(callOrder).toEqual(["disarm", "uninstall-daemon"]);
+    expect(callOrder).toEqual(["disarm", "uninstall-daemon", "scrub-egress-rules"]);
     // FIX F2: restore is now a REVERSE-MOVE from destPath (where the data
     // actually is), not the shallow backupPath.
     expect(rehomeOps.restores).toEqual(["/var/sanctuary-agents/sanctuary-hermes/.hermes/.env"]);
     expect(unprovisionFullyOk(outcomes)).toBe(true);
-    expect(outcomes.map((o) => o.step)).toEqual(["disarm", "uninstall-daemon", "restore-rehome"]);
+    expect(outcomes.map((o) => o.step)).toEqual(["disarm", "uninstall-daemon", "scrub-egress-rules", "restore-rehome"]);
     // Fix F3: custody handed back to the operator for the restored secret.
     expect(rehomeOps.restoreCustodyCalls).toEqual([
       { path: "/Users/operator/.hermes/.env", uid: OPERATOR_UID_GID.uid, gid: OPERATOR_UID_GID.gid },
@@ -87,6 +90,7 @@ describe("castle-wall/provision/unprovision", () => {
         throw new Error("disarm socket unreachable");
       },
       uninstallHarnessDaemon: async () => undefined,
+      scrubProvisionedEgressRules: async () => undefined,
     };
     const rehomeOps = mockRehomeOps();
 
@@ -112,6 +116,7 @@ describe("castle-wall/provision/unprovision", () => {
     const unprovisionOps: UnprovisionOps = {
       disarm: async () => undefined,
       uninstallHarnessDaemon: async () => undefined,
+      scrubProvisionedEgressRules: async () => undefined,
     };
     const rehomeOps = mockRehomeOps({
       restore: async () => {
@@ -136,6 +141,7 @@ describe("castle-wall/provision/unprovision", () => {
     const unprovisionOps: UnprovisionOps = {
       disarm: async () => undefined,
       uninstallHarnessDaemon: async () => undefined,
+      scrubProvisionedEgressRules: async () => undefined,
     };
     const rehomeOps = mockRehomeOps({
       restore: async () => ({ restored: false }),
@@ -152,6 +158,32 @@ describe("castle-wall/provision/unprovision", () => {
     const restoreOutcome = outcomes.find((o) => o.step === "restore-rehome");
     expect(restoreOutcome?.ok).toBe(false);
     expect(restoreOutcome?.error).toMatch(/\/Users\/operator\/\.hermes\/\.env/);
+  });
+
+  it("confined-agent egress (design section 6): a FAILED egress-rule scrub is reported fail-loud on its own step, and later steps still run", async () => {
+    const unprovisionOps: UnprovisionOps = {
+      disarm: async () => undefined,
+      uninstallHarnessDaemon: async () => undefined,
+      scrubProvisionedEgressRules: async () => {
+        throw new Error("egress rule scrub left 1 provisioned rule file(s) behind: provisioned-hermes-abc.json");
+      },
+    };
+    const rehomeOps = mockRehomeOps();
+
+    const outcomes = await unprovision({
+      rehomeResults: SAMPLE_RESULTS,
+      rehomeOps,
+      unprovisionOps,
+      operatorUidGid: OPERATOR_UID_GID,
+    });
+
+    expect(unprovisionFullyOk(outcomes)).toBe(false);
+    const scrubOutcome = outcomes.find((o) => o.step === "scrub-egress-rules");
+    expect(scrubOutcome?.ok).toBe(false);
+    expect(scrubOutcome?.error).toMatch(/provisioned-hermes-abc\.json/);
+    // The restore still ran (fail-loud, not fail-stop).
+    const restoreOutcome = outcomes.find((o) => o.step === "restore-rehome");
+    expect(restoreOutcome?.ok).toBe(true);
   });
 
   it("H2-b guard: this module exposes no account-deletion function (account removal is a separate, out-of-scope PR)", async () => {

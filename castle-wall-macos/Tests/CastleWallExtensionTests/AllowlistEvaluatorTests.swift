@@ -529,6 +529,96 @@ final class AllowlistEvaluatorTests: XCTestCase {
         XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
     }
 
+    // MARK: - HIGH-1 hardening (confined-agent egress design 2026-07-10):
+    // in UID mode, `.unattributed` NEVER earns an allow-disposition match.
+    // The egress provisioning build publishes UNSCOPED agent allow rules;
+    // without this clause every audit-token decode failure would inherit
+    // those grants (fail-closed bucket inverted to fail-open). This is the
+    // drill's Leg-1 check-3 control, proven here at the unit level.
+
+    func testHigh1_uidMode_unattributedNeverEarnsAllowMatch() {
+        // An UNSCOPED allow rule that MATCHES the flow's host: the exact
+        // shape the egress provisioning publishes. Before the hardening this
+        // evaluated .allow("r-1") for an unattributed flow.
+        let r = rule(host: .single("api.anthropic.com"), disposition: "allow")
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 0, unattributed: true),
+            rules: [r],
+            agentOrigin: uidOrigin()
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
+    }
+
+    func testHigh1_uidMode_agentStillEarnsTheSameAllowMatch() {
+        // Control: the SAME rule set still grants the positively-classified
+        // agent flow (the hardening suppresses allows for `.unattributed`
+        // only, never for `.agent`).
+        let r = rule(host: .single("api.anthropic.com"), disposition: "allow")
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 600),
+            rules: [r],
+            agentOrigin: uidOrigin()
+        )
+        XCTAssertEqual(outcome, .allow(matchedRuleId: "r-1"))
+    }
+
+    func testHigh1_uidMode_unattributedDenyRulesStillApply() {
+        // Deny rules keep applying to the fail-closed bucket (the hardening
+        // removes a benefit, never a restriction).
+        let r = rule(host: .single("api.anthropic.com"), disposition: "deny")
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 0, unattributed: true),
+            rules: [r],
+            agentOrigin: uidOrigin()
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: "r-1"))
+    }
+
+    func testHigh1_uidMode_unattributedPromptRulesStillSurface() {
+        // Prompt rules keep surfacing for an operator decision (a human
+        // gate, not a silent allow).
+        let r = rule(host: .single("api.anthropic.com"), disposition: "prompt")
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 0, unattributed: true),
+            rules: [r],
+            agentOrigin: uidOrigin()
+        )
+        XCTAssertEqual(outcome, .uncertain)
+    }
+
+    func testHigh1_natMode_unattributedKeepsExistingSemantics() {
+        // A POSITIVELY-resolved NAT mode is the ONLY case that keeps the allow
+        // for an `.unattributed` flow: NAT-mode unattributed flows are common
+        // unsigned operator-software, and the documented NAT rationale keeps
+        // their existing rule-loop semantics. Every non-NAT case (uid mode AND
+        // nil descriptor) suppresses.
+        let r = rule(host: .single("api.anthropic.com"), disposition: "allow")
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 0, unattributed: true),
+            rules: [r],
+            agentOrigin: natOrigin()
+        )
+        XCTAssertEqual(outcome, .allow(matchedRuleId: "r-1"))
+    }
+
+    func testHigh1_noDescriptor_unattributedSuppressesAllowFailClosed() {
+        // PR-905-review BLOCKER: a NIL descriptor is REACHABLE -- provisioned
+        // allow rules go live (store.update) before the origin descriptor
+        // installs, so on every boot / manifest apply there is a window with
+        // rules live and `_agentOrigin == nil`. An `.unattributed` flow in
+        // that window must NOT earn the provisioned allow; the fail-closed
+        // bucket stays closed. The `!= .nat` predicate suppresses here (nil is
+        // not positively NAT); the old `== .uid` predicate fail-OPENed on this
+        // exact case. Only a POSITIVELY-resolved NAT mode keeps the allow.
+        let r = rule(host: .single("api.anthropic.com"), disposition: "allow")
+        let outcome = AllowlistEvaluator.evaluate(
+            flow: originFlow(ruid: 0, unattributed: true),
+            rules: [r],
+            agentOrigin: nil
+        )
+        XCTAssertEqual(outcome, .drop(matchedRuleId: nil))
+    }
+
     // NAT mode
 
     func testNatMode_egressHelperIsAgentDenyUnlessAllowlisted() {

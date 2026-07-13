@@ -1197,6 +1197,19 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `The agent may be unreachable behind the wall. Run 'sudo sanctuary castle-wall disable' manually now, ` +
           `then investigate before re-running 'sanctuary protect --hermes'.`,
       ];
+    case "egress-unprovisioned-rolled-back":
+      // Confined-agent egress (design section 5): the wall armed but the
+      // post-arm AS-UID egress verification failed (an endpoint unreachable
+      // as the agent uid, or the negative control reachable), so the flow
+      // fast-disarmed and scrubbed the provisioned rules rather than leave a
+      // confined-into-silence agent or an unverified grant. Honest framing:
+      // the per-endpoint PASS/FAIL table was already printed by the flow.
+      return [
+        `  Note: Castle Wall armed, then was fast-disarmed because the as-agent-uid egress verification failed ` +
+          `(${outcome.reason}). The agent still runs under its dedicated, re-homed account; only enforcement came down` +
+          `${outcome.scrubbed ? " and the provisioned egress rules were scrubbed" : ""}. ` +
+          `Re-run 'sanctuary protect --hermes' once the per-endpoint failures above are resolved.`,
+      ];
     case "aborted":
       return abortedProvisionLines(outcome);
   }

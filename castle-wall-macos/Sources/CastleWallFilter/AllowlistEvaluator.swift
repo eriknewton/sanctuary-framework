@@ -61,9 +61,38 @@ public enum AllowlistEvaluator {
             return .allow(matchedRuleId: baselineRuleId(flow: flow, operatorBaseline: operatorBaseline))
         }
 
+        // HIGH-1 hardening (confined-agent egress design 2026-07-10,
+        // adversarial-review must-fix, then PR-905-review BLOCKER fix): when a
+        // flow is `.unattributed` it is the FAIL-CLOSED bucket and must NEVER
+        // earn an allow-disposition match, UNLESS we POSITIVELY know we are in
+        // NAT mode (where `.unattributed` flows are common unsigned
+        // operator-software and the documented NAT rationale keeps the allow).
+        // Publishing unscoped agent allow rules (the egress provisioning
+        // build) would otherwise invert this bucket to fail-OPEN for
+        // exfil-capable hosts -- any flow whose audit token fails to decode
+        // would inherit the agent's grants.
+        //
+        // The predicate is `agentOrigin?.mode != .nat`, NOT `== .uid`: the
+        // `== .uid` form failed OPEN when `agentOrigin == nil` (nil?.mode is
+        // nil, nil != .uid), and a nil descriptor is REACHABLE -- provisioned
+        // allow rules and the origin descriptor install non-atomically (the
+        // rules go live via `store.update` before `installAgentOriginIfPresent`
+        // runs), so on every manifest apply / recovery there is a window where
+        // allow rules are live while the engine's retained `_agentOrigin` is
+        // still nil (FlowEvaluatorEngine). The `!= .nat` form suppresses for
+        // the nil-descriptor AND uid-mode cases (both fail closed) and keeps
+        // the allow ONLY for a positively-resolved NAT mode. The install
+        // ordering is ALSO reordered (installAgentOriginIfPresent BEFORE
+        // store.update) to close the window structurally as defense in depth;
+        // this predicate is the invariant that holds regardless of ordering.
+        // Deny rules keep applying and prompt rules keep surfacing for
+        // operator decision; the bucket simply stops benefiting from allows.
+        // No wire or schema change.
+        let suppressAllowMatches = origin == .unattributed && agentOrigin?.mode != .nat
+
         // `.agent` and `.unattributed` route to the unchanged default-deny +
         // allowlist evaluation. Default-deny on no match is preserved.
-        return evaluate(flow: flow, rules: rules)
+        return evaluate(flow: flow, rules: rules, suppressAllowMatches: suppressAllowMatches)
     }
 
     static func baselineRuleId(
@@ -97,9 +126,16 @@ public enum AllowlistEvaluator {
     }
 
     /// Evaluate a flow against the current manifest snapshot.
+    ///
+    /// `suppressAllowMatches` (HIGH-1 hardening, default `false` so every
+    /// existing caller is unchanged): when `true`, allow-disposition rules
+    /// never match-through -- deny rules keep applying, prompt rules keep
+    /// surfacing, and the default-deny floor is preserved. Set ONLY for
+    /// uid-mode `.unattributed` flows by the origin-gated overload above.
     public static func evaluate(
         flow: FilterFlowDescriptor,
-        rules: [ManifestRule]
+        rules: [ManifestRule],
+        suppressAllowMatches: Bool = false
     ) -> EvaluationOutcome {
         var firstAllow: ManifestRule?
         var firstPrompt: ManifestRule?
@@ -109,7 +145,7 @@ public enum AllowlistEvaluator {
             case "deny":
                 return .drop(matchedRuleId: rule.id)
             case "allow":
-                if firstAllow == nil { firstAllow = rule }
+                if !suppressAllowMatches, firstAllow == nil { firstAllow = rule }
             case "prompt":
                 if firstPrompt == nil { firstPrompt = rule }
             default:
