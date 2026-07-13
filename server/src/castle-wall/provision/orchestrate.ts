@@ -52,6 +52,14 @@ export interface ProvisionFlowContext {
   isTty: boolean;
   /** Pre-answers the CHOICE only (fix L2): still confirms on a TTY, still plan-and-prints. */
   preAnsweredProvision?: boolean;
+  /**
+   * Bug B (one-flow gap): absolute fortress path whose Castle Wall POLICY daemon
+   * the flow must ensure is reachable BEFORE arming. Passed to
+   * `ops.ensurePolicyDaemon`, and `ops.arm`/`ops.disarm` target the SAME fortress
+   * (the CLI threads it through `--fortress`), so a non-default fortress is never
+   * probed at the default socket.
+   */
+  fortressPath: string;
 }
 
 /** The injected, side-effecting steps. Each corresponds to one stage of the target flow. */
@@ -97,6 +105,50 @@ export interface ProvisionFlowOps {
    * the shipped `uninstallAgentHarnessDaemon` teardown semantics).
    */
   uninstallHarnessDaemon(): Promise<void>;
+  /**
+   * Bug B (the one-flow gap): ensure a reachable Castle Wall POLICY daemon
+   * exists for `fortressPath` BEFORE arming. Arming with no policy daemon
+   * fail-closes the machine to deny-all (the exact lockout the arm's own probe
+   * refuses), so on a box with no wall for this fortress the flow must stand one
+   * up first. Returns a discriminated result (mirroring `installHarnessDaemon`)
+   * rather than throwing, so the abort/teardown decision keys on ONE honest
+   * signal:
+   *   - ok:true, freshlyInstalled:false -> a daemon was ALREADY reachable, or a
+   *     PRE-EXISTING boot service for this fortress was (re)started. There is
+   *     nothing for THIS flow to tear down on a later abort.
+   *   - ok:true, freshlyInstalled:true  -> THIS run stood up the singleton boot
+   *     service from nothing (no wall existed for any fortress). A later abort
+   *     MUST tear it back down (via `teardownPolicyDaemon`), restoring the prior
+   *     "no wall" state.
+   *   - ok:false                        -> could not ensure a reachable policy
+   *     daemon (a DIFFERENT-fortress boot service refuses to swap -- one machine
+   *     runs one wall; or an install/restart whose socket never became
+   *     reachable). The flow aborts + rolls back prior steps. `freshlyInstalled`
+   *     still reports whether this attempt left a fresh boot service live that
+   *     the abort must tear down (fail toward removing anything this run stood
+   *     up, never toward stranding it).
+   *
+   * This op ONLY ensures the policy daemon: it MUST NOT turn on the content
+   * filter (arm stays a separate, still-fail-closed step) and MUST NEVER leave
+   * the box in a filter-on / daemon-down (lockout) state.
+   */
+  ensurePolicyDaemon(
+    fortressPath: string,
+  ): Promise<
+    | { ok: true; freshlyInstalled: boolean }
+    | { ok: false; error: string; freshlyInstalled: boolean }
+  >;
+  /**
+   * Tear the FRESHLY-INSTALLED singleton Castle Wall boot (policy) service back
+   * down (bootout + remove the plist), used ONLY on an abort after
+   * `ensurePolicyDaemon` reported `freshlyInstalled:true`. Restores the prior
+   * "no wall for this machine" state. Idempotent + fail-loud (mirrors
+   * `uninstallHarnessDaemon`). NEVER called for a pre-existing boot service --
+   * we only fresh-install when no prior boot service existed, so tearing down to
+   * "no wall" is correct, and there is deliberately no swap-restore because we
+   * REFUSE to swap.
+   */
+  teardownPolicyDaemon(): Promise<void>;
   /** Endpoints to probe before arming (LLM / Telegram / Gmail, etc). */
   preArmEndpoints(): EndpointProbeTarget[];
   /** Hard existence + uid-match check immediately before arming (fix H1). */
@@ -105,8 +157,28 @@ export interface ProvisionFlowOps {
   arm(uid: number, ceiling: number): Promise<{ ok: true } | { ok: false; error: string }>;
   /** Endpoints to re-probe after arming (same list, post-arm). */
   postArmEndpoints(): EndpointProbeTarget[];
-  /** Fast disarm, used only when the post-arm re-check fails (fix B2 rollback). */
-  disarm(): Promise<void>;
+  /**
+   * Disarm the content filter (the unconditional dead-man `castle-wall
+   * disable`). Used by the post-arm re-check rollback (fix B2) AND, Bug B P1, by
+   * the arm-abort branch's disarm-first ordering before tearing a
+   * freshly-installed policy daemon down.
+   *
+   * THROWS when the disarm hard-fails (the dead-man lever itself failed).
+   * On success (no throw) it returns `neConfirmedOff`:
+   *   - `true`  -> the NE preference was AFFIRMATIVELY saved OFF (confirmed, or
+   *     saved-disabled with only inconclusive corroboration -- the save is
+   *     authoritative). Safe to remove a freshly-installed policy daemon.
+   *   - `false` -> the disable did NOT confirm the NE preference is off (the
+   *     fail-open-after-lease-revoke sub-case: the provider is fail-OPEN now, so
+   *     it is NOT enforcing, but the NE preference may STILL be enabled and a
+   *     reboot could come up enabled with no daemon = deny-all). Must be treated
+   *     exactly like a disarm that could not confirm: leave the daemon UP.
+   *
+   * IMPORTANT: a non-throwing disarm guarantees the filter is NOT ENFORCING
+   * right now; it does NOT by itself guarantee the NE preference is off -- that
+   * is exactly what `neConfirmedOff` distinguishes.
+   */
+  disarm(): Promise<{ neConfirmedOff: boolean }>;
   /**
    * Restore re-home from backup, used on a fail-closed abort between create
    * and arm. FIX F2/F5 (2026-07-07 fix-round): returns whether the restore
@@ -218,6 +290,21 @@ export type ProvisionFlowOutcome =
        * occurred -- a conflict never masks a real failure.
        */
       failedPaths?: string[];
+      /**
+       * Bug B P0 (disarm-first): true ONLY on an ARM-stage abort where a policy
+       * daemon was freshly installed this run AND `ops.disarm()` could NOT
+       * confirm the content filter is off. `arm` returning ok:false does NOT
+       * imply the filter is off -- on macOS Tahoe the host app can SAVE the NE
+       * config ENABLED then report non-zero because its post-change status
+       * corroboration timed out. Booting a FRESHLY-INSTALLED policy daemon out
+       * in that state would be filter-on + daemon-down = the exact deny-all
+       * lockout this feature prevents, so the freshly-installed policy daemon is
+       * deliberately LEFT RUNNING (filter-on + daemon-up is enforcing and
+       * RECOVERABLE). The CLI renderer keys a LOUD "the wall may still be armed;
+       * run 'sanctuary castle-wall disable'" frame on this and NEVER softens it
+       * into a clean "rolled back; re-run" line (the honesty gap the P0 flagged).
+       */
+      wallMayBeArmed?: boolean;
     }
   | { kind: "armed-then-rolled-back"; uid: number; reason: string }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string };
@@ -386,16 +473,18 @@ export async function runProvisionFlow(
     // signal (never the `!alreadyDedicated` heuristic, which does not track
     // daemon presence): a fresh daemon this attempt left live is removed; a
     // genuinely pre-existing daemon (R6-3) is preserved.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, !install.daemonPreexisted);
+    // This abort fires BEFORE the ensure-policy-daemon step (step 6.5), so no
+    // policy daemon was touched this run -- never tear one down here.
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, !install.daemonPreexisted, false);
     return {
       kind: "aborted",
       stage: "install-daemon",
-      reason: withDaemonTeardownNote(install.error, td.daemonTeardownError),
+      reason: withDaemonTeardownNote(install.error, td.daemonTeardownError, td.policyDaemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
-      daemonTeardownFailed: td.daemonTeardownError !== undefined,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
@@ -405,6 +494,53 @@ export async function runProvisionFlow(
   // `alreadyDedicated`, which does not track daemon presence).
   const daemonBootstrappedThisRun = install.bootstrappedThisRun;
   ops.print("Harness daemon installed; agent now runs under the dedicated account.");
+
+  // Step 6.5 (Bug B, the one-flow gap): ensure a reachable Castle Wall POLICY
+  // daemon for the target fortress BEFORE arming. Arming with no policy daemon
+  // deny-all-locks the box (filter on + daemon down); the arm's own probe
+  // refuses in that state, so on a box with no wall for this fortress the whole
+  // flow would otherwise roll back. Stand the policy daemon up here (install a
+  // fresh singleton boot service on a box with no wall; (re)start a stopped one
+  // that already targets this fortress; REFUSE to swap a wall that belongs to a
+  // DIFFERENT fortress -- one machine runs one wall). This step NEVER arms the
+  // filter and NEVER leaves the box filter-on/daemon-down.
+  const ensure = await ops.ensurePolicyDaemon(ctx.fortressPath);
+  if (!ensure.ok) {
+    // Fail-closed: we never proceed to arm without a reachable policy daemon.
+    // The harness daemon is LIVE by now (step 6 succeeded); tear it down iff
+    // this run stood it up, tear down a FRESH policy daemon iff this attempt
+    // stood one up (a refuse-to-swap abort leaves the machine's existing wall
+    // untouched -- ensure.freshlyInstalled is false there), then restore the
+    // re-home.
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      daemonBootstrappedThisRun,
+      ensure.freshlyInstalled,
+    );
+    return {
+      kind: "aborted",
+      stage: "ensure-policy-daemon",
+      reason: withDaemonTeardownNote(ensure.error, td.daemonTeardownError, td.policyDaemonTeardownError),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      accountCreated,
+    };
+  }
+  // Only meaningful on the ok path: whether THIS run stood up the machine's wall
+  // from nothing. Every LATER abort branch below threads this into
+  // `teardownDaemonAndRestore` so a fresh install is torn back down while a
+  // pre-existing (or already-reachable) wall is left untouched.
+  const policyDaemonFreshlyInstalled = ensure.freshlyInstalled;
+  ops.print(
+    policyDaemonFreshlyInstalled
+      ? "Castle Wall policy daemon installed for this fortress; ready to arm."
+      : "Castle Wall policy daemon reachable for this fortress; ready to arm.",
+  );
 
   // Step 7: verify BEFORE arming (fix B2 ordering). FIX G5 (2026-07-07
   // re-gate 3): this proves DNS-resolvability + every moved credential
@@ -418,7 +554,12 @@ export async function runProvisionFlow(
     // succeeded above); tear it down before restoring the re-home so this
     // fail-closed abort does not leave the daemon running under the dedicated
     // account.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun);
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      daemonBootstrappedThisRun,
+      policyDaemonFreshlyInstalled,
+    );
     return {
       kind: "aborted",
       stage: "verify-before-arm",
@@ -431,12 +572,13 @@ export async function runProvisionFlow(
         `pre-arm check could not confirm DNS-resolvability + moved-credential readability for: ${unreachable.join(", ")}. ` +
           describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
         td.daemonTeardownError,
+        td.policyDaemonTeardownError,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
-      daemonTeardownFailed: td.daemonTeardownError !== undefined,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
@@ -446,17 +588,24 @@ export async function runProvisionFlow(
   // arming, hard-check the account still exists at exactly this uid.
   const existenceCheck = await ops.checkUidExistence(uid);
   if (!existenceCheck.ok) {
-    // FIX (round 5, item N3): daemon is live; tear it down on this abort.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun);
+    // FIX (round 5, item N3): daemon is live; tear it down on this abort. Bug B:
+    // also tear down a freshly-installed policy daemon (untouched if it
+    // pre-existed or was already reachable).
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      daemonBootstrappedThisRun,
+      policyDaemonFreshlyInstalled,
+    );
     return {
       kind: "aborted",
       stage: "uid-existence-gate",
-      reason: withDaemonTeardownNote(existenceCheck.reason, td.daemonTeardownError),
+      reason: withDaemonTeardownNote(existenceCheck.reason, td.daemonTeardownError, td.policyDaemonTeardownError),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
-      daemonTeardownFailed: td.daemonTeardownError !== undefined,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
@@ -465,19 +614,80 @@ export async function runProvisionFlow(
   // Step 9: arm via the shipped `enable --agent-uid=N --ceiling` (step 1).
   const armResult = await ops.arm(uid, ctx.ceiling);
   if (!armResult.ok) {
-    // FIX (round 5, item N3): arming failed but the daemon is live; tear it
-    // down on this abort (the wall never armed, so there is nothing to
-    // disarm -- only the daemon to remove).
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun);
+    // FIX (round 5, item N3): arming failed but the harness daemon is live;
+    // tear it down on this abort.
+    //
+    // Bug B P0/P1 (disarm-first ordering + confirmed-off teardown): `arm`
+    // returning ok:false does NOT imply the content filter is off. On macOS
+    // Tahoe the host app can SAVE the NE config ENABLED and THEN return non-zero
+    // because its own post-change status corroboration timed out (or a build-sha
+    // check tripped after the save) -- so the filter may be ON. Booting a
+    // FRESHLY-INSTALLED policy daemon out in that state is filter-on +
+    // daemon-down = the exact deny-all lockout (SSH included) this feature
+    // exists to prevent. So when a policy daemon was freshly installed this run,
+    // DISARM FIRST, and tear the daemon down ONLY when disarm AFFIRMATIVELY
+    // CONFIRMS the NE preference is off. Order is ALWAYS filter-off THEN
+    // daemon-down.
+    //
+    // P1 refinement: a non-throwing disarm guarantees the filter is not
+    // ENFORCING now, but NOT that the NE preference is off. The
+    // fail-open-after-lease-revoke sub-case returns success while the NE
+    // preference may STILL be enabled -- removing the daemon there risks a
+    // reboot-brick (the provider could come up enabled + no daemon = deny-all).
+    // So the teardown condition is `neConfirmedOff === true`, never merely
+    // "disarm did not throw". Both a throw AND a non-throwing-but-not-confirmed
+    // disarm leave the daemon UP + set wallMayBeArmed.
+    let tearDownPolicyDaemon = false;
+    let wallMayBeArmed = false;
+    let disarmNote: string | undefined;
+    if (policyDaemonFreshlyInstalled) {
+      try {
+        const disarmResult = await ops.disarm();
+        if (disarmResult.neConfirmedOff) {
+          // NE preference AFFIRMATIVELY off (saved disabled -- confirmed, or
+          // saved with inconclusive corroboration where the save is
+          // authoritative). Safe to tear the fresh daemon down. Note the wall
+          // was disarmed during rollback so the operator can confirm -- not a
+          // bare "nothing happened" clean rollback.
+          tearDownPolicyDaemon = true;
+          disarmNote =
+            "The content filter was disarmed as part of this rollback; confirm it is off with 'sanctuary castle-wall status'.";
+        } else {
+          // Disarm succeeded as a dead-man lever (not ENFORCING now) but did NOT
+          // confirm the NE preference is off (fail-open after lease revoke). The
+          // NE preference may still be enabled -> a reboot could come up enabled
+          // with no daemon (deny-all). Treat exactly like disarm-uncertain:
+          // leave the fresh daemon UP (not-enforcing + daemon-up is recoverable)
+          // and surface loudly.
+          wallMayBeArmed = true;
+          disarmNote =
+            "disarm reported success as a dead-man lever but did NOT confirm the NE preference is off (fail-open after lease revoke); the wall may still be enabled at the preference level";
+        }
+      } catch (disarmErr) {
+        // Disarm hard-failed: it could NOT confirm the filter is off. Do NOT
+        // boot the fresh policy daemon out -- leave it UP (filter-on + daemon-up
+        // is enforcing and RECOVERABLE, never the deny-all lockout).
+        wallMayBeArmed = true;
+        disarmNote = (disarmErr as Error).message;
+      }
+    }
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun, tearDownPolicyDaemon);
     return {
       kind: "aborted",
       stage: "arm",
-      reason: withDaemonTeardownNote(armResult.error, td.daemonTeardownError),
+      reason: withArmWallStateNote(
+        withDaemonTeardownNote(armResult.error, td.daemonTeardownError, td.policyDaemonTeardownError),
+        wallMayBeArmed,
+        disarmNote,
+      ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
       conflictPaths: td.conflictPaths,
       failedPaths: td.failedPaths,
-      daemonTeardownFailed: td.daemonTeardownError !== undefined,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
+      // P0 honesty gap: when the filter may still be armed (disarm could not
+      // confirm), the CLI must NOT render a clean "rolled back; re-run" line.
+      wallMayBeArmed: wallMayBeArmed ? true : undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
@@ -606,25 +816,44 @@ async function teardownDaemonAndRestore(
   ops: ProvisionFlowOps,
   results: RehomeStepResult[],
   tearDownDaemon: boolean,
+  tearDownPolicyDaemon: boolean,
 ): Promise<{
   rolledBack: boolean | "partial";
   backupPaths: string[];
   conflictPaths: string[];
   failedPaths: string[];
   daemonTeardownError?: string;
+  policyDaemonTeardownError?: string;
 }> {
-  // FIX (round 5 / R6-3): only tear the daemon down when THIS run stood it up
-  // (the fresh-provision path). On the alreadyDedicated re-run path the harness
-  // daemon PRE-EXISTED a prior successful provision, so booting it out over a
-  // transient verify/arm failure would destroy working infrastructure -- and
-  // the subsequent neutral "nothing was changed" frame would be a lie. Leave a
-  // pre-existing daemon in place.
+  // FIX (round 5 / R6-3): only tear the harness daemon down when THIS run stood
+  // it up (the fresh-provision path). On the alreadyDedicated re-run path the
+  // harness daemon PRE-EXISTED a prior successful provision, so booting it out
+  // over a transient verify/arm failure would destroy working infrastructure --
+  // and the subsequent neutral "nothing was changed" frame would be a lie.
+  // Leave a pre-existing daemon in place.
   let daemonTeardownError: string | undefined;
   if (tearDownDaemon) {
     try {
       await ops.uninstallHarnessDaemon();
     } catch (err) {
       daemonTeardownError = (err as Error).message;
+    }
+  }
+  // Bug B (the one-flow gap): tear the FRESHLY-INSTALLED policy (boot) daemon
+  // back down too, so an abort after we stood up the machine's wall from
+  // nothing restores the prior "no wall for this fortress" state. This is only
+  // ever true when THIS run installed the boot service fresh (never for a
+  // pre-existing wall -- booting that out would be destructive; and we only
+  // reach these branches with the filter NOT armed, so it can never create the
+  // filter-on/daemon-down lockout). Best-effort + fail-loud: a teardown failure
+  // is captured and folded into the abort reason, never prevents the re-home
+  // restore, and never throws.
+  let policyDaemonTeardownError: string | undefined;
+  if (tearDownPolicyDaemon) {
+    try {
+      await ops.teardownPolicyDaemon();
+    } catch (err) {
+      policyDaemonTeardownError = (err as Error).message;
     }
   }
   const restore = await safeRestore(ops, results);
@@ -634,22 +863,63 @@ async function teardownDaemonAndRestore(
     conflictPaths: restore.conflictPaths,
     failedPaths: restore.failedPaths,
     daemonTeardownError,
+    policyDaemonTeardownError,
   };
 }
 
 /**
- * Fold a harness-daemon teardown failure (fix, round 5 item N3) into an abort
- * reason as LOUD manual-recovery guidance -- the operator must know a root
- * LaunchDaemon may still be live so they can remove it by hand. Returns the
- * reason unchanged when teardown succeeded.
+ * Fold a daemon-teardown failure into an abort reason as LOUD manual-recovery
+ * guidance -- the operator must know a root LaunchDaemon may still be live so
+ * they can remove it by hand. Covers both the harness daemon (fix, round 5 item
+ * N3) and the freshly-installed Castle Wall policy/boot daemon (Bug B). Returns
+ * the reason unchanged when every attempted teardown succeeded.
  */
-function withDaemonTeardownNote(reason: string, daemonTeardownError?: string): string {
-  if (daemonTeardownError === undefined) {
+function withDaemonTeardownNote(
+  reason: string,
+  daemonTeardownError?: string,
+  policyDaemonTeardownError?: string,
+): string {
+  const notes: string[] = [];
+  if (daemonTeardownError !== undefined) {
+    notes.push(
+      `the harness daemon could NOT be torn down automatically: ${daemonTeardownError}. ` +
+        `It may still be running under the dedicated account -- run 'sudo sanctuary castle-wall disable' and remove ` +
+        `the ai.sanctuaryprotocol.agent-harness LaunchDaemon manually before re-running.`,
+    );
+  }
+  if (policyDaemonTeardownError !== undefined) {
+    notes.push(
+      `the freshly-installed Castle Wall policy (boot) daemon could NOT be torn down automatically: ${policyDaemonTeardownError}. ` +
+        `A root LaunchDaemon may still be running -- run 'sudo sanctuary castle-wall uninstall-boot --yes' to remove it before re-running.`,
+    );
+  }
+  if (notes.length === 0) {
     return reason;
   }
-  return (
-    `${reason} (NOTE: the harness daemon could NOT be torn down automatically: ${daemonTeardownError}. ` +
-    `It may still be running under the dedicated account -- run 'sudo sanctuary castle-wall disable' and remove ` +
-    `the ai.sanctuaryprotocol.agent-harness LaunchDaemon manually before re-running.)`
-  );
+  return `${reason} (NOTE: ${notes.join(" ")})`;
+}
+
+/**
+ * Bug B P0 (disarm-first): fold the arm-abort wall-state note into the reason.
+ * When `wallMayBeArmed` (disarm could NOT confirm the filter is off), this is a
+ * LOUD manual-recovery warning -- the freshly-installed policy daemon was left
+ * running to avoid a lockout and the operator must run `castle-wall disable`.
+ * When disarm succeeded, `disarmNote` is a milder "the wall was disarmed during
+ * rollback; confirm with status" line so the outcome is never a bare clean
+ * rollback that hides the wall was touched. Returns the reason unchanged when
+ * no policy daemon was freshly installed (no disarm was attempted).
+ */
+function withArmWallStateNote(reason: string, wallMayBeArmed: boolean, disarmNote?: string): string {
+  if (disarmNote === undefined) {
+    return reason;
+  }
+  if (wallMayBeArmed) {
+    return (
+      `${reason} (WALL-STATE WARNING: arming reported a failure but the content filter MAY STILL BE ARMED and ` +
+      `disarm could not confirm it is off: ${disarmNote}. The freshly-installed Castle Wall policy daemon was LEFT ` +
+      `RUNNING to avoid a deny-all lockout (filter-on + daemon-up is enforcing and recoverable, unlike filter-on + ` +
+      `daemon-down). Run 'sudo sanctuary castle-wall disable' to confirm the filter is off before re-running.)`
+    );
+  }
+  return `${reason} (${disarmNote})`;
 }

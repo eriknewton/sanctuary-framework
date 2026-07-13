@@ -48,6 +48,7 @@ import {
   disarmExitCodeDecision,
   hermesEndpointProbes,
   allHermesCredentialDestPaths,
+  resolveWallFortressPath,
 } from "../../src/wrap/auto-provision.js";
 import {
   planRehome,
@@ -717,6 +718,29 @@ describe("wrap/auto-provision real-ops chokepoint: disarmExitCodeDecision (fix G
     const err = disarmExitCodeDecision(-1);
     expect(err).toBeInstanceOf(Error);
     expect(err?.message).toBe("castle-wall disable exited -1");
+  });
+});
+
+describe("wrap/auto-provision real-ops chokepoint: resolveWallFortressPath (Bug B, consistency)", () => {
+  it("honors SANCTUARY_STORAGE_PATH when the operator set it (an explicit non-default fortress)", () => {
+    expect(resolveWallFortressPath({ SANCTUARY_STORAGE_PATH: "/srv/fortress-a" }, "/Users/erik")).toBe(
+      "/srv/fortress-a",
+    );
+  });
+
+  it("falls back to the OPERATOR's home (never root's /var/root) when no override is set -- the sudo-aware R2-safe resolution", () => {
+    // Under `sudo`, resolveStoragePath/os.homedir() would give /var/root/.sanctuary;
+    // this must resolve the operator's own fortress instead.
+    expect(resolveWallFortressPath({}, "/Users/erik")).toBe("/Users/erik/.sanctuary");
+    expect(resolveWallFortressPath({}, "/Users/erik")).not.toMatch(/var\/root/);
+  });
+
+  it("treats an empty SANCTUARY_STORAGE_PATH as unset (falls back to the operator home)", () => {
+    expect(resolveWallFortressPath({ SANCTUARY_STORAGE_PATH: "" }, "/Users/erik")).toBe("/Users/erik/.sanctuary");
+  });
+
+  it("strips a trailing slash on the operator home before appending .sanctuary", () => {
+    expect(resolveWallFortressPath({}, "/Users/erik/")).toBe("/Users/erik/.sanctuary");
   });
 });
 

@@ -1206,6 +1206,20 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
     outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0
       ? ` Your file(s) recreated during provisioning were left intact; the previously re-homed copy is preserved at: ${outcome.conflictPaths.join(", ")} -- reconcile these by hand, and do NOT overwrite them from the backup.`
       : "";
+  // Bug B P0 (disarm-first): an ARM-stage abort where disarm could NOT confirm
+  // the content filter is off. The freshly-installed policy daemon was left
+  // RUNNING (filter-on + daemon-up is enforcing and recoverable, never the
+  // deny-all lockout), and the wall MAY STILL BE ARMED. This is the most severe
+  // state, so it is checked FIRST and NEVER softened into a clean "rolled back;
+  // re-run" line (the honesty gap the P0 flagged). `outcome.reason` already
+  // carries the full WALL-STATE WARNING with the `castle-wall disable` command.
+  if (outcome.wallMayBeArmed) {
+    return [
+      `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason})${backupNote}${conflictNote}` +
+        ` The Castle Wall content filter MAY STILL BE ARMED; the policy daemon was left running to avoid a lockout.` +
+        ` Run 'sudo sanctuary castle-wall disable' to confirm the filter is off, then investigate before re-running.`,
+    ];
+  }
   // FIX (round 5 / R2-2): a failed daemon teardown means a root LaunchDaemon
   // may STILL BE LIVE regardless of whether the re-home restore succeeded, so
   // it gets the LOUD frame -- never the soft "Note: ... re-run to retry" line

@@ -79,3 +79,6 @@ export type {
   ProvisionFlowOps,
   ProvisionFlowOutcome,
 } from "./orchestrate.js";
+
+export { resolvePolicyDaemonAction } from "./policy-daemon.js";
+export type { PolicyDaemonState, PolicyDaemonAction } from "./policy-daemon.js";

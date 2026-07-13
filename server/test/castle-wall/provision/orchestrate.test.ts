@@ -36,6 +36,8 @@ const REHOME_RESULTS: RehomeStepResult[] = [
   },
 ];
 
+const FORTRESS_PATH = "/Users/operator/.sanctuary";
+
 function baseCtx(overrides: Partial<ProvisionFlowContext> = {}): ProvisionFlowContext {
   return {
     agentId: "hermes",
@@ -43,6 +45,7 @@ function baseCtx(overrides: Partial<ProvisionFlowContext> = {}): ProvisionFlowCo
     ceiling: CEILING,
     detectResult: NEEDS_PROVISIONING,
     isTty: true,
+    fortressPath: FORTRESS_PATH,
     ...overrides,
   };
 }
@@ -61,11 +64,13 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     })),
     installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
     uninstallHarnessDaemon: vi.fn(async () => undefined),
+    ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
+    teardownPolicyDaemon: vi.fn(async () => undefined),
     preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
     checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: AGENT_UID })),
     arm: vi.fn(async () => ({ ok: true as const })),
     postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
-    disarm: vi.fn(async () => undefined),
+    disarm: vi.fn(async () => ({ neConfirmedOff: true as const })),
     restoreRehome: vi.fn(async () => ({
       fullyRestored: true,
       restoredCount: REHOME_RESULTS.length,
@@ -395,6 +400,7 @@ describe("castle-wall/provision/orchestrate", () => {
         if (err !== undefined) {
           throw err;
         }
+        return { neConfirmedOff: true };
       }),
     });
     const result = await runProvisionFlow(baseCtx(), ops);
@@ -589,5 +595,206 @@ describe("castle-wall/provision/orchestrate", () => {
     const reason = (result as { reason: string }).reason;
     expect(reason).not.toMatch(/restore FAILED/);
     expect(reason).toMatch(/left intact|reconcile/i);
+  });
+
+  // ── Bug B (the one-flow gap): ensure a policy daemon before arming ──────────
+  describe("Bug B: ensurePolicyDaemon step (single-wall-per-machine, refuse-not-swap)", () => {
+    it("happy path calls ensurePolicyDaemon with ctx.fortressPath (between install-daemon and arm), still arms, tears down nothing", async () => {
+      const ops = happyPathOps();
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(ops.ensurePolicyDaemon).toHaveBeenCalledWith(FORTRESS_PATH);
+      // Ordering: the policy daemon is ensured AFTER the harness daemon and
+      // BEFORE arming (arming with no policy daemon deny-all-locks the box).
+      const ensureOrder = (ops.ensurePolicyDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const installOrder = (ops.installHarnessDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const armOrder = (ops.arm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      expect(installOrder).toBeLessThan(ensureOrder);
+      expect(ensureOrder).toBeLessThan(armOrder);
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+    });
+
+    it("a FRESH install (freshlyInstalled:true) still arms and tears down nothing on success", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+    });
+
+    it("REFUSES a different-fortress wall (ok:false, freshlyInstalled:false): aborts at ensure-policy-daemon, never arms, tears the HARNESS daemon down, leaves the existing wall untouched, restores the re-home", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({
+          ok: false as const,
+          error:
+            "a Castle Wall is already installed for a different fortress; one machine runs one wall -- arming would replace it.",
+          freshlyInstalled: false,
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon", rolledBack: true });
+      expect(ops.arm).not.toHaveBeenCalled();
+      // The harness daemon was installed this run -> tear it down. The existing
+      // (different-fortress) wall is NEVER torn down -- refuse, not swap.
+      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+      expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
+      expect((result as { reason: string }).reason).toMatch(/different fortress/);
+    });
+
+    it("an abort AFTER a fresh install (verify-before-arm) tears BOTH the harness daemon AND the fresh policy daemon back down (restores the prior 'no wall' state)", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm" });
+      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
+    });
+
+    it("an abort after an ALREADY-reachable policy daemon (freshlyInstalled:false) tears the harness daemon down but LEAVES the pre-existing wall untouched", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
+        preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm" });
+      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      // Booting out a wall this run did NOT install would be destructive.
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+    });
+
+    it("ensurePolicyDaemon failing AFTER standing up a fresh daemon (ok:false, freshlyInstalled:true) tears that fresh daemon back down on the abort", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({
+          ok: false as const,
+          error: "the policy daemon was installed but its socket never became reachable within 10s; not arming.",
+          freshlyInstalled: true,
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon" });
+      expect(ops.arm).not.toHaveBeenCalled();
+      expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
+      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+    });
+
+    it("a FAILED policy-daemon teardown on abort is surfaced LOUDLY (daemonTeardownFailed + a manual uninstall-boot note), never silently swallowed", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+        teardownPolicyDaemon: vi.fn(async () => {
+          throw new Error("launchctl bootout failed: Operation not permitted");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "verify-before-arm", daemonTeardownFailed: true });
+      const reason = (result as { reason: string }).reason;
+      expect(reason).toMatch(/uninstall-boot --yes/);
+      expect(reason).toMatch(/launchctl bootout failed: Operation not permitted/);
+      // A teardown failure never prevents the re-home restore.
+      expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
+    });
+
+    it("ensurePolicyDaemon is NOT called when an EARLIER step (install-daemon) fails -- it is strictly downstream of the harness daemon install", async () => {
+      const ops = happyPathOps({
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: false as const,
+          error: "launchctl bootstrap exited 5",
+          daemonPreexisted: false,
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+      expect(ops.ensurePolicyDaemon).not.toHaveBeenCalled();
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+    });
+
+    // ── P0 (disarm-first ordering on the arm-STAGE abort) ─────────────────────
+    // `arm` returning ok:false does NOT imply the content filter is off (macOS
+    // Tahoe can SAVE the NE config ENABLED then report non-zero). Booting a
+    // FRESHLY-INSTALLED policy daemon out in that state = filter-on/daemon-down
+    // = deny-all lockout. So we DISARM FIRST, and only tear the fresh daemon
+    // down once disarm confirms the filter is off.
+    it("P0: arm ok:false with a FRESHLY-INSTALLED daemon disarms FIRST, THEN tears the policy daemon down (order: filter-off before daemon-down)", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
+      // Disarm was attempted and succeeded, so the fresh daemon IS torn down...
+      expect(ops.disarm).toHaveBeenCalledTimes(1);
+      expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
+      // ...and STRICTLY in filter-off-THEN-daemon-down order.
+      const disarmOrder = (ops.disarm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const teardownOrder = (ops.teardownPolicyDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      expect(disarmOrder).toBeLessThan(teardownOrder);
+      // A confirmed disarm is not flagged "may be armed", but the outcome is NOT
+      // a bare clean rollback -- it records that the wall was disarmed and tells
+      // the operator to confirm with `status`.
+      expect((result as { wallMayBeArmed?: boolean }).wallMayBeArmed).toBeUndefined();
+      expect((result as { reason: string }).reason).toMatch(/disarmed as part of this rollback|castle-wall status/i);
+    });
+
+    it("P0 honesty gap: arm ok:false + fresh daemon + disarm THROWS leaves the policy daemon UP (never boots it out into a lockout), sets wallMayBeArmed, and is NOT a clean rollback", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        // Disarm cannot confirm the filter is off (e.g. Tahoe corroboration
+        // affirmatively still shows enabled, or the disable save itself failed).
+        disarm: vi.fn(async () => {
+          throw new Error("castle-wall disable exited 1");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm", wallMayBeArmed: true });
+      expect(ops.disarm).toHaveBeenCalledTimes(1);
+      // CRITICAL: the freshly-installed policy daemon is LEFT RUNNING -- booting
+      // it out with the filter possibly ON is the exact deny-all lockout.
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+      // The harness daemon (not the wall) is still torn down normally.
+      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      const reason = (result as { reason: string }).reason;
+      expect(reason).toMatch(/MAY STILL BE ARMED/);
+      expect(reason).toMatch(/castle-wall disable/);
+    });
+
+    it("P1 (fail-open-after-lease-revoke): arm ok:false + fresh daemon + disarm returns neConfirmedOff:FALSE leaves the daemon UP (never a reboot-brick) + sets wallMayBeArmed, even though disarm did NOT throw", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        // Disarm did NOT throw (it succeeded as a dead-man lever, fail-open),
+        // but the NE preference was NOT confirmed off -- the exact P1 sub-case.
+        disarm: vi.fn(async () => ({ neConfirmedOff: false })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm", wallMayBeArmed: true });
+      expect(ops.disarm).toHaveBeenCalledTimes(1);
+      // CRITICAL: a non-throwing-but-not-confirmed disarm must NOT tear the fresh
+      // daemon down -- removing it while the NE preference may still be enabled
+      // risks a reboot-brick (provider up enabled + no daemon = deny-all).
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+      const reason = (result as { reason: string }).reason;
+      expect(reason).toMatch(/MAY STILL BE ARMED/);
+      expect(reason).toMatch(/fail-open after lease revoke/);
+      expect(reason).toMatch(/castle-wall disable/);
+    });
+
+    it("P0: the disarm-first guard is scoped to a FRESH install -- an arm ok:false over an ALREADY-reachable (freshlyInstalled:false) wall does NOT disarm and does NOT tear the wall down", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
+      // Nothing this run stood up -> no disarm, no wall teardown (leaving the
+      // pre-existing wall untouched; filter-on + daemon-up is recoverable).
+      expect(ops.disarm).not.toHaveBeenCalled();
+      expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
+      expect((result as { wallMayBeArmed?: boolean }).wallMayBeArmed).toBeUndefined();
+    });
   });
 });

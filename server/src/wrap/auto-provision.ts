@@ -43,12 +43,14 @@ import {
   restoreRehomeSteps,
   resolveHermesGatewayArgv,
   runProvisionFlow,
+  resolvePolicyDaemonAction,
   withProvisionLock,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
   type RehomeStepResult,
   type EndpointProbeTarget,
 } from "../castle-wall/provision/index.js";
+import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
   planAgentHarnessDaemonInstall,
   installAgentHarnessDaemon,
@@ -62,6 +64,58 @@ const execFileAsync = promisify(execFile);
 const PROVISION_CEILING = 500;
 const NEW_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
 const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
+
+/** Budget for polling the policy-daemon socket to become reachable after install-boot (Bug B). */
+const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
+
+/**
+ * Bug B (consistency): resolve the fortress path whose Castle Wall the
+ * auto-provision flow ensures a policy daemon for AND arms. This flow ONLY runs
+ * under `sudo sanctuary protect --hermes`, and under sudo `resolveStoragePath`/
+ * `os.homedir()` resolve to ROOT (`/var/root/.sanctuary`), never the operator's
+ * fortress -- the R2 trap. So this resolves sudo-aware exactly like install-boot
+ * does: `SANCTUARY_STORAGE_PATH` if the operator set it, else the operator's own
+ * `<operatorHome>/.sanctuary`. The SAME value is passed to `ensurePolicyDaemon`,
+ * `arm --fortress`, and `disarm --fortress`, so all three target one fortress
+ * end to end and a non-default fortress is never probed at the default socket.
+ *
+ * Exported (fix chokepoint) so the unit suite can prove the sudo-aware
+ * resolution (operator home, never `/var/root`) and the env override directly.
+ */
+export function resolveWallFortressPath(
+  env: { SANCTUARY_STORAGE_PATH?: string },
+  operatorHome: string,
+): string {
+  const override = env.SANCTUARY_STORAGE_PATH;
+  if (override !== undefined && override.length > 0) {
+    return override;
+  }
+  return `${operatorHome.replace(/\/+$/, "")}/.sanctuary`;
+}
+
+/**
+ * Poll a daemon socket until `probe` answers, or a bounded budget elapses
+ * (Bug B). After install-boot proves a STABLE pid, the policy daemon still needs
+ * a moment to bind its Unix socket; poll (not sleep-then-check-once) so a fast
+ * bind returns promptly and a never-binding daemon fails closed at the budget.
+ * Never throws (the probe itself is fail-closed).
+ */
+async function pollSocketReachable(
+  socketPath: string,
+  probe: (socketPath: string) => Promise<boolean>,
+  budgetMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    if (await probe(socketPath)) {
+      return true;
+    }
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 250));
+  }
+}
 
 // FIX R1 (BLOCKER, 2026-07-07 fix-round 2): the real endpoint hosts Hermes
 // needs to reach, so `preArmEndpoints`/`postArmEndpoints` below supply a
@@ -803,6 +857,10 @@ export async function runAutoProvisionForWrap(
   const operatorHome = operatorIdentity.home;
   const consoleOwnerUid = operatorIdentity.uid;
   const consoleOwnerGid = operatorIdentity.gid;
+  // Bug B: the fortress whose Castle Wall this flow ensures + arms. Resolved
+  // sudo-aware (operator home, never root's /var/root) and threaded identically
+  // into ensurePolicyDaemon, arm --fortress, and disarm --fortress.
+  const wallFortressPath = resolveWallFortressPath(process.env, operatorHome);
   const harnessConfiguredUid = await readHarnessConfiguredUid();
   const runningAgentUid = await readRunningHermesGatewayUid();
   // FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): the resolved
@@ -939,6 +997,101 @@ export async function runAutoProvisionForWrap(
     uninstallHarnessDaemon: async () => {
       await uninstallAgentHarnessDaemon(realHarnessDaemonOps());
     },
+    // Bug B (the one-flow gap): ensure a reachable Castle Wall POLICY daemon for
+    // the target fortress BEFORE arming. Arming with no policy daemon deny-all-
+    // locks the box, so on a box with no wall for this fortress the flow would
+    // otherwise roll back at the arm's own refuse gate. This op stands the
+    // policy daemon up (or refuses to swap a different fortress's wall) so arm
+    // can proceed -- it NEVER arms the filter itself, and NEVER leaves the box
+    // filter-on/daemon-down. The boot service is a SINGLETON (one launchd label,
+    // one plist, per machine), which is exactly why "a boot service exists for a
+    // DIFFERENT fortress" must REFUSE rather than swap.
+    ensurePolicyDaemon: async (fortressPath) => {
+      const socketPath = resolveCastleWallSocketPath({ platform: "darwin", fortressPath }).path;
+      const { defaultDaemonProbe } = await import("../cli/castle-wall.js");
+      const { runInstallBoot, bootServiceInstalled, CASTLE_WALL_BOOT_PLIST_PATH } = await import(
+        "../cli/castle-wall-boot.js"
+      );
+      // 1. Probe the SAME socket the arm probes. If it already answers, this is
+      //    a no-op (the stock-box case: a boot daemon already serves this
+      //    fortress). Nothing was stood up, so nothing is torn down on abort.
+      if (await defaultDaemonProbe(socketPath)) {
+        return { ok: true as const, freshlyInstalled: false };
+      }
+      // 2. Not reachable: inspect the SINGLETON boot-service state and decide
+      //    (pure) which action to take. `bootServiceInstalled(plist, fortress)`
+      //    confirms a well-formed unit that targets THIS fortress; the no-arg
+      //    form confirms one exists for ANY fortress.
+      const [forThisFortress, forAnyFortress] = await Promise.all([
+        bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH, fortressPath),
+        bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH),
+      ]);
+      const action = resolvePolicyDaemonAction({
+        socketReachable: false,
+        bootServiceForThisFortress: forThisFortress,
+        bootServiceForAnyFortress: forAnyFortress,
+      });
+      if (action === "refuse-conflict") {
+        // Single wall per machine: DO NOT silently stand the machine's existing
+        // wall down. Refuse and let the flow roll back its prior steps.
+        return {
+          ok: false as const,
+          freshlyInstalled: false,
+          error:
+            `a Castle Wall is already installed for a different fortress; one machine runs one wall -- ` +
+            `arming ${fortressPath} would replace it. Stand the existing wall down first ` +
+            `('sudo sanctuary castle-wall disable' then 'sudo sanctuary castle-wall uninstall-boot --yes'), then re-run.`,
+        };
+      }
+      // "install-fresh" and "restart-existing" both drive install-boot for THIS
+      // fortress: it stands one up from nothing AND is idempotent (re-bootstraps
+      // a stopped unit that already matches). `freshlyInstalled` is true ONLY
+      // when NO wall existed before this run, so an abort tears down exactly
+      // what this run created and never a pre-existing wall.
+      const freshlyInstalled = action === "install-fresh";
+      const code = await runInstallBoot(["--fortress", fortressPath], { env: process.env });
+      if (code !== 0) {
+        // install-boot boots out its own crash-looping unit on a start failure,
+        // so on a fresh box nothing is normally left live; `freshlyInstalled` is
+        // still reported so the orchestrator's teardown is belt-and-suspenders
+        // if a unit somehow lingers.
+        return {
+          ok: false as const,
+          freshlyInstalled,
+          error:
+            `could not ${freshlyInstalled ? "install" : "restart"} the Castle Wall policy daemon for ${fortressPath} ` +
+            `(install-boot exited ${code}); not arming (arming with no policy daemon would deny-all-lock this machine).`,
+        };
+      }
+      // install-boot certified a STABLE pid; the daemon still needs a moment to
+      // bind its socket. Poll (bounded) until it actually answers before
+      // declaring the daemon ready -- fail-closed if it never does.
+      const reachable = await pollSocketReachable(socketPath, defaultDaemonProbe, POLICY_DAEMON_SOCKET_BUDGET_MS);
+      if (!reachable) {
+        return {
+          ok: false as const,
+          freshlyInstalled,
+          error:
+            `the Castle Wall policy daemon for ${fortressPath} was ${freshlyInstalled ? "installed" : "restarted"} ` +
+            `but its socket (${socketPath}) never became reachable within ` +
+            `${Math.round(POLICY_DAEMON_SOCKET_BUDGET_MS / 1000)}s; not arming (fail-closed).`,
+        };
+      }
+      return { ok: true as const, freshlyInstalled };
+    },
+    // Bug B: tear the FRESHLY-INSTALLED singleton boot (policy) service back
+    // down on an abort after a fresh install (bootout + remove the plist),
+    // restoring the prior "no wall" state. Only ever invoked by the orchestrator
+    // when ensurePolicyDaemon reported `freshlyInstalled:true`; never for a
+    // pre-existing wall. `--yes` confirms the (safe here: filter NOT armed)
+    // removal. Fail-loud: a nonzero exit throws so the orchestrator surfaces it.
+    teardownPolicyDaemon: async () => {
+      const { runUninstallBoot } = await import("../cli/castle-wall-boot.js");
+      const code = await runUninstallBoot(["--yes"], { env: process.env });
+      if (code !== 0) {
+        throw new Error(`castle-wall uninstall-boot exited ${code}`);
+      }
+    },
     // FIX R1 (BLOCKER, fix-round 2): honest, fail-closed probe list -- see
     // `hermesEndpointProbes` above. `resolvedAgentUidGid` is always set by
     // `installHarnessDaemon` before this is called (steps 6 -> 7); if it is
@@ -952,7 +1105,18 @@ export async function runAutoProvisionForWrap(
     },
     arm: async (uid, ceiling) => {
       const { runEnable } = await import("../cli/castle-wall.js");
-      const code = await runEnable([`--agent-uid=${uid}`, `--ceiling=${ceiling}`, "--no-ttl"]);
+      // Bug B (consistency): target the SAME fortress the flow provisioned +
+      // ensured a policy daemon for. Without `--fortress`, runEnable resolves
+      // via resolveStoragePath(env), which under sudo is root's /var/root
+      // fortress -- so a non-default fortress would be probed at the WRONG
+      // socket and the arm's own daemon-reachability gate would refuse.
+      const code = await runEnable([
+        "--fortress",
+        wallFortressPath,
+        `--agent-uid=${uid}`,
+        `--ceiling=${ceiling}`,
+        "--no-ttl",
+      ]);
       return code === 0 ? { ok: true } : { ok: false, error: `castle-wall enable exited ${code}` };
     },
     postArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, movedCredentialDestPaths),
@@ -964,8 +1128,26 @@ export async function runAutoProvisionForWrap(
     // through to `armed-then-rolled-back`.
     disarm: async () => {
       const { runDisable } = await import("../cli/castle-wall.js");
-      const code = await runDisable([]);
+      // Bug B (consistency): disarm the SAME fortress the arm targeted (see the
+      // arm op above) so the fast post-arm rollback lever cannot miss the wall
+      // it just armed on a non-default fortress.
+      //
+      // Bug B P1: capture whether the disable AFFIRMATIVELY confirmed the NE
+      // preference is OFF, surfaced alongside the exit code via the
+      // onDisableNeConfirmedOff out-callback (runDisable's numeric contract is
+      // unchanged for every other caller). A non-throwing disarm alone is NOT
+      // sufficient to remove a freshly-installed policy daemon -- the
+      // fail-open-after-lease-revoke sub-case returns success while the NE
+      // preference may still be enabled -- so the orchestrator tears the fresh
+      // daemon down only when `neConfirmedOff === true`.
+      let neConfirmedOff = false;
+      const code = await runDisable(["--fortress", wallFortressPath], {
+        onDisableNeConfirmedOff: (confirmed) => {
+          neConfirmedOff = confirmed;
+        },
+      });
       throwIfDisarmFailed(code);
+      return { neConfirmedOff };
     },
     restoreRehome: async (results: RehomeStepResult[]) => {
       // FIX F2/F3 (2026-07-07 fix-round): thread the OPERATOR's uid/gid
@@ -1009,6 +1191,7 @@ export async function runAutoProvisionForWrap(
         detectResult,
         isTty: options.isTty,
         preAnsweredProvision: options.preAnsweredProvision,
+        fortressPath: wallFortressPath,
       },
       ops,
     ),

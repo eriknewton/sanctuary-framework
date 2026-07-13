@@ -106,6 +106,27 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).not.toMatch(/Re-homed paths were restored to your account\. Re-run/);
   });
 
+  it("Bug B P0 (disarm-first): a wallMayBeArmed arm-abort forces the LOUD 'MAY STILL BE ARMED / castle-wall disable' frame and NEVER the clean 'rolled back; re-run' line -- EVEN WHEN rolledBack:true (the honesty gap)", () => {
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "arm",
+        reason:
+          "castle-wall enable exited 1 (WALL-STATE WARNING: arming reported a failure but the content filter MAY STILL BE ARMED and disarm could not confirm it is off: castle-wall disable exited 1. ... Run 'sudo sanctuary castle-wall disable' to confirm the filter is off before re-running.)",
+        rolledBack: true,
+        rehomeAttempted: true,
+        wallMayBeArmed: true,
+      },
+    });
+    expect(out).toHaveLength(1);
+    // Loud WARNING frame, NOT the soft rolledBack:true "re-run to retry" line.
+    expect(out[0]).toMatch(/^ {2}WARNING:/);
+    expect(out[0]).toMatch(/MAY STILL BE ARMED/);
+    expect(out[0]).toMatch(/castle-wall disable/);
+    expect(out[0]).not.toMatch(/Re-homed paths were restored to your account\. Re-run/);
+  });
+
   it("FIX R2-2: succeeded daemon teardown (daemonTeardownFailed:false) with rolledBack:true uses the soft Note frame (no false loud warning)", () => {
     const out = lines({
       ran: true,
