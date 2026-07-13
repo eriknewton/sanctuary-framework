@@ -82,6 +82,12 @@ import {
 import { startDashboard, type DashboardHandle } from "../dashboard/index.js";
 import { buildWrapFleetRosterProvider } from "./fleet-roster-provider.js";
 import {
+  runAutoProvisionForWrap,
+  type AutoProvisionSummary,
+} from "./auto-provision.js";
+import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
+import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
+import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../dashboard/v1_1/wiring.js";
@@ -210,6 +216,18 @@ export interface WrapOptions {
    * (exit 2) rather than silently continuing without anchoring.
    */
   anchorTransparency?: boolean;
+  /**
+   * Auto-provision Step 2 (Build 1): pre-answers the CHOICE of whether to
+   * provision a dedicated agent OS account, when `protect` detects the
+   * agent is running on a shared (operator) account. Fix L2: this pre-
+   * answers the choice ONLY -- the privileged mutation (create account,
+   * re-home, install daemon, arm) still prints its plan and, on a TTY,
+   * still asks its own single confirm. `--provision-agent-account` sets
+   * this true; `--no-provision-agent-account` sets it false (an explicit
+   * decline, skipping straight to "cooperative wrap only"). Unset (neither
+   * flag passed) leaves the interactive prompt as the sole decision point.
+   */
+  provisionAgentAccount?: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1027,7 +1045,258 @@ async function probeEnforcementObservedIfArmed(
   return probeCastleWallEnforcementObserved(auditLog, storagePath);
 }
 
+/**
+ * Auto-provision Step 2 (Build 1): gate + invoke the one-flow orchestration
+ * (castle-wall/provision) from `runWrap`. v1 scope (D1/D2 resolved): Hermes
+ * on darwin only; a dry run never provisions (fix: dry-run must remain
+ * write-free, matching the existing `options.dryRun` early-return above).
+ * `--unwrap` never reaches this call (the unwrap branch returns at the top
+ * of `runWrap`).
+ *
+ * Fix H4: when provisioning is skipped because this run is non-interactive
+ * (no TTY), the cooperative wrap this function is called from has ALREADY
+ * completed its own writes by the time this runs -- this call only adds a
+ * status line, it never blocks or reverts the wrap that already happened.
+ * Any error thrown by the auto-provision flow is caught here and reported
+ * as a note, never allowed to turn an otherwise-successful cooperative wrap
+ * into a hard CLI failure (the wall staying un-armed is exactly the state
+ * the honesty gate already renders correctly via `castleWallArmed`).
+ */
+async function maybeRunAutoProvisionForWrap(
+  agentConfig: { platform: AgentPlatform },
+  options: WrapOptions,
+  deps: RunWrapDeps,
+): Promise<AutoProvisionSummary> {
+  if (agentConfig.platform !== "hermes" || options.dryRun) {
+    return { ran: false };
+  }
+  const runner = deps.runAutoProvisionForWrap ?? runAutoProvisionForWrap;
+  try {
+    return await runner({
+      isTty: process.stdin.isTTY === true,
+      preAnsweredProvision: options.provisionAgentAccount,
+      // SAFETY: stderr is the operator-facing CLI channel for this
+      // subcommand; this prints the plan-and-print + progress lines from
+      // the auto-provision flow (account plan, re-home summary, arm
+      // result), never secrets or key material.
+      print: (line) => console.error(`  ${line}`),
+    });
+  } catch (err) {
+    // FIX (round 5 / R8-2): a held provision lock means the flow body NEVER
+    // ran (another `sanctuary protect` is mid-provision), so this run mutated
+    // NOTHING. Classify it honestly -- the generic "may have PARTIALLY applied"
+    // warning below would falsely tell the operator to consider disarming a
+    // wall this run never touched.
+    if (err instanceof ProvisionLockHeldError) {
+      // SAFETY: stderr is the operator-facing CLI channel; a fixed, safe
+      // string plus the lock error message (a lock-path only, no secrets).
+      console.error(
+        `  Note: another 'sanctuary protect' provisioning run is already in progress (${(err as Error).message}); ` +
+          `this run made NO account, re-home, or Castle Wall changes. Wait for it to finish, then re-run if needed.`,
+      );
+      return { ran: true };
+    }
+    // FIX (round 5, item N5): a throw reaching here can surface AFTER
+    // privileged side effects already landed -- e.g. `withProvisionLock`'s
+    // finally re-throws a non-ENOENT lock-release error even when
+    // `runProvisionFlow` already created the account, re-homed the secrets, or
+    // ARMED the wall. The pre-fix copy asserted provisioning "did not
+    // complete" and told the operator to blindly re-run, which is wrong (and
+    // unsafe) if the wall is in fact armed over a half-provisioned agent. The
+    // catch cannot know how far the flow got, so it must not claim a
+    // completion state: warn that it may have PARTIALLY applied and that the
+    // armed state must be checked before re-running.
+    //
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this
+    // subcommand; never surface secrets or key material here.
+    console.error(
+      `  WARNING: automatic account provisioning raised an error (${(err as Error).message}). ` +
+        `It may have PARTIALLY applied -- the dedicated account, the re-home, or an armed Castle Wall could ` +
+        `already be in place. The cooperative wrap above still applies. Do NOT assume nothing happened: check ` +
+        `whether Castle Wall is armed before re-running, and run 'sudo sanctuary castle-wall disable' if it is ` +
+        `enforcing over a half-provisioned agent.`,
+    );
+    return { ran: true };
+  }
+}
+
+/**
+ * FIX F5 (HIGH, 2026-07-07 fix-round, absorbs the earlier F4 messaging nit):
+ * render EVERY `ProvisionFlowOutcome` at the CLI, not just the ones that
+ * happen to reach a catch block. Before this fix both wrap call sites
+ * ignored the returned outcome entirely: on a real abort (e.g. `launchctl
+ * bootstrap` failing after re-home) the wrap printed its normal success
+ * banner and the structured abort -- stage, reason, backup path, whether
+ * anything was actually restored -- was silently dropped. Every branch here
+ * is a distinct, accurate line:
+ *   - declined / non-tty: informational only, never "retry provisioning"
+ *     phrasing (the operator did not fail at anything).
+ *   - aborted with rolledBack === true: clean recovery, still surfaced so
+ *     the operator knows provisioning did not complete this run.
+ *   - aborted with rolledBack === false / "partial": LOUD manual-recovery
+ *     guidance with the backup path(s), since the operator's secrets may be
+ *     stranded under the new account's home.
+ *   - armed-then-rolled-back: the wall came down after a failed post-arm
+ *     check; the agent stays re-homed and the operator is told plainly.
+ *   - armed-rollback-failed (fix R5, 2026-07-07 fix-round 2): the wall
+ *     stayed ARMED after a failed post-arm check AND the fast-disarm rollback
+ *     itself failed. LOUDEST manual-recovery guidance of any branch: the
+ *     operator must disarm by hand, since the automatic rollback did not
+ *     complete.
+ *   - armed / skipped-already-dedicated: quiet single-line confirmation.
+ */
+/**
+ * Pure (exported for the seam, fix round-5 R2-2/R2-3): the operator-facing
+ * lines for a `ProvisionFlowOutcome`. Split out from the printer so every
+ * branch -- the silent-vs-loud framing, the non-TTY reason surfacing (R2-3),
+ * and the daemon-still-live loud override (R2-2) -- is unit-testable without
+ * spying on `console`. Returns `[]` when there is nothing to print. The
+ * render being untested is exactly how R2-2/R2-3 survived; this closes that.
+ */
+export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): string[] {
+  if (!summary.ran || summary.outcome === undefined) return [];
+  const outcome = summary.outcome;
+  switch (outcome.kind) {
+    case "armed":
+      return [`  Dedicated agent account provisioned and Castle Wall armed (uid ${outcome.uid}).`];
+    case "skipped-already-dedicated":
+      // The orchestrator already printed the "already a verified dedicated
+      // account ..." line via `print` at plan-and-print time; nothing to add.
+      return [];
+    case "skipped-non-tty-cooperative-only":
+      // FIX (round 5 / R2-3): the orchestrator printed only the forward-looking
+      // Plan line, NOT this outcome's reason, so the "re-run interactively to
+      // provision the account and arm the wall" guidance was silently dropped.
+      // Surface the reason here.
+      return [`  ${outcome.reason}`];
+    case "declined-by-operator":
+      return ["  Account provisioning declined; the cooperative wrap above still applies."];
+    case "armed-then-rolled-back":
+      return [
+        `  Note: Castle Wall armed then was fast-disarmed (${outcome.reason}). ` +
+          `The agent still runs under its dedicated, re-homed account; only enforcement came down. ` +
+          // FIX (round 5, item N5): honest -- the post-arm re-check proves
+          // DNS-resolvability + credential readability, not allow-list
+          // correctness, so do not tell the operator to "fix the allow-list".
+          `Re-run 'sanctuary protect --hermes' once the connectivity re-check passes (see the reason above).`,
+      ];
+    case "armed-rollback-failed":
+      return [
+        `  WARNING: Castle Wall is ARMED (uid ${outcome.uid}) and the automatic rollback FAILED (${outcome.reason}). ` +
+          `The disarm attempt itself also failed: ${outcome.disarmError}. ` +
+          `The agent may be unreachable behind the wall. Run 'sudo sanctuary castle-wall disable' manually now, ` +
+          `then investigate before re-running 'sanctuary protect --hermes'.`,
+      ];
+    case "aborted":
+      return abortedProvisionLines(outcome);
+  }
+}
+
+function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "aborted" }>): string[] {
+  const backupNote =
+    outcome.backupPaths !== undefined && outcome.backupPaths.length > 0
+      ? ` Backup copies remain at: ${outcome.backupPaths.join(", ")}.`
+      : "";
+  // FIX (round 5 / R5-2): an R6 restore CONFLICT means the operator recreated
+  // a re-homed file during provisioning; their recreated file was left intact
+  // and the previously re-homed copy is preserved at conflictPaths. This is
+  // NOT a failed restore and the operator must NOT be told to overwrite from
+  // the stale backup (that would destroy their newer file).
+  const conflictNote =
+    outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0
+      ? ` Your file(s) recreated during provisioning were left intact; the previously re-homed copy is preserved at: ${outcome.conflictPaths.join(", ")} -- reconcile these by hand, and do NOT overwrite them from the backup.`
+      : "";
+  // FIX (round 5 / R2-2): a failed daemon teardown means a root LaunchDaemon
+  // may STILL BE LIVE regardless of whether the re-home restore succeeded, so
+  // it gets the LOUD frame -- never the soft "Note: ... re-run to retry" line
+  // the rolledBack===true branch below would otherwise emit (which would
+  // directly contradict the manual-recovery note already folded into
+  // `outcome.reason`).
+  if (outcome.daemonTeardownFailed) {
+    return [
+      `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}).` +
+        ` A root harness LaunchDaemon may still be running under the dedicated account.${backupNote}${conflictNote}` +
+        ` Do not re-run until you have torn it down (see the note above) and recovered any files.`,
+    ];
+  }
+  // FIX (round 5 / R5-2): surface a restore conflict as its own honest frame
+  // (data is safe at conflictPaths) BEFORE the rolledBack branches, which would
+  // otherwise render a pure conflict (restoredCount 0 -> rolledBack false) as
+  // "restore FAILED / recover from backup" -- a false alarm that also
+  // misdirects the operator to clobber their newer recreated file.
+  //
+  // FIX (round 5 / R6-2): ONLY when there is no GENUINE failure. If a real
+  // restore failure co-occurs with a conflict, fall through to the LOUD
+  // rolledBack frames below (which now also carry `conflictNote`), so a
+  // conflict never masks a failure that needs backup recovery.
+  const hasGenuineFailure = outcome.failedPaths !== undefined && outcome.failedPaths.length > 0;
+  if (outcome.conflictPaths !== undefined && outcome.conflictPaths.length > 0 && !hasGenuineFailure) {
+    return [
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}).` +
+        conflictNote +
+        ` The cooperative wrap above still applies. Reconcile the file(s) above, then re-run 'sanctuary protect --hermes'.`,
+    ];
+  }
+  // FIX (round 5 / R3-2): a pre-re-home abort (root-check, operator-identity,
+  // detect, create-account, or a rehome that moved nothing) has NOTHING to
+  // restore. Render a neutral "nothing was changed; safe to re-run" line --
+  // never the "restore of your re-homed files FAILED / do not re-run" alarm
+  // the `rolledBack === false` branch below would otherwise print. This is the
+  // common no-sudo first attempt (stage "root-check").
+  if (outcome.rehomeAttempted === false) {
+    // FIX (round 5 / R4-2): key the account clause on `accountCreated`, not on
+    // `rehomeAttempted` (which only tracks whether a MOVE happened). At the
+    // rehome stage create-account has already succeeded, so an orphaned hidden
+    // account exists even though nothing moved -- claiming "no account was
+    // created" there would be a false all-clear.
+    const accountClause = outcome.accountCreated
+      ? `The dedicated account was created but no files were moved (it will be reused on the next run).`
+      : `No dedicated account was created and nothing was moved.`;
+    return [
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `${accountClause} The cooperative wrap above still applies. ` +
+        `Re-run 'sanctuary protect --hermes' once the cause above is resolved.`,
+    ];
+  }
+  if (outcome.rolledBack === true) {
+    return [
+      `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `Re-homed paths were restored to your account. Re-run 'sanctuary protect --hermes' to retry.`,
+    ];
+  }
+  if (outcome.rolledBack === "partial") {
+    return [
+      `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+        `Only SOME of your re-homed files were restored; the rest need manual recovery.${backupNote}${conflictNote} ` +
+        `Do not re-run until you have recovered the remaining files.`,
+    ];
+  }
+  return [
+    `  WARNING: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
+      `The restore of your re-homed files FAILED; manual recovery is required.${backupNote}${conflictNote} ` +
+      `Do not re-run until you have recovered your files.`,
+  ];
+}
+
+function renderAutoProvisionOutcome(summary: AutoProvisionSummary): void {
+  for (const line of renderAutoProvisionOutcomeLines(summary)) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+    // every line comes from renderAutoProvisionOutcomeLines, which interpolates
+    // only outcome metadata (stage / reason / uid / backup paths this process
+    // itself wrote) -- never secrets or key material.
+    console.error(line);
+  }
+}
+
 export interface RunWrapDeps {
+  /**
+   * Override the auto-provision entry point (for tests). Production
+   * callers leave this undefined and get the real
+   * `wrap/auto-provision.ts:runAutoProvisionForWrap`, which is the ONLY
+   * caller of the privileged (drill-only) account-creation / re-home /
+   * daemon-install / arm side effects.
+   */
+  runAutoProvisionForWrap?: typeof runAutoProvisionForWrap;
   /** Override dashboard starter (for tests). */
   startDashboard?: DashboardStarter;
   /** Override browser opener (for tests). */
@@ -2288,6 +2557,13 @@ export async function runWrap(
     }
 
     failIfAnchorOptInDropped();
+    // Auto-provision Step 2 (Build 1): after the cooperative wrap above has
+    // fully completed (config rewritten, identity bootstrapped, agent
+    // record persisted), offer to provision the dedicated agent account and
+    // arm the wall. Runs AFTER, never blocking, the cooperative wrap: a
+    // decline / non-TTY skip / mid-flow abort here never reverts anything
+    // already done above (fix H4 -- the cooperative wrap always completes).
+    renderAutoProvisionOutcome(await maybeRunAutoProvisionForWrap(agentConfig, options, deps));
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
     printWrapSuccessNoDashboard({
       toolName,
@@ -2576,6 +2852,11 @@ export async function runWrap(
   }
 
   failIfAnchorOptInDropped();
+
+  // Auto-provision Step 2 (Build 1): see the matching call + comment in the
+  // --no-dashboard branch above. Runs after the cooperative wrap (config +
+  // identity + dashboard) has fully completed; never reverts it.
+  renderAutoProvisionOutcome(await maybeRunAutoProvisionForWrap(agentConfig, options, deps));
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
@@ -3793,6 +4074,8 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--no-dashboard",
   "--allow-plaintext-remote",
   "--anchor-transparency",
+  "--provision-agent-account",
+  "--no-provision-agent-account",
   "--help",
   "-h",
 ]);
@@ -3892,6 +4175,12 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--anchor-transparency":
         options.anchorTransparency = true;
+        break;
+      case "--provision-agent-account":
+        options.provisionAgentAccount = true;
+        break;
+      case "--no-provision-agent-account":
+        options.provisionAgentAccount = false;
         break;
       case "--fortress":
         options.fortress = argv[++i];

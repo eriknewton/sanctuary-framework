@@ -1,0 +1,210 @@
+/**
+ * Auto-provision Step 2 (Build 1): `sanctuary protect`-level wiring tests.
+ *
+ * `castle-wall/provision/orchestrate.test.ts` already exercises the full
+ * folded-fix sequencing (detect -> plan -> confirm -> create -> re-home ->
+ * install-daemon -> verify -> uid-gate -> arm -> post-arm-recheck) against
+ * pure mocks. What that suite does NOT cover is the CALLER-SIDE gate this
+ * file targets: `wrap/cli.ts`'s `maybeRunAutoProvisionForWrap`, which decides
+ * WHETHER to invoke the orchestration at all from a real `runWrap` call, and
+ * the `--provision-agent-account` / `--no-provision-agent-account` CLI flags
+ * that feed it (fix L2: pre-answer the CHOICE only).
+ *
+ * Covered here:
+ *   - `parseWrapArgs` captures both new flags correctly (and leaves the
+ *     option unset when neither is passed, preserving the interactive-only
+ *     default).
+ *   - `runWrap` calls the injected `runAutoProvisionForWrap` dep ONLY for
+ *     `--hermes` (v1 scope: D1 headless-agent-runtime-only, Hermes-first
+ *     adapter) and never for other platforms.
+ *   - `runWrap --dry-run` NEVER invokes auto-provision (dry-run must stay
+ *     write-free end-to-end, matching the existing `options.dryRun`
+ *     early-return the rest of the wrap pipeline honors).
+ *   - the `isTty` and `preAnsweredProvision` values passed to the dep mirror
+ *     `process.stdin.isTTY` and `options.provisionAgentAccount` exactly.
+ *   - a thrown error from the auto-provision dep is caught and reported as a
+ *     note (fix H4: it never turns an otherwise-successful cooperative wrap
+ *     into a hard CLI failure -- `runWrap` must still resolve).
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { mkdtemp, rm, cp, mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import {
+  parseWrapArgs,
+  runWrap,
+  type RunWrapDeps,
+  type WrapOptions,
+} from "../../src/wrap/cli.js";
+import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
+import type { DashboardHandle } from "../../src/dashboard/index.js";
+import {
+  agreeingHermesParity,
+  installHermesParityHook,
+  clearHermesParityHook,
+} from "../helpers/hermes-parity.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const fixturesDir = join(__dirname, "..", "harness", "fixtures");
+
+describe("parseWrapArgs --provision-agent-account / --no-provision-agent-account (fix L2)", () => {
+  it("captures --provision-agent-account as true", () => {
+    const opts = parseWrapArgs(["--hermes", "--provision-agent-account"]);
+    expect(opts.provisionAgentAccount).toBe(true);
+  });
+
+  it("captures --no-provision-agent-account as false (explicit decline)", () => {
+    const opts = parseWrapArgs(["--hermes", "--no-provision-agent-account"]);
+    expect(opts.provisionAgentAccount).toBe(false);
+  });
+
+  it("leaves provisionAgentAccount undefined when neither flag is passed (interactive prompt is the sole decision point)", () => {
+    const opts = parseWrapArgs(["--hermes"]);
+    expect(opts.provisionAgentAccount).toBeUndefined();
+  });
+});
+
+describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
+  let tmpHome: string;
+  let originalHome: string | undefined;
+  let originalStoragePath: string | undefined;
+  let originalIsTty: boolean | undefined;
+  let stderrSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(async () => {
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-autoprovision-wiring-"));
+    originalHome = process.env.HOME;
+    originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    originalIsTty = process.stdin.isTTY;
+    process.env.HOME = tmpHome;
+    process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
+    // SAFETY: stdout is not a real console; silencing the operator-facing
+    // channel keeps test output clean without changing runWrap's behavior.
+    stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    installHermesParityHook(agreeingHermesParity);
+  });
+
+  afterEach(async () => {
+    stderrSpy.mockRestore();
+    clearHermesParityHook();
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+    else process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+    Object.defineProperty(process.stdin, "isTTY", {
+      value: originalIsTty,
+      configurable: true,
+    });
+    await rm(tmpHome, { recursive: true, force: true });
+  });
+
+  function setTty(value: boolean | undefined): void {
+    Object.defineProperty(process.stdin, "isTTY", { value, configurable: true });
+  }
+
+  function baseDeps(
+    overrides: Partial<RunWrapDeps> = {},
+  ): RunWrapDeps {
+    const fakeHandle: DashboardHandle = {
+      url: "http://127.0.0.1:0",
+      port: 0,
+      host: "127.0.0.1",
+      mode: "co-located",
+      stop: async () => {},
+    } as unknown as DashboardHandle;
+    return {
+      startDashboard: async () => fakeHandle,
+      openBrowser: async () => {},
+      resolvePassphrase: async () => ({
+        value: "test-passphrase",
+        location: "test-keychain",
+        source: "generated" as const,
+      }),
+      ...overrides,
+    };
+  }
+
+  async function installHermesFixture(): Promise<void> {
+    const hermesDir = join(tmpHome, ".hermes");
+    await mkdir(hermesDir, { recursive: true });
+    await cp(join(fixturesDir, "hermes.json"), join(hermesDir, "cli-config.json"));
+  }
+
+  async function installClaudeCodeFixture(): Promise<void> {
+    await cp(join(fixturesDir, "flat-mcp.json"), join(tmpHome, ".claude.json"));
+  }
+
+  function options(extra: WrapOptions = {}): WrapOptions {
+    return { noOpen: true, noDashboard: true, ...extra };
+  }
+
+  it("invokes the auto-provision dep for --hermes", async () => {
+    await installHermesFixture();
+    setTty(true);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    await runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap }));
+    expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
+  });
+
+  it("never invokes the auto-provision dep for a non-Hermes platform (v1 = Hermes-only)", async () => {
+    await installClaudeCodeFixture();
+    setTty(true);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    await runWrap(options({ claudeCode: true }), baseDeps({ runAutoProvisionForWrap }));
+    expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
+  });
+
+  it("never invokes the auto-provision dep on --dry-run (dry-run stays write-free end-to-end)", async () => {
+    await installHermesFixture();
+    setTty(true);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    await runWrap(options({ hermes: true, dryRun: true }), baseDeps({ runAutoProvisionForWrap }));
+    expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
+  });
+
+  it("passes isTty from process.stdin.isTTY and preAnsweredProvision from options.provisionAgentAccount through unchanged", async () => {
+    await installHermesFixture();
+    setTty(false);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    await runWrap(
+      options({ hermes: true, provisionAgentAccount: false }),
+      baseDeps({ runAutoProvisionForWrap }),
+    );
+    expect(runAutoProvisionForWrap).toHaveBeenCalledWith(
+      expect.objectContaining({ isTty: false, preAnsweredProvision: false }),
+    );
+  });
+
+  it("fix H4: a thrown auto-provision error is caught and reported as a note; runWrap still resolves", async () => {
+    await installHermesFixture();
+    setTty(true);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => {
+      throw new Error("sysadminctl exited 1");
+    });
+    await expect(
+      runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap })),
+    ).resolves.toBeUndefined();
+    expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
+  });
+
+  it("FIX (round 5, R8-2): a ProvisionLockHeldError is reported as an HONEST no-mutation note, not the generic 'may have partially applied / consider disarming' warning", async () => {
+    const { ProvisionLockHeldError } = await import("../../src/castle-wall/provision/index.js");
+    await installHermesFixture();
+    setTty(true);
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => {
+      throw new ProvisionLockHeldError("/var/run/sanctuary-provision.lock");
+    });
+    await expect(
+      runWrap(options({ hermes: true }), baseDeps({ runAutoProvisionForWrap })),
+    ).resolves.toBeUndefined();
+    const printed = stderrSpy.mock.calls.map((c) => String(c[0])).join("\n");
+    // Honest: another provisioning run is in progress; THIS run changed nothing.
+    expect(printed).toMatch(/another 'sanctuary protect' provisioning run is already in progress/);
+    expect(printed).toMatch(/made NO account, re-home, or Castle Wall changes/);
+    // Must NOT emit the partial-apply / disarm warning for a lock-held no-op.
+    expect(printed).not.toMatch(/may have PARTIALLY applied/);
+  });
+});
