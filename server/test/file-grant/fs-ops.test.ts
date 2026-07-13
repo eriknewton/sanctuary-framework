@@ -3,12 +3,11 @@
  *
  * Exercises the production `PosixFileGrantFsOps` wiring against a real
  * temp directory (mkdtemp, matching the repo's safe temp-dir pattern in
- * `egress-gate/pf-anchor.ts`). R3-3: `place()` never chowns the per-agent
- * subdirectory to a different uid at all (v1 never applies the functional
- * cross-uid read primitive, so a chown accomplished nothing useful and only
- * blocked a non-root operator's later revoke -- see the module's own
- * doc-comment), so every placement here -- same-uid or a configured uid
- * split -- stays operator-owned. Every OTHER file-grant test uses the
+ * `egress-gate/pf-anchor.ts`). `place()` never chowns the per-agent
+ * subdirectory to a different uid at all. The read primitive is the explicit
+ * source-inode ACL plus execute-only grant-tree ancestor traversal, so
+ * placement stays operator-owned and non-root revoke can unlink it. Every
+ * OTHER file-grant test uses the
  * injected `FakeFsOps` fake per the build spec's testability shape -- this
  * file is the one place that proves the real implementation's plumbing
  * (realpath / place / removeEntry / no-descriptor-configured uid resolution)
@@ -16,11 +15,30 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { execFile as nodeExecFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { PosixFileGrantFsOps } from "../../src/file-grant/fs-ops.js";
+import { mintFileGrant } from "../../src/file-grant/mint.js";
+import {
+  PosixFileGrantFsOps,
+  type FileGrantExecCommand,
+  type FileGrantMacAclLinkOps,
+} from "../../src/file-grant/fs-ops.js";
+import { makeFileGrantTestStore } from "./fixtures.js";
+
+function execFile(file: string, args: string[]): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    nodeExecFile(file, args, (error) => {
+      if (error) {
+        rejectPromise(error);
+        return;
+      }
+      resolvePromise();
+    });
+  });
+}
 
 describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
   let fortressDir: string;
@@ -58,11 +76,20 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     const content = await readFile(placedPath, "utf-8");
     expect(content).toBe("operator data");
 
-    await fsOps.removeEntry("agent-1/fg_abc123");
+    const removed = await fsOps.removeEntry("agent-1/fg_abc123");
+    expect(removed).toEqual({
+      treeEntryRemoved: true,
+      aclRemoval: { status: "not_applicable" },
+      scrubbed: true,
+    });
     await expect(readFile(placedPath, "utf-8")).rejects.toThrow();
 
     // Idempotent: removing an already-absent entry does not throw.
-    await expect(fsOps.removeEntry("agent-1/fg_abc123")).resolves.toBeUndefined();
+    await expect(fsOps.removeEntry("agent-1/fg_abc123")).resolves.toEqual({
+      treeEntryRemoved: false,
+      aclRemoval: { status: "not_applicable" },
+      scrubbed: true,
+    });
   });
 
   it("agentUid resolves null when no agent-origin descriptor is configured (honest same-uid default)", async () => {
@@ -108,12 +135,11 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     if (processUid === undefined) return; // POSIX-only path
 
     // Configure a dedicated agent uid DISTINCT from the running process uid.
-    // R3-3: v1 never applies a cross-uid chown at all (it never applied the
-    // functional read primitive anyway, so the chown accomplished nothing
-    // useful and only made the subdir agent-owned/0700, blocking a non-root
-    // operator revoke). place() must NOT throw, must place the symlink, and
-    // must leave the per-agent subdir OPERATOR-owned (the running process
-    // uid), never chowned to the configured agent uid.
+    // v1 never applies a cross-uid chown at all. The source-inode ACL carries
+    // the read grant, while the grant-tree symlink stays operator-owned.
+    // place() must NOT throw, must place the symlink, and must leave the
+    // per-agent subdir OPERATOR-owned (the running process uid), never chowned
+    // to the configured agent uid.
     const originDir = join(fortressDir, "policy", "egress");
     await mkdir(originDir, { recursive: true });
     await writeFile(
@@ -158,5 +184,64 @@ describe("PosixFileGrantFsOps (real filesystem, same-uid lane)", () => {
     const canonical = await fsOps.realpath(source);
 
     await expect(fsOps.place(canonical, "agent-1/fg_fatal")).rejects.toThrow();
+  });
+
+  it("mint refuses a FIFO before any hard link, ACE, probe, or grant record", async () => {
+    if (process.platform === "win32" || process.getuid === undefined) return;
+
+    const originDir = join(fortressDir, "policy", "egress");
+    await mkdir(originDir, { recursive: true });
+    await writeFile(
+      join(originDir, "agent-origin.json"),
+      JSON.stringify({
+        mode: "uid",
+        agent_uid: process.getuid() + 1,
+        system_uid_allow_ceiling: 1,
+      })
+    );
+
+    const fifo = join(sourceDir, "source.fifo");
+    await execFile("mkfifo", [fifo]);
+    const commands: FileGrantExecCommand[] = [];
+    const hardLinks: Array<{ existingPath: string; newPath: string }> = [];
+    const macAclLinkOps: FileGrantMacAclLinkOps = {
+      link: async (existingPath, newPath) => {
+        hardLinks.push({ existingPath, newPath });
+      },
+      open: async () => {
+        throw new Error("unexpected macOS ACL hard-link open");
+      },
+      rm: async () => {},
+    };
+    const fsOps = new PosixFileGrantFsOps(fortressDir, {
+      platform: "darwin",
+      macAclLinkOps,
+      execRunner: {
+        execFile: async (command) => {
+          commands.push(command);
+          if (command.file === "id") return { stdout: "agentuser\n", stderr: "" };
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+    const { grantStore } = makeFileGrantTestStore();
+
+    await expect(
+      mintFileGrant(
+        {
+          subjectAgentId: "agent-1",
+          scope: { kind: "file", path: fifo },
+          mode: "read",
+          ttlSeconds: 3600,
+          createdBy: "operator-1",
+        },
+        { fsOps, store: grantStore, now: new Date("2026-07-13T00:00:00.000Z") }
+      )
+    ).rejects.toThrow(/not a regular file or directory/);
+
+    expect(await grantStore.list()).toHaveLength(0);
+    expect(commands).toHaveLength(0);
+    expect(hardLinks).toHaveLength(0);
+    await expect(stat(join(fortressDir, "grants"))).rejects.toThrow();
   });
 });

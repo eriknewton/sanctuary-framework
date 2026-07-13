@@ -12,11 +12,12 @@ import type { FileGrant, FileGrantEnforcement, FileGrantStatus } from "./types.j
 
 /**
  * Pure honesty verdict for a grant's enforcement, given the resolved uids and
- * whether an agent-uid readability probe has actually confirmed access. This
- * is the single place the `met`/`unverified`/`unmet` decision is made, so the
- * "never overclaim from a uid-split alone" rule (Invariant #5, build spec
- * section 10) is enforced in ONE testable function rather than scattered
- * comparisons.
+ * whether an agent-uid readability probe has actually confirmed a read through
+ * the grant tree. This is the single place the `met`/`unverified`/`unmet`
+ * decision is made, so the "never overclaim from a uid-split alone" rule
+ * (Invariant #5, build spec section 10) is enforced in ONE testable function
+ * rather than scattered comparisons. POSIX ACL read is inode-scoped, not
+ * grant-tree-only; in the confined model the grant tree is the reachable path.
  *
  * - `agentUid === null`                    -> `unmet` (no dedicated agent
  *   account on this host, nothing to enforce with).
@@ -27,9 +28,10 @@ import type { FileGrant, FileGrantEnforcement, FileGrantStatus } from "./types.j
  *   boundary to enforce). This is the case a `sudo` mint would otherwise
  *   falsely report as enforced if the comparison used `process.getuid()`.
  * - a real, distinct boundary but NOT `readVerified` -> `unverified`
- *   (configured; on-hardware read-scope not yet verified -- the deferred
- *   drill). v1's autonomous path always lands here for a uid split.
- * - a real, distinct boundary AND `readVerified` -> `met`.
+ *   (configured, but a read through the grant tree was not confirmed in this
+ *   operation).
+ * - a real, distinct boundary AND `readVerified` -> `met` (confirmed read
+ *   through the grant tree).
  */
 export function determineEnforcement(params: {
   agentUid: number | null;

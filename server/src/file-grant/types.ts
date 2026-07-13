@@ -6,8 +6,8 @@
  * for the full build spec. This module gives an operator a way to hand an
  * agent read access to a specific file or directory on the SAME box, with the
  * grant recorded as a first-class encrypted state object and (where the
- * dedicated agent uid exists) enforced by real POSIX ownership on a per-agent
- * grant tree.
+ * dedicated agent uid exists) backed by a platform ACL on the source inode
+ * plus an agent-uid readability probe through a per-agent grant tree.
  *
  * v1 is deliberately narrow: box-local, read-only, mint wired to the truly
  * non-relaxable Tier-1 set. The daily-driver pull surface, `request_file_access`,
@@ -32,6 +32,55 @@ export interface FileGrantScope {
   kind: FileGrantScopeKind;
   /** Absolute, canonicalized (realpath'd at mint) operator-side source path. */
   path: string;
+}
+
+/** Stable source inode identity captured from fstat on an opened source fd. */
+export interface FileGrantSourceIdentity {
+  /** Decimal string to avoid JSON precision loss on large dev values. */
+  source_dev: string;
+  /** Decimal string to avoid JSON precision loss on large inode values. */
+  source_ino: string;
+}
+
+/**
+ * Source file opened and fstat'd during mint. Production keeps this fd open
+ * across ACL apply and probe so path swaps cannot redirect those steps.
+ */
+export interface FileGrantPinnedSource extends FileGrantSourceIdentity {
+  source_realpath: string;
+  source_owner_uid: number | null;
+  /** Linux fd-scoped path for child ACL commands, for example /proc/<pid>/fd/<fd>. */
+  source_fd_path?: string;
+  close(): Promise<void>;
+}
+
+/**
+ * The exact POSIX read ACE this grant added to the source inode.
+ *
+ * POSIX ACL read is inode-scoped, not grant-tree-path-scoped. The grant tree
+ * is the agent's reach path in the confined model because the agent uid cannot
+ * traverse the operator's source directories. The same uid could read this
+ * same inode through any other path it can already reach.
+ */
+export interface FileGrantGrantedReadAce {
+  agent_uid: number;
+  platform: NodeJS.Platform;
+  source_realpath: string;
+  /** Present on grants minted after inode-pinning was added. Missing legacy values fail closed on ACL cleanup. */
+  source_dev?: string;
+  /** Present on grants minted after inode-pinning was added. Missing legacy values fail closed on ACL cleanup. */
+  source_ino?: string;
+  /** macOS ACL removal needs the same principal string used during grant. */
+  mac_principal?: string;
+  /**
+   * macOS chmod is path-scoped and has no fd path equivalent, so new macOS
+   * grants apply and remove the read ACE through this verified hard link in
+   * the operator-owned grant tree. It is persisted only after fstat confirms
+   * the link's dev/ino equals the pinned source. The source and grant tree
+   * must be on the same filesystem; EXDEV leaves enforcement unverified and
+   * no ACE is applied.
+   */
+  mac_acl_hardlink_path?: string;
 }
 
 /**
@@ -65,6 +114,11 @@ export interface FileGrant {
   revoked_at: string | null;
   /** Relative path placed under the grant tree; scrubbed on revoke/expiry. */
   tree_entry: string;
+  /**
+   * Present only when mint actually applied a source-inode read ACL. Older
+   * grants and grants where ACL application never happened omit it or set null.
+   */
+  granted_read_ace?: FileGrantGrantedReadAce | null;
   audit_refs: string[];
 }
 
@@ -100,10 +154,33 @@ export const FILE_GRANT_DEFAULTS = {
 export interface FsOps {
   /** Canonicalize (realpath) an operator-supplied source path. Throws if the path does not exist. */
   realpath(path: string): Promise<string>;
+  /** Open the canonical source without following a final symlink and capture its inode identity. */
+  pinSource(canonicalPath: string): Promise<FileGrantPinnedSource>;
   /** Place (symlink) the canonical source at the given relative tree-entry path. */
   place(canonicalSrc: string, relativeTreeEntry: string): Promise<void>;
-  /** Remove a tree-entry path. Idempotent: removing an absent entry is a no-op, not an error. */
-  removeEntry(relativeTreeEntry: string): Promise<void>;
+  /** Apply the host ACL primitive to the source inode and grant-tree ancestors. */
+  grantAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number,
+    pinnedSource: FileGrantPinnedSource
+  ): Promise<FileGrantAclResult>;
+  /**
+   * Confirm by running a bounded read probe as `agentUid`. Returns true only
+   * when the probe opens and reads the same inode pinned during mint.
+   */
+  probeAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number,
+    pinnedSource: FileGrantSourceIdentity
+  ): Promise<boolean>;
+  /**
+   * Remove a tree-entry path. Idempotent when the entry is absent, unless an
+   * ACL target is supplied and ACL cleanup itself fails.
+   */
+  removeEntry(
+    relativeTreeEntry: string,
+    options?: FileGrantRemoveEntryOptions
+  ): Promise<FileGrantRemoveEntryResult>;
   /** The dedicated agent uid for `subjectAgentId`, or null if no uid-split origin is configured. */
   agentUid(subjectAgentId: string): Promise<number | null>;
   /**
@@ -118,23 +195,62 @@ export interface FsOps {
   sourceOwnerUid(canonicalPath: string): Promise<number | null>;
 }
 
+export type FileGrantAclStatus =
+  | "applied"
+  | "unsupported_platform"
+  | "not_privileged"
+  | "failed";
+
+export interface FileGrantAclResult {
+  status: FileGrantAclStatus;
+  platform: NodeJS.Platform;
+  reason?: string;
+  grantedReadAce?: FileGrantGrantedReadAce;
+}
+
+export interface FileGrantRemoveEntryOptions {
+  /** Persisted source-inode ACE to strip. If absent, ACL cleanup is skipped. */
+  grantedReadAce?: FileGrantGrantedReadAce | null;
+}
+
+export type FileGrantAclRemovalStatus =
+  | "removed"
+  | "not_applicable"
+  | "unsupported_platform"
+  | "failed";
+
+export interface FileGrantAclRemovalResult {
+  status: FileGrantAclRemovalStatus;
+  agent_uid?: number;
+  platform?: NodeJS.Platform;
+  source_realpath?: string;
+  reason?: string;
+}
+
+export interface FileGrantRemoveEntryResult {
+  /** True when the tree entry was unlinked in this call. False if already absent. */
+  treeEntryRemoved: boolean;
+  aclRemoval: FileGrantAclRemovalResult;
+  /** False when a residual source-inode ACE may remain. */
+  scrubbed: boolean;
+}
+
 /**
- * Whether the box-local read-scope boundary is actually enforced for a grant.
+ * Whether the box-local file-grant primitive has been confirmed for a grant.
  *
  * - `met`       the agent uid is distinct from the source-file owner AND an
- *               agent-uid readability probe has CONFIRMED the placed entry is
- *               readable by that uid (the real primitive applied and was
- *               verified). Only produced on a real dedicated-uid host with the
- *               privilege to apply + verify the primitive; v1's autonomous /
- *               CI path never fabricates it.
+ *               agent-uid read of the granted file through the grant tree was
+ *               CONFIRMED in this mint operation. POSIX ACL read is
+ *               inode-scoped: the same uid could read that same file through
+ *               any other path it can reach. In the confined model the agent
+ *               reaches it only through the grant tree because operator source
+ *               directories remain non-traversable.
  * - `unverified` a real boundary exists (dedicated agent uid, distinct from
  *               the source owner) but on-hardware read-scope has NOT been
- *               verified. v1 records the grant and places the tree entry; the
- *               functional cross-uid read primitive (POSIX ACL / ownership)
- *               and its readability verification are the separate Erik-present
- *               acceptance drill (build spec section 8). This is the honest
- *               "configured, on-hardware read-scope not yet verified" label --
- *               v1 must NEVER upgrade it to "met" from a uid-split alone.
+ *               verified in the current operation. This includes unsupported
+ *               platforms, missing privilege, ACL apply failure, probe failure,
+ *               and probe timeout. A uid split or ACL success alone must NEVER
+ *               upgrade to "met".
  * - `unmet`     no dedicated agent uid is configured, or the agent uid equals
  *               the source-file owner (the agent already owns / can read the
  *               source, so there is no boundary to enforce). Nothing is
