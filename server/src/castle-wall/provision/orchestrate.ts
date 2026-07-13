@@ -504,7 +504,6 @@ export async function runProvisionFlow(
   // that already targets this fortress; REFUSE to swap a wall that belongs to a
   // DIFFERENT fortress -- one machine runs one wall). This step NEVER arms the
   // filter and NEVER leaves the box filter-on/daemon-down.
-  let policyDaemonFreshlyInstalled = false;
   const ensure = await ops.ensurePolicyDaemon(ctx.fortressPath);
   if (!ensure.ok) {
     // Fail-closed: we never proceed to arm without a reachable policy daemon.
@@ -536,7 +535,7 @@ export async function runProvisionFlow(
   // from nothing. Every LATER abort branch below threads this into
   // `teardownDaemonAndRestore` so a fresh install is torn back down while a
   // pre-existing (or already-reachable) wall is left untouched.
-  policyDaemonFreshlyInstalled = ensure.freshlyInstalled;
+  const policyDaemonFreshlyInstalled = ensure.freshlyInstalled;
   ops.print(
     policyDaemonFreshlyInstalled
       ? "Castle Wall policy daemon installed for this fortress; ready to arm."
