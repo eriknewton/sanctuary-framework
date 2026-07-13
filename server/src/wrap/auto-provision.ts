@@ -1240,11 +1240,12 @@ export async function runAutoProvisionForWrap(
       let staticVerify;
       try {
         const persistedRules = await readEgressRulesFromDisk(wallFortressPath);
-        // Same resolver enumeration the daemon signs with (scutil --dns
-        // unioned with dns.getServers() on macOS): the static verify must
-        // judge the derived DNS rule against the resolver set the host's
-        // queries actually go to (2026-07-12 drill bug: Tailscale MagicDNS
-        // was the live resolver but absent from dns.getServers()).
+        // Same resolver enumeration the daemon signs with (a fresh
+        // scutil --dns read on macOS, empty on failure): the static verify
+        // must judge the derived DNS rule against the resolver set the
+        // host's queries actually go to (2026-07-12 drill bug: Tailscale
+        // MagicDNS was the live resolver but absent from the daemon's stale
+        // dns.getServers() snapshot).
         const { collectSystemResolvers } = await import(
           "../castle-wall/runtime/system-resolvers.js"
         );

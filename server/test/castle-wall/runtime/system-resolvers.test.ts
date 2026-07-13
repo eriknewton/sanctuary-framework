@@ -2,13 +2,15 @@
  * Active-resolver-set enumeration tests (the 2026-07-12 Mini1 drill bug).
  *
  * The derived DNS allow (#380) must scope to the resolver set the host's
- * queries ACTUALLY go to. On macOS `dns.getServers()` and `scutil --dns`
- * diverge under NetworkExtension DNS providers (Tailscale MagicDNS at
- * 100.100.100.100 was the live resolver on the drill host while
- * `dns.getServers()` never reported it), so `collectSystemResolvers` unions
- * the two there. These tests exercise the parse, the non-unicast filtering,
- * the union/dedupe, the non-darwin passthrough, the narrower-never-wider
- * scutil-failure fallback, and the end-to-end derivation composition.
+ * queries ACTUALLY go to. On macOS a long-lived daemon's `dns.getServers()`
+ * is a process-lifetime snapshot and the resolv.conf view misses configd's
+ * scoped resolvers, so `collectSystemResolvers` reads `scutil --dns` fresh
+ * there and FAILS CLOSED (empty set -> no derived rule -> loud refuse-to-arm)
+ * when that read is unavailable -- it never falls back to the possibly-stale
+ * snapshot (adversarial-review BLOCKER on the first cut). These tests
+ * exercise the parse, the byte-level non-unicast classification, zone-scoped
+ * entry rejection, the non-darwin passthrough, the fail-closed failure path,
+ * and the end-to-end derivation composition.
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -93,10 +95,25 @@ describe("castle-wall/runtime/system-resolvers parseScutilDnsNameservers", () =>
     expect(parseScutilDnsNameservers(output)).toEqual(["9.9.9.9"]);
   });
 
-  it("keeps link-local resolvers with a zone id (normalization is downstream)", () => {
-    expect(parseScutilDnsNameservers("  nameserver[0] : fe80::1%en0")).toEqual([
-      "fe80::1%en0",
-    ]);
+  it("drops noncanonical non-unicast spellings by parsed bytes (review LOW)", () => {
+    const output = [
+      "  nameserver[0] : 0:0:0:0:0:0:0:0",
+      "  nameserver[1] : 0000::",
+      "  nameserver[2] : ::ffff:255.255.255.255",
+      "  nameserver[3] : ::ffff:224.0.0.251",
+      "  nameserver[4] : ::ffff:9.9.9.9",
+      "  nameserver[5] : FF02::FB",
+      "  nameserver[6] : 0.1.2.3",
+    ].join("\n");
+    expect(parseScutilDnsNameservers(output)).toEqual(["::ffff:9.9.9.9"]);
+  });
+
+  it("drops zone-scoped link-local entries instead of widening them (review MED)", () => {
+    const output = [
+      "  nameserver[0] : fe80::1%en0",
+      "  nameserver[1] : 9.9.9.9",
+    ].join("\n");
+    expect(parseScutilDnsNameservers(output)).toEqual(["9.9.9.9"]);
   });
 
   it("ignores non-nameserver lines (domains, flags, if_index)", () => {
@@ -110,17 +127,19 @@ describe("castle-wall/runtime/system-resolvers parseScutilDnsNameservers", () =>
 });
 
 describe("castle-wall/runtime/system-resolvers collectSystemResolvers", () => {
-  it("darwin: unions dns.getServers() with the scutil nameserver set, deduped", async () => {
+  it("darwin: returns the fresh scutil nameserver set and never reads the getServers snapshot", async () => {
+    const getServersFn = vi.fn(() => ["10.99.99.99"]);
     const resolvers = await collectSystemResolvers({
       platform: "darwin",
-      getServersFn: () => ["192.168.1.1"],
+      getServersFn,
       runScutilDns: async () => SCUTIL_TAILSCALE_SAMPLE,
     });
     expect(resolvers).toEqual([
-      "192.168.1.1",
       "100.100.100.100",
       "fd7a:115c:a1e0::53",
+      "192.168.1.1",
     ]);
+    expect(getServersFn).not.toHaveBeenCalled();
   });
 
   it("non-darwin: returns dns.getServers() unchanged and never runs scutil", async () => {
@@ -134,21 +153,22 @@ describe("castle-wall/runtime/system-resolvers collectSystemResolvers", () => {
     expect(runScutilDns).not.toHaveBeenCalled();
   });
 
-  it("darwin: a scutil failure falls back to dns.getServers() alone (narrower, never wider)", async () => {
+  it("darwin: a scutil failure FAILS CLOSED to an empty set, never the stale snapshot (review BLOCKER)", async () => {
+    const getServersFn = vi.fn(() => ["192.168.1.1"]);
     const resolvers = await collectSystemResolvers({
       platform: "darwin",
-      getServersFn: () => ["192.168.1.1"],
+      getServersFn,
       runScutilDns: async () => {
         throw new Error("scutil timed out");
       },
     });
-    expect(resolvers).toEqual(["192.168.1.1"]);
+    expect(resolvers).toEqual([]);
+    expect(getServersFn).not.toHaveBeenCalled();
   });
 
-  it("darwin: scutil failure with an empty getServers() stays empty (fail-closed downstream: no derived rule)", async () => {
+  it("darwin: the fail-closed empty set derives NO rule (deny DNS, never an any-resolver or stale grant)", async () => {
     const resolvers = await collectSystemResolvers({
       platform: "darwin",
-      getServersFn: () => [],
       runScutilDns: async () => {
         throw new Error("boom");
       },
@@ -163,10 +183,9 @@ describe("castle-wall/runtime/system-resolvers collectSystemResolvers", () => {
     ).toBeNull();
   });
 
-  it("end-to-end: the derived DNS rule now carries the Tailscale MagicDNS resolver (the drill bug)", async () => {
+  it("end-to-end: the derived DNS rule carries the Tailscale MagicDNS resolver (the drill bug)", async () => {
     const resolvers = await collectSystemResolvers({
       platform: "darwin",
-      getServersFn: () => ["192.168.1.1"],
       runScutilDns: async () => SCUTIL_TAILSCALE_SAMPLE,
     });
     const derived = deriveDnsRuleForHostnameRules({
@@ -177,6 +196,7 @@ describe("castle-wall/runtime/system-resolvers collectSystemResolvers", () => {
     expect(derived?.id).toBe(DERIVED_DNS_RULE_ID);
     expect(derived?.match.ip).toContain("100.100.100.100");
     expect(derived?.match.ip).toContain("fd7a:115c:a1e0::53");
+    expect(derived?.match.ip).toContain("192.168.1.1");
     expect(derived?.match.port).toEqual([53]);
   });
 });

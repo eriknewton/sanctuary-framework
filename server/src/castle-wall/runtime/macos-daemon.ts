@@ -1390,11 +1390,10 @@ async function loadManifestState(input: {
   // ALWAYS injected (a conflicting operator ruleset throws — fail closed,
   // never a wall that can silence distress), then the scoped DNS allow
   // (#380) is derived when hostname allow-rules exist. The rule scopes to
-  // the host's ACTIVE resolver set ONLY (collectSystemResolvers: on macOS
-  // the scutil --dns nameserver set unioned with dns.getServers(), because
-  // the two diverge under NetworkExtension DNS providers like Tailscale
-  // MagicDNS -- the 2026-07-12 drill bug); absent when no hostname rules
-  // exist.
+  // the host's ACTIVE resolver set ONLY (collectSystemResolvers: on macOS a
+  // fresh scutil --dns read, EMPTY on failure -- fail closed, never a grant
+  // signed from this long-lived process's stale dns.getServers() snapshot;
+  // the 2026-07-12 drill bug); absent when no hostname rules exist.
   const distressConfig = await readDistressConfig(input.fortressPath);
   const resolvers = await collectSystemResolvers();
   const effectiveRules = composeEffectiveRules({
