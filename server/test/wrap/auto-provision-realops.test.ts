@@ -1222,10 +1222,18 @@ describe("wrap/auto-provision real-ops chokepoint: backup() shape handling (fix 
 
       // The backup is now a REAL file holding the secret (not a symlink); the
       // secret was NOT written through the link, and the victim is untouched.
-      expect((await lstat(returned)).isSymbolicLink()).toBe(false);
-      expect(await readFile(returned, "utf8")).toBe("SUPER-SECRET-LLM-KEY");
-      expect(await readFile(victim, "utf8")).toBe("OPERATOR-DATA-MUST-SURVIVE");
-      expect((await stat(victim)).mode & 0o777).toBe(0o644);
+      // Read each path's content BEFORE its shape/mode check (use-then-check,
+      // never check-then-use) so no assertion trusts a stat across a later
+      // read of the same path (js/file-system-race; the tmp tree is private,
+      // but the no-check-then-use shape is the honest one to model in a test).
+      const returnedContent = await readFile(returned, "utf8");
+      const returnedIsLink = (await lstat(returned)).isSymbolicLink();
+      const victimContent = await readFile(victim, "utf8");
+      const victimMode = (await stat(victim)).mode & 0o777;
+      expect(returnedIsLink).toBe(false);
+      expect(returnedContent).toBe("SUPER-SECRET-LLM-KEY");
+      expect(victimContent).toBe("OPERATOR-DATA-MUST-SURVIVE");
+      expect(victimMode).toBe(0o644);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
