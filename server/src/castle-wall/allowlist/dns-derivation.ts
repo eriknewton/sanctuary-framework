@@ -20,7 +20,13 @@
  *
  * This module is pure (resolvers are passed in) so it is unit-testable without
  * touching the host's real resolver configuration. The daemon supplies
- * `dns.getServers()` (verified to match `scutil --dns` nameservers on macOS).
+ * `collectSystemResolvers()` (runtime/system-resolvers.ts): on macOS that is
+ * `dns.getServers()` unioned with a FRESH `scutil --dns` nameserver read,
+ * because a long-lived daemon's `getServers()` is a process-lifetime snapshot
+ * and the resolv.conf view misses configd's scoped resolvers (the 2026-07-12
+ * drill bug: the daemon's snapshot predated Tailscale MagicDNS becoming the
+ * system resolver, so the derived rule missed 100.100.100.100 and the agent's
+ * DNS was default-denied).
  */
 
 import type { AllowlistRule, RuleScope } from "./schema.js";

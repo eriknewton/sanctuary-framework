@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { getServers } from "node:dns";
 import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
@@ -12,6 +11,7 @@ import type { AuditLog } from "../../operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
 import { composeEffectiveRules } from "../allowlist/habeas-port.js";
+import { collectSystemResolvers } from "./system-resolvers.js";
 import { readDistressConfig } from "../../distress/config.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
 import {
@@ -1390,12 +1390,16 @@ async function loadManifestState(input: {
   // ALWAYS injected (a conflicting operator ruleset throws — fail closed,
   // never a wall that can silence distress), then the scoped DNS allow
   // (#380) is derived when hostname allow-rules exist. The rule scopes to
-  // the system resolvers ONLY (dns.getServers(), verified to match
-  // `scutil --dns`); absent when no hostname rules exist.
+  // the host's ACTIVE resolver set ONLY (collectSystemResolvers: on macOS
+  // the scutil --dns nameserver set unioned with dns.getServers(), because
+  // the two diverge under NetworkExtension DNS providers like Tailscale
+  // MagicDNS -- the 2026-07-12 drill bug); absent when no hostname rules
+  // exist.
   const distressConfig = await readDistressConfig(input.fortressPath);
+  const resolvers = await collectSystemResolvers();
   const effectiveRules = composeEffectiveRules({
     operatorRules: rules,
-    resolvers: getServers(),
+    resolvers,
     distressWebhook: distressConfig.webhook_target,
     exclusiveEgressGate: input.exclusiveEgressGate,
     createdAt: new Date().toISOString(),
