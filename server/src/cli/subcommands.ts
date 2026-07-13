@@ -19,6 +19,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "exit",
   "export-passphrase",
   "federation",
+  "file-grant",
   "generate",
   "identity",
   "import-exit-bundle",

@@ -2,12 +2,42 @@
 
 Generated: 2026-05-21T21:48:37.862Z
 
+**Scoped patch (R3-2, 2026-07-07):** this file was last produced by a full run
+of `scripts/cli-audit-write-inventory.ts` on the date above. Governed
+File-Grant v1 added `file-grant mint/list/revoke` to `COMMAND_TABLE` but never
+regenerated this output, so it was missing all three rows entirely and
+misclassified `file-grant list` as read-only even after `cmdList` started
+calling `reconcileFileGrantTree` (a safe-direction mutator side effect). This
+patch adds the three `file-grant` rows below by hand from the current
+`COMMAND_TABLE` + source, WITHOUT re-running a full inventory generation.
+
+A full regen was attempted and reverted: it surfaces pre-existing drift that
+predates file-grant and is out of scope for this cleanup:
+  - `sanctuary identity create` is a real, currently-unclassified mutator
+    with NO audit-emitting code path in `src/cli/identity.ts` -- a genuine
+    coverage gap, but closing it means adding real audit code to identity
+    creation, not a classification-table fix. Left unclassified pending a
+    dedicated fix.
+  - `sanctuary anomaly status` is an undocumented alias for
+    `anomaly list-subscribed` (same handler, `cmdListSubscribed`,
+    `src/cli/anomaly.ts`) that predates file-grant and was never added to
+    `COMMAND_TABLE`.
+  - The extraction script's case-scanner is a line-scanner, not a parser: it
+    picks up EVERY `case "..."` in a CLI file, including nested switches in
+    non-dispatcher helper functions. `src/cli/file-grant.ts`'s `enforcementLine()`
+    helper has its own `switch (enforcement) { case "met": case "unverified":
+    case "unmet": ... }` that the scanner misreads as three more file-grant
+    subcommands. None of these three actually exist as CLI verbs.
+  A full regen would need to resolve all three before the "no uncertain
+  entries" test goes green again; none of the three is a file-grant hygiene
+  issue, so none is fixed here. Flagged for a follow-up pass.
+
 ## Summary
 
 | Metric | Count |
 |--------|-------|
-| Total CLI subcommands inventoried | 71 |
-| Mutators | 34 |
+| Total CLI subcommands inventoried | 74 |
+| Mutators | 37 |
 | Read-only | 37 |
 | Pure-UI | 0 |
 | **Mutators that do NOT audit (Batch 5b targets)** | **0** |
@@ -48,6 +78,9 @@ Generated: 2026-05-21T21:48:37.862Z
 | `sanctuary erc8004 status` | read-only | n/a | src/cli/erc8004.ts | 118 |
 | `sanctuary exit export` | mutator | yes | src/exit/cli.ts | 267 |
 | `sanctuary exit manifest-shape` | read-only | n/a | src/exit/cli.ts | 208 |
+| `sanctuary file-grant list` | mutator | yes | src/cli/file-grant.ts | 203 |
+| `sanctuary file-grant mint` | mutator | yes | src/cli/file-grant.ts | 197 |
+| `sanctuary file-grant revoke` | mutator | yes | src/cli/file-grant.ts | 209 |
 | `sanctuary honeypot compile` | read-only | n/a | src/honeypot/cli.ts | 150 |
 | `sanctuary honeypot credential-traps` | read-only | n/a | src/honeypot/cli.ts | 286 |
 | `sanctuary honeypot deploy` | mutator | yes | src/honeypot/cli.ts | 199 |

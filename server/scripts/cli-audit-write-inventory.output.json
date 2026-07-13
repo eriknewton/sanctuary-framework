@@ -248,6 +248,30 @@
     "notes": "read-only; audit not required"
   },
   {
+    "subcommand": "sanctuary file-grant list",
+    "file_path": "src/cli/file-grant.ts",
+    "line_number": 203,
+    "classification": "mutator",
+    "audits_currently": true,
+    "notes": "R3-2: reclassified from read-only. cmdList calls reconcileFileGrantTree before listing (safe-direction cleanup: scrubs expired tree entries, flips expired status, emits file_grant_revoke/expired_ttl_scrub audits), so list is a mutator, not purely read-only. It also emits its own file_grant_list access audit via recordFileGrantListAudit (Tier-3 auto-allow + audit)."
+  },
+  {
+    "subcommand": "sanctuary file-grant mint",
+    "file_path": "src/cli/file-grant.ts",
+    "line_number": 197,
+    "classification": "mutator",
+    "audits_currently": true,
+    "notes": "AuditLog.appendCritical in mintFileGrant (success and rolled-back-failure paths); reconciles expired grants on this touch"
+  },
+  {
+    "subcommand": "sanctuary file-grant revoke",
+    "file_path": "src/cli/file-grant.ts",
+    "line_number": 209,
+    "classification": "mutator",
+    "audits_currently": true,
+    "notes": "AuditLog.appendCritical in revokeFileGrant (success, not-found, and scrub-failure paths); reconciles expired grants on this touch"
+  },
+  {
     "subcommand": "sanctuary honeypot compile",
     "file_path": "src/honeypot/cli.ts",
     "line_number": 150,

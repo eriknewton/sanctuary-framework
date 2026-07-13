@@ -76,6 +76,31 @@ describe("CLI audit-write inventory", () => {
     expect(rotateKey!.audits_currently).toBe(true);
   });
 
+  it("classifies sanctuary file-grant list as a mutator, not read-only (R3-2: reconcile side effect)", () => {
+    const entries = loadInventory();
+    const fileGrantList = entries.find(
+      (e) => e.subcommand === "sanctuary file-grant list",
+    );
+    expect(fileGrantList).toBeDefined();
+    // cmdList calls reconcileFileGrantTree before listing, which can scrub
+    // expired tree entries, flip expired status, and emit
+    // file_grant_revoke/expired_ttl_scrub audits -- a safe-direction mutator
+    // side effect, not a pure read. Pin this so the classification cannot
+    // silently regress back to "read-only".
+    expect(fileGrantList!.classification).toBe("mutator");
+    expect(fileGrantList!.audits_currently).toBe(true);
+  });
+
+  it("classifies sanctuary file-grant mint and revoke as mutators with audit", () => {
+    const entries = loadInventory();
+    for (const sub of ["sanctuary file-grant mint", "sanctuary file-grant revoke"]) {
+      const entry = entries.find((e) => e.subcommand === sub);
+      expect(entry, sub).toBeDefined();
+      expect(entry!.classification, sub).toBe("mutator");
+      expect(entry!.audits_currently, sub).toBe(true);
+    }
+  });
+
   it("classifies sanctuary anomaly subscribe as mutator with audit (ZZZZZ batch 5b closed)", () => {
     const entries = loadInventory();
     const sub = entries.find(
