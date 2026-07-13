@@ -14,13 +14,18 @@
  * from the SOURCE file's owner (`sourceOwnerUid`, via `stat`), NEVER from
  * `process.getuid()`, so a `sudo` mint cannot fabricate a false "enforced".
  *
- * FUNCTIONAL PRIMITIVE: `grantAgentRead` resolves the source path before this
- * module sees it, applies the platform ACL operation to that canonical source
- * path, and applies execute-only traversal ACLs to grant-tree ancestors. The
- * grant tree is the agent's reach path, not a second path-scoped boundary.
- * POSIX read ACLs are inode-scoped: the same uid can read the same file
- * through any other path it can reach. `probeAgentRead` verifies readability
- * by running a bounded read through the grant tree as the agent uid.
+ * FUNCTIONAL PRIMITIVE: `grantAgentRead` receives a pinned source inode and
+ * applies the platform ACL operation only through an identity-bound target.
+ * Linux uses the pinned `/proc/<pid>/fd/<fd>` path. macOS has path-scoped
+ * `chmod +a` and no fd path, so it first replaces the grant-tree entry with a
+ * hard link in the operator-owned grant tree, then fstats that link with
+ * O_NOFOLLOW and requires the dev/ino to equal the pinned source. The macOS
+ * source and grant tree must be on the same filesystem; EXDEV or identity
+ * mismatch fails closed as unverified and applies no read ACE. The grant tree
+ * is the agent's reach path, not a second path-scoped boundary. POSIX read
+ * ACLs are inode-scoped: the same uid can read the same file through any
+ * other path it can reach. `probeAgentRead` verifies readability by running a
+ * bounded read through the grant tree as the agent uid.
  *
  * TRAVERSAL NOTE: `ensureTreeRoot` sets the root to `0711` (owner rwx,
  * group/other --x) so a future chowned per-agent leaf stays reachable while
@@ -36,14 +41,14 @@
 import { execFile as nodeExecFile } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import {
+  link as fsLink,
   mkdir,
   lstat,
-  open,
+  open as fsOpen,
   readFile,
   realpath as fsRealpath,
   rm,
   symlink,
-  type FileHandle,
 } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
@@ -80,8 +85,21 @@ export interface FileGrantExecRunner {
   execFile(command: FileGrantExecCommand, timeoutMs: number): Promise<FileGrantExecResult>;
 }
 
+export interface FileGrantOpenedFile {
+  readonly fd?: number;
+  stat(options: { bigint: true }): Promise<{ dev: bigint | number; ino: bigint | number; uid?: bigint | number }>;
+  close(): Promise<void>;
+}
+
+export interface FileGrantMacAclLinkOps {
+  link(existingPath: string, newPath: string): Promise<void>;
+  open(path: string, flags: number): Promise<FileGrantOpenedFile>;
+  rm(path: string, options: { force?: boolean }): Promise<void>;
+}
+
 export interface PosixFileGrantFsOpsOptions {
   execRunner?: FileGrantExecRunner;
+  macAclLinkOps?: FileGrantMacAclLinkOps;
   commandTimeoutMs?: number;
   platform?: NodeJS.Platform;
   nodePath?: string;
@@ -123,6 +141,12 @@ const DEFAULT_EXEC_RUNNER: FileGrantExecRunner = {
       );
     });
   },
+};
+
+const DEFAULT_MAC_ACL_LINK_OPS: FileGrantMacAclLinkOps = {
+  link: fsLink,
+  open: fsOpen,
+  rm,
 };
 
 function agentOriginDescriptorPath(fortressPath: string): string {
@@ -193,7 +217,7 @@ export function buildMacGrantAgentReadCommands(
   treeRoot: string,
   relativeTreeEntry: string,
   principal: string,
-  sourceRealpath: string
+  aclTargetPath: string
 ): FileGrantExecCommand[] {
   const { root, dest } = resolveTreeEntryUnderRoot(treeRoot, relativeTreeEntry);
   return [
@@ -201,15 +225,15 @@ export function buildMacGrantAgentReadCommands(
       file: "chmod",
       args: ["+a", `user:${principal} allow execute`, dir],
     })),
-    { file: "chmod", args: ["+a", `user:${principal} allow read,execute`, sourceRealpath] },
+    { file: "chmod", args: ["+a", `user:${principal} allow read,execute`, aclTargetPath] },
   ];
 }
 
 export function buildMacRevokeAgentReadCommands(
   principal: string,
-  sourceRealpath: string
+  aclTargetPath: string
 ): FileGrantExecCommand[] {
-  return [{ file: "chmod", args: ["-a", `user:${principal} allow read,execute`, sourceRealpath] }];
+  return [{ file: "chmod", args: ["-a", `user:${principal} allow read,execute`, aclTargetPath] }];
 }
 
 export function buildAgentReadProbeCommand(
@@ -246,6 +270,18 @@ function errorText(err: unknown): string {
       .join(" ");
   }
   return String(err);
+}
+
+function errorCode(err: unknown): unknown {
+  return (err as NodeJS.ErrnoException | undefined)?.code;
+}
+
+function isCrossDeviceLinkError(err: unknown): boolean {
+  return errorCode(err) === "EXDEV";
+}
+
+function isMissingPathError(err: unknown): boolean {
+  return errorCode(err) === "ENOENT";
 }
 
 function classifyAclFailure(err: unknown): FileGrantAclStatus {
@@ -303,7 +339,7 @@ function hasPersistedSourceIdentity(
   return typeof ace.source_dev === "string" && typeof ace.source_ino === "string";
 }
 
-async function closeBestEffort(handle: FileHandle): Promise<void> {
+async function closeBestEffort(handle: { close(): Promise<void> }): Promise<void> {
   try {
     await handle.close();
   } catch {
@@ -321,6 +357,7 @@ async function closeBestEffort(handle: FileHandle): Promise<void> {
  */
 export class PosixFileGrantFsOps implements FsOps {
   private readonly execRunner: FileGrantExecRunner;
+  private readonly macAclLinkOps: FileGrantMacAclLinkOps;
   private readonly commandTimeoutMs: number;
   private readonly platform: NodeJS.Platform;
   private readonly nodePath: string;
@@ -330,6 +367,7 @@ export class PosixFileGrantFsOps implements FsOps {
     options: PosixFileGrantFsOpsOptions = {}
   ) {
     this.execRunner = options.execRunner ?? DEFAULT_EXEC_RUNNER;
+    this.macAclLinkOps = options.macAclLinkOps ?? DEFAULT_MAC_ACL_LINK_OPS;
     this.commandTimeoutMs = options.commandTimeoutMs ?? FILE_GRANT_ACL_COMMAND_TIMEOUT_MS;
     this.platform = options.platform ?? process.platform;
     this.nodePath = options.nodePath ?? process.execPath;
@@ -359,9 +397,9 @@ export class PosixFileGrantFsOps implements FsOps {
   }
 
   async pinSource(canonicalPath: string): Promise<FileGrantPinnedSource> {
-    const handle = await open(canonicalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const handle = await fsOpen(canonicalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
     let closed = false;
-    let stats: Awaited<ReturnType<FileHandle["stat"]>>;
+    let stats: { dev: bigint | number; ino: bigint | number; uid?: bigint | number };
     try {
       stats = await handle.stat({ bigint: true });
     } catch (err) {
@@ -440,7 +478,7 @@ export class PosixFileGrantFsOps implements FsOps {
     options: FileGrantRemoveEntryOptions = {}
   ): Promise<FileGrantRemoveEntryResult> {
     const dest = this.resolveUnderRoot(relativeTreeEntry);
-    const aclRemoval = await this.removePersistedAgentReadAcl(options.grantedReadAce);
+    const aclRemoval = await this.removePersistedAgentReadAcl(options.grantedReadAce, dest);
     let treeEntryRemoved = false;
     try {
       const st = await lstat(dest);
@@ -505,6 +543,42 @@ export class PosixFileGrantFsOps implements FsOps {
     }
   }
 
+  /**
+   * macOS has path-scoped ACL tooling and no proc fd path, so the ACL target
+   * is a hard link inside the operator-owned grant tree. The link is accepted
+   * only after fstat confirms it is the pinned source inode. Cross-filesystem
+   * links fail closed before chmod runs.
+   */
+  private async prepareMacAclHardLinkTarget(
+    relativeTreeEntry: string,
+    pinnedSource: FileGrantPinnedSource
+  ): Promise<string> {
+    const dest = this.resolveUnderRoot(relativeTreeEntry);
+    await this.ensureTreeRoot();
+    await mkdir(dirname(dest), { recursive: true, mode: AGENT_SUBDIR_MODE });
+    try {
+      await this.macAclLinkOps.rm(dest, { force: true });
+    } catch {
+      // link() below surfaces any real collision or permissions problem.
+    }
+
+    try {
+      await this.macAclLinkOps.link(pinnedSource.source_realpath, dest);
+      await this.assertMacAclTargetIdentity(dest, pinnedSource, "after macOS ACL hard link");
+      return dest;
+    } catch (err) {
+      await this.removeMacAclHardLinkBestEffort(dest);
+      if (isCrossDeviceLinkError(err)) {
+        throw new Error(
+          `Governed File-Grant: macOS ACL hard link requires source and ` +
+            `grant tree on the same filesystem: ${errorText(err)}`,
+          { cause: err }
+        );
+      }
+      throw err;
+    }
+  }
+
   private async applyAgentReadAcl(
     relativeTreeEntry: string,
     agentUid: number,
@@ -519,6 +593,7 @@ export class PosixFileGrantFsOps implements FsOps {
     }
 
     let sourceLeafCommandAttempted = false;
+    let macAclHardlinkPath: string | undefined;
     try {
       const macPrincipal =
         this.platform === "darwin" ? await this.resolveMacPrincipal(agentUid) : undefined;
@@ -534,12 +609,15 @@ export class PosixFileGrantFsOps implements FsOps {
           pinnedSource.source_fd_path
         );
       } else {
-        await this.assertCurrentSourcePathIdentity(pinnedSource, "before macOS ACL apply");
+        macAclHardlinkPath = await this.prepareMacAclHardLinkTarget(
+          relativeTreeEntry,
+          pinnedSource
+        );
         commands = buildMacGrantAgentReadCommands(
           this.treeRoot(),
           relativeTreeEntry,
           macPrincipal!,
-          pinnedSource.source_realpath
+          macAclHardlinkPath
         );
       }
       const sourceLeafCommand = commands.at(-1);
@@ -549,7 +627,11 @@ export class PosixFileGrantFsOps implements FsOps {
         await this.runCommand(sourceLeafCommand);
       }
       if (this.platform === "darwin") {
-        await this.assertCurrentSourcePathIdentity(pinnedSource, "after macOS ACL apply");
+        await this.assertMacAclTargetIdentity(
+          macAclHardlinkPath!,
+          pinnedSource,
+          "after macOS ACL apply"
+        );
       }
       return {
         status: "applied",
@@ -561,11 +643,15 @@ export class PosixFileGrantFsOps implements FsOps {
           source_dev: pinnedSource.source_dev,
           source_ino: pinnedSource.source_ino,
           ...(macPrincipal ? { mac_principal: macPrincipal } : {}),
+          ...(macAclHardlinkPath ? { mac_acl_hardlink_path: macAclHardlinkPath } : {}),
         },
       };
     } catch (err) {
       if (sourceLeafCommandAttempted) {
-        await this.bestEffortRemoveAgentReadAcl(agentUid, pinnedSource);
+        await this.bestEffortRemoveAgentReadAcl(agentUid, pinnedSource, macAclHardlinkPath);
+      }
+      if (this.platform === "darwin" && macAclHardlinkPath) {
+        await this.removeMacAclHardLinkBestEffort(macAclHardlinkPath);
       }
       return {
         status: classifyAclFailure(err),
@@ -577,7 +663,8 @@ export class PosixFileGrantFsOps implements FsOps {
 
   private async bestEffortRemoveAgentReadAcl(
     agentUid: number,
-    pinnedSource: FileGrantPinnedSource
+    pinnedSource: FileGrantPinnedSource,
+    macAclHardlinkPath?: string
   ): Promise<void> {
     if (this.platform !== "linux" && this.platform !== "darwin") return;
     let commands: FileGrantExecCommand[];
@@ -588,7 +675,9 @@ export class PosixFileGrantFsOps implements FsOps {
       commands =
         this.platform === "linux"
           ? buildLinuxRevokeAgentReadCommands(agentUid, pinnedSource.source_fd_path!)
-          : buildMacRevokeAgentReadCommands(macPrincipal!, pinnedSource.source_realpath);
+          : macAclHardlinkPath
+            ? buildMacRevokeAgentReadCommands(macPrincipal!, macAclHardlinkPath)
+            : [];
     } catch {
       return;
     }
@@ -603,7 +692,8 @@ export class PosixFileGrantFsOps implements FsOps {
   }
 
   private async removePersistedAgentReadAcl(
-    grantedReadAce: FileGrantGrantedReadAce | null | undefined
+    grantedReadAce: FileGrantGrantedReadAce | null | undefined,
+    expectedTreeEntryPath: string
   ): Promise<FileGrantRemoveEntryResult["aclRemoval"]> {
     if (!grantedReadAce) return { status: "not_applicable" };
     if (grantedReadAce.platform !== "linux" && grantedReadAce.platform !== "darwin") {
@@ -622,6 +712,9 @@ export class PosixFileGrantFsOps implements FsOps {
         source_realpath: grantedReadAce.source_realpath,
         reason: "source inode identity missing from persisted ACE",
       };
+    }
+    if (grantedReadAce.platform === "darwin") {
+      return this.removePersistedMacAgentReadAcl(grantedReadAce, expectedTreeEntryPath);
     }
     let pinnedSource: FileGrantPinnedSource;
     try {
@@ -645,27 +738,14 @@ export class PosixFileGrantFsOps implements FsOps {
           reason: sourceIdentityMismatchReason(grantedReadAce, pinnedSource),
         };
       }
-      let commands: FileGrantExecCommand[];
-      if (grantedReadAce.platform === "linux") {
-        if (!pinnedSource.source_fd_path) {
-          throw new Error("Governed File-Grant: pinned source fd path unavailable on Linux");
-        }
-        commands = buildLinuxRevokeAgentReadCommands(
-          grantedReadAce.agent_uid,
-          pinnedSource.source_fd_path
-        );
-      } else {
-        await this.assertCurrentSourcePathIdentity(grantedReadAce, "before macOS ACL removal");
-        commands = buildMacRevokeAgentReadCommands(
-          grantedReadAce.mac_principal ??
-            (await this.resolveMacPrincipal(grantedReadAce.agent_uid)),
-          grantedReadAce.source_realpath
-        );
+      if (!pinnedSource.source_fd_path) {
+        throw new Error("Governed File-Grant: pinned source fd path unavailable on Linux");
       }
+      const commands = buildLinuxRevokeAgentReadCommands(
+        grantedReadAce.agent_uid,
+        pinnedSource.source_fd_path
+      );
       await this.runCommands(commands);
-      if (grantedReadAce.platform === "darwin") {
-        await this.assertCurrentSourcePathIdentity(grantedReadAce, "after macOS ACL removal");
-      }
       return {
         status: "removed",
         agent_uid: grantedReadAce.agent_uid,
@@ -685,22 +765,103 @@ export class PosixFileGrantFsOps implements FsOps {
     }
   }
 
-  private async assertCurrentSourcePathIdentity(
-    expected: FileGrantSourceIdentity & { source_realpath: string },
-    phase: string
-  ): Promise<void> {
-    const actual = await this.readSourceIdentityAtPath(expected.source_realpath);
-    if (!sameSourceIdentity(expected, actual)) {
-      throw new Error(`Governed File-Grant: ${phase} ${sourceIdentityMismatchReason(expected, actual)}`);
+  private async removePersistedMacAgentReadAcl(
+    grantedReadAce: FileGrantGrantedReadAce & FileGrantSourceIdentity,
+    expectedTreeEntryPath: string
+  ): Promise<FileGrantRemoveEntryResult["aclRemoval"]> {
+    const aclTargetPath = grantedReadAce.mac_acl_hardlink_path;
+    if (!aclTargetPath) {
+      return {
+        status: "failed",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+        reason: "trusted macOS ACL hard link missing from persisted ACE",
+      };
+    }
+    if (resolve(aclTargetPath) !== expectedTreeEntryPath) {
+      return {
+        status: "failed",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+        reason: "trusted macOS ACL hard link does not match the grant tree entry",
+      };
+    }
+
+    try {
+      await this.assertMacAclTargetIdentity(
+        aclTargetPath,
+        grantedReadAce,
+        "before macOS ACL removal"
+      );
+      const commands = buildMacRevokeAgentReadCommands(
+        grantedReadAce.mac_principal ??
+          (await this.resolveMacPrincipal(grantedReadAce.agent_uid)),
+        aclTargetPath
+      );
+      await this.runCommands(commands);
+      await this.assertMacAclTargetIdentity(
+        aclTargetPath,
+        grantedReadAce,
+        "after macOS ACL removal"
+      );
+      return {
+        status: "removed",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+      };
+    } catch (err) {
+      if (isMissingPathError(err)) {
+        return {
+          status: "removed",
+          agent_uid: grantedReadAce.agent_uid,
+          platform: grantedReadAce.platform,
+          source_realpath: grantedReadAce.source_realpath,
+          reason: "trusted macOS ACL hard link already absent",
+        };
+      }
+      return {
+        status: "failed",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+        reason: errorText(err),
+      };
     }
   }
 
-  private async readSourceIdentityAtPath(path: string): Promise<FileGrantSourceIdentity> {
-    const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  private async assertMacAclTargetIdentity(
+    aclTargetPath: string,
+    expected: FileGrantSourceIdentity,
+    phase: string
+  ): Promise<void> {
+    const actual = await this.readMacAclTargetIdentity(aclTargetPath);
+    if (!sameSourceIdentity(expected, actual)) {
+      throw new Error(
+        `Governed File-Grant: ${phase} ${sourceIdentityMismatchReason(expected, actual)}`
+      );
+    }
+  }
+
+  private async readMacAclTargetIdentity(path: string): Promise<FileGrantSourceIdentity> {
+    const handle = await this.macAclLinkOps.open(
+      path,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW
+    );
     try {
       return inodeIdentityFromStats(await handle.stat({ bigint: true }));
     } finally {
       await closeBestEffort(handle);
+    }
+  }
+
+  private async removeMacAclHardLinkBestEffort(path: string): Promise<void> {
+    try {
+      await this.macAclLinkOps.rm(path, { force: true });
+    } catch {
+      // Best-effort cleanup of the trusted hard link after a failed ACL path.
     }
   }
 

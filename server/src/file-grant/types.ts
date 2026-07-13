@@ -72,6 +72,15 @@ export interface FileGrantGrantedReadAce {
   source_ino?: string;
   /** macOS ACL removal needs the same principal string used during grant. */
   mac_principal?: string;
+  /**
+   * macOS chmod is path-scoped and has no fd path equivalent, so new macOS
+   * grants apply and remove the read ACE through this verified hard link in
+   * the operator-owned grant tree. It is persisted only after fstat confirms
+   * the link's dev/ino equals the pinned source. The source and grant tree
+   * must be on the same filesystem; EXDEV leaves enforcement unverified and
+   * no ACE is applied.
+   */
+  mac_acl_hardlink_path?: string;
 }
 
 /**

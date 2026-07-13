@@ -176,6 +176,9 @@ export class FakeFsOps implements FsOps {
         ...(result.grantedReadAce?.mac_principal
           ? { mac_principal: result.grantedReadAce.mac_principal }
           : {}),
+        ...(result.grantedReadAce?.mac_acl_hardlink_path
+          ? { mac_acl_hardlink_path: result.grantedReadAce.mac_acl_hardlink_path }
+          : {}),
       };
       this.grantedReads.push({
         entry: relativeTreeEntry,
