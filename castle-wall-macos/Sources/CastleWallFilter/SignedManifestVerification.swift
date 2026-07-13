@@ -96,19 +96,120 @@ public enum SignedManifestVerifier {
         )
     }
 
+    // Canonicalization parity (2026-07-12 Mini1 egress drill fix).
+    //
+    // These bytes MUST byte-match the Node signer's canonical JSON
+    // (`server/src/mesh/canonical-json.ts`: JSON.stringify escaping, keys
+    // sorted by UTF-16 code units, no whitespace). The previous
+    // JSONSerialization-based implementation escaped "/" as "\/", so any
+    // signed rule whose content contained a forward slash (every
+    // provisioned-hermes rule description carries "443/tcp") recomputed a
+    // different SHA-256 digest and the extension rejected the whole egress
+    // manifest -- the wall silently kept enforcing its prior manifest while
+    // the CLI reported armed. Verified live on Mini1: every egress
+    // manifest_updated since sysext 1118 booted was rejected; baseline
+    // (slash-free) manifests applied.
+    //
+    // FAIL-CLOSED bounds: non-finite and non-integral numbers are rejected
+    // (the Node emitter's shortest-round-trip float formatting is not
+    // reproduced here; no signed surface carries floats today), so a future
+    // float-bearing manifest surfaces as a loud verifier rejection, never a
+    // silently divergent signature.
     public static func canonicalJSONData<T: Encodable>(_ value: T) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.withoutEscapingSlashes]
-        let encoded = try encoder.encode(value)
-        let object = try JSONSerialization.jsonObject(with: encoded)
-        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        let encoded = try JSONEncoder().encode(value)
+        let jsonValue: JSONValue
+        do {
+            jsonValue = try JSONDecoder().decode(JSONValue.self, from: encoded)
+        } catch {
+            throw SignedManifestVerificationError.canonicalizationFailed("\(error)")
+        }
+        return try canonicalJSONData(jsonValue)
     }
 
     public static func canonicalJSONData(_ value: JSONValue) throws -> Data {
-        return try JSONSerialization.data(
-            withJSONObject: value.jsonObject(),
-            options: [.sortedKeys]
-        )
+        var out = ""
+        try appendCanonicalJSON(value, to: &out)
+        return Data(out.utf8)
+    }
+
+    private static func appendCanonicalJSON(_ value: JSONValue, to out: inout String) throws {
+        switch value {
+        case .null:
+            out += "null"
+        case .bool(let v):
+            out += v ? "true" : "false"
+        case .integer(let v):
+            out += String(v)
+        case .number(let v):
+            guard v.isFinite else {
+                throw SignedManifestVerificationError.canonicalizationFailed(
+                    "non-finite number is not canonicalizable"
+                )
+            }
+            // Integral doubles print like integers in the Node emitter
+            // (JSON.stringify(443.0) == "443"); anything else is rejected
+            // rather than risk a byte-divergent float rendering.
+            guard let integral = Int64(exactly: v) else {
+                throw SignedManifestVerificationError.canonicalizationFailed(
+                    "non-integral number is not canonicalizable (no float parity contract)"
+                )
+            }
+            out += String(integral)
+        case .string(let s):
+            appendCanonicalJSONString(s, to: &out)
+        case .array(let items):
+            out += "["
+            var first = true
+            for item in items {
+                if !first { out += "," }
+                first = false
+                try appendCanonicalJSON(item, to: &out)
+            }
+            out += "]"
+        case .object(let dict):
+            // Node sorts keys by UTF-16 code units (Array.prototype.sort on
+            // strings); Swift's default String ordering differs, so compare
+            // explicit UTF-16 code-unit sequences.
+            let keys = dict.keys.sorted {
+                Array($0.utf16).lexicographicallyPrecedes(Array($1.utf16))
+            }
+            out += "{"
+            var first = true
+            for key in keys {
+                if !first { out += "," }
+                first = false
+                appendCanonicalJSONString(key, to: &out)
+                out += ":"
+                try appendCanonicalJSON(dict[key]!, to: &out)
+            }
+            out += "}"
+        }
+    }
+
+    /// JSON string literal with exactly JSON.stringify's escaping: quote,
+    /// backslash, the short control escapes, \u00xx (lowercase hex) for the
+    /// remaining control characters, and EVERYTHING else raw -- no "/"
+    /// escaping, no non-ASCII escaping.
+    private static func appendCanonicalJSONString(_ s: String, to out: inout String) {
+        out += "\""
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\u{08}": out += "\\b"
+            case "\u{09}": out += "\\t"
+            case "\u{0A}": out += "\\n"
+            case "\u{0C}": out += "\\f"
+            case "\u{0D}": out += "\\r"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        out += "\""
     }
 
     public static func sha256Hex(_ data: Data) -> String {
