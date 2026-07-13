@@ -80,6 +80,7 @@ export async function reconcileFileGrantTree(
         scrubbed.push(entry.relative_tree_entry);
       } else {
         aclFailureByGrantId.set(entry.grant_id, removeResult.aclRemoval);
+        await appendScrubFailureAudit(deps, entry, grant, removeResult.aclRemoval);
         if (firstScrubError === null) {
           firstScrubError = new Error(
             `Governed File-Grant: failed to remove ACL for ` +
@@ -113,6 +114,31 @@ export async function reconcileFileGrantTree(
   if (firstScrubError !== null) throw firstScrubError;
 
   return { expired, scrubbed };
+}
+
+async function appendScrubFailureAudit(
+  deps: ReconcileFileGrantDeps,
+  entry: { grant_id: string; relative_tree_entry: string },
+  grant: FileGrant | undefined,
+  aclFailure: FileGrantAclRemovalResult
+): Promise<void> {
+  try {
+    await deps.auditLog?.appendCritical({
+      layer: "l1",
+      operation: "file_grant_revoke",
+      identity_id: deps.reconciledBy ?? "system",
+      result: "failure",
+      details: {
+        grant_id: entry.grant_id,
+        subject_agent_id: grant?.subject_agent_id,
+        reason: "reconcile_acl_removal_failed",
+        tree_entry: entry.relative_tree_entry,
+        acl_removal: aclFailure,
+      },
+    });
+  } catch {
+    // Best-effort: reconcile still reports the scrub failure to its caller.
+  }
 }
 
 async function appendExpiryAudit(

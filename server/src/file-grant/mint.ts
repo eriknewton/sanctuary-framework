@@ -108,6 +108,7 @@ import {
   type FileGrant,
   type FileGrantEnforcement,
   type FileGrantGrantedReadAce,
+  type FileGrantPinnedSource,
   type FileGrantScope,
   type FsOps,
 } from "./types.js";
@@ -161,6 +162,20 @@ export async function mintFileGrant(
   // Step 3: canonicalize the source path (throws if it does not exist; no
   // state has been persisted yet, so the throw simply fails the mint closed).
   const canonicalPath = await deps.fsOps.realpath(params.scope.path);
+  const pinnedSource = await deps.fsOps.pinSource(canonicalPath);
+  try {
+    return await mintFileGrantWithPinnedSource(params, deps, canonicalPath, pinnedSource);
+  } finally {
+    await pinnedSource.close();
+  }
+}
+
+async function mintFileGrantWithPinnedSource(
+  params: MintFileGrantParams,
+  deps: MintFileGrantDeps,
+  canonicalPath: string,
+  pinnedSource: FileGrantPinnedSource
+): Promise<MintFileGrantResult> {
   const grantId = generateFileGrantId();
   const treeEntry = `${params.subjectAgentId}/${grantId}`;
   const expiresAt = computeExpiresAt(params.ttlSeconds, deps.now);
@@ -171,7 +186,7 @@ export async function mintFileGrant(
   // a false "enforced". The final verdict is recomputed after placement from
   // a same-operation agent-uid readability probe.
   const agentUid = await deps.fsOps.agentUid(params.subjectAgentId);
-  const sourceOwnerUid = await deps.fsOps.sourceOwnerUid(canonicalPath);
+  const sourceOwnerUid = pinnedSource.source_owner_uid;
   const recordedEnforcement: FileGrantEnforcement = determineEnforcement({
     agentUid,
     sourceOwnerUid,
@@ -281,7 +296,7 @@ export async function mintFileGrant(
   const verification = await verifyAgentReadThisOperation({
     fsOps: deps.fsOps,
     treeEntry,
-    sourceRealpath: canonicalPath,
+    pinnedSource,
     agentUid,
     sourceOwnerUid,
   });
@@ -336,6 +351,7 @@ export async function mintFileGrant(
       expires_at: expiresAt,
       enforcement,
       acl_result: verification.aclResult?.status ?? "not_attempted",
+      ...(verification.aclResult?.reason ? { acl_reason: verification.aclResult.reason } : {}),
       phase: "placed",
     },
   });
@@ -346,7 +362,7 @@ export async function mintFileGrant(
 async function verifyAgentReadThisOperation(params: {
   fsOps: FsOps;
   treeEntry: string;
-  sourceRealpath: string;
+  pinnedSource: FileGrantPinnedSource;
   agentUid: number | null;
   sourceOwnerUid: number | null;
 }): Promise<{
@@ -354,13 +370,13 @@ async function verifyAgentReadThisOperation(params: {
   aclResult?: FileGrantAclResult;
   grantedReadAce?: FileGrantGrantedReadAce;
 }> {
-  const { fsOps, treeEntry, sourceRealpath, agentUid, sourceOwnerUid } = params;
+  const { fsOps, treeEntry, pinnedSource, agentUid, sourceOwnerUid } = params;
   if (agentUid === null || sourceOwnerUid === null) return { readVerified: false };
   if (agentUid === sourceOwnerUid) return { readVerified: false };
 
   let aclResult: FileGrantAclResult;
   try {
-    aclResult = await fsOps.grantAgentRead(treeEntry, agentUid, sourceRealpath);
+    aclResult = await fsOps.grantAgentRead(treeEntry, agentUid, pinnedSource);
   } catch {
     return { readVerified: false };
   }
@@ -372,12 +388,14 @@ async function verifyAgentReadThisOperation(params: {
     ({
       agent_uid: agentUid,
       platform: aclResult.platform,
-      source_realpath: sourceRealpath,
+      source_realpath: pinnedSource.source_realpath,
+      source_dev: pinnedSource.source_dev,
+      source_ino: pinnedSource.source_ino,
     } satisfies FileGrantGrantedReadAce);
 
   try {
     return {
-      readVerified: (await fsOps.probeAgentRead(treeEntry, agentUid)) === true,
+      readVerified: (await fsOps.probeAgentRead(treeEntry, agentUid, pinnedSource)) === true,
       aclResult,
       grantedReadAce,
     };

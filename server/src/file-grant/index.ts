@@ -25,6 +25,8 @@ export type {
   FileGrantAclResult,
   FileGrantAclStatus,
   FileGrantGrantedReadAce,
+  FileGrantPinnedSource,
+  FileGrantSourceIdentity,
   FileGrantAclRemovalResult,
   FileGrantAclRemovalStatus,
   FileGrantRemoveEntryOptions,

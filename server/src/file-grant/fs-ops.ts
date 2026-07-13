@@ -34,15 +34,27 @@
  */
 
 import { execFile as nodeExecFile } from "node:child_process";
-import { mkdir, lstat, readFile, realpath as fsRealpath, rm, stat, symlink } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import {
+  mkdir,
+  lstat,
+  open,
+  readFile,
+  realpath as fsRealpath,
+  rm,
+  symlink,
+  type FileHandle,
+} from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
 import type {
   FileGrantAclResult,
   FileGrantAclStatus,
   FileGrantGrantedReadAce,
+  FileGrantPinnedSource,
   FileGrantRemoveEntryResult,
   FileGrantRemoveEntryOptions,
+  FileGrantSourceIdentity,
   FsOps,
 } from "./types.js";
 
@@ -78,10 +90,13 @@ export interface PosixFileGrantFsOpsOptions {
 export const AGENT_READ_PROBE_SCRIPT =
   "const fs=require('node:fs');" +
   "const p=process.argv[1];" +
-  "const st=fs.statSync(p);" +
-  "if(st.isDirectory()){fs.readdirSync(p);process.exit(0);}" +
+  "const expectedDev=process.argv[2];" +
+  "const expectedIno=process.argv[3];" +
   "const fd=fs.openSync(p,'r');" +
-  "try{const b=Buffer.alloc(1);fs.readSync(fd,b,0,1,0);}finally{fs.closeSync(fd);}";
+  "try{const st=fs.fstatSync(fd,{bigint:true});" +
+  "if(String(st.dev)!==expectedDev||String(st.ino)!==expectedIno)process.exit(66);" +
+  "if(!st.isDirectory()){const b=Buffer.alloc(1);fs.readSync(fd,b,0,1,0);}}" +
+  "finally{fs.closeSync(fd);}";
 
 const DEFAULT_EXEC_RUNNER: FileGrantExecRunner = {
   execFile(command: FileGrantExecCommand, timeoutMs: number): Promise<FileGrantExecResult> {
@@ -201,13 +216,24 @@ export function buildAgentReadProbeCommand(
   treeRoot: string,
   relativeTreeEntry: string,
   agentUid: number,
+  pinnedSource: FileGrantSourceIdentity,
   nodePath: string = process.execPath
 ): FileGrantExecCommand {
   const uid = uidToken(agentUid);
   const { dest } = resolveTreeEntryUnderRoot(treeRoot, relativeTreeEntry);
   return {
     file: "sudo",
-    args: ["-n", "-u", `#${uid}`, nodePath, "-e", AGENT_READ_PROBE_SCRIPT, dest],
+    args: [
+      "-n",
+      "-u",
+      `#${uid}`,
+      nodePath,
+      "-e",
+      AGENT_READ_PROBE_SCRIPT,
+      dest,
+      pinnedSource.source_dev,
+      pinnedSource.source_ino,
+    ],
   };
 }
 
@@ -235,6 +261,54 @@ function classifyAclFailure(err: unknown): FileGrantAclStatus {
     return "not_privileged";
   }
   return "failed";
+}
+
+function inodeIdentityFromStats(stats: { dev: bigint | number; ino: bigint | number }): FileGrantSourceIdentity {
+  return {
+    source_dev: String(stats.dev),
+    source_ino: String(stats.ino),
+  };
+}
+
+function ownerUidFromStats(stats: { uid?: bigint | number }): number | null {
+  if (stats.uid === undefined) return null;
+  const uid = Number(stats.uid);
+  return Number.isSafeInteger(uid) && uid >= 0 ? uid : null;
+}
+
+function sameSourceIdentity(
+  left: FileGrantSourceIdentity,
+  right: FileGrantSourceIdentity
+): boolean {
+  return left.source_dev === right.source_dev && left.source_ino === right.source_ino;
+}
+
+function describeSourceIdentity(identity: FileGrantSourceIdentity): string {
+  return `dev=${identity.source_dev} ino=${identity.source_ino}`;
+}
+
+function sourceIdentityMismatchReason(
+  expected: FileGrantSourceIdentity,
+  actual: FileGrantSourceIdentity
+): string {
+  return (
+    `source inode mismatch: expected ${describeSourceIdentity(expected)}, ` +
+    `got ${describeSourceIdentity(actual)}`
+  );
+}
+
+function hasPersistedSourceIdentity(
+  ace: FileGrantGrantedReadAce
+): ace is FileGrantGrantedReadAce & FileGrantSourceIdentity {
+  return typeof ace.source_dev === "string" && typeof ace.source_ino === "string";
+}
+
+async function closeBestEffort(handle: FileHandle): Promise<void> {
+  try {
+    await handle.close();
+  } catch {
+    // Closing an fd after an earlier failure is best effort only.
+  }
 }
 
 /**
@@ -284,6 +358,30 @@ export class PosixFileGrantFsOps implements FsOps {
     return fsRealpath(path);
   }
 
+  async pinSource(canonicalPath: string): Promise<FileGrantPinnedSource> {
+    const handle = await open(canonicalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    let closed = false;
+    let stats: Awaited<ReturnType<FileHandle["stat"]>>;
+    try {
+      stats = await handle.stat({ bigint: true });
+    } catch (err) {
+      await closeBestEffort(handle);
+      throw err;
+    }
+    const identity = inodeIdentityFromStats(stats);
+    return {
+      source_realpath: canonicalPath,
+      source_owner_uid: ownerUidFromStats(stats),
+      ...identity,
+      ...(this.platform === "linux" ? { source_fd_path: `/proc/${process.pid}/fd/${handle.fd}` } : {}),
+      close: async () => {
+        if (closed) return;
+        closed = true;
+        await closeBestEffort(handle);
+      },
+    };
+  }
+
   async place(canonicalSrc: string, relativeTreeEntry: string): Promise<void> {
     const dest = this.resolveUnderRoot(relativeTreeEntry);
     await this.ensureTreeRoot();
@@ -310,12 +408,16 @@ export class PosixFileGrantFsOps implements FsOps {
   async grantAgentRead(
     relativeTreeEntry: string,
     agentUid: number,
-    sourceRealpath: string
+    pinnedSource: FileGrantPinnedSource
   ): Promise<FileGrantAclResult> {
-    return this.applyAgentReadAcl(relativeTreeEntry, agentUid, sourceRealpath);
+    return this.applyAgentReadAcl(relativeTreeEntry, agentUid, pinnedSource);
   }
 
-  async probeAgentRead(relativeTreeEntry: string, agentUid: number): Promise<boolean> {
+  async probeAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number,
+    pinnedSource: FileGrantSourceIdentity
+  ): Promise<boolean> {
     if (this.platform !== "linux" && this.platform !== "darwin") return false;
     try {
       await this.runCommand(
@@ -323,6 +425,7 @@ export class PosixFileGrantFsOps implements FsOps {
           this.treeRoot(),
           relativeTreeEntry,
           agentUid,
+          pinnedSource,
           this.nodePath
         )
       );
@@ -368,14 +471,19 @@ export class PosixFileGrantFsOps implements FsOps {
 
   async sourceOwnerUid(canonicalPath: string): Promise<number | null> {
     if (process.getuid === undefined) return null;
+    let pinnedSource: FileGrantPinnedSource;
     try {
-      const st = await stat(canonicalPath);
-      return st.uid;
+      pinnedSource = await this.pinSource(canonicalPath);
     } catch {
       // The path was realpath'd moments earlier; a stat failure here means it
       // vanished or became unreadable. Return null so the enforcement verdict
       // fails toward "unmet" (no false "enforced") rather than throwing.
       return null;
+    }
+    try {
+      return pinnedSource.source_owner_uid;
+    } finally {
+      await pinnedSource.close();
     }
   }
 
@@ -400,7 +508,7 @@ export class PosixFileGrantFsOps implements FsOps {
   private async applyAgentReadAcl(
     relativeTreeEntry: string,
     agentUid: number,
-    sourceRealpath: string
+    pinnedSource: FileGrantPinnedSource
   ): Promise<FileGrantAclResult> {
     if (this.platform !== "linux" && this.platform !== "darwin") {
       return {
@@ -410,36 +518,55 @@ export class PosixFileGrantFsOps implements FsOps {
       };
     }
 
+    let sourceLeafCommandAttempted = false;
     try {
       const macPrincipal =
         this.platform === "darwin" ? await this.resolveMacPrincipal(agentUid) : undefined;
-      const commands =
-        this.platform === "linux"
-          ? buildLinuxGrantAgentReadCommands(
-              this.treeRoot(),
-              relativeTreeEntry,
-              agentUid,
-              sourceRealpath
-            )
-          : buildMacGrantAgentReadCommands(
-              this.treeRoot(),
-              relativeTreeEntry,
-              macPrincipal!,
-              sourceRealpath
-            );
-      await this.runCommands(commands);
+      let commands: FileGrantExecCommand[];
+      if (this.platform === "linux") {
+        if (!pinnedSource.source_fd_path) {
+          throw new Error("Governed File-Grant: pinned source fd path unavailable on Linux");
+        }
+        commands = buildLinuxGrantAgentReadCommands(
+          this.treeRoot(),
+          relativeTreeEntry,
+          agentUid,
+          pinnedSource.source_fd_path
+        );
+      } else {
+        await this.assertCurrentSourcePathIdentity(pinnedSource, "before macOS ACL apply");
+        commands = buildMacGrantAgentReadCommands(
+          this.treeRoot(),
+          relativeTreeEntry,
+          macPrincipal!,
+          pinnedSource.source_realpath
+        );
+      }
+      const sourceLeafCommand = commands.at(-1);
+      await this.runCommands(commands.slice(0, -1));
+      if (sourceLeafCommand) {
+        sourceLeafCommandAttempted = true;
+        await this.runCommand(sourceLeafCommand);
+      }
+      if (this.platform === "darwin") {
+        await this.assertCurrentSourcePathIdentity(pinnedSource, "after macOS ACL apply");
+      }
       return {
         status: "applied",
         platform: this.platform,
         grantedReadAce: {
           agent_uid: agentUid,
           platform: this.platform,
-          source_realpath: sourceRealpath,
+          source_realpath: pinnedSource.source_realpath,
+          source_dev: pinnedSource.source_dev,
+          source_ino: pinnedSource.source_ino,
           ...(macPrincipal ? { mac_principal: macPrincipal } : {}),
         },
       };
     } catch (err) {
-      await this.bestEffortRemoveAgentReadAcl(agentUid, sourceRealpath);
+      if (sourceLeafCommandAttempted) {
+        await this.bestEffortRemoveAgentReadAcl(agentUid, pinnedSource);
+      }
       return {
         status: classifyAclFailure(err),
         platform: this.platform,
@@ -448,16 +575,20 @@ export class PosixFileGrantFsOps implements FsOps {
     }
   }
 
-  private async bestEffortRemoveAgentReadAcl(agentUid: number, sourceRealpath: string): Promise<void> {
+  private async bestEffortRemoveAgentReadAcl(
+    agentUid: number,
+    pinnedSource: FileGrantPinnedSource
+  ): Promise<void> {
     if (this.platform !== "linux" && this.platform !== "darwin") return;
     let commands: FileGrantExecCommand[];
     try {
       const macPrincipal =
         this.platform === "darwin" ? await this.resolveMacPrincipal(agentUid) : undefined;
+      if (this.platform === "linux" && !pinnedSource.source_fd_path) return;
       commands =
         this.platform === "linux"
-          ? buildLinuxRevokeAgentReadCommands(agentUid, sourceRealpath)
-          : buildMacRevokeAgentReadCommands(macPrincipal!, sourceRealpath);
+          ? buildLinuxRevokeAgentReadCommands(agentUid, pinnedSource.source_fd_path!)
+          : buildMacRevokeAgentReadCommands(macPrincipal!, pinnedSource.source_realpath);
     } catch {
       return;
     }
@@ -483,19 +614,58 @@ export class PosixFileGrantFsOps implements FsOps {
         source_realpath: grantedReadAce.source_realpath,
       };
     }
+    if (!hasPersistedSourceIdentity(grantedReadAce)) {
+      return {
+        status: "failed",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+        reason: "source inode identity missing from persisted ACE",
+      };
+    }
+    let pinnedSource: FileGrantPinnedSource;
     try {
-      const commands =
-        grantedReadAce.platform === "linux"
-          ? buildLinuxRevokeAgentReadCommands(
-              grantedReadAce.agent_uid,
-              grantedReadAce.source_realpath
-            )
-          : buildMacRevokeAgentReadCommands(
-              grantedReadAce.mac_principal ??
-                (await this.resolveMacPrincipal(grantedReadAce.agent_uid)),
-              grantedReadAce.source_realpath
-            );
+      pinnedSource = await this.pinSource(grantedReadAce.source_realpath);
+    } catch (err) {
+      return {
+        status: "failed",
+        agent_uid: grantedReadAce.agent_uid,
+        platform: grantedReadAce.platform,
+        source_realpath: grantedReadAce.source_realpath,
+        reason: `source inode unavailable: ${errorText(err)}`,
+      };
+    }
+    try {
+      if (!sameSourceIdentity(pinnedSource, grantedReadAce)) {
+        return {
+          status: "failed",
+          agent_uid: grantedReadAce.agent_uid,
+          platform: grantedReadAce.platform,
+          source_realpath: grantedReadAce.source_realpath,
+          reason: sourceIdentityMismatchReason(grantedReadAce, pinnedSource),
+        };
+      }
+      let commands: FileGrantExecCommand[];
+      if (grantedReadAce.platform === "linux") {
+        if (!pinnedSource.source_fd_path) {
+          throw new Error("Governed File-Grant: pinned source fd path unavailable on Linux");
+        }
+        commands = buildLinuxRevokeAgentReadCommands(
+          grantedReadAce.agent_uid,
+          pinnedSource.source_fd_path
+        );
+      } else {
+        await this.assertCurrentSourcePathIdentity(grantedReadAce, "before macOS ACL removal");
+        commands = buildMacRevokeAgentReadCommands(
+          grantedReadAce.mac_principal ??
+            (await this.resolveMacPrincipal(grantedReadAce.agent_uid)),
+          grantedReadAce.source_realpath
+        );
+      }
       await this.runCommands(commands);
+      if (grantedReadAce.platform === "darwin") {
+        await this.assertCurrentSourcePathIdentity(grantedReadAce, "after macOS ACL removal");
+      }
       return {
         status: "removed",
         agent_uid: grantedReadAce.agent_uid,
@@ -510,6 +680,27 @@ export class PosixFileGrantFsOps implements FsOps {
         source_realpath: grantedReadAce.source_realpath,
         reason: errorText(err),
       };
+    } finally {
+      await pinnedSource.close();
+    }
+  }
+
+  private async assertCurrentSourcePathIdentity(
+    expected: FileGrantSourceIdentity & { source_realpath: string },
+    phase: string
+  ): Promise<void> {
+    const actual = await this.readSourceIdentityAtPath(expected.source_realpath);
+    if (!sameSourceIdentity(expected, actual)) {
+      throw new Error(`Governed File-Grant: ${phase} ${sourceIdentityMismatchReason(expected, actual)}`);
+    }
+  }
+
+  private async readSourceIdentityAtPath(path: string): Promise<FileGrantSourceIdentity> {
+    const handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      return inodeIdentityFromStats(await handle.stat({ bigint: true }));
+    } finally {
+      await closeBestEffort(handle);
     }
   }
 

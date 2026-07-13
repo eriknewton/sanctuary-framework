@@ -34,6 +34,26 @@ export interface FileGrantScope {
   path: string;
 }
 
+/** Stable source inode identity captured from fstat on an opened source fd. */
+export interface FileGrantSourceIdentity {
+  /** Decimal string to avoid JSON precision loss on large dev values. */
+  source_dev: string;
+  /** Decimal string to avoid JSON precision loss on large inode values. */
+  source_ino: string;
+}
+
+/**
+ * Source file opened and fstat'd during mint. Production keeps this fd open
+ * across ACL apply and probe so path swaps cannot redirect those steps.
+ */
+export interface FileGrantPinnedSource extends FileGrantSourceIdentity {
+  source_realpath: string;
+  source_owner_uid: number | null;
+  /** Linux fd-scoped path for child ACL commands, for example /proc/<pid>/fd/<fd>. */
+  source_fd_path?: string;
+  close(): Promise<void>;
+}
+
 /**
  * The exact POSIX read ACE this grant added to the source inode.
  *
@@ -46,6 +66,10 @@ export interface FileGrantGrantedReadAce {
   agent_uid: number;
   platform: NodeJS.Platform;
   source_realpath: string;
+  /** Present on grants minted after inode-pinning was added. Missing legacy values fail closed on ACL cleanup. */
+  source_dev?: string;
+  /** Present on grants minted after inode-pinning was added. Missing legacy values fail closed on ACL cleanup. */
+  source_ino?: string;
   /** macOS ACL removal needs the same principal string used during grant. */
   mac_principal?: string;
 }
@@ -121,19 +145,25 @@ export const FILE_GRANT_DEFAULTS = {
 export interface FsOps {
   /** Canonicalize (realpath) an operator-supplied source path. Throws if the path does not exist. */
   realpath(path: string): Promise<string>;
+  /** Open the canonical source without following a final symlink and capture its inode identity. */
+  pinSource(canonicalPath: string): Promise<FileGrantPinnedSource>;
   /** Place (symlink) the canonical source at the given relative tree-entry path. */
   place(canonicalSrc: string, relativeTreeEntry: string): Promise<void>;
   /** Apply the host ACL primitive to the source inode and grant-tree ancestors. */
   grantAgentRead(
     relativeTreeEntry: string,
     agentUid: number,
-    sourceRealpath: string
+    pinnedSource: FileGrantPinnedSource
   ): Promise<FileGrantAclResult>;
   /**
    * Confirm by running a bounded read probe as `agentUid`. Returns true only
-   * when the probe actually opens and reads the placed entry in this call.
+   * when the probe opens and reads the same inode pinned during mint.
    */
-  probeAgentRead(relativeTreeEntry: string, agentUid: number): Promise<boolean>;
+  probeAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number,
+    pinnedSource: FileGrantSourceIdentity
+  ): Promise<boolean>;
   /**
    * Remove a tree-entry path. Idempotent when the entry is absent, unless an
    * ACL target is supplied and ACL cleanup itself fails.

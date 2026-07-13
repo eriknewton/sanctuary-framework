@@ -5,6 +5,9 @@
  * or any other host command.
  */
 
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -17,6 +20,19 @@ import {
   PosixFileGrantFsOps,
   type FileGrantExecCommand,
 } from "../../src/file-grant/fs-ops.js";
+import type { FileGrantPinnedSource } from "../../src/file-grant/types.js";
+
+function pinnedSource(overrides: Partial<FileGrantPinnedSource> = {}): FileGrantPinnedSource {
+  return {
+    source_realpath: "/operator/source.txt",
+    source_owner_uid: 501,
+    source_dev: "11",
+    source_ino: "22",
+    source_fd_path: "/proc/test/fd/9",
+    close: async () => {},
+    ...overrides,
+  };
+}
 
 describe("file-grant ACL command argv construction", () => {
   it("builds Linux setfacl grant commands with execute-only ancestors and source leaf read", () => {
@@ -92,7 +108,15 @@ describe("file-grant ACL command argv construction", () => {
   });
 
   it("builds the agent-uid read probe as sudo argv, not a shell command", () => {
-    expect(buildAgentReadProbeCommand("/fortress/grants", "agent-1/fg_abc", 502, "/node")).toEqual({
+    expect(
+      buildAgentReadProbeCommand(
+        "/fortress/grants",
+        "agent-1/fg_abc",
+        502,
+        { source_dev: "11", source_ino: "22" },
+        "/node"
+      )
+    ).toEqual({
       file: "sudo",
       args: [
         "-n",
@@ -102,6 +126,8 @@ describe("file-grant ACL command argv construction", () => {
         "-e",
         AGENT_READ_PROBE_SCRIPT,
         "/fortress/grants/agent-1/fg_abc",
+        "11",
+        "22",
       ],
     });
   });
@@ -121,18 +147,18 @@ describe("file-grant ACL command argv construction", () => {
       },
     });
 
-    const result = await fsOps.grantAgentRead("agent-1/fg_abc", 502, "/operator/source.txt");
+    const result = await fsOps.grantAgentRead("agent-1/fg_abc", 502, pinnedSource());
 
     expect(result.status).toBe("failed");
     expect(seen).toEqual([
       { file: "setfacl", args: ["-m", "u:502:--x", "/fortress/grants"] },
       { file: "setfacl", args: ["-m", "u:502:--x", "/fortress/grants/agent-1"] },
-      { file: "setfacl", args: ["-m", "u:502:rX", "/operator/source.txt"] },
-      { file: "setfacl", args: ["-x", "u:502", "/operator/source.txt"] },
+      { file: "setfacl", args: ["-m", "u:502:rX", "/proc/test/fd/9"] },
+      { file: "setfacl", args: ["-x", "u:502", "/proc/test/fd/9"] },
     ]);
   });
 
-  it("grantAgentRead applies the leaf ACL to source realpath, not the grant-tree symlink", async () => {
+  it("grantAgentRead applies the leaf ACL to the pinned source fd path", async () => {
     const seen: FileGrantExecCommand[] = [];
     const fsOps = new PosixFileGrantFsOps("/fortress", {
       platform: "linux",
@@ -144,15 +170,21 @@ describe("file-grant ACL command argv construction", () => {
       },
     });
 
-    const result = await fsOps.grantAgentRead("agent-1/fg_abc", 502, "/operator/source.txt");
+    const result = await fsOps.grantAgentRead("agent-1/fg_abc", 502, pinnedSource());
 
     expect(result.status).toBe("applied");
     expect(result.grantedReadAce).toEqual({
       agent_uid: 502,
       platform: "linux",
       source_realpath: "/operator/source.txt",
+      source_dev: "11",
+      source_ino: "22",
     });
     expect(seen).toContainEqual({
+      file: "setfacl",
+      args: ["-m", "u:502:rX", "/proc/test/fd/9"],
+    });
+    expect(seen).not.toContainEqual({
       file: "setfacl",
       args: ["-m", "u:502:rX", "/operator/source.txt"],
     });
@@ -163,6 +195,55 @@ describe("file-grant ACL command argv construction", () => {
   });
 
   it("removeEntry removes the persisted uid source ACE even when no descriptor exists", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-acl-"));
+    const source = join(dir, "source.txt");
+    await writeFile(source, "ok");
+    const seen: FileGrantExecCommand[] = [];
+    const fsOps = new PosixFileGrantFsOps("/fortress", {
+      platform: "linux",
+      execRunner: {
+        execFile: async (command) => {
+          seen.push(command);
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+    const pinned = await fsOps.pinSource(source);
+    const ace = {
+      agent_uid: 502,
+      platform: "linux" as const,
+      source_realpath: source,
+      source_dev: pinned.source_dev,
+      source_ino: pinned.source_ino,
+    };
+    await pinned.close();
+
+    const result = await fsOps.removeEntry("agent-1/fg_abc", {
+      grantedReadAce: ace,
+    });
+
+    expect(result).toEqual({
+      treeEntryRemoved: false,
+      aclRemoval: {
+        status: "removed",
+        agent_uid: 502,
+        platform: "linux",
+        source_realpath: source,
+      },
+      scrubbed: true,
+    });
+    expect(seen).toEqual([
+      {
+        file: "setfacl",
+        args: ["-x", "u:502", expect.stringMatching(`^/proc/${process.pid}/fd/`)],
+      },
+    ]);
+  });
+
+  it("removeEntry does not run setfacl remove when the persisted source inode changed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-acl-"));
+    const source = join(dir, "source.txt");
+    await writeFile(source, "ok");
     const seen: FileGrantExecCommand[] = [];
     const fsOps = new PosixFileGrantFsOps("/fortress", {
       platform: "linux",
@@ -178,22 +259,15 @@ describe("file-grant ACL command argv construction", () => {
       grantedReadAce: {
         agent_uid: 502,
         platform: "linux",
-        source_realpath: "/operator/source.txt",
+        source_realpath: source,
+        source_dev: "999",
+        source_ino: "888",
       },
     });
 
-    expect(result).toEqual({
-      treeEntryRemoved: false,
-      aclRemoval: {
-        status: "removed",
-        agent_uid: 502,
-        platform: "linux",
-        source_realpath: "/operator/source.txt",
-      },
-      scrubbed: true,
-    });
-    expect(seen).toEqual([
-      { file: "setfacl", args: ["-x", "u:502", "/operator/source.txt"] },
-    ]);
+    expect(result.scrubbed).toBe(false);
+    expect(result.aclRemoval.status).toBe("failed");
+    expect(result.aclRemoval.reason).toContain("source inode mismatch");
+    expect(seen).toHaveLength(0);
   });
 });

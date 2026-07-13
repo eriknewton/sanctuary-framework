@@ -10,7 +10,12 @@ import { describe, expect, it } from "vitest";
 import { mintFileGrant } from "../../src/file-grant/mint.js";
 import { revokeFileGrant } from "../../src/file-grant/revoke.js";
 import type { FileGrantAclResult } from "../../src/file-grant/types.js";
-import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
+import {
+  DEFAULT_FAKE_SOURCE_IDENTITY,
+  FakeFsOps,
+  SWAPPED_FAKE_SOURCE_IDENTITY,
+  makeFileGrantTestStore,
+} from "./fixtures.js";
 
 const APPLIED: FileGrantAclResult = { status: "applied", platform: process.platform };
 
@@ -82,6 +87,7 @@ describe("file-grant revoke: idempotent + audited", () => {
       entry: grant.tree_entry,
       uid: 502,
       sourceRealpath: grant.scope.path,
+      sourceIdentity: DEFAULT_FAKE_SOURCE_IDENTITY,
     });
     expect(fsOps.scrubbed).toContain(grant.tree_entry);
     expect(fsOps.removeOptions).toContainEqual({
@@ -216,12 +222,63 @@ describe("file-grant revoke: idempotent + audited", () => {
       entry: grant.tree_entry,
       uid: 502,
       sourceRealpath: "/tmp/example.txt",
+      sourceIdentity: DEFAULT_FAKE_SOURCE_IDENTITY,
     });
     expect(revokeFsOps.removedAcls).not.toContainEqual({
       entry: grant.tree_entry,
       uid: 777,
       sourceRealpath: "/tmp/example.txt",
+      sourceIdentity: DEFAULT_FAKE_SOURCE_IDENTITY,
     });
+  });
+
+  it("does not remove a persisted ACE when the source inode has changed", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const mintFsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      probeAgentReadResult: true,
+    });
+
+    const { grant } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: "/tmp/example.txt" },
+        mode: "read",
+        ttlSeconds: 3600,
+        createdBy: "operator-1",
+      },
+      { fsOps: mintFsOps, store: grantStore, now: new Date(), auditLog },
+    );
+
+    const revokeFsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      removeSourceIdentity: SWAPPED_FAKE_SOURCE_IDENTITY,
+    });
+    const result = await revokeFileGrant(grant.grant_id, "operator-1", {
+      fsOps: revokeFsOps,
+      store: grantStore,
+      now: new Date(),
+      auditLog,
+    });
+
+    expect(result.scrubbed).toBe(false);
+    expect(result.treeEntryRemoved).toBe(true);
+    expect(result.aclRemoval?.status).toBe("failed");
+    expect(result.aclRemoval?.reason).toContain("source inode mismatch");
+    expect(revokeFsOps.removedAcls).toHaveLength(0);
+    expect(revokeFsOps.scrubbed).toContain(grant.tree_entry);
+
+    const persisted = await grantStore.get(grant.grant_id);
+    expect(persisted!.status).toBe("revoked");
+    expect(persisted!.granted_read_ace).toEqual(grant.granted_read_ace);
+
+    const { entries } = await auditLog.query({ operation_type: "file_grant_revoke" });
+    expect(entries.at(-1)!.result).toBe("failure");
+    expect(entries.at(-1)!.details.reason).toBe("acl_removal_failed");
+    expect(entries.at(-1)!.details.tree_entry_removed).toBe(true);
   });
 
   it("reports ACL removal failure honestly while still unlinking the tree entry", async () => {

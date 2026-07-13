@@ -15,7 +15,7 @@ import { mintFileGrant } from "../../src/file-grant/mint.js";
 import { reconcileFileGrantTree } from "../../src/file-grant/reconcile.js";
 import { listFileGrants } from "../../src/file-grant/list.js";
 import type { FileGrantAclResult } from "../../src/file-grant/types.js";
-import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
+import { DEFAULT_FAKE_SOURCE_IDENTITY, FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
 
 const APPLIED: FileGrantAclResult = { status: "applied", platform: process.platform };
 
@@ -94,6 +94,7 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
       entry: grant.tree_entry,
       uid: 502,
       sourceRealpath: grant.scope.path,
+      sourceIdentity: DEFAULT_FAKE_SOURCE_IDENTITY,
     });
     expect(fsOps.scrubbed).toContain(grant.tree_entry);
     expect(fsOps.removeOptions).toContainEqual({

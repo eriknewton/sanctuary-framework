@@ -11,7 +11,12 @@ import { describe, expect, it } from "vitest";
 
 import { mintFileGrant } from "../../src/file-grant/mint.js";
 import type { FileGrantAclResult } from "../../src/file-grant/types.js";
-import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
+import {
+  DEFAULT_FAKE_SOURCE_IDENTITY,
+  FakeFsOps,
+  SWAPPED_FAKE_SOURCE_IDENTITY,
+  makeFileGrantTestStore,
+} from "./fixtures.js";
 
 const NOW = new Date("2026-07-13T00:00:00.000Z");
 const APPLIED: FileGrantAclResult = { status: "applied", platform: process.platform };
@@ -47,11 +52,71 @@ describe("file-grant ACL/probe enforcement honesty", () => {
       agent_uid: 502,
       platform: process.platform,
       source_realpath: "/tmp/example.txt",
+      ...DEFAULT_FAKE_SOURCE_IDENTITY,
     });
     expect(fsOps.events).toEqual([
       `place:${grant.tree_entry}`,
-      `grant:${grant.tree_entry}:502:/tmp/example.txt`,
-      `probe:${grant.tree_entry}:502`,
+      `grant:${grant.tree_entry}:502:/tmp/example.txt:100:200`,
+      `probe:${grant.tree_entry}:502:100:200`,
+    ]);
+  });
+
+  it("keeps a uid split unverified when source identity drifts before ACL apply", async () => {
+    const { grantStore } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      applySourceIdentity: SWAPPED_FAKE_SOURCE_IDENTITY,
+      probeAgentReadResult: true,
+    });
+
+    const { grant, enforcement } = await mintFileGrant(baseParams(), {
+      fsOps,
+      store: grantStore,
+      now: NOW,
+    });
+
+    expect(enforcement).toBe("unverified");
+    expect(grant.granted_read_ace).toBeNull();
+    expect(fsOps.grantedReads).toHaveLength(0);
+    expect(fsOps.probedReads).toHaveLength(0);
+    expect(fsOps.events).toEqual([
+      `place:${grant.tree_entry}`,
+      `grant:${grant.tree_entry}:502:/tmp/example.txt:100:200`,
+    ]);
+  });
+
+  it("keeps a uid split unverified when the probe reads a swapped inode", async () => {
+    const { grantStore } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      probeAgentReadResult: true,
+      probeReadIdentity: SWAPPED_FAKE_SOURCE_IDENTITY,
+    });
+
+    const { grant, enforcement } = await mintFileGrant(baseParams(), {
+      fsOps,
+      store: grantStore,
+      now: NOW,
+    });
+
+    expect(enforcement).toBe("unverified");
+    expect(grant.granted_read_ace).toEqual({
+      agent_uid: 502,
+      platform: process.platform,
+      source_realpath: "/tmp/example.txt",
+      ...DEFAULT_FAKE_SOURCE_IDENTITY,
+    });
+    expect(fsOps.probedReads).toEqual([
+      {
+        entry: grant.tree_entry,
+        uid: 502,
+        expectedIdentity: DEFAULT_FAKE_SOURCE_IDENTITY,
+        readIdentity: SWAPPED_FAKE_SOURCE_IDENTITY,
+      },
     ]);
   });
 
@@ -75,6 +140,7 @@ describe("file-grant ACL/probe enforcement honesty", () => {
       agent_uid: 502,
       platform: process.platform,
       source_realpath: "/tmp/example.txt",
+      ...DEFAULT_FAKE_SOURCE_IDENTITY,
     });
     expect(fsOps.probedReads).toHaveLength(1);
   });
