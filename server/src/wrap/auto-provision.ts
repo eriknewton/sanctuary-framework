@@ -755,6 +755,8 @@ export interface RunAutoProvisionForWrapOptions {
   isTty: boolean;
   /** `--provision-agent-account[=name]` pre-answer (fix L2: pre-answers the CHOICE only). Undefined = not passed. */
   preAnsweredProvision?: boolean;
+  /** Absolute path to the running Sanctuary CLI binary for install-boot's LaunchDaemon argv. */
+  cliBinary?: string;
   /** Print function for operator-facing output (defaults to console.error, matching the rest of wrap/cli.ts's stderr convention). */
   print?: (line: string) => void;
   /** Override for `process.getuid` (tests only; production leaves this undefined). */
@@ -771,6 +773,17 @@ export interface RunAutoProvisionForWrapOptions {
 export interface AutoProvisionSummary {
   ran: boolean;
   outcome?: ProvisionFlowOutcome;
+}
+
+export function policyDaemonInstallBootArgs(
+  fortressPath: string,
+  cliBinary: string | undefined,
+): string[] {
+  const args = ["--fortress", fortressPath];
+  if (cliBinary !== undefined && cliBinary.length > 0) {
+    args.push("--binary", cliBinary);
+  }
+  return args;
 }
 
 /**
@@ -1049,7 +1062,10 @@ export async function runAutoProvisionForWrap(
       // when NO wall existed before this run, so an abort tears down exactly
       // what this run created and never a pre-existing wall.
       const freshlyInstalled = action === "install-fresh";
-      const code = await runInstallBoot(["--fortress", fortressPath], { env: process.env });
+      const code = await runInstallBoot(
+        policyDaemonInstallBootArgs(fortressPath, options.cliBinary),
+        { env: process.env },
+      );
       if (code !== 0) {
         // install-boot boots out its own crash-looping unit on a start failure,
         // so on a fresh box nothing is normally left live; `freshlyInstalled` is

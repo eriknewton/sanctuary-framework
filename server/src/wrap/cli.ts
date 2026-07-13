@@ -369,6 +369,13 @@ function resolveSanctuaryCommand(options: WrapOptions): {
   };
 }
 
+function resolveAutoProvisionCliBinary(options: WrapOptions): string | undefined {
+  const candidate = options.devDist ?? process.argv[1];
+  return candidate === undefined || candidate.length === 0
+    ? undefined
+    : resolvePath(candidate);
+}
+
 /**
  * Validate a `--dev-dist <path>` before it is written into the harness config
  * (Finding 4, 2026-06-25). The dogfood path registers `node <path>` as the
@@ -1075,6 +1082,7 @@ async function maybeRunAutoProvisionForWrap(
     return await runner({
       isTty: process.stdin.isTTY === true,
       preAnsweredProvision: options.provisionAgentAccount,
+      cliBinary: resolveAutoProvisionCliBinary(options),
       // SAFETY: stderr is the operator-facing CLI channel for this
       // subcommand; this prints the plan-and-print + progress lines from
       // the auto-provision flow (account plan, re-home summary, arm
