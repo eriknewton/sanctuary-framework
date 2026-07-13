@@ -19,8 +19,8 @@
  * Linux uses the pinned `/proc/<pid>/fd/<fd>` path. macOS has path-scoped
  * `chmod +a` and no fd path, so it first replaces the grant-tree entry with a
  * hard link in the operator-owned grant tree, then fstats that link with
- * O_NOFOLLOW and requires the dev/ino to equal the pinned source. The macOS
- * source and grant tree must be on the same filesystem; EXDEV or identity
+ * O_NOFOLLOW | O_NONBLOCK and requires the dev/ino to equal the pinned source.
+ * The macOS source and grant tree must be on the same filesystem; EXDEV or identity
  * mismatch fails closed as unverified and applies no read ACE. The grant tree
  * is the agent's reach path, not a second path-scoped boundary. POSIX read
  * ACLs are inode-scoped: the same uid can read the same file through any
@@ -71,6 +71,8 @@ const AGENT_SUBDIR_MODE = 0o700;
 export const FILE_GRANT_ACL_COMMAND_TIMEOUT_MS = 2_000;
 const EXEC_MAX_BUFFER_BYTES = 64 * 1024;
 const FILE_GRANT_PIN_SOURCE_OPEN_FLAGS =
+  fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
+const FILE_GRANT_MAC_ACL_TARGET_OPEN_FLAGS =
   fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK;
 const POSIX_MODE_TYPE_MASK = 0o170000;
 const POSIX_MODE_TYPE_REGULAR = 0o100000;
@@ -908,10 +910,18 @@ export class PosixFileGrantFsOps implements FsOps {
   private async readMacAclTargetIdentity(path: string): Promise<FileGrantSourceIdentity> {
     const handle = await this.macAclLinkOps.open(
       path,
-      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW
+      FILE_GRANT_MAC_ACL_TARGET_OPEN_FLAGS
     );
     try {
-      return inodeIdentityFromStats(await handle.stat({ bigint: true }));
+      const stats = await handle.stat({ bigint: true });
+      const sourceKind = sourceKindFromStats(stats);
+      if (sourceKind !== "regular_file") {
+        throw new Error(
+          `Governed File-Grant: trusted macOS ACL target "${path}" is ` +
+            `${sourceKind}, not a regular file; refusing to remove an ACE through it.`
+        );
+      }
+      return inodeIdentityFromStats(stats);
     } finally {
       await closeBestEffort(handle);
     }

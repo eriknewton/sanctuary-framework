@@ -69,6 +69,7 @@ export async function reconcileFileGrantTree(
   const scrubbed: string[] = [];
   let firstScrubError: unknown = null;
   const aclFailureByGrantId = new Map<string, FileGrantAclRemovalResult>();
+  const confirmedScrubbedGrantIds = new Set<string>();
   for (const entry of plan.toScrub) {
     try {
       const grant = grantsById.get(entry.grant_id);
@@ -78,6 +79,7 @@ export async function reconcileFileGrantTree(
       );
       if (removeResult.scrubbed) {
         scrubbed.push(entry.relative_tree_entry);
+        confirmedScrubbedGrantIds.add(entry.grant_id);
       } else {
         aclFailureByGrantId.set(entry.grant_id, removeResult.aclRemoval);
         await appendScrubFailureAudit(deps, entry, grant, removeResult.aclRemoval);
@@ -101,8 +103,17 @@ export async function reconcileFileGrantTree(
   // `reviseGrantForExpiry` is a no-op for revoked or not-yet-expired grants.
   const expired: string[] = [];
   for (const grant of grants) {
-    if (grant.status === "active" && isGrantExpired(grant, deps.now)) {
-      await deps.store.put(reviseGrantForExpiry(grant, deps.now));
+    const shouldExpire = grant.status === "active" && isGrantExpired(grant, deps.now);
+    const shouldClearAce =
+      confirmedScrubbedGrantIds.has(grant.grant_id) && grant.granted_read_ace != null;
+    if (shouldExpire || shouldClearAce) {
+      let revised = shouldExpire ? reviseGrantForExpiry(grant, deps.now) : grant;
+      if (shouldClearAce) {
+        revised = { ...revised, granted_read_ace: null };
+      }
+      await deps.store.put(revised);
+    }
+    if (shouldExpire) {
       expired.push(grant.grant_id);
       await appendExpiryAudit(deps, grant, aclFailureByGrantId.get(grant.grant_id));
     }

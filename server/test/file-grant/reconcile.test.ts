@@ -101,6 +101,45 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
       entry: grant.tree_entry,
       options: { grantedReadAce: grant.granted_read_ace },
     });
+    const persisted = await grantStore.get(grant.grant_id);
+    expect(persisted!.status).toBe("expired");
+    expect(persisted!.granted_read_ace).toBeNull();
+  });
+
+  it("retains verified grant ACL metadata when expiry scrub cannot confirm removal", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      probeAgentReadResult: true,
+      removeAclThrows: new Error("acl removal failed"),
+    });
+
+    const { grant, enforcement } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: "/tmp/example.txt" },
+        mode: "read",
+        ttlSeconds: 60,
+        createdBy: "operator-1",
+      },
+      { fsOps, store: grantStore, now: new Date("2026-07-07T00:00:00.000Z"), auditLog },
+    );
+    expect(enforcement).toBe("met");
+
+    await expect(
+      reconcileFileGrantTree({
+        store: grantStore,
+        fsOps,
+        now: new Date("2026-07-07T02:00:00.000Z"),
+        auditLog,
+      }),
+    ).rejects.toThrow(/failed to remove ACL/);
+
+    const persisted = await grantStore.get(grant.grant_id);
+    expect(persisted!.status).toBe("expired");
+    expect(persisted!.granted_read_ace).toEqual(grant.granted_read_ace);
   });
 
   it("never scrubs or expires a standing (no-TTL) grant", async () => {

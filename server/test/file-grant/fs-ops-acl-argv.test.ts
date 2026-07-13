@@ -70,6 +70,8 @@ function makeMacAclLinkOps(params: {
   identity: FileGrantSourceIdentity;
   linkError?: NodeJS.ErrnoException;
   missingOnOpen?: boolean;
+  isFile?: boolean;
+  mode?: number;
 }): {
   links: Array<{ existingPath: string; newPath: string }>;
   opens: Array<{ path: string; flags: number }>;
@@ -92,6 +94,9 @@ function makeMacAclLinkOps(params: {
           dev: BigInt(params.identity.source_dev),
           ino: BigInt(params.identity.source_ino),
           uid: 501n,
+          mode: params.mode ?? 0o100000,
+          isFile: () => params.isFile ?? true,
+          isDirectory: () => false,
         }),
         close: async () => {},
       };
@@ -297,8 +302,14 @@ describe("file-grant ACL command argv construction", () => {
       { existingPath: "/operator/source.txt", newPath: trustedPath },
     ]);
     expect(macLinks.opens).toEqual([
-      { path: trustedPath, flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW },
-      { path: trustedPath, flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW },
+      {
+        path: trustedPath,
+        flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      },
+      {
+        path: trustedPath,
+        flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      },
     ]);
     expect(exec.commands).toEqual([
       { file: "id", args: ["-nu", "502"] },
@@ -451,10 +462,94 @@ describe("file-grant ACL command argv construction", () => {
       { file: "chmod", args: ["-a", "user:agentuser allow read,execute", trustedPath] },
     ]);
     expect(macLinks.opens).toEqual([
-      { path: trustedPath, flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW },
-      { path: trustedPath, flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW },
+      {
+        path: trustedPath,
+        flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      },
+      {
+        path: trustedPath,
+        flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      },
     ]);
     await expect(readFile(trustedPath, "utf-8")).rejects.toThrow();
+  });
+
+  it("macOS revoke fails closed when the trusted hard-link inode differs", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-mac-"));
+    const treeEntry = "agent-1/fg_revoke_mismatch";
+    const trustedPath = join(fortress, "grants", treeEntry);
+    const exec = makeRecordingExecRunner();
+    const macLinks = makeMacAclLinkOps({ identity: { source_dev: "11", source_ino: "23" } });
+    const fsOps = new PosixFileGrantFsOps(fortress, {
+      platform: "darwin",
+      execRunner: exec.runner,
+      macAclLinkOps: macLinks.ops,
+    });
+
+    const result = await fsOps.removeEntry(treeEntry, {
+      grantedReadAce: {
+        agent_uid: 502,
+        platform: "darwin",
+        source_realpath: "/operator/source.txt",
+        source_dev: "11",
+        source_ino: "22",
+        mac_principal: "agentuser",
+        mac_acl_hardlink_path: trustedPath,
+      },
+    });
+
+    expect(result.scrubbed).toBe(false);
+    expect(result.treeEntryRemoved).toBe(false);
+    expect(result.aclRemoval.status).toBe("failed");
+    expect(result.aclRemoval.reason).toContain("source inode mismatch");
+    expect(exec.commands).toHaveLength(0);
+    expect(macLinks.opens).toEqual([
+      {
+        path: trustedPath,
+        flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      },
+    ]);
+  });
+
+  it("macOS revoke fails closed when the trusted ACL target is not regular", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-mac-"));
+    const treeEntry = "agent-1/fg_revoke_fifo";
+    const trustedPath = join(fortress, "grants", treeEntry);
+    const exec = makeRecordingExecRunner();
+    const macLinks = makeMacAclLinkOps({
+      identity: { source_dev: "11", source_ino: "22" },
+      isFile: false,
+      mode: 0o010000,
+    });
+    const fsOps = new PosixFileGrantFsOps(fortress, {
+      platform: "darwin",
+      execRunner: exec.runner,
+      macAclLinkOps: macLinks.ops,
+    });
+
+    const result = await fsOps.removeEntry(treeEntry, {
+      grantedReadAce: {
+        agent_uid: 502,
+        platform: "darwin",
+        source_realpath: "/operator/source.txt",
+        source_dev: "11",
+        source_ino: "22",
+        mac_principal: "agentuser",
+        mac_acl_hardlink_path: trustedPath,
+      },
+    });
+
+    expect(result.scrubbed).toBe(false);
+    expect(result.treeEntryRemoved).toBe(false);
+    expect(result.aclRemoval.status).toBe("failed");
+    expect(result.aclRemoval.reason).toContain("not a regular file");
+    expect(exec.commands).toHaveLength(0);
+    expect(macLinks.opens).toEqual([
+      {
+        path: trustedPath,
+        flags: fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+      },
+    ]);
   });
 
   it("best-effort removes partial Linux ACLs when grant application fails", async () => {

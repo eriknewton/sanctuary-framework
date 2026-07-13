@@ -92,12 +92,28 @@ export async function revokeFileGrant(
     throw scrubErr;
   }
 
+  let resultGrant = revised;
   if (removeResult.scrubbed && revised.granted_read_ace) {
+    const clearedGrant = { ...revised, granted_read_ace: null };
     try {
-      await deps.store.put({ ...revised, granted_read_ace: null });
-    } catch {
-      // Best-effort cleanup of stale ACE metadata after confirmed removal.
-      // The grant is already revoked and the successful scrub is still true.
+      await deps.store.put(clearedGrant);
+      resultGrant = clearedGrant;
+    } catch (persistErr) {
+      await deps.auditLog?.appendCritical({
+        layer: "l1",
+        operation: "file_grant_revoke",
+        identity_id: revokedBy,
+        result: "failure",
+        details: {
+          grant_id: grantId,
+          already_revoked: alreadyRevoked,
+          reason: "ace_metadata_clear_persist_failed",
+          retryable: true,
+          tree_entry_removed: removeResult.treeEntryRemoved,
+          acl_removal: removeResult.aclRemoval,
+        },
+      });
+      throw persistErr;
     }
   }
 
@@ -142,7 +158,7 @@ export async function revokeFileGrant(
   return {
     found: true,
     alreadyRevoked,
-    grant: revised.granted_read_ace ? { ...revised, granted_read_ace: null } : revised,
+    grant: resultGrant,
     treeEntryRemoved: removeResult.treeEntryRemoved,
     scrubbed: true,
     aclRemoval: removeResult.aclRemoval,

@@ -90,6 +90,7 @@ function makeMacRevokeFsOps(params: {
           dev: BigInt(params.identity.source_dev),
           ino: BigInt(params.identity.source_ino),
           uid: 501n,
+          isFile: () => true,
         }),
         close: async () => {},
       };
@@ -191,6 +192,61 @@ describe("file-grant revoke: idempotent + audited", () => {
       `remove:${grant.tree_entry}`,
       `acl-removed:${grant.tree_entry}:502`,
     ]);
+  });
+
+  it("surfaces a durable ACE metadata-clear write failure after confirmed scrub", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      probeAgentReadResult: true,
+    });
+
+    const { grant } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: "/tmp/example.txt" },
+        mode: "read",
+        ttlSeconds: 3600,
+        createdBy: "operator-1",
+      },
+      { fsOps, store: grantStore, now: new Date("2026-07-07T00:00:00.000Z"), auditLog },
+    );
+
+    const persistError = new Error("metadata clear persist failed");
+    let putCount = 0;
+    const failingClearStore = {
+      get: (grantId: string) => grantStore.get(grantId),
+      put: async (nextGrant: FileGrant) => {
+        putCount += 1;
+        if (nextGrant.granted_read_ace === null) throw persistError;
+        await grantStore.put(nextGrant);
+      },
+    };
+
+    await expect(
+      revokeFileGrant(grant.grant_id, "operator-1", {
+        fsOps,
+        store: failingClearStore,
+        now: new Date("2026-07-07T01:00:00.000Z"),
+        auditLog,
+      }),
+    ).rejects.toThrow(persistError);
+
+    expect(putCount).toBe(2);
+    expect(fsOps.scrubbed).toContain(grant.tree_entry);
+    expect(fsOps.removedAcls).toHaveLength(1);
+
+    const persisted = await grantStore.get(grant.grant_id);
+    expect(persisted!.status).toBe("revoked");
+    expect(persisted!.granted_read_ace).toEqual(grant.granted_read_ace);
+
+    const { entries } = await auditLog.query({ operation_type: "file_grant_revoke" });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.result).toBe("failure");
+    expect(entries[0]!.details.reason).toBe("ace_metadata_clear_persist_failed");
+    expect(entries[0]!.details.retryable).toBe(true);
   });
 
   it("double-revoke is a no-op success, not an error", async () => {
