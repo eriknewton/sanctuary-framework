@@ -54,6 +54,7 @@ import {
   CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
   CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS,
   CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS,
+  CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS,
 } from "../constants.js";
 import {
   EGRESS_PROBE_FAILED_AUDIT_OP,
@@ -291,6 +292,21 @@ export interface MacOSCastleWallDaemonInput {
    * {@link CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS}. Tests inject a small value.
    */
   reloadBroadcastDeadlineMs?: number;
+  /**
+   * Deadline (ms) for the fire-and-forget audit write that records a reload
+   * outcome. The reload response never awaits this write. Defaults to
+   * {@link CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS}. Tests inject a small value.
+   */
+  reloadAuditDeadlineMs?: number;
+  /**
+   * Test-only fault-injection seam (mirrors the existing `signerClientInvoke` /
+   * `agentEgressProbe` / `now` injection seams). When present it is awaited at
+   * the very TOP of the reload compose phase, BEFORE any fortress read or the
+   * re-sign, so a test can prove the whole-body reload deadline bounds a stall
+   * that occurs before the signer is ever reached (not only a signer hang).
+   * Undefined in production.
+   */
+  reloadComposeHook?: () => Promise<void>;
 }
 
 export type MacOSCastleWallListenerOptions = ConstructorParameters<
@@ -351,6 +367,8 @@ export async function startMacOSCastleWallDaemon(
     input.reloadSignDeadlineMs ?? CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS;
   const reloadBroadcastDeadlineMs =
     input.reloadBroadcastDeadlineMs ?? CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS;
+  const reloadAuditDeadlineMs =
+    input.reloadAuditDeadlineMs ?? CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS;
 
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
@@ -773,20 +791,75 @@ export async function startMacOSCastleWallDaemon(
     throw err;
   }
 
+  /**
+   * Record a reload outcome to the audit log BEST-EFFORT and FIRE-AND-FORGET.
+   *
+   * Drill-found root cause (Mini1 2026-07-12, second miss): the reload COMPLETED
+   * the compose + sign + broadcast, but the response was gated behind
+   * `auditLog.append` + `flush`. A slow / wedged / lock-contended audit write
+   * therefore turned a successful reload into a client-visible generic timeout
+   * AND swallowed the bounded refusal (the failure-audit in the old catch block
+   * hung the same way, so no response was ever written). The audit write is
+   * observability, not correctness: the manifest is already signed and
+   * broadcast to the enforcing sysext. So the response path MUST NOT await it.
+   * This runs it detached, under its own deadline so it can never leak a pending
+   * operation, and never rejects into the caller.
+   */
+  function recordReloadOutcome(
+    operation: "policy_loaded" | "policy_validation_failed",
+    details: Record<string, unknown>,
+    result: "success" | "failure",
+  ): void {
+    void withReloadDeadline(
+      (async () => {
+        await input.auditLog.append(
+          "l1",
+          operation,
+          input.fortressId,
+          { ...details, source: "castle-wall-reload" },
+          result,
+        );
+        await input.auditLog.flush();
+      })(),
+      reloadAuditDeadlineMs,
+      `reload audit write (${operation}) did not complete within ${reloadAuditDeadlineMs}ms`,
+    ).catch((err: unknown) => {
+      // SAFETY: best-effort audit failures surface on daemon stderr only; they
+      // never fail the reload (the wall is already armed with the new manifest).
+      console.error(
+        `[castle-wall] reload audit write (${operation}) failed (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  }
+
   async function reloadPolicy(
     request?: PolicyReloadRequest,
   ): Promise<PolicyReloadResponse> {
+    const requestId = request?.request_id ?? randomBytes(16).toString("hex");
+    // Preserve the last-known-good signature for the failure response BEFORE any
+    // await, so a bounded refusal can be returned without touching (possibly
+    // wedged) shared state.
+    const lastKnownSignature = manifestState.signed.signature.signature_b64url;
     try {
       // Drill-found hang guard (Mini1 egress drill 2026-07-12): a policy reload
-      // RE-SIGNS the recomposed ruleset through the root signer helper. Every
-      // await here is bounded by an internal deadline strictly shorter than the
-      // client's request deadline, so a stalled helper (or wedged subscriber
-      // write) surfaces as a FAST, SPECIFIC `ok:false` from the daemon rather
-      // than the client giving up with a generic "IPC request timed out". A
-      // bounded specific refusal preserves the fail-closed refuse-to-arm while
-      // telling the operator exactly which stage stalled.
+      // RE-COMPOSES and RE-SIGNS the ruleset through the root signer helper. The
+      // ENTIRE compose+sign phase (the fortress reads AND the re-sign) runs under
+      // one internal deadline strictly shorter than the client's request
+      // deadline, so a stall ANYWHERE before the sign completes (a hung fortress
+      // read, a stalled signer helper) surfaces as a FAST, SPECIFIC `ok:false`
+      // from the daemon rather than a generic client-side "IPC request timed
+      // out". The response is NEVER gated on the audit write (see
+      // recordReloadOutcome). A bounded specific refusal preserves fail-closed
+      // refuse-to-arm.
       manifestState = await withReloadDeadline(
         (async () => {
+          // Test-only fault-injection point (before any real work), so the
+          // whole-body bound can be proven for a stall that is NOT the signer.
+          if (input.reloadComposeHook) {
+            await input.reloadComposeHook();
+          }
           const reloadedOrigin = await resolveAgentOrigin(
             input.fortressPath,
             input.agentOrigin,
@@ -812,17 +885,16 @@ export async function startMacOSCastleWallDaemon(
           });
         })(),
         reloadSignDeadlineMs,
-        `signer helper did not respond within ${reloadSignDeadlineMs}ms during policy reload`,
+        `policy reload did not compose and sign within ${reloadSignDeadlineMs}ms (signer helper or fortress read stalled)`,
       );
       const emitted = await withReloadDeadline(
         listener.broadcastManifestUpdate(),
         reloadBroadcastDeadlineMs,
         `manifest broadcast did not complete within ${reloadBroadcastDeadlineMs}ms during policy reload`,
       );
-      await input.auditLog.append(
-        "l1",
+      // Fire-and-forget: the response is returned WITHOUT awaiting the audit.
+      recordReloadOutcome(
         "policy_loaded",
-        input.fortressId,
         {
           loaded_rule_count: manifestState.rules.length,
           // Surface auto-derived rules (#380) so a derived grant is never
@@ -831,34 +903,28 @@ export async function startMacOSCastleWallDaemon(
             .filter((rule) => rule.derived === true)
             .map((rule) => rule.id),
           emitted_subscribers: emitted,
-          source: "castle-wall-reload",
         },
         "success",
       );
-      await input.auditLog.flush();
       return {
         type: "policy_reload_response",
-        request_id: request?.request_id ?? randomBytes(16).toString("hex"),
+        request_id: requestId,
         ok: true,
         loaded_manifest_signature_b64url: manifestState.signed.signature.signature_b64url,
         loaded_rule_count: manifestState.rules.length,
       };
     } catch (err) {
-      await input.auditLog.append(
-        "l1",
-        "policy_validation_failed",
-        input.fortressId,
-        { error: err instanceof Error ? err.message : String(err) },
-        "failure",
-      );
-      await input.auditLog.flush();
+      const message = err instanceof Error ? err.message : String(err);
+      // Fire-and-forget: a bounded refusal must reach the client even if the
+      // audit log is the thing that is wedged.
+      recordReloadOutcome("policy_validation_failed", { error: message }, "failure");
       return {
         type: "policy_reload_response",
-        request_id: request?.request_id ?? randomBytes(16).toString("hex"),
+        request_id: requestId,
         ok: false,
-        loaded_manifest_signature_b64url: manifestState.signed.signature.signature_b64url,
+        loaded_manifest_signature_b64url: lastKnownSignature,
         loaded_rule_count: manifestState.rules.length,
-        error: err instanceof Error ? err.message : String(err),
+        error: message,
       };
     }
   }

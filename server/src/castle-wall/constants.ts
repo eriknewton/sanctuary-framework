@@ -207,3 +207,17 @@ export const CASTLE_WALL_RELOAD_SIGN_DEADLINE_MS = 12_000 as const;
  * specific `ok:false` ("manifest broadcast did not complete ...").
  */
 export const CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS = 3_000 as const;
+
+/**
+ * Daemon-side deadline (ms) for the BEST-EFFORT audit write that records a
+ * reload outcome. The reload response is NEVER gated on this write: a slow or
+ * wedged audit log (e.g. cross-process write-lock contention, or a large-chain
+ * re-verify on append) must not turn a successful re-sign + broadcast into a
+ * client-visible timeout, nor swallow a bounded refusal. The audit write runs
+ * fire-and-forget under this deadline purely so it cannot leak a pending
+ * operation. Root cause of the second drill miss (Mini1 2026-07-12): the reload
+ * COMPLETED the compose + sign + broadcast, but the response was stuck behind
+ * `auditLog.append`/`flush`, so no `policy_loaded` was ever written and the
+ * client saw a generic timeout.
+ */
+export const CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS = 5_000 as const;

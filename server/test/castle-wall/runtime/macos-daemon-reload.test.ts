@@ -143,7 +143,12 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     masterKey: Uint8Array,
     helper: ReturnType<typeof makeControllableHelper>,
     listenerFactory: ReturnType<typeof makeControllableListener>["factory"],
-    deadlines: { reloadSignDeadlineMs?: number; reloadBroadcastDeadlineMs?: number } = {},
+    overrides: {
+      reloadSignDeadlineMs?: number;
+      reloadBroadcastDeadlineMs?: number;
+      reloadAuditDeadlineMs?: number;
+      reloadComposeHook?: () => Promise<void>;
+    } = {},
   ) {
     return await startMacOSCastleWallDaemon({
       fortressPath,
@@ -157,7 +162,7 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       socketPath: join(fortressPath, "castle.sock"),
       listenerFactory,
       signerClientInvoke: helper.invoke,
-      ...deadlines,
+      ...overrides,
     });
   }
 
@@ -192,7 +197,7 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       });
       const elapsed = Date.now() - started;
       expect(reply.ok).toBe(false);
-      expect(reply.error ?? "").toMatch(/signer helper did not respond within 50ms/);
+      expect(reply.error ?? "").toMatch(/did not compose and sign within 50ms/);
       // Bounded: nowhere near the client's multi-second deadline.
       expect(elapsed).toBeLessThan(2_000);
     } finally {
@@ -218,6 +223,68 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       const elapsed = Date.now() - started;
       expect(reply.ok).toBe(false);
       expect(reply.error ?? "").toMatch(/manifest broadcast did not complete within 50ms/);
+      expect(elapsed).toBeLessThan(2_000);
+    } finally {
+      await handle.stop();
+    }
+  });
+
+  it("returns ok:true even when the audit log is WEDGED (response is not gated on audit)", async () => {
+    // Root cause of the second drill miss (2026-07-12): the reload completed the
+    // compose+sign+broadcast, but the response was stuck behind auditLog.append/
+    // flush. A wedged audit log must NOT turn a successful reload into a
+    // client-visible timeout. Here the sign + broadcast succeed and the audit is
+    // frozen; the reload must still return ok:true promptly.
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const helper = makeControllableHelper();
+    const listener = makeControllableListener();
+    const handle = await startDaemon(fortressPath, auditLog, masterKey, helper, listener.factory, {
+      reloadAuditDeadlineMs: 50,
+    });
+    const origAppend = auditLog.append.bind(auditLog);
+    const origFlush = auditLog.flush.bind(auditLog);
+    try {
+      // Freeze the audit log AFTER startup (startup's own appends already ran).
+      auditLog.append = (() => new Promise<void>(() => {})) as typeof auditLog.append;
+      auditLog.flush = (() => new Promise<void>(() => {})) as typeof auditLog.flush;
+      const started = Date.now();
+      const reply = await handle.reloadPolicy({
+        type: "policy_reload_request",
+        request_id: "req-audit-wedged",
+      });
+      const elapsed = Date.now() - started;
+      expect(reply.ok).toBe(true);
+      expect(reply.loaded_rule_count).toBeGreaterThan(0);
+      expect(listener.broadcasts).toBeGreaterThan(0);
+      // Not blocked on the frozen audit write.
+      expect(elapsed).toBeLessThan(2_000);
+    } finally {
+      // Restore before stop() so the daemon's filter_stopped audit can complete.
+      auditLog.append = origAppend;
+      auditLog.flush = origFlush;
+      await handle.stop();
+    }
+  });
+
+  it("bounds a stall at the TOP of reloadPolicy (before the signer) -> ok:false", async () => {
+    // A hang BEFORE the re-sign (a wedged fortress read) must also be bounded by
+    // the whole-body reload deadline, not only a signer hang.
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const helper = makeControllableHelper();
+    const listener = makeControllableListener();
+    const handle = await startDaemon(fortressPath, auditLog, masterKey, helper, listener.factory, {
+      reloadSignDeadlineMs: 50,
+      reloadComposeHook: () => new Promise<void>(() => {}),
+    });
+    try {
+      const started = Date.now();
+      const reply = await handle.reloadPolicy({
+        type: "policy_reload_request",
+        request_id: "req-top-hang",
+      });
+      const elapsed = Date.now() - started;
+      expect(reply.ok).toBe(false);
+      expect(reply.error ?? "").toMatch(/did not compose and sign within 50ms/);
       expect(elapsed).toBeLessThan(2_000);
     } finally {
       await handle.stop();
