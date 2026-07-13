@@ -20,7 +20,9 @@ import {
   type OpenRunner,
 } from "../../src/cli/castle-wall.js";
 import {
+  CASTLE_WALL_BOOT_LABEL,
   bootServiceInstalled,
+  bootServiceReady,
   renderBootLaunchDaemonPlist,
 } from "../../src/cli/castle-wall-boot.js";
 
@@ -125,6 +127,41 @@ describe("castle-wall enable/disable CLI verbs", () => {
     });
   }
 
+  function makeBootServiceReadyProbe(
+    plistPath: string,
+    loadedFortressPath: string,
+    opts: { disabled?: boolean; running?: boolean } = {},
+  ): (expectedFortressPath?: string) => Promise<boolean> {
+    const disabled = opts.disabled ?? false;
+    const running = opts.running ?? true;
+    const execFileFn = (cmd: string, args: string[]) => {
+      if (cmd === "launchctl" && args[0] === "print-disabled") {
+        return {
+          code: 0,
+          stdout: `disabled services = {\n\t"${CASTLE_WALL_BOOT_LABEL}" => ${disabled ? "disabled" : "enabled"}\n}\n`,
+          stderr: "",
+        };
+      }
+      if (cmd === "launchctl" && args[0] === "print") {
+        return running
+          ? {
+              code: 0,
+              stdout:
+                "\tstate = running\n" +
+                "\tpid = 4242\n" +
+                "\tenvironment = {\n" +
+                `\t\tSANCTUARY_STORAGE_PATH => ${loadedFortressPath}\n` +
+                "\t}\n",
+              stderr: "",
+            }
+          : { code: 113, stdout: "", stderr: "Could not find service" };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected command: ${cmd}` };
+    };
+    return (expectedFortressPath?: string) =>
+      bootServiceReady(plistPath, expectedFortressPath, execFileFn, async () => {});
+  }
+
   it("enable refuses when no daemon is reachable", async () => {
     const { hostAppPath, env } = await makeFixture();
     const out = new CaptureStream();
@@ -162,7 +199,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: async () => false,
+      bootServiceReadyProbe: async () => false,
     });
 
     expect(code).toBe(1);
@@ -189,6 +226,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressA),
       bootServiceInstalledProbe: (expectedFortressPath) =>
         bootServiceInstalled(plistPath, expectedFortressPath),
     });
@@ -217,8 +255,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: (expectedFortressPath) =>
-        bootServiceInstalled(plistPath, expectedFortressPath),
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
       // This test targets the boot-service guard, not the descriptor guard.
       agentOriginDescriptorProbe: async () => true,
@@ -226,6 +263,60 @@ describe("castle-wall enable/disable CLI verbs", () => {
 
     expect(code).toBe(0);
     expect(out.text()).toContain("Castle Wall armed");
+  });
+
+  it("enable refuses when the matching boot service is disabled", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(fortressPath));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath, {
+        disabled: true,
+      }),
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("installed but not ready/enabled/loaded");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("enable refuses when the matching boot service is not loaded", async () => {
+    const { fortressPath, hostAppPath, env } = await makeFixture();
+    const plistPath = join(fortressPath, "boot.plist");
+    await writeFile(plistPath, makeBootPlist(fortressPath));
+    const err = new CaptureStream();
+    const { invoke, calls } = makeInvoker({});
+
+    const code = await runEnable(["--fortress", fortressPath, "--no-ttl"], {
+      out: new CaptureStream(),
+      err,
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      daemonProbe: async () => true,
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath, {
+        running: false,
+      }),
+      bootServiceInstalledProbe: (expectedFortressPath) =>
+        bootServiceInstalled(plistPath, expectedFortressPath),
+    });
+
+    expect(code).toBe(1);
+    expect(err.text()).toContain("installed but not ready/enabled/loaded");
+    expect(calls).toHaveLength(0);
   });
 
   it("enable REFUSES when no agent-origin descriptor is set and no --force (#877 boot-cut guard)", async () => {
@@ -246,8 +337,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: (expectedFortressPath) =>
-        bootServiceInstalled(plistPath, expectedFortressPath),
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
       agentOriginDescriptorProbe: async () => false,
     });
@@ -280,8 +370,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: (expectedFortressPath) =>
-        bootServiceInstalled(plistPath, expectedFortressPath),
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
       agentOriginDescriptorProbe: async () => true,
     });
@@ -342,8 +431,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: (expectedFortressPath) =>
-        bootServiceInstalled(plistPath, expectedFortressPath),
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
     });
 
@@ -376,8 +464,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: (expectedFortressPath) =>
-        bootServiceInstalled(plistPath, expectedFortressPath),
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
     });
 
@@ -411,8 +498,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
         daemonProbe: async () => true,
-        bootServiceInstalledProbe: (expectedFortressPath) =>
-          bootServiceInstalled(plistPath, expectedFortressPath),
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
         // No agentOriginDescriptorProbe override: exercises the REAL
         // read-back path, proving the descriptor this command just wrote
@@ -455,8 +541,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
         daemonProbe: async () => true,
-        bootServiceInstalledProbe: (expectedFortressPath) =>
-          bootServiceInstalled(plistPath, expectedFortressPath),
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
       },
     );
@@ -486,8 +571,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
         daemonProbe: async () => true,
-        bootServiceInstalledProbe: (expectedFortressPath) =>
-          bootServiceInstalled(plistPath, expectedFortressPath),
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
       },
     );
@@ -522,8 +606,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
         daemonProbe: async () => true,
-        bootServiceInstalledProbe: (expectedFortressPath) =>
-          bootServiceInstalled(plistPath, expectedFortressPath),
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
       },
     );
@@ -553,8 +636,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
         daemonProbe: async () => true,
-        bootServiceInstalledProbe: (expectedFortressPath) =>
-          bootServiceInstalled(plistPath, expectedFortressPath),
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
       },
     );
@@ -584,8 +666,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
         daemonProbe: async () => true,
-        bootServiceInstalledProbe: (expectedFortressPath) =>
-          bootServiceInstalled(plistPath, expectedFortressPath),
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
       },
     );
@@ -620,8 +701,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
         daemonProbe: async () => true,
-        bootServiceInstalledProbe: (expectedFortressPath) =>
-          bootServiceInstalled(plistPath, expectedFortressPath),
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
       },
     );
@@ -651,8 +731,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
         daemonProbe: async () => true,
-        bootServiceInstalledProbe: (expectedFortressPath) =>
-          bootServiceInstalled(plistPath, expectedFortressPath),
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
         sysextProbe: async () => "[activated enabled]",
       },
     );
@@ -685,8 +764,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: (expectedFortressPath) =>
-        bootServiceInstalled(plistPath, expectedFortressPath),
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, fortressPath),
       sysextProbe: async () => "[activated enabled]",
       // Real read-back path (no override): no descriptor exists on disk.
     });
@@ -736,8 +814,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       env: {},
       platform: "darwin",
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: (expectedFortressPath) =>
-        bootServiceInstalled(plistPath, expectedFortressPath),
+      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, defaultFortressPath),
     });
 
     expect(code).toBe(2);
@@ -762,7 +839,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
-      bootServiceInstalledProbe: async () => {
+      bootServiceReadyProbe: async () => {
         throw new Error("boot-service probe must not run under --force");
       },
     });
@@ -817,7 +894,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
       // This test targets the audit trail, not the descriptor guard.
       agentOriginDescriptorProbe: async () => true,
     });
@@ -885,7 +962,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppInvoke: invoke,
       sysextProbe: async () => "[activated enabled]",
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
       // This test targets the one-time GUI consent, not the descriptor guard.
       agentOriginDescriptorProbe: async () => true,
     });
@@ -1202,7 +1279,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
       sysextProbe: async () => "[activated enabled]",
     });
 
@@ -1230,7 +1307,7 @@ describe("castle-wall enable/disable CLI verbs", () => {
       hostAppCandidates: [hostAppPath],
       hostAppInvoke: invoke,
       daemonProbe: async () => true,
-      bootServiceInstalledProbe: async () => true,
+      bootServiceReadyProbe: async () => true,
       sysextProbe: async () => "[activated disabled]",
     });
 

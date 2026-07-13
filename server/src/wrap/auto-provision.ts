@@ -30,7 +30,7 @@ import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, lstat, readlink, symlink, rm, cp } from "node:fs/promises";
-import { dirname, relative, sep } from "node:path";
+import { dirname, relative, resolve as pathResolve, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
 import {
@@ -1022,28 +1022,48 @@ export async function runAutoProvisionForWrap(
     ensurePolicyDaemon: async (fortressPath) => {
       const socketPath = resolveCastleWallSocketPath({ platform: "darwin", fortressPath }).path;
       const { defaultDaemonProbe } = await import("../cli/castle-wall.js");
-      const { runInstallBoot, bootServiceInstalled, CASTLE_WALL_BOOT_PLIST_PATH } = await import(
-        "../cli/castle-wall-boot.js"
-      );
-      // 1. Probe the SAME socket the arm probes. If it already answers, this is
-      //    a no-op (the stock-box case: a boot daemon already serves this
-      //    fortress). Nothing was stood up, so nothing is torn down on abort.
-      if (await defaultDaemonProbe(socketPath)) {
-        return { ok: true as const, freshlyInstalled: false };
-      }
-      // 2. Not reachable: inspect the SINGLETON boot-service state and decide
-      //    (pure) which action to take. `bootServiceInstalled(plist, fortress)`
-      //    confirms a well-formed unit that targets THIS fortress; the no-arg
-      //    form confirms one exists for ANY fortress.
-      const [forThisFortress, forAnyFortress] = await Promise.all([
+      const {
+        runInstallBoot,
+        bootServiceInstalled,
+        bootServiceLoadState,
+        bootServicePlistPresent,
+        bootServiceReady,
+        CASTLE_WALL_BOOT_PLIST_PATH,
+      } = await import("../cli/castle-wall-boot.js");
+      // 1. Probe the SAME socket the arm probes, then inspect the SINGLETON
+      //    boot-service state. Bug D: a transient/manual daemon can answer the
+      //    socket NOW while no persistent boot service exists, and the arm's
+      //    reboot-survival guard correctly refuses that state. So reachability
+      //    is necessary but not sufficient; the no-op case requires BOTH a
+      //    reachable socket and a matching boot service for this fortress.
+      //    `bootServiceInstalled(plist, fortress)` confirms a well-formed unit
+      //    targets THIS fortress; `bootServiceReady` additionally confirms the
+      //    singleton launchd service is stably live. A matching-but-stopped or
+      //    nonfunctional plist must restart, not no-op. The occupancy check
+      //    treats either a singleton plist path OR a loaded singleton launchd
+      //    label as "some wall exists." If that state is unverifiable, treat it
+      //    as a conflict rather than silently overwriting unknown wall state.
+      const socketReachable = await defaultDaemonProbe(socketPath);
+      const [diskForThisFortress, readyForThisFortress, plistPresent] = await Promise.all([
         bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH, fortressPath),
-        bootServiceInstalled(CASTLE_WALL_BOOT_PLIST_PATH),
+        bootServiceReady(CASTLE_WALL_BOOT_PLIST_PATH, fortressPath),
+        bootServicePlistPresent(CASTLE_WALL_BOOT_PLIST_PATH),
       ]);
+      const loadedState = bootServiceLoadState();
+      const loadedForThisFortress =
+        loadedState.loaded && loadedState.fortressPath === pathResolve(fortressPath);
+      const forThisFortress =
+        diskForThisFortress && (!loadedState.loaded || loadedForThisFortress);
+      const forAnyFortress = plistPresent || loadedState.loaded;
       const action = resolvePolicyDaemonAction({
-        socketReachable: false,
+        socketReachable,
         bootServiceForThisFortress: forThisFortress,
+        bootServiceReadyForThisFortress: readyForThisFortress,
         bootServiceForAnyFortress: forAnyFortress,
       });
+      if (action === "noop") {
+        return { ok: true as const, freshlyInstalled: false };
+      }
       if (action === "refuse-conflict") {
         // Single wall per machine: DO NOT silently stand the machine's existing
         // wall down. Refuse and let the flow roll back its prior steps.
@@ -1051,7 +1071,7 @@ export async function runAutoProvisionForWrap(
           ok: false as const,
           freshlyInstalled: false,
           error:
-            `a Castle Wall is already installed for a different fortress; one machine runs one wall -- ` +
+            `a Castle Wall boot service already exists for a different or unverifiable fortress; one machine runs one wall -- ` +
             `arming ${fortressPath} would replace it. Stand the existing wall down first ` +
             `('sudo sanctuary castle-wall disable' then 'sudo sanctuary castle-wall uninstall-boot --yes'), then re-run.`,
         };
@@ -1079,6 +1099,16 @@ export async function runAutoProvisionForWrap(
             `(install-boot exited ${code}); not arming (arming with no policy daemon would deny-all-lock this machine).`,
         };
       }
+      if (!(await bootServiceReady(CASTLE_WALL_BOOT_PLIST_PATH, fortressPath))) {
+        return {
+          ok: false as const,
+          freshlyInstalled,
+          error:
+            `install-boot exited 0 for ${fortressPath}, but no matching ready persistent Castle Wall boot service ` +
+            `is installed; not arming (the arm reboot-survival guard would refuse, and arming without it ` +
+            `would reintroduce the F1 boot-cut).`,
+        };
+      }
       // install-boot certified a STABLE pid; the daemon still needs a moment to
       // bind its socket. Poll (bounded) until it actually answers before
       // declaring the daemon ready -- fail-closed if it never does.
@@ -1103,7 +1133,7 @@ export async function runAutoProvisionForWrap(
     // removal. Fail-loud: a nonzero exit throws so the orchestrator surfaces it.
     teardownPolicyDaemon: async () => {
       const { runUninstallBoot } = await import("../cli/castle-wall-boot.js");
-      const code = await runUninstallBoot(["--yes"], { env: process.env });
+      const code = await runUninstallBoot(["--yes", "--fortress", wallFortressPath], { env: process.env });
       if (code !== 0) {
         throw new Error(`castle-wall uninstall-boot exited ${code}`);
       }

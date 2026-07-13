@@ -1,12 +1,16 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { access, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 
 import {
   CASTLE_WALL_BOOT_LABEL,
+  bootServiceEnabled,
   bootServiceInstalled,
+  bootServiceLoaded,
+  bootServicePlistPresent,
+  bootServiceReady,
   deriveHomebrewStableBinDir,
   parseBootArgs,
   renderBootLaunchDaemonPlist,
@@ -43,13 +47,16 @@ interface FakeLaunchctl {
   calls: Array<{ cmd: string; args: string[] }>;
   /** Models a live, running launchd job (a `pid = N` line in `print`). */
   running: boolean;
+  /** Models a launchctl disabled override in `print-disabled system`. */
+  disabled: boolean;
   execFileFn: (cmd: string, args: string[]) => ExecFileResult;
 }
 
-function makeFakeExec(opts: { home?: string } = {}): FakeLaunchctl {
+function makeFakeExec(opts: { home?: string; fortress?: string } = {}): FakeLaunchctl {
   const state: FakeLaunchctl = {
     calls: [],
     running: false,
+    disabled: false,
     execFileFn: (cmd: string, args: string[]): ExecFileResult => {
       state.calls.push({ cmd, args });
       if (cmd === "dscl") {
@@ -64,9 +71,25 @@ function makeFakeExec(opts: { home?: string } = {}): FakeLaunchctl {
       }
       if (cmd === "launchctl") {
         const verb = args[0];
+        if (verb === "print-disabled") {
+          return {
+            code: 0,
+            stdout: `disabled services = {\n\t"${CASTLE_WALL_BOOT_LABEL}" => ${state.disabled ? "disabled" : "enabled"}\n}\n`,
+            stderr: "",
+          };
+        }
         if (verb === "print") {
           return state.running
-            ? { code: 0, stdout: "\tstate = running\n\tpid = 4242\n", stderr: "" }
+            ? {
+                code: 0,
+                stdout:
+                  "\tstate = running\n" +
+                  "\tpid = 4242\n" +
+                  "\tenvironment = {\n" +
+                  `\t\tSANCTUARY_STORAGE_PATH => ${opts.fortress ?? "/Users/operator/.sanctuary"}\n` +
+                  "\t}\n",
+                stderr: "",
+              }
             : { code: 113, stdout: "", stderr: "Could not find service" };
         }
         if (verb === "bootstrap") {
@@ -81,6 +104,7 @@ function makeFakeExec(opts: { home?: string } = {}): FakeLaunchctl {
             : { code: 113, stdout: "", stderr: "No such process" };
         }
         if (verb === "enable") {
+          state.disabled = false;
           return { code: 0, stdout: "", stderr: "" };
         }
       }
@@ -333,7 +357,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(await bootServiceInstalled(path, "/Users/operator/.sanctuary")).toBe(false);
     });
 
-    it("keeps legacy validation when no expected fortress path is provided", async () => {
+    it("returns false when the plist omits the fortress environment", async () => {
       const path = join(await makeTemp("f1-plist-"), "boot.plist");
       await writeFile(
         path,
@@ -342,8 +366,9 @@ describe("castle-wall boot service (F1 Option C)", () => {
           "",
         ),
       );
-      expect(await bootServiceInstalled(path)).toBe(true);
+      expect(await bootServiceInstalled(path)).toBe(false);
       expect(await bootServiceInstalled(path, "/Users/operator/.sanctuary")).toBe(false);
+      expect(await bootServicePlistPresent(path)).toBe(true);
     });
 
     it("returns false when the plist is absent", async () => {
@@ -373,6 +398,126 @@ describe("castle-wall boot service (F1 Option C)", () => {
         ),
       );
       expect(await bootServiceInstalled(path)).toBe(false);
+    });
+
+    it("returns false for a plist with KeepAlive disabled", async () => {
+      const path = join(await makeTemp("f1-plist-"), "nokeepalive.plist");
+      await writeFile(
+        path,
+        validPlist.replace(
+          "<key>KeepAlive</key>\n\t<true/>",
+          "<key>KeepAlive</key>\n\t<false/>",
+        ),
+      );
+      expect(await bootServiceInstalled(path)).toBe(false);
+    });
+
+    it("returns false for a plist that does not run castle-wall daemon under launchd", async () => {
+      const path = join(await makeTemp("f1-plist-"), "wrongargv.plist");
+      await writeFile(
+        path,
+        validPlist.replace("<string>castle-wall</string>", "<string>not-castle-wall</string>"),
+      );
+      expect(await bootServiceInstalled(path)).toBe(false);
+    });
+
+    it("returns false for an unsupported executable even when daemon tokens are present", async () => {
+      const path = join(await makeTemp("f1-plist-"), "wrongprogram.plist");
+      await writeFile(
+        path,
+        renderBootLaunchDaemonPlist({
+          programArguments: ["/bin/echo", "castle-wall", "daemon", "--safe-mode", "--launchd"],
+          fortressPath: "/Users/operator/.sanctuary",
+          signerClientPath: "/Applications/Castle Wall.app/Contents/MacOS/castle-wall-signer-client",
+        }),
+      );
+      expect(await bootServiceInstalled(path)).toBe(false);
+    });
+
+    it("returns false when the signer-client environment is missing or relative", async () => {
+      const missingPath = join(await makeTemp("f1-plist-"), "missing-signer.plist");
+      await writeFile(
+        missingPath,
+        validPlist.replace(
+          /\n\t\t<key>SANCTUARY_CASTLE_SIGNER_CLIENT<\/key>\n\t\t<string>[^<]*<\/string>/,
+          "",
+        ),
+      );
+      expect(await bootServiceInstalled(missingPath)).toBe(false);
+
+      const relativePath = join(await makeTemp("f1-plist-"), "relative-signer.plist");
+      await writeFile(
+        relativePath,
+        validPlist.replace(
+          /<key>SANCTUARY_CASTLE_SIGNER_CLIENT<\/key>\n\t\t<string>[^<]*<\/string>/,
+          "<key>SANCTUARY_CASTLE_SIGNER_CLIENT</key>\n\t\t<string>relative-shim</string>",
+        ),
+      );
+      expect(await bootServiceInstalled(relativePath)).toBe(false);
+    });
+
+    it("bootServiceReady requires the matching plist plus a stable live launchd pid", async () => {
+      const path = join(await makeTemp("f1-plist-"), "boot.plist");
+      await writeFile(path, validPlist);
+      const fake = makeFakeExec({ fortress: "/Users/operator/.sanctuary" });
+      const noSleep = async () => undefined;
+
+      expect(
+        await bootServiceReady(path, "/Users/operator/.sanctuary", fake.execFileFn, noSleep),
+      ).toBe(false);
+
+      fake.running = true;
+      expect(
+        await bootServiceReady(path, "/Users/operator/.sanctuary", fake.execFileFn, noSleep),
+      ).toBe(true);
+      expect(bootServiceEnabled(fake.execFileFn)).toBe(true);
+
+      fake.disabled = true;
+      expect(
+        await bootServiceReady(path, "/Users/operator/.sanctuary", fake.execFileFn, noSleep),
+      ).toBe(false);
+
+      const wrongLoadedJob = makeFakeExec({ fortress: "/Users/operator/other-sanctuary" });
+      wrongLoadedJob.running = true;
+      expect(
+        await bootServiceReady(path, "/Users/operator/.sanctuary", wrongLoadedJob.execFileFn, noSleep),
+      ).toBe(false);
+
+      const suffixLoadedJob = makeFakeExec({ fortress: "/Users/operator/.sanctuary-old" });
+      suffixLoadedJob.running = true;
+      expect(
+        await bootServiceReady(path, "/Users/operator/.sanctuary", suffixLoadedJob.execFileFn, noSleep),
+      ).toBe(false);
+    });
+
+    it("bootServiceEnabled parses both launchctl disabled value formats", () => {
+      const printDisabled = (value: string): ExecFileResult => ({
+        code: 0,
+        stdout: `disabled services = {\n\t"${CASTLE_WALL_BOOT_LABEL}" => ${value}\n}\n`,
+        stderr: "",
+      });
+
+      expect(bootServiceEnabled(() => printDisabled("enabled"))).toBe(true);
+      expect(bootServiceEnabled(() => printDisabled("disabled"))).toBe(false);
+      expect(bootServiceEnabled(() => printDisabled("false"))).toBe(true);
+      expect(bootServiceEnabled(() => printDisabled("true"))).toBe(false);
+      expect(bootServiceEnabled(() => printDisabled("bogus"))).toBe(false);
+    });
+
+    it("bootServiceLoaded treats unknown launchctl print failures as occupied", () => {
+      const notLoaded: ExecFileResult = {
+        code: 113,
+        stdout: "",
+        stderr: "Could not find service",
+      };
+      expect(bootServiceLoaded(() => notLoaded)).toBe(false);
+
+      const unknownFailure: ExecFileResult = {
+        code: 5,
+        stdout: "",
+        stderr: "Input/output error",
+      };
+      expect(bootServiceLoaded(() => unknownFailure)).toBe(true);
     });
   });
 
@@ -419,7 +564,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const fortress = await makeTemp("f1-prov-");
       const tokenPath = join(await makeTemp("f1-tok-"), "boot-token.bin");
       const out = new CaptureStream();
-      const fake = makeFakeExec();
+      const fake = makeFakeExec({ fortress });
       const code = await runProvisionBootToken(["--fortress", fortress], {
         out,
         platform: "darwin",
@@ -504,7 +649,7 @@ describe("castle-wall boot service (F1 Option C)", () => {
       await writeFile(binary, "#!/bin/sh\n", { mode: 0o755 });
       await writeFile(signerClient, "#!/bin/sh\n", { mode: 0o755 });
       await writeFile(globalPin, Buffer.alloc(32, 7));
-      const fake = makeFakeExec();
+      const fake = makeFakeExec({ fortress });
       const out = new CaptureStream();
       const err = new CaptureStream();
       const ctx: CastleWallBootContext = {
@@ -608,8 +753,12 @@ describe("castle-wall boot service (F1 Option C)", () => {
       const f = await makeInstallFixture();
       // Bootstrap accepted, but the job never produces a live PID (crash-loop /
       // missing dependency). `print` returns loaded-but-not-running: no pid line.
+      let bootstrapped = false;
       const noPidExec = (cmd: string, args: string[]): ExecFileResult => {
-        if (cmd === "launchctl" && args[0] === "print") {
+        if (cmd === "launchctl" && args[0] === "bootstrap") {
+          bootstrapped = true;
+        }
+        if (bootstrapped && cmd === "launchctl" && args[0] === "print") {
           return { code: 0, stdout: "\tstate = not running\n", stderr: "" };
         }
         return f.fake.execFileFn(cmd, args);
@@ -626,8 +775,12 @@ describe("castle-wall boot service (F1 Option C)", () => {
       // daemon that exits non-zero and is throttle-restarted on a new pid. A
       // one-shot check would certify the first transient pid as "running".
       let n = 0;
+      let bootstrapped = false;
       const flappingExec = (cmd: string, args: string[]): ExecFileResult => {
-        if (cmd === "launchctl" && args[0] === "print") {
+        if (cmd === "launchctl" && args[0] === "bootstrap") {
+          bootstrapped = true;
+        }
+        if (bootstrapped && cmd === "launchctl" && args[0] === "print") {
           return { code: 0, stdout: `\tstate = running\n\tpid = ${5000 + n++}\n`, stderr: "" };
         }
         return f.fake.execFileFn(cmd, args);
@@ -655,6 +808,145 @@ describe("castle-wall boot service (F1 Option C)", () => {
       ).length;
       expect(bootstrapsAfterSecond).toBe(bootstrapsAfterFirst);
       expect(f.out.text()).toContain("already installed and running");
+    });
+
+    it("repairs a disabled launchd override instead of taking the idempotent shortcut", async () => {
+      const f = await makeInstallFixture();
+      expect(await runInstallBoot(f.argv, f.ctx)).toBe(0);
+      const bootstrapsAfterFirst = f.fake.calls.filter(
+        (c) => c.cmd === "launchctl" && c.args[0] === "bootstrap",
+      ).length;
+
+      f.fake.disabled = true;
+      expect(await runInstallBoot(f.argv, f.ctx)).toBe(0);
+      const bootstrapsAfterSecond = f.fake.calls.filter(
+        (c) => c.cmd === "launchctl" && c.args[0] === "bootstrap",
+      ).length;
+      expect(bootstrapsAfterSecond).toBeGreaterThan(bootstrapsAfterFirst);
+      expect(f.fake.disabled).toBe(false);
+      const repairCalls = f.fake.calls
+        .map((call, index) => ({ ...call, index }))
+        .filter((call) => call.cmd === "launchctl" && (call.args[0] === "enable" || call.args[0] === "bootout"));
+      const lastEnable = repairCalls.findLast((call) => call.args[0] === "enable");
+      const lastBootout = repairCalls.findLast((call) => call.args[0] === "bootout");
+      expect(lastEnable?.index).toBeLessThan(lastBootout?.index ?? Number.POSITIVE_INFINITY);
+    });
+
+    it("refuses to replace an existing singleton plist for a different fortress", async () => {
+      const f = await makeInstallFixture();
+      const otherFortress = await makeTemp("f1-other-fortress-");
+      await writeFile(
+        f.plistPath,
+        renderBootLaunchDaemonPlist({
+          programArguments: [f.binary, "castle-wall", "daemon", "--safe-mode", "--launchd"],
+          fortressPath: otherFortress,
+          signerClientPath: f.signerClient,
+        }),
+      );
+
+      const code = await runInstallBoot(f.argv, f.ctx);
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("Refusing to replace");
+      expect(f.err.text()).toContain(otherFortress);
+      expect(f.err.text()).toContain(f.fortress);
+      expect(await readFile(f.plistPath, "utf8")).toContain(otherFortress);
+      expect(
+        f.fake.calls.some(
+          (c) => c.cmd === "launchctl" && (c.args[0] === "bootout" || c.args[0] === "bootstrap"),
+        ),
+      ).toBe(false);
+    });
+
+    it("refuses to replace a loaded singleton job for a different fortress", async () => {
+      const f = await makeInstallFixture();
+      const otherFortress = await makeTemp("f1-other-loaded-");
+      const loadedOther = makeFakeExec({ fortress: otherFortress });
+      loadedOther.running = true;
+
+      const code = await runInstallBoot(f.argv, { ...f.ctx, execFileFn: loadedOther.execFileFn });
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("Refusing to replace loaded");
+      expect(f.err.text()).toContain(otherFortress);
+      expect(await fileExists(f.plistPath)).toBe(false);
+      expect(
+        loadedOther.calls.some(
+          (c) => c.cmd === "launchctl" && (c.args[0] === "bootout" || c.args[0] === "bootstrap"),
+        ),
+      ).toBe(false);
+    });
+
+    it("refuses to replace an unverifiable singleton plist", async () => {
+      const f = await makeInstallFixture();
+      await writeFile(f.plistPath, "<plist/>");
+
+      const code = await runInstallBoot(f.argv, f.ctx);
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("does not expose a verifiable SANCTUARY_STORAGE_PATH");
+      expect(await readFile(f.plistPath, "utf8")).toBe("<plist/>");
+      expect(
+        f.fake.calls.some(
+          (c) => c.cmd === "launchctl" && (c.args[0] === "bootout" || c.args[0] === "bootstrap"),
+        ),
+      ).toBe(false);
+    });
+
+    it("refuses to replace an unverifiable loaded singleton job", async () => {
+      const f = await makeInstallFixture();
+      const loadedUnknownExec = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "print") {
+          return { code: 0, stdout: "\tstate = running\n\tpid = 4242\n", stderr: "" };
+        }
+        return f.fake.execFileFn(cmd, args);
+      };
+
+      const code = await runInstallBoot(f.argv, { ...f.ctx, execFileFn: loadedUnknownExec });
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("does not expose a verifiable SANCTUARY_STORAGE_PATH");
+      expect(await fileExists(f.plistPath)).toBe(false);
+      expect(
+        f.fake.calls.some(
+          (c) => c.cmd === "launchctl" && (c.args[0] === "bootout" || c.args[0] === "bootstrap"),
+        ),
+      ).toBe(false);
+    });
+
+    it("re-bootstraps instead of shortcutting when the matching service is not loaded", async () => {
+      const f = await makeInstallFixture();
+      expect(await runInstallBoot(f.argv, f.ctx)).toBe(0);
+      const bootstrapsAfterFirst = f.fake.calls.filter(
+        (c) => c.cmd === "launchctl" && c.args[0] === "bootstrap",
+      ).length;
+      const notLoadedJob = makeFakeExec({ fortress: f.fortress });
+      const rebootstrapExec = (cmd: string, args: string[]): ExecFileResult => {
+        const result = notLoadedJob.execFileFn(cmd, args);
+        f.fake.calls.push({ cmd, args });
+        return result;
+      };
+      expect(await runInstallBoot(f.argv, { ...f.ctx, execFileFn: rebootstrapExec })).toBe(0);
+      const bootstrapsAfterSecond = f.fake.calls.filter(
+        (c) => c.cmd === "launchctl" && c.args[0] === "bootstrap",
+      ).length;
+      expect(bootstrapsAfterSecond).toBeGreaterThan(bootstrapsAfterFirst);
+      expect(f.out.text()).not.toContain("already installed and running");
+    });
+
+    it("surfaces launchctl enable failure before bootout/bootstrap", async () => {
+      const f = await makeInstallFixture();
+      const failingEnableExec = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "enable") {
+          return { code: 64, stdout: "", stderr: "disabled database locked" };
+        }
+        return f.fake.execFileFn(cmd, args);
+      };
+
+      const code = await runInstallBoot(f.argv, { ...f.ctx, execFileFn: failingEnableExec });
+      expect(code).toBe(1);
+      expect(f.err.text()).toContain("launchctl enable failed");
+      expect(
+        f.fake.calls.some(
+          (c) => c.cmd === "launchctl" && (c.args[0] === "bootout" || c.args[0] === "bootstrap"),
+        ),
+      ).toBe(false);
     });
 
     it("surfaces a bootstrap failure instead of claiming success", async () => {
@@ -722,6 +1014,262 @@ describe("castle-wall boot service (F1 Option C)", () => {
       expect(await fileExists(plistPath)).toBe(false);
       expect(fake.calls.some((c) => c.cmd === "launchctl" && c.args[0] === "bootout")).toBe(true);
       expect(out.text()).toContain("does NOT disarm");
+    });
+
+    it("removes a stale fortress castle.sock when uninstalling the boot service (Bug D cleanup)", async () => {
+      const fortress = await makeTemp("f1-un-sock-fortress-");
+      const plistDir = await makeTemp("f1-un-sock-plist-");
+      const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
+      const socketPath = join(fortress, "castle.sock");
+      const sentinel = join(fortress, "sentinel");
+      await writeFile(sentinel, "target-must-not-be-touched");
+      await symlink(sentinel, socketPath);
+      await writeFile(
+        plistPath,
+        renderBootLaunchDaemonPlist({
+          programArguments: ["/opt/sanctuary/dist/cli.js", "castle-wall", "daemon", "--safe-mode", "--launchd"],
+          fortressPath: fortress,
+          signerClientPath: "/bin/echo",
+        }),
+      );
+      const fake = makeFakeExec();
+      fake.running = true;
+      const out = new CaptureStream();
+      const code = await runUninstallBoot(["--yes"], {
+        out,
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: fake.execFileFn,
+        plistPath,
+        socketHasLiveListenerFn: async (candidate) => {
+          expect(candidate).toBe(socketPath);
+          return false;
+        },
+      });
+      expect(code).toBe(0);
+      expect(await fileExists(plistPath)).toBe(false);
+      expect(await fileExists(socketPath)).toBe(false);
+      expect(await readFile(sentinel, "utf8")).toBe("target-must-not-be-touched");
+      expect(out.text()).toContain("Removed stale Castle Wall socket");
+    });
+
+    it("fails before plist or socket removal when launchctl bootout returns a real error", async () => {
+      const fortress = await makeTemp("f1-un-bootout-fail-fortress-");
+      const plistDir = await makeTemp("f1-un-bootout-fail-plist-");
+      const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
+      const socketPath = join(fortress, "castle.sock");
+      const sentinel = join(fortress, "sentinel");
+      await writeFile(sentinel, "target-must-not-be-touched");
+      await symlink(sentinel, socketPath);
+      await writeFile(
+        plistPath,
+        renderBootLaunchDaemonPlist({
+          programArguments: ["/opt/sanctuary/dist/cli.js", "castle-wall", "daemon", "--safe-mode", "--launchd"],
+          fortressPath: fortress,
+          signerClientPath: "/bin/echo",
+        }),
+      );
+      const fake = makeFakeExec();
+      const failingBootout = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "bootout") {
+          fake.calls.push({ cmd, args });
+          return { code: 5, stdout: "", stderr: "Input/output error" };
+        }
+        return fake.execFileFn(cmd, args);
+      };
+      const err = new CaptureStream();
+      const code = await runUninstallBoot(["--yes", "--fortress", fortress], {
+        err,
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: failingBootout,
+        plistPath,
+        socketHasLiveListenerFn: async () => {
+          throw new Error("socket cleanup must not run after bootout failure");
+        },
+      });
+      expect(code).toBe(1);
+      expect(await fileExists(plistPath)).toBe(true);
+      expect((await lstat(socketPath)).isSymbolicLink()).toBe(true);
+      expect(await readFile(sentinel, "utf8")).toBe("target-must-not-be-touched");
+      expect(err.text()).toContain("bootout failed");
+    });
+
+    it("fails before socket cleanup when a loaded singleton without a plist cannot be booted out", async () => {
+      const fortress = await makeTemp("f1-un-loaded-bootout-fail-fortress-");
+      const plistDir = await makeTemp("f1-un-loaded-bootout-fail-plist-");
+      const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
+      const socketPath = join(fortress, "castle.sock");
+      const sentinel = join(fortress, "sentinel");
+      await writeFile(sentinel, "target-must-not-be-touched");
+      await symlink(sentinel, socketPath);
+      const fake = makeFakeExec({ fortress });
+      fake.running = true;
+      const failingBootout = (cmd: string, args: string[]): ExecFileResult => {
+        if (cmd === "launchctl" && args[0] === "bootout") {
+          fake.calls.push({ cmd, args });
+          return { code: 5, stdout: "", stderr: "Input/output error" };
+        }
+        return fake.execFileFn(cmd, args);
+      };
+      const err = new CaptureStream();
+      const code = await runUninstallBoot(["--yes"], {
+        err,
+        env: { SANCTUARY_STORAGE_PATH: fortress },
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: failingBootout,
+        plistPath,
+        socketHasLiveListenerFn: async () => {
+          throw new Error("socket cleanup must not run after bootout failure");
+        },
+      });
+      expect(code).toBe(1);
+      expect((await lstat(socketPath)).isSymbolicLink()).toBe(true);
+      expect(await readFile(sentinel, "utf8")).toBe("target-must-not-be-touched");
+      expect(err.text()).toContain("bootout failed");
+    });
+
+    it("leaves a live/pre-existing castle.sock in place during uninstall cleanup (Bug D safety)", async () => {
+      const fortress = await makeTemp("f1-un-live-sock-fortress-");
+      const plistDir = await makeTemp("f1-un-live-sock-plist-");
+      const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
+      const socketPath = join(fortress, "castle.sock");
+      const sentinel = join(fortress, "live-socket-target");
+      await writeFile(sentinel, "live-target-must-not-be-touched");
+      await symlink(sentinel, socketPath);
+      const fake = makeFakeExec();
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const code = await runUninstallBoot(["--yes", "--fortress", fortress], {
+        out,
+        err,
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: fake.execFileFn,
+        plistPath,
+        socketHasLiveListenerFn: async (candidate) => {
+          expect(candidate).toBe(socketPath);
+          return true;
+        },
+      });
+      expect(code).toBe(0);
+      expect((await lstat(socketPath)).isSymbolicLink()).toBe(true);
+      expect(await readFile(sentinel, "utf8")).toBe("live-target-must-not-be-touched");
+      expect(err.text()).toContain("accepting connections");
+      expect(out.text()).toContain("nothing to remove");
+    });
+
+    it("refuses a scoped uninstall when the singleton boot service targets a different fortress", async () => {
+      const requestedFortress = await makeTemp("f1-un-requested-fortress-");
+      const installedFortress = await makeTemp("f1-un-installed-fortress-");
+      const plistDir = await makeTemp("f1-un-mismatch-plist-");
+      const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
+      await writeFile(
+        plistPath,
+        renderBootLaunchDaemonPlist({
+          programArguments: ["/opt/sanctuary/dist/cli.js", "castle-wall", "daemon", "--safe-mode", "--launchd"],
+          fortressPath: installedFortress,
+          signerClientPath: "/bin/echo",
+        }),
+      );
+      const fake = makeFakeExec();
+      fake.running = true;
+      const err = new CaptureStream();
+      const code = await runUninstallBoot(["--yes", "--fortress", requestedFortress], {
+        err,
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: fake.execFileFn,
+        plistPath,
+      });
+      expect(code).toBe(1);
+      expect(await fileExists(plistPath)).toBe(true);
+      expect(fake.running).toBe(true);
+      expect(fake.calls.some((c) => c.cmd === "launchctl" && c.args[0] === "bootout")).toBe(
+        false,
+      );
+      expect(err.text()).toContain("targets");
+      expect(err.text()).toContain(installedFortress);
+    });
+
+    it("refuses a scoped uninstall when the plist matches but the loaded singleton targets another fortress", async () => {
+      const requestedFortress = await makeTemp("f1-un-loaded-mismatch-requested-");
+      const loadedFortress = await makeTemp("f1-un-loaded-mismatch-loaded-");
+      const plistDir = await makeTemp("f1-un-loaded-mismatch-plist-");
+      const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
+      await writeFile(
+        plistPath,
+        renderBootLaunchDaemonPlist({
+          programArguments: ["/opt/sanctuary/dist/cli.js", "castle-wall", "daemon", "--safe-mode", "--launchd"],
+          fortressPath: requestedFortress,
+          signerClientPath: "/bin/echo",
+        }),
+      );
+      const fake = makeFakeExec({ fortress: loadedFortress });
+      fake.running = true;
+      const err = new CaptureStream();
+      const code = await runUninstallBoot(["--yes", "--fortress", requestedFortress], {
+        err,
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: fake.execFileFn,
+        plistPath,
+      });
+      expect(code).toBe(1);
+      expect(await fileExists(plistPath)).toBe(true);
+      expect(fake.running).toBe(true);
+      expect(fake.calls.some((c) => c.cmd === "launchctl" && c.args[0] === "bootout")).toBe(
+        false,
+      );
+      expect(err.text()).toContain("loaded singleton");
+      expect(err.text()).toContain(loadedFortress);
+    });
+
+    it("refuses a scoped uninstall when the singleton plist path is present but unverifiable", async () => {
+      const requestedFortress = await makeTemp("f1-un-dangling-requested-fortress-");
+      const plistDir = await makeTemp("f1-un-dangling-plist-");
+      const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
+      await symlink(join(plistDir, "missing-target.plist"), plistPath);
+      const fake = makeFakeExec({ fortress: "/Users/operator/other-sanctuary" });
+      fake.running = true;
+      const err = new CaptureStream();
+      const code = await runUninstallBoot(["--yes", "--fortress", requestedFortress], {
+        err,
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: fake.execFileFn,
+        plistPath,
+      });
+      expect(code).toBe(1);
+      expect((await lstat(plistPath)).isSymbolicLink()).toBe(true);
+      expect(fake.running).toBe(true);
+      expect(fake.calls.some((c) => c.cmd === "launchctl" && c.args[0] === "bootout")).toBe(
+        false,
+      );
+      expect(err.text()).toContain("verifiable matching plist");
+    });
+
+    it("refuses a scoped uninstall when launchd has a loaded singleton but no verifiable plist", async () => {
+      const requestedFortress = await makeTemp("f1-un-loaded-no-plist-fortress-");
+      const plistDir = await makeTemp("f1-un-loaded-no-plist-");
+      const plistPath = join(plistDir, `${CASTLE_WALL_BOOT_LABEL}.plist`);
+      const fake = makeFakeExec({ fortress: requestedFortress });
+      fake.running = true;
+      const err = new CaptureStream();
+      const code = await runUninstallBoot(["--yes", "--fortress", requestedFortress], {
+        err,
+        platform: "darwin",
+        getuid: () => 0,
+        execFileFn: fake.execFileFn,
+        plistPath,
+      });
+      expect(code).toBe(1);
+      expect(fake.running).toBe(true);
+      expect(fake.calls.some((c) => c.cmd === "launchctl" && c.args[0] === "bootout")).toBe(
+        false,
+      );
+      expect(err.text()).toContain("verifiable matching plist");
     });
 
     it("is idempotent when nothing is installed (with --yes)", async () => {
