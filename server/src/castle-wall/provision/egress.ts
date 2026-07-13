@@ -352,7 +352,7 @@ export function verifyProvisionedEgressStatically(
   }
   const mutableRules = [...rules];
   const checks: EndpointStaticCheck[] = set.endpoints.map((endpoint) => {
-    let allowed = false;
+    let allowed: boolean;
     try {
       const target = canonicalizeConnectAuthority(`${endpoint.host}:${endpoint.port}`);
       allowed = allowlistAllowsTarget(mutableRules, target);
@@ -399,7 +399,7 @@ export function egressRulesDir(fortressPath: string): string {
  */
 export async function readEgressRulesFromDisk(fortressPath: string): Promise<AllowlistRule[]> {
   const dir = egressRulesDir(fortressPath);
-  let filenames: string[] = [];
+  let filenames: string[];
   try {
     filenames = (await readdir(dir)).filter((name) => name.endsWith(".json"));
   } catch (err) {
@@ -525,7 +525,7 @@ export async function scrubProvisionedEgressRules(
   const dir = egressRulesDir(input.fortressPath);
   const prefix = provisionedRuleIdPrefix(input.harnessId);
   const removedRuleIds: string[] = [];
-  let filenames: string[] = [];
+  let filenames: string[];
   try {
     filenames = await readdir(dir);
   } catch (err) {

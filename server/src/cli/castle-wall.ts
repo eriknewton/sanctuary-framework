@@ -2258,7 +2258,7 @@ async function readAgentOriginModeBestEffort(
  */
 export async function countAgentMatchableAllowRules(fortressPath: string): Promise<number> {
   const rulesDir = join(fortressPath, "policy", "egress", "rules");
-  let filenames: string[] = [];
+  let filenames: string[];
   try {
     filenames = (await readdir(rulesDir)).filter((name) => name.endsWith(".json"));
   } catch {

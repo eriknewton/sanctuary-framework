@@ -81,6 +81,7 @@ Cross-machine federation is proven on real hardware (N=3) with signed policy dis
 ### Recent additions (June and July 2026)
 
 - **Observe/learn allow-list (v1).** A deny-and-record observe mode that drafts an egress allow-list from real traffic, with human-gated promotion to the signed manifest. The non-enforcing state is loudly labeled; nothing silently relaxes.
+- **Confined-agent egress provisioning.** One `protect` flow provisions a confined agent's own network egress: signed, per-uid, revocable allow rules for its declared endpoints (the harness endpoint set), published to the manifest, with a static pre-arm parity check and an as-uid post-arm probe. Refuse-to-arm fail-closed so a mis-provisioned wall never confines the agent into non-functionality. Drilled operator-present on macOS.
 - **Governed file-grant (v1).** Box-local, read-only, operator-granted file access for confined agents: recorded grants, a non-relaxable Tier-1 mint, honest labeling of the enforcement level.
 - **Remote console.** The cross-machine console drill was captured operator-present; one console reaching a second machine's fortress over the federation rails.
 

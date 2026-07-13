@@ -640,8 +640,6 @@ export async function runProvisionFlow(
   // behind is the exact confine-into-silence outcome this step exists to
   // prevent -- and emits the DISTINCT `egress_provision_refused` audit op so
   // a fleet operator can prove the refusal happened and why.
-  let egressProvisionedThisRun = false;
-  let provisionedEgressRuleIds: string[] = [];
   const egress = await ops.provisionEgress();
   if (egress.checks !== undefined) {
     for (const line of renderEndpointCheckLines(egress.checks)) {
@@ -690,8 +688,8 @@ export async function runProvisionFlow(
       accountCreated,
     };
   }
-  egressProvisionedThisRun = true;
-  provisionedEgressRuleIds = egress.ruleIds;
+  const egressProvisionedThisRun = true;
+  const provisionedEgressRuleIds = egress.ruleIds;
   ops.print(
     `Egress provisioned: ${egress.ruleIds.length} signed allow rule(s) published for the agent ` +
       `(${egress.ruleIds.join(", ")}); scoped DNS allow derived.`,
@@ -941,7 +939,7 @@ export async function runProvisionFlow(
       `A process running as the agent uid must reach every declared endpoint through the armed wall ` +
       `and must NOT reach the negative control; anything less confines the agent into ` +
       `non-functionality or proves nothing about confinement.`;
-    let disarmed = false;
+    let disarmed: boolean;
     try {
       await ops.disarm();
       disarmed = true;
