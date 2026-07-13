@@ -9,7 +9,10 @@ import { describe, expect, it } from "vitest";
 
 import { mintFileGrant } from "../../src/file-grant/mint.js";
 import { revokeFileGrant } from "../../src/file-grant/revoke.js";
+import type { FileGrantAclResult } from "../../src/file-grant/types.js";
 import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
+
+const APPLIED: FileGrantAclResult = { status: "applied", platform: process.platform };
 
 describe("file-grant revoke: idempotent + audited", () => {
   it("revoking an active grant marks it revoked, scrubs the tree entry, and audits", async () => {
@@ -45,6 +48,46 @@ describe("file-grant revoke: idempotent + audited", () => {
     const { entries } = await auditLog.query({ operation_type: "file_grant_revoke" });
     expect(entries).toHaveLength(1);
     expect(entries[0]!.result).toBe("success");
+  });
+
+  it("revoking a verified grant removes the ACL before scrubbing the tree entry", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      probeAgentReadResult: true,
+    });
+
+    const { grant, enforcement } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: "/tmp/example.txt" },
+        mode: "read",
+        ttlSeconds: 3600,
+        createdBy: "operator-1",
+      },
+      { fsOps, store: grantStore, now: new Date("2026-07-07T00:00:00.000Z"), auditLog },
+    );
+    expect(enforcement).toBe("met");
+
+    await revokeFileGrant(grant.grant_id, "operator-1", {
+      fsOps,
+      store: grantStore,
+      now: new Date("2026-07-07T01:00:00.000Z"),
+      auditLog,
+    });
+
+    expect(fsOps.removedAcls).toContainEqual({ entry: grant.tree_entry, uid: 502 });
+    expect(fsOps.scrubbed).toContain(grant.tree_entry);
+    expect(fsOps.removeOptions).toContainEqual({
+      entry: grant.tree_entry,
+      options: { canonicalAclTarget: grant.scope.path },
+    });
+    expect(fsOps.events.slice(-2)).toEqual([
+      `remove:${grant.tree_entry}`,
+      `acl-removed:${grant.tree_entry}:502`,
+    ]);
   });
 
   it("double-revoke is a no-op success, not an error", async () => {
@@ -134,5 +177,40 @@ describe("file-grant revoke: idempotent + audited", () => {
     // The record is still revoked even though the scrub failed.
     const persisted = await grantStore.get(grant.grant_id);
     expect(persisted!.status).toBe("revoked");
+  });
+
+  it("propagates an ACL removal failure and keeps the record revoked", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      probeAgentReadResult: true,
+      removeAclThrows: new Error("acl removal failed"),
+    });
+
+    const { grant } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: "/tmp/example.txt" },
+        mode: "read",
+        ttlSeconds: 3600,
+        createdBy: "operator-1",
+      },
+      { fsOps, store: grantStore, now: new Date(), auditLog },
+    );
+
+    await expect(
+      revokeFileGrant(grant.grant_id, "operator-1", {
+        fsOps,
+        store: grantStore,
+        now: new Date(),
+        auditLog,
+      }),
+    ).rejects.toThrow(/acl removal failed/);
+
+    const persisted = await grantStore.get(grant.grant_id);
+    expect(persisted!.status).toBe("revoked");
+    expect(fsOps.scrubbed).not.toContain(grant.tree_entry);
   });
 });

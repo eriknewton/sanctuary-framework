@@ -11,7 +11,11 @@ import { derivePurposeKey } from "../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FileGrantStore } from "../../src/file-grant/store.js";
-import type { FsOps } from "../../src/file-grant/types.js";
+import type {
+  FileGrantAclResult,
+  FileGrantRemoveEntryOptions,
+  FsOps,
+} from "../../src/file-grant/types.js";
 
 /** A real `FileGrantStore` backed by an in-memory StateStore, for tests that want real store code without touching disk. */
 export function makeFileGrantTestStore() {
@@ -40,16 +44,31 @@ export interface FakeFsOpsOptions {
   placeRecordsThenThrows?: Error;
   /** If set, `removeEntry()` throws this on every call. */
   removeThrows?: Error;
+  /** If set, ACL cleanup during `removeEntry()` throws this before the tree entry is scrubbed. */
+  removeAclThrows?: Error;
   /** The dedicated agent uid `agentUid()` reports, or null for "no uid-split origin configured". */
   agentUid?: number | null;
   /** The uid `sourceOwnerUid()` reports (the owner of the source file). */
   sourceOwnerUid?: number | null;
+  /** Structured result returned by `grantAgentRead()`. Defaults to unsupported. */
+  grantAgentReadResult?: FileGrantAclResult;
+  /** If set, `grantAgentRead()` throws despite the interface contract. */
+  grantAgentReadThrows?: Error;
+  /** Result returned by `probeAgentRead()`. Defaults to false. */
+  probeAgentReadResult?: boolean;
+  /** If set, `probeAgentRead()` throws despite the interface contract. */
+  probeAgentReadThrows?: Error;
 }
 
 /** In-memory fake `FsOps`: records every call, never touches the real filesystem. */
 export class FakeFsOps implements FsOps {
   placed: Array<{ src: string; dest: string }> = [];
   scrubbed: string[] = [];
+  grantedReads: Array<{ entry: string; uid: number }> = [];
+  probedReads: Array<{ entry: string; uid: number }> = [];
+  removedAcls: Array<{ entry: string; uid: number }> = [];
+  removeOptions: Array<{ entry: string; options?: FileGrantRemoveEntryOptions }> = [];
+  events: string[] = [];
 
   constructor(private readonly opts: FakeFsOpsOptions = {}) {}
 
@@ -58,6 +77,7 @@ export class FakeFsOps implements FsOps {
   }
 
   async place(canonicalSrc: string, relativeTreeEntry: string): Promise<void> {
+    this.events.push(`place:${relativeTreeEntry}`);
     if (this.opts.placeThrows) throw this.opts.placeThrows;
     if (this.opts.placeRecordsThenThrows) {
       this.placed.push({ src: canonicalSrc, dest: relativeTreeEntry });
@@ -66,8 +86,47 @@ export class FakeFsOps implements FsOps {
     this.placed.push({ src: canonicalSrc, dest: relativeTreeEntry });
   }
 
-  async removeEntry(relativeTreeEntry: string): Promise<void> {
+  async grantAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number
+  ): Promise<FileGrantAclResult> {
+    this.events.push(`grant:${relativeTreeEntry}:${agentUid}`);
+    if (this.opts.grantAgentReadThrows) throw this.opts.grantAgentReadThrows;
+    const result =
+      this.opts.grantAgentReadResult ??
+      ({
+        status: "unsupported_platform",
+        platform: process.platform,
+        reason: "fake default",
+      } satisfies FileGrantAclResult);
+    if (result.status === "applied") {
+      this.grantedReads.push({ entry: relativeTreeEntry, uid: agentUid });
+    }
+    return result;
+  }
+
+  async probeAgentRead(relativeTreeEntry: string, agentUid: number): Promise<boolean> {
+    this.events.push(`probe:${relativeTreeEntry}:${agentUid}`);
+    this.probedReads.push({ entry: relativeTreeEntry, uid: agentUid });
+    if (this.opts.probeAgentReadThrows) throw this.opts.probeAgentReadThrows;
+    return this.opts.probeAgentReadResult ?? false;
+  }
+
+  async removeEntry(
+    relativeTreeEntry: string,
+    options?: FileGrantRemoveEntryOptions
+  ): Promise<void> {
+    this.events.push(`remove:${relativeTreeEntry}`);
+    this.removeOptions.push(
+      options === undefined ? { entry: relativeTreeEntry } : { entry: relativeTreeEntry, options }
+    );
     if (this.opts.removeThrows) throw this.opts.removeThrows;
+    const matchingAcl = this.grantedReads.find((entry) => entry.entry === relativeTreeEntry);
+    if (matchingAcl) {
+      if (this.opts.removeAclThrows) throw this.opts.removeAclThrows;
+      this.removedAcls.push({ entry: relativeTreeEntry, uid: matchingAcl.uid });
+      this.events.push(`acl-removed:${relativeTreeEntry}:${matchingAcl.uid}`);
+    }
     this.scrubbed.push(relativeTreeEntry);
   }
 

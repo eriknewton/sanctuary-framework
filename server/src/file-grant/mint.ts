@@ -13,8 +13,9 @@
  *   2. Validate `subjectAgentId` is a safe slug (no path traversal) BEFORE any
  *      persistence or placement.
  *   3. Canonicalize the source path via `fsOps.realpath`.
- *   4. Read the uids and compute the honest `enforcement` verdict BEFORE
- *      placement (derived from the SOURCE-file owner, never `process.getuid()`).
+ *   4. Read the uids and compute a conservative pre-place `enforcement`
+ *      verdict with `readVerified:false` for the durable recorded audit
+ *      (derived from the SOURCE-file owner, never `process.getuid()`).
  *   5. Persist the grant object (`store.put`). A throw here does NOT prove
  *      nothing persisted (`StateStore.write` commits, THEN post-commit awaits
  *      can still throw), so it rolls the record back under a GUARDED remove
@@ -43,8 +44,13 @@
  *      grant, NO tree entry (Invariant #5c), and NO `file_grant` audit with
  *      `result:"success"` -- only `file_grant_recorded`(success) then
  *      `file_grant`(failure).
- *   7. Once `place` has succeeded, access is LIVE and already durably audited
- *      (step 5b, `file_grant_recorded`/success). The only remaining step is a
+ *   7. Once `place` has succeeded, attempt the platform ACL primitive and then
+ *      run a bounded read probe as the agent uid. The final `enforcement`
+ *      verdict can become `met` only from a probe that returns true in this
+ *      same operation. ACL failure, unsupported platform, no privilege, probe
+ *      failure, or timeout all keep the verdict at `unverified` or `unmet`.
+ *   8. Access is LIVE and already durably audited (step 5b,
+ *      `file_grant_recorded`/success). The only remaining step is a
  *      BEST-EFFORT post-place confirmation audit, `operation: "file_grant",
  *      result: "success"`: a throw there is swallowed, it must NEVER roll a
  *      live grant back and report failure (the fail-OPEN + false-rollback bug
@@ -80,8 +86,9 @@
  * `principal-policy/loader.ts` + `gate.ts`'s runtime mirror) is unchanged.
  *
  * The `enforcement` verdict is honest: it is `met` only when a distinct agent
- * uid's read access has actually been verified; a bare uid split reports
- * `unverified`, and a same-owner / no-uid box reports `unmet`.
+ * uid's read access has actually been verified by the same mint operation; a
+ * bare uid split reports `unverified`, and a same-owner / no-uid box reports
+ * `unmet`.
  */
 
 import { randomBytes } from "node:crypto";
@@ -93,6 +100,7 @@ import {
   FileGrantMintFailedError,
   FILE_GRANT_SCHEMA_VERSION,
   isSafeFileGrantAgentId,
+  type FileGrantAclResult,
   type FileGrant,
   type FileGrantEnforcement,
   type FileGrantScope,
@@ -152,16 +160,14 @@ export async function mintFileGrant(
   const treeEntry = `${params.subjectAgentId}/${grantId}`;
   const expiresAt = computeExpiresAt(params.ttlSeconds, deps.now);
 
-  // Step 4: resolve the uids and compute the HONEST enforcement verdict BEFORE
+  // Step 4: resolve the uids and compute the conservative enforcement verdict BEFORE
   // placement. The same-uid check compares the agent uid against the SOURCE
   // file's owner (never `process.getuid()`), so a `sudo` mint cannot fabricate
-  // a false "enforced". v1 has no autonomous agent-uid readability probe, so
-  // `readVerified` is always false here: a real uid split reports `unverified`
-  // (configured; on-hardware read-scope is the deferred acceptance drill),
-  // never `met`.
+  // a false "enforced". The final verdict is recomputed after placement from
+  // a same-operation agent-uid readability probe.
   const agentUid = await deps.fsOps.agentUid(params.subjectAgentId);
   const sourceOwnerUid = await deps.fsOps.sourceOwnerUid(canonicalPath);
-  const enforcement: FileGrantEnforcement = determineEnforcement({
+  const recordedEnforcement: FileGrantEnforcement = determineEnforcement({
     agentUid,
     sourceOwnerUid,
     readVerified: false,
@@ -219,7 +225,7 @@ export async function mintFileGrant(
         subject_agent_id: params.subjectAgentId,
         scope_kind: params.scope.kind,
         expires_at: expiresAt,
-        enforcement,
+        enforcement: recordedEnforcement,
         phase: "recorded",
       },
     });
@@ -266,6 +272,18 @@ export async function mintFileGrant(
     throw new FileGrantMintFailedError(grantId, placeErr);
   }
 
+  const verification = await verifyAgentReadThisOperation({
+    fsOps: deps.fsOps,
+    treeEntry,
+    agentUid,
+    sourceOwnerUid,
+  });
+  const enforcement: FileGrantEnforcement = determineEnforcement({
+    agentUid,
+    sourceOwnerUid,
+    readVerified: verification.readVerified,
+  });
+
   // Step 7: access is LIVE and already durably audited (step 5b). This
   // post-place confirmation is BEST-EFFORT: a throw here (e.g. audit-log
   // ENOSPC/EACCES) must NEVER roll back a live grant and report failure -- that
@@ -280,11 +298,42 @@ export async function mintFileGrant(
       scope_kind: params.scope.kind,
       expires_at: expiresAt,
       enforcement,
+      acl_result: verification.aclResult?.status ?? "not_attempted",
       phase: "placed",
     },
   });
 
   return { grant, enforcement };
+}
+
+async function verifyAgentReadThisOperation(params: {
+  fsOps: FsOps;
+  treeEntry: string;
+  agentUid: number | null;
+  sourceOwnerUid: number | null;
+}): Promise<{ readVerified: boolean; aclResult?: FileGrantAclResult }> {
+  const { fsOps, treeEntry, agentUid, sourceOwnerUid } = params;
+  if (agentUid === null || sourceOwnerUid === null) return { readVerified: false };
+  if (agentUid === sourceOwnerUid) return { readVerified: false };
+
+  let aclResult: FileGrantAclResult;
+  try {
+    aclResult = await fsOps.grantAgentRead(treeEntry, agentUid);
+  } catch {
+    return { readVerified: false };
+  }
+  if (aclResult.status !== "applied") {
+    return { readVerified: false, aclResult };
+  }
+
+  try {
+    return {
+      readVerified: (await fsOps.probeAgentRead(treeEntry, agentUid)) === true,
+      aclResult,
+    };
+  } catch {
+    return { readVerified: false, aclResult };
+  }
 }
 
 /**

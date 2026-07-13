@@ -6,8 +6,8 @@
  * for the full build spec. This module gives an operator a way to hand an
  * agent read access to a specific file or directory on the SAME box, with the
  * grant recorded as a first-class encrypted state object and (where the
- * dedicated agent uid exists) enforced by real POSIX ownership on a per-agent
- * grant tree.
+ * dedicated agent uid exists) enforced by a platform ACL plus an agent-uid
+ * readability probe on a per-agent grant tree.
  *
  * v1 is deliberately narrow: box-local, read-only, mint wired to the truly
  * non-relaxable Tier-1 set. The daily-driver pull surface, `request_file_access`,
@@ -102,8 +102,27 @@ export interface FsOps {
   realpath(path: string): Promise<string>;
   /** Place (symlink) the canonical source at the given relative tree-entry path. */
   place(canonicalSrc: string, relativeTreeEntry: string): Promise<void>;
-  /** Remove a tree-entry path. Idempotent: removing an absent entry is a no-op, not an error. */
-  removeEntry(relativeTreeEntry: string): Promise<void>;
+  /**
+   * Apply the host ACL primitive that should let only `agentUid` read the
+   * placed tree entry and traverse the grant-tree ancestors.
+   */
+  grantAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number
+  ): Promise<FileGrantAclResult>;
+  /**
+   * Confirm by running a bounded read probe as `agentUid`. Returns true only
+   * when the probe actually opens and reads the placed entry in this call.
+   */
+  probeAgentRead(relativeTreeEntry: string, agentUid: number): Promise<boolean>;
+  /**
+   * Remove a tree-entry path. Idempotent when the entry is absent, unless an
+   * ACL target is supplied and ACL cleanup itself fails.
+   */
+  removeEntry(
+    relativeTreeEntry: string,
+    options?: FileGrantRemoveEntryOptions
+  ): Promise<void>;
   /** The dedicated agent uid for `subjectAgentId`, or null if no uid-split origin is configured. */
   agentUid(subjectAgentId: string): Promise<number | null>;
   /**
@@ -118,6 +137,23 @@ export interface FsOps {
   sourceOwnerUid(canonicalPath: string): Promise<number | null>;
 }
 
+export type FileGrantAclStatus =
+  | "applied"
+  | "unsupported_platform"
+  | "not_privileged"
+  | "failed";
+
+export interface FileGrantAclResult {
+  status: FileGrantAclStatus;
+  platform: NodeJS.Platform;
+  reason?: string;
+}
+
+export interface FileGrantRemoveEntryOptions {
+  /** Canonical source path whose leaf ACL should be stripped if the symlink is already gone. */
+  canonicalAclTarget?: string;
+}
+
 /**
  * Whether the box-local read-scope boundary is actually enforced for a grant.
  *
@@ -129,12 +165,10 @@ export interface FsOps {
  *               CI path never fabricates it.
  * - `unverified` a real boundary exists (dedicated agent uid, distinct from
  *               the source owner) but on-hardware read-scope has NOT been
- *               verified. v1 records the grant and places the tree entry; the
- *               functional cross-uid read primitive (POSIX ACL / ownership)
- *               and its readability verification are the separate Erik-present
- *               acceptance drill (build spec section 8). This is the honest
- *               "configured, on-hardware read-scope not yet verified" label --
- *               v1 must NEVER upgrade it to "met" from a uid-split alone.
+ *               verified in the current operation. This includes unsupported
+ *               platforms, missing privilege, ACL apply failure, probe failure,
+ *               and probe timeout. A uid split or ACL success alone must NEVER
+ *               upgrade to "met".
  * - `unmet`     no dedicated agent uid is configured, or the agent uid equals
  *               the source-file owner (the agent already owns / can read the
  *               source, so there is no boundary to enforce). Nothing is

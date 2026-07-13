@@ -14,7 +14,10 @@ import { describe, expect, it } from "vitest";
 import { mintFileGrant } from "../../src/file-grant/mint.js";
 import { reconcileFileGrantTree } from "../../src/file-grant/reconcile.js";
 import { listFileGrants } from "../../src/file-grant/list.js";
+import type { FileGrantAclResult } from "../../src/file-grant/types.js";
 import { FakeFsOps, makeFileGrantTestStore } from "./fixtures.js";
+
+const APPLIED: FileGrantAclResult = { status: "applied", platform: process.platform };
 
 describe("file-grant reconcile: expired grants are actually scrubbed", () => {
   it("scrubs the tree entry AND flips persisted status once a grant is past its TTL", async () => {
@@ -57,6 +60,42 @@ describe("file-grant reconcile: expired grants are actually scrubbed", () => {
     expect(fsOps.scrubbed).toContain(grant.tree_entry);
     // The persisted record was flipped, not merely projected.
     expect((await grantStore.get(grant.grant_id))!.status).toBe("expired");
+  });
+
+  it("removes a verified grant ACL when expiry scrub removes the tree entry", async () => {
+    const { grantStore, auditLog } = makeFileGrantTestStore();
+    const fsOps = new FakeFsOps({
+      agentUid: 502,
+      sourceOwnerUid: 501,
+      grantAgentReadResult: APPLIED,
+      probeAgentReadResult: true,
+    });
+
+    const { grant, enforcement } = await mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: "/tmp/example.txt" },
+        mode: "read",
+        ttlSeconds: 60,
+        createdBy: "operator-1",
+      },
+      { fsOps, store: grantStore, now: new Date("2026-07-07T00:00:00.000Z"), auditLog },
+    );
+    expect(enforcement).toBe("met");
+
+    await reconcileFileGrantTree({
+      store: grantStore,
+      fsOps,
+      now: new Date("2026-07-07T02:00:00.000Z"),
+      auditLog,
+    });
+
+    expect(fsOps.removedAcls).toContainEqual({ entry: grant.tree_entry, uid: 502 });
+    expect(fsOps.scrubbed).toContain(grant.tree_entry);
+    expect(fsOps.removeOptions).toContainEqual({
+      entry: grant.tree_entry,
+      options: { canonicalAclTarget: grant.scope.path },
+    });
   });
 
   it("never scrubs or expires a standing (no-TTL) grant", async () => {

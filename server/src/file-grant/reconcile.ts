@@ -55,6 +55,7 @@ export async function reconcileFileGrantTree(
 ): Promise<ReconcileFileGrantResult> {
   const grants = await deps.store.list();
   const plan = planGrantTree(grants, deps.now);
+  const grantsById = new Map(grants.map((grant) => [grant.grant_id, grant]));
 
   // SAFETY-CRITICAL, FIRST: scrub every tree entry the plan says must not be
   // present (revoked + expired grants). Removing access is the safety-critical
@@ -69,7 +70,11 @@ export async function reconcileFileGrantTree(
   let firstScrubError: unknown = null;
   for (const entry of plan.toScrub) {
     try {
-      await deps.fsOps.removeEntry(entry.relative_tree_entry);
+      const grant = grantsById.get(entry.grant_id);
+      await deps.fsOps.removeEntry(
+        entry.relative_tree_entry,
+        grant ? { canonicalAclTarget: grant.scope.path } : undefined
+      );
       scrubbed.push(entry.relative_tree_entry);
     } catch (err) {
       if (firstScrubError === null) firstScrubError = err;

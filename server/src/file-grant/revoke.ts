@@ -63,7 +63,9 @@ export async function revokeFileGrant(
   }
 
   try {
-    await deps.fsOps.removeEntry(existing.tree_entry);
+    await deps.fsOps.removeEntry(existing.tree_entry, {
+      canonicalAclTarget: existing.scope.path,
+    });
   } catch (scrubErr) {
     await deps.auditLog?.appendCritical({
       layer: "l1",
