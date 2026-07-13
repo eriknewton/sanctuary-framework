@@ -65,11 +65,21 @@ export interface StatusResponse {
   no_wall_engaged: boolean;
 }
 
-/** Request from main to daemon: "manifest changed; re-read." */
+/**
+ * Request from main to daemon: "manifest changed; re-read."
+ *
+ * The daemon RECOMPOSES the manifest from the persisted rule files under
+ * `<fortress>/policy/egress/rules/` (multiple provenance-tagged files, not a
+ * single manifest document) and RE-SIGNS it through the pinned signer, so there
+ * is no single "manifest path" to hand it. `manifest_path` is therefore OPTIONAL
+ * and advisory only: no daemon reads it (it was a fabricated, non-existent path
+ * on the macOS reload path). Kept optional for wire compatibility; new callers
+ * should omit it.
+ */
 export interface PolicyReloadRequest {
   type: "policy_reload_request";
   request_id: IpcRequestId;
-  manifest_path: string;
+  manifest_path?: string;
 }
 
 /** Response from daemon to main confirming reload outcome. */
