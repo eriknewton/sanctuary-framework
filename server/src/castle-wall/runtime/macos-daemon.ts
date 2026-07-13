@@ -31,6 +31,7 @@ import {
   localManifestSigner,
 } from "./manifest-publisher.js";
 import { HelperSignerClient, type ShimInvoker } from "./helper-signer.js";
+import { writeGlobalPinIfUnestablished } from "../global-pin/index.js";
 import {
   isCustodyFsError,
   readFileCustody,
@@ -275,7 +276,7 @@ export async function startMacOSCastleWallDaemon(
   });
 
   const signer = input.signer ?? (await loadSigningKey(input));
-  await writeSystemPinnedPublicKey(signer);
+  await writeSystemPinnedPublicKey(signer, input.globalPinnedPublicKeyPath);
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
   const operatorBaseline = await resolveOperatorBaseline(
@@ -960,8 +961,21 @@ async function loadLocalSigningKey(
  * must NOT write it (it lacks root and would only EACCES). It is explicit, not a
  * silent warn. In the local dev/test path the daemon still best-effort writes it
  * so a developer box without the helper still has a readable pin.
+ *
+ * Fail-open fix (2026-07-07): the local-sign path previously rename-over-wrote
+ * the pin unconditionally, so a root local-sign daemon would silently CLOBBER
+ * an existing DIFFERING signer-owned pin (the same fail-open the provision-pin
+ * path had, on a different path). It now routes through the shared
+ * `writeGlobalPinIfUnestablished` chokepoint (read-and-compare before any
+ * write), so an existing, differing pin is left intact at ANY euid. Only re-pin
+ * (`helper-signer.ts installPin()`, NOT routed here) migrates an established
+ * pin. `globalPinPath` mirrors the existing helper-mode cross-check seam so the
+ * guard is testable without the real `/Library` path.
  */
-async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
+export async function writeSystemPinnedPublicKey(
+  signer: DaemonSigner,
+  globalPinPath: string = CASTLE_GLOBAL_PINNED_PUBKEY_PATH,
+): Promise<void> {
   if (signer.mode === "helper") {
     // SAFETY: daemon startup diagnostics are operator-facing stderr output.
     console.error(
@@ -970,18 +984,25 @@ async function writeSystemPinnedPublicKey(signer: DaemonSigner): Promise<void> {
     return;
   }
   try {
-    await mkdir(CASTLE_GLOBAL_PINNED_PUBKEY_DIR, {
-      recursive: true,
-      mode: 0o755,
-    });
-    await writeFileCustody(CASTLE_GLOBAL_PINNED_PUBKEY_PATH, signer.publicKey, {
-      mode: 0o644,
-      createParent: false,
+    await writeGlobalPinIfUnestablished(signer.publicKey, {
+      path: globalPinPath,
+      onRefuse: () =>
+        // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+        console.warn(
+          `[castle-wall] global pin ${globalPinPath} already exists with a different key owned by the root signer helper (A2); the local-sign daemon does not overwrite it. Run 'sanctuary castle-wall re-pin' to migrate the trust anchor to the signer helper.`,
+        ),
+      freshWrite: async (path, key) => {
+        await mkdir(dirname(path), { recursive: true, mode: 0o755 });
+        await writeFileCustody(path, key, {
+          mode: 0o644,
+          createParent: false,
+        });
+      },
     });
   } catch (error) {
     // SAFETY: daemon startup diagnostics are operator-facing stderr output.
     console.warn(
-      `[castle-wall] warning: unable to write shared pinned public key at ${CASTLE_GLOBAL_PINNED_PUBKEY_PATH}: ${error instanceof Error ? error.message : String(error)}`,
+      `[castle-wall] warning: unable to write shared pinned public key at ${globalPinPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }

@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -761,6 +761,203 @@ describe("castle-wall CLI verbs", () => {
     });
     expect(code).toBe(0);
     expect(out.text()).toContain("Pinned key fingerprint:");
+  });
+
+  describe("provision-pin global-pin fail-open guard (2026-07-07)", () => {
+    // Regression coverage for the root-euid fail-open: the OLD guard inferred
+    // "the signer helper owns this file" from an EACCES/EPERM write failure,
+    // which never fires for a root-euid caller (e.g. the auto-provision-
+    // agent-account flow, which runs the whole wrap under `sudo` because OS
+    // account creation needs root). The fix reads-and-compares BEFORE ever
+    // writing, so the refusal holds at ANY euid. These tests drive
+    // `runProvisionPin` with `ctx.globalPinnedPublicKeyPath` pointed at a temp
+    // file instead of the real root-owned `/Library/Application Support/
+    // Sanctuary/castle-pinned-pubkey.bin`, so no root/sudo is needed.
+
+    async function makeGlobalPinDir() {
+      const dir = await mkdtemp(join(tmpdir(), "sanctuary-cw-globalpin-"));
+      tempDirs.push(dir);
+      return join(dir, "castle-pinned-pubkey.bin");
+    }
+
+    it("REGRESSION: a differing global pin is never overwritten, even on a fresh per-fortress key (fresh-key call site)", async () => {
+      const { fortressPath, recoveryKey } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir();
+      const keyA = Buffer.from(new Uint8Array(32).fill(0xaa));
+      await writeFile(globalPinPath, keyA, { mode: 0o644 });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const code = await runProvisionPin([], {
+          out,
+          err,
+          env: {
+            SANCTUARY_STORAGE_PATH: fortressPath,
+            SANCTUARY_RECOVERY_KEY: recoveryKey,
+          },
+          globalPinnedPublicKeyPath: globalPinPath,
+        });
+
+        expect(code).toBe(0);
+        // The core per-fortress result must still succeed: provision-pin's
+        // job (mint + persist the fortress-local pin) is not blocked by the
+        // best-effort global-mirror refusal.
+        const localPub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+        expect(localPub.length).toBe(32);
+        const localStat = await stat(join(fortressPath, "castle-pinned-pubkey.bin"));
+        expect(localStat.mode & 0o777).toBe(0o600);
+
+        // THE FIX: the global pin must be byte-for-byte untouched.
+        const globalAfter = await readFile(globalPinPath);
+        expect(Buffer.compare(globalAfter, keyA)).toBe(0);
+
+        // Guidance must have been emitted so the operator knows to re-pin.
+        const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(warnedText).toContain("already exists and is owned by the root signer helper");
+        expect(warnedText).toContain("sanctuary castle-wall re-pin");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("writes the global pin when none exists yet (ENOENT)", async () => {
+      const { fortressPath, recoveryKey } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir(); // file does not exist yet
+
+      const out = new CaptureStream();
+      const err = new CaptureStream();
+      const code = await runProvisionPin([], {
+        out,
+        err,
+        env: {
+          SANCTUARY_STORAGE_PATH: fortressPath,
+          SANCTUARY_RECOVERY_KEY: recoveryKey,
+        },
+        globalPinnedPublicKeyPath: globalPinPath,
+      });
+
+      expect(code).toBe(0);
+      const localPub = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+      const globalPub = await readFile(globalPinPath);
+      expect(Buffer.compare(globalPub, localPub)).toBe(0);
+      const globalStat = await stat(globalPinPath);
+      expect(globalStat.mode & 0o777).toBe(0o644);
+    });
+
+    it("is a no-op when the existing global pin already equals the key being written (existing-local-key call site)", async () => {
+      const { fortressPath } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir();
+      const key = Buffer.from(new Uint8Array(32).fill(0x42));
+      // Pre-seed the LOCAL per-fortress pin (so runProvisionPin takes the
+      // "already provisioned" branch, which reads the existing local key and
+      // calls writeGlobalPinnedPublicKey with it) and the GLOBAL pin with the
+      // SAME bytes.
+      await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), key, { mode: 0o600 });
+      await writeFile(globalPinPath, key, { mode: 0o644 });
+      const globalStatBefore = await stat(globalPinPath);
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const code = await runProvisionPin([], {
+          out,
+          err,
+          env: { SANCTUARY_STORAGE_PATH: fortressPath },
+          globalPinnedPublicKeyPath: globalPinPath,
+        });
+
+        expect(code).toBe(0);
+        expect(err.text()).toBe("");
+        const globalAfter = await readFile(globalPinPath);
+        expect(Buffer.compare(globalAfter, key)).toBe(0);
+        const globalStatAfter = await stat(globalPinPath);
+        // Idempotent: no write means mtime is untouched too.
+        expect(globalStatAfter.mtimeMs).toBe(globalStatBefore.mtimeMs);
+        // No re-pin guidance for the quiet already-equal case.
+        const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(warnedText).not.toContain("re-pin");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("fails CLOSED (does not write) when the existing global pin is present but unreadable", async () => {
+      const { fortressPath, recoveryKey } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir();
+      const keyA = Buffer.from(new Uint8Array(32).fill(0x99));
+      await writeFile(globalPinPath, keyA, { mode: 0o644 });
+      // Simulate "present but unreadable for a reason other than ENOENT"
+      // (e.g. EACCES reading a root-owned file as an operator-UID caller) by
+      // stripping all permission bits from the file itself. As the
+      // non-privileged user running this test suite, this reproduces a real
+      // EACCES on readFile without needing root.
+      await chmod(globalPinPath, 0o000);
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const code = await runProvisionPin([], {
+          out,
+          err,
+          env: {
+            SANCTUARY_STORAGE_PATH: fortressPath,
+            SANCTUARY_RECOVERY_KEY: recoveryKey,
+          },
+          globalPinnedPublicKeyPath: globalPinPath,
+        });
+
+        expect(code).toBe(0);
+        // Restore permissions before reading back, so the assertion itself
+        // (and the afterEach temp-dir cleanup) is not fighting the 0o000 mode.
+        await chmod(globalPinPath, 0o644);
+        const globalAfter = await readFile(globalPinPath);
+        expect(Buffer.compare(globalAfter, keyA)).toBe(0);
+        const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(warnedText).toContain("already exists and is owned by the root signer helper");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("REGRESSION (existing-local-key call site): a differing global pin is left intact while the local per-fortress key is confirmed present at 0600", async () => {
+      const { fortressPath } = await makeFortress();
+      const globalPinPath = await makeGlobalPinDir();
+      const keyA = Buffer.from(new Uint8Array(32).fill(0xaa)); // global (helper-owned)
+      const keyB = Buffer.from(new Uint8Array(32).fill(0xbb)); // local per-fortress
+      await writeFile(globalPinPath, keyA, { mode: 0o644 });
+      await writeFile(join(fortressPath, "castle-pinned-pubkey.bin"), keyB, { mode: 0o600 });
+
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const out = new CaptureStream();
+        const err = new CaptureStream();
+        const code = await runProvisionPin([], {
+          out,
+          err,
+          env: { SANCTUARY_STORAGE_PATH: fortressPath },
+          globalPinnedPublicKeyPath: globalPinPath,
+        });
+
+        expect(code).toBe(0);
+        // The local pin the wrap IPC handshake depends on is present and
+        // correct, regardless of the global-pin refusal.
+        const localAfter = await readFile(join(fortressPath, "castle-pinned-pubkey.bin"));
+        expect(Buffer.compare(localAfter, keyB)).toBe(0);
+        const localStat = await stat(join(fortressPath, "castle-pinned-pubkey.bin"));
+        expect(localStat.mode & 0o777).toBe(0o600);
+        // Only the GLOBAL pin is protected; it must be untouched.
+        const globalAfter = await readFile(globalPinPath);
+        expect(Buffer.compare(globalAfter, keyA)).toBe(0);
+        const warnedText = warnSpy.mock.calls.map((c) => String(c[0])).join("\n");
+        expect(warnedText).toContain("already exists and is owned by the root signer helper");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 });
 
