@@ -272,6 +272,7 @@ export async function installAgentHarnessDaemon(
         `${message}; cleanup failed: ${
           cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
         }; leaving ${plan.plistPath} installed for manual recovery`,
+        { cause: cleanupError },
       );
     }
     throw new Error(message);
