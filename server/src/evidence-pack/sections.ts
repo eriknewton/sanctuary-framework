@@ -466,7 +466,22 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
   // is a deliberate out-of-scope build-slice decision). Inside a report whose
   // cover names a reporting quarter, a reader would otherwise infer the count
   // is quarter-scoped, so disclose the all-time basis in the legend.
+  //
+  // F1 (round-2 sweep 2026-07-14): the observe engine folds ONLY denied flows
+  // into candidates (castle-wall/observe/fold.ts, enforce-preserving posture
+  // D-Q1), so every row here is a destination the wall BLOCKED, and allowed
+  // egress is structurally absent. Without that disclosure the table is
+  // misreadable in BOTH directions: "Seen 812" reads as 812 contacts (it is
+  // 812 denied attempts), and the table reads as the machines' egress census
+  // (permitted egress is invisible). Disclose the row basis in the legend.
   const out = [
+    "Legend - Row basis: this table records BLOCKED flow observations only. " +
+      "Each row is a destination the wall DENIED; the Seen count is a count " +
+      "of those denied attempts. Destinations permitted by the operator's " +
+      "policy do NOT appear here - allowed egress is not inventoried by this " +
+      "table or this version of the pack, so this table is not a census of " +
+      "where the machines' traffic actually went.",
+    "",
     "Legend - Destination risk class: a heuristic CATEGORY of the destination " +
       "itself (for example, a messaging or paste host that could be misused for " +
       'exfiltration is "elevated"; a routine AI/API endpoint is "standard"). It ' +
