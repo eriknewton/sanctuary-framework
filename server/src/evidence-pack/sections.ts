@@ -459,6 +459,13 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
   // assessed". It is actually a heuristic CLASSIFICATION of the destination, not
   // a finding that anything left the firm. Relabel to a risk CLASS and define it
   // in an unmissable legend before the table.
+  //
+  // OPEN-MED-1 (confirmatory review 2026-07-14): "Seen" renders `times_seen`,
+  // the observe store's cumulative count since observation began - it is NOT
+  // quarter-scoped (the observe store is not quarter-indexed; quarter-scoping
+  // is a deliberate out-of-scope build-slice decision). Inside a report whose
+  // cover names a reporting quarter, a reader would otherwise infer the count
+  // is quarter-scoped, so disclose the all-time basis in the legend.
   const out = [
     "Legend - Destination risk class: a heuristic CATEGORY of the destination " +
       "itself (for example, a messaging or paste host that could be misused for " +
@@ -467,6 +474,11 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
       "exfiltration, and NOT a legal conclusion. See the Incident response " +
       "section for incident status. An 'elevated' row means only that this " +
       "destination is worth a human review.",
+    "",
+    "Legend - Seen: the ALL-TIME number of observations of this destination " +
+      "since observation began on this install, NOT a count scoped to the " +
+      "reporting quarter. A destination listed here may not have been seen " +
+      "within the reporting quarter.",
     "",
     "| Destination | Port | Protocol | Seen | Destination risk class |",
     "|---|---|---|---|---|",

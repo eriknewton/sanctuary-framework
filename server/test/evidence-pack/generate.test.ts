@@ -338,6 +338,32 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("NOT a confirmed exfiltration");
   });
 
+  it("OPEN-MED-1 (confirmatory): the egress 'Seen' column is disclosed as all-time, not quarter-scoped", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: emptyVerified(),
+          mcp_servers: emptyVerified(),
+          observed_destinations: populated([
+            { host: "api.anthropic.com", port: 443, protocol: "tcp", times_seen: 812, exfil_risk: false },
+          ]),
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    // The legend must state the all-time basis adjacent to the table, so a
+    // reader cannot infer the lifetime count is scoped to the reporting quarter.
+    expect(report).toContain("Legend - Seen:");
+    expect(report).toContain(
+      "NOT a count scoped to the reporting quarter"
+    );
+    expect(report).toContain(
+      "may not have been seen within the reporting quarter"
+    );
+  });
+
   it("MED-1 (sample-render): the tool count carries an active/recorded denominator", () => {
     const pack = buildEvidencePack(
       {
