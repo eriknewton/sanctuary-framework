@@ -113,6 +113,7 @@
 
 import type { AllowlistRule } from "../allowlist/schema.js";
 import {
+  allowlistAllowsFlow,
   canonicalizeConnectAuthority,
   evaluateFlowFirstMatch,
   type CanonicalConnectAuthority,
@@ -224,13 +225,23 @@ export type RefreshOutcome =
  *     denies/prompts that flow and keeps recording egress_blocked, so the
  *     candidate must NOT be suppressed just because SOME allow rule also
  *     matches).
- * Suppression/prune happens ONLY when the first-matching rule is an
- * unconditional `allow` (a rule carrying a time_window is conditional --
- * its allowance is not always in force, and the Linux daemon refuses such
- * manifests outright -- so it never suppresses). Fail-closed toward
- * KEEPING the candidate: a destination that cannot canonicalize can never
- * be allowed by the wall (the proxy denies `canonicalization_failed`), so
- * it stays a candidate.
+ * Suppression/prune happens ONLY when EVERY shipped enforcer interpretation
+ * allows the flow (the intersection -- Codex round-5 HIGH: the two shipped
+ * enforcers disagree on host_pattern syntax, so a single-enforcer verdict
+ * can suppress a candidate the OTHER enforcer still denies and records):
+ *   - the DAEMON leg must be an unconditional first-matching `allow`
+ *     (a rule carrying a time_window is conditional -- its allowance is not
+ *     always in force, and the Linux daemon refuses such manifests
+ *     outright -- so it never suppresses), AND
+ *   - the CONNECT-PROXY leg (`allowlistAllowsFlow`: scope-blind, allow-only,
+ *     `*.suffix` pattern form -- the proxy family's own semantics) must
+ *     also allow it.
+ * A consequence: an allow rule whose ONLY matching axis is host_pattern
+ * never suppresses (the two syntaxes are disjoint, so no pattern satisfies
+ * both legs) -- the conservative direction: a stale pending row, never a
+ * hidden denied flow. Fail-closed toward KEEPING the candidate: a
+ * destination that cannot canonicalize can never be allowed by the wall
+ * (the proxy denies `canonicalization_failed`), so it stays a candidate.
  */
 export function candidateCurrentlyAllowed(
   rules: readonly AllowlistRule[],
@@ -246,11 +257,24 @@ export function candidateCurrentlyAllowed(
   } catch {
     return false;
   }
-  const verdict = evaluateFlowFirstMatch(rules, target, row.protocol, {
+  const daemonVerdict = evaluateFlowFirstMatch(rules, target, row.protocol, {
     agent_id: row.agent_id,
     agent_template: row.agent_template,
   });
-  return verdict !== null && verdict.disposition === "allow" && verdict.rule.time_window === undefined;
+  const daemonAllows =
+    daemonVerdict !== null &&
+    daemonVerdict.disposition === "allow" &&
+    daemonVerdict.rule.time_window === undefined;
+  if (!daemonAllows) return false;
+  try {
+    return allowlistAllowsFlow([...rules], target, row.protocol);
+  } catch {
+    // The proxy-family matcher can throw canonicalizing an unusual rule
+    // host/pattern (e.g. a leading-dot pattern fed to its exact-host arm).
+    // A rule whose proxy-leg evaluation cannot even complete is NOT a
+    // positive both-enforcers allow -- keep the candidate (fail-closed).
+    return false;
+  }
 }
 
 /**

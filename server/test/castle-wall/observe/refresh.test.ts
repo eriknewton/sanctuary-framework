@@ -377,6 +377,34 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
     expect((await harness.store.listCandidates()).size).toBe(1);
   });
 
+  it("round-5 HIGH: a `*.suffix` host_pattern allow never suppresses (the Linux daemon treats that form as a defensive non-match and keeps denying)", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog); // api.example.com
+    const wildcardPattern = [
+      { ...allowRule({ host: undefined, host_pattern: "*.example.com" }) },
+    ];
+    const outcome = await refresh(harness, wildcardPattern);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("round-5 HIGH counterpart: a `.suffix` host_pattern allow also never suppresses (the CONNECT-proxy family would not allow that form; suppression requires the enforcer INTERSECTION)", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog); // api.example.com
+    const dotPattern = [{ ...allowRule({ host: undefined, host_pattern: ".example.com" }) }];
+    const outcome = await refresh(harness, dotPattern);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("round-5: an exact-host allow still suppresses (both enforcer legs agree)", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    const outcome = await refresh(harness, [allowRule()]);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
   it("an unverifiable allowlist aborts the refresh with NOTHING folded, written, or pruned", async () => {
     const harness = makeHarness();
     await appendBlocked(harness.auditLog);
