@@ -256,6 +256,44 @@ const NAMESPACE_RECIPES: Record<string, NamespaceRecipe> = {
     kind: "plaintext",
     reason: "operator-facing alert log (no key material, no ciphertext)",
   },
+  // F2 Option A (adversarial gate MED-1/M-1, 2026-07-14): the root Castle Wall
+  // daemon's own audit chain and its siblings. Master rotation does NOT yet
+  // support them (the daemon chain is encrypted under the SAME `audit-log`
+  // purpose key derivation as `_audit`, but the rotation engine has no
+  // adapter-aware pass to re-wrap a REMAPPED namespace, and the writer-split
+  // BOUNDARY MAC is keyed off the rotating master and is not re-stamped by any
+  // recipe). Refuse BY NAME with an actionable message rather than hitting the
+  // generic "no registered rotation recipe" fallthrough, so an operator on a
+  // migrated (armed) box gets a clear reason instead of an opaque internal
+  // error. LANDMINE (do not remove without reading): implementing rotation for
+  // these namespaces REQUIRES also re-stamping the split-boundary record under
+  // the new master (`deriveAuditStoreSplitBoundaryMacKey` + rewrite via
+  // `writeAuditStoreSplitBoundary`) IN THE SAME rotation, or the boundary reads
+  // `invalid` post-rotation and F2 regresses (the operator load stops filtering
+  // and re-throws on unreadable root-owned entries). See the `// F2 rekey`
+  // comment on `deriveAuditStoreSplitBoundaryMacKey` in
+  // `operational/audit-log.ts`.
+  "_audit-daemon": {
+    kind: "unsupported",
+    reason:
+      "the root Castle Wall daemon's own audit chain (F2 writer-split). Master " +
+      "rotation does not support it yet, and it is a persistent tamper-evident " +
+      "audit chain that must NOT be cleared. Rotation is deliberately refused on " +
+      "a migrated fortress until daemon-audit re-wrap + boundary-MAC re-stamp " +
+      "land. " + UNSUPPORTED_DEFERRAL,
+  },
+  "_audit-daemon_checkpoints": {
+    kind: "unsupported",
+    reason:
+      "the root Castle Wall daemon audit chain's checkpoints/anchors (F2 " +
+      "writer-split). Refused with `_audit-daemon`. " + UNSUPPORTED_DEFERRAL,
+  },
+  "_audit-daemon_meta": {
+    kind: "unsupported",
+    reason:
+      "the root Castle Wall daemon audit chain's established marker (F2 " +
+      "writer-split). Refused with `_audit-daemon`. " + UNSUPPORTED_DEFERRAL,
+  },
 
   _reputation: { kind: "purpose-encrypted", infos: ["l4-reputation"] },
   _escrows: { kind: "purpose-encrypted", infos: ["l4-reputation"] },

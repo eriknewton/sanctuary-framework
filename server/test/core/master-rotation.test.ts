@@ -517,6 +517,47 @@ describe("master rotation — fail-closed coverage", () => {
     );
   });
 
+  // F2 MED-1/M-1 (adversarial gate 2026-07-14): a fortress that ran the
+  // writer-split migration has an `_audit-daemon` namespace. Master rotation
+  // must refuse BY NAME (an intentional, greppable, actionable refusal), never
+  // silently skip it, and never mutate. Locks in the fail-closed contract the
+  // whole F2 design leans on (and prevents a future refactor from turning the
+  // refuse into a silent skip). Also asserts the message is the F2-specific one,
+  // not the generic "no registered rotation recipe" fallthrough.
+  it("aborts BY NAME (nothing mutated) when the F2 _audit-daemon namespace holds data", async () => {
+    const fortress = await buildFortress();
+    await fortress.storage.write(
+      "_audit-daemon",
+      "entry-00000000000000000001-1-0",
+      stringToBytes("{}")
+    );
+    let caught: unknown;
+    try {
+      await rotateMaster(rotateOpts(fortress));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(RotationPreflightError);
+    expect((caught as Error).message).toMatch(/_audit-daemon|writer-split|Castle Wall daemon/);
+    expect((caught as Error).message).not.toMatch(/no registered rotation recipe/);
+    // Nothing mutated: the master still establishes from the original passphrase.
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
+  });
+
+  it("aborts BY NAME on the sibling F2 daemon namespaces (_audit-daemon_checkpoints, _audit-daemon_meta)", async () => {
+    for (const ns of ["_audit-daemon_checkpoints", "_audit-daemon_meta"]) {
+      const fortress = await buildFortress();
+      await fortress.storage.write(ns, "some-key", stringToBytes("{}"));
+      await expect(rotateMaster(rotateOpts(fortress))).rejects.toThrow(
+        RotationPreflightError
+      );
+    }
+  });
+
   it("rotates compound-AAD records (anomaly classifier: key state.<a>.<b>, AAD a|b — codex r2)", async () => {
     const fortress = await buildFortress();
     await fortress.storage.write(

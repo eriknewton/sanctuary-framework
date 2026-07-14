@@ -415,12 +415,16 @@ async function main(): Promise<void> {
         // SAFETY: stderr / stdout is the operator-facing CLI channel; no logger module in scope.
         console.error(`sanctuary audit-chain export. Dump audit chain records to JSONL.
 
-Usage: sanctuary audit-chain export [--output <path>] [--fortress <path>]
+Usage: sanctuary audit-chain export [--output <path>] [--fortress <path>] [--operator-only]
 
 Options:
   --output <path>        Write JSONL to file (default: stdout)
   --fortress <path>      Override fortress path
   --storage-path <path>  Override state directory
+  --operator-only        Acknowledge an operator-chain-only export on a fortress
+                         that has a root daemon audit chain (_audit-daemon).
+                         Required there; the export otherwise fails closed rather
+                         than silently omitting the daemon chain.
   --help, -h             Show this help
 
 Examples:
@@ -1125,6 +1129,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runAuditFindings(args.slice(1));
   }
 
+  if (command === "audit-store-status") {
+    const { runAuditStoreStatus } = await import("./cli/castle-wall.js");
+    return runAuditStoreStatus(args.slice(1));
+  }
+
   if (command === "approve") {
     const { runApprove } = await import("./cli/castle-wall.js");
     return runApprove(args.slice(1));
@@ -1229,6 +1238,9 @@ function printCastleWallHelp(): void {
                      floor and makes no per-producer claim. --json for machine output;
                      --since <dur>; --producer-pub-key <path> override.
     audit-findings   List audit-chain integrity findings for the fortress (read-only diagnostic).
+    audit-store-status Report BOTH the operator and root-daemon audit chain verdicts (F2 Option A
+                     writer-split), each honestly and separately; a daemon chain that exists but
+                     is unreadable at this privilege reports as such, never as "verified". Read-only.
     approve          Approve a pending Castle Wall request.
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.
     re-pin           Migrate the trust anchor to the root signer helper's key (one-time, operator-approved).
