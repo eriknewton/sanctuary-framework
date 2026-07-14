@@ -201,6 +201,67 @@ async function gatherDiscreteExports(
   return { transparency, audit_chain, anchor };
 }
 
+/**
+ * Derive the pack's audit read outcome from the windowed `query()` result plus
+ * the authoritative on-disk census. Pure; exported so tests can pin the
+ * truncation and fallback semantics without a live server.
+ *
+ * Honesty invariants (each is a reviewed finding, not a style choice):
+ *
+ * - WATCH-2 (confirmatory review 2026-07-14): `retained_total` comes from the
+ *   on-disk census (`getRetentionUsage().entryCount`), NOT from `query()`'s
+ *   windowed total. The in-memory window (`maxInMemoryEntries`) today equals
+ *   the on-disk cap, but it is an anticipated tuning knob; a windowed total
+ *   would understate the retained log and defeat the shortfall detector's
+ *   at-cap check. The windowed total is used only when the census itself was
+ *   unreadable (`entryCount: null`).
+ * - F3 (round-2 sweep 2026-07-14): if the read is provably INCOMPLETE - the
+ *   on-disk census exceeds the windowed total (a RAM window smaller than the
+ *   disk cap), or `query()` returned fewer entries than its own total (its
+ *   `limit` truncated the result) - the whole audit read FAILS CLOSED to
+ *   `read_failed`. Otherwise a truncated window would feed the aggregation and
+ *   `earliest_retained_at`, and the shortfall reassurance arm ("the log has
+ *   never pruned ... no recorded activity before <earliest>") would assert a
+ *   false cause while older entries sit on disk outside the window. Neither
+ *   truncation is constructible with today's defaults; the guard makes the
+ *   anticipated configurations structurally safe.
+ */
+export function deriveAuditReadOutcome(params: {
+  entries: readonly AuditEntry[];
+  windowedTotal: number;
+  retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
+  usage: {
+    entryCount: number | null;
+    totalSizeBytes: number;
+    everPruned: boolean | null;
+  };
+}): ReadOutcome<AuditReadData> {
+  const { entries, windowedTotal, retentionConfig, usage } = params;
+  const windowTruncated =
+    usage.entryCount !== null && usage.entryCount > windowedTotal;
+  const queryTruncated = entries.length < windowedTotal;
+  if (windowTruncated || queryTruncated) {
+    const retainedCount = Math.max(usage.entryCount ?? 0, windowedTotal);
+    return readFailed(
+      `the audit log retains ${retainedCount} entries but only ` +
+        `${entries.length} could be read by this run, so the retained ` +
+        "history was not read to completion and the quarter's decision " +
+        "counts and coverage are not determinable from this read"
+    );
+  }
+  const earliest: string | null =
+    entries.length > 0 ? entries[0]!.timestamp : null;
+  const retention: RetentionFacts = {
+    max_entries: retentionConfig.maxEntries,
+    retained_total: usage.entryCount ?? windowedTotal,
+    max_total_size_bytes: retentionConfig.maxTotalSizeBytes,
+    retained_total_size_bytes: usage.totalSizeBytes,
+    ever_pruned: usage.everPruned,
+    earliest_retained_at: earliest,
+  };
+  return populated({ entries, retention });
+}
+
 interface EvidencePackCliOptions {
   subcommand: "generate" | "help";
   firmName: string;
@@ -358,25 +419,12 @@ export async function runEvidencePack(args: string[]): Promise<void> {
       } catch {
         usage = { entryCount: null, totalSizeBytes: 0, everPruned: null };
       }
-      const earliest: string | null =
-        entries.length > 0 ? (entries[0] as AuditEntry).timestamp : null;
-      const retention: RetentionFacts = {
-        max_entries: retentionConfig.maxEntries,
-        // WATCH-2 (confirmatory review 2026-07-14): source the retained count
-        // from the authoritative on-disk census, NOT from `query()`'s total.
-        // `query()` reports the in-memory window (`maxInMemoryEntries`), which
-        // today equals the on-disk cap but is an anticipated tuning knob; if it
-        // were ever set smaller, the windowed total would understate the
-        // retained log and the shortfall detector's at-cap check would read
-        // false while entries had in fact been pruned. Fall back to the
-        // windowed total only if the on-disk census itself was unreadable.
-        retained_total: usage.entryCount ?? total,
-        max_total_size_bytes: retentionConfig.maxTotalSizeBytes,
-        retained_total_size_bytes: usage.totalSizeBytes,
-        ever_pruned: usage.everPruned,
-        earliest_retained_at: earliest,
-      };
-      return populated({ entries, retention });
+      return deriveAuditReadOutcome({
+        entries: entries as readonly AuditEntry[],
+        windowedTotal: total,
+        retentionConfig,
+        usage,
+      });
     } catch (e) {
       return readFailed(`the audit log could not be read: ${(e as Error).message}`);
     }
