@@ -1,0 +1,178 @@
+{
+  "manifest_signed_body": {
+    "schema_version": 1,
+    "fortress_id": "fortress-parity-slash",
+    "issued_at": "2026-07-12T00:03:00.000Z",
+    "rules": [
+      {
+        "rule_id": "provisioned-hermes-73bfa0dd58b7",
+        "file": "provisioned-hermes-73bfa0dd58b7.json",
+        "sha256": "fb4202fd03586b5867a774f378b9f2dc710ff967eb9decbefedad23091aba750"
+      },
+      {
+        "rule_id": "provisioned-hermes-942f728575f2",
+        "file": "provisioned-hermes-942f728575f2.json",
+        "sha256": "70dd79ebba14beaa30b2b9bf3a61863900e5ea07a9af9cb62eaa28df96ce95a8"
+      },
+      {
+        "rule_id": "provisioned-hermes-1adf3c0925b1",
+        "file": "provisioned-hermes-1adf3c0925b1.json",
+        "sha256": "28e6a77498d29747b277a8bf1b7450197b54203410892caeb8733af4702c510e"
+      },
+      {
+        "rule_id": "provisioned-hermes-4aa5ef5054ec",
+        "file": "provisioned-hermes-4aa5ef5054ec.json",
+        "sha256": "28f3944479ace963bae1023706a590d2c54c3d05edd7049f34fa30de8915aefc"
+      },
+      {
+        "rule_id": "provisioned-hermes-b1aa686736ed",
+        "file": "provisioned-hermes-b1aa686736ed.json",
+        "sha256": "10fa7b8852a3098dcd376ce539eebeb725c37221f588280812d973e7809c227d"
+      },
+      {
+        "rule_id": "provisioned-hermes-5953d5806a06",
+        "file": "provisioned-hermes-5953d5806a06.json",
+        "sha256": "96449eaa174cd3de1426b226371c112c6f081e83cd4d59b26ea4a6bdf0a6fde4"
+      },
+      {
+        "rule_id": "derived_dns_for_hostname_rules",
+        "file": "derived_dns_for_hostname_rules.json",
+        "sha256": "f4e08fdc9fe50fec118833b6c680114bca271000267bccb628edb0e2fac7096b"
+      }
+    ]
+  },
+  "rules": [
+    {
+      "id": "provisioned-hermes-73bfa0dd58b7",
+      "schema_version": 1,
+      "created_at": "2026-07-12T00:00:00.000Z",
+      "description": "Provisioned egress for harness \"hermes\": LLM (Venice) (api.venice.ai:443/tcp). Published by 'sanctuary protect'; revocable via unprovision (provenance-tagged id).",
+      "match": {
+        "host": [
+          "api.venice.ai"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    },
+    {
+      "id": "provisioned-hermes-942f728575f2",
+      "schema_version": 1,
+      "created_at": "2026-07-12T00:00:00.000Z",
+      "description": "Provisioned egress for harness \"hermes\": Telegram Bot API (api.telegram.org:443/tcp). Published by 'sanctuary protect'; revocable via unprovision (provenance-tagged id).",
+      "match": {
+        "host": [
+          "api.telegram.org"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    },
+    {
+      "id": "provisioned-hermes-1adf3c0925b1",
+      "schema_version": 1,
+      "created_at": "2026-07-12T00:00:00.000Z",
+      "description": "Provisioned egress for harness \"hermes\": Google Workspace MCP (Gmail API) (gmail.googleapis.com:443/tcp). Published by 'sanctuary protect'; revocable via unprovision (provenance-tagged id).",
+      "match": {
+        "host": [
+          "gmail.googleapis.com"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    },
+    {
+      "id": "provisioned-hermes-4aa5ef5054ec",
+      "schema_version": 1,
+      "created_at": "2026-07-12T00:00:00.000Z",
+      "description": "Provisioned egress for harness \"hermes\": Google Workspace MCP (Calendar API) (calendar-json.googleapis.com:443/tcp). Published by 'sanctuary protect'; revocable via unprovision (provenance-tagged id).",
+      "match": {
+        "host": [
+          "calendar-json.googleapis.com"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    },
+    {
+      "id": "provisioned-hermes-b1aa686736ed",
+      "schema_version": 1,
+      "created_at": "2026-07-12T00:00:00.000Z",
+      "description": "Provisioned egress for harness \"hermes\": Google OAuth (token refresh) (oauth2.googleapis.com:443/tcp). Published by 'sanctuary protect'; revocable via unprovision (provenance-tagged id).",
+      "match": {
+        "host": [
+          "oauth2.googleapis.com"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    },
+    {
+      "id": "provisioned-hermes-5953d5806a06",
+      "schema_version": 1,
+      "created_at": "2026-07-12T00:00:00.000Z",
+      "description": "Provisioned egress for harness \"hermes\": Google OAuth (account endpoints) (accounts.google.com:443/tcp). Published by 'sanctuary protect'; revocable via unprovision (provenance-tagged id).",
+      "match": {
+        "host": [
+          "accounts.google.com"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    },
+    {
+      "id": "derived_dns_for_hostname_rules",
+      "schema_version": 1,
+      "created_at": "2026-07-12T00:00:00.000Z",
+      "description": "Auto-derived scoped DNS allow (#380): port 53, system resolvers only (tcp+udp). Lets agents holding a hostname allow-rule resolve names without an any-resolver port-53 grant. Scoped to the resolver set; a port-53 flow to a non-resolver IP does not match.",
+      "match": {
+        "ip": [
+          "100.100.100.100",
+          "fd7a:115c:a1e0::53",
+          "192.168.1.1"
+        ],
+        "port": [
+          53
+        ],
+        "protocol": "tcp+udp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    }
+  ],
+  "expected_canonical_json_b64": "eyJmb3J0cmVzc19pZCI6ImZvcnRyZXNzLXBhcml0eS1zbGFzaCIsImlzc3VlZF9hdCI6IjIwMjYtMDctMTJUMDA6MDM6MDAuMDAwWiIsInJ1bGVzIjpbeyJmaWxlIjoicHJvdmlzaW9uZWQtaGVybWVzLTczYmZhMGRkNThiNy5qc29uIiwicnVsZV9pZCI6InByb3Zpc2lvbmVkLWhlcm1lcy03M2JmYTBkZDU4YjciLCJzaGEyNTYiOiJmYjQyMDJmZDAzNTg2YjU4NjdhNzc0ZjM3OGI5ZjJkYzcxMGZmOTY3ZWI5ZGVjYmVmZWRhZDIzMDkxYWJhNzUwIn0seyJmaWxlIjoicHJvdmlzaW9uZWQtaGVybWVzLTk0MmY3Mjg1NzVmMi5qc29uIiwicnVsZV9pZCI6InByb3Zpc2lvbmVkLWhlcm1lcy05NDJmNzI4NTc1ZjIiLCJzaGEyNTYiOiI3MGRkNzllYmJhMTRiZWFhMzBiMmI5YmYzYTYxODYzOTAwZTVlYTA3YTlhZjljYjYyZWFhMjhkZjk2Y2U5NWE4In0seyJmaWxlIjoicHJvdmlzaW9uZWQtaGVybWVzLTFhZGYzYzA5MjViMS5qc29uIiwicnVsZV9pZCI6InByb3Zpc2lvbmVkLWhlcm1lcy0xYWRmM2MwOTI1YjEiLCJzaGEyNTYiOiIyOGU2YTc3NDk4ZDI5NzQ3YjI3N2E4YmYxYjc0NTAxOTdiNTQyMDM0MTA4OTJjYWViODczM2FmNDcwMmM1MTBlIn0seyJmaWxlIjoicHJvdmlzaW9uZWQtaGVybWVzLTRhYTVlZjUwNTRlYy5qc29uIiwicnVsZV9pZCI6InByb3Zpc2lvbmVkLWhlcm1lcy00YWE1ZWY1MDU0ZWMiLCJzaGEyNTYiOiIyOGYzOTQ0NDc5YWNlOTYzYmFlMTAyMzcwNmE1OTBkMmM1NGMzZDA1ZWRkNzA0OWYzNGZhMzBkZTg5MTVhZWZjIn0seyJmaWxlIjoicHJvdmlzaW9uZWQtaGVybWVzLWIxYWE2ODY3MzZlZC5qc29uIiwicnVsZV9pZCI6InByb3Zpc2lvbmVkLWhlcm1lcy1iMWFhNjg2NzM2ZWQiLCJzaGEyNTYiOiIxMGZhN2I4ODUyYTMwOThkY2QzNzZjZTUzOWVlYmViNzI1YzM3MjIxZjU4ODI4MDgxMmQ5NzNlNzgwOWMyMjdkIn0seyJmaWxlIjoicHJvdmlzaW9uZWQtaGVybWVzLTU5NTNkNTgwNmEwNi5qc29uIiwicnVsZV9pZCI6InByb3Zpc2lvbmVkLWhlcm1lcy01OTUzZDU4MDZhMDYiLCJzaGEyNTYiOiI5NjQ0OWVhYTE3NGNkM2RlMTQyNmIyMjYzNzFjMTEyYzZmMDgxZTgzY2Q0ZDU5YjI2ZWE0YTZiZGYwYTZmZGU0In0seyJmaWxlIjoiZGVyaXZlZF9kbnNfZm9yX2hvc3RuYW1lX3J1bGVzLmpzb24iLCJydWxlX2lkIjoiZGVyaXZlZF9kbnNfZm9yX2hvc3RuYW1lX3J1bGVzIiwic2hhMjU2IjoiZjRlMDhmZGM5ZmU1MGZlYzExODgzM2I2YzY4MDExNGJjYTI3MTAwMDI2N2JjY2I2MjhlZGIwZTJmYWM3MDk2YiJ9XSwic2NoZW1hX3ZlcnNpb24iOjF9",
+  "expected_canonical_json_hex": "7b22666f7274726573735f6964223a22666f7274726573732d7061726974792d736c617368222c226973737565645f6174223a22323032362d30372d31325430303a30333a30302e3030305a222c2272756c6573223a5b7b2266696c65223a2270726f766973696f6e65642d6865726d65732d3733626661306464353862372e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d373362666130646435386237222c22736861323536223a2266623432303266643033353836623538363761373734663337386239663264633731306666393637656239646563626566656461643233303931616261373530227d2c7b2266696c65223a2270726f766973696f6e65642d6865726d65732d3934326637323835373566322e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d393432663732383537356632222c22736861323536223a2237306464373965626261313462656161333062326239626633613631383633393030653565613037613961663963623632656161323864663936636539356138227d2c7b2266696c65223a2270726f766973696f6e65642d6865726d65732d3161646633633039323562312e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d316164663363303932356231222c22736861323536223a2232386536613737343938643239373437623237376138626631623734353031393762353432303334313038393263616562383733336166343730326335313065227d2c7b2266696c65223a2270726f766973696f6e65642d6865726d65732d3461613565663530353465632e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d346161356566353035346563222c22736861323536223a2232386633393434343739616365393633626165313032333730366135393064326335346333643035656464373034396633346661333064653839313561656663227d2c7b2266696c65223a2270726f766973696f6e65642d6865726d65732d6231616136383637333665642e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d623161613638363733366564222c22736861323536223a2231306661376238383532613330393864636433373663653533396565626562373235633337323231663538383238303831326439373365373830396332323764227d2c7b2266696c65223a2270726f766973696f6e65642d6865726d65732d3539353364353830366130362e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d353935336435383036613036222c22736861323536223a2239363434396561613137346364336465313432366232323633373163313132633666303831653833636434643539623236656134613662646630613666646534227d2c7b2266696c65223a22646572697665645f646e735f666f725f686f73746e616d655f72756c65732e6a736f6e222c2272756c655f6964223a22646572697665645f646e735f666f725f686f73746e616d655f72756c6573222c22736861323536223a2266346530386664633966653530666563313138383333623663363830313134626361323731303030323637626363623632386564623065326661633730393662227d5d2c22736368656d615f76657273696f6e223a317d",
+  "test_public_key_b64url": "Y6VmiGM_Zk9l6CFmOcv0VOn9ylIvlBcI5G1ZpqFS7dQ",
+  "test_signature_b64url": "Af04nNF4YFZLZMPKVCGH6amD9PmXqyO_V1Xp_vtMuk66CgRl94SCIlSmvYZjKG6nPtRXHayUMBPtaKoAXAr8AQ"
+}
