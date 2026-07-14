@@ -13,13 +13,13 @@
     "tauri:build": "tauri build"
   },
   "dependencies": {
-    "@tauri-apps/api": "2.11.0",
+    "@tauri-apps/api": "2.11.1",
     "@tauri-apps/plugin-notification": "2.3.3",
     "@tauri-apps/plugin-http": "2.5.9"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "2.11.2",
+    "@tauri-apps/cli": "2.11.4",
     "typescript": "6.0.3",
-    "vite": "8.0.16"
+    "vite": "8.1.4"
   }
 }
