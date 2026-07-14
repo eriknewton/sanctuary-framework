@@ -272,6 +272,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "fleet") {
+    const { runFleetCommand } = await import("./cli/fleet.js");
+    const code = await runFleetCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "plugin") {
     const { runPluginCommand } = await import("./cli/plugin.js");
     const code = await runPluginCommand({ argv: args.slice(1) });
