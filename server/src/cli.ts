@@ -1103,6 +1103,11 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runAuditDump(args.slice(1));
   }
 
+  if (command === "audit-verify") {
+    const { runAuditVerify } = await import("./cli/castle-wall.js");
+    return runAuditVerify(args.slice(1));
+  }
+
   if (command === "audit-findings") {
     const { runAuditFindings } = await import("./cli/castle-wall.js");
     return runAuditFindings(args.slice(1));
@@ -1203,6 +1208,14 @@ function printCastleWallHelp(): void {
                      Surfaces RECORDED per-flow rule attribution. It does NOT make the
                      audit trail tamper-evident: tamper-evidence (producer-signed audit
                      activation) is a separate capability, not yet active in production on Linux.
+    audit-verify     Re-verify each enforcement entry's PRODUCER SIGNATURE against the
+                     pinned audit-producer key and report verified / rejected / channel
+                     counts. Read-only. This is the tamper-evidence reader: unlike
+                     audit-dump it does NOT trust the cw_source marker; it cryptographically
+                     re-verifies the signature, so a forged producer_signed entry is REJECTED.
+                     With no published producer key it reports the honest channel-authenticated
+                     floor and makes no per-producer claim. --json for machine output;
+                     --since <dur>; --producer-pub-key <path> override.
     audit-findings   List audit-chain integrity findings for the fortress (read-only diagnostic).
     approve          Approve a pending Castle Wall request.
     configure-origin Configure the agent-origin descriptor for origin-differential enforcement.

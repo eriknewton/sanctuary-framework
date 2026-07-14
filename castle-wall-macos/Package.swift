@@ -80,7 +80,7 @@ let package = Package(
         ),
         .target(
             name: "CastleWallFilter",
-            dependencies: ["CastleWallIPC"],
+            dependencies: ["CastleWallIPC", "CastleWallSigner"],
             path: "Sources/CastleWallFilter",
             linkerSettings: [
                 .linkedFramework("NetworkExtension"),

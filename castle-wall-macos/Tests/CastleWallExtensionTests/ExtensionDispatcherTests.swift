@@ -34,6 +34,21 @@ import CastleWallIPC
 
 final class ExtensionDispatcherTests: XCTestCase {
 
+    final class ImmediateAuditProducerSigner: AuditProducerSigning {
+        let privateKey: Curve25519.Signing.PrivateKey
+
+        init(privateKey: Curve25519.Signing.PrivateKey) {
+            self.privateKey = privateKey
+        }
+
+        func signAuditProducerPayload(
+            _ payload: Data,
+            reply: @escaping (Data?, String?) -> Void
+        ) {
+            reply(try? privateKey.signature(for: payload), nil)
+        }
+    }
+
     // MARK: - Helpers
 
     func makeFlow(
@@ -330,6 +345,84 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(dispatcher.connectionState, .disconnected)
     }
 
+    /// Slice-M audit-drop fix: a verdict on a NEVER-STARTED dispatcher must
+    /// NOT kick a connection attempt. The lazy-rebind path is gated on
+    /// `hasEverStarted`, so the pristine `.disconnected` state is preserved
+    /// and a not-yet-bootstrapped provider does not race its own bootstrap.
+    /// Several verdicts in a row stay `.disconnected` (no transition to
+    /// `.handshaking` / `.retrying`).
+    func test_notifyVerdict_neverStarted_doesNotLazyReconnect() {
+        let engine = FlowEvaluatorEngine()
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(),
+            sendErrorHandler: { _ in }
+        )
+        for _ in 0..<5 {
+            dispatcher.notifyVerdict(.allow(matchedRuleId: "r-1"), for: makeFlow())
+        }
+        // Give any errant async reconnect a chance to flip the state.
+        let settle = self.expectation(description: "settle")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) { settle.fulfill() }
+        wait(for: [settle], timeout: 1.0)
+        XCTAssertEqual(
+            dispatcher.connectionState,
+            .disconnected,
+            "a never-started dispatcher must not lazy-reconnect from notifyVerdict"
+        )
+    }
+
+    /// Slice-M LAYER-1 starvation regression (`612f8d99`). Once `start()` has
+    /// failed its connect and scheduled a retry, the dispatcher sits in
+    /// `.retrying` with a PENDING retry timer. Steady verdict traffic — which an
+    /// armed wall produces constantly — must NOT keep resetting that timer, or
+    /// `attemptStartAndSubscribe` never fires and the audit channel never
+    /// reconnects (the 2026-06-29 drill: 0 producer-signed entries, endless
+    /// "reconnect scheduled" spam, zero "connected"). The fix guards the
+    /// reconnect-kick on `retryTimer == nil`; this test drives the exact
+    /// condition and asserts the pending timer is left intact (no new
+    /// reconnect scheduled) while verdicts pour in.
+    func test_notifyVerdict_whileRetryPending_doesNotResetTimer_starvationRegression() async {
+        let engine = FlowEvaluatorEngine()
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            // Non-existent UDS path: the connect fails, so start() lands the
+            // dispatcher in `.retrying` with a pending retry timer.
+            ipcClient: makeFloatingClient(),
+            sendErrorHandler: { _ in }
+        )
+
+        let live = await dispatcher.start()
+        XCTAssertFalse(live, "start() against a dead socket must not report live")
+        // The sync read drains the (serial) state queue, so the scheduleReconnect
+        // dispatched by the start failure has fully run by the time we read.
+        XCTAssertEqual(dispatcher.connectionState, .retrying)
+        let baseline = dispatcher.reconnectScheduledCount
+        XCTAssertEqual(baseline, 1, "a single failed start schedules exactly one reconnect")
+
+        // Pour verdicts at the dispatcher while the retry timer is pending. The
+        // PRE-fix livelock reset the timer on every one of these; the guard must
+        // leave the pending timer untouched, so the schedule count stays put.
+        for _ in 0..<100 {
+            dispatcher.notifyVerdict(.allow(matchedRuleId: "r-1"), for: makeFlow())
+        }
+        // Settle async drop bookkeeping, staying well under the ~0.85s minimum
+        // retry delay so the pending timer cannot legitimately fire mid-window.
+        try? await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertEqual(
+            dispatcher.reconnectScheduledCount,
+            baseline,
+            "verdicts while a retry timer is pending must NOT reschedule (starvation guard)"
+        )
+        XCTAssertEqual(
+            dispatcher.connectionState,
+            .retrying,
+            "the dispatcher must remain in .retrying with its original pending timer"
+        )
+        dispatcher.stop()
+    }
+
     // MARK: - Outbound message-shape correctness via the builder
 
     func test_decisionRecordedShape_allow_carriesMatchedRuleId() {
@@ -402,5 +495,49 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertEqual(body.expiresInSeconds, 45)
         XCTAssertEqual(body.agent.id, flow.agentId)
         XCTAssertEqual(body.destination.host, flow.destinationHost)
+    }
+
+    func test_auditProducerChain_signsAllowVerdictWithDomainSeparatedBytes() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
+        let chain = AuditProducerChain()
+        let flow = makeFlow()
+        let recordedAt = Date(timeIntervalSince1970: 1_760_000_000)
+        let exp = expectation(description: "signed verdict")
+        var signedMessage: IpcMessage?
+        var signedError: AuditProducerSigningError?
+
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: flow,
+            recordedAt: recordedAt,
+            signer: signer
+        ) { result in
+            switch result {
+            case .success(let message):
+                signedMessage = message
+            case .failure(let error):
+                signedError = error
+            }
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1)
+
+        XCTAssertNil(signedError)
+        guard case .flowDecisionRecorded(let body)? = signedMessage else {
+            return XCTFail("expected signed flowDecisionRecorded")
+        }
+        let producer = try XCTUnwrap(body.producer)
+        XCTAssertEqual(producer.seq, 0)
+        XCTAssertNil(producer.priorSha256Hex)
+        XCTAssertEqual(producer.keyId, AuditProducerSigningConstants.keyId)
+        let signature = try Base64URL.decode(producer.signatureB64url)
+        let payload = Data(
+            "\(AuditProducerSigningConstants.domainPrefix)\(producer.eventCanonicalJson)\n\(producer.capturedAtUnixMs)\n\(producer.seq)".utf8
+        )
+        XCTAssertTrue(
+            privateKey.publicKey.isValidSignature(signature, for: payload),
+            "signature must verify over the exact domain-separated producer bytes"
+        )
     }
 }

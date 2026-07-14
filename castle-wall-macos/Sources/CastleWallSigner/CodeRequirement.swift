@@ -31,6 +31,17 @@ public enum CodeRequirement {
         return "anchor apple generic and certificate leaf[subject.OU] = \"\(teamID)\" and identifier \"\(identifier)\""
     }
 
+    /// Requirement for the dedicated audit-producer service. This deliberately
+    /// pins to the system extension bundle identifier rather than the generic
+    /// signer-client shim; otherwise the TypeScript daemon could spawn the shim
+    /// to sign forged audit evidence with the same key.
+    public static func castleWallExtensionRequirement(
+        teamID: String = SignerConstants.teamID,
+        identifier: String = SignerConstants.castleWallExtensionIdentifier
+    ) -> String {
+        return "anchor apple generic and certificate leaf[subject.OU] = \"\(teamID)\" and identifier \"\(identifier)\""
+    }
+
     /// Build a `SecRequirement` from the requirement string, or nil if the
     /// string fails to compile. The helper uses this on macOS < 13 fallback
     /// paths and for an explicit pre-flight check; on macOS 13+ the listener

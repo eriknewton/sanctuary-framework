@@ -1014,13 +1014,15 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
     public let agent: IpcAgentAttribution
     public let matchedRuleId: String?
     public let recordedAt: String
+    public let producer: AuditProducerSignatureBody?
 
     public init(
         decision: String,
         destination: IpcDestination,
         agent: IpcAgentAttribution,
         matchedRuleId: String?,
-        recordedAt: String
+        recordedAt: String,
+        producer: AuditProducerSignatureBody? = nil
     ) {
         self.type = "flow_decision_recorded"
         self.decision = decision
@@ -1028,6 +1030,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         self.agent = agent
         self.matchedRuleId = matchedRuleId
         self.recordedAt = recordedAt
+        self.producer = producer
     }
 
     enum CodingKeys: String, CodingKey {
@@ -1037,6 +1040,7 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         case agent
         case matchedRuleId = "matched_rule_id"
         case recordedAt = "recorded_at"
+        case producer
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -1047,6 +1051,44 @@ public struct FlowDecisionRecordedBody: Codable, Equatable {
         try container.encode(agent, forKey: .agent)
         try container.encode(matchedRuleId, forKey: .matchedRuleId)
         try container.encode(recordedAt, forKey: .recordedAt)
+        try container.encodeIfPresent(producer, forKey: .producer)
+    }
+}
+
+/// Per-flow producer-signature tuple carried by the macOS extension. Mirrors
+/// the Linux `AuditDrainEvent` signature fields so the TypeScript reader can
+/// reuse the same fail-closed re-verification gate.
+public struct AuditProducerSignatureBody: Codable, Equatable {
+    public let eventCanonicalJson: String
+    public let capturedAtUnixMs: UInt64
+    public let seq: UInt64
+    public let priorSha256Hex: String?
+    public let signatureB64url: String
+    public let keyId: String
+
+    public init(
+        eventCanonicalJson: String,
+        capturedAtUnixMs: UInt64,
+        seq: UInt64,
+        priorSha256Hex: String?,
+        signatureB64url: String,
+        keyId: String
+    ) {
+        self.eventCanonicalJson = eventCanonicalJson
+        self.capturedAtUnixMs = capturedAtUnixMs
+        self.seq = seq
+        self.priorSha256Hex = priorSha256Hex
+        self.signatureB64url = signatureB64url
+        self.keyId = keyId
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case eventCanonicalJson = "event_canonical_json"
+        case capturedAtUnixMs = "captured_at_unix_ms"
+        case seq
+        case priorSha256Hex = "prior_sha256_hex"
+        case signatureB64url = "signature_b64url"
+        case keyId = "key_id"
     }
 }
 

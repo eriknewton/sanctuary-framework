@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { statSync } from "node:fs";
 import { mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { dirname, join } from "node:path";
@@ -35,6 +36,11 @@ import {
 import { HelperSignerClient, type ShimInvoker } from "./helper-signer.js";
 import { writeGlobalPinIfUnestablished } from "../global-pin/index.js";
 import {
+  CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH,
+  CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR,
+  resolveProducerPubKeyPath,
+} from "./producer-signature.js";
+import {
   isCustodyFsError,
   readFileCustody,
   readFileCustodyWithStats,
@@ -65,8 +71,10 @@ const execFileAsync = promisify(execFile);
 
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
 const CASTLE_PINNED_PRIVKEY = "castle-pinned-privkey.enc";
-const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = "/Library/Application Support/Sanctuary";
+const CASTLE_GLOBAL_PINNED_PUBKEY_DIR = CASTLE_WALL_MACOS_GLOBAL_PINNED_PUBKEY_DIR;
 const CASTLE_GLOBAL_PINNED_PUBKEY_PATH = `${CASTLE_GLOBAL_PINNED_PUBKEY_DIR}/${CASTLE_PINNED_PUBKEY}`;
+const CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH =
+  CASTLE_WALL_MACOS_AUDIT_PRODUCER_PUBKEY_PATH;
 
 /**
  * Signing handle used by the daemon. B2: the production default routes both
@@ -167,11 +175,18 @@ export interface MacOSCastleWallDaemonInput {
   platform?: NodeJS.Platform;
   socketPath?: string;
   /**
-   * Re-own the bound IPC socket to this uid (F1 #450 item 3). Set by the
-   * SAFE-MODE boot daemon (which runs as root) to the operator/fortress-owner
+   * Re-own the bound IPC socket to this uid (F1 #450 item 3). Set explicitly by
+   * the SAFE-MODE boot daemon (which runs as root) to the operator/fortress-owner
    * uid so the operator CLI dead-man lever can reach the otherwise root-owned
-   * socket. Undefined for the full operator daemon (socket is already
-   * operator-owned). See {@link MacOSFlowIpcListenerOptions.socketOwnerUid}.
+   * socket.
+   *
+   * Slice M Layer-2 (2026-06-29): this is now OPTIONAL even for a root daemon. When
+   * omitted and the daemon runs as root, the operator uid is AUTO-DERIVED from the
+   * fortress dir owner (the uid the content-filter extension runs as) so the engage
+   * path (`wrap`, which never passed this) re-owns the socket too and
+   * audit-producer signing can engage. An explicit value is still honored verbatim.
+   * See {@link resolveSocketReownUid} and
+   * {@link MacOSFlowIpcListenerOptions.socketOwnerUid}.
    */
   socketOwnerUid?: number;
   /**
@@ -234,6 +249,13 @@ export interface MacOSCastleWallDaemonInput {
    * pin installed on the build host.
    */
   globalPinnedPublicKeyPath?: string;
+  /**
+   * Root-helper-published macOS audit-producer public key. When present, the
+   * daemon pins the macOS flow-event consumer to it and copies it to the
+   * existing fortress producer-key reader path. Missing means the honest macOS
+   * channel-authenticated floor remains in effect.
+   */
+  auditProducerPublicKeyPath?: string;
   /**
    * Provider-side dead-man lease. Undefined/null means durable arming
    * (--no-ttl); a positive number means the extension fails open after that
@@ -343,6 +365,87 @@ interface ActiveCastleWallConfig {
   mode?: "safe" | "full";
 }
 
+/**
+ * Resolve the uid the bound IPC socket must be (re-)owned by so the macOS
+ * content-filter extension (which runs as the LOGGED-IN OPERATOR uid, not root)
+ * can connect to it.
+ *
+ * WHY this exists (Slice M Layer-2, drilled 2026-06-29, Erik-present): macOS
+ * audit-producer signing never engaged because the extension's IPC dispatcher
+ * could not CONNECT to the daemon's UDS control socket. When the daemon runs as
+ * ROOT (the engage drill ran it as root), `net.Server.listen()` binds the socket
+ * owned by `root` at mode 0600, and a non-root operator-uid extension gets EPERM
+ * connecting to it (the host app, which shares the extension's IPCClient
+ * connect+handshake code, handshook fine over an OPERATOR-owned socket; only the
+ * root-owned 0600 socket blocked it). The fix is to re-own the socket to the
+ * operator uid (the same user the extension runs as), which is the uid that
+ * OWNS THE FORTRESS DIRECTORY (an operator-owned 0o700 dir). Mode stays 0600, so
+ * root (the daemon + a root-running extension) still reaches it via superuser
+ * bypass and no other local user can; we NEVER widen the socket.
+ *
+ * Resolution order:
+ *   - An explicit `socketOwnerUid` (the safe-mode boot daemon already derives
+ *     and passes it) wins verbatim, preserving that path's behavior.
+ *   - Otherwise, only when the daemon is running as ROOT (`getuid() === 0`, i.e.
+ *     the socket would otherwise be root-owned) AND the fortress-dir owner is a
+ *     DIFFERENT uid than the daemon process, return that owner uid so the socket
+ *     is re-owned to the operator. When owners already match (a same-uid operator
+ *     daemon), or we are not root, return `undefined` (no re-own is needed).
+ *   - On a stat failure, warn and return `undefined` (fail-soft: the daemon still
+ *     comes up + enforces; the re-own is best-effort and the listener's own
+ *     chown is likewise loud-but-non-fatal).
+ *
+ * Pure except for the optional `warn` sink, so the LOGIC (target uid / skip
+ * conditions) is unit-testable without a root-owned socket on disk.
+ */
+export function resolveSocketReownUid(input: {
+  socketOwnerUid?: number;
+  fortressPath: string;
+  /** Current process uid; defaults to `process.getuid?.()`. Injected by tests. */
+  processUid?: number | undefined;
+  /** Stat the fortress dir for its owner uid; defaults to `fs.statSync`. */
+  statFortressUid?: (fortressPath: string) => number;
+  /** Operator-facing warning sink (stderr by default). */
+  warn?: (message: string) => void;
+}): number | undefined {
+  if (input.socketOwnerUid !== undefined) {
+    return input.socketOwnerUid;
+  }
+  const processUid =
+    input.processUid !== undefined ? input.processUid : process.getuid?.();
+  // Only a root daemon binds a root-owned socket the operator-uid extension
+  // cannot reach. A non-root (operator) daemon already binds an operator-owned
+  // socket; leave ownership untouched.
+  if (processUid !== 0) {
+    return undefined;
+  }
+  let ownerUid: number;
+  try {
+    ownerUid = input.statFortressUid
+      ? input.statFortressUid(input.fortressPath)
+      : statSync(input.fortressPath).uid;
+  } catch (err) {
+    // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+    (input.warn ?? defaultDaemonWarn)(
+      `[castle-wall] warning: could not resolve the fortress owner for ${input.fortressPath} ` +
+        `(${err instanceof Error ? err.message : String(err)}); the content-filter extension may be ` +
+        `unable to connect to the root-owned control socket and audit-producer signing may not engage.`,
+    );
+    return undefined;
+  }
+  // Owners already match (a same-uid daemon, e.g. an operator daemon that somehow
+  // reached here as root over its own fortress): no re-own needed.
+  if (ownerUid === processUid) {
+    return undefined;
+  }
+  return ownerUid;
+}
+
+function defaultDaemonWarn(message: string): void {
+  // SAFETY: daemon startup diagnostics are operator-facing stderr output.
+  console.error(message);
+}
+
 export async function startMacOSCastleWallDaemon(
   input: MacOSCastleWallDaemonInput,
 ): Promise<MacOSCastleWallDaemonHandle> {
@@ -370,6 +473,21 @@ export async function startMacOSCastleWallDaemon(
   const reloadAuditDeadlineMs =
     input.reloadAuditDeadlineMs ?? CASTLE_WALL_RELOAD_AUDIT_DEADLINE_MS;
 
+  // Slice M Layer-2: when the daemon runs as root the socket binds root-owned and
+  // the operator-uid content-filter extension cannot connect (EPERM on a 0600 root
+  // socket), so audit-producer signing never engages. Re-own to the fortress owner
+  // (= the operator the extension runs as). An explicit `socketOwnerUid` (the
+  // safe-mode boot daemon already supplies one) is honored verbatim; otherwise this
+  // auto-derives it from the fortress dir so EVERY caller (notably `wrap`, which did
+  // not pass one) is correct without per-caller patching. Mode stays 0600 and is
+  // never widened. See {@link resolveSocketReownUid}.
+  const socketOwnerUid = resolveSocketReownUid({
+    ...(input.socketOwnerUid !== undefined
+      ? { socketOwnerUid: input.socketOwnerUid }
+      : {}),
+    fortressPath: input.fortressPath,
+  });
+
   await assertActiveConfigNotOwnedByLiveProcess(activeConfigPath, legacyActiveConfigPath);
   await assertSocketNotOwnedByLiveProcess(socketPath);
   await mkdir(join(input.fortressPath, "policy", "egress", "rules"), {
@@ -379,6 +497,15 @@ export async function startMacOSCastleWallDaemon(
 
   const signer = input.signer ?? (await loadSigningKey(input));
   await writeSystemPinnedPublicKey(signer, input.globalPinnedPublicKeyPath);
+  const auditProducerKey = await loadMacOSAuditProducerPublicKey(
+    input.auditProducerPublicKeyPath ?? CASTLE_GLOBAL_AUDIT_PRODUCER_PUBKEY_PATH,
+  );
+  if (auditProducerKey !== null) {
+    await publishFortressAuditProducerPublicKey(
+      input.fortressPath,
+      auditProducerKey.bytes,
+    );
+  }
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
   const operatorBaseline = await resolveOperatorBaseline(
@@ -515,13 +642,12 @@ export async function startMacOSCastleWallDaemon(
     },
     auditSink: input.auditLog,
     defaultApprovalTimeoutSeconds: 30,
+    pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
   });
 
   const listenerOptions: MacOSCastleWallListenerOptions = {
     socketPath,
-    ...(input.socketOwnerUid !== undefined
-      ? { socketOwnerUid: input.socketOwnerUid }
-      : {}),
+    ...(socketOwnerUid !== undefined ? { socketOwnerUid } : {}),
     consumer,
     handshakeSigner: {
       fortressId: input.fortressId,
@@ -1418,6 +1544,47 @@ export async function writeSystemPinnedPublicKey(
       `[castle-wall] warning: unable to write shared pinned public key at ${globalPinPath}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+async function loadMacOSAuditProducerPublicKey(
+  path: string,
+): Promise<{ bytes: Uint8Array; keyB64url: string } | null> {
+  let bytes: Uint8Array;
+  try {
+    bytes = new Uint8Array(
+      await readFileCustody(path, { verifyPathIdentity: true }),
+    );
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") {
+      return null;
+    }
+    throw new Error(
+      `Castle Wall macOS audit-producer key at ${path} is unreadable: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+      { cause: error },
+    );
+  }
+  if (bytes.length !== 32) {
+    throw new Error(
+      `Castle Wall macOS audit-producer key at ${path} is ${bytes.length} bytes (expected 32).`,
+    );
+  }
+  return { bytes, keyB64url: toBase64url(bytes) };
+}
+
+async function publishFortressAuditProducerPublicKey(
+  fortressPath: string,
+  publicKey: Uint8Array,
+): Promise<void> {
+  await writeFileCustody(resolveProducerPubKeyPath(fortressPath), publicKey, {
+    mode: 0o644,
+    createParent: true,
+  });
 }
 
 /**

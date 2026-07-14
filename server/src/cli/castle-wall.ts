@@ -50,6 +50,16 @@ import { validateRule, type AllowlistRule } from "../castle-wall/allowlist/schem
 import { HABEAS_RULE_ID_PREFIX } from "../castle-wall/allowlist/habeas-port.js";
 import { EGRESS_PROVISION_REFUSED_AUDIT_OP } from "../castle-wall/provision/egress.js";
 import {
+  loadFortressProducerKey,
+  loadPinnedProducerKeyB64url,
+} from "../castle-wall/runtime/producer-signature.js";
+import {
+  reverifyEntryProducerSignature,
+  signedCanonicalOperation,
+  producerSignedDedupKey,
+  type EntryReverifyBasis,
+} from "../principal-policy/producer-reverify.js";
+import {
   CASTLE_WALL_BOOT_PLIST_PATH,
   bootServiceInstalled,
   bootServiceReady,
@@ -177,6 +187,23 @@ export interface CastleWallCommandContext {
    * rules an agent-classified flow could match.
    */
   egressAllowRuleCountProbe?: (fortressPath: string) => Promise<number>;
+  /**
+   * Inject the FULL operator-daemon start function (Slice M; tests pass a fake
+   * that captures the resolved {@link MacOSCastleWallDaemonInput}, so the
+   * key-resolution + producer-key threading can be exercised without a real
+   * socket/helper). Defaults to {@link startMacOSCastleWallDaemon}.
+   */
+  fullDaemonStart?: (
+    input: import("../castle-wall/runtime/macos-daemon.js").MacOSCastleWallDaemonInput,
+  ) => Promise<{ socketPath: string; stop: () => Promise<void> }>;
+  /**
+   * Override the macOS audit-producer public-key path threaded into the daemon
+   * and macOS reader verification (Slice M). Tests point it at a temp key; an
+   * operator may set it via `SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY` for a
+   * non-default helper layout. When unset the daemon/readers use their built-in
+   * `/Library/Application Support/Sanctuary/castle-audit-producer.pub` default.
+   */
+  auditProducerPublicKeyPath?: string;
 }
 
 export interface CastleWallParsedArgs {
@@ -223,6 +250,14 @@ export interface CastleWallParsedArgs {
    * out-of-band", a different assertion). The override is audited.
    */
   allowNoEgress?: boolean;
+  /** audit-verify: emit machine-readable JSON instead of the human summary. */
+  json?: boolean;
+  /**
+   * audit-verify: explicit override for the pinned audit-producer public-key
+   * file. Tests point this at a temp key; production resolves it from the
+   * fortress publish path. Never accepted from an untrusted source.
+   */
+  producerPubKey?: string;
 }
 
 /** Runs the host-app binary in headless mode; mirrors execFile semantics. */
@@ -1523,17 +1558,41 @@ export async function runDaemon(
       ? undefined
       : await resolveSignerClientPath(env, platform, ctx);
 
-    const { startMacOSCastleWallDaemon } = await import("../castle-wall/runtime/index.js");
+    // Slice M: resolve the macOS audit-producer public-key path the daemon
+    // pins flow verdicts against. ctx (tests) → env override → daemon default
+    // (`/Library/Application Support/Sanctuary/castle-audit-producer.pub`). When
+    // a key IS published there, the daemon loads it and engages per-producer
+    // re-verification; when it is absent, the daemon stays on the honest
+    // channel-authenticated floor (never overclaims).
+    const auditProducerKeyPath =
+      ctx.auditProducerPublicKeyPath ??
+      env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY;
+
+    const startFullDaemon =
+      ctx.fullDaemonStart ??
+      (async (input) => {
+        const { startMacOSCastleWallDaemon } = await import(
+          "../castle-wall/runtime/index.js"
+        );
+        return startMacOSCastleWallDaemon(input);
+      });
     try {
-      daemon = await startMacOSCastleWallDaemon({
+      daemon = await startFullDaemon({
         fortressPath: storagePath,
         fortressId: fortressIdFromStoragePath(storagePath),
         masterKey: derived.key,
         auditLog,
+        // FULL operator daemon: come up in FULL mode (NOT safe-mode-from-boot-
+        // token). This is the console-login enforcement path that holds the
+        // fortress key + reaches the audit-producer signing service.
+        daemonMode: "full",
         ...(launchdBoot ? { auditSource: "launchd-boot" } : {}),
         ...(localSign ? { localSign: true } : {}),
         ...(resolvedSignerClient
           ? { signerClientPath: resolvedSignerClient }
+          : {}),
+        ...(auditProducerKeyPath
+          ? { auditProducerPublicKeyPath: auditProducerKeyPath }
           : {}),
       });
     } catch (error) {
@@ -1865,6 +1924,16 @@ export async function runSafeModeDaemon(
       ...(ctx.globalPinnedPublicKeyPath
         ? { globalPinnedPublicKeyPath: ctx.globalPinnedPublicKeyPath }
         : {}),
+      // Slice M: a safe-mode boot daemon also loads the helper-published
+      // audit-producer key (the helper provisions it at boot independent of
+      // login), so producer-signed verdicts are re-verified even before login.
+      ...(ctx.auditProducerPublicKeyPath ?? env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY
+        ? {
+            auditProducerPublicKeyPath:
+              ctx.auditProducerPublicKeyPath ??
+              env.SANCTUARY_CASTLE_AUDIT_PRODUCER_PUBKEY,
+          }
+        : {}),
     });
   } catch (error) {
     write(err, `Safe-mode daemon failed to start: ${(error as Error).message}\n`);
@@ -2166,6 +2235,352 @@ export async function runAuditDump(
     return 0;
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+/** The per-basis tally `audit-verify` reports. */
+interface AuditVerifyTally {
+  verified: number;
+  rejected: number;
+  channel: number;
+  /**
+   * Verified-but-duplicate entries: a genuine signed tuple (same seq|signature)
+   * re-appended N times. The first copy is counted as `verified`; each extra
+   * copy lands here and does NOT inflate `verified`, so N copies of one real
+   * enforcement event never read as N distinct verified events.
+   */
+  duplicates: number;
+}
+
+/** Map a re-verification basis into the tally bucket it contributes to. */
+function tallyBucketForBasis(basis: EntryReverifyBasis): keyof AuditVerifyTally {
+  switch (basis) {
+    case "producer_signed_verified":
+      return "verified";
+    case "producer_signed_rejected":
+      return "rejected";
+    case "channel_authenticated":
+      return "channel";
+  }
+}
+
+/**
+ * Map from the daemon's SIGNED WAL `operation` vocabulary to the read-side
+ * `entry.operation` `audit-verify` scopes to. Mirrors `SIGNED_WAL_OP_TO_ENTRY_OP`
+ * in `posture.ts` and `SIGNED_WAL_OP_TO_FEATURE_OP` in `feature-health.ts`. Only
+ * the two flow-verdict operations matter here (the verb already filters to
+ * `egress_allowed` / `egress_blocked`); a signed `egress_pending` body can never
+ * match either, so a paused-decision tuple cannot be relabeled into a verdict.
+ */
+const AUDIT_VERIFY_SIGNED_WAL_OP_TO_ENTRY_OP: Readonly<Record<string, string>> =
+  Object.freeze({
+    egress_approved: "egress_allowed",
+    egress_blocked: "egress_blocked",
+  });
+
+/**
+ * True iff a re-verified producer-signed entry's SIGNED canonical body attests
+ * to the same read-side operation the entry is filed under (parity with the
+ * posture / feature-health green-light surfaces). Fail closed on any parse
+ * failure / unknown signed op / mismatch: a verified signature over one
+ * operation must NOT count toward a DIFFERENT operation's verified tally, so a
+ * genuine signed tuple cannot be relabeled under a different top-level operation
+ * to inflate or mis-slice the verified count.
+ */
+function auditVerifySignedOperationMatchesEntry(
+  details: Record<string, unknown>,
+  entryOperation: string,
+): boolean {
+  const signedOp = signedCanonicalOperation(details);
+  if (signedOp === null) return false;
+  return AUDIT_VERIFY_SIGNED_WAL_OP_TO_ENTRY_OP[signedOp] === entryOperation;
+}
+
+/**
+ * Resolve the pinned audit-producer public key for `audit-verify`, in
+ * base64url-no-pad, or `null` when no key is published.
+ *
+ * Path resolution (single source of truth - never invents a weaker basis):
+ *   1. an explicit `--producer-pub-key <path>` override (tests / non-default
+ *      layouts), else
+ *   2. on macOS, the root-helper-published host-wide key at
+ *      `/Library/Application Support/Sanctuary/castle-audit-producer.pub`,
+ *      falling back to the fortress path only when the host-wide key is absent,
+ *      else
+ *   3. the fortress publish path `resolveProducerPubKeyPath(fortressPath)` =
+ *      `<fortress>/policy/egress/audit-producer.pub`, which is exactly where the
+ *      Linux daemon publishes the key the audit CONSUMER pinned, so the reader
+ *      can never diverge onto a different key than the one writes were gated
+ *      against.
+ *
+ * A MISSING key file (ENOENT) is the honest no-key floor: the reader returns
+ * `null` and reports every entry on the channel basis - it never fabricates a
+ * verified result it cannot check. A PRESENT-but-bad key (wrong length, EACCES)
+ * is a fault, not "absent": it throws so the verb fails honestly rather than
+ * silently dropping to the channel basis (the Slice P fail-closed contract).
+ */
+async function resolveAuditVerifyProducerKey(
+  fortressPath: string,
+  explicitPath: string | undefined,
+  opts: {
+    platform?: NodeJS.Platform;
+    macosProducerPubKeyPath?: string;
+  } = {},
+): Promise<string | null> {
+  if (explicitPath === undefined) {
+    const load = await loadFortressProducerKey(fortressPath, {
+      platform: opts.platform,
+      macosProducerPubKeyPath: opts.macosProducerPubKeyPath,
+    });
+    if (load.status === "present") return load.keyB64url;
+    if (load.status === "absent") return null;
+    throw new Error(load.reason);
+  }
+  const pubKeyPath = explicitPath;
+  try {
+    return await loadPinnedProducerKeyB64url(pubKeyPath);
+  } catch (error) {
+    const code =
+      error && typeof error === "object" && "code" in error
+        ? (error as NodeJS.ErrnoException).code
+        : undefined;
+    if (code === "ENOENT") {
+      // No producer key published: the honest channel-authenticated floor.
+      // Not a failure - macOS pre-Slice-M / pre-provision Linux lives here.
+      return null;
+    }
+    // A key file exists but is unreadable / malformed. A key is EXPECTED here,
+    // so do NOT pretend it is absent and drop to the channel basis.
+    throw error;
+  }
+}
+
+/**
+ * `audit-verify` - the read-side tamper-evidence reader for Castle Wall
+ * enforcement evidence (Slice R / Slice M reader leg).
+ *
+ * Unlike `audit-dump` (which surfaces the RECORDED attribution, including a
+ * forgeable `cw_source` marker, and makes NO authenticity claim), this verb
+ * CRYPTOGRAPHICALLY RE-VERIFIES each entry's persisted producer signature
+ * against the daemon's pinned producer public key. A forger that stamped the
+ * `producer_signed` basis + marker but could not mint a signature over the
+ * pinned key is REJECTED here; only a signature that re-verifies counts as
+ * per-producer-authenticated.
+ *
+ * It reuses `reverifyEntryProducerSignature()` - the exact same fail-closed
+ * gate the posture/feature-health readers run - so the CLI cannot diverge from
+ * the live posture surface. Beyond the signature check it applies the SAME two
+ * guards those green-light surfaces apply, so a re-verifiable signature alone
+ * does not inflate the count: (1) OPERATION BINDING - the signed canonical
+ * body's operation must map to the entry's top-level operation, so a genuine
+ * signed tuple relabeled under a different operation is REJECTED, not verified;
+ * and (2) DEDUP on `seq|signature` - a genuine tuple copied N times counts once
+ * (the extras are surfaced as `duplicates`, never as distinct verified events).
+ * Without these, an in-process actor holding the AuditLog handle could replay a
+ * genuine signed tuple - relabeled and/or duplicated - to mis-slice the count.
+ *
+ * Honest no-key floor: when no producer key is published (macOS pre-Slice-M,
+ * pre-provision Linux), the verb reports every enforcement entry on the
+ * `channel_authenticated` basis and explicitly states it could NOT re-verify
+ * per-producer signatures. It never fakes a verified count.
+ *
+ * Exit codes:
+ *   0 - read + classification succeeded (this is a DIAGNOSTIC; a present
+ *       `rejected` count does NOT change the exit code, so a tamper finding is
+ *       reported, not swallowed by a non-zero exit a script might ignore).
+ *   1 - could not read the audit log / load an expected-but-broken key.
+ */
+export async function runAuditVerify(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+  const sinceIso = parsed.since
+    ? new Date(Date.now() - parseDurationMs(parsed.since)).toISOString()
+    : undefined;
+
+  try {
+    const pinnedProducerKeyB64url = await resolveAuditVerifyProducerKey(
+      fortressPath,
+      parsed.producerPubKey,
+      {
+        platform: ctx.platform ?? process.platform,
+        macosProducerPubKeyPath: ctx.auditProducerPublicKeyPath,
+      },
+    );
+
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveMasterKey(fortressPath, env);
+    const auditLog = new AuditLog(storage, masterKey, {
+      integrityMode: "lenient",
+    });
+    const query = await auditLog.query({
+      ...(sinceIso ? { since: sinceIso } : {}),
+      layer: "l1",
+      limit: 100_000,
+    });
+    // Only enforcement-evidence operations carry producer signatures; an
+    // operator_decision / policy_loaded / heartbeat entry is never expected to
+    // be producer-signed, so re-verifying them would inflate the channel count
+    // with entries that were never enforcement evidence. Scope to the two flow
+    // verdict operations the consumer signs.
+    const evidenceEntries = query.entries.filter(
+      (entry) =>
+        entry.operation === "egress_allowed" ||
+        entry.operation === "egress_blocked",
+    );
+
+    const tally: AuditVerifyTally = {
+      verified: 0,
+      rejected: 0,
+      channel: 0,
+      duplicates: 0,
+    };
+    const rejectedSamples: Array<{
+      timestamp: string;
+      operation: string;
+      reason: string;
+    }> = [];
+    // Dedup verified producer-signed entries on `seq|signature` so a genuine
+    // tuple copied N times counts once. Mirrors the posture / feature-health
+    // green-light surfaces, which already dedup the same way.
+    const seenSignedKeys = new Set<string>();
+    for (const entry of evidenceEntries) {
+      const details = entry.details ?? {};
+      const result = reverifyEntryProducerSignature(
+        details,
+        pinnedProducerKeyB64url,
+      );
+      // A signature that re-verifies is necessary but not sufficient to count as
+      // a distinct verified enforcement event: apply the same operation-binding
+      // and dedup guards the sibling green-light surfaces apply, so an in-process
+      // actor cannot replay a genuine signed tuple relabeled under a different
+      // top-level operation, nor duplicated N times, to inflate the verified
+      // tally.
+      if (result.basis === "producer_signed_verified") {
+        // (1) Operation binding: the signed canonical body's operation is
+        // authoritative, not the forgeable top-level `entry.operation`. A
+        // mismatch is a relabel attack: count it as REJECTED, not verified.
+        if (!auditVerifySignedOperationMatchesEntry(details, entry.operation)) {
+          tally.rejected += 1;
+          if (rejectedSamples.length < 20) {
+            rejectedSamples.push({
+              timestamp: entry.timestamp,
+              operation: entry.operation,
+              reason: "operation mismatch (signed body attests a different operation)",
+            });
+          }
+          continue;
+        }
+        // (2) Dedup: a genuine tuple copied N times re-verifies identically.
+        // Count the first copy as verified; surface the extras as duplicates so
+        // they do not read as distinct verified enforcement events. A
+        // null/absent dedup key cannot be trusted to be unique, so treat it as a
+        // duplicate beyond the first un-keyed entry would be unsound. Instead it
+        // simply cannot dedup, so it counts as verified (the inputs that make it
+        // verified already required seq+sig present in re-verification).
+        const dedupKey = producerSignedDedupKey(details);
+        if (dedupKey !== null && seenSignedKeys.has(dedupKey)) {
+          tally.duplicates += 1;
+          continue;
+        }
+        if (dedupKey !== null) seenSignedKeys.add(dedupKey);
+        tally.verified += 1;
+        continue;
+      }
+      tally[tallyBucketForBasis(result.basis)] += 1;
+      if (result.basis === "producer_signed_rejected" && rejectedSamples.length < 20) {
+        rejectedSamples.push({
+          timestamp: entry.timestamp,
+          operation: entry.operation,
+          reason: "signature failed re-verification against the pinned key",
+        });
+      }
+    }
+
+    if (parsed.json) {
+      write(
+        out,
+        JSON.stringify({
+          fortress: fortressPath,
+          producer_key_present: pinnedProducerKeyB64url !== null,
+          // The honest basis label for this run: with no pinned key we could
+          // only channel-authenticate; with a key we re-verified per-producer.
+          reader_basis:
+            pinnedProducerKeyB64url !== null
+              ? "per_producer_reverified"
+              : "channel_authenticated_only",
+          enforcement_entries: evidenceEntries.length,
+          verified: tally.verified,
+          rejected: tally.rejected,
+          channel_authenticated: tally.channel,
+          // Verified-but-duplicate copies of a genuine signed tuple. Surfaced
+          // separately so N copies of one real event never inflate `verified`.
+          duplicates: tally.duplicates,
+          rejected_samples: rejectedSamples,
+        }) + "\n",
+      );
+      return 0;
+    }
+
+    write(out, `Castle Wall audit-verify (fortress ${fortressPath})\n`);
+    if (pinnedProducerKeyB64url === null) {
+      write(
+        out,
+        "Producer key: NONE published. Cannot re-verify per-producer signatures.\n" +
+          "  Reporting on the channel-authenticated basis only (the honest macOS\n" +
+          "  pre-Slice-M / pre-provision Linux floor). A green here is NOT a\n" +
+          "  per-producer-authenticated claim.\n",
+      );
+    } else {
+      write(
+        out,
+        "Producer key: published. Re-verifying each enforcement entry's producer\n" +
+          "  signature against the pinned key (the forgeable cw_source marker is NOT\n" +
+          "  trusted; the cryptographic signature is the authority).\n",
+      );
+    }
+    write(out, `Enforcement entries examined: ${evidenceEntries.length}\n`);
+    write(out, `  producer_signed_verified : ${tally.verified}\n`);
+    write(out, `  producer_signed_rejected : ${tally.rejected}\n`);
+    write(out, `  channel_authenticated    : ${tally.channel}\n`);
+    if (tally.duplicates > 0) {
+      write(
+        out,
+        `  duplicates (not counted)  : ${tally.duplicates}\n` +
+          "    (genuine signed tuples re-appended; the first copy counts as\n" +
+          "     verified, the rest are NOT distinct enforcement events.)\n",
+      );
+    }
+    if (tally.rejected > 0) {
+      write(
+        err,
+        `WARNING: ${tally.rejected} enforcement entr${
+          tally.rejected === 1 ? "y" : "ies"
+        } CLAIMED producer_signed but did NOT count as verified.\n` +
+          "  This is a forgery / tamper signal: either the signature failed to\n" +
+          "  re-verify against the pinned producer key, or it re-verified but the\n" +
+          "  signed body attests a DIFFERENT operation than the entry was filed\n" +
+          "  under (a relabel / staple attack). Neither counts as a verified event.\n",
+      );
+      for (const sample of rejectedSamples) {
+        write(
+          err,
+          `    rejected: ${sample.timestamp} ${sample.operation} (${sample.reason})\n`,
+        );
+      }
+    }
+    return 0;
+  } catch (error) {
+    write(
+      err,
+      `Error: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
     return 1;
   }
 }
@@ -3512,6 +3927,12 @@ export function parseCastleWallArgs(argv: string[]): CastleWallParsedArgs {
       parsed.acceptBrokenChain = true;
     } else if (arg === "--by-rule") {
       parsed.byRule = true;
+    } else if (arg === "--json") {
+      parsed.json = true;
+    } else if (arg.startsWith("--producer-pub-key=")) {
+      parsed.producerPubKey = arg.slice("--producer-pub-key=".length);
+    } else if (arg === "--producer-pub-key") {
+      parsed.producerPubKey = argv[++i];
     } else if (arg.startsWith("--rule=")) {
       parsed.rule = arg.slice("--rule=".length);
     } else if (arg === "--rule") {
