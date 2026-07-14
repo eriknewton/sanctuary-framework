@@ -547,6 +547,18 @@ function appliedPolicyMarkerToNodeView(
   };
 }
 
+/**
+ * Fleet control plane, Add-Machine slice: the closed, server-typed result of
+ * parsing + validating a `POST /api/fleet/enroll-token` request body. Either a
+ * fully validated `{ node_id, node_mode }` pair, or a ready-to-send error
+ * response. Keeping the request-body values behind this tagged result lets the
+ * enroll handler branch only on the `ok` flag, so no attacker-controlled body
+ * value syntactically controls any condition that dominates a mint decision.
+ */
+type FleetEnrollTokenBodyParse =
+  | { ok: true; nodeId: string; nodeMode: NodeMode }
+  | { ok: false; status: number; payload: Record<string, string> };
+
 export class DashboardApprovalChannel implements ApprovalChannel {
   private config: DashboardConfig;
   /**
@@ -6569,6 +6581,67 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   }
 
   /**
+   * Fleet control plane, Add-Machine slice: parse + FULLY validate a
+   * `POST /api/fleet/enroll-token` request body into a closed, server-typed
+   * result BEFORE any enrollment decision runs. Pure: no I/O, no instance
+   * state, never throws (a malformed or unparseable body becomes a tagged
+   * `ok: false` result carrying the exact status + JSON payload to send, not
+   * an exception).
+   *
+   * Security note: this is INPUT VALIDATION, not a security gate. The real
+   * enrollment gates (paid node-cap, federation-provisioned + issuer
+   * authority, the join ceremony) all run AFTER this and are derived purely
+   * from server-side state, never from the request body. `node_id` is only a
+   * label bound into the minted token; `node_mode` is normalized to a closed
+   * enum and never selects a capacity bucket (the cap is checked against the
+   * TOTAL admitted roster count). Isolating validation here keeps the
+   * attacker-controlled `node_id`/`node_mode` out of every condition that
+   * dominates the mint: the handler branches only on the tagged `ok` flag, so
+   * no request-body value can influence whether the mint runs. It can only
+   * ever reject its own malformed request; it can never bypass a gate.
+   */
+  private parseFleetEnrollTokenBody(body: string): FleetEnrollTokenBodyParse {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      return {
+        ok: false,
+        status: 400,
+        payload: { error: "Invalid JSON body" },
+      };
+    }
+    const rawNodeId = parsed.node_id;
+    if (typeof rawNodeId !== "string" || rawNodeId.trim().length === 0) {
+      return {
+        ok: false,
+        status: 400,
+        payload: {
+          error: "validation_error",
+          message: "node_id is required and must be a non-empty string",
+        },
+      };
+    }
+    const rawNodeMode = parsed.node_mode;
+    if (
+      rawNodeMode !== "local" &&
+      rawNodeMode !== "operator_cloud" &&
+      rawNodeMode !== "sovereign_tee"
+    ) {
+      return {
+        ok: false,
+        status: 400,
+        payload: {
+          error: "validation_error",
+          message:
+            "node_mode must be one of local, operator_cloud, sovereign_tee",
+        },
+      };
+    }
+    return { ok: true, nodeId: rawNodeId, nodeMode: rawNodeMode };
+  }
+
+  /**
    * Fleet control plane, Add-Machine slice: `POST /api/fleet/enroll-token`.
    * The dashboard-side "Add a machine" button. Body: `{ node_id: string,
    * node_mode: "local" | "operator_cloud" | "sovereign_tee" }`.
@@ -6633,44 +6706,22 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     });
     req.on("end", async () => {
       if (destroyed) return;
-      let nodeId: string;
-      let nodeMode: NodeMode;
-      try {
-        const parsed = JSON.parse(body) as Record<string, unknown>;
-        const rawNodeId = parsed.node_id;
-        const rawNodeMode = parsed.node_mode;
-        if (typeof rawNodeId !== "string" || rawNodeId.trim().length === 0) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "validation_error",
-              message: "node_id is required and must be a non-empty string",
-            }),
-          );
-          return;
-        }
-        if (
-          rawNodeMode !== "local" &&
-          rawNodeMode !== "operator_cloud" &&
-          rawNodeMode !== "sovereign_tee"
-        ) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              error: "validation_error",
-              message:
-                "node_mode must be one of local, operator_cloud, sovereign_tee",
-            }),
-          );
-          return;
-        }
-        nodeId = rawNodeId;
-        nodeMode = rawNodeMode;
-      } catch {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+      // Parse + fully validate the request body up front into a closed,
+      // server-typed result. The handler then branches ONLY on the tagged
+      // `ok` flag, so no attacker-controlled body value (node_id / node_mode)
+      // syntactically controls any condition that dominates the mint below.
+      // This is input validation, not a security gate; the real gates
+      // (capacity, federation authority, ceremony) run afterward on
+      // server-derived state alone. See parseFleetEnrollTokenBody.
+      const parseResult = this.parseFleetEnrollTokenBody(body);
+      if (!parseResult.ok) {
+        res.writeHead(parseResult.status, {
+          "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify(parseResult.payload));
         return;
       }
+      const { nodeId, nodeMode } = parseResult;
 
       try {
         // Capacity pre-check FIRST: an operator at cap should never even

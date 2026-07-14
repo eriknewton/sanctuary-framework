@@ -492,3 +492,53 @@ describe("Add-Machine slice - never gates security (invariant)", () => {
     expect(capacityAfter.active_nodes).toBe(5);
   });
 });
+
+describe("POST /api/fleet/enroll-token - request-body values cannot bypass a gate (CodeQL js/user-controlled-bypass regression)", () => {
+  // CodeQL flagged the node_id validation condition as a "user-controlled
+  // bypass of a security check" because the attacker-controlled body flows
+  // into a condition that dominates the mint. This suite is the standing
+  // proof that the finding is a FALSE POSITIVE: no choice of node_id or
+  // node_mode can bypass the paid node-cap gate or the not-provisioned gate.
+  // The body only labels the token; the real gates read server-side state.
+
+  it("no attacker-chosen node_id/node_mode mints when the roster is at the finite cap (every choice still 409 at_capacity)", async () => {
+    // A well-formed body always clears input validation. If clearing it were a
+    // "bypass", one of these would mint. None does: the cap gate is checked
+    // against the TOTAL admitted roster count, independent of the body.
+    const bodies = [
+      { node_id: "attacker-node", node_mode: "local" },
+      { node_id: "attacker-node", node_mode: "operator_cloud" },
+      { node_id: "attacker-node", node_mode: "sovereign_tee" },
+      { node_id: "   padded-id   ", node_mode: "local" },
+      { node_id: "x".repeat(512), node_mode: "sovereign_tee" },
+    ];
+    for (const body of bodies) {
+      h = await startHarness({ totalNodes: 5 });
+      const res = await enrollToken(h, body, h.authToken);
+      expect(res.status).toBe(409);
+      const parsed = (await res.json()) as { error: string };
+      expect(parsed.error).toBe("at_capacity");
+      // No token shape ever leaks on the gated path, whatever the body was.
+      expect(JSON.stringify(parsed)).not.toMatch(/bootstrap_token|signature/i);
+      await h.stop();
+      h = null;
+    }
+  });
+
+  it("no attacker-chosen node_id/node_mode mints when federation is not provisioned (every choice still 409 federation_not_provisioned)", async () => {
+    const modes = ["local", "operator_cloud", "sovereign_tee"] as const;
+    for (const mode of modes) {
+      h = await startHarness({ totalNodes: 0, provisioned: false });
+      const res = await enrollToken(
+        h,
+        { node_id: "attacker-node", node_mode: mode },
+        h.authToken,
+      );
+      expect(res.status).toBe(409);
+      const parsed = (await res.json()) as { error: string };
+      expect(parsed.error).toBe("federation_not_provisioned");
+      await h.stop();
+      h = null;
+    }
+  });
+});
