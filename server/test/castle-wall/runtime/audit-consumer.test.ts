@@ -406,6 +406,133 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     );
     expect(dupEntries).toHaveLength(0);
   });
+
+  // ─── #924 interaction: uncanonicalizable events must SETTLE, never fault ──
+  //
+  // mesh `canonicalize()` (#924) now THROWS on an unsafe integer (>= 2^53) so
+  // it can never silently diverge from the Swift Int64 canonicalizer. This
+  // consumer calls that same `canonicalize()` on attacker-controllable
+  // `event.details` (a `Record<string, unknown>` spread verbatim from the
+  // daemon wire body) in fail-closed paths that must never themselves throw
+  // BEFORE the event's ack. An event with an unsafe integer buried in
+  // `details` is a forgery the consumer already models (full-sweep interaction
+  // sweep, 2026-07-14): it must be recorded as a SETTLED rejection (ACKed,
+  // cursor advances, wall stays ARMED), never an unsettled fault that wedges
+  // NOT-ARMED and causes the daemon to redeliver the same poison event forever.
+
+  const UNSAFE_INT = 2 ** 53 + 1;
+
+  it("settles an uncanonicalizable event on the reject (validateEvent-failure) path: recorded rejected + ACKed, never throws (bug-inject: unsafe int + bogus event_type)", async () => {
+    const event = buildAuditEvent({
+      timestamp: "2026-05-04T00:00:00Z",
+      fortress_id: "f",
+      event_type: "egress_allowed",
+      details: { seq: 0, prior_sha256_hex: null, poison: UNSAFE_INT },
+    });
+    const tampered = {
+      ...event,
+      event_type: "rogue" as unknown as CastleWallAuditEvent["event_type"],
+    } as CastleWallAuditEvent;
+    let acked = false;
+    // Must not throw: a forged/malformed event settling must never propagate
+    // an exception out of ingestCritical (that is what the drain loop reads
+    // as an UNSETTLED FAULT and trips NOT-ARMED).
+    await expect(
+      consumer.ingestCritical({
+        event: tampered,
+        ack: async () => {
+          acked = true;
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(acked).toBe(true);
+    expect(sink.entries.length).toBe(1);
+    expect(sink.entries[0]!.operation).toBe("audit_event_rejected");
+    expect(sink.entries[0]!.result).toBe("failure");
+    expect(consumer.getStats().rejectedEvents).toBe(1);
+    // The wall must stay armed: nothing here is an accepted critical event.
+    expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
+  });
+
+  it("settles an uncanonicalizable event on the accept/chain path as a SETTLED rejection, never accepts it, never throws (bug-inject: unsafe int, otherwise-valid event)", async () => {
+    const event = chainedEvent(5, null);
+    const poisoned: CastleWallAuditEvent = {
+      ...event,
+      details: { ...event.details, poison: UNSAFE_INT },
+    };
+    let acked = false;
+    await expect(
+      consumer.ingestCritical({
+        event: poisoned,
+        ack: async () => {
+          acked = true;
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(acked).toBe(true);
+    // Never accepted/chained: fail-closed for an unrepresentable event.
+    expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
+    expect(consumer.getStats().rejectedEvents).toBe(1);
+    expect(consumer.getWalChainState().lastAckedSeq).toBeNull();
+    expect(consumer.getWalChainState().lastEventCanonicalHash).toBeNull();
+    // Recorded as a rejection, not silently dropped or accepted as evidence.
+    const rejected = sink.entries.find((e) => e.operation === "audit_event_rejected");
+    expect(rejected).toBeDefined();
+    expect(rejected!.result).toBe("failure");
+  });
+
+  it("does not wedge on redelivery of the same uncanonicalizable event (anti-DoS)", async () => {
+    const event = chainedEvent(7, null);
+    const poisoned: CastleWallAuditEvent = {
+      ...event,
+      details: { ...event.details, poison: UNSAFE_INT },
+    };
+    // First delivery.
+    let firstAcked = false;
+    await expect(
+      consumer.ingestCritical({
+        event: poisoned,
+        ack: async () => {
+          firstAcked = true;
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(firstAcked).toBe(true);
+    // Daemon redelivers the identical poison event (it was never accepted, so
+    // the daemon's WAL cursor did not truly need to advance past it from the
+    // consumer's point of view, but a real daemon may still redeliver on a
+    // retry/restart). The consumer must handle it the SAME way every time -
+    // settled rejection, never a throw, never a wedge.
+    let secondAcked = false;
+    await expect(
+      consumer.ingestCritical({
+        event: poisoned,
+        ack: async () => {
+          secondAcked = true;
+        },
+      })
+    ).resolves.toBeUndefined();
+    expect(secondAcked).toBe(true);
+    expect(consumer.getStats().acceptedCriticalEvents).toBe(0);
+    expect(consumer.getStats().rejectedEvents).toBe(2);
+  });
+
+  it("a genuine event AFTER a settled uncanonicalizable rejection still chains and accepts normally (wall stays armed)", async () => {
+    const poisonedSeq5 = {
+      ...chainedEvent(5, null),
+      details: { seq: 5, prior_sha256_hex: null, poison: UNSAFE_INT },
+    } as CastleWallAuditEvent;
+    await consumer.ingestCritical({ event: poisonedSeq5, ack: async () => {} });
+    expect(consumer.getWalChainState().lastAckedSeq).toBeNull();
+
+    // A genuine bootstrap event (still no accepted anchor) must still be
+    // accepted normally - the poisoned event never became part of the chain.
+    const genuine = chainedEvent(5, null);
+    await consumer.ingestCritical({ event: genuine, ack: async () => {} });
+    expect(consumer.getStats().acceptedCriticalEvents).toBe(1);
+    expect(consumer.getWalChainState().lastAckedSeq).toBe(5);
+    expect(consumer.getWalChainState().lastEventCanonicalHash).toBe(eventHash(genuine));
+  });
 });
 
 describe("castle-wall/runtime/audit-consumer : ingestMetricBatch", () => {
