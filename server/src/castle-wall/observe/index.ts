@@ -26,12 +26,17 @@ export { flagExfilRisk, foldObservations, mergeCandidateObservations } from "./f
 
 export { flowEventsFromAuditEntries, flowEventFromAuditEntry } from "./adapter.js";
 
-export { refreshCandidatesFromAudit, candidateCurrentlyAllowed } from "./refresh.js";
+export {
+  refreshCandidatesFromAudit,
+  candidateCurrentlyAllowed,
+  inProcessRefreshLock,
+} from "./refresh.js";
 export type {
   RefreshAuditSource,
   RefreshCandidateStore,
   RefreshAllowlistRead,
   RefreshDeps,
+  RefreshLock,
   RefreshOutcome,
 } from "./refresh.js";
 

@@ -36,7 +36,7 @@
  * PR description).
  */
 
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -75,6 +75,7 @@ import {
   type ObserveGranularity,
   type PromoteSelectionRow,
   type RefreshAllowlistRead,
+  type RefreshLock,
   type VerifiedManifestRead,
 } from "../castle-wall/observe/index.js";
 
@@ -353,6 +354,7 @@ export async function runObserveCandidates(
         auditLog: boot.auditLog,
         store: boot.observeStore,
         readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
+        lock: observeRefreshFileLock(boot.fortressPath),
         now: new Date(),
       });
     } catch (error) {
@@ -364,6 +366,15 @@ export async function runObserveCandidates(
         err,
         `Error: could not refresh candidates -- the audit log failed verification (${(error as Error).message}). ` +
           "Nothing was changed. Run `sanctuary castle-wall audit-verify` to investigate.\n",
+      );
+      return 1;
+    }
+    if (outcome.status === "refresh_in_progress") {
+      write(
+        err,
+        "Error: another `observe candidates` refresh is already running for this fortress. " +
+          "Nothing was changed (a concurrent double-fold would inflate the Seen counts). " +
+          "Wait for it to finish and re-run; a crashed run's lock is broken automatically.\n",
       );
       return 1;
     }
@@ -417,6 +428,72 @@ export async function runObserveCandidates(
     "\nPromote with: sanctuary castle-wall observe promote --destination <host:port> [--destination ...] | --all\n",
   );
   return 0;
+}
+
+/** Lockfile basename for the cross-process refresh mutual exclusion (Codex gate BLOCKER; see castle-wall/observe/refresh.ts guarantee 2). Lives directly under the fortress root (mode 0700). */
+const OBSERVE_REFRESH_LOCK_FILE = ".observe-refresh.lock";
+
+/** True iff `pid` names a live process this user could signal (mirrors the audit write-lock's stale-holder detection in operational/audit-log.ts). */
+function isLockHolderAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user -- still alive.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Break a PROVABLY-stale refresh lock (dead recorded holder). An unreadable/unparseable lock is NEVER broken -- fail toward not folding, never toward folding concurrently. */
+async function breakStaleObserveRefreshLock(lockPath: string): Promise<boolean> {
+  try {
+    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown };
+    const pid = typeof parsed.pid === "number" ? parsed.pid : Number.NaN;
+    if (isLockHolderAlive(pid)) return false;
+    await rm(lockPath, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cross-process refresh lock: O_EXCL create with pid + stale-holder breaking,
+ * the same shape as the audit write lock (operational/audit-log.ts). Two
+ * concurrent `observe candidates` invocations are separate processes, so the
+ * in-process lock cannot cover them; whoever loses the race gets a clean
+ * "another refresh is in progress" abort instead of a double-folded count.
+ */
+export function observeRefreshFileLock(fortressPath: string): RefreshLock {
+  const lockPath = join(fortressPath, OBSERVE_REFRESH_LOCK_FILE);
+  return {
+    async acquire() {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const handle = await open(lockPath, "wx", 0o600);
+          try {
+            await handle.writeFile(
+              JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() }),
+            );
+            await handle.sync();
+          } finally {
+            await handle.close();
+          }
+          return async () => {
+            await rm(lockPath, { force: true });
+          };
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          if (attempt === 0 && (await breakStaleObserveRefreshLock(lockPath))) {
+            continue;
+          }
+          return null;
+        }
+      }
+      return null;
+    },
+  };
 }
 
 /**

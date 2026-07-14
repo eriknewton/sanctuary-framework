@@ -31,20 +31,29 @@ import { ObserveStore } from "../../../src/castle-wall/observe/store.js";
 import {
   refreshCandidatesFromAudit,
   candidateCurrentlyAllowed,
+  inProcessRefreshLock,
   type RefreshAllowlistRead,
+  type RefreshLock,
 } from "../../../src/castle-wall/observe/refresh.js";
-import { candidateKey, type CandidateObservation } from "../../../src/castle-wall/observe/types.js";
+import {
+  candidateKey,
+  type CandidateObservation,
+  type FoldWatermark,
+} from "../../../src/castle-wall/observe/types.js";
 
 interface Harness {
   auditLog: AuditLog;
   store: ObserveStore;
+  lock: RefreshLock;
+  masterKey: Uint8Array;
+  /** Replace the audit log with a brand-new chain on FRESH storage (simulates an audit-store reset/rebuild underneath a persisted observe store). */
+  resetAuditChain(): void;
 }
 
 function makeHarness(): Harness {
-  const storage = new MemoryStorage();
+  const stateStorage = new MemoryStorage();
   const masterKey = generateRandomKey();
-  const stateStore = new StateStore(storage, masterKey);
-  const auditLog = new AuditLog(storage, masterKey);
+  const stateStore = new StateStore(stateStorage, masterKey);
   const identityEncKey = derivePurposeKey(masterKey, "identity-encryption");
   const { storedIdentity } = createIdentity("operator", identityEncKey, "passphrase");
   const store = new ObserveStore(stateStore, {
@@ -52,7 +61,30 @@ function makeHarness(): Harness {
     encryptedPrivateKey: storedIdentity.encrypted_private_key,
     identityEncryptionKey: identityEncKey,
   });
-  return { auditLog, store };
+  const harness: Harness = {
+    auditLog: new AuditLog(new MemoryStorage(), masterKey),
+    store,
+    lock: inProcessRefreshLock(),
+    masterKey,
+    resetAuditChain() {
+      harness.auditLog = new AuditLog(new MemoryStorage(), masterKey);
+    },
+  };
+  return harness;
+}
+
+/** Append the audit marker `runObserveDiscard` / promote write onto the same chain (the recompute mint-bound; refresh.ts guarantee 3). */
+async function appendReviewMarker(
+  auditLog: AuditLog,
+  operation: "castle_wall_observe_discard" | "castle_wall_observe_promote",
+): Promise<void> {
+  await auditLog.appendCritical({
+    layer: "l1",
+    operation,
+    identity_id: "operator",
+    result: "success",
+    details: { discarded_count: 1 },
+  });
 }
 
 async function appendBlocked(
@@ -109,6 +141,7 @@ async function refresh(harness: Harness, rules: AllowlistRule[] = []) {
     auditLog: harness.auditLog,
     store: harness.store,
     readAllowlist: verifiedAllowlist(rules),
+    lock: harness.lock,
     now: new Date("2026-07-14T12:00:00.000Z"),
   });
 }
@@ -267,6 +300,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
       auditLog: harness.auditLog,
       store: harness.store,
       readAllowlist: async () => ({ status: "unverified", reason: "bad signature" }),
+      lock: harness.lock,
       now: new Date("2026-07-14T12:00:00.000Z"),
     });
     expect(outcome).toEqual({ status: "allowlist_unverified", reason: "bad signature" });
@@ -333,6 +367,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
     // A watermark from a previous audit-chain epoch, far past this chain.
     await harness.store.setFoldWatermark({
       folded_through_sequence: 999_999,
+      entry_hash: "a-hash-from-a-previous-chain-epoch",
       updated_at: "2026-07-01T00:00:00.000Z",
     });
 
@@ -357,13 +392,128 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
 });
 
 describe("watermark round-trip (store surface)", () => {
-  it("persists and re-reads the fold watermark; a malformed record reads as absent (recompute, never inflate)", async () => {
+  it("persists and re-reads the fold watermark; a malformed/hash-less record reads as absent (recompute, never inflate)", async () => {
     const harness = makeHarness();
     expect(await harness.store.getFoldWatermark()).toBeNull();
-    await harness.store.setFoldWatermark({ folded_through_sequence: 7, updated_at: "2026-07-14T12:00:00.000Z" });
-    expect(await harness.store.getFoldWatermark()).toEqual({
+    await harness.store.setFoldWatermark({
       folded_through_sequence: 7,
+      entry_hash: "abc123",
       updated_at: "2026-07-14T12:00:00.000Z",
     });
+    expect(await harness.store.getFoldWatermark()).toEqual({
+      folded_through_sequence: 7,
+      entry_hash: "abc123",
+      updated_at: "2026-07-14T12:00:00.000Z",
+    });
+
+    // A record missing the chain-identity hash (or otherwise malformed) is
+    // treated as absent: the refresh then recomputes with replace semantics
+    // rather than trusting a position it cannot bind to a chain.
+    await harness.store.setFoldWatermark({
+      folded_through_sequence: 9,
+      updated_at: "2026-07-14T12:00:00.000Z",
+    } as unknown as FoldWatermark);
+    expect(await harness.store.getFoldWatermark()).toBeNull();
+  });
+});
+
+describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
+  it("BLOCKER: a concurrent refresh is refused by the lock -- the suffix is folded exactly once, never twice", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    await appendBlocked(harness.auditLog);
+
+    const [first, second] = await Promise.all([refresh(harness), refresh(harness)]);
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual(["refresh_in_progress", "refreshed"]);
+    // The winning refresh folded the 2 events exactly once.
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
+
+    // And the lock is released: a later refresh runs normally.
+    const later = await refresh(harness);
+    expect(later.status).toBe("refreshed");
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
+  });
+
+  it("HIGH-1: a candidate discarded under the OLD engine (no watermark) is NOT resurrected by the migration recompute -- and a genuinely NEW denial re-mints it", async () => {
+    const harness = makeHarness();
+    // Old-engine history: two denials were folded into a candidate...
+    await appendBlocked(harness.auditLog);
+    await appendBlocked(harness.auditLog);
+    // ...which the operator then DISCARDED (runObserveDiscard removes the row
+    // and appends the discard audit marker onto the same chain). No watermark
+    // exists anywhere: this store predates the watermark engine.
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
+
+    const outcome = await refresh(harness);
+    expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
+    // The discarded candidate stays gone: the two events precede the chain's
+    // last review marker, so the recompute may not mint from them.
+    expect((await harness.store.listCandidates()).size).toBe(0);
+
+    // A genuinely NEW denial (after the review marker) re-mints at count 1.
+    await appendBlocked(harness.auditLog);
+    await refresh(harness);
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+  });
+
+  it("HIGH-1 counterpart: the migration recompute still HEALS a row that is present (not discarded), replacing its inflated count", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    await appendBlocked(harness.auditLog);
+    // A review action happened (say, a different destination was discarded),
+    // but THIS candidate is still present in the store with an old-engine
+    // inflated count. Present rows heal from full retained history.
+    await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
+    await harness.store.putCandidate({
+      agent_id: "agent-1",
+      agent_template: "claude-code",
+      host: "api.example.com",
+      ip: "203.0.113.5",
+      port: 443,
+      protocol: "tcp",
+      hostname_source: "sni",
+      times_seen: 6,
+      first_seen: "2026-07-14T09:00:00.000Z",
+      last_seen: "2026-07-14T09:00:01.000Z",
+      would_be_disposition: "denied",
+      exfil_risk: false,
+    });
+
+    const outcome = await refresh(harness);
+    expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
+  });
+
+  it("HIGH-2: a RESET audit chain that regrew PAST the old watermark is detected by the hash binding -- recompute, never a silent prefix skip", async () => {
+    const harness = makeHarness();
+    // Chain epoch 1: one denial, refreshed -> watermark at (seq 1, hash-of-epoch-1).
+    await appendBlocked(harness.auditLog);
+    await refresh(harness);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+    const watermark = await harness.store.getFoldWatermark();
+    expect(watermark).not.toBeNull();
+
+    // The audit store is reset/rebuilt and the NEW chain regrows past the old
+    // watermark's sequence before the next refresh.
+    harness.resetAuditChain();
+    await appendBlocked(harness.auditLog, { host: "reset-a.example.net", ip: "198.51.100.1" });
+    await appendBlocked(harness.auditLog, { host: "reset-b.example.net", ip: "198.51.100.2" });
+    await appendBlocked(harness.auditLog, { host: "reset-c.example.net", ip: "198.51.100.3" });
+
+    const outcome = await refresh(harness);
+    // A bare-sequence watermark would have called this "incremental" and
+    // folded only entries 2..3, permanently skipping the new chain's entry 1.
+    expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
+    const hosts = [...(await harness.store.listCandidates()).values()].map((c) => c.host).sort();
+    expect(hosts).toContain("reset-a.example.net");
+    expect(hosts).toContain("reset-b.example.net");
+    expect(hosts).toContain("reset-c.example.net");
+
+    // The watermark now binds to the NEW chain: the next refresh is a plain
+    // incremental no-op.
+    const again = await refresh(harness);
+    expect(again.status === "refreshed" && again.mode).toBe("incremental");
+    expect(again.status === "refreshed" && again.folded_events).toBe(0);
   });
 });

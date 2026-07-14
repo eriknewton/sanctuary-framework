@@ -95,7 +95,9 @@ export class ObserveStore {
     if (
       typeof parsed?.folded_through_sequence !== "number" ||
       !Number.isSafeInteger(parsed.folded_through_sequence) ||
-      parsed.folded_through_sequence < 0
+      parsed.folded_through_sequence < 0 ||
+      typeof parsed.entry_hash !== "string" ||
+      parsed.entry_hash.length === 0
     ) {
       // A malformed watermark is treated as absent: the refresh chokepoint
       // then RECOMPUTES with replace semantics, which converges to the true
