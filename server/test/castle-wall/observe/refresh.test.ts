@@ -289,8 +289,50 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   it("fail-closed toward KEEPING: a destination that cannot canonicalize is never treated as allowed", () => {
     const rules = [allowRule({ host: undefined, port: [443] })]; // port-only rule: matches any destination on 443
     expect(
-      candidateCurrentlyAllowed(rules, { host: "bad host with spaces", ip: "", port: 443, protocol: "tcp" }),
+      candidateCurrentlyAllowed(rules, {
+        agent_id: "agent-1",
+        agent_template: "claude-code",
+        host: "bad host with spaces",
+        ip: "",
+        port: 443,
+        protocol: "tcp",
+      }),
     ).toBe(false);
+  });
+
+  it("round-3 HIGH: suppression is SCOPE-AWARE -- a rule promoted for template A neither suppresses nor prunes template B's identical destination", async () => {
+    const harness = makeHarness();
+    // Template B (ops-runner) is denied reaching the same destination a
+    // claude-code-scoped rule allows. The daemon still denies ops-runner
+    // (RuleScope::applies_to), so its candidate must be minted and stay.
+    await appendBlocked(harness.auditLog, { template: "ops-runner" });
+    const outcome = await refresh(harness, [allowRule()]); // scope: template_ids ["claude-code"]
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
+    expect(outcome.status === "refreshed" && outcome.removed_now_allowed).toBe(0);
+    const row = await onlyCandidate(harness.store);
+    expect(row.agent_template).toBe("ops-runner");
+
+    // And it is not pruned on a later refresh either.
+    await refresh(harness, [allowRule()]);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("round-3 HIGH counterpart: an EMPTY scope (all wrapped agents) suppresses any template, matching the daemon's applies_to", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog, { template: "ops-runner" });
+    const allAgentsRule = { ...allowRule(), scope: {} };
+    const outcome = await refresh(harness, [allAgentsRule]);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("round-3 HIGH counterpart: an agent_ids scope suppresses exactly that instance", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog); // agent-1 / claude-code
+    const instanceRule = { ...allowRule(), scope: { agent_ids: ["agent-1"] } };
+    const outcome = await refresh(harness, [instanceRule]);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
+    expect((await harness.store.listCandidates()).size).toBe(0);
   });
 
   it("an unverifiable allowlist aborts the refresh with NOTHING folded, written, or pruned", async () => {

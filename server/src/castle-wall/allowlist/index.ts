@@ -23,6 +23,7 @@ export { verifyManifestSignature, verifyAndParseRules } from "./parse.js";
 export {
   canonicalizeConnectAuthority,
   ruleMatchesTarget,
+  ruleScopeCoversAgent,
   allowlistAllowsTarget,
   allowlistAllowsFlow,
   ConnectAuthorityError,

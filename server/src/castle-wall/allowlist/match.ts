@@ -24,7 +24,7 @@
 import net from "node:net";
 import { domainToASCII } from "node:url";
 
-import type { AllowlistRule, RuleProtocol } from "./schema.js";
+import type { AllowlistRule, RuleProtocol, RuleScope } from "./schema.js";
 import { ipMatches, cidrMatches } from "./ip-cidr.js";
 
 export interface CanonicalConnectAuthority {
@@ -176,11 +176,37 @@ export function allowlistAllowsTarget(rules: AllowlistRule[], target: CanonicalC
 }
 
 /**
+ * Does this rule's SCOPE apply to the given agent? Byte-for-byte parity with
+ * the enforcing Rust daemon's `RuleScope::applies_to`
+ * (castle-wall-daemon/src/policy.rs): an empty scope (no agent_ids and no
+ * template_ids) applies to every wrapped agent; otherwise the agent matches
+ * when EITHER its instance id is in agent_ids OR its template is in
+ * template_ids. (NOTE: the in-process CONNECT proxy's `ruleMatchesTarget`
+ * path deliberately does not evaluate scope -- the proxy has no per-flow
+ * agent attribution; the daemon does, and any consumer reasoning about "is
+ * this flow allowed for THIS agent" must use this check.)
+ */
+export function ruleScopeCoversAgent(
+  scope: RuleScope,
+  agent: { agent_id: string; agent_template: string },
+): boolean {
+  const scopedByAgent = (scope.agent_ids?.length ?? 0) > 0;
+  const scopedByTemplate = (scope.template_ids?.length ?? 0) > 0;
+  if (!scopedByAgent && !scopedByTemplate) return true;
+  if (scopedByAgent && scope.agent_ids!.includes(agent.agent_id)) return true;
+  if (scopedByTemplate && scope.template_ids!.includes(agent.agent_template)) return true;
+  return false;
+}
+
+/**
  * Protocol-generalized variant of `allowlistAllowsTarget` for consumers that
  * evaluate non-CONNECT flows (the observe engine's allowlist-aware fold folds
  * udp observations too). Identical destination/port semantics; the protocol
  * axis is checked against the OBSERVED flow's protocol instead of the CONNECT
- * proxy's hard-wired tcp.
+ * proxy's hard-wired tcp. Scope is NOT evaluated here -- callers that know
+ * the flow's agent must pre-filter with `ruleScopeCoversAgent` (the daemon
+ * enforces scope, so a destination-only match is NOT "allowed for this
+ * agent").
  */
 export function allowlistAllowsFlow(
   rules: AllowlistRule[],
