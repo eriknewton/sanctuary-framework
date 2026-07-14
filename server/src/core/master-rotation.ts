@@ -520,6 +520,17 @@ const TRANSPARENCY_FLOOR_MAC_DOMAIN = "sanctuary.transparency-counter-floor.v1\n
 
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
 const PRIMARY_IDENTITY_META_KEY = "primary_identity_id";
+// F2 BLOCKER-R2 (adversarial re-gate 2026-07-14): the writer-split
+// migration-established marker (byte-matches audit-log.ts's
+// AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY). Its presence proves the fortress ran
+// the F2 store-split migration, so master rotation MUST refuse (the split-
+// boundary MAC is keyed off the rotating master and is not re-stamped — see the
+// `_audit-daemon*` namespace recipes + the deriveAuditStoreSplitBoundaryMacKey
+// landmine comment). This `_meta` marker makes the refusal robust even if the
+// `_audit-daemon*` namespaces were deleted (the raw boundary-v1.json file is not
+// a `.enc` entry and is skipped by namespace enumeration, so it cannot carry the
+// refusal on its own).
+const AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY = "audit-store-split-established-v1";
 
 // Anti-rollback Stage 1 (duplicated from core/anti-rollback.ts; the
 // verify-before-write rule makes drift refuse, never corrupt). The witness is
@@ -1099,6 +1110,20 @@ async function convertPurposeNamespace(
 async function convertMeta(ctx: Ctx, verifyOnly: boolean): Promise<number> {
   let converted = 0;
   for (const key of await listKeys(ctx.storage, "_meta")) {
+    // F2 BLOCKER-R2: refuse BY NAME on a fortress that ran the writer-split
+    // migration. This covers the case where the `_audit-daemon*` namespaces were
+    // deleted (so their named recipes never fire) but the durable `_meta`
+    // established marker survives. The boundary MAC would silently regress F2 if
+    // rotated without re-stamping; do not rotate until that lands.
+    if (key === AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY) {
+      throw new RotationPreflightError(
+        `_meta/${key}: this fortress ran the F2 audit store writer-split ` +
+          "migration. Master rotation does not support it yet (the split-boundary " +
+          "MAC is keyed off the rotating master and is not re-stamped), so rotation " +
+          "is deliberately refused until daemon-audit re-wrap + boundary-MAC " +
+          "re-stamp land."
+      );
+    }
     const cls = classifyMetaKey(key);
     if (cls === null) {
       throw new RotationPreflightError(

@@ -333,6 +333,23 @@ const AUDIT_DAEMON_MIGRATION_MARKER_NAMESPACES = [
   "_audit-daemon_checkpoints",
   "_audit-daemon_meta",
 ] as const;
+// BLOCKER-R2 (adversarial re-gate 2026-07-14): a durable, MAC-authenticated
+// "the writer-split migration ran" marker in `_meta`, deliberately NOT
+// co-deletable with the daemon namespace set. The prior boundary-loss
+// fail-closed depended ONLY on the `_audit-daemon*` namespaces; deleting those
+// alongside the boundary restored the pre-fix absent-boundary TOFU path. This
+// marker lives beside the fortress's own custody records in `_meta`, so an
+// attacker who strips every daemon namespace + the boundary still leaves it
+// behind, and an absent boundary with this marker present fails closed
+// (`split_boundary_missing` + TOFU suppressed). MAC'd (same derived key as the
+// boundary, distinct domain) so it cannot be forged; deletion is the residual
+// the F1/F3 "single deletable file" note already documents (closing it fully
+// needs boot-anchored/externally-attested storage, out of scope).
+const AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY = "audit-store-split-established-v1";
+const AUDIT_STORE_SPLIT_ESTABLISHED_MARKER =
+  "__sanctuary_audit_store_split_established_v1";
+const AUDIT_STORE_SPLIT_ESTABLISHED_MAC_DOMAIN =
+  "sanctuary.audit-store-split-established.v1\n";
 
 // ── Master-rotation custody epochs (F7) ─────────────────────────────
 //
@@ -876,6 +893,15 @@ export interface AuditStoreSplitBoundary {
   /** Highest sequence number in the sealed legacy (pre-split) `_audit` chain.
    * 0 if the chain was empty at migration time. */
   sealed_tip_sequence: number;
+  /** BLOCKER-R1 (adversarial re-gate 2026-07-14): the LOWEST V2 `entry-*`
+   * sequence present in the sealed region at migration time (the pre-split
+   * rotation floor, or 1 if never rotated; 0 when the chain was empty). Recorded
+   * so a reader can detect deletion of the LOWEST sealed entry (the residual
+   * the first fix round documented but did not close). Without a known base, a
+   * deleted bottom entry leaves a still-contiguous-ending-at-tip run that reads
+   * as a legitimate rotation floor; with the base pinned, lowest-present must
+   * equal it. */
+  sealed_base_sequence: number;
   /** `entry_hash` of the sequence-`sealed_tip_sequence` entry, or
    * {@link AUDIT_CHAIN_GENESIS} if `sealed_tip_sequence` is 0. */
   sealed_tip_entry_hash: string;
@@ -932,6 +958,7 @@ function auditStoreSplitBoundaryMacBytes(
   macKey: Uint8Array,
   data: {
     sealed_tip_sequence: number;
+    sealed_base_sequence: number;
     sealed_tip_entry_hash: string;
     daemon_namespace: string;
     sealed_at: string;
@@ -963,17 +990,19 @@ export async function writeAuditStoreSplitBoundary(
   macKey: Uint8Array,
   boundary: {
     sealed_tip_sequence: number;
+    sealed_base_sequence: number;
     sealed_tip_entry_hash: string;
     daemon_namespace: string;
     sealed_at?: string;
   }
 ): Promise<void> {
   const sealedAt = boundary.sealed_at ?? new Date().toISOString();
-  // `data` holds the three structural fields; `sealed_at` lives at the envelope
-  // top level (as it always has) but is now folded into the MAC input below, so
-  // it is authenticated without being duplicated into the persisted `data`.
+  // `data` holds the structural fields; `sealed_at` lives at the envelope top
+  // level (as it always has) but is folded into the MAC input below, so it is
+  // authenticated without being duplicated into the persisted `data`.
   const data = {
     sealed_tip_sequence: boundary.sealed_tip_sequence,
+    sealed_base_sequence: boundary.sealed_base_sequence,
     sealed_tip_entry_hash: boundary.sealed_tip_entry_hash,
     daemon_namespace: boundary.daemon_namespace,
   };
@@ -1036,6 +1065,14 @@ export async function readAuditStoreSplitBoundary(
     typeof data.sealed_tip_sequence !== "number" ||
     !Number.isSafeInteger(data.sealed_tip_sequence) ||
     data.sealed_tip_sequence < 0 ||
+    typeof data.sealed_base_sequence !== "number" ||
+    !Number.isSafeInteger(data.sealed_base_sequence) ||
+    data.sealed_base_sequence < 0 ||
+    data.sealed_base_sequence > data.sealed_tip_sequence ||
+    // base is 0 iff the sealed chain was empty (tip 0); otherwise base >= 1.
+    (data.sealed_tip_sequence === 0
+      ? data.sealed_base_sequence !== 0
+      : data.sealed_base_sequence < 1) ||
     typeof data.sealed_tip_entry_hash !== "string" ||
     typeof data.daemon_namespace !== "string" ||
     data.daemon_namespace.length === 0 ||
@@ -1053,6 +1090,7 @@ export async function readAuditStoreSplitBoundary(
   }
   const expected = auditStoreSplitBoundaryMacBytes(macKey, {
     sealed_tip_sequence: data.sealed_tip_sequence,
+    sealed_base_sequence: data.sealed_base_sequence,
     sealed_tip_entry_hash: data.sealed_tip_entry_hash,
     daemon_namespace: data.daemon_namespace,
     sealed_at: sealedAt,
@@ -1064,11 +1102,90 @@ export async function readAuditStoreSplitBoundary(
     status: "valid",
     boundary: {
       sealed_tip_sequence: data.sealed_tip_sequence,
+      sealed_base_sequence: data.sealed_base_sequence,
       sealed_tip_entry_hash: data.sealed_tip_entry_hash,
       sealed_at: sealedAt,
       daemon_namespace: data.daemon_namespace,
     },
   };
+}
+
+// BLOCKER-R2: MAC over the (data-less) established marker. Domain-separated
+// from the boundary MAC but reuses the same derived key. Authenticates "a
+// party with the master key wrote this marker", so a planted fake cannot force
+// a spurious split_boundary_missing DoS.
+function auditStoreSplitEstablishedMacBytes(macKey: Uint8Array): Uint8Array {
+  return hmacSha256(
+    macKey,
+    stringToBytes(AUDIT_STORE_SPLIT_ESTABLISHED_MAC_DOMAIN)
+  );
+}
+
+/**
+ * BLOCKER-R2 (adversarial re-gate 2026-07-14): write the durable
+ * migration-established marker to `_meta` (via the normal StorageBackend, so it
+ * lands beside the fortress's custody records, NOT co-deletable with the
+ * `_audit-daemon*` namespaces). Written by `migrateFortressAuditStoreSplit`
+ * BEFORE the boundary commit, so a crash mid-migration still leaves the marker
+ * (a retry is idempotent). Its presence + an absent boundary = boundary was
+ * deleted (fail closed), regardless of whether the daemon namespaces survive.
+ */
+export async function writeAuditStoreSplitEstablishedMarker(
+  storage: StorageBackend,
+  macKey: Uint8Array
+): Promise<void> {
+  const envelope = {
+    [AUDIT_STORE_SPLIT_ESTABLISHED_MARKER]: true,
+    mac: toBase64url(auditStoreSplitEstablishedMacBytes(macKey)),
+  };
+  await storage.write(
+    "_meta",
+    AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY,
+    stringToBytes(JSON.stringify(envelope))
+  );
+}
+
+/**
+ * BLOCKER-R2: read + MAC-verify the migration-established marker.
+ *   - `present`: authentic marker → the writer-split migration ran on this
+ *     fortress. An absent boundary in this state is a deletion (fail closed).
+ *   - `absent` : no marker (never migrated) OR marker unreadable at this
+ *     privilege → do not assert migration; the caller's other evidence
+ *     (daemon namespaces) may still apply. A present-but-forged/marker-stripped
+ *     record also reads `absent` (its MAC does not authenticate), which is safe:
+ *     absence never fabricates a migration, it only fails to prove one.
+ */
+export async function readAuditStoreSplitEstablishedMarker(
+  storage: StorageBackend,
+  macKey: Uint8Array
+): Promise<"present" | "absent"> {
+  let raw: Uint8Array | null;
+  try {
+    raw = await storage.read("_meta", AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
+  } catch {
+    return "absent";
+  }
+  if (!raw) return "absent";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytesToString(raw));
+  } catch {
+    return "absent";
+  }
+  if (!isRecord(parsed) || parsed[AUDIT_STORE_SPLIT_ESTABLISHED_MARKER] !== true) {
+    return "absent";
+  }
+  const mac = parsed.mac;
+  if (typeof mac !== "string") return "absent";
+  let providedMac: Uint8Array;
+  try {
+    providedMac = fromBase64url(mac);
+  } catch {
+    return "absent";
+  }
+  return constantTimeEqual(providedMac, auditStoreSplitEstablishedMacBytes(macKey))
+    ? "present"
+    : "absent";
 }
 
 /** Parse the zero-padded sequence number embedded in a V2 `entry-*` storage
@@ -1724,6 +1841,18 @@ export class AuditLog {
    * it is safe cross-uid.
    */
   private async daemonMigrationMarkerExists(): Promise<boolean> {
+    // BLOCKER-R2 (adversarial re-gate): the durable `_meta` established marker
+    // is checked FIRST because it is NOT co-deletable with the daemon namespace
+    // set: an attacker who strips every `_audit-daemon*` namespace along with
+    // the boundary still leaves it behind, so boundary loss still fails closed.
+    if (
+      (await readAuditStoreSplitEstablishedMarker(
+        this.storage,
+        this.splitBoundaryMacKey
+      )) === "present"
+    ) {
+      return true;
+    }
     for (const ns of AUDIT_DAEMON_MIGRATION_MARKER_NAMESPACES) {
       try {
         if ((await this.storage.list(ns)).length > 0) return true;
@@ -1819,17 +1948,17 @@ export class AuditLog {
    * files), which the content-level chain walk cannot see because it never
    * reads those files.
    *
-   * Bounds (documented, not closed here): deletion of the LOWEST sealed entry
-   * shrinks the run but keeps it contiguous-and-ending-at-tip, so it reads as a
-   * legitimate pre-split rotation floor and is not flagged; this is the same
-   * "delete the bottom" residual class as the pre-existing rotation anchor, and
-   * the root `--verify-sealed` crypto walk is the stronger check. Pre-V2
-   * (null-sequence) legacy keys in the sealed region are not sequence-checkable
-   * here; they are covered by the root crypto verifier, not this listing check.
+   * BLOCKER-R1 (adversarial re-gate 2026-07-14): the run must ALSO start
+   * exactly at the MAC'd `sealed_base_sequence`, so deletion of the LOWEST
+   * sealed entry (which the first fix round left as a documented residual) is
+   * now caught here too, not just by the root crypto walk. Pre-V2 (null-seq)
+   * legacy keys below the V2 base are not sequence-checkable here; they are
+   * covered by the root crypto verifier, not this listing check.
    */
   private checkSealedPrefixCompleteness(
     storedEntriesRaw: readonly { key: string }[],
     sealedTipSequence: number,
+    sealedBaseSequence: number,
     findings: AuditIntegrityFinding[]
   ): void {
     if (sealedTipSequence <= 0) return; // nothing was sealed (empty at migration)
@@ -1840,6 +1969,7 @@ export class AuditLog {
     }
     sealedSeqs.sort((a, b) => a - b);
     const highest = sealedSeqs.length > 0 ? sealedSeqs[sealedSeqs.length - 1]! : 0;
+    const lowest = sealedSeqs.length > 0 ? sealedSeqs[0]! : 0;
     let contiguous = true;
     for (let i = 1; i < sealedSeqs.length; i++) {
       if (sealedSeqs[i]! !== sealedSeqs[i - 1]! + 1) {
@@ -1847,7 +1977,13 @@ export class AuditLog {
         break;
       }
     }
-    if (sealedSeqs.length === 0 || highest !== sealedTipSequence || !contiguous) {
+    const baseOk = sealedBaseSequence <= 0 || lowest === sealedBaseSequence;
+    if (
+      sealedSeqs.length === 0 ||
+      highest !== sealedTipSequence ||
+      !baseOk ||
+      !contiguous
+    ) {
       findings.push({
         kind: "sealed_prefix_incomplete",
         sequence: sealedTipSequence,
@@ -1858,7 +1994,9 @@ export class AuditLog {
             ? `the entire sealed legacy audit prefix (sequences <= ${sealedTipSequence}) is missing from disk (deletion or corruption)`
             : highest !== sealedTipSequence
               ? `the sealed legacy audit prefix's top entry (sequence ${sealedTipSequence}) is missing; highest surviving sealed sequence is ${highest} (truncation)`
-              : `the sealed legacy audit prefix has a gap below sequence ${sealedTipSequence} (a sealed entry was deleted)`,
+              : !baseOk
+                ? `the sealed legacy audit prefix's bottom entry (sequence ${sealedBaseSequence}) is missing; lowest surviving sealed sequence is ${lowest} (a sealed entry was deleted)`
+                : `the sealed legacy audit prefix has a gap below sequence ${sealedTipSequence} (a sealed entry was deleted)`,
       });
     }
   }
@@ -3185,6 +3323,7 @@ export class AuditLog {
         this.checkSealedPrefixCompleteness(
           storedEntriesRaw,
           effectiveSealedTip,
+          splitBoundary.boundary.sealed_base_sequence,
           findings
         );
       }

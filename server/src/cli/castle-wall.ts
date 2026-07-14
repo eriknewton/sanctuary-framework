@@ -27,6 +27,7 @@ import {
   AuditLog,
   AuditIntegrityError,
   type AuditEntry,
+  type AuditIntegrityFinding,
 } from "../operational/audit-log.js";
 import {
   AuditStoreSplitMigrationError,
@@ -34,6 +35,7 @@ import {
   migrateFortressAuditStoreSplit,
   probeDaemonChainAccess,
   verifyFortressAuditFullPicture,
+  verifySealedLegacyPrefix,
 } from "../operational/audit-store-split.js";
 import {
   DEFAULT_DENY_BUCKET,
@@ -605,16 +607,48 @@ export async function runAuditFindings(
     const masterKey = await resolveMasterKey(fortressPath, env);
     const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
     const findings = await auditLog.getIntegrityFindings();
+
+    // BLOCKER-R1 (adversarial re-gate 2026-07-14): the routine load SKIPS the
+    // sealed legacy region (that is the F2 fix), so `getIntegrityFindings()`
+    // above verified only the post-split SUFFIX plus the cheap sealed-region
+    // LISTING completeness check. It cannot, on its own, prove the sealed
+    // region's CONTENT is intact. So this diagnostic must NOT print "the chain
+    // verifies clean" unless the sealed region was actually crypto-walked and
+    // returned `verified` / `empty` / `not_present` (never migrated). Run that
+    // walk now and fold its verdict into the clean/unclean decision.
+    const sealed = await verifySealedLegacyPrefix(storage, masterKey);
     masterKey.fill(0);
 
-    if (findings.length === 0) {
-      write(out, "No audit integrity findings; the chain verifies clean.\n");
+    const sealedClean =
+      sealed.status === "verified" ||
+      sealed.status === "empty" ||
+      sealed.status === "not_present";
+
+    if (findings.length === 0 && sealedClean) {
+      write(
+        out,
+        sealed.status === "verified"
+          ? "No audit integrity findings; the chain verifies clean (including a crypto re-walk of the sealed legacy region).\n"
+          : "No audit integrity findings; the chain verifies clean.\n",
+      );
       return 0;
     }
 
+    // Not clean. Emit the routine findings AND an honest sealed-region verdict.
+    const sealedNote =
+      sealed.status === "unreadable"
+        ? "the sealed legacy region is NOT readable at this privilege and was NOT re-verified (re-run as root); this is NOT a clean result"
+        : sealed.status === "incomplete"
+          ? `the sealed legacy region is INCOMPLETE (expected tip sequence ${sealed.expected_tip}, highest present ${sealed.highest_present}); a sealed entry was deleted`
+          : sealed.status === "hash_mismatch"
+            ? `the sealed legacy region FAILED crypto re-verification at sequence ${sealed.sequence} (content tampered)`
+            : null;
+
     write(
       err,
-      `${findings.length} audit integrity finding(s) for fortress ${fortressIdFromStoragePath(fortressPath)}:\n`,
+      `${findings.length} audit integrity finding(s)` +
+        (sealedNote ? ` plus a sealed-region issue` : "") +
+        ` for fortress ${fortressIdFromStoragePath(fortressPath)}; the chain does NOT verify clean.\n`,
     );
     findings.forEach((finding, index) => {
       write(
@@ -630,6 +664,17 @@ export async function runAuditFindings(
         }) + "\n",
       );
     });
+    if (sealedNote) {
+      write(
+        out,
+        JSON.stringify({
+          kind: "sealed_region",
+          status: sealed.status,
+          message: sealedNote,
+        }) + "\n",
+      );
+      write(err, `sealed legacy region: ${sealedNote}.\n`);
+    }
     return 0;
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -2289,8 +2334,12 @@ export async function runApprove(
  * clean success).
  */
 type DaemonAuditView = {
-  status: "absent" | "included" | "unreadable";
+  // HIGH-R4 (adversarial re-gate 2026-07-14): `tampered` means the daemon chain
+  // is readable but FAILED integrity verification. Its entries must NOT be
+  // counted as verified coverage, and the caller must mark the run incomplete.
+  status: "absent" | "included" | "unreadable" | "tampered";
   entries: AuditEntry[];
+  findings: AuditIntegrityFinding[];
 };
 
 async function collectDaemonCastleWallEntries(
@@ -2299,18 +2348,31 @@ async function collectDaemonCastleWallEntries(
   queryOpts: { since?: string; layer: "l1"; limit: number },
 ): Promise<DaemonAuditView> {
   const access = await probeDaemonChainAccess(storage);
-  if (access === "absent") return { status: "absent", entries: [] };
-  if (access === "present_unreadable") return { status: "unreadable", entries: [] };
+  if (access === "absent") return { status: "absent", entries: [], findings: [] };
+  if (access === "present_unreadable") {
+    return { status: "unreadable", entries: [], findings: [] };
+  }
   try {
     const daemonLog = createDaemonAuditLog(storage, masterKey, {
       integrityMode: "lenient",
     });
     const q = await daemonLog.query(queryOpts);
-    return { status: "included", entries: q.entries };
+    // HIGH-R4: `query()` returns the daemon chain's integrity findings; a prior
+    // version DISCARDED them, so a readable-but-tampered daemon chain read as
+    // `complete: true` with no warning. Surface them: a chain with findings is
+    // `tampered`, and its entries are NOT counted as verified coverage.
+    if (q.integrity_findings.length > 0) {
+      return {
+        status: "tampered",
+        entries: q.entries,
+        findings: q.integrity_findings,
+      };
+    }
+    return { status: "included", entries: q.entries, findings: [] };
   } catch {
     // A read error mid-query (e.g. the dir became unreadable in a race) is
     // reported as unreadable, never silently dropped to "complete".
-    return { status: "unreadable", entries: [] };
+    return { status: "unreadable", entries: [], findings: [] };
   }
 }
 
@@ -2360,6 +2422,20 @@ export async function runAuditDump(
           "readable at this privilege; this dump is INCOMPLETE (daemon " +
           "enforcement events are omitted). Re-run as root for the full picture.\n",
       );
+    } else if (daemonView.status === "tampered") {
+      // HIGH-R4: the daemon chain is readable but FAILED integrity verification.
+      // Its records are still emitted (for forensic inspection) but MUST be
+      // flagged loudly so they are not trusted as verified evidence.
+      write(
+        err,
+        `WARNING: the root daemon audit store (_audit-daemon) has ` +
+          `${daemonView.findings.length} integrity finding(s); its records below ` +
+          `are TAMPERED / not trustworthy. Do NOT treat them as verified ` +
+          `enforcement evidence.\n`,
+      );
+      for (const f of daemonView.findings.slice(0, 20)) {
+        write(err, `  daemon finding: ${f.kind} - ${f.message}\n`);
+      }
     }
     // Merge for per-rule attribution (both chains' recorded flows).
     const mergedEntries = [...operatorEntries, ...daemonEntries];
@@ -2609,8 +2685,15 @@ export async function runAuditVerify(
       masterKey,
       queryOpts,
     );
-    const daemonEvidence = daemonView.entries.filter(isEvidence);
-    const daemonIncomplete = daemonView.status === "unreadable";
+    // HIGH-R4: a `tampered` daemon chain (readable but with integrity findings)
+    // is INCOMPLETE coverage too (its evidence is NOT trustworthy), so it is NOT
+    // merged into the verified tally and the run is marked incomplete.
+    const daemonTampered = daemonView.status === "tampered";
+    const daemonEvidence = daemonTampered
+      ? []
+      : daemonView.entries.filter(isEvidence);
+    const daemonIncomplete =
+      daemonView.status === "unreadable" || daemonTampered;
     const evidenceEntries = [...operatorEvidence, ...daemonEvidence];
 
     const tally: AuditVerifyTally = {
@@ -2693,12 +2776,16 @@ export async function runAuditVerify(
             pinnedProducerKeyB64url !== null
               ? "per_producer_reverified"
               : "channel_authenticated_only",
-          // F2 HIGH-1: honesty about chain coverage. `complete: false` means a
-          // daemon chain exists but was unreadable, so this tally OMITS the
-          // live daemon enforcement evidence and a green here is NOT a full
-          // success claim.
+          // F2 HIGH-1/HIGH-R4: honesty about chain coverage. `complete: false`
+          // means a daemon chain exists but was unreadable OR tampered, so this
+          // tally OMITS the live daemon enforcement evidence and a green here is
+          // NOT a full success claim. `daemon_chain: "tampered"` additionally
+          // surfaces the daemon chain's integrity findings.
           daemon_chain: daemonView.status,
           complete: !daemonIncomplete,
+          ...(daemonView.status === "tampered"
+            ? { daemon_integrity_findings: daemonView.findings }
+            : {}),
           enforcement_entries: evidenceEntries.length,
           verified: tally.verified,
           rejected: tally.rejected,
@@ -2734,6 +2821,18 @@ export async function runAuditVerify(
         out,
         "Chain coverage: operator + root daemon (_audit-daemon) chains both included.\n",
       );
+    } else if (daemonView.status === "tampered") {
+      // HIGH-R4: readable but failed integrity verification.
+      write(
+        err,
+        `WARNING: the root daemon audit store (_audit-daemon) has ` +
+          `${daemonView.findings.length} integrity finding(s); its enforcement ` +
+          `evidence is NOT trustworthy and is EXCLUDED from this tally. This verify ` +
+          `is INCOMPLETE: a green here is NOT a full success claim.\n`,
+      );
+      for (const f of daemonView.findings.slice(0, 20)) {
+        write(err, `  daemon finding: ${f.kind} - ${f.message}\n`);
+      }
     } else if (daemonIncomplete) {
       write(
         err,

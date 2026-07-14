@@ -254,6 +254,7 @@ describe("F2 Option A: fortress audit store split", () => {
       );
       await writeAuditStoreSplitBoundary(statePath, wrongKey, {
         sealed_tip_sequence: 0,
+        sealed_base_sequence: 0,
         sealed_tip_entry_hash: "GENESIS",
         daemon_namespace: AUDIT_DAEMON_NAMESPACE,
       });
@@ -507,6 +508,85 @@ describe("F2 Option A: fortress audit store split", () => {
       } finally {
         for (const f of files) await chmod(join(auditDir, f), 0o600).catch(() => undefined);
       }
+    });
+
+    // BLOCKER-R1: deleting the LOWEST sealed entry (sequence == base) was the
+    // first-round residual; the MAC'd sealed_base_sequence now catches it.
+    it("BLOCKER-R1: incomplete when the LOWEST sealed entry is deleted (base residual closed)", async () => {
+      const { statePath, storage, masterKey } = await migratedFortress(4);
+      const auditDir = join(statePath, "_audit");
+      const files = (await readdir(auditDir)).filter((f) => f.startsWith("entry-")).sort();
+      await unlink(join(auditDir, files[0]!)); // delete the bottom (seq 1)
+      const verdict = await verifySealedLegacyPrefix(storage, masterKey);
+      expect(verdict.status).toBe("incomplete");
+    });
+
+    it("BLOCKER-R1: the migrated boundary records sealed_base_sequence = 1 for a genesis-based chain", async () => {
+      const { storage, masterKey } = await migratedFortress(4);
+      const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
+      const statePath = storage.namespacePath("_audit").replace(/\/_audit$/, "");
+      const boundary = await readAuditStoreSplitBoundary(statePath, macKey);
+      expect(boundary.status).toBe("valid");
+      if (boundary.status === "valid") {
+        expect(boundary.boundary.sealed_base_sequence).toBe(1);
+        expect(boundary.boundary.sealed_tip_sequence).toBe(4);
+      }
+    });
+  });
+
+  describe("BLOCKER-R2: boundary-loss fail-closed does not depend on the daemon namespace set", () => {
+    async function migratedWithSuffix(operatorEntries: number, suffixEntries: number) {
+      const f = await makeFortress();
+      const op = new AuditLog(f.storage, f.masterKey);
+      for (let i = 0; i < operatorEntries; i++) {
+        await op.appendCritical({ layer: "l1", operation: `op-${i}`, identity_id: "id", result: "success" });
+      }
+      await op.flush();
+      await migrateFortressAuditStoreSplit({ storage: f.storage, masterKey: f.masterKey });
+      // Post-split operator suffix (writes a head anchor for the suffix).
+      const suffix = new AuditLog(f.storage, f.masterKey);
+      for (let i = 0; i < suffixEntries; i++) {
+        await suffix.appendCritical({ layer: "l1", operation: `post-${i}`, identity_id: "id", result: "success" });
+      }
+      await suffix.flush();
+      return f;
+    }
+
+    it("REQUIRED REPRO: delete _audit_migration + ALL _audit-daemon* namespaces + the sealed prefix -> split_boundary_missing and NO rotation anchor written", async () => {
+      const { root, statePath, storage, masterKey } = await migratedWithSuffix(2, 2);
+
+      // The attack: strip every co-deletable migration marker + the boundary +
+      // the sealed prefix, leaving a contiguous above-genesis suffix.
+      await rm(join(statePath, "_audit_migration"), { recursive: true, force: true });
+      for (const ns of ["_audit-daemon", "_audit-daemon_checkpoints", "_audit-daemon_meta"]) {
+        await rm(join(statePath, ns), { recursive: true, force: true });
+      }
+      const auditDir = join(statePath, "_audit");
+      for (const fn of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
+        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0");
+        if (seq >= 1 && seq <= 2) await unlink(join(auditDir, fn)); // the sealed prefix
+      }
+
+      const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+      const findings = await reader.getIntegrityFindings();
+      // The durable `_meta` established marker (NOT co-deletable with the daemon
+      // namespaces) makes this fail closed.
+      expect(findings.some((x) => x.kind === "split_boundary_missing")).toBe(true);
+      // No fresh rotation anchor was written to bless the truncated suffix.
+      const anchor = await storage.read("_audit_checkpoints", "__rotation_anchor");
+      expect(anchor).toBeNull();
+      void root;
+    });
+
+    it("the durable _meta established marker survives daemon-namespace deletion (the whole point)", async () => {
+      const { statePath, storage, masterKey } = await migratedWithSuffix(1, 1);
+      for (const ns of ["_audit-daemon", "_audit-daemon_checkpoints", "_audit-daemon_meta"]) {
+        await rm(join(statePath, ns), { recursive: true, force: true });
+      }
+      await rm(join(statePath, "_audit_migration"), { recursive: true, force: true });
+      // The established marker in `_meta` is still present.
+      expect(await storage.exists("_meta", "audit-store-split-established-v1")).toBe(true);
+      void masterKey;
     });
   });
 });

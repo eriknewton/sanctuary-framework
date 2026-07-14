@@ -33,6 +33,7 @@ import {
   readAuditStoreSplitBoundary,
   deriveAuditStoreSplitBoundaryMacKey,
 } from "../../src/operational/audit-log.js";
+import { verifySealedLegacyPrefix } from "../../src/operational/audit-store-split.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
@@ -97,6 +98,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     await writeAuditStoreSplitBoundary(statePath, macKey, {
       sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: head.sequence === 0 ? 0 : 1,
       sealed_tip_entry_hash: head.entry_hash,
       daemon_namespace: "_audit-daemon",
     });
@@ -132,6 +134,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     await writeAuditStoreSplitBoundary(statePath, macKey, {
       sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: head.sequence === 0 ? 0 : 1,
       sealed_tip_entry_hash: head.entry_hash,
       daemon_namespace: "_audit-daemon",
     });
@@ -162,6 +165,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     await writeAuditStoreSplitBoundary(statePath, macKey, {
       sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: head.sequence === 0 ? 0 : 1,
       sealed_tip_entry_hash: head.entry_hash,
       daemon_namespace: "_audit-daemon",
     });
@@ -219,6 +223,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
       const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
       await writeAuditStoreSplitBoundary(statePath, macKey, {
         sealed_tip_sequence: head.sequence,
+        sealed_base_sequence: head.sequence === 0 ? 0 : 1,
         sealed_tip_entry_hash: head.entry_hash,
         daemon_namespace: "_audit-daemon",
       });
@@ -252,6 +257,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     await writeAuditStoreSplitBoundary(statePath, macKey, {
       sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: head.sequence === 0 ? 0 : 1,
       sealed_tip_entry_hash: head.entry_hash,
       daemon_namespace: "_audit-daemon",
     });
@@ -278,6 +284,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const wrongKey = deriveAuditStoreSplitBoundaryMacKey(generateRandomKey());
     await writeAuditStoreSplitBoundary(statePath, wrongKey, {
       sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: head.sequence === 0 ? 0 : 1,
       sealed_tip_entry_hash: head.entry_hash,
       daemon_namespace: "_audit-daemon",
     });
@@ -329,6 +336,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     await writeAuditStoreSplitBoundary(statePath, macKey, {
       sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: head.sequence === 0 ? 0 : 1,
       sealed_tip_entry_hash: head.entry_hash,
       daemon_namespace: "_audit-daemon",
     });
@@ -367,7 +375,16 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     expect(anchor).toBeNull();
   });
 
-  it("consultSplitBoundary: false is the actual filter gate (reads sealed content the default instance skips)", async () => {
+  // BLOCKER-R1 (adversarial re-gate 2026-07-14): the former version of this test
+  // asserted the default instance stays clean on in-place sealed-content tamper
+  // and STOPPED THERE, which encoded the false-safe the gate flagged. The
+  // routine-load SKIP is intended (it must not read unreadable root-owned
+  // entries), BUT that skip MUST be backed by a shipped detector. This test now
+  // proves both halves: the routine load skips (by design), AND the shipped
+  // crypto verifier `verifySealedLegacyPrefix` DETECTS the in-place tamper. The
+  // CLI-level guarantee (audit-findings does not print "verifies clean") is in
+  // test/cli/castle-wall-audit-regate-repros.test.ts.
+  it("BLOCKER-R1: in-place sealed-content tamper is SKIPPED by the routine load but CAUGHT by the shipped crypto verifier", async () => {
     const { statePath, masterKey } = await makeFortress();
     const storage = new FilesystemStorage(statePath);
     const legacy = new AuditLog(storage, masterKey);
@@ -377,6 +394,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     await writeAuditStoreSplitBoundary(statePath, macKey, {
       sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: head.sequence === 0 ? 0 : 1,
       sealed_tip_entry_hash: head.entry_hash,
       daemon_namespace: "_audit-daemon",
     });
@@ -387,23 +405,28 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const files = (await readdir(auditDir)).filter((f) => f.startsWith("entry-")).sort();
     const target = join(auditDir, files[0]!);
     const raw = JSON.parse(await readFile(target, "utf-8"));
-    raw.entry_hash = "0".repeat(64);
+    raw.encrypted_payload_bytes = raw.encrypted_payload_bytes + "AAAA";
     await writeFile(target, JSON.stringify(raw));
 
-    // Default (consults the boundary): SKIPS the sealed content, so the routine
-    // load stays clean (the in-place tamper is caught by the crypto verifier /
-    // audit-store-status, not the routine load — documented M-2 behavior).
+    // (1) Routine load consults the boundary and SKIPS the sealed content, so
+    // getIntegrityFindings() stays [] (this keeps strict-mode ensureLoaded from
+    // throwing on every migrated fortress — the F2 fix). This is intended, but
+    // is NOT the whole story:
     const sealed = new AuditLog(storage, masterKey);
     await expect(sealed.getIntegrityFindings()).resolves.toEqual([]);
 
-    // consultSplitBoundary: false: reads the sealed content and DOES see the
-    // corruption, proving the flag is the actual filter gate, not a no-op.
+    // (2) THE INVERSION: the shipped crypto verifier reads the sealed content
+    // and DETECTS the tamper. So the tamper is never actually undetected.
+    const verdict = await verifySealedLegacyPrefix(storage, masterKey);
+    expect(verdict.status).toBe("hash_mismatch");
+
+    // (3) consultSplitBoundary: false also reads the content (proving the flag
+    // is the real filter gate, not a no-op).
     const unsealed = new AuditLog(storage, masterKey, {
       integrityMode: "lenient",
       consultSplitBoundary: false,
     });
-    const findings = await unsealed.getIntegrityFindings();
-    expect(findings.length).toBeGreaterThan(0);
+    expect((await unsealed.getIntegrityFindings()).length).toBeGreaterThan(0);
   });
 
   it("present-but-unreadable boundary file (permission-denied at this privilege) degrades to absent, never throws", async () => {
@@ -416,6 +439,7 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
     const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     await writeAuditStoreSplitBoundary(statePath, macKey, {
       sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: head.sequence === 0 ? 0 : 1,
       sealed_tip_entry_hash: head.entry_hash,
       daemon_namespace: "_audit-daemon",
     });

@@ -17,7 +17,10 @@ import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
 import { checkNodeVersion } from "./node-version.js";
-import { exportAuditChain } from "./audit-chain-export.js";
+import {
+  exportAuditChain,
+  fortressRanAuditStoreSplitMigration,
+} from "./audit-chain-export.js";
 import {
   verifyAuditChainRecords,
   type ExportRecord,
@@ -253,6 +256,22 @@ async function checkPolicy(storagePath: string): Promise<DoctorCheck> {
 
 async function checkAuditChain(storagePath: string): Promise<DoctorCheck> {
   const storage = new FilesystemStorage(join(storagePath, "state"));
+  // F2 HIGH-R3 (adversarial re-gate 2026-07-14): this check verifies ONLY the
+  // operator `_audit` chain. After the writer-split, the root daemon's
+  // enforcement evidence lives in `_audit-daemon`, so a plain "N entries
+  // verified" here would be a FALSE GREEN over an incomplete chain (and if the
+  // daemon namespace was deleted, it hides evidence destruction entirely). When
+  // the migration ran, refuse to report OK from this single-chain check and
+  // point the operator at the chain-aware verifier.
+  if (await fortressRanAuditStoreSplitMigration(storage)) {
+    return warn(
+      "audit chain",
+      "this fortress ran the F2 audit store writer-split; this single-chain " +
+        "check covers only the operator _audit chain and is NOT a full verdict",
+      "run 'sanctuary castle-wall audit-store-status' (as root for a full " +
+        "sealed-region + daemon-chain verify)",
+    );
+  }
   const entryMetas = await storage.list("_audit");
   if (entryMetas.length === 0) {
     return fail("audit chain", "no audit entries found", "start Sanctuary and perform an audited operation");

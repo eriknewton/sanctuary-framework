@@ -30,6 +30,14 @@ export const AUDIT_EXPORT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 // literals byte-match `operational/audit-store-split.ts`; duplicated here
 // because this raw exporter deliberately avoids server-runtime imports.
 export const AUDIT_EXPORT_DAEMON_NAMESPACE = "_audit-daemon";
+// F2 HIGH-R3 (adversarial re-gate 2026-07-14): the durable `_meta`
+// migration-established marker (byte-matches audit-log.ts). Its presence proves
+// the writer-split migration ran, so an `_audit`-only export is INCOMPLETE even
+// if the `_audit-daemon` directory itself was deleted/renamed. Unauthenticated
+// presence is sufficient here (this raw exporter has no master key): erring
+// toward "present" only over-requires --operator-only, which is fail-closed.
+export const AUDIT_EXPORT_SPLIT_ESTABLISHED_META_KEY =
+  "audit-store-split-established-v1";
 
 /** Record types in a JSONL export file. */
 export type ExportRecord =
@@ -205,19 +213,41 @@ export function parseExportArgs(argv: string[], env?: NodeJS.ProcessEnv): Export
 }
 
 /**
- * F2 HIGH-1: return true iff the fortress has a root daemon audit chain
- * (`_audit-daemon` holds at least one entry, OR the directory exists but is
- * unreadable at this privilege). Fail closed: any listing error is treated as
- * "present" so an operator-only export never silently hides a daemon chain.
+ * F2 HIGH-1 + HIGH-R3: return true iff the fortress ran the writer-split
+ * migration, so an `_audit`-only export is INCOMPLETE. True when the
+ * `_audit-daemon` namespace holds an entry, OR its directory exists but is
+ * unreadable, OR (HIGH-R3) the durable `_meta` migration-established marker is
+ * present even though the daemon directory was deleted/renamed. Fail closed: any
+ * listing error is treated as "present" so an operator-only export never
+ * silently hides a daemon chain.
  */
+/** HIGH-R3: public boundary/migration-aware presence probe, reused by `doctor`
+ * so its single-chain audit check refuses to report OK on a migrated fortress.
+ * Unauthenticated (no master key): fail-closed toward "present". */
+export async function fortressRanAuditStoreSplitMigration(
+  storage: StorageBackend
+): Promise<boolean> {
+  return daemonAuditChainPresent(storage);
+}
+
 async function daemonAuditChainPresent(
   storage: StorageBackend
 ): Promise<boolean> {
   try {
-    return (await storage.list(AUDIT_EXPORT_DAEMON_NAMESPACE)).length > 0;
+    if ((await storage.list(AUDIT_EXPORT_DAEMON_NAMESPACE)).length > 0) return true;
   } catch {
     return true;
   }
+  // HIGH-R3: the daemon namespace can be deleted; the `_meta` established marker
+  // is not co-deletable with it and still proves the export would be incomplete.
+  try {
+    if (await storage.exists("_meta", AUDIT_EXPORT_SPLIT_ESTABLISHED_META_KEY)) {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
 }
 
 export async function runExport(args: ExportArgs): Promise<void> {

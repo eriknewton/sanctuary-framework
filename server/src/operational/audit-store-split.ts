@@ -47,6 +47,8 @@ import {
   auditStoreSplitBoundaryPath,
   writeAuditStoreSplitBoundary,
   readAuditStoreSplitBoundary,
+  writeAuditStoreSplitEstablishedMarker,
+  readAuditStoreSplitEstablishedMarker,
   type AuditLogConfig,
   type AuditIntegrityFinding,
   type AuditStoreSplitBoundary,
@@ -276,6 +278,10 @@ export async function migrateFortressAuditStoreSplit(opts: {
 
   const existing = await readAuditStoreSplitBoundary(statePath, macKey);
   if (existing.status === "valid") {
+    // BLOCKER-R2: idempotently ensure the durable established marker exists even
+    // for a fortress migrated before this marker was introduced (backfill on the
+    // next daemon startup). Harmless when already present (same MAC'd record).
+    await writeAuditStoreSplitEstablishedMarker(storage, macKey);
     return { status: "already-migrated", boundary: existing.boundary };
   }
   if (existing.status === "invalid") {
@@ -313,6 +319,21 @@ export async function migrateFortressAuditStoreSplit(opts: {
     );
   }
   const head = await probe.getChainHead();
+  // BLOCKER-R1: the LOWEST surviving V2 sequence in `_audit` at migration time
+  // (the pre-split rotation floor, or 1 if never rotated; 0 for an empty chain).
+  // Recorded in the boundary so the routine listing check + the root crypto walk
+  // can detect deletion of the bottom sealed entry. Computed as root here, so it
+  // sees every entry regardless of owner.
+  const sealedBase = head.sequence === 0
+    ? 0
+    : await lowestV2SequenceInAuditNamespace(storage);
+  if (head.sequence > 0 && (sealedBase < 1 || sealedBase > head.sequence)) {
+    throw new AuditStoreSplitMigrationError(
+      `refusing to seal: could not determine a valid sealed base sequence ` +
+        `(computed ${sealedBase} for tip ${head.sequence}); the "_audit" chain ` +
+        `may be malformed. Investigate before retrying.`
+    );
+  }
 
   // Step 2: daemon genesis marker entry (durable, idempotent).
   const daemonAuditLog = createDaemonAuditLog(storage, masterKey);
@@ -347,10 +368,21 @@ export async function migrateFortressAuditStoreSplit(opts: {
   // docstring above for why re-verifying its content is unnecessary (nothing
   // else can have written to this namespace before the boundary exists).
 
+  // Step 2b (BLOCKER-R2): write the durable, MAC-authenticated
+  // migration-established marker to `_meta` BEFORE the boundary commit. It is
+  // NOT co-deletable with the daemon namespaces, so a later boundary deletion
+  // (even one that also strips every `_audit-daemon*` namespace) still fails
+  // closed (`split_boundary_missing`). Idempotent: a retry re-writes the same
+  // MAC'd record. A crash after this but before step 3 leaves the marker with
+  // no boundary, which the operator load correctly treats as boundary-missing
+  // (fail closed); the retry then completes the boundary.
+  await writeAuditStoreSplitEstablishedMarker(storage, macKey);
+
   // Step 3: commit. From this point on, the operator's OWN AuditLog seals
   // the legacy chain and continues from (head.sequence + 1, head.entry_hash).
   await writeAuditStoreSplitBoundary(statePath, macKey, {
     sealed_tip_sequence: head.sequence,
+    sealed_base_sequence: sealedBase,
     sealed_tip_entry_hash: head.entry_hash,
     daemon_namespace: AUDIT_DAEMON_NAMESPACE,
   });
@@ -370,6 +402,23 @@ export async function migrateFortressAuditStoreSplit(opts: {
 function dirnameOf(path: string): string {
   const idx = path.lastIndexOf("/");
   return idx <= 0 ? path : path.slice(0, idx);
+}
+
+/** BLOCKER-R1: the lowest V2 `entry-*` sequence present in `_audit` (the sealed
+ * region's base at migration time). Returns 0 when no V2 entry is present.
+ * Metadata-only (`list`), no read/decrypt. */
+async function lowestV2SequenceInAuditNamespace(
+  storage: FilesystemStorage
+): Promise<number> {
+  let lowest = 0;
+  for (const meta of await storage.list("_audit", "entry-")) {
+    const m = /^entry-(\d{20})-/.exec(meta.key);
+    if (!m) continue;
+    const seq = Number(m[1]);
+    if (!Number.isSafeInteger(seq) || seq < 1) continue;
+    if (lowest === 0 || seq < lowest) lowest = seq;
+  }
+  return lowest;
 }
 
 /**
@@ -416,6 +465,11 @@ export interface AuditChainReport {
     | "verified_suffix_only"
     | "findings"
     | "absent"
+    // HIGH-R3 (adversarial re-gate 2026-07-14): a VALID boundary proves the
+    // migration ran and names the daemon chain, so an absent/renamed daemon
+    // directory is a DELETION, not "never provisioned". Reported as `missing`
+    // (fail closed), never `absent`.
+    | "missing"
     | "present_unreadable"
     | "key_unavailable";
   finding_count?: number;
@@ -496,6 +550,7 @@ export async function verifySealedLegacyPrefix(
   const boundary = await readAuditStoreSplitBoundary(statePath, macKey);
   if (boundary.status !== "valid") return { status: "not_present" };
   const tip = boundary.boundary.sealed_tip_sequence;
+  const base = boundary.boundary.sealed_base_sequence;
   if (tip <= 0) return { status: "empty" };
 
   let metas: StorageEntryMeta[];
@@ -553,8 +608,17 @@ export async function verifySealedLegacyPrefix(
 
   const presentSeqs = [...bySeq.keys()].sort((a, b) => a - b);
   const highest = presentSeqs.length > 0 ? presentSeqs[presentSeqs.length - 1]! : 0;
-  // Completeness: a gap-free run ending exactly at the tip.
-  if (presentSeqs.length === 0 || highest !== tip) {
+  const lowest = presentSeqs.length > 0 ? presentSeqs[0]! : 0;
+  // Completeness: a gap-free run from the MAC'd base to the MAC'd tip.
+  // BLOCKER-R1: checking `lowest === base` closes the lowest-entry-deletion
+  // residual (a deleted bottom entry otherwise reads as a legitimate rotation
+  // floor). base <= 0 means the boundary predates this field (defensive; the
+  // current writer always records it), so only the tip is checked.
+  if (
+    presentSeqs.length === 0 ||
+    highest !== tip ||
+    (base > 0 && lowest !== base)
+  ) {
     return { status: "incomplete", expected_tip: tip, highest_present: highest };
   }
   for (let i = 1; i < presentSeqs.length; i++) {
@@ -726,14 +790,44 @@ export async function verifyFortressAuditFullPicture(opts: {
     }
   }
 
+  // HIGH-R3: a valid boundary proves the migration ran and names the daemon
+  // chain, so an absent daemon directory afterward is a deletion (fail closed),
+  // not "never provisioned". Resolve boundary validity once for the daemon
+  // verdict below.
+  const boundaryForDaemon = masterKey
+    ? await readAuditStoreSplitBoundary(
+        dirnameOf(storage.namespacePath("_audit")),
+        deriveAuditStoreSplitBoundaryMacKey(masterKey)
+      )
+    : { status: "absent" as const };
+  const migrationEstablished =
+    boundaryForDaemon.status === "valid" ||
+    (masterKey
+      ? (await readAuditStoreSplitEstablishedMarker(
+          storage,
+          deriveAuditStoreSplitBoundaryMacKey(masterKey)
+        )) === "present"
+      : false);
+
   let daemon: AuditChainReport;
   const access = await probeDaemonChainAccess(storage);
   if (access === "absent") {
-    daemon = {
-      chain: "daemon",
-      status: "absent",
-      note: "no root daemon audit store has ever been provisioned on this fortress",
-    };
+    daemon = migrationEstablished
+      ? {
+          chain: "daemon",
+          status: "missing",
+          finding_count: 1,
+          note:
+            "the writer-split migration ran (a valid boundary / established " +
+            "marker is present) and names a root daemon audit chain, but its " +
+            "namespace is ABSENT (deleted or renamed). This is evidence " +
+            "destruction, NOT a never-provisioned fortress.",
+        }
+      : {
+          chain: "daemon",
+          status: "absent",
+          note: "no root daemon audit store has ever been provisioned on this fortress",
+        };
   } else if (access === "present_unreadable") {
     daemon = {
       chain: "daemon",

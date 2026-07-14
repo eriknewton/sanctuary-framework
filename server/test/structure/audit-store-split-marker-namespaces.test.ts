@@ -45,4 +45,22 @@ describe("F2 audit-store-split marker namespaces stay in lockstep", () => {
     const src = readFileSync(join(SRC, "cli", "audit-chain-export.ts"), "utf8");
     expect(src).toContain(`AUDIT_EXPORT_DAEMON_NAMESPACE = "${AUDIT_DAEMON_NAMESPACE}"`);
   });
+
+  // BLOCKER-R2: the `_meta` migration-established marker key is ALSO duplicated
+  // across audit-log.ts (write/read), master-rotation.ts (refusal), and
+  // audit-chain-export.ts (presence probe). It cannot drift, or the boundary-loss
+  // fail-closed / rotation refusal / export refusal silently break.
+  it("the F2 _meta established-marker key literal is in lockstep across all four files", () => {
+    const KEY = "audit-store-split-established-v1";
+    for (const rel of [
+      ["operational", "audit-log.ts"],
+      ["core", "master-rotation.ts"],
+      ["cli", "audit-chain-export.ts"],
+    ] as const) {
+      const src = readFileSync(join(SRC, ...rel), "utf8");
+      expect(src, `${rel.join("/")} must reference the established-marker key`).toContain(
+        `"${KEY}"`,
+      );
+    }
+  });
 });

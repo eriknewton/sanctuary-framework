@@ -558,6 +558,33 @@ describe("master rotation — fail-closed coverage", () => {
     }
   });
 
+  // F2 BLOCKER-R2 (adversarial re-gate 2026-07-14): the durable `_meta`
+  // migration-established marker makes the rotation refusal robust even if the
+  // `_audit-daemon*` namespaces were deleted (the raw boundary-v1.json file is
+  // not a `.enc` entry and is skipped by namespace enumeration). Refuse BY NAME
+  // on the `_meta` marker alone, nothing mutated.
+  it("aborts BY NAME when only the F2 _meta established marker is present (daemon namespaces deleted)", async () => {
+    const fortress = await buildFortress();
+    await fortress.storage.write(
+      "_meta",
+      "audit-store-split-established-v1",
+      stringToBytes(JSON.stringify({ __sanctuary_audit_store_split_established_v1: true, mac: "x" }))
+    );
+    let caught: unknown;
+    try {
+      await rotateMaster(rotateOpts(fortress));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(RotationPreflightError);
+    expect((caught as Error).message).toMatch(/writer-split|audit-store-split-established/);
+    const est = await establishMaster({
+      storage: fortress.storage,
+      passphrase: PASSPHRASE,
+    });
+    expect(toBase64url(est.masterKey)).toBe(toBase64url(fortress.master));
+  });
+
   it("rotates compound-AAD records (anomaly classifier: key state.<a>.<b>, AAD a|b — codex r2)", async () => {
     const fortress = await buildFortress();
     await fortress.storage.write(
