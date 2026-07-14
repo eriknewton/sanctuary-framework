@@ -17,7 +17,7 @@
  * still refuses (ok:false, distinct error).
  */
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -35,6 +35,7 @@ import {
   CASTLE_WALL_RELOAD_BROADCAST_DEADLINE_MS,
 } from "../../../src/castle-wall/constants.js";
 import {
+  createAuditWriteDegradedCarry,
   startMacOSCastleWallDaemon,
   type MacOSCastleWallListenerOptions,
 } from "../../../src/castle-wall/runtime/index.js";
@@ -312,6 +313,92 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     expect(stopped[stopped.length - 1]!.details?.audit_write_degraded_count).toBe(1);
   });
 
+  it("overlapping heartbeat carries never double-subtract; a later drop still emits a marker (fix-round HIGH)", async () => {
+    // Codex fix-round HIGH repro: with snapshot-then-subtract-after-append,
+    // a slow append plus a short heartbeat interval let beats A and B BOTH
+    // snapshot the same 1-unit count, both append markers, and both subtract,
+    // driving the counter to -1; a LATER real drop then incremented -1 -> 0
+    // and its marker never emitted (the detail spread only fires > 0), so a
+    // real dropped policy_loaded became chain-invisible again. Reservation
+    // semantics (reserve units synchronously BEFORE the append, restore on
+    // failure) make that impossible; this test pins both halves:
+    //   (1) overlapping carries emit EXACTLY one 1-unit marker for one drop;
+    //   (2) a second drop after the overlap window still emits its marker.
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const helper = makeControllableHelper();
+    const listener = makeControllableListener();
+    const handle = await startDaemon(fortressPath, auditLog, masterKey, helper, listener.factory, {
+      reloadAuditDeadlineMs: 500,
+      // 100ms beats vs 300ms appends below: several carries overlap.
+      auditHeartbeatIntervalSeconds: 0.1,
+    });
+    const origAppend = auditLog.append.bind(auditLog);
+    const origFlush = auditLog.flush.bind(auditLog);
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const markerUnits = (entries: { operation: string; details?: Record<string, unknown> }[], op?: string): number =>
+      entries
+        .filter((e) => op === undefined || e.operation === op)
+        .reduce(
+          (sum, e) =>
+            sum +
+            (typeof e.details?.audit_write_degraded_count === "number"
+              ? e.details.audit_write_degraded_count
+              : 0),
+          0,
+        );
+    try {
+      // Drop 1: the reload-outcome audit write REJECTS fast (not hangs), so
+      // the drop is counted immediately and any beat in this window fails its
+      // own append and cleanly restores its reservation.
+      auditLog.append = (() =>
+        Promise.reject(new Error("audit wedged"))) as typeof auditLog.append;
+      const reply1 = await handle.reloadPolicy({
+        type: "policy_reload_request",
+        request_id: "req-overlap-drop-1",
+      });
+      expect(reply1.ok).toBe(true);
+      await sleep(80);
+
+      // SLOW appends (300ms) under 100ms beats: overlapping carries. With the
+      // double-subtract bug, beats at ~100/200/300ms would EACH snapshot the
+      // 1-unit count and each append a marker (sum 3, counter -2). With
+      // reservation, exactly one beat carries it.
+      auditLog.append = (async (
+        ...args: Parameters<typeof origAppend>
+      ): Promise<void> => {
+        await sleep(300);
+        return origAppend(...args);
+      }) as typeof auditLog.append;
+      await sleep(800);
+
+      const midEntries = (await auditLog.query({ layer: "l1", limit: 500 })).entries;
+      expect(markerUnits(midEntries, "castle_wall_heartbeat")).toBe(1);
+
+      // Drop 2 (the false-assurance half): must still emit a marker.
+      auditLog.append = (() =>
+        Promise.reject(new Error("audit wedged again"))) as typeof auditLog.append;
+      const reply2 = await handle.reloadPolicy({
+        type: "policy_reload_request",
+        request_id: "req-overlap-drop-2",
+      });
+      expect(reply2.ok).toBe(true);
+      await sleep(80);
+    } finally {
+      // stop() clears the heartbeat interval synchronously before its first
+      // await, so no beat can interleave between this restore and the
+      // filter_stopped carry.
+      auditLog.append = origAppend;
+      auditLog.flush = origFlush;
+      await handle.stop();
+    }
+
+    const { entries } = await auditLog.query({ layer: "l1", limit: 500 });
+    // Two real drops -> exactly two chain-visible marker units, total.
+    expect(markerUnits(entries)).toBe(2);
+    const stopped = entries.filter((e) => e.operation === "filter_stopped");
+    expect(stopped[stopped.length - 1]!.details?.audit_write_degraded_count).toBe(1);
+  });
+
   it("bounds a stall at the TOP of reloadPolicy (before the signer) -> ok:false", async () => {
     // A hang BEFORE the re-sign (a wedged fortress read) must also be bounded by
     // the whole-body reload deadline, not only a signer hang.
@@ -400,6 +487,52 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     } finally {
       helper.setSign("ok");
       await handle.stop();
+    }
+  });
+});
+
+describe("degraded-audit-write carry (reservation + clamp invariants)", () => {
+  it("reservation prevents double-carry; restore after a failed carry retries the units", () => {
+    const carry = createAuditWriteDegradedCarry();
+    carry.record();
+    const a = carry.reserve();
+    expect(a).toBe(1);
+    // An overlapping carrier (beat B while A's append is in flight) sees 0:
+    // the double-subtract of the same units is structurally impossible.
+    expect(carry.reserve()).toBe(0);
+    // A's append fails -> the units go back and the next carrier retries them.
+    carry.restore(a);
+    expect(carry.reserve()).toBe(1);
+    // A successful carry ends with nothing pending.
+    expect(carry.reserve()).toBe(0);
+  });
+
+  it("drops recorded while a carry is in flight stay pending for the next carrier", () => {
+    const carry = createAuditWriteDegradedCarry();
+    carry.record();
+    const inFlight = carry.reserve();
+    expect(inFlight).toBe(1);
+    // New drop lands while the first carry's append is still pending.
+    carry.record();
+    // The first carry succeeding does not touch the new unit...
+    expect(carry.reserve()).toBe(1);
+  });
+
+  it("clamps at zero with a loud stderr line if the counter would ever go negative", () => {
+    const carry = createAuditWriteDegradedCarry();
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Unreachable through the reserve/restore protocol; forced here to pin
+      // the invariant guard: loud, and the clamp keeps a later real drop's
+      // marker from being swallowed by a negative balance.
+      carry.restore(-3);
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(String(spy.mock.calls[0]![0])).toMatch(/invariant violation/);
+      carry.record();
+      // Clamped to 0 before the record, so the real drop is fully visible.
+      expect(carry.reserve()).toBe(1);
+    } finally {
+      spy.mockRestore();
     }
   });
 });
