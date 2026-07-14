@@ -330,6 +330,13 @@ export class AuditConsumer {
         {
           reason: "canonicalization_failed",
           detail: err instanceof Error ? err.message : String(err),
+          // Record seq + event_type so an auditor can correlate WHICH WAL
+          // position was suppressed - matching the sibling
+          // `producer_signature_rejected` path. Both are read WITHOUT
+          // canonicalize (the unrepresentable value lives elsewhere in
+          // `details`), so reading them here stays throw-safe.
+          seq: envelope.event.details?.seq,
+          event_type: envelope.event.event_type,
         },
         "failure"
       );
@@ -526,6 +533,15 @@ export class AuditConsumer {
     | { kind: "ok" }
     | { kind: "duplicate_replay" }
     | { kind: "error"; reason: string } {
+    // Defense in depth: `details` is typed `Record<string, unknown>` and the
+    // drain path always builds it as an object, but a null/undefined here
+    // would make the `hasOwnProperty.call` below throw. Treat a missing
+    // `details` as "no chain fields" - the same settled rejection as any other
+    // malformed event, never an unsettled fault.
+    const details = event.details as Record<string, unknown> | null | undefined;
+    if (details === null || details === undefined) {
+      return { kind: "error", reason: "chain_fields_missing" };
+    }
     const hasSeq = Object.prototype.hasOwnProperty.call(event.details, "seq");
     const hasPriorHash = Object.prototype.hasOwnProperty.call(
       event.details,

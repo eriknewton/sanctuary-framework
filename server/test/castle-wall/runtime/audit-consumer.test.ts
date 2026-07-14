@@ -479,6 +479,13 @@ describe("castle-wall/runtime/audit-consumer : ingestCritical", () => {
     const rejected = sink.entries.find((e) => e.operation === "audit_event_rejected");
     expect(rejected).toBeDefined();
     expect(rejected!.result).toBe("failure");
+    // Audit-integrity fidelity (opus MEDIUM): the canonicalization_failed
+    // rejection must record seq + event_type so an auditor can correlate WHICH
+    // WAL position was suppressed, matching the sibling
+    // `producer_signature_rejected` path. These are read WITHOUT canonicalize.
+    expect(rejected!.details?.reason).toBe("canonicalization_failed");
+    expect(rejected!.details?.seq).toBe(5);
+    expect(rejected!.details?.event_type).toBe("egress_allowed");
   });
 
   it("does not wedge on redelivery of the same uncanonicalizable event (anti-DoS)", async () => {
