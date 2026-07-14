@@ -15,6 +15,7 @@ import type { CandidateObservation } from "../../src/castle-wall/observe/types.j
 import {
   buildInventorySnapshot,
   emptyInventorySnapshot,
+  notCollectedInventorySnapshot,
   type ProxyServerView,
 } from "../../src/evidence-pack/inventory.js";
 import type {
@@ -136,14 +137,31 @@ describe("buildInventorySnapshot", () => {
     expect(snap.agents.status).toBe("empty_verified");
   });
 
-  it("an undefined source defaults to empty_verified; emptyInventorySnapshot is all empty_verified", () => {
+  it("R3-5: an undefined (not-collected) source is a FAILED read, never a minted EmptyVerified witness", () => {
     const snap = buildInventorySnapshot({});
-    expect(snap.agents.status).toBe("empty_verified");
-    expect(snap.mcp_servers.status).toBe("empty_verified");
-    expect(snap.observed_destinations.status).toBe("empty_verified");
+    for (const source of [snap.agents, snap.mcp_servers, snap.observed_destinations]) {
+      expect(source.status).toBe("read_failed");
+      if (source.status === "read_failed") {
+        expect(source.reason).toContain("not collected");
+      }
+    }
+  });
+
+  it("emptyInventorySnapshot stays all empty_verified (an EXPLICIT verified-empty constructor, never a not-collected default)", () => {
     const empty = emptyInventorySnapshot();
     expect(empty.agents.status).toBe("empty_verified");
+    expect(empty.mcp_servers.status).toBe("empty_verified");
     expect(empty.observed_destinations.status).toBe("empty_verified");
+  });
+
+  it("R3-5: notCollectedInventorySnapshot is all read_failed with the not-collected reason", () => {
+    const snap = notCollectedInventorySnapshot();
+    for (const source of [snap.agents, snap.mcp_servers, snap.observed_destinations]) {
+      expect(source.status).toBe("read_failed");
+      if (source.status === "read_failed") {
+        expect(source.reason).toContain("not collected");
+      }
+    }
   });
 
   it("a populated section carries only { status, value } - no completeness/total flag", () => {

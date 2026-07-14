@@ -52,7 +52,12 @@ export type {
   DiscreteExportView,
   DiscreteExportsView,
 } from "./sections.js";
-export { buildInventorySnapshot, emptyInventorySnapshot } from "./inventory.js";
+export {
+  buildInventorySnapshot,
+  emptyInventorySnapshot,
+  notCollectedInventorySnapshot,
+  NOT_COLLECTED_REASON,
+} from "./inventory.js";
 export type {
   InventorySources,
   InventorySourceRead,

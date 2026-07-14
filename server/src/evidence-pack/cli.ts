@@ -225,6 +225,14 @@ async function gatherDiscreteExports(
  *   false cause while older entries sit on disk outside the window. Neither
  *   truncation is constructible with today's defaults; the guard makes the
  *   anticipated configurations structurally safe.
+ * - R3-3 (round-3 sweep 2026-07-14): `earliest_retained_at` is the MINIMUM
+ *   entry timestamp, not the positionally-first entry. Audit entries sort by
+ *   append sequence, so under backward clock skew a later-appended entry can
+ *   carry an earlier timestamp; taking `entries[0]` would then let the
+ *   never-pruned reassurance arm assert "no recorded activity before X" while
+ *   a retained entry is timestamped before X. An entry whose timestamp does
+ *   not parse is skipped by the scan (with a positional fallback only if NO
+ *   timestamp parses, preserving a non-null earliest for a non-empty read).
  */
 export function deriveAuditReadOutcome(params: {
   entries: readonly AuditEntry[];
@@ -249,8 +257,20 @@ export function deriveAuditReadOutcome(params: {
         "counts and coverage are not determinable from this read"
     );
   }
-  const earliest: string | null =
-    entries.length > 0 ? entries[0]!.timestamp : null;
+  // R3-3: min-scan, never positional (entries are append-ordered, and clock
+  // skew can put an earlier timestamp on a later-appended entry).
+  let earliest: string | null = null;
+  let earliestMs = Number.POSITIVE_INFINITY;
+  for (const entry of entries) {
+    const t = new Date(entry.timestamp).getTime();
+    if (Number.isFinite(t) && t < earliestMs) {
+      earliestMs = t;
+      earliest = entry.timestamp;
+    }
+  }
+  if (earliest === null && entries.length > 0) {
+    earliest = entries[0]!.timestamp;
+  }
   const retention: RetentionFacts = {
     max_entries: retentionConfig.maxEntries,
     retained_total: usage.entryCount ?? windowedTotal,
@@ -504,9 +524,15 @@ export async function runEvidencePack(args: string[]): Promise<void> {
         ? "YES - disclosed in the report"
         : "no"
       : "indeterminate (audit log unreadable)";
+  // R3-4: mirror the report's honest split (sections.ts "Total recorded audit
+  // operations"): total_in_window includes non-control-point "other"
+  // operations, so labeling the raw total "control-point decisions" restates
+  // the mislabel the report already fixed (round-1 LOW-1).
   const decisionsLine =
     pack.aggregation.status === "populated"
-      ? String(pack.aggregation.value.total_in_window)
+      ? `${pack.aggregation.value.total_in_window} ` +
+        `(${pack.aggregation.value.total_in_window - pack.aggregation.value.by_category.other} ` +
+        `control-point decisions + ${pack.aggregation.value.by_category.other} other recorded operations)`
       : "not computed (audit log unreadable)";
   const partialTag =
     sf.status === "populated" && sf.value.in_progress_quarter
@@ -518,7 +544,7 @@ export async function runEvidencePack(args: string[]): Promise<void> {
     `  Quarter:          ${label}${partialTag}`,
     `  Covered window:   ${coverageLine}`,
     `  Covered-window shortfall: ${shortfallLine}`,
-    `  Control-point decisions in quarter: ${decisionsLine}`,
+    `  Recorded audit operations in quarter: ${decisionsLine}`,
     `  Signer:           ${pack.manifest.signer.did}`,
     "",
     "  NOT LEGAL ADVICE. Have the policy/attestation content reviewed by a",

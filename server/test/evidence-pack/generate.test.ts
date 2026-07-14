@@ -28,6 +28,7 @@ import {
   type BuildEvidencePackDeps,
 } from "../../src/evidence-pack/generate.js";
 import { canonicalJSON } from "../../src/evidence-pack/signer.js";
+import { emptyInventorySnapshot } from "../../src/evidence-pack/inventory.js";
 import {
   populated,
   emptyVerified,
@@ -361,6 +362,12 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("a count of those denied attempts");
     expect(report).toContain("allowed egress is not inventoried");
     expect(report).toContain("not a census of where the machines' traffic actually went");
+    // R3-1 re-truing: the "permitted destinations do NOT appear" claim is
+    // grounded in the engine mechanism that honors it (the refresh
+    // chokepoint's allowlist suppression + prune), not an unconditional
+    // absolute the store cannot back.
+    expect(report).toContain("as of its most recent refresh");
+    expect(report).toContain("clears any pending candidate");
   });
 
   it("OPEN-MED-1 + F2: the egress 'Seen' legend states its true basis (candidate-record lifetime, not quarter-scoped)", () => {
@@ -446,7 +453,13 @@ describe("buildEvidencePack", () => {
   });
 
   it("the executive summary says 'configured', never 'connected', for MCP servers", () => {
-    const pack = buildEvidencePack(baseInput(), deps([]));
+    // R3-5: the definitive census wording requires an explicitly COLLECTED
+    // (verified-empty) inventory; an absent inventory renders hedged
+    // not-collected language with no census sentence at all.
+    const pack = buildEvidencePack(
+      { ...baseInput(), inventory: emptyInventorySnapshot() },
+      deps([])
+    );
     const report = pack.files[0]!.content;
     expect(report).toContain("configured AI tool servers");
     expect(report).not.toContain("connected AI tool servers");
@@ -474,11 +487,51 @@ describe("buildEvidencePack", () => {
   });
 
   it("MED-1: an all-empty_verified inventory DOES print the definitive gated 0", () => {
-    const pack = buildEvidencePack(baseInput(), deps([]));
+    const pack = buildEvidencePack(
+      // R3-5: the definitive 0 now requires an EXPLICIT verified-empty
+      // inventory (every source actually read, each empty) -- it is no longer
+      // the default for an input that supplied no inventory at all.
+      { ...baseInput(), inventory: emptyInventorySnapshot() },
+      deps([])
+    );
     const report = pack.files[0]!.content;
-    // baseInput has no inventory -> emptyInventorySnapshot (all empty_verified).
     expect(report).toContain("AI tools inventoried:** 0");
     expect(report).toContain("NOT a claim that the firm uses no AI tools");
+  });
+
+  it("R3-5: an input with NO inventory renders hedged not-collected language, never a definitive census minted from nothing", () => {
+    const pack = buildEvidencePack(baseInput(), deps([]));
+    const report = pack.files[0]!.content;
+    // No definitive zero census from an inventory nobody collected.
+    expect(report).not.toContain("AI tools inventoried:** 0");
+    expect(report).not.toContain("No wrapped AI harnesses are recorded");
+    expect(report).not.toContain("No MCP tool servers are configured");
+    // Hedged instead: could-not-be-determined with the not-collected reason.
+    expect(report).toContain("could not be fully determined this period");
+    expect(report).toContain("This is NOT a count of zero.");
+    expect(report).toContain("not collected");
+  });
+
+  it("R3-2: the covered-window line and Scope-and-limits disclose retention-span vs recording-liveness", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const report = pack.files[0]!.content;
+    // The section-7 covered-window sentence carries the liveness clause: the
+    // window reflects what the retained log SPANS, and does not by itself
+    // prove the stack was recording throughout it.
+    expect(report).toContain("reflects what the retained audit log spans");
+    expect(report).toContain(
+      "does not by itself prove the enforcement stack was running and recording"
+    );
+    // And the mandatory Scope-and-limits page names the class directly.
+    expect(report).toContain(
+      "A covered window proves retention span, not recording liveness."
+    );
+    expect(report).toContain(
+      "zero recorded decisions in a period does not mean zero AI"
+    );
   });
 
   it("LOW-1: the total bullet is labeled 'audit operations' and splits out non-decision 'other'", () => {
