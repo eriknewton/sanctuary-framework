@@ -480,32 +480,36 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
   // engine was fixed rather than this wording softened a third time.
   //
   // F1 (round-2 sweep 2026-07-14; basis verified against the ENGINE after the
-  // round-3 R3-1 fix): the observe engine folds ONLY denied flows into
-  // candidates (castle-wall/observe/fold.ts, enforce-preserving posture
-  // D-Q1), so every row here is a destination the wall BLOCKED, and allowed
-  // egress is structurally absent. The "permitted flows do NOT appear"
-  // sentence is honored by the same R3-1 engine: the refresh suppresses a
-  // candidate the verified policy already permits FOR THE AGENT THAT
-  // ATTEMPTED IT and prunes pending candidates a later policy change
-  // permits, so a PROMOTED destination no longer re-enters this table from
-  // retained history. The claim is phrased over FLOWS, not destinations,
-  // and grounded in the refresh ("as of its most recent refresh"): the
-  // engine's suppression is scope-aware (a rule promoted for one
-  // agent/template does not permit another agent's attempts at the same
-  // destination -- the daemon still denies those, and this table has no
-  // agent column), so a destination-level absolute would be falsifiable
-  // while the flow-level sentence is what the engine enforces.
+  // round-3 R3-1 fix + its two-family-gate hardening): the observe engine
+  // folds ONLY denied flows into candidates (castle-wall/observe/fold.ts,
+  // enforce-preserving posture D-Q1), so every row here is a destination the
+  // wall BLOCKED, and allowed egress is structurally absent. The refresh
+  // chokepoint (castle-wall/observe/refresh.ts) suppresses and prunes a
+  // candidate ONLY when it can POSITIVELY verify the current signed policy
+  // permits that flow for the attempting agent across every enforcement
+  // path (an exact host/IP allow with covering scope and no matching
+  // deny -- exactly what the promote workflow writes), so a PROMOTED
+  // destination no longer re-enters this table from retained history. The
+  // legend claims exactly that verified-suppression semantics and EXPLICITLY
+  // discloses that a row may remain listed when its permission cannot be
+  // verified that exactly (pattern/scoped-rule cases) -- a definitive
+  // "permitted destinations never appear" absolute would be falsifiable,
+  // and the round-1..3 sweeps graded exactly such falsifiable absolutes
+  // HIGH. Never re-widen this wording without re-verifying the engine.
   const out = [
     "Legend - Row basis: this table records BLOCKED flow observations only. " +
       "Each row is a destination the wall DENIED; the Seen count is a count " +
-      "of those denied attempts. Flows the operator's policy permits do NOT " +
-      "appear here: as of its most recent refresh, the observe engine " +
-      "records no candidate the verified policy already permits for the " +
-      "agent that attempted it, and clears any pending candidate a later " +
-      "policy change permits. (A policy rule scoped to one agent or " +
-      "template does not cover another agent's attempts at the same " +
-      "destination, so such still-denied attempts remain listed.) Allowed " +
-      "egress is not inventoried by this " +
+      "of those denied attempts. This table never lists allowed egress: " +
+      "every row was denied when observed, and as of its most recent " +
+      "refresh the observe engine records no candidate, and clears any " +
+      "pending candidate, for a flow it can positively verify the current " +
+      "signed policy permits for the agent that attempted it (an exact " +
+      "host or IP allow rule, as written by the promote workflow). A row " +
+      "may remain listed while its permission cannot be verified that " +
+      "exactly (for example a hostname-pattern rule, or a rule scoped to a " +
+      "different agent whose own attempts stay denied); a listed row " +
+      "therefore means denied attempts were recorded, never that data was " +
+      "exchanged. Allowed egress is not inventoried by this " +
       "table or this version of the pack, so this table is not a census of " +
       "where the machines' traffic actually went.",
     "",
