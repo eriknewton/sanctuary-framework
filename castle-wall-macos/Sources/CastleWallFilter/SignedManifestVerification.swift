@@ -40,6 +40,16 @@ public enum SignedManifestVerificationError: Error, Equatable {
     /// widening a scoped rule to all agents -- so the enforcement side rejects
     /// the WHOLE snapshot against the RAW bytes the digest actually binds.
     case invalidRuleSchema(ruleId: String, reason: String)
+    /// S5-0 HIGH-5 (2026-07-14): a signed rule carries an axis that TS
+    /// `validateRule` ACCEPTS but this macOS evaluator does NOT enforce, so
+    /// applying the rule without that axis would be BROADER than the operator
+    /// authored (e.g. a `time_window`-bounded allow enforced at all times).
+    /// Fail closed: reject the whole snapshot, mirroring the Linux daemon's
+    /// `UnenforceableRuleAxis` (`castle-wall-daemon/src/policy.rs`), until the
+    /// macOS evaluator grows enforcement for the axis. Distinct from
+    /// `invalidRuleSchema` (which validates fields the evaluator DOES consume);
+    /// this rejects a field the evaluator does NOT consume.
+    case unenforceableRuleAxis(ruleId: String, axis: String)
 }
 
 public enum SignedManifestVerifier {
@@ -325,8 +335,35 @@ public enum SignedManifestVerifier {
                     ruleId: ruleId, reason: "rule.disposition must be allow, prompt, or deny (got \(disposition))"
                 )
             }
+
+            // UNENFORCEABLE-AXIS gate (S5-0 HIGH-5). DISTINCT from the schema
+            // validation above: the checks above validate fields the evaluator
+            // DOES consume; this rejects fields the evaluator does NOT consume
+            // but TS `validateRule` ACCEPTS. Enforcing such a rule WITHOUT the
+            // axis would make it BROADER than the operator authored, so we fail
+            // closed (reject the whole snapshot, keep prior policy) exactly like
+            // the Linux daemon's `UnenforceableRuleAxis`
+            // (`castle-wall-daemon/src/policy.rs`). The daemon's full
+            // unenforceable set is a single axis -- `time_window` -- so that is
+            // the whole set mirrored here. Do NOT "helpfully" delete this
+            // thinking it duplicates schema validation: a future reader who
+            // wires ACTUAL time-window enforcement into `AllowlistEvaluator`
+            // must remove this reject AND add a parity row (see the guard
+            // comment at `AllowlistEvaluator.matches`).
+            for axis in unenforceableRuleAxes where ruleObj[axis] != nil {
+                throw SignedManifestVerificationError.unenforceableRuleAxis(
+                    ruleId: ruleId, axis: axis
+                )
+            }
         }
     }
+
+    /// Rule axes TS `validateRule` accepts but the macOS `AllowlistEvaluator`
+    /// does not enforce -- so a rule carrying one is rejected fail-closed (a
+    /// present-but-unenforced constraint would widen the rule). Mirrors the
+    /// Linux daemon's `UnenforceableRuleAxis` set, which is exactly
+    /// `time_window` today.
+    private static let unenforceableRuleAxes: [String] = ["time_window"]
 
     private static func rejectUnknownRawKeys(
         _ obj: [String: JSONValue], known: Set<String>, ruleId: String, label: String

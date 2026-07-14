@@ -1025,6 +1025,100 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         XCTAssertEqual(engine.agentOrigin?.agentUid, 600)
     }
 
+    // MARK: - S5-0 HIGH-5: unenforceable-axis (time_window) fail-closed gate.
+    // TS accepts time_window (schema.ts:216) but the macOS evaluator does not
+    // enforce it, so a time-bounded allow would become an all-time allow. The
+    // verifier rejects it fail-closed, matching the Linux daemon's
+    // UnenforceableRuleAxis. This is DISTINCT from schema validation: it rejects
+    // a field the evaluator does NOT consume (vs. validating one it does).
+
+    func testUnenforceableAxis_timeWindow_rejectsWholeSnapshotKeepsPrior() throws {
+        // Codex's exact repro shape: a validly-signed windowed allow.
+        try assertRawRuleRejectedKeepingPrior(
+            #"""
+            {"id":"windowed","schema_version":1,"created_at":"2026-07-14T00:00:00Z","match":{"host":"windowed.example.com","port":443,"protocol":"tcp"},"scope":{"uids":[601]},"disposition":"allow","time_window":{"start":"09:00","end":"17:00"}}
+            """#
+        )
+    }
+
+    func testUnenforceableAxis_timeWindow_throwsTypedUnenforceableError() throws {
+        let bad = try makeSignedBodyWithRawRules(
+            rawRuleJSONs: [
+                #"""
+                {"id":"windowed","schema_version":1,"created_at":"2026-07-14T00:00:00Z","match":{"host":"windowed.example.com","port":443,"protocol":"tcp"},"scope":{"uids":[601]},"disposition":"allow","time_window":{"start":"09:00","end":"17:00"}}
+                """#
+            ],
+            agentOrigin: validGateOrigin()
+        )
+        XCTAssertThrowsError(
+            try SignedManifestVerifier.verifiedSnapshot(from: bad.body, pinnedPublicKey: bad.publicKey)
+        ) { error in
+            guard case SignedManifestVerificationError.unenforceableRuleAxis(_, let axis) = error else {
+                return XCTFail("expected .unenforceableRuleAxis, got \(error)")
+            }
+            XCTAssertEqual(axis, "time_window")
+        }
+    }
+
+    func testUnenforceableAxis_timeWindow_windowedHostNotReachableAfterRejection() throws {
+        // End-to-end: seed a two-uid policy that CONFINES the gate uid 601 (so
+        // 601 is a confined principal, not an operator), then apply a windowed
+        // allow for the gate to windowed.example.com. It is rejected; the prior
+        // policy (which has no rule for that host) stands, so the gate uid flow
+        // to the windowed host default-denies. Had the windowed rule been
+        // accepted, the evaluator -- which ignores time_window -- would have
+        // ALLOWED it at all times (the HIGH-5 widening).
+        let engine = FlowEvaluatorEngine()
+        let seedWire = AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 601, systemUidAllowCeiling: 500)
+        let seed = try makeSignedManifestUpdatedBody(rules: [sampleAllowRule()], agentOrigin: seedWire)
+        XCTAssertNotNil(IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(seed.body),
+            store: engine.manifestStore, cache: engine.flowCache,
+            pinnedPublicKey: seed.publicKey, engine: engine
+        ))
+        XCTAssertEqual(engine.agentOrigin?.gateUid, 601)
+
+        let bad = try makeSignedBodyWithRawRules(
+            rawRuleJSONs: [
+                #"""
+                {"id":"windowed","schema_version":1,"created_at":"2026-07-14T00:00:00Z","match":{"host":"windowed.example.com","port":443,"protocol":"tcp"},"scope":{"uids":[601]},"disposition":"allow","time_window":{"start":"09:00","end":"17:00"}}
+                """#
+            ],
+            agentOrigin: seedWire
+        )
+        XCTAssertNil(
+            IPCBridgeNotifications.applyManifestUpdated(
+                message: .manifestUpdated(bad.body),
+                store: engine.manifestStore,
+                cache: engine.flowCache,
+                pinnedPublicKey: bad.publicKey,
+                engine: engine
+            )
+        )
+        // Prior gate-confining policy intact; the windowed rule never went live.
+        XCTAssertEqual(engine.agentOrigin?.gateUid, 601)
+        XCTAssertEqual(engine.manifestStore.currentRules().map { $0.id }, ["r-origin"])
+
+        let gateFlow = FilterFlowDescriptor(
+            sourceAppIdentifier: "deadbeef",
+            agentId: "deadbeef",
+            templateId: "unknown",
+            destinationHost: "windowed.example.com",
+            destinationIp: "104.18.32.10",
+            destinationPort: 443,
+            networkProtocol: .tcp,
+            hostnameSource: "sni",
+            opaqueDestination: false,
+            sourceRuid: 601,
+            sourcePid: 4242,
+            sourcePidVersion: 1,
+            sourceSigningId: nil,
+            sourceTeamId: nil,
+            sourceUnattributed: false
+        )
+        XCTAssertEqual(engine.evaluate(gateFlow), .drop(matchedRuleId: nil))
+    }
+
     // MARK: - S5-0_930 anti-regression PARITY test
     //
     // Enumerates every security-relevant field TS `validateRule` +
@@ -1088,6 +1182,16 @@ final class IPCBridgeNotificationsTests: XCTestCase {
             (rawRule(match: #"{"host":"x"}"#, disposition: #""observe""#), "disposition enum (schema.ts:305)"),
             // unknown rule key (schema.ts:227)
             (rawRule(match: #"{"host":"x"}"#, extra: #","future_field":true"#), "unknown rule key (schema.ts:227)"),
+            // UNENFORCEABLE-AXIS gate (HIGH-5) -- NOT a schema-enforcement row:
+            // time_window is TS-valid (schema.ts:216) but the macOS evaluator
+            // does not enforce it, so a windowed allow must be rejected
+            // fail-closed (parity with the Linux daemon's UnenforceableRuleAxis,
+            // castle-wall-daemon/src/policy.rs:668). If time-window enforcement is
+            // ever wired into AllowlistEvaluator, this row must move/change.
+            (
+                rawRule(match: #"{"host":"x"}"#, extra: #","time_window":{"start":"09:00","end":"17:00"}"#),
+                "time_window unenforceable-axis gate (policy.rs:668; NOT schema.ts:216)"
+            ),
         ]
         for (ruleJSON, tsSource) in cases {
             do {

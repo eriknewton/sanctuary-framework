@@ -105,6 +105,14 @@ public enum AllowlistEvaluator {
         return operatorBaselineUidRuleId
     }
 
+    /// INVARIANT (harden against future refactors): `operator_baseline.essentials`
+    /// is consulted ONLY to LABEL the matched-rule id AFTER a flow has already
+    /// been positively classified `.operator` and taken the allow fast-path
+    /// (see `evaluate`); it never itself grants egress. So a null-collapsed
+    /// sub-field of a multi-axis essential can only broaden which OPERATOR flow
+    /// gets which label, never widen agent-facing egress. If a refactor ever
+    /// makes `matchingEssential` reachable for a non-`.operator` flow, its
+    /// fields must be schema-validated at the signed-manifest chokepoint too.
     static func matchingEssential(
         flow: FilterFlowDescriptor,
         operatorBaseline: OperatorBaselineWire?
@@ -163,6 +171,14 @@ public enum AllowlistEvaluator {
     }
 
     /// True when the rule's match conditions and scope both apply to the flow.
+    ///
+    /// NOTE (S5-0 HIGH-5): this evaluator does NOT read `rule.timeWindow` -- it
+    /// enforces no time bound. Because ignoring a time bound would WIDEN a
+    /// windowed allow to an all-time allow, `SignedManifestVerifier.validateSignedRule`
+    /// rejects any signed rule carrying `time_window` fail-closed (mirroring the
+    /// Linux daemon). If time-window enforcement is EVER wired in here, that
+    /// reject gate MUST be removed (so macOS stops rejecting an axis it now
+    /// supports) and a `time_window` enforcement parity row added.
     public static func matches(rule: ManifestRule, flow: FilterFlowDescriptor) -> Bool {
         if !scopeMatches(scope: rule.scope, flow: flow) {
             return false
