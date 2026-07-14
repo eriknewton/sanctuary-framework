@@ -32,6 +32,7 @@ import {
   candidateKey,
   candidateKeyDigest,
   type CandidateObservation,
+  type FoldWatermark,
   type ObserveModeState,
 } from "./types.js";
 
@@ -43,6 +44,7 @@ export interface ObserveWriteIdentity {
 }
 
 const STATE_KEY = "state";
+const FOLD_WATERMARK_KEY = "fold-watermark";
 const CANDIDATE_KEY_PREFIX = "candidate:";
 const PAGE_SIZE = 100;
 
@@ -75,6 +77,38 @@ export class ObserveStore {
 
   async setState(state: ObserveModeState): Promise<void> {
     await this.put(STATE_KEY, state);
+  }
+
+  /**
+   * Read the fold watermark: the highest authenticated audit-chain sequence
+   * the refresh chokepoint has already folded (see `refresh.ts`). Absent on a
+   * store that has never completed a watermarked refresh (fresh install, or a
+   * store written by the pre-watermark engine) -- reads as `null`, which the
+   * refresh chokepoint treats as "recompute from scratch with replace
+   * semantics" (the one-time heal for stores the pre-watermark additive
+   * re-fold inflated).
+   */
+  async getFoldWatermark(): Promise<FoldWatermark | null> {
+    const result = await this.stateStore.read(OBSERVE_NAMESPACE, FOLD_WATERMARK_KEY);
+    if (!result) return null;
+    const parsed = JSON.parse(result.value) as FoldWatermark;
+    if (
+      typeof parsed?.folded_through_sequence !== "number" ||
+      !Number.isSafeInteger(parsed.folded_through_sequence) ||
+      parsed.folded_through_sequence < 0
+    ) {
+      // A malformed watermark is treated as absent: the refresh chokepoint
+      // then RECOMPUTES with replace semantics, which converges to the true
+      // retained-history counts rather than double-adding (fail toward
+      // correct-and-conservative, never toward inflation).
+      return null;
+    }
+    return parsed;
+  }
+
+  /** Persist the fold watermark. Written by the refresh chokepoint ONLY after a fold pass committed cleanly. */
+  async setFoldWatermark(watermark: FoldWatermark): Promise<void> {
+    await this.put(FOLD_WATERMARK_KEY, watermark);
   }
 
   /** Storage key for a given candidate dedup key. Hashed so an operator-supplied host string can never itself become an unsafe StateStore key. */
@@ -129,6 +163,30 @@ export class ObserveStore {
       const prior = existing.get(key);
       if (prior && JSON.stringify(prior) === JSON.stringify(candidate)) continue;
       await this.putCandidate(candidate);
+    }
+  }
+
+  /**
+   * REPLACE-write freshly folded observations: each folded row overwrites the
+   * persisted row for its key outright (no count addition). Keys present in
+   * the store but absent from `observations` are left untouched (their audit
+   * history may simply have aged out of FIFO retention -- an unreviewed
+   * candidate is never silently dropped by a recompute).
+   *
+   * Used by the refresh chokepoint's RECOMPUTE mode (no valid watermark):
+   * replaying the full retained history yields the true per-key counts, so
+   * replacing converges -- this is the one-time heal for stores the
+   * pre-watermark additive re-fold inflated (sweep finding R3-1). Same
+   * RED-LINE scope as `mergeObservations`: only ever writes this reserved,
+   * agent-invisible namespace, never the live ruleset.
+   */
+  async replaceObservations(observations: readonly CandidateObservation[]): Promise<void> {
+    if (observations.length === 0) return;
+    const existing = await this.listCandidates();
+    for (const incoming of observations) {
+      const prior = existing.get(candidateKey(incoming));
+      if (prior && JSON.stringify(prior) === JSON.stringify(incoming)) continue;
+      await this.putCandidate(incoming);
     }
   }
 }

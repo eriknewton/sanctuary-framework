@@ -116,11 +116,17 @@ export function foldObservations(
 
 /**
  * Merge freshly folded observations into an EXISTING candidate map (keyed by
- * `candidateKey`), used by the CLI when re-folding the audit stream on top of
- * already-persisted candidates. Pure: takes and returns plain data, no I/O.
- * Bumps times_seen and extends first/last-seen for a key that already
- * exists; inserts a new row otherwise. Never touches anything outside the
- * returned map -- callers own persistence.
+ * `candidateKey`). Pure: takes and returns plain data, no I/O. Bumps
+ * times_seen and extends first/last-seen for a key that already exists;
+ * inserts a new row otherwise. Never touches anything outside the returned
+ * map -- callers own persistence.
+ *
+ * PRECONDITION (sweep finding R3-1): the merge is ADDITIVE, so it is only
+ * correct when every underlying flow event is folded EXACTLY ONCE across
+ * all merges. The refresh chokepoint (`refresh.ts`) guarantees that with
+ * its persisted fold watermark; do not call this with a re-fold of history
+ * that a previous merge already consumed -- that is precisely the
+ * times_seen-inflation defect the watermark exists to prevent.
  */
 export function mergeCandidateObservations(
   existing: ReadonlyMap<string, CandidateObservation>,

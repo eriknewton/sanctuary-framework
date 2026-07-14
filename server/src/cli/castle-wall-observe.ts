@@ -15,8 +15,12 @@
  *                a per-flow prompt).
  *   status       Show whether observe mode is on and how many candidates
  *                are pending review. Tier-3, read-only.
- *   candidates   Re-fold the audit log's denied flows into the candidate
- *                store, then list every pending candidate. Tier-3.
+ *   candidates   Fold the audit log's not-yet-folded denied flows into the
+ *                candidate store (idempotent: a persisted watermark folds
+ *                each recorded flow exactly once, and destinations the live
+ *                verified allowlist already permits are never minted and
+ *                are pruned -- see castle-wall/observe/refresh.ts), then
+ *                list every pending candidate. Tier-3.
  *   promote      Tier-1 FORCED. Synthesizes the selected candidates into
  *                allow rules, fires the SAME non-relaxable approval gate an
  *                MCP-exposed tool would use, and -- ONLY on approval --
@@ -65,12 +69,12 @@ import {
 } from "../castle-wall/allowlist/parse.js";
 import {
   ObserveStore,
-  flowEventsFromAuditEntries,
-  foldObservations,
   promoteCandidates,
+  refreshCandidatesFromAudit,
   type CandidateObservation,
   type ObserveGranularity,
   type PromoteSelectionRow,
+  type RefreshAllowlistRead,
   type VerifiedManifestRead,
 } from "../castle-wall/observe/index.js";
 
@@ -339,14 +343,44 @@ export async function runObserveCandidates(
   if (!boot) return 1;
 
   if (!noRefresh) {
-    const query = await boot.auditLog.query({
-      layer: "l1",
-      operation_type: "egress_blocked",
-      limit: 100_000,
-    });
-    const events = flowEventsFromAuditEntries(query.entries);
-    const folded = foldObservations(events);
-    await boot.observeStore.mergeObservations(folded);
+    // The idempotent, allowlist-aware refresh chokepoint (sweep finding
+    // R3-1): every audit event folds exactly once (persisted watermark), and
+    // a destination the operator's verified policy already permits is never
+    // minted -- and is pruned if present. See castle-wall/observe/refresh.ts.
+    let outcome;
+    try {
+      outcome = await refreshCandidatesFromAudit({
+        auditLog: boot.auditLog,
+        store: boot.observeStore,
+        readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
+        now: new Date(),
+      });
+    } catch (error) {
+      // streamVerifiedChain's strict verification failed: the audit chain
+      // does not verify. Nothing was folded or written (all refresh writes
+      // happen only after a clean verified pass); fail loud, never fold
+      // over an unverified chain.
+      write(
+        err,
+        `Error: could not refresh candidates -- the audit log failed verification (${(error as Error).message}). ` +
+          "Nothing was changed. Run `sanctuary castle-wall audit-verify` to investigate.\n",
+      );
+      return 1;
+    }
+    if (outcome.status === "allowlist_unverified") {
+      write(
+        err,
+        `Error: could not refresh candidates -- the live allowlist manifest did not verify (${outcome.reason}). ` +
+          "Nothing was changed. Refusing to fold with an unverifiable policy; investigate the egress manifest before reviewing candidates.\n",
+      );
+      return 1;
+    }
+    if (outcome.removed_now_allowed > 0) {
+      write(
+        out,
+        `Removed ${outcome.removed_now_allowed} candidate(s) your policy now permits (already-allowed destinations are never pending review).\n`,
+      );
+    }
   }
 
   const candidates = [...(await boot.observeStore.listCandidates()).values()].sort((a, b) =>
@@ -383,6 +417,60 @@ export async function runObserveCandidates(
     "\nPromote with: sanctuary castle-wall observe promote --destination <host:port> [--destination ...] | --all\n",
   );
   return 0;
+}
+
+/**
+ * Read + verify the live allowlist for the refresh chokepoint's
+ * allowlist-aware fold (see castle-wall/observe/refresh.ts).
+ *
+ * A genuinely-absent policy is a verified-EMPTY allowlist (fresh install /
+ * pre-provision fortress: there are no allow rules, so the filter is
+ * vacuous and `observe candidates` keeps working). Anything that EXISTS but
+ * cannot be verified -- a manifest with no pinned key to check it against,
+ * a truncated pinned key, a bad signature, a failed rule hash -- is
+ * `unverified`, which aborts the refresh loud (never a silent unfiltered
+ * fold; WHAT THESE TOOLS MUST NEVER DO #5).
+ */
+export async function readAllowlistForRefresh(fortressPath: string): Promise<RefreshAllowlistRead> {
+  const egressDir = join(fortressPath, "policy", "egress");
+
+  let pinnedPublicKey: Uint8Array;
+  try {
+    const pub = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
+    if (pub.length !== 32) {
+      return {
+        status: "unverified",
+        reason: `pinned public key must be 32 bytes (found ${pub.length})`,
+      };
+    }
+    pinnedPublicKey = new Uint8Array(pub);
+  } catch (error) {
+    if (!isEnoent(error)) {
+      return { status: "unverified", reason: `pinned public key unreadable: ${(error as Error).message}` };
+    }
+    // No pinned key. If no manifest exists either, this fortress simply has
+    // no live allowlist yet -- a verified-empty ruleset. If a manifest DOES
+    // exist with no key to verify it, that is unverifiable, not empty.
+    try {
+      await readFile(join(egressDir, "manifest.json"));
+    } catch (manifestError) {
+      if (isEnoent(manifestError)) return { status: "ok", rules: [] };
+      return {
+        status: "unverified",
+        reason: `manifest unreadable while checking for an unverifiable policy: ${(manifestError as Error).message}`,
+      };
+    }
+    return {
+      status: "unverified",
+      reason: "an egress manifest exists but there is no pinned Castle Wall public key to verify it against",
+    };
+  }
+
+  const read = await readVerifiedManifest(egressDir, pinnedPublicKey);
+  if (read.status === "tampered") {
+    return { status: "unverified", reason: read.reason };
+  }
+  return { status: "ok", rules: read.status === "ok" ? read.rules : [] };
 }
 
 class CastleWallObservePromptApprovalChannel implements ApprovalChannel {

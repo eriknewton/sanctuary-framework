@@ -19,11 +19,21 @@ export type {
   FlowObservationEvent,
   CandidateObservation,
   ObserveModeState,
+  FoldWatermark,
 } from "./types.js";
 
 export { flagExfilRisk, foldObservations, mergeCandidateObservations } from "./fold.js";
 
-export { flowEventsFromAuditEntries } from "./adapter.js";
+export { flowEventsFromAuditEntries, flowEventFromAuditEntry } from "./adapter.js";
+
+export { refreshCandidatesFromAudit, candidateCurrentlyAllowed } from "./refresh.js";
+export type {
+  RefreshAuditSource,
+  RefreshCandidateStore,
+  RefreshAllowlistRead,
+  RefreshDeps,
+  RefreshOutcome,
+} from "./refresh.js";
 
 export {
   naiveRegisteredDomain,

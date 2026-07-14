@@ -912,9 +912,13 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     "principal-policy/posture.ts",
     "principal-policy/unified-inbox-producers.ts",
     // operator CLI
+    // NOTE (observe-fold idempotency chokepoint, 2026-07-14): cli/castle-wall-observe.ts
+    // no longer uses auditLog.query at all -- runObserveCandidates now folds via
+    // castle-wall/observe/refresh.ts over streamVerifiedChain (window-independent,
+    // strict-verified, watermark-incremental), which is not one of the query sites
+    // this tripwire discovers, so it needs no row here.
     "cli/audit.ts",
     "cli/castle-wall.ts",
-    "cli/castle-wall-observe.ts",
     // compliance report generation — operator artifact
     "compliance/eu_ai_act/generator.ts",
     // operator chat context / concierge — human operator surface
@@ -1185,13 +1189,12 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
       reason:
         "operator CLI castle-wall audit dump: one-shot full read per invocation; wants a single full re-verify.",
     },
-    {
-      module: "cli/castle-wall-observe.ts",
-      fn: "runObserveCandidates",
-      kind: "operator-batch",
-      reason:
-        "operator CLI castle-wall observe candidates: one-shot re-fold of denied-flow audit entries into the candidate store per invocation; wants a single full re-verify, not a warm view (observe review is human-paced, not the SSE board).",
-    },
+    // NOTE (observe-fold idempotency chokepoint, 2026-07-14): runObserveCandidates
+    // (cli/castle-wall-observe.ts) no longer has an auditLog.query site -- the fold
+    // now streams the WHOLE verified chain via streamVerifiedChain (one-shot,
+    // strict full re-verify per invocation, watermark-incremental fold; see
+    // castle-wall/observe/refresh.ts), which this query-site tripwire does not
+    // discover, so it needs no escape row.
     {
       module: "cli/castle-wall.ts",
       fn: "runAuditVerify",
