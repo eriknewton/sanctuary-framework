@@ -80,6 +80,8 @@ Cross-machine federation is proven on real hardware (N=3) with signed policy dis
 
 *Update: the signed compliance-attestation export (an operator self-attestation of the fortress's own locally-verifiable posture, offline-verifiable, honestly scoped as NOT a third-party audit and NOT the per-flow rule-attributed audit trail) is built and passes the local gate (typecheck, full test suite) on a branch rebased onto current main; PR #895, still draft pending review.*
 
+*Update: the enrollment "Add Machine" flow (operator add-machine enrollment surface plus node-count capacity binding: a read-only capacity view and an operator-bearer-gated enroll-token mint over the existing join ceremony) is built and passes the local gate (typecheck, full test suite) on a branch rebased onto current main; PR #894, still draft pending review.*
+
 ### Recent additions (June and July 2026)
 
 - **Observe/learn allow-list (v1).** A deny-and-record observe mode that drafts an egress allow-list from real traffic, with human-gated promotion to the signed manifest. The non-enforcing state is loudly labeled; nothing silently relaxes.
