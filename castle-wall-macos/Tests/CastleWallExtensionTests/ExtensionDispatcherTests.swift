@@ -144,7 +144,7 @@ final class ExtensionDispatcherTests: XCTestCase {
 
     // MARK: - Hot-reload latency invariant
 
-    func test_handleInbound_manifestUpdated_hotReload_under_100ms() throws {
+    func test_handleInbound_manifestUpdated_hotReload_withinPerfCeiling() throws {
         // Build a manifest with 1000 rules to exercise a non-trivial
         // load. The reload itself typically completes in well under
         // 100ms on an unloaded machine, but this is a debug build run

@@ -294,7 +294,7 @@ export class AuditConsumer {
         CASTLE_WALL_AUDIT_LAYER,
         "audit_event_rejected",
         envelope.event.fortress_id ?? "unknown",
-        { reason, event_canonical: canonicalize(envelope.event) },
+        { reason, event_canonical: safeCanonicalizeForDiagnostic(envelope.event) },
         "failure"
       );
       await this.sink.flush();
@@ -302,7 +302,51 @@ export class AuditConsumer {
       await this.tryAck(envelope, "audit_event_rejected");
       return;
     }
-    const chainOutcome = this.validateWalChain(envelope.event);
+    // Anti-DoS (interaction with mesh #924): mesh `canonicalize()` now THROWS
+    // on an unsafe integer (>= 2^53) anywhere in the value, and `event.details`
+    // is a `Record<string, unknown>` spread verbatim from the attacker-
+    // controllable daemon wire body (linux-audit-drain.ts). An event that
+    // cannot be canonicalized is MALFORMED - it must be a SETTLED rejection
+    // (recorded + ACKed, cursor advances, wall stays ARMED), exactly like any
+    // other malformed event above, and it must NEVER be accepted/chained.
+    // Computing the hash HERE, before the WAL-chain check or the persist call
+    // even look at the event, means neither the chain's duplicate-hash
+    // comparison nor the post-persist `lastEventCanonicalHash` update below can
+    // ever throw: both reuse this already-proven-canonicalizable hash instead
+    // of re-deriving it from an event that might not be. A forger that stapled
+    // a bogus integer onto an otherwise-valid event must settle the same way a
+    // forger who stapled a bogus `event_type` does - never as an unsettled
+    // fault that would wedge the drain loop into NOT-ARMED (see
+    // linux-audit-drain.ts's cursor-is-the-discriminator ack/fault split).
+    let canonicalHash: string;
+    try {
+      canonicalHash = computeCanonicalHash(envelope.event);
+    } catch (err) {
+      this.stats.rejectedEvents += 1;
+      await this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "audit_event_rejected",
+        envelope.event.fortress_id ?? "unknown",
+        {
+          reason: "canonicalization_failed",
+          detail: err instanceof Error ? err.message : String(err),
+          // Record seq + event_type so an auditor can correlate WHICH WAL
+          // position was suppressed - matching the sibling
+          // `producer_signature_rejected` path. Both are read WITHOUT
+          // canonicalize (the unrepresentable value lives elsewhere in
+          // `details`), so reading them here stays throw-safe.
+          seq: envelope.event.details?.seq,
+          event_type: envelope.event.event_type,
+        },
+        "failure"
+      );
+      await this.sink.flush();
+      // Settle + ACK exactly like the shape-validation rejection above: a
+      // refused forgery must never stop the drain loop.
+      await this.tryAck(envelope, "audit_event_rejected");
+      return;
+    }
+    const chainOutcome = this.validateWalChain(envelope.event, canonicalHash);
     if (chainOutcome.kind === "duplicate_replay") {
       // Daemon retried a critical event whose persistence completed but whose
       // ACK never landed. Drop the payload silently (no double-append) and
@@ -398,7 +442,10 @@ export class AuditConsumer {
     // a transport-layer ACK failure must NOT leave the consumer's chain view
     // out of sync with what is actually on disk.
     this.lastAckedSeq = Number(envelope.event.details.seq);
-    this.lastEventCanonicalHash = computeCanonicalHash(envelope.event);
+    // Reuse the hash computed up front in `ingestCritical` (already proven
+    // canonicalizable there); do NOT re-derive it here, which would
+    // reintroduce a throw site after the event is already durably persisted.
+    this.lastEventCanonicalHash = canonicalHash;
     // The owed seq (if any) is now durable - clear the FIX 2 guard.
     this.pendingUnpersistedSeq = null;
     this.stats.acceptedCriticalEvents += 1;
@@ -465,6 +512,12 @@ export class AuditConsumer {
   /**
    * Classify an inbound critical event against the WAL chain.
    *
+   * `canonicalHash` is the hash the caller already computed up front in
+   * `ingestCritical` (before this method runs) - reusing it here means this
+   * method never itself calls `canonicalize()`/`computeCanonicalHash()` and
+   * so can never throw on an unrepresentable event; the caller's up-front
+   * check already routed that case to a settled rejection before we get here.
+   *
    * Returns:
    *   - `{ kind: "ok" }` for fresh, well-chained events.
    *   - `{ kind: "duplicate_replay" }` for daemon retries of an already-
@@ -474,11 +527,21 @@ export class AuditConsumer {
    *     mismatch.
    */
   private validateWalChain(
-    event: CastleWallAuditEvent
+    event: CastleWallAuditEvent,
+    canonicalHash: string
   ):
     | { kind: "ok" }
     | { kind: "duplicate_replay" }
     | { kind: "error"; reason: string } {
+    // Defense in depth: `details` is typed `Record<string, unknown>` and the
+    // drain path always builds it as an object, but a null/undefined here
+    // would make the `hasOwnProperty.call` below throw. Treat a missing
+    // `details` as "no chain fields" - the same settled rejection as any other
+    // malformed event, never an unsettled fault.
+    const details = event.details as Record<string, unknown> | null | undefined;
+    if (details === null || details === undefined) {
+      return { kind: "error", reason: "chain_fields_missing" };
+    }
     const hasSeq = Object.prototype.hasOwnProperty.call(event.details, "seq");
     const hasPriorHash = Object.prototype.hasOwnProperty.call(
       event.details,
@@ -503,7 +566,7 @@ export class AuditConsumer {
       if (
         seq === this.lastAckedSeq &&
         this.lastEventCanonicalHash !== null &&
-        computeCanonicalHash(event) === this.lastEventCanonicalHash
+        canonicalHash === this.lastEventCanonicalHash
       ) {
         return { kind: "duplicate_replay" };
       }
@@ -637,7 +700,7 @@ export class AuditConsumer {
       CASTLE_WALL_AUDIT_LAYER,
       "wal_chain_verification_failed",
       event.fortress_id ?? "unknown",
-      { reason, event_canonical: canonicalize(event) },
+      { reason, event_canonical: safeCanonicalizeForDiagnostic(event) },
       "failure"
     );
     await this.sink.flush();
@@ -814,4 +877,26 @@ function buildDetailsForEvent(
 
 function computeCanonicalHash(event: CastleWallAuditEvent): string {
   return createHash("sha256").update(canonicalize(event), "utf8").digest("hex");
+}
+
+/**
+ * Canonicalize a value for a DIAGNOSTIC audit field only - e.g. the
+ * `event_canonical` detail attached to a rejection entry - never for the WAL
+ * hash chain. Mesh `canonicalize()` (#924) throws on values it cannot
+ * represent exactly (an unsafe integer >= 2^53, non-finite numbers, ...); an
+ * attacker-controllable event that trips that guard is exactly the kind of
+ * malformed input a diagnostic field exists to describe, so a serialization
+ * failure here must degrade to a clearly-labeled placeholder string instead
+ * of propagating out of the caller. The caller is typically already IN a
+ * fail-closed rejection path (e.g. the `audit_event_rejected` /
+ * `wal_chain_verification_failed` recording), and that recording - and the
+ * ACK that settles the event - must never itself be prevented by the very
+ * malformation it is recording.
+ */
+function safeCanonicalizeForDiagnostic(value: unknown): string {
+  try {
+    return canonicalize(value);
+  } catch (err) {
+    return `<uncanonicalizable: ${err instanceof Error ? err.message : String(err)}>`;
+  }
 }

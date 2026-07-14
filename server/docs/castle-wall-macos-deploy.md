@@ -231,7 +231,7 @@ menubar notification fire within ~50ms of the block.
   100ms on an unloaded 2024-era Mac; the CI-gated assertion allows up
   to 600ms (best of 3 samples) to absorb wall-clock jitter on shared
   runners without weakening the regression guard (covered by
-  `test_handleInbound_manifestUpdated_hotReload_under_100ms`).
+  `test_handleInbound_manifestUpdated_hotReload_withinPerfCeiling`).
 
 ## Fail-closed invariants
 
