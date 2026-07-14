@@ -311,7 +311,7 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
 
   const kept: CandidateObservation[] = [];
   let suppressedAllowed = 0;
-  let foldedCount = 0;
+  let foldedCount: number;
 
   const keepFiltered = (folded: readonly CandidateObservation[], into: CandidateObservation[]): void => {
     for (const row of folded) {
