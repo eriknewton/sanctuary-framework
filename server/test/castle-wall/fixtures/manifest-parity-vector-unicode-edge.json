@@ -1,0 +1,61 @@
+{
+  "manifest_signed_body": {
+    "schema_version": 1,
+    "fortress_id": "fortress-parity-unicode-edge-  ",
+    "issued_at": "2026-07-14T00:00:00.000Z",
+    "rules": [
+      {
+        "rule_id": "provisioned-hermes-unicode-1",
+        "file": "provisioned-hermes-unicode-1.json",
+        "sha256": "ac77d4328830f03fb9f051d60fa191135ee2cb1e54a5c80c8903963e3d4ae31e"
+      },
+      {
+        "rule_id": "provisioned-hermes-unicode-2",
+        "file": "provisioned-hermes-unicode-2.json",
+        "sha256": "9aa50b900f0948d6ba15a2b188d016c44480f950ca9821cb74ac1a816c53c9b9"
+      }
+    ]
+  },
+  "rules": [
+    {
+      "id": "provisioned-hermes-unicode-1",
+      "schema_version": 1,
+      "created_at": "2026-07-14T00:00:00.000Z",
+      "description": "Provisioned egress: second line third line, astral emoji 😀 (U+1F600).",
+      "match": {
+        "host": [
+          "api.venice.ai"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    },
+    {
+      "id": "provisioned-hermes-unicode-2",
+      "schema_version": 1,
+      "created_at": "2026-07-14T00:00:01.000Z",
+      "description": "castle 🏰 emoji in description only (id stays ASCII)",
+      "match": {
+        "host": [
+          "api.telegram.org"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {},
+      "disposition": "allow",
+      "derived": true
+    }
+  ],
+  "expected_canonical_json_b64": "eyJmb3J0cmVzc19pZCI6ImZvcnRyZXNzLXBhcml0eS11bmljb2RlLWVkZ2Ut4oCo4oCpIiwiaXNzdWVkX2F0IjoiMjAyNi0wNy0xNFQwMDowMDowMC4wMDBaIiwicnVsZXMiOlt7ImZpbGUiOiJwcm92aXNpb25lZC1oZXJtZXMtdW5pY29kZS0xLmpzb24iLCJydWxlX2lkIjoicHJvdmlzaW9uZWQtaGVybWVzLXVuaWNvZGUtMSIsInNoYTI1NiI6ImFjNzdkNDMyODgzMGYwM2ZiOWYwNTFkNjBmYTE5MTEzNWVlMmNiMWU1NGE1YzgwYzg5MDM5NjNlM2Q0YWUzMWUifSx7ImZpbGUiOiJwcm92aXNpb25lZC1oZXJtZXMtdW5pY29kZS0yLmpzb24iLCJydWxlX2lkIjoicHJvdmlzaW9uZWQtaGVybWVzLXVuaWNvZGUtMiIsInNoYTI1NiI6IjlhYTUwYjkwMGYwOTQ4ZDZiYTE1YTJiMTg4ZDAxNmM0NDQ4MGY5NTBjYTk4MjFjYjc0YWMxYTgxNmM1M2M5YjkifV0sInNjaGVtYV92ZXJzaW9uIjoxfQ==",
+  "expected_canonical_json_hex": "7b22666f7274726573735f6964223a22666f7274726573732d7061726974792d756e69636f64652d656467652de280a8e280a9222c226973737565645f6174223a22323032362d30372d31345430303a30303a30302e3030305a222c2272756c6573223a5b7b2266696c65223a2270726f766973696f6e65642d6865726d65732d756e69636f64652d312e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d756e69636f64652d31222c22736861323536223a2261633737643433323838333066303366623966303531643630666131393131333565653263623165353461356338306338393033393633653364346165333165227d2c7b2266696c65223a2270726f766973696f6e65642d6865726d65732d756e69636f64652d322e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d756e69636f64652d32222c22736861323536223a2239616135306239303066303934386436626131356132623138386430313663343434383066393530636139383231636237346163316138313663353363396239227d5d2c22736368656d615f76657273696f6e223a317d",
+  "test_public_key_b64url": "kwsgoa14wIUprXtt0b-9QD3GySI0gyQDugZSXT0thlA",
+  "test_signature_b64url": "pCBT0cpdoo2N-pY7t5PcD-0f7w7I2vkeDZYZJz1DSC4IzW4SaAbVtpeQL9FE02_ZeenOQ1sWb2NwzNi5LCuJDQ"
+}

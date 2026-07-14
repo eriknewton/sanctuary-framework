@@ -29,6 +29,12 @@ async function loadSlashFixture(): Promise<ManifestParityFixture> {
   return JSON.parse(await readFile(fixturePath, "utf8")) as ManifestParityFixture;
 }
 
+async function loadNamedFixture(name: string): Promise<ManifestParityFixture> {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const fixturePath = join(here, `../fixtures/${name}.json`);
+  return JSON.parse(await readFile(fixturePath, "utf8")) as ManifestParityFixture;
+}
+
 describe("castle-wall manifest canonical parity vector", () => {
   it("TS canonicalizer matches fixture bytes and signature", async () => {
     const fixture = await loadFixture();
@@ -88,5 +94,82 @@ describe("castle-wall manifest canonical parity vector", () => {
         .digest("hex");
       expect(digest).toBe(fixture.manifest_signed_body.rules[index]?.sha256);
     }
+  });
+
+  // #915 adversarial-review follow-up (LOW): the slash fixture above only
+  // covers happy-path ASCII plus one escaping bug. These vectors broaden the
+  // parity surface to the adversarial classes the review named: U+2028/U+2029
+  // raw emission, astral scalar pairs, and lone-surrogate fail-closed
+  // behavior. See castle-wall-macos/Tests/CastleWallExtensionTests/ManifestParityVectorTests.swift
+  // for the Swift-side half of each vector.
+  it("unicode-edge vector: U+2028/U+2029 stay raw and astral scalar pairs round-trip byte-identically", async () => {
+    const fixture = await loadNamedFixture("manifest-parity-vector-unicode-edge");
+
+    // fortress_id carries raw U+2028/U+2029 -- JSON grammar does not require
+    // escaping them (only JS *source text* treats them as line terminators),
+    // so both the Node canonicalizer and Swift's Foundation-independent
+    // string emitter must pass them through unescaped.
+    expect(fixture.manifest_signed_body.fortress_id).toContain(" ");
+    expect(fixture.manifest_signed_body.fortress_id).toContain(" ");
+
+    const actualCanonical = new TextEncoder().encode(
+      canonicalize(fixture.manifest_signed_body),
+    );
+    expect(Buffer.from(actualCanonical).toString("hex")).toBe(
+      fixture.expected_canonical_json_hex,
+    );
+    expect(
+      Buffer.compare(
+        Buffer.from(actualCanonical),
+        Buffer.from(fixture.expected_canonical_json_b64, "base64"),
+      ),
+    ).toBe(0);
+
+    const verified = ed25519.verify(
+      Buffer.from(fixture.test_signature_b64url, "base64url"),
+      actualCanonical,
+      Buffer.from(fixture.test_public_key_b64url, "base64url"),
+    );
+    expect(verified).toBe(true);
+
+    // Per-rule digest parity, same as the slash vector, but the rule content
+    // itself carries the astral pair (rule[0]) and a second astral scalar in
+    // an otherwise-ASCII-id rule (rule[1]) -- exercising the digest path,
+    // not just the top-level manifest signature.
+    const { createHash: sha } = await import("node:crypto");
+    let sawAstral = false;
+    for (const [index, rule] of fixture.rules.entries()) {
+      const ruleCanonical = canonicalize(rule);
+      if (/\u{1F600}|\u{1F3F0}/u.test(ruleCanonical)) sawAstral = true;
+      const digest = sha("sha256").update(Buffer.from(ruleCanonical)).digest("hex");
+      expect(digest).toBe(fixture.manifest_signed_body.rules[index]?.sha256);
+    }
+    expect(sawAstral).toBe(true);
+  });
+
+  it("lone-surrogate vector: Node canonicalizes deterministically where Swift decode fails closed", async () => {
+    // Structural incompatibility, not a bug: Swift's String type is
+    // Unicode-scalar-based and cannot represent an unpaired surrogate at
+    // all, so Foundation's JSONDecoder/JSONSerialization reject this fixture
+    // outright (see the Swift-side
+    // testLoneSurrogateFixtureFailsClosedOnDecode, which asserts the throw).
+    // This TS test only proves the Node half: canonicalize() succeeds and is
+    // deterministic (ES2019 "well-formed JSON.stringify" escapes the lone
+    // surrogate as \ud800 rather than emitting ill-formed UTF-8), matching
+    // "Node JSON.stringify(\"\ud800\") emits \"\\ud800\"" from the #915 review.
+    const fixture = await loadNamedFixture("manifest-parity-vector-lone-surrogate");
+
+    expect(fixture.manifest_signed_body.fortress_id).toContain("\ud800");
+
+    const actualCanonical = new TextEncoder().encode(
+      canonicalize(fixture.manifest_signed_body),
+    );
+    expect(Buffer.from(actualCanonical).toString("hex")).toBe(
+      fixture.expected_canonical_json_hex,
+    );
+    // The escaped lone surrogate renders as plain ASCII backslash-u-d800 in
+    // the output text, so the canonical bytes are themselves well-formed
+    // UTF-8 even though the logical string is not well-formed Unicode.
+    expect(Buffer.from(actualCanonical).toString("utf8")).toContain("\\ud800");
   });
 });
