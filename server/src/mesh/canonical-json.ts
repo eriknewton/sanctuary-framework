@@ -61,6 +61,23 @@ function encode(value: unknown): string {
         `canonicalize(): non-finite number (${String(value)}) is not serializable`
       );
     }
+    // Fail-closed cross-language parity guard (mirrors the identical check
+    // in server/src/bridge/bridge.ts stableStringify): a JS `number` is an
+    // IEEE-754 float64 and cannot exactly represent integers beyond
+    // Number.MAX_SAFE_INTEGER (2^53-1). Swift's JSONValue.integer(Int64)
+    // case preserves full 64-bit precision, so an unsafe integer would
+    // silently canonicalize to a DIFFERENT digit string on the Node side
+    // than on the Swift side (e.g. Int64.max round-trips through
+    // JSON.parse -> JSON.stringify as "9223372036854776000", not
+    // "9223372036854775807") with no exception on either side -- exactly
+    // the class of non-fail-closed cross-language divergence #915 was.
+    // Reject rather than silently mangle; callers needing u64-scale values
+    // must carry them as strings.
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new MeshCanonicalJsonError(
+        `canonicalize(): unsafe integer (${String(value)}) cannot be represented exactly as a JS number and would silently diverge from Swift's Int64 canonicalization. Use a string for integers outside JavaScript's safe range.`
+      );
+    }
     return JSON.stringify(value);
   }
   if (typeof value === "string") return JSON.stringify(value);

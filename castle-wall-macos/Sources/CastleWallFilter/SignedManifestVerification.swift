@@ -170,6 +170,33 @@ public enum SignedManifestVerifier {
             // Node sorts keys by UTF-16 code units (Array.prototype.sort on
             // strings); Swift's default String ordering differs, so compare
             // explicit UTF-16 code-unit sequences.
+            //
+            // DEBT (#921 follow-up, contained-not-fixed): `dict` here is a
+            // genuinely dynamic `[String: JSONValue]` map. Swift's String
+            // equality is Unicode canonical-equivalence-aware, so if this
+            // dictionary was populated by decoding raw untrusted JSON text
+            // (e.g. an IPC-delivered `receivedRules` payload) rather than
+            // through a fixed-key Codable struct, two RAW-DISTINCT JSON keys
+            // that are NFC/NFD-equivalent (e.g. precomposed "e-acute" vs.
+            // "e" + combining acute) silently collapse into ONE dictionary
+            // entry (last-decoded wins) before this function ever runs --
+            // see testCanonicalKeyOrderCollapsesCanonicallyEquivalentKeysOnDecode
+            // in ManifestParityVectorTests.swift, which documents the exact
+            // divergence against the TS canonicalizer (which does NOT
+            // normalize and treats the two keys as distinct). This is
+            // CONTAINED today: every field that reaches this function
+            // (AllowlistManifest / ManifestRuleEntry / AgentOrigin /
+            // OperatorBaseline) is a fixed-key Codable struct, never a
+            // dynamic map, so the per-rule digest / manifest-signature
+            // checks fail closed on any resulting byte-count mismatch. If a
+            // FUTURE signed field introduces a genuinely dynamic
+            // `[String: JSONValue]` map, this collapse becomes live and
+            // needs a fix before that field ships -- e.g. decode such maps
+            // from an ordered key/value array instead of a Swift
+            // Dictionary, or reject decode outright on any UTF-16-distinct
+            // keys that compare canonically-equal. Not fixed here (no
+            // dynamic-map field exists yet to regress); flagged so it is
+            // not rediscovered from scratch.
             let keys = dict.keys.sorted {
                 Array($0.utf16).lexicographicallyPrecedes(Array($1.utf16))
             }
