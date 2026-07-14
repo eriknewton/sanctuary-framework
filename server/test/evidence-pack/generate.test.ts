@@ -338,6 +338,31 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("NOT a confirmed exfiltration");
   });
 
+  it("F1 (round-2 sweep): the egress table discloses its deny-only row basis", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: emptyVerified(),
+          mcp_servers: emptyVerified(),
+          observed_destinations: populated([
+            { host: "api.telegram.org", port: 443, protocol: "tcp", times_seen: 812, exfil_risk: true },
+          ]),
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    // The legend must state, adjacent to the table, that rows are BLOCKED
+    // observations (not contacts) and that allowed egress is structurally
+    // absent - closing both the self-incriminating and the flattering read.
+    expect(report).toContain("BLOCKED flow observations only");
+    expect(report).toContain("a destination the wall DENIED");
+    expect(report).toContain("a count of those denied attempts");
+    expect(report).toContain("allowed egress is not inventoried");
+    expect(report).toContain("not a census of where the machines' traffic actually went");
+  });
+
   it("OPEN-MED-1 (confirmatory): the egress 'Seen' column is disclosed as all-time, not quarter-scoped", () => {
     const pack = buildEvidencePack(
       {
