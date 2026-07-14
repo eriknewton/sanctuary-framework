@@ -75,18 +75,19 @@
  *    ROW'S AGENT is never minted (suppressed), and a persisted row that is
  *    now allowed for its agent is removed -- so after a clean refresh, no
  *    pending candidate names a flow the operator's policy permits (the
- *    invariant the evidence pack's "Destinations permitted by the
- *    operator's policy do NOT appear here" legend asserts). The verdict is
- *    the DAEMON'S OWN semantics (Codex round-3 + round-4 HIGHs): scope
- *    applies (a rule promoted for template A does NOT permit template B's
- *    identical destination -- B's candidate stays pending and keeps
- *    re-minting) and FIRST MATCH WINS in manifest order (a leading
- *    matching deny/prompt beats a later allow), via
- *    `evaluateFlowFirstMatch` in `../allowlist/match.ts`, which mirrors
- *    `PolicySnapshot::evaluate` (castle-wall-daemon/src/policy.rs); only
- *    an unconditional first-matching `allow` suppresses (a time_window
- *    allow is conditional and never suppresses). observe/ still never
- *    imports the evaluator module (THE RED-LINE structural pin). An allowlist that is
+ *    invariant the evidence pack's egress-table legend asserts). The
+ *    verdict never reconstructs any single enforcer (Codex rounds 3-6:
+ *    the three shipped enforcers diverge on precedence, scope handling,
+ *    and pattern syntax); it is the conservative CROSS-ENFORCER
+ *    DISCIPLINE documented on `candidateCurrentlyAllowed`: a generous
+ *    union deny/prompt veto plus an exact unconditional scope-covering
+ *    allow on the axes every enforcer agrees on (catch-all destination,
+ *    exact host, or exact ip -- exactly the shape promote synthesizes).
+ *    A rule scoped to template A never suppresses template B's identical
+ *    destination; a matching deny/prompt anywhere vetoes (macOS
+ *    deny-wins); pattern/cidr allows leave rows pending (disclosed
+ *    conservative staleness). observe/ still never imports the evaluator
+ *    module (THE RED-LINE structural pin). An allowlist that is
  *    present but does NOT verify aborts the refresh loud -- never silently
  *    skips the filter (WHAT THESE TOOLS MUST NEVER DO #5). Pruning is
  *    safe-direction (removes candidate rows, exactly like `observe
@@ -112,12 +113,9 @@
  */
 
 import type { AllowlistRule } from "../allowlist/schema.js";
-import {
-  allowlistAllowsFlow,
-  canonicalizeConnectAuthority,
-  evaluateFlowFirstMatch,
-  type CanonicalConnectAuthority,
-} from "../allowlist/match.js";
+import { ruleProtocolMatches, ruleScopeCoversAgent } from "../allowlist/match.js";
+import { ipMatches, cidrMatches } from "../allowlist/ip-cidr.js";
+import type { RuleMatch } from "../allowlist/schema.js";
 import type { VerifiedChainConsumer } from "../../operational/audit-log.js";
 import { flowEventFromAuditEntry } from "./adapter.js";
 import { foldObservations } from "./fold.js";
@@ -225,56 +223,132 @@ export type RefreshOutcome =
  *     denies/prompts that flow and keeps recording egress_blocked, so the
  *     candidate must NOT be suppressed just because SOME allow rule also
  *     matches).
- * Suppression/prune happens ONLY when EVERY shipped enforcer interpretation
- * allows the flow (the intersection -- Codex round-5 HIGH: the two shipped
- * enforcers disagree on host_pattern syntax, so a single-enforcer verdict
- * can suppress a candidate the OTHER enforcer still denies and records):
- *   - the DAEMON leg must be an unconditional first-matching `allow`
- *     (a rule carrying a time_window is conditional -- its allowance is not
- *     always in force, and the Linux daemon refuses such manifests
- *     outright -- so it never suppresses), AND
- *   - the CONNECT-PROXY leg (`allowlistAllowsFlow`: scope-blind, allow-only,
- *     `*.suffix` pattern form -- the proxy family's own semantics) must
- *     also allow it.
- * A consequence: an allow rule whose ONLY matching axis is host_pattern
- * never suppresses (the two syntaxes are disjoint, so no pattern satisfies
- * both legs) -- the conservative direction: a stale pending row, never a
- * hidden denied flow. Fail-closed toward KEEPING the candidate: a
- * destination that cannot canonicalize can never be allowed by the wall
- * (the proxy denies `canonicalization_failed`), so it stays a candidate.
+ * THE CROSS-ENFORCER DISCIPLINE (Codex rounds 3-6: three shipped enforcers,
+ * three divergent semantics -- Rust daemon: first-match-wins, scope-aware,
+ * `.suffix` patterns only; macOS filter: deny-ANYWHERE-wins over allow,
+ * scope-aware, `*.suffix` patterns; TS CONNECT proxy: some-allow,
+ * scope-blind, deny-blind, `*.suffix` patterns. Reconstructing any single
+ * enforcer's verdict here suppressed candidates another enforcer still
+ * denies and records). Suppression therefore never models one enforcer; it
+ * requires BOTH of:
+ *   1. NO DENY/PROMPT COULD FIRE (a generous UNION veto): any deny or
+ *      prompt rule whose destination/port/protocol could match this flow
+ *      under ANY shipped enforcer's syntax -- either pattern form, exact
+ *      pattern, host, ip, cidr, ignoring scope -- vetoes suppression.
+ *      Over-vetoing only KEEPS a candidate (conservative).
+ *   2. AN EXACT UNCONDITIONAL ALLOW EXISTS: an allow rule with no
+ *      time_window (conditional allowance never suppresses; the Linux
+ *      daemon refuses such manifests outright), whose scope covers this
+ *      row's agent (`ruleScopeCoversAgent` -- identical semantics in the
+ *      daemon and the macOS filter; the scope-blind proxy allows a
+ *      fortiori), and whose destination matches on the axes EVERY enforcer
+ *      agrees on: a catch-all destination (no destination axes), an exact
+ *      (ASCII-case-insensitive) `host` entry for a hostname-bearing row,
+ *      or an exact `ip` entry for an IP-only row. host_pattern and cidr
+ *      NEVER satisfy the allow leg (their semantics differ or are
+ *      unshared across enforcers) -- such rules leave the row pending, a
+ *      disclosed conservative staleness, never a hidden denied flow.
+ * This is exactly the shape the promote flow synthesizes
+ * (host-or-ip + port + protocol + template/agent scope), so the product's
+ * own promote-then-refresh path always suppresses; anything less exact
+ * stays visible for review.
  */
 export function candidateCurrentlyAllowed(
   rules: readonly AllowlistRule[],
   row: Pick<CandidateObservation, "agent_id" | "agent_template" | "host" | "ip" | "port" | "protocol">,
 ): boolean {
   if (rules.length === 0) return false;
-  const dest = row.host ?? row.ip;
-  let target: CanonicalConnectAuthority;
-  try {
-    // A raw IPv6 literal needs brackets to form a canonical authority.
-    const authorityHost = dest.includes(":") && !dest.startsWith("[") ? `[${dest}]` : dest;
-    target = canonicalizeConnectAuthority(`${authorityHost}:${row.port}`);
-  } catch {
-    return false;
+
+  for (const rule of rules) {
+    if (rule.disposition === "allow") continue;
+    if (denyOrPromptCouldMatch(rule.match, row)) return false;
   }
-  const daemonVerdict = evaluateFlowFirstMatch(rules, target, row.protocol, {
-    agent_id: row.agent_id,
-    agent_template: row.agent_template,
-  });
-  const daemonAllows =
-    daemonVerdict !== null &&
-    daemonVerdict.disposition === "allow" &&
-    daemonVerdict.rule.time_window === undefined;
-  if (!daemonAllows) return false;
-  try {
-    return allowlistAllowsFlow([...rules], target, row.protocol);
-  } catch {
-    // The proxy-family matcher can throw canonicalizing an unusual rule
-    // host/pattern (e.g. a leading-dot pattern fed to its exact-host arm).
-    // A rule whose proxy-leg evaluation cannot even complete is NOT a
-    // positive both-enforcers allow -- keep the candidate (fail-closed).
-    return false;
+
+  const agent = { agent_id: row.agent_id, agent_template: row.agent_template };
+  return rules.some(
+    (rule) =>
+      rule.disposition === "allow" &&
+      rule.time_window === undefined &&
+      ruleScopeCoversAgent(rule.scope, agent) &&
+      ruleProtocolMatches(rule.match.protocol, row.protocol) &&
+      portAxisAdmits(rule.match.port, row.port) &&
+      allowDestinationExact(rule.match, row),
+  );
+}
+
+/** ASCII-only lowercase (parity with the Rust daemon's `to_ascii_lowercase`; JS `toLowerCase` also folds non-ASCII, which the daemon does not). */
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
+function portAxisAdmits(spec: number | number[] | undefined, port: number): boolean {
+  if (spec === undefined) return true;
+  return Array.isArray(spec) ? spec.includes(port) : spec === port;
+}
+
+function asArray<T>(value: T | T[]): T[] {
+  return Array.isArray(value) ? value : [value];
+}
+
+/** The allow leg's destination test: ONLY the axes every shipped enforcer agrees on (see candidateCurrentlyAllowed doc). */
+function allowDestinationExact(
+  match: RuleMatch,
+  row: Pick<CandidateObservation, "host" | "ip">,
+): boolean {
+  const hasHost = match.host !== undefined;
+  const hasPattern = match.host_pattern !== undefined && match.host_pattern.length > 0;
+  const hasIp = match.ip !== undefined;
+  const hasCidr = match.cidr !== undefined;
+  if (!hasHost && !hasPattern && !hasIp && !hasCidr) {
+    // No destination axes: every enforcer treats the destination as
+    // non-constraining (port/protocol alone decide).
+    return true;
   }
+  if (row.host !== null) {
+    const hostLower = asciiLower(row.host);
+    return hasHost && asArray(match.host!).some((h) => asciiLower(h) === hostLower);
+  }
+  return hasIp && row.ip.length > 0 && ipMatches(match.ip!, row.ip);
+}
+
+/** The veto leg: could this deny/prompt rule's match-clause fire for this flow under ANY shipped enforcer's syntax? Generous by design (scope ignored; both pattern forms honored; exact-pattern form honored; host treated as IP literal for ip/cidr axes). Over-matching only KEEPS a candidate. */
+function denyOrPromptCouldMatch(
+  match: RuleMatch,
+  row: Pick<CandidateObservation, "host" | "ip" | "port" | "protocol">,
+): boolean {
+  if (!ruleProtocolMatches(match.protocol, row.protocol)) return false;
+  if (!portAxisAdmits(match.port, row.port)) return false;
+
+  const hasHost = match.host !== undefined;
+  const hasPattern = match.host_pattern !== undefined && match.host_pattern.length > 0;
+  const hasIp = match.ip !== undefined;
+  const hasCidr = match.cidr !== undefined;
+  if (!hasHost && !hasPattern && !hasIp && !hasCidr) return true;
+
+  if (row.host !== null) {
+    const hostLower = asciiLower(row.host);
+    if (hasHost && asArray(match.host!).some((h) => asciiLower(h) === hostLower)) return true;
+    if (hasPattern && patternCouldMatch(match.host_pattern!, hostLower)) return true;
+  }
+  for (const literal of [row.ip, row.host ?? ""]) {
+    if (literal.length === 0) continue;
+    if (hasIp && ipMatches(match.ip!, literal)) return true;
+    if (hasCidr && cidrMatches(match.cidr!, literal)) return true;
+  }
+  return false;
+}
+
+/** Union of every shipped enforcer's host_pattern syntax: `*.suffix` (proxy/macOS), `.suffix` (Rust daemon), and the exact-pattern fallback (macOS compares a non-wildcard pattern as an exact host). */
+function patternCouldMatch(pattern: string, hostLower: string): boolean {
+  const patternLower = asciiLower(pattern);
+  if (patternLower.startsWith("*.")) {
+    const dotSuffix = patternLower.slice(1); // ".suffix"
+    return hostLower.endsWith(dotSuffix) && hostLower.length > dotSuffix.length;
+  }
+  if (patternLower.startsWith(".")) {
+    return hostLower.endsWith(patternLower) && hostLower.length > patternLower.length;
+  }
+  return patternLower === hostLower;
 }
 
 /**

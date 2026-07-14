@@ -286,8 +286,22 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
     expect((await harness.store.listCandidates()).size).toBe(1);
   });
 
-  it("fail-closed toward KEEPING: a destination that cannot canonicalize is never treated as allowed", () => {
-    const rules = [allowRule({ host: undefined, port: [443] })]; // port-only rule: matches any destination on 443
+  it("a catch-all-destination allow (port/protocol only) suppresses -- every enforcer treats an absent destination axis as non-constraining", () => {
+    const rules = [allowRule({ host: undefined, port: [443] })];
+    expect(
+      candidateCurrentlyAllowed(rules, {
+        agent_id: "agent-1",
+        agent_template: "claude-code",
+        host: "api.example.com",
+        ip: "203.0.113.5",
+        port: 443,
+        protocol: "tcp",
+      }),
+    ).toBe(true);
+  });
+
+  it("fail-closed toward KEEPING: a host-axis allow never matches a row with a different (even malformed) host", () => {
+    const rules = [allowRule()]; // host: ["api.example.com"]
     expect(
       candidateCurrentlyAllowed(rules, {
         agent_id: "agent-1",
@@ -335,7 +349,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
     expect((await harness.store.listCandidates()).size).toBe(0);
   });
 
-  it("round-4 HIGH: FIRST MATCH WINS -- a leading matching deny beats a later allow, so the candidate is NOT suppressed (daemon parity)", async () => {
+  it("round-4 HIGH: a matching deny BEFORE an allow vetoes suppression (the daemon's first match denies; the flow keeps being recorded)", async () => {
     const harness = makeHarness();
     await appendBlocked(harness.auditLog);
     const denyFirst = [
@@ -343,13 +357,11 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
       allowRule(),
     ];
     const outcome = await refresh(harness, denyFirst);
-    // The daemon denies this flow (first match), so it keeps recording
-    // egress_blocked and the candidate must stay pending review.
     expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
     expect((await harness.store.listCandidates()).size).toBe(1);
   });
 
-  it("round-4 HIGH counterpart: allow-first-then-deny still suppresses (the allow is the first match, as the daemon would allow the flow)", async () => {
+  it("round-6 HIGH: a matching deny AFTER an allow ALSO vetoes suppression (macOS deny-anywhere-wins would drop and record this flow)", async () => {
     const harness = makeHarness();
     await appendBlocked(harness.auditLog);
     const allowFirst = [
@@ -357,7 +369,25 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
       { ...allowRule(), id: "deny-second", disposition: "deny" as const },
     ];
     const outcome = await refresh(harness, allowFirst);
-    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
+    // The Linux daemon (first-match) would allow, but the macOS filter
+    // drops on ANY matching deny -- so this flow can still be denied and
+    // recorded on a shipped enforcer, and the candidate must stay.
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("round-6 HIGH: an exact-host allow never suppresses an IP-ONLY observation (OS enforcers cannot match a host axis against a raw-IP flow)", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog, { host: null, ip: "203.0.113.10" });
+    const hostRuleForIp = [allowRule({ host: ["203.0.113.10"] })];
+    const outcome = await refresh(harness, hostRuleForIp);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+
+    // The exact `ip` axis IS the agreed axis for an IP-only row.
+    const ipRule = [allowRule({ host: undefined, ip: ["203.0.113.10"] })];
+    const again = await refresh(harness, ipRule);
+    expect(again.status === "refreshed" && again.removed_now_allowed).toBe(1);
     expect((await harness.store.listCandidates()).size).toBe(0);
   });
 

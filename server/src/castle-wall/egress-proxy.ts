@@ -21,7 +21,6 @@ import { intersectVerdicts, type EnforcementDecision, type HostDecision } from "
 export {
   canonicalizeConnectAuthority,
   allowlistAllowsTarget,
-  allowlistAllowsFlow,
   ruleMatchesTarget,
   ConnectAuthorityError,
   type CanonicalConnectAuthority,

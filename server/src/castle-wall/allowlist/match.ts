@@ -16,15 +16,23 @@
  * Behavior contract: `canonicalizeConnectAuthority`, `ruleMatchesTarget`, and
  * `allowlistAllowsTarget` are byte-identical in behavior to their pre-move
  * `egress-proxy.ts` versions (existing egress-proxy tests pin them).
- * `allowlistAllowsFlow` is the protocol-generalized variant: identical
- * destination/port semantics, with the protocol axis parameterized instead of
- * hard-wired to the CONNECT proxy's tcp.
+ * `ruleScopeCoversAgent` and `ruleProtocolMatches` are the two axes whose
+ * semantics every shipped enforcer agrees on, exported for consumers (the
+ * observe refresh) that reason about agent-attributed flows. NOTE the axes
+ * the enforcers do NOT agree on: host_pattern syntax differs per enforcer
+ * (the proxy/Swift honor `*.suffix`; the Rust daemon honors only
+ * `.suffix`), and deny/allow precedence differs (daemon first-match-wins;
+ * macOS deny-anywhere-wins; the proxy evaluates allow rules only) -- a
+ * consumer needing a cross-enforcer "is this flow allowed" answer must not
+ * reconstruct any single enforcer here (see
+ * `observe/refresh.ts#candidateCurrentlyAllowed` for the conservative
+ * intersection discipline).
  */
 
 import net from "node:net";
 import { domainToASCII } from "node:url";
 
-import type { AllowlistRule, RuleDisposition, RuleProtocol, RuleScope } from "./schema.js";
+import type { AllowlistRule, RuleProtocol, RuleScope } from "./schema.js";
 import { ipMatches, cidrMatches } from "./ip-cidr.js";
 
 export interface CanonicalConnectAuthority {
@@ -122,8 +130,8 @@ export function canonicalizeConnectAuthority(input: string): CanonicalConnectAut
   };
 }
 
-/** Does the rule's protocol axis admit `protocol`? Absent = match any (only port/destination constrain). */
-function ruleProtocolMatches(spec: RuleProtocol | undefined, protocol: "tcp" | "udp"): boolean {
+/** Does the rule's protocol axis admit `protocol`? Absent = match any (only port/destination constrain). Identical semantics in every shipped enforcer (TS proxy, Rust daemon, Swift filter). */
+export function ruleProtocolMatches(spec: RuleProtocol | undefined, protocol: "tcp" | "udp"): boolean {
   if (spec === undefined) return true;
   return spec === protocol || spec === "tcp+udp";
 }
@@ -137,17 +145,8 @@ function ruleProtocolMatches(spec: RuleProtocol | undefined, protocol: "tcp" | "
  * axes match `target.host` only when it is an IP literal (a DNS flow to a
  * resolver connects by raw IP), so a hostname target never spuriously matches.
  *
- * `patternMatcher` parameterizes the ONE axis whose syntax the two shipped
- * enforcers disagree on (host_pattern): the CONNECT proxy honors the
- * `*.suffix` form, the Linux daemon honors ONLY the `.suffix` form and
- * treats anything else as a defensive non-match. Each consumer picks its
- * enforcer's exact semantics; there is no blended form.
  */
-function ruleMatchesDestinationWith(
-  rule: AllowlistRule,
-  target: CanonicalConnectAuthority,
-  patternMatcher: (pattern: string, host: string) => boolean,
-): boolean {
+function ruleMatchesDestination(rule: AllowlistRule, target: CanonicalConnectAuthority): boolean {
   if (rule.match.port !== undefined && !portMatches(rule.match.port, target.port)) {
     return false;
   }
@@ -163,7 +162,7 @@ function ruleMatchesDestinationWith(
   if (rule.match.host !== undefined && hostMatches(rule.match.host, target.host)) {
     return true;
   }
-  if (rule.match.host_pattern !== undefined && rule.match.host_pattern.length > 0 && patternMatcher(rule.match.host_pattern, target.host)) {
+  if (rule.match.host_pattern !== undefined && rule.match.host_pattern.length > 0 && hostPatternMatches(rule.match.host_pattern, target.host)) {
     return true;
   }
   if (rule.match.ip !== undefined && ipMatches(rule.match.ip, target.host)) {
@@ -173,11 +172,6 @@ function ruleMatchesDestinationWith(
     return true;
   }
   return false;
-}
-
-/** The CONNECT proxy's destination matching (host_pattern in the `*.suffix` form). Byte-identical behavior to the pre-extraction `egress-proxy.ts` matcher. */
-function ruleMatchesDestination(rule: AllowlistRule, target: CanonicalConnectAuthority): boolean {
-  return ruleMatchesDestinationWith(rule, target, hostPatternMatches);
 }
 
 /** The CONNECT proxy's per-rule check: tcp protocol semantics + destination/port. Byte-identical behavior to the pre-move `egress-proxy.ts` version. */
@@ -213,60 +207,6 @@ export function ruleScopeCoversAgent(
   return false;
 }
 
-/**
- * Protocol-generalized variant of `allowlistAllowsTarget` for consumers that
- * evaluate non-CONNECT flows (the observe engine's allowlist-aware fold folds
- * udp observations too). Identical destination/port semantics; the protocol
- * axis is checked against the OBSERVED flow's protocol instead of the CONNECT
- * proxy's hard-wired tcp. Scope is NOT evaluated here -- callers that know
- * the flow's agent must pre-filter with `ruleScopeCoversAgent` (the daemon
- * enforces scope, so a destination-only match is NOT "allowed for this
- * agent").
- */
-export function allowlistAllowsFlow(
-  rules: AllowlistRule[],
-  target: CanonicalConnectAuthority,
-  protocol: "tcp" | "udp",
-): boolean {
-  return rules.some(
-    (rule) =>
-      rule.disposition === "allow" &&
-      ruleProtocolMatches(rule.match.protocol, protocol) &&
-      ruleMatchesDestination(rule, target),
-  );
-}
-
-/**
- * FIRST-MATCH-WINS evaluation of an agent-attributed flow against a ruleset,
- * mirroring the enforcing Rust daemon's `PolicySnapshot::evaluate`
- * (castle-wall-daemon/src/policy.rs): walk the rules in manifest order; the
- * first rule whose SCOPE applies to the agent AND whose match-clause covers
- * the destination/port/protocol decides the flow via its disposition; no
- * matching rule is `null` (the daemon's default-deny). A leading matching
- * `deny` (or `prompt`) therefore beats a later matching `allow`, exactly as
- * the daemon enforces -- consumers must never reduce this to "some allow
- * rule matches" (`allowlistAllowsTarget` does exactly that for the CONNECT
- * proxy's scope-less, allow-only path; it is NOT agent-verdict parity).
- * host_pattern uses the DAEMON's syntax (`hostPatternMatchesDaemon`:
- * leading-dot suffix only; a `*.suffix` or otherwise-malformed pattern is a
- * defensive non-match), NOT the proxy's `*.suffix` form -- the two shipped
- * enforcers disagree on this one axis and this function answers "what would
- * the DAEMON do", never a blend.
- */
-export function evaluateFlowFirstMatch(
-  rules: readonly AllowlistRule[],
-  target: CanonicalConnectAuthority,
-  protocol: "tcp" | "udp",
-  agent: { agent_id: string; agent_template: string },
-): { disposition: RuleDisposition; rule: AllowlistRule } | null {
-  for (const rule of rules) {
-    if (!ruleScopeCoversAgent(rule.scope, agent)) continue;
-    if (!ruleProtocolMatches(rule.match.protocol, protocol)) continue;
-    if (!ruleMatchesDestinationWith(rule, target, hostPatternMatchesDaemon)) continue;
-    return { disposition: rule.disposition, rule };
-  }
-  return null;
-}
 
 function portMatches(spec: number | number[], port: number): boolean {
   return Array.isArray(spec) ? spec.includes(port) : spec === port;
@@ -283,21 +223,6 @@ function hostPatternMatches(pattern: string, host: string): boolean {
     return host.endsWith(`.${suffix}`) && host !== suffix;
   }
   return canonicalizeRuleHost(pattern) === host;
-}
-
-/**
- * The Linux daemon's host_pattern semantics -- a faithful port of
- * `matches_suffix_pattern` (castle-wall-daemon/src/policy.rs): the pattern
- * MUST start with '.', the host matches when it ends with the pattern, and
- * the bare apex does not match. Any other shape (including the CONNECT
- * proxy's `*.suffix` form) is a defensive NON-MATCH, exactly as the daemon
- * treats it -- so a consumer computing an agent-attributed daemon verdict
- * (`evaluateFlowFirstMatch`) never claims a match the daemon would not make.
- */
-function hostPatternMatchesDaemon(pattern: string, hostLower: string): boolean {
-  const patternLower = pattern.toLowerCase();
-  if (!patternLower.startsWith(".")) return false;
-  return hostLower.endsWith(patternLower) && hostLower.length > patternLower.length;
 }
 
 function canonicalizeRuleHost(host: string): string {
