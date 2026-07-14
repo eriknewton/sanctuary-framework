@@ -349,12 +349,15 @@ export async function runObserveCandidates(
     // a destination the operator's verified policy already permits is never
     // minted -- and is pruned if present. See castle-wall/observe/refresh.ts.
     let outcome;
+    let lockHolderDescription = "";
     try {
       outcome = await refreshCandidatesFromAudit({
         auditLog: boot.auditLog,
         store: boot.observeStore,
         readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
-        lock: observeRefreshFileLock(boot.fortressPath),
+        lock: observeRefreshFileLock(boot.fortressPath, (holder) => {
+          lockHolderDescription = holder;
+        }),
         now: new Date(),
       });
     } catch (error) {
@@ -372,9 +375,11 @@ export async function runObserveCandidates(
     if (outcome.status === "refresh_in_progress") {
       write(
         err,
-        "Error: another `observe candidates` refresh is already running for this fortress. " +
-          "Nothing was changed (a concurrent double-fold would inflate the Seen counts). " +
-          "Wait for it to finish and re-run; a crashed run's lock is broken automatically.\n",
+        "Error: another `observe candidates` refresh holds this fortress's refresh lock" +
+          (lockHolderDescription ? ` (${lockHolderDescription})` : "") +
+          ". Nothing was changed (a concurrent double-fold would inflate the Seen counts). " +
+          "If the holder is still running, wait for it and re-run. This lock is never broken " +
+          "automatically.\n",
       );
       return 1;
     }
@@ -445,53 +450,66 @@ function isLockHolderAlive(pid: number): boolean {
   }
 }
 
-/** Break a PROVABLY-stale refresh lock (dead recorded holder). An unreadable/unparseable lock is NEVER broken -- fail toward not folding, never toward folding concurrently. */
-async function breakStaleObserveRefreshLock(lockPath: string): Promise<boolean> {
+/** Best-effort description of who holds the refresh lock, for the operator-facing contention message. Never throws. */
+async function describeLockHolder(lockPath: string): Promise<string> {
   try {
-    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as { pid?: unknown };
-    const pid = typeof parsed.pid === "number" ? parsed.pid : Number.NaN;
-    if (isLockHolderAlive(pid)) return false;
-    await rm(lockPath, { force: true });
-    return true;
+    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as {
+      pid?: unknown;
+      acquired_at?: unknown;
+    };
+    const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+    const at = typeof parsed.acquired_at === "string" ? parsed.acquired_at : "an unknown time";
+    if (pid === null) return `held since ${at} by an unrecorded process`;
+    return isLockHolderAlive(pid)
+      ? `held since ${at} by running process ${pid}`
+      : `held since ${at} by process ${pid}, which is NO LONGER RUNNING -- this lock is almost ` +
+          `certainly stale from a crashed run; verify with \`ps -p ${pid}\` and then remove ${lockPath}`;
   } catch {
-    return false;
+    return `present but unreadable at ${lockPath}`;
   }
 }
 
 /**
- * Cross-process refresh lock: O_EXCL create with pid + stale-holder breaking,
- * the same shape as the audit write lock (operational/audit-log.ts). Two
- * concurrent `observe candidates` invocations are separate processes, so the
- * in-process lock cannot cover them; whoever loses the race gets a clean
- * "another refresh is in progress" abort instead of a double-folded count.
+ * Cross-process refresh lock: O_EXCL create with pid metadata, NEVER
+ * auto-broken. Two concurrent `observe candidates` invocations are separate
+ * processes, so the in-process lock cannot cover them; whoever loses the
+ * O_EXCL race gets a clean "another refresh is in progress" abort instead of
+ * a double-folded count.
+ *
+ * WHY no automatic stale-lock breaking (Codex two-family gate round 2,
+ * HIGH): any read-check-unlink-retry scheme has a TOCTOU -- a slow breaker
+ * that read the stale file before a peer broke it can unlink the peer's
+ * FRESHLY-created lock, and then two refreshes run concurrently, which is
+ * exactly the double-count this lock exists to prevent. A lock left by a
+ * crashed run is instead surfaced with exact operator guidance (holder pid,
+ * liveness, the file to remove); removal is a deliberate human action, never
+ * a race. Fail toward not folding, never toward folding twice.
  */
-export function observeRefreshFileLock(fortressPath: string): RefreshLock {
+export function observeRefreshFileLock(
+  fortressPath: string,
+  onContention?: (holderDescription: string) => void,
+): RefreshLock {
   const lockPath = join(fortressPath, OBSERVE_REFRESH_LOCK_FILE);
   return {
     async acquire() {
-      for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const handle = await open(lockPath, "wx", 0o600);
         try {
-          const handle = await open(lockPath, "wx", 0o600);
-          try {
-            await handle.writeFile(
-              JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() }),
-            );
-            await handle.sync();
-          } finally {
-            await handle.close();
-          }
-          return async () => {
-            await rm(lockPath, { force: true });
-          };
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          if (attempt === 0 && (await breakStaleObserveRefreshLock(lockPath))) {
-            continue;
-          }
-          return null;
+          await handle.writeFile(
+            JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() }),
+          );
+          await handle.sync();
+        } finally {
+          await handle.close();
         }
+        return async () => {
+          await rm(lockPath, { force: true });
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (onContention) onContention(await describeLockHolder(lockPath));
+        return null;
       }
-      return null;
     },
   };
 }
@@ -999,15 +1017,39 @@ export async function runObserveDiscard(
         .filter(([, candidate]) => destinations.includes(destinationLabel(candidate)))
         .map(([key]) => key);
 
-  for (const key of keysToRemove) {
-    await boot.observeStore.removeCandidate(key);
-  }
+  if (keysToRemove.length > 0) {
+    // The discard audit entry is the REVIEW MARKER the refresh chokepoint's
+    // recompute heal depends on to not resurrect discarded candidates from
+    // retained history (castle-wall/observe/refresh.ts guarantee 3; Codex
+    // two-family gate round 2, HIGH). It is therefore written CRITICALLY and
+    // BEFORE the rows are removed: if the append fails, the discard aborts
+    // with the rows intact (fail-closed; the operator retries). A crash
+    // between the append and the removals is harmless -- the marker only
+    // bounds what a recompute may MINT for keys absent from the store, and
+    // the still-present rows heal normally.
+    try {
+      await boot.auditLog.appendCritical({
+        layer: "l1",
+        operation: "castle_wall_observe_discard",
+        identity_id: boot.primary.identity_id,
+        result: "success",
+        details: { discarded_count: keysToRemove.length },
+      });
+    } catch (error) {
+      write(
+        err,
+        `Error: the discard could not be recorded in the audit log (${(error as Error).message}). ` +
+          "Nothing was discarded; the discard record is what prevents a discarded destination " +
+          "from reappearing out of retained history, so it must land first. Re-run after " +
+          "resolving the audit-log failure.\n",
+      );
+      return 1;
+    }
 
-  await bestEffortAudit(boot.auditLog, {
-    identity_id: boot.primary.identity_id,
-    operation: "castle_wall_observe_discard",
-    details: { discarded_count: keysToRemove.length },
-  });
+    for (const key of keysToRemove) {
+      await boot.observeStore.removeCandidate(key);
+    }
+  }
 
   write(out, `Discarded ${keysToRemove.length} candidate(s).\n`);
   return 0;

@@ -485,6 +485,72 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
     expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
   });
 
+  it("round-2 MED: a watermark whose sequence was pruned off the surviving chain is NOT blindly honored -- it recomputes (identity unverifiable)", async () => {
+    const harness = makeHarness();
+    // Fake verified-chain source whose surviving suffix starts ABOVE the
+    // persisted watermark's sequence (heavy FIFO pruning between refreshes,
+    // or a reset chain that regrew and pruned past the old position -- the
+    // two are indistinguishable, which is exactly why this must recompute).
+    const prunedSource = {
+      async streamVerifiedChain(consumer: {
+        onEntry: (item: { sequence: number; entry_hash: string; entry: unknown }) => void;
+      }): Promise<void> {
+        for (const sequence of [6, 7]) {
+          consumer.onEntry({
+            sequence,
+            entry_hash: `hash-${sequence}`,
+            entry: {
+              timestamp: `2026-07-14T10:0${sequence}:00.000Z`,
+              layer: "l1",
+              operation: "egress_blocked",
+              identity_id: "castle-wall-daemon",
+              result: "failure",
+              details: {
+                agent: { id: "agent-1", template: "claude-code" },
+                destination: { host: "pruned.example.net", ip: "198.51.100.9", port: 443, protocol: "tcp", hostname_source: "sni" },
+              },
+            },
+          });
+        }
+      },
+    };
+    await harness.store.setFoldWatermark({
+      folded_through_sequence: 5,
+      entry_hash: "hash-from-an-unverifiable-past",
+      updated_at: "2026-07-01T00:00:00.000Z",
+    });
+
+    const outcome = await refreshCandidatesFromAudit({
+      auditLog: prunedSource as never,
+      store: harness.store,
+      readAllowlist: verifiedAllowlist([]),
+      lock: harness.lock,
+      now: new Date("2026-07-14T12:00:00.000Z"),
+    });
+    expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
+  });
+
+  it("round-2 LOW: a throwing lock release never masks a completed refresh", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    const outcome = await refreshCandidatesFromAudit({
+      auditLog: harness.auditLog,
+      store: harness.store,
+      readAllowlist: verifiedAllowlist([]),
+      lock: {
+        async acquire() {
+          return async () => {
+            throw new Error("release failed");
+          };
+        },
+      },
+      now: new Date("2026-07-14T12:00:00.000Z"),
+    });
+    expect(outcome.status).toBe("refreshed");
+    expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
+  });
+
   it("HIGH-2: a RESET audit chain that regrew PAST the old watermark is detected by the hash binding -- recompute, never a silent prefix skip", async () => {
     const harness = makeHarness();
     // Chain epoch 1: one denial, refreshed -> watermark at (seq 1, hash-of-epoch-1).

@@ -28,17 +28,22 @@
  *    new chain regrew past the old watermark's sequence, the entry at that
  *    sequence carries a different hash, the watermark is invalid, and the
  *    refresh RECOMPUTES instead of silently skipping the new chain's prefix.
- *    (A watermark whose sequence has been FIFO-pruned off the surviving
- *    chain is still honored: the stream's own anchor verification attests
- *    the surviving chain is the same chain's suffix.)
+ *    A watermark whose sequence has been FIFO-pruned off the surviving
+ *    chain can no longer be POSITIVELY re-verified against this chain, so
+ *    it also recomputes (Codex round-2 MED: a reset chain that regrew and
+ *    then pruned past the old position would otherwise be accepted);
+ *    only a verified hash match admits the cheap incremental path.
  *
  * 2. CROSS-RUN MUTUAL EXCLUSION (Codex gate BLOCKER). Two concurrent
  *    refreshes would read the same watermark, fold the same suffix, and
  *    additively merge it twice. Every refresh therefore runs under
  *    `deps.lock`: acquire returns null when another refresh holds it, and
  *    the refresh ABORTS (`refresh_in_progress`) without reading or writing
- *    anything. The CLI supplies an O_EXCL lockfile with stale-holder
- *    breaking (see `cli/castle-wall-observe.ts`); in-process callers/tests
+ *    anything. The CLI supplies an O_EXCL lockfile that is NEVER
+ *    auto-broken (Codex round-2 HIGH: any same-call break-and-retry scheme
+ *    has a TOCTOU where a slow breaker unlinks a fresh lock; a stale lock
+ *    from a crashed run is surfaced to the operator with exact guidance
+ *    instead -- see `cli/castle-wall-observe.ts`); in-process callers/tests
  *    use `inProcessRefreshLock()`.
  *
  * 3. RECOMPUTE HEAL (bootstrap + anomaly), REVIEW-MARKER-AWARE. With no
@@ -55,9 +60,15 @@
  *    that review, so those events must not resurrect it (Codex gate
  *    HIGH-1). A chain with no review action ever recorded is a fresh
  *    bootstrap and mints from the full retained history (the documented
- *    "observe start -> run agent -> review candidates" flow). The
- *    suppressed direction is conservative and self-healing: a still-denied
- *    destination re-mints itself from its next NEW denial.
+ *    "observe start -> run agent -> review candidates" flow). DISCLOSED
+ *    LIMIT (Codex round-2 MED, accepted): the marker is global, not
+ *    per-key, so a pre-marker event for a candidate the operator NEVER
+ *    reviewed is also suppressed by a recompute -- the conservative,
+ *    self-healing direction: the destination stays DENIED and re-mints
+ *    itself from its next NEW denial; nothing is ever allowed by
+ *    suppression. The discard verb writes its marker CRITICALLY, BEFORE
+ *    removing rows, and aborts the discard if the append fails -- the
+ *    marker this guarantee depends on is never best-effort.
  *
  * 4. ALLOWLIST-AWARE FOLD + PRUNE. A folded row whose destination the
  *    CURRENT cryptographically verified manifest already allows is never
@@ -230,11 +241,21 @@ export async function refreshCandidatesFromAudit(deps: RefreshDeps): Promise<Ref
   if (release === null) {
     return { status: "refresh_in_progress" };
   }
+  let outcome: RefreshOutcome;
   try {
-    return await runRefresh(deps);
+    outcome = await runRefresh(deps);
   } finally {
-    await release();
+    // Releasing is best-effort: a release failure must never mask the real
+    // refresh result (Codex round-2 LOW -- a completed refresh reported as
+    // "failed, nothing changed" would be false). A stranded lock surfaces on
+    // the next run as refresh_in_progress with operator guidance.
+    try {
+      await release();
+    } catch {
+      // Deliberately swallowed; see above.
+    }
   }
+  return outcome;
 }
 
 async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
@@ -250,7 +271,6 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
   let events: Array<{ sequence: number; event: FlowObservationEvent }> = [];
   let headSequence: number | null = null;
   let headHash: string | null = null;
-  let lowestSequence: number | null = null;
   let hashAtWatermark: string | null = null;
   let lastReviewSequence: number | null = null;
   await deps.auditLog.streamVerifiedChain({
@@ -259,7 +279,6 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
         headSequence = sequence;
         headHash = entry_hash;
       }
-      if (lowestSequence === null || sequence < lowestSequence) lowestSequence = sequence;
       if (watermark !== null && sequence === watermark.folded_through_sequence) {
         hashAtWatermark = entry_hash;
       }
@@ -276,17 +295,16 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
       events = [];
       headSequence = null;
       headHash = null;
-      lowestSequence = null;
       hashAtWatermark = null;
       lastReviewSequence = null;
     },
   });
 
   const chainHead: number | null = headSequence;
-  const chainLowest: number | null = lowestSequence;
 
-  // A watermark is honored ONLY against the chain that minted it (module
-  // doc, guarantee 1):
+  // A watermark is honored ONLY when its chain identity is POSITIVELY
+  // verified (module doc, guarantee 1; Codex round-2 MED on the old
+  // pruned-arm acceptance):
   //   - none persisted -> recompute (fresh store, or a pre-watermark store);
   //   - sequence beyond the surviving head -> the chain shrank/reset under
   //     us -> recompute;
@@ -294,20 +312,23 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
   //     hash -> a reset/rebuilt chain regrew past the old position -> the
   //     old position is meaningless here -> recompute (never silently skip
   //     the new chain's prefix);
-  //   - the watermark's sequence has been pruned off the surviving chain
-  //     (below the lowest survivor) -> honored: the stream's own rotation-
-  //     anchor verification attests the surviving chain is the same chain's
-  //     suffix.
+  //   - the watermark's sequence has been FIFO-pruned off the surviving
+  //     chain -> the identity binding CANNOT be re-verified against this
+  //     chain (a reset chain that regrew and pruned past the old position
+  //     would be indistinguishable) -> recompute. Replace semantics + the
+  //     review-marker mint bound make that recompute convergent, and the
+  //     case is rare in practice (it needs more appends between two
+  //     refreshes than the whole retention cap).
+  // A positive hash match is the ONLY thing that admits the cheap
+  // incremental path; everything else falls back to the convergent
+  // recompute. (An empty chain with a persisted watermark folds nothing and
+  // keeps the watermark.)
   const watermarkValid =
     watermark !== null &&
     chainHead !== null &&
     watermark.folded_through_sequence <= chainHead &&
-    (chainLowest === null ||
-      watermark.folded_through_sequence < chainLowest ||
-      hashAtWatermark === watermark.entry_hash);
+    hashAtWatermark === watermark.entry_hash;
   const recompute = !(watermark !== null && (chainHead === null ? true : watermarkValid));
-  // (An empty chain with a persisted watermark folds nothing and keeps the
-  // watermark: `chainHead === null` yields recompute=false and an empty fold.)
 
   const kept: CandidateObservation[] = [];
   let suppressedAllowed = 0;
