@@ -233,6 +233,18 @@ export interface FileGrantRemoveEntryResult {
   aclRemoval: FileGrantAclRemovalResult;
   /** False when a residual source-inode ACE may remain. */
   scrubbed: boolean;
+  /**
+   * Present only when this call drained the agent's LAST grant-tree entry
+   * (the per-agent grant-tree subdirectory is now empty) and the
+   * implementation attempted to remove the execute-only fortress-dir
+   * traverse ACE that was applied for that agent uid at grant time (F1 fix,
+   * 2026-07-14 drill finding). Absent when the agent still has another
+   * active grant (the ACE must stay), when no agent uid is configured, or on
+   * an unsupported platform -- so its absence is never itself a failure
+   * signal. Best-effort: a `"failed"` status here does not affect
+   * `scrubbed`, which still reflects only the per-grant source-inode ACE.
+   */
+  fortressTraverseRemoval?: FileGrantAclRemovalResult;
 }
 
 /**

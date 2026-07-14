@@ -15,8 +15,12 @@ import { mintFileGrant } from "../../src/file-grant/mint.js";
 import {
   AGENT_READ_PROBE_SCRIPT,
   buildAgentReadProbeCommand,
+  buildLinuxFortressTraverseGrantCommand,
+  buildLinuxFortressTraverseRevokeCommand,
   buildLinuxGrantAgentReadCommands,
   buildLinuxRevokeAgentReadCommands,
+  buildMacFortressTraverseGrantCommand,
+  buildMacFortressTraverseRevokeCommand,
   buildMacGrantAgentReadCommands,
   buildMacRevokeAgentReadCommands,
   type FileGrantMacAclLinkOps,
@@ -234,6 +238,31 @@ describe("file-grant ACL command argv construction", () => {
     ]);
   });
 
+  it("builds the fortress-dir traverse grant/revoke commands as single execute-only ACEs (F1 fix)", () => {
+    expect(buildLinuxFortressTraverseGrantCommand("/fortress", 502)).toEqual({
+      file: "setfacl",
+      args: ["-m", "u:502:--x", "/fortress"],
+    });
+    expect(buildLinuxFortressTraverseRevokeCommand("/fortress", 502)).toEqual({
+      file: "setfacl",
+      args: ["-x", "u:502", "/fortress"],
+    });
+    expect(buildMacFortressTraverseGrantCommand("/fortress", "agentuser")).toEqual({
+      file: "chmod",
+      args: ["+a", "user:agentuser allow execute", "/fortress"],
+    });
+    expect(buildMacFortressTraverseRevokeCommand("/fortress", "agentuser")).toEqual({
+      file: "chmod",
+      args: ["-a", "user:agentuser allow execute", "/fortress"],
+    });
+    // Never a read ACE: the fortress dir gets traverse-only, same as every
+    // other ancestor in the grant-tree walk.
+    expect(
+      JSON.stringify(buildMacFortressTraverseGrantCommand("/fortress", "agentuser"))
+    ).not.toContain("read");
+    expect(buildLinuxFortressTraverseGrantCommand("/fortress", 502).args).not.toContain("u:502:rX");
+  });
+
   it("builds the agent-uid read probe as sudo argv, not a shell command", () => {
     expect(
       buildAgentReadProbeCommand(
@@ -313,6 +342,7 @@ describe("file-grant ACL command argv construction", () => {
     ]);
     expect(exec.commands).toEqual([
       { file: "id", args: ["-nu", "502"] },
+      { file: "chmod", args: ["+a", "user:agentuser allow execute", fortress] },
       { file: "chmod", args: ["+a", "user:agentuser allow execute", join(fortress, "grants")] },
       {
         file: "chmod",
@@ -571,11 +601,36 @@ describe("file-grant ACL command argv construction", () => {
 
     expect(result.status).toBe("failed");
     expect(seen).toEqual([
+      { file: "setfacl", args: ["-m", "u:502:--x", "/fortress"] },
       { file: "setfacl", args: ["-m", "u:502:--x", "/fortress/grants"] },
       { file: "setfacl", args: ["-m", "u:502:--x", "/fortress/grants/agent-1"] },
       { file: "setfacl", args: ["-m", "u:502:rX", "/proc/test/fd/9"] },
       { file: "setfacl", args: ["-x", "u:502", "/proc/test/fd/9"] },
     ]);
+  });
+
+  it("fails closed (never applied) when the fortress-dir traverse ACE itself fails to apply", async () => {
+    const seen: FileGrantExecCommand[] = [];
+    const fsOps = new PosixFileGrantFsOps("/fortress", {
+      platform: "linux",
+      execRunner: {
+        execFile: async (command) => {
+          seen.push(command);
+          if (command.args[2] === "/fortress") {
+            throw new Error("setfacl fortress ACE failed: EPERM");
+          }
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+
+    const result = await fsOps.grantAgentRead("agent-1/fg_abc", 502, pinnedSource());
+
+    // The whole apply fails closed: no ancestor or leaf ACE command ever ran,
+    // because the agent could not even reach the grant tree without the
+    // fortress-dir ACE (F1 fix: this is the exact gap the fix closes).
+    expect(result.status).toBe("not_privileged");
+    expect(seen).toEqual([{ file: "setfacl", args: ["-m", "u:502:--x", "/fortress"] }]);
   });
 
   it("grantAgentRead applies the leaf ACL to the pinned source fd path", async () => {
@@ -689,5 +744,154 @@ describe("file-grant ACL command argv construction", () => {
     expect(result.aclRemoval.status).toBe("failed");
     expect(result.aclRemoval.reason).toContain("source inode mismatch");
     expect(seen).toHaveLength(0);
+  });
+
+  it("Linux: keeps the fortress-dir traverse ACE while the agent has another active grant, and removes it once drained (F1 fix)", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-fortress-lifecycle-"));
+    const sourceDir = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-source-lifecycle-"));
+    const sourceA = join(sourceDir, "a.txt");
+    const sourceB = join(sourceDir, "b.txt");
+    await writeFile(sourceA, "a");
+    await writeFile(sourceB, "b");
+
+    const originDir = join(fortress, "policy", "egress");
+    await mkdir(originDir, { recursive: true });
+    await writeFile(
+      join(originDir, "agent-origin.json"),
+      JSON.stringify({ mode: "uid", agent_uid: 502, system_uid_allow_ceiling: 500 })
+    );
+
+    const exec = makeRecordingExecRunner();
+    const fsOps = new PosixFileGrantFsOps(fortress, {
+      platform: "linux",
+      execRunner: exec.runner,
+    });
+
+    const pinnedA = await fsOps.pinSource(sourceA);
+    await fsOps.place(sourceA, "agent-1/fg_a");
+    const resultA = await fsOps.grantAgentRead("agent-1/fg_a", 502, pinnedA);
+    await pinnedA.close();
+
+    const pinnedB = await fsOps.pinSource(sourceB);
+    await fsOps.place(sourceB, "agent-1/fg_b");
+    const resultB = await fsOps.grantAgentRead("agent-1/fg_b", 502, pinnedB);
+    await pinnedB.close();
+
+    expect(resultA.status).toBe("applied");
+    expect(resultB.status).toBe("applied");
+    // Both grants applied the (idempotent) fortress-dir traverse ACE.
+    expect(exec.commands.filter((c) => c.args.includes(fortress))).toHaveLength(2);
+
+    exec.commands.length = 0;
+
+    // Revoking the FIRST grant leaves the agent's SECOND grant active, so the
+    // fortress-dir ACE must stay in place.
+    const first = await fsOps.removeEntry("agent-1/fg_a", {
+      grantedReadAce: resultA.grantedReadAce,
+    });
+    expect(first.treeEntryRemoved).toBe(true);
+    expect(first.fortressTraverseRemoval).toBeUndefined();
+    expect(exec.commands).not.toContainEqual({ file: "setfacl", args: ["-x", "u:502", fortress] });
+
+    // Revoking the LAST (second) grant drains the agent: the fortress-dir ACE
+    // must be removed too, not left as a standing orphan.
+    const second = await fsOps.removeEntry("agent-1/fg_b", {
+      grantedReadAce: resultB.grantedReadAce,
+    });
+    expect(second.treeEntryRemoved).toBe(true);
+    expect(second.fortressTraverseRemoval).toEqual({
+      status: "removed",
+      agent_uid: 502,
+      platform: "linux",
+    });
+    expect(exec.commands).toContainEqual({ file: "setfacl", args: ["-x", "u:502", fortress] });
+  });
+
+  it("macOS: keeps the fortress-dir traverse ACE while the agent has another active grant, and removes it once drained (F1 fix)", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-mac-lifecycle-"));
+    const originDir = join(fortress, "policy", "egress");
+    await mkdir(originDir, { recursive: true });
+    await writeFile(
+      join(originDir, "agent-origin.json"),
+      JSON.stringify({ mode: "uid", agent_uid: 502, system_uid_allow_ceiling: 500 })
+    );
+
+    const treeEntryA = "agent-1/fg_a";
+    const treeEntryB = "agent-1/fg_b";
+    const trustedPathA = join(fortress, "grants", treeEntryA);
+    const trustedPathB = join(fortress, "grants", treeEntryB);
+    await mkdir(join(fortress, "grants", "agent-1"), { recursive: true });
+    await writeFile(trustedPathA, "a");
+    await writeFile(trustedPathB, "b");
+
+    const identityA: FileGrantSourceIdentity = { source_dev: "11", source_ino: "22" };
+    const identityB: FileGrantSourceIdentity = { source_dev: "11", source_ino: "33" };
+    const exec = makeRecordingExecRunner();
+    const macAclLinkOps: FileGrantMacAclLinkOps = {
+      link: async () => {},
+      open: async (path): Promise<FileGrantOpenedFile> => {
+        const identity = path === trustedPathA ? identityA : identityB;
+        return {
+          stat: async () => ({
+            dev: BigInt(identity.source_dev),
+            ino: BigInt(identity.source_ino),
+            uid: 501n,
+            isFile: () => true,
+          }),
+          close: async () => {},
+        };
+      },
+      rm: async () => {},
+    };
+    const fsOps = new PosixFileGrantFsOps(fortress, {
+      platform: "darwin",
+      execRunner: exec.runner,
+      macAclLinkOps,
+    });
+
+    const aceA = {
+      agent_uid: 502,
+      platform: "darwin" as const,
+      source_realpath: "/operator/a.txt",
+      source_dev: identityA.source_dev,
+      source_ino: identityA.source_ino,
+      mac_principal: "agentuser",
+      mac_acl_hardlink_path: trustedPathA,
+    };
+    const aceB = {
+      agent_uid: 502,
+      platform: "darwin" as const,
+      source_realpath: "/operator/b.txt",
+      source_dev: identityB.source_dev,
+      source_ino: identityB.source_ino,
+      mac_principal: "agentuser",
+      mac_acl_hardlink_path: trustedPathB,
+    };
+
+    // Revoking the FIRST grant leaves the agent's SECOND grant active, so the
+    // fortress-dir ACE must stay in place.
+    const first = await fsOps.removeEntry(treeEntryA, { grantedReadAce: aceA });
+    expect(first.treeEntryRemoved).toBe(true);
+    expect(first.aclRemoval.status).toBe("removed");
+    expect(first.fortressTraverseRemoval).toBeUndefined();
+    expect(exec.commands).not.toContainEqual({
+      file: "chmod",
+      args: ["-a", "user:agentuser allow execute", fortress],
+    });
+
+    // Revoking the LAST (second) grant drains the agent: the fortress-dir ACE
+    // must be removed too, not left as a standing orphan.
+    const second = await fsOps.removeEntry(treeEntryB, { grantedReadAce: aceB });
+    expect(second.treeEntryRemoved).toBe(true);
+    expect(second.aclRemoval.status).toBe("removed");
+    expect(second.fortressTraverseRemoval).toEqual({
+      status: "removed",
+      agent_uid: 502,
+      platform: "darwin",
+    });
+    expect(exec.commands).toContainEqual({
+      file: "chmod",
+      args: ["-a", "user:agentuser allow execute", fortress],
+    });
   });
 });
