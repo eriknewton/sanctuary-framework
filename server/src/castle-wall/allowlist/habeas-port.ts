@@ -318,7 +318,17 @@ export function isGenuineDerivedHabeasRule(rule: AllowlistRule): boolean {
     Array.isArray(scope.agent_ids) &&
     scope.agent_ids.length === 1 &&
     scope.agent_ids[0] === HABEAS_EMITTER_AGENT_ID &&
-    (scope.template_ids === undefined || scope.template_ids.length === 0);
+    (scope.template_ids === undefined || scope.template_ids.length === 0) &&
+    // S5-0 (2026-07-14): `uids` composes as an OR with agent_ids/template_ids
+    // (dns-derivation.ts, AllowlistEvaluator.scopeMatches), so a rule
+    // claiming the reserved id PLUS a non-empty `uids` axis would ALSO match
+    // extra uid-scoped flows beyond the genuine emitter-only grant -- exactly
+    // the kind of widened-but-still-"genuine"-looking shape this exact-match
+    // recognizer exists to catch. The Rust daemon's `deny_unknown_fields` on
+    // `RuleScope` independently rejects any `uids`-bearing rule file at parse
+    // time (it does not model this field), so this branch is TS/Swift-only
+    // defense in depth, not a parity gap.
+    (scope.uids === undefined || scope.uids.length === 0);
   if (!emitterScoped) return false;
   const m = rule.match;
   const protocolIsTcp =

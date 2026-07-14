@@ -293,6 +293,52 @@ final class ManifestParityVectorTests: XCTestCase {
         }
     }
 
+    /// S5-0 (2026-07-14 two-confined-uid extension): the new
+    /// `agent_origin.gate_uid` field and a rule carrying `scope.uids` inside
+    /// the SAME signed body. Proves the Swift canonicalizer + verifier agree
+    /// byte-for-byte with the Node signer on the twin-uid shape -- the #1
+    /// risk the S5-0 feasibility spike named. See the TS-side half of this
+    /// vector ("two-uid vector...") in
+    /// server/test/castle-wall/runtime/manifest-parity-vector.test.ts.
+    func testTwoUidVectorCanonicalBytesAndSignatureParity() throws {
+        let fixture = try loadFixture(named: "manifest-parity-vector-two-uid")
+        let expectedBytes = try XCTUnwrap(Data(base64Encoded: fixture.expectedCanonicalJsonB64))
+
+        XCTAssertEqual(fixture.manifestSignedBody.agentOrigin?.gateUid, 601)
+        XCTAssertEqual(fixture.rules[1].scope.uids, [601])
+
+        let actualBytes = try SignedManifestVerifier.canonicalJSONData(fixture.manifestSignedBody)
+        XCTAssertEqual(actualBytes, expectedBytes)
+        XCTAssertEqual(actualBytes.hexEncodedString(), fixture.expectedCanonicalJsonHex)
+
+        let signature = ManifestSignatureEnvelope(
+            signatureScheme: CastleWallConstants.signatureSchemeV1,
+            signingKeyId: "parity-test-key",
+            signatureB64url: fixture.testSignatureB64url
+        )
+        let message = ManifestUpdatedBody(
+            manifest: fixture.manifestSignedBody,
+            signature: signature,
+            rules: fixture.rules
+        )
+        let pinnedPublicKey = try Base64URL.decode(fixture.testPublicKeyB64url)
+
+        let snapshot = try SignedManifestVerifier.verifiedSnapshot(
+            from: message,
+            pinnedPublicKey: pinnedPublicKey,
+            now: Date(timeIntervalSince1970: 0)
+        )
+        XCTAssertEqual(snapshot.rules.count, fixture.rules.count)
+        XCTAssertEqual(snapshot.agentOrigin?.gateUid, 601)
+
+        // The gate-scoped rule's scope must survive verification intact, and
+        // the AllowlistEvaluator must use it to separate the two principals:
+        // a gate-uid flow matches the gate-scoped rule, an agent-uid flow to
+        // the SAME destination does not.
+        let gateRule = try XCTUnwrap(snapshot.rules.first { $0.id == "gate-scoped-endpoint" })
+        XCTAssertEqual(gateRule.scope.uids, [601])
+    }
+
     private func loadFixture() throws -> Fixture {
         return try loadFixture(named: "manifest-parity-vector")
     }

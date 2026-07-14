@@ -204,4 +204,39 @@ describe("castle-wall/allowlist/schema/validateRule", () => {
       expect(validateRule(r).length, JSON.stringify(scope)).toBeGreaterThan(0);
     }
   });
+
+  // --- S5-0 (2026-07-14): scope.uids, the per-uid rule-scope axis ---
+
+  it("accepts a rule scoped to one or more uids", () => {
+    const r = { ...validRule(), scope: { uids: [601] } };
+    expect(validateRule(r)).toEqual([]);
+    const r2 = { ...validRule(), scope: { uids: [600, 601] } };
+    expect(validateRule(r2)).toEqual([]);
+  });
+
+  it("accepts uids composed alongside agent_ids/template_ids (OR-composition axis)", () => {
+    const r = {
+      ...validRule(),
+      scope: { agent_ids: ["specific-agent"], template_ids: ["coding-assistant"], uids: [601] },
+    };
+    expect(validateRule(r)).toEqual([]);
+  });
+
+  it("rejects malformed scope.uids", () => {
+    for (const scope of [
+      { uids: "not-an-array" },
+      { uids: [0] }, // root can never be a scope member
+      { uids: [-1] },
+      { uids: [6.5] },
+      { uids: ["601"] },
+    ]) {
+      const r = { ...validRule(), scope } as unknown as AllowlistRule;
+      expect(validateRule(r).length, JSON.stringify(scope)).toBeGreaterThan(0);
+    }
+  });
+
+  it("an empty scope.uids array means 'all' (same convention as agent_ids/template_ids)", () => {
+    const r = { ...validRule(), scope: { uids: [] } };
+    expect(validateRule(r)).toEqual([]);
+  });
 });

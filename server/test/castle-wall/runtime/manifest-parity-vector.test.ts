@@ -172,4 +172,47 @@ describe("castle-wall manifest canonical parity vector", () => {
     // UTF-8 even though the logical string is not well-formed Unicode.
     expect(Buffer.from(actualCanonical).toString("utf8")).toContain("\\ud800");
   });
+
+  // S5-0 (2026-07-14 two-confined-uid extension): the new `agent_origin.gate_uid`
+  // field and a rule carrying `scope.uids` inside the SAME signed body. Proves
+  // the TS canonicalizer + signature verify byte-for-byte for the twin-uid
+  // shape -- the #1 risk the S5-0 feasibility spike named (cross-language
+  // canonical-JSON drift on the new field). See the Swift-side half of this
+  // vector in castle-wall-macos/Tests/CastleWallExtensionTests/ManifestParityVectorTests.swift.
+  it("two-uid vector: agent_origin.gate_uid and rule scope.uids canonicalize and verify", async () => {
+    const fixture = await loadNamedFixture("manifest-parity-vector-two-uid");
+
+    expect(fixture.manifest_signed_body.agent_origin?.gate_uid).toBe(601);
+    expect(fixture.rules[1]?.scope.uids).toEqual([601]);
+
+    const actualCanonical = new TextEncoder().encode(
+      canonicalize(fixture.manifest_signed_body),
+    );
+    expect(Buffer.from(actualCanonical).toString("hex")).toBe(
+      fixture.expected_canonical_json_hex,
+    );
+    expect(
+      Buffer.compare(
+        Buffer.from(actualCanonical),
+        Buffer.from(fixture.expected_canonical_json_b64, "base64"),
+      ),
+    ).toBe(0);
+
+    const verified = ed25519.verify(
+      Buffer.from(fixture.test_signature_b64url, "base64url"),
+      actualCanonical,
+      Buffer.from(fixture.test_public_key_b64url, "base64url"),
+    );
+    expect(verified).toBe(true);
+
+    // Per-rule digest parity for both rules, including the uids-scoped one.
+    const { createHash } = await import("node:crypto");
+    for (const [index, rule] of fixture.rules.entries()) {
+      const ruleCanonical = canonicalize(rule);
+      const digest = createHash("sha256")
+        .update(Buffer.from(ruleCanonical))
+        .digest("hex");
+      expect(digest).toBe(fixture.manifest_signed_body.rules[index]?.sha256);
+    }
+  });
 });

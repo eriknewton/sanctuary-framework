@@ -1808,6 +1808,37 @@ mod tests {
         assert!(serde_json::from_str::<AllowlistRule>(raw).is_err());
     }
 
+    // ---- S5-0 (2026-07-14 two-confined-uid extension, macOS Castle Wall) ----
+    //
+    // The macOS sysext + TS producer gained an optional `scope.uids` axis so
+    // an endpoint rule can bind to a SECOND confined uid (a `sanctuary-gate`
+    // account) without matching the wrapped agent's uid. This daemon (Linux,
+    // cgroup/nftables-based) has NO per-flow raw-uid attribution concept --
+    // its `RuleScope::applies_to` reasons over `(agent_id, agent_template)`
+    // strings resolved from a cgroup-tagged process, never a uid. `uids` is
+    // therefore out of this daemon's wire vocabulary by design, not omission.
+    //
+    // The existing `deny_unknown_fields` on `RuleScope` (see its doc comment
+    // above: "an ignored (unmodeled) scope axis would apply a rule to MORE
+    // agents than the operator intended") is the CORRECT, deliberate response
+    // to a `uids`-bearing rule: refuse the rule file outright (fail closed,
+    // "RuleParse" error, keep the prior good policy) rather than silently
+    // drop the axis and risk enforcing a rule wider than what was signed.
+    // This test proves that safety net actually holds for the new field --
+    // no Rust source change was needed or made for S5-0; this only pins the
+    // existing behavior so a future serde/schema refactor cannot silently
+    // regress it into an ignored-field accept.
+    #[test]
+    fn rule_with_macos_gate_uid_scope_axis_fails_to_parse_not_silently_ignored() {
+        let raw = r#"{ "id": "uuid-1", "schema_version": 1, "created_at": "2026-05-05T00:00:00Z", "match": { "host": ["gate-endpoint.example.com"] }, "scope": { "uids": [601] }, "disposition": "allow" }"#;
+        let parsed = serde_json::from_str::<AllowlistRule>(raw);
+        assert!(
+            parsed.is_err(),
+            "a macOS-only scope.uids axis must fail deserialization here, not silently apply to every agent"
+        );
+        assert!(parsed.unwrap_err().to_string().contains("uids"));
+    }
+
     #[test]
     fn rule_with_derived_flag_and_time_window_field_parses() {
         // The full TS rule surface is modeled: `derived` and `time_window`

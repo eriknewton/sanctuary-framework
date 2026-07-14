@@ -78,9 +78,37 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
     if (c.agent_uid < 1 || c.agent_uid < systemUidAllowCeiling) {
       return null;
     }
+
+    // `gate_uid` (S5-0, 2026-07-14): a SECOND optional confined principal,
+    // valid only in UID mode. Applies the SAME floor invariants as
+    // `agent_uid` above, PLUS distinctness from it. Any violation rejects
+    // the WHOLE descriptor -- never a half-built twin-uid config, because a
+    // gate uid that silently degraded to "no gate_uid" would fall through to
+    // today's binary classifier (`classifyUid`'s existing "any other
+    // resolved high uid is operator" branch) and reach the OPERATOR
+    // allow-all fast-path: exactly the fail-open this field exists to close.
+    const agentUid = c.agent_uid;
+    if (c.gate_uid !== undefined) {
+      if (!isNonNegativeInt(c.gate_uid)) {
+        return null;
+      }
+      if (
+        c.gate_uid < 1 ||
+        c.gate_uid < systemUidAllowCeiling ||
+        c.gate_uid === agentUid
+      ) {
+        return null;
+      }
+      return {
+        mode: "uid",
+        agent_uid: agentUid,
+        gate_uid: c.gate_uid,
+        system_uid_allow_ceiling: systemUidAllowCeiling,
+      };
+    }
     return {
       mode: "uid",
-      agent_uid: c.agent_uid,
+      agent_uid: agentUid,
       system_uid_allow_ceiling: systemUidAllowCeiling,
     };
   }
@@ -90,6 +118,17 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
   const hasSigningId = isNonEmptyString(c.egress_helper_signing_id);
   const hasTeamId = isNonEmptyString(c.egress_helper_team_id);
   if (!hasSigningId && !hasTeamId) {
+    return null;
+  }
+
+  // `gate_uid` is a UID-mode-only concept: NAT mode identifies the agent via
+  // egress-helper signing identity, never a uid, so there is no meaningful
+  // "second confined uid" to carry. A NAT candidate carrying `gate_uid` is an
+  // unexpected/malformed shape (a caller bug, or a future NAT+gate combo not
+  // yet designed) -- reject the whole descriptor rather than silently drop
+  // or silently accept an ambiguous field, matching the "never a half-built
+  // descriptor" doctrine above.
+  if (c.gate_uid !== undefined) {
     return null;
   }
 

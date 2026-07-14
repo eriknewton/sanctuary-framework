@@ -52,11 +52,22 @@ export interface RuleMatch {
 
 /**
  * Scope describes which wrapped agents the rule applies to. An empty agent_ids
- * AND empty template_ids both mean "all wrapped agents."
+ * AND empty template_ids AND empty uids all mean "all wrapped agents."
+ *
+ * `uids` (S5-0, 2026-07-14 two-confined-uid extension): scopes a rule to one
+ * or more macOS real uids directly, composing as an OR with `agent_ids` /
+ * `template_ids` (same as the destination-axis OR-composition on `RuleMatch`).
+ * This is the axis a gate-scoped endpoint rule uses so it matches the
+ * `sanctuary-gate` confined uid WITHOUT matching the wrapped agent's uid --
+ * the Swift `AllowlistEvaluator.scopeMatches` compares against the flow's
+ * `sourceRuid`. Any caller that composes/unions rule scopes (e.g.
+ * `dns-derivation.ts`) must fold this axis in too, or a uid-scoped rule's
+ * derived companion rule silently widens back to "all agents."
  */
 export interface RuleScope {
   agent_ids?: string[];
   template_ids?: string[];
+  uids?: number[];
 }
 
 /**
@@ -98,6 +109,11 @@ function isNonEmptyString(value: unknown): value is string {
 
 function isValidPortNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
+/** True when `value` is a positive integer uid (0/root is never a valid scope member). */
+function isPositiveUid(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1;
 }
 
 /**
@@ -142,7 +158,7 @@ const KNOWN_RULE_KEYS = new Set([
   "derived",
 ]);
 const KNOWN_MATCH_KEYS = new Set(["host", "host_pattern", "ip", "cidr", "port", "protocol"]);
-const KNOWN_SCOPE_KEYS = new Set(["agent_ids", "template_ids"]);
+const KNOWN_SCOPE_KEYS = new Set(["agent_ids", "template_ids", "uids"]);
 const KNOWN_TIME_WINDOW_KEYS = new Set(["start", "end"]);
 
 /**
@@ -267,6 +283,11 @@ export function validateRule(rule: AllowlistRule): string[] {
       if (ids === undefined) continue;
       if (!Array.isArray(ids) || ids.some((id) => !isNonEmptyString(id))) {
         issues.push(`rule.scope.${key} must be an array of non-empty strings when present`);
+      }
+    }
+    if (rule.scope.uids !== undefined) {
+      if (!Array.isArray(rule.scope.uids) || rule.scope.uids.some((uid) => !isPositiveUid(uid))) {
+        issues.push("rule.scope.uids must be an array of positive integers when present");
       }
     }
   }

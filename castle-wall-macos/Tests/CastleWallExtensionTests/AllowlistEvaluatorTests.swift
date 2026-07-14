@@ -25,6 +25,7 @@ final class AllowlistEvaluatorTests: XCTestCase {
         protocolName: String? = nil,
         agentIds: [String]? = nil,
         templateIds: [String]? = nil,
+        uids: [UInt32]? = nil,
         disposition: String = "allow"
     ) -> ManifestRule {
         return ManifestRule(
@@ -40,7 +41,7 @@ final class AllowlistEvaluatorTests: XCTestCase {
                 port: port,
                 protocolName: protocolName
             ),
-            scope: ManifestRuleScope(agentIds: agentIds, templateIds: templateIds),
+            scope: ManifestRuleScope(agentIds: agentIds, templateIds: templateIds, uids: uids),
             disposition: disposition,
             timeWindow: nil
         )
@@ -52,7 +53,8 @@ final class AllowlistEvaluatorTests: XCTestCase {
         host: String? = "api.anthropic.com",
         ip: String = "104.18.32.10",
         port: Int = 443,
-        proto: FlowProtocol = .tcp
+        proto: FlowProtocol = .tcp,
+        sourceRuid: uid_t = 0
     ) -> FilterFlowDescriptor {
         return FilterFlowDescriptor(
             sourceAppIdentifier: "ai.sanctuaryprotocol.test",
@@ -63,7 +65,8 @@ final class AllowlistEvaluatorTests: XCTestCase {
             destinationPort: port,
             networkProtocol: proto,
             hostnameSource: host != nil ? "sni" : nil,
-            opaqueDestination: host == nil
+            opaqueDestination: host == nil,
+            sourceRuid: sourceRuid
         )
     }
 
@@ -393,6 +396,145 @@ final class AllowlistEvaluatorTests: XCTestCase {
         XCTAssertEqual(
             AllowlistEvaluator.evaluate(flow: flow(agentId: "any-agent", templateId: "any-template"), rules: [r]),
             .allow(matchedRuleId: "r-1")
+        )
+    }
+
+    // MARK: - Scope: uids (S5-0, 2026-07-14 two-confined-uid extension)
+    //
+    // The load-bearing proof: an endpoint rule scoped to the gate uid must
+    // match gate-originated flows and must NEVER match agent-originated
+    // flows to the same destination -- the "no leak to the agent" invariant
+    // the S5-0 spike's risk #3 names.
+
+    func testScopeUidsConstrainsRuleToGateUidOnly() {
+        let r = rule(host: .single("gate-endpoint.example.com"), uids: [601], disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: "gate-endpoint.example.com", sourceRuid: 601), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        // SAME destination, agent's uid: must NOT match the gate-scoped rule.
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: "gate-endpoint.example.com", sourceRuid: 600), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+        // A third, unrelated uid also does not match.
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(host: "gate-endpoint.example.com", sourceRuid: 700), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testScopeUidsComposesAsOrWithAgentIds() {
+        let r = rule(
+            host: .single("api.anthropic.com"),
+            agentIds: ["specific-agent"],
+            uids: [601],
+            disposition: "allow"
+        )
+        // Matches via the agent_ids axis even at an unrelated uid.
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(agentId: "specific-agent", sourceRuid: 999), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        // Matches via the uids axis even with an unrelated agent_id.
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(agentId: "different-agent", sourceRuid: 601), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+        // Matches neither axis: drop.
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(agentId: "different-agent", sourceRuid: 999), rules: [r]),
+            .drop(matchedRuleId: nil)
+        )
+    }
+
+    func testEmptyScopeUidsMeansAllAgents() {
+        let r = rule(host: .single("api.anthropic.com"), uids: [], disposition: "allow")
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(flow: flow(sourceRuid: 12345), rules: [r]),
+            .allow(matchedRuleId: "r-1")
+        )
+    }
+
+    /// End-to-end origin-gated proof mirroring the S5-0 spike's minimal
+    /// on-hardware drill (legs a/b/c), driven entirely through the pure
+    /// evaluator (no NetworkExtension / signing host needed): given a
+    /// twin-uid `agentOrigin` and ONE endpoint rule scoped to the gate uid
+    /// only, (a) the gate uid is allowed to the declared endpoint, (b) the
+    /// agent uid is BLOCKED to the SAME declared endpoint (the rule does not
+    /// leak), and (c) both uids classify `.agent` (confined), never
+    /// `.operator` (neither gets the allow-all fast-path).
+    func testTwoUidOriginGatedEvaluation_gateScopedRuleDoesNotLeakToAgent() {
+        let origin = AgentOriginDescriptor(mode: .uid, agentUid: 600, gateUid: 601, systemUidAllowCeiling: 500)
+        let gateRule = rule(
+            id: "gate-scoped-endpoint",
+            host: .single("gate-endpoint.example.com"),
+            uids: [601],
+            disposition: "allow"
+        )
+
+        func originFlow(ruid: uid_t, host: String) -> FilterFlowDescriptor {
+            return FilterFlowDescriptor(
+                sourceAppIdentifier: "deadbeef",
+                agentId: "deadbeef",
+                templateId: "unknown",
+                destinationHost: host,
+                destinationIp: "104.18.32.10",
+                destinationPort: 443,
+                networkProtocol: .tcp,
+                hostnameSource: "sni",
+                opaqueDestination: false,
+                sourceRuid: ruid,
+                sourcePid: 4242,
+                sourcePidVersion: 1,
+                sourceSigningId: nil,
+                sourceTeamId: nil,
+                sourceUnattributed: false
+            )
+        }
+
+        // (a) gate uid ALLOWED to the declared endpoint.
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(
+                flow: originFlow(ruid: 601, host: "gate-endpoint.example.com"),
+                rules: [gateRule],
+                agentOrigin: origin
+            ),
+            .allow(matchedRuleId: "gate-scoped-endpoint")
+        )
+
+        // (b) agent uid BLOCKED to the SAME declared endpoint -- the
+        // gate-scoped rule must not widen the agent.
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(
+                flow: originFlow(ruid: 600, host: "gate-endpoint.example.com"),
+                rules: [gateRule],
+                agentOrigin: origin
+            ),
+            .drop(matchedRuleId: nil)
+        )
+
+        // (c) gate uid BLOCKED to a non-declared endpoint (proves the gate
+        // is confined via default-deny, not operator-allow-all).
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(
+                flow: originFlow(ruid: 601, host: "not-declared.example.com"),
+                rules: [gateRule],
+                agentOrigin: origin
+            ),
+            .drop(matchedRuleId: nil)
+        )
+
+        // Control: a third uid (neither agent nor gate) still gets the
+        // operator allow-all fast-path -- the twin-uid extension confines
+        // exactly the two configured principals, nothing wider.
+        XCTAssertEqual(
+            AllowlistEvaluator.evaluate(
+                flow: originFlow(ruid: 700, host: "not-declared.example.com"),
+                rules: [gateRule],
+                agentOrigin: origin
+            ),
+            .allow(matchedRuleId: AllowlistEvaluator.operatorBaselineUidRuleId)
         )
     }
 

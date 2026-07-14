@@ -170,17 +170,26 @@ public enum AllowlistEvaluator {
         return matchClauseMatches(match: rule.match, flow: flow)
     }
 
-    /// Scope: agent_ids OR template_ids. Empty/nil on both means "all".
+    /// Scope: agent_ids OR template_ids OR uids. Empty/nil on all three means
+    /// "all". `uids` (S5-0, 2026-07-14 two-confined-uid extension) matches
+    /// directly against the flow's `sourceRuid` -- this is the axis that lets
+    /// an endpoint rule bind to the gate uid WITHOUT matching the agent uid
+    /// (or vice versa), the core separation the two-confined-uid capability
+    /// exists to provide.
     public static func scopeMatches(scope: ManifestRuleScope, flow: FilterFlowDescriptor) -> Bool {
         let hasAgents = scope.agentIds?.isEmpty == false
         let hasTemplates = scope.templateIds?.isEmpty == false
-        if !hasAgents && !hasTemplates {
+        let hasUids = scope.uids?.isEmpty == false
+        if !hasAgents && !hasTemplates && !hasUids {
             return true
         }
         if hasAgents, let agents = scope.agentIds, agents.contains(flow.agentId) {
             return true
         }
         if hasTemplates, let templates = scope.templateIds, templates.contains(flow.templateId) {
+            return true
+        }
+        if hasUids, let uids = scope.uids, uids.contains(flow.sourceRuid) {
             return true
         }
         return false

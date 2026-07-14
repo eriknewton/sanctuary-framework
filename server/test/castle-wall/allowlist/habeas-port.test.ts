@@ -345,6 +345,32 @@ describe("composed-manifest gate (Rust parity mirror)", () => {
     expect(isGenuineDerivedHabeasRule(withWindow)).toBe(false);
   });
 
+  // S5-0 (2026-07-14): scope.uids composes as an OR with agent_ids/template_ids
+  // (dns-derivation.ts, Swift AllowlistEvaluator.scopeMatches), so a reserved-id
+  // rule that ALSO carries a non-empty uids axis would match extra uid-scoped
+  // flows beyond the genuine emitter-only grant -- widened, not narrowed. The
+  // exact-shape recognizer must reject this, exactly as it rejects an extra
+  // template_ids axis.
+  it("a non-empty uids axis on a reserved-id rule breaks genuineness (widening guard)", () => {
+    const [local] = derivedRules();
+    const widened: AllowlistRule = {
+      ...local,
+      scope: { ...local.scope, uids: [0] },
+    };
+    expect(isGenuineDerivedHabeasRule(widened)).toBe(false);
+    const issues = findHabeasConflictsInComposed([widened]);
+    expect(issues.some((i) => i.includes(HABEAS_RULE_ID_PREFIX))).toBe(true);
+  });
+
+  it("an EMPTY uids axis on a reserved-id rule stays genuine (same convention as absent)", () => {
+    const [local] = derivedRules();
+    const withEmptyUids: AllowlistRule = {
+      ...local,
+      scope: { ...local.scope, uids: [] },
+    };
+    expect(isGenuineDerivedHabeasRule(withEmptyUids)).toBe(true);
+  });
+
   it("composeEffectiveRules output always passes the composed gate", () => {
     const composed = composeEffectiveRules({
       operatorRules: [operatorRule({ id: "r1" })],
