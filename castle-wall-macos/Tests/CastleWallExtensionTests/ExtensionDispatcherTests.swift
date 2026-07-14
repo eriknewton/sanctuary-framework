@@ -268,6 +268,48 @@ final class ExtensionDispatcherTests: XCTestCase {
         XCTAssertTrue(dispatcher.bindingState.armLeaseReceived)
     }
 
+    func test_rejectedManifest_doesNotMarkManifestReceived() throws {
+        // S5-0 HIGH-2 observability (b): a REJECTED manifest (verifier throw ->
+        // applyManifestUpdated returns nil, prior policy kept) must NOT advance
+        // manifestReceived. Otherwise isProviderBound would report bound on the
+        // strength of a policy push that never applied.
+        let engine = FlowEvaluatorEngine()
+        // A validly-signed body whose raw rule scope is off-spec (uids:null):
+        // it verifies signature+digest but fails the schema chokepoint.
+        let bad = try makeSignedBodyWithRawRules(
+            rawRuleJSONs: [
+                #"{"id":"gate-scoped","schema_version":1,"created_at":"2026-07-14T00:00:00Z","match":{"host":["gate-endpoint.example.com"],"port":[443],"protocol":"tcp"},"scope":{"uids":null},"disposition":"allow"}"#
+            ],
+            agentOrigin: AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 601, systemUidAllowCeiling: 500)
+        )
+        let dispatcher = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: bad.publicKey)
+        )
+
+        XCTAssertFalse(dispatcher.bindingState.manifestReceived)
+        dispatcher.handleInbound(.manifestUpdated(bad.body))
+        XCTAssertFalse(
+            dispatcher.bindingState.manifestReceived,
+            "a rejected manifest must not mark manifest_received"
+        )
+        XCTAssertFalse(engine.manifestStore.hasSnapshot, "rejected rules never went live")
+
+        // Control: a subsequent WELL-FORMED manifest still applies and advances
+        // the flag (the rejection is not sticky / not a policy-refresh DoS).
+        let good = try makeSignedManifestUpdatedBody(
+            rules: [makeRule(id: "r-ok", host: "api.anthropic.com", port: 443, disposition: "allow")],
+            privateKey: Curve25519.Signing.PrivateKey()
+        )
+        let dispatcher2 = ExtensionDispatcher(
+            engine: engine,
+            ipcClient: makeFloatingClient(pinnedPublicKey: good.publicKey)
+        )
+        dispatcher2.handleInbound(.manifestUpdated(good.body))
+        XCTAssertTrue(dispatcher2.bindingState.manifestReceived)
+        XCTAssertTrue(engine.manifestStore.hasSnapshot)
+    }
+
     func test_buildProviderUnboundAudit_usesAcceptedEventShape() {
         let message = ExtensionDispatcher.buildProviderUnboundAudit(
             fortressId: "fortress-test",

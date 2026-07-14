@@ -33,6 +33,13 @@ public enum SignedManifestVerificationError: Error, Equatable {
     /// not producer VALIDITY, so the enforcement side re-checks and rejects the
     /// WHOLE snapshot (keeping prior policy) rather than trusting the producer.
     case invalidAgentOrigin(String)
+    /// S5-0 HIGH-2 (2026-07-14): a signed rule whose RAW scope JSON does not
+    /// match the TS `validateRule` shape (e.g. `scope.uids: null`, a scalar, a
+    /// fractional/zero/negative/over-`UInt32` uid, or a non-string agent/template
+    /// id). Optional `Codable` would silently collapse these to "absent",
+    /// widening a scoped rule to all agents -- so the enforcement side rejects
+    /// the WHOLE snapshot against the RAW bytes the digest actually binds.
+    case invalidRuleSchema(ruleId: String, reason: String)
 }
 
 public enum SignedManifestVerifier {
@@ -89,18 +96,42 @@ public enum SignedManifestVerifier {
             rules: body.rules,
             receivedRules: body.receivedRules
         )
-        // `manifest.agentOrigin` is part of the canonical bytes just verified
-        // against the pinned key, so it is trusted for AUTHENTICITY iff the
-        // signature passed. But S5-0 (2026-07-14) defense-in-depth: a valid
-        // signature does NOT prove the producer's floor invariants hold, and
-        // AGENTS.md invariant 4/5 forbids trusting across the TS->Swift
-        // boundary or silently degrading. Re-validate the descriptor's floors
-        // HERE, at the enforcement point, and throw (rejecting the WHOLE
-        // snapshot, so both `applyManifestUpdated` and `recoverPersistedManifest`
-        // keep the prior good snapshot + classifier) on any impossible security
-        // state -- e.g. `gate_uid == agent_uid` (which would collapse the two
-        // confined principals back into one at `AllowlistEvaluator.scopeMatches`),
-        // root/below-ceiling uids, or a NAT descriptor carrying `gate_uid`.
+        // ─────────────────────────────────────────────────────────────────
+        // S5-0 enforcement-boundary SCHEMA validation (the HIGH-1 + HIGH-2
+        // chokepoint). A valid signature/digest proves AUTHENTICITY, not that
+        // the producer's schema/floor invariants hold. AGENTS.md invariant 4/5
+        // forbids trusting across the TS->Swift boundary or silently degrading.
+        // So each security-relevant field the TS producer validates is
+        // independently re-validated HERE, before the snapshot is constructed;
+        // on any violation this THROWS, rejecting the WHOLE snapshot (both
+        // `applyManifestUpdated` and `recoverPersistedManifest` funnel through
+        // here and keep the prior good snapshot + classifier on throw).
+        //
+        // CRITICAL: validate each field in the representation the crypto
+        // actually BINDS.
+        //   - RULES: their per-rule DIGEST is computed over the RAW wire bytes
+        //     (`verifyRuleDigests` hashes `receivedRules`), and the evaluator
+        //     consumes the TYPED `ManifestRule` -- but optional `Codable`
+        //     silently collapses an explicit JSON `null` (and other off-shape
+        //     values) to "absent". A signed rule whose raw scope is
+        //     `{"uids": null}` passes the digest yet decodes to `uids == nil`,
+        //     which `scopeMatches` treats as "all agents": a UID-scoped rule
+        //     silently widens to every principal (HIGH-2). The digest binds the
+        //     RAW bytes, so the RAW bytes are what must be schema-validated.
+        //   - AGENT_ORIGIN: the MANIFEST-BODY SIGNATURE is verified over the
+        //     re-encoded TYPED `ManifestSignedBody`, so the TYPED struct is the
+        //     cryptographically-bound form -- `validateAgentOriginFloors`
+        //     validates that same typed form (HIGH-1). As additional
+        //     defense-in-depth against the same Codable-null-collapse class we
+        //     ALSO schema-check the RAW `agent_origin` when present.
+        // ─────────────────────────────────────────────────────────────────
+        try validateSignedRuleScopes(
+            rules: body.rules,
+            receivedRules: body.receivedRules
+        )
+        if let rawManifest = body.receivedManifest {
+            try validateRawAgentOriginShape(rawManifest)
+        }
         if let origin = manifest.agentOrigin {
             try validateAgentOriginFloors(origin)
         }
@@ -167,6 +198,141 @@ public enum SignedManifestVerifier {
             guard wire.egressHelperSigningId != nil || wire.egressHelperTeamId != nil else {
                 throw SignedManifestVerificationError.invalidAgentOrigin(
                     "nat mode requires at least one egress-helper identity"
+                )
+            }
+        }
+    }
+
+    /// Largest value the sysext's `UInt32` uid wire type can hold. Mirrors the
+    /// TS `UINT32_MAX` cap in `agent-origin.ts` / `schema.ts`.
+    private static let uidWireMax: Int64 = 0xFFFF_FFFF
+
+    /// Enforcement-boundary schema validation of each signed rule's SCOPE axes,
+    /// operating on the RAW `receivedRules` JSON (S5-0 HIGH-2). Mirrors the TS
+    /// `validateRule` scope shape (`server/src/castle-wall/allowlist/schema.ts`):
+    ///   - `uids`, when present, must be an array whose every element is a JSON
+    ///     integer in `[1, UInt32.max]` (reject `null`, a scalar, a fractional
+    ///     number, `0`/root, a negative, or an above-`UInt32` value). An empty
+    ///     array is allowed (means "all", same as `agent_ids`/`template_ids`).
+    ///   - `agent_ids` / `template_ids`, when present, must be an array of
+    ///     non-empty strings.
+    /// Absent axes are fine. Only these scope axes are read by
+    /// `AllowlistEvaluator.scopeMatches`, so they are the only widening vectors;
+    /// unknown additive scope keys are not read and cannot widen, so they are
+    /// left to the sysext's forward-compat posture rather than rejected here.
+    ///
+    /// Runs against the RAW JSON (not the Codable-parsed `ManifestRule`) so an
+    /// explicit `null` / off-type value cannot be silently collapsed to
+    /// "absent" before it is checked. When `receivedRules` is absent (the typed
+    /// test/legacy construction path), the digest was computed over the typed
+    /// re-encode, so there is no raw-vs-typed gap and validation is skipped.
+    static func validateSignedRuleScopes(
+        rules: [ManifestRule],
+        receivedRules: [JSONValue]?
+    ) throws {
+        guard let receivedRules else { return }
+        for (index, raw) in receivedRules.enumerated() {
+            let fallbackId = index < rules.count ? rules[index].id : "<unknown>"
+            let ruleId = ruleIdOf(raw: raw) ?? fallbackId
+            guard case .object(let ruleObj) = raw else {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule is not a JSON object"
+                )
+            }
+            guard let scopeValue = ruleObj["scope"] else {
+                // `scope` is a required, non-optional field on `ManifestRule`;
+                // a rule missing it would have failed typed decode upstream.
+                // Treat a raw rule with no `scope` key defensively as invalid.
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule.scope missing"
+                )
+            }
+            guard case .object(let scopeObj) = scopeValue else {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule.scope must be a JSON object"
+                )
+            }
+            if let uids = scopeObj["uids"] {
+                try validateRawUidScopeAxis(uids, ruleId: ruleId)
+            }
+            for key in ["agent_ids", "template_ids"] {
+                if let ids = scopeObj[key] {
+                    try validateRawStringIdAxis(ids, ruleId: ruleId, axis: key)
+                }
+            }
+        }
+    }
+
+    private static func validateRawUidScopeAxis(_ value: JSONValue, ruleId: String) throws {
+        guard case .array(let items) = value else {
+            throw SignedManifestVerificationError.invalidRuleSchema(
+                ruleId: ruleId,
+                reason: "rule.scope.uids must be an array of integers (got a null, scalar, or wrong type)"
+            )
+        }
+        for item in items {
+            guard case .integer(let n) = item else {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId,
+                    reason: "rule.scope.uids contains a non-integer element"
+                )
+            }
+            if n < 1 || n > uidWireMax {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId,
+                    reason: "rule.scope.uids element \(n) out of range [1, \(uidWireMax)]"
+                )
+            }
+        }
+    }
+
+    private static func validateRawStringIdAxis(_ value: JSONValue, ruleId: String, axis: String) throws {
+        guard case .array(let items) = value else {
+            throw SignedManifestVerificationError.invalidRuleSchema(
+                ruleId: ruleId,
+                reason: "rule.scope.\(axis) must be an array of non-empty strings (got a null, scalar, or wrong type)"
+            )
+        }
+        for item in items {
+            guard case .string(let s) = item, !s.isEmpty else {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId,
+                    reason: "rule.scope.\(axis) contains a non-string or empty element"
+                )
+            }
+        }
+    }
+
+    private static func ruleIdOf(raw: JSONValue) -> String? {
+        guard case .object(let obj) = raw, case .string(let id)? = obj["id"] else {
+            return nil
+        }
+        return id
+    }
+
+    /// Defense-in-depth schema check of the RAW `agent_origin` object (S5-0
+    /// HIGH-2 class). The manifest-body signature already binds the re-encoded
+    /// TYPED descriptor (validated by `validateAgentOriginFloors`), but this
+    /// additionally rejects a raw `agent_origin` whose uid-family fields are
+    /// present as an explicit `null` or a non-integer -- shapes optional
+    /// `Codable` would collapse to "absent". Range/floor/cross-field checks stay
+    /// in `validateAgentOriginFloors` (which runs on the cryptographically-bound
+    /// typed form); here we only ensure the raw uid fields are integers when
+    /// present. A `null` or absent `agent_origin` is fine (means no descriptor).
+    static func validateRawAgentOriginShape(_ rawManifest: JSONValue) throws {
+        guard case .object(let manifestObj) = rawManifest else { return }
+        guard let originValue = manifestObj["agent_origin"] else { return }
+        if case .null = originValue { return }
+        guard case .object(let originObj) = originValue else {
+            throw SignedManifestVerificationError.invalidAgentOrigin(
+                "agent_origin must be a JSON object when present"
+            )
+        }
+        for field in ["agent_uid", "gate_uid", "system_uid_allow_ceiling"] {
+            guard let fieldValue = originObj[field] else { continue }
+            guard case .integer = fieldValue else {
+                throw SignedManifestVerificationError.invalidAgentOrigin(
+                    "agent_origin.\(field) must be an integer when present (raw null / wrong-type collapse rejected)"
                 )
             }
         }

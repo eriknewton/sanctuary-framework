@@ -671,6 +671,268 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         XCTAssertEqual(engine.evaluate(agentFlow), .drop(matchedRuleId: nil))
     }
 
+    // MARK: - S5-0 HIGH-2: signed rule with off-spec RAW scope fails whole
+    // snapshot, keeps prior policy (the digest binds RAW bytes; optional
+    // Codable must not silently collapse null/wrong-type to "absent" = all).
+
+    private func validGateOrigin() -> AgentOriginWire {
+        return AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 601, systemUidAllowCeiling: 500)
+    }
+
+    /// A raw rule JSON string for gate-endpoint.example.com:443 with the given
+    /// literal `scope` JSON substring.
+    private func rawGateRule(scopeJSON: String) -> String {
+        return """
+        {"id":"gate-scoped","schema_version":1,"created_at":"2026-07-14T00:00:00Z",\
+        "match":{"host":["gate-endpoint.example.com"],"port":[443],"protocol":"tcp"},\
+        "scope":\(scopeJSON),"disposition":"allow"}
+        """
+    }
+
+    private func assertRawScopeRejectedKeepingPrior(
+        scopeJSON: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let engine = try seedGoodUidPolicy()
+        let bad = try makeSignedBodyWithRawRules(
+            rawRuleJSONs: [rawGateRule(scopeJSON: scopeJSON)],
+            agentOrigin: validGateOrigin()
+        )
+        let rejected = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(bad.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: bad.publicKey,
+            engine: engine
+        )
+        XCTAssertNil(rejected, "off-spec raw scope must reject the whole snapshot", file: file, line: line)
+        XCTAssertEqual(engine.agentOrigin?.agentUid, 600, file: file, line: line)
+        XCTAssertEqual(engine.manifestStore.currentRules().map { $0.id }, ["r-origin"], file: file, line: line)
+    }
+
+    func testSignedScopeUidsNull_theExploit_rejectsWholeSnapshotKeepsPrior() throws {
+        // Codex's exact HIGH-2 repro: raw `scope: {"uids": null}`. Optional
+        // Codable collapses it to uids == nil, which scopeMatches would treat
+        // as "all agents" -- widening a gate-only rule to every principal.
+        try assertRawScopeRejectedKeepingPrior(scopeJSON: #"{"uids":null}"#)
+    }
+
+    func testVerifiedSnapshotThrowsInvalidRuleSchemaForScopeUidsNull() throws {
+        // Pin the typed error + the "does not throw" repro Codex ran directly
+        // at the verifier chokepoint.
+        let bad = try makeSignedBodyWithRawRules(
+            rawRuleJSONs: [rawGateRule(scopeJSON: #"{"uids":null}"#)],
+            agentOrigin: validGateOrigin()
+        )
+        XCTAssertThrowsError(
+            try SignedManifestVerifier.verifiedSnapshot(from: bad.body, pinnedPublicKey: bad.publicKey)
+        ) { error in
+            guard case SignedManifestVerificationError.invalidRuleSchema = error else {
+                return XCTFail("expected .invalidRuleSchema, got \(error)")
+            }
+        }
+    }
+
+    func testSignedScopeUidsZeroRoot_rejects() throws {
+        // `[0]` passes the typed `[UInt32]` decode (0 is a valid UInt32) but is
+        // off-spec (uids must be >= 1) -- so it reaches and is caught by the
+        // raw-schema chokepoint, not the typed decoder.
+        try assertRawScopeRejectedKeepingPrior(scopeJSON: #"{"uids":[0]}"#)
+    }
+
+    func testSignedScopeAgentIdsNull_rejects() throws {
+        // Same collapse class on the agent_ids axis (also touched by S5-0).
+        try assertRawScopeRejectedKeepingPrior(scopeJSON: #"{"agent_ids":null}"#)
+    }
+
+    func testSignedScopeTemplateIdsNull_rejects() throws {
+        try assertRawScopeRejectedKeepingPrior(scopeJSON: #"{"template_ids":null}"#)
+    }
+
+    // The two-layer defense: shapes that optional Codable does NOT silently
+    // collapse (a scalar where an array is expected, a fractional/negative/
+    // over-UInt32 uid, a non-string id) are rejected even earlier -- by the
+    // strict typed `[UInt32]?` / `[String]?` decode of `ManifestRule` -- so the
+    // whole IPC message fails to decode and never reaches `applyManifestUpdated`
+    // at all. This proves that first line (the wire body cannot be built).
+    func testOffSpecScopeShapesFailClosedAtStrictTypedDecode() throws {
+        for scopeJSON in [
+            #"{"uids":601}"#,          // scalar, not array
+            #"{"uids":[601.5]}"#,      // fractional
+            #"{"uids":[-1]}"#,         // negative (not UInt32-representable)
+            #"{"uids":[4294967296]}"#, // above UInt32.max
+            #"{"template_ids":[123]}"#, // non-string id
+        ] {
+            XCTAssertThrowsError(
+                try makeSignedBodyWithRawRules(
+                    rawRuleJSONs: [rawGateRule(scopeJSON: scopeJSON)],
+                    agentOrigin: validGateOrigin()
+                ),
+                "off-spec scope \(scopeJSON) must fail closed at IPC decode"
+            )
+        }
+    }
+
+    // The raw-schema chokepoint's own range/shape logic, exercised DIRECTLY
+    // (bypassing the strict typed decode that would otherwise pre-empt some of
+    // these) so the chokepoint is a proven backstop even if the typed layer
+    // ever loosens. Each off-spec raw `scope.uids` throws `.invalidRuleSchema`.
+    func testValidateSignedRuleScopes_rejectsEveryOffSpecUidsShape() throws {
+        func ruleValue(uids: JSONValue) -> JSONValue {
+            return .object([
+                "id": .string("gate-scoped"),
+                "scope": .object(["uids": uids]),
+            ])
+        }
+        let badUids: [JSONValue] = [
+            .null,                                   // null (Codable-collapse class)
+            .integer(601),                           // scalar, not array
+            .string("601"),                          // string, not array
+            .array([.number(601.5)]),                // fractional element
+            .array([.integer(0)]),                   // zero / root
+            .array([.integer(-1)]),                  // negative
+            .array([.integer(0x1_0000_0000)]),       // above UInt32.max
+            .array([.string("601")]),                // string element
+        ]
+        for uids in badUids {
+            XCTAssertThrowsError(
+                try SignedManifestVerifier.validateSignedRuleScopes(
+                    rules: [], receivedRules: [ruleValue(uids: uids)]
+                )
+            ) { error in
+                guard case SignedManifestVerificationError.invalidRuleSchema = error else {
+                    return XCTFail("expected .invalidRuleSchema for \(uids), got \(error)")
+                }
+            }
+        }
+        // Control: a well-formed array and an empty array (means "all") pass.
+        XCTAssertNoThrow(
+            try SignedManifestVerifier.validateSignedRuleScopes(
+                rules: [], receivedRules: [ruleValue(uids: .array([.integer(601), .integer(602)]))]
+            )
+        )
+        XCTAssertNoThrow(
+            try SignedManifestVerifier.validateSignedRuleScopes(
+                rules: [], receivedRules: [ruleValue(uids: .array([]))]
+            )
+        )
+    }
+
+    func testValidateSignedRuleScopes_rejectsNonStringIdAxes() throws {
+        func ruleValue(_ axis: String, _ value: JSONValue) -> JSONValue {
+            return .object(["id": .string("r"), "scope": .object([axis: value])])
+        }
+        for axis in ["agent_ids", "template_ids"] {
+            for bad: JSONValue in [.null, .string("x"), .array([.integer(1)]), .array([.string("")])] {
+                XCTAssertThrowsError(
+                    try SignedManifestVerifier.validateSignedRuleScopes(
+                        rules: [], receivedRules: [ruleValue(axis, bad)]
+                    )
+                ) { error in
+                    guard case SignedManifestVerificationError.invalidRuleSchema = error else {
+                        return XCTFail("expected .invalidRuleSchema for \(axis)=\(bad), got \(error)")
+                    }
+                }
+            }
+        }
+    }
+
+    func testSignedScopeUidsValidArray_stillAccepted() throws {
+        // Control: a well-formed raw uids scope is NOT rejected -- the
+        // chokepoint rejects only off-spec shapes, never legitimate ones.
+        let engine = try seedGoodUidPolicy()
+        let good = try makeSignedBodyWithRawRules(
+            rawRuleJSONs: [rawGateRule(scopeJSON: #"{"uids":[601]}"#)],
+            agentOrigin: validGateOrigin()
+        )
+        let snapshot = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(good.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: good.publicKey,
+            engine: engine
+        )
+        XCTAssertNotNil(snapshot, "a well-formed uids-scoped rule must still apply")
+        XCTAssertEqual(engine.manifestStore.currentRules().map { $0.id }, ["gate-scoped"])
+        // And the gate-scoped rule does not leak to the agent uid.
+        XCTAssertEqual(snapshot?.rules.first?.scope.uids, [601])
+    }
+
+    func testSignedScopeUidsNull_exploitFlowNotAllowed_agentDefaultDenied() throws {
+        // End-to-end: after the null-scope manifest is rejected, an agent-uid
+        // (600) flow to the gate endpoint default-denies under the prior policy.
+        // The rule never widened to all agents because it never went live.
+        let engine = try seedGoodUidPolicy()
+        let bad = try makeSignedBodyWithRawRules(
+            rawRuleJSONs: [rawGateRule(scopeJSON: #"{"uids":null}"#)],
+            agentOrigin: validGateOrigin()
+        )
+        XCTAssertNil(
+            IPCBridgeNotifications.applyManifestUpdated(
+                message: .manifestUpdated(bad.body),
+                store: engine.manifestStore,
+                cache: engine.flowCache,
+                pinnedPublicKey: bad.publicKey,
+                engine: engine
+            )
+        )
+        let agentFlow = FilterFlowDescriptor(
+            sourceAppIdentifier: "deadbeef",
+            agentId: "deadbeef",
+            templateId: "unknown",
+            destinationHost: "gate-endpoint.example.com",
+            destinationIp: "104.18.32.10",
+            destinationPort: 443,
+            networkProtocol: .tcp,
+            hostnameSource: "sni",
+            opaqueDestination: false,
+            sourceRuid: 600,
+            sourcePid: 4242,
+            sourcePidVersion: 1,
+            sourceSigningId: nil,
+            sourceTeamId: nil,
+            sourceUnattributed: false
+        )
+        XCTAssertEqual(engine.evaluate(agentFlow), .drop(matchedRuleId: nil))
+    }
+
+    func testValidateRawAgentOriginShape_rejectsNullUidField() throws {
+        // Defense-in-depth (S5-0 HIGH-2 class) on the raw agent_origin: a
+        // uid-family field present as explicit null (which optional Codable
+        // would collapse to absent) is rejected against the raw JSON.
+        let rawManifest = JSONValue.object([
+            "agent_origin": .object([
+                "mode": .string("uid"),
+                "agent_uid": .null, // explicit null -> would collapse to nil
+                "system_uid_allow_ceiling": .integer(500),
+            ]),
+        ])
+        XCTAssertThrowsError(
+            try SignedManifestVerifier.validateRawAgentOriginShape(rawManifest)
+        ) { error in
+            guard case SignedManifestVerificationError.invalidAgentOrigin = error else {
+                return XCTFail("expected .invalidAgentOrigin, got \(error)")
+            }
+        }
+        // Control: a clean integer descriptor passes the raw shape check.
+        XCTAssertNoThrow(
+            try SignedManifestVerifier.validateRawAgentOriginShape(
+                .object([
+                    "agent_origin": .object([
+                        "mode": .string("uid"),
+                        "agent_uid": .integer(600),
+                        "gate_uid": .integer(601),
+                        "system_uid_allow_ceiling": .integer(500),
+                    ]),
+                ])
+            )
+        )
+        // Control: absent / null agent_origin is fine (means no descriptor).
+        XCTAssertNoThrow(try SignedManifestVerifier.validateRawAgentOriginShape(.object([:])))
+        XCTAssertNoThrow(try SignedManifestVerifier.validateRawAgentOriginShape(.object(["agent_origin": .null])))
+    }
+
     // MARK: - PR-905-review BLOCKER: install ordering closes the boot window
 
     func testApplyManifestUpdated_installsOriginBEFORE_rulesGoLive() throws {

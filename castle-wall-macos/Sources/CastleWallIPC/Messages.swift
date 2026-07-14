@@ -956,6 +956,14 @@ public struct ManifestUpdatedBody: Codable, Equatable {
     /// this representation so additive fields unknown to `ManifestRule` remain
     /// inside the signed digest boundary.
     public let receivedRules: [JSONValue]?
+    /// Opaque manifest-body JSON as delivered on the wire (S5-0 HIGH-2,
+    /// 2026-07-14). Retained -- symmetric with `receivedRules` -- so the
+    /// enforcement boundary can schema-validate the RAW `agent_origin` and
+    /// catch shapes that optional `Codable` would silently collapse (e.g. an
+    /// explicit `"agent_uid": null`). Decode-only; never re-encoded and never
+    /// part of signature/digest verification (the signature binds the
+    /// re-encoded TYPED `manifest`).
+    public let receivedManifest: JSONValue?
 
     public init(manifestSignatureB64url: String?, rules: [ManifestRule]) {
         self.type = "manifest_updated"
@@ -977,19 +985,22 @@ public struct ManifestUpdatedBody: Codable, Equatable {
         }
         self.rules = rules
         self.receivedRules = nil
+        self.receivedManifest = nil
     }
 
     public init(
         manifest: ManifestSignedBody,
         signature: ManifestSignatureEnvelope,
         rules: [ManifestRule],
-        receivedRules: [JSONValue]? = nil
+        receivedRules: [JSONValue]? = nil,
+        receivedManifest: JSONValue? = nil
     ) {
         self.type = "manifest_updated"
         self.manifest = manifest
         self.signature = signature
         self.rules = rules
         self.receivedRules = receivedRules
+        self.receivedManifest = receivedManifest
     }
 
     public var manifestSignatureB64url: String? {
@@ -1010,6 +1021,10 @@ public struct ManifestUpdatedBody: Codable, Equatable {
         self.signature = try container.decodeIfPresent(ManifestSignatureEnvelope.self, forKey: .signature)
         self.rules = try container.decode([ManifestRule].self, forKey: .rules)
         self.receivedRules = try container.decode([JSONValue].self, forKey: .rules)
+        // Retain the RAW manifest-body JSON (decode-only), so the enforcement
+        // boundary can schema-validate the raw `agent_origin` before trusting
+        // the Codable-collapsed typed form (S5-0 HIGH-2).
+        self.receivedManifest = try container.decodeIfPresent(JSONValue.self, forKey: .manifest)
     }
 
     public func encode(to encoder: Encoder) throws {

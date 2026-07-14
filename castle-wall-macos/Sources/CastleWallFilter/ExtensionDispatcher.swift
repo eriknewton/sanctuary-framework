@@ -410,16 +410,36 @@ public final class ExtensionDispatcher {
             flowCache.clear()
         case .manifestUpdated:
             // Apply via the existing helper to keep store + cache invariants paired.
-            _ = IPCBridgeNotifications.applyManifestUpdated(
+            let applied = IPCBridgeNotifications.applyManifestUpdated(
                 message: message,
                 store: manifestStore,
                 cache: flowCache,
                 pinnedPublicKey: ipcClient.pinnedPublicKeyBytes,
                 engine: engine
             )
-            stateQueue.sync {
-                manifestReceived = true
-                cancelUnboundTimerIfBoundLocked()
+            // S5-0 HIGH-2 observability (2026-07-14): a REJECTED manifest
+            // (verifier throw -> `applyManifestUpdated` returns nil, prior
+            // policy kept) must NOT be marked as received. Marking it would let
+            // `isProviderBound` (connected && manifestReceived && armLeaseReceived)
+            // report bound on the strength of a policy push that never applied.
+            // Only a successfully-applied snapshot advances the flag.
+            //
+            // DEBT (non-blocking follow-up, deferred to keep this fail-closed and
+            // minimal): also emit a distinct operator-facing `manifest_rejected`
+            // IPC nack back to the control plane so a rejected push is visible on
+            // the dashboard, not just in the unified log. `applyManifestUpdated`
+            // already logs the rejection via `CastleWallLog.ipc.notice`; the full
+            // IPC nack is a new wire message type (frozen-surface change) and is
+            // tracked as a separate PR per the re-gate observability note.
+            if applied != nil {
+                stateQueue.sync {
+                    manifestReceived = true
+                    cancelUnboundTimerIfBoundLocked()
+                }
+            } else {
+                CastleWallLog.ipc.notice(
+                    "manifest_updated rejected; manifest_received NOT advanced (prior policy retained)"
+                )
             }
         case .decisionResponse:
             // Operator-approval / -deny resume path; round-trip wiring
