@@ -606,6 +606,38 @@ describe("file-grant ACL command argv construction", () => {
       { file: "setfacl", args: ["-m", "u:502:--x", "/fortress/grants/agent-1"] },
       { file: "setfacl", args: ["-m", "u:502:rX", "/proc/test/fd/9"] },
       { file: "setfacl", args: ["-x", "u:502", "/proc/test/fd/9"] },
+      // The just-applied fortress traverse ACE is cleaned up too: a partial
+      // apply must never orphan the uid-level traverse ACE.
+      { file: "setfacl", args: ["-x", "u:502", "/fortress"] },
+    ]);
+  });
+
+  it("cleans up the fortress traverse ACE when an ancestor command fails BEFORE the source leaf is attempted", async () => {
+    const seen: FileGrantExecCommand[] = [];
+    const fsOps = new PosixFileGrantFsOps("/fortress", {
+      platform: "linux",
+      execRunner: {
+        execFile: async (command) => {
+          seen.push(command);
+          if (command.args[2] === "/fortress/grants") {
+            throw new Error("setfacl ancestor failed");
+          }
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+
+    const result = await fsOps.grantAgentRead("agent-1/fg_abc", 502, pinnedSource());
+
+    // The fortress ACE succeeded, the FIRST grant-tree ancestor failed, and
+    // the source leaf was never attempted -- yet the fortress ACE is still
+    // removed. This is the pre-leaf failure path that previously skipped ALL
+    // cleanup (sourceLeafCommandAttempted was never set).
+    expect(result.status).toBe("failed");
+    expect(seen).toEqual([
+      { file: "setfacl", args: ["-m", "u:502:--x", "/fortress"] },
+      { file: "setfacl", args: ["-m", "u:502:--x", "/fortress/grants"] },
+      { file: "setfacl", args: ["-x", "u:502", "/fortress"] },
     ]);
   });
 
@@ -746,7 +778,12 @@ describe("file-grant ACL command argv construction", () => {
     expect(seen).toHaveLength(0);
   });
 
-  it("Linux: keeps the fortress-dir traverse ACE while the agent has another active grant, and removes it once drained (F1 fix)", async () => {
+  it("Linux: draining ONE subject agent id never strips the shared-uid fortress ACE while ANOTHER agent id still holds a grant (F1 fix, cross-agent)", async () => {
+    // The fortress traverse ACE is keyed on the box's single OS uid; two
+    // DISTINCT logical agent ids resolve to that same uid. Draining agent-1's
+    // subtree while agent-2 still holds an active grant must NOT remove the
+    // shared ACE (it would break agent-2's still-live reach path). Only when
+    // the WHOLE grant tree is drained may the ACE go.
     const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-fortress-lifecycle-"));
     const sourceDir = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-source-lifecycle-"));
     const sourceA = join(sourceDir, "a.txt");
@@ -773,8 +810,8 @@ describe("file-grant ACL command argv construction", () => {
     await pinnedA.close();
 
     const pinnedB = await fsOps.pinSource(sourceB);
-    await fsOps.place(sourceB, "agent-1/fg_b");
-    const resultB = await fsOps.grantAgentRead("agent-1/fg_b", 502, pinnedB);
+    await fsOps.place(sourceB, "agent-2/fg_b");
+    const resultB = await fsOps.grantAgentRead("agent-2/fg_b", 502, pinnedB);
     await pinnedB.close();
 
     expect(resultA.status).toBe("applied");
@@ -784,27 +821,73 @@ describe("file-grant ACL command argv construction", () => {
 
     exec.commands.length = 0;
 
-    // Revoking the FIRST grant leaves the agent's SECOND grant active, so the
-    // fortress-dir ACE must stay in place.
+    // Draining agent-1 ENTIRELY (its last grant) while agent-2's grant is
+    // still live: the shared uid's fortress ACE must stay.
     const first = await fsOps.removeEntry("agent-1/fg_a", {
       grantedReadAce: resultA.grantedReadAce,
     });
     expect(first.treeEntryRemoved).toBe(true);
-    expect(first.fortressTraverseRemoval).toBeUndefined();
     expect(exec.commands).not.toContainEqual({ file: "setfacl", args: ["-x", "u:502", fortress] });
 
-    // Revoking the LAST (second) grant drains the agent: the fortress-dir ACE
-    // must be removed too, not left as a standing orphan.
-    const second = await fsOps.removeEntry("agent-1/fg_b", {
+    // Draining agent-2 as well empties the WHOLE tree: now (and only now)
+    // the fortress ACE is removed, not left as a standing orphan.
+    const second = await fsOps.removeEntry("agent-2/fg_b", {
       grantedReadAce: resultB.grantedReadAce,
     });
     expect(second.treeEntryRemoved).toBe(true);
-    expect(second.fortressTraverseRemoval).toEqual({
-      status: "removed",
-      agent_uid: 502,
-      platform: "linux",
-    });
     expect(exec.commands).toContainEqual({ file: "setfacl", args: ["-x", "u:502", fortress] });
+    // ...and exactly once, with no compensating re-apply (the tree really is empty).
+    expect(exec.commands.filter((c) => c.args.includes(fortress))).toEqual([
+      { file: "setfacl", args: ["-x", "u:502", fortress] },
+    ]);
+  });
+
+  it("Linux: a concurrent mint placing an entry between drain-check and ACE removal triggers an immediate re-apply (revoke-vs-mint race close)", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-fortress-race-"));
+    const sourceDir = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-source-race-"));
+    const source = join(sourceDir, "a.txt");
+    await writeFile(source, "a");
+
+    const originDir = join(fortress, "policy", "egress");
+    await mkdir(originDir, { recursive: true });
+    await writeFile(
+      join(originDir, "agent-origin.json"),
+      JSON.stringify({ mode: "uid", agent_uid: 502, system_uid_allow_ceiling: 500 })
+    );
+
+    // Exec runner that simulates a concurrent mint: the moment the revoke
+    // path issues the fortress ACE removal, a new grant entry appears in the
+    // tree (as a real mint's place() would have done).
+    const seen: FileGrantExecCommand[] = [];
+    const fsOps = new PosixFileGrantFsOps(fortress, {
+      platform: "linux",
+      execRunner: {
+        execFile: async (command) => {
+          seen.push(command);
+          if (command.args[0] === "-x" && command.args[2] === fortress) {
+            await mkdir(join(fortress, "grants", "agent-9"), { recursive: true });
+            await writeFile(join(fortress, "grants", "agent-9", "fg_new"), "placed");
+          }
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+
+    const pinned = await fsOps.pinSource(source);
+    await fsOps.place(source, "agent-1/fg_a");
+    const result = await fsOps.grantAgentRead("agent-1/fg_a", 502, pinned);
+    await pinned.close();
+    expect(result.status).toBe("applied");
+    seen.length = 0;
+
+    await fsOps.removeEntry("agent-1/fg_a", { grantedReadAce: result.grantedReadAce });
+
+    // The drain check passed (tree looked empty), the removal ran, the
+    // re-check saw the concurrently placed entry, and the ACE was re-applied.
+    expect(seen.filter((c) => c.args.includes(fortress))).toEqual([
+      { file: "setfacl", args: ["-x", "u:502", fortress] },
+      { file: "setfacl", args: ["-m", "u:502:--x", fortress] },
+    ]);
   });
 
   it("macOS: keeps the fortress-dir traverse ACE while the agent has another active grant, and removes it once drained (F1 fix)", async () => {
@@ -873,22 +956,16 @@ describe("file-grant ACL command argv construction", () => {
     const first = await fsOps.removeEntry(treeEntryA, { grantedReadAce: aceA });
     expect(first.treeEntryRemoved).toBe(true);
     expect(first.aclRemoval.status).toBe("removed");
-    expect(first.fortressTraverseRemoval).toBeUndefined();
     expect(exec.commands).not.toContainEqual({
       file: "chmod",
       args: ["-a", "user:agentuser allow execute", fortress],
     });
 
-    // Revoking the LAST (second) grant drains the agent: the fortress-dir ACE
-    // must be removed too, not left as a standing orphan.
+    // Revoking the LAST (second) grant drains the whole tree: the fortress
+    // ACE is removed too, not left as a standing orphan.
     const second = await fsOps.removeEntry(treeEntryB, { grantedReadAce: aceB });
     expect(second.treeEntryRemoved).toBe(true);
     expect(second.aclRemoval.status).toBe("removed");
-    expect(second.fortressTraverseRemoval).toEqual({
-      status: "removed",
-      agent_uid: 502,
-      platform: "darwin",
-    });
     expect(exec.commands).toContainEqual({
       file: "chmod",
       args: ["-a", "user:agentuser allow execute", fortress],

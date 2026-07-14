@@ -46,13 +46,36 @@
  * (proven on real uid-split hardware, Mini1, 2026-07-14). `applyAgentReadAcl`
  * now also applies a single execute-only ACE on the fortress dir itself for
  * the agent uid. Unlike the grant-tree ancestor ACEs, this ACE is
- * LIFECYCLE-BOUND: because the fortress root is a more sensitive boundary
- * than the dedicated grants subtree (every other operator file lives beside
- * it), `removeEntry` removes it again once the agent's per-agent grant-tree
- * subdirectory is confirmed empty (no more active grants for that agent) --
- * see `removeFortressTraverseAceIfAgentDrained`. It is still execute-only
- * (traverse, never list or read), applied and removed the same way as every
- * other ACE here (`chmod +a`/`-a` on macOS, `setfacl -m`/`-x` on Linux).
+ * LIFECYCLE-BOUND, and its lifecycle is keyed on the OS UID, not on a
+ * logical agent id: the box's agent-origin descriptor names ONE dedicated
+ * uid, every subject agent id resolves to it, and the ACE itself is a
+ * uid-level object. So `removeEntry` removes it only when the WHOLE grant
+ * tree is drained (no tree entry left under ANY per-agent subdirectory) --
+ * see `removeFortressTraverseAceIfTreeDrained`. Draining one logical agent's
+ * subtree while another still holds an active grant for the same uid MUST
+ * NOT strip the shared ACE. A failed ACL apply also best-effort removes the
+ * ACE it just added (never left orphaned by a partial apply). It is still
+ * execute-only (traverse, never list or read), applied and removed the same
+ * way as every other ACE here (`chmod +a`/`-a` on macOS, `setfacl -m`/`-x`
+ * on Linux).
+ *
+ * DEBT (uid-basis re-resolution): cleanup currently re-resolves the agent
+ * uid from the live agent-origin descriptor at removal time. The durable fix
+ * is to persist the uid basis on the grant record at mint time so cleanup
+ * never consults mutable current policy; that lands with a multi-uid
+ * descriptor model, not v1.
+ *
+ * ACCEPTED CONSEQUENCE (documented, not a defect): while the traverse ACE is
+ * live, the agent uid can stat() DIRECT fortress-root children by known name
+ * (existence, size, mtime -- metadata only, never contents, since the
+ * startup tightener and every root-child writer keep child modes owner-only).
+ * That metadata visibility is inherent to granting traverse. Consequently,
+ * ANY new writer of a direct fortress-root file MUST create it with an
+ * explicit owner-only mode from the first byte (`{ mode: 0o600 }` /
+ * `writeFileCustody`), never default-mode-then-chmod: the 2026-07-14 review
+ * found and fixed exactly that create-window in `broker-policy.json`
+ * (disclosure/broker/open.ts) and `first-run-notice-shown`
+ * (first-run-notice.ts). Do not add a third.
  */
 
 import { execFile as nodeExecFile } from "node:child_process";
@@ -623,67 +646,105 @@ export class PosixFileGrantFsOps implements FsOps {
       }
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-        const fortressTraverseRemoval =
-          await this.removeFortressTraverseAceIfAgentDrained(relativeTreeEntry);
+        await this.removeFortressTraverseAceIfTreeDrained(relativeTreeEntry);
         return {
           treeEntryRemoved,
           aclRemoval,
           scrubbed: didScrubConfirmedAclTarget(grantedReadAce, aclRemoval),
-          ...(fortressTraverseRemoval ? { fortressTraverseRemoval } : {}),
         };
       }
       throw err;
     }
-    const fortressTraverseRemoval =
-      await this.removeFortressTraverseAceIfAgentDrained(relativeTreeEntry);
+    await this.removeFortressTraverseAceIfTreeDrained(relativeTreeEntry);
     return {
       treeEntryRemoved,
       aclRemoval,
       scrubbed: didScrubConfirmedAclTarget(grantedReadAce, aclRemoval),
-      ...(fortressTraverseRemoval ? { fortressTraverseRemoval } : {}),
     };
   }
 
   /**
    * F1 fix (2026-07-14 drill finding): once a tree entry has been scrubbed
-   * (or was already absent), check whether the agent's per-agent grant-tree
-   * subdirectory is now empty. If so, this was the agent's LAST active
-   * grant, so the execute-only fortress-dir traverse ACE applied at grant
-   * time (`applyAgentReadAcl`) is no longer needed and is removed too.
-   * Best-effort and purely informational: a failure here never affects
+   * (or was already absent), check whether the WHOLE grant tree is now
+   * drained -- no tree entry left under ANY per-agent subdirectory. Only
+   * then is the execute-only fortress-dir traverse ACE applied at grant time
+   * (`applyAgentReadAcl`) removed.
+   *
+   * WHOLE tree, not this entry's per-agent subtree: the ACE is keyed on the
+   * box's single dedicated agent UID, and today every subject agent id
+   * resolves to that same uid (`agentUid` ignores its argument). Draining
+   * one logical agent's subtree while a DIFFERENT subject agent id still
+   * holds an active grant would strip the shared uid's traverse and break
+   * the other agent's still-live reach path. See the module doc comment's
+   * DEBT note for the durable multi-uid fix (persist the uid basis on the
+   * grant record).
+   *
+   * Revoke-vs-concurrent-mint race close: after a confirmed removal the tree
+   * is re-checked; if a concurrent mint placed a new entry between the drain
+   * check and the ACE removal, the ACE is immediately re-applied (mint also
+   * re-applies it idempotently during its own ACL step, so the residual
+   * window is a transient probe failure that reports the honest `unverified`
+   * label, never a false `met` and never a silently unreachable verified
+   * grant).
+   *
+   * Best-effort and purely internal: the return value is consumed only by
+   * unit tests via the recorded exec commands; a failure here never affects
    * `scrubbed` (which tracks only the per-grant source-inode ACE) and never
    * throws, because the grant this call is scrubbing has already been
-   * correctly revoked/expired regardless of whether this bonus cleanup
-   * succeeds. Returns undefined (no field on the result) when there is
-   * nothing to report: unsupported platform, the agent still has another
-   * active grant, or no agent uid is currently configured.
+   * correctly revoked/expired regardless of whether this cleanup succeeds.
+   * Returns undefined when there is nothing to do: unsupported platform,
+   * some grant is still live anywhere in the tree, or no agent uid is
+   * currently configured.
    */
-  private async removeFortressTraverseAceIfAgentDrained(
+  private async removeFortressTraverseAceIfTreeDrained(
     relativeTreeEntry: string
   ): Promise<FileGrantAclRemovalResult | undefined> {
     if (this.platform !== "linux" && this.platform !== "darwin") return undefined;
+    if (!(await this.isGrantTreeDrained())) return undefined;
     const agentId = agentIdFromRelativeTreeEntry(relativeTreeEntry);
-    if (agentId === null) return undefined;
-    const agentLeafDir = resolve(this.treeRoot(), agentId);
-    const drained = await this.isDirectoryEmptyOrAbsent(agentLeafDir);
-    if (!drained) return undefined;
     let agentUid: number | null;
     try {
-      agentUid = await this.agentUid(agentId);
+      agentUid = await this.agentUid(agentId ?? "");
     } catch {
       agentUid = null;
     }
     if (agentUid === null) return undefined;
-    return this.removeFortressTraverseAce(agentUid);
+    const removal = await this.removeFortressTraverseAce(agentUid);
+    if (removal.status === "removed" && !(await this.isGrantTreeDrained())) {
+      await this.bestEffortReapplyFortressTraverseAce(agentUid);
+    }
+    return removal;
   }
 
-  private async isDirectoryEmptyOrAbsent(dir: string): Promise<boolean> {
+  /**
+   * True when no grant-tree entry exists under any per-agent subdirectory
+   * (or the tree root itself is absent). Fails toward NOT-drained on any
+   * unexpected read error: uncertainty must keep the traverse ACE in place
+   * (a later confirmed drain removes it) rather than strip a possibly-live
+   * grant's reach path.
+   */
+  private async isGrantTreeDrained(): Promise<boolean> {
+    const root = this.treeRoot();
+    let agentDirs: string[];
     try {
-      const entries = await readdir(dir);
-      return entries.length === 0;
+      agentDirs = await readdir(root);
     } catch (err) {
       return (err as NodeJS.ErrnoException)?.code === "ENOENT";
     }
+    for (const name of agentDirs) {
+      try {
+        const entries = await readdir(join(root, name));
+        if (entries.length > 0) return false;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        // A vanished subdir is drained; a stray non-directory direct child is
+        // not a grant entry (entries live at depth 2). Anything else is
+        // uncertainty: treat as not drained.
+        if (code === "ENOENT" || code === "ENOTDIR") continue;
+        return false;
+      }
+    }
+    return true;
   }
 
   private async removeFortressTraverseAce(
@@ -704,6 +765,20 @@ export class PosixFileGrantFsOps implements FsOps {
         platform: this.platform,
         reason: errorText(err),
       };
+    }
+  }
+
+  private async bestEffortReapplyFortressTraverseAce(agentUid: number): Promise<void> {
+    try {
+      if (this.platform === "linux") {
+        await this.runCommand(buildLinuxFortressTraverseGrantCommand(this.fortressPath, agentUid));
+      } else {
+        const principal = await this.resolveMacPrincipal(agentUid);
+        await this.runCommand(buildMacFortressTraverseGrantCommand(this.fortressPath, principal));
+      }
+    } catch {
+      // Best-effort: the concurrent mint's own ACL step re-applies this same
+      // idempotent ACE; its probe simply reports unverified until it does.
     }
   }
 
@@ -797,43 +872,47 @@ export class PosixFileGrantFsOps implements FsOps {
     }
 
     let sourceLeafCommandAttempted = false;
+    let fortressTraverseAceApplied = false;
     let macAclHardlinkPath: string | undefined;
     try {
       const macPrincipal =
         this.platform === "darwin" ? await this.resolveMacPrincipal(agentUid) : undefined;
+      let fortressCommand: FileGrantExecCommand;
       let commands: FileGrantExecCommand[];
       if (this.platform === "linux") {
         if (!pinnedSource.source_fd_path) {
           throw new Error("Governed File-Grant: pinned source fd path unavailable on Linux");
         }
-        commands = [
-          // F1 fix (2026-07-14): the fortress dir sits ABOVE the grant-tree
-          // root and is 0700 by default, so without this the agent uid can
-          // never reach the grant tree at all. Idempotent; a second/third
-          // grant for the same agent repeats this harmlessly.
-          buildLinuxFortressTraverseGrantCommand(this.fortressPath, agentUid),
-          ...buildLinuxGrantAgentReadCommands(
-            this.treeRoot(),
-            relativeTreeEntry,
-            agentUid,
-            pinnedSource.source_fd_path
-          ),
-        ];
+        fortressCommand = buildLinuxFortressTraverseGrantCommand(this.fortressPath, agentUid);
+        commands = buildLinuxGrantAgentReadCommands(
+          this.treeRoot(),
+          relativeTreeEntry,
+          agentUid,
+          pinnedSource.source_fd_path
+        );
       } else {
         macAclHardlinkPath = await this.prepareMacAclHardLinkTarget(
           relativeTreeEntry,
           pinnedSource
         );
-        commands = [
-          buildMacFortressTraverseGrantCommand(this.fortressPath, macPrincipal!),
-          ...buildMacGrantAgentReadCommands(
-            this.treeRoot(),
-            relativeTreeEntry,
-            macPrincipal!,
-            macAclHardlinkPath
-          ),
-        ];
+        fortressCommand = buildMacFortressTraverseGrantCommand(this.fortressPath, macPrincipal!);
+        commands = buildMacGrantAgentReadCommands(
+          this.treeRoot(),
+          relativeTreeEntry,
+          macPrincipal!,
+          macAclHardlinkPath
+        );
       }
+      // F1 fix (2026-07-14): the fortress dir sits ABOVE the grant-tree root
+      // and is 0700 by default, so without this the agent uid can never reach
+      // the grant tree at all. Idempotent; a second/third grant for the same
+      // uid repeats this harmlessly. Tracked separately from the source-leaf
+      // attempt so a failure ANYWHERE after this point (including on a
+      // grant-tree ancestor, before the leaf is attempted) still best-effort
+      // removes the just-applied fortress ACE in the catch below -- a partial
+      // apply must never leave the uid-level traverse ACE orphaned.
+      await this.runCommand(fortressCommand);
+      fortressTraverseAceApplied = true;
       const sourceLeafCommand = commands.at(-1);
       await this.runCommands(commands.slice(0, -1));
       if (sourceLeafCommand) {
@@ -863,6 +942,17 @@ export class PosixFileGrantFsOps implements FsOps {
     } catch (err) {
       if (sourceLeafCommandAttempted) {
         await this.bestEffortRemoveAgentReadAcl(agentUid, pinnedSource, macAclHardlinkPath);
+      }
+      if (fortressTraverseAceApplied) {
+        // Best-effort removal of the exact ACE this failed apply added, on
+        // EVERY non-applied exit after it ran. Failing toward LESS access is
+        // the safe direction: if the same uid holds another live verified
+        // grant, its reach path is restored by any subsequent successful
+        // apply (the fortress ACE is idempotent and re-applied on every
+        // grant), whereas leaving the ACE orphaned after a failed apply would
+        // be a standing traverse the operator never got a confirmed grant
+        // for.
+        await this.removeFortressTraverseAce(agentUid);
       }
       if (this.platform === "darwin" && macAclHardlinkPath) {
         await this.removeMacAclHardLinkBestEffort(macAclHardlinkPath);
