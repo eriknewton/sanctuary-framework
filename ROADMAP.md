@@ -103,7 +103,7 @@ Concrete, scoped, on the engineering path. Each item has named decision artifact
 
 Today the macOS wall enforces and a per-rule read-out exists, but the unforgeable, producer-signed, per-flow audit trail is not wired. This build converts "the wall blocked it" into "this rule blocked this flow, provably, in a record nobody can edit," which is what a security operations console needs to consume enforcement as evidence. **Why it matters:** it is the honest gap named on the Assurance Matrix row, and closing it upgrades every enforcement claim from demonstration to per-decision evidence.
 
-*Status: the top enforcement-path item; design work sequenced in the current build queue.*
+*Status: the three macOS pieces (producer-key mint+publish, full-mode daemon producer-signing, and the `castle-wall audit-verify` reader CLI verb with forged-entry rejection) are built and pass the full local gate (lint, typecheck, 10k+ tests) on a branch rebased onto current main; still HALTed pending Erik security-core review and a signed-host engage drill where producer signing actually fires on real flows (N>=3). Built is not yet drilled, and this does not widen the Assurance Matrix row.*
 
 #### Castle Wall on Windows
 
