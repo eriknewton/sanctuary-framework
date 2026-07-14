@@ -360,14 +360,19 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("BLOCKED flow observations only");
     expect(report).toContain("a destination the wall DENIED");
     expect(report).toContain("a count of those denied attempts");
-    expect(report).toContain("allowed egress is not inventoried");
+    expect(report).toContain("Allowed egress is not inventoried");
     expect(report).toContain("not a census of where the machines' traffic actually went");
-    // R3-1 re-truing: the "permitted destinations do NOT appear" claim is
-    // grounded in the engine mechanism that honors it (the refresh
-    // chokepoint's allowlist suppression + prune), not an unconditional
-    // absolute the store cannot back.
+    // R3-1 re-truing: the "permitted flows do NOT appear" claim is grounded
+    // in the engine mechanism that honors it (the refresh chokepoint's
+    // SCOPE-AWARE allowlist suppression + prune), phrased over flows-for-the-
+    // attempting-agent rather than a destination-level absolute the store
+    // cannot back (this table has no agent column, and a rule scoped to one
+    // template does not permit another's attempts).
+    expect(report).toContain("Flows the operator's policy permits do NOT");
+    expect(report).toContain("for the agent that attempted it");
     expect(report).toContain("as of its most recent refresh");
     expect(report).toContain("clears any pending candidate");
+    expect(report).toContain("does not cover another agent's attempts");
   });
 
   it("OPEN-MED-1 + F2: the egress 'Seen' legend states its true basis (candidate-record lifetime, not quarter-scoped)", () => {
