@@ -95,6 +95,11 @@ export {
 } from "./fleet-cap.js";
 
 export {
+  computeFleetCapacityView,
+  type FleetCapacityView,
+} from "./fleet-capacity.js";
+
+export {
   FLEET_ACTIVATION_META_KEY,
   readFleetActivation,
   writeFleetActivation,

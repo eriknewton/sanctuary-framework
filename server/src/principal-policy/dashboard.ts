@@ -96,10 +96,12 @@ import {
   readDowngradeLog,
   runFleetReResolve,
   resolveFleetCap as resolveFleetCapPure,
+  computeFleetCapacityView,
   type FleetCap,
   type ActivateFleetResult,
   type PriorCapState,
   type ReResolveRosterView,
+  type FleetCapacityView,
 } from "../entitlement/index.js";
 import {
   buildCastleWallPosture,
@@ -128,6 +130,7 @@ import {
   federationContextHasIssuerAuthority,
   federationEventHash,
   validateFederationEventHash,
+  JoinCeremony,
   type FederationAppendOptions,
   type FederationAppendResult,
   type FederationContext,
@@ -137,6 +140,8 @@ import {
   type FederationSyncCursor,
   type V1FederationDeps,
 } from "../v1/federation.js";
+import type { NodeMode } from "../mesh/constants.js";
+import type { BootstrapToken } from "../mesh/lifecycle/types.js";
 import {
   deriveNodePosture,
   NODE_TRUST_BOUNDARY_VERSION,
@@ -541,6 +546,18 @@ function appliedPolicyMarkerToNodeView(
     source_event_id: marker.source_event_id,
   };
 }
+
+/**
+ * Fleet control plane, Add-Machine slice: the closed, server-typed result of
+ * parsing + validating a `POST /api/fleet/enroll-token` request body. Either a
+ * fully validated `{ node_id, node_mode }` pair, or a ready-to-send error
+ * response. Keeping the request-body values behind this tagged result lets the
+ * enroll handler branch only on the `ok` flag, so no attacker-controlled body
+ * value syntactically controls any condition that dominates a mint decision.
+ */
+type FleetEnrollTokenBodyParse =
+  | { ok: true; nodeId: string; nodeMode: NodeMode }
+  | { ok: false; status: number; payload: Record<string, string> };
 
 export class DashboardApprovalChannel implements ApprovalChannel {
   private config: DashboardConfig;
@@ -5873,6 +5890,28 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         // capacity for a revoked license; every node's wall stays up.
         if (!this.checkAuth(req, url, res, { requireToken: true })) return;
         this.handleFleetRevocationListPush(req, res);
+      } else if (method === "GET" && url.pathname === "/api/fleet/capacity") {
+        // Fleet control plane, Add-Machine slice: the honest "enrollment
+        // headroom" read the Add-Machine UI needs before it invites a node.
+        // Read-only; fail-closed to the community floor on any read failure;
+        // never gates security; carries no key material.
+        void this.handleFleetCapacity(res);
+      } else if (
+        method === "POST" &&
+        url.pathname === "/api/fleet/enroll-token"
+      ) {
+        // Fleet control plane, Add-Machine slice: the dashboard-side "Add a
+        // machine" button. Mints a bootstrap token through the SAME ceremony
+        // primitive the CLI's `sanctuary federation authorize` drives. Changes
+        // fleet membership intent, so gate it with the operator bearer token
+        // exactly like `/api/fleet/activate` and `/api/fleet/revocation-list`
+        // (the default-deny gate above already re-checks every non-GET route
+        // with `{ requireToken: true }`; made explicit and local here too).
+        // NEVER GATES SECURITY: the at-capacity pre-check is advisory
+        // MANAGEMENT-CAPACITY UX, not enforcement; it touches no wall /
+        // enforcement / local-dashboard / policy-push / kill-safety path.
+        if (!this.checkAuth(req, url, res, { requireToken: true })) return;
+        this.handleFleetEnrollToken(req, res);
       } else if (method === "POST" && url.pathname.startsWith("/api/approve/")) {
         // Decision endpoints get an additional tighter rate limit
         if (!this.checkRateLimit(req, res, "decisions")) return;
@@ -6448,6 +6487,361 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       version: result.version,
       revokedCount: result.revokedCount,
     };
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: resolve the pure enrollment
+   * headroom view AND a "was the active-node count reliably derived" signal,
+   * by composing SHIPPED parts only (the existing private
+   * {@link resolveFleetCap} plus the durable roster via
+   * `buildFleetRoster(...)`, as {@link activateFleetLicense} already does),
+   * and feeding both into the pure {@link computeFleetCapacityView}.
+   *
+   * `rosterCountReliable` distinguishes two different "no active count"
+   * shapes that must NOT be treated the same by every caller:
+   *  - `buildFleetRoster` returns normally with `available: false`
+   *    (federation genuinely not provisioned on this fortress): there IS no
+   *    fleet, so `active_nodes: 0` is an honest count. `rosterCountReliable`
+   *    is `true` here.
+   *  - `buildFleetRoster` THROWS (an unexpected derivation failure, e.g. a
+   *    transient revocation-state read error) while federation IS
+   *    provisioned/enabled: the real roster size is UNKNOWN, not zero.
+   *    `rosterCountReliable` is `false` here, and `active_nodes: 0` in the
+   *    returned view must be read as "unavailable", never as "genuinely
+   *    empty".
+   *
+   * Never throws: `resolveFleetCap` itself is already fail-closed to the
+   * community floor, and a roster derivation failure is caught and reported
+   * via `rosterCountReliable`, not re-thrown.
+   */
+  private async computeFleetCapacityWithReliability(): Promise<{
+    view: FleetCapacityView;
+    rosterCountReliable: boolean;
+  }> {
+    const cap = await this.resolveFleetCap();
+    let activeNodes = 0;
+    let rosterCountReliable = true;
+    try {
+      const roster = buildFleetRoster(this.buildV1FederationDeps(), {
+        evictionSerial: this._federationState.evictionMaxSerial,
+        operatorPolicy: this._federationState.operatorPolicy,
+      });
+      if (roster.available) {
+        activeNodes = roster.summary.admitted;
+      }
+    } catch {
+      // Roster derivation failed while federation is (or may be) provisioned:
+      // the true count is UNKNOWN, not zero. Callers that gate a mutation
+      // (e.g. the enroll-token mint pre-check) must fail closed on this
+      // signal rather than read active_nodes as "0 active, plenty of room".
+      activeNodes = 0;
+      rosterCountReliable = false;
+    }
+    return {
+      view: computeFleetCapacityView(cap, activeNodes),
+      rosterCountReliable,
+    };
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: resolve the pure enrollment
+   * headroom view for READ-ONLY display surfaces (`GET /api/fleet/capacity`).
+   * A roster derivation failure still reports `active_nodes: 0` here (honest
+   * absence for a status panel); see
+   * {@link computeFleetCapacityWithReliability} for the reliability signal the
+   * enroll-token MINT gate uses to fail closed instead of proceeding as if 0
+   * nodes were active. Never throws.
+   */
+  private async computeFleetCapacity(): Promise<FleetCapacityView> {
+    const { view } = await this.computeFleetCapacityWithReliability();
+    return view;
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: `GET /api/fleet/capacity`. The
+   * honest "enrollment headroom" read the Add-Machine UI needs before it
+   * invites a node: tier, max_nodes (null = unlimited), active_nodes,
+   * remaining headroom, and whether the fleet is at capacity. Read-only, no
+   * bearer mutation, no key material. NEVER GATES SECURITY: advisory
+   * management-capacity UX only; touches no wall / enforcement /
+   * local-dashboard / policy-push / kill-safety path. Never throws.
+   */
+  private async handleFleetCapacity(res: ServerResponse): Promise<void> {
+    try {
+      const view = await this.computeFleetCapacity();
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify(view));
+    } catch {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "internal_error" }));
+    }
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: parse + FULLY validate a
+   * `POST /api/fleet/enroll-token` request body into a closed, server-typed
+   * result BEFORE any enrollment decision runs. Pure: no I/O, no instance
+   * state, never throws (a malformed or unparseable body becomes a tagged
+   * `ok: false` result carrying the exact status + JSON payload to send, not
+   * an exception).
+   *
+   * Security note: this is INPUT VALIDATION, not a security gate. The real
+   * enrollment gates (paid node-cap, federation-provisioned + issuer
+   * authority, the join ceremony) all run AFTER this and are derived purely
+   * from server-side state, never from the request body. `node_id` is only a
+   * label bound into the minted token; `node_mode` is normalized to a closed
+   * enum and never selects a capacity bucket (the cap is checked against the
+   * TOTAL admitted roster count). Isolating validation here keeps the
+   * attacker-controlled `node_id`/`node_mode` out of every condition that
+   * dominates the mint: the handler branches only on the tagged `ok` flag, so
+   * no request-body value can influence whether the mint runs. It can only
+   * ever reject its own malformed request; it can never bypass a gate.
+   */
+  private parseFleetEnrollTokenBody(body: string): FleetEnrollTokenBodyParse {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(body) as Record<string, unknown>;
+    } catch {
+      return {
+        ok: false,
+        status: 400,
+        payload: { error: "Invalid JSON body" },
+      };
+    }
+    const rawNodeId = parsed.node_id;
+    if (typeof rawNodeId !== "string" || rawNodeId.trim().length === 0) {
+      return {
+        ok: false,
+        status: 400,
+        payload: {
+          error: "validation_error",
+          message: "node_id is required and must be a non-empty string",
+        },
+      };
+    }
+    const rawNodeMode = parsed.node_mode;
+    if (
+      rawNodeMode !== "local" &&
+      rawNodeMode !== "operator_cloud" &&
+      rawNodeMode !== "sovereign_tee"
+    ) {
+      return {
+        ok: false,
+        status: 400,
+        payload: {
+          error: "validation_error",
+          message:
+            "node_mode must be one of local, operator_cloud, sovereign_tee",
+        },
+      };
+    }
+    return { ok: true, nodeId: rawNodeId, nodeMode: rawNodeMode };
+  }
+
+  /**
+   * Fleet control plane, Add-Machine slice: `POST /api/fleet/enroll-token`.
+   * The dashboard-side "Add a machine" button. Body: `{ node_id: string,
+   * node_mode: "local" | "operator_cloud" | "sovereign_tee" }`.
+   *
+   * This is a THIN in-process wrapper over the SAME ceremony primitive
+   * `runFederationAuthorize` drives over HTTP (`JoinCeremony.authorizeInit`,
+   * the daemon-side entry the `/v1/federation/authorize/init` route
+   * dispatches to). It mints the SAME bootstrap-token artifact the CLI verb
+   * prints to stdout (a public signed authorization to submit a JoinRequest),
+   * NOT membership and NOT a secret (AGENTS.md #6: no private key, no master,
+   * no passphrase in the response).
+   *
+   * CAPACITY PRE-CHECK (the product point of this slice): before minting,
+   * resolves the SAME capacity view as `GET /api/fleet/capacity`. If
+   * `at_capacity` and the cap is finite, returns 409 `at_capacity`. This is
+   * advisory MANAGEMENT-CAPACITY UX, not enforcement (the real node-count
+   * enforcement is the already-shipped `applyFleetCap` on the central
+   * roster). It never touches the wall/enforcement/policy-push path, and a
+   * bug here can only ever over-block enrollment, never over-admit a node.
+   *
+   * AUTH: gated by the operator bearer token by the caller (matches
+   * `/api/fleet/activate` and `/api/fleet/revocation-list`).
+   *
+   * Response shape:
+   *   - 200 `{ ok: true, bootstrap_token }` on a successful mint.
+   *   - 400 `{ error: "validation_error" }` on a missing/malformed `node_id`
+   *     or `node_mode`, or `{ error: "Invalid JSON body" }` on unparseable
+   *     JSON.
+   *   - 409 `{ error: "at_capacity", active_nodes, max_nodes, message }` when
+   *     the fleet is at its finite paid node cap (fail-closed courtesy; see
+   *     above).
+   *   - 503 `{ error: "capacity_unavailable", message }` when the durable
+   *     roster's active-node count could not be reliably derived (e.g. a
+   *     roster-derivation throw). This is the fail-closed branch for the
+   *     MINT gate specifically: an unreliable count must never be read as
+   *     "0 active, plenty of room" (that would be fail-open on a paid
+   *     enrollment gate). `GET /api/fleet/capacity` is unaffected and may
+   *     still display `active_nodes: 0` on the same underlying condition;
+   *     that surface is read-only and never mints.
+   *   - 409 `{ error: "federation_not_provisioned" }` when federation is not
+   *     enabled/provisioned on this fortress, or this fortress cannot mint
+   *     (a non-issuer context, e.g. an operator_cloud or joiner node): never
+   *     a fabricated token, never a silent success (AGENTS.md #5).
+   *   - 500 `{ error: "internal_error" }` on an unexpected throw (no key
+   *     material leaked; no stack).
+   */
+  private handleFleetEnrollToken(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): void {
+    let body = "";
+    let destroyed = false;
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString();
+      // 4KB is ample for { node_id, node_mode }.
+      if (body.length > 4096) {
+        destroyed = true;
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large" }));
+        req.destroy();
+      }
+    });
+    req.on("end", async () => {
+      if (destroyed) return;
+      // Parse + fully validate the request body up front into a closed,
+      // server-typed result. The handler then branches ONLY on the tagged
+      // `ok` flag, so no attacker-controlled body value (node_id / node_mode)
+      // syntactically controls any condition that dominates the mint below.
+      // This is input validation, not a security gate; the real gates
+      // (capacity, federation authority, ceremony) run afterward on
+      // server-derived state alone. See parseFleetEnrollTokenBody.
+      const parseResult = this.parseFleetEnrollTokenBody(body);
+      if (!parseResult.ok) {
+        res.writeHead(parseResult.status, {
+          "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify(parseResult.payload));
+        return;
+      }
+      const { nodeId, nodeMode } = parseResult;
+
+      try {
+        // Capacity pre-check FIRST: an operator at cap should never even
+        // reach the ceremony. Advisory UX only (see doc comment above); the
+        // real enforcement is applyFleetCap on the central roster, untouched.
+        //
+        // Fail-closed exception (MEDIUM finding fix): this MINT path, unlike
+        // the read-only GET /api/fleet/capacity panel, must NOT proceed as if
+        // the roster were genuinely empty when the roster count could not be
+        // reliably derived (buildFleetRoster threw). Reading an unreliable
+        // "0 active" as real headroom would mint a token even when the true
+        // roster is at or over cap, fail-OPEN on a paid enrollment gate. So
+        // when the count is unreliable, refuse to mint rather than guess.
+        const { view: capacity, rosterCountReliable } =
+          await this.computeFleetCapacityWithReliability();
+        if (!rosterCountReliable) {
+          res.writeHead(503, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(
+            JSON.stringify({
+              error: "capacity_unavailable",
+              message:
+                "Cannot determine current fleet node count; refusing to mint an enrollment token. Try again shortly.",
+            }),
+          );
+          void this.buildV1FederationDeps().audit({
+            operation: "fleet_enroll_token_mint",
+            result: "failure",
+            identityId: nodeId,
+            details: { reason: "capacity_unavailable" },
+          });
+          return;
+        }
+        if (capacity.at_capacity && capacity.max_nodes !== null) {
+          res.writeHead(409, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(
+            JSON.stringify({
+              error: "at_capacity",
+              active_nodes: capacity.active_nodes,
+              max_nodes: capacity.max_nodes,
+              message:
+                `This fleet is at its paid node cap (${capacity.max_nodes}). ` +
+                "Upgrade your plan or remove a node from the console to " +
+                "enroll another. Every existing node keeps its Castle Wall protection.",
+            }),
+          );
+          void this.buildV1FederationDeps().audit({
+            operation: "fleet_enroll_token_mint",
+            result: "failure",
+            identityId: nodeId,
+            details: { reason: "at_capacity" },
+          });
+          return;
+        }
+
+        const ctx = this._federationContext;
+        if (
+          !this._federationEnabled ||
+          ctx === null ||
+          !federationContextHasIssuerAuthority(ctx)
+        ) {
+          // Federation disabled/unprovisioned, or this fortress cannot mint
+          // (e.g. a non-issuer joiner/operator_cloud context): fail closed,
+          // never a fabricated token.
+          res.writeHead(409, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ error: "federation_not_provisioned" }));
+          void this.buildV1FederationDeps().audit({
+            operation: "fleet_enroll_token_mint",
+            result: "failure",
+            identityId: nodeId,
+            details: { reason: "federation_not_provisioned" },
+          });
+          return;
+        }
+
+        let bootstrapToken: BootstrapToken;
+        try {
+          bootstrapToken = new JoinCeremony(ctx).authorizeInit({
+            intendedNodeId: nodeId,
+            intendedNodeMode: nodeMode,
+          });
+        } catch {
+          res.writeHead(409, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ error: "federation_not_provisioned" }));
+          void this.buildV1FederationDeps().audit({
+            operation: "fleet_enroll_token_mint",
+            result: "failure",
+            identityId: nodeId,
+            details: { reason: "mint_unavailable" },
+          });
+          return;
+        }
+
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(JSON.stringify({ ok: true, bootstrap_token: bootstrapToken }));
+        void this.buildV1FederationDeps().audit({
+          operation: "fleet_enroll_token_mint",
+          result: "success",
+          identityId: nodeId,
+          details: { node_mode: nodeMode, nonce: bootstrapToken.nonce },
+        });
+      } catch {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "internal_error" }));
+      }
+    });
   }
 
   private serveLoginPage(res: ServerResponse): void {
