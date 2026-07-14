@@ -374,14 +374,19 @@ async function verifyAgentReadThisOperation(params: {
   if (agentUid === null || sourceOwnerUid === null) return { readVerified: false };
   if (agentUid === sourceOwnerUid) return { readVerified: false };
 
-  let aclResult: FileGrantAclResult;
-  try {
-    aclResult = await fsOps.grantAgentRead(treeEntry, agentUid, pinnedSource);
-  } catch {
-    return { readVerified: false };
-  }
-  if (aclResult.status !== "applied") {
-    return { readVerified: false, aclResult };
+  // Round 4: the ACL apply AND the same-operation probe run inside ONE
+  // fortress-ACE-lock hold (`grantAndProbeAgentRead`), so a concurrent
+  // revoke's drain-check-and-removal cannot strip the shared fortress ACE in
+  // the gap between this mint's apply and its probe. The combined op never
+  // throws (lock contention or internal failure -> readVerified:false,
+  // reported as `unverified`, never `met`).
+  const { aclResult, readVerified } = await fsOps.grantAndProbeAgentRead(
+    treeEntry,
+    agentUid,
+    pinnedSource
+  );
+  if (!aclResult || aclResult.status !== "applied") {
+    return aclResult ? { readVerified: false, aclResult } : { readVerified: false };
   }
   const grantedReadAce =
     aclResult.grantedReadAce ??
@@ -393,15 +398,7 @@ async function verifyAgentReadThisOperation(params: {
       source_ino: pinnedSource.source_ino,
     } satisfies FileGrantGrantedReadAce);
 
-  try {
-    return {
-      readVerified: (await fsOps.probeAgentRead(treeEntry, agentUid, pinnedSource)) === true,
-      aclResult,
-      grantedReadAce,
-    };
-  } catch {
-    return { readVerified: false, aclResult, grantedReadAce };
-  }
+  return { readVerified, aclResult, grantedReadAce };
 }
 
 /**

@@ -174,6 +174,24 @@ export interface FsOps {
     pinnedSource: FileGrantSourceIdentity
   ): Promise<boolean>;
   /**
+   * Apply the ACL AND run the same-operation read probe as ONE atomic
+   * fortress-ACE-lock hold (round 4). This is the method the mint's
+   * enforcement verdict MUST use: a concurrent revoke's drain-check-and-removal
+   * cannot interleave between the apply and the probe, so a mint can never
+   * probe a false `met` against a fortress ACE a concurrent revoke stripped in
+   * that gap. The probe runs ONLY when the apply returns `status: "applied"`.
+   * Never throws: lock contention or an internal failure yields
+   * `readVerified: false` (the mint reports `unverified`, never `met`); a
+   * present-but-not-`applied` result is returned so the caller keeps its
+   * existing acl-result-detail behavior. `aclResult` is absent only when the
+   * apply itself threw before producing any result.
+   */
+  grantAndProbeAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number,
+    pinnedSource: FileGrantPinnedSource
+  ): Promise<{ aclResult?: FileGrantAclResult; readVerified: boolean }>;
+  /**
    * Remove a tree-entry path. Idempotent when the entry is absent, unless an
    * ACL target is supplied and ACL cleanup itself fails.
    */

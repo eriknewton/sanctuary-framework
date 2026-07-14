@@ -21,6 +21,16 @@
  * keeps the tree converged; it is also exported standalone for a future
  * `file-grant sweep` / cron. It never PLACES entries (v1 only places at mint),
  * so it can only ever REDUCE access -- safe to run on any touch.
+ *
+ * THROW CONTRACT (round 4, opus LOW-2): a per-entry `removeEntry` may throw
+ * `FileGrantFortressAceReapplyError` in the rare concurrent-place-then-reapply-
+ * fails path. Per-entry scrub errors are already caught and deferred here
+ * (`firstScrubError`), so one entry's throw never skips another's scrub or the
+ * status bookkeeping; the first such error is surfaced only AFTER every
+ * best-effort removal. Each scrubbed entry's access is removed BEFORE any
+ * throw, so a surfaced throw is fail-closed. Being idempotent and safe-
+ * direction, a subsequent `reconcileFileGrantTree` run re-converges the shared
+ * fortress ACE.
  */
 
 import type { AuditLog } from "../operational/audit-log.js";

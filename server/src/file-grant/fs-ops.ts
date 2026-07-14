@@ -59,20 +59,27 @@
  * never list or read), applied and removed the same way as every other ACE
  * here (`chmod +a`/`-a` on macOS, `setfacl -m`/`-x` on Linux).
  *
- * CONCURRENCY (fail-closed, F1 fix-round): the fortress-ACE application (mint)
- * and the drain-check-and-removal (revoke/reconcile) are serialized across
- * processes by a cross-process O_EXCL lock on the grant-tree root
- * (`withFortressAceLock`, reusing `storage/cross-process-lock`'s `withPathLock`).
- * Without it, a concurrent mint could probe a false `met` in the window
- * between a revoke's stale drain-check and its ACE removal. With it, a mint's
- * apply-then-probe can never interleave with a revoke's removal: the revoke
- * either sees the mint's placed entry (and does not remove) or runs first (and
- * the mint's own idempotent apply re-adds the ACE before it probes). A place()
- * that slips into the locked removal is caught by a post-removal re-check and
- * re-applied; a FAILED re-apply THROWS (`FileGrantFortressAceReapplyError`),
- * never a silent unreachable-active-grant. Sustained lock contention fails
- * SAFE on the removal side (leave the ACE) and fails CLOSED on the apply side
- * (report `unverified`, never a false `met`).
+ * CONCURRENCY (fail-closed, round 4): a cross-process O_EXCL lock on the
+ * grant-tree root (`withFortressAceLock`, reusing `storage/cross-process-lock`'s
+ * `withPathLock`) serializes two critical sections against each other:
+ *   (a) the MINT's ACL apply AND its same-operation read probe, held together
+ *       as ONE lock hold by `grantAndProbeAgentRead` -- NOT the apply alone;
+ *       the probe is inside the critical section, so a revoke cannot run
+ *       between a mint's apply and its probe; and
+ *   (b) the REVOKE/reconcile drain-check-and-removal
+ *       (`removeFortressTraverseAceIfTreeDrained`).
+ * Because the probe is inside the mint's hold, a concurrent revoke can never
+ * strip the shared fortress ACE in the apply->probe gap, so a mint can never
+ * probe a false `met`. (Correctness no longer relies on the subtler
+ * "place() happens-before probe, and the revoke's drain-check observes the
+ * placed entry" invariant -- that still holds, but the lock makes it not
+ * load-bearing.) A place() that slips into the locked REMOVAL is caught by a
+ * post-removal re-check and re-applied; a FAILED re-apply THROWS
+ * (`FileGrantFortressAceReapplyError`) rather than leaving a silent
+ * unreachable-active-grant. Sustained lock contention fails SAFE on the
+ * removal side (leave the ACE) and fails CLOSED on the mint side (report
+ * `unverified`, never a false `met`; the bounded-wait timeout means a mint
+ * never blocks indefinitely -- the operator retries).
  *
  * DEBT (uid-basis re-resolution): cleanup currently re-resolves the agent
  * uid from the live agent-origin descriptor at removal time. The durable fix
@@ -104,6 +111,7 @@ import {
   readFile,
   realpath as fsRealpath,
   rm,
+  stat,
   symlink,
 } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
@@ -670,6 +678,48 @@ export class PosixFileGrantFsOps implements FsOps {
     }
   }
 
+  /**
+   * Apply the ACL and run the same-operation probe under ONE fortress-ACE-lock
+   * hold (round 4). The lock spans BOTH steps, so a concurrent revoke's
+   * drain-check-and-removal cannot run in the gap between this mint's apply and
+   * its probe -- closing the "apply outside-lock probe" false-`met` window.
+   * The probe is invoked through the overridable `this.probeAgentRead` (it
+   * takes no lock of its own, so calling it inside the held lock is safe and
+   * not reentrant). Fail-closed: lock CONTENTION (or any throw) yields
+   * `readVerified: false` with no `aclResult`, so the mint reports `unverified`
+   * and the operator retries -- never a false `met`, never an indefinite block
+   * (the lock's bounded-wait timeout governs).
+   */
+  async grantAndProbeAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number,
+    pinnedSource: FileGrantPinnedSource
+  ): Promise<{ aclResult?: FileGrantAclResult; readVerified: boolean }> {
+    try {
+      return await this.withFortressAceLock(async () => {
+        const aclResult = await this.applyAgentReadAclLocked(
+          relativeTreeEntry,
+          agentUid,
+          pinnedSource
+        );
+        if (aclResult.status !== "applied") {
+          return { aclResult, readVerified: false };
+        }
+        const readVerified = await this.probeAgentRead(
+          relativeTreeEntry,
+          agentUid,
+          pinnedSource
+        );
+        return { aclResult, readVerified };
+      });
+    } catch {
+      // Lock contention (bounded-wait timeout) or an unexpected internal
+      // failure: fail CLOSED. No aclResult -> no ACE persisted, enforcement
+      // reports `unverified`, never a false `met`.
+      return { readVerified: false };
+    }
+  }
+
   async removeEntry(
     relativeTreeEntry: string,
     options: FileGrantRemoveEntryOptions = {}
@@ -814,20 +864,36 @@ export class PosixFileGrantFsOps implements FsOps {
 
   /**
    * Serialize a fortress-ACE-mutating critical section across processes on
-   * the grant-tree root's lockfile. Degrades to running `operation` directly
-   * when the lock directory cannot be created (unit rigs / unreal fortress
-   * paths have no cross-process surface). Reuses the shared `withPathLock`
+   * the grant-tree root's lockfile. Reuses the shared `withPathLock`
    * primitive; never invents its own lock discipline. NOT reentrant: callers
    * inside a held lock use the `*Locked` / `*ForUid` non-locking helpers.
+   *
+   * Degrade is NARROW (opus LOW-1): it runs `operation` UNLOCKED only when the
+   * fortress path genuinely does not exist -- the unit-rig / unreal-path case
+   * (e.g. a synthetic `"/fortress"`), which has no cross-process surface. On a
+   * REAL, existing fortress a `mkdir` failure is an unexpected error and fails
+   * CLOSED (rethrow) rather than silently running the critical section
+   * unlocked (a fail-OPEN of the serialization). A real deployment always has
+   * the fortress present by the time a grant is applied or removed.
    */
   private async withFortressAceLock<T>(operation: () => Promise<T>): Promise<T> {
     const lockDir = this.treeRoot();
     try {
       await mkdir(lockDir, { recursive: true, mode: TREE_ROOT_MODE });
-    } catch {
+    } catch (err) {
+      if (await this.fortressPathExists()) throw err;
       return operation();
     }
     return withPathLock(lockDir, FORTRESS_ACE_LOCK_FILE, operation);
+  }
+
+  private async fortressPathExists(): Promise<boolean> {
+    try {
+      await stat(this.fortressPath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**

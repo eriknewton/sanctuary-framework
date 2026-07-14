@@ -6,7 +6,7 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -945,6 +945,16 @@ describe("file-grant ACL command argv construction", () => {
       { file: "setfacl", args: ["-x", "u:502", fortress] },
       { file: "setfacl", args: ["-m", "u:502:--x", fortress] },
     ]);
+
+    // opus LOW-2: access for THIS grant was removed BEFORE the throw. The
+    // grant-tree entry is gone, and the source-inode ACE removal ran before
+    // any fortress-dir command.
+    await expect(stat(join(fortress, "grants", "agent-1", "fg_a"))).rejects.toThrow();
+    const firstFortressIdx = seen.findIndex((c) => c.args.includes(fortress));
+    const sourceAceRemoved = seen
+      .slice(0, firstFortressIdx)
+      .some((c) => c.args[0] === "-x" && c.args[2]?.includes("/fd/"));
+    expect(sourceAceRemoved).toBe(true);
   });
 
   it("serializes concurrent fortress-ACE removals across two FsOps over the same fortress (cross-process lock engaged)", async () => {
@@ -984,6 +994,79 @@ describe("file-grant ACL command argv construction", () => {
     await first;
     await second;
     expect(secondEnteredWhileFirstInside).toBe(false);
+  });
+
+  it("holds the fortress-ACE lock THROUGH the mint probe (a concurrent acquire times out during the probe; round-4 bug-inject)", async () => {
+    if (process.getuid === undefined) return; // POSIX-only
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-probe-lock-"));
+    const sourceDir = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-probe-src-"));
+    const source = join(sourceDir, "s.txt");
+    await writeFile(source, "secret");
+
+    const originDir = join(fortress, "policy", "egress");
+    await mkdir(originDir, { recursive: true });
+    // The agent uid MUST differ from the source-file owner (this process) so
+    // the probe actually runs.
+    const agentUid = process.getuid() + 4242;
+    await writeFile(
+      join(originDir, "agent-origin.json"),
+      JSON.stringify({ mode: "uid", agent_uid: agentUid, system_uid_allow_ceiling: 500 })
+    );
+
+    let releaseProbe: () => void = () => {};
+    const probeGate = new Promise<void>((r) => (releaseProbe = r));
+    let markProbeEntered: () => void = () => {};
+    const probeEntered = new Promise<void>((r) => (markProbeEntered = r));
+
+    const { grantStore } = makeFileGrantTestStore();
+    const fsOps = new PosixFileGrantFsOps(fortress, {
+      platform: "linux",
+      execRunner: {
+        execFile: async (command) => {
+          if (command.file === "sudo") {
+            // Inside the read probe: signal, then BLOCK. In round 4 the mint
+            // still holds the fortress-ACE lock here (apply+probe are one hold).
+            markProbeEntered();
+            await probeGate;
+          }
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+
+    const mintPromise = mintFileGrant(
+      {
+        subjectAgentId: "agent-1",
+        scope: { kind: "file", path: source },
+        mode: "read",
+        ttlSeconds: 3600,
+        createdBy: "operator-1",
+      },
+      { fsOps, store: grantStore, now: new Date("2026-07-14T00:00:00.000Z") }
+    );
+
+    await probeEntered; // the mint is now blocked inside its read probe
+
+    // Round-4 guarantee: the fortress-ACE lock is held THROUGH the probe, so a
+    // concurrent acquire on the same grants-root lockfile must TIME OUT.
+    // Bug-inject: pre-round-4 the probe ran OUTSIDE the lock, so this acquire
+    // would SUCCEED (acquired === true) and the test would fail.
+    let acquired = false;
+    await withPathLock(
+      join(fortress, "grants"),
+      ".fortress-ace.lock",
+      async () => {
+        acquired = true;
+      },
+      { timeoutMs: 300, retryMs: 20 }
+    ).catch(() => {
+      /* expected: CrossProcessLockError (held through the probe) */
+    });
+    expect(acquired).toBe(false);
+
+    releaseProbe();
+    const { enforcement } = await mintPromise;
+    expect(enforcement).toBe("met");
   });
 
   it("macOS: keeps the fortress-dir traverse ACE while the agent has another active grant, and removes it once drained (F1 fix)", async () => {

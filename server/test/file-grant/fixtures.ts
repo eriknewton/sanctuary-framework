@@ -217,6 +217,40 @@ export class FakeFsOps implements FsOps {
     return (this.opts.probeAgentReadResult ?? false) && sameSourceIdentity(readIdentity, pinnedSource);
   }
 
+  /**
+   * Fake combined apply-and-probe (round 4). Delegates to the same
+   * `grantAgentRead` + `probeAgentRead` fakes so the recorded events,
+   * `grantedReads`, and `probedReads` are identical to the pre-round-4
+   * two-call path -- there is no real lock to model in-process, so the
+   * observable behavior is exactly grant-then-(probe-only-if-applied). The
+   * grant-throws / probe-throws options are preserved: a grant throw yields
+   * no `aclResult` (matching the old grant-throw early return); a probe throw
+   * yields `readVerified:false` while keeping `aclResult` (matching the old
+   * probe-throw path, which still built a grantedReadAce).
+   */
+  async grantAndProbeAgentRead(
+    relativeTreeEntry: string,
+    agentUid: number,
+    pinnedSource: FileGrantPinnedSource
+  ): Promise<{ aclResult?: FileGrantAclResult; readVerified: boolean }> {
+    let aclResult: FileGrantAclResult;
+    try {
+      aclResult = await this.grantAgentRead(relativeTreeEntry, agentUid, pinnedSource);
+    } catch {
+      return { readVerified: false };
+    }
+    if (aclResult.status !== "applied") {
+      return { aclResult, readVerified: false };
+    }
+    try {
+      const readVerified =
+        (await this.probeAgentRead(relativeTreeEntry, agentUid, pinnedSource)) === true;
+      return { aclResult, readVerified };
+    } catch {
+      return { aclResult, readVerified: false };
+    }
+  }
+
   async removeEntry(
     relativeTreeEntry: string,
     options?: FileGrantRemoveEntryOptions
