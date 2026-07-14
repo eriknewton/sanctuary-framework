@@ -348,17 +348,29 @@ export async function runEvidencePack(args: string[]): Promise<void> {
       const retentionConfig = auditLog.getRetentionConfig();
       // Read the on-disk usage + ever-pruned so the shortfall detector can tell
       // size-cap pruning from genuine inactivity (sweep HIGH-5). Best-effort.
-      let usage: { totalSizeBytes: number; everPruned: boolean | null };
+      let usage: {
+        entryCount: number | null;
+        totalSizeBytes: number;
+        everPruned: boolean | null;
+      };
       try {
         usage = await auditLog.getRetentionUsage();
       } catch {
-        usage = { totalSizeBytes: 0, everPruned: null };
+        usage = { entryCount: null, totalSizeBytes: 0, everPruned: null };
       }
       const earliest: string | null =
         entries.length > 0 ? (entries[0] as AuditEntry).timestamp : null;
       const retention: RetentionFacts = {
         max_entries: retentionConfig.maxEntries,
-        retained_total: total,
+        // WATCH-2 (confirmatory review 2026-07-14): source the retained count
+        // from the authoritative on-disk census, NOT from `query()`'s total.
+        // `query()` reports the in-memory window (`maxInMemoryEntries`), which
+        // today equals the on-disk cap but is an anticipated tuning knob; if it
+        // were ever set smaller, the windowed total would understate the
+        // retained log and the shortfall detector's at-cap check would read
+        // false while entries had in fact been pruned. Fall back to the
+        // windowed total only if the on-disk census itself was unreadable.
+        retained_total: usage.entryCount ?? total,
         max_total_size_bytes: retentionConfig.maxTotalSizeBytes,
         retained_total_size_bytes: usage.totalSizeBytes,
         ever_pruned: usage.everPruned,
