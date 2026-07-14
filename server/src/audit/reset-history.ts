@@ -272,8 +272,11 @@ export async function consumeResetHistoryMarker(
   await options.auditLog.flush();
   // Write `.consumed` sentinel BEFORE deleting the marker. If the process
   // crashes between these two operations, the next boot sees `.consumed`
-  // and skips re-emission (idempotent).
-  await writeFile(consumedPath, "", "utf-8");
+  // and skips re-emission (idempotent). Owner-only (0600) from the first
+  // byte: this is a direct fortress-root child, and every root-child writer
+  // creates owner-only so a live file-grant traverse ACE never exposes it by
+  // name (see the FORTRESS-DIR TRAVERSAL note in file-grant/fs-ops.ts).
+  await writeFile(consumedPath, "", { mode: 0o600 });
   await rm(markerPath, { force: true });
   await rm(consumedPath, { force: true });
   return { emitted: markers.length, markerHash, markerPath };

@@ -33,6 +33,7 @@ import type {
   FileGrantPinnedSource,
   FileGrantSourceIdentity,
 } from "../../src/file-grant/types.js";
+import { withPathLock } from "../../src/storage/cross-process-lock.js";
 import { makeFileGrantTestStore } from "./fixtures.js";
 
 function pinnedSource(overrides: Partial<FileGrantPinnedSource> = {}): FileGrantPinnedSource {
@@ -888,6 +889,101 @@ describe("file-grant ACL command argv construction", () => {
       { file: "setfacl", args: ["-x", "u:502", fortress] },
       { file: "setfacl", args: ["-m", "u:502:--x", fortress] },
     ]);
+  });
+
+  it("Linux: a FAILED re-apply after a concurrent placement THROWS loudly, never a silent unreachable grant (fail-closed; bug-inject vs the swallow)", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-fortress-race-fail-"));
+    const sourceDir = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-source-race-fail-"));
+    const source = join(sourceDir, "a.txt");
+    await writeFile(source, "a");
+
+    const originDir = join(fortress, "policy", "egress");
+    await mkdir(originDir, { recursive: true });
+    await writeFile(
+      join(originDir, "agent-origin.json"),
+      JSON.stringify({ mode: "uid", agent_uid: 502, system_uid_allow_ceiling: 500 })
+    );
+
+    // The `-x` removal triggers a concurrent placement (as a mint's place()
+    // would), AND the subsequent `-m` re-apply FAILS. The old code swallowed
+    // that failure, leaving the shared ACE removed while an active grant needs
+    // it (a silent unreachable-active-grant). The fix makes it a hard throw.
+    const seen: FileGrantExecCommand[] = [];
+    let armed = false;
+    const fsOps = new PosixFileGrantFsOps(fortress, {
+      platform: "linux",
+      execRunner: {
+        execFile: async (command) => {
+          seen.push(command);
+          if (armed && command.args[0] === "-x" && command.args[2] === fortress) {
+            await mkdir(join(fortress, "grants", "agent-9"), { recursive: true });
+            await writeFile(join(fortress, "grants", "agent-9", "fg_new"), "placed");
+          }
+          if (armed && command.args[0] === "-m" && command.args[2] === fortress) {
+            throw new Error("setfacl re-apply failed: EPERM");
+          }
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+
+    const pinned = await fsOps.pinSource(source);
+    await fsOps.place(source, "agent-1/fg_a");
+    const result = await fsOps.grantAgentRead("agent-1/fg_a", 502, pinned);
+    await pinned.close();
+    expect(result.status).toBe("applied");
+    seen.length = 0;
+    armed = true;
+
+    // Fail-closed: the removal path THROWS rather than swallowing the failed
+    // re-apply. (Against the pre-fix swallow this resolves without throwing.)
+    await expect(
+      fsOps.removeEntry("agent-1/fg_a", { grantedReadAce: result.grantedReadAce })
+    ).rejects.toThrow(/re-apply the fortress traverse ACE/);
+
+    expect(seen.filter((c) => c.args.includes(fortress))).toEqual([
+      { file: "setfacl", args: ["-x", "u:502", fortress] },
+      { file: "setfacl", args: ["-m", "u:502:--x", fortress] },
+    ]);
+  });
+
+  it("serializes concurrent fortress-ACE removals across two FsOps over the same fortress (cross-process lock engaged)", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-lock-"));
+    await mkdir(join(fortress, "grants"), { recursive: true, mode: 0o711 });
+
+    // A first holder that parks inside the locked critical section long enough
+    // for a second acquire to be forced to wait, proving mutual exclusion.
+    let firstInside = false;
+    let secondEnteredWhileFirstInside = false;
+    let releaseFirst: () => void = () => {};
+    const firstDone = new Promise<void>((r) => (releaseFirst = r));
+
+    const lockDir = join(fortress, "grants");
+    const first = withPathLock(lockDir, ".fortress-ace.lock", async () => {
+      firstInside = true;
+      await firstDone;
+      firstInside = false;
+    });
+    // Give `first` a tick to acquire.
+    await new Promise((r) => setTimeout(r, 20));
+
+    const second = withPathLock(
+      lockDir,
+      ".fortress-ace.lock",
+      async () => {
+        // If the lock is real, we only get here after `first` released.
+        secondEnteredWhileFirstInside = firstInside;
+      },
+      { retryMs: 5, timeoutMs: 2000 }
+    );
+
+    // Second must still be blocked while first holds the lock.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(firstInside).toBe(true);
+    releaseFirst();
+    await first;
+    await second;
+    expect(secondEnteredWhileFirstInside).toBe(false);
   });
 
   it("macOS: keeps the fortress-dir traverse ACE while the agent has another active grant, and removes it once drained (F1 fix)", async () => {

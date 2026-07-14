@@ -53,11 +53,26 @@
  * tree is drained (no tree entry left under ANY per-agent subdirectory) --
  * see `removeFortressTraverseAceIfTreeDrained`. Draining one logical agent's
  * subtree while another still holds an active grant for the same uid MUST
- * NOT strip the shared ACE. A failed ACL apply also best-effort removes the
- * ACE it just added (never left orphaned by a partial apply). It is still
- * execute-only (traverse, never list or read), applied and removed the same
- * way as every other ACE here (`chmod +a`/`-a` on macOS, `setfacl -m`/`-x`
- * on Linux).
+ * NOT strip the shared ACE. A failed ACL apply also drain-gated-removes the
+ * ACE it just added (never left orphaned by a partial apply, never stripped
+ * while another live grant needs it). It is still execute-only (traverse,
+ * never list or read), applied and removed the same way as every other ACE
+ * here (`chmod +a`/`-a` on macOS, `setfacl -m`/`-x` on Linux).
+ *
+ * CONCURRENCY (fail-closed, F1 fix-round): the fortress-ACE application (mint)
+ * and the drain-check-and-removal (revoke/reconcile) are serialized across
+ * processes by a cross-process O_EXCL lock on the grant-tree root
+ * (`withFortressAceLock`, reusing `storage/cross-process-lock`'s `withPathLock`).
+ * Without it, a concurrent mint could probe a false `met` in the window
+ * between a revoke's stale drain-check and its ACE removal. With it, a mint's
+ * apply-then-probe can never interleave with a revoke's removal: the revoke
+ * either sees the mint's placed entry (and does not remove) or runs first (and
+ * the mint's own idempotent apply re-adds the ACE before it probes). A place()
+ * that slips into the locked removal is caught by a post-removal re-check and
+ * re-applied; a FAILED re-apply THROWS (`FileGrantFortressAceReapplyError`),
+ * never a silent unreachable-active-grant. Sustained lock contention fails
+ * SAFE on the removal side (leave the ACE) and fails CLOSED on the apply side
+ * (report `unverified`, never a false `met`).
  *
  * DEBT (uid-basis re-resolution): cleanup currently re-resolves the agent
  * uid from the live agent-origin descriptor at removal time. The durable fix
@@ -93,6 +108,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { validateAgentOrigin } from "../castle-wall/allowlist/agent-origin.js";
+import { withPathLock } from "../storage/cross-process-lock.js";
 import type {
   FileGrantAclRemovalResult,
   FileGrantAclResult,
@@ -110,6 +126,16 @@ const GRANT_TREE_DIR_NAME = "grants";
 const TREE_ROOT_MODE = 0o711;
 /** Per-agent leaf: readable/traversable ONLY by its owner. */
 const AGENT_SUBDIR_MODE = 0o700;
+/**
+ * Cross-process lock file (under the grant-tree root) that serializes the
+ * uid-level fortress-dir ACE lifecycle: a mint's fortress-ACE APPLICATION and
+ * a revoke/reconcile's drain-check-and-REMOVAL for the same fortress must be
+ * mutually exclusive across processes, so a concurrent mint can never observe
+ * a false `met` while a concurrent revoke strips the shared uid's traverse ACE
+ * (the F1 fix-round race). Lives beside the grant subtrees; `isGrantTreeDrained`
+ * skips it (it is not a per-agent grant directory).
+ */
+const FORTRESS_ACE_LOCK_FILE = ".fortress-ace.lock";
 export const FILE_GRANT_ACL_COMMAND_TIMEOUT_MS = 2_000;
 const EXEC_MAX_BUFFER_BYTES = 64 * 1024;
 const FILE_GRANT_PIN_SOURCE_OPEN_FLAGS =
@@ -492,6 +518,27 @@ async function closeBestEffort(handle: { close(): Promise<void> }): Promise<void
 }
 
 /**
+ * Thrown (LOUD, fail-closed) when the fortress-dir traverse ACE could not be
+ * re-applied after a concurrent placement was detected mid-removal. A missing
+ * shared ACE while an active grant exists is a hard error the caller must
+ * see, never a silently-unreachable active grant (F1 fix-round).
+ */
+export class FileGrantFortressAceReapplyError extends Error {
+  constructor(
+    public readonly agentUid: number,
+    public readonly cause: unknown
+  ) {
+    super(
+      `Governed File-Grant: failed to re-apply the fortress traverse ACE for ` +
+        `uid ${agentUid} after a concurrent grant placement; an active grant may ` +
+        `be unreachable until the next mint. ` +
+        `Cause: ${cause instanceof Error ? cause.message : String(cause)}`
+    );
+    this.name = "FileGrantFortressAceReapplyError";
+  }
+}
+
+/**
  * Real POSIX-backed `FsOps`. `fortressPath` is the operator's fortress
  * storage path (`config.storage_path`); the grant tree lives at
  * `<fortressPath>/grants/`, a plain (non-encrypted) directory alongside the
@@ -679,27 +726,57 @@ export class PosixFileGrantFsOps implements FsOps {
    * DEBT note for the durable multi-uid fix (persist the uid basis on the
    * grant record).
    *
-   * Revoke-vs-concurrent-mint race close: after a confirmed removal the tree
-   * is re-checked; if a concurrent mint placed a new entry between the drain
-   * check and the ACE removal, the ACE is immediately re-applied (mint also
-   * re-applies it idempotently during its own ACL step, so the residual
-   * window is a transient probe failure that reports the honest `unverified`
-   * label, never a false `met` and never a silently unreachable verified
-   * grant).
+   * Revoke-vs-concurrent-mint race close (FIX-ROUND, fail-CLOSED): the
+   * drain-check + removal (+ a defensive re-check/re-apply) run UNDER the
+   * cross-process fortress-ACE lock (`withFortressAceLock`), which the mint's
+   * own fortress-ACE APPLICATION also holds. So a concurrent mint's
+   * apply-then-probe can never interleave with this removal: either the mint
+   * applied+placed first (this drain-check then observes its entry and does
+   * NOT remove), or this removal ran first (the mint's subsequent apply
+   * re-adds the idempotent ACE before it probes -- it cannot probe `met`
+   * against a missing ACE). If a place() nonetheless slipped in during this
+   * locked section (place is not itself locked), the post-removal re-check
+   * catches it and re-applies; and if that re-apply FAILS, this throws LOUDLY
+   * rather than swallowing -- a now-non-drained tree with the shared ACE
+   * removed is a hard error the caller must see, never a silent
+   * unreachable-active-grant. On sustained lock contention the ACE is left in
+   * place untouched (fail-SAFE: an over-permissive traverse-only ACE lingers
+   * until a later touch removes it, versus stripping a possibly-live grant's
+   * reach path).
    *
-   * Best-effort and purely internal: the return value is consumed only by
-   * unit tests via the recorded exec commands; a failure here never affects
-   * `scrubbed` (which tracks only the per-grant source-inode ACE) and never
-   * throws, because the grant this call is scrubbing has already been
-   * correctly revoked/expired regardless of whether this cleanup succeeds.
-   * Returns undefined when there is nothing to do: unsupported platform,
-   * some grant is still live anywhere in the tree, or no agent uid is
-   * currently configured.
+   * Purely internal: the return value is consumed only by unit tests via the
+   * recorded exec commands. Returns undefined when there is nothing to do:
+   * unsupported platform, some grant still live anywhere in the tree, no
+   * agent uid configured, or lock contention.
    */
   private async removeFortressTraverseAceIfTreeDrained(
     relativeTreeEntry: string
   ): Promise<FileGrantAclRemovalResult | undefined> {
     if (this.platform !== "linux" && this.platform !== "darwin") return undefined;
+    try {
+      return await this.withFortressAceLock(() =>
+        this.drainGatedRemoveFortressAceLocked(relativeTreeEntry)
+      );
+    } catch (err) {
+      if (err instanceof FileGrantFortressAceReapplyError) throw err;
+      // Lock could not be acquired (sustained contention / unlockable dir):
+      // fail SAFE and leave the ACE in place for a later touch to remove.
+      return undefined;
+    }
+  }
+
+  /**
+   * Drain-gated fortress-ACE removal for the REVOKE/reconcile path. Caller
+   * MUST already hold the fortress-ACE lock (this method never re-acquires
+   * it, so it is safe to call from inside `withFortressAceLock`). Re-resolves
+   * the agent uid from the live descriptor because a revoke/reconcile call
+   * does not carry it. On a place() that slipped into the locked section, the
+   * post-removal re-check re-applies and THROWS `FileGrantFortressAceReapplyError`
+   * on failure (fail-closed-loud; see the module doc comment).
+   */
+  private async drainGatedRemoveFortressAceLocked(
+    relativeTreeEntry: string
+  ): Promise<FileGrantAclRemovalResult | undefined> {
     if (!(await this.isGrantTreeDrained())) return undefined;
     const agentId = agentIdFromRelativeTreeEntry(relativeTreeEntry);
     let agentUid: number | null;
@@ -711,9 +788,46 @@ export class PosixFileGrantFsOps implements FsOps {
     if (agentUid === null) return undefined;
     const removal = await this.removeFortressTraverseAce(agentUid);
     if (removal.status === "removed" && !(await this.isGrantTreeDrained())) {
-      await this.bestEffortReapplyFortressTraverseAce(agentUid);
+      await this.reapplyFortressTraverseAceOrThrow(agentUid);
     }
     return removal;
+  }
+
+  /**
+   * Drain-gated fortress-ACE cleanup for the failed-APPLY path, keyed on the
+   * uid the apply already resolved (never re-resolving the descriptor). Caller
+   * MUST already hold the fortress-ACE lock. Best-effort and silent: the apply
+   * is already returning a failure result, and the ACE is removed ONLY when
+   * the tree is drained (so a concurrent live grant for the same uid is never
+   * stripped -- unifying finding #1's drain-gating with finding #2's
+   * no-orphan cleanup).
+   */
+  private async drainGatedRemoveFortressAceForUid(agentUid: number): Promise<void> {
+    try {
+      if (await this.isGrantTreeDrained()) {
+        await this.removeFortressTraverseAce(agentUid);
+      }
+    } catch {
+      // Best-effort cleanup on an already-failing apply.
+    }
+  }
+
+  /**
+   * Serialize a fortress-ACE-mutating critical section across processes on
+   * the grant-tree root's lockfile. Degrades to running `operation` directly
+   * when the lock directory cannot be created (unit rigs / unreal fortress
+   * paths have no cross-process surface). Reuses the shared `withPathLock`
+   * primitive; never invents its own lock discipline. NOT reentrant: callers
+   * inside a held lock use the `*Locked` / `*ForUid` non-locking helpers.
+   */
+  private async withFortressAceLock<T>(operation: () => Promise<T>): Promise<T> {
+    const lockDir = this.treeRoot();
+    try {
+      await mkdir(lockDir, { recursive: true, mode: TREE_ROOT_MODE });
+    } catch {
+      return operation();
+    }
+    return withPathLock(lockDir, FORTRESS_ACE_LOCK_FILE, operation);
   }
 
   /**
@@ -768,7 +882,7 @@ export class PosixFileGrantFsOps implements FsOps {
     }
   }
 
-  private async bestEffortReapplyFortressTraverseAce(agentUid: number): Promise<void> {
+  private async reapplyFortressTraverseAceOrThrow(agentUid: number): Promise<void> {
     try {
       if (this.platform === "linux") {
         await this.runCommand(buildLinuxFortressTraverseGrantCommand(this.fortressPath, agentUid));
@@ -776,9 +890,8 @@ export class PosixFileGrantFsOps implements FsOps {
         const principal = await this.resolveMacPrincipal(agentUid);
         await this.runCommand(buildMacFortressTraverseGrantCommand(this.fortressPath, principal));
       }
-    } catch {
-      // Best-effort: the concurrent mint's own ACL step re-applies this same
-      // idempotent ACE; its probe simply reports unverified until it does.
+    } catch (err) {
+      throw new FileGrantFortressAceReapplyError(agentUid, err);
     }
   }
 
@@ -870,7 +983,29 @@ export class PosixFileGrantFsOps implements FsOps {
         reason: `unsupported platform ${this.platform}`,
       };
     }
+    // Serialize the fortress-ACE application against a concurrent revoke's
+    // drain-check-and-removal for the same fortress (F1 fix-round): so a
+    // concurrent mint can never probe a false `met` while a concurrent revoke
+    // strips the shared uid's traverse ACE. On sustained lock CONTENTION the
+    // apply fails CLOSED (no false `met`); the mint reports `unverified`.
+    try {
+      return await this.withFortressAceLock(() =>
+        this.applyAgentReadAclLocked(relativeTreeEntry, agentUid, pinnedSource)
+      );
+    } catch (err) {
+      return {
+        status: classifyAclFailure(err),
+        platform: this.platform,
+        reason: errorText(err),
+      };
+    }
+  }
 
+  private async applyAgentReadAclLocked(
+    relativeTreeEntry: string,
+    agentUid: number,
+    pinnedSource: FileGrantPinnedSource
+  ): Promise<FileGrantAclResult> {
     let sourceLeafCommandAttempted = false;
     let fortressTraverseAceApplied = false;
     let macAclHardlinkPath: string | undefined;
@@ -944,15 +1079,13 @@ export class PosixFileGrantFsOps implements FsOps {
         await this.bestEffortRemoveAgentReadAcl(agentUid, pinnedSource, macAclHardlinkPath);
       }
       if (fortressTraverseAceApplied) {
-        // Best-effort removal of the exact ACE this failed apply added, on
-        // EVERY non-applied exit after it ran. Failing toward LESS access is
-        // the safe direction: if the same uid holds another live verified
-        // grant, its reach path is restored by any subsequent successful
-        // apply (the fortress ACE is idempotent and re-applied on every
-        // grant), whereas leaving the ACE orphaned after a failed apply would
-        // be a standing traverse the operator never got a confirmed grant
-        // for.
-        await this.removeFortressTraverseAce(agentUid);
+        // Clean up the exact ACE this failed apply added, on EVERY non-applied
+        // exit after it ran (including an ancestor failure BEFORE the source
+        // leaf). Drain-gated: removed ONLY when the tree is drained, so a
+        // concurrent live grant for the same uid is never stripped (finding #1)
+        // while a genuine orphan (no remaining entry) is never left behind
+        // (finding #2). We already hold the fortress-ACE lock here.
+        await this.drainGatedRemoveFortressAceForUid(agentUid);
       }
       if (this.platform === "darwin" && macAclHardlinkPath) {
         await this.removeMacAclHardLinkBestEffort(macAclHardlinkPath);
