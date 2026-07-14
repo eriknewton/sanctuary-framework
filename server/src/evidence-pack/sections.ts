@@ -483,21 +483,29 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
   // round-3 R3-1 fix): the observe engine folds ONLY denied flows into
   // candidates (castle-wall/observe/fold.ts, enforce-preserving posture
   // D-Q1), so every row here is a destination the wall BLOCKED, and allowed
-  // egress is structurally absent. The "permitted destinations do NOT appear"
+  // egress is structurally absent. The "permitted flows do NOT appear"
   // sentence is honored by the same R3-1 engine: the refresh suppresses a
-  // candidate whose destination the verified policy already permits and
-  // prunes pending candidates a later policy change permits, so a PROMOTED
-  // destination no longer re-enters this table from retained history. The
-  // legend grounds the claim in that refresh ("as of its most recent
-  // refresh") rather than asserting an unconditional absolute.
+  // candidate the verified policy already permits FOR THE AGENT THAT
+  // ATTEMPTED IT and prunes pending candidates a later policy change
+  // permits, so a PROMOTED destination no longer re-enters this table from
+  // retained history. The claim is phrased over FLOWS, not destinations,
+  // and grounded in the refresh ("as of its most recent refresh"): the
+  // engine's suppression is scope-aware (a rule promoted for one
+  // agent/template does not permit another agent's attempts at the same
+  // destination -- the daemon still denies those, and this table has no
+  // agent column), so a destination-level absolute would be falsifiable
+  // while the flow-level sentence is what the engine enforces.
   const out = [
     "Legend - Row basis: this table records BLOCKED flow observations only. " +
       "Each row is a destination the wall DENIED; the Seen count is a count " +
-      "of those denied attempts. Destinations permitted by the operator's " +
-      "policy do NOT appear here: as of its most recent refresh, the observe " +
-      "engine records no candidate for a destination the verified policy " +
-      "already permits and clears any pending candidate a later policy " +
-      "change permits; allowed egress is not inventoried by this " +
+      "of those denied attempts. Flows the operator's policy permits do NOT " +
+      "appear here: as of its most recent refresh, the observe engine " +
+      "records no candidate the verified policy already permits for the " +
+      "agent that attempted it, and clears any pending candidate a later " +
+      "policy change permits. (A policy rule scoped to one agent or " +
+      "template does not cover another agent's attempts at the same " +
+      "destination, so such still-denied attempts remain listed.) Allowed " +
+      "egress is not inventoried by this " +
       "table or this version of the pack, so this table is not a census of " +
       "where the machines' traffic actually went.",
     "",
