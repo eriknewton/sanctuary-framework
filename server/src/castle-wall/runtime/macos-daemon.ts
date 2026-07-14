@@ -457,6 +457,38 @@ export async function startMacOSCastleWallDaemon(
     clearInterval(auditHeartbeat);
     auditHeartbeat = undefined;
   };
+  /**
+   * #912 MED-1 fix (drill-found, 2026-07-12): a dropped best-effort reload
+   * audit write (`recordReloadOutcome`'s detached persist missing its
+   * deadline, or the underlying write itself failing) used to surface ONLY on
+   * daemon stderr; the reload still reported `ok:true`, and the drop was
+   * never chain-visible. Each drop is now counted here and stamped as an
+   * `audit_write_degraded_count` detail field onto the next successfully
+   * appended `castle_wall_heartbeat` (or the shutdown `filter_stopped`), so
+   * the loss becomes a tamper-evident chain entry within one heartbeat
+   * interval. A LOCAL detail field on existing operations, not a new
+   * operation or a widened enum. Reservation semantics (fix-round HIGH):
+   * see {@link createAuditWriteDegradedCarry} for why carries reserve units
+   * up front instead of subtracting after the append lands.
+   *
+   * HONEST BOUND (fix-round MED): the pending count is PROCESS-LOCAL. Once a
+   * carry is appended the marker is durable in the chain, but a count that
+   * has not yet been carried survives only until process exit: the residual
+   * loss window is one heartbeat interval, or a crash/SIGKILL before the
+   * next carry. This is availability-of-evidence in a crash window, not a
+   * forgery path; the full-chain verification is unchanged.
+   * DEBT: if a drill ever shows that window matters, persist the pending
+   * count alongside the existing daemon state (the active-config /
+   * fortress-path files) instead of building a retry queue.
+   *
+   * MEANING (fix-round LOW-3, deliberate): the counter records reload
+   * outcome audit writes NOT CONFIRMED within the deadline, not writes
+   * proven lost. A detached append that misses the deadline but lands late
+   * still increments (fail-safe over-report; the operator investigates a
+   * marker and finds the entry present, rather than a real loss going
+   * unmarked).
+   */
+  const degradedCarry = createAuditWriteDegradedCarry();
   const agentEgressProbeIntervalSeconds =
     input.agentEgressProbeIntervalSeconds ??
     CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS;
@@ -689,6 +721,12 @@ export async function startMacOSCastleWallDaemon(
     // HONESTY: a heartbeat proves the daemon is ALIVE, NOT that it adjudicated a
     // real flow, so the reader keeps it OUT of the green/armed determination.
     const emitAuditHeartbeat = async (): Promise<void> => {
+      // RESERVATION carry (fix-round HIGH): take ownership of the pending
+      // units synchronously BEFORE the append, so an overlapping beat (slow
+      // append + short interval) reserves 0 and can never double-subtract
+      // the same units. A drop recorded WHILE this write is in flight stays
+      // pending for the next beat.
+      const degradedCountThisBeat = degradedCarry.reserve();
       try {
         await input.auditLog.append(
           "l1",
@@ -698,6 +736,13 @@ export async function startMacOSCastleWallDaemon(
             socket_path: socketPath,
             source: auditSource,
             daemon_mode: daemonMode,
+            // #912 MED-1: a non-zero count means a reload outcome audit write
+            // was not confirmed within its deadline (deadline or persist
+            // failure) since the last successfully carried marker. See the
+            // `degradedCarry` declaration above for the exact semantics.
+            ...(degradedCountThisBeat > 0
+              ? { audit_write_degraded_count: degradedCountThisBeat }
+              : {}),
             // Provenance marker LAST, from constructed fields only (no untrusted
             // spread), mirroring the audit consumer's enforcement-evidence path.
             [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -709,7 +754,9 @@ export async function startMacOSCastleWallDaemon(
         // A heartbeat write failure must never crash the daemon or take down
         // enforcement. The reader's silent-death detection fails toward an
         // alarm (a MISSING heartbeat reads as fault), so a dropped beat is
-        // surfaced honestly rather than masked.
+        // surfaced honestly rather than masked. The reserved units go back
+        // so the next beat retries carrying the same count.
+        degradedCarry.restore(degradedCountThisBeat);
       }
     };
     await emitAuditHeartbeat();
@@ -824,8 +871,13 @@ export async function startMacOSCastleWallDaemon(
       reloadAuditDeadlineMs,
       `reload audit write (${operation}) did not complete within ${reloadAuditDeadlineMs}ms`,
     ).catch((err: unknown) => {
-      // SAFETY: best-effort audit failures surface on daemon stderr only; they
-      // never fail the reload (the wall is already armed with the new manifest).
+      // A dropped audit write must not be silent: count it so it becomes
+      // chain-visible on the next successful carry (#912 MED-1; see the
+      // `degradedCarry` declaration / `emitAuditHeartbeat` above).
+      degradedCarry.record();
+      // SAFETY: the reload itself never fails on this (the wall is already
+      // armed with the new manifest); the immediate operator signal is
+      // daemon stderr, and the chain marker above is the durable record.
       console.error(
         `[castle-wall] reload audit write (${operation}) failed (non-fatal): ${
           err instanceof Error ? err.message : String(err)
@@ -945,25 +997,41 @@ export async function startMacOSCastleWallDaemon(
           heartbeatIntervalSeconds,
         })).catch(() => undefined);
         await listener.stop();
-        await input.auditLog.append(
-          "l1",
-          "filter_stopped",
-          input.fortressId,
-          {
-            socket_path: socketPath,
-            source: auditSource,
-            // Observability Slice 2 (false-RED fix): stamp the SAME `cw_source`
-            // marker the heartbeat carries so the silent-death reader recognizes
-            // this clean operator stop as an INTENTIONAL stand-down (off on
-            // purpose) and does NOT raise a false `dead_no_heartbeat`/red alarm.
-            // Constructed fields only, marker LAST (no untrusted spread). Gated
-            // read-side on the heartbeat's trust basis; it can only relabel red
-            // to a non-green `unknown`, never manufacture green.
-            [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
-          },
-          "success",
-        );
-        await input.auditLog.flush();
+        // #912 MED-1: carry any still-pending degraded-write count into the
+        // shutdown audit write too, not only the next heartbeat -- a reload
+        // that drops its audit write shortly before `stop()` must not lose the
+        // marker to a heartbeat that never fires again. Same RESERVATION
+        // semantics as the heartbeat carry (fix-round HIGH; the same
+        // double-subtract race exists against an in-flight beat at teardown):
+        // reserve before the append, restore on append failure.
+        const degradedCountAtStop = degradedCarry.reserve();
+        try {
+          await input.auditLog.append(
+            "l1",
+            "filter_stopped",
+            input.fortressId,
+            {
+              socket_path: socketPath,
+              source: auditSource,
+              ...(degradedCountAtStop > 0
+                ? { audit_write_degraded_count: degradedCountAtStop }
+                : {}),
+              // Observability Slice 2 (false-RED fix): stamp the SAME `cw_source`
+              // marker the heartbeat carries so the silent-death reader recognizes
+              // this clean operator stop as an INTENTIONAL stand-down (off on
+              // purpose) and does NOT raise a false `dead_no_heartbeat`/red alarm.
+              // Constructed fields only, marker LAST (no untrusted spread). Gated
+              // read-side on the heartbeat's trust basis; it can only relabel red
+              // to a non-green `unknown`, never manufacture green.
+              [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+            },
+            "success",
+          );
+          await input.auditLog.flush();
+        } catch (err) {
+          degradedCarry.restore(degradedCountAtStop);
+          throw err;
+        }
       } finally {
         await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
       }
@@ -997,6 +1065,66 @@ function buildArmLease(input: {
  * error, so a `reloadPolicy` that times out here returns `ok:false`, never a
  * silent partial success.
  */
+/**
+ * Pending degraded-audit-write counter with RESERVATION carry semantics
+ * (#912 MED-1 follow-up, fix-round HIGH).
+ *
+ * `record()` counts one dropped (deadline-missed or persist-failed) audit
+ * write. A carrier calls `reserve()` to take ownership of the units it will
+ * stamp into a chain entry, BEFORE starting its append; on append failure it
+ * calls `restore(units)` so the next carrier retries them. Because a reserve
+ * synchronously zeroes the pending units, two overlapping carries can never
+ * both snapshot and then both subtract the same units (the double-subtract
+ * bug: two concurrent heartbeat carries of the same 1-unit snapshot drove the
+ * counter to -1, and a LATER real drop incremented -1 to 0, so its marker
+ * never emitted and the loss became chain-invisible again).
+ *
+ * The count is clamped at >= 0: with reservation semantics a negative value
+ * is unreachable, so reaching one means the carry protocol was violated and
+ * is reported loudly instead of silently corrupting later markers.
+ *
+ * Exported for direct unit-testing of the reservation and clamp invariants;
+ * production code uses the single instance inside
+ * {@link startMacOSCastleWallDaemon}.
+ */
+export interface AuditWriteDegradedCarry {
+  /** Count one dropped audit write. */
+  record(): void;
+  /** Take ownership of all pending units (may be 0). Call BEFORE the append. */
+  reserve(): number;
+  /** Return reserved units after a FAILED carry so the next carrier retries them. */
+  restore(units: number): void;
+}
+
+export function createAuditWriteDegradedCarry(): AuditWriteDegradedCarry {
+  let pending = 0;
+  const clamp = (): void => {
+    if (pending >= 0) return;
+    // SAFETY: an impossible negative counter is an invariant violation in the
+    // carry protocol; report it loudly on daemon stderr rather than letting it
+    // silently swallow the next real drop's marker.
+    console.error(
+      `[castle-wall] degraded-audit-write counter went negative (${pending}); clamping to 0 (carry-protocol invariant violation)`,
+    );
+    pending = 0;
+  };
+  return {
+    record() {
+      pending += 1;
+    },
+    reserve() {
+      const units = pending;
+      pending -= units;
+      clamp();
+      return units;
+    },
+    restore(units) {
+      pending += units;
+      clamp();
+    },
+  };
+}
+
 function withReloadDeadline<T>(
   op: Promise<T>,
   deadlineMs: number,

@@ -2330,35 +2330,46 @@ export class AuditLog {
     }
   }
 
+  /**
+   * Drill-found lock-hold fix (Mini1 fortress drill, 2026-07-12): this used to
+   * read-and-parse EVERY persisted entry to find the max sequence, on every
+   * single append, HELD INSIDE the cross-process `withAuditWriteLock`. On a
+   * non-trivial log that made each append's lock hold time O(n), and under
+   * concurrent writers (egress-probe timer, heartbeats, reload, flow
+   * decisions) the queue backed up past `AUDIT_WRITE_LOCK_TIMEOUT_MS` (5s),
+   * exactly the contention window the drill observed, starving flow-decision
+   * writes with `AuditLockContentionError`.
+   *
+   * `storage.list()` returns keys sorted ascending, and the `entry-` key
+   * embeds the sequence zero-padded to a fixed width (see the `key` built in
+   * `persistChainedEntry`), so the highest-sequence entry is ALWAYS the tail
+   * of `metas`. Walking backward from the tail and stopping at the first
+   * entry that parses as a valid envelope makes the common case O(1) instead
+   * of O(n); a run of malformed/torn trailing entries costs more, but never
+   * more than the prior full scan (fail-safe: this can never see fewer
+   * candidates than necessary to find a valid one, matching the previous
+   * "scan until you find a real entry" behavior exactly).
+   */
   private async readLatestPersistedChainState(): Promise<{
     nextSequence: number;
     lastEntryHash: string;
   } | null> {
     const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
-    let latest: PersistedAuditEnvelopeV2 | null = null;
-    for (const meta of metas) {
-      const raw = await this.storage.read(AUDIT_NAMESPACE, meta.key);
+    for (let i = metas.length - 1; i >= 0; i--) {
+      const raw = await this.storage.read(AUDIT_NAMESPACE, metas[i]!.key);
       if (!raw) continue;
       try {
         const parsed = JSON.parse(bytesToString(raw));
         if (!isPersistedAuditEnvelopeV2(parsed)) continue;
-        if (
-          latest === null ||
-          parsed.sequence > latest.sequence ||
-          (parsed.sequence === latest.sequence &&
-            parsed.timestamp.localeCompare(latest.timestamp) > 0)
-        ) {
-          latest = parsed;
-        }
+        return {
+          nextSequence: parsed.sequence + 1,
+          lastEntryHash: parsed.entry_hash,
+        };
       } catch {
         // Full integrity verification reports malformed entries separately.
       }
     }
-    if (!latest) return null;
-    return {
-      nextSequence: latest.sequence + 1,
-      lastEntryHash: latest.entry_hash,
-    };
+    return null;
   }
 
   private async writeAuditEntryBytes(
