@@ -118,6 +118,31 @@ export function claimFromCompleteRead<T>(
   return line;
 }
 
+// ── SOURCE-COMPILED DURABILITY GUARD (parameter vector) ──────────────
+//
+// `_assertReadFailedExcludedFromComplete` above catches a future widening of
+// `Complete<T>` itself, but NOT the other loosening vector: widening
+// `claimFromCompleteRead`'s PARAMETER from `Complete<T>` to `ReadOutcome<T>`, a
+// contravariant loosening that breaks no caller and so produces no compile
+// error anywhere else in `src/**`. This guard closes that vector.
+//
+// Mechanism: `Parameters<typeof claimFromCompleteRead>[0]` is the gate's
+// declared parameter type (the generic instantiates as `Complete<unknown>`).
+// If the signature is ever loosened so that a `ReadFailed` becomes an
+// acceptable argument, the conditional resolves to `never`, the initializer
+// below can no longer be `true`, and `npm run typecheck` (= `tsc --noEmit`
+// over `src/**`, which CI runs) fails (TS2322). Verified by injection:
+// widening the parameter to `ReadOutcome<T>` makes `npm run typecheck` FAIL.
+type ReadFailedNotAcceptedByClaimGate = ReadFailed extends Parameters<
+  typeof claimFromCompleteRead
+>[0]
+  ? never
+  : true;
+const _assertReadFailedNotAcceptedByClaimGate: ReadFailedNotAcceptedByClaimGate =
+  true;
+// Reference it so an unused-locals rule cannot strip the guard.
+void _assertReadFailedNotAcceptedByClaimGate;
+
 /**
  * Exhaustive fold over a {@link ReadOutcome}: the caller MUST handle all three
  * arms, so the `read_failed` case can never be forgotten. The `populated` and
