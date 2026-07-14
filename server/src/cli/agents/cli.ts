@@ -21,7 +21,8 @@
  * alias — see server/src/cli.ts.
  */
 
-import { readFile, writeFile, chmod } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
+import { writeFileCustody } from "../../storage/custody-fs.js";
 import { join } from "node:path";
 
 import { resolveStoragePath } from "../../paths.js";
@@ -563,8 +564,14 @@ async function writeApprovalRedirectToPolicyFile(params: {
   } catch (err) {
     throw new Error("principal policy update refused", { cause: err });
   }
-  await writeFile(policyPath, updated, "utf-8");
-  await chmod(policyPath, 0o600);
+  // Owner-only (0600) from the FIRST byte, never default-mode-then-chmod:
+  // the Principal Policy is a direct fortress-root child, and AGENTS.md
+  // invariant #7 says the agent must NEVER read or infer it. Once a
+  // file-grant fortress traverse ACE is live, a default-0644 create window
+  // would let the agent uid open principal-policy.yaml by known name. The
+  // O_EXCL-temp-at-0600 + rename path (writeFileCustody) closes that window.
+  // See the FORTRESS-DIR TRAVERSAL note in file-grant/fs-ops.ts.
+  await writeFileCustody(policyPath, updated, { mode: 0o600, parentMode: 0o700 });
 }
 
 async function readPolicyTextForMutation(storagePath: string): Promise<string> {

@@ -90,12 +90,35 @@ export async function withCrossProcessLock<T>(
 ): Promise<T> {
   const capabilities = asFilesystemCapabilities(storage);
   if (!capabilities) return operation();
+  const dir = capabilities.namespacePath(namespace);
+  return withPathLock(dir, lockFileName, operation, options);
+}
 
+/**
+ * Lower-level path-keyed variant of {@link withCrossProcessLock}: serialize
+ * `operation` under an O_EXCL lockfile at `<lockDir>/<lockFileName>`, with the
+ * SAME discipline as the storage-backed helper -- bounded wait, NO
+ * auto-stale-break (fail CLOSED with a manual-`rm` hint on sustained
+ * contention), and an always-`rm` `finally` release. Use this directly when
+ * the critical section is keyed on a plain filesystem directory rather than a
+ * StateStore namespace (for example the file-grant grant-tree root, whose
+ * fortress-level ACE lifecycle must serialize a concurrent mint against a
+ * concurrent revoke for the SAME agent uid). `lockDir` is created
+ * `recursive`/`0700` before the acquire; a caller that needs to DEGRADE when
+ * the directory cannot exist (unit rigs, unreal paths) should guard the call
+ * and run `operation` directly on failure -- this helper itself always
+ * attempts the lock.
+ */
+export async function withPathLock<T>(
+  lockDir: string,
+  lockFileName: string,
+  operation: () => Promise<T>,
+  options: CrossProcessLockOptions = {},
+): Promise<T> {
   const timeoutMs = options.timeoutMs ?? CROSS_PROCESS_LOCK_TIMEOUT_MS;
   const retryMs = options.retryMs ?? CROSS_PROCESS_LOCK_RETRY_MS;
-  const dir = capabilities.namespacePath(namespace);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const lockPath = join(dir, lockFileName);
+  await mkdir(lockDir, { recursive: true, mode: 0o700 });
+  const lockPath = join(lockDir, lockFileName);
   const started = Date.now();
 
   for (;;) {

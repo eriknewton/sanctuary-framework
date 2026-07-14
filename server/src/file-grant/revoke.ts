@@ -14,6 +14,20 @@
  * Double-revoke is a no-op-success: revoking an already-revoked grant
  * re-attempts the (idempotent) scrub and returns `alreadyRevoked: true`
  * rather than erroring.
+ *
+ * THROW CONTRACT (round 4, opus LOW-2): `removeEntry` may, in the rare
+ * concurrent-place-then-reapply-fails path, throw
+ * `FileGrantFortressAceReapplyError` (the shared fortress traverse ACE could
+ * not be re-applied for a grant a concurrent mint placed mid-removal). This
+ * propagates here as a scrub error, is audited (`tree_scrub_failed`), and is
+ * re-thrown to the caller -- FAIL-CLOSED: by the time it can throw, THIS
+ * grant's access is already gone (the record was marked `revoked` first, and
+ * `removeEntry` removed the tree entry + source-inode ACE before it reached
+ * the shared-ACE step). The unreachable grant is the CONCURRENT mint's, which
+ * a later `reconcileFileGrantTree` (or the next mint's idempotent re-apply)
+ * re-converges. Callers must treat the throw as "revoke succeeded in reducing
+ * access; the shared-ACE cleanup needs a retry," never as "access may still
+ * be live."
  */
 
 import type { AuditLog } from "../operational/audit-log.js";

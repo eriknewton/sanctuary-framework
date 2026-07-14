@@ -12,8 +12,9 @@
  * Sanctuary master key.
  */
 
-import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { writeFileCustody } from "../../storage/custody-fs.js";
 import { FilesystemStorage } from "../../storage/filesystem.js";
 import { loadConfig } from "../../config.js";
 import { resolveCliMasterKey } from "../../core/master-custody.js";
@@ -129,15 +130,16 @@ export async function saveBrokerPolicy(
     secrets: Array<{ name: string; scope?: "read" | "rotate"; ttl?: number }>;
   }>
 ): Promise<void> {
-  await mkdir(storagePath, { recursive: true });
   const path = brokerPolicyPath(storagePath);
   const body = JSON.stringify({ skills }, null, 2);
-  await writeFile(path, body);
-  try {
-    await chmod(path, 0o600);
-  } catch {
-    /* non-POSIX filesystems */
-  }
+  // Owner-only from the FIRST byte (O_EXCL temp at 0600 + rename), never
+  // default-mode-then-chmod: this file is a direct fortress-root child, and
+  // once a file-grant fortress traverse ACE is live the agent uid can open
+  // root children by known name during a lax-creation window. It holds
+  // broker grant policy metadata (secret NAMES, scopes, TTLs). Parent is
+  // created 0700. See the FORTRESS-DIR TRAVERSAL note in
+  // file-grant/fs-ops.ts.
+  await writeFileCustody(path, body, { mode: 0o600, parentMode: 0o700 });
 }
 
 export async function loadBrokerPolicyRaw(

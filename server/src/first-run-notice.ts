@@ -58,8 +58,13 @@ export async function printFirstRunNoticeOnce(
   }
 
   try {
-    await mkdir(storagePath, { recursive: true });
-    await writeFile(markerPath, "1\n");
+    await mkdir(storagePath, { recursive: true, mode: 0o700 });
+    // Owner-only from the first byte: the marker is a direct fortress-root
+    // child, and once a file-grant fortress traverse ACE is live the agent
+    // uid can open root children by known name. The content is not secret,
+    // but every direct-root writer holds the same owner-only-at-create line
+    // (see the FORTRESS-DIR TRAVERSAL note in file-grant/fs-ops.ts).
+    await writeFile(markerPath, "1\n", { mode: 0o600 });
   } catch {
     // Fail open: could not persist the marker (read-only fs, missing
     // parent, permissions, concurrent writer, etc.). The notice may print
