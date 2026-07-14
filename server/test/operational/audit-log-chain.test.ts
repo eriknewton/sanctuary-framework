@@ -331,4 +331,42 @@ describe("AuditLog tamper-evident chain", () => {
     expect(Date.now() - started).toBeLessThan(5000);
     expect(await storage.list("_audit")).toHaveLength(1000);
   });
+
+  it("skips a malformed trailing entry when freshening chain state from disk (tail-scan fail-safe)", async () => {
+    // Drill-found lock-hold fix (2026-07-12): freshening chain state used to
+    // read-and-parse EVERY persisted entry, held inside the cross-process
+    // write lock, on every append. It now walks backward from the highest
+    // key and stops at the first VALID envelope, which must degrade no
+    // worse than the old full-scan on a torn/corrupt trailing write: a
+    // malformed entry sorting AFTER every real entry (e.g. a torn write
+    // from a crashed concurrent writer) must be skipped, not mistaken for
+    // the chain head.
+    const storage = new MemoryStorage();
+    const masterKey = MASTER_KEY();
+    const writer = new AuditLog(storage, masterKey);
+
+    await appendCritical(writer, "op-1");
+    await appendCritical(writer, "op-2");
+    await appendCritical(writer, "op-3");
+    await writer.flush();
+
+    const corruptKey = `entry-${String(99).padStart(20, "0")}-9999999999999-0`;
+    await storage.write("_audit", corruptKey, stringToBytes("not valid json"));
+
+    await appendCritical(writer, "op-4");
+    await writer.flush();
+
+    const keys = (await auditKeys(storage)).filter((k) => k !== corruptKey);
+    const envelopes = await Promise.all(keys.map((k) => readEnvelope(storage, k)));
+    const sequences = envelopes.map((e) => e.sequence).sort((a, b) => a - b);
+    expect(sequences).toEqual([1, 2, 3, 4]);
+
+    // A fresh reader still verifies cleanly over the real chain; the
+    // corrupt trailing key never entered the chain's own sequence space,
+    // so lenient-mode integrity findings report it distinctly (not as a
+    // hash/sequence-continuity break in the real chain).
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const result = await reader.query({ limit: 100 });
+    expect(result.total).toBe(4);
+  });
 });

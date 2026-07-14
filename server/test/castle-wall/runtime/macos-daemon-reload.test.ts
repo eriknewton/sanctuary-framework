@@ -148,6 +148,7 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       reloadBroadcastDeadlineMs?: number;
       reloadAuditDeadlineMs?: number;
       reloadComposeHook?: () => Promise<void>;
+      auditHeartbeatIntervalSeconds?: number;
     } = {},
   ) {
     return await startMacOSCastleWallDaemon({
@@ -264,6 +265,51 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       auditLog.flush = origFlush;
       await handle.stop();
     }
+  });
+
+  it("chain-records a dropped reload audit write on the next successful audit append (#912 MED-1)", async () => {
+    // Drill-found gap (2026-07-12, SAFE-TO-HOLD MED-1): before this fix, a
+    // dropped `recordReloadOutcome` write (deadline exceeded, or the
+    // underlying persist failing) surfaced ONLY on daemon stderr; the reload
+    // still reported ok:true and the audit CHAIN itself never recorded that
+    // a policy_loaded event was lost. This proves the drop is now durably
+    // chain-visible: it is carried on the next successful audit append (here,
+    // the `filter_stopped` write at shutdown) as `audit_write_degraded_count`.
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const helper = makeControllableHelper();
+    const listener = makeControllableListener();
+    const handle = await startDaemon(fortressPath, auditLog, masterKey, helper, listener.factory, {
+      reloadAuditDeadlineMs: 50,
+      // Keep the heartbeat well outside this test's window so it cannot race
+      // the assertion by consuming (and zeroing) the degraded count first.
+      auditHeartbeatIntervalSeconds: 3_600,
+    });
+    const origAppend = auditLog.append.bind(auditLog);
+    const origFlush = auditLog.flush.bind(auditLog);
+    try {
+      // Freeze the audit log AFTER startup (startup's own appends already ran).
+      auditLog.append = (() => new Promise<void>(() => {})) as typeof auditLog.append;
+      auditLog.flush = (() => new Promise<void>(() => {})) as typeof auditLog.flush;
+      const reply = await handle.reloadPolicy({
+        type: "policy_reload_request",
+        request_id: "req-audit-degraded",
+      });
+      expect(reply.ok).toBe(true);
+      // Let the detached audit write's internal deadline (50ms) actually fire
+      // and its catch handler run BEFORE restoring the audit log.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    } finally {
+      // Restore before stop() so the shutdown audit write can complete AND
+      // carry the degraded-write marker recorded while frozen.
+      auditLog.append = origAppend;
+      auditLog.flush = origFlush;
+      await handle.stop();
+    }
+
+    const { entries } = await auditLog.query({ layer: "l1", limit: 200 });
+    const stopped = entries.filter((e) => e.operation === "filter_stopped");
+    expect(stopped.length).toBeGreaterThan(0);
+    expect(stopped[stopped.length - 1]!.details?.audit_write_degraded_count).toBe(1);
   });
 
   it("bounds a stall at the TOP of reloadPolicy (before the signer) -> ok:false", async () => {

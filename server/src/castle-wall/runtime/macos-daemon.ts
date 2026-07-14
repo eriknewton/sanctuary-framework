@@ -457,6 +457,20 @@ export async function startMacOSCastleWallDaemon(
     clearInterval(auditHeartbeat);
     auditHeartbeat = undefined;
   };
+  /**
+   * #912 MED-1 fix (drill-found, 2026-07-12): a dropped best-effort reload
+   * audit write (`recordReloadOutcome`'s detached persist missing its
+   * deadline, or the underlying write itself failing) used to surface ONLY on
+   * daemon stderr; the reload still reported `ok:true`, and the drop was
+   * never chain-visible. This counts drops SINCE the last successful carry
+   * and is stamped onto the next periodic audit heartbeat (see
+   * `emitAuditHeartbeat` below), which runs on a fixed cadence independent of
+   * reload traffic, so a drop becomes a durable, tamper-evident chain entry
+   * within one heartbeat interval instead of being lost to stderr. A LOCAL
+   * detail field on the existing `castle_wall_heartbeat` operation, not a new
+   * operation or a widened enum.
+   */
+  let auditWriteDegradedCount = 0;
   const agentEgressProbeIntervalSeconds =
     input.agentEgressProbeIntervalSeconds ??
     CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS;
@@ -689,6 +703,11 @@ export async function startMacOSCastleWallDaemon(
     // HONESTY: a heartbeat proves the daemon is ALIVE, NOT that it adjudicated a
     // real flow, so the reader keeps it OUT of the green/armed determination.
     const emitAuditHeartbeat = async (): Promise<void> => {
+      // Snapshot-and-subtract (not snapshot-and-zero): a drop recorded by
+      // `recordReloadOutcome` WHILE this write is in flight must not be lost.
+      // Subtracting only the amount this beat actually carries keeps any
+      // concurrent increment intact for the next beat to pick up.
+      const degradedCountThisBeat = auditWriteDegradedCount;
       try {
         await input.auditLog.append(
           "l1",
@@ -698,6 +717,13 @@ export async function startMacOSCastleWallDaemon(
             socket_path: socketPath,
             source: auditSource,
             daemon_mode: daemonMode,
+            // #912 MED-1: a non-zero count means a reload outcome audit write
+            // was dropped (deadline or persist failure) since the last beat
+            // that successfully carried this marker. See the declaration of
+            // `auditWriteDegradedCount` above.
+            ...(degradedCountThisBeat > 0
+              ? { audit_write_degraded_count: degradedCountThisBeat }
+              : {}),
             // Provenance marker LAST, from constructed fields only (no untrusted
             // spread), mirroring the audit consumer's enforcement-evidence path.
             [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -705,11 +731,13 @@ export async function startMacOSCastleWallDaemon(
           "success",
         );
         await input.auditLog.flush();
+        auditWriteDegradedCount -= degradedCountThisBeat;
       } catch {
         // A heartbeat write failure must never crash the daemon or take down
         // enforcement. The reader's silent-death detection fails toward an
         // alarm (a MISSING heartbeat reads as fault), so a dropped beat is
-        // surfaced honestly rather than masked.
+        // surfaced honestly rather than masked. `auditWriteDegradedCount` is
+        // left untouched so the next beat retries carrying the same count.
       }
     };
     await emitAuditHeartbeat();
@@ -824,8 +852,13 @@ export async function startMacOSCastleWallDaemon(
       reloadAuditDeadlineMs,
       `reload audit write (${operation}) did not complete within ${reloadAuditDeadlineMs}ms`,
     ).catch((err: unknown) => {
-      // SAFETY: best-effort audit failures surface on daemon stderr only; they
-      // never fail the reload (the wall is already armed with the new manifest).
+      // A dropped audit write must not be silent: count it so it becomes
+      // durably chain-visible on the next audit heartbeat (#912 MED-1; see
+      // `auditWriteDegradedCount` / `emitAuditHeartbeat` above).
+      auditWriteDegradedCount += 1;
+      // SAFETY: the reload itself never fails on this (the wall is already
+      // armed with the new manifest); the immediate operator signal is
+      // daemon stderr, and the chain marker above is the durable record.
       console.error(
         `[castle-wall] reload audit write (${operation}) failed (non-fatal): ${
           err instanceof Error ? err.message : String(err)
@@ -945,6 +978,11 @@ export async function startMacOSCastleWallDaemon(
           heartbeatIntervalSeconds,
         })).catch(() => undefined);
         await listener.stop();
+        // #912 MED-1: carry any still-unrecorded degraded-write count into the
+        // shutdown audit write too, not only the next heartbeat -- a reload
+        // that drops its audit write shortly before `stop()` must not lose the
+        // marker to a heartbeat that never fires again.
+        const degradedCountAtStop = auditWriteDegradedCount;
         await input.auditLog.append(
           "l1",
           "filter_stopped",
@@ -952,6 +990,9 @@ export async function startMacOSCastleWallDaemon(
           {
             socket_path: socketPath,
             source: auditSource,
+            ...(degradedCountAtStop > 0
+              ? { audit_write_degraded_count: degradedCountAtStop }
+              : {}),
             // Observability Slice 2 (false-RED fix): stamp the SAME `cw_source`
             // marker the heartbeat carries so the silent-death reader recognizes
             // this clean operator stop as an INTENTIONAL stand-down (off on
@@ -964,6 +1005,7 @@ export async function startMacOSCastleWallDaemon(
           "success",
         );
         await input.auditLog.flush();
+        auditWriteDegradedCount -= degradedCountAtStop;
       } finally {
         await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
       }
