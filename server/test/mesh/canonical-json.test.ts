@@ -142,32 +142,47 @@ describe("canonicalize: cross-language edge classes (castle-wall #915 follow-up)
     expect(Number.MAX_SAFE_INTEGER).toBe(9007199254740991);
   });
 
-  // TODO(security-finding, #915 follow-up -- reported to coordinator, not
-  // fixed here, test-only build): canonicalize()'s number branch operates on
-  // the JS `number` (float64) primitive, which cannot exactly represent
-  // integers beyond Number.MAX_SAFE_INTEGER (2^53-1). Swift's
-  // JSONValue.integer(Int64) case (see
+  // FIXED (#915 follow-up security finding, closed): canonicalize()'s number
+  // branch operates on the JS `number` (float64) primitive, which cannot
+  // exactly represent integers beyond Number.MAX_SAFE_INTEGER (2^53-1).
+  // Swift's JSONValue.integer(Int64) case (see
   // testCanonicalNumberBoundsAtSafeIntegerAndInt64Max in the Swift suite)
-  // preserves full 64-bit precision for a bare JSON integer literal. A
-  // value like Int64.max (9223372036854775807) silently round-trips through
+  // preserves full 64-bit precision for a bare JSON integer literal. A value
+  // like Int64.max (9223372036854775807) used to silently round-trip through
   // Node's JSON.parse -> canonicalize() -> JSON.stringify as
   // "9223372036854776000" -- a byte-level divergence from Swift's exact
-  // "9223372036854775807", with NO exception thrown on either side. This is
+  // "9223372036854775807", with NO exception thrown on either side. That was
   // NOT fail-closed: a hypothetical future manifest field carrying a true
-  // u64-scale value would be silently corrupted by the Node signer rather
-  // than rejected. No field in today's signed-manifest schema carries
-  // values in this range (uids/ports/schema_version are all small), so this
-  // is a structural landmine, not a live exploit. Skipped (not asserted as
-  // "working") per the #915 follow-up instruction: a real, non-fail-closed
-  // divergence gets flagged, not papered over with a passing test.
-  it.skip("KNOWN GAP: u64-scale integers silently lose precision on the Node side (not fail-closed)", () => {
+  // u64-scale value would have been silently corrupted by the Node signer
+  // rather than rejected. canonicalize() now mirrors the existing
+  // server/src/bridge/bridge.ts stableStringify unsafe-integer guard and
+  // throws instead of mangling. No field in today's signed-manifest schema
+  // carries values in this range (uids/ports/schema_version are all small),
+  // so this was a structural landmine, not a live exploit -- but the fix
+  // closes the class fail-closed rather than leaving it latent.
+  it("rejects u64-scale integers instead of silently losing precision (cross-language parity, fail-closed)", () => {
     const raw = "9223372036854775807"; // Int64.max; Swift preserves this exactly
     const parsed = JSON.parse(`{"n":${raw}}`) as { n: number };
-    const canonical = canonicalize(parsed);
-    // Documents the actual (buggy) behavior once un-skipped: Node silently
-    // mangles the digit string instead of throwing or preserving it.
-    expect(canonical).toBe('{"n":9223372036854776000}');
-    expect(canonical).not.toBe(`{"n":${raw}}`);
+    // Node's JSON.parse has already lost precision by this point (the
+    // float64 literal 9223372036854775807 parses to the nearest
+    // representable double); the point of the guard is that canonicalize()
+    // refuses to emit a confidently-wrong digit string rather than that it
+    // recovers the original value. It must throw, loudly, every time.
+    expect(() => canonicalize(parsed)).toThrow(MeshCanonicalJsonError);
+    expect(() => canonicalize(parsed)).toThrow(/unsafe integer/);
+    expect(() => canonicalize(9223372036854775807)).toThrow(MeshCanonicalJsonError);
+  });
+
+  it("still round-trips a safe integer with byte-parity after the unsafe-integer guard", () => {
+    // Proves the guard only rejects previously-silently-mangled inputs and
+    // does not change the canonical bytes of any currently-valid value.
+    expect(canonicalize(Number.MAX_SAFE_INTEGER)).toBe("9007199254740991");
+    expect(canonicalize(0)).toBe("0");
+    expect(canonicalize(-1)).toBe("-1");
+    expect(canonicalize(42)).toBe("42");
+    expect(canonicalize({ n: Number.MAX_SAFE_INTEGER })).toBe(
+      '{"n":9007199254740991}',
+    );
   });
 
   it("matches Swift on deeply nested (but bounded) array recursion", () => {
