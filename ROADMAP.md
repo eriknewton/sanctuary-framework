@@ -127,7 +127,7 @@ One dashboard to view the security posture of every agent the operator runs: whi
 
 The security vendors operators already use (Crowdstrike, Cloudflare, Lakera, Pi-hole, NextDNS, and others) plug into Sanctuary as first-class enforcement. Their verdicts contribute to audit events with per-plugin attribution. Sanctuary does not build detection intelligence in-house; the substrate hosts everyone. **Why it matters:** composes Sanctuary with the rest of the operator's security stack rather than competing with it. Every vendor partnership is a distribution channel and a co-marketing surface.
 
-*Status: substrate and host shipped through slice 5: vendor contract, kernel confinement of plugins, launcher, supervisor with egress consultation, reference blocklist plugin, and hostile-plugin drill evidence. External vendor partnerships are the open item.*
+*Status: substrate and host shipped through slice 5: vendor contract, kernel confinement of plugins, launcher, supervisor with egress consultation, reference blocklist plugin, and hostile-plugin drill evidence. Confinement substrate shipped: sanctuary-jail (#439). External vendor partnerships are the open item.*
 
 #### Agent-native ergonomic surface
 
