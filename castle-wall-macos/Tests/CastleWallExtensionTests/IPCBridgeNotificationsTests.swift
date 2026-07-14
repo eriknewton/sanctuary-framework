@@ -778,13 +778,7 @@ final class IPCBridgeNotificationsTests: XCTestCase {
     // (bypassing the strict typed decode that would otherwise pre-empt some of
     // these) so the chokepoint is a proven backstop even if the typed layer
     // ever loosens. Each off-spec raw `scope.uids` throws `.invalidRuleSchema`.
-    func testValidateSignedRuleScopes_rejectsEveryOffSpecUidsShape() throws {
-        func ruleValue(uids: JSONValue) -> JSONValue {
-            return .object([
-                "id": .string("gate-scoped"),
-                "scope": .object(["uids": uids]),
-            ])
-        }
+    func testValidateRawScope_rejectsEveryOffSpecUidsShape() throws {
         let badUids: [JSONValue] = [
             .null,                                   // null (Codable-collapse class)
             .integer(601),                           // scalar, not array
@@ -797,9 +791,7 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         ]
         for uids in badUids {
             XCTAssertThrowsError(
-                try SignedManifestVerifier.validateSignedRuleScopes(
-                    rules: [], receivedRules: [ruleValue(uids: uids)]
-                )
+                try SignedManifestVerifier.validateRawScope(.object(["uids": uids]), ruleId: "r")
             ) { error in
                 guard case SignedManifestVerificationError.invalidRuleSchema = error else {
                     return XCTFail("expected .invalidRuleSchema for \(uids), got \(error)")
@@ -808,33 +800,75 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         }
         // Control: a well-formed array and an empty array (means "all") pass.
         XCTAssertNoThrow(
-            try SignedManifestVerifier.validateSignedRuleScopes(
-                rules: [], receivedRules: [ruleValue(uids: .array([.integer(601), .integer(602)]))]
+            try SignedManifestVerifier.validateRawScope(
+                .object(["uids": .array([.integer(601), .integer(602)])]), ruleId: "r"
             )
         )
         XCTAssertNoThrow(
-            try SignedManifestVerifier.validateSignedRuleScopes(
-                rules: [], receivedRules: [ruleValue(uids: .array([]))]
-            )
+            try SignedManifestVerifier.validateRawScope(.object(["uids": .array([])]), ruleId: "r")
+        )
+        // Control: unknown scope key rejected (an unknown-only scope axis would
+        // decode to no known axes and widen to all-agents).
+        XCTAssertThrowsError(
+            try SignedManifestVerifier.validateRawScope(.object(["future_axis": .string("x")]), ruleId: "r")
         )
     }
 
-    func testValidateSignedRuleScopes_rejectsNonStringIdAxes() throws {
-        func ruleValue(_ axis: String, _ value: JSONValue) -> JSONValue {
-            return .object(["id": .string("r"), "scope": .object([axis: value])])
-        }
+    func testValidateRawScope_rejectsNonStringIdAxes() throws {
         for axis in ["agent_ids", "template_ids"] {
             for bad: JSONValue in [.null, .string("x"), .array([.integer(1)]), .array([.string("")])] {
                 XCTAssertThrowsError(
-                    try SignedManifestVerifier.validateSignedRuleScopes(
-                        rules: [], receivedRules: [ruleValue(axis, bad)]
-                    )
+                    try SignedManifestVerifier.validateRawScope(.object([axis: bad]), ruleId: "r")
                 ) { error in
                     guard case SignedManifestVerificationError.invalidRuleSchema = error else {
                         return XCTFail("expected .invalidRuleSchema for \(axis)=\(bad), got \(error)")
                     }
                 }
             }
+        }
+    }
+
+    func testValidateRawMatch_mirrorsTsValidateRule() throws {
+        // Each off-spec match shape throws (HIGH-3 completeness).
+        let badMatches: [JSONValue] = [
+            .object([:]),                                             // no destination axis
+            .object(["host": .null]),                                // host null (collapse)
+            .object(["host": .array([])]),                           // empty array
+            .object(["host": .array([.string("")])]),                // empty-string element
+            .object(["host_pattern": .string("")]),                  // empty pattern
+            .object(["host_pattern": .array([.string("x")])]),       // pattern must be scalar
+            .object(["ip": .string("not-an-ip")]),                   // malformed IP
+            .object(["cidr": .string("10.0.0.0/99")]),               // bad prefix
+            .object(["port": .null]),                                // port null (collapse)
+            .object(["port": .integer(0)]),                          // port out of range
+            .object(["port": .integer(70000)]),                      // port out of range
+            .object(["port": .array([])]),                           // empty port array
+            .object(["host": .string("x"), "protocol": .null]),      // protocol null
+            .object(["host": .string("x"), "protocol": .string("icmp")]), // bad protocol
+            .object(["host": .string("x"), "future_axis": .string("y")]), // unknown match key
+        ]
+        for match in badMatches {
+            XCTAssertThrowsError(
+                try SignedManifestVerifier.validateRawMatch(match, ruleId: "r")
+            ) { error in
+                guard case SignedManifestVerificationError.invalidRuleSchema = error else {
+                    return XCTFail("expected .invalidRuleSchema for \(match), got \(error)")
+                }
+            }
+        }
+        // Controls: legitimate match shapes pass.
+        for good: JSONValue in [
+            .object(["host": .string("api.anthropic.com"), "port": .integer(443), "protocol": .string("tcp")]),
+            .object(["host": .array([.string("a.com"), .string("b.com")])]),
+            .object(["ip": .string("1.1.1.1")]),
+            .object(["cidr": .string("10.0.0.0/8")]),
+            .object(["port": .array([.integer(80), .integer(443)])]),
+            .object(["host_pattern": .string("*.example.com")]),
+        ] {
+            XCTAssertNoThrow(
+                try SignedManifestVerifier.validateRawMatch(good, ruleId: "r"),
+                "legitimate match \(good) must pass"
+            )
         }
     }
 
@@ -931,6 +965,161 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         // Control: absent / null agent_origin is fine (means no descriptor).
         XCTAssertNoThrow(try SignedManifestVerifier.validateRawAgentOriginShape(.object([:])))
         XCTAssertNoThrow(try SignedManifestVerifier.validateRawAgentOriginShape(.object(["agent_origin": .null])))
+    }
+
+    // MARK: - S5-0 HIGH-4: NAT helper identity strings must be non-empty
+    // (an empty string makes the REAL helper classify as operator and bypass
+    // every rule via the allow-all fast-path).
+
+    func testNatEmptySigningId_rejectsAndKeepsPrior() throws {
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .nat, egressHelperSigningId: "", systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]
+        )
+    }
+
+    func testNatEmptyTeamId_rejectsAndKeepsPrior() throws {
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .nat, egressHelperTeamId: "", systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]
+        )
+    }
+
+    func testNatValidSigningPlusEmptyTeam_rejectsAndKeepsPrior() throws {
+        // One valid axis plus one present-but-empty axis still rejects: a
+        // present helper identity must be non-empty (TS treats "" as absent,
+        // Swift must not accept it as a match target).
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(
+                mode: .nat,
+                egressHelperSigningId: "ai.sanctuaryprotocol.egress-helper",
+                egressHelperTeamId: "",
+                systemUidAllowCeiling: 500
+            ),
+            badRules: [sampleAllowRule()]
+        )
+    }
+
+    func testNatEmptySigningId_realHelperNotFastPathedAfterRejection() throws {
+        // End-to-end HIGH-4 proof: after the empty-signing-id NAT descriptor is
+        // rejected, the prior UID-mode policy stays in force; a flow from the
+        // agent uid to a non-allowlisted host default-denies (the empty-helper
+        // descriptor, which would have operator-fast-pathed the real helper,
+        // never went live).
+        let engine = try seedGoodUidPolicy()
+        let bad = try makeSignedManifestUpdatedBody(
+            rules: [sampleAllowRule()],
+            agentOrigin: AgentOriginWire(mode: .nat, egressHelperSigningId: "", systemUidAllowCeiling: 500)
+        )
+        XCTAssertNil(
+            IPCBridgeNotifications.applyManifestUpdated(
+                message: .manifestUpdated(bad.body),
+                store: engine.manifestStore,
+                cache: engine.flowCache,
+                pinnedPublicKey: bad.publicKey,
+                engine: engine
+            )
+        )
+        // Prior uid-mode classifier intact.
+        XCTAssertEqual(engine.agentOrigin?.mode, .uid)
+        XCTAssertEqual(engine.agentOrigin?.agentUid, 600)
+    }
+
+    // MARK: - S5-0_930 anti-regression PARITY test
+    //
+    // Enumerates every security-relevant field TS `validateRule` +
+    // `validateAgentOrigin` validate and asserts the Swift chokepoint rejects a
+    // malformed raw value for each -- rejecting the WHOLE snapshot and keeping
+    // prior policy. This is what makes the chokepoint provably COMPLETE: if a
+    // future change drops a field from `validateSignedRule`, the matching row
+    // here fails. Each raw rule below is otherwise well-formed except the one
+    // field under test.
+
+    /// Seed prior good policy, sign+apply a manifest carrying the given single
+    /// raw rule, and assert it rejects the whole snapshot + keeps prior policy.
+    private func assertRawRuleRejectedKeepingPrior(
+        _ ruleJSON: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let engine = try seedGoodUidPolicy()
+        let bad = try makeSignedBodyWithRawRules(rawRuleJSONs: [ruleJSON], agentOrigin: validGateOrigin())
+        let rejected = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(bad.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: bad.publicKey,
+            engine: engine
+        )
+        XCTAssertNil(rejected, "malformed rule must reject the whole snapshot", file: file, line: line)
+        XCTAssertEqual(engine.agentOrigin?.agentUid, 600, file: file, line: line)
+        XCTAssertEqual(engine.manifestStore.currentRules().map { $0.id }, ["r-origin"], file: file, line: line)
+    }
+
+    private func rawRule(match: String, scope: String = #"{"uids":[601]}"#, disposition: String = #""allow""#, extra: String = "") -> String {
+        return """
+        {"id":"parity","schema_version":1,"created_at":"2026-07-14T00:00:00Z",\
+        "match":\(match),"scope":\(scope),"disposition":\(disposition)\(extra)}
+        """
+    }
+
+    func testS5_0_930_parity_everyTsValidatedRuleFieldRejects() throws {
+        // Map: raw rule shape -> TS validateRule source it mirrors.
+        let cases: [(String, String)] = [
+            // match clause (schema.ts:231-286) -- HIGH-3
+            (rawRule(match: #"{}"#), "match >=1 axis (schema.ts:240)"),
+            (rawRule(match: #"{"host":null,"port":[443]}"#), "match.host null (schema.ts:245+141)"),
+            (rawRule(match: #"{"host":[]}"#), "match.host empty array (schema.ts:148)"),
+            (rawRule(match: #"{"host":[""]}"#), "match.host empty element (schema.ts:249)"),
+            (rawRule(match: #"{"host_pattern":""}"#), "match.host_pattern empty (schema.ts:254)"),
+            (rawRule(match: #"{"ip":"not-an-ip"}"#), "match.ip grammar (schema.ts:261)"),
+            (rawRule(match: #"{"cidr":"10.0.0.0/99"}"#), "match.cidr grammar (schema.ts:263)"),
+            (rawRule(match: #"{"port":null,"host":"x"}"#), "match.port null (schema.ts:272+141)"),
+            (rawRule(match: #"{"port":0}"#), "match.port range (schema.ts:99)"),
+            (rawRule(match: #"{"port":70000}"#), "match.port range (schema.ts:99)"),
+            (rawRule(match: #"{"host":"x","protocol":null}"#), "match.protocol null (schema.ts:281)"),
+            (rawRule(match: #"{"host":"x","protocol":"icmp"}"#), "match.protocol enum (schema.ts:283)"),
+            (rawRule(match: #"{"host":"x","future_axis":"y"}"#), "unknown match key (schema.ts:234)"),
+            // scope (schema.ts:288-303) -- HIGH-2
+            (rawRule(match: #"{"host":"x"}"#, scope: #"{"uids":null}"#), "scope.uids null (schema.ts:299)"),
+            (rawRule(match: #"{"host":"x"}"#, scope: #"{"agent_ids":[""]}"#), "scope.agent_ids empty (schema.ts:295)"),
+            (rawRule(match: #"{"host":"x"}"#, scope: #"{"future_axis":"y"}"#), "unknown scope key (schema.ts:291)"),
+            // disposition (schema.ts:305)
+            (rawRule(match: #"{"host":"x"}"#, disposition: #""observe""#), "disposition enum (schema.ts:305)"),
+            // unknown rule key (schema.ts:227)
+            (rawRule(match: #"{"host":"x"}"#, extra: #","future_field":true"#), "unknown rule key (schema.ts:227)"),
+        ]
+        for (ruleJSON, tsSource) in cases {
+            do {
+                try assertRawRuleRejectedKeepingPrior(ruleJSON)
+            } catch {
+                XCTFail("parity row failed for [\(tsSource)]: \(error)\nrule=\(ruleJSON)")
+            }
+        }
+    }
+
+    func testS5_0_930_parity_everyTsValidatedAgentOriginFieldRejects() throws {
+        // agent_origin (agent-origin.ts) -- HIGH-1 floors + HIGH-4 helper.
+        // uid mode floors:
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .uid, agentUid: nil, systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]) // uid mode requires agent_uid (agent-origin.ts:79)
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .uid, agentUid: 100, systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]) // agent_uid >= ceiling (agent-origin.ts:94)
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 600, systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]) // gate_uid != agent_uid (agent-origin.ts:114)
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 100, systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]) // gate_uid >= ceiling (agent-origin.ts:112)
+        // NAT mode: gate_uid forbidden, >=1 non-empty helper (agent-origin.ts:129,139).
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .nat, egressHelperSigningId: "id", gateUid: 601, systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]) // gate_uid in nat rejected
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .nat, egressHelperSigningId: "", systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]) // empty helper (HIGH-4, agent-origin.ts:139)
     }
 
     // MARK: - PR-905-review BLOCKER: install ordering closes the boot window

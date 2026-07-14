@@ -97,15 +97,26 @@ public enum SignedManifestVerifier {
             receivedRules: body.receivedRules
         )
         // ─────────────────────────────────────────────────────────────────
-        // S5-0 enforcement-boundary SCHEMA validation (the HIGH-1 + HIGH-2
+        // S5-0 enforcement-boundary SCHEMA validation (the HIGH-1..HIGH-4
         // chokepoint). A valid signature/digest proves AUTHENTICITY, not that
         // the producer's schema/floor invariants hold. AGENTS.md invariant 4/5
         // forbids trusting across the TS->Swift boundary or silently degrading.
-        // So each security-relevant field the TS producer validates is
+        // So EVERY security-relevant field the TS producer validates is
         // independently re-validated HERE, before the snapshot is constructed;
         // on any violation this THROWS, rejecting the WHOLE snapshot (both
         // `applyManifestUpdated` and `recoverPersistedManifest` funnel through
         // here and keep the prior good snapshot + classifier on throw).
+        //
+        // COMPLETENESS: `validateSignedRule` is the full mirror of the TS
+        // `validateRule` (`server/src/castle-wall/allowlist/schema.ts`) for the
+        // security-relevant fields the Swift evaluator/classifier consume --
+        // the whole `match` clause (destination axes + the "at least one axis"
+        // floor + protocol), the whole `scope` (uids/agent_ids/template_ids),
+        // unknown-key rejection at rule/match/scope, and disposition -- plus
+        // `validateAgentOriginFloors` for `agent_origin` (the TS
+        // `validateAgentOrigin` mirror). The `S5-0_930_parity` anti-regression
+        // test enumerates each TS-validated field and asserts the chokepoint
+        // rejects a malformed value, so no field can be silently left out again.
         //
         // CRITICAL: validate each field in the representation the crypto
         // actually BINDS.
@@ -114,18 +125,24 @@ public enum SignedManifestVerifier {
         //     consumes the TYPED `ManifestRule` -- but optional `Codable`
         //     silently collapses an explicit JSON `null` (and other off-shape
         //     values) to "absent". A signed rule whose raw scope is
-        //     `{"uids": null}` passes the digest yet decodes to `uids == nil`,
-        //     which `scopeMatches` treats as "all agents": a UID-scoped rule
-        //     silently widens to every principal (HIGH-2). The digest binds the
-        //     RAW bytes, so the RAW bytes are what must be schema-validated.
+        //     `{"uids": null}` (HIGH-2) or whose raw `match` is `{}` /
+        //     `{"host": null}` (HIGH-3) passes the digest yet decodes to a
+        //     widened rule (scope -> all agents, match -> any destination). The
+        //     digest binds the RAW bytes, so the RAW bytes are what
+        //     `validateSignedRule` schema-validates. On the live IPC + recovery
+        //     paths `receivedRules` is ALWAYS populated (decoded from the same
+        //     `rules` key as the typed rules, `Messages.swift`), so raw<->typed
+        //     correspondence is exact; the `receivedRules == nil` skip is the
+        //     in-process typed-constructor path only (digest over the typed
+        //     re-encode, so no raw-vs-typed gap exists there).
         //   - AGENT_ORIGIN: the MANIFEST-BODY SIGNATURE is verified over the
         //     re-encoded TYPED `ManifestSignedBody`, so the TYPED struct is the
         //     cryptographically-bound form -- `validateAgentOriginFloors`
-        //     validates that same typed form (HIGH-1). As additional
+        //     validates that same typed form (HIGH-1/HIGH-4). As additional
         //     defense-in-depth against the same Codable-null-collapse class we
         //     ALSO schema-check the RAW `agent_origin` when present.
         // ─────────────────────────────────────────────────────────────────
-        try validateSignedRuleScopes(
+        try validateSignedRule(
             rules: body.rules,
             receivedRules: body.receivedRules
         )
@@ -193,11 +210,29 @@ public enum SignedManifestVerifier {
                     "gate_uid is not valid in nat mode (uid-mode-only concept)"
                 )
             }
-            // NAT mode needs at least one egress-helper identity axis, else an
-            // egress-helper match can never be expressed.
+            // HIGH-4 (2026-07-14): a present egress-helper identity must be
+            // NON-EMPTY. TS `validateAgentOrigin` (`agent-origin.ts`) treats an
+            // empty string as absent (`isNonEmptyString("")` is false); Swift's
+            // typed `String?` decode reads `""` as `.some("")` = present. If we
+            // accepted `egress_helper_signing_id: ""`, `matchesEgressHelper`
+            // would compare the real helper's non-empty signing id against `""`,
+            // fail the match, and `classifyNat` would resolve the REAL helper as
+            // `.operator` -- earning the allow-all fast-path and bypassing every
+            // rule. Reject present-but-empty, then require at least one present
+            // (which, after the empty rejection, means at least one NON-empty).
+            if let signingId = wire.egressHelperSigningId, signingId.isEmpty {
+                throw SignedManifestVerificationError.invalidAgentOrigin(
+                    "egress_helper_signing_id must be non-empty when present"
+                )
+            }
+            if let teamId = wire.egressHelperTeamId, teamId.isEmpty {
+                throw SignedManifestVerificationError.invalidAgentOrigin(
+                    "egress_helper_team_id must be non-empty when present"
+                )
+            }
             guard wire.egressHelperSigningId != nil || wire.egressHelperTeamId != nil else {
                 throw SignedManifestVerificationError.invalidAgentOrigin(
-                    "nat mode requires at least one egress-helper identity"
+                    "nat mode requires at least one non-empty egress-helper identity"
                 )
             }
         }
@@ -207,26 +242,48 @@ public enum SignedManifestVerifier {
     /// TS `UINT32_MAX` cap in `agent-origin.ts` / `schema.ts`.
     private static let uidWireMax: Int64 = 0xFFFF_FFFF
 
-    /// Enforcement-boundary schema validation of each signed rule's SCOPE axes,
-    /// operating on the RAW `receivedRules` JSON (S5-0 HIGH-2). Mirrors the TS
-    /// `validateRule` scope shape (`server/src/castle-wall/allowlist/schema.ts`):
-    ///   - `uids`, when present, must be an array whose every element is a JSON
-    ///     integer in `[1, UInt32.max]` (reject `null`, a scalar, a fractional
-    ///     number, `0`/root, a negative, or an above-`UInt32` value). An empty
-    ///     array is allowed (means "all", same as `agent_ids`/`template_ids`).
-    ///   - `agent_ids` / `template_ids`, when present, must be an array of
-    ///     non-empty strings.
-    /// Absent axes are fine. Only these scope axes are read by
-    /// `AllowlistEvaluator.scopeMatches`, so they are the only widening vectors;
-    /// unknown additive scope keys are not read and cannot widen, so they are
-    /// left to the sysext's forward-compat posture rather than rejected here.
+    /// The TS `validateRule` known-key sets (`schema.ts`), mirrored so an
+    /// unknown key -- which a conforming producer would never sign, and which
+    /// an unknown-only scope/match axis would let widen to all-agents /
+    /// any-destination -- is rejected here too (fail closed). Only
+    /// `schema_version == 1` rules reach this point (`verifyRuleDigests`
+    /// rejects any other version first), so these are the v1 key sets.
+    private static let knownRuleKeys: Set<String> = [
+        "id", "schema_version", "created_at", "description",
+        "match", "scope", "disposition", "time_window", "derived",
+    ]
+    private static let knownMatchKeys: Set<String> = [
+        "host", "host_pattern", "ip", "cidr", "port", "protocol",
+    ]
+    private static let knownScopeKeys: Set<String> = [
+        "agent_ids", "template_ids", "uids",
+    ]
+
+    /// Complete enforcement-boundary schema validation of each signed rule,
+    /// operating on the RAW `receivedRules` JSON (S5-0 HIGH-2 + HIGH-3). This is
+    /// the full mirror of the security-relevant TS `validateRule`
+    /// (`server/src/castle-wall/allowlist/schema.ts`) for every field the Swift
+    /// `AllowlistEvaluator` consumes:
+    ///   - unknown keys at the rule / match / scope level are rejected
+    ///     (`rejectUnknownKeys` parity);
+    ///   - `match` must be an object with at least one of
+    ///     `host`/`host_pattern`/`ip`/`cidr`/`port` present, and every present
+    ///     axis is shape/grammar-validated (reject `null`, empty array, empty
+    ///     string, malformed IP/CIDR, out-of-range port, invalid protocol) --
+    ///     otherwise a null-collapsed or empty `match` widens the rule to ANY
+    ///     destination in `matchClauseMatches` (HIGH-3);
+    ///   - `scope` axes are validated (HIGH-2): `uids` an array of integers in
+    ///     `[1, UInt32.max]`; `agent_ids`/`template_ids` arrays of non-empty
+    ///     strings; empty arrays mean "all" (parity with TS + `scopeMatches`);
+    ///   - `disposition` is one of `allow`/`prompt`/`deny`.
     ///
     /// Runs against the RAW JSON (not the Codable-parsed `ManifestRule`) so an
     /// explicit `null` / off-type value cannot be silently collapsed to
     /// "absent" before it is checked. When `receivedRules` is absent (the typed
-    /// test/legacy construction path), the digest was computed over the typed
-    /// re-encode, so there is no raw-vs-typed gap and validation is skipped.
-    static func validateSignedRuleScopes(
+    /// in-process constructor path only, never the wire), the digest was computed
+    /// over the typed re-encode, so there is no raw-vs-typed gap and validation
+    /// is skipped.
+    static func validateSignedRule(
         rules: [ManifestRule],
         receivedRules: [JSONValue]?
     ) throws {
@@ -239,26 +296,167 @@ public enum SignedManifestVerifier {
                     ruleId: ruleId, reason: "rule is not a JSON object"
                 )
             }
+            try rejectUnknownRawKeys(ruleObj, known: knownRuleKeys, ruleId: ruleId, label: "rule")
+
+            // match
+            guard let matchValue = ruleObj["match"] else {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule.match missing"
+                )
+            }
+            try validateRawMatch(matchValue, ruleId: ruleId)
+
+            // scope
             guard let scopeValue = ruleObj["scope"] else {
-                // `scope` is a required, non-optional field on `ManifestRule`;
-                // a rule missing it would have failed typed decode upstream.
-                // Treat a raw rule with no `scope` key defensively as invalid.
                 throw SignedManifestVerificationError.invalidRuleSchema(
                     ruleId: ruleId, reason: "rule.scope missing"
                 )
             }
-            guard case .object(let scopeObj) = scopeValue else {
+            try validateRawScope(scopeValue, ruleId: ruleId)
+
+            // disposition
+            guard case .string(let disposition)? = ruleObj["disposition"] else {
                 throw SignedManifestVerificationError.invalidRuleSchema(
-                    ruleId: ruleId, reason: "rule.scope must be a JSON object"
+                    ruleId: ruleId, reason: "rule.disposition missing or not a string"
                 )
             }
-            if let uids = scopeObj["uids"] {
-                try validateRawUidScopeAxis(uids, ruleId: ruleId)
+            guard disposition == "allow" || disposition == "prompt" || disposition == "deny" else {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule.disposition must be allow, prompt, or deny (got \(disposition))"
+                )
             }
-            for key in ["agent_ids", "template_ids"] {
-                if let ids = scopeObj[key] {
-                    try validateRawStringIdAxis(ids, ruleId: ruleId, axis: key)
-                }
+        }
+    }
+
+    private static func rejectUnknownRawKeys(
+        _ obj: [String: JSONValue], known: Set<String>, ruleId: String, label: String
+    ) throws {
+        for key in obj.keys where !known.contains(key) {
+            throw SignedManifestVerificationError.invalidRuleSchema(
+                ruleId: ruleId, reason: "\(label) has unknown field \"\(key)\" (fail closed)"
+            )
+        }
+    }
+
+    /// Validate the RAW `match` object: at least one destination axis present,
+    /// each present axis shape/grammar-valid, unknown keys rejected. Mirrors TS
+    /// `validateRule`'s match block (`schema.ts:231-286`).
+    static func validateRawMatch(_ value: JSONValue, ruleId: String) throws {
+        guard case .object(let matchObj) = value else {
+            throw SignedManifestVerificationError.invalidRuleSchema(
+                ruleId: ruleId, reason: "rule.match must be a JSON object"
+            )
+        }
+        try rejectUnknownRawKeys(matchObj, known: knownMatchKeys, ruleId: ruleId, label: "rule.match")
+
+        // At least one of host/host_pattern/ip/cidr/port must be present (a
+        // present key, even null -- but a null value then fails its own axis
+        // validation below, so an all-null match is rejected either way).
+        let destinationAxes = ["host", "host_pattern", "ip", "cidr", "port"]
+        let presentDestinationAxes = destinationAxes.filter { matchObj[$0] != nil }
+        if presentDestinationAxes.isEmpty {
+            throw SignedManifestVerificationError.invalidRuleSchema(
+                ruleId: ruleId,
+                reason: "rule.match must specify at least one of host, host_pattern, ip, cidr, or port"
+            )
+        }
+        if let host = matchObj["host"] {
+            try validateRawScalarOrArray(host, ruleId: ruleId, axis: "host") { isNonEmptyStringValue($0) }
+        }
+        if let pattern = matchObj["host_pattern"] {
+            guard case .string(let s) = pattern, !s.isEmpty else {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule.match.host_pattern must be a non-empty string"
+                )
+            }
+        }
+        if let ip = matchObj["ip"] {
+            try validateRawScalarOrArray(ip, ruleId: ruleId, axis: "ip") { isValidIpValue($0) }
+        }
+        if let cidr = matchObj["cidr"] {
+            try validateRawScalarOrArray(cidr, ruleId: ruleId, axis: "cidr") { isValidCidrValue($0) }
+        }
+        if let port = matchObj["port"] {
+            try validateRawScalarOrArray(port, ruleId: ruleId, axis: "port") { isValidPortValue($0) }
+        }
+        if let proto = matchObj["protocol"] {
+            guard case .string(let p) = proto, p == "tcp" || p == "udp" || p == "tcp+udp" else {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule.match.protocol must be tcp, udp, or tcp+udp"
+                )
+            }
+        }
+    }
+
+    /// Validate a `T | T[]` axis over raw JSON: a single valid scalar, or a
+    /// NON-EMPTY array of valid scalars. `null`, an empty array, and any invalid
+    /// element all reject -- mirroring TS `validateAxisValues` (`schema.ts:141`).
+    private static func validateRawScalarOrArray(
+        _ value: JSONValue, ruleId: String, axis: String, element: (JSONValue) -> Bool
+    ) throws {
+        if case .array(let items) = value {
+            if items.isEmpty {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule.match.\(axis) must not be an empty array"
+                )
+            }
+            for item in items where !element(item) {
+                throw SignedManifestVerificationError.invalidRuleSchema(
+                    ruleId: ruleId, reason: "rule.match.\(axis) contains an invalid element"
+                )
+            }
+            return
+        }
+        // Scalar (including null / wrong type): must validate as a single element.
+        if !element(value) {
+            throw SignedManifestVerificationError.invalidRuleSchema(
+                ruleId: ruleId, reason: "rule.match.\(axis) is null, empty, or the wrong type"
+            )
+        }
+    }
+
+    private static func isNonEmptyStringValue(_ v: JSONValue) -> Bool {
+        if case .string(let s) = v { return !s.isEmpty }
+        return false
+    }
+
+    private static func isValidIpValue(_ v: JSONValue) -> Bool {
+        guard case .string(let s) = v, !s.isEmpty else { return false }
+        // Reuse the evaluator's parser so grammar validation cannot drift from
+        // what actually matches at enforcement time.
+        return AllowlistEvaluator.parseIP(s) != nil
+    }
+
+    private static func isValidCidrValue(_ v: JSONValue) -> Bool {
+        guard case .string(let s) = v, !s.isEmpty else { return false }
+        let parts = s.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, let prefix = Int(parts[1]) else { return false }
+        guard let base = AllowlistEvaluator.parseIP(String(parts[0])) else { return false }
+        let maxBits = base.bytes.count == 4 ? 32 : 128
+        return prefix >= 0 && prefix <= maxBits
+    }
+
+    private static func isValidPortValue(_ v: JSONValue) -> Bool {
+        guard case .integer(let n) = v else { return false }
+        return n >= 1 && n <= 65535
+    }
+
+    /// Validate the RAW `scope` object: known keys only, uids/agent_ids/
+    /// template_ids axis shapes. Empty arrays are allowed (mean "all", parity
+    /// with TS + `scopeMatches`).
+    static func validateRawScope(_ value: JSONValue, ruleId: String) throws {
+        guard case .object(let scopeObj) = value else {
+            throw SignedManifestVerificationError.invalidRuleSchema(
+                ruleId: ruleId, reason: "rule.scope must be a JSON object"
+            )
+        }
+        try rejectUnknownRawKeys(scopeObj, known: knownScopeKeys, ruleId: ruleId, label: "rule.scope")
+        if let uids = scopeObj["uids"] {
+            try validateRawUidScopeAxis(uids, ruleId: ruleId)
+        }
+        for key in ["agent_ids", "template_ids"] {
+            if let ids = scopeObj[key] {
+                try validateRawStringIdAxis(ids, ruleId: ruleId, axis: key)
             }
         }
     }

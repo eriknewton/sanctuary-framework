@@ -55,8 +55,16 @@ public extension AgentOriginDescriptor {
                 systemUidAllowCeiling: uid_t(wire.systemUidAllowCeiling)
             )
         case .nat:
-            // NAT mode requires at least one egress-helper identity axis.
-            guard wire.egressHelperSigningId != nil || wire.egressHelperTeamId != nil else {
+            // NAT mode requires at least one NON-EMPTY egress-helper identity
+            // axis (HIGH-4, 2026-07-14). Defense-in-depth mirror of the
+            // verifier's `validateAgentOriginFloors`: normalize an empty string
+            // to nil so `""` can never become a match target (which would make
+            // the REAL helper -- with a non-empty signing id -- fail the match
+            // and classify `.operator`, bypassing every rule via the allow-all
+            // fast-path). A descriptor with no non-empty identity is unusable.
+            let signingId = wire.egressHelperSigningId.flatMap { $0.isEmpty ? nil : $0 }
+            let teamId = wire.egressHelperTeamId.flatMap { $0.isEmpty ? nil : $0 }
+            guard signingId != nil || teamId != nil else {
                 return nil
             }
             var portRange: ClosedRange<Int>?
@@ -67,8 +75,8 @@ public extension AgentOriginDescriptor {
             }
             self.init(
                 mode: .nat,
-                egressHelperSigningId: wire.egressHelperSigningId,
-                egressHelperTeamId: wire.egressHelperTeamId,
+                egressHelperSigningId: signingId,
+                egressHelperTeamId: teamId,
                 agentRuntimePortRange: portRange,
                 agentUid: nil,
                 gateUid: nil,
