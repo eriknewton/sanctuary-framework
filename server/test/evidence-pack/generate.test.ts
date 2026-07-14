@@ -360,19 +360,24 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("BLOCKED flow observations only");
     expect(report).toContain("a destination the wall DENIED");
     expect(report).toContain("a count of those denied attempts");
+    expect(report).toContain("This table never lists allowed egress");
     expect(report).toContain("Allowed egress is not inventoried");
     expect(report).toContain("not a census of where the machines' traffic actually went");
-    // R3-1 re-truing: the "permitted flows do NOT appear" claim is grounded
-    // in the engine mechanism that honors it (the refresh chokepoint's
-    // SCOPE-AWARE allowlist suppression + prune), phrased over flows-for-the-
-    // attempting-agent rather than a destination-level absolute the store
-    // cannot back (this table has no agent column, and a rule scoped to one
-    // template does not permit another's attempts).
-    expect(report).toContain("Flows the operator's policy permits do NOT");
+    // R3-1 re-truing (final, post two-family-gate engine hardening): the
+    // legend claims the engine's VERIFIED-suppression semantics -- rows are
+    // suppressed/cleared only for flows the engine can positively verify
+    // the signed policy permits for the attempting agent (exact host/IP
+    // allows, the promote workflow's shape) -- and explicitly discloses
+    // that a row may remain listed when permission cannot be verified that
+    // exactly. No falsifiable "permitted destinations never appear"
+    // absolute survives.
+    expect(report).toContain("positively verify the current");
     expect(report).toContain("for the agent that attempted it");
     expect(report).toContain("as of its most recent refresh");
     expect(report).toContain("clears any pending candidate");
-    expect(report).toContain("does not cover another agent's attempts");
+    expect(report).toContain("may remain listed while its permission cannot be verified");
+    expect(report).toContain("never that data was exchanged");
+    expect(report).not.toContain("do NOT appear here");
   });
 
   it("OPEN-MED-1 + F2: the egress 'Seen' legend states its true basis (candidate-record lifetime, not quarter-scoped)", () => {
