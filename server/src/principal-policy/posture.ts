@@ -38,7 +38,13 @@
  * without a live HTTP server or a running daemon.
  */
 
-import type { AuditLog } from "../operational/audit-log.js";
+import {
+  auditChainVerdictClaimsClean,
+  auditChainVerdictUntampered,
+  type AuditLog,
+  type AuditChainVerdict,
+  type AuditChainVerdictStatus,
+} from "../operational/audit-log.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import type { AgentPlatform } from "../wrap/config-reader.js";
 import type { SovereigntyTier } from "../reputation/tiers.js";
@@ -346,7 +352,15 @@ export async function buildCastleWallPosture(
       limit: 10_000,
     });
     entries = result.entries;
-    integrityOk = result.integrity_findings.length === 0;
+    // BLOCKER-1 (round 3): route the arm-state integrity gate through the shared
+    // audit-chain verdict so it also reflects sealed-region tamper (which the
+    // routine query skips). Use the UNTAMPERED collapse: block arm only on
+    // active tamper (findings), NOT on `verified_suffix_only` (an armed box's
+    // operator uid cannot read the root-owned sealed history — that must not
+    // flip every armed box's arm-state to unknown).
+    integrityOk = auditChainVerdictUntampered(
+      await input.auditLog.getAuditChainVerdict(),
+    );
   } catch {
     // A failed/ tainted read must NOT be reported as armed. Fail closed to
     // unknown with integrity flagged.
@@ -636,8 +650,15 @@ export interface AuditDigest {
   approvals_denied: number;
   /** Per-agent operation counts (top contributors first). */
   by_agent: Array<{ identity_id: string; operations: number }>;
-  /** Audit chain verification status for the banner (G3-cheap variant). */
+  /** Audit chain verification status for the banner (G3-cheap variant). True
+   * ONLY for a fully-verified chain (routine clean AND sealed region verified).
+   * F2 BLOCKER-1: folds the sealed-region crypto verdict, so this is never true
+   * over an in-place-corrupted sealed entry that the routine query skips. */
   chain_verified: boolean;
+  /** F2 BLOCKER-1: the richer audit-chain verdict so the UI can distinguish a
+   * fully-verified chain from `verified_suffix_only` (sealed region unreadable at
+   * this privilege) and `findings` (tamper/failure). */
+  chain_verdict: AuditChainVerdictStatus;
   /** Number of integrity findings surfaced by the read (0 when verified). */
   integrity_finding_count: number;
 }
@@ -706,12 +727,18 @@ export async function buildAuditDigest(
       approvals_denied: 0,
       by_agent: [],
       chain_verified: false,
+      chain_verdict: "findings",
       integrity_finding_count: 0,
     };
   }
 
   let entries;
   let integrityFindings;
+  // BLOCKER-1 (round 3): fold the sealed-region verdict into the digest's
+  // `chain_verified` / `chain_verdict`, so "the audit log verified clean: no
+  // tampering" is NEVER claimed over an in-place-corrupted sealed entry (the
+  // routine query skips sealed content). Computed after the query below.
+  let chainVerdict: AuditChainVerdict | null = null;
   try {
     const result = await input.auditLog.query({
       since: windowStart,
@@ -719,6 +746,7 @@ export async function buildAuditDigest(
     });
     entries = result.entries;
     integrityFindings = result.integrity_findings;
+    chainVerdict = await input.auditLog.getAuditChainVerdict();
   } catch {
     // A tainted/unreadable read is reported as an unverified chain with zero
     // counts — never as a clean day.
@@ -734,6 +762,7 @@ export async function buildAuditDigest(
       approvals_denied: 0,
       by_agent: [],
       chain_verified: false,
+      chain_verdict: "findings",
       integrity_finding_count: 1,
     };
   }
@@ -840,7 +869,13 @@ export async function buildAuditDigest(
     approvals_granted: approvalsGranted,
     approvals_denied: approvalsDenied,
     by_agent: byAgent,
-    chain_verified: integrityFindings.length === 0,
+    // BLOCKER-1 (round 3): `chain_verified` is the shared clean-claim collapse
+    // (fully `verified` only). `chain_verdict` carries the richer status so the
+    // UI can render `verified_suffix_only` as a neutral "sealed region not
+    // re-verified at this privilege" rather than a scary red, and `findings` as
+    // a real failure.
+    chain_verified: chainVerdict !== null && auditChainVerdictClaimsClean(chainVerdict),
+    chain_verdict: chainVerdict?.status ?? "findings",
     integrity_finding_count: integrityFindings.length,
   };
 }
@@ -1104,7 +1139,12 @@ export async function buildCustodyExitPanel(
   try {
     const result = await input.auditLog.query({ since, limit: 50_000 });
     entries = result.entries;
-    integrityOk = result.integrity_findings.length === 0;
+    // BLOCKER-1 (round 3): fold the sealed-region verdict (untampered collapse:
+    // fail closed only on active tamper, not on an armed box's unreadable sealed
+    // history).
+    integrityOk = auditChainVerdictUntampered(
+      await input.auditLog.getAuditChainVerdict(),
+    );
   } catch {
     // A failed/tainted read must NOT read as "no damage, therefore fine".
     // Fail closed to unconfirmed with integrity flagged.
@@ -1413,10 +1453,13 @@ export async function buildRecognitionPanel(
       ),
     );
     entries = results.flatMap((r) => r.entries);
-    // Integrity findings are chain-level state (the same snapshot is returned by
-    // every query), so any one result reflects the whole chain; OR across all is
-    // belt-and-suspenders.
-    integrityOk = results.every((r) => r.integrity_findings.length === 0);
+    // BLOCKER-1 (round 3): the audit-chain verdict is chain-level state (one
+    // call covers the whole chain, including the sealed-region crypto verdict
+    // the per-query findings skip). Untampered collapse: fail closed only on
+    // active tamper.
+    integrityOk = auditChainVerdictUntampered(
+      await input.auditLog.getAuditChainVerdict(),
+    );
     // Honest cap disclosure (#651 LOW + MEDIUM): for each bridge op, `total` is
     // that op's full in-window population and the returned `entries` are at most
     // the most-recent `cap` of it. When any op's `total` exceeds its returned

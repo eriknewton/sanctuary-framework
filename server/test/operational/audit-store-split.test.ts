@@ -588,5 +588,67 @@ describe("F2 Option A: fortress audit store split", () => {
       expect(await storage.exists("_meta", "audit-store-split-established-v1")).toBe(true);
       void masterKey;
     });
+
+    // F2 HIGH-1 (round 3): the marker read is TRI-STATE. A present-but-corrupt
+    // established marker is NOT "absent"; it counts as migration evidence and
+    // fails closed. This closes the "corrupt the last witness" fail-open where
+    // an attacker who cannot delete the marker cleanly scribbles over it.
+    it("REQUIRED REPRO (HIGH-1a): CORRUPT the _meta established marker (not deletable) -> still split_boundary_missing, NO anchor", async () => {
+      const { statePath, storage, masterKey } = await migratedWithSuffix(2, 2);
+
+      // Strip boundary + daemon namespaces + sealed prefix, as before.
+      await rm(join(statePath, "_audit_migration"), { recursive: true, force: true });
+      for (const ns of ["_audit-daemon", "_audit-daemon_checkpoints", "_audit-daemon_meta"]) {
+        await rm(join(statePath, ns), { recursive: true, force: true });
+      }
+      const auditDir = join(statePath, "_audit");
+      for (const fn of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
+        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0");
+        if (seq >= 1 && seq <= 2) await unlink(join(auditDir, fn));
+      }
+      // ALSO corrupt the established marker in place (bad MAC / bad JSON) rather
+      // than deleting it: tri-state read must classify this as evidence.
+      const markerDir = join(statePath, "_meta");
+      const markerFile = (await readdir(markerDir)).find((x) =>
+        x.startsWith("audit-store-split-established-v1"),
+      );
+      expect(markerFile).toBeDefined();
+      await writeFile(join(markerDir, markerFile as string), "corrupt-not-json", "utf8");
+
+      const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+      const findings = await reader.getIntegrityFindings();
+      expect(findings.some((x) => x.kind === "split_boundary_missing")).toBe(true);
+      const anchor = await storage.read("_audit_checkpoints", "__rotation_anchor");
+      expect(anchor).toBeNull();
+    });
+
+    // F2 HIGH-1 (round 3, part b): the irreducible residual. If the attacker
+    // DOES manage to delete every witness (boundary + daemon namespaces + the
+    // `_meta` marker) AND the sealed prefix, the surviving suffix starts above
+    // genesis with no authenticated rotation anchor. That shape is ITSELF
+    // evidence of a deleted prefix and is never TOFU-blessed: it fails closed
+    // with `rotation_anchor_missing` and writes NO anchor.
+    it("REQUIRED REPRO (HIGH-1b): DELETE the _meta marker too -> above-genesis suffix fails closed, NO anchor", async () => {
+      const { statePath, storage, masterKey } = await migratedWithSuffix(2, 2);
+
+      await rm(join(statePath, "_audit_migration"), { recursive: true, force: true });
+      for (const ns of ["_audit-daemon", "_audit-daemon_checkpoints", "_audit-daemon_meta"]) {
+        await rm(join(statePath, ns), { recursive: true, force: true });
+      }
+      await rm(join(statePath, "_meta"), { recursive: true, force: true });
+      const auditDir = join(statePath, "_audit");
+      for (const fn of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
+        const seq = Number(/^entry-(\d{20})-/.exec(fn)?.[1] ?? "0");
+        if (seq >= 1 && seq <= 2) await unlink(join(auditDir, fn));
+      }
+
+      const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+      const findings = await reader.getIntegrityFindings();
+      // No witness survives, but the above-genesis suffix without an
+      // authenticated anchor is itself the tell: fail closed, never self-heal.
+      expect(findings.length).toBeGreaterThan(0);
+      const anchor = await storage.read("_audit_checkpoints", "__rotation_anchor");
+      expect(anchor).toBeNull();
+    });
   });
 });

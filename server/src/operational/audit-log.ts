@@ -1146,46 +1146,54 @@ export async function writeAuditStoreSplitEstablishedMarker(
 }
 
 /**
- * BLOCKER-R2: read + MAC-verify the migration-established marker.
- *   - `present`: authentic marker → the writer-split migration ran on this
- *     fortress. An absent boundary in this state is a deletion (fail closed).
- *   - `absent` : no marker (never migrated) OR marker unreadable at this
- *     privilege → do not assert migration; the caller's other evidence
- *     (daemon namespaces) may still apply. A present-but-forged/marker-stripped
- *     record also reads `absent` (its MAC does not authenticate), which is safe:
- *     absence never fabricates a migration, it only fails to prove one.
+ * BLOCKER-R2 + HIGH-1 (round 3): read + MAC-verify the migration-established
+ * marker, TRI-STATE so a corrupted/unreadable marker is NOT laundered into
+ * "never migrated":
+ *   - `present`: authentic marker → the writer-split migration ran. An absent
+ *     boundary in this state is a deletion (fail closed).
+ *   - `invalid_or_unreadable`: the marker RECORD exists but does not
+ *     authenticate (bad JSON, missing/wrong marker key, missing/malformed/wrong
+ *     MAC) OR the read threw (EACCES/IO). This is evidence of a migration whose
+ *     witness was tampered/corrupted, so callers MUST treat it as migration
+ *     evidence and fail closed; the round-2 fix collapsed all of these to
+ *     "absent", which let an attacker CORRUPT the marker to re-open the TOFU
+ *     fail-open (HIGH-1).
+ *   - `absent`: NO record at all (`storage.read` returned null) → genuinely
+ *     never migrated (the common case). Absence never fabricates a migration.
  */
 export async function readAuditStoreSplitEstablishedMarker(
   storage: StorageBackend,
   macKey: Uint8Array
-): Promise<"present" | "absent"> {
+): Promise<"present" | "absent" | "invalid_or_unreadable"> {
   let raw: Uint8Array | null;
   try {
     raw = await storage.read("_meta", AUDIT_STORE_SPLIT_ESTABLISHED_META_KEY);
   } catch {
-    return "absent";
+    // A read error cannot prove absence; a present-but-unreadable marker is
+    // exactly the tamper case. Fail closed.
+    return "invalid_or_unreadable";
   }
-  if (!raw) return "absent";
+  if (!raw) return "absent"; // no record: genuinely never migrated
   let parsed: unknown;
   try {
     parsed = JSON.parse(bytesToString(raw));
   } catch {
-    return "absent";
+    return "invalid_or_unreadable";
   }
   if (!isRecord(parsed) || parsed[AUDIT_STORE_SPLIT_ESTABLISHED_MARKER] !== true) {
-    return "absent";
+    return "invalid_or_unreadable";
   }
   const mac = parsed.mac;
-  if (typeof mac !== "string") return "absent";
+  if (typeof mac !== "string") return "invalid_or_unreadable";
   let providedMac: Uint8Array;
   try {
     providedMac = fromBase64url(mac);
   } catch {
-    return "absent";
+    return "invalid_or_unreadable";
   }
   return constantTimeEqual(providedMac, auditStoreSplitEstablishedMacBytes(macKey))
     ? "present"
-    : "absent";
+    : "invalid_or_unreadable";
 }
 
 /** Parse the zero-padded sequence number embedded in a V2 `entry-*` storage
@@ -1197,6 +1205,240 @@ function parseEntryKeySequence(key: string): number | null {
   if (!match) return null;
   const seq = Number(match[1]);
   return Number.isSafeInteger(seq) ? seq : null;
+}
+
+// ── F2 sealed-region verifier (chokepoint core) ────────────────────────────
+//
+// BLOCKER-1 (adversarial re-gate round 3, 2026-07-14): the routine load SKIPS
+// the sealed legacy region by design, so `getIntegrityFindings()` never
+// reflects sealed CONTENT integrity. This crypto walk is the one place that
+// re-verifies the sealed region's content (reading envelope bytes, recomputing
+// entry hashes, chaining base->tip, matching the MAC'd tip hash; NO decrypt,
+// so it works whenever the caller can READ the files). It lives here (not in
+// audit-store-split.ts) so `AuditLog` can call it directly with its own stored
+// `splitBoundaryMacKey` + `storage`, WITHOUT the raw master key; which is what
+// makes the single `AuditLog.getAuditChainVerdict()` chokepoint reachable from
+// every clean-claiming surface (they all hold only an `AuditLog` handle).
+// `verifySealedLegacyPrefix(storage, masterKey)` in audit-store-split.ts is a
+// thin wrapper over this that derives the MAC key from the master.
+export type SealedRegionVerdict =
+  /** No VALID boundary present: nothing was sealed by a committed migration. */
+  | { status: "not_present" }
+  /** The migration sealed an empty chain (`sealed_tip_sequence === 0`). */
+  | { status: "empty" }
+  /** Every sealed V2 entry re-hashed, chained, and the tip matched the MAC'd
+   * `sealed_tip_entry_hash`. */
+  | { status: "verified"; entries_verified: number; sealed_tip_sequence: number }
+  /** At least one sealed entry could not be read at this privilege (the F2
+   * cross-uid case). Honest: NOT verified. Re-run as root. */
+  | { status: "unreadable"; note: string }
+  /** The sealed V2 entry files are not a gap-free run from the MAC'd base to the
+   * MAC'd tip (a sealed entry was deleted / disappeared). */
+  | { status: "incomplete"; expected_tip: number; highest_present: number }
+  /** A sealed entry's content was tampered: a recomputed entry hash, a chain
+   * link, or the tip hash did not match. */
+  | { status: "hash_mismatch"; sequence: number; expected: string; actual: string };
+
+interface SealedEnvelopeV2 {
+  sequence: number;
+  prev_hash: string;
+  entry_hash: string;
+  timestamp: string;
+  encrypted_payload_bytes: string;
+  schema_version: number;
+}
+
+function isSealedEnvelopeV2(value: unknown): value is SealedEnvelopeV2 {
+  if (!isRecord(value)) return false;
+  return (
+    value.schema_version === AUDIT_CHAIN_SCHEMA_VERSION &&
+    typeof value.sequence === "number" &&
+    Number.isSafeInteger(value.sequence) &&
+    value.sequence > 0 &&
+    typeof value.prev_hash === "string" &&
+    typeof value.entry_hash === "string" &&
+    /^[0-9a-f]{64}$/.test(value.entry_hash) &&
+    typeof value.timestamp === "string" &&
+    typeof value.encrypted_payload_bytes === "string"
+  );
+}
+
+/**
+ * The sealed-region crypto walk. `storage` needs only `list`/`read` on the
+ * `_audit` namespace; `statePath` is the fortress `state` dir (for the boundary
+ * file); `macKey` is the split-boundary MAC key (from the master key, or an
+ * `AuditLog`'s pre-derived `splitBoundaryMacKey`). Never decrypts.
+ *
+ * Deletion of the LOWEST sealed entry IS now caught (via the MAC'd
+ * `sealed_base_sequence`). Pre-V2 (null-sequence) sealed keys are not walked
+ * here; a chain mixing pre-V2 sealed entries gets `verified` over its V2 sealed
+ * region only.
+ */
+export async function verifySealedRegionAt(opts: {
+  storage: Pick<StorageBackend, "list" | "read">;
+  statePath: string;
+  macKey: Uint8Array;
+}): Promise<SealedRegionVerdict> {
+  const { storage, statePath, macKey } = opts;
+  const boundary = await readAuditStoreSplitBoundary(statePath, macKey);
+  if (boundary.status !== "valid") return { status: "not_present" };
+  const tip = boundary.boundary.sealed_tip_sequence;
+  const base = boundary.boundary.sealed_base_sequence;
+  if (tip <= 0) return { status: "empty" };
+
+  let metas;
+  try {
+    metas = await storage.list(AUDIT_NAMESPACE);
+  } catch {
+    return { status: "unreadable", note: "could not list the _audit namespace" };
+  }
+
+  const bySeq = new Map<number, SealedEnvelopeV2>();
+  for (const meta of metas) {
+    const seq = parseEntryKeySequence(meta.key);
+    if (seq === null || seq > tip) continue;
+    let raw: Uint8Array | null;
+    try {
+      raw = await storage.read(AUDIT_NAMESPACE, meta.key);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EACCES" || code === "EPERM") {
+        return {
+          status: "unreadable",
+          note: `sealed entry ${meta.key} is not readable at this privilege (re-run as root)`,
+        };
+      }
+      return {
+        status: "unreadable",
+        note: `sealed entry ${meta.key} could not be read: ${failureMessage(err)}`,
+      };
+    }
+    if (!raw) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytesToString(raw));
+    } catch {
+      return { status: "hash_mismatch", sequence: seq, expected: "<valid V2 envelope>", actual: "<unparseable>" };
+    }
+    if (!isSealedEnvelopeV2(parsed)) {
+      return { status: "hash_mismatch", sequence: seq, expected: "<valid V2 envelope>", actual: "<malformed envelope>" };
+    }
+    bySeq.set(parsed.sequence, parsed);
+  }
+
+  const presentSeqs = [...bySeq.keys()].sort((a, b) => a - b);
+  const highest = presentSeqs.length > 0 ? presentSeqs[presentSeqs.length - 1]! : 0;
+  const lowest = presentSeqs.length > 0 ? presentSeqs[0]! : 0;
+  // Completeness: a gap-free run from the MAC'd base to the MAC'd tip. Checking
+  // `lowest === base` closes the lowest-entry-deletion residual.
+  if (presentSeqs.length === 0 || highest !== tip || (base > 0 && lowest !== base)) {
+    return { status: "incomplete", expected_tip: tip, highest_present: highest };
+  }
+  for (let i = 1; i < presentSeqs.length; i++) {
+    if (presentSeqs[i]! !== presentSeqs[i - 1]! + 1) {
+      return { status: "incomplete", expected_tip: tip, highest_present: highest };
+    }
+  }
+
+  // Crypto walk: recompute each entry hash, verify chain links among present
+  // entries, and match the tip to the MAC'd sealed_tip_entry_hash.
+  let prevHash: string | null = null;
+  for (const seq of presentSeqs) {
+    const env = bySeq.get(seq)!;
+    const recomputed = computeAuditEntryHash({
+      sequence: env.sequence,
+      prev_hash: env.prev_hash,
+      timestamp: env.timestamp,
+      encrypted_payload_bytes: env.encrypted_payload_bytes,
+      schema_version: env.schema_version,
+    });
+    if (recomputed !== env.entry_hash) {
+      return { status: "hash_mismatch", sequence: seq, expected: env.entry_hash, actual: recomputed };
+    }
+    if (prevHash !== null && env.prev_hash !== prevHash) {
+      return { status: "hash_mismatch", sequence: seq, expected: prevHash, actual: env.prev_hash };
+    }
+    prevHash = env.entry_hash;
+  }
+
+  const tipEnv = bySeq.get(tip)!;
+  if (tipEnv.entry_hash !== boundary.boundary.sealed_tip_entry_hash) {
+    return {
+      status: "hash_mismatch",
+      sequence: tip,
+      expected: boundary.boundary.sealed_tip_entry_hash,
+      actual: tipEnv.entry_hash,
+    };
+  }
+  return { status: "verified", entries_verified: presentSeqs.length, sealed_tip_sequence: tip };
+}
+
+/**
+ * BLOCKER-1 (round 3): the SINGLE audit-chain verdict every clean-claiming
+ * surface must consume. `verified` ONLY when routine suffix findings are empty
+ * AND the sealed region is `verified`/`empty`/`not_present`. `verified_suffix_only`
+ * when the suffix is clean but the sealed region is `unreadable` (e.g. an armed
+ * box's operator uid). `findings` for any routine finding OR a sealed
+ * `hash_mismatch`/`incomplete`. `key_unavailable` is for callers that have no
+ * verifier at all (never produced by `AuditLog.getAuditChainVerdict`, which
+ * always has its keys).
+ */
+export type AuditChainVerdictStatus =
+  | "verified"
+  | "verified_suffix_only"
+  | "findings"
+  | "key_unavailable";
+
+export interface AuditChainVerdict {
+  status: AuditChainVerdictStatus;
+  routine_finding_count: number;
+  sealed_region: SealedRegionVerdict;
+}
+
+/** Fold a routine-finding count + a sealed-region verdict into the single
+ * clean-claim verdict. Shared so the derivation lives in exactly one place. */
+export function foldAuditChainVerdict(
+  routineFindingCount: number,
+  sealed: SealedRegionVerdict
+): AuditChainVerdict {
+  const sealedIsProblem =
+    sealed.status === "hash_mismatch" || sealed.status === "incomplete";
+  let status: AuditChainVerdictStatus;
+  if (routineFindingCount > 0 || sealedIsProblem) {
+    status = "findings";
+  } else if (sealed.status === "unreadable") {
+    status = "verified_suffix_only";
+  } else {
+    status = "verified"; // sealed verified / empty / not_present
+  }
+  return { status, routine_finding_count: routineFindingCount, sealed_region: sealed };
+}
+
+/**
+ * Collapse the verdict for a surface that makes an explicit "verified clean /
+ * no tampering / verified_against_audit_chain" CLAIM. True ONLY for a fully
+ * `verified` chain (routine clean AND sealed verified/empty/not_present). A
+ * `verified_suffix_only` (sealed unreadable at this privilege) is NOT a clean
+ * claim and returns false; the surface should render "suffix verified, sealed
+ * region unverified at this privilege", never bare "verified".
+ */
+export function auditChainVerdictClaimsClean(v: AuditChainVerdict): boolean {
+  return v.status === "verified";
+}
+
+/**
+ * Collapse the verdict for a gate whose only job is "is the audit read TAINTED
+ * (active tamper); must I fail closed?"; e.g. the Castle Wall arm-state gate
+ * and the custody/recognition integrity gates. Untampered = anything that is
+ * NOT `findings` (which covers routine findings AND sealed hash_mismatch /
+ * incomplete). A `verified_suffix_only` (sealed unreadable) is UNTAMPERED: the
+ * live/suffix evidence verified, and an armed box's operator-uid simply cannot
+ * read the root-owned sealed history — that must NOT flip every armed box's
+ * arm-state to "unknown". Root re-verification (audit-store-status) is where a
+ * root-owned sealed tamper is caught.
+ */
+export function auditChainVerdictUntampered(v: AuditChainVerdict): boolean {
+  return v.status !== "findings";
 }
 
 export class AuditLog {
@@ -1292,6 +1534,11 @@ export class AuditLog {
    * (mirrors every other purpose key on this class: the raw master is never
    * retained). */
   private readonly splitBoundaryMacKey: Uint8Array;
+  /** BLOCKER-1 (round 3): memoized sealed-region verdict, keyed on the cheap
+   * sealed-region fingerprint (see {@link verifySealedRegion}). The sealed
+   * region is immutable post-migration, so a stable fingerprint means the
+   * verdict is reusable; any tamper flips the fingerprint and forces a re-walk. */
+  private cachedSealedVerdict: { fingerprint: string; verdict: SealedRegionVerdict } | null = null;
 
   constructor(storage: StorageBackend, masterKey: Uint8Array, config?: AuditLogConfig) {
     this.storage = storage;
@@ -1426,6 +1673,89 @@ export class AuditLog {
     await this.appendQueue;
     await this.ensureLoaded({ allowIntegrityFindings: true });
     return { sequence: this.nextSequence - 1, entry_hash: this.lastEntryHash };
+  }
+
+  /**
+   * BLOCKER-1 (adversarial re-gate round 3, 2026-07-14): crypto-re-verify the
+   * sealed legacy region's CONTENT using this instance's own `storage` +
+   * `splitBoundaryMacKey` (no master key needed; the walk reads envelope bytes
+   * and recomputes hashes). Memoized on a cheap sealed-region fingerprint
+   * (count + newest key + size/mtime aggregate over the sealed entries), which
+   * changes on ANY tamper (in-place edit changes size/mtime; delete changes
+   * count/key), so repeated clean-claim calls are cheap while a tamper always
+   * forces a re-walk. Returns `not_present` for a non-filesystem backend or a
+   * daemon instance (`consultSplitBoundary: false`).
+   */
+  async verifySealedRegion(): Promise<SealedRegionVerdict> {
+    if (!this.consultSplitBoundary || !this.filesystemCapabilities) {
+      return { status: "not_present" };
+    }
+    const statePath = dirname(
+      this.filesystemCapabilities.namespacePath(AUDIT_NAMESPACE)
+    );
+    let fingerprint: string;
+    try {
+      fingerprint = await this.sealedRegionFingerprint();
+    } catch {
+      fingerprint = "list-error"; // force a walk (which will report unreadable)
+    }
+    if (
+      this.cachedSealedVerdict &&
+      this.cachedSealedVerdict.fingerprint === fingerprint
+    ) {
+      return this.cachedSealedVerdict.verdict;
+    }
+    const verdict = await verifySealedRegionAt({
+      storage: this.storage,
+      statePath,
+      macKey: this.splitBoundaryMacKey,
+    });
+    // Only cache a stable/terminal verdict; an `unreadable` may be transient
+    // (a race with a chmod), so leave it uncached so the next call re-checks.
+    if (verdict.status !== "unreadable") {
+      this.cachedSealedVerdict = { fingerprint, verdict };
+    }
+    return verdict;
+  }
+
+  /** Cheap metadata fingerprint of ONLY the sealed region (entries at or below
+   * the boundary tip): count + newest key + per-entry size/mtime aggregate. No
+   * read/decrypt. Any in-place edit (size/mtime) or deletion (count/key) of a
+   * sealed entry flips it. Returns "no-boundary" when there is no valid boundary
+   * (nothing sealed) so the memo key is stable for the common case. */
+  private async sealedRegionFingerprint(): Promise<string> {
+    const boundary = await this.loadSplitBoundary();
+    if (boundary.status !== "valid") return "no-boundary";
+    const tip = boundary.boundary.sealed_tip_sequence;
+    if (tip <= 0) return "empty";
+    const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
+    const sealed = metas.filter((m) => {
+      const seq = parseEntryKeySequence(m.key);
+      return seq !== null && seq <= tip;
+    });
+    sealed.sort((a, b) => a.key.localeCompare(b.key));
+    let sizeSum = 0;
+    let mtimeAgg = 0;
+    for (const m of sealed) {
+      sizeSum += m.size_bytes;
+      mtimeAgg ^= Date.parse(m.modified_at) || 0;
+    }
+    const newest = sealed.length > 0 ? sealed[sealed.length - 1]!.key : "";
+    return `${tip}:${sealed.length}:${newest}:${sizeSum}:${mtimeAgg}`;
+  }
+
+  /**
+   * BLOCKER-1 (round 3): the SINGLE audit-chain verdict every clean-claiming
+   * surface must consume instead of deriving "clean" from
+   * `query().integrity_findings.length === 0` (which skips the sealed region
+   * and lies over in-place sealed tamper). Folds the routine suffix findings
+   * with the sealed-region crypto verdict. `verified` ONLY when routine findings
+   * are empty AND sealed is verified/empty/not_present.
+   */
+  async getAuditChainVerdict(): Promise<AuditChainVerdict> {
+    const routine = await this.getIntegrityFindings();
+    const sealed = await this.verifySealedRegion();
+    return foldAuditChainVerdict(routine.length, sealed);
   }
 
   /**
@@ -1841,15 +2171,18 @@ export class AuditLog {
    * it is safe cross-uid.
    */
   private async daemonMigrationMarkerExists(): Promise<boolean> {
-    // BLOCKER-R2 (adversarial re-gate): the durable `_meta` established marker
-    // is checked FIRST because it is NOT co-deletable with the daemon namespace
-    // set: an attacker who strips every `_audit-daemon*` namespace along with
-    // the boundary still leaves it behind, so boundary loss still fails closed.
+    // BLOCKER-R2 + HIGH-1 (round 3): the durable `_meta` established marker is
+    // checked FIRST because it is NOT co-deletable with the daemon namespace
+    // set. Both `present` (authentic) AND `invalid_or_unreadable` (corrupted /
+    // unreadable record) count as migration evidence and fail closed; the
+    // round-2 code only checked `=== "present"`, which let an attacker CORRUPT
+    // the marker to collapse it to "absent" and re-open the TOFU fail-open.
+    // Only a genuinely-`absent` marker (no record at all) is not evidence.
     if (
       (await readAuditStoreSplitEstablishedMarker(
         this.storage,
         this.splitBoundaryMacKey
-      )) === "present"
+      )) !== "absent"
     ) {
       return true;
     }
@@ -2413,33 +2746,37 @@ export class AuditLog {
       };
     }
 
-    // anchor.status === "absent": pre-F3 already-rotated log OR truncation.
-    if (this.isChainInternallyContiguous(chainedEntries)) {
-      // TOFU: accept the current surviving chain once and authenticate it.
-      //
-      // RESIDUAL (documented, not closed here — F3 design ratified 2026-06-06,
-      // consistent with F1 #394): a filesystem-level adversary who deletes BOTH
-      // this anchor file AND the current lowest-surviving (head) entry leaves a
-      // still-contiguous suffix that is indistinguishable from a legitimate
-      // pre-F3 rotation, so this branch re-accepts it and re-anchors at the new
-      // head — a head truncation hidden as migration. This is the same class as
-      // F1's "delete the MAC'd floor file + one more op" replay residual, and the
-      // filesystem-adversary threat model is explicitly not fully specified
-      // (see CLAUDE.md "Known Complexity" #6). Closing it requires a floor that
-      // does not live in a single deletable file (boot-anchored / externally
-      // attested), which is out of scope for F3.
-      await this.writeRotationAnchor(lowestChainedSeq, head.prev_hash);
-      return {
-        expectedSequence: lowestChainedSeq,
-        expectedPrevHash: head.prev_hash,
-      };
-    }
-    // Non-contiguous: a genuine internal truncation. Flag it; the forward walk
-    // also localizes the exact break.
+    // HIGH-1 (adversarial re-gate round 3, 2026-07-14): the ROBUST,
+    // key-independent invariant. We are here only when the surviving chained
+    // region starts ABOVE the floor (`lowestChainedSeq > defaultSeedSequence`,
+    // so always > genesis) with NO authenticated rotation anchor. Such a suffix
+    // is itself evidence of a deleted prefix, and it must NEVER be TOFU-blessed
+    // (self-healed into a fresh rotation anchor) regardless of marker state.
+    // The round-2 code self-healed here whenever the suffix was internally
+    // contiguous, which is exactly the fail-open an attacker who deletes every
+    // migration witness (boundary + daemon namespaces + `_meta` marker + sealed
+    // prefix) rides: the contiguous above-genesis suffix got re-anchored and
+    // read clean. Now we fail closed unconditionally: surface a
+    // `rotation_anchor_missing` finding and write NO anchor.
+    //
+    // Compatibility note (accepted): a genuinely legitimate PRE-F3
+    // already-rotated log (rotated before F3 shipped 2026-06-06, no anchor, and
+    // never loaded since) no longer silently self-heals; it now surfaces this
+    // finding once and the operator re-establishes via `--accept-broken-chain`.
+    // Any F3+ rotation writes an authenticated anchor (handled above), so only
+    // that vanishing never-loaded-since population is affected, and for it the
+    // outcome is fail-closed (a finding), never corruption.
+    //
+    // IRREDUCIBLE RESIDUAL (documented, NOT claimed closed): this invariant
+    // relies on the SURVIVING entries. It cannot distinguish this from a
+    // legitimate history on evidence alone; a floor that does not live in a
+    // single deletable file (boot-anchored / externally attested) is required
+    // to close the "delete every witness" case fully, same class as F1/F3's
+    // documented boot-anchor residual (CLAUDE.md "Known Complexity" #6).
     findings.push({
       kind: "rotation_anchor_missing",
       sequence: lowestChainedSeq,
-      message: `audit chain starts at sequence ${lowestChainedSeq} (above ${defaultSeedSequence}) with no rotation anchor and is not internally contiguous (entries may have been truncated)`,
+      message: `audit chain starts at sequence ${lowestChainedSeq} (above ${defaultSeedSequence}) with no authenticated rotation anchor; an above-genesis suffix without an authenticated cut is evidence of a deleted prefix and is NOT self-healed`,
     });
     return {
       expectedSequence: lowestChainedSeq,
@@ -2447,23 +2784,10 @@ export class AuditLog {
     };
   }
 
-  /**
-   * True iff the chained entries form an unbroken run: each sequence is exactly
-   * one above its predecessor and each prev_hash equals the predecessor's
-   * entry_hash. Used to decide whether an anchor-less rotated log is a legitimate
-   * pre-F3 prune (TOFU-acceptable) versus a truncated chain.
-   */
-  private isChainInternallyContiguous(
-    chainedEntries: Array<{ envelope: PersistedAuditEnvelopeV2 }>
-  ): boolean {
-    for (let i = 1; i < chainedEntries.length; i++) {
-      const prev = chainedEntries[i - 1]!.envelope;
-      const curr = chainedEntries[i]!.envelope;
-      if (curr.sequence !== prev.sequence + 1) return false;
-      if (curr.prev_hash !== prev.entry_hash) return false;
-    }
-    return true;
-  }
+  // (`isChainInternallyContiguous` was removed in round 3: the anchor-absent
+  // above-genesis suffix is now unconditionally fail-closed per HIGH-1, so the
+  // contiguous-vs-not distinction no longer gates a TOFU self-heal. The forward
+  // chain walk still localizes any internal break.)
 
   /**
    * Read-only verified view of the surviving hash chain, pairing each chained

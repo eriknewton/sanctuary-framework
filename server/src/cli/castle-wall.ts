@@ -2361,7 +2361,14 @@ async function collectDaemonCastleWallEntries(
     // version DISCARDED them, so a readable-but-tampered daemon chain read as
     // `complete: true` with no warning. Surface them: a chain with findings is
     // `tampered`, and its entries are NOT counted as verified coverage.
-    if (q.integrity_findings.length > 0) {
+    //
+    // F2 BLOCKER-1 (round 3): the cleanliness decision routes through the shared
+    // chokepoint `getAuditChainVerdict` (the daemon chain has no sealed region of
+    // its own, so its sealed verdict is `not_present` and the fold reduces to the
+    // routine findings, exactly as before) rather than reading findings.length
+    // directly. This keeps every audit-cleanliness claim on one code path.
+    const verdict = await daemonLog.getAuditChainVerdict();
+    if (verdict.status === "findings") {
       return {
         status: "tampered",
         entries: q.entries,

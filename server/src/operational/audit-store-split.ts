@@ -39,8 +39,6 @@ import type {
   FilesystemStorageCapabilities,
 } from "../storage/interface.js";
 import { assertSdwRawWriteAuthorized, isSdwNamespace } from "../sdw/write-gate.js";
-import { bytesToString } from "../core/encoding.js";
-import { computeAuditEntryHash } from "../audit/chain.js";
 import {
   AuditLog,
   deriveAuditStoreSplitBoundaryMacKey,
@@ -49,10 +47,17 @@ import {
   readAuditStoreSplitBoundary,
   writeAuditStoreSplitEstablishedMarker,
   readAuditStoreSplitEstablishedMarker,
+  verifySealedRegionAt,
   type AuditLogConfig,
   type AuditIntegrityFinding,
   type AuditStoreSplitBoundary,
+  type SealedRegionVerdict,
 } from "./audit-log.js";
+
+// F2: the sealed-region verdict type is defined in audit-log.ts (so `AuditLog`
+// can produce it without a cycle); re-exported here for the CLI/tests that
+// import it from this module.
+export type { SealedRegionVerdict } from "./audit-log.js";
 
 /** The root daemon's own audit namespace. Independently tamper-evident from
  * the operator's `_audit` chain, root-owned (0700-class: whichever uid
@@ -421,38 +426,6 @@ async function lowestV2SequenceInAuditNamespace(
   return lowest;
 }
 
-/**
- * BLOCKER-1(b) (adversarial gate 2026-07-14): the honest verdict for the sealed
- * legacy prefix (the entries at or below the split boundary's tip). Because the
- * routine load skips this region, a separate crypto walk is the only thing that
- * re-verifies it, and it can only do so when the caller can READ the sealed
- * entry files (root, or an operator on a fortress whose sealed entries predate
- * root ownership). The chain check uses `encrypted_payload_bytes` (no decrypt),
- * so it needs no ability to decrypt, only to read the envelope bytes.
- */
-export type SealedRegionVerdict =
-  /** No VALID boundary present: nothing was sealed by a committed migration. */
-  | { status: "not_present" }
-  /** The migration sealed an empty chain (`sealed_tip_sequence === 0`). */
-  | { status: "empty" }
-  /** Every sealed V2 entry re-hashed, chained, and the tip matched the MAC'd
-   * `sealed_tip_entry_hash`. */
-  | { status: "verified"; entries_verified: number; sealed_tip_sequence: number }
-  /** At least one sealed entry could not be read at this privilege (the F2
-   * cross-uid case). Honest: NOT verified. Re-run as root. */
-  | { status: "unreadable"; note: string }
-  /** The sealed V2 entry files are not a gap-free run ending at the tip (a
-   * sealed entry was deleted / disappeared). */
-  | { status: "incomplete"; expected_tip: number; highest_present: number }
-  /** A sealed entry's content was tampered: a recomputed entry hash, a chain
-   * link, or the tip hash did not match. */
-  | {
-      status: "hash_mismatch";
-      sequence: number;
-      expected: string;
-      actual: string;
-    };
-
 /** One chain's honest verdict from {@link verifyFortressAuditFullPicture}. */
 export interface AuditChainReport {
   chain: "operator" | "daemon";
@@ -488,191 +461,30 @@ export interface AuditFullPictureReport {
   daemon: AuditChainReport;
 }
 
-/** Local copy of `audit-log.ts`'s V2 `entry-*` sequence parse (that helper is
- * module-private there; audit-store-split.ts imports FROM audit-log.ts, so it
- * cannot import back). Kept trivial; the format is a frozen at-rest contract. */
-function parseSealedEntryKeySequence(key: string): number | null {
-  const match = /^entry-(\d{20})-/.exec(key);
-  if (!match) return null;
-  const seq = Number(match[1]);
-  return Number.isSafeInteger(seq) ? seq : null;
-}
-
-interface SealedEnvelopeV2 {
-  sequence: number;
-  prev_hash: string;
-  entry_hash: string;
-  timestamp: string;
-  encrypted_payload_bytes: string;
-  schema_version: number;
-}
-
-function isSealedEnvelopeV2(value: unknown): value is SealedEnvelopeV2 {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const v = value as Record<string, unknown>;
-  return (
-    v.schema_version === 2 &&
-    typeof v.sequence === "number" &&
-    Number.isSafeInteger(v.sequence) &&
-    v.sequence > 0 &&
-    typeof v.prev_hash === "string" &&
-    typeof v.entry_hash === "string" &&
-    /^[0-9a-f]{64}$/.test(v.entry_hash) &&
-    typeof v.timestamp === "string" &&
-    typeof v.encrypted_payload_bytes === "string"
-  );
-}
-
 /**
- * BLOCKER-1(b) (adversarial gate 2026-07-14): the root-capable sealed-prefix
- * verifier. Reads the split boundary, then walks the sealed V2 entries
- * (seq <= sealed_tip), recomputes each `entry_hash`, checks the chain links
- * among present entries, and compares the sealed tip entry's hash to the MAC'd
- * `sealed_tip_entry_hash`. This is the shipped verifier that backs the
- * "inspectable by root" claim: content tampering, reordering, or top/middle
- * deletion is DETECTED whenever the caller can read the files. Needs no
- * decryption (chain covers ciphertext bytes), only read access to the entry
- * files and the master key to authenticate the boundary MAC.
+ * F2: the root-capable sealed-prefix verifier, kept as a stable export for the
+ * CLI + tests. Thin wrapper over {@link verifySealedRegionAt} (defined in
+ * audit-log.ts so `AuditLog` can produce the same verdict without the master
+ * key, via `AuditLog.getAuditChainVerdict()` / `verifySealedRegion()`). It
+ * reads the split boundary, walks the sealed V2 entries from the MAC'd base to
+ * the MAC'd tip, recomputes each `entry_hash`, checks chain links, and matches
+ * the tip hash. No decryption (chain covers ciphertext bytes), only read access
+ * plus the master key to derive the boundary MAC key.
  *
- * Residual (documented): deletion of the LOWEST sealed entry keeps a
- * contiguous-and-tip-matching run and is not distinguishable from a legitimate
- * pre-split rotation floor (the same "delete the bottom" class as the
- * rotation anchor). Pre-V2 (null-sequence) sealed legacy keys are not walked
- * here (no parseable sequence); a fortress that mixes pre-V2 sealed entries
- * gets `verified` over its V2 sealed entries only.
+ * Deletion of the LOWEST sealed entry IS caught (the MAC'd `sealed_base_sequence`
+ * is checked against the lowest surviving sequence). Pre-V2 (null-sequence)
+ * sealed keys are not walked here; a chain mixing pre-V2 sealed entries gets
+ * `verified` over its V2 sealed region only.
  */
 export async function verifySealedLegacyPrefix(
   storage: FilesystemStorage,
   masterKey: Uint8Array
 ): Promise<SealedRegionVerdict> {
-  const statePath = dirnameOf(storage.namespacePath("_audit"));
-  const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
-  const boundary = await readAuditStoreSplitBoundary(statePath, macKey);
-  if (boundary.status !== "valid") return { status: "not_present" };
-  const tip = boundary.boundary.sealed_tip_sequence;
-  const base = boundary.boundary.sealed_base_sequence;
-  if (tip <= 0) return { status: "empty" };
-
-  let metas: StorageEntryMeta[];
-  try {
-    metas = await storage.list("_audit");
-  } catch {
-    return { status: "unreadable", note: "could not list the _audit namespace" };
-  }
-
-  const bySeq = new Map<number, SealedEnvelopeV2>();
-
-  for (const meta of metas) {
-    const seq = parseSealedEntryKeySequence(meta.key);
-    if (seq === null || seq > tip) continue;
-    let raw: Uint8Array | null;
-    try {
-      raw = await storage.read("_audit", meta.key);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EACCES" || code === "EPERM") {
-        return {
-          status: "unreadable",
-          note: `sealed entry ${meta.key} is not readable at this privilege (re-run as root)`,
-        };
-      }
-      return {
-        status: "unreadable",
-        note: `sealed entry ${meta.key} could not be read: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      };
-    }
-    if (!raw) continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(bytesToString(raw));
-    } catch {
-      return {
-        status: "hash_mismatch",
-        sequence: seq,
-        expected: "<valid V2 envelope>",
-        actual: "<unparseable>",
-      };
-    }
-    if (!isSealedEnvelopeV2(parsed)) {
-      return {
-        status: "hash_mismatch",
-        sequence: seq,
-        expected: "<valid V2 envelope>",
-        actual: "<malformed envelope>",
-      };
-    }
-    bySeq.set(parsed.sequence, parsed);
-  }
-
-  const presentSeqs = [...bySeq.keys()].sort((a, b) => a - b);
-  const highest = presentSeqs.length > 0 ? presentSeqs[presentSeqs.length - 1]! : 0;
-  const lowest = presentSeqs.length > 0 ? presentSeqs[0]! : 0;
-  // Completeness: a gap-free run from the MAC'd base to the MAC'd tip.
-  // BLOCKER-R1: checking `lowest === base` closes the lowest-entry-deletion
-  // residual (a deleted bottom entry otherwise reads as a legitimate rotation
-  // floor). base <= 0 means the boundary predates this field (defensive; the
-  // current writer always records it), so only the tip is checked.
-  if (
-    presentSeqs.length === 0 ||
-    highest !== tip ||
-    (base > 0 && lowest !== base)
-  ) {
-    return { status: "incomplete", expected_tip: tip, highest_present: highest };
-  }
-  for (let i = 1; i < presentSeqs.length; i++) {
-    if (presentSeqs[i]! !== presentSeqs[i - 1]! + 1) {
-      return { status: "incomplete", expected_tip: tip, highest_present: highest };
-    }
-  }
-
-  // Crypto walk: recompute each entry hash, verify chain links among present
-  // entries, and match the tip to the MAC'd sealed_tip_entry_hash.
-  let prevHash: string | null = null; // null = first present entry (its prev
-  // points at a possibly-rotated-away predecessor we cannot check)
-  for (const seq of presentSeqs) {
-    const env = bySeq.get(seq)!;
-    const recomputed = computeAuditEntryHash({
-      sequence: env.sequence,
-      prev_hash: env.prev_hash,
-      timestamp: env.timestamp,
-      encrypted_payload_bytes: env.encrypted_payload_bytes,
-      schema_version: env.schema_version,
-    });
-    if (recomputed !== env.entry_hash) {
-      return {
-        status: "hash_mismatch",
-        sequence: seq,
-        expected: env.entry_hash,
-        actual: recomputed,
-      };
-    }
-    if (prevHash !== null && env.prev_hash !== prevHash) {
-      return {
-        status: "hash_mismatch",
-        sequence: seq,
-        expected: prevHash,
-        actual: env.prev_hash,
-      };
-    }
-    prevHash = env.entry_hash;
-  }
-
-  const tipEnv = bySeq.get(tip)!;
-  if (tipEnv.entry_hash !== boundary.boundary.sealed_tip_entry_hash) {
-    return {
-      status: "hash_mismatch",
-      sequence: tip,
-      expected: boundary.boundary.sealed_tip_entry_hash,
-      actual: tipEnv.entry_hash,
-    };
-  }
-  return {
-    status: "verified",
-    entries_verified: presentSeqs.length,
-    sealed_tip_sequence: tip,
-  };
+  return verifySealedRegionAt({
+    storage,
+    statePath: dirnameOf(storage.namespacePath("_audit")),
+    macKey: deriveAuditStoreSplitBoundaryMacKey(masterKey),
+  });
 }
 
 /**
@@ -803,10 +615,12 @@ export async function verifyFortressAuditFullPicture(opts: {
   const migrationEstablished =
     boundaryForDaemon.status === "valid" ||
     (masterKey
-      ? (await readAuditStoreSplitEstablishedMarker(
+      ? // HIGH-1 (round 3): a corrupted/unreadable marker is still migration
+        // evidence (fail closed), so `!== "absent"`.
+        (await readAuditStoreSplitEstablishedMarker(
           storage,
           deriveAuditStoreSplitBoundaryMacKey(masterKey)
-        )) === "present"
+        )) !== "absent"
       : false);
 
   let daemon: AuditChainReport;

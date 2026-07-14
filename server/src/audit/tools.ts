@@ -32,7 +32,7 @@ export interface AuditToolsRuntimeDeps {
 
 export function createAuditTools(
   config: SanctuaryConfig,
-  auditLog?: Pick<AuditLog, "query">,
+  auditLog?: Pick<AuditLog, "query" | "getAuditChainVerdict">,
   runtimeDeps?: AuditToolsRuntimeDeps
 ): { tools: ToolDefinition[] } {
   const tools: ToolDefinition[] = [
@@ -94,14 +94,39 @@ export function createAuditTools(
 }
 
 async function detectAuditSubsystemHealth(
-  auditLog?: Pick<AuditLog, "query">
+  auditLog?: Pick<AuditLog, "query" | "getAuditChainVerdict">
 ): Promise<AuditSubsystemHealth | undefined> {
   if (!auditLog) return undefined;
 
   try {
     const result = await auditLog.query({ limit: 0 });
+    const findings = [...result.integrity_findings];
+    // BLOCKER-1 (round 3): the routine query skips the sealed legacy region, so
+    // an in-place-corrupted or deleted sealed entry would leave `integrity_findings`
+    // empty and score this fortress as clean audit health. Fold the shared
+    // sealed-region verdict: a sealed hash_mismatch/incomplete is surfaced as a
+    // score-deducted finding so the sovereignty audit does not read clean.
+    if (auditLog.getAuditChainVerdict) {
+      const verdict = await auditLog.getAuditChainVerdict();
+      const sealed = verdict.sealed_region;
+      if (sealed.status === "hash_mismatch") {
+        findings.push({
+          kind: "entry_hash_mismatch",
+          message: `sealed legacy region content tamper at sequence ${sealed.sequence}`,
+          sequence: sealed.sequence,
+          expected: sealed.expected,
+          actual: sealed.actual,
+        });
+      } else if (sealed.status === "incomplete") {
+        findings.push({
+          kind: "sequence_gap_or_reorder",
+          message: `sealed legacy region incomplete (a sealed entry was deleted; expected tip ${sealed.expected_tip}, highest present ${sealed.highest_present})`,
+          sequence: sealed.expected_tip,
+        });
+      }
+    }
     return {
-      integrity_findings: result.integrity_findings,
+      integrity_findings: findings,
       exit_export_aborted_by_integrity_gate: false,
       mcp_tools_bricked_by_integrity_gate: false,
     };

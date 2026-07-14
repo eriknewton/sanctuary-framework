@@ -74,6 +74,15 @@ function stubAuditLog(
     // scope and runs `fn`; for this in-memory stub (whose `query` is already a
     // constant return) it is a transparent pass-through that simply invokes `fn`.
     runEagerReads: <T>(fn: () => Promise<T>): Promise<T> => fn(),
+    // F2 BLOCKER-1 (round 3): the aggregator now routes its integrity gate
+    // through the shared audit-chain verdict. This stub fortress is not migrated
+    // (sealed region `not_present`), so the verdict is `findings` iff routine
+    // findings exist, else `verified`.
+    getAuditChainVerdict: async () => ({
+      status: integrity_findings.length > 0 ? "findings" : "verified",
+      routine_finding_count: integrity_findings.length,
+      sealed_region: { status: "not_present" },
+    }),
     append: () => undefined,
     size: entries.length,
   } as unknown as AuditLog;

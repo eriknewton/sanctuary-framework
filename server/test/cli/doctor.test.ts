@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { runDoctorChecks, runDoctorCommand } from "../../src/cli/doctor.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
+import { migrateFortressAuditStoreSplit } from "../../src/operational/audit-store-split.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation.js";
 import { stringToBytes } from "../../src/core/encoding.js";
@@ -157,5 +158,72 @@ approval_channel:
     expect(code).toBe(0);
     expect(out.text()).toContain("Usage: sanctuary doctor");
     expect(out.text()).toContain("--json");
+  });
+
+  // F2 MEDIUM-1 (adversarial re-gate round 3, 2026-07-14): on a migrated
+  // fortress, doctor is an operator health command; when it CAN verify (the
+  // master key is available via the passphrase) and finds KNOWN tamper in the
+  // sealed legacy region, it must FAIL (exit non-zero), not merely WARN. The
+  // routine load skips the sealed region, so this only closes via the
+  // chain-aware full-picture verifier doctor now calls.
+  it("MEDIUM-1: FAILs (exit non-zero) on a migrated fortress with a tampered sealed entry when it can verify", async () => {
+    const fortress = await mkdtemp(join(tmpdir(), "sanctuary-doctor-f2-"));
+    tempDirs.push(fortress);
+    await chmod(fortress, 0o700);
+    const statePath = join(fortress, "state");
+    const storage = new FilesystemStorage(statePath);
+    const derived = await deriveMasterKey(passphrase);
+    await storage.write("_meta", "key-params", stringToBytes(JSON.stringify(derived.params)));
+
+    // Pre-split history that will become the sealed prefix.
+    const auditLog = new AuditLog(storage, derived.key, { checkpointInterval: 0 });
+    for (let i = 0; i < 4; i++) {
+      await auditLog.appendCritical({
+        layer: "l2",
+        operation: `pre-split-${i}`,
+        identity_id: "agent-a",
+        result: "success",
+      });
+    }
+    await auditLog.flush();
+    await migrateFortressAuditStoreSplit({ storage, masterKey: derived.key });
+
+    // Tamper one sealed entry IN PLACE (hash_mismatch, not deletion).
+    const auditDir = join(statePath, "_audit");
+    const files = (await readdir(auditDir)).filter((f) => f.startsWith("entry-")).sort();
+    const target = join(auditDir, files[1]!);
+    const raw = JSON.parse(await readFile(target, "utf-8"));
+    raw.timestamp = "1999-01-01T00:00:00.000Z";
+    await writeFile(target, JSON.stringify(raw));
+    derived.key.fill(0);
+
+    // With the passphrase available, doctor CAN verify -> the audit chain FAILs.
+    const withKey = await runDoctorChecks({
+      storagePath: fortress,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    const chainCheck = withKey.find((c) => c.name === "audit chain");
+    expect(chainCheck?.status).toBe("FAIL");
+
+    // The full command exits non-zero.
+    const out = new Capture();
+    const code = await runDoctorCommand({
+      argv: ["--fortress", fortress],
+      out,
+      env: { SANCTUARY_PASSPHRASE: passphrase },
+      platform: "linux",
+    });
+    expect(code).toBe(1);
+    expect(out.text()).toContain("FAIL audit chain");
+    expect(out.text()).not.toContain(passphrase);
+
+    // WITHOUT the key it cannot verify: it must WARN (point at audit-store-status), not FAIL.
+    const noKey = await runDoctorChecks({
+      storagePath: fortress,
+      env: {},
+      platform: "linux",
+    });
+    expect(noKey.find((c) => c.name === "audit chain")?.status).toBe("WARN");
   });
 });

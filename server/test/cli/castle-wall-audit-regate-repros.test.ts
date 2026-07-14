@@ -210,20 +210,38 @@ describe("F2 re-gate repros (round 2)", () => {
     ).rejects.toThrow(/INCOMPLETE|--operator-only|daemon/);
   });
 
-  it("HIGH-R3: doctor does NOT return an OK audit-chain check on a migrated fortress", async () => {
+  // F2 MEDIUM-1 (round 3, 2026-07-14) SUPERSEDES the round-2 assertion here.
+  // Round 2 made doctor never-OK on ANY migrated fortress because the
+  // single-chain export verify could not cover the daemon chain. Round 3 gave
+  // doctor the chain-aware full-picture verifier, so with the master key it CAN
+  // fully verify: a CLEAN migrated fortress is now legitimately OK, and it only
+  // stays not-OK when it cannot verify (no key -> WARN) or finds tamper (FAIL,
+  // covered by the doctor MEDIUM-1 test).
+  it("MEDIUM-1: doctor is OK on a fully-verified migrated fortress WITH the key, and WARN without it", async () => {
     const { fortressPath } = await seededMigratedFortress({
       operatorEntries: 2,
       daemonEntries: 1,
     });
-    const checks = await runDoctorChecks({
+    const withKey = await runDoctorChecks({
       env: ENV(fortressPath),
       storagePath: fortressPath,
       platform: process.platform,
       nodeVersion: process.version,
     });
-    const auditCheck = checks.find((c) => c.name === "audit chain");
-    expect(auditCheck).toBeDefined();
-    expect(auditCheck!.status).not.toBe("OK");
+    const withKeyCheck = withKey.find((c) => c.name === "audit chain");
+    expect(withKeyCheck).toBeDefined();
+    expect(withKeyCheck!.status).toBe("OK");
+
+    // Without the master key doctor cannot re-verify the sealed region or the
+    // daemon chain, so it must WARN (point at audit-store-status), never OK.
+    const noKey = await runDoctorChecks({
+      env: {},
+      storagePath: fortressPath,
+      platform: process.platform,
+      nodeVersion: process.version,
+    });
+    const noKeyCheck = noKey.find((c) => c.name === "audit chain");
+    expect(noKeyCheck!.status).toBe("WARN");
   });
 
   // ── HIGH-R4 ────────────────────────────────────────────────────────────

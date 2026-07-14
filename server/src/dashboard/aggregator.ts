@@ -10,7 +10,11 @@
  * safe to call repeatedly — callers control freshness.
  */
 
-import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
+import {
+  auditChainVerdictUntampered,
+  type AuditLog,
+  type AuditEntry,
+} from "../operational/audit-log.js";
 import type { IdentityManager } from "../cognitive/tools.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import type { BaselineTracker } from "../principal-policy/baseline.js";
@@ -732,16 +736,19 @@ export async function getProtectionSnapshot(
         auditLog.query({ limit: MAX_AUDIT }),
       );
       audit = result.entries;
-      // A real AuditLog.query always returns integrity_findings; treat an absent
-      // field (non-conforming stub) as "no findings" rather than a false red. A
-      // THROWN read still fails closed below.
-      auditIntegrityOk = (result.integrity_findings?.length ?? 0) === 0;
-      // Only a real, present, empty integrity_findings array is positive
-      // evidence the chain verified clean. An absent field (non-conforming stub)
-      // is NOT live evidence and must not earn the "encrypted at rest" claim.
+      // BLOCKER-1 (round 3): the overall-light integrity gate must reflect the
+      // sealed-region verdict (the routine query skips sealed content). Run the
+      // shared verdict (inside the same eager-read scope) and use the UNTAMPERED
+      // collapse: red/compromised only on active tamper, not on an armed box's
+      // unreadable sealed history. `hasLiveIntegrityEvidence` still requires a
+      // real, present findings array (a non-conforming stub earns nothing).
+      const verdict = await auditLog.runEagerReads(() =>
+        auditLog.getAuditChainVerdict(),
+      );
+      auditIntegrityOk = auditChainVerdictUntampered(verdict);
       hasLiveIntegrityEvidence =
         Array.isArray(result.integrity_findings) &&
-        result.integrity_findings.length === 0;
+        auditChainVerdictUntampered(verdict);
     } catch {
       audit = [];
       auditIntegrityOk = false;

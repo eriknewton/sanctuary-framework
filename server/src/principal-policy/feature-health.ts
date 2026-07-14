@@ -69,6 +69,7 @@
  */
 
 import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
+import { auditChainVerdictUntampered, foldAuditChainVerdict } from "../operational/audit-log.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -1537,7 +1538,22 @@ export async function buildFeatureHealthPanel(
       limit: AUDIT_PAGE_LIMIT,
     });
     entries = result.entries;
-    integrityOk = result.integrity_findings.length === 0;
+    // F2 BLOCKER-1 (round 3): fold the sealed-region crypto verdict (the routine
+    // windowed `query()` skips it over the boundary) into the cleanliness claim
+    // through the SHARED verdict fold. We deliberately fold the WINDOWED routine
+    // count (not a full-chain re-scan via getAuditChainVerdict) so this keeps
+    // feature-health's page-truncation tolerance intact; the sealed verdict is
+    // boundary-scoped and independent of the window. `untampered` (verified OR
+    // the armed-box verified_suffix_only) keeps feature health green when the
+    // sealed history is merely unreadable at operator privilege, but flips to
+    // NOT-ok on any real tamper (routine finding OR a sealed hash_mismatch /
+    // incomplete).
+    integrityOk = auditChainVerdictUntampered(
+      foldAuditChainVerdict(
+        result.integrity_findings.length,
+        await input.auditLog.verifySealedRegion(),
+      ),
+    );
 
     // Lifecycle evidence (heartbeat + intentional stand-down) must not be
     // crowded out by unrelated high-volume audit traffic. Query those exact
