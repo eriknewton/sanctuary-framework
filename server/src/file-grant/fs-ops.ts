@@ -868,31 +868,46 @@ export class PosixFileGrantFsOps implements FsOps {
    * primitive; never invents its own lock discipline. NOT reentrant: callers
    * inside a held lock use the `*Locked` / `*ForUid` non-locking helpers.
    *
-   * Degrade is NARROW (opus LOW-1): it runs `operation` UNLOCKED only when the
-   * fortress path genuinely does not exist -- the unit-rig / unreal-path case
-   * (e.g. a synthetic `"/fortress"`), which has no cross-process surface. On a
-   * REAL, existing fortress a `mkdir` failure is an unexpected error and fails
-   * CLOSED (rethrow) rather than silently running the critical section
-   * unlocked (a fail-OPEN of the serialization). A real deployment always has
-   * the fortress present by the time a grant is applied or removed.
+   * Degrade is NARROW (opus LOW-1 + round-5 close): it runs `operation`
+   * UNLOCKED only when the fortress path is PROVABLY ABSENT -- the unit-rig /
+   * unreal-path case (e.g. a synthetic `"/fortress"`), which has no
+   * cross-process surface. "Provably absent" means `stat(<fortress>)` reports
+   * ENOENT/ENOTDIR. On a REAL, existing fortress a `mkdir` failure is an
+   * unexpected error and fails CLOSED (rethrow) rather than silently running
+   * the critical section unlocked (a fail-OPEN of the serialization). A
+   * PERMISSION anomaly that blocks BOTH the mkdir AND the `stat` (EACCES /
+   * EPERM / EIO / etc.) must NOT be mistaken for "absent": `fortressPresence`
+   * rethrows any non-ENOENT/ENOTDIR stat error so the lock fails closed
+   * (mint -> unverified; revoke/reconcile -> leave the ACE), never unlocked. A
+   * real deployment always has the fortress present by grant time.
    */
   private async withFortressAceLock<T>(operation: () => Promise<T>): Promise<T> {
     const lockDir = this.treeRoot();
     try {
       await mkdir(lockDir, { recursive: true, mode: TREE_ROOT_MODE });
-    } catch (err) {
-      if (await this.fortressPathExists()) throw err;
+    } catch (mkdirErr) {
+      // Only a PROVABLY-ABSENT fortress (stat -> ENOENT/ENOTDIR) takes the
+      // unit-rig unlocked path. Any other stat error propagates -> fail closed.
+      if ((await this.fortressPresence()) === "present") throw mkdirErr;
       return operation();
     }
     return withPathLock(lockDir, FORTRESS_ACE_LOCK_FILE, operation);
   }
 
-  private async fortressPathExists(): Promise<boolean> {
+  /**
+   * "absent" ONLY when `stat(<fortress>)` reports ENOENT/ENOTDIR (the path
+   * genuinely does not exist). "present" on success. Any OTHER stat error
+   * (EACCES/EPERM/EIO/...) is rethrown: an inability to observe the fortress
+   * must never be collapsed to "absent" and drive a fail-open unlocked path.
+   */
+  private async fortressPresence(): Promise<"present" | "absent"> {
     try {
       await stat(this.fortressPath);
-      return true;
-    } catch {
-      return false;
+      return "present";
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT" || code === "ENOTDIR") return "absent";
+      throw err;
     }
   }
 

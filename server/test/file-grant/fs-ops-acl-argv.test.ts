@@ -6,7 +6,7 @@
  */
 
 import { constants as fsConstants } from "node:fs";
-import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -1067,6 +1067,67 @@ describe("file-grant ACL command argv construction", () => {
     releaseProbe();
     const { enforcement } = await mintPromise;
     expect(enforcement).toBe("met");
+  });
+
+  it("fails CLOSED (never runs unlocked) when a permission anomaly blocks BOTH mkdir AND stat on a REAL fortress (round-5 close; bug-inject)", async () => {
+    if (process.getuid?.() === 0) return; // root bypasses mode bits; anomaly not reproducible
+    // A real, EXISTING fortress whose PARENT is unsearchable: mkdir(grants)
+    // and stat(fortress) BOTH EACCES, yet the fortress path exists. The lock
+    // must NOT mistake "cannot observe" for "absent" and run the critical
+    // section unlocked (a fail-OPEN of serialization).
+    const parent = await mkdtemp(join(tmpdir(), "sanctuary-file-grant-perm-"));
+    const fortress = join(parent, "fortress");
+    await mkdir(fortress);
+    await chmod(parent, 0o000); // remove search/traverse on the parent
+    try {
+      const seen: FileGrantExecCommand[] = [];
+      const fsOps = new PosixFileGrantFsOps(fortress, {
+        platform: "linux",
+        execRunner: {
+          execFile: async (command) => {
+            seen.push(command);
+            return { stdout: "", stderr: "" };
+          },
+        },
+      });
+
+      const result = await fsOps.grantAgentRead("agent-1/fg_x", 502, pinnedSource());
+
+      // Fail-closed: the apply reports a non-applied status and the critical
+      // section never entered (zero exec commands ran). On dc73884d the EACCES
+      // stat collapsed to "absent" -> degraded UNLOCKED -> status "applied" and
+      // commands recorded, so this bug-injects.
+      expect(result.status).not.toBe("applied");
+      expect(seen).toHaveLength(0);
+    } finally {
+      await chmod(parent, 0o700);
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("still takes the unit-rig UNLOCKED path when the fortress is genuinely absent (ENOENT); does not over-tighten", async () => {
+    // A synthetic, non-existent fortress: mkdir(grants) fails and stat(fortress)
+    // -> ENOENT (provably absent) -> the intended unit-rig unlocked fallback
+    // still runs the operation (commands recorded), so the rigs are not broken.
+    const seen: FileGrantExecCommand[] = [];
+    const fsOps = new PosixFileGrantFsOps("/fortress-does-not-exist-xyz", {
+      platform: "linux",
+      execRunner: {
+        execFile: async (command) => {
+          seen.push(command);
+          return { stdout: "", stderr: "" };
+        },
+      },
+    });
+
+    const result = await fsOps.grantAgentRead("agent-1/fg_x", 502, pinnedSource());
+
+    expect(result.status).toBe("applied");
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen[0]).toEqual({
+      file: "setfacl",
+      args: ["-m", "u:502:--x", "/fortress-does-not-exist-xyz"],
+    });
   });
 
   it("macOS: keeps the fortress-dir traverse ACE while the agent has another active grant, and removes it once drained (F1 fix)", async () => {
