@@ -32,7 +32,7 @@ import type {
   ShortfallReport,
 } from "./types.js";
 import type { QuarterWindow } from "./types.js";
-import { emptyInventorySnapshot } from "./inventory.js";
+import { notCollectedInventorySnapshot } from "./inventory.js";
 import {
   claimFromCompleteRead,
   foldOutcome,
@@ -467,25 +467,37 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
   // reporting quarter, a reader would otherwise infer the count is
   // quarter-scoped, so disclose the count's basis in the legend.
   //
-  // F2 (round-2 sweep 2026-07-14): the count's true basis is the CURRENT
-  // candidate record, not "since observation began": `observe discard` and
-  // promote delete the candidate row, and a later denial of the same
-  // destination recreates it with times_seen: 1 (fold.ts). The legend must
-  // state the reset semantics or it asserts a basis that is false (in the
-  // understating direction) after a discard-then-re-observe.
+  // F2 (round-2 sweep 2026-07-14; basis verified against the ENGINE after the
+  // round-3 R3-1 fix): the count's true basis is the CURRENT candidate
+  // record, not "since observation began". The observe refresh chokepoint
+  // (castle-wall/observe/refresh.ts, the R3-1 fold-watermark engine this
+  // stack rebases on) folds each recorded denial into the store EXACTLY
+  // once, `observe discard`/promote delete the candidate row, and only a
+  // genuinely NEW denial re-mints it -- restarting its count at 1. The
+  // legend states those reset semantics; the round-3 sweep proved the
+  // PRE-watermark engine did not honor them (it re-folded retained history
+  // additively, inflating counts and resurrecting rows), which is why the
+  // engine was fixed rather than this wording softened a third time.
   //
-  // F1 (round-2 sweep 2026-07-14): the observe engine folds ONLY denied flows
-  // into candidates (castle-wall/observe/fold.ts, enforce-preserving posture
+  // F1 (round-2 sweep 2026-07-14; basis verified against the ENGINE after the
+  // round-3 R3-1 fix): the observe engine folds ONLY denied flows into
+  // candidates (castle-wall/observe/fold.ts, enforce-preserving posture
   // D-Q1), so every row here is a destination the wall BLOCKED, and allowed
-  // egress is structurally absent. Without that disclosure the table is
-  // misreadable in BOTH directions: "Seen 812" reads as 812 contacts (it is
-  // 812 denied attempts), and the table reads as the machines' egress census
-  // (permitted egress is invisible). Disclose the row basis in the legend.
+  // egress is structurally absent. The "permitted destinations do NOT appear"
+  // sentence is honored by the same R3-1 engine: the refresh suppresses a
+  // candidate whose destination the verified policy already permits and
+  // prunes pending candidates a later policy change permits, so a PROMOTED
+  // destination no longer re-enters this table from retained history. The
+  // legend grounds the claim in that refresh ("as of its most recent
+  // refresh") rather than asserting an unconditional absolute.
   const out = [
     "Legend - Row basis: this table records BLOCKED flow observations only. " +
       "Each row is a destination the wall DENIED; the Seen count is a count " +
       "of those denied attempts. Destinations permitted by the operator's " +
-      "policy do NOT appear here - allowed egress is not inventoried by this " +
+      "policy do NOT appear here: as of its most recent refresh, the observe " +
+      "engine records no candidate for a destination the verified policy " +
+      "already permits and clears any pending candidate a later policy " +
+      "change permits; allowed egress is not inventoried by this " +
       "table or this version of the pack, so this table is not a census of " +
       "where the machines' traffic actually went.",
     "",
@@ -700,7 +712,11 @@ function renderAccessLog(
   });
   const window = foldOutcome(shortfall, {
     populated: (s) => [
-      `Covered window attested for this quarter: ${s.covered_from} to ${s.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter.`,
+      // R3-2: the covered window is derived from what the retained log SPANS.
+      // Without the second clause, a quarter where Sanctuary was simply not
+      // running (retained entries on both sides, zero decisions in between)
+      // reads as "fully covered, zero denials, everything enforced".
+      `Covered window attested for this quarter: ${s.covered_from} to ${s.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter; it reflects what the retained audit log spans and does not by itself prove the enforcement stack was running and recording at every moment within it.`,
       "",
       ...(s.shortfall ? ["> COVERAGE NOTICE: " + s.explanation, ""] : []),
     ],
@@ -989,6 +1005,13 @@ function renderScopeAndLimits(): PackSection {
       "(end-side / partial-quarter shortfall). This report detects and " +
       "discloses both above and states the real covered-through instant, " +
       "never assuming coverage to the quarter end.",
+    "- **A covered window proves retention span, not recording liveness.** " +
+      "The covered window states what the retained audit log spans. It does " +
+      "not prove the enforcement stack was running and recording at every " +
+      "moment inside that span: if Sanctuary was off for part of the window, " +
+      "AI use during that time was unmanaged and invisible to this report, " +
+      "and zero recorded decisions in a period does not mean zero AI " +
+      "activity in it.",
     "- **Human vs automated decisions are separated by the gate's `decided_by` " +
       "field.** Human control-point approvals AND denials (an operator decided, " +
       "via the inbox or the interactive channel) are counted in the human rows; " +
@@ -1038,7 +1061,10 @@ export function renderSections(params: {
   inventory?: InventorySnapshot;
   discreteExports: DiscreteExportsView;
 }): PackSection[] {
-  const inv = params.inventory ?? emptyInventorySnapshot();
+  // R3-5: an inventory nobody collected is a FAILED read per source, never a
+  // verified empty -- a definitive "No wrapped AI harnesses are recorded ..."
+  // census line may only come from a read that actually completed.
+  const inv = params.inventory ?? notCollectedInventorySnapshot();
   return [
     renderCover(
       params.input,

@@ -92,6 +92,46 @@ describe("deriveAuditReadOutcome", () => {
     }
   });
 
+  it("R3-3: earliest_retained_at is the timestamp MINIMUM, not the positionally-first entry (backward clock skew)", () => {
+    // Append order puts the LATER-appended entry with an EARLIER timestamp
+    // (backward clock skew). Positional entries[0] would report 00:10 and let
+    // the never-pruned reassurance arm assert "no recorded activity before
+    // 00:10" while a retained entry is timestamped 00:05.
+    const entries = [
+      entry("2026-07-02T00:10:00.000Z"),
+      entry("2026-07-02T00:05:00.000Z"),
+      entry("2026-07-02T00:20:00.000Z"),
+    ];
+    const outcome = deriveAuditReadOutcome({
+      entries,
+      windowedTotal: 3,
+      retentionConfig: RETENTION_CONFIG,
+      usage: { entryCount: 3, totalSizeBytes: 3072, everPruned: false },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status === "populated") {
+      expect(outcome.value.retention.earliest_retained_at).toBe(
+        "2026-07-02T00:05:00.000Z"
+      );
+    }
+  });
+
+  it("R3-3: an unparseable timestamp is skipped by the min-scan; a non-empty read still yields a non-null earliest", () => {
+    const entries = [entry("not-a-timestamp"), entry("2026-07-02T00:05:00.000Z")];
+    const outcome = deriveAuditReadOutcome({
+      entries,
+      windowedTotal: 2,
+      retentionConfig: RETENTION_CONFIG,
+      usage: { entryCount: 2, totalSizeBytes: 2048, everPruned: false },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status === "populated") {
+      expect(outcome.value.retention.earliest_retained_at).toBe(
+        "2026-07-02T00:05:00.000Z"
+      );
+    }
+  });
+
   it("a genuinely empty store derives a populated zero, not a failure (empty is not truncated)", () => {
     const outcome = deriveAuditReadOutcome({
       entries: [],

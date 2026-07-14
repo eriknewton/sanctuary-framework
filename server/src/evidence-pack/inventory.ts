@@ -63,7 +63,11 @@ export interface ProxyServerView {
  * The read outcome for one source: whether the store was read successfully,
  * the raw records read (empty when genuinely none OR unread), and a reason on
  * failure. Undefined for a source means "not collected" and is treated as a
- * successful empty read (see {@link buildInventorySnapshot}).
+ * FAILED read (R3-5, round-3 sweep 2026-07-14): an `EmptyVerified` witness
+ * asserts "read to completion, zero records", and a source nobody read can
+ * never mint that witness -- otherwise a caller omitting a source would
+ * render the definitive "No wrapped AI harnesses are recorded ..." census
+ * line from nothing (see {@link buildInventorySnapshot}).
  */
 export interface InventorySourceRead<T> {
   ok: boolean;
@@ -128,8 +132,9 @@ function destinationRow(
  * with the reason (NEVER a partial list presented as complete); a successful
  * empty read yields `empty_verified` (the only state from which the renderer
  * may assert a definitive "none"); a non-empty read yields `populated` with
- * sorted rows. An undefined (not-collected) source is treated as a successful
- * empty read.
+ * sorted rows. An undefined (not-collected) source is a FAILED read: only an
+ * actual completed read may mint the `EmptyVerified` witness the renderer
+ * turns into a definitive "none recorded" census line (R3-5).
  */
 function toOutcome<TRaw, TRow>(
   read: InventorySourceRead<TRaw> | undefined,
@@ -137,7 +142,7 @@ function toOutcome<TRaw, TRow>(
   sort: (a: TRow, b: TRow) => number
 ): ReadOutcome<TRow[]> {
   if (read === undefined) {
-    return emptyVerified();
+    return readFailed(NOT_COLLECTED_REASON);
   }
   if (!read.ok) {
     return readFailed(read.reason ?? "the source could not be read.");
@@ -174,11 +179,38 @@ export function buildInventorySnapshot(
   };
 }
 
-/** An all-sources verified-empty snapshot (for callers that pass no inventory). */
+/** The honest reason rendered for an inventory source this pack run never read (R3-5). */
+export const NOT_COLLECTED_REASON =
+  "this inventory source was not collected by this pack run, so no census claim is made for it.";
+
+/**
+ * An all-sources VERIFIED-EMPTY snapshot. `EmptyVerified` is a witness that a
+ * read COMPLETED and found zero records, so this constructor is only for
+ * callers (and test fixtures) that genuinely mean "every source was read and
+ * each was empty" -- it must never be a default for an inventory nobody
+ * collected. For that case use {@link notCollectedInventorySnapshot}, which
+ * renders hedged could-not-be-determined language instead of a definitive
+ * "none recorded" census (R3-5, round-3 sweep 2026-07-14).
+ */
 export function emptyInventorySnapshot(): InventorySnapshot {
   return {
     agents: emptyVerified(),
     mcp_servers: emptyVerified(),
     observed_destinations: emptyVerified(),
+  };
+}
+
+/**
+ * The snapshot for a pack built WITHOUT collecting the inventory: every
+ * source is a failed (not-collected) read, so the renderer prints "could not
+ * be fully determined ... NOT a count of zero" language and never a
+ * definitive census line minted from nothing (R3-5). This is the fallback
+ * `renderSections` uses when no inventory is supplied.
+ */
+export function notCollectedInventorySnapshot(): InventorySnapshot {
+  return {
+    agents: readFailed(NOT_COLLECTED_REASON),
+    mcp_servers: readFailed(NOT_COLLECTED_REASON),
+    observed_destinations: readFailed(NOT_COLLECTED_REASON),
   };
 }
