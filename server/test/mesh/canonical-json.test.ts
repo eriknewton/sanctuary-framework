@@ -88,3 +88,99 @@ describe("canonicalize: basic shape (smoke)", () => {
     );
   });
 });
+
+/**
+ * Cross-language edge-class vectors (#915 adversarial review follow-up,
+ * LOW finding). Each `it` here has a Swift-side counterpart in
+ * castle-wall-macos/Tests/CastleWallExtensionTests/ManifestParityVectorTests.swift
+ * asserting the SAME expected bytes (parity) or the language-specific
+ * divergent behavior (documented, not silently papered over).
+ */
+describe("canonicalize: cross-language edge classes (castle-wall #915 follow-up)", () => {
+  it("keeps canonically-equivalent but raw-distinct object keys as separate entries, sorted by UTF-16 code unit", () => {
+    // "é" (precomposed e-acute) and "é" (decomposed e + combining
+    // acute) are the SAME string under Unicode canonical equivalence (NFC)
+    // but are DIFFERENT raw UTF-16 code-unit sequences. canonicalize() must
+    // NOT normalize -- it sorts/serializes the raw code units, matching
+    // RFC 8785 and Array.prototype.sort's default string comparator.
+    //
+    // Swift's counterpart (testCanonicalKeyOrderCollapsesCanonicallyEquivalentKeysOnDecode)
+    // documents a DIFFERENT, real divergence here: Swift's String equality
+    // is canonical-equivalence-aware, so decoding this same raw JSON text
+    // into a Swift `[String: JSONValue]` dictionary SILENTLY COLLAPSES the
+    // two keys into one entry (last-write-wins) before canonicalization
+    // ever runs. That collapse happens only for genuinely dynamic
+    // `[String: JSONValue]` maps (e.g. IPC-delivered `receivedRules`
+    // content); every current signed field in AllowlistManifest /
+    // ManifestRuleEntry / AgentOrigin / OperatorBaseline is a fixed-key
+    // Codable struct, not a dynamic map, so this class is contained today
+    // by the existing per-rule digest / manifest-signature checks (a
+    // mismatched byte count from a dropped key fails verification --
+    // fail-closed). Flagged to the coordinator as a structural landmine for
+    // any FUTURE dynamic-map field; not fixed here (test-only build).
+    const precomposed = "é"; // é
+    const decomposed = "é"; // e + combining acute (U+0301)
+    const value: Record<string, number> = { m: 1 };
+    value[precomposed] = 2;
+    value[decomposed] = 3;
+
+    expect(Object.keys(value)).toHaveLength(3);
+    const canonical = canonicalize(value);
+    expect(canonical).toBe('{"é":3,"m":1,"é":2}');
+    expect(Buffer.from(canonical, "utf8").toString("hex")).toBe(
+      "7b2265cc81223a332c226d223a312c22c3a9223a327d",
+    );
+  });
+
+  it("agrees with Swift at the Number.MAX_SAFE_INTEGER boundary (both exact)", () => {
+    // 2^53-1 is the largest integer a JS `number` (float64) represents
+    // exactly, and Swift's JSONValue.integer(Int64) case represents it
+    // exactly too (decoded from a bare JSON integer literal, no decimal
+    // point, so Swift's Codable-generated JSONValue picks the `.integer`
+    // branch, not `.number(Double)`). Both sides emit the same digit string.
+    expect(canonicalize(Number.MAX_SAFE_INTEGER)).toBe("9007199254740991");
+    expect(Number.MAX_SAFE_INTEGER).toBe(9007199254740991);
+  });
+
+  // TODO(security-finding, #915 follow-up -- reported to coordinator, not
+  // fixed here, test-only build): canonicalize()'s number branch operates on
+  // the JS `number` (float64) primitive, which cannot exactly represent
+  // integers beyond Number.MAX_SAFE_INTEGER (2^53-1). Swift's
+  // JSONValue.integer(Int64) case (see
+  // testCanonicalNumberBoundsAtSafeIntegerAndInt64Max in the Swift suite)
+  // preserves full 64-bit precision for a bare JSON integer literal. A
+  // value like Int64.max (9223372036854775807) silently round-trips through
+  // Node's JSON.parse -> canonicalize() -> JSON.stringify as
+  // "9223372036854776000" -- a byte-level divergence from Swift's exact
+  // "9223372036854775807", with NO exception thrown on either side. This is
+  // NOT fail-closed: a hypothetical future manifest field carrying a true
+  // u64-scale value would be silently corrupted by the Node signer rather
+  // than rejected. No field in today's signed-manifest schema carries
+  // values in this range (uids/ports/schema_version are all small), so this
+  // is a structural landmine, not a live exploit. Skipped (not asserted as
+  // "working") per the #915 follow-up instruction: a real, non-fail-closed
+  // divergence gets flagged, not papered over with a passing test.
+  it.skip("KNOWN GAP: u64-scale integers silently lose precision on the Node side (not fail-closed)", () => {
+    const raw = "9223372036854775807"; // Int64.max; Swift preserves this exactly
+    const parsed = JSON.parse(`{"n":${raw}}`) as { n: number };
+    const canonical = canonicalize(parsed);
+    // Documents the actual (buggy) behavior once un-skipped: Node silently
+    // mangles the digit string instead of throwing or preserving it.
+    expect(canonical).toBe('{"n":9223372036854776000}');
+    expect(canonical).not.toBe(`{"n":${raw}}`);
+  });
+
+  it("matches Swift on deeply nested (but bounded) array recursion", () => {
+    // Both canonicalizers recurse one call frame per nesting level (TS via
+    // encode(), Swift via appendCanonicalJSON()). 300 levels is far beyond
+    // any real manifest shape but well within both languages' default call
+    // stacks -- this is a "does it blow up or diverge" vector, not a
+    // performance test.
+    const depth = 300;
+    let value: unknown = 42;
+    for (let i = 0; i < depth; i++) value = [value];
+    const canonical = canonicalize(value);
+    const expected = "[".repeat(depth) + "42" + "]".repeat(depth);
+    expect(canonical).toBe(expected);
+  });
+});
