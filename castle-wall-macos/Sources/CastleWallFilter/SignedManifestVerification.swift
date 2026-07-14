@@ -28,6 +28,11 @@ public enum SignedManifestVerificationError: Error, Equatable {
     case missingDeliveredRule(String)
     case unexpectedDeliveredRule(String)
     case ruleDigestMismatch(ruleId: String, expected: String, actual: String)
+    /// S5-0 defense-in-depth (2026-07-14): a signed `agent_origin` descriptor
+    /// whose floor invariants do not hold. The signature proves AUTHENTICITY,
+    /// not producer VALIDITY, so the enforcement side re-checks and rejects the
+    /// WHOLE snapshot (keeping prior policy) rather than trusting the producer.
+    case invalidAgentOrigin(String)
 }
 
 public enum SignedManifestVerifier {
@@ -85,8 +90,20 @@ public enum SignedManifestVerifier {
             receivedRules: body.receivedRules
         )
         // `manifest.agentOrigin` is part of the canonical bytes just verified
-        // against the pinned key, so it is trusted iff the signature passed.
-        // An unsigned / replayed envelope can never inject it.
+        // against the pinned key, so it is trusted for AUTHENTICITY iff the
+        // signature passed. But S5-0 (2026-07-14) defense-in-depth: a valid
+        // signature does NOT prove the producer's floor invariants hold, and
+        // AGENTS.md invariant 4/5 forbids trusting across the TS->Swift
+        // boundary or silently degrading. Re-validate the descriptor's floors
+        // HERE, at the enforcement point, and throw (rejecting the WHOLE
+        // snapshot, so both `applyManifestUpdated` and `recoverPersistedManifest`
+        // keep the prior good snapshot + classifier) on any impossible security
+        // state -- e.g. `gate_uid == agent_uid` (which would collapse the two
+        // confined principals back into one at `AllowlistEvaluator.scopeMatches`),
+        // root/below-ceiling uids, or a NAT descriptor carrying `gate_uid`.
+        if let origin = manifest.agentOrigin {
+            try validateAgentOriginFloors(origin)
+        }
         return ManifestSnapshot(
             signatureB64url: signature.signatureB64url,
             rules: body.rules,
@@ -94,6 +111,65 @@ public enum SignedManifestVerifier {
             agentOrigin: manifest.agentOrigin,
             operatorBaseline: manifest.operatorBaseline
         )
+    }
+
+    /// Enforcement-boundary re-validation of a signed `AgentOriginWire`,
+    /// mirroring the TS producer's `validateAgentOrigin`
+    /// (`server/src/castle-wall/allowlist/agent-origin.ts`) floor invariants so
+    /// the macOS consumer independently rejects impossible security state
+    /// rather than trusting that the producer enforced them before signing.
+    /// Throws `invalidAgentOrigin` (caller rejects the whole snapshot) on any
+    /// violation. A `nil` descriptor is not passed here (absent is valid).
+    static func validateAgentOriginFloors(_ wire: AgentOriginWire) throws {
+        switch wire.mode {
+        case .uid:
+            // UID mode requires the dedicated agent account uid; without it the
+            // classifier would resolve every non-system flow as operator.
+            guard let agentUid = wire.agentUid else {
+                throw SignedManifestVerificationError.invalidAgentOrigin(
+                    "uid mode requires agent_uid"
+                )
+            }
+            // Floor: a real, above-the-system-band account. `agent_uid == 0`
+            // (root) or below the system-daemon ceiling is nonsensical/dangerous.
+            if agentUid < 1 || agentUid < wire.systemUidAllowCeiling {
+                throw SignedManifestVerificationError.invalidAgentOrigin(
+                    "agent_uid \(agentUid) below floor (must be >= 1 and >= system_uid_allow_ceiling \(wire.systemUidAllowCeiling))"
+                )
+            }
+            // S5-0: the SECOND confined principal must satisfy the SAME floors
+            // AND be distinct from the agent. A colliding gate_uid would let a
+            // gate-scoped `uids` rule match the agent's own flows, collapsing
+            // the two principals into one at enforcement.
+            if let gateUid = wire.gateUid {
+                if gateUid < 1 || gateUid < wire.systemUidAllowCeiling {
+                    throw SignedManifestVerificationError.invalidAgentOrigin(
+                        "gate_uid \(gateUid) below floor (must be >= 1 and >= system_uid_allow_ceiling \(wire.systemUidAllowCeiling))"
+                    )
+                }
+                if gateUid == agentUid {
+                    throw SignedManifestVerificationError.invalidAgentOrigin(
+                        "gate_uid \(gateUid) collides with agent_uid; the two confined principals must be distinct"
+                    )
+                }
+            }
+        case .nat:
+            // `gate_uid` is a UID-mode-only concept. A NAT descriptor carrying
+            // it is malformed: REJECT the whole snapshot (never silently drop
+            // the field, which would be a silent-degrade contract violation).
+            if wire.gateUid != nil {
+                throw SignedManifestVerificationError.invalidAgentOrigin(
+                    "gate_uid is not valid in nat mode (uid-mode-only concept)"
+                )
+            }
+            // NAT mode needs at least one egress-helper identity axis, else an
+            // egress-helper match can never be expressed.
+            guard wire.egressHelperSigningId != nil || wire.egressHelperTeamId != nil else {
+                throw SignedManifestVerificationError.invalidAgentOrigin(
+                    "nat mode requires at least one egress-helper identity"
+                )
+            }
+        }
     }
 
     // Canonicalization parity (2026-07-12 Mini1 egress drill fix).

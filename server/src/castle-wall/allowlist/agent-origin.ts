@@ -23,9 +23,25 @@ import type { AgentOrigin, AgentOriginMode } from "./manifest.js";
 
 const VALID_MODES: ReadonlySet<string> = new Set<AgentOriginMode>(["nat", "uid"]);
 
-/** True when `n` is a non-negative integer (uids, ports, ceilings). */
+/**
+ * Upper bound for every uid-family field (`agent_uid`, `gate_uid`,
+ * `system_uid_allow_ceiling`). The macOS sysext decodes all three as
+ * `UInt32` (`AgentOriginWire` in castle-wall-macos), so a value above
+ * `UInt32.max` passes JS validation and canonical signing but then FAILS the
+ * Swift decode -- a signed manifest the consumer cannot apply. Capping here
+ * (LOW-1, 2026-07-14) rejects the impossible value at publish, not just at
+ * the cross-language decode boundary.
+ */
+const UINT32_MAX = 0xffffffff;
+
+/** True when `n` is a non-negative integer (ports, ranges). */
 function isNonNegativeInt(n: unknown): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= 0;
+}
+
+/** True when `n` is a non-negative integer within the `UInt32` wire range. */
+function isUint32Int(n: unknown): n is number {
+  return isNonNegativeInt(n) && n <= UINT32_MAX;
 }
 
 /** True when `s` is a non-empty string. */
@@ -51,8 +67,9 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
   }
   const mode = c.mode as AgentOriginMode;
 
-  // `system_uid_allow_ceiling` is required in both modes.
-  if (!isNonNegativeInt(c.system_uid_allow_ceiling)) {
+  // `system_uid_allow_ceiling` is required in both modes. It decodes as a
+  // `UInt32` on the sysext, so it is capped at `UInt32.max` too (LOW-1).
+  if (!isUint32Int(c.system_uid_allow_ceiling)) {
     return null;
   }
   const systemUidAllowCeiling = c.system_uid_allow_ceiling;
@@ -60,7 +77,9 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
   if (mode === "uid") {
     // UID mode requires the dedicated agent account uid. Without it, the
     // sysext would classify every non-system flow as operator (fail-open).
-    if (!isNonNegativeInt(c.agent_uid)) {
+    // Capped at `UInt32.max` (LOW-1): a larger value passes canonical signing
+    // but fails the sysext's `UInt32` decode -- an unappliable signed manifest.
+    if (!isUint32Int(c.agent_uid)) {
       return null;
     }
     // Floor invariant (fail-closed semantic reject): the confined agent uid must
@@ -89,7 +108,9 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
     // allow-all fast-path: exactly the fail-open this field exists to close.
     const agentUid = c.agent_uid;
     if (c.gate_uid !== undefined) {
-      if (!isNonNegativeInt(c.gate_uid)) {
+      // Same `UInt32` cap as `agent_uid` (LOW-1): reject an out-of-wire-range
+      // gate uid at publish, not just at the sysext decode boundary.
+      if (!isUint32Int(c.gate_uid)) {
         return null;
       }
       if (

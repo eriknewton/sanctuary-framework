@@ -316,4 +316,54 @@ describe("castle-wall/allowlist/agent-origin : validateAgentOrigin", () => {
       })
     ).toBeNull();
   });
+
+  // --- LOW-1 (2026-07-14): uid-family fields capped at UInt32.max (wire type) ---
+
+  const UINT32_MAX = 0xffffffff;
+
+  it("accepts agent_uid + gate_uid at exactly UInt32.max (boundary)", () => {
+    const out = validateAgentOrigin({
+      mode: "uid",
+      agent_uid: UINT32_MAX,
+      gate_uid: UINT32_MAX - 1,
+      system_uid_allow_ceiling: 500,
+    });
+    expect(out).toEqual({
+      mode: "uid",
+      agent_uid: UINT32_MAX,
+      gate_uid: UINT32_MAX - 1,
+      system_uid_allow_ceiling: 500,
+    });
+  });
+
+  it("rejects agent_uid above UInt32.max (would fail the sysext UInt32 decode)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: UINT32_MAX + 1,
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects gate_uid above UInt32.max", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        gate_uid: 9007199254740991, // Number.MAX_SAFE_INTEGER, far above UInt32.max
+        system_uid_allow_ceiling: 500,
+      })
+    ).toBeNull();
+  });
+
+  it("rejects system_uid_allow_ceiling above UInt32.max (also decodes as UInt32)", () => {
+    expect(
+      validateAgentOrigin({
+        mode: "uid",
+        agent_uid: 600,
+        system_uid_allow_ceiling: UINT32_MAX + 1,
+      })
+    ).toBeNull();
+  });
 });

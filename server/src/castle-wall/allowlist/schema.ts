@@ -111,9 +111,20 @@ function isValidPortNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
 }
 
-/** True when `value` is a positive integer uid (0/root is never a valid scope member). */
+/**
+ * True when `value` is a positive integer uid within the `UInt32` wire range.
+ * 0/root is never a valid scope member, and the sysext decodes `scope.uids`
+ * as `[UInt32]` (castle-wall-macos `ManifestRuleScope`), so a value above
+ * `UInt32.max` (LOW-1, 2026-07-14) passes canonical signing but fails Swift
+ * decode -- an unappliable signed manifest. Cap it here at publish.
+ */
 function isPositiveUid(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 1;
+  return (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value >= 1 &&
+    value <= 0xffffffff
+  );
 }
 
 /**

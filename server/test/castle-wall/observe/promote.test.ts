@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { promoteCandidates } from "../../../src/castle-wall/observe/promote.js";
+import { promoteCandidates, describeEffectiveRule } from "../../../src/castle-wall/observe/promote.js";
 import type { VerifiedManifestRead } from "../../../src/castle-wall/observe/promote.js";
 import { candidateKey, type CandidateObservation } from "../../../src/castle-wall/observe/types.js";
 import { validateRule } from "../../../src/castle-wall/allowlist/schema.js";
@@ -390,6 +390,45 @@ describe("promoteCandidates: FIX 3 -- approval context shows the synthesized eff
     if (outcome.status !== "no_candidates") throw new Error("unreachable");
     expect(outcome.dropped).toEqual([{ key: candidateKey(a), reason: "failed_validation" }]);
     expect(approveCalled).toBe(false);
+  });
+});
+
+describe("describeEffectiveRule: renders every scope axis (S5-0 MEDIUM-1)", () => {
+  const match = { host: ["gate-endpoint.example.com"], port: [443], protocol: "tcp" as const };
+
+  it("renders a uids-only scope as uid:..., NOT all-agents", () => {
+    // Before the fix this read `scope=all-agents`, understating breadth to
+    // the Tier-1 human approver (an approval-integrity fail-open).
+    const desc = describeEffectiveRule(match, { uids: [601] });
+    expect(desc).toContain("scope=uid:601");
+    expect(desc).not.toContain("all-agents");
+  });
+
+  it("renders a mixed agent_ids + uids scope showing BOTH axes (OR-composed)", () => {
+    const desc = describeEffectiveRule(match, { agent_ids: ["a"], uids: [601] });
+    expect(desc).toContain("agent:a");
+    expect(desc).toContain("uid:601");
+    // Both axes present, joined by OR -- neither hidden.
+    expect(desc).toContain("scope=agent:a OR uid:601");
+  });
+
+  it("renders all three axes when present", () => {
+    const desc = describeEffectiveRule(match, {
+      agent_ids: ["a"],
+      template_ids: ["t"],
+      uids: [601, 602],
+    });
+    expect(desc).toContain("scope=agent:a OR template:t OR uid:601,602");
+  });
+
+  it("still renders all-agents when no axis is present", () => {
+    const desc = describeEffectiveRule(match, {});
+    expect(desc).toContain("scope=all-agents");
+  });
+
+  it("empty uids array is not a scope (falls back to all-agents)", () => {
+    const desc = describeEffectiveRule(match, { uids: [] });
+    expect(desc).toContain("scope=all-agents");
   });
 });
 

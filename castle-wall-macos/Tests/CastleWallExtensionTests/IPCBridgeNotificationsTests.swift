@@ -504,6 +504,173 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         XCTAssertNil(engine.agentOrigin, "rejected envelope must not install agent_origin")
     }
 
+    // MARK: - S5-0 HIGH-1: malformed gate_uid fails manifest application,
+    // keeps prior policy (defense-in-depth at the enforcement boundary).
+    //
+    // A VALID signature proves the body is AUTHENTIC, not that the producer's
+    // floor invariants hold. Each case below signs a well-formed envelope
+    // (real signature, correct pinned key) whose `agent_origin` carries an
+    // IMPOSSIBLE security state. The enforcement side must reject the WHOLE
+    // snapshot and leave the prior good snapshot + classifier untouched.
+
+    /// A gate-uid-scoped allow rule for `host` (S5-0 `scope.uids` axis).
+    private func gateScopedRule(uid: UInt32, host: String) -> ManifestRule {
+        return ManifestRule(
+            id: "gate-scoped",
+            schemaVersion: 1,
+            createdAt: "2026-07-14T00:00:00Z",
+            description: nil,
+            match: ManifestRuleMatch(
+                host: .single(host),
+                hostPattern: nil,
+                port: .single(443),
+                protocolName: "tcp"
+            ),
+            scope: ManifestRuleScope(agentIds: nil, templateIds: nil, uids: [uid]),
+            disposition: "allow",
+            timeWindow: nil
+        )
+    }
+
+    /// Establish a prior GOOD policy (valid uid origin + a benign rule) on a
+    /// fresh engine, so a subsequent malformed manifest's rejection can be
+    /// proven to leave this intact.
+    private func seedGoodUidPolicy() throws -> FlowEvaluatorEngine {
+        let engine = FlowEvaluatorEngine()
+        let goodWire = AgentOriginWire(mode: .uid, agentUid: 600, systemUidAllowCeiling: 500)
+        let good = try makeSignedManifestUpdatedBody(
+            rules: [sampleAllowRule()],
+            agentOrigin: goodWire
+        )
+        XCTAssertNotNil(
+            IPCBridgeNotifications.applyManifestUpdated(
+                message: .manifestUpdated(good.body),
+                store: engine.manifestStore,
+                cache: engine.flowCache,
+                pinnedPublicKey: good.publicKey,
+                engine: engine
+            )
+        )
+        XCTAssertEqual(engine.agentOrigin?.agentUid, 600)
+        XCTAssertNil(engine.agentOrigin?.gateUid)
+        XCTAssertEqual(engine.manifestStore.currentRules().map { $0.id }, ["r-origin"])
+        return engine
+    }
+
+    /// Apply a validly-signed but malformed-`agent_origin` manifest and assert
+    /// it is rejected whole and the prior good policy survives unchanged.
+    private func assertMalformedOriginRejectedKeepingPrior(
+        badWire: AgentOriginWire,
+        badRules: [ManifestRule],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let engine = try seedGoodUidPolicy()
+        let bad = try makeSignedManifestUpdatedBody(rules: badRules, agentOrigin: badWire)
+        let rejected = IPCBridgeNotifications.applyManifestUpdated(
+            message: .manifestUpdated(bad.body),
+            store: engine.manifestStore,
+            cache: engine.flowCache,
+            pinnedPublicKey: bad.publicKey,
+            engine: engine
+        )
+        XCTAssertNil(rejected, "malformed agent_origin must reject the whole snapshot", file: file, line: line)
+        // Prior classifier intact: still the good agent uid, still no gate uid.
+        XCTAssertEqual(engine.agentOrigin?.agentUid, 600, file: file, line: line)
+        XCTAssertNil(engine.agentOrigin?.gateUid, file: file, line: line)
+        // Prior rules intact: the malformed manifest's rules never went live.
+        XCTAssertEqual(engine.manifestStore.currentRules().map { $0.id }, ["r-origin"], file: file, line: line)
+    }
+
+    func testMalformedGateUid_collisionWithAgentUid_rejectsAndKeepsPrior() throws {
+        // The exact Codex exploit: gate_uid == agent_uid (600) plus a rule
+        // scoped uids=[600]. If accepted, the agent uid would use a rule meant
+        // for the distinct gate uid -- the two principals collapse into one.
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 600, systemUidAllowCeiling: 500),
+            badRules: [gateScopedRule(uid: 600, host: "gate-endpoint.example.com")]
+        )
+    }
+
+    func testMalformedGateUid_root_rejectsAndKeepsPrior() throws {
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 0, systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]
+        )
+    }
+
+    func testMalformedGateUid_belowCeiling_rejectsAndKeepsPrior() throws {
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 100, systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]
+        )
+    }
+
+    func testMalformedAgentUid_belowCeiling_rejectsAndKeepsPrior() throws {
+        // The agent uid floor is re-validated at the boundary too (not just
+        // gate_uid): a sub-ceiling agent uid is impossible security state.
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(mode: .uid, agentUid: 100, systemUidAllowCeiling: 500),
+            badRules: [sampleAllowRule()]
+        )
+    }
+
+    func testNatDescriptorCarryingGateUid_rejectsNotSilentlyDropped() throws {
+        // Never-silently-degrade: TS refuses to sign a NAT descriptor carrying
+        // gate_uid; the enforcement side must REJECT the whole snapshot too,
+        // not silently drop the field (which the wire->descriptor converter
+        // would otherwise do by construction).
+        try assertMalformedOriginRejectedKeepingPrior(
+            badWire: AgentOriginWire(
+                mode: .nat,
+                egressHelperSigningId: "ai.sanctuaryprotocol.egress-helper",
+                gateUid: 601,
+                systemUidAllowCeiling: 500
+            ),
+            badRules: [sampleAllowRule()]
+        )
+    }
+
+    func testMalformedGateUidCollision_exploitFlowNotAllowedPriorPolicyEnforced() throws {
+        // End-to-end proof the exploit does not land: after the collision
+        // manifest is rejected, an agent-uid flow (ruid 600) to the gate
+        // endpoint is NOT allowed -- the prior policy (which has no rule for
+        // that host) default-denies it. The second principal never collapsed
+        // into the first because the malformed manifest never went live.
+        let engine = try seedGoodUidPolicy()
+        let bad = try makeSignedManifestUpdatedBody(
+            rules: [gateScopedRule(uid: 600, host: "gate-endpoint.example.com")],
+            agentOrigin: AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 600, systemUidAllowCeiling: 500)
+        )
+        XCTAssertNil(
+            IPCBridgeNotifications.applyManifestUpdated(
+                message: .manifestUpdated(bad.body),
+                store: engine.manifestStore,
+                cache: engine.flowCache,
+                pinnedPublicKey: bad.publicKey,
+                engine: engine
+            )
+        )
+        let agentFlow = FilterFlowDescriptor(
+            sourceAppIdentifier: "deadbeef",
+            agentId: "deadbeef",
+            templateId: "unknown",
+            destinationHost: "gate-endpoint.example.com",
+            destinationIp: "104.18.32.10",
+            destinationPort: 443,
+            networkProtocol: .tcp,
+            hostnameSource: "sni",
+            opaqueDestination: false,
+            sourceRuid: 600,
+            sourcePid: 4242,
+            sourcePidVersion: 1,
+            sourceSigningId: nil,
+            sourceTeamId: nil,
+            sourceUnattributed: false
+        )
+        XCTAssertEqual(engine.evaluate(agentFlow), .drop(matchedRuleId: nil))
+    }
+
     // MARK: - PR-905-review BLOCKER: install ordering closes the boot window
 
     func testApplyManifestUpdated_installsOriginBEFORE_rulesGoLive() throws {
@@ -587,9 +754,16 @@ final class IPCBridgeNotificationsTests: XCTestCase {
         XCTAssertEqual(originAtRulesLive??.agentUid, 600)
     }
 
-    func testUnusableAgentOriginIsIgnoredFailClosed() throws {
-        // A signed-but-structurally-unusable UID descriptor (no agent_uid)
-        // must NOT install; the engine stays classify-all-agent.
+    func testUnusableAgentOriginRejectsWholeSnapshotFailClosed() throws {
+        // A signed-but-structurally-unusable UID descriptor (no agent_uid).
+        //
+        // HARDENED (S5-0 HIGH-1, 2026-07-14): the OLD behavior tolerated this
+        // -- it applied the snapshot (rules went live) while merely skipping
+        // the descriptor install. But malformed descriptor + live rules is NOT
+        // a closed state (a signed body proves authenticity, not producer
+        // validity). The enforcement boundary now REJECTS THE WHOLE SNAPSHOT
+        // and keeps prior policy: the engine stays classify-all-agent and NO
+        // rules go live.
         let badWire = AgentOriginWire(mode: .uid, agentUid: nil, systemUidAllowCeiling: 500)
         let signed = try makeSignedManifestUpdatedBody(
             rules: [sampleAllowRule()],
@@ -603,8 +777,28 @@ final class IPCBridgeNotificationsTests: XCTestCase {
             pinnedPublicKey: signed.publicKey,
             engine: engine
         )
-        XCTAssertNotNil(snapshot)
-        XCTAssertEqual(snapshot?.agentOrigin, badWire)
+        XCTAssertNil(snapshot, "unusable descriptor must reject the whole snapshot")
         XCTAssertNil(engine.agentOrigin, "unusable descriptor must not install")
+        XCTAssertTrue(engine.manifestStore.currentRules().isEmpty, "no rules go live on a rejected manifest")
+    }
+
+    func testVerifiedSnapshotThrowsTypedErrorOnGateUidCollision() throws {
+        // Pin the typed error at the verifier chokepoint (both apply and
+        // recover paths funnel through it and keep prior policy on throw).
+        let badWire = AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 600, systemUidAllowCeiling: 500)
+        let signed = try makeSignedManifestUpdatedBody(
+            rules: [sampleAllowRule()],
+            agentOrigin: badWire
+        )
+        XCTAssertThrowsError(
+            try SignedManifestVerifier.verifiedSnapshot(
+                from: signed.body,
+                pinnedPublicKey: signed.publicKey
+            )
+        ) { error in
+            guard case SignedManifestVerificationError.invalidAgentOrigin = error else {
+                return XCTFail("expected .invalidAgentOrigin, got \(error)")
+            }
+        }
     }
 }

@@ -229,10 +229,16 @@ describe("castle-wall/allowlist/schema/validateRule", () => {
       { uids: [-1] },
       { uids: [6.5] },
       { uids: ["601"] },
+      { uids: [0x100000000] }, // above UInt32.max: fails the sysext [UInt32] decode (LOW-1)
     ]) {
       const r = { ...validRule(), scope } as unknown as AllowlistRule;
       expect(validateRule(r).length, JSON.stringify(scope)).toBeGreaterThan(0);
     }
+  });
+
+  it("accepts scope.uids at exactly UInt32.max (boundary)", () => {
+    const r = { ...validRule(), scope: { uids: [0xffffffff] } };
+    expect(validateRule(r)).toEqual([]);
   });
 
   it("an empty scope.uids array means 'all' (same convention as agent_ids/template_ids)", () => {
