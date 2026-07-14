@@ -363,7 +363,7 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("not a census of where the machines' traffic actually went");
   });
 
-  it("OPEN-MED-1 (confirmatory): the egress 'Seen' column is disclosed as all-time, not quarter-scoped", () => {
+  it("OPEN-MED-1 + F2: the egress 'Seen' legend states its true basis (candidate-record lifetime, not quarter-scoped)", () => {
     const pack = buildEvidencePack(
       {
         ...baseInput(),
@@ -378,15 +378,20 @@ describe("buildEvidencePack", () => {
       deps([])
     );
     const report = pack.files[0]!.content;
-    // The legend must state the all-time basis adjacent to the table, so a
-    // reader cannot infer the lifetime count is scoped to the reporting quarter.
+    // The legend must state the count's true basis adjacent to the table: the
+    // current candidate record (discard/promote resets the count - F2), and
+    // never quarter-scoped (OPEN-MED-1).
     expect(report).toContain("Legend - Seen:");
+    expect(report).toContain("current candidate record was created");
+    expect(report).toContain("later observed again restarts its count");
     expect(report).toContain(
       "NOT a count scoped to the reporting quarter"
     );
     expect(report).toContain(
       "may not have been seen within the reporting quarter"
     );
+    // The falsifiable-under-reset absolute basis claim is gone.
+    expect(report).not.toContain("since observation began on this install");
   });
 
   it("MED-1 (sample-render): the tool count carries an active/recorded denominator", () => {
