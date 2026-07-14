@@ -83,7 +83,17 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
 
   afterEach(async () => {
     for (const socket of liveSockets.splice(0)) socket.destroy();
-    for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+    for (const dir of tempDirs.splice(0)) {
+      // Bounded retry (CI-load de-flake): several tests below fire DETACHED
+      // audit writes (recordReloadOutcome / emitAuditHeartbeat are
+      // fire-and-forget by design, see macos-daemon.ts) that can still be
+      // landing a file under `dir` after the test function returns. force:true
+      // only swallows ENOENT, not the ENOTEMPTY/EBUSY this recursive rm can hit
+      // if it reads the directory as empty and a write lands before the final
+      // rmdir. Retrying with backoff closes that window without touching any
+      // test assertion.
+      await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
   });
 
   async function provisionFortress() {
@@ -335,6 +345,15 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
     const origAppend = auditLog.append.bind(auditLog);
     const origFlush = auditLog.flush.bind(auditLog);
     const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    // De-flake (teardown race, CI-load-flaky ENOTEMPTY on the fortress temp
+    // dir): a heartbeat that grabs the SLOW append wrapper below can still be
+    // sleeping-then-writing after this test's own waits return, because the
+    // heartbeat interval is DETACHED (`void emitAuditHeartbeat()`, never
+    // awaited by stop()). Track every real write the slow wrapper starts so
+    // the `finally` block can drain them before `handle.stop()` and the
+    // suite's `afterEach` rm run, instead of leaving a real fs write racing
+    // directory cleanup.
+    const pendingSlowAppends: Promise<unknown>[] = [];
     const markerUnits = (entries: { operation: string; details?: Record<string, unknown> }[], op?: string): number =>
       entries
         .filter((e) => op === undefined || e.operation === op)
@@ -363,11 +382,15 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       // double-subtract bug, beats at ~100/200/300ms would EACH snapshot the
       // 1-unit count and each append a marker (sum 3, counter -2). With
       // reservation, exactly one beat carries it.
-      auditLog.append = (async (
-        ...args: Parameters<typeof origAppend>
-      ): Promise<void> => {
-        await sleep(300);
-        return origAppend(...args);
+      auditLog.append = ((...args: Parameters<typeof origAppend>): Promise<void> => {
+        const written = (async () => {
+          await sleep(300);
+          return origAppend(...args);
+        })();
+        // Tracked so `finally` can await real completion (see
+        // `pendingSlowAppends` above) instead of leaving it to race teardown.
+        pendingSlowAppends.push(written);
+        return written;
       }) as typeof auditLog.append;
       await sleep(800);
 
@@ -384,11 +407,22 @@ describe("Castle Wall macOS daemon — policy reload hang guard", () => {
       expect(reply2.ok).toBe(true);
       await sleep(80);
     } finally {
+      // Drain every real write the SLOW wrapper started (see
+      // `pendingSlowAppends` above) BEFORE stop()/afterEach's recursive rm can
+      // run, so a heartbeat that was still sleeping-then-writing when the
+      // assertions above returned cannot land a file mid-cleanup.
+      await Promise.allSettled(pendingSlowAppends);
       // stop() clears the heartbeat interval synchronously before its first
       // await, so no beat can interleave between this restore and the
       // filter_stopped carry.
       auditLog.append = origAppend;
       auditLog.flush = origFlush;
+      // Extra quiescence: drain the real append queue/checkpoint path too
+      // (flush() is documented safe to call repeatedly), belt-and-suspenders
+      // alongside the pendingSlowAppends drain above. Not asserted on: this is
+      // a settle wait, and any real failure it would swallow still shows up
+      // as an unexplained marker count in the assertions below.
+      await auditLog.flush().catch(() => undefined);
       await handle.stop();
     }
 
