@@ -26,6 +26,7 @@ export {
   ruleScopeCoversAgent,
   allowlistAllowsTarget,
   allowlistAllowsFlow,
+  evaluateFlowFirstMatch,
   ConnectAuthorityError,
   type CanonicalConnectAuthority,
   type CanonicalizationErrorCode,

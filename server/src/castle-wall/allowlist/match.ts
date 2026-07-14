@@ -24,7 +24,7 @@
 import net from "node:net";
 import { domainToASCII } from "node:url";
 
-import type { AllowlistRule, RuleProtocol, RuleScope } from "./schema.js";
+import type { AllowlistRule, RuleDisposition, RuleProtocol, RuleScope } from "./schema.js";
 import { ipMatches, cidrMatches } from "./ip-cidr.js";
 
 export interface CanonicalConnectAuthority {
@@ -219,6 +219,33 @@ export function allowlistAllowsFlow(
       ruleProtocolMatches(rule.match.protocol, protocol) &&
       ruleMatchesDestination(rule, target),
   );
+}
+
+/**
+ * FIRST-MATCH-WINS evaluation of an agent-attributed flow against a ruleset,
+ * mirroring the enforcing Rust daemon's `PolicySnapshot::evaluate`
+ * (castle-wall-daemon/src/policy.rs): walk the rules in manifest order; the
+ * first rule whose SCOPE applies to the agent AND whose match-clause covers
+ * the destination/port/protocol decides the flow via its disposition; no
+ * matching rule is `null` (the daemon's default-deny). A leading matching
+ * `deny` (or `prompt`) therefore beats a later matching `allow`, exactly as
+ * the daemon enforces -- consumers must never reduce this to "some allow
+ * rule matches" (`allowlistAllowsTarget` does exactly that for the CONNECT
+ * proxy's scope-less, allow-only path; it is NOT agent-verdict parity).
+ */
+export function evaluateFlowFirstMatch(
+  rules: readonly AllowlistRule[],
+  target: CanonicalConnectAuthority,
+  protocol: "tcp" | "udp",
+  agent: { agent_id: string; agent_template: string },
+): { disposition: RuleDisposition; rule: AllowlistRule } | null {
+  for (const rule of rules) {
+    if (!ruleScopeCoversAgent(rule.scope, agent)) continue;
+    if (!ruleProtocolMatches(rule.match.protocol, protocol)) continue;
+    if (!ruleMatchesDestination(rule, target)) continue;
+    return { disposition: rule.disposition, rule };
+  }
+  return null;
 }
 
 function portMatches(spec: number | number[], port: number): boolean {

@@ -335,6 +335,48 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
     expect((await harness.store.listCandidates()).size).toBe(0);
   });
 
+  it("round-4 HIGH: FIRST MATCH WINS -- a leading matching deny beats a later allow, so the candidate is NOT suppressed (daemon parity)", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    const denyFirst = [
+      { ...allowRule(), id: "deny-first", disposition: "deny" as const },
+      allowRule(),
+    ];
+    const outcome = await refresh(harness, denyFirst);
+    // The daemon denies this flow (first match), so it keeps recording
+    // egress_blocked and the candidate must stay pending review.
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("round-4 HIGH counterpart: allow-first-then-deny still suppresses (the allow is the first match, as the daemon would allow the flow)", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    const allowFirst = [
+      allowRule(),
+      { ...allowRule(), id: "deny-second", disposition: "deny" as const },
+    ];
+    const outcome = await refresh(harness, allowFirst);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("round-4: a first-matching PROMPT disposition does not suppress (the flow is not unconditionally allowed)", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    const promptFirst = [{ ...allowRule(), disposition: "prompt" as const }];
+    await refresh(harness, promptFirst);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("round-4: a time_window allow is CONDITIONAL and never suppresses", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog);
+    const windowed = [{ ...allowRule(), time_window: { start: "09:00", end: "17:00" } }];
+    await refresh(harness, windowed);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
   it("an unverifiable allowlist aborts the refresh with NOTHING folded, written, or pruned", async () => {
     const harness = makeHarness();
     await appendBlocked(harness.auditLog);

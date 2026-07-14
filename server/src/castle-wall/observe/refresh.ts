@@ -76,15 +76,17 @@
  *    now allowed for its agent is removed -- so after a clean refresh, no
  *    pending candidate names a flow the operator's policy permits (the
  *    invariant the evidence pack's "Destinations permitted by the
- *    operator's policy do NOT appear here" legend asserts). Scope matters
- *    (Codex round-3 HIGH): the enforcing daemon applies rule scope, so a
- *    rule promoted for template A does NOT permit template B's identical
- *    destination -- B's candidate stays pending and keeps re-minting.
- *    Matching goes through the enforcement chokepoints' OWN logic
- *    (`../allowlist/match.ts`: `ruleScopeCoversAgent`, byte-parity with the
- *    Rust daemon's `RuleScope::applies_to`, then the destination/protocol
- *    matcher shared with `egress-proxy.ts`; observe/ still never imports
- *    the evaluator module, preserving THE RED-LINE structural pin). An allowlist that is
+ *    operator's policy do NOT appear here" legend asserts). The verdict is
+ *    the DAEMON'S OWN semantics (Codex round-3 + round-4 HIGHs): scope
+ *    applies (a rule promoted for template A does NOT permit template B's
+ *    identical destination -- B's candidate stays pending and keeps
+ *    re-minting) and FIRST MATCH WINS in manifest order (a leading
+ *    matching deny/prompt beats a later allow), via
+ *    `evaluateFlowFirstMatch` in `../allowlist/match.ts`, which mirrors
+ *    `PolicySnapshot::evaluate` (castle-wall-daemon/src/policy.rs); only
+ *    an unconditional first-matching `allow` suppresses (a time_window
+ *    allow is conditional and never suppresses). observe/ still never
+ *    imports the evaluator module (THE RED-LINE structural pin). An allowlist that is
  *    present but does NOT verify aborts the refresh loud -- never silently
  *    skips the filter (WHAT THESE TOOLS MUST NEVER DO #5). Pruning is
  *    safe-direction (removes candidate rows, exactly like `observe
@@ -111,9 +113,8 @@
 
 import type { AllowlistRule } from "../allowlist/schema.js";
 import {
-  allowlistAllowsFlow,
   canonicalizeConnectAuthority,
-  ruleScopeCoversAgent,
+  evaluateFlowFirstMatch,
   type CanonicalConnectAuthority,
 } from "../allowlist/match.js";
 import type { VerifiedChainConsumer } from "../../operational/audit-log.js";
@@ -211,33 +212,31 @@ export type RefreshOutcome =
 
 /**
  * Is this candidate's flow allowed by the CURRENT verified ruleset FOR THIS
- * CANDIDATE'S AGENT, per the enforcing daemon's own semantics? Two-stage,
- * both stages the enforcement chokepoints' own logic:
- *   1. SCOPE (Codex round-3 HIGH: suppression must not be scope-blind): a
- *      rule is considered only when its scope covers the candidate's
- *      agent (`ruleScopeCoversAgent`, byte-parity with the Rust daemon's
- *      `RuleScope::applies_to`). A rule promoted for template A does not
- *      make template B's identical destination "allowed" -- the daemon
- *      still denies B, so B's candidate must stay pending review, and its
- *      future denials must keep re-minting it.
- *   2. DESTINATION/PROTOCOL (`allowlistAllowsFlow`, shared with the
- *      CONNECT-proxy matcher).
- * Fail-closed toward KEEPING the candidate: a destination that cannot
- * canonicalize can never be allowed by the wall (the proxy denies
- * `canonicalization_failed`), so it stays a candidate; only a positive
- * verified scope+destination match suppresses/prunes.
+ * CANDIDATE'S AGENT, per the enforcing daemon's own semantics? The verdict
+ * comes from `evaluateFlowFirstMatch` (`../allowlist/match.ts`), which
+ * mirrors the Rust daemon's `PolicySnapshot::evaluate` exactly:
+ *   - SCOPE applies first (Codex round-3 HIGH: a rule promoted for
+ *     template A does not make template B's identical destination
+ *     "allowed" -- the daemon still denies B, so B's candidate must stay
+ *     pending review and keep re-minting);
+ *   - FIRST MATCH WINS in manifest order (Codex round-4 HIGH: a leading
+ *     matching deny/prompt beats a later matching allow -- the daemon
+ *     denies/prompts that flow and keeps recording egress_blocked, so the
+ *     candidate must NOT be suppressed just because SOME allow rule also
+ *     matches).
+ * Suppression/prune happens ONLY when the first-matching rule is an
+ * unconditional `allow` (a rule carrying a time_window is conditional --
+ * its allowance is not always in force, and the Linux daemon refuses such
+ * manifests outright -- so it never suppresses). Fail-closed toward
+ * KEEPING the candidate: a destination that cannot canonicalize can never
+ * be allowed by the wall (the proxy denies `canonicalization_failed`), so
+ * it stays a candidate.
  */
 export function candidateCurrentlyAllowed(
   rules: readonly AllowlistRule[],
   row: Pick<CandidateObservation, "agent_id" | "agent_template" | "host" | "ip" | "port" | "protocol">,
 ): boolean {
-  const scoped = rules.filter((rule) =>
-    ruleScopeCoversAgent(rule.scope, {
-      agent_id: row.agent_id,
-      agent_template: row.agent_template,
-    }),
-  );
-  if (scoped.length === 0) return false;
+  if (rules.length === 0) return false;
   const dest = row.host ?? row.ip;
   let target: CanonicalConnectAuthority;
   try {
@@ -247,7 +246,11 @@ export function candidateCurrentlyAllowed(
   } catch {
     return false;
   }
-  return allowlistAllowsFlow(scoped, target, row.protocol);
+  const verdict = evaluateFlowFirstMatch(rules, target, row.protocol, {
+    agent_id: row.agent_id,
+    agent_template: row.agent_template,
+  });
+  return verdict !== null && verdict.disposition === "allow" && verdict.rule.time_window === undefined;
 }
 
 /**
