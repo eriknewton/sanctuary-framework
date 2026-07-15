@@ -7,6 +7,7 @@
     "context_gate_apply_template",
     "context_gate_set_policy",
     "decommission_certificate",
+    "enforcement_export_enabled",
     "exit_bundle_export",
     "exit_bundle_import",
     "exit_bundle_import_activate",

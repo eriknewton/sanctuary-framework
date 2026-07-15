@@ -135,6 +135,25 @@ export const NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS = [
   "castle_wall_observe_promote",
 ] as const;
 
+/**
+ * Enforcement-event exporter (Cortex-ready, 2026-07-10): ARMING the outbound
+ * push (`enforcement_export_enabled`) starts forwarding Castle Wall enforcement
+ * metadata off-box to an operator-pinned collector -- a data-egress /
+ * trust-boundary change of the SAME class as `operator_cloud_provision` /
+ * `state_export` above. It must ALWAYS require an explicit operator approval and
+ * must NEVER be relaxable into Tier 2 (anomaly-gated) or Tier 3 (auto-allow) by a
+ * hand-authored policy. Without this force-pin an unknown op classifies Tier 2
+ * and could auto-arm the push absent an anomaly -- the exact silent-degrade the
+ * gate exists to prevent (Hard Constraint #5). The LOCAL file sink never invokes
+ * approval at all, so this gate only fires on the outbound lane. Spread into the
+ * SAME two force-lists as the sets above (this one, and `gate.ts`'s runtime
+ * mirror) so both enforcement points cannot drift apart; a drift guard test pins
+ * the relationship.
+ */
+export const NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS = [
+  "enforcement_export_enabled",
+] as const;
+
 const FORCED_TIER1_OPERATIONS = [
   RAW_IDENTITY_SIGN_OPERATION,
   "principal_policy_view",
@@ -148,6 +167,7 @@ const FORCED_TIER1_OPERATIONS = [
   ...NON_RELAXABLE_CLOUD_TIER1_OPERATIONS,
   ...NON_RELAXABLE_FILE_GRANT_TIER1_OPERATIONS,
   ...NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS,
+  ...NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS,
 ] as const;
 
 /**
@@ -513,6 +533,12 @@ export const DEFAULT_POLICY: PrincipalPolicy = {
     // NON_RELAXABLE_CASTLE_WALL_OBSERVE_TIER1_OPERATIONS so a hand-authored
     // policy cannot relax it.
     "castle_wall_observe_promote",
+    // Enforcement-event exporter (2026-07-10): arming the outbound push of Castle
+    // Wall enforcement metadata to an operator-pinned collector is a data-egress
+    // change, the same class as operator_cloud_provision / state_export above.
+    // ALSO force-pinned via NON_RELAXABLE_ENFORCEMENT_EXPORT_TIER1_OPERATIONS so a
+    // hand-authored policy cannot relax it out of Tier 1.
+    "enforcement_export_enabled",
   ],
   tier2_anomaly: DEFAULT_TIER2,
   tier3_always_allow: [

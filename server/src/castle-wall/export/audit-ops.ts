@@ -26,3 +26,22 @@ export const ENFORCEMENT_EXPORT_EMITTED = "enforcement_export_emitted" as const;
  * collector. Never a silent drop; never a fallback to a different lane.
  */
 export const ENFORCEMENT_EXPORT_REFUSED = "enforcement_export_refused" as const;
+
+/**
+ * The streaming consumer durably ADVANCED its export cursor after a batch (or a
+ * whole clean pass) was confirmed delivered. This is the resume point a restart
+ * reads: entries at or below it are never re-scanned into a re-send. Recording it
+ * as a distinct op lets an operator audit exactly how far the export has caught
+ * up, separately from an individual emission.
+ */
+export const ENFORCEMENT_EXPORT_CURSOR_ADVANCED = "enforcement_export_cursor_advanced" as const;
+
+/**
+ * A batch EXHAUSTED its bounded delivery retries and the streamer is failing
+ * closed on it: the cursor is NOT advanced past the batch, so the same
+ * (metadata-only) batch is re-attempted on the next run rather than dropped. This
+ * is distinct from a single `enforcement_export_refused` (which each failed
+ * attempt already records) so an operator can tell "one transient blip" from "the
+ * collector stayed unreachable across the whole retry budget."
+ */
+export const ENFORCEMENT_EXPORT_RETRY_EXHAUSTED = "enforcement_export_retry_exhausted" as const;

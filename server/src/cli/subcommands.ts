@@ -10,6 +10,7 @@ export const TOP_LEVEL_SUBCOMMANDS = [
   "completion",
   "compliance",
   "concierge",
+  "cortex-export",
   "dashboard",
   "deploy",
   "did-web",

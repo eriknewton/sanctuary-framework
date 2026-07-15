@@ -199,6 +199,12 @@ async function main(): Promise<void> {
     return drainAndExit(code);
   }
 
+  if (args[0] === "cortex-export") {
+    const { runCortexExportCommand } = await import("./cli/cortex-export.js");
+    const code = await runCortexExportCommand({ argv: args.slice(1) });
+    return drainAndExit(code);
+  }
+
   if (args[0] === "generate") {
     const { runGenerateCommand } = await import("./cli/generate.js");
     const code = await runGenerateCommand({ argv: args.slice(1) });
@@ -867,6 +873,11 @@ Subcommands:
                        lane (operator test verb; same path the agent uses).
                        Use "sanctuary distress --help" for options.
 
+  cortex-export        Export Castle Wall enforcement decisions to a security
+                       console as a frozen metadata-only event stream (local by
+                       default; outbound push is Tier-1 gated + pinned).
+                       Use "sanctuary cortex-export --help" for options.
+
   transparency         Emit and export signed enforcement checkpoints
                        (verifiable evidence the wall is enforcing).
                        Use "sanctuary transparency --help" for options.
@@ -1062,6 +1073,11 @@ async function handleHelpEarly(args: string[]): Promise<boolean> {
     case "distress": {
       const { runDistressCommand } = await import("./cli/distress.js");
       await runDistressCommand({ argv: args.slice(1).concat("--help") });
+      return true;
+    }
+    case "cortex-export": {
+      const { runCortexExportCommand } = await import("./cli/cortex-export.js");
+      await runCortexExportCommand({ argv: args.slice(1).concat("--help") });
       return true;
     }
     case "deploy": {
