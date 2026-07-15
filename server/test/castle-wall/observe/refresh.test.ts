@@ -435,6 +435,37 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
     expect((await harness.store.listCandidates()).size).toBe(0);
   });
 
+  it("round-7 HIGH: the 'unknown' sentinel template (macOS default resolver -- may contain unattributed drops no allow can ever permit) is NEVER suppressed or pruned", async () => {
+    const harness = makeHarness();
+    await appendBlocked(harness.auditLog, { template: "unknown" });
+    const allAgentsRule = { ...allowRule(), scope: {} };
+    const outcome = await refresh(harness, [allAgentsRule]);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
+    expect(outcome.status === "refreshed" && outcome.removed_now_allowed).toBe(0);
+    expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("round-7 HIGH: the deny veto folds Unicode case (macOS caseInsensitiveCompare), not just ASCII", () => {
+    const rules = [
+      allowRule({ host: ["É.example"] }), // "É.example"
+      {
+        ...allowRule({ host: ["é.example"] }), // "é.example"
+        id: "unicode-deny",
+        disposition: "deny" as const,
+      },
+    ];
+    expect(
+      candidateCurrentlyAllowed(rules, {
+        agent_id: "agent-1",
+        agent_template: "claude-code",
+        host: "É.example",
+        ip: "",
+        port: 443,
+        protocol: "tcp",
+      }),
+    ).toBe(false);
+  });
+
   it("an unverifiable allowlist aborts the refresh with NOTHING folded, written, or pruned", async () => {
     const harness = makeHarness();
     await appendBlocked(harness.auditLog);

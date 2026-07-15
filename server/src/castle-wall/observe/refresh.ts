@@ -259,6 +259,22 @@ export function candidateCurrentlyAllowed(
 ): boolean {
   if (rules.length === 0) return false;
 
+  // macOS UNATTRIBUTED bucket (Codex round-7 HIGH): the macOS filter
+  // fail-closed-drops every uid-mode flow whose audit token cannot be
+  // decoded, REGARDLESS of allow rules (AllowlistEvaluator
+  // suppressAllowMatches), and keeps recording those drops -- but the
+  // recorded event cannot tell an unattributed drop from an attributed
+  // default-deny. What IS knowable: every flow the current macOS build
+  // reports carries the default resolver's `templateId: "unknown"`
+  // (FlowEvaluatorEngine.defaultAgentResolver; macos-flow-events.ts uses
+  // the same fallback identity), while Linux-daemon events carry the real
+  // wrapped-agent template. A row bearing the "unknown" sentinel template
+  // may therefore contain macOS flows that NO allow rule can ever permit,
+  // so it is NEVER suppressed or pruned (conservative: it stays pending
+  // for review). When the macOS registry resolver lands, that build must
+  // forward the origin classification before this exemption can narrow.
+  if (row.agent_template === "unknown") return false;
+
   for (const rule of rules) {
     if (rule.disposition === "allow") continue;
     if (denyOrPromptCouldMatch(rule.match, row)) return false;
@@ -326,8 +342,15 @@ function denyOrPromptCouldMatch(
   if (!hasHost && !hasPattern && !hasIp && !hasCidr) return true;
 
   if (row.host !== null) {
-    const hostLower = asciiLower(row.host);
-    if (hasHost && asArray(match.host!).some((h) => asciiLower(h) === hostLower)) return true;
+    // FULL-Unicode folding on the VETO side (Codex round-7 HIGH): the macOS
+    // filter compares exact hosts with Unicode-aware caseInsensitiveCompare,
+    // so an ASCII-only fold here would miss a deny that macOS enforces
+    // (e.g. deny "é.example" vs row "É.example"). Unicode folding
+    // matches a strict SUPERSET of what ASCII folding matches, so using it
+    // on the veto only ever KEEPS more rows (conservative); the ALLOW leg
+    // stays ASCII-only (the Rust daemon's strictest interpretation).
+    const hostLower = row.host.toLowerCase();
+    if (hasHost && asArray(match.host!).some((h) => h.toLowerCase() === hostLower)) return true;
     if (hasPattern && patternCouldMatch(match.host_pattern!, hostLower)) return true;
   }
   for (const literal of [row.ip, row.host ?? ""]) {
@@ -338,9 +361,9 @@ function denyOrPromptCouldMatch(
   return false;
 }
 
-/** Union of every shipped enforcer's host_pattern syntax: `*.suffix` (proxy/macOS), `.suffix` (Rust daemon), and the exact-pattern fallback (macOS compares a non-wildcard pattern as an exact host). */
+/** Union of every shipped enforcer's host_pattern syntax: `*.suffix` (proxy/macOS), `.suffix` (Rust daemon), and the exact-pattern fallback (macOS compares a non-wildcard pattern as an exact host). Full-Unicode folding (veto side; see denyOrPromptCouldMatch). */
 function patternCouldMatch(pattern: string, hostLower: string): boolean {
-  const patternLower = asciiLower(pattern);
+  const patternLower = pattern.toLowerCase();
   if (patternLower.startsWith("*.")) {
     const dotSuffix = patternLower.slice(1); // ".suffix"
     return hostLower.endsWith(dotSuffix) && hostLower.length > dotSuffix.length;
