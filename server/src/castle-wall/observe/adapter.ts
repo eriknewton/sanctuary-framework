@@ -25,10 +25,14 @@
  *     `signedDetailsFor`), both preserved verbatim into `entry.details` by
  *     `audit-consumer.ts` `buildDetailsForEvent`. The two flat producers are
  *     told apart by fingerprint: the Rust daemon ALWAYS writes
- *     `decision_provenance` (a field the macOS body never carries), so a flat
- *     row with `decision_provenance` is PROVENANCE `"linux_daemon"`; any other
- *     flat row is `"macos"` (e.g. the macOS producer-signed body, which
- *     instead carries `source: "macos_extension"`). The flat arm keys STRICTLY
+ *     `decision_provenance` (a field the macOS body never carries) and NEVER a
+ *     `source` marker, while the macOS producer-signed body is the inverse
+ *     (`source: "macos_extension"`, no `decision_provenance`). A flat row is
+ *     `"linux_daemon"` ONLY when it carries `decision_provenance` AND is not
+ *     macOS-sourced; a positive `source: "macos_extension"` is an
+ *     authoritative macOS override (so even a malformed row carrying both
+ *     stays `"macos"`, keeping the safe `"unknown"` exemption). Any other flat
+ *     row is `"macos"`. The flat arm keys STRICTLY
  *     on the daemon's `dest_*` destination field names, which the
  *     credential-honeypot audit body (`honeypot/credential-trap-runtime.ts`,
  *     which writes a flat `destination_host` -- the FULL word -- and NO
@@ -167,6 +171,13 @@ function flowEventFromFlatDetails(
   const port = details.dest_port;
   if (typeof port !== "number") return null;
   const protocol = details.dest_protocol;
+  // v1 SCOPE (parity with the nested arm + fold.ts + the `"tcp" | "udp"`
+  // schema): observe models only TCP/UDP egress destinations. The daemon's
+  // numeric-string `dest_protocol` fallback for a non-TCP/UDP packet
+  // (`nfqueue.rs` protocol_str) is therefore DROPPED here, exactly as the
+  // nested arm drops it -- a dropped row is NOT allowed: the wall keeps
+  // denying that flow; it simply is not surfaced as a promote candidate (the
+  // allowlist rule shape is host/ip:port over tcp/udp). Fails safe.
   if (!isProtocol(protocol)) return null;
 
   const host =
@@ -175,10 +186,20 @@ function flowEventFromFlatDetails(
   if (!host && ip.length === 0) return null;
 
   // The Rust daemon writes `decision_provenance` on EVERY audit body
-  // (`policy.rs` build_audit_event_canonical_json, unconditional); the macOS
-  // producer-signed body never does. Its presence is the daemon fingerprint.
+  // (`policy.rs` build_audit_event_canonical_json, unconditional) and NEVER a
+  // `source` marker; the macOS producer-signed body is the inverse -- it
+  // carries `source: "macos_extension"` and no `decision_provenance`
+  // (`AuditProducerSigning.swift` signedDetailsFor). Classify as the daemon
+  // ONLY on the daemon's positive fingerprint AND the ABSENCE of the macOS
+  // marker: a positive `source: "macos_extension"` is an authoritative macOS
+  // override, so even a malformed/future macOS flat row that also carried a
+  // string `decision_provenance` stays `"macos"` and keeps the unattributed
+  // `"unknown"` exemption (Codex gate finding 3 -- fail toward NOT suppressing
+  // on any macOS-attributable row).
   const provenance: ObserveProvenance =
-    typeof details.decision_provenance === "string" ? "linux_daemon" : "macos";
+    typeof details.decision_provenance === "string" && details.source !== "macos_extension"
+      ? "linux_daemon"
+      : "macos";
 
   return {
     timestamp: entry.timestamp,

@@ -178,6 +178,30 @@ describe("flowEventsFromAuditEntries", () => {
       expect(events[0]!.provenance).toBe("macos");
     });
 
+    it("Codex gate finding 3: a flat row carrying BOTH decision_provenance AND source=macos_extension is tagged 'macos' (positive macОS marker overrides the daemon fingerprint -- fail safe)", () => {
+      const entry = daemonFlatEntry({
+        details: {
+          agent_id: "agent-9",
+          agent_template: "unknown",
+          dest_ip: "198.51.100.7",
+          dest_port: 443,
+          dest_protocol: "tcp",
+          decision_provenance: "default_deny", // daemon-looking...
+          source: "macos_extension", // ...but positively macOS-sourced
+        },
+      });
+      const events = flowEventsFromAuditEntries([entry]);
+      expect(events).toHaveLength(1);
+      expect(events[0]!.provenance).toBe("macos");
+    });
+
+    it("v1 scope (Codex gate finding 1): a flat row with a numeric-string dest_protocol (daemon non-TCP/UDP fallback) is DROPPED, exactly as the nested arm drops it -- the wall keeps denying, it is just not a candidate", () => {
+      const entry = daemonFlatEntry({
+        details: { agent_id: "a", agent_template: "t", dest_ip: "1.2.3.4", dest_port: 7, dest_protocol: "1", decision_provenance: "x" },
+      });
+      expect(flowEventsFromAuditEntries([entry])).toHaveLength(0);
+    });
+
     it("skips a flat row missing dest_port", () => {
       const entry = daemonFlatEntry({
         details: { agent_id: "a", agent_template: "t", dest_ip: "1.2.3.4", dest_protocol: "tcp", decision_provenance: "x" },
