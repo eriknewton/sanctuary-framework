@@ -449,15 +449,22 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("has not completed a reconciling refresh");
     expect(report).toContain("castle-wall observe candidates");
     expect(report).toContain("regenerate this pack");
-    expect(report).toContain("the listed set may still include a destination");
+    expect(report).toContain("it may still include a destination the engine would clear");
     expect(report).toContain("every listed row is a destination where denied attempts were recorded");
     // Gate run 2 HIGH: the remedy must NOT overclaim that a refresh removes a
     // re-surfaced DISCARDED destination (a discard leaves no allow rule; the
-    // recompute replacement path keeps an already-resurfaced discard). The
-    // caveat scopes "removes those" to policy-permitted/promoted rows and tells
-    // the operator to discard the re-surfaced ones again.
-    expect(report).toContain("which you may need to discard again");
+    // recompute replacement path keeps an already-resurfaced discard). Tell the
+    // operator to discard the re-surfaced ones again.
+    expect(report).toContain("you would need to discard it again");
     expect(report).not.toContain("that a reconciling refresh would remove");
+    // Gate run 3 HIGH: the "would clear on refresh" claim must NOT
+    // over-generalize to "any destination the policy permits" -- the prune only
+    // clears candidateCurrentlyAllowed rows (provenance-scoped, exact-allow),
+    // NEVER a macOS "unknown" row. The caveat defers to the Row-basis legend's
+    // conditions and calls out the macOS non-clearing case explicitly.
+    expect(report).toContain("provenance-scoped conditions described in the Row-basis legend");
+    expect(report).toContain("NOT a macOS 'unknown' row, which is never auto-cleared");
+    expect(report).not.toContain("a reconciling refresh removes those");
     // Must NOT attribute cause to an "earlier engine version" (false in the
     // crash-interrupted-heal case), and must NOT falsely reassure that only
     // the Seen magnitude is affected.
