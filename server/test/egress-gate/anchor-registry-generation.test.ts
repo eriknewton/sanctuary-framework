@@ -103,6 +103,16 @@ describe("egress-gate/anchor-registry generation_id (S5-2 additive)", () => {
     const { registry } = makeRegistry(bad);
     await expect(registry.list()).rejects.toBeInstanceOf(PfAnchorRegistryStateError);
   });
+
+  it("rejects a persisted generation_id of 0 (generated ids start at 1)", async () => {
+    const bad: PfAnchorRegistryState = {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [{ agent_uid: 502, gate_port: 19998, fortress_path: "/f/a", generation_id: 0 } as PfAnchorRegistryEntry],
+      enable_token: "1",
+    };
+    const { registry } = makeRegistry(bad);
+    await expect(registry.list()).rejects.toBeInstanceOf(PfAnchorRegistryStateError);
+  });
 });
 
 describe("egress-gate/anchor-registry tombstone (S5-2 M4)", () => {
@@ -129,6 +139,14 @@ describe("egress-gate/anchor-registry tombstone (S5-2 M4)", () => {
     expect(res.committed).toHaveLength(1);
     expect(store.current?.committed[0]).toMatchObject({ agent_uid: 777, gate_port: 30000, tombstone: true });
     expect(armCalls.at(-1)).toEqual([{ agent_uid: 777, gate_port: 30000, tombstone: true }]);
+  });
+
+  it("absent-uid tombstone CARRIES the fallback generation_id (monotonicity guard)", async () => {
+    const { registry, store } = makeRegistry();
+    await registry.tombstone(777, { gate_port: 30000, fortress_path: "/f/x", generation_id: 5 });
+    // The added block-only entry retains generation_id 5 so the next bring-up's
+    // monotonic id can never reuse an already-staged id.
+    expect(store.current?.committed[0]?.generation_id).toBe(5);
   });
 
   it("refuses to tombstone an absent uid with NO fallback (no port to validate)", async () => {

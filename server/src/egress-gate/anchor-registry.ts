@@ -221,7 +221,12 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
   // ADDITIVE optional fields (S5-2). Reject a present-but-malformed value
   // (fail-closed: a garbled generation/tombstone marker is a repair signal,
   // never silently coerced); a MISSING field is the v1-compatible legacy shape.
-  if (c.generation_id !== undefined && !isNonNegativeInt(c.generation_id)) return null;
+  // `generation_id` must be a POSITIVE integer: generated ids start at 1
+  // (`computeNextGenerationId`), so a persisted 0 is a corruption/reuse signal,
+  // never a legitimate committed generation (gate finding).
+  if (c.generation_id !== undefined && (!Number.isInteger(c.generation_id) || (c.generation_id as number) < 1)) {
+    return null;
+  }
   if (c.tombstone !== undefined && typeof c.tombstone !== "boolean") return null;
   const entry: PfAnchorRegistryEntry = {
     agent_uid: c.agent_uid as number,
@@ -448,7 +453,7 @@ export class PfAnchorRegistry {
    */
   async tombstone(
     agentUid: number,
-    fallback?: { gate_port: number; fortress_path: string },
+    fallback?: { gate_port: number; fortress_path: string; generation_id?: number },
   ): Promise<PfAnchorRegistryMutationResult> {
     if (!isNonNegativeInt(agentUid)) {
       throw new PfAnchorRegistryStateError(`refusing to tombstone a non-integer uid ${String(agentUid)}`);
@@ -460,7 +465,10 @@ export class PfAnchorRegistry {
           e.agent_uid === agentUid ? { ...e, tombstone: true } : e,
         );
       }
-      // Absent: add a block-only entry from the fallback (validated below).
+      // Absent: add a block-only entry from the fallback (validated below). The
+      // dead generation's id is CARRIED so generation-id monotonicity holds
+      // across this recovery (gate finding: dropping it let the next bring-up
+      // reuse an already-staged id).
       if (fallback === undefined) {
         throw new PfAnchorRegistryStateError(
           `refusing to tombstone absent uid ${agentUid} without a fallback {gate_port, fortress_path} ` +
@@ -472,6 +480,7 @@ export class PfAnchorRegistry {
         gate_port: fallback.gate_port,
         fortress_path: fallback.fortress_path,
         tombstone: true,
+        ...(fallback.generation_id !== undefined ? { generation_id: fallback.generation_id } : {}),
       });
       if (added === null) {
         throw new PfAnchorRegistryStateError(

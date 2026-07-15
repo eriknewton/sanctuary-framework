@@ -62,10 +62,12 @@ export {
 export {
   GenerationCoordinator,
   GenerationStateError,
+  GENERATION_LOCK_PATH_PREFIX,
   bindEphemeralGatePort,
   computeNextGenerationId,
   createFsGenerationStagingStore,
   evaluateGenerationMatch,
+  resolveCommittedGeneration,
   resolveGateRestart,
   type GenerationPhase,
   type GateBinding,

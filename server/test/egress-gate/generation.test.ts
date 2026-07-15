@@ -13,6 +13,7 @@ import {
   bindEphemeralGatePort,
   computeNextGenerationId,
   evaluateGenerationMatch,
+  resolveCommittedGeneration,
   resolveGateRestart,
   type CommittedGeneration,
   type GateBinding,
@@ -21,6 +22,26 @@ import {
   type GenerationStagingRecord,
   type GenerationStagingStore,
 } from "../../src/egress-gate/generation.js";
+import type { ProvisionLockOps } from "../../src/castle-wall/provision/lockfile.js";
+
+/** In-memory O_EXCL lock (fail-loud on double-acquire), records contention. */
+function memLock(): ProvisionLockOps & { held: boolean } {
+  const box = {
+    held: false,
+    async acquire() {
+      if (box.held) {
+        const err = new Error("EEXIST") as NodeJS.ErrnoException;
+        err.code = "EEXIST";
+        throw err;
+      }
+      box.held = true;
+    },
+    async release() {
+      box.held = false;
+    },
+  };
+  return box;
+}
 
 /** In-memory staging store (one record per uid). */
 function memStaging(): GenerationStagingStore & { records: Map<number, GenerationStagingRecord> } {
@@ -46,7 +67,7 @@ function memRegistry(
   const entries = new Map<number, { agent_uid: number; gate_port: number; generation_id?: number; tombstone?: boolean }>();
   for (const e of initial) entries.set(e.agent_uid, { ...e });
   const armCalls: Array<{ agent_uid: number; gate_port: number; generation_id: number }> = [];
-  const tombstoneCalls: Array<{ uid: number; fallback?: { gate_port: number; fortress_path: string } }> = [];
+  const tombstoneCalls: Array<{ uid: number; fallback?: { gate_port: number; fortress_path: string; generation_id?: number } }> = [];
   const ops: GenerationRegistryOps = {
     async armEntry(entry) {
       armCalls.push({ ...entry });
@@ -56,7 +77,7 @@ function memRegistry(
       tombstoneCalls.push({ uid, ...(fallback !== undefined ? { fallback } : {}) });
       const existing = entries.get(uid);
       if (existing !== undefined) entries.set(uid, { ...existing, tombstone: true });
-      else if (fallback !== undefined) entries.set(uid, { agent_uid: uid, gate_port: fallback.gate_port, tombstone: true });
+      else if (fallback !== undefined) entries.set(uid, { agent_uid: uid, gate_port: fallback.gate_port, generation_id: fallback.generation_id, tombstone: true });
     },
     async readEntry(uid) {
       return entries.has(uid) ? { ...entries.get(uid)! } : null;
@@ -71,6 +92,7 @@ interface Harness {
   reg: ReturnType<typeof memRegistry>;
   events: string[];
   manifestPublished: Array<{ agent_uid: number; gate_port: number; generation_id: number }>;
+  lock: ReturnType<typeof memLock>;
 }
 
 function makeHarness(opts: {
@@ -78,13 +100,14 @@ function makeHarness(opts: {
   bindPort?: number;
   ownerHolds?: boolean;
   failAt?: "bind" | "owner" | "arm" | "manifest";
+  tombstoneThrows?: boolean;
 } = {}): Harness {
   const staging = memStaging();
   const reg = memRegistry(opts.registryInitial ?? []);
   const events: string[] = [];
   const manifestPublished: Array<{ agent_uid: number; gate_port: number; generation_id: number }> = [];
   const bindPort = opts.bindPort ?? 45001;
-  let released = false;
+  const lock = memLock();
 
   const ops: GenerationOps = {
     async bind() {
@@ -95,7 +118,6 @@ function makeHarness(opts: {
         pid: 9001,
         pidStart: "start-9001",
         async release() {
-          released = true;
           events.push("release");
         },
       };
@@ -111,7 +133,11 @@ function makeHarness(opts: {
         await reg.ops.armEntry(entry);
         events.push("arm");
       },
-      tombstone: reg.ops.tombstone,
+      async tombstone(uid, fallback) {
+        events.push("tombstone");
+        if (opts.tombstoneThrows === true) throw new Error("tombstone failed");
+        await reg.ops.tombstone(uid, fallback);
+      },
       readEntry: reg.ops.readEntry,
     },
     async publishManifest(gen) {
@@ -120,10 +146,9 @@ function makeHarness(opts: {
       events.push("manifest");
     },
     staging,
+    lock,
   };
-  // expose released via a getter through events; return harness
-  void released;
-  return { coord: new GenerationCoordinator(ops), staging, reg, events, manifestPublished };
+  return { coord: new GenerationCoordinator(ops), staging, reg, events, manifestPublished, lock };
 }
 
 describe("egress-gate/generation bringUp (G1-G5 happy path)", () => {
@@ -179,13 +204,27 @@ describe("egress-gate/generation bringUp failure -> in-process recovery", () => 
     expect(h.staging.records.has(502)).toBe(false);
   });
 
-  it("G3 arm failure: releases the port and TOMBSTONES the uid (block-only)", async () => {
+  it("G3 arm failure: TOMBSTONES the uid BEFORE releasing the port (no squat window)", async () => {
     const h = makeHarness({ failAt: "arm" });
     await expect(h.coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" })).rejects.toThrow("arm failed");
-    expect(h.events).toContain("release");
-    // Recovery tombstoned the uid from the pf_loaded write-ahead (fail-closed).
+    // Recovery tombstoned the uid from the pf_loaded write-ahead (fail-closed)...
     expect(h.reg.tombstoneCalls.map((c) => c.uid)).toContain(502);
+    // ...and the DROP of the uncommitted pass happened BEFORE freeing the port
+    // (else a stale pass would point at a now-free squattable port).
+    expect(h.events.indexOf("tombstone")).toBeLessThan(h.events.indexOf("release"));
     expect(h.staging.records.has(502)).toBe(false);
+    // The tombstone carried the dead generation id (monotonicity guard).
+    expect(h.reg.tombstoneCalls.at(-1)?.fallback?.generation_id).toBe(1);
+  });
+
+  it("recovery failure KEEPS the port held (never freed to a squatter)", async () => {
+    const h = makeHarness({ failAt: "arm", tombstoneThrows: true });
+    await expect(h.coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" })).rejects.toThrow("arm failed");
+    // Tombstone was attempted but threw -> the port must NOT be released.
+    expect(h.events).toContain("tombstone");
+    expect(h.events).not.toContain("release");
+    // The staging record survives for a later recover().
+    expect(h.staging.records.has(502)).toBe(true);
   });
 
   it("G4 manifest failure: pf was armed, recovery tombstones the uncommitted pass", async () => {
@@ -223,7 +262,7 @@ describe("egress-gate/generation recover (crash-recovery table)", () => {
     });
     const out = await h.coord.recover(502);
     expect(out.action).toBe("tombstoned");
-    expect(h.reg.tombstoneCalls).toEqual([{ uid: 502, fallback: { gate_port: 45001, fortress_path: "/f/a" } }]);
+    expect(h.reg.tombstoneCalls).toEqual([{ uid: 502, fallback: { gate_port: 45001, fortress_path: "/f/a", generation_id: 3 } }]);
     expect(h.staging.records.has(502)).toBe(false);
   });
 
@@ -282,6 +321,48 @@ describe("egress-gate/generation pure helpers", () => {
   it("resolveGateRestart reports no committed generation when absent", () => {
     expect(resolveGateRestart({ committed: null, rebindOk: false, ownerVerified: false }).action).toBe("no_committed_generation");
   });
+
+  it("resolveCommittedGeneration treats an armed-but-uncommitted (staging present) entry as NOT committed", () => {
+    const entry = { gate_port: 45001, generation_id: 3 };
+    // A staging record in flight -> the entry is NOT yet committed (G4-before-G5).
+    const withStaging = resolveCommittedGeneration({ entry, stagingRecordPresent: true });
+    expect(withStaging.committedGenerationId).toBeUndefined();
+    expect(withStaging.committedPort).toBeUndefined();
+    // Fed to the match check, an uncommitted generation NEVER serves green.
+    expect(
+      evaluateGenerationMatch({ ...withStaging, pfPassPort: 45001, manifestPort: 45001, manifestGenerationId: 3 }).serve,
+    ).toBe(false);
+    // No staging record -> committed.
+    const committed = resolveCommittedGeneration({ entry, stagingRecordPresent: false });
+    expect(committed).toEqual({ committedGenerationId: 3, committedPort: 45001 });
+  });
+
+  it("resolveCommittedGeneration treats a tombstoned or dirty entry as NOT committed", () => {
+    expect(
+      resolveCommittedGeneration({ entry: { gate_port: 45001, generation_id: 3, tombstone: true }, stagingRecordPresent: false }).committedGenerationId,
+    ).toBeUndefined();
+    expect(
+      resolveCommittedGeneration({ entry: { gate_port: 45001, generation_id: 3 }, stagingRecordPresent: false, registryDirty: true }).committedGenerationId,
+    ).toBeUndefined();
+    expect(resolveCommittedGeneration({ entry: null, stagingRecordPresent: false }).committedGenerationId).toBeUndefined();
+  });
+});
+
+describe("egress-gate/generation per-uid lock (TOCTOU guard)", () => {
+  it("bringUp runs under the per-uid lock (acquired + released)", async () => {
+    const h = makeHarness();
+    await h.coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" });
+    expect(h.lock.held).toBe(false); // released in finally
+  });
+
+  it("refuses to start a concurrent bring-up for the same uid while the lock is held", async () => {
+    const h = makeHarness();
+    // Simulate the lock already held by another in-flight run.
+    await h.lock.acquire();
+    await expect(h.coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" })).rejects.toThrow(/lock held|in progress/i);
+    // No bind happened -- the race was refused before G1.
+    expect(h.events).not.toContain("bind");
+  });
 });
 
 describe("egress-gate/generation bind-first helper", () => {
@@ -295,5 +376,9 @@ describe("egress-gate/generation bind-first helper", () => {
     const again = await bindEphemeralGatePort();
     expect(again.port).toBeGreaterThan(0);
     await again.release();
+  });
+
+  it("refuses a non-loopback host (loopback-only by construction)", async () => {
+    await expect(bindEphemeralGatePort("0.0.0.0")).rejects.toBeInstanceOf(GenerationStateError);
   });
 });

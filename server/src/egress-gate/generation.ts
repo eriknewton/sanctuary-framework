@@ -64,6 +64,14 @@
 
 import net from "node:net";
 
+import {
+  withProvisionLock,
+  type ProvisionLockOps,
+} from "../castle-wall/provision/lockfile.js";
+
+/** Default per-uid generation lock path prefix (an internal on-disk artifact). */
+export const GENERATION_LOCK_PATH_PREFIX = "/var/db/sanctuary/generation";
+
 /** How far a bring-up progressed, recorded in the staging record for recovery. */
 export type GenerationPhase = "owner_checked" | "pf_loaded" | "manifest_reloaded";
 
@@ -73,7 +81,13 @@ export interface GateBinding {
   port: number;
   /** The listener process pid (for the owner check). */
   pid: number;
-  /** A process start-time token the owner check re-verifies (defeats pid reuse). */
+  /**
+   * A process-identity token the owner check re-verifies. Production `bind`
+   * impls (S5-6) supply the real listener's start-time so it defeats pid reuse;
+   * the default {@link bindEphemeralGatePort} sets a NON-AUTHORITATIVE
+   * placeholder (the pid, no start-time), so pid-reuse defense there comes only
+   * from the injected {@link GenerationOps.verifyOwner} (S5-3), never this field.
+   */
   pidStart: string;
   /** Free the port. Called only when a bring-up aborts (never after G5 commit). */
   release(): Promise<void>;
@@ -122,10 +136,12 @@ export interface GenerationRegistryOps {
     fortress_path: string;
     generation_id: number;
   }): Promise<void>;
-  /** Recovery: block-only tombstone the uid (drop stale pass, keep block-drops). */
+  /** Recovery: block-only tombstone the uid (drop stale pass, keep block-drops).
+   *  The fallback carries the dead generation's id so a tombstone that ADDS a
+   *  block-only entry (uid absent) preserves generation-id monotonicity. */
   tombstone(
     agentUid: number,
-    fallback?: { gate_port: number; fortress_path: string },
+    fallback?: { gate_port: number; fortress_path: string; generation_id?: number },
   ): Promise<void>;
   /** Read the committed entry for a uid (port + committed generation), or null. */
   readEntry(agentUid: number): Promise<{
@@ -152,6 +168,16 @@ export interface GenerationOps {
   }): Promise<void>;
   /** The staging-record store. */
   staging: GenerationStagingStore;
+  /**
+   * Per-uid exclusive lock (the shipped O_EXCL {@link ProvisionLockOps}
+   * discipline). {@link GenerationCoordinator.bringUp} and {@link GenerationCoordinator.recover}
+   * both run UNDER this lock, keyed per uid, so two concurrent bring-ups for one
+   * uid cannot both observe "no staging record", bind different ports, and
+   * interleave G3-G5 (the TOCTOU the gate flagged). Fail-loud on contention.
+   */
+  lock: ProvisionLockOps;
+  /** Lock-path prefix (default {@link GENERATION_LOCK_PATH_PREFIX}); the uid is appended. */
+  lockPathPrefix?: string;
 }
 
 /** A generation-machine invariant was violated or a transition failed. Fail-closed. */
@@ -214,11 +240,50 @@ export function computeNextGenerationId(
 }
 
 /**
+ * Resolve the COMMITTED generation of a registry entry for the generation-match
+ * check. THE LOAD-BEARING GATE (folds the reviewers' shared finding): a
+ * registry entry's `generation_id` is written at G3 (pf load), BEFORE the G5
+ * commit, so the raw entry alone cannot be trusted as "committed" -- between
+ * G3/G4 and G5 the pf pass port, manifest port, and entry `generation_id` all
+ * agree while the generation is still UNCOMMITTED. A uid is committed ONLY when
+ * NO staging record exists for it AND it is not tombstoned AND the registry is
+ * not dirty. Callers of {@link evaluateGenerationMatch} MUST derive the
+ * `committed*` inputs through THIS resolver (never the raw entry), so a naive
+ * consumer cannot read an armed-but-uncommitted generation as green.
+ */
+export function resolveCommittedGeneration(input: {
+  entry: { gate_port: number; generation_id?: number; tombstone?: boolean } | null;
+  stagingRecordPresent: boolean;
+  registryDirty?: boolean;
+}): { committedGenerationId: number | undefined; committedPort: number | undefined } {
+  const { entry } = input;
+  // Uncommitted / not-green if: no entry, a staging record is in flight, the uid
+  // is tombstoned (gate dropped), the registry is dirty (needs repair), or the
+  // entry carries no committed generation id (a legacy/never-committed entry).
+  if (
+    entry === null ||
+    input.stagingRecordPresent ||
+    entry.tombstone === true ||
+    input.registryDirty === true ||
+    entry.generation_id === undefined
+  ) {
+    return { committedGenerationId: undefined, committedPort: undefined };
+  }
+  return { committedGenerationId: entry.generation_id, committedPort: entry.gate_port };
+}
+
+/**
  * The three-surface generation-match check: refuse traffic ("never green from
  * stale rules") unless the pf pass-rule port, the manifest port, and the
  * committed registry port ALL agree and the manifest generation equals the
  * committed generation. Any missing or mismatched surface -> `serve: false`
  * with the specific reasons (posture reads amber). Pure; no I/O.
+ *
+ * The `committed*` inputs MUST come from {@link resolveCommittedGeneration}
+ * (which returns `undefined` for an armed-but-uncommitted generation), NEVER
+ * from a raw registry entry -- otherwise a G4-before-G5 generation would serve
+ * green. A `committedGenerationId`/`committedPort` of `undefined` always yields
+ * `serve: false`.
  */
 export function evaluateGenerationMatch(input: GenerationMatchInput): {
   serve: boolean;
@@ -296,11 +361,24 @@ export function resolveGateRestart(input: {
  * TCB (S5-3). Production (S5-6) supplies a `bind` that starts the real gate.
  */
 export async function bindEphemeralGatePort(host = "127.0.0.1"): Promise<GateBinding> {
+  // Loopback-only by construction: the gate is never reachable off-box. Refuse
+  // any non-loopback host rather than silently binding a wider surface (gate
+  // finding: the param claimed loopback but accepted arbitrary hosts).
+  if (host !== "127.0.0.1" && host !== "::1") {
+    throw new GenerationStateError(
+      `bind-first helper refuses a non-loopback host ${JSON.stringify(host)} (loopback-only by construction)`,
+    );
+  }
   const server = net.createServer();
+  // Keep an error handler attached for the LIFETIME of the held listener: a
+  // late 'error' after listen (e.g. while the port is held) would otherwise be
+  // an unhandled event and crash the process (gate finding).
+  server.on("error", () => undefined);
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
+    const onListenError = (err: unknown): void => reject(err);
+    server.once("error", onListenError);
     server.listen(0, host, () => {
-      server.removeListener("error", reject);
+      server.removeListener("error", onListenError);
       resolve();
     });
   });
@@ -313,6 +391,8 @@ export async function bindEphemeralGatePort(host = "127.0.0.1"): Promise<GateBin
   return {
     port,
     pid: process.pid,
+    // NON-AUTHORITATIVE placeholder (the pid, not a start-time) -- see the
+    // GateBinding.pidStart doc; production `bind` (S5-6) supplies the real token.
     pidStart: `pid-${process.pid}`,
     async release(): Promise<void> {
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -378,18 +458,34 @@ function validateRequest(request: GenerationBringUpRequest): GenerationBringUpRe
 export class GenerationCoordinator {
   constructor(private readonly ops: GenerationOps) {}
 
+  private lockPathFor(agentUid: number): string {
+    const prefix = this.ops.lockPathPrefix ?? GENERATION_LOCK_PATH_PREFIX;
+    return `${prefix}-${agentUid}.lock`;
+  }
+
   /**
-   * Run G1-G5 to a committed generation. Write-ahead journaling: each phase's
-   * intent is persisted to the staging record BEFORE its side effect, so a
-   * crash mid-step is recoverable fail-closed (recovery tombstones an
-   * uncommitted pass rather than trusting it). On an in-process failure the
-   * staged port is released and best-effort recovery runs; a hard crash leaves
-   * the staging record for a later {@link recover}. Refuses to start when a
-   * staging record already exists (recover first).
+   * Run G1-G5 to a committed generation, UNDER the per-uid lock (so two
+   * concurrent bring-ups for one uid cannot race past the staging-record
+   * check). Write-ahead journaling: each phase's intent is persisted to the
+   * staging record BEFORE its side effect, so a crash mid-step is recoverable
+   * fail-closed (recovery tombstones an uncommitted pass rather than trusting
+   * it). On an in-process failure the uncommitted pass is DROPPED (recovery)
+   * BEFORE the staged port is released, so a stale pass never points at a
+   * now-free squattable port; if that recovery fails the port is KEPT held and
+   * the failure surfaces. Refuses to start when a staging record already exists
+   * (recover first).
    */
   async bringUp(request: GenerationBringUpRequest): Promise<CommittedGeneration> {
     const { agent_uid, fortress_path } = validateRequest(request);
+    return withProvisionLock(this.lockPathFor(agent_uid), this.ops.lock, () =>
+      this.bringUpLocked(agent_uid, fortress_path),
+    );
+  }
 
+  private async bringUpLocked(
+    agent_uid: number,
+    fortress_path: string,
+  ): Promise<CommittedGeneration> {
     const existing = await this.ops.staging.load(agent_uid);
     if (existing !== null) {
       throw new GenerationStateError(
@@ -449,29 +545,42 @@ export class GenerationCoordinator {
       await this.ops.staging.delete(agent_uid);
       return base;
     } catch (err) {
-      // Uncommitted: free the staged port so it does not linger held, then run
-      // best-effort recovery (tombstone/discard). A failure of that recovery
-      // leaves the staging record for a later recover(); the original error
+      // Uncommitted. ORDER MATTERS (gate finding): DROP any uncommitted pass
+      // (recovery/tombstone) BEFORE freeing the port -- releasing first would
+      // leave the stale pass pointing at a now-free, squattable port. Only after
+      // recovery succeeds is the port released. If recovery FAILS, KEEP the port
+      // held (so the stale pass still points at a port WE own, never a squatter)
+      // and leave the staging record for a later recover(); the original error
       // still propagates.
-      await binding.release().catch(() => undefined);
-      await this.recover(agent_uid).catch(() => undefined);
+      try {
+        await this.recoverLocked(agent_uid);
+        await binding.release().catch(() => undefined);
+      } catch {
+        // Recovery failed: do NOT release the port. Surface the original error.
+      }
       throw err;
     }
   }
 
   /**
-   * Apply the crash-recovery rule for an in-flight (uncommitted) staging record.
-   * No record -> `none` (a committed generation, if any, stands). A pre-pf (G2)
-   * record -> `discarded` (pf was never armed; delete it, no packet change). A
-   * G3/G4 record -> `tombstoned`: the uid's four block-drops are re-armed and
-   * its stale/uncommitted pass dropped, so non-gate loopback stays CLOSED while
-   * a fresh generation is owed. An uncommitted generation is NEVER trusted to
-   * serve, so the tombstone is unconditional for pf-loaded/manifest phases
-   * (stricter than the design table's "if the gate no longer holds the port":
-   * it also covers the gate-still-holds-but-uncommitted case, which must
-   * likewise never present as a committed green channel).
+   * Apply the crash-recovery rule for an in-flight (uncommitted) staging record,
+   * UNDER the per-uid lock. No record -> `none` (a committed generation, if any,
+   * stands). A pre-pf (G2) record -> `discarded` (pf was never armed; delete it,
+   * no packet change). A G3/G4 record -> `tombstoned`: the uid's four block-drops
+   * are re-armed and its stale/uncommitted pass dropped, so non-gate loopback
+   * stays CLOSED while a fresh generation is owed. An uncommitted generation is
+   * NEVER trusted to serve, so the tombstone is unconditional for
+   * pf-loaded/manifest phases (stricter than the design table's "if the gate no
+   * longer holds the port": it also covers the gate-still-holds-but-uncommitted
+   * case, which must likewise never present as a committed green channel).
    */
   async recover(agentUid: number): Promise<GenerationRecoveryOutcome> {
+    return withProvisionLock(this.lockPathFor(agentUid), this.ops.lock, () =>
+      this.recoverLocked(agentUid),
+    );
+  }
+
+  private async recoverLocked(agentUid: number): Promise<GenerationRecoveryOutcome> {
     const record = await this.ops.staging.load(agentUid);
     if (record === null) {
       return { agent_uid: agentUid, action: "none" };
@@ -499,10 +608,12 @@ export class GenerationCoordinator {
 
     // pf_loaded | manifest_reloaded: the uid's pass rule MAY have been armed.
     // Tombstone fail-closed (drop the uncommitted pass, keep the block-drops);
-    // the fallback supplies a valid port if the arm did not actually land.
+    // the fallback supplies a valid port + the dead generation id (so the next
+    // bring-up's monotonic id can never reuse it) if the arm did not land.
     await this.ops.registry.tombstone(agentUid, {
       gate_port: record.gate_port,
       fortress_path: record.fortress_path,
+      generation_id: record.generation_id,
     });
     await this.ops.staging.delete(agentUid);
     return {
