@@ -574,6 +574,15 @@ export async function checkPfAnchorUnionLiveness(
   // rule. An unexpected line (a stray permissive `pass`, a broader rule from
   // drift or a botched mutation) makes the union NOT live -- this is the H4
   // hardening over a bare per-uid presence check.
+  //
+  // Deliberately SET-based, not multiset/ordered (gate-round LOW): a duplicated
+  // expected line or a reordering can only ever make the anchor MORE blocking
+  // (all rules are `quick`; the only `pass` is the narrow per-uid gate rule and
+  // everything else is `block drop`, so any reorder can at worst shadow a uid's
+  // own gate pass behind its own block = that uid loses gate access, fail-closed,
+  // never a widening). A strict count/order check would instead risk a
+  // fail-CLOSED availability cliff on benign pfctl canonical-print drift, so the
+  // presence + no-unexpected-line pair is the conservative, drill-safe choice.
   for (const line of printedLines) {
     if (!expected.some(({ re }) => re.test(line))) {
       reasons.push(
@@ -776,6 +785,11 @@ export async function armPfAnchorUnion(
   const dir = await mkdtemp(join(tmpdir(), "sanctuary-pf-"));
   const rulesFile = join(dir, "egress-gate.rules");
   let enableToken: string | undefined = options.existingEnableToken;
+  // The `pfctl -E` reference THIS call acquired (only set on the first arm,
+  // when no existing token was supplied). Tracked so a post-enable failure
+  // releases exactly the reference this call took, never one another uid or
+  // an earlier arm depends on (folds gate-round finding: leaked -E reference).
+  let acquiredToken: string | undefined;
   try {
     await writeFile(rulesFile, rulesText, { mode: 0o600 });
 
@@ -793,9 +807,17 @@ export async function armPfAnchorUnion(
         throw new Error(`pfctl -E exited ${enable.code}: ${enable.stderr.trim()}`);
       }
       const tokenMatch = /Token\s*:\s*(\d+)/.exec(`${enable.stdout}\n${enable.stderr}`);
-      if (tokenMatch) {
-        enableToken = tokenMatch[1];
+      if (tokenMatch === null) {
+        // Fail-closed (AGENTS.md rule 5): a 0-exit `-E` with no parsable token
+        // means pf is now enabled with a reference we cannot track or release.
+        // Refuse to arm rather than commit an untracked pf enable reference.
+        throw new Error(
+          "pfctl -E exited 0 but printed no numeric token; refusing to arm with an " +
+            "untracked pf enable reference (cannot be released at disarm)",
+        );
       }
+      enableToken = tokenMatch[1];
+      acquiredToken = tokenMatch[1];
     }
 
     // Settle-probe on the EXACT union: require N consecutive live results.
@@ -827,12 +849,19 @@ export async function armPfAnchorUnion(
       armResult.enableToken = enableToken;
     }
     return armResult;
-    // Codex B2: NO catch-flush here -- the anchor is a shared multi-uid
-    // surface, so flushing on failure would drop every OTHER confined uid's
-    // rules. The registry owns rollback (re-assert the committed union, else
-    // mark itself dirty and force posture red). This primitive only ever
-    // loads/hooks/enables/settles and throws on failure, leaving the anchor
-    // for the registry to reconcile.
+  } catch (err) {
+    // Codex B2: NO catch-FLUSH -- the anchor is a shared multi-uid surface, so
+    // `-F all` would drop every OTHER confined uid's rules; the registry owns
+    // rollback of the anchor CONTENTS. BUT the `-E` reference THIS call took is
+    // ours alone: release it so a post-enable failure never leaves pf enabled
+    // with a dangling reference the registry believes it never acquired
+    // (gate-round finding -- unbounded leak on retry + silent host-firewall
+    // posture change). We only release what WE acquired this call (an existing
+    // token belongs to a prior arm and stays live).
+    if (acquiredToken !== undefined) {
+      await runner.run("pfctl", ["-X", acquiredToken]).catch(() => undefined);
+    }
+    throw err;
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
@@ -899,9 +928,16 @@ export async function armPfAnchor(
       throw new Error(`pfctl -E exited ${enable.code}: ${enable.stderr.trim()}`);
     }
     const tokenMatch = /Token\s*:\s*(\d+)/.exec(`${enable.stdout}\n${enable.stderr}`);
-    if (tokenMatch) {
-      enableToken = tokenMatch[1];
+    if (tokenMatch === null) {
+      // Fail-closed (gate-round finding): a 0-exit `-E` with no parsable token
+      // enabled pf with a reference we cannot release at disarm. Refuse rather
+      // than proceed with an untracked reference (the catch below disarms).
+      throw new Error(
+        "pfctl -E exited 0 but printed no numeric token; refusing to arm with an " +
+          "untracked pf enable reference (cannot be released at disarm)",
+      );
     }
+    enableToken = tokenMatch[1];
 
     // Settle-probe: require N consecutive live results before declaring armed.
     const deadline = Date.now() + settleTimeoutMs;

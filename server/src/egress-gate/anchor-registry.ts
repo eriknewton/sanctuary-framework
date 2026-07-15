@@ -222,7 +222,39 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
   if (typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token)) {
     state.enable_token = loaded.enable_token;
   }
+  // Preserve the journaled `pending` set (gate finding: it was dropped on
+  // reload, making the two-phase journal dead across a crash). Validate it the
+  // same way as `committed`; a malformed journal is a REPAIR signal (dirty),
+  // never silently discarded.
+  if (loaded.pending !== undefined) {
+    const pending: PfAnchorRegistryEntry[] = [];
+    const pseen = new Set<number>();
+    let pendingOk = Array.isArray(loaded.pending);
+    if (pendingOk) {
+      for (const raw of loaded.pending) {
+        const e = validateEntry(raw);
+        if (e === null || pseen.has(e.agent_uid)) {
+          pendingOk = false;
+          break;
+        }
+        pseen.add(e.agent_uid);
+        pending.push(e);
+      }
+    }
+    if (pendingOk) {
+      state.pending = pending;
+    } else {
+      state.dirty = true;
+    }
+  }
   if (loaded.dirty === true) state.dirty = true;
+  // A non-empty committed set with no valid enable token is inconsistent (pf
+  // should be enabled and its reference releasable): treat as needs-repair
+  // (gate finding). reconcile-on-entry re-asserts the committed union, which
+  // re-acquires a fresh `-E` token.
+  if (committed.length > 0 && state.enable_token === undefined) {
+    state.dirty = true;
+  }
   return state;
 }
 
@@ -295,10 +327,19 @@ export class PfAnchorRegistry {
       ((entries) => checkPfAnchorUnionLiveness(runner, entries, anchorName));
   }
 
-  /** Read the current confined-uid set and whether repair is owed. Lockless snapshot. */
+  /**
+   * Read the current confined-uid set and whether repair is owed. Lockless
+   * snapshot. A journaled `pending` set (a mutation that was in flight when the
+   * process died) counts as dirty: the anchor may not match `committed` until
+   * the next mutation's reconcile-on-entry re-asserts it, so posture must not
+   * read green (gate finding: `pending` was ignored here).
+   */
   async list(): Promise<{ entries: PfAnchorRegistryEntry[]; dirty: boolean }> {
     const state = normalizeState(await this.store.load());
-    return { entries: state.committed, dirty: state.dirty === true };
+    return {
+      entries: state.committed,
+      dirty: state.dirty === true || state.pending !== undefined,
+    };
   }
 
   /**
@@ -359,8 +400,12 @@ export class PfAnchorRegistry {
       state.pending = desired;
       await this.store.save(state);
 
+      let forwardReleased = false;
       try {
-        await this.applyUnion(state, desired);
+        // `forwardReleased` is true iff this apply released the pf enable
+        // reference (the remove-last flush path). rollback needs it to decide
+        // whether to re-acquire a fresh `-E` vs reuse the prior token.
+        forwardReleased = await this.applyUnion(state, desired);
         state.committed = desired;
         delete state.pending;
         delete state.dirty;
@@ -369,7 +414,7 @@ export class PfAnchorRegistry {
       } catch (applyErr) {
         // Roll back to the previous committed union. Throws
         // PfAnchorRegistryDirtyError if the rollback itself fails.
-        await this.rollback(state, previousCommitted, previousToken, applyErr);
+        await this.rollback(state, previousCommitted, previousToken, forwardReleased, applyErr);
         throw applyErr;
       }
     });
@@ -377,23 +422,25 @@ export class PfAnchorRegistry {
 
   /**
    * Apply a desired set to the anchor: flush when empty (releasing the enable
-   * token), otherwise arm the union (reusing hook + enable + settle). Mutates
-   * `state.committed`/`state.enable_token` ONLY through its callers; here it
-   * only performs the pf side and updates `state.enable_token`.
+   * token), otherwise arm the union (reusing hook + enable + settle). Updates
+   * `state.enable_token` and returns whether it RELEASED the enable reference
+   * (the empty/flush path), so a caller's rollback knows to re-acquire a fresh
+   * `-E` rather than reuse a spent token (gate finding).
    */
   private async applyUnion(
     state: PfAnchorRegistryState,
     desired: PfAnchorRegistryEntry[],
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (desired.length === 0) {
       // Empty set: flush the anchor and release the pf enable reference. This
       // is the ONLY sanctioned `-F all`.
+      const hadToken = state.enable_token !== undefined;
       await this.disarm({
         anchorName: this.anchorName,
-        ...(state.enable_token !== undefined ? { enableToken: state.enable_token } : {}),
+        ...(hadToken ? { enableToken: state.enable_token } : {}),
       });
       delete state.enable_token;
-      return;
+      return hadToken;
     }
     const res = await this.armUnion(desired.map(toPolicy), {
       ...this.armOptions,
@@ -403,6 +450,7 @@ export class PfAnchorRegistry {
     if (res.enableToken !== undefined) {
       state.enable_token = res.enableToken;
     }
+    return false;
   }
 
   /**
@@ -414,12 +462,26 @@ export class PfAnchorRegistry {
    */
   private async reconcile(state: PfAnchorRegistryState): Promise<void> {
     if (state.committed.length === 0) {
-      // Nothing confined. Clear any stale dirty/pending; the next add re-loads
-      // the anchor from scratch (a `-f` load replaces the whole anchor).
+      // Nothing confined. If a repair marker is set (dirty, or a journaled
+      // pending from a crashed run), do a REAL repair -- actively flush the
+      // anchor + release any enable reference to reach a KNOWN-empty state --
+      // rather than just deleting the marker (gate finding: clearing dirty
+      // without proving the anchor empty could leave stale rules + a stuck pf
+      // enable while posture reads clean). Only clear the marker on success.
       if (state.dirty || state.pending !== undefined) {
-        delete state.dirty;
-        delete state.pending;
-        await this.store.save(state);
+        try {
+          await this.applyUnion(state, []); // disarm: `-F all` + release token
+          delete state.dirty;
+          delete state.pending;
+          await this.store.save(state);
+        } catch (repairErr) {
+          state.dirty = true;
+          await this.store.save(state).catch(() => undefined);
+          throw new PfAnchorRegistryDirtyError(
+            new Error("reconcile-on-entry could not flush the anchor to a known-empty state"),
+            repairErr,
+          );
+        }
       }
       return;
     }
@@ -445,25 +507,52 @@ export class PfAnchorRegistry {
 
   /**
    * Roll back a failed mutation by re-asserting the previous committed union.
-   * On success, restores committed/token and rethrows nothing (the caller
-   * rethrows the original apply error). On rollback failure, marks the
-   * registry dirty and throws {@link PfAnchorRegistryDirtyError}.
+   * On success, restores committed/token and returns (the caller rethrows the
+   * original apply error). On rollback failure, marks the registry dirty and
+   * throws {@link PfAnchorRegistryDirtyError}.
+   *
+   * `forwardReleased` (gate finding) tells rollback whether the FAILED apply
+   * already released the pf enable reference (the remove-last flush path). If
+   * so, `previousToken` is spent and pf is disabled, so rollback must re-arm
+   * the previous union with a FRESH `-E`, not reuse the dead token.
    */
   private async rollback(
     state: PfAnchorRegistryState,
     previousCommitted: PfAnchorRegistryEntry[],
     previousToken: string | undefined,
+    forwardReleased: boolean,
     cause: unknown,
   ): Promise<void> {
     try {
-      // Restore the token baseline so applyUnion re-enables/releases correctly.
-      if (previousToken !== undefined) {
-        state.enable_token = previousToken;
-      } else {
+      if (previousCommitted.length === 0) {
+        // The previous state was empty; a forward apply cannot have released a
+        // token it needed a non-empty prev to hold. Ensure the anchor is flushed
+        // to match (idempotent).
+        if (previousToken !== undefined) {
+          state.enable_token = previousToken;
+        } else {
+          delete state.enable_token;
+        }
+        await this.applyUnion(state, []);
+        state.committed = [];
+      } else if (forwardReleased) {
+        // The forward apply RELEASED the enable reference (remove-last flushed +
+        // `-X`, then the commit save failed). pf is disabled and `previousToken`
+        // is spent -- clear it so the re-arm acquires a FRESH `-E`.
         delete state.enable_token;
+        await this.applyUnion(state, previousCommitted);
+        state.committed = previousCommitted;
+      } else {
+        // The forward apply threw WITHOUT releasing (a mid-arm failure). The
+        // previous token, if any, is still live; re-assert with it.
+        if (previousToken !== undefined) {
+          state.enable_token = previousToken;
+        } else {
+          delete state.enable_token;
+        }
+        await this.applyUnion(state, previousCommitted);
+        state.committed = previousCommitted;
       }
-      await this.applyUnion(state, previousCommitted);
-      state.committed = previousCommitted;
       delete state.pending;
       delete state.dirty;
       await this.store.save(state);

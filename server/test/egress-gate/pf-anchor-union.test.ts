@@ -272,5 +272,69 @@ describe("egress-gate/pf-anchor union primitives", () => {
         /EMPTY union/,
       );
     });
+
+    it("releases its OWN acquired -E reference on a post-enable failure, and does NOT flush (gate finding)", async () => {
+      // Load + hook + enable succeed, but the anchor never becomes live (pf
+      // reports Disabled), so settle times out AFTER -E acquired a reference.
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 777\n") },
+        // liveness: pf reports DISABLED -> never live -> settle times out
+        infoCall(ok("Status: Disabled\n")),
+        anchorRulesCall(ok(canonicalUnionPrint([A]))),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
+        // the release on failure:
+        { match: (_c, a) => a[0] === "-X" && a[1] === "777", result: ok("") },
+      ]);
+      await expect(
+        armPfAnchorUnion(runner, [A], {
+          mainConfPath: "/dev/null",
+          settleConsecutive: 1,
+          settleDelayMs: 0,
+          settleTimeoutMs: 30,
+          sleep: async () => {},
+        }),
+      ).rejects.toThrow(/settle-probe timed out/);
+      // The acquired -E reference (token 777) was released via -X.
+      expect(runner.calls.some((c) => c[1] === "-X" && c[2] === "777")).toBe(true);
+      // The shared anchor was NOT flushed (would drop other uids).
+      expect(runner.calls.some((c) => c.includes("-F"))).toBe(false);
+    });
+
+    it("does NOT release a token it did not acquire (existing token belongs to a prior arm)", async () => {
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        infoCall(ok("Status: Disabled\n")), // never live
+        anchorRulesCall(ok(canonicalUnionPrint([A]))),
+        ifacesCall(ok(PF_IFACES_CLEAN)),
+      ]);
+      await expect(
+        armPfAnchorUnion(runner, [A], {
+          mainConfPath: "/dev/null",
+          existingEnableToken: "555",
+          settleConsecutive: 1,
+          settleDelayMs: 0,
+          settleTimeoutMs: 30,
+          sleep: async () => {},
+        }),
+      ).rejects.toThrow(/settle-probe timed out/);
+      // Never -X the existing token (a prior arm / other uid still depends on it),
+      // and never -E (already enabled).
+      expect(runner.calls.some((c) => c[1] === "-X")).toBe(false);
+      expect(runner.calls.some((c) => c[1] === "-E")).toBe(false);
+    });
+
+    it("fails closed when pfctl -E exits 0 but prints no numeric token (gate finding)", async () => {
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        { match: (_c, a) => a[0] === "-E", result: ok("pf enabled (no token line)\n") },
+      ]);
+      await expect(
+        armPfAnchorUnion(runner, [A], { mainConfPath: "/dev/null", ...settleFast }),
+      ).rejects.toThrow(/no numeric token/);
+    });
   });
 });

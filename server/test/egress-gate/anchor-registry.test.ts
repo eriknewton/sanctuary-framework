@@ -307,4 +307,113 @@ describe("egress-gate/anchor-registry", () => {
     expect(disarmCalls).toHaveLength(0);
     expect(store.current?.committed).toHaveLength(1);
   });
+
+  // ── gate-round fix-round tests ──────────────────────────────────────────
+
+  it("list() reports dirty when a journaled pending set is present (crashed mid-mutation)", async () => {
+    const { registry } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [A],
+        enable_token: "1",
+        pending: [A, B],
+      },
+    });
+    const listed = await registry.list();
+    expect(listed.dirty).toBe(true);
+  });
+
+  it("list() reports dirty when committed is non-empty but the enable token is missing", async () => {
+    const { registry } = makeRegistry({
+      // No enable_token despite a non-empty committed set: inconsistent -> dirty.
+      initial: { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed: [A] },
+    });
+    const listed = await registry.list();
+    expect(listed.dirty).toBe(true);
+  });
+
+  it("a journaled pending forces reconcile to re-assert committed before the next mutation", async () => {
+    const { registry, armCalls } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [A],
+        enable_token: "1",
+        pending: [A, B], // a crashed prior mutation left this journal
+      },
+    });
+    await registry.addOrUpdate(B);
+    // reconcile re-asserts committed [A] (because pending was set), THEN the
+    // mutation applies [A,B].
+    expect(armCalls).toEqual([
+      { uids: [502], existingEnableToken: "1" },
+      { uids: [502, 504], existingEnableToken: "1" },
+    ]);
+  });
+
+  it("reconcile on an empty-but-dirty registry ACTIVELY flushes before proceeding (gate finding)", async () => {
+    const { registry, disarmCalls } = makeRegistry({
+      initial: { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed: [], dirty: true },
+    });
+    await registry.addOrUpdate(A);
+    // The empty+dirty reconcile flushed the anchor to a known-empty state
+    // (disarm called) rather than just clearing the marker.
+    expect(disarmCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("stays DIRTY when the empty-registry repair flush itself fails (gate finding)", async () => {
+    const { registry, store } = makeRegistry({
+      initial: { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed: [], dirty: true },
+      disarmImpl: async () => {
+        throw new Error("flush failed");
+      },
+    });
+    await expect(registry.addOrUpdate(A)).rejects.toBeInstanceOf(PfAnchorRegistryDirtyError);
+    expect(store.current?.dirty).toBe(true);
+  });
+
+  it("rollback of a failed remove-last re-arms with a FRESH -E, not the released token (gate finding)", async () => {
+    // Store throws on the COMMIT save (2nd save: after pending journal), so the
+    // remove-last forward path (flush + -X token) succeeds but the commit fails.
+    let saveN = 0;
+    let current: PfAnchorRegistryState | null = {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [B],
+      enable_token: "1",
+    };
+    const store: PfAnchorRegistryStore = {
+      async load() {
+        return current === null ? null : structuredClone(current);
+      },
+      async save(s) {
+        saveN += 1;
+        if (saveN === 2) throw new Error("commit save failed"); // the commit
+        current = structuredClone(s);
+      },
+    };
+    const armCalls: Array<{ uids: number[]; existingEnableToken?: string }> = [];
+    const disarmCalls: Array<{ enableToken?: string }> = [];
+    const reg = new PfAnchorRegistry({
+      store,
+      lock: memLock(),
+      runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
+      armUnion: async (entries, options) => {
+        armCalls.push({
+          uids: entries.map((e) => e.agent_uid),
+          ...(options.existingEnableToken !== undefined
+            ? { existingEnableToken: options.existingEnableToken }
+            : {}),
+        });
+        return okArm(options.existingEnableToken ?? "2"); // fresh -E yields token "2"
+      },
+      disarm: async (options) => {
+        disarmCalls.push({ ...(options.enableToken !== undefined ? { enableToken: options.enableToken } : {}) });
+      },
+      unionLiveness: async () => live,
+    });
+    await expect(reg.remove(504)).rejects.toThrow(/commit save failed/);
+    // Forward flush released token "1"; rollback re-armed [B] with a FRESH -E
+    // (no existingEnableToken), never reusing the spent token.
+    expect(disarmCalls).toEqual([{ enableToken: "1" }]);
+    expect(armCalls).toEqual([{ uids: [504] }]); // fresh -E, no existing token
+  });
 });
