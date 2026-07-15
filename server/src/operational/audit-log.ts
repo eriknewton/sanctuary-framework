@@ -1441,6 +1441,24 @@ export function auditChainVerdictUntampered(v: AuditChainVerdict): boolean {
   return v.status !== "findings";
 }
 
+/**
+ * F2 round-4 HIGH-1 (2026-07-15): the AMBER caveat companion to
+ * {@link auditChainVerdictUntampered}. True when the chain is untampered at
+ * this privilege BUT the sealed history could not be re-verified here
+ * (`verified_suffix_only`, i.e. an armed box's operator uid cannot read the
+ * root-owned sealed region). An operational/arm gate may treat this as non-red
+ * (untampered), but an EVIDENCE surface must NOT render it as a fully-`verified`
+ * green: it renders amber ("sealed history not re-verifiable at this privilege;
+ * run as root for a full verify"). Distinct from `findings` (active tamper) and
+ * from `verified` (fully clean). Callers pair this with `untampered` so the
+ * green claim stays reserved for `auditChainVerdictClaimsClean`.
+ */
+export function auditChainVerdictSealedUnverifiedAtPrivilege(
+  v: AuditChainVerdict
+): boolean {
+  return v.status === "verified_suffix_only";
+}
+
 export class AuditLog {
   private storage: StorageBackend;
   private encryptionKey: Uint8Array;

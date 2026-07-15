@@ -69,7 +69,11 @@
  */
 
 import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
-import { auditChainVerdictUntampered, foldAuditChainVerdict } from "../operational/audit-log.js";
+import {
+  auditChainVerdictUntampered,
+  auditChainVerdictSealedUnverifiedAtPrivilege,
+  foldAuditChainVerdict,
+} from "../operational/audit-log.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -1395,8 +1399,19 @@ export interface FeatureHealthPanel {
    * enforcement path. See `plugin-feature-health.ts`.
    */
   plugin_rows: PluginHealthRow[];
-  /** True when the backing audit read was integrity-clean. */
+  /** True when the backing audit read was untampered (findings-free). This is
+   * the OPERATIONAL gate: it stays true over an armed box's
+   * `verified_suffix_only` so a correctly-armed fortress is not falsely flagged.
+   * A fully-verified sealed region is NOT required here; that distinction is
+   * carried by {@link FeatureHealthPanel.sealed_region_unverified_at_privilege}. */
   audit_integrity_ok: boolean;
+  /** F2 round-4 HIGH-1: AMBER caveat. True when the chain is untampered but the
+   * sealed history could not be re-verified at this privilege
+   * (`verified_suffix_only`). Green rows remain honest only when a reader treats
+   * this as "sealed not re-verified here (run as root for a full verify)", never
+   * as fully-verified integrity. False when fully verified, when tainted, or when
+   * there is no sealed region. */
+  sealed_region_unverified_at_privilege: boolean;
   /**
    * Honest disclosure, surfaced to the UI: broken-zero (a silently-disabled
    * feature) is UNDETECTABLE for purely event-driven features in Slice 1.
@@ -1527,6 +1542,13 @@ export async function buildFeatureHealthPanel(
 
   let entries: AuditEntry[];
   let integrityOk: boolean;
+  // F2 round-4 HIGH-1 (2026-07-15): amber caveat. Feature rows stay ALIVE over
+  // an armed box's `verified_suffix_only` (the operator uid cannot read the
+  // root-owned sealed history — forcing every armed box to `unknown` would cry
+  // wolf), but this evidence surface must SAY that the sealed history was not
+  // re-verified here rather than presenting a bare green. `audit_integrity_ok`
+  // stays the operational untampered gate; this is the honest amber companion.
+  let sealedUnverifiedAtPrivilege = false;
   let freshnessComplete = true;
   let lifecycleHistoryComplete = true;
   try {
@@ -1548,12 +1570,13 @@ export async function buildFeatureHealthPanel(
     // sealed history is merely unreadable at operator privilege, but flips to
     // NOT-ok on any real tamper (routine finding OR a sealed hash_mismatch /
     // incomplete).
-    integrityOk = auditChainVerdictUntampered(
-      foldAuditChainVerdict(
-        result.integrity_findings.length,
-        await input.auditLog.verifySealedRegion(),
-      ),
+    const foldedVerdict = foldAuditChainVerdict(
+      result.integrity_findings.length,
+      await input.auditLog.verifySealedRegion(),
     );
+    integrityOk = auditChainVerdictUntampered(foldedVerdict);
+    sealedUnverifiedAtPrivilege =
+      auditChainVerdictSealedUnverifiedAtPrivilege(foldedVerdict);
 
     // Lifecycle evidence (heartbeat + intentional stand-down) must not be
     // crowded out by unrelated high-volume audit traffic. Query those exact
@@ -1685,6 +1708,7 @@ export async function buildFeatureHealthPanel(
     rows,
     plugin_rows: pluginRows,
     audit_integrity_ok: integrityOk,
+    sealed_region_unverified_at_privilege: sealedUnverifiedAtPrivilege,
     disclosure: {
       broken_zero_undetectable_for_event_driven: true,
       // Slice 2: silent death is now DETECTED (a missing heartbeat reads

@@ -665,6 +665,38 @@ describe("getProtectionSnapshot", () => {
         })
       );
       expect(snap.layers.l1.headline).toBe("State encrypted at rest");
+      expect(snap.layers.l1.memory_attest_ready).toBe(true);
+    });
+
+    it("F2 HIGH-1: verified_suffix_only earns amber, NEVER the green 'State encrypted at rest' / memory_attest_ready", async () => {
+      // An armed box: the operator uid cannot read the root-owned sealed region,
+      // so the shared verdict is `verified_suffix_only` (untampered but NOT
+      // fully verified). This is the false-green the round-4 gate caught: the
+      // dashboard used to render "State encrypted at rest" + memory_attest_ready
+      // over it. It must now render an honest amber caveat instead.
+      const suffixOnlyLog = {
+        query: async () => ({ entries: [], total: 0, integrity_findings: [] }),
+        runEagerReads: <T>(fn: () => Promise<T>): Promise<T> => fn(),
+        getAuditChainVerdict: async () => ({
+          status: "verified_suffix_only",
+          routine_finding_count: 0,
+          sealed_region: { status: "unreadable", note: "operator-uid EACCES" },
+        }),
+        append: () => undefined,
+        size: 0,
+      } as unknown as AuditLog;
+
+      const snap = await getProtectionSnapshot(
+        baseSources({
+          identityManager: stubIdentityManager(stubIdentity()),
+          auditLog: suffixOnlyLog,
+        })
+      );
+      expect(snap.layers.l1.headline).toBe(
+        "State encrypted; sealed history not re-verifiable at this privilege (run as root for a full verify)"
+      );
+      expect(snap.layers.l1.headline).not.toBe("State encrypted at rest");
+      expect(snap.layers.l1.memory_attest_ready).toBe(false);
     });
   });
 

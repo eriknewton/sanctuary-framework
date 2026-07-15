@@ -1849,6 +1849,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
           verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
           audit_integrity_ok: true,
+          sealed_region_unverified_at_privilege: false,
           producer_authenticity: "not_applicable",
         };
       }
@@ -1891,6 +1892,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         freshness_window_ms: DEFAULT_ENFORCEMENT_FRESHNESS_MS,
         verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
         audit_integrity_ok: false,
+        sealed_region_unverified_at_privilege: false,
         producer_authenticity: "not_applicable",
       };
     }

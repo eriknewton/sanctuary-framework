@@ -41,6 +41,7 @@
 import {
   auditChainVerdictClaimsClean,
   auditChainVerdictUntampered,
+  auditChainVerdictSealedUnverifiedAtPrivilege,
   type AuditLog,
   type AuditChainVerdict,
   type AuditChainVerdictStatus,
@@ -237,8 +238,19 @@ export interface CastleWallPosture {
   freshness_window_ms: number;
   /** Verdict counts over the digest window. */
   verdict_counts: CastleWallVerdictCounts;
-  /** True when an integrity finding tainted the audit read backing this. */
+  /** True when the audit read backing this was untampered (no active tamper).
+   * OPERATIONAL gate: stays true over an armed box's `verified_suffix_only`
+   * (operator uid cannot read the root-owned sealed history) so a correctly-armed
+   * fortress is not falsely flagged; the full-verify distinction is carried by
+   * {@link sealed_region_unverified_at_privilege}. */
   audit_integrity_ok: boolean;
+  /** F2 round-4 HIGH-1: AMBER caveat. True when the arm-backing audit read was
+   * untampered but the sealed history could not be re-verified at this privilege
+   * (`verified_suffix_only`). The arm gate treats this as non-red, but the UI
+   * must render it amber ("sealed history not re-verifiable at this privilege"),
+   * never as fully-verified green. False when fully verified, tainted, or when
+   * there is no sealed region. */
+  sealed_region_unverified_at_privilege: boolean;
   /**
    * The CRYPTOGRAPHIC basis the green light rests on — surfaced honestly so the
    * UI never over-claims (never-overclaim ethos). This is independent of the
@@ -335,6 +347,7 @@ export async function buildCastleWallPosture(
       freshness_window_ms: freshnessWindowMs,
       verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
       audit_integrity_ok: true,
+      sealed_region_unverified_at_privilege: false,
       producer_authenticity: "not_applicable",
     };
   }
@@ -345,6 +358,8 @@ export async function buildCastleWallPosture(
   const digestSince = new Date(now - digestWindowMs).toISOString();
   let entries;
   let integrityOk: boolean;
+  // F2 round-4 HIGH-1: amber caveat companion to `integrityOk` (see interface).
+  let sealedUnverifiedAtPrivilege = false;
   try {
     const result = await input.auditLog.query({
       since: digestSince,
@@ -357,10 +372,12 @@ export async function buildCastleWallPosture(
     // routine query skips). Use the UNTAMPERED collapse: block arm only on
     // active tamper (findings), NOT on `verified_suffix_only` (an armed box's
     // operator uid cannot read the root-owned sealed history — that must not
-    // flip every armed box's arm-state to unknown).
-    integrityOk = auditChainVerdictUntampered(
-      await input.auditLog.getAuditChainVerdict(),
-    );
+    // flip every armed box's arm-state to unknown). The suffix-only case is
+    // surfaced separately as an amber caveat (never as fully-verified green).
+    const armVerdict = await input.auditLog.getAuditChainVerdict();
+    integrityOk = auditChainVerdictUntampered(armVerdict);
+    sealedUnverifiedAtPrivilege =
+      auditChainVerdictSealedUnverifiedAtPrivilege(armVerdict);
   } catch {
     // A failed/ tainted read must NOT be reported as armed. Fail closed to
     // unknown with integrity flagged.
@@ -373,6 +390,7 @@ export async function buildCastleWallPosture(
       freshness_window_ms: freshnessWindowMs,
       verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
       audit_integrity_ok: false,
+      sealed_region_unverified_at_privilege: false,
       producer_authenticity: "not_applicable",
     };
   }
@@ -559,6 +577,7 @@ export async function buildCastleWallPosture(
     freshness_window_ms: freshnessWindowMs,
     verdict_counts: verdictCounts,
     audit_integrity_ok: integrityOk,
+    sealed_region_unverified_at_privilege: sealedUnverifiedAtPrivilege,
     producer_authenticity: producerAuthenticity,
   };
 }

@@ -12,6 +12,8 @@
 
 import {
   auditChainVerdictUntampered,
+  auditChainVerdictClaimsClean,
+  auditChainVerdictSealedUnverifiedAtPrivilege,
   type AuditLog,
   type AuditEntry,
 } from "../operational/audit-log.js";
@@ -344,7 +346,15 @@ function buildCognitive(
    * could not confirm the chain) we downgrade to the honest "Encryption
    * configured" (the crypto is set up, but nothing live confirms it right now).
    */
-  hasLiveIntegrityEvidence: boolean
+  hasLiveIntegrityEvidence: boolean,
+  /**
+   * F2 round-4 HIGH-1: true when the chain is untampered but the sealed history
+   * was not re-verifiable at this privilege (`verified_suffix_only`, the armed-box
+   * operator-uid case). Renders an honest AMBER headline distinct from both the
+   * green "encrypted at rest" (which requires full `verified`) and the blank
+   * "no live integrity check" (which implies nothing was checked).
+   */
+  sealedUnverifiedAtPrivilege = false
 ): CognitiveStatus {
   const hasIdentity = !!sources.identityManager?.getDefault();
   const state: LayerState = hasIdentity ? "full" : "degraded";
@@ -353,6 +363,9 @@ function buildCognitive(
     headline = "No sovereign identity — run sanctuary_bootstrap";
   } else if (hasLiveIntegrityEvidence) {
     headline = "State encrypted at rest";
+  } else if (sealedUnverifiedAtPrivilege) {
+    headline =
+      "State encrypted; sealed history not re-verifiable at this privilege (run as root for a full verify)";
   } else {
     headline = "Encryption configured (no live integrity check)";
   }
@@ -704,6 +717,11 @@ export async function getProtectionSnapshot(
   // live read; it gates the L1 "State encrypted at rest" enforcement claim,
   // which must never be asserted from config-presence alone (never-overclaim).
   let hasLiveIntegrityEvidence = false;
+  // Amber companion to `hasLiveIntegrityEvidence`: true when the chain is
+  // untampered but the sealed history was not re-verifiable at this privilege
+  // (`verified_suffix_only`). Lets the cognitive headline read an honest amber
+  // instead of falsely green or misleadingly "no live integrity check".
+  let sealedUnverifiedAtPrivilege = false;
   if (sources.auditLog) {
     // Local binding so the eager-scope closure keeps the AuditLog type (and the
     // `.query` receiver terminal name stays `auditLog`, which the agent-audit
@@ -738,26 +756,41 @@ export async function getProtectionSnapshot(
       audit = result.entries;
       // BLOCKER-1 (round 3): the overall-light integrity gate must reflect the
       // sealed-region verdict (the routine query skips sealed content). Run the
-      // shared verdict (inside the same eager-read scope) and use the UNTAMPERED
-      // collapse: red/compromised only on active tamper, not on an armed box's
-      // unreadable sealed history. `hasLiveIntegrityEvidence` still requires a
-      // real, present findings array (a non-conforming stub earns nothing).
+      // shared verdict (inside the same eager-read scope).
       const verdict = await auditLog.runEagerReads(() =>
         auditLog.getAuditChainVerdict(),
       );
+      // The overall-light OPERATIONAL gate is non-red on anything UNTAMPERED
+      // (findings-free), including an armed box's `verified_suffix_only` where
+      // the operator uid cannot read the root-owned sealed history — that must
+      // NOT flip every armed box's light to red.
       auditIntegrityOk = auditChainVerdictUntampered(verdict);
+      // F2 round-4 HIGH-1 (2026-07-15): `hasLiveIntegrityEvidence` drives the
+      // AFFIRMATIVE green claims "State encrypted at rest" + `memory_attest_ready`.
+      // Those are fully-verified evidence claims, so they require a full
+      // `verified` chain (routine clean AND sealed re-verified). A
+      // `verified_suffix_only` is untampered-but-not-fully-verified: it earns the
+      // non-red operational light above, but NOT the green integrity evidence
+      // (previously it did, a false green on armed boxes). It still also requires
+      // a real, present findings array (a non-conforming stub earns nothing).
       hasLiveIntegrityEvidence =
         Array.isArray(result.integrity_findings) &&
-        auditChainVerdictUntampered(verdict);
+        auditChainVerdictClaimsClean(verdict);
+      // Amber caveat: distinguish "sealed not re-verifiable at this privilege"
+      // from a plain "no live integrity check", so the cognitive headline is
+      // honest rather than either falsely green or misleadingly blank.
+      sealedUnverifiedAtPrivilege =
+        auditChainVerdictSealedUnverifiedAtPrivilege(verdict);
     } catch {
       audit = [];
       auditIntegrityOk = false;
       hasLiveIntegrityEvidence = false;
+      sealedUnverifiedAtPrivilege = false;
     }
   }
 
   const agent = buildAgent(sources);
-  const l1 = buildCognitive(sources, audit, hasLiveIntegrityEvidence);
+  const l1 = buildCognitive(sources, audit, hasLiveIntegrityEvidence, sealedUnverifiedAtPrivilege);
   const l2 = buildOperational(sources, audit);
   const l3 = buildDisclosure(sources, audit);
   const l4 = buildReputation(sources);
