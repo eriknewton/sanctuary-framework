@@ -775,13 +775,13 @@ function renderHumanReview(
  * `absent` prints nothing (a non-split fortress; the operator store is the whole
  * census, unchanged). `included` states the merge. `present_unreadable` is a
  * COVERAGE NOTICE: the daemon store exists but could not be read at this
- * privilege, so its enforcement events are NOT in the counts above — never a
- * silent omission.
+ * privilege, so its enforcement events are NOT in the counts above (never a
+ * silent omission).
  */
 function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
   // Defensive: a coverage report produced before this field existed (or a
-  // partial test fixture) has no daemon disclosure — treat as `absent` (a
-  // non-split fortress), i.e. print nothing rather than throw.
+  // partial test fixture) has no daemon disclosure, treated as `absent` (a
+  // non-split fortress): print nothing rather than throw.
   if (!d || d.status === "absent") return [];
   if (d.status === "included") {
     return [

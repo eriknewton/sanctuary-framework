@@ -762,7 +762,7 @@ export async function getProtectionSnapshot(
       );
       // The overall-light OPERATIONAL gate is non-red on anything UNTAMPERED
       // (findings-free), including an armed box's `verified_suffix_only` where
-      // the operator uid cannot read the root-owned sealed history — that must
+      // the operator uid cannot read the root-owned sealed history, which must
       // NOT flip every armed box's light to red.
       auditIntegrityOk = auditChainVerdictUntampered(verdict);
       // F2 round-4 HIGH-1 (2026-07-15): `hasLiveIntegrityEvidence` drives the

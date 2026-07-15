@@ -1544,8 +1544,8 @@ export async function buildFeatureHealthPanel(
   let integrityOk: boolean;
   // F2 round-4 HIGH-1 (2026-07-15): amber caveat. Feature rows stay ALIVE over
   // an armed box's `verified_suffix_only` (the operator uid cannot read the
-  // root-owned sealed history — forcing every armed box to `unknown` would cry
-  // wolf), but this evidence surface must SAY that the sealed history was not
+  // root-owned sealed history, and forcing every armed box to `unknown` would
+  // cry wolf), but this evidence surface must SAY the sealed history was not
   // re-verified here rather than presenting a bare green. `audit_integrity_ok`
   // stays the operational untampered gate; this is the honest amber companion.
   let sealedUnverifiedAtPrivilege = false;
