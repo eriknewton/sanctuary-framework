@@ -1676,15 +1676,24 @@ export class AuditLog {
   }
 
   /**
-   * BLOCKER-1 (adversarial re-gate round 3, 2026-07-14): crypto-re-verify the
-   * sealed legacy region's CONTENT using this instance's own `storage` +
-   * `splitBoundaryMacKey` (no master key needed; the walk reads envelope bytes
-   * and recomputes hashes). Memoized on a cheap sealed-region fingerprint
-   * (count + newest key + size/mtime aggregate over the sealed entries), which
-   * changes on ANY tamper (in-place edit changes size/mtime; delete changes
-   * count/key), so repeated clean-claim calls are cheap while a tamper always
-   * forces a re-walk. Returns `not_present` for a non-filesystem backend or a
-   * daemon instance (`consultSplitBoundary: false`).
+   * BLOCKER-1 (adversarial re-gate round 3, 2026-07-14; hardened round 5,
+   * 2026-07-15): crypto-re-verify the sealed legacy region's CONTENT using this
+   * instance's own `storage` + `splitBoundaryMacKey` (no master key needed; the
+   * walk reads envelope bytes and recomputes hashes). Memoized on a
+   * CONTENT-authenticated sealed-region fingerprint (see
+   * {@link sealedRegionFingerprint}): the fingerprint reads the same stored
+   * envelope bytes the verifier reads and folds them into a SHA-256, so any
+   * in-place edit or deletion of a sealed entry flips it and forces a full
+   * re-walk. A cache hit skips only the more expensive decrypt-free chain
+   * recompute + tip-MAC match, not the tamper check itself. Returns
+   * `not_present` for a non-filesystem backend or a daemon instance
+   * (`consultSplitBoundary: false`).
+   *
+   * Round-5 note: the prior fingerprint keyed on count + size/mtime metadata,
+   * which the exact in-place sealed-tamper adversary can forge (a same-length
+   * ciphertext-byte flip preserves size; `utimes`/`touch -r` restores mtime),
+   * so a long-lived process served a STALE `verified` over a real sealed tamper.
+   * Metadata is NOT a tamper-detection guarantee; only reading the bytes is.
    */
   async verifySealedRegion(): Promise<SealedRegionVerdict> {
     if (!this.consultSplitBoundary || !this.filesystemCapabilities) {
@@ -1718,11 +1727,18 @@ export class AuditLog {
     return verdict;
   }
 
-  /** Cheap metadata fingerprint of ONLY the sealed region (entries at or below
-   * the boundary tip): count + newest key + per-entry size/mtime aggregate. No
-   * read/decrypt. Any in-place edit (size/mtime) or deletion (count/key) of a
-   * sealed entry flips it. Returns "no-boundary" when there is no valid boundary
-   * (nothing sealed) so the memo key is stable for the common case. */
+  /** CONTENT-authenticated fingerprint of ONLY the sealed region (entries at or
+   * below the boundary tip). Reads the SAME stored envelope bytes the verifier
+   * ({@link verifySealedRegionAt}) reads and folds each entry's key + raw bytes
+   * into a SHA-256, so any in-place byte edit or deletion of a sealed entry
+   * changes the digest and forces a re-walk. It deliberately does NOT use file
+   * size/mtime: both are attacker-forgeable (a same-length ciphertext-byte flip
+   * preserves size; mtime can be restored via `utimes`), so metadata can never
+   * be the trust basis for reusing a cached `verified`. Returns "no-boundary"
+   * when there is no valid boundary (nothing sealed) so the memo key is stable
+   * for the common case; "empty" when the boundary sealed an empty chain.
+   * Propagates a read error (e.g. EACCES on an armed box) to the caller, which
+   * forces a walk that reports `unreadable` (and is not cached). */
   private async sealedRegionFingerprint(): Promise<string> {
     const boundary = await this.loadSplitBoundary();
     if (boundary.status !== "valid") return "no-boundary";
@@ -1734,14 +1750,16 @@ export class AuditLog {
       return seq !== null && seq <= tip;
     });
     sealed.sort((a, b) => a.key.localeCompare(b.key));
-    let sizeSum = 0;
-    let mtimeAgg = 0;
+    // Fold the actual stored bytes of every sealed entry into the digest. Any
+    // in-place tamper flips a per-entry hash; a deletion drops a key from the
+    // run (marked "<absent>" if it vanishes between list and read). A read
+    // failure throws out of here so the caller falls through to a fresh walk.
+    const parts: string[] = [`tip=${tip}`, `count=${sealed.length}`];
     for (const m of sealed) {
-      sizeSum += m.size_bytes;
-      mtimeAgg ^= Date.parse(m.modified_at) || 0;
+      const raw = await this.storage.read(AUDIT_NAMESPACE, m.key);
+      parts.push(`${m.key}:${raw ? sha256Hex(raw) : "<absent>"}`);
     }
-    const newest = sealed.length > 0 ? sealed[sealed.length - 1]!.key : "";
-    return `${tip}:${sealed.length}:${newest}:${sizeSum}:${mtimeAgg}`;
+    return sha256Hex(parts.join("\n"));
   }
 
   /**
