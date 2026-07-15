@@ -62,7 +62,7 @@ function emittedGateOpPrefixes(): Set<string> {
   // categorized in GATE_DECISION_OP_CATEGORIES.
   if (/operation:\s*`gate_\$\{[^}]*decision[^}]*\}:/.test(src)) {
     const members = new Set<string>();
-    for (const decl of src.matchAll(/\bdecision:\s*((?:"[a-z_]+"\s*\|?\s*)+);/g)) {
+    for (const decl of src.matchAll(/\bdecision:\s*("[a-z_]+"(?:\s*\|\s*"[a-z_]+")*)\s*;/g)) {
       for (const lit of decl[1]!.matchAll(/"([a-z_]+)"/g)) {
         members.add(lit[1]!);
       }
