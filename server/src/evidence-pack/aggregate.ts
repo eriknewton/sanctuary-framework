@@ -316,5 +316,9 @@ export function detectShortfall(
     retention_at_cap: retentionAtCap,
     zero_of_quarter_covered: zeroOfQuarterCovered,
     explanation: parts.join(" "),
+    // WATCH-1: carry the daemon-store disclosure onto the coverage report so the
+    // enforcement-summary section can state whether daemon-recorded enforcement
+    // events are included in the counts.
+    daemon_store: retention.daemon_store,
   };
 }

@@ -82,6 +82,7 @@ const FULL_COVERAGE: RetentionFacts = {
   retained_total_size_bytes: 0,
   ever_pruned: false,
   earliest_retained_at: "2026-06-01T00:00:00.000Z",
+  daemon_store: { status: "absent", included_entry_count: 0 },
 };
 
 /** Deps with a populated audit read. */
@@ -178,6 +179,40 @@ describe("buildEvidencePack", () => {
     expect(coverage(pack).shortfall).toBe(true);
     expect(coverage(pack).retention_at_cap).toBe(true);
     expect(pack.files[0]!.content).toContain("COVERAGE NOTICE");
+  });
+
+  it("WATCH-1: discloses a present-but-unreadable daemon enforcement store in the report", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "present_unreadable", included_entry_count: 0 },
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("_audit-daemon");
+    expect(report).toContain("NOT included in the counts");
+    expect(report).toContain("Re-run the pack as root");
+  });
+
+  it("WATCH-1: states that an included daemon enforcement store was merged", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "included", included_entry_count: 7 },
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("Daemon enforcement store: included");
+    expect(report).toContain("7 daemon-recorded enforcement entries");
+  });
+
+  it("WATCH-1: an absent daemon store adds no daemon disclosure (non-split fortress unchanged)", () => {
+    const pack = buildEvidencePack(baseInput(), deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")]));
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("_audit-daemon");
+    expect(report).not.toContain("Daemon enforcement store");
   });
 
   it("N2: an all-post-quarter completed quarter cover banner says NONE covered, not the generic 'does not reach the start'", () => {

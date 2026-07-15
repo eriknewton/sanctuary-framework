@@ -126,6 +126,30 @@ export interface QuarterAggregation {
  * FIFO, not time-based, so a busy fortress can prune early-quarter entries
  * before generation day (spec risk #6).
  */
+/**
+ * WATCH-1 (F2 audit-store split, 2026-07-15): the F2 migration moves
+ * daemon-produced enforcement records (Castle Wall gate decisions, egress
+ * denials, producer-signed daemon entries) out of the operator `_audit`
+ * namespace into a separate root-owned `_audit-daemon` store. The evidence pack
+ * reads the operator store; this descriptor makes the daemon store's
+ * contribution EXPLICIT so the census is never a silent single-store false
+ * count. Three honest states:
+ *   - `absent`: no daemon store exists (a fresh / never-armed fortress). The
+ *     operator store is the whole census.
+ *   - `included`: the daemon store was read at this privilege and its entries
+ *     were MERGED into the census (its retention counted independently).
+ *   - `present_unreadable`: a daemon store EXISTS but could not be read at this
+ *     privilege (the expected operator-uid case on an armed box). Its records
+ *     are NOT in the counts; the pack DISCLOSES the omission rather than
+ *     presenting the operator-only view as complete. Re-run as root for a full
+ *     census.
+ */
+export interface DaemonStoreDisclosure {
+  status: "absent" | "included" | "present_unreadable";
+  /** Daemon-store entries merged into the census (only when `included`). */
+  included_entry_count: number;
+}
+
 export interface RetentionFacts {
   /** Configured maximum retained entry count (FIFO cap). */
   max_entries: number;
@@ -153,6 +177,11 @@ export interface RetentionFacts {
    * from before it are not available for this quarter.
    */
   earliest_retained_at: string | null;
+  /**
+   * WATCH-1: whether the F2 daemon enforcement store (`_audit-daemon`) exists
+   * and whether its records are in this census. See {@link DaemonStoreDisclosure}.
+   */
+  daemon_store: DaemonStoreDisclosure;
 }
 
 /**
@@ -212,6 +241,12 @@ export interface ShortfallReport {
   zero_of_quarter_covered: boolean;
   /** A lay-reader explanation suitable for printing in the PDF. */
   explanation: string;
+  /**
+   * WATCH-1: the F2 daemon enforcement store's disclosure, carried onto the
+   * coverage report so the enforcement-summary section can state honestly
+   * whether daemon-recorded enforcement events are included in the counts.
+   */
+  daemon_store: DaemonStoreDisclosure;
 }
 
 /**

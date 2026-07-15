@@ -23,6 +23,7 @@
 
 import type {
   CustodyFacts,
+  DaemonStoreDisclosure,
   EvidencePackInput,
   InventoryAgentRow,
   InventoryMcpServerRow,
@@ -769,6 +770,37 @@ function renderHumanReview(
 
 // ── Section 7: access-log and enforcement summary ────────────────────
 
+/**
+ * WATCH-1: render the F2 daemon enforcement store's contribution to the census.
+ * `absent` prints nothing (a non-split fortress; the operator store is the whole
+ * census, unchanged). `included` states the merge. `present_unreadable` is a
+ * COVERAGE NOTICE: the daemon store exists but could not be read at this
+ * privilege, so its enforcement events are NOT in the counts above — never a
+ * silent omission.
+ */
+function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
+  // Defensive: a coverage report produced before this field existed (or a
+  // partial test fixture) has no daemon disclosure — treat as `absent` (a
+  // non-split fortress), i.e. print nothing rather than throw.
+  if (!d || d.status === "absent") return [];
+  if (d.status === "included") {
+    return [
+      `Daemon enforcement store: included. ${d.included_entry_count} ` +
+        "daemon-recorded enforcement entries (from the root-owned _audit-daemon " +
+        "store created by the audit-store split) are merged into the counts above.",
+      "",
+    ];
+  }
+  return [
+    "> COVERAGE NOTICE: a separate root-owned daemon enforcement store " +
+      "(_audit-daemon) is present but was NOT readable at this privilege, so " +
+      "daemon-recorded enforcement events (automated Castle Wall gate decisions " +
+      "and egress denials) are NOT included in the counts above. Re-run the pack " +
+      "as root for a complete enforcement census.",
+    "",
+  ];
+}
+
 function renderAccessLog(
   aggregation: ReadOutcome<QuarterAggregation>,
   shortfall: ReadOutcome<ShortfallReport>
@@ -815,6 +847,11 @@ function renderAccessLog(
       `Covered window attested for this quarter: ${s.covered_from} to ${s.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter; it reflects what the retained audit log spans and does not by itself prove the enforcement stack was running and recording at every moment within it.`,
       "",
       ...(s.shortfall ? ["> COVERAGE NOTICE: " + s.explanation, ""] : []),
+      // WATCH-1: the F2 audit-store split routes daemon-produced enforcement
+      // records (Castle Wall gate decisions, egress denials) into a separate
+      // root-owned store. State its contribution explicitly so the counts above
+      // are never read as a complete census when a second store exists.
+      ...daemonStoreNote(s.daemon_store),
     ],
     emptyVerified: () => [],
     readFailed: (reason) => [
