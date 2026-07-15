@@ -105,6 +105,14 @@ public enum AllowlistEvaluator {
         return operatorBaselineUidRuleId
     }
 
+    /// INVARIANT (harden against future refactors): `operator_baseline.essentials`
+    /// is consulted ONLY to LABEL the matched-rule id AFTER a flow has already
+    /// been positively classified `.operator` and taken the allow fast-path
+    /// (see `evaluate`); it never itself grants egress. So a null-collapsed
+    /// sub-field of a multi-axis essential can only broaden which OPERATOR flow
+    /// gets which label, never widen agent-facing egress. If a refactor ever
+    /// makes `matchingEssential` reachable for a non-`.operator` flow, its
+    /// fields must be schema-validated at the signed-manifest chokepoint too.
     static func matchingEssential(
         flow: FilterFlowDescriptor,
         operatorBaseline: OperatorBaselineWire?
@@ -163,6 +171,14 @@ public enum AllowlistEvaluator {
     }
 
     /// True when the rule's match conditions and scope both apply to the flow.
+    ///
+    /// NOTE (S5-0 HIGH-5): this evaluator does NOT read `rule.timeWindow` -- it
+    /// enforces no time bound. Because ignoring a time bound would WIDEN a
+    /// windowed allow to an all-time allow, `SignedManifestVerifier.validateSignedRule`
+    /// rejects any signed rule carrying `time_window` fail-closed (mirroring the
+    /// Linux daemon). If time-window enforcement is EVER wired in here, that
+    /// reject gate MUST be removed (so macOS stops rejecting an axis it now
+    /// supports) and a `time_window` enforcement parity row added.
     public static func matches(rule: ManifestRule, flow: FilterFlowDescriptor) -> Bool {
         if !scopeMatches(scope: rule.scope, flow: flow) {
             return false
@@ -170,17 +186,26 @@ public enum AllowlistEvaluator {
         return matchClauseMatches(match: rule.match, flow: flow)
     }
 
-    /// Scope: agent_ids OR template_ids. Empty/nil on both means "all".
+    /// Scope: agent_ids OR template_ids OR uids. Empty/nil on all three means
+    /// "all". `uids` (S5-0, 2026-07-14 two-confined-uid extension) matches
+    /// directly against the flow's `sourceRuid` -- this is the axis that lets
+    /// an endpoint rule bind to the gate uid WITHOUT matching the agent uid
+    /// (or vice versa), the core separation the two-confined-uid capability
+    /// exists to provide.
     public static func scopeMatches(scope: ManifestRuleScope, flow: FilterFlowDescriptor) -> Bool {
         let hasAgents = scope.agentIds?.isEmpty == false
         let hasTemplates = scope.templateIds?.isEmpty == false
-        if !hasAgents && !hasTemplates {
+        let hasUids = scope.uids?.isEmpty == false
+        if !hasAgents && !hasTemplates && !hasUids {
             return true
         }
         if hasAgents, let agents = scope.agentIds, agents.contains(flow.agentId) {
             return true
         }
         if hasTemplates, let templates = scope.templateIds, templates.contains(flow.templateId) {
+            return true
+        }
+        if hasUids, let uids = scope.uids, uids.contains(flow.sourceRuid) {
             return true
         }
         return false

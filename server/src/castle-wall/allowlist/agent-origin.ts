@@ -23,9 +23,25 @@ import type { AgentOrigin, AgentOriginMode } from "./manifest.js";
 
 const VALID_MODES: ReadonlySet<string> = new Set<AgentOriginMode>(["nat", "uid"]);
 
-/** True when `n` is a non-negative integer (uids, ports, ceilings). */
+/**
+ * Upper bound for every uid-family field (`agent_uid`, `gate_uid`,
+ * `system_uid_allow_ceiling`). The macOS sysext decodes all three as
+ * `UInt32` (`AgentOriginWire` in castle-wall-macos), so a value above
+ * `UInt32.max` passes JS validation and canonical signing but then FAILS the
+ * Swift decode -- a signed manifest the consumer cannot apply. Capping here
+ * (LOW-1, 2026-07-14) rejects the impossible value at publish, not just at
+ * the cross-language decode boundary.
+ */
+const UINT32_MAX = 0xffffffff;
+
+/** True when `n` is a non-negative integer (ports, ranges). */
 function isNonNegativeInt(n: unknown): n is number {
   return typeof n === "number" && Number.isInteger(n) && n >= 0;
+}
+
+/** True when `n` is a non-negative integer within the `UInt32` wire range. */
+function isUint32Int(n: unknown): n is number {
+  return isNonNegativeInt(n) && n <= UINT32_MAX;
 }
 
 /** True when `s` is a non-empty string. */
@@ -51,8 +67,9 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
   }
   const mode = c.mode as AgentOriginMode;
 
-  // `system_uid_allow_ceiling` is required in both modes.
-  if (!isNonNegativeInt(c.system_uid_allow_ceiling)) {
+  // `system_uid_allow_ceiling` is required in both modes. It decodes as a
+  // `UInt32` on the sysext, so it is capped at `UInt32.max` too (LOW-1).
+  if (!isUint32Int(c.system_uid_allow_ceiling)) {
     return null;
   }
   const systemUidAllowCeiling = c.system_uid_allow_ceiling;
@@ -60,7 +77,9 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
   if (mode === "uid") {
     // UID mode requires the dedicated agent account uid. Without it, the
     // sysext would classify every non-system flow as operator (fail-open).
-    if (!isNonNegativeInt(c.agent_uid)) {
+    // Capped at `UInt32.max` (LOW-1): a larger value passes canonical signing
+    // but fails the sysext's `UInt32` decode -- an unappliable signed manifest.
+    if (!isUint32Int(c.agent_uid)) {
       return null;
     }
     // Floor invariant (fail-closed semantic reject): the confined agent uid must
@@ -78,9 +97,39 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
     if (c.agent_uid < 1 || c.agent_uid < systemUidAllowCeiling) {
       return null;
     }
+
+    // `gate_uid` (S5-0, 2026-07-14): a SECOND optional confined principal,
+    // valid only in UID mode. Applies the SAME floor invariants as
+    // `agent_uid` above, PLUS distinctness from it. Any violation rejects
+    // the WHOLE descriptor -- never a half-built twin-uid config, because a
+    // gate uid that silently degraded to "no gate_uid" would fall through to
+    // today's binary classifier (`classifyUid`'s existing "any other
+    // resolved high uid is operator" branch) and reach the OPERATOR
+    // allow-all fast-path: exactly the fail-open this field exists to close.
+    const agentUid = c.agent_uid;
+    if (c.gate_uid !== undefined) {
+      // Same `UInt32` cap as `agent_uid` (LOW-1): reject an out-of-wire-range
+      // gate uid at publish, not just at the sysext decode boundary.
+      if (!isUint32Int(c.gate_uid)) {
+        return null;
+      }
+      if (
+        c.gate_uid < 1 ||
+        c.gate_uid < systemUidAllowCeiling ||
+        c.gate_uid === agentUid
+      ) {
+        return null;
+      }
+      return {
+        mode: "uid",
+        agent_uid: agentUid,
+        gate_uid: c.gate_uid,
+        system_uid_allow_ceiling: systemUidAllowCeiling,
+      };
+    }
     return {
       mode: "uid",
-      agent_uid: c.agent_uid,
+      agent_uid: agentUid,
       system_uid_allow_ceiling: systemUidAllowCeiling,
     };
   }
@@ -90,6 +139,17 @@ export function validateAgentOrigin(candidate: unknown): AgentOrigin | null {
   const hasSigningId = isNonEmptyString(c.egress_helper_signing_id);
   const hasTeamId = isNonEmptyString(c.egress_helper_team_id);
   if (!hasSigningId && !hasTeamId) {
+    return null;
+  }
+
+  // `gate_uid` is a UID-mode-only concept: NAT mode identifies the agent via
+  // egress-helper signing identity, never a uid, so there is no meaningful
+  // "second confined uid" to carry. A NAT candidate carrying `gate_uid` is an
+  // unexpected/malformed shape (a caller bug, or a future NAT+gate combo not
+  // yet designed) -- reject the whole descriptor rather than silently drop
+  // or silently accept an ambiguous field, matching the "never a half-built
+  // descriptor" doctrine above.
+  if (c.gate_uid !== undefined) {
     return null;
   }
 

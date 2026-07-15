@@ -66,11 +66,13 @@ final class OriginClassifierTests: XCTestCase {
 
     private func uidOrigin(
         agentUid: uid_t? = 600,
+        gateUid: uid_t? = nil,
         ceiling: uid_t = 500
     ) -> AgentOriginDescriptor {
         return AgentOriginDescriptor(
             mode: .uid,
             agentUid: agentUid,
+            gateUid: gateUid,
             systemUidAllowCeiling: ceiling
         )
     }
@@ -180,6 +182,80 @@ final class OriginClassifierTests: XCTestCase {
         XCTAssertEqual(oc, .operator)
     }
 
+    // MARK: - S5-0 (2026-07-14) two-confined-uid extension
+    //
+    // The load-bearing security fix: before this, ANY high uid that was not
+    // the agent uid classified `.operator` (the allow-all fast-path) -- so a
+    // second confined account (e.g. `sanctuary-gate`) was unbounded WAN. The
+    // gate uid must classify `.agent` (default-deny + allowlist), exactly
+    // like the agent uid, never `.operator`.
+
+    func testUidMode_gateUidFlowIsAgentNotOperator() {
+        let oc = OriginClassifier.originClass(
+            descriptor: attributed(ruid: 601),
+            agentOrigin: uidOrigin(agentUid: 600, gateUid: 601, ceiling: 500)
+        )
+        XCTAssertEqual(oc, .agent)
+    }
+
+    func testUidMode_agentUidStillAgentWhenGateUidAlsoConfigured() {
+        let oc = OriginClassifier.originClass(
+            descriptor: attributed(ruid: 600),
+            agentOrigin: uidOrigin(agentUid: 600, gateUid: 601, ceiling: 500)
+        )
+        XCTAssertEqual(oc, .agent)
+    }
+
+    func testUidMode_thirdUidStillOperatorWhenGateUidConfigured() {
+        // A high uid that is NEITHER the agent NOR the gate must still
+        // resolve `.operator` -- the twin-uid extension confines exactly the
+        // two configured principals, not "any high uid".
+        let oc = OriginClassifier.originClass(
+            descriptor: attributed(ruid: 700),
+            agentOrigin: uidOrigin(agentUid: 600, gateUid: 601, ceiling: 500)
+        )
+        XCTAssertEqual(oc, .operator)
+    }
+
+    func testUidMode_noGateUidConfiguredBehavesExactlyAsBefore() {
+        // Byte-identical-behavior control: with gateUid absent, a uid that
+        // would have been the gate is just another operator high uid, same
+        // as pre-S5-0.
+        let oc = OriginClassifier.originClass(
+            descriptor: attributed(ruid: 601),
+            agentOrigin: uidOrigin(agentUid: 600, gateUid: nil, ceiling: 500)
+        )
+        XCTAssertEqual(oc, .operator)
+    }
+
+    func testUidMode_gateUidUnattributedStillFailsClosed() {
+        // Invariant 1 dominates every mode/config: an unattributed flow is
+        // ALWAYS unattributed, even at the configured gate uid's ruid value.
+        var flow = attributed(ruid: 601)
+        flow = FilterFlowDescriptor(
+            sourceAppIdentifier: flow.sourceAppIdentifier,
+            agentId: flow.agentId,
+            templateId: flow.templateId,
+            destinationHost: flow.destinationHost,
+            destinationIp: flow.destinationIp,
+            destinationPort: flow.destinationPort,
+            networkProtocol: flow.networkProtocol,
+            hostnameSource: flow.hostnameSource,
+            opaqueDestination: flow.opaqueDestination,
+            sourceRuid: 601,
+            sourcePid: flow.sourcePid,
+            sourcePidVersion: flow.sourcePidVersion,
+            sourceSigningId: nil,
+            sourceTeamId: nil,
+            sourceUnattributed: true
+        )
+        let oc = OriginClassifier.originClass(
+            descriptor: flow,
+            agentOrigin: uidOrigin(agentUid: 600, gateUid: 601, ceiling: 500)
+        )
+        XCTAssertEqual(oc, .unattributed)
+    }
+
     // MARK: - NAT mode
 
     func testNatMode_egressHelperSigningIdIsAgent() {
@@ -253,7 +329,33 @@ final class OriginClassifierTests: XCTestCase {
         let d = AgentOriginDescriptor(wire: wire)
         XCTAssertEqual(d?.mode, .uid)
         XCTAssertEqual(d?.agentUid, 600)
+        XCTAssertNil(d?.gateUid)
         XCTAssertEqual(d?.systemUidAllowCeiling, 500)
+    }
+
+    func testWireUidWithGateUidConverts() {
+        let wire = AgentOriginWire(mode: .uid, agentUid: 600, gateUid: 601, systemUidAllowCeiling: 500)
+        let d = AgentOriginDescriptor(wire: wire)
+        XCTAssertEqual(d?.mode, .uid)
+        XCTAssertEqual(d?.agentUid, 600)
+        XCTAssertEqual(d?.gateUid, 601)
+        XCTAssertEqual(d?.systemUidAllowCeiling, 500)
+    }
+
+    func testWireNatIgnoresGateUidField() {
+        // The Swift side simply never reads gateUid in NAT mode (the TS
+        // producer already refuses to sign a NAT+gate_uid descriptor at all,
+        // per validateAgentOrigin) -- the converted descriptor's gateUid is
+        // always nil for NAT regardless of what the wire type carries.
+        let wire = AgentOriginWire(
+            mode: .nat,
+            egressHelperSigningId: "id",
+            gateUid: 601,
+            systemUidAllowCeiling: 500
+        )
+        let d = AgentOriginDescriptor(wire: wire)
+        XCTAssertNotNil(d)
+        XCTAssertNil(d?.gateUid)
     }
 
     func testWireNatPortRangeConverts() {

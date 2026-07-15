@@ -229,11 +229,18 @@ export function describeEffectiveRule(match: RuleMatch, scope: RuleScope): strin
     parts.push(`port=${Array.isArray(match.port) ? match.port.join(",") : match.port}`);
   }
   if (match.protocol !== undefined) parts.push(match.protocol);
-  const scopeDesc = scope.agent_ids?.length
-    ? `agent:${scope.agent_ids.join(",")}`
-    : scope.template_ids?.length
-      ? `template:${scope.template_ids.join(",")}`
-      : "all-agents";
+  // Render EVERY non-empty scope axis, not just the first (S5-0, 2026-07-14).
+  // The axes compose as an OR at enforcement (agent_ids OR template_ids OR
+  // uids), so showing only the first understates the rule's breadth to the
+  // Tier-1 human approver -- an approval-integrity fail-open direction. The
+  // `uids` axis in particular (the two-confined-uid rule scope) was invisible
+  // here before, so a uid-scoped or mixed agent_ids+uids grant read as
+  // "all-agents" or hid the uid widening entirely.
+  const scopeAxes: string[] = [];
+  if (scope.agent_ids?.length) scopeAxes.push(`agent:${scope.agent_ids.join(",")}`);
+  if (scope.template_ids?.length) scopeAxes.push(`template:${scope.template_ids.join(",")}`);
+  if (scope.uids?.length) scopeAxes.push(`uid:${scope.uids.join(",")}`);
+  const scopeDesc = scopeAxes.length > 0 ? scopeAxes.join(" OR ") : "all-agents";
   return `allow ${parts.join(" ")} scope=${scopeDesc}`;
 }
 

@@ -1,0 +1,73 @@
+{
+  "manifest_signed_body": {
+    "schema_version": 1,
+    "fortress_id": "fortress-two-uid-parity",
+    "issued_at": "2026-07-14T00:00:00.000Z",
+    "rules": [
+      {
+        "rule_id": "allow-anthropic",
+        "file": "allow-anthropic.json",
+        "sha256": "c59d1d968ed420833b03e504f7e304b3992c34891c37e203d18939aac944fb3b"
+      },
+      {
+        "rule_id": "gate-scoped-endpoint",
+        "file": "gate-scoped-endpoint.json",
+        "sha256": "4e0ec8fa82ba0fb1f96904ba5f6df4dde0bd081d2c33b1b219896ff02b8c980b"
+      }
+    ],
+    "agent_origin": {
+      "mode": "uid",
+      "agent_uid": 600,
+      "gate_uid": 601,
+      "system_uid_allow_ceiling": 500
+    }
+  },
+  "rules": [
+    {
+      "id": "allow-anthropic",
+      "schema_version": 1,
+      "created_at": "2026-07-14T00:00:00.000Z",
+      "description": "Allow Anthropic API over TLS (agent-scoped)",
+      "match": {
+        "host": [
+          "api.anthropic.com"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {
+        "agent_ids": [
+          "coding-assistant-1"
+        ]
+      },
+      "disposition": "allow"
+    },
+    {
+      "id": "gate-scoped-endpoint",
+      "schema_version": 1,
+      "created_at": "2026-07-14T00:00:00.000Z",
+      "description": "S5-0 two-confined-uid parity vector: endpoint rule scoped to the gate uid ONLY (601), must never match the agent uid (600).",
+      "match": {
+        "host": [
+          "gate-endpoint.example.com"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {
+        "uids": [
+          601
+        ]
+      },
+      "disposition": "allow"
+    }
+  ],
+  "expected_canonical_json_b64": "eyJhZ2VudF9vcmlnaW4iOnsiYWdlbnRfdWlkIjo2MDAsImdhdGVfdWlkIjo2MDEsIm1vZGUiOiJ1aWQiLCJzeXN0ZW1fdWlkX2FsbG93X2NlaWxpbmciOjUwMH0sImZvcnRyZXNzX2lkIjoiZm9ydHJlc3MtdHdvLXVpZC1wYXJpdHkiLCJpc3N1ZWRfYXQiOiIyMDI2LTA3LTE0VDAwOjAwOjAwLjAwMFoiLCJydWxlcyI6W3siZmlsZSI6ImFsbG93LWFudGhyb3BpYy5qc29uIiwicnVsZV9pZCI6ImFsbG93LWFudGhyb3BpYyIsInNoYTI1NiI6ImM1OWQxZDk2OGVkNDIwODMzYjAzZTUwNGY3ZTMwNGIzOTkyYzM0ODkxYzM3ZTIwM2QxODkzOWFhYzk0NGZiM2IifSx7ImZpbGUiOiJnYXRlLXNjb3BlZC1lbmRwb2ludC5qc29uIiwicnVsZV9pZCI6ImdhdGUtc2NvcGVkLWVuZHBvaW50Iiwic2hhMjU2IjoiNGUwZWM4ZmE4MmJhMGZiMWY5NjkwNGJhNWY2ZGY0ZGRlMGJkMDgxZDJjMzNiMWIyMTk4OTZmZjAyYjhjOTgwYiJ9XSwic2NoZW1hX3ZlcnNpb24iOjF9",
+  "expected_canonical_json_hex": "7b226167656e745f6f726967696e223a7b226167656e745f756964223a3630302c22676174655f756964223a3630312c226d6f6465223a22756964222c2273797374656d5f7569645f616c6c6f775f6365696c696e67223a3530307d2c22666f7274726573735f6964223a22666f7274726573732d74776f2d7569642d706172697479222c226973737565645f6174223a22323032362d30372d31345430303a30303a30302e3030305a222c2272756c6573223a5b7b2266696c65223a22616c6c6f772d616e7468726f7069632e6a736f6e222c2272756c655f6964223a22616c6c6f772d616e7468726f706963222c22736861323536223a2263353964316439363865643432303833336230336535303466376533303462333939326333343839316333376532303364313839333961616339343466623362227d2c7b2266696c65223a22676174652d73636f7065642d656e64706f696e742e6a736f6e222c2272756c655f6964223a22676174652d73636f7065642d656e64706f696e74222c22736861323536223a2234653065633866613832626130666231663936393034626135663664663464646530626430383164326333336231623231393839366666303262386339383062227d5d2c22736368656d615f76657273696f6e223a317d",
+  "test_public_key_b64url": "I2jKdEVfbTxkwqGnc0LqpqVmypwfWwaEuU8VtfKJQ9M",
+  "test_signature_b64url": "TzJKdxU2Dj26uSmQjM3V_CIZGH0mV1PMtTIj2GDfoSXBRD8JrwR2juDNO1sB9uiyUm7WK7nMwf8fcAHoAX2nBA"
+}

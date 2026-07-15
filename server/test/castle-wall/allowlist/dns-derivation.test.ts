@@ -135,6 +135,56 @@ describe("castle-wall/allowlist/dns-derivation deriveDnsRuleForHostnameRules", (
     });
   });
 
+  // --- S5-0 (2026-07-14): scope.uids must not silently widen back to "all" ---
+
+  it("a uids-only scoped hostname rule is NOT treated as unscoped (scope-leak regression guard)", () => {
+    const derived = deriveDnsRuleForHostnameRules({
+      rules: [hostRule({ id: "gate-host", scope: { uids: [601] } })],
+      resolvers: ["1.1.1.1"],
+      createdAt: CREATED_AT,
+    });
+    // Before the S5-0 fix, `scopeIsAll` ignored `uids` entirely and this
+    // asserted `{}` (unscoped -- reachable by every agent, including the one
+    // the gate-only hostname rule was never meant to grant DNS resolution to).
+    expect(derived?.scope).toEqual({ uids: [601] });
+  });
+
+  it("unions scope.uids across multiple gate-scoped hostname rules", () => {
+    const derived = deriveDnsRuleForHostnameRules({
+      rules: [
+        hostRule({ id: "h-1", scope: { uids: [601] } }),
+        hostRule({ id: "h-2", scope: { uids: [601, 602] } }),
+      ],
+      resolvers: ["1.1.1.1"],
+      createdAt: CREATED_AT,
+    });
+    expect(derived?.scope).toEqual({ uids: [601, 602] });
+  });
+
+  it("a mix of agent_ids-scoped and uids-scoped hostname rules unions both axes", () => {
+    const derived = deriveDnsRuleForHostnameRules({
+      rules: [
+        hostRule({ id: "h-1", scope: { agent_ids: ["agent-a"] } }),
+        hostRule({ id: "h-2", scope: { uids: [601] } }),
+      ],
+      resolvers: ["1.1.1.1"],
+      createdAt: CREATED_AT,
+    });
+    expect(derived?.scope).toEqual({ agent_ids: ["agent-a"], uids: [601] });
+  });
+
+  it("STILL widens to unscoped when any parent is unscoped, even alongside a uids-scoped parent", () => {
+    const derived = deriveDnsRuleForHostnameRules({
+      rules: [
+        hostRule({ id: "h-1", scope: { uids: [601] } }),
+        hostRule({ id: "h-2", scope: {} }), // all agents
+      ],
+      resolvers: ["1.1.1.1"],
+      createdAt: CREATED_AT,
+    });
+    expect(derived?.scope).toEqual({});
+  });
+
   it("yields to an operator-authored rule that claims the reserved derived id", () => {
     const operatorOverride = hostRule({
       id: DERIVED_DNS_RULE_ID,
