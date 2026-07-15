@@ -2408,8 +2408,11 @@ export class AuditLog {
       return { status: "invalid" };
     }
     if (!isRecord(parsed) || parsed[AUDIT_ROTATION_ANCHOR_MARKER] !== true) {
-      // Bare / marker-stripped / legacy: untrusted, treated as no anchor so the
-      // TOFU migration path re-establishes it from the surviving chain.
+      // Bare / marker-stripped / legacy: untrusted, treated as no anchor. An
+      // absent anchor is NOT self-healed: for a genesis-rooted chain the default
+      // seed applies, and for an above-genesis suffix `resolveChainSeed` fails
+      // closed (`rotation_anchor_missing`). Only a legitimate future rotation
+      // re-establishes an authenticated anchor (via `maybeRotate`).
       return { status: "absent" };
     }
 
@@ -3845,7 +3848,9 @@ export class AuditLog {
       );
 
       // F3: derive the chain-walk seed, honoring an authenticated rotation cut
-      // (async: it reads + MAC-verifies the rotation anchor and may TOFU-write).
+      // (async: it reads + MAC-verifies the rotation anchor). It no longer
+      // self-heals an above-genesis suffix: an absent/invalid anchor there fails
+      // closed (`rotation_anchor_missing`) rather than TOFU-writing a fresh one.
       const chainSeed = await this.resolveChainSeed(
         chainedEntries,
         legacyRawEntries.length,
