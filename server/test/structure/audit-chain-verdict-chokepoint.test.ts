@@ -1,5 +1,6 @@
 /**
- * F2 BLOCKER-1 (adversarial re-gate round 3, 2026-07-14) ANTI-REGRESSION.
+ * F2 BLOCKER-1 (adversarial re-gate round 3, 2026-07-14) ANTI-REGRESSION,
+ * hardened to PER-OCCURRENCE in round 4 (HIGH-2, 2026-07-15).
  *
  * The round-1/2 fix routed the sealed-region verdict into cleanliness claims
  * per-surface, which is whack-a-mole: a future surface (or a resurrected old
@@ -9,10 +10,20 @@
  * collapsed the decision into ONE chokepoint, `AuditLog.getAuditChainVerdict()`
  * (folded via `auditChainVerdictClaimsClean` / `auditChainVerdictUntampered`).
  *
- * This structural test fails if any source file derives an audit-chain
- * cleanliness verdict WITHOUT going through that chokepoint. It is deliberately
- * source-text-based (not a runtime test) so it catches the bypass at authoring
- * time, before any fortress is even constructed.
+ * Round-4 HIGH-2: the original guard was FILE-level — a file passed if it
+ * referenced any routing symbol ANYWHERE, so a second bypassing clean-claim in
+ * an already-routed file slipped through (Codex's example: cooperative-surface.ts
+ * routes `sanctuary_audit_search` but a different handler reads
+ * `integrity_findings.length`). This version scans PER OCCURRENCE: every use of a
+ * raw cleanliness signal must have a routing symbol within a bounded proximity
+ * window OR carry an explicit `audit-chokepoint-exempt:` annotation (for a
+ * fail-closed deny / renderer that is provably not a clean-claim). The
+ * `flags a bypass in an already-routed file` test is the teeth: it runs the SAME
+ * checker over synthetic source with one routed function plus one separate
+ * bypassing clean-claim and asserts the bypass is caught.
+ *
+ * It is deliberately source-text-based (not a runtime test) so it catches the
+ * bypass at authoring time, before any fortress is even constructed.
  */
 
 import { describe, expect, it } from "vitest";
@@ -30,14 +41,28 @@ const CHOKEPOINT = "getAuditChainVerdict";
 // (routine full-chain findings + sealed verdict), or it folds its OWN routine
 // count with the sealed verdict via the shared `foldAuditChainVerdict` and then
 // collapses through `auditChainVerdictClaimsClean` / `auditChainVerdictUntampered`.
-// A bespoke sealed check cannot produce an `AuditChainVerdict` without one of
-// these, so referencing one is the structural proof of routing.
 const ROUTING_SYMBOLS = [
   "getAuditChainVerdict",
   "auditChainVerdictClaimsClean",
   "auditChainVerdictUntampered",
+  "foldAuditChainVerdict",
 ];
-const isRouted = (text: string): boolean => ROUTING_SYMBOLS.some((s) => text.includes(s));
+
+// The explicit local escape hatch for a raw-signal use that is provably NOT a
+// clean-claim (a fail-closed deny on findings, or a renderer). Placing it near
+// the occurrence is a deliberate, reviewable act; a naked bypass has neither
+// routing NOR this marker and fails.
+const EXEMPTION_MARKER = "audit-chokepoint-exempt";
+
+// The raw cleanliness signals a bypass would derive "clean" from. Each must be
+// routed-or-exempt at EVERY occurrence (comments / description copy excluded).
+const RAW_SIGNALS = ["integrity_findings.length", "verified_against_audit_chain"];
+
+// How many lines around an occurrence count as "near" for a routing symbol or an
+// exemption marker. Wide enough to cover a handler's claim+routing proximity,
+// narrow enough that a DIFFERENT handler's routing in the same file does NOT
+// launder a bypass (Codex's cooperative-surface handlers are ~70 lines apart).
+const PROXIMITY_WINDOW = 25;
 
 // The chokepoint is DEFINED here; it is allowed to reference the raw signals.
 const CHOKEPOINT_HOME = "operational/audit-log.ts";
@@ -54,6 +79,66 @@ const CONSUMER_EXEMPT: Record<string, string> = {
   "health/evidence.ts":
     "neutral: emits chain_verified:\"unknown\" unconditionally (no AuditLog, never a clean claim)",
 };
+
+/** Strip a trailing `// ...` line comment so a routing symbol MENTIONED in a
+ * comment does not count as real routing. */
+function codeOnly(line: string): string {
+  const i = line.indexOf("//");
+  return i === -1 ? line : line.slice(0, i);
+}
+
+function isCommentLine(line: string): boolean {
+  const t = line.trimStart();
+  return t.startsWith("//") || t.startsWith("*") || t.startsWith("/*");
+}
+
+/**
+ * A raw-signal occurrence is a potential CLEAN-CLAIM context unless it is a
+ * comment, product-copy `description:` string, or a trailing-comment mention.
+ * Those never derive a runtime cleanliness verdict.
+ */
+function isClaimContext(line: string, signal: string): boolean {
+  if (isCommentLine(line)) return false;
+  if (line.includes("description:")) return false;
+  const matchIdx = line.indexOf(signal);
+  const commentIdx = line.indexOf("//");
+  if (commentIdx !== -1 && commentIdx < matchIdx) return false; // in a trailing comment
+  return true;
+}
+
+/** True when a routing symbol (in real code, not a comment) OR an exemption
+ * marker appears within {@link PROXIMITY_WINDOW} lines of `idx`. */
+function routedOrExemptNear(lines: string[], idx: number): boolean {
+  const lo = Math.max(0, idx - PROXIMITY_WINDOW);
+  const hi = Math.min(lines.length - 1, idx + PROXIMITY_WINDOW);
+  for (let i = lo; i <= hi; i++) {
+    const line = lines[i]!;
+    if (line.includes(EXEMPTION_MARKER)) return true;
+    const code = codeOnly(line);
+    if (ROUTING_SYMBOLS.some((s) => code.includes(s))) return true;
+  }
+  return false;
+}
+
+/**
+ * The PER-OCCURRENCE checker. Returns each raw-signal occurrence (in claim
+ * context) that is neither near a routing symbol nor near an exemption marker.
+ * Pure over `text` so the negative fixture can drive it on synthetic source.
+ */
+function unroutedOccurrences(text: string): Array<{ line: number; signal: string; snippet: string }> {
+  const lines = text.split("\n");
+  const out: Array<{ line: number; signal: string; snippet: string }> = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    for (const signal of RAW_SIGNALS) {
+      if (!line.includes(signal)) continue;
+      if (!isClaimContext(line, signal)) continue;
+      if (routedOrExemptNear(lines, i)) continue;
+      out.push({ line: i + 1, signal, snippet: line.trim() });
+    }
+  }
+  return out;
+}
 
 function tsFiles(dir: string): string[] {
   const out: string[] = [];
@@ -80,37 +165,82 @@ describe("F2 BLOCKER-1: audit-chain cleanliness is derived ONLY through the shar
     expect(home!.text).toContain("export function auditChainVerdictUntampered");
   });
 
-  // The exact bypass the gate named: deriving verified/clean from the raw
-  // routine-findings count. Any file that reads `integrity_findings.length`
-  // MUST also route through the chokepoint (which folds the sealed verdict the
-  // routine findings omit), or be the chokepoint's own home.
-  it("no file derives cleanliness from integrity_findings.length without the chokepoint", () => {
+  // PER-OCCURRENCE scan: EVERY use of a raw cleanliness signal (outside the
+  // chokepoint home and the renderer/neutral exempt list) must have routing OR
+  // an exemption marker within the proximity window. A second bypassing
+  // clean-claim in an already-routed file no longer slips through.
+  it("every raw-signal occurrence is routed through the chokepoint or explicitly exempt", () => {
     const offenders = files
       .filter((f) => f.rel !== CHOKEPOINT_HOME)
-      .filter((f) => f.text.includes("integrity_findings.length"))
-      .filter((f) => !isRouted(f.text))
       .filter((f) => !(f.rel in CONSUMER_EXEMPT))
-      .map((f) => f.rel);
+      .flatMap((f) =>
+        unroutedOccurrences(f.text).map((o) => `${f.rel}:${o.line}  ${o.signal}  |  ${o.snippet}`),
+      );
     expect(
       offenders,
-      "these files read integrity_findings.length but never call getAuditChainVerdict; " +
-        "route the cleanliness claim through the shared verdict (it folds the sealed-region " +
-        "crypto verdict the routine findings skip) or, if genuinely a renderer/neutral surface, " +
-        "add it to CONSUMER_EXEMPT with a reason:\n" +
+      "these occurrences read a raw audit-chain cleanliness signal but have neither a routing " +
+        "symbol nor an `audit-chokepoint-exempt:` annotation within " +
+        `${PROXIMITY_WINDOW} lines. Route the cleanliness claim through the shared verdict (it folds ` +
+        "the sealed-region crypto verdict the routine findings skip), or — if this is a fail-closed " +
+        "deny / renderer that never stamps a clean label — annotate it with `audit-chokepoint-exempt: " +
+        "<reason>`:\n" +
         offenders.join("\n"),
     ).toEqual([]);
   });
 
-  // The "verified against the audit chain" label is a cleanliness claim; it may
-  // only be emitted where the verdict was consulted.
-  it("no file emits the verified_against_audit_chain label without the chokepoint", () => {
-    const offenders = files
-      .filter((f) => f.rel !== CHOKEPOINT_HOME)
-      .filter((f) => f.text.includes("verified_against_audit_chain"))
-      .filter((f) => !isRouted(f.text))
-      .filter((f) => !(f.rel in CONSUMER_EXEMPT))
-      .map((f) => f.rel);
-    expect(offenders, `these files stamp verified_against_audit_chain without routing through ${CHOKEPOINT}`).toEqual([]);
+  // TEETH: the checker must FLAG a bypass added to an ALREADY-ROUTED file. This
+  // synthetic source has a correctly-routed handler AND a second, separate
+  // clean-claim handler that derives clean from `integrity_findings.length`
+  // without routing — exactly the file-level guard's blind spot. The bypass sits
+  // well outside the proximity window of the routed handler.
+  it("flags a bypassing clean-claim in an already-routed file (proves per-occurrence teeth)", () => {
+    const filler = Array.from({ length: PROXIMITY_WINDOW + 5 }, (_, i) => `    // filler line ${i}`).join("\n");
+    const synthetic = [
+      "function routedHandler(log) {",
+      "  const verdict = await log.getAuditChainVerdict();",
+      "  return auditChainVerdictClaimsClean(verdict);",
+      "}",
+      filler,
+      "function bypassingHandler(res) {",
+      "  // derives clean straight off the routine count, skipping the sealed verdict",
+      "  const clean = res.integrity_findings.length === 0;",
+      "  return { chain_ok: clean };",
+      "}",
+    ].join("\n");
+
+    const flagged = unroutedOccurrences(synthetic);
+    expect(flagged.length, "the bypass must be caught").toBe(1);
+    expect(flagged[0]!.signal).toBe("integrity_findings.length");
+    expect(flagged[0]!.snippet).toContain("res.integrity_findings.length === 0");
+  });
+
+  // The negative-control's counterpart: once the bypass routes (or is exempted),
+  // the SAME checker is clean. Proves the guard is satisfiable the honest way and
+  // does not false-positive on a genuinely-routed occurrence.
+  it("passes the same file once the bypass routes through the chokepoint", () => {
+    const filler = Array.from({ length: PROXIMITY_WINDOW + 5 }, (_, i) => `    // filler line ${i}`).join("\n");
+    const routedFix = [
+      "function routedHandler(log) {",
+      "  const verdict = await log.getAuditChainVerdict();",
+      "  return auditChainVerdictClaimsClean(verdict);",
+      "}",
+      filler,
+      "function nowRoutedHandler(log) {",
+      "  const verdict = await log.getAuditChainVerdict();",
+      "  const clean = auditChainVerdictClaimsClean(verdict);",
+      "  return { chain_ok: clean };",
+      "}",
+    ].join("\n");
+    expect(unroutedOccurrences(routedFix)).toEqual([]);
+
+    const exemptedFix = [
+      "function denyOnFinding(res) {",
+      "  // audit-chokepoint-exempt: fail-closed deny, never stamps a clean label",
+      "  if (res.integrity_findings.length > 0) return deny();",
+      "  return ok();",
+      "}",
+    ].join("\n");
+    expect(unroutedOccurrences(exemptedFix)).toEqual([]);
   });
 
   // No hardcoded green: a literal `chain_verified: true` / `chain_verdict:
@@ -139,8 +269,9 @@ describe("F2 BLOCKER-1: audit-chain cleanliness is derived ONLY through the shar
     for (const p of PRODUCERS) {
       const f = files.find((x) => x.rel === p);
       expect(f, `expected producer surface ${p} to exist`).toBeDefined();
+      const routed = ROUTING_SYMBOLS.some((s) => f!.text.includes(s));
       expect(
-        isRouted(f!.text),
+        routed,
         `${p} must route its audit-chain cleanliness claim through the shared verdict ` +
           `(one of: ${ROUTING_SYMBOLS.join(", ")})`,
       ).toBe(true);

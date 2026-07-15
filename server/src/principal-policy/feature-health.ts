@@ -1593,6 +1593,10 @@ export async function buildFeatureHealthPanel(
       if (lifecycle.total > lifecycle.entries.length) {
         lifecycleHistoryComplete = false;
       }
+      // audit-chokepoint-exempt: fail-closed TIGHTENING (only ever flips
+      // integrityOk to false on a finding); never derives or stamps a clean
+      // verdict. The clean derivation for this panel routes through the fold
+      // above (F2 round-4 HIGH-2).
       if (lifecycle.integrity_findings.length > 0) integrityOk = false;
     }
   } catch {
@@ -1619,6 +1623,8 @@ export async function buildFeatureHealthPanel(
     });
     freshnessEntries = fresh.entries;
     freshnessComplete = fresh.entries.length < AUDIT_PAGE_LIMIT;
+    // audit-chokepoint-exempt: fail-closed TIGHTENING on the freshness-window
+    // read (only flips integrityOk to false on a finding); never a clean-claim.
     if (fresh.integrity_findings.length > 0) integrityOk = false;
   } catch {
     freshnessEntries = [];

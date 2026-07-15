@@ -868,6 +868,10 @@ export function createAgentNativeCooperativeTools(
               limit: 500,
             })
           );
+          // audit-chokepoint-exempt: fail-closed DENY on any integrity finding,
+          // not a clean-CLAIM. `sanctuary_events_read` returns redacted events; a
+          // finding makes it refuse, it never stamps a verified-clean label, so it
+          // does not derive an audit-chain cleanliness verdict (F2 round-4 HIGH-2).
           if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_events_read");
           const own = queried.entries;
           const startOffset = cursor.offset;
