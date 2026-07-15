@@ -170,4 +170,48 @@ describe("buildInventorySnapshot", () => {
     });
     expect(Object.keys(snap.agents).sort()).toEqual(["status", "value"]);
   });
+
+  describe("R4-2 pre-idempotency (un-healed legacy observe store) signal", () => {
+    it("sets observed_destinations_pre_idempotency when a populated store had no fold watermark", () => {
+      const snap = buildInventorySnapshot({
+        observedDestinations: { ok: true, records: [candidate({ host: "api.telegram.org" })] },
+        observedStorePreIdempotency: true,
+      });
+      expect(snap.observed_destinations.status).toBe("populated");
+      expect(snap.observed_destinations_pre_idempotency).toBe(true);
+    });
+
+    it("is false on a post-#931 (watermarked) store even when populated", () => {
+      const snap = buildInventorySnapshot({
+        observedDestinations: { ok: true, records: [candidate({ host: "api.telegram.org" })] },
+        observedStorePreIdempotency: false,
+      });
+      expect(snap.observed_destinations_pre_idempotency).toBe(false);
+    });
+
+    it("is dropped (false) when the observe read is NOT populated - no rows means no Seen caveat to orphan", () => {
+      // Empty read + the legacy signal: nothing renders, so the caveat is suppressed.
+      const emptyRead = buildInventorySnapshot({
+        observedDestinations: { ok: true, records: [] },
+        observedStorePreIdempotency: true,
+      });
+      expect(emptyRead.observed_destinations.status).toBe("empty_verified");
+      expect(emptyRead.observed_destinations_pre_idempotency).toBe(false);
+
+      // Failed read + the legacy signal: same suppression.
+      const failedRead = buildInventorySnapshot({
+        observedDestinations: { ok: false, records: [], reason: "store unreadable" },
+        observedStorePreIdempotency: true,
+      });
+      expect(failedRead.observed_destinations.status).toBe("read_failed");
+      expect(failedRead.observed_destinations_pre_idempotency).toBe(false);
+    });
+
+    it("defaults to false when the signal is omitted", () => {
+      const snap = buildInventorySnapshot({
+        observedDestinations: { ok: true, records: [candidate({ host: "api.telegram.org" })] },
+      });
+      expect(snap.observed_destinations_pre_idempotency).toBe(false);
+    });
+  });
 });

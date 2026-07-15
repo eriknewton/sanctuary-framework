@@ -115,6 +115,15 @@ async function gatherInventory(
     }
   })();
 
+  // R4-2 (round-4 sweep 2026-07-15): alongside the candidate rows, capture
+  // whether the store is a legacy PRE-#931 store (candidate rows present but no
+  // fold watermark). The pack renders the persisted store WITHOUT folding
+  // (staying non-mutating + offline + allowlist-independent), so it cannot heal
+  // an un-reconciled store; instead it detects the condition here and the
+  // renderer discloses that the Seen counts may pre-date the exactly-once
+  // engine. Post-#931 every mint path advances the watermark, so
+  // candidates-without-watermark uniquely identifies an un-healed legacy store.
+  let observedStorePreIdempotency = false;
   const observedDestinations: InventorySourceRead<CandidateObservation> =
     await (async () => {
       try {
@@ -124,10 +133,12 @@ async function gatherInventory(
           encryptedPrivateKey: signer.encrypted_private_key,
           identityEncryptionKey: derivePurposeKey(masterKey, "identity-encryption"),
         });
-        return {
-          ok: true,
-          records: [...(await observeStore.listCandidates()).values()],
-        };
+        const records = [...(await observeStore.listCandidates()).values()];
+        if (records.length > 0) {
+          const watermark = await observeStore.getFoldWatermark();
+          observedStorePreIdempotency = watermark === null;
+        }
+        return { ok: true, records };
       } catch (e) {
         return {
           ok: false,
@@ -137,7 +148,12 @@ async function gatherInventory(
       }
     })();
 
-  return buildInventorySnapshot({ agents, proxyServers, observedDestinations });
+  return buildInventorySnapshot({
+    agents,
+    proxyServers,
+    observedDestinations,
+    observedStorePreIdempotency,
+  });
 }
 
 /**

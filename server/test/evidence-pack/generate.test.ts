@@ -419,6 +419,56 @@ describe("buildEvidencePack", () => {
     );
     // The falsifiable-under-reset absolute basis claim is gone.
     expect(report).not.toContain("since observation began on this install");
+    // R4-2: with no pre-idempotency flag, no staleness caveat is printed - the
+    // exactly-once basis stands unqualified for a healed/current store.
+    expect(report).not.toContain("Seen counts may pre-date the exactly-once fold engine");
+  });
+
+  it("R4-2: an un-healed pre-#931 observe store (rows, no watermark) prints the Seen-count staleness caveat", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: emptyVerified(),
+          mcp_servers: emptyVerified(),
+          observed_destinations: populated([
+            { host: "api.telegram.org", port: 443, protocol: "tcp", times_seen: 999, exfil_risk: true },
+          ]),
+          observed_destinations_pre_idempotency: true,
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    // The caveat must be adjacent to the Seen legend and name the remedy
+    // (observe candidates heals; regenerate), and must be clear that only the
+    // Seen MAGNITUDE may be off, not the destination set or its denied status.
+    expect(report).toContain("Seen counts may pre-date the exactly-once fold engine");
+    expect(report).toContain("castle-wall observe candidates");
+    expect(report).toContain("regenerate this pack");
+    expect(report).toContain("only the Seen magnitude may be high");
+    // The row still renders faithfully (the pack never mutates the store).
+    expect(report).toContain("api.telegram.org");
+    expect(report).toContain("999");
+  });
+
+  it("R4-2: the staleness caveat is NOT printed when the pre-idempotency flag is false", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: emptyVerified(),
+          mcp_servers: emptyVerified(),
+          observed_destinations: populated([
+            { host: "api.telegram.org", port: 443, protocol: "tcp", times_seen: 4, exfil_risk: true },
+          ]),
+          observed_destinations_pre_idempotency: false,
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("Seen counts may pre-date the exactly-once fold engine");
   });
 
   it("MED-1 (sample-render): the tool count carries an active/recorded denominator", () => {

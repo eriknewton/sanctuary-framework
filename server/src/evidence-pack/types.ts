@@ -269,6 +269,22 @@ export interface InventorySnapshot {
   agents: ReadOutcome<InventoryAgentRow[]>;
   mcp_servers: ReadOutcome<InventoryMcpServerRow[]>;
   observed_destinations: ReadOutcome<InventoryObservedDestinationRow[]>;
+  /**
+   * R4-2 (round-4 sweep 2026-07-15): true when the observe store carried
+   * candidate rows but NO fold watermark at read time -- the signature of a
+   * store minted by the PRE-#931 additive fold engine that has not yet been
+   * reconciled by the idempotent recompute-heal (post-#931 every mint path
+   * advances the watermark, so candidates-without-watermark can only be a
+   * legacy store). Under that condition the rendered `Seen` counts may
+   * OVERSTATE the exactly-once "since this candidate record was created" basis
+   * the egress legend asserts, so the renderer discloses it and directs the
+   * operator to regenerate after `castle-wall observe candidates` (which runs
+   * the heal). Absent/false on any post-#931 store and whenever the observe
+   * read was not populated. The pack stays NON-MUTATING and offline: it
+   * detects and discloses rather than folding (which would add an allowlist +
+   * lock dependency and could fail generation).
+   */
+  observed_destinations_pre_idempotency?: boolean;
 }
 
 /**

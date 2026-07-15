@@ -371,7 +371,8 @@ function renderInventory(inv: InventorySnapshot): PackSection {
   lines.push("");
   lines.push(
     ...foldOutcome(inv.observed_destinations, {
-      populated: (rows) => destinationTable(rows),
+      populated: (rows) =>
+        destinationTable(rows, inv.observed_destinations_pre_idempotency === true),
       emptyVerified: (witness) => [
         claimFromCompleteRead(
           witness,
@@ -452,7 +453,10 @@ function mcpTable(rows: InventoryMcpServerRow[]): string[] {
   return out;
 }
 
-function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
+function destinationTable(
+  rows: InventoryObservedDestinationRow[],
+  seenCountsMayPredateIdempotency = false,
+): string[] {
   // HIGH-1 (sample-render): the column was a bare "Exfil risk: yes/no", which a
   // non-technical underwriter can misread as the firm SELF-REPORTING that data
   // was exfiltrated - especially next to an incident section that says "not
@@ -550,9 +554,34 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
       "destination listed here may not have been seen within the reporting " +
       "quarter.",
     "",
+  ];
+  if (seenCountsMayPredateIdempotency) {
+    // R4-2 (round-4 sweep 2026-07-15): the observe store held candidate rows
+    // but no fold watermark -- a legacy store minted by the PRE-#931 additive
+    // engine that has not been reconciled by the exactly-once recompute-heal.
+    // Its Seen counts may OVERSTATE the "since this candidate record was
+    // created" basis above (the pre-#931 engine re-folded retained history
+    // additively). The pack renders the persisted store faithfully without
+    // mutating it, so it discloses the condition rather than silently printing
+    // a possibly-inflated count under the exactly-once legend. Running
+    // `castle-wall observe candidates` heals the store (idempotent recompute);
+    // regenerate the pack afterward for reconciled counts.
+    out.push(
+      "CAVEAT - Seen counts may pre-date the exactly-once fold engine: this " +
+        "install's observe store was recorded by an earlier engine version and " +
+        "has not been reconciled since upgrade, so the Seen counts above may " +
+        "OVERSTATE the per-candidate basis just described. Run `sanctuary " +
+        "castle-wall observe candidates` (which reconciles the store) and " +
+        "regenerate this pack for accurate counts. The set of destinations and " +
+        "their denied/allowed status is unaffected; only the Seen magnitude may " +
+        "be high.",
+      "",
+    );
+  }
+  out.push(
     "| Destination | Port | Protocol | Seen | Destination risk class |",
     "|---|---|---|---|---|",
-  ];
+  );
   for (const d of rows) {
     const riskClass = d.exfil_risk ? "elevated (review)" : "standard";
     out.push(
