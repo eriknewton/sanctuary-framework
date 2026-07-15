@@ -208,7 +208,7 @@ export class EnforcementExportStreamer {
   private async deliverWithRetry(events: readonly EnforcementEvent[]): Promise<void> {
     let attempt = 0;
     for (;;) {
-      let outcomeReason: string | null = null;
+      let outcomeReason: string | null;
       try {
         const outcome = await this.deps.exporter.exportEvents(events);
         if (outcome.status === "refused") {
