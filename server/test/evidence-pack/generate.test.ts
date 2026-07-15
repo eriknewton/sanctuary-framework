@@ -451,6 +451,13 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("regenerate this pack");
     expect(report).toContain("the listed set may still include a destination");
     expect(report).toContain("every listed row is a destination where denied attempts were recorded");
+    // Gate run 2 HIGH: the remedy must NOT overclaim that a refresh removes a
+    // re-surfaced DISCARDED destination (a discard leaves no allow rule; the
+    // recompute replacement path keeps an already-resurfaced discard). The
+    // caveat scopes "removes those" to policy-permitted/promoted rows and tells
+    // the operator to discard the re-surfaced ones again.
+    expect(report).toContain("which you may need to discard again");
+    expect(report).not.toContain("that a reconciling refresh would remove");
     // Must NOT attribute cause to an "earlier engine version" (false in the
     // crash-interrupted-heal case), and must NOT falsely reassure that only
     // the Seen magnitude is affected.

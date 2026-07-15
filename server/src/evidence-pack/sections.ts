@@ -571,25 +571,35 @@ function destinationTable(
     // it does NOT claim membership is unaffected: the PRE-#931 additive engine
     // could resurrect promoted/discarded destinations from retained history
     // and did not prune now-allowed destinations, so the LISTED SET (not just
-    // the Seen magnitude) may be un-reconciled (Codex HIGH #2). What DOES hold
-    // regardless of the watermark is the blocked-only fold basis (adapter.ts
-    // gates on egress_blocked; fold.ts folds only denied), so every listed row
-    // is still a recorded denied observation -- the caveat preserves that true
-    // invariant. Running `castle-wall observe candidates` completes the
-    // reconciling refresh (idempotent recompute, and for a crashed heal simply
-    // finishes it); regenerate the pack afterward.
+    // the Seen magnitude) may be un-reconciled (Codex HIGH #2). The remedy
+    // clause is scoped precisely (gate run 2 HIGH): a reconciling refresh
+    // removes allow-rule-backed rows -- destinations the current policy permits
+    // and PROMOTED destinations (promote synthesizes the exact allow rule the
+    // prune matches, refresh.ts prune at ~:568-575) -- but does NOT remove a
+    // re-surfaced DISCARDED destination: a discard leaves no allow rule, and
+    // the recompute-heal's replacement path (refresh.ts ~:534-537) keeps any
+    // already-persisted key present in the full-history fold, so an
+    // already-resurfaced discard survives; the operator must discard it again.
+    // What DOES hold regardless of the watermark is the blocked-only fold basis
+    // (adapter.ts gates on egress_blocked; fold.ts folds only denied), so every
+    // listed row is still a recorded denied observation -- the caveat preserves
+    // that true invariant. Running `castle-wall observe candidates` completes
+    // the reconciling refresh (idempotent recompute, and for a crashed heal
+    // simply finishes it); regenerate the pack afterward.
     out.push(
       "CAVEAT - this install's observe store has not completed a reconciling " +
         "refresh (no fold watermark is present), so the rows below may not " +
         "reflect a reconciled state. The Seen counts may OVERSTATE the " +
         "per-candidate basis described above, AND the listed set may still " +
         "include a destination your current policy already permits, or one you " +
-        "previously promoted or discarded, that a reconciling refresh would " +
-        "remove. What still holds is that every listed row is a destination " +
-        "where denied attempts were recorded (the blocked-only basis does not " +
-        "depend on the refresh). Run `sanctuary castle-wall observe candidates` " +
-        "(which completes the reconciling refresh) and regenerate this pack for " +
-        "an accurate list and counts.",
+        "previously promoted -- a reconciling refresh removes those -- or one " +
+        "you previously discarded that an earlier fold re-surfaced, which a " +
+        "refresh does NOT remove and which you may need to discard again. What " +
+        "still holds is that every listed row is a destination where denied " +
+        "attempts were recorded (the blocked-only basis does not depend on the " +
+        "refresh). Run `sanctuary castle-wall observe candidates` (which " +
+        "completes the reconciling refresh), re-discard any re-surfaced " +
+        "destinations, and regenerate this pack.",
       "",
     );
   }
