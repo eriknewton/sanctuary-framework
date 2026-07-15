@@ -97,6 +97,37 @@ describe("foldObservations", () => {
     expect(once).toEqual(again);
     expect(once[0]!.host).toBe("a.example.com");
   });
+
+  // ── #897 finding 2: provenance carries through the fold so the suppression
+  // belt can scope the "unknown"-template exemption per platform. ──
+  it("carries a single event's provenance onto the folded candidate", () => {
+    const linux = foldObservations([flow({ provenance: "linux_daemon" })]);
+    expect(linux[0]!.provenance).toBe("linux_daemon");
+    const macos = foldObservations([flow({ provenance: "macos" })]);
+    expect(macos[0]!.provenance).toBe("macos");
+  });
+
+  it("folds same-key linux_daemon events to a linux_daemon candidate", () => {
+    const events = [flow({ provenance: "linux_daemon" }), flow({ provenance: "linux_daemon" })];
+    const [candidate] = foldObservations(events);
+    expect(candidate!.times_seen).toBe(2);
+    expect(candidate!.provenance).toBe("linux_daemon");
+  });
+
+  it("CONSERVATIVE merge: a mixed macOS+daemon same-key fold is NON-daemon (macos), so the row keeps the unknown-exemption", () => {
+    const events = [flow({ provenance: "linux_daemon" }), flow({ provenance: "macos" })];
+    const [candidate] = foldObservations(events);
+    expect(candidate!.provenance).toBe("macos");
+    // Order-independent.
+    const reversed = foldObservations([flow({ provenance: "macos" }), flow({ provenance: "linux_daemon" })]);
+    expect(reversed[0]!.provenance).toBe("macos");
+  });
+
+  it("CONSERVATIVE merge: daemon + undefined-origin same-key fold is NOT purely-daemon (drops to non-daemon)", () => {
+    const events = [flow({ provenance: "linux_daemon" }), flow({ provenance: undefined })];
+    const [candidate] = foldObservations(events);
+    expect(candidate!.provenance).not.toBe("linux_daemon");
+  });
 });
 
 describe("flagExfilRisk (D-Q3)", () => {

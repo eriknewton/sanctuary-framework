@@ -255,25 +255,37 @@ export type RefreshOutcome =
  */
 export function candidateCurrentlyAllowed(
   rules: readonly AllowlistRule[],
-  row: Pick<CandidateObservation, "agent_id" | "agent_template" | "host" | "ip" | "port" | "protocol">,
+  row: Pick<
+    CandidateObservation,
+    "agent_id" | "agent_template" | "host" | "ip" | "port" | "protocol" | "provenance"
+  >,
 ): boolean {
   if (rules.length === 0) return false;
 
-  // macOS UNATTRIBUTED bucket (Codex round-7 HIGH): the macOS filter
-  // fail-closed-drops every uid-mode flow whose audit token cannot be
-  // decoded, REGARDLESS of allow rules (AllowlistEvaluator
-  // suppressAllowMatches), and keeps recording those drops -- but the
-  // recorded event cannot tell an unattributed drop from an attributed
-  // default-deny. What IS knowable: every flow the current macOS build
-  // reports carries the default resolver's `templateId: "unknown"`
-  // (FlowEvaluatorEngine.defaultAgentResolver; macos-flow-events.ts uses
-  // the same fallback identity), while Linux-daemon events carry the real
-  // wrapped-agent template. A row bearing the "unknown" sentinel template
-  // may therefore contain macOS flows that NO allow rule can ever permit,
-  // so it is NEVER suppressed or pruned (conservative: it stays pending
-  // for review). When the macOS registry resolver lands, that build must
-  // forward the origin classification before this exemption can narrow.
-  if (row.agent_template === "unknown") return false;
+  // macOS UNATTRIBUTED bucket (Codex round-7 HIGH), NOW PROVENANCE-SCOPED
+  // (#897 finding 2): the macOS filter fail-closed-drops every uid-mode flow
+  // whose audit token cannot be decoded, REGARDLESS of allow rules
+  // (AllowlistEvaluator suppressAllowMatches), and keeps recording those
+  // drops -- but the recorded event cannot tell an unattributed drop from an
+  // attributed default-deny. Every flow the current macOS build reports
+  // carries the default resolver's `templateId: "unknown"`
+  // (FlowEvaluatorEngine.defaultAgentResolver; macos-flow-events.ts uses the
+  // same fallback identity), so a macOS "unknown" row may contain flows NO
+  // allow rule can ever permit and must NEVER be suppressed or pruned.
+  //
+  // The Linux daemon ALSO stamps `agent_template: "unknown"` -- NFQUEUE
+  // hardcodes it (`nfqueue.rs`) -- but there "unknown" is a REAL, enforceable
+  // template: an allow rule scoped to it genuinely flips the daemon's verdict,
+  // so a daemon "unknown" row IS a legitimate suppression candidate and must
+  // NOT get this exemption (else finding 1's newly-folded Linux rows would be
+  // blanket-pinned pending forever, breaking the evidence-pack legend
+  // "permitted destinations do NOT appear here"). The two are told apart by
+  // the row's PROVENANCE (adapter.ts): the exemption applies to every row we
+  // cannot POSITIVELY attribute to the Linux daemon -- macOS rows AND any
+  // undefined-origin (legacy/hand-built) row -- the conservative direction.
+  // When the macOS registry resolver lands, that build must forward the real
+  // template before its rows lose the exemption.
+  if (row.agent_template === "unknown" && row.provenance !== "linux_daemon") return false;
 
   for (const rule of rules) {
     if (rule.disposition === "allow") continue;

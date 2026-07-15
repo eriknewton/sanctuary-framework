@@ -29,6 +29,33 @@ export const OBSERVE_SCHEMA_VERSION = "1.0" as const;
 export type HostnameSource = "dns" | "sni" | "url" | "socket" | null;
 
 /**
+ * Which enforcement PRODUCER minted a recorded flow (adapter.ts derives it
+ * from the on-disk audit-body shape + producer fingerprint). This is the
+ * per-row PROVENANCE the suppression belt needs to scope the `"unknown"`
+ * agent_template exemption CORRECTLY across platforms (refresh.ts):
+ *
+ *   - `"macos"`: a macOS NEFilterDataProvider flow (the nested
+ *     `agent`/`destination` default-resolver shape from
+ *     `runtime/macos-flow-events.ts`, OR a macOS producer-signed body carrying
+ *     `source: "macos_extension"`). Here `agent_template: "unknown"` is the
+ *     DEFAULT RESOLVER sentinel for an UNATTRIBUTED flow that no allow rule can
+ *     ever truly permit (the macOS filter fail-closed-drops it regardless of
+ *     allows), so such a row must NEVER be suppressed.
+ *   - `"linux_daemon"`: a Rust NFQUEUE/daemon flow (the flat `dest_*` shape
+ *     carrying the daemon's `decision_provenance` fingerprint). Here
+ *     `agent_template: "unknown"` is a REAL, enforceable template (NFQUEUE
+ *     hardcodes it, `nfqueue.rs`), so an allow rule scoped to it genuinely
+ *     changes the daemon's verdict and the row IS a legitimate suppression
+ *     candidate.
+ *
+ * OMITTED (`undefined`) on a hand-built or legacy-persisted row whose producer
+ * cannot be positively identified: the suppression belt then treats it as
+ * NON-daemon (the conservative direction -- the `"unknown"` exemption applies,
+ * so the row stays pending; nothing is ever suppressed on a guessed origin).
+ */
+export type ObserveProvenance = "macos" | "linux_daemon";
+
+/**
  * Granularity a candidate synthesizes into an AllowlistRule at (D-Q2).
  * Reuses the `LearnedGranularity` enum already declared for the prompt-time
  * "always" decision (`../ipc/messages.ts`); this feature is its first
@@ -71,6 +98,8 @@ export interface FlowObservationEvent {
   hostname_source: HostnameSource;
   /** What the ARMED wall did with this flow. v1 folds "denied" flows only (see fold.ts). */
   disposition: "denied" | "allowed";
+  /** Which enforcement producer minted this flow (adapter.ts). Scopes the `"unknown"`-template suppression exemption per platform; see {@link ObserveProvenance}. `undefined` on a hand-built event => treated as non-daemon (conservative). */
+  provenance?: ObserveProvenance;
 }
 
 /**
@@ -94,6 +123,8 @@ export interface CandidateObservation {
   would_be_disposition: "denied" | "allowed";
   /** True when the host matches the messaging-platform exfil denylist (D-Q3). Never pre-selected for promote. */
   exfil_risk: boolean;
+  /** Which enforcement producer minted the folded flow(s) behind this row; scopes the `"unknown"`-template suppression exemption per platform (see {@link ObserveProvenance} and refresh.ts `candidateCurrentlyAllowed`). Folded conservatively: `"linux_daemon"` survives ONLY when every contributing event was the Linux daemon; any macOS/undefined contribution keeps the row non-daemon. `undefined` on a legacy-persisted row => treated as non-daemon. */
+  provenance?: ObserveProvenance;
 }
 
 /**

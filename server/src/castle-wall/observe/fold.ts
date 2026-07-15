@@ -15,6 +15,7 @@ import {
   type CandidateObservation,
   type FlowObservationEvent,
   type HostnameSource,
+  type ObserveProvenance,
 } from "./types.js";
 
 /**
@@ -58,6 +59,29 @@ function upgradedHostnameSource(
 }
 
 /**
+ * Fold two contributing events' provenance for the SAME candidate key
+ * (`candidateKey` intentionally excludes provenance, so a destination the
+ * agent hit on both platforms coalesces into one row). CONSERVATIVE:
+ * `"linux_daemon"` -- the only value that DROPS the `"unknown"`-template
+ * suppression exemption (refresh.ts) -- survives ONLY when BOTH contributors
+ * were the Linux daemon. Any macOS or unattributed (`undefined`) contribution
+ * keeps the row non-daemon, so a mixed-origin `"unknown"` row is never
+ * suppressed on the strength of the daemon half alone. A positive macOS marker
+ * is preferred over `undefined` for label fidelity; the exemption only ever
+ * checks `!== "linux_daemon"`, so all non-daemon results behave identically.
+ */
+function mergedProvenance(
+  a: ObserveProvenance | undefined,
+  b: ObserveProvenance | undefined,
+): ObserveProvenance | undefined {
+  if (a === b) return a;
+  if (a === "macos" || b === "macos") return "macos";
+  // Remaining: exactly one side is "linux_daemon" and the other is undefined.
+  // Not positively macOS, but not purely daemon either -> conservative unknown.
+  return undefined;
+}
+
+/**
  * Fold a batch of flow-audit events into deduped candidate rows. Dedup key
  * is (agent template, host-or-ip, port, protocol) per scoping doc section
  * 2.1. Deterministic output order (sorted by first_seen, then key) so
@@ -87,6 +111,7 @@ export function foldObservations(
       if (event.timestamp < existing.first_seen) existing.first_seen = event.timestamp;
       if (event.timestamp > existing.last_seen) existing.last_seen = event.timestamp;
       existing.hostname_source = upgradedHostnameSource(existing.hostname_source, event.hostname_source);
+      existing.provenance = mergedProvenance(existing.provenance, event.provenance);
       continue;
     }
 
@@ -103,6 +128,7 @@ export function foldObservations(
       last_seen: event.timestamp,
       would_be_disposition: "denied",
       exfil_risk: flagExfilRisk(dest.host),
+      provenance: event.provenance,
     });
   }
 
@@ -146,6 +172,7 @@ export function mergeCandidateObservations(
       first_seen: incoming.first_seen < prior.first_seen ? incoming.first_seen : prior.first_seen,
       last_seen: incoming.last_seen > prior.last_seen ? incoming.last_seen : prior.last_seen,
       hostname_source: upgradedHostnameSource(prior.hostname_source, incoming.hostname_source),
+      provenance: mergedProvenance(prior.provenance, incoming.provenance),
     });
   }
   return merged;
