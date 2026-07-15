@@ -4,6 +4,7 @@ date: 2026-05-15
 description: "Sanctuary started one morning in February. I woke from a dead sleep before dawn and said: you have to build this. Shut up and just do it. Four years of waiting, three iterations, and the Castle Architecture that finally got it right."
 author: "Erik Newton"
 image: /images/blog/nobody-else-was-going-to-build-it.jpg
+claims_era_note: true
 ---
 
 # Nobody Else Was Going to Build It

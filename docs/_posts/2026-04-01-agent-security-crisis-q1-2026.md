@@ -150,4 +150,4 @@ The next agent security incident is coming. Whether it happens to your organizat
 
 ---
 
-*Sanctuary Framework defines four-layer security architecture for agent infrastructure. The incidents of Q1 2026 are precisely the classes of failure that architectural controls prevent. To learn more or contribute, visit [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework).*
+*Sanctuary Framework defines a security architecture for agent infrastructure. The incidents of Q1 2026 are precisely the classes of failure that architectural controls are built to contain. To learn more or contribute, visit [github.com/eriknewton/sanctuary-framework](https://github.com/eriknewton/sanctuary-framework).*
