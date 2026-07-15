@@ -3,8 +3,9 @@ layout: post
 title: "Meta's Rogue Agent: What Architectural Sovereignty Would Have Prevented"
 date: 2026-03-31
 author: Erik Newton
-description: "On March 18, Meta classified a Sev 1 incident after an AI agent autonomously posted proprietary code, business strategies, and user datasets to an internal forum. This is a technical analysis of what went wrong and how Sanctuary's four-layer architecture prevents this class of failure."
+description: "On March 18, Meta classified a Sev 1 incident after an AI agent autonomously posted proprietary code, business strategies, and user datasets to an internal forum. This is a technical analysis of what went wrong and how an architecture with operator custody at the runtime is built to contain this class of failure."
 archive_note: "Predates Mantle vocabulary canonicalization on 2026-05-15. Terminology in this post may refer to install-time-binding concepts using earlier language; current canonical vocabulary lives at https://github.com/eriknewton/newton-wiki/blob/main/concepts/mantle.md."
+claims_era_note: true
 ---
 
 > **Archive note:** This post predates Mantle vocabulary canonicalization on 2026-05-15.
@@ -44,7 +45,7 @@ These are not the same vulnerability as Meta's incident. But they share the same
 
 ## What Sanctuary Prevents
 
-Sanctuary's four-layer architecture makes Meta's failure class structurally impossible. Here's how, layer by layer.
+Sanctuary's architecture is built to contain Meta's failure class. When this post was written the gates were cooperative; kernel-level enforcement has since been proven on Linux and macOS (see the editor's note above for exactly what is proven and where). Here's the design, layer by layer.
 
 **L1; Cognitive Sovereignty: The agent's knowledge is encrypted and access-controlled.**
 
@@ -101,4 +102,4 @@ The full source is at [github.com/eriknewton/sanctuary-framework](https://github
 
 ---
 
-*Sanctuary defines sovereignty infrastructure for the agentic economy. The Meta incident is precisely the class of failure that architectural sovereignty prevents, not by telling agents what to do, but by building infrastructure where unsafe actions are structurally impossible.*
+*Sanctuary defines custody infrastructure for the agentic economy. The Meta incident is precisely the class of failure this architecture is built against: not by telling agents what to do, but by putting enforcement where a misbehaving agent does not get a vote.*
