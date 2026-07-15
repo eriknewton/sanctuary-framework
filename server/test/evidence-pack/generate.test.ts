@@ -420,11 +420,11 @@ describe("buildEvidencePack", () => {
     // The falsifiable-under-reset absolute basis claim is gone.
     expect(report).not.toContain("since observation began on this install");
     // R4-2: with no pre-idempotency flag, no staleness caveat is printed - the
-    // exactly-once basis stands unqualified for a healed/current store.
-    expect(report).not.toContain("Seen counts may pre-date the exactly-once fold engine");
+    // exactly-once basis stands unqualified for a reconciled/current store.
+    expect(report).not.toContain("has not completed a reconciling refresh");
   });
 
-  it("R4-2: an un-healed pre-#931 observe store (rows, no watermark) prints the Seen-count staleness caveat", () => {
+  it("R4-2: an un-reconciled observe store (rows, no watermark) prints the staleness caveat", () => {
     const pack = buildEvidencePack(
       {
         ...baseInput(),
@@ -440,13 +440,22 @@ describe("buildEvidencePack", () => {
       deps([])
     );
     const report = pack.files[0]!.content;
-    // The caveat must be adjacent to the Seen legend and name the remedy
-    // (observe candidates heals; regenerate), and must be clear that only the
-    // Seen MAGNITUDE may be off, not the destination set or its denied status.
-    expect(report).toContain("Seen counts may pre-date the exactly-once fold engine");
+    // The caveat must state the neutral observable (no completed reconciling
+    // refresh) WITHOUT attributing a specific cause (gate HIGH #1: "earlier
+    // engine version" would be false in the crash-window case), name the remedy
+    // (observe candidates completes the refresh; regenerate), and disclose that
+    // the LISTED SET may also be stale, not just the Seen magnitude (gate HIGH
+    // #2). The true blocked-only invariant is preserved.
+    expect(report).toContain("has not completed a reconciling refresh");
     expect(report).toContain("castle-wall observe candidates");
     expect(report).toContain("regenerate this pack");
-    expect(report).toContain("only the Seen magnitude may be high");
+    expect(report).toContain("the listed set may still include a destination");
+    expect(report).toContain("every listed row is a destination where denied attempts were recorded");
+    // Must NOT attribute cause to an "earlier engine version" (false in the
+    // crash-interrupted-heal case), and must NOT falsely reassure that only
+    // the Seen magnitude is affected.
+    expect(report).not.toContain("earlier engine version");
+    expect(report).not.toContain("only the Seen magnitude may be high");
     // The row still renders faithfully (the pack never mutates the store).
     expect(report).toContain("api.telegram.org");
     expect(report).toContain("999");
@@ -468,7 +477,7 @@ describe("buildEvidencePack", () => {
       deps([])
     );
     const report = pack.files[0]!.content;
-    expect(report).not.toContain("Seen counts may pre-date the exactly-once fold engine");
+    expect(report).not.toContain("has not completed a reconciling refresh");
   });
 
   it("MED-1 (sample-render): the tool count carries an active/recorded denominator", () => {

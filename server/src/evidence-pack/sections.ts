@@ -556,25 +556,40 @@ function destinationTable(
     "",
   ];
   if (seenCountsMayPredateIdempotency) {
-    // R4-2 (round-4 sweep 2026-07-15): the observe store held candidate rows
-    // but no fold watermark -- a legacy store minted by the PRE-#931 additive
-    // engine that has not been reconciled by the exactly-once recompute-heal.
-    // Its Seen counts may OVERSTATE the "since this candidate record was
-    // created" basis above (the pre-#931 engine re-folded retained history
-    // additively). The pack renders the persisted store faithfully without
-    // mutating it, so it discloses the condition rather than silently printing
-    // a possibly-inflated count under the exactly-once legend. Running
-    // `castle-wall observe candidates` heals the store (idempotent recompute);
-    // regenerate the pack afterward for reconciled counts.
+    // R4-2 (round-4 sweep 2026-07-15; gate-hardened): the observe store held
+    // candidate rows but NO fold watermark -- it has not completed a
+    // reconciling refresh. This is a legacy PRE-#931 additive store, OR (the
+    // narrow safe-direction case both gate families flagged) a post-#931 store
+    // whose recompute-heal crashed between writing rows and advancing the
+    // watermark (refresh.ts writes rows then the watermark, non-atomically by
+    // design). In EITHER case the pack renders the persisted store faithfully
+    // without mutating it, so it discloses the un-reconciled condition rather
+    // than presenting the rows as if a reconciling refresh had run.
+    //
+    // The caveat does NOT attribute a specific cause ("earlier engine
+    // version" would be false in the crash-window case -- Codex HIGH #1), and
+    // it does NOT claim membership is unaffected: the PRE-#931 additive engine
+    // could resurrect promoted/discarded destinations from retained history
+    // and did not prune now-allowed destinations, so the LISTED SET (not just
+    // the Seen magnitude) may be un-reconciled (Codex HIGH #2). What DOES hold
+    // regardless of the watermark is the blocked-only fold basis (adapter.ts
+    // gates on egress_blocked; fold.ts folds only denied), so every listed row
+    // is still a recorded denied observation -- the caveat preserves that true
+    // invariant. Running `castle-wall observe candidates` completes the
+    // reconciling refresh (idempotent recompute, and for a crashed heal simply
+    // finishes it); regenerate the pack afterward.
     out.push(
-      "CAVEAT - Seen counts may pre-date the exactly-once fold engine: this " +
-        "install's observe store was recorded by an earlier engine version and " +
-        "has not been reconciled since upgrade, so the Seen counts above may " +
-        "OVERSTATE the per-candidate basis just described. Run `sanctuary " +
-        "castle-wall observe candidates` (which reconciles the store) and " +
-        "regenerate this pack for accurate counts. The set of destinations and " +
-        "their denied/allowed status is unaffected; only the Seen magnitude may " +
-        "be high.",
+      "CAVEAT - this install's observe store has not completed a reconciling " +
+        "refresh (no fold watermark is present), so the rows below may not " +
+        "reflect a reconciled state. The Seen counts may OVERSTATE the " +
+        "per-candidate basis described above, AND the listed set may still " +
+        "include a destination your current policy already permits, or one you " +
+        "previously promoted or discarded, that a reconciling refresh would " +
+        "remove. What still holds is that every listed row is a destination " +
+        "where denied attempts were recorded (the blocked-only basis does not " +
+        "depend on the refresh). Run `sanctuary castle-wall observe candidates` " +
+        "(which completes the reconciling refresh) and regenerate this pack for " +
+        "an accurate list and counts.",
       "",
     );
   }

@@ -270,19 +270,28 @@ export interface InventorySnapshot {
   mcp_servers: ReadOutcome<InventoryMcpServerRow[]>;
   observed_destinations: ReadOutcome<InventoryObservedDestinationRow[]>;
   /**
-   * R4-2 (round-4 sweep 2026-07-15): true when the observe store carried
-   * candidate rows but NO fold watermark at read time -- the signature of a
-   * store minted by the PRE-#931 additive fold engine that has not yet been
-   * reconciled by the idempotent recompute-heal (post-#931 every mint path
-   * advances the watermark, so candidates-without-watermark can only be a
-   * legacy store). Under that condition the rendered `Seen` counts may
-   * OVERSTATE the exactly-once "since this candidate record was created" basis
-   * the egress legend asserts, so the renderer discloses it and directs the
-   * operator to regenerate after `castle-wall observe candidates` (which runs
-   * the heal). Absent/false on any post-#931 store and whenever the observe
-   * read was not populated. The pack stays NON-MUTATING and offline: it
-   * detects and discloses rather than folding (which would add an allowlist +
-   * lock dependency and could fail generation).
+   * R4-2 (round-4 sweep 2026-07-15; gate-hardened): true when the observe
+   * store carried candidate rows but NO fold watermark at read time -- the
+   * signature of a store that has NOT completed a reconciling refresh. That is
+   * a legacy PRE-#931 additive store, OR the narrow window of a post-#931
+   * recompute-heal that crashed after writing rows but before advancing the
+   * watermark (refresh.ts advances the watermark non-atomically after the
+   * rows, by design). Under that condition the rendered rows may not reflect a
+   * reconciled state: the `Seen` counts may OVERSTATE the exactly-once "since
+   * this candidate record was created" basis the egress legend asserts, AND
+   * the listed set may still include a destination the current policy permits
+   * or one previously promoted/discarded (the pre-#931 additive engine did not
+   * prune allowed rows and could resurrect removed ones). The renderer
+   * discloses this without attributing a specific cause and directs the
+   * operator to regenerate after `castle-wall observe candidates` (which
+   * completes the reconciling refresh). The blocked-only fold basis holds
+   * regardless, so every listed row is still a recorded denied observation.
+   * Absent/false whenever a watermark is present (a completed refresh) and
+   * whenever the observe read was not populated. The pack stays NON-MUTATING
+   * and offline: it detects and discloses rather than folding (which would add
+   * an allowlist + lock dependency and could fail generation). The signal is
+   * sound in the dangerous direction -- a reconciled store always carries a
+   * watermark, so a genuinely un-reconciled store is never missed.
    */
   observed_destinations_pre_idempotency?: boolean;
 }
