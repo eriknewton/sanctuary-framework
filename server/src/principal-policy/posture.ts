@@ -359,7 +359,9 @@ export async function buildCastleWallPosture(
   let entries;
   let integrityOk: boolean;
   // F2 round-4 HIGH-1: amber caveat companion to `integrityOk` (see interface).
-  let sealedUnverifiedAtPrivilege = false;
+  // No initializer: the try assigns it on every completing path and the catch
+  // returns, so an initial value would be a dead assignment (lint-enforced).
+  let sealedUnverifiedAtPrivilege: boolean;
   try {
     const result = await input.auditLog.query({
       since: digestSince,
@@ -756,8 +758,10 @@ export async function buildAuditDigest(
   // BLOCKER-1 (round 3): fold the sealed-region verdict into the digest's
   // `chain_verified` / `chain_verdict`, so "the audit log verified clean: no
   // tampering" is NEVER claimed over an in-place-corrupted sealed entry (the
-  // routine query skips sealed content). Computed after the query below.
-  let chainVerdict: AuditChainVerdict | null = null;
+  // routine query skips sealed content). Computed after the query below. No
+  // initializer: the try assigns it and the catch returns, so an initial null
+  // would be a dead assignment (lint-enforced).
+  let chainVerdict: AuditChainVerdict | null;
   try {
     const result = await input.auditLog.query({
       since: windowStart,
