@@ -416,4 +416,38 @@ describe("egress-gate/anchor-registry", () => {
     expect(disarmCalls).toEqual([{ enableToken: "1" }]);
     expect(armCalls).toEqual([{ uids: [504] }]); // fresh -E, no existing token
   });
+
+  it("rollback of a failed add-to-empty RELEASES the freshly acquired -E token, no leak (gate re-review)", async () => {
+    // Fresh empty registry. add A: applyUnion acquires -E token "1", then the
+    // COMMIT save (2nd save) fails -> rollback to empty must FLUSH+release that
+    // fresh token, never drop it (the re-review's new-hole finding).
+    let saveN = 0;
+    let current: PfAnchorRegistryState | null = null;
+    const store: PfAnchorRegistryStore = {
+      async load() {
+        return current === null ? null : structuredClone(current);
+      },
+      async save(s) {
+        saveN += 1;
+        if (saveN === 2) throw new Error("commit save failed");
+        current = structuredClone(s);
+      },
+    };
+    const disarmCalls: Array<{ enableToken?: string }> = [];
+    const reg = new PfAnchorRegistry({
+      store,
+      lock: memLock(),
+      runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
+      armUnion: async (_entries, options) => okArm(options.existingEnableToken ?? "1"),
+      disarm: async (options) => {
+        disarmCalls.push({ ...(options.enableToken !== undefined ? { enableToken: options.enableToken } : {}) });
+      },
+      unionLiveness: async () => live,
+    });
+    await expect(reg.addOrUpdate(A)).rejects.toThrow(/commit save failed/);
+    // The freshly acquired token "1" was released by the rollback flush (no leak).
+    expect(disarmCalls).toEqual([{ enableToken: "1" }]);
+    expect(current?.committed).toEqual([]);
+    expect(current?.enable_token).toBeUndefined();
+  });
 });

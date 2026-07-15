@@ -49,6 +49,19 @@
  * Every side effect (store I/O, lock, pfctl arm/disarm/liveness) is injected,
  * so the whole state machine -- including every rollback and dirty branch -- is
  * unit-testable against mocks without a real host, root, or pf.
+ *
+ * KNOWN BOUNDED RESIDUAL (gate re-review, LOW, accept-and-documented). On a
+ * FIRST arm, the `pfctl -E` reference is acquired INSIDE `armPfAnchorUnion` and
+ * only persisted when the mutation's commit save lands. If the process is KILLED
+ * in the microsecond window between that `-E` and the commit save, the fresh
+ * token is lost from both memory and disk: the next reconcile forces posture red
+ * (the journaled `pending` reads dirty) and flushes the anchor to a known-empty
+ * state, but it cannot `-X` a token it never learned, so pf is left with one
+ * dangling enable reference (over-restrictive, never a confinement escape). This
+ * is inherent to `-E` living inside the arm primitive; closing it fully would
+ * require splitting enable from arm and journaling the token before the settle
+ * probe. Bounded to one leaked reference per hard-crash-in-window; not fixed
+ * here by deliberate minimalism (the primitive is not yet wired into install).
  */
 
 import type { ExclusiveEgressGatePolicy } from "../castle-wall/allowlist/gate-derivation.js";
@@ -525,14 +538,15 @@ export class PfAnchorRegistry {
   ): Promise<void> {
     try {
       if (previousCommitted.length === 0) {
-        // The previous state was empty; a forward apply cannot have released a
-        // token it needed a non-empty prev to hold. Ensure the anchor is flushed
-        // to match (idempotent).
-        if (previousToken !== undefined) {
-          state.enable_token = previousToken;
-        } else {
-          delete state.enable_token;
-        }
+        // The previous state was empty, so rolling back means returning the
+        // anchor to empty. CRITICAL (gate re-review finding): flush using the
+        // token CURRENTLY in state, NOT previousToken. A forward add-to-empty
+        // that SUCCEEDED (acquiring a fresh `-E` into state.enable_token) and
+        // then failed at commit-save must have that fresh token RELEASED by the
+        // flush; resetting to previousToken (undefined) here would drop it and
+        // leak the pf enable reference silently. applyUnion([]) releases
+        // whatever token state currently holds (the fresh one, or none if the
+        // forward arm threw and cleaned up its own reference).
         await this.applyUnion(state, []);
         state.committed = [];
       } else if (forwardReleased) {
