@@ -234,6 +234,18 @@ export function renderPfAnchorRules(policy: ExclusiveEgressGatePolicy): string {
       "renderPfAnchorRules: refusing to render a pf anchor from a malformed exclusive-egress gate policy",
     );
   }
+  // Single-uid render delegates to the multi-uid union path (Slice 5 S5-1) so
+  // the two can never drift: one confined uid is just a one-entry union.
+  return renderPfAnchorRulesForUids([policy]);
+}
+
+/**
+ * Render one confined uid's five anchor rules (the pass-to-gate rule + the
+ * four block-drops). The pass rule uses the exact printed form the Tahoe
+ * keystone drill captured from `pfctl -a <anchor> -sr`, so the liveness
+ * check can compare against pfctl's canonical output.
+ */
+function renderUidAnchorLines(policy: ExclusiveEgressGatePolicy): string[] {
   const uid = policy.agent_uid;
   const port = policy.gate_port;
   return [
@@ -242,8 +254,58 @@ export function renderPfAnchorRules(policy: ExclusiveEgressGatePolicy): string {
     `block drop quick on lo0 inet proto udp from any to any user = ${uid}`,
     `block drop quick on lo0 inet6 proto tcp from any to any user = ${uid}`,
     `block drop quick on lo0 inet6 proto udp from any to any user = ${uid}`,
-    "",
-  ].join("\n");
+  ];
+}
+
+/**
+ * Render the pf anchor rule text for a UNION of confined uids (Unified
+ * Protect Slice 5 S5-1). The shared `sanctuary.egress-gate` anchor holds one
+ * confinement block per confined uid; this is the single artifact loaded into
+ * the anchor whenever the set of confined uids changes, so a second uid never
+ * overwrites a first's rules (the HIGH-4 destructive-full-replace flaw) and a
+ * removal re-renders only the remaining union.
+ *
+ * DETERMINISTIC ORDER: entries are emitted sorted ascending by `agent_uid`,
+ * so re-rendering the same SET produces byte-identical text (an idempotent
+ * `pfctl -f` load; the liveness snapshot compare stays stable).
+ *
+ * FAIL-CLOSED at render time (never emit a permissive-by-accident anchor):
+ *   - an EMPTY list throws (callers flush the anchor for the empty case, they
+ *     do not load empty text);
+ *   - a DUPLICATE `agent_uid` throws (the registry must never hold two
+ *     entries for one uid; two blocks for one uid with different gate ports
+ *     would render two conflicting pass rules);
+ *   - any entry failing {@link validateExclusiveEgressGatePolicy} throws.
+ */
+export function renderPfAnchorRulesForUids(
+  entries: readonly ExclusiveEgressGatePolicy[],
+): string {
+  if (entries.length === 0) {
+    throw new Error(
+      "renderPfAnchorRulesForUids: refusing to render an EMPTY union (flush the anchor for the no-confined-uid case, never load empty rule text)",
+    );
+  }
+  const seen = new Set<number>();
+  for (const entry of entries) {
+    if (validateExclusiveEgressGatePolicy(entry) === null) {
+      throw new Error(
+        "renderPfAnchorRulesForUids: refusing to render a pf anchor from a malformed exclusive-egress gate policy entry",
+      );
+    }
+    if (seen.has(entry.agent_uid)) {
+      throw new Error(
+        `renderPfAnchorRulesForUids: duplicate agent_uid ${entry.agent_uid} in the union (each confined uid must appear at most once)`,
+      );
+    }
+    seen.add(entry.agent_uid);
+  }
+  const sorted = [...entries].sort((a, b) => a.agent_uid - b.agent_uid);
+  const lines: string[] = [];
+  for (const entry of sorted) {
+    lines.push(...renderUidAnchorLines(entry));
+  }
+  lines.push("");
+  return lines.join("\n");
 }
 
 /** Liveness verdict with the positive/negative evidence that produced it. */
@@ -403,6 +465,175 @@ function blockRuleRe(family: "inet" | "inet6", proto: "tcp" | "udp", uid: number
   );
 }
 
+/**
+ * Per-line (anchored, no `m` flag) matchers for exactly one confined uid's
+ * five anchor rules, used by the exact-union liveness comparison. Accepts
+ * both pfctl block-rule spellings (`all` vs `from any to any`).
+ */
+function uidExpectedLineMatchers(
+  policy: ExclusiveEgressGatePolicy,
+): Array<{ re: RegExp; label: string }> {
+  const uid = policy.agent_uid;
+  const port = policy.gate_port;
+  return [
+    {
+      re: new RegExp(
+        `^pass quick on lo0 inet proto tcp from any to 127\\.0\\.0\\.1 port = ${port} user = ${uid} flags S/SA keep state$`,
+      ),
+      label: `agent-to-gate pass rule (port ${port}, uid ${uid})`,
+    },
+    { re: new RegExp(`^block drop quick on lo0 inet proto tcp (?:all|from any to any) user = ${uid}$`), label: `inet tcp block-drop for uid ${uid}` },
+    { re: new RegExp(`^block drop quick on lo0 inet proto udp (?:all|from any to any) user = ${uid}$`), label: `inet udp block-drop for uid ${uid}` },
+    { re: new RegExp(`^block drop quick on lo0 inet6 proto tcp (?:all|from any to any) user = ${uid}$`), label: `inet6 tcp block-drop for uid ${uid}` },
+    { re: new RegExp(`^block drop quick on lo0 inet6 proto udp (?:all|from any to any) user = ${uid}$`), label: `inet6 udp block-drop for uid ${uid}` },
+  ];
+}
+
+/**
+ * Exact-union liveness (Unified Protect Slice 5 S5-1, folds Codex H4): prove
+ * by POSITIVE EVIDENCE that the shared anchor holds EXACTLY the union of the
+ * given confined uids' rules -- no more, no less -- and is enabled, hooked,
+ * un-skipped, and un-preempted.
+ *
+ * Distinct from {@link checkPfAnchorLiveness} (single-uid presence check):
+ * per-uid presence alone does not prove the anchor lacks an earlier or
+ * broader PERMISSIVE rule (a stray `pass` from drift, a botched mutation, or
+ * a third party). This check takes ONE anchor snapshot and asserts:
+ *   (a) every expected rule for every confined uid is present, AND
+ *   (b) EVERY printed anchor rule matches some expected union rule -- any
+ *       unexpected line (especially a `pass`) makes the union NOT live.
+ * Then it runs the shared hook / skip / preemption probes once for the whole
+ * union. Fail-closed on any pfctl error, non-zero exit, or unparseable
+ * output.
+ */
+export async function checkPfAnchorUnionLiveness(
+  runner: PfCommandRunner,
+  entries: readonly ExclusiveEgressGatePolicy[],
+  anchorName: string = PF_ANCHOR_NAME,
+): Promise<PfLivenessResult> {
+  if (entries.length === 0) {
+    return { live: false, reasons: ["empty union (no confined uids to verify)"] };
+  }
+  const seen = new Set<number>();
+  for (const entry of entries) {
+    if (validateExclusiveEgressGatePolicy(entry) === null) {
+      return { live: false, reasons: ["malformed exclusive-egress gate policy entry in union"] };
+    }
+    if (seen.has(entry.agent_uid)) {
+      return { live: false, reasons: [`duplicate agent_uid ${entry.agent_uid} in union`] };
+    }
+    seen.add(entry.agent_uid);
+  }
+  const reasons: string[] = [];
+
+  let info: PfCommandResult;
+  try {
+    info = await runner.run("pfctl", ["-s", "info"]);
+  } catch (err) {
+    return {
+      live: false,
+      reasons: [`pfctl -s info failed to run: ${err instanceof Error ? err.message : String(err)}`],
+    };
+  }
+  if (info.code !== 0) {
+    reasons.push(`pfctl -s info exited ${info.code}`);
+  } else if (!/^Status:\s+Enabled\b/m.test(info.stdout)) {
+    reasons.push("pf is not enabled (pfctl -s info lacks 'Status: Enabled')");
+  }
+
+  let rules: PfCommandResult;
+  try {
+    rules = await runner.run("pfctl", ["-a", anchorName, "-sr"]);
+  } catch (err) {
+    reasons.push(
+      `pfctl -a ${anchorName} -sr failed to run: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { live: false, reasons };
+  }
+  if (rules.code !== 0) {
+    reasons.push(`pfctl -a ${anchorName} -sr exited ${rules.code}`);
+    return { live: false, reasons };
+  }
+
+  const printedLines = rules.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+  const sorted = [...entries].sort((a, b) => a.agent_uid - b.agent_uid);
+  const expected: Array<{ re: RegExp; label: string }> = [];
+  for (const entry of sorted) {
+    expected.push(...uidExpectedLineMatchers(entry));
+  }
+  // (a) every expected union rule must be present.
+  for (const { re, label } of expected) {
+    if (!printedLines.some((line) => re.test(line))) {
+      reasons.push(`anchor ${anchorName} is missing the ${label}`);
+    }
+  }
+  // (b) EXACTNESS: every printed anchor rule must match some expected union
+  // rule. An unexpected line (a stray permissive `pass`, a broader rule from
+  // drift or a botched mutation) makes the union NOT live -- this is the H4
+  // hardening over a bare per-uid presence check.
+  for (const line of printedLines) {
+    if (!expected.some(({ re }) => re.test(line))) {
+      reasons.push(
+        `anchor ${anchorName} contains an unexpected rule not in the confined-uid union: ${line}`,
+      );
+    }
+  }
+
+  // Hooked, not merely loaded: the main ruleset must call the anchor.
+  let mainRules: PfCommandResult;
+  try {
+    mainRules = await runner.run("pfctl", ["-sr"]);
+  } catch (err) {
+    reasons.push(`pfctl -sr failed to run: ${err instanceof Error ? err.message : String(err)}`);
+    return { live: false, reasons };
+  }
+  if (mainRules.code !== 0) {
+    reasons.push(`pfctl -sr exited ${mainRules.code}`);
+    return { live: false, reasons };
+  }
+  if (!anchorCallRuleRe(anchorName).test(mainRules.stdout)) {
+    reasons.push(
+      `main ruleset is missing the anchor call rule for ${anchorName} on lo0 ` +
+        "(anchor is loaded but NOT hooked into packet evaluation)",
+    );
+  } else {
+    const preempting = findPreemptingQuickPassRules(mainRules.stdout, anchorName);
+    if (preempting.length > 0) {
+      reasons.push(
+        `main ruleset has ${preempting.length} 'pass ... quick' rule(s) before the ` +
+          `${anchorName} anchor call that can match lo0 traffic and terminate evaluation ` +
+          `first (anchor is hooked but PREEMPTED); first: ${preempting[0]}`,
+      );
+    }
+  }
+
+  // pf must actually evaluate lo0 (not `set skip on lo0`/`lo`).
+  let ifaces: PfCommandResult;
+  try {
+    ifaces = await runner.run("pfctl", ["-v", "-s", "Interfaces"]);
+  } catch (err) {
+    reasons.push(
+      `pfctl -v -s Interfaces failed to run: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return { live: false, reasons };
+  }
+  if (ifaces.code !== 0) {
+    reasons.push(`pfctl -v -s Interfaces exited ${ifaces.code}`);
+    return { live: false, reasons };
+  }
+  if (LOOPBACK_SKIP_LINE_RE.test(ifaces.stdout)) {
+    reasons.push(
+      "pf is set to skip filtering on loopback ('set skip' covers lo0 or the lo group); " +
+        "the anchor call rule prints but is never evaluated (anchor is hooked but SKIPPED)",
+    );
+  }
+
+  return { live: reasons.length === 0, reasons };
+}
+
 /** Options for {@link armPfAnchor}. */
 export interface ArmPfAnchorOptions {
   anchorName?: string;
@@ -434,6 +665,178 @@ export interface ArmPfAnchorResult {
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Install the main-ruleset anchor call rule when it is absent, composing the
+ * running main ruleset from the operator's base pf config plus the Sanctuary
+ * hook lines (the drill-proven shape, preserving the stock com.apple
+ * anchors). Skipped when `pfctl -sr` already prints the call rule, so
+ * repeated arms do not reload the main ruleset. Refuses (throws) on an
+ * unreadable base config or one that sets pf to skip filtering on loopback.
+ * Shared by {@link armPfAnchor} and {@link armPfAnchorUnion} so the two can
+ * never drift.
+ */
+async function installAnchorHookIfAbsent(
+  runner: PfCommandRunner,
+  anchorName: string,
+  rulesFile: string,
+  mainConfPath: string,
+  dir: string,
+): Promise<void> {
+  const mainRules = await runner.run("pfctl", ["-sr"]);
+  if (mainRules.code !== 0) {
+    throw new Error(`pfctl -sr exited ${mainRules.code}: ${mainRules.stderr.trim()}`);
+  }
+  if (anchorCallRuleRe(anchorName).test(mainRules.stdout)) {
+    return;
+  }
+  let baseConf: string;
+  try {
+    baseConf = await readFile(mainConfPath, "utf8");
+  } catch (err) {
+    throw new Error(
+      `armPfAnchor: cannot read base pf config ${mainConfPath} ` +
+        `(${err instanceof Error ? err.message : String(err)}); ` +
+        "refusing to hook the anchor without preserving the operator's base ruleset",
+      { cause: err },
+    );
+  }
+  const skipLines = findLoopbackSkipLines(baseConf);
+  if (skipLines.length > 0) {
+    throw new Error(
+      `armPfAnchor: base pf config ${mainConfPath} sets pf to skip filtering on ` +
+        `loopback (${skipLines.join("; ")}); hooking the anchor through it would load ` +
+        "a ruleset pf never evaluates on lo0 (silently unenforced). Remove lo0/lo from " +
+        "'set skip' and re-arm; refusing to arm a void anchor",
+    );
+  }
+  const mainFile = join(dir, "main.conf");
+  const composed =
+    (baseConf.endsWith("\n") || baseConf.length === 0 ? baseConf : `${baseConf}\n`) +
+    renderPfMainRulesetHook(anchorName, rulesFile);
+  await writeFile(mainFile, composed, { mode: 0o600 });
+  const hook = await runner.run("pfctl", ["-f", mainFile]);
+  if (hook.code !== 0) {
+    throw new Error(
+      `pfctl -f (main-ruleset anchor hook) exited ${hook.code}: ${hook.stderr.trim()}`,
+    );
+  }
+}
+
+/** Options for {@link armPfAnchorUnion}. */
+export interface ArmPfAnchorUnionOptions extends ArmPfAnchorOptions {
+  /**
+   * The `pfctl -E` reference token this fortress already holds, when pf was
+   * enabled by a PRIOR arm of this anchor (the registry threads its committed
+   * token here). When present, {@link armPfAnchorUnion} does NOT call
+   * `pfctl -E` again -- each `-E` bumps pf's enable reference count and returns
+   * a NEW token, so re-enabling on every mutation would leak references that a
+   * single `-X` at teardown could never fully release, leaving pf stuck
+   * enabled. When absent, this is the first arm: `pfctl -E` runs and the new
+   * token is returned for the caller to persist and release at final disarm.
+   */
+  existingEnableToken?: string;
+}
+
+/**
+ * Arm the shared anchor to a UNION of confined uids (Unified Protect Slice 5
+ * S5-1). This is the arm-equivalent primitive the locked registry uses in
+ * place of a bare `pfctl -a <anchor> -f`: it reuses the SAME hook-install +
+ * pf-enable + settle-probe semantics {@link armPfAnchor} owns (Codex H3 --
+ * a bare load leaves rules loaded-but-unhooked/disabled, enforcing nothing),
+ * with the settle-probe gated on {@link checkPfAnchorUnionLiveness} so "armed"
+ * means the anchor holds EXACTLY the union and is hooked, enabled, un-skipped,
+ * and un-preempted.
+ *
+ * Two deliberate differences from {@link armPfAnchor}:
+ *   - It NEVER re-enables pf when `existingEnableToken` is supplied (reference
+ *     counting -- see {@link ArmPfAnchorUnionOptions.existingEnableToken}).
+ *   - ON FAILURE IT DOES NOT FLUSH THE ANCHOR (Codex B2). A flush would drop
+ *     every other confined uid's rules; the anchor is a shared multi-uid
+ *     surface now. The caller (the registry) owns rollback: it re-asserts the
+ *     previous committed union, or -- if that too fails -- marks the registry
+ *     dirty and forces posture red. This function just loads, hooks, enables,
+ *     settles, and throws on any failure, leaving the anchor for the registry
+ *     to reconcile.
+ */
+export async function armPfAnchorUnion(
+  runner: PfCommandRunner,
+  entries: readonly ExclusiveEgressGatePolicy[],
+  options: ArmPfAnchorUnionOptions = {},
+): Promise<ArmPfAnchorResult> {
+  const anchorName = options.anchorName ?? PF_ANCHOR_NAME;
+  assertSafeAnchorName(anchorName);
+  const mainConfPath = options.mainConfPath ?? PF_BASE_CONF_PATH;
+  const rulesText = renderPfAnchorRulesForUids(entries); // throws on empty/dup/malformed
+  const sleep = options.sleep ?? defaultSleep;
+  const settleConsecutive = options.settleConsecutive ?? 2;
+  const settleDelayMs = options.settleDelayMs ?? 200;
+  const settleTimeoutMs = options.settleTimeoutMs ?? 5_000;
+
+  const dir = await mkdtemp(join(tmpdir(), "sanctuary-pf-"));
+  const rulesFile = join(dir, "egress-gate.rules");
+  let enableToken: string | undefined = options.existingEnableToken;
+  try {
+    await writeFile(rulesFile, rulesText, { mode: 0o600 });
+
+    const load = await runner.run("pfctl", ["-a", anchorName, "-f", rulesFile]);
+    if (load.code !== 0) {
+      throw new Error(`pfctl -a ${anchorName} -f exited ${load.code}: ${load.stderr.trim()}`);
+    }
+
+    await installAnchorHookIfAbsent(runner, anchorName, rulesFile, mainConfPath, dir);
+
+    // Enable pf ONLY if we do not already hold a reference token (first arm).
+    if (options.existingEnableToken === undefined) {
+      const enable = await runner.run("pfctl", ["-E"]);
+      if (enable.code !== 0) {
+        throw new Error(`pfctl -E exited ${enable.code}: ${enable.stderr.trim()}`);
+      }
+      const tokenMatch = /Token\s*:\s*(\d+)/.exec(`${enable.stdout}\n${enable.stderr}`);
+      if (tokenMatch) {
+        enableToken = tokenMatch[1];
+      }
+    }
+
+    // Settle-probe on the EXACT union: require N consecutive live results.
+    const deadline = Date.now() + settleTimeoutMs;
+    let consecutive = 0;
+    let probes = 0;
+    let lastReasons: string[] = [];
+    while (consecutive < settleConsecutive) {
+      if (Date.now() > deadline) {
+        throw new Error(
+          `pf anchor union settle-probe timed out after ${settleTimeoutMs}ms ` +
+            `(last liveness failure: ${lastReasons.join("; ") || "none recorded"})`,
+        );
+      }
+      const result = await checkPfAnchorUnionLiveness(runner, entries, anchorName);
+      probes += 1;
+      if (result.live) {
+        consecutive += 1;
+      } else {
+        consecutive = 0;
+        lastReasons = result.reasons;
+      }
+      if (consecutive < settleConsecutive) {
+        await sleep(settleDelayMs);
+      }
+    }
+    const armResult: ArmPfAnchorResult = { settleProbes: probes };
+    if (enableToken !== undefined) {
+      armResult.enableToken = enableToken;
+    }
+    return armResult;
+    // Codex B2: NO catch-flush here -- the anchor is a shared multi-uid
+    // surface, so flushing on failure would drop every OTHER confined uid's
+    // rules. The registry owns rollback (re-assert the committed union, else
+    // mark itself dirty and force posture red). This primitive only ever
+    // loads/hooks/enables/settles and throws on failure, leaving the anchor
+    // for the registry to reconcile.
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
 
 /**
  * Arm the anchor: load the rendered rules into the Sanctuary anchor, HOOK
@@ -489,43 +892,7 @@ export async function armPfAnchor(
 
     // Hook the anchor into the MAIN ruleset (a loaded-but-unhooked anchor
     // enforces nothing). Skipped when the call rule is already present.
-    const mainRules = await runner.run("pfctl", ["-sr"]);
-    if (mainRules.code !== 0) {
-      throw new Error(`pfctl -sr exited ${mainRules.code}: ${mainRules.stderr.trim()}`);
-    }
-    if (!anchorCallRuleRe(anchorName).test(mainRules.stdout)) {
-      let baseConf: string;
-      try {
-        baseConf = await readFile(mainConfPath, "utf8");
-      } catch (err) {
-        throw new Error(
-          `armPfAnchor: cannot read base pf config ${mainConfPath} ` +
-            `(${err instanceof Error ? err.message : String(err)}); ` +
-            "refusing to hook the anchor without preserving the operator's base ruleset",
-          { cause: err },
-        );
-      }
-      const skipLines = findLoopbackSkipLines(baseConf);
-      if (skipLines.length > 0) {
-        throw new Error(
-          `armPfAnchor: base pf config ${mainConfPath} sets pf to skip filtering on ` +
-            `loopback (${skipLines.join("; ")}); hooking the anchor through it would load ` +
-            "a ruleset pf never evaluates on lo0 (silently unenforced). Remove lo0/lo from " +
-            "'set skip' and re-arm; refusing to arm a void anchor",
-        );
-      }
-      const mainFile = join(dir, "main.conf");
-      const composed =
-        (baseConf.endsWith("\n") || baseConf.length === 0 ? baseConf : `${baseConf}\n`) +
-        renderPfMainRulesetHook(anchorName, rulesFile);
-      await writeFile(mainFile, composed, { mode: 0o600 });
-      const hook = await runner.run("pfctl", ["-f", mainFile]);
-      if (hook.code !== 0) {
-        throw new Error(
-          `pfctl -f (main-ruleset anchor hook) exited ${hook.code}: ${hook.stderr.trim()}`,
-        );
-      }
-    }
+    await installAnchorHookIfAbsent(runner, anchorName, rulesFile, mainConfPath, dir);
 
     const enable = await runner.run("pfctl", ["-E"]);
     if (enable.code !== 0) {

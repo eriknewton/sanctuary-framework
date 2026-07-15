@@ -25,19 +25,38 @@ export {
   PF_COMMAND_TIMEOUT_MS,
   createExecFilePfRunner,
   renderPfAnchorRules,
+  renderPfAnchorRulesForUids,
   renderPfMainRulesetHook,
   checkPfAnchorLiveness,
+  checkPfAnchorUnionLiveness,
   findPreemptingQuickPassRules,
   findLoopbackSkipLines,
   armPfAnchor,
+  armPfAnchorUnion,
   disarmPfAnchor,
   type PfCommandRunner,
   type PfCommandResult,
   type PfLivenessResult,
   type ArmPfAnchorOptions,
+  type ArmPfAnchorUnionOptions,
   type ArmPfAnchorResult,
   type DisarmPfAnchorOptions,
 } from "./pf-anchor.js";
+
+export {
+  PF_ANCHOR_REGISTRY_PATH,
+  PF_ANCHOR_REGISTRY_LOCK_PATH,
+  PF_ANCHOR_REGISTRY_STATE_VERSION,
+  PfAnchorRegistry,
+  PfAnchorRegistryDirtyError,
+  PfAnchorRegistryStateError,
+  createFsRegistryStore,
+  type PfAnchorRegistryEntry,
+  type PfAnchorRegistryState,
+  type PfAnchorRegistryStore,
+  type PfAnchorRegistryOps,
+  type PfAnchorRegistryMutationResult,
+} from "./anchor-registry.js";
 
 export {
   checkGatePolicyParity,
