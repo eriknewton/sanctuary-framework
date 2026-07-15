@@ -791,6 +791,22 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
       "",
     ];
   }
+  if (d.status === "present_tampered") {
+    // Round-5 two-family gate: a readable store that FAILED integrity
+    // verification is tamper evidence. It must never be described as a
+    // privilege limitation, and "re-run as root" is futile advice here (root
+    // hits the same integrity failure). Say what was detected.
+    return [
+      "> INTEGRITY NOTICE: a separate root-owned daemon enforcement store " +
+        "(_audit-daemon) is present and was readable, but it FAILED integrity " +
+        "verification (its tamper-evident chain did not verify). Its " +
+        "daemon-recorded enforcement events are NOT included in the counts " +
+        "above, and this failure is itself evidence that the store was " +
+        "modified or corrupted. Investigate before relying on this report; do " +
+        "not treat this as a complete enforcement census.",
+      "",
+    ];
+  }
   return [
     "> COVERAGE NOTICE: a separate root-owned daemon enforcement store " +
       "(_audit-daemon) is present but was NOT readable at this privilege, so " +

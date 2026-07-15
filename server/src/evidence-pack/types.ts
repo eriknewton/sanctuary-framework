@@ -133,7 +133,7 @@ export interface QuarterAggregation {
  * namespace into a separate root-owned `_audit-daemon` store. The evidence pack
  * reads the operator store; this descriptor makes the daemon store's
  * contribution EXPLICIT so the census is never a silent single-store false
- * count. Three honest states:
+ * count. Four honest states:
  *   - `absent`: no daemon store exists (a fresh / never-armed fortress). The
  *     operator store is the whole census.
  *   - `included`: the daemon store was read at this privilege and its entries
@@ -143,9 +143,13 @@ export interface QuarterAggregation {
  *     are NOT in the counts; the pack DISCLOSES the omission rather than
  *     presenting the operator-only view as complete. Re-run as root for a full
  *     census.
+ *   - `present_tampered`: the daemon store WAS readable but FAILED integrity
+ *     verification (round-5 two-family gate): tamper evidence, not a privilege
+ *     limitation. Its records are NOT in the counts, and the disclosure says
+ *     "tamper detected, investigate", never the futile "re-run as root".
  */
 export interface DaemonStoreDisclosure {
-  status: "absent" | "included" | "present_unreadable";
+  status: "absent" | "included" | "present_unreadable" | "present_tampered";
   /** Daemon-store entries merged into the census (only when `included`). */
   included_entry_count: number;
 }

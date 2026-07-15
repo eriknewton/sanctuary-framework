@@ -21,7 +21,7 @@ import { Writable } from "node:stream";
 import { createSanctuaryServer } from "../index.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { StoredIdentity } from "../core/identity.js";
-import type { AuditEntry } from "../operational/audit-log.js";
+import { AuditIntegrityError, type AuditEntry } from "../operational/audit-log.js";
 import {
   createDaemonAuditLog,
   probeDaemonChainAccess,
@@ -279,6 +279,7 @@ export function deriveAuditReadOutcome(params: {
   daemon?:
     | { status: "absent" }
     | { status: "present_unreadable" }
+    | { status: "present_tampered" }
     | {
         status: "included";
         entries: readonly AuditEntry[];
@@ -372,17 +373,23 @@ export function deriveAuditReadOutcome(params: {
  * WATCH-1: read the F2 daemon enforcement store (`_audit-daemon`) for the
  * census. Returns `absent` on a non-split fortress (nothing to add),
  * `present_unreadable` when a daemon store exists but this privilege cannot read
- * it (the pack then DISCLOSES the omission), or `included` with the daemon
- * entries + retention to merge. A read that fails after the directory was
- * listable is treated as `present_unreadable` so a pack always generates and
- * discloses rather than crashing.
+ * it (the pack then DISCLOSES the omission), `present_tampered` when the store
+ * WAS readable but failed integrity verification (round-5 gate: tamper evidence
+ * must never be mislabeled as a privilege limitation, and "re-run as root" is
+ * futile advice when root already hit the integrity failure), or `included`
+ * with the daemon entries + retention to merge. A non-integrity read failure
+ * after the directory was listable is `present_unreadable` so a pack always
+ * generates and discloses rather than crashing.
+ *
+ * Exported for the integration regression test only; the CLI is the caller.
  */
-async function readDaemonStore(
+export async function readDaemonStore(
   storage: FilesystemStorage,
   masterKey: Uint8Array
 ): Promise<
   | { status: "absent" }
   | { status: "present_unreadable" }
+  | { status: "present_tampered" }
   | {
       status: "included";
       entries: readonly AuditEntry[];
@@ -399,6 +406,8 @@ async function readDaemonStore(
   if (access === "present_unreadable") return { status: "present_unreadable" };
   try {
     const daemonLog = createDaemonAuditLog(storage, masterKey);
+    // Default strict integrity mode: a daemon-store tamper makes query() throw
+    // AuditIntegrityError, distinguished below from an access failure.
     const { entries, total } = await daemonLog.query({ limit: 1_000_000 });
     let usage: {
       entryCount: number | null;
@@ -416,9 +425,15 @@ async function readDaemonStore(
       windowedTotal: total,
       usage,
     };
-  } catch {
-    // Listable but not fully readable / a strict-mode integrity throw: disclose
-    // the store rather than silently dropping it or failing the whole pack.
+  } catch (e) {
+    // A strict-mode integrity failure over a READABLE store is tamper evidence,
+    // not a privilege limitation. Disclose it as such (two-family round-5 gate:
+    // Codex HIGH / Opus-family MED, convergent).
+    if (e instanceof AuditIntegrityError) {
+      return { status: "present_tampered" };
+    }
+    // Listable but not readable (privilege / IO): disclose the omission rather
+    // than silently dropping the store or failing the whole pack.
     return { status: "present_unreadable" };
   }
 }

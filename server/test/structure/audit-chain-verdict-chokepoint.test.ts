@@ -24,6 +24,17 @@
  *
  * It is deliberately source-text-based (not a runtime test) so it catches the
  * bypass at authoring time, before any fortress is even constructed.
+ *
+ * HONEST SCOPE (round 5, both review families): this guard is a BEST-EFFORT
+ * authoring-time backstop, not complete-by-construction. A line scan cannot
+ * follow aliases across lines (it flags the alias MINT, not the later use), and
+ * a bypass written within the proximity window of a genuinely different,
+ * correctly-routed handler is laundered by proximity. The real enforcement is
+ * the runtime chokepoint itself (`getAuditChainVerdict` + the collapse
+ * helpers); this test raises the regression bar and catches every idiom named
+ * by four rounds of adversarial review. Making it alias- and scope-exact needs
+ * an AST/parser rewrite (see the repo's line-scanner-vs-parser escalation
+ * discipline), tracked as follow-up, not claimed here.
  */
 
 import { describe, expect, it } from "vitest";
@@ -56,7 +67,32 @@ const EXEMPTION_MARKER = "audit-chokepoint-exempt";
 
 // The raw cleanliness signals a bypass would derive "clean" from. Each must be
 // routed-or-exempt at EVERY occurrence (comments / description copy excluded).
-const RAW_SIGNALS = ["integrity_findings.length", "verified_against_audit_chain"];
+// Round-5 tightening (two-family gate): beyond the direct `.length` read and the
+// clean-claim label, also flag the LAUNDERING idioms both reviewers exploited:
+//   - alias-minting: `const f = res.integrity_findings;` (later `f.length === 0`
+//     is invisible to a line scan, so the MINT line is the enforcement point);
+//   - destructuring: `const { integrity_findings } = res;` (same laundering);
+//   - filter-emptiness: `integrity_findings.filter(...).length === 0` (no
+//     `.length` directly after the property).
+// Named regexes so offender output stays readable.
+const RAW_SIGNALS: Array<{ name: string; re: RegExp }> = [
+  { name: "integrity_findings.length", re: /integrity_findings\s*\.\s*length/ },
+  { name: "verified_against_audit_chain", re: /verified_against_audit_chain/ },
+  {
+    name: "integrity_findings alias-mint",
+    // An assignment whose right-hand side is a bare `.integrity_findings` read
+    // (ends the expression): `x = res.integrity_findings;` / `= r.integrity_findings)`.
+    re: /=\s*[A-Za-z_$][\w$.]*\.integrity_findings\s*[;,)\]]?\s*$/,
+  },
+  {
+    name: "integrity_findings destructure",
+    re: /\{[^{}]*\bintegrity_findings\b[^{}]*\}\s*=/,
+  },
+  {
+    name: "integrity_findings.filter",
+    re: /integrity_findings\s*\.\s*(filter|some|every|find)\b/,
+  },
+];
 
 // How many lines around an occurrence count as "near" for a routing symbol or an
 // exemption marker. Wide enough to cover a handler's claim+routing proximity,
@@ -97,10 +133,9 @@ function isCommentLine(line: string): boolean {
  * comment, product-copy `description:` string, or a trailing-comment mention.
  * Those never derive a runtime cleanliness verdict.
  */
-function isClaimContext(line: string, signal: string): boolean {
+function isClaimContext(line: string, matchIdx: number): boolean {
   if (isCommentLine(line)) return false;
   if (line.includes("description:")) return false;
-  const matchIdx = line.indexOf(signal);
   const commentIdx = line.indexOf("//");
   if (commentIdx !== -1 && commentIdx < matchIdx) return false; // in a trailing comment
   return true;
@@ -131,10 +166,12 @@ function unroutedOccurrences(text: string): Array<{ line: number; signal: string
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     for (const signal of RAW_SIGNALS) {
-      if (!line.includes(signal)) continue;
-      if (!isClaimContext(line, signal)) continue;
+      const m = signal.re.exec(line);
+      if (!m) continue;
+      if (!isClaimContext(line, m.index)) continue;
       if (routedOrExemptNear(lines, i)) continue;
-      out.push({ line: i + 1, signal, snippet: line.trim() });
+      out.push({ line: i + 1, signal: signal.name, snippet: line.trim() });
+      break; // one report per line is enough
     }
   }
   return out;
@@ -212,6 +249,47 @@ describe("F2 BLOCKER-1: audit-chain cleanliness is derived ONLY through the shar
     expect(flagged.length, "the bypass must be caught").toBe(1);
     expect(flagged[0]!.signal).toBe("integrity_findings.length");
     expect(flagged[0]!.snippet).toContain("res.integrity_findings.length === 0");
+  });
+
+  // Round-5 teeth (two-family gate): the laundering idioms both reviewers
+  // exploited must each be flagged when unrouted, alias-minting, destructuring,
+  // and filter-emptiness. The alias's LATER use (`f.length === 0`) is invisible
+  // to a line scan; the mint line is the enforcement point, so flagging the mint
+  // forces routing/exemption exactly where the raw signal enters scope.
+  it("flags the alias-mint, destructure, and filter-emptiness laundering idioms", () => {
+    const alias = unroutedOccurrences(
+      [
+        "function bypass(res) {",
+        "  const f = res.integrity_findings;",
+        "  return { chain_ok: f.filter(Boolean).length === 0 };",
+        "}",
+      ].join("\n"),
+    );
+    expect(alias.length, "the alias mint must be flagged").toBeGreaterThanOrEqual(1);
+    expect(alias[0]!.signal).toBe("integrity_findings alias-mint");
+
+    const destructured = unroutedOccurrences(
+      [
+        "function bypass2(res) {",
+        "  const { integrity_findings } = res;",
+        "  return { chain_ok: integrity_findings.length === 0 };",
+        "}",
+      ].join("\n"),
+    );
+    expect(
+      destructured.some((o) => o.signal === "integrity_findings destructure"),
+      "the destructure must be flagged",
+    ).toBe(true);
+
+    const filtered = unroutedOccurrences(
+      [
+        "function bypass3(res) {",
+        "  return { chain_ok: res.integrity_findings.filter(isReal).length === 0 };",
+        "}",
+      ].join("\n"),
+    );
+    expect(filtered.length, "the filter-emptiness idiom must be flagged").toBe(1);
+    expect(filtered[0]!.signal).toBe("integrity_findings.filter");
   });
 
   // The negative-control's counterpart: once the bypass routes (or is exempted),

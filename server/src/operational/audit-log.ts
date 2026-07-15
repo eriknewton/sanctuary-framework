@@ -1720,11 +1720,16 @@ export class AuditLog {
     const statePath = dirname(
       this.filesystemCapabilities.namespacePath(AUDIT_NAMESPACE)
     );
-    let fingerprint: string;
+    // A fingerprint read failure yields NULL, never a shared sentinel string: a
+    // sentinel key could collide with itself across calls (throw -> cache under
+    // sentinel -> later throw -> stale hit on a non-content key). Null always
+    // misses the cache AND is never cached, so every failed-fingerprint call
+    // does a fresh walk (round-5 gate hardening).
+    let fingerprint: string | null;
     try {
       fingerprint = await this.sealedRegionFingerprint();
     } catch {
-      fingerprint = "list-error"; // force a walk (which will report unreadable)
+      fingerprint = null; // force a fresh walk; result not cacheable
     }
     if (
       this.cachedSealedVerdict &&
@@ -1737,9 +1742,11 @@ export class AuditLog {
       statePath,
       macKey: this.splitBoundaryMacKey,
     });
-    // Only cache a stable/terminal verdict; an `unreadable` may be transient
-    // (a race with a chmod), so leave it uncached so the next call re-checks.
-    if (verdict.status !== "unreadable") {
+    // Only cache a stable/terminal verdict under a REAL content fingerprint; an
+    // `unreadable` may be transient (a race with a chmod), and a null
+    // fingerprint (fingerprint read failed) must never be a cache key (null
+    // would match null on the next failed read and serve a stale verdict).
+    if (verdict.status !== "unreadable" && fingerprint !== null) {
       this.cachedSealedVerdict = { fingerprint, verdict };
     }
     return verdict;
@@ -2644,15 +2651,20 @@ export class AuditLog {
    *     genesis / legacy anchor as before (a stale anchor, if any, is ignored).
    *   - lowest chained  > legacyCount+1 → the head was pruned; REQUIRE a MAC-valid
    *     rotation anchor whose base_sequence == the lowest survivor. Absent /
-   *     invalid / mismatched → finding (fail closed), except the TOFU case below.
+   *     invalid / mismatched → finding (fail closed), unconditionally.
    *   - no chained entries → if an anchor still exists, the whole post-cut chain
    *     was truncated → finding.
    *
-   * Trust-on-first-use migration: a pre-F3 log that rotated before this change
-   * has lowest > legacyCount+1 and NO anchor. If its surviving chain is internally
-   * contiguous, accept it once and write the authenticated anchor; thereafter it
-   * is MAC-protected. A non-contiguous (genuinely truncated) chain still flags via
-   * the forward walk. This mirrors F1's one-time self-heal residual.
+   * NO trust-on-first-use for an above-genesis suffix (F2 round 3, 2026-07-14):
+   * the old pre-F3 accommodation, "an anchor-absent but internally-contiguous
+   * surviving chain is accepted once and a fresh anchor is written", was removed
+   * because an attacker who deletes the prefix AND every witness leaves exactly
+   * that shape. An above-genesis suffix with no authenticated cut now ALWAYS
+   * surfaces `rotation_anchor_missing` and writes NO anchor, regardless of
+   * marker/boundary state. Only a legitimate future rotation writes an anchor
+   * (via `maybeRotate`). A pre-F3 log that genuinely rotated before anchors
+   * existed therefore reports the finding until re-anchored by a real rotation:
+   * honest, fail-closed, and the accepted cost of closing the launder.
    *
    * F2 Option A: when a valid split-boundary record exists (`splitBoundary`),
    * it REPLACES `legacyCount+1`/genesis as the default seed. The sealed
@@ -2661,7 +2673,7 @@ export class AuditLog {
    * anchor file for it is required (the boundary record IS the anchor for
    * this purpose) and `chainedEntries.length === 0` at the boundary is the
    * EXPECTED steady state immediately after migration, not a truncation.
-   * Everything below (rotation-anchor TOFU / mismatch / truncation handling)
+   * Everything below (rotation-anchor validation / mismatch / truncation handling)
    * is otherwise unchanged and layers on top of this new default correctly:
    * a LATER rotation of the post-split chain is still detected and
    * authenticated exactly as before.

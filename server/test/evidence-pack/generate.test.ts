@@ -208,6 +208,23 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("7 daemon-recorded enforcement entries");
   });
 
+  it("WATCH-1 round-5: a TAMPERED daemon store renders an INTEGRITY notice, never the privilege excuse", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "present_tampered", included_entry_count: 0 },
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("INTEGRITY NOTICE");
+    expect(report).toContain("FAILED integrity verification");
+    expect(report).toContain("NOT included in the counts");
+    // The futile privilege advice must NOT appear for a tamper.
+    expect(report).not.toContain("Re-run the pack as root");
+    expect(report).not.toContain("NOT readable at this privilege");
+  });
+
   it("WATCH-1: an absent daemon store adds no daemon disclosure (non-split fortress unchanged)", () => {
     const pack = buildEvidencePack(baseInput(), deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")]));
     const report = pack.files[0]!.content;

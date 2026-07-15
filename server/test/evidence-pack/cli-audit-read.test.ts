@@ -233,6 +233,23 @@ describe("deriveAuditReadOutcome", () => {
       }
     });
 
+    it("`present_tampered`: the pack still generates, counts EXCLUDE the daemon store, and the TAMPER (not a privilege excuse) is disclosed", () => {
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-02T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+        daemon: { status: "present_tampered" },
+      });
+      expect(outcome.status).toBe("populated");
+      if (outcome.status === "populated") {
+        expect(outcome.value.entries.length).toBe(1);
+        expect(outcome.value.retention.retained_total).toBe(1);
+        expect(outcome.value.retention.daemon_store.status).toBe("present_tampered");
+        expect(outcome.value.retention.daemon_store.included_entry_count).toBe(0);
+      }
+    });
+
     it("`present_unreadable`: the pack still generates (populated), counts EXCLUDE the daemon store, and the omission is disclosed", () => {
       const outcome = deriveAuditReadOutcome({
         entries: [entry("2026-07-02T00:00:00.000Z")],
