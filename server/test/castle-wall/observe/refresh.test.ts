@@ -121,6 +121,41 @@ async function appendBlocked(
   });
 }
 
+/**
+ * Append a Linux daemon FLAT-shape egress_blocked row (#897): flat `dest_*` +
+ * `agent_*` + the daemon's unconditional `decision_provenance` fingerprint, as
+ * `castle-wall-daemon/src/policy.rs` writes it. The adapter tags these
+ * `provenance: "linux_daemon"`, so an `"unknown"` template here is a REAL,
+ * suppressible template (unlike the macOS default-resolver sentinel).
+ */
+async function appendBlockedFlat(
+  auditLog: AuditLog,
+  overrides: {
+    host?: string | null;
+    ip?: string;
+    port?: number;
+    protocol?: "tcp" | "udp";
+    template?: string;
+  } = {},
+): Promise<void> {
+  await auditLog.appendCritical({
+    layer: "l1",
+    operation: "egress_blocked",
+    identity_id: "castle-wall-daemon",
+    result: "failure",
+    details: {
+      agent_id: "agent-1",
+      agent_template: overrides.template ?? "claude-code",
+      ...(overrides.host === null ? {} : { dest_host: overrides.host ?? "api.example.com" }),
+      dest_ip: overrides.ip ?? "203.0.113.5",
+      dest_port: overrides.port ?? 443,
+      dest_protocol: overrides.protocol ?? "tcp",
+      opaque: false,
+      decision_provenance: "default_deny",
+    },
+  });
+}
+
 function allowRule(overrides: Partial<AllowlistRule["match"]> = {}): AllowlistRule {
   return {
     id: `rule-${JSON.stringify(overrides)}`,
@@ -443,6 +478,37 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
     expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(0);
     expect(outcome.status === "refreshed" && outcome.removed_now_allowed).toBe(0);
     expect((await harness.store.listCandidates()).size).toBe(1);
+  });
+
+  it("#897 finding 2: a Linux-daemon FLAT 'unknown'-template row IS folded AND IS suppressed by a covering allow rule scoped to 'unknown' (the exemption is macOS-only)", async () => {
+    const harness = makeHarness();
+    // A real NFQUEUE row: flat shape, agent_template "unknown", provenance linux_daemon.
+    await appendBlockedFlat(harness.auditLog, { template: "unknown" });
+    // Operator has allowed exactly this destination for template "unknown".
+    const unknownScopedAllow = { ...allowRule(), scope: { template_ids: ["unknown"] } };
+    const outcome = await refresh(harness, [unknownScopedAllow]);
+    // Folded (finding 1) then suppressed (finding 2: NOT blanket-exempted).
+    expect(outcome.status === "refreshed" && outcome.folded_events).toBe(1);
+    expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
+    expect((await harness.store.listCandidates()).size).toBe(0);
+  });
+
+  it("#897 finding 2: a macOS default-resolver 'unknown' row and a Linux-daemon 'unknown' row diverge under the SAME allow rule (macOS stays pending, Linux is suppressed)", () => {
+    const covering = [{ ...allowRule(), scope: { template_ids: ["unknown"] } }];
+    const base = {
+      agent_id: "agent-1",
+      agent_template: "unknown",
+      host: "api.example.com",
+      ip: "203.0.113.5",
+      port: 443,
+      protocol: "tcp" as const,
+    };
+    // macOS default-resolver sentinel: unattributed, NEVER suppressed.
+    expect(candidateCurrentlyAllowed(covering, { ...base, provenance: "macos" })).toBe(false);
+    // undefined provenance (legacy/hand-built): conservative -> also exempt.
+    expect(candidateCurrentlyAllowed(covering, { ...base, provenance: undefined })).toBe(false);
+    // Linux daemon: "unknown" is a real, enforceable template -> suppressible.
+    expect(candidateCurrentlyAllowed(covering, { ...base, provenance: "linux_daemon" })).toBe(true);
   });
 
   it("round-7 HIGH: the deny veto folds Unicode case (macOS caseInsensitiveCompare), not just ASCII", () => {
