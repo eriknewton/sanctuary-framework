@@ -375,9 +375,19 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("for the agent that attempted it");
     expect(report).toContain("as of its most recent refresh");
     expect(report).toContain("clears any pending candidate");
-    expect(report).toContain("may remain listed while its permission cannot be verified");
+    expect(report).toContain("may also remain listed while its permission cannot be verified");
     expect(report).toContain("never that data was exchanged");
     expect(report).not.toContain("do NOT appear here");
+    // R4-1 re-truing vs #934 (provenance-scoped belt + Linux flat-shape fold):
+    // the auto-clearing claim is scoped to where the engine can attribute the
+    // flow (Linux daemon rows), and the legend discloses that on the current
+    // macOS build every flow is recorded "unknown" so macOS rows are NOT
+    // auto-cleared by policy and must be cleared via promote/discard. This
+    // keeps the auto-clear claim from over-generalizing to macOS.
+    expect(report).toContain("Linux enforcement-daemon rows today");
+    expect(report).toContain('unresolved "unknown" agent attribution');
+    expect(report).toContain("macOS rows are NOT auto-cleared by policy");
+    expect(report).toContain("Reconcile this table against current policy");
   });
 
   it("OPEN-MED-1 + F2: the egress 'Seen' legend states its true basis (candidate-record lifetime, not quarter-scoped)", () => {
