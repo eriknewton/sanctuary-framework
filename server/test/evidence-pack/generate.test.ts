@@ -375,9 +375,19 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("for the agent that attempted it");
     expect(report).toContain("as of its most recent refresh");
     expect(report).toContain("clears any pending candidate");
-    expect(report).toContain("may remain listed while its permission cannot be verified");
+    expect(report).toContain("may also remain listed while its permission cannot be verified");
     expect(report).toContain("never that data was exchanged");
     expect(report).not.toContain("do NOT appear here");
+    // R4-1 re-truing vs #934 (provenance-scoped belt + Linux flat-shape fold):
+    // the auto-clearing claim is scoped to where the engine can attribute the
+    // flow (Linux daemon rows), and the legend discloses that on the current
+    // macOS build every flow is recorded "unknown" so macOS rows are NOT
+    // auto-cleared by policy and must be cleared via promote/discard. This
+    // keeps the auto-clear claim from over-generalizing to macOS.
+    expect(report).toContain("Linux enforcement-daemon rows today");
+    expect(report).toContain('unresolved "unknown" agent attribution');
+    expect(report).toContain("macOS rows are NOT auto-cleared by policy");
+    expect(report).toContain("Reconcile this table against current policy");
   });
 
   it("OPEN-MED-1 + F2: the egress 'Seen' legend states its true basis (candidate-record lifetime, not quarter-scoped)", () => {
@@ -409,6 +419,79 @@ describe("buildEvidencePack", () => {
     );
     // The falsifiable-under-reset absolute basis claim is gone.
     expect(report).not.toContain("since observation began on this install");
+    // R4-2: with no pre-idempotency flag, no staleness caveat is printed - the
+    // exactly-once basis stands unqualified for a reconciled/current store.
+    expect(report).not.toContain("has not completed a reconciling refresh");
+  });
+
+  it("R4-2: an un-reconciled observe store (rows, no watermark) prints the staleness caveat", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: emptyVerified(),
+          mcp_servers: emptyVerified(),
+          observed_destinations: populated([
+            { host: "api.telegram.org", port: 443, protocol: "tcp", times_seen: 999, exfil_risk: true },
+          ]),
+          observed_destinations_pre_idempotency: true,
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    // The caveat must state the neutral observable (no completed reconciling
+    // refresh) WITHOUT attributing a specific cause (gate HIGH #1: "earlier
+    // engine version" would be false in the crash-window case), name the remedy
+    // (observe candidates completes the refresh; regenerate), and disclose that
+    // the LISTED SET may also be stale, not just the Seen magnitude (gate HIGH
+    // #2). The true blocked-only invariant is preserved.
+    expect(report).toContain("has not completed a reconciling refresh");
+    expect(report).toContain("castle-wall observe candidates");
+    expect(report).toContain("regenerate this pack");
+    expect(report).toContain("it may still include a destination the engine would clear");
+    expect(report).toContain("every listed row is a destination where denied attempts were recorded");
+    // Gate run 2 HIGH: the remedy must NOT overclaim that a refresh removes a
+    // re-surfaced DISCARDED destination (a discard leaves no allow rule; the
+    // recompute replacement path keeps an already-resurfaced discard). Tell the
+    // operator to discard the re-surfaced ones again.
+    expect(report).toContain("you would need to discard it again");
+    expect(report).not.toContain("that a reconciling refresh would remove");
+    // Gate run 3 HIGH: the "would clear on refresh" claim must NOT
+    // over-generalize to "any destination the policy permits" -- the prune only
+    // clears candidateCurrentlyAllowed rows (provenance-scoped, exact-allow),
+    // NEVER a macOS "unknown" row. The caveat defers to the Row-basis legend's
+    // conditions and calls out the macOS non-clearing case explicitly.
+    expect(report).toContain("provenance-scoped conditions described in the Row-basis legend");
+    expect(report).toContain("NOT a macOS 'unknown' row, which is never auto-cleared");
+    expect(report).not.toContain("a reconciling refresh removes those");
+    // Must NOT attribute cause to an "earlier engine version" (false in the
+    // crash-interrupted-heal case), and must NOT falsely reassure that only
+    // the Seen magnitude is affected.
+    expect(report).not.toContain("earlier engine version");
+    expect(report).not.toContain("only the Seen magnitude may be high");
+    // The row still renders faithfully (the pack never mutates the store).
+    expect(report).toContain("api.telegram.org");
+    expect(report).toContain("999");
+  });
+
+  it("R4-2: the staleness caveat is NOT printed when the pre-idempotency flag is false", () => {
+    const pack = buildEvidencePack(
+      {
+        ...baseInput(),
+        inventory: {
+          agents: emptyVerified(),
+          mcp_servers: emptyVerified(),
+          observed_destinations: populated([
+            { host: "api.telegram.org", port: 443, protocol: "tcp", times_seen: 4, exfil_risk: true },
+          ]),
+          observed_destinations_pre_idempotency: false,
+        },
+      },
+      deps([])
+    );
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("has not completed a reconciling refresh");
   });
 
   it("MED-1 (sample-render): the tool count carries an active/recorded denominator", () => {

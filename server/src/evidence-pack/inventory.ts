@@ -83,6 +83,19 @@ export interface InventorySources {
   proxyServers?: InventorySourceRead<ProxyServerView>;
   /** Observed egress destinations from the observe engine. */
   observedDestinations?: InventorySourceRead<CandidateObservation>;
+  /**
+   * R4-2: true when the observe store held candidate rows but NO fold
+   * watermark at read time -- a store that has NOT completed a reconciling
+   * refresh (a legacy pre-#931 additive store, OR the narrow window of a
+   * post-#931 recompute-heal that crashed after writing rows but before
+   * advancing the watermark). Surfaced onto
+   * {@link InventorySnapshot.observed_destinations_pre_idempotency} (only when
+   * the observed-destinations read is populated) so the renderer can disclose
+   * that the rows may not reflect a reconciled state. The CLI derives it from
+   * `observeStore.getFoldWatermark()`; test fixtures set it directly. See
+   * {@link InventorySnapshot} for the full semantics.
+   */
+  observedStorePreIdempotency?: boolean;
 }
 
 /** Map one `LocalAgentRecord` to the inventory row shape. */
@@ -164,6 +177,11 @@ function toOutcome<TRaw, TRow>(
 export function buildInventorySnapshot(
   sources: InventorySources
 ): InventorySnapshot {
+  const observed_destinations = toOutcome(
+    sources.observedDestinations,
+    destinationRow,
+    (a, b) => a.host.localeCompare(b.host) || (a.port ?? 0) - (b.port ?? 0)
+  );
   return {
     agents: toOutcome(sources.agents, agentRow, (a, b) =>
       a.agent_id.localeCompare(b.agent_id)
@@ -171,11 +189,14 @@ export function buildInventorySnapshot(
     mcp_servers: toOutcome(sources.proxyServers, mcpServerRow, (a, b) =>
       a.name.localeCompare(b.name)
     ),
-    observed_destinations: toOutcome(
-      sources.observedDestinations,
-      destinationRow,
-      (a, b) => a.host.localeCompare(b.host) || (a.port ?? 0) - (b.port ?? 0)
-    ),
+    observed_destinations,
+    // R4-2: the pre-idempotency staleness disclosure is meaningful ONLY when
+    // there are rendered Seen counts to caveat -- i.e. a populated read. A
+    // failed/empty observe read renders no counts, so the flag is dropped
+    // there to avoid an orphan caveat with no table.
+    observed_destinations_pre_idempotency:
+      observed_destinations.status === "populated" &&
+      sources.observedStorePreIdempotency === true,
   };
 }
 

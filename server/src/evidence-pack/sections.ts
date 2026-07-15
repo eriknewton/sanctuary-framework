@@ -371,7 +371,8 @@ function renderInventory(inv: InventorySnapshot): PackSection {
   lines.push("");
   lines.push(
     ...foldOutcome(inv.observed_destinations, {
-      populated: (rows) => destinationTable(rows),
+      populated: (rows) =>
+        destinationTable(rows, inv.observed_destinations_pre_idempotency === true),
       emptyVerified: (witness) => [
         claimFromCompleteRead(
           witness,
@@ -452,7 +453,10 @@ function mcpTable(rows: InventoryMcpServerRow[]): string[] {
   return out;
 }
 
-function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
+function destinationTable(
+  rows: InventoryObservedDestinationRow[],
+  seenCountsMayPredateIdempotency = false,
+): string[] {
   // HIGH-1 (sample-render): the column was a bare "Exfil risk: yes/no", which a
   // non-technical underwriter can misread as the firm SELF-REPORTING that data
   // was exfiltrated - especially next to an incident section that says "not
@@ -479,23 +483,37 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
   // additively, inflating counts and resurrecting rows), which is why the
   // engine was fixed rather than this wording softened a third time.
   //
-  // F1 (round-2 sweep 2026-07-14; basis verified against the ENGINE after the
-  // round-3 R3-1 fix + its two-family-gate hardening): the observe engine
-  // folds ONLY denied flows into candidates (castle-wall/observe/fold.ts,
-  // enforce-preserving posture D-Q1), so every row here is a destination the
-  // wall BLOCKED, and allowed egress is structurally absent. The refresh
-  // chokepoint (castle-wall/observe/refresh.ts) suppresses and prunes a
-  // candidate ONLY when it can POSITIVELY verify the current signed policy
-  // permits that flow for the attempting agent across every enforcement
-  // path (an exact host/IP allow with covering scope and no matching
-  // deny -- exactly what the promote workflow writes), so a PROMOTED
-  // destination no longer re-enters this table from retained history. The
-  // legend claims exactly that verified-suppression semantics and EXPLICITLY
-  // discloses that a row may remain listed when its permission cannot be
-  // verified that exactly (pattern/scoped-rule cases) -- a definitive
-  // "permitted destinations never appear" absolute would be falsifiable,
-  // and the round-1..3 sweeps graded exactly such falsifiable absolutes
-  // HIGH. Never re-widen this wording without re-verifying the engine.
+  // F1 (round-2 sweep 2026-07-14; basis RE-VERIFIED against the ENGINE after
+  // the round-3 R3-1 fix, its two-family-gate hardening, AND #934's
+  // provenance-scoped belt + Linux flat-shape fold -- round-4 R4-1): the
+  // observe engine folds ONLY denied flows into candidates (adapter.ts gates
+  // both the nested and the #934 flat arm on `egress_blocked` and stamps
+  // `disposition: "denied"`; castle-wall/observe/fold.ts, enforce-preserving
+  // posture D-Q1), so every row here is a destination the wall BLOCKED and
+  // allowed egress is structurally absent -- TRUE on macOS AND on the Linux
+  // daemon rows #934 newly folds. The refresh chokepoint
+  // (castle-wall/observe/refresh.ts) suppresses and prunes a candidate ONLY
+  // when it can POSITIVELY verify the current signed policy permits that flow
+  // for the attempting agent across every enforcement path (an exact host/IP
+  // allow with covering scope and no matching deny -- exactly what the promote
+  // workflow writes), so a PROMOTED destination no longer re-enters this table
+  // from retained history.
+  //
+  // #934 PROVENANCE SCOPE (R4-1 re-truing): that auto-suppression belt is now
+  // OPERATIVE for Linux-daemon-attributed rows (`refresh.ts:288` no longer
+  // exempts them) but INERT for the current macOS build, where every flow is
+  // recorded with the default resolver's `agent_template: "unknown"` and
+  // `provenance` macos, which `refresh.ts:288` refuses to suppress -- so a
+  // macOS destination the policy permits is NOT auto-cleared and stays listed
+  // until the operator promotes or discards it (promote deletes the row on
+  // every platform, independent of the belt). The legend now discloses this
+  // macOS-`"unknown"` case explicitly rather than presenting auto-clearing as
+  // universal; it still EXPLICITLY discloses that a row may remain listed when
+  // its permission cannot be verified that exactly (pattern/scoped-rule cases)
+  // -- a definitive "permitted destinations never appear" absolute would be
+  // falsifiable, and the round-1..3 sweeps graded exactly such falsifiable
+  // absolutes HIGH. Never re-widen this wording without re-verifying the
+  // engine.
   const out = [
     "Legend - Row basis: this table records BLOCKED flow observations only. " +
       "Each row is a destination the wall DENIED; the Seen count is a count " +
@@ -504,14 +522,22 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
       "refresh the observe engine records no candidate, and clears any " +
       "pending candidate, for a flow it can positively verify the current " +
       "signed policy permits for the agent that attempted it (an exact " +
-      "host or IP allow rule, as written by the promote workflow). A row " +
-      "may remain listed while its permission cannot be verified that " +
-      "exactly (for example a hostname-pattern rule, or a rule scoped to a " +
-      "different agent whose own attempts stay denied); a listed row " +
-      "therefore means denied attempts were recorded, never that data was " +
-      "exchanged. Allowed egress is not inventoried by this " +
-      "table or this version of the pack, so this table is not a census of " +
-      "where the machines' traffic actually went.",
+      "host or IP allow rule, as written by the promote workflow). That " +
+      "automatic clearing applies only where the engine can attribute the " +
+      "flow to an agent whose allow rule it can verify -- Linux " +
+      "enforcement-daemon rows today. On the current macOS build every flow " +
+      "is recorded with an unresolved \"unknown\" agent attribution that no " +
+      "allow rule's scope can be verified to cover, so macOS rows are NOT " +
+      "auto-cleared by policy; a macOS destination you have permitted stays " +
+      "listed until you clear it by promoting or discarding it (`observe " +
+      "promote` / `observe discard`). A row may also remain listed while its " +
+      "permission cannot be verified that exactly (for example a " +
+      "hostname-pattern rule, or a rule scoped to a different agent whose " +
+      "own attempts stay denied); a listed row therefore means denied " +
+      "attempts were recorded, never that data was exchanged. Reconcile this " +
+      "table against current policy. Allowed egress is not inventoried by " +
+      "this table or this version of the pack, so this table is not a census " +
+      "of where the machines' traffic actually went.",
     "",
     "Legend - Destination risk class: a heuristic CATEGORY of the destination " +
       "itself (for example, a messaging or paste host that could be misused for " +
@@ -528,9 +554,67 @@ function destinationTable(rows: InventoryObservedDestinationRow[]): string[] {
       "destination listed here may not have been seen within the reporting " +
       "quarter.",
     "",
+  ];
+  if (seenCountsMayPredateIdempotency) {
+    // R4-2 (round-4 sweep 2026-07-15; gate-hardened): the observe store held
+    // candidate rows but NO fold watermark -- it has not completed a
+    // reconciling refresh. This is a legacy PRE-#931 additive store, OR (the
+    // narrow safe-direction case both gate families flagged) a post-#931 store
+    // whose recompute-heal crashed between writing rows and advancing the
+    // watermark (refresh.ts writes rows then the watermark, non-atomically by
+    // design). In EITHER case the pack renders the persisted store faithfully
+    // without mutating it, so it discloses the un-reconciled condition rather
+    // than presenting the rows as if a reconciling refresh had run.
+    //
+    // The caveat does NOT attribute a specific cause ("earlier engine
+    // version" would be false in the crash-window case -- Codex HIGH #1), and
+    // it does NOT claim membership is unaffected: the PRE-#931 additive engine
+    // could resurrect promoted/discarded destinations from retained history
+    // and did not prune now-allowed destinations, so the LISTED SET (not just
+    // the Seen magnitude) may be un-reconciled (Codex HIGH #2). The remedy
+    // clause is scoped precisely (gate runs 2+3 HIGH): a reconciling refresh
+    // clears a row ONLY under `candidateCurrentlyAllowed` (refresh.ts prune at
+    // ~:568-575) -- the SAME exact, provenance-scoped condition the Row-basis
+    // legend already discloses, so the caveat defers to it rather than
+    // re-stating it (and, like the legend, must NOT over-generalize: a macOS
+    // 'unknown' row the policy permits is NEVER auto-cleared, refresh.ts:288;
+    // pattern/cidr allows and deny-shadowed rows also do not clear). PROMOTED
+    // destinations do clear because promote synthesizes the exact allow rule
+    // that predicate matches. A re-surfaced DISCARDED destination is NOT
+    // removed: a discard leaves no allow rule, and the recompute-heal's
+    // replacement path (refresh.ts ~:534-537) keeps any already-persisted key
+    // present in the full-history fold, so an already-resurfaced discard
+    // survives; the operator must discard it again.
+    // What DOES hold regardless of the watermark is the blocked-only fold basis
+    // (adapter.ts gates on egress_blocked; fold.ts folds only denied), so every
+    // listed row is still a recorded denied observation -- the caveat preserves
+    // that true invariant. Running `castle-wall observe candidates` completes
+    // the reconciling refresh (idempotent recompute, and for a crashed heal
+    // simply finishes it); regenerate the pack afterward.
+    out.push(
+      "CAVEAT - this install's observe store has not completed a reconciling " +
+        "refresh (no fold watermark is present), so the rows below may not " +
+        "reflect a reconciled state. The Seen counts may OVERSTATE the " +
+        "per-candidate basis described above, AND the listed set may not match " +
+        "what a completed refresh would show: it may still include a " +
+        "destination the engine would clear under the current policy on refresh " +
+        "(only under the exact, provenance-scoped conditions described in the " +
+        "Row-basis legend above -- notably NOT a macOS 'unknown' row, which is " +
+        "never auto-cleared), and it may include a destination you previously " +
+        "discarded that an earlier fold re-surfaced, which a refresh does NOT " +
+        "remove (you would need to discard it again). What still holds is that " +
+        "every listed row is a destination where denied attempts were recorded " +
+        "(the blocked-only basis does not depend on the refresh). Run `sanctuary " +
+        "castle-wall observe candidates` (which completes the reconciling " +
+        "refresh), re-discard any re-surfaced destinations, and regenerate this " +
+        "pack.",
+      "",
+    );
+  }
+  out.push(
     "| Destination | Port | Protocol | Seen | Destination risk class |",
     "|---|---|---|---|---|",
-  ];
+  );
   for (const d of rows) {
     const riskClass = d.exfil_risk ? "elevated (review)" : "standard";
     out.push(
