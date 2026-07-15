@@ -321,6 +321,49 @@ describe("buildEvidencePack", () => {
     expect(report).toContain("daemon enforcement store (_audit-daemon) IS");
   });
 
+  it("G-1(c) follow-up: a ZERO-ENTRY quarter with NO daemon store keeps neutral wording (no under-claiming 'operator' scoping)", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([], {
+        max_entries: 100_000,
+        retained_total: 0,
+        max_total_size_bytes: 100 * 1024 * 1024,
+        retained_total_size_bytes: 0,
+        ever_pruned: false,
+        earliest_retained_at: null,
+        daemon_store: { status: "absent", included_entry_count: 0 },
+      })
+    );
+    const report = pack.files[0]!.content;
+    // Single-store fortress: the neutral absolute is correct, not "operator".
+    expect(report).toContain("The audit log holds no retained entries, so");
+    expect(report).not.toContain("operator audit log holds no retained entries");
+  });
+
+  it("manifest coverage carries the daemon-store disclosure (no silent single-store signal in the SIGNED manifest)", () => {
+    const unreadable = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          unreadable_reason: "io",
+        },
+      })
+    );
+    const c = coverage(unreadable);
+    expect(c.daemon_store.status).toBe("present_unreadable");
+    expect(c.daemon_store.unreadable_reason).toBe("io");
+
+    // absent still serializes an explicit status (never simply omitted).
+    const absent = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    expect(coverage(absent).daemon_store.status).toBe("absent");
+  });
+
   // ── G-2: the §7 "N merged" figure is the QUARTER-WINDOWED daemon count ──
 
   it("G-2: §7 reports the WINDOWED daemon count that contributes to the counts, not the all-time total read", () => {

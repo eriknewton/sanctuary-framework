@@ -13,8 +13,11 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { AuditIntegrityError } from "../../src/operational/audit-log.js";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
 import {
+  classifyDaemonIntegrityError,
+  daemonStoreCliWarning,
   daemonUnreadableReason,
   deriveAuditReadOutcome,
 } from "../../src/evidence-pack/cli.js";
@@ -333,5 +336,66 @@ describe("daemonUnreadableReason (G-3 classifier)", () => {
       daemonUnreadableReason(Object.assign(new Error("bad"), { code: "EIO" }))
     ).toBe("io");
     expect(daemonUnreadableReason(undefined)).toBe("io");
+  });
+});
+
+describe("classifyDaemonIntegrityError (G-3 follow-up: access failure is not tamper)", () => {
+  it("classifies a purely-access-failure strict throw as present_unreadable/privilege, NEVER tamper", () => {
+    const err = new AuditIntegrityError([
+      { kind: "entry_unreadable", key: "entry-1", message: "EACCES: denied" },
+      { kind: "storage_unavailable", message: "list failed" },
+    ]);
+    const out = classifyDaemonIntegrityError(err);
+    expect(out.status).toBe("present_unreadable");
+    if (out.status === "present_unreadable") {
+      expect(out.unreadable_reason).toBe("privilege");
+    }
+  });
+
+  it("classifies a genuine tamper finding as present_tampered", () => {
+    const err = new AuditIntegrityError([
+      {
+        kind: "entry_hash_mismatch",
+        key: "entry-1",
+        sequence: 1,
+        expected: "aa",
+        actual: "bb",
+        message: "hash mismatch",
+      },
+    ]);
+    expect(classifyDaemonIntegrityError(err).status).toBe("present_tampered");
+  });
+
+  it("a MIX of access + tamper findings is present_tampered (tamper wins)", () => {
+    const err = new AuditIntegrityError([
+      { kind: "entry_unreadable", key: "entry-1", message: "EACCES" },
+      { kind: "prev_hash_mismatch", key: "entry-2", message: "link broken" },
+    ]);
+    expect(classifyDaemonIntegrityError(err).status).toBe("present_tampered");
+  });
+});
+
+describe("daemonStoreCliWarning (G-1 follow-up: CLI summary is not a silent single-store count)", () => {
+  it("warns for present_unreadable (operator-store-only count) and present_tampered", () => {
+    const unreadable = daemonStoreCliWarning({
+      status: "present_unreadable",
+      included_entry_count: 0,
+    }).join("\n");
+    expect(unreadable).toContain("OPERATOR audit");
+    expect(unreadable).toContain("_audit-daemon");
+    expect(unreadable).toContain("not a complete enforcement census");
+
+    const tampered = daemonStoreCliWarning({
+      status: "present_tampered",
+      included_entry_count: 0,
+    }).join("\n");
+    expect(tampered).toContain("FAILED integrity verification");
+    expect(tampered).toContain("tamper evidence");
+  });
+
+  it("stays silent for absent / included / undefined (the count IS the census)", () => {
+    expect(daemonStoreCliWarning({ status: "absent", included_entry_count: 0 })).toEqual([]);
+    expect(daemonStoreCliWarning({ status: "included", included_entry_count: 5 })).toEqual([]);
+    expect(daemonStoreCliWarning(undefined)).toEqual([]);
   });
 });

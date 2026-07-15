@@ -118,22 +118,27 @@ function renderCover(
         ];
       }
       if (s.zero_of_quarter_covered) {
+        // G-1(c): when a root-owned daemon store is present but EXCLUDED
+        // (unreadable/tampered), scope the zero-coverage claim to the OPERATOR
+        // store (the daemon may hold enforcement history for the quarter) and
+        // signpost it. When the daemon store is absent/included, the operator
+        // count IS the whole census, so keep the neutral wording (do not
+        // introduce a distinction that under-claims the single-store case).
+        const daemonExcluded =
+          s.daemon_store?.status === "present_unreadable" ||
+          s.daemon_store?.status === "present_tampered";
         return [
-          // G-1(c): scope the zero-coverage claim to the OPERATOR store; a
-          // present-but-unreadable/tampered daemon store may hold enforcement
-          // history for the quarter. The access-log section carries the daemon
-          // disclosure.
-          "> COVERAGE NOTICE: NONE of this quarter is covered by the operator " +
-            "audit log; no operator-store entries from " +
-            window.label +
-            " survive in the retained log. See the access-log section for " +
-            "details" +
-            (s.daemon_store?.status === "present_unreadable" ||
-            s.daemon_store?.status === "present_tampered"
-              ? ", including a separate root-owned daemon enforcement store that " +
-                "is present but not included in these counts"
-              : "") +
-            ".",
+          daemonExcluded
+            ? "> COVERAGE NOTICE: NONE of this quarter is covered by the operator " +
+              "audit log; no operator-store entries from " +
+              window.label +
+              " survive in the retained log. See the access-log section for " +
+              "details, including a separate root-owned daemon enforcement store " +
+              "that is present but not included in these counts."
+            : "> COVERAGE NOTICE: NONE of this quarter is covered; no entries from " +
+              window.label +
+              " survive in the retained log. See the access-log section for " +
+              "details.",
           "",
         ];
       }
@@ -718,7 +723,7 @@ function renderHumanReview(
       "tamper-evident audit log with a timestamp. (Whether a given action was " +
       "Tier 1 depends on the operator's policy configuration, which this report " +
       "does not itself attest.) The counts below reflect the approvals and " +
-      "denials actually recorded in this install's operator audit log, separating " +
+      "denials actually recorded in this install's audit log, separating " +
       "decisions a HUMAN made at the control point from decisions the automated " +
       "policy tiers made without a human, so this section never presents an " +
       "automated decision as human oversight, or the reverse.",

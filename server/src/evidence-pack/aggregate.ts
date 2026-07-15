@@ -259,6 +259,19 @@ export function detectShortfall(
     Math.min(quarterEndMs, generatedMs)
   ).toISOString();
 
+  // G-1(c): `earliest_retained_at` is derived from the OPERATOR store only (the
+  // daemon store is merged into the scan only when readable). When a root-owned
+  // daemon store is present but EXCLUDED (unreadable/tampered), the operator
+  // store can be empty while the daemon HAS been enforcing and recording, so an
+  // unqualified "the audit log holds no history" would be a false completeness
+  // claim -- scope it to the operator log and signpost the daemon store. When the
+  // daemon store is absent/included, the operator count IS the whole census, so
+  // keep the neutral wording (do not introduce a distinction that under-claims
+  // the single-store case -- two-family gate follow-up).
+  const daemonExcluded =
+    retention.daemon_store?.status === "present_unreadable" ||
+    retention.daemon_store?.status === "present_tampered";
+
   // START SIDE.
   let coveredFrom: string;
   let startShortfall: boolean;
@@ -268,19 +281,14 @@ export function detectShortfall(
     coveredFrom = window.start_inclusive;
     startShortfall = true;
     zeroOfQuarterCovered = true;
-    // G-1(c): `earliest_retained_at` is derived from the OPERATOR store only
-    // (the daemon store is merged only when readable). On an armed box whose
-    // root-owned daemon store is present-but-unreadable/tampered, the operator
-    // store can be empty while the daemon HAS been enforcing and recording, so
-    // "the audit log holds no history" would be a false completeness claim.
-    // Qualify to the operator store; the daemon store's own disclosure is
-    // rendered separately in the enforcement-summary and definitive-count
-    // sections.
-    startExplanation =
-      "The operator audit log holds no retained entries, so this quarter has " +
-      "no covered access history in the operator store. Confirm the fortress " +
-      "was recording during the reporting period." +
-      daemonPresentButExcludedSuffix(retention);
+    startExplanation = daemonExcluded
+      ? "The operator audit log holds no retained entries, so this quarter has " +
+        "no covered access history in the operator store. Confirm the fortress " +
+        "was recording during the reporting period." +
+        daemonPresentButExcludedSuffix(retention)
+      : "The audit log holds no retained entries, so this quarter has no " +
+        "covered access history. Confirm the fortress was recording during " +
+        "the reporting period.";
   } else if (earliestMs >= quarterEndMs) {
     // M1: the entire retained window post-dates the quarter (all in-quarter
     // entries pruned). Do NOT cite an out-of-quarter covered_from; state plainly
@@ -288,18 +296,23 @@ export function detectShortfall(
     coveredFrom = window.start_inclusive;
     startShortfall = true;
     zeroOfQuarterCovered = true;
-    // G-1(c): `earliest_retained_at` is operator-store-only, so scope this to the
-    // operator log rather than claiming NO enforcement history exists anywhere.
-    startExplanation =
-      "NONE of this quarter is covered by the operator audit log: its earliest " +
-      "retained entry (" +
-      retention.earliest_retained_at! +
-      ") is at or after the quarter end, so no operator-store entries from this " +
-      "quarter survive in the retained log. The counts above are therefore zero " +
-      "for this quarter (from the operator store). This almost always means " +
-      "earlier entries were pruned by size/count (FIFO) retention; raise the " +
-      "retention cap or export monthly snapshots." +
-      daemonPresentButExcludedSuffix(retention);
+    startExplanation = daemonExcluded
+      ? "NONE of this quarter is covered by the operator audit log: its earliest " +
+        "retained entry (" +
+        retention.earliest_retained_at! +
+        ") is at or after the quarter end, so no operator-store entries from " +
+        "this quarter survive in the retained log. The counts above are therefore " +
+        "zero for this quarter (from the operator store). This almost always " +
+        "means earlier entries were pruned by size/count (FIFO) retention; raise " +
+        "the retention cap or export monthly snapshots." +
+        daemonPresentButExcludedSuffix(retention)
+      : "NONE of this quarter is covered: the earliest retained audit entry (" +
+        retention.earliest_retained_at! +
+        ") is at or after the quarter end, so no entries from this quarter " +
+        "survive in the retained log. The counts above are therefore zero for " +
+        "this quarter. This almost always means earlier entries were pruned by " +
+        "size/count (FIFO) retention; raise the retention cap or export monthly " +
+        "snapshots.";
   } else if (earliestMs > quarterStartMs) {
     coveredFrom = retention.earliest_retained_at!;
     startShortfall = true;

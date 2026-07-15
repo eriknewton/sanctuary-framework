@@ -490,6 +490,19 @@ export interface EvidencePackManifest {
         /** True when the quarter had not ended at generation time (partial quarter). */
         in_progress_quarter: boolean;
         retention_at_cap: boolean;
+        /**
+         * G-1 (two-family gate follow-up): the F2 daemon enforcement store's
+         * disclosure, machine-readable, so a verifier reading `shortfall: false`
+         * is never left believing the census was complete when a root-owned
+         * daemon store was present but excluded. `absent`/`included` mean the
+         * count is the whole census / already merged; `present_unreadable` /
+         * `present_tampered` mean these coverage facts reflect the OPERATOR store
+         * only (never a silent single-store signal, even in the signed manifest).
+         */
+        daemon_store: {
+          status: DaemonStoreDisclosure["status"];
+          unreadable_reason?: "privilege" | "io";
+        };
       }
     | { determinable: false; reason: string };
   manifest_signature: string;

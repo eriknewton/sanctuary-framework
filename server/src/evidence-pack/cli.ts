@@ -43,6 +43,7 @@ import {
 import { exportAuditChain } from "../cli/audit-chain-export.js";
 import type {
   CustodyFacts,
+  DaemonStoreDisclosure,
   EvidencePackDiscreteExports,
   EvidencePackInput,
   InventorySnapshot,
@@ -447,9 +448,12 @@ export async function readDaemonStore(
   } catch (e) {
     // A strict-mode integrity failure over a READABLE store is tamper evidence,
     // not a privilege limitation. Disclose it as such (two-family round-5 gate:
-    // Codex HIGH / Opus-family MED, convergent).
+    // Codex HIGH / Opus-family MED, convergent) -- BUT only when the findings are
+    // genuine tamper. A strict-mode throw whose findings are purely ACCESS
+    // failures (a per-file EACCES the directory listed) is a privilege limit, not
+    // tamper: never cry "tamper" for a permission problem (G-3 follow-up gate).
     if (e instanceof AuditIntegrityError) {
-      return { status: "present_tampered" };
+      return classifyDaemonIntegrityError(e);
     }
     // G-3: the directory listed, but the read/decrypt failed for another reason.
     // Distinguish a PRIVILEGE limitation (a per-file EACCES/EPERM under a
@@ -482,6 +486,71 @@ export function daemonUnreadableReason(e: unknown): "privilege" | "io" {
     cur = next;
   }
   return "io";
+}
+
+/**
+ * G-3 follow-up (two-family gate): a strict-mode daemon `query()` raises
+ * `AuditIntegrityError` for BOTH genuine tamper (hash / prev-hash / anchor /
+ * decrypt / malformed / sequence findings) AND a pure ACCESS failure
+ * (`entry_unreadable` / `storage_unavailable` -- a file the directory listed but
+ * this uid could not read, e.g. a per-file EACCES under a root-owned store).
+ * Only the former is tamper evidence. Classify a purely-access-failure error as
+ * a PRIVILEGE limitation (`present_unreadable`; re-run as root reads it), never
+ * `present_tampered` -- crying "tamper" for a permission problem is the round-5
+ * mislabel in the other direction. Any genuine tamper finding (even mixed with
+ * access findings) is `present_tampered`. Exported for direct unit coverage.
+ */
+export function classifyDaemonIntegrityError(
+  e: AuditIntegrityError
+):
+  | { status: "present_tampered" }
+  | { status: "present_unreadable"; unreadable_reason: "privilege" | "io" } {
+  const ACCESS_ONLY_KINDS: ReadonlySet<string> = new Set([
+    "entry_unreadable",
+    "storage_unavailable",
+  ]);
+  const allAccessFailures =
+    e.findings.length > 0 &&
+    e.findings.every((f) => ACCESS_ONLY_KINDS.has(f.kind));
+  if (allAccessFailures) {
+    return { status: "present_unreadable", unreadable_reason: "privilege" };
+  }
+  return { status: "present_tampered" };
+}
+
+/**
+ * G-1 follow-up (two-family gate): the operator-facing CLI summary echoes the
+ * quarter's recorded-operation count, which is the OPERATOR store only when the
+ * daemon store is excluded (`present_unreadable` / `present_tampered`). Return a
+ * warning so that terminal echo is never a silent single-store count either.
+ * Empty for `absent` / `included` (the count is the whole census / already
+ * merged). The signed report + PDF carry the full disclosure; this keeps the
+ * ephemeral stderr summary consistent with them.
+ */
+export function daemonStoreCliWarning(
+  daemon: DaemonStoreDisclosure | undefined
+): string[] {
+  if (!daemon) return [];
+  if (daemon.status === "present_unreadable") {
+    return [
+      "  NOTE: the recorded-operation count above is from the OPERATOR audit",
+      "  store only. A root-owned daemon enforcement store (_audit-daemon) is",
+      "  present but was not readable here, so daemon-recorded enforcement is NOT",
+      "  in that count (not a complete enforcement census). See the report's",
+      "  access-log and enforcement summary section.",
+      "",
+    ];
+  }
+  if (daemon.status === "present_tampered") {
+    return [
+      "  WARNING: a root-owned daemon enforcement store (_audit-daemon) is present",
+      "  but FAILED integrity verification, so the recorded-operation count above",
+      "  is the OPERATOR store only and the daemon store shows tamper evidence;",
+      "  investigate. See the report's access-log and enforcement summary section.",
+      "",
+    ];
+  }
+  return [];
 }
 
 interface EvidencePackCliOptions {
@@ -757,6 +826,12 @@ export async function runEvidencePack(args: string[]): Promise<void> {
     `  Covered window:   ${coverageLine}`,
     `  Covered-window shortfall: ${shortfallLine}`,
     `  Recorded audit operations in quarter: ${decisionsLine}`,
+    // G-1 follow-up: keep the terminal count from reading as a complete census
+    // when a root-owned daemon store is present but excluded (the operator-uid
+    // armed-box case) -- disclose it adjacent to the count, as the report does.
+    ...daemonStoreCliWarning(
+      sf.status === "populated" ? sf.value.daemon_store : undefined
+    ),
     `  Signer:           ${pack.manifest.signer.did}`,
     "",
     "  NOT LEGAL ADVICE. Have the policy/attestation content reviewed by a",

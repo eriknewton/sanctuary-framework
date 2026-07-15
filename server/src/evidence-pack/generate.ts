@@ -226,6 +226,15 @@ export function buildEvidencePack(
         shortfall: s.shortfall,
         in_progress_quarter: s.in_progress_quarter,
         retention_at_cap: s.retention_at_cap,
+        // G-1 follow-up: carry the daemon-store disclosure into the SIGNED
+        // machine-readable coverage so `shortfall: false` is never read as a
+        // complete-census signal when a present daemon store was excluded.
+        daemon_store: {
+          status: s.daemon_store?.status ?? "absent",
+          ...(s.daemon_store?.unreadable_reason
+            ? { unreadable_reason: s.daemon_store.unreadable_reason }
+            : {}),
+        },
       }),
       emptyVerified: () => ({
         determinable: false,
