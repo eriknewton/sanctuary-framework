@@ -33,7 +33,7 @@ import {
   readFailed,
   type ReadOutcome,
 } from "./read-outcome.js";
-import { quarterWindow } from "./quarter.js";
+import { isInWindow, quarterWindow } from "./quarter.js";
 import { aggregateQuarter, detectShortfall } from "./aggregate.js";
 import { renderSections } from "./sections.js";
 import { buildPackManifest, makePackSigner, signFile } from "./signer.js";
@@ -58,6 +58,14 @@ export const ANCHOR_EVIDENCE_FILENAME = "anchor-evidence.json";
 export interface AuditReadData {
   entries: readonly AuditEntry[];
   retention: RetentionFacts;
+  /**
+   * G-2: when the F2 daemon store was merged (`included`), the daemon entries on
+   * their own (a subset of `entries`), so the generator -- which owns the quarter
+   * window -- can count how many fall INSIDE the window and render that windowed
+   * figure in the §7 daemon note instead of the all-time total. Absent for a
+   * non-split / unreadable / absent daemon store.
+   */
+  daemon_entries?: readonly AuditEntry[];
 }
 
 /** Already-resolved inputs the generator needs (see module doc-comment). */
@@ -121,9 +129,28 @@ export function buildEvidencePack(
           aggregation.status === "populated"
             ? aggregation.value.last_entry_at
             : null;
-        return populated(
-          detectShortfall(window, data.retention, { generatedAt, lastEntryAt })
-        );
+        const report = detectShortfall(window, data.retention, {
+          generatedAt,
+          lastEntryAt,
+        });
+        // G-2: the §7 daemon note renders "N merged into the counts above". The
+        // counts above are quarter-windowed, so N must be the daemon entries
+        // that fall INSIDE the window, not the all-time total the read layer
+        // recorded. Compute it here, where the window is known.
+        if (
+          report.daemon_store?.status === "included" &&
+          data.daemon_entries !== undefined
+        ) {
+          const windowed = data.daemon_entries.reduce(
+            (n, e) => (isInWindow(e.timestamp, window) ? n + 1 : n),
+            0
+          );
+          report.daemon_store = {
+            ...report.daemon_store,
+            windowed_entry_count: windowed,
+          };
+        }
+        return populated(report);
       },
       emptyVerified: () =>
         readFailed("the audit log read returned no verifiable result."),
@@ -199,6 +226,15 @@ export function buildEvidencePack(
         shortfall: s.shortfall,
         in_progress_quarter: s.in_progress_quarter,
         retention_at_cap: s.retention_at_cap,
+        // G-1 follow-up: carry the daemon-store disclosure into the SIGNED
+        // machine-readable coverage so `shortfall: false` is never read as a
+        // complete-census signal when a present daemon store was excluded.
+        daemon_store: {
+          status: s.daemon_store?.status ?? "absent",
+          ...(s.daemon_store?.unreadable_reason
+            ? { unreadable_reason: s.daemon_store.unreadable_reason }
+            : {}),
+        },
       }),
       emptyVerified: () => ({
         determinable: false,
