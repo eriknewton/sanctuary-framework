@@ -37,6 +37,7 @@ export {
   type PfCommandRunner,
   type PfCommandResult,
   type PfLivenessResult,
+  type PfAnchorUnionEntry,
   type ArmPfAnchorOptions,
   type ArmPfAnchorUnionOptions,
   type ArmPfAnchorResult,
@@ -57,6 +58,29 @@ export {
   type PfAnchorRegistryOps,
   type PfAnchorRegistryMutationResult,
 } from "./anchor-registry.js";
+
+export {
+  GenerationCoordinator,
+  GenerationStateError,
+  GENERATION_LOCK_PATH_PREFIX,
+  bindEphemeralGatePort,
+  computeNextGenerationId,
+  createFsGenerationStagingStore,
+  evaluateGenerationMatch,
+  resolveCommittedGeneration,
+  resolveGateRestart,
+  type GenerationPhase,
+  type GateBinding,
+  type GenerationBringUpRequest,
+  type CommittedGeneration,
+  type GenerationStagingRecord,
+  type GenerationStagingStore,
+  type GenerationRegistryOps,
+  type GenerationOps,
+  type GenerationRecoveryOutcome,
+  type GenerationMatchInput,
+  type GateRestartOutcome,
+} from "./generation.js";
 
 export {
   checkGatePolicyParity,

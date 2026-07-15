@@ -64,7 +64,6 @@
  * here by deliberate minimalism (the primitive is not yet wired into install).
  */
 
-import type { ExclusiveEgressGatePolicy } from "../castle-wall/allowlist/gate-derivation.js";
 import { validateExclusiveEgressGatePolicy } from "../castle-wall/allowlist/gate-derivation.js";
 import {
   withProvisionLock,
@@ -77,6 +76,7 @@ import {
   disarmPfAnchor,
   type ArmPfAnchorResult,
   type ArmPfAnchorUnionOptions,
+  type PfAnchorUnionEntry,
   type PfCommandRunner,
   type PfLivenessResult,
 } from "./pf-anchor.js";
@@ -98,6 +98,27 @@ export interface PfAnchorRegistryEntry {
   gate_port: number;
   /** The fortress this confinement belongs to (for boot re-arm + posture). */
   fortress_path: string;
+  /**
+   * The committed exclusive-egress GENERATION for this uid (Unified Protect
+   * Slice 5 S5-2). Written by the generation state machine's G3 (pf load) with
+   * the staged generation id; a uid is "actively committed" at that generation
+   * only once the generation state machine's staging record is removed (G5).
+   * ADDITIVE + OPTIONAL: v1 on-disk state that predates the generation machine
+   * carries no `generation_id`; such an entry loads unchanged (a legacy
+   * pre-generation confinement) and the state version stays `1`.
+   */
+  generation_id?: number;
+  /**
+   * Block-only tombstone (Unified Protect Slice 5 S5-2, folds Codex M4). When
+   * `true`, the shared-anchor union renders ONLY this uid's four block-drops,
+   * NOT its gate pass rule: the uid stays confined (non-gate loopback blocked)
+   * but has no gate channel. The generation state machine's crash recovery sets
+   * this when a uid's gate generation was staged into the anchor but never
+   * committed, so the stale pass is removed without reopening loopback relay or
+   * dropping the whole uid. `gate_port` is retained for schema validity but is
+   * not rendered while tombstoned. ADDITIVE + OPTIONAL: absent === live.
+   */
+  tombstone?: boolean;
 }
 
 /** Persisted registry state. */
@@ -134,12 +155,12 @@ export interface PfAnchorRegistryOps {
   armOptions?: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableToken">;
   /** Injected for tests; default to the real pf-anchor functions. */
   armUnion?: (
-    entries: readonly ExclusiveEgressGatePolicy[],
+    entries: readonly PfAnchorUnionEntry[],
     options: ArmPfAnchorUnionOptions,
   ) => Promise<ArmPfAnchorResult>;
   disarm?: (options: { anchorName: string; enableToken?: string }) => Promise<void>;
   unionLiveness?: (
-    entries: readonly ExclusiveEgressGatePolicy[],
+    entries: readonly PfAnchorUnionEntry[],
     anchorName: string,
   ) => Promise<PfLivenessResult>;
 }
@@ -197,11 +218,24 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
     return null;
   }
   if (typeof c.fortress_path !== "string" || c.fortress_path.length === 0) return null;
-  return {
+  // ADDITIVE optional fields (S5-2). Reject a present-but-malformed value
+  // (fail-closed: a garbled generation/tombstone marker is a repair signal,
+  // never silently coerced); a MISSING field is the v1-compatible legacy shape.
+  // `generation_id` must be a POSITIVE integer: generated ids start at 1
+  // (`computeNextGenerationId`), so a persisted 0 is a corruption/reuse signal,
+  // never a legitimate committed generation (gate finding).
+  if (c.generation_id !== undefined && (!Number.isInteger(c.generation_id) || (c.generation_id as number) < 1)) {
+    return null;
+  }
+  if (c.tombstone !== undefined && typeof c.tombstone !== "boolean") return null;
+  const entry: PfAnchorRegistryEntry = {
     agent_uid: c.agent_uid as number,
     gate_port: c.gate_port as number,
     fortress_path: c.fortress_path,
   };
+  if (c.generation_id !== undefined) entry.generation_id = c.generation_id as number;
+  if (c.tombstone === true) entry.tombstone = true;
+  return entry;
 }
 
 /** Normalize a loaded state (or `null`) into a usable state. Throws on corruption. */
@@ -271,9 +305,18 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
   return state;
 }
 
-/** The gate-policy view of a registry entry (what the pf primitives consume). */
-function toPolicy(entry: PfAnchorRegistryEntry): ExclusiveEgressGatePolicy {
-  return { agent_uid: entry.agent_uid, gate_port: entry.gate_port };
+/**
+ * The pf-union view of a registry entry (what the pf primitives consume). A
+ * tombstoned entry (S5-2) is threaded through as a block-only union member, so
+ * arm + liveness render/verify its four block-drops and REJECT any gate pass
+ * for it; a live entry renders pass + block-drops as before.
+ */
+function toUnionEntry(entry: PfAnchorRegistryEntry): PfAnchorUnionEntry {
+  return {
+    agent_uid: entry.agent_uid,
+    gate_port: entry.gate_port,
+    ...(entry.tombstone === true ? { tombstone: true } : {}),
+  };
 }
 
 /** An FS-backed store (temp-write + rename for atomicity, 0600). */
@@ -389,6 +432,66 @@ export class PfAnchorRegistry {
   }
 
   /**
+   * Block-only TOMBSTONE a confined uid (Unified Protect Slice 5 S5-2, folds
+   * Codex M4). The uid stays in the union but its gate pass rule is dropped and
+   * ONLY its four block-drops are re-armed, so non-gate loopback stays CLOSED
+   * for the uid while its stale/uncommitted gate channel is removed. This is
+   * the generation state machine's crash-recovery action when a uid's gate
+   * generation was staged into the anchor (its pass loaded at G3) but never
+   * committed (G5): dropping the whole entry would drop the block-drops too and
+   * reopen non-gate loopback mid-repair, so the tombstone keeps the packet
+   * layer closed until a fresh generation commits or unprotect removes the uid.
+   *
+   * FAIL-CLOSED for the not-yet-armed uid: if the uid is absent from the
+   * registry (a crash BEFORE G3's arm actually landed the entry, where the
+   * write-ahead journal recorded intent), a block-only entry is ADDED from the
+   * `fallback` (the staged port + fortress from the generation staging record),
+   * so recovery reaches a confined-but-gateless state rather than leaving the
+   * uid un-confined. A `fallback` is REQUIRED when the uid is absent (no port to
+   * validate an entry otherwise). Idempotent: tombstoning an already-tombstoned
+   * uid re-arms the same block-only union.
+   */
+  async tombstone(
+    agentUid: number,
+    fallback?: { gate_port: number; fortress_path: string; generation_id?: number },
+  ): Promise<PfAnchorRegistryMutationResult> {
+    if (!isNonNegativeInt(agentUid)) {
+      throw new PfAnchorRegistryStateError(`refusing to tombstone a non-integer uid ${String(agentUid)}`);
+    }
+    return this.mutate((committed) => {
+      const existing = committed.find((e) => e.agent_uid === agentUid);
+      if (existing !== undefined) {
+        return committed.map((e) =>
+          e.agent_uid === agentUid ? { ...e, tombstone: true } : e,
+        );
+      }
+      // Absent: add a block-only entry from the fallback (validated below). The
+      // dead generation's id is CARRIED so generation-id monotonicity holds
+      // across this recovery (gate finding: dropping it let the next bring-up
+      // reuse an already-staged id).
+      if (fallback === undefined) {
+        throw new PfAnchorRegistryStateError(
+          `refusing to tombstone absent uid ${agentUid} without a fallback {gate_port, fortress_path} ` +
+            "(no port to construct a valid block-only entry)",
+        );
+      }
+      const added = validateEntry({
+        agent_uid: agentUid,
+        gate_port: fallback.gate_port,
+        fortress_path: fallback.fortress_path,
+        tombstone: true,
+        ...(fallback.generation_id !== undefined ? { generation_id: fallback.generation_id } : {}),
+      });
+      if (added === null) {
+        throw new PfAnchorRegistryStateError(
+          `refusing to tombstone uid ${agentUid}: malformed fallback (port ${String(fallback.gate_port)})`,
+        );
+      }
+      return [...committed, added];
+    });
+  }
+
+  /**
    * The shared mutation core: lock -> load -> reconcile-on-entry -> journal
    * pending -> apply (arm union or flush) -> commit -> (on failure) rollback
    * -> (on rollback failure) dirty. See the module doc for the full contract.
@@ -455,7 +558,7 @@ export class PfAnchorRegistry {
       delete state.enable_token;
       return hadToken;
     }
-    const res = await this.armUnion(desired.map(toPolicy), {
+    const res = await this.armUnion(desired.map(toUnionEntry), {
       ...this.armOptions,
       anchorName: this.anchorName,
       ...(state.enable_token !== undefined ? { existingEnableToken: state.enable_token } : {}),
@@ -498,7 +601,7 @@ export class PfAnchorRegistry {
       }
       return;
     }
-    const live = await this.unionLiveness(state.committed.map(toPolicy), this.anchorName);
+    const live = await this.unionLiveness(state.committed.map(toUnionEntry), this.anchorName);
     if (live.live && state.dirty !== true && state.pending === undefined) {
       return; // already exact-live and clean
     }

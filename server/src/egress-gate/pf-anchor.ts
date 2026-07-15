@@ -250,11 +250,46 @@ function renderUidAnchorLines(policy: ExclusiveEgressGatePolicy): string[] {
   const port = policy.gate_port;
   return [
     `pass quick on lo0 inet proto tcp from any to 127.0.0.1 port = ${port} user = ${uid} flags S/SA keep state`,
+    ...renderUidBlockOnlyLines(uid),
+  ];
+}
+
+/**
+ * Render one confined uid's FOUR block-drop rules WITHOUT the pass-to-gate
+ * rule (Unified Protect Slice 5 S5-2, folds Codex M4 -- the block-only
+ * tombstone). The generation state machine's crash recovery uses this when a
+ * uid's gate generation was staged into the anchor (its pass rule loaded) but
+ * never COMMITTED (G5), and must be torn back to a confined-but-gateless
+ * state: the four block-drops keep non-gate loopback CLOSED for the uid while
+ * the stale, uncommitted pass rule is removed, so recovery never reopens the
+ * loopback-relay hole nor drops the whole uid (which would drop the
+ * block-drops too). Posture reads amber/not-live for a tombstoned uid (no gate
+ * pass) until a fresh generation commits or unprotect removes the uid.
+ */
+function renderUidBlockOnlyLines(uid: number): string[] {
+  return [
     `block drop quick on lo0 inet proto tcp from any to any user = ${uid}`,
     `block drop quick on lo0 inet proto udp from any to any user = ${uid}`,
     `block drop quick on lo0 inet6 proto tcp from any to any user = ${uid}`,
     `block drop quick on lo0 inet6 proto udp from any to any user = ${uid}`,
   ];
+}
+
+/**
+ * A member of the shared anchor's confined-uid union (Unified Protect Slice 5).
+ * A LIVE member ({@link ExclusiveEgressGatePolicy}: `agent_uid` + `gate_port`)
+ * renders the pass-to-gate rule plus the four block-drops. A TOMBSTONE member
+ * (`tombstone: true`, S5-2 M4) renders ONLY the four block-drops -- the uid
+ * stays confined (non-gate loopback blocked) but has no gate pass, the
+ * confined-but-gateless state a crash between G3 (pf load) and G5 (commit)
+ * must leave. `gate_port` stays a valid port for schema validity even when
+ * tombstoned; it is simply not rendered. This type is a backward-compatible
+ * widening of the S5-1 union entry: an entry with no `tombstone` field renders
+ * byte-identically to before.
+ */
+export interface PfAnchorUnionEntry extends ExclusiveEgressGatePolicy {
+  /** Block-only tombstone: render the four block-drops, NOT the gate pass rule. */
+  tombstone?: boolean;
 }
 
 /**
@@ -278,7 +313,7 @@ function renderUidAnchorLines(policy: ExclusiveEgressGatePolicy): string[] {
  *   - any entry failing {@link validateExclusiveEgressGatePolicy} throws.
  */
 export function renderPfAnchorRulesForUids(
-  entries: readonly ExclusiveEgressGatePolicy[],
+  entries: readonly PfAnchorUnionEntry[],
 ): string {
   if (entries.length === 0) {
     throw new Error(
@@ -302,7 +337,11 @@ export function renderPfAnchorRulesForUids(
   const sorted = [...entries].sort((a, b) => a.agent_uid - b.agent_uid);
   const lines: string[] = [];
   for (const entry of sorted) {
-    lines.push(...renderUidAnchorLines(entry));
+    lines.push(
+      ...(entry.tombstone === true
+        ? renderUidBlockOnlyLines(entry.agent_uid)
+        : renderUidAnchorLines(entry)),
+    );
   }
   lines.push("");
   return lines.join("\n");
@@ -471,10 +510,22 @@ function blockRuleRe(family: "inet" | "inet6", proto: "tcp" | "udp", uid: number
  * both pfctl block-rule spellings (`all` vs `from any to any`).
  */
 function uidExpectedLineMatchers(
-  policy: ExclusiveEgressGatePolicy,
+  entry: PfAnchorUnionEntry,
 ): Array<{ re: RegExp; label: string }> {
-  const uid = policy.agent_uid;
-  const port = policy.gate_port;
+  const uid = entry.agent_uid;
+  const port = entry.gate_port;
+  const blockMatchers: Array<{ re: RegExp; label: string }> = [
+    { re: new RegExp(`^block drop quick on lo0 inet proto tcp (?:all|from any to any) user = ${uid}$`), label: `inet tcp block-drop for uid ${uid}` },
+    { re: new RegExp(`^block drop quick on lo0 inet proto udp (?:all|from any to any) user = ${uid}$`), label: `inet udp block-drop for uid ${uid}` },
+    { re: new RegExp(`^block drop quick on lo0 inet6 proto tcp (?:all|from any to any) user = ${uid}$`), label: `inet6 tcp block-drop for uid ${uid}` },
+    { re: new RegExp(`^block drop quick on lo0 inet6 proto udp (?:all|from any to any) user = ${uid}$`), label: `inet6 udp block-drop for uid ${uid}` },
+  ];
+  // A tombstoned uid must hold ONLY its four block-drops -- no pass rule. The
+  // exactness pass (b) below then REJECTS any stray pass line for it, so a
+  // stale/uncommitted gate pass on a tombstoned uid makes the union NOT live.
+  if (entry.tombstone === true) {
+    return blockMatchers;
+  }
   return [
     {
       re: new RegExp(
@@ -482,10 +533,7 @@ function uidExpectedLineMatchers(
       ),
       label: `agent-to-gate pass rule (port ${port}, uid ${uid})`,
     },
-    { re: new RegExp(`^block drop quick on lo0 inet proto tcp (?:all|from any to any) user = ${uid}$`), label: `inet tcp block-drop for uid ${uid}` },
-    { re: new RegExp(`^block drop quick on lo0 inet proto udp (?:all|from any to any) user = ${uid}$`), label: `inet udp block-drop for uid ${uid}` },
-    { re: new RegExp(`^block drop quick on lo0 inet6 proto tcp (?:all|from any to any) user = ${uid}$`), label: `inet6 tcp block-drop for uid ${uid}` },
-    { re: new RegExp(`^block drop quick on lo0 inet6 proto udp (?:all|from any to any) user = ${uid}$`), label: `inet6 udp block-drop for uid ${uid}` },
+    ...blockMatchers,
   ];
 }
 
@@ -508,7 +556,7 @@ function uidExpectedLineMatchers(
  */
 export async function checkPfAnchorUnionLiveness(
   runner: PfCommandRunner,
-  entries: readonly ExclusiveEgressGatePolicy[],
+  entries: readonly PfAnchorUnionEntry[],
   anchorName: string = PF_ANCHOR_NAME,
 ): Promise<PfLivenessResult> {
   if (entries.length === 0) {
@@ -770,7 +818,7 @@ export interface ArmPfAnchorUnionOptions extends ArmPfAnchorOptions {
  */
 export async function armPfAnchorUnion(
   runner: PfCommandRunner,
-  entries: readonly ExclusiveEgressGatePolicy[],
+  entries: readonly PfAnchorUnionEntry[],
   options: ArmPfAnchorUnionOptions = {},
 ): Promise<ArmPfAnchorResult> {
   const anchorName = options.anchorName ?? PF_ANCHOR_NAME;
