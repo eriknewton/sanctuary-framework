@@ -145,4 +145,130 @@ describe("deriveAuditReadOutcome", () => {
       expect(outcome.value.retention.earliest_retained_at).toBeNull();
     }
   });
+
+  // ─── WATCH-1: F2 audit-store split — the daemon store must be read too ───
+  describe("WATCH-1: daemon enforcement store (_audit-daemon)", () => {
+    it("no daemon param defaults to `absent` — a non-split fortress is unchanged", () => {
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-02T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+      });
+      expect(outcome.status).toBe("populated");
+      if (outcome.status === "populated") {
+        expect(outcome.value.retention.daemon_store.status).toBe("absent");
+        expect(outcome.value.retention.daemon_store.included_entry_count).toBe(0);
+        expect(outcome.value.entries.length).toBe(1);
+        expect(outcome.value.retention.retained_total).toBe(1);
+      }
+    });
+
+    it("`included` MERGES daemon entries + retention into the census", () => {
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-02T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+        daemon: {
+          status: "included",
+          entries: [
+            entry("2026-07-03T00:00:00.000Z"),
+            entry("2026-07-04T00:00:00.000Z"),
+          ],
+          windowedTotal: 2,
+          usage: { entryCount: 2, totalSizeBytes: 2048, everPruned: true },
+        },
+      });
+      expect(outcome.status).toBe("populated");
+      if (outcome.status === "populated") {
+        // Entries unioned; retention summed; ever_pruned OR-ed across stores.
+        expect(outcome.value.entries.length).toBe(3);
+        expect(outcome.value.retention.retained_total).toBe(3);
+        expect(outcome.value.retention.retained_total_size_bytes).toBe(3072);
+        expect(outcome.value.retention.ever_pruned).toBe(true);
+        expect(outcome.value.retention.daemon_store.status).toBe("included");
+        expect(outcome.value.retention.daemon_store.included_entry_count).toBe(2);
+      }
+    });
+
+    it("`included`: a daemon entry can be the earliest retained (min-scan over the merged set)", () => {
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-10T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+        daemon: {
+          status: "included",
+          entries: [entry("2026-07-01T00:00:00.000Z")],
+          windowedTotal: 1,
+          usage: { entryCount: 1, totalSizeBytes: 512, everPruned: false },
+        },
+      });
+      expect(outcome.status).toBe("populated");
+      if (outcome.status === "populated") {
+        expect(outcome.value.retention.earliest_retained_at).toBe(
+          "2026-07-01T00:00:00.000Z"
+        );
+      }
+    });
+
+    it("`included` but the daemon read is TRUNCATED fails closed (same honesty bar as the operator store)", () => {
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-02T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+        daemon: {
+          status: "included",
+          entries: [entry("2026-07-03T00:00:00.000Z")],
+          windowedTotal: 1,
+          usage: { entryCount: 9, totalSizeBytes: 4096, everPruned: true },
+        },
+      });
+      expect(outcome.status).toBe("read_failed");
+      if (outcome.status === "read_failed") {
+        expect(outcome.reason).toContain("_audit-daemon");
+        expect(outcome.reason).toContain("not read to completion");
+      }
+    });
+
+    it("`present_tampered`: the pack still generates, counts EXCLUDE the daemon store, and the TAMPER (not a privilege excuse) is disclosed", () => {
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-02T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+        daemon: { status: "present_tampered" },
+      });
+      expect(outcome.status).toBe("populated");
+      if (outcome.status === "populated") {
+        expect(outcome.value.entries.length).toBe(1);
+        expect(outcome.value.retention.retained_total).toBe(1);
+        expect(outcome.value.retention.daemon_store.status).toBe("present_tampered");
+        expect(outcome.value.retention.daemon_store.included_entry_count).toBe(0);
+      }
+    });
+
+    it("`present_unreadable`: the pack still generates (populated), counts EXCLUDE the daemon store, and the omission is disclosed", () => {
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-02T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+        daemon: { status: "present_unreadable" },
+      });
+      expect(outcome.status).toBe("populated");
+      if (outcome.status === "populated") {
+        // NOT a silent inclusion and NOT a whole-pack failure: counts are the
+        // operator store only, and the disclosure carries the caveat forward.
+        expect(outcome.value.entries.length).toBe(1);
+        expect(outcome.value.retention.retained_total).toBe(1);
+        expect(outcome.value.retention.daemon_store.status).toBe(
+          "present_unreadable"
+        );
+        expect(outcome.value.retention.daemon_store.included_entry_count).toBe(0);
+      }
+    });
+  });
 });

@@ -25,6 +25,19 @@ import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 
 export const AUDIT_EXPORT_NAMESPACE = "_audit";
 export const AUDIT_EXPORT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
+// F2 HIGH-1 (adversarial gate 2026-07-14): the root Castle Wall daemon's own
+// audit chain. Its presence means an `_audit`-only export is INCOMPLETE. These
+// literals byte-match `operational/audit-store-split.ts`; duplicated here
+// because this raw exporter deliberately avoids server-runtime imports.
+export const AUDIT_EXPORT_DAEMON_NAMESPACE = "_audit-daemon";
+// F2 HIGH-R3 (adversarial re-gate 2026-07-14): the durable `_meta`
+// migration-established marker (byte-matches audit-log.ts). Its presence proves
+// the writer-split migration ran, so an `_audit`-only export is INCOMPLETE even
+// if the `_audit-daemon` directory itself was deleted/renamed. Unauthenticated
+// presence is sufficient here (this raw exporter has no master key): erring
+// toward "present" only over-requires --operator-only, which is fail-closed.
+export const AUDIT_EXPORT_SPLIT_ESTABLISHED_META_KEY =
+  "audit-store-split-established-v1";
 
 /** Record types in a JSONL export file. */
 export type ExportRecord =
@@ -179,6 +192,10 @@ export interface ExportArgs {
   output?: string;
   storagePath?: string;
   fortressPath?: string;
+  /** F2 HIGH-1: explicitly acknowledge an operator-chain-only export on a
+   * fortress that has a daemon chain. Without it, the export fails closed
+   * rather than silently omitting the daemon chain. */
+  operatorOnly?: boolean;
   argv: string[];
   env?: NodeJS.ProcessEnv;
 }
@@ -191,7 +208,46 @@ export function parseExportArgs(argv: string[], env?: NodeJS.ProcessEnv): Export
     env?.SANCTUARY_STORAGE_PATH ??
     env?.SANCTUARY_FORTRESS_PATH;
   const storagePath = flagValue(argv, "--storage-path");
-  return { output, storagePath, fortressPath, argv, env };
+  const operatorOnly = argv.includes("--operator-only");
+  return { output, storagePath, fortressPath, operatorOnly, argv, env };
+}
+
+/**
+ * F2 HIGH-1 + HIGH-R3: return true iff the fortress ran the writer-split
+ * migration, so an `_audit`-only export is INCOMPLETE. True when the
+ * `_audit-daemon` namespace holds an entry, OR its directory exists but is
+ * unreadable, OR (HIGH-R3) the durable `_meta` migration-established marker is
+ * present even though the daemon directory was deleted/renamed. Fail closed: any
+ * listing error is treated as "present" so an operator-only export never
+ * silently hides a daemon chain.
+ */
+/** HIGH-R3: public boundary/migration-aware presence probe, reused by `doctor`
+ * so its single-chain audit check refuses to report OK on a migrated fortress.
+ * Unauthenticated (no master key): fail-closed toward "present". */
+export async function fortressRanAuditStoreSplitMigration(
+  storage: StorageBackend
+): Promise<boolean> {
+  return daemonAuditChainPresent(storage);
+}
+
+async function daemonAuditChainPresent(
+  storage: StorageBackend
+): Promise<boolean> {
+  try {
+    if ((await storage.list(AUDIT_EXPORT_DAEMON_NAMESPACE)).length > 0) return true;
+  } catch {
+    return true;
+  }
+  // HIGH-R3: the daemon namespace can be deleted; the `_meta` established marker
+  // is not co-deletable with it and still proves the export would be incomplete.
+  try {
+    if (await storage.exists("_meta", AUDIT_EXPORT_SPLIT_ESTABLISHED_META_KEY)) {
+      return true;
+    }
+  } catch {
+    return true;
+  }
+  return false;
 }
 
 export async function runExport(args: ExportArgs): Promise<void> {
@@ -208,6 +264,29 @@ export async function runExport(args: ExportArgs): Promise<void> {
   const storage = new FilesystemStorage(storagePath);
   const banner = lockdownBanner(await readLockdownStatus(storagePath));
   if (banner) process.stderr.write(banner);
+
+  // F2 HIGH-1 (adversarial gate 2026-07-14): this raw exporter dumps the
+  // operator `_audit` chain only. After the writer-split, the root daemon's
+  // enforcement evidence lives in `_audit-daemon`, so an unqualified export on
+  // a migrated fortress would be silently INCOMPLETE. Fail closed: refuse
+  // unless the operator explicitly acknowledges an operator-only export with
+  // `--operator-only`. (Exporting both chains + the boundary record is a
+  // deferred follow-up; the verifier assumes one sequence from genesis.)
+  if (!args.operatorOnly && (await daemonAuditChainPresent(storage))) {
+    throw new Error(
+      "This fortress has a root daemon audit chain (_audit-daemon), so an " +
+        "'_audit'-only export would be INCOMPLETE (it omits the daemon's " +
+        "enforcement evidence). Re-run with --operator-only to export just the " +
+        "operator chain (and note the omission), or export the daemon chain " +
+        "separately. Exporting both chains in one file is not yet supported.",
+    );
+  }
+  if (args.operatorOnly && (await daemonAuditChainPresent(storage))) {
+    process.stderr.write(
+      "NOTE: --operator-only export. The root daemon audit chain (_audit-daemon) " +
+        "exists and is NOT included in this file; this export is operator-chain-only.\n",
+    );
+  }
 
   if (args.output) {
     const stream = createWriteStream(args.output, { encoding: "utf8" });

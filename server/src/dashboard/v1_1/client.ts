@@ -2695,10 +2695,15 @@ function postureMetricCard(value, label) {
   return '<div class="posture-metric"><span class="pm-v">' + value + '</span><span class="pm-l">' + escHtml(label) + '</span></div>';
 }
 function renderPostureStory(d) {
+  // F2 BLOCKER-1: three-state from the shared verdict. Never "verified clean"
+  // over a tampered sealed entry; a neutral "sealed history not re-verifiable at
+  // this privilege" for verified_suffix_only.
   if (state.posture.storyPlain) {
     const chainText = d.chain_verified
       ? "The audit log verified clean: no tampering."
-      : "The audit log is unverified: " + escHtml(d.integrity_finding_count) + " integrity finding(s).";
+      : d.chain_verdict === "verified_suffix_only"
+        ? "The recent audit log verified clean; the sealed legacy history is not re-verifiable at this privilege (run as root for a full verify)."
+        : "The audit log is unverified: " + escHtml(d.integrity_finding_count) + " integrity finding(s).";
     return '<p>Today your agents ran <strong>' + escHtml(d.total_operations) +
       '</strong> operations in the last 24h. Sanctuary blocked <strong>' + escHtml(d.kernel_blocks) +
       '</strong> outbound connections and allowed <strong>' + escHtml(d.kernel_allows) +
@@ -2706,13 +2711,16 @@ function renderPostureStory(d) {
       '</strong> approvals and granted <strong>' + escHtml(d.approvals_granted) +
       '</strong>. ' + chainText + '</p>';
   }
+  const chainLine = d.chain_verified
+    ? '<span class="pill tone-verified">Audit chain verified</span> no tampering.'
+    : d.chain_verdict === "verified_suffix_only"
+      ? '<span class="pill tone-degraded">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
+      : '<span class="pill tone-locked">Audit chain UNVERIFIED (' + escHtml(d.integrity_finding_count) + ' findings).</span>';
   const lines = [
     '<strong>' + escHtml(d.total_operations) + '</strong> operations in the last 24h.',
     '<strong>' + escHtml(d.kernel_blocks) + '</strong> outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows) + ' allowed.',
     '<strong>' + escHtml(d.approvals_denied) + '</strong> approvals denied, ' + escHtml(d.approvals_granted) + ' granted by you.',
-    d.chain_verified
-      ? '<span class="pill tone-verified">Audit chain verified</span> no tampering.'
-      : '<span class="pill tone-locked">Audit chain UNVERIFIED (' + escHtml(d.integrity_finding_count) + ' findings).</span>'
+    chainLine
   ];
   return lines.map(function (l) { return '<div class="story-line">' + l + '</div>'; }).join("");
 }
@@ -2766,9 +2774,12 @@ function renderPostureScreen() {
   const pending = state.inbox.filter(function (i) { return !i.resolved && i.kind === "approval_pending"; }).length;
   const findings = home.anomaly_findings || [];
   const anomalyUnknown = home.anomaly_findings_unknown === true;
+  // F2 BLOCKER-1: three-state audit-chain pill from the shared verdict.
   const chainPill = home.digest && home.digest.chain_verified
     ? '<span class="pill tone-verified">Verified</span>'
-    : '<span class="pill tone-locked">Unverified</span>';
+    : (home.digest && home.digest.chain_verdict === "verified_suffix_only")
+      ? '<span class="pill tone-degraded">Suffix-only</span>'
+      : '<span class="pill tone-locked">Unverified</span>';
   const metricCards =
     '<div class="posture-metrics">' +
       postureMetricCard(escHtml(home.protection_requested_count), "Protection requested") +

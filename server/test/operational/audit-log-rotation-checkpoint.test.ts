@@ -337,28 +337,33 @@ describe("AuditLog F3 rotation checkpoint", () => {
     expect(result.integrity_findings).toEqual([]);
   });
 
-  it("TOFU-migrates a pre-F3 rotated log, then authenticates subsequent cuts", async () => {
+  // F2 HIGH-1 (adversarial re-gate round 3, 2026-07-14): the anchor-absent
+  // above-genesis TOFU self-heal is now CLOSED. An above-genesis suffix with no
+  // authenticated rotation anchor is evidence of a deleted prefix and must never
+  // be TOFU-blessed (that was the fail-open a "delete every migration witness"
+  // attacker rode). A genuine pre-F3 rotated log that never loaded since F3 now
+  // fails closed with a `rotation_anchor_missing` finding (recoverable via
+  // --accept-broken-chain) instead of silently self-healing. This test was
+  // inverted from asserting self-heal to asserting the fail-closed finding.
+  it("does NOT TOFU-self-heal a pre-F3 anchor-absent above-genesis suffix (HIGH-1 round 3)", async () => {
     const { storage, masterKey } = await rotatedLog(5, 12);
 
     // Simulate a log rotated before F3 existed: no rotation anchor on disk.
     await storage.delete("_audit_checkpoints", ROTATION_ANCHOR_KEY);
     expect(await storage.read("_audit_checkpoints", ROTATION_ANCHOR_KEY)).toBeNull();
 
-    // First load self-heals: contiguous surviving chain accepted, anchor written.
-    const reader = new AuditLog(storage, masterKey);
-    const result = await reader.query({ limit: 100 });
-    expect(result.integrity_findings).toEqual([]);
-    const healed = await readAnchor(storage);
-    expect(healed.data.base_sequence).toBe(8);
+    // Load now FAILS CLOSED: the above-genesis suffix without an authenticated
+    // anchor surfaces `rotation_anchor_missing` and NO fresh anchor is written.
+    const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const findings = await reader.getIntegrityFindings();
+    expect(findings.some((f) => f.kind === "rotation_anchor_missing")).toBe(true);
+    // No self-heal: no rotation anchor was written to bless the suffix.
+    expect(await storage.read("_audit_checkpoints", ROTATION_ANCHOR_KEY)).toBeNull();
 
-    // Now that it is authenticated, a subsequent post-cut deletion is detected.
-    await storage.delete("_audit", await keyForSequence(storage, 11));
-    const reader2 = new AuditLog(storage, masterKey);
-    await expect(reader2.query({ limit: 100 })).rejects.toMatchObject({
+    // Strict mode throws on the finding (fail closed), never a silent green.
+    const strict = new AuditLog(storage, masterKey);
+    await expect(strict.query({ limit: 100 })).rejects.toMatchObject({
       name: "AuditIntegrityError",
-      findings: expect.arrayContaining([
-        expect.objectContaining({ kind: "sequence_gap_or_reorder" }),
-      ]),
     });
   });
 });

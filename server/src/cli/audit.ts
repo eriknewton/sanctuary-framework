@@ -88,6 +88,8 @@ export async function runAuditCommand(args: AuditCommandArgs): Promise<number> {
     const total = entries.length;
     entries = entries.slice(-searchOpts.limit);
 
+    // audit-chokepoint-exempt: fail-closed WARNING surface, findings are printed
+    // to the operator and forwarded in the JSON; never a chain-verified claim.
     const findings = result.integrity_findings;
     if (findings.length > 0) {
       printIntegrityWarning(err, findings);

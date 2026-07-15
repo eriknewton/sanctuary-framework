@@ -148,7 +148,7 @@
 37	server/src/core/anti-rollback.ts
 1	server/src/core/identity.ts
 34	server/src/core/master-custody.ts
-19	server/src/core/master-rotation.ts
+17	server/src/core/master-rotation.ts
 8	server/src/dashboard/aggregator.ts
 1	server/src/dashboard/api.ts
 1	server/src/dashboard/html.ts
@@ -187,7 +187,7 @@
 2	server/src/mesh/recovery-flows/device-recovery.ts
 1	server/src/mesh/recovery-flows/master-rotation.ts
 7	server/src/mesh/trust-root.ts
-25	server/src/operational/audit-log.ts
+23	server/src/operational/audit-log.ts
 4	server/src/operational/call-governor.ts
 1	server/src/operational/context-gate-enforcer.ts
 4	server/src/operational/context-gate-recommend.ts

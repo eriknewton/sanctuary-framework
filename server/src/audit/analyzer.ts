@@ -480,6 +480,8 @@ function scoreAuditHealthPenalty(env: EnvironmentFingerprint): number {
   const health = env.audit_subsystem_health;
   if (!health) return 0;
 
+  // audit-chokepoint-exempt: fail-closed PENALTY scoring, findings only ever
+  // DEDUCT from the health score; never derives or emits a chain-verified claim.
   const deductedFindings = health.integrity_findings.filter((finding) =>
     AUDIT_HEALTH_DEDUCTED_KINDS.has(finding.kind)
   );
@@ -508,6 +510,8 @@ function generateGaps(
   const oc = env.openclaw_config;
   const auditHealth = env.audit_subsystem_health;
 
+  // audit-chokepoint-exempt: fail-closed GAP-raising, findings only ever ADD a
+  // critical sovereignty gap; never derives or emits a chain-verified claim.
   const deductedAuditFindings = auditHealth?.integrity_findings.filter((finding) =>
     AUDIT_HEALTH_DEDUCTED_KINDS.has(finding.kind)
   ) ?? [];
@@ -784,6 +788,8 @@ function generateRecommendations(
 ): Recommendation[] {
   const recs: Recommendation[] = [];
 
+  // audit-chokepoint-exempt: fail-closed RECOMMENDATION-raising, findings only
+  // ever ADD a priority-1 repair action; never a chain-verified claim.
   if (env.audit_subsystem_health?.integrity_findings.some((finding) =>
     AUDIT_HEALTH_DEDUCTED_KINDS.has(finding.kind)
   )) {

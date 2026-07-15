@@ -888,7 +888,18 @@ export function renderPostureHomeHTML(): string {
       stat(wallPill(home.castle_wall.arm_state), "Castle Wall") +
       stat(pendingCount, "Approvals waiting") +
       stat(openAnomalies, "Open anomalies") +
-      stat(home.digest.chain_verified ? '<span class="pill green">VERIFIED</span>' : '<span class="pill red">UNVERIFIED</span>', "Audit chain");
+      stat(auditChainPill(home.digest), "Audit chain");
+  }
+  // F2 BLOCKER-1: three-state pill from the shared verdict — green VERIFIED only
+  // for a fully-verified chain; a neutral SUFFIX-ONLY when the sealed history is
+  // unreadable at this privilege (an armed box's operator uid); red UNVERIFIED on
+  // tamper/failure. Never green over an in-place-corrupted sealed entry.
+  function auditChainPill(d) {
+    if (d.chain_verdict === "verified_suffix_only")
+      return '<span class="pill amber">SUFFIX-ONLY</span>';
+    return d.chain_verified
+      ? '<span class="pill green">VERIFIED</span>'
+      : '<span class="pill red">UNVERIFIED</span>';
   }
   function stat(value, label) {
     return '<div class="stat"><span class="v">' + value + '</span><span class="l">' + esc(label) + "</span></div>";
@@ -1082,7 +1093,9 @@ export function renderPostureHomeHTML(): string {
   function renderStoryPlainSummary(d) {
     var chainText = d.chain_verified
       ? "The audit log verified clean: no tampering."
-      : "The audit log is unverified: " + d.integrity_finding_count + " integrity finding(s).";
+      : d.chain_verdict === "verified_suffix_only"
+        ? "The recent audit log verified clean; the sealed legacy history is not re-verifiable at this privilege (run as root for a full verify)."
+        : "The audit log is unverified: " + d.integrity_finding_count + " integrity finding(s).";
     return '<p class="story-summary">Today your agents ran <strong>' + esc(d.total_operations) +
       "</strong> operations in the last 24h. Sanctuary blocked <strong>" + esc(d.kernel_blocks) +
       "</strong> outbound connections and allowed <strong>" + esc(d.kernel_allows) +
@@ -1108,7 +1121,9 @@ export function renderPostureHomeHTML(): string {
       d.approvals_granted + " granted by you.");
     lines.push(d.chain_verified
       ? '<span class="pill green">Audit chain verified</span> no tampering.'
-      : '<span class="err">Audit chain UNVERIFIED (' + d.integrity_finding_count + " findings).</span>");
+      : d.chain_verdict === "verified_suffix_only"
+        ? '<span class="pill amber">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
+        : '<span class="err">Audit chain UNVERIFIED (' + d.integrity_finding_count + " findings).</span>");
     el.innerHTML = lines.map(function (l) { return '<div class="story-line">' + l + "</div>"; }).join("") +
       '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
   }

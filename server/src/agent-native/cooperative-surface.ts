@@ -868,6 +868,10 @@ export function createAgentNativeCooperativeTools(
               limit: 500,
             })
           );
+          // audit-chokepoint-exempt: fail-closed DENY on any integrity finding,
+          // not a clean-CLAIM. `sanctuary_events_read` returns redacted events; a
+          // finding makes it refuse, it never stamps a verified-clean label, so it
+          // does not derive an audit-chain cleanliness verdict (F2 round-4 HIGH-2).
           if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_events_read");
           const own = queried.entries;
           const startOffset = cursor.offset;
@@ -931,7 +935,21 @@ export function createAgentNativeCooperativeTools(
               limit: 500,
             })
           );
-          if (queried.integrity_findings.length > 0) return deny("audit:sanctuary_audit_search");
+          // BLOCKER-1 (round 3): route the "verified against the audit chain"
+          // claim through the shared verdict, which folds the sealed-region
+          // crypto verdict the routine query skips. Deny on any `findings`
+          // (routine tamper OR a sealed hash_mismatch/incomplete). The old gate
+          // only saw routine findings and stamped "verified_against_audit_chain"
+          // over a tampered sealed entry. On `verified_suffix_only` (the sealed
+          // history is unreadable at the agent's privilege, the common armed-box
+          // case) the agent verified only the post-split chain, so it claims the
+          // honest weaker label rather than full-chain verification.
+          const chainVerdict = await options.auditLog.getAuditChainVerdict();
+          if (chainVerdict.status === "findings") return deny("audit:sanctuary_audit_search");
+          const verificationLabel =
+            chainVerdict.status === "verified"
+              ? "verified_against_audit_chain"
+              : "verified_against_post_split_chain";
           const needle = String(args.query).toLowerCase();
           const limit = Math.min(25, Math.max(1, Number(args.limit ?? 10)));
           const matches = queried.entries
@@ -960,7 +978,7 @@ export function createAgentNativeCooperativeTools(
               audit_ref: `audit:search:${index}`,
               timestamp: entry.timestamp,
               operation: entry.operation,
-              verification: "verified_against_audit_chain",
+              verification: verificationLabel,
               summary: { result: entry.result },
             }));
           const auditRef = await audit("sanctuary_audit_search", {

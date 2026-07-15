@@ -27,7 +27,16 @@ import {
   AuditLog,
   AuditIntegrityError,
   type AuditEntry,
+  type AuditIntegrityFinding,
 } from "../operational/audit-log.js";
+import {
+  AuditStoreSplitMigrationError,
+  createDaemonAuditLog,
+  migrateFortressAuditStoreSplit,
+  probeDaemonChainAccess,
+  verifyFortressAuditFullPicture,
+  verifySealedLegacyPrefix,
+} from "../operational/audit-store-split.js";
 import {
   DEFAULT_DENY_BUCKET,
   attributeFlows,
@@ -598,16 +607,48 @@ export async function runAuditFindings(
     const masterKey = await resolveMasterKey(fortressPath, env);
     const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
     const findings = await auditLog.getIntegrityFindings();
+
+    // BLOCKER-R1 (adversarial re-gate 2026-07-14): the routine load SKIPS the
+    // sealed legacy region (that is the F2 fix), so `getIntegrityFindings()`
+    // above verified only the post-split SUFFIX plus the cheap sealed-region
+    // LISTING completeness check. It cannot, on its own, prove the sealed
+    // region's CONTENT is intact. So this diagnostic must NOT print "the chain
+    // verifies clean" unless the sealed region was actually crypto-walked and
+    // returned `verified` / `empty` / `not_present` (never migrated). Run that
+    // walk now and fold its verdict into the clean/unclean decision.
+    const sealed = await verifySealedLegacyPrefix(storage, masterKey);
     masterKey.fill(0);
 
-    if (findings.length === 0) {
-      write(out, "No audit integrity findings; the chain verifies clean.\n");
+    const sealedClean =
+      sealed.status === "verified" ||
+      sealed.status === "empty" ||
+      sealed.status === "not_present";
+
+    if (findings.length === 0 && sealedClean) {
+      write(
+        out,
+        sealed.status === "verified"
+          ? "No audit integrity findings; the chain verifies clean (including a crypto re-walk of the sealed legacy region).\n"
+          : "No audit integrity findings; the chain verifies clean.\n",
+      );
       return 0;
     }
 
+    // Not clean. Emit the routine findings AND an honest sealed-region verdict.
+    const sealedNote =
+      sealed.status === "unreadable"
+        ? "the sealed legacy region is NOT readable at this privilege and was NOT re-verified (re-run as root); this is NOT a clean result"
+        : sealed.status === "incomplete"
+          ? `the sealed legacy region is INCOMPLETE (expected tip sequence ${sealed.expected_tip}, highest present ${sealed.highest_present}); a sealed entry was deleted`
+          : sealed.status === "hash_mismatch"
+            ? `the sealed legacy region FAILED crypto re-verification at sequence ${sealed.sequence} (content tampered)`
+            : null;
+
     write(
       err,
-      `${findings.length} audit integrity finding(s) for fortress ${fortressIdFromStoragePath(fortressPath)}:\n`,
+      `${findings.length} audit integrity finding(s)` +
+        (sealedNote ? ` plus a sealed-region issue` : "") +
+        ` for fortress ${fortressIdFromStoragePath(fortressPath)}; the chain does NOT verify clean.\n`,
     );
     findings.forEach((finding, index) => {
       write(
@@ -623,6 +664,50 @@ export async function runAuditFindings(
         }) + "\n",
       );
     });
+    if (sealedNote) {
+      write(
+        out,
+        JSON.stringify({
+          kind: "sealed_region",
+          status: sealed.status,
+          message: sealedNote,
+        }) + "\n",
+      );
+      write(err, `sealed legacy region: ${sealedNote}.\n`);
+    }
+    return 0;
+  } catch (error) {
+    write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+}
+
+/**
+ * F2 Option A: print the full-picture fortress audit-store-split status
+ * (both chains' verdicts, reported honestly and separately). Read-only;
+ * never migrates, repairs, or writes anything.
+ *
+ * Exit code is always 0 unless resolving the master key itself fails: a
+ * `present_unreadable` or `findings` verdict is the whole POINT of this
+ * command (it is meant to be run as the operator, where the daemon chain, if
+ * armed, is EXPECTED to be unreadable) and is not itself a command failure.
+ */
+export async function runAuditStoreStatus(
+  argv: string[] = [],
+  ctx: CastleWallCommandContext = {},
+): Promise<number> {
+  const out = ctx.out ?? process.stdout;
+  const err = ctx.err ?? process.stderr;
+  const env = ctx.env ?? process.env;
+  const parsed = parseCastleWallArgs(argv);
+  const fortressPath = resolveFortressArg(parsed.fortress, env);
+
+  try {
+    const storage = new FilesystemStorage(join(fortressPath, "state"));
+    const masterKey = await resolveMasterKey(fortressPath, env);
+    const report = await verifyFortressAuditFullPicture({ storage, masterKey });
+    masterKey.fill(0);
+    write(out, JSON.stringify(report, null, 2) + "\n");
     return 0;
   } catch (error) {
     write(err, `Error: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -1495,14 +1580,72 @@ export async function runDaemon(
     );
     return 1;
   }
-  const auditLog = await buildAuditLogForPrivilegedAction({
-    storage,
-    masterKey: derived.key,
-    fortressPath: storagePath,
-    verb: "daemon",
-    acceptBrokenChain,
-    err,
-  });
+  // F2 Option A (2026-07-14): on an armed box the `daemon` verb is launched as
+  // ROOT (launchd/system context, needed for the NEFilter/pf enforcement
+  // primitives), while every OTHER caller of this same binary runs as the
+  // fortress operator. When both write into the shared `_audit` chain, the
+  // daemon's root-owned entries become permanently unreadable to the
+  // operator uid, so the operator's own `ensureLoaded()` throws
+  // `AuditIntegrityError` on every subsequent read/mint (drill-verified
+  // finding F2, `Review/Sanctuary/FileGrant_F2_Audit_Contamination_Decision_2026-07-14.md`).
+  // The fix is store separation: a root daemon gets its OWN root-owned
+  // `_audit-daemon` chain (never `_audit`), reached via
+  // `createDaemonAuditLog`. On startup it MUST also run the one-time,
+  // idempotent, crash-safe migration that seals any PRE-EXISTING `_audit`
+  // history (which may already have contamination) as a legacy segment; see
+  // `operational/audit-store-split.ts`'s module doc comment for the full
+  // design.
+  //
+  // A NON-root daemon run (dev/test/manual, or a deployment that does not
+  // need root for enforcement) is unaffected: it keeps writing straight into
+  // the shared `_audit` chain exactly as before this PR, byte-for-byte, and
+  // never provisions a daemon namespace or a split-boundary record. This
+  // keeps every existing test/CI/dev flow (which never runs as uid 0)
+  // completely unchanged.
+  const getuid = ctx.getuid ?? process.getuid?.bind(process);
+  const isRootDaemon = getuid?.() === 0;
+  let auditLog: AuditLog;
+  if (isRootDaemon) {
+    try {
+      const migration = await migrateFortressAuditStoreSplit({
+        storage,
+        masterKey: derived.key,
+        identityId: fortressIdFromStoragePath(storagePath),
+      });
+      write(
+        out,
+        migration.status === "already-migrated"
+          ? `Fortress audit store split already active (sealed at legacy sequence ${migration.boundary.sealed_tip_sequence}).\n`
+          : `Fortress audit store split engaged: sealed the pre-split "_audit" chain at sequence ${migration.boundary.sealed_tip_sequence}; this daemon now writes its own root-owned "${migration.boundary.daemon_namespace}" chain.\n`,
+      );
+    } catch (error) {
+      write(
+        err,
+        `Refusing to start: the fortress audit store writer-split migration failed ` +
+          `(${error instanceof AuditStoreSplitMigrationError ? error.message : String(error)}).\n` +
+          "This runs as root and can read every existing audit entry regardless of " +
+          "owner, so a failure here means a genuine chain problem, not routine " +
+          "cross-uid unreadability. Investigate before retrying (see " +
+          "'sanctuary castle-wall audit-findings').\n",
+      );
+      return 1;
+    }
+    // The daemon's own chain is fresh from this migration onward (nothing but
+    // this migration and this daemon ever write to it), so there is no
+    // analogous "accept a pre-existing broken chain" override to apply here;
+    // `--accept-broken-chain` still governs ONLY the legacy `_audit` read
+    // path other privileged verbs (e.g. `re-pin`) use.
+    auditLog = createDaemonAuditLog(storage, derived.key);
+  } else {
+    auditLog = await buildAuditLogForPrivilegedAction({
+      storage,
+      masterKey: derived.key,
+      fortressPath: storagePath,
+      verb: "daemon",
+      acceptBrokenChain,
+      err,
+    });
+  }
 
   let daemon: { socketPath: string; stop: () => Promise<void> };
 
@@ -2181,6 +2324,65 @@ export async function runApprove(
   }
 }
 
+/**
+ * F2 HIGH-1 (adversarial gate 2026-07-14): after the writer-split, the root
+ * daemon's Castle Wall enforcement events (egress_allowed / egress_blocked /
+ * filter_started) live in `_audit-daemon`, NOT `_audit`. A reader that reads
+ * only `_audit` would print a false-green over an incomplete chain. This helper
+ * returns the daemon chain's entries when readable, or an honest status so the
+ * caller can mark its output INCOMPLETE (and never treat a zero-count as a
+ * clean success).
+ */
+type DaemonAuditView = {
+  // HIGH-R4 (adversarial re-gate 2026-07-14): `tampered` means the daemon chain
+  // is readable but FAILED integrity verification. Its entries must NOT be
+  // counted as verified coverage, and the caller must mark the run incomplete.
+  status: "absent" | "included" | "unreadable" | "tampered";
+  entries: AuditEntry[];
+  findings: AuditIntegrityFinding[];
+};
+
+async function collectDaemonCastleWallEntries(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  queryOpts: { since?: string; layer: "l1"; limit: number },
+): Promise<DaemonAuditView> {
+  const access = await probeDaemonChainAccess(storage);
+  if (access === "absent") return { status: "absent", entries: [], findings: [] };
+  if (access === "present_unreadable") {
+    return { status: "unreadable", entries: [], findings: [] };
+  }
+  try {
+    const daemonLog = createDaemonAuditLog(storage, masterKey, {
+      integrityMode: "lenient",
+    });
+    const q = await daemonLog.query(queryOpts);
+    // HIGH-R4: `query()` returns the daemon chain's integrity findings; a prior
+    // version DISCARDED them, so a readable-but-tampered daemon chain read as
+    // `complete: true` with no warning. Surface them: a chain with findings is
+    // `tampered`, and its entries are NOT counted as verified coverage.
+    //
+    // F2 BLOCKER-1 (round 3): the cleanliness decision routes through the shared
+    // chokepoint `getAuditChainVerdict` (the daemon chain has no sealed region of
+    // its own, so its sealed verdict is `not_present` and the fold reduces to the
+    // routine findings, exactly as before) rather than reading findings.length
+    // directly. This keeps every audit-cleanliness claim on one code path.
+    const verdict = await daemonLog.getAuditChainVerdict();
+    if (verdict.status === "findings") {
+      return {
+        status: "tampered",
+        entries: q.entries,
+        findings: q.integrity_findings,
+      };
+    }
+    return { status: "included", entries: q.entries, findings: [] };
+  } catch {
+    // A read error mid-query (e.g. the dir became unreadable in a race) is
+    // reported as unreadable, never silently dropped to "complete".
+    return { status: "unreadable", entries: [], findings: [] };
+  }
+}
+
 export async function runAuditDump(
   argv: string[] = [],
   ctx: CastleWallCommandContext = {}
@@ -2201,13 +2403,49 @@ export async function runAuditDump(
   try {
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const masterKey = await resolveMasterKey(fortressPath, env);
-    const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
-    const query = await auditLog.query({
+    const queryOpts = {
       ...(sinceIso ? { since: sinceIso } : {}),
-      layer: "l1",
+      layer: "l1" as const,
       limit: 100_000,
-    });
-    const castleWallEntries = query.entries.filter(isCastleWallAuditEntry);
+    };
+    const auditLog = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+    const query = await auditLog.query(queryOpts);
+    const operatorEntries = query.entries.filter(isCastleWallAuditEntry);
+
+    // F2 HIGH-1: include the root daemon's own Castle Wall chain when present +
+    // readable; warn INCOMPLETE (never a false green) when it exists but is
+    // unreadable at this privilege.
+    const daemonView = await collectDaemonCastleWallEntries(
+      storage,
+      masterKey,
+      queryOpts,
+    );
+    const daemonEntries = daemonView.entries.filter(isCastleWallAuditEntry);
+    const daemonPresent = daemonView.status !== "absent";
+    if (daemonView.status === "unreadable") {
+      write(
+        err,
+        "WARNING: a root daemon audit store (_audit-daemon) exists but is NOT " +
+          "readable at this privilege; this dump is INCOMPLETE (daemon " +
+          "enforcement events are omitted). Re-run as root for the full picture.\n",
+      );
+    } else if (daemonView.status === "tampered") {
+      // HIGH-R4: the daemon chain is readable but FAILED integrity verification.
+      // Its records are still emitted (for forensic inspection) but MUST be
+      // flagged loudly so they are not trusted as verified evidence.
+      write(
+        err,
+        `WARNING: the root daemon audit store (_audit-daemon) has ` +
+          `${daemonView.findings.length} integrity finding(s); its records below ` +
+          `are TAMPERED / not trustworthy. Do NOT treat them as verified ` +
+          `enforcement evidence.\n`,
+      );
+      for (const f of daemonView.findings.slice(0, 20)) {
+        write(err, `  daemon finding: ${f.kind} - ${f.message}\n`);
+      }
+    }
+    // Merge for per-rule attribution (both chains' recorded flows).
+    const mergedEntries = [...operatorEntries, ...daemonEntries];
 
     // Per-rule-per-flow read-out modes (#c4). These attribute each RECORDED flow
     // to the rule that decided it; they do NOT change emission, schema, or
@@ -2215,7 +2453,7 @@ export async function runAuditDump(
     // separate, currently-inert producer-signed-audit capability). The rule id
     // shown here is operator-only - this CLI runs in operator context.
     if (parsed.byRule || parsed.rule !== undefined) {
-      const flows = attributeFlows(castleWallEntries);
+      const flows = attributeFlows(mergedEntries);
       if (parsed.rule !== undefined) {
         const ruleId = normalizeRuleFilter(parsed.rule);
         for (const flow of filterFlowsByRule(flows, ruleId)) {
@@ -2229,8 +2467,18 @@ export async function runAuditDump(
       return 0;
     }
 
-    for (const entry of castleWallEntries) {
-      write(out, JSON.stringify(entry) + "\n");
+    // Plain dump. When a daemon chain is present at all, tag each record with
+    // its source chain (`_chain`) so the two are distinguishable; on the
+    // overwhelming (non-migrated) majority the output is byte-identical to
+    // before this change (no `_chain` field, operator entries only).
+    for (const entry of operatorEntries) {
+      write(
+        out,
+        JSON.stringify(daemonPresent ? { ...entry, _chain: "operator" } : entry) + "\n",
+      );
+    }
+    for (const entry of daemonEntries) {
+      write(out, JSON.stringify({ ...entry, _chain: "daemon" }) + "\n");
     }
     return 0;
   } catch (error) {
@@ -2416,24 +2664,44 @@ export async function runAuditVerify(
 
     const storage = new FilesystemStorage(join(fortressPath, "state"));
     const masterKey = await resolveMasterKey(fortressPath, env);
+    const queryOpts = {
+      ...(sinceIso ? { since: sinceIso } : {}),
+      layer: "l1" as const,
+      limit: 100_000,
+    };
     const auditLog = new AuditLog(storage, masterKey, {
       integrityMode: "lenient",
     });
-    const query = await auditLog.query({
-      ...(sinceIso ? { since: sinceIso } : {}),
-      layer: "l1",
-      limit: 100_000,
-    });
+    const query = await auditLog.query(queryOpts);
     // Only enforcement-evidence operations carry producer signatures; an
     // operator_decision / policy_loaded / heartbeat entry is never expected to
     // be producer-signed, so re-verifying them would inflate the channel count
     // with entries that were never enforcement evidence. Scope to the two flow
     // verdict operations the consumer signs.
-    const evidenceEntries = query.entries.filter(
-      (entry) =>
-        entry.operation === "egress_allowed" ||
-        entry.operation === "egress_blocked",
+    const isEvidence = (entry: { operation: string }): boolean =>
+      entry.operation === "egress_allowed" ||
+      entry.operation === "egress_blocked";
+    const operatorEvidence = query.entries.filter(isEvidence);
+
+    // F2 HIGH-1: after the writer-split, the LIVE daemon enforcement evidence
+    // lives in `_audit-daemon`. Include it when readable; mark the run
+    // INCOMPLETE (and refuse to present a zero-count as a clean success) when
+    // the daemon chain exists but is unreadable at this privilege.
+    const daemonView = await collectDaemonCastleWallEntries(
+      storage,
+      masterKey,
+      queryOpts,
     );
+    // HIGH-R4: a `tampered` daemon chain (readable but with integrity findings)
+    // is INCOMPLETE coverage too (its evidence is NOT trustworthy), so it is NOT
+    // merged into the verified tally and the run is marked incomplete.
+    const daemonTampered = daemonView.status === "tampered";
+    const daemonEvidence = daemonTampered
+      ? []
+      : daemonView.entries.filter(isEvidence);
+    const daemonIncomplete =
+      daemonView.status === "unreadable" || daemonTampered;
+    const evidenceEntries = [...operatorEvidence, ...daemonEvidence];
 
     const tally: AuditVerifyTally = {
       verified: 0,
@@ -2515,6 +2783,16 @@ export async function runAuditVerify(
             pinnedProducerKeyB64url !== null
               ? "per_producer_reverified"
               : "channel_authenticated_only",
+          // F2 HIGH-1/HIGH-R4: honesty about chain coverage. `complete: false`
+          // means a daemon chain exists but was unreadable OR tampered, so this
+          // tally OMITS the live daemon enforcement evidence and a green here is
+          // NOT a full success claim. `daemon_chain: "tampered"` additionally
+          // surfaces the daemon chain's integrity findings.
+          daemon_chain: daemonView.status,
+          complete: !daemonIncomplete,
+          ...(daemonView.status === "tampered"
+            ? { daemon_integrity_findings: daemonView.findings }
+            : {}),
           enforcement_entries: evidenceEntries.length,
           verified: tally.verified,
           rejected: tally.rejected,
@@ -2543,6 +2821,32 @@ export async function runAuditVerify(
         "Producer key: published. Re-verifying each enforcement entry's producer\n" +
           "  signature against the pinned key (the forgeable cw_source marker is NOT\n" +
           "  trusted; the cryptographic signature is the authority).\n",
+      );
+    }
+    if (daemonView.status === "included") {
+      write(
+        out,
+        "Chain coverage: operator + root daemon (_audit-daemon) chains both included.\n",
+      );
+    } else if (daemonView.status === "tampered") {
+      // HIGH-R4: readable but failed integrity verification.
+      write(
+        err,
+        `WARNING: the root daemon audit store (_audit-daemon) has ` +
+          `${daemonView.findings.length} integrity finding(s); its enforcement ` +
+          `evidence is NOT trustworthy and is EXCLUDED from this tally. This verify ` +
+          `is INCOMPLETE: a green here is NOT a full success claim.\n`,
+      );
+      for (const f of daemonView.findings.slice(0, 20)) {
+        write(err, `  daemon finding: ${f.kind} - ${f.message}\n`);
+      }
+    } else if (daemonIncomplete) {
+      write(
+        err,
+        "WARNING: a root daemon audit store (_audit-daemon) exists but is NOT " +
+          "readable at this privilege. This verify is INCOMPLETE: it OMITS the " +
+          "daemon's live enforcement evidence. A green / zero-count here is NOT a " +
+          "full success claim. Re-run as root to include the daemon chain.\n",
       );
     }
     write(out, `Enforcement entries examined: ${evidenceEntries.length}\n`);

@@ -747,6 +747,8 @@ async function buildEvidence(
   entries: import("../operational/audit-log.js").AuditEntry[];
   total: number;
   integrity_findings: import("../operational/audit-log.js").AuditIntegrityFinding[];
+  chain_verdict: import("../operational/audit-log.js").AuditChainVerdictStatus;
+  sealed_region: import("../operational/audit-log.js").SealedRegionVerdict;
 }> {
   const auditLog = deps.auditLog as AuditLog;
 
@@ -789,11 +791,18 @@ async function buildEvidence(
     // matched the result filter.  This is the honest reading of the number.
   }
 
+  // BLOCKER-1 (round 3): `integrity_findings` is the ROUTINE finding set, which
+  // skips the sealed legacy region. Surface the shared audit-chain verdict so a
+  // client cannot read empty `integrity_findings` as "the whole chain is clean"
+  // over an in-place-corrupted sealed entry.
+  const chainVerdict = await auditLog.getAuditChainVerdict();
   return {
     origin_machine: deps.originMachine,
     entries,
     total,
     integrity_findings: queryResult.integrity_findings,
+    chain_verdict: chainVerdict.status,
+    sealed_region: chainVerdict.sealed_region,
   };
 }
 

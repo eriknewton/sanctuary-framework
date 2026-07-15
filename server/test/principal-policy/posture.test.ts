@@ -1081,6 +1081,11 @@ describe("buildRecognitionPanel — local-evidence-only", () => {
         total: operation_type === "bridge_commit" ? 80_000 : 0,
         integrity_findings: [],
       }),
+      getAuditChainVerdict: async () => ({
+        status: "verified",
+        routine_finding_count: 0,
+        sealed_region: { status: "not_present" },
+      }),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
     const capped = await buildRecognitionPanel({
@@ -1131,6 +1136,11 @@ describe("buildRecognitionPanel — local-evidence-only", () => {
           integrity_findings: [],
         };
       },
+      getAuditChainVerdict: async () => ({
+        status: "verified",
+        routine_finding_count: 0,
+        sealed_region: { status: "not_present" },
+      }),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
     const panel = await buildRecognitionPanel({

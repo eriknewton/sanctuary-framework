@@ -21,7 +21,11 @@ import { Writable } from "node:stream";
 import { createSanctuaryServer } from "../index.js";
 import type { SanctuaryConfig } from "../config.js";
 import type { StoredIdentity } from "../core/identity.js";
-import type { AuditEntry } from "../operational/audit-log.js";
+import { AuditIntegrityError, type AuditEntry } from "../operational/audit-log.js";
+import {
+  createDaemonAuditLog,
+  probeDaemonChainAccess,
+} from "../operational/audit-store-split.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { StateStore } from "../cognitive/state-store.js";
@@ -265,8 +269,30 @@ export function deriveAuditReadOutcome(params: {
     totalSizeBytes: number;
     everPruned: boolean | null;
   };
+  /**
+   * WATCH-1: the F2 daemon enforcement store (`_audit-daemon`) read, when the
+   * operator store has been split. Omit (or `absent`) on a non-split fortress.
+   * `included` merges the daemon entries + retention into the census;
+   * `present_unreadable` discloses the daemon store exists but was not readable
+   * at this privilege (the counts then EXCLUDE it, disclosed, never silent).
+   */
+  daemon?:
+    | { status: "absent" }
+    | { status: "present_unreadable" }
+    | { status: "present_tampered" }
+    | {
+        status: "included";
+        entries: readonly AuditEntry[];
+        windowedTotal: number;
+        usage: {
+          entryCount: number | null;
+          totalSizeBytes: number;
+          everPruned: boolean | null;
+        };
+      };
 }): ReadOutcome<AuditReadData> {
   const { entries, windowedTotal, retentionConfig, usage } = params;
+  const daemon = params.daemon ?? { status: "absent" as const };
   const windowTruncated =
     usage.entryCount !== null && usage.entryCount > windowedTotal;
   const queryTruncated = entries.length < windowedTotal;
@@ -279,29 +305,137 @@ export function deriveAuditReadOutcome(params: {
         "counts and coverage are not determinable from this read"
     );
   }
+
+  // WATCH-1: fold the daemon store in. A truncated daemon read is the same
+  // honesty failure as a truncated operator read: fail closed rather than
+  // present a partial daemon census as complete.
+  let mergedEntries: readonly AuditEntry[] = entries;
+  let retainedTotal = usage.entryCount ?? windowedTotal;
+  let retainedSizeBytes = usage.totalSizeBytes;
+  let everPruned = usage.everPruned;
+  let includedDaemonCount = 0;
+  if (daemon.status === "included") {
+    const daemonWindowTruncated =
+      daemon.usage.entryCount !== null &&
+      daemon.usage.entryCount > daemon.windowedTotal;
+    const daemonQueryTruncated = daemon.entries.length < daemon.windowedTotal;
+    if (daemonWindowTruncated || daemonQueryTruncated) {
+      const retained = Math.max(daemon.usage.entryCount ?? 0, daemon.windowedTotal);
+      return readFailed(
+        `the daemon enforcement store (_audit-daemon) retains ${retained} ` +
+          `entries but only ${daemon.entries.length} could be read by this ` +
+          "run, so the daemon enforcement history was not read to completion " +
+          "and the quarter's decision counts and coverage are not determinable"
+      );
+    }
+    mergedEntries = [...entries, ...daemon.entries];
+    includedDaemonCount = daemon.entries.length;
+    retainedTotal += daemon.usage.entryCount ?? daemon.windowedTotal;
+    retainedSizeBytes += daemon.usage.totalSizeBytes;
+    // Either store having pruned means early-quarter entries may be missing.
+    everPruned =
+      usage.everPruned === null && daemon.usage.everPruned === null
+        ? null
+        : Boolean(usage.everPruned) || Boolean(daemon.usage.everPruned);
+  }
+
   // R3-3: min-scan, never positional (entries are append-ordered, and clock
-  // skew can put an earlier timestamp on a later-appended entry).
+  // skew can put an earlier timestamp on a later-appended entry). Scan the
+  // MERGED set so a daemon entry can legitimately be the earliest.
   let earliest: string | null = null;
   let earliestMs = Number.POSITIVE_INFINITY;
-  for (const entry of entries) {
+  for (const entry of mergedEntries) {
     const t = new Date(entry.timestamp).getTime();
     if (Number.isFinite(t) && t < earliestMs) {
       earliestMs = t;
       earliest = entry.timestamp;
     }
   }
-  if (earliest === null && entries.length > 0) {
-    earliest = entries[0]!.timestamp;
+  if (earliest === null && mergedEntries.length > 0) {
+    earliest = mergedEntries[0]!.timestamp;
   }
   const retention: RetentionFacts = {
     max_entries: retentionConfig.maxEntries,
-    retained_total: usage.entryCount ?? windowedTotal,
+    retained_total: retainedTotal,
     max_total_size_bytes: retentionConfig.maxTotalSizeBytes,
-    retained_total_size_bytes: usage.totalSizeBytes,
-    ever_pruned: usage.everPruned,
+    retained_total_size_bytes: retainedSizeBytes,
+    ever_pruned: everPruned,
     earliest_retained_at: earliest,
+    daemon_store: {
+      status: daemon.status,
+      included_entry_count: includedDaemonCount,
+    },
   };
-  return populated({ entries, retention });
+  return populated({ entries: mergedEntries, retention });
+}
+
+/**
+ * WATCH-1: read the F2 daemon enforcement store (`_audit-daemon`) for the
+ * census. Returns `absent` on a non-split fortress (nothing to add),
+ * `present_unreadable` when a daemon store exists but this privilege cannot read
+ * it (the pack then DISCLOSES the omission), `present_tampered` when the store
+ * WAS readable but failed integrity verification (round-5 gate: tamper evidence
+ * must never be mislabeled as a privilege limitation, and "re-run as root" is
+ * futile advice when root already hit the integrity failure), or `included`
+ * with the daemon entries + retention to merge. A non-integrity read failure
+ * after the directory was listable is `present_unreadable` so a pack always
+ * generates and discloses rather than crashing.
+ *
+ * Exported for the integration regression test only; the CLI is the caller.
+ */
+export async function readDaemonStore(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array
+): Promise<
+  | { status: "absent" }
+  | { status: "present_unreadable" }
+  | { status: "present_tampered" }
+  | {
+      status: "included";
+      entries: readonly AuditEntry[];
+      windowedTotal: number;
+      usage: {
+        entryCount: number | null;
+        totalSizeBytes: number;
+        everPruned: boolean | null;
+      };
+    }
+> {
+  const access = await probeDaemonChainAccess(storage);
+  if (access === "absent") return { status: "absent" };
+  if (access === "present_unreadable") return { status: "present_unreadable" };
+  try {
+    const daemonLog = createDaemonAuditLog(storage, masterKey);
+    // Default strict integrity mode: a daemon-store tamper makes query() throw
+    // AuditIntegrityError, distinguished below from an access failure.
+    const { entries, total } = await daemonLog.query({ limit: 1_000_000 });
+    let usage: {
+      entryCount: number | null;
+      totalSizeBytes: number;
+      everPruned: boolean | null;
+    };
+    try {
+      usage = await daemonLog.getRetentionUsage();
+    } catch {
+      usage = { entryCount: null, totalSizeBytes: 0, everPruned: null };
+    }
+    return {
+      status: "included",
+      entries: entries as readonly AuditEntry[],
+      windowedTotal: total,
+      usage,
+    };
+  } catch (e) {
+    // A strict-mode integrity failure over a READABLE store is tamper evidence,
+    // not a privilege limitation. Disclose it as such (two-family round-5 gate:
+    // Codex HIGH / Opus-family MED, convergent).
+    if (e instanceof AuditIntegrityError) {
+      return { status: "present_tampered" };
+    }
+    // Listable but not readable (privilege / IO): disclose the omission rather
+    // than silently dropping the store or failing the whole pack.
+    return { status: "present_unreadable" };
+  }
 }
 
 interface EvidencePackCliOptions {
@@ -437,7 +571,10 @@ export async function runEvidencePack(args: string[]): Promise<void> {
 
   // Read-only storage handle onto the same fortress state dir, for the
   // inventory + discrete-export enumeration (no live connections, no network).
-  const storage: StorageBackend = new FilesystemStorage(
+  // Typed as the concrete FilesystemStorage so the WATCH-1 daemon-store probe /
+  // read (which need `namespacePath`) can reuse it; it still satisfies every
+  // `StorageBackend` consumer below.
+  const storage: FilesystemStorage = new FilesystemStorage(
     `${config.storage_path}/state`
   );
 
@@ -461,11 +598,18 @@ export async function runEvidencePack(args: string[]): Promise<void> {
       } catch {
         usage = { entryCount: null, totalSizeBytes: 0, everPruned: null };
       }
+      // WATCH-1: after the F2 audit-store split, daemon-produced enforcement
+      // records live in the separate root-owned `_audit-daemon` store, which the
+      // operator `auditLog.query()` above does NOT see. Probe it and, when
+      // readable, MERGE it into the census; when present-but-unreadable, disclose
+      // the omission (never a silent single-store false count).
+      const daemon = await readDaemonStore(storage, masterKey);
       return deriveAuditReadOutcome({
         entries: entries as readonly AuditEntry[],
         windowedTotal: total,
         retentionConfig,
         usage,
+        daemon,
       });
     } catch (e) {
       return readFailed(`the audit log could not be read: ${(e as Error).message}`);

@@ -17,7 +17,11 @@ import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
 import { checkNodeVersion } from "./node-version.js";
-import { exportAuditChain } from "./audit-chain-export.js";
+import { verifyFortressAuditFullPicture } from "../operational/audit-store-split.js";
+import {
+  exportAuditChain,
+  fortressRanAuditStoreSplitMigration,
+} from "./audit-chain-export.js";
 import {
   verifyAuditChainRecords,
   type ExportRecord,
@@ -118,7 +122,7 @@ export async function runDoctorChecks(opts: {
   const masterKey = await resolveMasterKeyIfAvailable(opts.storagePath, opts.env);
   checks.push(await checkIdentity(opts.storagePath, masterKey));
   checks.push(await checkPolicy(opts.storagePath));
-  checks.push(await checkAuditChain(opts.storagePath));
+  checks.push(await checkAuditChain(opts.storagePath, masterKey ?? undefined));
   checks.push(await checkCustodyFactors(opts.storagePath));
   checks.push(checkRuntime());
   checks.push(await checkCastleWall(opts));
@@ -251,8 +255,61 @@ async function checkPolicy(storagePath: string): Promise<DoctorCheck> {
   }
 }
 
-async function checkAuditChain(storagePath: string): Promise<DoctorCheck> {
+async function checkAuditChain(
+  storagePath: string,
+  masterKey?: Uint8Array,
+): Promise<DoctorCheck> {
   const storage = new FilesystemStorage(join(storagePath, "state"));
+  // F2 HIGH-R3 + MEDIUM-1 (round 3): after the writer-split the daemon's
+  // enforcement evidence lives in `_audit-daemon`, so the single-chain
+  // `exportAuditChain` verify below is NOT a full verdict. When the migration
+  // ran:
+  //   - with a master key available, run the chain-aware full-picture verifier
+  //     and FAIL on known tamper (operator/daemon findings, daemon missing),
+  //     WARN on unverifiable-at-this-privilege states, OK only when fully
+  //     verified. Doctor is an operator health command: when it CAN verify and
+  //     finds tamper it must FAIL (exit non-zero), not just WARN.
+  //   - without a master key, WARN and point at `audit-store-status`.
+  if (await fortressRanAuditStoreSplitMigration(storage)) {
+    if (!masterKey) {
+      return warn(
+        "audit chain",
+        "this fortress ran the F2 audit store writer-split; a full verify needs " +
+          "the master key (run with the fortress passphrase / recovery key)",
+        "run 'sanctuary castle-wall audit-store-status' (as root for a full " +
+          "sealed-region + daemon-chain verify)",
+      );
+    }
+    const report = await verifyFortressAuditFullPicture({ storage, masterKey });
+    const op = report.operator.status;
+    const dm = report.daemon.status;
+    const tamper =
+      op === "findings" || dm === "findings" || dm === "missing";
+    if (tamper) {
+      return fail(
+        "audit chain",
+        `audit store split verification FAILED (operator: ${op}, daemon: ${dm})`,
+        "run 'sanctuary castle-wall audit-store-status' (as root) and investigate the findings",
+      );
+    }
+    const unverifiable =
+      op === "verified_suffix_only" ||
+      dm === "present_unreadable" ||
+      dm === "key_unavailable" ||
+      op === "key_unavailable";
+    if (unverifiable) {
+      return warn(
+        "audit chain",
+        `audit store split partially verified at this privilege (operator: ${op}, daemon: ${dm})`,
+        "re-run as root for a full sealed-region + daemon-chain verify",
+      );
+    }
+    return ok(
+      "audit chain",
+      `audit store split fully verified (operator: ${op}, daemon: ${dm})`,
+      "none",
+    );
+  }
   const entryMetas = await storage.list("_audit");
   if (entryMetas.length === 0) {
     return fail("audit chain", "no audit entries found", "start Sanctuary and perform an audited operation");
