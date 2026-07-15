@@ -21,7 +21,7 @@
  * fingerprint this test fails (stale `verified` from cache); post-fix it passes.
  */
 
-import { mkdtemp, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readdir, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -103,20 +103,28 @@ async function pinSealedEntry(statePath: string): Promise<string> {
  * the old `tip:count:newest:sizeSum:mtimeAgg` fingerprint would be UNCHANGED.
  */
 async function tamperSealedEntryPreservingMetadata(target: string): Promise<void> {
-  const before = await stat(target);
-  const rawText = await readFile(target, "utf-8");
-  const parsed = JSON.parse(rawText) as { encrypted_payload_bytes: string };
-  const payload = parsed.encrypted_payload_bytes;
-  const idx = Math.floor(payload.length / 2);
-  const flipped = payload[idx] === "A" ? "B" : "A";
-  const tamperedPayload = payload.slice(0, idx) + flipped + payload.slice(idx + 1);
-  const tamperedText = rawText.replace(payload, tamperedPayload);
-  expect(tamperedText.length).toBe(rawText.length);
-  await writeFile(target, tamperedText);
-  await utimes(target, PINNED_EPOCH_SEC, PINNED_EPOCH_SEC);
-  const after = await stat(target);
-  expect(after.size).toBe(before.size);
-  expect(after.mtimeMs).toBe(before.mtimeMs);
+  // One FileHandle for the whole check-tamper-recheck sequence, so every
+  // operation acts on the same open file (no path re-resolution between the
+  // stat and the write; CodeQL js/file-system-race).
+  const fh = await open(target, "r+");
+  try {
+    const before = await fh.stat();
+    const rawText = await fh.readFile("utf-8");
+    const parsed = JSON.parse(rawText) as { encrypted_payload_bytes: string };
+    const payload = parsed.encrypted_payload_bytes;
+    const idx = Math.floor(payload.length / 2);
+    const flipped = payload[idx] === "A" ? "B" : "A";
+    const tamperedPayload = payload.slice(0, idx) + flipped + payload.slice(idx + 1);
+    const tamperedText = rawText.replace(payload, tamperedPayload);
+    expect(tamperedText.length).toBe(rawText.length);
+    await fh.write(tamperedText, 0, "utf-8");
+    await fh.utimes(PINNED_EPOCH_SEC, PINNED_EPOCH_SEC);
+    const after = await fh.stat();
+    expect(after.size).toBe(before.size);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  } finally {
+    await fh.close();
+  }
 }
 
 describe("F2 sealed-verdict cache: a stale `verified` does not survive a size+mtime-preserving in-place sealed tamper", () => {
