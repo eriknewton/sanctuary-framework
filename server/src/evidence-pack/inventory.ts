@@ -85,12 +85,15 @@ export interface InventorySources {
   observedDestinations?: InventorySourceRead<CandidateObservation>;
   /**
    * R4-2: true when the observe store held candidate rows but NO fold
-   * watermark at read time (a legacy pre-#931 additive store not yet healed).
-   * Surfaced onto {@link InventorySnapshot.observed_destinations_pre_idempotency}
-   * (only when the observed-destinations read is populated) so the renderer can
-   * disclose that the `Seen` counts may pre-date the exactly-once engine. The
-   * CLI derives it from `observeStore.getFoldWatermark()`; test fixtures set it
-   * directly. See {@link InventorySnapshot}.
+   * watermark at read time -- a store that has NOT completed a reconciling
+   * refresh (a legacy pre-#931 additive store, OR the narrow window of a
+   * post-#931 recompute-heal that crashed after writing rows but before
+   * advancing the watermark). Surfaced onto
+   * {@link InventorySnapshot.observed_destinations_pre_idempotency} (only when
+   * the observed-destinations read is populated) so the renderer can disclose
+   * that the rows may not reflect a reconciled state. The CLI derives it from
+   * `observeStore.getFoldWatermark()`; test fixtures set it directly. See
+   * {@link InventorySnapshot} for the full semantics.
    */
   observedStorePreIdempotency?: boolean;
 }
