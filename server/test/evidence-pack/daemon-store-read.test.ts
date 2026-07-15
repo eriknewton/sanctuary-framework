@@ -108,5 +108,10 @@ describe("WATCH-1 round-5: readDaemonStore four honest states over a real on-dis
     await chmod(daemonDir, 0o000);
     const result = await readDaemonStore(f.storage, f.masterKey);
     expect(result.status).toBe("present_unreadable");
+    // G-3: a directory unreadable at this uid is a PRIVILEGE limitation (re-run
+    // as root reads it), never an I/O error.
+    if (result.status === "present_unreadable") {
+      expect(result.unreadable_reason).toBe("privilege");
+    }
   });
 });

@@ -119,10 +119,21 @@ function renderCover(
       }
       if (s.zero_of_quarter_covered) {
         return [
-          "> COVERAGE NOTICE: NONE of this quarter is covered; no entries from " +
+          // G-1(c): scope the zero-coverage claim to the OPERATOR store; a
+          // present-but-unreadable/tampered daemon store may hold enforcement
+          // history for the quarter. The access-log section carries the daemon
+          // disclosure.
+          "> COVERAGE NOTICE: NONE of this quarter is covered by the operator " +
+            "audit log; no operator-store entries from " +
             window.label +
             " survive in the retained log. See the access-log section for " +
-            "details.",
+            "details" +
+            (s.daemon_store?.status === "present_unreadable" ||
+            s.daemon_store?.status === "present_tampered"
+              ? ", including a separate root-owned daemon enforcement store that " +
+                "is present but not included in these counts"
+              : "") +
+            ".",
           "",
         ];
       }
@@ -295,6 +306,14 @@ function renderExecutiveSummary(
     ],
   });
   lines.push(...coverageNotice);
+  // G-1(a): the "Automated decisions ... denied by policy" and "Total recorded
+  // audit operations" bullets above are DEFINITIVE counts. When a root-owned
+  // daemon store is present-but-unreadable/tampered, they are an operator-store
+  // view, not the whole enforcement census -- disclose that here, adjacent to
+  // the numbers, not only in §7.
+  const daemonDisclosure =
+    shortfall.status === "populated" ? shortfall.value.daemon_store : undefined;
+  lines.push(...daemonCensusCaveat(daemonDisclosure));
   lines.push(
     "These counts reflect enforcement decisions at Sanctuary's control " +
       "point. They show that a human was in the loop for gated actions; they " +
@@ -686,7 +705,8 @@ function countsUnavailable(reason: string): string[] {
 }
 
 function renderHumanReview(
-  aggregation: ReadOutcome<QuarterAggregation>
+  aggregation: ReadOutcome<QuarterAggregation>,
+  daemon: DaemonStoreDisclosure | undefined
 ): PackSection {
   const lead = [
     "# Human review of AI actions at the control point",
@@ -698,11 +718,16 @@ function renderHumanReview(
       "tamper-evident audit log with a timestamp. (Whether a given action was " +
       "Tier 1 depends on the operator's policy configuration, which this report " +
       "does not itself attest.) The counts below reflect the approvals and " +
-      "denials actually recorded in this install's audit log, separating " +
+      "denials actually recorded in this install's operator audit log, separating " +
       "decisions a HUMAN made at the control point from decisions the automated " +
       "policy tiers made without a human, so this section never presents an " +
       "automated decision as human oversight, or the reverse.",
     "",
+    // G-1(b): the per-category decision tables below are DEFINITIVE operator-store
+    // counts. When a root-owned daemon store is present-but-unreadable/tampered,
+    // disclose that these are an operator-store view, not the whole enforcement
+    // census, adjacent to the tables rather than only in §7.
+    ...daemonCensusCaveat(daemon),
   ];
   const body = foldOutcome(aggregation, {
     populated: (agg) => {
@@ -784,10 +809,28 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
   // non-split fortress): print nothing rather than throw.
   if (!d || d.status === "absent") return [];
   if (d.status === "included") {
+    // G-2: "the counts above" are quarter-windowed (aggregateQuarter skips
+    // out-of-window entries), so the figure that contributes to them is the
+    // WINDOWED daemon count, not the all-time total read. Render the windowed
+    // figure when the generator supplied it; otherwise fall back to a
+    // window-agnostic phrasing that does not claim the total was merged into the
+    // counts above.
+    if (d.windowed_entry_count !== undefined) {
+      return [
+        `Daemon enforcement store: included. Of ${d.included_entry_count} ` +
+          "daemon-recorded enforcement entries merged into this report's census " +
+          "(from the root-owned _audit-daemon store created by the audit-store " +
+          `split), ${d.windowed_entry_count} fall within the reporting quarter ` +
+          "and contribute to the counts above; the remainder are retained daemon " +
+          "history outside the quarter window.",
+        "",
+      ];
+    }
     return [
       `Daemon enforcement store: included. ${d.included_entry_count} ` +
         "daemon-recorded enforcement entries (from the root-owned _audit-daemon " +
-        "store created by the audit-store split) are merged into the counts above.",
+        "store created by the audit-store split) are included in this report's " +
+        "census; those within the reporting quarter contribute to the counts above.",
       "",
     ];
   }
@@ -807,6 +850,24 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
       "",
     ];
   }
+  // present_unreadable. G-3: only advise "re-run as root" when the store was
+  // unreadable for a PRIVILEGE reason (the root-owned-store armed-box case, where
+  // root can read it). A genuine I/O / corruption error does NOT clear by
+  // re-running as root -- root hits the same failure -- so that case gets honest
+  // "investigate the store" framing instead. Default to `privilege` when the
+  // reason is unset (older reports / fixtures; the dominant real cause).
+  if (d.unreadable_reason === "io") {
+    return [
+      "> COVERAGE NOTICE: a separate root-owned daemon enforcement store " +
+        "(_audit-daemon) is present but could NOT be read here due to an I/O or " +
+        "corruption error (not a privilege limitation), so daemon-recorded " +
+        "enforcement events (automated Castle Wall gate decisions and egress " +
+        "denials) are NOT included in the counts above. Re-running the pack as " +
+        "root will NOT resolve this; investigate the daemon store directly " +
+        "before relying on this report as a complete enforcement census.",
+      "",
+    ];
+  }
   return [
     "> COVERAGE NOTICE: a separate root-owned daemon enforcement store " +
       "(_audit-daemon) is present but was NOT readable at this privilege, so " +
@@ -815,6 +876,52 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
       "as root for a complete enforcement census.",
     "",
   ];
+}
+
+/**
+ * G-1: the daemon-store completeness caveat for a section that presents
+ * DEFINITIVE operator-store counts adjacent to the numbers -- the executive
+ * summary and the §6 human-review aggregation. When the root-owned daemon store
+ * is present but NOT merged (`present_unreadable` / `present_tampered`), those
+ * counts are an operator-store-only view, NOT a complete enforcement census, so
+ * every count-presenting section must say so next to the numbers, not only in §7
+ * (#929 invariant: never a silent single-store count anywhere). `absent` and
+ * `included` add nothing here: absent means the operator store IS the whole
+ * census, and included means the counts already fold the daemon entries in
+ * (stated in §7). The full disclosure + the privilege/IO-scoped remedy live in
+ * the enforcement-summary section, so this caveat defers there rather than
+ * duplicating the "re-run as root" advice (which keeps it G-3-correct by
+ * construction: no root advice is emitted from here for any reason).
+ */
+function daemonCensusCaveat(d: DaemonStoreDisclosure | undefined): string[] {
+  if (!d) return [];
+  if (d.status === "present_unreadable") {
+    return [
+      "> COVERAGE NOTICE: these counts are drawn from the operator audit store " +
+        "only. A separate root-owned daemon enforcement store (_audit-daemon) is " +
+        "present but was not readable here, so daemon-recorded enforcement events " +
+        "(automated Castle Wall gate decisions and egress denials) are NOT " +
+        "included in the counts here. On an enforced machine that is the bulk of " +
+        "enforcement, so treat these as an operator-store view, not a complete " +
+        "enforcement census. The access-log and enforcement summary section " +
+        "carries the full disclosure and remedy.",
+      "",
+    ];
+  }
+  if (d.status === "present_tampered") {
+    return [
+      "> INTEGRITY NOTICE: these counts are drawn from the operator audit store " +
+        "only. A separate root-owned daemon enforcement store (_audit-daemon) is " +
+        "present and was readable but FAILED integrity verification, so its " +
+        "daemon-recorded enforcement events are NOT included in the counts here " +
+        "and that failure is itself evidence the store was modified or corrupted. " +
+        "Do not treat these counts as a complete enforcement census; investigate. " +
+        "The access-log and enforcement summary section carries the full " +
+        "disclosure.",
+      "",
+    ];
+  }
+  return [];
 }
 
 function renderAccessLog(
@@ -1227,7 +1334,12 @@ export function renderSections(params: {
     renderInventory(inv),
     renderGovernancePolicy(),
     renderTrainingAttestations(),
-    renderHumanReview(params.aggregation),
+    renderHumanReview(
+      params.aggregation,
+      params.shortfall.status === "populated"
+        ? params.shortfall.value.daemon_store
+        : undefined
+    ),
     renderAccessLog(params.aggregation, params.shortfall),
     renderCustody(params.custody),
     renderIncidentResponse(),

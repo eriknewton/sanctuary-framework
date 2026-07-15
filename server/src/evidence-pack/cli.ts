@@ -278,7 +278,7 @@ export function deriveAuditReadOutcome(params: {
    */
   daemon?:
     | { status: "absent" }
-    | { status: "present_unreadable" }
+    | { status: "present_unreadable"; unreadable_reason?: "privilege" | "io" }
     | { status: "present_tampered" }
     | {
         status: "included";
@@ -364,9 +364,23 @@ export function deriveAuditReadOutcome(params: {
     daemon_store: {
       status: daemon.status,
       included_entry_count: includedDaemonCount,
+      // G-3: carry WHY the daemon store was unreadable (privilege vs I/O) so the
+      // §7 disclosure only advises "re-run as root" for a privilege limitation.
+      ...(daemon.status === "present_unreadable" && daemon.unreadable_reason
+        ? { unreadable_reason: daemon.unreadable_reason }
+        : {}),
     },
   };
-  return populated({ entries: mergedEntries, retention });
+  // G-2: hand the generator the daemon entries separately (in addition to the
+  // merged census) so it can compute how many fall INSIDE the reporting quarter
+  // window -- the figure the §7 "N merged into the counts above" note renders,
+  // rather than the all-time total. Only present when the daemon store was
+  // merged (`included`); the window itself is not known at this pre-window layer.
+  return populated(
+    daemon.status === "included"
+      ? { entries: mergedEntries, retention, daemon_entries: daemon.entries }
+      : { entries: mergedEntries, retention }
+  );
 }
 
 /**
@@ -388,7 +402,7 @@ export async function readDaemonStore(
   masterKey: Uint8Array
 ): Promise<
   | { status: "absent" }
-  | { status: "present_unreadable" }
+  | { status: "present_unreadable"; unreadable_reason: "privilege" | "io" }
   | { status: "present_tampered" }
   | {
       status: "included";
@@ -403,7 +417,12 @@ export async function readDaemonStore(
 > {
   const access = await probeDaemonChainAccess(storage);
   if (access === "absent") return { status: "absent" };
-  if (access === "present_unreadable") return { status: "present_unreadable" };
+  // A directory that exists but is not listable at this uid is a PRIVILEGE
+  // limitation (the expected operator-uid case on an armed box, where re-running
+  // as root reads it), never an I/O error.
+  if (access === "present_unreadable") {
+    return { status: "present_unreadable", unreadable_reason: "privilege" };
+  }
   try {
     const daemonLog = createDaemonAuditLog(storage, masterKey);
     // Default strict integrity mode: a daemon-store tamper makes query() throw
@@ -432,10 +451,37 @@ export async function readDaemonStore(
     if (e instanceof AuditIntegrityError) {
       return { status: "present_tampered" };
     }
-    // Listable but not readable (privilege / IO): disclose the omission rather
-    // than silently dropping the store or failing the whole pack.
-    return { status: "present_unreadable" };
+    // G-3: the directory listed, but the read/decrypt failed for another reason.
+    // Distinguish a PRIVILEGE limitation (a per-file EACCES/EPERM under a
+    // root-owned store -- re-running as root fixes it) from a genuine I/O or
+    // corruption error (root will hit the SAME failure), so the §7 disclosure
+    // does not advise the futile "re-run as root" for the latter. Disclose the
+    // omission either way rather than dropping the store or failing the pack.
+    return {
+      status: "present_unreadable",
+      unreadable_reason: daemonUnreadableReason(e),
+    };
   }
+}
+
+/**
+ * G-3: classify a non-integrity daemon-store read failure as a `privilege`
+ * limitation (a filesystem permission error -- `EACCES`/`EPERM`, possibly nested
+ * on the error's `cause` chain) or a generic `io` error. The distinction drives
+ * whether the disclosure advises "re-run as root": a privilege limitation clears
+ * under root, a genuine I/O/corruption error does not. Exported for direct unit
+ * coverage (a real non-privilege, non-integrity read error is fragile to stage
+ * on disk).
+ */
+export function daemonUnreadableReason(e: unknown): "privilege" | "io" {
+  for (let cur: unknown = e, depth = 0; cur != null && depth < 8; depth++) {
+    const code = (cur as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") return "privilege";
+    const next = (cur as { cause?: unknown }).cause;
+    if (next === cur) break;
+    cur = next;
+  }
+  return "io";
 }
 
 interface EvidencePackCliOptions {

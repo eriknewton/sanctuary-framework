@@ -14,7 +14,10 @@
 
 import { describe, it, expect } from "vitest";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
-import { deriveAuditReadOutcome } from "../../src/evidence-pack/cli.js";
+import {
+  daemonUnreadableReason,
+  deriveAuditReadOutcome,
+} from "../../src/evidence-pack/cli.js";
 
 function entry(timestamp: string): AuditEntry {
   return {
@@ -270,5 +273,65 @@ describe("deriveAuditReadOutcome", () => {
         expect(outcome.value.retention.daemon_store.included_entry_count).toBe(0);
       }
     });
+
+    it("G-2: `included` hands the daemon entries through so the generator can window them", () => {
+      const daemonEntries = [
+        entry("2026-07-03T00:00:00.000Z"),
+        entry("2026-07-04T00:00:00.000Z"),
+      ];
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-02T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+        daemon: {
+          status: "included",
+          entries: daemonEntries,
+          windowedTotal: 2,
+          usage: { entryCount: 2, totalSizeBytes: 2048, everPruned: false },
+        },
+      });
+      expect(outcome.status).toBe("populated");
+      if (outcome.status === "populated") {
+        expect(outcome.value.daemon_entries).toEqual(daemonEntries);
+      }
+    });
+
+    it("G-3: a present_unreadable daemon carries its unreadable_reason forward for the disclosure", () => {
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-07-02T00:00:00.000Z")],
+        windowedTotal: 1,
+        retentionConfig: RETENTION_CONFIG,
+        usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+        daemon: { status: "present_unreadable", unreadable_reason: "io" },
+      });
+      expect(outcome.status).toBe("populated");
+      if (outcome.status === "populated") {
+        expect(outcome.value.retention.daemon_store.unreadable_reason).toBe("io");
+      }
+    });
+  });
+});
+
+describe("daemonUnreadableReason (G-3 classifier)", () => {
+  it("classifies EACCES / EPERM as a privilege limitation", () => {
+    for (const code of ["EACCES", "EPERM"]) {
+      const err = Object.assign(new Error(`${code}: denied`), { code });
+      expect(daemonUnreadableReason(err)).toBe("privilege");
+    }
+  });
+
+  it("walks the error `cause` chain to find a nested privilege error", () => {
+    const root = Object.assign(new Error("EACCES: denied"), { code: "EACCES" });
+    const wrapped = new Error("read failed", { cause: root });
+    expect(daemonUnreadableReason(wrapped)).toBe("privilege");
+  });
+
+  it("classifies a generic / corruption error as io (root will not fix it)", () => {
+    expect(daemonUnreadableReason(new Error("unexpected token in JSON"))).toBe("io");
+    expect(
+      daemonUnreadableReason(Object.assign(new Error("bad"), { code: "EIO" }))
+    ).toBe("io");
+    expect(daemonUnreadableReason(undefined)).toBe("io");
   });
 });

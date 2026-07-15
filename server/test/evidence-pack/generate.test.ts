@@ -232,6 +232,160 @@ describe("buildEvidencePack", () => {
     expect(report).not.toContain("Daemon enforcement store");
   });
 
+  // ── G-1: daemon disclosure threaded into every census-presenting section ──
+
+  /** The Markdown of one section (by its `# ` heading) from the assembled report. */
+  function section(pack: EvidencePack, heading: string): string {
+    const parts = pack.files[0]!.content.split("\n---\n");
+    const found = parts.find((p) => p.trimStart().startsWith(`# ${heading}`));
+    if (!found) throw new Error(`section not found: ${heading}`);
+    return found;
+  }
+
+  it("G-1: a present-unreadable daemon store is disclosed in the EXECUTIVE SUMMARY and §6 HUMAN REVIEW, not only §7", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "present_unreadable", included_entry_count: 0 },
+      })
+    );
+    const exec = section(pack, "Executive summary");
+    const human = section(pack, "Human review of AI actions at the control point");
+    for (const s of [exec, human]) {
+      expect(s).toContain("operator audit store only");
+      expect(s).toContain("_audit-daemon");
+      expect(s).toContain("not a complete enforcement census");
+    }
+    // The definitive-count sections defer the "re-run as root" remedy to §7 (G-3
+    // scoping lives there); they must not emit the root advice themselves.
+    expect(exec).not.toContain("Re-run the pack as root");
+    expect(human).not.toContain("Re-run the pack as root");
+  });
+
+  it("G-1: a present-tampered daemon store raises an INTEGRITY notice in the exec summary and §6, never a privilege excuse", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "present_tampered", included_entry_count: 0 },
+      })
+    );
+    const exec = section(pack, "Executive summary");
+    const human = section(pack, "Human review of AI actions at the control point");
+    for (const s of [exec, human]) {
+      expect(s).toContain("INTEGRITY NOTICE");
+      expect(s).toContain("FAILED integrity verification");
+      expect(s).not.toContain("Re-run the pack as root");
+      expect(s).not.toContain("not readable at this privilege");
+    }
+  });
+
+  it("G-1: an absent OR included daemon store adds NO operator-only caveat to the exec summary / §6 (no false alarm)", () => {
+    for (const daemon_store of [
+      { status: "absent" as const, included_entry_count: 0 },
+      { status: "included" as const, included_entry_count: 3 },
+    ]) {
+      const pack = buildEvidencePack(
+        baseInput(),
+        deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+          ...FULL_COVERAGE,
+          daemon_store,
+        })
+      );
+      const exec = section(pack, "Executive summary");
+      const human = section(pack, "Human review of AI actions at the control point");
+      expect(exec).not.toContain("operator audit store only");
+      expect(human).not.toContain("operator audit store only");
+    }
+  });
+
+  it("G-1(c): a ZERO-ENTRY quarter with an unreadable daemon store scopes 'no history' to the operator log and signposts the daemon store", () => {
+    const pack = buildEvidencePack(
+      baseInput(), // Q3 complete at generation
+      deps([], {
+        max_entries: 100_000,
+        retained_total: 0,
+        max_total_size_bytes: 100 * 1024 * 1024,
+        retained_total_size_bytes: 0,
+        ever_pruned: false,
+        earliest_retained_at: null,
+        daemon_store: { status: "present_unreadable", included_entry_count: 0 },
+      })
+    );
+    const report = pack.files[0]!.content;
+    // The old absolute "The audit log holds no retained entries" is scoped now.
+    expect(report).toContain("The operator audit log holds no retained entries");
+    expect(report).not.toContain("The audit log holds no retained entries, so");
+    // And the daemon store is signposted right in the coverage prose.
+    expect(report).toContain("daemon enforcement store (_audit-daemon) IS");
+  });
+
+  // ── G-2: the §7 "N merged" figure is the QUARTER-WINDOWED daemon count ──
+
+  it("G-2: §7 reports the WINDOWED daemon count that contributes to the counts, not the all-time total read", () => {
+    const inWindow = [
+      entry("2026-08-05T00:00:00.000Z", "gate_deny:d1"),
+      entry("2026-08-06T00:00:00.000Z", "gate_deny:d2"),
+    ];
+    const outOfWindow = [
+      entry("2026-01-01T00:00:00.000Z", "gate_deny:old1"),
+      entry("2026-01-02T00:00:00.000Z", "gate_deny:old2"),
+      entry("2026-11-01T00:00:00.000Z", "gate_deny:future"),
+    ];
+    const daemonEntries = [...inWindow, ...outOfWindow]; // 5 read, 2 in Q3
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:op"), ...daemonEntries],
+      retention: {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "included", included_entry_count: 5 },
+      },
+      daemon_entries: daemonEntries,
+    });
+    const pack = buildEvidencePack(baseInput(), { audit, signer, masterKey });
+    const report = pack.files[0]!.content;
+    // Of 5 merged into the census, only 2 fall in Q3 and contribute to the counts.
+    expect(report).toContain("Of 5 daemon-recorded enforcement entries merged");
+    expect(report).toContain("2 fall within the reporting quarter");
+    expect(report).toContain("contribute to the counts above");
+  });
+
+  // ── G-3: "re-run as root" only for a PRIVILEGE-unreadable daemon store ──
+
+  it("G-3: a privilege-unreadable daemon store advises re-running as root", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          unreadable_reason: "privilege",
+        },
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("Re-run the pack as root for a complete enforcement census");
+  });
+
+  it("G-3: an I/O-unreadable daemon store gives honest framing and does NOT advise re-running as root", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          unreadable_reason: "io",
+        },
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("I/O or corruption error");
+    expect(report).toContain("Re-running the pack as root will NOT resolve this");
+    expect(report).not.toContain("Re-run the pack as root for a complete enforcement census");
+  });
+
   it("N2: an all-post-quarter completed quarter cover banner says NONE covered, not the generic 'does not reach the start'", () => {
     const pack = buildEvidencePack(
       baseInput(), // generated_at 2026-10-02 (Q3 complete)

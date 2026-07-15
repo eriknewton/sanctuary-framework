@@ -142,7 +142,9 @@ export interface QuarterAggregation {
  *     privilege (the expected operator-uid case on an armed box). Its records
  *     are NOT in the counts; the pack DISCLOSES the omission rather than
  *     presenting the operator-only view as complete. Re-run as root for a full
- *     census.
+ *     census -- but ONLY when {@link DaemonStoreDisclosure.unreadable_reason} is
+ *     `privilege` (a genuine I/O/corruption error does not clear by re-running
+ *     as root; see G-3).
  *   - `present_tampered`: the daemon store WAS readable but FAILED integrity
  *     verification (round-5 two-family gate): tamper evidence, not a privilege
  *     limitation. Its records are NOT in the counts, and the disclosure says
@@ -150,8 +152,38 @@ export interface QuarterAggregation {
  */
 export interface DaemonStoreDisclosure {
   status: "absent" | "included" | "present_unreadable" | "present_tampered";
-  /** Daemon-store entries merged into the census (only when `included`). */
+  /**
+   * Daemon-store entries merged into the census (only when `included`). This is
+   * the TOTAL retained daemon entries read, across all time -- NOT the subset
+   * that falls in the reporting quarter. The rendered "N merged into the counts
+   * above" figure uses {@link windowed_entry_count} instead, so an all-time
+   * total never overstates the daemon contribution to the quarter's counts.
+   */
   included_entry_count: number;
+  /**
+   * G-2: of {@link included_entry_count}, how many daemon entries fall INSIDE the
+   * reporting quarter window and therefore actually contribute to the displayed
+   * decision counts. Set by the generator, which owns the quarter window; the
+   * pre-window read layer (`deriveAuditReadOutcome`) has no window and leaves it
+   * `undefined`, in which case the renderer falls back to a windowed-agnostic
+   * phrasing. Only meaningful when `status === "included"`.
+   */
+  windowed_entry_count?: number;
+  /**
+   * G-3: when `present_unreadable`, WHY the daemon store could not be read:
+   *   - `privilege`: a permission limitation (the root-owned store the operator
+   *     uid cannot read; the EXPECTED armed-box case). Re-running the pack as
+   *     root reads the store, so the "re-run as root for a complete census"
+   *     remedy is correct here.
+   *   - `io`: a genuine I/O or corruption error that is NOT a privilege limit
+   *     (the directory listed, but the read/decrypt failed for another reason).
+   *     Running as root will NOT resolve it, so the disclosure must NOT advise
+   *     "re-run as root"; it directs the operator to investigate the store.
+   * Absent for the other statuses. When unset on a `present_unreadable`
+   * disclosure (older fixtures / reports), the renderer defaults to `privilege`,
+   * the dominant real cause.
+   */
+  unreadable_reason?: "privilege" | "io";
 }
 
 export interface RetentionFacts {
