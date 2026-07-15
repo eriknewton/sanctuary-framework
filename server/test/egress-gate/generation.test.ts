@@ -378,7 +378,10 @@ describe("egress-gate/generation bind-first helper", () => {
     await again.release();
   });
 
-  it("refuses a non-loopback host (loopback-only by construction)", async () => {
+  it("refuses any host but IPv4 127.0.0.1 (the whole stack is IPv4-loopback)", async () => {
     await expect(bindEphemeralGatePort("0.0.0.0")).rejects.toBeInstanceOf(GenerationStateError);
+    // ::1 is rejected too: holding the IPv6 loopback port does NOT reserve the
+    // IPv4 127.0.0.1:<port> the pf/manifest/gate stack references (anti-squat hole).
+    await expect(bindEphemeralGatePort("::1")).rejects.toBeInstanceOf(GenerationStateError);
   });
 });

@@ -361,12 +361,17 @@ export function resolveGateRestart(input: {
  * TCB (S5-3). Production (S5-6) supplies a `bind` that starts the real gate.
  */
 export async function bindEphemeralGatePort(host = "127.0.0.1"): Promise<GateBinding> {
-  // Loopback-only by construction: the gate is never reachable off-box. Refuse
-  // any non-loopback host rather than silently binding a wider surface (gate
-  // finding: the param claimed loopback but accepted arbitrary hosts).
-  if (host !== "127.0.0.1" && host !== "::1") {
+  // IPv4-loopback ONLY by construction: the WHOLE exclusive-egress stack is
+  // 127.0.0.1-only -- the pf pass rule (`renderUidAnchorLines`), the manifest
+  // gate CIDR (`GATE_LOOPBACK_CIDR`), and the gate bind (`GATE_BIND_HOST`) are
+  // all IPv4 127.0.0.1. Binding-first on `::1` would NOT reserve the IPv4
+  // `127.0.0.1:<port>` the rest of the stack references (a same-port IPv4 bind
+  // still succeeds), so it would defeat the anti-squat guarantee. Reject
+  // anything but 127.0.0.1 until IPv6 policy/pf/gate support exists (gate
+  // finding: allowing `::1` was an anti-squat hole).
+  if (host !== "127.0.0.1") {
     throw new GenerationStateError(
-      `bind-first helper refuses a non-loopback host ${JSON.stringify(host)} (loopback-only by construction)`,
+      `bind-first helper refuses host ${JSON.stringify(host)} (IPv4 loopback 127.0.0.1 only; the pf/manifest/gate stack is IPv4-only)`,
     );
   }
   const server = net.createServer();
