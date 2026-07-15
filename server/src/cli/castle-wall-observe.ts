@@ -15,8 +15,12 @@
  *                a per-flow prompt).
  *   status       Show whether observe mode is on and how many candidates
  *                are pending review. Tier-3, read-only.
- *   candidates   Re-fold the audit log's denied flows into the candidate
- *                store, then list every pending candidate. Tier-3.
+ *   candidates   Fold the audit log's not-yet-folded denied flows into the
+ *                candidate store (idempotent: a persisted watermark folds
+ *                each recorded flow exactly once, and destinations the live
+ *                verified allowlist already permits are never minted and
+ *                are pruned -- see castle-wall/observe/refresh.ts), then
+ *                list every pending candidate. Tier-3.
  *   promote      Tier-1 FORCED. Synthesizes the selected candidates into
  *                allow rules, fires the SAME non-relaxable approval gate an
  *                MCP-exposed tool would use, and -- ONLY on approval --
@@ -32,7 +36,7 @@
  * PR description).
  */
 
-import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createInterface } from "node:readline/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -65,12 +69,13 @@ import {
 } from "../castle-wall/allowlist/parse.js";
 import {
   ObserveStore,
-  flowEventsFromAuditEntries,
-  foldObservations,
   promoteCandidates,
+  refreshCandidatesFromAudit,
   type CandidateObservation,
   type ObserveGranularity,
   type PromoteSelectionRow,
+  type RefreshAllowlistRead,
+  type RefreshLock,
   type VerifiedManifestRead,
 } from "../castle-wall/observe/index.js";
 
@@ -339,14 +344,59 @@ export async function runObserveCandidates(
   if (!boot) return 1;
 
   if (!noRefresh) {
-    const query = await boot.auditLog.query({
-      layer: "l1",
-      operation_type: "egress_blocked",
-      limit: 100_000,
-    });
-    const events = flowEventsFromAuditEntries(query.entries);
-    const folded = foldObservations(events);
-    await boot.observeStore.mergeObservations(folded);
+    // The idempotent, allowlist-aware refresh chokepoint (sweep finding
+    // R3-1): every audit event folds exactly once (persisted watermark), and
+    // a destination the operator's verified policy already permits is never
+    // minted -- and is pruned if present. See castle-wall/observe/refresh.ts.
+    let outcome;
+    let lockHolderDescription = "";
+    try {
+      outcome = await refreshCandidatesFromAudit({
+        auditLog: boot.auditLog,
+        store: boot.observeStore,
+        readAllowlist: () => readAllowlistForRefresh(boot.fortressPath),
+        lock: observeRefreshFileLock(boot.fortressPath, (holder) => {
+          lockHolderDescription = holder;
+        }),
+        now: new Date(),
+      });
+    } catch (error) {
+      // streamVerifiedChain's strict verification failed: the audit chain
+      // does not verify. Nothing was folded or written (all refresh writes
+      // happen only after a clean verified pass); fail loud, never fold
+      // over an unverified chain.
+      write(
+        err,
+        `Error: could not refresh candidates -- the audit log failed verification (${(error as Error).message}). ` +
+          "Nothing was changed. Run `sanctuary castle-wall audit-verify` to investigate.\n",
+      );
+      return 1;
+    }
+    if (outcome.status === "refresh_in_progress") {
+      write(
+        err,
+        "Error: another `observe candidates` refresh holds this fortress's refresh lock" +
+          (lockHolderDescription ? ` (${lockHolderDescription})` : "") +
+          ". Nothing was changed (a concurrent double-fold would inflate the Seen counts). " +
+          "If the holder is still running, wait for it and re-run. This lock is never broken " +
+          "automatically.\n",
+      );
+      return 1;
+    }
+    if (outcome.status === "allowlist_unverified") {
+      write(
+        err,
+        `Error: could not refresh candidates -- the live allowlist manifest did not verify (${outcome.reason}). ` +
+          "Nothing was changed. Refusing to fold with an unverifiable policy; investigate the egress manifest before reviewing candidates.\n",
+      );
+      return 1;
+    }
+    if (outcome.removed_now_allowed > 0) {
+      write(
+        out,
+        `Removed ${outcome.removed_now_allowed} candidate(s) your policy now permits (already-allowed destinations are never pending review).\n`,
+      );
+    }
   }
 
   const candidates = [...(await boot.observeStore.listCandidates()).values()].sort((a, b) =>
@@ -383,6 +433,139 @@ export async function runObserveCandidates(
     "\nPromote with: sanctuary castle-wall observe promote --destination <host:port> [--destination ...] | --all\n",
   );
   return 0;
+}
+
+/** Lockfile basename for the cross-process refresh mutual exclusion (Codex gate BLOCKER; see castle-wall/observe/refresh.ts guarantee 2). Lives directly under the fortress root (mode 0700). */
+const OBSERVE_REFRESH_LOCK_FILE = ".observe-refresh.lock";
+
+/** True iff `pid` names a live process this user could signal (mirrors the audit write-lock's stale-holder detection in operational/audit-log.ts). */
+function isLockHolderAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user -- still alive.
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Best-effort description of who holds the refresh lock, for the operator-facing contention message. Never throws. */
+async function describeLockHolder(lockPath: string): Promise<string> {
+  try {
+    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as {
+      pid?: unknown;
+      acquired_at?: unknown;
+    };
+    const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+    const at = typeof parsed.acquired_at === "string" ? parsed.acquired_at : "an unknown time";
+    if (pid === null) return `held since ${at} by an unrecorded process`;
+    return isLockHolderAlive(pid)
+      ? `held since ${at} by running process ${pid}`
+      : `held since ${at} by process ${pid}, which is NO LONGER RUNNING -- this lock is almost ` +
+          `certainly stale from a crashed run; verify with \`ps -p ${pid}\` and then remove ${lockPath}`;
+  } catch {
+    return `present but unreadable at ${lockPath}`;
+  }
+}
+
+/**
+ * Cross-process refresh lock: O_EXCL create with pid metadata, NEVER
+ * auto-broken. Two concurrent `observe candidates` invocations are separate
+ * processes, so the in-process lock cannot cover them; whoever loses the
+ * O_EXCL race gets a clean "another refresh is in progress" abort instead of
+ * a double-folded count.
+ *
+ * WHY no automatic stale-lock breaking (Codex two-family gate round 2,
+ * HIGH): any read-check-unlink-retry scheme has a TOCTOU -- a slow breaker
+ * that read the stale file before a peer broke it can unlink the peer's
+ * FRESHLY-created lock, and then two refreshes run concurrently, which is
+ * exactly the double-count this lock exists to prevent. A lock left by a
+ * crashed run is instead surfaced with exact operator guidance (holder pid,
+ * liveness, the file to remove); removal is a deliberate human action, never
+ * a race. Fail toward not folding, never toward folding twice.
+ */
+export function observeRefreshFileLock(
+  fortressPath: string,
+  onContention?: (holderDescription: string) => void,
+): RefreshLock {
+  const lockPath = join(fortressPath, OBSERVE_REFRESH_LOCK_FILE);
+  return {
+    async acquire() {
+      try {
+        const handle = await open(lockPath, "wx", 0o600);
+        try {
+          await handle.writeFile(
+            JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() }),
+          );
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        return async () => {
+          await rm(lockPath, { force: true });
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (onContention) onContention(await describeLockHolder(lockPath));
+        return null;
+      }
+    },
+  };
+}
+
+/**
+ * Read + verify the live allowlist for the refresh chokepoint's
+ * allowlist-aware fold (see castle-wall/observe/refresh.ts).
+ *
+ * A genuinely-absent policy is a verified-EMPTY allowlist (fresh install /
+ * pre-provision fortress: there are no allow rules, so the filter is
+ * vacuous and `observe candidates` keeps working). Anything that EXISTS but
+ * cannot be verified -- a manifest with no pinned key to check it against,
+ * a truncated pinned key, a bad signature, a failed rule hash -- is
+ * `unverified`, which aborts the refresh loud (never a silent unfiltered
+ * fold; WHAT THESE TOOLS MUST NEVER DO #5).
+ */
+export async function readAllowlistForRefresh(fortressPath: string): Promise<RefreshAllowlistRead> {
+  const egressDir = join(fortressPath, "policy", "egress");
+
+  let pinnedPublicKey: Uint8Array;
+  try {
+    const pub = await readFile(join(fortressPath, CASTLE_PINNED_PUBKEY));
+    if (pub.length !== 32) {
+      return {
+        status: "unverified",
+        reason: `pinned public key must be 32 bytes (found ${pub.length})`,
+      };
+    }
+    pinnedPublicKey = new Uint8Array(pub);
+  } catch (error) {
+    if (!isEnoent(error)) {
+      return { status: "unverified", reason: `pinned public key unreadable: ${(error as Error).message}` };
+    }
+    // No pinned key. If no manifest exists either, this fortress simply has
+    // no live allowlist yet -- a verified-empty ruleset. If a manifest DOES
+    // exist with no key to verify it, that is unverifiable, not empty.
+    try {
+      await readFile(join(egressDir, "manifest.json"));
+    } catch (manifestError) {
+      if (isEnoent(manifestError)) return { status: "ok", rules: [] };
+      return {
+        status: "unverified",
+        reason: `manifest unreadable while checking for an unverifiable policy: ${(manifestError as Error).message}`,
+      };
+    }
+    return {
+      status: "unverified",
+      reason: "an egress manifest exists but there is no pinned Castle Wall public key to verify it against",
+    };
+  }
+
+  const read = await readVerifiedManifest(egressDir, pinnedPublicKey);
+  if (read.status === "tampered") {
+    return { status: "unverified", reason: read.reason };
+  }
+  return { status: "ok", rules: read.status === "ok" ? read.rules : [] };
 }
 
 class CastleWallObservePromptApprovalChannel implements ApprovalChannel {
@@ -834,15 +1017,39 @@ export async function runObserveDiscard(
         .filter(([, candidate]) => destinations.includes(destinationLabel(candidate)))
         .map(([key]) => key);
 
-  for (const key of keysToRemove) {
-    await boot.observeStore.removeCandidate(key);
-  }
+  if (keysToRemove.length > 0) {
+    // The discard audit entry is the REVIEW MARKER the refresh chokepoint's
+    // recompute heal depends on to not resurrect discarded candidates from
+    // retained history (castle-wall/observe/refresh.ts guarantee 3; Codex
+    // two-family gate round 2, HIGH). It is therefore written CRITICALLY and
+    // BEFORE the rows are removed: if the append fails, the discard aborts
+    // with the rows intact (fail-closed; the operator retries). A crash
+    // between the append and the removals is harmless -- the marker only
+    // bounds what a recompute may MINT for keys absent from the store, and
+    // the still-present rows heal normally.
+    try {
+      await boot.auditLog.appendCritical({
+        layer: "l1",
+        operation: "castle_wall_observe_discard",
+        identity_id: boot.primary.identity_id,
+        result: "success",
+        details: { discarded_count: keysToRemove.length },
+      });
+    } catch (error) {
+      write(
+        err,
+        `Error: the discard could not be recorded in the audit log (${(error as Error).message}). ` +
+          "Nothing was discarded; the discard record is what prevents a discarded destination " +
+          "from reappearing out of retained history, so it must land first. Re-run after " +
+          "resolving the audit-log failure.\n",
+      );
+      return 1;
+    }
 
-  await bestEffortAudit(boot.auditLog, {
-    identity_id: boot.primary.identity_id,
-    operation: "castle_wall_observe_discard",
-    details: { discarded_count: keysToRemove.length },
-  });
+    for (const key of keysToRemove) {
+      await boot.observeStore.removeCandidate(key);
+    }
+  }
 
   write(out, `Discarded ${keysToRemove.length} candidate(s).\n`);
   return 0;

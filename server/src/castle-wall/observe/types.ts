@@ -125,3 +125,28 @@ export interface ObserveModeState {
   started_at: string | null;
   updated_at: string;
 }
+
+/**
+ * Persisted fold watermark (its own record, DELIBERATELY not a field on
+ * `ObserveModeState`, so no other state writer can ever clobber it): the
+ * highest authenticated audit-chain sequence the refresh chokepoint has
+ * already folded into the candidate store. Every chained event is folded
+ * EXACTLY ONCE across refreshes (sweep finding R3-1: the pre-watermark
+ * engine re-folded the full retained history additively on every refresh,
+ * multiplying `times_seen` and resurrecting promoted/discarded candidates).
+ * The sequence is the hash-chain position `AuditLog.streamVerifiedChain`
+ * authenticates -- append-monotonic and prune-stable, never a skewable
+ * wall-clock timestamp.
+ *
+ * `entry_hash` binds the watermark to the CHAIN IDENTITY, not just a bare
+ * position (Codex gate HIGH-2): it is the verified `entry_hash` of the
+ * chained entry at `folded_through_sequence`. A reset/rebuilt audit chain
+ * that regrows past the old sequence carries a different hash there, so the
+ * refresh detects the mismatch and recomputes instead of silently skipping
+ * the new chain's prefix.
+ */
+export interface FoldWatermark {
+  folded_through_sequence: number;
+  entry_hash: string;
+  updated_at: string;
+}

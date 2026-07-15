@@ -45,41 +45,52 @@ export function flowEventsFromAuditEntries(
   entries: readonly AuditEntry[],
 ): FlowObservationEvent[] {
   const events: FlowObservationEvent[] = [];
-
   for (const entry of entries) {
-    if (entry.operation !== BLOCKED_OPERATION) continue;
-    const details = entry.details;
-    if (!details) continue;
-
-    const agent = details.agent as { id?: unknown; template?: unknown } | undefined;
-    if (!agent || typeof agent.id !== "string" || typeof agent.template !== "string") continue;
-
-    const destination = details.destination as
-      | {
-          host?: unknown;
-          ip?: unknown;
-          port?: unknown;
-          protocol?: unknown;
-          hostname_source?: unknown;
-        }
-      | undefined;
-    if (!destination) continue;
-    if (typeof destination.port !== "number") continue;
-    if (destination.protocol !== "tcp" && destination.protocol !== "udp") continue;
-
-    const host =
-      typeof destination.host === "string" && destination.host.length > 0 ? destination.host : null;
-    const ip = typeof destination.ip === "string" ? destination.ip : "";
-    if (!host && ip.length === 0) continue;
-
-    events.push({
-      timestamp: entry.timestamp,
-      agent: { id: agent.id, template: agent.template },
-      destination: { host, ip, port: destination.port, protocol: destination.protocol },
-      hostname_source: isHostnameSource(destination.hostname_source) ? destination.hostname_source : null,
-      disposition: "denied",
-    });
+    const event = flowEventFromAuditEntry(entry);
+    if (event) events.push(event);
   }
-
   return events;
+}
+
+/**
+ * Adapt ONE raw audit entry, or `null` when it is not an adaptable
+ * `egress_blocked` flow record (wrong operation, or missing required
+ * fields -- skipped, never guessed). Single-entry form of
+ * {@link flowEventsFromAuditEntries}, used by the streaming refresh
+ * chokepoint (`refresh.ts`) so entries are adapted-or-dropped as the
+ * verified chain streams past instead of materializing an `AuditEntry[]`.
+ */
+export function flowEventFromAuditEntry(entry: AuditEntry): FlowObservationEvent | null {
+  if (entry.operation !== BLOCKED_OPERATION) return null;
+  const details = entry.details;
+  if (!details) return null;
+
+  const agent = details.agent as { id?: unknown; template?: unknown } | undefined;
+  if (!agent || typeof agent.id !== "string" || typeof agent.template !== "string") return null;
+
+  const destination = details.destination as
+    | {
+        host?: unknown;
+        ip?: unknown;
+        port?: unknown;
+        protocol?: unknown;
+        hostname_source?: unknown;
+      }
+    | undefined;
+  if (!destination) return null;
+  if (typeof destination.port !== "number") return null;
+  if (destination.protocol !== "tcp" && destination.protocol !== "udp") return null;
+
+  const host =
+    typeof destination.host === "string" && destination.host.length > 0 ? destination.host : null;
+  const ip = typeof destination.ip === "string" ? destination.ip : "";
+  if (!host && ip.length === 0) return null;
+
+  return {
+    timestamp: entry.timestamp,
+    agent: { id: agent.id, template: agent.template },
+    destination: { host, ip, port: destination.port, protocol: destination.protocol },
+    hostname_source: isHostnameSource(destination.hostname_source) ? destination.hostname_source : null,
+    disposition: "denied",
+  };
 }
