@@ -1871,6 +1871,49 @@ export class AuditLog {
   }
 
   /**
+   * Read-only view of the configured FIFO retention caps. Exposed for
+   * calendar-period reporters (the law-firm evidence pack) that must disclose
+   * a covered-window shortfall when size-based retention may have pruned
+   * early-period entries. Returns configuration only; no entries, no keys.
+   */
+  getRetentionConfig(): { maxEntries: number; maxTotalSizeBytes: number } {
+    return {
+      maxEntries: this.maxEntries,
+      maxTotalSizeBytes: this.maxTotalSizeBytes,
+    };
+  }
+
+  /**
+   * Read-only view of the CURRENT on-disk retention usage: the retained entry
+   * count, the total on-disk size in bytes, and whether the log has ever pruned
+   * (a rotation anchor exists). Exposed for calendar-period reporters (the
+   * law-firm evidence pack) so a covered-window shortfall can distinguish
+   * size-cap pruning from genuine inactivity (retention prunes on EITHER the
+   * entry cap OR the size cap). Returns metadata sums only; no entries decrypted,
+   * no keys touched. `everPruned` is best-effort: an unreadable anchor namespace
+   * yields `null` so the caller does not over-claim "never pruned".
+   */
+  async getRetentionUsage(): Promise<{
+    entryCount: number;
+    totalSizeBytes: number;
+    everPruned: boolean | null;
+  }> {
+    const metas = await this.storage.list(AUDIT_NAMESPACE);
+    const totalSizeBytes = metas.reduce((sum, m) => sum + m.size_bytes, 0);
+    let everPruned: boolean | null;
+    try {
+      const anchor = await this.storage.read(
+        AUDIT_CHECKPOINT_NAMESPACE,
+        AUDIT_ROTATION_ANCHOR_KEY
+      );
+      everPruned = anchor !== null;
+    } catch {
+      everPruned = null;
+    }
+    return { entryCount: metas.length, totalSizeBytes, everPruned };
+  }
+
+  /**
    * Eager, bounded-cost read for the always-on posture surface (the home board,
    * its per-panel endpoints, and the SSE live-refresh push).
    *
