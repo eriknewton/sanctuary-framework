@@ -49,6 +49,43 @@ final class ExtensionDispatcherTests: XCTestCase {
         }
     }
 
+    /// Drill Leg 3 (2026-07-15) repro: an XPC signer whose reply block is
+    /// DROPPED (never invoked) and whose error handler also never fires, the
+    /// exact silent-stall the drill observed. The chain's watchdog must convert
+    /// this into a loud failure rather than hang forever with no drop line.
+    final class NeverRepliesAuditProducerSigner: AuditProducerSigning {
+        func signAuditProducerPayload(
+            _ payload: Data,
+            reply: @escaping (Data?, String?) -> Void
+        ) {
+            // Intentionally never calls `reply` (nor an error): the dropped-reply
+            // condition that stranded emission.
+        }
+    }
+
+    /// A signer that replies LATE (after `delay`), to prove a reply arriving
+    /// after the watchdog already fired is a harmless no-op (never double-fires,
+    /// never advances the chain for a flow already reported as dropped).
+    final class DelayedAuditProducerSigner: AuditProducerSigning {
+        let privateKey: Curve25519.Signing.PrivateKey
+        let delay: TimeInterval
+
+        init(privateKey: Curve25519.Signing.PrivateKey, delay: TimeInterval) {
+            self.privateKey = privateKey
+            self.delay = delay
+        }
+
+        func signAuditProducerPayload(
+            _ payload: Data,
+            reply: @escaping (Data?, String?) -> Void
+        ) {
+            let key = privateKey
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                reply(try? key.signature(for: payload), nil)
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     func makeFlow(
@@ -581,5 +618,115 @@ final class ExtensionDispatcherTests: XCTestCase {
             privateKey.publicKey.isValidSignature(signature, for: payload),
             "signature must verify over the exact domain-separated producer bytes"
         )
+    }
+
+    // Drill Leg 3 (2026-07-15): per-flow audit emission stopped SILENTLY because
+    // the XPC sign reply was dropped and neither the reply nor the error handler
+    // fired, so `buildSignedFlowDecision`'s completion never ran -> no emit, no
+    // drop line. The watchdog MUST convert that stall into a loud failure so the
+    // flow surfaces on the existing `path=signing-failure` drop probe instead of
+    // vanishing (AGENTS.md rule 5).
+    func test_auditProducerChain_droppedReply_firesLoudTimeoutFailure() {
+        let signer = NeverRepliesAuditProducerSigner()
+        let chain = AuditProducerChain(signTimeoutSeconds: 0.15)
+        let exp = expectation(description: "timeout failure")
+        var result: Result<IpcMessage, AuditProducerSigningError>?
+
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: makeFlow(),
+            signer: signer
+        ) { r in
+            result = r
+            exp.fulfill()
+        }
+        // The completion must fire (loudly), not hang forever.
+        wait(for: [exp], timeout: 2)
+
+        guard case .failure(let error)? = result else {
+            return XCTFail("dropped reply must surface as a failure, not silence")
+        }
+        // A signer-unavailable failure routes to the dispatcher's DROP-PATH 3,
+        // which logs `[slice-m-audit-drop] path=signing-failure`.
+        guard case .signerUnavailable(let detail) = error else {
+            return XCTFail("expected signerUnavailable, got \(error)")
+        }
+        XCTAssertTrue(
+            detail.contains("did not arrive"),
+            "timeout failure should name the dropped/timed-out reply; got: \(detail)"
+        )
+    }
+
+    func test_auditProducerChain_completionFiresExactlyOnce_onTimeoutThenLateReply() {
+        // A reply that arrives AFTER the watchdog already fired must be a no-op:
+        // never a second completion, and never advance the chain for a flow
+        // already reported dropped.
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let chain = AuditProducerChain(signTimeoutSeconds: 0.1)
+
+        let firstExp = expectation(description: "first completion (timeout)")
+        var completionCount = 0
+        var firstResultIsFailure = false
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: makeFlow(),
+            signer: DelayedAuditProducerSigner(privateKey: privateKey, delay: 0.4)
+        ) { r in
+            completionCount += 1
+            if case .failure = r { firstResultIsFailure = true }
+            firstExp.fulfill()
+        }
+        wait(for: [firstExp], timeout: 2)
+        XCTAssertTrue(firstResultIsFailure, "the timeout must win over the late reply")
+
+        // Give the late reply (0.4s) time to arrive and be discarded.
+        Thread.sleep(forTimeInterval: 0.6)
+        XCTAssertEqual(completionCount, 1, "the late reply must not fire a second completion")
+
+        // The chain must NOT have advanced for the dropped flow: the next signed
+        // flow still uses seq 0 (proving the late reply did not advance the seq).
+        let nextExp = expectation(description: "next flow keeps seq 0")
+        var nextSeq: UInt64?
+        chain.buildSignedFlowDecision(
+            outcome: .allow(matchedRuleId: "r-allow"),
+            flow: makeFlow(),
+            signer: ImmediateAuditProducerSigner(privateKey: privateKey)
+        ) { r in
+            if case .success(.flowDecisionRecorded(let body)) = r {
+                nextSeq = body.producer?.seq
+            }
+            nextExp.fulfill()
+        }
+        wait(for: [nextExp], timeout: 2)
+        XCTAssertEqual(nextSeq, 0, "a dropped/timed-out flow must not advance the producer chain seq")
+    }
+
+    func test_auditProducerChain_successAdvancesSeqAcrossFlows() {
+        // The happy path still advances the chain: two sequential signed flows
+        // get seq 0 then seq 1 (the one-shot guard advances on the winning
+        // success, unchanged behavior).
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let signer = ImmediateAuditProducerSigner(privateKey: privateKey)
+        let chain = AuditProducerChain()
+
+        func signSeq(_ label: String) -> UInt64? {
+            let exp = expectation(description: label)
+            var seq: UInt64?
+            chain.buildSignedFlowDecision(
+                outcome: .allow(matchedRuleId: "r-allow"),
+                flow: makeFlow(),
+                signer: signer
+            ) { r in
+                if case .success(.flowDecisionRecorded(let body)) = r {
+                    seq = body.producer?.seq
+                }
+                exp.fulfill()
+            }
+            wait(for: [exp], timeout: 2)
+            return seq
+        }
+
+        XCTAssertEqual(signSeq("first"), 0)
+        XCTAssertEqual(signSeq("second"), 1)
     }
 }

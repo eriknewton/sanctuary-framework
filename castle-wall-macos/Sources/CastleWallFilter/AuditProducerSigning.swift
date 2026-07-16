@@ -32,7 +32,22 @@ public protocol AuditProducerSigning {
 }
 
 public final class XpcAuditProducerSigner: AuditProducerSigning {
-    public init() {}
+    /// Self-deadline for a single privileged XPC sign call. Drill Leg 3
+    /// (2026-07-15) found the reply can be DROPPED with the proxy error handler
+    /// ALSO not firing; since the old code only ever `invalidate()`d the
+    /// connection from inside those two handlers, a dropped reply leaked one
+    /// privileged `NSXPCConnection` (plus its retained reply-closure graph, mach
+    /// port, and fd) PER stalled flow, indefinitely, in the resource-constrained
+    /// sysext (Opus re-gate F5). This deadline invalidates the connection and
+    /// replies with a timeout if neither handler fires, so a sustained signer
+    /// outage reclaims each connection instead of accumulating them. Kept
+    /// slightly above the chain-level watchdog so the chain reports the loud
+    /// drop first; both are independent one-shots.
+    private let signCallTimeoutSeconds: TimeInterval
+
+    public init(signCallTimeoutSeconds: TimeInterval = 6.0) {
+        self.signCallTimeoutSeconds = signCallTimeoutSeconds
+    }
 
     public func signAuditProducerPayload(
         _ payload: Data,
@@ -46,21 +61,52 @@ public final class XpcAuditProducerSigner: AuditProducerSigning {
             NSXPCInterface(with: CastleWallSignerXPCProtocol.self)
         connection.resume()
 
-        let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+        // Fire-EXACTLY-once terminator shared by the reply, the proxy error
+        // handler, and the self-deadline. EVERY path invalidates the connection
+        // (reclaiming it in the success, error, AND dropped-reply cases), then
+        // delivers the reply once. Guarantees no connection leak and no double
+        // reply regardless of which of the three fires.
+        let replyLock = NSLock()
+        var replied = false
+        let finishOnce: (Data?, String?) -> Void = { signature, error in
+            replyLock.lock()
+            if replied {
+                replyLock.unlock()
+                return
+            }
+            replied = true
+            replyLock.unlock()
             connection.invalidate()
-            reply(nil, "audit producer helper unreachable: \(error.localizedDescription)")
+            reply(signature, error)
+        }
+
+        // Cancellable self-deadline (F6): a fast success cancels it immediately
+        // rather than retaining the closure graph for the full timeout.
+        let deadline = DispatchWorkItem {
+            finishOnce(
+                nil,
+                "audit producer sign call timed out; connection reclaimed"
+            )
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(
+            deadline: .now() + signCallTimeoutSeconds,
+            execute: deadline
+        )
+
+        let proxy = connection.remoteObjectProxyWithErrorHandler { error in
+            finishOnce(nil, "audit producer helper unreachable: \(error.localizedDescription)")
         }
         guard let signer = proxy as? CastleWallSignerXPCProtocol else {
-            connection.invalidate()
-            reply(nil, "audit producer helper proxy unavailable")
+            deadline.cancel()
+            finishOnce(nil, "audit producer helper proxy unavailable")
             return
         }
         signer.sign(
             payload: payload,
             purpose: SignerConstants.SignPurpose.auditProducer
         ) { signature, error in
-            connection.invalidate()
-            reply(signature, error)
+            deadline.cancel()
+            finishOnce(signature, error)
         }
     }
 }
@@ -71,10 +117,37 @@ public final class AuditProducerChain {
     private let stateQueue = DispatchQueue(
         label: "ai.sanctuaryprotocol.castle-wall.audit-producer-chain"
     )
+    /// Watchdog deadline for a single sign call's completion. Drill Leg 3
+    /// (2026-07-15) found per-flow audit emission stops SILENTLY ~350ms after
+    /// bind: the XPC sign reply from the root audit-producer helper stopped
+    /// arriving and NEITHER the reply block NOR the proxy error handler fired,
+    /// so `buildSignedFlowDecision`'s completion never ran, so `notifyVerdict`
+    /// emitted nothing AND logged no drop line (the wall kept enforcing, the
+    /// record of it vanished). NSXPC does not guarantee a reply block runs if
+    /// the connection is torn down mid-call, so a per-call watchdog is required
+    /// to bound it: if neither reply nor error arrives within this window, the
+    /// completion is fired with a signing-failure so the flow surfaces on the
+    /// EXISTING loud drop path (`[slice-m-audit-drop] path=signing-failure`)
+    /// instead of vanishing (AGENTS.md rule 5: never silently degrade). The
+    /// wedged connection itself is reclaimed by `XpcAuditProducerSigner`'s own
+    /// self-deadline (see there), so a sustained outage neither goes silent nor
+    /// leaks a connection per flow; each subsequent flow opens a fresh one.
+    private let signTimeoutSeconds: TimeInterval
+    /// Queue the watchdog timer fires on. MUST be distinct from `stateQueue`
+    /// (the completion path takes `stateQueue.sync`, which would deadlock if the
+    /// watchdog ran on it).
+    private let timeoutQueue = DispatchQueue(
+        label: "ai.sanctuaryprotocol.castle-wall.audit-producer-chain.timeout"
+    )
 
-    public init(nextSeq: UInt64 = 0, priorHashHex: String? = nil) {
+    public init(
+        nextSeq: UInt64 = 0,
+        priorHashHex: String? = nil,
+        signTimeoutSeconds: TimeInterval = 5.0
+    ) {
         self.nextSeq = nextSeq
         self.priorHashHex = priorHashHex
+        self.signTimeoutSeconds = signTimeoutSeconds
     }
 
     public func buildSignedFlowDecision(
@@ -101,13 +174,59 @@ public final class AuditProducerChain {
             return
         }
 
-        signer.signAuditProducerPayload(pending.signingBytes) { [weak self] signature, error in
+        // Fire-EXACTLY-once guard shared by the real reply and the watchdog. On
+        // the WINNING success it advances the producer chain (seq/prior-hash);
+        // a lost/late reply is a no-op, so the chain never advances for a flow
+        // that was reported as dropped (the NEXT flow reuses the same seq, which
+        // is correct: nothing was sent for the dropped one).
+        // Fire-EXACTLY-once guard shared by the real reply and the watchdog. On
+        // the WINNING success it advances the producer chain (seq/prior-hash);
+        // a lost/late reply is a no-op, so the chain never advances for a flow
+        // that was reported as dropped (the NEXT flow reuses the same seq, which
+        // is correct: nothing was sent for the dropped one). The watchdog is a
+        // plain `asyncAfter` (not a cancellable work item): on a fast success it
+        // still fires at the deadline but is an immediate no-op via `didComplete`,
+        // so its only cost is holding this small closure for the bounded timeout
+        // (never a leak). A cancellable work item was rejected because cancelling
+        // it from `finish` would require `finish` to capture the item, forming a
+        // retain cycle that drains no earlier than the same deadline.
+        let completionLock = NSLock()
+        var didComplete = false
+        let finish: (Result<IpcMessage, AuditProducerSigningError>, (seq: UInt64, hash: String)?) -> Void = { [weak self] result, advance in
+            completionLock.lock()
+            if didComplete {
+                completionLock.unlock()
+                return
+            }
+            didComplete = true
+            completionLock.unlock()
+            if let advance, let self {
+                self.stateQueue.sync {
+                    if self.nextSeq == advance.seq {
+                        self.nextSeq = advance.seq + 1
+                        self.priorHashHex = advance.hash
+                    }
+                }
+            }
+            completion(result)
+        }
+
+        timeoutQueue.asyncAfter(deadline: .now() + signTimeoutSeconds) { [signTimeoutSeconds] in
+            finish(
+                .failure(.signerUnavailable(
+                    "audit-producer sign reply did not arrive within \(signTimeoutSeconds)s (helper unreachable or XPC reply dropped)"
+                )),
+                nil
+            )
+        }
+
+        signer.signAuditProducerPayload(pending.signingBytes) { signature, error in
             if let error {
-                completion(.failure(.signerUnavailable(error)))
+                finish(.failure(.signerUnavailable(error)), nil)
                 return
             }
             guard let signature, !signature.isEmpty else {
-                completion(.failure(.emptySignature))
+                finish(.failure(.emptySignature), nil)
                 return
             }
             let producer = AuditProducerSignatureBody(
@@ -126,13 +245,10 @@ public final class AuditProducerChain {
                 recordedAt: pending.body.recordedAt,
                 producer: producer
             )
-            self?.stateQueue.sync {
-                if self?.nextSeq == pending.seq {
-                    self?.nextSeq = pending.seq + 1
-                    self?.priorHashHex = pending.eventHashHex
-                }
-            }
-            completion(.success(.flowDecisionRecorded(signedBody)))
+            finish(
+                .success(.flowDecisionRecorded(signedBody)),
+                (pending.seq, pending.eventHashHex)
+            )
         }
     }
 
