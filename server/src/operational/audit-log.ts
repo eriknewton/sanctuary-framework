@@ -9,7 +9,9 @@
  * can inspect what their agent has done.
  */
 
-import { mkdir, open, readFile, rm } from "node:fs/promises";
+import { mkdir, open, readFile, rm, link, stat, unlink } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { uptime as osUptime } from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -702,6 +704,24 @@ const AUDIT_INTEGRITY_ALERT_KEY = "audit-integrity-alert.log";
 const AUDIT_WRITE_LOCK_FILE = ".audit-write.lock";
 const AUDIT_WRITE_LOCK_TIMEOUT_MS = 5_000;
 const AUDIT_WRITE_LOCK_RETRY_MS = 100;
+// Drill-found (Leg 5, MBA, 2026-07-15): a 0-byte / unparseable audit lock that
+// carries neither `pid` nor `acquired_at` cannot be proven stale by the two
+// content-based proofs in `breakStaleAuditLock`, so a torn acquire (crash
+// between file-create and stamp under the old open-then-write path) stranded a
+// permanently unbreakable lock. A lock with NO usable id content whose mtime
+// exceeds this generous age bound is provably not a live holder: a legitimate
+// holder ALWAYS writes its stamp before doing any work (and, since the
+// atomic-acquire fix below, the lock file never exists without its full stamp),
+// and no legitimate hold ever approaches this bound (holds are sub-second; the
+// contention timeout above is 5s). The bound only ever clears an id-less lock,
+// never a content-bearing one, so it cannot break a live lock a real holder
+// stamped. Ten minutes is far beyond any conceivable hold yet far below
+// "survived a reboot" (already covered by the boot-time proof).
+const AUDIT_WRITE_LOCK_IDLESS_STALE_MS = 10 * 60 * 1_000;
+// Process-local monotonic counter for unique audit-lock temp-file names during
+// the atomic acquire (paired with pid + a wall-clock component). Never
+// persisted; collision-free within a process and across concurrent processes.
+let auditLockTempCounter = 0;
 // Read-consistency backstop. A reader does NOT take the write lock (audit reads
 // must work even if a crashed writer stranded a lock, and must never be blockable
 // by a planted lock file), so it can observe a torn cut while a rotation is
@@ -816,7 +836,14 @@ export class AuditPersistenceError extends Error {
 export class AuditLockContentionError extends Error {
   constructor(readonly lockPath: string) {
     super(
-      `audit write blocked: another writer held the lock for >5s; check for stuck processes; inspect with: lsof ${lockPath}`
+      `audit write blocked: the audit write lock at '${lockPath}' was held for >5s. ` +
+        `The lock file records the holder's pid and acquired_at; inspect it to see who ` +
+        `holds it. If a Sanctuary process is genuinely running, wait for it to finish. ` +
+        `If none is, the lock is a stale/torn leftover from a crashed writer: stop all ` +
+        `Sanctuary processes for this fortress, then delete the lock file at that path ` +
+        `and retry. (This lock is not held open by a file descriptor during the write, ` +
+        `so lsof may show no holder even for a legitimately held lock; trust the ` +
+        `recorded pid + a process check, not lsof.)`
     );
     this.name = "AuditLockContentionError";
   }
@@ -1471,6 +1498,21 @@ export class AuditLog {
   private entries: AuditEntry[] = [];
   private chainEntries: Array<{ sequence: number; entry_hash: string }> = [];
   private counter = 0;
+  /**
+   * Per-instance random suffix mixed into every persisted entry key. Two
+   * DISTINCT writers (two processes, or two `AuditLog` instances in one process)
+   * that momentarily both believe they hold the write lock could otherwise
+   * persist the SAME `entry-<seq>-<ms>-<counter>` key in the same millisecond
+   * with both counters at 0, and the atomic rename would silently OVERWRITE one
+   * of the two forked writes at the same path, leaving no second file for the
+   * chain verifier to flag as a fork (Codex re-gate, 2026-07-15). A per-instance
+   * nonce makes their keys distinct, so a double-acquire always leaves TWO files
+   * at the same sequence, which the contiguous-sequence walk detects as
+   * `sequence_gap_or_reorder`/`prev_hash_mismatch` (fail closed, never a silent
+   * fork). The key's `^entry-<20-digit-seq>-` prefix (the only part any reader
+   * parses via `parseEntryKeySequence`) is unchanged, so this is parse- and
+   * sort-compatible with existing fortresses. */
+  private readonly instanceKeyNonce = randomBytes(6).toString("hex");
   private readonly maxTotalSizeBytes: number;
   private readonly maxEntries: number;
   /**
@@ -1870,7 +1912,7 @@ export class AuditLog {
           timestamp: normalized.timestamp,
           encrypted_payload_bytes: encryptedPayloadBytes,
         };
-        const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}`;
+        const key = `entry-${String(sequence).padStart(20, "0")}-${Date.now()}-${this.counter++}-${this.instanceKeyNonce}`;
         const persistedBytes = stringToBytes(JSON.stringify(envelope));
         try {
           await this.writeAuditEntryBytes(key, persistedBytes);
@@ -3393,18 +3435,15 @@ export class AuditLog {
     let acquired = false;
     while (!acquired) {
       try {
-        const handle = await open(this.auditWriteLockPath, "wx", 0o600);
-        try {
-          await handle.writeFile(
-            JSON.stringify({
-              pid: process.pid,
-              acquired_at: new Date().toISOString(),
-            })
-          );
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
+        // Atomic acquire (drill-found fix, Leg 5, MBA 2026-07-15): stamp a fully
+        // populated lock into a temp file (with `pid` + `acquired_at`), fsync it,
+        // then `link()` it into place. `link` fails with EEXIST if the lock is
+        // already held, giving the same mutual-exclusion guarantee as `open(wx)`,
+        // but the visible lock file NEVER exists in a content-less state; there
+        // is no create-then-stamp window in which a crash can strand a 0-byte
+        // lock its own staleness-prover cannot clear. A crash before the `link`
+        // leaves only the temp file (cleaned up below / ignored by the prover).
+        await this.atomicAcquireAuditLock(this.auditWriteLockPath);
         acquired = true;
       } catch (err) {
         const code =
@@ -3435,27 +3474,189 @@ export class AuditLog {
   }
 
   /**
+   * Atomically create the audit write lock already carrying its `{pid,
+   * acquired_at}` stamp, or throw `EEXIST` if it is already held.
+   *
+   * Drill-found fix (Leg 5, MBA 2026-07-15): the prior acquire did
+   * `open(path,"wx")` (which creates the file EMPTY) and only THEN wrote the
+   * stamp. A crash / kill -9 / power-loss in that window stranded a 0-byte lock,
+   * and `breakStaleAuditLock` (which proves staleness from `pid`/`acquired_at`)
+   * cannot clear a content-less file, so the fortress was permanently bricked
+   * with a misleading "another writer holds the lock". This closes the window:
+   * the fully-stamped payload is written + fsync'd to a temp file first, then
+   * `link()`-ed into place. `link` is atomic and fails with EEXIST when the lock
+   * already exists (same mutual exclusion as `open(wx)`), so the visible lock
+   * file only ever exists WITH its stamp. A crash before the `link` leaves at
+   * most an orphan temp file, which is cleaned up here and never consulted by
+   * the staleness prover.
+   */
+  private async atomicAcquireAuditLock(lockPath: string): Promise<void> {
+    // The temp name uses a CRYPTO-RANDOM component (not just pid + time +
+    // counter) so it is unpredictable: combined with the O_EXCL (`"wx"`) create
+    // below and the operator-owned 0700 audit dir it lives in, an attacker
+    // cannot pre-create a symlink at a guessable temp path to redirect the write
+    // (CodeQL js/insecure-temporary-file). The pid + counter are retained only
+    // for human-readable provenance in a crash-orphan.
+    const tempPath =
+      `${lockPath}.acquire.${process.pid}.${(auditLockTempCounter++).toString(36)}.` +
+      `${randomBytes(12).toString("hex")}.tmp`;
+    let tempCreated = false;
+    try {
+      const handle = await open(tempPath, "wx", 0o600);
+      tempCreated = true;
+      try {
+        await handle.writeFile(
+          JSON.stringify({
+            pid: process.pid,
+            acquired_at: new Date().toISOString(),
+          })
+        );
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      // Atomic publish: EEXIST here means the lock is already held; propagate it
+      // so the caller's contention/break loop handles it exactly as before.
+      await link(tempPath, lockPath);
+    } finally {
+      if (tempCreated) {
+        // The temp name is no longer needed whether the link succeeded, the link
+        // threw, or the write/sync/close between them threw: `link` created a
+        // second name for the same inode (so `lockPath` keeps it), and every
+        // other path leaves only the orphan temp to reclaim. Cleaning up on the
+        // whole post-create range (not just after a successful stamp) prevents
+        // orphan-temp litter accumulating in the audit dir on partial failures.
+        await unlink(tempPath).catch(() => undefined);
+      }
+    }
+  }
+
+  /**
+   * Remove `lockPath` ONLY if it still resolves to the SAME inode
+   * (`dev`+`ino`) that {@link breakStaleAuditLock} just proved stale, returning
+   * true iff the proven-stale file was removed (or had already vanished).
+   *
+   * Pathname-TOCTOU guard (Codex re-gate, 2026-07-15): break-by-path can, under
+   * concurrent acquirers, delete a DIFFERENT file than the one proven stale: a
+   * racing acquirer may have already broken the stale lock and published a fresh
+   * live lock at the same path, which a delayed `rm(lockPath)` would then
+   * clobber, letting two writers believe they hold the lock. Re-checking inode
+   * identity immediately before removal rejects exactly that case (a fresh lock
+   * has a new inode). The residual window between this re-`stat` and the `rm` is
+   * a couple of syscalls; any double-acquire it could still permit is caught by
+   * the hash-chain's contiguous-sequence verification on the next load (fail
+   * closed as a detected integrity finding, never a silent fork).
+   */
+  private async unlinkIfSameInode(
+    lockPath: string,
+    proven: Stats
+  ): Promise<boolean> {
+    let current: Stats;
+    try {
+      current = await stat(lockPath);
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      // Already gone: another writer removed the proven-stale lock; effectively
+      // broken from our perspective. Anything else: cannot safely remove.
+      if (code === "ENOENT") return true;
+      return false;
+    }
+    if (current.dev !== proven.dev || current.ino !== proven.ino) {
+      // A different file object now occupies the path (a racing acquirer already
+      // broke the stale lock and published a fresh one). Do NOT remove it.
+      return false;
+    }
+    await rm(lockPath, { force: true });
+    return true;
+  }
+
+  /**
    * Break the audit-write lock iff it is PROVABLY stale, returning true when a
-   * stale lock was removed. Staleness is proven two ways, both robust:
+   * stale lock was removed. Staleness is proven three ways, all robust:
    *
    *   - The lock's `acquired_at` predates the current system boot. A lock that
    *     survived a reboot is definitionally orphaned, and this is immune to PID
-   *     reuse (the recorded PID may now belong to an unrelated process).
+   *     reuse (the recorded PID may now belong to an unrelated process, INCLUDING
+   *     this very process: after a reboot the OS can hand us the dead holder's
+   *     old pid, so this proof is checked BEFORE the self-pid guard).
+   *   - The recorded pid is OURS but `acquired_at` predates THIS process's start
+   *     (a reused-self-pid orphan): we had not started when it was stamped, so it
+   *     cannot be a lock we hold. Uses `process.uptime()` (no `uv_uptime`
+   *     syscall), so it breaks the orphan even when boot time is unavailable in a
+   *     confined-uid sandbox (Opus re-gate NEW-1, 2026-07-15).
    *   - The recorded holder PID is not alive. Covers a same-boot crash / kill
    *     before the PID has been reused.
+   *   - Drill-found (Leg 5, MBA 2026-07-15): the lock is a genuinely EMPTY
+   *     (0-byte) file (the exact torn-acquire artifact) AND its file mtime
+   *     predates boot OR exceeds {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS}. A
+   *     legitimate holder always stamps `{pid, acquired_at}` (and, since the
+   *     atomic-acquire fix, the lock file never exists content-less), so a
+   *     0-byte lock can only be a torn acquire from an old binary or an
+   *     out-of-band tool. Gated on `size === 0` (not merely "no id parsed"): a
+   *     NON-empty but unparseable lock stays fail-closed, since it could be a
+   *     live holder writing a format this build does not understand.
    *
    * A lock held by a live process acquired during this boot is left untouched
-   * (legitimate contention). An unreadable / corrupt / pid-less lock cannot be
-   * proven stale, so it is also left untouched (fail-safe: never break a lock we
-   * cannot prove is dead). Fixes the daemon-cannot-restart-after-reboot defect
-   * surfaced by the A1 acceptance drill (2026-06-04, reboot 2).
+   * (legitimate contention). A lock that carries an id but cannot be proven
+   * stale, or a non-empty lock this build cannot parse, is left untouched
+   * (fail-safe: never break a lock we cannot prove is dead). Every removal goes
+   * through {@link unlinkIfSameInode} so a racing acquirer's fresh lock is never
+   * clobbered by a delayed break. Fixes the daemon-cannot-restart-after-reboot
+   * defect (A1 drill 2026-06-04, reboot 2) and the permanently-bricking 0-byte
+   * lock (MBA custody drill 2026-07-15).
+   *
+   * Availability limitation (documented, not a proof): a 0-byte lock with a
+   * FUTURE mtime is deliberately NOT broken here (it neither predates boot nor
+   * exceeds the age bound). Planting such a file requires fortress-uid write
+   * access, i.e. prior full compromise, at which point the attacker could
+   * destroy the audit log directly; this fallback is an availability aid for
+   * honest torn acquires, not a defense against a uid-level adversary.
    */
   private async breakStaleAuditLock(lockPath: string): Promise<boolean> {
+    // Capture the identity + metadata AND the content of the EXACT file we are
+    // about to reason about from a SINGLE open file descriptor: `fstat` + read
+    // on one fd is a consistent snapshot, so the metadata (inode, size, mtime)
+    // and the parsed `{pid, acquired_at}` always describe the same file object.
+    // This closes the stat->read TOCTOU a separate path-based `stat()` then
+    // `readFile()` would open (CodeQL js/file-system-race), and the captured
+    // inode is re-verified by `unlinkIfSameInode` before the eventual removal so
+    // a racing acquirer's fresh lock is never clobbered.
+    let proven: Stats;
+    let rawContent: string;
+    let handle: Awaited<ReturnType<typeof open>>;
+    try {
+      handle = await open(lockPath, "r");
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      // Vanished: another writer released it; retry. Otherwise (e.g. EACCES):
+      // cannot inspect, cannot prove stale.
+      if (code === "ENOENT") return true;
+      return false;
+    }
+    try {
+      proven = await handle.stat();
+      rawContent = await handle.readFile("utf8");
+    } catch (err) {
+      const code =
+        err instanceof Error && "code" in err
+          ? String((err as NodeJS.ErrnoException).code)
+          : "";
+      if (code === "ENOENT") return true;
+      return false;
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+
     let holderPid: number | undefined;
     let acquiredAtMs: number | undefined;
     try {
-      const raw = await readFile(lockPath, "utf8");
-      const parsed = JSON.parse(raw) as { pid?: unknown; acquired_at?: unknown };
+      const parsed = JSON.parse(rawContent) as { pid?: unknown; acquired_at?: unknown };
       if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid)) {
         holderPid = parsed.pid;
       }
@@ -3463,30 +3664,67 @@ export class AuditLog {
         const t = Date.parse(parsed.acquired_at);
         if (!Number.isNaN(t)) acquiredAtMs = t;
       }
-    } catch (err) {
-      const code =
-        err instanceof Error && "code" in err
-          ? String((err as NodeJS.ErrnoException).code)
-          : "";
-      // Vanished between open() and read(): another writer released it; retry.
-      if (code === "ENOENT") return true;
-      // Unreadable / corrupt content: cannot prove staleness — do not break.
-      return false;
+    } catch {
+      // Empty or non-JSON content: no id to parse. Handled by the 0-byte
+      // fallback below (only when genuinely empty); non-empty stays fail-closed.
     }
-
-    if (holderPid === process.pid) return false;
 
     const bootTimeMs = currentBootTimeMs();
     const predatesBoot =
       acquiredAtMs !== undefined &&
       bootTimeMs !== undefined &&
       acquiredAtMs < bootTimeMs;
-    const holderDead = holderPid !== undefined && !isProcessAlive(holderPid);
-    if (!predatesBoot && !holderDead) return false;
+    // A lock whose recorded pid is OURS but whose acquired_at predates our own
+    // process start cannot be a lock this process holds (we had not started when
+    // it was stamped), so it is a reused-pid orphan. `process.uptime()` needs no
+    // `uv_uptime` syscall, so this proof holds even in the confined-uid sandbox
+    // that can leave `currentBootTimeMs()` undefined; without it, a restarted
+    // fixed-role daemon that reclaims its old pid across a reboot would re-brick
+    // exactly the way the boot proof is meant to prevent (Opus re-gate NEW-1,
+    // 2026-07-15). Sound because a pid is unique among LIVE processes: a lock
+    // carrying our pid is either ours (stamped at/after our start) or a dead
+    // predecessor's (stamped before), never a concurrent foreign live holder.
+    const processStartMs = currentProcessStartMs();
+    const reusedSelfPidOrphan =
+      holderPid === process.pid &&
+      acquiredAtMs !== undefined &&
+      processStartMs !== undefined &&
+      acquiredAtMs < processStartMs;
 
-    // Best-effort removal; ignore a race where another writer already cleared it.
-    await rm(lockPath, { force: true });
-    return true;
+    // A lock whose OWN acquired_at predates this boot cannot belong to any live
+    // process, INCLUDING this one (we started after boot). Break it regardless
+    // of the recorded pid, and BEFORE the self-pid guard: after a reboot the OS
+    // can reuse the dead holder's pid as ours, and a self-pid short-circuit here
+    // would otherwise refuse to break a genuinely orphaned lock (Codex re-gate,
+    // 2026-07-15).
+    if (predatesBoot || reusedSelfPidOrphan) {
+      return this.unlinkIfSameInode(lockPath, proven);
+    }
+
+    // Our OWN live lock (our pid, stamped at/after our start): never break it.
+    if (holderPid === process.pid) return false;
+
+    if (holderPid !== undefined && !isProcessAlive(holderPid)) {
+      return this.unlinkIfSameInode(lockPath, proven);
+    }
+
+    // 0-byte fallback: a genuinely EMPTY lock carries no id to prove liveness
+    // from, so the pid/boot proofs above can never clear it (the exact
+    // 0-byte-lock brick). It is provably NOT a live holder when its file mtime
+    // predates boot (survived a reboot) or exceeds a generous age bound no
+    // legitimate sub-second hold approaches. Gated on `size === 0` so a
+    // content-bearing lock (parseable or not) is NEVER cleared this way.
+    if (proven.size === 0) {
+      const mtimeMs = proven.mtimeMs;
+      const mtimePredatesBoot = bootTimeMs !== undefined && mtimeMs < bootTimeMs;
+      const exceedsIdlessAgeBound =
+        Date.now() - mtimeMs > AUDIT_WRITE_LOCK_IDLESS_STALE_MS;
+      if (mtimePredatesBoot || exceedsIdlessAgeBound) {
+        return this.unlinkIfSameInode(lockPath, proven);
+      }
+    }
+
+    return false;
   }
 
   private async freshenChainStateFromDisk(): Promise<void> {
@@ -4508,7 +4746,26 @@ function currentBootTimeMs(): number | undefined {
     return Date.now() - osUptime() * 1000;
   } catch {
     // Some sandboxed child processes cannot call uv_uptime. In that case the
-    // lock is not proven stale by boot time; PID liveness can still prove it.
+    // lock is not proven stale by boot time; PID liveness (and the
+    // process-start proof below) can still prove it.
+    return undefined;
+  }
+}
+
+/**
+ * Wall-clock time this Node PROCESS started, in ms. Unlike
+ * {@link currentBootTimeMs}, `process.uptime()` is process-local and needs no
+ * `uv_uptime` syscall, so it survives the confined-uid sandbox that can block
+ * `os.uptime()`. Used ONLY as the reused-self-pid discriminator: a lock whose
+ * recorded pid equals ours but whose `acquired_at` predates our own start
+ * cannot be a lock this process holds (we had not started when it was stamped),
+ * so it is a reused-pid orphan and must be breakable even when boot time is
+ * unavailable (drill-follow-up, Opus re-gate NEW-1, 2026-07-15).
+ */
+function currentProcessStartMs(): number | undefined {
+  try {
+    return Date.now() - process.uptime() * 1000;
+  } catch {
     return undefined;
   }
 }
