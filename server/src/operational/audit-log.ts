@@ -238,6 +238,34 @@ const AUDIT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
 const AUDIT_ROTATION_ANCHOR_KEY = "__rotation_anchor";
 const AUDIT_HEAD_ANCHOR_KEY = "__head_anchor";
 const AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY = "audit-head-anchor-established-v1";
+// F2 Option A (Finding 1, adversarial gate 2026-07-15): an OPERATOR-provenance
+// marker that records "the operator has written at least one POST-SPLIT suffix
+// head anchor (an entry above the sealed tip)". It is a NEW key that no pre-#929
+// daemon ever wrote, and the post-#929 daemon's `_meta` is remapped to
+// `_audit-daemon_meta`, so its presence is UNSPOOFABLY operator-established. It
+// discriminates the two states that otherwise look identical from surviving
+// disk (chain == sealed region only + an unreadable `__head_anchor`): a genuine
+// just-migrated armed box (marker ABSENT, benign, suppress) versus a fortress
+// whose post-split suffix was ERASED and whose anchor was made unreadable to
+// launder it (marker PRESENT, tamper, fail closed). Without it, the unreadable
+// legacy-anchor suppression could hide a full-suffix truncation.
+//
+// RESIDUAL (documented, irreducible at the filesystem-durability tier): a
+// directory-write attacker who ALSO deletes this operator-owned marker returns
+// `read` -> null -> "not established" -> suppression, re-opening the full-suffix
+// laundering. This is (a) strictly narrower than the pre-fix single-chmod heal
+// (the marker raises the attack from "hide the anchor" to "hide the anchor AND
+// erase the whole suffix AND delete this marker"), and (b) the SAME co-deletable-
+// witness class the module already accepts for the whole-log case
+// (`AUDIT_HEAD_ANCHOR_ESTABLISHED_KEY` + `isEstablishedAuditStore`: delete every
+// entry + that marker + all checkpoints and a truncation-to-empty likewise reads
+// as a legitimate first boot). No non-co-deletable on-disk witness of a suffix
+// can exist once the entries, checkpoints, anchor, and marker all live in the
+// operator-writable store; closing it requires boot-anchored / externally-
+// attested state (Secure Enclave / TPM / remote attestation), which is a
+// separate build and out of scope for the mint unblock.
+const AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY =
+  "audit-post-split-suffix-established-v1";
 // Distinctive envelope marker so a MAC'd rotation anchor is unambiguously
 // distinguished from a bare/marker-stripped record (mirrors F1's state-meta MAC).
 const AUDIT_ROTATION_ANCHOR_MARKER = "__sanctuary_audit_rotation_anchor_v1";
@@ -1234,6 +1262,35 @@ function parseEntryKeySequence(key: string): number | null {
   return Number.isSafeInteger(seq) ? seq : null;
 }
 
+/** Parse the zero-padded checkpoint sequence embedded in an `audit-checkpoint-`
+ * / `legacy-anchor-` storage key (`${kind}-${20-digit-sequence}`, built by
+ * `writeCheckpointRecord`). Returns null for any key that does not match, which
+ * callers treat as "not classifiable by sequence" (never sequence 0). Lets the
+ * operator decide a checkpoint sits in the sealed legacy region from the
+ * UNENCRYPTED key alone, without reading the (possibly root-owned, unreadable)
+ * file. */
+function parseCheckpointKeySequence(key: string): number | null {
+  const match = /-(\d{20})$/.exec(key);
+  if (!match) return null;
+  const seq = Number(match[1]);
+  return Number.isSafeInteger(seq) ? seq : null;
+}
+
+/** True iff a filesystem error is a privilege denial (EACCES/EPERM), i.e. "this
+ * process cannot open the file at its current privilege", as opposed to a
+ * corruption / IO / not-found condition. F2: on an armed box the legacy audit
+ * checkpoint/anchor files a pre-split ROOT daemon wrote are root-owned 0600, so
+ * the operator uid's read throws EACCES; that is the contamination case the
+ * split boundary re-routes, distinct from a genuine tamper/IO fault which must
+ * still fail closed. */
+function isPermissionError(err: unknown): boolean {
+  const code =
+    err instanceof Error && "code" in err
+      ? String((err as NodeJS.ErrnoException).code)
+      : "";
+  return code === "EACCES" || code === "EPERM";
+}
+
 // ── F2 sealed-region verifier (chokepoint core) ────────────────────────────
 //
 // BLOCKER-1 (adversarial re-gate round 3, 2026-07-14): the routine load SKIPS
@@ -1513,6 +1570,15 @@ export class AuditLog {
    * parses via `parseEntryKeySequence`) is unchanged, so this is parse- and
    * sort-compatible with existing fortresses. */
   private readonly instanceKeyNonce = randomBytes(6).toString("hex");
+  /** F2 Finding 1: the sealed split-boundary tip observed on the last load (0
+   * when no valid boundary). Cached so the append path can tell a post-split
+   * SUFFIX entry (`sequence > cachedSealedTip`) from a sealed-region one without
+   * re-reading the boundary per append. */
+  private cachedSealedTip = 0;
+  /** F2 Finding 1: in-memory guard so the post-split-suffix-established marker is
+   * written at most once per instance (it is idempotent, but this avoids a
+   * `_meta` write on every suffix append). */
+  private postSplitSuffixMarkerEnsured = false;
   private readonly maxTotalSizeBytes: number;
   private readonly maxEntries: number;
   /**
@@ -1921,6 +1987,32 @@ export class AuditLog {
             await this.verifyPersistedBytes(key, persistedBytes);
           }
           await this.writeHeadAnchor(sequence, entryHash);
+          // F2 Finding 1: the FIRST time this operator instance persists a
+          // post-split SUFFIX entry (above the sealed tip) under boundary
+          // consultation, record the operator-provenance "suffix established"
+          // marker. Thereafter an unreadable/erased head anchor with the suffix
+          // gone is proven tamper (fail closed), not a benign just-migrated box.
+          // Best-effort + off the durability-critical path: a failure to stamp
+          // it must never brick an append (worst case the next append retries);
+          // the marker only tightens Finding 1's full-suffix-erasure case, which
+          // the `sequence > tip` gate already covers for surviving suffixes.
+          if (
+            this.consultSplitBoundary &&
+            !this.postSplitSuffixMarkerEnsured &&
+            sequence > this.cachedSealedTip &&
+            this.cachedSealedTip > 0
+          ) {
+            try {
+              await this.storage.write(
+                "_meta",
+                AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY,
+                stringToBytes("1")
+              );
+              this.postSplitSuffixMarkerEnsured = true;
+            } catch {
+              // Non-fatal; retried on the next suffix append.
+            }
+          }
         } catch (err) {
           throw toAuditPersistenceError(err);
         }
@@ -2543,11 +2635,21 @@ export class AuditLog {
   }
 
   private async loadHeadAnchor(
-    findings: AuditIntegrityFinding[]
+    findings: AuditIntegrityFinding[],
+    // F2 Option A: whether a VALID split boundary seals a legacy region. On an
+    // armed box the legacy `__head_anchor` was written by a pre-split ROOT
+    // daemon and is root-owned 0600, so the operator uid's read throws EACCES.
+    // With a valid boundary that legacy anchor only ever recorded the sealed
+    // region's head (<= sealed tip; the migration captured the tip), so it is
+    // superseded by the boundary. Reporting `unreadable_sealed` lets the caller
+    // treat it as "no usable anchor for the post-split suffix" and re-establish
+    // the operator's OWN anchor, instead of failing the whole load closed.
+    boundaryIsValid = false
   ): Promise<
     | { status: "valid"; highest_sequence: number; head_hash: string }
     | { status: "absent" }
     | { status: "invalid" }
+    | { status: "unreadable_sealed" }
   > {
     let raw: Uint8Array | null;
     try {
@@ -2556,6 +2658,12 @@ export class AuditLog {
         AUDIT_HEAD_ANCHOR_KEY
       );
     } catch (err) {
+      if (boundaryIsValid && isPermissionError(err)) {
+        // Root-owned legacy anchor, unreadable at the operator uid, superseded
+        // by the MAC'd boundary. Not a finding; the caller re-establishes the
+        // suffix anchor. A non-permission fault still fails closed below.
+        return { status: "unreadable_sealed" };
+      }
       findings.push({
         kind: "storage_unavailable",
         message: `audit head anchor could not be read: ${failureMessage(err)}`,
@@ -2616,9 +2724,11 @@ export class AuditLog {
     highestChainedHash: string,
     hasLegacyEntries: boolean,
     hasChainedEntries: boolean,
-    findings: AuditIntegrityFinding[]
+    findings: AuditIntegrityFinding[],
+    boundaryIsValid = false,
+    sealedTipSequence = 0
   ): Promise<void> {
-    const anchor = await this.loadHeadAnchor(findings);
+    const anchor = await this.loadHeadAnchor(findings, boundaryIsValid);
     if (anchor.status === "valid") {
       if (highestChainedSeq < anchor.highest_sequence) {
         findings.push({
@@ -2654,6 +2764,57 @@ export class AuditLog {
       return;
     }
 
+    if (anchor.status === "unreadable_sealed") {
+      // F2 Option A: `__head_anchor` is unreadable at the operator uid while a
+      // VALID MAC'd boundary exists. On a just-migrated armed box this is the
+      // benign legacy state (a pre-split root daemon wrote a root-owned anchor
+      // that only ever recorded the sealed region's head, <= the sealed tip,
+      // which the boundary now anchors). But a bare "suppress" here would launder
+      // a post-split tail truncation, so it is gated on TWO proofs (Finding 1,
+      // adversarial gate 2026-07-15):
+      //
+      //   (a) No surviving post-split SUFFIX. If `highestChainedSeq >
+      //       sealedTipSequence`, a suffix survives; the operator necessarily
+      //       already wrote its OWN operator-owned, readable anchor at that
+      //       higher floor, so an unreadable anchor now is tamper (someone made
+      //       it unreadable to force a lower-floor heal). Fail closed.
+      //   (b) The operator never established a suffix that has since been erased.
+      //       Even with no surviving suffix, a fortress that ONCE had one (and
+      //       whose suffix + suffix checkpoints were all deleted) is
+      //       indistinguishable from a fresh box by surviving entries alone. The
+      //       operator-provenance "suffix established" marker
+      //       (AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY) closes that: if it is
+      //       present the suffix was erased -> fail closed.
+      //
+      // When both proofs pass (no surviving suffix AND never established one),
+      // this is the genuine just-migrated state: suppress the finding. NO write
+      // is done here (unlike the prior heal) -- the operator's next append
+      // establishes its own readable anchor via the normal append path, so a
+      // pure read never mutates the store.
+      if (highestChainedSeq > sealedTipSequence) {
+        findings.push({
+          kind: "tail_anchor_invalid",
+          sequence: highestChainedSeq,
+          message:
+            "audit head anchor is unreadable at this privilege but a post-split " +
+            "suffix survives (the operator's own anchor must be readable); " +
+            "refusing to heal to a lower floor (possible tail truncation)",
+        });
+        return;
+      }
+      if (await this.postSplitSuffixWasEstablished()) {
+        findings.push({
+          kind: "tail_anchor_invalid",
+          message:
+            "audit head anchor is unreadable and no post-split suffix survives, " +
+            "but the operator previously established a post-split suffix " +
+            "(possible full-suffix truncation with the anchor hidden)",
+        });
+        return;
+      }
+      return;
+    }
+
     if (hasLegacyEntries && !hasChainedEntries && highestChainedSeq > 0) {
       await this.writeHeadAnchor(highestChainedSeq, highestChainedHash);
       return;
@@ -2668,6 +2829,31 @@ export class AuditLog {
         message:
           "audit head anchor missing for established audit store (tail truncation or whole-log deletion may have occurred)",
       });
+    }
+  }
+
+  /**
+   * F2 Finding 1: has this operator ever established a POST-SPLIT suffix (an
+   * entry above the sealed tip)? Reads the operator-provenance marker
+   * {@link AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY}. Fail-safe: a present OR
+   * unreadable/errored marker is treated as "established" (so an attacker cannot
+   * clear the tamper signal by making the marker unreadable); only a definitely-
+   * absent marker (`read` returns null) is "not established". `exists` is
+   * stat-based and would report a root-owned marker present without proving we
+   * can read its provenance, so this uses `read` and treats a permission error
+   * conservatively as established.
+   */
+  private async postSplitSuffixWasEstablished(): Promise<boolean> {
+    try {
+      const raw = await this.storage.read(
+        "_meta",
+        AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED_KEY
+      );
+      return raw !== null;
+    } catch {
+      // Unreadable/errored: cannot prove absence, so assume established (fail
+      // closed) rather than let an unreadable marker suppress the tamper check.
+      return true;
     }
   }
 
@@ -3778,6 +3964,15 @@ export class AuditLog {
     const splitBoundary = await this.loadSplitBoundary();
     const sealedTipSequence =
       splitBoundary.status === "valid" ? splitBoundary.boundary.sealed_tip_sequence : 0;
+    // F2 Finding 1 (Codex re-gate MED): refresh the cached sealed tip from this
+    // fresh boundary read. `freshenChainStateFromDisk` runs on every append, so
+    // this keeps `cachedSealedTip` current even for a long-lived instance that
+    // first loaded BEFORE the boundary was created (which would otherwise leave
+    // it 0 and make the post-split-suffix marker write miss). Only advance it
+    // (never zero it) so a transient boundary-read failure cannot lose the tip.
+    if (sealedTipSequence > this.cachedSealedTip) {
+      this.cachedSealedTip = sealedTipSequence;
+    }
     const metas = await this.storage.list(AUDIT_NAMESPACE, "entry-");
     for (let i = metas.length - 1; i >= 0; i--) {
       const seq = parseEntryKeySequence(metas[i]!.key);
@@ -3926,6 +4121,9 @@ export class AuditLog {
         effectiveSealedTip,
         suppressTofu,
       } = await this.resolveSplitBoundaryForLoad(findings);
+      // F2 Finding 1: remember the trusted sealed tip so the append path can
+      // classify a post-split suffix entry without re-reading the boundary.
+      this.cachedSealedTip = effectiveSealedTip;
       const storedEntriesRaw = await this.storage.list(AUDIT_NAMESPACE);
       // BLOCKER-1: with a valid boundary, prove from the LISTING that the sealed
       // region is complete (gap-free run ending at the tip). This catches
@@ -4094,7 +4292,8 @@ export class AuditLog {
       await this.verifyAndMaybeWriteLegacyAnchor(
         legacyRawEntries.length,
         legacyAnchorHash,
-        findings
+        findings,
+        effectiveSealedTip
       );
 
       // F3: derive the chain-walk seed, honoring an authenticated rotation cut
@@ -4163,7 +4362,9 @@ export class AuditLog {
         highestChainedHash,
         legacyRawEntries.length > 0,
         chainedEntries.length > 0,
-        findings
+        findings,
+        splitBoundary.status === "valid",
+        effectiveSealedTip
       );
       this.nextSequence = highestChainedSeq + 1;
       this.lastEntryHash = highestChainedHash;
@@ -4212,10 +4413,15 @@ export class AuditLog {
   private async verifyAndMaybeWriteLegacyAnchor(
     legacyCount: number,
     legacyAnchorHash: string,
-    findings: AuditIntegrityFinding[]
+    findings: AuditIntegrityFinding[],
+    sealedTipSequence = 0
   ): Promise<void> {
     if (legacyCount === 0) return;
-    const existing = await this.readCheckpoints("legacy-anchor", findings);
+    const existing = await this.readCheckpoints(
+      "legacy-anchor",
+      findings,
+      sealedTipSequence
+    );
     if (existing.length === 0) {
       await this.writeCheckpointRecord({
         checkpoint_kind: "legacy-anchor",
@@ -4291,19 +4497,25 @@ export class AuditLog {
     splitBoundary: AuditStoreSplitBoundaryLoadResult,
     findings: AuditIntegrityFinding[]
   ): Promise<void> {
-    const checkpoints = await this.readCheckpoints("audit-checkpoint", findings);
-    const entryBySequence = new Map(entries.map((entry) => [entry.sequence, entry]));
-    let highestCheckpoint = 0;
-
     // F2 Option A: a checkpoint entirely within the SEALED legacy region (see
     // the module doc comment near AUDIT_SPLIT_BOUNDARY_DIRNAME) can never be
     // root-recomputed from the current in-memory entry set, since this
     // instance never even attempted to read those entries. Every checkpoint
     // that predates the split has `checkpoint_sequence <= sealedTipSequence`
     // by construction (the migration captures the CURRENT tip, so nothing
-    // sealed can reference a not-yet-written future entry).
+    // sealed can reference a not-yet-written future entry). Resolve it BEFORE
+    // the read so `readCheckpoints` can also SKIP a sealed-region checkpoint
+    // file that is unreadable at this privilege (a root-owned legacy file on an
+    // armed box) instead of failing the whole load closed.
     const sealedTipSequence =
       splitBoundary.status === "valid" ? splitBoundary.boundary.sealed_tip_sequence : 0;
+    const checkpoints = await this.readCheckpoints(
+      "audit-checkpoint",
+      findings,
+      sealedTipSequence
+    );
+    const entryBySequence = new Map(entries.map((entry) => [entry.sequence, entry]));
+    let highestCheckpoint = 0;
 
     // F3: the lowest surviving chained sequence. Entries below this floor (but
     // above the legacy region) were legitimately pruned by rotation. A checkpoint
@@ -4426,7 +4638,19 @@ export class AuditLog {
 
   private async readCheckpoints(
     kind: "audit-checkpoint" | "legacy-anchor",
-    findings: AuditIntegrityFinding[]
+    findings: AuditIntegrityFinding[],
+    // F2 Option A: the sealed split-boundary tip (0 when there is no VALID
+    // boundary). A checkpoint whose key-sequence sits at or below this tip
+    // anchors ONLY the sealed legacy region, whose integrity is carried by the
+    // MAC'd boundary + the root-only sealed-region crypto walk, NOT by these
+    // legacy checkpoints. On an armed box those files were written by a
+    // pre-split ROOT daemon (root-owned 0600) and are unreadable at the operator
+    // uid, so their read throws EACCES. Below, such a read is SKIPPED (never a
+    // finding) exactly as the routine load already skips sealed ENTRIES; a
+    // genuine tamper/IO fault, or any unreadable checkpoint ABOVE the tip, still
+    // fails closed. This is the READ-side analogue of the sealed-region skip that
+    // `verifyCheckpoints` already applies to the root RE-DERIVATION.
+    sealedTipSequence = 0
   ): Promise<AuditCheckpointRecord[]> {
     const records: AuditCheckpointRecord[] = [];
     let metas;
@@ -4441,7 +4665,28 @@ export class AuditLog {
     }
 
     for (const meta of metas) {
-      const raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      const keySeq = parseCheckpointKeySequence(meta.key);
+      const inSealedRegion =
+        sealedTipSequence > 0 && keySeq !== null && keySeq <= sealedTipSequence;
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      } catch (err) {
+        // F2: a sealed-region checkpoint the operator uid cannot open on an
+        // armed box (root-owned legacy file). The boundary MAC covers the
+        // sealed region, so skip it silently: the same soundness argument that
+        // lets the routine load skip unreadable sealed entries. Anything else
+        // (a non-permission error, or an unreadable checkpoint ABOVE the sealed
+        // tip) is a real problem and fails closed.
+        if (inSealedRegion && isPermissionError(err)) {
+          continue;
+        }
+        findings.push({
+          kind: "storage_unavailable",
+          message: `audit checkpoint ${meta.key} could not be read: ${failureMessage(err)}`,
+        });
+        continue;
+      }
       if (!raw) {
         findings.push({
           kind: "checkpoint_malformed",
@@ -4485,21 +4730,24 @@ export class AuditLog {
     try {
       await this.withAuditWriteLock(async () => {
         await this.freshenChainStateFromDisk();
-        const previousCheckpointSequence =
-          await this.readHighestAuditCheckpointSequence();
-        const checkpointSequence = this.nextSequence - 1;
         // F2 Option A: never ask for hashes at or below a valid split
         // boundary's sealed tip, since those entries are the legacy region
         // this instance's routine paths must never attempt to read. A checkpoint
         // whose natural `from_sequence` would dip into the sealed region
         // instead starts right after it, mirroring how `verifyCheckpoints`
         // already tolerates a checkpoint not covering a rotated/sealed
-        // prefix on the READ side.
+        // prefix on the READ side. Resolve it BEFORE scanning existing
+        // checkpoints so the scan can also skip a sealed-region checkpoint file
+        // that is unreadable at this privilege (a root-owned legacy file on an
+        // armed box) instead of throwing EACCES out of the append/checkpoint path.
         const splitBoundary = await this.loadSplitBoundary();
         const sealedTipSequence =
           splitBoundary.status === "valid"
             ? splitBoundary.boundary.sealed_tip_sequence
             : 0;
+        const previousCheckpointSequence =
+          await this.readHighestAuditCheckpointSequence(sealedTipSequence);
+        const checkpointSequence = this.nextSequence - 1;
         const fromSequence = Math.max(
           previousCheckpointSequence + 1,
           sealedTipSequence + 1
@@ -4527,14 +4775,31 @@ export class AuditLog {
     }
   }
 
-  private async readHighestAuditCheckpointSequence(): Promise<number> {
+  private async readHighestAuditCheckpointSequence(
+    sealedTipSequence = 0
+  ): Promise<number> {
     const metas = await this.storage.list(
       AUDIT_CHECKPOINT_NAMESPACE,
       "audit-checkpoint-"
     );
     let highest = 0;
     for (const meta of metas) {
-      const raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      // F2 Option A: the operator's own checkpoints are always ABOVE the sealed
+      // tip, so a sealed-region checkpoint the operator uid cannot open on an
+      // armed box (root-owned legacy file) is never the highest and can be
+      // skipped silently. A non-permission fault, or an unreadable checkpoint
+      // above the tip, still surfaces (rethrown to the append/checkpoint caller,
+      // which fails closed rather than under-counting the checkpoint floor).
+      const keySeq = parseCheckpointKeySequence(meta.key);
+      const inSealedRegion =
+        sealedTipSequence > 0 && keySeq !== null && keySeq <= sealedTipSequence;
+      let raw: Uint8Array | null;
+      try {
+        raw = await this.storage.read(AUDIT_CHECKPOINT_NAMESPACE, meta.key);
+      } catch (err) {
+        if (inSealedRegion && isPermissionError(err)) continue;
+        throw err;
+      }
       if (!raw) continue;
       try {
         const parsed = JSON.parse(bytesToString(raw));
