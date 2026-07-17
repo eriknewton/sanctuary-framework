@@ -384,8 +384,8 @@ describe("detectShortfall", () => {
         earliest_retained_at: "2026-08-01T00:00:00.000Z",
         ever_pruned: false,
         per_store_retention: [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       }),
       complete
@@ -405,8 +405,8 @@ describe("detectShortfall", () => {
         earliest_retained_at: "2026-08-01T00:00:00.000Z",
         ever_pruned: true,
         per_store_retention: [
-          { store: "operator", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 100, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 100, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       }),
       complete
@@ -533,7 +533,7 @@ describe("detectShortfall", () => {
             store: "operator",
             max_entries: 100,
             retained_total: 60,
-            max_total_size_bytes: 0,
+            max_total_size_bytes: 1_000_000,
             retained_total_size_bytes: 0,
           },
         ],
@@ -550,7 +550,7 @@ describe("detectShortfall", () => {
             store: "daemon",
             max_entries: 100,
             retained_total: 50,
-            max_total_size_bytes: 0,
+            max_total_size_bytes: 1_000_000,
             retained_total_size_bytes: 0,
           },
         ],
@@ -573,43 +573,43 @@ describe("detectShortfall", () => {
       [
         "operator row missing retained_total",
         [
-          { store: "operator", max_entries: 100, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ] as unknown as RetentionFacts["per_store_retention"],
       ],
       [
         "operator row with NaN max_entries",
         [
-          { store: "operator", max_entries: NaN, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: NaN, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       ],
       [
         "daemon row with Infinity retained_total",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: Infinity, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: Infinity, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       ],
       [
         "operator row with string-typed max_entries (wrong type)",
         [
-          { store: "operator", max_entries: "100", retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: "100", retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ] as unknown as RetentionFacts["per_store_retention"],
       ],
       [
         "operator row with undefined retained_total_size_bytes (contract is null-or-finite)",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: undefined },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: undefined },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ] as unknown as RetentionFacts["per_store_retention"],
       ],
       [
         "null row element among complete rows",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
           null,
         ] as unknown as RetentionFacts["per_store_retention"],
       ],
@@ -619,17 +619,17 @@ describe("detectShortfall", () => {
         // a signed falsehood in the OVER-claiming direction.
         "duplicate operator rows (second duplicate at cap)",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "operator", max_entries: 100, retained_total: 100, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 100, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       ],
       [
         "duplicate daemon rows",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       ],
       [
@@ -638,9 +638,9 @@ describe("detectShortfall", () => {
         // invalid "archive" row flipped the at-cap OR to a signed true.
         "unknown-store row (store:'archive' at its own cap) alongside complete rows",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "archive", max_entries: 1, retained_total: 1, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "archive", max_entries: 1, retained_total: 1, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ] as unknown as RetentionFacts["per_store_retention"],
       ],
     ];
@@ -665,8 +665,8 @@ describe("detectShortfall", () => {
       const r = detectShortfall(
         Q3_2026,
         mergedOverCap([
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ]),
         complete
       );
@@ -715,18 +715,27 @@ describe("detectShortfall", () => {
       expect(r.explanation).toMatch(/cannot be ruled out/i);
     });
 
-    it("F2-R2 non-vacuity: rows with the documented null retained_total_size_bytes ('unread') stay determinable", () => {
+    it("D8-1 Leg C (DELIBERATE REVERSAL of the F2-R2 null-is-usable allowance): rows with a null ('unread') retained_total_size_bytes are NOT determinable", () => {
+      // Pre-D8-1 this test pinned the OPPOSITE: null size stayed determinable
+      // and earned the "below both its entry and size retention caps"
+      // reassurance -- a signed definitive claim over a size dimension nobody
+      // read (and boundary-real: pruning fires only when size EXCEEDS the cap,
+      // so ever_pruned=false does not exclude size == cap). The allowance is
+      // reversed: an unread size forfeits determinability entirely, so neither
+      // the definitive boolean nor the below-caps prose can ride on it.
       const r = detectShortfall(
         Q3_2026,
         mergedOverCap([
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: null },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: null },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: null },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: null },
         ]),
         complete
       );
-      expect(r.retention_at_cap_determinable).toBe(true);
+      expect(r.retention_at_cap_determinable).toBe(false);
       expect(r.retention_at_cap).toBe(false);
-      expect(r.explanation).toMatch(/no recorded activity before/i);
+      expect(r.explanation).not.toMatch(/below both/i);
+      expect(r.explanation).not.toMatch(/no recorded activity before/i);
+      expect(r.explanation).toMatch(/cannot be ruled out/i);
     });
   });
 
@@ -782,23 +791,35 @@ describe("detectShortfall", () => {
       });
     }
 
-    it("non-vacuity: a null retained_total_size_bytes (documented 'unread') stays determinable and at-cap still fires", () => {
+    it("D8-1 Leg C (DELIBERATE REVERSAL): a null ('unread') retained_total_size_bytes on the legacy single-store fallback is NOT determinable", () => {
+      // Pre-D8-1 this test pinned the OPPOSITE (null size stayed determinable
+      // and the entry-dimension at-cap fired). Reversed with the allowance:
+      // on every REAL path a null size only arises when getRetentionUsage()
+      // threw, where the retained_total is a windowed FALLBACK figure rather
+      // than an on-disk census -- so the "entry cap is proven anyway" premise
+      // is hollow exactly when null size occurs. The uniform rule fails safe
+      // toward hedging (never the flattering direction): the prose warns via
+      // the ever-pruned/hedged arm below instead of asserting a definitive
+      // at-cap over unverified figures.
       const r = detectShortfall(
         Q3_2026,
         singleStore({ retained_total_size_bytes: null, ever_pruned: true }),
         complete
       );
-      expect(r.retention_at_cap_determinable).toBe(true);
-      expect(r.retention_at_cap).toBe(true);
-      expect(r.explanation).toMatch(/at a retention cap/i);
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).not.toMatch(/at a retention cap/i);
+      expect(r.explanation).not.toMatch(/below both/i);
+      // Still warns (ever_pruned true): honesty is hedged, not flattering.
+      expect(r.explanation).toMatch(/pruned entries at least once/i);
     });
   });
 
   describe("D7-1: retentionDeterminability chokepoint routing", () => {
     it("routes a usable breakdown through as the contributing stores", () => {
       const rows = [
-        { store: "operator" as const, max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-        { store: "daemon" as const, max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        { store: "operator" as const, max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        { store: "daemon" as const, max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
       ];
       const d = retentionDeterminability(
         ret({
@@ -879,5 +900,148 @@ describe("detectShortfall", () => {
       "The last recorded audit entry inside the covered window is 2026-09-20T00:00:00.000Z."
     );
     expect(r.explanation).not.toContain("operator-store audit entry");
+  });
+
+  // ─── D8-1 (Dry-8 sweep): the usable-figures chokepoint. FINITE is not
+  // USABLE: a cap of 0/negative is the documented in-band "cap not known to
+  // this reporter" encoding (Leg B), and a null size is the documented
+  // "size unread" encoding (Leg C) -- yet pre-D8-1 rows carrying them
+  // validated and earned a definitive signed retention_at_cap:false plus
+  // "below both its entry and size retention caps" prose over caps declared
+  // UNKNOWN and size figures nobody read. (This is also why the row fixtures
+  // across this file now carry a real 1_000_000 size cap instead of the old
+  // 0: the old fixtures leaned on the retired allowance.) ───
+  describe("D8-1 Leg B: an unknown (<= 0) cap on any contributing row forfeits determinability", () => {
+    const belowEntryCaps = (
+      perStore: RetentionFacts["per_store_retention"]
+    ): RetentionFacts =>
+      ret({
+        retained_total: 110,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: false,
+        daemon_store: { status: "included", included_entry_count: 50 },
+        per_store_retention: perStore,
+      });
+
+    it("a breakdown row with max_total_size_bytes: 0 (size cap unknown) is NOT determinable and earns no below-caps reassurance", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        belowEntryCaps([
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 100 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+        ]),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).not.toMatch(/below both/i);
+      expect(r.explanation).not.toMatch(/no recorded activity before/i);
+      expect(r.explanation).toMatch(/cannot be ruled out/i);
+    });
+
+    it("a breakdown row with max_entries: 0 (entry cap unknown) is NOT determinable", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        belowEntryCaps([
+          { store: "operator", max_entries: 0, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+        ]),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).not.toMatch(/no recorded activity before/i);
+      expect(r.explanation).toMatch(/cannot be ruled out/i);
+    });
+
+    it("a NEGATIVE cap is equally unknown (<= 0, not === 0)", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        belowEntryCaps([
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: -1, retained_total_size_bytes: 100 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+        ]),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+    });
+
+    it("the legacy single-store fallback with max_total_size_bytes: 0 is NOT determinable (no below-caps reassurance from an unknown cap)", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          max_entries: 100,
+          retained_total: 42,
+          max_total_size_bytes: 0,
+          retained_total_size_bytes: 100,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: false,
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        }),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).not.toMatch(/below both/i);
+      expect(r.explanation).not.toMatch(/no recorded activity before/i);
+      expect(r.explanation).toMatch(/cannot be ruled out/i);
+    });
+
+    it("the legacy single-store fallback with max_entries: 0 is NOT determinable", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          max_entries: 0,
+          retained_total: 42,
+          retained_total_size_bytes: 100,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: false,
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        }),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).not.toMatch(/no recorded activity before/i);
+    });
+
+    it("non-vacuity: the same rows with REAL (> 0) caps and read sizes stay determinable with the earned reassurance", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        belowEntryCaps([
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+        ]),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(true);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).toMatch(/no recorded activity before/i);
+      expect(r.explanation).toMatch(/below both/i);
+    });
+  });
+
+  describe("D8-1 Leg C: a null (unread) size on ONE row of an otherwise-usable breakdown forfeits determinability", () => {
+    it("operator row size unread, daemon row fully read: NOT determinable (no below-caps claim over the unread dimension)", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          retained_total: 110,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: false,
+          daemon_store: { status: "included", included_entry_count: 50 },
+          per_store_retention: [
+            { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: null },
+            { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+          ],
+        }),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).not.toMatch(/below both/i);
+      expect(r.explanation).not.toMatch(/no recorded activity before/i);
+      expect(r.explanation).toMatch(/cannot be ruled out/i);
+    });
   });
 });

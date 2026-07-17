@@ -383,6 +383,53 @@ export function mergeEverPruned(
 }
 
 /**
+ * D8-1 Leg A (Dry-8 sweep): one store's retention-usage read as the pack
+ * consumes it. `entryCount: null` is the SINGLE "usage unavailable" signal:
+ * the underlying `AuditLog.getRetentionUsage()` returns a plain `number`
+ * entryCount and can NEVER produce `null` itself, so a `null` here means the
+ * whole usage read THREW and NOTHING about the store's on-disk usage was
+ * read. `totalSizeBytes` is therefore `null` ("unread") in that state --
+ * never the old `0` placeholder, which was a FILLER masquerading as a read
+ * figure: it passed the chokepoint's finiteness checks and let the SIGNED
+ * manifest serialize a definitive `retention_at_cap: false` (plus "below
+ * both caps" prose) from a size nobody read, while the same pack's prose
+ * hedged. `everPruned` may independently be `null` (its sub-read inside a
+ * successful usage read is best-effort).
+ */
+export interface RetentionUsageRead {
+  entryCount: number | null;
+  totalSizeBytes: number | null;
+  everPruned: boolean | null;
+}
+
+/**
+ * D8-1 Leg A: the ONE catch for a failed `getRetentionUsage()` read (both the
+ * operator and daemon call sites route through it). On a throw -- e.g. a
+ * transient storage fault between `query()` succeeding and the usage
+ * `storage.list()` -- it returns the all-`null` "usage unavailable" signal,
+ * never placeholder figures. `deriveAuditReadOutcome` then records the
+ * store's size position as UNREAD (`retained_total_size_bytes: null`), which
+ * the `retentionDeterminability` chokepoint classifies NOT-DETERMINABLE: the
+ * prose hedges AND the signed manifest carries the explicit
+ * `retention_at_cap_determinable: false` marker instead of a definitive
+ * boolean -- the two surfaces converge instead of contradicting each other.
+ * Exported so tests can drive the REAL failure path with an injected throw.
+ */
+export async function readRetentionUsage(log: {
+  getRetentionUsage(): Promise<{
+    entryCount: number;
+    totalSizeBytes: number;
+    everPruned: boolean | null;
+  }>;
+}): Promise<RetentionUsageRead> {
+  try {
+    return await log.getRetentionUsage();
+  } catch {
+    return { entryCount: null, totalSizeBytes: null, everPruned: null };
+  }
+}
+
+/**
  * Derive the pack's audit read outcome from the windowed `query()` result plus
  * the authoritative on-disk census. Pure; exported so tests can pin the
  * truncation and fallback semantics without a live server.
@@ -406,6 +453,23 @@ export function mergeEverPruned(
  *   false cause while older entries sit on disk outside the window. Neither
  *   truncation is constructible with today's defaults; the guard makes the
  *   anticipated configurations structurally safe.
+ * - D8-1 Leg A note on F3 when usage is UNAVAILABLE (`entryCount: null`): the
+ *   window-vs-census comparison has no census to compare against, so the
+ *   `windowTruncated` half of the guard is INERT in that state. That is
+ *   accepted, precisely because every claim the guard protects is disarmed
+ *   elsewhere in the same state: (a) the `queryTruncated` half still fails
+ *   closed on `query()`'s own internal truncation; (b) a RAM window smaller
+ *   than the disk cap is not constructible with today's defaults
+ *   (`maxInMemoryEntries` defaults to `maxEntries` -- the same reason F3 is
+ *   an anticipatory guard at all); and (c) with usage unavailable this
+ *   derivation records the store's size position as UNREAD (`null`), so the
+ *   `retentionDeterminability` chokepoint classifies at-cap NOT-DETERMINABLE
+ *   and the reassurance arm F3 exists to protect ("never pruned ... below
+ *   both caps ... no recorded activity before X") structurally cannot fire
+ *   (`ever_pruned` is also `null`, which `mergeEverPruned` keeps absorbing).
+ *   The residual exposure -- a future window-smaller-than-disk configuration
+ *   AND a usage fault in the same run -- yields hedged prose plus the signed
+ *   not-determinable marker, never a definitive claim.
  * - R3-3 (round-3 sweep 2026-07-14): `earliest_retained_at` is the MINIMUM
  *   entry timestamp, not the positionally-first entry. Audit entries sort by
  *   append sequence, so under backward clock skew a later-appended entry can
@@ -419,11 +483,8 @@ export function deriveAuditReadOutcome(params: {
   entries: readonly AuditEntry[];
   windowedTotal: number;
   retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
-  usage: {
-    entryCount: number | null;
-    totalSizeBytes: number;
-    everPruned: boolean | null;
-  };
+  /** See {@link RetentionUsageRead}: `entryCount: null` = usage unavailable. */
+  usage: RetentionUsageRead;
   /**
    * WATCH-1: the F2 daemon enforcement store (`_audit-daemon`) read, when the
    * operator store has been split. Omit (or `absent`) on a non-split fortress.
@@ -443,11 +504,8 @@ export function deriveAuditReadOutcome(params: {
         status: "included";
         entries: readonly AuditEntry[];
         windowedTotal: number;
-        usage: {
-          entryCount: number | null;
-          totalSizeBytes: number;
-          everPruned: boolean | null;
-        };
+        /** See {@link RetentionUsageRead}: `entryCount: null` = usage unavailable. */
+        usage: RetentionUsageRead;
         /**
          * D5-1: the daemon store's OWN retention caps. Its own `AuditLog`
          * instance prunes on independent 100k-entry / 100 MB caps, so at-cap
@@ -459,6 +517,10 @@ export function deriveAuditReadOutcome(params: {
 }): ReadOutcome<AuditReadData> {
   const { entries, windowedTotal, retentionConfig, usage } = params;
   const daemon = params.daemon ?? { status: "absent" as const };
+  // `entryCount: null` (usage unavailable) disarms this half of the F3 guard;
+  // see the "D8-1 Leg A note on F3" in the doc comment for why that is inert
+  // (queryTruncated still guards, the window==disk-cap default, and the unread
+  // size position makes every protected claim not-determinable downstream).
   const windowTruncated =
     usage.entryCount !== null && usage.entryCount > windowedTotal;
   const queryTruncated = entries.length < windowedTotal;
@@ -472,12 +534,26 @@ export function deriveAuditReadOutcome(params: {
     );
   }
 
+  // D8-1 Leg A: a store whose usage read THREW (`entryCount: null`) had
+  // NOTHING about its on-disk usage read, so its size position is UNREAD
+  // (`null`) -- even if a stale caller still passes the old `totalSizeBytes: 0`
+  // placeholder alongside `entryCount: null`, that figure is a filler by
+  // construction, never a read, and must not reach the chokepoint as one. The
+  // `null` size makes `retentionDeterminability` classify at-cap
+  // NOT-DETERMINABLE (hedged prose + the signed manifest marker), which is the
+  // honest rendering of "the retention position was not read this run".
+  const readSize = (u: RetentionUsageRead): number | null =>
+    u.entryCount === null ? null : u.totalSizeBytes;
+  // Merged DISPLAY size: a sum over an unread contributor is itself unread.
+  const addSizes = (a: number | null, b: number | null): number | null =>
+    a === null || b === null ? null : a + b;
+
   // WATCH-1: fold the daemon store in. A truncated daemon read is the same
   // honesty failure as a truncated operator read: fail closed rather than
   // present a partial daemon census as complete.
   let mergedEntries: readonly AuditEntry[] = entries;
   let retainedTotal = usage.entryCount ?? windowedTotal;
-  let retainedSizeBytes = usage.totalSizeBytes;
+  let retainedSizeBytes = readSize(usage);
   let everPruned = usage.everPruned;
   let includedDaemonCount = 0;
   // D5-1: the per-store retention breakdown that drives the at-cap decision.
@@ -491,7 +567,7 @@ export function deriveAuditReadOutcome(params: {
       max_entries: retentionConfig.maxEntries,
       retained_total: usage.entryCount ?? windowedTotal,
       max_total_size_bytes: retentionConfig.maxTotalSizeBytes,
-      retained_total_size_bytes: usage.totalSizeBytes,
+      retained_total_size_bytes: readSize(usage),
     },
   ];
   if (daemon.status === "included") {
@@ -511,7 +587,7 @@ export function deriveAuditReadOutcome(params: {
     mergedEntries = [...entries, ...daemon.entries];
     includedDaemonCount = daemon.entries.length;
     retainedTotal += daemon.usage.entryCount ?? daemon.windowedTotal;
-    retainedSizeBytes += daemon.usage.totalSizeBytes;
+    retainedSizeBytes = addSizes(retainedSizeBytes, readSize(daemon.usage));
     // D5-2: merge the pruned-status WITHOUT laundering an UNKNOWN into `false`.
     // `null` (a store whose `getRetentionUsage()` threw) is ABSORBING unless the
     // other store definitely pruned: `true || anything -> true`,
@@ -525,7 +601,7 @@ export function deriveAuditReadOutcome(params: {
       max_entries: daemon.retentionConfig.maxEntries,
       retained_total: daemon.usage.entryCount ?? daemon.windowedTotal,
       max_total_size_bytes: daemon.retentionConfig.maxTotalSizeBytes,
-      retained_total_size_bytes: daemon.usage.totalSizeBytes,
+      retained_total_size_bytes: readSize(daemon.usage),
     });
   }
 
@@ -611,11 +687,8 @@ export async function readDaemonStore(
       status: "included";
       entries: readonly AuditEntry[];
       windowedTotal: number;
-      usage: {
-        entryCount: number | null;
-        totalSizeBytes: number;
-        everPruned: boolean | null;
-      };
+      /** See {@link RetentionUsageRead}: `entryCount: null` = usage unavailable. */
+      usage: RetentionUsageRead;
       // D5-1: the daemon store's OWN retention caps, so at-cap is judged against
       // this store's independent limits, never the merged total vs a single cap.
       retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
@@ -639,16 +712,10 @@ export async function readDaemonStore(
     // Default strict integrity mode: a daemon-store tamper makes query() throw
     // AuditIntegrityError, distinguished below from an access failure.
     const { entries, total } = await daemonLog.query({ limit: 1_000_000 });
-    let usage: {
-      entryCount: number | null;
-      totalSizeBytes: number;
-      everPruned: boolean | null;
-    };
-    try {
-      usage = await daemonLog.getRetentionUsage();
-    } catch {
-      usage = { entryCount: null, totalSizeBytes: 0, everPruned: null };
-    }
+    // D8-1 Leg A: a usage-read throw yields the all-null "usage unavailable"
+    // signal (never placeholder figures), so the daemon store's retention
+    // position renders not-determinable instead of a signed below-cap claim.
+    const usage = await readRetentionUsage(daemonLog);
     return {
       status: "included",
       entries: entries as readonly AuditEntry[],
@@ -946,17 +1013,13 @@ export async function runEvidencePack(args: string[]): Promise<void> {
       const { entries, total } = await auditLog.query({ limit: 1_000_000 });
       const retentionConfig = auditLog.getRetentionConfig();
       // Read the on-disk usage + ever-pruned so the shortfall detector can tell
-      // size-cap pruning from genuine inactivity (sweep HIGH-5). Best-effort.
-      let usage: {
-        entryCount: number | null;
-        totalSizeBytes: number;
-        everPruned: boolean | null;
-      };
-      try {
-        usage = await auditLog.getRetentionUsage();
-      } catch {
-        usage = { entryCount: null, totalSizeBytes: 0, everPruned: null };
-      }
+      // size-cap pruning from genuine inactivity (sweep HIGH-5). Best-effort:
+      // D8-1 Leg A -- a throw here (a transient fault between query()'s
+      // storage.list() and this one) yields the all-null "usage unavailable"
+      // signal, never placeholder figures, so the pack's retention position
+      // renders not-determinable (hedged prose + signed manifest marker)
+      // instead of a definitive below-cap claim built on a filler size of 0.
+      const usage = await readRetentionUsage(auditLog);
       // WATCH-1: after the F2 audit-store split, daemon-produced enforcement
       // records live in the separate root-owned `_audit-daemon` store, which the
       // operator `auditLog.query()` above does NOT see. Probe it and, when

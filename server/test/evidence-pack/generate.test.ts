@@ -28,7 +28,10 @@ import {
   type BuildEvidencePackDeps,
 } from "../../src/evidence-pack/generate.js";
 import { canonicalJSON } from "../../src/evidence-pack/signer.js";
-import { deriveAuditReadOutcome } from "../../src/evidence-pack/cli.js";
+import {
+  deriveAuditReadOutcome,
+  readRetentionUsage,
+} from "../../src/evidence-pack/cli.js";
 import { emptyInventorySnapshot } from "../../src/evidence-pack/inventory.js";
 import {
   populated,
@@ -199,7 +202,7 @@ describe("buildEvidencePack", () => {
             store: "operator",
             max_entries: 100,
             retained_total: 60,
-            max_total_size_bytes: 0,
+            max_total_size_bytes: 1_000_000,
             retained_total_size_bytes: 0,
           },
         ],
@@ -215,7 +218,7 @@ describe("buildEvidencePack", () => {
             store: "daemon",
             max_entries: 100,
             retained_total: 50,
-            max_total_size_bytes: 0,
+            max_total_size_bytes: 1_000_000,
             retained_total_size_bytes: 0,
           },
         ],
@@ -237,28 +240,28 @@ describe("buildEvidencePack", () => {
       [
         "operator row with NaN max_entries",
         [
-          { store: "operator", max_entries: NaN, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: NaN, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       ],
       [
         "operator row with string-typed max_entries (wrong type)",
         [
-          { store: "operator", max_entries: "100", retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: "100", retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ] as unknown as RetentionFacts["per_store_retention"],
       ],
       [
         "operator row with undefined retained_total_size_bytes (contract is null-or-finite)",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: undefined },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: undefined },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ] as unknown as RetentionFacts["per_store_retention"],
       ],
       [
         "daemon row missing max_total_size_bytes",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
           { store: "daemon", max_entries: 100, retained_total: 50, retained_total_size_bytes: 0 },
         ] as unknown as RetentionFacts["per_store_retention"],
       ],
@@ -267,17 +270,17 @@ describe("buildEvidencePack", () => {
         // a definitive retention_at_cap:true from the invalid extra row.
         "duplicate operator rows (second duplicate at cap)",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "operator", max_entries: 100, retained_total: 100, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 100, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       ],
       [
         "duplicate daemon rows",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ],
       ],
       [
@@ -285,10 +288,36 @@ describe("buildEvidencePack", () => {
         // the at-cap OR -- a signed falsehood in the OVER-claiming direction.
         "unknown-store row (store:'archive' at its own cap) alongside complete rows",
         [
-          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
-          { store: "archive", max_entries: 1, retained_total: 1, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "archive", max_entries: 1, retained_total: 1, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
         ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      // ─── D8-1 (Dry-8 sweep): FINITE is not USABLE. Pre-D8-1, the three
+      // variants below all VALIDATED and the SIGNED manifest carried a
+      // definitive flattering retention_at_cap:false -- over a cap declared
+      // unknown in-band (0 = "cap not known to this reporter", Leg B) or a
+      // size dimension nobody read (null = "unread", Leg C). ───
+      [
+        "D8-1 Leg B: row with size cap declared unknown (max_total_size_bytes: 0)",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        "D8-1 Leg B: row with entry cap declared unknown (max_entries: 0)",
+        [
+          { store: "operator", max_entries: 0, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        "D8-1 Leg C: row with an UNREAD size (retained_total_size_bytes: null)",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: null },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
       ],
     ];
 
@@ -352,17 +381,21 @@ describe("buildEvidencePack", () => {
       const daemonEntries = Array.from({ length: 50 }, (_, i) =>
         entry(`2026-08-03T00:00:${String(i).padStart(2, "0")}.000Z`, "gate_deny:daemon")
       );
+      // D8-1 Leg B: the shipped happy path carries REAL caps (the default
+      // AuditLog config is 100k entries / 100 MB and is never 0); a 0 size cap
+      // is the in-band "cap not known" encoding and now (correctly) renders
+      // not-determinable, so this shipped-path fixture models the real config.
       const outcome = deriveAuditReadOutcome({
         entries: operatorEntries,
         windowedTotal: 60,
-        retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 0 },
+        retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 100 * 1024 * 1024 },
         usage: { entryCount: 60, totalSizeBytes: 1024, everPruned: false },
         daemon: {
           status: "included",
           entries: daemonEntries,
           windowedTotal: 50,
           usage: { entryCount: 50, totalSizeBytes: 1024, everPruned: false },
-          retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 0 },
+          retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 100 * 1024 * 1024 },
         },
       });
       if (outcome.status !== "populated") throw new Error("expected populated");
@@ -388,6 +421,99 @@ describe("buildEvidencePack", () => {
         "retention_at_cap",
         "daemon_store",
       ]);
+    });
+
+    it("D8-1 Leg A: a shipped-CLI usage-throw (query() succeeded, getRetentionUsage() threw) makes the SIGNED manifest carry the not-determinable marker, converging with the hedged prose", async () => {
+      // The exact Dry-8 D8-1 repro shape, driven through the REAL components
+      // the shipped CLI composes: the real usage catch (readRetentionUsage
+      // with an injected throw), the real deriveAuditReadOutcome, the real
+      // buildEvidencePack. Pre-D8-1 the catch substituted { entryCount: null,
+      // totalSizeBytes: 0, everPruned: null }; the filler 0 became a per-store
+      // retained_total_size_bytes: 0 that passed the chokepoint's finiteness
+      // checks, and the SIGNED manifest serialized a definitive
+      // retention_at_cap: false while the SAME pack's prose hedged
+      // ("size-based pruning cannot be ruled out") -- two contradicting
+      // surfaces in one signed artifact.
+      const usage = await readRetentionUsage({
+        getRetentionUsage: async (): Promise<{
+          entryCount: number;
+          totalSizeBytes: number;
+          everPruned: boolean | null;
+        }> => {
+          throw new Error("transient storage fault between the two storage.list() calls");
+        },
+      });
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+        windowedTotal: 1,
+        retentionConfig: { maxEntries: 100_000, maxTotalSizeBytes: 100 * 1024 * 1024 },
+        usage,
+      });
+      expect(outcome.status).toBe("populated");
+      const pack = buildEvidencePack(baseInput(), {
+        audit: outcome,
+        signer,
+        masterKey,
+      });
+      const c = coverage(pack);
+      // The definitive boolean is never signed for an unread retention position...
+      expect("retention_at_cap" in c).toBe(false);
+      // ...the explicit marker is, and the serialized manifest agrees.
+      expect(c.retention_at_cap_determinable).toBe(false);
+      const json = canonicalJSON(pack.manifest);
+      expect(json).toContain('"retention_at_cap_determinable":false');
+      expect(json).not.toContain('"retention_at_cap":');
+      // The prose hedges -- and now AGREES with the manifest instead of
+      // contradicting it.
+      const report = pack.files[0]!.content;
+      expect(report).not.toMatch(/below both/i);
+      expect(report).not.toMatch(/no recorded activity before/i);
+      expect(report).toMatch(/cannot be ruled out/i);
+    });
+
+    it("D8-1 Leg B: the legacy single-store fallback with a cap declared unknown (max_total_size_bytes: 0) serializes the marker, never the definitive boolean", () => {
+      const pack = buildEvidencePack(
+        baseInput(),
+        deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+          max_entries: 100_000,
+          retained_total: 42,
+          max_total_size_bytes: 0, // documented in-band "cap not known"
+          retained_total_size_bytes: 100,
+          ever_pruned: false,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        })
+      );
+      const c = coverage(pack);
+      expect("retention_at_cap" in c).toBe(false);
+      expect(c.retention_at_cap_determinable).toBe(false);
+      const report = pack.files[0]!.content;
+      expect(report).not.toMatch(/below both/i);
+      expect(report).toMatch(/cannot be ruled out/i);
+    });
+
+    it("D8-1 Leg C: a null (unread) top-level retained_total_size_bytes on the legacy single-store path serializes the marker (DELIBERATE REVERSAL of the null-is-usable allowance)", () => {
+      const pack = buildEvidencePack(
+        baseInput(),
+        deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+          max_entries: 100_000,
+          retained_total: 42,
+          max_total_size_bytes: 100 * 1024 * 1024,
+          retained_total_size_bytes: null, // unread -- never read this run
+          ever_pruned: false,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        })
+      );
+      const c = coverage(pack);
+      expect("retention_at_cap" in c).toBe(false);
+      expect(c.retention_at_cap_determinable).toBe(false);
+      const report = pack.files[0]!.content;
+      // Never "below both its entry and size retention caps" over a size
+      // dimension nobody read.
+      expect(report).not.toMatch(/below both/i);
+      expect(report).not.toMatch(/no recorded activity before/i);
+      expect(report).toMatch(/cannot be ruled out/i);
     });
   });
 
