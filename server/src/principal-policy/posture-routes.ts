@@ -71,6 +71,8 @@ import {
   type CustodyExitPanel,
   type RecognitionPanel,
   type RecognitionReputationEvidence,
+  failedExclusiveEgressStatus,
+  type ExclusiveEgressStatus,
 } from "./posture.js";
 import {
   buildFeatureHealthPanel,
@@ -255,6 +257,40 @@ export interface PostureRouteDeps {
   /** Injectable timer hooks so tests can drive the stream cadence synchronously. */
   streamSetInterval?: (handler: () => void, ms: number) => NodeJS.Timeout;
   streamClearInterval?: (handle: NodeJS.Timeout) => void;
+  /**
+   * Exclusive-egress posture provider (Unified Protect Slice 5 S5-P). Resolved
+   * lazily per request so post-provision wiring is observed. When ABSENT, no
+   * fine-grained agent has ever been provisioned and every surface behaves as
+   * today. When PRESENT, the resolved status is threaded into the wall posture
+   * and feature-health builders, which apply the ONE aggregate-green capping
+   * rule (`armed` -> distinct non-green `coarse_only` when a fine-grained
+   * agent's exclusive stack is not live). FAIL-CLOSED: if the provider THROWS,
+   * the routes substitute `failedExclusiveEgressStatus(...)` (which caps
+   * green) - a failed posture read must never render the stronger claim.
+   */
+  exclusiveEgressPosture?: () =>
+    | Promise<ExclusiveEgressStatus | null>
+    | ExclusiveEgressStatus
+    | null;
+}
+
+/**
+ * Resolve the optional exclusive-egress posture provider fail-closed: absent
+ * provider -> null (no fine-grained agent; no cap); provider THROWS ->
+ * `failedExclusiveEgressStatus` (caps green). Shared by the wall-posture and
+ * feature-health builders so both surfaces resolve identically.
+ */
+async function resolveExclusiveEgress(
+  deps: PostureRouteDeps,
+): Promise<ExclusiveEgressStatus | null> {
+  if (!deps.exclusiveEgressPosture) return null;
+  try {
+    return await deps.exclusiveEgressPosture();
+  } catch (err) {
+    return failedExclusiveEgressStatus(
+      err instanceof Error ? err.message : String(err),
+    );
+  }
 }
 
 /**
@@ -587,6 +623,10 @@ export async function handlePostureRoute(
 // on the full per-request re-verify path, keeping per-request on-disk tamper
 // detection on the inspectable audit surface.
 async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPosture> {
+  // S5-P: resolve the exclusive-egress posture BEFORE the eager read scope so
+  // the provider (which may read its own state surfaces) never nests inside the
+  // audit log's read scope. Fail-closed on provider throw.
+  const exclusiveEgress = await resolveExclusiveEgress(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildCastleWallPosture({
       auditLog: deps.auditLog as AuditLog,
@@ -599,6 +639,7 @@ async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPostu
       ...(deps.producerKeyExpectedButUnavailable
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
+      ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
     }),
   );
 }
@@ -641,6 +682,9 @@ async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
 async function buildFeatureHealth(
   deps: PostureRouteDeps,
 ): Promise<FeatureHealthPanel> {
+  // S5-P: same fail-closed resolve as the wall posture, so the
+  // `castle_wall_egress` row and the banner cap green identically.
+  const exclusiveEgress = await resolveExclusiveEgress(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildFeatureHealthPanel({
       auditLog: deps.auditLog as AuditLog,
@@ -648,6 +692,7 @@ async function buildFeatureHealth(
       // Surface the per-plugin attribution rows on the operator posture surface.
       // Read-only projection over the same audit read; never enforcement-bearing.
       includePluginRows: true,
+      ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()

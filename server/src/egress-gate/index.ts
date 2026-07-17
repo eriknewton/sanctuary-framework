@@ -181,3 +181,16 @@ export {
   type HarnessDaemonInstallPlan,
   type HarnessDaemonStatus,
 } from "./harness-daemon.js";
+
+export {
+  buildExclusiveEgressPosture,
+  summarizeExclusiveEgressStatus,
+  exclusiveEgressCapsAggregateGreen,
+  failedExclusiveEgressStatus,
+  type ExclusiveEgressMode,
+  type ExclusiveEgressPosture,
+  type ExclusiveEgressPostureInput,
+  type ExclusiveEgressRegistryEntryView,
+  type ExclusiveEgressStatus,
+  type GateProcessStatus,
+} from "./posture.js";

@@ -89,6 +89,12 @@ export function featureHealthPill(status: FeatureHealthStatus): {
       return { cls: "red", label: "fault" };
     case "unconfirmed":
       return { cls: "amber", label: "unconfirmed" };
+    // S5-P (design §6): the DISTINCT non-green coarse-only chip. The coarse
+    // wall is enforcing but a fine-grained-provisioned agent's exclusive-egress
+    // stack is not live. Amber (not red: the coarse wall IS protecting), with
+    // its own label so it is never mistaken for a vague "unconfirmed".
+    case "coarse_only":
+      return { cls: "amber", label: "coarse-only" };
     case "unknown":
     default:
       // Fail closed: any unrecognized status is non-green by construction.
@@ -462,9 +468,12 @@ export function renderPostureHomeHTML(): string {
     });
   }
 
-  // "Never fake green": ARMED is the ONLY green arm-state.
+  // "Never fake green": ARMED is the ONLY green arm-state. COARSE-ONLY (S5-P)
+  // is the DISTINCT non-green state: the coarse wall is enforcing but a
+  // fine-grained-provisioned agent's exclusive-egress stack is not live.
   function wallPill(state) {
     if (state === "armed") return '<span class="pill green">ARMED</span>';
+    if (state === "coarse_only") return '<span class="pill amber">COARSE-ONLY</span>';
     if (state === "degraded") return '<span class="pill red">DEGRADED</span>';
     if (state === "not_installed") return '<span class="pill amber">NOT INSTALLED</span>';
     return '<span class="pill amber">UNKNOWN</span>';
@@ -489,6 +498,7 @@ export function renderPostureHomeHTML(): string {
     if (status === "active") return '<span class="pill green">active</span>';
     if (status === "fault") return '<span class="pill red">fault</span>';
     if (status === "unconfirmed") return '<span class="pill amber">unconfirmed</span>';
+    if (status === "coarse_only") return '<span class="pill amber">coarse-only</span>';
     return '<span class="pill amber">unknown</span>';
   }
 
@@ -512,6 +522,8 @@ export function renderPostureHomeHTML(): string {
         return "Activity observed in the last 24h.";
       case "fault_evidence":
         return "A fault event was observed; not enforcing.";
+      case "exclusive_egress_not_live":
+        return "Coarse-only: the coarse wall is enforcing, but a fine-grained agent's exclusive-egress stack (gate, pf, generation) is not live.";
       case "stale_evidence":
         return "Evidence is stale; recent state cannot be confirmed.";
       case "no_evidence_self_reporting":
@@ -1322,13 +1334,32 @@ export function renderPostureHomeHTML(): string {
     var el = document.getElementById("wall");
     var meaning = w.arm_state === "armed"
       ? "The operating system is blocking unauthorized outbound connections from wrapped agents."
-      : w.arm_state === "degraded"
-        ? "The wall is present but recent evidence shows it is NOT enforcing."
-        : w.arm_state === "not_installed"
-          ? "Castle Wall is not installed on this machine."
-          : "Enforcement could not be proven from recent audit evidence. Not rendered green by design.";
+      : w.arm_state === "coarse_only"
+        ? "The coarse wall is enforcing, but a fine-grained agent's exclusive-egress stack (gate, pf, generation) is NOT live. Not green by design."
+        : w.arm_state === "degraded"
+          ? "The wall is present but recent evidence shows it is NOT enforcing."
+          : w.arm_state === "not_installed"
+            ? "Castle Wall is not installed on this machine."
+            : "Enforcement could not be proven from recent audit evidence. Not rendered green by design.";
+    // S5-P: the exclusive-egress posture block (design section 6), rendered
+    // whenever the wall posture carries it. Non-live reasons are listed so the
+    // coarse-only state is a first-class story, never a footnote.
+    var exclusiveDetail = "";
+    var x = w.exclusive_egress;
+    if (x && x.fine_grained_declared) {
+      var xLabel = x.exclusive_egress_live
+        ? "live (all fine-grained agents exclusive)"
+        : "NOT live" + (x.mode ? " (" + esc(x.mode) + ")" : "");
+      exclusiveDetail =
+        '<div class="evidence">Exclusive egress: <code>' + xLabel + "</code>" +
+        (x.reasons && x.reasons.length
+          ? " · " + esc(x.reasons.join(" · "))
+          : "") +
+        "</div>";
+    }
     el.innerHTML =
       "<div>" + wallPill(w.arm_state) + " &nbsp;" + esc(meaning) + "</div>" +
+      exclusiveDetail +
       '<div class="evidence">Platform: ' + esc(w.platform) +
       " · verdicts (24h): " + w.verdict_counts.allowed + " allowed / " + w.verdict_counts.blocked + " blocked / " +
       w.verdict_counts.operator_decisions + " operator decisions</div>" +

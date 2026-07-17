@@ -774,6 +774,9 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
       const hasPending = pendingApprovals.length > 0;
       const wallArmed = wallArmState === 'armed';
       const wallDegraded = wallArmState === 'degraded';
+      // S5-P distinct non-green: coarse wall enforcing, but a fine-grained
+      // agent's exclusive-egress stack is not live. Never green.
+      const wallCoarseOnly = wallArmState === 'coarse_only';
 
       if (hasErrors) {
         indicator.className = 'status-indicator red';
@@ -788,6 +791,15 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
         indicator.innerHTML = '&#x26A0;';
         title.textContent = 'Enforcement not active';
         subtitle.textContent = 'Castle Wall is not filtering traffic. Your agent is wrapped but not protected.';
+      } else if (wallCoarseOnly) {
+        // S5-P: the DISTINCT coarse-only state. The coarse wall is enforcing
+        // (the agent is confined to its declared destinations), but the
+        // fine-grained exclusive-egress stack (gate + pf + generation) is not
+        // live. Amber, named plainly - never green, never a vague unknown.
+        indicator.className = 'status-indicator amber';
+        indicator.innerHTML = '&#x26A0;';
+        title.textContent = 'Coarse protection only';
+        subtitle.textContent = 'Castle Wall is enforcing the coarse wall, but the fine-grained exclusive-egress gate is not live.';
       } else if (hasPending) {
         indicator.className = 'status-indicator amber';
         indicator.innerHTML = '&#x23F3;';
