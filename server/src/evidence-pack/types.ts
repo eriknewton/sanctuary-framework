@@ -267,6 +267,41 @@ export interface RetentionFacts {
    * and whether its records are in this census. See {@link DaemonStoreDisclosure}.
    */
   daemon_store: DaemonStoreDisclosure;
+  /**
+   * D5-1 (dry-bar round 5): the per-contributing-store retention breakdown so
+   * "the log is at a retention cap" is evaluated PER STORE against each store's
+   * OWN independent cap, then OR-ed -- never the MERGED two-store total compared
+   * against a single store's cap (which falsely reports "at cap" on a healthy
+   * split fortress whose combined count exceeds one store's cap while neither
+   * store is near its own). The merged {@link retained_total} /
+   * {@link retained_total_size_bytes} above stay as the all-time DISPLAY totals;
+   * this array drives the at-cap decision. Always includes the operator store;
+   * includes the daemon store only when it was merged (`included`). When absent
+   * (a legacy fixture / a caller that predates this field), the shortfall
+   * detector treats the merged top-level fields as a single conceptual store --
+   * the correct single-store computation for a non-split fortress.
+   */
+  per_store_retention?: readonly PerStoreRetention[];
+}
+
+/**
+ * D5-1: one contributing audit store's retention position, so at-cap is judged
+ * against THIS store's own configured caps (each `AuditLog` prunes on its own
+ * independent 100k-entry / 100 MB caps; two stores have 200k/200 MB combined
+ * capacity). `retained_total` / `retained_total_size_bytes` are this store's
+ * own retained figures, never the merged census total.
+ */
+export interface PerStoreRetention {
+  /** Which contributing store these figures belong to. */
+  store: "operator" | "daemon";
+  /** This store's configured maximum retained entry count (FIFO cap). */
+  max_entries: number;
+  /** This store's own retained entry count (across all time). */
+  retained_total: number;
+  /** This store's configured maximum total on-disk size in bytes. */
+  max_total_size_bytes: number;
+  /** This store's own retained on-disk size in bytes, or null if unread. */
+  retained_total_size_bytes: number | null;
 }
 
 /**

@@ -20,7 +20,10 @@ import {
   daemonStoreCliWarning,
   daemonUnreadableReason,
   deriveAuditReadOutcome,
+  mergeEverPruned,
 } from "../../src/evidence-pack/cli.js";
+import { detectShortfall } from "../../src/evidence-pack/aggregate.js";
+import { quarterWindow } from "../../src/evidence-pack/quarter.js";
 
 function entry(timestamp: string): AuditEntry {
   return {
@@ -184,6 +187,7 @@ describe("deriveAuditReadOutcome", () => {
           ],
           windowedTotal: 2,
           usage: { entryCount: 2, totalSizeBytes: 2048, everPruned: true },
+          retentionConfig: RETENTION_CONFIG,
         },
       });
       expect(outcome.status).toBe("populated");
@@ -209,6 +213,7 @@ describe("deriveAuditReadOutcome", () => {
           entries: [entry("2026-07-01T00:00:00.000Z")],
           windowedTotal: 1,
           usage: { entryCount: 1, totalSizeBytes: 512, everPruned: false },
+          retentionConfig: RETENTION_CONFIG,
         },
       });
       expect(outcome.status).toBe("populated");
@@ -230,6 +235,7 @@ describe("deriveAuditReadOutcome", () => {
           entries: [entry("2026-07-03T00:00:00.000Z")],
           windowedTotal: 1,
           usage: { entryCount: 9, totalSizeBytes: 4096, everPruned: true },
+          retentionConfig: RETENTION_CONFIG,
         },
       });
       expect(outcome.status).toBe("read_failed");
@@ -292,6 +298,7 @@ describe("deriveAuditReadOutcome", () => {
           entries: daemonEntries,
           windowedTotal: 2,
           usage: { entryCount: 2, totalSizeBytes: 2048, everPruned: false },
+          retentionConfig: RETENTION_CONFIG,
         },
       });
       expect(outcome.status).toBe("populated");
@@ -397,5 +404,199 @@ describe("daemonStoreCliWarning (G-1 follow-up: CLI summary is not a silent sing
     expect(daemonStoreCliWarning({ status: "absent", included_entry_count: 0 })).toEqual([]);
     expect(daemonStoreCliWarning({ status: "included", included_entry_count: 5 })).toEqual([]);
     expect(daemonStoreCliWarning(undefined)).toEqual([]);
+  });
+});
+
+// ─── D5-2 (dry-bar round 5): the pruned-status merge must not launder an ───
+// ─── UNKNOWN (null) into a definitive `false`. ────────────────────────────
+describe("mergeEverPruned (D5-2: null is absorbing, never laundered to false)", () => {
+  it("true dominates: any store that definitely pruned makes the merge true", () => {
+    expect(mergeEverPruned(true, false)).toBe(true);
+    expect(mergeEverPruned(false, true)).toBe(true);
+    expect(mergeEverPruned(true, null)).toBe(true);
+    expect(mergeEverPruned(null, true)).toBe(true);
+    expect(mergeEverPruned(true, true)).toBe(true);
+  });
+
+  it("an UNKNOWN (null) can NEVER become a definitive never-pruned false", () => {
+    // The exact D5-2 regression: `null || false` used to collapse to `false`,
+    // re-enabling the flattering "never pruned / no activity before X" arm from
+    // an unreadable census. It must stay UNKNOWN (null).
+    expect(mergeEverPruned(null, false)).toBeNull();
+    expect(mergeEverPruned(false, null)).toBeNull();
+    expect(mergeEverPruned(null, null)).toBeNull();
+  });
+
+  it("only two DEFINITE never-pruned reads merge to a definitive false", () => {
+    expect(mergeEverPruned(false, false)).toBe(false);
+  });
+});
+
+describe("D5-2: deriveAuditReadOutcome keeps an unreadable store's pruned-status UNKNOWN", () => {
+  it("operator pruned-status UNKNOWN + daemon false merges to null, NOT a definitive false", () => {
+    // Operator `getRetentionUsage()` threw (entryCount null / everPruned null),
+    // daemon store readable and genuinely never-pruned. The merged census must
+    // NOT assert a definitive never-pruned; it stays UNKNOWN so the flattering
+    // reassurance arm cannot fire from a census that was not fully read.
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-07-02T00:00:00.000Z")],
+      windowedTotal: 1,
+      retentionConfig: RETENTION_CONFIG,
+      usage: { entryCount: null, totalSizeBytes: 0, everPruned: null },
+      daemon: {
+        status: "included",
+        entries: [entry("2026-07-03T00:00:00.000Z")],
+        windowedTotal: 1,
+        usage: { entryCount: 1, totalSizeBytes: 512, everPruned: false },
+        retentionConfig: RETENTION_CONFIG,
+      },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status === "populated") {
+      expect(outcome.value.retention.ever_pruned).toBeNull();
+    }
+  });
+
+  it("daemon pruned-status UNKNOWN + operator false ALSO merges to null (both directions)", () => {
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-07-02T00:00:00.000Z")],
+      windowedTotal: 1,
+      retentionConfig: RETENTION_CONFIG,
+      usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+      daemon: {
+        status: "included",
+        entries: [entry("2026-07-03T00:00:00.000Z")],
+        windowedTotal: 1,
+        usage: { entryCount: null, totalSizeBytes: 0, everPruned: null },
+        retentionConfig: RETENTION_CONFIG,
+      },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status === "populated") {
+      expect(outcome.value.retention.ever_pruned).toBeNull();
+    }
+  });
+
+  it("either store definitely pruned still merges to a definitive true", () => {
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-07-02T00:00:00.000Z")],
+      windowedTotal: 1,
+      retentionConfig: RETENTION_CONFIG,
+      usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+      daemon: {
+        status: "included",
+        entries: [entry("2026-07-03T00:00:00.000Z")],
+        windowedTotal: 1,
+        usage: { entryCount: 1, totalSizeBytes: 512, everPruned: true },
+        retentionConfig: RETENTION_CONFIG,
+      },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status === "populated") {
+      expect(outcome.value.retention.ever_pruned).toBe(true);
+    }
+  });
+});
+
+// ─── D5-1 (dry-bar round 5): the merge must carry each store's OWN cap so ──
+// ─── at-cap is judged per store, not the merged total vs a single cap. ────
+describe("D5-1: deriveAuditReadOutcome builds a per-store retention breakdown", () => {
+  it("`included` emits an operator + daemon per-store breakdown, each with its OWN cap", () => {
+    // Non-truncated reads (entryCount == windowedTotal == entries.length); the
+    // point is that each store carries its OWN distinct cap, not the merged one.
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-07-02T00:00:00.000Z")],
+      windowedTotal: 1,
+      retentionConfig: { maxEntries: 100_000, maxTotalSizeBytes: 100 },
+      usage: { entryCount: 1, totalSizeBytes: 40, everPruned: false },
+      daemon: {
+        status: "included",
+        entries: [entry("2026-07-03T00:00:00.000Z")],
+        windowedTotal: 1,
+        usage: { entryCount: 1, totalSizeBytes: 30, everPruned: false },
+        retentionConfig: { maxEntries: 90_000, maxTotalSizeBytes: 90 },
+      },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status === "populated") {
+      const per = outcome.value.retention.per_store_retention;
+      expect(per).toEqual([
+        {
+          store: "operator",
+          max_entries: 100_000,
+          retained_total: 1,
+          max_total_size_bytes: 100,
+          retained_total_size_bytes: 40,
+        },
+        {
+          store: "daemon",
+          max_entries: 90_000,
+          retained_total: 1,
+          max_total_size_bytes: 90,
+          retained_total_size_bytes: 30,
+        },
+      ]);
+      // The merged DISPLAY totals still sum both stores (WATCH-2 semantics).
+      expect(outcome.value.retention.retained_total).toBe(2);
+      expect(outcome.value.retention.retained_total_size_bytes).toBe(70);
+    }
+  });
+
+  it("a non-split fortress emits only the operator store in the breakdown", () => {
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-07-02T00:00:00.000Z")],
+      windowedTotal: 1,
+      retentionConfig: RETENTION_CONFIG,
+      usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status === "populated") {
+      const per = outcome.value.retention.per_store_retention;
+      expect(per).toHaveLength(1);
+      expect(per?.[0]?.store).toBe("operator");
+    }
+  });
+
+  it("false→honest end-to-end: two stores EACH below their own cap, merged over one cap, is NOT 'at cap'", () => {
+    // The exact D5-1 falsifying state, scaled: operator 60 + daemon 50 entries,
+    // each store's OWN cap 100 (combined capacity 200). The old code summed to
+    // 110 and compared against a single 100-cap -> false "at cap". Per-store,
+    // neither store is at its own cap, so retention_at_cap must be false AND the
+    // genuine "no recorded activity before X" reassurance is NOT suppressed.
+    const opEntries = Array.from({ length: 60 }, (_, i) =>
+      entry(`2026-08-01T00:00:${String(i % 60).padStart(2, "0")}.000Z`)
+    );
+    const daemonEntries = Array.from({ length: 50 }, (_, i) =>
+      entry(`2026-08-02T00:00:${String(i % 60).padStart(2, "0")}.000Z`)
+    );
+    const outcome = deriveAuditReadOutcome({
+      entries: opEntries,
+      windowedTotal: 60,
+      retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 0 },
+      usage: { entryCount: 60, totalSizeBytes: 600, everPruned: false },
+      daemon: {
+        status: "included",
+        entries: daemonEntries,
+        windowedTotal: 50,
+        usage: { entryCount: 50, totalSizeBytes: 500, everPruned: false },
+        retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 0 },
+      },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status !== "populated") return;
+    // Sanity: the merged display total DOES exceed the single-store cap of 100.
+    expect(outcome.value.retention.retained_total).toBe(110);
+
+    const report = detectShortfall(quarterWindow({ year: 2026, quarter: 3 }), outcome.value.retention, {
+      generatedAt: "2026-11-01T00:00:00.000Z",
+      lastEntryAt: null,
+    });
+    // The healthy split fortress is NOT at a retention cap...
+    expect(report.retention_at_cap).toBe(false);
+    // ...and the false "at a retention cap"/pruned prose is gone; the earned
+    // "no recorded activity before X" reassurance renders (the daemon store is
+    // `included`, so the whole-fortress wording is correct).
+    expect(report.explanation).toMatch(/no recorded activity before/i);
+    expect(report.explanation).not.toMatch(/at a retention cap/i);
   });
 });

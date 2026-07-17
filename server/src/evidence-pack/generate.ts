@@ -27,7 +27,6 @@ import type {
   ShortfallReport,
 } from "./types.js";
 import {
-  emptyVerified,
   foldOutcome,
   populated,
   readFailed,
@@ -84,16 +83,32 @@ export interface BuildEvidencePackDeps {
   masterKey: Uint8Array;
 }
 
-/** Default (not-collected) discrete exports: all verified-empty. */
+/**
+ * D5-3 (dry-bar round 5): default (not-gathered) discrete exports. A caller
+ * that OMITS `input.discrete_exports` did not READ the transparency bundle,
+ * audit chain, or anchor evidence, so this default must NOT mint an
+ * `empty_verified` witness -- that is a definitive "read to completion, zero
+ * records" for a read that never happened, which §10 renders as three definitive
+ * negatives ("emitted no signed transparency checkpoints yet", "the audit-chain
+ * export was empty", "no public-anchor evidence is available"). That is the
+ * exact R3-5/C4 witness-minting class. A NON-read yields `read_failed`, whose
+ * §10 arms render the honest "Not included: <reason>" instead of a false empty.
+ * The shipped `runEvidencePack` always supplies real gathers; this default only
+ * covers a programmatic `buildEvidencePack` caller that omits them.
+ */
 function defaultDiscreteExports(): {
   transparency: ReadOutcome<string>;
   audit_chain: ReadOutcome<string>;
   anchor: ReadOutcome<string>;
 } {
+  const notGathered = (): ReadOutcome<string> =>
+    readFailed(
+      "discrete exports were not gathered by this pack run (the caller omitted them)."
+    );
   return {
-    transparency: emptyVerified(),
-    audit_chain: emptyVerified(),
-    anchor: emptyVerified(),
+    transparency: notGathered(),
+    audit_chain: notGathered(),
+    anchor: notGathered(),
   };
 }
 

@@ -257,14 +257,35 @@ export function detectShortfall(
     retention.earliest_retained_at === null
       ? null
       : new Date(retention.earliest_retained_at).getTime();
-  // Either FIFO cap counts as "at cap" (sweep HIGH-5): entries OR total size.
-  const atEntryCap =
-    retention.max_entries > 0 && retention.retained_total >= retention.max_entries;
-  const atSizeCap =
-    retention.max_total_size_bytes > 0 &&
-    retention.retained_total_size_bytes !== null &&
-    retention.retained_total_size_bytes >= retention.max_total_size_bytes;
-  const retentionAtCap = atEntryCap || atSizeCap;
+  // D5-1 (dry-bar round 5): "at a retention cap" is judged PER STORE against
+  // each store's OWN independent cap, then OR-ed. Each contributing `AuditLog`
+  // (operator + daemon) prunes on its own 100k-entry / 100 MB caps, so the
+  // combined healthy capacity is 200k/200 MB; comparing the MERGED two-store
+  // retained total against a SINGLE store's cap falsely reported "at cap" (and a
+  // false `retention_at_cap: true` in the signed manifest) for a healthy split
+  // fortress whose combined count crossed one store's cap while NEITHER store was
+  // near its own. When the per-store breakdown is absent (a legacy fixture / a
+  // non-split single-store caller), fall back to the merged top-level fields as
+  // ONE conceptual store -- the correct single-store computation.
+  const contributingStores =
+    retention.per_store_retention ?? [
+      {
+        max_entries: retention.max_entries,
+        retained_total: retention.retained_total,
+        max_total_size_bytes: retention.max_total_size_bytes,
+        retained_total_size_bytes: retention.retained_total_size_bytes,
+      },
+    ];
+  // Either FIFO cap counts as "at cap" for a given store (sweep HIGH-5):
+  // entries OR total size.
+  const retentionAtCap = contributingStores.some((s) => {
+    const atEntryCap = s.max_entries > 0 && s.retained_total >= s.max_entries;
+    const atSizeCap =
+      s.max_total_size_bytes > 0 &&
+      s.retained_total_size_bytes !== null &&
+      s.retained_total_size_bytes >= s.max_total_size_bytes;
+    return atEntryCap || atSizeCap;
+  });
 
   // END SIDE: coverage can never extend past the moment the report was made.
   const inProgress = generatedMs < quarterEndMs;
@@ -389,8 +410,19 @@ export function detectShortfall(
   }
   parts.push(startExplanation);
   if (!inProgress && params.lastEntryAt) {
+    // D5-4 (dry-bar round 5, C2-family residue): `lastEntryAt` is the maximum
+    // in-window timestamp across the MERGED census, which excludes a daemon
+    // store that was not read (present_unreadable/tampered/missing). When the
+    // daemon store is excluded it may hold a LATER in-window enforcement entry,
+    // so an unqualified "the last recorded audit entry ... is X" is a definitive
+    // claim the code cannot back. Scope it to the operator store (its true
+    // source) exactly like its sibling coverage sentences; when the daemon store
+    // is absent/included the merged census IS the whole story, so keep the
+    // neutral wording (no under-claim of the single-store case).
     parts.push(
-      "The last recorded audit entry inside the covered window is " +
+      (daemonExcluded
+        ? "The last recorded operator-store audit entry inside the covered window is "
+        : "The last recorded audit entry inside the covered window is ") +
         params.lastEntryAt +
         "."
     );

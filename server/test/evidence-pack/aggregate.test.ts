@@ -369,4 +369,115 @@ describe("detectShortfall", () => {
     expect(r.in_progress_quarter).toBe(false);
     expect(r.covered_to_exclusive).toBe(Q3_2026.end_exclusive);
   });
+
+  // ─── D5-1 (dry-bar round 5): at-cap judged PER STORE, not merged vs one cap ──
+  it("D5-1: two stores EACH below their own cap (merged total over one cap) is NOT at cap", () => {
+    // The falsifying state: operator 60 + daemon 50 retained, each store's own
+    // cap 100 (combined capacity 200). Old code summed to 110 and compared vs a
+    // single 100-cap -> false 'at cap' + false retention_at_cap in the signed
+    // manifest, AND suppressed the earned never-pruned reassurance.
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        retained_total: 110, // merged display total only
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: false,
+        per_store_retention: [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ],
+      }),
+      complete
+    );
+    expect(r.retention_at_cap).toBe(false);
+    expect(r.explanation).not.toMatch(/at a retention cap/i);
+    // The genuine "no recorded activity before X" reassurance is no longer
+    // suppressed by the false at-cap.
+    expect(r.explanation).toMatch(/no recorded activity before/i);
+  });
+
+  it("D5-1: a single store AT its own entry cap DOES report at cap (real pruning is not hidden)", () => {
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        retained_total: 150,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: true,
+        per_store_retention: [
+          { store: "operator", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 100, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ],
+      }),
+      complete
+    );
+    expect(r.retention_at_cap).toBe(true);
+    expect(r.explanation).toMatch(/at a retention cap/i);
+  });
+
+  it("D5-1: a store AT its own SIZE cap reports at cap (either FIFO cap counts, per store)", () => {
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: true,
+        per_store_retention: [
+          { store: "operator", max_entries: 100_000, retained_total: 10, max_total_size_bytes: 100, retained_total_size_bytes: 100 },
+        ],
+      }),
+      complete
+    );
+    expect(r.retention_at_cap).toBe(true);
+  });
+
+  it("D5-1: legacy fallback — no per_store_retention treats the merged fields as ONE store", () => {
+    // A caller/fixture predating the field: the merged top-level fields ARE a
+    // single conceptual (non-split) store, so retained_total >= cap is the
+    // correct single-store at-cap.
+    const r = detectShortfall(
+      Q3_2026,
+      ret({ retained_total: cap, earliest_retained_at: "2026-08-01T00:00:00.000Z", ever_pruned: true }),
+      complete
+    );
+    expect(r.retention_at_cap).toBe(true);
+  });
+
+  // ─── D5-4 (dry-bar round 5): scope the "last recorded entry" sentence ──────
+  it("D5-4: the 'last recorded audit entry' sentence is SCOPED to the operator store when the daemon store is excluded", () => {
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          unreadable_reason: "privilege",
+        },
+      }),
+      { generatedAt: "2026-12-01T00:00:00.000Z", lastEntryAt: "2026-09-20T00:00:00.000Z" }
+    );
+    expect(r.in_progress_quarter).toBe(false);
+    // The excluded daemon store may hold a LATER in-window entry, so the claim is
+    // scoped to the operator store rather than the whole census.
+    expect(r.explanation).toContain(
+      "The last recorded operator-store audit entry inside the covered window is 2026-09-20T00:00:00.000Z."
+    );
+    expect(r.explanation).not.toContain(
+      "The last recorded audit entry inside the covered window is 2026-09-20"
+    );
+  });
+
+  it("D5-4: keeps the neutral 'last recorded audit entry' wording when the daemon store is absent (whole census)", () => {
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: { status: "absent", included_entry_count: 0 },
+      }),
+      { generatedAt: "2026-12-01T00:00:00.000Z", lastEntryAt: "2026-09-20T00:00:00.000Z" }
+    );
+    expect(r.explanation).toContain(
+      "The last recorded audit entry inside the covered window is 2026-09-20T00:00:00.000Z."
+    );
+    expect(r.explanation).not.toContain("operator-store audit entry");
+  });
 });

@@ -1114,3 +1114,48 @@ describe("gate round 2: §7 covered-window is operator-scoped when the daemon st
     expect(accessLog).not.toMatch(/retained OPERATOR audit log spans/);
   });
 });
+
+describe("D5-3: a caller that OMITS discrete_exports never mints definitive §10 negatives", () => {
+  it("renders honest 'not gathered' read-failed §10 arms, NOT verified-empty definitives", () => {
+    // baseInput() supplies no `discrete_exports`; the generator default must NOT
+    // mint empty_verified witnesses (a definitive 'read to completion, zero
+    // records' for reads that never happened) -- the R3-5/C4 witness-minting class.
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const report = pack.files[0]!.content;
+    // The three definitive negatives minted from a NON-read are gone...
+    expect(report).not.toContain("emitted no signed transparency checkpoints yet");
+    expect(report).not.toContain("the audit-chain export was empty for this fortress");
+    expect(report).not.toContain("no public-anchor (Sigstore/Rekor) evidence is available");
+    // ...replaced by the honest not-gathered disclosure for each export.
+    expect(report).toContain("discrete exports were not gathered by this pack run");
+    // And no discrete-export FILE is signed in from a non-read.
+    const names = pack.files.map((f) => f.filename);
+    expect(names).not.toContain("transparency-bundle.json");
+    expect(names).not.toContain("audit-chain.jsonl");
+    expect(names).not.toContain("anchor-evidence.json");
+  });
+
+  it("an EXPLICIT empty_verified discrete read STILL renders the definitive-empty §10 (a real 'none')", () => {
+    // The fix scopes to the NON-read default only; a genuine verified-empty read
+    // (a real completed read that found nothing) keeps its definitive wording.
+    const input: EvidencePackInput = {
+      ...baseInput(),
+      discrete_exports: {
+        transparency: emptyVerified(),
+        audit_chain: emptyVerified(),
+        anchor: emptyVerified(),
+      },
+    };
+    const pack = buildEvidencePack(
+      input,
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("emitted no signed transparency checkpoints yet");
+    expect(report).toContain("the audit-chain export was empty for this fortress");
+    expect(report).toContain("no public-anchor (Sigstore/Rekor) evidence is available");
+  });
+});
