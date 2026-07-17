@@ -10,7 +10,7 @@
  * server/docs/perf-calibration.md and pinned in the test.
  *
  * Run:
- *   cd server && npx vite-node scripts/calibrate-d5-perf.ts
+ *   cd server && npx tsx scripts/calibrate-d5-perf.ts
  */
 
 import {

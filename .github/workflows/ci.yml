@@ -59,7 +59,7 @@ jobs:
         # a `// SAFETY:` comment or lives inside a template literal
         # (browser-side JS embedded in HTML). Doc:
         # server/docs/logging-discipline.md.
-        run: npx vite-node scripts/check-no-raw-console.ts
+        run: npx tsx scripts/check-no-raw-console.ts
 
       - name: Build (populates dist/templates for tarball tests)
         working-directory: server
