@@ -186,6 +186,15 @@ describe("runCortexExportCommand: fortress-backed sink wiring", () => {
     expect(code).toBe(1);
     expect(err.text()).toMatch(/Refused: the outbound push was not armed/);
     expect(err.text()).toMatch(/Nothing was exported over the network/);
+    // NON-VACUITY: pin the ApprovalGate path specifically. The refusal reason
+    // wrapped into the "not armed" line is the gate's Tier-1 REQUIRES_APPROVAL
+    // string ("operation requires operator approval") — which ONLY the
+    // `sink === "http"` ApprovalGate branch (:377-383) can produce. The
+    // default-deny fallback approver emits "no approval channel wired" instead,
+    // so these two assertions FAIL if that branch is removed, proving the test
+    // exercises the gate-construction path it claims to and not the fallback.
+    expect(err.text()).toMatch(/operation requires operator approval/);
+    expect(err.text()).not.toMatch(/no approval channel wired/);
   }, 30_000);
 
   it("an http sink refusal reported as JSON still exits 1 with ok:false", async () => {
@@ -206,6 +215,11 @@ describe("runCortexExportCommand: fortress-backed sink wiring", () => {
     const parsed = JSON.parse(out.text());
     expect(parsed.ok).toBe(false);
     expect(typeof parsed.refused).toBe("string");
+    // NON-VACUITY (JSON mode): `refused` carries the pipeline reason verbatim.
+    // Pin it to the gate's Tier-1 REQUIRES_APPROVAL string so this fails if the
+    // `sink === "http"` ApprovalGate branch is swapped for the fallback approver
+    // (which would emit "no approval channel wired").
+    expect(parsed.refused).toBe("operation requires operator approval");
   }, 30_000);
 });
 
