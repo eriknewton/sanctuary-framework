@@ -546,6 +546,29 @@ describe("Sovereignty Audit", () => {
       expect(gateGap!.incident_class!.id).toBe("META-SEV1-2026");
     });
 
+    it("maps the BINARY approval-gate gap to the Meta inbox-deletion incident", () => {
+      // A binary in-harness "requireApproval" hook is exactly what META-INBOX
+      // defeated: the safety instruction lived in context and was stripped by
+      // compaction. This wires the previously-dead INCIDENT_META_INBOX so the
+      // analyzer can actually report META-INBOX-2026.
+      const env = makeFingerprint({
+        sanctuary_installed: false,
+        sanctuary_version: null,
+        openclaw_detected: true,
+        openclaw_config: makeOpenClawConfig({
+          require_approval_enabled: true,
+        }),
+      });
+
+      const result = analyzeSovereignty(env, config);
+      const gateGap = result.gaps.find((g) => g.id === "GAP-L2-001");
+      expect(gateGap).toBeDefined();
+      expect(gateGap!.title).toMatch(/binary/i);
+      expect(gateGap!.incident_class).toBeDefined();
+      expect(gateGap!.incident_class!.id).toBe("META-INBOX-2026");
+      expect(gateGap!.incident_class!.name).toMatch(/inbox deletion/i);
+    });
+
     it("maps basic-sandbox gap to OpenClaw CVE incident", () => {
       const env = makeFingerprint({
         sanctuary_installed: false,
