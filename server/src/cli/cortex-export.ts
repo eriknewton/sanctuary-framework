@@ -241,6 +241,42 @@ function formatApprovalPrompt(request: ApprovalRequest): string {
   );
 }
 
+/** Minimal audit surface `buildExportAudit` needs (an `AuditLog` in production). */
+type ExportAuditSink = Pick<AuditLog, "appendCritical">;
+
+/**
+ * Build the export-lifecycle audit sink. Appends are best-effort by design -- a
+ * failed audit NEVER blocks the operator verb (the export op still runs). But a
+ * DROPPED append is made LOUD on `err` instead of silently swallowed: that
+ * silence is the exact per-flow silent-audit-emission class #946 made loud on
+ * the Swift side, and it must not re-open here. The operator sees that a
+ * lifecycle event went unrecorded, so the audit trail's completeness stays
+ * honest (a missing record is visible, not invisible).
+ *
+ * Exported so the loud-drop path is unit-testable with a throwing audit stub
+ * (the production wiring constructs the real `AuditLog` internally).
+ */
+export function buildExportAudit(auditLog: ExportAuditSink, err: Writable): ExportAudit {
+  return async (operation, details, result) => {
+    try {
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation,
+        identity_id: "operator",
+        result,
+        details,
+      });
+    } catch (error) {
+      write(
+        err,
+        `Warning: cortex-export audit append for "${operation}" was dropped ` +
+          `(${error instanceof Error ? error.message : String(error)}); the export ` +
+          `proceeded but this lifecycle event has no audit record.\n`,
+      );
+    }
+  };
+}
+
 /**
  * A file-sink line writer that APPENDS one NDJSON line to `filePath`. Never a
  * network sink. Used when the operator config sets `file_path`.
@@ -327,20 +363,9 @@ async function cmdRun(
 
     // A best-effort local audit append (a failed audit never blocks the operator
     // verb; the export lifecycle is recorded on a best-effort basis, same posture
-    // as the observe CLI).
-    const audit: ExportAudit = async (operation, details, result) => {
-      try {
-        await auditLog.appendCritical({
-          layer: "l1",
-          operation,
-          identity_id: "operator",
-          result,
-          details,
-        });
-      } catch {
-        // Best-effort only.
-      }
-    };
+    // as the observe CLI). A DROPPED append is made LOUD on stderr (never
+    // silently swallowed): see `buildExportAudit` (silent-audit-drop class #946).
+    const audit = buildExportAudit(auditLog, err);
 
     // Tier-1 approval gate, built ONLY when the outbound http lane is configured.
     // For the file sink `approve` is never invoked (enable() short-circuits), so

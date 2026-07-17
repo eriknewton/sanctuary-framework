@@ -32,12 +32,37 @@ describe("withCrossProcessLock", () => {
   let base: string;
   let storage: FilesystemStorage;
 
+  // Lock ops a test starts but whose settlement is timing-dependent (a live
+  // holder that blocks until released, a contender that rejects on timeout) are
+  // registered here so teardown can settle them BEFORE the temp dir is removed.
+  // Otherwise a still-pending holder/contender can outlive its test: when a
+  // later assertion throws before the test's own cleanup runs, the orphaned
+  // op releases (or times out) against a deleted dir and surfaces as an
+  // unhandled `CrossProcessLockError` in a *different* test's error channel
+  // (the "leaks its contender promise past teardown" flake).
+  let pending: Promise<unknown>[] = [];
+  let releasers: Array<() => void> = [];
+
+  /** Register a blocking holder's release fn + its promise for teardown. */
+  function track<T>(promise: Promise<T>, release?: () => void): Promise<T> {
+    pending.push(promise);
+    if (release) releasers.push(release);
+    return promise;
+  }
+
   beforeEach(async () => {
     base = await mkdtemp(join(tmpdir(), "xproc-lock-"));
     storage = new FilesystemStorage(join(base, "state"));
+    pending = [];
+    releasers = [];
   });
 
   afterEach(async () => {
+    // Release any still-held lock so its holder proceeds to its `finally`
+    // unlink, then swallow every tracked promise's outcome so a leaked
+    // rejection can never surface after the test. Only then remove the dir.
+    for (const release of releasers) release();
+    await Promise.allSettled(pending);
     await rm(base, { recursive: true, force: true });
   });
 
@@ -79,17 +104,26 @@ describe("withCrossProcessLock", () => {
     // Hold the lock with a long-running op, then try to acquire with a short timeout.
     let release!: () => void;
     const held = new Promise<void>((r) => (release = r));
-    const holder = withCrossProcessLock(storage, NS, LOCK, async () => {
-      await held;
-    });
+    // Track the holder + its release so teardown always settles it, even if the
+    // assertion below throws before we reach the explicit release/await.
+    const holder = track(
+      withCrossProcessLock(storage, NS, LOCK, async () => {
+        await held;
+      }),
+      release,
+    );
     // Give the holder a beat to take the lock.
     await sleep(20);
 
+    // Track the contender too: its rejection is asserted inline here, but
+    // registering it guarantees no unhandled rejection can outlive the test.
     await expect(
-      withCrossProcessLock(storage, NS, LOCK, async () => undefined, {
-        timeoutMs: 80,
-        retryMs: 10,
-      }),
+      track(
+        withCrossProcessLock(storage, NS, LOCK, async () => undefined, {
+          timeoutMs: 80,
+          retryMs: 10,
+        }),
+      ),
     ).rejects.toBeInstanceOf(CrossProcessLockError);
 
     release();
