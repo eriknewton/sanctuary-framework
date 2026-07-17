@@ -49,13 +49,14 @@ import {
   TRANSPARENCY_BUNDLE_FORMAT,
   type TransparencyBundle,
 } from "../transparency/checkpoint.js";
-import { exportAuditChain } from "../cli/audit-chain-export.js";
+import { exportAuditChain, totalRecordsSkipped } from "../cli/audit-chain-export.js";
 import type {
   CustodyFacts,
   DaemonStoreDisclosure,
   EvidencePackDiscreteExports,
   EvidencePackInput,
   InventorySnapshot,
+  PerStoreRetention,
   RetentionFacts,
 } from "./types.js";
 import {
@@ -273,8 +274,29 @@ export async function gatherDiscreteExports(
           cb();
         },
       });
-      await exportAuditChain(storage, sink);
+      const summary = await exportAuditChain(storage, sink);
       const jsonl = Buffer.concat(chunks).toString("utf8");
+      // P1-A (dry-bar round 6): one or more LISTED records were unreadable /
+      // invalid JSON / not a V2 envelope and were SKIPPED, so this export is
+      // INCOMPLETE. Distinguish "listed N, exported < N" (a corrupt / partial
+      // chain) from "listed 0" (a genuinely empty chain): never render a corrupt
+      // all-skipped chain as a definitive §10 `emptyVerified` "empty" (a false
+      // clean bill, the opposite of the tamper-evidence the export exists to
+      // provide), and never sign a silently-partial chain as complete. Disclose
+      // it as a read failure carrying the listed/exported/skipped counts.
+      const skipped = totalRecordsSkipped(summary);
+      if (skipped > 0) {
+        return readFailed(
+          "the audit-chain export could NOT be shown to be complete for this " +
+            `fortress: ${skipped} listed record(s) were unreadable, invalid, or ` +
+            "not a recognized audit record and were skipped (entries: listed " +
+            `${summary.entriesListed}, exported ${summary.entriesExported}, ` +
+            `skipped ${summary.entriesSkipped}; checkpoints: listed ` +
+            `${summary.checkpointsListed}, exported ${summary.checkpointsExported}, ` +
+            `skipped ${summary.checkpointsSkipped}). It was NOT included rather ` +
+            "than present a corrupt or incomplete chain as a complete or empty one."
+        );
+      }
       return jsonl.length > 0 ? populated(jsonl) : emptyVerified();
     } catch (e) {
       return readFailed(`the audit-chain export could not be gathered: ${(e as Error).message}`);
@@ -334,6 +356,30 @@ export async function gatherDiscreteExports(
   })();
 
   return { transparency, audit_chain, anchor };
+}
+
+/**
+ * D5-2 (dry-bar round 5): merge two stores' `ever_pruned` facts WITHOUT
+ * laundering an UNKNOWN (`null`) into a definitive `false`. `null` means a
+ * store's `getRetentionUsage()` threw, so its pruned-status is genuinely
+ * unknown; it is ABSORBING unless the other store DEFINITELY pruned:
+ *
+ *   - `true || anything    -> true`   (some store definitely pruned)
+ *   - `null || (false|null) -> null`  (an unknown can NEVER become never-pruned)
+ *   - `false || false      -> false`  (both stores definitely never pruned)
+ *
+ * The old `Boolean(a) || Boolean(b)` collapsed `null || false` to a definitive
+ * `false`, re-enabling the flattering "the log has never pruned ... no recorded
+ * activity before X" reassurance from a census that was not fully read. Exported
+ * for direct unit coverage of the three-state truth table.
+ */
+export function mergeEverPruned(
+  a: boolean | null,
+  b: boolean | null
+): boolean | null {
+  if (a === true || b === true) return true;
+  if (a === null || b === null) return null;
+  return false;
 }
 
 /**
@@ -402,6 +448,13 @@ export function deriveAuditReadOutcome(params: {
           totalSizeBytes: number;
           everPruned: boolean | null;
         };
+        /**
+         * D5-1: the daemon store's OWN retention caps. Its own `AuditLog`
+         * instance prunes on independent 100k-entry / 100 MB caps, so at-cap
+         * must be evaluated against THESE, not the operator caps applied to the
+         * merged two-store total.
+         */
+        retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
       };
 }): ReadOutcome<AuditReadData> {
   const { entries, windowedTotal, retentionConfig, usage } = params;
@@ -427,6 +480,20 @@ export function deriveAuditReadOutcome(params: {
   let retainedSizeBytes = usage.totalSizeBytes;
   let everPruned = usage.everPruned;
   let includedDaemonCount = 0;
+  // D5-1: the per-store retention breakdown that drives the at-cap decision.
+  // The operator store is always a contributor; the daemon store is added only
+  // when merged (`included`). `detectShortfall` ORs at-cap PER STORE against
+  // each store's OWN cap, so a healthy split fortress whose MERGED total exceeds
+  // one store's cap (while neither store is near its own) never renders "at cap".
+  const perStoreRetention: PerStoreRetention[] = [
+    {
+      store: "operator",
+      max_entries: retentionConfig.maxEntries,
+      retained_total: usage.entryCount ?? windowedTotal,
+      max_total_size_bytes: retentionConfig.maxTotalSizeBytes,
+      retained_total_size_bytes: usage.totalSizeBytes,
+    },
+  ];
   if (daemon.status === "included") {
     const daemonWindowTruncated =
       daemon.usage.entryCount !== null &&
@@ -445,11 +512,21 @@ export function deriveAuditReadOutcome(params: {
     includedDaemonCount = daemon.entries.length;
     retainedTotal += daemon.usage.entryCount ?? daemon.windowedTotal;
     retainedSizeBytes += daemon.usage.totalSizeBytes;
-    // Either store having pruned means early-quarter entries may be missing.
-    everPruned =
-      usage.everPruned === null && daemon.usage.everPruned === null
-        ? null
-        : Boolean(usage.everPruned) || Boolean(daemon.usage.everPruned);
+    // D5-2: merge the pruned-status WITHOUT laundering an UNKNOWN into `false`.
+    // `null` (a store whose `getRetentionUsage()` threw) is ABSORBING unless the
+    // other store definitely pruned: `true || anything -> true`,
+    // `false || null -> null`, `null || null -> null`. The old `Boolean(a)||
+    // Boolean(b)` collapsed `null || false` to a definitive `false`, re-enabling
+    // the flattering "never pruned / no activity before X" reassurance from an
+    // unreadable census. An unknown must never become a definitive never-pruned.
+    everPruned = mergeEverPruned(usage.everPruned, daemon.usage.everPruned);
+    perStoreRetention.push({
+      store: "daemon",
+      max_entries: daemon.retentionConfig.maxEntries,
+      retained_total: daemon.usage.entryCount ?? daemon.windowedTotal,
+      max_total_size_bytes: daemon.retentionConfig.maxTotalSizeBytes,
+      retained_total_size_bytes: daemon.usage.totalSizeBytes,
+    });
   }
 
   // R3-3: min-scan, never positional (entries are append-ordered, and clock
@@ -483,6 +560,8 @@ export function deriveAuditReadOutcome(params: {
         ? { unreadable_reason: daemon.unreadable_reason }
         : {}),
     },
+    // D5-1: judge at-cap per store against each store's own cap (see above).
+    per_store_retention: perStoreRetention,
   };
   // G-2: hand the generator the daemon entries separately (in addition to the
   // merged census) so it can compute how many fall INSIDE the reporting quarter
@@ -537,6 +616,9 @@ export async function readDaemonStore(
         totalSizeBytes: number;
         everPruned: boolean | null;
       };
+      // D5-1: the daemon store's OWN retention caps, so at-cap is judged against
+      // this store's independent limits, never the merged total vs a single cap.
+      retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
     }
 > {
   // C1 + C3: the marker-aware presence chokepoint distinguishes a fresh
@@ -572,6 +654,9 @@ export async function readDaemonStore(
       entries: entries as readonly AuditEntry[],
       windowedTotal: total,
       usage,
+      // D5-1: capture the daemon store's OWN retention caps for the per-store
+      // at-cap comparison (a distinct AuditLog instance with independent caps).
+      retentionConfig: daemonLog.getRetentionConfig(),
     };
   } catch (e) {
     // A strict-mode integrity failure over a READABLE store is tamper evidence,

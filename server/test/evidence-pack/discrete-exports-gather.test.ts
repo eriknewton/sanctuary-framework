@@ -143,3 +143,76 @@ describe("C4: anchor export gather from real anchoring state", () => {
     expect(out.anchor.status).toBe("read_failed");
   });
 });
+
+describe("P1-A: a corrupt/all-skipped audit chain is disclosed, never a false 'empty' or a silent partial", () => {
+  const enc = new TextEncoder();
+
+  it("all-corrupt _audit records → read_failed (NOT a definitive empty_verified)", async () => {
+    const f = await freshFortress();
+    // Plant records the raw exporter will SKIP: invalid JSON, a non-envelope
+    // object, and a wrong-schema (V1) envelope. None is a V2 audit envelope, so
+    // exportAuditChain lists 3 and exports 0 -> zero bytes. The OLD mapping turned
+    // zero bytes into emptyVerified() -> §10 "the audit-chain export was empty for
+    // this fortress", presenting a CORRUPT chain as a clean/empty one (the
+    // opposite of the tamper-evidence the export exists to provide).
+    await f.storage.write(
+      "_audit",
+      "0000000000000000000001",
+      enc.encode("this is not valid json {{{")
+    );
+    await f.storage.write(
+      "_audit",
+      "0000000000000000000002",
+      enc.encode(JSON.stringify({ hello: "world" }))
+    );
+    await f.storage.write(
+      "_audit",
+      "0000000000000000000003",
+      enc.encode(
+        JSON.stringify({
+          schema_version: 1,
+          sequence: 1,
+          prev_hash: "x",
+          entry_hash: "y",
+          timestamp: "t",
+          encrypted_payload_bytes: "z",
+        })
+      )
+    );
+    const out = await gatherDiscreteExports(f.storage, f.masterKey, "fortress-1", GEN_AT);
+    expect(out.audit_chain.status).toBe("read_failed");
+    if (out.audit_chain.status === "read_failed") {
+      expect(out.audit_chain.reason).toMatch(/skip|unreadable|complete/i);
+      // The disclosed counts distinguish "listed 3, exported 0" from "listed 0".
+      expect(out.audit_chain.reason).toMatch(/listed 3/);
+      expect(out.audit_chain.reason).toMatch(/skipped 3/);
+    }
+  });
+
+  it("partly-corrupt chain (1 valid + 1 skipped) → read_failed, NOT a silently-partial populated export", async () => {
+    const f = await freshFortress();
+    const auditLog = new AuditLog(f.storage, f.masterKey);
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: "op",
+      identity_id: "agent-a",
+      result: "success",
+    });
+    await auditLog.flush();
+    // One real V2 entry now exists; plant ONE corrupt record alongside it. The
+    // export IS partly populated (jsonl.length > 0), but the silently-dropped
+    // record makes it INCOMPLETE, so it must NOT be signed as a complete chain.
+    await f.storage.write("_audit", "zzzz-corrupt-0001", enc.encode("not json"));
+    const out = await gatherDiscreteExports(f.storage, f.masterKey, "fortress-1", GEN_AT);
+    expect(out.audit_chain.status).toBe("read_failed");
+  });
+
+  it("non-vacuity: a GENUINELY empty _audit (0 records listed) is still a verified empty, not a read failure", async () => {
+    const f = await freshFortress();
+    // No audit activity at all: listed 0, exported 0, skipped 0 -> the honest
+    // "empty" (a fresh fortress genuinely has no audit history). This proves the
+    // read_failed cases above are driven by the SKIP count, not "always fail".
+    const out = await gatherDiscreteExports(f.storage, f.masterKey, "fortress-1", GEN_AT);
+    expect(out.audit_chain.status).toBe("empty_verified");
+  });
+});
