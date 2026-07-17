@@ -243,12 +243,24 @@ export interface RetentionFacts {
   /**
    * Configured maximum total on-disk size in bytes (the OTHER FIFO cap). Audit
    * retention prunes on EITHER cap: 100,000 entries OR 100 MB by default (sweep
-   * HIGH-5). 0 means the size cap is not known to this reporter (no size-cap
-   * judgment is made). F2-R2: a non-finite or ABSENT value from an untyped
-   * caller makes at-cap NOT DETERMINABLE in the legacy single-store fallback.
+   * HIGH-5). A value `<= 0` means the size cap is not known to this reporter,
+   * and (D8-1 Leg B) an UNKNOWN cap on any contributing row makes at-cap NOT
+   * DETERMINABLE: it can prove neither "at cap" nor "below both caps", so no
+   * definitive at-cap boolean is signed and no below-caps prose renders (the
+   * pre-D8-1 "no size-cap judgment is made" allowance still earned the signed
+   * definitive `retention_at_cap: false`, which was a claim over a cap
+   * declared unknown). F2-R2: a non-finite or ABSENT value from an untyped
+   * caller equally makes at-cap NOT DETERMINABLE.
    */
   max_total_size_bytes: number;
-  /** Total on-disk size in bytes of the retained audit log, or null if unread. */
+  /**
+   * Total on-disk size in bytes of the retained audit log, or null if unread.
+   * D8-1 Leg C: an UNREAD (`null`) size on any contributing row makes at-cap
+   * NOT DETERMINABLE -- "below both its entry and size retention caps" cannot
+   * be asserted over a size dimension nobody read, and `ever_pruned === false`
+   * does not exclude `size == cap` (pruning fires only when the size EXCEEDS
+   * the cap). This deliberately reverses the earlier null-is-usable allowance.
+   */
   retained_total_size_bytes: number | null;
   /**
    * True when the audit log has EVER pruned entries (a rotation anchor exists).
@@ -296,13 +308,24 @@ export interface RetentionFacts {
 export interface PerStoreRetention {
   /** Which contributing store these figures belong to. */
   store: "operator" | "daemon";
-  /** This store's configured maximum retained entry count (FIFO cap). */
+  /**
+   * This store's configured maximum retained entry count (FIFO cap).
+   * D8-1 Leg B: `<= 0` = cap unknown => at-cap NOT DETERMINABLE.
+   */
   max_entries: number;
   /** This store's own retained entry count (across all time). */
   retained_total: number;
-  /** This store's configured maximum total on-disk size in bytes. */
+  /**
+   * This store's configured maximum total on-disk size in bytes.
+   * D8-1 Leg B: `<= 0` = cap unknown => at-cap NOT DETERMINABLE.
+   */
   max_total_size_bytes: number;
-  /** This store's own retained on-disk size in bytes, or null if unread. */
+  /**
+   * This store's own retained on-disk size in bytes, or null if unread.
+   * D8-1 Leg C: `null` (unread -- including a store whose usage read threw,
+   * Leg A) => at-cap NOT DETERMINABLE; no surface may claim the size
+   * dimension when the size was never read.
+   */
   retained_total_size_bytes: number | null;
 }
 
@@ -369,6 +392,13 @@ export interface ShortfallReport {
    * `retained_total_size_bytes`, an unknown `store` tag, a duplicate row for
    * the same store, or a non-object row): incomplete cap evidence must never
    * be evaluated as a definitive at-cap OR below-cap position.
+   * D8-1 (Dry-8 sweep): ALSO false when any contributing row is complete but
+   * not USABLE for a definitive verdict -- an entry or size cap `<= 0` (the
+   * in-band "cap not known to this reporter" encoding, Leg B) or a `null`
+   * (unread) `retained_total_size_bytes` (Leg C; including the shipped-CLI
+   * state where `getRetentionUsage()` threw while `query()` succeeded, Leg A,
+   * which previously substituted a filler size of 0 and SIGNED a definitive
+   * `retention_at_cap: false` while the prose hedged).
    * When false, every surface must treat at-cap as NOT DETERMINABLE: the prose
    * suppresses both the definitive "at a retention cap" claim AND the
    * flattering "never pruned / below both caps" reassurance, and the SIGNED

@@ -21,6 +21,7 @@ import {
   daemonUnreadableReason,
   deriveAuditReadOutcome,
   mergeEverPruned,
+  readRetentionUsage,
 } from "../../src/evidence-pack/cli.js";
 import { detectShortfall } from "../../src/evidence-pack/aggregate.js";
 import { quarterWindow } from "../../src/evidence-pack/quarter.js";
@@ -35,7 +36,10 @@ function entry(timestamp: string): AuditEntry {
   };
 }
 
-const RETENTION_CONFIG = { maxEntries: 100_000, maxTotalSizeBytes: 0 };
+// D8-1 Leg B: a 0 size cap is the in-band "cap not known" encoding and now
+// forfeits at-cap determinability, so the shared fixture carries a REAL cap
+// (matching the shipped default config, whose caps are never 0).
+const RETENTION_CONFIG = { maxEntries: 100_000, maxTotalSizeBytes: 100 * 1024 * 1024 };
 
 describe("deriveAuditReadOutcome", () => {
   it("F3: fails closed when the on-disk census exceeds the windowed total (RAM window truncated)", () => {
@@ -90,7 +94,7 @@ describe("deriveAuditReadOutcome", () => {
       entries,
       windowedTotal: 1,
       retentionConfig: RETENTION_CONFIG,
-      usage: { entryCount: null, totalSizeBytes: 0, everPruned: null },
+      usage: { entryCount: null, totalSizeBytes: null, everPruned: null },
     });
     expect(outcome.status).toBe("populated");
     if (outcome.status === "populated") {
@@ -442,7 +446,7 @@ describe("D5-2: deriveAuditReadOutcome keeps an unreadable store's pruned-status
       entries: [entry("2026-07-02T00:00:00.000Z")],
       windowedTotal: 1,
       retentionConfig: RETENTION_CONFIG,
-      usage: { entryCount: null, totalSizeBytes: 0, everPruned: null },
+      usage: { entryCount: null, totalSizeBytes: null, everPruned: null },
       daemon: {
         status: "included",
         entries: [entry("2026-07-03T00:00:00.000Z")],
@@ -467,7 +471,7 @@ describe("D5-2: deriveAuditReadOutcome keeps an unreadable store's pruned-status
         status: "included",
         entries: [entry("2026-07-03T00:00:00.000Z")],
         windowedTotal: 1,
-        usage: { entryCount: null, totalSizeBytes: 0, everPruned: null },
+        usage: { entryCount: null, totalSizeBytes: null, everPruned: null },
         retentionConfig: RETENTION_CONFIG,
       },
     });
@@ -572,14 +576,17 @@ describe("D5-1: deriveAuditReadOutcome builds a per-store retention breakdown", 
     const outcome = deriveAuditReadOutcome({
       entries: opEntries,
       windowedTotal: 60,
-      retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 0 },
+      // D8-1 Leg B: real (> 0) size caps -- a 0 cap now (correctly) forfeits
+      // at-cap determinability, and this test's point is the per-store cap
+      // comparison, which needs determinable figures.
+      retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 1_000_000 },
       usage: { entryCount: 60, totalSizeBytes: 600, everPruned: false },
       daemon: {
         status: "included",
         entries: daemonEntries,
         windowedTotal: 50,
         usage: { entryCount: 50, totalSizeBytes: 500, everPruned: false },
-        retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 0 },
+        retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 1_000_000 },
       },
     });
     expect(outcome.status).toBe("populated");
@@ -598,5 +605,141 @@ describe("D5-1: deriveAuditReadOutcome builds a per-store retention breakdown", 
     // `included`, so the whole-fortress wording is correct).
     expect(report.explanation).toMatch(/no recorded activity before/i);
     expect(report.explanation).not.toMatch(/at a retention cap/i);
+  });
+});
+
+// ─── D8-1 Leg A (Dry-8 sweep): a getRetentionUsage() throw after a successful
+// query() must thread "usage unavailable" through, never placeholder figures.
+// The shipped catch previously substituted { entryCount: null,
+// totalSizeBytes: 0, everPruned: null }; the filler 0 became a per-store
+// retained_total_size_bytes: 0 that PASSED the chokepoint's finiteness checks,
+// so the SIGNED manifest serialized a definitive retention_at_cap: false while
+// the same pack's prose hedged ("size-based pruning cannot be ruled out"). ───
+describe("D8-1 Leg A: readRetentionUsage + usage-unavailable derivation", () => {
+  const throwingLog = {
+    getRetentionUsage: async (): Promise<{
+      entryCount: number;
+      totalSizeBytes: number;
+      everPruned: boolean | null;
+    }> => {
+      throw new Error("transient storage fault");
+    },
+  };
+
+  it("readRetentionUsage returns the all-null unavailable signal on a throw (never a 0 filler)", async () => {
+    const usage = await readRetentionUsage(throwingLog);
+    expect(usage).toEqual({ entryCount: null, totalSizeBytes: null, everPruned: null });
+  });
+
+  it("readRetentionUsage passes a successful read through unchanged", async () => {
+    const usage = await readRetentionUsage({
+      getRetentionUsage: async () => ({ entryCount: 3, totalSizeBytes: 4096, everPruned: false }),
+    });
+    expect(usage).toEqual({ entryCount: 3, totalSizeBytes: 4096, everPruned: false });
+  });
+
+  it("an OPERATOR usage-throw derives an UNREAD size position and the prose-side report classifies NOT determinable", async () => {
+    // The real failure path end-to-end (unit side): the real catch, the real
+    // derivation, the real shortfall detector.
+    const usage = await readRetentionUsage(throwingLog);
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-08-02T00:00:00.000Z")],
+      windowedTotal: 1,
+      retentionConfig: RETENTION_CONFIG,
+      usage,
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status !== "populated") return;
+    // The size position is UNREAD (null), never a filler 0 pretending to be a read.
+    expect(outcome.value.retention.retained_total_size_bytes).toBeNull();
+    expect(
+      outcome.value.retention.per_store_retention?.[0]?.retained_total_size_bytes
+    ).toBeNull();
+    expect(outcome.value.retention.ever_pruned).toBeNull();
+
+    const report = detectShortfall(
+      quarterWindow({ year: 2026, quarter: 3 }),
+      outcome.value.retention,
+      { generatedAt: "2026-11-01T00:00:00.000Z", lastEntryAt: null }
+    );
+    // Pre-D8-1 this was determinable:true with a definitive at_cap:false --
+    // the exact prose/manifest divergence: the ShortfallReport (which drives
+    // every prose surface AND the manifest serialization) now converges on
+    // not-determinable.
+    expect(report.retention_at_cap_determinable).toBe(false);
+    expect(report.retention_at_cap).toBe(false);
+    expect(report.explanation).not.toMatch(/below both/i);
+    expect(report.explanation).not.toMatch(/no recorded activity before/i);
+    expect(report.explanation).toMatch(/cannot be ruled out/i);
+  });
+
+  it("a DAEMON usage-throw on a merged census equally forfeits determinability (the ~648 catch site)", async () => {
+    const daemonUsage = await readRetentionUsage(throwingLog);
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-08-02T00:00:00.000Z")],
+      windowedTotal: 1,
+      retentionConfig: RETENTION_CONFIG,
+      usage: { entryCount: 1, totalSizeBytes: 1024, everPruned: false },
+      daemon: {
+        status: "included",
+        entries: [entry("2026-08-03T00:00:00.000Z")],
+        windowedTotal: 1,
+        usage: daemonUsage,
+        retentionConfig: RETENTION_CONFIG,
+      },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status !== "populated") return;
+    // Daemon row size UNREAD; merged display size is unread too (a sum over an
+    // unread contributor is not a read figure).
+    expect(
+      outcome.value.retention.per_store_retention?.find((s) => s.store === "daemon")
+        ?.retained_total_size_bytes
+    ).toBeNull();
+    expect(outcome.value.retention.retained_total_size_bytes).toBeNull();
+
+    const report = detectShortfall(
+      quarterWindow({ year: 2026, quarter: 3 }),
+      outcome.value.retention,
+      { generatedAt: "2026-11-01T00:00:00.000Z", lastEntryAt: null }
+    );
+    expect(report.retention_at_cap_determinable).toBe(false);
+    expect(report.retention_at_cap).toBe(false);
+    expect(report.explanation).not.toMatch(/no recorded activity before/i);
+  });
+
+  it("a STALE caller still passing the old totalSizeBytes: 0 filler alongside entryCount: null is coerced to UNREAD at the derivation", () => {
+    // Belt-and-suspenders: entryCount === null means the usage read THREW, so
+    // any accompanying size figure is a placeholder by construction. The
+    // derivation must not let it reach the chokepoint as a read figure.
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-08-02T00:00:00.000Z")],
+      windowedTotal: 1,
+      retentionConfig: RETENTION_CONFIG,
+      usage: { entryCount: null, totalSizeBytes: 0, everPruned: null },
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status !== "populated") return;
+    expect(outcome.value.retention.retained_total_size_bytes).toBeNull();
+    expect(
+      outcome.value.retention.per_store_retention?.[0]?.retained_total_size_bytes
+    ).toBeNull();
+  });
+
+  it("D8-1/F3 note: usage-unavailable with a complete query() read stays populated (documented inert windowTruncated half)", async () => {
+    // The windowTruncated guard cannot fire without a census; that is inert BY
+    // DESIGN because (a) queryTruncated still guards query()'s own truncation,
+    // and (b) the unread size position makes every claim the guard protects
+    // not-determinable (pinned above). This test pins that the pack still
+    // GENERATES (best-effort usage stays best-effort; the failure mode is
+    // hedged disclosure, not a lost pack).
+    const usage = await readRetentionUsage(throwingLog);
+    const outcome = deriveAuditReadOutcome({
+      entries: [entry("2026-08-02T00:00:00.000Z"), entry("2026-08-03T00:00:00.000Z")],
+      windowedTotal: 2,
+      retentionConfig: RETENTION_CONFIG,
+      usage,
+    });
+    expect(outcome.status).toBe("populated");
   });
 });

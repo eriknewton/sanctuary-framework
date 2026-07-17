@@ -265,21 +265,42 @@ const isFiniteNumber = (v: unknown): v is number =>
   typeof v === "number" && Number.isFinite(v);
 
 /**
- * F2-R2: runtime FIELD COMPLETENESS of one contributing store position. Row
+ * F2-R2 -> D8-1: runtime USABILITY of one contributing store position. Row
  * PRESENCE alone is not determinability: a tags-only row like
  * `{ store: "operator" }` carries no cap evidence at all, yet the at-cap
  * comparison would silently evaluate its missing fields as "not at cap" and
  * let the pack SIGN a definitive flattering `retention_at_cap: false` (plus
  * the never-pruned reassurance). Every field the at-cap comparison reads must
- * be a finite number; `retained_total_size_bytes` may instead be the
- * documented `null` ("unread") -- but never `undefined` or any other type.
+ * be a finite number, and (D8-1, Dry-8 sweep) the figures must be USABLE for
+ * a definitive verdict in BOTH directions, not merely finite:
+ *
+ *  - Leg B (caps): a cap `<= 0` is the in-band "this cap is not known to this
+ *    reporter" encoding (see `types.ts`). A row whose entry or size cap is
+ *    unknown can prove NEITHER "at cap" NOR "below both caps", yet previously
+ *    still earned the definitive signed `retention_at_cap: false` and the
+ *    "below both its entry and size retention caps" prose over caps declared
+ *    UNKNOWN. Cap unknown => the store's position is not determinable.
+ *  - Leg C (unread size): `retained_total_size_bytes: null` is the documented
+ *    "size was never read" encoding (it is what the shipped CLI now carries
+ *    when `getRetentionUsage()` threw -- Leg A). A null size cannot support
+ *    "below both its entry and size retention caps" (the size dimension was
+ *    never read), and `ever_pruned === false` does not exclude `size == cap`
+ *    (pruning fires only when the size EXCEEDS the cap), so the previous
+ *    allowance let a signed definitive below-both-caps claim ride on a figure
+ *    nobody read. Unread size => the store's position is not determinable.
+ *    (This DELIBERATELY reverses the #954 null-is-usable allowance; the two
+ *    non-vacuity tests that pinned it were updated with the reversal note.)
+ *
+ * `undefined`, `NaN`, `Infinity`, and wrong-typed values remain rejected as
+ * before (F2-R2 completeness).
  */
-const storePositionComplete = (s: StoreRetentionPosition): boolean =>
+const storePositionUsable = (s: StoreRetentionPosition): boolean =>
   isFiniteNumber(s.max_entries) &&
+  s.max_entries > 0 &&
   isFiniteNumber(s.retained_total) &&
   isFiniteNumber(s.max_total_size_bytes) &&
-  (s.retained_total_size_bytes === null ||
-    isFiniteNumber(s.retained_total_size_bytes));
+  s.max_total_size_bytes > 0 &&
+  isFiniteNumber(s.retained_total_size_bytes);
 
 /**
  * D7-1 / Codex-F1+F2 (dry-bar round 7): the SINGLE chokepoint deciding whether
@@ -345,7 +366,17 @@ const storePositionComplete = (s: StoreRetentionPosition): boolean =>
  *       OR directly, so an invalid extra row could also SIGN a definitive
  *       `retention_at_cap: true` -- a signed falsehood in the OVER-claiming
  *       direction. An inconsistent census description forfeits determinability
- *       entirely (fail-safe: assert NEITHER direction).
+ *       entirely (fail-safe: assert NEITHER direction);
+ *     - D8-1 (Dry-8 sweep): any contributing row -- a breakdown row or the
+ *       legacy top-level fallback -- whose figures are finite but not USABLE
+ *       for a definitive verdict: an entry or size cap `<= 0` (the documented
+ *       in-band "cap not known to this reporter" encoding, Leg B) or a `null`
+ *       `retained_total_size_bytes` (the documented "size unread" encoding,
+ *       now ALSO what the shipped CLI carries when `getRetentionUsage()`
+ *       threw -- Leg A/C). Previously these rows validated and earned the
+ *       definitive signed `retention_at_cap: false` plus "below both its
+ *       entry and size retention caps" prose over caps declared unknown and
+ *       size figures nobody read. See {@link storePositionUsable}.
  */
 export function retentionDeterminability(
   retention: RetentionFacts
@@ -355,15 +386,17 @@ export function retentionDeterminability(
   // `Array.isArray` deliberately rejects `undefined`, a `null` smuggled past
   // the optional-array type by an untyped caller, AND any non-Array object.
   if (Array.isArray(breakdown) && breakdown.length > 0) {
-    // F2-R2: every row must be a runtime-complete object with a KNOWN store
-    // tag -- presence-only rows like `{ store: "operator" }` carry no cap
-    // evidence and must never be evaluated as "not at cap".
+    // F2-R2 -> D8-1: every row must be a runtime-USABLE object with a KNOWN
+    // store tag -- presence-only rows like `{ store: "operator" }` carry no cap
+    // evidence, and rows with an unknown (`<= 0`) cap or an unread (`null`)
+    // size carry evidence that cannot back a definitive verdict in either
+    // direction. Neither must ever be evaluated as "not at cap".
     const rowsComplete = breakdown.every(
       (s) =>
         typeof s === "object" &&
         s !== null &&
         (s.store === "operator" || s.store === "daemon") &&
-        storePositionComplete(s)
+        storePositionUsable(s)
     );
     // The operator store is part of EVERY census (`types.ts` documents the
     // breakdown invariant as "Always includes the operator store"), so a
@@ -385,16 +418,17 @@ export function retentionDeterminability(
     return { at_cap_determinable: false, contributing_stores: [] };
   }
   if (!daemonIncluded && breakdown === undefined) {
-    // F2-R2: the legacy fallback row is a CONTRIBUTING row like any other --
-    // validate the top-level figures under the same completeness rule before
-    // letting them drive a definitive at-cap/below-cap claim.
+    // F2-R2 -> D8-1: the legacy fallback row is a CONTRIBUTING row like any
+    // other -- validate the top-level figures under the same usability rule
+    // (finite, caps > 0, size actually read) before letting them drive a
+    // definitive at-cap/below-cap claim.
     const single: StoreRetentionPosition = {
       max_entries: retention.max_entries,
       retained_total: retention.retained_total,
       max_total_size_bytes: retention.max_total_size_bytes,
       retained_total_size_bytes: retention.retained_total_size_bytes,
     };
-    if (storePositionComplete(single)) {
+    if (storePositionUsable(single)) {
       return { at_cap_determinable: true, contributing_stores: [single] };
     }
   }
@@ -452,7 +486,11 @@ export function detectShortfall(
   // below caps" reassurance.
   const atCapForStore = (s: StoreRetentionPosition): boolean => {
     // Either FIFO cap counts as "at cap" for a given store (sweep HIGH-5):
-    // entries OR total size.
+    // entries OR total size. D8-1: a contributing store is guaranteed by the
+    // `retentionDeterminability` chokepoint to carry caps > 0 and a non-null
+    // (actually read) size, so the `> 0` / `!== null` guards below are
+    // defensive narrowing, never a semantic "unknown cap counts as below-cap"
+    // allowance (that allowance is retired; unknown/unread => not determinable).
     const atEntryCap = s.max_entries > 0 && s.retained_total >= s.max_entries;
     const atSizeCap =
       s.max_total_size_bytes > 0 &&
