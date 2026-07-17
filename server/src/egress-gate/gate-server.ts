@@ -25,19 +25,24 @@
  * probe errors, the gate REFUSES to proxy (503) and emits a
  * `liveness_refused` event so posture surfaces report not-protected. A
  * positive result is NEVER cached across requests: a stale positive would
- * allow the gate to proxy after the anchor was silently flushed. Concurrent
- * requests still share one in-flight probe, so the confined agent cannot
- * amplify one traffic burst into one pfctl subprocess tree per socket.
+ * allow the gate to proxy after the anchor was silently flushed. Whether
+ * concurrent requests share one in-flight probe is decided AT CONSTRUCTION
+ * from the probe's self-declared `coalescing` discriminator (see
+ * `singleFlightLiveness` on the options): a coalescing-safe (pfctl-backed)
+ * probe is single-flight so the confined agent cannot amplify one traffic
+ * burst into one pfctl subprocess tree per socket; a coalescing-forbidden
+ * (oracle) probe runs per-CONNECT so no CONNECT can join a pre-flush
+ * in-flight green. This is a construction guard, never a caller obligation.
  *
  * SUBPROCESS AMPLIFICATION IS BOUNDED (the confined agent is the adversary
  * on this socket and can open CONNECTs in a tight loop; each probe/lookup
  * spawns a child as the gate's NON-agent uid, so unbounded concurrency
  * would let the agent degrade the enforcement host past its own uid's
  * process limits -- a confused-deputy resource amplification):
- *   - the liveness probe is SINGLE-FLIGHT: concurrent requests share one
- *     in-flight probe instead of each spawning pfctl (this also bounds the
- *     not-live case, where the no-negative-caching rule would otherwise
- *     make every request pay its own probe);
+ *   - a coalescing-safe liveness probe is SINGLE-FLIGHT: concurrent
+ *     requests share one in-flight probe instead of each spawning pfctl
+ *     (this also bounds the not-live case, where the no-negative-caching
+ *     rule would otherwise make every request pay its own probe);
  *   - advisory peer lookups are capped at PEER_LOOKUP_MAX_CONCURRENT;
  *     at the cap the lookup is SKIPPED (peer_unresolved) rather than
  *     queued, because queuing would just move the amplification into
@@ -55,8 +60,11 @@
  * agent uid, or it is DENIED (403 + a `client_denied` audit event). Bearer never
  * overrides peer, and an unresolved/capped peer denies (fail-closed availability
  * bound, see `gate-client-auth.ts`). In TCB mode the gate's mandatory
- * `livenessProbe` is the root-owned signed-freshness-token oracle probe
- * (`liveness-oracle.ts`): the non-root gate verifies liveness by checking a
+ * `livenessProbe` MUST be the root-owned signed-freshness-token oracle probe
+ * (`liveness-oracle.ts`) -- the constructor REFUSES any probe that does not
+ * self-declare `coalescing: "forbidden"` AND a `binding` (fail-closed; a
+ * subprocess-backed or unbound probe cannot give a TCB gate per-CONNECT,
+ * principal-bound liveness): the non-root gate verifies liveness by checking a
  * signature, never by holding pf privilege.
  *
  * HONESTY BOUNDS: routing is kernel-enforced; destination policy here is
@@ -123,6 +131,26 @@ export const PEER_LOOKUP_MAX_CONCURRENT = 4;
 export interface GateLivenessProbe {
   check(): Promise<PfLivenessResult>;
   /**
+   * EXPLICIT coalescing discriminator (second-family fix-round on the
+   * single-flight construction guard). The probe SELF-DECLARES whether its
+   * `check()` may be coalesced under single-flight, instead of the gate
+   * INFERRING oracle-ness from the presence of `binding` (the inference
+   * conflated "principal-bound verdict" with "subprocess-free oracle": a
+   * pfctl-backed probe that grows a binding for cross-principal safety must
+   * NOT silently lose its single-flight amplification bound, and a hand-rolled
+   * oracle-style probe that forgot its binding must NOT silently keep a
+   * shared-green window):
+   *   - `"forbidden"` -- the probe is subprocess-free and its verdict must be
+   *     read PER-CONNECT (the signed-token oracle probe,
+   *     `createOracleLivenessProbe`, always declares this). The constructor
+   *     auto-disables single-flight and REFUSES `singleFlightLiveness: true`.
+   *   - `"safe"` or omitted -- coalescing concurrent CONNECTs onto one
+   *     in-flight `check()` is sound (the pfctl-backed legacy probe; omitted
+   *     covers every pre-existing probe object). The single-flight default
+   *     stays `true` regardless of whether the probe also declares `binding`.
+   */
+  readonly coalescing?: "safe" | "forbidden";
+  /**
    * OPTIONAL self-declared binding (Slice 5 S5-3; Codex F3 fix-round). When a
    * probe advertises the `{ agentUid, gatePort }` its verdict is computed for
    * (the oracle probe does), the gate cross-checks it against `policy` at
@@ -130,7 +158,9 @@ export interface GateLivenessProbe {
    * DIFFERENT agent/port (a live token for gate A) can never be wired into gate
    * B and read as live here. Generation binding is out of the gate policy's
    * knowledge and stays the wiring layer's job (`evaluateGenerationMatch`,
-   * S5-2). A probe that omits this (the legacy pf probe) is used as-is.
+   * S5-2). A probe that omits this (the legacy pf probe) is used as-is on a
+   * non-TCB gate; a TCB gate (`clientAuth` present) REQUIRES it (see
+   * {@link ExclusiveEgressGateOptions.clientAuth}).
    */
   readonly binding?: { agentUid: number; gatePort: number };
 }
@@ -166,18 +196,30 @@ export interface ExclusiveEgressGateOptions {
    * itself (capped, as in advisory mode) and feeds it to the authenticator, so
    * this REQUIRES a `peerRunner`; with none, every peer is unresolved and every
    * CONNECT denies (fail-closed). Omit for the legacy advisory behavior.
+   *
+   * TCB mode also CONSTRAINS the `livenessProbe`: the constructor REFUSES any
+   * probe that does not self-declare `coalescing: "forbidden"` AND a `binding`
+   * (i.e. anything but the oracle-probe shape, `createOracleLivenessProbe`).
+   * A TCB gate wired to a subprocess-backed or unbound probe would either keep
+   * a coalesced shared-green window or accept a cross-principal verdict, so it
+   * fails loudly at construction instead.
    */
   clientAuth?: GateClientAuthenticator;
   /**
    * Whether concurrent CONNECTs share ONE in-flight liveness probe (Slice 5
-   * S5-3; Codex F4 fix-round). For a binding-less legacy probe the default is
-   * `true`, bounding pfctl subprocess amplification. For a binding-declaring
-   * probe (the subprocess-free oracle probe) the CONSTRUCTOR enforces
-   * per-CONNECT liveness: omitting this option auto-disables single-flight,
-   * and `true` is REFUSED at construction (a shared in-flight green would let
-   * a CONNECT arriving after a flush read stale liveness -- the post-flush
-   * shared-green window; there is no amplification cost to lose). This is a
-   * construction guard, not a caller obligation.
+   * S5-3; Codex F4 fix-round). Keyed off the probe's EXPLICIT
+   * {@link GateLivenessProbe.coalescing} discriminator, never inferred. For a
+   * coalescing-safe (or undeclared, i.e. legacy pfctl-backed) probe the
+   * default is `true`, bounding pfctl subprocess amplification -- including a
+   * future pfctl-backed probe that also declares a `binding`. For a
+   * `coalescing: "forbidden"` probe (the subprocess-free oracle probe) the
+   * CONSTRUCTOR enforces per-CONNECT liveness: omitting this option
+   * auto-disables single-flight, and `true` is REFUSED at construction (a
+   * shared in-flight green would let a CONNECT arriving after a flush read
+   * stale liveness -- the post-flush shared-green window; there is no
+   * amplification cost to lose). This is a construction guard, not a caller
+   * obligation: the S5-6 wiring constructs with `createOracleLivenessProbe`
+   * and simply omits this option.
    */
   singleFlightLiveness?: boolean;
   /** Event sink for audit/posture wiring. */
@@ -277,41 +319,64 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
         `must match policy {agent_uid:${policy.agent_uid}, gate_port:${policy.gate_port}}; refusing a cross-principal liveness verdict`,
     );
   }
-  // Per-CONNECT liveness (Codex F4 fix-round; hardened to a CONSTRUCTION GUARD
-  // pre-S5-6). Single-flight shares ONE in-flight probe across concurrent
-  // CONNECTs to bound pfctl SUBPROCESS amplification -- correct for the legacy
-  // pfctl probe. The oracle probe (S5-3) spawns no subprocess (a file read +
-  // signature verify), so single-flight buys no amplification protection there
-  // and can let a CONNECT that arrived strictly AFTER a flush join an
-  // already-in-flight green read (the post-flush shared-green window). That must
-  // not be a caller obligation: for a BINDING-DECLARING probe (the oracle probe
-  // advertises `binding`; the legacy pf probe never does) the constructor
-  // auto-disables single-flight when the option is omitted, and REFUSES to
-  // construct when the caller explicitly asked for `true` -- honoring it
-  // silently would re-open the window. A binding-less probe keeps the
-  // unchanged default `true` (the pfctl path and all existing callers).
-  if (probeBinding !== undefined && options.singleFlightLiveness === true) {
+  // TCB PROBE REQUIREMENT (second-family fix-round HIGH). A TCB gate
+  // (`clientAuth` present) must run on the oracle-probe shape: a probe that
+  // SELF-DECLARES `coalescing: "forbidden"` (per-CONNECT verdict, no coalesced
+  // shared-green window) AND a `binding` (principal-bound verdict, cross-checked
+  // above). Anything else -- a legacy pfctl probe, or an oracle-style probe that
+  // forgot its marker or binding -- would give the TCB gate either a stale
+  // shared-green window or an unbound liveness verdict; refuse to construct
+  // rather than default into either.
+  const probeCoalescing = livenessProbe.coalescing;
+  if (clientAuth && (probeCoalescing !== "forbidden" || probeBinding === undefined)) {
     throw new Error(
-      "createExclusiveEgressGate: singleFlightLiveness:true is incompatible with a binding-declaring " +
+      "createExclusiveEgressGate: TCB mode (clientAuth present) requires an oracle-shape liveness probe " +
+        `that self-declares coalescing:"forbidden" AND a binding (use createOracleLivenessProbe); got ` +
+        `coalescing:${probeCoalescing === undefined ? "undeclared" : JSON.stringify(probeCoalescing)}, ` +
+        `binding:${probeBinding === undefined ? "undeclared" : "declared"}. A subprocess-backed or ` +
+        "unbound probe cannot give a TCB gate per-CONNECT, principal-bound liveness; refusing to construct.",
+    );
+  }
+  // Per-CONNECT liveness (Codex F4 fix-round; hardened to a CONSTRUCTION GUARD
+  // pre-S5-6, then keyed off the EXPLICIT `coalescing` marker in the
+  // second-family fix-round). Single-flight shares ONE in-flight probe across
+  // concurrent CONNECTs to bound pfctl SUBPROCESS amplification -- correct for
+  // the legacy pfctl probe. The oracle probe (S5-3) spawns no subprocess (a
+  // file read + signature verify), so single-flight buys no amplification
+  // protection there and can let a CONNECT that arrived strictly AFTER a flush
+  // join an already-in-flight green read (the post-flush shared-green window).
+  // That must not be a caller obligation: for a `coalescing: "forbidden"` probe
+  // (the oracle probe always self-declares it; see createOracleLivenessProbe)
+  // the constructor auto-disables single-flight when the option is omitted, and
+  // REFUSES to construct when the caller explicitly asked for `true` --
+  // honoring it silently would re-open the window. A coalescing-safe or
+  // undeclared probe keeps the unchanged default `true` (the pfctl path and all
+  // existing callers) EVEN IF it also declares a `binding`: binding means
+  // "principal-bound verdict", not "subprocess-free", and a future pfctl-backed
+  // probe that grows a binding must not silently lose its amplification bound.
+  if (probeCoalescing === "forbidden" && options.singleFlightLiveness === true) {
+    throw new Error(
+      'createExclusiveEgressGate: singleFlightLiveness:true is incompatible with a coalescing:"forbidden" ' +
         "(oracle) liveness probe: a shared in-flight probe can hand a post-flush CONNECT a stale green " +
         "verdict, and the subprocess-free oracle probe gains no amplification protection from coalescing. " +
         "Omit singleFlightLiveness (auto-disabled) or pass false.",
     );
   }
-  const singleFlight = probeBinding !== undefined ? false : (options.singleFlightLiveness ?? true);
+  const singleFlight = probeCoalescing === "forbidden" ? false : (options.singleFlightLiveness ?? true);
   let inflightProbe: Promise<PfLivenessResult> | null = null;
   let activePeerLookups = 0;
 
   /**
-   * Liveness probe wrapper. With single-flight (the default for binding-less
-   * probes), concurrent requests in the same decision window share ONE probe
-   * (one pfctl spawn set) instead of each spawning their own; the shared
-   * variable is cleared when the probe settles so no positive survives into a
-   * later request. Without single-flight (forced at construction for
-   * binding-declaring oracle probes; opt-in via `singleFlightLiveness: false`
-   * otherwise) every CONNECT runs its own probe (no shared in-flight verdict),
-   * which closes the post-flush shared-green window for the subprocess-free
-   * oracle probe. Either way the probe never rejects.
+   * Liveness probe wrapper. With single-flight (the default for
+   * coalescing-safe/undeclared probes), concurrent requests in the same
+   * decision window share ONE probe (one pfctl spawn set) instead of each
+   * spawning their own; the shared variable is cleared when the probe settles
+   * so no positive survives into a later request. Without single-flight
+   * (forced at construction for `coalescing: "forbidden"` oracle probes;
+   * opt-in via `singleFlightLiveness: false` otherwise) every CONNECT runs its
+   * own probe (no shared in-flight verdict), which closes the post-flush
+   * shared-green window for the subprocess-free oracle probe. Either way the
+   * probe never rejects.
    */
   function probeLiveness(): Promise<PfLivenessResult> {
     if (!singleFlight) {

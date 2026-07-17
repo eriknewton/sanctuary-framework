@@ -47,6 +47,14 @@ const acceptRecord: GateCredentialAcceptRecord = {
 };
 const acceptSource: GateAcceptSource = { current: () => Promise.resolve(acceptRecord) };
 const liveProbe: GateLivenessProbe = { check: () => Promise.resolve({ live: true, reasons: [] }) };
+// TCB gates additionally require the oracle-shape probe (coalescing:"forbidden"
+// + a policy-matching binding); `liveProbe` above stays marker-less for the
+// legacy (non-TCB) paths under test.
+const tcbLiveProbe: GateLivenessProbe = {
+  coalescing: "forbidden",
+  binding: { agentUid: AGENT_UID, gatePort: GATE_PORT },
+  check: () => Promise.resolve({ live: true, reasons: [] }),
+};
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -61,11 +69,18 @@ describe("F1 refute: cross-principal client authenticator", () => {
     ).toThrow(/must equal policy\.agent_uid/);
   });
 
-  it("builds when the authenticator uid matches policy (control)", () => {
+  it("builds when the authenticator uid matches policy (control; TCB needs the oracle-shape probe)", () => {
+    const okAuth = createGateClientAuthenticator({ agentUid: AGENT_UID, acceptSource });
+    expect(() =>
+      createExclusiveEgressGate({ policy, rules: [], livenessProbe: tcbLiveProbe, clientAuth: okAuth, peerRunner: { run: () => Promise.resolve({ code: 1, stdout: "" }) } }),
+    ).not.toThrow();
+  });
+
+  it("ATTACK (second-family HIGH): a TCB gate wired to a marker-less legacy probe must be REFUSED, never defaulted to single-flight", () => {
     const okAuth = createGateClientAuthenticator({ agentUid: AGENT_UID, acceptSource });
     expect(() =>
       createExclusiveEgressGate({ policy, rules: [], livenessProbe: liveProbe, clientAuth: okAuth, peerRunner: { run: () => Promise.resolve({ code: 1, stdout: "" }) } }),
-    ).not.toThrow();
+    ).toThrow(/TCB mode \(clientAuth present\) requires an oracle-shape liveness probe/);
   });
 
   it("even with a VALID credential a wrong peer uid still DENIES at runtime (bearer never overrides peer)", () => {

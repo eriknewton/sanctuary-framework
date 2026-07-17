@@ -47,7 +47,13 @@ const acceptRecord: GateCredentialAcceptRecord = {
   secret_sha256: sha256Hex(SECRET),
 };
 const acceptSource: GateAcceptSource = { current: () => Promise.resolve(acceptRecord) };
-const liveProbe: GateLivenessProbe = { check: () => Promise.resolve({ live: true, reasons: [] }) };
+// TCB gates require the oracle-shape probe (coalescing:"forbidden" + a
+// policy-matching binding); the gate refuses construction otherwise.
+const liveProbe: GateLivenessProbe = {
+  coalescing: "forbidden",
+  binding: { agentUid: AGENT_UID, gatePort: 19997 },
+  check: () => Promise.resolve({ live: true, reasons: [] }),
+};
 const validHeader = formatGateCredentialHeader({ generation_id: GEN, secret: SECRET });
 
 function allowRule(host: string, port: number): AllowlistRule {
@@ -133,7 +139,11 @@ describe("REFUTE gate TCB integration: auth must not bypass destination policy o
   it("ATTACK valid credential + matched peer but liveness DEAD — must 503, never tunnel", async () => {
     const upstream = await startUpstream();
     cleanups.push(upstream.close);
-    const deadProbe: GateLivenessProbe = { check: () => Promise.resolve({ live: false, reasons: ["pf anchor flushed"] }) };
+    const deadProbe: GateLivenessProbe = {
+      coalescing: "forbidden",
+      binding: { agentUid: AGENT_UID, gatePort: 19997 },
+      check: () => Promise.resolve({ live: false, reasons: ["pf anchor flushed"] }),
+    };
     const { port } = await startTcbGate({ rules: [allowRule("127.0.0.1", upstream.port)], livenessProbe: deadProbe });
     const result = await rawConnect(port, `127.0.0.1:${upstream.port}`, validHeader);
     expect(result.statusLine).toBe("HTTP/1.1 503 Service Unavailable");
