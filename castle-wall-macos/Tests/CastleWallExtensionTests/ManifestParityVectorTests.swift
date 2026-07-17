@@ -339,6 +339,73 @@ final class ManifestParityVectorTests: XCTestCase {
         XCTAssertEqual(gateRule.scope.uids, [601])
     }
 
+    /// S5-4 (2026-07-16 exclusive routing manifest composition): the shapes
+    /// the exclusive-routing composer actually emits -- a provisioned
+    /// endpoint rule RE-SCOPED to the gate principal (`scope.uids = [601]`)
+    /// and the derived gate-channel rule bound to the AGENT principal
+    /// (`scope.uids = [600]`) -- inside one signed body carrying both
+    /// confined uids. Proves the Swift canonicalizer + verifier agree
+    /// byte-for-byte with the Node composer on the S5-4 composition, and
+    /// that both rules' scopes survive verification intact. See the TS-side
+    /// half ("exclusive-routing vector (S5-4)...") in
+    /// server/test/castle-wall/runtime/manifest-parity-vector.test.ts.
+    func testExclusiveRoutingVectorCanonicalBytesAndSignatureParity() throws {
+        let fixture = try loadFixture(named: "manifest-parity-vector-exclusive-routing")
+        let expectedBytes = try XCTUnwrap(Data(base64Encoded: fixture.expectedCanonicalJsonB64))
+
+        XCTAssertEqual(fixture.manifestSignedBody.agentOrigin?.gateUid, 601)
+        XCTAssertEqual(fixture.rules[0].scope.uids, [601])
+        XCTAssertEqual(fixture.rules[1].id, "derived_exclusive_egress_gate")
+        XCTAssertEqual(fixture.rules[1].scope.uids, [600])
+
+        let actualBytes = try SignedManifestVerifier.canonicalJSONData(fixture.manifestSignedBody)
+        XCTAssertEqual(actualBytes, expectedBytes)
+        XCTAssertEqual(actualBytes.hexEncodedString(), fixture.expectedCanonicalJsonHex)
+
+        // Build the wire message from the RAW fixture JSON (like
+        // `testSlashBearingEgressManifestVerifies`) so `receivedRules` is
+        // populated: the provisioned + derived rules carry `derived: true`,
+        // which the Codable `ManifestRule` re-encode drops. The per-rule
+        // digest recompute canonicalizes the RAW received rule (with
+        // `derived`) exactly as the production IPC path does; passing decoded
+        // `ManifestRule`s (no `receivedRules`) would digest a `derived`-less
+        // re-encode and diverge from the Node-signed digest.
+        let fixtureJSON = try JSONSerialization.jsonObject(
+            with: Data(contentsOf: fixtureURL(named: "manifest-parity-vector-exclusive-routing"))
+        ) as! [String: Any]
+        let wire: [String: Any] = [
+            "type": "manifest_updated",
+            "manifest": fixtureJSON["manifest_signed_body"]!,
+            "signature": [
+                "signature_scheme": CastleWallConstants.signatureSchemeV1,
+                "signing_key_id": "parity-test-key",
+                "signature_b64url": fixture.testSignatureB64url,
+            ],
+            "rules": fixtureJSON["rules"]!,
+        ]
+        let wireData = try JSONSerialization.data(withJSONObject: wire)
+        let message = try JSONDecoder().decode(ManifestUpdatedBody.self, from: wireData)
+        XCTAssertNotNil(message.receivedRules)
+        let pinnedPublicKey = try Base64URL.decode(fixture.testPublicKeyB64url)
+
+        let snapshot = try SignedManifestVerifier.verifiedSnapshot(
+            from: message,
+            pinnedPublicKey: pinnedPublicKey,
+            now: Date(timeIntervalSince1970: 0)
+        )
+        XCTAssertEqual(snapshot.rules.count, fixture.rules.count)
+        XCTAssertEqual(snapshot.agentOrigin?.agentUid, 600)
+        XCTAssertEqual(snapshot.agentOrigin?.gateUid, 601)
+
+        // Both S5-4 scopes survive verification: the endpoint allow binds to
+        // the gate principal ONLY (the agent must not match it), and the
+        // gate-channel allow binds to the agent principal ONLY.
+        let endpointRule = try XCTUnwrap(snapshot.rules.first { $0.id.hasPrefix("provisioned-hermes-") })
+        XCTAssertEqual(endpointRule.scope.uids, [601])
+        let channelRule = try XCTUnwrap(snapshot.rules.first { $0.id == "derived_exclusive_egress_gate" })
+        XCTAssertEqual(channelRule.scope.uids, [600])
+    }
+
     private func loadFixture() throws -> Fixture {
         return try loadFixture(named: "manifest-parity-vector")
     }

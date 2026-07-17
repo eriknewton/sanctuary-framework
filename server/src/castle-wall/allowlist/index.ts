@@ -38,4 +38,22 @@ export {
   validateExclusiveEgressGatePolicy,
   deriveGateAllowRule,
   type ExclusiveEgressGatePolicy,
+  type DeriveGateAllowRuleOptions,
 } from "./gate-derivation.js";
+
+export {
+  EXCLUSIVE_ROUTING_COARSE_FALLBACK_AUDIT_OP,
+  ExclusiveRoutingViolationError,
+  ExclusiveRoutingResidueError,
+  allowRuleScopeReachesAgent,
+  ruleIsLoopbackOnly,
+  assertExclusiveRoutingComposition,
+  composeExclusiveRoutingRules,
+  type ConfinedAgentIdentity,
+  type ExclusiveRoutingPrincipals,
+  type ExclusiveRoutingViolation,
+  type ExclusiveRoutingCompositionReport,
+  type CoarseFallbackAuditRecord,
+  type ExclusiveRoutingRequest,
+  type ExclusiveRoutingComposition,
+} from "./exclusive-routing.js";

@@ -215,4 +215,77 @@ describe("castle-wall manifest canonical parity vector", () => {
       expect(digest).toBe(fixture.manifest_signed_body.rules[index]?.sha256);
     }
   });
+
+  it("exclusive-routing vector (S5-4): gate-scoped provisioned rule + agent-scoped gate channel canonicalize and verify", async () => {
+    const fixture = await loadNamedFixture("manifest-parity-vector-exclusive-routing");
+
+    // The S5-4 composition shapes: the provisioned endpoint rule is RE-SCOPED
+    // to the gate principal (601), and the derived gate-channel rule binds to
+    // the AGENT principal (600). Regenerate both from the REAL producers so
+    // the fixture can never drift from what the composition actually emits.
+    expect(fixture.manifest_signed_body.agent_origin?.gate_uid).toBe(601);
+    expect(fixture.rules[0]?.scope.uids).toEqual([601]);
+    expect(fixture.rules[1]?.id).toBe("derived_exclusive_egress_gate");
+    expect(fixture.rules[1]?.scope.uids).toEqual([600]);
+
+    const { buildProvisionedEgressRules } = await import(
+      "../../../src/castle-wall/provision/egress.js"
+    );
+    const { deriveGateAllowRule } = await import(
+      "../../../src/castle-wall/allowlist/gate-derivation.js"
+    );
+    const createdAt = fixture.rules[0]!.created_at;
+    const [expectedProvisioned] = buildProvisionedEgressRules(
+      {
+        harnessId: "hermes",
+        endpoints: [
+          {
+            name: "LLM (Venice)",
+            host: "api.venice.ai",
+            port: 443,
+            protocol: "tcp",
+            riskClass: "standard",
+          },
+        ],
+      },
+      createdAt,
+      { mode: "exclusive", gate_uid: 601 },
+    );
+    expect(fixture.rules[0]).toEqual(expectedProvisioned);
+    expect(fixture.rules[1]).toEqual(
+      deriveGateAllowRule({ agent_uid: 600, gate_port: 49152 }, createdAt, {
+        scope_to_agent_uid: true,
+      }),
+    );
+
+    const actualCanonical = new TextEncoder().encode(
+      canonicalize(fixture.manifest_signed_body),
+    );
+    expect(Buffer.from(actualCanonical).toString("hex")).toBe(
+      fixture.expected_canonical_json_hex,
+    );
+    expect(
+      Buffer.compare(
+        Buffer.from(actualCanonical),
+        Buffer.from(fixture.expected_canonical_json_b64, "base64"),
+      ),
+    ).toBe(0);
+
+    const verified = ed25519.verify(
+      Buffer.from(fixture.test_signature_b64url, "base64url"),
+      actualCanonical,
+      Buffer.from(fixture.test_public_key_b64url, "base64url"),
+    );
+    expect(verified).toBe(true);
+
+    // Per-rule digest parity for both S5-4 shapes.
+    const { createHash } = await import("node:crypto");
+    for (const [index, rule] of fixture.rules.entries()) {
+      const ruleCanonical = canonicalize(rule);
+      const digest = createHash("sha256")
+        .update(Buffer.from(ruleCanonical))
+        .digest("hex");
+      expect(digest).toBe(fixture.manifest_signed_body.rules[index]?.sha256);
+    }
+  });
 });
