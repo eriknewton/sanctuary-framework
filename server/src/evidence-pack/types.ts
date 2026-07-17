@@ -349,9 +349,25 @@ export interface ShortfallReport {
    * True when the retained log is at or above its FIFO cap, which means
    * pruning is actively occurring and early-quarter entries were LIKELY
    * dropped (as opposed to the fortress simply having no earlier activity).
-   * Distinguishing these two causes keeps the disclosure honest.
+   * Distinguishing these two causes keeps the disclosure honest. When
+   * {@link retention_at_cap_determinable} is false this stays `false` ONLY
+   * because at-cap was never asserted, NOT because below-cap was proven.
    */
   retention_at_cap: boolean;
+  /**
+   * D7-1 / Codex-F1 (dry-bar round 7): whether {@link retention_at_cap} could
+   * honestly be COMPUTED at all, decided by the single
+   * `retentionDeterminability` chokepoint. False when the retention facts
+   * carried no usable per-store breakdown (`per_store_retention` absent,
+   * `null`, empty, or missing the daemon row while the daemon store is
+   * `included`) for anything other than the genuine legacy single-store case.
+   * When false, every surface must treat at-cap as NOT DETERMINABLE: the prose
+   * suppresses both the definitive "at a retention cap" claim AND the
+   * flattering "never pruned / below both caps" reassurance, and the SIGNED
+   * manifest serializes an explicit not-determinable marker instead of a
+   * definitive `retention_at_cap` boolean.
+   */
+  retention_at_cap_determinable: boolean;
   /**
    * True when the ENTIRE retained window post-dates the quarter, so ZERO of the
    * quarter is covered even though the nominal signed span reaches the quarter
@@ -573,7 +589,26 @@ export interface EvidencePackManifest {
         shortfall: boolean;
         /** True when the quarter had not ended at generation time (partial quarter). */
         in_progress_quarter: boolean;
-        retention_at_cap: boolean;
+        /**
+         * Codex-F1 (dry-bar round 7): present ONLY when at-cap was actually
+         * computable ({@link ShortfallReport.retention_at_cap_determinable}).
+         * Exactly ONE of `retention_at_cap` /
+         * `retention_at_cap_determinable: false` is serialized: a definitive
+         * boolean when at-cap was computed, the explicit marker when it was
+         * not. A definitive `retention_at_cap: false` ("not at a retention
+         * cap") must NEVER be signed for a state where at-cap could not be
+         * determined (a merged census with no usable per-store breakdown).
+         */
+        retention_at_cap?: boolean;
+        /**
+         * Serialized as `false` ONLY when at-cap was NOT determinable (and
+         * `retention_at_cap` is then omitted). Omitted entirely (never `true`)
+         * when `retention_at_cap` is present, so the shipped CLI path's
+         * manifest shape is unchanged. Mirrors the top-level
+         * `determinable: false` convention: a machine consumer that sees this
+         * marker knows the at-cap fact was not computed, not that it is false.
+         */
+        retention_at_cap_determinable?: false;
         /**
          * G-1 (two-family gate follow-up): the F2 daemon enforcement store's
          * disclosure, machine-readable, so a verifier reading `shortfall: false`

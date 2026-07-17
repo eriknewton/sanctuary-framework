@@ -15,6 +15,7 @@ import {
   aggregateQuarter,
   categorizeEntry,
   detectShortfall,
+  retentionDeterminability,
 } from "../../src/evidence-pack/aggregate.js";
 import {
   parseQuarterLabel,
@@ -493,6 +494,168 @@ describe("detectShortfall", () => {
     );
     expect(r.retention_at_cap).toBe(true);
     expect(r.explanation).toMatch(/at a retention cap/i);
+  });
+
+  // ─── D7-1 / Codex-F2 (dry-bar round 7): the retention-determinability
+  // chokepoint. The P1-B guard keyed on `=== undefined`, so an INCOMPLETE or
+  // INCONSISTENT breakdown (empty `[]`, a `null` from an untyped caller, an
+  // operator-only row while the daemon is `included`) slipped past it into the
+  // single-store fallback, reviving the flattering "never pruned / below both
+  // caps / no recorded activity before X" reassurance from a merged census
+  // whose cap position was never supplied. Every no-usable-breakdown variant
+  // must now classify as NOT determinable on BOTH the prose and manifest paths. ─
+  describe("D7-1/F2: not-determinable per_store_retention variants (prose path)", () => {
+    // The round-7 revival state: a MERGED census (daemon `included`) whose
+    // merged retained_total (110) exceeds ONE store's cap (100), never-pruned,
+    // starting mid-quarter.
+    const mergedOverCap = (
+      perStore: RetentionFacts["per_store_retention"]
+    ): RetentionFacts =>
+      ret({
+        max_entries: 100,
+        retained_total: 110,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: false,
+        daemon_store: { status: "included", included_entry_count: 50 },
+        per_store_retention: perStore,
+      });
+
+    const variants: Array<[string, RetentionFacts["per_store_retention"]]> = [
+      ["absent (undefined)", undefined],
+      ["empty ([])", []],
+      // Type-invalid, but reachable from a JS / JSON.parse caller of the
+      // exported buildEvidencePack -- the exact Codex round-7 vector.
+      ["null (untyped caller)", null as unknown as undefined],
+      [
+        "operator-only while the daemon store is `included`",
+        [
+          {
+            store: "operator",
+            max_entries: 100,
+            retained_total: 60,
+            max_total_size_bytes: 0,
+            retained_total_size_bytes: 0,
+          },
+        ],
+      ],
+    ];
+
+    for (const [name, perStore] of variants) {
+      it(`suppresses at-cap AND the flattering reassurance for ${name}`, () => {
+        const r = detectShortfall(Q3_2026, mergedOverCap(perStore), complete);
+        // Never a definitive at-cap either way.
+        expect(r.retention_at_cap).toBe(false);
+        expect(r.retention_at_cap_determinable).toBe(false);
+        expect(r.explanation).not.toMatch(/at a retention cap/i);
+        // Never the flattering reassurance from an unknown cap position.
+        expect(r.explanation).not.toMatch(/never pruned/i);
+        expect(r.explanation).not.toMatch(/below both/i);
+        expect(r.explanation).not.toMatch(/no recorded activity before/i);
+        // Hedges instead (over-warn is the safe direction).
+        expect(r.explanation).toMatch(/cannot be ruled out/i);
+      });
+    }
+
+    it("non-vacuity: a COMPLETE breakdown (operator + daemon rows) stays determinable with unchanged prose", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        mergedOverCap([
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ]),
+        complete
+      );
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.retention_at_cap_determinable).toBe(true);
+      // The EARNED reassurance still fires when the breakdown proves below-cap.
+      expect(r.explanation).toMatch(/no recorded activity before/i);
+    });
+
+    it("non-vacuity: the legacy single-store fallback (undefined breakdown, daemon NOT included) stays determinable", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          max_entries: 100,
+          retained_total: 110,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: true,
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        }),
+        complete
+      );
+      expect(r.retention_at_cap).toBe(true);
+      expect(r.retention_at_cap_determinable).toBe(true);
+      expect(r.explanation).toMatch(/at a retention cap/i);
+    });
+
+    it("fail-safe: an explicitly-supplied EMPTY breakdown is not-determinable even on a single-store census", () => {
+      // The caller asserted a breakdown and delivered nothing usable; under the
+      // old code `[]` made at-cap false and (never-pruned) revived "no recorded
+      // activity before X" even with the only present cap figure AT cap.
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          max_entries: 100,
+          retained_total: 100,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: false,
+          daemon_store: { status: "absent", included_entry_count: 0 },
+          per_store_retention: [],
+        }),
+        complete
+      );
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.explanation).not.toMatch(/no recorded activity before/i);
+      expect(r.explanation).toMatch(/cannot be ruled out/i);
+    });
+  });
+
+  describe("D7-1: retentionDeterminability chokepoint routing", () => {
+    it("routes a usable breakdown through as the contributing stores", () => {
+      const rows = [
+        { store: "operator" as const, max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        { store: "daemon" as const, max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+      ];
+      const d = retentionDeterminability(
+        ret({
+          daemon_store: { status: "included", included_entry_count: 50 },
+          per_store_retention: rows,
+        })
+      );
+      expect(d.at_cap_determinable).toBe(true);
+      expect(d.contributing_stores).toBe(rows);
+    });
+
+    it("builds the single conceptual store from the top-level fields for the legacy case", () => {
+      const d = retentionDeterminability(
+        ret({
+          max_entries: 100,
+          retained_total: 110,
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        })
+      );
+      expect(d.at_cap_determinable).toBe(true);
+      expect(d.contributing_stores).toEqual([
+        {
+          max_entries: 100,
+          retained_total: 110,
+          max_total_size_bytes: 100 * 1024 * 1024,
+          retained_total_size_bytes: 0,
+        },
+      ]);
+    });
+
+    it("returns no contributing stores when not determinable (at-cap can never be computed)", () => {
+      const d = retentionDeterminability(
+        ret({
+          daemon_store: { status: "included", included_entry_count: 50 },
+          per_store_retention: [],
+        })
+      );
+      expect(d.at_cap_determinable).toBe(false);
+      expect(d.contributing_stores).toEqual([]);
+    });
   });
 
   // ─── D5-4 (dry-bar round 5): scope the "last recorded entry" sentence ──────

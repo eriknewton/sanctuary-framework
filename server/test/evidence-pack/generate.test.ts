@@ -28,6 +28,7 @@ import {
   type BuildEvidencePackDeps,
 } from "../../src/evidence-pack/generate.js";
 import { canonicalJSON } from "../../src/evidence-pack/signer.js";
+import { deriveAuditReadOutcome } from "../../src/evidence-pack/cli.js";
 import { emptyInventorySnapshot } from "../../src/evidence-pack/inventory.js";
 import {
   populated,
@@ -162,6 +163,146 @@ describe("buildEvidencePack", () => {
     expect(agg(pack).by_category.allowed).toBe(1);
     expect(agg(pack).by_category.denied).toBe(1);
     expect(agg(pack).by_category.human_approved).toBe(1);
+  });
+
+  // ─── Codex-F1 / D7-1 (dry-bar round 7): the SIGNED manifest must never
+  // serialize a definitive `retention_at_cap` boolean for a state where at-cap
+  // was NOT determinable (a merged census with no usable per-store breakdown).
+  // It emits the explicit `retention_at_cap_determinable: false` marker and
+  // omits the boolean, mirroring the top-level `determinable: false` convention. ─
+  describe("F1: manifest retention_at_cap determinability", () => {
+    // The round-7 state: daemon `included`, merged retained_total (110) over
+    // one store's cap (100), never-pruned, earliest after the quarter start.
+    function mergedOverCap(
+      perStore: RetentionFacts["per_store_retention"]
+    ): RetentionFacts {
+      return {
+        max_entries: 100,
+        retained_total: 110,
+        max_total_size_bytes: 100 * 1024 * 1024,
+        retained_total_size_bytes: 0,
+        ever_pruned: false,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        daemon_store: { status: "included", included_entry_count: 50 },
+        per_store_retention: perStore,
+      };
+    }
+
+    const variants: Array<[string, RetentionFacts["per_store_retention"]]> = [
+      ["absent (undefined)", undefined],
+      ["empty ([])", []],
+      ["null (untyped caller)", null as unknown as undefined],
+      [
+        "operator-only while the daemon store is `included`",
+        [
+          {
+            store: "operator",
+            max_entries: 100,
+            retained_total: 60,
+            max_total_size_bytes: 0,
+            retained_total_size_bytes: 0,
+          },
+        ],
+      ],
+    ];
+
+    for (const [name, perStore] of variants) {
+      it(`serializes the not-determinable marker (never a definitive boolean) for ${name}`, () => {
+        const pack = buildEvidencePack(
+          baseInput(),
+          deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], mergedOverCap(perStore))
+        );
+        const c = coverage(pack);
+        // The definitive boolean is OMITTED...
+        expect("retention_at_cap" in c).toBe(false);
+        // ...and the explicit marker is present.
+        expect(c.retention_at_cap_determinable).toBe(false);
+        // The serialized SIGNED manifest agrees byte-for-byte with the typed view
+        // (the marker key name contains the boolean's, so match the exact key).
+        const json = canonicalJSON(pack.manifest);
+        expect(json).toContain('"retention_at_cap_determinable":false');
+        expect(json).not.toContain('"retention_at_cap":');
+        // The report PROSE for the same render hedges: no flattering reassurance.
+        const report = pack.files[0]!.content;
+        expect(report).not.toMatch(/below both/i);
+        expect(report).not.toMatch(/no recorded activity before/i);
+        expect(report).toMatch(/cannot be ruled out/i);
+      });
+    }
+
+    it("non-vacuity: a determinable render serializes the definitive boolean, NO marker, and the pre-change key shape", () => {
+      const pack = buildEvidencePack(
+        baseInput(),
+        deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+      );
+      const c = coverage(pack);
+      expect(c.retention_at_cap).toBe(false);
+      expect("retention_at_cap_determinable" in c).toBe(false);
+      // The determinable manifest coverage shape is UNCHANGED by the round-7 fix.
+      expect(Object.keys(c)).toEqual([
+        "determinable",
+        "covered_from",
+        "covered_to_exclusive",
+        "shortfall",
+        "in_progress_quarter",
+        "retention_at_cap",
+        "daemon_store",
+      ]);
+    });
+
+    it("shipped-CLI-path: retention derived by deriveAuditReadOutcome (daemon included) stays determinable with an unchanged manifest shape", () => {
+      // runEvidencePack derives its RetentionFacts exclusively through
+      // deriveAuditReadOutcome, which ALWAYS seeds a complete per-store
+      // breakdown (operator row + daemon row when merged), so a real CLI pack
+      // must never hit the not-determinable branch. Exercises the same
+      // derivation + generation components runEvidencePack composes.
+      // Full untruncated reads (entryCount == entries read == windowed total)
+      // so the derivation's fail-closed truncation guards do not fire: operator
+      // 60 + daemon 50 retained -> merged 110 over one store's 100 cap while
+      // NEITHER store is at its own cap.
+      const operatorEntries = Array.from({ length: 60 }, (_, i) =>
+        entry(`2026-08-02T00:00:${String(i).padStart(2, "0")}.000Z`, "gate_allow:op")
+      );
+      const daemonEntries = Array.from({ length: 50 }, (_, i) =>
+        entry(`2026-08-03T00:00:${String(i).padStart(2, "0")}.000Z`, "gate_deny:daemon")
+      );
+      const outcome = deriveAuditReadOutcome({
+        entries: operatorEntries,
+        windowedTotal: 60,
+        retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 0 },
+        usage: { entryCount: 60, totalSizeBytes: 1024, everPruned: false },
+        daemon: {
+          status: "included",
+          entries: daemonEntries,
+          windowedTotal: 50,
+          usage: { entryCount: 50, totalSizeBytes: 1024, everPruned: false },
+          retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 0 },
+        },
+      });
+      if (outcome.status !== "populated") throw new Error("expected populated");
+      // The merged total (110) exceeds one store's cap (100) -- the exact
+      // figures that are NOT determinable when hand-built without a breakdown --
+      // but the shipped derivation carries the complete breakdown, so the
+      // manifest serializes the definitive (false) boolean and no marker.
+      expect(outcome.value.retention.retained_total).toBe(110);
+      const pack = buildEvidencePack(baseInput(), {
+        audit: outcome,
+        signer,
+        masterKey,
+      });
+      const c = coverage(pack);
+      expect(c.retention_at_cap).toBe(false);
+      expect("retention_at_cap_determinable" in c).toBe(false);
+      expect(Object.keys(c)).toEqual([
+        "determinable",
+        "covered_from",
+        "covered_to_exclusive",
+        "shortfall",
+        "in_progress_quarter",
+        "retention_at_cap",
+        "daemon_store",
+      ]);
+    });
   });
 
   it("discloses a covered-window shortfall in the manifest and the report", () => {
