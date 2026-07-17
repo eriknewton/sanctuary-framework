@@ -204,6 +204,22 @@ describe("buildEvidencePack", () => {
           },
         ],
       ],
+      // Fix-round F1: mirror of the operator-only case -- a daemon-only
+      // breakdown omits the operator row that EVERY census includes, so the
+      // SIGNED manifest must carry the not-determinable marker, never a
+      // definitive retention_at_cap:false computed over the daemon row alone.
+      [
+        "daemon-only (operator row missing)",
+        [
+          {
+            store: "daemon",
+            max_entries: 100,
+            retained_total: 50,
+            max_total_size_bytes: 0,
+            retained_total_size_bytes: 0,
+          },
+        ],
+      ],
     ];
 
     for (const [name, perStore] of variants) {

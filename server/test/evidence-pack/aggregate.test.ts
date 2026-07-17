@@ -538,6 +538,23 @@ describe("detectShortfall", () => {
           },
         ],
       ],
+      // Fix-round F1: the exact mirror of the operator-only case. The operator
+      // store is part of EVERY census, so a daemon-only breakdown leaves the
+      // operator store's own cap position unsupplied; before the fix the
+      // below-cap daemon row alone earned determinable:true, the flattering
+      // reassurance, and a signed definitive retention_at_cap:false.
+      [
+        "daemon-only (operator row missing)",
+        [
+          {
+            store: "daemon",
+            max_entries: 100,
+            retained_total: 50,
+            max_total_size_bytes: 0,
+            retained_total_size_bytes: 0,
+          },
+        ],
+      ],
     ];
 
     for (const [name, perStore] of variants) {

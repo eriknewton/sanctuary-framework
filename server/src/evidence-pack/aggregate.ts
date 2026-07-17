@@ -271,7 +271,8 @@ export interface RetentionDeterminability {
  * Classification, fail-safe by default (mirrors the D5-3 rule: never assert a
  * definitive claim the present data cannot back):
  *  1. USABLE breakdown -- a present, non-empty `per_store_retention` that
- *     carries a `store: "daemon"` row whenever the census is MERGED
+ *     carries the `store: "operator"` row (the operator store is part of EVERY
+ *     census) plus a `store: "daemon"` row whenever the census is MERGED
  *     (`daemon_store.status === "included"`) -> DETERMINABLE, judged per store
  *     against each store's own caps (the shipped path: `deriveAuditReadOutcome`
  *     always seeds the operator row and adds the daemon row when merged).
@@ -282,6 +283,12 @@ export interface RetentionDeterminability {
  *     - daemon `included` with the breakdown absent, `null`, empty, or missing
  *       the daemon row: the top-level total is MERGED, so comparing it to one
  *       store's cap is the exact mismatched-scope arithmetic P1-B banned;
+ *     - a breakdown missing the OPERATOR row (fix-round F1): every census
+ *       includes the operator store, so a daemon-only breakdown left the
+ *       operator store's own cap position unsupplied -- the exact mirror of
+ *       the daemon-less case -- yet previously still earned the definitive
+ *       below-cap claim and the flattering reassurance over the daemon row
+ *       alone;
  *     - an explicitly-supplied empty `[]` or `null` breakdown on ANY census:
  *       the caller asserted a breakdown and delivered nothing usable, so the
  *       anomalous input never earns a definitive at-cap OR below-cap claim.
@@ -296,6 +303,10 @@ export function retentionDeterminability(
   const usable =
     breakdown != null &&
     breakdown.length > 0 &&
+    // The operator store is part of EVERY census (`types.ts` documents the
+    // breakdown invariant as "Always includes the operator store"), so a
+    // daemon-only breakdown is as incomplete as an operator-only one.
+    breakdown.some((s) => s.store === "operator") &&
     (!daemonIncluded || breakdown.some((s) => s.store === "daemon"));
   if (usable) {
     return { at_cap_determinable: true, contributing_stores: breakdown };
