@@ -12,7 +12,9 @@ import {
   GenerationStateError,
   bindEphemeralGatePort,
   computeNextGenerationId,
+  createFsGenerationStagingStore,
   evaluateGenerationMatch,
+  parseGenerationStagingRecord,
   resolveCommittedGeneration,
   resolveGateRestart,
   type CommittedGeneration,
@@ -345,6 +347,78 @@ describe("egress-gate/generation pure helpers", () => {
       resolveCommittedGeneration({ entry: { gate_port: 45001, generation_id: 3 }, stagingRecordPresent: false, registryDirty: true }).committedGenerationId,
     ).toBeUndefined();
     expect(resolveCommittedGeneration({ entry: null, stagingRecordPresent: false }).committedGenerationId).toBeUndefined();
+  });
+});
+
+describe("egress-gate/generation staging-record shape validation", () => {
+  const valid: GenerationStagingRecord = {
+    generation_id: 3,
+    agent_uid: 502,
+    gate_port: 45001,
+    gate_pid: 1234,
+    gate_pid_start: "starttime-abc",
+    fortress_path: "/f/a",
+    phase: "pf_loaded",
+  };
+  const path = "/var/db/sanctuary/generation-staging-502.json";
+
+  it("accepts a valid record round-tripped through JSON", () => {
+    expect(parseGenerationStagingRecord(JSON.stringify(valid), path)).toEqual(valid);
+  });
+
+  it("rejects non-JSON text, naming the staging path", () => {
+    expect(() => parseGenerationStagingRecord("not json{", path)).toThrow(GenerationStateError);
+    expect(() => parseGenerationStagingRecord("not json{", path)).toThrow(/generation-staging-502\.json/);
+  });
+
+  it("rejects a non-object payload (array, string, null)", () => {
+    for (const text of ["[]", '"str"', "null", "42"]) {
+      expect(() => parseGenerationStagingRecord(text, path)).toThrow(GenerationStateError);
+    }
+  });
+
+  it("rejects a record with a missing required field, naming the field and path", () => {
+    for (const field of Object.keys(valid)) {
+      const broken: Record<string, unknown> = { ...valid };
+      delete broken[field];
+      expect(() => parseGenerationStagingRecord(JSON.stringify(broken), path)).toThrow(
+        new RegExp(`${field}.*generation-staging-502|generation-staging-502.*${field}`),
+      );
+    }
+  });
+
+  it("rejects wrong-typed fields (string port, numeric fortress_path, unknown phase, non-integer id)", () => {
+    const cases: Array<Record<string, unknown>> = [
+      { ...valid, gate_port: "45001" },
+      { ...valid, fortress_path: 7 },
+      { ...valid, fortress_path: "" },
+      { ...valid, phase: "committed" },
+      { ...valid, generation_id: 1.5 },
+      { ...valid, gate_pid_start: 99 },
+    ];
+    for (const broken of cases) {
+      expect(() => parseGenerationStagingRecord(JSON.stringify(broken), path)).toThrow(GenerationStateError);
+    }
+  });
+
+  // Wiring test: the validator must be load-bearing THROUGH the FS store's
+  // load(), not only when called directly (reverting the load() wiring line
+  // must fail this test).
+  it("createFsGenerationStagingStore.load routes through the validator (malformed file fails closed, valid file loads)", async () => {
+    const { mkdtemp, writeFile: wf, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = await mkdtemp(join(tmpdir(), "gen-staging-test-"));
+    try {
+      const store = createFsGenerationStagingStore(dir);
+      await wf(join(dir, "generation-staging-502.json"), JSON.stringify({ ...valid, gate_port: "45001" }));
+      await expect(store.load(502)).rejects.toThrow(GenerationStateError);
+      await wf(join(dir, "generation-staging-502.json"), JSON.stringify(valid));
+      await expect(store.load(502)).resolves.toEqual(valid);
+      expect(await store.load(999)).toBeNull(); // ENOENT path unchanged
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

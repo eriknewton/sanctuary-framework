@@ -6792,6 +6792,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       }
       const { nodeId, nodeMode } = parseResult;
 
+      // Build the federation deps ONCE for this request (pure synchronous
+      // object construction; every closure reads live `this` state, so a
+      // single instance observes the same state as per-call rebuilds did).
+      const federationDeps = this.buildV1FederationDeps();
+
       try {
         // Capacity pre-check FIRST: an operator at cap should never even
         // reach the ceremony. Advisory UX only (see doc comment above); the
@@ -6818,7 +6823,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
                 "Cannot determine current fleet node count; refusing to mint an enrollment token. Try again shortly.",
             }),
           );
-          void this.buildV1FederationDeps().audit({
+          void federationDeps.audit({
             operation: "fleet_enroll_token_mint",
             result: "failure",
             identityId: nodeId,
@@ -6842,7 +6847,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
                 "enroll another. Every existing node keeps its Castle Wall protection.",
             }),
           );
-          void this.buildV1FederationDeps().audit({
+          void federationDeps.audit({
             operation: "fleet_enroll_token_mint",
             result: "failure",
             identityId: nodeId,
@@ -6865,7 +6870,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             "Cache-Control": "no-store",
           });
           res.end(JSON.stringify({ error: "federation_not_provisioned" }));
-          void this.buildV1FederationDeps().audit({
+          void federationDeps.audit({
             operation: "fleet_enroll_token_mint",
             result: "failure",
             identityId: nodeId,
@@ -6886,7 +6891,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             "Cache-Control": "no-store",
           });
           res.end(JSON.stringify({ error: "federation_not_provisioned" }));
-          void this.buildV1FederationDeps().audit({
+          void federationDeps.audit({
             operation: "fleet_enroll_token_mint",
             result: "failure",
             identityId: nodeId,
@@ -6900,7 +6905,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           "Cache-Control": "no-store",
         });
         res.end(JSON.stringify({ ok: true, bootstrap_token: bootstrapToken }));
-        void this.buildV1FederationDeps().audit({
+        void federationDeps.audit({
           operation: "fleet_enroll_token_mint",
           result: "success",
           identityId: nodeId,
