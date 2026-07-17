@@ -49,7 +49,7 @@ import {
   TRANSPARENCY_BUNDLE_FORMAT,
   type TransparencyBundle,
 } from "../transparency/checkpoint.js";
-import { exportAuditChain } from "../cli/audit-chain-export.js";
+import { exportAuditChain, totalRecordsSkipped } from "../cli/audit-chain-export.js";
 import type {
   CustodyFacts,
   DaemonStoreDisclosure,
@@ -274,8 +274,29 @@ export async function gatherDiscreteExports(
           cb();
         },
       });
-      await exportAuditChain(storage, sink);
+      const summary = await exportAuditChain(storage, sink);
       const jsonl = Buffer.concat(chunks).toString("utf8");
+      // P1-A (dry-bar round 6): one or more LISTED records were unreadable /
+      // invalid JSON / not a V2 envelope and were SKIPPED, so this export is
+      // INCOMPLETE. Distinguish "listed N, exported < N" (a corrupt / partial
+      // chain) from "listed 0" (a genuinely empty chain): never render a corrupt
+      // all-skipped chain as a definitive §10 `emptyVerified` "empty" (a false
+      // clean bill, the opposite of the tamper-evidence the export exists to
+      // provide), and never sign a silently-partial chain as complete. Disclose
+      // it as a read failure carrying the listed/exported/skipped counts.
+      const skipped = totalRecordsSkipped(summary);
+      if (skipped > 0) {
+        return readFailed(
+          "the audit-chain export could NOT be shown to be complete for this " +
+            `fortress: ${skipped} listed record(s) were unreadable, invalid, or ` +
+            "not a recognized audit record and were skipped (entries: listed " +
+            `${summary.entriesListed}, exported ${summary.entriesExported}, ` +
+            `skipped ${summary.entriesSkipped}; checkpoints: listed ` +
+            `${summary.checkpointsListed}, exported ${summary.checkpointsExported}, ` +
+            `skipped ${summary.checkpointsSkipped}). It was NOT included rather ` +
+            "than present a corrupt or incomplete chain as a complete or empty one."
+        );
+      }
       return jsonl.length > 0 ? populated(jsonl) : emptyVerified();
     } catch (e) {
       return readFailed(`the audit-chain export could not be gathered: ${(e as Error).message}`);

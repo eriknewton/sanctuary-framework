@@ -91,6 +91,45 @@ export interface RotationAnchorExportRecord {
 }
 
 /**
+ * P1-A (dry-bar round 6): the outcome of an audit-chain export, so a caller can
+ * tell a GENUINELY-EMPTY chain ("listed 0 records") apart from a CORRUPT one
+ * ("listed N, exported < N; the remainder were unreadable / invalid JSON / not a
+ * V2 envelope and were SKIPPED"). Without this, an all-skipped chain produced
+ * zero bytes and rendered as a DEFINITIVE "the audit-chain export was empty" — a
+ * corrupt chain presented as a clean one, the opposite of the tamper-evidence
+ * the export exists to provide — and a partly-corrupt chain was signed as
+ * silently-complete. A nonzero `*Skipped` count means the export is INCOMPLETE
+ * and must NOT be presented as complete or definitively empty.
+ */
+export interface AuditChainExportSummary {
+  /** Entry records listed in the `_audit` namespace. */
+  entriesListed: number;
+  /** Entry records successfully written to the export. */
+  entriesExported: number;
+  /**
+   * Entry records LISTED but not exported: unreadable at read time, invalid
+   * JSON, or not a V2 audit envelope (corruption / tamper / wrong schema).
+   */
+  entriesSkipped: number;
+  /** Checkpoint/anchor records listed in `_audit_checkpoints`. */
+  checkpointsListed: number;
+  /** Checkpoint/anchor records successfully written to the export. */
+  checkpointsExported: number;
+  /**
+   * Checkpoint/anchor records LISTED but skipped as GENUINE CORRUPTION: unreadable
+   * at read time or invalid JSON. A record that PARSES but is not a recognized
+   * checkpoint / anchor is a legitimate non-export control record (e.g. the
+   * `__head_anchor` head pointer) and is NOT counted here.
+   */
+  checkpointsSkipped: number;
+}
+
+/** Total records listed but skipped (a nonzero total means an INCOMPLETE export). */
+export function totalRecordsSkipped(s: AuditChainExportSummary): number {
+  return s.entriesSkipped + s.checkpointsSkipped;
+}
+
+/**
  * Export an audit chain from a StorageBackend to a Writable stream.
  *
  * Entries are written in sequence order, followed by checkpoints.
@@ -98,25 +137,38 @@ export interface RotationAnchorExportRecord {
  *
  * This function is intentionally separated from CLI arg parsing so the
  * drill test can call it directly with a MemoryStorage backend.
+ *
+ * Returns a {@link AuditChainExportSummary} counting listed/exported/skipped
+ * records so a caller never presents a corrupt (all-skipped) chain as empty, or
+ * a partly-corrupt chain as complete (P1-A).
  */
 export async function exportAuditChain(
   storage: StorageBackend,
   out: Writable
-): Promise<void> {
+): Promise<AuditChainExportSummary> {
   // Export entries, sorted by key (keys are sequence-padded for natural sort)
   const entryMetas = await storage.list(AUDIT_EXPORT_NAMESPACE);
   entryMetas.sort((a, b) => a.key.localeCompare(b.key));
 
+  let entriesExported = 0;
+  let entriesSkipped = 0;
   for (const meta of entryMetas) {
     const raw = await storage.read(AUDIT_EXPORT_NAMESPACE, meta.key);
-    if (!raw) continue;
+    if (!raw) {
+      entriesSkipped++;
+      continue;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(bytesToString(raw));
     } catch {
+      entriesSkipped++;
       continue;
     }
-    if (!isPersistedAuditEnvelopeV2(parsed)) continue;
+    if (!isPersistedAuditEnvelopeV2(parsed)) {
+      entriesSkipped++;
+      continue;
+    }
 
     const record: EntryExportRecord = {
       type: "entry",
@@ -128,19 +180,26 @@ export async function exportAuditChain(
       encrypted_payload_bytes: parsed.encrypted_payload_bytes,
     };
     out.write(JSON.stringify(record) + "\n");
+    entriesExported++;
   }
 
   // Export checkpoints and legacy anchors
   const cpMetas = await storage.list(AUDIT_EXPORT_CHECKPOINT_NAMESPACE);
   cpMetas.sort((a, b) => a.key.localeCompare(b.key));
 
+  let checkpointsExported = 0;
+  let checkpointsSkipped = 0;
   for (const meta of cpMetas) {
     const raw = await storage.read(AUDIT_EXPORT_CHECKPOINT_NAMESPACE, meta.key);
-    if (!raw) continue;
+    if (!raw) {
+      checkpointsSkipped++;
+      continue;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(bytesToString(raw));
     } catch {
+      checkpointsSkipped++;
       continue;
     }
     if (isRotationAnchorRecord(parsed)) {
@@ -150,9 +209,18 @@ export async function exportAuditChain(
         base_prev_hash: parsed.data.base_prev_hash,
       };
       out.write(JSON.stringify(record) + "\n");
+      checkpointsExported++;
       continue;
     }
-    if (!isAuditCheckpointRecord(parsed)) continue;
+    if (!isAuditCheckpointRecord(parsed)) {
+      // A record that PARSED but is not a checkpoint / legacy-anchor / rotation-
+      // anchor is a legitimate NON-EXPORT control record that lives in this
+      // namespace (e.g. the `__head_anchor` head pointer), NOT corruption. It was
+      // always silently skipped by design and must NOT be counted as a skipped
+      // corrupt record (doing so would false-positive a `read_failed` on every
+      // healthy fortress). Only unreadable / invalid-JSON records above count.
+      continue;
+    }
 
     if (parsed.checkpoint_kind === "audit-checkpoint") {
       const record: CheckpointExportRecord = {
@@ -169,6 +237,7 @@ export async function exportAuditChain(
         unsigned: parsed.unsigned,
       };
       out.write(JSON.stringify(record) + "\n");
+      checkpointsExported++;
     } else if (parsed.checkpoint_kind === "legacy-anchor") {
       const record: LegacyAnchorExportRecord = {
         type: "legacy_anchor",
@@ -183,8 +252,18 @@ export async function exportAuditChain(
         unsigned: parsed.unsigned,
       };
       out.write(JSON.stringify(record) + "\n");
+      checkpointsExported++;
     }
   }
+
+  return {
+    entriesListed: entryMetas.length,
+    entriesExported,
+    entriesSkipped,
+    checkpointsListed: cpMetas.length,
+    checkpointsExported,
+    checkpointsSkipped,
+  };
 }
 
 /** CLI args for the export subcommand. */
@@ -290,15 +369,38 @@ export async function runExport(args: ExportArgs): Promise<void> {
 
   if (args.output) {
     const stream = createWriteStream(args.output, { encoding: "utf8" });
-    await exportAuditChain(storage, stream);
+    const summary = await exportAuditChain(storage, stream);
     await new Promise<void>((resolve, reject) => {
       stream.end(() => resolve());
       stream.on("error", reject);
     });
     process.stderr.write(`Exported audit chain to ${args.output}\n`);
+    writeSkipNoteIfIncomplete(summary);
   } else {
-    await exportAuditChain(storage, process.stdout);
+    const summary = await exportAuditChain(storage, process.stdout);
+    writeSkipNoteIfIncomplete(summary);
   }
+}
+
+/**
+ * P1-A: make a silently-incomplete export LOUD on the CLI. When any listed
+ * record was unreadable / corrupt / non-V2 it was skipped, so the export is NOT
+ * a complete chain; disclose that on stderr rather than presenting a truncated
+ * file as the whole audit history.
+ */
+function writeSkipNoteIfIncomplete(summary: AuditChainExportSummary): void {
+  const skipped = totalRecordsSkipped(summary);
+  if (skipped === 0) return;
+  process.stderr.write(
+    `WARNING: this export is INCOMPLETE. ${skipped} listed record(s) were ` +
+      `unreadable, invalid JSON, or not a recognized audit record and were ` +
+      `SKIPPED (entries: listed ${summary.entriesListed}, exported ` +
+      `${summary.entriesExported}, skipped ${summary.entriesSkipped}; ` +
+      `checkpoints: listed ${summary.checkpointsListed}, exported ` +
+      `${summary.checkpointsExported}, skipped ${summary.checkpointsSkipped}). ` +
+      `The exported chain does NOT contain the skipped records; do NOT treat ` +
+      `this file as a complete audit chain.\n`
+  );
 }
 
 export function resolveAuditStoragePath(path: string): string {

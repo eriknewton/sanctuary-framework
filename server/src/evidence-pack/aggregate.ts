@@ -264,28 +264,57 @@ export function detectShortfall(
   // retained total against a SINGLE store's cap falsely reported "at cap" (and a
   // false `retention_at_cap: true` in the signed manifest) for a healthy split
   // fortress whose combined count crossed one store's cap while NEITHER store was
-  // near its own. When the per-store breakdown is absent (a legacy fixture / a
-  // non-split single-store caller), fall back to the merged top-level fields as
-  // ONE conceptual store -- the correct single-store computation.
-  const contributingStores =
-    retention.per_store_retention ?? [
-      {
-        max_entries: retention.max_entries,
-        retained_total: retention.retained_total,
-        max_total_size_bytes: retention.max_total_size_bytes,
-        retained_total_size_bytes: retention.retained_total_size_bytes,
-      },
-    ];
-  // Either FIFO cap counts as "at cap" for a given store (sweep HIGH-5):
-  // entries OR total size.
-  const retentionAtCap = contributingStores.some((s) => {
+  // near its own.
+  //
+  // P1-B (dry-bar round 6): the single-store fallback must NEVER be applied to a
+  // census that self-declares as MERGED (daemon `included`) but omits the
+  // per-store breakdown -- comparing the merged `retained_total` against a single
+  // store's `max_entries` cap is exactly the mismatched-scope arithmetic that
+  // revived the false `retention_at_cap: true` in the SIGNED manifest through the
+  // exported `buildEvidencePack`. Three cases, fail-safe by default:
+  //   1. `per_store_retention` present  -> judge PER STORE (the shipped path).
+  //   2. absent + daemon `included`     -> a MERGED census with no breakdown:
+  //      at-cap is NOT DETERMINABLE (a merged total cannot be compared to any one
+  //      store's cap). Assert NEITHER at-cap NOR the flattering "never pruned /
+  //      below caps" reassurance (mirrors the D5-3 fail-safe default -- never
+  //      assert a definitive claim the present data cannot back).
+  //   3. absent + daemon NOT `included` -> a genuine SINGLE-store census
+  //      (operator only, or no daemon store): the top-level fields ARE that one
+  //      store's own figures, so the single-store computation is correct.
+  const atCapForStore = (s: {
+    max_entries: number;
+    retained_total: number;
+    max_total_size_bytes: number;
+    retained_total_size_bytes: number | null;
+  }): boolean => {
+    // Either FIFO cap counts as "at cap" for a given store (sweep HIGH-5):
+    // entries OR total size.
     const atEntryCap = s.max_entries > 0 && s.retained_total >= s.max_entries;
     const atSizeCap =
       s.max_total_size_bytes > 0 &&
       s.retained_total_size_bytes !== null &&
       s.retained_total_size_bytes >= s.max_total_size_bytes;
     return atEntryCap || atSizeCap;
-  });
+  };
+  const mergedWithoutBreakdown =
+    retention.per_store_retention === undefined &&
+    retention.daemon_store?.status === "included";
+  // DETERMINABLE only when we have the per-store caps OR the census is genuinely a
+  // single store. A merged census without the breakdown leaves at-cap unknown, so
+  // `retentionAtCap` stays false (never asserted) AND the reassurance is gated off
+  // by `atCapDeterminable` below.
+  const atCapDeterminable = !mergedWithoutBreakdown;
+  const contributingStores = retention.per_store_retention ?? [
+    {
+      max_entries: retention.max_entries,
+      retained_total: retention.retained_total,
+      max_total_size_bytes: retention.max_total_size_bytes,
+      retained_total_size_bytes: retention.retained_total_size_bytes,
+    },
+  ];
+  const retentionAtCap = atCapDeterminable
+    ? contributingStores.some(atCapForStore)
+    : false;
 
   // END SIDE: coverage can never extend past the moment the report was made.
   const inProgress = generatedMs < quarterEndMs;
@@ -350,9 +379,14 @@ export function detectShortfall(
     startShortfall = true;
     // The DEFINITIVE discriminator is whether the log ever pruned (a rotation
     // anchor). Only affirm "genuine inactivity, not pruning" when we KNOW the
-    // log never pruned AND it is below both caps; otherwise do not reassure.
+    // log never pruned AND it is DEFINITIVELY below both caps; otherwise do not
+    // reassure. P1-B: when at-cap is not determinable (a merged census with no
+    // per-store breakdown), `!retentionAtCap` is true only because at-cap was
+    // never asserted, NOT because we proved below-cap -- so require
+    // `atCapDeterminable` here to keep the flattering reassurance from firing
+    // from an unknown cap position.
     const neverPruned =
-      retention.ever_pruned === false && !retentionAtCap;
+      retention.ever_pruned === false && atCapDeterminable && !retentionAtCap;
     // C2 (dry-bar): `earliest_retained_at` / `ever_pruned` are the OPERATOR
     // store's facts (the daemon store merges into the scan only when readable).
     // When a root-owned daemon store is present but EXCLUDED, the "no recorded
