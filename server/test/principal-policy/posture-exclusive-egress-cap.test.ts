@@ -25,6 +25,8 @@ import {
 import {
   buildFeatureHealthPanel,
   SLICE1_FEATURE_REGISTRY,
+  type FeatureHealthPanel,
+  type FeatureHealthRow,
 } from "../../src/principal-policy/feature-health.js";
 import {
   featureHealthPill,
@@ -320,14 +322,17 @@ describe("S5-P: every surface renders coarse-only NON-GREEN and DISTINCT", () =>
     expect(js).toContain("coarse-only (exclusive egress not live)");
   });
 
-  it("the fortress-view (Protect) page maps coarse_only to a distinct amber state, never green", async () => {
+  it("the fortress-view (Protect) page maps coarse_only to a distinct amber state, never green, with mode-agnostic copy", async () => {
     const { generateFortressViewHTML } = await import("../../src/wrap/fortress-view.js");
     const html = generateFortressViewHTML({
       serverVersion: "1.6.1",
       upstreamServerCount: 1,
     });
     expect(html).toContain("wallArmState === 'coarse_only'");
-    expect(html).toContain("Coarse protection only");
+    expect(html).toContain("Fine-grained protection not live");
+    // Copy must NOT assert coarse protection for every agent (the worst mode
+    // may be unprotected): no bare "enforcing the coarse wall" claim.
+    expect(html).not.toContain("Castle Wall is enforcing the coarse wall, but");
     // The coarse-only branch sets the amber indicator, not the green one.
     const branch = html.slice(
       html.indexOf("} else if (wallCoarseOnly) {"),
@@ -335,5 +340,227 @@ describe("S5-P: every surface renders coarse-only NON-GREEN and DISTINCT", () =>
     );
     expect(branch).toContain("status-indicator amber");
     expect(branch).not.toContain("status-indicator green");
+  });
+
+  it("the posture-home wall copy is mode-precise: unprotected worst-mode never asserts coarse protection", () => {
+    const html = renderPostureHomeHTML();
+    // The coarse-only meaning branches on the exclusive_egress.mode.
+    expect(html).toContain('w.exclusive_egress.mode === "unprotected"');
+    expect(html).toContain("A fine-grained agent is UNPROTECTED");
+  });
+});
+
+describe("S5-P: single-resolve BLOCKER fix + fail-closed provider semantics", () => {
+  // A provider whose resolve is INTERMITTENT: succeeds then throws. The home
+  // payload must resolve it ONCE and cap BOTH the wall pill and the
+  // feature-health row from the same snapshot (never one green, one capped).
+  it("buildHome resolves the provider ONCE: an intermittent provider caps wall AND feature-health together", async () => {
+    const {
+      handlePostureRoute,
+      POSTURE_API_PREFIX,
+    } = await import("../../src/principal-policy/posture-routes.js");
+    const { createServer } = await import("node:http");
+    const log = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
+
+    let calls = 0;
+    const deps = {
+      auditLog: log,
+      originMachine: FORTRESS,
+      listAgents: () => [],
+      platform: "darwin" as const,
+      // Would-be intermittent: cap on the 1st call, throw on any 2nd. A
+      // per-builder resolve (the bug) would call this TWICE and diverge; the
+      // fix calls it exactly ONCE so both surfaces get the same capped snapshot.
+      exclusiveEgressPosture: () => {
+        calls += 1;
+        if (calls === 1) return coarseOnlyStatus();
+        throw new Error("intermittent provider failure on the second call");
+      },
+    };
+    const server = createServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+      const handled = await handlePostureRoute(deps, req, res, url, req.method ?? "GET");
+      if (!handled) res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address() as { port: number };
+    try {
+      const home = await (
+        await fetch(`http://127.0.0.1:${addr.port}${POSTURE_API_PREFIX}/home`)
+      ).json();
+      expect(calls).toBe(1); // resolved exactly once for the whole payload
+      expect(home.castle_wall.arm_state).toBe("coarse_only");
+      const wallRow = home.feature_health.rows.find(
+        (r: { feature_id: string }) => r.feature_id === "castle_wall_egress",
+      );
+      expect(wallRow.status).toBe("coarse_only");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("a provider that THROWS caps green on the home wall AND feature-health (fail-closed end to end)", async () => {
+    const {
+      handlePostureRoute,
+      POSTURE_API_PREFIX,
+    } = await import("../../src/principal-policy/posture-routes.js");
+    const { createServer } = await import("node:http");
+    const log = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
+    const deps = {
+      auditLog: log,
+      originMachine: FORTRESS,
+      listAgents: () => [],
+      platform: "darwin" as const,
+      exclusiveEgressPosture: () => {
+        throw new Error("provider exploded");
+      },
+    };
+    const server = createServer(async (req, res) => {
+      const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+      const handled = await handlePostureRoute(deps, req, res, url, req.method ?? "GET");
+      if (!handled) res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address() as { port: number };
+    try {
+      const home = await (
+        await fetch(`http://127.0.0.1:${addr.port}${POSTURE_API_PREFIX}/home`)
+      ).json();
+      expect(home.castle_wall.arm_state).toBe("coarse_only");
+      const wallRow = home.feature_health.rows.find(
+        (r: { feature_id: string }) => r.feature_id === "castle_wall_egress",
+      );
+      expect(wallRow.status).toBe("coarse_only");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("a provider that RETURNS NULL (affirmatively no fine-grained agent) does NOT cap green", async () => {
+    const log = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
+    // A null return is a positive "none declared" answer, not an error: green.
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+      exclusiveEgress: null,
+    });
+    expect(posture.arm_state).toBe("armed");
+    expect(posture.exclusive_egress).toBeUndefined();
+  });
+
+  it("an empty summary is 'genuinely none' (green); the producer must use failedExclusiveEgressStatus on a read failure instead", () => {
+    const empty = summarizeExclusiveEgressStatus([]);
+    expect(empty.fine_grained_declared).toBe(false);
+    expect(empty.exclusive_egress_live).toBe(true);
+    // The fail-closed alternative the producer MUST use on a roster-read
+    // failure DOES cap - the two are distinct by construction.
+    expect(failedExclusiveEgressStatus("roster read failed").fine_grained_declared).toBe(true);
+    expect(failedExclusiveEgressStatus("roster read failed").exclusive_egress_live).toBe(false);
+  });
+});
+
+describe("S5-P: feature-fault-raise handles coarse_only without a suppression trap (codex/claude MED)", () => {
+  // Minimal FeatureHealthPanel/Row builders for the transition test.
+  function row(status: string, basis: string): FeatureHealthRow {
+    return {
+      origin_machine: FORTRESS,
+      feature_id: "castle_wall_egress",
+      label: "Castle Wall egress firewall",
+      liveness: "self_reporting",
+      status: status as FeatureHealthRow["status"],
+      basis: basis as FeatureHealthRow["basis"],
+      invocation_count: 0,
+      last_evidence_at: null,
+      broken_zero_detectable: true,
+      expectation_floor: null,
+      trailing_window_volume: null,
+      audit_integrity_ok: true,
+      freshness_window_ms: 600_000,
+    };
+  }
+  function panel(r: FeatureHealthRow): FeatureHealthPanel {
+    return {
+      origin_machine: FORTRESS,
+      window_start: new Date(0).toISOString(),
+      window_end: new Date().toISOString(),
+      rows: [r],
+      plugin_rows: [],
+      audit_integrity_ok: true,
+      sealed_region_unverified_at_privilege: false,
+      disclosure: {
+        broken_zero_undetectable_for_event_driven: true,
+        castle_wall_silent_death_is_unknown_not_green: false,
+        silent_death_distinguished_from_intentional_stop: true,
+        broker_daemon_silent_death_detectable: true,
+      },
+    };
+  }
+
+  it("a healthy active -> coarse_only transition raises NOTHING (loud on surface, never an OS notification)", async () => {
+    const { deriveFeatureFaults } = await import(
+      "../../src/principal-policy/feature-fault-raise.js"
+    );
+    const faults = deriveFeatureFaults(
+      panel(row("coarse_only", "exclusive_egress_not_live")),
+      panel(row("active", "fresh_enforcement_evidence")),
+    );
+    expect(faults).toHaveLength(0);
+  });
+
+  it("a coarse_only -> unknown transition DOES raise feature_silently_off (no suppression trap)", async () => {
+    const { deriveFeatureFaults } = await import(
+      "../../src/principal-policy/feature-fault-raise.js"
+    );
+    const faults = deriveFeatureFaults(
+      panel(row("unknown", "stale_evidence")),
+      panel(row("coarse_only", "exclusive_egress_not_live")),
+    );
+    expect(faults.map((f) => f.fault_class)).toContain("feature_silently_off");
+  });
+
+  it("a coarse_only -> coarse_only steady state raises nothing", async () => {
+    const { deriveFeatureFaults } = await import(
+      "../../src/principal-policy/feature-fault-raise.js"
+    );
+    const faults = deriveFeatureFaults(
+      panel(row("coarse_only", "exclusive_egress_not_live")),
+      panel(row("coarse_only", "exclusive_egress_not_live")),
+    );
+    expect(faults).toHaveLength(0);
+  });
+});
+
+describe("S5-P: wrap first-run banner is cap-capable", () => {
+  it("probeCastleWallEnforcementObserved reads NOT observed (banner not Full) when the row caps to coarse_only", async () => {
+    const { probeCastleWallEnforcementObserved } = await import("../../src/wrap/cli.js");
+    const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const storagePath = await mkdtemp(join(tmpdir(), "s5p-wrap-"));
+    await mkdir(join(storagePath, "policy", "egress"), { recursive: true });
+    const log = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
+
+    // No provider: today's behavior, the row is `active` => observed.
+    const observedNoProvider = await probeCastleWallEnforcementObserved(log, storagePath);
+    expect(observedNoProvider).toBe(true);
+
+    // With a capping provider (S5-6 will wire one): the row caps to
+    // coarse_only, so the affirmative "Full" banner is NOT earned.
+    const observedCapped = await probeCastleWallEnforcementObserved(
+      log,
+      storagePath,
+      async () => coarseOnlyStatus(),
+    );
+    expect(observedCapped).toBe(false);
   });
 });

@@ -792,14 +792,16 @@ export function generateFortressViewHTML(options: FortressViewOptions): string {
         title.textContent = 'Enforcement not active';
         subtitle.textContent = 'Castle Wall is not filtering traffic. Your agent is wrapped but not protected.';
       } else if (wallCoarseOnly) {
-        // S5-P: the DISTINCT coarse-only state. The coarse wall is enforcing
-        // (the agent is confined to its declared destinations), but the
-        // fine-grained exclusive-egress stack (gate + pf + generation) is not
-        // live. Amber, named plainly - never green, never a vague unknown.
+        // S5-P: the DISTINCT non-green coarse-only arm-state. A
+        // fine-grained-provisioned agent's exclusive-egress stack (gate + pf +
+        // generation) is not live. Copy stays mode-agnostic: the worst
+        // per-agent mode may be unprotected (no coarse wall over that agent),
+        // so this must NOT assert coarse protection for every agent. Amber,
+        // named plainly, pointing at per-agent posture; never green.
         indicator.className = 'status-indicator amber';
         indicator.innerHTML = '&#x26A0;';
-        title.textContent = 'Coarse protection only';
-        subtitle.textContent = 'Castle Wall is enforcing the coarse wall, but the fine-grained exclusive-egress gate is not live.';
+        title.textContent = 'Fine-grained protection not live';
+        subtitle.textContent = 'The fine-grained exclusive-egress gate is not live for a protected agent. Coverage may be coarse-only or weaker; see per-agent posture.';
       } else if (hasPending) {
         indicator.className = 'status-indicator amber';
         indicator.innerHTML = '&#x23F3;';

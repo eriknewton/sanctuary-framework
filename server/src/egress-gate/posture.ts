@@ -308,6 +308,17 @@ export function buildExclusiveEgressPosture(
  * consume. `exclusive_egress_live` is true iff EVERY fine-grained-declared
  * agent reads `exclusive` (vacuously true when none is declared - the cap
  * never fires for a coarse-only fleet). Pure.
+ *
+ * PRODUCER CONTRACT (fail-closed, load-bearing): an EMPTY `agents` list means
+ * "affirmatively scanned; NO fine-grained agent is provisioned" and correctly
+ * does NOT cap green (there is nothing fine-grained to be down). The producer
+ * (S5-6) MUST therefore never summarize an empty list from a FAILED roster
+ * read - a read failure must resolve to {@link failedExclusiveEgressStatus}
+ * (which caps green), NEVER to `summarizeExclusiveEgressStatus([])`. Likewise
+ * a provider that cannot determine state must throw or return
+ * `failedExclusiveEgressStatus`, never a bare empty summary. This function
+ * cannot distinguish "genuinely none" from "lost the roster"; the producer
+ * owns that distinction and the fail-closed choice.
  */
 export function summarizeExclusiveEgressStatus(
   agents: ReadonlyArray<ExclusiveEgressPosture>,

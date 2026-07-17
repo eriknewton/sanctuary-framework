@@ -1276,6 +1276,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.identityManager?.getPrimaryIdentityId() ??
       "local";
     const auditLog = this.auditLog;
+    // S5-P (codex MED fix): thread the SAME fail-closed exclusive-egress
+    // snapshot every other feature-health consumer uses, so the fault-raise
+    // panel's `castle_wall_egress` row agrees with the rendered dashboard row
+    // (both compute `coarse_only` when the exclusive stack is down). This keeps
+    // the raise path's transition memory consistent with what the operator
+    // sees; `coarse_only` is not in the silent-off set, so it never spuriously
+    // raises an OS notification (coarse-only stays loud on the surface, not a
+    // notification - the ratified tight fault-class set is unchanged).
+    const exclusiveEgress = await this.resolveExclusiveEgressPosture();
     return auditLog.runEagerReads(() =>
       buildFeatureHealthPanel({
         auditLog,
@@ -1291,6 +1300,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...(brokerLoad?.status === "unreadable"
           ? { brokerProducerKeyExpectedButUnavailable: true }
           : {}),
+        ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
       }),
     );
   }

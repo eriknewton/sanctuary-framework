@@ -1332,10 +1332,19 @@ export function renderPostureHomeHTML(): string {
 
   function renderWall(w) {
     var el = document.getElementById("wall");
+    // S5-P: when the arm-state is capped to coarse_only, the precise meaning
+    // depends on the WORST per-agent mode carried on the exclusive_egress
+    // block: coarse-only (coarse wall enforcing, fine stack down) vs
+    // unprotected (a fine-grained agent has NO coarse wall either). Never
+    // assert coarse protection when the worst mode is unprotected.
+    var coarseMeaning =
+      w.exclusive_egress && w.exclusive_egress.mode === "unprotected"
+        ? "A fine-grained agent is UNPROTECTED: its exclusive-egress stack is not live AND the coarse wall is not armed over it. Not green by design."
+        : "The coarse wall is enforcing, but a fine-grained agent's exclusive-egress stack (gate, pf, generation) is NOT live. Not green by design.";
     var meaning = w.arm_state === "armed"
       ? "The operating system is blocking unauthorized outbound connections from wrapped agents."
       : w.arm_state === "coarse_only"
-        ? "The coarse wall is enforcing, but a fine-grained agent's exclusive-egress stack (gate, pf, generation) is NOT live. Not green by design."
+        ? coarseMeaning
         : w.arm_state === "degraded"
           ? "The wall is present but recent evidence shows it is NOT enforcing."
           : w.arm_state === "not_installed"

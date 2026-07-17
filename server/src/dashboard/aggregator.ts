@@ -649,10 +649,13 @@ function castleWallNotEnforcingHeadline(arm: CastleWallArmState): string {
       return "Layers configured, Castle Wall degraded (not enforcing)";
     case "not_installed":
       return "Layers configured, Castle Wall not installed on this host";
-    // S5-P distinct non-green: the coarse wall IS enforcing, but a
-    // fine-grained agent's exclusive-egress stack is not live.
+    // S5-P distinct non-green: a fine-grained-provisioned agent's
+    // exclusive-egress stack is not live. Deliberately does NOT assert the
+    // coarse wall is enforcing FOR THAT AGENT: the worst per-agent mode may be
+    // `unprotected` (no coarse wall over it), so the machine headline stays
+    // mode-agnostic and points at the per-agent posture. Non-green either way.
     case "coarse_only":
-      return "Coarse wall enforcing, exclusive egress NOT live (coarse-only)";
+      return "Fine-grained exclusive-egress not live for a protected agent (coarse-only or weaker); see per-agent posture";
     default:
       return "Layers configured, Castle Wall enforcement not confirmed";
   }
