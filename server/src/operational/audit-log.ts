@@ -4103,9 +4103,11 @@ export class AuditLog {
         // proof, so a large forward clock step can make our own live lock's
         // `acquired_at` appear to predate our process start and false-break it.
         // A false-break is detected fail-closed by the hash-chain
-        // contiguous-sequence check on the next load (never a silent fork), and
-        // every lock THIS build writes carries both `uptime_ms` and `boot_id`,
-        // so the residual applies only to locks written by older binaries.
+        // contiguous-sequence check on the next load (never a silent fork).
+        // atomicAcquireAuditLock stamps `uptime_ms`/`boot_id` CONDITIONALLY
+        // (their platform sources can be unavailable), so the residual covers
+        // locks written by older binaries AND current builds on hosts where
+        // those sources return undefined.
         if (lockUptimeMs !== undefined && ourStartUptime !== undefined) {
           if (lockUptimeMs < ourStartUptime - AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS) {
             return this.unlinkIfSameInode(lockPath, proven);

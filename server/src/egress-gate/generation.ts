@@ -405,11 +405,14 @@ export async function bindEphemeralGatePort(host = "127.0.0.1"): Promise<GateBin
   };
 }
 
-const GENERATION_PHASES: readonly GenerationPhase[] = [
-  "owner_checked",
-  "pf_loaded",
-  "manifest_reloaded",
-];
+// Exhaustiveness guard: adding a GenerationPhase variant without listing it
+// here is a compile error (the parser would otherwise silently reject it).
+const GENERATION_PHASE_SET: Record<GenerationPhase, true> = {
+  owner_checked: true,
+  pf_loaded: true,
+  manifest_reloaded: true,
+};
+const GENERATION_PHASES = Object.keys(GENERATION_PHASE_SET) as readonly GenerationPhase[];
 
 /**
  * Post-parse shape validation for an on-disk staging record. `JSON.parse`
@@ -440,9 +443,11 @@ export function parseGenerationStagingRecord(
     new GenerationStateError(
       `staging record at ${path} has a missing/invalid ${JSON.stringify(field)} (expected ${want}); refusing to interpret it`,
     );
-  const requireInt = (field: string): number => {
+  const requireInt = (field: string, min: number, max = Number.MAX_SAFE_INTEGER): number => {
     const value = record[field];
-    if (typeof value !== "number" || !Number.isSafeInteger(value)) throw bad(field, "an integer");
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
+      throw bad(field, `an integer in [${min}, ${max === Number.MAX_SAFE_INTEGER ? "…" : max}]`);
+    }
     return value;
   };
   const requireString = (field: string): string => {
@@ -455,10 +460,10 @@ export function parseGenerationStagingRecord(
     throw bad("phase", `one of ${GENERATION_PHASES.join(", ")}`);
   }
   return {
-    generation_id: requireInt("generation_id"),
-    agent_uid: requireInt("agent_uid"),
-    gate_port: requireInt("gate_port"),
-    gate_pid: requireInt("gate_pid"),
+    generation_id: requireInt("generation_id", 1),
+    agent_uid: requireInt("agent_uid", 1),
+    gate_port: requireInt("gate_port", 1, 65535),
+    gate_pid: requireInt("gate_pid", 1),
     gate_pid_start: requireString("gate_pid_start"),
     fortress_path: requireString("fortress_path"),
     phase: phase as GenerationPhase,
@@ -484,7 +489,15 @@ export function createFsGenerationStagingStore(
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw err;
       }
-      return parseGenerationStagingRecord(text, path);
+      const record = parseGenerationStagingRecord(text, path);
+      // A staging file whose embedded uid disagrees with the uid it was loaded
+      // for must never drive that uid's recovery (cross-uid port/fortress mixup).
+      if (record.agent_uid !== agentUid) {
+        throw new GenerationStateError(
+          `staging record at ${path} carries agent_uid ${record.agent_uid} but was loaded for uid ${agentUid}; refusing to interpret it`,
+        );
+      }
+      return record;
     },
     async save(record: GenerationStagingRecord): Promise<void> {
       const { writeFile, rename, mkdir } = await import("node:fs/promises");

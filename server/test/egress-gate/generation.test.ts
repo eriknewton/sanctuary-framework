@@ -401,6 +401,21 @@ describe("egress-gate/generation staging-record shape validation", () => {
     }
   });
 
+  it("rejects semantically invalid numerics (zero/negative ids and pids, out-of-range port)", () => {
+    const cases: Array<Record<string, unknown>> = [
+      { ...valid, generation_id: 0 },
+      { ...valid, agent_uid: 0 },
+      { ...valid, agent_uid: -502 },
+      { ...valid, gate_port: 0 },
+      { ...valid, gate_port: 65536 },
+      { ...valid, gate_pid: 0 },
+      { ...valid, gate_pid: -1 },
+    ];
+    for (const broken of cases) {
+      expect(() => parseGenerationStagingRecord(JSON.stringify(broken), path)).toThrow(GenerationStateError);
+    }
+  });
+
   // Wiring test: the validator must be load-bearing THROUGH the FS store's
   // load(), not only when called directly (reverting the load() wiring line
   // must fail this test).
@@ -416,6 +431,9 @@ describe("egress-gate/generation staging-record shape validation", () => {
       await wf(join(dir, "generation-staging-502.json"), JSON.stringify(valid));
       await expect(store.load(502)).resolves.toEqual(valid);
       expect(await store.load(999)).toBeNull(); // ENOENT path unchanged
+      // Cross-uid mismatch: a file embedding uid 502 must never drive uid 777's recovery.
+      await wf(join(dir, "generation-staging-777.json"), JSON.stringify(valid));
+      await expect(store.load(777)).rejects.toThrow(/agent_uid 502.*loaded for uid 777/);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
