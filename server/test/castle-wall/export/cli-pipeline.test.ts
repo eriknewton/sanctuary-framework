@@ -22,6 +22,8 @@ import {
   EXPORT_CURSOR_START,
   type ExportApprover,
   type ExportAudit,
+  type ExportCursorReadResult,
+  type ExportCursorState,
   type ExportCursorStore,
   type VerifiedChainSource,
 } from "../../../src/castle-wall/export/index.js";
@@ -36,12 +38,18 @@ import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 
 class MemoryCursorStore implements ExportCursorStore {
-  constructor(public value: number = EXPORT_CURSOR_START) {}
-  async read(): Promise<number> {
-    return this.value;
+  state: ExportCursorState;
+  constructor(sequence: number = EXPORT_CURSOR_START) {
+    this.state = { sequence, entryHash: sequence === EXPORT_CURSOR_START ? null : `eh-${sequence}` };
   }
-  async write(sequence: number): Promise<void> {
-    this.value = sequence;
+  get value(): number {
+    return this.state.sequence;
+  }
+  async read(): Promise<ExportCursorReadResult> {
+    return { state: { ...this.state }, reset: null };
+  }
+  async write(state: ExportCursorState): Promise<void> {
+    this.state = { ...state };
   }
 }
 
@@ -56,7 +64,7 @@ function egressChain(): VerifiedChainSource {
   };
   return {
     async streamVerifiedChain(consumer) {
-      consumer.onEntry({ sequence: 0, entry });
+      consumer.onEntry({ sequence: 0, entry_hash: "eh-0", entry });
     },
   };
 }

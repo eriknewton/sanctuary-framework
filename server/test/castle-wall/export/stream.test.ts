@@ -19,27 +19,56 @@ import {
   EnforcementExportStreamer,
   ENFORCEMENT_EVENT_SCHEMA,
   ENFORCEMENT_EXPORT_CURSOR_ADVANCED,
+  ENFORCEMENT_EXPORT_CURSOR_RESET,
   ENFORCEMENT_EXPORT_EMITTED,
   ENFORCEMENT_EXPORT_REFUSED,
   ENFORCEMENT_EXPORT_RETRY_EXHAUSTED,
   EXPORT_CURSOR_START,
+  EXPORT_CURSOR_START_STATE,
   type EnforcementExportConfig,
   type ExportApprover,
   type ExportAudit,
+  type ExportCursorReadResult,
+  type ExportCursorReset,
+  type ExportCursorState,
   type ExportCursorStore,
   type VerifiedChainSource,
 } from "../../../src/castle-wall/export/index.js";
 
 // ── Test doubles ──────────────────────────────────────────────────────────────
 
-/** An in-memory durable cursor. */
+/**
+ * A deterministic synthetic chain hash for a sequence. The fake chain is
+ * deterministic per sequence, so a re-run reads the SAME hash at the cursor and
+ * the streamer's chain-identity binding passes (as a real un-mutated chain would).
+ */
+function chainHash(sequence: number): string {
+  return `eh-${sequence}`;
+}
+
+/**
+ * An in-memory, authenticated-shaped durable cursor. `read()` returns the
+ * `{ state, reset }` contract; set `pendingReset` to simulate a store-level
+ * DISCARD (the store always resets `state` to the start sentinel in that case).
+ */
 class MemoryCursorStore implements ExportCursorStore {
-  constructor(public value: number = EXPORT_CURSOR_START) {}
-  async read(): Promise<number> {
-    return this.value;
+  state: ExportCursorState;
+  pendingReset: ExportCursorReset | null = null;
+  constructor(sequence: number = EXPORT_CURSOR_START, entryHash: string | null = null) {
+    this.state = { sequence, entryHash };
   }
-  async write(sequence: number): Promise<void> {
-    this.value = sequence;
+  /** Convenience: the persisted sequence (mirrors the pre-auth `value` field). */
+  get value(): number {
+    return this.state.sequence;
+  }
+  async read(): Promise<ExportCursorReadResult> {
+    if (this.pendingReset) {
+      return { state: { ...EXPORT_CURSOR_START_STATE }, reset: this.pendingReset };
+    }
+    return { state: { ...this.state }, reset: null };
+  }
+  async write(state: ExportCursorState): Promise<void> {
+    this.state = { ...state };
   }
 }
 
@@ -47,7 +76,9 @@ class MemoryCursorStore implements ExportCursorStore {
 function chainSource(items: Array<{ sequence: number; entry: AuditEntry }>): VerifiedChainSource {
   return {
     async streamVerifiedChain(consumer) {
-      for (const item of items) consumer.onEntry(item);
+      for (const item of items) {
+        consumer.onEntry({ sequence: item.sequence, entry_hash: chainHash(item.sequence), entry: item.entry });
+      }
     },
   };
 }
@@ -232,6 +263,165 @@ describe("durable cursor resumes after a mid-run crash", () => {
     expect(lines).toHaveLength(2);
     await streamer.runOnce(chainSource(chain));
     expect(lines).toHaveLength(2); // unchanged: nothing re-sent
+  });
+});
+
+// ── 1b. Cursor authentication / head-clamp / identity binding: fail LOUD, ───────
+//        never a silent zero-forward, never a skip (sweep fix 1 security carve-out).
+
+describe("cursor tamper defenses: refuse-or-reset LOUD, never silently blind", () => {
+  /** Build an armed file exporter + a streamer wired to capture audits + warns. */
+  async function armed(cursor: MemoryCursorStore): Promise<{
+    streamer: EnforcementExportStreamer;
+    lines: string[];
+    audits: Array<{ op: string; result: string; details: Record<string, unknown> }>;
+    warns: string[];
+  }> {
+    const lines: string[] = [];
+    const audits: Array<{ op: string; result: string; details: Record<string, unknown> }> = [];
+    const warns: string[] = [];
+    const { exporter } = await enabledFileExporter(lines, audits);
+    const streamer = new EnforcementExportStreamer({
+      exporter,
+      cursor,
+      audit: async (op, details, result) => {
+        audits.push({ op, result, details });
+      },
+      warn: (m) => warns.push(m),
+      batchSize: 10,
+      sleep: noSleep,
+    });
+    return { streamer, lines, audits, warns };
+  }
+
+  const resetAudits = (
+    audits: Array<{ op: string; result: string; details: Record<string, unknown> }>,
+  ) => audits.filter((a) => a.op === ENFORCEMENT_EXPORT_CURSOR_RESET);
+
+  it("a poisoned HIGH cursor (above the chain head) is RESET loud + re-scans; NEVER delivered:0 (the headline)", async () => {
+    // The exact attack: a valid-shaped cursor far above the real chain head. The
+    // pre-fix bug forwarded 0 events, advanced nothing, and emitted NOTHING.
+    const cursor = new MemoryCursorStore(999999999, "eh-999999999");
+    const chain = [egressDeny(0, "a.example"), egressDeny(1, "b.example")];
+    const { streamer, lines, audits, warns } = await armed(cursor);
+
+    const outcome = await streamer.runOnce(chainSource(chain));
+
+    // NOT a silent zero-forward: the whole surviving chain was re-scanned + sent.
+    expect(outcome.delivered).toBe(2);
+    expect(lines.map((l) => JSON.parse(l).destination_host)).toEqual(["a.example", "b.example"]);
+    // LOUD on BOTH channels: an audit record + a stderr warning naming the reason.
+    const resets = resetAudits(audits);
+    expect(resets).toHaveLength(1);
+    expect(resets[0]!.result).toBe("failure");
+    expect(resets[0]!.details.reason).toBe("cursor_above_chain_head");
+    expect(warns.some((w) => w.includes("cursor_above_chain_head"))).toBe(true);
+    // The cursor self-heals to a valid authenticated position bound to the head.
+    expect(cursor.state).toEqual({ sequence: 1, entryHash: "eh-1" });
+  });
+
+  it("a store-level DISCARD (bad MAC / unauthenticated) is surfaced LOUD, then re-scans from start", async () => {
+    const cursor = new MemoryCursorStore();
+    cursor.pendingReset = { reason: "cursor_mac_invalid", detail: "forged" };
+    const chain = [egressDeny(0, "a.example"), egressDeny(1, "b.example")];
+    const { streamer, lines, audits, warns } = await armed(cursor);
+
+    const outcome = await streamer.runOnce(chainSource(chain));
+
+    expect(outcome.delivered).toBe(2); // full re-scan, never blind
+    const resets = resetAudits(audits);
+    expect(resets).toHaveLength(1);
+    expect(resets[0]!.details.reason).toBe("cursor_mac_invalid");
+    expect(warns.some((w) => w.includes("cursor_mac_invalid"))).toBe(true);
+  });
+
+  it("a cursor bound to a DIFFERENT chain identity (wipe+recreate) RESETS; never skips the new prefix", async () => {
+    // Same sequence exists on the new chain, but its entry hash differs → a
+    // regrown/different chain. Must NOT trust the position; re-scan from start.
+    const cursor = new MemoryCursorStore(1, "eh-from-an-old-wiped-chain");
+    const chain = [egressDeny(0, "a.example"), egressDeny(1, "b.example"), egressDeny(2, "c.example")];
+    const { streamer, lines, audits } = await armed(cursor);
+
+    const outcome = await streamer.runOnce(chainSource(chain));
+
+    // The prefix (seq 0,1) the stale cursor would have skipped IS delivered.
+    expect(outcome.delivered).toBe(3);
+    expect(lines.map((l) => JSON.parse(l).destination_host)).toEqual([
+      "a.example",
+      "b.example",
+      "c.example",
+    ]);
+    expect(resetAudits(audits)[0]!.details.reason).toBe("cursor_chain_identity_mismatch");
+  });
+
+  it("a non-start cursor with NO chain-identity hash (null boundHash) RESETS; never skips the prefix", async () => {
+    // Belt-and-suspenders for the cursor.ts null-hash guard: a store that hands
+    // back a real sequence but a NULL identity anchor. The store layer rejects
+    // this shape, but the streamer must defend it independently — without a bound
+    // hash, the sequence-absent / identity-mismatch checks can never fire, so a
+    // naive streamer would forward only seq > 1 and SILENTLY SKIP the prefix.
+    const cursor = new MemoryCursorStore(1, null);
+    const chain = [egressDeny(0, "a.example"), egressDeny(1, "b.example"), egressDeny(2, "c.example")];
+    const { streamer, lines, audits, warns } = await armed(cursor);
+
+    const outcome = await streamer.runOnce(chainSource(chain));
+
+    // The prefix (seq 0,1) a naive skip would have dropped IS delivered.
+    expect(outcome.delivered).toBe(3);
+    expect(lines.map((l) => JSON.parse(l).destination_host)).toEqual([
+      "a.example",
+      "b.example",
+      "c.example",
+    ]);
+    const resets = resetAudits(audits);
+    expect(resets).toHaveLength(1);
+    expect(resets[0]!.details.reason).toBe("cursor_identity_binding_absent");
+    expect(warns.some((w) => w.includes("cursor_identity_binding_absent"))).toBe(true);
+    // Self-heals to a proper bound position at the head.
+    expect(cursor.state).toEqual({ sequence: 2, entryHash: "eh-2" });
+  });
+
+  it("a cursor whose sequence is ABSENT from the surviving chain RESETS (pruned / different chain)", async () => {
+    // Bound to seq 1, but the surviving chain has no seq-1 entry (e.g. FIFO-pruned
+    // under it, or a different chain). Identity cannot be re-verified → re-scan.
+    const cursor = new MemoryCursorStore(1, "eh-1");
+    const chain = [egressDeny(0, "a.example"), egressDeny(2, "c.example")]; // no seq 1
+    const { streamer, audits } = await armed(cursor);
+
+    const outcome = await streamer.runOnce(chainSource(chain));
+
+    expect(outcome.delivered).toBe(2); // 0 and 2 both re-sent, nothing skipped
+    expect(resetAudits(audits)[0]!.details.reason).toBe("cursor_sequence_absent");
+  });
+
+  it("a LEGITIMATE advance (matching identity) round-trips with NO reset (no false positive)", async () => {
+    // Bound to seq 1 with the correct hash; the chain grew to seq 2. Only seq 2 is
+    // new. No reset, no re-send of 0/1, no warn.
+    const cursor = new MemoryCursorStore(1, "eh-1");
+    const chain = [egressDeny(0, "a.example"), egressDeny(1, "b.example"), egressDeny(2, "c.example")];
+    const { streamer, lines, audits, warns } = await armed(cursor);
+
+    const outcome = await streamer.runOnce(chainSource(chain));
+
+    expect(outcome.delivered).toBe(1);
+    expect(lines.map((l) => JSON.parse(l).destination_host)).toEqual(["c.example"]);
+    expect(resetAudits(audits)).toHaveLength(0);
+    expect(warns).toHaveLength(0);
+    expect(cursor.state).toEqual({ sequence: 2, entryHash: "eh-2" });
+  });
+
+  it("an EMPTY chain with a real cursor neither resets nor delivers (no false overshoot)", async () => {
+    // Nothing on the chain this run: actualChainHead is null, so the head-clamp is
+    // NOT triggered (an empty read is not evidence the cursor overshot). Idempotent.
+    const cursor = new MemoryCursorStore(5, "eh-5");
+    const { streamer, lines, audits } = await armed(cursor);
+
+    const outcome = await streamer.runOnce(chainSource([]));
+
+    expect(outcome.delivered).toBe(0);
+    expect(lines).toHaveLength(0);
+    expect(resetAudits(audits)).toHaveLength(0);
+    expect(cursor.state).toEqual({ sequence: 5, entryHash: "eh-5" }); // unchanged
   });
 });
 
