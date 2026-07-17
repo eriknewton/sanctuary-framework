@@ -1,0 +1,598 @@
+/**
+ * Release-barrier sequence (Unified Protect Slice 5 S5-5): every orchestration
+ * branch, host-free over injected ops. The pinned invariants are the design's
+ * barrier line: enable strictly after commit + hold-file, bootstrap strictly
+ * after enable, EVERY abort branch removes the hold file and leaves the job
+ * disabled, and cleanup failures are loud (never swallowed).
+ */
+
+import { describe, it, expect } from "vitest";
+
+import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
+import {
+  ReleaseBarrierError,
+  computeHarnessArgvDigest,
+  runReleaseBarrierSequence,
+  type CommittedGenerationIdentity,
+  type HarnessReleaseHoldRecord,
+  type ReleaseBarrierContext,
+  type ReleaseBarrierOps,
+} from "../../src/egress-gate/release-barrier.js";
+
+const CTX: ReleaseBarrierContext = {
+  agentUid: 503,
+  harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
+  harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
+};
+
+interface SpyOps {
+  ops: ReleaseBarrierOps;
+  calls: string[];
+  written: HarnessReleaseHoldRecord[];
+  releasedPlists: CommittedGenerationIdentity[];
+}
+
+function makeOps(overrides?: Partial<Record<keyof ReleaseBarrierOps, unknown>>): SpyOps {
+  const calls: string[] = [];
+  const written: HarnessReleaseHoldRecord[] = [];
+  const releasedPlists: CommittedGenerationIdentity[] = [];
+  const base: ReleaseBarrierOps = {
+    async disableJob() {
+      calls.push("disable");
+    },
+    async enableJob() {
+      calls.push("enable");
+    },
+    async bootstrapJob() {
+      calls.push("bootstrap");
+    },
+    async bootoutJob() {
+      calls.push("bootout");
+    },
+    async removeHoldFile() {
+      calls.push("removeHold");
+    },
+    async writeHoldFile(record) {
+      calls.push("writeHold");
+      written.push(record);
+    },
+    async bootSessionUuid() {
+      calls.push("bootUuid");
+      return "1A2B3C4D-0000-4444-8888-ABCDEFABCDEF";
+    },
+    async rearmAnchor() {
+      calls.push("rearm");
+      return { ok: true as const };
+    },
+    async verifyGate() {
+      calls.push("verifyGate");
+      return { ok: true as const, observed: { generation_id: 7, agent_uid: 503 } };
+    },
+    async commitGeneration(): Promise<CommittedGenerationIdentity> {
+      calls.push("commit");
+      return { generation_id: 7, agent_uid: 503 };
+    },
+    async writeReleasedPlist(committed) {
+      calls.push("writeReleasedPlist");
+      releasedPlists.push(committed);
+    },
+    async restoreParkedPlist() {
+      calls.push("restoreParkedPlist");
+    },
+    async harnessStatus() {
+      calls.push("harnessStatus");
+      return { known: true, installed: true, running: true, pid: 4242 };
+    },
+  };
+  const ops = { ...base, ...(overrides as Partial<ReleaseBarrierOps>) };
+  return { ops, calls, written, releasedPlists };
+}
+
+describe("runReleaseBarrierSequence: happy path", () => {
+  it("releases with the exact stage ordering and re-parks the boot state last", async () => {
+    const { ops, calls, written, releasedPlists } = makeOps();
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome).toEqual({ kind: "released", generation_id: 7 });
+    expect(calls).toEqual([
+      "removeHold", // reassert-parked: stale hold cleared first
+      "disable", // reassert-parked: persistent park asserted
+      "restoreParkedPlist", // reassert-parked: a crashed run's released plist cleared
+      "rearm",
+      "verifyGate",
+      "commit",
+      "verifyGate", // verify-committed: committed identity re-verified live
+      "bootUuid",
+      "writeHold",
+      "writeReleasedPlist", // released plist embeds the committed generation
+      "enable",
+      "bootstrap",
+      "harnessStatus", // verify-running: post-bootstrap liveness probe
+      "disable", // repark-boot-state (enable persists; boot path re-parked)
+      "restoreParkedPlist", // repark-boot-state: parked plist restored
+      "harnessStatus", // verify-running: the re-park must not kill the session
+    ]);
+    // The barrier line: enable strictly after commit, hold-file write, AND the
+    // released-plist write (a parked plist embeds generation 0 and the wrapper
+    // refuses it, so enabling before the re-render can never exec the harness).
+    expect(calls.indexOf("enable")).toBeGreaterThan(calls.indexOf("commit"));
+    expect(calls.indexOf("enable")).toBeGreaterThan(calls.indexOf("writeHold"));
+    expect(calls.indexOf("enable")).toBeGreaterThan(calls.indexOf("writeReleasedPlist"));
+    expect(calls.indexOf("bootstrap")).toBeGreaterThan(calls.indexOf("enable"));
+    // The hold file names the committed generation, this uid, and the argv digest.
+    expect(written).toEqual([
+      {
+        generation_id: 7,
+        agent_uid: 503,
+        harness_label: AGENT_HARNESS_DAEMON_LABEL,
+        argv_digest: computeHarnessArgvDigest(CTX.harnessArgv),
+        boot_session_uuid: "1A2B3C4D-0000-4444-8888-ABCDEFABCDEF",
+      },
+    ]);
+    // The released plist re-render received the exact committed identity.
+    expect(releasedPlists).toEqual([{ generation_id: 7, agent_uid: 503 }]);
+  });
+
+  it("refuses invalid contexts outright (bad uid, unsafe label)", async () => {
+    const { ops } = makeOps();
+    await expect(runReleaseBarrierSequence({ ...CTX, agentUid: 0 }, ops)).rejects.toThrow(ReleaseBarrierError);
+    await expect(runReleaseBarrierSequence({ ...CTX, harnessLabel: "bad label" }, ops)).rejects.toThrow(
+      ReleaseBarrierError,
+    );
+  });
+});
+
+describe("runReleaseBarrierSequence: abort branches (fail-closed, hold removed, job disabled)", () => {
+  it("reassert-parked failure refuses to proceed and reports the cleanup error loudly", async () => {
+    const { ops, calls } = makeOps({
+      disableJob: async () => {
+        calls.push("disable");
+        throw new Error("launchctl down");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("reassert-parked");
+    expect(outcome.jobDisabled).toBe(false);
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.cleanupErrors.join(" ")).toContain("launchctl down");
+    // Nothing past the park assertion ran.
+    expect(calls).not.toContain("rearm");
+    expect(calls).not.toContain("enable");
+    expect(calls).not.toContain("bootstrap");
+  });
+
+  it("stale-hold-removal failure at reassert-parked also refuses to proceed", async () => {
+    const { ops, calls } = makeOps({
+      removeHoldFile: async () => {
+        calls.push("removeHold");
+        throw new Error("EACCES");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("reassert-parked");
+    expect(outcome.holdFileRemoved).toBe(false);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(calls).not.toContain("rearm");
+  });
+
+  it("rearm-anchor failure parks (already-asserted park state stands; no enable, no bootstrap)", async () => {
+    const { ops, calls } = makeOps({
+      rearmAnchor: async () => {
+        calls.push("rearm");
+        return { ok: false as const, reason: "pfctl exited 1" };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome).toEqual({
+      kind: "parked",
+      stage: "rearm-anchor",
+      reason: "pf anchor re-arm failed: pfctl exited 1",
+      holdFileRemoved: true,
+      jobDisabled: true,
+      cleanupErrors: [],
+    });
+    expect(calls).not.toContain("verifyGate");
+    expect(calls).not.toContain("writeHold");
+    expect(calls).not.toContain("enable");
+    expect(calls).not.toContain("bootstrap");
+  });
+
+  it("gate-verify failure parks with the reasons vector and never enables", async () => {
+    const { ops, calls } = makeOps({
+      verifyGate: async () => {
+        calls.push("verifyGate");
+        return { ok: false as const, reasons: ["gate down", "generation mismatch"] };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("gate-verify");
+    expect(outcome.reason).toContain("gate down; generation mismatch");
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(calls).not.toContain("commit");
+    expect(calls).not.toContain("enable");
+  });
+
+  it("commit failure parks, re-runs the park cleanup, and never writes the hold file", async () => {
+    const { ops, calls } = makeOps({
+      commitGeneration: async () => {
+        calls.push("commit");
+        throw new Error("G3 pf load failed");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("commit-generation");
+    expect(outcome.reason).toContain("G3 pf load failed");
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(calls.filter((c) => c === "removeHold")).toHaveLength(2);
+    expect(calls.filter((c) => c === "disable")).toHaveLength(2);
+    expect(calls).not.toContain("writeHold");
+    expect(calls).not.toContain("enable");
+  });
+
+  it("a commit naming a DIFFERENT uid parks (identity keying; never releases another agent's commit)", async () => {
+    const { ops, calls } = makeOps({
+      commitGeneration: async () => {
+        calls.push("commit");
+        return { generation_id: 7, agent_uid: 601 };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("commit-generation");
+    expect(outcome.reason).toContain("identity mismatch");
+    expect(calls).not.toContain("writeHold");
+    expect(calls).not.toContain("enable");
+  });
+
+  it("a commit with a non-positive generation id parks", async () => {
+    const { ops } = makeOps({
+      commitGeneration: async () => ({ generation_id: 0, agent_uid: 503 }),
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("commit-generation");
+  });
+
+  it("hold-file write failure parks and removes the (possibly partial) hold file", async () => {
+    const { ops, calls } = makeOps({
+      writeHoldFile: async () => {
+        calls.push("writeHold");
+        throw new Error("disk full");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("write-hold-file");
+    expect(outcome.reason).toContain("disk full");
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(calls).not.toContain("enable");
+    expect(calls).not.toContain("bootstrap");
+  });
+
+  it("boot-session-uuid read failure parks at write-hold-file (fail-closed; no unverifiable hold file)", async () => {
+    const { ops, calls } = makeOps({
+      bootSessionUuid: async () => {
+        calls.push("bootUuid");
+        throw new Error("sysctl unavailable");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("write-hold-file");
+    expect(outcome.reason).toContain("sysctl unavailable");
+    expect(calls).not.toContain("writeHold");
+    expect(calls).not.toContain("enable");
+  });
+
+  it("enable failure parks: hold file removed, job re-disabled, bootstrap never attempted", async () => {
+    const { ops, calls } = makeOps({
+      enableJob: async () => {
+        calls.push("enable");
+        throw new Error("enable refused");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("enable");
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(outcome.cleanupErrors).toEqual([]);
+    expect(calls).not.toContain("bootstrap");
+    // The hold write happened before enable; the abort removed it again.
+    expect(calls.indexOf("removeHold", calls.indexOf("writeHold"))).toBeGreaterThan(calls.indexOf("writeHold"));
+  });
+
+  it("bootstrap failure parks: bootout attempted, hold file removed, job disabled", async () => {
+    const { ops, calls } = makeOps({
+      bootstrapJob: async () => {
+        calls.push("bootstrap");
+        throw new Error("bootstrap 5: input/output error");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("bootstrap");
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(calls).toContain("bootout");
+    // Bootout precedes the hold-file removal and the re-disable in cleanup.
+    expect(calls.indexOf("bootout")).toBeGreaterThan(calls.indexOf("bootstrap"));
+  });
+
+  it("cleanup failures inside an abort are LOUD: booleans false + errors named", async () => {
+    let removeCount = 0;
+    const { ops } = makeOps({
+      enableJob: async () => {
+        throw new Error("enable refused");
+      },
+      removeHoldFile: async () => {
+        removeCount += 1;
+        // First call (reassert-parked) succeeds; the abort-cleanup call fails.
+        if (removeCount > 1) throw new Error("EROFS");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("enable");
+    expect(outcome.holdFileRemoved).toBe(false);
+    expect(outcome.cleanupErrors.join(" ")).toContain("EROFS");
+  });
+
+  it("bootstrap-abort with failing bootout still removes the hold file and disables, reporting the bootout error", async () => {
+    const { ops, calls } = makeOps({
+      bootstrapJob: async () => {
+        throw new Error("io error");
+      },
+      bootoutJob: async () => {
+        calls.push("bootout");
+        throw new Error("bootout refused");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(outcome.cleanupErrors.join(" ")).toContain("bootout refused");
+  });
+});
+
+describe("runReleaseBarrierSequence: repark-boot-state", () => {
+  it("a failed final re-disable is a DISTINCT loud outcome, never a clean release", async () => {
+    let disableCount = 0;
+    const { ops } = makeOps({
+      disableJob: async () => {
+        disableCount += 1;
+        // First call (reassert-parked) succeeds; the final re-park fails.
+        if (disableCount > 1) throw new Error("override db locked");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome).toEqual({
+      kind: "released-repark-failed",
+      generation_id: 7,
+      reparkError: "override db locked",
+    });
+  });
+
+  it("a failed parked-plist restore during re-park is the same loud amber outcome", async () => {
+    let restoreCount = 0;
+    const { ops } = makeOps({
+      restoreParkedPlist: async () => {
+        restoreCount += 1;
+        // First call (reassert-parked) succeeds; the re-park restore fails.
+        if (restoreCount > 1) throw new Error("EROFS");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome).toEqual({
+      kind: "released-repark-failed",
+      generation_id: 7,
+      reparkError: "EROFS",
+    });
+  });
+});
+
+describe("runReleaseBarrierSequence: verify-committed (TOCTOU binding; fix-round HIGH-2)", () => {
+  it("parks when the post-commit re-verify observes a DIFFERENT generation than the commit", async () => {
+    let verifyCount = 0;
+    const { ops, calls } = makeOps({
+      verifyGate: async () => {
+        verifyCount += 1;
+        calls.push("verifyGate");
+        // Pre-commit verify sees generation 6; the commit returns 7; the
+        // post-commit re-verify still sees 6 (the commit did not become the
+        // live gate generation). The hold file must never be written.
+        return { ok: true as const, observed: { generation_id: 6, agent_uid: 503 } };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("verify-committed");
+    expect(outcome.reason).toContain("observed uid 503 generation 6");
+    expect(outcome.reason).toContain("commit named uid 503 generation 7");
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(verifyCount).toBe(2);
+    expect(calls).not.toContain("writeHold");
+    expect(calls).not.toContain("writeReleasedPlist");
+    expect(calls).not.toContain("enable");
+  });
+
+  it("parks when the post-commit re-verify observes a DIFFERENT uid", async () => {
+    let verifyCount = 0;
+    const { ops, calls } = makeOps({
+      verifyGate: async () => {
+        verifyCount += 1;
+        return verifyCount === 1
+          ? { ok: true as const, observed: { generation_id: 7, agent_uid: 503 } }
+          : { ok: true as const, observed: { generation_id: 7, agent_uid: 601 } };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("verify-committed");
+    expect(calls).not.toContain("writeHold");
+  });
+
+  it("parks when the post-commit re-verify itself fails or throws (fail-closed)", async () => {
+    let verifyCount = 0;
+    const { ops: failOps, calls: failCalls } = makeOps({
+      verifyGate: async () => {
+        verifyCount += 1;
+        return verifyCount === 1
+          ? { ok: true as const, observed: { generation_id: 7, agent_uid: 503 } }
+          : { ok: false as const, reasons: ["gate went down mid-release"] };
+      },
+    });
+    const failed = await runReleaseBarrierSequence(CTX, failOps);
+    expect(failed.kind).toBe("parked");
+    if (failed.kind !== "parked") return;
+    expect(failed.stage).toBe("verify-committed");
+    expect(failed.reason).toContain("gate went down mid-release");
+    expect(failCalls).not.toContain("writeHold");
+
+    let throwCount = 0;
+    const { ops: throwOps } = makeOps({
+      verifyGate: async () => {
+        throwCount += 1;
+        if (throwCount > 1) throw new Error("oracle timeout");
+        return { ok: true as const, observed: { generation_id: 7, agent_uid: 503 } };
+      },
+    });
+    const threw = await runReleaseBarrierSequence(CTX, throwOps);
+    expect(threw.kind).toBe("parked");
+    if (threw.kind !== "parked") return;
+    expect(threw.stage).toBe("verify-committed");
+    expect(threw.reason).toContain("oracle timeout");
+  });
+});
+
+describe("runReleaseBarrierSequence: write-released-plist (fix-round HIGH-1)", () => {
+  it("the released-plist write receives the committed identity and precedes enable", async () => {
+    const { ops, calls, releasedPlists } = makeOps();
+    await runReleaseBarrierSequence(CTX, ops);
+    expect(releasedPlists).toEqual([{ generation_id: 7, agent_uid: 503 }]);
+    expect(calls.indexOf("writeReleasedPlist")).toBeGreaterThan(calls.indexOf("writeHold"));
+    expect(calls.indexOf("writeReleasedPlist")).toBeLessThan(calls.indexOf("enable"));
+  });
+
+  it("a failed released-plist write parks: hold removed, disabled, parked plist restored, never enabled", async () => {
+    const { ops, calls } = makeOps({
+      writeReleasedPlist: async () => {
+        calls.push("writeReleasedPlist");
+        throw new Error("disk full");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("write-released-plist");
+    expect(outcome.reason).toContain("disk full");
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(outcome.cleanupErrors).toEqual([]);
+    // The abort restored the parked plist (2nd restore; 1st was reassert-parked).
+    expect(calls.filter((c) => c === "restoreParkedPlist")).toHaveLength(2);
+    expect(calls).not.toContain("enable");
+    expect(calls).not.toContain("bootstrap");
+  });
+
+  it("enable/bootstrap aborts restore the parked plist so no released plist survives an abort", async () => {
+    const { ops, calls } = makeOps({
+      bootstrapJob: async () => {
+        calls.push("bootstrap");
+        throw new Error("io error");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("bootstrap");
+    expect(calls.filter((c) => c === "restoreParkedPlist")).toHaveLength(2);
+  });
+});
+
+describe("runReleaseBarrierSequence: verify-running (liveness; fix-round HIGH-3)", () => {
+  it("parks when the harness is not running after bootstrap (no silent green-on-down)", async () => {
+    const { ops, calls } = makeOps({
+      harnessStatus: async () => {
+        calls.push("harnessStatus");
+        return { known: true, installed: true, running: false };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("verify-running");
+    expect(outcome.reason).toContain("not running after bootstrap");
+    expect(outcome.holdFileRemoved).toBe(true);
+    expect(outcome.jobDisabled).toBe(true);
+    expect(calls).toContain("bootout");
+    expect(calls.filter((c) => c === "restoreParkedPlist")).toHaveLength(2);
+  });
+
+  it("parks fail-closed when the status is untrustworthy or the probe throws", async () => {
+    const { ops: unknownOps } = makeOps({
+      harnessStatus: async () => ({ known: false, installed: false, running: false }),
+    });
+    const unknown = await runReleaseBarrierSequence(CTX, unknownOps);
+    expect(unknown.kind).toBe("parked");
+    if (unknown.kind !== "parked") return;
+    expect(unknown.stage).toBe("verify-running");
+    expect(unknown.reason).toContain("trustworthy");
+
+    const { ops: throwOps } = makeOps({
+      harnessStatus: async () => {
+        throw new Error("launchctl hung");
+      },
+    });
+    const threw = await runReleaseBarrierSequence(CTX, throwOps);
+    expect(threw.kind).toBe("parked");
+    if (threw.kind !== "parked") return;
+    expect(threw.stage).toBe("verify-running");
+    expect(threw.reason).toContain("launchctl hung");
+  });
+
+  it("parks when the harness dies across the boot-state re-park (released is never claimed for a dead harness)", async () => {
+    let probeCount = 0;
+    const { ops, calls } = makeOps({
+      harnessStatus: async () => {
+        probeCount += 1;
+        calls.push("harnessStatus");
+        // Alive after bootstrap; dead after the re-park.
+        return probeCount === 1
+          ? { known: true, installed: true, running: true, pid: 4242 }
+          : { known: true, installed: true, running: false };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("verify-running");
+    expect(outcome.reason).toContain("re-park");
+    expect(outcome.holdFileRemoved).toBe(true);
+    // The re-park already disabled the job; the cleanup boots the dead job out.
+    expect(outcome.jobDisabled).toBe(true);
+    expect(calls).toContain("bootout");
+  });
+});
