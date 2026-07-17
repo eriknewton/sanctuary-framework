@@ -85,6 +85,11 @@ type StreamerCursorResetReason =
   /** The cursor sits ABOVE the verified chain head — an overshoot tamper signal
    * (the exact `999999999` case), or a chain that shrank under a stale cursor. */
   | "cursor_above_chain_head"
+  /** A non-start cursor with NO chain-identity hash to bind to. The store layer
+   * (`./cursor.ts`) already rejects this shape, but the streamer defends it
+   * independently: an unbound real cursor could silently skip the prefix at/below
+   * its sequence, so it is a reset, never a trusted skip. */
+  | "cursor_identity_binding_absent"
   /** The cursor's sequence is not present in the surviving chain (FIFO-pruned, or
    * a different chain) → its identity binding cannot be re-verified here. */
   | "cursor_sequence_absent"
@@ -209,10 +214,18 @@ export class EnforcementExportStreamer {
       if (fromCursor > scan.actualChainHead) {
         reason = "cursor_above_chain_head";
         detail = `cursor ${fromCursor} is above the verified chain head ${scan.actualChainHead}`;
-      } else if (boundHash !== null && scan.hashAtCursor === null) {
+      } else if (boundHash === null) {
+        // A real (non-start) cursor with NO chain-identity anchor cannot be bound
+        // to the surviving chain, so the sequence-absent / identity-mismatch checks
+        // below (which require a bound hash) can never fire and the prefix at/below
+        // `fromCursor` would be silently skipped. The store rejects this shape
+        // (cursor.ts), but the streamer defends it independently: reset, re-scan.
+        reason = "cursor_identity_binding_absent";
+        detail = `cursor sequence ${fromCursor} carries no chain-identity hash to bind to`;
+      } else if (scan.hashAtCursor === null) {
         reason = "cursor_sequence_absent";
         detail = `cursor sequence ${fromCursor} is not present in the surviving chain (pruned, or a different chain)`;
-      } else if (boundHash !== null && scan.hashAtCursor !== boundHash) {
+      } else if (scan.hashAtCursor !== boundHash) {
         reason = "cursor_chain_identity_mismatch";
         detail = `entry hash at cursor sequence ${fromCursor} does not match the bound chain identity`;
       }

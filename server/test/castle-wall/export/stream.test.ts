@@ -354,6 +354,33 @@ describe("cursor tamper defenses: refuse-or-reset LOUD, never silently blind", (
     expect(resetAudits(audits)[0]!.details.reason).toBe("cursor_chain_identity_mismatch");
   });
 
+  it("a non-start cursor with NO chain-identity hash (null boundHash) RESETS; never skips the prefix", async () => {
+    // Belt-and-suspenders for the cursor.ts null-hash guard: a store that hands
+    // back a real sequence but a NULL identity anchor. The store layer rejects
+    // this shape, but the streamer must defend it independently — without a bound
+    // hash, the sequence-absent / identity-mismatch checks can never fire, so a
+    // naive streamer would forward only seq > 1 and SILENTLY SKIP the prefix.
+    const cursor = new MemoryCursorStore(1, null);
+    const chain = [egressDeny(0, "a.example"), egressDeny(1, "b.example"), egressDeny(2, "c.example")];
+    const { streamer, lines, audits, warns } = await armed(cursor);
+
+    const outcome = await streamer.runOnce(chainSource(chain));
+
+    // The prefix (seq 0,1) a naive skip would have dropped IS delivered.
+    expect(outcome.delivered).toBe(3);
+    expect(lines.map((l) => JSON.parse(l).destination_host)).toEqual([
+      "a.example",
+      "b.example",
+      "c.example",
+    ]);
+    const resets = resetAudits(audits);
+    expect(resets).toHaveLength(1);
+    expect(resets[0]!.details.reason).toBe("cursor_identity_binding_absent");
+    expect(warns.some((w) => w.includes("cursor_identity_binding_absent"))).toBe(true);
+    // Self-heals to a proper bound position at the head.
+    expect(cursor.state).toEqual({ sequence: 2, entryHash: "eh-2" });
+  });
+
   it("a cursor whose sequence is ABSENT from the surviving chain RESETS (pruned / different chain)", async () => {
     // Bound to seq 1, but the surviving chain has no seq-1 entry (e.g. FIFO-pruned
     // under it, or a different chain). Identity cannot be re-verified → re-scan.

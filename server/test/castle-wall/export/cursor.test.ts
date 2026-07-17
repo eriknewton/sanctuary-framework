@@ -25,6 +25,7 @@ import {
   FileExportCursorStore,
 } from "../../../src/castle-wall/export/index.js";
 import { generateRandomKey } from "../../../src/core/random.js";
+import { fromBase64url } from "../../../src/core/encoding.js";
 
 let fortress: string;
 let masterKey: Uint8Array;
@@ -165,6 +166,51 @@ describe("FileExportCursorStore: fail-LOUD on an un-authenticatable cursor", () 
     const read = await new FileExportCursorStore(fortress, masterKey).read();
     expect(read.state.sequence).toBe(EXPORT_CURSOR_START);
     expect(read.reset?.reason).toBe("cursor_malformed");
+  });
+
+  it("DISCARDS a VALID-MAC cursor with a non-start sequence but a NULL entry_hash (the un-bound skip)", async () => {
+    // The chain-identity-binding gap: `write` computes a real MAC over whatever
+    // state it is handed, so this authors a cursor with a VALID master-key MAC over
+    // { last_sequence: 5, entry_hash: null }. Only a master-key holder can mint it,
+    // but its null hash means the streamer's identity checks (which require a bound
+    // hash) never fire — it would SILENTLY SKIP the chain prefix at/below seq 5.
+    // It must be rejected as malformed (LOUD → full re-scan), not trusted.
+    const store = new FileExportCursorStore(fortress, masterKey);
+    await store.write({ sequence: 5, entryHash: null });
+    const read = await store.read();
+    expect(read.state).toEqual({ sequence: EXPORT_CURSOR_START, entryHash: null });
+    expect(read.reset?.reason).toBe("cursor_malformed");
+
+    // NON-VACUITY: the SAME store + write path with a proper bound hash reads back
+    // clean. So the MAC machinery accepts this envelope; the ONLY thing rejecting
+    // the null-hash variant is the binding guard. Remove the guard and the null
+    // cursor reads back trusted (reset === null) and the assertion above fails.
+    await store.write({ sequence: 5, entryHash: "eh-5" });
+    const bound = await store.read();
+    expect(bound.reset).toBeNull();
+    expect(bound.state).toEqual({ sequence: 5, entryHash: "eh-5" });
+  });
+
+  it("REJECTS a MAC-valid cursor with trailing garbage appended to the MAC (strict base64url)", async () => {
+    // Author a legit authenticated cursor, then append a non-alphabet char to its
+    // MAC. Lenient `fromBase64url` silently skips it, so the tampered MAC decodes
+    // to the SAME bytes and would still verify — a fail-open seam. Strict decoding
+    // rejects the non-canonical encoding outright.
+    await new FileExportCursorStore(fortress, masterKey).write({ sequence: 8, entryHash: "eh-8" });
+    const raw = await readRawCursor();
+    const validMac = raw.mac as string;
+    const tamperedMac = `${validMac}!`;
+
+    // NON-VACUITY: prove the lenient decoder cannot tell the two MACs apart — they
+    // decode to identical bytes, so a lenient verifier WOULD accept the tampered
+    // one. Only strict decoding rejects it; this is what closes the seam.
+    expect([...fromBase64url(tamperedMac)]).toEqual([...fromBase64url(validMac)]);
+
+    raw.mac = tamperedMac;
+    await writeRawCursor(raw);
+    const read = await new FileExportCursorStore(fortress, masterKey).read();
+    expect(read.state.sequence).toBe(EXPORT_CURSOR_START);
+    expect(read.reset?.reason).toBe("cursor_mac_invalid");
   });
 
   it("is LOUD (reset, not silent) on a non-ENOENT read error", async () => {

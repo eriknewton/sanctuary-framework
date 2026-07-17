@@ -64,7 +64,7 @@ import { derivePurposeKey } from "../../core/key-derivation.js";
 import { hmacSha256 } from "../../core/hashing.js";
 import {
   toBase64url,
-  fromBase64url,
+  fromBase64urlStrict,
   stringToBytes,
   constantTimeEqual,
 } from "../../core/encoding.js";
@@ -136,10 +136,13 @@ export interface ExportCursorReset {
     /** No authenticated (v2) envelope: a legacy v1 record OR a hand-written bare
      * cursor. Recognized, never trusted for its value. */
     | "cursor_unauthenticated"
-    /** An authenticated envelope whose `data` fields are the wrong type/range. */
+    /** An authenticated envelope whose `data` fields are the wrong type/range,
+     * OR whose chain-identity binding is inconsistent (a non-start sequence with
+     * a null `entry_hash`, or the start sentinel carrying a hash). */
     | "cursor_malformed"
-    /** MAC present but does not verify → tampered, forged, or written under a
-     * different master key. */
+    /** MAC absent/non-canonically-encoded, or present but does not verify →
+     * tampered, forged, trailing-garbage-appended, or written under a different
+     * master key. */
     | "cursor_mac_invalid";
   /** Human-readable specifics for the audit record + stderr line (no secrets). */
   detail: string;
@@ -285,13 +288,42 @@ export class FileExportCursorStore implements ExportCursorStore {
       };
     }
 
+    // CHAIN-IDENTITY-BINDING INVARIANT: `entry_hash` is null IFF this is the start
+    // sentinel. A non-start sequence MUST carry a chain-identity hash. The
+    // streamer's chain-identity checks (`cursor_sequence_absent` /
+    // `cursor_chain_identity_mismatch`) only fire when a bound hash is present, so
+    // a MAC-valid cursor with a real sequence but a NULL `entry_hash` would slip
+    // past them and SILENTLY SKIP the chain prefix at/below that sequence: the
+    // exact "cannot silently skip the new low sequences" guarantee this cursor
+    // exists to make. It is only producible by a master-key holder (a legit write
+    // never mints this shape), but it defeats the invariant, so reject it LOUDLY
+    // (full re-scan) rather than trust a skip. The mirror inconsistency (a start
+    // sentinel that carries a hash) is rejected the same way.
+    if ((entryHash === null) !== (lastSequence === EXPORT_CURSOR_START)) {
+      return {
+        state: { ...EXPORT_CURSOR_START_STATE },
+        reset: {
+          reason: "cursor_malformed",
+          detail:
+            entryHash === null
+              ? `cursor sequence ${lastSequence} has a null chain-identity hash (only the start sentinel may be unbound)`
+              : "cursor start sentinel carries a chain-identity hash (must be null)",
+        },
+      };
+    }
+
     let provided: Uint8Array;
     try {
-      provided = fromBase64url(parsed.mac);
+      // STRICT decode: signature/MAC material MUST use `fromBase64urlStrict`. The
+      // lenient `fromBase64url` silently skips non-alphabet chars and stray
+      // padding, so trailing garbage appended to a valid MAC (`<mac>!`, `<mac>=`,
+      // a newline) decodes to the SAME bytes and would still verify: a fail-open
+      // seam. Strict rejects any non-canonical encoding here (loud, fail-closed).
+      provided = fromBase64urlStrict(parsed.mac);
     } catch {
       return {
         state: { ...EXPORT_CURSOR_START_STATE },
-        reset: { reason: "cursor_mac_invalid", detail: "cursor MAC is not valid base64url" },
+        reset: { reason: "cursor_mac_invalid", detail: "cursor MAC is not canonical base64url" },
       };
     }
     if (
