@@ -24,8 +24,17 @@ import type { StoredIdentity } from "../core/identity.js";
 import { AuditIntegrityError, type AuditEntry } from "../operational/audit-log.js";
 import {
   createDaemonAuditLog,
-  probeDaemonChainAccess,
+  daemonMigrationEstablished,
+  errnoAccessReason,
+  resolveDaemonStorePresence,
 } from "../operational/audit-store-split.js";
+import { fortressRanAuditStoreSplitMigration } from "../cli/audit-chain-export.js";
+import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import {
+  anchorReceiptsPresentOnDisk,
+  buildAnchorsExport,
+  readAnchorConfig,
+} from "../transparency/anchoring.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { StateStore } from "../cognitive/state-store.js";
@@ -171,13 +180,34 @@ async function gatherInventory(
  * Gather the discrete third-party verification exports from persisted state,
  * offline: the signed transparency-checkpoint bundle (assembled from the
  * shipped `readPersistedCheckpoints`; requires a single signing key across the
- * checkpoints), and the audit-chain JSONL export (from the shipped
- * `exportAuditChain`). Public-anchor evidence is opt-in / default-off and is
- * reported absent unless a later slice wires it. Each absent export carries an
- * honest reason string. Never contacts the network.
+ * checkpoints), the audit-chain JSONL export (from the shipped
+ * `exportAuditChain`), and the public-anchor evidence (from the shipped
+ * `buildAnchorsExport`). Each absent export carries an honest reason string.
+ * Never contacts the network.
+ *
+ * R2-1 (dry-bar): the raw `exportAuditChain` dumps the OPERATOR `_audit` chain
+ * only. On a fortress that ran the writer-split migration, a daemon enforcement
+ * chain (`_audit-daemon`) also exists, so an operator-only export would present
+ * an INCOMPLETE enforcement history as "the recorded enforcement history" (the
+ * census hole G-1 closed on the counts, on the export surface). The gather omits
+ * the audit-chain export (an honest `read_failed`) whenever EITHER the export
+ * module's daemon-dir/marker probe (`fortressRanAuditStoreSplitMigration`, what
+ * `runExport` fails closed on) OR the boundary-aware `daemonMigrationEstablished`
+ * (which the census path uses and which catches a boundary-only migrated
+ * fortress whose daemon dir + `_meta` marker were deleted) fires -- so the
+ * export surface omits on the SAME evidence-destruction cases the census path
+ * flags `missing`, not a weaker subset.
+ *
+ * C4 (dry-bar): the anchor export is read from actual anchoring state via
+ * `readAnchorConfig` + `buildAnchorsExport`, NEVER minted as a bare
+ * `empty_verified` (which would render a DEFINITIVE "anchoring is not enabled on
+ * this install" even when it is enabled with receipts). A genuinely-absent
+ * (authenticated) config is the only path to `empty_verified`.
  */
-async function gatherDiscreteExports(
-  storage: StorageBackend,
+export async function gatherDiscreteExports(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  fortressId: string,
   generatedAt: string
 ): Promise<EvidencePackDiscreteExports> {
   const transparency: ReadOutcome<string> = await (async () => {
@@ -206,6 +236,36 @@ async function gatherDiscreteExports(
 
   const audit_chain: ReadOutcome<string> = await (async () => {
     try {
+      // R2-1: refuse an operator-only chain on a split (migrated) fortress. The
+      // raw exporter dumps `_audit` only; the daemon enforcement chain would be
+      // silently omitted. This is the SAME fail-closed guard `runExport`
+      // enforces (marker-aware: it also fires when the daemon directory was
+      // deleted but the migration marker survives). Omitting it as a
+      // `read_failed` is honest: §10 then states the export is not included and
+      // why, instead of calling an incomplete chain "the recorded enforcement
+      // history".
+      // Consult BOTH the export module's own daemon-dir/marker probe AND the
+      // marker+boundary-aware `daemonMigrationEstablished` (which the pack can
+      // run because it holds the master key): the former misses a boundary-only
+      // migrated fortress whose daemon dir was deleted and whose _meta marker is
+      // absent, the latter closes that hole. Either firing means an operator-
+      // only export would omit the daemon chain.
+      if (
+        (await fortressRanAuditStoreSplitMigration(storage)) ||
+        (await daemonMigrationEstablished(storage, masterKey))
+      ) {
+        return readFailed(
+          "a single-file audit-chain export could NOT be shown to be complete for " +
+            "this fortress: it appears to have run the audit-store writer split (a " +
+            "daemon enforcement chain _audit-daemon, or a durable split marker, is " +
+            "present, or the check could not rule it out), so an operator-`_audit`-" +
+            "only export would omit the root-owned daemon enforcement chain. It was " +
+            "NOT included rather than risk presenting an incomplete enforcement " +
+            "history as complete. Export the operator chain with 'sanctuary " +
+            "audit-chain export --operator-only' and the daemon chain separately as " +
+            "root."
+        );
+      }
       const chunks: Buffer[] = [];
       const sink = new Writable({
         write(chunk, _enc, cb) {
@@ -221,9 +281,57 @@ async function gatherDiscreteExports(
     }
   })();
 
-  // Public anchoring is opt-in / default-off; a not-enabled install is a
-  // verified empty, not a read failure.
-  const anchor: ReadOutcome<string> = emptyVerified();
+  // C4: read ACTUAL anchoring state rather than minting a bare verified-empty
+  // (which renders a DEFINITIVE "anchoring is not enabled" even when it is
+  // enabled with receipts). Public anchoring is opt-in / default-off. Honest
+  // mapping, each arm backed by a real read:
+  //   - config absent (MAC-authenticated) AND no receipts on disk -> verified
+  //     empty (no anchor evidence: not enabled, or enabled-and-nothing-anchored;
+  //     the §10 wording covers both);
+  //   - config present (enabled/disabled) with >=1 receipt -> the real anchors
+  //     export (historical anchors stay auditable even when currently disabled);
+  //   - config present but ZERO receipts -> verified empty (configured, nothing
+  //     anchored yet) -- NEVER populated, so §10 never says a receipt-less export
+  //     lets an auditor "confirm the checkpoints were publicly anchored";
+  //   - config absent but receipts PRESENT on disk (inconsistent), a tampered
+  //     config, or any other read error -> read_failed, never a false "not
+  //     enabled". `anchorReceiptsPresentOnDisk` fails toward "present", so an
+  //     unlistable receipt store becomes read_failed here, not a false empty.
+  const anchor: ReadOutcome<string> = await (async () => {
+    try {
+      const state = await readAnchorConfig({ storage, masterKey });
+      const receiptsPresent = await anchorReceiptsPresentOnDisk(storage);
+      if (state.status === "absent") {
+        return receiptsPresent
+          ? readFailed(
+              "the anchoring config is absent but anchor receipts are present on " +
+                "disk (an inconsistent anchoring state), so the anchor evidence " +
+                "could not be gathered and this install's anchoring status could " +
+                "not be determined."
+            )
+          : emptyVerified();
+      }
+      const anchorsDoc = await buildAnchorsExport({
+        storage,
+        masterKey,
+        fortressId,
+        now: () => new Date(generatedAt),
+      });
+      // Only a receipt with status "anchored" is public-anchor evidence. A
+      // receipt-less export -- or one carrying ONLY failed anchor attempts (a
+      // Rekor outage persists `status:"failed"` receipts) -- proves NOTHING was
+      // publicly anchored, so it must not render as a definitive "publicly
+      // anchored" claim. Verified empty instead ("enabled, nothing anchored yet").
+      const hasAnchored = anchorsDoc.receipts.some(
+        (r) => r.status === "anchored"
+      );
+      return hasAnchored
+        ? populated(JSON.stringify(anchorsDoc, null, 2))
+        : emptyVerified();
+    } catch (e) {
+      return readFailed(`the anchor evidence could not be gathered: ${(e as Error).message}`);
+    }
+  })();
 
   return { transparency, audit_chain, anchor };
 }
@@ -276,9 +384,13 @@ export function deriveAuditReadOutcome(params: {
    * `included` merges the daemon entries + retention into the census;
    * `present_unreadable` discloses the daemon store exists but was not readable
    * at this privilege (the counts then EXCLUDE it, disclosed, never silent).
+   * `missing` (C1): audit-store split evidence is present but the daemon store
+   * is absent (deleted/renamed, or the split evidence is present-but-unverifiable
+   * -- fail-closed) (excluded + disclosed, never conflated with `absent`).
    */
   daemon?:
     | { status: "absent" }
+    | { status: "missing" }
     | { status: "present_unreadable"; unreadable_reason?: "privilege" | "io" }
     | { status: "present_tampered" }
     | {
@@ -386,15 +498,25 @@ export function deriveAuditReadOutcome(params: {
 
 /**
  * WATCH-1: read the F2 daemon enforcement store (`_audit-daemon`) for the
- * census. Returns `absent` on a non-split fortress (nothing to add),
- * `present_unreadable` when a daemon store exists but this privilege cannot read
- * it (the pack then DISCLOSES the omission), `present_tampered` when the store
- * WAS readable but failed integrity verification (round-5 gate: tamper evidence
- * must never be mislabeled as a privilege limitation, and "re-run as root" is
- * futile advice when root already hit the integrity failure), or `included`
- * with the daemon entries + retention to merge. A non-integrity read failure
- * after the directory was listable is `present_unreadable` so a pack always
- * generates and discloses rather than crashing.
+ * census. Returns:
+ *   - `absent` on a genuinely fresh / never-armed fortress (nothing to add);
+ *   - `missing` (C1) when audit-store split evidence is present but the daemon
+ *     store is absent (deleted/renamed, or present-but-unverifiable split
+ *     evidence -- fail-closed), distinguished from `absent` via the marker-aware
+ *     {@link resolveDaemonStorePresence}, and EXCLUDED from the census with a
+ *     hedged split-evidence disclosure;
+ *   - `present_unreadable` when a daemon store exists but this privilege cannot
+ *     read it (the pack then DISCLOSES the omission), with the reason
+ *     (`privilege` vs `io`) classified from the actual filesystem errno (C3) so
+ *     the disclosure only advises "re-run as root" for a privilege limitation;
+ *   - `present_tampered` when the store WAS readable but failed integrity
+ *     verification (round-5 gate: tamper evidence must never be mislabeled as a
+ *     privilege limitation, and "re-run as root" is futile advice when root
+ *     already hit the integrity failure);
+ *   - `included` with the daemon entries + retention to merge.
+ * A non-integrity read failure after the directory was listable is
+ * `present_unreadable` so a pack always generates and discloses rather than
+ * crashing.
  *
  * Exported for the integration regression test only; the CLI is the caller.
  */
@@ -403,6 +525,7 @@ export async function readDaemonStore(
   masterKey: Uint8Array
 ): Promise<
   | { status: "absent" }
+  | { status: "missing" }
   | { status: "present_unreadable"; unreadable_reason: "privilege" | "io" }
   | { status: "present_tampered" }
   | {
@@ -416,13 +539,18 @@ export async function readDaemonStore(
       };
     }
 > {
-  const access = await probeDaemonChainAccess(storage);
-  if (access === "absent") return { status: "absent" };
-  // A directory that exists but is not listable at this uid is a PRIVILEGE
-  // limitation (the expected operator-uid case on an armed box, where re-running
-  // as root reads it), never an I/O error.
-  if (access === "present_unreadable") {
-    return { status: "present_unreadable", unreadable_reason: "privilege" };
+  // C1 + C3: the marker-aware presence chokepoint distinguishes a fresh
+  // fortress (`absent`) from a deleted daemon store on a migrated one
+  // (`missing`), and classifies an unreadable store's reason from the actual
+  // stat/readdir errno instead of assuming `privilege`.
+  const presence = await resolveDaemonStorePresence(storage, masterKey);
+  if (presence.kind === "absent") return { status: "absent" };
+  if (presence.kind === "missing") return { status: "missing" };
+  if (presence.kind === "present_unreadable") {
+    return {
+      status: "present_unreadable",
+      unreadable_reason: presence.reason,
+    };
   }
   try {
     const daemonLog = createDaemonAuditLog(storage, masterKey);
@@ -478,14 +606,10 @@ export async function readDaemonStore(
  * on disk).
  */
 export function daemonUnreadableReason(e: unknown): "privilege" | "io" {
-  for (let cur: unknown = e, depth = 0; cur != null && depth < 8; depth++) {
-    const code = (cur as NodeJS.ErrnoException).code;
-    if (code === "EACCES" || code === "EPERM") return "privilege";
-    const next = (cur as { cause?: unknown }).cause;
-    if (next === cur) break;
-    cur = next;
-  }
-  return "io";
+  // Delegates to the single canonical classifier in `operational` (the lowest
+  // layer that owns the daemon store) so the privilege-vs-io walk can never
+  // drift between the presence resolver and this post-read path.
+  return errnoAccessReason(e);
 }
 
 /**
@@ -495,10 +619,22 @@ export function daemonUnreadableReason(e: unknown): "privilege" | "io" {
  * (`entry_unreadable` / `storage_unavailable` -- a file the directory listed but
  * this uid could not read, e.g. a per-file EACCES under a root-owned store).
  * Only the former is tamper evidence. Classify a purely-access-failure error as
- * a PRIVILEGE limitation (`present_unreadable`; re-run as root reads it), never
- * `present_tampered` -- crying "tamper" for a permission problem is the round-5
- * mislabel in the other direction. Any genuine tamper finding (even mixed with
- * access findings) is `present_tampered`. Exported for direct unit coverage.
+ * `present_unreadable` (re-run as root may read it), never `present_tampered` --
+ * crying "tamper" for a permission problem is the round-5 mislabel in the other
+ * direction. Any genuine tamper finding (even mixed with access findings) is
+ * `present_tampered`. Exported for direct unit coverage.
+ *
+ * C3 (dry-bar): within the access-only case, distinguish the reason from the
+ * REAL errno rather than the finding KIND. Both `entry_unreadable` (a per-file
+ * read failure) and `storage_unavailable` (a namespace listing / anchor read
+ * failure) can be EITHER a permission limit (a root-owned file the operator uid
+ * cannot read -- root clears it, "re-run as root" is correct) OR a genuine I/O /
+ * corruption / disappearance error (root will NOT clear it). audit-log.ts stamps
+ * the underlying error's message onto the finding, so classify `privilege` iff
+ * any access-only finding's message reveals a permission errno (`EACCES`/
+ * `EPERM`), else the claim-less `io` (honest "investigate", no futile root
+ * advice). This closes the mislabel in BOTH directions and for BOTH access
+ * kinds (a pure `entry_unreadable`/EIO no longer advises a futile root re-run).
  */
 export function classifyDaemonIntegrityError(
   e: AuditIntegrityError
@@ -512,10 +648,20 @@ export function classifyDaemonIntegrityError(
   const allAccessFailures =
     e.findings.length > 0 &&
     e.findings.every((f) => ACCESS_ONLY_KINDS.has(f.kind));
-  if (allAccessFailures) {
-    return { status: "present_unreadable", unreadable_reason: "privilege" };
+  if (!allAccessFailures) {
+    return { status: "present_tampered" };
   }
-  return { status: "present_tampered" };
+  // Privilege ONLY when a permission errno is actually present in a finding
+  // message; otherwise the claim-less `io` (covers EIO, a null/disappeared
+  // read, and any non-permission storage failure), so no access kind ever
+  // advises a futile "re-run as root" for a non-permission error.
+  const anyPermissionErrno = e.findings.some((f) =>
+    /\bE(ACCES|PERM)\b/.test(f.message)
+  );
+  return {
+    status: "present_unreadable",
+    unreadable_reason: anyPermissionErrno ? "privilege" : "io",
+  };
 }
 
 /**
@@ -533,20 +679,33 @@ export function daemonStoreCliWarning(
   if (!daemon) return [];
   if (daemon.status === "present_unreadable") {
     return [
-      "  NOTE: the recorded-operation count above is from the OPERATOR audit",
-      "  store only. A root-owned daemon enforcement store (_audit-daemon) is",
-      "  present but was not readable here, so daemon-recorded enforcement is NOT",
-      "  in that count (not a complete enforcement census). See the report's",
-      "  access-log and enforcement summary section.",
+      "  NOTE: the recorded-operation count AND the covered-window / shortfall",
+      "  assessment above are from the OPERATOR audit store only. A root-owned",
+      "  daemon enforcement store (_audit-daemon) is present but was not readable",
+      "  here, so daemon-recorded enforcement is NOT reflected in them; treat these",
+      "  as an operator-store view, not a complete enforcement census. See the",
+      "  report's access-log and enforcement summary section.",
       "",
     ];
   }
   if (daemon.status === "present_tampered") {
     return [
       "  WARNING: a root-owned daemon enforcement store (_audit-daemon) is present",
-      "  but FAILED integrity verification, so the recorded-operation count above",
-      "  is the OPERATOR store only and the daemon store shows tamper evidence;",
-      "  investigate. See the report's access-log and enforcement summary section.",
+      "  but FAILED integrity verification, so the recorded-operation count AND the",
+      "  covered-window / shortfall assessment above are the OPERATOR store only and",
+      "  the daemon store shows tamper evidence; investigate. See the report's",
+      "  access-log and enforcement summary section.",
+      "",
+    ];
+  }
+  if (daemon.status === "missing") {
+    return [
+      "  WARNING: audit-store writer-split evidence is present but the root-owned",
+      "  daemon enforcement store (_audit-daemon) is ABSENT (deleted or renamed, or",
+      "  the split evidence is present but unverifiable), so the recorded-operation",
+      "  count AND the covered-window / shortfall assessment above are the OPERATOR",
+      "  store only. This is NOT a clean fresh fortress; investigate. See the",
+      "  report's access-log and enforcement summary section.",
       "",
     ];
   }
@@ -749,7 +908,17 @@ export async function runEvidencePack(args: string[]): Promise<void> {
   // third-party verification exports, both READ-ONLY from persisted state.
   const generatedAt = new Date().toISOString();
   const inventory = await gatherInventory(config, storage, masterKey, signer);
-  const discreteExports = await gatherDiscreteExports(storage, generatedAt);
+  const discreteExports = await gatherDiscreteExports(
+    storage,
+    masterKey,
+    // Stamp the anchor export with the SAME fortress id the transparency
+    // checkpoints carry (derived from the storage path), NOT the signer identity
+    // id: the auditor's `verify-transparency --check-anchors` cross-checks the
+    // anchors export's `fortress_id` against the checkpoints, and a mismatch
+    // makes it emit "not evidence about this bundle" (Codex/Family-B MED).
+    fortressIdFromStoragePath(config.storage_path),
+    generatedAt
+  );
 
   const input: EvidencePackInput = {
     firm_name: opts.firmName,

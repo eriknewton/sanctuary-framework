@@ -39,7 +39,10 @@ import {
   AuditStoreSplitMigrationError,
   DaemonAuditStorageAdapter,
   createDaemonAuditLog,
+  daemonMigrationEstablished,
+  errnoAccessReason,
   migrateFortressAuditStoreSplit,
+  resolveDaemonStorePresence,
   verifyFortressAuditFullPicture,
   verifySealedLegacyPrefix,
 } from "../../src/operational/audit-store-split.js";
@@ -649,6 +652,132 @@ describe("F2 Option A: fortress audit store split", () => {
       expect(findings.length).toBeGreaterThan(0);
       const anchor = await storage.read("_audit_checkpoints", "__rotation_anchor");
       expect(anchor).toBeNull();
+    });
+  });
+
+  describe("resolveDaemonStorePresence (C1 marker-aware census/export chokepoint)", () => {
+    it("absent on a genuinely fresh (never-migrated) fortress", async () => {
+      const { storage, masterKey } = await makeFortress();
+      expect(await resolveDaemonStorePresence(storage, masterKey)).toEqual({
+        kind: "absent",
+      });
+      expect(await daemonMigrationEstablished(storage, masterKey)).toBe(false);
+    });
+
+    it("accessible on a migrated fortress with an intact daemon store", async () => {
+      const { storage, masterKey } = await makeFortress();
+      const auditLog = new AuditLog(storage, masterKey);
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation: "op",
+        identity_id: "a",
+        result: "success",
+      });
+      await auditLog.flush();
+      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      expect(await daemonMigrationEstablished(storage, masterKey)).toBe(true);
+      expect(await resolveDaemonStorePresence(storage, masterKey)).toEqual({
+        kind: "accessible",
+      });
+    });
+
+    it("missing (NOT absent) when the daemon store was deleted after migration", async () => {
+      const { statePath, storage, masterKey } = await makeFortress();
+      const auditLog = new AuditLog(storage, masterKey);
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation: "op",
+        identity_id: "a",
+        result: "success",
+      });
+      await auditLog.flush();
+      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await rm(join(statePath, AUDIT_DAEMON_NAMESPACE), {
+        recursive: true,
+        force: true,
+      });
+      // The established marker in _meta survives the daemon-dir deletion, so this
+      // is evidence destruction, not a never-provisioned fortress.
+      expect(await resolveDaemonStorePresence(storage, masterKey)).toEqual({
+        kind: "missing",
+      });
+    });
+
+    it("missing on a BOUNDARY-ONLY fortress (daemon dir AND _meta marker deleted, boundary survives)", async () => {
+      const { statePath, storage, masterKey } = await makeFortress();
+      const auditLog = new AuditLog(storage, masterKey);
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation: "op",
+        identity_id: "a",
+        result: "success",
+      });
+      await auditLog.flush();
+      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await rm(join(statePath, AUDIT_DAEMON_NAMESPACE), {
+        recursive: true,
+        force: true,
+      });
+      await storage.delete("_meta", "audit-store-split-established-v1");
+      // The MAC'd boundary record alone still proves the migration ran.
+      expect(await daemonMigrationEstablished(storage, masterKey)).toBe(true);
+      expect(await resolveDaemonStorePresence(storage, masterKey)).toEqual({
+        kind: "missing",
+      });
+    });
+
+    it("present_unreadable with a privilege reason when the daemon dir is not listable", async () => {
+      if (typeof process.getuid === "function" && process.getuid() === 0) {
+        return; // root bypasses mode bits
+      }
+      const { statePath, storage, masterKey } = await makeFortress();
+      const auditLog = new AuditLog(storage, masterKey);
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation: "op",
+        identity_id: "a",
+        result: "success",
+      });
+      await auditLog.flush();
+      await migrateFortressAuditStoreSplit({ storage, masterKey });
+      await chmod(join(statePath, AUDIT_DAEMON_NAMESPACE), 0o000);
+      expect(await resolveDaemonStorePresence(storage, masterKey)).toEqual({
+        kind: "present_unreadable",
+        reason: "privilege",
+      });
+    });
+
+    it("fail-closed: a present-but-UNVERIFIABLE boundary file (junk) on an otherwise-fresh fortress -> established -> missing", async () => {
+      // Fix-4 raw-stat existence check: a boundary file that readAuditStoreSplitBoundary
+      // would launder to `absent` (junk / unreadable) still counts as split
+      // evidence, so the daemon store reads `missing` (fail closed), never a clean
+      // `absent`. The disclosure wording hedges accordingly (see the pack tests).
+      const { statePath, storage, masterKey } = await makeFortress();
+      const { mkdir, writeFile } = await import("node:fs/promises");
+      const { auditStoreSplitBoundaryPath } = await import(
+        "../../src/operational/audit-log.js"
+      );
+      const boundaryPath = auditStoreSplitBoundaryPath(statePath);
+      await mkdir(join(boundaryPath, ".."), { recursive: true });
+      await writeFile(boundaryPath, "not-a-valid-boundary-record", "utf8");
+      expect(await daemonMigrationEstablished(storage, masterKey)).toBe(true);
+      expect(await resolveDaemonStorePresence(storage, masterKey)).toEqual({
+        kind: "missing",
+      });
+    });
+
+    it("errnoAccessReason classifies EACCES/EPERM as privilege, else io", () => {
+      expect(errnoAccessReason(Object.assign(new Error("x"), { code: "EACCES" }))).toBe(
+        "privilege"
+      );
+      expect(
+        errnoAccessReason(
+          Object.assign(new Error("x"), {
+            cause: Object.assign(new Error("y"), { code: "EPERM" }),
+          })
+        )
+      ).toBe("privilege");
+      expect(errnoAccessReason(Object.assign(new Error("x"), { code: "EIO" }))).toBe("io");
     });
   });
 });

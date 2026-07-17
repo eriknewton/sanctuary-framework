@@ -499,6 +499,12 @@ export async function verifySealedLegacyPrefix(
  *     conflated with "absent" or "verified".
  *   - `accessible`: this process can list the directory; a full decrypt +
  *     chain-walk verify is attempted next.
+ *
+ * This is the plain filesystem probe. It CANNOT distinguish a genuinely fresh
+ * fortress from a DELETED daemon store on a migrated one (both stat ENOENT); a
+ * caller that needs that distinction must consult the migration-established
+ * marker via {@link daemonMigrationEstablished} (as {@link resolveDaemonStorePresence}
+ * and {@link verifyFortressAuditFullPicture} do).
  */
 export async function probeDaemonChainAccess(
   storage: FilesystemStorage
@@ -520,6 +526,130 @@ export async function probeDaemonChainAccess(
     return "accessible";
   } catch {
     return "present_unreadable";
+  }
+}
+
+/**
+ * Classify a filesystem access error as a `privilege` limitation (an
+ * `EACCES`/`EPERM`, possibly nested on the error's `cause` chain -- re-running
+ * as root reads it) or a generic `io` error (root will hit the same failure).
+ * The single canonical classifier: `operational` is the lowest layer that owns
+ * the daemon store, so every consumer (this module's presence resolver and the
+ * evidence-pack's `daemonUnreadableReason`) delegates here rather than
+ * re-deriving the walk, so the classification can never drift between surfaces.
+ */
+export function errnoAccessReason(err: unknown): "privilege" | "io" {
+  for (let cur: unknown = err, depth = 0; cur != null && depth < 8; depth++) {
+    const code = (cur as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") return "privilege";
+    const next = (cur as { cause?: unknown }).cause;
+    if (next === cur) break;
+    cur = next;
+  }
+  return "io";
+}
+
+/**
+ * True iff the writer-split migration has been ESTABLISHED on this fortress: a
+ * valid split-boundary record exists, OR the durable `_meta`
+ * migration-established marker is present-but-not-absent (a corrupted/unreadable
+ * marker is still migration evidence -- fail closed). This is the single
+ * source of the "migration ran" signal, so a DELETED/renamed daemon directory
+ * is distinguished from a never-provisioned one identically everywhere. Extracted
+ * from {@link verifyFortressAuditFullPicture} (which now calls it) so there is
+ * ONE definition, not two that can drift.
+ */
+export async function daemonMigrationEstablished(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array
+): Promise<boolean> {
+  const statePath = dirnameOf(storage.namespacePath("_audit"));
+  const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
+  // Fail-closed RAW existence check FIRST: `readAuditStoreSplitBoundary`
+  // launders an unreadable boundary file (e.g. an EACCES on a root-owned
+  // boundary) to `{status:"absent"}`, so relying on its parsed verdict alone
+  // would let a destroyed store on a locked-down box read as a never-migrated
+  // fortress. A boundary FILE on disk -- readable or not -- proves the
+  // migration ran. Any non-ENOENT stat error is treated as present (the file
+  // is there but unreadable), never as absent.
+  try {
+    await stat(auditStoreSplitBoundaryPath(statePath));
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return true;
+    // ENOENT: genuinely no boundary file. Fall through to the parsed reads.
+  }
+  const boundary = await readAuditStoreSplitBoundary(statePath, macKey);
+  // Any PRESENT boundary record (valid OR invalid/tampered) is migration
+  // evidence: the migration is the only writer of this record, and a tampered
+  // boundary on an armed box is itself a fail-closed signal, so a subsequently
+  // deleted daemon store must read as `missing`, never `absent`. Only a
+  // genuinely `absent` boundary falls through to the marker.
+  if (boundary.status !== "absent") return true;
+  // A corrupted/unreadable marker is still migration evidence (fail closed).
+  return (await readAuditStoreSplitEstablishedMarker(storage, macKey)) !== "absent";
+}
+
+/** The marker-aware daemon-store presence verdict. See {@link resolveDaemonStorePresence}. */
+export type DaemonStorePresence =
+  | { kind: "absent" }
+  | { kind: "missing" }
+  | { kind: "present_unreadable"; reason: "privilege" | "io" }
+  | { kind: "accessible" };
+
+/**
+ * The marker-aware daemon-store presence resolver: the SINGLE census/export
+ * chokepoint for "what state is the daemon enforcement store in". Folds the
+ * plain filesystem probe together with {@link daemonMigrationEstablished} so a
+ * daemon store that is absent WHILE split evidence is present (a deleted/renamed
+ * store on a migrated fortress, or present-but-unverifiable split evidence) is
+ * reported as `missing`, NOT `absent` (a never-armed fortress) -- mirroring
+ * {@link verifyFortressAuditFullPicture}'s dual-reader verdict. It also
+ * classifies an unreadable store's reason (`privilege` vs `io`) from the ACTUAL
+ * stat/readdir errno via {@link errnoAccessReason}, so the disclosure never
+ * advises a futile "re-run as root" for a genuine I/O error.
+ *
+ * Verdicts:
+ *   - `absent`: probe absent AND migration NOT established (fresh/never-armed).
+ *   - `missing`: probe absent BUT migration established (deleted/renamed -- the
+ *     store was provisioned and is now gone).
+ *   - `present_unreadable{reason}`: the directory exists but could not be
+ *     stat'd/listed at this privilege; `reason` distinguishes a permission limit
+ *     (root can read it) from an I/O error (root cannot).
+ *   - `accessible`: the directory listed; the caller reads + integrity-verifies.
+ */
+export async function resolveDaemonStorePresence(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array
+): Promise<DaemonStorePresence> {
+  const dirPath = storage.namespacePath(AUDIT_DAEMON_NAMESPACE);
+  const absentOrMissing = async (): Promise<DaemonStorePresence> =>
+    (await daemonMigrationEstablished(storage, masterKey))
+      ? { kind: "missing" }
+      : { kind: "absent" };
+  let stats;
+  try {
+    stats = await stat(dirPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return absentOrMissing();
+    // Any other stat error (e.g. EACCES on an ancestor, or an EIO): the store
+    // is present-but-unreadable. Classify the reason from the errno so the
+    // disclosure only advises "re-run as root" for a privilege limitation.
+    return { kind: "present_unreadable", reason: errnoAccessReason(err) };
+  }
+  // A non-directory at the daemon path is not a provisioned chain; treat it
+  // exactly like ENOENT (absent vs. destroyed-on-a-migrated-fortress).
+  if (!stats.isDirectory()) return absentOrMissing();
+  try {
+    await readdir(dirPath);
+    return { kind: "accessible" };
+  } catch (err) {
+    // A readdir ENOENT after a successful stat means the directory was removed
+    // between the two calls (a concurrent deletion / TOCTOU): that is an
+    // absent-vs-destroyed question, NOT an unreadable-store one, so re-resolve
+    // against the migration marker rather than mislabeling it privilege/io.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return absentOrMissing();
+    return { kind: "present_unreadable", reason: errnoAccessReason(err) };
   }
 }
 
@@ -604,24 +734,12 @@ export async function verifyFortressAuditFullPicture(opts: {
 
   // HIGH-R3: a valid boundary proves the migration ran and names the daemon
   // chain, so an absent daemon directory afterward is a deletion (fail closed),
-  // not "never provisioned". Resolve boundary validity once for the daemon
-  // verdict below.
-  const boundaryForDaemon = masterKey
-    ? await readAuditStoreSplitBoundary(
-        dirnameOf(storage.namespacePath("_audit")),
-        deriveAuditStoreSplitBoundaryMacKey(masterKey)
-      )
-    : { status: "absent" as const };
-  const migrationEstablished =
-    boundaryForDaemon.status === "valid" ||
-    (masterKey
-      ? // HIGH-1 (round 3): a corrupted/unreadable marker is still migration
-        // evidence (fail closed), so `!== "absent"`.
-        (await readAuditStoreSplitEstablishedMarker(
-          storage,
-          deriveAuditStoreSplitBoundaryMacKey(masterKey)
-        )) !== "absent"
-      : false);
+  // not "never provisioned". The valid-boundary-OR-established-marker signal is
+  // shared with the evidence-pack census/export chokepoint via
+  // {@link daemonMigrationEstablished} (ONE definition).
+  const migrationEstablished = masterKey
+    ? await daemonMigrationEstablished(storage, masterKey)
+    : false;
 
   let daemon: AuditChainReport;
   const access = await probeDaemonChainAccess(storage);

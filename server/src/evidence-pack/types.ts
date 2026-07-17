@@ -5,12 +5,14 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Shared types for the quarterly law-firm evidence pack (slice 1, the
- * walking skeleton). The evidence pack is a signed, human-readable PDF an
- * office manager attaches to an insurance renewal or an outside-counsel
- * audit. It reuses the shipped tamper-evident audit log, the zero-dependency
- * PDF writer, and the signed-manifest bundle pattern; the NEW code here is the
- * calendar-quarter aggregation layer plus honest coverage/shortfall
- * disclosure.
+ * walking skeleton). The evidence pack is a human-readable PDF plus a signed
+ * Markdown report and a signed manifest, which an office manager attaches to an
+ * insurance renewal or an outside-counsel audit. Integrity lives in the signed
+ * Markdown + manifest; the PDF itself is a render and is deliberately NOT
+ * signed (see the CLI help and section 10). It reuses the shipped tamper-evident
+ * audit log, the zero-dependency PDF writer, and the signed-manifest bundle
+ * pattern; the NEW code here is the calendar-quarter aggregation layer plus
+ * honest coverage/shortfall disclosure.
  *
  * NOT LEGAL ADVICE. This defines the shape of a technical evidence artifact.
  * It is not a legal interpretation of any professional-responsibility rule,
@@ -49,9 +51,14 @@ export interface QuarterWindow {
 /**
  * Category an audit entry is bucketed into for the human-review and
  * access-log sections. Derived from the entry's `operation` prefix (the
- * `gate_*` families the enforcement gate writes) and, for cross-harness
- * approvals, from the entry `result`. `other` is every operation that is not
- * an enforcement-decision record (identity ops, state writes, heartbeats).
+ * `gate_*` families the enforcement gate writes), refined by the gate's own
+ * `details.decided_by` for the human/automated split. `other` is every
+ * operation that is not a counted enforcement-decision record (identity ops,
+ * state writes, heartbeats) -- including the `cross_harness_approval_resolved`
+ * op, which is deliberately routed to `other` (NOT read from the entry
+ * `result`) because it is a paired OBSERVATION of a decision the gate already
+ * counted; counting it again would double the human-review figure (see
+ * `aggregate.ts`).
  *
  * HUMAN vs AUTOMATED via `details.decided_by` (round-2 N1 fix): the gate writes
  * `decided_by: response.decided_by` on `gate_approve:` and `gate_deny:` (see
@@ -133,9 +140,21 @@ export interface QuarterAggregation {
  * namespace into a separate root-owned `_audit-daemon` store. The evidence pack
  * reads the operator store; this descriptor makes the daemon store's
  * contribution EXPLICIT so the census is never a silent single-store false
- * count. Four honest states:
- *   - `absent`: no daemon store exists (a fresh / never-armed fortress). The
- *     operator store is the whole census.
+ * count. Five honest states:
+ *   - `absent`: no daemon store has ever been provisioned here AND the
+ *     writer-split migration has NOT been established (a genuinely fresh /
+ *     never-armed fortress). The operator store is the whole census. This is
+ *     resolved against the split-established marker, NOT a bare directory
+ *     stat, so a DELETED store is never mislabeled `absent` (see `missing`).
+ *   - `missing` (C1): audit-store writer-split evidence is present (a split
+ *     boundary and/or established marker referencing a daemon chain) but the
+ *     daemon namespace is ABSENT. This is either genuine deletion/renaming of a
+ *     migrated store OR present-but-unverifiable split evidence (the presence
+ *     check is fail-closed on a raw boundary-file stat, so it does not assert
+ *     the migration definitively "ran"); EITHER way it is NOT a never-armed
+ *     fortress. The counts EXCLUDE it and the disclosure hedges accordingly,
+ *     never the futile "re-run as root" (root cannot recreate a missing store).
+ *     Mirrors `verifyFortressAuditFullPicture`'s `missing` verdict.
  *   - `included`: the daemon store was read at this privilege and its entries
  *     were MERGED into the census (its retention counted independently).
  *   - `present_unreadable`: a daemon store EXISTS but could not be read at this
@@ -151,7 +170,12 @@ export interface QuarterAggregation {
  *     "tamper detected, investigate", never the futile "re-run as root".
  */
 export interface DaemonStoreDisclosure {
-  status: "absent" | "included" | "present_unreadable" | "present_tampered";
+  status:
+    | "absent"
+    | "missing"
+    | "included"
+    | "present_unreadable"
+    | "present_tampered";
   /**
    * Daemon-store entries merged into the census (only when `included`). This is
    * the TOTAL retained daemon entries read, across all time -- NOT the subset
@@ -184,6 +208,31 @@ export interface DaemonStoreDisclosure {
    * the dominant real cause.
    */
   unreadable_reason?: "privilege" | "io";
+}
+
+/**
+ * The SINGLE predicate for "a daemon enforcement store is present on this
+ * fortress but its records are NOT in the census" -- i.e. the counts/coverage
+ * are an operator-store-only view and every definitive-census surface must
+ * disclose that. True for `present_unreadable`, `present_tampered`, and
+ * `missing` (split evidence present but the daemon store absent -- deleted or
+ * unverifiable); false for `absent` (the operator store
+ * IS the whole census) and `included` (the daemon entries are already merged).
+ *
+ * Centralised so a future status flows through ONE decision rather than N
+ * inline `||` chains that can drift apart (the recurring-hole pattern). Every
+ * count/coverage/CLI surface that scopes its wording to the operator store
+ * derives that scoping from HERE.
+ */
+export function daemonStoreExcludedFromCensus(
+  daemon: DaemonStoreDisclosure | undefined
+): boolean {
+  const status = daemon?.status;
+  return (
+    status === "present_unreadable" ||
+    status === "present_tampered" ||
+    status === "missing"
+  );
 }
 
 export interface RetentionFacts {
@@ -495,8 +544,10 @@ export interface EvidencePackManifest {
          * disclosure, machine-readable, so a verifier reading `shortfall: false`
          * is never left believing the census was complete when a root-owned
          * daemon store was present but excluded. `absent`/`included` mean the
-         * count is the whole census / already merged; `present_unreadable` /
-         * `present_tampered` mean these coverage facts reflect the OPERATOR store
+         * count is the whole census / already merged; `present_unreadable`,
+         * `present_tampered`, and `missing` (split evidence present but the
+         * daemon store absent -- deleted or unverifiable, C1) mean these
+         * coverage facts reflect the OPERATOR store
          * only (never a silent single-store signal, even in the signed manifest).
          */
         daemon_store: {

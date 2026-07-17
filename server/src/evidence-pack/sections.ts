@@ -33,6 +33,7 @@ import type {
   ShortfallReport,
 } from "./types.js";
 import type { QuarterWindow } from "./types.js";
+import { daemonStoreExcludedFromCensus } from "./types.js";
 import { notCollectedInventorySnapshot } from "./inventory.js";
 import {
   claimFromCompleteRead,
@@ -119,22 +120,23 @@ function renderCover(
       }
       if (s.zero_of_quarter_covered) {
         // G-1(c): when a root-owned daemon store is present but EXCLUDED
-        // (unreadable/tampered), scope the zero-coverage claim to the OPERATOR
-        // store (the daemon may hold enforcement history for the quarter) and
-        // signpost it. When the daemon store is absent/included, the operator
-        // count IS the whole census, so keep the neutral wording (do not
-        // introduce a distinction that under-claims the single-store case).
-        const daemonExcluded =
-          s.daemon_store?.status === "present_unreadable" ||
-          s.daemon_store?.status === "present_tampered";
+        // (unreadable/tampered/missing), scope the zero-coverage claim to the
+        // OPERATOR store (the daemon may hold enforcement history for the
+        // quarter) and signpost it. When the daemon store is absent/included,
+        // the operator count IS the whole census, so keep the neutral wording
+        // (do not introduce a distinction that under-claims the single-store
+        // case).
+        // When a daemon store is excluded, scope the zero-coverage claim to the
+        // OPERATOR store (the daemon may hold quarter history). The daemon store
+        // itself is disclosed by the daemon cover caveat appended below (which
+        // is status-correct for present-unreadable/tampered vs. deleted), so this
+        // banner does not describe the daemon store's state here.
         return [
-          daemonExcluded
+          daemonStoreExcludedFromCensus(s.daemon_store)
             ? "> COVERAGE NOTICE: NONE of this quarter is covered by the operator " +
               "audit log; no operator-store entries from " +
               window.label +
-              " survive in the retained log. See the access-log section for " +
-              "details, including a separate root-owned daemon enforcement store " +
-              "that is present but not included in these counts."
+              " survive in the retained log. See the access-log section for details."
             : "> COVERAGE NOTICE: NONE of this quarter is covered; no entries from " +
               window.label +
               " survive in the retained log. See the access-log section for " +
@@ -143,10 +145,19 @@ function renderCover(
         ];
       }
       if (s.shortfall) {
+        // C2 (dry-bar): the generic start-side shortfall banner asserted
+        // "earlier-quarter access history is not in the retained log" without
+        // qualification. When a root-owned daemon store is EXCLUDED, scope that
+        // to the OPERATOR store; the daemon store's own state is disclosed by the
+        // daemon cover caveat appended below.
         return [
-          "> COVERAGE NOTICE: the signed span above does NOT reach the quarter " +
-            "start; earlier-quarter access history is not in the retained log. " +
-            "See the access-log section for details.",
+          daemonStoreExcludedFromCensus(s.daemon_store)
+            ? "> COVERAGE NOTICE: the signed span above does NOT reach the quarter " +
+              "start; earlier-quarter access history is not in the retained " +
+              "OPERATOR audit log. See the access-log section for details."
+            : "> COVERAGE NOTICE: the signed span above does NOT reach the quarter " +
+              "start; earlier-quarter access history is not in the retained log. " +
+              "See the access-log section for details.",
           "",
         ];
       }
@@ -162,6 +173,14 @@ function renderCover(
     ],
   });
   body.push(...banner);
+  // Cover-level enforcement-census caveat: fires whenever a daemon store is
+  // EXCLUDED, INDEPENDENT of the shortfall banner above -- so a full-operator-
+  // coverage quarter (shortfall=false) with an excluded/missing daemon store is
+  // never presented on the cover as a complete enforcement record (dry-bar
+  // gate-round HIGH). Status-correct wording (deleted vs. unreadable vs. tampered).
+  const coverDaemon =
+    shortfall.status === "populated" ? shortfall.value.daemon_store : undefined;
+  body.push(...daemonCoverCaveat(coverDaemon));
   body.push(
     // HIGH-4: honest evidence-toward framing. Three of the five CNA sections are
     // labeled placeholders in this build, and every file is self-signed with the
@@ -855,6 +874,27 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
       "",
     ];
   }
+  if (d.status === "missing") {
+    // C1 (dry-bar): audit-store writer-split evidence is present but the daemon
+    // namespace is absent. Not a fresh fortress, and not a privilege limitation
+    // ("re-run as root" is futile -- root cannot recreate a missing store).
+    // Gate round 2: the split evidence is a fail-closed signal that may be a
+    // valid boundary/marker (genuine deletion) OR a present-but-unverifiable
+    // record, so the wording hedges rather than definitively asserting the
+    // migration "ran".
+    return [
+      "> ENFORCEMENT-CENSUS NOTICE: audit-store writer-split evidence is present " +
+        "on this fortress (a split boundary and/or established marker naming a " +
+        "separate root-owned daemon enforcement store, _audit-daemon), but that " +
+        "store is ABSENT: either the writer-split migration ran and the store was " +
+        "since deleted or renamed, or the split evidence on disk is present but " +
+        "unverifiable. Either way, daemon-recorded enforcement events are NOT " +
+        "included in the counts above and this is NOT a clean fresh or " +
+        "never-armed fortress. Investigate before relying on this report; do not " +
+        "treat these counts as a complete enforcement census.",
+      "",
+    ];
+  }
   // present_unreadable. G-3: only advise "re-run as root" when the store was
   // unreadable for a PRIVILEGE reason (the root-owned-store armed-box case, where
   // root can read it). A genuine I/O / corruption error does NOT clear by
@@ -898,6 +938,40 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
  * duplicating the "re-run as root" advice (which keeps it G-3-correct by
  * construction: no root advice is emitted from here for any reason).
  */
+/**
+ * Cover-level enforcement-census caveat, appended to the cover whenever a daemon
+ * store is EXCLUDED from the census -- independent of the coverage/shortfall
+ * banner, so a shortfall=false quarter never presents a clean cover as a
+ * complete enforcement record. Wording is STATUS-CORRECT: a `missing` store is
+ * described as absent (deleted, or present-but-unverifiable split evidence),
+ * never "present" and never a definitive "the migration ran". Empty for
+ * `absent`/`included`.
+ */
+function daemonCoverCaveat(d: DaemonStoreDisclosure | undefined): string[] {
+  if (!daemonStoreExcludedFromCensus(d)) return [];
+  const phrase =
+    d!.status === "missing"
+      ? "audit-store writer-split evidence is present on this fortress but the " +
+        "separate root-owned daemon enforcement store (_audit-daemon) it " +
+        "references is ABSENT (deleted or renamed, or the split evidence is " +
+        "present but unverifiable), so this is not a clean fresh fortress"
+      : d!.status === "present_tampered"
+        ? "a separate root-owned daemon enforcement store (_audit-daemon) is " +
+          "present but FAILED integrity verification (tamper evidence)"
+        : "a separate root-owned daemon enforcement store (_audit-daemon) is " +
+          "present but was not readable here";
+  return [
+    "> ENFORCEMENT-CENSUS NOTICE: " +
+      phrase +
+      ". Its daemon-recorded enforcement (automated Castle Wall gate decisions " +
+      "and egress denials) is NOT included in this report's counts or its " +
+      "covered-window / shortfall assessment, so those are an operator-store " +
+      "view, NOT a complete enforcement census. See the access-log and " +
+      "enforcement summary section.",
+    "",
+  ];
+}
+
 function daemonCensusCaveat(d: DaemonStoreDisclosure | undefined): string[] {
   if (!d) return [];
   if (d.status === "present_unreadable") {
@@ -923,6 +997,20 @@ function daemonCensusCaveat(d: DaemonStoreDisclosure | undefined): string[] {
         "Do not treat these counts as a complete enforcement census; investigate. " +
         "The access-log and enforcement summary section carries the full " +
         "disclosure.",
+      "",
+    ];
+  }
+  if (d.status === "missing") {
+    return [
+      "> ENFORCEMENT-CENSUS NOTICE: these counts are drawn from the operator " +
+        "audit store only. Audit-store writer-split evidence is present on this " +
+        "fortress, but the separate root-owned daemon enforcement store " +
+        "(_audit-daemon) it references is ABSENT (deleted or renamed, or the " +
+        "split evidence is present but unverifiable), so its daemon-recorded " +
+        "enforcement events are NOT included in the counts here. This is NOT a " +
+        "clean fresh fortress; do not treat these counts as a complete " +
+        "enforcement census; investigate. The access-log and enforcement summary " +
+        "section carries the full disclosure.",
       "",
     ];
   }
@@ -972,7 +1060,14 @@ function renderAccessLog(
       // Without the second clause, a quarter where Sanctuary was simply not
       // running (retained entries on both sides, zero decisions in between)
       // reads as "fully covered, zero denials, everything enforced".
-      `Covered window attested for this quarter: ${s.covered_from} to ${s.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter; it reflects what the retained audit log spans and does not by itself prove the enforcement stack was running and recording at every moment within it.`,
+      //
+      // Gate round 2 (dry-bar): when a daemon store is EXCLUDED, this covered
+      // window is derived from the OPERATOR log only, so scope it explicitly --
+      // it is not the enforcement stack's covered window (the daemon store's own
+      // coverage is not reflected here; the ENFORCEMENT-CENSUS notice below and
+      // on the cover carry that). Without this, a full-operator-coverage quarter
+      // reads as a complete enforcement census on this signed section too.
+      `Covered window attested for this quarter: ${s.covered_from} to ${s.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter; it reflects what the retained ${daemonStoreExcludedFromCensus(s.daemon_store) ? "OPERATOR " : ""}audit log spans and does not by itself prove the enforcement stack was running and recording at every moment within it.${daemonStoreExcludedFromCensus(s.daemon_store) ? " A separate daemon enforcement store is excluded from this window (see the notice below), so this covered window is an operator-store view, not a complete enforcement census." : ""}`,
       "",
       ...(s.shortfall ? ["> COVERAGE NOTICE: " + s.explanation, ""] : []),
       // WATCH-1: the F2 audit-store split routes daemon-produced enforcement
@@ -1207,30 +1302,33 @@ function renderVerification(
         "Not included: the audit-chain export was empty for this fortress.",
         "",
       ],
-      readFailed: (reason) => [
-        `Not included: the audit-chain export could not be gathered. ${reason}`,
-        "",
-      ],
+      // The reason is self-contained (it covers BOTH a genuine gather failure
+      // and the deliberate split-fortress omission, C2/R2-1), so it carries the
+      // "why" without a fixed "could not be gathered" prefix that would
+      // misdescribe a deliberate omission as a failure.
+      readFailed: (reason) => [`Not included: ${reason}`, ""],
     }),
     "### Public-anchor (Rekor) evidence",
     "",
     ...foldOutcome(discreteExports.anchor.outcome, {
       populated: () => [
-        `Included as \`${discreteExports.anchor.filename}\`. It lets an auditor ` +
-          "confirm the checkpoints were publicly anchored (freshness and fork " +
-          "detection). It contains salted commitments handed over deliberately, " +
-          "never content.",
+        `Included as \`${discreteExports.anchor.filename}\`. It carries the ` +
+          "anchor receipts this fortress recorded, so an auditor can confirm those " +
+          "checkpoints were publicly anchored (freshness and fork detection). It " +
+          "contains salted commitments handed over deliberately, never content.",
         "",
       ],
+      // C4 (dry-bar): reached ONLY when a real read found no anchor evidence --
+      // either anchoring was never enabled, or it is enabled but no checkpoint
+      // has been anchored yet. State both honestly rather than asserting a
+      // definitive "not enabled" the read may not support.
       emptyVerified: () => [
-        "Not included: public transparency anchoring (Sigstore/Rekor) is opt-in " +
-          "and is not enabled on this install.",
+        "Not included: no public-anchor (Sigstore/Rekor) evidence is available " +
+          "for this install. Public anchoring is opt-in; either it is not enabled, " +
+          "or it is enabled but no checkpoint has been anchored yet.",
         "",
       ],
-      readFailed: (reason) => [
-        `Not included: the anchor evidence could not be gathered. ${reason}`,
-        "",
-      ],
+      readFailed: (reason) => [`Not included: ${reason}`, ""],
     }),
   ];
 
