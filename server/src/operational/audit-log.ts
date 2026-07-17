@@ -4098,6 +4098,16 @@ export class AuditLog {
         // If it is at/after our start, the lock is genuinely ours → never break.
         // If no uptime stamp is present we cannot decide here; fall through to
         // the wall-clock reused-self proof below (process.uptime()-based).
+        // Documented residual (mirrors the id-less note below): a same-boot
+        // OWN-PID lock LACKING `uptime_ms` reaches the wall-clock reused-self
+        // proof, so a large forward clock step can make our own live lock's
+        // `acquired_at` appear to predate our process start and false-break it.
+        // A false-break is detected fail-closed by the hash-chain
+        // contiguous-sequence check on the next load (never a silent fork).
+        // atomicAcquireAuditLock stamps `uptime_ms`/`boot_id` CONDITIONALLY
+        // (their platform sources can be unavailable), so the residual covers
+        // locks written by older binaries AND current builds on hosts where
+        // those sources return undefined.
         if (lockUptimeMs !== undefined && ourStartUptime !== undefined) {
           if (lockUptimeMs < ourStartUptime - AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS) {
             return this.unlinkIfSameInode(lockPath, proven);

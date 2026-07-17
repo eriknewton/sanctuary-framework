@@ -67,6 +67,7 @@ export {
   computeNextGenerationId,
   createFsGenerationStagingStore,
   evaluateGenerationMatch,
+  parseGenerationStagingRecord,
   resolveCommittedGeneration,
   resolveGateRestart,
   type GenerationPhase,
