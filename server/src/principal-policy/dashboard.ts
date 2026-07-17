@@ -107,7 +107,9 @@ import {
   buildCastleWallPosture,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   mapPlatform,
+  failedExclusiveEgressStatus,
   type CastleWallPosture,
+  type ExclusiveEgressStatus,
 } from "./posture.js";
 import {
   createPostureStreamRegistry,
@@ -699,6 +701,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * old 501 oracle.
    */
   private supervisorBridge: SupervisorBridge | null = null;
+  /** S5-P exclusive-egress posture provider (null until S5-6 wires the producer). */
+  private _exclusiveEgressPostureProvider:
+    | (() => Promise<ExclusiveEgressStatus | null> | ExclusiveEgressStatus | null)
+    | null = null;
 
   /**
    * Slice 2 (park-not-exit): true when this dashboard booted WITHOUT a master
@@ -1270,6 +1276,15 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.identityManager?.getPrimaryIdentityId() ??
       "local";
     const auditLog = this.auditLog;
+    // S5-P (codex MED fix): thread the SAME fail-closed exclusive-egress
+    // snapshot every other feature-health consumer uses, so the fault-raise
+    // panel's `castle_wall_egress` row agrees with the rendered dashboard row
+    // (both compute `coarse_only` when the exclusive stack is down). This keeps
+    // the raise path's transition memory consistent with what the operator
+    // sees; `coarse_only` is not in the silent-off set, so it never spuriously
+    // raises an OS notification (coarse-only stays loud on the surface, not a
+    // notification - the ratified tight fault-class set is unchanged).
+    const exclusiveEgress = await this.resolveExclusiveEgressPosture();
     return auditLog.runEagerReads(() =>
       buildFeatureHealthPanel({
         auditLog,
@@ -1285,6 +1300,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...(brokerLoad?.status === "unreadable"
           ? { brokerProducerKeyExpectedButUnavailable: true }
           : {}),
+        ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
       }),
     );
   }
@@ -1674,6 +1690,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
       streamRegistry: this.postureStreamRegistry,
+      // S5-P: the exclusive-egress posture provider (fail-closed resolve lives
+      // in the route layer; this passes the raw provider through so post-wiring
+      // is observed lazily per request). Null until S5-6 attaches a producer.
+      ...(this._exclusiveEgressPostureProvider
+        ? { exclusiveEgressPosture: this._exclusiveEgressPostureProvider }
+        : {}),
     };
     return handlePostureRoute(deps, req, res, url, method);
   }
@@ -1866,6 +1888,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // runs changes. This is the operator/badge read, NOT the agent-facing
       // `/api/posture/evidence` audit surface (which deliberately stays
       // per-request re-verified).
+      // S5-P: resolve the exclusive-egress posture (fail-closed) OUTSIDE the
+      // eager read scope, then let the ONE canonical shaper apply the
+      // aggregate-green cap so /v1/status and the posture routes can never
+      // diverge on green.
+      const exclusiveEgress = await this.resolveExclusiveEgressPosture();
       return await this.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: this.auditLog as AuditLog,
@@ -1875,6 +1902,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           ...(load?.status === "unreadable"
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
+          ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
         }),
       );
     } catch {
@@ -2128,6 +2156,45 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setSupervisorBridge(bridge: SupervisorBridge | null): void {
     this.supervisorBridge = bridge;
+  }
+
+  /**
+   * Unified Protect Slice 5 S5-P: bind (or detach with `null`) the
+   * exclusive-egress posture provider. The provider is produced by the
+   * root-supervised provisioning/boot flow (S5-6, owed) and resolves the
+   * per-agent exclusive-egress posture objects + wall-level summary. While
+   * detached (today: no fine-grained agent is provisioned anywhere), every
+   * posture surface behaves exactly as before. Once attached, the wall
+   * posture, the feature-health panel, the hero shield, /v1/status, and the
+   * CLI all apply the ONE aggregate-green capping rule through the canonical
+   * builders. Detaching reverts to the unwired behavior.
+   */
+  setExclusiveEgressPostureProvider(
+    provider:
+      | (() => Promise<ExclusiveEgressStatus | null> | ExclusiveEgressStatus | null)
+      | null,
+  ): void {
+    this._exclusiveEgressPostureProvider = provider;
+  }
+
+  /**
+   * Resolve the S5-P exclusive-egress posture provider FAIL-CLOSED: absent
+   * provider -> null (no fine-grained agent; no cap); a provider that THROWS
+   * -> `failedExclusiveEgressStatus` (caps green). Shared by every dashboard
+   * consumer (posture routes deps, /v1/status, the hero-shield aggregator) so
+   * all surfaces resolve identically and none can silently green through a
+   * failed posture read.
+   */
+  private async resolveExclusiveEgressPosture(): Promise<ExclusiveEgressStatus | null> {
+    const provider = this._exclusiveEgressPostureProvider;
+    if (!provider) return null;
+    try {
+      return await provider();
+    } catch (err) {
+      return failedExclusiveEgressStatus(
+        err instanceof Error ? err.message : String(err),
+      );
+    }
   }
 
   /**
@@ -6983,6 +7050,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ...(load?.status === "unreadable"
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
+      // S5-P: hand the hero shield the SAME fail-closed exclusive-egress
+      // resolver every other surface uses, so the shield's wall arm-state
+      // (via the ONE canonical shaper) caps green identically.
+      resolveExclusiveEgressPosture: () => this.resolveExclusiveEgressPosture(),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,

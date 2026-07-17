@@ -71,6 +71,8 @@ import {
   type CustodyExitPanel,
   type RecognitionPanel,
   type RecognitionReputationEvidence,
+  failedExclusiveEgressStatus,
+  type ExclusiveEgressStatus,
 } from "./posture.js";
 import {
   buildFeatureHealthPanel,
@@ -255,6 +257,49 @@ export interface PostureRouteDeps {
   /** Injectable timer hooks so tests can drive the stream cadence synchronously. */
   streamSetInterval?: (handler: () => void, ms: number) => NodeJS.Timeout;
   streamClearInterval?: (handle: NodeJS.Timeout) => void;
+  /**
+   * Exclusive-egress posture provider (Unified Protect Slice 5 S5-P). Resolved
+   * lazily per request so post-provision wiring is observed. Return semantics
+   * (fail-closed contract):
+   *   - provider ABSENT (field undefined): no producer is wired => no
+   *     fine-grained agent has ever been provisioned; every surface behaves as
+   *     today (no cap).
+   *   - provider returns `null`: "affirmatively scanned; no fine-grained agent
+   *     declared right now" => same as absent (no cap). A `null` return is a
+   *     POSITIVE no-fine-grained-agent answer, NOT an error channel.
+   *   - provider returns a status: threaded into the wall posture and
+   *     feature-health builders, which apply the ONE aggregate-green capping
+   *     rule (`armed` -> distinct non-green `coarse_only` when a fine-grained
+   *     agent's exclusive stack is not live).
+   *   - provider THROWS: the routes substitute `failedExclusiveEgressStatus`
+   *     (which caps green) - a failed posture read must never render the
+   *     stronger claim. A provider that cannot DETERMINE state must throw or
+   *     return `failedExclusiveEgressStatus`, never a bare empty summary
+   *     (see the producer contract on `summarizeExclusiveEgressStatus`).
+   */
+  exclusiveEgressPosture?: () =>
+    | Promise<ExclusiveEgressStatus | null>
+    | ExclusiveEgressStatus
+    | null;
+}
+
+/**
+ * Resolve the optional exclusive-egress posture provider fail-closed: absent
+ * provider -> null (no fine-grained agent; no cap); provider THROWS ->
+ * `failedExclusiveEgressStatus` (caps green). Shared by the wall-posture and
+ * feature-health builders so both surfaces resolve identically.
+ */
+async function resolveExclusiveEgress(
+  deps: PostureRouteDeps,
+): Promise<ExclusiveEgressStatus | null> {
+  if (!deps.exclusiveEgressPosture) return null;
+  try {
+    return await deps.exclusiveEgressPosture();
+  } catch (err) {
+    return failedExclusiveEgressStatus(
+      err instanceof Error ? err.message : String(err),
+    );
+  }
 }
 
 /**
@@ -586,7 +631,25 @@ export async function handlePostureRoute(
 // agent-facing `/api/posture/evidence` read (`buildEvidence`) deliberately stays
 // on the full per-request re-verify path, keeping per-request on-disk tamper
 // detection on the inspectable audit surface.
-async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPosture> {
+async function buildWallPosture(
+  deps: PostureRouteDeps,
+  /**
+   * S5-P: a pre-resolved exclusive-egress snapshot. `buildHome` resolves the
+   * provider ONCE and threads the SAME snapshot into both the wall posture and
+   * the feature-health panel, so an intermittent provider can never cap one
+   * home surface while the other renders green (codex BLOCKER). Undefined =>
+   * resolve here (the single-builder `/api/posture/castle-wall` route path,
+   * where a single resolve per request is correct).
+   */
+  preResolvedExclusiveEgress?: ExclusiveEgressStatus | null,
+): Promise<CastleWallPosture> {
+  // S5-P: resolve the exclusive-egress posture BEFORE the eager read scope so
+  // the provider (which may read its own state surfaces) never nests inside the
+  // audit log's read scope. Fail-closed on provider throw.
+  const exclusiveEgress =
+    preResolvedExclusiveEgress !== undefined
+      ? preResolvedExclusiveEgress
+      : await resolveExclusiveEgress(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildCastleWallPosture({
       auditLog: deps.auditLog as AuditLog,
@@ -599,6 +662,7 @@ async function buildWallPosture(deps: PostureRouteDeps): Promise<CastleWallPostu
       ...(deps.producerKeyExpectedButUnavailable
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
+      ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
     }),
   );
 }
@@ -640,7 +704,21 @@ async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
  */
 async function buildFeatureHealth(
   deps: PostureRouteDeps,
+  /**
+   * S5-P: a pre-resolved exclusive-egress snapshot (see `buildWallPosture`).
+   * `buildHome` passes the SAME snapshot it gave the wall posture so the
+   * `castle_wall_egress` row and the banner cap green from ONE verdict.
+   * Undefined => resolve here (the single-builder `/api/posture/feature-health`
+   * route path).
+   */
+  preResolvedExclusiveEgress?: ExclusiveEgressStatus | null,
 ): Promise<FeatureHealthPanel> {
+  // S5-P: same fail-closed resolve as the wall posture, so the
+  // `castle_wall_egress` row and the banner cap green identically.
+  const exclusiveEgress =
+    preResolvedExclusiveEgress !== undefined
+      ? preResolvedExclusiveEgress
+      : await resolveExclusiveEgress(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildFeatureHealthPanel({
       auditLog: deps.auditLog as AuditLog,
@@ -648,6 +726,7 @@ async function buildFeatureHealth(
       // Surface the per-plugin attribution rows on the operator posture surface.
       // Read-only projection over the same audit read; never enforcement-bearing.
       includePluginRows: true,
+      ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()
@@ -915,12 +994,18 @@ function buildReach(
 export type { PostureHome };
 
 async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
+  // S5-P (codex BLOCKER fix): resolve the exclusive-egress provider EXACTLY
+  // ONCE for the whole home payload, then thread the SAME snapshot into both
+  // the wall posture and the feature-health panel. Resolving per-builder would
+  // let an intermittent provider cap one surface (wall pill) while the other
+  // (feature-health row) still rendered green from a second, luckier read.
+  const exclusiveEgress = await resolveExclusiveEgress(deps);
   const [castleWall, digest, unwrapped, featureHealth, custodyExit, federation] =
     await Promise.all([
-      buildWallPosture(deps),
+      buildWallPosture(deps, exclusiveEgress),
       buildDigest(deps),
       buildUnwrapped(deps),
-      buildFeatureHealth(deps),
+      buildFeatureHealth(deps, exclusiveEgress),
       buildCustodyExit(deps),
       buildFederationSummary(deps),
     ]);

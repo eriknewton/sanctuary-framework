@@ -112,6 +112,10 @@ import {
   buildPluginHealthRows,
   type PluginHealthRow,
 } from "./plugin-feature-health.js";
+import {
+  exclusiveEgressCapsAggregateGreen,
+  type ExclusiveEgressStatus,
+} from "../egress-gate/posture.js";
 
 /**
  * Liveness-op set for the broker daemon's process-liveness heartbeat (Option C).
@@ -313,8 +317,23 @@ export type FeatureLivenessClass = "self_reporting" | "event_driven";
  *                 whose backing audit read was integrity-tainted. Slice 2 moves
  *                 the genuinely-dead case (alive once, now no heartbeat) OUT of
  *                 `unknown` and into `fault`.
+ *  - `coarse_only` → distinct NON-GREEN chip (Unified Protect Slice 5 S5-P,
+ *                 design §6). Applied ONLY to the `castle_wall_egress` row:
+ *                 the coarse wall's own evidence earned green, but a
+ *                 fine-grained-provisioned agent's exclusive-egress stack
+ *                 (gate + pf + generation match) is not live. Aggregate green
+ *                 is `castle_wall_armed AND exclusive_egress_live`, so the
+ *                 row must NOT read `active` - and it is NOT a `fault` either
+ *                 (the coarse wall IS protecting; OS-notification classes stay
+ *                 the ratified tight set). Distinct so the operator sees the
+ *                 degrade-loud coarse-only state, never a vague amber.
  */
-export type FeatureHealthStatus = "active" | "fault" | "unconfirmed" | "unknown";
+export type FeatureHealthStatus =
+  | "active"
+  | "fault"
+  | "unconfirmed"
+  | "unknown"
+  | "coarse_only";
 
 /**
  * Stable enum form of *why* a feature reads as it does. The UI renders human
@@ -371,7 +390,14 @@ export type FeatureHealthBasis =
   // prove the absence of a fault, so a self-reporting feature can never render
   // green on this basis - it fails closed to `unknown`. See codex MEDIUM
   // 2026-06-13.
-  | "freshness_scan_incomplete";
+  | "freshness_scan_incomplete"
+  // Unified Protect Slice 5 S5-P (design §6): the coarse wall's evidence
+  // earned green, but a fine-grained-provisioned agent's exclusive-egress
+  // stack is not live, so the `castle_wall_egress` row is capped to the
+  // distinct non-green `coarse_only` status. The per-agent reasons live on the
+  // posture surface's `exclusive_egress` block; this basis names WHY the row
+  // is not green without leaking rule internals.
+  | "exclusive_egress_not_live";
 
 /**
  * An OPT-IN, operator-declared "expected minimum volume" for an event-driven
@@ -839,6 +865,18 @@ export interface BuildFeatureHealthInput {
    * an empty `plugin_rows` array.
    */
   includePluginRows?: boolean;
+  /**
+   * Exclusive-egress posture (Unified Protect Slice 5 S5-P, design §6). When
+   * the SAME capping rule the wall posture applies
+   * ({@link exclusiveEgressCapsAggregateGreen}) says a
+   * fine-grained-provisioned agent's exclusive stack is not live, the
+   * `castle_wall_egress` row's would-be green (`active`) is capped to the
+   * DISTINCT non-green `coarse_only` status with basis
+   * `exclusive_egress_not_live`. Absent/null = no producer wired = unchanged.
+   * Impure callers whose provider THROWS must pass
+   * `failedExclusiveEgressStatus(...)`, never null (fail-closed).
+   */
+  exclusiveEgress?: ExclusiveEgressStatus | null;
 }
 
 /**
@@ -1670,7 +1708,7 @@ export async function buildFeatureHealthPanel(
       now,
       windowMs,
     );
-    return evaluateFeatureHealth({
+    const row = evaluateFeatureHealth({
       feature,
       entries: inWindow,
       freshnessEntries: inFreshness,
@@ -1688,6 +1726,26 @@ export async function buildFeatureHealthPanel(
         ? { verifyProducerSignature: input.verifyProducerSignature }
       : {}),
     });
+    // S5-P aggregate-green cap (design §6): the `castle_wall_egress` row's
+    // would-be green is capped to the DISTINCT non-green `coarse_only` when a
+    // fine-grained-provisioned agent's exclusive-egress stack is not live -
+    // the SAME rule (same function) `buildCastleWallPosture` applies to
+    // `arm_state`, so the banner and this panel can never disagree on green.
+    // Only a would-be `active` is transformed: every other status is already
+    // non-green and keeps its more specific story (a stale/faulted wall must
+    // not be relabeled into "coarse wall enforcing, fine stack down").
+    if (
+      feature.id === "castle_wall_egress" &&
+      row.status === "active" &&
+      exclusiveEgressCapsAggregateGreen(input.exclusiveEgress)
+    ) {
+      return {
+        ...row,
+        status: "coarse_only" as const,
+        basis: "exclusive_egress_not_live" as const,
+      };
+    }
+    return row;
   });
   const detectionEvidenceComplete = freshnessComplete && lifecycleHistoryComplete;
 

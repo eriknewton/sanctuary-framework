@@ -24,6 +24,7 @@ import type { PrincipalPolicy } from "../principal-policy/types.js";
 import {
   buildCastleWallPosture,
   type CastleWallArmState,
+  type ExclusiveEgressStatus,
 } from "../principal-policy/posture.js";
 import type { ReputationEvidence } from "../shr/generator.js";
 import { deriveReputationDegradations } from "../shr/generator.js";
@@ -224,6 +225,17 @@ export interface AggregatorSources {
   resolveBrokerPinnedProducerKey?: () => string | null;
   /** Broker liveness producer key exists or is expected but could not be read. */
   brokerProducerKeyExpectedButUnavailable?: boolean;
+  /**
+   * Unified Protect Slice 5 S5-P: resolve the exclusive-egress posture for the
+   * wall reader. MUST already be fail-closed (the dashboard's resolver maps a
+   * provider throw to `failedExclusiveEgressStatus`, which caps green); this
+   * layer only threads the resolved status into `buildCastleWallPosture`, whose
+   * capping rule turns a would-be `armed` into the DISTINCT non-green
+   * `coarse_only` when a fine-grained-provisioned agent's exclusive stack is
+   * not live — so the hero shield (green requires `armed`) repaints with every
+   * other surface. Absent = no producer wired = unchanged behavior.
+   */
+  resolveExclusiveEgressPosture?: () => Promise<ExclusiveEgressStatus | null>;
 }
 
 /**
@@ -637,6 +649,13 @@ function castleWallNotEnforcingHeadline(arm: CastleWallArmState): string {
       return "Layers configured, Castle Wall degraded (not enforcing)";
     case "not_installed":
       return "Layers configured, Castle Wall not installed on this host";
+    // S5-P distinct non-green: a fine-grained-provisioned agent's
+    // exclusive-egress stack is not live. Deliberately does NOT assert the
+    // coarse wall is enforcing FOR THAT AGENT: the worst per-agent mode may be
+    // `unprotected` (no coarse wall over it), so the machine headline stays
+    // mode-agnostic and points at the per-agent posture. Non-green either way.
+    case "coarse_only":
+      return "Fine-grained exclusive-egress not live for a protected agent (coarse-only or weaker); see per-agent posture";
     default:
       return "Layers configured, Castle Wall enforcement not confirmed";
   }
@@ -827,6 +846,12 @@ export async function getProtectionSnapshot(
       // throttled backstop catch out-of-band tampering, and the shaper's
       // freshness/evidence gating (unknown / degraded, never armed without fresh
       // verified evidence) is untouched: only WHERE its `query` runs changes.
+      // S5-P: resolve the exclusive-egress posture (already fail-closed at the
+      // dashboard resolver) BEFORE the eager read scope, so the ONE canonical
+      // shaper applies the aggregate-green cap for the hero shield too.
+      const exclusiveEgress = sources.resolveExclusiveEgressPosture
+        ? await sources.resolveExclusiveEgressPosture()
+        : null;
       const wall = await sources.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: sources.auditLog as AuditLog,
@@ -835,6 +860,7 @@ export async function getProtectionSnapshot(
           ...(sources.producerKeyExpectedButUnavailable
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
+          ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
         }),
       );
       wallArmState = wall.arm_state;

@@ -62,6 +62,21 @@ import {
   producerSignedDedupKey,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
+import {
+  exclusiveEgressCapsAggregateGreen,
+  type ExclusiveEgressStatus,
+} from "../egress-gate/posture.js";
+
+// Re-export the S5-P exclusive-egress posture surface for posture consumers
+// (routes, dashboard, CLI) so they import the wall-posture module they already
+// depend on; the canonical definitions live in `egress-gate/posture.ts`.
+export {
+  exclusiveEgressCapsAggregateGreen,
+  failedExclusiveEgressStatus,
+  type ExclusiveEgressStatus,
+  type ExclusiveEgressPosture,
+  type ExclusiveEgressMode,
+} from "../egress-gate/posture.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -203,8 +218,23 @@ export const ENFORCEMENT_FUTURE_SKEW_MS = 60 * 1000;
  * fresh enforcement evidence. `degraded` means the wall is present but recent
  * evidence shows it is not enforcing. `unknown` means we cannot prove
  * enforcement either way — it renders amber, never green.
+ *
+ * `coarse_only` (Unified Protect Slice 5 S5-P, design §6): the coarse wall IS
+ * enforcing (fresh evidence would otherwise read `armed`), but a
+ * fine-grained-provisioned agent's exclusive-egress stack (gate + pf +
+ * generation match) is NOT live. A DISTINCT non-green state: aggregate green
+ * is `castle_wall_armed AND exclusive_egress_live`, so this surfaces the
+ * degrade-loud "coarse-only" mode on EVERY consumer of `arm_state` at once
+ * (every surface earns green ONLY from `armed`; the new value is non-green by
+ * construction on all of them). The specifics live in the
+ * {@link CastleWallPosture.exclusive_egress} block.
  */
-export type CastleWallArmState = "armed" | "degraded" | "unknown" | "not_installed";
+export type CastleWallArmState =
+  | "armed"
+  | "coarse_only"
+  | "degraded"
+  | "unknown"
+  | "not_installed";
 
 export interface CastleWallVerdictCounts {
   allowed: number;
@@ -270,6 +300,16 @@ export interface CastleWallPosture {
     | "producer_signed"
     | "channel_authenticated"
     | "not_applicable";
+  /**
+   * The exclusive-egress posture object (Unified Protect Slice 5 S5-P, design
+   * §6): the first-class, queryable per-agent status (mode, generation match,
+   * pf-liveness reasons, gate process) plus the wall-level summary. Present
+   * whenever an exclusive-egress posture source was supplied to the builder;
+   * absent when no producer is wired (no fine-grained agent provisioned).
+   * When this block caps green, `arm_state` reads the DISTINCT non-green
+   * `coarse_only` — never `armed`.
+   */
+  exclusive_egress?: ExclusiveEgressStatus;
 }
 
 export interface BuildCastleWallPostureInput {
@@ -304,6 +344,44 @@ export interface BuildCastleWallPostureInput {
   producerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
+  /**
+   * Exclusive-egress posture (Slice 5 S5-P). When provided, the block is
+   * attached verbatim to the returned posture AND the aggregate-green cap is
+   * applied: a would-be `armed` reads the DISTINCT non-green `coarse_only`
+   * whenever a fine-grained-provisioned agent's exclusive-egress stack is not
+   * live ({@link exclusiveEgressCapsAggregateGreen}). Absent/null = no
+   * producer wired = no fine-grained agent exists = unchanged behavior.
+   * PROVIDER FAILURE CONTRACT: an impure caller whose provider THROWS must
+   * pass `failedExclusiveEgressStatus(...)` (which caps green), never null —
+   * a failed posture read must not render the stronger claim.
+   */
+  exclusiveEgress?: ExclusiveEgressStatus | null;
+}
+
+/**
+ * Apply the Slice-5 S5-P exclusive-egress block to a computed wall posture:
+ * attach the block verbatim (queryability) and cap a would-be green to the
+ * DISTINCT non-green `coarse_only` when a fine-grained-provisioned agent's
+ * exclusive-egress stack is not live. The ONE place the cap is applied, so
+ * every arm_state consumer (CLI, dashboard, v1.1 console, hero shield,
+ * fortress-view, /v1/status, posture APIs) repaints together. Non-armed
+ * states are left as computed (already non-green; the block still attaches).
+ */
+function applyExclusiveEgress(
+  posture: CastleWallPosture,
+  exclusiveEgress: ExclusiveEgressStatus | null | undefined,
+): CastleWallPosture {
+  if (exclusiveEgress === null || exclusiveEgress === undefined) {
+    return posture;
+  }
+  const capped =
+    posture.arm_state === "armed" &&
+    exclusiveEgressCapsAggregateGreen(exclusiveEgress);
+  return {
+    ...posture,
+    ...(capped ? { arm_state: "coarse_only" as const } : {}),
+    exclusive_egress: exclusiveEgress,
+  };
 }
 
 /**
@@ -338,18 +416,21 @@ export async function buildCastleWallPosture(
   // basis, so the reader must NOT fall back to the channel basis and render
   // green — it surfaces `degraded` (not-armed) until the key is readable again.
   if (input.producerKeyExpectedButUnavailable === true) {
-    return {
-      origin_machine: input.originMachine,
-      arm_state: "degraded",
-      platform,
-      evidence_basis: "producer_key_unavailable",
-      last_enforcement_evidence_at: null,
-      freshness_window_ms: freshnessWindowMs,
-      verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
-      audit_integrity_ok: true,
-      sealed_region_unverified_at_privilege: false,
-      producer_authenticity: "not_applicable",
-    };
+    return applyExclusiveEgress(
+      {
+        origin_machine: input.originMachine,
+        arm_state: "degraded",
+        platform,
+        evidence_basis: "producer_key_unavailable",
+        last_enforcement_evidence_at: null,
+        freshness_window_ms: freshnessWindowMs,
+        verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+        audit_integrity_ok: true,
+        sealed_region_unverified_at_privilege: false,
+        producer_authenticity: "not_applicable",
+      },
+      input.exclusiveEgress,
+    );
   }
 
   // Read the l1 (Castle Wall) slice over the digest window. The freshness
@@ -383,18 +464,21 @@ export async function buildCastleWallPosture(
   } catch {
     // A failed/ tainted read must NOT be reported as armed. Fail closed to
     // unknown with integrity flagged.
-    return {
-      origin_machine: input.originMachine,
-      arm_state: "unknown",
-      platform,
-      evidence_basis: "no_evidence",
-      last_enforcement_evidence_at: null,
-      freshness_window_ms: freshnessWindowMs,
-      verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
-      audit_integrity_ok: false,
-      sealed_region_unverified_at_privilege: false,
-      producer_authenticity: "not_applicable",
-    };
+    return applyExclusiveEgress(
+      {
+        origin_machine: input.originMachine,
+        arm_state: "unknown",
+        platform,
+        evidence_basis: "no_evidence",
+        last_enforcement_evidence_at: null,
+        freshness_window_ms: freshnessWindowMs,
+        verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+        audit_integrity_ok: false,
+        sealed_region_unverified_at_privilege: false,
+        producer_authenticity: "not_applicable",
+      },
+      input.exclusiveEgress,
+    );
   }
 
   const freshnessFloor = now - freshnessWindowMs;
@@ -567,21 +651,32 @@ export async function buildCastleWallPosture(
     producerAuthenticity = "channel_authenticated";
   }
 
-  return {
-    origin_machine: input.originMachine,
-    arm_state: armState,
-    platform,
-    evidence_basis: basis,
-    last_enforcement_evidence_at:
-      latestEnforcementMs !== null
-        ? new Date(latestEnforcementMs).toISOString()
-        : null,
-    freshness_window_ms: freshnessWindowMs,
-    verdict_counts: verdictCounts,
-    audit_integrity_ok: integrityOk,
-    sealed_region_unverified_at_privilege: sealedUnverifiedAtPrivilege,
-    producer_authenticity: producerAuthenticity,
-  };
+  // S5-P aggregate-green cap (design §6): `armed` survives ONLY when no
+  // fine-grained-provisioned agent is missing exclusive-egress liveness. The
+  // cap composes AFTER the evidence pipeline so the wall's own evidence
+  // semantics (freshness, signature re-verify, integrity) are untouched —
+  // `coarse_only` means exactly "the coarse wall earned green AND the
+  // exclusive stack did not". `producer_authenticity` keeps describing the
+  // wall-evidence basis it was computed from (the pill only renders it when
+  // `armed`, so a capped posture surfaces the coarse-only story instead).
+  return applyExclusiveEgress(
+    {
+      origin_machine: input.originMachine,
+      arm_state: armState,
+      platform,
+      evidence_basis: basis,
+      last_enforcement_evidence_at:
+        latestEnforcementMs !== null
+          ? new Date(latestEnforcementMs).toISOString()
+          : null,
+      freshness_window_ms: freshnessWindowMs,
+      verdict_counts: verdictCounts,
+      audit_integrity_ok: integrityOk,
+      sealed_region_unverified_at_privilege: sealedUnverifiedAtPrivilege,
+      producer_authenticity: producerAuthenticity,
+    },
+    input.exclusiveEgress,
+  );
 }
 
 /**
