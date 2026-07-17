@@ -103,6 +103,7 @@ import {
   type WrapCustodyResult,
 } from "./custody-flow.js";
 import { AuditLog } from "../operational/audit-log.js";
+import type { ExclusiveEgressStatus } from "../principal-policy/posture.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { SANCTUARY_VERSION } from "../config.js";
@@ -984,6 +985,20 @@ export type DashboardStarter = (opts: {
 export async function probeCastleWallEnforcementObserved(
   auditLog: AuditLog,
   storagePath: string,
+  /**
+   * S5-P: an OPTIONAL fail-closed exclusive-egress posture resolver. The
+   * affirmative "Your agent is protected. / Castle Wall Full" first-run banner
+   * is earned by `castle_wall_egress === "active"`; under the S5-P cap a
+   * fine-grained-provisioned agent whose exclusive stack is not live reads the
+   * DISTINCT `coarse_only`, so the banner must NOT claim "Full" then. This
+   * param makes the banner CAP-CAPABLE: when a producer is wired (S5-6) the
+   * caller passes it and the row caps; ABSENT (today, and every coarse-only-
+   * unprovisioned install) the panel is byte-identical to before. The resolver
+   * MUST already be fail-closed (map a provider throw to
+   * `failedExclusiveEgressStatus`); this probe additionally swallows a throw
+   * to `false` (never "observed") so a resolver bug can only under-claim.
+   */
+  resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>,
 ): Promise<boolean> {
   try {
     const { buildFeatureHealthPanel } = await import(
@@ -993,6 +1008,9 @@ export async function probeCastleWallEnforcementObserved(
       "../castle-wall/runtime/producer-signature.js"
     );
     const keyLoad = await loadFortressProducerKey(storagePath);
+    const exclusiveEgress = resolveExclusiveEgress
+      ? await resolveExclusiveEgress()
+      : null;
     // Eager-read scope: same one-verified-view discipline as the dashboard
     // callers of buildFeatureHealthPanel (H4 chokepoint).
     const panel = await auditLog.runEagerReads(() =>
@@ -1004,11 +1022,14 @@ export async function probeCastleWallEnforcementObserved(
         ...(keyLoad.status === "unreadable"
           ? { producerKeyExpectedButUnavailable: true }
           : {}),
+        ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
       }),
     );
     const row = panel.rows.find(
       (r) => r.feature_id === "castle_wall_egress",
     );
+    // Only a genuine `active` earns the affirmative banner: `coarse_only`
+    // (S5-P cap) is a distinct non-green state and reads NOT observed here.
     return row?.status === "active";
   } catch {
     return false;

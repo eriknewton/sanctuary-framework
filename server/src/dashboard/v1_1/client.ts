@@ -2686,6 +2686,9 @@ function renderActivityScreen() {
 // only (no L-numbers); no em-dashes in user-visible copy.
 function postureWallLabel(armState) {
   if (armState === "armed") return { cls: "pill tone-verified", text: "Enforcing" };
+  // S5-P distinct non-green: coarse wall enforcing, fine-grained exclusive-egress
+  // stack not live. Never the verified/green tone.
+  if (armState === "coarse_only") return { cls: "pill tone-degraded", text: "Coarse-only" };
   if (armState === "degraded") return { cls: "pill tone-degraded", text: "Degraded" };
   if (armState === "not_installed") return { cls: "pill", text: "Not installed" };
   if (armState === "locked_down") return { cls: "pill tone-locked", text: "Locked down" };
@@ -2988,6 +2991,9 @@ function postureLayerLines() {
   const seal = deriveSeal();
   var wallV;
   if (seal.arm === "armed") wallV = "enforcing";
+  // S5-P: honest coarse-only line - the coarse wall IS enforcing, the
+  // fine-grained exclusive-egress stack is not live. Non-green (warn) below.
+  else if (seal.arm === "coarse_only") wallV = "coarse-only (exclusive egress not live)";
   else if (seal.arm === "degraded") wallV = "degraded";
   else if (seal.arm === "locked_down") wallV = "locked down";
   else if (seal.arm) wallV = "not enforcing";
