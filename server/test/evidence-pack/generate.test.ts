@@ -220,6 +220,76 @@ describe("buildEvidencePack", () => {
           },
         ],
       ],
+      // ─── F2-R2 (Codex second-family review + Dry-8 sweep): row PRESENCE
+      // without row FIELD COMPLETENESS. Presence-only rows sailed through the
+      // chokepoint, atCapForStore evaluated the missing/NaN/wrong-typed fields
+      // as "not at cap", and the SIGNED manifest carried a definitive
+      // flattering retention_at_cap:false; duplicate/unknown-store rows fed
+      // the at-cap OR and could sign the definitive OVER-claim (true). Every
+      // variant must serialize the not-determinable marker instead. ───
+      [
+        "tags-only rows with NO cap fields (presence-only exploit)",
+        [
+          { store: "operator" },
+          { store: "daemon" },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      [
+        "operator row with NaN max_entries",
+        [
+          { store: "operator", max_entries: NaN, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        "operator row with string-typed max_entries (wrong type)",
+        [
+          { store: "operator", max_entries: "100", retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      [
+        "operator row with undefined retained_total_size_bytes (contract is null-or-finite)",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: undefined },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      [
+        "daemon row missing max_total_size_bytes",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, retained_total_size_bytes: 0 },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      [
+        // Dry-8 HIGH repro: the duplicate is AT its cap -- the old code signed
+        // a definitive retention_at_cap:true from the invalid extra row.
+        "duplicate operator rows (second duplicate at cap)",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 100, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        "duplicate daemon rows",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        // Dry-8 HIGH repro: an unknown store tag AT its own (tiny) cap flipped
+        // the at-cap OR -- a signed falsehood in the OVER-claiming direction.
+        "unknown-store row (store:'archive' at its own cap) alongside complete rows",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "archive", max_entries: 1, retained_total: 1, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
     ];
 
     for (const [name, perStore] of variants) {

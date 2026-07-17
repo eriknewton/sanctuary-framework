@@ -243,7 +243,9 @@ export interface RetentionFacts {
   /**
    * Configured maximum total on-disk size in bytes (the OTHER FIFO cap). Audit
    * retention prunes on EITHER cap: 100,000 entries OR 100 MB by default (sweep
-   * HIGH-5). 0/absent means the size cap is not known to this reporter.
+   * HIGH-5). 0 means the size cap is not known to this reporter (no size-cap
+   * judgment is made). F2-R2: a non-finite or ABSENT value from an untyped
+   * caller makes at-cap NOT DETERMINABLE in the legacy single-store fallback.
    */
   max_total_size_bytes: number;
   /** Total on-disk size in bytes of the retained audit log, or null if unread. */
@@ -360,7 +362,13 @@ export interface ShortfallReport {
    * `retentionDeterminability` chokepoint. False when the retention facts
    * carried no usable per-store breakdown (`per_store_retention` absent,
    * `null`, empty, or missing the daemon row while the daemon store is
-   * `included`) for anything other than the genuine legacy single-store case.
+   * `included`) for anything other than the genuine legacy single-store case,
+   * or (F2-R2, second-family review) when any contributing row -- a breakdown
+   * row or the legacy top-level fallback -- is runtime-INCOMPLETE (a
+   * missing/`NaN`/`Infinity`/wrong-typed numeric field, an `undefined`
+   * `retained_total_size_bytes`, an unknown `store` tag, a duplicate row for
+   * the same store, or a non-object row): incomplete cap evidence must never
+   * be evaluated as a definitive at-cap OR below-cap position.
    * When false, every surface must treat at-cap as NOT DETERMINABLE: the prose
    * suppresses both the definitive "at a retention cap" claim AND the
    * flattering "never pruned / below both caps" reassurance, and the SIGNED
