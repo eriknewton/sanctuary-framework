@@ -89,6 +89,39 @@ export interface AgentHarnessDaemonPlistOptions {
   environment?: Record<string, string>;
   /** KeepAlive (restart on exit). Default true. */
   keepAlive?: boolean;
+  /**
+   * S5-5 barrier form: render `<key>Disabled</key><true/>`. Constraint: the
+   * authoritative park state is launchd's override database (`launchctl
+   * disable`), which takes precedence over this key after the first
+   * enable/disable; the plist key documents the parked-by-default posture.
+   * Default false (key absent; legacy output byte-identical).
+   */
+  disabled?: boolean;
+  /**
+   * RunAtLoad value. Default true (legacy). The S5-5 barrier form renders
+   * false so a loaded job never auto-starts; the root supervisor starts it
+   * with `kickstart` strictly after the release barrier passes.
+   */
+  runAtLoad?: boolean;
+  /**
+   * Render KeepAlive as `{Crashed:true}` (restart ONLY after a crash within a
+   * bootstrapped session; no unconditional keep-running). Overrides
+   * `keepAlive` when true. Used by the S5-5 barrier form: a bare
+   * `KeepAlive=true` starts the job at load regardless of RunAtLoad, which
+   * would defeat the park.
+   *
+   * WHY `Crashed` AND NOT `SuccessfulExit`: launchd.plist(5) documents that
+   * the `SuccessfulExit` key IMPLIES `RunAtLoad=true` ("the job needs to run
+   * at least once before an exit status can be considered"), which would
+   * override the barrier form's explicit `RunAtLoad=false` and start the job
+   * at bootstrap/boot-load -- and a refused wrapper (exit 78, an unsuccessful
+   * exit) would be restarted indefinitely in a throttled refusal loop. The
+   * `Crashed` key carries no RunAtLoad implication and does not restart on a
+   * plain non-zero exit, so a wrapper refusal terminates instead of looping.
+   * The no-start-at-load behavior of `{Crashed:true}` is an S5-DRILL-owed
+   * launchd assertion (stated design intent, not a proven fact).
+   */
+  keepAliveCrashedOnly?: boolean;
 }
 
 /**
@@ -160,22 +193,27 @@ export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOp
         `\t<key>StandardErrorPath</key>\n\t<string>${xmlEscape(join(logDir, "agent-harness.err.log"))}</string>\n`
       : "";
 
+  const disabledXml = options.disabled === true ? `\t<key>Disabled</key>\n\t<true/>\n` : "";
+  const keepAliveXml =
+    options.keepAliveCrashedOnly === true
+      ? `\t<key>KeepAlive</key>\n\t<dict>\n\t\t<key>Crashed</key>\n\t\t<true/>\n\t</dict>`
+      : `\t<key>KeepAlive</key>\n\t<${(options.keepAlive ?? true) ? "true" : "false"}/>`;
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
 \t<key>Label</key>
 \t<string>${xmlEscape(AGENT_HARNESS_DAEMON_LABEL)}</string>
-\t<key>UserName</key>
+${disabledXml}\t<key>UserName</key>
 \t<string>${xmlEscape(account)}</string>
 \t<key>ProgramArguments</key>
 \t<array>
 ${argsXml}
 \t</array>
 ${envXml}${logXml}\t<key>RunAtLoad</key>
-\t<true/>
-\t<key>KeepAlive</key>
-\t<${(options.keepAlive ?? true) ? "true" : "false"}/>
+\t<${(options.runAtLoad ?? true) ? "true" : "false"}/>
+${keepAliveXml}
 </dict>
 </plist>
 `;
@@ -303,6 +341,47 @@ export async function uninstallAgentHarnessDaemon(ops: HarnessDaemonOps): Promis
   await ops.removeFile(AGENT_HARNESS_DAEMON_PLIST_PATH);
 }
 
+/**
+ * Set the harness job's persistent launchd enable/disable override state
+ * (S5-5 release barrier). Constraint: `disable` is the durable park (a
+ * disabled job is not bootstrapped at boot and cannot be bootstrapped until
+ * enabled); `enable` PERSISTS across boots, so the release sequence must
+ * re-disable after a successful bootstrap. Throws on a non-zero exit.
+ */
+export async function setAgentHarnessJobDisabled(ops: HarnessDaemonOps, disabled: boolean): Promise<void> {
+  const verb = disabled ? "disable" : "enable";
+  const result = await ops.runLaunchctl([verb, `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (result.code !== 0) {
+    throw new Error(
+      `launchctl ${verb} system/${AGENT_HARNESS_DAEMON_LABEL} exited ${result.code}: ${result.stderr.trim()}`,
+    );
+  }
+}
+
+/**
+ * Start the (already-bootstrapped) harness job. The S5-5 barrier plist renders
+ * `RunAtLoad=false`, so a bootstrap alone does not start it; the root
+ * supervisor kickstarts strictly after the release barrier passes. Throws on
+ * a non-zero exit AND when the job does not reach a stable running pid
+ * afterwards: a kickstart whose process immediately exits (e.g. the release
+ * wrapper refusing with exit 78) is a FAILED start, not a silent green --
+ * accepting the launchctl exit code alone would report "started" for a
+ * harness that never execs (same stability bar as the install path).
+ */
+export async function kickstartAgentHarnessDaemon(ops: HarnessDaemonOps): Promise<void> {
+  const result = await ops.runLaunchctl(["kickstart", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (result.code !== 0) {
+    throw new Error(
+      `launchctl kickstart system/${AGENT_HARNESS_DAEMON_LABEL} exited ${result.code}: ${result.stderr.trim()}`,
+    );
+  }
+  if (!(await agentHarnessDaemonStableRunning(ops))) {
+    throw new Error(
+      `launchctl kickstart system/${AGENT_HARNESS_DAEMON_LABEL} was accepted, but the job did not report a stable running pid (the release wrapper may be refusing to exec)`,
+    );
+  }
+}
+
 /** Status of the harness daemon as launchd reports it. */
 export interface HarnessDaemonStatus {
   /** False when launchctl itself failed or timed out and status is unknowable. */
@@ -339,7 +418,15 @@ export async function agentHarnessDaemonStatus(ops: HarnessDaemonOps): Promise<H
   return { known: true, installed: true, running: false };
 }
 
-async function agentHarnessDaemonStableRunning(ops: HarnessDaemonOps): Promise<boolean> {
+/**
+ * Sample `launchctl print` until the job shows the SAME running pid for
+ * {@link HARNESS_DAEMON_STABILITY_SAMPLES} consecutive samples (a process
+ * that starts and immediately exits -- a refusing release wrapper, a
+ * crash-looping harness -- never passes). Exported so the S5-5 release
+ * sequence's `harnessStatus` op can reuse the exact stability bar the
+ * install path enforces. Fail-closed: unknown status returns false.
+ */
+export async function agentHarnessDaemonStableRunning(ops: HarnessDaemonOps): Promise<boolean> {
   const sleep = ops.sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   let expectedPid: number | undefined;
   let stableSamples = 0;

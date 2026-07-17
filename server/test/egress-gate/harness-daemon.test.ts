@@ -18,6 +18,7 @@ import {
   installAgentHarnessDaemon,
   uninstallAgentHarnessDaemon,
   agentHarnessDaemonStatus,
+  kickstartAgentHarnessDaemon,
   type HarnessDaemonOps,
 } from "../../src/egress-gate/harness-daemon.js";
 import { FORBIDDEN_PLIST_ENV } from "../../src/cli/castle-wall-boot.js";
@@ -497,6 +498,42 @@ describe("egress-gate/harness-daemon", () => {
         /bootout system\/.* exited 5/,
       );
       expect(ops.removals).toEqual([]);
+    });
+  });
+
+  describe("kickstartAgentHarnessDaemon (no silent green-on-down; fix-round HIGH regression)", () => {
+    const printRunning = {
+      code: 0,
+      stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n\tstate = running\n}\n`,
+      stderr: "",
+    };
+    const printNotRunning = {
+      code: 0,
+      stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tstate = not running\n}\n`,
+      stderr: "",
+    };
+
+    it("succeeds only when the job reaches a stable running pid after kickstart", async () => {
+      const ops = mockOps({
+        runLaunchctl: (args) =>
+          Promise.resolve(args[0] === "print" ? printRunning : { code: 0, stdout: "", stderr: "" }),
+      });
+      await expect(kickstartAgentHarnessDaemon(ops)).resolves.toBeUndefined();
+    });
+
+    it("throws when kickstart is ACCEPTED but the job never runs (a refusing wrapper is a failed start, not a green)", async () => {
+      const ops = mockOps({
+        runLaunchctl: (args) =>
+          Promise.resolve(args[0] === "print" ? printNotRunning : { code: 0, stdout: "", stderr: "" }),
+      });
+      await expect(kickstartAgentHarnessDaemon(ops)).rejects.toThrow(/stable running pid/);
+    });
+
+    it("throws on a non-zero kickstart exit", async () => {
+      const ops = mockOps({
+        runLaunchctl: () => Promise.resolve({ code: 5, stdout: "", stderr: "Input/output error" }),
+      });
+      await expect(kickstartAgentHarnessDaemon(ops)).rejects.toThrow(/kickstart/);
     });
   });
 
