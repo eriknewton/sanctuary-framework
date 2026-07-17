@@ -57,7 +57,13 @@ const GEN = 7;
 const SECRET = "deadbeefcafef00d";
 const sha256Hex = (v: string): string => createHash("sha256").update(v, "utf8").digest("hex");
 
-const liveProbe: GateLivenessProbe = { check: () => Promise.resolve({ live: true, reasons: [] }) };
+// TCB gates require the oracle-shape probe (coalescing:"forbidden" + a
+// policy-matching binding); the gate refuses construction otherwise.
+const liveProbe: GateLivenessProbe = {
+  coalescing: "forbidden",
+  binding: { agentUid: AGENT_UID, gatePort: 19998 },
+  check: () => Promise.resolve({ live: true, reasons: [] }),
+};
 const acceptRecord: GateCredentialAcceptRecord = {
   version: GATE_CREDENTIAL_VERSION,
   generation_id: GEN,

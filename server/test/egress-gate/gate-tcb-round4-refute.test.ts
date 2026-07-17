@@ -42,7 +42,13 @@ const acceptRecord: GateCredentialAcceptRecord = {
   secret_sha256: sha256Hex(SECRET),
 };
 const acceptSource: GateAcceptSource = { current: () => Promise.resolve(acceptRecord) };
-const liveProbe: GateLivenessProbe = { check: () => Promise.resolve({ live: true, reasons: [] }) };
+// TCB gates require the oracle-shape probe (coalescing:"forbidden" + a
+// policy-matching binding); the gate refuses construction otherwise.
+const liveProbe: GateLivenessProbe = {
+  coalescing: "forbidden",
+  binding: { agentUid: AGENT_UID, gatePort: GATE_PORT },
+  check: () => Promise.resolve({ live: true, reasons: [] }),
+};
 
 const policyFor = (uid: number): ExclusiveEgressGatePolicy => ({ agent_uid: uid, gate_port: GATE_PORT });
 const validHeader = formatGateCredentialHeader({ generation_id: 7, secret: SECRET });

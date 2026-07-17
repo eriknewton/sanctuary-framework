@@ -284,6 +284,15 @@ export function verifyLivenessToken(input: {
  * mandatory `livenessProbe`: each CONNECT reads and re-verifies the current
  * token (no positive is cached across requests -- that contract lives in the
  * gate), so a flushed/invalidated token denies on the very next CONNECT.
+ *
+ * The probe SELF-DECLARES `coalescing: "forbidden"` (the explicit oracle
+ * marker, second-family fix-round): its `check()` is a subprocess-free file
+ * read + signature verify, so coalescing concurrent CONNECTs onto one
+ * in-flight read buys no amplification protection and would let a post-flush
+ * CONNECT join a pre-flush green. `createExclusiveEgressGate` keys its
+ * single-flight construction guard off this marker: wire this probe in, OMIT
+ * `singleFlightLiveness`, and single-flight is auto-disabled (the S5-6
+ * contract; callers change nothing).
  */
 export function createOracleLivenessProbe(input: {
   source: LivenessTokenSource;
@@ -319,6 +328,9 @@ export function createOracleLivenessProbe(input: {
   // `.read` could feed an old unexpired signed token back after invalidation.
   const readToken = input.source.read.bind(input.source);
   const probe: GateLivenessProbe = {
+    // The EXPLICIT oracle marker (never inferred from `binding`): this probe's
+    // verdict must be read per-CONNECT; the gate refuses to coalesce it.
+    coalescing: "forbidden",
     binding: advertised,
     async check(): Promise<PfLivenessResult> {
       let raw: string | null;
