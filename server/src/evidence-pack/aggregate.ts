@@ -226,6 +226,182 @@ function daemonPresentButExcludedSuffix(retention: RetentionFacts): string {
 }
 
 /**
+ * One contributing store's retention position as consumed by the at-cap
+ * decision: the store's OWN caps against its OWN retained figures. A structural
+ * subset of {@link PerStoreRetention} (no `store` tag) so the legacy top-level
+ * single-store fallback can flow through the same chokepoint.
+ */
+export interface StoreRetentionPosition {
+  max_entries: number;
+  retained_total: number;
+  max_total_size_bytes: number;
+  retained_total_size_bytes: number | null;
+}
+
+/**
+ * The at-cap determinability classification: either at-cap CAN be computed and
+ * `contributing_stores` are the stores whose own caps drive it, or it CANNOT
+ * (`contributing_stores` empty) and no surface may assert a definitive at-cap
+ * or below-cap claim.
+ */
+export interface RetentionDeterminability {
+  /** True when "at a retention cap" can honestly be computed from the facts. */
+  at_cap_determinable: boolean;
+  /**
+   * The stores whose OWN caps drive the at-cap decision when determinable;
+   * empty when not determinable (at-cap must never be asserted either way).
+   */
+  contributing_stores: readonly StoreRetentionPosition[];
+}
+
+/**
+ * F2-R2 (Codex second-family review + Dry-8 sweep): a finite plain number --
+ * the ONLY runtime shape the at-cap comparisons in `detectShortfall` can
+ * honestly evaluate. Rejects `NaN`, `Infinity`, `undefined`, `null`, strings,
+ * and every other type an untyped JS / `JSON.parse` caller can smuggle past
+ * the compile-time `number` annotation.
+ */
+const isFiniteNumber = (v: unknown): v is number =>
+  typeof v === "number" && Number.isFinite(v);
+
+/**
+ * F2-R2: runtime FIELD COMPLETENESS of one contributing store position. Row
+ * PRESENCE alone is not determinability: a tags-only row like
+ * `{ store: "operator" }` carries no cap evidence at all, yet the at-cap
+ * comparison would silently evaluate its missing fields as "not at cap" and
+ * let the pack SIGN a definitive flattering `retention_at_cap: false` (plus
+ * the never-pruned reassurance). Every field the at-cap comparison reads must
+ * be a finite number; `retained_total_size_bytes` may instead be the
+ * documented `null` ("unread") -- but never `undefined` or any other type.
+ */
+const storePositionComplete = (s: StoreRetentionPosition): boolean =>
+  isFiniteNumber(s.max_entries) &&
+  isFiniteNumber(s.retained_total) &&
+  isFiniteNumber(s.max_total_size_bytes) &&
+  (s.retained_total_size_bytes === null ||
+    isFiniteNumber(s.retained_total_size_bytes));
+
+/**
+ * D7-1 / Codex-F1+F2 (dry-bar round 7): the SINGLE chokepoint deciding whether
+ * "the log is at a retention cap" is DETERMINABLE from a set of retention
+ * facts, and if so which stores' own caps drive the decision. Both consumers
+ * route through it: `detectShortfall` (every prose surface -- shortfall
+ * explanation, exec-summary and section-7 coverage notices, the PDF) and, via
+ * the `retention_at_cap_determinable` field it feeds, the SIGNED manifest
+ * serialization in `generate.ts`. This replaces the P1-B `=== undefined` guard,
+ * whose narrow keying let an INCOMPLETE/INCONSISTENT breakdown (empty `[]`, a
+ * type-invalid `null` from a JS/`JSON.parse` caller, or an operator-only row
+ * while the daemon store is `included`) fall back to the mismatched-scope
+ * merged-total-vs-one-cap arithmetic and revive the flattering "never pruned /
+ * below both caps" reassurance.
+ *
+ * Classification, fail-safe by default (mirrors the D5-3 rule: never assert a
+ * definitive claim the present data cannot back):
+ *  1. USABLE breakdown -- a present, non-empty, genuinely-Array
+ *     `per_store_retention` whose EVERY row is a runtime-complete
+ *     {@link PerStoreRetention} (a known `store` tag plus finite numeric
+ *     `max_entries`, `retained_total`, `max_total_size_bytes`, and a
+ *     null-or-finite `retained_total_size_bytes`), with EXACTLY ONE
+ *     `store: "operator"` row (the operator store is part of EVERY census) and
+ *     AT MOST ONE `store: "daemon"` row -- EXACTLY ONE whenever the census is
+ *     MERGED (`daemon_store.status === "included"`) -> DETERMINABLE, judged
+ *     per store against each store's own caps (the shipped path:
+ *     `deriveAuditReadOutcome` always seeds a complete operator row and adds
+ *     the daemon row when merged). A single complete daemon row on a
+ *     NON-merged census stays usable: it can only widen the at-cap OR toward
+ *     over-warning, never manufacture the flattering below-cap claim, and the
+ *     pre-WATCH-1 D5-1 fixtures (no `daemon_store` disclosure) depend on it.
+ *  2. Breakdown genuinely ABSENT (`undefined`) on a genuinely SINGLE-store
+ *     census (daemon NOT `included`) -> DETERMINABLE via the top-level fields,
+ *     which ARE that one store's own figures (the legacy pre-D5-1 caller) --
+ *     but ONLY when those top-level fields are themselves runtime-complete
+ *     under the same rule (F2-R2: the fallback row is a CONTRIBUTING row like
+ *     any other; a non-finite/absent top-level figure from an untyped caller
+ *     is no more evaluable than a field-free breakdown row).
+ *  3. Everything else -> NOT DETERMINABLE:
+ *     - daemon `included` with the breakdown absent, `null`, empty, or missing
+ *       the daemon row: the top-level total is MERGED, so comparing it to one
+ *       store's cap is the exact mismatched-scope arithmetic P1-B banned;
+ *     - a breakdown missing the OPERATOR row (fix-round F1): every census
+ *       includes the operator store, so a daemon-only breakdown left the
+ *       operator store's own cap position unsupplied -- the exact mirror of
+ *       the daemon-less case -- yet previously still earned the definitive
+ *       below-cap claim and the flattering reassurance over the daemon row
+ *       alone;
+ *     - an explicitly-supplied empty `[]`, `null`, or non-Array breakdown on
+ *       ANY census: the caller asserted a breakdown and delivered nothing
+ *       usable, so the anomalous input never earns a definitive at-cap OR
+ *       below-cap claim;
+ *     - F2-R2 (second-family review): any row that is not a runtime-complete
+ *       object -- a `null`/non-object element, an unknown `store` tag, a
+ *       missing/`NaN`/`Infinity`/wrong-typed numeric field, or an `undefined`
+ *       `retained_total_size_bytes` (the contract is null-or-finite). Row
+ *       PRESENCE without field COMPLETENESS previously sailed through: the
+ *       at-cap comparison evaluated the missing fields as "not at cap" and the
+ *       pack SIGNED a definitive flattering `retention_at_cap: false` plus the
+ *       never-pruned reassurance from rows carrying zero cap evidence;
+ *     - F2-R2 / Dry-8 HIGH: DUPLICATE rows for the same store or UNKNOWN-store
+ *       rows (e.g. `store: "archive"`). `contributing_stores` feeds the at-cap
+ *       OR directly, so an invalid extra row could also SIGN a definitive
+ *       `retention_at_cap: true` -- a signed falsehood in the OVER-claiming
+ *       direction. An inconsistent census description forfeits determinability
+ *       entirely (fail-safe: assert NEITHER direction).
+ */
+export function retentionDeterminability(
+  retention: RetentionFacts
+): RetentionDeterminability {
+  const breakdown = retention.per_store_retention;
+  const daemonIncluded = retention.daemon_store?.status === "included";
+  // `Array.isArray` deliberately rejects `undefined`, a `null` smuggled past
+  // the optional-array type by an untyped caller, AND any non-Array object.
+  if (Array.isArray(breakdown) && breakdown.length > 0) {
+    // F2-R2: every row must be a runtime-complete object with a KNOWN store
+    // tag -- presence-only rows like `{ store: "operator" }` carry no cap
+    // evidence and must never be evaluated as "not at cap".
+    const rowsComplete = breakdown.every(
+      (s) =>
+        typeof s === "object" &&
+        s !== null &&
+        (s.store === "operator" || s.store === "daemon") &&
+        storePositionComplete(s)
+    );
+    // The operator store is part of EVERY census (`types.ts` documents the
+    // breakdown invariant as "Always includes the operator store"), so a
+    // daemon-only breakdown is as incomplete as an operator-only one. F2-R2 /
+    // Dry-8: DUPLICATE rows would feed the at-cap OR twice (an invalid extra
+    // at-cap row signs a definitive over-claim), so exactly one operator row
+    // and at most one daemon row -- exactly one when the census is MERGED.
+    if (!rowsComplete) {
+      return { at_cap_determinable: false, contributing_stores: [] };
+    }
+    const operatorCount = breakdown.filter((s) => s.store === "operator").length;
+    const daemonCount = breakdown.filter((s) => s.store === "daemon").length;
+    const usable =
+      operatorCount === 1 &&
+      (daemonIncluded ? daemonCount === 1 : daemonCount <= 1);
+    if (usable) {
+      return { at_cap_determinable: true, contributing_stores: breakdown };
+    }
+    return { at_cap_determinable: false, contributing_stores: [] };
+  }
+  if (!daemonIncluded && breakdown === undefined) {
+    // F2-R2: the legacy fallback row is a CONTRIBUTING row like any other --
+    // validate the top-level figures under the same completeness rule before
+    // letting them drive a definitive at-cap/below-cap claim.
+    const single: StoreRetentionPosition = {
+      max_entries: retention.max_entries,
+      retained_total: retention.retained_total,
+      max_total_size_bytes: retention.max_total_size_bytes,
+      retained_total_size_bytes: retention.retained_total_size_bytes,
+    };
+    if (storePositionComplete(single)) {
+      return { at_cap_determinable: true, contributing_stores: [single] };
+    }
+  }
+  return { at_cap_determinable: false, contributing_stores: [] };
+}
+
+/**
  * Detect a covered-window shortfall: whether the retained audit log
  * demonstrably covers the full quarter, on BOTH the start side and the end
  * side (HIGH-2 fix). A shortfall exists when either:
@@ -266,27 +442,15 @@ export function detectShortfall(
   // fortress whose combined count crossed one store's cap while NEITHER store was
   // near its own.
   //
-  // P1-B (dry-bar round 6): the single-store fallback must NEVER be applied to a
-  // census that self-declares as MERGED (daemon `included`) but omits the
-  // per-store breakdown -- comparing the merged `retained_total` against a single
-  // store's `max_entries` cap is exactly the mismatched-scope arithmetic that
-  // revived the false `retention_at_cap: true` in the SIGNED manifest through the
-  // exported `buildEvidencePack`. Three cases, fail-safe by default:
-  //   1. `per_store_retention` present  -> judge PER STORE (the shipped path).
-  //   2. absent + daemon `included`     -> a MERGED census with no breakdown:
-  //      at-cap is NOT DETERMINABLE (a merged total cannot be compared to any one
-  //      store's cap). Assert NEITHER at-cap NOR the flattering "never pruned /
-  //      below caps" reassurance (mirrors the D5-3 fail-safe default -- never
-  //      assert a definitive claim the present data cannot back).
-  //   3. absent + daemon NOT `included` -> a genuine SINGLE-store census
-  //      (operator only, or no daemon store): the top-level fields ARE that one
-  //      store's own figures, so the single-store computation is correct.
-  const atCapForStore = (s: {
-    max_entries: number;
-    retained_total: number;
-    max_total_size_bytes: number;
-    retained_total_size_bytes: number | null;
-  }): boolean => {
+  // P1-B (round 6) -> D7-1/F2 (round 7): whether at-cap is even DETERMINABLE,
+  // and over which stores, is decided by the `retentionDeterminability`
+  // chokepoint above (usable breakdown -> per store; genuine legacy
+  // single-store -> top-level fields; anything else -- a merged census with an
+  // absent/`null`/empty/daemon-less breakdown, or an explicitly-supplied
+  // empty/`null` breakdown -- fail-safe NOT determinable). When not
+  // determinable, assert NEITHER at-cap NOR the flattering "never pruned /
+  // below caps" reassurance.
+  const atCapForStore = (s: StoreRetentionPosition): boolean => {
     // Either FIFO cap counts as "at cap" for a given store (sweep HIGH-5):
     // entries OR total size.
     const atEntryCap = s.max_entries > 0 && s.retained_total >= s.max_entries;
@@ -296,25 +460,12 @@ export function detectShortfall(
       s.retained_total_size_bytes >= s.max_total_size_bytes;
     return atEntryCap || atSizeCap;
   };
-  const mergedWithoutBreakdown =
-    retention.per_store_retention === undefined &&
-    retention.daemon_store?.status === "included";
-  // DETERMINABLE only when we have the per-store caps OR the census is genuinely a
-  // single store. A merged census without the breakdown leaves at-cap unknown, so
-  // `retentionAtCap` stays false (never asserted) AND the reassurance is gated off
-  // by `atCapDeterminable` below.
-  const atCapDeterminable = !mergedWithoutBreakdown;
-  const contributingStores = retention.per_store_retention ?? [
-    {
-      max_entries: retention.max_entries,
-      retained_total: retention.retained_total,
-      max_total_size_bytes: retention.max_total_size_bytes,
-      retained_total_size_bytes: retention.retained_total_size_bytes,
-    },
-  ];
-  const retentionAtCap = atCapDeterminable
-    ? contributingStores.some(atCapForStore)
-    : false;
+  // When not determinable, `retentionAtCap` stays false (never asserted) AND
+  // the reassurance is gated off by `atCapDeterminable` below.
+  const determinability = retentionDeterminability(retention);
+  const atCapDeterminable = determinability.at_cap_determinable;
+  const retentionAtCap =
+    atCapDeterminable && determinability.contributing_stores.some(atCapForStore);
 
   // END SIDE: coverage can never extend past the moment the report was made.
   const inProgress = generatedMs < quarterEndMs;
@@ -469,6 +620,9 @@ export function detectShortfall(
     in_progress_quarter: inProgress,
     last_entry_at: params.lastEntryAt,
     retention_at_cap: retentionAtCap,
+    // D7-1/F1 (round 7): carry determinability so the SIGNED manifest can
+    // serialize a not-determinable marker instead of a definitive boolean.
+    retention_at_cap_determinable: atCapDeterminable,
     zero_of_quarter_covered: zeroOfQuarterCovered,
     explanation: parts.join(" "),
     // WATCH-1: carry the daemon-store disclosure onto the coverage report so the

@@ -44,7 +44,12 @@ export {
   aggregateQuarter,
   categorizeEntry,
   detectShortfall,
+  retentionDeterminability,
   GATE_DECISION_OP_CATEGORIES,
+} from "./aggregate.js";
+export type {
+  RetentionDeterminability,
+  StoreRetentionPosition,
 } from "./aggregate.js";
 export { renderSections, PACK_DISCLAIMER } from "./sections.js";
 export type {

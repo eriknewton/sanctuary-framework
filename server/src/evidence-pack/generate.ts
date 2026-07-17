@@ -240,7 +240,18 @@ export function buildEvidencePack(
         covered_to_exclusive: s.covered_to_exclusive,
         shortfall: s.shortfall,
         in_progress_quarter: s.in_progress_quarter,
-        retention_at_cap: s.retention_at_cap,
+        // Codex-F1 (dry-bar round 7): NEVER serialize a definitive
+        // `retention_at_cap` boolean into the SIGNED manifest when at-cap was
+        // not determinable (a merged census with no usable per-store
+        // breakdown): a machine consumer reading the flattering `false` would
+        // take "not at a retention cap" as a determined fact. Serialize the
+        // boolean ONLY when the `retentionDeterminability` chokepoint said it
+        // was computed; otherwise emit the explicit
+        // `retention_at_cap_determinable: false` marker (mirroring the
+        // top-level `determinable: false` convention) and omit the boolean.
+        ...(s.retention_at_cap_determinable
+          ? { retention_at_cap: s.retention_at_cap }
+          : { retention_at_cap_determinable: false as const }),
         // G-1 follow-up: carry the daemon-store disclosure into the SIGNED
         // machine-readable coverage so `shortfall: false` is never read as a
         // complete-census signal when a present daemon store was excluded.
