@@ -422,3 +422,123 @@ describe("egress-gate/gate-server TCB fail-closed client auth", () => {
     expect(second.statusLine).toBe("HTTP/1.1 503 Service Unavailable");
   });
 });
+
+// ---------------------------------------------------------------------------
+// singleFlightLiveness CONSTRUCTION GUARD (pre-S5-6 wiring-footgun closure).
+// A binding-declaring (oracle) probe must never run under single-flight
+// coalescing: the guard auto-disables it when the option is omitted and
+// REFUSES construction when the caller explicitly asked for `true`. A
+// binding-less legacy probe keeps the unchanged single-flight default.
+// ---------------------------------------------------------------------------
+describe("egress-gate/gate-server singleFlightLiveness construction guard", () => {
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  /** A probe whose check() stays pending until resolved, counting calls. */
+  function pendingCountingProbe(binding?: { agentUid: number; gatePort: number }) {
+    let calls = 0;
+    const resolvers: Array<(r: PfLivenessResult) => void> = [];
+    const probe: GateLivenessProbe = {
+      ...(binding !== undefined ? { binding } : {}),
+      check: () =>
+        new Promise<PfLivenessResult>((res) => {
+          calls += 1;
+          resolvers.push(res);
+        }),
+    };
+    return {
+      probe,
+      get calls() {
+        return calls;
+      },
+      resolveAll(r: PfLivenessResult) {
+        for (const f of resolvers.splice(0)) f(r);
+      },
+    };
+  }
+
+  /** Start a legacy (no clientAuth) gate on an ephemeral port. */
+  async function startLegacyGate(
+    livenessProbe: GateLivenessProbe,
+    singleFlightLiveness?: boolean,
+  ): Promise<number> {
+    const server = createExclusiveEgressGate({
+      policy: { agent_uid: AGENT_UID, gate_port: 19998 },
+      rules: [],
+      livenessProbe,
+      ...(singleFlightLiveness !== undefined ? { singleFlightLiveness } : {}),
+    });
+    await new Promise<void>((resolve) => server.listen(0, GATE_BIND_HOST, resolve));
+    cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+    return (server.address() as AddressInfo).port;
+  }
+
+  it("AUTO-DISABLES single-flight for a binding-declaring probe with default options (per-CONNECT probes)", async () => {
+    const pc = pendingCountingProbe({ agentUid: AGENT_UID, gatePort: 19998 });
+    const port = await startLegacyGate(pc.probe); // no singleFlightLiveness option at all
+    const connects = [
+      rawConnect(port, "example.com:443"),
+      rawConnect(port, "example.com:443"),
+      rawConnect(port, "example.com:443"),
+    ];
+    await sleep(80);
+    // Auto-disabled: every concurrent CONNECT ran its OWN probe. Under the old
+    // default-true behavior this would be 1 (the post-flush shared-green window).
+    expect(pc.calls).toBe(3);
+    pc.resolveAll({ live: false, reasons: ["flushed"] });
+    for (const p of connects) expect((await p).statusLine).toContain("503");
+  });
+
+  it("REFUSES to construct a binding-declaring probe with explicit singleFlightLiveness:true (never silently honored)", () => {
+    const boundProbe: GateLivenessProbe = {
+      binding: { agentUid: AGENT_UID, gatePort: 19998 },
+      check: () => Promise.resolve({ live: true, reasons: [] }),
+    };
+    expect(() =>
+      createExclusiveEgressGate({
+        policy: { agent_uid: AGENT_UID, gate_port: 19998 },
+        rules: [],
+        livenessProbe: boundProbe,
+        singleFlightLiveness: true,
+      }),
+    ).toThrow(/singleFlightLiveness:true is incompatible with a binding-declaring/);
+  });
+
+  it("still accepts a binding-declaring probe with explicit singleFlightLiveness:false (the S5-6 wiring)", () => {
+    const boundProbe: GateLivenessProbe = {
+      binding: { agentUid: AGENT_UID, gatePort: 19998 },
+      check: () => Promise.resolve({ live: true, reasons: [] }),
+    };
+    expect(() =>
+      createExclusiveEgressGate({
+        policy: { agent_uid: AGENT_UID, gate_port: 19998 },
+        rules: [],
+        livenessProbe: boundProbe,
+        singleFlightLiveness: false,
+      }),
+    ).not.toThrow();
+  });
+
+  it("keeps the single-flight DEFAULT for a binding-less legacy probe (one shared probe for concurrent CONNECTs)", async () => {
+    const pc = pendingCountingProbe(); // no binding => legacy pf-probe shape
+    const port = await startLegacyGate(pc.probe); // default options
+    const connects = [
+      rawConnect(port, "example.com:443"),
+      rawConnect(port, "example.com:443"),
+      rawConnect(port, "example.com:443"),
+    ];
+    await sleep(80);
+    expect(pc.calls).toBe(1); // unchanged: shared in-flight probe bounds pfctl amplification
+    pc.resolveAll({ live: false, reasons: ["denied"] });
+    for (const p of connects) expect((await p).statusLine).toContain("503");
+  });
+
+  it("keeps explicit singleFlightLiveness:true working for a binding-less probe (no behavior change off the oracle path)", async () => {
+    const pc = pendingCountingProbe();
+    const port = await startLegacyGate(pc.probe, true);
+    const connects = [rawConnect(port, "example.com:443"), rawConnect(port, "example.com:443")];
+    await sleep(80);
+    expect(pc.calls).toBe(1);
+    pc.resolveAll({ live: false, reasons: ["denied"] });
+    for (const p of connects) expect((await p).statusLine).toContain("503");
+  });
+});

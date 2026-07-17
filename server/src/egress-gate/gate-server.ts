@@ -170,10 +170,14 @@ export interface ExclusiveEgressGateOptions {
   clientAuth?: GateClientAuthenticator;
   /**
    * Whether concurrent CONNECTs share ONE in-flight liveness probe (Slice 5
-   * S5-3; Codex F4 fix-round). Default `true` bounds pfctl subprocess
-   * amplification for the legacy pf probe. Set `false` when wiring the
-   * subprocess-free oracle probe so every CONNECT re-reads the freshness token
-   * (closes the post-flush shared-green window; no amplification cost to lose).
+   * S5-3; Codex F4 fix-round). For a binding-less legacy probe the default is
+   * `true`, bounding pfctl subprocess amplification. For a binding-declaring
+   * probe (the subprocess-free oracle probe) the CONSTRUCTOR enforces
+   * per-CONNECT liveness: omitting this option auto-disables single-flight,
+   * and `true` is REFUSED at construction (a shared in-flight green would let
+   * a CONNECT arriving after a flush read stale liveness -- the post-flush
+   * shared-green window; there is no amplification cost to lose). This is a
+   * construction guard, not a caller obligation.
    */
   singleFlightLiveness?: boolean;
   /** Event sink for audit/posture wiring. */
@@ -241,7 +245,6 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
   const rules = deepFreeze(structuredClone(options.rules)) as AllowlistRule[];
   const isRoutable = options.isRoutable;
   const onEvent = options.onEvent;
-  const singleFlight = options.singleFlightLiveness ?? true;
 
   if (validateExclusiveEgressGatePolicy(policy) === null) {
     throw new Error("createExclusiveEgressGate: malformed exclusive-egress gate policy");
@@ -274,26 +277,41 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
         `must match policy {agent_uid:${policy.agent_uid}, gate_port:${policy.gate_port}}; refusing a cross-principal liveness verdict`,
     );
   }
-  // Per-CONNECT liveness (Codex F4 fix-round). Single-flight shares ONE in-flight
-  // probe across concurrent CONNECTs to bound pfctl SUBPROCESS amplification --
-  // correct for the legacy pfctl probe. The oracle probe (S5-3) spawns no
-  // subprocess (a file read + signature verify), so single-flight buys no
-  // amplification protection there and can let a CONNECT that arrived strictly
-  // AFTER a flush join an already-in-flight green read. A caller wiring the
-  // oracle probe SHOULD set `singleFlightLiveness: false` so every CONNECT gets
-  // its own fresh token read; the default stays `true` (unchanged for the pfctl
-  // path and all existing callers).
+  // Per-CONNECT liveness (Codex F4 fix-round; hardened to a CONSTRUCTION GUARD
+  // pre-S5-6). Single-flight shares ONE in-flight probe across concurrent
+  // CONNECTs to bound pfctl SUBPROCESS amplification -- correct for the legacy
+  // pfctl probe. The oracle probe (S5-3) spawns no subprocess (a file read +
+  // signature verify), so single-flight buys no amplification protection there
+  // and can let a CONNECT that arrived strictly AFTER a flush join an
+  // already-in-flight green read (the post-flush shared-green window). That must
+  // not be a caller obligation: for a BINDING-DECLARING probe (the oracle probe
+  // advertises `binding`; the legacy pf probe never does) the constructor
+  // auto-disables single-flight when the option is omitted, and REFUSES to
+  // construct when the caller explicitly asked for `true` -- honoring it
+  // silently would re-open the window. A binding-less probe keeps the
+  // unchanged default `true` (the pfctl path and all existing callers).
+  if (probeBinding !== undefined && options.singleFlightLiveness === true) {
+    throw new Error(
+      "createExclusiveEgressGate: singleFlightLiveness:true is incompatible with a binding-declaring " +
+        "(oracle) liveness probe: a shared in-flight probe can hand a post-flush CONNECT a stale green " +
+        "verdict, and the subprocess-free oracle probe gains no amplification protection from coalescing. " +
+        "Omit singleFlightLiveness (auto-disabled) or pass false.",
+    );
+  }
+  const singleFlight = probeBinding !== undefined ? false : (options.singleFlightLiveness ?? true);
   let inflightProbe: Promise<PfLivenessResult> | null = null;
   let activePeerLookups = 0;
 
   /**
-   * Liveness probe wrapper. With `singleFlightLiveness` (default), concurrent
-   * requests in the same decision window share ONE probe (one pfctl spawn set)
-   * instead of each spawning their own; the shared variable is cleared when the
-   * probe settles so no positive survives into a later request. With
-   * `singleFlightLiveness: false` every CONNECT runs its own probe (no shared
-   * in-flight verdict), which closes the post-flush shared-green window for the
-   * subprocess-free oracle probe. Either way the probe never rejects.
+   * Liveness probe wrapper. With single-flight (the default for binding-less
+   * probes), concurrent requests in the same decision window share ONE probe
+   * (one pfctl spawn set) instead of each spawning their own; the shared
+   * variable is cleared when the probe settles so no positive survives into a
+   * later request. Without single-flight (forced at construction for
+   * binding-declaring oracle probes; opt-in via `singleFlightLiveness: false`
+   * otherwise) every CONNECT runs its own probe (no shared in-flight verdict),
+   * which closes the post-flush shared-green window for the subprocess-free
+   * oracle probe. Either way the probe never rejects.
    */
   function probeLiveness(): Promise<PfLivenessResult> {
     if (!singleFlight) {
