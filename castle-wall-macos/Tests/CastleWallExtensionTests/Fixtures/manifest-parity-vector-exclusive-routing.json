@@ -1,0 +1,73 @@
+{
+  "manifest_signed_body": {
+    "schema_version": 1,
+    "fortress_id": "fortress-exclusive-routing-parity",
+    "issued_at": "2026-07-16T00:00:00.000Z",
+    "rules": [
+      {
+        "rule_id": "provisioned-hermes-73bfa0dd58b7",
+        "file": "provisioned-hermes-73bfa0dd58b7.json",
+        "sha256": "5cbad4e5f00f50d9545360077526b26a2a3fd8c00381fd812e7ab507f95c877f"
+      },
+      {
+        "rule_id": "derived_exclusive_egress_gate",
+        "file": "derived_exclusive_egress_gate.json",
+        "sha256": "44a8297c7894c463bc1f546975547ac968adb9615a360d2aee5caa1788196787"
+      }
+    ],
+    "agent_origin": {
+      "mode": "uid",
+      "agent_uid": 600,
+      "gate_uid": 601,
+      "system_uid_allow_ceiling": 500
+    }
+  },
+  "rules": [
+    {
+      "id": "provisioned-hermes-73bfa0dd58b7",
+      "schema_version": 1,
+      "created_at": "2026-07-16T00:00:00.000Z",
+      "description": "Provisioned egress for harness \"hermes\": LLM (Venice) (api.venice.ai:443/tcp). Published by 'sanctuary protect'; revocable via unprovision (provenance-tagged id). Exclusive routing: bound to the sanctuary-gate principal (S5-0 uids scope); the agent transits the gate.",
+      "match": {
+        "host": [
+          "api.venice.ai"
+        ],
+        "port": [
+          443
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {
+        "uids": [
+          601
+        ]
+      },
+      "disposition": "allow",
+      "derived": true
+    },
+    {
+      "id": "derived_exclusive_egress_gate",
+      "schema_version": 1,
+      "created_at": "2026-07-16T00:00:00.000Z",
+      "description": "Exclusive-egress gate channel: agent loopback TCP to the local policy gate (127.0.0.1:49152). Auto-derived from the gate policy; the per-uid pf anchor is generated from the same source.",
+      "match": {
+        "cidr": "127.0.0.1/32",
+        "port": [
+          49152
+        ],
+        "protocol": "tcp"
+      },
+      "scope": {
+        "uids": [
+          600
+        ]
+      },
+      "disposition": "allow",
+      "derived": true
+    }
+  ],
+  "expected_canonical_json_b64": "eyJhZ2VudF9vcmlnaW4iOnsiYWdlbnRfdWlkIjo2MDAsImdhdGVfdWlkIjo2MDEsIm1vZGUiOiJ1aWQiLCJzeXN0ZW1fdWlkX2FsbG93X2NlaWxpbmciOjUwMH0sImZvcnRyZXNzX2lkIjoiZm9ydHJlc3MtZXhjbHVzaXZlLXJvdXRpbmctcGFyaXR5IiwiaXNzdWVkX2F0IjoiMjAyNi0wNy0xNlQwMDowMDowMC4wMDBaIiwicnVsZXMiOlt7ImZpbGUiOiJwcm92aXNpb25lZC1oZXJtZXMtNzNiZmEwZGQ1OGI3Lmpzb24iLCJydWxlX2lkIjoicHJvdmlzaW9uZWQtaGVybWVzLTczYmZhMGRkNThiNyIsInNoYTI1NiI6IjVjYmFkNGU1ZjAwZjUwZDk1NDUzNjAwNzc1MjZiMjZhMmEzZmQ4YzAwMzgxZmQ4MTJlN2FiNTA3Zjk1Yzg3N2YifSx7ImZpbGUiOiJkZXJpdmVkX2V4Y2x1c2l2ZV9lZ3Jlc3NfZ2F0ZS5qc29uIiwicnVsZV9pZCI6ImRlcml2ZWRfZXhjbHVzaXZlX2VncmVzc19nYXRlIiwic2hhMjU2IjoiNDRhODI5N2M3ODk0YzQ2M2JjMWY1NDY5NzU1NDdhYzk2OGFkYjk2MTVhMzYwZDJhZWU1Y2FhMTc4ODE5Njc4NyJ9XSwic2NoZW1hX3ZlcnNpb24iOjF9",
+  "expected_canonical_json_hex": "7b226167656e745f6f726967696e223a7b226167656e745f756964223a3630302c22676174655f756964223a3630312c226d6f6465223a22756964222c2273797374656d5f7569645f616c6c6f775f6365696c696e67223a3530307d2c22666f7274726573735f6964223a22666f7274726573732d6578636c75736976652d726f7574696e672d706172697479222c226973737565645f6174223a22323032362d30372d31365430303a30303a30302e3030305a222c2272756c6573223a5b7b2266696c65223a2270726f766973696f6e65642d6865726d65732d3733626661306464353862372e6a736f6e222c2272756c655f6964223a2270726f766973696f6e65642d6865726d65732d373362666130646435386237222c22736861323536223a2235636261643465356630306635306439353435333630303737353236623236613261336664386330303338316664383132653761623530376639356338373766227d2c7b2266696c65223a22646572697665645f6578636c75736976655f6567726573735f676174652e6a736f6e222c2272756c655f6964223a22646572697665645f6578636c75736976655f6567726573735f67617465222c22736861323536223a2234346138323937633738393463343633626331663534363937353534376163393638616462393631356133363064326165653563616131373838313936373837227d5d2c22736368656d615f76657273696f6e223a317d",
+  "test_public_key_b64url": "jVUTNfTKzC8CPmmqHlNbuoiOPFaiaileAwNUtxezwrc",
+  "test_signature_b64url": "Kx-K1XqcWGyNuVCvFwwY2We7h7XQriEVIX1h_HOcrXoqIu3FJxKdB0ENOTHMuBgEsCNs1v76LKvjRdpx75zjDA"
+}

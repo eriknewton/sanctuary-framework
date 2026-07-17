@@ -232,20 +232,57 @@ export function endpointIsMessagingExfilRisk(endpoint: HarnessEndpoint): boolean
 }
 
 /**
+ * Routing mode for the provisioned endpoint rules (Unified Protect Slice 5
+ * S5-4, the exclusive routing model, design BLOCKER-1 fix):
+ *
+ *  - `coarse` (default, byte-identical to the shipped v1 shape): rules ship
+ *    UNSCOPED (`scope: {}`), so the confined agent may reach its declared
+ *    endpoints DIRECTLY. The drill-proven coarse posture.
+ *  - `exclusive`: rules are RE-SCOPED AWAY FROM THE AGENT to the gate
+ *    principal (`scope.uids = [gate_uid]`, the S5-0 per-principal axis), so
+ *    the GATE uid is kernel-bounded to the declared endpoint set while the
+ *    agent's only sanctioned path off the box is the gate channel. macOS-only
+ *    (the Linux daemon fail-closed refuses `uids`-bearing rule files by
+ *    design); the exclusive-routing composer asserts no agent-reachable
+ *    direct endpoint allow survives composition.
+ */
+export type ProvisionedEgressRouting =
+  | { readonly mode: "coarse" }
+  | { readonly mode: "exclusive"; readonly gate_uid: number };
+
+/**
  * Build the provisioned allow rules for a harness endpoint set (pure).
  *
  * Shape decisions (design section 3.3): exact host + pinned port + pinned
- * protocol; UNSCOPED (v1 carries the mandatory same-PR `.unattributed`
- * uid-mode evaluator hardening instead of a uids scope axis, which has a
- * real cross-language version-skew hazard); `derived: true` + provenance id
- * + harness-naming description (section 2.3). Throws when any built rule
- * fails schema validation -- a rule that cannot be published safely must
- * abort the flow, never be silently dropped.
+ * protocol; `derived: true` + provenance id + harness-naming description
+ * (section 2.3). Scope is routing-mode dependent (see
+ * {@link ProvisionedEgressRouting}): UNSCOPED in coarse mode (the shipped v1
+ * shape, byte-identical), gate-uid-scoped in exclusive mode (S5-4). Throws
+ * when any built rule fails schema validation -- a rule that cannot be
+ * published safely must abort the flow, never be silently dropped -- and
+ * when an exclusive routing carries a non-positive gate uid.
  */
 export function buildProvisionedEgressRules(
   set: HarnessEndpointSet,
   createdAt: string,
+  routing: ProvisionedEgressRouting = { mode: "coarse" },
 ): AllowlistRule[] {
+  if (
+    routing.mode === "exclusive" &&
+    (!Number.isInteger(routing.gate_uid) || routing.gate_uid <= 0)
+  ) {
+    throw new Error(
+      `provisioned egress rules: exclusive routing requires a positive integer gate_uid, got ${String(
+        (routing as { gate_uid: unknown }).gate_uid,
+      )}`,
+    );
+  }
+  const scope: AllowlistRule["scope"] =
+    routing.mode === "exclusive" ? { uids: [routing.gate_uid] } : {};
+  const routingNote =
+    routing.mode === "exclusive"
+      ? " Exclusive routing: bound to the sanctuary-gate principal (S5-0 uids scope); the agent transits the gate."
+      : "";
   const rules: AllowlistRule[] = set.endpoints.map((endpoint) => ({
     id: provisionedRuleId(set.harnessId, endpoint),
     schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
@@ -253,13 +290,14 @@ export function buildProvisionedEgressRules(
     description:
       `Provisioned egress for harness "${set.harnessId}": ${endpoint.name} ` +
       `(${endpoint.host}:${endpoint.port}/${endpoint.protocol}). Published by 'sanctuary protect'; ` +
-      `revocable via unprovision (provenance-tagged id).`,
+      `revocable via unprovision (provenance-tagged id).` +
+      routingNote,
     match: {
       host: [endpoint.host],
       port: [endpoint.port],
       protocol: endpoint.protocol,
     },
-    scope: {},
+    scope: { ...scope },
     disposition: "allow",
     derived: true,
   }));
@@ -436,6 +474,13 @@ export interface PublishProvisionedEgressInput {
    * unreachable socket -- is a fail-closed refusal.
    */
   reloadPolicy: PolicyReloadTrigger;
+  /**
+   * Routing mode for the published rules (S5-4). Default coarse (the shipped
+   * v1 shape, byte-identical). Exclusive scopes every provisioned rule to the
+   * gate principal; the same provenance-tagged ids are reused, so a mode
+   * switch republishes (overwrites) the same files rather than duplicating.
+   */
+  routing?: ProvisionedEgressRouting;
   now?: () => Date;
 }
 
@@ -459,7 +504,11 @@ export async function publishProvisionedEgressRules(
   const now = input.now ?? (() => new Date());
   const dir = egressRulesDir(input.fortressPath);
   try {
-    const rules = buildProvisionedEgressRules(input.endpointSet, now().toISOString());
+    const rules = buildProvisionedEgressRules(
+      input.endpointSet,
+      now().toISOString(),
+      input.routing ?? { mode: "coarse" },
+    );
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const wantedFilenames = new Set(rules.map((rule) => `${rule.id}.json`));
     for (const rule of rules) {
