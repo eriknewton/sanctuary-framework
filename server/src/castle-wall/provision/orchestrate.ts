@@ -35,6 +35,10 @@
  */
 
 import type { ProvisionNeedResult } from "./detect.js";
+import {
+  runExclusiveEgressArming,
+  type ExclusiveEgressArmOps,
+} from "./exclusive-arm.js";
 import type { AccountProvisionPlan } from "./account.js";
 import type { RehomePlan, RehomeStepResult } from "./rehome.js";
 import { RehomeExecutionError } from "./rehome.js";
@@ -81,6 +85,17 @@ export interface ProvisionFlowContext {
    * so the granted set and the printed set can never drift.
    */
   harnessEndpoints: HarnessEndpointSet;
+  /**
+   * Unified Protect Slice 5 S5-6: this provision is FINE-GRAINED
+   * (exclusive-egress) mode. When true the flow REQUIRES (fail-closed,
+   * checked BEFORE any mutation): (a) `ops.exclusiveEgress` wired, and
+   * (b) `ops.installHarnessDaemon` performing the S5-5 PARKED install
+   * (`parked: true` on its result) -- the agent must not run until the
+   * release barrier passes. After the coarse stages prove live, the flow
+   * runs the exclusive arming stage (gate generation bring-up + release
+   * barrier), with the degrade-loud coarse fallback on failure.
+   */
+  fineGrainedDeclared?: boolean;
 }
 
 /** The injected, side-effecting steps. Each corresponds to one stage of the target flow. */
@@ -116,7 +131,21 @@ export interface ProvisionFlowOps {
    */
   installHarnessDaemon(
     uid: number,
-  ): Promise<{ ok: true; bootstrappedThisRun: boolean } | { ok: false; error: string; daemonPreexisted: boolean }>;
+  ): Promise<
+    | {
+        ok: true;
+        bootstrappedThisRun: boolean;
+        /**
+         * S5-6: true when the install was the S5-5 PARKED form (plist
+         * Disabled + launchctl-disabled + hold file absent; the daemon was
+         * NOT bootstrapped). REQUIRED true when `ctx.fineGrainedDeclared`;
+         * the flow aborts fail-closed otherwise (a running agent before the
+         * release barrier is the exact BLOCKER-2 escape).
+         */
+        parked?: boolean;
+      }
+    | { ok: false; error: string; daemonPreexisted: boolean }
+  >;
   /**
    * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
    * bootstraps a LIVE root LaunchDaemon; every post-install abort branch
@@ -276,6 +305,14 @@ export interface ProvisionFlowOps {
      */
     failedPaths: string[];
   }>;
+  /**
+   * S5-6: the exclusive-egress arming stage ops (gate generation bring-up +
+   * S5-5 release barrier + degrade-loud coarse fallback). REQUIRED when
+   * `ctx.fineGrainedDeclared`; the flow aborts BEFORE any mutation when it is
+   * missing (a fine-grained provision without the arming stage would end with
+   * a parked agent and no path to release it).
+   */
+  exclusiveEgress?: ExclusiveEgressArmOps;
 }
 
 /**
@@ -389,6 +426,40 @@ export type ProvisionFlowOutcome =
       reason: string;
       /** False when the provisioned-rule scrub after fast-disarm could not be confirmed. */
       scrubbed: boolean;
+    }
+  /**
+   * S5-6 (Unified Protect Slice 5): the FULL fine-grained outcome -- coarse
+   * stages proved live AND the exclusive-egress generation committed AND the
+   * S5-5 release barrier released the (previously parked) harness. The only
+   * fine-grained outcome that may contribute to aggregate green.
+   */
+  | { kind: "armed-exclusive"; uid: number; generationId: number }
+  /**
+   * S5-6: exclusive stack LIVE and the harness running confined, but the
+   * persistent boot state could not be re-parked (the next boot could
+   * auto-start the harness before G5). DISTINCT AMBER, never green; fixed by
+   * `sudo sanctuary protect --repair-egress-gate`.
+   */
+  | { kind: "armed-exclusive-repark-failed"; uid: number; generationId: number; reparkError: string }
+  /**
+   * S5-6 DEGRADE-LOUD (design answer 2 choice (b), requires S5-P on every
+   * surface): fine-grained was declared but the exclusive stack could not
+   * come live; the PROVEN coarse wall stays armed. The manifest was
+   * explicitly recomposed to coarse scope through the audited S5-4 fallback
+   * (`coarseCompositionRestored`) and the agent started in coarse mode
+   * (`harnessStartedCoarse`) -- either false means the agent is PARKED (not
+   * running) and the outcome says so loudly. ALWAYS a distinct non-green
+   * posture (`coarse-only` / amber on every surface); NEVER silent, NEVER
+   * fake-green.
+   */
+  | {
+      kind: "exclusive-egress-unarmed-coarse-active";
+      uid: number;
+      stage: "bring-up" | "release";
+      reason: string;
+      coarseCompositionRestored: boolean;
+      harnessStartedCoarse: boolean;
+      cleanupErrors: string[];
     };
 
 /**
@@ -411,6 +482,23 @@ export async function runProvisionFlow(
   // on the alreadyDedicated path (the account pre-existed; we did not create
   // it) and for every pre-create abort.
   let accountCreated = false;
+
+  // S5-6 PREFLIGHT (fail-closed BEFORE any mutation): a fine-grained
+  // provision without the exclusive arming stage wired is a caller contract
+  // violation -- proceeding would end with a permanently parked agent (the
+  // parked install has no release path) or, worse, tempt a wiring layer into
+  // an un-parked install. Refuse up front; nothing has been changed.
+  if (ctx.fineGrainedDeclared === true && ops.exclusiveEgress === undefined) {
+    return {
+      kind: "aborted",
+      stage: "exclusive-egress-preflight",
+      reason:
+        "fine-grained (exclusive-egress) mode was declared but no exclusive-egress arming ops were " +
+        "wired; refusing to provision (the parked agent would have no release path). Nothing was changed.",
+      rolledBack: false,
+      rehomeAttempted: false,
+    };
+  }
 
   // FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): `alreadyDedicated`
   // used to short-circuit straight to "done" -- reporting "already a
@@ -583,7 +671,38 @@ export async function runProvisionFlow(
   // -- the post-install abort branches key their teardown on it (never on
   // `alreadyDedicated`, which does not track daemon presence).
   const daemonBootstrappedThisRun = install.bootstrappedThisRun;
-  ops.print("Harness daemon installed; agent now runs under the dedicated account.");
+
+  // S5-6 BARRIER ASSERTION (fail-closed): in fine-grained mode the install
+  // MUST have been the S5-5 PARKED form -- a bootstrapped (running) agent
+  // before the release barrier is the exact BLOCKER-2 escape the barrier
+  // exists to close. Tear the daemon back down and abort rather than proceed
+  // with an agent that is already running unconfined-by-the-gate.
+  if (ctx.fineGrainedDeclared === true && install.parked !== true) {
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun, false);
+    return {
+      kind: "aborted",
+      stage: "install-daemon",
+      reason: withDaemonTeardownNote(
+        "fine-grained (exclusive-egress) mode requires the PARKED harness install (the release " +
+          "barrier starts the agent only after the gate generation commits), but the install op " +
+          "did not report parked:true; aborting fail-closed rather than run the agent before the barrier.",
+        td.daemonTeardownError,
+        td.policyDaemonTeardownError,
+      ),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      accountCreated,
+    };
+  }
+  ops.print(
+    ctx.fineGrainedDeclared === true
+      ? "Harness daemon PARK-installed (disabled; the release barrier starts it after the gate commits)."
+      : "Harness daemon installed; agent now runs under the dedicated account.",
+  );
 
   // Step 6.5 (Bug B, the one-flow gap): ensure a reachable Castle Wall POLICY
   // daemon for the target fortress BEFORE arming. Arming with no policy daemon
@@ -984,7 +1103,39 @@ export async function runProvisionFlow(
     endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
     probe_rows: egressVerify.rows,
   });
-  return { kind: "armed", uid };
+
+  if (ctx.fineGrainedDeclared !== true) {
+    return { kind: "armed", uid };
+  }
+
+  // S5-6: the exclusive-egress arming stage. Runs ONLY after the coarse
+  // stages proved live (wall armed + as-uid egress verified) and only over a
+  // PARKED harness (asserted at install). Every failure inside the stage is
+  // handled by the stage itself (degrade-loud coarse fallback / parked), so
+  // the mapping here is 1:1 outcome translation -- no failure path can fall
+  // through to a green "armed".
+  ops.print("Coarse stages live; arming the exclusive-egress gate (fine-grained mode).");
+  const exclusive = await runExclusiveEgressArming({ agentUid: uid }, ops.exclusiveEgress!);
+  if (exclusive.kind === "exclusive-armed") {
+    return { kind: "armed-exclusive", uid, generationId: exclusive.generationId };
+  }
+  if (exclusive.kind === "exclusive-armed-repark-failed") {
+    return {
+      kind: "armed-exclusive-repark-failed",
+      uid,
+      generationId: exclusive.generationId,
+      reparkError: exclusive.reparkError,
+    };
+  }
+  return {
+    kind: "exclusive-egress-unarmed-coarse-active",
+    uid,
+    stage: exclusive.stage,
+    reason: exclusive.reason,
+    coarseCompositionRestored: exclusive.coarseCompositionRestored,
+    harnessStartedCoarse: exclusive.harnessStartedCoarse,
+    cleanupErrors: exclusive.cleanupErrors,
+  };
 }
 
 /**

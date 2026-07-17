@@ -60,9 +60,10 @@
  * ops: it renders the parked plist + wrapper, plans/executes the parked
  * install, and sequences re-arm -> gate-verify -> commit -> verify-committed
  * -> hold-file -> released-plist -> enable -> bootstrap -> verify-running ->
- * re-park -> verify-running. NO production caller routes through it yet
- * (S5-6 wires `runProvisionFlow` and the boot daemon; S5-7 wires unprotect),
- * so it arms nothing, parks no real host, and advances no capability claim.
+ * re-park -> verify-running. It is WIRED (S5-6): `runProvisionFlow`'s
+ * exclusive stage and the safe-mode boot daemon route through it via
+ * `egress-gate/arming-wiring.ts` (S5-7 still wires unprotect). It advances
+ * no capability claim: the Erik-present S5-DRILL is still owed.
  * The wrapper verifies the argv DIGEST, not binary content (a swapped binary
  * AT an allowed path is out of scope, per the design's argv-digest bound).
  * The `{Crashed:true}` KeepAlive semantics ("crash-restart within a

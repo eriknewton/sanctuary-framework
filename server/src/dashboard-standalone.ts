@@ -689,6 +689,35 @@ async function wireUnlockedDeps(args: {
   // 5. Initialize audit log (for reading historical entries)
   const auditLog = new AuditLog(storage, masterKey);
 
+  // Unified Protect Slice 5 S5-6: bind the exclusive-egress posture PRODUCER
+  // (the S5-P provider -- previously "no live producer exists"). Reads the
+  // real root-supervised surfaces per call (exclusive-routing marker, S5-1
+  // registry + dirty, S5-2 staging, gate runtime state, the oracle's signed
+  // freshness token verified against the pinned public key). The coarse-wall
+  // evidence probe is the SAME adjudicated-flow evidence surface the wrap
+  // banner and feature-health already trust (never daemon self-report). A
+  // provider throw is mapped to failedExclusiveEgressStatus by the
+  // dashboard's shared fail-closed resolver (caps green, never silently
+  // reads "no fine-grained agents"). darwin-only; elsewhere the provider
+  // stays detached and every surface behaves exactly as before.
+  if (process.platform === "darwin") {
+    const { createExclusiveEgressPostureProducer } = await import(
+      "./egress-gate/arming-wiring.js"
+    );
+    dashboard.setExclusiveEgressPostureProvider(
+      createExclusiveEgressPostureProducer({
+        fortressPath: config.storage_path,
+        coarseWallArmed: async (): Promise<boolean> => {
+          const { probeCastleWallEnforcementObserved } = await import("./wrap/cli.js");
+          // NO resolver passed here (the producer IS the resolver upstream);
+          // passing one would recurse. This reads the coarse enforcement
+          // evidence only.
+          return probeCastleWallEnforcementObserved(auditLog, config.storage_path);
+        },
+      }),
+    );
+  }
+
   // 5pre. Custody audit trail (mirrors the MCP server boot): record
   // envelope creation / migration / deferral - wrap types and install mode
   // only, never key material.

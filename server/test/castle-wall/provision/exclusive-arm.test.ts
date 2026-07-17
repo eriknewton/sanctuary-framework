@@ -1,0 +1,377 @@
+/**
+ * Unified Protect Slice 5 S5-6: the exclusive-egress arming stage, the
+ * repair verb sequence, and the boot release driver -- every abort/degrade
+ * branch driven host-free through injected ops, with fail-closed assertions
+ * (no path may leave the flow claiming green without the barrier's released
+ * outcome; every degrade is audited + distinct).
+ */
+
+import { describe, it, expect, vi } from "vitest";
+
+import {
+  runExclusiveEgressArming,
+  runEgressGateRepair,
+  runBootExclusiveEgressRelease,
+  EXCLUSIVE_EGRESS_ARMED_AUDIT_OP,
+  EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP,
+  EGRESS_GATE_REPAIR_AUDIT_OP,
+  EGRESS_GATE_REPAIR_OVERRIDE_AUDIT_OP,
+  EGRESS_GATE_REPAIR_REFUSED_AUDIT_OP,
+  type ExclusiveEgressArmOps,
+  type EgressGateRepairOps,
+} from "../../../src/castle-wall/provision/exclusive-arm.js";
+import type { ReleaseBarrierOutcome } from "../../../src/egress-gate/release-barrier.js";
+
+const AGENT_UID = 502;
+const COMMITTED = { generation_id: 7, agent_uid: AGENT_UID, gate_port: 49152 };
+const RELEASED: ReleaseBarrierOutcome = { kind: "released", generation_id: 7 };
+const PARKED: ReleaseBarrierOutcome = {
+  kind: "parked",
+  stage: "gate-verify",
+  reason: "gate verification failed: oracle not live",
+  holdFileRemoved: true,
+  jobDisabled: true,
+  cleanupErrors: [],
+};
+
+function armOps(overrides: Partial<ExclusiveEgressArmOps> = {}): ExclusiveEgressArmOps {
+  return {
+    bringUpGeneration: vi.fn(async () => ({ ...COMMITTED })),
+    runReleaseSequence: vi.fn(async () => RELEASED),
+    restoreCoarseComposition: vi.fn(async () => undefined),
+    startHarnessCoarse: vi.fn(async () => undefined),
+    audit: vi.fn(async () => undefined),
+    print: vi.fn(),
+    ...overrides,
+  };
+}
+
+describe("runExclusiveEgressArming", () => {
+  it("success: bring-up then release -> exclusive-armed, audited, no degrade ops touched", async () => {
+    const ops = armOps();
+    const outcome = await runExclusiveEgressArming({ agentUid: AGENT_UID }, ops);
+    expect(outcome).toEqual({ kind: "exclusive-armed", generationId: 7 });
+    expect(ops.runReleaseSequence).toHaveBeenCalledWith(COMMITTED);
+    expect(ops.restoreCoarseComposition).not.toHaveBeenCalled();
+    expect(ops.startHarnessCoarse).not.toHaveBeenCalled();
+    expect(ops.audit).toHaveBeenCalledWith(
+      EXCLUSIVE_EGRESS_ARMED_AUDIT_OP,
+      expect.objectContaining({ agent_uid: AGENT_UID, generation_id: 7 }),
+    );
+  });
+
+  it("released-repark-failed maps to the DISTINCT amber outcome (never plain armed)", async () => {
+    const ops = armOps({
+      runReleaseSequence: vi.fn(async () => ({
+        kind: "released-repark-failed" as const,
+        generation_id: 7,
+        reparkError: "launchctl disable exited 5",
+      })),
+    });
+    const outcome = await runExclusiveEgressArming({ agentUid: AGENT_UID }, ops);
+    expect(outcome).toEqual({
+      kind: "exclusive-armed-repark-failed",
+      generationId: 7,
+      reparkError: "launchctl disable exited 5",
+    });
+    // Never silently degraded and never plain-green.
+    expect(ops.restoreCoarseComposition).not.toHaveBeenCalled();
+  });
+
+  it("bring-up throw -> degrade-loud: coarse restore + coarse start + degraded audit, distinct outcome", async () => {
+    const ops = armOps({
+      bringUpGeneration: vi.fn(async () => {
+        throw new Error("pfctl -E exited 1");
+      }),
+    });
+    const outcome = await runExclusiveEgressArming({ agentUid: AGENT_UID }, ops);
+    expect(outcome).toMatchObject({
+      kind: "degraded-coarse-active",
+      stage: "bring-up",
+      coarseCompositionRestored: true,
+      harnessStartedCoarse: true,
+      cleanupErrors: [],
+    });
+    expect((outcome as { reason: string }).reason).toContain("pfctl -E exited 1");
+    expect(ops.restoreCoarseComposition).toHaveBeenCalledTimes(1);
+    expect(ops.startHarnessCoarse).toHaveBeenCalledTimes(1);
+    expect(ops.audit).toHaveBeenCalledWith(
+      EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP,
+      expect.objectContaining({
+        agent_uid: AGENT_UID,
+        stage: "bring-up",
+        coarse_composition_restored: true,
+        harness_started_coarse: true,
+      }),
+    );
+    // The release barrier must never run after a failed bring-up.
+    expect(ops.runReleaseSequence).not.toHaveBeenCalled();
+  });
+
+  it("cross-uid commit is refused (degrade), never released", async () => {
+    const ops = armOps({
+      bringUpGeneration: vi.fn(async () => ({ ...COMMITTED, agent_uid: 999 })),
+    });
+    const outcome = await runExclusiveEgressArming({ agentUid: AGENT_UID }, ops);
+    expect(outcome.kind).toBe("degraded-coarse-active");
+    expect(ops.runReleaseSequence).not.toHaveBeenCalled();
+  });
+
+  it("release parked -> degrade-loud, carrying the barrier's cleanup errors forward", async () => {
+    const ops = armOps({
+      runReleaseSequence: vi.fn(async () => ({
+        ...PARKED,
+        cleanupErrors: ["disable failed: launchctl timed out"],
+      })),
+    });
+    const outcome = await runExclusiveEgressArming({ agentUid: AGENT_UID }, ops);
+    expect(outcome).toMatchObject({
+      kind: "degraded-coarse-active",
+      stage: "release",
+      coarseCompositionRestored: true,
+      harnessStartedCoarse: true,
+    });
+    expect((outcome as { cleanupErrors: string[] }).cleanupErrors).toContain(
+      "disable failed: launchctl timed out",
+    );
+    expect((outcome as { reason: string }).reason).toContain("gate-verify");
+  });
+
+  it("release sequence THROW is fail-closed to degrade (never an unhandled escape)", async () => {
+    const ops = armOps({
+      runReleaseSequence: vi.fn(async () => {
+        throw new Error("launchctl vanished");
+      }),
+    });
+    const outcome = await runExclusiveEgressArming({ agentUid: AGENT_UID }, ops);
+    expect(outcome).toMatchObject({ kind: "degraded-coarse-active", stage: "release" });
+    expect((outcome as { reason: string }).reason).toContain("launchctl vanished");
+  });
+
+  it("degrade path: coarse restore FAILS -> harness is NOT started (agent stays parked), loudly reported", async () => {
+    const ops = armOps({
+      bringUpGeneration: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+      restoreCoarseComposition: vi.fn(async () => {
+        throw new Error("republish failed");
+      }),
+    });
+    const outcome = await runExclusiveEgressArming({ agentUid: AGENT_UID }, ops);
+    expect(outcome).toMatchObject({
+      kind: "degraded-coarse-active",
+      coarseCompositionRestored: false,
+      harnessStartedCoarse: false,
+    });
+    // FAIL-CLOSED: never start the agent over a manifest that may still be
+    // exclusive-scoped with no live gate.
+    expect(ops.startHarnessCoarse).not.toHaveBeenCalled();
+    expect((outcome as { cleanupErrors: string[] }).cleanupErrors.join(" ")).toContain(
+      "republish failed",
+    );
+    // The degraded audit still fires with the honest false flags.
+    expect(ops.audit).toHaveBeenCalledWith(
+      EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP,
+      expect.objectContaining({ coarse_composition_restored: false, harness_started_coarse: false }),
+    );
+  });
+
+  it("degrade path: coarse start FAILS -> harnessStartedCoarse false (agent parked), restore still true", async () => {
+    const ops = armOps({
+      bringUpGeneration: vi.fn(async () => {
+        throw new Error("boom");
+      }),
+      startHarnessCoarse: vi.fn(async () => {
+        throw new Error("bootstrap refused");
+      }),
+    });
+    const outcome = await runExclusiveEgressArming({ agentUid: AGENT_UID }, ops);
+    expect(outcome).toMatchObject({
+      kind: "degraded-coarse-active",
+      coarseCompositionRestored: true,
+      harnessStartedCoarse: false,
+    });
+    expect((outcome as { cleanupErrors: string[] }).cleanupErrors.join(" ")).toContain(
+      "bootstrap refused",
+    );
+  });
+});
+
+function repairOps(overrides: Partial<EgressGateRepairOps> = {}): EgressGateRepairOps {
+  return {
+    diffTransientPfRules: vi.fn(async () => ({ foreign: [] })),
+    recoverGeneration: vi.fn(async () => undefined),
+    bringUpGeneration: vi.fn(async () => ({ ...COMMITTED })),
+    runReleaseSequence: vi.fn(async () => RELEASED),
+    audit: vi.fn(async () => undefined),
+    print: vi.fn(),
+    ...overrides,
+  };
+}
+
+const REPAIR_CTX = { agentUid: AGENT_UID, isTty: true, overrideTransientPfRules: false };
+
+describe("runEgressGateRepair", () => {
+  it("clean path: diff clean -> recover -> bring-up -> release -> repaired + audited", async () => {
+    const ops = repairOps();
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toEqual({ kind: "repaired", generationId: 7 });
+    expect(ops.recoverGeneration).toHaveBeenCalledTimes(1);
+    expect(ops.audit).toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_AUDIT_OP,
+      expect.objectContaining({ agent_uid: AGENT_UID, generation_id: 7, override_used: false }),
+    );
+  });
+
+  it("MED-7: foreign transient rules with NO override -> REFUSES before any mutation, audited", async () => {
+    const ops = repairOps({
+      diffTransientPfRules: vi.fn(async () => ({ foreign: ["pass in quick on utun3 all"] })),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toEqual({
+      kind: "refused-foreign-transient-rules",
+      foreign: ["pass in quick on utun3 all"],
+    });
+    // NO mutation op may run on a refusal.
+    expect(ops.recoverGeneration).not.toHaveBeenCalled();
+    expect(ops.bringUpGeneration).not.toHaveBeenCalled();
+    expect(ops.runReleaseSequence).not.toHaveBeenCalled();
+    expect(ops.audit).toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_REFUSED_AUDIT_OP,
+      expect.objectContaining({ foreign_rules: ["pass in quick on utun3 all"] }),
+    );
+  });
+
+  it("MED-7 override: TTY + --override-transient-pf-rules proceeds, with the override AUDITED BEFORE any mutation", async () => {
+    const calls: string[] = [];
+    const ops = repairOps({
+      diffTransientPfRules: vi.fn(async () => ({ foreign: ["pass in quick on utun3 all"] })),
+      audit: vi.fn(async (op: string) => {
+        calls.push(`audit:${op}`);
+      }),
+      recoverGeneration: vi.fn(async () => {
+        calls.push("recover");
+      }),
+    });
+    const outcome = await runEgressGateRepair(
+      { ...REPAIR_CTX, overrideTransientPfRules: true },
+      ops,
+    );
+    expect(outcome).toMatchObject({ kind: "repaired", generationId: 7 });
+    const overrideIdx = calls.indexOf(`audit:${EGRESS_GATE_REPAIR_OVERRIDE_AUDIT_OP}`);
+    const recoverIdx = calls.indexOf("recover");
+    expect(overrideIdx).toBeGreaterThanOrEqual(0);
+    expect(recoverIdx).toBeGreaterThan(overrideIdx);
+    expect(ops.audit).toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_AUDIT_OP,
+      expect.objectContaining({ override_used: true }),
+    );
+  });
+
+  it("override WITHOUT a TTY is refused unconditionally (never proceeds, never diffs)", async () => {
+    const ops = repairOps({
+      diffTransientPfRules: vi.fn(async () => ({ foreign: [] })),
+    });
+    const outcome = await runEgressGateRepair(
+      { ...REPAIR_CTX, isTty: false, overrideTransientPfRules: true },
+      ops,
+    );
+    expect(outcome).toEqual({ kind: "refused-non-tty-override" });
+    expect(ops.diffTransientPfRules).not.toHaveBeenCalled();
+    expect(ops.recoverGeneration).not.toHaveBeenCalled();
+  });
+
+  it("a THROWING drift diff refuses (never hook-installs blind), audited", async () => {
+    const ops = repairOps({
+      diffTransientPfRules: vi.fn(async () => {
+        throw new Error("pfctl -sr exited 1");
+      }),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toMatchObject({ kind: "refused-diff-unavailable" });
+    expect((outcome as { reason: string }).reason).toContain("pfctl -sr exited 1");
+    expect(ops.recoverGeneration).not.toHaveBeenCalled();
+    expect(ops.audit).toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_REFUSED_AUDIT_OP,
+      expect.objectContaining({ reason: expect.stringContaining("pfctl -sr exited 1") }),
+    );
+  });
+
+  it("recover / bring-up / release failures each map to repair-failed at the right stage (agent stays parked)", async () => {
+    for (const [stage, overrides] of [
+      ["recover", { recoverGeneration: vi.fn(async () => Promise.reject(new Error("locked"))) }],
+      ["bring-up", { bringUpGeneration: vi.fn(async () => Promise.reject(new Error("bind failed"))) }],
+      ["release", { runReleaseSequence: vi.fn(async () => Promise.reject(new Error("launchctl"))) }],
+    ] as const) {
+      const ops = repairOps(overrides as Partial<EgressGateRepairOps>);
+      const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+      expect(outcome).toMatchObject({ kind: "repair-failed", stage });
+    }
+  });
+
+  it("a PARKED release outcome is repair-failed (never repaired without the barrier's released verdict)", async () => {
+    const ops = repairOps({ runReleaseSequence: vi.fn(async () => PARKED) });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toMatchObject({ kind: "repair-failed", stage: "release" });
+    expect((outcome as { reason: string }).reason).toContain("gate-verify");
+    // The success audit must not fire.
+    expect(ops.audit).not.toHaveBeenCalledWith(EGRESS_GATE_REPAIR_AUDIT_OP, expect.anything());
+  });
+
+  it("repaired-repark-failed is a DISTINCT non-clean outcome", async () => {
+    const ops = repairOps({
+      runReleaseSequence: vi.fn(async () => ({
+        kind: "released-repark-failed" as const,
+        generation_id: 7,
+        reparkError: "disable failed",
+      })),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toEqual({
+      kind: "repaired-repark-failed",
+      generationId: 7,
+      reparkError: "disable failed",
+    });
+  });
+});
+
+describe("runBootExclusiveEgressRelease", () => {
+  it("per-agent isolation: one parked/throwing agent never blocks or releases another; all audited; never throws", async () => {
+    const releaseAgent = vi.fn(async (uid: number): Promise<ReleaseBarrierOutcome> => {
+      if (uid === 501) return RELEASED;
+      if (uid === 502) return PARKED;
+      throw new Error("registry corrupt for 503");
+    });
+    const audit = vi.fn(async () => undefined);
+    const print = vi.fn();
+    const results = await runBootExclusiveEgressRelease(
+      [{ agent_uid: 501 }, { agent_uid: 502 }, { agent_uid: 503 }],
+      { releaseAgent, audit, print },
+    );
+    expect(results).toHaveLength(3);
+    expect(results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+    expect(results[1]!.outcome.kind).toBe("parked");
+    expect(results[2]!.outcome.kind).toBe("parked");
+    expect((results[2]!.outcome as { reason: string }).reason).toContain("registry corrupt");
+    expect(audit).toHaveBeenCalledTimes(3);
+    // The parked agents get the LOUD repair guidance.
+    const printed = print.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(printed).toContain("remains PARKED");
+    expect(printed).toContain("--repair-egress-gate");
+  });
+
+  it("repark-failed boot release is surfaced as a WARNING, never a clean green line", async () => {
+    const print = vi.fn();
+    const results = await runBootExclusiveEgressRelease([{ agent_uid: 501 }], {
+      releaseAgent: async () => ({
+        kind: "released-repark-failed" as const,
+        generation_id: 3,
+        reparkError: "disable failed",
+      }),
+      audit: async () => undefined,
+      print,
+    });
+    expect(results[0]!.outcome).toMatchObject({ kind: "released-repark-failed" });
+    expect(print.mock.calls.map((c) => String(c[0])).join("\n")).toContain("WARNING");
+  });
+});

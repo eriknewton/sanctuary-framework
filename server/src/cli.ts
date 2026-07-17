@@ -1201,6 +1201,52 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     return runObserveCommand({ argv: args.slice(1) });
   }
 
+  if (command === "egress-gate-daemon") {
+    // Unified Protect Slice 5 S5-6: the long-lived exclusive-egress gate
+    // daemon entrypoint. Spawned by launchd under the dedicated
+    // `sanctuary-gate-<agentId>` service uid (NEVER root, NEVER the agent);
+    // reads its gate-readable config copies from /var/db/sanctuary/
+    // gate-runtime, binds EXACTLY the committed gate port, and serves with
+    // the S5-3 TCB wiring (oracle liveness probe + fail-closed client auth +
+    // peer runner). A bind/config failure exits non-zero (the gate refuses
+    // to serve rather than squat another port; posture reads amber).
+    const uidArg = args.slice(1).find((a) => a.startsWith("--agent-uid="));
+    const agentUid = uidArg !== undefined ? Number(uidArg.slice("--agent-uid=".length)) : NaN;
+    if (!Number.isInteger(agentUid) || agentUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("egress-gate-daemon requires --agent-uid=<positive integer>");
+      return 2;
+    }
+    const { runEgressGateDaemon } = await import("./egress-gate/gate-daemon.js");
+    try {
+      const handle = await runEgressGateDaemon({ agentUid });
+      const stop = async (): Promise<void> => {
+        try {
+          await handle.close();
+        } finally {
+          process.exit(0);
+        }
+      };
+      process.on("SIGTERM", () => {
+        void stop();
+      });
+      process.on("SIGINT", () => {
+        void stop();
+      });
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `[egress-gate] serving uid ${agentUid} on 127.0.0.1:${handle.gate.port} (generation ${handle.generationId})`,
+      );
+      // The gate server holds the event loop open; this promise never
+      // resolves (shutdown exits via the signal handlers above).
+      return await new Promise<number>(() => undefined);
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`egress-gate daemon failed to start: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`

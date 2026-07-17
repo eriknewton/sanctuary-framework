@@ -64,10 +64,13 @@
  * pf/gate stack is a macOS subsystem. The Linux fine-grained layer is a
  * named future design, not this module.
  *
- * HONESTY BOUNDS. This is the composition LIBRARY only: no caller routes
- * through it yet (S5-6 wires `runProvisionFlow`), it signs nothing, arms
- * nothing, and advances no capability claim (code; Erik-present drill
- * pending). The static endpoint verify (`verifyProvisionedEgressStatically`)
+ * HONESTY BOUNDS. This is the composition LIBRARY; it is WIRED (S5-6): the
+ * signing daemon (`castle-wall/runtime/macos-daemon.ts`) routes every
+ * manifest compose through it whenever the exclusive-routing marker
+ * (`allowlist/routing-marker.ts`) is present, and the install/repair flows'
+ * degrade path routes the coarse-only fallback through it. It advances no
+ * capability claim (code; the Erik-present S5-DRILL is still owed). The
+ * static endpoint verify (`verifyProvisionedEgressStatically`)
  * is scope-blind by construction, so under exclusive routing it verifies the
  * DESTINATION set only; the as-principal reachability proof is the drill's
  * as-gate-uid / as-agent-uid legs, never this library.

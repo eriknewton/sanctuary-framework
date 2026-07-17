@@ -1,0 +1,1142 @@
+/**
+ * Root-supervisor PRODUCTION WIRING for the exclusive-egress stack (Unified
+ * Protect Slice 5 S5-6). This module maps the pure S5-1..S5-5 libraries onto
+ * real side effects for the three callers that now exist:
+ *
+ *   1. INSTALL (`sudo sanctuary protect --hermes --exclusive-egress`, via
+ *      `wrap/auto-provision.ts` -> `runProvisionFlow`'s exclusive stage):
+ *      {@link createInstallExclusiveEgressOps}.
+ *   2. REPAIR (`sudo sanctuary protect --repair-egress-gate`):
+ *      {@link createRepairExclusiveEgressOps} (+ the MED-7 drift guard).
+ *   3. BOOT (the root Castle Wall policy daemon):
+ *      {@link startExclusiveEgressBootSupervisor} -- re-arm -> gate-verify ->
+ *      recommit/hold per the S5-5 persistent-park contract, plus the ongoing
+ *      oracle freshness-token refresh loop the gate's per-CONNECT liveness
+ *      depends on.
+ *
+ * It also provides the S5-P posture PRODUCER
+ * ({@link createExclusiveEgressPostureProducer}) that the dashboard binds via
+ * `setExclusiveEgressPostureProvider` -- retiring S5-P's "no live producer"
+ * staging disclosure.
+ *
+ * NAMED DEVIATION (bind-first handoff): G1 binds the ephemeral port in THIS
+ * root process (`bindEphemeralGatePort`) so no pf/manifest rule ever names an
+ * unowned port; after G5 the placeholder is released and the gate DAEMON
+ * (running as the non-root gate uid) rebinds the committed port. The
+ * release-to-rebind window is closed FAIL-CLOSED, not prevented: the S5-5
+ * barrier's `verifyGate` re-verifies the listener's pid/uid (lsof) and the
+ * committed generation before any unpark, so a squatter on the port parks the
+ * agent (amber) rather than receiving agent traffic. The only party pf allows
+ * to CONNECT to the port is the agent uid, which is parked until the verify
+ * passes.
+ *
+ * HONESTY BOUNDS: everything here is the WIRED production path; the composed
+ * fused flow is S5-DRILL-owed (Erik-present, Mini1) and no capability claim
+ * advances until that drill captures evidence.
+ */
+
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import {
+  generateKeyPairSync,
+  createPrivateKey,
+  createPublicKey,
+  type KeyObject,
+} from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+import { PfAnchorRegistry, createFsRegistryStore } from "./anchor-registry.js";
+import {
+  GenerationCoordinator,
+  bindEphemeralGatePort,
+  createFsGenerationStagingStore,
+  evaluateGenerationMatch,
+  resolveCommittedGeneration,
+  type GateBinding,
+} from "./generation.js";
+import { createExecFilePfRunner, checkPfAnchorLiveness } from "./pf-anchor.js";
+import {
+  GateLivenessOracle,
+  createFsLivenessOracleOps,
+  GATE_LIVENESS_DIR,
+} from "./liveness-oracle.js";
+import { createFsGateCredentialAuthority } from "./gate-credential.js";
+import { deriveGateAccountName, planAndCreateGateAccount } from "./gate-account.js";
+import {
+  AGENT_HARNESS_DAEMON_LABEL,
+  agentHarnessDaemonStatus,
+  agentHarnessDaemonStableRunning,
+  installAgentHarnessDaemon,
+  planAgentHarnessDaemonInstall,
+  setAgentHarnessJobDisabled,
+  type HarnessDaemonOps,
+  type HarnessDaemonStatus,
+} from "./harness-daemon.js";
+import {
+  AGENT_HARNESS_HOLD_DIR,
+  holdFilePathForUid,
+  planParkedHarnessInstall,
+  renderHarnessReleaseHoldFile,
+  runReleaseBarrierSequence,
+  type CommittedGenerationIdentity,
+  type ReleaseBarrierOps,
+  type ReleaseBarrierOutcome,
+} from "./release-barrier.js";
+import {
+  EGRESS_GATE_RUNTIME_DIR,
+  GATE_ORACLE_PUBLIC_KEY_PATH,
+  egressGateDaemonLabel,
+  egressGateDaemonPlistPath,
+  egressGatePolicyConfigPath,
+  egressGateRulesConfigPath,
+  egressGateRuntimeStatePath,
+  parseEgressGateRuntimeState,
+  renderEgressGateDaemonPlist,
+  type EgressGateRuntimeState,
+} from "./gate-daemon.js";
+import { diffTransientPfRules } from "./drift-guard.js";
+import {
+  buildExclusiveEgressPosture,
+  summarizeExclusiveEgressStatus,
+  failedExclusiveEgressStatus,
+  type ExclusiveEgressStatus,
+} from "./posture.js";
+import { verifyLivenessToken } from "./liveness-oracle.js";
+import {
+  exclusiveRoutingMarkerPath,
+  loadExclusiveRoutingMarker,
+  renderExclusiveRoutingMarker,
+} from "../castle-wall/allowlist/routing-marker.js";
+import {
+  EXCLUSIVE_EGRESS_GATE_FILENAME,
+} from "../castle-wall/allowlist/gate-derivation.js";
+import { composeExclusiveRoutingRules } from "../castle-wall/allowlist/exclusive-routing.js";
+import type {
+  ExclusiveEgressArmOps,
+  ExclusiveGenerationIdentity,
+} from "../castle-wall/provision/exclusive-arm.js";
+import {
+  runBootExclusiveEgressRelease,
+  type BootReleaseResult,
+} from "../castle-wall/provision/exclusive-arm.js";
+import type { ProvisionLockOps } from "../castle-wall/provision/lockfile.js";
+
+const execFileAsync = promisify(execFile);
+
+/** Root-only private half of the supervisor oracle key. */
+export const GATE_ORACLE_PRIVATE_KEY_PATH = `${GATE_LIVENESS_DIR}/supervisor-oracle-key.pem`;
+
+const LAUNCHCTL_TIMEOUT_MS = 15_000;
+const GATE_RUNTIME_WAIT_BUDGET_MS = 15_000;
+const GATE_RUNTIME_WAIT_INTERVAL_MS = 250;
+
+/** Real O_EXCL lock ops (the shipped provision-lock discipline). */
+export function fsLockOps(): ProvisionLockOps {
+  return {
+    async acquire(lockPath: string): Promise<void> {
+      const { open } = await import("node:fs/promises");
+      const handle = await open(lockPath, "wx");
+      await handle.close();
+    },
+    async release(lockPath: string): Promise<void> {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(lockPath).catch((err) => {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      });
+    },
+  };
+}
+
+/** The production S5-1 registry (fs store + O_EXCL lock + execFile pfctl). */
+export function createProductionAnchorRegistry(): PfAnchorRegistry {
+  return new PfAnchorRegistry({
+    store: createFsRegistryStore(),
+    lock: fsLockOps(),
+    runner: createExecFilePfRunner(),
+  });
+}
+
+/**
+ * Load-or-create the supervisor oracle Ed25519 keypair: private half
+ * root-only 0600, public half 0644 at {@link GATE_ORACLE_PUBLIC_KEY_PATH}
+ * (the gate daemon pins it). Idempotent.
+ */
+export async function ensureSupervisorOracleKeys(): Promise<{
+  privateKey: KeyObject;
+  publicKey: KeyObject;
+}> {
+  await mkdir(GATE_LIVENESS_DIR, { recursive: true, mode: 0o755 }).catch(() => undefined);
+  try {
+    const pem = await readFile(GATE_ORACLE_PRIVATE_KEY_PATH, "utf8");
+    const privateKey = createPrivateKey(pem);
+    const publicKey = createPublicKey({ key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(), format: "pem" });
+    // Re-assert the public half (a missing/garbled pub file must self-heal:
+    // the gate pins THIS file).
+    await writeFile(
+      GATE_ORACLE_PUBLIC_KEY_PATH,
+      publicKey.export({ type: "spki", format: "pem" }),
+      { mode: 0o644 },
+    );
+    return { privateKey, publicKey };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+  }
+  const pair = generateKeyPairSync("ed25519");
+  await writeFile(
+    GATE_ORACLE_PRIVATE_KEY_PATH,
+    pair.privateKey.export({ type: "pkcs8", format: "pem" }),
+    { mode: 0o600 },
+  );
+  await writeFile(
+    GATE_ORACLE_PUBLIC_KEY_PATH,
+    pair.publicKey.export({ type: "spki", format: "pem" }),
+    { mode: 0o644 },
+  );
+  return { privateKey: pair.privateKey, publicKey: pair.publicKey };
+}
+
+/** Build the production oracle over the pfctl probe (root-side). */
+export function createProductionOracle(privateKey: KeyObject, gateUid: number): GateLivenessOracle {
+  const runner = createExecFilePfRunner();
+  return new GateLivenessOracle(
+    privateKey,
+    createFsLivenessOracleOps({
+      gateUid,
+      probe: ({ agentUid, gatePort }) =>
+        checkPfAnchorLiveness(runner, { agent_uid: agentUid, gate_port: gatePort }),
+    }),
+  );
+}
+
+/** lsof-backed port-owner check: the listener on `port` must be pid+uid-expected. */
+export async function verifyLoopbackPortOwner(input: {
+  port: number;
+  expectedPid: number;
+  expectedUid?: number;
+  execFileFn?: typeof execFileAsync;
+}): Promise<boolean> {
+  const run = input.execFileFn ?? execFileAsync;
+  try {
+    const { stdout } = await run("lsof", [
+      "-nP",
+      `-iTCP:${input.port}`,
+      "-sTCP:LISTEN",
+      "-Fpu",
+    ]);
+    let pid: number | undefined;
+    let uid: number | undefined;
+    for (const line of stdout.split("\n")) {
+      if (line.startsWith("p")) pid = Number(line.slice(1));
+      if (line.startsWith("u")) uid = Number(line.slice(1));
+      if (pid !== undefined && uid !== undefined) break;
+    }
+    if (pid !== input.expectedPid) return false;
+    if (input.expectedUid !== undefined && uid !== input.expectedUid) return false;
+    return true;
+  } catch {
+    // No listener / lsof failure: not owner-verified (fail-closed).
+    return false;
+  }
+}
+
+async function runLaunchctl(args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync("launchctl", [...args], {
+      timeout: LAUNCHCTL_TIMEOUT_MS,
+    });
+    return { code: 0, stdout, stderr };
+  } catch (err) {
+    const e = err as { code?: number; stdout?: string; stderr?: string; message?: string };
+    return {
+      code: typeof e.code === "number" ? e.code : 1,
+      stdout: e.stdout ?? "",
+      stderr: e.stderr ?? (e.message ?? ""),
+    };
+  }
+}
+
+function realHarnessOps(): HarnessDaemonOps {
+  return {
+    async writeFile(path, content, mode): Promise<void> {
+      await writeFile(path, content, { mode });
+    },
+    async removeFile(path): Promise<void> {
+      await rm(path, { force: true });
+    },
+    runLaunchctl,
+  };
+}
+
+async function atomicRootWrite(path: string, content: string, mode: number): Promise<void> {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  await writeFile(tmp, content, { mode });
+  try {
+    await rename(tmp, path);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
+}
+
+/** Everything the install/repair wiring needs to know about one agent. */
+export interface ExclusiveEgressWiringInput {
+  agentId: string;
+  agentUid: number;
+  agentAccount: string;
+  /** The operator fortress the wall + manifest belong to. */
+  fortressPath: string;
+  /** The REAL harness argv (the S5-5 wrapper digest source). */
+  harnessArgv: string[];
+  /** Harness daemon log dir (agent-writable). */
+  harnessLogDir: string;
+  /** The confined agent's template identity (e.g. "hermes"), for the S5-4 marker. */
+  agentTemplate: string;
+  /** The sanctuary CLI argv prefix used to spawn the gate daemon entrypoint. */
+  gateDaemonArgvPrefix: string[];
+  /** Operator/console uids the gate account must never collide with. */
+  excludeUids: number[];
+  /** Uid ceiling for the gate service account (the shipped arm-time ceiling). */
+  gateAccountCeiling: number;
+  /** The gate service account's home directory (a dir it owns; never the agent's). */
+  gateHomeDirectory: string;
+  /** Trigger the policy daemon's manifest reload (the shipped pinned-signer path). */
+  reloadPolicy(): Promise<{ ok: boolean; error?: string }>;
+  /** Republish the provisioned endpoint rules with the given routing scope. */
+  publishProvisionedRules(routing: { mode: "coarse" } | { mode: "exclusive"; gate_uid: number }): Promise<
+    { ok: true; ruleIds: string[] } | { ok: false; error: string }
+  >;
+  /** Best-effort audit (distinct local ops; never throws). */
+  audit(operation: string, details: Record<string, unknown>): Promise<void>;
+  print(line: string): void;
+  /** Account-provision ops (the shipped sysadminctl/dscl real ops). */
+  accountOps: Parameters<typeof planAndCreateGateAccount>[1];
+}
+
+interface BringUpState {
+  gateUid: number;
+  gateAccountName: string;
+}
+
+/**
+ * The full production bring-up: gate account -> generation G1-G5 (placeholder
+ * bind, lsof owner check, registry pf arm, gate-readable config publish +
+ * gate policy + exclusive marker + manifest reload, commit) -> credential
+ * mint -> gate daemon install + bootstrap -> runtime-state + owner verify ->
+ * first oracle refresh. Throws on ANY failure (the generation machine's own
+ * recovery has already tombstoned the pf pass by then).
+ */
+async function productionBringUp(
+  input: ExclusiveEgressWiringInput,
+  state: BringUpState,
+  oracle: GateLivenessOracle,
+): Promise<ExclusiveGenerationIdentity> {
+  const registry = createProductionAnchorRegistry();
+  let lastBinding: GateBinding | null = null;
+
+  const coordinator = new GenerationCoordinator({
+    bind: async (request) => {
+      const binding = await bindEphemeralGatePort();
+      lastBinding = binding;
+      void request;
+      return binding;
+    },
+    verifyOwner: async ({ port, pid }) =>
+      verifyLoopbackPortOwner({ port, expectedPid: pid }),
+    registry: {
+      armEntry: async (entry) => {
+        await registry.addOrUpdate({
+          agent_uid: entry.agent_uid,
+          gate_port: entry.gate_port,
+          fortress_path: entry.fortress_path,
+          generation_id: entry.generation_id,
+        });
+      },
+      tombstone: async (agentUid, fallback) => {
+        await registry.tombstone(agentUid, fallback);
+      },
+      readEntry: async (agentUid) => {
+        const { entries } = await registry.list();
+        return entries.find((e) => e.agent_uid === agentUid) ?? null;
+      },
+    },
+    publishManifest: async (gen) => {
+      // (a) Re-scope the provisioned endpoint rules to the GATE principal
+      // (the S5-4 routing model; scope moves off the agent).
+      const published = await input.publishProvisionedRules({
+        mode: "exclusive",
+        gate_uid: state.gateUid,
+      });
+      if (!published.ok) {
+        throw new Error(`exclusive re-scope publish failed: ${published.error}`);
+      }
+      // (b) The generation-bearing gate policy file (G4 contract: the policy
+      // carries port + generation) into the fortress for the signing daemon...
+      const policyDoc = JSON.stringify(
+        { agent_uid: gen.agent_uid, gate_port: gen.gate_port, generation_id: gen.generation_id },
+        null,
+        2,
+      );
+      const fortressPolicyPath = join(
+        input.fortressPath,
+        "policy",
+        "egress",
+        EXCLUSIVE_EGRESS_GATE_FILENAME,
+      );
+      await mkdir(join(input.fortressPath, "policy", "egress"), { recursive: true }).catch(
+        () => undefined,
+      );
+      await atomicRootWrite(fortressPolicyPath, policyDoc, 0o600);
+      // (c) ...and the gate-readable runtime copies (policy + rules) for the
+      // non-root gate daemon, which cannot read the operator fortress.
+      await mkdir(EGRESS_GATE_RUNTIME_DIR, { recursive: true, mode: 0o755 }).catch(() => undefined);
+      await atomicRootWrite(egressGatePolicyConfigPath(gen.agent_uid), policyDoc, 0o644);
+      const { readEgressRulesFromDisk } = await import("../castle-wall/provision/egress.js");
+      const rules = await readEgressRulesFromDisk(input.fortressPath);
+      await atomicRootWrite(egressGateRulesConfigPath(gen.agent_uid), JSON.stringify(rules), 0o644);
+      // (d) The exclusive-routing marker: from here the signing daemon
+      // composes through the S5-4 exclusive composition (compose-time
+      // assertion = fail-closed chokepoint on every reload).
+      await atomicRootWrite(
+        exclusiveRoutingMarkerPath(input.fortressPath),
+        renderExclusiveRoutingMarker({
+          agent_uid: gen.agent_uid,
+          gate_uid: state.gateUid,
+          agent_id: input.agentId,
+          agent_template: input.agentTemplate,
+        }),
+        0o600,
+      );
+      // (e) Reload: the daemon re-composes (exclusive assertion runs), re-signs,
+      // broadcasts. A reload failure fails the G4 transition (recovery
+      // tombstones the staged pass; never a half-published generation).
+      const reload = await input.reloadPolicy();
+      if (!reload.ok) {
+        throw new Error(`policy reload after exclusive publish failed: ${reload.error ?? "unknown"}`);
+      }
+    },
+    staging: createFsGenerationStagingStore(),
+    lock: fsLockOps(),
+  });
+
+  const committed = await coordinator.bringUp({
+    agent_uid: input.agentUid,
+    fortress_path: input.fortressPath,
+  });
+
+  // Mint the generation-bound bearer credential BEFORE the gate daemon comes
+  // up (accept-state precedes any CONNECT) and BEFORE unpark (design M5).
+  const credAuthority = createFsGateCredentialAuthority({ gateUid: state.gateUid });
+  await credAuthority.mint({ agentUid: input.agentUid, generationId: committed.generation_id });
+
+  // Hand the committed port from the root placeholder to the gate daemon:
+  // release, install the gate daemon plist, bootstrap, then wait for the
+  // runtime state naming EXACTLY this {port, generation} and verify the
+  // listener's owner (fail-closed: any mismatch throws; the S5-5 barrier will
+  // ALSO re-verify before unpark).
+  if (lastBinding !== null) {
+    await (lastBinding as GateBinding).release();
+  }
+  const label = egressGateDaemonLabel(input.agentUid);
+  const plistPath = egressGateDaemonPlistPath(input.agentUid);
+  await writeFile(
+    plistPath,
+    renderEgressGateDaemonPlist({
+      agentUid: input.agentUid,
+      gateAccount: state.gateAccountName,
+      programArguments: [
+        ...input.gateDaemonArgvPrefix,
+        "castle-wall",
+        "egress-gate-daemon",
+        `--agent-uid=${input.agentUid}`,
+      ],
+      fortressPath: input.fortressPath,
+      logDir: input.harnessLogDir,
+    }),
+    { mode: 0o644 },
+  );
+  const bootstrap = await runLaunchctl(["bootstrap", "system", plistPath]);
+  if (bootstrap.code !== 0 && !/already bootstrapped|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)) {
+    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
+  }
+  const kick = await runLaunchctl(["kickstart", `system/${label}`]);
+  if (kick.code !== 0) {
+    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
+  }
+  const runtime = await waitForGateRuntime(input.agentUid, committed.generation_id, committed.gate_port);
+  const ownerOk = await verifyLoopbackPortOwner({
+    port: committed.gate_port,
+    expectedPid: runtime.pid,
+    expectedUid: state.gateUid,
+  });
+  if (!ownerOk) {
+    throw new Error(
+      `gate daemon owner check failed: the listener on port ${committed.gate_port} is not the gate ` +
+        `daemon pid ${runtime.pid} under uid ${state.gateUid} (refusing to proceed toward release)`,
+    );
+  }
+  // First oracle refresh: publish the signed freshness token so the gate's
+  // per-CONNECT verify has a live-bound verdict from the first CONNECT.
+  const token = await oracle.refresh({
+    agentUid: input.agentUid,
+    gatePort: committed.gate_port,
+    generationId: committed.generation_id,
+  });
+  if (token === null) {
+    throw new Error("first oracle refresh reported the pf anchor NOT live; refusing to proceed toward release");
+  }
+  return {
+    generation_id: committed.generation_id,
+    agent_uid: committed.agent_uid,
+    gate_port: committed.gate_port,
+  };
+}
+
+async function waitForGateRuntime(
+  agentUid: number,
+  generationId: number,
+  gatePort: number,
+): Promise<EgressGateRuntimeState> {
+  const deadline = Date.now() + GATE_RUNTIME_WAIT_BUDGET_MS;
+  const path = egressGateRuntimeStatePath(agentUid);
+  let lastError = "runtime state never appeared";
+  while (Date.now() < deadline) {
+    try {
+      const text = await readFile(path, "utf8");
+      const state = parseEgressGateRuntimeState(text, path);
+      if (state.generation_id === generationId && state.gate_port === gatePort && state.agent_uid === agentUid) {
+        return state;
+      }
+      lastError = `runtime state names generation ${state.generation_id} port ${state.gate_port}, expected ${generationId}/${gatePort}`;
+    } catch (err) {
+      lastError = (err as Error).message;
+    }
+    await new Promise((r) => setTimeout(r, GATE_RUNTIME_WAIT_INTERVAL_MS));
+  }
+  throw new Error(`gate daemon did not publish a matching runtime state within ${GATE_RUNTIME_WAIT_BUDGET_MS}ms: ${lastError}`);
+}
+
+/**
+ * The production S5-5 barrier ops for one agent. `rearm` distinguishes the
+ * install path (pf armed at G3: no-op ok) from the boot path (re-assert the
+ * registry union).
+ */
+export function createProductionReleaseBarrierOps(input: {
+  agentUid: number;
+  agentAccount: string;
+  harnessArgv: string[];
+  fortressPath: string;
+  harnessLogDir: string;
+  gateUid: number;
+  oracle: GateLivenessOracle;
+  rearm: "install-noop" | "boot-rearm";
+}): ReleaseBarrierOps {
+  const registry = createProductionAnchorRegistry();
+  const staging = createFsGenerationStagingStore();
+  const harnessOps = realHarnessOps();
+  const holdPath = holdFilePathForUid(input.agentUid);
+
+  async function writePlist(expectedGenerationId: number): Promise<void> {
+    const plan = planParkedHarnessInstall({
+      agentAccount: input.agentAccount,
+      agentUid: input.agentUid,
+      harnessArgv: input.harnessArgv,
+      fortressPath: input.fortressPath,
+      logDir: input.harnessLogDir,
+      expectedGenerationId,
+    });
+    await writeFile(plan.plistPath, plan.plistContent, { mode: 0o644 });
+  }
+
+  async function readCommitted(): Promise<CommittedGenerationIdentity | null> {
+    const { entries, dirty } = await registry.list();
+    const entry = entries.find((e) => e.agent_uid === input.agentUid) ?? null;
+    const stagingRecord = await staging.load(input.agentUid);
+    const committed = resolveCommittedGeneration({
+      entry,
+      stagingRecordPresent: stagingRecord !== null,
+      registryDirty: dirty,
+    });
+    if (committed.committedGenerationId === undefined || entry === null) return null;
+    return { generation_id: committed.committedGenerationId, agent_uid: input.agentUid };
+  }
+
+  return {
+    async disableJob(): Promise<void> {
+      const r = await runLaunchctl(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      if (r.code !== 0) throw new Error(`launchctl disable exited ${r.code}: ${r.stderr.trim()}`);
+    },
+    async enableJob(): Promise<void> {
+      const r = await runLaunchctl(["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      if (r.code !== 0) throw new Error(`launchctl enable exited ${r.code}: ${r.stderr.trim()}`);
+    },
+    async bootstrapJob(): Promise<void> {
+      const plistPath = `/Library/LaunchDaemons/${AGENT_HARNESS_DAEMON_LABEL}.plist`;
+      const b = await runLaunchctl(["bootstrap", "system", plistPath]);
+      if (b.code !== 0 && !/already bootstrapped/i.test(b.stderr)) {
+        throw new Error(`launchctl bootstrap exited ${b.code}: ${b.stderr.trim()}`);
+      }
+      const k = await runLaunchctl(["kickstart", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      if (k.code !== 0) throw new Error(`launchctl kickstart exited ${k.code}: ${k.stderr.trim()}`);
+    },
+    async bootoutJob(): Promise<void> {
+      const r = await runLaunchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      if (r.code !== 0 && !/No such process|Could not find/i.test(r.stderr)) {
+        throw new Error(`launchctl bootout exited ${r.code}: ${r.stderr.trim()}`);
+      }
+    },
+    async removeHoldFile(): Promise<void> {
+      await rm(holdPath, { force: true });
+    },
+    async writeHoldFile(record): Promise<void> {
+      await mkdir(AGENT_HARNESS_HOLD_DIR, { recursive: true, mode: 0o755 }).catch(() => undefined);
+      await atomicRootWrite(holdPath, renderHarnessReleaseHoldFile(record), 0o644);
+    },
+    async bootSessionUuid(): Promise<string> {
+      const { stdout } = await execFileAsync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"]);
+      const uuid = stdout.trim();
+      if (uuid.length === 0) throw new Error("kern.bootsessionuuid is empty");
+      return uuid;
+    },
+    async rearmAnchor(): Promise<{ ok: true } | { ok: false; reason: string }> {
+      if (input.rearm === "install-noop") return { ok: true };
+      try {
+        const { entries } = await registry.list();
+        const entry = entries.find((e) => e.agent_uid === input.agentUid);
+        if (entry === undefined) {
+          return { ok: false, reason: `no registry entry for uid ${input.agentUid}` };
+        }
+        // Re-assert the committed union (idempotent add/update re-renders +
+        // re-loads + re-verifies per-uid liveness through the locked registry).
+        await registry.addOrUpdate(entry);
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, reason: (err as Error).message };
+      }
+    },
+    async verifyGate(): Promise<
+      { ok: true; observed: CommittedGenerationIdentity } | { ok: false; reasons: string[] }
+    > {
+      const reasons: string[] = [];
+      const committed = await readCommitted();
+      if (committed === null) {
+        return { ok: false, reasons: ["no committed generation (registry empty/dirty/staging in flight)"] };
+      }
+      const { entries, dirty } = await registry.list();
+      const entry = entries.find((e) => e.agent_uid === input.agentUid)!;
+      // Gate runtime + owner.
+      let runtime: EgressGateRuntimeState;
+      try {
+        const path = egressGateRuntimeStatePath(input.agentUid);
+        runtime = parseEgressGateRuntimeState(await readFile(path, "utf8"), path);
+      } catch (err) {
+        return { ok: false, reasons: [`gate runtime state unreadable: ${(err as Error).message}`] };
+      }
+      const match = evaluateGenerationMatch({
+        committedGenerationId: committed.generation_id,
+        committedPort: entry.gate_port,
+        pfPassPort: entry.tombstone === true ? undefined : entry.gate_port,
+        manifestPort: runtime.gate_port,
+        manifestGenerationId: runtime.generation_id,
+      });
+      if (!match.serve) reasons.push(...match.reasons);
+      if (dirty) reasons.push("registry is dirty (needs repair)");
+      const ownerOk = await verifyLoopbackPortOwner({
+        port: entry.gate_port,
+        expectedPid: runtime.pid,
+        expectedUid: input.gateUid,
+      });
+      if (!ownerOk) {
+        reasons.push(`gate port ${entry.gate_port} listener is not the gate daemon (owner check failed)`);
+      }
+      // Fresh oracle probe: the pf union must be LIVE right now (and this
+      // publishes/refreshes the signed token the gate verifies per-CONNECT).
+      try {
+        const token = await input.oracle.refresh({
+          agentUid: input.agentUid,
+          gatePort: entry.gate_port,
+          generationId: committed.generation_id,
+        });
+        if (token === null) reasons.push("pf anchor liveness probe reported NOT live");
+      } catch (err) {
+        reasons.push(`oracle refresh failed: ${(err as Error).message}`);
+      }
+      if (reasons.length > 0) return { ok: false, reasons };
+      return { ok: true, observed: committed };
+    },
+    async commitGeneration(): Promise<CommittedGenerationIdentity> {
+      // Install path: G5 already committed by the coordinator strictly before
+      // this sequence; boot path: the committed generation persisted. Either
+      // way the commit this release binds to is the REGISTRY's committed
+      // generation, resolved through the S5-2 resolver (staging/dirty aware).
+      const committed = await readCommitted();
+      if (committed === null) {
+        throw new Error(`no committed generation for uid ${input.agentUid}; refusing to release`);
+      }
+      return committed;
+    },
+    async writeReleasedPlist(committed): Promise<void> {
+      await writePlist(committed.generation_id);
+    },
+    async restoreParkedPlist(): Promise<void> {
+      await writePlist(0);
+    },
+    async harnessStatus(): Promise<HarnessDaemonStatus> {
+      const status = await agentHarnessDaemonStatus(harnessOps);
+      if (!status.known || !status.running) return status;
+      const stable = await agentHarnessDaemonStableRunning(harnessOps);
+      return { ...status, running: stable };
+    },
+  };
+}
+
+/**
+ * Build the install-time {@link ExclusiveEgressArmOps} (the object
+ * `runProvisionFlow`'s exclusive stage consumes). Provisions the gate service
+ * account on first use inside `bringUpGeneration` (fail-closed: no account,
+ * no generation).
+ */
+export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInput): ExclusiveEgressArmOps {
+  let state: BringUpState | null = null;
+  let oracle: GateLivenessOracle | null = null;
+
+  async function ensureState(): Promise<{ state: BringUpState; oracle: GateLivenessOracle }> {
+    if (state !== null && oracle !== null) return { state, oracle };
+    const account = await planAndCreateGateAccount(
+      {
+        agentId: input.agentId,
+        agentUid: input.agentUid,
+        excludeUids: input.excludeUids,
+        ceiling: input.gateAccountCeiling,
+        homeDirectory: input.gateHomeDirectory,
+      },
+      input.accountOps,
+    );
+    const keys = await ensureSupervisorOracleKeys();
+    state = { gateUid: account.uid, gateAccountName: account.accountName };
+    oracle = createProductionOracle(keys.privateKey, account.uid);
+    return { state, oracle };
+  }
+
+  return {
+    async bringUpGeneration(): Promise<ExclusiveGenerationIdentity> {
+      const { state: s, oracle: o } = await ensureState();
+      return productionBringUp(input, s, o);
+    },
+    async runReleaseSequence(committed): Promise<ReleaseBarrierOutcome> {
+      const { state: s, oracle: o } = await ensureState();
+      return runReleaseBarrierSequence(
+        {
+          agentUid: input.agentUid,
+          harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
+          harnessArgv: input.harnessArgv,
+        },
+        createProductionReleaseBarrierOps({
+          agentUid: committed.agent_uid,
+          agentAccount: input.agentAccount,
+          harnessArgv: input.harnessArgv,
+          fortressPath: input.fortressPath,
+          harnessLogDir: input.harnessLogDir,
+          gateUid: s.gateUid,
+          oracle: o,
+          rearm: "install-noop",
+        }),
+      );
+    },
+    async restoreCoarseComposition(reason): Promise<void> {
+      await restoreCoarseCompositionProduction(input, reason);
+    },
+    async startHarnessCoarse(): Promise<void> {
+      // The degrade path re-renders the PLAIN (RunAtLoad/KeepAlive) plist and
+      // brings the harness up through the shipped coarse install path
+      // (bootstrap + stable-pid verify), after re-enabling the job the park
+      // disabled.
+      const harnessOps = realHarnessOps();
+      const plan = planAgentHarnessDaemonInstall({
+        agentAccount: input.agentAccount,
+        programArguments: input.harnessArgv,
+        fortressPath: input.fortressPath,
+        logDir: input.harnessLogDir,
+      });
+      await setAgentHarnessJobDisabled(harnessOps, false);
+      await installAgentHarnessDaemon(plan, harnessOps);
+    },
+    audit: input.audit,
+    print: input.print,
+  };
+}
+
+/**
+ * DEGRADE-LOUD manifest restore (the S5-4 coarse-only path): remove the
+ * exclusive marker + gate policy, republish the endpoint rules agent-scoped,
+ * verify the coarse composition residue-free + emit the REQUIRED
+ * `exclusive_routing_coarse_fallback` audit, tear the gate surfaces down
+ * (registry entry, daemon, credential, oracle token), reload. Throws on
+ * failure (the caller keeps the agent parked, loudly).
+ */
+export async function restoreCoarseCompositionProduction(
+  input: ExclusiveEgressWiringInput,
+  reason: string,
+): Promise<void> {
+  // 1. Marker + gate policy OFF first: from the next compose the daemon is in
+  // plain coarse mode (gate-scoped rules briefly compose coarse -- the agent
+  // has no direct allows in that window, which is the safe direction).
+  await rm(exclusiveRoutingMarkerPath(input.fortressPath), { force: true });
+  await rm(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME), {
+    force: true,
+  });
+  // 2. Registry entry off (un-confine the agent's loopback from the dead gate
+  // port; flush only fires when the last uid leaves) + token/credential off.
+  const registry = createProductionAnchorRegistry();
+  const { entries } = await registry.list();
+  if (entries.some((e) => e.agent_uid === input.agentUid)) {
+    await registry.remove(input.agentUid);
+  }
+  const keys = await ensureSupervisorOracleKeys();
+  const gateAccountName = deriveGateAccountName(input.agentId);
+  // Best-effort uid resolution for teardown surfaces that need the gate uid;
+  // a missing account means nothing to tear down on those surfaces.
+  let gateUid: number | undefined;
+  try {
+    const found = await input.accountOps.lookupAccountUid(gateAccountName);
+    gateUid = found ?? undefined;
+  } catch {
+    gateUid = undefined;
+  }
+  if (gateUid !== undefined) {
+    const oracle = createProductionOracle(keys.privateKey, gateUid);
+    await oracle.invalidate(input.agentUid);
+    await createFsGateCredentialAuthority({ gateUid }).revoke(input.agentUid);
+  }
+  // 3. Gate daemon down + config copies off.
+  await runLaunchctl(["bootout", `system/${egressGateDaemonLabel(input.agentUid)}`]).catch(() => undefined);
+  await rm(egressGateDaemonPlistPath(input.agentUid), { force: true });
+  await rm(egressGatePolicyConfigPath(input.agentUid), { force: true });
+  await rm(egressGateRulesConfigPath(input.agentUid), { force: true });
+  await rm(egressGateRuntimeStatePath(input.agentUid), { force: true });
+  // 4. Republish the endpoint rules AGENT-scoped (coarse) + reload.
+  const published = await input.publishProvisionedRules({ mode: "coarse" });
+  if (!published.ok) {
+    throw new Error(`coarse republish failed: ${published.error}`);
+  }
+  // 5. Verify + AUDIT through the S5-4 coarse-only composition (residue check
+  // + the REQUIRED exclusive_routing_coarse_fallback audit record). The
+  // compose here is a verification pass over the read-back rules -- the
+  // daemon's own signed compose is the enforced one; both consume the same
+  // persisted rule files.
+  const { readEgressRulesFromDisk } = await import("../castle-wall/provision/egress.js");
+  const { collectSystemResolvers } = await import("../castle-wall/runtime/system-resolvers.js");
+  const rules = await readEgressRulesFromDisk(input.fortressPath);
+  await composeExclusiveRoutingRules({
+    base: {
+      operatorRules: rules,
+      resolvers: await collectSystemResolvers(),
+      createdAt: new Date().toISOString(),
+    },
+    routing: {
+      mode: "coarse-only",
+      agent_uid: input.agentUid,
+      reason,
+      audit: async (record) => {
+        await input.audit(record.operation, {
+          reason: record.reason,
+          agent_uid: record.agent_uid,
+          coarse_provisioned_rule_ids: record.coarse_provisioned_rule_ids,
+        });
+      },
+    },
+  });
+}
+
+/** Repair ops (`--repair-egress-gate`): drift guard + recover + bring-up + release. */
+export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput): {
+  diffTransientPfRules(): Promise<{ foreign: string[] }>;
+  recoverGeneration(): Promise<void>;
+  bringUpGeneration(): Promise<ExclusiveGenerationIdentity>;
+  runReleaseSequence(committed: ExclusiveGenerationIdentity): Promise<ReleaseBarrierOutcome>;
+  audit(operation: string, details: Record<string, unknown>): Promise<void>;
+  print(line: string): void;
+} {
+  const install = createInstallExclusiveEgressOps(input);
+  return {
+    async diffTransientPfRules(): Promise<{ foreign: string[] }> {
+      const diff = await diffTransientPfRules(createExecFilePfRunner());
+      return { foreign: diff.foreign };
+    },
+    async recoverGeneration(): Promise<void> {
+      const registry = createProductionAnchorRegistry();
+      const coordinator = new GenerationCoordinator({
+        bind: async () => bindEphemeralGatePort(),
+        verifyOwner: async ({ port, pid }) => verifyLoopbackPortOwner({ port, expectedPid: pid }),
+        registry: {
+          armEntry: async (entry) => {
+            await registry.addOrUpdate({
+              agent_uid: entry.agent_uid,
+              gate_port: entry.gate_port,
+              fortress_path: entry.fortress_path,
+              generation_id: entry.generation_id,
+            });
+          },
+          tombstone: async (agentUid, fallback) => {
+            await registry.tombstone(agentUid, fallback);
+          },
+          readEntry: async (agentUid) => {
+            const { entries } = await registry.list();
+            return entries.find((e) => e.agent_uid === agentUid) ?? null;
+          },
+        },
+        publishManifest: async () => {
+          throw new Error("recover() must never publish a manifest");
+        },
+        staging: createFsGenerationStagingStore(),
+        lock: fsLockOps(),
+      });
+      await coordinator.recover(input.agentUid);
+    },
+    bringUpGeneration: () => install.bringUpGeneration(),
+    runReleaseSequence: (committed) => install.runReleaseSequence(committed),
+    audit: input.audit,
+    print: input.print,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Boot supervisor (called by the root Castle Wall policy daemon)
+// ---------------------------------------------------------------------------
+
+/** Handle for the boot supervisor's ongoing oracle refresh loop. */
+export interface ExclusiveEgressBootSupervisorHandle {
+  results: BootReleaseResult[];
+  stopOracleLoop(): void;
+}
+
+/**
+ * The boot daemon's exclusive-egress supervisor: for every fortress with an
+ * exclusive-routing marker + registry entry, run the S5-5 boot release
+ * sequence (re-arm -> gate-verify -> recommit/hold -> enable+bootstrap ->
+ * re-park), then keep the oracle freshness-token loop running (the gate's
+ * per-CONNECT liveness is TTL-fresh; without the loop every CONNECT denies
+ * within one TTL -- fail-closed but non-functional). NEVER throws.
+ *
+ * Boot wiring detail: the harness argv + agent account are recovered from the
+ * registry entry's fortress + the parked plist contract via the injected
+ * resolver, because the boot daemon has no wrap context.
+ */
+export async function startExclusiveEgressBootSupervisor(input: {
+  /** Resolve per-agent release context from the registry entry. */
+  resolveAgent: (entry: { agent_uid: number; fortress_path: string }) => Promise<{
+    agentAccount: string;
+    harnessArgv: string[];
+    harnessLogDir: string;
+    gateUid: number;
+  } | null>;
+  audit: (operation: string, details: Record<string, unknown>) => Promise<void>;
+  print: (line: string) => void;
+  /** Oracle refresh cadence (default: half the token TTL). */
+  refreshIntervalMs?: number;
+}): Promise<ExclusiveEgressBootSupervisorHandle> {
+  const registry = createProductionAnchorRegistry();
+  let entries: { agent_uid: number; gate_port: number; fortress_path: string; generation_id?: number; tombstone?: boolean }[] = [];
+  try {
+    entries = (await registry.list()).entries;
+  } catch (err) {
+    input.print(`[castle-wall] boot: exclusive-egress registry unreadable (${(err as Error).message}); all confined agents stay PARKED`);
+    return { results: [], stopOracleLoop: () => undefined };
+  }
+  if (entries.length === 0) {
+    return { results: [], stopOracleLoop: () => undefined };
+  }
+  const keys = await ensureSupervisorOracleKeys();
+  const resolved = new Map<number, { gateUid: number; entry: (typeof entries)[number] }>();
+
+  const results = await runBootExclusiveEgressRelease(
+    entries.map((e) => ({ agent_uid: e.agent_uid })),
+    {
+      releaseAgent: async (agentUid): Promise<ReleaseBarrierOutcome> => {
+        const entry = entries.find((e) => e.agent_uid === agentUid)!;
+        const ctx = await input.resolveAgent({ agent_uid: agentUid, fortress_path: entry.fortress_path });
+        if (ctx === null) {
+          return {
+            kind: "parked",
+            stage: "reassert-parked",
+            reason: `no release context could be resolved for uid ${agentUid} (marker/account missing)`,
+            holdFileRemoved: false,
+            jobDisabled: false,
+            cleanupErrors: [],
+          };
+        }
+        resolved.set(agentUid, { gateUid: ctx.gateUid, entry });
+        const oracle = createProductionOracle(keys.privateKey, ctx.gateUid);
+        return runReleaseBarrierSequence(
+          { agentUid, harnessLabel: AGENT_HARNESS_DAEMON_LABEL, harnessArgv: ctx.harnessArgv },
+          createProductionReleaseBarrierOps({
+            agentUid,
+            agentAccount: ctx.agentAccount,
+            harnessArgv: ctx.harnessArgv,
+            fortressPath: entry.fortress_path,
+            harnessLogDir: ctx.harnessLogDir,
+            gateUid: ctx.gateUid,
+            oracle,
+            rearm: "boot-rearm",
+          }),
+        );
+      },
+      audit: input.audit,
+      print: input.print,
+    },
+  );
+
+  // Ongoing oracle refresh for the RELEASED agents (TTL-fresh liveness). A
+  // refresh failure removes the token (fail-closed: the gate denies) and is
+  // logged; the loop keeps trying (self-healing drift posture).
+  const interval = input.refreshIntervalMs ?? 1_000;
+  const timer = setInterval(() => {
+    void (async (): Promise<void> => {
+      for (const result of results) {
+        if (result.outcome.kind === "parked") continue;
+        const info = resolved.get(result.agent_uid);
+        if (info === undefined) continue;
+        const generationId = result.outcome.generationId;
+        try {
+          const oracle = createProductionOracle(keys.privateKey, info.gateUid);
+          await oracle.refresh({
+            agentUid: result.agent_uid,
+            gatePort: info.entry.gate_port,
+            generationId,
+          });
+        } catch (err) {
+          input.print(
+            `[castle-wall] oracle refresh failed for uid ${result.agent_uid}: ${(err as Error).message} (gate denies until it recovers)`,
+          );
+        }
+      }
+    })();
+  }, interval);
+  timer.unref();
+  return {
+    results,
+    stopOracleLoop: (): void => clearInterval(timer),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// S5-P posture producer (retires the "no live producer" disclosure)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the exclusive-egress posture PROVIDER the dashboard binds via
+ * `setExclusiveEgressPostureProvider`. Reads the REAL surfaces per call:
+ * the exclusive-routing marker (fine-grained intent), the S5-1 registry
+ * (+dirty), the S5-2 staging store, the gate runtime state, the oracle token
+ * (verified against the pinned public key -- the gate's own fail-closed
+ * verdict), and the injected coarse-wall-armed probe. FAIL-CLOSED: a read
+ * failure THROWS; the dashboard's shared resolver maps a throwing provider to
+ * `failedExclusiveEgressStatus` (caps green). Returns null when no
+ * fine-grained agent was ever provisioned (marker absent + registry empty).
+ */
+export function createExclusiveEgressPostureProducer(input: {
+  fortressPath: string;
+  /** The same coarse-wall evidence surface the caller already trusts. */
+  coarseWallArmed: () => Promise<boolean>;
+}): () => Promise<ExclusiveEgressStatus | null> {
+  return async (): Promise<ExclusiveEgressStatus | null> => {
+    const marker = await loadExclusiveRoutingMarker(input.fortressPath).catch((err) => {
+      // A malformed marker is a fail-closed cap, not a null.
+      throw err instanceof Error ? err : new Error(String(err));
+    });
+    const registry = createProductionAnchorRegistry();
+    let entries: { agent_uid: number; gate_port: number; fortress_path: string; generation_id?: number; tombstone?: boolean }[];
+    let dirty: boolean;
+    try {
+      const listed = await registry.list();
+      entries = listed.entries;
+      dirty = listed.dirty;
+    } catch (err) {
+      // No registry file at all + no marker = affirmatively no fine-grained
+      // agent; any OTHER failure caps green.
+      if (marker === null && (err as { name?: string }).name === "PfAnchorRegistryStateError") {
+        return null;
+      }
+      throw err;
+    }
+    if (marker === null && entries.length === 0) {
+      return null;
+    }
+    const staging = createFsGenerationStagingStore();
+    const coarseArmed = await input.coarseWallArmed();
+    let publicKey: KeyObject | null = null;
+    try {
+      publicKey = createPublicKey(await readFile(GATE_ORACLE_PUBLIC_KEY_PATH, "utf8"));
+    } catch {
+      publicKey = null;
+    }
+
+    const uids = new Set<number>(entries.map((e) => e.agent_uid));
+    if (marker !== null) uids.add(marker.agent_uid);
+    const agents = [];
+    for (const uid of uids) {
+      const entry = entries.find((e) => e.agent_uid === uid) ?? null;
+      const stagingRecord = await staging.load(uid).catch(() => null);
+      let runtime: EgressGateRuntimeState | null = null;
+      try {
+        const path = egressGateRuntimeStatePath(uid);
+        runtime = parseEgressGateRuntimeState(await readFile(path, "utf8"), path);
+      } catch {
+        runtime = null;
+      }
+      // The oracle token IS the pf-liveness verdict (the gate's own check).
+      let pfLiveness: { live: false | true; reasons: string[] } = {
+        live: false,
+        reasons: ["oracle public key unavailable"],
+      };
+      if (publicKey !== null) {
+        let raw: string | null = null;
+        try {
+          raw = await readFile(join(GATE_LIVENESS_DIR, `${uid}.token`), "utf8");
+        } catch {
+          raw = null;
+        }
+        const committed = resolveCommittedGeneration({
+          entry,
+          stagingRecordPresent: stagingRecord !== null,
+          registryDirty: dirty,
+        });
+        pfLiveness = verifyLivenessToken({
+          raw,
+          publicKey,
+          binding: {
+            agentUid: uid,
+            gatePort: entry?.gate_port ?? 0,
+            generationId: committed.committedGenerationId ?? 0,
+          },
+          now: Date.now(),
+        });
+      }
+      const ownerVerified =
+        runtime !== null &&
+        (await verifyLoopbackPortOwner({ port: runtime.gate_port, expectedPid: runtime.pid }));
+      agents.push(
+        buildExclusiveEgressPosture({
+          agent_uid: uid,
+          fine_grained_declared: marker !== null && marker.agent_uid === uid ? true : entry !== null,
+          coarse_wall_armed: coarseArmed,
+          registry_entry: entry,
+          staging_record_present: stagingRecord !== null,
+          registry_dirty: dirty,
+          pf_pass_port: entry !== null && entry.tombstone !== true ? entry.gate_port : undefined,
+          manifest: runtime !== null ? { gate_port: runtime.gate_port, generation_id: runtime.generation_id } : null,
+          pf_liveness: pfLiveness,
+          gate_process: {
+            up: runtime !== null,
+            port_owner_verified: ownerVerified,
+            reasons: runtime === null ? ["gate runtime state absent"] : [],
+          },
+        }),
+      );
+    }
+    return summarizeExclusiveEgressStatus(agents);
+  };
+}
+
+// Re-exported so wiring callers do not need a second import site.
+export { failedExclusiveEgressStatus };

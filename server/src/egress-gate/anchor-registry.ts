@@ -38,7 +38,7 @@
  * fails marks the registry dirty.
  *
  * HONESTY BOUNDS. This is the multi-uid mutation-SAFETY primitive only. It does
- * NOT arm anything at install (that is S5-6, owed), does NOT own the generation
+ * NOT arm anything at install (that is S5-6's `arming-wiring.ts`), does NOT own the generation
  * state machine (S5-2, owed -- the state schema is versioned so `generation_id`
  * is added additively there), does NOT start the gate (S5-3, owed), and makes
  * NO external enforcement claim. HIGH-4 is REMEDIATED-once-callers-route-through

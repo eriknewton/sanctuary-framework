@@ -228,3 +228,42 @@ export {
   type ExclusiveEgressStatus,
   type GateProcessStatus,
 } from "./posture.js";
+
+// Unified Protect Slice 5 S5-6: gate daemon + drift guard + production wiring.
+export {
+  EGRESS_GATE_RUNTIME_DIR,
+  EGRESS_GATE_DAEMON_LABEL_PREFIX,
+  GATE_ORACLE_PUBLIC_KEY_PATH,
+  egressGateDaemonLabel,
+  egressGateDaemonPlistPath,
+  egressGatePolicyConfigPath,
+  egressGateRulesConfigPath,
+  egressGateRuntimeStatePath,
+  parseEgressGateRuntimeState,
+  renderEgressGateDaemonPlist,
+  runEgressGateDaemon,
+  type EgressGateDaemonDeps,
+  type EgressGateDaemonHandle,
+  type EgressGateDaemonPlistOptions,
+  type EgressGateRuntimeState,
+} from "./gate-daemon.js";
+export {
+  diffTransientPfRules,
+  type DiffTransientPfRulesOptions,
+  type TransientPfRulesDiff,
+} from "./drift-guard.js";
+export {
+  GATE_ORACLE_PRIVATE_KEY_PATH,
+  createExclusiveEgressPostureProducer,
+  createInstallExclusiveEgressOps,
+  createProductionAnchorRegistry,
+  createProductionOracle,
+  createProductionReleaseBarrierOps,
+  createRepairExclusiveEgressOps,
+  ensureSupervisorOracleKeys,
+  restoreCoarseCompositionProduction,
+  startExclusiveEgressBootSupervisor,
+  verifyLoopbackPortOwner,
+  type ExclusiveEgressBootSupervisorHandle,
+  type ExclusiveEgressWiringInput,
+} from "./arming-wiring.js";

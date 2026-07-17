@@ -12,6 +12,8 @@ import type { AuditLog } from "../../operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
 import { composeEffectiveRules } from "../allowlist/habeas-port.js";
+import { composeExclusiveRoutingRules } from "../allowlist/exclusive-routing.js";
+import { loadExclusiveRoutingMarker } from "../allowlist/routing-marker.js";
 import { collectSystemResolvers } from "./system-resolvers.js";
 import { readDistressConfig } from "../../distress/config.js";
 import { validateAgentOrigin } from "../allowlist/agent-origin.js";
@@ -1691,13 +1693,49 @@ async function loadManifestState(input: {
   // the 2026-07-12 drill bug); absent when no hostname rules exist.
   const distressConfig = await readDistressConfig(input.fortressPath);
   const resolvers = await collectSystemResolvers();
-  const effectiveRules = composeEffectiveRules({
-    operatorRules: rules,
-    resolvers,
-    distressWebhook: distressConfig.webhook_target,
-    exclusiveEgressGate: input.exclusiveEgressGate,
-    createdAt: new Date().toISOString(),
-  });
+  // Unified Protect Slice 5 S5-6: the exclusive-routing MODE MARKER decides
+  // which composition this manifest gets. Marker ABSENT = coarse (today's
+  // path, byte-unchanged). Marker PRESENT = the S5-4 exclusive composition:
+  // provisioned endpoint rules must be gate-scoped and the compose-time
+  // assertion refuses ANY agent-reachable direct off-box allow -- a violation
+  // THROWS here, so NO manifest is produced (fail-closed: no manifest, no
+  // arm; never a silently-widened one). A present-but-malformed marker also
+  // throws (loadExclusiveRoutingMarker's contract) rather than guessing a
+  // mode. This makes the daemon -- the only real manifest producer -- the
+  // chokepoint for the BLOCKER-1 routing property on every load AND reload.
+  const routingMarker = await loadExclusiveRoutingMarker(input.fortressPath);
+  let effectiveRules: AllowlistRule[];
+  if (routingMarker !== null) {
+    const composition = await composeExclusiveRoutingRules({
+      base: {
+        operatorRules: rules,
+        resolvers,
+        distressWebhook: distressConfig.webhook_target,
+        exclusiveEgressGate: input.exclusiveEgressGate,
+        createdAt: new Date().toISOString(),
+      },
+      routing: {
+        mode: "exclusive",
+        principals: {
+          agent_uid: routingMarker.agent_uid,
+          gate_uid: routingMarker.gate_uid,
+          agent: {
+            agent_id: routingMarker.agent_id,
+            agent_template: routingMarker.agent_template,
+          },
+        },
+      },
+    });
+    effectiveRules = composition.rules;
+  } else {
+    effectiveRules = composeEffectiveRules({
+      operatorRules: rules,
+      resolvers,
+      distressWebhook: distressConfig.webhook_target,
+      exclusiveEgressGate: input.exclusiveEgressGate,
+      createdAt: new Date().toISOString(),
+    });
+  }
   const { signed } = await buildSignedManifest({
     fortressId: input.fortressId,
     issuedAt: new Date().toISOString(),

@@ -57,3 +57,15 @@ export {
   type ExclusiveRoutingRequest,
   type ExclusiveRoutingComposition,
 } from "./exclusive-routing.js";
+
+// Unified Protect Slice 5 S5-6: the durable exclusive-routing mode marker.
+export {
+  EXCLUSIVE_ROUTING_MARKER_FILENAME,
+  EXCLUSIVE_ROUTING_MARKER_VERSION,
+  ExclusiveRoutingMarkerError,
+  exclusiveRoutingMarkerPath,
+  loadExclusiveRoutingMarker,
+  parseExclusiveRoutingMarker,
+  renderExclusiveRoutingMarker,
+  type ExclusiveRoutingMarker,
+} from "./routing-marker.js";

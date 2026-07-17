@@ -41,7 +41,7 @@
  *                      `generation_id` (written at G3) is now the ACTIVE
  *                      committed generation by virtue of there being no staging
  *                      record. This is the barrier line: only after G5 may a
- *                      consumer unpark the agent harness (S5-5/S5-6, owed).
+ *                      consumer unpark the agent harness (S5-5/S5-6, WIRED).
  *
  * GENERATION MATCH (never green from stale rules). {@link evaluateGenerationMatch}
  * refuses traffic unless the pf pass-rule port, the manifest port, and the
@@ -54,7 +54,7 @@
  * only, over INJECTED ops (bind, owner-check, registry, manifest-publish,
  * staging store), so the whole machine -- every crash-recovery branch -- is
  * unit-testable with no host, root, gate, or pf. It does NOT wire arming into
- * install (S5-6, owed), does NOT provision the gate service uid or its
+ * install (that is S5-6's `arming-wiring.ts`), does NOT provision the gate service uid or its
  * client-auth / liveness oracle (S5-3, owed), does NOT compose the exclusive
  * routing manifest (S5-4 owns the endpoint re-scope; G4 here only publishes the
  * generation-bearing gate policy file), and does NOT park/unpark the harness
@@ -618,7 +618,7 @@ export class GenerationCoordinator {
       // G5: commit -- removing the staging record makes the G3-written
       // generation_id the ACTIVE committed generation. The gate keeps holding
       // the port (NOT released). Only now may a consumer unpark the harness
-      // (S5-5/S5-6, owed -- not this library).
+      // (S5-5/S5-6 release barrier -- not this library).
       await this.ops.staging.delete(agent_uid);
       return base;
     } catch (err) {
