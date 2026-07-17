@@ -31,7 +31,22 @@ import {
 } from "../../src/operational/audit-store-split.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
-import { readDaemonStore } from "../../src/evidence-pack/cli.js";
+import { derivePurposeKey } from "../../src/core/key-derivation.js";
+import { createIdentity } from "../../src/core/identity.js";
+import type { StoredIdentity } from "../../src/core/identity.js";
+import { readDaemonStore, deriveAuditReadOutcome } from "../../src/evidence-pack/cli.js";
+import { buildEvidencePack } from "../../src/evidence-pack/generate.js";
+
+/** A throwaway fortress identity for signing a fixture pack, encrypted under the
+ * SAME master key `buildEvidencePack` will use to decrypt it for signing. */
+function fixtureSigner(masterKey: Uint8Array): StoredIdentity {
+  const { storedIdentity } = createIdentity(
+    "acme-law",
+    derivePurposeKey(masterKey, "identity-encryption"),
+    "pw"
+  );
+  return storedIdentity;
+}
 
 const dirs: string[] = [];
 
@@ -113,5 +128,72 @@ describe("WATCH-1 round-5: readDaemonStore four honest states over a real on-dis
     if (result.status === "present_unreadable") {
       expect(result.unreadable_reason).toBe("privilege");
     }
+  });
+
+  it("C1: 'missing' (NOT 'absent') when a migrated fortress's daemon store was DELETED", async () => {
+    const f = await splitFortress();
+    // The migration wrote a valid boundary + established marker (in _meta) and a
+    // daemon chain. Deleting only the daemon namespace leaves the marker behind,
+    // so the store is now provably DESTROYED, not never-provisioned.
+    await rm(join(f.statePath, AUDIT_DAEMON_NAMESPACE), {
+      recursive: true,
+      force: true,
+    });
+    const result = await readDaemonStore(f.storage, f.masterKey);
+    // The pre-fix code returned "absent" here (a fresh fortress) -- the hole.
+    expect(result.status).toBe("missing");
+  });
+
+  it("C1: a fresh (never-migrated) fortress with no daemon dir stays 'absent', not 'missing'", async () => {
+    // Guard the fix does not over-fire: with NO migration marker, an absent
+    // daemon directory is a genuinely fresh fortress.
+    const f = await freshFortress();
+    const result = await readDaemonStore(f.storage, f.masterKey);
+    expect(result.status).toBe("absent");
+  });
+
+  it("C1: a deleted daemon store surfaces as 'missing' in the SIGNED manifest coverage", async () => {
+    const f = await splitFortress();
+    await rm(join(f.statePath, AUDIT_DAEMON_NAMESPACE), {
+      recursive: true,
+      force: true,
+    });
+    const daemon = await readDaemonStore(f.storage, f.masterKey);
+    const outcome = deriveAuditReadOutcome({
+      entries: [],
+      windowedTotal: 0,
+      retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 1024 },
+      usage: { entryCount: 0, totalSizeBytes: 0, everPruned: false },
+      daemon,
+    });
+    expect(outcome.status).toBe("populated");
+    if (outcome.status === "populated") {
+      expect(outcome.value.retention.daemon_store.status).toBe("missing");
+    }
+
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-01T00:00:00.000Z",
+      },
+      { audit: outcome, signer: fixtureSigner(f.masterKey), masterKey: f.masterKey }
+    );
+    // The daemon-store status is carried into the SIGNED manifest coverage, so a
+    // reader of `shortfall: ...` is never left believing a fresh census.
+    expect(
+      pack.manifest.coverage.determinable &&
+        pack.manifest.coverage.daemon_store.status
+    ).toBe("missing");
+    // And the rendered report raises the evidence-destruction alarm, never a
+    // silent operator-only census.
+    const report = pack.files.find((x) => x.filename.endsWith(".md"))!;
+    expect(report.content).toContain("ENFORCEMENT-CENSUS NOTICE");
+    expect(report.content).toMatch(/writer-split evidence is present/i);
+    // Hedged, not over-definite: never asserts the migration definitively "ran
+    // and provisioned" (the presence check is fail-closed on a raw stat).
+    expect(report.content).not.toMatch(/ran the audit-store writer split and provisioned/i);
+    // A missing store is not a privilege limit: never advise the futile root re-run.
+    expect(report.content).not.toMatch(/re-run .*as root/i);
   });
 });

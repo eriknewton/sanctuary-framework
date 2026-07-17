@@ -318,13 +318,21 @@ class PdfBuilder {
   private cursorY: number = BODY_TOP_Y;
   private readonly manifestDigest: string;
   private readonly footerLabelPrefix: string;
+  private readonly footerDigestLabel: string;
 
   constructor(
     manifestDigest: string,
-    footerLabelPrefix = "Sanctuary EU AI Act Compliance Bundle"
+    footerLabelPrefix = "Sanctuary EU AI Act Compliance Bundle",
+    // The label preceding the digest in the footer. Defaults to
+    // "Manifest SHA-256" for the EU AI Act bundle (whose digest IS a manifest
+    // identifier). A caller passing a DIFFERENT digest (e.g. the evidence pack,
+    // whose footer digest is the report file's SHA-256, not the manifest's)
+    // MUST pass a matching label so the footer never mislabels what was hashed.
+    footerDigestLabel = "Manifest SHA-256"
   ) {
     this.manifestDigest = manifestDigest;
     this.footerLabelPrefix = footerLabelPrefix;
+    this.footerDigestLabel = footerDigestLabel;
     this.currentPage = { operators: [], pageNumber: 1 };
     this.pages.push(this.currentPage);
   }
@@ -446,7 +454,7 @@ class PdfBuilder {
     const totalPages = this.pages.length;
     const digestShort = this.manifestDigest.slice(0, 16) + "...";
     const leftFooter =
-      this.footerLabelPrefix + " | Manifest SHA-256: " + digestShort;
+      this.footerLabelPrefix + " | " + this.footerDigestLabel + ": " + digestShort;
 
     // Width guard: compute the longest possible page label (i.e. the
     // final page, which has the widest N-of-M number) and assert the
@@ -702,15 +710,23 @@ export interface PdfDocument {
  * evidence pack), so the PDF writer is reused rather than reinvented.
  *
  * `footerLabel` sets the per-page footer prefix; `footerDigest` is the short
- * identifier shown after it (a manifest content hash). NOT CRYPTOGRAPHICALLY
- * SIGNED: the PDF is a human-readable render of separately-signed artifacts;
- * verify integrity against the signed files and manifest, not against the PDF.
+ * identifier shown after it, and `footerDigestLabel` names WHAT that digest is
+ * (default "Manifest SHA-256"). A caller whose `footerDigest` is not the
+ * manifest hash MUST pass a matching `footerDigestLabel` (e.g. the evidence pack
+ * passes the report file's SHA-256 with the label "Report SHA-256") so the
+ * footer never claims to show a hash it does not. NOT CRYPTOGRAPHICALLY SIGNED:
+ * the PDF is a human-readable render of separately-signed artifacts; verify
+ * integrity against the signed files and manifest, not against the PDF.
  */
 export function renderMarkdownDocumentsToPdf(
   documents: PdfDocument[],
-  options: { footerLabel: string; footerDigest: string }
+  options: { footerLabel: string; footerDigest: string; footerDigestLabel?: string }
 ): Uint8Array {
-  const builder = new PdfBuilder(options.footerDigest, options.footerLabel);
+  const builder = new PdfBuilder(
+    options.footerDigest,
+    options.footerLabel,
+    options.footerDigestLabel
+  );
   for (const doc of documents) {
     builder.writeDocument(doc.title, markdownToLines(doc.markdown));
   }

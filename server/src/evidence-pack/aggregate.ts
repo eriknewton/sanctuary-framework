@@ -24,6 +24,7 @@ import type {
   RetentionFacts,
   ShortfallReport,
 } from "./types.js";
+import { daemonStoreExcludedFromCensus } from "./types.js";
 import { isInWindow } from "./quarter.js";
 
 /**
@@ -88,9 +89,11 @@ export const GATE_DECISION_OP_CATEGORIES: Readonly<
 
 /**
  * Map one audit entry to a decision category. The gate encodes the decision in
- * the operation prefix before the first colon; the cross-harness approval
- * resolution encodes it in the entry result (success = approved, failure =
- * denied).
+ * the operation prefix before the first colon, refined by `details.decided_by`
+ * for the human/automated split. The `cross_harness_approval_resolved` op is
+ * NOT read from the entry `result`; it is routed to `other` unconditionally
+ * (see the de-dup note below), because it is a paired observation of a decision
+ * the gate already counted.
  *
  * UNMAPPED-OP GUARD: a `gate_`-shaped op NOT in {@link GATE_DECISION_OP_CATEGORIES}
  * is a control-point decision this version does not classify, so it returns
@@ -209,6 +212,16 @@ function daemonPresentButExcludedSuffix(retention: RetentionFacts): string {
       "evidence; see the enforcement-summary section."
     );
   }
+  if (d.status === "missing") {
+    return (
+      " NOTE: audit-store writer-split evidence is present on this fortress but " +
+      "the separate root-owned daemon enforcement store (_audit-daemon) it " +
+      "references is ABSENT (deleted or renamed, or the split evidence is present " +
+      "but unverifiable), so daemon-recorded enforcement for this quarter is not " +
+      "reflected above. This is not a clean fresh fortress; see the " +
+      "enforcement-summary section."
+    );
+  }
   return "";
 }
 
@@ -268,9 +281,7 @@ export function detectShortfall(
   // daemon store is absent/included, the operator count IS the whole census, so
   // keep the neutral wording (do not introduce a distinction that under-claims
   // the single-store case -- two-family gate follow-up).
-  const daemonExcluded =
-    retention.daemon_store?.status === "present_unreadable" ||
-    retention.daemon_store?.status === "present_tampered";
+  const daemonExcluded = daemonStoreExcludedFromCensus(retention.daemon_store);
 
   // START SIDE.
   let coveredFrom: string;
@@ -321,13 +332,29 @@ export function detectShortfall(
     // log never pruned AND it is below both caps; otherwise do not reassure.
     const neverPruned =
       retention.ever_pruned === false && !retentionAtCap;
+    // C2 (dry-bar): `earliest_retained_at` / `ever_pruned` are the OPERATOR
+    // store's facts (the daemon store merges into the scan only when readable).
+    // When a root-owned daemon store is present but EXCLUDED, the "no recorded
+    // activity before <coveredFrom>" reassurance is a completeness claim the
+    // code cannot back -- the daemon may have been enforcing and recording
+    // before that instant. Scope the reassurance to the operator store and
+    // signpost the excluded daemon store; keep the neutral wording when the
+    // operator count IS the whole census (absent/included).
     startExplanation = neverPruned
-      ? "The earliest retained audit entry is after the quarter start, and the " +
-        "log has never pruned entries (it is below both its entry and size " +
-        "retention caps), so this reflects that the fortress had no recorded " +
-        "activity before " +
-        coveredFrom +
-        ", not that entries were pruned. Coverage begins at that instant."
+      ? daemonExcluded
+        ? "The earliest retained entry in the operator audit log is after the " +
+          "quarter start, and the operator log has never pruned entries (it is " +
+          "below both its entry and size retention caps), so the operator store " +
+          "records no activity before " +
+          coveredFrom +
+          "; operator-store coverage begins at that instant." +
+          daemonPresentButExcludedSuffix(retention)
+        : "The earliest retained audit entry is after the quarter start, and the " +
+          "log has never pruned entries (it is below both its entry and size " +
+          "retention caps), so this reflects that the fortress had no recorded " +
+          "activity before " +
+          coveredFrom +
+          ", not that entries were pruned. Coverage begins at that instant."
       : "The retained audit window begins after the quarter start, and " +
         (retentionAtCap
           ? "the log is at a retention cap (entries or size), "
@@ -339,7 +366,8 @@ export function detectShortfall(
         coveredFrom +
         " onward; whether the gap is pruning or genuine inactivity cannot be " +
         "affirmed here. Raise the retention cap or export monthly snapshots to " +
-        "cover the full quarter.";
+        "cover the full quarter." +
+        (daemonExcluded ? daemonPresentButExcludedSuffix(retention) : "");
   } else {
     coveredFrom = window.start_inclusive;
     startShortfall = false;

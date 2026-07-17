@@ -274,6 +274,50 @@ describe("detectShortfall", () => {
     expect(r.explanation).toMatch(/no recorded activity/i);
   });
 
+  it("C2: the never-pruned partial-coverage reassurance is SCOPED to the operator store when a daemon store is excluded", () => {
+    // Same never-pruned mid-quarter case, but a root-owned daemon store is
+    // present-but-unreadable: the daemon may have been enforcing before the
+    // earliest OPERATOR entry, so the unqualified "the fortress had no recorded
+    // activity before X" completeness claim must NOT be asserted.
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        retained_total: 42,
+        retained_total_size_bytes: 10,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: false,
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          unreadable_reason: "privilege",
+        },
+      }),
+      complete
+    );
+    expect(r.shortfall).toBe(true);
+    // Scoped to the operator store, and signposts the excluded daemon store.
+    expect(r.explanation).toMatch(/operator (audit )?log|operator store/i);
+    expect(r.explanation).toMatch(/_audit-daemon/);
+    // Never the unqualified whole-fortress completeness claim.
+    expect(r.explanation).not.toMatch(/the fortress had no recorded activity/i);
+  });
+
+  it("C2: keeps the neutral whole-fortress wording when the daemon store is ABSENT (no under-claim)", () => {
+    const r = detectShortfall(
+      Q3_2026,
+      ret({
+        retained_total: 42,
+        retained_total_size_bytes: 10,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        ever_pruned: false,
+        daemon_store: { status: "absent", included_entry_count: 0 },
+      }),
+      complete
+    );
+    expect(r.explanation).toMatch(/the fortress had no recorded activity/i);
+    expect(r.explanation).not.toMatch(/_audit-daemon/);
+  });
+
   it("HIGH-5: below both caps but ever_pruned true (or unknown) does NOT affirm 'not pruned'", () => {
     const rUnknown = detectShortfall(
       Q3_2026,

@@ -1009,3 +1009,108 @@ describe("buildEvidencePack", () => {
     expect(report).not.toContain("| Data export | requires human (Tier 1) approval |");
   });
 });
+
+describe("R2-2: PDF footer digest label", () => {
+  it("labels the evidence-pack footer digest 'Report SHA-256' (its digest is the report file, not the manifest)", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const pdfText = Buffer.from(pack.pdf).toString("latin1");
+    // The footer digest passed by generate.ts is `reportFile.sha256`, so the
+    // label must say so -- the shared PDF builder's default "Manifest SHA-256"
+    // (correct only for the EU AI Act bundle) would be a false label here.
+    expect(pdfText).toContain("Report SHA-256:");
+    expect(pdfText).not.toContain("Manifest SHA-256:");
+    // Sanity: the digest shown IS the report file's SHA-256 prefix.
+    expect(pdfText).toContain("Report SHA-256: " + pack.files[0]!.sha256.slice(0, 16));
+  });
+});
+
+describe("dry-bar gate-round: cover enforcement-census caveat (shortfall=false)", () => {
+  it("the COVER caveats an excluded daemon store even when operator coverage is FULL (no shortfall)", () => {
+    // FULL_COVERAGE => shortfall=false, so none of the coverage banners fire.
+    // A present-but-unreadable daemon store must still be disclosed on the cover
+    // so a full-coverage quarter is not read as a complete enforcement record.
+    const retention: RetentionFacts = {
+      ...FULL_COVERAGE,
+      daemon_store: {
+        status: "present_unreadable",
+        included_entry_count: 0,
+        unreadable_reason: "privilege",
+      },
+    };
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], retention)
+    );
+    expect(pack.shortfall.status).toBe("populated");
+    if (pack.shortfall.status === "populated") {
+      expect(pack.shortfall.value.shortfall).toBe(false);
+    }
+    const cover = pack.files[0]!.content;
+    expect(cover).toContain("ENFORCEMENT-CENSUS NOTICE");
+  });
+
+  it("the COVER caveat describes a MISSING (deleted) daemon store as destruction, never 'present'", () => {
+    const retention: RetentionFacts = {
+      ...FULL_COVERAGE,
+      daemon_store: { status: "missing", included_entry_count: 0 },
+    };
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], retention)
+    );
+    const cover = pack.files[0]!.content.split("---")[0]!; // cover section only
+    expect(cover).toContain("ENFORCEMENT-CENSUS NOTICE");
+    expect(cover).toMatch(/ABSENT/);
+    expect(cover).toMatch(/deleted or renamed|unverifiable/i);
+    // Never describes the daemon store itself as "present" on the cover for a
+    // missing store, and never over-definitely asserts it "ran and provisioned".
+    expect(cover).not.toMatch(/\(_audit-daemon\) is\s+present/i);
+    expect(cover).not.toMatch(/ran the audit-store writer split and provisioned/i);
+  });
+
+  it("a daemon store that is ABSENT/included adds no cover caveat", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], FULL_COVERAGE)
+    );
+    expect(pack.files[0]!.content.split("---")[0]).not.toContain(
+      "ENFORCEMENT-CENSUS NOTICE"
+    );
+  });
+});
+
+describe("gate round 2: §7 covered-window is operator-scoped when the daemon store is excluded", () => {
+  it("scopes the access-log covered-window sentence to the OPERATOR store on an excluded daemon", () => {
+    const retention: RetentionFacts = {
+      ...FULL_COVERAGE,
+      daemon_store: {
+        status: "present_unreadable",
+        included_entry_count: 0,
+        unreadable_reason: "privilege",
+      },
+    };
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], retention)
+    );
+    const full = pack.files[0]!.content;
+    const accessLog = full.slice(full.indexOf("# Access-log and enforcement summary"));
+    // The covered-window sentence itself is scoped, not just the counts note.
+    expect(accessLog).toMatch(/retained OPERATOR audit log spans/);
+    expect(accessLog).toMatch(/operator-store view, not a complete enforcement census/);
+  });
+
+  it("leaves the neutral covered-window wording when the daemon store is absent/included", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], FULL_COVERAGE)
+    );
+    const full = pack.files[0]!.content;
+    const accessLog = full.slice(full.indexOf("# Access-log and enforcement summary"));
+    expect(accessLog).toMatch(/retained audit log spans/);
+    expect(accessLog).not.toMatch(/retained OPERATOR audit log spans/);
+  });
+});

@@ -255,9 +255,18 @@ export function buildEvidencePack(
     ds,
   });
 
+  // R2-2 (dry-bar): the footer digest is the REPORT file's SHA-256
+  // (`reportFile.sha256`), not the manifest's, so the label must say "Report
+  // SHA-256". The shared PDF builder defaults the label to "Manifest SHA-256"
+  // (correct for the EU AI Act bundle it was written for); passing the label
+  // explicitly keeps this pack's footer from claiming to show the manifest hash.
   const pdf = renderMarkdownDocumentsToPdf(
     sections.map((s) => ({ title: s.title, markdown: s.markdown })),
-    { footerLabel: PRODUCT_NAME, footerDigest: reportFile.sha256 }
+    {
+      footerLabel: PRODUCT_NAME,
+      footerDigest: reportFile.sha256,
+      footerDigestLabel: "Report SHA-256",
+    }
   );
 
   return { manifest, files, pdf, aggregation, shortfall };
