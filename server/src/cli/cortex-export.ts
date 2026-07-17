@@ -388,7 +388,10 @@ async function cmdRun(
         ? appendFileLineWriter(exportConfig.file_path)
         : stdoutLineWriter();
 
-    const cursor = new FileExportCursorStore(fortressPath);
+    // The durable cursor is master-key-AUTHENTICATED (MAC'd + chain-identity
+    // bound): a hand-written / tampered / stale cursor is discarded loudly and the
+    // run re-scans from the start rather than silently going blind. See cursor.ts.
+    const cursor = new FileExportCursorStore(fortressPath, masterKey);
 
     const result = await runExportPipeline({
       config: exportConfig,

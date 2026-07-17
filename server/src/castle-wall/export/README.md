@@ -69,15 +69,30 @@ verified pass but delivers them only AFTER the `await` resolves clean, so a
 tampered chain rejects before a single event leaves the host, and a torn-read
 retry (`reset()`) discards the partial pass.
 
-- **Durable cursor** (`cursor.ts`, `FileExportCursorStore` at
-  `<fortress>/state/cortex-export-cursor.json`): a run forwards only entries
-  whose chain sequence is STRICTLY ABOVE the persisted cursor. The cursor is
-  persisted (atomic temp+rename) only AFTER a batch is confirmed delivered by the
-  fail-loud sink, so a crash can only leave it BEHIND the delivered frontier. That
-  is the fail-safe direction: re-scan + re-deliver, never skip. The contract is
+- **Durable, AUTHENTICATED cursor** (`cursor.ts`, `FileExportCursorStore` at
+  `<fortress>/state/cortex-export-cursor.json`, schema
+  `sanctuary.enforcement-export-cursor.v2`): a run forwards only entries whose
+  chain sequence is STRICTLY ABOVE the persisted cursor. The cursor is persisted
+  (atomic temp+rename) only AFTER a batch is confirmed delivered by the fail-loud
+  sink, so a crash can only leave it BEHIND the delivered frontier. That is the
+  fail-safe direction: re-scan + re-deliver, never skip. The contract is
   at-least-once with **no gap** and **no re-send storm** (a lost cursor write
   re-sends at most the already-delivered tail of one batch; a collector dedupes on
   event identity).
+  - **Tamper-authenticated (this was the one un-authenticated link).** A run used
+    to trust any well-formed cursor, so a poisoned high cursor (`999999999`) made
+    it forward ZERO events, advance nothing, and emit NOTHING — the off-box console
+    silently went blind. Now the record is **MAC'd with a purpose key derived from
+    the fortress master key** (the SAME construction the audit rotation/head anchors
+    use) and **bound to the chain identity** via the `entry_hash` at the cursor
+    sequence. A hand-written / tampered / wrong-key cursor fails the MAC; a cursor
+    ABOVE the verified chain head, or bound to a DIFFERENT chain (an audit-store
+    wipe+recreate), fails the streamer's head-clamp / identity check. Every such
+    failure is **fail-LOUD**: an `_cursor_reset` audit record (`failure`) + a stderr
+    warning, then a re-scan from the start (re-send, never a silent zero-forward,
+    never a skip). A legacy (v1, un-MAC'd) or unreadable (non-ENOENT) cursor is
+    treated the same way — discarded loudly, never silently trusted or silently
+    reset.
 - **Bounded retry, still fail closed**: a transient sink failure is retried up to
   a bounded budget with backoff. The retried payload is the SAME already-mapped
   metadata batch through the SAME sink (no re-mapping, no fallback to a different

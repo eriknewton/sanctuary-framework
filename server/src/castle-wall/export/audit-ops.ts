@@ -45,3 +45,19 @@ export const ENFORCEMENT_EXPORT_CURSOR_ADVANCED = "enforcement_export_cursor_adv
  * collector stayed unreachable across the whole retry budget."
  */
 export const ENFORCEMENT_EXPORT_RETRY_EXHAUSTED = "enforcement_export_retry_exhausted" as const;
+
+/**
+ * The streamer DISCARDED a persisted export cursor and fell back to the start
+ * sentinel (a full re-scan of the verified chain). This is a LOUD, fail-safe
+ * anomaly signal, recorded as `failure`, and it is the antidote to the silent
+ * failure this whole surface exists to prevent: a poisoned or stale cursor that
+ * makes a run forward ZERO events and emit NOTHING (the off-box console goes
+ * blind). It fires when the cursor is unreadable (a non-ENOENT read error, e.g.
+ * EACCES), corrupt, UNAUTHENTICATED (a legacy or hand-written cursor with no
+ * valid master-key MAC), tampered (MAC mismatch), ABOVE the verified chain head
+ * (an overshoot tamper signal), or bound to a DIFFERENT chain identity (an
+ * audit-store wipe+recreate left a stale cursor that would otherwise skip the new
+ * low sequences). The `details.reason` names which. A reset re-sends already
+ * delivered events (the collector dedupes on event identity); it NEVER skips.
+ */
+export const ENFORCEMENT_EXPORT_CURSOR_RESET = "enforcement_export_cursor_reset" as const;
