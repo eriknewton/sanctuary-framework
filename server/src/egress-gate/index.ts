@@ -111,6 +111,63 @@ export {
 } from "./gate-server.js";
 
 export {
+  GATE_ACCOUNT_NAME_PREFIX,
+  deriveGateAccountName,
+  gateAccountProvisionOptions,
+  planGateAccountProvision,
+  planAndCreateGateAccount,
+  GateUidCollisionError,
+  type GateAccountProvisionOptions,
+} from "./gate-account.js";
+
+export {
+  GATE_CRED_DIR,
+  GATE_AUTH_SCHEME,
+  GATE_CREDENTIAL_VERSION,
+  GATE_CREDENTIAL_SECRET_BYTES,
+  GateCredentialAuthority,
+  formatGateCredentialHeader,
+  parseGateCredentialHeader,
+  verifyGateCredential,
+  mintGateSecret,
+  createFsGateCredentialAuthority,
+  createFsGateAcceptSource,
+  type GateCredentialToken,
+  type GateCredentialAcceptRecord,
+  type PresentedGateCredential,
+  type GateCredentialDenyReason,
+  type GateCredentialVerdict,
+  type GateCredentialAuthorityOps,
+  type GateAcceptSource,
+} from "./gate-credential.js";
+
+export {
+  decideGateClientAuth,
+  createGateClientAuthenticator,
+  type GatePeerResolution,
+  type GateClientDenyReason,
+  type GateClientAuthDecision,
+  type GateClientAuthenticator,
+} from "./gate-client-auth.js";
+
+export {
+  GATE_LIVENESS_DIR,
+  GATE_LIVENESS_TOKEN_VERSION,
+  GATE_LIVENESS_DEFAULT_TTL_MS,
+  canonicalLivenessPayload,
+  GateLivenessOracle,
+  verifyLivenessToken,
+  createOracleLivenessProbe,
+  createFsLivenessOracleOps,
+  createFsLivenessTokenSource,
+  type LivenessTokenClaims,
+  type SignedLivenessToken,
+  type LivenessOracleOps,
+  type LivenessTokenSource,
+  type LivenessProbeBinding,
+} from "./liveness-oracle.js";
+
+export {
   AGENT_HARNESS_DAEMON_LABEL,
   AGENT_HARNESS_DAEMON_PLIST_PATH,
   HARNESS_FORBIDDEN_PLIST_ENV,

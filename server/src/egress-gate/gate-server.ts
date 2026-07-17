@@ -44,10 +44,20 @@
  *     memory. Skipping is safe precisely because peer identity is
  *     advisory-only and never gates the decision.
  *
- * PEER IDENTITY (Slice 2) is advisory-only: a resolved peer uid that is not
- * the agent uid emits a loud `peer_uid_mismatch` event; it never grants and
- * never (alone) denies. The TOCTOU window is documented in
+ * PEER IDENTITY (Slice 2) is advisory-only IN THE LEGACY PATH: a resolved peer
+ * uid that is not the agent uid emits a loud `peer_uid_mismatch` event; it never
+ * grants and never (alone) denies. The TOCTOU window is documented in
  * `peer-identity.ts`.
+ *
+ * FAIL-CLOSED CLIENT AUTH (Slice 5 S5-3): when a `clientAuth` authenticator is
+ * supplied the gate runs in TCB mode -- every CONNECT must present a current,
+ * generation-bound bearer credential (`gate-credential.ts`) AND resolve to the
+ * agent uid, or it is DENIED (403 + a `client_denied` audit event). Bearer never
+ * overrides peer, and an unresolved/capped peer denies (fail-closed availability
+ * bound, see `gate-client-auth.ts`). In TCB mode the gate's mandatory
+ * `livenessProbe` is the root-owned signed-freshness-token oracle probe
+ * (`liveness-oracle.ts`): the non-root gate verifies liveness by checking a
+ * signature, never by holding pf privilege.
  *
  * HONESTY BOUNDS: routing is kernel-enforced; destination policy here is
  * userspace-enforced (this process); loopback confinement is pf-enforced,
@@ -73,9 +83,33 @@ import {
 } from "../castle-wall/allowlist/gate-derivation.js";
 import type { PfLivenessResult } from "./pf-anchor.js";
 import { resolveLoopbackPeer, type PeerCommandRunner } from "./peer-identity.js";
+import type {
+  GateClientAuthenticator,
+  GateClientDenyReason,
+  GatePeerResolution,
+} from "./gate-client-auth.js";
 
 /** The loopback address the gate binds. Never configurable wider. */
 export const GATE_BIND_HOST = "127.0.0.1";
+
+/**
+ * Recursively freeze a value in place (Codex/Family-A round-6). Used on a CLONE
+ * of the caller's destination rules so the gate's captured rule set is a true
+ * immutable snapshot: a caller cannot `push` a permissive rule into the array,
+ * reorder it, or flip an existing rule's `disposition`/`match` AFTER
+ * construction and thereby change what the gate enforces per CONNECT. Freezing a
+ * clone (never the caller's own array) keeps the defensive-copy discipline the
+ * frozen `policy` copy already established, without mutating caller state.
+ */
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      deepFreeze((value as Record<string, unknown>)[key]);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
 
 /**
  * Hard cap on concurrent advisory peer lookups (each spawns one lsof as the
@@ -88,6 +122,17 @@ export const PEER_LOOKUP_MAX_CONCURRENT = 4;
 /** A liveness probe the gate consults before proxying (fail-closed). */
 export interface GateLivenessProbe {
   check(): Promise<PfLivenessResult>;
+  /**
+   * OPTIONAL self-declared binding (Slice 5 S5-3; Codex F3 fix-round). When a
+   * probe advertises the `{ agentUid, gatePort }` its verdict is computed for
+   * (the oracle probe does), the gate cross-checks it against `policy` at
+   * construction and REFUSES to start if they disagree -- so a probe bound to a
+   * DIFFERENT agent/port (a live token for gate A) can never be wired into gate
+   * B and read as live here. Generation binding is out of the gate policy's
+   * knowledge and stays the wiring layer's job (`evaluateGenerationMatch`,
+   * S5-2). A probe that omits this (the legacy pf probe) is used as-is.
+   */
+  readonly binding?: { agentUid: number; gatePort: number };
 }
 
 /** Events the gate emits for audit/posture wiring. */
@@ -95,6 +140,7 @@ export type EgressGateEvent =
   | { kind: "liveness_refused"; authority: string; reasons: string[] }
   | { kind: "peer_uid_mismatch"; authority: string; peerUid: number; peerPid: number; agentUid: number }
   | { kind: "peer_unresolved"; authority: string }
+  | { kind: "client_denied"; authority: string; reason: GateClientDenyReason; peerUid?: number }
   | { kind: "decision"; authority: string; decision: EgressProxyDecision }
   | { kind: "gate_error"; authority: string; message: string };
 
@@ -112,6 +158,24 @@ export interface ExclusiveEgressGateOptions {
   livenessProbe: GateLivenessProbe;
   /** Advisory peer-identity runner; omit to skip peer resolution. */
   peerRunner?: PeerCommandRunner;
+  /**
+   * FAIL-CLOSED client authorization (Slice 5 S5-3). When present the gate is in
+   * TCB mode: every CONNECT must present a current generation-bound bearer
+   * credential AND resolve to the agent uid, or it is DENIED (`client_denied`,
+   * 403) -- the advisory peer path below is NOT used. The gate resolves the peer
+   * itself (capped, as in advisory mode) and feeds it to the authenticator, so
+   * this REQUIRES a `peerRunner`; with none, every peer is unresolved and every
+   * CONNECT denies (fail-closed). Omit for the legacy advisory behavior.
+   */
+  clientAuth?: GateClientAuthenticator;
+  /**
+   * Whether concurrent CONNECTs share ONE in-flight liveness probe (Slice 5
+   * S5-3; Codex F4 fix-round). Default `true` bounds pfctl subprocess
+   * amplification for the legacy pf probe. Set `false` when wiring the
+   * subprocess-free oracle probe so every CONNECT re-reads the freshness token
+   * (closes the post-flush shared-green window; no amplification cost to lose).
+   */
+  singleFlightLiveness?: boolean;
   /** Event sink for audit/posture wiring. */
   onEvent?: (event: EgressGateEvent) => void;
   /** Pass-through to the destination evaluator (tests). */
@@ -133,24 +197,121 @@ export interface ExclusiveEgressGateHandle {
  * tests can drive it on an ephemeral port.
  */
 export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): http.Server {
-  if (validateExclusiveEgressGatePolicy(options.policy) === null) {
+  // CHOKEPOINT: CAPTURE EVERY CONSUMED DEPENDENCY AT CONSTRUCTION (Codex round-5).
+  // The gate must never re-dereference the caller-owned `options` object at
+  // runtime -- otherwise a caller mutating its own `options` after construction
+  // (swapping `clientAuth`/`livenessProbe`/`rules`, or mutating `policy`) would
+  // change what the gate ENFORCES while the construction guards already passed
+  // against the original -- the advertised-vs-enforced divergence class, one
+  // level up from the individual objects. Everything below (guards AND the
+  // per-CONNECT handlers) reads these frozen/captured locals ONLY; `options` is
+  // never touched again. `policy` is a FROZEN COPY (so even field mutation on the
+  // caller's policy cannot change the gate); the authenticator and oracle probe
+  // are themselves frozen at their factories, so capturing the reference is
+  // sufficient for those.
+  const policy = Object.freeze({
+    agent_uid: options.policy.agent_uid,
+    gate_port: options.policy.gate_port,
+  });
+  const clientAuth = options.clientAuth;
+  const livenessProbe = options.livenessProbe;
+  // BIND injected-op METHODS once at construction (Codex round-7). Runtime must
+  // never re-read `obj.method` off a caller-held object, or a caller could
+  // reassign `.check`/`.run`/`.resolve` after construction and flip enforcement
+  // (503->200, fake a peer uid, redirect resolution). Binding captures the
+  // method as it was at construction; a later property swap on the caller's
+  // object cannot reach the gate. (What an injected method closes over is the
+  // injector's own behavior -- the injector is trusted TCB by construction; this
+  // closes the REASSIGNMENT vector, which is the accidental/aliasing one.)
+  const probeCheck = livenessProbe.check.bind(livenessProbe);
+  // Bind the authenticator's method too (uniform with the other injected ops),
+  // so the discipline "runtime never re-reads obj.method" holds independently of
+  // the factory freeze -- even a hand-rolled unfrozen authenticator cannot have
+  // its `.authorize` swapped after construction.
+  const clientAuthorize = clientAuth ? clientAuth.authorize.bind(clientAuth) : undefined;
+  const boundPeerRunner: PeerCommandRunner | undefined = options.peerRunner
+    ? Object.freeze({ run: options.peerRunner.run.bind(options.peerRunner) })
+    : undefined;
+  const boundResolver: EgressProxyResolver | undefined = options.resolver
+    ? Object.freeze({ resolve: options.resolver.resolve.bind(options.resolver) })
+    : undefined;
+  // Destination rules are a DEEP-FROZEN CLONE (not the caller's array): a
+  // post-construction in-place mutation (push a permissive rule, flip a
+  // disposition, widen a match) cannot change what the gate enforces.
+  const rules = deepFreeze(structuredClone(options.rules)) as AllowlistRule[];
+  const isRoutable = options.isRoutable;
+  const onEvent = options.onEvent;
+  const singleFlight = options.singleFlightLiveness ?? true;
+
+  if (validateExclusiveEgressGatePolicy(policy) === null) {
     throw new Error("createExclusiveEgressGate: malformed exclusive-egress gate policy");
   }
+  // FAIL-CLOSED SELF-CONSISTENCY GUARDS (Slice 5 S5-3; Codex F1 + F3 fix-round).
+  // The gate is TCB; a mis-wired authenticator or liveness probe bound to a
+  // DIFFERENT principal would let a valid-for-someone-else credential/liveness
+  // read as green here. Refuse to construct rather than trust the injected
+  // config blindly. These check the SAME captured locals the runtime enforces.
+  //   F1: the client authenticator must be bound to THIS gate's agent uid, so a
+  //       uid-501 authenticator can never be paired with a uid-502 policy and
+  //       admit a uid-501 client.
+  if (clientAuth && clientAuth.agentUid !== policy.agent_uid) {
+    throw new Error(
+      `createExclusiveEgressGate: clientAuth.agentUid (${clientAuth.agentUid}) must equal ` +
+        `policy.agent_uid (${policy.agent_uid}); refusing to authorize one uid's clients against another's credential`,
+    );
+  }
+  //   F3: a liveness probe that declares its binding must be bound to THIS
+  //       gate's { agent_uid, gate_port }, so a live token for gate A cannot be
+  //       wired into gate B and read as live. (Generation binding is not in the
+  //       gate policy; it stays the wiring layer's job via evaluateGenerationMatch.)
+  const probeBinding = livenessProbe.binding;
+  if (
+    probeBinding !== undefined &&
+    (probeBinding.agentUid !== policy.agent_uid || probeBinding.gatePort !== policy.gate_port)
+  ) {
+    throw new Error(
+      `createExclusiveEgressGate: livenessProbe.binding {agentUid:${probeBinding.agentUid}, gatePort:${probeBinding.gatePort}} ` +
+        `must match policy {agent_uid:${policy.agent_uid}, gate_port:${policy.gate_port}}; refusing a cross-principal liveness verdict`,
+    );
+  }
+  // Per-CONNECT liveness (Codex F4 fix-round). Single-flight shares ONE in-flight
+  // probe across concurrent CONNECTs to bound pfctl SUBPROCESS amplification --
+  // correct for the legacy pfctl probe. The oracle probe (S5-3) spawns no
+  // subprocess (a file read + signature verify), so single-flight buys no
+  // amplification protection there and can let a CONNECT that arrived strictly
+  // AFTER a flush join an already-in-flight green read. A caller wiring the
+  // oracle probe SHOULD set `singleFlightLiveness: false` so every CONNECT gets
+  // its own fresh token read; the default stays `true` (unchanged for the pfctl
+  // path and all existing callers).
   let inflightProbe: Promise<PfLivenessResult> | null = null;
   let activePeerLookups = 0;
 
   /**
-   * Single-flight, never-rejecting liveness probe: concurrent requests in
-   * the same decision window share ONE probe (one pfctl spawn set) instead
-   * of each spawning their own. The shared variable is cleared when the
-   * probe settles so the no-negative-caching contract holds: the next
-   * request AFTER a failure starts a fresh probe.
+   * Liveness probe wrapper. With `singleFlightLiveness` (default), concurrent
+   * requests in the same decision window share ONE probe (one pfctl spawn set)
+   * instead of each spawning their own; the shared variable is cleared when the
+   * probe settles so no positive survives into a later request. With
+   * `singleFlightLiveness: false` every CONNECT runs its own probe (no shared
+   * in-flight verdict), which closes the post-flush shared-green window for the
+   * subprocess-free oracle probe. Either way the probe never rejects.
    */
   function probeLiveness(): Promise<PfLivenessResult> {
+    if (!singleFlight) {
+      return (async (): Promise<PfLivenessResult> => {
+        try {
+          return await probeCheck();
+        } catch (err) {
+          return {
+            live: false,
+            reasons: [`liveness probe threw: ${err instanceof Error ? err.message : String(err)}`],
+          };
+        }
+      })();
+    }
     if (inflightProbe === null) {
       const probe = (async (): Promise<PfLivenessResult> => {
         try {
-          return await options.livenessProbe.check();
+          return await probeCheck();
         } catch (err) {
           return {
             live: false,
@@ -166,6 +327,42 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       });
     }
     return inflightProbe;
+  }
+
+  /**
+   * Resolve the connecting loopback peer into a {@link GatePeerResolution} for
+   * the fail-closed authenticator, applying the SAME subprocess-amplification
+   * cap as the advisory path: at the cap the lookup is skipped
+   * (`skipped_cap`), which the authenticator treats as a DENY (fail-closed),
+   * never queued. A missing client port or a null lsof result is `unresolved`
+   * (also a deny). With no `peerRunner` every peer is `unresolved`, so a TCB
+   * gate with no peer runner denies every CONNECT (documented on the option).
+   */
+  async function resolvePeerForAuth(
+    clientSocket: Duplex,
+    peerRunner: PeerCommandRunner | undefined,
+  ): Promise<GatePeerResolution> {
+    if (peerRunner === undefined) {
+      return { kind: "unresolved" };
+    }
+    const clientPort = (clientSocket as net.Socket).remotePort;
+    if (typeof clientPort !== "number") {
+      return { kind: "unresolved" };
+    }
+    if (activePeerLookups >= PEER_LOOKUP_MAX_CONCURRENT) {
+      return { kind: "skipped_cap" };
+    }
+    activePeerLookups += 1;
+    let peer: Awaited<ReturnType<typeof resolveLoopbackPeer>>;
+    try {
+      peer = await resolveLoopbackPeer({ clientPort, runner: peerRunner });
+    } finally {
+      activePeerLookups -= 1;
+    }
+    if (peer === null) {
+      return { kind: "unresolved" };
+    }
+    return { kind: "resolved", uid: peer.uid, pid: peer.pid };
   }
 
   const server = http.createServer((_request, response) => {
@@ -184,7 +381,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     // gate. Deny-direction: the affected accept is lost; the gate keeps
     // serving. Listen-time bind failures are still surfaced to callers by
     // the one-shot reject listener in startExclusiveEgressGate.
-    options.onEvent?.({ kind: "gate_error", authority: "", message: err.message });
+    onEvent?.({ kind: "gate_error", authority: "", message: err.message });
   });
 
   server.on("connect", (request, clientSocket, head) => {
@@ -196,7 +393,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
       // contract-bound never to reject; this catches any future edit that
       // breaks that contract.
       try {
-        options.onEvent?.({
+        onEvent?.({
           kind: "gate_error",
           authority: request.url ?? "",
           message: err instanceof Error ? err.message : String(err),
@@ -234,42 +431,69 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     // probeLiveness), but no positive verdict survives into a later request.
     const liveness = await probeLiveness();
     if (!liveness.live) {
-      options.onEvent?.({ kind: "liveness_refused", authority, reasons: liveness.reasons });
+      onEvent?.({ kind: "liveness_refused", authority, reasons: liveness.reasons });
       clientSocket.end(
         "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n",
       );
       return;
     }
 
-    // 2. Advisory peer identity (never grants, never solely denies).
-    // Lookups are capped: at the cap this request's lookup is skipped
-    // (surfaced as peer_unresolved) instead of spawning another lsof.
-    if (options.peerRunner) {
+    // 2. Client authorization. TWO modes:
+    //   - TCB / FAIL-CLOSED (Slice 5 S5-3), when `clientAuth` is set: resolve
+    //     the peer (capped) and require BOTH a current bearer credential AND a
+    //     matching peer uid, or DENY (403 `client_denied`). Bearer never
+    //     overrides peer; unresolved/skipped-at-cap peers deny.
+    //   - ADVISORY (Slice 2, unchanged), when only `peerRunner` is set: a
+    //     mismatch/unresolved is logged loudly but the request still proceeds.
+    if (clientAuthorize) {
+      const peer = await resolvePeerForAuth(clientSocket, boundPeerRunner);
+      const decision = await clientAuthorize({
+        credentialHeader: request.headers["proxy-authorization"],
+        peer,
+      });
+      if (!decision.allow) {
+        onEvent?.({
+          kind: "client_denied",
+          authority,
+          reason: decision.reason,
+          ...(decision.peerUid !== undefined ? { peerUid: decision.peerUid } : {}),
+        });
+        // Enforcement-as-teacher: a distinct header names the auth failure so a
+        // misconfigured client is told the channel exists but rejected it.
+        clientSocket.end(
+          "HTTP/1.1 403 Forbidden\r\nConnection: close\r\nX-Sanctuary-Gate: client-denied\r\n\r\n",
+        );
+        return;
+      }
+    } else if (boundPeerRunner) {
+      // Advisory peer identity (never grants, never solely denies). Lookups are
+      // capped: at the cap this request's lookup is skipped (surfaced as
+      // peer_unresolved) instead of spawning another lsof.
       const socket = clientSocket as net.Socket;
       const clientPort = socket.remotePort;
       if (typeof clientPort === "number") {
         if (activePeerLookups >= PEER_LOOKUP_MAX_CONCURRENT) {
-          options.onEvent?.({ kind: "peer_unresolved", authority });
+          onEvent?.({ kind: "peer_unresolved", authority });
         } else {
           activePeerLookups += 1;
           let peer: Awaited<ReturnType<typeof resolveLoopbackPeer>>;
           try {
             peer = await resolveLoopbackPeer({
               clientPort,
-              runner: options.peerRunner,
+              runner: boundPeerRunner,
             });
           } finally {
             activePeerLookups -= 1;
           }
           if (peer === null) {
-            options.onEvent?.({ kind: "peer_unresolved", authority });
-          } else if (peer.uid !== options.policy.agent_uid) {
-            options.onEvent?.({
+            onEvent?.({ kind: "peer_unresolved", authority });
+          } else if (peer.uid !== policy.agent_uid) {
+            onEvent?.({
               kind: "peer_uid_mismatch",
               authority,
               peerUid: peer.uid,
               peerPid: peer.pid,
-              agentUid: options.policy.agent_uid,
+              agentUid: policy.agent_uid,
             });
           }
         }
@@ -278,12 +502,12 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
 
     // 3. Destination policy: the shared TS evaluator (Swift-parity logic).
     const evaluatorOptions: EgressProxyOptions = {
-      rules: options.rules,
-      ...(options.resolver ? { resolver: options.resolver } : {}),
-      ...(options.isRoutable ? { isRoutable: options.isRoutable } : {}),
+      rules: rules,
+      ...(boundResolver ? { resolver: boundResolver } : {}),
+      ...(isRoutable ? { isRoutable } : {}),
     };
     const decision = await decideEgressProxyConnect(authority, evaluatorOptions);
-    options.onEvent?.({ kind: "decision", authority, decision });
+    onEvent?.({ kind: "decision", authority, decision });
     if (decision.disposition === "deny") {
       // Enforcement-as-teacher: the denial names the sanctioned route.
       clientSocket.end(
@@ -333,15 +557,19 @@ export async function startExclusiveEgressGate(
   options: ExclusiveEgressGateOptions,
 ): Promise<ExclusiveEgressGateHandle> {
   const server = createExclusiveEgressGate(options);
+  // Snapshot the bind port once (consistent with the per-CONNECT chokepoint) so
+  // a caller mutating options.policy after construction cannot change where the
+  // gate binds vs what it was validated/constructed for.
+  const gatePort = options.policy.gate_port;
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(options.policy.gate_port, GATE_BIND_HOST, () => {
+    server.listen(gatePort, GATE_BIND_HOST, () => {
       server.removeListener("error", reject);
       resolve();
     });
   });
   const address = server.address();
-  const port = typeof address === "object" && address !== null ? address.port : options.policy.gate_port;
+  const port = typeof address === "object" && address !== null ? address.port : gatePort;
   return {
     server,
     port,
