@@ -9,8 +9,9 @@
  * can inspect what their agent has done.
  */
 
-import { mkdir, open, readFile, rm, link, stat, unlink } from "node:fs/promises";
-import type { Stats } from "node:fs";
+import { mkdir, open, readFile, readdir, rm, link, stat, unlink } from "node:fs/promises";
+import { readFileSync, type Stats } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
 import { uptime as osUptime } from "node:os";
@@ -198,6 +199,17 @@ export interface AuditLogConfig {
    * gated by this interval; this is only the residual same-length+mtime backstop.
    */
   eagerReverifyIntervalMs?: number;
+  /**
+   * Age bound (ms) past which an id-less (0-byte) stale audit-write lock, and an
+   * orphaned `.acquire.*.tmp` acquire-temp, are considered crash litter and
+   * swept. Defaults to {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS} (10 min); also
+   * overridable via the `AUDIT_WRITE_LOCK_IDLESS_STALE_MS` env var. Exposed so
+   * tests can drive the 0-byte-age and orphan-temp-GC branches deterministically
+   * on a freshly-booted host (where a real 10-minute mtime cannot be assumed to
+   * post-date boot). Never breaks a content-bearing lock; only the id-less
+   * fallback and the acquire-temp sweep consult it.
+   */
+  idlessStaleLockMs?: number;
 }
 
 export interface AuditIntegrityAnomalyEvent {
@@ -746,10 +758,38 @@ const AUDIT_WRITE_LOCK_RETRY_MS = 100;
 // stamped. Ten minutes is far beyond any conceivable hold yet far below
 // "survived a reboot" (already covered by the boot-time proof).
 const AUDIT_WRITE_LOCK_IDLESS_STALE_MS = 10 * 60 * 1_000;
+// Slack (ms) absorbed when comparing a lock's monotonic `uptime_ms` stamp
+// against the current `os.uptime()`: the holder read its uptime a few syscalls
+// before the reader reads theirs, so a lock legitimately stamped "just now" can
+// carry an uptime a hair ABOVE the reader's current uptime purely from that
+// ordering. One second is far beyond that gap yet far below any interval that
+// could let a genuinely stale lock masquerade as same-boot-live.
+const AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS = 1_000;
 // Process-local monotonic counter for unique audit-lock temp-file names during
 // the atomic acquire (paired with pid + a wall-clock component). Never
 // persisted; collision-free within a process and across concurrent processes.
 let auditLockTempCounter = 0;
+// Suffix marking an audit-lock acquire-temp: `<lockfile>.acquire.<pid>.<n>.<hex>.tmp`.
+// A crash / kill -9 between `link()` and the `finally` unlink in
+// `atomicAcquireAuditLock` strands one of these; the startup sweep GCs any older
+// than the id-less stale bound (invisible to `list()`, litter only).
+const AUDIT_LOCK_ACQUIRE_TEMP_INFIX = ".acquire.";
+const AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX = ".tmp";
+
+/** Parse the id-less-stale-lock / orphan-acquire-temp age bound from config /
+ * env, defaulting to {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS}. A positive finite
+ * override wins (config first, then env); anything else falls back to the
+ * default. Mirrors {@link resolveEagerReverifyIntervalMs}. */
+function resolveIdlessStaleLockMs(configured?: number): number {
+  if (typeof configured === "number" && Number.isFinite(configured) && configured >= 0) {
+    return configured;
+  }
+  const env = Number(process.env.AUDIT_WRITE_LOCK_IDLESS_STALE_MS);
+  if (Number.isFinite(env) && env >= 0 && process.env.AUDIT_WRITE_LOCK_IDLESS_STALE_MS) {
+    return env;
+  }
+  return AUDIT_WRITE_LOCK_IDLESS_STALE_MS;
+}
 // Read-consistency backstop. A reader does NOT take the write lock (audit reads
 // must work even if a crashed writer stranded a lock, and must never be blockable
 // by a planted lock file), so it can observe a torn cut while a rotation is
@@ -1653,6 +1693,15 @@ export class AuditLog {
   /** Backstop interval (ms) between full on-disk re-verifies on the eager path;
    * resolved once from config/env. See {@link resolveEagerReverifyIntervalMs}. */
   private readonly eagerReverifyIntervalMs: number;
+  /** Age bound (ms) for the id-less 0-byte stale-lock fallback and the orphan
+   * acquire-temp sweep; resolved once from config/env. See
+   * {@link resolveIdlessStaleLockMs}. */
+  private readonly idlessStaleLockMs: number;
+  /** One-shot guard: the orphan `.acquire.*.tmp` sweep runs once per process on
+   * the first write-lock acquire (crash-orphan temps can only predate this
+   * process, so a single lazy startup sweep suffices to keep them from
+   * accumulating across restarts). */
+  private staleAcquireTempsSwept = false;
   /** F2 Option A: whether to consult the split-boundary record. See
    * {@link AuditLogConfig.consultSplitBoundary}. */
   private readonly consultSplitBoundary: boolean;
@@ -1699,6 +1748,7 @@ export class AuditLog {
     this.eagerReverifyIntervalMs = resolveEagerReverifyIntervalMs(
       config?.eagerReverifyIntervalMs
     );
+    this.idlessStaleLockMs = resolveIdlessStaleLockMs(config?.idlessStaleLockMs);
     this.consultSplitBoundary = config?.consultSplitBoundary ?? true;
     this.splitBoundaryMacKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
     this.filesystemCapabilities = asFilesystemCapabilities(storage);
@@ -3617,7 +3667,18 @@ export class AuditLog {
       recursive: true,
       mode: 0o700,
     });
+    // Once-per-process: GC any `.acquire.*.tmp` a prior process's crash/kill-9
+    // stranded between `link()` and its cleanup (invisible to `list()`, litter
+    // only). Bounded and best-effort so it can never block or fail an acquire.
+    await this.sweepStaleAcquireTempsOnce(this.auditWriteLockPath);
     const started = Date.now();
+    // Identity (dev+ino) of the lock file THIS acquire published, captured at
+    // acquire time. The graceful release below unlinks ONLY if the path still
+    // resolves to this exact inode, symmetric with the stale-break path: if the
+    // lock was ever broken-and-republished under us (a fresh inode at the same
+    // path), a bare `rm(path)` would delete the NEW holder's lock and let two
+    // writers proceed. `unlinkIfSameInode` rejects that. See atomicAcquireAuditLock.
+    let heldLockStats: Stats | undefined;
     let acquired = false;
     while (!acquired) {
       try {
@@ -3629,7 +3690,7 @@ export class AuditLog {
         // is no create-then-stamp window in which a crash can strand a 0-byte
         // lock its own staleness-prover cannot clear. A crash before the `link`
         // leaves only the temp file (cleaned up below / ignored by the prover).
-        await this.atomicAcquireAuditLock(this.auditWriteLockPath);
+        heldLockStats = await this.atomicAcquireAuditLock(this.auditWriteLockPath);
         acquired = true;
       } catch (err) {
         const code =
@@ -3655,13 +3716,72 @@ export class AuditLog {
     try {
       return await operation();
     } finally {
-      await rm(this.auditWriteLockPath, { force: true });
+      // Inode-verified release (symmetric with the stale-break path). Delete the
+      // lock only if it is still the file WE published; if a broken-and-republished
+      // lock now occupies the path with a different inode, leave it (never clobber
+      // the new holder). Fall back to a bare `rm` only if we somehow hold no
+      // captured identity, so a release never silently leaks the lock.
+      //
+      // A REAL unlink failure (EIO/EPERM/EROFS) now PROPAGATES rather than being
+      // swallowed: `unlinkIfSameInode` returns for the benign outcomes (the file
+      // was ours and removed, was already gone, or a different inode now occupies
+      // the path → not ours) and THROWS only on a genuine fs error. Swallowing
+      // that error would leave our lock on disk still carrying our live same-boot
+      // pid, which the next acquirer cannot prove stale → permanent self-brick.
+      // Surfacing it is invariant 5 (never silently degrade to a leaked lock).
+      if (heldLockStats) {
+        await this.unlinkIfSameInode(this.auditWriteLockPath, heldLockStats);
+      } else {
+        await rm(this.auditWriteLockPath, { force: true });
+      }
+    }
+  }
+
+  /**
+   * Once per process, sweep orphaned audit-lock acquire-temps
+   * (`<lockfile>.acquire.*.tmp`) whose mtime is older than
+   * {@link idlessStaleLockMs}. A crash / kill -9 between `link()` and the
+   * `finally` unlink in {@link atomicAcquireAuditLock} strands one of these
+   * permanently: it is invisible to `list()` (which filters to `.enc`) and never
+   * consulted by the staleness prover, so it is pure litter that accumulates
+   * across restarts. Age-gating past the generous id-less bound guarantees a
+   * temp a CONCURRENT acquirer is mid-flight with (sub-second) is never reaped.
+   * Best-effort and bounded: any error is swallowed so the sweep can never block
+   * or fail a write-lock acquire.
+   */
+  private async sweepStaleAcquireTempsOnce(lockPath: string): Promise<void> {
+    if (this.staleAcquireTempsSwept) return;
+    this.staleAcquireTempsSwept = true;
+    try {
+      const dir = dirname(lockPath);
+      const lockBase = lockPath.slice(dir.length + 1);
+      const tempPrefix = lockBase + AUDIT_LOCK_ACQUIRE_TEMP_INFIX;
+      const entries = await readdir(dir);
+      const now = Date.now();
+      for (const name of entries) {
+        if (!name.startsWith(tempPrefix) || !name.endsWith(AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX)) {
+          continue;
+        }
+        const tempPath = join(dir, name);
+        try {
+          const st = await stat(tempPath);
+          if (now - st.mtimeMs > this.idlessStaleLockMs) {
+            await unlink(tempPath).catch(() => undefined);
+          }
+        } catch {
+          // Vanished or unstattable between readdir and stat: nothing to reap.
+        }
+      }
+    } catch {
+      // Listing the audit dir failed (e.g. not yet created): no temps to sweep.
     }
   }
 
   /**
    * Atomically create the audit write lock already carrying its `{pid,
-   * acquired_at}` stamp, or throw `EEXIST` if it is already held.
+   * acquired_at, uptime_ms, boot_id}` stamp, or throw `EEXIST` if it is already
+   * held. Returns the `Stats` (dev+ino) of the published lock so the caller's
+   * graceful release can be inode-verified (symmetric with the stale-break path).
    *
    * Drill-found fix (Leg 5, MBA 2026-07-15): the prior acquire did
    * `open(path,"wx")` (which creates the file EMPTY) and only THEN wrote the
@@ -3675,8 +3795,17 @@ export class AuditLog {
    * file only ever exists WITH its stamp. A crash before the `link` leaves at
    * most an orphan temp file, which is cleaned up here and never consulted by
    * the staleness prover.
+   *
+   * `boot_id` (a per-boot IDENTITY UUID; see {@link currentBootId}) is the
+   * PRIMARY same-boot proof: `breakStaleAuditLock` protects a live same-boot lock
+   * only when the lock's `boot_id` equals the current boot's, and treats any
+   * mismatch as definitive reboot evidence. `uptime_ms` (system `os.uptime()` at
+   * acquire) is a MONOTONIC magnitude used WITHIN a proven-same boot to tell our
+   * own live lock from a reused-self-pid orphan without trusting the wall clock;
+   * unlike `boot_id`, a bare uptime magnitude aliases across reboots, so it is
+   * never consulted unless `boot_id` has already proven the same boot.
    */
-  private async atomicAcquireAuditLock(lockPath: string): Promise<void> {
+  private async atomicAcquireAuditLock(lockPath: string): Promise<Stats> {
     // The temp name uses a CRYPTO-RANDOM component (not just pid + time +
     // counter) so it is unpredictable: combined with the O_EXCL (`"wx"`) create
     // below and the operator-owned 0700 audit dir it lives in, an attacker
@@ -3684,20 +3813,31 @@ export class AuditLog {
     // (CodeQL js/insecure-temporary-file). The pid + counter are retained only
     // for human-readable provenance in a crash-orphan.
     const tempPath =
-      `${lockPath}.acquire.${process.pid}.${(auditLockTempCounter++).toString(36)}.` +
-      `${randomBytes(12).toString("hex")}.tmp`;
+      `${lockPath}${AUDIT_LOCK_ACQUIRE_TEMP_INFIX}${process.pid}.` +
+      `${(auditLockTempCounter++).toString(36)}.` +
+      `${randomBytes(12).toString("hex")}${AUDIT_LOCK_ACQUIRE_TEMP_SUFFIX}`;
     let tempCreated = false;
+    // Inode identity of the file we publish. `link` is a hard link, so `lockPath`
+    // shares the temp's inode: capturing it from the OPEN handle (before close,
+    // hence before the link) is race-free: it is exactly the inode `lockPath`
+    // will resolve to, with no window for another actor to swap it.
+    let publishedStats: Stats | undefined;
     try {
       const handle = await open(tempPath, "wx", 0o600);
       tempCreated = true;
       try {
+        const uptimeMs = currentUptimeMs();
+        const bootId = currentBootId();
         await handle.writeFile(
           JSON.stringify({
             pid: process.pid,
             acquired_at: new Date().toISOString(),
+            ...(uptimeMs !== undefined ? { uptime_ms: Math.round(uptimeMs) } : {}),
+            ...(bootId !== undefined ? { boot_id: bootId } : {}),
           })
         );
         await handle.sync();
+        publishedStats = await handle.stat();
       } finally {
         await handle.close();
       }
@@ -3715,6 +3855,9 @@ export class AuditLog {
         await unlink(tempPath).catch(() => undefined);
       }
     }
+    // Reached only when the link succeeded (any failure above threw); the handle
+    // stat always populated publishedStats before the link, so this is defined.
+    return publishedStats!;
   }
 
   /**
@@ -3746,28 +3889,54 @@ export class AuditLog {
           ? String((err as NodeJS.ErrnoException).code)
           : "";
       // Already gone: another writer removed the proven-stale lock; effectively
-      // broken from our perspective. Anything else: cannot safely remove.
+      // broken from our perspective. A REAL fs error (EACCES/EIO/…) is NOT
+      // "already gone" and must NOT be laundered into a benign `false`: surface
+      // it so a caller (esp. the graceful release) never silently treats a lock
+      // it could not verify as released (invariant 5: never silently degrade).
       if (code === "ENOENT") return true;
-      return false;
+      throw err;
     }
     if (current.dev !== proven.dev || current.ino !== proven.ino) {
       // A different file object now occupies the path (a racing acquirer already
-      // broke the stale lock and published a fresh one). Do NOT remove it.
+      // broke the stale lock and published a fresh one). Do NOT remove it. This
+      // is the one benign `false`: not an error, just "not ours to remove".
       return false;
     }
+    // `rm(force)` swallows ENOENT (someone else removed it first → gone, fine)
+    // but PROPAGATES a real removal error (EIO/EPERM/EROFS). That propagation is
+    // intentional and must reach the caller: a swallowed release failure leaves
+    // our lock on disk still carrying our live same-boot pid, which the next
+    // acquirer cannot prove stale → permanent self-brick.
     await rm(lockPath, { force: true });
     return true;
   }
 
   /**
    * Break the audit-write lock iff it is PROVABLY stale, returning true when a
-   * stale lock was removed. Staleness is proven three ways, all robust:
+   * stale lock was removed. Staleness is proven several ways, all robust:
    *
-   *   - The lock's `acquired_at` predates the current system boot. A lock that
-   *     survived a reboot is definitionally orphaned, and this is immune to PID
-   *     reuse (the recorded PID may now belong to an unrelated process, INCLUDING
-   *     this very process: after a reboot the OS can hand us the dead holder's
-   *     old pid, so this proof is checked BEFORE the self-pid guard).
+   *   - BOOT-IDENTITY (primary; a per-boot UUID stamp, see {@link
+   *     currentBootId}). When the lock's `boot_id` proves a DIFFERENT boot than
+   *     the current one, the lock survived a reboot and is definitionally
+   *     orphaned REGARDLESS of pid liveness (a reboot can reuse the dead holder's
+   *     pid for a live process, foreign OR our own reclaimed pid), so it is
+   *     broken, and this check runs BEFORE any pid-liveness "protect" path.
+   *     When `boot_id` proves the SAME boot, the monotonic `uptime_ms` / pid
+   *     reasoning is valid and immune to a wall-clock step, so a live same-boot
+   *     holder is protected (legitimate contention) and a same-boot crash orphan
+   *     (dead pid, or our own reused pid stamped before our start) is broken.
+   *     This is what a bare `uptime_ms` MAGNITUDE cannot do alone: uptime resets
+   *     on reboot, so a previous boot's value ALIASES into this boot's range and
+   *     a reboot orphan with a reused-alive pid would masquerade as live (the
+   *     #944 permanent-brick regression this gating closes).
+   *   - WALL-CLOCK FALLBACK (locks with NO `boot_id`, i.e. old format, or when the
+   *     boot-identity source is unavailable in a confined sandbox): the lock's
+   *     `acquired_at` predates the current system boot. A lock that survived a
+   *     reboot is definitionally orphaned, and this is immune to PID reuse (the
+   *     recorded PID may now belong to an unrelated process, INCLUDING this very
+   *     process: after a reboot the OS can hand us the dead holder's old pid, so
+   *     this proof is checked BEFORE the self-pid guard). This restores the
+   *     pre-PR behavior for old-format locks: strong reboot evidence WINS.
    *   - The recorded pid is OURS but `acquired_at` predates THIS process's start
    *     (a reused-self-pid orphan): we had not started when it was stamped, so it
    *     cannot be a lock we hold. Uses `process.uptime()` (no `uv_uptime`
@@ -3777,13 +3946,26 @@ export class AuditLog {
    *     before the PID has been reused.
    *   - Drill-found (Leg 5, MBA 2026-07-15): the lock is a genuinely EMPTY
    *     (0-byte) file (the exact torn-acquire artifact) AND its file mtime
-   *     predates boot OR exceeds {@link AUDIT_WRITE_LOCK_IDLESS_STALE_MS}. A
-   *     legitimate holder always stamps `{pid, acquired_at}` (and, since the
-   *     atomic-acquire fix, the lock file never exists content-less), so a
-   *     0-byte lock can only be a torn acquire from an old binary or an
-   *     out-of-band tool. Gated on `size === 0` (not merely "no id parsed"): a
-   *     NON-empty but unparseable lock stays fail-closed, since it could be a
-   *     live holder writing a format this build does not understand.
+   *     predates boot OR exceeds the id-less stale bound ({@link
+   *     AuditLogConfig.idlessStaleLockMs}, default {@link
+   *     AUDIT_WRITE_LOCK_IDLESS_STALE_MS}). A legitimate holder always stamps
+   *     `{pid, acquired_at, uptime_ms, boot_id}` (and, since the atomic-acquire
+   *     fix, the lock file never exists content-less), so a 0-byte lock can only
+   *     be a torn acquire from an old binary or an out-of-band tool. Gated on
+   *     `size === 0` (not merely "no id parsed"): a NON-empty but unparseable
+   *     lock stays fail-closed, since it could be a live holder writing a format
+   *     this build does not understand.
+   *
+   * Documented residual: for an OLD-format lock (no `boot_id`), or in a sandbox
+   * with no boot-identity source, a large forward wall-clock step can still make
+   * a live same-boot lock's `acquired_at` look pre-boot and break it (the
+   * original clock-skew case). Every lock THIS build writes carries a `boot_id`
+   * and is immune (the same-boot identity match protects it). A false-break is
+   * detected fail-closed by the hash-chain's contiguous-sequence check on the
+   * next load (a detected integrity finding, never a silent fork). The lock is a
+   * LOCAL-ONLY, single-host, single-boot coordination primitive; the boot-
+   * identity / monotonic reasoning is not valid across a shared network
+   * filesystem.
    *
    * A lock held by a live process acquired during this boot is left untouched
    * (legitimate contention). A lock that carries an id but cannot be proven
@@ -3841,8 +4023,15 @@ export class AuditLog {
 
     let holderPid: number | undefined;
     let acquiredAtMs: number | undefined;
+    let lockUptimeMs: number | undefined;
+    let lockBootId: string | undefined;
     try {
-      const parsed = JSON.parse(rawContent) as { pid?: unknown; acquired_at?: unknown };
+      const parsed = JSON.parse(rawContent) as {
+        pid?: unknown;
+        acquired_at?: unknown;
+        uptime_ms?: unknown;
+        boot_id?: unknown;
+      };
       if (typeof parsed.pid === "number" && Number.isInteger(parsed.pid)) {
         holderPid = parsed.pid;
       }
@@ -3850,11 +4039,93 @@ export class AuditLog {
         const t = Date.parse(parsed.acquired_at);
         if (!Number.isNaN(t)) acquiredAtMs = t;
       }
+      if (typeof parsed.uptime_ms === "number" && Number.isFinite(parsed.uptime_ms)) {
+        lockUptimeMs = parsed.uptime_ms;
+      }
+      if (typeof parsed.boot_id === "string" && parsed.boot_id.length > 0) {
+        lockBootId = parsed.boot_id;
+      }
     } catch {
       // Empty or non-JSON content: no id to parse. Handled by the 0-byte
       // fallback below (only when genuinely empty); non-empty stays fail-closed.
     }
 
+    // ── Boot-identity-gated staleness reasoning ─────────────────────────────
+    // A per-boot IDENTITY token (`boot_id`; a UUID minted fresh each boot, see
+    // currentBootId) answers "was this lock stamped during the CURRENT boot?"
+    // PROVABLY. This is what a raw uptime MAGNITUDE cannot do: `os.uptime()`
+    // resets to 0 on reboot, so a PREVIOUS boot's `uptime_ms` falls in the same
+    // numeric range as this boot's and ALIASES: a reboot orphan (whose recorded
+    // pid a reboot then reused for a live process) looks exactly like a live
+    // same-boot lock. Gating the "this is a live lock, protect it" decision on
+    // boot-identity EQUALITY lets us protect a genuine live same-boot lock
+    // WITHOUT ever shadowing the reboot-orphan proof (the #944 permanent-brick
+    // regression this closes).
+    //
+    // Local-only invariant (documented): this lock coordinates writers on ONE
+    // host's local filesystem. `boot_id` / `os.uptime()` are comparable only
+    // within a single machine; this must NOT be pointed at a shared network
+    // filesystem where they would come from a different host.
+    const currentBoot = currentBootId();
+    const bootIdentityKnown = lockBootId !== undefined && currentBoot !== undefined;
+    const bootIdentitySameBoot = bootIdentityKnown && lockBootId === currentBoot;
+    const bootIdentityDifferentBoot = bootIdentityKnown && lockBootId !== currentBoot;
+
+    // TIE-BREAK (mandatory): a boot-identity that proves a DIFFERENT boot is the
+    // STRONGEST reboot proof there is: the lock survived a reboot, so it is
+    // definitionally orphaned REGARDLESS of pid liveness (a reboot can hand the
+    // dead holder's pid to a live process, foreign OR our own reclaimed pid).
+    // Checked BEFORE any pid-liveness "protect" path so a reused-alive pid can
+    // never keep a reboot orphan intact. Rows A/B of the acceptance table.
+    if (bootIdentityDifferentBoot) {
+      return this.unlinkIfSameInode(lockPath, proven);
+    }
+
+    const currentUptime = currentUptimeMs();
+    const ourStartUptime =
+      currentUptime !== undefined ? currentUptime - process.uptime() * 1000 : undefined;
+
+    // SAME boot PROVEN → the monotonic uptime / pid-liveness reasoning is valid
+    // and immune to a wall-clock step, so we can safely protect a live same-boot
+    // lock (rows D/E) and break a same-boot crash orphan, with no risk of
+    // shadowing the reboot proof, since a reboot would have failed the identity
+    // match above. Only reached when boot-identity is KNOWN and equal.
+    if (bootIdentitySameBoot && holderPid !== undefined) {
+      if (holderPid === process.pid) {
+        // Our own pid, PROVEN same boot. If a monotonic `uptime_ms` stamp is
+        // present and predates THIS process's start, a dead predecessor reclaimed
+        // our pid this boot → reused-self orphan → break (clock-step-immune).
+        // If it is at/after our start, the lock is genuinely ours → never break.
+        // If no uptime stamp is present we cannot decide here; fall through to
+        // the wall-clock reused-self proof below (process.uptime()-based).
+        if (lockUptimeMs !== undefined && ourStartUptime !== undefined) {
+          if (lockUptimeMs < ourStartUptime - AUDIT_LOCK_MONO_UPTIME_TOLERANCE_MS) {
+            return this.unlinkIfSameInode(lockPath, proven);
+          }
+          return false;
+        }
+      } else if (isProcessAlive(holderPid)) {
+        // A live FOREIGN holder that PROVABLY stamped this boot → legitimate
+        // contention. Protect it from the wall-clock `predatesBoot` proof below,
+        // which a forward clock step could otherwise use to break this live lock.
+        return false;
+      } else {
+        // Foreign holder, proven same boot, NOT alive → same-boot crash orphan.
+        return this.unlinkIfSameInode(lockPath, proven);
+      }
+    }
+
+    // UNKNOWN boot-identity (old-format lock with no `boot_id`, or boot-identity
+    // unavailable in a confined sandbox): we CANNOT prove same-boot, so we must
+    // NOT protect on pid-liveness alone: that is exactly what would let a reboot
+    // orphan with a reused-alive pid survive → brick. Fall through to the
+    // wall-clock reboot proofs below (`predatesBoot`-unconditional, the pre-PR
+    // fail-safe behavior), which break a reboot orphan. Documented residual: an
+    // OLD-format live same-boot lock under a large forward clock step can still
+    // be false-broken here (predatesBoot); every lock THIS build writes carries a
+    // `boot_id` and is immune. A false-break is detected fail-closed by the
+    // hash-chain contiguous-sequence check on the next load (never a silent
+    // fork), the same residual the id-less path documents.
     const bootTimeMs = currentBootTimeMs();
     const predatesBoot =
       acquiredAtMs !== undefined &&
@@ -3904,7 +4175,7 @@ export class AuditLog {
       const mtimeMs = proven.mtimeMs;
       const mtimePredatesBoot = bootTimeMs !== undefined && mtimeMs < bootTimeMs;
       const exceedsIdlessAgeBound =
-        Date.now() - mtimeMs > AUDIT_WRITE_LOCK_IDLESS_STALE_MS;
+        Date.now() - mtimeMs > this.idlessStaleLockMs;
       if (mtimePredatesBoot || exceedsIdlessAgeBound) {
         return this.unlinkIfSameInode(lockPath, proven);
       }
@@ -5013,6 +5284,91 @@ function currentBootTimeMs(): number | undefined {
     // Some sandboxed child processes cannot call uv_uptime. In that case the
     // lock is not proven stale by boot time; PID liveness (and the
     // process-start proof below) can still prove it.
+    return undefined;
+  }
+}
+
+/**
+ * System uptime in ms (`os.uptime()`), or undefined if the syscall is
+ * unavailable (the same confined-uid sandbox that can block {@link
+ * currentBootTimeMs}). Unlike a wall-clock-derived boot/start time, this is a
+ * MONOTONIC signal: it advances at real-time rate and is unaffected by a wall-
+ * clock step, so it is the trustworthy basis for deciding whether an audit-write
+ * lock stamped `uptime_ms` belongs to the current boot / a live holder even when
+ * the wall clock has jumped forward (VM resume, NTP correction).
+ */
+function currentUptimeMs(): number | undefined {
+  try {
+    return osUptime() * 1000;
+  } catch {
+    return undefined;
+  }
+}
+
+// Cache for {@link currentBootId}: `undefined` = not yet read, `null` = read but
+// no source available. The boot-identity token is constant for the life of a
+// boot, so one read suffices and keeps the sysctl exec / /proc read off the
+// per-acquire hot path.
+let cachedBootId: string | null | undefined;
+
+/**
+ * A per-boot IDENTITY token that is STABLE within a boot, DIFFERENT across
+ * reboots, and (unlike a boot TIME) INVARIANT to a wall-clock step:
+ *   - Linux: `/proc/sys/kernel/random/boot_id`, a random UUID minted each boot.
+ *   - macOS: `kern.bootsessionuuid`, a random UUID minted each boot; falls back
+ *     to the `kern.boottime` string on the rare build without it.
+ * Returns `undefined` when no source is available (an unknown platform, or a
+ * confined sandbox that blocks both the /proc read and the sysctl exec).
+ *
+ * This is the trustworthy answer to "was this lock stamped during the CURRENT
+ * boot?". A boot TIME derived from `Date.now() - uptime` shifts under an NTP /
+ * VM-resume clock step, and a raw `uptime` MAGNITUDE ALIASES across reboots (a
+ * previous boot's uptime falls in the same numeric range as this boot's), so
+ * neither can distinguish a live same-boot lock from a reboot orphan whose pid
+ * was reused by a live process. A per-boot UUID cannot be confused between two
+ * boots, so {@link AuditLog.breakStaleAuditLock} uses it to protect a genuine
+ * live same-boot lock WITHOUT shadowing the reboot-orphan proof.
+ *
+ * Result is cached (see {@link cachedBootId}). A read failure caches "no source"
+ * so a broken/blocked source is not retried on every acquire; this fails safe:
+ * with no identity the caller falls back to the wall-clock reboot proofs.
+ */
+function currentBootId(): string | undefined {
+  if (cachedBootId !== undefined) return cachedBootId ?? undefined;
+  cachedBootId = readBootIdUncached() ?? null;
+  return cachedBootId ?? undefined;
+}
+
+/** One-shot platform read behind {@link currentBootId}'s cache. */
+function readBootIdUncached(): string | undefined {
+  try {
+    if (process.platform === "linux") {
+      const id = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      return id.length > 0 ? id : undefined;
+    }
+    if (process.platform === "darwin") {
+      const readSysctl = (name: string): string => {
+        try {
+          return execFileSync("sysctl", ["-n", name], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+            timeout: 2_000,
+          }).trim();
+        } catch {
+          return "";
+        }
+      };
+      const sessionUuid = readSysctl("kern.bootsessionuuid");
+      if (sessionUuid.length > 0) return sessionUuid;
+      // Last-resort fallback for a macOS build without kern.bootsessionuuid: the
+      // boot TIME string. Less ideal (a large clock step can shift it), but still
+      // a per-boot discriminator; the tie-break treats any mismatch as reboot
+      // evidence, never as license to protect an orphan.
+      const boottime = readSysctl("kern.boottime");
+      return boottime.length > 0 ? boottime : undefined;
+    }
+    return undefined;
+  } catch {
     return undefined;
   }
 }

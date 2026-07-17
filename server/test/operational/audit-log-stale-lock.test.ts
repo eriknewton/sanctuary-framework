@@ -1,9 +1,10 @@
-import { mkdtemp, rm, writeFile, mkdir, stat, utimes, readdir } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdtemp, rm, writeFile, readFile, rename, mkdir, stat, utimes, readdir } from "node:fs/promises";
+import { tmpdir, uptime as osUptime } from "node:os";
+import type { Stats } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { AuditLog } from "../../src/operational/audit-log.js";
+import { AuditLog, type AuditLogConfig } from "../../src/operational/audit-log.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
@@ -321,5 +322,409 @@ describe("AuditLog stale write-lock recovery (Finding F)", () => {
     await log.append("l1", "egress_allowed", "id-2", { n: 2 });
     await expect(log.flush()).resolves.toBeUndefined();
     await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+});
+
+// #944 write-lock robustness cluster (sweep fix 5, 2026-07-16): clock-skew-safe
+// staleness via a monotonic `uptime_ms` stamp, inode-verified graceful release,
+// orphan acquire-temp GC, and the previously-missing #944 branch cases. These
+// are white-box tests over the private lock internals: they drive the staleness
+// decision and the release path directly so the security-critical branches are
+// exercised deterministically, without racing the 5s contention timeout.
+describe("AuditLog write-lock robustness (#944 cluster)", () => {
+  const dirs: string[] = [];
+
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  // Minimal white-box surface onto the private lock internals under test.
+  type LockInternals = {
+    breakStaleAuditLock(lockPath: string): Promise<boolean>;
+    unlinkIfSameInode(lockPath: string, proven: Stats): Promise<boolean>;
+    withAuditWriteLock<T>(operation: () => Promise<T>): Promise<T>;
+    readonly auditWriteLockPath?: string;
+  };
+
+  async function makeLog(config?: AuditLogConfig) {
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-audit-lock-robust-"));
+    dirs.push(root);
+    const storagePath = join(root, "state");
+    const log = new AuditLog(new FilesystemStorage(storagePath), generateRandomKey(), {
+      integrityMode: "lenient",
+      ...config,
+    });
+    const lockPath = join(storagePath, "_audit", ".audit-write.lock");
+    await mkdir(dirname(lockPath), { recursive: true });
+    return { log, lockPath, internals: log as unknown as LockInternals };
+  }
+
+  // Monotonic reference points captured the same way the production code does.
+  function monotonicNow() {
+    const currentUptimeMs = osUptime() * 1000;
+    const ourStartUptimeMs = currentUptimeMs - process.uptime() * 1000;
+    return { currentUptimeMs, ourStartUptimeMs };
+  }
+
+  const PRE_BOOT = "2020-01-01T00:00:00.000Z";
+  // A boot-identity token guaranteed to differ from the current boot's (a UUID
+  // that no real boot mints), used to simulate a PREVIOUS boot's lock (a reboot
+  // orphan). currentBootId reads a per-boot UUID; this fixed one cannot collide.
+  const DIFFERENT_BOOT = "00000000-0000-4000-8000-000000000000";
+
+  // The EXACT boot-identity token production stamps THIS boot, read back from a
+  // real acquire so the test can never drift from currentBootId's platform read
+  // (mirrors how monotonicNow re-derives os.uptime the way production does).
+  // Precondition-asserts availability: every CI host (Linux /proc/.../boot_id,
+  // macOS kern.bootsessionuuid) exposes one, and the boot-identity path under
+  // test is meaningless without it.
+  async function currentStampedBootId(
+    internals: LockInternals,
+    lockPath: string,
+  ): Promise<string> {
+    let id: unknown;
+    await internals.withAuditWriteLock(async () => {
+      id = JSON.parse(await readFile(lockPath, "utf8")).boot_id;
+    });
+    expect(typeof id).toBe("string");
+    expect(id).not.toBe(DIFFERENT_BOOT);
+    return id as string;
+  }
+
+  // Finding 2 (clock-skew), row E — the headline protect-test. A forward
+  // wall-clock step (VM resume, NTP correction) inflates the DERIVED boot time,
+  // making a LIVE same-boot lock's acquired_at look pre-boot. The OLD wall-clock
+  // proof would break this live lock (→ two writers → chain fork). The lock's
+  // `boot_id` PROVES it was stamped THIS boot (a per-boot UUID is invariant to a
+  // clock step), so it is left intact regardless of the wall clock. (pid 1 is
+  // always alive.)
+  it("does NOT break a LIVE same-boot lock whose acquired_at looks pre-boot (forward clock step)", async () => {
+    const { lockPath, internals } = await makeLog();
+    const bootId = await currentStampedBootId(internals, lockPath);
+    const { currentUptimeMs } = monotonicNow();
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 1,
+        acquired_at: PRE_BOOT, // as a forward clock step would make it appear
+        uptime_ms: Math.round(currentUptimeMs - 1000), // stamped ~1s ago, this boot
+        boot_id: bootId, // PROVES this boot → protected despite the pre-boot stamp
+      }),
+    );
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(false);
+    await expect(stat(lockPath)).resolves.toBeDefined();
+  });
+
+  // Finding 2 — the same protection for our OWN pid: a live sibling instance in
+  // THIS process holds the lock, stamped after our start, but a forward step made
+  // its acquired_at look pre-boot. Same boot is PROVEN by `boot_id`; within that,
+  // the monotonic uptime_ms (>= our start) confirms it as our own live hold, so
+  // it wins over the wall-clock predatesBoot proof and is not broken. This is the
+  // exact "2 in-process instances + forward step" trigger.
+  it("does NOT break our own live lock stamped after our start, despite a pre-boot acquired_at", async () => {
+    const { lockPath, internals } = await makeLog();
+    const bootId = await currentStampedBootId(internals, lockPath);
+    const { currentUptimeMs, ourStartUptimeMs } = monotonicNow();
+    expect(ourStartUptimeMs).toBeGreaterThan(2000); // precondition for the stamp below
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        acquired_at: PRE_BOOT,
+        // Between our start and now → unambiguously our own live hold.
+        uptime_ms: Math.round((ourStartUptimeMs + currentUptimeMs) / 2),
+        boot_id: bootId, // PROVES this boot → the uptime reasoning is trusted
+      }),
+    );
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(false);
+    await expect(stat(lockPath)).resolves.toBeDefined();
+  });
+
+  // Finding 2 — the fix must NOT over-protect: a genuinely dead holder is still
+  // broken even though its lock is PROVEN same-boot (matching boot_id + recent
+  // uptime_ms). Proves the same-boot path gates on liveness, not merely on
+  // "stamped this boot" — a same-boot crash orphan is still cleared.
+  it("STILL breaks a dead holder's same-boot lock (proven boot_id, recent uptime_ms)", async () => {
+    const { lockPath, internals } = await makeLog();
+    const bootId = await currentStampedBootId(internals, lockPath);
+    const { currentUptimeMs } = monotonicNow();
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 999_999, // not a live process
+        acquired_at: new Date().toISOString(),
+        uptime_ms: Math.round(currentUptimeMs - 1000),
+        boot_id: bootId, // same boot proven, yet the holder is dead → break
+      }),
+    );
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // Finding 2 — reused-self-pid orphan proven MONOTONICALLY within a proven-same
+  // boot (immune to a clock step): matching boot_id proves same boot, and the
+  // uptime_ms stamp predates THIS process's start, so a dead predecessor
+  // reclaimed our pid this boot. Must break.
+  it("breaks a reused-self-pid orphan via the monotonic uptime proof (same boot)", async () => {
+    const { lockPath, internals } = await makeLog();
+    const bootId = await currentStampedBootId(internals, lockPath);
+    const { ourStartUptimeMs } = monotonicNow();
+    expect(ourStartUptimeMs).toBeGreaterThan(2000);
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        acquired_at: new Date().toISOString(), // recent wall clock is irrelevant here
+        uptime_ms: Math.round(ourStartUptimeMs / 2), // before we started, same boot
+        boot_id: bootId, // same boot proven → the uptime predates-our-start proof applies
+      }),
+    );
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // ── HIGH regression (two-family gate, 2026-07-16): the reboot-orphan brick ──
+  // os.uptime() RESETS on reboot, so a previous boot's uptime_ms falls in the
+  // SAME numeric range as this boot's. Gating "protect this live lock" on that
+  // magnitude alone would let a reboot orphan whose recorded pid a reboot then
+  // reused for a LIVE process masquerade as a live same-boot lock → never broken
+  // → the fortress retries to the 5s timeout → AuditLockContentionError → audit
+  // writes bricked. Boot-identity (a per-boot UUID) closes it: a mismatch is
+  // proven reboot evidence and wins over any pid-liveness protect path.
+
+  // Row A: reboot orphan whose reused pid is a LIVE FOREIGN process. The exact
+  // brick vector — MUST be broken despite the live pid and the aliasing uptime.
+  it("breaks a reboot orphan whose reused pid is a LIVE foreign process (boot-identity mismatch)", async () => {
+    const { lockPath, internals } = await makeLog();
+    const realBoot = await currentStampedBootId(internals, lockPath);
+    const { currentUptimeMs } = monotonicNow();
+    // Previous boot's uptime_ms aliased BELOW the current uptime (the norm for an
+    // early-boot daemon at reboot-recovery); pid 1 is always alive; acquired_at
+    // predates boot. Only the boot-identity mismatch proves it is a reboot orphan.
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 1,
+        acquired_at: PRE_BOOT,
+        uptime_ms: Math.max(0, Math.round(currentUptimeMs - 1000)),
+        boot_id: DIFFERENT_BOOT,
+      }),
+    );
+    expect(DIFFERENT_BOOT).not.toBe(realBoot);
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // Row B: reboot orphan on our OWN reused pid whose uptime_ms is >= our process
+  // start. The buggy magnitude path treated this as "genuinely ours, live" and
+  // refused to break; the boot-identity mismatch proves it is a reboot orphan.
+  it("breaks a reboot orphan on our OWN reused pid even when uptime_ms >= our start (boot-identity mismatch)", async () => {
+    const { lockPath, internals } = await makeLog();
+    const realBoot = await currentStampedBootId(internals, lockPath);
+    const { currentUptimeMs, ourStartUptimeMs } = monotonicNow();
+    const aliasedUptime = Math.round((ourStartUptimeMs + currentUptimeMs) / 2);
+    expect(aliasedUptime).toBeGreaterThan(ourStartUptimeMs); // >= our start
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        acquired_at: PRE_BOOT,
+        uptime_ms: aliasedUptime,
+        boot_id: DIFFERENT_BOOT,
+      }),
+    );
+    expect(DIFFERENT_BOOT).not.toBe(realBoot);
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // NON-VACUITY: the boot-identity gate is load-bearing. The SAME lock bytes are
+  // PROTECTED when boot_id matches this boot (rows D/E) and BROKEN when only the
+  // boot_id is flipped to a different boot (rows A/B). Flipping that one field is
+  // what flips the outcome — proving the guard is not a no-op.
+  it("boot-identity is load-bearing: same lock PROTECTED on match, BROKEN on mismatch", async () => {
+    const { lockPath, internals } = await makeLog();
+    const realBoot = await currentStampedBootId(internals, lockPath);
+    const { currentUptimeMs } = monotonicNow();
+    const base = {
+      pid: 1, // always alive
+      acquired_at: PRE_BOOT, // forward-clock-step appearance
+      uptime_ms: Math.max(0, Math.round(currentUptimeMs - 1000)),
+    };
+
+    // Same boot proven → a live foreign holder is legitimate contention → kept.
+    await writeFile(lockPath, JSON.stringify({ ...base, boot_id: realBoot }));
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(false);
+    await expect(stat(lockPath)).resolves.toBeDefined();
+
+    // Flip ONLY boot_id → proven reboot orphan → broken. Same bytes otherwise.
+    expect(DIFFERENT_BOOT).not.toBe(realBoot);
+    await writeFile(lockPath, JSON.stringify({ ...base, boot_id: DIFFERENT_BOOT }));
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // Tie-break for an OLD-format lock (no boot_id): absent boot-identity must NOT
+  // leave a reboot orphan intact. pid 1 is alive and acquired_at predates boot —
+  // the pre-PR fail-safe wins (predatesBoot breaks it) rather than the buggy
+  // magnitude path protecting it. Guards the "fall back to predatesBoot-
+  // unconditional" contract for locks an old binary / out-of-band tool wrote.
+  it("old-format lock (no boot_id) still breaks a reboot orphan via predatesBoot (live pid)", async () => {
+    const { lockPath, internals } = await makeLog();
+    await writeFile(
+      lockPath,
+      JSON.stringify({ pid: 1, acquired_at: PRE_BOOT }),
+    );
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // MEDIUM (invariant 5): a REAL removal error must be SURFACED, not swallowed.
+  // The lock path is a non-empty directory: the identity re-stat matches, but the
+  // removal throws a genuine fs error (EISDIR / EPERM / …). unlinkIfSameInode
+  // must propagate it — the graceful release relies on this so a failed release
+  // never silently leaves our lock on disk (self-brick), only the benign
+  // already-gone / inode-mismatch outcomes are swallowed.
+  it("unlinkIfSameInode surfaces a REAL removal error instead of swallowing it", async () => {
+    const { lockPath, internals } = await makeLog();
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(join(lockPath, "child"), "x");
+    const proven = await stat(lockPath);
+
+    await expect(internals.unlinkIfSameInode(lockPath, proven)).rejects.toBeDefined();
+    // The un-removable object is still present: the release did not silently
+    // claim success (which would have leaked the lock).
+    await expect(stat(lockPath)).resolves.toBeDefined();
+  });
+
+  // Finding 4 — the same-boot `exceedsIdlessAgeBound` 0-byte branch (distinct
+  // from the mtime-predates-boot branch the existing suite covers). A 0-byte lock
+  // whose mtime is AFTER boot but older than the (test-lowered) id-less bound is
+  // provably not a live sub-second hold → break.
+  it("breaks a same-boot 0-byte lock via the id-less age bound (not the boot proof)", async () => {
+    const { lockPath, internals } = await makeLog({ idlessStaleLockMs: 100 });
+    await writeFile(lockPath, "");
+    const mtime = new Date(Date.now() - 1000); // ~1s ago: after boot, > 100ms bound
+    await utimes(lockPath, mtime, mtime);
+    await expect(stat(lockPath).then((s) => s.size)).resolves.toBe(0);
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // Finding 4 — a field-less but non-empty `{}` lock (valid JSON, no pid /
+  // acquired_at / uptime_ms) is NOT 0-byte, so the id-less fallback cannot fire,
+  // and it carries no id to prove liveness from → it stays fail-closed (never
+  // broken), exactly like a foreign live holder writing an unknown format.
+  it("does NOT break a field-less {} lock (stays fail-closed)", async () => {
+    const { lockPath, internals } = await makeLog();
+    await writeFile(lockPath, "{}");
+
+    await expect(internals.breakStaleAuditLock(lockPath)).resolves.toBe(false);
+    await expect(stat(lockPath)).resolves.toBeDefined();
+  });
+
+  // Finding 4 — the `unlinkIfSameInode` inode-MISMATCH branch directly (the
+  // existing suite only reaches it through the concurrent-race outcome). A
+  // delayed break must NOT remove a DIFFERENT file that now occupies the path
+  // (a racing acquirer's fresh lock), and must remove the proven one, and must
+  // treat an already-vanished file as broken.
+  it("unlinkIfSameInode removes only the proven inode (mismatch left intact)", async () => {
+    const { lockPath, internals } = await makeLog();
+    const sibling = lockPath + ".sibling";
+
+    // MISMATCH: a racing acquirer republished a fresh lock (a NEW inode) at the
+    // same path. We publish it at a sibling path first, then rename it over the
+    // lock: two coexisting files always have distinct inodes, so the republished
+    // inode is guaranteed != `proven` even on a filesystem that AGGRESSIVELY
+    // reuses freed inode numbers (Linux ext4/tmpfs) — a plain rm+recreate can
+    // reuse the number and is flaky. The delayed break must leave it intact.
+    await writeFile(lockPath, "original");
+    const proven = await stat(lockPath);
+    await writeFile(sibling, "republished");
+    await rename(sibling, lockPath); // atomic replace → lockPath now has a NEW inode
+    const republished = await stat(lockPath);
+    expect(republished.ino).not.toBe(proven.ino);
+    await expect(internals.unlinkIfSameInode(lockPath, proven)).resolves.toBe(false);
+    await expect(stat(lockPath).then((s) => s.ino)).resolves.toBe(republished.ino);
+
+    // MATCH: proving the CURRENT file stale removes it and returns true.
+    const current = await stat(lockPath);
+    await expect(internals.unlinkIfSameInode(lockPath, current)).resolves.toBe(true);
+    await expect(stat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+    // ABSENT: nothing at the path → treated as already-broken, returns true.
+    await expect(internals.unlinkIfSameInode(lockPath, current)).resolves.toBe(true);
+  });
+
+  // Finding 1 — inode-verified GRACEFUL release. If the lock this instance holds
+  // is broken-and-republished under it (a fresh inode at the same path) while its
+  // operation runs, the finally-release must NOT delete the new holder's lock (a
+  // bare rm-by-path would → double-acquire cascade). We drive withAuditWriteLock
+  // with an operation that republishes the lock, then assert the republished lock
+  // survives the release.
+  it("graceful release does not clobber a lock republished under it", async () => {
+    const { lockPath, internals } = await makeLog();
+    let republishedIno = -1;
+
+    await internals.withAuditWriteLock(async () => {
+      const held = await stat(lockPath);
+      // Simulate a break-and-republish by another acquirer. Publish the fresh
+      // lock at a sibling path, then rename it over ours: coexisting files have
+      // distinct inodes, so the republished inode is guaranteed != held even on a
+      // filesystem that reuses freed inode numbers (a plain rm+recreate is flaky
+      // on Linux ext4/tmpfs, which immediately reuses the just-freed inode).
+      const sibling = lockPath + ".sibling";
+      await writeFile(
+        sibling,
+        JSON.stringify({ pid: 4242, acquired_at: new Date().toISOString() }),
+      );
+      await rename(sibling, lockPath);
+      republishedIno = (await stat(lockPath)).ino;
+      expect(republishedIno).not.toBe(held.ino);
+    });
+
+    // The republished (different-inode) lock must still be present: our release
+    // recognized it was not the file we acquired and left it alone.
+    await expect(stat(lockPath).then((s) => s.ino)).resolves.toBe(republishedIno);
+  });
+
+  // Finding 3 — orphan `.acquire.*.tmp` GC. A crash between link() and cleanup
+  // strands an acquire-temp permanently. The once-per-process startup sweep GCs
+  // temps older than the id-less bound, and age-gates so a CONCURRENT acquirer's
+  // in-flight temp is never reaped. One append triggers the lazy sweep.
+  it("sweeps an orphaned acquire-temp older than the bound but keeps a recent one", async () => {
+    // Bound of 3s: the 5s-old temp exceeds it (swept); a "now" temp stays under
+    // it even allowing for the append+flush latency below (kept).
+    const { log, lockPath } = await makeLog({ idlessStaleLockMs: 3000 });
+    const auditDir = dirname(lockPath);
+    const oldTemp = join(auditDir, ".audit-write.lock.acquire.99999.0.deadbeef.tmp");
+    const recentTemp = join(auditDir, ".audit-write.lock.acquire.88888.0.cafef00d.tmp");
+    await writeFile(oldTemp, JSON.stringify({ pid: 99999 }));
+    await writeFile(recentTemp, JSON.stringify({ pid: 88888 }));
+    const old = new Date(Date.now() - 5000); // 5s old, > 3s bound → swept
+    await utimes(oldTemp, old, old);
+    // recentTemp keeps its "now" mtime → within the bound → NOT swept.
+
+    // The first write-lock acquire runs the one-shot sweep.
+    await log.append("l1", "egress_allowed", "id-1", { n: 1 });
+    await log.flush();
+
+    await expect(stat(oldTemp)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(recentTemp)).resolves.toBeDefined();
+    // The append's own acquire-temp left no litter either.
+    const leftovers = (await readdir(auditDir)).filter(
+      (f) => f.includes(".audit-write.lock.acquire.") && f !== ".audit-write.lock.acquire.88888.0.cafef00d.tmp",
+    );
+    expect(leftovers).toEqual([]);
   });
 });
