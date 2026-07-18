@@ -2117,16 +2117,29 @@ export async function runSafeModeDaemon(
   // keeps serving regardless.
   let exclusiveEgressSupervisor: { stopOracleLoop(): void } | undefined;
   try {
-    const { startExclusiveEgressBootSupervisor } = await import("../egress-gate/arming-wiring.js");
+    const { startExclusiveEgressBootSupervisor, NON_HERMES_BOOT_PARK_REASON } = await import(
+      "../egress-gate/arming-wiring.js"
+    );
     const { loadExclusiveRoutingMarker } = await import("../castle-wall/allowlist/routing-marker.js");
     const { deriveAgentAccountName, resolveHermesGatewayArgv } = await import(
       "../castle-wall/provision/index.js"
     );
     exclusiveEgressSupervisor = await startExclusiveEgressBootSupervisor({
+      // Discriminated resolution (fix-round H1): an unresolvable agent gets a
+      // REAL reassert-parked (bootout + hold-file removal + disable) inside
+      // the supervisor, never a synthetic unverified "parked" report.
       resolveAgent: async (entry) => {
         const marker = await loadExclusiveRoutingMarker(entry.fortress_path).catch(() => null);
-        if (marker === null || marker.agent_uid !== entry.agent_uid) return null;
-        if (marker.agent_id !== "hermes") return null; // v1 scope: Hermes only.
+        if (marker === null || marker.agent_uid !== entry.agent_uid) {
+          return {
+            kind: "unresolvable" as const,
+            reason: `no exclusive-routing marker names uid ${entry.agent_uid} in ${entry.fortress_path} (marker missing, malformed, or for another uid)`,
+          };
+        }
+        if (marker.agent_id !== "hermes") {
+          // Fix-round M6: a deliberate v1 scope bound, not a fault.
+          return { kind: "unresolvable" as const, reason: NON_HERMES_BOOT_PARK_REASON };
+        }
         const accountName = deriveAgentAccountName(marker.agent_id);
         const agentHome = `/var/sanctuary-agents/${accountName}`;
         const { access } = await import("node:fs/promises");
@@ -2140,6 +2153,7 @@ export async function runSafeModeDaemon(
         };
         const resolved = await resolveHermesGatewayArgv({ pathExists }, { agentHome });
         return {
+          kind: "ok" as const,
           agentAccount: accountName,
           harnessArgv: resolved.programArguments,
           harnessLogDir: `${agentHome}/logs`,

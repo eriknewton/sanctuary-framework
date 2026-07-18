@@ -547,13 +547,21 @@ async function waitForGateRuntime(
   agentUid: number,
   generationId: number,
   gatePort: number,
+  deps?: {
+    readState?: (agentUid: number) => Promise<string>;
+    budgetMs?: number;
+    intervalMs?: number;
+  },
 ): Promise<EgressGateRuntimeState> {
-  const deadline = Date.now() + GATE_RUNTIME_WAIT_BUDGET_MS;
+  const budgetMs = deps?.budgetMs ?? GATE_RUNTIME_WAIT_BUDGET_MS;
+  const intervalMs = deps?.intervalMs ?? GATE_RUNTIME_WAIT_INTERVAL_MS;
   const path = egressGateRuntimeStatePath(agentUid);
+  const readState = deps?.readState ?? (async (uid: number): Promise<string> => readFile(egressGateRuntimeStatePath(uid), "utf8"));
+  const deadline = Date.now() + budgetMs;
   let lastError = "runtime state never appeared";
-  while (Date.now() < deadline) {
+  for (;;) {
     try {
-      const text = await readFile(path, "utf8");
+      const text = await readState(agentUid);
       const state = parseEgressGateRuntimeState(text, path);
       if (state.generation_id === generationId && state.gate_port === gatePort && state.agent_uid === agentUid) {
         return state;
@@ -562,9 +570,51 @@ async function waitForGateRuntime(
     } catch (err) {
       lastError = (err as Error).message;
     }
-    await new Promise((r) => setTimeout(r, GATE_RUNTIME_WAIT_INTERVAL_MS));
+    if (Date.now() >= deadline) break;
+    await new Promise((r) => setTimeout(r, intervalMs));
   }
-  throw new Error(`gate daemon did not publish a matching runtime state within ${GATE_RUNTIME_WAIT_BUDGET_MS}ms: ${lastError}`);
+  throw new Error(`gate daemon did not publish a matching runtime state within ${budgetMs}ms: ${lastError}`);
+}
+
+/**
+ * Bootstrap + kickstart one agent's gate daemon LaunchDaemon and (when a
+ * committed identity is known) wait for its runtime state (fix-round H2: the
+ * gate plist is `RunAtLoad=false`, so WITHOUT this step nothing starts the
+ * gate after a reboot and `verifyGate` parks the agent forever). Mirrors the
+ * install path's bootstrap sequence in {@link productionBringUp}. Throws on
+ * failure; the boot caller logs loudly and lets the barrier's `verifyGate`
+ * produce the honest parked outcome.
+ */
+export async function bootstrapGateDaemonForBoot(input: {
+  agentUid: number;
+  /** The committed identity to await, or null to skip the runtime wait. */
+  expected: { generationId: number; gatePort: number } | null;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  readState?: (agentUid: number) => Promise<string>;
+  waitBudgetMs?: number;
+  waitIntervalMs?: number;
+}): Promise<void> {
+  const run = input.runLaunchctlFn ?? runLaunchctl;
+  const label = egressGateDaemonLabel(input.agentUid);
+  const plistPath = egressGateDaemonPlistPath(input.agentUid);
+  const bootstrap = await run(["bootstrap", "system", plistPath]);
+  if (
+    bootstrap.code !== 0 &&
+    !/already bootstrapped|service already loaded|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)
+  ) {
+    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
+  }
+  const kick = await run(["kickstart", `system/${label}`]);
+  if (kick.code !== 0) {
+    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
+  }
+  if (input.expected !== null) {
+    await waitForGateRuntime(input.agentUid, input.expected.generationId, input.expected.gatePort, {
+      ...(input.readState !== undefined ? { readState: input.readState } : {}),
+      ...(input.waitBudgetMs !== undefined ? { budgetMs: input.waitBudgetMs } : {}),
+      ...(input.waitIntervalMs !== undefined ? { intervalMs: input.waitIntervalMs } : {}),
+    });
+  }
 }
 
 /**
@@ -1020,35 +1070,154 @@ export interface ExclusiveEgressBootSupervisorHandle {
   stopOracleLoop(): void;
 }
 
+/** Registry entry shape the supervisor consumes (S5-1 + additive S5-2 fields). */
+export interface BootRegistryEntry {
+  agent_uid: number;
+  gate_port: number;
+  fortress_path: string;
+  generation_id?: number;
+  tombstone?: boolean;
+}
+
+/**
+ * The honest v1-scope park reason for a non-Hermes confined agent (fix-round
+ * M6: the prior "marker/account missing" wording misdescribed a deliberate
+ * scope bound as a fault). Exported so the CLI resolver and the tests share
+ * one string.
+ */
+export const NON_HERMES_BOOT_PARK_REASON =
+  "v1 releases only Hermes; other confined agents stay parked by design.";
+
+/** Discriminated boot-agent resolution (fix-round H1: never a bare null). */
+export type BootAgentResolution =
+  | {
+      kind: "ok";
+      agentAccount: string;
+      harnessArgv: string[];
+      harnessLogDir: string;
+      gateUid: number;
+    }
+  | { kind: "unresolvable"; reason: string };
+
+/**
+ * TEST-ONLY seams for {@link startExclusiveEgressBootSupervisor}. Production
+ * callers omit this entirely (real registry, launchctl, barrier, oracle).
+ * Kept in one bag so the production call sites stay obviously seam-free.
+ */
+export interface ExclusiveEgressBootSupervisorInternals {
+  listRegistryEntries?: () => Promise<BootRegistryEntry[]>;
+  ensureKeys?: () => Promise<{ privateKey: KeyObject; publicKey: KeyObject }>;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  runBarrier?: typeof runReleaseBarrierSequence;
+  createBarrierOps?: typeof createProductionReleaseBarrierOps;
+  createOracle?: (privateKey: KeyObject, gateUid: number) => Pick<GateLivenessOracle, "refresh">;
+  removeHoldFile?: (agentUid: number) => Promise<void>;
+  readRuntimeState?: (agentUid: number) => Promise<string>;
+  gateWaitBudgetMs?: number;
+  gateWaitIntervalMs?: number;
+  loadMarker?: (fortressPath: string) => Promise<{ agent_uid: number; gate_uid: number } | null>;
+  ensureRuntimeFs?: (input: { agentUid: number; gateUid: number }) => Promise<void>;
+}
+
+/**
+ * Reassert the parked state for an agent whose release CONTEXT could not be
+ * resolved (fix-round H1: the pre-fix code reported a SYNTHETIC "parked"
+ * with no ops run at all -- a crash-left enable override or hold file could
+ * boot the harness while the log said PARKED). Without the harness argv /
+ * account we cannot re-render the parked plist, but the three ops we CAN run
+ * are sufficient to hold the park: bootout stops any live job, the disable
+ * override keeps launchd from bootstrapping it at boot, and removing the
+ * hold file makes the exec wrapper refuse even a mistakenly-started job.
+ * Every failure is reported loudly in the returned flags/errors -- never a
+ * clean "parked" that nobody verified.
+ */
+async function reassertParkedWithoutContext(input: {
+  agentUid: number;
+  runLaunchctlFn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  removeHoldFile: (agentUid: number) => Promise<void>;
+}): Promise<{ holdFileRemoved: boolean; jobDisabled: boolean; cleanupErrors: string[] }> {
+  const errors: string[] = [];
+  const bootout = await input.runLaunchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+    errors.push(`bootout failed: launchctl exited ${bootout.code}: ${bootout.stderr.trim()}`);
+  }
+  let holdFileRemoved = false;
+  try {
+    await input.removeHoldFile(input.agentUid);
+    holdFileRemoved = true;
+  } catch (err) {
+    errors.push(`hold-file removal failed: ${(err as Error).message}`);
+  }
+  let jobDisabled = false;
+  const disable = await input.runLaunchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (disable.code === 0) {
+    jobDisabled = true;
+  } else {
+    errors.push(`disable failed: launchctl exited ${disable.code}: ${disable.stderr.trim()}`);
+  }
+  return { holdFileRemoved, jobDisabled, cleanupErrors: errors };
+}
+
 /**
  * The boot daemon's exclusive-egress supervisor: for every fortress with an
- * exclusive-routing marker + registry entry, run the S5-5 boot release
- * sequence (re-arm -> gate-verify -> recommit/hold -> enable+bootstrap ->
- * re-park), then keep the oracle freshness-token loop running (the gate's
- * per-CONNECT liveness is TTL-fresh; without the loop every CONNECT denies
- * within one TTL -- fail-closed but non-functional). NEVER throws.
+ * exclusive-routing marker + registry entry, assert the runtime fs layout,
+ * BOOTSTRAP the per-uid gate daemon (fix-round H2: its plist is
+ * `RunAtLoad=false`, so the boot path must start it before `verifyGate` can
+ * ever pass), then run the S5-5 boot release sequence (re-arm ->
+ * gate-verify -> recommit/hold -> enable+bootstrap -> re-park) -- and keep
+ * the oracle freshness-token loop running. NEVER throws.
+ *
+ * THE REFRESH LOOP RE-SCANS THE REGISTRY EVERY TICK (fix-round H3): the
+ * install CLI's own oracle refresh dies when the CLI exits, so the
+ * PERSISTENT cadence for install-provisioned agents lives HERE, in the
+ * always-running root policy daemon. A successful install requires a live
+ * policy-daemon reload (fail-closed), so any agent that armed exclusively
+ * has this daemon running; its next tick (<= refreshIntervalMs) picks the
+ * new registry entry up and keeps the token fresh. HONEST RESIDUAL (stated
+ * loudly): the cadence lives in the boot-safe-mode policy daemon's process;
+ * if an operator runs a fortress with NO castle-wall policy daemon resident,
+ * tokens expire within the TTL and the gate denies everything -- fail-closed
+ * non-functional, repairable by starting the daemon; drill-owed.
  *
  * Boot wiring detail: the harness argv + agent account are recovered from the
  * registry entry's fortress + the parked plist contract via the injected
- * resolver, because the boot daemon has no wrap context.
+ * resolver, because the boot daemon has no wrap context. An UNRESOLVABLE
+ * agent (no marker, non-Hermes) is still parked FOR REAL via
+ * {@link reassertParkedWithoutContext} -- never a synthetic unverified
+ * "parked" report (fix-round H1).
  */
 export async function startExclusiveEgressBootSupervisor(input: {
   /** Resolve per-agent release context from the registry entry. */
-  resolveAgent: (entry: { agent_uid: number; fortress_path: string }) => Promise<{
-    agentAccount: string;
-    harnessArgv: string[];
-    harnessLogDir: string;
-    gateUid: number;
-  } | null>;
+  resolveAgent: (entry: { agent_uid: number; fortress_path: string }) => Promise<BootAgentResolution>;
   audit: (operation: string, details: Record<string, unknown>) => Promise<void>;
   print: (line: string) => void;
   /** Oracle refresh cadence (default: half the token TTL). */
   refreshIntervalMs?: number;
+  /** TEST-ONLY seams; production omits. */
+  internals?: ExclusiveEgressBootSupervisorInternals;
 }): Promise<ExclusiveEgressBootSupervisorHandle> {
-  const registry = createProductionAnchorRegistry();
-  let entries: { agent_uid: number; gate_port: number; fortress_path: string; generation_id?: number; tombstone?: boolean }[] = [];
+  const internals = input.internals ?? {};
+  const listEntries =
+    internals.listRegistryEntries ??
+    (async (): Promise<BootRegistryEntry[]> => (await createProductionAnchorRegistry().list()).entries);
+  const launchctlFn = internals.runLaunchctlFn ?? runLaunchctl;
+  const runBarrier = internals.runBarrier ?? runReleaseBarrierSequence;
+  const createBarrierOps = internals.createBarrierOps ?? createProductionReleaseBarrierOps;
+  const createOracle =
+    internals.createOracle ??
+    ((privateKey: KeyObject, gateUid: number): Pick<GateLivenessOracle, "refresh"> =>
+      createProductionOracle(privateKey, gateUid));
+  const removeHold =
+    internals.removeHoldFile ?? (async (uid: number): Promise<void> => rm(holdFilePathForUid(uid), { force: true }));
+  const loadMarker =
+    internals.loadMarker ??
+    (async (fortressPath: string): Promise<{ agent_uid: number; gate_uid: number } | null> =>
+      loadExclusiveRoutingMarker(fortressPath));
+  const ensureRuntimeFs = internals.ensureRuntimeFs ?? ensureExclusiveEgressRuntimeFs;
+
+  let entries: BootRegistryEntry[] = [];
   try {
-    entries = (await registry.list()).entries;
+    entries = await listEntries();
   } catch (err) {
     input.print(`[castle-wall] boot: exclusive-egress registry unreadable (${(err as Error).message}); all confined agents stay PARKED`);
     return { results: [], stopOracleLoop: () => undefined };
@@ -1056,37 +1225,87 @@ export async function startExclusiveEgressBootSupervisor(input: {
   if (entries.length === 0) {
     return { results: [], stopOracleLoop: () => undefined };
   }
-  const keys = await ensureSupervisorOracleKeys();
-  const resolved = new Map<number, { gateUid: number; entry: (typeof entries)[number] }>();
+  const keys = internals.ensureKeys !== undefined ? await internals.ensureKeys() : await ensureSupervisorOracleKeys();
+  // Gate-uid cache for the refresh loop (seeded by the boot release, extended
+  // by marker reads for agents armed after boot).
+  const gateUids = new Map<number, number>();
 
   const results = await runBootExclusiveEgressRelease(
     entries.map((e) => ({ agent_uid: e.agent_uid })),
     {
       releaseAgent: async (agentUid): Promise<ReleaseBarrierOutcome> => {
         const entry = entries.find((e) => e.agent_uid === agentUid)!;
-        const ctx = await input.resolveAgent({ agent_uid: agentUid, fortress_path: entry.fortress_path });
-        if (ctx === null) {
+        const resolution = await input.resolveAgent({ agent_uid: agentUid, fortress_path: entry.fortress_path });
+        if (resolution.kind === "unresolvable") {
+          // Fix-round H1: park FOR REAL (bootout + hold-file removal +
+          // disable) and report the ACTUAL results, never a synthetic parked.
+          const reassert = await reassertParkedWithoutContext({
+            agentUid,
+            runLaunchctlFn: launchctlFn,
+            removeHoldFile: removeHold,
+          });
+          if (reassert.cleanupErrors.length > 0) {
+            input.print(
+              `[castle-wall] boot: uid ${agentUid} could NOT be fully re-parked while unresolvable ` +
+                `(${reassert.cleanupErrors.join("; ")}); treat the agent as possibly startable and intervene manually.`,
+            );
+          }
           return {
             kind: "parked",
             stage: "reassert-parked",
-            reason: `no release context could be resolved for uid ${agentUid} (marker/account missing)`,
-            holdFileRemoved: false,
-            jobDisabled: false,
-            cleanupErrors: [],
+            reason: resolution.reason,
+            holdFileRemoved: reassert.holdFileRemoved,
+            jobDisabled: reassert.jobDisabled,
+            cleanupErrors: reassert.cleanupErrors,
           };
         }
-        resolved.set(agentUid, { gateUid: ctx.gateUid, entry });
-        const oracle = createProductionOracle(keys.privateKey, ctx.gateUid);
-        return runReleaseBarrierSequence(
+        const ctx = resolution;
+        gateUids.set(agentUid, ctx.gateUid);
+        // Re-assert the runtime fs layout (idempotent; heals drift and
+        // pre-plan installs). A failure is loud but NOT terminal here: the
+        // barrier's verifyGate will produce the honest parked outcome.
+        try {
+          await ensureRuntimeFs({ agentUid, gateUid: ctx.gateUid });
+        } catch (err) {
+          input.print(`[castle-wall] boot: uid ${agentUid} runtime-fs assert failed: ${(err as Error).message}`);
+        }
+        // Fix-round H2: START the gate daemon (RunAtLoad=false by contract;
+        // nothing else starts it after a reboot), then let the barrier verify
+        // it. A bootstrap failure logs loudly and still runs the barrier,
+        // which parks the agent through its own fail-closed machinery.
+        try {
+          const expected =
+            entry.tombstone !== true &&
+            typeof entry.generation_id === "number" &&
+            Number.isInteger(entry.generation_id) &&
+            entry.generation_id > 0
+              ? { generationId: entry.generation_id, gatePort: entry.gate_port }
+              : null;
+          await bootstrapGateDaemonForBoot({
+            agentUid,
+            expected,
+            runLaunchctlFn: launchctlFn,
+            ...(internals.readRuntimeState !== undefined ? { readState: internals.readRuntimeState } : {}),
+            ...(internals.gateWaitBudgetMs !== undefined ? { waitBudgetMs: internals.gateWaitBudgetMs } : {}),
+            ...(internals.gateWaitIntervalMs !== undefined ? { waitIntervalMs: internals.gateWaitIntervalMs } : {}),
+          });
+        } catch (err) {
+          input.print(
+            `[castle-wall] boot: uid ${agentUid} gate daemon bootstrap failed (${(err as Error).message}); ` +
+              "the release barrier will verify and park fail-closed.",
+          );
+        }
+        const oracle = createOracle(keys.privateKey, ctx.gateUid);
+        return runBarrier(
           { agentUid, harnessLabel: AGENT_HARNESS_DAEMON_LABEL, harnessArgv: ctx.harnessArgv },
-          createProductionReleaseBarrierOps({
+          createBarrierOps({
             agentUid,
             agentAccount: ctx.agentAccount,
             harnessArgv: ctx.harnessArgv,
             fortressPath: entry.fortress_path,
             harnessLogDir: ctx.harnessLogDir,
             gateUid: ctx.gateUid,
-            oracle,
+            oracle: oracle as GateLivenessOracle,
             rearm: "boot-rearm",
           }),
         );
@@ -1096,27 +1315,61 @@ export async function startExclusiveEgressBootSupervisor(input: {
     },
   );
 
-  // Ongoing oracle refresh for the RELEASED agents (TTL-fresh liveness). A
-  // refresh failure removes the token (fail-closed: the gate denies) and is
-  // logged; the loop keeps trying (self-healing drift posture).
+  // Ongoing oracle refresh (TTL-fresh liveness), fix-round H3: RE-SCAN the
+  // registry every tick so agents armed AFTER boot (the install CLI path,
+  // whose own refresh dies with the CLI process) are picked up within one
+  // interval. A refresh failure removes the token (fail-closed: the gate
+  // denies) and is logged; the loop keeps trying (self-healing posture).
   const interval = input.refreshIntervalMs ?? 1_000;
+  const warnedUids = new Set<number>();
   const timer = setInterval(() => {
     void (async (): Promise<void> => {
-      for (const result of results) {
-        if (result.outcome.kind === "parked") continue;
-        const info = resolved.get(result.agent_uid);
-        if (info === undefined) continue;
-        const generationId = result.outcome.generationId;
+      let current: BootRegistryEntry[];
+      try {
+        current = await listEntries();
+      } catch (err) {
+        input.print(`[castle-wall] oracle refresh: registry unreadable (${(err as Error).message}); gates deny within one TTL`);
+        return;
+      }
+      for (const entry of current) {
+        if (entry.tombstone === true) continue;
+        const generationId = entry.generation_id;
+        if (typeof generationId !== "number" || !Number.isInteger(generationId) || generationId <= 0) continue;
+        let gateUid = gateUids.get(entry.agent_uid);
+        if (gateUid === undefined) {
+          try {
+            const marker = await loadMarker(entry.fortress_path);
+            if (marker === null || marker.agent_uid !== entry.agent_uid) {
+              if (!warnedUids.has(entry.agent_uid)) {
+                warnedUids.add(entry.agent_uid);
+                input.print(
+                  `[castle-wall] oracle refresh: no exclusive-routing marker resolves a gate uid for uid ${entry.agent_uid}; its gate denies within one TTL (fail-closed)`,
+                );
+              }
+              continue;
+            }
+            gateUid = marker.gate_uid;
+            gateUids.set(entry.agent_uid, gateUid);
+          } catch (err) {
+            if (!warnedUids.has(entry.agent_uid)) {
+              warnedUids.add(entry.agent_uid);
+              input.print(
+                `[castle-wall] oracle refresh: marker read failed for uid ${entry.agent_uid} (${(err as Error).message}); its gate denies within one TTL (fail-closed)`,
+              );
+            }
+            continue;
+          }
+        }
         try {
-          const oracle = createProductionOracle(keys.privateKey, info.gateUid);
+          const oracle = createOracle(keys.privateKey, gateUid);
           await oracle.refresh({
-            agentUid: result.agent_uid,
-            gatePort: info.entry.gate_port,
+            agentUid: entry.agent_uid,
+            gatePort: entry.gate_port,
             generationId,
           });
         } catch (err) {
           input.print(
-            `[castle-wall] oracle refresh failed for uid ${result.agent_uid}: ${(err as Error).message} (gate denies until it recovers)`,
+            `[castle-wall] oracle refresh failed for uid ${entry.agent_uid}: ${(err as Error).message} (gate denies until it recovers)`,
           );
         }
       }

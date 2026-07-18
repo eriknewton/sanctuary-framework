@@ -265,6 +265,8 @@ export {
 } from "./runtime-fs-plan.js";
 export {
   GATE_ORACLE_PRIVATE_KEY_PATH,
+  NON_HERMES_BOOT_PARK_REASON,
+  bootstrapGateDaemonForBoot,
   createExclusiveEgressPostureProducer,
   createInstallExclusiveEgressOps,
   createProductionAnchorRegistry,
@@ -276,6 +278,9 @@ export {
   startExclusiveEgressBootSupervisor,
   verifyLoopbackTcpPortOwner,
   PID_START_TOLERANCE_MS,
+  type BootAgentResolution,
+  type BootRegistryEntry,
   type ExclusiveEgressBootSupervisorHandle,
+  type ExclusiveEgressBootSupervisorInternals,
   type ExclusiveEgressWiringInput,
 } from "./arming-wiring.js";
