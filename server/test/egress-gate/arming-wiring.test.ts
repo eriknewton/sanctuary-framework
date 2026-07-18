@@ -16,6 +16,7 @@ import {
   createInstallExclusiveEgressOps,
   createProductionReleaseBarrierOps,
   createRepairExclusiveEgressOps,
+  createUnprotectExclusiveEgressOps,
   parkHarnessPersistently,
   restoreCoarseCompositionProduction,
   verifyHarnessJobDisabled,
@@ -26,12 +27,25 @@ import {
   type PersistentParkContext,
 } from "../../src/egress-gate/arming-wiring.js";
 import { PfAnchorRegistry } from "../../src/egress-gate/anchor-registry.js";
+import {
+  gateCredentialAcceptPath,
+  gateCredentialTokenPath,
+} from "../../src/egress-gate/gate-credential.js";
+import {
+  egressGateDaemonPlistPath,
+  egressGatePolicyConfigPath,
+  egressGateRulesConfigPath,
+  egressGateRuntimeUidDirPath,
+} from "../../src/egress-gate/gate-daemon.js";
+import { gateLivenessTokenPath } from "../../src/egress-gate/liveness-oracle.js";
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
 import {
   holdFilePathForUid,
   planParkedHarnessInstall,
   type ReleaseBarrierOps,
 } from "../../src/egress-gate/release-barrier.js";
+import { exclusiveRoutingMarkerPath } from "../../src/castle-wall/allowlist/routing-marker.js";
+import { EXCLUSIVE_EGRESS_GATE_FILENAME } from "../../src/castle-wall/allowlist/gate-derivation.js";
 
 function lsofOutput(pid: number, uid: number): string {
   return `p${pid}\nu${uid}\nnlocalhost:40001\n`;
@@ -573,5 +587,140 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
     // And the matching case releases through the same repair surface.
     const ok = createRepairExclusiveEgressOps(wiringInput(mkBarrierOps(7, [])));
     expect(await ok.runReleaseSequence(CAPTURED)).toEqual({ kind: "released", generation_id: 7 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5-7: createUnprotectExclusiveEgressOps -- the production mapping of the
+// unprotect sequence's injected ops (the sequence itself is pinned in
+// castle-wall/provision/exclusive-unprotect.test.ts).
+// ---------------------------------------------------------------------------
+
+describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
+  const UNPROTECT_INPUT = {
+    agentUid: 601,
+    agentId: "hermes",
+    agentAccount: "sanctuary-hermes",
+    fortressPath: "/fortress/a",
+    harnessArgv: ["/usr/local/bin/hermes"],
+    harnessLogDir: "/var/sanctuary-agents/sanctuary-hermes/logs",
+    audit: async () => {},
+    print: () => {},
+  } as unknown as ExclusiveEgressWiringInput;
+
+  it("bootoutGateDaemon: not-running/not-found is SUCCESS; a genuine failure THROWS with the label named", async () => {
+    const mk = (code: number, stderr: string) =>
+      createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+        runLaunchctl: async () => ({ code, stdout: "", stderr }),
+      });
+    await expect(mk(0, "").bootoutGateDaemon()).resolves.toBeUndefined();
+    await expect(mk(3, "Boot-out failed: 3: No such process").bootoutGateDaemon()).resolves.toBeUndefined();
+    await expect(mk(113, "Could not find service").bootoutGateDaemon()).resolves.toBeUndefined();
+    await expect(mk(5, "Boot-out failed: 5: Input/output error").bootoutGateDaemon()).rejects.toThrow(
+      /bootout ai\.sanctuaryprotocol\.egress-gate\.601 exited 5/,
+    );
+  });
+
+  it("credential + oracle teardown removes EXACTLY the single-source uid-keyed paths (no constructed authority needed)", async () => {
+    const removed: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      removeFile: async (path) => {
+        removed.push(path);
+      },
+    });
+    await ops.invalidateOracleToken();
+    await ops.revokeCredential();
+    expect(removed).toEqual([
+      gateLivenessTokenPath(601),
+      gateCredentialAcceptPath(601),
+      gateCredentialTokenPath(601),
+    ]);
+  });
+
+  it("removeGateSurfaces removes marker + fortress policy + plist + runtime configs + per-uid runtime dir", async () => {
+    const removed: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      removeFile: async (path) => {
+        removed.push(path);
+      },
+    });
+    await ops.removeGateSurfaces();
+    expect(removed).toEqual([
+      exclusiveRoutingMarkerPath("/fortress/a"),
+      `/fortress/a/policy/egress/${EXCLUSIVE_EGRESS_GATE_FILENAME}`,
+      egressGateDaemonPlistPath(601),
+      egressGatePolicyConfigPath(601),
+      egressGateRulesConfigPath(601),
+      egressGateRuntimeUidDirPath(601),
+    ]);
+  });
+
+  it("removeRegistryEntry routes through the locked registry remove and maps remaining/flushed/dirty", async () => {
+    const removeCalls: number[] = [];
+    const stubRegistry = {
+      remove: async (uid: number) => {
+        removeCalls.push(uid);
+        return {
+          committed: [{ agent_uid: 602, gate_port: 20001, fortress_path: "/fortress/b" }],
+          dirty: false,
+        };
+      },
+    } as unknown as PfAnchorRegistry;
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, { registry: stubRegistry });
+    await expect(ops.removeRegistryEntry()).resolves.toEqual({
+      remainingUids: [602],
+      flushed: false,
+      dirty: false,
+    });
+    expect(removeCalls).toEqual([601]);
+
+    const emptyRegistry = {
+      remove: async () => ({ committed: [], dirty: true }),
+    } as unknown as PfAnchorRegistry;
+    const last = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, { registry: emptyRegistry });
+    await expect(last.removeRegistryEntry()).resolves.toEqual({
+      remainingUids: [],
+      flushed: true,
+      dirty: true,
+    });
+  });
+
+  it("recoverGeneration + scrubProvisionedRules route through their injected seams with this uid/harness", async () => {
+    const recovered: number[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      recoverGeneration: async (uid) => {
+        recovered.push(uid);
+      },
+      scrubRules: async () => ({ removedRuleIds: ["provisioned-hermes-api"], reloadOk: true }),
+    });
+    await ops.recoverGeneration();
+    expect(recovered).toEqual([601]);
+    await expect(ops.scrubProvisionedRules()).resolves.toEqual({
+      removedRuleIds: ["provisioned-hermes-api"],
+      reloadOk: true,
+    });
+  });
+
+  it("parkHarness/verifyParkedPersistent delegate to the S5-5 persistent-park helpers over the parkDeps seam", async () => {
+    const { fn, calls } = parkLaunchctl();
+    const fs = parkFs();
+    const ops = createUnprotectExclusiveEgressOps(
+      {
+        ...UNPROTECT_INPUT,
+        agentUid: PARK_CTX.agentUid,
+        agentAccount: PARK_CTX.agentAccount,
+        harnessArgv: PARK_CTX.harnessArgv,
+        fortressPath: PARK_CTX.fortressPath,
+        harnessLogDir: PARK_CTX.harnessLogDir,
+      },
+      { parkDeps: { runLaunchctlFn: fn, ...fs } },
+    );
+    await ops.parkHarness();
+    // The park ran the full persistent sequence (bootout + disable observed)
+    // and restored the PARKED plist form on disk.
+    expect(calls.some((c) => c.startsWith("bootout"))).toBe(true);
+    expect(calls.some((c) => c.startsWith("disable"))).toBe(true);
+    expect(fs.files.get(PARKED_PLAN.plistPath)).toBe(PARKED_PLAN.plistContent);
+    await expect(ops.verifyParkedPersistent()).resolves.toEqual({ ok: true });
   });
 });

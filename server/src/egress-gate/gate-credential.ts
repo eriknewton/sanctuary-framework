@@ -285,6 +285,22 @@ export function mintGateSecret(): string {
 }
 
 /**
+ * The uid's gate-readable ACCEPT file path (the sha256 accept-state). The
+ * SINGLE source for this path shape: the fs authority writes/removes through
+ * it, and the S5-7 unprotect teardown removes it directly (revoke must work
+ * even when the gate service account is already gone, so the teardown never
+ * needs a `gateUid` to construct an authority).
+ */
+export function gateCredentialAcceptPath(agentUid: number, dir: string = GATE_CRED_DIR): string {
+  return `${dir}/${agentUid}.accept`;
+}
+
+/** The uid's agent-readable bearer TOKEN file path (see {@link gateCredentialAcceptPath}). */
+export function gateCredentialTokenPath(agentUid: number, dir: string = GATE_CRED_DIR): string {
+  return `${dir}/${agentUid}.token`;
+}
+
+/**
  * The fs surface {@link createFsGateCredentialAuthority} writes through.
  * Injectable (tests pin the EXACT ownership/mode sequence with a recorder,
  * fix-round BLOCKER-2); production uses `node:fs/promises`.
@@ -325,8 +341,8 @@ export function createFsGateCredentialAuthority(input: {
   fsOps?: GateCredentialFsOps;
 }): GateCredentialAuthority {
   const dir = input.dir ?? GATE_CRED_DIR;
-  const acceptPath = (uid: number): string => `${dir}/${uid}.accept`;
-  const tokenPath = (uid: number): string => `${dir}/${uid}.token`;
+  const acceptPath = (uid: number): string => gateCredentialAcceptPath(uid, dir);
+  const tokenPath = (uid: number): string => gateCredentialTokenPath(uid, dir);
 
   async function atomicWrite(path: string, payload: string, ownerUid: number): Promise<void> {
     const fs = input.fsOps ?? (await defaultGateCredentialFsOps());

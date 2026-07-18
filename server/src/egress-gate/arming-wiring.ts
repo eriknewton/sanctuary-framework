@@ -65,8 +65,13 @@ import {
   GateLivenessOracle,
   createFsLivenessOracleOps,
   GATE_LIVENESS_DIR,
+  gateLivenessTokenPath,
 } from "./liveness-oracle.js";
-import { createFsGateCredentialAuthority } from "./gate-credential.js";
+import {
+  createFsGateCredentialAuthority,
+  gateCredentialAcceptPath,
+  gateCredentialTokenPath,
+} from "./gate-credential.js";
 import { deriveGateAccountName, planAndCreateGateAccount } from "./gate-account.js";
 import {
   AGENT_HARNESS_DAEMON_LABEL,
@@ -126,6 +131,7 @@ import {
   runBootExclusiveEgressRelease,
   type BootReleaseResult,
 } from "../castle-wall/provision/exclusive-arm.js";
+import type { EgressGateUnprotectOps } from "../castle-wall/provision/exclusive-unprotect.js";
 import type { ProvisionLockOps } from "../castle-wall/provision/lockfile.js";
 
 const execFileAsync = promisify(execFile);
@@ -1308,6 +1314,49 @@ export async function parkHarnessPersistently(
 }
 
 /**
+ * Recover any in-flight (uncommitted) generation for one uid through the
+ * production S5-2 coordinator: real registry, real staging store, real
+ * owner-check, per-uid O_EXCL lock. Shared by the repair verb and the S5-7
+ * unprotect sequence (recover() never allocates or publishes; the manifest
+ * publisher throws by construction).
+ */
+async function productionRecoverGeneration(agentUid: number): Promise<void> {
+  const registry = createProductionAnchorRegistry();
+  const coordinator = new GenerationCoordinator({
+    bind: async () => bindEphemeralGatePort(),
+    verifyOwner: async ({ port, pid }) =>
+      (await verifyLoopbackTcpPortOwner({ port, expectedPid: pid })).ok,
+    registry: {
+      armEntry: async (entry) => {
+        await registry.addOrUpdate({
+          agent_uid: entry.agent_uid,
+          gate_port: entry.gate_port,
+          fortress_path: entry.fortress_path,
+          generation_id: entry.generation_id,
+        });
+      },
+      tombstone: async (uid, fallback) => {
+        await registry.tombstone(uid, fallback);
+      },
+      readEntry: async (uid) => {
+        const { entries } = await registry.list();
+        return entries.find((e) => e.agent_uid === uid) ?? null;
+      },
+      // Fix-round-5 P1: the persisted floor covering repair-discarded
+      // generations (recover() never allocates, but the adapter stays
+      // complete and consistent with the install-path adapter).
+      readGenerationFloor: async () => (await registry.list()).generationFloor,
+    },
+    publishManifest: async () => {
+      throw new Error("recover() must never publish a manifest");
+    },
+    staging: createFsGenerationStagingStore(),
+    lock: fsLockOps(),
+  });
+  await coordinator.recover(agentUid);
+}
+
+/**
  * Repair ops (`--repair-egress-gate`): drift guard + verified PERSISTENT
  * harness park (fix-round BLOCKER-3 + fix-round-2 HIGH-2) + recover +
  * bring-up + release.
@@ -1346,43 +1395,110 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
       // anything (host-wide token denial until manual surgery).
       return createProductionAnchorRegistry().repairQuarantined();
     },
-    async recoverGeneration(): Promise<void> {
-      const registry = createProductionAnchorRegistry();
-      const coordinator = new GenerationCoordinator({
-        bind: async () => bindEphemeralGatePort(),
-        verifyOwner: async ({ port, pid }) =>
-          (await verifyLoopbackTcpPortOwner({ port, expectedPid: pid })).ok,
-        registry: {
-          armEntry: async (entry) => {
-            await registry.addOrUpdate({
-              agent_uid: entry.agent_uid,
-              gate_port: entry.gate_port,
-              fortress_path: entry.fortress_path,
-              generation_id: entry.generation_id,
-            });
-          },
-          tombstone: async (agentUid, fallback) => {
-            await registry.tombstone(agentUid, fallback);
-          },
-          readEntry: async (agentUid) => {
-            const { entries } = await registry.list();
-            return entries.find((e) => e.agent_uid === agentUid) ?? null;
-          },
-          // Fix-round-5 P1: the persisted floor covering repair-discarded
-          // generations (recover() never allocates, but the adapter stays
-          // complete and consistent with the install-path adapter).
-          readGenerationFloor: async () => (await registry.list()).generationFloor,
-        },
-        publishManifest: async () => {
-          throw new Error("recover() must never publish a manifest");
-        },
-        staging: createFsGenerationStagingStore(),
-        lock: fsLockOps(),
-      });
-      await coordinator.recover(input.agentUid);
-    },
+    recoverGeneration: () => productionRecoverGeneration(input.agentUid),
     bringUpGeneration: () => install.bringUpGeneration(),
     runReleaseSequence: (committed) => install.runReleaseSequence(committed),
+    audit: input.audit,
+    print: input.print,
+  };
+}
+
+/** TEST-ONLY dep seams for {@link createUnprotectExclusiveEgressOps}; production omits. */
+export interface UnprotectWiringDeps {
+  runLaunchctl?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  removeFile?: (path: string) => Promise<void>;
+  registry?: PfAnchorRegistry;
+  recoverGeneration?: (agentUid: number) => Promise<void>;
+  parkDeps?: PersistentParkDeps;
+  scrubRules?: () => Promise<{ removedRuleIds: string[]; reloadOk: boolean }>;
+}
+
+/**
+ * Production ops for the S5-7 per-agent unprotect sequence
+ * (`runEgressGateUnprotect`, `castle-wall/provision/exclusive-unprotect.ts`).
+ * Maps each injected op onto the real primitive:
+ *
+ *  - park/verify: the S5-5 verified persistent park (bootout + persistent
+ *    disable + hold-file removal + parked-plist restore, read back).
+ *  - recover: the shared production S5-2 recovery (staging record resolved
+ *    per the crash table; a tombstoned dead generation keeps its id in the
+ *    registry entry so the final remove folds it into the persisted floor).
+ *  - gate daemon: `launchctl bootout` -- not-found is success, any other
+ *    failure THROWS (S5-6 M5: never tear down surfaces under a live gate).
+ *  - credential/oracle: DIRECT single-source path removals
+ *    ({@link gateCredentialAcceptPath}/{@link gateCredentialTokenPath}/
+ *    {@link gateLivenessTokenPath}) -- deliberately NOT through a constructed
+ *    authority/oracle, so revocation works even when the gate service
+ *    account or oracle keys are already gone (idempotent re-run after a
+ *    partial teardown).
+ *  - policy surfaces: exclusive routing marker, fortress gate policy file,
+ *    gate daemon plist, gate-readable runtime config copies, per-uid runtime
+ *    dir (all `rm -f` semantics).
+ *  - manifest scrub: `scrubProvisionedEgressRules` (verified read-back) +
+ *    the caller's `reloadPolicy`.
+ *  - registry: the production S5-1 locked registry `remove()` (union
+ *    re-render preserving every remaining uid, per-remaining-uid liveness,
+ *    flush only on empty, generation floor folded).
+ */
+export function createUnprotectExclusiveEgressOps(
+  input: ExclusiveEgressWiringInput,
+  deps: UnprotectWiringDeps = {},
+): EgressGateUnprotectOps {
+  const launchctl = deps.runLaunchctl ?? runLaunchctl;
+  const removeFile =
+    deps.removeFile ?? (async (path: string): Promise<void> => rm(path, { force: true, recursive: true }));
+  const parkCtx: PersistentParkContext = {
+    agentUid: input.agentUid,
+    agentAccount: input.agentAccount,
+    harnessArgv: input.harnessArgv,
+    fortressPath: input.fortressPath,
+    harnessLogDir: input.harnessLogDir,
+  };
+  return {
+    parkHarness: () => parkHarnessPersistently(parkCtx, deps.parkDeps ?? {}),
+    verifyParkedPersistent: () => verifyHarnessParkedPersistent(parkCtx, deps.parkDeps ?? {}),
+    recoverGeneration: () => (deps.recoverGeneration ?? productionRecoverGeneration)(input.agentUid),
+    async bootoutGateDaemon(): Promise<void> {
+      const label = egressGateDaemonLabel(input.agentUid);
+      const bootout = await launchctl(["bootout", `system/${label}`]);
+      if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+        throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
+      }
+    },
+    async invalidateOracleToken(): Promise<void> {
+      await removeFile(gateLivenessTokenPath(input.agentUid));
+    },
+    async revokeCredential(): Promise<void> {
+      await removeFile(gateCredentialAcceptPath(input.agentUid));
+      await removeFile(gateCredentialTokenPath(input.agentUid));
+    },
+    async removeGateSurfaces(): Promise<void> {
+      await removeFile(exclusiveRoutingMarkerPath(input.fortressPath));
+      await removeFile(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME));
+      await removeFile(egressGateDaemonPlistPath(input.agentUid));
+      await removeFile(egressGatePolicyConfigPath(input.agentUid));
+      await removeFile(egressGateRulesConfigPath(input.agentUid));
+      await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
+    },
+    async scrubProvisionedRules(): Promise<{ removedRuleIds: string[]; reloadOk: boolean }> {
+      if (deps.scrubRules !== undefined) return deps.scrubRules();
+      const { scrubProvisionedEgressRules } = await import("../castle-wall/provision/egress.js");
+      const result = await scrubProvisionedEgressRules({
+        fortressPath: input.fortressPath,
+        harnessId: input.agentId,
+        reloadPolicy: () => input.reloadPolicy(),
+      });
+      return { removedRuleIds: result.removedRuleIds, reloadOk: result.reloadOk };
+    },
+    async removeRegistryEntry(): Promise<{ remainingUids: number[]; flushed: boolean; dirty: boolean }> {
+      const registry = deps.registry ?? createProductionAnchorRegistry();
+      const result = await registry.remove(input.agentUid);
+      return {
+        remainingUids: result.committed.map((e) => e.agent_uid),
+        flushed: result.committed.length === 0,
+        dirty: result.dirty,
+      };
+    },
     audit: input.audit,
     print: input.print,
   };
