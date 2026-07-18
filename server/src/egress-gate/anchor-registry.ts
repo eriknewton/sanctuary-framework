@@ -617,11 +617,19 @@ export class PfAnchorRegistry {
           typeof raw.agent_uid === "number" && Number.isInteger(raw.agent_uid) ? raw.agent_uid : null;
         let disposition: PfAnchorQuarantineRepairFinding["disposition"] = "removed";
         if (uid !== null && !next.some((e) => e.agent_uid === uid)) {
+          // Carry the raw generation_id when it is independently valid (the
+          // entry may be malformed for an unrelated field): dropping a live
+          // id here would let the next bring-up reuse an already-committed
+          // generation (the same monotonicity rule the S5-2 tombstone
+          // fallback preserves).
           const salvage = validateEntry({
             agent_uid: raw.agent_uid,
             gate_port: raw.gate_port,
             fortress_path: raw.fortress_path,
             tombstone: true,
+            ...(Number.isInteger(raw.generation_id) && (raw.generation_id as number) >= 1
+              ? { generation_id: raw.generation_id }
+              : {}),
           });
           if (salvage !== null) {
             next.push(salvage);

@@ -608,6 +608,29 @@ describe("egress-gate/anchor-registry repairQuarantined (fix-round-4 P2: coded r
     expect((await registry.list()).dirty).toBe(false);
   });
 
+  it("a salvaged tombstone CARRIES a still-valid generation_id (garbled tombstone flag case): monotonicity preserved", async () => {
+    const { registry } = makeRegistry({
+      initial: quarantinedState({
+        agent_uid: 601,
+        gate_port: 20002,
+        fortress_path: "/f/c",
+        generation_id: 9, // valid; the entry is malformed for the tombstone flag
+        tombstone: "yes",
+      }),
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.findings[0]?.disposition).toBe("tombstoned");
+    // The live generation id survives the recovery, so the next bring-up
+    // cannot reuse an already-committed id for this uid.
+    expect(res.remaining.find((e) => e.agent_uid === 601)).toEqual({
+      agent_uid: 601,
+      gate_port: 20002,
+      fortress_path: "/f/c",
+      generation_id: 9,
+      tombstone: true,
+    });
+  });
+
   it("a duplicate committed uid is REMOVED (the first valid entry keeps the uid confined; no tombstone shadowing)", async () => {
     const dup = { ...A, gate_port: 20009 };
     const { registry } = makeRegistry({ initial: quarantinedState(dup) });
