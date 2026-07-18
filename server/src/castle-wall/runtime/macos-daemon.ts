@@ -22,7 +22,6 @@ import {
 } from "../allowlist/gate-derivation.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
 import {
-  DEFAULT_EMISSION_STALL_GRACE_MS,
   EMISSION_STALL_AUDIT_OP,
   EMISSION_STALL_LOG_PREFIX,
   EMISSION_STALL_RECOVERED_AUDIT_OP,
