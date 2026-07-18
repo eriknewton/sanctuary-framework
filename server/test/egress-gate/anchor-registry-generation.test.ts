@@ -172,3 +172,87 @@ describe("egress-gate/anchor-registry tombstone (S5-2 M4)", () => {
     expect(b?.tombstone).toBeUndefined(); // uid 504 stays LIVE (pass rendered)
   });
 });
+
+describe("egress-gate/anchor-registry remove() generation-floor fold (S5-7)", () => {
+  const twoEntries = (): PfAnchorRegistryState => ({
+    version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+    committed: [
+      { agent_uid: 502, gate_port: 19998, fortress_path: "/f/a", generation_id: 7 },
+      { agent_uid: 504, gate_port: 20001, fortress_path: "/f/b", generation_id: 3 },
+    ],
+    enable_token: "1",
+  });
+
+  it("folds the removed entry's generation_id into the persisted floor (re-protect can never reuse it)", async () => {
+    const { registry, store } = makeRegistry(twoEntries());
+    await registry.remove(502);
+    expect(store.current?.generation_floor).toBe(7);
+    const listed = await registry.list();
+    expect(listed.generationFloor).toBe(7);
+    // The sibling's entry survives untouched.
+    expect(listed.entries).toEqual([
+      { agent_uid: 504, gate_port: 20001, fortress_path: "/f/b", generation_id: 3 },
+    ]);
+  });
+
+  it("the fold is MONOTONE: never lowers an existing higher floor, raises a lower one", async () => {
+    const higher = { ...twoEntries(), generation_floor: 9 };
+    const { registry: r1, store: s1 } = makeRegistry(higher);
+    await r1.remove(502); // removed gen 7 < floor 9
+    expect(s1.current?.generation_floor).toBe(9);
+
+    const lower = { ...twoEntries(), generation_floor: 5 };
+    const { registry: r2, store: s2 } = makeRegistry(lower);
+    await r2.remove(502); // removed gen 7 > floor 5
+    expect(s2.current?.generation_floor).toBe(7);
+  });
+
+  it("removing a legacy entry with NO generation_id writes no floor", async () => {
+    const legacy: PfAnchorRegistryState = {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [{ agent_uid: 502, gate_port: 19998, fortress_path: "/f/a" }],
+      enable_token: "1",
+    };
+    const { registry, store } = makeRegistry(legacy);
+    await registry.remove(502);
+    expect(store.current?.generation_floor).toBeUndefined();
+  });
+
+  it("removing an ABSENT uid folds nothing (reconciling no-op)", async () => {
+    const { registry, store } = makeRegistry(twoEntries());
+    await registry.remove(999);
+    expect(store.current?.generation_floor).toBeUndefined();
+    expect(store.current?.committed).toHaveLength(2);
+  });
+
+  it("a failed remove keeps the raised floor after rollback (over-restrictive, never fail-open)", async () => {
+    const store = memStore(twoEntries());
+    let armCount = 0;
+    const ops: PfAnchorRegistryOps = {
+      store,
+      lock: memLock(),
+      runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
+      armUnion: async (entries, options): Promise<ArmPfAnchorResult> => {
+        armCount += 1;
+        // Reconcile-on-entry passes (liveness already live so no re-assert);
+        // fail the FORWARD arm (the one-entry union after the remove), succeed
+        // on the rollback re-assert (two entries).
+        if (entries.length === 1) throw new Error("settle probe failed");
+        return options.existingEnableToken !== undefined
+          ? { settleProbes: 1, enableToken: options.existingEnableToken }
+          : { settleProbes: 1, enableToken: "1" };
+      },
+      disarm: async () => {},
+      unionLiveness: async () => live,
+    };
+    const registry = new PfAnchorRegistry(ops);
+    await expect(registry.remove(502)).rejects.toThrow("settle probe failed");
+    // Rolled back: both entries still committed...
+    expect(store.current?.committed).toHaveLength(2);
+    // ...and the floor raise SURVIVES the rollback (documented direction: a
+    // floor may only ever rise; allocation is strictly-above so the restored
+    // entry's own generation stays valid).
+    expect(store.current?.generation_floor).toBe(7);
+    expect(armCount).toBeGreaterThanOrEqual(2);
+  });
+});

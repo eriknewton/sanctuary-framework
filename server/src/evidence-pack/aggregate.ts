@@ -24,7 +24,12 @@ import type {
   RetentionFacts,
   ShortfallReport,
 } from "./types.js";
-import { daemonStoreExcludedFromCensus } from "./types.js";
+import {
+  daemonStoreExcludedFromCensus,
+  isRecognizedDaemonStatus,
+  isUsableFigure,
+  isUsableTimestamp,
+} from "./types.js";
 import { isInWindow } from "./quarter.js";
 
 /**
@@ -222,6 +227,18 @@ function daemonPresentButExcludedSuffix(retention: RetentionFacts): string {
       "enforcement-summary section."
     );
   }
+  // D8-4 (Dry-9): an UNRECOGNIZED status (an untyped / JSON caller) is disclosed
+  // as not-determinable, never silently dropped -- and never mislabeled with a
+  // known status's specific wording.
+  if (!isRecognizedDaemonStatus(d.status)) {
+    return (
+      " NOTE: the daemon enforcement store disclosure carried an UNRECOGNIZED " +
+      "status, so whether daemon-recorded enforcement for this quarter is " +
+      "reflected above cannot be determined; treat this as an operator-store " +
+      "view, not a complete enforcement census. See the enforcement-summary " +
+      "section."
+    );
+  }
   return "";
 }
 
@@ -255,16 +272,6 @@ export interface RetentionDeterminability {
 }
 
 /**
- * F2-R2 (Codex second-family review + Dry-8 sweep): a finite plain number --
- * the ONLY runtime shape the at-cap comparisons in `detectShortfall` can
- * honestly evaluate. Rejects `NaN`, `Infinity`, `undefined`, `null`, strings,
- * and every other type an untyped JS / `JSON.parse` caller can smuggle past
- * the compile-time `number` annotation.
- */
-const isFiniteNumber = (v: unknown): v is number =>
-  typeof v === "number" && Number.isFinite(v);
-
-/**
  * F2-R2 -> D8-1: runtime USABILITY of one contributing store position. Row
  * PRESENCE alone is not determinability: a tags-only row like
  * `{ store: "operator" }` carries no cap evidence at all, yet the at-cap
@@ -295,12 +302,12 @@ const isFiniteNumber = (v: unknown): v is number =>
  * before (F2-R2 completeness).
  */
 const storePositionUsable = (s: StoreRetentionPosition): boolean =>
-  isFiniteNumber(s.max_entries) &&
+  isUsableFigure(s.max_entries) &&
   s.max_entries > 0 &&
-  isFiniteNumber(s.retained_total) &&
-  isFiniteNumber(s.max_total_size_bytes) &&
+  isUsableFigure(s.retained_total) &&
+  isUsableFigure(s.max_total_size_bytes) &&
   s.max_total_size_bytes > 0 &&
-  isFiniteNumber(s.retained_total_size_bytes);
+  isUsableFigure(s.retained_total_size_bytes);
 
 /**
  * D7-1 / Codex-F1+F2 (dry-bar round 7): the SINGLE chokepoint deciding whether
@@ -445,9 +452,22 @@ export function retentionDeterminability(
  *    attest coverage of the portion of the quarter after `generatedAt` (an
  *    in-progress quarter, the default one-command case).
  *
- * `covered_to_exclusive` is `min(quarter end, generation instant)` and is NEVER
- * unconditionally the quarter end: the pack can never attest coverage of a
- * period after the moment it was generated.
+ * `covered_to_exclusive` is `min(quarter end, generation instant, census cut)`
+ * and is NEVER unconditionally the quarter end: the pack can never attest
+ * coverage of a period after the moment it was generated, NOR (D9C-1) past the
+ * instant the audit census was taken. The audit census is read BEFORE the pack
+ * stamps its generation time, so entries appended in the gap between the census
+ * and generation were never counted; attesting coverage through the later
+ * generation instant would sign a window covering operations the census never
+ * saw. When the caller supplies `censusTakenAt`, the covered window stops at
+ * that cut so the count and the attested span stay mutually consistent.
+ *
+ * D9C-2: the attested span must never run BACKWARDS. An entry timestamped after
+ * the attestable end (a future-dated in-quarter entry, or any entry past the
+ * census/generation cut) cannot anchor `covered_from` -- that would sign an
+ * impossible `covered_from > covered_to_exclusive` span. Such a state renders as
+ * zero-covered (mirroring the M1 wholly-post-quarter case), never a backwards
+ * window.
  *
  * The start-side disclosure distinguishes retention pruning (log at/above its
  * FIFO cap; early entries LIKELY dropped) from genuine inactivity (log below
@@ -458,15 +478,85 @@ export function retentionDeterminability(
 export function detectShortfall(
   window: QuarterWindow,
   retention: RetentionFacts,
-  params: { generatedAt: string; lastEntryAt: string | null }
+  params: {
+    generatedAt: string;
+    lastEntryAt: string | null;
+    /**
+     * D9C-1: the instant the audit census was taken (the audit `query()` +
+     * usage read completed), when the caller captured it. The census is read
+     * BEFORE the pack stamps its generation time, so the attested coverage
+     * window must not extend past it -- otherwise the signed span would claim
+     * coverage of operations appended between the census and generation that the
+     * census never counted. Omit (legacy callers) to fall back to the generation
+     * instant.
+     */
+    censusTakenAt?: string;
+  }
 ): ShortfallReport {
   const quarterStartMs = new Date(window.start_inclusive).getTime();
   const quarterEndMs = new Date(window.end_exclusive).getTime();
   const generatedMs = new Date(params.generatedAt).getTime();
-  const earliestMs =
-    retention.earliest_retained_at === null
-      ? null
-      : new Date(retention.earliest_retained_at).getTime();
+  // Dry-9 fix-round-2 (P1): the audit-census cut is attestation-bearing -- it
+  // bounds `covered_to_exclusive` from above. A present-but-UNPARSEABLE cut can
+  // bound nothing, and falling back to the generation instant would attest
+  // coverage the census never proved (the exact widening #954/#958 fought on the
+  // NUMERIC dimension). So a present-but-unusable cut makes the covered WINDOW
+  // NOT DETERMINABLE: fail closed to the same shape a read_failed audit source
+  // produces (no definitive span; prose + SIGNED manifest both render
+  // not-determinable) rather than silently widen. An ABSENT cut (legacy caller)
+  // and a USABLE cut both flow through normally below.
+  const censusUnusable =
+    params.censusTakenAt !== undefined && !isUsableTimestamp(params.censusTakenAt);
+  if (censusUnusable) {
+    return {
+      shortfall: true,
+      // No definitive span: the manifest chokepoint serializes determinable:false
+      // (dropping these bounds) and every prose surface reads coverage_determinable.
+      covered_from: window.start_inclusive,
+      covered_to_exclusive: window.start_inclusive,
+      in_progress_quarter: false,
+      last_entry_at: params.lastEntryAt,
+      retention_at_cap: false,
+      retention_at_cap_determinable: false,
+      // NOT a zero-covered finding (that is a DETERMINED empty window); this is
+      // "we could not determine the window at all". Keep the markers off so no
+      // surface reads a definitive zero-coverage claim here.
+      zero_of_quarter_covered: false,
+      covered_to_is_census_cut: false,
+      coverage_determinable: false,
+      explanation:
+        "The audit-census cut timestamp (" +
+        String(params.censusTakenAt) +
+        ") was present but could not be parsed, so this report cannot bound the " +
+        "upper end of the coverage window: the covered window for this quarter " +
+        "is NOT DETERMINABLE. This report makes no coverage claim. Investigate " +
+        "the census-capture timestamp and regenerate.",
+      daemon_store: retention.daemon_store,
+    };
+  }
+  // D9C-1: the census cut, when supplied and USABLE, bounds the attested window
+  // from above. An absent or unparseable value is ignored (falls back to
+  // generation) -- D8-2: the census cut is attestation-bearing, so it flows
+  // through the shared `isUsableTimestamp` guard exactly like the earliest
+  // instant below.
+  const censusBoundMs =
+    params.censusTakenAt !== undefined && isUsableTimestamp(params.censusTakenAt)
+      ? new Date(params.censusTakenAt).getTime()
+      : null;
+  // D8-2 (Dry-9): the earliest-retained instant DRIVES the start-coverage
+  // verdict, so it must be USABLE (a string that parses to a finite instant)
+  // before it can anchor any definitive claim. A fully type-valid but
+  // UNPARSEABLE value previously NaN'd through every numeric branch below into
+  // the flattering "reaches the quarter start" arm, signing shortfall:false off
+  // an instant nobody parsed. `earliestMs` is a finite number ONLY when the
+  // stored value is usable; a genuinely-null (empty log) value and an unusable
+  // (unparseable) value are told apart by `earliestUnparseable`.
+  const earliestRaw = retention.earliest_retained_at;
+  const earliestUsable = earliestRaw !== null && isUsableTimestamp(earliestRaw);
+  const earliestMs = earliestUsable
+    ? new Date(earliestRaw as string).getTime()
+    : null;
+  const earliestUnparseable = earliestRaw !== null && !earliestUsable;
   // D5-1 (dry-bar round 5): "at a retention cap" is judged PER STORE against
   // each store's OWN independent cap, then OR-ed. Each contributing `AuditLog`
   // (operator + daemon) prunes on its own 100k-entry / 100 MB caps, so the
@@ -505,11 +595,25 @@ export function detectShortfall(
   const retentionAtCap =
     atCapDeterminable && determinability.contributing_stores.some(atCapForStore);
 
-  // END SIDE: coverage can never extend past the moment the report was made.
-  const inProgress = generatedMs < quarterEndMs;
-  const coveredToExclusive = new Date(
-    Math.min(quarterEndMs, generatedMs)
-  ).toISOString();
+  // END SIDE: coverage can never extend past the moment the report was made,
+  // NOR (D9C-1) past the instant the audit census was taken. The attestable end
+  // is the earliest of the quarter end, the generation instant, and the census
+  // cut (when supplied).
+  const coveredToExclusiveMs = Math.min(
+    quarterEndMs,
+    generatedMs,
+    ...(censusBoundMs !== null ? [censusBoundMs] : [])
+  );
+  const inProgress = coveredToExclusiveMs < quarterEndMs;
+  const coveredToExclusive = new Date(coveredToExclusiveMs).toISOString();
+  // P3 (Dry-9): the attestable end is the AUDIT-CENSUS cut (not the generation
+  // instant) when that census cut precedes generation AND is the binding
+  // minimum. Surfaces that echo the bound name it honestly from this flag
+  // instead of the stale "the generation time".
+  const coveredToIsCensusCut =
+    censusBoundMs !== null &&
+    censusBoundMs < generatedMs &&
+    coveredToExclusiveMs === censusBoundMs;
 
   // G-1(c): `earliest_retained_at` is derived from the OPERATOR store only (the
   // daemon store is merged into the scan only when readable). When a root-owned
@@ -527,7 +631,29 @@ export function detectShortfall(
   let startShortfall: boolean;
   let startExplanation: string;
   let zeroOfQuarterCovered = false;
-  if (earliestMs === null) {
+  if (earliestUnparseable) {
+    // D8-2 (Dry-9): the earliest-retained timestamp is present but UNPARSEABLE,
+    // so the start side is NOT DETERMINABLE. Attest an EMPTY span (never the
+    // flattering "reaches the quarter start" full-coverage arm, and never a
+    // definitive non-empty span) and disclose the unparseable value honestly --
+    // without the false FIFO-pruning or "no entries survive" diagnosis (entries
+    // exist; only their instant is unreadable).
+    coveredFrom = coveredToExclusive;
+    startShortfall = true;
+    startExplanation = daemonExcluded
+      ? "The earliest retained entry in the operator audit log carries a " +
+        "timestamp (" +
+        String(retention.earliest_retained_at) +
+        ") that could not be parsed, so this report cannot demonstrate coverage " +
+        "of any part of the quarter from the operator store; start-side coverage " +
+        "is NOT DETERMINABLE. Investigate the operator store's earliest entry." +
+        daemonPresentButExcludedSuffix(retention)
+      : "The earliest retained audit entry carries a timestamp (" +
+        String(retention.earliest_retained_at) +
+        ") that could not be parsed, so this report cannot demonstrate coverage " +
+        "of any part of the quarter; start-side coverage is NOT DETERMINABLE. " +
+        "Investigate the audit store's earliest entry.";
+  } else if (earliestMs === null) {
     coveredFrom = window.start_inclusive;
     startShortfall = true;
     zeroOfQuarterCovered = true;
@@ -539,30 +665,51 @@ export function detectShortfall(
       : "The audit log holds no retained entries, so this quarter has no " +
         "covered access history. Confirm the fortress was recording during " +
         "the reporting period.";
-  } else if (earliestMs >= quarterEndMs) {
-    // M1: the entire retained window post-dates the quarter (all in-quarter
-    // entries pruned). Do NOT cite an out-of-quarter covered_from; state plainly
-    // that zero of the quarter is covered.
+  } else if (earliestMs >= coveredToExclusiveMs) {
+    // M1 + D9C-2: the earliest retained entry is at or after the ATTESTABLE end
+    // (min(quarter end, generation, census cut)) -- either the whole retained
+    // window post-dates the quarter (all in-quarter entries pruned), OR the
+    // earliest entry post-dates the generation/census cut (a future-dated stamp,
+    // clock skew). Either way NONE of the attestable window is covered: do NOT
+    // cite an out-of-window covered_from (that would sign an impossible
+    // covered_from > covered_to_exclusive span), and do NOT attribute a
+    // post-generation entry to pruning. State plainly that zero is covered.
     coveredFrom = window.start_inclusive;
     startShortfall = true;
     zeroOfQuarterCovered = true;
+    // The reason + advice differ: an entry at/after the QUARTER END is the
+    // pruned-history case (FIFO advice applies); an entry after the attestable
+    // end but BEFORE the quarter end post-dates the report itself (a future
+    // stamp), where FIFO-pruning advice would be a false diagnosis.
+    const postQuarterEnd = earliestMs >= quarterEndMs;
+    const reasonClause = postQuarterEnd
+      ? "is at or after the quarter end"
+      : "is after this report's attested coverage end (" +
+        coveredToExclusive +
+        "), so it post-dates the window this report can attest";
+    const tailAdvice = postQuarterEnd
+      ? " This almost always means earlier entries were pruned by size/count " +
+        "(FIFO) retention; raise the retention cap or export monthly snapshots."
+      : " Regenerate after the entry's timestamp (and after the quarter closes) " +
+        "for a report whose attested window can include it.";
     startExplanation = daemonExcluded
       ? "NONE of this quarter is covered by the operator audit log: its earliest " +
         "retained entry (" +
         retention.earliest_retained_at! +
-        ") is at or after the quarter end, so no operator-store entries from " +
-        "this quarter survive in the retained log. The counts above are therefore " +
-        "zero for this quarter (from the operator store). This almost always " +
-        "means earlier entries were pruned by size/count (FIFO) retention; raise " +
-        "the retention cap or export monthly snapshots." +
+        ") " +
+        reasonClause +
+        ", so no operator-store entries survive inside the attested window. The " +
+        "counts above are therefore zero for the attested window (from the " +
+        "operator store)." +
+        tailAdvice +
         daemonPresentButExcludedSuffix(retention)
       : "NONE of this quarter is covered: the earliest retained audit entry (" +
         retention.earliest_retained_at! +
-        ") is at or after the quarter end, so no entries from this quarter " +
-        "survive in the retained log. The counts above are therefore zero for " +
-        "this quarter. This almost always means earlier entries were pruned by " +
-        "size/count (FIFO) retention; raise the retention cap or export monthly " +
-        "snapshots.";
+        ") " +
+        reasonClause +
+        ", so no entries survive inside the attested window. The counts above " +
+        "are therefore zero for the attested window." +
+        tailAdvice;
   } else if (earliestMs > quarterStartMs) {
     coveredFrom = retention.earliest_retained_at!;
     startShortfall = true;
@@ -620,13 +767,60 @@ export function detectShortfall(
       "retained entry precedes it.";
   }
 
+  // D9C-2 (a): a signed coverage span must never run BACKWARDS. Every branch
+  // above keeps covered_from <= covered_to_exclusive EXCEPT the degenerate case
+  // where the attestable end precedes even the quarter start (a report generated
+  // -- or a census taken -- before its own quarter began), where covered_from
+  // defaults to the quarter start yet the attestable end is earlier. Collapse
+  // the window to an empty [end, end) span (never backwards) and disclose zero
+  // coverage rather than sign an impossible span.
+  if (new Date(coveredFrom).getTime() > coveredToExclusiveMs) {
+    coveredFrom = coveredToExclusive;
+    startShortfall = true;
+    zeroOfQuarterCovered = true;
+  }
+
+  // D9C-2/P1 (Dry-9 fix): whenever ZERO of the quarter is covered, the attested
+  // span must be EMPTY. Several zero-covered branches above leave `coveredFrom`
+  // at the quarter start, which the cover span, the §7 span, AND the SIGNED
+  // manifest all render as covered_from..covered_to_exclusive -- a DEFINITIVE
+  // non-empty coverage window that flatly contradicts the "NONE of this quarter
+  // is covered" disclosure a machine reader would otherwise trust. Collapse
+  // `coveredFrom` to the exclusive end so every surface attests a zero-width
+  // span consistent with the disclosure.
+  if (zeroOfQuarterCovered) {
+    coveredFrom = coveredToExclusive;
+  }
+
+  // Dry-9 fix-round-2 (P3): the zero_of_quarter_covered marker is derived from
+  // the SPAN itself, UNIFORMLY, from this one code path -- so an EMPTY signed
+  // span can never be emitted without its marker. The earlier per-branch flag
+  // (set in the empty-log and post-attestable-end arms) missed the
+  // unparseable-earliest arm, which attests an empty span (covered_from ==
+  // covered_to_exclusive) but left the marker off, so the SIGNED manifest
+  // carried an empty span with no zero marker. An empty span is exactly
+  // covered_from >= covered_to_exclusive (the end is EXCLUSIVE, so equal bounds
+  // are already a zero-width window); a genuine covered window keeps the marker
+  // off. This runs after every branch has settled covered_from, so it is the
+  // single structural guarantee for "empty span <=> marker".
+  if (new Date(coveredFrom).getTime() >= coveredToExclusiveMs) {
+    zeroOfQuarterCovered = true;
+  }
+
   const parts: string[] = [];
   if (inProgress) {
+    // D9C-1: the attestable end is the census cut when that is what bounds the
+    // window (it precedes the generation instant); otherwise it is the
+    // generation instant. Name it honestly.
+    const endLabel =
+      censusBoundMs !== null && censusBoundMs < generatedMs
+        ? " (the audit-census cut point)"
+        : " (the generation time)";
     parts.push(
-      "PARTIAL QUARTER: this report was generated before the quarter ended, " +
-        "so it can only attest coverage through " +
+      "PARTIAL QUARTER: this report can only attest coverage through " +
         coveredToExclusive +
-        " (the generation time), not the full quarter ending " +
+        endLabel +
+        ", not the full quarter ending " +
         window.end_exclusive +
         ". Regenerate after the quarter closes for a complete report."
     );
@@ -662,6 +856,14 @@ export function detectShortfall(
     // serialize a not-determinable marker instead of a definitive boolean.
     retention_at_cap_determinable: atCapDeterminable,
     zero_of_quarter_covered: zeroOfQuarterCovered,
+    // P3 (Dry-9): whether the attestable end is the audit-census cut (vs the
+    // generation instant / quarter end), so surfaces echo the bound honestly.
+    covered_to_is_census_cut: coveredToIsCensusCut,
+    // Dry-9 fix-round-2 (P1): every path that reaches here bounded the window
+    // from a USABLE (or absent) census cut, so the covered window IS
+    // determinable. Only the present-but-unusable-census short-circuit above
+    // returns false.
+    coverage_determinable: true,
     explanation: parts.join(" "),
     // WATCH-1: carry the daemon-store disclosure onto the coverage report so the
     // enforcement-summary section can state whether daemon-recorded enforcement

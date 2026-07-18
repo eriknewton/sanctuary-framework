@@ -16,6 +16,16 @@
  * silently proceeding.
  */
 
+/**
+ * The canonical exclusive provision-lock path. The auto-provision arm/repair
+ * flows AND the S5-7 unprotect sequence take THIS lock, so arm, repair, and
+ * unprotect are mutually exclusive and two unprotects serialize (S5-7
+ * fix-round-2 HIGH-1: a lockless sibling snapshot let a concurrent
+ * `protect --exclusive-egress` commit a sibling between the snapshot and the
+ * teardown). Single source of truth so the two callers can never drift.
+ */
+export const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
+
 /** Injected lock operations so this is unit-testable without touching the real filesystem. */
 export interface ProvisionLockOps {
   /**

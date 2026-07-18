@@ -45,6 +45,9 @@ import {
   runProvisionFlow,
   resolvePolicyDaemonAction,
   withProvisionLock,
+  PROVISION_LOCK_PATH,
+  ProvisionLockHeldError,
+  type ProvisionLockOps,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
   type RehomeStepResult,
@@ -76,19 +79,21 @@ import {
 import {
   createInstallExclusiveEgressOps,
   createRepairExclusiveEgressOps,
+  createUnprotectExclusiveEgressOps,
   type ExclusiveEgressWiringInput,
 } from "../egress-gate/arming-wiring.js";
 import { deriveGateAccountName } from "../egress-gate/gate-account.js";
 import {
   runEgressGateRepair,
   type ExclusiveEgressArmOps,
+  type EgressGateRepairOutcome,
 } from "../castle-wall/provision/exclusive-arm.js";
+import { runEgressGateUnprotect } from "../castle-wall/provision/exclusive-unprotect.js";
 
 const execFileAsync = promisify(execFile);
 
 const PROVISION_CEILING = 500;
 const NEW_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
-const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
 
 /** Budget for polling the policy-daemon socket to become reachable after install-boot (Bug B). */
 const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
@@ -2249,15 +2254,136 @@ export async function uninstallAutoProvisionedHarnessDaemon(): Promise<void> {
   await uninstallAgentHarnessDaemon(realHarnessDaemonOps());
 }
 
-// ── S5-6: the `--repair-egress-gate` CLI runner ─────────────────────────────
+// ── S5-6/S5-7: the `--repair-egress-gate` / `--unprotect-egress-gate` CLI runners ──
+
+/**
+ * The shared production {@link ExclusiveEgressWiringInput} for the Hermes
+ * exclusive-egress CLI verbs (repair + unprotect): one construction so the
+ * two runners can never drift on gate-daemon argv, endpoint set, audit
+ * plumbing, or account ops. `auditSource` distinguishes the verbs in the
+ * audit trail.
+ */
+function buildHermesExclusiveCliWiring(input: {
+  agentUid: number;
+  accountName: string;
+  newAccountHome: string;
+  wallFortressPath: string;
+  harnessArgv: string[];
+  operatorUid: number;
+  auditSource: string;
+  print: (line: string) => void;
+  accountOps: ReturnType<typeof realAccountProvisionOps>;
+  cliBinary?: string;
+  /** S5-7 MED-1: argv-unavailable fallback park (remove the plist, not restore). */
+  parkPlistFallbackRemoval?: boolean;
+}): ExclusiveEgressWiringInput {
+  const agentId = "hermes";
+  const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
+    const { requestPolicyReload } = await import("../cli/castle-wall.js");
+    const result = await requestPolicyReload(input.wallFortressPath, "darwin");
+    return result.ok ? { ok: true } : { ok: false, error: result.error };
+  };
+  return {
+    agentId,
+    agentUid: input.agentUid,
+    agentAccount: input.accountName,
+    fortressPath: input.wallFortressPath,
+    harnessArgv: input.harnessArgv,
+    harnessLogDir: resolveHarnessDaemonLogDir(input.newAccountHome),
+    agentTemplate: agentId,
+    gateDaemonArgvPrefix:
+      input.cliBinary !== undefined && input.cliBinary.length > 0
+        ? [input.cliBinary]
+        : [process.execPath, process.argv[1] ?? "sanctuary"],
+    excludeUids: [input.operatorUid],
+    gateAccountCeiling: PROVISION_CEILING,
+    gateHomeDirectory: `${NEW_ACCOUNT_HOME_BASE}/${deriveGateAccountName(agentId)}`,
+    reloadPolicy,
+    publishProvisionedRules: async (routing) => {
+      const published = await publishProvisionedEgressRules({
+        fortressPath: input.wallFortressPath,
+        endpointSet: HERMES_ENDPOINT_SET,
+        reloadPolicy,
+        routing,
+      });
+      return published.ok
+        ? { ok: true as const, ruleIds: published.ruleIds }
+        : { ok: false as const, error: published.error };
+    },
+    audit: async (operation, details) => {
+      try {
+        const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+        await appendCastleWallCliAuditBestEffort(
+          operation,
+          { source: input.auditSource, ...details },
+          input.wallFortressPath,
+          process.env,
+          process.stderr,
+        );
+      } catch {
+        // Best-effort by contract.
+      }
+    },
+    print: input.print,
+    accountOps: input.accountOps,
+    ...(input.parkPlistFallbackRemoval === true ? { parkPlistFallbackRemoval: true } : {}),
+  };
+}
+
+/**
+ * S5-7 fix-round-3: run the repair sequence under the exclusive provision lock
+ * (the SAME `PROVISION_LOCK_PATH` single source the arm/unprotect CLI runners
+ * take), so arm, repair, and unprotect are genuinely mutually exclusive. Repair
+ * MUTATES the registry (addOrUpdate re-arm + release-barrier bootstrap); without
+ * the lock a concurrent `--repair-egress-gate` could re-arm / re-bootstrap a uid
+ * while an in-flight unprotect tears that same uid's gate, credential, and
+ * policy down (or vice versa) -- the residual race both adversarial families
+ * flagged. Returns the repair outcome when the lock was free, or
+ * `{ locked: false }` (fail-closed, NOTHING mutated -- the refusal is already
+ * printed) when another provisioning run holds it.
+ *
+ * NO SELF-DEADLOCK: the repair sub-ops self-lock on the REGISTRY lock
+ * (`PF_ANCHOR_REGISTRY_LOCK_PATH`) and the per-uid GENERATION lock, both DISTINCT
+ * paths from `PROVISION_LOCK_PATH`; nothing inside `runEgressGateRepair`
+ * re-acquires this path. The lock releases in `withProvisionLock`'s `finally` on
+ * every throw. Only the interactive CLI runner takes this wrap (matching where
+ * arm/unprotect take it); no single-threaded boot path repairs, so nothing is
+ * wedged. Extracted with an injectable `lockOps` (production default
+ * {@link realLockOps}) so the concurrency behavior is host-free unit-testable --
+ * the CLI runner itself is darwin/root-gated over real account ops.
+ */
+export async function runEgressGateRepairUnderProvisionLock(
+  runRepair: () => Promise<EgressGateRepairOutcome>,
+  print: (line: string) => void,
+  lockOps: ProvisionLockOps = realLockOps(),
+): Promise<{ locked: true; outcome: EgressGateRepairOutcome } | { locked: false }> {
+  try {
+    const outcome = await withProvisionLock(PROVISION_LOCK_PATH, lockOps, runRepair);
+    return { locked: true, outcome };
+  } catch (err) {
+    if (err instanceof ProvisionLockHeldError) {
+      // SAFETY: stderr is the operator-facing CLI channel; a fixed, safe string
+      // plus the lock error message (a lock-path only, no secrets).
+      print(
+        `Repair refused: another 'sanctuary protect' provisioning run is already in progress ` +
+          `(${(err as Error).message}); this run made NO changes. Wait for it to finish, then re-run.`,
+      );
+      return { locked: false };
+    }
+    throw err;
+  }
+}
 
 /**
  * Run the exclusive-egress repair sequence for the already-provisioned
  * fine-grained Hermes agent (Unified Protect Slice 5 S5-6, design MED-7).
  * Drift-guard first (foreign transient pf rules REFUSE without the
- * interactive override), then recover -> bring-up -> release barrier.
- * Returns a process exit code (0 = repaired; 2 = refused/failed -- the agent
- * stays parked or coarse-only, loudly).
+ * interactive override), then recover -> bring-up -> release barrier. The whole
+ * sequence runs under the exclusive provision lock
+ * ({@link runEgressGateRepairUnderProvisionLock}), so a concurrent arm or
+ * unprotect cannot race the registry mutation. Returns a process exit code
+ * (0 = repaired; 2 = refused/failed -- the agent stays parked or coarse-only,
+ * loudly).
  */
 export async function runEgressGateRepairForCli(options: {
   isTty: boolean;
@@ -2307,59 +2433,38 @@ export async function runEgressGateRepairForCli(options: {
     print(`Could not resolve the harness argv for the repair (${(err as Error).message}); refusing.`);
     return 2;
   }
-  const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
-    const { requestPolicyReload } = await import("../cli/castle-wall.js");
-    const result = await requestPolicyReload(wallFortressPath, "darwin");
-    return result.ok ? { ok: true } : { ok: false, error: result.error };
-  };
-  const wiring: ExclusiveEgressWiringInput = {
-    agentId,
+  const wiring = buildHermesExclusiveCliWiring({
     agentUid,
-    agentAccount: accountName,
-    fortressPath: wallFortressPath,
+    accountName,
+    newAccountHome,
+    wallFortressPath,
     harnessArgv,
-    harnessLogDir: resolveHarnessDaemonLogDir(newAccountHome),
-    agentTemplate: agentId,
-    gateDaemonArgvPrefix:
-      options.cliBinary !== undefined && options.cliBinary.length > 0
-        ? [options.cliBinary]
-        : [process.execPath, process.argv[1] ?? "sanctuary"],
-    excludeUids: [operatorIdentity.uid],
-    gateAccountCeiling: PROVISION_CEILING,
-    gateHomeDirectory: `${NEW_ACCOUNT_HOME_BASE}/${deriveGateAccountName(agentId)}`,
-    reloadPolicy,
-    publishProvisionedRules: async (routing) => {
-      const published = await publishProvisionedEgressRules({
-        fortressPath: wallFortressPath,
-        endpointSet: HERMES_ENDPOINT_SET,
-        reloadPolicy,
-        routing,
-      });
-      return published.ok
-        ? { ok: true as const, ruleIds: published.ruleIds }
-        : { ok: false as const, error: published.error };
-    },
-    audit: async (operation, details) => {
-      try {
-        const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
-        await appendCastleWallCliAuditBestEffort(
-          operation,
-          { source: "sanctuary-protect-repair", ...details },
-          wallFortressPath,
-          process.env,
-          process.stderr,
-        );
-      } catch {
-        // Best-effort by contract.
-      }
-    },
+    operatorUid: operatorIdentity.uid,
+    auditSource: "sanctuary-protect-repair",
     print,
     accountOps,
-  };
-  const outcome = await runEgressGateRepair(
-    { agentUid, isTty: options.isTty, overrideTransientPfRules: options.overrideTransientPfRules },
-    createRepairExclusiveEgressOps(wiring),
+    ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
+  });
+  // CONCURRENCY (S5-7 fix-round-3): run the WHOLE repair sequence under the
+  // SAME exclusive provision lock the arm (`runProvisionFlow`, above) and
+  // unprotect (`withUnprotectLock`) paths take, so arm, repair, and unprotect
+  // are genuinely mutually exclusive. See {@link runEgressGateRepairUnderProvisionLock}
+  // for the rationale and the no-self-deadlock argument.
+  const locked = await runEgressGateRepairUnderProvisionLock(
+    () =>
+      runEgressGateRepair(
+        { agentUid, isTty: options.isTty, overrideTransientPfRules: options.overrideTransientPfRules },
+        createRepairExclusiveEgressOps(wiring),
+      ),
+    print,
   );
+  if (!locked.locked) {
+    // Fail-closed: another arm/repair/unprotect run holds the provision lock, so
+    // the repair sequence NEVER ran and this run mutated NOTHING (the helper
+    // already printed the loud refusal).
+    return 2;
+  }
+  const outcome = locked.outcome;
   switch (outcome.kind) {
     case "repaired":
       print(`Exclusive-egress gate repaired: generation ${outcome.generationId} live; the agent harness was released.`);
@@ -2389,6 +2494,154 @@ export async function runEgressGateRepairForCli(options: {
             : "WARNING: the agent's parked state could NOT be fully verified -- it may be startable now " +
               `or at the next boot. Failed checks: ${outcome.parkedStateProblems.join("; ") || "no probe detail"}. ` +
               "Investigate immediately."),
+      );
+      return 2;
+  }
+}
+
+/**
+ * Run the S5-7 per-agent exclusive-egress UNPROTECT for the provisioned
+ * fine-grained Hermes agent (Unified Protect Slice 5 S5-7): verified
+ * persistent park -> generation recovery -> gate daemon down -> credential +
+ * oracle-token teardown -> provisioned-rule scrub -> policy surfaces off ->
+ * registry remove (union re-render preserving every remaining confined uid;
+ * the anchor is flushed ONLY when the last agent leaves). Returns a process
+ * exit code (0 = unprotected; 2 = failed -- remaining protection intact, the
+ * agent stays parked, loudly). Idempotent: a re-run after any failure
+ * converges.
+ *
+ * SCOPE (matches the design's S5-7 row): the exclusive-egress teardown only.
+ * It does NOT delete the agent/gate service accounts (Erik-present, separate
+ * build by standing decision) and does NOT disarm the coarse wall or restore
+ * re-homed files (the unprovision flow owns those).
+ */
+export async function runEgressGateUnprotectForCli(options: {
+  print?: (line: string) => void;
+  cliBinary?: string;
+  getuid?: () => number;
+  resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+}): Promise<number> {
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+  // this is only the default when no `print` override is supplied (the CLI
+  // caller always supplies one). Never used to print secrets or key material.
+  const print = options.print ?? ((line: string) => console.error(`  ${line}`));
+  if (osPlatform() !== "darwin") {
+    print("--unprotect-egress-gate is macOS-only (the pf/launchd exclusive-egress stack).");
+    return 2;
+  }
+  const getuid = options.getuid ?? process.getuid?.bind(process);
+  if (getuid?.() !== 0) {
+    print(
+      "Removing the exclusive-egress gate requires root. Re-run: sudo sanctuary protect --unprotect-egress-gate",
+    );
+    return 2;
+  }
+  const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
+  const operatorIdentity = await resolveIdentity();
+  if (operatorIdentity === undefined) {
+    print("Could not determine the operator account under sudo (SUDO_UID/SUDO_GID unset); refusing to unprotect.");
+    return 2;
+  }
+  const wallFortressPath = resolveWallFortressPath(process.env, operatorIdentity.home);
+  const accountName = deriveAgentAccountName("hermes");
+  const newAccountHome = `${NEW_ACCOUNT_HOME_BASE}/${accountName}`;
+  const accountOps = realAccountProvisionOps();
+  const agentUid = await accountOps.lookupAccountUid(accountName);
+  if (agentUid === undefined || agentUid === null) {
+    print(
+      `No dedicated agent account "${accountName}" exists; nothing to unprotect. ` +
+        "(Account removal is a separate, operator-present step and is never bundled here.)",
+    );
+    return 2;
+  }
+  // MED-1 (teardown wedge on a damaged install): argv resolution needs the
+  // re-homed Hermes runtime tree (runtime files + system python + venv). If it
+  // was damaged or deleted, REFUSING here would wedge the unprotect verb
+  // permanently while pf rules + the registry entry + the gate daemon + the
+  // credential all persist -- a fail-closed dead-end with no recovery path. The
+  // argv is only needed to RE-RENDER the parked plist; an ABSENT plist is
+  // equally unbootable (and `verifyHarnessParkedPersistent` accepts it), so we
+  // fall back to a plist-REMOVAL park and still complete the teardown. A
+  // harmless absolute placeholder keeps the parked-plan renderer from throwing;
+  // it is never written to disk (the plist is removed on this path).
+  let harnessArgv: string[];
+  let parkPlistFallbackRemoval = false;
+  try {
+    const resolved = await resolveHermesGatewayArgv({ pathExists }, { agentHome: newAccountHome });
+    harnessArgv = resolved.programArguments;
+  } catch (err) {
+    print(
+      `Could not resolve the harness argv for the unprotect (${(err as Error).message}); ` +
+        "falling back to a plist-removal park -- the harness will be left unbootable (no parked plist) and " +
+        "the teardown will still complete. (The re-homed Hermes runtime tree looks damaged or removed.)",
+    );
+    harnessArgv = ["/usr/bin/false"];
+    parkPlistFallbackRemoval = true;
+  }
+  const wiring = buildHermesExclusiveCliWiring({
+    agentUid,
+    accountName,
+    newAccountHome,
+    wallFortressPath,
+    harnessArgv,
+    operatorUid: operatorIdentity.uid,
+    auditSource: "sanctuary-protect-unprotect",
+    print,
+    accountOps,
+    parkPlistFallbackRemoval,
+    ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
+  });
+  const outcome = await runEgressGateUnprotect(
+    { agentUid },
+    createUnprotectExclusiveEgressOps(wiring),
+  );
+  switch (outcome.kind) {
+    case "unprotected":
+      print(
+        outcome.flushed
+          ? `Exclusive-egress protection removed for uid ${agentUid}; no confined agents remain (pf anchor flushed).`
+          : `Exclusive-egress protection removed for uid ${agentUid}; ${outcome.remainingUids.length} confined ` +
+              "agent(s) remain with confinement re-verified live.",
+      );
+      // LOW-2 (UX honesty): unprotect removes the exclusive-egress GATE and
+      // parks the harness DOWN -- it does NOT re-release the agent to run under
+      // the coarse wall. The harness stays parked/unbootable until it is
+      // explicitly re-provisioned or the operator releases it. (Account removal
+      // and coarse-wall disarm are separate, operator-present steps.)
+      print(
+        "The agent harness is left PARKED (down / unbootable), not running coarse -- re-provision or " +
+          "release it explicitly to bring it back up.",
+      );
+      if (outcome.registryDirty) {
+        print(
+          "NOTE: the registry still carries a repair-owed marker (posture stays non-green). " +
+            "Run: sudo sanctuary protect --repair-egress-gate",
+        );
+        return 2;
+      }
+      return 0;
+    case "unprotect-failed":
+      print(
+        `Exclusive-egress unprotect FAILED at ${outcome.stage}: ${outcome.reason}. ` +
+          "Remaining protection is INTACT (fail-closed). " +
+          (outcome.parkedStateVerified
+            ? "The agent harness is PARKED (verified: not running, job disabled, hold file absent, " +
+              "parked plist on disk). Investigate, then re-run the unprotect."
+            : "WARNING: the agent's parked state could NOT be fully verified -- it may be startable now " +
+              `or at the next boot. Failed checks: ${outcome.parkedStateProblems.join("; ") || "no probe detail"}. ` +
+              "Investigate immediately."),
+      );
+      return 2;
+    case "unprotect-refused":
+      // Fail-closed refusal (S5-7 fix-round-2): the sole-exclusive-agent
+      // invariant did not hold, the committed registry could not be read, or
+      // another provisioning run held the lock. NOTHING was torn down.
+      print(
+        `Exclusive-egress unprotect REFUSED (nothing torn down; every surface INTACT): ${outcome.reason}.` +
+          (outcome.conflictingUids.length > 0
+            ? " Per-agent unprotect of a shared-fortress/harness config is not supported until the " +
+              "multi-agent teardown lands."
+            : ""),
       );
       return 2;
   }

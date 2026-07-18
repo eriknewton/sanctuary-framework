@@ -68,6 +68,7 @@ import {
   withProvisionLock,
   type ProvisionLockOps,
 } from "../castle-wall/provision/lockfile.js";
+import { hasGenerationHeadroom } from "./anchor-registry.js";
 
 /** Default per-uid generation lock path prefix (an internal on-disk artifact). */
 export const GENERATION_LOCK_PATH_PREFIX = "/var/db/sanctuary/generation";
@@ -262,10 +263,16 @@ export function computeNextGenerationId(
     generationFloor ?? 0,
   );
   const next = highest + 1;
-  // Fail-closed backstop (fix-round-8): the registry boundary rejects unsafe
-  // generation values, but if one ever reaches allocation anyway, n+1 === n
-  // at 2^53 would silently commit a COLLIDING generation. Refuse instead.
-  if (!Number.isSafeInteger(next) || next <= highest) {
+  // Fail-closed backstop (fix-round-8; bound tightened post-#959): the
+  // registry boundary rejects unsafe generation values, but if one ever
+  // reaches allocation anyway, n+1 === n at 2^53 would silently commit a
+  // COLLIDING generation. The bound is the SAME `hasGenerationHeadroom`
+  // predicate the registry enforces (value AND value+1 both safe), so an
+  // allocation landing exactly AT 2^53-1 -- itself a safe integer, but with
+  // no headroom for the NEXT allocation -- is refused HERE, at the
+  // allocator, rather than committed now and rejected later at the registry
+  // boundary. Refuse instead.
+  if (!hasGenerationHeadroom(next) || next <= highest) {
     throw new Error(
       `generation allocation has no safe headroom above ${highest}; the anchor registry needs repair`,
     );

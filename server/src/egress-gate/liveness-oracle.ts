@@ -65,6 +65,17 @@ import type { GateLivenessProbe } from "./gate-server.js";
  */
 export const GATE_LIVENESS_DIR = "/var/db/sanctuary/gate-liveness";
 
+/**
+ * The uid's signed freshness-token file path. The SINGLE source for this
+ * path shape: the fs oracle ops read/write/remove through it, and the S5-7
+ * unprotect teardown removes it directly (invalidation must work even when
+ * the gate service account or oracle keys are already gone, so the teardown
+ * never needs a constructed oracle).
+ */
+export function gateLivenessTokenPath(agentUid: number, dir: string = GATE_LIVENESS_DIR): string {
+  return `${dir}/${agentUid}.token`;
+}
+
 /** On-disk schema version for the signed freshness token. */
 export const GATE_LIVENESS_TOKEN_VERSION = 1 as const;
 
@@ -369,7 +380,7 @@ export function createFsLivenessOracleOps(input: {
   now?: () => number;
 }): LivenessOracleOps {
   const dir = input.dir ?? GATE_LIVENESS_DIR;
-  const tokenPath = (uid: number): string => `${dir}/${uid}.token`;
+  const tokenPath = (uid: number): string => gateLivenessTokenPath(uid, dir);
   return {
     async writeToken(agentUid, payload): Promise<void> {
       const { open, mkdir, chmod, rename, rm } = await import("node:fs/promises");

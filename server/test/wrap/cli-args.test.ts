@@ -36,6 +36,18 @@ describe("Wrap CLI", () => {
       expect(opts.wrap).toBe("/path/to/config.json");
     });
 
+    it("parses --unprotect-egress-gate flag (S5-7 unprotect verb)", () => {
+      const opts = parseWrapArgs(["--unprotect-egress-gate"]);
+      expect(opts.unprotectEgressGate).toBe(true);
+      expect(opts.repairEgressGate).toBeUndefined();
+    });
+
+    it("parses --repair-egress-gate flag (S5-6 repair verb)", () => {
+      const opts = parseWrapArgs(["--repair-egress-gate"]);
+      expect(opts.repairEgressGate).toBe(true);
+      expect(opts.unprotectEgressGate).toBeUndefined();
+    });
+
     it("parses --unwrap flag", () => {
       const opts = parseWrapArgs(["--unwrap"]);
       expect(opts.unwrap).toBe(true);
