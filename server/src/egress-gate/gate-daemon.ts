@@ -131,7 +131,7 @@ export function parseEgressGateRuntimeState(text: string, path: string): EgressG
   try {
     parsed = JSON.parse(text);
   } catch (err) {
-    throw new Error(`gate runtime state at ${path} is not valid JSON: ${(err as Error).message}`);
+    throw new Error(`gate runtime state at ${path} is not valid JSON: ${(err as Error).message}`, { cause: err });
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     throw new Error(`gate runtime state at ${path} is not a JSON object`);
@@ -308,7 +308,7 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
   try {
     parsedPolicy = JSON.parse(policyText);
   } catch (err) {
-    throw new Error(`egress-gate daemon: gate policy is not valid JSON: ${(err as Error).message}`);
+    throw new Error(`egress-gate daemon: gate policy is not valid JSON: ${(err as Error).message}`, { cause: err });
   }
   const policy = validateExclusiveEgressGatePolicy(parsedPolicy);
   if (policy === null) {

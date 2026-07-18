@@ -558,7 +558,7 @@ async function waitForGateRuntime(
   const path = egressGateRuntimeStatePath(agentUid);
   const readState = deps?.readState ?? (async (uid: number): Promise<string> => readFile(egressGateRuntimeStatePath(uid), "utf8"));
   const deadline = Date.now() + budgetMs;
-  let lastError = "runtime state never appeared";
+  let lastError: string | undefined;
   for (;;) {
     try {
       const text = await readState(agentUid);
@@ -573,7 +573,9 @@ async function waitForGateRuntime(
     if (Date.now() >= deadline) break;
     await new Promise((r) => setTimeout(r, intervalMs));
   }
-  throw new Error(`gate daemon did not publish a matching runtime state within ${budgetMs}ms: ${lastError}`);
+  throw new Error(
+    `gate daemon did not publish a matching runtime state within ${budgetMs}ms: ${lastError ?? "runtime state never appeared"}`,
+  );
 }
 
 /**
@@ -1427,12 +1429,9 @@ export function createExclusiveEgressPostureProducer(input: {
     }
     const staging = createFsGenerationStagingStore();
     const coarseArmed = await input.coarseWallArmed();
-    let publicKey: KeyObject | null = null;
-    try {
-      publicKey = createPublicKey(await readFile(GATE_ORACLE_PUBLIC_KEY_PATH, "utf8"));
-    } catch {
-      publicKey = null;
-    }
+    const publicKey: KeyObject | null = await readFile(GATE_ORACLE_PUBLIC_KEY_PATH, "utf8")
+      .then((pem) => createPublicKey(pem))
+      .catch(() => null);
 
     const uids = new Set<number>(entries.map((e) => e.agent_uid));
     if (marker !== null) uids.add(marker.agent_uid);
@@ -1440,25 +1439,19 @@ export function createExclusiveEgressPostureProducer(input: {
     for (const uid of uids) {
       const entry = entries.find((e) => e.agent_uid === uid) ?? null;
       const stagingRecord = await staging.load(uid).catch(() => null);
-      let runtime: EgressGateRuntimeState | null = null;
-      try {
-        const path = egressGateRuntimeStatePath(uid);
-        runtime = parseEgressGateRuntimeState(await readFile(path, "utf8"), path);
-      } catch {
-        runtime = null;
-      }
+      const runtimeStatePath = egressGateRuntimeStatePath(uid);
+      const runtime: EgressGateRuntimeState | null = await readFile(runtimeStatePath, "utf8")
+        .then((text) => parseEgressGateRuntimeState(text, runtimeStatePath))
+        .catch(() => null);
       // The oracle token IS the pf-liveness verdict (the gate's own check).
       let pfLiveness: { live: false | true; reasons: string[] } = {
         live: false,
         reasons: ["oracle public key unavailable"],
       };
       if (publicKey !== null) {
-        let raw: string | null = null;
-        try {
-          raw = await readFile(join(GATE_LIVENESS_DIR, `${uid}.token`), "utf8");
-        } catch {
-          raw = null;
-        }
+        const raw: string | null = await readFile(join(GATE_LIVENESS_DIR, `${uid}.token`), "utf8").catch(
+          () => null,
+        );
         const committed = resolveCommittedGeneration({
           entry,
           stagingRecordPresent: stagingRecord !== null,
