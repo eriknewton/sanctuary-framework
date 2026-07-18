@@ -46,6 +46,8 @@ import {
   resolvePolicyDaemonAction,
   withProvisionLock,
   PROVISION_LOCK_PATH,
+  ProvisionLockHeldError,
+  type ProvisionLockOps,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
   type RehomeStepResult,
@@ -84,6 +86,7 @@ import { deriveGateAccountName } from "../egress-gate/gate-account.js";
 import {
   runEgressGateRepair,
   type ExclusiveEgressArmOps,
+  type EgressGateRepairOutcome,
 } from "../castle-wall/provision/exclusive-arm.js";
 import { runEgressGateUnprotect } from "../castle-wall/provision/exclusive-unprotect.js";
 
@@ -2328,12 +2331,59 @@ function buildHermesExclusiveCliWiring(input: {
 }
 
 /**
+ * S5-7 fix-round-3: run the repair sequence under the exclusive provision lock
+ * (the SAME `PROVISION_LOCK_PATH` single source the arm/unprotect CLI runners
+ * take), so arm, repair, and unprotect are genuinely mutually exclusive. Repair
+ * MUTATES the registry (addOrUpdate re-arm + release-barrier bootstrap); without
+ * the lock a concurrent `--repair-egress-gate` could re-arm / re-bootstrap a uid
+ * while an in-flight unprotect tears that same uid's gate, credential, and
+ * policy down (or vice versa) -- the residual race both adversarial families
+ * flagged. Returns the repair outcome when the lock was free, or
+ * `{ locked: false }` (fail-closed, NOTHING mutated -- the refusal is already
+ * printed) when another provisioning run holds it.
+ *
+ * NO SELF-DEADLOCK: the repair sub-ops self-lock on the REGISTRY lock
+ * (`PF_ANCHOR_REGISTRY_LOCK_PATH`) and the per-uid GENERATION lock, both DISTINCT
+ * paths from `PROVISION_LOCK_PATH`; nothing inside `runEgressGateRepair`
+ * re-acquires this path. The lock releases in `withProvisionLock`'s `finally` on
+ * every throw. Only the interactive CLI runner takes this wrap (matching where
+ * arm/unprotect take it); no single-threaded boot path repairs, so nothing is
+ * wedged. Extracted with an injectable `lockOps` (production default
+ * {@link realLockOps}) so the concurrency behavior is host-free unit-testable --
+ * the CLI runner itself is darwin/root-gated over real account ops.
+ */
+export async function runEgressGateRepairUnderProvisionLock(
+  runRepair: () => Promise<EgressGateRepairOutcome>,
+  print: (line: string) => void,
+  lockOps: ProvisionLockOps = realLockOps(),
+): Promise<{ locked: true; outcome: EgressGateRepairOutcome } | { locked: false }> {
+  try {
+    const outcome = await withProvisionLock(PROVISION_LOCK_PATH, lockOps, runRepair);
+    return { locked: true, outcome };
+  } catch (err) {
+    if (err instanceof ProvisionLockHeldError) {
+      // SAFETY: stderr is the operator-facing CLI channel; a fixed, safe string
+      // plus the lock error message (a lock-path only, no secrets).
+      print(
+        `Repair refused: another 'sanctuary protect' provisioning run is already in progress ` +
+          `(${(err as Error).message}); this run made NO changes. Wait for it to finish, then re-run.`,
+      );
+      return { locked: false };
+    }
+    throw err;
+  }
+}
+
+/**
  * Run the exclusive-egress repair sequence for the already-provisioned
  * fine-grained Hermes agent (Unified Protect Slice 5 S5-6, design MED-7).
  * Drift-guard first (foreign transient pf rules REFUSE without the
- * interactive override), then recover -> bring-up -> release barrier.
- * Returns a process exit code (0 = repaired; 2 = refused/failed -- the agent
- * stays parked or coarse-only, loudly).
+ * interactive override), then recover -> bring-up -> release barrier. The whole
+ * sequence runs under the exclusive provision lock
+ * ({@link runEgressGateRepairUnderProvisionLock}), so a concurrent arm or
+ * unprotect cannot race the registry mutation. Returns a process exit code
+ * (0 = repaired; 2 = refused/failed -- the agent stays parked or coarse-only,
+ * loudly).
  */
 export async function runEgressGateRepairForCli(options: {
   isTty: boolean;
@@ -2395,10 +2445,26 @@ export async function runEgressGateRepairForCli(options: {
     accountOps,
     ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
   });
-  const outcome = await runEgressGateRepair(
-    { agentUid, isTty: options.isTty, overrideTransientPfRules: options.overrideTransientPfRules },
-    createRepairExclusiveEgressOps(wiring),
+  // CONCURRENCY (S5-7 fix-round-3): run the WHOLE repair sequence under the
+  // SAME exclusive provision lock the arm (`runProvisionFlow`, above) and
+  // unprotect (`withUnprotectLock`) paths take, so arm, repair, and unprotect
+  // are genuinely mutually exclusive. See {@link runEgressGateRepairUnderProvisionLock}
+  // for the rationale and the no-self-deadlock argument.
+  const locked = await runEgressGateRepairUnderProvisionLock(
+    () =>
+      runEgressGateRepair(
+        { agentUid, isTty: options.isTty, overrideTransientPfRules: options.overrideTransientPfRules },
+        createRepairExclusiveEgressOps(wiring),
+      ),
+    print,
   );
+  if (!locked.locked) {
+    // Fail-closed: another arm/repair/unprotect run holds the provision lock, so
+    // the repair sequence NEVER ran and this run mutated NOTHING (the helper
+    // already printed the loud refusal).
+    return 2;
+  }
+  const outcome = locked.outcome;
   switch (outcome.kind) {
     case "repaired":
       print(`Exclusive-egress gate repaired: generation ${outcome.generationId} live; the agent harness was released.`);
