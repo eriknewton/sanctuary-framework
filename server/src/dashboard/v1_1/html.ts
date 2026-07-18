@@ -70,9 +70,14 @@ body {
     "sidebar topbar"
     "sidebar main";
 }
-.sidebar { grid-area: sidebar; background: var(--paper-2); border-right: 1px solid var(--rule); padding: 12px 8px; }
+.sidebar { grid-area: sidebar; background: var(--paper-2); border-right: 1px solid var(--rule); padding: 12px 8px; display: flex; flex-direction: column; }
 .sidebar h1 { font-family: var(--serif); font-size: var(--text-lg); margin: 4px 8px 16px; }
 .sidebar nav { display: flex; flex-direction: column; gap: 2px; }
+/* S2: version / deployment / attestation demoted from the top bar to the
+   sidebar footer, stacked and muted so the top bar carries one state pill. */
+.nav-footer { margin-top: auto; padding: 12px 6px 2px; border-top: 1px solid var(--rule); }
+.nav-footer .pills { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+.nav-footer .pills .pill { font-size: 10px; padding: 1px 7px; }
 .sidebar nav a {
   display: flex; align-items: center; gap: var(--space-2);
   padding: 6px 10px; border-radius: var(--rad);
@@ -87,10 +92,18 @@ body {
 .sidebar nav a.active { background: var(--surface); color: var(--ink); border: 1px solid var(--rule); }
 .sidebar nav a.active svg { color: var(--ink); }
 .topbar { grid-area: topbar; display: flex; align-items: center; gap: var(--space-3); padding: 0 16px; border-bottom: 1px solid var(--rule); background: var(--surface); }
-.topbar .brand { font-family: var(--serif); font-size: var(--text-md); }
-.topbar .pills { display: flex; gap: 6px; flex: 1; }
-.topbar .fleet-link { font-size: var(--text-xs); color: var(--accent); text-decoration: none; padding: 4px 10px; border: 1px solid var(--rule); border-radius: 6px; white-space: nowrap; }
-.topbar .fleet-link:hover { border-color: var(--accent); }
+/* S2: machine identity. Human alias leads (serif); the raw id is demoted to a
+   short mono chip that copies the full id on click. */
+.topbar .machine { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.topbar .machine-name { font-family: var(--serif); font-size: var(--text-md); font-weight: 600; white-space: nowrap; }
+.topbar .idchip {
+  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
+  border: 1px solid var(--rule); border-radius: 4px; padding: 1px 6px;
+  background: var(--surface-2); cursor: pointer; max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.topbar .idchip:hover { border-color: var(--rule-2); color: var(--ink-2); }
+.topbar-spacer { flex: 1; }
 .pill {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 2px 8px; border-radius: 12px; font-size: var(--text-xs);
@@ -113,6 +126,10 @@ body {
 .btn.btn-primary { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 .btn.btn-primary:hover:not(:disabled) { background: var(--ink-2); }
 .btn.btn-danger { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
+/* S2: Lockdown is quiet (outlined) until it is actually engaged. The
+   tier1-engaged state below fills it loud when lockdown is ON. */
+.btn.btn-lockdown { background: transparent; color: var(--rust); border-color: var(--rust); }
+.btn.btn-lockdown:hover:not(:disabled) { background: var(--rust-bg); }
 .btn.tier1-pending { background: var(--ochre-bg); color: var(--ochre); border-color: var(--ochre); }
 .btn.tier1-engaged { background: var(--rust-bg); color: var(--rust); border-color: var(--rust); }
 .btn.btn-icon {
@@ -1168,6 +1185,8 @@ body {
   .fortress { display: none; }
   .sidebar h1, .sidebar nav a span { display: none; }
   .sidebar nav a { justify-content: center; padding: 8px 6px; }
+  .nav-footer, .nav-group-label { display: none; }
+  .topbar .idchip { display: none; }
   .template-grid { grid-template-columns: 1fr; }
   .policy-center h1 { font-size: 30px; }
   .intel-center h1 { font-size: 30px; }
@@ -1194,21 +1213,8 @@ body {
  * only (ochre = waiting on you, sage = protected, rust = locked).
  * =================================================================== */
 
-/* Talk hero block (promoted spine entry in the sidebar). */
-.sidebar nav .nav-talk {
-  display: flex; align-items: center; gap: 10px;
-  padding: 11px 12px; margin: 0 0 10px;
-  border-radius: var(--rad-lg);
-  background: var(--surface); border: 1px solid var(--rule);
-  box-shadow: var(--shadow);
-}
-.sidebar nav .nav-talk:hover { background: var(--surface); border-color: var(--rule-2); }
-.sidebar nav .nav-talk.active { background: var(--surface); border-color: var(--ink-3); }
-.sidebar nav .nav-talk svg { width: 18px; height: 18px; color: var(--ink); flex-shrink: 0; }
-.nav-talk-glyph { display: inline-flex; }
-.nav-talk-text { display: flex; flex-direction: column; line-height: 1.2; }
-.nav-talk-text strong { font-family: var(--serif); font-size: var(--text-lg); font-weight: 500; }
-.nav-talk-sub { font-family: var(--mono); font-size: 10px; color: var(--ink-3); letter-spacing: 0.02em; }
+/* S2 (2026-07-18): the Talk hero block retired. Talk is now a normal item
+   under the Assist group; posture (Overview) leads the primary spine. */
 .nav-group-label {
   font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
   text-transform: uppercase; color: var(--ink-4);
@@ -1408,51 +1414,60 @@ body {
 .ambient-stat .l { font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-3); }
 `;
 
+type NavItem = { id: string; label: string; href?: string; icon?: string };
+
 /**
  * Sidebar nav definition. Out-of-scope screens at v1.1 ship are NOT
  * present in this list. Federation (v1.3), Composition (v1.4+), and full
  * Recovery management are excluded by construction.
  *
- * Wave 1 redesign (2026-06-30): the prior flat 11-item list read every
- * surface at equal weight, so the conversational spine ("Dashboard", the
- * concierge) was item one of eleven and did not read as primary. The list
- * is now grouped so the spine is the emphasized default and the rest steps
- * down into named groups: Operate (run the fleet), Verify (check the
- * record), Advanced (everything else, including the flourishing /
- * anti-mind-crime surfaces, which stay tucked here and never on the
- * surface). The Talk item is rendered separately (a promoted hero block),
- * so it is NOT in any group. Route ids are unchanged frozen surfaces; only
- * the visible grouping + the "Dashboard" -> "Talk" / "Activity" labels move.
+ * S2 redesign (2026-07-18): posture becomes Home. The primary nav is now a
+ * flat, noun-based spine ordered Overview / Agents / Machines / Policy /
+ * Evidence, matching the CISO trust grammar (a posture-summary home, then
+ * inventory, then rules, then the audit record). "Overview" is the posture
+ * route promoted to the landing surface; "Evidence" is the activity/audit
+ * route relabeled; "Machines" links out to the Fleet Switcher page (a real
+ * href, not a hash route). Talk demotes from the old promoted hero block to
+ * a normal item under the Assist group. Everything secondary steps down into
+ * Advanced. Route ids are unchanged frozen surfaces (posture, agents, policy,
+ * activity, dashboard, ...); only the visible grouping, ordering, and the
+ * "Posture" -> "Overview" / "Activity" -> "Evidence" / "Dashboard" -> "Talk"
+ * labels move.
  *
- * "Activity" is a NEW route hosting the full inbox + the heavy six-field
- * filter panel that previously sat inline on the right rail. The rail keeps
- * only the click-to-clear approvals queue; power-querying lives here.
+ * "Activity" (now labeled Evidence) hosts the full inbox + the heavy
+ * six-field filter panel that previously sat inline on the right rail. The
+ * rail keeps only the click-to-clear approvals queue; power-querying lives
+ * here.
  */
-const NAV_GROUPS: Array<{ label: string; items: Array<{ id: string; label: string }> }> = [
+const NAV_PRIMARY: NavItem[] = [
+  // Overview: the posture board ("How safe you are right now"), promoted to the
+  // landing surface. Reuses the existing /api/posture/* data endpoints; the
+  // seal in the top bar also expands into this same screen.
+  { id: "posture", label: "Overview" },
+  { id: "agents", label: "Agents" },
+  // Machines: the Fleet Switcher page (absorbs the old top-bar Fleet link).
+  // A real href, not a hash route, so it never collides with an SPA route id.
+  { id: "machines", label: "Machines", href: "/fleet", icon: "machines" },
+  { id: "policy", label: "Policy" },
+  // Evidence: the activity/audit feed (frozen route id "activity").
+  { id: "activity", label: "Evidence", icon: "activity" },
+];
+
+const NAV_GROUPS: Array<{ label: string; items: NavItem[] }> = [
   {
-    label: "Operate",
+    label: "Assist",
     items: [
-      { id: "agents", label: "Agents" },
-      { id: "policy", label: "Policy" },
-      { id: "auto-trigger", label: "Auto-trigger" },
-    ],
-  },
-  {
-    label: "Verify",
-    items: [
-      { id: "activity", label: "Activity" },
-      // Posture: the full posture detail (metric cards, today's story, anomaly
-      // findings, per-agent drill-down, evidence view) folded into the single
-      // surface. Reuses the existing /api/posture/* data endpoints; the seal in
-      // the top bar also expands into this same screen.
-      { id: "posture", label: "Posture" },
-      { id: "attestation", label: "Attestation" },
-      { id: "health", label: "Health" },
+      // Talk: the concierge, frozen route id "dashboard". Demoted from the
+      // old promoted hero to a normal Assist item now that posture leads.
+      { id: "dashboard", label: "Talk", icon: "talk" },
     ],
   },
   {
     label: "Advanced",
     items: [
+      { id: "attestation", label: "Attestation" },
+      { id: "health", label: "Health" },
+      { id: "auto-trigger", label: "Auto-trigger" },
       { id: "intelligence", label: "Intelligence" },
       { id: "privacy", label: "Privacy" },
       { id: "honeypot", label: "Honeypots" },
@@ -1485,6 +1500,8 @@ const NAV_ICON_PATHS: Record<string, string> = {
     '<path d="M8 1.5l5 2v4.5c0 3.1-2.1 5.2-5 6.5-2.9-1.3-5-3.4-5-6.5V3.5z"/><path d="M5.8 8l1.6 1.6L10.4 6"/>',
   talk:
     '<path d="M2 3.5h12v7H8l-3 3v-3H2z"/>',
+  machines:
+    '<rect x="2" y="3" width="12" height="7" rx="1"/><path d="M5.5 13h5M8 10v3"/>',
   intelligence:
     '<rect x="3.5" y="3.5" width="9" height="9" rx="0.5"/><rect x="6" y="6" width="4" height="4"/><path d="M6 1.5v2M10 1.5v2M6 12.5v2M10 12.5v2M1.5 6h2M1.5 10h2M12.5 6h2M12.5 10h2"/>',
   attestation:
@@ -1539,24 +1556,23 @@ export function renderDashboardV11Html(
   const sanctuaryVersion = options.sanctuaryVersion ?? SANCTUARY_VERSION;
   const embedClient = options.embedClient !== false;
 
-  const navItemHtml = (n: { id: string; label: string }) => {
-    const iconPath = NAV_ICON_PATHS[n.id] ?? "";
+  const navItemHtml = (n: NavItem) => {
+    const iconPath = NAV_ICON_PATHS[n.icon ?? n.id] ?? "";
     const icon = iconPath ? SVG_OPEN + iconPath + "</svg>" : "";
+    // A href item (Machines -> /fleet) is a full-page link, not a hash route,
+    // so it carries no data-route and never matches the SPA active-highlight.
+    if (n.href) {
+      return `<a href="${escHtml(n.href)}" title="Switch between Sanctuary machines">${icon}<span>${escHtml(n.label)}</span></a>`;
+    }
     return `<a href="#${n.id}" data-route="${n.id}">${icon}<span>${escHtml(n.label)}</span></a>`;
   };
-  // Talk hero block: the promoted conversational spine. data-route
-  // "dashboard" is the SAME frozen route the concierge has always used;
-  // only the visible affordance (a hero card, not a flat nav row) changes.
-  const talkIcon = SVG_OPEN + (NAV_ICON_PATHS["talk"] ?? "") + "</svg>";
-  const talkHero =
-    `<a href="#dashboard" data-route="dashboard" class="nav-talk">` +
-    `<span class="nav-talk-glyph">${talkIcon}</span>` +
-    `<span class="nav-talk-text"><strong>Talk</strong><span class="nav-talk-sub">your fortress</span></span>` +
-    `</a>`;
-  const nav = talkHero + "\n        " + NAV_GROUPS.map((g) => {
+  // S2: primary flat spine (Overview leads) followed by the named groups.
+  const navPrimary = NAV_PRIMARY.map(navItemHtml).join("\n          ");
+  const navGroups = NAV_GROUPS.map((g) => {
     const groupItems = g.items.map(navItemHtml).join("\n          ");
     return `<div class="nav-group-label">${escHtml(g.label)}</div>\n          ${groupItems}`;
   }).join("\n        ");
+  const nav = navPrimary + "\n        " + navGroups;
 
   // Emit raw JSON inside `<script type="application/json">`. HTML parsers
   // treat script content as RAWTEXT so character references are NOT
@@ -1587,15 +1603,26 @@ export function renderDashboardV11Html(
   <style>${STYLES}</style>
 </head>
 <body>
-  <div class="app" id="app" data-route="dashboard">
+  <div class="app route-full" id="app" data-route="posture">
     <aside class="sidebar">
       <h1>Sanctuary</h1>
       <nav id="sidebar-nav">
         ${nav}
       </nav>
+      <div class="nav-footer">
+        <div class="pills" id="topbar-pills">
+          <span class="pill" data-pill="version">v${escHtml(sanctuaryVersion)}</span>
+          <span class="pill" data-pill="deployment">deployment: local</span>
+          <span class="pill" data-pill="mode">mode: solo</span>
+          <span class="att-global pending" data-pill="attestation" title="Fortress attestation"><span class="seal"><span class="seal-ring dashed"></span><span class="seal-core"></span></span><span class="label">pending</span></span>
+        </div>
+      </div>
     </aside>
     <header class="topbar">
-      <span class="brand mono">${tenantName ? `${escHtml(tenantName)} ` : ""}${escHtml(fortressId)}</span>
+      <div class="machine">
+        <span class="machine-name">${escHtml(tenantName ? tenantName : "This machine")}</span>
+        <button type="button" class="idchip mono" data-action="copy-fortress-id" data-fortress-id="${escHtml(fortressId)}" title="Copy machine id">${escHtml(fortressId)}</button>
+      </div>
       <div class="agent-switcher" id="agent-switcher" data-switcher>
         <button type="button" class="agent-switcher-trigger" id="agent-switcher-trigger" data-action="agent-switcher-toggle" aria-haspopup="true" aria-expanded="false" title="Choose which protected agent you are steering">
           <span class="sw-glyph" id="agent-switcher-glyph">··</span>
@@ -1604,12 +1631,7 @@ export function renderDashboardV11Html(
         </button>
         <div class="agent-switcher-menu" id="agent-switcher-menu" role="menu" hidden></div>
       </div>
-      <div class="pills" id="topbar-pills">
-        <span class="pill" data-pill="version">v${escHtml(sanctuaryVersion)}</span>
-        <span class="pill" data-pill="deployment">deployment: local</span>
-        <span class="pill" data-pill="mode">mode: solo</span>
-        <span class="att-global pending" data-pill="attestation" title="Fortress attestation"><span class="seal"><span class="seal-ring dashed"></span><span class="seal-core"></span></span><span class="label">pending</span></span>
-      </div>
+      <div class="topbar-spacer"></div>
       <div class="posture-seal-wrap" id="posture-seal-wrap" data-seal>
         <button type="button" class="posture-seal" id="posture-seal" data-action="posture-seal-toggle" aria-haspopup="true" aria-expanded="false" title="How protected you are right now">
           <span class="seal-glyph" aria-hidden="true"></span>
@@ -1617,12 +1639,11 @@ export function renderDashboardV11Html(
         </button>
         <div class="posture-seal-pop" id="posture-seal-pop" hidden></div>
       </div>
-      <a href="/fleet" class="fleet-link" title="Switch between Sanctuary machines (more machines arrive in a later wave)">Fleet Switcher</a>
       <button class="btn btn-icon" id="btn-theme-toggle" data-action="theme-toggle" aria-label="Toggle theme" title="Toggle theme">
         <span class="icon-moon">${THEME_ICON_MOON}</span>
         <span class="icon-sun">${THEME_ICON_SUN}</span>
       </button>
-      <button class="btn btn-danger" id="btn-lockdown" data-action="lockdown">Lockdown</button>
+      <button class="btn btn-lockdown" id="btn-lockdown" data-action="lockdown">Lockdown</button>
     </header>
     <main class="main" id="main"><p class="muted">Loading dashboard.</p></main>
     <aside class="fortress" id="fortress"><p class="muted">Loading fortress column.</p></aside>
