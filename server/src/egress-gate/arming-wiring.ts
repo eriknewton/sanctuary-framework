@@ -65,11 +65,17 @@ import {
   GateLivenessOracle,
   createFsLivenessOracleOps,
   GATE_LIVENESS_DIR,
+  gateLivenessTokenPath,
 } from "./liveness-oracle.js";
-import { createFsGateCredentialAuthority } from "./gate-credential.js";
+import {
+  createFsGateCredentialAuthority,
+  gateCredentialAcceptPath,
+  gateCredentialTokenPath,
+} from "./gate-credential.js";
 import { deriveGateAccountName, planAndCreateGateAccount } from "./gate-account.js";
 import {
   AGENT_HARNESS_DAEMON_LABEL,
+  AGENT_HARNESS_DAEMON_PLIST_PATH,
   agentHarnessDaemonStatus,
   agentHarnessDaemonStableRunning,
   installAgentHarnessDaemon,
@@ -126,7 +132,12 @@ import {
   runBootExclusiveEgressRelease,
   type BootReleaseResult,
 } from "../castle-wall/provision/exclusive-arm.js";
-import type { ProvisionLockOps } from "../castle-wall/provision/lockfile.js";
+import type { EgressGateUnprotectOps } from "../castle-wall/provision/exclusive-unprotect.js";
+import {
+  PROVISION_LOCK_PATH,
+  withProvisionLock,
+  type ProvisionLockOps,
+} from "../castle-wall/provision/lockfile.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -400,6 +411,17 @@ export interface ExclusiveEgressWiringInput {
   print(line: string): void;
   /** Account-provision ops (the shipped sysadminctl/dscl real ops). */
   accountOps: Parameters<typeof planAndCreateGateAccount>[1];
+  /**
+   * S5-7 MED-1 fallback: when the harness argv could not be resolved (the
+   * re-homed Hermes runtime tree that argv derives from was damaged or
+   * deleted), the unprotect park REMOVES the host-singleton harness plist
+   * (absent === unbootable) instead of restoring the parked barrier form, so
+   * the teardown can still complete rather than wedging permanently. Only the
+   * S5-7 unprotect wiring reads it; install/repair ignore it. Default (absent /
+   * false) === the normal restore disposition. `harnessArgv` is unused on this
+   * path (the plist is removed, never rendered).
+   */
+  parkPlistFallbackRemoval?: boolean;
   /**
    * TEST-ONLY seam; production omits. Injecting `barrierOps` bypasses the
    * gate-account/oracle bring-up so the release sequence (and its fix-round-4
@@ -1308,6 +1330,49 @@ export async function parkHarnessPersistently(
 }
 
 /**
+ * Recover any in-flight (uncommitted) generation for one uid through the
+ * production S5-2 coordinator: real registry, real staging store, real
+ * owner-check, per-uid O_EXCL lock. Shared by the repair verb and the S5-7
+ * unprotect sequence (recover() never allocates or publishes; the manifest
+ * publisher throws by construction).
+ */
+async function productionRecoverGeneration(agentUid: number): Promise<void> {
+  const registry = createProductionAnchorRegistry();
+  const coordinator = new GenerationCoordinator({
+    bind: async () => bindEphemeralGatePort(),
+    verifyOwner: async ({ port, pid }) =>
+      (await verifyLoopbackTcpPortOwner({ port, expectedPid: pid })).ok,
+    registry: {
+      armEntry: async (entry) => {
+        await registry.addOrUpdate({
+          agent_uid: entry.agent_uid,
+          gate_port: entry.gate_port,
+          fortress_path: entry.fortress_path,
+          generation_id: entry.generation_id,
+        });
+      },
+      tombstone: async (uid, fallback) => {
+        await registry.tombstone(uid, fallback);
+      },
+      readEntry: async (uid) => {
+        const { entries } = await registry.list();
+        return entries.find((e) => e.agent_uid === uid) ?? null;
+      },
+      // Fix-round-5 P1: the persisted floor covering repair-discarded
+      // generations (recover() never allocates, but the adapter stays
+      // complete and consistent with the install-path adapter).
+      readGenerationFloor: async () => (await registry.list()).generationFloor,
+    },
+    publishManifest: async () => {
+      throw new Error("recover() must never publish a manifest");
+    },
+    staging: createFsGenerationStagingStore(),
+    lock: fsLockOps(),
+  });
+  await coordinator.recover(agentUid);
+}
+
+/**
  * Repair ops (`--repair-egress-gate`): drift guard + verified PERSISTENT
  * harness park (fix-round BLOCKER-3 + fix-round-2 HIGH-2) + recover +
  * bring-up + release.
@@ -1346,43 +1411,225 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
       // anything (host-wide token denial until manual surgery).
       return createProductionAnchorRegistry().repairQuarantined();
     },
-    async recoverGeneration(): Promise<void> {
-      const registry = createProductionAnchorRegistry();
-      const coordinator = new GenerationCoordinator({
-        bind: async () => bindEphemeralGatePort(),
-        verifyOwner: async ({ port, pid }) =>
-          (await verifyLoopbackTcpPortOwner({ port, expectedPid: pid })).ok,
-        registry: {
-          armEntry: async (entry) => {
-            await registry.addOrUpdate({
-              agent_uid: entry.agent_uid,
-              gate_port: entry.gate_port,
-              fortress_path: entry.fortress_path,
-              generation_id: entry.generation_id,
-            });
-          },
-          tombstone: async (agentUid, fallback) => {
-            await registry.tombstone(agentUid, fallback);
-          },
-          readEntry: async (agentUid) => {
-            const { entries } = await registry.list();
-            return entries.find((e) => e.agent_uid === agentUid) ?? null;
-          },
-          // Fix-round-5 P1: the persisted floor covering repair-discarded
-          // generations (recover() never allocates, but the adapter stays
-          // complete and consistent with the install-path adapter).
-          readGenerationFloor: async () => (await registry.list()).generationFloor,
-        },
-        publishManifest: async () => {
-          throw new Error("recover() must never publish a manifest");
-        },
-        staging: createFsGenerationStagingStore(),
-        lock: fsLockOps(),
-      });
-      await coordinator.recover(input.agentUid);
-    },
+    recoverGeneration: () => productionRecoverGeneration(input.agentUid),
     bringUpGeneration: () => install.bringUpGeneration(),
     runReleaseSequence: (committed) => install.runReleaseSequence(committed),
+    audit: input.audit,
+    print: input.print,
+  };
+}
+
+/**
+ * How the S5-7 park disposes of the harness plist. Because step 0 asserts the
+ * leaving uid is the SOLE exclusive agent (no sibling behind the host-singleton
+ * label), the park always fully tears the label down; only the plist byte-state
+ * differs:
+ *  - `restore`: rewrite the parked barrier plist (the normal path -- the
+ *    harness argv is available, so the parked form is re-rendered on disk).
+ *  - `remove`: DELETE the plist (the argv-unavailable fallback, MED-1). An
+ *    ABSENT plist is unbootable, which {@link verifyHarnessParkedPersistent}
+ *    already accepts, so the unprotect can still complete its teardown when the
+ *    re-homed harness runtime tree (the argv source) was damaged or deleted --
+ *    instead of wedging permanently while pf rules + the registry entry + the
+ *    gate daemon + credentials all persist with no recovery path.
+ */
+export type UnprotectParkPlistDisposition = "restore" | "remove";
+
+/**
+ * Verified persistent park for the S5-7 unprotect sequence. Because the leaving
+ * uid is the sole exclusive agent (step 0 invariant), the host-singleton
+ * harness label ({@link AGENT_HARNESS_DAEMON_LABEL}) + its plist
+ * ({@link AGENT_HARNESS_DAEMON_PLIST_PATH}) belong to it alone, so the full
+ * S5-5 verified park applies:
+ *  - `restore`: delegate to {@link parkHarnessPersistently} (bootout + disable
+ *    + hold-file removal + parked-plist RESTORE, verified) -- the exact,
+ *    well-covered S5-5 path, unchanged.
+ *  - `remove`: bootout + disable + hold-file removal + parked-plist REMOVAL
+ *    (absent === unbootable), then the same {@link verifyHarnessParkedPersistent}
+ *    posture (which accepts an absent plist).
+ */
+async function parkHarnessForUnprotect(
+  ctx: PersistentParkContext,
+  plistDisposition: UnprotectParkPlistDisposition,
+  deps: PersistentParkDeps = {},
+): Promise<void> {
+  // Normal restore disposition == the exact S5-5 verified park; delegate so
+  // that well-covered path is unchanged.
+  if (plistDisposition === "restore") {
+    await parkHarnessPersistently(ctx, deps);
+    return;
+  }
+  // argv-unavailable fallback (MED-1): full label teardown + REMOVE the plist.
+  const launchctlFn = deps.runLaunchctlFn ?? runLaunchctl;
+  const removeFileFn = deps.removeFileFn ?? (async (path: string): Promise<void> => rm(path, { force: true }));
+  const problems: string[] = [];
+  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
+  }
+  const disable = await launchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (disable.code !== 0) {
+    problems.push(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
+  }
+  try {
+    await removeFileFn(holdFilePathForUid(ctx.agentUid));
+  } catch (err) {
+    problems.push(`hold-file removal failed: ${(err as Error).message}`);
+  }
+  try {
+    await removeFileFn(AGENT_HARNESS_DAEMON_PLIST_PATH);
+  } catch (err) {
+    problems.push(`parked-plist removal failed: ${(err as Error).message}`);
+  }
+  const verified = await verifyHarnessParkedPersistent(ctx, deps);
+  if (!verified.ok) problems.push(...verified.problems);
+  if (problems.length > 0) {
+    throw new Error(`park not verified: ${problems.join("; ")}`);
+  }
+}
+
+/** TEST-ONLY dep seams for {@link createUnprotectExclusiveEgressOps}; production omits. */
+export interface UnprotectWiringDeps {
+  runLaunchctl?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  removeFile?: (path: string) => Promise<void>;
+  registry?: PfAnchorRegistry;
+  recoverGeneration?: (agentUid: number) => Promise<void>;
+  parkDeps?: PersistentParkDeps;
+  scrubRules?: () => Promise<{ removedRuleIds: string[]; reloadOk: boolean }>;
+  /** Injected provision-lock ops (production: the real O_EXCL {@link fsLockOps}). */
+  lockOps?: ProvisionLockOps;
+}
+
+/**
+ * Production ops for the S5-7 per-agent unprotect sequence
+ * (`runEgressGateUnprotect`, `castle-wall/provision/exclusive-unprotect.ts`).
+ * Maps each injected op onto the real primitive:
+ *
+ *  - lock: `withUnprotectLock` -> `withProvisionLock(PROVISION_LOCK_PATH, ...)`,
+ *    the SAME O_EXCL lock the arm/repair paths take, held around the WHOLE
+ *    sequence (S5-7 fix-round-2 HIGH-1) so a concurrent `protect --exclusive-egress`
+ *    cannot commit a sibling between the invariant assertion and the teardown.
+ *  - invariant: `assertSoleUserInvariant` reads the committed non-tombstone
+ *    registry set (under the lock) and refuses when ANY other committed entry
+ *    shares the leaving uid's fortress OR harness. The registry entry does not
+ *    record a harness id and v1 provisions a single harness (Hermes), so the
+ *    fail-closed reading is that ANY other committed non-tombstone entry is a
+ *    shared-fortress/harness sibling -- the ONLY reachable v1 state is exactly
+ *    one exclusive agent, and a second exclusive install overwrites the first's
+ *    single-uid marker. An unreadable registry THROWS (the sequence refuses).
+ *  - park/verify: the full S5-5 verified persistent park (bootout + persistent
+ *    disable + hold-file removal + parked-plist restore-or-remove, read back).
+ *    Because the invariant proved the leaving uid is the sole exclusive agent,
+ *    the host-singleton harness label + plist belong to it alone, so the whole
+ *    label is torn down (no sibling branch). See {@link parkHarnessForUnprotect}.
+ *  - policy surfaces: every surface goes -- the per-uid gate daemon plist /
+ *    config copies / runtime dir AND the fortress exclusive-routing marker +
+ *    gate policy file (the leaving uid is the sole user; no retention branch).
+ *  - manifest scrub: `scrubProvisionedEgressRules` removes the LEAVING harness's
+ *    `provisioned-<harnessId>-*` rules; runs BEFORE the routing-marker removal so
+ *    a crash + external reload composes marker-present-no-rules (blocked,
+ *    fail-closed) rather than marker-gone-rules-present (agent-scoped, fail-open).
+ *  - recover: the shared production S5-2 recovery (staging record resolved
+ *    per the crash table; a tombstoned dead generation keeps its id in the
+ *    registry entry so the final remove folds it into the persisted floor).
+ *  - gate daemon: `launchctl bootout` -- not-found is success, any other
+ *    failure THROWS (S5-6 M5: never tear down surfaces under a live gate).
+ *  - credential/oracle: DIRECT single-source path removals
+ *    ({@link gateCredentialAcceptPath}/{@link gateCredentialTokenPath}/
+ *    {@link gateLivenessTokenPath}) -- deliberately NOT through a constructed
+ *    authority/oracle, so revocation works even when the gate service
+ *    account or oracle keys are already gone (idempotent re-run after a
+ *    partial teardown).
+ *  - registry: the production S5-1 locked registry `remove()` (union re-render,
+ *    per-remaining-tombstone liveness, flush when empty, generation floor folded).
+ */
+export function createUnprotectExclusiveEgressOps(
+  input: ExclusiveEgressWiringInput,
+  deps: UnprotectWiringDeps = {},
+): EgressGateUnprotectOps {
+  const launchctl = deps.runLaunchctl ?? runLaunchctl;
+  const removeFile =
+    deps.removeFile ?? (async (path: string): Promise<void> => rm(path, { force: true, recursive: true }));
+  const registry = deps.registry ?? createProductionAnchorRegistry();
+  const lockOps = deps.lockOps ?? fsLockOps();
+  const parkDeps = deps.parkDeps ?? {};
+  const plistDisposition: UnprotectParkPlistDisposition =
+    input.parkPlistFallbackRemoval === true ? "remove" : "restore";
+  const parkCtx: PersistentParkContext = {
+    agentUid: input.agentUid,
+    agentAccount: input.agentAccount,
+    harnessArgv: input.harnessArgv,
+    fortressPath: input.fortressPath,
+    harnessLogDir: input.harnessLogDir,
+  };
+  return {
+    withUnprotectLock: <T>(fn: () => Promise<T>): Promise<T> =>
+      withProvisionLock(PROVISION_LOCK_PATH, lockOps, fn),
+    async assertSoleUserInvariant(): Promise<{ ok: true } | { ok: false; conflictingUids: number[] }> {
+      // Read the COMMITTED non-tombstone set (an unreadable registry throws ->
+      // the sequence refuses fail-closed). Any OTHER committed non-tombstone
+      // entry is a shared-fortress/harness sibling this per-agent teardown
+      // cannot safely dismantle: the routing marker names ONE uid, the gate
+      // policy file is fortress-keyed, and the scrub is harness-keyed, and the
+      // registry carries no per-entry harness id (v1 is single-harness). So the
+      // fail-closed invariant is exactly "no other committed non-tombstone uid."
+      const { entries } = await registry.list();
+      const conflictingUids = entries
+        .filter((e) => e.agent_uid !== input.agentUid && e.tombstone !== true)
+        .map((e) => e.agent_uid);
+      return conflictingUids.length === 0 ? { ok: true } : { ok: false, conflictingUids };
+    },
+    parkHarness: async (): Promise<void> => {
+      await parkHarnessForUnprotect(parkCtx, plistDisposition, parkDeps);
+    },
+    verifyParkedPersistent: async (): Promise<{ ok: true } | { ok: false; problems: string[] }> =>
+      verifyHarnessParkedPersistent(parkCtx, parkDeps),
+    recoverGeneration: () => (deps.recoverGeneration ?? productionRecoverGeneration)(input.agentUid),
+    async bootoutGateDaemon(): Promise<void> {
+      const label = egressGateDaemonLabel(input.agentUid);
+      const bootout = await launchctl(["bootout", `system/${label}`]);
+      if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+        throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
+      }
+    },
+    async invalidateOracleToken(): Promise<void> {
+      await removeFile(gateLivenessTokenPath(input.agentUid));
+    },
+    async revokeCredential(): Promise<void> {
+      await removeFile(gateCredentialAcceptPath(input.agentUid));
+      await removeFile(gateCredentialTokenPath(input.agentUid));
+    },
+    async removeGateSurfaces(): Promise<void> {
+      // The leaving uid is the sole exclusive agent (step 0 invariant), so
+      // every surface is torn down. PER-UID surfaces (the gate daemon was
+      // already booted out, step 3):
+      await removeFile(egressGateDaemonPlistPath(input.agentUid));
+      await removeFile(egressGatePolicyConfigPath(input.agentUid));
+      await removeFile(egressGateRulesConfigPath(input.agentUid));
+      await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
+      // Fortress exclusive-routing marker + gate policy file (single-uid /
+      // fortress-keyed; safe to remove because no sibling shares them).
+      await removeFile(exclusiveRoutingMarkerPath(input.fortressPath));
+      await removeFile(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME));
+    },
+    async scrubProvisionedRules(): Promise<{ removedRuleIds: string[]; reloadOk: boolean }> {
+      if (deps.scrubRules !== undefined) return deps.scrubRules();
+      const { scrubProvisionedEgressRules } = await import("../castle-wall/provision/egress.js");
+      const result = await scrubProvisionedEgressRules({
+        fortressPath: input.fortressPath,
+        harnessId: input.agentId,
+        reloadPolicy: () => input.reloadPolicy(),
+      });
+      return { removedRuleIds: result.removedRuleIds, reloadOk: result.reloadOk };
+    },
+    async removeRegistryEntry(): Promise<{ remainingUids: number[]; flushed: boolean; dirty: boolean }> {
+      const result = await registry.remove(input.agentUid);
+      return {
+        remainingUids: result.committed.map((e) => e.agent_uid),
+        flushed: result.committed.length === 0,
+        dirty: result.dirty,
+      };
+    },
     audit: input.audit,
     print: input.print,
   };

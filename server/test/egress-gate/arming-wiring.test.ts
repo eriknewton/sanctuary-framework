@@ -16,6 +16,7 @@ import {
   createInstallExclusiveEgressOps,
   createProductionReleaseBarrierOps,
   createRepairExclusiveEgressOps,
+  createUnprotectExclusiveEgressOps,
   parkHarnessPersistently,
   restoreCoarseCompositionProduction,
   verifyHarnessJobDisabled,
@@ -26,12 +27,26 @@ import {
   type PersistentParkContext,
 } from "../../src/egress-gate/arming-wiring.js";
 import { PfAnchorRegistry } from "../../src/egress-gate/anchor-registry.js";
+import {
+  gateCredentialAcceptPath,
+  gateCredentialTokenPath,
+} from "../../src/egress-gate/gate-credential.js";
+import {
+  egressGateDaemonPlistPath,
+  egressGatePolicyConfigPath,
+  egressGateRulesConfigPath,
+  egressGateRuntimeUidDirPath,
+} from "../../src/egress-gate/gate-daemon.js";
+import { gateLivenessTokenPath } from "../../src/egress-gate/liveness-oracle.js";
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
 import {
   holdFilePathForUid,
   planParkedHarnessInstall,
   type ReleaseBarrierOps,
 } from "../../src/egress-gate/release-barrier.js";
+import { exclusiveRoutingMarkerPath } from "../../src/castle-wall/allowlist/routing-marker.js";
+import { EXCLUSIVE_EGRESS_GATE_FILENAME } from "../../src/castle-wall/allowlist/gate-derivation.js";
+import { ProvisionLockHeldError } from "../../src/castle-wall/provision/lockfile.js";
 
 function lsofOutput(pid: number, uid: number): string {
   return `p${pid}\nu${uid}\nnlocalhost:40001\n`;
@@ -573,5 +588,269 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
     // And the matching case releases through the same repair surface.
     const ok = createRepairExclusiveEgressOps(wiringInput(mkBarrierOps(7, [])));
     expect(await ok.runReleaseSequence(CAPTURED)).toEqual({ kind: "released", generation_id: 7 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S5-7: createUnprotectExclusiveEgressOps -- the production mapping of the
+// unprotect sequence's injected ops (the sequence itself is pinned in
+// castle-wall/provision/exclusive-unprotect.test.ts).
+// ---------------------------------------------------------------------------
+
+describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
+  const UNPROTECT_INPUT = {
+    agentUid: 601,
+    agentId: "hermes",
+    agentAccount: "sanctuary-hermes",
+    fortressPath: "/fortress/a",
+    harnessArgv: ["/usr/local/bin/hermes"],
+    harnessLogDir: "/var/sanctuary-agents/sanctuary-hermes/logs",
+    audit: async () => {},
+    print: () => {},
+  } as unknown as ExclusiveEgressWiringInput;
+
+  /**
+   * A registry whose `list()` returns a fixed committed set -- the only method
+   * `assertSoleUserInvariant` reads. Everything else is undefined (the teardown
+   * ops under test never call it).
+   */
+  function stubListRegistry(
+    entries: Array<{ agent_uid: number; gate_port: number; fortress_path: string; tombstone?: boolean }>,
+  ): PfAnchorRegistry {
+    return { list: async () => ({ entries, dirty: false }) } as unknown as PfAnchorRegistry;
+  }
+
+  /** A registry whose `list()` throws (an unreadable registry). */
+  function throwingListRegistry(): PfAnchorRegistry {
+    return {
+      list: async () => {
+        throw new Error("EACCES: egress-anchor-registry.json");
+      },
+    } as unknown as PfAnchorRegistry;
+  }
+
+  it("assertSoleUserInvariant: the sole committed uid is OK (no conflicting uids)", async () => {
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      registry: stubListRegistry([{ agent_uid: 601, gate_port: 20000, fortress_path: "/fortress/a" }]),
+    });
+    await expect(ops.assertSoleUserInvariant()).resolves.toEqual({ ok: true });
+  });
+
+  it("assertSoleUserInvariant: ANY other committed non-tombstone entry (shared fortress OR harness) is a conflict -> NOT ok", async () => {
+    // Same fortress sibling.
+    const sameFortress = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      registry: stubListRegistry([
+        { agent_uid: 601, gate_port: 20000, fortress_path: "/fortress/a" },
+        { agent_uid: 602, gate_port: 20001, fortress_path: "/fortress/a" },
+      ]),
+    });
+    await expect(sameFortress.assertSoleUserInvariant()).resolves.toEqual({ ok: false, conflictingUids: [602] });
+    // Different fortress but the single v1 harness (no per-entry harness id) ->
+    // still a conflict, fail-closed.
+    const otherFortress = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      registry: stubListRegistry([
+        { agent_uid: 601, gate_port: 20000, fortress_path: "/fortress/a" },
+        { agent_uid: 603, gate_port: 20002, fortress_path: "/fortress/b" },
+      ]),
+    });
+    await expect(otherFortress.assertSoleUserInvariant()).resolves.toEqual({ ok: false, conflictingUids: [603] });
+  });
+
+  it("assertSoleUserInvariant: a TOMBSTONE-only other entry is excluded (block-only residue is not a live sibling) -> ok", async () => {
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      registry: stubListRegistry([
+        { agent_uid: 601, gate_port: 20000, fortress_path: "/fortress/a" },
+        { agent_uid: 602, gate_port: 20001, fortress_path: "/fortress/a", tombstone: true },
+      ]),
+    });
+    await expect(ops.assertSoleUserInvariant()).resolves.toEqual({ ok: true });
+  });
+
+  it("assertSoleUserInvariant: an unreadable registry THROWS (the sequence maps that to a fail-closed refusal)", async () => {
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, { registry: throwingListRegistry() });
+    await expect(ops.assertSoleUserInvariant()).rejects.toThrow(/egress-anchor-registry\.json/);
+  });
+
+  it("withUnprotectLock: brackets fn with the injected O_EXCL lock acquire/release around PROVISION_LOCK_PATH", async () => {
+    const events: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      lockOps: {
+        acquire: async (p) => {
+          events.push(`acquire ${p}`);
+        },
+        release: async (p) => {
+          events.push(`release ${p}`);
+        },
+      },
+    });
+    const result = await ops.withUnprotectLock(async () => {
+      events.push("body");
+      return 42;
+    });
+    expect(result).toBe(42);
+    expect(events).toEqual([
+      "acquire /var/run/sanctuary-provision.lock",
+      "body",
+      "release /var/run/sanctuary-provision.lock",
+    ]);
+  });
+
+  it("withUnprotectLock: a held lock (acquire EEXIST) throws ProvisionLockHeldError; the body never runs", async () => {
+    let bodyRan = false;
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      lockOps: {
+        acquire: async () => {
+          const err = new Error("EEXIST") as NodeJS.ErrnoException;
+          err.code = "EEXIST";
+          throw err;
+        },
+        release: async () => {},
+      },
+    });
+    await expect(
+      ops.withUnprotectLock(async () => {
+        bodyRan = true;
+      }),
+    ).rejects.toBeInstanceOf(ProvisionLockHeldError);
+    expect(bodyRan).toBe(false);
+  });
+
+  it("bootoutGateDaemon: not-running/not-found is SUCCESS; a genuine failure THROWS with the label named", async () => {
+    const mk = (code: number, stderr: string) =>
+      createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+        runLaunchctl: async () => ({ code, stdout: "", stderr }),
+      });
+    await expect(mk(0, "").bootoutGateDaemon()).resolves.toBeUndefined();
+    await expect(mk(3, "Boot-out failed: 3: No such process").bootoutGateDaemon()).resolves.toBeUndefined();
+    await expect(mk(113, "Could not find service").bootoutGateDaemon()).resolves.toBeUndefined();
+    await expect(mk(5, "Boot-out failed: 5: Input/output error").bootoutGateDaemon()).rejects.toThrow(
+      /bootout ai\.sanctuaryprotocol\.egress-gate\.601 exited 5/,
+    );
+  });
+
+  it("credential + oracle teardown removes EXACTLY the single-source uid-keyed paths (no constructed authority needed)", async () => {
+    const removed: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      removeFile: async (path) => {
+        removed.push(path);
+      },
+    });
+    await ops.invalidateOracleToken();
+    await ops.revokeCredential();
+    expect(removed).toEqual([
+      gateLivenessTokenPath(601),
+      gateCredentialAcceptPath(601),
+      gateCredentialTokenPath(601),
+    ]);
+  });
+
+  it("removeGateSurfaces (sole user, asserted): per-uid surfaces first, then the fortress marker + policy file -- every surface goes", async () => {
+    const removed: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      removeFile: async (path) => {
+        removed.push(path);
+      },
+    });
+    await ops.removeGateSurfaces();
+    expect(removed).toEqual([
+      egressGateDaemonPlistPath(601),
+      egressGatePolicyConfigPath(601),
+      egressGateRulesConfigPath(601),
+      egressGateRuntimeUidDirPath(601),
+      exclusiveRoutingMarkerPath("/fortress/a"),
+      `/fortress/a/policy/egress/${EXCLUSIVE_EGRESS_GATE_FILENAME}`,
+    ]);
+  });
+
+  it("removeRegistryEntry routes through the locked registry remove and maps remaining/flushed/dirty", async () => {
+    const removeCalls: number[] = [];
+    const stubRegistry = {
+      remove: async (uid: number) => {
+        removeCalls.push(uid);
+        return {
+          committed: [{ agent_uid: 602, gate_port: 20001, fortress_path: "/fortress/b" }],
+          dirty: false,
+        };
+      },
+    } as unknown as PfAnchorRegistry;
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, { registry: stubRegistry });
+    await expect(ops.removeRegistryEntry()).resolves.toEqual({
+      remainingUids: [602],
+      flushed: false,
+      dirty: false,
+    });
+    expect(removeCalls).toEqual([601]);
+
+    const emptyRegistry = {
+      remove: async () => ({ committed: [], dirty: true }),
+    } as unknown as PfAnchorRegistry;
+    const last = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, { registry: emptyRegistry });
+    await expect(last.removeRegistryEntry()).resolves.toEqual({
+      remainingUids: [],
+      flushed: true,
+      dirty: true,
+    });
+  });
+
+  it("recoverGeneration + scrubProvisionedRules route through their injected seams with this uid/harness", async () => {
+    const recovered: number[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      recoverGeneration: async (uid) => {
+        recovered.push(uid);
+      },
+      scrubRules: async () => ({ removedRuleIds: ["provisioned-hermes-api"], reloadOk: true }),
+    });
+    await ops.recoverGeneration();
+    expect(recovered).toEqual([601]);
+    await expect(ops.scrubProvisionedRules()).resolves.toEqual({
+      removedRuleIds: ["provisioned-hermes-api"],
+      reloadOk: true,
+    });
+  });
+
+  const PARK_INPUT = {
+    ...UNPROTECT_INPUT,
+    agentUid: PARK_CTX.agentUid,
+    agentAccount: PARK_CTX.agentAccount,
+    harnessArgv: PARK_CTX.harnessArgv,
+    fortressPath: PARK_CTX.fortressPath,
+    harnessLogDir: PARK_CTX.harnessLogDir,
+  } as unknown as ExclusiveEgressWiringInput;
+
+  it("parkHarness (sole user) runs the full persistent park: bootout + disable + parked-plist restore, verified", async () => {
+    const { fn, calls } = parkLaunchctl();
+    const fs = parkFs();
+    const ops = createUnprotectExclusiveEgressOps(PARK_INPUT, {
+      parkDeps: { runLaunchctlFn: fn, ...fs },
+    });
+    await ops.parkHarness();
+    expect(calls.some((c) => c.startsWith("bootout"))).toBe(true);
+    expect(calls.some((c) => c.startsWith("disable"))).toBe(true);
+    expect(fs.files.get(PARKED_PLAN.plistPath)).toBe(PARKED_PLAN.plistContent);
+    await expect(ops.verifyParkedPersistent()).resolves.toEqual({ ok: true });
+  });
+
+  it("parkHarness (MED-1 argv-unavailable fallback) REMOVES the plist instead of restoring it; verified parked", async () => {
+    const { fn, calls } = parkLaunchctl();
+    // Simulate a stale released plist on disk that the fallback must remove,
+    // plus a stale hold file that the park removes.
+    const fs = parkFs({
+      [PARKED_PLAN.plistPath]: "<plist>stale released form</plist>",
+      [HOLD_PATH]: "stale hold file",
+    });
+    const ops = createUnprotectExclusiveEgressOps(
+      { ...PARK_INPUT, parkPlistFallbackRemoval: true } as unknown as ExclusiveEgressWiringInput,
+      {
+        parkDeps: { runLaunchctlFn: fn, ...fs },
+      },
+    );
+    await ops.parkHarness();
+    expect(calls.some((c) => c.startsWith("bootout"))).toBe(true);
+    expect(calls.some((c) => c.startsWith("disable"))).toBe(true);
+    // The plist is REMOVED (absent === unbootable), never re-rendered, and the
+    // leaving uid's hold file is gone.
+    expect(fs.files.has(PARKED_PLAN.plistPath)).toBe(false);
+    expect(fs.files.has(HOLD_PATH)).toBe(false);
+    await expect(ops.verifyParkedPersistent()).resolves.toEqual({ ok: true });
   });
 });

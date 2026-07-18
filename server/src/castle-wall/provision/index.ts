@@ -60,7 +60,7 @@ export type {
   ConnectivityVerifyResult,
 } from "./verify.js";
 
-export { withProvisionLock, ProvisionLockHeldError } from "./lockfile.js";
+export { withProvisionLock, ProvisionLockHeldError, PROVISION_LOCK_PATH } from "./lockfile.js";
 export type { ProvisionLockOps } from "./lockfile.js";
 
 export { unprovision, unprovisionFullyOk } from "./unprovision.js";
@@ -142,3 +142,14 @@ export {
   type ExclusiveEgressArmOutcome,
   type ExclusiveGenerationIdentity,
 } from "./exclusive-arm.js";
+
+// Unified Protect Slice 5 S5-7: the per-agent unprotect-via-registry driver.
+export {
+  EGRESS_GATE_UNPROTECT_AUDIT_OP,
+  EGRESS_GATE_UNPROTECT_FAILED_AUDIT_OP,
+  runEgressGateUnprotect,
+  type EgressGateUnprotectContext,
+  type EgressGateUnprotectOps,
+  type EgressGateUnprotectOutcome,
+  type EgressGateUnprotectStage,
+} from "./exclusive-unprotect.js";

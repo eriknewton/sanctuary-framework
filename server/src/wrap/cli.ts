@@ -252,6 +252,17 @@ export interface WrapOptions {
    * (`egress_gate_repair_override`) before any pf mutation.
    */
   overrideTransientPfRules?: boolean;
+  /**
+   * S5-7 unprotect verb: per-agent exclusive-egress teardown via the locked
+   * registry (verified park -> generation recovery -> gate daemon down ->
+   * credential/oracle teardown -> policy surfaces off -> provisioned-rule
+   * scrub -> registry remove; every REMAINING confined uid's rules re-verified
+   * live; the anchor is flushed only when the LAST agent leaves). Fail-closed:
+   * any failure leaves remaining protection intact; idempotent re-run
+   * converges. Does not delete accounts, disarm the coarse wall, or wrap
+   * anything.
+   */
+  unprotectEgressGate?: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1523,6 +1534,18 @@ export async function runWrap(
     const code = await runEgressGateRepairForCli({
       isTty: process.stdin.isTTY === true,
       overrideTransientPfRules: options.overrideTransientPfRules === true,
+      cliBinary: resolveAutoProvisionCliBinary(options),
+    });
+    process.exit(code);
+  }
+
+  // S5-7: the exclusive-egress unprotect verb. Does NOT wrap anything -- it
+  // tears down the per-agent exclusive-egress stack (verified park first;
+  // registry remove LAST so every remaining confined uid's rules re-verify
+  // live and the anchor flushes only when the last agent leaves).
+  if (options.unprotectEgressGate === true) {
+    const { runEgressGateUnprotectForCli } = await import("./auto-provision.js");
+    const code = await runEgressGateUnprotectForCli({
       cliBinary: resolveAutoProvisionCliBinary(options),
     });
     process.exit(code);
@@ -4225,6 +4248,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--no-provision-agent-account",
   "--exclusive-egress",
   "--repair-egress-gate",
+  "--unprotect-egress-gate",
   "--override-transient-pf-rules",
   "--help",
   "-h",
@@ -4337,6 +4361,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--repair-egress-gate":
         options.repairEgressGate = true;
+        break;
+      case "--unprotect-egress-gate":
+        options.unprotectEgressGate = true;
         break;
       case "--override-transient-pf-rules":
         options.overrideTransientPfRules = true;
