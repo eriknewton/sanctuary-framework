@@ -400,10 +400,13 @@ export interface ExclusiveEgressWiringInput {
   print(line: string): void;
   /** Account-provision ops (the shipped sysadminctl/dscl real ops). */
   accountOps: Parameters<typeof planAndCreateGateAccount>[1];
-  /** TEST-ONLY seams; production omits (real barrier ops + real sequence). */
+  /**
+   * TEST-ONLY seam; production omits. Injecting `barrierOps` bypasses the
+   * gate-account/oracle bring-up so the release sequence (and its fix-round-4
+   * P1 captured-generation guard) is exercisable host-free.
+   */
   internals?: {
     barrierOps?: ReleaseBarrierOps;
-    runBarrier?: typeof runReleaseBarrierSequence;
   };
 }
 
@@ -1002,8 +1005,7 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
           return observed;
         },
       };
-      const runBarrier = input.internals?.runBarrier ?? runReleaseBarrierSequence;
-      return runBarrier(
+      return runReleaseBarrierSequence(
         {
           agentUid: input.agentUid,
           harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
