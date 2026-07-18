@@ -46,6 +46,21 @@
 #          stage the new count in .test-baseline. Net-zero churn
 #          commits (count == baseline) pass untouched.
 #
+#          PLATFORM-DELTA CARVE-OUT: the fail-above demand applies
+#          only to commits that stage something under server/. On a
+#          macOS dev box the local passing count always exceeds the
+#          Linux floor by the platform delta (macOS-gated suites that
+#          skip on Linux), so `passing > baseline` is the normal
+#          resting state, not a signal. A commit staging nothing under
+#          server/ cannot have added a test, so demanding a bump there
+#          asked for an accounting that did not exist and made
+#          SKIP_TEST_BASELINE=1 the routine way to commit a docs edit.
+#          That is how a gate stops being a gate. Such commits now warn
+#          with the observed delta and pass; the floor is untouched.
+#          The fail-BELOW regression check still blocks on every commit,
+#          and the CI mirror (which runs on Linux, where no delta
+#          exists) still enforces the floor exactly.
+#
 # Runtime budget: < 60 seconds on a modern Mac. Typecheck is ~3s,
 # the test suite is ~20s, total well under the budget.
 #
@@ -210,6 +225,43 @@ log "Gate 2/2: npm test + transform-error detection + baseline check"
 baseline_is_staged=""
 if git diff --cached --name-only 2>/dev/null | grep -qx ".test-baseline"; then
   baseline_is_staged="yes"
+fi
+
+# Does this commit stage anything that could CHANGE the test count?
+#
+# The fail-above check below exists to stop a silent ratchet: new tests raising
+# the passing count without the floor being raised to match. But on a macOS dev
+# box the local passing count ALWAYS exceeds the Linux floor by the platform
+# delta (macOS-gated suites that skip on Linux), so `passing > baseline` is the
+# NORMAL resting state locally, not evidence of anything.
+#
+# That produced a real failure mode (observed 2026-07-18, PR #965): on a commit
+# that touches no server code at all (a ROADMAP.md edit, a dev-script fix), the
+# hook demanded the author "account for the drift" by raising .test-baseline —
+# but there was nothing to account for. The correct Linux floor had not changed,
+# and raising it to the local macOS count would set a floor Linux can never
+# reach, breaking CI for everyone. The only way through was
+# SKIP_TEST_BASELINE=1. A gate that must be routinely bypassed to do ordinary
+# work stops being a gate, and its override log stops being a signal.
+#
+# So: scope the fail-above demand to commits that could plausibly have changed
+# the count. Anything under server/ qualifies (test files obviously, but also
+# src, package.json, and vitest config — all of which can move the count). A
+# commit staging NOTHING under server/ cannot have added a test, so an excess
+# over the floor there is platform delta by construction, and is reported as a
+# warning instead of a block.
+#
+# What this deliberately does NOT relax:
+#   - the fail-BELOW regression check still blocks unconditionally, on every
+#     commit, regardless of what is staged;
+#   - any commit touching server/ still owes the full accounting;
+#   - the CI guard (.github/workflows/test-baseline-guard.yml) is UNCHANGED and
+#     still enforces the floor exactly. It runs on ubuntu-latest, where local
+#     == CI and no platform delta exists, so it is the authority this local hook
+#     is only the fast convenience copy of.
+server_code_staged=""
+if git diff --cached --name-only 2>/dev/null | grep -qE '^server/'; then
+  server_code_staged="yes"
 fi
 
 # `|| true`: under `set -o pipefail` a failing `git show` (e.g. no HEAD on the
@@ -445,6 +497,20 @@ if [[ -n "$baseline_is_staged" ]]; then
 fi
 if (( passing > baseline )); then
   if [[ -z "$baseline_is_staged" ]]; then
+    # Platform-delta case: nothing under server/ is staged, so this commit
+    # cannot have added a test. The excess is the macOS-over-Linux delta, which
+    # is the normal resting state on a dev box. Report it and allow; do NOT
+    # demand a bump that would set a floor Linux can never reach.
+    if [[ -z "$server_code_staged" ]]; then
+      warn "Passing count ($passing) exceeds the committed floor ($baseline) by $((passing - baseline))."
+      warn "This commit stages nothing under server/, so it cannot have added a test —"
+      warn "treating the excess as the known macOS-over-Linux platform delta."
+      warn "The floor is UNCHANGED at $baseline. Do NOT raise it to your local count:"
+      warn "the floor is the LINUX CI passing count, and CI enforces it exactly."
+      ok "Gate 2/2: $actual_total test files loaded, $passing tests passed (floor: $baseline, platform delta: $((passing - baseline)))."
+      ok "All baseline-guard checks passed. Commit allowed."
+      exit 0
+    fi
     fail "TEST BASELINE DRIFTED ABOVE THE FLOOR — commit blocked"
     printf '[baseline-guard]   Committed floor (HEAD:.test-baseline): %s\n' "$baseline" >&2
     printf '[baseline-guard]   Current passing count:                 %s\n' "$passing" >&2
