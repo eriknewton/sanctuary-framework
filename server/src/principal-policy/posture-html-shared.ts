@@ -17,6 +17,10 @@
  * `<style>` tag. Keep them dependency free and side-effect free.
  */
 
+import { PAPER_INK_ROOT_TOKENS_CSS } from "../dashboard/design-tokens.js";
+
+export { PAPER_INK_ROOT_TOKENS_CSS, THEME_BOOTSTRAP_SCRIPT } from "../dashboard/design-tokens.js";
+
 /**
  * The agent Standing pill: the most-screenshotted honesty surface (#634).
  *
@@ -37,23 +41,62 @@ export const AGENT_PILL_FN_SOURCE = `function agentPill(row) {
   }`;
 
 /**
- * The shared `:root` CSS custom-property block for the three posture pages
- * (Home, per-agent drill-down, Evidence view). Pure refactor: before this
- * change each of `posture-home-html.ts`, `posture-agent-html.ts`, and
- * `posture-evidence-html.ts` hand-copied an identical `:root { ... }` block
- * inline in its `<style>` tag. Copy-pasted design tokens drift silently the
- * first time someone tweaks a color on one page and forgets the other two;
- * this constant is now the single source all three interpolate, so a future
- * token change can no longer land on only one of the three surfaces.
+ * The shared design-token block for the three posture pages (Home, per-agent
+ * drill-down, Evidence view). This is now the canonical "paper/ink" token
+ * block - the SAME `PAPER_INK_ROOT_TOKENS_CSS` the v1.1 dashboard and the Fleet
+ * Switcher interpolate - so all four web surfaces speak one visual language.
  *
- * This is a byte-for-byte extraction of the block that already shipped on
- * all three pages: no color, spacing, or property changed. A test
- * (`posture-html-shared.test.ts`) pins the rendered `:root` block on all three
- * pages equal to a captured baseline of the pre-refactor output, so this
- * extraction cannot silently change what ships.
+ * Before this change the three posture pages carried a generic GitHub-dark
+ * palette (`--bg: #0e1116; --green: #2ea043; --accent: #58a6ff; ...`) that read
+ * as a developer default and diverged from the v1.1 board's warm paper/ink
+ * system. Porting them onto the shared block is the S1 "one token system" work:
+ * the pages' component CSS now references the paper/ink token names
+ * (`--paper`, `--surface`, `--rule`, `--ink`, `--ink-3`, `--sage`, `--ochre`,
+ * `--rust`, `--indigo`) directly, and the standalone pages carry a small theme
+ * bootstrap (`THEME_BOOTSTRAP_SCRIPT`) so they follow the dashboard's light/dark
+ * choice instead of rendering a single fixed theme.
+ *
+ * A test (`posture-html-shared.test.ts`) pins the rendered `:root` block on all
+ * three pages equal to the shared constant, so a future token change can no
+ * longer land on only one of the surfaces.
  */
-export const POSTURE_ROOT_TOKENS_CSS = `:root {
-    --bg: #0e1116; --panel: #161b22; --panel-2: #1c2330; --border: #2a313c;
-    --text: #e6edf3; --muted: #9aa6b2; --green: #2ea043; --amber: #d29922;
-    --red: #f85149; --accent: #58a6ff;
-  }`;
+export const POSTURE_ROOT_TOKENS_CSS = PAPER_INK_ROOT_TOKENS_CSS;
+
+/**
+ * The shared status-pill CSS for the posture surfaces. Before this change each
+ * of the three pages hand-copied a nearly identical `.pill` rule set inline;
+ * this constant is the single source all three interpolate.
+ *
+ * Two additions the design audit called for, on top of the paper/ink recolor:
+ *
+ *   - **Color + shape redundancy.** Every status pill carries a leading glyph
+ *     (filled circle = good, triangle = attention, hexagon = fault, open circle
+ *     = neutral, dashed ring = unknown), so state is legible without color for
+ *     colorblind and projector viewing. The glyph is injected by CSS `::before`,
+ *     so the honesty mappers' emitted markup (`<span class="pill green">...`) is
+ *     byte-unchanged - the pinned mapper sources cannot drift from this.
+ *
+ *   - **The slate "unknown / not monitored" treatment.** A full-weight neutral
+ *     gray with a dashed ring - never a whisper, never mistaken for green.
+ *     "Green must mean checked-and-passed, never no-data." Available here for
+ *     surfaces that render an unknown status (wired incrementally); adding the
+ *     treatment does not itself change any mapper's color model.
+ *
+ * Glyphs are written as CSS unicode escapes so this source stays ASCII-clean.
+ */
+export const STATUS_PILL_CSS = `.pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600;
+    white-space: nowrap;
+  }
+  .pill::before { font-size: 9px; line-height: 1; }
+  .pill.green { background: var(--sage-bg); color: var(--sage); }
+  .pill.green::before { content: "\\25CF"; }
+  .pill.amber { background: var(--ochre-bg); color: var(--ochre); }
+  .pill.amber::before { content: "\\25B2"; }
+  .pill.red { background: var(--rust-bg); color: var(--rust); }
+  .pill.red::before { content: "\\2B22"; }
+  .pill.neutral { background: var(--surface-2); color: var(--ink-3); }
+  .pill.neutral::before { content: "\\25CB"; }
+  .pill.unknown { background: var(--slate-bg); color: var(--slate); border: 1px dashed var(--slate); }
+  .pill.unknown::before { content: "\\25CC"; }`;

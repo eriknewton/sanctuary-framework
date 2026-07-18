@@ -31,7 +31,12 @@
 
 import type { FeatureHealthStatus } from "./feature-health.js";
 import type { CustodyState } from "./posture.js";
-import { AGENT_PILL_FN_SOURCE, POSTURE_ROOT_TOKENS_CSS } from "./posture-html-shared.js";
+import {
+  AGENT_PILL_FN_SOURCE,
+  POSTURE_ROOT_TOKENS_CSS,
+  STATUS_PILL_CSS,
+  THEME_BOOTSTRAP_SCRIPT,
+} from "./posture-html-shared.js";
 
 /**
  * "Never fake green" + "never imply anonymity" for the Query-privacy section
@@ -139,100 +144,98 @@ export function renderPostureHomeHTML(): string {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Sanctuary - Sovereignty Posture</title>
+<script>${THEME_BOOTSTRAP_SCRIPT}</script>
 <style>
   ${POSTURE_ROOT_TOKENS_CSS}
   * { box-sizing: border-box; }
   body {
-    margin: 0; background: var(--bg); color: var(--text);
+    margin: 0; background: var(--paper); color: var(--ink);
     font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   }
-  header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--rule); }
   .header-row { display: flex; align-items: flex-start; gap: 16px; }
   .header-row .header-titles { flex: 1; min-width: 0; }
   h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
-  .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .sub { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
   .fleet-link {
-    flex: none; align-self: center; color: var(--accent); font-size: 13px;
-    padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px;
-    background: var(--panel); white-space: nowrap;
+    flex: none; align-self: center; color: var(--indigo); font-size: 13px;
+    padding: 6px 12px; border: 1px solid var(--rule); border-radius: 6px;
+    background: var(--surface); white-space: nowrap;
   }
-  .fleet-link:hover { border-color: var(--accent); text-decoration: none; }
+  .fleet-link:hover { border-color: var(--indigo); text-decoration: none; }
   main { padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
   .banner {
     display: flex; flex-wrap: wrap; gap: 14px; padding: 16px;
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
     margin-bottom: 20px;
   }
   .stat { display: flex; flex-direction: column; min-width: 130px; }
   .stat .v { font-size: 22px; font-weight: 700; }
-  .stat .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
-  .pill.green { background: rgba(46,160,67,.18); color: var(--green); }
-  .pill.amber { background: rgba(210,153,34,.18); color: var(--amber); }
-  .pill.red { background: rgba(248,81,73,.18); color: var(--red); }
+  .stat .l { color: var(--ink-3); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
+  ${STATUS_PILL_CSS}
   section { margin-bottom: 24px; }
-  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 0 0 10px; }
+  section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--ink-3); margin: 0 0 10px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
   .card {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
     padding: 14px;
   }
-  .card.amber { border-color: var(--amber); }
+  .card.amber { border-color: var(--ochre); }
   .card h3 { margin: 0 0 4px; font-size: 14px; }
-  .card .meta { color: var(--muted); font-size: 12px; }
-  .reach { margin-top: 8px; font-size: 12px; color: var(--muted); }
-  a { color: var(--accent); text-decoration: none; }
+  .card .meta { color: var(--ink-3); font-size: 12px; }
+  .reach { margin-top: 8px; font-size: 12px; color: var(--ink-3); }
+  a { color: var(--indigo); text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .panel { background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; }
   .story-line { margin: 4px 0; }
-  .fh-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .fh-row { display: flex; align-items: baseline; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--rule); }
   .fh-row:last-child { border-bottom: 0; }
   .fh-row .name { flex: 1; }
-  .fh-row .why { color: var(--muted); font-size: 12px; }
-  .fh-note { color: var(--muted); font-size: 11px; margin-top: 10px; }
+  .fh-row .why { color: var(--ink-3); font-size: 12px; }
+  .fh-note { color: var(--ink-3); font-size: 11px; margin-top: 10px; }
   .approval-row {
     display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
-    padding: 10px 0; border-bottom: 1px solid var(--border);
+    padding: 10px 0; border-bottom: 1px solid var(--rule);
   }
   .approval-row:last-child { border-bottom: 0; }
   .approval-main { min-width: 0; }
   .approval-title { font-weight: 600; }
-  .approval-detail { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .approval-detail { color: var(--ink-3); font-size: 12px; margin-top: 2px; }
   .approval-actions { display: flex; gap: 8px; flex: none; }
   .approval-actions button {
-    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px;
-    color: var(--text); background: var(--panel-2); cursor: pointer; font-size: 12px;
+    border: 1px solid var(--rule); border-radius: 6px; padding: 5px 10px;
+    color: var(--ink); background: var(--surface-2); cursor: pointer; font-size: 12px;
   }
-  .approval-actions button.approve { border-color: rgba(46,160,67,.55); }
-  .approval-actions button.deny { border-color: rgba(248,81,73,.55); }
+  .approval-actions button.approve { border-color: var(--sage); }
+  .approval-actions button.deny { border-color: var(--rust); }
   .approval-actions button:disabled { opacity: .55; cursor: not-allowed; }
-  .approval-error { color: var(--red); font-size: 12px; margin-top: 8px; }
+  .approval-error { color: var(--rust); font-size: 12px; margin-top: 8px; }
   .footer {
-    margin: 24px 0 8px; padding: 14px 16px; background: var(--panel-2);
-    border: 1px solid var(--border); border-radius: 10px; color: var(--muted); font-size: 12px;
+    margin: 24px 0 8px; padding: 14px 16px; background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 10px; color: var(--ink-3); font-size: 12px;
   }
-  .footer strong { color: var(--text); }
-  .empty { color: var(--muted); font-style: italic; }
-  .err { color: var(--red); }
-  code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  .evidence { font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .footer strong { color: var(--ink); }
+  .empty { color: var(--ink-3); font-style: italic; }
+  .err { color: var(--rust); }
+  code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .evidence { font-size: 11px; color: var(--ink-3); margin-top: 6px; }
   button.guided {
-    margin-top: 8px; background: var(--panel-2); color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px;
+    margin-top: 8px; background: var(--surface-2); color: var(--ink);
+    border: 1px solid var(--rule); border-radius: 6px; padding: 5px 10px; cursor: pointer; font-size: 12px;
   }
-  button.guided:hover { border-color: var(--accent); }
+  button.guided:hover { border-color: var(--indigo); }
   /* Live-refresh connection indicator. The dot color is the at-a-glance honesty
      signal: green = a fresh frame arrived inside the staleness window; amber =
      reconnecting / no recent frame (the data on screen may be stale). It is
      NEVER green merely because a stream socket is open. */
-  .conn { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-top: 4px; }
-  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
-  .conn.live .dot { background: var(--green); }
-  .conn.reconnecting .dot { background: var(--amber); }
-  .conn .updated { color: var(--muted); }
+  .conn { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); margin-top: 4px; }
+  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); flex: none; }
+  .conn.live .dot { background: var(--sage); }
+  .conn.reconnecting .dot { background: var(--ochre); }
+  .conn .updated { color: var(--ink-3); }
   .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; }
-  .section-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); margin: 0; }
-  .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; user-select: none; }
+  .section-head h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--ink-3); margin: 0; }
+  .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: 12px; user-select: none; }
   .story-toggle input { margin: 0; }
   .story-summary { margin: 0; }
 </style>
@@ -1179,7 +1182,7 @@ export function renderPostureHomeHTML(): string {
   // muted vocabulary and never a green/red trust pill: a node's reach can never
   // launder it into looking trusted. "recent" is informational, not "all well."
   function fleetReachLabel(reach) {
-    if (reach === "recent") return '<span class="pill" style="background:#1c2330">reachable</span>';
+    if (reach === "recent") return '<span class="pill" style="background:var(--surface-2)">reachable</span>';
     if (reach === "stale") return '<span class="pill amber">no recent sync</span>';
     return '<span class="pill amber">never synced</span>';
   }

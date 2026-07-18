@@ -19,6 +19,7 @@
 
 import { getClientScript } from "./client.js";
 import { SANCTUARY_VERSION } from "../../config.js";
+import { PAPER_INK_ROOT_TOKENS_CSS } from "../design-tokens.js";
 
 export interface DashboardV11HtmlOptions {
   /** Bearer token for hub API auth, when not running loopback auto-auth. */
@@ -44,74 +45,7 @@ export interface DashboardV11HtmlOptions {
   embedClient?: boolean;
 }
 
-const STYLES = String.raw`:root {
-  --paper: #f7f5f0;
-  --paper-2: #efece5;
-  --paper-3: #e6e3da;
-  --ink: #1a1a17;
-  --ink-2: #39362f;
-  --ink-3: #6a6659;
-  --ink-4: #9a9585;
-  --rule: #d8d4c8;
-  --rule-2: #c4bfb0;
-  --surface: #fdfcf8;
-  --surface-2: #f1eee6;
-  --sage: oklch(62% 0.07 145);
-  --sage-bg: oklch(94% 0.02 145);
-  --ochre: oklch(68% 0.09 75);
-  --ochre-bg: oklch(94% 0.03 75);
-  --rust: oklch(55% 0.11 35);
-  --rust-bg: oklch(94% 0.03 35);
-  --indigo: oklch(50% 0.10 260);
-  --indigo-bg: oklch(94% 0.03 260);
-  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-  --serif: "Iowan Old Style", "Charter", "Georgia", serif;
-  --rad: 6px;
-  --rad-lg: 10px;
-  --shadow: 0 1px 2px rgba(0,0,0,0.04), 0 0 0 1px rgba(0,0,0,0.02);
-  /* Type scale. Names are size-relative, not semantic, so refactors do
-     not need to invent new names. Existing rules used these literal px
-     values; tokens make future polish a one-line change. */
-  --text-xs: 11px;
-  --text-sm: 12px;
-  --text-base: 13px;
-  --text-md: 14px;
-  --text-lg: 16px;
-  --text-xl: 22px;
-  --text-display: 36px;
-  /* Spacing scale (4px multiples). Layout-specific magic numbers
-     (220px sidebar, 360px fortress rail, concierge-card heights) stay
-     as literals because the token system is for component padding /
-     margin / gap, not grid track sizing. */
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-5: 24px;
-  --space-6: 32px;
-}
-[data-theme="dark"] {
-  --paper: #121210;
-  --paper-2: #171714;
-  --paper-3: #1e1e1b;
-  --ink: #ecebe5;
-  --ink-2: #c7c5bd;
-  --ink-3: #8d8a80;
-  --ink-4: #5e5c55;
-  --rule: #2a2a26;
-  --rule-2: #36352f;
-  --surface: #1a1a17;
-  --surface-2: #1f1e1a;
-  --sage: oklch(72% 0.08 145);
-  --sage-bg: oklch(22% 0.03 145);
-  --ochre: oklch(78% 0.09 75);
-  --ochre-bg: oklch(22% 0.04 75);
-  --rust: oklch(70% 0.11 35);
-  --rust-bg: oklch(22% 0.04 35);
-  --indigo: oklch(72% 0.09 260);
-  --indigo-bg: oklch(22% 0.03 260);
-}
+const STYLES = String.raw`${PAPER_INK_ROOT_TOKENS_CSS}
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; }
 body {
@@ -155,8 +89,8 @@ body {
 .topbar { grid-area: topbar; display: flex; align-items: center; gap: var(--space-3); padding: 0 16px; border-bottom: 1px solid var(--rule); background: var(--surface); }
 .topbar .brand { font-family: var(--serif); font-size: var(--text-md); }
 .topbar .pills { display: flex; gap: 6px; flex: 1; }
-.topbar .fleet-link { font-size: var(--text-xs); color: var(--accent, #58a6ff); text-decoration: none; padding: 4px 10px; border: 1px solid var(--rule); border-radius: 6px; white-space: nowrap; }
-.topbar .fleet-link:hover { border-color: var(--accent, #58a6ff); }
+.topbar .fleet-link { font-size: var(--text-xs); color: var(--accent); text-decoration: none; padding: 4px 10px; border: 1px solid var(--rule); border-radius: 6px; white-space: nowrap; }
+.topbar .fleet-link:hover { border-color: var(--accent); }
 .pill {
   display: inline-flex; align-items: center; gap: 4px;
   padding: 2px 8px; border-radius: 12px; font-size: var(--text-xs);
