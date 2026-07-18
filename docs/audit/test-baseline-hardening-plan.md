@@ -148,3 +148,76 @@ Once all three pass verification, the EU AI Act compliance generator can cite "S
 - Incident: loader.ts syntax error in commit `4ac95830` (2026-04-09), detected in EU AI Act compliance build session (2026-04-10)
 - Fix commit: separate minimal commit following pattern `fix(principal-policy): close tier3_always_allow array accidentally absorbed into comment`
 - Wiki decision entry: `Wiki/decisions/sanctuary-test-baseline-enforcement.md`
+
+---
+
+## 2026-07-18 amendment: the platform-delta carve-out and the inert-hook bug
+
+Two defects were found and fixed while reviewing why the emergency override was
+being used routinely rather than exceptionally.
+
+### The guard demanded an accounting that did not exist
+
+On macOS the local passing count always exceeds the Linux floor by the platform
+delta: a set of macOS-gated suites run locally and skip on Linux. So
+`passing > baseline` is the **normal resting state** on a dev box, not evidence
+of new tests.
+
+The fail-above check treated that state as unaccounted drift and told the author
+to raise `.test-baseline`. On a commit that stages nothing under `server/` (a
+`ROADMAP.md` edit, a dev-script fix) there is no legitimate bump to make: the
+Linux floor has not changed, and raising it to the local macOS count sets a floor
+Linux can never reach, which breaks CI for everyone. The only way through was
+`SKIP_TEST_BASELINE=1`.
+
+That is how a gate stops being a gate. PR #965 alone logged two overrides, both
+entirely legitimate, which is precisely the problem: once overriding is the
+normal way to commit a docs edit, the override log stops distinguishing routine
+work from a real bypass, and the audit trail it exists to provide is noise.
+
+**Fix:** the fail-above demand now applies only when the commit stages something
+under `server/` (test files, src, `package.json`, and vitest config can all move
+the count). A commit staging nothing there cannot have added a test, so the
+excess is platform delta by construction. It warns with the observed delta and
+passes, leaving the floor untouched.
+
+**Deliberately not relaxed:** the fail-below regression check still blocks on
+every commit; any commit touching `server/` still owes the full accounting; and
+the CI mirror is unchanged and still enforces the floor exactly. CI runs on
+`ubuntu-latest`, where local equals CI and no delta exists, so it remains the
+authority this local hook is only the fast convenience copy of.
+
+### install-hooks installed the hook where git would never run it
+
+In a worktree, `.git` is a file pointing at `<main>/.git/worktrees/<name>`, and
+the installer wrote the hook into that directory's `hooks/`. Git does not run
+per-worktree hooks: it resolves them against the **common** git dir and honors
+`core.hooksPath` above both.
+
+The failure was silent and the wrong way round. `npm run install-hooks` reported
+success, wrote a file nothing would execute, and left the worktree running
+whatever the main checkout happened to have, or no hook at all on a fresh clone.
+Because worktree-per-build is the standard dispatch pattern, build threads that
+dutifully installed the hook were unguarded while believing they were protected.
+
+`resolveHooksDir` now asks `git rev-parse --git-path hooks`, which is
+authoritative for both `core.hooksPath` and the commondir indirection, with a
+commondir-aware pure-path fallback for when git cannot be invoked. The previous
+test asserted the per-worktree path and so pinned the bug in place; it is
+replaced by a regression test and an end-to-end test against a real git worktree.
+
+**A note on that end-to-end test.** It shells out to real git, which makes it the
+one test in the suite that can damage a developer's own repository, and it did:
+run inside the pre-commit hook before the environment scrub existed, the
+inherited `GIT_DIR` pointed at the Sanctuary repo, so `git init` marked that repo
+bare and `git config user.*` overwrote its identity. Every subsequent git command
+failed with "must be run in a work tree" until the config was repaired by hand.
+No commit or object was affected; the damage was confined to three config keys.
+
+The test is now isolated in three layers: the repo-scoping `GIT_*` variables are
+scrubbed, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point at `/dev/null` so
+config writes cannot reach real files even if the scrub were defeated, and a
+containment assertion checks that git agrees the temp directory is its own top
+level **before** any mutating command runs. The same scrub is applied in
+`resolveHooksDir` itself, where an inherited `GIT_DIR` would otherwise make it
+answer for the wrong repository while appearing perfectly healthy.
