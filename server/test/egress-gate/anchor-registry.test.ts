@@ -451,3 +451,68 @@ describe("egress-gate/anchor-registry", () => {
     expect(current?.enable_token).toBeUndefined();
   });
 });
+
+describe("egress-gate/anchor-registry listQuarantined (fix-round-2 MED-6: per-entry quarantine for the refresh read)", () => {
+  const GOOD_STATE = (committed: unknown[]): PfAnchorRegistryState =>
+    ({ version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed, enable_token: "1" }) as PfAnchorRegistryState;
+
+  it("one malformed committed entry is quarantined (index + reason) while the valid entries stay usable; dirty forced", async () => {
+    const { registry } = makeRegistry({
+      initial: GOOD_STATE([A, { agent_uid: "nope", gate_port: -1 }, B]),
+    });
+    const listed = await registry.listQuarantined();
+    expect(listed.entries.map((e) => e.agent_uid)).toEqual([502, 504]);
+    expect(listed.quarantined).toEqual([{ index: 1, reason: expect.stringContaining("malformed") }]);
+    // Repair owed: never green over a quarantine.
+    expect(listed.dirty).toBe(true);
+    // The wholesale-fail-closed read STILL throws for mutation-path callers.
+    await expect(registry.list()).rejects.toThrow(PfAnchorRegistryStateError);
+  });
+
+  it("a duplicate agent_uid quarantines the LATER occurrence and names the uid", async () => {
+    const { registry } = makeRegistry({
+      initial: GOOD_STATE([A, { ...A, gate_port: 30001 }]),
+    });
+    const listed = await registry.listQuarantined();
+    expect(listed.entries).toHaveLength(1);
+    expect(listed.quarantined).toEqual([{ index: 1, reason: expect.stringContaining("duplicate committed agent_uid 502") }]);
+    expect(listed.dirty).toBe(true);
+  });
+
+  it("a clean state lists clean: no quarantine, dirty false, same entries as list()", async () => {
+    const { registry } = makeRegistry({ initial: GOOD_STATE([A, B]) });
+    const listed = await registry.listQuarantined();
+    expect(listed.quarantined).toEqual([]);
+    expect(listed.dirty).toBe(false);
+    expect(listed.entries).toEqual((await registry.list()).entries);
+  });
+
+  it("STRUCTURAL corruption still throws wholesale (nothing trustworthy to salvage)", async () => {
+    for (const initial of [
+      { version: 999, committed: [A] },
+      { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed: "not-an-array" },
+    ]) {
+      const { registry } = makeRegistry({ initial: initial as never });
+      await expect(registry.listQuarantined()).rejects.toThrow(PfAnchorRegistryStateError);
+    }
+  });
+
+  it("dirty semantics preserved: journaled pending, explicit dirty, and a missing enable token each force dirty", async () => {
+    const pending = {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [A],
+      enable_token: "1",
+      pending: [B],
+    } as PfAnchorRegistryState;
+    expect((await makeRegistry({ initial: pending }).registry.listQuarantined()).dirty).toBe(true);
+    const explicit = {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [A],
+      enable_token: "1",
+      dirty: true,
+    } as PfAnchorRegistryState;
+    expect((await makeRegistry({ initial: explicit }).registry.listQuarantined()).dirty).toBe(true);
+    const noToken = { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed: [A] } as PfAnchorRegistryState;
+    expect((await makeRegistry({ initial: noToken }).registry.listQuarantined()).dirty).toBe(true);
+  });
+});

@@ -201,7 +201,7 @@ function repairOps(overrides: Partial<EgressGateRepairOps> = {}): EgressGateRepa
   return {
     diffTransientPfRules: vi.fn(async () => ({ foreign: [] })),
     parkHarness: vi.fn(async () => undefined),
-    verifyHarnessStopped: vi.fn(async () => ({ ok: true as const })),
+    verifyParkedPersistent: vi.fn(async () => ({ ok: true as const })),
     recoverGeneration: vi.fn(async () => undefined),
     bringUpGeneration: vi.fn(async () => ({ ...COMMITTED })),
     runReleaseSequence: vi.fn(async () => RELEASED),
@@ -307,7 +307,12 @@ describe("runEgressGateRepair", () => {
     ] as const) {
       const ops = repairOps(overrides as Partial<EgressGateRepairOps>);
       const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
-      expect(outcome).toMatchObject({ kind: "repair-failed", stage, harnessStopVerified: true });
+      expect(outcome).toMatchObject({
+        kind: "repair-failed",
+        stage,
+        parkedStateVerified: true,
+        parkedStateProblems: [],
+      });
     }
   });
 
@@ -339,14 +344,14 @@ describe("runEgressGateRepair", () => {
       parkHarness: vi.fn(async () => {
         throw new Error("harness still reports RUNNING");
       }),
-      verifyHarnessStopped: vi.fn(async () => ({ ok: false as const, reason: "pid 4242 alive" })),
+      verifyParkedPersistent: vi.fn(async () => ({ ok: false as const, problems: ["pid 4242 alive"] })),
     });
     const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
     expect(outcome).toMatchObject({
       kind: "repair-failed",
       stage: "park",
-      harnessStopVerified: false,
-      harnessStopNote: "pid 4242 alive",
+      parkedStateVerified: false,
+      parkedStateProblems: ["pid 4242 alive"],
     });
     expect((outcome as { reason: string }).reason).toContain("harness still reports RUNNING");
     expect(ops.recoverGeneration).not.toHaveBeenCalled();
@@ -354,27 +359,39 @@ describe("runEgressGateRepair", () => {
     expect(ops.runReleaseSequence).not.toHaveBeenCalled();
   });
 
-  it("fix-round BLOCKER-3: repair-failed never claims PARKED unverified (probe not-ok and probe-throw both read as unverified)", async () => {
+  it("fix-round BLOCKER-3 + fix-round-2 HIGH-2: repair-failed never claims PARKED unverified, and the problems are ENUMERATED", async () => {
     const notOk = repairOps({
       runReleaseSequence: vi.fn(async () => PARKED),
-      verifyHarnessStopped: vi.fn(async () => ({ ok: false as const, reason: "launchctl untrustworthy" })),
+      verifyParkedPersistent: vi.fn(async () => ({
+        ok: false as const,
+        // The HIGH-2 scenario: stopped NOW, but stale release material remains.
+        problems: [
+          "launchd's override database does not show the job disabled",
+          "the release hold file is still present (stale release material)",
+        ],
+      })),
     });
     const outcome1 = await runEgressGateRepair(REPAIR_CTX, notOk);
     expect(outcome1).toMatchObject({
       kind: "repair-failed",
       stage: "release",
-      harnessStopVerified: false,
-      harnessStopNote: "launchctl untrustworthy",
+      parkedStateVerified: false,
     });
+    expect((outcome1 as { parkedStateProblems: string[] }).parkedStateProblems).toHaveLength(2);
+    expect((outcome1 as { parkedStateProblems: string[] }).parkedStateProblems.join(" ")).toContain(
+      "override database",
+    );
     const throwing = repairOps({
       runReleaseSequence: vi.fn(async () => PARKED),
-      verifyHarnessStopped: vi.fn(async () => {
+      verifyParkedPersistent: vi.fn(async () => {
         throw new Error("probe died");
       }),
     });
     const outcome2 = await runEgressGateRepair(REPAIR_CTX, throwing);
-    expect(outcome2).toMatchObject({ kind: "repair-failed", harnessStopVerified: false });
-    expect((outcome2 as { harnessStopNote: string }).harnessStopNote).toContain("probe died");
+    expect(outcome2).toMatchObject({ kind: "repair-failed", parkedStateVerified: false });
+    expect((outcome2 as { parkedStateProblems: string[] }).parkedStateProblems.join(" ")).toContain(
+      "probe died",
+    );
   });
 
   it("fix-round BLOCKER-3: refusals never touch the harness (no park on foreign rules / non-TTY / diff failure)", async () => {
@@ -436,14 +453,59 @@ describe("runBootExclusiveEgressRelease", () => {
     );
     expect(results).toHaveLength(3);
     expect(results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
-    expect(results[1]!.outcome.kind).toBe("parked");
-    expect(results[2]!.outcome.kind).toBe("parked");
+    // The barrier-parked agent's outcome carries the REAL re-park flags
+    // (fix-round-2 BLOCKER-1).
+    expect(results[1]!.outcome).toEqual({
+      kind: "parked",
+      reason: expect.stringContaining("gate-verify"),
+      holdFileRemoved: true,
+      jobDisabled: true,
+      cleanupErrors: [],
+    });
+    // Fix-round-2 BLOCKER-1: a THROWING release attempt is NOT a synthetic
+    // "parked" -- no re-park op verifiably ran, and the outcome says so.
+    expect(results[2]!.outcome.kind).toBe("park-not-verified");
     expect((results[2]!.outcome as { reason: string }).reason).toContain("registry corrupt");
     expect(audit).toHaveBeenCalledTimes(3);
-    // The parked agents get the LOUD repair guidance.
+    // The parked agent gets the LOUD repair guidance; the not-verified one
+    // gets the LOUDER possibly-startable warning.
     const printed = print.mock.calls.map((c) => String(c[0])).join("\n");
     expect(printed).toContain("remains PARKED");
+    expect(printed).toContain("NOT verified");
+    expect(printed).toContain("possibly startable");
     expect(printed).toContain("--repair-egress-gate");
+  });
+
+  it("fix-round-2 BLOCKER-1: parked cleanup FAILURES surface in the print and the audit record, never swallowed", async () => {
+    const audit = vi.fn(async () => undefined);
+    const print = vi.fn();
+    const results = await runBootExclusiveEgressRelease([{ agent_uid: 502 }], {
+      releaseAgent: async () => ({
+        ...PARKED,
+        jobDisabled: false,
+        cleanupErrors: ["disable failed: launchctl exited 5: override db locked"],
+      }),
+      audit,
+      print,
+    });
+    expect(results[0]!.outcome).toMatchObject({
+      kind: "parked",
+      jobDisabled: false,
+      cleanupErrors: ["disable failed: launchctl exited 5: override db locked"],
+    });
+    const printed = print.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(printed).toContain("re-park ops reported failures");
+    expect(printed).toContain("override db locked");
+    expect(audit).toHaveBeenCalledWith(
+      "exclusive_egress_boot_release",
+      expect.objectContaining({
+        agent_uid: 502,
+        outcome: "parked",
+        hold_file_removed: true,
+        job_disabled: false,
+        cleanup_errors: ["disable failed: launchctl exited 5: override db locked"],
+      }),
+    );
   });
 
   it("repark-failed boot release is surfaced as a WARNING, never a clean green line", async () => {
