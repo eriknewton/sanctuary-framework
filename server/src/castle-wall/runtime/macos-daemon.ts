@@ -21,6 +21,15 @@ import {
   type ExclusiveEgressGatePolicy,
 } from "../allowlist/gate-derivation.js";
 import { validateOperatorBaseline } from "../allowlist/operator-baseline.js";
+import {
+  DEFAULT_EMISSION_STALL_GRACE_MS,
+  EMISSION_STALL_AUDIT_OP,
+  EMISSION_STALL_LOG_PREFIX,
+  EMISSION_STALL_RECOVERED_AUDIT_OP,
+  EmissionLivenessWatchdog,
+  type EmissionRecoveryFinding,
+  type EmissionStallFinding,
+} from "../audit/emission-liveness.js";
 import { verifyManifestSignature } from "../allowlist/parse.js";
 import type { SignedManifest } from "../allowlist/manifest.js";
 import type {
@@ -115,6 +124,16 @@ export const CASTLE_WALL_DEFAULT_AUDIT_HEARTBEAT_INTERVAL_SECONDS = 45 as const;
  * calling at all.
  */
 export const CASTLE_WALL_DEFAULT_AGENT_EGRESS_PROBE_INTERVAL_SECONDS = 21_600 as const;
+
+/**
+ * Default cadence (seconds) of the Slice M emission-liveness watchdog tick
+ * (the decided-vs-emitted divergence evaluation). The tick is a pure counter
+ * comparison (no I/O unless a stall fires), so a seconds-scale cadence is
+ * cheap; it just needs to be comfortably shorter than the watchdog's grace
+ * window (default 60s) so a stall fires within roughly one grace window of
+ * onset.
+ */
+export const CASTLE_WALL_DEFAULT_EMISSION_LIVENESS_TICK_SECONDS = 15 as const;
 
 /**
  * Resolve the as-agent-uid egress probe: the injected one (tests), else the
@@ -298,6 +317,20 @@ export interface MacOSCastleWallDaemonInput {
    * cannot actually change uid).
    */
   agentEgressProbe?: (uid: number, host: string, port: number) => Promise<boolean>;
+  /**
+   * Grace window (ms) of the Slice M emission-liveness watchdog: how long
+   * decisions may keep arriving with ZERO persisted enforcement emission
+   * before the daemon fails loud (`audit_emission_stall` audit entry + a
+   * greppable stderr line). Defaults to
+   * {@link DEFAULT_EMISSION_STALL_GRACE_MS}. Tests inject a small value.
+   */
+  emissionStallGraceMs?: number;
+  /**
+   * Cadence (seconds) of the watchdog's divergence evaluation tick. Defaults
+   * to {@link CASTLE_WALL_DEFAULT_EMISSION_LIVENESS_TICK_SECONDS}. Tests
+   * inject a small value.
+   */
+  emissionLivenessTickSeconds?: number;
   /**
    * Backstop deadline (ms) for the compose+sign phase of a `policy_reload`
    * (drill-found hang guard, 2026-07-12). Bounds custody reads + compose + the
@@ -626,6 +659,100 @@ export async function startMacOSCastleWallDaemon(
     agentEgressProbeTimer = undefined;
   };
 
+  // Slice M emission-liveness watchdog (decided-vs-emitted divergence; the
+  // honest #946 follow-up, root cause in
+  // Review/Sanctuary/SliceM_Emission_Stall_RootCause_2026-07-17.md). The flow
+  // consumer feeds it (receipts / emissions / rejections), the as-uid egress
+  // probe feeds it (a daemon-initiated flow an armed wall must adjudicate),
+  // and the tick timer below evaluates it. A stall fails LOUD: one greppable
+  // stderr line plus one `audit_emission_stall` chain entry; recovery writes
+  // the paired recovered entry. The callbacks must NEVER crash the daemon or
+  // touch enforcement, and a failed stall-audit append must not mask the
+  // alarm: the stderr line fires FIRST, unconditionally.
+  const emissionLivenessTickSeconds =
+    input.emissionLivenessTickSeconds ??
+    CASTLE_WALL_DEFAULT_EMISSION_LIVENESS_TICK_SECONDS;
+  let emissionLivenessTimer: NodeJS.Timeout | undefined;
+  const stopEmissionLivenessTimer = (): void => {
+    if (!emissionLivenessTimer) return;
+    clearInterval(emissionLivenessTimer);
+    emissionLivenessTimer = undefined;
+  };
+  const recordEmissionLivenessTransition = (
+    operation:
+      | typeof EMISSION_STALL_AUDIT_OP
+      | typeof EMISSION_STALL_RECOVERED_AUDIT_OP,
+    details: Record<string, unknown>,
+    result: "success" | "failure",
+  ): void => {
+    void (async () => {
+      await input.auditLog.append(
+        "l1",
+        operation,
+        input.fortressId,
+        {
+          ...details,
+          source: auditSource,
+          // Provenance marker LAST, from constructed fields only (no
+          // untrusted spread), mirroring the heartbeat / filter_stopped
+          // pattern so the honest readers recognize daemon origin.
+          [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+        },
+        result,
+      );
+      await input.auditLog.flush();
+    })().catch((err: unknown) => {
+      // Never crash the daemon, never mask the alarm: the stderr line has
+      // already fired before this append was attempted.
+      console.error(
+        `${EMISSION_STALL_LOG_PREFIX} ${operation} audit write failed (non-fatal; stderr line above is the alarm): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  };
+  const emissionLivenessWatchdog = new EmissionLivenessWatchdog({
+    now: nowMs,
+    ...(input.emissionStallGraceMs !== undefined
+      ? { graceMs: input.emissionStallGraceMs }
+      : {}),
+    onStall: (finding: EmissionStallFinding) => {
+      console.error(
+        `${EMISSION_STALL_LOG_PREFIX} enforcement decisions continue but audit emission has STOPPED: decided_since_last_emission=${finding.decidedSinceLastEmission} decided_total=${finding.decidedTotal} emitted_total=${finding.emittedTotal} rejected_total=${finding.rejectedTotal} ms_since_last_emission=${finding.msSinceLastEmissionMs ?? "never"} sources=${JSON.stringify(finding.decidedBySource)}`,
+      );
+      recordEmissionLivenessTransition(
+        EMISSION_STALL_AUDIT_OP,
+        {
+          decided_total: finding.decidedTotal,
+          emitted_total: finding.emittedTotal,
+          rejected_total: finding.rejectedTotal,
+          decided_since_last_emission: finding.decidedSinceLastEmission,
+          decided_by_source: finding.decidedBySource,
+          ms_since_last_emission: finding.msSinceLastEmissionMs,
+          ms_since_first_unemitted_decision:
+            finding.msSinceFirstUnemittedDecisionMs,
+        },
+        "failure",
+      );
+    },
+    onRecovery: (finding: EmissionRecoveryFinding) => {
+      console.error(
+        `${EMISSION_STALL_LOG_PREFIX} audit emission RECOVERED after ${finding.stallDurationMs}ms (decided_during_stall=${finding.decidedDuringStall})`,
+      );
+      recordEmissionLivenessTransition(
+        EMISSION_STALL_RECOVERED_AUDIT_OP,
+        {
+          decided_total: finding.decidedTotal,
+          emitted_total: finding.emittedTotal,
+          rejected_total: finding.rejectedTotal,
+          decided_during_stall: finding.decidedDuringStall,
+          stall_duration_ms: finding.stallDurationMs,
+        },
+        "success",
+      );
+    },
+  });
+
   const consumer = new MacOSFlowEventConsumer({
     manifestProvider: {
       currentSnapshot() {
@@ -643,6 +770,7 @@ export async function startMacOSCastleWallDaemon(
     auditSink: input.auditLog,
     defaultApprovalTimeoutSeconds: 30,
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
+    emissionLiveness: emissionLivenessWatchdog,
   });
 
   const listenerOptions: MacOSCastleWallListenerOptions = {
@@ -891,6 +1019,23 @@ export async function startMacOSCastleWallDaemon(
     }, auditHeartbeatIntervalSeconds * 1000);
     auditHeartbeat.unref();
 
+    // Slice M emission-liveness tick: evaluate the decided-vs-emitted
+    // divergence on a fixed cadence. Pure counter comparison; the loud
+    // outputs live in the watchdog callbacks above. A throwing evaluation
+    // must never take down enforcement, so the tick catches and reports.
+    emissionLivenessTimer = setInterval(() => {
+      try {
+        emissionLivenessWatchdog.evaluate();
+      } catch (err) {
+        console.error(
+          `${EMISSION_STALL_LOG_PREFIX} watchdog evaluation failed (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }, emissionLivenessTickSeconds * 1000);
+    emissionLivenessTimer.unref();
+
     // Confined-agent egress MED-3 (secondary signal): periodic AS-AGENT-UID
     // egress liveness probe over the provisioned-* allow rules in the loaded
     // manifest. Refuse-to-arm protects the ARM moment; this timer bounds
@@ -926,6 +1071,16 @@ export async function startMacOSCastleWallDaemon(
             } catch {
               reachable = false;
             }
+            // Slice M emission-liveness: this probe is a REAL flow an armed
+            // wall must adjudicate (reachable or not, allow or deny), so it
+            // is a decision signal that survives even the 07-17 stall mode
+            // where the sysext stops reporting its own decisions. Counted
+            // only while a sysext subscriber is connected: with no extension
+            // on the channel there is nothing that could emit, and the
+            // silent-death / provider_unbound alarms own that state.
+            if (consumer.getStats().subscribers > 0) {
+              emissionLivenessWatchdog.noteDecision("agent_egress_probe");
+            }
             if (!reachable) {
               await input.auditLog.append(
                 "l1",
@@ -957,6 +1112,7 @@ export async function startMacOSCastleWallDaemon(
     stopLeaseHeartbeat();
     stopAuditHeartbeat();
     stopAgentEgressProbeTimer();
+    stopEmissionLivenessTimer();
     if (activeConfigWritten) {
       await removeActiveConfigIfCurrent(writtenActiveConfigPath, socketPath, input.fortressId);
     }
@@ -1117,6 +1273,7 @@ export async function startMacOSCastleWallDaemon(
         // IPC lease heartbeat, so a stopped daemon stops claiming liveness.
         stopAuditHeartbeat();
         stopAgentEgressProbeTimer();
+        stopEmissionLivenessTimer();
         await listener.broadcastArmLease(buildArmLease({
           armed: false,
           ttlSeconds: null,
