@@ -870,12 +870,17 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
         "",
       ];
     }
-    // G-2: "the counts above" are quarter-windowed (aggregateQuarter skips
-    // out-of-window entries), so the figure that contributes to them is the
-    // WINDOWED daemon count, not the all-time total read. Render the windowed
-    // figure when the generator supplied it AND it is usable; otherwise fall
-    // back to a window-agnostic phrasing that does not claim the total was
+    // G-2: "the counts above" are windowed, so the figure that contributes to
+    // them is the WINDOWED daemon count, not the all-time total read. Render the
+    // windowed figure when the generator supplied it AND it is usable; otherwise
+    // fall back to a window-agnostic phrasing that does not claim the total was
     // merged into the counts above.
+    //
+    // D10-1: that window is now the ATTESTED coverage window, not the calendar
+    // quarter, because the counts it describes are taken over the attested
+    // window. The figure and the counts stay consistent (both come from the one
+    // chokepoint); the WORDING below is what had to follow, since "within the
+    // reporting quarter" would now name a boundary the figure did not apply.
     if (
       d.windowed_entry_count !== undefined &&
       isUsableFigure(d.windowed_entry_count)
@@ -884,9 +889,9 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
         `Daemon enforcement store: included. Of ${d.included_entry_count} ` +
           "daemon-recorded enforcement entries merged into this report's census " +
           "(from the root-owned _audit-daemon store created by the audit-store " +
-          `split), ${d.windowed_entry_count} fall within the reporting quarter ` +
-          "and contribute to the counts above; the remainder are retained daemon " +
-          "history outside the quarter window.",
+          `split), ${d.windowed_entry_count} fall within this report's attested ` +
+          "coverage window and contribute to the counts above; the remainder are " +
+          "retained daemon history outside that window.",
         "",
       ];
     }
@@ -1289,19 +1294,30 @@ function renderVerification(
     "",
     "Each Markdown and export file in this pack is individually SHA-256 hashed " +
       "and Ed25519-signed with the firm's primary identity; the signatures and " +
-      "hashes are recorded in `00_pack_manifest.json`. To verify a file " +
-      "without any Sanctuary software:",
+      "hashes are recorded in `00_pack_manifest.json`. The manifest's `files` " +
+      "list is EXHAUSTIVE for this pack: the generator writes the delivered " +
+      "directory as a complete set, so apart from this report's PDF copy there " +
+      "should be no other Markdown or export file present. Step 3 below lets " +
+      "you confirm that yourself. To verify a file without any Sanctuary " +
+      "software:",
     "",
     "1. Recompute the file's SHA-256 (for example, `sha256sum <file>`) and " +
       "confirm it matches the `sha256` recorded for that file in the manifest.",
     "2. Verify the Ed25519 signature over that SHA-256 digest against the " +
       `signer public key in the manifest (signer: ${signerDid}).`,
-    "3. (Optional) Verify the manifest's own `manifest_signature`. Reproduce the " +
+    "3. Reconcile the DIRECTORY against the manifest: list the files you " +
+      "received and confirm every one is either recorded in the manifest's " +
+      "`files` list or is `00_pack_manifest.json` or `evidence-pack.pdf`. A " +
+      "file present here but absent from the manifest is NOT covered by these " +
+      "signatures and must not be relied on, even if it looks like a valid " +
+      "Sanctuary artifact and verifies on its own: it may be left over from a " +
+      "different reporting period.",
+    "4. (Optional) Verify the manifest's own `manifest_signature`. Reproduce the " +
       "canonical body EXACTLY: take the manifest JSON, DROP the " +
       "`manifest_signature` field, sort ALL object keys recursively in ASCII " +
       "order, serialize with NO whitespace, then Ed25519-verify " +
       "`manifest_signature` over the SHA-256 digest of that canonical string, " +
-      "using the same signer public key. (Steps 1 and 2 are the primary, " +
+      "using the same signer public key. (Steps 1 to 3 are the primary, " +
       "tool-free integrity checks; this manifest self-signature is a " +
       "belt-and-suspenders check and depends on reproducing the canonicalization " +
       "above.)",
@@ -1363,10 +1379,11 @@ function renderVerification(
           "one-line verify command above.",
         "",
       ],
-      readFailed: (reason) => [
-        `Not included: the transparency bundle could not be gathered. ${reason}`,
-        "",
-      ],
+      // D10-3 (dry-bar round 10): the reason ALREADY leads with "the
+      // transparency bundle could not be gathered", so re-prefixing it printed
+      // the clause twice, the second time lowercase after a period. Render the
+      // bare reason, exactly like the two sibling arms below.
+      readFailed: (reason) => [`Not included: ${reason}`, ""],
     }),
     "### Audit-chain export",
     "",

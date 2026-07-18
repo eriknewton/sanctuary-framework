@@ -740,9 +740,13 @@ describe("buildEvidencePack", () => {
     });
     const pack = buildEvidencePack(baseInput(), { audit, signer, masterKey });
     const report = pack.files[0]!.content;
-    // Of 5 merged into the census, only 2 fall in Q3 and contribute to the counts.
+    // Of 5 merged into the census, only 2 fall inside the attested window and
+    // contribute to the counts. D10-1: that window is the ATTESTED coverage span
+    // (the boundary the counts are actually taken over), not the calendar
+    // quarter, so the wording names it as such. The FIGURE is the honesty
+    // assertion here and it is unchanged.
     expect(report).toContain("Of 5 daemon-recorded enforcement entries merged");
-    expect(report).toContain("2 fall within the reporting quarter");
+    expect(report).toContain("2 fall within this report's attested coverage window");
     expect(report).toContain("contribute to the counts above");
   });
 
