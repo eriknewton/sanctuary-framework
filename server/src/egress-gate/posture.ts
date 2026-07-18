@@ -69,9 +69,9 @@
  * arms nothing, probes nothing by itself (all probe results are injected), and
  * advances no capability claim: the exclusive-egress fine-grained claim stays
  * drill-pending (code; Erik-present drill owed). The `coarse-only` state this
- * module renders is not yet producible by any shipped code path - S5-4 lands
- * the compose-time fallback as an uncalled library and S5-6 wires it - which
- * is exactly the design's ordering constraint: render-first, produce-second.
+ * module renders is producible by the S5-6 degrade-loud path (the S5-4
+ * compose-time fallback, wired through `arming-wiring.ts`); the design's
+ * ordering constraint held: render-first (S5-P merged), produce-second (S5-6).
  */
 
 import type { PfLivenessResult } from "./pf-anchor.js";

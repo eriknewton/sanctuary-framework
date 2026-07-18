@@ -701,7 +701,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * old 501 oracle.
    */
   private supervisorBridge: SupervisorBridge | null = null;
-  /** S5-P exclusive-egress posture provider (null until S5-6 wires the producer). */
+  /** S5-P exclusive-egress posture provider (S5-6's arming-wiring producer; null while detached). */
   private _exclusiveEgressPostureProvider:
     | (() => Promise<ExclusiveEgressStatus | null> | ExclusiveEgressStatus | null)
     | null = null;

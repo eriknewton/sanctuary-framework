@@ -48,9 +48,11 @@
  *
  * HONESTY BOUND. This is the credential PRIMITIVE only. It does not itself
  * authorize a CONNECT (that is `gate-client-auth.ts`, which combines this with
- * the peer lens fail-closed), does not provision the gate uid (`gate-account.ts`),
- * and no caller writes a real credential until the release barrier lands (S5-5)
- * and the install flow wires it (S5-6). It advances no capability claim.
+ * the peer lens fail-closed) and does not provision the gate uid
+ * (`gate-account.ts`). It is WIRED (S5-6): the install flow
+ * (`arming-wiring.ts`) mints the generation-bound credential strictly before
+ * unpark and revokes it on the coarse restore. It advances no capability
+ * claim: the Erik-present S5-DRILL is still owed.
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
