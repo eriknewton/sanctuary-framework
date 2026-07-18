@@ -878,6 +878,35 @@ describe("buildEvidencePack", () => {
     expect(pack.files[0]!.content).toContain("PARTIAL QUARTER");
   });
 
+  it("D9C-1: the SIGNED coverage window stops at the audit census, not the later generation instant", () => {
+    // TOCTOU repro at the pack level: the audit census was taken at 11:00, but
+    // the pack stamps its generation time at 12:00 (after inventory/discrete
+    // gathering). Operations appended in the 11:00-12:00 gap are NOT in the
+    // census. The signed covered_to_exclusive must be the census cut (11:00),
+    // never the generation instant (12:00) it would otherwise over-claim.
+    const census = "2026-08-15T11:00:00.000Z";
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+      retention: { ...FULL_COVERAGE },
+      census_taken_at: census,
+    });
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-15T12:00:00.000Z",
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      { audit, signer, masterKey }
+    );
+    expect(coverage(pack).covered_to_exclusive).toBe(census);
+    expect(coverage(pack).covered_to_exclusive).not.toBe("2026-08-15T12:00:00.000Z");
+    expect(coverage(pack).in_progress_quarter).toBe(true);
+  });
+
   it("a POPULATED inventory still prints the coverage-basis + never-complete language", () => {
     const pack = buildEvidencePack(
       {
@@ -1510,5 +1539,301 @@ describe("D5-3: a caller that OMITS discrete_exports never mints definitive §10
     expect(report).toContain("emitted no signed transparency checkpoints yet");
     expect(report).toContain("the audit-chain export was empty for this fortress");
     expect(report).toContain("no public-anchor (Sigstore/Rekor) evidence is available");
+  });
+
+  // ─── Dry-9 fix-round: manifest/prose coverage honesty ───
+
+  // P1 [HIGH]: a zero-covered quarter previously signed a DEFINITIVE non-empty
+  // span into the manifest (covered_from = quarter start, covered_to = census
+  // cut, determinable:true) while the prose said "NONE of this quarter is
+  // covered". The SIGNED manifest and the prose must agree: an empty span + an
+  // explicit zero_of_quarter_covered marker, never a definitive non-empty span.
+  it("P1: the SIGNED manifest of a zero-covered quarter carries an EMPTY span + zero marker, matching the prose", () => {
+    const census = "2026-08-01T00:00:00.000Z";
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-09-15T00:00:00.000Z", "gate_allow:x")],
+      retention: { ...FULL_COVERAGE, earliest_retained_at: "2026-09-15T00:00:00.000Z" },
+      census_taken_at: census,
+    });
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-01T00:00:00.000Z",
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      { audit, signer, masterKey }
+    );
+    const c = coverage(pack);
+    // SIGNED manifest: empty span, explicit zero marker, shortfall true.
+    expect(c.covered_from).toBe(c.covered_to_exclusive);
+    expect((c as { zero_of_quarter_covered?: boolean }).zero_of_quarter_covered).toBe(true);
+    expect(c.shortfall).toBe(true);
+    // The manifest is what gets signed: verify the signature still holds.
+    const signerPub = fromBase64url(pack.manifest.signer.public_key_base64url);
+    const { manifest_signature, ...bodyM } = pack.manifest;
+    const manifestDigest = hash(stringToBytes(canonicalJSON(bodyM)));
+    expect(verify(manifestDigest, fromBase64url(manifest_signature), signerPub)).toBe(true);
+    // Prose: the cover span must NOT read as a definitive non-empty coverage
+    // window while the banner says NONE covered.
+    const report = pack.files[0]!.content;
+    expect(report).toContain("NONE of this quarter is covered");
+    expect(report).not.toContain(`2026-07-01T00:00:00.000Z to ${census} (exclusive)`);
+  });
+
+  // P2: the pure/signed path signs `included_entry_count` (daemon store) into
+  // the report prose without the non-negative safe-integer guard, so a negative
+  // count signed "-7 daemon-recorded enforcement entries ... are included."
+  it("P2: a negative daemon included_entry_count never signs an impossible count into the report", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "included", included_entry_count: -7 },
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("-7 daemon-recorded");
+    expect(report).not.toMatch(/-7[^)]*enforcement entries/);
+    // Renders honest not-determinable language instead.
+    expect(report).toMatch(/not determinable|could not be determined|not[- ]gathered/i);
+  });
+
+  // D8-2 [MED]: an unparseable earliest_retained_at must never serialize a
+  // definitive shortfall:false / full-coverage span into the SIGNED manifest.
+  it("D8-2: an unparseable earliest_retained_at never signs shortfall:false into the manifest", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "garbage-not-a-date",
+        ever_pruned: true,
+      })
+    );
+    const c = coverage(pack);
+    expect(c.shortfall).toBe(true);
+    expect(c.covered_from).toBe(c.covered_to_exclusive);
+  });
+
+  // D8-4 [LOW]: an unrecognized daemon_store.status must be disclosed as
+  // not-gathered / not-determinable, never silently a complete definitive census
+  // with the never-pruned/below-caps reassurance.
+  it("D8-4: an unrecognized daemon_store.status is disclosed, never a silent complete census", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps(
+        [entry("2026-08-15T00:00:00.000Z", "gate_allow:x")],
+        {
+          max_entries: 100_000,
+          retained_total: 42,
+          max_total_size_bytes: 100 * 1024 * 1024,
+          retained_total_size_bytes: 10,
+          ever_pruned: false,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          // Untyped/JSON caller smuggles an unrecognized status past the union.
+          daemon_store: {
+            status: "quarantined" as unknown as "included",
+            included_entry_count: 0,
+          },
+        }
+      )
+    );
+    const report = pack.files[0]!.content;
+    // Must NOT present the operator counts as a complete enforcement census.
+    expect(report).toMatch(/not a complete enforcement census|unrecognized|not[- ]determinable/i);
+    // Must NOT assert the flattering unqualified whole-fortress reassurance.
+    expect(report).not.toContain("the fortress had no recorded activity");
+  });
+
+  // P3: when the census cut clamps the window, the CLI/scope copy must name the
+  // census cut, not falsely claim the bound is "the generation time".
+  it("P3: the scope-and-limits covered-window copy names the audit-census cut, not only generation time", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const report = pack.files[0]!.content;
+    // The static covered-window scope bullet must acknowledge the census-cut
+    // bound so it is not stale when D9C-1 clamps to the census cut.
+    const scope = report.split("\n---\n").find((p) => p.includes("Covered window (both ends)"));
+    expect(scope).toBeTruthy();
+    expect(scope!).toMatch(/census/i);
+  });
+});
+
+// ─── Dry-9 fix-round-2: the SIGNED MANIFEST serialization chokepoint. The prior
+// round closed each defect in the PROSE, but the manifest-serialization paths
+// did not all route through the same honesty-guarded values, so the SIGNED
+// manifest (the machine-verified artifact) still asserted definitive/raw values
+// for the corrupt/unknown variants. These tests assert on the SIGNED MANIFEST
+// bytes: a dishonest manifest must be structurally unrepresentable. ───
+describe("Dry-9 fix-round-2: signed-manifest serialization chokepoint", () => {
+  /** The signed manifest body bytes, as a third-party verifier would canonicalize them. */
+  function signedManifestBytes(pack: EvidencePack): string {
+    const { manifest_signature: _sig, ...body } = pack.manifest;
+    return canonicalJSON(body);
+  }
+
+  function verifyManifest(pack: EvidencePack): boolean {
+    const signerPub = fromBase64url(pack.manifest.signer.public_key_base64url);
+    const { manifest_signature, ...body } = pack.manifest;
+    const digest = hash(stringToBytes(canonicalJSON(body)));
+    return verify(digest, fromBase64url(manifest_signature), signerPub);
+  }
+
+  // P1 [HIGH]: a present-but-UNPARSEABLE census cut previously fell back to the
+  // generation instant, so the SIGNED manifest widened coverage to
+  // generated_at (determinable:true, covered_from:quarter-start,
+  // covered_to:generated_at). A corrupt census cut cannot prove coverage
+  // through generation time; the manifest must fail closed to NOT-DETERMINABLE.
+  it("P1: an unparseable census_taken_at fails the SIGNED manifest closed to determinable:false, never widened to generated_at", () => {
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+      retention: { ...FULL_COVERAGE },
+      census_taken_at: "not-a-census-timestamp",
+    });
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-15T00:00:00.000Z",
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      { audit, signer, masterKey }
+    );
+    // SIGNED manifest: coverage is NOT determinable, never a widened span.
+    expect(pack.manifest.coverage.determinable).toBe(false);
+    const bytes = signedManifestBytes(pack);
+    // The generation instant must NOT appear as a signed covered_to_exclusive.
+    expect(bytes).not.toContain('"covered_to_exclusive":"2026-08-15T00:00:00.000Z"');
+    expect(bytes).not.toContain('"covered_from":"2026-07-01T00:00:00.000Z"');
+    // The signature still holds over the honest body.
+    expect(verifyManifest(pack)).toBe(true);
+    // Prose is consistent: the cover span is not a definitive window.
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain(
+      "2026-07-01T00:00:00.000Z to 2026-08-15T00:00:00.000Z (exclusive)"
+    );
+    expect(report).toMatch(/could not be parsed|not[- ]?determinable/i);
+  });
+
+  // P2 [HIGH]: an unrecognized daemon_store.status (an untyped/JSON caller)
+  // previously serialized the RAW value into the enum-shaped SIGNED manifest
+  // field. It must normalize to a recognized enum sentinel ("unrecognized"),
+  // never the raw string.
+  it("P2: an unrecognized daemon_store.status never signs the raw value; it normalizes to the 'unrecognized' sentinel", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-15T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "quarantined" as unknown as "included",
+          included_entry_count: 0,
+        },
+      })
+    );
+    const c = coverage(pack);
+    // The SIGNED enum-shaped field is a recognized value, never the raw string.
+    expect(c.daemon_store.status).toBe("unrecognized");
+    const bytes = signedManifestBytes(pack);
+    expect(bytes).not.toContain("quarantined");
+    expect(bytes).toContain('"status":"unrecognized"');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // P3 [MED]: an unparseable earliest_retained_at produces an EMPTY span but
+  // previously OMITTED the zero_of_quarter_covered marker the manifest contract
+  // promises for an empty span. The marker must be present whenever the signed
+  // span is empty.
+  it("P3: an unparseable earliest_retained_at signs the zero_of_quarter_covered marker on its EMPTY span", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "garbage-not-a-date",
+        ever_pruned: true,
+      })
+    );
+    const c = coverage(pack);
+    // Empty span AND the explicit zero marker travel together in the SIGNED bytes.
+    expect(c.covered_from).toBe(c.covered_to_exclusive);
+    expect((c as { zero_of_quarter_covered?: boolean }).zero_of_quarter_covered).toBe(true);
+    expect(signedManifestBytes(pack)).toContain('"zero_of_quarter_covered":true');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // P4 [HIGH, Dry-9 fix-round-3]: a SIBLING enum-shaped daemon field. The
+  // chokepoint normalized `daemon_store.status` but copied
+  // `daemon_store.unreadable_reason` RAW, so an untyped / JSON caller's smuggled
+  // value signed straight into the enum-shaped SIGNED field (which only allows
+  // "privilege" | "io"). The complete daemon-disclosure normalization must
+  // validate EVERY enum-shaped field, so no raw reason ever reaches the manifest.
+  it("P4: an unrecognized daemon_store.unreadable_reason never signs the raw value into the enum-shaped SIGNED field", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-15T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          // Untyped/JSON caller smuggles a reason the manifest enum forbids.
+          unreadable_reason: "bogus-reason" as unknown as "io",
+        },
+      })
+    );
+    const c = coverage(pack);
+    // Status is preserved (a recognized value); the RAW reason is NOT carried.
+    expect(c.daemon_store.status).toBe("present_unreadable");
+    expect(c.daemon_store.unreadable_reason).toBeUndefined();
+    const bytes = signedManifestBytes(pack);
+    // The confirmed dishonest bytes must be structurally absent from the signature.
+    expect(bytes).not.toContain("bogus-reason");
+    expect(bytes).not.toContain('"unreadable_reason":"bogus-reason"');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // A RECOGNIZED unreadable_reason still flows through unchanged (no regression
+  // to the honest present_unreadable/io case the manifest already carried).
+  it("P4 (honest case): a recognized unreadable_reason ('io') is preserved in the SIGNED manifest", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-15T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          unreadable_reason: "io",
+        },
+      })
+    );
+    const c = coverage(pack);
+    expect(c.daemon_store.status).toBe("present_unreadable");
+    expect(c.daemon_store.unreadable_reason).toBe("io");
+    expect(signedManifestBytes(pack)).toContain('"unreadable_reason":"io"');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // Regression guard: a normal, fully-covered quarter's manifest shape is
+  // unchanged by the chokepoint (no zero marker, no unrecognized status, a real
+  // determinable span).
+  it("regression: an honest fully-covered quarter keeps its unchanged determinable manifest shape", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const c = coverage(pack);
+    expect(c.daemon_store.status).toBe("absent");
+    expect("zero_of_quarter_covered" in c).toBe(false);
+    expect(c.covered_from).not.toBe(c.covered_to_exclusive);
+    expect(verifyManifest(pack)).toBe(true);
   });
 });

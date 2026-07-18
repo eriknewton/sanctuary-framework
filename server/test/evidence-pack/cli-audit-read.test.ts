@@ -17,6 +17,7 @@ import { AuditIntegrityError } from "../../src/operational/audit-log.js";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
 import {
   classifyDaemonIntegrityError,
+  coverageSummaryLine,
   daemonStoreCliWarning,
   daemonUnreadableReason,
   deriveAuditReadOutcome,
@@ -25,6 +26,8 @@ import {
 } from "../../src/evidence-pack/cli.js";
 import { detectShortfall } from "../../src/evidence-pack/aggregate.js";
 import { quarterWindow } from "../../src/evidence-pack/quarter.js";
+import { populated, readFailed } from "../../src/evidence-pack/read-outcome.js";
+import type { RetentionFacts } from "../../src/evidence-pack/types.js";
 
 function entry(timestamp: string): AuditEntry {
   return {
@@ -741,5 +744,61 @@ describe("D8-1 Leg A: readRetentionUsage + usage-unavailable derivation", () => 
       usage,
     });
     expect(outcome.status).toBe("populated");
+  });
+});
+
+// ─── Dry-9 fix-round-3 (P5, MED): the CLI console summary must not diverge from
+// the honest signed verdict. For an unparseable audit-census cut the shortfall
+// is populated with a ZERO-WIDTH span (covered_from === covered_to_exclusive ===
+// window.start) and coverage_determinable === false: the manifest + PDF say
+// "could not be determined," but the operator console previously printed a
+// definitive-looking zero-width span. All surfaces must agree. ───
+describe("coverageSummaryLine (operator console) mirrors the signed verdict", () => {
+  const window = quarterWindow({ year: 2026, quarter: 3 });
+
+  const RETENTION_FACTS: RetentionFacts = {
+    max_entries: 100_000,
+    retained_total: 3,
+    max_total_size_bytes: 100 * 1024 * 1024,
+    retained_total_size_bytes: 0,
+    ever_pruned: false,
+    earliest_retained_at: "2026-06-01T00:00:00.000Z",
+    daemon_store: { status: "absent", included_entry_count: 0 },
+  };
+
+  it("P5: a NON-determinable window (unparseable census cut) prints 'could not be determined', never a zero-width span", () => {
+    const sf = detectShortfall(window, RETENTION_FACTS, {
+      generatedAt: "2026-08-15T00:00:00.000Z",
+      lastEntryAt: "2026-08-01T00:00:00.000Z",
+      censusTakenAt: "not-a-census-timestamp",
+    });
+    // Precondition: this is exactly the trap -- a populated report whose span is
+    // a zero-width point AND whose window is not determinable.
+    expect(sf.coverage_determinable).toBe(false);
+    expect(sf.covered_from).toBe(sf.covered_to_exclusive);
+
+    const line = coverageSummaryLine(populated(sf));
+    // The console must NOT print the definitive-looking span.
+    expect(line).not.toContain("(exclusive)");
+    expect(line).not.toContain(sf.covered_from);
+    expect(line).toMatch(/could not be determined/i);
+    expect(line).toMatch(/census/i);
+  });
+
+  it("a determinable window prints the definitive span, unchanged", () => {
+    const sf = detectShortfall(window, RETENTION_FACTS, {
+      generatedAt: "2026-10-02T00:00:00.000Z",
+      lastEntryAt: "2026-08-01T00:00:00.000Z",
+    });
+    expect(sf.coverage_determinable).toBe(true);
+    const line = coverageSummaryLine(populated(sf));
+    expect(line).toContain("(exclusive)");
+    expect(line).toContain(sf.covered_from);
+  });
+
+  it("a read_failed shortfall prints the audit-unreadable message", () => {
+    expect(coverageSummaryLine(readFailed("boom"))).toMatch(
+      /could not be determined \(audit log unreadable\)/i
+    );
   });
 });
