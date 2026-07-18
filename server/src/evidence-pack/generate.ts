@@ -37,8 +37,11 @@ import {
   isRecognizedDaemonStatus,
   isRecognizedDaemonUnreadableReason,
 } from "./types.js";
-import { isInWindow, quarterWindow } from "./quarter.js";
-import { aggregateQuarter, detectShortfall } from "./aggregate.js";
+import { quarterWindow } from "./quarter.js";
+import {
+  censusOverAttestedWindow,
+  type AttestedQuarterCensus,
+} from "./aggregate.js";
 import { renderSections } from "./sections.js";
 import { buildPackManifest, makePackSigner, signFile } from "./signer.js";
 
@@ -57,6 +60,29 @@ export const TRANSPARENCY_BUNDLE_FILENAME = "transparency-bundle.json";
 export const AUDIT_CHAIN_FILENAME = "audit-chain.jsonl";
 /** Basename of the gathered public-anchor evidence (slice 2). */
 export const ANCHOR_EVIDENCE_FILENAME = "anchor-evidence.json";
+
+/**
+ * D10-2 (dry-bar round 10): EVERY filename this generator can emit. Three of
+ * them are CONDITIONAL (a discrete export is written only when its read was
+ * `populated`), which is what made a reused output directory dangerous: a run
+ * that emitted `transparency-bundle.json` left it behind byte-identical when a
+ * later run into the same directory could not gather it, so the shipped
+ * directory carried a stale export under the exact canonical filename the
+ * verification section tells auditors to look for, while the new signed report
+ * said that export was not included.
+ *
+ * The output-directory chokepoint in `cli.ts` uses this list to tell a file THIS
+ * TOOL may have written (safe to sweep) from a file it never writes (refuse,
+ * rather than delete an operator's data).
+ */
+export const PACK_FILENAMES: readonly string[] = [
+  MANIFEST_FILENAME,
+  REPORT_FILENAME,
+  PDF_FILENAME,
+  TRANSPARENCY_BUNDLE_FILENAME,
+  AUDIT_CHAIN_FILENAME,
+  ANCHOR_EVIDENCE_FILENAME,
+];
 
 /** The result of reading the audit log for the pack (one read: entries + retention). */
 export interface AuditReadData {
@@ -263,52 +289,46 @@ export function buildEvidencePack(
   const window = quarterWindow(input.quarter);
   const generatedAt = input.generated_at_override ?? new Date().toISOString();
 
-  // Derive the aggregation + shortfall from the audit read. Both are
-  // read_failed exactly when the audit read is - a failed read can never
-  // produce a zero-count aggregation or a "full quarter covered" bound.
-  const aggregation = foldOutcome<AuditReadData, ReadOutcome<QuarterAggregation>>(
+  // D10-1: the decision counts and the coverage statement about them come from
+  // ONE call, so they can never be derived from different boundaries (see the
+  // attested-window chokepoint in `aggregate.ts`). This function deliberately
+  // does NOT pair `aggregateQuarter` with `detectShortfall` itself: that pairing
+  // is what let the counts read the calendar quarter while the coverage prose
+  // and the SIGNED manifest read the narrower attested span, producing a signed
+  // report that contradicted itself on its own face. Both remain `read_failed`
+  // exactly when the audit read is.
+  const census = foldOutcome<AuditReadData, ReadOutcome<AttestedQuarterCensus>>(
     deps.audit,
     {
-      populated: (data) => populated(aggregateQuarter(data.entries, window)),
+      populated: (data) =>
+        populated(
+          censusOverAttestedWindow(data.entries, data.retention, window, {
+            generatedAt,
+            // D9C-1: bound the attested window at the census cut so it never
+            // post-dates the operations actually counted.
+            censusTakenAt: data.census_taken_at,
+            daemonEntries: data.daemon_entries,
+          })
+        ),
       emptyVerified: () =>
         readFailed("the audit log read returned no verifiable result."),
       readFailed: (reason) => readFailed(reason),
     }
   );
-  const shortfall = foldOutcome<AuditReadData, ReadOutcome<ShortfallReport>>(
-    deps.audit,
+  const aggregation = foldOutcome<
+    AttestedQuarterCensus,
+    ReadOutcome<QuarterAggregation>
+  >(census, {
+    // Already a ReadOutcome, narrowed to the attested window by the chokepoint.
+    populated: (c) => c.aggregation,
+    emptyVerified: () =>
+      readFailed("the audit log read returned no verifiable result."),
+    readFailed: (reason) => readFailed(reason),
+  });
+  const shortfall = foldOutcome<AttestedQuarterCensus, ReadOutcome<ShortfallReport>>(
+    census,
     {
-      populated: (data) => {
-        const lastEntryAt =
-          aggregation.status === "populated"
-            ? aggregation.value.last_entry_at
-            : null;
-        const report = detectShortfall(window, data.retention, {
-          generatedAt,
-          lastEntryAt,
-          // D9C-1: bound the attested window at the census cut so it never
-          // post-dates the operations actually counted.
-          censusTakenAt: data.census_taken_at,
-        });
-        // G-2: the §7 daemon note renders "N merged into the counts above". The
-        // counts above are quarter-windowed, so N must be the daemon entries
-        // that fall INSIDE the window, not the all-time total the read layer
-        // recorded. Compute it here, where the window is known.
-        if (
-          report.daemon_store?.status === "included" &&
-          data.daemon_entries !== undefined
-        ) {
-          const windowed = data.daemon_entries.reduce(
-            (n, e) => (isInWindow(e.timestamp, window) ? n + 1 : n),
-            0
-          );
-          report.daemon_store = {
-            ...report.daemon_store,
-            windowed_entry_count: windowed,
-          };
-        }
-        return populated(report);
-      },
+      populated: (c) => populated(c.coverage),
       emptyVerified: () =>
         readFailed("the audit log read returned no verifiable result."),
       readFailed: (reason) => readFailed(reason),

@@ -15,7 +15,7 @@
  * NOT LEGAL ADVICE. The generated pack is a technical artifact.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { createSanctuaryServer } from "../index.js";
@@ -53,6 +53,7 @@ import { exportAuditChain, totalRecordsSkipped } from "../cli/audit-chain-export
 import type {
   CustodyFacts,
   DaemonStoreDisclosure,
+  EvidencePack,
   EvidencePackDiscreteExports,
   EvidencePackInput,
   InventorySnapshot,
@@ -66,6 +67,7 @@ import {
   type ProxyServerView,
 } from "./inventory.js";
 import {
+  describeReadFailureCause,
   emptyVerified,
   populated,
   readFailed,
@@ -74,12 +76,153 @@ import {
 import {
   buildEvidencePack,
   MANIFEST_FILENAME,
+  PACK_FILENAMES,
   PDF_FILENAME,
   PRODUCT_NAME,
   REPORT_FILENAME,
   type AuditReadData,
 } from "./generate.js";
 import { currentQuarter, parseQuarterLabel, quarterLabel } from "./quarter.js";
+
+/**
+ * D10-DISC-1 (dry-bar round 10): the ONE place a caught read error becomes a
+ * reason string for the pack. It splits the two audiences that were previously
+ * conflated by interpolating a raw `Error.message` into the artifact:
+ *
+ *  - THE LAW FIRM gets `lead` plus a COARSE category from the closed set in
+ *    `describeReadFailureCause`. The error's free-text message is never read,
+ *    so an absolute fortress path, username, hostname, or raw syscall string
+ *    cannot reach the signed report or the SIGNED manifest `coverage.reason`.
+ *  - THE OPERATOR gets the full raw diagnostic on the local console, which is
+ *    not part of the pack and never leaves the machine.
+ *
+ * Round 10 rendered a full absolute fortress path into the signed, firm-facing
+ * report through the raw-interpolation shape this replaces. Every read-failure
+ * site in this CLI routes through here; `readFailed` additionally scrubs the
+ * result, so a future site that forgets this helper still cannot emit a path.
+ */
+function readFailureReason(lead: string, cause: unknown): string {
+  const raw =
+    cause instanceof Error ? cause.message : String(cause);
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet. This is deliberately the ONLY place the raw diagnostic appears, and stderr is not part of the delivered pack.
+  console.error(
+    `[sanctuary evidence-pack] ${lead}. Local diagnostic (operator console ` +
+      `only, deliberately NOT included in the pack): ${raw}`
+  );
+  return `${lead}: ${describeReadFailureCause(cause)}`;
+}
+
+// ── D10-2: THE OUTPUT-DIRECTORY CHOKEPOINT ──────────────────────────
+//
+// The pack that reaches the law firm is the DIRECTORY (the operator zips or
+// attaches it), not the manifest alone. Round 10 showed the directory drifting
+// out of agreement with the manifest that describes it: run A emitted
+// `transparency-bundle.json`; a routine Castle Wall signing-key rotation flipped
+// that arm to `read_failed`; run B into the SAME directory wrote a manifest
+// listing only its own files and a report saying the bundle was "Not included",
+// and run A's bundle survived byte-identical under the canonical filename the
+// verification section tells auditors to look for.
+//
+// That is worse than untidy for two reasons. The stale bundle is GENUINE and
+// internally valid, so an auditor who follows the report's own instruction to
+// verify it offline gets a CLEAN result and concludes the enforcement history
+// was independently corroborated, in the exact quarter the report says it was
+// not. And section 1 of the SIGNED report asserts a universally-quantified
+// claim: that each Markdown and export file in the pack is recorded in
+// `00_pack_manifest.json`. A stale export falsifies a claim the firm's signature
+// stands behind.
+//
+// So the directory is made a GENERATED SET rather than an accumulating one:
+// after this function returns, the directory contains EXACTLY the files this run
+// emitted. The universal claim in section 1 is then true by construction rather
+// than by hope, which is why the fix lives here and not in the wording.
+//
+// Files this tool never writes are REFUSED, not deleted: sweeping an operator's
+// own file out of their directory would be a data-loss bug, and a foreign file
+// in the shipped directory is exactly what would falsify section 1. Dotfiles
+// (`.DS_Store` and friends) are ignored throughout: they are neither Markdown
+// nor export files, so they cannot falsify the claim, and refusing on them would
+// make the tool unusable on a machine whose file browser has opened the folder.
+
+/** True for a directory entry the pack's claims range over (dotfiles excluded). */
+function isPackRelevantEntry(name: string): boolean {
+  return !name.startsWith(".");
+}
+
+/**
+ * Write the pack so the output directory ends up containing EXACTLY this run's
+ * files (see the block comment above). Refuses rather than deleting anything
+ * this tool does not itself emit, and reconciles the directory against the
+ * manifest afterwards so a drift can never ship silently.
+ */
+export async function writePackDirectory(
+  outputDir: string,
+  pack: EvidencePack
+): Promise<void> {
+  // The complete set this run is entitled to leave behind: the signed manifest,
+  // the unsigned human-readable PDF, and every file the manifest lists.
+  const expected = new Set<string>([
+    MANIFEST_FILENAME,
+    PDF_FILENAME,
+    ...pack.files.map((f) => f.filename),
+  ]);
+
+  await mkdir(outputDir, { recursive: true });
+  const before = (await readdir(outputDir)).filter(isPackRelevantEntry);
+
+  const foreign = before.filter((name) => !PACK_FILENAMES.includes(name));
+  if (foreign.length > 0) {
+    throw new Error(
+      `The output directory already contains ${foreign.length} file(s) this ` +
+        `command did not write: ${foreign.sort().join(", ")}. The evidence pack ` +
+        "is delivered as a whole directory, and its signed report states that " +
+        "every Markdown and export file in the pack is recorded in " +
+        `${MANIFEST_FILENAME}, so an unrecorded file would make that signed ` +
+        "statement false. Point --output at an empty directory, or remove the " +
+        "listed file(s), and run again. Nothing was written."
+    );
+  }
+
+  // Sweep this tool's own artifacts from earlier runs that THIS run does not
+  // emit. Without this, a conditional export that a previous run gathered and
+  // this one could not survives as stale evidence beside a manifest that omits
+  // it. Files that ARE in `expected` need no removal; the writes below replace
+  // them.
+  for (const name of before) {
+    if (!expected.has(name)) {
+      await rm(join(outputDir, name), { force: true });
+    }
+  }
+
+  await writeFile(
+    join(outputDir, MANIFEST_FILENAME),
+    JSON.stringify(pack.manifest, null, 2),
+    "utf-8"
+  );
+  for (const file of pack.files) {
+    await writeFile(join(outputDir, file.filename), file.content, "utf-8");
+  }
+  await writeFile(join(outputDir, PDF_FILENAME), pack.pdf);
+
+  // Reconcile: prove the shipped directory IS the pack. This is the step the
+  // report's section-1 verification recipe now tells the auditor to repeat, so
+  // the generator must not ship a directory that would fail it.
+  const after = (await readdir(outputDir)).filter(isPackRelevantEntry);
+  const unexpected = after.filter((name) => !expected.has(name));
+  const missing = [...expected].filter((name) => !after.includes(name));
+  if (unexpected.length > 0 || missing.length > 0) {
+    throw new Error(
+      "The output directory does not match the signed manifest after writing " +
+        (unexpected.length > 0
+          ? `(unexpected: ${unexpected.sort().join(", ")}) `
+          : "") +
+        (missing.length > 0 ? `(missing: ${missing.sort().join(", ")}) ` : "") +
+        "so this pack must not be delivered. Something else wrote to the " +
+        "directory during generation. Use a private empty --output directory " +
+        "and run again."
+    );
+  }
+}
 
 /**
  * Enumerate the AI-tool inventory from the fortress's persisted state,
@@ -105,7 +248,7 @@ async function gatherInventory(
       return {
         ok: false,
         records: [],
-        reason: `the hub agent registry could not be read: ${(e as Error).message}`,
+        reason: readFailureReason("the hub agent registry could not be read", e),
       };
     }
   })();
@@ -126,7 +269,7 @@ async function gatherInventory(
       return {
         ok: false,
         records: [],
-        reason: `the sovereignty profile could not be read: ${(e as Error).message}`,
+        reason: readFailureReason("the sovereignty profile could not be read", e),
       };
     }
   })();
@@ -165,7 +308,7 @@ async function gatherInventory(
         return {
           ok: false,
           records: [],
-          reason: `the observe store could not be read: ${(e as Error).message}`,
+          reason: readFailureReason("the observe store could not be read", e),
         };
       }
     })();
@@ -232,7 +375,9 @@ export async function gatherDiscreteExports(
       };
       return populated(JSON.stringify(bundle, null, 2));
     } catch (e) {
-      return readFailed(`the transparency bundle could not be gathered: ${(e as Error).message}`);
+      return readFailed(
+        readFailureReason("the transparency bundle could not be gathered", e)
+      );
     }
   })();
 
@@ -300,7 +445,9 @@ export async function gatherDiscreteExports(
       }
       return jsonl.length > 0 ? populated(jsonl) : emptyVerified();
     } catch (e) {
-      return readFailed(`the audit-chain export could not be gathered: ${(e as Error).message}`);
+      return readFailed(
+        readFailureReason("the audit-chain export could not be gathered", e)
+      );
     }
   })();
 
@@ -352,7 +499,9 @@ export async function gatherDiscreteExports(
         ? populated(JSON.stringify(anchorsDoc, null, 2))
         : emptyVerified();
     } catch (e) {
-      return readFailed(`the anchor evidence could not be gathered: ${(e as Error).message}`);
+      return readFailed(
+        readFailureReason("the anchor evidence could not be gathered", e)
+      );
     }
   })();
 
@@ -1082,7 +1231,9 @@ export async function runEvidencePack(args: string[]): Promise<void> {
         censusTakenAt,
       });
     } catch (e) {
-      return readFailed(`the audit log could not be read: ${(e as Error).message}`);
+      return readFailed(
+        readFailureReason("the audit log could not be read", e)
+      );
     }
   })();
 
@@ -1127,16 +1278,7 @@ export async function runEvidencePack(args: string[]): Promise<void> {
 
   const pack = buildEvidencePack(input, { audit, signer, masterKey });
 
-  await mkdir(outputDir, { recursive: true });
-  await writeFile(
-    join(outputDir, MANIFEST_FILENAME),
-    JSON.stringify(pack.manifest, null, 2),
-    "utf-8"
-  );
-  for (const file of pack.files) {
-    await writeFile(join(outputDir, file.filename), file.content, "utf-8");
-  }
-  await writeFile(join(outputDir, PDF_FILENAME), pack.pdf);
+  await writePackDirectory(outputDir, pack);
 
   const summaryLines = [
     "",

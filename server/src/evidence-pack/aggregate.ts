@@ -31,6 +31,32 @@ import {
   isUsableTimestamp,
 } from "./types.js";
 import { isInWindow } from "./quarter.js";
+import {
+  populated,
+  readFailed,
+  sanitizeReason,
+  type ReadOutcome,
+} from "./read-outcome.js";
+
+/**
+ * D10-DISC-1 (neighbouring surface): quote a value that FAILED its usability
+ * check back to the reader. Every caller is on an error path, so by definition
+ * the value is NOT a valid timestamp: it is arbitrary text from a corrupted
+ * store or an untyped caller, and the coverage `explanation` it lands in is
+ * copied verbatim into the SIGNED manifest's `coverage.reason` whenever the
+ * window is not determinable. That is the same free-text-into-a-signed-artifact
+ * vector `readFailed` closes, reached by a different door, so it is scrubbed by
+ * the same sanitizer. It is also LENGTH-CAPPED: a corrupt store could otherwise
+ * push an unbounded blob into a signed field and the firm's PDF.
+ *
+ * Values that PASS the usability check are not routed here: a string only
+ * parses to a finite instant if it is a real date, so it cannot carry a path.
+ */
+function quoteUnusableValue(value: unknown): string {
+  const raw = typeof value === "string" ? value : String(value);
+  const scrubbed = sanitizeReason(raw);
+  return scrubbed.length > 60 ? `${scrubbed.slice(0, 60)}...` : scrubbed;
+}
 
 /**
  * The operation string the approval aggregator writes when a cross-harness
@@ -526,7 +552,7 @@ export function detectShortfall(
       coverage_determinable: false,
       explanation:
         "The audit-census cut timestamp (" +
-        String(params.censusTakenAt) +
+        quoteUnusableValue(params.censusTakenAt) +
         ") was present but could not be parsed, so this report cannot bound the " +
         "upper end of the coverage window: the covered window for this quarter " +
         "is NOT DETERMINABLE. This report makes no coverage claim. Investigate " +
@@ -643,13 +669,13 @@ export function detectShortfall(
     startExplanation = daemonExcluded
       ? "The earliest retained entry in the operator audit log carries a " +
         "timestamp (" +
-        String(retention.earliest_retained_at) +
+        quoteUnusableValue(retention.earliest_retained_at) +
         ") that could not be parsed, so this report cannot demonstrate coverage " +
         "of any part of the quarter from the operator store; start-side coverage " +
         "is NOT DETERMINABLE. Investigate the operator store's earliest entry." +
         daemonPresentButExcludedSuffix(retention)
       : "The earliest retained audit entry carries a timestamp (" +
-        String(retention.earliest_retained_at) +
+        quoteUnusableValue(retention.earliest_retained_at) +
         ") that could not be parsed, so this report cannot demonstrate coverage " +
         "of any part of the quarter; start-side coverage is NOT DETERMINABLE. " +
         "Investigate the audit store's earliest entry.";
@@ -870,4 +896,164 @@ export function detectShortfall(
     // events are included in the counts.
     daemon_store: retention.daemon_store,
   };
+}
+
+// ── D10-1: THE ATTESTED-WINDOW COUNTING CHOKEPOINT ───────────────────
+//
+// Round 10 produced a SIGNED report that simultaneously said the attested
+// coverage window was EMPTY, said "NONE of this quarter is covered", said "The
+// counts above are therefore zero for the attested window", and printed
+// "Total recorded audit operations in the quarter: 1" with a nonzero category
+// table. Both statements were rendered from the same signed file.
+//
+// The root cause was that TWO DIFFERENT WINDOWS were in play. `detectShortfall`
+// settles the window the pack may ATTEST -- [covered_from,
+// covered_to_exclusive), bounded by the census cut and the generation instant.
+// `aggregateQuarter` counted against the CALENDAR QUARTER, which is wider: it
+// includes the future-dated tail after the census cut. Fixing the manifest span
+// (Dry-9) left the count surfaces still reading the wider boundary.
+//
+// The fix is not a guard on the count renderers. It is to delete the second
+// window: counts are ONLY ever taken over the attested window, and there is
+// exactly ONE function that produces the (counts, coverage) pair. A count and
+// the coverage statement about it can no longer disagree, because they are no
+// longer derived from different boundaries.
+//
+// Two consequences fall out for free rather than needing their own fixes:
+//
+//  - A zero-width attested window yields ZERO counts automatically, because
+//    `isInWindow` requires `t >= start && t < end` and no instant satisfies
+//    that when start == end. "The counts above are therefore zero" becomes true
+//    by construction instead of by assertion.
+//  - The "last recorded audit entry inside the covered window is X" sentence
+//    becomes true by construction, because `last_entry_at` is now the maximum
+//    timestamp INSIDE the attested window. Round 10 reproduced that sentence
+//    naming an instant outside the window; it is now unrepresentable.
+//
+// A NOT-DETERMINABLE window (a present-but-unparseable audit-census cut) yields
+// a `read_failed` aggregation, so every count surface renders its honest
+// "could not be computed" arm. Previously the manifest correctly said
+// `determinable: false` while the report still printed definitive counts: the
+// same contradiction, one surface over.
+
+/**
+ * The window over which the pack may render DEFINITIVE decision counts. Either
+ * the attested span (never the calendar quarter) or an explicit
+ * not-determinable with the reason the reader is owed.
+ */
+export type AttestedCountWindow =
+  | { readonly determinable: true; readonly window: QuarterWindow }
+  | { readonly determinable: false; readonly reason: string };
+
+/**
+ * Derive the countable window from a settled coverage report. The calendar
+ * quarter's `quarter` and `label` are preserved (the pack is still "2026-Q3"),
+ * but the BOUNDS become the attested span, so nothing outside what the report
+ * can attest is ever counted.
+ */
+export function attestedCountWindow(
+  quarter: QuarterWindow,
+  coverage: ShortfallReport
+): AttestedCountWindow {
+  if (!coverage.coverage_determinable) {
+    return { determinable: false, reason: coverage.explanation };
+  }
+  return {
+    determinable: true,
+    window: {
+      ...quarter,
+      start_inclusive: coverage.covered_from,
+      end_exclusive: coverage.covered_to_exclusive,
+    },
+  };
+}
+
+/** The (counts, coverage) pair, guaranteed to share one boundary. */
+export interface AttestedQuarterCensus {
+  /**
+   * Counts over the ATTESTED window. `read_failed` when that window was not
+   * determinable, so no count surface can print a definitive figure.
+   */
+  readonly aggregation: ReadOutcome<QuarterAggregation>;
+  /** The coverage report whose span bounded those counts. */
+  readonly coverage: ShortfallReport;
+}
+
+/**
+ * THE SINGLE CONSTRUCTION SITE for the pack's decision counts and its coverage
+ * statement (see the block comment above). `buildEvidencePack` calls ONLY this;
+ * it never pairs `aggregateQuarter` with `detectShortfall` itself, because that
+ * pairing is exactly what allowed the two boundaries to drift apart.
+ *
+ * The two passes over `detectShortfall` are ordering, not duplication:
+ * `lastEntryAt` is consumed ONLY to render one sentence and is read by no
+ * window-bounding branch, so pass 1 settles the identical span that pass 2
+ * returns. That equality is not assumed: it is asserted below and fails CLOSED,
+ * matching how the pack already behaves when signing cannot be completed (it
+ * emits nothing rather than something dishonest).
+ */
+export function censusOverAttestedWindow(
+  entries: readonly AuditEntry[],
+  retention: RetentionFacts,
+  quarter: QuarterWindow,
+  params: {
+    generatedAt: string;
+    censusTakenAt?: string;
+    /**
+     * G-2: the merged daemon entries, counted over the SAME attested window as
+     * everything else so the "N merged into the counts above" note cannot cite
+     * a figure taken from a different boundary than the counts it describes.
+     */
+    daemonEntries?: readonly AuditEntry[];
+  }
+): AttestedQuarterCensus {
+  // PASS 1: settle the attested span. `lastEntryAt: null` cannot change it.
+  const bounds = detectShortfall(quarter, retention, {
+    generatedAt: params.generatedAt,
+    lastEntryAt: null,
+    censusTakenAt: params.censusTakenAt,
+  });
+  const attested = attestedCountWindow(quarter, bounds);
+  if (!attested.determinable) {
+    // No countable window: assert no counts at all.
+    return { aggregation: readFailed(attested.reason), coverage: bounds };
+  }
+
+  const aggregation = aggregateQuarter(entries, attested.window);
+
+  // PASS 2: the same span, now carrying the windowed tail for the prose.
+  const coverage = detectShortfall(quarter, retention, {
+    generatedAt: params.generatedAt,
+    lastEntryAt: aggregation.last_entry_at,
+    censusTakenAt: params.censusTakenAt,
+  });
+  if (
+    coverage.covered_from !== bounds.covered_from ||
+    coverage.covered_to_exclusive !== bounds.covered_to_exclusive ||
+    coverage.coverage_determinable !== bounds.coverage_determinable
+  ) {
+    throw new Error(
+      "Evidence pack internal invariant violated: the attested coverage window " +
+        "that bounded the decision counts is not the window rendered alongside " +
+        "them. No pack was written. This is a defect in the pack generator, not " +
+        "a problem with this fortress; report it with the quarter label."
+    );
+  }
+
+  // G-2: count the daemon contribution over the attested window too.
+  if (
+    coverage.daemon_store?.status === "included" &&
+    params.daemonEntries !== undefined
+  ) {
+    const windowed = params.daemonEntries.reduce(
+      (n, e) => (isInWindow(e.timestamp, attested.window) ? n + 1 : n),
+      0
+    );
+    coverage.daemon_store = {
+      ...coverage.daemon_store,
+      windowed_entry_count: windowed,
+    };
+  }
+
+  return { aggregation: populated(aggregation), coverage };
 }

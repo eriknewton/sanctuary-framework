@@ -35,10 +35,29 @@ export interface EmptyVerified {
   readonly status: "empty_verified";
 }
 
+/**
+ * D10-DISC-1 (dry-bar round 10): a read-failure reason that has passed through
+ * {@link sanitizeReason}. The brand exists so the SANITIZATION cannot be
+ * bypassed: a plain `string` is NOT assignable to this type, so
+ * `{ status: "read_failed", reason: someRawErrorMessage }` is a COMPILE error
+ * and the ONLY way to build a {@link ReadFailed} is {@link readFailed}, which
+ * sanitizes. Every read-failure reason reaches the firm-facing report and (on
+ * the audit leg) the SIGNED manifest `coverage.reason`, so an unsanitized
+ * reason is an over-disclosure defect in a document sent outside the firm.
+ */
+export type SanitizedReason = string & {
+  readonly __brand: "SanitizedReason";
+};
+
 /** A source that could NOT be read. Carries a lay-reader reason for the report. */
 export interface ReadFailed {
   readonly status: "read_failed";
-  readonly reason: string;
+  /**
+   * Always SANITIZED (see {@link SanitizedReason}): no absolute path, home
+   * directory, uid/gid, or raw syscall text can be carried here, because the
+   * brand makes a raw `string` unassignable.
+   */
+  readonly reason: SanitizedReason;
 }
 
 /**
@@ -75,6 +94,24 @@ const _assertReadFailedExcludedFromComplete: ReadFailedExcludedFromComplete = tr
 // Reference it so an unused-locals rule cannot strip the guard.
 void _assertReadFailedExcludedFromComplete;
 
+// ── SOURCE-COMPILED DURABILITY GUARD (reason-sanitization vector) ────
+//
+// The disclosure chokepoint holds only while `ReadFailed.reason` stays BRANDED.
+// If it is ever widened back to a plain `string`, every existing call site keeps
+// compiling (a branded string IS a string), so the loosening would produce no
+// error anywhere else and the raw-path leak would silently return. This guard
+// lives in `src` (which `npm run typecheck` compiles and CI runs) for the same
+// reason as the two above: `test/` is excluded from tsc, so a guard in a test
+// file fires nowhere.
+//
+// Mechanism: a plain `string` must NOT be assignable to the reason field. If it
+// becomes assignable, the conditional resolves to `never`, the initializer can
+// no longer be `true`, and `tsc` errors (TS2322).
+type ReasonFieldStaysBranded = string extends ReadFailed["reason"] ? never : true;
+const _assertReasonFieldStaysBranded: ReasonFieldStaysBranded = true;
+// Reference it so an unused-locals rule cannot strip the guard.
+void _assertReasonFieldStaysBranded;
+
 /** Construct a populated outcome. */
 export const populated = <T>(value: T): Populated<T> => ({
   status: "populated",
@@ -84,10 +121,109 @@ export const populated = <T>(value: T): Populated<T> => ({
 /** Construct a verified-empty outcome (a read that genuinely found nothing). */
 export const emptyVerified = (): EmptyVerified => ({ status: "empty_verified" });
 
-/** Construct a read-failure outcome with a lay-reader reason. */
+// ── D10-DISC-1: THE READ-FAILURE DISCLOSURE CHOKEPOINT ───────────────
+//
+// Read-failure reasons are FREE TEXT, and free text is the one thing the #962
+// manifest-coverage chokepoint cannot validate by construction: it checks every
+// enum-shaped and numeric field, then copies `reason` through untouched. Round
+// 10 rendered an absolute fortress path (revealing the operator's username and
+// home-directory layout) into the SIGNED, firm-facing Markdown report through
+// exactly that gap.
+//
+// The defence is two layers, both structural:
+//
+//  1. AT THE CAUSE (the real fix, an ALLOWLIST): `describeReadFailureCause`
+//     never reads an error's free-text `message`. It maps the error to a COARSE
+//     category drawn from a CLOSED set. Nothing host-specific can be selected
+//     because nothing host-specific is ever consulted.
+//  2. AT THE CONSTRUCTOR (defence in depth, a DENYLIST): `readFailed` routes
+//     every reason through `sanitizeReason`, which scrubs path-shaped and
+//     identity-shaped tokens. This catches any FUTURE call site that
+//     interpolates raw text without going through layer 1.
+//
+// The `SanitizedReason` brand is what makes layer 2 unbypassable: `ReadFailed`
+// cannot be built as an object literal, so `readFailed` is the only door.
+
+/** Replacement token for a redacted host path. */
+const REDACTED_PATH = "<path withheld>";
+
+/**
+ * Scrub host-identifying tokens out of a reason before it can reach a
+ * firm-facing artifact. Defence in depth behind
+ * {@link describeReadFailureCause}: absolute POSIX paths, Windows paths, home
+ * (`~`) paths, and uid/gid pairs are replaced. Path matching requires TWO or
+ * more segments so ordinary prose (`read/write`, `and/or`) is never mangled.
+ */
+export function sanitizeReason(raw: string): SanitizedReason {
+  const scrubbed = raw
+    // Home-relative paths first: `~/a/b` would otherwise leave a stray `~`.
+    .replace(/~(?:\/[^\s/\\:"']+)+\/?/g, REDACTED_PATH)
+    // Windows paths, e.g. `C:\Users\someone\file`.
+    .replace(/[A-Za-z]:\\[^\s"']*/g, REDACTED_PATH)
+    // Absolute POSIX paths with 2+ segments, not preceded by a word character
+    // (so `read/write` and `and/or` are untouched).
+    .replace(/(?<![A-Za-z0-9])(?:\/[^\s/\\:"']+){2,}\/?/g, REDACTED_PATH)
+    // Numeric account identifiers.
+    .replace(/\b(uid|gid)=\d+/gi, "$1=<withheld>")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return scrubbed as SanitizedReason;
+}
+
+/**
+ * The CLOSED set of read-failure categories the artifact may disclose. Keyed by
+ * `NodeJS.ErrnoException.code`. A cause outside this set collapses to the
+ * generic category, so no host-specific text can ever be selected.
+ */
+const READ_FAILURE_CATEGORIES: Readonly<Record<string, string>> = {
+  ENOENT: "the expected file or directory was not present",
+  EACCES: "this process was not permitted to read it",
+  EPERM: "the operation was not permitted at this privilege level",
+  EISDIR: "a directory was found where a file was expected",
+  ENOTDIR: "a path component was not a directory",
+  ELOOP: "the path resolved through too many symbolic links",
+  EMFILE: "too many files were already open",
+  ENFILE: "too many files were already open on this machine",
+  ENOSPC: "the storage volume was out of space",
+  EROFS: "the storage volume was read-only",
+  EBUSY: "the store was busy or locked by another process",
+  EIO: "the storage volume reported a low-level I/O error",
+};
+
+/** What the artifact says when the cause is outside the closed set. */
+const GENERIC_READ_FAILURE =
+  "it could not be read (the local diagnostic is recorded in this run's " +
+  "operator console output, not in this report, because it can contain " +
+  "machine-specific detail)";
+
+/**
+ * Map a caught error to a COARSE, host-independent category for a firm-facing
+ * artifact. This is the ALLOWLIST layer: the error's free-text `message` is
+ * NEVER read, so an absolute path, username, hostname, or raw syscall string
+ * cannot reach the report or the SIGNED manifest through this door. The raw
+ * message stays available to the caller for operator-local logging.
+ */
+export function describeReadFailureCause(cause: unknown): string {
+  const code = (cause as { code?: unknown } | null | undefined)?.code;
+  if (typeof code === "string") {
+    const known = READ_FAILURE_CATEGORIES[code];
+    // The errno CODE itself is host-independent and useful to an auditor, so it
+    // is disclosed alongside the plain-language category. An UNKNOWN code is
+    // not echoed (it is not from the closed set).
+    if (known !== undefined) return `${known} (${code})`;
+  }
+  return GENERIC_READ_FAILURE;
+}
+
+/**
+ * Construct a read-failure outcome with a lay-reader reason. The reason is
+ * ALWAYS sanitized (see {@link sanitizeReason}); because {@link ReadFailed}
+ * carries a branded reason, this is the only way to build one, so no raw
+ * `Error.message` can reach a firm-facing artifact without passing here.
+ */
 export const readFailed = (reason: string): ReadFailed => ({
   status: "read_failed",
-  reason,
+  reason: sanitizeReason(reason),
 });
 
 /** True iff the source was read to completion (a value OR a verified empty). */
