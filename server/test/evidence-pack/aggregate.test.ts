@@ -1328,4 +1328,72 @@ describe("detectShortfall", () => {
       expect(r.covered_to_is_census_cut).toBe(false);
     });
   });
+
+  // ─── Dry-9 fix-round-2 (P1): a present-but-UNPARSEABLE census cut is
+  // attestation-bearing; it bounds the attested window from above, and falling
+  // back to the generation instant would attest coverage the census never
+  // proved. It must make the covered window NOT DETERMINABLE, not widen it. ───
+  describe("P1: an unparseable census_taken_at makes coverage not determinable", () => {
+    it("sets coverage_determinable:false and attests no definitive span (never widened to generation)", () => {
+      const gen = "2026-08-15T12:00:00.000Z";
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+        { generatedAt: gen, lastEntryAt: null, censusTakenAt: "not-a-census-timestamp" }
+      );
+      expect(r.coverage_determinable).toBe(false);
+      expect(r.shortfall).toBe(true);
+      // The generation instant must NOT become the attested covered_to.
+      expect(r.covered_to_exclusive).not.toBe(gen);
+      expect(r.explanation).toMatch(/could not be parsed|not[- ]?determinable/i);
+    });
+
+    it("a genuinely-usable census cut stays determinable (no regression)", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+        {
+          generatedAt: "2026-08-15T12:00:00.000Z",
+          lastEntryAt: null,
+          censusTakenAt: "2026-08-15T11:00:00.000Z",
+        }
+      );
+      expect(r.coverage_determinable).toBe(true);
+      expect(r.covered_to_exclusive).toBe("2026-08-15T11:00:00.000Z");
+    });
+
+    it("no census cut supplied stays determinable (legacy caller, no regression)", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+        complete
+      );
+      expect(r.coverage_determinable).toBe(true);
+    });
+  });
+
+  // ─── Dry-9 fix-round-2 (P3): the zero_of_quarter_covered marker is set
+  // UNIFORMLY whenever the signed span is EMPTY, from one code path -- so the
+  // unparseable-earliest arm (which attests an empty span) can never omit it. ───
+  describe("P3: an EMPTY signed span always carries the zero_of_quarter_covered marker", () => {
+    it("sets the marker on the unparseable-earliest empty span", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "garbage-not-a-date", ever_pruned: true }),
+        complete
+      );
+      expect(r.covered_from).toBe(r.covered_to_exclusive);
+      expect(r.zero_of_quarter_covered).toBe(true);
+    });
+
+    it("does NOT set the marker on a real non-empty covered span", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-15T00:00:00.000Z" }),
+        complete
+      );
+      expect(r.covered_from).not.toBe(r.covered_to_exclusive);
+      expect(r.zero_of_quarter_covered).toBe(false);
+    });
+  });
 });

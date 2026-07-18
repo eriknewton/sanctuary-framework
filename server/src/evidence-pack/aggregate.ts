@@ -496,6 +496,44 @@ export function detectShortfall(
   const quarterStartMs = new Date(window.start_inclusive).getTime();
   const quarterEndMs = new Date(window.end_exclusive).getTime();
   const generatedMs = new Date(params.generatedAt).getTime();
+  // Dry-9 fix-round-2 (P1): the audit-census cut is attestation-bearing -- it
+  // bounds `covered_to_exclusive` from above. A present-but-UNPARSEABLE cut can
+  // bound nothing, and falling back to the generation instant would attest
+  // coverage the census never proved (the exact widening #954/#958 fought on the
+  // NUMERIC dimension). So a present-but-unusable cut makes the covered WINDOW
+  // NOT DETERMINABLE: fail closed to the same shape a read_failed audit source
+  // produces (no definitive span; prose + SIGNED manifest both render
+  // not-determinable) rather than silently widen. An ABSENT cut (legacy caller)
+  // and a USABLE cut both flow through normally below.
+  const censusUnusable =
+    params.censusTakenAt !== undefined && !isUsableTimestamp(params.censusTakenAt);
+  if (censusUnusable) {
+    return {
+      shortfall: true,
+      // No definitive span: the manifest chokepoint serializes determinable:false
+      // (dropping these bounds) and every prose surface reads coverage_determinable.
+      covered_from: window.start_inclusive,
+      covered_to_exclusive: window.start_inclusive,
+      in_progress_quarter: false,
+      last_entry_at: params.lastEntryAt,
+      retention_at_cap: false,
+      retention_at_cap_determinable: false,
+      // NOT a zero-covered finding (that is a DETERMINED empty window); this is
+      // "we could not determine the window at all". Keep the markers off so no
+      // surface reads a definitive zero-coverage claim here.
+      zero_of_quarter_covered: false,
+      covered_to_is_census_cut: false,
+      coverage_determinable: false,
+      explanation:
+        "The audit-census cut timestamp (" +
+        String(params.censusTakenAt) +
+        ") was present but could not be parsed, so this report cannot bound the " +
+        "upper end of the coverage window: the covered window for this quarter " +
+        "is NOT DETERMINABLE. This report makes no coverage claim. Investigate " +
+        "the census-capture timestamp and regenerate.",
+      daemon_store: retention.daemon_store,
+    };
+  }
   // D9C-1: the census cut, when supplied and USABLE, bounds the attested window
   // from above. An absent or unparseable value is ignored (falls back to
   // generation) -- D8-2: the census cut is attestation-bearing, so it flows
@@ -754,6 +792,21 @@ export function detectShortfall(
     coveredFrom = coveredToExclusive;
   }
 
+  // Dry-9 fix-round-2 (P3): the zero_of_quarter_covered marker is derived from
+  // the SPAN itself, UNIFORMLY, from this one code path -- so an EMPTY signed
+  // span can never be emitted without its marker. The earlier per-branch flag
+  // (set in the empty-log and post-attestable-end arms) missed the
+  // unparseable-earliest arm, which attests an empty span (covered_from ==
+  // covered_to_exclusive) but left the marker off, so the SIGNED manifest
+  // carried an empty span with no zero marker. An empty span is exactly
+  // covered_from >= covered_to_exclusive (the end is EXCLUSIVE, so equal bounds
+  // are already a zero-width window); a genuine covered window keeps the marker
+  // off. This runs after every branch has settled covered_from, so it is the
+  // single structural guarantee for "empty span <=> marker".
+  if (new Date(coveredFrom).getTime() >= coveredToExclusiveMs) {
+    zeroOfQuarterCovered = true;
+  }
+
   const parts: string[] = [];
   if (inProgress) {
     // D9C-1: the attestable end is the census cut when that is what bounds the
@@ -806,6 +859,11 @@ export function detectShortfall(
     // P3 (Dry-9): whether the attestable end is the audit-census cut (vs the
     // generation instant / quarter end), so surfaces echo the bound honestly.
     covered_to_is_census_cut: coveredToIsCensusCut,
+    // Dry-9 fix-round-2 (P1): every path that reaches here bounded the window
+    // from a USABLE (or absent) census cut, so the covered window IS
+    // determinable. Only the present-but-unusable-census short-circuit above
+    // returns false.
+    coverage_determinable: true,
     explanation: parts.join(" "),
     // WATCH-1: carry the daemon-store disclosure onto the coverage report so the
     // enforcement-summary section can state whether daemon-recorded enforcement

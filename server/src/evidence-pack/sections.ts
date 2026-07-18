@@ -91,7 +91,14 @@ function renderCover(
   // shows BOTH bounds (not just the end) so a cover-only reader is not misled
   // when early entries were pruned in a completed quarter (MED-1).
   const coveredSpan = foldOutcome(shortfall, {
-    populated: (s) => `${s.covered_from} to ${s.covered_to_exclusive} (exclusive)`,
+    // Dry-9 fix-round-2 (P1): when the covered WINDOW was not determinable (a
+    // present-but-unparseable audit-census cut), render "could not be
+    // determined" -- never a definitive (here empty) span -- so the cover
+    // matches the SIGNED manifest's determinable:false.
+    populated: (s) =>
+      s.coverage_determinable
+        ? `${s.covered_from} to ${s.covered_to_exclusive} (exclusive)`
+        : "could not be determined",
     emptyVerified: () => "could not be determined",
     readFailed: () => "could not be determined (the audit log could not be read)",
   });
@@ -111,6 +118,14 @@ function renderCover(
   ];
   const banner = foldOutcome(shortfall, {
     populated: (s) => {
+      // Dry-9 fix-round-2 (P1): coverage window not determinable (a present-but-
+      // unparseable audit-census cut). Make no coverage claim -- the same
+      // fail-closed posture the SIGNED manifest takes -- with the precise reason,
+      // never the start-side "does not reach the quarter start" banner (which
+      // would misattribute a census-cut fault to pruning).
+      if (!s.coverage_determinable) {
+        return ["> COVERAGE UNAVAILABLE: " + s.explanation, ""];
+      }
       if (s.in_progress_quarter) {
         return [
           "> PARTIAL QUARTER: this report was generated before " +
@@ -1112,7 +1127,22 @@ function renderAccessLog(
     readFailed: (reason) => countsUnavailable(reason),
   });
   const window = foldOutcome(shortfall, {
-    populated: (s) => [
+    populated: (s) => {
+      // Dry-9 fix-round-2 (P1): coverage window not determinable (a present-but-
+      // unparseable audit-census cut) makes NO coverage claim and asserts NO
+      // definitive covered-window sentence, matching the SIGNED manifest's
+      // determinable:false. The daemon disclosure still renders (it is
+      // independent of the census cut).
+      if (!s.coverage_determinable) {
+        return [
+          "Covered window: could NOT be determined for this quarter. This " +
+            "report makes no coverage claim. Reason: " +
+            s.explanation,
+          "",
+          ...daemonStoreNote(s.daemon_store),
+        ];
+      }
+      return [
       // R3-2: the covered window is derived from what the retained log SPANS.
       // Without the second clause, a quarter where Sanctuary was simply not
       // running (retained entries on both sides, zero decisions in between)
@@ -1132,7 +1162,8 @@ function renderAccessLog(
       // root-owned store. State its contribution explicitly so the counts above
       // are never read as a complete census when a second store exists.
       ...daemonStoreNote(s.daemon_store),
-    ],
+      ];
+    },
     emptyVerified: () => [],
     readFailed: (reason) => [
       "Covered window: could NOT be determined for this quarter because the " +

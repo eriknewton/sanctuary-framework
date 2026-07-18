@@ -484,6 +484,21 @@ export interface ShortfallReport {
    * {@link in_progress_quarter} (a clamp only happens then).
    */
   covered_to_is_census_cut: boolean;
+  /**
+   * Dry-9 fix-round-2 (P1): whether the covered WINDOW itself could be
+   * determined at all. False when an attestation-bearing bound is present but
+   * UNUSABLE -- specifically a present-but-unparseable audit-census cut, which
+   * bounds `covered_to_exclusive` from above: with the cut unreadable the pack
+   * cannot bound the upper end of coverage, and falling back to the generation
+   * instant would attest coverage the census never proved. When false, every
+   * surface (cover span, cover banner, section-7 window, and the SIGNED
+   * manifest) renders NOT-DETERMINABLE and asserts NO definitive covered span --
+   * the same fail-closed shape a `read_failed` audit source produces. True for
+   * every determinable window (the common case), so the shipped manifest/prose
+   * shape is unchanged. Distinct from {@link zero_of_quarter_covered}, which is
+   * a DETERMINABLE finding (coverage was computed and is empty).
+   */
+  coverage_determinable: boolean;
   /** A lay-reader explanation suitable for printing in the PDF. */
   explanation: string;
   /**
@@ -738,9 +753,20 @@ export interface EvidencePackManifest {
          * daemon store absent -- deleted or unverifiable, C1) mean these
          * coverage facts reflect the OPERATOR store
          * only (never a silent single-store signal, even in the signed manifest).
+         *
+         * Dry-9 fix-round-2 (P2): the additive `"unrecognized"` value is the
+         * normalization SENTINEL the serialization chokepoint emits when an
+         * untyped / JSON caller smuggles a status the input union does not
+         * define (e.g. `"quarantined"`) into the disclosure. The enum-shaped
+         * SIGNED field is ALWAYS one of these recognized values, NEVER the raw
+         * smuggled string, so a machine reader parsing the manifest can trust
+         * the field's shape. Additive to the 0.1-preview manifest (same pattern
+         * as the prior `retention_at_cap_determinable` / `zero_of_quarter_covered`
+         * additions); the input {@link DaemonStoreDisclosure} contract, which
+         * models real fortress states, is unchanged.
          */
         daemon_store: {
-          status: DaemonStoreDisclosure["status"];
+          status: DaemonStoreDisclosure["status"] | "unrecognized";
           unreadable_reason?: "privilege" | "io";
         };
       }

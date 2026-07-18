@@ -18,6 +18,7 @@ import type { StoredIdentity } from "../core/identity.js";
 import { renderMarkdownDocumentsToPdf } from "../compliance/eu_ai_act/pdf.js";
 import type {
   CustodyFacts,
+  DaemonStoreDisclosure,
   EvidencePack,
   EvidencePackFile,
   EvidencePackInput,
@@ -32,6 +33,7 @@ import {
   readFailed,
   type ReadOutcome,
 } from "./read-outcome.js";
+import { isRecognizedDaemonStatus } from "./types.js";
 import { isInWindow, quarterWindow } from "./quarter.js";
 import { aggregateQuarter, detectShortfall } from "./aggregate.js";
 import { renderSections } from "./sections.js";
@@ -119,6 +121,96 @@ function defaultDiscreteExports(): {
     audit_chain: notGathered(),
     anchor: notGathered(),
   };
+}
+
+/**
+ * Dry-9 fix-round-2: the SINGLE chokepoint that serializes the SIGNED manifest
+ * `coverage` from the honesty-guarded {@link ShortfallReport}. Every field the
+ * signed manifest asserts about coverage is derived HERE, from the SAME values
+ * the prose reads, so the machine-verified artifact and the human-readable
+ * report can never diverge. BY CONSTRUCTION this function cannot emit:
+ *
+ *  - P1: a definitive covered span when coverage is NOT DETERMINABLE. A populated
+ *    report with `coverage_determinable === false` (a present-but-unparseable
+ *    audit-census cut that cannot bound the window) fails closed to the SAME
+ *    `{ determinable: false, reason }` shape a `read_failed` / `empty_verified`
+ *    audit read produces -- never a span silently widened to the generation
+ *    instant.
+ *  - P2: a RAW, unrecognized daemon status in the enum-shaped `daemon_store.status`
+ *    field. An untyped / JSON caller's smuggled value (e.g. `"quarantined"`)
+ *    normalizes to the explicit `"unrecognized"` sentinel via
+ *    {@link isRecognizedDaemonStatus}; the field is ALWAYS a recognized value.
+ *  - P3: an EMPTY covered span without its `zero_of_quarter_covered` marker. The
+ *    marker is re-derived from the span itself (`covered_from` ==
+ *    `covered_to_exclusive`), so no upstream path can hand this function an empty
+ *    span and have it serialized bare.
+ *
+ * Valid, fully-covered quarters flow through unchanged (no marker, a recognized
+ * status, a real determinable span), so the shipped manifest shape is untouched.
+ */
+function serializeManifestCoverage(
+  shortfall: ReadOutcome<ShortfallReport>
+): EvidencePackManifest["coverage"] {
+  return foldOutcome<ShortfallReport, EvidencePackManifest["coverage"]>(
+    shortfall,
+    {
+      populated: (s) => {
+        // P1: the covered window was not determinable (e.g. an unparseable
+        // audit-census cut). Fail closed to the not-determinable shape; NEVER
+        // sign a definitive span. This is checked FIRST so no widened span can
+        // reach the determinable branch below.
+        if (!s.coverage_determinable) {
+          return { determinable: false, reason: s.explanation };
+        }
+        // P3: re-derive the empty-span marker from the span itself so an empty
+        // span is structurally inseparable from its marker. `covered_to_exclusive`
+        // is EXCLUSIVE, so equal bounds are already a zero-width window.
+        const emptySpan =
+          new Date(s.covered_from).getTime() >=
+          new Date(s.covered_to_exclusive).getTime();
+        const zeroCovered = s.zero_of_quarter_covered || emptySpan;
+        // P2: normalize the enum-shaped daemon status. A missing disclosure
+        // defaults to `absent` (the documented default); a recognized status
+        // passes through; anything else (an untyped/JSON caller's smuggled
+        // string) becomes the explicit `unrecognized` sentinel, NEVER the raw
+        // value.
+        const rawStatus = s.daemon_store?.status ?? "absent";
+        const status: DaemonStoreDisclosure["status"] | "unrecognized" =
+          isRecognizedDaemonStatus(rawStatus) ? rawStatus : "unrecognized";
+        return {
+          determinable: true,
+          covered_from: s.covered_from,
+          covered_to_exclusive: s.covered_to_exclusive,
+          shortfall: s.shortfall,
+          in_progress_quarter: s.in_progress_quarter,
+          // Codex-F1 (dry-bar round 7): serialize the definitive at-cap boolean
+          // ONLY when it was actually computed; otherwise the explicit
+          // not-determinable marker (never a flattering definitive `false`).
+          ...(s.retention_at_cap_determinable
+            ? { retention_at_cap: s.retention_at_cap }
+            : { retention_at_cap_determinable: false as const }),
+          // P1/P3 (Dry-9): an empty span always carries the marker; omitted
+          // (never `false`) for a normally-covered quarter so the shipped shape
+          // is unchanged.
+          ...(zeroCovered ? { zero_of_quarter_covered: true as const } : {}),
+          // G-1 follow-up: carry the (normalized) daemon disclosure so
+          // `shortfall: false` is never read as a complete-census signal when a
+          // present daemon store was excluded.
+          daemon_store: {
+            status,
+            ...(s.daemon_store?.unreadable_reason
+              ? { unreadable_reason: s.daemon_store.unreadable_reason }
+              : {}),
+          },
+        };
+      },
+      emptyVerified: () => ({
+        determinable: false,
+        reason: "the coverage window could not be determined.",
+      }),
+      readFailed: (reason) => ({ determinable: false, reason }),
+    }
+  );
 }
 
 /**
@@ -241,55 +333,11 @@ export function buildEvidencePack(
     );
   }
 
-  // Manifest coverage: a machine-readable UNION so a failed audit read cannot
-  // serialize a false "shortfall: false" - it serializes determinable:false.
-  const coverage = foldOutcome<ShortfallReport, EvidencePackManifest["coverage"]>(
-    shortfall,
-    {
-      populated: (s) => ({
-        determinable: true,
-        covered_from: s.covered_from,
-        covered_to_exclusive: s.covered_to_exclusive,
-        shortfall: s.shortfall,
-        in_progress_quarter: s.in_progress_quarter,
-        // Codex-F1 (dry-bar round 7): NEVER serialize a definitive
-        // `retention_at_cap` boolean into the SIGNED manifest when at-cap was
-        // not determinable (a merged census with no usable per-store
-        // breakdown): a machine consumer reading the flattering `false` would
-        // take "not at a retention cap" as a determined fact. Serialize the
-        // boolean ONLY when the `retentionDeterminability` chokepoint said it
-        // was computed; otherwise emit the explicit
-        // `retention_at_cap_determinable: false` marker (mirroring the
-        // top-level `determinable: false` convention) and omit the boolean.
-        ...(s.retention_at_cap_determinable
-          ? { retention_at_cap: s.retention_at_cap }
-          : { retention_at_cap_determinable: false as const }),
-        // P1 (Dry-9 fix): when ZERO of the quarter is covered, carry the
-        // explicit marker so a machine reader sees the empty
-        // `covered_from === covered_to_exclusive` span for what it is -- zero
-        // coverage -- and never mistakes it for a real (if narrow) window.
-        // Omitted (never `false`) otherwise, so the shipped manifest shape is
-        // unchanged for a normally-covered quarter.
-        ...(s.zero_of_quarter_covered
-          ? { zero_of_quarter_covered: true as const }
-          : {}),
-        // G-1 follow-up: carry the daemon-store disclosure into the SIGNED
-        // machine-readable coverage so `shortfall: false` is never read as a
-        // complete-census signal when a present daemon store was excluded.
-        daemon_store: {
-          status: s.daemon_store?.status ?? "absent",
-          ...(s.daemon_store?.unreadable_reason
-            ? { unreadable_reason: s.daemon_store.unreadable_reason }
-            : {}),
-        },
-      }),
-      emptyVerified: () => ({
-        determinable: false,
-        reason: "the coverage window could not be determined.",
-      }),
-      readFailed: (reason) => ({ determinable: false, reason }),
-    }
-  );
+  // Manifest coverage: derived through the SINGLE serialization chokepoint so
+  // the SIGNED artifact and the prose read the same honesty-guarded values (P1
+  // not-determinable fail-closed, P2 normalized daemon status, P3 empty-span
+  // marker). See serializeManifestCoverage above.
+  const coverage = serializeManifestCoverage(shortfall);
 
   const manifest = buildPackManifest({
     productName: PRODUCT_NAME,
