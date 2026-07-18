@@ -45,6 +45,7 @@ import {
   runProvisionFlow,
   resolvePolicyDaemonAction,
   withProvisionLock,
+  PROVISION_LOCK_PATH,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
   type RehomeStepResult,
@@ -90,7 +91,6 @@ const execFileAsync = promisify(execFile);
 
 const PROVISION_CEILING = 500;
 const NEW_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
-const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
 
 /** Budget for polling the policy-daemon socket to become reachable after install-boot (Bug B). */
 const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
@@ -2564,6 +2564,18 @@ export async function runEgressGateUnprotectForCli(options: {
             : "WARNING: the agent's parked state could NOT be fully verified -- it may be startable now " +
               `or at the next boot. Failed checks: ${outcome.parkedStateProblems.join("; ") || "no probe detail"}. ` +
               "Investigate immediately."),
+      );
+      return 2;
+    case "unprotect-refused":
+      // Fail-closed refusal (S5-7 fix-round-2): the sole-exclusive-agent
+      // invariant did not hold, the committed registry could not be read, or
+      // another provisioning run held the lock. NOTHING was torn down.
+      print(
+        `Exclusive-egress unprotect REFUSED (nothing torn down; every surface INTACT): ${outcome.reason}.` +
+          (outcome.conflictingUids.length > 0
+            ? " Per-agent unprotect of a shared-fortress/harness config is not supported until the " +
+              "multi-agent teardown lands."
+            : ""),
       );
       return 2;
   }

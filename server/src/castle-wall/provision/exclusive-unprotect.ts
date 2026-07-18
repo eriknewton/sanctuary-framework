@@ -14,18 +14,34 @@
  * is that sequencing layer, pure over injected ops (production wiring:
  * `egress-gate/arming-wiring.ts` `createUnprotectExclusiveEgressOps`).
  *
+ * CONCURRENCY + INVARIANT (S5-7 fix-round-2, replacing the fix-round's
+ * sibling-retention model). The whole sequence runs UNDER THE PROVISION LOCK
+ * (`withUnprotectLock` -> `withProvisionLock(PROVISION_LOCK_PATH, ...)`, the
+ * SAME lock the arm/repair paths take), so arm, repair, and unprotect are
+ * mutually exclusive and two unprotects serialize -- closing the HIGH-1 TOCTOU
+ * where a lockless registry snapshot let a concurrent `protect --exclusive-egress`
+ * commit a sibling between the read and the teardown. UNDER THE LOCK, step 0
+ * ASSERTS the one-exclusive-agent-per-fortress/harness invariant: the exclusive
+ * marker names ONE uid and a second exclusive install overwrites the first's
+ * marker, so the ONLY reachable v1 state is exactly one exclusive agent per
+ * fortress/harness. If any OTHER committed non-tombstone registry entry shares
+ * the leaving uid's fortress or harness, the state is a future multi-agent
+ * config this per-agent teardown cannot safely handle (the routing marker, gate
+ * policy file, and harness-keyed provisioned rules are ALL single-uid/harness-
+ * keyed -- half-tearing one a sibling still needs is the HIGH-2/HIGH-3 defect):
+ * it REFUSES, fail-closed and loud, leaving every surface + the registry entry
+ * intact. When the invariant holds (the sole-user case) the teardown is FULL --
+ * the leaving uid is the only user, so tearing down every shared surface is
+ * correct.
+ *
  * ORDERING (mirrors `restoreCoarseCompositionProduction`'s rationale, and the
  * S5-1 registry-last rule):
  *   1. PARK the harness (verified persistent park: not running + launchd
- *      override-db read-back + hold file absent + parked plist). The leaving
- *      agent's process must be DOWN and unbootable before any of its
- *      confinement is dismantled -- removing the registry entry drops the
+ *      override-db read-back + hold file absent + parked plist -- or an ABSENT
+ *      plist under the argv-unavailable fallback, which the verify accepts).
+ *      The leaving agent's process must be DOWN and unbootable before any of
+ *      its confinement is dismantled -- removing the registry entry drops the
  *      uid's four block-drops, so a still-running agent would be UNCONFINED.
- *      SIBLING-AWARE (production wiring): the harness launchd label + plist are
- *      a HOST SINGLETON, so the shared bootout/disable/plist ops run only when
- *      the leaving uid is the LAST one behind the label; while a sibling
- *      remains, only the leaving uid's own hold file is removed and a running
- *      shared label refuses the park (fail-closed).
  *   2. RECOVER any in-flight generation (the S5-2 crash table: a dead pre-pf
  *      staging record is discarded; a staged-but-uncommitted generation is
  *      block-only tombstoned with its generation id carried into the entry,
@@ -46,41 +62,44 @@
  *      marker-present-but-no-rules (agent BLOCKED, fail-closed), never
  *      marker-gone-but-rules-present (agent-scoped direct grants, fail-open).
  *   6. POLICY teardown: gate-readable runtime config copies, gate daemon plist,
- *      per-uid gate runtime dir (always), plus the FORTRESS-SHARED exclusive
- *      routing marker + gate policy file -- the latter two removed ONLY when
- *      the leaving uid is the last confined uid in the fortress (the same
- *      last-leaves rule as the flush); RETAINED while a sibling shares the
- *      fortress so it stays routed + protected.
- *   7. REGISTRY REMOVE, LAST: the union re-renders WITHOUT the leaving uid,
- *      every REMAINING uid's confinement is re-verified exact-live by the
- *      registry's own transaction machinery (never a partial union), and the
- *      anchor is FLUSHED only when the set becomes empty (the registry's one
- *      sanctioned `-F all`). The leaving uid's own generation_id folds into
- *      the persisted generation floor so a later re-protect cannot reuse it.
+ *      per-uid gate runtime dir, AND the exclusive routing marker + gate policy
+ *      file -- the leaving uid is the sole user (asserted in step 0), so every
+ *      surface is torn down.
+ *   7. REGISTRY REMOVE, LAST: the union re-renders WITHOUT the leaving uid and
+ *      the anchor is FLUSHED (the registry's one sanctioned `-F all`); the
+ *      leaving uid's own generation_id folds into the persisted generation
+ *      floor so a later re-protect cannot reuse it. (Any tombstone-only residue
+ *      of another uid re-verifies exact-live by the registry's own transaction
+ *      machinery -- never a partial union.)
  *
- * FAIL-CLOSED DIRECTION: every failure returns an honest staged outcome and
- * LEAVES THE REMAINING PROTECTION IN PLACE -- a failure before step 7 leaves
- * the leaving uid's block-drops live (over-restrictive: the parked agent is
- * down AND still confined), and a step-7 failure rolls back inside the
- * registry's own journaled transaction (remaining uids re-asserted, dirty =
- * loud repair signal). Nothing here can un-confine a sibling uid: the union
- * re-render preserves every remaining entry by construction. IDEMPOTENT:
- * every step tolerates already-torn-down, so a re-run after any failure
- * converges to the same terminal state (an absent uid's remove() is a
- * reconciling no-op).
+ * FAIL-CLOSED DIRECTION: a step-0 invariant violation (or an unreadable
+ * registry) REFUSES with NOTHING torn down; every later-stage failure returns
+ * an honest staged outcome and LEAVES THE PROTECTION IN PLACE -- a failure
+ * before step 7 leaves the leaving uid's block-drops live (over-restrictive:
+ * the parked agent is down AND still confined), and a step-7 failure rolls
+ * back inside the registry's own journaled transaction (dirty = loud repair
+ * signal). IDEMPOTENT: every step tolerates already-torn-down, so a re-run
+ * after any failure converges to the same terminal state (an absent uid's
+ * remove() is a reconciling no-op).
  *
- * HONEST BOUNDS: this is the per-agent EXCLUSIVE-EGRESS teardown only. It
- * does not delete the agent or gate service accounts (Erik-present, out of
- * scope by standing decision), does not restore re-homed files or disarm the
- * coarse wall (`unprovision.ts` owns that flow), and advances no capability
- * claim -- the multi-uid unprotect drill (S5-DRILL leg 6: two confined uids,
- * unprotect one, sibling confinement verified INTACT under a concurrent
- * probe loop) is owed before any external claim.
+ * HONEST BOUNDS: this is the per-agent EXCLUSIVE-EGRESS teardown for the
+ * SOLE-USER (single-exclusive-agent) case only. The shared-fortress
+ * multi-agent teardown is explicitly OUT OF SCOPE and REFUSED fail-closed
+ * (step 0), never silently mishandled. It does not delete the agent or gate
+ * service accounts (Erik-present, out of scope by standing decision), does not
+ * restore re-homed files or disarm the coarse wall (`unprovision.ts` owns that
+ * flow), and advances no capability claim -- the multi-uid unprotect drill
+ * (S5-DRILL leg 6: two confined uids, unprotect one, sibling confinement
+ * verified INTACT under a concurrent probe loop) is owed before any external
+ * claim.
  */
+
+import { ProvisionLockHeldError } from "./lockfile.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EGRESS_GATE_UNPROTECT_AUDIT_OP = "egress_gate_unprotected";
 export const EGRESS_GATE_UNPROTECT_FAILED_AUDIT_OP = "egress_gate_unprotect_failed";
+export const EGRESS_GATE_UNPROTECT_REFUSED_AUDIT_OP = "egress_gate_unprotect_refused";
 
 /** The teardown stage a failure is attributed to (in execution order). */
 export type EgressGateUnprotectStage =
@@ -104,6 +123,26 @@ export interface EgressGateUnprotectContext {
  * failure.
  */
 export interface EgressGateUnprotectOps {
+  /**
+   * Hold the exclusive provision lock (the SAME lock the arm/repair paths take,
+   * `PROVISION_LOCK_PATH`) around the WHOLE unprotect sequence, so arm, repair,
+   * and unprotect are mutually exclusive and two unprotects serialize (S5-7
+   * fix-round-2 HIGH-1). Production maps this to `withProvisionLock`. Throws
+   * `ProvisionLockHeldError` when another provisioning run holds the lock; the
+   * sequence converts that to a fail-closed `unprotect-refused` outcome (never
+   * proceeds under contention).
+   */
+  withUnprotectLock<T>(fn: () => Promise<T>): Promise<T>;
+  /**
+   * UNDER THE LOCK, assert the one-exclusive-agent-per-fortress/harness
+   * invariant (production: read the committed non-tombstone registry set): `ok`
+   * only when the leaving uid is the SOLE exclusive agent; otherwise the
+   * `conflictingUids` are the other committed uids sharing its fortress or
+   * harness, and the teardown REFUSES fail-closed rather than half-tearing a
+   * single-uid shared surface a sibling still needs. Throws on an unreadable
+   * registry (the sequence converts that to a fail-closed refusal).
+   */
+  assertSoleUserInvariant(): Promise<{ ok: true } | { ok: false; conflictingUids: number[] }>;
   /**
    * Verified persistent park (production: `parkHarnessPersistently`): bootout
    * + persistent disable + hold-file removal + parked-plist restore, then the
@@ -139,12 +178,11 @@ export interface EgressGateUnprotectOps {
    */
   revokeCredential(): Promise<void>;
   /**
-   * Remove the uid's gate policy surfaces. The per-uid surfaces (gate-readable
-   * runtime config copies, gate daemon plist, per-uid runtime dir) always go;
-   * the FORTRESS-SHARED exclusive routing marker + gate policy file are removed
-   * ONLY when the leaving uid is the last confined uid in the fortress (the
-   * production wiring enforces that last-leaves guard) so a sibling in the same
-   * fortress stays routed + protected. Each removal idempotent (`rm -f`).
+   * Remove the uid's gate policy surfaces. Because step 0 asserted the leaving
+   * uid is the SOLE exclusive agent, every surface is torn down: the per-uid
+   * surfaces (gate-readable runtime config copies, gate daemon plist, per-uid
+   * runtime dir) AND the fortress exclusive routing marker + gate policy file.
+   * Each removal idempotent (`rm -f`).
    */
   removeGateSurfaces(): Promise<void>;
   /**
@@ -195,17 +233,90 @@ export type EgressGateUnprotectOutcome =
       reason: string;
       parkedStateVerified: boolean;
       parkedStateProblems: string[];
-    };
+    }
+  /**
+   * The teardown was REFUSED before any surface was touched (fail-closed):
+   * either the sole-exclusive-agent invariant does not hold (`conflictingUids`
+   * names the other committed uids sharing the fortress/harness -- per-agent
+   * unprotect of a shared-fortress multi-agent config is out of scope until the
+   * multi-agent teardown lands), the committed registry could not be read to
+   * assert the invariant, or another provisioning run holds the provision lock.
+   * EVERY surface + the registry entry are left INTACT; the caller maps this to
+   * a non-zero exit and a loud message.
+   */
+  | { kind: "unprotect-refused"; reason: string; conflictingUids: number[] };
 
 /**
- * Run the per-agent exclusive-egress unprotect sequence. See the module doc
- * for ordering + fail-closed rationale. Never throws: every failure is an
- * honest staged outcome (the production CLI maps it to a non-zero exit).
+ * Run the per-agent exclusive-egress unprotect sequence UNDER THE PROVISION
+ * LOCK (S5-7 fix-round-2 HIGH-1). See the module doc for ordering + fail-closed
+ * rationale. Never throws: a held provision lock, an invariant violation, an
+ * unreadable registry, or any staged failure is an honest outcome the
+ * production CLI maps to a non-zero exit.
  */
 export async function runEgressGateUnprotect(
   ctx: EgressGateUnprotectContext,
   ops: EgressGateUnprotectOps,
 ): Promise<EgressGateUnprotectOutcome> {
+  const refuse = async (
+    reason: string,
+    conflictingUids: number[],
+  ): Promise<EgressGateUnprotectOutcome> => {
+    await ops.audit(EGRESS_GATE_UNPROTECT_REFUSED_AUDIT_OP, {
+      agent_uid: ctx.agentUid,
+      reason,
+      conflicting_uids: conflictingUids,
+    });
+    return { kind: "unprotect-refused", reason, conflictingUids };
+  };
+  try {
+    return await ops.withUnprotectLock(() => runUnprotectSequenceLocked(ctx, ops, refuse));
+  } catch (err) {
+    // The provision lock is held by another arm/repair/unprotect run: refuse
+    // fail-closed (nothing was touched -- acquisition precedes the sequence).
+    if (err instanceof ProvisionLockHeldError) {
+      return refuse(
+        "another sanctuary provisioning run holds the exclusive provision lock; refusing to unprotect " +
+          `concurrently (nothing torn down): ${err.message}`,
+        [],
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * The locked unprotect body: step 0 invariant assertion + the ordered teardown.
+ * Runs inside {@link runEgressGateUnprotect}'s `withUnprotectLock`, so the
+ * committed registry it reads cannot change under it.
+ */
+async function runUnprotectSequenceLocked(
+  ctx: EgressGateUnprotectContext,
+  ops: EgressGateUnprotectOps,
+  refuse: (reason: string, conflictingUids: number[]) => Promise<EgressGateUnprotectOutcome>,
+): Promise<EgressGateUnprotectOutcome> {
+  // 0. INVARIANT (fail-closed). The exclusive marker/gate-policy/provisioned
+  // rules are single-uid/harness-keyed; a per-agent teardown is only safe when
+  // the leaving uid is the sole exclusive agent. A shared-fortress/harness
+  // sibling (or an unreadable registry) REFUSES -- nothing is torn down.
+  let invariant: { ok: true } | { ok: false; conflictingUids: number[] };
+  try {
+    invariant = await ops.assertSoleUserInvariant();
+  } catch (err) {
+    return refuse(
+      "could not read the committed registry to assert the sole-exclusive-agent invariant " +
+        `(fail-closed; nothing torn down): ${(err as Error).message}`,
+      [],
+    );
+  }
+  if (!invariant.ok) {
+    return refuse(
+      "per-agent unprotect of a shared-fortress/harness agent is not supported until the multi-agent " +
+        "teardown lands; refusing to tear down single-uid shared surfaces (routing marker, gate policy, " +
+        `harness-keyed rules) a sibling still needs (conflicting confined uid(s): ${invariant.conflictingUids.join(", ")})`,
+      invariant.conflictingUids,
+    );
+  }
+
   const fail = async (
     stage: EgressGateUnprotectStage,
     reason: string,
@@ -290,10 +401,9 @@ export async function runEgressGateUnprotect(
     );
   }
 
-  // 6. Policy surfaces off. The FORTRESS-SHARED routing marker + gate policy
-  // file are torn down only when the leaving uid is the last confined uid in
-  // the fortress (the production op enforces that last-leaves guard); per-uid
-  // gate surfaces always go.
+  // 6. Policy surfaces off. Step 0 asserted the leaving uid is the sole
+  // exclusive agent, so every surface goes: per-uid gate surfaces AND the
+  // fortress routing marker + gate policy file.
   try {
     await ops.removeGateSurfaces();
   } catch (err) {

@@ -133,7 +133,11 @@ import {
   type BootReleaseResult,
 } from "../castle-wall/provision/exclusive-arm.js";
 import type { EgressGateUnprotectOps } from "../castle-wall/provision/exclusive-unprotect.js";
-import type { ProvisionLockOps } from "../castle-wall/provision/lockfile.js";
+import {
+  PROVISION_LOCK_PATH,
+  withProvisionLock,
+  type ProvisionLockOps,
+} from "../castle-wall/provision/lockfile.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1416,8 +1420,10 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
 }
 
 /**
- * How the S5-7 park disposes of the HOST-SINGLETON harness plist when the
- * leaving uid is the last one behind the shared label:
+ * How the S5-7 park disposes of the harness plist. Because step 0 asserts the
+ * leaving uid is the SOLE exclusive agent (no sibling behind the host-singleton
+ * label), the park always fully tears the label down; only the plist byte-state
+ * differs:
  *  - `restore`: rewrite the parked barrier plist (the normal path -- the
  *    harness argv is available, so the parked form is re-rendered on disk).
  *  - `remove`: DELETE the plist (the argv-unavailable fallback, MED-1). An
@@ -1430,151 +1436,56 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
 export type UnprotectParkPlistDisposition = "restore" | "remove";
 
 /**
- * The confined-set signals the S5-7 teardown reads ONCE (from the locked
- * registry) to gate SHARED surface removals behind the same "last-leaves"
- * rule that guards the pf-anchor flush. Every shared surface stays in place
- * while a sibling uid still needs it; only the leaving uid's per-uid surfaces
- * go unconditionally.
- */
-interface UnprotectSiblingSignals {
-  /**
-   * True when another COMMITTED, non-tombstone registry entry shares the
-   * leaving uid's `fortress_path` -- the fortress-keyed routing marker and gate
-   * policy file are then RETAINED (a sibling in the same fortress still
-   * routes through them).
-   */
-  fortressShared: boolean;
-  /**
-   * True when ANY other committed, non-tombstone registry entry remains -- the
-   * host-singleton harness label + its plist are then LEFT RUNNING for the
-   * sibling(s) (only the leaving uid's own hold file is removed).
-   */
-  anySibling: boolean;
-}
-
-/**
- * Sibling-aware persistent park for the S5-7 unprotect sequence. The harness
- * launchd label ({@link AGENT_HARNESS_DAEMON_LABEL}) and its plist
- * ({@link AGENT_HARNESS_DAEMON_PLIST_PATH}) are a HOST SINGLETON shared by
- * every confined uid, so unprotecting one uid must NEVER bootout/disable/rewrite
- * that shared label while a sibling uid still depends on it -- the exact
- * shared-label discipline {@link reassertParkedWithoutContext} already enforces
- * on the boot path (reused here, not reinvented).
- *
- *  - LAST behind the label (`!anySibling`): the full persistent park (bootout +
- *    disable + hold-file removal + parked-plist restore-or-remove), verified.
- *  - SIBLING(S) remain: leave the shared label running/enabled + its plist
- *    intact; remove only the leaving uid's own hold file (the exec wrapper
- *    refuses any start for a uid without its hold file, so that is the
- *    enforceable per-uid park). FAIL-CLOSED: because a running shared label
- *    cannot be attributed to a specific uid, a currently-RUNNING label refuses
- *    the park (throws) rather than tearing the leaving uid's confinement down
- *    while it might still be the live process.
+ * Verified persistent park for the S5-7 unprotect sequence. Because the leaving
+ * uid is the sole exclusive agent (step 0 invariant), the host-singleton
+ * harness label ({@link AGENT_HARNESS_DAEMON_LABEL}) + its plist
+ * ({@link AGENT_HARNESS_DAEMON_PLIST_PATH}) belong to it alone, so the full
+ * S5-5 verified park applies:
+ *  - `restore`: delegate to {@link parkHarnessPersistently} (bootout + disable
+ *    + hold-file removal + parked-plist RESTORE, verified) -- the exact,
+ *    well-covered S5-5 path, unchanged.
+ *  - `remove`: bootout + disable + hold-file removal + parked-plist REMOVAL
+ *    (absent === unbootable), then the same {@link verifyHarnessParkedPersistent}
+ *    posture (which accepts an absent plist).
  */
 async function parkHarnessForUnprotect(
   ctx: PersistentParkContext,
-  siblings: UnprotectSiblingSignals,
   plistDisposition: UnprotectParkPlistDisposition,
   deps: PersistentParkDeps = {},
 ): Promise<void> {
-  // Last uid behind the singleton AND the normal restore disposition == the
-  // exact S5-5 verified park; delegate so that well-covered path is unchanged.
-  if (!siblings.anySibling && plistDisposition === "restore") {
+  // Normal restore disposition == the exact S5-5 verified park; delegate so
+  // that well-covered path is unchanged.
+  if (plistDisposition === "restore") {
     await parkHarnessPersistently(ctx, deps);
     return;
   }
+  // argv-unavailable fallback (MED-1): full label teardown + REMOVE the plist.
   const launchctlFn = deps.runLaunchctlFn ?? runLaunchctl;
   const removeFileFn = deps.removeFileFn ?? (async (path: string): Promise<void> => rm(path, { force: true }));
   const problems: string[] = [];
-
-  // Per-uid park state, ALWAYS: hold-file removal is the enforceable per-uid
-  // start-gate (the exec wrapper refuses without it).
+  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
+  }
+  const disable = await launchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (disable.code !== 0) {
+    problems.push(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
+  }
   try {
     await removeFileFn(holdFilePathForUid(ctx.agentUid));
   } catch (err) {
     problems.push(`hold-file removal failed: ${(err as Error).message}`);
   }
-
-  if (!siblings.anySibling) {
-    // Last behind the label, argv-unavailable fallback (MED-1): tear the
-    // shared label down and REMOVE the plist (absent === unbootable).
-    const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-    if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
-      problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
-    }
-    const disable = await launchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-    if (disable.code !== 0) {
-      problems.push(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
-    }
-    try {
-      await removeFileFn(AGENT_HARNESS_DAEMON_PLIST_PATH);
-    } catch (err) {
-      problems.push(`parked-plist removal failed: ${(err as Error).message}`);
-    }
+  try {
+    await removeFileFn(AGENT_HARNESS_DAEMON_PLIST_PATH);
+  } catch (err) {
+    problems.push(`parked-plist removal failed: ${(err as Error).message}`);
   }
-  // else: a sibling still depends on the shared label -- leave bootout/disable
-  // and the shared plist untouched (only the leaving uid's hold file was
-  // removed above).
-
-  const verified = await verifyHarnessParkedForUnprotect(ctx, siblings, deps);
+  const verified = await verifyHarnessParkedPersistent(ctx, deps);
   if (!verified.ok) problems.push(...verified.problems);
   if (problems.length > 0) {
     throw new Error(`park not verified: ${problems.join("; ")}`);
   }
-}
-
-/**
- * The honest parked-state probe for the S5-7 unprotect sequence's failure
- * outcomes. When the leaving uid is the LAST behind the singleton label the
- * full {@link verifyHarnessParkedPersistent} posture applies (the plist may be
- * legitimately ABSENT under the `remove` fallback, which that probe already
- * tolerates). When SIBLING(s) remain the shared label is legitimately
- * enabled + possibly running a sibling, so only the per-uid guarantees are
- * checked: the leaving uid's hold file is absent AND -- fail-closed -- the
- * shared label is not currently running (a running singleton cannot be
- * attributed to a uid, so it is never reported as a verified leaving-uid park).
- * Never throws (a throwing probe reads as not-verified).
- */
-async function verifyHarnessParkedForUnprotect(
-  ctx: PersistentParkContext,
-  siblings: UnprotectSiblingSignals,
-  deps: PersistentParkDeps = {},
-): Promise<{ ok: true } | { ok: false; problems: string[] }> {
-  if (!siblings.anySibling) {
-    return verifyHarnessParkedPersistent(ctx, deps);
-  }
-  const launchctlFn = deps.runLaunchctlFn ?? runLaunchctl;
-  const readFileFn = deps.readFileFn ?? (async (path: string): Promise<string> => readFile(path, "utf8"));
-  const harnessOps: HarnessDaemonOps = {
-    ...realHarnessOps(),
-    runLaunchctl: launchctlFn,
-    ...(deps.sleepMs !== undefined ? { sleepMs: deps.sleepMs } : {}),
-  };
-  const problems: string[] = [];
-  try {
-    const status = await agentHarnessDaemonStatus(harnessOps);
-    if (!status.known) {
-      problems.push("launchctl did not return a trustworthy harness status");
-    } else if (status.running) {
-      problems.push(
-        `the shared harness job ${AGENT_HARNESS_DAEMON_LABEL} reports RUNNING (pid ${status.pid ?? "unknown"}); ` +
-          "with a sibling uid still behind the host-singleton label its process cannot be attributed to a uid, " +
-          "so the leaving uid cannot be proven down",
-      );
-    }
-  } catch (err) {
-    problems.push(`status probe errored: ${(err as Error).message}`);
-  }
-  const holdPath = holdFilePathForUid(ctx.agentUid);
-  try {
-    await readFileFn(holdPath);
-    problems.push(`the release hold file ${holdPath} is still present (the leaving uid remains startable)`);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      problems.push(`could not check the release hold file ${holdPath}: ${(err as Error).message}`);
-    }
-  }
-  return problems.length === 0 ? { ok: true } : { ok: false, problems };
 }
 
 /** TEST-ONLY dep seams for {@link createUnprotectExclusiveEgressOps}; production omits. */
@@ -1585,6 +1496,8 @@ export interface UnprotectWiringDeps {
   recoverGeneration?: (agentUid: number) => Promise<void>;
   parkDeps?: PersistentParkDeps;
   scrubRules?: () => Promise<{ removedRuleIds: string[]; reloadOk: boolean }>;
+  /** Injected provision-lock ops (production: the real O_EXCL {@link fsLockOps}). */
+  lockOps?: ProvisionLockOps;
 }
 
 /**
@@ -1592,24 +1505,30 @@ export interface UnprotectWiringDeps {
  * (`runEgressGateUnprotect`, `castle-wall/provision/exclusive-unprotect.ts`).
  * Maps each injected op onto the real primitive:
  *
- *  - park/verify: SIBLING-AWARE (S5-7 fix-round). The harness launchd label +
- *    its plist are a HOST SINGLETON; the full S5-5 verified persistent park
- *    (bootout + persistent disable + hold-file removal + parked-plist restore,
- *    read back) runs only when the leaving uid is the LAST one behind the
- *    label. While a sibling uid remains, only the leaving uid's own hold file
- *    is removed (the shared label is left running/enabled for the sibling) and
- *    the verify checks the per-uid park plus a fail-closed not-running guard.
- *    See {@link parkHarnessForUnprotect}.
- *  - policy surfaces: the per-uid gate daemon plist / config copies / runtime
- *    dir go unconditionally; the FORTRESS-SHARED exclusive-routing marker + gate
- *    policy file are RETAINED while another committed uid shares the fortress
- *    (same last-leaves rule as the pf-anchor flush).
- *  - manifest scrub: `scrubProvisionedEgressRules` removes only the LEAVING
- *    harness's own `provisioned-<harnessId>-*` rules (uniquely prefixed per the
- *    leaving uid's account, so a sibling's differently-prefixed rules are never
- *    touched); runs BEFORE the routing-marker removal so a crash + external
- *    reload composes marker-present-no-rules (blocked, fail-closed) rather than
- *    marker-gone-rules-present (agent-scoped, fail-open).
+ *  - lock: `withUnprotectLock` -> `withProvisionLock(PROVISION_LOCK_PATH, ...)`,
+ *    the SAME O_EXCL lock the arm/repair paths take, held around the WHOLE
+ *    sequence (S5-7 fix-round-2 HIGH-1) so a concurrent `protect --exclusive-egress`
+ *    cannot commit a sibling between the invariant assertion and the teardown.
+ *  - invariant: `assertSoleUserInvariant` reads the committed non-tombstone
+ *    registry set (under the lock) and refuses when ANY other committed entry
+ *    shares the leaving uid's fortress OR harness. The registry entry does not
+ *    record a harness id and v1 provisions a single harness (Hermes), so the
+ *    fail-closed reading is that ANY other committed non-tombstone entry is a
+ *    shared-fortress/harness sibling -- the ONLY reachable v1 state is exactly
+ *    one exclusive agent, and a second exclusive install overwrites the first's
+ *    single-uid marker. An unreadable registry THROWS (the sequence refuses).
+ *  - park/verify: the full S5-5 verified persistent park (bootout + persistent
+ *    disable + hold-file removal + parked-plist restore-or-remove, read back).
+ *    Because the invariant proved the leaving uid is the sole exclusive agent,
+ *    the host-singleton harness label + plist belong to it alone, so the whole
+ *    label is torn down (no sibling branch). See {@link parkHarnessForUnprotect}.
+ *  - policy surfaces: every surface goes -- the per-uid gate daemon plist /
+ *    config copies / runtime dir AND the fortress exclusive-routing marker +
+ *    gate policy file (the leaving uid is the sole user; no retention branch).
+ *  - manifest scrub: `scrubProvisionedEgressRules` removes the LEAVING harness's
+ *    `provisioned-<harnessId>-*` rules; runs BEFORE the routing-marker removal so
+ *    a crash + external reload composes marker-present-no-rules (blocked,
+ *    fail-closed) rather than marker-gone-rules-present (agent-scoped, fail-open).
  *  - recover: the shared production S5-2 recovery (staging record resolved
  *    per the crash table; a tombstoned dead generation keeps its id in the
  *    registry entry so the final remove folds it into the persisted floor).
@@ -1621,9 +1540,8 @@ export interface UnprotectWiringDeps {
  *    authority/oracle, so revocation works even when the gate service
  *    account or oracle keys are already gone (idempotent re-run after a
  *    partial teardown).
- *  - registry: the production S5-1 locked registry `remove()` (union
- *    re-render preserving every remaining uid, per-remaining-uid liveness,
- *    flush only on empty, generation floor folded).
+ *  - registry: the production S5-1 locked registry `remove()` (union re-render,
+ *    per-remaining-tombstone liveness, flush when empty, generation floor folded).
  */
 export function createUnprotectExclusiveEgressOps(
   input: ExclusiveEgressWiringInput,
@@ -1633,6 +1551,7 @@ export function createUnprotectExclusiveEgressOps(
   const removeFile =
     deps.removeFile ?? (async (path: string): Promise<void> => rm(path, { force: true, recursive: true }));
   const registry = deps.registry ?? createProductionAnchorRegistry();
+  const lockOps = deps.lockOps ?? fsLockOps();
   const parkDeps = deps.parkDeps ?? {};
   const plistDisposition: UnprotectParkPlistDisposition =
     input.parkPlistFallbackRemoval === true ? "remove" : "restore";
@@ -1643,37 +1562,28 @@ export function createUnprotectExclusiveEgressOps(
     fortressPath: input.fortressPath,
     harnessLogDir: input.harnessLogDir,
   };
-  // Snapshot the confined set ONCE (memoized) so every shared-surface guard in
-  // this run reads a consistent view. FAIL-CLOSED: an unreadable registry is
-  // treated as "siblings present" (retain every shared surface, never bootout
-  // the singleton) -- the same read failure aborts the step-7 registry remove
-  // anyway, so the whole unprotect fails-closed with nothing shared torn down.
-  let siblingSnapshot: Promise<UnprotectSiblingSignals> | undefined;
-  const siblings = (): Promise<UnprotectSiblingSignals> => {
-    if (siblingSnapshot === undefined) {
-      siblingSnapshot = (async (): Promise<UnprotectSiblingSignals> => {
-        try {
-          const { entries } = await registry.list();
-          const others = entries.filter(
-            (e) => e.agent_uid !== input.agentUid && e.tombstone !== true,
-          );
-          return {
-            fortressShared: others.some((e) => e.fortress_path === input.fortressPath),
-            anySibling: others.length > 0,
-          };
-        } catch {
-          return { fortressShared: true, anySibling: true };
-        }
-      })();
-    }
-    return siblingSnapshot;
-  };
   return {
+    withUnprotectLock: <T>(fn: () => Promise<T>): Promise<T> =>
+      withProvisionLock(PROVISION_LOCK_PATH, lockOps, fn),
+    async assertSoleUserInvariant(): Promise<{ ok: true } | { ok: false; conflictingUids: number[] }> {
+      // Read the COMMITTED non-tombstone set (an unreadable registry throws ->
+      // the sequence refuses fail-closed). Any OTHER committed non-tombstone
+      // entry is a shared-fortress/harness sibling this per-agent teardown
+      // cannot safely dismantle: the routing marker names ONE uid, the gate
+      // policy file is fortress-keyed, and the scrub is harness-keyed, and the
+      // registry carries no per-entry harness id (v1 is single-harness). So the
+      // fail-closed invariant is exactly "no other committed non-tombstone uid."
+      const { entries } = await registry.list();
+      const conflictingUids = entries
+        .filter((e) => e.agent_uid !== input.agentUid && e.tombstone !== true)
+        .map((e) => e.agent_uid);
+      return conflictingUids.length === 0 ? { ok: true } : { ok: false, conflictingUids };
+    },
     parkHarness: async (): Promise<void> => {
-      await parkHarnessForUnprotect(parkCtx, await siblings(), plistDisposition, parkDeps);
+      await parkHarnessForUnprotect(parkCtx, plistDisposition, parkDeps);
     },
     verifyParkedPersistent: async (): Promise<{ ok: true } | { ok: false; problems: string[] }> =>
-      verifyHarnessParkedForUnprotect(parkCtx, await siblings(), parkDeps),
+      verifyHarnessParkedPersistent(parkCtx, parkDeps),
     recoverGeneration: () => (deps.recoverGeneration ?? productionRecoverGeneration)(input.agentUid),
     async bootoutGateDaemon(): Promise<void> {
       const label = egressGateDaemonLabel(input.agentUid);
@@ -1690,26 +1600,15 @@ export function createUnprotectExclusiveEgressOps(
       await removeFile(gateCredentialTokenPath(input.agentUid));
     },
     async removeGateSurfaces(): Promise<void> {
-      // PER-UID surfaces: always removed for the leaving uid (uid-keyed, never
-      // shared). The gate daemon was already booted out (step 3).
+      // The leaving uid is the sole exclusive agent (step 0 invariant), so
+      // every surface is torn down. PER-UID surfaces (the gate daemon was
+      // already booted out, step 3):
       await removeFile(egressGateDaemonPlistPath(input.agentUid));
       await removeFile(egressGatePolicyConfigPath(input.agentUid));
       await removeFile(egressGateRulesConfigPath(input.agentUid));
       await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
-      // FORTRESS-SHARED surfaces: the exclusive-routing marker and the fortress
-      // gate policy file are keyed on the fortress, not the uid -- a sibling uid
-      // confined in the SAME fortress still routes through them. Remove them
-      // ONLY when the leaving uid is the last confined uid in this fortress
-      // (the same last-leaves rule that guards the pf-anchor flush); otherwise
-      // RETAIN them so the sibling stays fully protected.
-      const { fortressShared } = await siblings();
-      if (fortressShared) {
-        input.print(
-          `[castle-wall] unprotect: fortress ${input.fortressPath} still has confined sibling agent(s); ` +
-            "the shared exclusive-routing marker and gate policy file are RETAINED.",
-        );
-        return;
-      }
+      // Fortress exclusive-routing marker + gate policy file (single-uid /
+      // fortress-keyed; safe to remove because no sibling shares them).
       await removeFile(exclusiveRoutingMarkerPath(input.fortressPath));
       await removeFile(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME));
     },

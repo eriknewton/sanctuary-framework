@@ -1,11 +1,12 @@
 /**
  * Unified Protect Slice 5 S5-7: the per-agent unprotect sequence
  * (`runEgressGateUnprotect`). Host-free: every side effect is an injected
- * recorder op. Pins the design's S5-7 row semantics -- two-agent remove-one
- * (sibling confinement preserved, no flush), last-agent flush, idempotent
- * re-run -- plus the ordering + fail-closed contract: park FIRST, registry
- * remove LAST, every failure leaves remaining protection intact and reports
- * an honest staged outcome with a verified parked claim.
+ * recorder op. Pins the fix-round-2 design: the WHOLE sequence runs under the
+ * provision lock; step 0 asserts the sole-exclusive-agent invariant and
+ * REFUSES fail-closed (nothing torn down) on a shared-fortress/harness sibling,
+ * an unreadable registry, or a held lock; the sole-user case is a FULL teardown
+ * (park FIRST, registry remove LAST) with every failure leaving protection
+ * intact and reporting an honest staged outcome with a verified parked claim.
  */
 
 import { describe, it, expect } from "vitest";
@@ -13,9 +14,11 @@ import { describe, it, expect } from "vitest";
 import {
   EGRESS_GATE_UNPROTECT_AUDIT_OP,
   EGRESS_GATE_UNPROTECT_FAILED_AUDIT_OP,
+  EGRESS_GATE_UNPROTECT_REFUSED_AUDIT_OP,
   runEgressGateUnprotect,
   type EgressGateUnprotectOps,
 } from "../../../src/castle-wall/provision/exclusive-unprotect.js";
+import { ProvisionLockHeldError } from "../../../src/castle-wall/provision/lockfile.js";
 
 interface Recorder {
   ops: EgressGateUnprotectOps;
@@ -29,6 +32,18 @@ function makeOps(overrides: Partial<EgressGateUnprotectOps> = {}): Recorder {
   const audits: { operation: string; details: Record<string, unknown> }[] = [];
   const prints: string[] = [];
   const ops: EgressGateUnprotectOps = {
+    async withUnprotectLock(fn) {
+      calls.push("lock-acquire");
+      try {
+        return await fn();
+      } finally {
+        calls.push("lock-release");
+      }
+    },
+    async assertSoleUserInvariant() {
+      calls.push("assert-invariant");
+      return { ok: true };
+    },
     async parkHarness() {
       calls.push("park");
     },
@@ -57,7 +72,7 @@ function makeOps(overrides: Partial<EgressGateUnprotectOps> = {}): Recorder {
     },
     async removeRegistryEntry() {
       calls.push("registry-remove");
-      return { remainingUids: [602], flushed: false, dirty: false };
+      return { remainingUids: [], flushed: true, dirty: false };
     },
     async audit(operation, details) {
       audits.push({ operation, details });
@@ -73,36 +88,38 @@ function makeOps(overrides: Partial<EgressGateUnprotectOps> = {}): Recorder {
 const ctx = { agentUid: 601 };
 
 describe("castle-wall/provision/exclusive-unprotect: happy paths", () => {
-  it("two-agent remove-one: unprotects, preserves the sibling (no flush), audits", async () => {
+  it("sole-user teardown: unprotects, flushes the anchor, audits", async () => {
     const r = makeOps();
     const outcome = await runEgressGateUnprotect(ctx, r.ops);
     expect(outcome).toEqual({
       kind: "unprotected",
-      remainingUids: [602],
-      flushed: false,
+      remainingUids: [],
+      flushed: true,
       registryDirty: false,
     });
     expect(r.audits).toHaveLength(1);
     expect(r.audits[0]?.operation).toBe(EGRESS_GATE_UNPROTECT_AUDIT_OP);
     expect(r.audits[0]?.details).toMatchObject({
       agent_uid: 601,
-      remaining_uids: [602],
-      anchor_flushed: false,
+      remaining_uids: [],
+      anchor_flushed: true,
       registry_dirty: false,
       scrubbed_rule_ids: ["provisioned-hermes-api"],
       reload_confirmed: true,
     });
-    expect(r.prints.some((l) => l.includes("re-verified live"))).toBe(true);
-    expect(r.prints.some((l) => l.includes("602"))).toBe(true);
+    expect(r.prints.some((l) => l.includes("flushed"))).toBe(true);
   });
 
-  it("runs the teardown in the contract order: park -> recover -> gate daemon -> credential -> scrub -> policy -> registry LAST", async () => {
+  it("runs UNDER THE LOCK, invariant FIRST, then park -> recover -> gate daemon -> credential -> scrub -> policy -> registry LAST", async () => {
     const r = makeOps();
     await runEgressGateUnprotect(ctx, r.ops);
-    // Fix-round LOW-2: the manifest scrub runs BEFORE the policy-surface
-    // (routing-marker) removal so a crash + external reload composes
-    // marker-present-no-rules (fail-closed), never marker-gone-rules-present.
+    // The whole sequence is bracketed by lock acquire/release; step 0 asserts
+    // the invariant; then the teardown. Fix-round LOW-2: the manifest scrub
+    // runs BEFORE the policy-surface (routing-marker) removal so a crash +
+    // external reload composes marker-present-no-rules (fail-closed).
     expect(r.calls).toEqual([
+      "lock-acquire",
+      "assert-invariant",
       "park",
       "recover",
       "bootout-gate",
@@ -111,19 +128,23 @@ describe("castle-wall/provision/exclusive-unprotect: happy paths", () => {
       "scrub",
       "remove-surfaces",
       "registry-remove",
+      "lock-release",
     ]);
   });
 
-  it("last-agent flush: reports flushed and says so", async () => {
+  it("a tombstone-only residue of another uid remains after removal: still unprotected, no flush, reports the residual", async () => {
+    // The invariant excludes tombstones, so a block-only tombstone residue does
+    // not block the sole-user teardown; the registry remove reports it as a
+    // remaining (non-flushed) union member.
     const r = makeOps({
       async removeRegistryEntry() {
-        return { remainingUids: [], flushed: true, dirty: false };
+        return { remainingUids: [602], flushed: false, dirty: false };
       },
     });
     const outcome = await runEgressGateUnprotect(ctx, r.ops);
-    expect(outcome).toMatchObject({ kind: "unprotected", remainingUids: [], flushed: true });
-    expect(r.prints.some((l) => l.includes("flushed"))).toBe(true);
-    expect(r.audits[0]?.details).toMatchObject({ anchor_flushed: true });
+    expect(outcome).toMatchObject({ kind: "unprotected", remainingUids: [602], flushed: false });
+    expect(r.prints.some((l) => l.includes("602"))).toBe(true);
+    expect(r.audits[0]?.details).toMatchObject({ anchor_flushed: false, remaining_uids: [602] });
   });
 
   it("idempotent re-run converges: a second run over already-torn-down ops unprotects again", async () => {
@@ -165,6 +186,85 @@ describe("castle-wall/provision/exclusive-unprotect: happy paths", () => {
   });
 });
 
+describe("castle-wall/provision/exclusive-unprotect: fail-closed refusals (S5-7 fix-round-2)", () => {
+  it("invariant violation (a committed sibling shares fortress OR harness): REFUSES, NOTHING torn down, loud, non-zero-mappable", async () => {
+    const r = makeOps({
+      async assertSoleUserInvariant() {
+        return { ok: false, conflictingUids: [602] };
+      },
+    });
+    const outcome = await runEgressGateUnprotect(ctx, r.ops);
+    expect(outcome).toEqual({
+      kind: "unprotect-refused",
+      reason: expect.stringContaining("shared-fortress/harness"),
+      conflictingUids: [602],
+    });
+    if (outcome.kind !== "unprotect-refused") throw new Error("unreachable");
+    expect(outcome.reason).toContain("602");
+    // No teardown op ran: every surface + the registry entry stay INTACT.
+    expect(r.calls).not.toContain("park");
+    expect(r.calls).not.toContain("remove-surfaces");
+    expect(r.calls).not.toContain("registry-remove");
+    // The refusal audits distinctly (not the success/failed op).
+    expect(r.audits).toHaveLength(1);
+    expect(r.audits[0]?.operation).toBe(EGRESS_GATE_UNPROTECT_REFUSED_AUDIT_OP);
+    expect(r.audits[0]?.details).toMatchObject({ agent_uid: 601, conflicting_uids: [602] });
+  });
+
+  it("concurrent arm committed a sibling before the lock: the under-lock invariant sees it and REFUSES (no shared surface removed)", async () => {
+    // Model the serialization: the lock is held around the sequence, and the
+    // invariant assertion reads the committed set INSIDE the lock. A sibling
+    // committed by a concurrent arm before the lock was acquired is therefore
+    // visible and refuses -- the exact HIGH-1 TOCTOU the whole-sequence lock closes.
+    let assertedUnderLock = false;
+    const r = makeOps({
+      async withUnprotectLock(fn) {
+        // The sibling is "already committed" by the time the lock is held.
+        return fn();
+      },
+      async assertSoleUserInvariant() {
+        assertedUnderLock = true;
+        return { ok: false, conflictingUids: [777] };
+      },
+    });
+    const outcome = await runEgressGateUnprotect(ctx, r.ops);
+    expect(assertedUnderLock).toBe(true);
+    expect(outcome).toMatchObject({ kind: "unprotect-refused", conflictingUids: [777] });
+    expect(r.calls).not.toContain("remove-surfaces");
+    expect(r.calls).not.toContain("registry-remove");
+  });
+
+  it("unreadable registry during the invariant assertion: REFUSES fail-closed, nothing torn down", async () => {
+    const r = makeOps({
+      async assertSoleUserInvariant() {
+        throw new Error("EACCES: egress-anchor-registry.json");
+      },
+    });
+    const outcome = await runEgressGateUnprotect(ctx, r.ops);
+    expect(outcome).toMatchObject({ kind: "unprotect-refused", conflictingUids: [] });
+    if (outcome.kind !== "unprotect-refused") throw new Error("unreachable");
+    expect(outcome.reason).toContain("could not read the committed registry");
+    expect(r.calls).not.toContain("park");
+    expect(r.calls).not.toContain("registry-remove");
+    expect(r.audits[0]?.operation).toBe(EGRESS_GATE_UNPROTECT_REFUSED_AUDIT_OP);
+  });
+
+  it("another provisioning run holds the provision lock: REFUSES (nothing touched -- acquisition precedes the sequence)", async () => {
+    const r = makeOps({
+      async withUnprotectLock() {
+        throw new ProvisionLockHeldError("/var/run/sanctuary-provision.lock");
+      },
+    });
+    const outcome = await runEgressGateUnprotect(ctx, r.ops);
+    expect(outcome).toMatchObject({ kind: "unprotect-refused", conflictingUids: [] });
+    if (outcome.kind !== "unprotect-refused") throw new Error("unreachable");
+    expect(outcome.reason).toContain("holds the exclusive provision lock");
+    // The assertion and every teardown op are unreachable when the lock is held.
+    expect(r.calls).toEqual([]);
+    expect(r.audits[0]?.operation).toBe(EGRESS_GATE_UNPROTECT_REFUSED_AUDIT_OP);
+  });
+});
+
 describe("castle-wall/provision/exclusive-unprotect: fail-closed staged failures", () => {
   it("park failure: honest 'park' stage, NOTHING dismantled (no later op ran)", async () => {
     const r = makeOps({
@@ -183,8 +283,13 @@ describe("castle-wall/provision/exclusive-unprotect: fail-closed staged failures
     });
     if (outcome.kind !== "unprotect-failed") throw new Error("unreachable");
     expect(outcome.parkedStateProblems).toEqual(["the harness job reports RUNNING (pid 4242)"]);
-    // No teardown op ran: the leaving uid's confinement is fully intact.
-    expect(r.calls.filter((c) => c !== "verify-parked")).toEqual([]);
+    // No teardown op past the (failed) park ran: the leaving uid's confinement
+    // is fully intact. (The invariant assertion + lock bracket are the only
+    // pre-park calls.)
+    expect(r.calls).not.toContain("recover");
+    expect(r.calls).not.toContain("bootout-gate");
+    expect(r.calls).not.toContain("remove-surfaces");
+    expect(r.calls).not.toContain("registry-remove");
     expect(r.audits[0]?.operation).toBe(EGRESS_GATE_UNPROTECT_FAILED_AUDIT_OP);
     expect(r.audits[0]?.details).toMatchObject({ stage: "park", parked_state_verified: false });
   });
