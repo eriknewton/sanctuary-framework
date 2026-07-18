@@ -294,6 +294,22 @@ export function isRecognizedDaemonStatus(
   );
 }
 
+/**
+ * Dry-9 fix-round-3 (P4): is a daemon-store `unreadable_reason` one this version
+ * explicitly recognizes? Mirrors {@link isRecognizedDaemonStatus} for the OTHER
+ * enum-shaped daemon field. An untyped / JSON caller can smuggle any string past
+ * the compile-time `"privilege" | "io"` union, and a raw value must NEVER be
+ * signed into the enum-shaped SIGNED manifest field; the serialization
+ * chokepoint routes an unrecognized reason to omission via this predicate.
+ * Centralised here so the recognized-value list lives next to its sibling and
+ * cannot drift.
+ */
+export function isRecognizedDaemonUnreadableReason(
+  reason: unknown
+): reason is NonNullable<DaemonStoreDisclosure["unreadable_reason"]> {
+  return reason === "privilege" || reason === "io";
+}
+
 export interface RetentionFacts {
   /** Configured maximum retained entry count (FIFO cap). */
   max_entries: number;

@@ -58,6 +58,7 @@ import type {
   InventorySnapshot,
   PerStoreRetention,
   RetentionFacts,
+  ShortfallReport,
 } from "./types.js";
 import {
   buildInventorySnapshot,
@@ -877,6 +878,31 @@ export function daemonStoreCliWarning(
   return [];
 }
 
+/**
+ * Dry-9 fix-round-3 (P5): the operator-console "Covered window" line, derived
+ * from the SAME honesty-guarded {@link ShortfallReport} the signed manifest,
+ * cover span, and PDF read. It must NOT diverge from them. For a present-but-
+ * unparseable audit-census cut the shortfall is populated but
+ * `coverage_determinable === false` and the span collapses to a zero-width point
+ * (`covered_from === covered_to_exclusive === window.start`); branching on
+ * `sf.status === "populated"` ALONE printed that zero-width span as a
+ * definitive-looking window, conflating "window not determinable" with
+ * "determined zero-width span". Mirroring `sections.ts`, the not-determinable
+ * case renders "could not be determined ...", never a span -- so every surface
+ * agrees.
+ */
+export function coverageSummaryLine(sf: ReadOutcome<ShortfallReport>): string {
+  if (sf.status !== "populated") {
+    return "could not be determined (audit log unreadable)";
+  }
+  if (!sf.value.coverage_determinable) {
+    // The manifest serializes determinable:false and the cover reads "could not
+    // be determined" here; the console must match, never a zero-width span.
+    return "could not be determined (audit-census cut unparseable)";
+  }
+  return `${sf.value.covered_from} to ${sf.value.covered_to_exclusive} (exclusive)`;
+}
+
 interface EvidencePackCliOptions {
   subcommand: "generate" | "help";
   firmName: string;
@@ -1140,10 +1166,10 @@ export async function runEvidencePack(args: string[]): Promise<void> {
       ""
     );
   }
-  const coverageLine =
-    sf.status === "populated"
-      ? `${sf.value.covered_from} to ${sf.value.covered_to_exclusive} (exclusive)`
-      : "could not be determined (audit log unreadable)";
+  // P5: the console line is derived from the SAME honest verdict as the manifest
+  // + PDF, so a non-determinable window never prints as a definitive zero-width
+  // span. See coverageSummaryLine.
+  const coverageLine = coverageSummaryLine(sf);
   const shortfallLine =
     sf.status === "populated"
       ? sf.value.shortfall

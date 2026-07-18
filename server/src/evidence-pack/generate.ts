@@ -33,7 +33,10 @@ import {
   readFailed,
   type ReadOutcome,
 } from "./read-outcome.js";
-import { isRecognizedDaemonStatus } from "./types.js";
+import {
+  isRecognizedDaemonStatus,
+  isRecognizedDaemonUnreadableReason,
+} from "./types.js";
 import { isInWindow, quarterWindow } from "./quarter.js";
 import { aggregateQuarter, detectShortfall } from "./aggregate.js";
 import { renderSections } from "./sections.js";
@@ -123,6 +126,50 @@ function defaultDiscreteExports(): {
   };
 }
 
+/** The SIGNED manifest coverage's daemon-store shape (every field enum-shaped). */
+type ManifestDaemonStore = {
+  status: DaemonStoreDisclosure["status"] | "unrecognized";
+  unreadable_reason?: "privilege" | "io";
+};
+
+/**
+ * Dry-9 fix-round-3 (P4): normalize the ENTIRE daemon-store disclosure that
+ * reaches the SIGNED manifest coverage. The manifest `daemon_store` shape is
+ * enum-shaped in EVERY field:
+ *
+ *   - `status`: the five recognized states plus the `"unrecognized"` sentinel.
+ *   - `unreadable_reason`: `"privilege" | "io"` only.
+ *
+ * An untyped / JSON caller can smuggle a raw string past the compile-time union
+ * into ANY of them. The prior chokepoint normalized `status` but copied
+ * `unreadable_reason` RAW, so a bogus reason signed straight into the enum-shaped
+ * SIGNED field. This ONE helper validates EVERY enum-shaped field by
+ * construction: an unrecognized `status` becomes the `"unrecognized"` sentinel;
+ * an unrecognized `unreadable_reason` is OMITTED (rendered absent, never the raw
+ * string). Because the result is built field-by-field HERE -- never spread from
+ * the input disclosure -- no future sibling field can slip a raw value into the
+ * signed manifest either. The input {@link DaemonStoreDisclosure} contract, which
+ * models real fortress states, is untouched; this is purely the serialization
+ * concern on the manifest coverage type.
+ */
+function normalizeManifestDaemonStore(
+  daemon: DaemonStoreDisclosure | undefined
+): ManifestDaemonStore {
+  // A missing disclosure defaults to `absent` (the documented default).
+  const rawStatus = daemon?.status ?? "absent";
+  const status: DaemonStoreDisclosure["status"] | "unrecognized" =
+    isRecognizedDaemonStatus(rawStatus) ? rawStatus : "unrecognized";
+  // The reason is carried ONLY when it is a recognized enum value; anything else
+  // is dropped so the raw string never reaches the signed enum-shaped field.
+  const rawReason = daemon?.unreadable_reason;
+  return {
+    status,
+    ...(isRecognizedDaemonUnreadableReason(rawReason)
+      ? { unreadable_reason: rawReason }
+      : {}),
+  };
+}
+
 /**
  * Dry-9 fix-round-2: the SINGLE chokepoint that serializes the SIGNED manifest
  * `coverage` from the honesty-guarded {@link ShortfallReport}. Every field the
@@ -136,10 +183,12 @@ function defaultDiscreteExports(): {
  *    `{ determinable: false, reason }` shape a `read_failed` / `empty_verified`
  *    audit read produces -- never a span silently widened to the generation
  *    instant.
- *  - P2: a RAW, unrecognized daemon status in the enum-shaped `daemon_store.status`
- *    field. An untyped / JSON caller's smuggled value (e.g. `"quarantined"`)
- *    normalizes to the explicit `"unrecognized"` sentinel via
- *    {@link isRecognizedDaemonStatus}; the field is ALWAYS a recognized value.
+ *  - P2/P4: a RAW value in ANY enum-shaped `daemon_store` field. The ENTIRE
+ *    disclosure is normalized by {@link normalizeManifestDaemonStore}: an
+ *    untyped / JSON caller's smuggled `status` (e.g. `"quarantined"`) becomes the
+ *    explicit `"unrecognized"` sentinel, and a smuggled `unreadable_reason` (e.g.
+ *    `"bogus-reason"`) is OMITTED, never signed raw. Every enum-shaped daemon
+ *    field the manifest carries is ALWAYS a recognized value or absent.
  *  - P3: an EMPTY covered span without its `zero_of_quarter_covered` marker. The
  *    marker is re-derived from the span itself (`covered_from` ==
  *    `covered_to_exclusive`), so no upstream path can hand this function an empty
@@ -169,14 +218,6 @@ function serializeManifestCoverage(
           new Date(s.covered_from).getTime() >=
           new Date(s.covered_to_exclusive).getTime();
         const zeroCovered = s.zero_of_quarter_covered || emptySpan;
-        // P2: normalize the enum-shaped daemon status. A missing disclosure
-        // defaults to `absent` (the documented default); a recognized status
-        // passes through; anything else (an untyped/JSON caller's smuggled
-        // string) becomes the explicit `unrecognized` sentinel, NEVER the raw
-        // value.
-        const rawStatus = s.daemon_store?.status ?? "absent";
-        const status: DaemonStoreDisclosure["status"] | "unrecognized" =
-          isRecognizedDaemonStatus(rawStatus) ? rawStatus : "unrecognized";
         return {
           determinable: true,
           covered_from: s.covered_from,
@@ -193,15 +234,12 @@ function serializeManifestCoverage(
           // (never `false`) for a normally-covered quarter so the shipped shape
           // is unchanged.
           ...(zeroCovered ? { zero_of_quarter_covered: true as const } : {}),
-          // G-1 follow-up: carry the (normalized) daemon disclosure so
+          // G-1 follow-up + P4: carry the FULLY normalized daemon disclosure
+          // (every enum-shaped field validated by the ONE chokepoint helper) so
           // `shortfall: false` is never read as a complete-census signal when a
-          // present daemon store was excluded.
-          daemon_store: {
-            status,
-            ...(s.daemon_store?.unreadable_reason
-              ? { unreadable_reason: s.daemon_store.unreadable_reason }
-              : {}),
-          },
+          // present daemon store was excluded, and no raw enum value is ever
+          // signed into the manifest.
+          daemon_store: normalizeManifestDaemonStore(s.daemon_store),
         };
       },
       emptyVerified: () => ({

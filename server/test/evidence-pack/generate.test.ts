@@ -1769,6 +1769,59 @@ describe("Dry-9 fix-round-2: signed-manifest serialization chokepoint", () => {
     expect(verifyManifest(pack)).toBe(true);
   });
 
+  // P4 [HIGH, Dry-9 fix-round-3]: a SIBLING enum-shaped daemon field. The
+  // chokepoint normalized `daemon_store.status` but copied
+  // `daemon_store.unreadable_reason` RAW, so an untyped / JSON caller's smuggled
+  // value signed straight into the enum-shaped SIGNED field (which only allows
+  // "privilege" | "io"). The complete daemon-disclosure normalization must
+  // validate EVERY enum-shaped field, so no raw reason ever reaches the manifest.
+  it("P4: an unrecognized daemon_store.unreadable_reason never signs the raw value into the enum-shaped SIGNED field", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-15T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          // Untyped/JSON caller smuggles a reason the manifest enum forbids.
+          unreadable_reason: "bogus-reason" as unknown as "io",
+        },
+      })
+    );
+    const c = coverage(pack);
+    // Status is preserved (a recognized value); the RAW reason is NOT carried.
+    expect(c.daemon_store.status).toBe("present_unreadable");
+    expect(c.daemon_store.unreadable_reason).toBeUndefined();
+    const bytes = signedManifestBytes(pack);
+    // The confirmed dishonest bytes must be structurally absent from the signature.
+    expect(bytes).not.toContain("bogus-reason");
+    expect(bytes).not.toContain('"unreadable_reason":"bogus-reason"');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // A RECOGNIZED unreadable_reason still flows through unchanged (no regression
+  // to the honest present_unreadable/io case the manifest already carried).
+  it("P4 (honest case): a recognized unreadable_reason ('io') is preserved in the SIGNED manifest", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-15T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          unreadable_reason: "io",
+        },
+      })
+    );
+    const c = coverage(pack);
+    expect(c.daemon_store.status).toBe("present_unreadable");
+    expect(c.daemon_store.unreadable_reason).toBe("io");
+    expect(signedManifestBytes(pack)).toContain('"unreadable_reason":"io"');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
   // Regression guard: a normal, fully-covered quarter's manifest shape is
   // unchanged by the chokepoint (no zero marker, no unrecognized status, a real
   // determinable span).
