@@ -156,7 +156,11 @@ export interface GenerationRegistryOps {
    * it removes an entry whose generation survives in no other entry. OPTIONAL
    * (older adapters); absent or `undefined` === no floor. Bring-up folds it
    * into {@link computeNextGenerationId} so a repair-discarded generation is
-   * never reallocated.
+   * never reallocated. Fix-round-6 F1: when the registry's persisted floor is
+   * MALFORMED but its preserved raw parses numerically, the registry folds the
+   * parsed value into this read, so allocation stays above it even before the
+   * repair verb resolves the raw (the dirty registry separately withholds
+   * release until then).
    */
   readGenerationFloor?(): Promise<number | undefined>;
 }

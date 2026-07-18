@@ -144,6 +144,21 @@ export interface PfAnchorRegistryState {
    * (absent === no floor); the state version stays `1`.
    */
   generation_floor?: number;
+  /**
+   * PRESERVED raw value of a malformed `generation_floor` (fix-round-6 F1).
+   * A present-but-malformed floor must never be silently dropped: dropped
+   * dirty-only, a later successful mutation cleared dirty and saved a state
+   * WITHOUT the floor, making the discarded generation reallocatable
+   * (monotonicity fail-open). Instead the raw value is carried here through
+   * every mutation, the dirty marker stays STICKY while it is present (see
+   * `clearDirtyUnlessFloorRepairOwed`), and only
+   * {@link PfAnchorRegistry.repairQuarantined} resolves it (best-effort
+   * numeric parse folded into the repaired floor; loud reset when
+   * unrecoverable). A PARSEABLE raw is additionally folded into the effective
+   * `generation_floor` on load, so the generation allocator respects it even
+   * before repair. ADDITIVE + OPTIONAL; the state version stays `1`.
+   */
+  generation_floor_raw?: unknown;
 }
 
 /** Injected persistence for the registry state (root-owned file in production). */
@@ -242,6 +257,24 @@ export interface PfAnchorQuarantineRepairResult {
   forensicPath: string | null;
   /** The committed set after the repair (valid entries + salvaged tombstones). */
   remaining: PfAnchorRegistryEntry[];
+  /**
+   * Present when the persisted generation floor itself was malformed and this
+   * repair resolved it (fix-round-6 F1). `parsed` is the best-effort numeric
+   * recovery of the preserved raw value (`null` = unrecoverable). When
+   * unrecoverable, the floor is RESET to the maximum generation observed
+   * across surviving entries + tombstones (+ any generation removed by this
+   * repair) with NO invented safety margin; the caller MUST report that reset
+   * loudly (the original floor was unrecoverable; re-provision is advised).
+   * `resolved_floor` is the floor actually persisted (`null` when no
+   * generation survived anywhere to derive a floor from, in which case no
+   * floor is persisted at all).
+   */
+  floorRepair?: {
+    raw: unknown;
+    parsed: number | null;
+    resolved_floor: number | null;
+    unrecoverable: boolean;
+  };
 }
 
 /**
@@ -330,6 +363,81 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
   return entry;
 }
 
+/**
+ * Best-effort numeric recovery of a malformed generation-floor value
+ * (fix-round-6 F1): a number, or a numeric string (e.g. `"8"`), that resolves
+ * to a finite value >= 1. Fractional values round UP (a floor must never be
+ * lowered by coercion). Anything else is unrecoverable (`null`).
+ */
+function parseGenerationFloorRaw(raw: unknown): number | null {
+  const n =
+    typeof raw === "number"
+      ? raw
+      : typeof raw === "string" && raw.trim() !== ""
+        ? Number(raw)
+        : Number.NaN;
+  if (!Number.isFinite(n) || n < 1) return null;
+  return Math.ceil(n);
+}
+
+/**
+ * Classify the persisted generation floor of a loaded state (fix-round-6 F1):
+ * the SHARED boundary between `normalizeState`, `listQuarantined`, and
+ * `repairQuarantined`, so all three agree on what counts as a malformed floor.
+ * `validFloor` is a well-formed persisted `generation_floor`; `raw` is the
+ * preserved evidence of a malformed one (either a malformed `generation_floor`
+ * observed now, or a `generation_floor_raw` carried from an earlier load);
+ * `rawParsed` is the best-effort numeric recovery across that evidence.
+ */
+function classifyGenerationFloor(loaded: PfAnchorRegistryState): {
+  validFloor?: number;
+  raw?: unknown;
+  rawParsed: number | null;
+} {
+  const out: { validFloor?: number; raw?: unknown; rawParsed: number | null } = {
+    rawParsed: null,
+  };
+  const rawCandidates: unknown[] = [];
+  if (loaded.generation_floor !== undefined) {
+    if (Number.isInteger(loaded.generation_floor) && loaded.generation_floor >= 1) {
+      out.validFloor = loaded.generation_floor;
+    } else {
+      rawCandidates.push(loaded.generation_floor);
+    }
+  }
+  if (loaded.generation_floor_raw !== undefined) {
+    rawCandidates.push(loaded.generation_floor_raw);
+  }
+  if (rawCandidates.length > 0) {
+    // The newest malformed evidence wins as the preserved raw (a malformed
+    // `generation_floor` can only appear via external mutation and is newer
+    // than a carried raw); the parse folds across ALL candidates, monotone.
+    out.raw = rawCandidates[0];
+    for (const candidate of rawCandidates) {
+      const parsed = parseGenerationFloorRaw(candidate);
+      if (parsed !== null) out.rawParsed = Math.max(out.rawParsed ?? 0, parsed);
+    }
+  }
+  return out;
+}
+
+/**
+ * Clear the needs-repair marker after a successful mutation, reconcile, or
+ * rollback -- UNLESS a preserved malformed generation-floor raw is still
+ * pending repair (fix-round-6 F1). A successful apply proves the ANCHOR
+ * matches the registry, but it cannot resolve the floor: clearing dirty here
+ * would let posture read green (and the next save look clean) while the
+ * floor's true value is still unknown. Only
+ * {@link PfAnchorRegistry.repairQuarantined} resolves the raw and clears this.
+ */
+function clearDirtyUnlessFloorRepairOwed(state: PfAnchorRegistryState): void {
+  if (state.generation_floor_raw === undefined) {
+    delete state.dirty;
+  } else {
+    state.dirty = true;
+  }
+}
+
 /** Normalize a loaded state (or `null`) into a usable state. Throws on corruption. */
 function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryState {
   if (loaded === null) {
@@ -387,18 +495,24 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
     }
   }
   if (loaded.dirty === true) state.dirty = true;
-  // Fix-round-5 P1: preserve the persisted generation floor (a strictly-
-  // exceeded lower bound for future generation allocation, written by the
-  // quarantine repair verb when it removes an entry carrying a generation_id
-  // no surviving entry preserves). A present-but-malformed floor is a repair
-  // signal (dirty), never silently coerced -- its value is unrecoverable, so
-  // it is dropped and posture is forced red rather than trusting garbage.
-  if (loaded.generation_floor !== undefined) {
-    if (Number.isInteger(loaded.generation_floor) && loaded.generation_floor >= 1) {
-      state.generation_floor = loaded.generation_floor;
-    } else {
-      state.dirty = true;
-    }
+  // Fix-round-5 P1 + fix-round-6 F1: preserve the persisted generation floor
+  // (a strictly-exceeded lower bound for future generation allocation, written
+  // by the quarantine repair verb when it removes an entry carrying a
+  // generation_id no surviving entry preserves). A present-but-malformed floor
+  // is a repair signal (dirty) and its RAW value is PRESERVED in
+  // `generation_floor_raw`, never silently dropped: a floor that vanished on
+  // the next save would make the discarded generation reallocatable once a
+  // later mutation cleared dirty (the round-6 fail-open). A parseable raw is
+  // ALSO folded into the effective floor (defense in depth: the allocator
+  // respects it even before repair), and dirty stays STICKY until
+  // repairQuarantined resolves the raw (see clearDirtyUnlessFloorRepairOwed).
+  const floorInfo = classifyGenerationFloor(loaded);
+  if (floorInfo.validFloor !== undefined || floorInfo.rawParsed !== null) {
+    state.generation_floor = Math.max(floorInfo.validFloor ?? 0, floorInfo.rawParsed ?? 0);
+  }
+  if (floorInfo.raw !== undefined) {
+    state.generation_floor_raw = floorInfo.raw;
+    state.dirty = true;
   }
   // A non-empty committed set with no valid enable token is inconsistent (pf
   // should be enabled and its reference releasable): treat as needs-repair
@@ -468,7 +582,20 @@ function toUnionEntry(entry: PfAnchorRegistryEntry): PfAnchorUnionEntry {
   };
 }
 
-/** An FS-backed store (temp-write + rename for atomicity, 0600). */
+/**
+ * An FS-backed store (temp-write + rename for atomicity, 0600).
+ *
+ * HONEST BOUND (fix-round-6 F3, accepted documented residual). The registry
+ * file -- including `generation_floor` -- is protected by root-only fs modes
+ * (0700 directory / 0600 file) and by COOPERATIVE-MUTATION monotonicity only
+ * (this module never lowers the floor and never drops a preserved raw). An
+ * EXTERNAL restore of an older registry file (a root actor, a backup/rollback
+ * tool, disk-image restore) can lower the floor or resurrect a removed entry;
+ * nothing here anchors the file against that. This is the same residual class
+ * as the other root-owned state files in this codebase; anti-rollback
+ * anchoring is a separate ratified mechanism class and is deliberately NOT
+ * built into this store.
+ */
 export function createFsRegistryStore(path: string = PF_ANCHOR_REGISTRY_PATH): PfAnchorRegistryStore {
   return {
     async load(): Promise<PfAnchorRegistryState | null> {
@@ -557,6 +684,8 @@ export class PfAnchorRegistry {
       dirty: state.dirty === true || state.pending !== undefined,
       // Fix-round-5 P1: surface the persisted generation floor so allocation
       // adapters (generation bring-up) can never reuse a repair-discarded id.
+      // Fix-round-6 F1: this includes a PARSEABLE malformed-raw floor folded
+      // on load, so allocation respects it even while repair is still owed.
       ...(state.generation_floor !== undefined ? { generationFloor: state.generation_floor } : {}),
     };
   }
@@ -596,15 +725,33 @@ export class PfAnchorRegistry {
     const { entries, quarantined } = classifyCommitted(loaded);
     const enableTokenValid =
       typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token);
+    // Fix-round-6 F2: a malformed persisted generation_floor must be VISIBLE
+    // on this read path too -- the boot supervisor and oracle refresh loop
+    // read through here, and a floor problem only normalizeState noticed
+    // would let the boot refresh run green over a monotonicity hole. It is
+    // reported as a registry-LEVEL finding (index -1: it is not a committed
+    // entry) and FORCES dirty, so every token is withheld until repair.
+    const floorInfo = classifyGenerationFloor(loaded);
+    const quarantinedOut = quarantined.map((q) => ({ index: q.index, reason: q.reason }));
+    if (floorInfo.raw !== undefined) {
+      quarantinedOut.push({
+        index: -1,
+        reason:
+          "registry-level generation_floor is malformed (not a committed entry; the raw value " +
+          "is preserved for repair); generation-floor monotonicity cannot be trusted until " +
+          "'sanctuary protect --repair-egress-gate' resolves it",
+      });
+    }
     const dirty =
       loaded.dirty === true ||
       loaded.pending !== undefined ||
       quarantined.length > 0 ||
+      floorInfo.raw !== undefined ||
       (entries.length > 0 && !enableTokenValid);
     return {
       entries,
       dirty,
-      quarantined: quarantined.map((q) => ({ index: q.index, reason: q.reason })),
+      quarantined: quarantinedOut,
     };
   }
 
@@ -645,6 +792,15 @@ export class PfAnchorRegistry {
    *    structurally VALID duplicate is reported loudly with both generations
    *    (see {@link PfAnchorQuarantineRepairFinding.duplicate}) -- a discarded
    *    generation must never be silently reusable.
+   *  - Malformed floor resolution (fix-round-6 F1): a preserved malformed
+   *    `generation_floor` raw (see
+   *    {@link PfAnchorRegistryState.generation_floor_raw}) is RESOLVED here:
+   *    a parseable raw folds into the repaired floor; an unrecoverable raw
+   *    resets the floor to the maximum generation still observable across
+   *    surviving entries + tombstones (no invented margin), reported via
+   *    {@link PfAnchorQuarantineRepairResult.floorRepair} so the caller says
+   *    LOUDLY that the original floor was unrecoverable and re-provision is
+   *    advised. A floor problem alone makes this verb act (it is not a no-op).
    *  - The remaining union is re-rendered + re-armed and the state persisted
    *    CLEAN (the explicit re-assert supersedes any journaled `pending`,
    *    exactly like reconcile-on-entry). An arm/save failure leaves the
@@ -658,7 +814,12 @@ export class PfAnchorRegistry {
         return { repaired: false, findings: [], forensicPath: null, remaining: [] };
       }
       const { entries: valid, quarantined } = classifyCommitted(loaded);
-      if (quarantined.length === 0) {
+      // Fix-round-6 F1: a malformed persisted generation_floor is ALSO a
+      // repairable finding -- without this, the preserved raw kept the
+      // registry dirty forever (sticky by design) while the documented repair
+      // verb reported "nothing to repair".
+      const floorInfo = classifyGenerationFloor(loaded);
+      if (quarantined.length === 0 && floorInfo.raw === undefined) {
         return { repaired: false, findings: [], forensicPath: null, remaining: valid };
       }
       // Forensics FIRST, and BYTE-EXACT (fix-round-5 P3): the sidecar is the
@@ -753,20 +914,57 @@ export class PfAnchorRegistry {
       // Fold the generation floor: carry any valid persisted floor forward and
       // raise it to cover every generation removed above. Monotone by
       // construction (Math.max); never lowered, never dropped by a repair.
-      const priorFloor =
-        Number.isInteger(loaded.generation_floor) && (loaded.generation_floor as number) >= 1
-          ? (loaded.generation_floor as number)
-          : undefined;
-      const nextFloor =
+      const priorFloor = floorInfo.validFloor;
+      let nextFloor =
         priorFloor !== undefined || removedGenerationMax !== undefined
           ? Math.max(priorFloor ?? 0, removedGenerationMax ?? 0)
           : undefined;
+      // Fix-round-6 F1: RESOLVE a preserved malformed floor. Parseable raw:
+      // fold the recovered value in (monotone). Unrecoverable raw: reset the
+      // floor to the maximum generation still observable across surviving
+      // entries + tombstones (+ anything removed above) -- no invented safety
+      // margin; the honest bound is "at least every generation we can still
+      // see". The caller must report the reset loudly (the original floor was
+      // unrecoverable; re-provision is advised). Either way the raw is
+      // consumed here: the repaired state carries no `generation_floor_raw`,
+      // which un-sticks the dirty marker.
+      let floorRepair: PfAnchorQuarantineRepairResult["floorRepair"];
+      if (floorInfo.raw !== undefined) {
+        if (floorInfo.rawParsed !== null) {
+          nextFloor = Math.max(nextFloor ?? 0, floorInfo.rawParsed);
+          floorRepair = {
+            raw: floorInfo.raw,
+            parsed: floorInfo.rawParsed,
+            resolved_floor: nextFloor,
+            unrecoverable: false,
+          };
+        } else {
+          const maxObservedGeneration = next.reduce(
+            (max, entry) => Math.max(max, entry.generation_id ?? 0),
+            0,
+          );
+          const reset = Math.max(nextFloor ?? 0, maxObservedGeneration);
+          nextFloor = reset >= 1 ? reset : undefined;
+          floorRepair = {
+            raw: floorInfo.raw,
+            parsed: null,
+            resolved_floor: nextFloor ?? null,
+            unrecoverable: true,
+          };
+        }
+      }
       if (nextFloor !== undefined) {
         state.generation_floor = nextFloor;
       }
       await this.applyUnion(state, next);
       await this.store.save(state);
-      return { repaired: true, findings, forensicPath, remaining: next };
+      return {
+        repaired: true,
+        findings,
+        forensicPath,
+        remaining: next,
+        ...(floorRepair !== undefined ? { floorRepair } : {}),
+      };
     });
   }
 
@@ -896,9 +1094,12 @@ export class PfAnchorRegistry {
         forwardReleased = await this.applyUnion(state, desired);
         state.committed = desired;
         delete state.pending;
-        delete state.dirty;
+        clearDirtyUnlessFloorRepairOwed(state);
         await this.store.save(state);
-        return { committed: state.committed, dirty: false };
+        // Fix-round-6 F1: report the REAL post-mutation dirtiness -- a sticky
+        // malformed-floor raw keeps the registry dirty through a successful
+        // mutation, and the caller must not read that as clean.
+        return { committed: state.committed, dirty: state.dirty === true };
       } catch (applyErr) {
         // Roll back to the previous committed union. Throws
         // PfAnchorRegistryDirtyError if the rollback itself fails.
@@ -959,7 +1160,7 @@ export class PfAnchorRegistry {
       if (state.dirty || state.pending !== undefined) {
         try {
           await this.applyUnion(state, []); // disarm: `-F all` + release token
-          delete state.dirty;
+          clearDirtyUnlessFloorRepairOwed(state);
           delete state.pending;
           await this.store.save(state);
         } catch (repairErr) {
@@ -980,7 +1181,7 @@ export class PfAnchorRegistry {
     // Drift (or a leftover dirty/pending marker): re-assert the committed set.
     try {
       await this.applyUnion(state, state.committed);
-      delete state.dirty;
+      clearDirtyUnlessFloorRepairOwed(state);
       delete state.pending;
       await this.store.save(state);
     } catch (repairErr) {
@@ -1043,7 +1244,7 @@ export class PfAnchorRegistry {
         state.committed = previousCommitted;
       }
       delete state.pending;
-      delete state.dirty;
+      clearDirtyUnlessFloorRepairOwed(state);
       await this.store.save(state);
     } catch (rollbackErr) {
       state.dirty = true;

@@ -516,6 +516,11 @@ export async function runEgressGateRepair(
           // the audit record too (kept vs removed generation).
           ...(f.duplicate !== undefined ? { duplicate: f.duplicate } : {}),
         })),
+        // Fix-round-6 F1: a repaired malformed generation floor is loud in the
+        // audit record (raw evidence, best-effort parse, resolved floor).
+        ...(quarantine.floorRepair !== undefined
+          ? { generation_floor_repair: quarantine.floorRepair }
+          : {}),
       });
       for (const f of quarantine.findings) {
         const uidText = f.agent_uid !== null ? `uid ${f.agent_uid}` : "an unrecoverable uid";
@@ -541,6 +546,27 @@ export async function runEgressGateRepair(
             duplicateText +
             ` Raw entry preserved for forensics at ${quarantine.forensicPath}. The affected agent ` +
             "must be RE-PROVISIONED (sudo sanctuary protect) before its gate can serve again.",
+        );
+      }
+      // Fix-round-6 F1: a repaired malformed generation floor is LOUD --
+      // especially the unrecoverable case, where the reset floor is only "the
+      // maximum generation still observable" and the original may have been
+      // higher.
+      if (quarantine.floorRepair !== undefined) {
+        const fr = quarantine.floorRepair;
+        ops.print(
+          fr.unrecoverable
+            ? "The registry's persisted generation floor was malformed and its original value is " +
+                `UNRECOVERABLE (raw ${JSON.stringify(fr.raw)} did not parse as a number). The floor ` +
+                "was reset to the maximum generation still observable across committed entries and " +
+                `tombstones (${fr.resolved_floor ?? "none observable; no floor persisted"}). The ` +
+                "original floor may have been higher, so RE-PROVISIONING the confined agents " +
+                "(sudo sanctuary protect) is advised: it allocates a fresh generation above " +
+                "everything observable, so no stale generation artifact can masquerade as current. " +
+                `Pre-repair bytes preserved at ${quarantine.forensicPath}.`
+            : "The registry's persisted generation floor was malformed; its preserved raw value " +
+                `${JSON.stringify(fr.raw)} parsed to ${fr.parsed} and was folded into the repaired ` +
+                `floor (${fr.resolved_floor}). Pre-repair bytes preserved at ${quarantine.forensicPath}.`,
         );
       }
     }
