@@ -616,7 +616,9 @@ describe("Standalone Dashboard", () => {
     const noAuthBody = await noAuth.text();
     expect(noAuthBody).toMatch(/Auth Token/);
     expect(noAuthBody).toMatch(/Session tokens expire/);
-    expect(noAuthBody).not.toContain("Sovereignty Posture");
+    // S2 (2026-07-18): posture page identity renamed "Sovereignty Posture" ->
+    // "Security Posture" (copy rule). The login page is not the posture shell.
+    expect(noAuthBody).not.toContain("Security Posture");
 
     // The v1.1 SPA aliases get the same login affordance.
     const aliasNoAuth = await fetch(`${base}/dashboard`);
@@ -633,7 +635,8 @@ describe("Standalone Dashboard", () => {
     expect(authed.status).toBe(200);
     const authedBody = await authed.text();
     expect(authedBody).toContain('id="main"');
-    expect(authedBody).not.toContain("Sovereignty Posture");
+    // S2: the v1.1 concierge surface is not the posture shell.
+    expect(authedBody).not.toContain("Security Posture");
     expect(authedBody).not.toMatch(/Session tokens expire/);
 
     // SECURITY: the data routes still require the token regardless of the
@@ -686,13 +689,15 @@ describe("Standalone Dashboard", () => {
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain('id="main"');
-    expect(body).not.toContain("Sovereignty Posture");
+    // S2: the v1.1 concierge surface is not the posture shell.
+    expect(body).not.toContain("Security Posture");
     expect(body).not.toMatch(/Auth Token/);
     expect(body).not.toMatch(/Session tokens expire/);
 
     // The posture board is preserved at /posture (frozen surface).
     const postureRes = await fetch(`http://127.0.0.1:${result.port}/posture`);
     expect(postureRes.status).toBe(200);
-    expect(await postureRes.text()).toContain("Sovereignty Posture");
+    // S2: page identity renamed "Sovereignty Posture" -> "Security Posture".
+    expect(await postureRes.text()).toContain("Security Posture");
   });
 });

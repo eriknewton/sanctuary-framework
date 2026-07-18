@@ -152,26 +152,28 @@ describe("v1.1 dashboard shell HTML", () => {
     expect(combined.toLowerCase()).not.toContain("forward secrecy via mls");
   });
 
-  it("renders the binary version pill in the topbar (Finding CCC, v1.2.0-rc.3)", () => {
+  it("renders the binary version pill (Finding CCC, v1.2.0-rc.3)", () => {
     const html = renderDashboardV11Html({ sanctuaryVersion: "1.2.0-rc.3" });
-    // Pill is server-rendered alongside deployment / mode / attestation.
+    // S2 (2026-07-18): the version / deployment / mode / attestation chips
+    // moved off the top bar into the sidebar footer so the top bar carries
+    // one overall state pill. The pill stays in the same flex container.
     expect(html).toContain('data-pill="version"');
     expect(html).toContain("v1.2.0-rc.3");
-    // The pill stays in the same flex container as the other pills.
-    const topbarMatch = html.match(/<div class="pills" id="topbar-pills">[\s\S]*?<\/div>/);
-    expect(topbarMatch).toBeTruthy();
-    expect(topbarMatch![0]).toContain('data-pill="version"');
-    expect(topbarMatch![0]).toContain('data-pill="deployment"');
+    const pillsMatch = html.match(/<div class="pills" id="topbar-pills">[\s\S]*?<\/div>/);
+    expect(pillsMatch).toBeTruthy();
+    expect(pillsMatch![0]).toContain('data-pill="version"');
+    expect(pillsMatch![0]).toContain('data-pill="deployment"');
   });
 
-  it("renders a clickable Fleet Switcher link to /fleet in the topbar (C1 Finding 4)", () => {
+  it("renders a clickable link to /fleet as the Machines nav item (C1 Finding 4; S2 reorder)", () => {
     const html = renderDashboardV11Html({});
+    // S2: the Fleet Switcher moved from a top-bar link to the "Machines" item
+    // in the sidebar nav spine. The /fleet route stays reachable, unremoved.
     expect(html).toMatch(/<a[^>]+href="\/fleet"[^>]*>/);
-    expect(html).toContain("Fleet Switcher");
-    // The affordance lives in the topbar so an operator lands on it.
-    const topbarMatch = html.match(/<header class="topbar">[\s\S]*?<\/header>/);
-    expect(topbarMatch).toBeTruthy();
-    expect(topbarMatch![0]).toContain('href="/fleet"');
+    const navMatch = html.match(/<nav id="sidebar-nav">[\s\S]*?<\/nav>/);
+    expect(navMatch).toBeTruthy();
+    expect(navMatch![0]).toContain('href="/fleet"');
+    expect(navMatch![0]).toContain("Machines");
   });
 
   it("falls back to the package binary version when sanctuaryVersion is unset", () => {

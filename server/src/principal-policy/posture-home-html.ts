@@ -143,7 +143,7 @@ export function renderPostureHomeHTML(): string {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Sanctuary - Sovereignty Posture</title>
+<title>Sanctuary - Security Posture</title>
 <script>${THEME_BOOTSTRAP_SCRIPT}</script>
 <style>
   ${POSTURE_ROOT_TOKENS_CSS}
@@ -244,7 +244,7 @@ export function renderPostureHomeHTML(): string {
 <header>
   <div class="header-row">
     <div class="header-titles">
-      <h1>Sanctuary - Sovereignty Posture</h1>
+      <h1>Sanctuary - Security Posture</h1>
       <div class="sub" id="origin">Loading…</div>
       <div class="conn" id="conn">
         <span class="dot"></span>

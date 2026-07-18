@@ -171,12 +171,14 @@ describe("DashboardApprovalChannel v1.1 routing (hotfix)", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/text\/html/);
     const html = await res.text();
-    // Concierge SPA markers: the v1.1 shell mounts on #main and carries the
-    // Talk hero + grouped sidebar. It is NOT the standalone posture board shell
-    // (which would fetch /api/posture/home directly from its own static page).
+    // v1.1 SPA markers: the shell mounts on #main and carries the grouped
+    // sidebar nav. It is NOT the standalone posture board shell (which would
+    // fetch /api/posture/home directly from its own static page). S2
+    // (2026-07-18): the SPA now lands on the posture Overview (data-route
+    // "posture") rather than the concierge; Talk stays reachable in the nav.
     expect(html).toContain('id="main"');
-    expect(html).toContain("nav-talk");
-    // The folded-in Posture entry is reachable from the single surface.
+    expect(html).toContain('id="sidebar-nav"');
+    // The posture Overview is the landing surface on this single shell.
     expect(html).toContain('data-route="posture"');
   });
 

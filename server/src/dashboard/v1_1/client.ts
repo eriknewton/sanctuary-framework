@@ -53,7 +53,10 @@ const SESSION_KEY = "sanctuary-v11-sidebar";
 
 // ── State ──────────────────────────────────────────────────────────────
 const state = {
-  route: "dashboard",
+  // Posture-first landing (S2, 2026-07-18): the SPA opens on the posture
+  // Overview board ("How safe you are right now"), not the concierge. Talk
+  // stays fully reachable at the frozen "dashboard" route via the Assist nav.
+  route: "posture",
   agents: [],
   inbox: [],
   inboxOps: {
@@ -3445,8 +3448,8 @@ function rerender() {
 // ── Wire-up: events ────────────────────────────────────────────────────
 function bindHashRoute() {
   function fromHash() {
-    const h = (location.hash || "#dashboard").slice(1);
-    setRoute(h.split("?")[0] || "dashboard");
+    const h = (location.hash || "#posture").slice(1);
+    setRoute(h.split("?")[0] || "posture");
   }
   window.addEventListener("hashchange", fromHash);
   fromHash();
@@ -3493,6 +3496,19 @@ document.addEventListener("click", function (ev) {
     const next = isDark ? "light" : "dark";
     sessionStorage.setItem(THEME_KEY, next);
     applyTheme(next);
+    return;
+  }
+  // S2 (2026-07-18): copy the full machine id to the clipboard. The top bar
+  // shows a human machine name with the id demoted to a short mono chip; the
+  // chip copies the untruncated id so operators can paste it verbatim.
+  if (action === "copy-fortress-id") {
+    const id = tgt.getAttribute("data-fortress-id") || "";
+    if (id && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(id).then(
+        function () { toast("Machine id copied.", "info"); },
+        function () { toast("Could not copy machine id.", "error"); }
+      );
+    }
     return;
   }
   // Wave 1: agent switcher + posture seal (top-bar popovers).
