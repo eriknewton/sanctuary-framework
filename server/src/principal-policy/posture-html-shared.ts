@@ -41,6 +41,36 @@ export const AGENT_PILL_FN_SOURCE = `function agentPill(row) {
   }`;
 
 /**
+ * The shared relative-time formatter for freshness stamps ("checked 14s ago").
+ *
+ * S3 evidence spine: every posture claim on screen should say how recently it
+ * was checked, and a freshness stamp is only trustworthy if it means the same
+ * thing on every surface. Four near-identical `Ns/m/h/d ago` ladders already
+ * existed in this codebase with divergent null/NaN handling; this constant is
+ * the single source the posture pages interpolate so the wording of "how fresh"
+ * cannot drift per surface.
+ *
+ * Honesty contract, and the reason this is NOT a copy of the v1.1 client's
+ * `relTimeFromIso`: an absent or unparseable timestamp returns the EMPTY string,
+ * never the raw input and never a fabricated age. Call sites are responsible for
+ * rendering an explicit "no evidence yet" when they get "" back, so a missing
+ * check can never be mistaken for a recent one. `Math.max(0, ...)` clamps a
+ * future-dated timestamp (clock skew) to "0s ago" rather than a negative age.
+ */
+export const REL_TIME_FN_SOURCE = `function relTime(iso) {
+    if (!iso) return "";
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    var sec = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+    if (sec < 60) return sec + "s ago";
+    var min = Math.floor(sec / 60);
+    if (min < 60) return min + "m ago";
+    var hr = Math.floor(min / 60);
+    if (hr < 24) return hr + "h ago";
+    return Math.floor(hr / 24) + "d ago";
+  }`;
+
+/**
  * The shared design-token block for the three posture pages (Home, per-agent
  * drill-down, Evidence view). This is now the canonical "paper/ink" token
  * block - the SAME `PAPER_INK_ROOT_TOKENS_CSS` the v1.1 dashboard and the Fleet
@@ -100,3 +130,31 @@ export const STATUS_PILL_CSS = `.pill {
   .pill.neutral::before { content: "\\25CB"; }
   .pill.unknown { background: var(--slate-bg); color: var(--slate); border: 1px dashed var(--slate); }
   .pill.unknown::before { content: "\\25CC"; }`;
+
+/**
+ * The shared evidence-spine CSS: the denominator, freshness stamp, and
+ * evidence-link treatments that hang off a posture tile or panel row.
+ *
+ * S3 makes three things visible on every claim the pages already have data for:
+ * a denominator ("2 of 3"), a freshness stamp ("checked 14s ago"), and a link
+ * to the evidence behind the number. The denominator renders in a lighter,
+ * smaller sans face beside the value so the big number still reads first;
+ * the freshness stamp is mono (it is a measurement, not prose); the evidence
+ * link uses the informational indigo, never a status hue, so it can never be
+ * mistaken for a state signal.
+ *
+ * `--slate` is deliberate for `.stat-fresh.none`: an absent freshness stamp is
+ * the unknown treatment, not a warning and never a pass.
+ */
+export const EVIDENCE_SPINE_CSS = `.stat-of {
+    font-size: 11px; font-weight: 400; color: var(--ink-3); margin-left: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .stat-foot {
+    margin-top: auto; padding-top: 6px; display: flex; align-items: baseline;
+    justify-content: space-between; gap: 8px; flex-wrap: wrap;
+  }
+  .stat-fresh { font-family: var(--mono, monospace); font-size: 10px; color: var(--ink-4, var(--ink-3)); white-space: nowrap; }
+  .stat-fresh.none { color: var(--slate); }
+  .stat-ev { font-size: 10.5px; color: var(--indigo); text-decoration: none; white-space: nowrap; }
+  .stat-ev:hover { text-decoration: underline; }`;

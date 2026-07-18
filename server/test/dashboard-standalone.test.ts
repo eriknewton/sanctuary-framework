@@ -616,8 +616,8 @@ describe("Standalone Dashboard", () => {
     const noAuthBody = await noAuth.text();
     expect(noAuthBody).toMatch(/Auth Token/);
     expect(noAuthBody).toMatch(/Session tokens expire/);
-    // S2 (2026-07-18): posture page identity renamed "Sovereignty Posture" ->
-    // "Security Posture" (copy rule). The login page is not the posture shell.
+    // S2 (2026-07-18): the posture page identity is "Security Posture" (copy
+    // rule; renamed off the retired term). The login page is not that shell.
     expect(noAuthBody).not.toContain("Security Posture");
 
     // The v1.1 SPA aliases get the same login affordance.
@@ -697,7 +697,8 @@ describe("Standalone Dashboard", () => {
     // The posture board is preserved at /posture (frozen surface).
     const postureRes = await fetch(`http://127.0.0.1:${result.port}/posture`);
     expect(postureRes.status).toBe(200);
-    // S2: page identity renamed "Sovereignty Posture" -> "Security Posture".
+    // S2: the posture page identity is "Security Posture" (renamed off the
+    // retired term, which must never appear on screen).
     expect(await postureRes.text()).toContain("Security Posture");
   });
 });
