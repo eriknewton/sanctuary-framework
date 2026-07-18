@@ -484,6 +484,105 @@ describe("Castle Wall macOS daemon integration", () => {
     }
   });
 
+  it("fires a LOUD audit_emission_stall when decisions continue but emission stops (Slice M watchdog)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    // Capture the consumer the daemon builds so we can drive decisions whose
+    // emission we then sabotage, reproducing the 07-17 decided-but-not-emitted
+    // divergence at the daemon layer.
+    let captured: { consumer: MacOSCastleWallListenerOptions["consumer"] } | null = null;
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      // Small grace + fast tick so the stall fires within the test window.
+      emissionStallGraceMs: 20,
+      emissionLivenessTickSeconds: 0.01,
+      listenerFactory(options) {
+        captured = { consumer: options.consumer };
+        return fakeListenerFactory(options);
+      },
+    });
+
+    expect(captured).not.toBeNull();
+    const consumer = captured!.consumer;
+
+    // Drive two malformed decisions: each is a DECISION (noted) that is
+    // REJECTED (never emitted), so the watchdog sees decided-without-emission.
+    const malformed = {
+      type: "flow_decision_recorded",
+      decision: "INVALID",
+      destination: { host: "x", ip: "1.2.3.4", port: 443, protocol: "tcp", hostname_source: null, opaque: false },
+      agent: { id: "agent-stall", template: "ops-runner" },
+      matched_rule_id: null,
+      recorded_at: "2026-05-11T12:01:00Z",
+    } as unknown as Parameters<typeof consumer.handleFlowDecisionRecorded>[0];
+    await consumer.handleFlowDecisionRecorded(malformed);
+    await consumer.handleFlowDecisionRecorded(malformed);
+
+    // Wait for the grace window to elapse and the tick to evaluate.
+    await wait(120);
+    await handle.stop();
+
+    const stalls = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "audit_emission_stall");
+    expect(stalls.length).toBeGreaterThanOrEqual(1);
+    const details = stalls[0].details as Record<string, unknown>;
+    expect(stalls[0].result).toBe("failure");
+    expect(details[CASTLE_WALL_AUDIT_PROVENANCE_KEY]).toBe(
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    );
+    expect(details.decided_since_last_emission).toBeGreaterThanOrEqual(2);
+    expect(details.emitted_total).toBe(0);
+  });
+
+  it("does NOT fire audit_emission_stall on a healthy interleaved decided/emitted stream (Slice M watchdog)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    let captured: { consumer: MacOSCastleWallListenerOptions["consumer"] } | null = null;
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      emissionStallGraceMs: 20,
+      emissionLivenessTickSeconds: 0.01,
+      listenerFactory(options) {
+        captured = { consumer: options.consumer };
+        return fakeListenerFactory(options);
+      },
+    });
+    const consumer = captured!.consumer;
+
+    // Well-formed allow decisions persist as emissions on the channel path, so
+    // the anchor resets each time and no stall accrues.
+    const good = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: { host: "api.anthropic.com", ip: "104.18.32.10", port: 443, protocol: "tcp", hostname_source: "sni", opaque: false },
+      agent: { id: "agent-live", template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: "2026-05-11T12:00:00Z",
+    } as unknown as Parameters<typeof consumer.handleFlowDecisionRecorded>[0];
+    for (let i = 0; i < 5; i += 1) {
+      await consumer.handleFlowDecisionRecorded(good);
+      await wait(10);
+    }
+    await wait(60);
+    await handle.stop();
+
+    const stalls = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "audit_emission_stall");
+    expect(stalls.length).toBe(0);
+  });
+
   it("stops emitting heartbeats after the daemon is stopped (same teardown as the lease heartbeat)", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress();
     const handle = await startMacOSCastleWallDaemon({

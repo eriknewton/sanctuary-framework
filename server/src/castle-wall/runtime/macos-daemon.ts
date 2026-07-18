@@ -702,8 +702,9 @@ export async function startMacOSCastleWallDaemon(
       );
       await input.auditLog.flush();
     })().catch((err: unknown) => {
-      // Never crash the daemon, never mask the alarm: the stderr line has
-      // already fired before this append was attempted.
+      // SAFETY: never crash the daemon, never mask the alarm; the stderr line
+      // has already fired before this append was attempted, so this is a
+      // best-effort diagnostic for a failed audit write, not the alarm itself.
       console.error(
         `${EMISSION_STALL_LOG_PREFIX} ${operation} audit write failed (non-fatal; stderr line above is the alarm): ${
           err instanceof Error ? err.message : String(err)
@@ -717,6 +718,9 @@ export async function startMacOSCastleWallDaemon(
       ? { graceMs: input.emissionStallGraceMs }
       : {}),
     onStall: (finding: EmissionStallFinding) => {
+      // SAFETY: this stderr line IS the loud alarm the divergence detector
+      // exists to raise; it fires unconditionally, before any audit write, so
+      // a wedged/failing audit store can never suppress the operator signal.
       console.error(
         `${EMISSION_STALL_LOG_PREFIX} enforcement decisions continue but audit emission has STOPPED: decided_since_last_emission=${finding.decidedSinceLastEmission} decided_total=${finding.decidedTotal} emitted_total=${finding.emittedTotal} rejected_total=${finding.rejectedTotal} ms_since_last_emission=${finding.msSinceLastEmissionMs ?? "never"} sources=${JSON.stringify(finding.decidedBySource)}`,
       );
@@ -736,6 +740,9 @@ export async function startMacOSCastleWallDaemon(
       );
     },
     onRecovery: (finding: EmissionRecoveryFinding) => {
+      // SAFETY: recovery is operator-relevant state (the stall cleared), so it
+      // uses the same stderr operator channel as the stall alarm above; it
+      // fires before the paired recovered audit write.
       console.error(
         `${EMISSION_STALL_LOG_PREFIX} audit emission RECOVERED after ${finding.stallDurationMs}ms (decided_during_stall=${finding.decidedDuringStall})`,
       );
@@ -1027,6 +1034,9 @@ export async function startMacOSCastleWallDaemon(
       try {
         emissionLivenessWatchdog.evaluate();
       } catch (err) {
+        // SAFETY: a throwing evaluate (e.g. a throwing onStall callback) must
+        // never take down enforcement; surface it on the operator channel and
+        // continue ticking.
         console.error(
           `${EMISSION_STALL_LOG_PREFIX} watchdog evaluation failed (non-fatal): ${
             err instanceof Error ? err.message : String(err)

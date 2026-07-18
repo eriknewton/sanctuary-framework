@@ -287,6 +287,10 @@ export class MacOSFlowEventConsumer {
           this.emissionLiveness?.noteRejection(
             `audit_chain:${err.message}`
           );
+          // SAFETY: the AuditChainError swallow used to be stderr-silent; a
+          // rejection burst is a decided-but-not-emitted divergence and must
+          // leave one greppable operator line (the rejection entry itself is
+          // already durably recorded by the consumer before the throw).
           console.error(
             `${EMISSION_STALL_LOG_PREFIX} flow_decision_recorded rejected by the audit chain gate (recorded as a rejection entry, NOT persisted as evidence): ${err.message}`
           );
