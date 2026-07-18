@@ -19,14 +19,28 @@
  * own honesty logic decides every pill and every rendered claim from these
  * payloads exactly as it would from the live daemon.
  */
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { renderPostureHomeHTML } from "../src/principal-policy/posture-home-html.js";
 import { renderPostureAgentHTML } from "../src/principal-policy/posture-agent-html.js";
 import { renderPostureEvidenceHTML } from "../src/principal-policy/posture-evidence-html.js";
 import { generateFleetSwitcherHTML } from "../src/principal-policy/dashboard-html.js";
 import { renderDashboardV11Html } from "../src/dashboard/v1_1/html.js";
 
-const OUT = process.argv[2] || "/tmp/s3-shots";
+/**
+ * Output directory. An explicit path is used as given; with no argument we mint
+ * a fresh unique directory via mkdtempSync rather than defaulting to a fixed
+ * name in the shared OS temp dir.
+ *
+ * A predictable shared-temp path (the old `/tmp/s3-shots`) is hijackable on a
+ * multi-user host: another user can pre-create the directory or plant symlinks
+ * at the filenames this script is about to write, redirecting the writes.
+ * mkdtempSync creates a 0700 directory with a random suffix that cannot be
+ * guessed or pre-created, so there is nothing to race. Flagged by CodeQL
+ * js/insecure-temporary-file; this is the real fix, not a suppression.
+ */
+const OUT = process.argv[2] ?? mkdtempSync(join(tmpdir(), "sanctuary-s3-shots-"));
 mkdirSync(OUT, { recursive: true });
 
 const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
