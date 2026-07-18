@@ -47,6 +47,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { PfAnchorRegistry, createFsRegistryStore } from "./anchor-registry.js";
+import type { PfLivenessResult } from "./pf-anchor.js";
 import {
   GenerationCoordinator,
   bindEphemeralGatePort,
@@ -668,6 +669,14 @@ export async function bootstrapGateDaemonForBoot(input: {
  * The production S5-5 barrier ops for one agent. `rearm` distinguishes the
  * install path (pf armed at G3: no-op ok) from the boot path (re-assert the
  * registry union).
+ *
+ * REGISTRY READS ARE QUARANTINE-AWARE (fix-round-3 MED-3): every registry
+ * read here routes through `listQuarantined`, so ONE malformed sibling entry
+ * no longer throws this uid's whole release into the outer catch
+ * (park-not-verified with no ops verified). The valid uid proceeds through
+ * the barrier's own fail-closed machinery (a quarantine forces `dirty`, so
+ * gate-verify still refuses to RELEASE until repair), and each quarantined
+ * sibling is reported loudly via `print`.
  */
 export function createProductionReleaseBarrierOps(input: {
   agentUid: number;
@@ -678,11 +687,44 @@ export function createProductionReleaseBarrierOps(input: {
   gateUid: number;
   oracle: GateLivenessOracle;
   rearm: "install-noop" | "boot-rearm";
+  /** Loud sink for quarantined-sibling findings (fix-round-3 MED-3). */
+  print?: (line: string) => void;
+  /** TEST-ONLY seams; production omits (real fs registry + pfctl probe). */
+  internals?: {
+    registry?: PfAnchorRegistry;
+    probeAnchorLiveness?: (policy: { agent_uid: number; gate_port: number }) => Promise<PfLivenessResult>;
+  };
 }): ReleaseBarrierOps {
-  const registry = createProductionAnchorRegistry();
+  const registry = input.internals?.registry ?? createProductionAnchorRegistry();
+  const probeAnchorLiveness =
+    input.internals?.probeAnchorLiveness ??
+    ((policy: { agent_uid: number; gate_port: number }): Promise<PfLivenessResult> =>
+      checkPfAnchorLiveness(createExecFilePfRunner(), policy));
+  const print = input.print ?? ((): void => undefined);
   const staging = createFsGenerationStagingStore();
   const harnessOps = realHarnessOps();
   const holdPath = holdFilePathForUid(input.agentUid);
+
+  /**
+   * One quarantine-aware registry snapshot (fix-round-3 MED-3): valid entries
+   * + the registry-level dirty bit stay usable; every quarantined sibling is
+   * individually loud. Structural corruption still throws (nothing salvageable).
+   */
+  async function listQuarantineAware(context: string): Promise<{
+    entries: { agent_uid: number; gate_port: number; fortress_path: string; generation_id?: number; tombstone?: boolean }[];
+    dirty: boolean;
+    quarantined: { index: number; reason: string }[];
+  }> {
+    const listed = await registry.listQuarantined();
+    for (const q of listed.quarantined) {
+      print(
+        `[castle-wall] release barrier (uid ${input.agentUid}, ${context}): registry entry #${q.index} ` +
+          `is malformed and QUARANTINED (${q.reason}); uid ${input.agentUid}'s valid entry proceeds ` +
+          "through the barrier's own fail-closed checks; repair is owed: sudo sanctuary protect --repair-egress-gate",
+      );
+    }
+    return listed;
+  }
 
   async function writePlist(expectedGenerationId: number): Promise<void> {
     const plan = planParkedHarnessInstall({
@@ -715,7 +757,7 @@ export function createProductionReleaseBarrierOps(input: {
   }
 
   async function readCommitted(): Promise<CommittedGenerationIdentity | null> {
-    return readCommittedFrom(await registry.list());
+    return readCommittedFrom(await listQuarantineAware("commit-generation"));
   }
 
   return {
@@ -758,10 +800,33 @@ export function createProductionReleaseBarrierOps(input: {
     async rearmAnchor(): Promise<{ ok: true } | { ok: false; reason: string }> {
       if (input.rearm === "install-noop") return { ok: true };
       try {
-        const { entries } = await registry.list();
-        const entry = entries.find((e) => e.agent_uid === input.agentUid);
+        // Quarantine-aware read (fix-round-3 MED-3): a malformed SIBLING
+        // entry no longer throws this uid's rearm into a bare failure.
+        const listed = await listQuarantineAware("rearm-anchor");
+        const entry = listed.entries.find((e) => e.agent_uid === input.agentUid);
         if (entry === undefined) {
           return { ok: false, reason: `no registry entry for uid ${input.agentUid}` };
+        }
+        if (listed.quarantined.length > 0) {
+          // A quarantined sibling means the FULL committed union cannot be
+          // read, and every registry MUTATION refuses a partially-valid
+          // baseline by design (re-rendering a partial union could DROP the
+          // quarantined uid's live block rules from the anchor -- fail-open).
+          // So instead of re-arming, VERIFY this uid's rules are live
+          // AS-ARMED: live means there is nothing to re-arm for this uid and
+          // the release proceeds to gate-verify (which still refuses over
+          // the dirty registry until repair); not-live fails LOUD -- never a
+          // partial union re-render.
+          const live = await probeAnchorLiveness({ agent_uid: entry.agent_uid, gate_port: entry.gate_port });
+          if (live.live) return { ok: true };
+          return {
+            ok: false,
+            reason:
+              `uid ${input.agentUid}'s pf anchor rules are not live (${live.reasons.join("; ")}) and a ` +
+              `quarantined registry entry (#${listed.quarantined.map((q) => q.index).join(", #")}) blocks a ` +
+              "safe union re-arm (a partial re-render could drop the quarantined uid's block rules); " +
+              "repair: sudo sanctuary protect --repair-egress-gate",
+          };
         }
         // Re-assert the committed union (idempotent add/update re-renders +
         // re-loads + re-verifies per-uid liveness through the locked registry).
@@ -775,8 +840,11 @@ export function createProductionReleaseBarrierOps(input: {
       { ok: true; observed: CommittedGenerationIdentity } | { ok: false; reasons: string[] }
     > {
       const reasons: string[] = [];
-      // ONE registry snapshot for the whole verify (fix-round-2 LOW-7).
-      const listed = await registry.list();
+      // ONE registry snapshot for the whole verify (fix-round-2 LOW-7),
+      // quarantine-aware (fix-round-3 MED-3): a malformed sibling entry is
+      // loud + this uid's verify proceeds; the quarantine forces `dirty`,
+      // which the check below turns into an honest parked reason.
+      const listed = await listQuarantineAware("gate-verify");
       const { dirty } = listed;
       const entry = listed.entries.find((e) => e.agent_uid === input.agentUid) ?? null;
       const committed = await readCommittedFrom(listed);
@@ -900,6 +968,7 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
           gateUid: s.gateUid,
           oracle: o,
           rearm: "install-noop",
+          print: input.print,
         }),
       );
     },
@@ -1315,6 +1384,16 @@ export interface QuarantinedBootRegistryEntry {
 export interface BootRegistryListing {
   entries: BootRegistryEntry[];
   quarantined: QuarantinedBootRegistryEntry[];
+  /**
+   * Registry-level needs-repair bit (fix-round-3 HIGH-2): true on a
+   * quarantined entry, a journaled pending set, an explicit dirty marker, or
+   * a missing enable token. While dirty, the live pf anchor may DIVERGE from
+   * the committed union, and the per-uid liveness probe behind the oracle
+   * refresh cannot rule out EXTRA permissive rules -- so the refresh loop
+   * WITHHOLDS freshness tokens (the gate denies within one TTL, fail-closed)
+   * instead of re-signing liveness nobody can verify.
+   */
+  dirty: boolean;
 }
 
 /**
@@ -1461,7 +1540,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
       // OTHER agent (a wholesale-throwing read was a mass egress denial
       // within one token TTL). Structural corruption still throws.
       const listed = await createProductionAnchorRegistry().listQuarantined();
-      return { entries: listed.entries, quarantined: listed.quarantined };
+      return { entries: listed.entries, quarantined: listed.quarantined, dirty: listed.dirty };
     });
   const launchctlFn = internals.runLaunchctlFn ?? runLaunchctl;
   const runBarrier = internals.runBarrier ?? runReleaseBarrierSequence;
@@ -1591,6 +1670,29 @@ export async function startExclusiveEgressBootSupervisor(input: {
                 `harness label ${AGENT_HARNESS_DAEMON_LABEL} were SKIPPED because uid(s) ` +
                 `${resolvedUids.join(", ")} resolved for release on that same host-singleton label.`,
             );
+            // Fix-round-3 HIGH-1: with bootout withheld, NOTHING above stopped
+            // a harness already running from stale launchd state -- hold-file
+            // removal blocks only the NEXT start (the exec wrapper), never a
+            // live process. VERIFY not-running (the same launchd status probe
+            // the repair path's park verify uses) before claiming PARKED; a
+            // running or unknowable job is a LOUD park-not-verified (the
+            // throw below maps to that distinct outcome), never a silent
+            // PARKED report over a live process. This probe runs BEFORE any
+            // resolved uid's release (phase-2 ordering), so a running job
+            // here is stale state by construction, not a fresh release.
+            const status = await agentHarnessDaemonStatus({ ...realHarnessOps(), runLaunchctl: launchctlFn });
+            if (!status.known || status.running) {
+              throw new Error(
+                `uid ${agentUid} re-park NOT verified: ` +
+                  (status.known
+                    ? `the shared harness job ${AGENT_HARNESS_DAEMON_LABEL} reports RUNNING (pid ${status.pid ?? "unknown"})`
+                    : `launchctl did not return a trustworthy status for the shared harness job ${AGENT_HARNESS_DAEMON_LABEL}`) +
+                  ` while bootout/disable were withheld (uid(s) ${resolvedUids.join(", ")} resolved for ` +
+                  "release on that host-singleton label); the hold file was removed so the exec wrapper " +
+                  "refuses any NEW start, but a process already running from stale launchd state was NOT " +
+                  "stopped; intervene manually",
+              );
+            }
           }
           if (reassert.cleanupErrors.length > 0) {
             input.print(
@@ -1644,18 +1746,45 @@ export async function startExclusiveEgressBootSupervisor(input: {
           );
         }
         const oracle = createOracle(keys.privateKey, ctx.gateUid);
+        const barrierOps = createBarrierOps({
+          agentUid,
+          agentAccount: ctx.agentAccount,
+          harnessArgv: ctx.harnessArgv,
+          fortressPath: entry.fortress_path,
+          harnessLogDir: ctx.harnessLogDir,
+          gateUid: ctx.gateUid,
+          oracle: oracle as GateLivenessOracle,
+          rearm: "boot-rearm",
+          print: input.print,
+        });
+        // Fix-round-3 MED-4: the release context (fortressPath, harnessArgv,
+        // gateUid) was resolved from THIS registry entry in phase 1. Between
+        // that resolution and the barrier's release, a concurrent repair or
+        // install for the same uid can commit a NEW generation -- the barrier
+        // would then verify the new generation while releasing with the STALE
+        // resolved context. Capture the entry's committed generation at
+        // resolution time and re-check it at the commit step (immediately
+        // before any release surface is written): a mismatch THROWS, which
+        // the barrier maps to a loud fail-closed park at commit-generation.
+        const resolvedGenerationId = entry.generation_id;
+        const guardedOps: ReleaseBarrierOps = {
+          ...barrierOps,
+          commitGeneration: async (): Promise<CommittedGenerationIdentity> => {
+            const committed = await barrierOps.commitGeneration();
+            if (committed.generation_id !== resolvedGenerationId) {
+              throw new Error(
+                `registry changed during boot release for uid ${agentUid}: resolution captured committed ` +
+                  `generation ${resolvedGenerationId ?? "none"} but the registry now commits generation ` +
+                  `${committed.generation_id} (a concurrent install/repair advanced it); the resolved ` +
+                  "release context may be stale; parking fail-closed -- re-run the boot release or repair",
+              );
+            }
+            return committed;
+          },
+        };
         return runBarrier(
           { agentUid, harnessLabel: AGENT_HARNESS_DAEMON_LABEL, harnessArgv: ctx.harnessArgv },
-          createBarrierOps({
-            agentUid,
-            agentAccount: ctx.agentAccount,
-            harnessArgv: ctx.harnessArgv,
-            fortressPath: entry.fortress_path,
-            harnessLogDir: ctx.harnessLogDir,
-            gateUid: ctx.gateUid,
-            oracle: oracle as GateLivenessOracle,
-            rearm: "boot-rearm",
-          }),
+          guardedOps,
         );
       },
       audit: input.audit,
@@ -1678,10 +1807,18 @@ export async function startExclusiveEgressBootSupervisor(input: {
   // LOG DISCIPLINE (fix-round-2 MED-6): "registry unreadable" and
   // per-quarantined-entry findings are WARN-ONCE (re-armed on recovery),
   // never a 1-per-second flood that buries the signal.
+  //
+  // DIRTY REGISTRY WITHHOLDS TOKENS (fix-round-3 HIGH-2): while the registry
+  // reads dirty (quarantined entry, pending journal, explicit dirty marker,
+  // missing enable token), the anchor may diverge from the committed union
+  // in ways the per-uid liveness probe cannot see, so the loop withholds
+  // EVERY freshness token (gates deny within one TTL, fail-closed) and
+  // warns once per uid until the registry is clean again.
   const interval = input.refreshIntervalMs ?? 1_000;
   const REFRESH_SKIP_WARN_THRESHOLD = 3;
   const warnedUids = new Set<number>();
   const warnedQuarantined = new Set<string>();
+  const warnedDirtyUids = new Set<number>();
   let warnedRegistryUnreadable = false;
   let refreshInFlight = false;
   let consecutiveSkips = 0;
@@ -1723,9 +1860,37 @@ export async function startExclusiveEgressBootSupervisor(input: {
           input.print(
             `[castle-wall] oracle refresh: registry entry #${q.index} is malformed and QUARANTINED ` +
               `(${q.reason}); its agent gets no token refresh and its gate denies (fail-closed); ` +
-              "other agents keep refreshing; repair is owed (warn-once)",
+              "the quarantine marks the registry DIRTY, so every entry's token is withheld until " +
+              "repair; repair is owed (warn-once)",
           );
         }
+      }
+      // Fix-round-3 HIGH-2: while the registry is DIRTY (quarantined entry,
+      // journaled pending set, explicit dirty marker, or missing enable
+      // token) the live anchor may diverge from the committed union, and the
+      // per-uid liveness probe behind oracle.refresh checks only that THIS
+      // uid's rules are present -- it cannot rule out EXTRA permissive rules
+      // on a dirty anchor. WITHHOLD every token: the previous one expires
+      // within one TTL and the gate denies (fail-closed), matching the
+      // release barrier, which also refuses to release over a dirty
+      // registry. Warn-once per uid; re-armed when the registry is clean.
+      if (current.dirty) {
+        for (const entry of current.entries) {
+          if (!warnedDirtyUids.has(entry.agent_uid)) {
+            warnedDirtyUids.add(entry.agent_uid);
+            input.print(
+              `[castle-wall] oracle refresh: registry is DIRTY (needs repair), so the freshness token ` +
+                `for uid ${entry.agent_uid} is WITHHELD; its gate denies within one TTL (fail-closed: ` +
+                "per-uid liveness cannot rule out extra permissive rules on a dirty anchor); " +
+                "repair: sudo sanctuary protect --repair-egress-gate (warn-once until the registry is clean)",
+            );
+          }
+        }
+        return;
+      }
+      if (warnedDirtyUids.size > 0) {
+        warnedDirtyUids.clear();
+        input.print("[castle-wall] oracle refresh: registry is clean again; token refresh resumed");
       }
       for (const entry of current.entries) {
         if (entry.tombstone === true) continue;
