@@ -566,8 +566,34 @@ function renderTopbarAttestationBadge(stateName) {
   '</span>';
 }
 
+// Legacy clipboard path for non-secure contexts, where navigator.clipboard is
+// undefined. Returns true only when the copy actually succeeded, so the caller
+// can fall through to an honest "copy it manually" message. The scratch textarea
+// is positioned offscreen and removed synchronously; it never enters layout.
+function copyViaExecCommand(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand && document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (ok) toast("Machine id copied.", "info");
+    return ok === true;
+  } catch (e) {
+    return false;
+  }
+}
+
 function renderTopbar() {
-  const pillEl = document.getElementById("topbar-pills");
+  // S3 nit: id renamed topbar-pills -> sidebar-pills. S2 relocated these chips
+  // from the top bar into the sidebar footer, leaving the old id describing a
+  // place they no longer live. The element is still found by id here.
+  const pillEl = document.getElementById("sidebar-pills");
   if (!pillEl) return;
   // Version pill (Finding CCC, v1.2.0-rc.3): operator-visible binary
   // version so a stale build is impossible to mistake for a fresh one.
@@ -2697,8 +2723,36 @@ function postureWallLabel(armState) {
   if (armState === "locked_down") return { cls: "pill tone-locked", text: "Locked down" };
   return { cls: "pill", text: "Unknown" };
 }
-function postureMetricCard(value, label) {
-  return '<div class="posture-metric"><span class="pm-v">' + value + '</span><span class="pm-l">' + escHtml(label) + '</span></div>';
+// S3 evidence spine tile. The opts argument and every field in it are optional:
+// the honest render of a missing denominator or a missing timestamp is to OMIT
+// it, never to substitute a placeholder that reads like data.
+//   opts.of            a denominator, rendered only when it is a finite number,
+//                      so a null/NaN total renders a bare count rather than
+//                      "of 0" or "of -".
+//   opts.fresh         an ISO timestamp, rendered through relTimeFromIso. When
+//                      it is absent we render opts.freshNone in the slate
+//                      unknown tone, so "not checked" can never be mistaken
+//                      for "checked recently".
+//   opts.ev            { href, text } link to the evidence behind the number.
+function postureMetricCard(value, label, opts) {
+  const o = opts || {};
+  const ofText = (typeof o.of === "number" && isFinite(o.of))
+    ? '<span class="pm-of">of ' + escHtml(o.of) + '</span>'
+    : "";
+  const freshText = o.fresh ? relTimeFromIso(o.fresh) : "";
+  let freshHtml = "";
+  if (freshText) {
+    freshHtml = '<span class="pm-fresh" title="' + escHtml(o.fresh) + '">checked ' + escHtml(freshText) + '</span>';
+  } else if (o.freshNone) {
+    freshHtml = '<span class="pm-fresh none">' + escHtml(o.freshNone) + '</span>';
+  }
+  const evHtml = o.ev
+    ? '<a class="pm-ev" href="' + escHtml(o.ev.href) + '">' + escHtml(o.ev.text) + ' &rarr;</a>'
+    : "";
+  const foot = (freshHtml || evHtml)
+    ? '<span class="pm-foot">' + freshHtml + evHtml + '</span>'
+    : "";
+  return '<div class="posture-metric"><span class="pm-v">' + value + ofText + '</span><span class="pm-l">' + escHtml(label) + '</span>' + foot + '</div>';
 }
 function renderPostureStory(d) {
   // F2 BLOCKER-1: three-state from the shared verdict. Never "verified clean"
@@ -2722,20 +2776,45 @@ function renderPostureStory(d) {
     : d.chain_verdict === "verified_suffix_only"
       ? '<span class="pill tone-degraded">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
       : '<span class="pill tone-locked">Audit chain UNVERIFIED (' + escHtml(d.integrity_finding_count) + ' findings).</span>';
+  // S3 denominators: each count states the whole it came out of, so a "4" reads
+  // as 4-of-2,113 rather than an unanchored number. Both totals are computed
+  // from fields already on the digest; nothing new is fetched.
+  const connTotal = (d.kernel_blocks || 0) + (d.kernel_allows || 0);
+  const decidedTotal = (d.approvals_denied || 0) + (d.approvals_granted || 0);
   const lines = [
-    '<strong>' + escHtml(d.total_operations) + '</strong> operations in the last 24h.',
-    '<strong>' + escHtml(d.kernel_blocks) + '</strong> outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows) + ' allowed.',
-    '<strong>' + escHtml(d.approvals_denied) + '</strong> approvals denied, ' + escHtml(d.approvals_granted) + ' granted by you.',
+    '<strong>' + escHtml(d.total_operations) + '</strong> operations in the last 24h' +
+      (d.failures ? ', ' + escHtml(d.failures) + ' of them failed.' : '.'),
+    '<strong>' + escHtml(d.kernel_blocks) + '</strong> of ' + escHtml(connTotal) +
+      ' observed outbound connections blocked at the kernel; ' + escHtml(d.kernel_allows) + ' allowed.',
+    '<strong>' + escHtml(d.approvals_denied) + '</strong> of ' + escHtml(decidedTotal) +
+      ' decided approvals denied by you, ' + escHtml(d.approvals_granted) + ' granted.',
     chainLine
   ];
   return lines.map(function (l) { return '<div class="story-line">' + l + '</div>'; }).join("");
+}
+// S3 evidence spine for Today's story: how recently the counted window closed,
+// beside the link to the evidence behind the counts. A digest with no
+// window_end says so rather than letting stale counts read as live.
+function postureStoryFoot(d) {
+  const freshText = d && d.window_end ? relTimeFromIso(d.window_end) : "";
+  const fresh = freshText
+    ? '<span class="pm-fresh" title="' + escHtml(d.window_end) + '">window closed ' + escHtml(freshText) + '</span>'
+    : '<span class="pm-fresh none">window not stated</span>';
+  return '<div class="evidence pm-foot">' + fresh +
+    '<a class="pm-ev" href="/posture/evidence">Open the Evidence view &rarr;</a></div>';
 }
 function renderPostureAnomalies(findings, unknown) {
   if (unknown) {
     return '<p class="muted">Open anomaly findings unavailable (the detector did not respond). This is not a confirmation of zero findings.</p>';
   }
   if (!findings || !findings.length) {
-    return '<p class="muted">No open anomaly findings.</p>';
+    // S3 quiet empty state: earned calm, and explicit about WHY it is empty.
+    // This is the detector-ANSWERED case only; the unknown branch above must
+    // never borrow it, because a silent detector is not a clean bill of health.
+    return '<div class="posture-quiet"><span class="quiet-mark">&#9679;</span>' +
+      '<span>No open anomaly findings.' +
+      '<span class="quiet-why"> The detector answered and reported nothing open.</span>' +
+      '</span></div>';
   }
   return findings.map(function (f) {
     return '<div class="story-line"><span class="pill tone-degraded">' + escHtml(f.severity || "finding") + '</span> ' +
@@ -2744,7 +2823,25 @@ function renderPostureAnomalies(findings, unknown) {
 }
 function renderPostureAgentRows(home) {
   const rows = (home.agents || []);
-  if (!rows.length) return '<p class="muted">No protected agents yet.</p>';
+  // S3 first-run empty state: emptiness becomes a guided path rather than a
+  // void. Step 1 is the only step actionable before an agent exists; the wall
+  // and chain steps are described, never claimed. Nothing here asserts a
+  // protection that is not in place, and the tiles above stay grey until
+  // there is evidence for them.
+  if (!rows.length) return '<div class="posture-firstrun">' +
+    '<h4>No agents protected yet.</h4>' +
+    '<p>Sanctuary protects an agent by giving it an identity, a policy, and approval ' +
+    'gates, then enforcing them at the operating system. Three steps get this board to green.</p>' +
+    '<ol class="firstrun-steps">' +
+      '<li><strong>Protect your first agent.</strong> Run this where your agent lives.' +
+      '<code class="firstrun-cmd">sanctuary protect</code></li>' +
+      '<li><strong>Arm the wall.</strong> Turns policy into blocking the agent cannot talk its way past.' +
+      '<code class="firstrun-cmd">sanctuary castle-wall arm</code></li>' +
+      '<li><strong>Verify your audit chain.</strong> Confirms the record of what happened has not been altered.' +
+      '<code class="firstrun-cmd">sanctuary audit-chain verify</code></li>' +
+    '</ol>' +
+    '<p class="firstrun-foot">Each step lights its own tile above.</p>' +
+    '</div>';
   return rows.map(function (a) {
     // HONEST per-agent pill (#634): green ONLY on confirmed live enforcement;
     // amber on policy-only protection; never machine-arm bleed-through.
@@ -2786,14 +2883,44 @@ function renderPostureScreen() {
     : (home.digest && home.digest.chain_verdict === "verified_suffix_only")
       ? '<span class="pill tone-degraded">Suffix-only</span>'
       : '<span class="pill tone-locked">Unverified</span>';
+  // S3 evidence spine. Every tile carries, where the payload already supports
+  // it, a denominator, a freshness stamp, and a link to its evidence. Nothing
+  // here fetches new data: detectedTotal, the wall's evidence timestamp, and the
+  // digest window all come from the /api/posture/home payload already in state.
+  // Tiles the payload cannot honestly qualify (approvals, anomalies) get an
+  // evidence link only, with no invented denominator or age.
+  const detectedTotal =
+    ((home.agents && home.agents.length) || 0) +
+    ((home.unwrapped && home.unwrapped.unwrapped && home.unwrapped.unwrapped.length) || 0);
+  const wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
+  const digest = home.digest || {};
   const metricCards =
     '<div class="posture-metrics">' +
-      postureMetricCard(escHtml(home.protection_requested_count), "Protection requested") +
-      postureMetricCard(escHtml(home.enforcement_confirmed_count), "Enforcement confirmed") +
-      postureMetricCard('<span class="' + wall.cls + '">' + escHtml(wall.text) + '</span>', "Castle Wall") +
+      postureMetricCard(escHtml(home.protection_requested_count), "Protection requested", {
+        of: detectedTotal,
+        // Hash route, matching the SPA's own nav ids, so this stays in-app.
+        ev: { href: "#agents", text: "agents" },
+      }) +
+      postureMetricCard(escHtml(home.enforcement_confirmed_count), "Enforcement confirmed", {
+        of: home.protection_requested_count,
+        ev: { href: "/posture/evidence", text: "evidence" },
+      }) +
+      postureMetricCard('<span class="' + wall.cls + '">' + escHtml(wall.text) + '</span>', "Castle Wall", {
+        // The wall's freshness is the age of its last ENFORCEMENT evidence, not
+        // of this render. No evidence says so outright: absence must read as
+        // absence, never as a recent check that happened to pass.
+        fresh: wallEvidenceAt,
+        freshNone: "no enforcement evidence yet",
+      }) +
       postureMetricCard(escHtml(pending), "Approvals waiting") +
       postureMetricCard(anomalyUnknown ? '<span class="tone-degraded">?</span>' : escHtml(findings.length), "Open anomalies") +
-      postureMetricCard(chainPill, "Audit chain") +
+      postureMetricCard(chainPill, "Audit chain", {
+        // The digest window is the period this verdict covers; its end states
+        // how current the verdict is.
+        fresh: digest.window_end,
+        freshNone: "no verify on record",
+        ev: { href: "/api/audit-log", text: "audit log" },
+      }) +
     '</div>';
   const storyToggle =
     '<label class="story-toggle"><input type="checkbox" data-action="posture-story-plain"' +
@@ -2809,7 +2936,7 @@ function renderPostureScreen() {
       '<section class="card">',
         '<div class="card-head-row"><h3>Today&#39;s story</h3>' + storyToggle + '</div>',
         renderPostureStory(home.digest || {}),
-        '<div class="evidence"><a href="/posture/evidence">Open the Evidence view</a></div>',
+        postureStoryFoot(home.digest || {}),
       '</section>',
       '<section class="card">',
         '<h3>Anomaly findings</h3>',
@@ -3501,13 +3628,26 @@ document.addEventListener("click", function (ev) {
   // S2 (2026-07-18): copy the full machine id to the clipboard. The top bar
   // shows a human machine name with the id demoted to a short mono chip; the
   // chip copies the untruncated id so operators can paste it verbatim.
+  // S3 nit: the handler previously did nothing at all when navigator.clipboard
+  // was unavailable, which is the common case rather than the rare one -- the
+  // async Clipboard API needs a secure context, so reaching this dashboard over
+  // plain http on a LAN address (http://192.168.x.x:3501) silently disabled the
+  // chip while it still looked clickable. It now falls back to the legacy
+  // execCommand path and, failing that, tells the operator to copy manually.
+  // A copy affordance that quietly does nothing is worse than one that admits
+  // it cannot: never a silent no-op.
   if (action === "copy-fortress-id") {
     const id = tgt.getAttribute("data-fortress-id") || "";
-    if (id && navigator.clipboard && navigator.clipboard.writeText) {
+    if (!id) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(id).then(
         function () { toast("Machine id copied.", "info"); },
-        function () { toast("Could not copy machine id.", "error"); }
+        function () { if (!copyViaExecCommand(id)) toast("Could not copy. Select the id and copy it manually.", "error"); }
       );
+      return;
+    }
+    if (!copyViaExecCommand(id)) {
+      toast("Copying needs a secure connection. Select the id and copy it manually.", "error");
     }
     return;
   }

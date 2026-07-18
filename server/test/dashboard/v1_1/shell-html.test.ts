@@ -157,9 +157,11 @@ describe("v1.1 dashboard shell HTML", () => {
     // S2 (2026-07-18): the version / deployment / mode / attestation chips
     // moved off the top bar into the sidebar footer so the top bar carries
     // one overall state pill. The pill stays in the same flex container.
+    // S3 (2026-07-18): the container id followed the chips -- "topbar-pills"
+    // described a location they had already left, so it is now "sidebar-pills".
     expect(html).toContain('data-pill="version"');
     expect(html).toContain("v1.2.0-rc.3");
-    const pillsMatch = html.match(/<div class="pills" id="topbar-pills">[\s\S]*?<\/div>/);
+    const pillsMatch = html.match(/<div class="pills" id="sidebar-pills">[\s\S]*?<\/div>/);
     expect(pillsMatch).toBeTruthy();
     expect(pillsMatch![0]).toContain('data-pill="version"');
     expect(pillsMatch![0]).toContain('data-pill="deployment"');

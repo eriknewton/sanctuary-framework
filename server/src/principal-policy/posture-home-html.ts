@@ -33,7 +33,9 @@ import type { FeatureHealthStatus } from "./feature-health.js";
 import type { CustodyState } from "./posture.js";
 import {
   AGENT_PILL_FN_SOURCE,
+  EVIDENCE_SPINE_CSS,
   POSTURE_ROOT_TOKENS_CSS,
+  REL_TIME_FN_SOURCE,
   STATUS_PILL_CSS,
   THEME_BOOTSTRAP_SCRIPT,
 } from "./posture-html-shared.js";
@@ -164,15 +166,25 @@ export function renderPostureHomeHTML(): string {
   }
   .fleet-link:hover { border-color: var(--indigo); text-decoration: none; }
   main { padding: 20px 24px; max-width: 1100px; margin: 0 auto; }
+  /*
+    S3: the at-a-glance row is a grid, not a wrapping flex row. With the
+    evidence spine each tile is taller and carries a footer, and flex-wrap left
+    the last tile orphaned on its own row at common widths. auto-fit keeps the
+    six tiles on an even baseline and lets them reflow to 3+3 or 2+2+2 rather
+    than 5+1.
+  */
   .banner {
-    display: flex; flex-wrap: wrap; gap: 14px; padding: 16px;
+    display: grid; grid-template-columns: repeat(2, 1fr);
+    gap: 14px 18px; padding: 16px;
     background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
     margin-bottom: 20px;
   }
-  .stat { display: flex; flex-direction: column; min-width: 130px; }
-  .stat .v { font-size: 22px; font-weight: 700; }
+  @media (min-width: 780px) { .banner { grid-template-columns: repeat(3, 1fr); } }
+  .stat { display: flex; flex-direction: column; min-width: 0; }
+  .stat .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
   .stat .l { color: var(--ink-3); font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
   ${STATUS_PILL_CSS}
+  ${EVIDENCE_SPINE_CSS}
   section { margin-bottom: 24px; }
   section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .5px; color: var(--ink-3); margin: 0 0 10px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
@@ -238,6 +250,33 @@ export function renderPostureHomeHTML(): string {
   .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: 12px; user-select: none; }
   .story-toggle input { margin: 0; }
   .story-summary { margin: 0; }
+  /*
+    S3 first-run empty state. An empty fortress is the most common first
+    impression, so emptiness renders as a guided path rather than a void. It
+    spans the agent grid's columns so the checklist reads as one block.
+  */
+  .firstrun {
+    grid-column: 1 / -1; background: var(--surface); border: 1px solid var(--rule);
+    border-radius: 10px; padding: 18px 20px;
+  }
+  .firstrun h3 { margin: 0 0 6px; font-size: 15px; }
+  .firstrun p { margin: 0 0 12px; color: var(--ink-3); font-size: 12.5px; max-width: 68ch; }
+  .firstrun-steps { margin: 0; padding-left: 20px; display: grid; gap: 10px; }
+  .firstrun-steps li { font-size: 12.5px; color: var(--ink-2); }
+  .firstrun-cmd {
+    display: block; margin-top: 5px; font-family: var(--mono, monospace); font-size: 11.5px;
+    background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px;
+    padding: 5px 9px; color: var(--ink-2); width: fit-content;
+  }
+  .firstrun-foot { margin: 14px 0 0; font-size: 11.5px; color: var(--ink-4, var(--ink-3)); }
+  /*
+    S3 quiet empty state: "nothing here" should read as earned calm, not as a
+    failure or a blank. Used for the panels that are legitimately empty on a
+    healthy box (no approvals waiting, no anomaly findings).
+  */
+  .quiet { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; color: var(--ink-2); }
+  .quiet .quiet-mark { color: var(--sage); font-size: 11px; }
+  .quiet .quiet-why { color: var(--ink-3); font-size: 11.5px; }
 </style>
 </head>
 <body>
@@ -492,6 +531,12 @@ export function renderPostureHomeHTML(): string {
   // the drill-down cannot weaken this color model independently (#641).
   ${AGENT_PILL_FN_SOURCE}
 
+  // S3 evidence spine: the shared freshness formatter (posture-html-shared.ts).
+  // Returns "" for an absent or unparseable timestamp so a missing check can
+  // never render as a recent one; call sites render an explicit "no evidence
+  // yet" on "". Shared so "checked 14s ago" means the same on every surface.
+  ${REL_TIME_FN_SOURCE}
+
   // "Never fake green" for the feature-health panel. Mirrors the canonical
   // pure mapper exported from this module (featureHealthPill). GREEN is earned
   // ONLY by "active"; "fault" is red; "unconfirmed" and "unknown" are amber and
@@ -626,11 +671,17 @@ export function renderPostureHomeHTML(): string {
         (e.verified_wraps !== null && e.verified_wraps !== undefined
           ? " · " + esc(e.verified_wraps) + " verified recovery factor(s)"
           : "") +
-        " · observed " + esc(e.observed_at) + "</div>";
+        // S3 freshness: an age reads faster than a raw ISO stamp. The absolute
+        // timestamp stays in the title attribute so the exact value an operator
+        // would cite in an incident write-up is never lost, only demoted.
+        ' · observed <span title="' + esc(e.observed_at) + '">' +
+        esc(relTime(e.observed_at) || e.observed_at) + "</span></div>";
     }
     if (panel.last_damage_evidence_at) {
       html += '<div class="evidence">Last custody-damage evidence: ' +
-        esc(panel.last_damage_evidence_at) + "</div>";
+        '<span title="' + esc(panel.last_damage_evidence_at) + '">' +
+        esc(relTime(panel.last_damage_evidence_at) || panel.last_damage_evidence_at) +
+        "</span></div>";
     }
     if (!panel.audit_integrity_ok) {
       html += '<div class="err">Audit integrity finding present - custody read may be incomplete.</div>';
@@ -894,16 +945,55 @@ export function renderPostureHomeHTML(): string {
     }
     document.getElementById("origin").textContent =
       originText;
+    // S3 evidence spine. Every tile below carries, where the payload already
+    // supports it: a denominator (so a bare count cannot be read as a whole), a
+    // freshness stamp (so a claim states how recently it was checked), and a
+    // link to the evidence behind the number. Nothing here fetches new data --
+    // every value comes from the /api/posture/home payload the page already
+    // holds. Where the payload has no honest denominator or timestamp for a
+    // tile, that tile renders WITHOUT one rather than inventing a plausible
+    // value. See the null-handling in statOf/fresh below.
+    var detectedTotal =
+      ((home.agents && home.agents.length) || 0) +
+      ((home.unwrapped && home.unwrapped.unwrapped && home.unwrapped.unwrapped.length) || 0);
+    var wallEvidenceAt = home.castle_wall && home.castle_wall.last_enforcement_evidence_at;
+    var digest = home.digest || {};
     document.getElementById("banner").innerHTML =
       // Honest split (#634): "protection requested" is policy intent; "enforcement
       // confirmed" is the observed-live count. Reporting only a flat "protected"
-      // number overstated enforcement the server cannot prove.
-      stat(home.protection_requested_count, "Protection requested") +
-      stat(home.enforcement_confirmed_count, "Enforcement confirmed") +
-      stat(wallPill(home.castle_wall.arm_state), "Castle Wall") +
-      stat(pendingCount, "Approvals waiting") +
-      stat(openAnomalies, "Open anomalies") +
-      stat(auditChainPill(home.digest), "Audit chain");
+      // number overstated enforcement the server cannot prove. S3 keeps that
+      // split and adds the denominator that makes it legible: requested is "of
+      // N detected", and confirmed is "of N requested" -- so a "0 of 3" reads as
+      // the honest gap it is rather than an unexplained zero.
+      stat(home.protection_requested_count, "Protection requested", {
+        of: detectedTotal,
+        ev: { href: "#agents", text: "agents" },
+      }) +
+      stat(home.enforcement_confirmed_count, "Enforcement confirmed", {
+        of: home.protection_requested_count,
+        ev: { href: "/posture/evidence", text: "evidence" },
+      }) +
+      stat(wallPill(home.castle_wall.arm_state), "Castle Wall", {
+        // The wall's freshness is the age of its last ENFORCEMENT evidence, not
+        // the age of this page render. No evidence means an explicit "no
+        // enforcement evidence yet", never a blank that could read as fresh.
+        fresh: wallEvidenceAt,
+        freshNoneText: "no enforcement evidence yet",
+        ev: { href: "#wall", text: "what is protecting you" },
+      }) +
+      stat(pendingCount, "Approvals waiting", {
+        ev: { href: "#approvals", text: "queue" },
+      }) +
+      stat(openAnomalies, "Open anomalies", {
+        ev: { href: "#anomalies", text: "findings" },
+      }) +
+      stat(auditChainPill(home.digest), "Audit chain", {
+        // The digest window is the period the chain verdict covers. Rendering
+        // its end as a freshness stamp says how current the verdict is.
+        fresh: digest.window_end,
+        freshNoneText: "no verify on record",
+        ev: { href: "/api/audit-log", text: "audit log" },
+      });
   }
   // F2 BLOCKER-1: three-state pill from the shared verdict — green VERIFIED only
   // for a fully-verified chain; a neutral SUFFIX-ONLY when the sealed history is
@@ -916,8 +1006,42 @@ export function renderPostureHomeHTML(): string {
       ? '<span class="pill green">VERIFIED</span>'
       : '<span class="pill red">UNVERIFIED</span>';
   }
-  function stat(value, label) {
-    return '<div class="stat"><span class="v">' + value + '</span><span class="l">' + esc(label) + "</span></div>";
+  // S3 evidence spine tile. The opts argument is optional and every field in it
+  // is optional, because the honest render of a missing denominator or a missing
+  // timestamp is to OMIT it, not to substitute a placeholder that looks like
+  // data. Specifically:
+  //   opts.of            a denominator. Rendered only when it is a finite
+  //                      number; a null/undefined/NaN total renders a bare
+  //                      count, never "of 0" and never "of -".
+  //   opts.fresh         an ISO timestamp. Rendered through the shared relTime,
+  //                      which returns "" for absent/unparseable input; on ""
+  //                      we render opts.freshNoneText in the slate unknown tone
+  //                      so "not checked" can never be mistaken for "checked".
+  //   opts.ev            { href, text } link to the evidence behind the number.
+  function stat(value, label, opts) {
+    var o = opts || {};
+    var ofText = "";
+    if (typeof o.of === "number" && isFinite(o.of)) {
+      ofText = '<span class="stat-of">of ' + esc(o.of) + "</span>";
+    }
+    var foot = "";
+    var freshText = o.fresh ? relTime(o.fresh) : "";
+    var freshHtml = "";
+    if (freshText) {
+      freshHtml = '<span class="stat-fresh">checked ' + esc(freshText) + "</span>";
+    } else if (o.freshNoneText) {
+      freshHtml = '<span class="stat-fresh none">' + esc(o.freshNoneText) + "</span>";
+    }
+    var evHtml = o.ev
+      ? '<a class="stat-ev" href="' + esc(o.ev.href) + '">' + esc(o.ev.text) + " &rarr;</a>"
+      : "";
+    if (freshHtml || evHtml) {
+      foot = '<span class="stat-foot">' + freshHtml + evHtml + "</span>";
+    }
+    return (
+      '<div class="stat"><span class="v">' + value + ofText + "</span>" +
+      '<span class="l">' + esc(label) + "</span>" + foot + "</div>"
+    );
   }
 
   function renderAgents(home) {
@@ -940,7 +1064,33 @@ export function renderPostureHomeHTML(): string {
         '<div class="reach"><code>' + esc(u.config_path) + "</code></div>" +
         '<button class="guided" data-harness="' + esc(u.harness) + '">Protect (guided)</button></div>';
     });
-    if (!html) html = '<span class="empty">No agents detected.</span>';
+    // S3 empty states: first-run reads as a guided path, not as a void. An
+    // empty agent grid is the most common first impression a new operator gets,
+    // and "No agents detected." gave them nothing to do next. The checklist
+    // below is honest about state -- step 1 is the only step that is actionable
+    // before an agent exists, and the wall/chain steps are described, not
+    // claimed. Nothing here asserts a protection that is not in place.
+    if (!html) {
+      html =
+        '<div class="firstrun">' +
+        "<h3>No agents protected yet.</h3>" +
+        "<p>Sanctuary protects an agent by giving it an identity, a policy, and " +
+        "approval gates, then enforcing them at the operating system. Three steps " +
+        "get this board to green.</p>" +
+        '<ol class="firstrun-steps">' +
+        "<li><strong>Protect your first agent.</strong> Run this where your agent lives." +
+        '<code class="firstrun-cmd">sanctuary protect</code></li>' +
+        "<li><strong>Arm the wall.</strong> Turns policy into blocking that the " +
+        "agent cannot talk its way past." +
+        '<code class="firstrun-cmd">sanctuary castle-wall arm</code></li>' +
+        "<li><strong>Verify your audit chain.</strong> Confirms the record of what " +
+        "happened has not been altered." +
+        '<code class="firstrun-cmd">sanctuary audit-chain verify</code></li>' +
+        "</ol>" +
+        '<p class="firstrun-foot">Each step lights its own tile above. The tiles ' +
+        "stay grey until there is evidence for them.</p>" +
+        "</div>";
+    }
     var el = document.getElementById("agents");
     el.innerHTML = html;
     // Guided wrap: show the command, never execute in-place (one-click
@@ -1031,7 +1181,14 @@ export function renderPostureHomeHTML(): string {
   function renderApprovals(approvalState) {
     var pending = (approvalState && approvalState.rows) || [];
     if (!pending.length) {
-      document.getElementById("approvals").innerHTML = '<span class="empty">Nothing needs you.</span>';
+      // S3 quiet empty state: earned calm. An empty approvals queue is a good
+      // state, so it reads as one -- but the second clause keeps it honest
+      // about WHY it is empty (nothing was held), not that nothing happened.
+      document.getElementById("approvals").innerHTML =
+        '<div class="quiet"><span class="quiet-mark">&#9679;</span>' +
+        "<span>Nothing needs you." +
+        '<span class="quiet-why"> No operation is waiting on your decision.</span>' +
+        "</span></div>";
       return;
     }
     var html = "";
@@ -1105,6 +1262,23 @@ export function renderPostureHomeHTML(): string {
     toggle.checked = readStoryPlainSummaryPreference();
   }
 
+  // S3 evidence spine for Today's story: the window the counts cover, how
+  // recently that window closed, and the two links to the evidence behind them.
+  // The digest carries window_start/window_end already; stating the window's
+  // age stops a stale digest from reading as live. When the payload has no
+  // window_end we say so rather than implying the counts are current.
+  function storyEvidenceFoot(d) {
+    var freshText = d && d.window_end ? relTime(d.window_end) : "";
+    var fresh = freshText
+      ? '<span class="stat-fresh" title="' + esc(d.window_end) + '">window closed ' + esc(freshText) + "</span>"
+      : '<span class="stat-fresh none">window not stated</span>';
+    return (
+      '<div class="evidence stat-foot">' + fresh +
+      '<span><a class="stat-ev" href="/posture/evidence">Evidence view &rarr;</a>' +
+      ' &nbsp;<a class="stat-ev" href="/api/audit-log">signed audit feed &rarr;</a></span></div>'
+    );
+  }
+
   function renderStoryPlainSummary(d) {
     var chainText = d.chain_verified
       ? "The audit log verified clean: no tampering."
@@ -1117,7 +1291,7 @@ export function renderPostureHomeHTML(): string {
       "</strong>. You denied <strong>" + esc(d.approvals_denied) +
       "</strong> approvals and granted <strong>" + esc(d.approvals_granted) +
       "</strong>. " + esc(chainText) + "</p>" +
-      '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
+      storyEvidenceFoot(d);
   }
 
   function renderStory(d) {
@@ -1128,19 +1302,25 @@ export function renderPostureHomeHTML(): string {
       el.innerHTML = renderStoryPlainSummary(d);
       return;
     }
+    // S3 denominators: each count states the whole it came out of, so a "4" is
+    // legible as 4-of-2,113 rather than an unanchored number. The totals are
+    // computed from fields already on the digest; nothing new is fetched.
+    var connTotal = (d.kernel_blocks || 0) + (d.kernel_allows || 0);
+    var decidedTotal = (d.approvals_denied || 0) + (d.approvals_granted || 0);
     var lines = [];
-    lines.push("<strong>" + d.total_operations + "</strong> operations in the last 24h.");
-    lines.push("<strong>" + d.kernel_blocks + "</strong> outbound connections blocked at the kernel; " +
-      d.kernel_allows + " allowed.");
-    lines.push("<strong>" + d.approvals_denied + "</strong> approvals denied, " +
-      d.approvals_granted + " granted by you.");
+    lines.push("<strong>" + d.total_operations + "</strong> operations in the last 24h" +
+      (d.failures ? ", " + d.failures + " of them failed." : "."));
+    lines.push("<strong>" + d.kernel_blocks + "</strong> of " + connTotal +
+      " observed outbound connections blocked at the kernel; " + d.kernel_allows + " allowed.");
+    lines.push("<strong>" + d.approvals_denied + "</strong> of " + decidedTotal +
+      " decided approvals denied by you, " + d.approvals_granted + " granted.");
     lines.push(d.chain_verified
       ? '<span class="pill green">Audit chain verified</span> no tampering.'
       : d.chain_verdict === "verified_suffix_only"
         ? '<span class="pill amber">Audit chain: recent verified, sealed history not re-verifiable at this privilege</span> (run as root for a full verify).'
         : '<span class="err">Audit chain UNVERIFIED (' + d.integrity_finding_count + " findings).</span>");
     el.innerHTML = lines.map(function (l) { return '<div class="story-line">' + l + "</div>"; }).join("") +
-      '<div class="evidence"><a href="/api/audit-log">Open the signed audit feed &rarr;</a></div>';
+      storyEvidenceFoot(d);
   }
 
   function wireStoryToggle() {
@@ -1156,7 +1336,15 @@ export function renderPostureHomeHTML(): string {
   function renderAnomalies(findings) {
     var el = document.getElementById("anomalies");
     if (!findings || !findings.length) {
-      el.innerHTML = '<span class="empty">No open anomaly findings.</span>';
+      // S3 quiet empty state: earned calm. This is the DETECTOR-ANSWERED empty
+      // case only. The separate "detector did not respond" path elsewhere on
+      // this page must never borrow this treatment: a silent detector is an
+      // unknown, not a clean bill of health.
+      el.innerHTML =
+        '<div class="quiet"><span class="quiet-mark">&#9679;</span>' +
+        "<span>No open anomaly findings." +
+        '<span class="quiet-why"> The detector answered and reported nothing open.</span>' +
+        "</span></div>";
       return;
     }
     el.innerHTML = findings.map(function (f) {
@@ -1325,8 +1513,12 @@ export function renderPostureHomeHTML(): string {
         '<div class="evidence">' + esc(fleetTrustWhy(n)) +
         " · mode " + esc(n.node_mode) + modeNote +
         " · " + esc(fleetPolicyEvidence(n.policy)) +
+        // S3 freshness: a machine's staleness is the point of this line, and an
+        // age states it directly. "no sync received" stays explicit -- a silent
+        // machine must never render as a recently-synced one.
         (n.last_sync_received_at
-          ? " · last sync " + esc(n.last_sync_received_at)
+          ? ' · last sync <span title="' + esc(n.last_sync_received_at) + '">' +
+            esc(relTime(n.last_sync_received_at) || n.last_sync_received_at) + "</span>"
           : " · no sync received") +
         "</div></div>";
     }).join("");
@@ -1372,11 +1564,24 @@ export function renderPostureHomeHTML(): string {
     el.innerHTML =
       "<div>" + wallPill(w.arm_state) + " &nbsp;" + esc(meaning) + "</div>" +
       exclusiveDetail +
+      // S3 denominator: the three verdict counts are parts of one total, so the
+      // total is stated rather than left for the reader to add up. A zero total
+      // says "no traffic observed", which is NOT the same claim as "nothing was
+      // blocked" -- an unarmed wall also reports zeros.
       '<div class="evidence">Platform: ' + esc(w.platform) +
-      " · verdicts (24h): " + w.verdict_counts.allowed + " allowed / " + w.verdict_counts.blocked + " blocked / " +
+      " · verdicts (24h): " +
+      (w.verdict_counts.allowed + w.verdict_counts.blocked + w.verdict_counts.operator_decisions) +
+      " observed, of which " + w.verdict_counts.allowed + " allowed / " +
+      w.verdict_counts.blocked + " blocked / " +
       w.verdict_counts.operator_decisions + " operator decisions</div>" +
       '<div class="evidence">Evidence basis: <code>' + esc(w.evidence_basis) + "</code>" +
-      (w.last_enforcement_evidence_at ? " · last enforcement " + esc(w.last_enforcement_evidence_at) : "") + "</div>" +
+      // S3 freshness: the age of the evidence the wall's color rests on. When
+      // there is none, say so outright -- absence of evidence must read as
+      // absence, never as a fresh check.
+      (w.last_enforcement_evidence_at
+        ? ' · last enforcement <span title="' + esc(w.last_enforcement_evidence_at) + '">' +
+          esc(relTime(w.last_enforcement_evidence_at) || w.last_enforcement_evidence_at) + "</span>"
+        : " · no enforcement evidence on record") + "</div>" +
       // Slice R: honestly surface the cryptographic basis the green light rests
       // on. producer_signed = the daemon producer signature was re-verified at
       // read time. channel_authenticated = the green rests on the mutually-

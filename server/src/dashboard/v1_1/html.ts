@@ -1311,19 +1311,70 @@ body {
 .posture-seal-pop .pp-more:hover { text-decoration: underline; }
 
 /* Posture screen (one-surface fold): the full posture detail folded in. */
+/* S3: six tiles, so the column count is chosen to divide evenly (3+3 or 2+2+2)
+ * rather than left to auto-fit, which orphaned the sixth tile on its own row at
+ * common widths once the evidence spine made each tile taller. */
 .posture-metrics {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  display: grid; grid-template-columns: repeat(2, 1fr);
   gap: 10px; margin: 8px 0 4px;
 }
+@media (min-width: 760px) { .posture-metrics { grid-template-columns: repeat(3, 1fr); } }
 .posture-metric {
   display: flex; flex-direction: column; gap: 4px; padding: 12px;
   border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2);
 }
-.posture-metric .pm-v { font-size: var(--text-xl); font-family: var(--serif); }
+.posture-metric .pm-v { font-size: var(--text-xl); font-family: var(--serif); font-variant-numeric: tabular-nums; }
 .posture-metric .pm-l {
   font-size: var(--text-xs); color: var(--ink-3); text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+/* S3 evidence spine: the denominator, freshness stamp, and evidence link that
+ * hang off a posture tile. The denominator sits beside the value in a lighter
+ * sans so the number still reads first; the freshness stamp is mono because it
+ * is a measurement; the evidence link is informational indigo, never a status
+ * hue, so it can never be misread as a state signal. An absent freshness stamp
+ * takes the slate unknown tone (.none), never a pass or a warning colour. */
+/* Deliberately NOT scoped under .posture-metric: the same spine treatment is
+ * reused by Today's story footer, which lives outside a tile. The pm- prefix
+ * already makes these names unique. */
+.pm-of {
+  font-family: var(--sans); font-size: var(--text-xs); color: var(--ink-3);
+  margin-left: 4px; font-weight: 400;
+}
+.pm-foot {
+  margin-top: auto; padding-top: 6px; display: flex; align-items: baseline;
+  justify-content: space-between; gap: 8px; flex-wrap: wrap;
+}
+.pm-fresh { font-family: var(--mono); font-size: 10px; color: var(--ink-4); white-space: nowrap; }
+.pm-fresh.none { color: var(--slate); }
+.pm-ev { font-size: 10.5px; color: var(--indigo); text-decoration: none; white-space: nowrap; }
+.pm-ev:hover { text-decoration: underline; }
+/* S3 empty states. First-run reads as a guided path (a checklist with the one
+ * command per step), quiet reads as earned calm (a short line that says why it
+ * is empty, not merely that it is). */
+.posture-firstrun {
+  border: 1px solid var(--rule); border-radius: 8px; background: var(--paper-2);
+  padding: 16px 18px;
+}
+.posture-firstrun h4 { margin: 0 0 6px; font-size: var(--text-md); }
+.posture-firstrun p { margin: 0 0 12px; color: var(--ink-3); font-size: var(--text-sm); max-width: 68ch; }
+.firstrun-steps { margin: 0; padding-left: 20px; display: grid; gap: 10px; }
+.firstrun-steps li { font-size: var(--text-sm); color: var(--ink-2); }
+.firstrun-cmd {
+  display: block; margin-top: 5px; font-family: var(--mono); font-size: 11.5px;
+  background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px;
+  padding: 5px 9px; color: var(--ink-2); width: fit-content;
+}
+.firstrun-foot { margin: 14px 0 0; font-size: var(--text-xs); color: var(--ink-4); }
+.posture-quiet { display: flex; align-items: baseline; gap: 8px; font-size: var(--text-sm); color: var(--ink-2); }
+.posture-quiet .quiet-mark { color: var(--sage); font-size: 11px; }
+.posture-quiet .quiet-why { color: var(--ink-3); font-size: var(--text-xs); }
+/* S3: the pre-hydration placeholder. The SPA renders its real content into
+ * #main on first paint; until then this states what is happening and that the
+ * data is gated, rather than a bare one-word loading line. */
+.boot-placeholder { padding: 28px 4px; max-width: 60ch; }
+.boot-placeholder h2 { margin: 0 0 6px; font-family: var(--serif); font-weight: 500; }
+.boot-placeholder p { margin: 0; color: var(--ink-3); font-size: var(--text-sm); }
 .card-head-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .story-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-3); font-size: var(--text-sm); user-select: none; }
 .story-toggle input { margin: 0; }
@@ -1610,7 +1661,13 @@ export function renderDashboardV11Html(
         ${nav}
       </nav>
       <div class="nav-footer">
-        <div class="pills" id="topbar-pills">
+        <!--
+          S3 nit: these chips moved from the top bar to the sidebar footer in
+          S2, so the "topbar-pills" id no longer described where they live.
+          Renamed to sidebar-pills; renderTopbar() looks the element up by this
+          id (client.ts) and was updated in the same change.
+        -->
+        <div class="pills" id="sidebar-pills">
           <span class="pill" data-pill="version">v${escHtml(sanctuaryVersion)}</span>
           <span class="pill" data-pill="deployment">deployment: local</span>
           <span class="pill" data-pill="mode">mode: solo</span>
@@ -1645,7 +1702,7 @@ export function renderDashboardV11Html(
       </button>
       <button class="btn btn-lockdown" id="btn-lockdown" data-action="lockdown">Lockdown</button>
     </header>
-    <main class="main" id="main"><p class="muted">Loading dashboard.</p></main>
+    <main class="main" id="main"><div class="boot-placeholder"><h2>Checking how safe you are.</h2><p>Reading this machine's posture from your local Sanctuary. The posture routes stay behind your operator token, so nothing renders until that check completes.</p></div></main>
     <aside class="fortress" id="fortress"><p class="muted">Loading fortress column.</p></aside>
   </div>
   <div id="toast-host" aria-live="polite"></div>
