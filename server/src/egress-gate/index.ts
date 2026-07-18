@@ -52,11 +52,14 @@ export {
   PfAnchorRegistryDirtyError,
   PfAnchorRegistryStateError,
   createFsRegistryStore,
+  createFsQuarantineForensicsWriter,
   type PfAnchorRegistryEntry,
   type PfAnchorRegistryState,
   type PfAnchorRegistryStore,
   type PfAnchorRegistryOps,
   type PfAnchorRegistryMutationResult,
+  type PfAnchorQuarantineRepairFinding,
+  type PfAnchorQuarantineRepairResult,
 } from "./anchor-registry.js";
 
 export {

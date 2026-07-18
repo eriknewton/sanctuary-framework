@@ -163,12 +163,69 @@ export interface PfAnchorRegistryOps {
     entries: readonly PfAnchorUnionEntry[],
     anchorName: string,
   ) => Promise<PfLivenessResult>;
+  /**
+   * Forensic sink for {@link PfAnchorRegistry.repairQuarantined}: persist the
+   * raw quarantined entries BEFORE any of them is removed and return the
+   * absolute path written. MUST throw on failure (the repair then refuses to
+   * remove anything -- an entry is never dropped without its bytes preserved).
+   * Injected for tests; defaults to {@link createFsQuarantineForensicsWriter}.
+   */
+  quarantineForensics?: (payload: string) => Promise<string>;
 }
 
 /** The result of a mutation: the new committed set and whether repair is owed. */
 export interface PfAnchorRegistryMutationResult {
   committed: PfAnchorRegistryEntry[];
   dirty: boolean;
+}
+
+/** One quarantined committed entry the repair verb acted on (fix-round-4 P2). */
+export interface PfAnchorQuarantineRepairFinding {
+  /** Position of the raw entry in the on-disk `committed` array. */
+  index: number;
+  /** The quarantine listing's classification reason. */
+  reason: string;
+  /** Best-effort uid recovered from the raw entry (`null` when unrecoverable). */
+  agent_uid: number | null;
+  /**
+   * `tombstoned`: the raw entry's uid/port/fortress still validate, so the uid
+   * is KEPT in the union as a block-only tombstone (packet-confined, no gate
+   * channel) -- fail-closed for the affected agent. `removed`: nothing
+   * renderable could be salvaged (or the uid duplicates a valid entry), so the
+   * entry is dropped from the committed set outright.
+   */
+  disposition: "tombstoned" | "removed";
+}
+
+/** Result of {@link PfAnchorRegistry.repairQuarantined} (fix-round-4 P2). */
+export interface PfAnchorQuarantineRepairResult {
+  /** True when at least one quarantined entry was removed/tombstoned. */
+  repaired: boolean;
+  /** What was acted on, per entry (empty when `repaired` is false). */
+  findings: PfAnchorQuarantineRepairFinding[];
+  /** Absolute path of the forensic sidecar (`null` when nothing was repaired). */
+  forensicPath: string | null;
+  /** The committed set after the repair (valid entries + salvaged tombstones). */
+  remaining: PfAnchorRegistryEntry[];
+}
+
+/**
+ * Production forensic writer for {@link PfAnchorRegistry.repairQuarantined}:
+ * a root-only (0600) timestamped sidecar beside the registry file, opened
+ * `wx` so an existing capture is never overwritten. Returns the path written.
+ */
+export function createFsQuarantineForensicsWriter(
+  registryPath: string = PF_ANCHOR_REGISTRY_PATH,
+): (payload: string) => Promise<string> {
+  return async (payload: string): Promise<string> => {
+    const { writeFile, mkdir } = await import("node:fs/promises");
+    const { dirname } = await import("node:path");
+    await mkdir(dirname(registryPath), { recursive: true, mode: 0o700 }).catch(() => undefined);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const path = `${registryPath}.quarantine-${stamp}-${process.pid}.json`;
+    await writeFile(path, payload, { mode: 0o600, flag: "wx" });
+    return path;
+  };
 }
 
 /** The persisted state was corrupt/unusable. Fail-closed: never mutate from an unknown baseline. */
@@ -306,6 +363,50 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
 }
 
 /**
+ * Structural checks + per-entry quarantine classification of a loaded state
+ * (the SHARED boundary between `listQuarantined` and `repairQuarantined`,
+ * fix-round-4 P2: what the listing classifies as malformed is exactly what
+ * the repair verb may act on -- nothing more). STRUCTURAL corruption throws;
+ * a malformed or duplicate ENTRY becomes a quarantined finding carrying its
+ * raw value (for forensics), while the valid entries stay usable.
+ */
+function classifyCommitted(loaded: PfAnchorRegistryState): {
+  entries: PfAnchorRegistryEntry[];
+  quarantined: { index: number; reason: string; raw: unknown }[];
+} {
+  if (typeof loaded !== "object") {
+    throw new PfAnchorRegistryStateError("not an object");
+  }
+  if (loaded.version !== PF_ANCHOR_REGISTRY_STATE_VERSION) {
+    throw new PfAnchorRegistryStateError(`unknown state version ${String(loaded.version)}`);
+  }
+  if (!Array.isArray(loaded.committed)) {
+    throw new PfAnchorRegistryStateError("committed is not an array");
+  }
+  const entries: PfAnchorRegistryEntry[] = [];
+  const quarantined: { index: number; reason: string; raw: unknown }[] = [];
+  const seen = new Set<number>();
+  loaded.committed.forEach((raw, index) => {
+    const entry = validateEntry(raw);
+    if (entry === null) {
+      quarantined.push({
+        index,
+        reason: "malformed committed entry (failed the fail-closed entry validation)",
+        raw,
+      });
+      return;
+    }
+    if (seen.has(entry.agent_uid)) {
+      quarantined.push({ index, reason: `duplicate committed agent_uid ${entry.agent_uid}`, raw });
+      return;
+    }
+    seen.add(entry.agent_uid);
+    entries.push(entry);
+  });
+  return { entries, quarantined };
+}
+
+/**
  * The pf-union view of a registry entry (what the pf primitives consume). A
  * tombstoned entry (S5-2) is threaded through as a block-only union member, so
  * arm + liveness render/verify its four block-drops and REJECT any gate pass
@@ -366,6 +467,7 @@ export class PfAnchorRegistry {
   private readonly armUnion: NonNullable<PfAnchorRegistryOps["armUnion"]>;
   private readonly disarm: NonNullable<PfAnchorRegistryOps["disarm"]>;
   private readonly unionLiveness: NonNullable<PfAnchorRegistryOps["unionLiveness"]>;
+  private readonly quarantineForensics: NonNullable<PfAnchorRegistryOps["quarantineForensics"]>;
 
   constructor(ops: PfAnchorRegistryOps) {
     this.store = ops.store;
@@ -381,6 +483,7 @@ export class PfAnchorRegistry {
     this.unionLiveness =
       ops.unionLiveness ??
       ((entries) => checkPfAnchorUnionLiveness(runner, entries, anchorName));
+    this.quarantineForensics = ops.quarantineForensics ?? createFsQuarantineForensicsWriter();
   }
 
   /**
@@ -430,34 +533,7 @@ export class PfAnchorRegistry {
     if (loaded === null) {
       return { entries: [], dirty: false, quarantined: [] };
     }
-    if (typeof loaded !== "object") {
-      throw new PfAnchorRegistryStateError("not an object");
-    }
-    if (loaded.version !== PF_ANCHOR_REGISTRY_STATE_VERSION) {
-      throw new PfAnchorRegistryStateError(`unknown state version ${String(loaded.version)}`);
-    }
-    if (!Array.isArray(loaded.committed)) {
-      throw new PfAnchorRegistryStateError("committed is not an array");
-    }
-    const entries: PfAnchorRegistryEntry[] = [];
-    const quarantined: { index: number; reason: string }[] = [];
-    const seen = new Set<number>();
-    loaded.committed.forEach((raw, index) => {
-      const entry = validateEntry(raw);
-      if (entry === null) {
-        quarantined.push({
-          index,
-          reason: "malformed committed entry (failed the fail-closed entry validation)",
-        });
-        return;
-      }
-      if (seen.has(entry.agent_uid)) {
-        quarantined.push({ index, reason: `duplicate committed agent_uid ${entry.agent_uid}` });
-        return;
-      }
-      seen.add(entry.agent_uid);
-      entries.push(entry);
-    });
+    const { entries, quarantined } = classifyCommitted(loaded);
     const enableTokenValid =
       typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token);
     const dirty =
@@ -465,7 +541,110 @@ export class PfAnchorRegistry {
       loaded.pending !== undefined ||
       quarantined.length > 0 ||
       (entries.length > 0 && !enableTokenValid);
-    return { entries, dirty, quarantined };
+    return {
+      entries,
+      dirty,
+      quarantined: quarantined.map((q) => ({ index: q.index, reason: q.reason })),
+    };
+  }
+
+  /**
+   * The coded recovery path for a QUARANTINED committed entry (fix-round-4
+   * P2). A malformed committed entry correctly marks the registry dirty
+   * (fail-closed: every token is withheld host-wide), but every registry
+   * MUTATION normalizes wholesale via `normalizeState`, which THROWS on that
+   * same entry -- so without this verb the documented repair
+   * (`--repair-egress-gate`) failed before it could rewrite anything and the
+   * only way out was manual registry surgery.
+   *
+   * SEMANTICS (root-only caller, loud, audited by the repair sequence):
+   *  - Acts ONLY on entries the quarantine listing itself classifies as
+   *    malformed/duplicate ({@link classifyCommitted} -- the exact same
+   *    boundary `listQuarantined` reports). Transiently-invalid state (a
+   *    missing/garbled enable token, a journaled `pending` set, an explicit
+   *    dirty marker) is NEVER grounds to drop an entry: with no quarantined
+   *    entry this is a read-only no-op and the normal mutation reconcile
+   *    handles that dirt without discarding confinement state.
+   *  - STRUCTURAL corruption (unparseable file, wrong version, `committed`
+   *    not an array) still throws wholesale: nothing salvageable.
+   *  - Forensics FIRST: every quarantined entry's raw content is persisted
+   *    through the injected {@link PfAnchorRegistryOps.quarantineForensics}
+   *    sink BEFORE any removal; a forensic write failure aborts the repair
+   *    with the registry untouched.
+   *  - Fail-closed disposition per entry: when the raw entry's
+   *    uid/port/fortress still validate, the uid is KEPT as a block-only
+   *    TOMBSTONE (packet-confined, gate channel gone) rather than dropped --
+   *    removing it would drop its live block rules from the anchor
+   *    (fail-open). Only an entry with nothing renderable (or a duplicate of
+   *    a valid sibling) is removed outright. Either way the affected uid
+   *    needs re-provisioning before its gate serves again.
+   *  - The remaining union is re-rendered + re-armed and the state persisted
+   *    CLEAN (the explicit re-assert supersedes any journaled `pending`,
+   *    exactly like reconcile-on-entry). An arm/save failure leaves the
+   *    on-disk registry untouched (still quarantined + dirty, posture red)
+   *    and throws.
+   */
+  async repairQuarantined(): Promise<PfAnchorQuarantineRepairResult> {
+    return withProvisionLock(this.lockPath, this.lock, async () => {
+      const loaded = await this.store.load();
+      if (loaded === null) {
+        return { repaired: false, findings: [], forensicPath: null, remaining: [] };
+      }
+      const { entries: valid, quarantined } = classifyCommitted(loaded);
+      if (quarantined.length === 0) {
+        return { repaired: false, findings: [], forensicPath: null, remaining: valid };
+      }
+      // Forensics FIRST: nothing is removed unless its raw bytes are preserved.
+      const forensicPath = await this.quarantineForensics(
+        JSON.stringify(
+          {
+            captured_at: new Date().toISOString(),
+            registry_version: loaded.version,
+            note:
+              "raw committed entries removed/tombstoned by the quarantine repair verb " +
+              "(sanctuary protect --repair-egress-gate); the affected uid(s) must be re-provisioned",
+            quarantined,
+          },
+          null,
+          2,
+        ),
+      );
+      const findings: PfAnchorQuarantineRepairFinding[] = [];
+      const next = [...valid];
+      for (const q of quarantined) {
+        const raw = (q.raw !== null && typeof q.raw === "object" ? q.raw : {}) as Record<string, unknown>;
+        const uid =
+          typeof raw.agent_uid === "number" && Number.isInteger(raw.agent_uid) ? raw.agent_uid : null;
+        let disposition: PfAnchorQuarantineRepairFinding["disposition"] = "removed";
+        if (uid !== null && !next.some((e) => e.agent_uid === uid)) {
+          const salvage = validateEntry({
+            agent_uid: raw.agent_uid,
+            gate_port: raw.gate_port,
+            fortress_path: raw.fortress_path,
+            tombstone: true,
+          });
+          if (salvage !== null) {
+            next.push(salvage);
+            disposition = "tombstoned";
+          }
+        }
+        findings.push({ index: q.index, reason: q.reason, agent_uid: uid, disposition });
+      }
+      // Re-render + re-arm the union from what remains, then persist CLEAN. A
+      // failure here propagates with the on-disk registry untouched: still
+      // quarantined + dirty, posture red, repair still owed -- never a
+      // half-repaired silent state.
+      const state: PfAnchorRegistryState = {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: next,
+      };
+      if (typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token)) {
+        state.enable_token = loaded.enable_token;
+      }
+      await this.applyUnion(state, next);
+      await this.store.save(state);
+      return { repaired: true, findings, forensicPath, remaining: next };
+    });
   }
 
   /**

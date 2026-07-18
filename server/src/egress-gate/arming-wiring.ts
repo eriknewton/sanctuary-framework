@@ -46,7 +46,11 @@ import {
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { PfAnchorRegistry, createFsRegistryStore } from "./anchor-registry.js";
+import {
+  PfAnchorRegistry,
+  createFsRegistryStore,
+  type PfAnchorQuarantineRepairResult,
+} from "./anchor-registry.js";
 import type { PfLivenessResult } from "./pf-anchor.js";
 import {
   GenerationCoordinator,
@@ -396,6 +400,11 @@ export interface ExclusiveEgressWiringInput {
   print(line: string): void;
   /** Account-provision ops (the shipped sysadminctl/dscl real ops). */
   accountOps: Parameters<typeof planAndCreateGateAccount>[1];
+  /** TEST-ONLY seams; production omits (real barrier ops + real sequence). */
+  internals?: {
+    barrierOps?: ReleaseBarrierOps;
+    runBarrier?: typeof runReleaseBarrierSequence;
+  };
 }
 
 interface BringUpState {
@@ -952,14 +961,12 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
       return productionBringUp(input, s, o);
     },
     async runReleaseSequence(committed): Promise<ReleaseBarrierOutcome> {
-      const { state: s, oracle: o } = await ensureState();
-      return runReleaseBarrierSequence(
-        {
-          agentUid: input.agentUid,
-          harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
-          harnessArgv: input.harnessArgv,
-        },
-        createProductionReleaseBarrierOps({
+      let barrierOps: ReleaseBarrierOps;
+      if (input.internals?.barrierOps !== undefined) {
+        barrierOps = input.internals.barrierOps;
+      } else {
+        const { state: s, oracle: o } = await ensureState();
+        barrierOps = createProductionReleaseBarrierOps({
           agentUid: committed.agent_uid,
           agentAccount: input.agentAccount,
           harnessArgv: input.harnessArgv,
@@ -969,7 +976,40 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
           oracle: o,
           rearm: "install-noop",
           print: input.print,
-        }),
+        });
+      }
+      // Fix-round-4 P1: bind the release to the generation THIS RUN brought
+      // up, exactly like the boot path's fix-round-3 MED-4 guard. The barrier
+      // ops' `commitGeneration` re-reads the registry and would bind to
+      // whatever generation is CURRENT -- under a concurrent repair/install
+      // for the same uid, run A would release run B's generation with A's
+      // stale context (gate uid, oracle, argv) while A's caller audits and
+      // reports A's generation id. A mismatch THROWS, which the barrier maps
+      // to a loud fail-closed park at commit-generation (agent stays parked).
+      const guardedOps: ReleaseBarrierOps = {
+        ...barrierOps,
+        commitGeneration: async (): Promise<CommittedGenerationIdentity> => {
+          const observed = await barrierOps.commitGeneration();
+          if (observed.generation_id !== committed.generation_id) {
+            throw new Error(
+              `registry changed during release for uid ${input.agentUid}: this run brought up committed ` +
+                `generation ${committed.generation_id} but the registry now commits generation ` +
+                `${observed.generation_id} (a concurrent install/repair advanced it); refusing to ` +
+                "release a generation this run did not bring up; the agent stays parked fail-closed " +
+                "-- re-run the repair",
+            );
+          }
+          return observed;
+        },
+      };
+      const runBarrier = input.internals?.runBarrier ?? runReleaseBarrierSequence;
+      return runBarrier(
+        {
+          agentUid: input.agentUid,
+          harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
+          harnessArgv: input.harnessArgv,
+        },
+        guardedOps,
       );
     },
     async restoreCoarseComposition(reason): Promise<void> {
@@ -1271,6 +1311,7 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
   diffTransientPfRules(): Promise<{ foreign: string[] }>;
   parkHarness(): Promise<void>;
   verifyParkedPersistent(): Promise<{ ok: true } | { ok: false; problems: string[] }>;
+  repairQuarantinedRegistry(): Promise<PfAnchorQuarantineRepairResult>;
   recoverGeneration(): Promise<void>;
   bringUpGeneration(): Promise<ExclusiveGenerationIdentity>;
   runReleaseSequence(committed: ExclusiveGenerationIdentity): Promise<ReleaseBarrierOutcome>;
@@ -1292,6 +1333,14 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
     },
     parkHarness: () => parkHarnessPersistently(parkCtx),
     verifyParkedPersistent: () => verifyHarnessParkedPersistent(parkCtx),
+    async repairQuarantinedRegistry(): Promise<PfAnchorQuarantineRepairResult> {
+      // Fix-round-4 P2: the coded recovery path for a quarantined committed
+      // entry. Every OTHER registry mutation in the repair sequence enters
+      // through `normalizeState`, which throws on the malformed entry -- so
+      // this must run FIRST or the documented repair verb can never rewrite
+      // anything (host-wide token denial until manual surgery).
+      return createProductionAnchorRegistry().repairQuarantined();
+    },
     async recoverGeneration(): Promise<void> {
       const registry = createProductionAnchorRegistry();
       const coordinator = new GenerationCoordinator({

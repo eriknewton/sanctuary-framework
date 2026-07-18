@@ -202,6 +202,12 @@ function repairOps(overrides: Partial<EgressGateRepairOps> = {}): EgressGateRepa
     diffTransientPfRules: vi.fn(async () => ({ foreign: [] })),
     parkHarness: vi.fn(async () => undefined),
     verifyParkedPersistent: vi.fn(async () => ({ ok: true as const })),
+    repairQuarantinedRegistry: vi.fn(async () => ({
+      repaired: false,
+      findings: [],
+      forensicPath: null,
+      remaining: [],
+    })),
     recoverGeneration: vi.fn(async () => undefined),
     bringUpGeneration: vi.fn(async () => ({ ...COMMITTED })),
     runReleaseSequence: vi.fn(async () => RELEASED),

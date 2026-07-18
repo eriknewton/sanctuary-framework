@@ -32,6 +32,7 @@
 import type {
   ReleaseBarrierOutcome,
 } from "../../egress-gate/release-barrier.js";
+import type { PfAnchorQuarantineRepairResult } from "../../egress-gate/anchor-registry.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EXCLUSIVE_EGRESS_ARMED_AUDIT_OP = "exclusive_egress_armed";
@@ -39,6 +40,7 @@ export const EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP = "exclusive_egress_degraded_coa
 export const EGRESS_GATE_REPAIR_AUDIT_OP = "egress_gate_repair";
 export const EGRESS_GATE_REPAIR_REFUSED_AUDIT_OP = "egress_gate_repair_refused";
 export const EGRESS_GATE_REPAIR_OVERRIDE_AUDIT_OP = "egress_gate_repair_override";
+export const EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP = "egress_gate_repair_quarantine";
 
 /** The committed identity the stage keys the release on (S5-2 G5 output). */
 export interface ExclusiveGenerationIdentity {
@@ -319,6 +321,25 @@ export interface EgressGateRepairOps {
    */
   verifyParkedPersistent(): Promise<{ ok: true } | { ok: false; problems: string[] }>;
   /**
+   * The coded recovery path for a QUARANTINED committed registry entry
+   * (fix-round-4 P2). A malformed committed entry marks the registry dirty
+   * (correct, fail-closed: tokens are withheld host-wide), but every registry
+   * MUTATION the rest of this sequence performs normalizes wholesale and
+   * THROWS on that same entry -- so without this step the documented repair
+   * verb failed before it could rewrite anything (permanent host-wide token
+   * denial until manual registry surgery). Production (root-only, locked):
+   * captures each quarantined entry's raw content to a forensic sidecar
+   * FIRST, then removes it (or keeps the uid as a block-only tombstone when
+   * its uid/port/fortress still validate -- never dropping live block rules),
+   * re-renders + re-arms the union from the remaining valid entries, and
+   * persists clean. Acts ONLY on entries the quarantine listing classifies as
+   * malformed; transiently-invalid state (missing enable token, journaled
+   * pending) never drops an entry. No-op when nothing is quarantined. Throws
+   * on failure (the repair then fails at the distinct `quarantine-repair`
+   * stage with the registry untouched).
+   */
+  repairQuarantinedRegistry(): Promise<PfAnchorQuarantineRepairResult>;
+  /**
    * Recover any in-flight (uncommitted) generation first (production: the
    * S5-2 `GenerationCoordinator.recover` -- discard/tombstone per the crash
    * table). Throws on failure.
@@ -359,7 +380,7 @@ export type EgressGateRepairOutcome =
    */
   | {
       kind: "repair-failed";
-      stage: "park" | "recover" | "bring-up" | "release";
+      stage: "park" | "quarantine-repair" | "recover" | "bring-up" | "release";
       reason: string;
       parkedStateVerified: boolean;
       parkedStateProblems: string[];
@@ -389,7 +410,7 @@ export async function runEgressGateRepair(
   // job disabled + hold file absent + parked plist); a throwing probe reads
   // as not-verified with the throw enumerated.
   const failParked = async (
-    stage: "park" | "recover" | "bring-up" | "release",
+    stage: "park" | "quarantine-repair" | "recover" | "bring-up" | "release",
     reason: string,
   ): Promise<EgressGateRepairOutcome> => {
     let parked: { ok: true } | { ok: false; problems: string[] };
@@ -469,6 +490,48 @@ export async function runEgressGateRepair(
     await ops.parkHarness();
   } catch (err) {
     return failParked("park", `could not park the harness before repair: ${(err as Error).message}`);
+  }
+
+  // Stage: quarantine-repair (fix-round-4 P2). MUST run before any other
+  // registry mutation: a quarantined (structurally malformed) committed entry
+  // makes every wholesale-normalizing mutation below throw, so without this
+  // coded path the repair verb the dirty-registry log lines point at could
+  // never rewrite anything -- host-wide token denial until manual surgery.
+  // The verb is a no-op when nothing is quarantined, acts ONLY on entries the
+  // quarantine listing classifies as malformed (transiently-invalid state is
+  // never grounds to drop an entry), and preserves each removed entry's raw
+  // content in a forensic sidecar before touching it.
+  try {
+    const quarantine = await ops.repairQuarantinedRegistry();
+    if (quarantine.repaired) {
+      await ops.audit(EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP, {
+        agent_uid: ctx.agentUid,
+        forensic_path: quarantine.forensicPath,
+        quarantined: quarantine.findings.map((f) => ({
+          index: f.index,
+          reason: f.reason,
+          agent_uid: f.agent_uid,
+          disposition: f.disposition,
+        })),
+      });
+      for (const f of quarantine.findings) {
+        const uidText = f.agent_uid !== null ? `uid ${f.agent_uid}` : "an unrecoverable uid";
+        const dispositionText =
+          f.disposition === "tombstoned"
+            ? "TOMBSTONED block-only (the uid stays packet-confined; its gate channel is gone)"
+            : "REMOVED from the committed set";
+        ops.print(
+          `Quarantined registry entry #${f.index} (${uidText}) was ${dispositionText}: ${f.reason}. ` +
+            `Raw entry preserved for forensics at ${quarantine.forensicPath}. The affected agent ` +
+            "must be RE-PROVISIONED (sudo sanctuary protect) before its gate can serve again.",
+        );
+      }
+    }
+  } catch (err) {
+    return failParked(
+      "quarantine-repair",
+      `quarantined-registry repair failed (registry left untouched, still dirty): ${(err as Error).message}`,
+    );
   }
 
   try {
