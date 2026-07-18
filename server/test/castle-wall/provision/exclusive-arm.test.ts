@@ -653,6 +653,61 @@ describe("runEgressGateRepair quarantine-repair stage (fix-round-4 P2)", () => {
     expect(printed.join("\n")).toContain("entry #3 (an unrecoverable uid)");
   });
 
+  it("a repaired PARSEABLE malformed generation floor is LOUD and audited (fix-round-6 F1)", async () => {
+    const printed: string[] = [];
+    const floorRepair = { raw: "8", parsed: 8, resolved_floor: 8, unrecoverable: false };
+    const ops = repairOps({
+      repairQuarantinedRegistry: vi.fn(async () => ({
+        ...QUARANTINE_RESULT,
+        findings: [],
+        floorRepair,
+      })),
+      print: vi.fn((line: string) => {
+        printed.push(line);
+      }),
+    });
+    await runEgressGateRepair(REPAIR_CTX, ops);
+    const log = printed.join("\n");
+    expect(log).toContain("generation floor was malformed");
+    expect(log).toContain('"8"');
+    expect(log).toContain("parsed to 8");
+    expect(log).toContain("folded into the repaired floor (8)");
+    expect(ops.audit).toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP,
+      expect.objectContaining({ generation_floor_repair: floorRepair }),
+    );
+  });
+
+  it("an UNRECOVERABLE malformed generation floor is LOUD: reset named, re-provision advised, audited (fix-round-6 F1)", async () => {
+    const printed: string[] = [];
+    const floorRepair = {
+      raw: { bogus: true },
+      parsed: null,
+      resolved_floor: 9,
+      unrecoverable: true,
+    };
+    const ops = repairOps({
+      repairQuarantinedRegistry: vi.fn(async () => ({
+        ...QUARANTINE_RESULT,
+        findings: [],
+        floorRepair,
+      })),
+      print: vi.fn((line: string) => {
+        printed.push(line);
+      }),
+    });
+    await runEgressGateRepair(REPAIR_CTX, ops);
+    const log = printed.join("\n");
+    expect(log).toContain("UNRECOVERABLE");
+    expect(log).toContain("reset to the maximum generation still observable");
+    expect(log).toContain("(9)");
+    expect(log).toContain("RE-PROVISIONING");
+    expect(ops.audit).toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP,
+      expect.objectContaining({ generation_floor_repair: floorRepair }),
+    );
+  });
+
   it("a quarantine-repair failure -> repair-failed at the DISTINCT quarantine-repair stage, honest park, no downstream mutation", async () => {
     const ops = repairOps({
       repairQuarantinedRegistry: vi.fn(async () => {

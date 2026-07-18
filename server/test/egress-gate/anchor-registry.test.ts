@@ -909,3 +909,206 @@ describe("egress-gate/anchor-registry fix-round-5 (P1 generation floor on remova
     }
   });
 });
+
+describe("egress-gate/anchor-registry fix-round-6 (F1 malformed generation_floor preserved + repaired; F2 quarantine visibility)", () => {
+  const KEPT7: PfAnchorRegistryEntry = {
+    agent_uid: 502,
+    gate_port: 19998,
+    fortress_path: "/f/a",
+    generation_id: 7,
+  };
+  const TOMB9: PfAnchorRegistryEntry = {
+    agent_uid: 601,
+    gate_port: 20002,
+    fortress_path: "/f/c",
+    generation_id: 9,
+    tombstone: true,
+  };
+
+  /** One valid committed entry at gen 7, with a MALFORMED (string) floor "8". */
+  function malformedFloorState(floor: unknown = "8"): PfAnchorRegistryState {
+    return {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [KEPT7],
+      enable_token: "1",
+      generation_floor: floor as never,
+    };
+  }
+
+  it("F1: a malformed (string) floor is dirty AND its parseable value is folded into the effective floor -- never invisible to the allocator read", async () => {
+    const { registry } = makeRegistry({ initial: malformedFloorState("8") });
+    const listed = await registry.list();
+    expect(listed.dirty).toBe(true);
+    // Pre-fix the malformed floor was DROPPED (generationFloor undefined), so
+    // readGenerationFloor returned undefined and bring-up could allocate 8.
+    expect(listed.generationFloor).toBe(8);
+  });
+
+  it("F1: the raw floor SURVIVES ordinary mutations and dirty stays STICKY -- a successful mutation must never launder the floor away", async () => {
+    const { registry, store } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [A],
+        enable_token: "1",
+        generation_floor: "8" as never,
+      },
+    });
+    const res = await registry.addOrUpdate(B);
+    // Pre-fix: the mutation's commit save cleared dirty and persisted a state
+    // WITHOUT the floor (raw dropped at normalizeState) -- monotonicity
+    // fail-open. The result also hardcoded dirty: false.
+    expect(res.dirty).toBe(true);
+    expect(store.current?.dirty).toBe(true);
+    expect(store.current?.generation_floor_raw).toBe("8");
+    expect(store.current?.generation_floor).toBe(8);
+    // A second mutation still carries it (nothing but repair may consume it).
+    await registry.remove(B.agent_uid);
+    expect(store.current?.dirty).toBe(true);
+    expect(store.current?.generation_floor_raw).toBe("8");
+    expect(store.current?.generation_floor).toBe(8);
+  });
+
+  it("F1: a REAL bring-up through the production-shaped adapter allocates ABOVE the parseable raw floor while dirty (never at-or-below)", async () => {
+    const { registry } = makeRegistry({ initial: malformedFloorState("8") });
+    const staging = new Map<number, GenerationStagingRecord>();
+    const coord = new GenerationCoordinator({
+      bind: async () => ({
+        port: 45001,
+        pid: 9001,
+        pidStart: "start-9001",
+        release: async () => {},
+      }),
+      verifyOwner: async () => true,
+      registry: {
+        armEntry: async (entry) => {
+          await registry.addOrUpdate(entry);
+        },
+        tombstone: async (uid, fallback) => {
+          await registry.tombstone(uid, fallback);
+        },
+        readEntry: async (uid) =>
+          (await registry.list()).entries.find((e) => e.agent_uid === uid) ?? null,
+        readGenerationFloor: async () => (await registry.list()).generationFloor,
+      },
+      publishManifest: async () => {},
+      staging: {
+        load: async (uid) => staging.get(uid) ?? null,
+        save: async (record) => {
+          staging.set(record.agent_uid, record);
+        },
+        delete: async (uid) => {
+          staging.delete(uid);
+        },
+      },
+      lock: memLock(),
+    });
+    const committed = await coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" });
+    // Pre-fix: the dropped floor made computeNextGenerationId(7, undefined,
+    // undefined) allocate 8 -- exactly the id the floor "8" says is spent.
+    // (The dirty registry separately withholds RELEASE; this pins that the
+    // ALLOCATOR also respects the parseable raw floor.)
+    expect(committed.generation_id).toBe(9);
+  });
+
+  it("F2: listQuarantined reports a malformed floor as a distinct registry-LEVEL finding (index -1) and FORCES dirty", async () => {
+    const { registry } = makeRegistry({ initial: malformedFloorState("8") });
+    const listed = await registry.listQuarantined();
+    // Pre-fix: dirty false + quarantined [] -- the boot refresh path read
+    // green over the malformed floor.
+    expect(listed.dirty).toBe(true);
+    expect(listed.entries).toEqual([KEPT7]);
+    expect(listed.quarantined).toEqual([
+      { index: -1, reason: expect.stringContaining("generation_floor is malformed") },
+    ]);
+  });
+
+  it("F1: repairQuarantined RESOLVES a parseable raw floor -- forensics first, floor persisted, raw consumed, dirty un-stuck", async () => {
+    const { registry, store, forensicWrites } = makeRegistry({
+      initial: malformedFloorState("8"),
+    });
+    const res = await registry.repairQuarantined();
+    // Pre-fix: no quarantined ENTRY meant "nothing to repair" (repaired:
+    // false) while the sticky dirty could never clear -- an unrepairable red.
+    expect(res.repaired).toBe(true);
+    expect(res.findings).toEqual([]); // no committed entry was touched
+    expect(res.remaining).toEqual([KEPT7]);
+    expect(res.floorRepair).toEqual({
+      raw: "8",
+      parsed: 8,
+      resolved_floor: 8,
+      unrecoverable: false,
+    });
+    expect(forensicWrites).toHaveLength(1); // bytes preserved BEFORE the rewrite
+    expect(store.current?.generation_floor).toBe(8);
+    expect(store.current?.generation_floor_raw).toBeUndefined();
+    const after = await registry.list();
+    expect(after.dirty).toBe(false);
+    expect(after.generationFloor).toBe(8);
+  });
+
+  it("F1: an UNPARSEABLE raw floor is reset to the max observable generation across entries + tombstones (no invented margin) and flagged unrecoverable", async () => {
+    const { registry, store } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [KEPT7, TOMB9],
+        enable_token: "1",
+        generation_floor: { bogus: true } as never,
+      },
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    expect(res.floorRepair).toEqual({
+      raw: { bogus: true },
+      parsed: null,
+      resolved_floor: 9, // max(gen 7 entry, gen 9 tombstone) + 0
+      unrecoverable: true,
+    });
+    expect(store.current?.generation_floor).toBe(9);
+    expect(store.current?.generation_floor_raw).toBeUndefined();
+    expect((await registry.list()).dirty).toBe(false);
+  });
+
+  it("F1: an unparseable raw floor with NO observable generation anywhere persists no floor at all (resolved_floor null, still loud)", async () => {
+    const { registry, store } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [A], // no generation_id anywhere
+        enable_token: "1",
+        generation_floor: true as never,
+      },
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    expect(res.floorRepair).toEqual({
+      raw: true,
+      parsed: null,
+      resolved_floor: null,
+      unrecoverable: true,
+    });
+    expect(store.current?.generation_floor).toBeUndefined();
+    expect(store.current?.generation_floor_raw).toBeUndefined();
+    expect((await registry.list()).dirty).toBe(false);
+  });
+
+  it("F1: a floor repair COMPOSES with an entry repair -- the parseable raw folds monotonically with a removed duplicate's generation", async () => {
+    const DUP8 = { agent_uid: 502, gate_port: 20009, fortress_path: "/f/a", generation_id: 8 };
+    const { registry, store } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [KEPT7, DUP8 as never],
+        enable_token: "1",
+        generation_floor: "20" as never,
+      },
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.findings).toHaveLength(1); // the removed gen-8 duplicate
+    expect(res.floorRepair).toEqual({
+      raw: "20",
+      parsed: 20,
+      resolved_floor: 20, // max(removed 8, parsed 20): monotone fold
+      unrecoverable: false,
+    });
+    expect(store.current?.generation_floor).toBe(20);
+    expect((await registry.list()).dirty).toBe(false);
+  });
+});

@@ -26,6 +26,11 @@ import {
   type BootRegistryEntry,
   type ExclusiveEgressBootSupervisorInternals,
 } from "../../src/egress-gate/arming-wiring.js";
+import {
+  PfAnchorRegistry,
+  PF_ANCHOR_REGISTRY_STATE_VERSION,
+  type PfAnchorRegistryState,
+} from "../../src/egress-gate/anchor-registry.js";
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
 import {
   runReleaseBarrierSequence,
@@ -745,5 +750,71 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-c
     });
     handle.stopOracleLoop();
     expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+  });
+});
+
+describe("startExclusiveEgressBootSupervisor (fix-round-6 F2: malformed generation_floor withholds tokens through the REAL quarantine listing)", () => {
+  it("the boot refresh withholds every token while the registry's generation_floor is malformed", async () => {
+    // A REAL PfAnchorRegistry over an in-memory store: the boot supervisor's
+    // listing seam routes through the PRODUCTION listQuarantined semantics,
+    // so this refutes the pre-fix behavior where a malformed floor was
+    // invisible on this read path (dirty: false -> tokens kept flowing over a
+    // generation-monotonicity hole).
+    const state: PfAnchorRegistryState = {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [
+        { agent_uid: 502, gate_port: 40001, fortress_path: "/fortress/a", generation_id: 7 },
+      ],
+      enable_token: "1",
+      generation_floor: "9" as never,
+    };
+    const registry = new PfAnchorRegistry({
+      store: {
+        load: async () => structuredClone(state),
+        save: async () => undefined,
+      },
+      lock: { acquire: async () => undefined, release: async () => undefined },
+      runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
+      armUnion: async () => ({ settleProbes: 1, enableToken: "1" }),
+      disarm: async () => undefined,
+      unionLiveness: async () => ({ live: true, reasons: [] }),
+    });
+    const refreshed: number[] = [];
+    const printed: string[] = [];
+    let listCalls = 0;
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 5,
+      internals: baseInternals({
+        listRegistryEntries: async () => {
+          listCalls += 1;
+          const listed = await registry.listQuarantined();
+          return { entries: listed.entries, quarantined: listed.quarantined, dirty: listed.dirty };
+        },
+        createOracle: (() => ({
+          refresh: async (binding: { agentUid: number }) => {
+            refreshed.push(binding.agentUid);
+            return null;
+          },
+        })) as never,
+      }),
+    });
+    // Many full refresh ticks (load-robust deadline).
+    const deadline = Date.now() + 10_000;
+    while (listCalls < 5 && Date.now() < deadline) {
+      await sleep(5);
+    }
+    handle.stopOracleLoop();
+    // Pre-fix: listQuarantined read GREEN over the malformed floor (dirty
+    // false, no finding), so the uid's token was re-signed every tick.
+    expect(refreshed).toHaveLength(0);
+    const log = printed.join("\n");
+    // The distinct registry-level finding is loud on the boot path...
+    expect(log).toContain("generation_floor is malformed");
+    // ...and the withholding names the uid and the dirty fail-closed rule.
+    const withheldLines = printed.filter((l) => l.includes("WITHHELD") && l.includes("uid 502"));
+    expect(withheldLines).toHaveLength(1);
   });
 });
