@@ -21,6 +21,11 @@
  *      agent's process must be DOWN and unbootable before any of its
  *      confinement is dismantled -- removing the registry entry drops the
  *      uid's four block-drops, so a still-running agent would be UNCONFINED.
+ *      SIBLING-AWARE (production wiring): the harness launchd label + plist are
+ *      a HOST SINGLETON, so the shared bootout/disable/plist ops run only when
+ *      the leaving uid is the LAST one behind the label; while a sibling
+ *      remains, only the leaving uid's own hold file is removed and a running
+ *      shared label refuses the park (fail-closed).
  *   2. RECOVER any in-flight generation (the S5-2 crash table: a dead pre-pf
  *      staging record is discarded; a staged-but-uncommitted generation is
  *      block-only tombstoned with its generation id carried into the entry,
@@ -31,15 +36,21 @@
  *   4. CREDENTIAL teardown: oracle freshness token invalidated + the
  *      generation-bound bearer credential revoked (file + gate accept-state,
  *      design M5: "unprotect removes the file and the gate-side accept-state").
- *   5. POLICY teardown: exclusive routing marker, fortress gate policy file,
- *      gate-readable runtime config copies, gate daemon plist, per-uid gate
- *      runtime dir.
- *   6. MANIFEST scrub: every `provisioned-<harness>-*` rule removed from the
+ *   5. MANIFEST scrub: every `provisioned-<harness>-*` rule removed from the
  *      signing source + verified none survive (the agent is LEAVING; its
  *      grants must not survive as orphans -- gate-scoped OR agent-scoped),
- *      then the signing daemon reloaded (with the marker gone the compose is
- *      plain coarse; a reload failure is reported, not thrown, because the
- *      rules are already gone from the signing source).
+ *      then the signing daemon reloaded (a reload failure is reported, not
+ *      thrown, because the rules are already gone from the signing source).
+ *      Runs BEFORE the routing-marker removal (fix-round LOW-2): scrubbing
+ *      first means a crash-then-external-reload window composes
+ *      marker-present-but-no-rules (agent BLOCKED, fail-closed), never
+ *      marker-gone-but-rules-present (agent-scoped direct grants, fail-open).
+ *   6. POLICY teardown: gate-readable runtime config copies, gate daemon plist,
+ *      per-uid gate runtime dir (always), plus the FORTRESS-SHARED exclusive
+ *      routing marker + gate policy file -- the latter two removed ONLY when
+ *      the leaving uid is the last confined uid in the fortress (the same
+ *      last-leaves rule as the flush); RETAINED while a sibling shares the
+ *      fortress so it stays routed + protected.
  *   7. REGISTRY REMOVE, LAST: the union re-renders WITHOUT the leaving uid,
  *      every REMAINING uid's confinement is re-verified exact-live by the
  *      registry's own transaction machinery (never a partial union), and the
@@ -77,8 +88,8 @@ export type EgressGateUnprotectStage =
   | "recover"
   | "gate-daemon"
   | "credential"
-  | "policy"
   | "manifest-scrub"
+  | "policy"
   | "registry";
 
 /** Context for one unprotect run. */
@@ -128,9 +139,12 @@ export interface EgressGateUnprotectOps {
    */
   revokeCredential(): Promise<void>;
   /**
-   * Remove the uid's gate policy surfaces: exclusive routing marker, fortress
-   * gate policy file, gate-readable runtime config copies, gate daemon plist,
-   * per-uid runtime dir. Each removal idempotent (`rm -f` semantics).
+   * Remove the uid's gate policy surfaces. The per-uid surfaces (gate-readable
+   * runtime config copies, gate daemon plist, per-uid runtime dir) always go;
+   * the FORTRESS-SHARED exclusive routing marker + gate policy file are removed
+   * ONLY when the leaving uid is the last confined uid in the fortress (the
+   * production wiring enforces that last-leaves guard) so a sibling in the same
+   * fortress stays routed + protected. Each removal idempotent (`rm -f`).
    */
   removeGateSurfaces(): Promise<void>;
   /**
@@ -253,14 +267,12 @@ export async function runEgressGateUnprotect(
     return fail("credential", `could not tear down the gate credential surfaces: ${(err as Error).message}`);
   }
 
-  // 5. Policy surfaces off.
-  try {
-    await ops.removeGateSurfaces();
-  } catch (err) {
-    return fail("policy", `could not remove the gate policy surfaces: ${(err as Error).message}`);
-  }
-
-  // 6. Manifest scrub (no orphan grants for a leaving agent) + reload.
+  // 5. Manifest scrub (no orphan grants for a leaving agent) + reload. This
+  // runs BEFORE the routing-marker removal (fix-round LOW-2): a crash between
+  // marker removal and the scrub, followed by an external policy-daemon reload,
+  // would otherwise compose the still-present provisioned rules AGENT-SCOPED
+  // (direct grants, no gate = fail-open). Scrubbing first means a crash in this
+  // window leaves marker-present-but-no-rules (the agent is BLOCKED, fail-closed).
   let scrub: { removedRuleIds: string[]; reloadOk: boolean };
   try {
     scrub = await ops.scrubProvisionedRules();
@@ -276,6 +288,16 @@ export async function runEgressGateUnprotect(
         "policy daemon reload could not be confirmed; the running daemon may serve the old compose " +
         "until its next reload.",
     );
+  }
+
+  // 6. Policy surfaces off. The FORTRESS-SHARED routing marker + gate policy
+  // file are torn down only when the leaving uid is the last confined uid in
+  // the fortress (the production op enforces that last-leaves guard); per-uid
+  // gate surfaces always go.
+  try {
+    await ops.removeGateSurfaces();
+  } catch (err) {
+    return fail("policy", `could not remove the gate policy surfaces: ${(err as Error).message}`);
   }
 
   // 7. Registry remove, LAST. Union re-render preserves every remaining uid;

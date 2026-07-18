@@ -2271,6 +2271,8 @@ function buildHermesExclusiveCliWiring(input: {
   print: (line: string) => void;
   accountOps: ReturnType<typeof realAccountProvisionOps>;
   cliBinary?: string;
+  /** S5-7 MED-1: argv-unavailable fallback park (remove the plist, not restore). */
+  parkPlistFallbackRemoval?: boolean;
 }): ExclusiveEgressWiringInput {
   const agentId = "hermes";
   const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
@@ -2321,6 +2323,7 @@ function buildHermesExclusiveCliWiring(input: {
     },
     print: input.print,
     accountOps: input.accountOps,
+    ...(input.parkPlistFallbackRemoval === true ? { parkPlistFallbackRemoval: true } : {}),
   };
 }
 
@@ -2434,7 +2437,7 @@ export async function runEgressGateRepairForCli(options: {
  * Run the S5-7 per-agent exclusive-egress UNPROTECT for the provisioned
  * fine-grained Hermes agent (Unified Protect Slice 5 S5-7): verified
  * persistent park -> generation recovery -> gate daemon down -> credential +
- * oracle-token teardown -> policy surfaces off -> provisioned-rule scrub ->
+ * oracle-token teardown -> provisioned-rule scrub -> policy surfaces off ->
  * registry remove (union re-render preserving every remaining confined uid;
  * the anchor is flushed ONLY when the last agent leaves). Returns a process
  * exit code (0 = unprotected; 2 = failed -- remaining protection intact, the
@@ -2485,13 +2488,29 @@ export async function runEgressGateUnprotectForCli(options: {
     );
     return 2;
   }
+  // MED-1 (teardown wedge on a damaged install): argv resolution needs the
+  // re-homed Hermes runtime tree (runtime files + system python + venv). If it
+  // was damaged or deleted, REFUSING here would wedge the unprotect verb
+  // permanently while pf rules + the registry entry + the gate daemon + the
+  // credential all persist -- a fail-closed dead-end with no recovery path. The
+  // argv is only needed to RE-RENDER the parked plist; an ABSENT plist is
+  // equally unbootable (and `verifyHarnessParkedPersistent` accepts it), so we
+  // fall back to a plist-REMOVAL park and still complete the teardown. A
+  // harmless absolute placeholder keeps the parked-plan renderer from throwing;
+  // it is never written to disk (the plist is removed on this path).
   let harnessArgv: string[];
+  let parkPlistFallbackRemoval = false;
   try {
     const resolved = await resolveHermesGatewayArgv({ pathExists }, { agentHome: newAccountHome });
     harnessArgv = resolved.programArguments;
   } catch (err) {
-    print(`Could not resolve the harness argv for the unprotect (${(err as Error).message}); refusing.`);
-    return 2;
+    print(
+      `Could not resolve the harness argv for the unprotect (${(err as Error).message}); ` +
+        "falling back to a plist-removal park -- the harness will be left unbootable (no parked plist) and " +
+        "the teardown will still complete. (The re-homed Hermes runtime tree looks damaged or removed.)",
+    );
+    harnessArgv = ["/usr/bin/false"];
+    parkPlistFallbackRemoval = true;
   }
   const wiring = buildHermesExclusiveCliWiring({
     agentUid,
@@ -2503,6 +2522,7 @@ export async function runEgressGateUnprotectForCli(options: {
     auditSource: "sanctuary-protect-unprotect",
     print,
     accountOps,
+    parkPlistFallbackRemoval,
     ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
   });
   const outcome = await runEgressGateUnprotect(
@@ -2516,6 +2536,15 @@ export async function runEgressGateUnprotectForCli(options: {
           ? `Exclusive-egress protection removed for uid ${agentUid}; no confined agents remain (pf anchor flushed).`
           : `Exclusive-egress protection removed for uid ${agentUid}; ${outcome.remainingUids.length} confined ` +
               "agent(s) remain with confinement re-verified live.",
+      );
+      // LOW-2 (UX honesty): unprotect removes the exclusive-egress GATE and
+      // parks the harness DOWN -- it does NOT re-release the agent to run under
+      // the coarse wall. The harness stays parked/unbootable until it is
+      // explicitly re-provisioned or the operator releases it. (Account removal
+      // and coarse-wall disarm are separate, operator-present steps.)
+      print(
+        "The agent harness is left PARKED (down / unbootable), not running coarse -- re-provision or " +
+          "release it explicitly to bring it back up.",
       );
       if (outcome.registryDirty) {
         print(

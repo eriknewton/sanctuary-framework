@@ -608,6 +608,17 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     print: () => {},
   } as unknown as ExclusiveEgressWiringInput;
 
+  /**
+   * A registry whose `list()` returns a fixed committed set -- the only method
+   * the sibling-sharing snapshot reads. Everything else is undefined (the
+   * teardown ops under test never call it).
+   */
+  function stubListRegistry(
+    entries: Array<{ agent_uid: number; gate_port: number; fortress_path: string; tombstone?: boolean }>,
+  ): PfAnchorRegistry {
+    return { list: async () => ({ entries, dirty: false }) } as unknown as PfAnchorRegistry;
+  }
+
   it("bootoutGateDaemon: not-running/not-found is SUCCESS; a genuine failure THROWS with the label named", async () => {
     const mk = (code: number, stderr: string) =>
       createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
@@ -637,22 +648,69 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     ]);
   });
 
-  it("removeGateSurfaces removes marker + fortress policy + plist + runtime configs + per-uid runtime dir", async () => {
+  it("removeGateSurfaces (LAST in fortress): per-uid surfaces first, then the fortress-shared marker + policy file", async () => {
     const removed: string[] = [];
     const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
       removeFile: async (path) => {
         removed.push(path);
       },
+      // Only the leaving uid is committed -> fortressShared === false.
+      registry: stubListRegistry([
+        { agent_uid: 601, gate_port: 20000, fortress_path: "/fortress/a" },
+      ]),
     });
     await ops.removeGateSurfaces();
     expect(removed).toEqual([
+      egressGateDaemonPlistPath(601),
+      egressGatePolicyConfigPath(601),
+      egressGateRulesConfigPath(601),
+      egressGateRuntimeUidDirPath(601),
       exclusiveRoutingMarkerPath("/fortress/a"),
       `/fortress/a/policy/egress/${EXCLUSIVE_EGRESS_GATE_FILENAME}`,
+    ]);
+  });
+
+  it("removeGateSurfaces (SIBLING in the same fortress): per-uid surfaces go, the shared marker + policy file are RETAINED", async () => {
+    const removed: string[] = [];
+    const printed: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(
+      { ...UNPROTECT_INPUT, print: (l: string) => printed.push(l) } as unknown as ExclusiveEgressWiringInput,
+      {
+        removeFile: async (path) => {
+          removed.push(path);
+        },
+        // A sibling uid 602 shares /fortress/a -> fortressShared === true.
+        registry: stubListRegistry([
+          { agent_uid: 601, gate_port: 20000, fortress_path: "/fortress/a" },
+          { agent_uid: 602, gate_port: 20001, fortress_path: "/fortress/a" },
+        ]),
+      },
+    );
+    await ops.removeGateSurfaces();
+    // Per-uid surfaces are removed; the shared marker + policy file are NOT.
+    expect(removed).toEqual([
       egressGateDaemonPlistPath(601),
       egressGatePolicyConfigPath(601),
       egressGateRulesConfigPath(601),
       egressGateRuntimeUidDirPath(601),
     ]);
+    expect(removed).not.toContain(exclusiveRoutingMarkerPath("/fortress/a"));
+    expect(printed.join("\n")).toContain("RETAINED");
+  });
+
+  it("removeGateSurfaces: a TOMBSTONE sibling does NOT retain the shared surfaces (a dead sibling is not a live user)", async () => {
+    const removed: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      removeFile: async (path) => {
+        removed.push(path);
+      },
+      registry: stubListRegistry([
+        { agent_uid: 601, gate_port: 20000, fortress_path: "/fortress/a" },
+        { agent_uid: 602, gate_port: 20001, fortress_path: "/fortress/a", tombstone: true },
+      ]),
+    });
+    await ops.removeGateSurfaces();
+    expect(removed).toContain(exclusiveRoutingMarkerPath("/fortress/a"));
   });
 
   it("removeRegistryEntry routes through the locked registry remove and maps remaining/flushed/dirty", async () => {
@@ -701,26 +759,87 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     });
   });
 
-  it("parkHarness/verifyParkedPersistent delegate to the S5-5 persistent-park helpers over the parkDeps seam", async () => {
+  const PARK_INPUT = {
+    ...UNPROTECT_INPUT,
+    agentUid: PARK_CTX.agentUid,
+    agentAccount: PARK_CTX.agentAccount,
+    harnessArgv: PARK_CTX.harnessArgv,
+    fortressPath: PARK_CTX.fortressPath,
+    harnessLogDir: PARK_CTX.harnessLogDir,
+  } as unknown as ExclusiveEgressWiringInput;
+
+  it("parkHarness (LAST behind the label) runs the full persistent park: bootout + disable + parked-plist restore, verified", async () => {
     const { fn, calls } = parkLaunchctl();
     const fs = parkFs();
-    const ops = createUnprotectExclusiveEgressOps(
-      {
-        ...UNPROTECT_INPUT,
-        agentUid: PARK_CTX.agentUid,
-        agentAccount: PARK_CTX.agentAccount,
-        harnessArgv: PARK_CTX.harnessArgv,
-        fortressPath: PARK_CTX.fortressPath,
-        harnessLogDir: PARK_CTX.harnessLogDir,
-      },
-      { parkDeps: { runLaunchctlFn: fn, ...fs } },
-    );
+    const ops = createUnprotectExclusiveEgressOps(PARK_INPUT, {
+      parkDeps: { runLaunchctlFn: fn, ...fs },
+      // Only the leaving uid is committed -> last behind the singleton label.
+      registry: stubListRegistry([
+        { agent_uid: PARK_CTX.agentUid, gate_port: 20000, fortress_path: PARK_CTX.fortressPath },
+      ]),
+    });
     await ops.parkHarness();
-    // The park ran the full persistent sequence (bootout + disable observed)
-    // and restored the PARKED plist form on disk.
     expect(calls.some((c) => c.startsWith("bootout"))).toBe(true);
     expect(calls.some((c) => c.startsWith("disable"))).toBe(true);
     expect(fs.files.get(PARKED_PLAN.plistPath)).toBe(PARKED_PLAN.plistContent);
+    await expect(ops.verifyParkedPersistent()).resolves.toEqual({ ok: true });
+  });
+
+  it("parkHarness (SIBLING remains behind the singleton label) does NOT bootout/disable the shared harness; only the leaving uid's hold file goes", async () => {
+    const { fn, calls } = parkLaunchctl();
+    const fs = parkFs({ [HOLD_PATH]: "stale hold file" });
+    const ops = createUnprotectExclusiveEgressOps(PARK_INPUT, {
+      parkDeps: { runLaunchctlFn: fn, ...fs },
+      // A sibling uid remains committed -> the shared label must be left alone.
+      registry: stubListRegistry([
+        { agent_uid: PARK_CTX.agentUid, gate_port: 20000, fortress_path: PARK_CTX.fortressPath },
+        { agent_uid: PARK_CTX.agentUid + 1, gate_port: 20001, fortress_path: "/fortress/other" },
+      ]),
+    });
+    await ops.parkHarness();
+    // The host-singleton harness label was NOT torn down (a sibling needs it).
+    expect(calls.some((c) => c.startsWith("bootout"))).toBe(false);
+    expect(calls.some((c) => c.startsWith("disable"))).toBe(false);
+    // The shared parked plist was NOT rewritten.
+    expect(fs.files.has(PARKED_PLAN.plistPath)).toBe(false);
+    // Only the leaving uid's per-uid hold file was removed.
+    expect(fs.files.has(HOLD_PATH)).toBe(false);
+    await expect(ops.verifyParkedPersistent()).resolves.toEqual({ ok: true });
+  });
+
+  it("parkHarness (SIBLING remains) FAILS CLOSED when the shared label is still RUNNING: it cannot prove the leaving uid is down", async () => {
+    // `print` reports the shared harness RUNNING (pid 4242) -> cannot attribute
+    // the process to a uid while a sibling shares the singleton label.
+    const { fn } = parkLaunchctl({ print: { code: 0, stdout: `pid = 4242\nstate = running\n` } });
+    const fs = parkFs({ [HOLD_PATH]: "stale hold file" });
+    const ops = createUnprotectExclusiveEgressOps(PARK_INPUT, {
+      parkDeps: { runLaunchctlFn: fn, ...fs },
+      registry: stubListRegistry([
+        { agent_uid: PARK_CTX.agentUid, gate_port: 20000, fortress_path: PARK_CTX.fortressPath },
+        { agent_uid: PARK_CTX.agentUid + 1, gate_port: 20001, fortress_path: "/fortress/other" },
+      ]),
+    });
+    await expect(ops.parkHarness()).rejects.toThrow(/park not verified/);
+  });
+
+  it("parkHarness (MED-1 argv-unavailable fallback, last behind the label) REMOVES the plist instead of restoring it; verified parked", async () => {
+    const { fn, calls } = parkLaunchctl();
+    // Simulate a stale released plist on disk that the fallback must remove.
+    const fs = parkFs({ [PARKED_PLAN.plistPath]: "<plist>stale released form</plist>" });
+    const ops = createUnprotectExclusiveEgressOps(
+      { ...PARK_INPUT, parkPlistFallbackRemoval: true } as unknown as ExclusiveEgressWiringInput,
+      {
+        parkDeps: { runLaunchctlFn: fn, ...fs },
+        registry: stubListRegistry([
+          { agent_uid: PARK_CTX.agentUid, gate_port: 20000, fortress_path: PARK_CTX.fortressPath },
+        ]),
+      },
+    );
+    await ops.parkHarness();
+    expect(calls.some((c) => c.startsWith("bootout"))).toBe(true);
+    expect(calls.some((c) => c.startsWith("disable"))).toBe(true);
+    // The plist is REMOVED (absent === unbootable), never re-rendered.
+    expect(fs.files.has(PARKED_PLAN.plistPath)).toBe(false);
     await expect(ops.verifyParkedPersistent()).resolves.toEqual({ ok: true });
   });
 });

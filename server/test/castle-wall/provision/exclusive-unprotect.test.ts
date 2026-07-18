@@ -96,17 +96,20 @@ describe("castle-wall/provision/exclusive-unprotect: happy paths", () => {
     expect(r.prints.some((l) => l.includes("602"))).toBe(true);
   });
 
-  it("runs the teardown in the contract order: park -> recover -> gate daemon -> credential -> policy -> scrub -> registry LAST", async () => {
+  it("runs the teardown in the contract order: park -> recover -> gate daemon -> credential -> scrub -> policy -> registry LAST", async () => {
     const r = makeOps();
     await runEgressGateUnprotect(ctx, r.ops);
+    // Fix-round LOW-2: the manifest scrub runs BEFORE the policy-surface
+    // (routing-marker) removal so a crash + external reload composes
+    // marker-present-no-rules (fail-closed), never marker-gone-rules-present.
     expect(r.calls).toEqual([
       "park",
       "recover",
       "bootout-gate",
       "invalidate-token",
       "revoke-credential",
-      "remove-surfaces",
       "scrub",
+      "remove-surfaces",
       "registry-remove",
     ]);
   });
@@ -227,19 +230,7 @@ describe("castle-wall/provision/exclusive-unprotect: fail-closed staged failures
     expect(r.calls).not.toContain("registry-remove");
   });
 
-  it("policy-surface removal failure: 'policy' stage, scrub + registry untouched", async () => {
-    const r = makeOps({
-      async removeGateSurfaces() {
-        throw new Error("EPERM: exclusive-routing.json");
-      },
-    });
-    const outcome = await runEgressGateUnprotect(ctx, r.ops);
-    expect(outcome).toMatchObject({ kind: "unprotect-failed", stage: "policy" });
-    expect(r.calls).not.toContain("scrub");
-    expect(r.calls).not.toContain("registry-remove");
-  });
-
-  it("scrub failure (a rule survived the verified read-back): 'manifest-scrub' stage, registry untouched", async () => {
+  it("scrub failure (a rule survived the verified read-back): 'manifest-scrub' stage, policy + registry untouched", async () => {
     const r = makeOps({
       async scrubProvisionedRules() {
         throw new Error("egress rule scrub left 1 provisioned rule file(s) behind");
@@ -247,6 +238,22 @@ describe("castle-wall/provision/exclusive-unprotect: fail-closed staged failures
     });
     const outcome = await runEgressGateUnprotect(ctx, r.ops);
     expect(outcome).toMatchObject({ kind: "unprotect-failed", stage: "manifest-scrub" });
+    // Scrub now runs BEFORE the policy-surface removal (LOW-2), so a scrub
+    // failure leaves the routing marker + registry untouched.
+    expect(r.calls).not.toContain("remove-surfaces");
+    expect(r.calls).not.toContain("registry-remove");
+  });
+
+  it("policy-surface removal failure: 'policy' stage, registry untouched (scrub already ran)", async () => {
+    const r = makeOps({
+      async removeGateSurfaces() {
+        throw new Error("EPERM: exclusive-routing.json");
+      },
+    });
+    const outcome = await runEgressGateUnprotect(ctx, r.ops);
+    expect(outcome).toMatchObject({ kind: "unprotect-failed", stage: "policy" });
+    // The scrub ran first (LOW-2 ordering); only the registry remove is skipped.
+    expect(r.calls).toContain("scrub");
     expect(r.calls).not.toContain("registry-remove");
   });
 
