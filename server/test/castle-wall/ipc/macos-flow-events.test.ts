@@ -40,6 +40,7 @@ import {
   type MacOSManifestProvider,
   type MacOSSubscriber,
 } from "../../../src/castle-wall/runtime/index.js";
+import type { EmissionLivenessNotes } from "../../../src/castle-wall/audit/emission-liveness.js";
 import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
@@ -629,6 +630,117 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         matched_rule_id: 42 as never,
       })
     ).toMatch(/matched_rule_id/);
+  });
+});
+
+describe("MacOSFlowEventConsumer : emission-liveness feed (Slice M)", () => {
+  interface RecordedNote {
+    decisions: string[];
+    emissions: number;
+    rejections: string[];
+  }
+  function makeNotes(): { notes: EmissionLivenessNotes; recorded: RecordedNote } {
+    const recorded: RecordedNote = { decisions: [], emissions: 0, rejections: [] };
+    const notes: EmissionLivenessNotes = {
+      noteDecision(source) {
+        recorded.decisions.push(source);
+      },
+      noteEmission() {
+        recorded.emissions += 1;
+      },
+      noteRejection(reason) {
+        recorded.rejections.push(reason);
+      },
+    };
+    return { notes, recorded };
+  }
+
+  const goodNotification: FlowDecisionRecordedNotification = {
+    type: "flow_decision_recorded",
+    decision: "allow",
+    destination: {
+      host: "api.anthropic.com",
+      ip: "104.18.32.10",
+      port: 443,
+      protocol: "tcp",
+      hostname_source: "sni",
+      opaque: false,
+    },
+    agent: { id: "agent-live", template: "coding-assistant" },
+    matched_rule_id: "rule-anthropic",
+    recorded_at: "2026-05-11T12:00:00Z",
+  };
+
+  it("notes a decision AND an emission on the channel-authenticated success path", async () => {
+    const { notes, recorded } = makeNotes();
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE], "sigA"),
+      approvalQueue: makeApprovalQueue().queue,
+      auditSink: makeAuditSink().sink,
+      defaultApprovalTimeoutSeconds: 30,
+      emissionLiveness: notes,
+    });
+    await consumer.handleFlowDecisionRecorded(goodNotification);
+    expect(recorded.decisions).toEqual(["flow_decision_recorded"]);
+    expect(recorded.emissions).toBe(1);
+    expect(recorded.rejections).toEqual([]);
+  });
+
+  it("notes a decision AND a rejection (never an emission) on a malformed notification", async () => {
+    const { notes, recorded } = makeNotes();
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE], "sigA"),
+      approvalQueue: makeApprovalQueue().queue,
+      auditSink: makeAuditSink().sink,
+      defaultApprovalTimeoutSeconds: 30,
+      emissionLiveness: notes,
+    });
+    const malformed = {
+      ...goodNotification,
+      decision: "INVALID",
+    } as unknown as FlowDecisionRecordedNotification;
+    await consumer.handleFlowDecisionRecorded(malformed);
+    expect(recorded.decisions).toEqual(["flow_decision_recorded"]);
+    expect(recorded.emissions).toBe(0);
+    expect(recorded.rejections).toHaveLength(1);
+    expect(recorded.rejections[0]).toMatch(/^validation:/);
+  });
+
+  it("notes a rejection (not an emission) when the channel-path persist throws", async () => {
+    const { notes, recorded } = makeNotes();
+    const throwingSink: AuditSink = {
+      append() {
+        throw new Error("disk full");
+      },
+      async flush() {},
+    };
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE], "sigA"),
+      approvalQueue: makeApprovalQueue().queue,
+      auditSink: throwingSink,
+      defaultApprovalTimeoutSeconds: 30,
+      emissionLiveness: notes,
+    });
+    await expect(
+      consumer.handleFlowDecisionRecorded(goodNotification),
+    ).rejects.toThrow(/disk full/);
+    expect(recorded.decisions).toEqual(["flow_decision_recorded"]);
+    expect(recorded.emissions).toBe(0);
+    expect(recorded.rejections).toHaveLength(1);
+    expect(recorded.rejections[0]).toMatch(/^persist_error:/);
+  });
+
+  it("works without an emission-liveness feed wired (optional dependency)", async () => {
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE], "sigA"),
+      approvalQueue: makeApprovalQueue().queue,
+      auditSink: makeAuditSink().sink,
+      defaultApprovalTimeoutSeconds: 30,
+    });
+    await expect(
+      consumer.handleFlowDecisionRecorded(goodNotification),
+    ).resolves.toBeUndefined();
+    expect(consumer.getStats().decisionsRecorded).toBe(1);
   });
 });
 
