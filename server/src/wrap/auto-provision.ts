@@ -2267,6 +2267,9 @@ export async function runEgressGateRepairForCli(options: {
   getuid?: () => number;
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
 }): Promise<number> {
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+  // this is only the default when no `print` override is supplied (the CLI
+  // caller always supplies one). Never used to print secrets or key material.
   const print = options.print ?? ((line: string) => console.error(`  ${line}`));
   if (osPlatform() !== "darwin") {
     print("--repair-egress-gate is macOS-only (the pf/launchd exclusive-egress stack).");
