@@ -878,6 +878,35 @@ describe("buildEvidencePack", () => {
     expect(pack.files[0]!.content).toContain("PARTIAL QUARTER");
   });
 
+  it("D9C-1: the SIGNED coverage window stops at the audit census, not the later generation instant", () => {
+    // TOCTOU repro at the pack level: the audit census was taken at 11:00, but
+    // the pack stamps its generation time at 12:00 (after inventory/discrete
+    // gathering). Operations appended in the 11:00-12:00 gap are NOT in the
+    // census. The signed covered_to_exclusive must be the census cut (11:00),
+    // never the generation instant (12:00) it would otherwise over-claim.
+    const census = "2026-08-15T11:00:00.000Z";
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+      retention: { ...FULL_COVERAGE },
+      census_taken_at: census,
+    });
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-15T12:00:00.000Z",
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      { audit, signer, masterKey }
+    );
+    expect(coverage(pack).covered_to_exclusive).toBe(census);
+    expect(coverage(pack).covered_to_exclusive).not.toBe("2026-08-15T12:00:00.000Z");
+    expect(coverage(pack).in_progress_quarter).toBe(true);
+  });
+
   it("a POPULATED inventory still prints the coverage-basis + never-complete language", () => {
     const pack = buildEvidencePack(
       {

@@ -65,6 +65,15 @@ export interface AuditReadData {
    * non-split / unreadable / absent daemon store.
    */
   daemon_entries?: readonly AuditEntry[];
+  /**
+   * D9C-1: the instant the audit census was taken (captured by the caller
+   * BEFORE the pack stamps its generation time). The attested coverage window
+   * must never post-date this cut: entries appended between the census and
+   * generation were not counted, so signing coverage through the later
+   * generation instant would attest a window the census never saw. Absent for
+   * legacy callers, whose coverage falls back to the generation instant.
+   */
+  census_taken_at?: string;
 }
 
 /** Already-resolved inputs the generator needs (see module doc-comment). */
@@ -147,6 +156,9 @@ export function buildEvidencePack(
         const report = detectShortfall(window, data.retention, {
           generatedAt,
           lastEntryAt,
+          // D9C-1: bound the attested window at the census cut so it never
+          // post-dates the operations actually counted.
+          censusTakenAt: data.census_taken_at,
         });
         // G-2: the §7 daemon note renders "N merged into the counts above". The
         // counts above are quarter-windowed, so N must be the daemon entries

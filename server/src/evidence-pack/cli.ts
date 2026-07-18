@@ -514,6 +514,13 @@ export function deriveAuditReadOutcome(params: {
          */
         retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
       };
+  /**
+   * D9C-1: the instant the audit census was taken (captured by the CLI BEFORE
+   * `auditLog.query()`), threaded onto the returned {@link AuditReadData} so the
+   * generator can bound the attested coverage window at the census cut rather
+   * than the later generation instant. Omit for callers that do not track it.
+   */
+  censusTakenAt?: string;
 }): ReadOutcome<AuditReadData> {
   const { entries, windowedTotal, retentionConfig, usage } = params;
   const daemon = params.daemon ?? { status: "absent" as const };
@@ -644,10 +651,16 @@ export function deriveAuditReadOutcome(params: {
   // window -- the figure the §7 "N merged into the counts above" note renders,
   // rather than the all-time total. Only present when the daemon store was
   // merged (`included`); the window itself is not known at this pre-window layer.
+  // D9C-1: carry the census cut (when the caller captured one) so the generator
+  // never signs a coverage window that post-dates the operations counted here.
+  const censusFields =
+    params.censusTakenAt !== undefined
+      ? { census_taken_at: params.censusTakenAt }
+      : {};
   return populated(
     daemon.status === "included"
-      ? { entries: mergedEntries, retention, daemon_entries: daemon.entries }
-      : { entries: mergedEntries, retention }
+      ? { entries: mergedEntries, retention, daemon_entries: daemon.entries, ...censusFields }
+      : { entries: mergedEntries, retention, ...censusFields }
   );
 }
 
@@ -1010,6 +1023,14 @@ export async function runEvidencePack(args: string[]): Promise<void> {
   // denials" / "full quarter covered".
   const audit: ReadOutcome<AuditReadData> = await (async () => {
     try {
+      // D9C-1: stamp the census cut BEFORE the query. Every entry the census
+      // counts has a timestamp at or before the query's storage snapshot, which
+      // is at or after this instant; bounding the attested coverage window at
+      // `censusTakenAt` therefore guarantees the signed span never claims
+      // coverage of an operation appended after the census (and never counted).
+      // The generation time is stamped LATER (after inventory + discrete-export
+      // gathering), so attesting through it would over-claim the intervening gap.
+      const censusTakenAt = new Date().toISOString();
       const { entries, total } = await auditLog.query({ limit: 1_000_000 });
       const retentionConfig = auditLog.getRetentionConfig();
       // Read the on-disk usage + ever-pruned so the shortfall detector can tell
@@ -1032,6 +1053,7 @@ export async function runEvidencePack(args: string[]): Promise<void> {
         retentionConfig,
         usage,
         daemon,
+        censusTakenAt,
       });
     } catch (e) {
       return readFailed(`the audit log could not be read: ${(e as Error).message}`);

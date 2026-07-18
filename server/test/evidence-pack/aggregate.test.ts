@@ -1044,4 +1044,197 @@ describe("detectShortfall", () => {
       expect(r.explanation).toMatch(/cannot be ruled out/i);
     });
   });
+
+  // ─── D9C-2 (Dry-9 sweep): a future-dated in-quarter entry (timestamped AFTER
+  // generation but still inside the quarter) must never sign an IMPOSSIBLE
+  // coverage span where covered_from > covered_to_exclusive. You cannot attest
+  // coverage of the future; the attestable window ends at the generation
+  // instant, so an entry after it cannot anchor a covered_from. ───
+  describe("D9C-2: a future-dated in-quarter entry never signs a backwards (from > to) span", () => {
+    it("an entry dated after generation (still before quarter end) reports zero-covered, never covered_from > covered_to", () => {
+      // Q3 in progress: generated 2026-08-01, but the earliest (only) retained
+      // entry is timestamped 2026-09-15 -- AFTER generation, still inside Q3.
+      // Old code: covered_from = 2026-09-15, covered_to = 2026-08-01 (from > to),
+      // SIGNED. The window this report can attest ends at 2026-08-01.
+      const gen = "2026-08-01T00:00:00.000Z";
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          retained_total: 1,
+          earliest_retained_at: "2026-09-15T00:00:00.000Z",
+          ever_pruned: false,
+        }),
+        { generatedAt: gen, lastEntryAt: null }
+      );
+      const fromMs = new Date(r.covered_from).getTime();
+      const toMs = new Date(r.covered_to_exclusive).getTime();
+      expect(fromMs).toBeLessThanOrEqual(toMs); // never a backwards span
+      expect(r.covered_to_exclusive).toBe(gen); // attestable end is generation time
+      expect(r.zero_of_quarter_covered).toBe(true);
+      expect(r.shortfall).toBe(true);
+      // Honest prose: none covered, post-dates the attested window; NOT "pruned"
+      // (the entry post-dating generation is clock skew / a future stamp, not a
+      // FIFO prune of earlier entries).
+      expect(r.explanation).toMatch(/NONE of this quarter is covered/);
+      expect(r.explanation).not.toMatch(/pruned/i);
+    });
+
+    it("(a) a report generated before its quarter begins never signs a backwards span", () => {
+      // generated 2026-06-01, before Q3 starts (2026-07-01), so the attestable
+      // end (2026-06-01) precedes even the quarter start. covered_from must be
+      // clamped so the SIGNED span is never backwards.
+      const gen = "2026-06-01T00:00:00.000Z";
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ retained_total: 1, earliest_retained_at: "2026-08-01T00:00:00.000Z" }),
+        { generatedAt: gen, lastEntryAt: null }
+      );
+      const fromMs = new Date(r.covered_from).getTime();
+      const toMs = new Date(r.covered_to_exclusive).getTime();
+      expect(fromMs).toBeLessThanOrEqual(toMs);
+      expect(r.zero_of_quarter_covered).toBe(true);
+    });
+
+    it("M1 (unchanged): an entry at or after the quarter end still says NONE covered and cites the quarter end", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ retained_total: 5, earliest_retained_at: "2026-11-01T00:00:00.000Z", ever_pruned: true }),
+        { generatedAt: "2026-11-01T00:00:00.000Z", lastEntryAt: null }
+      );
+      expect(r.covered_from).toBe(Q3_2026.start_inclusive);
+      expect(new Date(r.covered_from).getTime()).toBeLessThanOrEqual(
+        new Date(r.covered_to_exclusive).getTime()
+      );
+      expect(r.explanation).toMatch(/NONE of this quarter is covered/);
+      expect(r.explanation).toMatch(/quarter end/i);
+    });
+  });
+
+  // ─── D9C-3 (Dry-9 sweep): negative and non-safe-integer figures are not
+  // USABLE for a definitive cap verdict, exactly like the null/unknown cases
+  // (D8-1). A negative size (`-1`) or an unsafe size (> Number.MAX_SAFE_INTEGER,
+  // which JS rounds) must forfeit determinability rather than sign a definitive
+  // retention_at_cap verdict. ───
+  describe("D9C-3: negative / non-safe-integer retained figures are NOT usable", () => {
+    it("a negative retained_total_size_bytes forfeits determinability (no signed below-cap verdict)", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          retained_total: 110,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: false,
+          daemon_store: { status: "included", included_entry_count: 50 },
+          per_store_retention: [
+            { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: -1 },
+            { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+          ],
+        }),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).not.toMatch(/below both/i);
+      expect(r.explanation).not.toMatch(/no recorded activity before/i);
+      expect(r.explanation).toMatch(/cannot be ruled out/i);
+    });
+
+    it("an unsafe (> Number.MAX_SAFE_INTEGER) size forfeits determinability (no signed at-cap verdict)", () => {
+      // The unsafe value rounds in JS; it must never sign a definitive at-cap.
+      const unsafe = Number.MAX_SAFE_INTEGER + 100;
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: true,
+          per_store_retention: [
+            { store: "operator", max_entries: 100, retained_total: 10, max_total_size_bytes: 100, retained_total_size_bytes: unsafe },
+          ],
+        }),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+    });
+
+    it("a negative retained entry count on the legacy single-store fallback forfeits determinability", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          max_entries: 100,
+          retained_total: -5,
+          retained_total_size_bytes: 100,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: false,
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        }),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(false);
+      expect(r.retention_at_cap).toBe(false);
+    });
+
+    it("non-vacuity: the same rows with real non-negative safe-integer sizes stay determinable", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          retained_total: 110,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          ever_pruned: false,
+          daemon_store: { status: "included", included_entry_count: 50 },
+          per_store_retention: [
+            { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+            { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 100 },
+          ],
+        }),
+        complete
+      );
+      expect(r.retention_at_cap_determinable).toBe(true);
+      expect(r.retention_at_cap).toBe(false);
+      expect(r.explanation).toMatch(/no recorded activity before/i);
+    });
+  });
+
+  // ─── D9C-1 (Dry-9 sweep): the attested coverage window must never post-date
+  // the audit census. The census is read BEFORE the pack stamps its generation
+  // time, so entries appended in the gap were never counted; the signed window
+  // must stop at the census cut, not the later generation instant. ───
+  describe("D9C-1: the attested coverage window never post-dates the census cut", () => {
+    it("bounds covered_to at the census cut point, not a later generation instant", () => {
+      // Census taken at 11:00; generation stamped at 12:00. Entries appended in
+      // the 11:00-12:00 gap were never counted, so the SIGNED window must stop
+      // at the census cut (11:00), never claim coverage through 12:00.
+      const census = "2026-08-15T11:00:00.000Z";
+      const gen = "2026-08-15T12:00:00.000Z";
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+        { generatedAt: gen, lastEntryAt: null, censusTakenAt: census }
+      );
+      expect(r.covered_to_exclusive).toBe(census);
+      expect(r.covered_to_exclusive).not.toBe(gen);
+      expect(r.in_progress_quarter).toBe(true);
+      expect(r.explanation).toMatch(/audit-census cut point/);
+    });
+
+    it("falls back to the generation instant when no census cut is supplied (unchanged)", () => {
+      const gen = "2026-08-15T12:00:00.000Z";
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+        { generatedAt: gen, lastEntryAt: null }
+      );
+      expect(r.covered_to_exclusive).toBe(gen);
+    });
+
+    it("uses the generation instant when the census cut is LATER than it (never widens the window)", () => {
+      // A census cut after generation must not push the window past generation.
+      const gen = "2026-08-15T12:00:00.000Z";
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+        { generatedAt: gen, lastEntryAt: null, censusTakenAt: "2026-08-15T13:00:00.000Z" }
+      );
+      expect(r.covered_to_exclusive).toBe(gen);
+    });
+  });
 });
