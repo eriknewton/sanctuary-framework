@@ -374,10 +374,14 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
  * `computeNextGenerationId` allocates value+1 and the gate runtime rejects
  * unsafe generation ids -- at 2^53-1, n+1 === n, so an at-or-above value
  * would make every future allocation collide. This is the SINGLE boundary
- * shared by entry validation, floor classification/parsing, and repair
- * salvage, so no unsafe number can reach the allocator.
+ * shared by entry validation, floor classification/parsing, repair salvage,
+ * AND the allocator's own backstop (`computeNextGenerationId` imports it, so
+ * an allocation that lands exactly AT 2^53-1 -- headroom-less even though it
+ * is itself a safe integer -- is refused at the allocator rather than
+ * committed and rejected later at this boundary). Exported for that
+ * allocator; no other module should need it.
  */
-function hasGenerationHeadroom(n: number): boolean {
+export function hasGenerationHeadroom(n: number): boolean {
   return Number.isSafeInteger(n) && n >= 1 && Number.isSafeInteger(n + 1);
 }
 
@@ -1108,6 +1112,25 @@ export class PfAnchorRegistry {
       const previousToken = state.enable_token;
       const desired = apply(state.committed);
       assertNoDuplicateUids(desired);
+
+      // Unprotect generation-monotonicity (S5-7, extends fix-round-5 P1): a
+      // committed entry this mutation REMOVES (its uid survives in no desired
+      // entry -- today only `remove()`, the unprotect path) folds its
+      // generation_id into the persisted floor, so a later re-protect of the
+      // same uid can never reuse a generation whose stale manifest/pf/credential
+      // artifacts might survive a partial teardown. Folded BEFORE the pending
+      // journal save (a crash mid-mutation keeps the raised floor --
+      // over-restrictive, never fail-open) and left raised by a rollback
+      // (harmless: allocation is strictly-above, and the restored entry's own
+      // generation already bounds it).
+      for (const prev of previousCommitted) {
+        if (
+          prev.generation_id !== undefined &&
+          !desired.some((e) => e.agent_uid === prev.agent_uid)
+        ) {
+          state.generation_floor = Math.max(state.generation_floor ?? 0, prev.generation_id);
+        }
+      }
 
       // Journal the pending desired set BEFORE touching the anchor (Codex B1).
       state.pending = desired;

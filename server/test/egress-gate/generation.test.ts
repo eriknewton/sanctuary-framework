@@ -347,9 +347,17 @@ describe("egress-gate/generation pure helpers", () => {
     expect(() =>
       computeNextGenerationId(undefined, undefined, Number.MAX_SAFE_INTEGER),
     ).toThrow(/no safe headroom/);
-    // The last SAFE allocation is still served.
-    expect(computeNextGenerationId(Number.MAX_SAFE_INTEGER - 1, undefined)).toBe(
-      Number.MAX_SAFE_INTEGER,
+    // Post-#959 LOW follow-up: the allocator now enforces the SAME
+    // `hasGenerationHeadroom` bound as the registry boundary, so an
+    // allocation landing exactly AT 2^53-1 -- itself a safe integer, but
+    // headroom-less (the registry would reject it on the next load) -- is
+    // refused HERE rather than committed and rejected later.
+    expect(() => computeNextGenerationId(Number.MAX_SAFE_INTEGER - 1, undefined)).toThrow(
+      /no safe headroom/,
+    );
+    // The last allocation WITH headroom is still served.
+    expect(computeNextGenerationId(Number.MAX_SAFE_INTEGER - 2, undefined)).toBe(
+      Number.MAX_SAFE_INTEGER - 1,
     );
   });
 
