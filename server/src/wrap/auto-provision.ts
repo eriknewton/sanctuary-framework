@@ -2376,9 +2376,14 @@ export async function runEgressGateRepairForCli(options: {
       // The repair sequence already printed the specific refusal + guidance.
       return 2;
     case "repair-failed":
+      // BLOCKER-3 honesty: claim PARKED only when the stop was VERIFIED by a
+      // status probe; otherwise say so loudly (possibly-running agent).
       print(
         `Exclusive-egress repair FAILED at ${outcome.stage}: ${outcome.reason}. ` +
-          "The agent harness remains PARKED (fail-closed). Investigate, then re-run the repair.",
+          (outcome.harnessStopVerified
+            ? "The agent harness remains PARKED (verified not running; fail-closed). Investigate, then re-run the repair."
+            : `WARNING: the agent harness could NOT be verified stopped (${outcome.harnessStopNote ?? "no probe detail"}); ` +
+              "treat the agent as possibly RUNNING and investigate immediately."),
       );
       return 2;
   }

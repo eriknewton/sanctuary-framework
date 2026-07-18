@@ -552,7 +552,10 @@ export interface ReleaseBarrierOps {
   enableJob(): Promise<void>;
   /** `launchctl bootstrap` + `kickstart` the job. Throws on failure. */
   bootstrapJob(): Promise<void>;
-  /** `launchctl bootout` (bootstrap-failure cleanup only). Throws on failure. */
+  /**
+   * `launchctl bootout` (reassert-parked stop of any live job + abort
+   * cleanup; production treats not-running as success). Throws on failure.
+   */
   bootoutJob(): Promise<void>;
   /** Remove the hold file (ENOENT is success). Throws on failure. */
   removeHoldFile(): Promise<void>;
@@ -701,10 +704,12 @@ async function parkCleanup(
  *   - EVERY abort branch removes the hold file, leaves the job disabled, and
  *     (once the released plist may be on disk) restores the parked plist
  *     (fail-closed; a cleanup failure is reported, never swallowed).
- *   - The FIRST step re-asserts the parked state (disable + remove any stale
- *     hold file + restore the parked plist) so a crashed previous run can
- *     never leak a releasable state into this one; if the park cannot be
- *     asserted, the sequence refuses to proceed at all.
+ *   - The FIRST step re-asserts the parked state (bootout any live job +
+ *     disable + remove any stale hold file + restore the parked plist) so a
+ *     crashed previous run -- or a coarse-mode-running harness on the repair
+ *     path -- can never leak a releasable state OR a live process into this
+ *     one; if the park cannot be asserted, the sequence refuses to proceed
+ *     at all.
  */
 export async function runReleaseBarrierSequence(
   ctx: ReleaseBarrierContext,
@@ -717,14 +722,23 @@ export async function runReleaseBarrierSequence(
 
   // Stage: reassert-parked. Refuse to proceed unless the parked state holds.
   // Restores the parked plist too: a crashed previous run may have left a
-  // released plist (embedding a real generation id) on disk.
-  const initial = await parkCleanup(ops, { removeHold: true, disable: true, restorePlist: true });
+  // released plist (embedding a real generation id) on disk. BOOTS OUT any
+  // live job as well (fix-round BLOCKER-3): a crashed prior run -- or the
+  // repair path, whose harness may be running in coarse mode -- can have a
+  // LIVE process; "parked" asserted over a still-running harness is not a
+  // park. The production bootout op treats not-running as success.
+  const initial = await parkCleanup(ops, {
+    removeHold: true,
+    disable: true,
+    bootout: true,
+    restorePlist: true,
+  });
   if (initial.errors.length > 0) {
     return {
       kind: "parked",
       stage: "reassert-parked",
       reason:
-        "could not re-assert the parked state (disable + stale-hold-file removal + parked-plist restore); refusing to run the release sequence",
+        "could not re-assert the parked state (bootout + disable + stale-hold-file removal + parked-plist restore); refusing to run the release sequence",
       holdFileRemoved: initial.holdFileRemoved,
       jobDisabled: initial.jobDisabled,
       cleanupErrors: initial.errors,

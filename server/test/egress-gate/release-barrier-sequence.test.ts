@@ -94,7 +94,8 @@ describe("runReleaseBarrierSequence: happy path", () => {
     const outcome = await runReleaseBarrierSequence(CTX, ops);
     expect(outcome).toEqual({ kind: "released", generation_id: 7 });
     expect(calls).toEqual([
-      "removeHold", // reassert-parked: stale hold cleared first
+      "bootout", // reassert-parked (fix-round BLOCKER-3): any live job stopped FIRST
+      "removeHold", // reassert-parked: stale hold cleared
       "disable", // reassert-parked: persistent park asserted
       "restoreParkedPlist", // reassert-parked: a crashed run's released plist cleared
       "rearm",
@@ -157,6 +158,27 @@ describe("runReleaseBarrierSequence: abort branches (fail-closed, hold removed, 
     expect(outcome.holdFileRemoved).toBe(true);
     expect(outcome.cleanupErrors.join(" ")).toContain("launchctl down");
     // Nothing past the park assertion ran.
+    expect(calls).not.toContain("rearm");
+    expect(calls).not.toContain("enable");
+    expect(calls).not.toContain("bootstrap");
+  });
+
+  it("fix-round BLOCKER-3: reassert-parked BOOTS OUT any live job FIRST; a bootout failure refuses to proceed", async () => {
+    const { ops, calls } = makeOps({
+      bootoutJob: async () => {
+        calls.push("bootout");
+        throw new Error("still running, bootout refused");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("reassert-parked");
+    expect(outcome.cleanupErrors.join(" ")).toContain("still running, bootout refused");
+    // The bootout is the FIRST op of the sequence -- a live harness from a
+    // crashed run (or the repair path's coarse-mode harness) is stopped
+    // before ANY release work.
+    expect(calls[0]).toBe("bootout");
     expect(calls).not.toContain("rearm");
     expect(calls).not.toContain("enable");
     expect(calls).not.toContain("bootstrap");
@@ -331,8 +353,9 @@ describe("runReleaseBarrierSequence: abort branches (fail-closed, hold removed, 
     expect(outcome.holdFileRemoved).toBe(true);
     expect(outcome.jobDisabled).toBe(true);
     expect(calls).toContain("bootout");
-    // Bootout precedes the hold-file removal and the re-disable in cleanup.
-    expect(calls.indexOf("bootout")).toBeGreaterThan(calls.indexOf("bootstrap"));
+    // The ABORT-cleanup bootout (the last one; reassert-parked also boots
+    // out at the very start) follows the failed bootstrap.
+    expect(calls.lastIndexOf("bootout")).toBeGreaterThan(calls.indexOf("bootstrap"));
   });
 
   it("cleanup failures inside an abort are LOUD: booleans false + errors named", async () => {
@@ -356,13 +379,16 @@ describe("runReleaseBarrierSequence: abort branches (fail-closed, hold removed, 
   });
 
   it("bootstrap-abort with failing bootout still removes the hold file and disables, reporting the bootout error", async () => {
+    let bootoutCount = 0;
     const { ops, calls } = makeOps({
       bootstrapJob: async () => {
         throw new Error("io error");
       },
       bootoutJob: async () => {
         calls.push("bootout");
-        throw new Error("bootout refused");
+        bootoutCount += 1;
+        // First call (reassert-parked) succeeds; the abort-cleanup call fails.
+        if (bootoutCount > 1) throw new Error("bootout refused");
       },
     });
     const outcome = await runReleaseBarrierSequence(CTX, ops);

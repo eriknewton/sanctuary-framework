@@ -277,6 +277,31 @@ describe("egress-gate/generation recover (crash-recovery table)", () => {
     expect(out.action).toBe("tombstoned");
     expect(h.reg.tombstoneCalls.map((c) => c.uid)).toEqual([502]);
   });
+
+  it("fix-round H4 pin: recover NEVER reaches publishManifest on ANY path (the repair wiring's injected always-throwing publishManifest stays safe)", async () => {
+    // The repair ops (`createRepairExclusiveEgressOps`) wire recover() with a
+    // publishManifest that unconditionally throws. This pin proves recover's
+    // tombstone path for pf_loaded/manifest_reloaded staging records (and the
+    // discard/none paths) never invokes it: with failAt:"manifest" a single
+    // publishManifest call would reject the whole recover().
+    for (const phase of ["pf_loaded", "manifest_reloaded"] as const) {
+      const h = makeHarness({ failAt: "manifest" });
+      await h.staging.save({
+        generation_id: 3, agent_uid: 502, gate_port: 45001, gate_pid: 9001, gate_pid_start: "start-9001", fortress_path: "/f/a", phase,
+      });
+      const out = await h.coord.recover(502);
+      expect(out.action).toBe("tombstoned");
+      expect(h.events).not.toContain("manifest");
+      expect(h.manifestPublished).toHaveLength(0);
+    }
+    const discarded = makeHarness({ failAt: "manifest" });
+    await discarded.staging.save({
+      generation_id: 3, agent_uid: 502, gate_port: 45001, gate_pid: 9001, gate_pid_start: "start-9001", fortress_path: "/f/a", phase: "owner_checked",
+    });
+    expect((await discarded.coord.recover(502)).action).toBe("discarded");
+    const none = makeHarness({ failAt: "manifest" });
+    expect((await none.coord.recover(502)).action).toBe("none");
+  });
 });
 
 describe("egress-gate/generation pure helpers", () => {

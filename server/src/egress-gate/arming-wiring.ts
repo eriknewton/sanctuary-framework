@@ -920,9 +920,14 @@ export async function restoreCoarseCompositionProduction(
   });
 }
 
-/** Repair ops (`--repair-egress-gate`): drift guard + recover + bring-up + release. */
+/**
+ * Repair ops (`--repair-egress-gate`): drift guard + verified harness park
+ * (fix-round BLOCKER-3) + recover + bring-up + release.
+ */
 export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput): {
   diffTransientPfRules(): Promise<{ foreign: string[] }>;
+  parkHarness(): Promise<void>;
+  verifyHarnessStopped(): Promise<{ ok: true } | { ok: false; reason: string }>;
   recoverGeneration(): Promise<void>;
   bringUpGeneration(): Promise<ExclusiveGenerationIdentity>;
   runReleaseSequence(committed: ExclusiveGenerationIdentity): Promise<ReleaseBarrierOutcome>;
@@ -930,11 +935,44 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
   print(line: string): void;
 } {
   const install = createInstallExclusiveEgressOps(input);
+  const harnessOps = realHarnessOps();
+  async function verifyHarnessStopped(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+      const status = await agentHarnessDaemonStatus(harnessOps);
+      if (!status.known) {
+        return { ok: false, reason: "launchctl did not return a trustworthy harness status" };
+      }
+      if (status.running) {
+        return { ok: false, reason: `the harness job reports RUNNING (pid ${status.pid ?? "unknown"})` };
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, reason: `status probe errored: ${(err as Error).message}` };
+    }
+  }
   return {
     async diffTransientPfRules(): Promise<{ foreign: string[] }> {
       const diff = await diffTransientPfRules(createExecFilePfRunner());
       return { foreign: diff.foreign };
     },
+    async parkHarness(): Promise<void> {
+      // BLOCKER-3: bootout the possibly-live (coarse-degraded) harness, then
+      // persistently disable it, then VERIFY it is not running. Loud on any
+      // failure -- the repair refuses to mutate manifests under a live agent.
+      const bootout = await runLaunchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+        throw new Error(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
+      }
+      const disable = await runLaunchctl(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      if (disable.code !== 0) {
+        throw new Error(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
+      }
+      const stopped = await verifyHarnessStopped();
+      if (!stopped.ok) {
+        throw new Error(`park not verified: ${stopped.reason}`);
+      }
+    },
+    verifyHarnessStopped,
     async recoverGeneration(): Promise<void> {
       const registry = createProductionAnchorRegistry();
       const coordinator = new GenerationCoordinator({

@@ -292,6 +292,24 @@ export interface EgressGateRepairOps {
    */
   diffTransientPfRules(): Promise<{ foreign: string[] }>;
   /**
+   * PARK the harness before any repair mutation (fix-round BLOCKER-3): a
+   * degrade-loud outcome may have left the harness RUNNING IN COARSE MODE,
+   * and the bring-up republishes the manifest exclusive-scoped -- doing that
+   * under a live coarse harness would confine it into silence mid-flight,
+   * and the release barrier's reassert-parked was never designed to be the
+   * only stop for an already-running process. Production: `launchctl
+   * bootout` (not-running is success) + `disable` + a VERIFIED not-running
+   * status probe. MUST throw unless the harness is verified stopped.
+   */
+  parkHarness(): Promise<void>;
+  /**
+   * Verify the harness process is actually NOT running (status probe).
+   * Discriminated, never throws in spirit (a throwing impl is treated as
+   * not-verified). Used before any `repair-failed` outcome claims the agent
+   * is parked (fix-round BLOCKER-3: never claim PARKED unverified).
+   */
+  verifyHarnessStopped(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
    * Recover any in-flight (uncommitted) generation first (production: the
    * S5-2 `GenerationCoordinator.recover` -- discard/tombstone per the crash
    * table). Throws on failure.
@@ -321,22 +339,58 @@ export type EgressGateRepairOutcome =
   | { kind: "refused-non-tty-override" }
   /** The drift diff itself failed: refuse rather than hook-install blind. */
   | { kind: "refused-diff-unavailable"; reason: string }
-  /** The repair ran but could not bring the generation live; agent stays parked. */
-  | { kind: "repair-failed"; stage: "recover" | "bring-up" | "release"; reason: string };
+  /**
+   * The repair ran but could not bring the generation live. The agent's
+   * parked claim is HONEST: `harnessStopVerified` is true only when a status
+   * probe confirmed the harness process is not running (fix-round BLOCKER-3;
+   * false means "treat as possibly RUNNING, investigate immediately").
+   */
+  | {
+      kind: "repair-failed";
+      stage: "park" | "recover" | "bring-up" | "release";
+      reason: string;
+      harnessStopVerified: boolean;
+      harnessStopNote?: string;
+    };
 
 /**
  * Run the egress-gate repair sequence (design answer 3, the MED-7 guard):
  * drift-check first (refuse on foreign transient rules without an explicit
  * interactive override; the override itself is audited BEFORE any mutation),
- * then recover -> bring-up -> release. Every failure leaves the agent parked
- * (the barrier's fail-closed park) and reports the stage; nothing here can
- * silently clobber third-party pf state or report green without the barrier's
- * released outcome.
+ * then PARK the possibly-live harness (fix-round BLOCKER-3: a degrade-loud
+ * outcome may have started it in coarse mode; bring-up must never republish
+ * the manifest exclusive-scoped under a live coarse harness), then recover
+ * -> bring-up -> release. Every failure leaves the agent parked (the
+ * barrier's fail-closed park) and reports the stage, and a `repair-failed`
+ * outcome claims PARKED only with a verified not-running status probe;
+ * nothing here can silently clobber third-party pf state or report green
+ * without the barrier's released outcome.
  */
 export async function runEgressGateRepair(
   ctx: EgressGateRepairContext,
   ops: EgressGateRepairOps,
 ): Promise<EgressGateRepairOutcome> {
+  // Honest-park helper for every repair-failed return (BLOCKER-3): the
+  // outcome may claim the agent is parked ONLY when a status probe verified
+  // the process is not running; a throwing probe reads as not-verified.
+  const failParked = async (
+    stage: "park" | "recover" | "bring-up" | "release",
+    reason: string,
+  ): Promise<EgressGateRepairOutcome> => {
+    let stopped: { ok: true } | { ok: false; reason: string };
+    try {
+      stopped = await ops.verifyHarnessStopped();
+    } catch (err) {
+      stopped = { ok: false, reason: `stop-verify probe threw: ${(err as Error).message}` };
+    }
+    return {
+      kind: "repair-failed",
+      stage,
+      reason,
+      harnessStopVerified: stopped.ok,
+      ...(stopped.ok ? {} : { harnessStopNote: stopped.reason }),
+    };
+  };
   // Override is TTY-ONLY (design: "interactive TTY only"): a non-interactive
   // override could be baked into automation and silently clobber VPN rules on
   // every boot, which is exactly what the guard exists to prevent.
@@ -392,22 +446,32 @@ export async function runEgressGateRepair(
     );
   }
 
+  // Stage: park (BLOCKER-3). The bring-up below republishes the manifest
+  // exclusive-scoped and tears down / re-creates gate surfaces; the harness
+  // (possibly running in coarse mode after a prior degrade) must be VERIFIED
+  // stopped first. parkHarness throws unless the stop is verified.
+  try {
+    await ops.parkHarness();
+  } catch (err) {
+    return failParked("park", `could not park the harness before repair: ${(err as Error).message}`);
+  }
+
   try {
     await ops.recoverGeneration();
   } catch (err) {
-    return { kind: "repair-failed", stage: "recover", reason: (err as Error).message };
+    return failParked("recover", (err as Error).message);
   }
   let committed: ExclusiveGenerationIdentity;
   try {
     committed = await ops.bringUpGeneration();
   } catch (err) {
-    return { kind: "repair-failed", stage: "bring-up", reason: (err as Error).message };
+    return failParked("bring-up", (err as Error).message);
   }
   let release: ReleaseBarrierOutcome;
   try {
     release = await ops.runReleaseSequence(committed);
   } catch (err) {
-    return { kind: "repair-failed", stage: "release", reason: (err as Error).message };
+    return failParked("release", (err as Error).message);
   }
   if (release.kind === "released") {
     await ops.audit(EGRESS_GATE_REPAIR_AUDIT_OP, {
@@ -429,11 +493,7 @@ export async function runEgressGateRepair(
       reparkError: release.reparkError,
     };
   }
-  return {
-    kind: "repair-failed",
-    stage: "release",
-    reason: `release barrier parked at stage ${release.stage}: ${release.reason}`,
-  };
+  return failParked("release", `release barrier parked at stage ${release.stage}: ${release.reason}`);
 }
 
 // ---------------------------------------------------------------------------

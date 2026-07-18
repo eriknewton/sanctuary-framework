@@ -200,6 +200,8 @@ describe("runExclusiveEgressArming", () => {
 function repairOps(overrides: Partial<EgressGateRepairOps> = {}): EgressGateRepairOps {
   return {
     diffTransientPfRules: vi.fn(async () => ({ foreign: [] })),
+    parkHarness: vi.fn(async () => undefined),
+    verifyHarnessStopped: vi.fn(async () => ({ ok: true as const })),
     recoverGeneration: vi.fn(async () => undefined),
     bringUpGeneration: vi.fn(async () => ({ ...COMMITTED })),
     runReleaseSequence: vi.fn(async () => RELEASED),
@@ -305,8 +307,92 @@ describe("runEgressGateRepair", () => {
     ] as const) {
       const ops = repairOps(overrides as Partial<EgressGateRepairOps>);
       const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
-      expect(outcome).toMatchObject({ kind: "repair-failed", stage });
+      expect(outcome).toMatchObject({ kind: "repair-failed", stage, harnessStopVerified: true });
     }
+  });
+
+  it("fix-round BLOCKER-3: the harness is PARKED (verified) after the drift gate and BEFORE any mutation", async () => {
+    const calls: string[] = [];
+    const ops = repairOps({
+      diffTransientPfRules: vi.fn(async () => {
+        calls.push("diff");
+        return { foreign: [] };
+      }),
+      parkHarness: vi.fn(async () => {
+        calls.push("park");
+      }),
+      recoverGeneration: vi.fn(async () => {
+        calls.push("recover");
+      }),
+      bringUpGeneration: vi.fn(async () => {
+        calls.push("bring-up");
+        return { ...COMMITTED };
+      }),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toMatchObject({ kind: "repaired" });
+    expect(calls).toEqual(["diff", "park", "recover", "bring-up"]);
+  });
+
+  it("fix-round BLOCKER-3: a park failure is repair-failed at stage 'park'; NO mutation runs", async () => {
+    const ops = repairOps({
+      parkHarness: vi.fn(async () => {
+        throw new Error("harness still reports RUNNING");
+      }),
+      verifyHarnessStopped: vi.fn(async () => ({ ok: false as const, reason: "pid 4242 alive" })),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toMatchObject({
+      kind: "repair-failed",
+      stage: "park",
+      harnessStopVerified: false,
+      harnessStopNote: "pid 4242 alive",
+    });
+    expect((outcome as { reason: string }).reason).toContain("harness still reports RUNNING");
+    expect(ops.recoverGeneration).not.toHaveBeenCalled();
+    expect(ops.bringUpGeneration).not.toHaveBeenCalled();
+    expect(ops.runReleaseSequence).not.toHaveBeenCalled();
+  });
+
+  it("fix-round BLOCKER-3: repair-failed never claims PARKED unverified (probe not-ok and probe-throw both read as unverified)", async () => {
+    const notOk = repairOps({
+      runReleaseSequence: vi.fn(async () => PARKED),
+      verifyHarnessStopped: vi.fn(async () => ({ ok: false as const, reason: "launchctl untrustworthy" })),
+    });
+    const outcome1 = await runEgressGateRepair(REPAIR_CTX, notOk);
+    expect(outcome1).toMatchObject({
+      kind: "repair-failed",
+      stage: "release",
+      harnessStopVerified: false,
+      harnessStopNote: "launchctl untrustworthy",
+    });
+    const throwing = repairOps({
+      runReleaseSequence: vi.fn(async () => PARKED),
+      verifyHarnessStopped: vi.fn(async () => {
+        throw new Error("probe died");
+      }),
+    });
+    const outcome2 = await runEgressGateRepair(REPAIR_CTX, throwing);
+    expect(outcome2).toMatchObject({ kind: "repair-failed", harnessStopVerified: false });
+    expect((outcome2 as { harnessStopNote: string }).harnessStopNote).toContain("probe died");
+  });
+
+  it("fix-round BLOCKER-3: refusals never touch the harness (no park on foreign rules / non-TTY / diff failure)", async () => {
+    for (const overrides of [
+      { diffTransientPfRules: vi.fn(async () => ({ foreign: ["pass in quick on utun3 all"] })) },
+      {
+        diffTransientPfRules: vi.fn(async () => {
+          throw new Error("pfctl gone");
+        }),
+      },
+    ]) {
+      const ops = repairOps(overrides as Partial<EgressGateRepairOps>);
+      await runEgressGateRepair(REPAIR_CTX, ops);
+      expect(ops.parkHarness).not.toHaveBeenCalled();
+    }
+    const nonTty = repairOps();
+    await runEgressGateRepair({ ...REPAIR_CTX, isTty: false, overrideTransientPfRules: true }, nonTty);
+    expect(nonTty.parkHarness).not.toHaveBeenCalled();
   });
 
   it("a PARKED release outcome is repair-failed (never repaired without the barrier's released verdict)", async () => {

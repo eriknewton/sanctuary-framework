@@ -13,8 +13,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  restoreCoarseCompositionProduction,
   verifyLoopbackTcpPortOwner,
   PID_START_TOLERANCE_MS,
+  type ExclusiveEgressWiringInput,
 } from "../../src/egress-gate/arming-wiring.js";
 
 function lsofOutput(pid: number, uid: number): string {
@@ -123,5 +125,29 @@ describe("egress-gate/arming-wiring verifyLoopbackTcpPortOwner", () => {
         }),
       ).resolves.toBe(false);
     }
+  });
+});
+
+describe("restoreCoarseCompositionProduction (fix-round M5: gate daemon stopped FIRST, loudly)", () => {
+  it("boots the gate daemon out BEFORE any teardown; a real bootout failure THROWS with nothing removed", async () => {
+    const calls: string[] = [];
+    // Only agentUid is reached before the loud throw; the rest of the wiring
+    // input is deliberately untouched (host-free).
+    const input = { agentUid: 502, agentId: "hermes", fortressPath: "/tmp/fortress-x" } as ExclusiveEgressWiringInput;
+    await expect(
+      restoreCoarseCompositionProduction(input, "test-reason", {
+        runLaunchctl: async (args) => {
+          calls.push(`launchctl ${args.join(" ")}`);
+          return { code: 5, stdout: "", stderr: "Boot-out failed: 5: Input/output error" };
+        },
+        removeFile: async (path) => {
+          calls.push(`rm ${path}`);
+        },
+      }),
+    ).rejects.toThrow(/could not stop the egress-gate daemon/);
+    // The bootout was the FIRST and ONLY side effect: no marker/policy/config
+    // removal ran under a possibly-live gate (pre-fix code swallowed the
+    // bootout failure AND removed files before attempting the stop).
+    expect(calls).toEqual(["launchctl bootout system/ai.sanctuaryprotocol.egress-gate.502"]);
   });
 });
