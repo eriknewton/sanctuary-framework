@@ -33,7 +33,11 @@ import type {
   ShortfallReport,
 } from "./types.js";
 import type { QuarterWindow } from "./types.js";
-import { daemonStoreExcludedFromCensus } from "./types.js";
+import {
+  daemonStoreExcludedFromCensus,
+  isRecognizedDaemonStatus,
+  isUsableFigure,
+} from "./types.js";
 import { notCollectedInventorySnapshot } from "./inventory.js";
 import {
   claimFromCompleteRead,
@@ -833,13 +837,34 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
   // non-split fortress): print nothing rather than throw.
   if (!d || d.status === "absent") return [];
   if (d.status === "included") {
+    // P2 (Dry-9): `included_entry_count` (and the windowed subset) are signed
+    // into this prose. Guard them with the shared `isUsableFigure` chokepoint --
+    // a negative / non-safe-integer count is an impossible census (the shipped
+    // CLI derives it from `daemon.entries.length` and is safe, but this
+    // pure/signed path must not sign "-7 daemon-recorded enforcement entries").
+    // An unusable count renders NOT-DETERMINABLE, never a definitive impossible
+    // number.
+    if (!isUsableFigure(d.included_entry_count)) {
+      return [
+        "> ENFORCEMENT-CENSUS NOTICE: a separate root-owned daemon enforcement " +
+          "store (_audit-daemon) is reported as included, but its merged entry " +
+          "count is not a usable figure, so the number of daemon-recorded " +
+          "enforcement entries in this census is NOT DETERMINABLE. Do not treat " +
+          "these counts as a complete enforcement census; investigate the daemon " +
+          "store.",
+        "",
+      ];
+    }
     // G-2: "the counts above" are quarter-windowed (aggregateQuarter skips
     // out-of-window entries), so the figure that contributes to them is the
     // WINDOWED daemon count, not the all-time total read. Render the windowed
-    // figure when the generator supplied it; otherwise fall back to a
-    // window-agnostic phrasing that does not claim the total was merged into the
-    // counts above.
-    if (d.windowed_entry_count !== undefined) {
+    // figure when the generator supplied it AND it is usable; otherwise fall
+    // back to a window-agnostic phrasing that does not claim the total was
+    // merged into the counts above.
+    if (
+      d.windowed_entry_count !== undefined &&
+      isUsableFigure(d.windowed_entry_count)
+    ) {
       return [
         `Daemon enforcement store: included. Of ${d.included_entry_count} ` +
           "daemon-recorded enforcement entries merged into this report's census " +
@@ -892,6 +917,20 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
         "included in the counts above and this is NOT a clean fresh or " +
         "never-armed fortress. Investigate before relying on this report; do not " +
         "treat these counts as a complete enforcement census.",
+      "",
+    ];
+  }
+  // D8-4 (Dry-9): an UNRECOGNIZED status (an untyped / JSON caller smuggled a
+  // string past the union) must be disclosed as not-determinable, never
+  // mislabeled with the present_unreadable "not readable at this privilege"
+  // wording below (a specific false diagnosis) and never silently dropped.
+  if (!isRecognizedDaemonStatus(d.status)) {
+    return [
+      "> ENFORCEMENT-CENSUS NOTICE: the daemon enforcement store disclosure " +
+        "carried an UNRECOGNIZED status, so whether a separate root-owned daemon " +
+        "enforcement store contributed to these counts could NOT be determined. " +
+        "Do not treat these counts as a complete enforcement census; investigate " +
+        "the daemon store.",
       "",
     ];
   }
@@ -958,8 +997,13 @@ function daemonCoverCaveat(d: DaemonStoreDisclosure | undefined): string[] {
       : d!.status === "present_tampered"
         ? "a separate root-owned daemon enforcement store (_audit-daemon) is " +
           "present but FAILED integrity verification (tamper evidence)"
-        : "a separate root-owned daemon enforcement store (_audit-daemon) is " +
-          "present but was not readable here";
+        : // D8-4 (Dry-9): an unrecognized status gets honest not-determinable
+          // wording, never the specific "not readable here" privilege excuse.
+          !isRecognizedDaemonStatus(d!.status)
+          ? "the daemon enforcement store disclosure carried an UNRECOGNIZED " +
+            "status, so its contribution to the census is not determinable"
+          : "a separate root-owned daemon enforcement store (_audit-daemon) is " +
+            "present but was not readable here";
   return [
     "> ENFORCEMENT-CENSUS NOTICE: " +
       phrase +
@@ -1011,6 +1055,19 @@ function daemonCensusCaveat(d: DaemonStoreDisclosure | undefined): string[] {
         "clean fresh fortress; do not treat these counts as a complete " +
         "enforcement census; investigate. The access-log and enforcement summary " +
         "section carries the full disclosure.",
+      "",
+    ];
+  }
+  // D8-4 (Dry-9): an unrecognized status is disclosed as not-determinable so the
+  // adjacent definitive counts are never presented as a complete census.
+  if (!isRecognizedDaemonStatus(d.status)) {
+    return [
+      "> ENFORCEMENT-CENSUS NOTICE: these counts are drawn from the operator " +
+        "audit store only. The daemon enforcement store disclosure carried an " +
+        "UNRECOGNIZED status, so whether a separate root-owned daemon enforcement " +
+        "store contributed is NOT DETERMINABLE. Do not treat these counts as a " +
+        "complete enforcement census; investigate. The access-log and enforcement " +
+        "summary section carries the full disclosure.",
       "",
     ];
   }
@@ -1360,10 +1417,11 @@ function renderScopeAndLimits(): PackSection {
     "- **Covered window (both ends).** Audit retention is size/count-based " +
       "(FIFO), not time-based, so a busy fortress can prune early-quarter " +
       "entries (start-side shortfall); and a report generated before the " +
-      "quarter closes can only attest coverage through its generation time " +
-      "(end-side / partial-quarter shortfall). This report detects and " +
-      "discloses both above and states the real covered-through instant, " +
-      "never assuming coverage to the quarter end.",
+      "quarter closes can only attest coverage through the earlier of its " +
+      "generation time and the audit-census cut point (the instant the audit " +
+      "log was read) (end-side / partial-quarter shortfall). This report " +
+      "detects and discloses both above and states the real covered-through " +
+      "instant, never assuming coverage to the quarter end.",
     "- **A covered window proves retention span, not recording liveness.** " +
       "The covered window states what the retained audit log spans. It does " +
       "not prove the enforcement stack was running and recording at every " +

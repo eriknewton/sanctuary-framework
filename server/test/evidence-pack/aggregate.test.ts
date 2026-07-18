@@ -337,8 +337,11 @@ describe("detectShortfall", () => {
       complete
     );
     expect(r.shortfall).toBe(true);
-    // covered_from is NOT the out-of-quarter date; it stays the quarter start.
-    expect(r.covered_from).toBe(Q3_2026.start_inclusive);
+    // D9C-2/P1 (Dry-9 fix): covered_from is NOT the out-of-quarter date; a
+    // zero-covered quarter attests an EMPTY span, so covered_from collapses to
+    // the exclusive end (never a definitive non-empty [quarter-start, end) span
+    // the SIGNED manifest / cover / §7 would otherwise back).
+    expect(r.covered_from).toBe(r.covered_to_exclusive);
     expect(r.explanation).toMatch(/NONE of this quarter is covered/);
   });
 
@@ -1095,13 +1098,15 @@ describe("detectShortfall", () => {
       expect(r.zero_of_quarter_covered).toBe(true);
     });
 
-    it("M1 (unchanged): an entry at or after the quarter end still says NONE covered and cites the quarter end", () => {
+    it("M1: an entry at or after the quarter end still says NONE covered, cites the quarter end, and attests an EMPTY span", () => {
       const r = detectShortfall(
         Q3_2026,
         ret({ retained_total: 5, earliest_retained_at: "2026-11-01T00:00:00.000Z", ever_pruned: true }),
         { generatedAt: "2026-11-01T00:00:00.000Z", lastEntryAt: null }
       );
-      expect(r.covered_from).toBe(Q3_2026.start_inclusive);
+      // D9C-2/P1 (Dry-9 fix): covered_from collapses to the exclusive end so the
+      // signed span is EMPTY, never a definitive non-empty one.
+      expect(r.covered_from).toBe(r.covered_to_exclusive);
       expect(new Date(r.covered_from).getTime()).toBeLessThanOrEqual(
         new Date(r.covered_to_exclusive).getTime()
       );
@@ -1235,6 +1240,92 @@ describe("detectShortfall", () => {
         { generatedAt: gen, lastEntryAt: null, censusTakenAt: "2026-08-15T13:00:00.000Z" }
       );
       expect(r.covered_to_exclusive).toBe(gen);
+    });
+  });
+
+  // ─── D8-2 (late Dry-8 lens): a fully type-valid but UNPARSEABLE
+  // `earliest_retained_at` string previously NaN'd through every numeric branch
+  // into the definitive "retained audit window reaches the quarter start" arm,
+  // signing shortfall:false + full-quarter coverage off a timestamp NOBODY
+  // parsed -- even with ever_pruned:true, and could sign the contradictory
+  // retention_at_cap:true + shortfall:false pair. The timestamp dimension must
+  // mirror the isUsableFigure discipline: unparseable => NOT DETERMINABLE for
+  // the start arm, never a definitive no-shortfall verdict. ───
+  describe("D8-2: an unparseable earliest_retained_at is never a definitive full-coverage verdict", () => {
+    const AFTER_Q3 = "2026-11-01T00:00:00.000Z";
+    it("does NOT sign shortfall:false / 'reaches the quarter start' for an unparseable timestamp", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "not-a-timestamp", ever_pruned: true }),
+        { generatedAt: AFTER_Q3, lastEntryAt: null }
+      );
+      expect(r.shortfall).toBe(true);
+      expect(r.explanation).not.toMatch(/reaches the quarter start/i);
+      // Attests an EMPTY span (never a definitive non-empty one).
+      expect(r.covered_from).toBe(r.covered_to_exclusive);
+      // Honest: names the unparseable timestamp, does NOT falsely diagnose FIFO
+      // pruning or claim "no entries survive" (entries exist; the time is unread).
+      expect(r.explanation).toMatch(/could not be parsed|not[- ]determinable/i);
+    });
+
+    it("does not sign the contradictory retention_at_cap:true + shortfall:false pair", () => {
+      // A VALID per-store row at cap would set retention_at_cap:true; the
+      // unparseable earliest must still force shortfall:true (never the false pair).
+      const r = detectShortfall(
+        Q3_2026,
+        ret({
+          earliest_retained_at: "2026-13-45T99:99:99.999Z", // structurally invalid
+          ever_pruned: true,
+          per_store_retention: [
+            {
+              store: "operator",
+              max_entries: 100,
+              retained_total: 100, // at entry cap
+              max_total_size_bytes: 1_000_000,
+              retained_total_size_bytes: 0,
+            },
+          ],
+        }),
+        { generatedAt: AFTER_Q3, lastEntryAt: null }
+      );
+      expect(r.shortfall).toBe(true);
+    });
+
+    it("still treats a genuinely NULL earliest (empty log) as the empty-log case, not unparseable", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ retained_total: 0, earliest_retained_at: null }),
+        { generatedAt: AFTER_Q3, lastEntryAt: null }
+      );
+      expect(r.shortfall).toBe(true);
+      expect(r.explanation).toMatch(/no retained entries/i);
+    });
+  });
+
+  // ─── P3 (Dry-9): when the census cut clamps covered_to_exclusive, surfaces
+  // that echo the bound must name the CENSUS CUT, not "the generation time". ───
+  describe("P3: covered_to_is_census_cut names the actual attestable-end bound", () => {
+    it("is true when the audit-census cut bounds the window (precedes generation)", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+        {
+          generatedAt: "2026-08-15T12:00:00.000Z",
+          lastEntryAt: null,
+          censusTakenAt: "2026-08-15T11:00:00.000Z",
+        }
+      );
+      expect(r.covered_to_is_census_cut).toBe(true);
+      expect(r.covered_to_exclusive).toBe("2026-08-15T11:00:00.000Z");
+    });
+
+    it("is false when the generation instant (not a census cut) bounds the window", () => {
+      const r = detectShortfall(
+        Q3_2026,
+        ret({ earliest_retained_at: "2026-06-01T00:00:00.000Z" }),
+        { generatedAt: "2026-08-15T12:00:00.000Z", lastEntryAt: null }
+      );
+      expect(r.covered_to_is_census_cut).toBe(false);
     });
   });
 });

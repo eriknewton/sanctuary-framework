@@ -264,6 +264,15 @@ export function buildEvidencePack(
         ...(s.retention_at_cap_determinable
           ? { retention_at_cap: s.retention_at_cap }
           : { retention_at_cap_determinable: false as const }),
+        // P1 (Dry-9 fix): when ZERO of the quarter is covered, carry the
+        // explicit marker so a machine reader sees the empty
+        // `covered_from === covered_to_exclusive` span for what it is -- zero
+        // coverage -- and never mistakes it for a real (if narrow) window.
+        // Omitted (never `false`) otherwise, so the shipped manifest shape is
+        // unchanged for a normally-covered quarter.
+        ...(s.zero_of_quarter_covered
+          ? { zero_of_quarter_covered: true as const }
+          : {}),
         // G-1 follow-up: carry the daemon-store disclosure into the SIGNED
         // machine-readable coverage so `shortfall: false` is never read as a
         // complete-census signal when a present daemon store was excluded.

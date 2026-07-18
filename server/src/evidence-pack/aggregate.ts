@@ -24,7 +24,12 @@ import type {
   RetentionFacts,
   ShortfallReport,
 } from "./types.js";
-import { daemonStoreExcludedFromCensus } from "./types.js";
+import {
+  daemonStoreExcludedFromCensus,
+  isRecognizedDaemonStatus,
+  isUsableFigure,
+  isUsableTimestamp,
+} from "./types.js";
 import { isInWindow } from "./quarter.js";
 
 /**
@@ -222,6 +227,18 @@ function daemonPresentButExcludedSuffix(retention: RetentionFacts): string {
       "enforcement-summary section."
     );
   }
+  // D8-4 (Dry-9): an UNRECOGNIZED status (an untyped / JSON caller) is disclosed
+  // as not-determinable, never silently dropped -- and never mislabeled with a
+  // known status's specific wording.
+  if (!isRecognizedDaemonStatus(d.status)) {
+    return (
+      " NOTE: the daemon enforcement store disclosure carried an UNRECOGNIZED " +
+      "status, so whether daemon-recorded enforcement for this quarter is " +
+      "reflected above cannot be determined; treat this as an operator-store " +
+      "view, not a complete enforcement census. See the enforcement-summary " +
+      "section."
+    );
+  }
   return "";
 }
 
@@ -253,36 +270,6 @@ export interface RetentionDeterminability {
    */
   contributing_stores: readonly StoreRetentionPosition[];
 }
-
-/**
- * F2-R2 (Codex second-family review + Dry-8 sweep): a finite plain number --
- * the ONLY runtime shape the at-cap comparisons in `detectShortfall` can
- * honestly evaluate. Rejects `NaN`, `Infinity`, `undefined`, `null`, strings,
- * and every other type an untyped JS / `JSON.parse` caller can smuggle past
- * the compile-time `number` annotation.
- */
-/**
- * D9C-3 (Dry-9 sweep): a retained COUNT or SIZE figure is only usable for a
- * definitive cap verdict when it is a NON-NEGATIVE SAFE INTEGER. Two classes of
- * finite-but-unusable figure previously signed definitive verdicts:
- *
- *  - NEGATIVE (`retained_total_size_bytes: -1`, a negative retained count): a
- *    count of things cannot be negative, so a negative figure is a corrupt /
- *    sentinel reading, not a real census. It passed a plain finite-number check
- *    and then signed a flattering below-cap verdict (`-1 >= cap` is always false).
- *  - NON-SAFE (`> Number.MAX_SAFE_INTEGER`): JS silently ROUNDS integers past
- *    2^53-1, so the at-cap comparison rests on a value that is not the figure
- *    the reporter recorded. It passed a plain finite-number check and could sign
- *    a definitive at-cap verdict off a rounded number.
- *
- * `Number.isSafeInteger` rejects `NaN`, `Infinity`, non-integers, and every
- * value outside the safe range in one predicate; the explicit `>= 0` bans the
- * negative sentinel. This mirrors the D8-1 usable-figures chokepoint and the S5
- * safe-generation bound: a corrupt or unrepresentable figure is NOT DETERMINABLE,
- * never a definitive verdict.
- */
-const isUsableFigure = (v: unknown): v is number =>
-  typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 
 /**
  * F2-R2 -> D8-1: runtime USABILITY of one contributing store position. Row
@@ -509,18 +496,29 @@ export function detectShortfall(
   const quarterStartMs = new Date(window.start_inclusive).getTime();
   const quarterEndMs = new Date(window.end_exclusive).getTime();
   const generatedMs = new Date(params.generatedAt).getTime();
-  // D9C-1: the census cut, when supplied and parseable, bounds the attested
-  // window from above. A non-finite value is ignored (falls back to generation).
-  const censusMs =
-    params.censusTakenAt === undefined
-      ? null
-      : new Date(params.censusTakenAt).getTime();
+  // D9C-1: the census cut, when supplied and USABLE, bounds the attested window
+  // from above. An absent or unparseable value is ignored (falls back to
+  // generation) -- D8-2: the census cut is attestation-bearing, so it flows
+  // through the shared `isUsableTimestamp` guard exactly like the earliest
+  // instant below.
   const censusBoundMs =
-    censusMs !== null && Number.isFinite(censusMs) ? censusMs : null;
-  const earliestMs =
-    retention.earliest_retained_at === null
-      ? null
-      : new Date(retention.earliest_retained_at).getTime();
+    params.censusTakenAt !== undefined && isUsableTimestamp(params.censusTakenAt)
+      ? new Date(params.censusTakenAt).getTime()
+      : null;
+  // D8-2 (Dry-9): the earliest-retained instant DRIVES the start-coverage
+  // verdict, so it must be USABLE (a string that parses to a finite instant)
+  // before it can anchor any definitive claim. A fully type-valid but
+  // UNPARSEABLE value previously NaN'd through every numeric branch below into
+  // the flattering "reaches the quarter start" arm, signing shortfall:false off
+  // an instant nobody parsed. `earliestMs` is a finite number ONLY when the
+  // stored value is usable; a genuinely-null (empty log) value and an unusable
+  // (unparseable) value are told apart by `earliestUnparseable`.
+  const earliestRaw = retention.earliest_retained_at;
+  const earliestUsable = earliestRaw !== null && isUsableTimestamp(earliestRaw);
+  const earliestMs = earliestUsable
+    ? new Date(earliestRaw as string).getTime()
+    : null;
+  const earliestUnparseable = earliestRaw !== null && !earliestUsable;
   // D5-1 (dry-bar round 5): "at a retention cap" is judged PER STORE against
   // each store's OWN independent cap, then OR-ed. Each contributing `AuditLog`
   // (operator + daemon) prunes on its own 100k-entry / 100 MB caps, so the
@@ -570,6 +568,14 @@ export function detectShortfall(
   );
   const inProgress = coveredToExclusiveMs < quarterEndMs;
   const coveredToExclusive = new Date(coveredToExclusiveMs).toISOString();
+  // P3 (Dry-9): the attestable end is the AUDIT-CENSUS cut (not the generation
+  // instant) when that census cut precedes generation AND is the binding
+  // minimum. Surfaces that echo the bound name it honestly from this flag
+  // instead of the stale "the generation time".
+  const coveredToIsCensusCut =
+    censusBoundMs !== null &&
+    censusBoundMs < generatedMs &&
+    coveredToExclusiveMs === censusBoundMs;
 
   // G-1(c): `earliest_retained_at` is derived from the OPERATOR store only (the
   // daemon store is merged into the scan only when readable). When a root-owned
@@ -587,7 +593,29 @@ export function detectShortfall(
   let startShortfall: boolean;
   let startExplanation: string;
   let zeroOfQuarterCovered = false;
-  if (earliestMs === null) {
+  if (earliestUnparseable) {
+    // D8-2 (Dry-9): the earliest-retained timestamp is present but UNPARSEABLE,
+    // so the start side is NOT DETERMINABLE. Attest an EMPTY span (never the
+    // flattering "reaches the quarter start" full-coverage arm, and never a
+    // definitive non-empty span) and disclose the unparseable value honestly --
+    // without the false FIFO-pruning or "no entries survive" diagnosis (entries
+    // exist; only their instant is unreadable).
+    coveredFrom = coveredToExclusive;
+    startShortfall = true;
+    startExplanation = daemonExcluded
+      ? "The earliest retained entry in the operator audit log carries a " +
+        "timestamp (" +
+        String(retention.earliest_retained_at) +
+        ") that could not be parsed, so this report cannot demonstrate coverage " +
+        "of any part of the quarter from the operator store; start-side coverage " +
+        "is NOT DETERMINABLE. Investigate the operator store's earliest entry." +
+        daemonPresentButExcludedSuffix(retention)
+      : "The earliest retained audit entry carries a timestamp (" +
+        String(retention.earliest_retained_at) +
+        ") that could not be parsed, so this report cannot demonstrate coverage " +
+        "of any part of the quarter; start-side coverage is NOT DETERMINABLE. " +
+        "Investigate the audit store's earliest entry.";
+  } else if (earliestMs === null) {
     coveredFrom = window.start_inclusive;
     startShortfall = true;
     zeroOfQuarterCovered = true;
@@ -714,6 +742,18 @@ export function detectShortfall(
     zeroOfQuarterCovered = true;
   }
 
+  // D9C-2/P1 (Dry-9 fix): whenever ZERO of the quarter is covered, the attested
+  // span must be EMPTY. Several zero-covered branches above leave `coveredFrom`
+  // at the quarter start, which the cover span, the §7 span, AND the SIGNED
+  // manifest all render as covered_from..covered_to_exclusive -- a DEFINITIVE
+  // non-empty coverage window that flatly contradicts the "NONE of this quarter
+  // is covered" disclosure a machine reader would otherwise trust. Collapse
+  // `coveredFrom` to the exclusive end so every surface attests a zero-width
+  // span consistent with the disclosure.
+  if (zeroOfQuarterCovered) {
+    coveredFrom = coveredToExclusive;
+  }
+
   const parts: string[] = [];
   if (inProgress) {
     // D9C-1: the attestable end is the census cut when that is what bounds the
@@ -763,6 +803,9 @@ export function detectShortfall(
     // serialize a not-determinable marker instead of a definitive boolean.
     retention_at_cap_determinable: atCapDeterminable,
     zero_of_quarter_covered: zeroOfQuarterCovered,
+    // P3 (Dry-9): whether the attestable end is the audit-census cut (vs the
+    // generation instant / quarter end), so surfaces echo the bound honestly.
+    covered_to_is_census_cut: coveredToIsCensusCut,
     explanation: parts.join(" "),
     // WATCH-1: carry the daemon-store disclosure onto the coverage report so the
     // enforcement-summary section can state whether daemon-recorded enforcement

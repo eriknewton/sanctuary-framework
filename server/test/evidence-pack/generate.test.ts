@@ -1540,4 +1540,126 @@ describe("D5-3: a caller that OMITS discrete_exports never mints definitive §10
     expect(report).toContain("the audit-chain export was empty for this fortress");
     expect(report).toContain("no public-anchor (Sigstore/Rekor) evidence is available");
   });
+
+  // ─── Dry-9 fix-round: manifest/prose coverage honesty ───
+
+  // P1 [HIGH]: a zero-covered quarter previously signed a DEFINITIVE non-empty
+  // span into the manifest (covered_from = quarter start, covered_to = census
+  // cut, determinable:true) while the prose said "NONE of this quarter is
+  // covered". The SIGNED manifest and the prose must agree: an empty span + an
+  // explicit zero_of_quarter_covered marker, never a definitive non-empty span.
+  it("P1: the SIGNED manifest of a zero-covered quarter carries an EMPTY span + zero marker, matching the prose", () => {
+    const census = "2026-08-01T00:00:00.000Z";
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-09-15T00:00:00.000Z", "gate_allow:x")],
+      retention: { ...FULL_COVERAGE, earliest_retained_at: "2026-09-15T00:00:00.000Z" },
+      census_taken_at: census,
+    });
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-01T00:00:00.000Z",
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      { audit, signer, masterKey }
+    );
+    const c = coverage(pack);
+    // SIGNED manifest: empty span, explicit zero marker, shortfall true.
+    expect(c.covered_from).toBe(c.covered_to_exclusive);
+    expect((c as { zero_of_quarter_covered?: boolean }).zero_of_quarter_covered).toBe(true);
+    expect(c.shortfall).toBe(true);
+    // The manifest is what gets signed: verify the signature still holds.
+    const signerPub = fromBase64url(pack.manifest.signer.public_key_base64url);
+    const { manifest_signature, ...bodyM } = pack.manifest;
+    const manifestDigest = hash(stringToBytes(canonicalJSON(bodyM)));
+    expect(verify(manifestDigest, fromBase64url(manifest_signature), signerPub)).toBe(true);
+    // Prose: the cover span must NOT read as a definitive non-empty coverage
+    // window while the banner says NONE covered.
+    const report = pack.files[0]!.content;
+    expect(report).toContain("NONE of this quarter is covered");
+    expect(report).not.toContain(`2026-07-01T00:00:00.000Z to ${census} (exclusive)`);
+  });
+
+  // P2: the pure/signed path signs `included_entry_count` (daemon store) into
+  // the report prose without the non-negative safe-integer guard, so a negative
+  // count signed "-7 daemon-recorded enforcement entries ... are included."
+  it("P2: a negative daemon included_entry_count never signs an impossible count into the report", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "included", included_entry_count: -7 },
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("-7 daemon-recorded");
+    expect(report).not.toMatch(/-7[^)]*enforcement entries/);
+    // Renders honest not-determinable language instead.
+    expect(report).toMatch(/not determinable|could not be determined|not[- ]gathered/i);
+  });
+
+  // D8-2 [MED]: an unparseable earliest_retained_at must never serialize a
+  // definitive shortfall:false / full-coverage span into the SIGNED manifest.
+  it("D8-2: an unparseable earliest_retained_at never signs shortfall:false into the manifest", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "garbage-not-a-date",
+        ever_pruned: true,
+      })
+    );
+    const c = coverage(pack);
+    expect(c.shortfall).toBe(true);
+    expect(c.covered_from).toBe(c.covered_to_exclusive);
+  });
+
+  // D8-4 [LOW]: an unrecognized daemon_store.status must be disclosed as
+  // not-gathered / not-determinable, never silently a complete definitive census
+  // with the never-pruned/below-caps reassurance.
+  it("D8-4: an unrecognized daemon_store.status is disclosed, never a silent complete census", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps(
+        [entry("2026-08-15T00:00:00.000Z", "gate_allow:x")],
+        {
+          max_entries: 100_000,
+          retained_total: 42,
+          max_total_size_bytes: 100 * 1024 * 1024,
+          retained_total_size_bytes: 10,
+          ever_pruned: false,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          // Untyped/JSON caller smuggles an unrecognized status past the union.
+          daemon_store: {
+            status: "quarantined" as unknown as "included",
+            included_entry_count: 0,
+          },
+        }
+      )
+    );
+    const report = pack.files[0]!.content;
+    // Must NOT present the operator counts as a complete enforcement census.
+    expect(report).toMatch(/not a complete enforcement census|unrecognized|not[- ]determinable/i);
+    // Must NOT assert the flattering unqualified whole-fortress reassurance.
+    expect(report).not.toContain("the fortress had no recorded activity");
+  });
+
+  // P3: when the census cut clamps the window, the CLI/scope copy must name the
+  // census cut, not falsely claim the bound is "the generation time".
+  it("P3: the scope-and-limits covered-window copy names the audit-census cut, not only generation time", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const report = pack.files[0]!.content;
+    // The static covered-window scope bullet must acknowledge the census-cut
+    // bound so it is not stale when D9C-1 clamps to the census cut.
+    const scope = report.split("\n---\n").find((p) => p.includes("Covered window (both ends)"));
+    expect(scope).toBeTruthy();
+    expect(scope!).toMatch(/census/i);
+  });
 });

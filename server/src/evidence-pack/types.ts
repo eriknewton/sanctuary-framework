@@ -22,6 +22,38 @@
 import type { ReadOutcome } from "./read-outcome.js";
 
 /**
+ * D9C-3 / D8-1: the SHARED "usable figure" honesty predicate for a retained
+ * COUNT or SIZE. A figure may drive a definitive verdict (a cap comparison, a
+ * signed census count) ONLY when it is a NON-NEGATIVE SAFE INTEGER.
+ * `Number.isSafeInteger` rejects `NaN`, `Infinity`, non-integers, and every
+ * value outside 2^53-1 (past which JS silently ROUNDS) in one predicate; the
+ * explicit `>= 0` bans the negative sentinel (a count of things cannot be
+ * negative). Centralised here so every count/size ingress -- the at-cap
+ * comparison in `aggregate.ts` AND the daemon-census prose in `sections.ts`
+ * (P2, Dry-9) -- routes through ONE chokepoint: a corrupt or unrepresentable
+ * figure is NOT DETERMINABLE, never a definitive verdict or an impossible
+ * signed count.
+ */
+export const isUsableFigure = (v: unknown): v is number =>
+  typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+/**
+ * D8-2 (Dry-9): the SHARED "usable timestamp" honesty predicate, the time-
+ * dimension mirror of {@link isUsableFigure}. An attestation-bearing timestamp
+ * (the earliest-retained instant that drives the start-coverage verdict, the
+ * audit-census cut that bounds the attested window) may anchor a definitive
+ * coverage verdict ONLY when it is a string that parses to a FINITE instant. A
+ * fully type-valid but UNPARSEABLE string NaNs through every numeric comparison;
+ * #954/#958 validated every NUMERIC dimension but left the TIMESTAMP dimension
+ * unguarded, so an unparseable value could sign a definitive full-coverage /
+ * no-shortfall verdict off an instant nobody parsed. Requiring `typeof string`
+ * also rejects an untyped caller's number/object smuggled past the compile-time
+ * `string` annotation.
+ */
+export const isUsableTimestamp = (v: unknown): v is string =>
+  typeof v === "string" && Number.isFinite(new Date(v).getTime());
+
+/**
  * A calendar quarter, e.g. `{ year: 2026, quarter: 3 }` for 2026-Q3 (July,
  * August, September). Quarter is 1..4.
  */
@@ -227,11 +259,38 @@ export interface DaemonStoreDisclosure {
 export function daemonStoreExcludedFromCensus(
   daemon: DaemonStoreDisclosure | undefined
 ): boolean {
-  const status = daemon?.status;
+  // A wholly-absent disclosure (a partial fixture / a report produced before
+  // this field existed) keeps its documented default: treat as `absent`, the
+  // operator store IS the whole census (NOT excluded).
+  if (daemon === undefined) return false;
+  const status = daemon.status;
+  // D8-4 (Dry-9): fail-safe allowlist. The operator store is the whole census
+  // ONLY for the two definitively-complete states: `absent` (never-armed) and
+  // `included` (daemon merged). Every excluded state (`present_unreadable`,
+  // `present_tampered`, `missing`) AND any UNRECOGNIZED status an untyped / JSON
+  // caller smuggles past the union is EXCLUDED -- disclosed, never silently
+  // presented as a complete definitive census with the never-pruned reassurance.
+  return status !== "absent" && status !== "included";
+}
+
+/**
+ * D8-4 (Dry-9): is a daemon-store status one this version explicitly recognizes?
+ * An untyped / JSON caller can smuggle any string past the compile-time union,
+ * and an unrecognized status must be DISCLOSED as not-gathered / not-determinable
+ * rather than mislabeled with a specific status's wording (e.g. the
+ * "present but not readable here" privilege excuse). Every renderer that
+ * switches on the status uses this to route an unknown value to honest
+ * "unrecognized" copy instead of a definitive census.
+ */
+export function isRecognizedDaemonStatus(
+  status: unknown
+): status is DaemonStoreDisclosure["status"] {
   return (
+    status === "absent" ||
+    status === "missing" ||
+    status === "included" ||
     status === "present_unreadable" ||
-    status === "present_tampered" ||
-    status === "missing"
+    status === "present_tampered"
   );
 }
 
@@ -410,9 +469,21 @@ export interface ShortfallReport {
    * True when the ENTIRE retained window post-dates the quarter, so ZERO of the
    * quarter is covered even though the nominal signed span reaches the quarter
    * start (round-2 N2). Lets the cover banner state "none of this quarter is
-   * covered" precisely rather than the generic "does not reach the start".
+   * covered" precisely rather than the generic "does not reach the start". P1
+   * (Dry-9): when true, `covered_from` collapses to `covered_to_exclusive` so
+   * every surface (cover span, §7 span, SIGNED manifest) attests an EMPTY span,
+   * never a definitive non-empty one the disclosure denies.
    */
   zero_of_quarter_covered: boolean;
+  /**
+   * P3 (Dry-9): true when `covered_to_exclusive` is bounded by the AUDIT-CENSUS
+   * cut (D9C-1) -- the census instant precedes the generation instant -- rather
+   * than by the generation instant or the quarter end. Lets surfaces that echo
+   * the attestable-end bound name it honestly ("the audit-census cut point")
+   * instead of the stale "the generation time". Only meaningful when
+   * {@link in_progress_quarter} (a clamp only happens then).
+   */
+  covered_to_is_census_cut: boolean;
   /** A lay-reader explanation suitable for printing in the PDF. */
   explanation: string;
   /**
@@ -647,6 +718,16 @@ export interface EvidencePackManifest {
          * marker knows the at-cap fact was not computed, not that it is false.
          */
         retention_at_cap_determinable?: false;
+        /**
+         * P1 (Dry-9 fix): serialized `true` ONLY when ZERO of the quarter is
+         * demonstrably covered (the entire retained window post-dates the
+         * attestable end, or the earliest instant was unusable). In that state
+         * `covered_from === covered_to_exclusive` (an EMPTY span), so a machine
+         * reader is never handed a definitive non-empty covered span the prose
+         * denies. Omitted (never `false`) otherwise, so the shipped CLI path's
+         * manifest shape is unchanged.
+         */
+        zero_of_quarter_covered?: true;
         /**
          * G-1 (two-family gate follow-up): the F2 daemon enforcement store's
          * disclosure, machine-readable, so a verifier reading `shortfall: false`

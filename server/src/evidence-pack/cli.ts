@@ -1126,9 +1126,15 @@ export async function runEvidencePack(args: string[]): Promise<void> {
       ""
     );
   } else if (sf.status === "populated" && sf.value.in_progress_quarter) {
+    // P3 (Dry-9): name the actual attestable-end bound. When D9C-1 clamps the
+    // window to the audit-census cut, say so -- never the stale "the generation
+    // time" (the census was read BEFORE the generation instant).
+    const boundLabel = sf.value.covered_to_is_census_cut
+      ? "the audit-census cut point"
+      : "the generation time";
     summaryLines.push(
       `  WARNING: ${label} is still IN PROGRESS. This pack covers only through`,
-      `  ${sf.value.covered_to_exclusive} (the generation time), NOT the full`,
+      `  ${sf.value.covered_to_exclusive} (${boundLabel}), NOT the full`,
       "  quarter. Do not present it to an insurer or client as a complete-quarter",
       "  report; regenerate after the quarter closes. The report is stamped PARTIAL.",
       ""
