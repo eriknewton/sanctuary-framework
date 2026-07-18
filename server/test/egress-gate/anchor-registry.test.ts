@@ -1112,3 +1112,55 @@ describe("egress-gate/anchor-registry fix-round-6 (F1 malformed generation_floor
     expect((await registry.list()).dirty).toBe(false);
   });
 });
+
+describe("egress-gate/anchor-registry fix-round-7 (unsafe-integer generation floor has no allocation headroom)", () => {
+  const KEPT7: PfAnchorRegistryEntry = {
+    agent_uid: 502,
+    gate_port: 19998,
+    fortress_path: "/f/a",
+    generation_id: 7,
+  };
+
+  it("an unsafe-integer RAW floor is UNRECOVERABLE (never folded, never persisted): floor+1 would allocate the same id forever", async () => {
+    const { registry, store } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [KEPT7],
+        enable_token: "1",
+        generation_floor: "9007199254740993" as never,
+      },
+    });
+    const listed = await registry.list();
+    expect(listed.dirty).toBe(true);
+    // Pre-fix: Number("9007199254740993") rounded to 2^53 and was folded as a
+    // "parseable" floor, so the allocator would return the SAME unsafe id
+    // forever (floor+1 === floor at that magnitude).
+    expect(listed.generationFloor).toBeUndefined();
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    expect(res.floorRepair).toEqual({
+      raw: "9007199254740993",
+      parsed: null,
+      resolved_floor: 7,
+      unrecoverable: true,
+    });
+    expect(store.current?.generation_floor).toBe(7);
+    expect(store.current?.generation_floor_raw).toBeUndefined();
+  });
+
+  it("a well-formed but unsafe-integer NUMBER floor is malformed evidence (dirty), not a valid floor", async () => {
+    const { registry } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [KEPT7],
+        enable_token: "1",
+        generation_floor: 9007199254740992 as never,
+      },
+    });
+    const listed = await registry.list();
+    // Pre-fix: Number.isInteger(2^53) is true, so this read as a VALID floor
+    // and flowed straight into allocation with no headroom.
+    expect(listed.dirty).toBe(true);
+    expect(listed.generationFloor).toBeUndefined();
+  });
+});

@@ -367,7 +367,12 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
  * Best-effort numeric recovery of a malformed generation-floor value
  * (fix-round-6 F1): a number, or a numeric string (e.g. `"8"`), that resolves
  * to a finite value >= 1. Fractional values round UP (a floor must never be
- * lowered by coercion). Anything else is unrecoverable (`null`).
+ * lowered by coercion). The recovered floor must leave allocation headroom:
+ * both the floor and floor+1 must be safe integers, because
+ * `computeNextGenerationId` allocates floor+1 and the gate runtime rejects
+ * unsafe generation ids -- a floor at 2^53-1 would silently allocate the SAME
+ * id forever (floor+1 === floor at that magnitude). Anything else is
+ * unrecoverable (`null`).
  */
 function parseGenerationFloorRaw(raw: unknown): number | null {
   const n =
@@ -377,7 +382,11 @@ function parseGenerationFloorRaw(raw: unknown): number | null {
         ? Number(raw)
         : Number.NaN;
   if (!Number.isFinite(n) || n < 1) return null;
-  return Math.ceil(n);
+  const ceiled = Math.ceil(n);
+  if (!Number.isSafeInteger(ceiled) || !Number.isSafeInteger(ceiled + 1)) {
+    return null;
+  }
+  return ceiled;
 }
 
 /**
@@ -399,7 +408,14 @@ function classifyGenerationFloor(loaded: PfAnchorRegistryState): {
   };
   const rawCandidates: unknown[] = [];
   if (loaded.generation_floor !== undefined) {
-    if (Number.isInteger(loaded.generation_floor) && loaded.generation_floor >= 1) {
+    // Same allocation-headroom bound as parseGenerationFloorRaw: a
+    // well-formed-looking floor at or above 2^53-1 cannot allocate a distinct
+    // next id, so it is malformed evidence, not a valid floor.
+    if (
+      Number.isSafeInteger(loaded.generation_floor) &&
+      loaded.generation_floor >= 1 &&
+      Number.isSafeInteger(loaded.generation_floor + 1)
+    ) {
       out.validFloor = loaded.generation_floor;
     } else {
       rawCandidates.push(loaded.generation_floor);
