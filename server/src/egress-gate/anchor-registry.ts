@@ -132,6 +132,18 @@ export interface PfAnchorRegistryState {
   pending?: PfAnchorRegistryEntry[];
   /** Needs-repair: the anchor and registry may diverge; posture MUST be red. */
   dirty?: boolean;
+  /**
+   * Generation floor (fix-round-5 P1): a STRICTLY-EXCEEDED lower bound for any
+   * future generation allocation. Written by {@link PfAnchorRegistry.repairQuarantined}
+   * when it REMOVES a quarantined entry whose raw parse carried a valid
+   * `generation_id` that no surviving entry preserves (a removed duplicate, or
+   * a malformed entry that could not be salvaged as a tombstone) -- without the
+   * floor, the next bring-up would recompute from the surviving entry alone and
+   * could REUSE the discarded generation, letting a stale manifest/pf rule
+   * masquerade as current. Monotone: only ever raised. ADDITIVE + OPTIONAL
+   * (absent === no floor); the state version stays `1`.
+   */
+  generation_floor?: number;
 }
 
 /** Injected persistence for the registry state (root-owned file in production). */
@@ -140,6 +152,15 @@ export interface PfAnchorRegistryStore {
   load(): Promise<PfAnchorRegistryState | null>;
   /** Persist the state atomically (production: temp-write + rename, 0600). */
   save(state: PfAnchorRegistryState): Promise<void>;
+  /**
+   * Read the persisted state's RAW BYTES verbatim (`null` when no registry
+   * exists). OPTIONAL, but the production FS store provides it: the quarantine
+   * repair's forensic sidecar must preserve the byte-exact pre-repair file
+   * (duplicate JSON keys, formatting -- everything `JSON.parse` flattens,
+   * fix-round-5 P3). A store without raw access degrades the sidecar to a
+   * canonical re-serialization of the parsed state.
+   */
+  loadRaw?(): Promise<string | null>;
 }
 
 /** Everything the registry needs, all injectable so it is host-free in tests. */
@@ -165,7 +186,9 @@ export interface PfAnchorRegistryOps {
   ) => Promise<PfLivenessResult>;
   /**
    * Forensic sink for {@link PfAnchorRegistry.repairQuarantined}: persist the
-   * raw quarantined entries BEFORE any of them is removed and return the
+   * BYTE-EXACT pre-repair registry file (fix-round-5 P3; the store's raw bytes
+   * when it exposes {@link PfAnchorRegistryStore.loadRaw}, else a canonical
+   * snapshot of the parsed state) BEFORE anything is removed and return the
    * absolute path written. MUST throw on failure (the repair then refuses to
    * remove anything -- an entry is never dropped without its bytes preserved).
    * Injected for tests; defaults to {@link createFsQuarantineForensicsWriter}.
@@ -195,6 +218,18 @@ export interface PfAnchorQuarantineRepairFinding {
    * entry is dropped from the committed set outright.
    */
   disposition: "tombstoned" | "removed";
+  /**
+   * Present ONLY when a structurally VALID duplicate of a kept uid was REMOVED
+   * (fix-round-5 P1): discarding a valid committed entry must be LOUD, naming
+   * the kept sibling's generation and the removed one's (`null` when the
+   * respective entry carries no generation). A removed generation is folded
+   * into the persisted {@link PfAnchorRegistryState.generation_floor} so it
+   * can never be reallocated.
+   */
+  duplicate?: {
+    kept_generation_id: number | null;
+    removed_generation_id: number | null;
+  };
 }
 
 /** Result of {@link PfAnchorRegistry.repairQuarantined} (fix-round-4 P2). */
@@ -352,6 +387,19 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
     }
   }
   if (loaded.dirty === true) state.dirty = true;
+  // Fix-round-5 P1: preserve the persisted generation floor (a strictly-
+  // exceeded lower bound for future generation allocation, written by the
+  // quarantine repair verb when it removes an entry carrying a generation_id
+  // no surviving entry preserves). A present-but-malformed floor is a repair
+  // signal (dirty), never silently coerced -- its value is unrecoverable, so
+  // it is dropped and posture is forced red rather than trusting garbage.
+  if (loaded.generation_floor !== undefined) {
+    if (Number.isInteger(loaded.generation_floor) && loaded.generation_floor >= 1) {
+      state.generation_floor = loaded.generation_floor;
+    } else {
+      state.dirty = true;
+    }
+  }
   // A non-empty committed set with no valid enable token is inconsistent (pf
   // should be enabled and its reference releasable): treat as needs-repair
   // (gate finding). reconcile-on-entry re-asserts the committed union, which
@@ -440,6 +488,15 @@ export function createFsRegistryStore(path: string = PF_ANCHOR_REGISTRY_PATH): P
         );
       }
     },
+    async loadRaw(): Promise<string | null> {
+      const { readFile } = await import("node:fs/promises");
+      try {
+        return await readFile(path, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+      }
+    },
     async save(state: PfAnchorRegistryState): Promise<void> {
       const { writeFile, rename, mkdir } = await import("node:fs/promises");
       const { dirname } = await import("node:path");
@@ -493,11 +550,14 @@ export class PfAnchorRegistry {
    * the next mutation's reconcile-on-entry re-asserts it, so posture must not
    * read green (gate finding: `pending` was ignored here).
    */
-  async list(): Promise<{ entries: PfAnchorRegistryEntry[]; dirty: boolean }> {
+  async list(): Promise<{ entries: PfAnchorRegistryEntry[]; dirty: boolean; generationFloor?: number }> {
     const state = normalizeState(await this.store.load());
     return {
       entries: state.committed,
       dirty: state.dirty === true || state.pending !== undefined,
+      // Fix-round-5 P1: surface the persisted generation floor so allocation
+      // adapters (generation bring-up) can never reuse a repair-discarded id.
+      ...(state.generation_floor !== undefined ? { generationFloor: state.generation_floor } : {}),
     };
   }
 
@@ -567,10 +627,11 @@ export class PfAnchorRegistry {
    *    handles that dirt without discarding confinement state.
    *  - STRUCTURAL corruption (unparseable file, wrong version, `committed`
    *    not an array) still throws wholesale: nothing salvageable.
-   *  - Forensics FIRST: every quarantined entry's raw content is persisted
-   *    through the injected {@link PfAnchorRegistryOps.quarantineForensics}
-   *    sink BEFORE any removal; a forensic write failure aborts the repair
-   *    with the registry untouched.
+   *  - Forensics FIRST and BYTE-EXACT (fix-round-5 P3): the pre-repair
+   *    registry file's raw bytes are persisted verbatim through the injected
+   *    {@link PfAnchorRegistryOps.quarantineForensics} sink BEFORE any
+   *    removal; a forensic write failure aborts the repair with the registry
+   *    untouched.
    *  - Fail-closed disposition per entry: when the raw entry's
    *    uid/port/fortress still validate, the uid is KEPT as a block-only
    *    TOMBSTONE (packet-confined, gate channel gone) rather than dropped --
@@ -578,6 +639,12 @@ export class PfAnchorRegistry {
    *    (fail-open). Only an entry with nothing renderable (or a duplicate of
    *    a valid sibling) is removed outright. Either way the affected uid
    *    needs re-provisioning before its gate serves again.
+   *  - Generation monotonicity (fix-round-5 P1): a REMOVED entry whose raw
+   *    parse carried a valid `generation_id` folds that id into the persisted
+   *    {@link PfAnchorRegistryState.generation_floor}, and removing a
+   *    structurally VALID duplicate is reported loudly with both generations
+   *    (see {@link PfAnchorQuarantineRepairFinding.duplicate}) -- a discarded
+   *    generation must never be silently reusable.
    *  - The remaining union is re-rendered + re-armed and the state persisted
    *    CLEAN (the explicit re-assert supersedes any journaled `pending`,
    *    exactly like reconcile-on-entry). An arm/save failure leaves the
@@ -594,28 +661,42 @@ export class PfAnchorRegistry {
       if (quarantined.length === 0) {
         return { repaired: false, findings: [], forensicPath: null, remaining: valid };
       }
-      // Forensics FIRST: nothing is removed unless its raw bytes are preserved.
+      // Forensics FIRST, and BYTE-EXACT (fix-round-5 P3): the sidecar is the
+      // ORIGINAL on-disk registry file copied verbatim BEFORE any mutation --
+      // duplicate JSON keys, formatting, everything `JSON.parse` flattens. A
+      // store without raw access (an injected non-FS store) degrades to a
+      // canonical snapshot of the parsed state; the production FS store is raw.
+      // Nothing is removed unless this write lands.
+      const rawBytes = this.store.loadRaw !== undefined ? await this.store.loadRaw() : null;
       const forensicPath = await this.quarantineForensics(
-        JSON.stringify(
-          {
-            captured_at: new Date().toISOString(),
-            registry_version: loaded.version,
-            note:
-              "raw committed entries removed/tombstoned by the quarantine repair verb " +
-              "(sanctuary protect --repair-egress-gate); the affected uid(s) must be re-provisioned",
-            quarantined,
-          },
-          null,
-          2,
-        ),
+        rawBytes ??
+          JSON.stringify(
+            {
+              captured_at: new Date().toISOString(),
+              registry_version: loaded.version,
+              note:
+                "canonical (non-byte-exact) pre-repair snapshot -- the store exposed no raw bytes; " +
+                "raw committed entries removed/tombstoned by the quarantine repair verb " +
+                "(sanctuary protect --repair-egress-gate); the affected uid(s) must be re-provisioned",
+              quarantined,
+            },
+            null,
+            2,
+          ),
       );
       const findings: PfAnchorQuarantineRepairFinding[] = [];
       const next = [...valid];
+      let removedGenerationMax: number | undefined;
       for (const q of quarantined) {
         const raw = (q.raw !== null && typeof q.raw === "object" ? q.raw : {}) as Record<string, unknown>;
         const uid =
           typeof raw.agent_uid === "number" && Number.isInteger(raw.agent_uid) ? raw.agent_uid : null;
+        const rawGenerationId =
+          Number.isInteger(raw.generation_id) && (raw.generation_id as number) >= 1
+            ? (raw.generation_id as number)
+            : null;
         let disposition: PfAnchorQuarantineRepairFinding["disposition"] = "removed";
+        let duplicate: PfAnchorQuarantineRepairFinding["duplicate"];
         if (uid !== null && !next.some((e) => e.agent_uid === uid)) {
           // Carry the raw generation_id when it is independently valid (the
           // entry may be malformed for an unrelated field): dropping a live
@@ -627,16 +708,36 @@ export class PfAnchorRegistry {
             gate_port: raw.gate_port,
             fortress_path: raw.fortress_path,
             tombstone: true,
-            ...(Number.isInteger(raw.generation_id) && (raw.generation_id as number) >= 1
-              ? { generation_id: raw.generation_id }
-              : {}),
+            ...(rawGenerationId !== null ? { generation_id: rawGenerationId } : {}),
           });
           if (salvage !== null) {
             next.push(salvage);
             disposition = "tombstoned";
           }
+        } else if (uid !== null && validateEntry(q.raw) !== null) {
+          // Fix-round-5 P1 (loudness): a structurally VALID committed entry is
+          // being REMOVED because it duplicates a kept uid. Name both
+          // generations in the report so the discard is loud, never silent.
+          const kept = next.find((e) => e.agent_uid === uid);
+          duplicate = {
+            kept_generation_id: kept?.generation_id ?? null,
+            removed_generation_id: rawGenerationId,
+          };
         }
-        findings.push({ index: q.index, reason: q.reason, agent_uid: uid, disposition });
+        if (disposition === "removed" && rawGenerationId !== null) {
+          // Fix-round-5 P1 (monotonicity): a REMOVED entry's parseable
+          // generation_id survives in no entry, so fold it into the persisted
+          // floor below -- otherwise the next bring-up recomputes from the
+          // kept sibling (e.g. gen 7) and REUSES the discarded id (gen 8).
+          removedGenerationMax = Math.max(removedGenerationMax ?? 0, rawGenerationId);
+        }
+        findings.push({
+          index: q.index,
+          reason: q.reason,
+          agent_uid: uid,
+          disposition,
+          ...(duplicate !== undefined ? { duplicate } : {}),
+        });
       }
       // Re-render + re-arm the union from what remains, then persist CLEAN. A
       // failure here propagates with the on-disk registry untouched: still
@@ -648,6 +749,20 @@ export class PfAnchorRegistry {
       };
       if (typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token)) {
         state.enable_token = loaded.enable_token;
+      }
+      // Fold the generation floor: carry any valid persisted floor forward and
+      // raise it to cover every generation removed above. Monotone by
+      // construction (Math.max); never lowered, never dropped by a repair.
+      const priorFloor =
+        Number.isInteger(loaded.generation_floor) && (loaded.generation_floor as number) >= 1
+          ? (loaded.generation_floor as number)
+          : undefined;
+      const nextFloor =
+        priorFloor !== undefined || removedGenerationMax !== undefined
+          ? Math.max(priorFloor ?? 0, removedGenerationMax ?? 0)
+          : undefined;
+      if (nextFloor !== undefined) {
+        state.generation_floor = nextFloor;
       }
       await this.applyUnion(state, next);
       await this.store.save(state);

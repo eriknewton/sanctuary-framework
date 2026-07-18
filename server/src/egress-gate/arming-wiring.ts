@@ -466,6 +466,9 @@ async function productionBringUp(
         const { entries } = await registry.list();
         return entries.find((e) => e.agent_uid === agentUid) ?? null;
       },
+      // Fix-round-5 P1: the persisted floor covering repair-discarded
+      // generations; bring-up must allocate strictly above it.
+      readGenerationFloor: async () => (await registry.list()).generationFloor,
     },
     publishManifest: async (gen) => {
       // (a) Re-scope the provisioned endpoint rules to the GATE principal
@@ -1365,6 +1368,10 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
             const { entries } = await registry.list();
             return entries.find((e) => e.agent_uid === agentUid) ?? null;
           },
+          // Fix-round-5 P1: the persisted floor covering repair-discarded
+          // generations (recover() never allocates, but the adapter stays
+          // complete and consistent with the install-path adapter).
+          readGenerationFloor: async () => (await registry.list()).generationFloor,
         },
         publishManifest: async () => {
           throw new Error("recover() must never publish a manifest");

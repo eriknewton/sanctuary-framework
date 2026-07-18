@@ -150,6 +150,15 @@ export interface GenerationRegistryOps {
     generation_id?: number;
     tombstone?: boolean;
   } | null>;
+  /**
+   * Read the registry's persisted generation floor (fix-round-5 P1): a
+   * strictly-exceeded lower bound recorded by the quarantine repair verb when
+   * it removes an entry whose generation survives in no other entry. OPTIONAL
+   * (older adapters); absent or `undefined` === no floor. Bring-up folds it
+   * into {@link computeNextGenerationId} so a repair-discarded generation is
+   * never reallocated.
+   */
+  readGenerationFloor?(): Promise<number | undefined>;
 }
 
 /** Everything the coordinator needs, all injectable so it is host-free in tests. */
@@ -230,12 +239,24 @@ export interface GateRestartOutcome {
  * Monotonic-per-agent next generation id: strictly greater than any generation
  * this agent has committed OR staged, so a restart/crash can never reuse an id
  * (a reused id would let a stale manifest/pf rule masquerade as current).
+ *
+ * `generationFloor` (fix-round-5 P1) is the registry's persisted floor: the
+ * quarantine repair verb records there any generation it REMOVED without a
+ * surviving entry (e.g. a discarded valid duplicate at gen 8 beside a kept gen
+ * 7), so the next allocation must exceed it too -- otherwise the removed id
+ * would be reused and its stale manifest/pf artifacts could masquerade as
+ * current.
  */
 export function computeNextGenerationId(
   committedGenerationId: number | undefined,
   stagingGenerationId: number | undefined,
+  generationFloor?: number,
 ): number {
-  const highest = Math.max(committedGenerationId ?? 0, stagingGenerationId ?? 0);
+  const highest = Math.max(
+    committedGenerationId ?? 0,
+    stagingGenerationId ?? 0,
+    generationFloor ?? 0,
+  );
   return highest + 1;
 }
 
@@ -575,7 +596,18 @@ export class GenerationCoordinator {
     const binding = await this.ops.bind({ agent_uid, fortress_path });
     try {
       const committed = await this.ops.registry.readEntry(agent_uid);
-      const generation_id = computeNextGenerationId(committed?.generation_id, undefined);
+      // Fix-round-5 P1: fold in the registry's persisted generation floor so a
+      // generation the quarantine repair REMOVED (surviving in no entry) can
+      // never be reallocated to this or any uid.
+      const generationFloor =
+        this.ops.registry.readGenerationFloor !== undefined
+          ? await this.ops.registry.readGenerationFloor()
+          : undefined;
+      const generation_id = computeNextGenerationId(
+        committed?.generation_id,
+        undefined,
+        generationFloor,
+      );
       const base: CommittedGeneration = {
         generation_id,
         agent_uid,

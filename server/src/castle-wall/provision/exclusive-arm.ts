@@ -512,6 +512,9 @@ export async function runEgressGateRepair(
           reason: f.reason,
           agent_uid: f.agent_uid,
           disposition: f.disposition,
+          // Fix-round-5 P1: a removed structurally VALID duplicate is loud in
+          // the audit record too (kept vs removed generation).
+          ...(f.duplicate !== undefined ? { duplicate: f.duplicate } : {}),
         })),
       });
       for (const f of quarantine.findings) {
@@ -520,9 +523,23 @@ export async function runEgressGateRepair(
           f.disposition === "tombstoned"
             ? "TOMBSTONED block-only (the uid stays packet-confined; its gate channel is gone)"
             : "REMOVED from the committed set";
+        // Fix-round-5 P1: removing a structurally VALID duplicate must be loud
+        // -- name the uid and both generations, and say what protects the
+        // discarded id from reuse (the persisted generation floor).
+        const duplicateText =
+          f.duplicate !== undefined
+            ? ` This entry was a structurally VALID DUPLICATE of a kept entry for the same uid ` +
+              `(kept generation ${f.duplicate.kept_generation_id ?? "none"}, removed generation ` +
+              `${f.duplicate.removed_generation_id ?? "none"}).` +
+              (f.duplicate.removed_generation_id !== null
+                ? " The removed generation was folded into the registry's persisted generation " +
+                  "floor so it can never be reallocated."
+                : "")
+            : "";
         ops.print(
-          `Quarantined registry entry #${f.index} (${uidText}) was ${dispositionText}: ${f.reason}. ` +
-            `Raw entry preserved for forensics at ${quarantine.forensicPath}. The affected agent ` +
+          `Quarantined registry entry #${f.index} (${uidText}) was ${dispositionText}: ${f.reason}.` +
+            duplicateText +
+            ` Raw entry preserved for forensics at ${quarantine.forensicPath}. The affected agent ` +
             "must be RE-PROVISIONED (sudo sanctuary protect) before its gate can serve again.",
         );
       }
