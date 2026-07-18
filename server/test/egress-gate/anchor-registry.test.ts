@@ -16,11 +16,17 @@ import {
   PfAnchorRegistryStateError,
   ProvisionLockHeldError,
   PF_ANCHOR_REGISTRY_STATE_VERSION,
+  createFsQuarantineForensicsWriter,
+  createFsRegistryStore,
   type PfAnchorRegistryEntry,
   type PfAnchorRegistryOps,
   type PfAnchorRegistryState,
   type PfAnchorRegistryStore,
 } from "../../src/egress-gate/anchor-registry.js";
+import {
+  GenerationCoordinator,
+  type GenerationStagingRecord,
+} from "../../src/egress-gate/generation.js";
 import type { ArmPfAnchorResult, PfLivenessResult } from "../../src/egress-gate/pf-anchor.js";
 import type { ProvisionLockOps } from "../../src/castle-wall/provision/lockfile.js";
 
@@ -631,13 +637,21 @@ describe("egress-gate/anchor-registry repairQuarantined (fix-round-4 P2: coded r
     });
   });
 
-  it("a duplicate committed uid is REMOVED (the first valid entry keeps the uid confined; no tombstone shadowing)", async () => {
+  it("a duplicate committed uid is REMOVED (the first valid entry keeps the uid confined; no tombstone shadowing) and reported LOUDLY as a valid duplicate", async () => {
     const dup = { ...A, gate_port: 20009 };
     const { registry } = makeRegistry({ initial: quarantinedState(dup) });
     const res = await registry.repairQuarantined();
     expect(res.repaired).toBe(true);
     expect(res.findings).toEqual([
-      { index: 1, reason: "duplicate committed agent_uid 502", agent_uid: 502, disposition: "removed" },
+      {
+        index: 1,
+        reason: "duplicate committed agent_uid 502",
+        agent_uid: 502,
+        disposition: "removed",
+        // Fix-round-5 P1: a removed structurally VALID duplicate names both
+        // generations (null here: neither entry carries one).
+        duplicate: { kept_generation_id: null, removed_generation_id: null },
+      },
     ]);
     expect(res.remaining).toEqual([A]);
   });
@@ -703,5 +717,195 @@ describe("egress-gate/anchor-registry repairQuarantined (fix-round-4 P2: coded r
     expect(disarmCalls).toEqual([{ enableToken: "1" }]);
     expect(store.current?.enable_token).toBeUndefined();
     expect(await registry.list()).toEqual({ entries: [], dirty: false });
+  });
+});
+
+describe("egress-gate/anchor-registry fix-round-5 (P1 generation floor on removal + P3 byte-exact forensics)", () => {
+  const KEPT7: PfAnchorRegistryEntry = {
+    agent_uid: 502,
+    gate_port: 19998,
+    fortress_path: "/f/a",
+    generation_id: 7,
+  };
+  const DUP8 = { agent_uid: 502, gate_port: 20009, fortress_path: "/f/a", generation_id: 8 };
+
+  /** Two structurally VALID committed entries for one uid: gen 7 kept, gen 8 quarantined as duplicate. */
+  function gen78State(): PfAnchorRegistryState {
+    return {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [KEPT7, DUP8 as never],
+      enable_token: "1",
+    };
+  }
+
+  it("P1: removing the VALID gen-8 duplicate of a kept gen-7 uid is LOUD (uid + both generations in the report) and folds gen 8 into the persisted floor", async () => {
+    const { registry, store } = makeRegistry({ initial: gen78State() });
+    const res = await registry.repairQuarantined();
+    expect(res.findings).toEqual([
+      {
+        index: 1,
+        reason: "duplicate committed agent_uid 502",
+        agent_uid: 502,
+        disposition: "removed",
+        duplicate: { kept_generation_id: 7, removed_generation_id: 8 },
+      },
+    ]);
+    expect(res.remaining).toEqual([KEPT7]);
+    // Pre-fix the removed gen 8 survived NOWHERE: the next bring-up recomputed
+    // from the kept gen 7 and reallocated 8. The persisted floor closes that.
+    expect(store.current?.generation_floor).toBe(8);
+    expect((await registry.list()).generationFloor).toBe(8);
+  });
+
+  it("P1: after the gen7-kept/gen8-duplicate repair, a REAL bring-up through the registry adapter allocates generation 9 (never reuses the discarded 8)", async () => {
+    const { registry } = makeRegistry({ initial: gen78State() });
+    await registry.repairQuarantined();
+    // Wire the repaired registry into the generation machine exactly like the
+    // production adapter (arming-wiring): readEntry + readGenerationFloor both
+    // come from registry.list().
+    const staging = new Map<number, GenerationStagingRecord>();
+    const coord = new GenerationCoordinator({
+      bind: async () => ({
+        port: 45001,
+        pid: 9001,
+        pidStart: "start-9001",
+        release: async () => {},
+      }),
+      verifyOwner: async () => true,
+      registry: {
+        armEntry: async (entry) => {
+          await registry.addOrUpdate(entry);
+        },
+        tombstone: async (uid, fallback) => {
+          await registry.tombstone(uid, fallback);
+        },
+        readEntry: async (uid) =>
+          (await registry.list()).entries.find((e) => e.agent_uid === uid) ?? null,
+        readGenerationFloor: async () => (await registry.list()).generationFloor,
+      },
+      publishManifest: async () => {},
+      staging: {
+        load: async (uid) => staging.get(uid) ?? null,
+        save: async (record) => {
+          staging.set(record.agent_uid, record);
+        },
+        delete: async (uid) => {
+          staging.delete(uid);
+        },
+      },
+      lock: memLock(),
+    });
+    const committed = await coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" });
+    // Pre-fix: computeNextGenerationId(7, undefined) allocated 8 -- the very
+    // id the repair just discarded. The floor forces strictly above it.
+    expect(committed.generation_id).toBe(9);
+  });
+
+  it("P1: a REMOVED malformed entry (nothing salvageable) still folds its parseable generation_id into the floor", async () => {
+    const { registry, store } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        // gate_port is garbage, so the tombstone salvage fails and the entry
+        // is removed outright -- but its generation_id 12 parsed fine and must
+        // not become reallocatable.
+        committed: [
+          A,
+          { agent_uid: 601, gate_port: "not-a-port", fortress_path: "/f/c", generation_id: 12 } as never,
+        ],
+        enable_token: "1",
+      },
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.findings[0]?.disposition).toBe("removed");
+    // Not a structurally valid duplicate, so no duplicate detail -- just the floor.
+    expect(res.findings[0]?.duplicate).toBeUndefined();
+    expect(store.current?.generation_floor).toBe(12);
+  });
+
+  it("P1: the floor is MONOTONE (a smaller removed generation never lowers it) and survives later ordinary mutations", async () => {
+    const { registry, store } = makeRegistry({
+      initial: { ...gen78State(), generation_floor: 20 },
+    });
+    await registry.repairQuarantined();
+    expect(store.current?.generation_floor).toBe(20); // 8 < 20: not lowered
+    await registry.addOrUpdate(B);
+    expect(store.current?.generation_floor).toBe(20); // normalizeState carries it
+    expect((await registry.list()).generationFloor).toBe(20);
+  });
+
+  it("P1: a present-but-malformed generation_floor is a repair signal (dirty), never silently coerced", async () => {
+    const { registry } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [A],
+        enable_token: "1",
+        generation_floor: -2 as never,
+      },
+    });
+    expect((await registry.list()).dirty).toBe(true);
+  });
+
+  it("P3: the forensic sidecar is the BYTE-EXACT pre-repair file when the store exposes raw bytes (odd formatting + duplicate JSON keys preserved)", async () => {
+    const odd =
+      '{\n  "version": 1,\n\t"committed": [ {"agent_uid":502,"gate_port":19998,"fortress_path":"/f/a"} ,\n    {"bogus":true,"bogus":true} ],\n  "enable_token": "1"\n}\n';
+    // A raw-capable store: load() parses the odd bytes; loadRaw() returns them verbatim.
+    let current = odd;
+    const store: PfAnchorRegistryStore = {
+      load: async () => JSON.parse(current) as PfAnchorRegistryState,
+      loadRaw: async () => current,
+      save: async (state) => {
+        current = JSON.stringify(state);
+      },
+    };
+    const forensicWrites: string[] = [];
+    const registry = new PfAnchorRegistry({
+      store,
+      lock: memLock(),
+      runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
+      armUnion: async () => ({ settleProbes: 1, enableToken: "1" }),
+      disarm: async () => {},
+      unionLiveness: async () => live,
+      quarantineForensics: async (payload) => {
+        forensicWrites.push(payload);
+        return "/var/db/sanctuary/egress-anchor-registry.json.quarantine-test.json";
+      },
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    // Pre-fix the sidecar was JSON.stringify of PARSED objects: the duplicate
+    // JSON key and the formatting were already lost at load's JSON.parse.
+    expect(forensicWrites).toEqual([odd]);
+  });
+
+  it("P3: FS store + FS forensics writer end-to-end: the on-disk sidecar's bytes equal the pre-repair registry file's bytes", async () => {
+    const { mkdtemp, readFile, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = await mkdtemp(join(tmpdir(), "sanctuary-anchor-forensics-"));
+    try {
+      const path = join(dir, "egress-anchor-registry.json");
+      const odd =
+        '{"version":1,"committed":[{"agent_uid":502,"gate_port":19998,"fortress_path":"/f/a"},' +
+        '{"bogus":  true,\t"bogus":false}],"enable_token":"1"}';
+      await writeFile(path, odd);
+      const preRepair = await readFile(path);
+      const registry = new PfAnchorRegistry({
+        store: createFsRegistryStore(path),
+        lock: memLock(),
+        runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
+        armUnion: async () => ({ settleProbes: 1, enableToken: "1" }),
+        disarm: async () => {},
+        unionLiveness: async () => live,
+        quarantineForensics: createFsQuarantineForensicsWriter(path),
+      });
+      const res = await registry.repairQuarantined();
+      expect(res.repaired).toBe(true);
+      expect(res.forensicPath).not.toBeNull();
+      const sidecar = await readFile(res.forensicPath as string);
+      expect(sidecar.equals(preRepair)).toBe(true);
+      expect(sidecar.toString("utf8")).toBe(odd);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -598,6 +598,46 @@ describe("runEgressGateRepair quarantine-repair stage (fix-round-4 P2)", () => {
     expect(log).toContain("RE-PROVISIONED");
   });
 
+  it("a removed structurally VALID duplicate is LOUD: kept + removed generations named in the log and the audit record (fix-round-5 P1)", async () => {
+    const printed: string[] = [];
+    const ops = repairOps({
+      repairQuarantinedRegistry: vi.fn(async () => ({
+        ...QUARANTINE_RESULT,
+        findings: [
+          {
+            index: 1,
+            reason: "duplicate committed agent_uid 502",
+            agent_uid: 502,
+            disposition: "removed" as const,
+            duplicate: { kept_generation_id: 7, removed_generation_id: 8 },
+          },
+        ],
+      })),
+      print: vi.fn((line: string) => {
+        printed.push(line);
+      }),
+    });
+    await runEgressGateRepair(REPAIR_CTX, ops);
+    const log = printed.join("\n");
+    expect(log).toContain("entry #1 (uid 502)");
+    expect(log).toContain("structurally VALID DUPLICATE");
+    expect(log).toContain("kept generation 7");
+    expect(log).toContain("removed generation 8");
+    expect(log).toContain("generation floor");
+    expect(ops.audit).toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP,
+      expect.objectContaining({
+        quarantined: [
+          expect.objectContaining({
+            agent_uid: 502,
+            disposition: "removed",
+            duplicate: { kept_generation_id: 7, removed_generation_id: 8 },
+          }),
+        ],
+      }),
+    );
+  });
+
   it("an unrecoverable uid is still reported loudly (no silent finding)", async () => {
     const printed: string[] = [];
     const ops = repairOps({

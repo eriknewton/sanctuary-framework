@@ -103,6 +103,8 @@ function makeHarness(opts: {
   ownerHolds?: boolean;
   failAt?: "bind" | "owner" | "arm" | "manifest";
   tombstoneThrows?: boolean;
+  /** The registry's persisted generation floor (fix-round-5 P1); omitted === no adapter method. */
+  generationFloor?: number;
 } = {}): Harness {
   const staging = memStaging();
   const reg = memRegistry(opts.registryInitial ?? []);
@@ -141,6 +143,9 @@ function makeHarness(opts: {
         await reg.ops.tombstone(uid, fallback);
       },
       readEntry: reg.ops.readEntry,
+      ...(opts.generationFloor !== undefined
+        ? { readGenerationFloor: async () => opts.generationFloor }
+        : {}),
     },
     async publishManifest(gen) {
       if (opts.failAt === "manifest") throw new Error("manifest failed");
@@ -180,6 +185,19 @@ describe("egress-gate/generation bringUp (G1-G5 happy path)", () => {
     const h = makeHarness({ registryInitial: [{ agent_uid: 502, gate_port: 111, generation_id: 8 }] });
     const committed = await h.coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" });
     expect(committed.generation_id).toBe(9);
+  });
+
+  it("allocates ABOVE the registry's persisted generation floor (fix-round-5 P1: a repair-discarded id is never reused)", async () => {
+    // The quarantine repair discarded a valid gen-8 duplicate beside this kept
+    // gen-7 entry and recorded 8 in the floor. Pre-fix, bring-up recomputed
+    // from the kept entry alone and reallocated 8.
+    const h = makeHarness({
+      registryInitial: [{ agent_uid: 502, gate_port: 19998, generation_id: 7 }],
+      generationFloor: 8,
+    });
+    const committed = await h.coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" });
+    expect(committed.generation_id).toBe(9);
+    expect(h.manifestPublished[0]?.generation_id).toBe(9);
   });
 
   it("refuses to start when a staging record already exists (recover first)", async () => {
@@ -305,11 +323,16 @@ describe("egress-gate/generation recover (crash-recovery table)", () => {
 });
 
 describe("egress-gate/generation pure helpers", () => {
-  it("computeNextGenerationId is strictly-greater over committed + staging", () => {
+  it("computeNextGenerationId is strictly-greater over committed + staging + floor", () => {
     expect(computeNextGenerationId(undefined, undefined)).toBe(1);
     expect(computeNextGenerationId(5, undefined)).toBe(6);
     expect(computeNextGenerationId(5, 9)).toBe(10);
     expect(computeNextGenerationId(9, 5)).toBe(10);
+    // Fix-round-5 P1: the registry's persisted floor (a repair-discarded
+    // generation) also bounds the next allocation.
+    expect(computeNextGenerationId(7, undefined, 8)).toBe(9);
+    expect(computeNextGenerationId(9, undefined, 3)).toBe(10);
+    expect(computeNextGenerationId(undefined, undefined, 4)).toBe(5);
   });
 
   it("evaluateGenerationMatch serves ONLY when all three surfaces agree", () => {
