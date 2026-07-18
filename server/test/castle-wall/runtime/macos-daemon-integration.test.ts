@@ -486,9 +486,15 @@ describe("Castle Wall macOS daemon integration", () => {
 
   it("fires a LOUD audit_emission_stall when decisions continue but emission stops (Slice M watchdog)", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress();
-    // Capture the consumer the daemon builds so we can drive decisions whose
-    // emission we then sabotage, reproducing the 07-17 decided-but-not-emitted
-    // divergence at the daemon layer.
+    // Capture the consumer the daemon builds and drive MALFORMED
+    // `flow_decision_recorded` receipts: each is a reported decision that the
+    // consumer rejects (never emits), producing a decided-but-not-emitted
+    // divergence through the daemon wiring. HONESTY: this is a DIFFERENT
+    // signature from the 07-17 stall. There the sysext stopped sending
+    // receipts entirely, so the watchdog receives neither decisions nor
+    // emissions and stays quiet (the Swift decided-counter feed is the owed
+    // instrument for that mode). This test pins the divergence class the
+    // watchdog CAN catch: decisions still reported, emission stopped.
     let captured: { consumer: MacOSCastleWallListenerOptions["consumer"] } | null = null;
     const handle = await startMacOSCastleWallDaemon({
       fortressPath,
@@ -581,6 +587,258 @@ describe("Castle Wall macOS daemon integration", () => {
       await auditLog.query({ layer: "l1", limit: 5000 })
     ).entries.filter((e) => e.operation === "audit_emission_stall");
     expect(stalls.length).toBe(0);
+  });
+
+  it("castle_wall_heartbeat carries the emission-liveness watchdog snapshot, including a live last_evaluate_at_ms (Slice M fix-round HIGH)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      // Fast tick so last_evaluate_at_ms is stamped within the test window.
+      // Zero traffic is deliberate: the snapshot must ride EVERY heartbeat
+      // (an idle wall included), and the tick pulse must be a real timestamp
+      // even when no decision has ever arrived. The decided/emitted counter
+      // values themselves are pinned by the watchdog unit tests and by the
+      // stall/no-stall daemon tests above; this test pins the transport.
+      emissionLivenessTickSeconds: 0.01,
+      listenerFactory: fakeListenerFactory,
+    });
+    await wait(60);
+    await handle.stop();
+
+    const beats = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION);
+    expect(beats.length).toBeGreaterThanOrEqual(1);
+    const last = beats[beats.length - 1]!;
+    const snapshot = (last.details as Record<string, unknown>)
+      .emission_liveness as Record<string, unknown>;
+    expect(snapshot).toBeDefined();
+    expect(snapshot.decided_total).toBe(0);
+    expect(snapshot.emitted_total).toBe(0);
+    expect(snapshot.decided_since_last_emission).toBe(0);
+    expect(snapshot.stalled).toBe(false);
+    // The tick timer ran inside the window, so its pulse is a real timestamp
+    // (the sibling test below pins the null/never-ticked presentation).
+    expect(typeof snapshot.last_evaluate_at_ms).toBe("number");
+  });
+
+  it("castle_wall_heartbeat reports last_evaluate_at_ms null while the divergence tick has never run (staleness is observable, not silent)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      // Default (15s) tick cadence: within this short test window the tick
+      // NEVER fires, which is exactly the condition a reader must be able to
+      // see. A cleared or never-ticking watchdog timer shows up as a
+      // null/stale last_evaluate_at_ms against advancing heartbeats.
+      listenerFactory: fakeListenerFactory,
+    });
+    await wait(40);
+    await handle.stop();
+
+    const beats = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION);
+    expect(beats.length).toBeGreaterThanOrEqual(1);
+    for (const beat of beats) {
+      const snapshot = (beat.details as Record<string, unknown>)
+        .emission_liveness as Record<string, unknown>;
+      expect(snapshot).toBeDefined();
+      expect(snapshot.last_evaluate_at_ms).toBeNull();
+    }
+  });
+
+  it("an arm-lease revoke stands the watchdog down (no stall post-revoke); a fresh arm re-engages it (Slice M fix-round MED)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    let captured: {
+      consumer: MacOSCastleWallListenerOptions["consumer"];
+      onArmLease: MacOSCastleWallListenerOptions["onArmLease"];
+      onArmLeaseRevoke: MacOSCastleWallListenerOptions["onArmLeaseRevoke"];
+    } | null = null;
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      // Grace window comfortably wider than the audit appends + revoke write
+      // below, so the revoke ALWAYS lands inside the open divergence run
+      // (with a tiny grace the run can mature into a stall before the revoke
+      // is processed, and the test would assert the wrong thing).
+      emissionStallGraceMs: 1500,
+      emissionLivenessTickSeconds: 0.01,
+      listenerFactory(options) {
+        captured = {
+          consumer: options.consumer,
+          onArmLease: options.onArmLease,
+          onArmLeaseRevoke: options.onArmLeaseRevoke,
+        };
+        return fakeListenerFactory(options);
+      },
+    });
+    const consumer = captured!.consumer;
+    const malformed = {
+      type: "flow_decision_recorded",
+      decision: "INVALID",
+      destination: { host: "x", ip: "1.2.3.4", port: 443, protocol: "tcp", hostname_source: null, opaque: false },
+      agent: { id: "agent-revoke", template: "ops-runner" },
+      matched_rule_id: null,
+      recorded_at: "2026-05-11T12:01:00Z",
+    } as unknown as Parameters<typeof consumer.handleFlowDecisionRecorded>[0];
+
+    // Open a divergence run, then REVOKE before the grace window matures.
+    await consumer.handleFlowDecisionRecorded(malformed);
+    await consumer.handleFlowDecisionRecorded(malformed);
+    await captured!.onArmLeaseRevoke?.({
+      type: "arm_lease",
+      armed: false,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-17T00:00:00.000Z",
+    });
+
+    // Well past the grace window + many tick intervals: a deliberately
+    // stood-down wall must never mature those decisions into a stall alarm.
+    await wait(2500);
+    let stalls = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "audit_emission_stall");
+    expect(stalls.length).toBe(0);
+
+    // A fresh operator arm re-engages the detector: the same divergence
+    // signature after re-arm DOES fire (the stand-down is a gate, not a
+    // permanent disable of the watchdog).
+    await captured!.onArmLease?.({
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: 90,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-17T00:00:00.000Z",
+    });
+    await consumer.handleFlowDecisionRecorded(malformed);
+    await consumer.handleFlowDecisionRecorded(malformed);
+    await wait(2500);
+    await handle.stop();
+
+    stalls = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "audit_emission_stall");
+    expect(stalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("post-revoke egress-probe attempts are never counted as decisions: no stall can fire from the probe feed on a stood-down wall (Slice M fix-round MED)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    // uid-mode agent-origin + one provisioned rule so the probe timer runs
+    // (same fixture shape as the MED-3 probe tests below).
+    const egressDir = join(fortressPath, "policy", "egress");
+    const rulesDir = join(egressDir, "rules");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(rulesDir, { recursive: true });
+    await writeFile(
+      join(egressDir, "agent-origin.json"),
+      JSON.stringify({ mode: "uid", agent_uid: 503, system_uid_allow_ceiling: 500 }),
+    );
+    await writeFile(
+      join(rulesDir, "provisioned-hermes-aaaaaaaaaaaa.json"),
+      JSON.stringify({
+        id: "provisioned-hermes-aaaaaaaaaaaa",
+        schema_version: 1,
+        created_at: "2026-07-10T00:00:00Z",
+        match: { host: ["api.venice.ai"], port: [443], protocol: "tcp" },
+        scope: {},
+        disposition: "allow",
+        derived: true,
+      }),
+    );
+
+    let captured: {
+      consumer: MacOSCastleWallListenerOptions["consumer"];
+      onArmLeaseRevoke: MacOSCastleWallListenerOptions["onArmLeaseRevoke"];
+    } | null = null;
+    const probeCalls: string[] = [];
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      emissionStallGraceMs: 20,
+      emissionLivenessTickSeconds: 0.01,
+      agentEgressProbeIntervalSeconds: 0.02,
+      agentEgressProbe: async (_uid, host) => {
+        probeCalls.push(host);
+        return true;
+      },
+      listenerFactory(options) {
+        captured = {
+          consumer: options.consumer,
+          onArmLeaseRevoke: options.onArmLeaseRevoke,
+        };
+        return fakeListenerFactory(options);
+      },
+    });
+    // A connected sysext subscriber, so the probe feed's OTHER gate
+    // (subscribers > 0) is satisfied and only the revoke gate is under test.
+    captured!.consumer.registerSubscriber({
+      subscriberId: "fake-sysext",
+      async emitManifestUpdate() {},
+    });
+    // Revoke immediately: every probe attempt in the window below happens on
+    // a deliberately stood-down wall.
+    await captured!.onArmLeaseRevoke?.({
+      type: "arm_lease",
+      armed: false,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-17T00:00:00.000Z",
+    });
+
+    // Probes keep running (they still serve reachability observation), well
+    // past the grace window and many ticks, but none may count as a decision.
+    await wait(150);
+    await handle.stop();
+
+    expect(probeCalls.length).toBeGreaterThan(0);
+    const stalls = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "audit_emission_stall");
+    expect(stalls.length).toBe(0);
+  });
+
+  it("rejects a zero/negative/NaN emissionLivenessTickSeconds at the daemon boundary (fix-round LOW)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    for (const bad of [0, -5, Number.NaN]) {
+      await expect(
+        startMacOSCastleWallDaemon({
+          fortressPath,
+          fortressId: "fortress-test",
+          masterKey,
+          localSign: true,
+          auditLog,
+          platform: "darwin",
+          activeConfigPath: activeConfigPath(fortressPath),
+          emissionLivenessTickSeconds: bad,
+          listenerFactory: fakeListenerFactory,
+        }),
+      ).rejects.toThrow(/emissionLivenessTickSeconds must be a positive finite number/);
+    }
   });
 
   it("stops emitting heartbeats after the daemon is stopped (same teardown as the lease heartbeat)", async () => {

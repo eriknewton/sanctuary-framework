@@ -672,11 +672,56 @@ export async function startMacOSCastleWallDaemon(
   const emissionLivenessTickSeconds =
     input.emissionLivenessTickSeconds ??
     CASTLE_WALL_DEFAULT_EMISSION_LIVENESS_TICK_SECONDS;
+  // Fail-closed boundary validation (fix-round LOW): a 0/negative/NaN cadence
+  // would either throw inside setInterval, silently clamp to a ~1ms busy
+  // tick, or never tick; none of those is an acceptable failure mode for the
+  // component whose job is detecting silent failure. Mirrors the watchdog's
+  // own graceMs/minDecisions constructor validation.
+  if (
+    !Number.isFinite(emissionLivenessTickSeconds) ||
+    emissionLivenessTickSeconds <= 0
+  ) {
+    throw new Error(
+      `startMacOSCastleWallDaemon: emissionLivenessTickSeconds must be a positive finite number (got ${String(
+        input.emissionLivenessTickSeconds,
+      )})`,
+    );
+  }
   let emissionLivenessTimer: NodeJS.Timeout | undefined;
   const stopEmissionLivenessTimer = (): void => {
     if (!emissionLivenessTimer) return;
     clearInterval(emissionLivenessTimer);
     emissionLivenessTimer = undefined;
+  };
+  // Whether the operator has REVOKED the arm lease (deliberate stand-down).
+  // Gates the watchdog's decision feeds and its tick timer: a stood-down wall
+  // makes no emission promise, so nothing observed after a revoke may mature
+  // into a stall alarm (fix-round MED). A fresh operator arm clears it.
+  let armLeaseRevoked = false;
+  // Idempotent starter so the tick timer can be resumed after a revoke
+  // stopped it (mirror of restartLeaseHeartbeat). Defined here, first started
+  // in the startup try-block below.
+  const startEmissionLivenessTimer = (): void => {
+    if (emissionLivenessTimer) return;
+    // Slice M emission-liveness tick: evaluate the decided-vs-emitted
+    // divergence on a fixed cadence. Pure counter comparison; the loud
+    // outputs live in the watchdog callbacks below. A throwing evaluation
+    // must never take down enforcement, so the tick catches and reports.
+    emissionLivenessTimer = setInterval(() => {
+      try {
+        emissionLivenessWatchdog.evaluate();
+      } catch (err) {
+        // SAFETY: a throwing evaluate (e.g. a throwing onStall callback) must
+        // never take down enforcement; surface it on the operator channel and
+        // continue ticking.
+        console.error(
+          `${EMISSION_STALL_LOG_PREFIX} watchdog evaluation failed (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }, emissionLivenessTickSeconds * 1000);
+    emissionLivenessTimer.unref();
   };
   const recordEmissionLivenessTransition = (
     operation:
@@ -842,6 +887,11 @@ export async function startMacOSCastleWallDaemon(
       // previous TTL expiry had stopped the beat (re-arm after fail-open).
       leaseExpired = false;
       restartLeaseHeartbeat?.();
+      // A fresh arm also re-engages the emission-liveness watchdog that a
+      // prior revoke stood down (fix-round MED): clear the revoke gate so the
+      // probe feed counts again, and resume the divergence tick.
+      armLeaseRevoked = false;
+      startEmissionLivenessTimer();
     },
     async onArmLeaseRevoke() {
       stopLeaseHeartbeat();
@@ -852,6 +902,16 @@ export async function startMacOSCastleWallDaemon(
       // operator; stop claiming liveness too so the reader does not see a fresh
       // heartbeat from a daemon that has been told to stand down.
       stopAuditHeartbeat();
+      // Stand the emission-liveness watchdog down with the wall (fix-round
+      // MED): a deliberately revoked wall makes no emission promise, so
+      // decisions observed BEFORE the revoke must not mature into a stall
+      // alarm after it (false-fire on an intentionally stood-down wall), and
+      // the probe feed is gated off via `armLeaseRevoked` so probe attempts
+      // on an unarmed wall are never counted as decisions. Timer stopped +
+      // run cleared; a fresh operator arm (onArmLease) re-engages both.
+      armLeaseRevoked = true;
+      stopEmissionLivenessTimer();
+      emissionLivenessWatchdog.standDown();
       // Observability Slice 2 (false-RED fix): RECORD the intentional stand-down.
       // Stopping the heartbeat without a recorded reason is indistinguishable
       // from a daemon that was KILLED mid-flight, so the silent-death reader
@@ -988,6 +1048,15 @@ export async function startMacOSCastleWallDaemon(
       // the same units. A drop recorded WHILE this write is in flight stays
       // pending for the next beat.
       const degradedCountThisBeat = degradedCarry.reserve();
+      // Slice M fix-round HIGH: the emission-liveness watchdog is a detector
+      // FOR silent failure, so its own liveness must be observable, not
+      // assumed. Each heartbeat carries a compact watchdog snapshot on the
+      // same provenance basis as `audit_write_degraded_count` (a LOCAL detail
+      // field on the existing heartbeat operation, constructed fields only).
+      // `last_evaluate_at_ms` is the tick timer's own pulse: a cleared /
+      // never-started tick shows up as a null or stale value against the
+      // advancing heartbeat timestamps instead of being invisible.
+      const emissionLivenessSnapshot = emissionLivenessWatchdog.snapshot();
       try {
         await input.auditLog.append(
           "l1",
@@ -1004,6 +1073,14 @@ export async function startMacOSCastleWallDaemon(
             ...(degradedCountThisBeat > 0
               ? { audit_write_degraded_count: degradedCountThisBeat }
               : {}),
+            emission_liveness: {
+              decided_total: emissionLivenessSnapshot.decidedTotal,
+              emitted_total: emissionLivenessSnapshot.emittedTotal,
+              decided_since_last_emission:
+                emissionLivenessSnapshot.decidedSinceLastEmission,
+              stalled: emissionLivenessSnapshot.stalled,
+              last_evaluate_at_ms: emissionLivenessSnapshot.lastEvaluateAtMs,
+            },
             // Provenance marker LAST, from constructed fields only (no untrusted
             // spread), mirroring the audit consumer's enforcement-evidence path.
             [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -1026,25 +1103,10 @@ export async function startMacOSCastleWallDaemon(
     }, auditHeartbeatIntervalSeconds * 1000);
     auditHeartbeat.unref();
 
-    // Slice M emission-liveness tick: evaluate the decided-vs-emitted
-    // divergence on a fixed cadence. Pure counter comparison; the loud
-    // outputs live in the watchdog callbacks above. A throwing evaluation
-    // must never take down enforcement, so the tick catches and reports.
-    emissionLivenessTimer = setInterval(() => {
-      try {
-        emissionLivenessWatchdog.evaluate();
-      } catch (err) {
-        // SAFETY: a throwing evaluate (e.g. a throwing onStall callback) must
-        // never take down enforcement; surface it on the operator channel and
-        // continue ticking.
-        console.error(
-          `${EMISSION_STALL_LOG_PREFIX} watchdog evaluation failed (non-fatal): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
-    }, emissionLivenessTickSeconds * 1000);
-    emissionLivenessTimer.unref();
+    // Slice M emission-liveness tick (definition next to
+    // stopEmissionLivenessTimer above; restarted by a fresh operator arm
+    // after a revoke stopped it).
+    startEmissionLivenessTimer();
 
     // Confined-agent egress MED-3 (secondary signal): periodic AS-AGENT-UID
     // egress liveness probe over the provisioned-* allow rules in the loaded
@@ -1081,14 +1143,28 @@ export async function startMacOSCastleWallDaemon(
             } catch {
               reachable = false;
             }
-            // Slice M emission-liveness: this probe is a REAL flow an armed
-            // wall must adjudicate (reachable or not, allow or deny), so it
-            // is a decision signal that survives even the 07-17 stall mode
-            // where the sysext stops reporting its own decisions. Counted
-            // only while a sysext subscriber is connected: with no extension
-            // on the channel there is nothing that could emit, and the
-            // silent-death / provider_unbound alarms own that state.
-            if (consumer.getStats().subscribers > 0) {
+            // Slice M emission-liveness: an INFERRED decision signal, and an
+            // honest accounting of what it proves. What the daemon observes
+            // here is ONLY its own probe attempt and its connect outcome. It
+            // does NOT observe a sysext verdict for this flow: no receipt is
+            // matched to it, and a successful (allowed) probe is not
+            // correlated with any paired audit entry here. Counting it as a
+            // decision rests on an inference: while an operator arm is live
+            // and a sysext subscriber is connected, a real as-agent-uid flow
+            // SHOULD be adjudicated by the wall, so a sustained run of probe
+            // attempts with ZERO emissions is divergence-shaped evidence.
+            // That inference can be wrong exactly when the wall is not
+            // actually filtering this flow, which is why this feed is gated
+            // on the arm-lease state (below) and why it is NOT the owed
+            // instrument from the root-cause doc section 6(b): that design
+            // correlates each probe with the appearance of its OWN audit
+            // entry and only it fires under every surviving hypothesis.
+            // Gates: never counted after an operator revoke (a stood-down
+            // wall adjudicates nothing on this operator's behalf; fix-round
+            // MED), and never without a sysext subscriber (nothing on the
+            // channel could emit, and the silent-death / provider_unbound
+            // alarms own that state).
+            if (!armLeaseRevoked && consumer.getStats().subscribers > 0) {
               emissionLivenessWatchdog.noteDecision("agent_egress_probe");
             }
             if (!reachable) {

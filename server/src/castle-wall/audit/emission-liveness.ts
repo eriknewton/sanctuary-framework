@@ -32,14 +32,18 @@
  * HONEST BOUND (stated in the root-cause doc and the PR): under the confirmed
  * 07-17 stall localization, the sysext stops reporting decisions entirely, so
  * the receipt-fed signal goes quiet WITH the emission signal and this
- * watchdog stays quiet too. The signals that survive that failure mode are
- * (a) a Swift decided-counter taken at the very top of `handleNewFlow`,
- * heartbeat-piggybacked to the daemon, and (b) the as-uid egress probe
- * correlated with its own audit entry. (b) is wired here (slow cadence);
- * (a) is a Swift-side follow-up. This module deliberately accepts ANY
- * decision source so those feeds plug in without changing the detector.
- * Building this watchdog does NOT close Slice M; the real-world firing is
- * drill-owed on the signed host.
+ * watchdog stays quiet too. The exact 07-17 no-receipt stall is therefore
+ * NOT detectable by this watchdog as wired today. The signals that would
+ * survive that failure mode are (a) a Swift decided-counter taken at the very
+ * top of `handleNewFlow`, heartbeat-piggybacked to the daemon (Swift-side
+ * follow-up, owed), and (b) the as-uid egress probe CORRELATED with the
+ * appearance of its own audit entry (owed). What IS wired today is weaker
+ * than (b): the daemon notes its own probe ATTEMPTS as decision inferences
+ * without observing any sysext verdict for them (see the daemon-side comment
+ * for exactly what that proves and does not prove). This module deliberately
+ * accepts ANY decision source so the owed feeds plug in without changing the
+ * detector. Building this watchdog does NOT close Slice M; the real-world
+ * firing is drill-owed on the signed host.
  */
 
 /** Audit operation appended (result: "failure") when a stall is detected. */
@@ -56,9 +60,15 @@ export const EMISSION_STALL_LOG_PREFIX = "[slice-m-emission-stall]";
  * Default grace window: decisions must keep arriving with NO emission for
  * this long before the stall fires. Generous relative to the per-event
  * persist latency (milliseconds) so an in-flight receipt-then-persist pair
- * can never false-positive, and short enough that the 07-17 signature
- * (12 minutes of decided traffic, zero entries) would have fired loudly
- * within the first minute.
+ * can never false-positive, and short enough that an EMISSION-SIDE stall
+ * (decisions still being reported to the daemon while persistence has
+ * stopped: rejection bursts, a wedged audit store, a broken persist path)
+ * fires loudly within roughly one minute of onset. HONESTY: this window is
+ * NOT a bound on detecting the exact 07-17 stall. In that confirmed mode
+ * the sysext stops reporting decisions entirely, so `flow_decision_recorded`
+ * receipts go quiet WITH the emissions, the detector receives neither input,
+ * and it stays quiet regardless of this window (see HONEST BOUND above; the
+ * Swift decided-counter feed is the owed instrument for that signature).
  */
 export const DEFAULT_EMISSION_STALL_GRACE_MS = 60_000;
 
@@ -81,6 +91,15 @@ export interface EmissionLivenessSnapshot {
   firstUnemittedDecisionAtMs: number | null;
   stalled: boolean;
   stallStartedAtMs: number | null;
+  /**
+   * Epoch ms of the most recent `evaluate()` call, or null when it has never
+   * run. This is the watchdog's OWN liveness signal: the daemon piggybacks it
+   * onto the periodic `castle_wall_heartbeat` entry, so a cleared/never-wired
+   * tick timer shows up as a stale (or null) value against the heartbeat's
+   * own timestamps instead of being silently unobservable (fix-round HIGH:
+   * a watchdog for silent failure must not itself be silently absent).
+   */
+  lastEvaluateAtMs: number | null;
 }
 
 /** Payload handed to `onStall` exactly once per stall episode. */
@@ -154,6 +173,7 @@ export class EmissionLivenessWatchdog implements EmissionLivenessNotes {
   private stalled = false;
   private stallStartedAtMs: number | null = null;
   private decidedTotalAtStallStart = 0;
+  private lastEvaluateAtMs: number | null = null;
 
   constructor(options: EmissionLivenessWatchdogOptions) {
     const graceMs = options.graceMs ?? DEFAULT_EMISSION_STALL_GRACE_MS;
@@ -241,11 +261,16 @@ export class EmissionLivenessWatchdog implements EmissionLivenessNotes {
    * stall episode.
    */
   evaluate(): EmissionStallFinding | null {
+    // Stamp the evaluation clock FIRST, on every call including early
+    // returns: `lastEvaluateAtMs` is the tick timer's liveness signal, and it
+    // must advance whenever the timer is actually ticking, not only when a
+    // stall is close.
+    const nowMs = this.now();
+    this.lastEvaluateAtMs = nowMs;
     if (this.stalled) return null;
     if (this.decidedSinceLastEmission < this.minDecisions) return null;
     const anchor = this.firstUnemittedDecisionAtMs;
     if (anchor === null) return null;
-    const nowMs = this.now();
     if (nowMs - anchor < this.graceMs) return null;
 
     // Commit the transition BEFORE the callback so a throwing callback can
@@ -270,6 +295,24 @@ export class EmissionLivenessWatchdog implements EmissionLivenessNotes {
     return finding;
   }
 
+  /**
+   * Deliberate stand-down (fix-round MED: arm-lease revoke): clear the current
+   * unemitted run and any active stall episode WITHOUT invoking the recovery
+   * callback. A revoked wall has been told to stop enforcing for this
+   * operator, so it makes no emission promise; decisions observed BEFORE the
+   * revoke must not mature into a stall alarm on a wall that is intentionally
+   * stood down (that would be a false alarm, and `onArmLeaseRevoke` already
+   * records the stand-down honestly). The recovery callback is NOT invoked
+   * because nothing recovered: an active stall episode ends unresolved, and
+   * the monotonic totals are preserved so diagnostics keep the history.
+   */
+  standDown(): void {
+    this.decidedSinceLastEmission = 0;
+    this.firstUnemittedDecisionAtMs = null;
+    this.stalled = false;
+    this.stallStartedAtMs = null;
+  }
+
   /** Read-only snapshot for status surfaces and tests. */
   snapshot(): EmissionLivenessSnapshot {
     return {
@@ -282,6 +325,7 @@ export class EmissionLivenessWatchdog implements EmissionLivenessNotes {
       firstUnemittedDecisionAtMs: this.firstUnemittedDecisionAtMs,
       stalled: this.stalled,
       stallStartedAtMs: this.stallStartedAtMs,
+      lastEvaluateAtMs: this.lastEvaluateAtMs,
     };
   }
 

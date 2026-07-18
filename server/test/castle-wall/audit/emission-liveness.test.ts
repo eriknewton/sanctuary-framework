@@ -292,4 +292,79 @@ describe("EmissionLivenessWatchdog", () => {
     expect(wd.evaluate()).toBeNull();
     expect(calls).toBe(1);
   });
+
+  it("stamps lastEvaluateAtMs on EVERY evaluate call, including early returns (watchdog self-liveness signal)", () => {
+    const clock = makeClock(2_000_000);
+    const { wd } = makeWatchdog({ graceMs: 60_000, minDecisions: 2, now: clock.now });
+
+    // Never evaluated: the pulse is null (a never-started tick is visible).
+    expect(wd.snapshot().lastEvaluateAtMs).toBeNull();
+
+    // An early-return evaluate (zero decisions) still stamps the pulse: the
+    // signal tracks the TICK TIMER's liveness, not stall proximity.
+    expect(wd.evaluate()).toBeNull();
+    expect(wd.snapshot().lastEvaluateAtMs).toBe(2_000_000);
+
+    // Ticks stopped (no further evaluate calls): the pulse goes stale while
+    // the clock advances, which is exactly what a heartbeat reader compares
+    // against to detect a cleared tick timer.
+    clock.advance(300_000);
+    expect(wd.snapshot().lastEvaluateAtMs).toBe(2_000_000);
+
+    // A later tick advances it again.
+    expect(wd.evaluate()).toBeNull();
+    expect(wd.snapshot().lastEvaluateAtMs).toBe(2_300_000);
+  });
+
+  it("standDown clears the unemitted run and an active stall episode WITHOUT invoking the recovery callback", () => {
+    const clock = makeClock();
+    const { wd, captured } = makeWatchdog({ graceMs: 10_000, minDecisions: 2, now: clock.now });
+
+    // Mature a real stall episode.
+    wd.noteDecision("flow_decision_recorded");
+    wd.noteDecision("flow_decision_recorded");
+    clock.advance(10_001);
+    expect(wd.evaluate()).not.toBeNull();
+    expect(captured.stalls).toHaveLength(1);
+    expect(wd.snapshot().stalled).toBe(true);
+
+    // Deliberate stand-down: the episode ends unresolved. NOT a recovery
+    // (nothing recovered), so the recovery callback must not fire.
+    wd.standDown();
+    const snap = wd.snapshot();
+    expect(snap.stalled).toBe(false);
+    expect(snap.stallStartedAtMs).toBeNull();
+    expect(snap.decidedSinceLastEmission).toBe(0);
+    expect(snap.firstUnemittedDecisionAtMs).toBeNull();
+    expect(captured.recoveries).toHaveLength(0);
+    // Monotonic totals survive for diagnostics.
+    expect(snap.decidedTotal).toBe(2);
+
+    // Post-stand-down, no residue can mature into a stall.
+    clock.advance(60_000);
+    expect(wd.evaluate()).toBeNull();
+    expect(captured.stalls).toHaveLength(1);
+
+    // The detector is NOT weakened: fresh divergence after a stand-down
+    // (e.g. a re-armed wall) fires normally.
+    wd.noteDecision("flow_decision_recorded");
+    wd.noteDecision("flow_decision_recorded");
+    clock.advance(10_001);
+    expect(wd.evaluate()).not.toBeNull();
+    expect(captured.stalls).toHaveLength(2);
+  });
+
+  it("standDown on a pre-stall run prevents that run from ever firing", () => {
+    const clock = makeClock();
+    const { wd, captured } = makeWatchdog({ graceMs: 10_000, minDecisions: 2, now: clock.now });
+
+    wd.noteDecision("flow_decision_recorded");
+    wd.noteDecision("flow_decision_recorded");
+    // Stand down BEFORE the grace window matures.
+    clock.advance(5_000);
+    wd.standDown();
+    clock.advance(60_000);
+    expect(wd.evaluate()).toBeNull();
+    expect(captured.stalls).toHaveLength(0);
+  });
 });
