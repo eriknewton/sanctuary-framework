@@ -701,7 +701,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * old 501 oracle.
    */
   private supervisorBridge: SupervisorBridge | null = null;
-  /** S5-P exclusive-egress posture provider (null until S5-6 wires the producer). */
+  /** S5-P exclusive-egress posture provider (S5-6's arming-wiring producer; null while detached). */
   private _exclusiveEgressPostureProvider:
     | (() => Promise<ExclusiveEgressStatus | null> | ExclusiveEgressStatus | null)
     | null = null;
@@ -2161,7 +2161,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
   /**
    * Unified Protect Slice 5 S5-P: bind (or detach with `null`) the
    * exclusive-egress posture provider. The provider is produced by the
-   * root-supervised provisioning/boot flow (S5-6, owed) and resolves the
+   * root-supervised provisioning/boot flow (S5-6: the arming-wiring posture
+   * producer, bound by dashboard-standalone on darwin) and resolves the
    * per-agent exclusive-egress posture objects + wall-level summary. While
    * detached (today: no fine-grained agent is provisioned anywhere), every
    * posture surface behaves exactly as before. Once attached, the wall

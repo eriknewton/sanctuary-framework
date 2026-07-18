@@ -52,11 +52,14 @@ export {
   PfAnchorRegistryDirtyError,
   PfAnchorRegistryStateError,
   createFsRegistryStore,
+  createFsQuarantineForensicsWriter,
   type PfAnchorRegistryEntry,
   type PfAnchorRegistryState,
   type PfAnchorRegistryStore,
   type PfAnchorRegistryOps,
   type PfAnchorRegistryMutationResult,
+  type PfAnchorQuarantineRepairFinding,
+  type PfAnchorQuarantineRepairResult,
 } from "./anchor-registry.js";
 
 export {
@@ -228,3 +231,67 @@ export {
   type ExclusiveEgressStatus,
   type GateProcessStatus,
 } from "./posture.js";
+
+// Unified Protect Slice 5 S5-6: gate daemon + drift guard + production wiring.
+export {
+  EGRESS_GATE_RUNTIME_DIR,
+  EGRESS_GATE_DAEMON_LABEL_PREFIX,
+  GATE_ORACLE_PUBLIC_KEY_PATH,
+  egressGateDaemonLabel,
+  egressGateDaemonPlistPath,
+  egressGatePolicyConfigPath,
+  egressGateRulesConfigPath,
+  egressGateRuntimeStatePath,
+  egressGateRuntimeUidDirPath,
+  parseEgressGateRuntimeState,
+  renderEgressGateDaemonPlist,
+  runEgressGateDaemon,
+  type EgressGateDaemonDeps,
+  type EgressGateDaemonHandle,
+  type EgressGateDaemonPlistOptions,
+  type EgressGateRuntimeState,
+} from "./gate-daemon.js";
+export {
+  diffTransientPfRules,
+  type DiffTransientPfRulesOptions,
+  type TransientPfRulesDiff,
+} from "./drift-guard.js";
+export {
+  SANCTUARY_VAR_DB_DIR,
+  applyGateRuntimeFsPlan,
+  createRealGateRuntimeFsOps,
+  ensureExclusiveEgressRuntimeFs,
+  planExclusiveEgressRuntimeFs,
+  type GateRuntimeFsOps,
+  type GateRuntimeFsPlanInput,
+  type GateRuntimeFsStep,
+} from "./runtime-fs-plan.js";
+export {
+  GATE_ORACLE_PRIVATE_KEY_PATH,
+  NON_HERMES_BOOT_PARK_REASON,
+  bootstrapGateDaemonForBoot,
+  createExclusiveEgressPostureProducer,
+  createInstallExclusiveEgressOps,
+  createProductionAnchorRegistry,
+  createProductionOracle,
+  createProductionReleaseBarrierOps,
+  createRepairExclusiveEgressOps,
+  ensureSupervisorOracleKeys,
+  parkHarnessPersistently,
+  restoreCoarseCompositionProduction,
+  startExclusiveEgressBootSupervisor,
+  verifyHarnessJobDisabled,
+  verifyHarnessParkedPersistent,
+  verifyLoopbackTcpPortOwner,
+  PID_START_TOLERANCE_MS,
+  type BootAgentResolution,
+  type BootRegistryEntry,
+  type BootRegistryListing,
+  type ExclusiveEgressBootSupervisorHandle,
+  type ExclusiveEgressBootSupervisorInternals,
+  type ExclusiveEgressWiringInput,
+  type PersistentParkContext,
+  type PersistentParkDeps,
+  type PortOwnerVerdict,
+  type QuarantinedBootRegistryEntry,
+} from "./arming-wiring.js";

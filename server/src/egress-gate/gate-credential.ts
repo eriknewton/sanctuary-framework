@@ -48,14 +48,25 @@
  *
  * HONESTY BOUND. This is the credential PRIMITIVE only. It does not itself
  * authorize a CONNECT (that is `gate-client-auth.ts`, which combines this with
- * the peer lens fail-closed), does not provision the gate uid (`gate-account.ts`),
- * and no caller writes a real credential until the release barrier lands (S5-5)
- * and the install flow wires it (S5-6). It advances no capability claim.
+ * the peer lens fail-closed) and does not provision the gate uid
+ * (`gate-account.ts`). It is WIRED (S5-6): the install flow
+ * (`arming-wiring.ts`) mints the generation-bound credential strictly before
+ * unpark and revokes it on the coarse restore. It advances no capability
+ * claim: the Erik-present S5-DRILL is still owed.
  */
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 
-/** Root-owned parent directory for the gate credential files (0700 root). */
+/**
+ * Root-owned parent directory for the gate credential files. Mode 0711
+ * (fix-round BLOCKER-2; asserted by `runtime-fs-plan.ts` at arming time):
+ * root-only write + listing, but EXECUTE/SEARCH for everyone so the two
+ * non-root readers can traverse to the one file each is entitled to --
+ * the GATE uid reads its 0600 `<uid>.accept`, the AGENT uid reads its 0600
+ * `<uid>.token`. A 0700 parent (the pre-fix state) blocked both reads and
+ * made every CONNECT deny; per-file 0600 + ownership still bind each file
+ * to exactly its intended reader.
+ */
 export const GATE_CRED_DIR = "/var/db/sanctuary/gate-cred";
 
 /** The `Proxy-Authorization` auth-scheme token the agent presents. */
@@ -274,25 +285,59 @@ export function mintGateSecret(): string {
 }
 
 /**
+ * The fs surface {@link createFsGateCredentialAuthority} writes through.
+ * Injectable (tests pin the EXACT ownership/mode sequence with a recorder,
+ * fix-round BLOCKER-2); production uses `node:fs/promises`.
+ */
+export interface GateCredentialFsOps {
+  open(path: string, flags: string, mode: number): Promise<{
+    writeFile(data: string, encoding: string): Promise<void>;
+    chown(uid: number, gid: number): Promise<void>;
+    chmod(mode: number): Promise<void>;
+    close(): Promise<void>;
+  }>;
+  mkdir(path: string, options: { recursive: boolean; mode: number }): Promise<unknown>;
+  chmod(path: string, mode: number): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
+  rm(path: string, options: { force: boolean }): Promise<void>;
+}
+
+async function defaultGateCredentialFsOps(): Promise<GateCredentialFsOps> {
+  const { open, mkdir, chmod, rename, rm } = await import("node:fs/promises");
+  return { open, mkdir, chmod, rename, rm } as GateCredentialFsOps;
+}
+
+/**
  * Production FS-backed authority. Atomic writes (tmp + rename); the caller-owned
  * `chown` binds each file to its reader (accept -> gate uid, token -> agent uid)
  * before the rename so the file is never briefly world-readable at its final
- * path. Root-only in practice; drill/wiring surface, arms nothing by itself.
+ * path. The parent dir is created/re-asserted 0711 with an EXPLICIT chmod
+ * (mkdir's mode is umask-masked and does nothing for a pre-existing 0700 dir
+ * from an older build) so both readers can traverse to their own file -- see
+ * {@link GATE_CRED_DIR}. Root-only in practice; drill/wiring surface, arms
+ * nothing by itself.
  */
 export function createFsGateCredentialAuthority(input: {
   gateUid: number;
   dir?: string;
   mintSecret?: () => string;
+  /** TEST SEAM: recorder fs ops (production always uses node:fs/promises). */
+  fsOps?: GateCredentialFsOps;
 }): GateCredentialAuthority {
   const dir = input.dir ?? GATE_CRED_DIR;
   const acceptPath = (uid: number): string => `${dir}/${uid}.accept`;
   const tokenPath = (uid: number): string => `${dir}/${uid}.token`;
 
   async function atomicWrite(path: string, payload: string, ownerUid: number): Promise<void> {
-    const { open, mkdir, rename, rm } = await import("node:fs/promises");
-    await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => undefined);
+    const fs = input.fsOps ?? (await defaultGateCredentialFsOps());
+    await fs.mkdir(dir, { recursive: true, mode: 0o711 }).catch(() => undefined);
+    // EXPLICIT traversal mode (never umask/creation-order luck): both the
+    // gate uid (.accept) and the agent uid (.token) must be able to search
+    // this root-owned dir. Loud on failure: a credential the reader cannot
+    // reach is a guaranteed all-deny, better surfaced at mint time.
+    await fs.chmod(dir, 0o711);
     const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-    const handle = await open(tmp, "wx", 0o600);
+    const handle = await fs.open(tmp, "wx", 0o600);
     try {
       await handle.writeFile(payload, "utf8");
       // Bind ownership BEFORE the rename so the file is never at its final,
@@ -303,9 +348,9 @@ export function createFsGateCredentialAuthority(input: {
       await handle.close();
     }
     try {
-      await rename(tmp, path);
+      await fs.rename(tmp, path);
     } catch (err) {
-      await rm(tmp, { force: true }).catch(() => undefined);
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
       throw err;
     }
   }
@@ -319,9 +364,9 @@ export function createFsGateCredentialAuthority(input: {
       await atomicWrite(tokenPath(agentUid), payload, agentUid);
     },
     async remove(agentUid): Promise<void> {
-      const { rm } = await import("node:fs/promises");
-      await rm(acceptPath(agentUid), { force: true });
-      await rm(tokenPath(agentUid), { force: true });
+      const fs = input.fsOps ?? (await defaultGateCredentialFsOps());
+      await fs.rm(acceptPath(agentUid), { force: true });
+      await fs.rm(tokenPath(agentUid), { force: true });
     },
   });
 }

@@ -41,7 +41,7 @@
  *                      `generation_id` (written at G3) is now the ACTIVE
  *                      committed generation by virtue of there being no staging
  *                      record. This is the barrier line: only after G5 may a
- *                      consumer unpark the agent harness (S5-5/S5-6, owed).
+ *                      consumer unpark the agent harness (S5-5/S5-6, WIRED).
  *
  * GENERATION MATCH (never green from stale rules). {@link evaluateGenerationMatch}
  * refuses traffic unless the pf pass-rule port, the manifest port, and the
@@ -54,7 +54,7 @@
  * only, over INJECTED ops (bind, owner-check, registry, manifest-publish,
  * staging store), so the whole machine -- every crash-recovery branch -- is
  * unit-testable with no host, root, gate, or pf. It does NOT wire arming into
- * install (S5-6, owed), does NOT provision the gate service uid or its
+ * install (that is S5-6's `arming-wiring.ts`), does NOT provision the gate service uid or its
  * client-auth / liveness oracle (S5-3, owed), does NOT compose the exclusive
  * routing manifest (S5-4 owns the endpoint re-scope; G4 here only publishes the
  * generation-bearing gate policy file), and does NOT park/unpark the harness
@@ -150,6 +150,19 @@ export interface GenerationRegistryOps {
     generation_id?: number;
     tombstone?: boolean;
   } | null>;
+  /**
+   * Read the registry's persisted generation floor (fix-round-5 P1): a
+   * strictly-exceeded lower bound recorded by the quarantine repair verb when
+   * it removes an entry whose generation survives in no other entry. OPTIONAL
+   * (older adapters); absent or `undefined` === no floor. Bring-up folds it
+   * into {@link computeNextGenerationId} so a repair-discarded generation is
+   * never reallocated. Fix-round-6 F1: when the registry's persisted floor is
+   * MALFORMED but its preserved raw parses numerically, the registry folds the
+   * parsed value into this read, so allocation stays above it even before the
+   * repair verb resolves the raw (the dirty registry separately withholds
+   * release until then).
+   */
+  readGenerationFloor?(): Promise<number | undefined>;
 }
 
 /** Everything the coordinator needs, all injectable so it is host-free in tests. */
@@ -230,13 +243,34 @@ export interface GateRestartOutcome {
  * Monotonic-per-agent next generation id: strictly greater than any generation
  * this agent has committed OR staged, so a restart/crash can never reuse an id
  * (a reused id would let a stale manifest/pf rule masquerade as current).
+ *
+ * `generationFloor` (fix-round-5 P1) is the registry's persisted floor: the
+ * quarantine repair verb records there any generation it REMOVED without a
+ * surviving entry (e.g. a discarded valid duplicate at gen 8 beside a kept gen
+ * 7), so the next allocation must exceed it too -- otherwise the removed id
+ * would be reused and its stale manifest/pf artifacts could masquerade as
+ * current.
  */
 export function computeNextGenerationId(
   committedGenerationId: number | undefined,
   stagingGenerationId: number | undefined,
+  generationFloor?: number,
 ): number {
-  const highest = Math.max(committedGenerationId ?? 0, stagingGenerationId ?? 0);
-  return highest + 1;
+  const highest = Math.max(
+    committedGenerationId ?? 0,
+    stagingGenerationId ?? 0,
+    generationFloor ?? 0,
+  );
+  const next = highest + 1;
+  // Fail-closed backstop (fix-round-8): the registry boundary rejects unsafe
+  // generation values, but if one ever reaches allocation anyway, n+1 === n
+  // at 2^53 would silently commit a COLLIDING generation. Refuse instead.
+  if (!Number.isSafeInteger(next) || next <= highest) {
+    throw new Error(
+      `generation allocation has no safe headroom above ${highest}; the anchor registry needs repair`,
+    );
+  }
+  return next;
 }
 
 /**
@@ -575,7 +609,18 @@ export class GenerationCoordinator {
     const binding = await this.ops.bind({ agent_uid, fortress_path });
     try {
       const committed = await this.ops.registry.readEntry(agent_uid);
-      const generation_id = computeNextGenerationId(committed?.generation_id, undefined);
+      // Fix-round-5 P1: fold in the registry's persisted generation floor so a
+      // generation the quarantine repair REMOVED (surviving in no entry) can
+      // never be reallocated to this or any uid.
+      const generationFloor =
+        this.ops.registry.readGenerationFloor !== undefined
+          ? await this.ops.registry.readGenerationFloor()
+          : undefined;
+      const generation_id = computeNextGenerationId(
+        committed?.generation_id,
+        undefined,
+        generationFloor,
+      );
       const base: CommittedGeneration = {
         generation_id,
         agent_uid,
@@ -618,7 +663,7 @@ export class GenerationCoordinator {
       // G5: commit -- removing the staging record makes the G3-written
       // generation_id the ACTIVE committed generation. The gate keeps holding
       // the port (NOT released). Only now may a consumer unpark the harness
-      // (S5-5/S5-6, owed -- not this library).
+      // (S5-5/S5-6 release barrier -- not this library).
       await this.ops.staging.delete(agent_uid);
       return base;
     } catch (err) {

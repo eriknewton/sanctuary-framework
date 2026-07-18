@@ -1086,4 +1086,118 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe("S5-6 exclusive-egress (fine-grained) stage", () => {
+    const COMMITTED = { generation_id: 4, agent_uid: AGENT_UID, gate_port: 40001 };
+
+    /** Exclusive ops whose bring-up + release succeed. */
+    function happyExclusiveOps() {
+      return {
+        bringUpGeneration: vi.fn(async () => COMMITTED),
+        runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
+        restoreCoarseComposition: vi.fn(async () => undefined),
+        startHarnessCoarse: vi.fn(async () => undefined),
+        audit: vi.fn(async () => undefined),
+        print: vi.fn(),
+      };
+    }
+
+    /** happyPathOps with the PARKED install form the fine-grained mode requires. */
+    function fineGrainedOps(exclusive = happyExclusiveOps(), overrides: Partial<ProvisionFlowOps> = {}) {
+      return {
+        ops: happyPathOps({
+          installHarnessDaemon: vi.fn(async () => ({
+            ok: true as const,
+            bootstrappedThisRun: false,
+            parked: true,
+          })),
+          exclusiveEgress: exclusive,
+          ...overrides,
+        }),
+        exclusive,
+      };
+    }
+
+    it("PREFLIGHT (fail-closed, before ANY mutation): fine-grained declared with no exclusive ops wired aborts with nothing changed", async () => {
+      const ops = happyPathOps();
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-egress-preflight" });
+      // Nothing ran: no confirm ceremony, no account, no daemon, no arm.
+      expect(ops.confirm).not.toHaveBeenCalled();
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    it("BARRIER ASSERTION: a non-parked install in fine-grained mode aborts at install-daemon and tears the daemon down (never an agent running before the barrier)", async () => {
+      const { ops } = fineGrainedOps(happyExclusiveOps(), {
+        // The install "succeeds" but NOT in the parked form.
+        installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+      expect(String((result as { reason: string }).reason)).toMatch(/parked/i);
+      expect(ops.uninstallHarnessDaemon).toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    it("happy fine-grained path: coarse stages first, then the exclusive stage, terminal outcome armed-exclusive (never plain armed)", async () => {
+      const { ops, exclusive } = fineGrainedOps();
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toEqual({ kind: "armed-exclusive", uid: AGENT_UID, generationId: COMMITTED.generation_id });
+      // The exclusive stage ran strictly AFTER the coarse arm proved live.
+      const armOrder = (ops.arm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const bringUpOrder = exclusive.bringUpGeneration.mock.invocationCallOrder[0]!;
+      expect(armOrder).toBeLessThan(bringUpOrder);
+      expect(exclusive.runReleaseSequence).toHaveBeenCalledWith(COMMITTED);
+      // No degrade surfaces touched on the happy path.
+      expect(exclusive.restoreCoarseComposition).not.toHaveBeenCalled();
+      expect(exclusive.startHarnessCoarse).not.toHaveBeenCalled();
+    });
+
+    it("released-repark-failed maps to the DISTINCT armed-exclusive-repark-failed outcome (amber, never green)", async () => {
+      const exclusive = happyExclusiveOps();
+      exclusive.runReleaseSequence = vi.fn(async () => ({
+        kind: "released-repark-failed" as const,
+        generation_id: COMMITTED.generation_id,
+        reparkError: "launchctl disable exited 1",
+      }));
+      const { ops } = fineGrainedOps(exclusive);
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toEqual({
+        kind: "armed-exclusive-repark-failed",
+        uid: AGENT_UID,
+        generationId: COMMITTED.generation_id,
+        reparkError: "launchctl disable exited 1",
+      });
+    });
+
+    it("DEGRADE-LOUD: a failed bring-up maps to exclusive-egress-unarmed-coarse-active carrying the stage/reason/restore/start signals", async () => {
+      const exclusive = happyExclusiveOps();
+      exclusive.bringUpGeneration = vi.fn(async () => {
+        throw new Error("pf anchor liveness probe reported NOT live");
+      });
+      const { ops } = fineGrainedOps(exclusive);
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({
+        kind: "exclusive-egress-unarmed-coarse-active",
+        uid: AGENT_UID,
+        stage: "bring-up",
+        coarseCompositionRestored: true,
+        harnessStartedCoarse: true,
+      });
+      expect(String((result as { reason: string }).reason)).toMatch(/NOT live/);
+      // The proven coarse wall was NOT disarmed by the degrade path.
+      expect(ops.disarm).not.toHaveBeenCalled();
+    });
+
+    it("coarse mode (fineGrainedDeclared absent) never invokes the exclusive stage even when ops are wired", async () => {
+      const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
+        installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
+    });
+  });
 });

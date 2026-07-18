@@ -2105,12 +2105,82 @@ export async function runSafeModeDaemon(
     "Agents denied by default; persisted signed manifest enforced if present. Full operation resumes at first login.\n",
   );
 
+  // Unified Protect Slice 5 S5-6: the exclusive-egress BOOT release sequence
+  // (design "Boot ordering via the root supervisor"). For every confined
+  // agent in the S5-1 registry: re-arm the pf anchor union from the registry
+  // -> verify gate + generation -> recommit + hold file -> enable+bootstrap
+  // the parked harness, per the S5-5 persistent-park contract -- then keep
+  // the oracle freshness-token loop running (the gate's per-CONNECT liveness
+  // is TTL-fresh). PER-AGENT FAIL-CLOSED and NEVER daemon-fatal: a failure
+  // leaves that agent PARKED (loud, amber, repairable via
+  // 'sudo sanctuary protect --repair-egress-gate'), and the policy daemon
+  // keeps serving regardless.
+  let exclusiveEgressSupervisor: { stopOracleLoop(): void } | undefined;
+  try {
+    const { startExclusiveEgressBootSupervisor, NON_HERMES_BOOT_PARK_REASON } = await import(
+      "../egress-gate/arming-wiring.js"
+    );
+    const { loadExclusiveRoutingMarker } = await import("../castle-wall/allowlist/routing-marker.js");
+    const { deriveAgentAccountName, resolveHermesGatewayArgv } = await import(
+      "../castle-wall/provision/index.js"
+    );
+    exclusiveEgressSupervisor = await startExclusiveEgressBootSupervisor({
+      // Discriminated resolution (fix-round H1): an unresolvable agent gets a
+      // REAL reassert-parked (bootout + hold-file removal + disable) inside
+      // the supervisor, never a synthetic unverified "parked" report.
+      resolveAgent: async (entry) => {
+        const marker = await loadExclusiveRoutingMarker(entry.fortress_path).catch(() => null);
+        if (marker === null || marker.agent_uid !== entry.agent_uid) {
+          return {
+            kind: "unresolvable" as const,
+            reason: `no exclusive-routing marker names uid ${entry.agent_uid} in ${entry.fortress_path} (marker missing, malformed, or for another uid)`,
+          };
+        }
+        if (marker.agent_id !== "hermes") {
+          // Fix-round M6: a deliberate v1 scope bound, not a fault.
+          return { kind: "unresolvable" as const, reason: NON_HERMES_BOOT_PARK_REASON };
+        }
+        const accountName = deriveAgentAccountName(marker.agent_id);
+        const agentHome = `/var/sanctuary-agents/${accountName}`;
+        const { access } = await import("node:fs/promises");
+        const pathExists = async (p: string): Promise<boolean> => {
+          try {
+            await access(p);
+            return true;
+          } catch {
+            return false;
+          }
+        };
+        const resolved = await resolveHermesGatewayArgv({ pathExists }, { agentHome });
+        return {
+          kind: "ok" as const,
+          agentAccount: accountName,
+          harnessArgv: resolved.programArguments,
+          harnessLogDir: `${agentHome}/logs`,
+          gateUid: marker.gate_uid,
+        };
+      },
+      audit: async () => undefined, // safe-mode: unified log is the boot evidence channel.
+      print: (line) => write(out, `${line}\n`),
+    });
+  } catch (bootErr) {
+    // HONESTY (fix-round-2 BLOCKER-1): a supervisor throw means NO re-park op
+    // verifiably ran here -- never claim the agents "stay PARKED"; their
+    // persisted parked posture (hold files + disable overrides) was not
+    // re-verified this boot.
+    write(
+      err,
+      `[castle-wall] exclusive-egress boot supervisor failed (${bootErr instanceof Error ? bootErr.message : String(bootErr)}); NO boot release or re-park ran and the confined agents' parked state was NOT verified -- treat them as possibly startable and intervene. Repair: sudo sanctuary protect --repair-egress-gate\n`,
+    );
+  }
+
   await new Promise<void>((resolveWait) => {
     let stopping = false;
     const stop = () => {
       if (stopping) return;
       stopping = true;
       write(err, "\nStopping Castle Wall safe-mode daemon...\n");
+      exclusiveEgressSupervisor?.stopOracleLoop();
       void daemon
         .stop()
         .catch(() => undefined)

@@ -121,3 +121,24 @@ export type {
   AgentEgressProbeRow,
   AgentEgressVerifyReport,
 } from "./egress.js";
+
+// Unified Protect Slice 5 S5-6: the exclusive-egress arming stage + repair +
+// boot release drivers.
+export {
+  EXCLUSIVE_EGRESS_ARMED_AUDIT_OP,
+  EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP,
+  EGRESS_GATE_REPAIR_AUDIT_OP,
+  EGRESS_GATE_REPAIR_OVERRIDE_AUDIT_OP,
+  EGRESS_GATE_REPAIR_REFUSED_AUDIT_OP,
+  runExclusiveEgressArming,
+  runEgressGateRepair,
+  runBootExclusiveEgressRelease,
+  type BootReleaseAgent,
+  type BootReleaseResult,
+  type EgressGateRepairContext,
+  type EgressGateRepairOps,
+  type EgressGateRepairOutcome,
+  type ExclusiveEgressArmOps,
+  type ExclusiveEgressArmOutcome,
+  type ExclusiveGenerationIdentity,
+} from "./exclusive-arm.js";

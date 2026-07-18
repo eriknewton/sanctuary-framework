@@ -229,6 +229,29 @@ export interface WrapOptions {
    * flag passed) leaves the interactive prompt as the sole decision point.
    */
   provisionAgentAccount?: boolean;
+  /**
+   * Unified Protect Slice 5 S5-6: provision in FINE-GRAINED (exclusive-
+   * egress) mode -- the agent's only sanctioned egress path becomes the
+   * loopback policy gate; the harness is PARK-installed and released only
+   * after the gate generation commits (the S5-5 release barrier). Requires
+   * `--hermes` + darwin. Off by default (the coarse drill-proven path).
+   */
+  exclusiveEgress?: boolean;
+  /**
+   * S5-6 repair verb: re-run the exclusive-egress bring-up + release barrier
+   * for an already-provisioned fine-grained agent (after a flush, gate
+   * crash, or degrade). Runs the MED-7 transient-pf-rule drift guard first
+   * and REFUSES when foreign (VPN/firewall) rules are present in the running
+   * ruleset, unless `--override-transient-pf-rules` is also passed on an
+   * interactive TTY. Does not wrap anything.
+   */
+  repairEgressGate?: boolean;
+  /**
+   * Explicit, interactive-only override for the repair drift guard (design
+   * MED-7). TTY-only: refused on a non-interactive stdin. Audited
+   * (`egress_gate_repair_override`) before any pf mutation.
+   */
+  overrideTransientPfRules?: boolean;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -1106,6 +1129,8 @@ async function maybeRunAutoProvisionForWrap(
       preAnsweredProvision: options.provisionAgentAccount,
       cliBinary: resolveAutoProvisionCliBinary(options),
       stopTransientCastleWallDaemon,
+      // S5-6: fine-grained (exclusive-egress) provisioning mode.
+      exclusiveEgress: options.exclusiveEgress,
       // SAFETY: stderr is the operator-facing CLI channel for this
       // subcommand; this prints the plan-and-print + progress lines from
       // the auto-provision flow (account plan, re-home summary, arm
@@ -1231,6 +1256,36 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `${outcome.scrubbed ? " and the provisioned egress rules were scrubbed" : ""}. ` +
           `Re-run 'sanctuary protect --hermes' once the per-endpoint failures above are resolved.`,
       ];
+    case "armed-exclusive":
+      // S5-6: the full fine-grained outcome. Honest wording: wired + live,
+      // drill-owed (no "audited per-rule per-flow"-class overclaim).
+      return [
+        `  Dedicated agent account provisioned, Castle Wall armed, and the exclusive-egress gate is LIVE ` +
+          `(uid ${outcome.uid}, generation ${outcome.generationId}). The agent's only sanctioned egress path is the gate.`,
+      ];
+    case "armed-exclusive-repark-failed":
+      return [
+        `  WARNING: the exclusive-egress gate is LIVE (uid ${outcome.uid}, generation ${outcome.generationId}) and the ` +
+          `agent is running confined, but the persistent boot state could NOT be re-parked (${outcome.reparkError}). ` +
+          `The NEXT boot could start the agent before the gate re-arms. Run 'sudo sanctuary protect --repair-egress-gate' now.`,
+      ];
+    case "exclusive-egress-unarmed-coarse-active": {
+      // S5-6 degrade-loud: DISTINCT non-green state; every posture surface
+      // renders coarse-only amber (S5-P). Never softened into a success line.
+      const agentState = outcome.harnessStartedCoarse
+        ? "The agent is RUNNING in coarse-only mode (network-destination wall, no fine-grained gate)."
+        : outcome.coarseCompositionRestored
+          ? "The agent is PARKED (not running): the manifest is back in coarse scope but the harness could not be started."
+          : "The agent is PARKED (not running) and the manifest could NOT be restored to coarse scope.";
+      const cleanupNote =
+        outcome.cleanupErrors.length > 0 ? ` Cleanup problems: ${outcome.cleanupErrors.join("; ")}.` : "";
+      return [
+        `  WARNING: fine-grained exclusive egress could NOT come live at "${outcome.stage}" (${outcome.reason}). ` +
+          `The coarse Castle Wall remains armed over the agent -- this is a DISTINCT NON-GREEN (coarse-only) state ` +
+          `on every posture surface, not full protection. ${agentState}${cleanupNote} ` +
+          `Fix with: sudo sanctuary protect --repair-egress-gate`,
+      ];
+    }
     case "aborted":
       return abortedProvisionLines(outcome);
   }
@@ -1457,6 +1512,21 @@ export async function runWrap(
   // resolveStoragePath(). Extracted so tests can pin the precedence
   // without standing up the whole wrap flow.
   promoteFortressToStoragePath(options);
+
+  // S5-6: the exclusive-egress repair verb. Does NOT wrap anything -- it
+  // re-runs the gate generation bring-up + release barrier for an
+  // already-provisioned fine-grained agent, behind the MED-7 transient-
+  // pf-rule drift guard (foreign VPN/firewall rules refuse without the
+  // interactive `--override-transient-pf-rules`).
+  if (options.repairEgressGate === true) {
+    const { runEgressGateRepairForCli } = await import("./auto-provision.js");
+    const code = await runEgressGateRepairForCli({
+      isTty: process.stdin.isTTY === true,
+      overrideTransientPfRules: options.overrideTransientPfRules === true,
+      cliBinary: resolveAutoProvisionCliBinary(options),
+    });
+    process.exit(code);
+  }
 
   let platformHint: AgentPlatform | undefined;
   if (options.openclaw) platformHint = "openclaw";
@@ -4153,6 +4223,9 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--anchor-transparency",
   "--provision-agent-account",
   "--no-provision-agent-account",
+  "--exclusive-egress",
+  "--repair-egress-gate",
+  "--override-transient-pf-rules",
   "--help",
   "-h",
 ]);
@@ -4258,6 +4331,15 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         break;
       case "--no-provision-agent-account":
         options.provisionAgentAccount = false;
+        break;
+      case "--exclusive-egress":
+        options.exclusiveEgress = true;
+        break;
+      case "--repair-egress-gate":
+        options.repairEgressGate = true;
+        break;
+      case "--override-transient-pf-rules":
+        options.overrideTransientPfRules = true;
         break;
       case "--fortress":
         options.fortress = argv[++i];

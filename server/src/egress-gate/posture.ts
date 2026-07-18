@@ -2,7 +2,7 @@
  * Exclusive-egress posture object + aggregate-green capping (Unified Protect
  * Slice 5 S5-P, the design's HIGH-3 hard predecessor; design rev3 §6).
  *
- * THE PROBLEM (review HIGH-3). Slice 5's install flow (S5-6, owed) has a
+ * THE PROBLEM (review HIGH-3). Slice 5's install flow (S5-6, WIRED) has a
  * degrade-loud outcome: fine-grained exclusive egress cannot come live, the
  * proven coarse wall stays armed, and the agent runs "coarse-only". The
  * never-silently-degrade rule (AGENTS.md invariant 5) forbids that state
@@ -56,7 +56,9 @@
  * live, `armed` is capped to the DISTINCT non-green `coarse_only` arm-state,
  * so every surface repaints at once - a chokepoint, not N per-surface checks.
  *
- * FAIL-CLOSED PROVIDER CONTRACT. No live producer exists yet (S5-6, owed):
+ * FAIL-CLOSED PROVIDER CONTRACT. The live producer is WIRED (S5-6:
+ * `egress-gate/arming-wiring.ts` createExclusiveEgressPostureProducer,
+ * bound by dashboard-standalone on darwin; drill still owed):
  * surfaces take an OPTIONAL provider. Provider absent = no fine-grained agent
  * has ever been provisioned = no cap (today's honest truth). Provider present
  * but FAILING = we cannot prove exclusive-egress live for a fleet that
@@ -67,9 +69,9 @@
  * arms nothing, probes nothing by itself (all probe results are injected), and
  * advances no capability claim: the exclusive-egress fine-grained claim stays
  * drill-pending (code; Erik-present drill owed). The `coarse-only` state this
- * module renders is not yet producible by any shipped code path - S5-4 lands
- * the compose-time fallback as an uncalled library and S5-6 wires it - which
- * is exactly the design's ordering constraint: render-first, produce-second.
+ * module renders is producible by the S5-6 degrade-loud path (the S5-4
+ * compose-time fallback, wired through `arming-wiring.ts`); the design's
+ * ordering constraint held: render-first (S5-P merged), produce-second (S5-6).
  */
 
 import type { PfLivenessResult } from "./pf-anchor.js";

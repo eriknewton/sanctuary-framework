@@ -69,6 +69,20 @@ import {
   agentHarnessDaemonStatus,
   type HarnessDaemonOps,
 } from "../egress-gate/harness-daemon.js";
+import {
+  planParkedHarnessInstall,
+  executeParkedHarnessInstall,
+} from "../egress-gate/release-barrier.js";
+import {
+  createInstallExclusiveEgressOps,
+  createRepairExclusiveEgressOps,
+  type ExclusiveEgressWiringInput,
+} from "../egress-gate/arming-wiring.js";
+import { deriveGateAccountName } from "../egress-gate/gate-account.js";
+import {
+  runEgressGateRepair,
+  type ExclusiveEgressArmOps,
+} from "../castle-wall/provision/exclusive-arm.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -789,6 +803,13 @@ export interface RunAutoProvisionForWrapOptions {
   getuid?: () => number;
   /** Override for the resolved operator identity (tests only; production leaves this undefined and resolves via SUDO_UID/GID/USER). */
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+  /**
+   * Unified Protect Slice 5 S5-6: fine-grained (exclusive-egress) mode. The
+   * harness is PARK-installed (S5-5 barrier form) and the exclusive-egress
+   * arming stage (gate generation + release barrier) runs after the coarse
+   * stages prove live. Off by default (coarse drill-proven path unchanged).
+   */
+  exclusiveEgress?: boolean;
 }
 
 /**
@@ -966,6 +987,88 @@ export async function runAutoProvisionForWrap(
   // probe falls back to the full adapter set (the account is presumed
   // complete).
   let movedCredentialDestPaths: string[] | undefined;
+  // S5-6: the REAL harness argv captured at parked-install time (the release
+  // barrier's argv-digest source). Set exactly once, only in exclusive mode.
+  let capturedHarnessArgv: string[] | undefined;
+
+  // S5-6: the exclusive-egress arming stage's production wiring. Built
+  // LAZILY: the agent uid + harness argv are only known after the parked
+  // install ran, and the stage is only ever invoked after it (orchestrate
+  // asserts the parked form first). A call before that state exists is a
+  // contract violation and throws (fail-closed; the orchestrator maps it to
+  // the degrade-loud outcome, which leaves the agent parked).
+  const buildExclusiveWiringInput = (): ExclusiveEgressWiringInput => {
+    if (resolvedAgentUidGid === undefined || capturedHarnessArgv === undefined) {
+      throw new Error(
+        "exclusive-egress stage invoked before the parked harness install resolved the agent uid/argv (contract violation)",
+      );
+    }
+    const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
+      const { requestPolicyReload } = await import("../cli/castle-wall.js");
+      const result = await requestPolicyReload(wallFortressPath, "darwin");
+      return result.ok ? { ok: true } : { ok: false, error: result.error };
+    };
+    return {
+      agentId,
+      agentUid: resolvedAgentUidGid.uid,
+      agentAccount: accountName,
+      fortressPath: wallFortressPath,
+      harnessArgv: capturedHarnessArgv,
+      harnessLogDir: resolveHarnessDaemonLogDir(newAccountHome),
+      agentTemplate: agentId,
+      gateDaemonArgvPrefix:
+        options.cliBinary !== undefined && options.cliBinary.length > 0
+          ? [options.cliBinary]
+          : [process.execPath, process.argv[1] ?? "sanctuary"],
+      excludeUids: [consoleOwnerUid],
+      gateAccountCeiling: PROVISION_CEILING,
+      gateHomeDirectory: `${NEW_ACCOUNT_HOME_BASE}/${deriveGateAccountName(agentId)}`,
+      reloadPolicy,
+      publishProvisionedRules: async (routing) => {
+        const published = await publishProvisionedEgressRules({
+          fortressPath: wallFortressPath,
+          endpointSet: HERMES_ENDPOINT_SET,
+          reloadPolicy,
+          routing,
+        });
+        return published.ok
+          ? { ok: true as const, ruleIds: published.ruleIds }
+          : { ok: false as const, error: published.error };
+      },
+      audit: async (operation, details) => {
+        try {
+          const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+          await appendCastleWallCliAuditBestEffort(
+            operation,
+            { source: "sanctuary-protect", ...details },
+            wallFortressPath,
+            process.env,
+            process.stderr,
+          );
+        } catch {
+          // Best-effort by contract.
+        }
+      },
+      print,
+      accountOps: realAccountProvisionOps(),
+    };
+  };
+  let cachedExclusiveOps: ExclusiveEgressArmOps | undefined;
+  const lazyExclusiveOps = (): ExclusiveEgressArmOps => {
+    cachedExclusiveOps ??= createInstallExclusiveEgressOps(buildExclusiveWiringInput());
+    return cachedExclusiveOps;
+  };
+  const exclusiveEgressOps: ExclusiveEgressArmOps | undefined =
+    options.exclusiveEgress === true
+      ? {
+          bringUpGeneration: () => lazyExclusiveOps().bringUpGeneration(),
+          runReleaseSequence: (committed) => lazyExclusiveOps().runReleaseSequence(committed),
+          restoreCoarseComposition: (reason) => lazyExclusiveOps().restoreCoarseComposition(reason),
+          startHarnessCoarse: () => lazyExclusiveOps().startHarnessCoarse(),
+          audit: (operation, details) => lazyExclusiveOps().audit(operation, details),
+          print,
+        }
+      : undefined;
 
   const ops: ProvisionFlowOps = {
     confirm: (promptText) => confirmOnTty(promptText),
@@ -1050,6 +1153,30 @@ export async function runAutoProvisionForWrap(
         await mkdir(harnessLogDir, { recursive: true, mode: 0o700 });
         await chmod(harnessLogDir, 0o700);
         await fsChown(harnessLogDir, uid, uid);
+        if (options.exclusiveEgress === true) {
+          // S5-6 fine-grained mode: the S5-5 PARKED install. The plist is the
+          // barrier form (Disabled + RunAtLoad=false + wrapper argv), the job
+          // is launchctl-disabled, any stale hold file is removed, and
+          // NOTHING is bootstrapped: the release barrier starts the agent
+          // strictly after the gate generation commits. The REAL harness argv
+          // is captured for the barrier's argv-digest.
+          capturedHarnessArgv = resolved.programArguments;
+          const plan = planParkedHarnessInstall({
+            agentAccount: accountName,
+            agentUid: uid,
+            harnessArgv: resolved.programArguments,
+            fortressPath: process.env.SANCTUARY_STORAGE_PATH,
+            logDir: harnessLogDir,
+            environment: resolved.environment,
+          });
+          await executeParkedHarnessInstall(plan, {
+            writeFile: daemonOps.writeFile,
+            removeFile: daemonOps.removeFile,
+            runLaunchctl: daemonOps.runLaunchctl,
+            harnessStatus: () => agentHarnessDaemonStatus(daemonOps),
+          });
+          return { ok: true as const, bootstrappedThisRun: false, parked: true };
+        }
         const plan = planAgentHarnessDaemonInstall({
           agentAccount: accountName,
           programArguments: resolved.programArguments,
@@ -1425,8 +1552,11 @@ export async function runAutoProvisionForWrap(
         // Confined-agent egress: the SAME endpoint set the provisioning +
         // probes consume, threaded for the Tier-1 confirm plan-print.
         harnessEndpoints: HERMES_ENDPOINT_SET,
+        // S5-6: fine-grained (exclusive-egress) mode -- parked install +
+        // exclusive arming stage after the coarse stages prove live.
+        fineGrainedDeclared: options.exclusiveEgress === true,
       },
-      ops,
+      { ...ops, ...(exclusiveEgressOps !== undefined ? { exclusiveEgress: exclusiveEgressOps } : {}) },
     ),
   );
 
@@ -2117,4 +2247,149 @@ function realLockOps() {
 /** Exposed for the CLI `unprovision`/rollback surface (reuses this module's real ops). */
 export async function uninstallAutoProvisionedHarnessDaemon(): Promise<void> {
   await uninstallAgentHarnessDaemon(realHarnessDaemonOps());
+}
+
+// ── S5-6: the `--repair-egress-gate` CLI runner ─────────────────────────────
+
+/**
+ * Run the exclusive-egress repair sequence for the already-provisioned
+ * fine-grained Hermes agent (Unified Protect Slice 5 S5-6, design MED-7).
+ * Drift-guard first (foreign transient pf rules REFUSE without the
+ * interactive override), then recover -> bring-up -> release barrier.
+ * Returns a process exit code (0 = repaired; 2 = refused/failed -- the agent
+ * stays parked or coarse-only, loudly).
+ */
+export async function runEgressGateRepairForCli(options: {
+  isTty: boolean;
+  overrideTransientPfRules: boolean;
+  print?: (line: string) => void;
+  cliBinary?: string;
+  getuid?: () => number;
+  resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+}): Promise<number> {
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+  // this is only the default when no `print` override is supplied (the CLI
+  // caller always supplies one). Never used to print secrets or key material.
+  const print = options.print ?? ((line: string) => console.error(`  ${line}`));
+  if (osPlatform() !== "darwin") {
+    print("--repair-egress-gate is macOS-only (the pf/launchd exclusive-egress stack).");
+    return 2;
+  }
+  const getuid = options.getuid ?? process.getuid?.bind(process);
+  if (getuid?.() !== 0) {
+    print("Repairing the exclusive-egress gate requires root. Re-run: sudo sanctuary protect --repair-egress-gate");
+    return 2;
+  }
+  const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
+  const operatorIdentity = await resolveIdentity();
+  if (operatorIdentity === undefined) {
+    print("Could not determine the operator account under sudo (SUDO_UID/SUDO_GID unset); refusing to repair.");
+    return 2;
+  }
+  const wallFortressPath = resolveWallFortressPath(process.env, operatorIdentity.home);
+  const agentId = "hermes";
+  const accountName = deriveAgentAccountName(agentId);
+  const newAccountHome = `${NEW_ACCOUNT_HOME_BASE}/${accountName}`;
+  const accountOps = realAccountProvisionOps();
+  const agentUid = await accountOps.lookupAccountUid(accountName);
+  if (agentUid === undefined || agentUid === null) {
+    print(
+      `No dedicated agent account "${accountName}" exists; nothing to repair. ` +
+        "Provision first: sudo sanctuary protect --hermes --exclusive-egress",
+    );
+    return 2;
+  }
+  let harnessArgv: string[];
+  try {
+    const resolved = await resolveHermesGatewayArgv({ pathExists }, { agentHome: newAccountHome });
+    harnessArgv = resolved.programArguments;
+  } catch (err) {
+    print(`Could not resolve the harness argv for the repair (${(err as Error).message}); refusing.`);
+    return 2;
+  }
+  const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
+    const { requestPolicyReload } = await import("../cli/castle-wall.js");
+    const result = await requestPolicyReload(wallFortressPath, "darwin");
+    return result.ok ? { ok: true } : { ok: false, error: result.error };
+  };
+  const wiring: ExclusiveEgressWiringInput = {
+    agentId,
+    agentUid,
+    agentAccount: accountName,
+    fortressPath: wallFortressPath,
+    harnessArgv,
+    harnessLogDir: resolveHarnessDaemonLogDir(newAccountHome),
+    agentTemplate: agentId,
+    gateDaemonArgvPrefix:
+      options.cliBinary !== undefined && options.cliBinary.length > 0
+        ? [options.cliBinary]
+        : [process.execPath, process.argv[1] ?? "sanctuary"],
+    excludeUids: [operatorIdentity.uid],
+    gateAccountCeiling: PROVISION_CEILING,
+    gateHomeDirectory: `${NEW_ACCOUNT_HOME_BASE}/${deriveGateAccountName(agentId)}`,
+    reloadPolicy,
+    publishProvisionedRules: async (routing) => {
+      const published = await publishProvisionedEgressRules({
+        fortressPath: wallFortressPath,
+        endpointSet: HERMES_ENDPOINT_SET,
+        reloadPolicy,
+        routing,
+      });
+      return published.ok
+        ? { ok: true as const, ruleIds: published.ruleIds }
+        : { ok: false as const, error: published.error };
+    },
+    audit: async (operation, details) => {
+      try {
+        const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+        await appendCastleWallCliAuditBestEffort(
+          operation,
+          { source: "sanctuary-protect-repair", ...details },
+          wallFortressPath,
+          process.env,
+          process.stderr,
+        );
+      } catch {
+        // Best-effort by contract.
+      }
+    },
+    print,
+    accountOps,
+  };
+  const outcome = await runEgressGateRepair(
+    { agentUid, isTty: options.isTty, overrideTransientPfRules: options.overrideTransientPfRules },
+    createRepairExclusiveEgressOps(wiring),
+  );
+  switch (outcome.kind) {
+    case "repaired":
+      print(`Exclusive-egress gate repaired: generation ${outcome.generationId} live; the agent harness was released.`);
+      return 0;
+    case "repaired-repark-failed":
+      print(
+        `Exclusive-egress gate repaired (generation ${outcome.generationId}) BUT the boot-state re-park failed ` +
+          `(${outcome.reparkError}); the next boot could auto-start the agent before the gate re-arms. Re-run the repair.`,
+      );
+      return 2;
+    case "refused-foreign-transient-rules":
+    case "refused-non-tty-override":
+    case "refused-diff-unavailable":
+      // The repair sequence already printed the specific refusal + guidance.
+      return 2;
+    case "repair-failed":
+      // BLOCKER-3 honesty, tightened by fix-round-2 HIGH-2: claim PARKED only
+      // when the FULL persistent parked posture was verified (not running +
+      // launchd job disabled + hold file absent + parked plist); otherwise
+      // enumerate exactly which checks failed -- the agent may be startable
+      // now or at the next boot (stale release material).
+      print(
+        `Exclusive-egress repair FAILED at ${outcome.stage}: ${outcome.reason}. ` +
+          (outcome.parkedStateVerified
+            ? "The agent harness remains PARKED (verified: not running, job disabled, hold file absent, " +
+              "parked plist on disk; fail-closed). Investigate, then re-run the repair."
+            : "WARNING: the agent's parked state could NOT be fully verified -- it may be startable now " +
+              `or at the next boot. Failed checks: ${outcome.parkedStateProblems.join("; ") || "no probe detail"}. ` +
+              "Investigate immediately."),
+      );
+      return 2;
+  }
 }

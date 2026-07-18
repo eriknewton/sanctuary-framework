@@ -1,0 +1,422 @@
+/**
+ * The exclusive-egress gate DAEMON (Unified Protect Slice 5 S5-6): the
+ * long-lived LaunchDaemon that runs `startExclusiveEgressGate` under the
+ * dedicated `sanctuary-gate-<agentId>` service uid, with the S5-3 TCB wiring
+ * the design mandates -- fail-closed client auth (generation-bound bearer +
+ * peer uid), the root liveness oracle's signed-freshness-token probe
+ * (constructed via `createOracleLivenessProbe`; `singleFlightLiveness` is
+ * OMITTED, so the gate's construction guard auto-disables single-flight on
+ * the coalescing-forbidden oracle probe), and a real `peerRunner` (without
+ * one every CONNECT would deny, fail-closed but useless).
+ *
+ * PROCESS SHAPE (design answer 1): one daemon per confined agent, label
+ * `ai.sanctuaryprotocol.egress-gate.<agent_uid>`, `UserName` = the gate
+ * service account (NEVER root -- root would defeat the S5-0 gate-uid kernel
+ * bound; NEVER the agent -- kernel-denied), `KeepAlive` within its
+ * bootstrapped session. Lifecycle owned by the provision ops (installed
+ * during the exclusive bring-up, torn down in the same rollback / unprotect).
+ *
+ * REBIND SEMANTICS (S5-2 `resolveGateRestart`): the daemon reads the
+ * COMMITTED gate policy (`exclusive-egress-gate.json`, which carries the
+ * port + generation published at G4) and binds exactly that port. A bind
+ * failure EXITS non-zero: the gate REFUSES to serve rather than squat a
+ * different port (posture goes amber via the owner check + oracle; the root
+ * owner coordinates a full new generation). After a successful bind the
+ * daemon writes a RUNTIME STATE file (`/var/db/sanctuary/gate-runtime/
+ * <uid>/state.json`: port, pid, pid start-time, generation) that the root
+ * supervisor's owner check and the posture producer read. The per-uid
+ * subdir is PRE-CREATED and chowned to the gate uid by the root supervisor
+ * (`runtime-fs-plan.ts`, fix-round BLOCKER-1): the non-root gate daemon can
+ * write only inside its own subdir, never the root-owned parent.
+ *
+ * HONESTY BOUNDS: destination + per-action policy at this gate is
+ * USERSPACE-enforced; gate compromise = bypass of per-action destination
+ * policy, bounded to the gate uid's kernel-constrained endpoint set (S5-0
+ * two-principal model), not arbitrary WAN. Liveness is TTL-fresh (oracle
+ * token), not instantaneous. The composed fused flow is S5-DRILL-owed;
+ * nothing here advances a capability claim.
+ */
+
+import { readFile, mkdir, writeFile, rename, rm } from "node:fs/promises";
+import { createPublicKey, type KeyObject } from "node:crypto";
+import { isAbsolute, join } from "node:path";
+
+import type { AllowlistRule } from "../castle-wall/allowlist/schema.js";
+import { validateExclusiveEgressGatePolicy } from "../castle-wall/allowlist/gate-derivation.js";
+import {
+  startExclusiveEgressGate,
+  type ExclusiveEgressGateHandle,
+  type EgressGateEvent,
+} from "./gate-server.js";
+import { createOracleLivenessProbe, createFsLivenessTokenSource, GATE_LIVENESS_DIR } from "./liveness-oracle.js";
+import { createGateClientAuthenticator, type GateClientAuthenticator } from "./gate-client-auth.js";
+import { createFsGateAcceptSource, GATE_CRED_DIR } from "./gate-credential.js";
+import { createExecFilePeerRunner } from "./peer-identity.js";
+
+/**
+ * Root-owned runtime dir (0755 root, EXPLICIT chmod via `runtime-fs-plan.ts`).
+ * Root writes the world-readable per-uid CONFIG copies directly in it; each
+ * agent's gate daemon writes its runtime STATE inside its own pre-chowned
+ * per-uid subdir ({@link egressGateRuntimeUidDirPath}).
+ */
+export const EGRESS_GATE_RUNTIME_DIR = "/var/db/sanctuary/gate-runtime";
+
+/**
+ * Gate-readable CONFIG copies (root-written at G4). The fortress is
+ * operator-owned 0700, so the NON-ROOT gate uid cannot (and must not) read
+ * it; the root supervisor publishes exactly the two documents the gate
+ * needs -- the committed gate policy (+ generation) and the destination
+ * rules -- into the root-owned runtime dir as 0644 files. Nothing secret is
+ * in either (ports, uids, endpoint hosts); the bearer credential and oracle
+ * token stay in their own 0600 owner-bound files.
+ */
+export function egressGatePolicyConfigPath(agentUid: number, dir: string = EGRESS_GATE_RUNTIME_DIR): string {
+  return join(dir, `${agentUid}-policy.json`);
+}
+
+/** Gate-readable destination-rules copy path (see {@link egressGatePolicyConfigPath}). */
+export function egressGateRulesConfigPath(agentUid: number, dir: string = EGRESS_GATE_RUNTIME_DIR): string {
+  return join(dir, `${agentUid}-rules.json`);
+}
+
+/** The supervisor oracle PUBLIC key the gate pins (written by the root supervisor). */
+export const GATE_ORACLE_PUBLIC_KEY_PATH = `${GATE_LIVENESS_DIR}/supervisor-oracle-pub.pem`;
+
+/** Label prefix; one daemon per confined agent uid. */
+export const EGRESS_GATE_DAEMON_LABEL_PREFIX = "ai.sanctuaryprotocol.egress-gate";
+
+/** The per-agent gate daemon label. */
+export function egressGateDaemonLabel(agentUid: number): string {
+  if (!Number.isInteger(agentUid) || agentUid <= 0) {
+    throw new Error(`egress-gate daemon label requires a positive integer uid (got ${String(agentUid)})`);
+  }
+  return `${EGRESS_GATE_DAEMON_LABEL_PREFIX}.${agentUid}`;
+}
+
+/** The per-agent gate daemon plist path. */
+export function egressGateDaemonPlistPath(agentUid: number): string {
+  return `/Library/LaunchDaemons/${egressGateDaemonLabel(agentUid)}.plist`;
+}
+
+/**
+ * The per-uid runtime-state SUBDIR: owned by the GATE uid (root pre-creates +
+ * chowns it at arming time, `runtime-fs-plan.ts`), 0755 so root and the
+ * posture producer can read the state file the gate publishes inside it.
+ */
+export function egressGateRuntimeUidDirPath(agentUid: number, dir: string = EGRESS_GATE_RUNTIME_DIR): string {
+  if (!Number.isInteger(agentUid) || agentUid <= 0) {
+    throw new Error(`gate runtime-state path requires a positive integer uid (got ${String(agentUid)})`);
+  }
+  return join(dir, String(agentUid));
+}
+
+/** Runtime-state file path for one agent's gate (inside the gate-owned per-uid subdir). */
+export function egressGateRuntimeStatePath(agentUid: number, dir: string = EGRESS_GATE_RUNTIME_DIR): string {
+  return join(egressGateRuntimeUidDirPath(agentUid, dir), "state.json");
+}
+
+/** The gate daemon's published runtime state (root supervisor + posture read it). */
+export interface EgressGateRuntimeState {
+  agent_uid: number;
+  gate_port: number;
+  generation_id: number;
+  pid: number;
+  /** Best-effort process start token (`<pid>-<startEpochMs>`), for pid-reuse defense. */
+  pid_start: string;
+}
+
+/** Strict parse of a runtime-state document. Throws on any deviation (fail-closed). */
+export function parseEgressGateRuntimeState(text: string, path: string): EgressGateRuntimeState {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`gate runtime state at ${path} is not valid JSON: ${(err as Error).message}`, { cause: err });
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`gate runtime state at ${path} is not a JSON object`);
+  }
+  const r = parsed as Record<string, unknown>;
+  const int = (field: string, min: number, max = Number.MAX_SAFE_INTEGER): number => {
+    const v = r[field];
+    if (typeof v !== "number" || !Number.isSafeInteger(v) || v < min || v > max) {
+      throw new Error(`gate runtime state at ${path}: ${field} missing/invalid`);
+    }
+    return v;
+  };
+  const pidStart = r.pid_start;
+  if (typeof pidStart !== "string" || pidStart.length === 0) {
+    throw new Error(`gate runtime state at ${path}: pid_start missing/invalid`);
+  }
+  return {
+    agent_uid: int("agent_uid", 1),
+    gate_port: int("gate_port", 1, 65535),
+    generation_id: int("generation_id", 1),
+    pid: int("pid", 1),
+    pid_start: pidStart,
+  };
+}
+
+const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
+
+function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function assertNoControlChars(value: string, what: string): void {
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1F\x7F]/.test(value)) {
+    throw new Error(`${what} contains control characters; refusing to render plist.`);
+  }
+}
+
+/** Options for {@link renderEgressGateDaemonPlist}. */
+export interface EgressGateDaemonPlistOptions {
+  /** The confined agent uid this gate serves (names the label). */
+  agentUid: number;
+  /** The dedicated gate service account (NEVER root, NEVER the agent account). */
+  gateAccount: string;
+  /** Full argv of the gate daemon entrypoint (absolute program path first). */
+  programArguments: string[];
+  /** Absolute fortress path, rendered as SANCTUARY_STORAGE_PATH. */
+  fortressPath: string;
+  /** Absolute log directory. */
+  logDir?: string;
+}
+
+/**
+ * Render the gate daemon plist. `RunAtLoad=false` + `KeepAlive={Crashed:true}`
+ * deliberately: the ROOT SUPERVISOR sequences gate start inside the exclusive
+ * bring-up (owner-checked, generation-bound); an auto-started gate at boot
+ * before the pf anchor re-arm would just refuse (oracle token absent), but
+ * not starting it at load keeps the boot ordering single-owner (the boot
+ * daemon bootstraps it during the release sequence).
+ */
+export function renderEgressGateDaemonPlist(options: EgressGateDaemonPlistOptions): string {
+  const label = egressGateDaemonLabel(options.agentUid);
+  if (!SAFE_ACCOUNT_RE.test(options.gateAccount)) {
+    throw new Error(`gate account name is not a safe service-account name (got ${JSON.stringify(options.gateAccount)})`);
+  }
+  if (["root", "_root", "daemon", "wheel"].includes(options.gateAccount)) {
+    throw new Error(`refusing to render an egress-gate daemon running as "${options.gateAccount}" (the gate is TCB but must never hold root)`);
+  }
+  if (options.programArguments.length === 0 || !isAbsolute(options.programArguments[0]!)) {
+    throw new Error("gate daemon programArguments must be non-empty with an absolute program path first");
+  }
+  for (const arg of options.programArguments) {
+    assertNoControlChars(arg, "gate daemon program argument");
+  }
+  if (!isAbsolute(options.fortressPath)) {
+    throw new Error(`fortress path must be absolute (got ${options.fortressPath})`);
+  }
+  assertNoControlChars(options.fortressPath, "fortress path");
+  const logDir = options.logDir;
+  if (logDir !== undefined && !isAbsolute(logDir)) {
+    throw new Error(`log dir must be absolute (got ${logDir})`);
+  }
+  const argsXml = options.programArguments
+    .map((a) => `\t\t<string>${xmlEscape(a)}</string>`)
+    .join("\n");
+  const logXml =
+    logDir !== undefined
+      ? `\t<key>StandardOutPath</key>\n\t<string>${xmlEscape(join(logDir, `egress-gate-${options.agentUid}.out.log`))}</string>\n` +
+        `\t<key>StandardErrorPath</key>\n\t<string>${xmlEscape(join(logDir, `egress-gate-${options.agentUid}.err.log`))}</string>\n`
+      : "";
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>Label</key>
+\t<string>${xmlEscape(label)}</string>
+\t<key>UserName</key>
+\t<string>${xmlEscape(options.gateAccount)}</string>
+\t<key>ProgramArguments</key>
+\t<array>
+${argsXml}
+\t</array>
+\t<key>EnvironmentVariables</key>
+\t<dict>
+\t\t<key>SANCTUARY_STORAGE_PATH</key>
+\t\t<string>${xmlEscape(options.fortressPath)}</string>
+\t</dict>
+${logXml}\t<key>RunAtLoad</key>
+\t<false/>
+\t<key>KeepAlive</key>
+\t<dict>
+\t\t<key>Crashed</key>
+\t\t<true/>
+\t</dict>
+</dict>
+</plist>
+`;
+}
+
+/** Injected dependencies for {@link runEgressGateDaemon} (tests are host-free). */
+export interface EgressGateDaemonDeps {
+  /** The confined agent uid this daemon serves. */
+  agentUid: number;
+  /** Load the committed gate policy JSON text (default: the gate-readable runtime copy). */
+  loadGatePolicy?: () => Promise<string>;
+  /** Load the destination allow rules the gate enforces (default: the gate-readable runtime copy). */
+  loadRules?: () => Promise<AllowlistRule[]>;
+  /** Load the pinned supervisor-oracle PUBLIC key (default: PEM at {@link GATE_ORACLE_PUBLIC_KEY_PATH}). */
+  loadOraclePublicKey?: () => Promise<KeyObject>;
+  /** The client authenticator (default: FS accept-record authority). */
+  clientAuth?: GateClientAuthenticator;
+  /** Runtime-state dir override (tests). */
+  runtimeDir?: string;
+  /** Liveness token dir override (tests). */
+  livenessDir?: string;
+  /** Credential accept-record dir override (tests). */
+  credDir?: string;
+  /** Event sink (default: stderr lines; production also ships the unified log). */
+  onEvent?: (event: EgressGateEvent) => void;
+}
+
+/** A running gate daemon handle (the CLI verb holds it until SIGTERM). */
+export interface EgressGateDaemonHandle {
+  gate: ExclusiveEgressGateHandle;
+  generationId: number;
+  runtimeStatePath: string;
+  close(): Promise<void>;
+}
+
+/**
+ * Start the gate for the COMMITTED generation: load + validate the gate
+ * policy (port + generation, published at G4), load the destination rules,
+ * pin the oracle public key, construct the fail-closed client authenticator
+ * and the oracle liveness probe (binding = {agent_uid, gate_port} from the
+ * policy, generation from the policy file -- so a stale token for another
+ * generation reads not-live), start the gate on EXACTLY the committed port
+ * (a bind failure throws; the caller exits non-zero, never squats another
+ * port), then publish the runtime state file. `singleFlightLiveness` is
+ * OMITTED by contract (the oracle probe self-declares coalescing:"forbidden";
+ * the gate constructor auto-disables single-flight).
+ */
+export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<EgressGateDaemonHandle> {
+  const configDir = deps.runtimeDir ?? EGRESS_GATE_RUNTIME_DIR;
+  const loadPolicy =
+    deps.loadGatePolicy ??
+    (async (): Promise<string> => readFile(egressGatePolicyConfigPath(deps.agentUid, configDir), "utf8"));
+  const policyText = await loadPolicy();
+  let parsedPolicy: unknown;
+  try {
+    parsedPolicy = JSON.parse(policyText);
+  } catch (err) {
+    throw new Error(`egress-gate daemon: gate policy is not valid JSON: ${(err as Error).message}`, { cause: err });
+  }
+  const policy = validateExclusiveEgressGatePolicy(parsedPolicy);
+  if (policy === null) {
+    throw new Error("egress-gate daemon: gate policy is structurally invalid; refusing to serve");
+  }
+  if (policy.agent_uid !== deps.agentUid) {
+    throw new Error(
+      `egress-gate daemon: gate policy names agent_uid ${policy.agent_uid} but this daemon serves uid ${deps.agentUid}; refusing (cross-principal)`,
+    );
+  }
+  // The published policy carries the committed generation (G4). Absent =
+  // legacy/uncommitted policy: refuse (the oracle token is generation-bound;
+  // an unbound gate could never verify liveness anyway).
+  const generationId = (parsedPolicy as { generation_id?: unknown }).generation_id;
+  if (typeof generationId !== "number" || !Number.isSafeInteger(generationId) || generationId <= 0) {
+    throw new Error("egress-gate daemon: gate policy carries no committed generation_id; refusing to serve");
+  }
+
+  const loadRules =
+    deps.loadRules ??
+    (async (): Promise<AllowlistRule[]> => {
+      const text = await readFile(egressGateRulesConfigPath(deps.agentUid, configDir), "utf8");
+      const parsed = JSON.parse(text) as unknown;
+      if (!Array.isArray(parsed)) {
+        throw new Error("egress-gate daemon: rules config is not a JSON array; refusing to serve");
+      }
+      return parsed as AllowlistRule[];
+    });
+  const rules = await loadRules();
+
+  const loadOraclePub =
+    deps.loadOraclePublicKey ??
+    (async (): Promise<KeyObject> => {
+      const pem = await readFile(GATE_ORACLE_PUBLIC_KEY_PATH, "utf8");
+      return createPublicKey(pem);
+    });
+  const oraclePublicKey = await loadOraclePub();
+
+  // Fail-closed client auth (S5-3): the accept record is generation-bound on
+  // disk (the root supervisor rotates it at each G5), so the authenticator
+  // reads the CURRENT accept-state per CONNECT; a stale-generation credential
+  // denies without a gate restart.
+  const clientAuth =
+    deps.clientAuth ??
+    createGateClientAuthenticator({
+      agentUid: policy.agent_uid,
+      acceptSource: createFsGateAcceptSource(deps.credDir ?? GATE_CRED_DIR),
+    });
+
+  const livenessProbe = createOracleLivenessProbe({
+    source: createFsLivenessTokenSource(deps.livenessDir ?? GATE_LIVENESS_DIR),
+    publicKey: oraclePublicKey,
+    binding: { agentUid: policy.agent_uid, gatePort: policy.gate_port, generationId },
+  });
+
+  const onEvent =
+    deps.onEvent ??
+    ((event: EgressGateEvent): void => {
+      process.stderr.write(`[egress-gate] ${JSON.stringify(event)}\n`);
+    });
+
+  // The S5-6 wiring contract: oracle probe + peerRunner + clientAuth, and
+  // singleFlightLiveness OMITTED (the construction guard auto-disables it for
+  // the coalescing-forbidden oracle probe).
+  const gate = await startExclusiveEgressGate({
+    policy,
+    rules,
+    livenessProbe,
+    peerRunner: createExecFilePeerRunner(),
+    clientAuth,
+    onEvent,
+  });
+
+  const runtimeDir = deps.runtimeDir ?? EGRESS_GATE_RUNTIME_DIR;
+  const runtimeStatePath = egressGateRuntimeStatePath(deps.agentUid, runtimeDir);
+  const state: EgressGateRuntimeState = {
+    agent_uid: policy.agent_uid,
+    gate_port: gate.port,
+    generation_id: generationId,
+    pid: process.pid,
+    pid_start: `${process.pid}-${Math.round(Date.now() - process.uptime() * 1000)}`,
+  };
+  // The per-uid subdir is root-pre-created and chowned to THIS gate uid at
+  // arming time (`runtime-fs-plan.ts`). The mkdir here only serves dir-
+  // override tests / self-healing when the subdir already belongs to us; a
+  // failure to have a writable dir surfaces LOUDLY below (the daemon exits
+  // non-zero rather than serving without a readable runtime state).
+  const uidDir = egressGateRuntimeUidDirPath(deps.agentUid, runtimeDir);
+  try {
+    await mkdir(uidDir, { recursive: true });
+  } catch (err) {
+    throw new Error(
+      `egress-gate daemon: runtime dir ${uidDir} is missing and could not be created ` +
+        `(${(err as Error).message}); the root supervisor pre-provisions it at arming time -- refusing to serve`,
+      { cause: err },
+    );
+  }
+  const tmp = `${runtimeStatePath}.tmp-${process.pid}`;
+  await writeFile(tmp, JSON.stringify(state), { mode: 0o644 });
+  await rename(tmp, runtimeStatePath);
+
+  return {
+    gate,
+    generationId,
+    runtimeStatePath,
+    async close(): Promise<void> {
+      await gate.close();
+      await rm(runtimeStatePath, { force: true }).catch(() => undefined);
+    },
+  };
+}
