@@ -399,6 +399,76 @@ export class PfAnchorRegistry {
   }
 
   /**
+   * Read the committed set with PER-ENTRY QUARANTINE (fix-round-2 MED-6): one
+   * malformed committed entry must not starve the boot daemon's oracle
+   * refresh loop for every OTHER agent -- with the wholesale-throwing
+   * {@link list}, a single bad entry made the refresh return before
+   * refreshing anyone and every gate denied within one token TTL.
+   *
+   * SEMANTICS (fail-closed direction preserved):
+   *  - STRUCTURAL corruption (unparseable JSON, wrong version, `committed`
+   *    not an array) still THROWS wholesale: there is no trustworthy entry to
+   *    salvage from a file whose shape is unknown.
+   *  - A malformed or duplicate ENTRY is returned as a `quarantined` finding
+   *    (individually identified by index + reason) while the remaining valid
+   *    entries stay usable. The quarantined entry's own agent gets NO
+   *    refresh, so ITS gate keeps denying (fail-closed for the bad entry,
+   *    live for the good ones).
+   *  - Any quarantined entry forces `dirty` (repair owed): posture must
+   *    never read green over a quarantine.
+   *
+   * READ-ONLY consumers only (the refresh loop / boot supervisor). Every
+   * MUTATION still normalizes wholesale fail-closed via `normalizeState`:
+   * never mutate from a partially-valid baseline.
+   */
+  async listQuarantined(): Promise<{
+    entries: PfAnchorRegistryEntry[];
+    dirty: boolean;
+    quarantined: { index: number; reason: string }[];
+  }> {
+    const loaded = await this.store.load();
+    if (loaded === null) {
+      return { entries: [], dirty: false, quarantined: [] };
+    }
+    if (typeof loaded !== "object") {
+      throw new PfAnchorRegistryStateError("not an object");
+    }
+    if (loaded.version !== PF_ANCHOR_REGISTRY_STATE_VERSION) {
+      throw new PfAnchorRegistryStateError(`unknown state version ${String(loaded.version)}`);
+    }
+    if (!Array.isArray(loaded.committed)) {
+      throw new PfAnchorRegistryStateError("committed is not an array");
+    }
+    const entries: PfAnchorRegistryEntry[] = [];
+    const quarantined: { index: number; reason: string }[] = [];
+    const seen = new Set<number>();
+    loaded.committed.forEach((raw, index) => {
+      const entry = validateEntry(raw);
+      if (entry === null) {
+        quarantined.push({
+          index,
+          reason: "malformed committed entry (failed the fail-closed entry validation)",
+        });
+        return;
+      }
+      if (seen.has(entry.agent_uid)) {
+        quarantined.push({ index, reason: `duplicate committed agent_uid ${entry.agent_uid}` });
+        return;
+      }
+      seen.add(entry.agent_uid);
+      entries.push(entry);
+    });
+    const enableTokenValid =
+      typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token);
+    const dirty =
+      loaded.dirty === true ||
+      loaded.pending !== undefined ||
+      quarantined.length > 0 ||
+      (entries.length > 0 && !enableTokenValid);
+    return { entries, dirty, quarantined };
+  }
+
+  /**
    * Add a confined uid, or update the gate_port/fortress of an existing one.
    * Re-renders + re-arms the full union and verifies exact-union liveness for
    * every remaining uid; a second uid never drops the first's rules.

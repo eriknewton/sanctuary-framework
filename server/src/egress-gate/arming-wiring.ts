@@ -179,26 +179,28 @@ export async function ensureSupervisorOracleKeys(): Promise<{
     const privateKey = createPrivateKey(pem);
     const publicKey = createPublicKey({ key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(), format: "pem" });
     // Re-assert the public half (a missing/garbled pub file must self-heal:
-    // the gate pins THIS file).
-    await writeFile(
+    // the gate pins THIS file). ATOMIC tmp+rename (fix-round-2 LOW-8): the
+    // running gate daemon re-reads this pinned key; an in-place write leaves
+    // a partial-PEM window in which every gate verify fails.
+    await atomicRootWrite(
       GATE_ORACLE_PUBLIC_KEY_PATH,
-      publicKey.export({ type: "spki", format: "pem" }),
-      { mode: 0o644 },
+      publicKey.export({ type: "spki", format: "pem" }).toString(),
+      0o644,
     );
     return { privateKey, publicKey };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
   const pair = generateKeyPairSync("ed25519");
-  await writeFile(
+  await atomicRootWrite(
     GATE_ORACLE_PRIVATE_KEY_PATH,
-    pair.privateKey.export({ type: "pkcs8", format: "pem" }),
-    { mode: 0o600 },
+    pair.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    0o600,
   );
-  await writeFile(
+  await atomicRootWrite(
     GATE_ORACLE_PUBLIC_KEY_PATH,
-    pair.publicKey.export({ type: "spki", format: "pem" }),
-    { mode: 0o644 },
+    pair.publicKey.export({ type: "spki", format: "pem" }).toString(),
+    0o644,
   );
   return { privateKey: pair.privateKey, publicKey: pair.publicKey };
 }
@@ -225,15 +227,27 @@ export function createProductionOracle(privateKey: KeyObject, gateUid: number): 
 export const PID_START_TOLERANCE_MS = 10_000;
 
 /**
+ * Discriminated port-owner verdict (fix-round-2 MED-4): a failed owner check
+ * names WHICH check failed (listener/pid/uid/pid_start token/lstart parse)
+ * so a persistent park/degrade on a real host is diagnosable from the log,
+ * not a bare boolean.
+ */
+export type PortOwnerVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
  * lsof-backed loopback TCP port-owner check (TCP-only by construction: the
  * whole exclusive-egress stack is 127.0.0.1 TCP). The listener on `port`
  * must be the expected pid, and -- when supplied -- the expected uid and the
  * expected `pid_start` token (`<pid>-<startEpochMs>`, the gate runtime
  * state's pid-reuse defense, fix-round finding: the stored token was
  * previously never enforced). The start-time check reads the kernel's
- * process start via `ps -p <pid> -o lstart=` and requires it within
+ * process start via `ps -p <pid> -o lstart=` -- ALWAYS under `LC_ALL=C`
+ * (fix-round-2 MED-4: sudo inherits the operator's locale, and a
+ * French/German `lstart` string gives `Date.parse` NaN, persistently
+ * bricking the owner check on non-English hosts) -- and requires it within
  * {@link PID_START_TOLERANCE_MS} of the token's epoch. Fail-closed: any
- * lookup/parse failure or mismatch is NOT owner-verified.
+ * lookup/parse failure or mismatch is NOT owner-verified, with the failing
+ * check named in the verdict.
  */
 export async function verifyLoopbackTcpPortOwner(input: {
   port: number;
@@ -242,7 +256,7 @@ export async function verifyLoopbackTcpPortOwner(input: {
   /** The runtime state's `pid_start` token (`<pid>-<startEpochMs>`). */
   expectedPidStart?: string;
   execFileFn?: typeof execFileAsync;
-}): Promise<boolean> {
+}): Promise<PortOwnerVerdict> {
   const run = input.execFileFn ?? execFileAsync;
   try {
     const { stdout } = await run("lsof", [
@@ -258,24 +272,55 @@ export async function verifyLoopbackTcpPortOwner(input: {
       if (line.startsWith("u")) uid = Number(line.slice(1));
       if (pid !== undefined && uid !== undefined) break;
     }
-    if (pid !== input.expectedPid) return false;
-    if (input.expectedUid !== undefined && uid !== input.expectedUid) return false;
+    if (pid !== input.expectedPid) {
+      return {
+        ok: false,
+        reason: `pid check failed: listener pid ${pid === undefined ? "absent" : pid} != expected pid ${input.expectedPid}`,
+      };
+    }
+    if (input.expectedUid !== undefined && uid !== input.expectedUid) {
+      return {
+        ok: false,
+        reason: `uid check failed: listener uid ${uid === undefined ? "absent" : uid} != expected uid ${input.expectedUid}`,
+      };
+    }
     if (input.expectedPidStart !== undefined) {
       const m = /^(\d+)-(\d+)$/.exec(input.expectedPidStart);
-      if (m === null) return false; // malformed token: never owner-verified
-      if (Number(m[1]) !== input.expectedPid) return false; // token names another pid
+      if (m === null) {
+        // Malformed token: never owner-verified.
+        return { ok: false, reason: `pid_start token check failed: token ${JSON.stringify(input.expectedPidStart)} is malformed` };
+      }
+      if (Number(m[1]) !== input.expectedPid) {
+        return { ok: false, reason: `pid_start token check failed: token names pid ${m[1]}, expected pid ${input.expectedPid}` };
+      }
       const expectedStartMs = Number(m[2]);
-      const { stdout: lstartOut } = await run("ps", ["-p", String(input.expectedPid), "-o", "lstart="]);
+      // LC_ALL=C pins the lstart format Date.parse understands (MED-4).
+      const { stdout: lstartOut } = await run(
+        "ps",
+        ["-p", String(input.expectedPid), "-o", "lstart="],
+        { env: { ...process.env, LC_ALL: "C" } },
+      );
       const lstart = lstartOut.trim();
-      if (lstart.length === 0) return false;
+      if (lstart.length === 0) {
+        return { ok: false, reason: `pid_start check failed: ps returned no start time for pid ${input.expectedPid} (process gone?)` };
+      }
       const actualStartMs = Date.parse(lstart);
-      if (!Number.isFinite(actualStartMs)) return false;
-      if (Math.abs(actualStartMs - expectedStartMs) > PID_START_TOLERANCE_MS) return false;
+      if (!Number.isFinite(actualStartMs)) {
+        return { ok: false, reason: `pid_start-parse check failed: ps lstart ${JSON.stringify(lstart)} is not parseable` };
+      }
+      if (Math.abs(actualStartMs - expectedStartMs) > PID_START_TOLERANCE_MS) {
+        return {
+          ok: false,
+          reason:
+            `pid_start check failed: kernel start time differs from the token by ` +
+            `${Math.abs(actualStartMs - expectedStartMs)}ms (> ${PID_START_TOLERANCE_MS}ms tolerance; possible pid reuse)`,
+        };
+      }
     }
-    return true;
-  } catch {
+    return { ok: true };
+  } catch (err) {
     // No listener / lsof or ps failure: not owner-verified (fail-closed).
-    return false;
+    return { ok: false, reason: `listener lookup failed: ${(err as Error).message}` };
   }
 }
 
@@ -391,7 +436,7 @@ async function productionBringUp(
     // (see bindEphemeralGatePort); the authoritative pid_start enforcement
     // applies to the GATE DAEMON's runtime state below and in verifyGate.
     verifyOwner: async ({ port, pid }) =>
-      verifyLoopbackTcpPortOwner({ port, expectedPid: pid }),
+      (await verifyLoopbackTcpPortOwner({ port, expectedPid: pid })).ok,
     registry: {
       armEntry: async (entry) => {
         await registry.addOrUpdate({
@@ -514,16 +559,16 @@ async function productionBringUp(
     throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
   }
   const runtime = await waitForGateRuntime(input.agentUid, committed.generation_id, committed.gate_port);
-  const ownerOk = await verifyLoopbackTcpPortOwner({
+  const owner = await verifyLoopbackTcpPortOwner({
     port: committed.gate_port,
     expectedPid: runtime.pid,
     expectedUid: state.gateUid,
     expectedPidStart: runtime.pid_start,
   });
-  if (!ownerOk) {
+  if (!owner.ok) {
     throw new Error(
       `gate daemon owner check failed: the listener on port ${committed.gate_port} is not the gate ` +
-        `daemon pid ${runtime.pid} under uid ${state.gateUid} (refusing to proceed toward release)`,
+        `daemon pid ${runtime.pid} under uid ${state.gateUid} (${owner.reason}; refusing to proceed toward release)`,
     );
   }
   // First oracle refresh: publish the signed freshness token so the gate's
@@ -651,17 +696,26 @@ export function createProductionReleaseBarrierOps(input: {
     await writeFile(plan.plistPath, plan.plistContent, { mode: 0o644 });
   }
 
-  async function readCommitted(): Promise<CommittedGenerationIdentity | null> {
-    const { entries, dirty } = await registry.list();
-    const entry = entries.find((e) => e.agent_uid === input.agentUid) ?? null;
+  // Resolve the committed identity from ONE registry listing (fix-round-2
+  // LOW-7: readCommitted + a second registry.list() in verifyGate was a
+  // read/re-read TOCTOU with a non-null assertion on the re-read).
+  async function readCommittedFrom(listed: {
+    entries: { agent_uid: number; gate_port: number; generation_id?: number; tombstone?: boolean }[];
+    dirty: boolean;
+  }): Promise<CommittedGenerationIdentity | null> {
+    const entry = listed.entries.find((e) => e.agent_uid === input.agentUid) ?? null;
     const stagingRecord = await staging.load(input.agentUid);
     const committed = resolveCommittedGeneration({
       entry,
       stagingRecordPresent: stagingRecord !== null,
-      registryDirty: dirty,
+      registryDirty: listed.dirty,
     });
     if (committed.committedGenerationId === undefined || entry === null) return null;
     return { generation_id: committed.committedGenerationId, agent_uid: input.agentUid };
+  }
+
+  async function readCommitted(): Promise<CommittedGenerationIdentity | null> {
+    return readCommittedFrom(await registry.list());
   }
 
   return {
@@ -721,12 +775,14 @@ export function createProductionReleaseBarrierOps(input: {
       { ok: true; observed: CommittedGenerationIdentity } | { ok: false; reasons: string[] }
     > {
       const reasons: string[] = [];
-      const committed = await readCommitted();
-      if (committed === null) {
+      // ONE registry snapshot for the whole verify (fix-round-2 LOW-7).
+      const listed = await registry.list();
+      const { dirty } = listed;
+      const entry = listed.entries.find((e) => e.agent_uid === input.agentUid) ?? null;
+      const committed = await readCommittedFrom(listed);
+      if (committed === null || entry === null) {
         return { ok: false, reasons: ["no committed generation (registry empty/dirty/staging in flight)"] };
       }
-      const { entries, dirty } = await registry.list();
-      const entry = entries.find((e) => e.agent_uid === input.agentUid)!;
       // Gate runtime + owner.
       let runtime: EgressGateRuntimeState;
       try {
@@ -744,14 +800,14 @@ export function createProductionReleaseBarrierOps(input: {
       });
       if (!match.serve) reasons.push(...match.reasons);
       if (dirty) reasons.push("registry is dirty (needs repair)");
-      const ownerOk = await verifyLoopbackTcpPortOwner({
+      const owner = await verifyLoopbackTcpPortOwner({
         port: entry.gate_port,
         expectedPid: runtime.pid,
         expectedUid: input.gateUid,
         expectedPidStart: runtime.pid_start,
       });
-      if (!ownerOk) {
-        reasons.push(`gate port ${entry.gate_port} listener is not the gate daemon (owner check failed)`);
+      if (!owner.ok) {
+        reasons.push(`gate port ${entry.gate_port} listener is not the gate daemon (${owner.reason})`);
       }
       // Fresh oracle probe: the pf union must be LIVE right now (and this
       // publishes/refreshes the signed token the gate verifies per-CONNECT).
@@ -972,14 +1028,180 @@ export async function restoreCoarseCompositionProduction(
   });
 }
 
+/** What the persistent-park helpers need to know about the agent. */
+export interface PersistentParkContext {
+  agentUid: number;
+  agentAccount: string;
+  harnessArgv: string[];
+  fortressPath: string;
+  harnessLogDir: string;
+}
+
+/** TEST-ONLY dep seams for the persistent-park helpers; production omits. */
+export interface PersistentParkDeps {
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  writeFileFn?: (path: string, content: string, mode: number) => Promise<void>;
+  removeFileFn?: (path: string) => Promise<void>;
+  readFileFn?: (path: string) => Promise<string>;
+  sleepMs?: (ms: number) => Promise<void>;
+}
+
 /**
- * Repair ops (`--repair-egress-gate`): drift guard + verified harness park
- * (fix-round BLOCKER-3) + recover + bring-up + release.
+ * Check launchd's PERSISTENT override database for the harness job's
+ * disabled state (`launchctl print-disabled system`). A `launchctl disable`
+ * whose override write silently did not take effect leaves the job
+ * bootable at the next boot, so "disabled" must be read back, not assumed
+ * (fix-round-2 HIGH-2). Fail-closed: an unreadable override db or an absent
+ * / enabled entry is NOT disabled-verified.
+ */
+export async function verifyHarnessJobDisabled(
+  runLaunchctlFn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }> = runLaunchctl,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const r = await runLaunchctlFn(["print-disabled", "system"]);
+  if (r.code !== 0) {
+    return { ok: false, reason: `launchctl print-disabled system exited ${r.code}: ${r.stderr.trim()}` };
+  }
+  // macOS prints either `"<label>" => disabled` (newer) or `"<label>" => true`.
+  const label = AGENT_HARNESS_DAEMON_LABEL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`"${label}"\\s*=>\\s*(disabled|true)\\b`).test(r.stdout)) {
+    return { ok: true };
+  }
+  return {
+    ok: false,
+    reason: `launchd's override database does not show ${AGENT_HARNESS_DAEMON_LABEL} disabled (the job can boot at next reboot)`,
+  };
+}
+
+/**
+ * Verify the FULL persistent parked posture for the harness (fix-round-2
+ * HIGH-2): (a) the job has no running pid, (b) the job is disabled in
+ * launchd's persistent override db, (c) the per-uid hold file is ABSENT,
+ * and (d) the on-disk plist is the PARKED barrier form (or absent -- no
+ * unit at all is unbootable). A stopped-but-releasable harness (enable
+ * override on, released plist + hold file still on disk) fails this check:
+ * it can boot at the next reboot. Never throws; every failed check is one
+ * enumerated problem.
+ */
+export async function verifyHarnessParkedPersistent(
+  ctx: PersistentParkContext,
+  deps: PersistentParkDeps = {},
+): Promise<{ ok: true } | { ok: false; problems: string[] }> {
+  const launchctlFn = deps.runLaunchctlFn ?? runLaunchctl;
+  const readFileFn = deps.readFileFn ?? (async (path: string): Promise<string> => readFile(path, "utf8"));
+  const harnessOps: HarnessDaemonOps = {
+    ...realHarnessOps(),
+    runLaunchctl: launchctlFn,
+    ...(deps.sleepMs !== undefined ? { sleepMs: deps.sleepMs } : {}),
+  };
+  const problems: string[] = [];
+  // (a) Not running.
+  try {
+    const status = await agentHarnessDaemonStatus(harnessOps);
+    if (!status.known) {
+      problems.push("launchctl did not return a trustworthy harness status");
+    } else if (status.running) {
+      problems.push(`the harness job reports RUNNING (pid ${status.pid ?? "unknown"})`);
+    }
+  } catch (err) {
+    problems.push(`status probe errored: ${(err as Error).message}`);
+  }
+  // (b) Persistently disabled.
+  const disabled = await verifyHarnessJobDisabled(launchctlFn);
+  if (!disabled.ok) problems.push(disabled.reason);
+  // (c) Hold file absent (stale release material).
+  const holdPath = holdFilePathForUid(ctx.agentUid);
+  try {
+    await readFileFn(holdPath);
+    problems.push(`the release hold file ${holdPath} is still present (stale release material)`);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      problems.push(`could not check the release hold file ${holdPath}: ${(err as Error).message}`);
+    }
+  }
+  // (d) Parked plist form (a released plist embeds a real generation id the
+  // wrapper would accept; an ABSENT plist is unbootable, which is fine).
+  const plan = planParkedHarnessInstall({
+    agentAccount: ctx.agentAccount,
+    agentUid: ctx.agentUid,
+    harnessArgv: ctx.harnessArgv,
+    fortressPath: ctx.fortressPath,
+    logDir: ctx.harnessLogDir,
+  });
+  try {
+    const onDisk = await readFileFn(plan.plistPath);
+    if (onDisk !== plan.plistContent) {
+      problems.push(
+        `the harness plist ${plan.plistPath} is not the parked barrier form (possible released-plist residue)`,
+      );
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      problems.push(`could not check the harness plist ${plan.plistPath}: ${(err as Error).message}`);
+    }
+  }
+  return problems.length === 0 ? { ok: true } : { ok: false, problems };
+}
+
+/**
+ * PARK the harness into the FULL persistent parked state (fix-round-2
+ * HIGH-2; supersedes the fix-round BLOCKER-3 bootout+disable-only park):
+ * bootout (not-running is success) + persistent disable + hold-file removal
+ * + parked-plist restore, EACH result captured, then verify the whole
+ * posture via {@link verifyHarnessParkedPersistent}. Throws with every
+ * failed step enumerated unless the full parked state is verified -- a
+ * "parked" claim that leaves stale release material bootable at the next
+ * reboot was the exact reviewed defect.
+ */
+export async function parkHarnessPersistently(
+  ctx: PersistentParkContext,
+  deps: PersistentParkDeps = {},
+): Promise<void> {
+  const launchctlFn = deps.runLaunchctlFn ?? runLaunchctl;
+  const writeFileFn =
+    deps.writeFileFn ?? (async (path: string, content: string, mode: number): Promise<void> => writeFile(path, content, { mode }));
+  const removeFileFn = deps.removeFileFn ?? (async (path: string): Promise<void> => rm(path, { force: true }));
+  const problems: string[] = [];
+  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
+  }
+  const disable = await launchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (disable.code !== 0) {
+    problems.push(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
+  }
+  try {
+    await removeFileFn(holdFilePathForUid(ctx.agentUid));
+  } catch (err) {
+    problems.push(`hold-file removal failed: ${(err as Error).message}`);
+  }
+  try {
+    const plan = planParkedHarnessInstall({
+      agentAccount: ctx.agentAccount,
+      agentUid: ctx.agentUid,
+      harnessArgv: ctx.harnessArgv,
+      fortressPath: ctx.fortressPath,
+      logDir: ctx.harnessLogDir,
+    });
+    await writeFileFn(plan.plistPath, plan.plistContent, 0o644);
+  } catch (err) {
+    problems.push(`parked-plist restore failed: ${(err as Error).message}`);
+  }
+  const verified = await verifyHarnessParkedPersistent(ctx, deps);
+  if (!verified.ok) problems.push(...verified.problems);
+  if (problems.length > 0) {
+    throw new Error(`park not verified: ${problems.join("; ")}`);
+  }
+}
+
+/**
+ * Repair ops (`--repair-egress-gate`): drift guard + verified PERSISTENT
+ * harness park (fix-round BLOCKER-3 + fix-round-2 HIGH-2) + recover +
+ * bring-up + release.
  */
 export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput): {
   diffTransientPfRules(): Promise<{ foreign: string[] }>;
   parkHarness(): Promise<void>;
-  verifyHarnessStopped(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  verifyParkedPersistent(): Promise<{ ok: true } | { ok: false; problems: string[] }>;
   recoverGeneration(): Promise<void>;
   bringUpGeneration(): Promise<ExclusiveGenerationIdentity>;
   runReleaseSequence(committed: ExclusiveGenerationIdentity): Promise<ReleaseBarrierOutcome>;
@@ -987,49 +1209,26 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
   print(line: string): void;
 } {
   const install = createInstallExclusiveEgressOps(input);
-  const harnessOps = realHarnessOps();
-  async function verifyHarnessStopped(): Promise<{ ok: true } | { ok: false; reason: string }> {
-    try {
-      const status = await agentHarnessDaemonStatus(harnessOps);
-      if (!status.known) {
-        return { ok: false, reason: "launchctl did not return a trustworthy harness status" };
-      }
-      if (status.running) {
-        return { ok: false, reason: `the harness job reports RUNNING (pid ${status.pid ?? "unknown"})` };
-      }
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, reason: `status probe errored: ${(err as Error).message}` };
-    }
-  }
+  const parkCtx: PersistentParkContext = {
+    agentUid: input.agentUid,
+    agentAccount: input.agentAccount,
+    harnessArgv: input.harnessArgv,
+    fortressPath: input.fortressPath,
+    harnessLogDir: input.harnessLogDir,
+  };
   return {
     async diffTransientPfRules(): Promise<{ foreign: string[] }> {
       const diff = await diffTransientPfRules(createExecFilePfRunner());
       return { foreign: diff.foreign };
     },
-    async parkHarness(): Promise<void> {
-      // BLOCKER-3: bootout the possibly-live (coarse-degraded) harness, then
-      // persistently disable it, then VERIFY it is not running. Loud on any
-      // failure -- the repair refuses to mutate manifests under a live agent.
-      const bootout = await runLaunchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-      if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
-        throw new Error(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
-      }
-      const disable = await runLaunchctl(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-      if (disable.code !== 0) {
-        throw new Error(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
-      }
-      const stopped = await verifyHarnessStopped();
-      if (!stopped.ok) {
-        throw new Error(`park not verified: ${stopped.reason}`);
-      }
-    },
-    verifyHarnessStopped,
+    parkHarness: () => parkHarnessPersistently(parkCtx),
+    verifyParkedPersistent: () => verifyHarnessParkedPersistent(parkCtx),
     async recoverGeneration(): Promise<void> {
       const registry = createProductionAnchorRegistry();
       const coordinator = new GenerationCoordinator({
         bind: async () => bindEphemeralGatePort(),
-        verifyOwner: async ({ port, pid }) => verifyLoopbackTcpPortOwner({ port, expectedPid: pid }),
+        verifyOwner: async ({ port, pid }) =>
+          (await verifyLoopbackTcpPortOwner({ port, expectedPid: pid })).ok,
         registry: {
           armEntry: async (entry) => {
             await registry.addOrUpdate({
@@ -1102,12 +1301,29 @@ export type BootAgentResolution =
   | { kind: "unresolvable"; reason: string };
 
 /**
+ * A committed registry entry that failed per-entry validation and was
+ * QUARANTINED by the read layer (fix-round-2 MED-6): identified by its
+ * position so the operator can find and repair it; its agent's gate keeps
+ * denying (fail-closed) while other agents keep refreshing.
+ */
+export interface QuarantinedBootRegistryEntry {
+  index: number;
+  reason: string;
+}
+
+/** A boot-supervisor registry read: usable entries + quarantined findings. */
+export interface BootRegistryListing {
+  entries: BootRegistryEntry[];
+  quarantined: QuarantinedBootRegistryEntry[];
+}
+
+/**
  * TEST-ONLY seams for {@link startExclusiveEgressBootSupervisor}. Production
  * callers omit this entirely (real registry, launchctl, barrier, oracle).
  * Kept in one bag so the production call sites stay obviously seam-free.
  */
 export interface ExclusiveEgressBootSupervisorInternals {
-  listRegistryEntries?: () => Promise<BootRegistryEntry[]>;
+  listRegistryEntries?: () => Promise<BootRegistryListing>;
   ensureKeys?: () => Promise<{ privateKey: KeyObject; publicKey: KeyObject }>;
   runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
   runBarrier?: typeof runReleaseBarrierSequence;
@@ -1126,10 +1342,22 @@ export interface ExclusiveEgressBootSupervisorInternals {
  * resolved (fix-round H1: the pre-fix code reported a SYNTHETIC "parked"
  * with no ops run at all -- a crash-left enable override or hold file could
  * boot the harness while the log said PARKED). Without the harness argv /
- * account we cannot re-render the parked plist, but the three ops we CAN run
- * are sufficient to hold the park: bootout stops any live job, the disable
+ * account we cannot re-render the parked plist, but the ops we CAN run are
+ * sufficient to hold the park: bootout stops any live job, the disable
  * override keeps launchd from bootstrapping it at boot, and removing the
  * hold file makes the exec wrapper refuse even a mistakenly-started job.
+ *
+ * SHARED-LABEL GUARD (fix-round-2 HIGH-3): the harness LaunchDaemon label
+ * ({@link AGENT_HARNESS_DAEMON_LABEL}) is a HOST SINGLETON, so bootout /
+ * disable act on whichever uid's harness currently owns it. When ANOTHER
+ * registry entry resolved for release, running them here would kill that
+ * uid's just-released (or about-to-be-released) harness while the log blames
+ * this uid. In that case the caller passes `sharedLabelOpsAllowed: false`:
+ * only the strictly PER-UID op (this uid's hold-file removal) runs -- which
+ * alone holds this uid's park, because the exec wrapper refuses any start
+ * without a matching hold file -- and the skip is reported honestly
+ * (`sharedLabelOpsSkipped`, `jobDisabled: false`).
+ *
  * Every failure is reported loudly in the returned flags/errors -- never a
  * clean "parked" that nobody verified.
  */
@@ -1137,11 +1365,20 @@ async function reassertParkedWithoutContext(input: {
   agentUid: number;
   runLaunchctlFn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
   removeHoldFile: (agentUid: number) => Promise<void>;
-}): Promise<{ holdFileRemoved: boolean; jobDisabled: boolean; cleanupErrors: string[] }> {
+  /** False when another uid resolved for release on the shared label (HIGH-3). */
+  sharedLabelOpsAllowed: boolean;
+}): Promise<{
+  holdFileRemoved: boolean;
+  jobDisabled: boolean;
+  sharedLabelOpsSkipped: boolean;
+  cleanupErrors: string[];
+}> {
   const errors: string[] = [];
-  const bootout = await input.runLaunchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
-    errors.push(`bootout failed: launchctl exited ${bootout.code}: ${bootout.stderr.trim()}`);
+  if (input.sharedLabelOpsAllowed) {
+    const bootout = await input.runLaunchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+    if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+      errors.push(`bootout failed: launchctl exited ${bootout.code}: ${bootout.stderr.trim()}`);
+    }
   }
   let holdFileRemoved = false;
   try {
@@ -1151,13 +1388,20 @@ async function reassertParkedWithoutContext(input: {
     errors.push(`hold-file removal failed: ${(err as Error).message}`);
   }
   let jobDisabled = false;
-  const disable = await input.runLaunchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-  if (disable.code === 0) {
-    jobDisabled = true;
-  } else {
-    errors.push(`disable failed: launchctl exited ${disable.code}: ${disable.stderr.trim()}`);
+  if (input.sharedLabelOpsAllowed) {
+    const disable = await input.runLaunchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+    if (disable.code === 0) {
+      jobDisabled = true;
+    } else {
+      errors.push(`disable failed: launchctl exited ${disable.code}: ${disable.stderr.trim()}`);
+    }
   }
-  return { holdFileRemoved, jobDisabled, cleanupErrors: errors };
+  return {
+    holdFileRemoved,
+    jobDisabled,
+    sharedLabelOpsSkipped: !input.sharedLabelOpsAllowed,
+    cleanupErrors: errors,
+  };
 }
 
 /**
@@ -1184,9 +1428,19 @@ async function reassertParkedWithoutContext(input: {
  * Boot wiring detail: the harness argv + agent account are recovered from the
  * registry entry's fortress + the parked plist contract via the injected
  * resolver, because the boot daemon has no wrap context. An UNRESOLVABLE
- * agent (no marker, non-Hermes) is still parked FOR REAL via
+ * agent (no marker, non-Hermes, OR a THROWING resolver -- fix-round-2
+ * BLOCKER-1) is still parked FOR REAL via
  * {@link reassertParkedWithoutContext} -- never a synthetic unverified
  * "parked" report (fix-round H1).
+ *
+ * ORDERING (fix-round-2 HIGH-3): ALL entries are resolved BEFORE any side
+ * effect, every contextless re-park runs BEFORE any release, and the
+ * host-singleton harness label is booted out / disabled by a contextless
+ * re-park ONLY when no entry resolved for release -- a stale unresolvable
+ * entry must never kill another uid's just-released harness (with the log
+ * blaming the wrong uid). A failure BEFORE the re-park/release loop
+ * (supervisor oracle keys unavailable) yields the LOUD `park-not-verified`
+ * outcome per agent, never a synthetic PARKED.
  */
 export async function startExclusiveEgressBootSupervisor(input: {
   /** Resolve per-agent release context from the registry entry. */
@@ -1201,7 +1455,14 @@ export async function startExclusiveEgressBootSupervisor(input: {
   const internals = input.internals ?? {};
   const listEntries =
     internals.listRegistryEntries ??
-    (async (): Promise<BootRegistryEntry[]> => (await createProductionAnchorRegistry().list()).entries);
+    (async (): Promise<BootRegistryListing> => {
+      // Per-entry quarantine (fix-round-2 MED-6): one malformed committed
+      // entry must not stop the boot release / oracle refresh for every
+      // OTHER agent (a wholesale-throwing read was a mass egress denial
+      // within one token TTL). Structural corruption still throws.
+      const listed = await createProductionAnchorRegistry().listQuarantined();
+      return { entries: listed.entries, quarantined: listed.quarantined };
+    });
   const launchctlFn = internals.runLaunchctlFn ?? runLaunchctl;
   const runBarrier = internals.runBarrier ?? runReleaseBarrierSequence;
   const createBarrierOps = internals.createBarrierOps ?? createProductionReleaseBarrierOps;
@@ -1217,35 +1478,120 @@ export async function startExclusiveEgressBootSupervisor(input: {
       loadExclusiveRoutingMarker(fortressPath));
   const ensureRuntimeFs = internals.ensureRuntimeFs ?? ensureExclusiveEgressRuntimeFs;
 
-  let entries: BootRegistryEntry[] = [];
+  let listing: BootRegistryListing;
   try {
-    entries = await listEntries();
+    listing = await listEntries();
   } catch (err) {
-    input.print(`[castle-wall] boot: exclusive-egress registry unreadable (${(err as Error).message}); all confined agents stay PARKED`);
+    // HONESTY (fix-round-2 BLOCKER-1 class): an unreadable registry means NO
+    // re-park op ran here; agents remain in their PERSISTED parked posture
+    // (hold files + launchd disable overrides survive boots) but nothing was
+    // re-verified this boot -- never claim a verified park.
+    input.print(
+      `[castle-wall] boot: exclusive-egress registry unreadable (${(err as Error).message}); ` +
+        "NO boot release or re-park ran; confined agents remain in their persisted parked state, " +
+        "which was NOT re-verified this boot. Repair: sudo sanctuary protect --repair-egress-gate",
+    );
     return { results: [], stopOracleLoop: () => undefined };
+  }
+  const entries = listing.entries;
+  for (const q of listing.quarantined) {
+    input.print(
+      `[castle-wall] boot: registry entry #${q.index} is malformed and QUARANTINED (${q.reason}); ` +
+        "its agent gets no boot release and its gate denies (fail-closed); repair is owed. " +
+        "Other agents proceed. Repair: sudo sanctuary protect --repair-egress-gate",
+    );
   }
   if (entries.length === 0) {
     return { results: [], stopOracleLoop: () => undefined };
   }
-  const keys = internals.ensureKeys !== undefined ? await internals.ensureKeys() : await ensureSupervisorOracleKeys();
+
+  // PHASE 1 (fix-round-2 HIGH-3): resolve EVERY entry before any side
+  // effect, so contextless re-parks can be ordered strictly before any
+  // release and the shared-label guard knows whether any uid will release.
+  // A THROWING resolver (missing Hermes runtime etc.) routes into the same
+  // contextless re-park path as a null resolution (fix-round-2 BLOCKER-1).
+  const resolutions = new Map<number, BootAgentResolution>();
+  for (const entry of entries) {
+    let resolution: BootAgentResolution;
+    try {
+      resolution = await input.resolveAgent({ agent_uid: entry.agent_uid, fortress_path: entry.fortress_path });
+    } catch (err) {
+      resolution = {
+        kind: "unresolvable",
+        reason: `release-context resolver threw: ${(err as Error).message}`,
+      };
+    }
+    resolutions.set(entry.agent_uid, resolution);
+  }
+  const resolvedUids = entries
+    .filter((e) => resolutions.get(e.agent_uid)!.kind === "ok")
+    .map((e) => e.agent_uid);
+
+  let keys: { privateKey: KeyObject; publicKey: KeyObject };
+  try {
+    keys = internals.ensureKeys !== undefined ? await internals.ensureKeys() : await ensureSupervisorOracleKeys();
+  } catch (err) {
+    // PRE-LOOP failure (fix-round-2 BLOCKER-1): no re-park or release op ran
+    // for ANY agent, so the honest outcome is the LOUD `park-not-verified`
+    // kind per agent -- never a synthetic PARKED nobody verified.
+    const reason =
+      `boot supervisor failed before any re-park/release op ran ` +
+      `(supervisor oracle keys unavailable: ${(err as Error).message}); the parked state was NOT verified`;
+    const results: BootReleaseResult[] = [];
+    for (const entry of entries) {
+      input.print(
+        `[castle-wall] boot: uid ${entry.agent_uid} ${reason}; treat the agent as possibly ` +
+          "startable and intervene manually. Repair: sudo sanctuary protect --repair-egress-gate",
+      );
+      await input.audit("exclusive_egress_boot_release", {
+        agent_uid: entry.agent_uid,
+        outcome: "park-not-verified",
+        reason,
+      });
+      results.push({ agent_uid: entry.agent_uid, outcome: { kind: "park-not-verified", reason } });
+    }
+    return { results, stopOracleLoop: () => undefined };
+  }
   // Gate-uid cache for the refresh loop (seeded by the boot release, extended
   // by marker reads for agents armed after boot).
   const gateUids = new Map<number, number>();
 
+  // PHASE 2 ORDERING (fix-round-2 HIGH-3): every UNRESOLVABLE entry's
+  // contextless re-park runs BEFORE any resolvable entry's release, so a
+  // stale entry can never act on the shared harness label after another
+  // uid's harness was released on it.
+  const orderedAgents = [
+    ...entries.filter((e) => resolutions.get(e.agent_uid)!.kind !== "ok"),
+    ...entries.filter((e) => resolutions.get(e.agent_uid)!.kind === "ok"),
+  ].map((e) => ({ agent_uid: e.agent_uid }));
+
   const results = await runBootExclusiveEgressRelease(
-    entries.map((e) => ({ agent_uid: e.agent_uid })),
+    orderedAgents,
     {
       releaseAgent: async (agentUid): Promise<ReleaseBarrierOutcome> => {
         const entry = entries.find((e) => e.agent_uid === agentUid)!;
-        const resolution = await input.resolveAgent({ agent_uid: agentUid, fortress_path: entry.fortress_path });
+        const resolution = resolutions.get(agentUid)!;
         if (resolution.kind === "unresolvable") {
           // Fix-round H1: park FOR REAL (bootout + hold-file removal +
           // disable) and report the ACTUAL results, never a synthetic parked.
+          // Fix-round-2 HIGH-3: the shared-label ops (bootout/disable of the
+          // host-singleton harness label) run ONLY when no other uid resolved
+          // for release; the per-uid hold-file removal alone holds this uid's
+          // park (the exec wrapper refuses without a matching hold file).
           const reassert = await reassertParkedWithoutContext({
             agentUid,
             runLaunchctlFn: launchctlFn,
             removeHoldFile: removeHold,
+            sharedLabelOpsAllowed: resolvedUids.length === 0,
           });
+          if (reassert.sharedLabelOpsSkipped) {
+            input.print(
+              `[castle-wall] boot: uid ${agentUid} is unresolvable; its per-uid hold file was removed ` +
+                `(the exec wrapper refuses any start without it), but bootout/disable of the shared ` +
+                `harness label ${AGENT_HARNESS_DAEMON_LABEL} were SKIPPED because uid(s) ` +
+                `${resolvedUids.join(", ")} resolved for release on that same host-singleton label.`,
+            );
+          }
           if (reassert.cleanupErrors.length > 0) {
             input.print(
               `[castle-wall] boot: uid ${agentUid} could NOT be fully re-parked while unresolvable ` +
@@ -1322,18 +1668,66 @@ export async function startExclusiveEgressBootSupervisor(input: {
   // whose own refresh dies with the CLI process) are picked up within one
   // interval. A refresh failure removes the token (fail-closed: the gate
   // denies) and is logged; the loop keeps trying (self-healing posture).
+  //
+  // RE-ENTRANCY GUARD (fix-round-2 MED-5): the tick body is async; on a slow
+  // host (hung pfctl, slow disk) overlapping ticks would pile up concurrent
+  // registry reads + pfctl probes. A tick is SKIPPED while the previous one
+  // is still running; consecutive skips are counted and warned loudly at a
+  // threshold (tokens may expire -> gates deny, fail-closed but visible).
+  //
+  // LOG DISCIPLINE (fix-round-2 MED-6): "registry unreadable" and
+  // per-quarantined-entry findings are WARN-ONCE (re-armed on recovery),
+  // never a 1-per-second flood that buries the signal.
   const interval = input.refreshIntervalMs ?? 1_000;
+  const REFRESH_SKIP_WARN_THRESHOLD = 3;
   const warnedUids = new Set<number>();
+  const warnedQuarantined = new Set<string>();
+  let warnedRegistryUnreadable = false;
+  let refreshInFlight = false;
+  let consecutiveSkips = 0;
   const timer = setInterval(() => {
+    if (refreshInFlight) {
+      consecutiveSkips += 1;
+      if (consecutiveSkips % REFRESH_SKIP_WARN_THRESHOLD === 0) {
+        input.print(
+          `[castle-wall] oracle refresh: previous refresh still running; ${consecutiveSkips} ` +
+            "consecutive tick(s) skipped (slow host or hung registry/pfctl probe); tokens may " +
+            "expire within the TTL and gates then deny (fail-closed)",
+        );
+      }
+      return;
+    }
+    refreshInFlight = true;
     void (async (): Promise<void> => {
-      let current: BootRegistryEntry[];
+      let current: BootRegistryListing;
       try {
         current = await listEntries();
       } catch (err) {
-        input.print(`[castle-wall] oracle refresh: registry unreadable (${(err as Error).message}); gates deny within one TTL`);
+        if (!warnedRegistryUnreadable) {
+          warnedRegistryUnreadable = true;
+          input.print(
+            `[castle-wall] oracle refresh: registry unreadable (${(err as Error).message}); gates deny ` +
+              "within one TTL (fail-closed); this warning is suppressed until the registry recovers",
+          );
+        }
         return;
       }
-      for (const entry of current) {
+      if (warnedRegistryUnreadable) {
+        warnedRegistryUnreadable = false;
+        input.print("[castle-wall] oracle refresh: registry readable again; refresh resumed");
+      }
+      for (const q of current.quarantined) {
+        const key = `${q.index}:${q.reason}`;
+        if (!warnedQuarantined.has(key)) {
+          warnedQuarantined.add(key);
+          input.print(
+            `[castle-wall] oracle refresh: registry entry #${q.index} is malformed and QUARANTINED ` +
+              `(${q.reason}); its agent gets no token refresh and its gate denies (fail-closed); ` +
+              "other agents keep refreshing; repair is owed (warn-once)",
+          );
+        }
+      }
+      for (const entry of current.entries) {
         if (entry.tombstone === true) continue;
         const generationId = entry.generation_id;
         if (typeof generationId !== "number" || !Number.isInteger(generationId) || generationId <= 0) continue;
@@ -1375,7 +1769,10 @@ export async function startExclusiveEgressBootSupervisor(input: {
           );
         }
       }
-    })();
+    })().finally(() => {
+      refreshInFlight = false;
+      consecutiveSkips = 0;
+    });
   }, interval);
   timer.unref();
   return {
@@ -1471,15 +1868,17 @@ export function createExclusiveEgressPostureProducer(input: {
       // Owner check with the full evidence available to posture: expected
       // gate uid from the marker (the registry entry carries no gate uid) and
       // the runtime state's pid_start token (pid-reuse defense, fix-round:
-      // previously stored but never enforced).
-      const ownerVerified =
-        runtime !== null &&
-        (await verifyLoopbackTcpPortOwner({
-          port: runtime.gate_port,
-          expectedPid: runtime.pid,
-          ...(marker !== null && marker.agent_uid === uid ? { expectedUid: marker.gate_uid } : {}),
-          expectedPidStart: runtime.pid_start,
-        }));
+      // previously stored but never enforced). The verdict's reason feeds the
+      // posture reasons for diagnosability (fix-round-2 MED-4).
+      const ownerVerdict: PortOwnerVerdict =
+        runtime === null
+          ? { ok: false, reason: "gate runtime state absent" }
+          : await verifyLoopbackTcpPortOwner({
+              port: runtime.gate_port,
+              expectedPid: runtime.pid,
+              ...(marker !== null && marker.agent_uid === uid ? { expectedUid: marker.gate_uid } : {}),
+              expectedPidStart: runtime.pid_start,
+            });
       agents.push(
         buildExclusiveEgressPosture({
           agent_uid: uid,
@@ -1493,8 +1892,13 @@ export function createExclusiveEgressPostureProducer(input: {
           pf_liveness: pfLiveness,
           gate_process: {
             up: runtime !== null,
-            port_owner_verified: ownerVerified,
-            reasons: runtime === null ? ["gate runtime state absent"] : [],
+            port_owner_verified: ownerVerdict.ok,
+            reasons:
+              runtime === null
+                ? ["gate runtime state absent"]
+                : ownerVerdict.ok
+                  ? []
+                  : [ownerVerdict.reason],
           },
         }),
       );

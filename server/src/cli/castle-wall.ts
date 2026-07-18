@@ -2164,9 +2164,13 @@ export async function runSafeModeDaemon(
       print: (line) => write(out, `${line}\n`),
     });
   } catch (bootErr) {
+    // HONESTY (fix-round-2 BLOCKER-1): a supervisor throw means NO re-park op
+    // verifiably ran here -- never claim the agents "stay PARKED"; their
+    // persisted parked posture (hold files + disable overrides) was not
+    // re-verified this boot.
     write(
       err,
-      `[castle-wall] exclusive-egress boot supervisor failed (${bootErr instanceof Error ? bootErr.message : String(bootErr)}); confined agents stay PARKED (fail-closed). Repair: sudo sanctuary protect --repair-egress-gate\n`,
+      `[castle-wall] exclusive-egress boot supervisor failed (${bootErr instanceof Error ? bootErr.message : String(bootErr)}); NO boot release or re-park ran and the confined agents' parked state was NOT verified -- treat them as possibly startable and intervene. Repair: sudo sanctuary protect --repair-egress-gate\n`,
     );
   }
 

@@ -2376,14 +2376,19 @@ export async function runEgressGateRepairForCli(options: {
       // The repair sequence already printed the specific refusal + guidance.
       return 2;
     case "repair-failed":
-      // BLOCKER-3 honesty: claim PARKED only when the stop was VERIFIED by a
-      // status probe; otherwise say so loudly (possibly-running agent).
+      // BLOCKER-3 honesty, tightened by fix-round-2 HIGH-2: claim PARKED only
+      // when the FULL persistent parked posture was verified (not running +
+      // launchd job disabled + hold file absent + parked plist); otherwise
+      // enumerate exactly which checks failed -- the agent may be startable
+      // now or at the next boot (stale release material).
       print(
         `Exclusive-egress repair FAILED at ${outcome.stage}: ${outcome.reason}. ` +
-          (outcome.harnessStopVerified
-            ? "The agent harness remains PARKED (verified not running; fail-closed). Investigate, then re-run the repair."
-            : `WARNING: the agent harness could NOT be verified stopped (${outcome.harnessStopNote ?? "no probe detail"}); ` +
-              "treat the agent as possibly RUNNING and investigate immediately."),
+          (outcome.parkedStateVerified
+            ? "The agent harness remains PARKED (verified: not running, job disabled, hold file absent, " +
+              "parked plist on disk; fail-closed). Investigate, then re-run the repair."
+            : "WARNING: the agent's parked state could NOT be fully verified -- it may be startable now " +
+              `or at the next boot. Failed checks: ${outcome.parkedStateProblems.join("; ") || "no probe detail"}. ` +
+              "Investigate immediately."),
       );
       return 2;
   }

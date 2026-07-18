@@ -292,23 +292,32 @@ export interface EgressGateRepairOps {
    */
   diffTransientPfRules(): Promise<{ foreign: string[] }>;
   /**
-   * PARK the harness before any repair mutation (fix-round BLOCKER-3): a
-   * degrade-loud outcome may have left the harness RUNNING IN COARSE MODE,
-   * and the bring-up republishes the manifest exclusive-scoped -- doing that
-   * under a live coarse harness would confine it into silence mid-flight,
-   * and the release barrier's reassert-parked was never designed to be the
-   * only stop for an already-running process. Production: `launchctl
-   * bootout` (not-running is success) + `disable` + a VERIFIED not-running
-   * status probe. MUST throw unless the harness is verified stopped.
+   * PARK the harness before any repair mutation (fix-round BLOCKER-3 +
+   * fix-round-2 HIGH-2): a degrade-loud outcome may have left the harness
+   * RUNNING IN COARSE MODE, and the bring-up republishes the manifest
+   * exclusive-scoped -- doing that under a live coarse harness would confine
+   * it into silence mid-flight. "Park" is the FULL PERSISTENT parked state,
+   * not just not-running-now: production runs `launchctl bootout`
+   * (not-running is success) + `launchctl disable` + hold-file removal +
+   * parked-plist restore, captures each result, and VERIFIES the whole
+   * posture (not running + job disabled in launchd's override db + hold file
+   * absent + parked plist on disk). Without the last three, a "parked" claim
+   * can leave stale release material that boots the harness at the next
+   * reboot. MUST throw (enumerating every failed step) unless the full
+   * parked state is verified.
    */
   parkHarness(): Promise<void>;
   /**
-   * Verify the harness process is actually NOT running (status probe).
-   * Discriminated, never throws in spirit (a throwing impl is treated as
-   * not-verified). Used before any `repair-failed` outcome claims the agent
-   * is parked (fix-round BLOCKER-3: never claim PARKED unverified).
+   * Verify the FULL persistent parked posture (fix-round-2 HIGH-2): the
+   * harness process is not running, the launchd job is disabled in the
+   * override database, the per-uid hold file is absent, and the on-disk
+   * plist is the parked barrier form (or absent). Discriminated, never
+   * throws in spirit (a throwing impl is treated as not-verified). Used
+   * before any `repair-failed` outcome claims the agent is parked: a
+   * stopped-but-releasable harness (enable override left on, released plist
+   * + hold file still on disk) is NOT parked -- it can boot at next reboot.
    */
-  verifyHarnessStopped(): Promise<{ ok: true } | { ok: false; reason: string }>;
+  verifyParkedPersistent(): Promise<{ ok: true } | { ok: false; problems: string[] }>;
   /**
    * Recover any in-flight (uncommitted) generation first (production: the
    * S5-2 `GenerationCoordinator.recover` -- discard/tombstone per the crash
@@ -341,16 +350,19 @@ export type EgressGateRepairOutcome =
   | { kind: "refused-diff-unavailable"; reason: string }
   /**
    * The repair ran but could not bring the generation live. The agent's
-   * parked claim is HONEST: `harnessStopVerified` is true only when a status
-   * probe confirmed the harness process is not running (fix-round BLOCKER-3;
-   * false means "treat as possibly RUNNING, investigate immediately").
+   * parked claim is HONEST (fix-round BLOCKER-3, tightened by fix-round-2
+   * HIGH-2): `parkedStateVerified` is true only when a probe confirmed the
+   * FULL persistent parked posture (not running + job disabled + hold file
+   * absent + parked plist). False means "the agent may be startable now or
+   * at the next boot"; `parkedStateProblems` enumerates exactly which
+   * checks failed so the operator knows what release material remains.
    */
   | {
       kind: "repair-failed";
       stage: "park" | "recover" | "bring-up" | "release";
       reason: string;
-      harnessStopVerified: boolean;
-      harnessStopNote?: string;
+      parkedStateVerified: boolean;
+      parkedStateProblems: string[];
     };
 
 /**
@@ -362,7 +374,8 @@ export type EgressGateRepairOutcome =
  * the manifest exclusive-scoped under a live coarse harness), then recover
  * -> bring-up -> release. Every failure leaves the agent parked (the
  * barrier's fail-closed park) and reports the stage, and a `repair-failed`
- * outcome claims PARKED only with a verified not-running status probe;
+ * outcome claims PARKED only with the FULL persistent parked posture
+ * verified (not running + job disabled + hold file absent + parked plist);
  * nothing here can silently clobber third-party pf state or report green
  * without the barrier's released outcome.
  */
@@ -370,25 +383,27 @@ export async function runEgressGateRepair(
   ctx: EgressGateRepairContext,
   ops: EgressGateRepairOps,
 ): Promise<EgressGateRepairOutcome> {
-  // Honest-park helper for every repair-failed return (BLOCKER-3): the
-  // outcome may claim the agent is parked ONLY when a status probe verified
-  // the process is not running; a throwing probe reads as not-verified.
+  // Honest-park helper for every repair-failed return (BLOCKER-3, tightened
+  // by fix-round-2 HIGH-2): the outcome may claim the agent is parked ONLY
+  // when a probe verified the FULL persistent parked posture (not running +
+  // job disabled + hold file absent + parked plist); a throwing probe reads
+  // as not-verified with the throw enumerated.
   const failParked = async (
     stage: "park" | "recover" | "bring-up" | "release",
     reason: string,
   ): Promise<EgressGateRepairOutcome> => {
-    let stopped: { ok: true } | { ok: false; reason: string };
+    let parked: { ok: true } | { ok: false; problems: string[] };
     try {
-      stopped = await ops.verifyHarnessStopped();
+      parked = await ops.verifyParkedPersistent();
     } catch (err) {
-      stopped = { ok: false, reason: `stop-verify probe threw: ${(err as Error).message}` };
+      parked = { ok: false, problems: [`parked-state verify probe threw: ${(err as Error).message}`] };
     }
     return {
       kind: "repair-failed",
       stage,
       reason,
-      harnessStopVerified: stopped.ok,
-      ...(stopped.ok ? {} : { harnessStopNote: stopped.reason }),
+      parkedStateVerified: parked.ok,
+      parkedStateProblems: parked.ok ? [] : parked.problems,
     };
   };
   // Override is TTY-ONLY (design: "interactive TTY only"): a non-interactive
@@ -505,13 +520,36 @@ export interface BootReleaseAgent {
   agent_uid: number;
 }
 
-/** Per-agent boot result (the boot daemon logs these; it never throws). */
+/**
+ * Per-agent boot result (the boot daemon logs these; it never throws).
+ *
+ * HONESTY CONTRACT (fix-round-2 BLOCKER-1): `parked` is claimed ONLY when
+ * the re-park ops actually ran, and it carries their REAL results
+ * (`holdFileRemoved`/`jobDisabled`/`cleanupErrors` from the barrier or the
+ * contextless re-park). A release attempt that THREW proves nothing about
+ * the parked state and maps to the DISTINCT `park-not-verified` kind --
+ * never a synthetic "parked" nobody verified.
+ */
 export interface BootReleaseResult {
   agent_uid: number;
   outcome:
     | { kind: "released"; generationId: number }
     | { kind: "released-repark-failed"; generationId: number; reparkError: string }
-    | { kind: "parked"; reason: string };
+    | {
+        kind: "parked";
+        reason: string;
+        /** True when the hold file is confirmed absent (real op result). */
+        holdFileRemoved: boolean;
+        /** True when the launchd job is confirmed disabled (real op result). */
+        jobDisabled: boolean;
+        /** Re-park op failures, LOUD and per-op (empty on a clean park). */
+        cleanupErrors: string[];
+      }
+    | {
+        kind: "park-not-verified";
+        /** Why no verified park exists (e.g. the release attempt threw). */
+        reason: string;
+      };
 }
 
 /**
@@ -548,19 +586,40 @@ export async function runBootExclusiveEgressRelease(
           reparkError: release.reparkError,
         };
       } else {
+        // Carry the REAL re-park results forward (fix-round-2 BLOCKER-1):
+        // "parked" without the op results would be a claim nobody could audit.
         outcome = {
           kind: "parked",
           reason: `release barrier parked at stage ${release.stage}: ${release.reason}`,
+          holdFileRemoved: release.holdFileRemoved,
+          jobDisabled: release.jobDisabled,
+          cleanupErrors: release.cleanupErrors,
         };
       }
     } catch (err) {
-      outcome = { kind: "parked", reason: `boot release threw: ${(err as Error).message}` };
+      // Fix-round-2 BLOCKER-1: a THROW out of the release attempt proves
+      // nothing about the parked state (the pre-fix code reported a synthetic
+      // PARKED here with no re-park op verified). Distinct, LOUD, honest.
+      outcome = {
+        kind: "park-not-verified",
+        reason: `boot release threw before a verified park: ${(err as Error).message}`,
+      };
     }
-    if (outcome.kind === "parked") {
+    if (outcome.kind === "park-not-verified") {
+      ops.print(
+        `[castle-wall] boot: uid ${agent.agent_uid} exclusive egress NOT live AND the parked state ` +
+          `was NOT verified (${outcome.reason}); treat the agent as possibly startable and ` +
+          "intervene manually. Fix with: sudo sanctuary protect --repair-egress-gate",
+      );
+    } else if (outcome.kind === "parked") {
       ops.print(
         `[castle-wall] boot: uid ${agent.agent_uid} exclusive egress NOT live; the agent harness ` +
-          `remains PARKED (fail-closed): ${outcome.reason}. ` +
-          "Fix with: sudo sanctuary protect --repair-egress-gate",
+          `remains PARKED (fail-closed): ${outcome.reason}.` +
+          (outcome.cleanupErrors.length > 0
+            ? ` WARNING: re-park ops reported failures (hold file removed: ${outcome.holdFileRemoved}, ` +
+              `job disabled: ${outcome.jobDisabled}): ${outcome.cleanupErrors.join("; ")}.`
+            : "") +
+          " Fix with: sudo sanctuary protect --repair-egress-gate",
       );
     } else {
       ops.print(
@@ -574,7 +633,16 @@ export async function runBootExclusiveEgressRelease(
     await ops.audit("exclusive_egress_boot_release", {
       agent_uid: agent.agent_uid,
       outcome: outcome.kind,
-      ...(outcome.kind !== "parked" ? { generation_id: outcome.generationId } : { reason: outcome.reason }),
+      ...(outcome.kind === "released" || outcome.kind === "released-repark-failed"
+        ? { generation_id: outcome.generationId }
+        : { reason: outcome.reason }),
+      ...(outcome.kind === "parked"
+        ? {
+            hold_file_removed: outcome.holdFileRemoved,
+            job_disabled: outcome.jobDisabled,
+            cleanup_errors: outcome.cleanupErrors,
+          }
+        : {}),
     });
     results.push({ agent_uid: agent.agent_uid, outcome });
   }
