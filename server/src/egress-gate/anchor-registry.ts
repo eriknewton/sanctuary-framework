@@ -346,10 +346,15 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
   // ADDITIVE optional fields (S5-2). Reject a present-but-malformed value
   // (fail-closed: a garbled generation/tombstone marker is a repair signal,
   // never silently coerced); a MISSING field is the v1-compatible legacy shape.
-  // `generation_id` must be a POSITIVE integer: generated ids start at 1
-  // (`computeNextGenerationId`), so a persisted 0 is a corruption/reuse signal,
-  // never a legitimate committed generation (gate finding).
-  if (c.generation_id !== undefined && (!Number.isInteger(c.generation_id) || (c.generation_id as number) < 1)) {
+  // `generation_id` must be a POSITIVE integer WITH allocation headroom
+  // (fix-round-8, `hasGenerationHeadroom`): generated ids start at 1
+  // (`computeNextGenerationId`), so a persisted 0 is a corruption/reuse
+  // signal, and an unsafe-magnitude id would wedge every future allocation
+  // (n+1 === n at 2^53) -- both are repair signals, never silently coerced.
+  if (
+    c.generation_id !== undefined &&
+    (typeof c.generation_id !== "number" || !hasGenerationHeadroom(c.generation_id))
+  ) {
     return null;
   }
   if (c.tombstone !== undefined && typeof c.tombstone !== "boolean") return null;
@@ -364,15 +369,24 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
 }
 
 /**
+ * A generation value is usable ONLY with allocation headroom (fix-round-8):
+ * the value and value+1 must both be safe integers, because
+ * `computeNextGenerationId` allocates value+1 and the gate runtime rejects
+ * unsafe generation ids -- at 2^53-1, n+1 === n, so an at-or-above value
+ * would make every future allocation collide. This is the SINGLE boundary
+ * shared by entry validation, floor classification/parsing, and repair
+ * salvage, so no unsafe number can reach the allocator.
+ */
+function hasGenerationHeadroom(n: number): boolean {
+  return Number.isSafeInteger(n) && n >= 1 && Number.isSafeInteger(n + 1);
+}
+
+/**
  * Best-effort numeric recovery of a malformed generation-floor value
  * (fix-round-6 F1): a number, or a numeric string (e.g. `"8"`), that resolves
- * to a finite value >= 1. Fractional values round UP (a floor must never be
- * lowered by coercion). The recovered floor must leave allocation headroom:
- * both the floor and floor+1 must be safe integers, because
- * `computeNextGenerationId` allocates floor+1 and the gate runtime rejects
- * unsafe generation ids -- a floor at 2^53-1 would silently allocate the SAME
- * id forever (floor+1 === floor at that magnitude). Anything else is
- * unrecoverable (`null`).
+ * to a finite value >= 1 WITH allocation headroom (`hasGenerationHeadroom`).
+ * Fractional values round UP (a floor must never be lowered by coercion).
+ * Anything else is unrecoverable (`null`).
  */
 function parseGenerationFloorRaw(raw: unknown): number | null {
   const n =
@@ -383,9 +397,7 @@ function parseGenerationFloorRaw(raw: unknown): number | null {
         : Number.NaN;
   if (!Number.isFinite(n) || n < 1) return null;
   const ceiled = Math.ceil(n);
-  if (!Number.isSafeInteger(ceiled) || !Number.isSafeInteger(ceiled + 1)) {
-    return null;
-  }
+  if (!hasGenerationHeadroom(ceiled)) return null;
   return ceiled;
 }
 
@@ -412,9 +424,8 @@ function classifyGenerationFloor(loaded: PfAnchorRegistryState): {
     // well-formed-looking floor at or above 2^53-1 cannot allocate a distinct
     // next id, so it is malformed evidence, not a valid floor.
     if (
-      Number.isSafeInteger(loaded.generation_floor) &&
-      loaded.generation_floor >= 1 &&
-      Number.isSafeInteger(loaded.generation_floor + 1)
+      typeof loaded.generation_floor === "number" &&
+      hasGenerationHeadroom(loaded.generation_floor)
     ) {
       out.validFloor = loaded.generation_floor;
     } else {
@@ -869,8 +880,8 @@ export class PfAnchorRegistry {
         const uid =
           typeof raw.agent_uid === "number" && Number.isInteger(raw.agent_uid) ? raw.agent_uid : null;
         const rawGenerationId =
-          Number.isInteger(raw.generation_id) && (raw.generation_id as number) >= 1
-            ? (raw.generation_id as number)
+          typeof raw.generation_id === "number" && hasGenerationHeadroom(raw.generation_id)
+            ? raw.generation_id
             : null;
         let disposition: PfAnchorQuarantineRepairFinding["disposition"] = "removed";
         let duplicate: PfAnchorQuarantineRepairFinding["duplicate"];

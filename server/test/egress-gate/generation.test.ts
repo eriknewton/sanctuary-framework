@@ -335,6 +335,24 @@ describe("egress-gate/generation pure helpers", () => {
     expect(computeNextGenerationId(undefined, undefined, 4)).toBe(5);
   });
 
+  it("computeNextGenerationId REFUSES to allocate without safe headroom (fix-round-8): a colliding id must never be returned", () => {
+    // Pre-fix: 2^53 + 1 === 2^53, so the allocator RETURNED the same id it
+    // was supposed to exceed -- a silent generation collision.
+    expect(() => computeNextGenerationId(Number.MAX_SAFE_INTEGER, undefined)).toThrow(
+      /no safe headroom/,
+    );
+    expect(() => computeNextGenerationId(9007199254740992, undefined)).toThrow(
+      /no safe headroom/,
+    );
+    expect(() =>
+      computeNextGenerationId(undefined, undefined, Number.MAX_SAFE_INTEGER),
+    ).toThrow(/no safe headroom/);
+    // The last SAFE allocation is still served.
+    expect(computeNextGenerationId(Number.MAX_SAFE_INTEGER - 1, undefined)).toBe(
+      Number.MAX_SAFE_INTEGER,
+    );
+  });
+
   it("evaluateGenerationMatch serves ONLY when all three surfaces agree", () => {
     expect(
       evaluateGenerationMatch({ committedGenerationId: 3, committedPort: 45001, pfPassPort: 45001, manifestPort: 45001, manifestGenerationId: 3 }).serve,

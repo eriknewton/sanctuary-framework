@@ -261,7 +261,16 @@ export function computeNextGenerationId(
     stagingGenerationId ?? 0,
     generationFloor ?? 0,
   );
-  return highest + 1;
+  const next = highest + 1;
+  // Fail-closed backstop (fix-round-8): the registry boundary rejects unsafe
+  // generation values, but if one ever reaches allocation anyway, n+1 === n
+  // at 2^53 would silently commit a COLLIDING generation. Refuse instead.
+  if (!Number.isSafeInteger(next) || next <= highest) {
+    throw new Error(
+      `generation allocation has no safe headroom above ${highest}; the anchor registry needs repair`,
+    );
+  }
+  return next;
 }
 
 /**

@@ -1164,3 +1164,51 @@ describe("egress-gate/anchor-registry fix-round-7 (unsafe-integer generation flo
     expect(listed.generationFloor).toBeUndefined();
   });
 });
+
+describe("egress-gate/anchor-registry fix-round-8 (unsafe generation_id closed at every ingress)", () => {
+  it("a committed entry with an unsafe-integer generation_id is QUARANTINED, not loaded as valid", async () => {
+    const { registry } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [{ ...A, generation_id: 9007199254740992 as never }],
+        enable_token: "1",
+      },
+    });
+    const listed = await registry.listQuarantined();
+    // Pre-fix: Number.isInteger(2^53) is true, so the entry loaded as VALID
+    // and its id flowed into computeNextGenerationId where +1 no-ops.
+    expect(listed.dirty).toBe(true);
+    expect(listed.entries.some((e) => e.agent_uid === A.agent_uid)).toBe(false);
+    expect(listed.quarantined.length).toBe(1);
+  });
+
+  it("repair salvage refuses to carry an unsafe generation_id into a tombstone", async () => {
+    const { registry, store } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [
+          // Malformed via `tombstone` (a field the salvage REBUILDS rather
+          // than copies), so the salvage path genuinely runs and the unsafe
+          // generation_id is what the carry decision is made on.
+          { ...A, tombstone: "yes" as never, generation_id: 9007199254740992 as never },
+        ],
+        enable_token: "1",
+      },
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    // Pre-fix the salvage validated the raw id with Number.isInteger only and
+    // carried 2^53 into the tombstone, re-feeding the allocation path later.
+    const tomb = (store.current?.committed ?? []).find(
+      (e) => e.agent_uid === A.agent_uid && e.tombstone === true,
+    );
+    if (tomb !== undefined) {
+      expect(tomb.generation_id).toBeUndefined();
+    }
+    expect(
+      (store.current?.committed ?? []).some(
+        (e) => e.generation_id !== undefined && !Number.isSafeInteger(e.generation_id + 1),
+      ),
+    ).toBe(false);
+  });
+});
