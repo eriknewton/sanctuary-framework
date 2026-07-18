@@ -81,11 +81,13 @@ function makeRegistry(opts: {
   armImpl?: (entries: readonly { agent_uid: number }[], options: { existingEnableToken?: string }) => Promise<ArmPfAnchorResult>;
   disarmImpl?: (options: { enableToken?: string }) => Promise<void>;
   livenessImpl?: () => Promise<PfLivenessResult>;
+  forensicsImpl?: (payload: string) => Promise<string>;
 } = {}) {
   const store = memStore(opts.initial ?? null);
   const lock = memLock();
   const armCalls: Array<{ uids: number[]; existingEnableToken?: string }> = [];
   const disarmCalls: Array<{ enableToken?: string }> = [];
+  const forensicWrites: string[] = [];
   const runner = { async run() { return { code: 0, stdout: "", stderr: "" }; } };
   const ops: PfAnchorRegistryOps = {
     store,
@@ -105,8 +107,13 @@ function makeRegistry(opts: {
       await (opts.disarmImpl ?? (async () => {}))(options);
     },
     unionLiveness: opts.livenessImpl ?? (async () => live),
+    quarantineForensics: async (payload) => {
+      forensicWrites.push(payload);
+      if (opts.forensicsImpl !== undefined) return opts.forensicsImpl(payload);
+      return "/var/db/sanctuary/egress-anchor-registry.json.quarantine-test.json";
+    },
   };
-  return { registry: new PfAnchorRegistry(ops), store, lock, armCalls, disarmCalls };
+  return { registry: new PfAnchorRegistry(ops), store, lock, armCalls, disarmCalls, forensicWrites };
 }
 
 describe("egress-gate/anchor-registry", () => {
@@ -514,5 +521,164 @@ describe("egress-gate/anchor-registry listQuarantined (fix-round-2 MED-6: per-en
     expect((await makeRegistry({ initial: explicit }).registry.listQuarantined()).dirty).toBe(true);
     const noToken = { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed: [A] } as PfAnchorRegistryState;
     expect((await makeRegistry({ initial: noToken }).registry.listQuarantined()).dirty).toBe(true);
+  });
+});
+
+describe("egress-gate/anchor-registry repairQuarantined (fix-round-4 P2: coded recovery for a quarantined committed entry)", () => {
+  const MALFORMED_NO_UID = { bogus: true, fortress_path: "/f/x" };
+  const MALFORMED_SALVAGEABLE = {
+    agent_uid: 601,
+    gate_port: 20002,
+    fortress_path: "/f/c",
+    generation_id: 0, // invalid: committed generations start at 1
+  };
+
+  function quarantinedState(malformed: unknown): PfAnchorRegistryState {
+    return {
+      version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+      committed: [A, malformed as never],
+      enable_token: "1",
+    };
+  }
+
+  it("repairs over a malformed sibling: forensic payload FIRST, union re-armed from the valid entry, registry CLEAN (tokens resume), mutations work again", async () => {
+    const { registry, store, armCalls, forensicWrites } = makeRegistry({
+      initial: quarantinedState(MALFORMED_NO_UID),
+    });
+    // Pre-fix: every mutation (and any repair built on mutations) entered
+    // normalizeState and THREW "a committed entry is malformed" -- the
+    // documented repair verb could never rewrite anything.
+    await expect(registry.addOrUpdate(B)).rejects.toThrow(PfAnchorRegistryStateError);
+
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    expect(res.findings).toEqual([
+      {
+        index: 1,
+        reason: "malformed committed entry (failed the fail-closed entry validation)",
+        agent_uid: null, // no recoverable uid on the raw entry
+        disposition: "removed",
+      },
+    ]);
+    expect(res.forensicPath).toBe("/var/db/sanctuary/egress-anchor-registry.json.quarantine-test.json");
+    expect(res.remaining.map((e) => e.agent_uid)).toEqual([502]);
+    // The raw entry's content was captured for forensics before removal.
+    expect(forensicWrites).toHaveLength(1);
+    expect(forensicWrites[0]).toContain('"bogus": true');
+    expect(forensicWrites[0]).toContain("re-provisioned");
+    // The union was re-rendered from the remaining valid entry only.
+    expect(armCalls.at(-1)?.uids).toEqual([502]);
+    // Persisted CLEAN: the round-3 dirty-registry machinery (posture red,
+    // freshness tokens withheld host-wide) stands down -- the valid
+    // sibling's tokens resume on the next oracle tick.
+    expect(store.current?.committed).toEqual([A]);
+    expect(store.current?.dirty).toBeUndefined();
+    expect(store.current?.pending).toBeUndefined();
+    expect(await registry.list()).toEqual({ entries: [A], dirty: false });
+    // And ordinary mutations enter normalizeState cleanly again.
+    const after = await registry.addOrUpdate(B);
+    expect(after.committed.map((e) => e.agent_uid).sort()).toEqual([502, 504]);
+  });
+
+  it("a salvageable malformed entry (garbled generation_id, valid uid/port/fortress) is TOMBSTONED block-only, never dropped", async () => {
+    const { registry, store, armCalls } = makeRegistry({
+      initial: quarantinedState(MALFORMED_SALVAGEABLE),
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    expect(res.findings).toEqual([
+      {
+        index: 1,
+        reason: "malformed committed entry (failed the fail-closed entry validation)",
+        agent_uid: 601,
+        disposition: "tombstoned",
+      },
+    ]);
+    // The uid STAYS in the union as a block-only tombstone: dropping it would
+    // drop its live block rules from the anchor (fail-open direction).
+    const kept = res.remaining.find((e) => e.agent_uid === 601);
+    expect(kept).toEqual({
+      agent_uid: 601,
+      gate_port: 20002,
+      fortress_path: "/f/c",
+      tombstone: true,
+    });
+    expect(armCalls.at(-1)?.uids.sort()).toEqual([502, 601]);
+    expect(store.current?.committed).toHaveLength(2);
+    expect((await registry.list()).dirty).toBe(false);
+  });
+
+  it("a duplicate committed uid is REMOVED (the first valid entry keeps the uid confined; no tombstone shadowing)", async () => {
+    const dup = { ...A, gate_port: 20009 };
+    const { registry } = makeRegistry({ initial: quarantinedState(dup) });
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    expect(res.findings).toEqual([
+      { index: 1, reason: "duplicate committed agent_uid 502", agent_uid: 502, disposition: "removed" },
+    ]);
+    expect(res.remaining).toEqual([A]);
+  });
+
+  it("transiently-invalid state (missing enable token) is NEVER grounds to drop an entry: read-only no-op", async () => {
+    const { registry, store, armCalls, forensicWrites } = makeRegistry({
+      initial: { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed: [A, B] }, // no enable_token -> dirty
+    });
+    const res = await registry.repairQuarantined();
+    expect(res).toEqual({ repaired: false, findings: [], forensicPath: null, remaining: [A, B] });
+    // Nothing written, nothing armed, nothing removed; the normal mutation
+    // reconcile owns this dirt without discarding confinement state.
+    expect(forensicWrites).toHaveLength(0);
+    expect(armCalls).toHaveLength(0);
+    expect(store.saves).toHaveLength(0);
+    expect((await registry.list()).entries).toEqual([A, B]);
+  });
+
+  it("a forensic-write failure ABORTS with the registry untouched (an entry is never dropped without its bytes preserved)", async () => {
+    const { registry, store, armCalls } = makeRegistry({
+      initial: quarantinedState(MALFORMED_NO_UID),
+      forensicsImpl: async () => {
+        throw new Error("forensic sink full");
+      },
+    });
+    await expect(registry.repairQuarantined()).rejects.toThrow("forensic sink full");
+    expect(armCalls).toHaveLength(0);
+    expect(store.saves).toHaveLength(0);
+    expect((store.current?.committed as unknown[])[1]).toEqual(MALFORMED_NO_UID);
+  });
+
+  it("a re-arm failure leaves the on-disk registry untouched (still quarantined + dirty, posture red) and throws", async () => {
+    const { registry, store } = makeRegistry({
+      initial: quarantinedState(MALFORMED_NO_UID),
+      armImpl: async () => {
+        throw new Error("pfctl exploded");
+      },
+    });
+    await expect(registry.repairQuarantined()).rejects.toThrow("pfctl exploded");
+    expect(store.saves).toHaveLength(0);
+    expect((store.current?.committed as unknown[])[1]).toEqual(MALFORMED_NO_UID);
+    expect((await registry.listQuarantined()).dirty).toBe(true);
+  });
+
+  it("STRUCTURAL corruption still throws wholesale (nothing salvageable from an unknown shape)", async () => {
+    const { registry } = makeRegistry({
+      initial: { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed: "nope" as never },
+    });
+    await expect(registry.repairQuarantined()).rejects.toThrow(PfAnchorRegistryStateError);
+  });
+
+  it("all entries quarantined: the anchor is flushed to a known-empty state and the enable token released", async () => {
+    const { registry, store, disarmCalls } = makeRegistry({
+      initial: {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: [MALFORMED_NO_UID as never],
+        enable_token: "1",
+      },
+    });
+    const res = await registry.repairQuarantined();
+    expect(res.repaired).toBe(true);
+    expect(res.remaining).toEqual([]);
+    expect(disarmCalls).toEqual([{ enableToken: "1" }]);
+    expect(store.current?.enable_token).toBeUndefined();
+    expect(await registry.list()).toEqual({ entries: [], dirty: false });
   });
 });

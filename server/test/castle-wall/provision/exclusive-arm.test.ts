@@ -16,6 +16,7 @@ import {
   EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP,
   EGRESS_GATE_REPAIR_AUDIT_OP,
   EGRESS_GATE_REPAIR_OVERRIDE_AUDIT_OP,
+  EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP,
   EGRESS_GATE_REPAIR_REFUSED_AUDIT_OP,
   type ExclusiveEgressArmOps,
   type EgressGateRepairOps,
@@ -527,5 +528,132 @@ describe("runBootExclusiveEgressRelease", () => {
     });
     expect(results[0]!.outcome).toMatchObject({ kind: "released-repark-failed" });
     expect(print.mock.calls.map((c) => String(c[0])).join("\n")).toContain("WARNING");
+  });
+});
+
+describe("runEgressGateRepair quarantine-repair stage (fix-round-4 P2)", () => {
+  const QUARANTINE_RESULT = {
+    repaired: true,
+    findings: [
+      {
+        index: 1,
+        reason: "malformed committed entry (failed the fail-closed entry validation)",
+        agent_uid: 601,
+        disposition: "removed" as const,
+      },
+      {
+        index: 2,
+        reason: "malformed committed entry (failed the fail-closed entry validation)",
+        agent_uid: 602,
+        disposition: "tombstoned" as const,
+      },
+    ],
+    forensicPath: "/var/db/sanctuary/egress-anchor-registry.json.quarantine-t.json",
+    remaining: [{ agent_uid: AGENT_UID, gate_port: 49152, fortress_path: "/f/a" }],
+  };
+
+  it("runs AFTER park and BEFORE any other registry mutation; a repaired quarantine is audited + loud, then the sequence proceeds", async () => {
+    const calls: string[] = [];
+    const printed: string[] = [];
+    const ops = repairOps({
+      parkHarness: vi.fn(async () => {
+        calls.push("park");
+      }),
+      repairQuarantinedRegistry: vi.fn(async () => {
+        calls.push("quarantine");
+        return QUARANTINE_RESULT;
+      }),
+      recoverGeneration: vi.fn(async () => {
+        calls.push("recover");
+      }),
+      print: vi.fn((line: string) => {
+        printed.push(line);
+      }),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toEqual({ kind: "repaired", generationId: 7 });
+    // Ordering: the coded quarantine path must precede every wholesale-
+    // normalizing mutation (pre-fix, recover/bring-up threw on the malformed
+    // entry before repair could rewrite anything).
+    expect(calls).toEqual(["park", "quarantine", "recover"]);
+    expect(ops.audit).toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP,
+      expect.objectContaining({
+        agent_uid: AGENT_UID,
+        forensic_path: QUARANTINE_RESULT.forensicPath,
+        quarantined: [
+          expect.objectContaining({ index: 1, agent_uid: 601, disposition: "removed" }),
+          expect.objectContaining({ index: 2, agent_uid: 602, disposition: "tombstoned" }),
+        ],
+      }),
+    );
+    // The log names what was quarantined, where the forensic copy lives, and
+    // the re-provision debt -- per finding.
+    const log = printed.join("\n");
+    expect(log).toContain("entry #1 (uid 601)");
+    expect(log).toContain("REMOVED");
+    expect(log).toContain("entry #2 (uid 602)");
+    expect(log).toContain("TOMBSTONED");
+    expect(log).toContain(QUARANTINE_RESULT.forensicPath);
+    expect(log).toContain("RE-PROVISIONED");
+  });
+
+  it("an unrecoverable uid is still reported loudly (no silent finding)", async () => {
+    const printed: string[] = [];
+    const ops = repairOps({
+      repairQuarantinedRegistry: vi.fn(async () => ({
+        ...QUARANTINE_RESULT,
+        findings: [{ index: 3, reason: "malformed committed entry (failed the fail-closed entry validation)", agent_uid: null, disposition: "removed" as const }],
+      })),
+      print: vi.fn((line: string) => {
+        printed.push(line);
+      }),
+    });
+    await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(printed.join("\n")).toContain("entry #3 (an unrecoverable uid)");
+  });
+
+  it("a quarantine-repair failure -> repair-failed at the DISTINCT quarantine-repair stage, honest park, no downstream mutation", async () => {
+    const ops = repairOps({
+      repairQuarantinedRegistry: vi.fn(async () => {
+        throw new Error("forensic sink full");
+      }),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toMatchObject({
+      kind: "repair-failed",
+      stage: "quarantine-repair",
+      parkedStateVerified: true,
+    });
+    const reason = (outcome as { reason: string }).reason;
+    expect(reason).toContain("forensic sink full");
+    expect(reason).toContain("untouched");
+    expect(ops.recoverGeneration).not.toHaveBeenCalled();
+    expect(ops.bringUpGeneration).not.toHaveBeenCalled();
+    expect(ops.runReleaseSequence).not.toHaveBeenCalled();
+  });
+
+  it("a clean registry is a silent no-op (no quarantine audit, no quarantine print)", async () => {
+    const printed: string[] = [];
+    const ops = repairOps({
+      print: vi.fn((line: string) => {
+        printed.push(line);
+      }),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toEqual({ kind: "repaired", generationId: 7 });
+    expect(ops.audit).not.toHaveBeenCalledWith(
+      EGRESS_GATE_REPAIR_QUARANTINE_AUDIT_OP,
+      expect.anything(),
+    );
+    expect(printed.join("\n")).not.toContain("Quarantined");
+  });
+
+  it("a refusal (foreign transient rules, no override) never reaches the quarantine step", async () => {
+    const ops = repairOps({
+      diffTransientPfRules: vi.fn(async () => ({ foreign: ["pass in quick on utun3 all"] })),
+    });
+    await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(ops.repairQuarantinedRegistry).not.toHaveBeenCalled();
   });
 });

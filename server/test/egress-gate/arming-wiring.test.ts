@@ -13,7 +13,9 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  createInstallExclusiveEgressOps,
   createProductionReleaseBarrierOps,
+  createRepairExclusiveEgressOps,
   parkHarnessPersistently,
   restoreCoarseCompositionProduction,
   verifyHarnessJobDisabled,
@@ -25,7 +27,11 @@ import {
 } from "../../src/egress-gate/arming-wiring.js";
 import { PfAnchorRegistry } from "../../src/egress-gate/anchor-registry.js";
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
-import { holdFilePathForUid, planParkedHarnessInstall } from "../../src/egress-gate/release-barrier.js";
+import {
+  holdFilePathForUid,
+  planParkedHarnessInstall,
+  type ReleaseBarrierOps,
+} from "../../src/egress-gate/release-barrier.js";
 
 function lsofOutput(pid: number, uid: number): string {
   return `p${pid}\nu${uid}\nnlocalhost:40001\n`;
@@ -475,5 +481,97 @@ describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quar
     // the quarantine-path liveness probe (live:false above would have failed).
     expect(armCalls).toHaveLength(1);
     expect(printed).toHaveLength(0);
+  });
+});
+
+describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: release binds to the CAPTURED generation)", () => {
+  function mkBarrierOps(commitGen: number, calls: string[]): ReleaseBarrierOps {
+    return {
+      disableJob: async () => {
+        calls.push("disableJob");
+      },
+      enableJob: async () => {
+        calls.push("enableJob");
+      },
+      bootstrapJob: async () => {
+        calls.push("bootstrapJob");
+      },
+      bootoutJob: async () => {
+        calls.push("bootoutJob");
+      },
+      removeHoldFile: async () => undefined,
+      writeHoldFile: async () => undefined,
+      bootSessionUuid: async () => "ABCDEF01-2345-6789-ABCD-EF0123456789",
+      rearmAnchor: async () => ({ ok: true }),
+      verifyGate: async () => ({ ok: true, observed: { generation_id: commitGen, agent_uid: 502 } }),
+      commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502 }),
+      writeReleasedPlist: async () => undefined,
+      restoreParkedPlist: async () => undefined,
+      harnessStatus: async () => ({ known: true, installed: true, running: true, pid: 4242 }),
+    };
+  }
+
+  function wiringInput(barrierOps: ReleaseBarrierOps): ExclusiveEgressWiringInput {
+    return {
+      agentId: "hermes",
+      agentUid: 502,
+      agentAccount: "sanctuary-hermes",
+      fortressPath: "/fortress/a",
+      harnessArgv: ["/usr/local/bin/hermes"],
+      harnessLogDir: "/tmp/sanctuary-test-logs",
+      agentTemplate: "hermes",
+      gateDaemonArgvPrefix: ["sanctuary"],
+      excludeUids: [501],
+      gateAccountCeiling: 599,
+      gateHomeDirectory: "/var/empty",
+      reloadPolicy: async () => ({ ok: true }),
+      publishProvisionedRules: async () => ({ ok: true, ruleIds: [] }),
+      audit: async () => undefined,
+      print: () => undefined,
+      accountOps: {} as never,
+      internals: { barrierOps },
+    };
+  }
+
+  const CAPTURED = { generation_id: 7, agent_uid: 502, gate_port: 49152 };
+
+  it("a registry generation advanced between bring-up and release parks LOUDLY at commit-generation, never releases", async () => {
+    const calls: string[] = [];
+    // This run brought up generation 7; a concurrent repair/install advanced
+    // the registry to generation 8 before the barrier committed. Pre-fix, the
+    // barrier bound to generation 8 (the re-read) and RELEASED it with this
+    // run's stale context while the caller audited generation 7.
+    const ops = createInstallExclusiveEgressOps(wiringInput(mkBarrierOps(8, calls)));
+    const outcome = await ops.runReleaseSequence(CAPTURED);
+    expect(outcome.kind).toBe("parked");
+    expect((outcome as { stage: string }).stage).toBe("commit-generation");
+    const reason = (outcome as { reason: string }).reason;
+    expect(reason).toContain("registry changed during release for uid 502");
+    expect(reason).toContain("generation 7");
+    expect(reason).toContain("generation 8");
+    expect(reason).toContain("re-run the repair");
+    // The release surfaces were never touched (fail-closed park, agent stays
+    // parked: no enable, no bootstrap).
+    expect(calls).not.toContain("enableJob");
+    expect(calls).not.toContain("bootstrapJob");
+  });
+
+  it("a matching generation at commit still releases (no false park from the guard)", async () => {
+    const ops = createInstallExclusiveEgressOps(wiringInput(mkBarrierOps(7, [])));
+    const outcome = await ops.runReleaseSequence(CAPTURED);
+    expect(outcome).toEqual({ kind: "released", generation_id: 7 });
+  });
+
+  it("the REPAIR ops reuse the guarded install release path (repair run A cannot release repair run B's generation)", async () => {
+    const calls: string[] = [];
+    const repair = createRepairExclusiveEgressOps(wiringInput(mkBarrierOps(8, calls)));
+    const outcome = await repair.runReleaseSequence(CAPTURED);
+    expect(outcome.kind).toBe("parked");
+    expect((outcome as { stage: string }).stage).toBe("commit-generation");
+    expect((outcome as { reason: string }).reason).toContain("registry changed during release for uid 502");
+    expect(calls).not.toContain("enableJob");
+    // And the matching case releases through the same repair surface.
+    const ok = createRepairExclusiveEgressOps(wiringInput(mkBarrierOps(7, [])));
+    expect(await ok.runReleaseSequence(CAPTURED)).toEqual({ kind: "released", generation_id: 7 });
   });
 });
