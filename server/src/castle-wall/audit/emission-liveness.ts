@@ -305,6 +305,10 @@ export class EmissionLivenessWatchdog implements EmissionLivenessNotes {
    * records the stand-down honestly). The recovery callback is NOT invoked
    * because nothing recovered: an active stall episode ends unresolved, and
    * the monotonic totals are preserved so diagnostics keep the history.
+   * RE-DETECTION LATENCY: because the unemitted run is cleared, a REAL stall
+   * that persists across a revoke/re-arm cannot re-fire until at least
+   * `minDecisions` (default 2) fresh decisions arrive after the re-arm AND a
+   * full fresh grace window elapses on top of them.
    */
   standDown(): void {
     this.decidedSinceLastEmission = 0;

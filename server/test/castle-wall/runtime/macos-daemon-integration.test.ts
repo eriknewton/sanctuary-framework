@@ -822,6 +822,162 @@ describe("Castle Wall macOS daemon integration", () => {
     expect(stalls.length).toBe(0);
   });
 
+  it("receipts landing DURING a revoked window never mature into a stall after re-arm; a FRESH post-re-arm divergence still fires (final fix-round HIGH)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    let captured: {
+      consumer: MacOSCastleWallListenerOptions["consumer"];
+      onArmLease: MacOSCastleWallListenerOptions["onArmLease"];
+      onArmLeaseRevoke: MacOSCastleWallListenerOptions["onArmLeaseRevoke"];
+    } | null = null;
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      // Grace SHORTER than the revoked-window wait below, so the stale run's
+      // anchor is already past the grace window at re-arm time: without the
+      // fresh-arm stand-down, the FIRST post-re-arm tick matures it into a
+      // false audit_emission_stall (the exact pre-fix failure mode this test
+      // exists to pin; it fails on pre-fix code).
+      emissionStallGraceMs: 200,
+      emissionLivenessTickSeconds: 0.01,
+      listenerFactory(options) {
+        captured = {
+          consumer: options.consumer,
+          onArmLease: options.onArmLease,
+          onArmLeaseRevoke: options.onArmLeaseRevoke,
+        };
+        return fakeListenerFactory(options);
+      },
+    });
+    const consumer = captured!.consumer;
+    const malformed = {
+      type: "flow_decision_recorded",
+      decision: "INVALID",
+      destination: { host: "x", ip: "1.2.3.4", port: 443, protocol: "tcp", hostname_source: null, opaque: false },
+      agent: { id: "agent-revoked-window", template: "ops-runner" },
+      matched_rule_id: null,
+      recorded_at: "2026-05-11T12:01:00Z",
+    } as unknown as Parameters<typeof consumer.handleFlowDecisionRecorded>[0];
+
+    // Stand the wall down FIRST, then let receipts land DURING the revoked
+    // window (an in-flight or draining sysext still delivering decisions that
+    // validation rejects). The receipt feed is deliberately ungated by the
+    // revoke flag, so these count into the watchdog's state.
+    await captured!.onArmLeaseRevoke?.({
+      type: "arm_lease",
+      armed: false,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-17T00:00:00.000Z",
+    });
+    await consumer.handleFlowDecisionRecorded(malformed);
+    await consumer.handleFlowDecisionRecorded(malformed);
+
+    // Age the stale run well past the grace window while still revoked. The
+    // tick timer is stopped, so nothing can fire during this window either
+    // way; what matters is that the anchor is now grace-expired.
+    await wait(400);
+
+    // Re-arm, then run many ticks with NO fresh divergence: the stood-down
+    // window's receipts must not poison the new arm window.
+    await captured!.onArmLease?.({
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: 90,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-17T00:00:00.000Z",
+    });
+    await wait(300);
+    let stalls = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "audit_emission_stall");
+    expect(stalls.length).toBe(0);
+
+    // A FRESH post-re-arm divergence must still fire: the fresh-arm
+    // stand-down resets the window, it does not blunt the detector.
+    await consumer.handleFlowDecisionRecorded(malformed);
+    await consumer.handleFlowDecisionRecorded(malformed);
+    await wait(800);
+    await handle.stop();
+
+    stalls = (
+      await auditLog.query({ layer: "l1", limit: 5000 })
+    ).entries.filter((e) => e.operation === "audit_emission_stall");
+    expect(stalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("a fresh arm restarts the audit liveness heartbeat a revoke stopped, and the post-re-arm beat carries the emission-liveness snapshot (final fix-round MED)", async () => {
+    const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    let captured: {
+      onArmLease: MacOSCastleWallListenerOptions["onArmLease"];
+      onArmLeaseRevoke: MacOSCastleWallListenerOptions["onArmLeaseRevoke"];
+    } | null = null;
+    const handle = await startMacOSCastleWallDaemon({
+      fortressPath,
+      fortressId: "fortress-test",
+      masterKey,
+      localSign: true,
+      auditLog,
+      platform: "darwin",
+      activeConfigPath: activeConfigPath(fortressPath),
+      auditHeartbeatIntervalSeconds: 0.01,
+      // Fast tick so the re-engaged watchdog stamps a real evaluation pulse
+      // for the post-re-arm beat to carry.
+      emissionLivenessTickSeconds: 0.01,
+      listenerFactory(options) {
+        captured = {
+          onArmLease: options.onArmLease,
+          onArmLeaseRevoke: options.onArmLeaseRevoke,
+        };
+        return fakeListenerFactory(options);
+      },
+    });
+    const countBeats = async () =>
+      (
+        await auditLog.query({ layer: "l1", limit: 5000 })
+      ).entries.filter((e) => e.operation === CASTLE_WALL_HEARTBEAT_OPERATION);
+    await wait(30);
+    await captured!.onArmLeaseRevoke?.({
+      type: "arm_lease",
+      armed: false,
+      ttl_seconds: null,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-17T00:00:00.000Z",
+    });
+    // Let any in-flight beat land, then confirm the revoke stand-down still
+    // stops the beat (the restart must not weaken the revoke path).
+    await wait(30);
+    const afterRevoke = (await countBeats()).length;
+    await wait(50);
+    const later = (await countBeats()).length;
+    expect(later).toBe(afterRevoke);
+
+    // Re-arm: the beat must resume. Pre-fix it never did, so the re-engaged
+    // watchdog's snapshot was unobservable for the rest of the process life.
+    await captured!.onArmLease?.({
+      type: "arm_lease",
+      armed: true,
+      ttl_seconds: 90,
+      heartbeat_interval_seconds: 5,
+      updated_at: "2026-07-17T00:00:00.000Z",
+    });
+    await wait(60);
+    await handle.stop();
+
+    const beats = await countBeats();
+    expect(beats.length).toBeGreaterThan(afterRevoke);
+    const last = beats[beats.length - 1]!;
+    const snapshot = (last.details as Record<string, unknown>)
+      .emission_liveness as Record<string, unknown>;
+    expect(snapshot).toBeDefined();
+    expect(snapshot.stalled).toBe(false);
+    expect(typeof snapshot.last_evaluate_at_ms).toBe("number");
+  });
+
   it("rejects a zero/negative/NaN emissionLivenessTickSeconds at the daemon boundary (fix-round LOW)", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress();
     for (const bad of [0, -5, Number.NaN]) {

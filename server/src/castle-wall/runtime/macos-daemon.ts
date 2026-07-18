@@ -617,6 +617,15 @@ export async function startMacOSCastleWallDaemon(
     clearInterval(auditHeartbeat);
     auditHeartbeat = undefined;
   };
+  // Restart the periodic audit liveness heartbeat if it is not currently
+  // running. Used when a fresh operator arm arrives AFTER a prior revoke
+  // stopped the beat (final fix-round MED: onArmLeaseRevoke calls
+  // stopAuditHeartbeat, and without a restart the re-engaged watchdog's
+  // snapshot would never publish again for the rest of the process life).
+  // Assigned in the startup try-block below (it closes over
+  // emitAuditHeartbeat); an operator arm can only arrive after
+  // `listener.start()`, by which point this is set. A no-op before then.
+  let restartAuditHeartbeat: (() => void) | undefined;
   /**
    * #912 MED-1 fix (drill-found, 2026-07-12): a dropped best-effort reload
    * audit write (`recordReloadOutcome`'s detached persist missing its
@@ -694,9 +703,13 @@ export async function startMacOSCastleWallDaemon(
     emissionLivenessTimer = undefined;
   };
   // Whether the operator has REVOKED the arm lease (deliberate stand-down).
-  // Gates the watchdog's decision feeds and its tick timer: a stood-down wall
-  // makes no emission promise, so nothing observed after a revoke may mature
-  // into a stall alarm (fix-round MED). A fresh operator arm clears it.
+  // Gates exactly ONE decision feed, the as-uid egress probe below (the
+  // receipt feed in the flow consumer is deliberately ungated, so receipts
+  // landing in a revoked window still count into the watchdog's state; the
+  // fresh-arm stand-down in onArmLease clears them before the tick resumes).
+  // The revoke handler also stops the tick timer: a stood-down wall makes no
+  // emission promise, so nothing observed after a revoke may mature into a
+  // stall alarm (fix-round MED). A fresh operator arm clears it.
   let armLeaseRevoked = false;
   // Idempotent starter so the tick timer can be resumed after a revoke
   // stopped it (mirror of restartLeaseHeartbeat). Defined here, first started
@@ -888,10 +901,25 @@ export async function startMacOSCastleWallDaemon(
       leaseExpired = false;
       restartLeaseHeartbeat?.();
       // A fresh arm also re-engages the emission-liveness watchdog that a
-      // prior revoke stood down (fix-round MED): clear the revoke gate so the
-      // probe feed counts again, and resume the divergence tick.
+      // prior revoke stood down (fix-round MED). Stand it down FIRST (final
+      // fix-round HIGH): the receipt feed is deliberately not gated by the
+      // revoke, so receipts landing DURING the revoked window (an in-flight
+      // or draining sysext, validation-rejected or persist-failing
+      // decisions) accumulate as an unemitted run whose grace anchor keeps
+      // aging while the wall is intentionally stood down. Restarting the
+      // tick with that stale run intact would mature it into a false
+      // `audit_emission_stall` on the first post-re-arm tick; clearing it
+      // here means only FRESH post-re-arm divergence can fire. Then clear
+      // the revoke gate so the probe feed counts again, and resume the
+      // divergence tick.
+      emissionLivenessWatchdog.standDown();
       armLeaseRevoked = false;
       startEmissionLivenessTimer();
+      // The revoke also stopped the audit liveness heartbeat; restart it so
+      // the re-armed wall's liveness (and the re-engaged watchdog's snapshot
+      // riding each beat) publishes again (final fix-round MED). Mirrors the
+      // initial start: one immediate best-effort beat, then the interval.
+      restartAuditHeartbeat?.();
     },
     async onArmLeaseRevoke() {
       stopLeaseHeartbeat();
@@ -1097,11 +1125,24 @@ export async function startMacOSCastleWallDaemon(
         degradedCarry.restore(degradedCountThisBeat);
       }
     };
-    await emitAuditHeartbeat();
-    auditHeartbeat = setInterval(() => {
+    const startAuditHeartbeatInterval = (): void => {
+      auditHeartbeat = setInterval(() => {
+        void emitAuditHeartbeat();
+      }, auditHeartbeatIntervalSeconds * 1000);
+      auditHeartbeat.unref();
+    };
+    restartAuditHeartbeat = (): void => {
+      if (auditHeartbeat) return;
+      // One immediate best-effort beat so the re-armed wall's liveness (and
+      // the watchdog snapshot it carries) is visible without waiting a full
+      // audit-cadence interval, mirroring the awaited first beat of the
+      // initial start below. emitAuditHeartbeat handles its own write
+      // failures, so nothing here can throw into the arm path.
       void emitAuditHeartbeat();
-    }, auditHeartbeatIntervalSeconds * 1000);
-    auditHeartbeat.unref();
+      startAuditHeartbeatInterval();
+    };
+    await emitAuditHeartbeat();
+    startAuditHeartbeatInterval();
 
     // Slice M emission-liveness tick (definition next to
     // stopEmissionLivenessTimer above; restarted by a fresh operator arm
