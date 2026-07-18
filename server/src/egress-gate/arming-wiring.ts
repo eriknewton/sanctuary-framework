@@ -84,18 +84,19 @@ import {
   type ReleaseBarrierOutcome,
 } from "./release-barrier.js";
 import {
-  EGRESS_GATE_RUNTIME_DIR,
   GATE_ORACLE_PUBLIC_KEY_PATH,
   egressGateDaemonLabel,
   egressGateDaemonPlistPath,
   egressGatePolicyConfigPath,
   egressGateRulesConfigPath,
   egressGateRuntimeStatePath,
+  egressGateRuntimeUidDirPath,
   parseEgressGateRuntimeState,
   renderEgressGateDaemonPlist,
   type EgressGateRuntimeState,
 } from "./gate-daemon.js";
 import { diffTransientPfRules } from "./drift-guard.js";
+import { ensureExclusiveEgressRuntimeFs } from "./runtime-fs-plan.js";
 import {
   buildExclusiveEgressPosture,
   summarizeExclusiveEgressStatus,
@@ -166,7 +167,13 @@ export async function ensureSupervisorOracleKeys(): Promise<{
   privateKey: KeyObject;
   publicKey: KeyObject;
 }> {
-  await mkdir(GATE_LIVENESS_DIR, { recursive: true, mode: 0o755 }).catch(() => undefined);
+  // EXPLICIT mode (fix-round BLOCKER-2 class): 0711 so the non-root gate uid
+  // can traverse to its token + the 0644 public key (mkdir's mode argument is
+  // umask-masked and silent on a pre-existing dir). Loud on failure: keys the
+  // gate cannot reach are a guaranteed all-deny.
+  await mkdir(GATE_LIVENESS_DIR, { recursive: true, mode: 0o711 });
+  const { chmod } = await import("node:fs/promises");
+  await chmod(GATE_LIVENESS_DIR, 0o711);
   try {
     const pem = await readFile(GATE_ORACLE_PRIVATE_KEY_PATH, "utf8");
     const privateKey = createPrivateKey(pem);
@@ -209,11 +216,31 @@ export function createProductionOracle(privateKey: KeyObject, gateUid: number): 
   );
 }
 
-/** lsof-backed port-owner check: the listener on `port` must be pid+uid-expected. */
-export async function verifyLoopbackPortOwner(input: {
+/**
+ * Tolerance for comparing the gate's self-reported start epoch against the
+ * kernel's (`ps -o lstart=`, 1s resolution, plus Date.now()/uptime jitter).
+ * A recycled pid would need to land within this window AND on the same port
+ * with the same uid to fool the check.
+ */
+export const PID_START_TOLERANCE_MS = 10_000;
+
+/**
+ * lsof-backed loopback TCP port-owner check (TCP-only by construction: the
+ * whole exclusive-egress stack is 127.0.0.1 TCP). The listener on `port`
+ * must be the expected pid, and -- when supplied -- the expected uid and the
+ * expected `pid_start` token (`<pid>-<startEpochMs>`, the gate runtime
+ * state's pid-reuse defense, fix-round finding: the stored token was
+ * previously never enforced). The start-time check reads the kernel's
+ * process start via `ps -p <pid> -o lstart=` and requires it within
+ * {@link PID_START_TOLERANCE_MS} of the token's epoch. Fail-closed: any
+ * lookup/parse failure or mismatch is NOT owner-verified.
+ */
+export async function verifyLoopbackTcpPortOwner(input: {
   port: number;
   expectedPid: number;
   expectedUid?: number;
+  /** The runtime state's `pid_start` token (`<pid>-<startEpochMs>`). */
+  expectedPidStart?: string;
   execFileFn?: typeof execFileAsync;
 }): Promise<boolean> {
   const run = input.execFileFn ?? execFileAsync;
@@ -233,9 +260,21 @@ export async function verifyLoopbackPortOwner(input: {
     }
     if (pid !== input.expectedPid) return false;
     if (input.expectedUid !== undefined && uid !== input.expectedUid) return false;
+    if (input.expectedPidStart !== undefined) {
+      const m = /^(\d+)-(\d+)$/.exec(input.expectedPidStart);
+      if (m === null) return false; // malformed token: never owner-verified
+      if (Number(m[1]) !== input.expectedPid) return false; // token names another pid
+      const expectedStartMs = Number(m[2]);
+      const { stdout: lstartOut } = await run("ps", ["-p", String(input.expectedPid), "-o", "lstart="]);
+      const lstart = lstartOut.trim();
+      if (lstart.length === 0) return false;
+      const actualStartMs = Date.parse(lstart);
+      if (!Number.isFinite(actualStartMs)) return false;
+      if (Math.abs(actualStartMs - expectedStartMs) > PID_START_TOLERANCE_MS) return false;
+    }
     return true;
   } catch {
-    // No listener / lsof failure: not owner-verified (fail-closed).
+    // No listener / lsof or ps failure: not owner-verified (fail-closed).
     return false;
   }
 }
@@ -331,6 +370,12 @@ async function productionBringUp(
   state: BringUpState,
   oracle: GateLivenessOracle,
 ): Promise<ExclusiveGenerationIdentity> {
+  // FIRST (fix-round BLOCKER-1 + BLOCKER-2): assert the runtime filesystem
+  // layout -- the gate-uid-owned per-uid runtime subdir, the 0711 traversal
+  // modes on gate-cred/gate-liveness, 0755 on the parents -- with explicit
+  // chown/chmod as root, BEFORE any config publish, credential mint, or gate
+  // bootstrap. Throws on failure (no arming over a broken layout).
+  await ensureExclusiveEgressRuntimeFs({ agentUid: input.agentUid, gateUid: state.gateUid });
   const registry = createProductionAnchorRegistry();
   let lastBinding: GateBinding | null = null;
 
@@ -341,8 +386,12 @@ async function productionBringUp(
       void request;
       return binding;
     },
+    // Placeholder-bind owner check (G2): pid-only by design -- the in-process
+    // placeholder's pidStart token is the NON-AUTHORITATIVE `pid-<pid>` form
+    // (see bindEphemeralGatePort); the authoritative pid_start enforcement
+    // applies to the GATE DAEMON's runtime state below and in verifyGate.
     verifyOwner: async ({ port, pid }) =>
-      verifyLoopbackPortOwner({ port, expectedPid: pid }),
+      verifyLoopbackTcpPortOwner({ port, expectedPid: pid }),
     registry: {
       armEntry: async (entry) => {
         await registry.addOrUpdate({
@@ -388,8 +437,9 @@ async function productionBringUp(
       );
       await atomicRootWrite(fortressPolicyPath, policyDoc, 0o600);
       // (c) ...and the gate-readable runtime copies (policy + rules) for the
-      // non-root gate daemon, which cannot read the operator fortress.
-      await mkdir(EGRESS_GATE_RUNTIME_DIR, { recursive: true, mode: 0o755 }).catch(() => undefined);
+      // non-root gate daemon, which cannot read the operator fortress. The
+      // runtime dir layout (modes + per-uid gate-owned subdir) was asserted
+      // by ensureExclusiveEgressRuntimeFs at the top of the bring-up.
       await atomicRootWrite(egressGatePolicyConfigPath(gen.agent_uid), policyDoc, 0o644);
       const { readEgressRulesFromDisk } = await import("../castle-wall/provision/egress.js");
       const rules = await readEgressRulesFromDisk(input.fortressPath);
@@ -464,10 +514,11 @@ async function productionBringUp(
     throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
   }
   const runtime = await waitForGateRuntime(input.agentUid, committed.generation_id, committed.gate_port);
-  const ownerOk = await verifyLoopbackPortOwner({
+  const ownerOk = await verifyLoopbackTcpPortOwner({
     port: committed.gate_port,
     expectedPid: runtime.pid,
     expectedUid: state.gateUid,
+    expectedPidStart: runtime.pid_start,
   });
   if (!ownerOk) {
     throw new Error(
@@ -641,10 +692,11 @@ export function createProductionReleaseBarrierOps(input: {
       });
       if (!match.serve) reasons.push(...match.reasons);
       if (dirty) reasons.push("registry is dirty (needs repair)");
-      const ownerOk = await verifyLoopbackPortOwner({
+      const ownerOk = await verifyLoopbackTcpPortOwner({
         port: entry.gate_port,
         expectedPid: runtime.pid,
         expectedUid: input.gateUid,
+        expectedPidStart: runtime.pid_start,
       });
       if (!ownerOk) {
         reasons.push(`gate port ${entry.gate_port} listener is not the gate daemon (owner check failed)`);
@@ -767,24 +819,44 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
 }
 
 /**
- * DEGRADE-LOUD manifest restore (the S5-4 coarse-only path): remove the
- * exclusive marker + gate policy, republish the endpoint rules agent-scoped,
- * verify the coarse composition residue-free + emit the REQUIRED
- * `exclusive_routing_coarse_fallback` audit, tear the gate surfaces down
- * (registry entry, daemon, credential, oracle token), reload. Throws on
- * failure (the caller keeps the agent parked, loudly).
+ * DEGRADE-LOUD manifest restore (the S5-4 coarse-only path): stop the gate
+ * DAEMON first (fix-round M5: a live gate must never keep serving over
+ * surfaces this function is about to tear down, and a failed stop THROWS
+ * loudly rather than being swallowed), then remove the exclusive marker +
+ * gate policy, republish the endpoint rules agent-scoped, verify the coarse
+ * composition residue-free + emit the REQUIRED
+ * `exclusive_routing_coarse_fallback` audit, tear the remaining gate
+ * surfaces down (registry entry, credential, oracle token), reload. Throws
+ * on failure (the caller keeps the agent parked, loudly).
  */
 export async function restoreCoarseCompositionProduction(
   input: ExclusiveEgressWiringInput,
   reason: string,
+  /** TEST SEAM: launchctl/rm recorders (production always uses the real ops). */
+  deps?: {
+    runLaunchctl?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+    removeFile?: (path: string) => Promise<void>;
+  },
 ): Promise<void> {
-  // 1. Marker + gate policy OFF first: from the next compose the daemon is in
+  const launchctl = deps?.runLaunchctl ?? runLaunchctl;
+  const removeFile = deps?.removeFile ?? (async (path: string): Promise<void> => rm(path, { force: true, recursive: true }));
+  // 0. GATE DAEMON DOWN FIRST (fix-round M5). A "no such process"/not-found
+  // bootout is success (nothing was running); any OTHER failure throws --
+  // tearing down the credential/registry/config under a still-serving gate
+  // would leave a live-but-unaccounted-for daemon, and swallowing that was
+  // the exact reviewed defect. The caller keeps the agent parked, loudly.
+  const bootout = await launchctl(["bootout", `system/${egressGateDaemonLabel(input.agentUid)}`]);
+  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+    throw new Error(
+      `coarse restore: could not stop the egress-gate daemon (launchctl bootout exited ${bootout.code}: ` +
+        `${bootout.stderr.trim()}); refusing to tear down the gate surfaces under a possibly-live gate`,
+    );
+  }
+  // 1. Marker + gate policy OFF next: from the next compose the daemon is in
   // plain coarse mode (gate-scoped rules briefly compose coarse -- the agent
   // has no direct allows in that window, which is the safe direction).
-  await rm(exclusiveRoutingMarkerPath(input.fortressPath), { force: true });
-  await rm(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME), {
-    force: true,
-  });
+  await removeFile(exclusiveRoutingMarkerPath(input.fortressPath));
+  await removeFile(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME));
   // 2. Registry entry off (un-confine the agent's loopback from the dead gate
   // port; flush only fires when the last uid leaves) + token/credential off.
   const registry = createProductionAnchorRegistry();
@@ -808,12 +880,12 @@ export async function restoreCoarseCompositionProduction(
     await oracle.invalidate(input.agentUid);
     await createFsGateCredentialAuthority({ gateUid }).revoke(input.agentUid);
   }
-  // 3. Gate daemon down + config copies off.
-  await runLaunchctl(["bootout", `system/${egressGateDaemonLabel(input.agentUid)}`]).catch(() => undefined);
-  await rm(egressGateDaemonPlistPath(input.agentUid), { force: true });
-  await rm(egressGatePolicyConfigPath(input.agentUid), { force: true });
-  await rm(egressGateRulesConfigPath(input.agentUid), { force: true });
-  await rm(egressGateRuntimeStatePath(input.agentUid), { force: true });
+  // 3. Plist + config copies + the per-uid runtime dir off (daemon already
+  // stopped in step 0).
+  await removeFile(egressGateDaemonPlistPath(input.agentUid));
+  await removeFile(egressGatePolicyConfigPath(input.agentUid));
+  await removeFile(egressGateRulesConfigPath(input.agentUid));
+  await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
   // 4. Republish the endpoint rules AGENT-scoped (coarse) + reload.
   const published = await input.publishProvisionedRules({ mode: "coarse" });
   if (!published.ok) {
@@ -867,7 +939,7 @@ export function createRepairExclusiveEgressOps(input: ExclusiveEgressWiringInput
       const registry = createProductionAnchorRegistry();
       const coordinator = new GenerationCoordinator({
         bind: async () => bindEphemeralGatePort(),
-        verifyOwner: async ({ port, pid }) => verifyLoopbackPortOwner({ port, expectedPid: pid }),
+        verifyOwner: async ({ port, pid }) => verifyLoopbackTcpPortOwner({ port, expectedPid: pid }),
         registry: {
           armEntry: async (entry) => {
             await registry.addOrUpdate({
@@ -1112,9 +1184,18 @@ export function createExclusiveEgressPostureProducer(input: {
           now: Date.now(),
         });
       }
+      // Owner check with the full evidence available to posture: expected
+      // gate uid from the marker (the registry entry carries no gate uid) and
+      // the runtime state's pid_start token (pid-reuse defense, fix-round:
+      // previously stored but never enforced).
       const ownerVerified =
         runtime !== null &&
-        (await verifyLoopbackPortOwner({ port: runtime.gate_port, expectedPid: runtime.pid }));
+        (await verifyLoopbackTcpPortOwner({
+          port: runtime.gate_port,
+          expectedPid: runtime.pid,
+          ...(marker !== null && marker.agent_uid === uid ? { expectedUid: marker.gate_uid } : {}),
+          expectedPidStart: runtime.pid_start,
+        }));
       agents.push(
         buildExclusiveEgressPosture({
           agent_uid: uid,

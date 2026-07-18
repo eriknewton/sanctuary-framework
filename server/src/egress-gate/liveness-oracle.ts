@@ -54,7 +54,15 @@ import { sign as edSign, verify as edVerify, type KeyObject } from "node:crypto"
 import type { PfLivenessResult } from "./pf-anchor.js";
 import type { GateLivenessProbe } from "./gate-server.js";
 
-/** Root-owned parent directory for the gate liveness tokens (0700 root). */
+/**
+ * Root-owned parent directory for the gate liveness tokens. Mode 0711
+ * (fix-round BLOCKER-2 class; asserted by `runtime-fs-plan.ts` at arming
+ * time): root-only write + listing, execute/search for everyone, so the
+ * NON-ROOT gate uid can traverse to its 0600 `<uid>.token` and the 0644
+ * pinned supervisor PUBLIC key. The 0600 root-owned PRIVATE key in the same
+ * dir stays unreadable by file mode. A 0700 parent (the pre-fix state)
+ * blocked the gate's token read and made every CONNECT deny.
+ */
 export const GATE_LIVENESS_DIR = "/var/db/sanctuary/gate-liveness";
 
 /** On-disk schema version for the signed freshness token. */
@@ -364,8 +372,12 @@ export function createFsLivenessOracleOps(input: {
   const tokenPath = (uid: number): string => `${dir}/${uid}.token`;
   return {
     async writeToken(agentUid, payload): Promise<void> {
-      const { open, mkdir, rename, rm } = await import("node:fs/promises");
-      await mkdir(dir, { recursive: true, mode: 0o700 }).catch(() => undefined);
+      const { open, mkdir, chmod, rename, rm } = await import("node:fs/promises");
+      await mkdir(dir, { recursive: true, mode: 0o711 }).catch(() => undefined);
+      // EXPLICIT traversal mode (see GATE_LIVENESS_DIR): the gate uid must be
+      // able to search this dir to read its own 0600 token; mkdir's mode is
+      // umask-masked and does nothing for a pre-existing dir.
+      await chmod(dir, 0o711);
       const path = tokenPath(agentUid);
       const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
       const handle = await open(tmp, "wx", 0o600);

@@ -23,8 +23,11 @@
  * different port (posture goes amber via the owner check + oracle; the root
  * owner coordinates a full new generation). After a successful bind the
  * daemon writes a RUNTIME STATE file (`/var/db/sanctuary/gate-runtime/
- * <uid>.json`: port, pid, pid start-time, generation) that the root
- * supervisor's owner check and the posture producer read.
+ * <uid>/state.json`: port, pid, pid start-time, generation) that the root
+ * supervisor's owner check and the posture producer read. The per-uid
+ * subdir is PRE-CREATED and chowned to the gate uid by the root supervisor
+ * (`runtime-fs-plan.ts`, fix-round BLOCKER-1): the non-root gate daemon can
+ * write only inside its own subdir, never the root-owned parent.
  *
  * HONESTY BOUNDS: destination + per-action policy at this gate is
  * USERSPACE-enforced; gate compromise = bypass of per-action destination
@@ -50,7 +53,12 @@ import { createGateClientAuthenticator, type GateClientAuthenticator } from "./g
 import { createFsGateAcceptSource, GATE_CRED_DIR } from "./gate-credential.js";
 import { createExecFilePeerRunner } from "./peer-identity.js";
 
-/** Root-owned runtime-state dir (0755 root; files owner gate-uid, world-readable). */
+/**
+ * Root-owned runtime dir (0755 root, EXPLICIT chmod via `runtime-fs-plan.ts`).
+ * Root writes the world-readable per-uid CONFIG copies directly in it; each
+ * agent's gate daemon writes its runtime STATE inside its own pre-chowned
+ * per-uid subdir ({@link egressGateRuntimeUidDirPath}).
+ */
 export const EGRESS_GATE_RUNTIME_DIR = "/var/db/sanctuary/gate-runtime";
 
 /**
@@ -90,12 +98,21 @@ export function egressGateDaemonPlistPath(agentUid: number): string {
   return `/Library/LaunchDaemons/${egressGateDaemonLabel(agentUid)}.plist`;
 }
 
-/** Runtime-state file path for one agent's gate. */
-export function egressGateRuntimeStatePath(agentUid: number, dir: string = EGRESS_GATE_RUNTIME_DIR): string {
+/**
+ * The per-uid runtime-state SUBDIR: owned by the GATE uid (root pre-creates +
+ * chowns it at arming time, `runtime-fs-plan.ts`), 0755 so root and the
+ * posture producer can read the state file the gate publishes inside it.
+ */
+export function egressGateRuntimeUidDirPath(agentUid: number, dir: string = EGRESS_GATE_RUNTIME_DIR): string {
   if (!Number.isInteger(agentUid) || agentUid <= 0) {
     throw new Error(`gate runtime-state path requires a positive integer uid (got ${String(agentUid)})`);
   }
-  return join(dir, `${agentUid}.json`);
+  return join(dir, String(agentUid));
+}
+
+/** Runtime-state file path for one agent's gate (inside the gate-owned per-uid subdir). */
+export function egressGateRuntimeStatePath(agentUid: number, dir: string = EGRESS_GATE_RUNTIME_DIR): string {
+  return join(egressGateRuntimeUidDirPath(agentUid, dir), "state.json");
 }
 
 /** The gate daemon's published runtime state (root supervisor + posture read it). */
@@ -374,7 +391,21 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
     pid: process.pid,
     pid_start: `${process.pid}-${Math.round(Date.now() - process.uptime() * 1000)}`,
   };
-  await mkdir(runtimeDir, { recursive: true }).catch(() => undefined);
+  // The per-uid subdir is root-pre-created and chowned to THIS gate uid at
+  // arming time (`runtime-fs-plan.ts`). The mkdir here only serves dir-
+  // override tests / self-healing when the subdir already belongs to us; a
+  // failure to have a writable dir surfaces LOUDLY below (the daemon exits
+  // non-zero rather than serving without a readable runtime state).
+  const uidDir = egressGateRuntimeUidDirPath(deps.agentUid, runtimeDir);
+  try {
+    await mkdir(uidDir, { recursive: true });
+  } catch (err) {
+    throw new Error(
+      `egress-gate daemon: runtime dir ${uidDir} is missing and could not be created ` +
+        `(${(err as Error).message}); the root supervisor pre-provisions it at arming time -- refusing to serve`,
+      { cause: err },
+    );
+  }
   const tmp = `${runtimeStatePath}.tmp-${process.pid}`;
   await writeFile(tmp, JSON.stringify(state), { mode: 0o644 });
   await rename(tmp, runtimeStatePath);

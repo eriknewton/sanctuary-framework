@@ -224,4 +224,53 @@ describe("egress-gate/gate-credential default mint + FS round-trip", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("fix-round BLOCKER-2: the FS authority's COMPUTED ownership/mode sequence is pinned via a recorder (0711 traversal dir; per-file chown-to-reader + 0600 strictly before the rename)", async () => {
+    const calls: string[] = [];
+    const fsOps = {
+      open: async (path: string, flags: string, mode: number) => {
+        calls.push(`open ${path} ${flags} 0o${mode.toString(8)}`);
+        return {
+          writeFile: async () => void calls.push(`write ${path}`),
+          chown: async (uid: number, gid: number) => void calls.push(`fchown ${path} ${uid}:${gid}`),
+          chmod: async (mode2: number) => void calls.push(`fchmod ${path} 0o${mode2.toString(8)}`),
+          close: async () => void calls.push(`close ${path}`),
+        };
+      },
+      mkdir: async (path: string, options: { recursive: boolean; mode: number }) => {
+        calls.push(`mkdir ${path} 0o${options.mode.toString(8)}`);
+      },
+      chmod: async (path: string, mode: number) => {
+        calls.push(`chmod ${path} 0o${mode.toString(8)}`);
+      },
+      rename: async (from: string, to: string) => void calls.push(`rename ${to}`),
+      rm: async (path: string) => void calls.push(`rm ${path}`),
+    };
+    const authority = createFsGateCredentialAuthority({
+      gateUid: 511,
+      dir: "/var/db/sanctuary/gate-cred",
+      mintSecret: () => "ab".repeat(32),
+      fsOps,
+    });
+    await authority.mint({ agentUid: 502, generationId: 9 });
+
+    // Per-write shape: mkdir(0711) -> EXPLICIT chmod(dir, 0711) -> open tmp
+    // wx 0600 -> write -> fchown(reader) -> fchmod(0600) -> close -> rename.
+    const acceptIdx = calls.findIndex((c) => c.startsWith("fchown") && c.includes(".accept"));
+    const tokenIdx = calls.findIndex((c) => c.startsWith("fchown") && c.includes(".token"));
+    expect(calls[acceptIdx]).toMatch(/^fchown \/var\/db\/sanctuary\/gate-cred\/502\.accept\.tmp-\S+ 511:-1$/);
+    expect(calls[tokenIdx]).toMatch(/^fchown \/var\/db\/sanctuary\/gate-cred\/502\.token\.tmp-\S+ 502:-1$/);
+    // Accept (gate-readable) is written strictly BEFORE the agent token.
+    expect(acceptIdx).toBeLessThan(tokenIdx);
+    // The dir traversal mode is asserted explicitly (0711), not left to mkdir/umask.
+    expect(calls).toContain("mkdir /var/db/sanctuary/gate-cred 0o711");
+    expect(calls).toContain("chmod /var/db/sanctuary/gate-cred 0o711");
+    // Ownership binds before the file appears at its final path.
+    const acceptRename = calls.findIndex((c) => c === "rename /var/db/sanctuary/gate-cred/502.accept");
+    const tokenRename = calls.findIndex((c) => c === "rename /var/db/sanctuary/gate-cred/502.token");
+    expect(acceptRename).toBeGreaterThan(acceptIdx);
+    expect(tokenRename).toBeGreaterThan(tokenIdx);
+    // Tmp files are opened exclusive-create 0600.
+    expect(calls.filter((c) => c.startsWith("open")).every((c) => c.includes(" wx 0o600"))).toBe(true);
+  });
 });

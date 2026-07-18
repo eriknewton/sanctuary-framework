@@ -239,6 +239,7 @@ export {
   egressGatePolicyConfigPath,
   egressGateRulesConfigPath,
   egressGateRuntimeStatePath,
+  egressGateRuntimeUidDirPath,
   parseEgressGateRuntimeState,
   renderEgressGateDaemonPlist,
   runEgressGateDaemon,
@@ -253,6 +254,16 @@ export {
   type TransientPfRulesDiff,
 } from "./drift-guard.js";
 export {
+  SANCTUARY_VAR_DB_DIR,
+  applyGateRuntimeFsPlan,
+  createRealGateRuntimeFsOps,
+  ensureExclusiveEgressRuntimeFs,
+  planExclusiveEgressRuntimeFs,
+  type GateRuntimeFsOps,
+  type GateRuntimeFsPlanInput,
+  type GateRuntimeFsStep,
+} from "./runtime-fs-plan.js";
+export {
   GATE_ORACLE_PRIVATE_KEY_PATH,
   createExclusiveEgressPostureProducer,
   createInstallExclusiveEgressOps,
@@ -263,7 +274,8 @@ export {
   ensureSupervisorOracleKeys,
   restoreCoarseCompositionProduction,
   startExclusiveEgressBootSupervisor,
-  verifyLoopbackPortOwner,
+  verifyLoopbackTcpPortOwner,
+  PID_START_TOLERANCE_MS,
   type ExclusiveEgressBootSupervisorHandle,
   type ExclusiveEgressWiringInput,
 } from "./arming-wiring.js";

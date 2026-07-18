@@ -53,7 +53,10 @@ describe("egress-gate/gate-daemon paths + label", () => {
     expect(egressGateDaemonPlistPath(AGENT_UID)).toBe(
       "/Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate.502.plist",
     );
-    expect(egressGateRuntimeStatePath(AGENT_UID, "/tmp/x")).toBe("/tmp/x/502.json");
+    // Fix-round BLOCKER-1: the state file lives inside the GATE-UID-owned
+    // per-uid subdir (root pre-creates + chowns it; the non-root daemon can
+    // write there), never directly in the root-owned parent.
+    expect(egressGateRuntimeStatePath(AGENT_UID, "/tmp/x")).toBe("/tmp/x/502/state.json");
     expect(egressGatePolicyConfigPath(AGENT_UID, "/tmp/x")).toBe("/tmp/x/502-policy.json");
     expect(egressGateRulesConfigPath(AGENT_UID, "/tmp/x")).toBe("/tmp/x/502-rules.json");
     expect(() => egressGateDaemonLabel(0)).toThrow(/positive integer uid/);
