@@ -27,7 +27,11 @@ import {
   type ExclusiveEgressBootSupervisorInternals,
 } from "../../src/egress-gate/arming-wiring.js";
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
-import type { ReleaseBarrierOutcome } from "../../src/egress-gate/release-barrier.js";
+import {
+  runReleaseBarrierSequence,
+  type ReleaseBarrierOps,
+  type ReleaseBarrierOutcome,
+} from "../../src/egress-gate/release-barrier.js";
 
 const KEYS = ((): { privateKey: never; publicKey: never } => {
   const pair = generateKeyPairSync("ed25519");
@@ -52,7 +56,7 @@ function okLaunchctl(calls: string[]) {
 
 function baseInternals(overrides: ExclusiveEgressBootSupervisorInternals = {}): ExclusiveEgressBootSupervisorInternals {
   return {
-    listRegistryEntries: async () => ({ entries: [ENTRY], quarantined: [] }),
+    listRegistryEntries: async () => ({ entries: [ENTRY], quarantined: [], dirty: false }),
     ensureKeys: async () => KEYS,
     runLaunchctlFn: async () => ({ code: 0, stdout: "", stderr: "" }),
     runBarrier: async () => RELEASED,
@@ -262,7 +266,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H3: persistent registry-
           scans += 1;
           // First list (boot release) sees only ENTRY; later ticks see the
           // post-boot-armed agent too (the install CLI added it).
-          return { entries: scans <= 1 ? [ENTRY] : [ENTRY, lateEntry], quarantined: [] };
+          return { entries: scans <= 1 ? [ENTRY] : [ENTRY, lateEntry], quarantined: [], dirty: false };
         },
         loadMarker: async (fortressPath) =>
           fortressPath === "/fortress/b" ? { agent_uid: 601, gate_uid: 612 } : null,
@@ -301,6 +305,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H3: persistent registry-
             { agent_uid: 701, gate_port: 40004, fortress_path: "/fortress/d" },
           ],
           quarantined: [],
+          dirty: false,
         }),
         createOracle: ((_priv: never, gateUid: number) => ({
           refresh: async (binding: { agentUid: number }) => {
@@ -401,7 +406,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 HIGH-3: host-singleton
       internals: baseInternals({
         // Registry order puts the RESOLVABLE entry FIRST: the supervisor must
         // still run the stale entry's contextless re-park before the release.
-        listRegistryEntries: async () => ({ entries: [okEntry, staleEntry], quarantined: [] }),
+        listRegistryEntries: async () => ({ entries: [okEntry, staleEntry], quarantined: [], dirty: false }),
         runLaunchctlFn: async (args) => {
           events.push(`launchctl ${args.join(" ")}`);
           return { code: 0, stdout: "", stderr: "" };
@@ -458,7 +463,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
               releaseHang = resolve;
             });
           }
-          return { entries: [ENTRY], quarantined: [] };
+          return { entries: [ENTRY], quarantined: [], dirty: false };
         },
       }),
     });
@@ -476,20 +481,26 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
   });
 });
 
-describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-6: quarantined entries + warn-once logs)", () => {
-  it("one malformed registry entry does NOT starve the others: valid agents keep refreshing; the finding is warn-once", async () => {
+describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-6 + fix-round-3 HIGH-2: quarantine + warn-once logs)", () => {
+  it("a quarantined entry is warn-once AND (fix-round-3) forces dirty: the sibling's token is WITHHELD until repair", async () => {
     const refreshed: number[] = [];
     const printed: string[] = [];
+    let listCalls = 0;
     const handle = await startExclusiveEgressBootSupervisor({
       resolveAgent: async () => OK_CTX,
       audit: async () => undefined,
       print: (line) => printed.push(line),
       refreshIntervalMs: 5,
       internals: baseInternals({
-        listRegistryEntries: async () => ({
-          entries: [ENTRY],
-          quarantined: [{ index: 1, reason: "malformed committed entry (failed the fail-closed entry validation)" }],
-        }),
+        listRegistryEntries: async () => {
+          listCalls += 1;
+          // Production semantics: listQuarantined FORCES dirty on quarantine.
+          return {
+            entries: [ENTRY],
+            quarantined: [{ index: 1, reason: "malformed committed entry (failed the fail-closed entry validation)" }],
+            dirty: true,
+          };
+        },
         createOracle: (() => ({
           refresh: async (binding: { agentUid: number }) => {
             refreshed.push(binding.agentUid);
@@ -500,12 +511,14 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-6: quarantined ent
     });
     // Poll until several full ticks completed (load-robust deadline).
     const deadline = Date.now() + 10_000;
-    while (refreshed.filter((uid) => uid === 502).length < 3 && Date.now() < deadline) {
+    while (listCalls < 5 && Date.now() < deadline) {
       await sleep(5);
     }
     handle.stopOracleLoop();
-    // The valid agent kept refreshing across many ticks despite the bad entry.
-    expect(refreshed.filter((uid) => uid === 502).length).toBeGreaterThanOrEqual(3);
+    // Fix-round-3 HIGH-2: the sibling entry got NO token across many ticks --
+    // per-uid liveness cannot rule out extra permissive rules on a dirty
+    // anchor, so re-signing freshness would be an unverifiable claim.
+    expect(refreshed).toHaveLength(0);
     // The quarantine finding is individually identified and WARN-ONCE in the
     // refresh loop (plus the one boot-phase line), never a per-tick flood.
     const bootLines = printed.filter((l) => l.includes("boot: registry entry #1"));
@@ -513,6 +526,10 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-6: quarantined ent
     expect(bootLines).toHaveLength(1);
     expect(refreshLines).toHaveLength(1);
     expect(refreshLines[0]).toContain("QUARANTINED");
+    // The withholding is warn-once per uid, naming the uid and the reason.
+    const withheldLines = printed.filter((l) => l.includes("WITHHELD") && l.includes("uid 502"));
+    expect(withheldLines).toHaveLength(1);
+    expect(withheldLines[0]).toContain("DIRTY");
   });
 
   it("an unreadable registry in the refresh loop is warn-once (not a 1-per-tick flood), re-armed on recovery", async () => {
@@ -527,7 +544,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-6: quarantined ent
         listRegistryEntries: async () => {
           listCalls += 1;
           if (listCalls > 1) throw new Error("EIO reading registry");
-          return { entries: [ENTRY], quarantined: [] };
+          return { entries: [ENTRY], quarantined: [], dirty: false };
         },
       }),
     });
@@ -540,5 +557,193 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-6: quarantined ent
     expect(listCalls).toBeGreaterThanOrEqual(5); // many ticks actually ran
     const unreadableLines = printed.filter((l) => l.includes("registry unreadable"));
     expect(unreadableLines).toHaveLength(1);
+  });
+});
+
+describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-1: shared-label skip verifies not-running)", () => {
+  const staleEntry: BootRegistryEntry = { agent_uid: 502, gate_port: 40001, fortress_path: "/fortress/stale" };
+  // No generation_id on the ok entry: the gate-daemon runtime wait is skipped.
+  const okEntry: BootRegistryEntry = { agent_uid: 601, gate_port: 40002, fortress_path: "/fortress/b" };
+
+  function skipPathInput(printOutput: { code: number; stdout: string; stderr: string }, printed: string[]) {
+    const launchctlCalls: string[] = [];
+    return {
+      launchctlCalls,
+      input: {
+        resolveAgent: async (entry: { agent_uid: number }) =>
+          entry.agent_uid === 601
+            ? { ...OK_CTX, gateUid: 612 }
+            : ({ kind: "unresolvable" as const, reason: "no marker for uid 502" } as BootAgentResolution),
+        audit: async () => undefined,
+        print: (line: string) => void printed.push(line),
+        refreshIntervalMs: 60_000,
+        internals: baseInternals({
+          listRegistryEntries: async () => ({ entries: [okEntry, staleEntry], quarantined: [], dirty: false }),
+          runLaunchctlFn: async (args: readonly string[]) => {
+            launchctlCalls.push(`launchctl ${args.join(" ")}`);
+            if (args[0] === "print") return printOutput;
+            return { code: 0, stdout: "", stderr: "" };
+          },
+          removeHoldFile: async () => undefined,
+          runBarrier: async () => RELEASED,
+        }),
+      },
+    };
+  }
+
+  it("a harness RUNNING from stale launchd state while bootout is withheld is a LOUD park-not-verified, never a silent PARKED", async () => {
+    const printed: string[] = [];
+    // The status probe (launchctl print system/<label>) reports a live pid.
+    const { input, launchctlCalls } = skipPathInput(
+      { code: 0, stdout: "\tstate = running\n\tpid = 4242\n", stderr: "" },
+      printed,
+    );
+    const handle = await startExclusiveEgressBootSupervisor(input);
+    handle.stopOracleLoop();
+    const stale = handle.results.find((r) => r.agent_uid === 502)!;
+    // Pre-fix: this was a quiet {kind:"parked"} while the process kept running.
+    expect(stale.outcome.kind).toBe("park-not-verified");
+    const reason = (stale.outcome as { reason: string }).reason;
+    expect(reason).toContain("uid 502");
+    expect(reason).toContain("RUNNING (pid 4242)");
+    expect(reason).toContain("withheld");
+    expect(reason).toContain("601");
+    // The shared-label ops stayed withheld (never issued for the stale uid).
+    expect(launchctlCalls).not.toContain(`launchctl bootout system/${AGENT_HARNESS_DAEMON_LABEL}`);
+    expect(launchctlCalls).not.toContain(`launchctl disable system/${AGENT_HARNESS_DAEMON_LABEL}`);
+    // The loud boot log names the unverified park.
+    expect(printed.join("\n")).toContain("NOT verified");
+    // The resolvable uid's release still proceeded.
+    const ok = handle.results.find((r) => r.agent_uid === 601)!;
+    expect(ok.outcome).toEqual({ kind: "released", generationId: 7 });
+  });
+
+  it("an UNTRUSTWORTHY launchctl status in the skip path is also park-not-verified (fail-closed toward loud)", async () => {
+    const printed: string[] = [];
+    // launchctl print fails in a way that is neither running nor not-loaded.
+    const { input } = skipPathInput({ code: 150, stdout: "", stderr: "Bad system call" }, printed);
+    const handle = await startExclusiveEgressBootSupervisor(input);
+    handle.stopOracleLoop();
+    const stale = handle.results.find((r) => r.agent_uid === 502)!;
+    expect(stale.outcome.kind).toBe("park-not-verified");
+    expect((stale.outcome as { reason: string }).reason).toContain("trustworthy");
+  });
+
+  it("the skip path with NO running process still parks quietly (kind parked, shared-label ops honestly skipped)", async () => {
+    const printed: string[] = [];
+    // launchctl print: job loaded but no pid line = not running.
+    const { input } = skipPathInput({ code: 0, stdout: "\tstate = not running\n", stderr: "" }, printed);
+    const handle = await startExclusiveEgressBootSupervisor(input);
+    handle.stopOracleLoop();
+    const stale = handle.results.find((r) => r.agent_uid === 502)!;
+    expect(stale.outcome).toMatchObject({ kind: "parked", holdFileRemoved: true, jobDisabled: false });
+  });
+});
+
+describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-2: dirty registry withholds freshness tokens)", () => {
+  it("no token is refreshed while the listing is dirty (warn-once per uid); refresh RESUMES when the registry is clean", async () => {
+    const refreshed: number[] = [];
+    const printed: string[] = [];
+    let listCalls = 0;
+    let dirtyNow = true;
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 5,
+      internals: baseInternals({
+        listRegistryEntries: async () => {
+          listCalls += 1;
+          return { entries: [ENTRY], quarantined: [], dirty: dirtyNow };
+        },
+        createOracle: (() => ({
+          refresh: async (binding: { agentUid: number }) => {
+            refreshed.push(binding.agentUid);
+            return null;
+          },
+        })) as never,
+      }),
+    });
+    // Phase 1: many dirty ticks (load-robust deadline). Pre-fix, the loop
+    // ignored the dirty bit and kept re-signing tokens for a dirty anchor.
+    const deadline = Date.now() + 10_000;
+    while (listCalls < 6 && Date.now() < deadline) {
+      await sleep(5);
+    }
+    expect(refreshed).toHaveLength(0);
+    const withheldLines = printed.filter((l) => l.includes("WITHHELD") && l.includes("uid 502"));
+    expect(withheldLines).toHaveLength(1);
+    // Phase 2: the registry recovers (repair ran); tokens flow again for the
+    // clean entry and the warn-once state is re-armed via the resume line.
+    dirtyNow = false;
+    const resumeDeadline = Date.now() + 10_000;
+    while (refreshed.length === 0 && Date.now() < resumeDeadline) {
+      await sleep(5);
+    }
+    handle.stopOracleLoop();
+    expect(refreshed.length).toBeGreaterThan(0);
+    expect(new Set(refreshed)).toEqual(new Set([502]));
+    expect(printed.filter((l) => l.includes("token refresh resumed"))).toHaveLength(1);
+  });
+});
+
+describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-check before release)", () => {
+  function mkBarrierOps(commitGen: number): ReleaseBarrierOps {
+    return {
+      disableJob: async () => undefined,
+      enableJob: async () => undefined,
+      bootstrapJob: async () => undefined,
+      bootoutJob: async () => undefined,
+      removeHoldFile: async () => undefined,
+      writeHoldFile: async () => undefined,
+      bootSessionUuid: async () => "ABCDEF01-2345-6789-ABCD-EF0123456789",
+      rearmAnchor: async () => ({ ok: true }),
+      verifyGate: async () => ({ ok: true, observed: { generation_id: commitGen, agent_uid: 502 } }),
+      commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502 }),
+      writeReleasedPlist: async () => undefined,
+      restoreParkedPlist: async () => undefined,
+      harnessStatus: async () => ({ known: true, installed: true, running: true, pid: 4242 }),
+    };
+  }
+
+  it("a registry generation advanced between resolution and release parks LOUDLY at commit-generation, never releases", async () => {
+    const printed: string[] = [];
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        // ENTRY was resolved at generation 7; a concurrent repair/install
+        // advanced the registry to generation 8 before the barrier committed.
+        runBarrier: runReleaseBarrierSequence,
+        createBarrierOps: (() => mkBarrierOps(8)) as never,
+      }),
+    });
+    handle.stopOracleLoop();
+    const outcome = handle.results[0]!.outcome;
+    // Pre-fix: the barrier verified generation 8 and RELEASED with the stale
+    // generation-7 resolved context (fortressPath/argv).
+    expect(outcome.kind).toBe("parked");
+    const reason = (outcome as { reason: string }).reason;
+    expect(reason).toContain("commit-generation");
+    expect(reason).toContain("registry changed during boot release for uid 502");
+    expect(reason).toContain("generation 7");
+    expect(reason).toContain("generation 8");
+  });
+
+  it("a matching generation at commit still releases (no false park from the re-check)", async () => {
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        runBarrier: runReleaseBarrierSequence,
+        createBarrierOps: (() => mkBarrierOps(7)) as never,
+      }),
+    });
+    handle.stopOracleLoop();
+    expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
   });
 });

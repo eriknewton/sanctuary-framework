@@ -13,6 +13,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  createProductionReleaseBarrierOps,
   parkHarnessPersistently,
   restoreCoarseCompositionProduction,
   verifyHarnessJobDisabled,
@@ -22,6 +23,7 @@ import {
   type ExclusiveEgressWiringInput,
   type PersistentParkContext,
 } from "../../src/egress-gate/arming-wiring.js";
+import { PfAnchorRegistry } from "../../src/egress-gate/anchor-registry.js";
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
 import { holdFilePathForUid, planParkedHarnessInstall } from "../../src/egress-gate/release-barrier.js";
 
@@ -371,5 +373,107 @@ describe("verifyHarnessJobDisabled (persistent override-db read-back)", () => {
       const verdict = await verifyHarnessJobDisabled(fn);
       expect(verdict.ok).toBe(false);
     }
+  });
+});
+
+describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quarantine-aware registry reads)", () => {
+  const VALID_ENTRY = { agent_uid: 502, gate_port: 40001, fortress_path: "/fortress/a", generation_id: 7 };
+
+  function memRegistry(
+    committed: unknown[],
+    armCalls: unknown[] = [],
+  ): import("../../src/egress-gate/anchor-registry.js").PfAnchorRegistry {
+    let current: unknown = { version: 1, committed, enable_token: "12345" };
+    return new PfAnchorRegistry({
+      store: {
+        load: async () => JSON.parse(JSON.stringify(current)) as never,
+        save: async (s) => {
+          current = JSON.parse(JSON.stringify(s));
+        },
+      },
+      lock: { acquire: async () => undefined, release: async () => undefined },
+      runner: { run: async () => ({ code: 0, stdout: "", stderr: "" }) } as never,
+      armUnion: (async (entries: unknown) => {
+        armCalls.push(entries);
+        return { enableToken: "12345" };
+      }) as never,
+      unionLiveness: async () => ({ live: true, reasons: [] }),
+      disarm: async () => undefined,
+    });
+  }
+
+  function mkOps(input: {
+    registry: import("../../src/egress-gate/anchor-registry.js").PfAnchorRegistry;
+    live: boolean;
+    liveReasons?: string[];
+    printed: string[];
+  }) {
+    return createProductionReleaseBarrierOps({
+      agentUid: 502,
+      agentAccount: "sanctuary-hermes",
+      harnessArgv: ["/usr/local/bin/hermes"],
+      fortressPath: "/fortress/a",
+      harnessLogDir: "/tmp/sanctuary-test-logs",
+      gateUid: 511,
+      oracle: {} as never,
+      rearm: "boot-rearm",
+      print: (line) => input.printed.push(line),
+      internals: {
+        registry: input.registry,
+        probeAnchorLiveness: async () => ({ live: input.live, reasons: input.liveReasons ?? [] }),
+      },
+    });
+  }
+
+  it("a malformed SIBLING entry no longer fails the valid uid's rearm: live rules verify ok, the sibling is LOUD", async () => {
+    const printed: string[] = [];
+    const ops = mkOps({
+      registry: memRegistry([VALID_ENTRY, { bogus: true }]),
+      live: true,
+      printed,
+    });
+    // Pre-fix: registry.list() threw "a committed entry is malformed" and the
+    // valid uid parked at rearm-anchor with that bare reason.
+    const rearm = await ops.rearmAnchor();
+    expect(rearm).toEqual({ ok: true });
+    const log = printed.join("\n");
+    expect(log).toContain("QUARANTINED");
+    expect(log).toContain("registry entry #1");
+    expect(log).toContain("uid 502");
+    expect(log).toContain("repair-egress-gate");
+  });
+
+  it("a quarantined sibling with this uid's rules NOT live fails LOUD (no partial union re-render, ever)", async () => {
+    const printed: string[] = [];
+    const armCalls: unknown[] = [];
+    const ops = mkOps({
+      registry: memRegistry([VALID_ENTRY, { bogus: true }], armCalls),
+      live: false,
+      liveReasons: ["anchor not loaded"],
+      printed,
+    });
+    const rearm = await ops.rearmAnchor();
+    expect(rearm.ok).toBe(false);
+    const reason = (rearm as { ok: false; reason: string }).reason;
+    expect(reason).toContain("uid 502");
+    expect(reason).toContain("anchor not loaded");
+    expect(reason).toContain("quarantined");
+    expect(reason).toContain("repair-egress-gate");
+    // The fail-open direction is pinned shut: no union was ever re-rendered
+    // over the partially-valid baseline (it would drop the quarantined uid's
+    // block rules from the anchor).
+    expect(armCalls).toHaveLength(0);
+  });
+
+  it("a CLEAN registry still takes the full locked re-arm path (addOrUpdate re-renders + re-verifies the union)", async () => {
+    const printed: string[] = [];
+    const armCalls: unknown[] = [];
+    const ops = mkOps({ registry: memRegistry([VALID_ENTRY], armCalls), live: false, printed });
+    const rearm = await ops.rearmAnchor();
+    expect(rearm).toEqual({ ok: true });
+    // The union was re-armed through the registry mutation, NOT skipped via
+    // the quarantine-path liveness probe (live:false above would have failed).
+    expect(armCalls).toHaveLength(1);
+    expect(printed).toHaveLength(0);
   });
 });
