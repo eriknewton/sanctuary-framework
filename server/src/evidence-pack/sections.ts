@@ -870,12 +870,17 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
         "",
       ];
     }
-    // G-2: "the counts above" are quarter-windowed (aggregateQuarter skips
-    // out-of-window entries), so the figure that contributes to them is the
-    // WINDOWED daemon count, not the all-time total read. Render the windowed
-    // figure when the generator supplied it AND it is usable; otherwise fall
-    // back to a window-agnostic phrasing that does not claim the total was
+    // G-2: "the counts above" are windowed, so the figure that contributes to
+    // them is the WINDOWED daemon count, not the all-time total read. Render the
+    // windowed figure when the generator supplied it AND it is usable; otherwise
+    // fall back to a window-agnostic phrasing that does not claim the total was
     // merged into the counts above.
+    //
+    // D10-1: that window is now the ATTESTED coverage window, not the calendar
+    // quarter, because the counts it describes are taken over the attested
+    // window. The figure and the counts stay consistent (both come from the one
+    // chokepoint); the WORDING below is what had to follow, since "within the
+    // reporting quarter" would now name a boundary the figure did not apply.
     if (
       d.windowed_entry_count !== undefined &&
       isUsableFigure(d.windowed_entry_count)
@@ -884,9 +889,9 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
         `Daemon enforcement store: included. Of ${d.included_entry_count} ` +
           "daemon-recorded enforcement entries merged into this report's census " +
           "(from the root-owned _audit-daemon store created by the audit-store " +
-          `split), ${d.windowed_entry_count} fall within the reporting quarter ` +
-          "and contribute to the counts above; the remainder are retained daemon " +
-          "history outside the quarter window.",
+          `split), ${d.windowed_entry_count} fall within this report's attested ` +
+          "coverage window and contribute to the counts above; the remainder are " +
+          "retained daemon history outside that window.",
         "",
       ];
     }

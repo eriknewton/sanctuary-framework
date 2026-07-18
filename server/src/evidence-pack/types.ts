@@ -143,8 +143,18 @@ export type DecisionCategory =
  * (FIFO retention), never calendar-based.
  */
 export interface QuarterAggregation {
+  /**
+   * D10-1: the window the counts were ACTUALLY taken over. When the aggregation
+   * comes from `censusOverAttestedWindow` (which is the only way the pack builds
+   * one), `quarter` and `label` are the calendar quarter but the BOUNDS are the
+   * ATTESTED coverage span, which is narrower whenever the census cut or the
+   * generation instant bounds the quarter. Do NOT read these bounds as the
+   * calendar quarter's: use `quarterWindow(input.quarter)` for that. Rendering a
+   * count against the calendar quarter while it was taken over the attested span
+   * is exactly the contradiction round 10 found in a signed report.
+   */
   window: QuarterWindow;
-  /** Total audit entries whose timestamp falls inside the quarter window. */
+  /** Total audit entries whose timestamp falls inside {@link window}. */
   total_in_window: number;
   /** Count per decision category (every category key is present, zero-filled). */
   by_category: Record<DecisionCategory, number>;
