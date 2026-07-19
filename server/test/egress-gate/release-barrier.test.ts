@@ -6,9 +6,12 @@
 
 import { describe, it, expect } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, existsSync, statSync, readFileSync } from "node:fs";
+import { chmod, mkdir, rm, writeFile as fsWriteFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+import { ensureAgentHarnessHoldDir } from "../../src/egress-gate/arming-wiring.js";
 
 import {
   AGENT_HARNESS_DAEMON_LABEL,
@@ -17,6 +20,8 @@ import {
 } from "../../src/egress-gate/harness-daemon.js";
 import {
   AGENT_HARNESS_HOLD_DIR,
+  AGENT_HARNESS_HOLD_DIR_MODE,
+  writeIntoHoldDir,
   HOLD_FILE_HEADER,
   PARKED_EXPECTED_GENERATION,
   RELEASE_EXEC_WRAPPER_SCRIPT,
@@ -281,33 +286,60 @@ describe("barrier plist form", () => {
 
 interface OpsLog {
   writes: Array<{ path: string; mode: number }>;
+  ensured: Array<{ path: string; mode: number }>;
   removed: string[];
   launchctl: string[][];
+  notices: string[];
+  /** Every side effect in the order it happened (cross-op-kind ordering). */
+  sequence: string[];
 }
 
 function makeParkedOps(overrides?: {
   disableCode?: number;
+  bootoutCode?: number;
+  bootoutStderr?: string;
   running?: boolean;
   known?: boolean;
+  ensureHoldDirError?: string;
 }): { ops: ParkedInstallOps; log: OpsLog } {
-  const log: OpsLog = { writes: [], removed: [], launchctl: [] };
+  const log: OpsLog = { writes: [], ensured: [], removed: [], launchctl: [], notices: [], sequence: [] };
   const ops: ParkedInstallOps = {
+    async ensureHoldDir(path, mode) {
+      log.ensured.push({ path, mode });
+      log.sequence.push(`ensureHoldDir:${path}`);
+      if (overrides?.ensureHoldDirError !== undefined) throw new Error(overrides.ensureHoldDirError);
+    },
     async writeFile(path, _content, mode) {
       log.writes.push({ path, mode });
+      log.sequence.push(`write:${path}`);
     },
     async removeFile(path) {
       log.removed.push(path);
+      log.sequence.push(`remove:${path}`);
     },
     async runLaunchctl(args) {
       log.launchctl.push([...args]);
+      log.sequence.push(`launchctl:${args.join(" ")}`);
+      if (args[0] === "bootout") {
+        return {
+          code: overrides?.bootoutCode ?? 0,
+          stdout: "",
+          stderr: overrides?.bootoutStderr ?? "",
+        };
+      }
       return { code: overrides?.disableCode ?? 0, stdout: "", stderr: "boom" };
     },
     async harnessStatus() {
+      log.sequence.push("harnessStatus");
       return {
         known: overrides?.known ?? true,
         installed: false,
         running: overrides?.running ?? false,
       };
+    },
+    notify(message) {
+      log.notices.push(message);
+      log.sequence.push("notify");
     },
   };
   return { ops, log };
@@ -320,14 +352,17 @@ describe("executeParkedHarnessInstall", () => {
     harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
   });
 
-  it("writes wrapper 0755 + plist 0644, disables, removes any stale hold file, and NEVER bootstraps", async () => {
+  it("writes wrapper 0755 + plist 0644, disables, stands down, removes any stale hold file, and NEVER bootstraps", async () => {
     const { ops, log } = makeParkedOps();
     await executeParkedHarnessInstall(plan, ops);
     expect(log.writes).toEqual([
       { path: plan.wrapperPath, mode: 0o755 },
       { path: plan.plistPath, mode: 0o644 },
     ]);
-    expect(log.launchctl).toEqual([["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]]);
+    expect(log.launchctl).toEqual([
+      ["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+      ["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+    ]);
     expect(log.removed).toEqual([plan.holdFilePath]);
     expect(log.launchctl.some((args) => args[0] === "bootstrap" || args[0] === "kickstart")).toBe(false);
   });
@@ -345,6 +380,168 @@ describe("executeParkedHarnessInstall", () => {
   it("fails loud when the harness status is not trustworthy", async () => {
     const { ops } = makeParkedOps({ known: false });
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/trustworthy/);
+  });
+
+  // ------------------------------------------------------------------
+  // Drill D1 (2026-07-18): the wrapper was written into a root-owned
+  // directory nothing in a first-ever install creates, so every clean-host
+  // arm died with ENOENT before any account existed.
+  // ------------------------------------------------------------------
+
+  it("D1: ensures the hold directory BEFORE writing the wrapper into it, root-owned 0755", async () => {
+    const { ops, log } = makeParkedOps();
+    await executeParkedHarnessInstall(plan, ops);
+    expect(log.ensured).toEqual([{ path: AGENT_HARNESS_HOLD_DIR, mode: AGENT_HARNESS_HOLD_DIR_MODE }]);
+    // ORDER, not merely presence: the ensure must precede the write it guards.
+    expect(log.sequence.indexOf(`ensureHoldDir:${AGENT_HARNESS_HOLD_DIR}`)).toBeLessThan(
+      log.sequence.indexOf(`write:${plan.wrapperPath}`),
+    );
+  });
+
+  it("D1: refuses the whole parked install when the hold directory cannot be ensured", async () => {
+    const { ops, log } = makeParkedOps({ ensureHoldDirError: "EACCES: read-only /var/db" });
+    await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/EACCES/);
+    // Fail-closed: nothing was written and no launchctl state was touched.
+    expect(log.writes).toEqual([]);
+    expect(log.launchctl).toEqual([]);
+  });
+
+  it("D1: writeIntoHoldDir refuses a relative path or a path with no real parent", async () => {
+    const { ops } = makeParkedOps();
+    await expect(writeIntoHoldDir(ops, "relative/path.sh", "x", 0o755)).rejects.toThrow(ReleaseBarrierError);
+    await expect(writeIntoHoldDir(ops, "/top-level", "x", 0o755)).rejects.toThrow(ReleaseBarrierError);
+  });
+
+  // ------------------------------------------------------------------
+  // Drill D2 (2026-07-18): `launchctl disable` does not stop an already
+  // running job, so every upgrade host (pre-Slice-5 KeepAlive harness)
+  // tripped the post-install RUNNING assertion and aborted the arm.
+  // ------------------------------------------------------------------
+
+  it("D2: disables BEFORE booting out, so nothing can re-bootstrap under the stand-down", async () => {
+    const { ops, log } = makeParkedOps();
+    await executeParkedHarnessInstall(plan, ops);
+    const disableAt = log.sequence.indexOf(`launchctl:disable system/${AGENT_HARNESS_DAEMON_LABEL}`);
+    const bootoutAt = log.sequence.indexOf(`launchctl:bootout system/${AGENT_HARNESS_DAEMON_LABEL}`);
+    expect(disableAt).toBeGreaterThanOrEqual(0);
+    expect(bootoutAt).toBeGreaterThanOrEqual(0);
+    expect(disableAt).toBeLessThan(bootoutAt);
+    // ...and both strictly before the assertion that reads the result.
+    expect(bootoutAt).toBeLessThan(log.sequence.indexOf("harnessStatus"));
+  });
+
+  it("D2: a bootout that actually stopped a live job is announced, never silent", async () => {
+    const { ops, log } = makeParkedOps({ bootoutCode: 0 });
+    await executeParkedHarnessInstall(plan, ops);
+    expect(log.notices).toHaveLength(1);
+    expect(log.notices[0]).toMatch(/bootout/);
+    expect(log.notices[0]).toContain(AGENT_HARNESS_DAEMON_LABEL);
+  });
+
+  it("D2: treats 'no such process' / 'could not find' bootout failures as already-stopped", async () => {
+    for (const stderr of [
+      "Boot-out failed: 3: No such process",
+      "Could not find service “ai.sanctuaryprotocol.agent-harness”",
+      "Boot-out failed: 113: Could not find specified service",
+    ]) {
+      const { ops, log } = makeParkedOps({ bootoutCode: 3, bootoutStderr: stderr });
+      await expect(executeParkedHarnessInstall(plan, ops)).resolves.toBeUndefined();
+      // Nothing was stopped, so nothing is announced.
+      expect(log.notices).toEqual([]);
+    }
+  });
+
+  it("D2: refuses when bootout fails for any OTHER reason (never a park it could not assert)", async () => {
+    const { ops, log } = makeParkedOps({ bootoutCode: 1, bootoutStderr: "Operation not permitted" });
+    await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/stand down/);
+    // Fail-closed: the stale hold file removal and the status claim never ran.
+    expect(log.removed).toEqual([]);
+    expect(log.sequence).not.toContain("harnessStatus");
+  });
+
+  it("D2: STILL refuses when the job reports running after a successful stand-down", async () => {
+    // The pre-existing fail-closed assertion is the last line of defense and
+    // must survive the stand-down being added in front of it.
+    const { ops, log } = makeParkedOps({ bootoutCode: 0, running: true });
+    await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/RUNNING/);
+    expect(log.launchctl).toContainEqual(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  });
+});
+
+/**
+ * Drill D1, REAL FILESYSTEM. The unit suite above proves the ops contract; it
+ * would still have passed with a mocked `mkdir` that never ran. This exercises
+ * the production ensure (`ensureAgentHarnessHoldDir`) against real `fs` with a
+ * hold directory that DOES NOT EXIST -- the exact clean-host condition the
+ * drill hit -- and asserts the wrapper file is on disk with the right mode
+ * afterwards. Never touches /var/db; the hold dir is redirected into a tmpdir.
+ *
+ * `chown(0, 0)` is root-only, so the real ensure is used verbatim when the
+ * suite runs as root and with the chown step relaxed otherwise; the mkdir +
+ * explicit-chmod behavior under test is identical either way.
+ */
+describe("parked install against a REAL, NON-EXISTENT hold directory (drill D1)", () => {
+  const runningAsRoot = typeof process.getuid === "function" && process.getuid() === 0;
+
+  it("creates the missing hold directory and lands the wrapper 0755 inside it", async () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), "s5-d1-holddir-"));
+    try {
+      // Deliberately NOT created: this is the clean-host state.
+      const holdDir = join(tmpRoot, "var", "db", "sanctuary", "agent-harness");
+      expect(existsSync(holdDir)).toBe(false);
+
+      const realPlan = planParkedHarnessInstall({
+        agentAccount: "sanctuary-hermes",
+        agentUid: 503,
+        harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
+        holdDir,
+      });
+      expect(realPlan.wrapperPath).toBe(join(holdDir, "release-exec-wrapper.sh"));
+
+      const plistPath = join(tmpRoot, "agent-harness.plist");
+      const launchctl: string[][] = [];
+      await executeParkedHarnessInstall(
+        { ...realPlan, plistPath },
+        {
+          ensureHoldDir: runningAsRoot
+            ? ensureAgentHarnessHoldDir
+            : async (path, mode) => {
+                // Same shape as the production ensure minus the root-only
+                // chown: mkdir -p (mode omitted, umask-masked) + EXPLICIT chmod.
+                await mkdir(path, { recursive: true });
+                await chmod(path, mode);
+              },
+          async writeFile(path, content, mode) {
+            await fsWriteFile(path, content, { mode });
+            await chmod(path, mode);
+          },
+          async removeFile(path) {
+            await rm(path, { force: true });
+          },
+          async runLaunchctl(args) {
+            launchctl.push([...args]);
+            return { code: 0, stdout: "", stderr: "" };
+          },
+          async harnessStatus() {
+            return { known: true, installed: true, running: false };
+          },
+          notify() {
+            /* captured by the unit suite; irrelevant here */
+          },
+        },
+      );
+
+      // The directory the drill found missing now exists, root-owned-shaped 0755...
+      expect(statSync(holdDir).isDirectory()).toBe(true);
+      expect(statSync(holdDir).mode & 0o777).toBe(AGENT_HARNESS_HOLD_DIR_MODE);
+      // ...and the wrapper is genuinely on disk inside it, executable.
+      expect(existsSync(realPlan.wrapperPath)).toBe(true);
+      expect(statSync(realPlan.wrapperPath).mode & 0o777).toBe(0o755);
+      expect(readFileSync(realPlan.wrapperPath, "utf8")).toBe(RELEASE_EXEC_WRAPPER_SCRIPT);
+      expect(launchctl.map((a) => a[0])).toEqual(["disable", "bootout"]);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
 

@@ -195,6 +195,8 @@ export {
 
 export {
   AGENT_HARNESS_HOLD_DIR,
+  AGENT_HARNESS_HOLD_DIR_MODE,
+  writeIntoHoldDir,
   HOLD_FILE_HEADER,
   RELEASE_WRAPPER_FILENAME,
   RELEASE_WRAPPER_REFUSAL_EXIT_CODE,
@@ -212,6 +214,7 @@ export {
   executeParkedHarnessInstall,
   runReleaseBarrierSequence,
   type HarnessReleaseHoldRecord,
+  type HoldDirWriteOps,
   type BarrierProgramArgumentsInput,
   type ParkedHarnessInstallOptions,
   type ParkedHarnessInstallPlan,
@@ -281,8 +284,10 @@ export {
   createProductionReleaseBarrierOps,
   createRepairExclusiveEgressOps,
   createUnprotectExclusiveEgressOps,
+  ensureAgentHarnessHoldDir,
   ensureSupervisorOracleKeys,
   parkHarnessPersistently,
+  realHoldDirWriteOps,
   restoreCoarseCompositionProduction,
   startExclusiveEgressBootSupervisor,
   verifyHarnessJobDisabled,

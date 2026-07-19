@@ -80,6 +80,7 @@ import {
   createInstallExclusiveEgressOps,
   createRepairExclusiveEgressOps,
   createUnprotectExclusiveEgressOps,
+  ensureAgentHarnessHoldDir,
   type ExclusiveEgressWiringInput,
 } from "../egress-gate/arming-wiring.js";
 import { deriveGateAccountName } from "../egress-gate/gate-account.js";
@@ -1175,10 +1176,18 @@ export async function runAutoProvisionForWrap(
             environment: resolved.environment,
           });
           await executeParkedHarnessInstall(plan, {
+            // Drill D1: the wrapper lands in the root-owned hold dir, which
+            // nothing else in a first-ever install creates. `ensureHoldDir` is
+            // the production ensure the release sequence's hold-file write
+            // also uses, so both writers agree on one root-owned 0755 dir.
+            ensureHoldDir: ensureAgentHarnessHoldDir,
             writeFile: daemonOps.writeFile,
             removeFile: daemonOps.removeFile,
             runLaunchctl: daemonOps.runLaunchctl,
             harnessStatus: () => agentHarnessDaemonStatus(daemonOps),
+            // Drill D2: the parked install stands down an already-running
+            // harness. Stopping the operator's live agent is never silent.
+            notify: (message) => print(message),
           });
           return { ok: true as const, bootstrappedThisRun: false, parked: true };
         }

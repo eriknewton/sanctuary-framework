@@ -74,7 +74,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 
 import {
   AGENT_HARNESS_DAEMON_LABEL,
@@ -86,6 +86,14 @@ import {
 
 /** Root-owned parent directory for hold files + the exec wrapper (0755 root). */
 export const AGENT_HARNESS_HOLD_DIR = "/var/db/sanctuary/agent-harness";
+
+/**
+ * The hold directory's REQUIRED mode: root-owned 0755 (the agent uid must be
+ * able to traverse it and read the wrapper + its hold file; only root may
+ * write it). Single source of truth -- `runtime-fs-plan.ts` imports this
+ * rather than restating `0o755`, so the two layout statements cannot drift.
+ */
+export const AGENT_HARNESS_HOLD_DIR_MODE = 0o755;
 
 /** First line of every hold file; the wrapper hard-checks it. */
 export const HOLD_FILE_HEADER = "sanctuary-agent-harness-release v1";
@@ -141,6 +149,63 @@ function assertAgentUid(agentUid: number): void {
   if (!Number.isInteger(agentUid) || agentUid <= 0) {
     throw new ReleaseBarrierError(`agent uid must be a positive integer (got ${String(agentUid)})`);
   }
+}
+
+/**
+ * Injected side effects for {@link writeIntoHoldDir}: the ONLY two operations
+ * a hold-dir writer is given. There is deliberately no way to write without
+ * also supplying the directory-ensure op.
+ */
+export interface HoldDirWriteOps {
+  /**
+   * Ensure the root-owned hold directory exists at `path` with EXACTLY `mode`
+   * (production: mkdir -p + chown root:wheel + an explicit chmod, because
+   * `mkdir`'s mode argument is umask-masked). An already-correct directory is
+   * success. THROWS on failure -- a hold dir that is not root-owned 0755 is a
+   * barrier defect, never something to write into anyway.
+   */
+  ensureHoldDir(path: string, mode: number): Promise<void>;
+  /** Write `content` at `path` with `mode` (root-owned in production). */
+  writeFile(path: string, content: string, mode: number): Promise<void>;
+}
+
+/**
+ * THE CHOKEPOINT (drill D1, 2026-07-18): the one and only way to place a file
+ * inside the root-owned hold directory.
+ *
+ * WHY THIS SHAPE. `/var/db/sanctuary/agent-harness` is root-owned and nothing
+ * in a first-ever install creates it before the barrier needs it. Two writers
+ * lived over that directory -- the parked install's exec wrapper and the
+ * release sequence's hold file -- and they disagreed about whose job the
+ * `mkdir` was: the hold-file writer did it, the wrapper writer did not, so
+ * EVERY clean-host `sanctuary protect --hermes --exclusive-egress` died with
+ * `ENOENT ... release-exec-wrapper.sh` before any account was created.
+ *
+ * Adding a second `mkdir` next to the wrapper write would have fixed that one
+ * call site and left the same latent split for the third writer. Instead, the
+ * ensure is not a step a writer may forget: it is fused to the write. The
+ * directory is derived from the file being written (`dirname`), so a caller
+ * cannot ensure one directory and then write into another, and the ops
+ * interface hands out no bare `writeFile` for a hold-dir path. A structural
+ * test pins that no module writes a hold-dir path by any other route.
+ */
+export async function writeIntoHoldDir(
+  ops: HoldDirWriteOps,
+  filePath: string,
+  content: string,
+  mode: number,
+): Promise<void> {
+  if (!isAbsolute(filePath)) {
+    throw new ReleaseBarrierError(`hold-dir file path must be absolute (got ${JSON.stringify(filePath)})`);
+  }
+  const dir = dirname(filePath);
+  if (dir === "/" || dir === "." || dir.length === 0) {
+    throw new ReleaseBarrierError(
+      `refusing to treat ${JSON.stringify(dir)} as the agent-harness hold directory`,
+    );
+  }
+  await ops.ensureHoldDir(dir, AGENT_HARNESS_HOLD_DIR_MODE);
+  await ops.writeFile(filePath, content, mode);
 }
 
 /**
@@ -464,36 +529,79 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
   };
 }
 
+/**
+ * launchctl `bootout` stderr that means "the job was not running", which is
+ * SUCCESS for a stand-down. Kept byte-identical to the tolerance the shipped
+ * `arming-wiring.ts` bootout ops already use, so the two never disagree about
+ * what counts as "already stopped".
+ */
+const BOOTOUT_NOT_RUNNING_RE = /No such process|Could not find|not find service/i;
+
 /** Injected side effects for the parked install (root in production; mocks in tests). */
-export interface ParkedInstallOps {
-  /** Write `content` at `path` with `mode` (root-owned in production). */
-  writeFile(path: string, content: string, mode: number): Promise<void>;
+export interface ParkedInstallOps extends HoldDirWriteOps {
   /** Remove the file at `path` (ENOENT is not an error). */
   removeFile(path: string): Promise<void>;
   /** Run launchctl with argv (never a shell). */
   runLaunchctl(args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }>;
   /** The harness job's launchd status (the shipped `agentHarnessDaemonStatus`). */
   harnessStatus(): Promise<HarnessDaemonStatus>;
+  /**
+   * Surface one line to the operator running the flow. REQUIRED (not
+   * optional): the stand-down below stops a live, privileged agent process,
+   * and an install that silently kills the user's running harness would be a
+   * worse defect than the one it fixes. A caller that genuinely wants silence
+   * must say so with an explicit no-op.
+   */
+  notify(message: string): void;
 }
 
 /**
- * Execute a parked install: write the wrapper (0755) and the barrier plist
- * (0644), `launchctl disable` the job, and remove any stale hold file. This
+ * Execute a parked install: write the wrapper (0755, through the hold-dir
+ * chokepoint) and the barrier plist (0644), `launchctl disable` the job, STAND
+ * DOWN any already-running instance, and remove any stale hold file. This
  * function NEVER bootstraps (a structural test pins that no `bootstrap`
  * launchctl verb can be issued from here), and it fails LOUD if the job
  * reports running afterwards -- a parked install with a live harness is a
  * barrier violation, not a warning.
+ *
+ * THE STAND-DOWN (drill D2, 2026-07-18). `launchctl disable` only stops
+ * FUTURE bootstrapping; it does not stop a job that is already running. Any
+ * host that ran a pre-Slice-5 `protect` has a KeepAlive harness running, so
+ * the post-install assertion below tripped and every upgrade-host arm aborted.
+ * The park is now ASSERTED rather than assumed:
+ *
+ *   1. `disable` FIRST, so nothing can re-bootstrap the job underneath the
+ *      bootout (the reverse order leaves a window where launchd restarts it).
+ *   2. `bootout` the running instance. "No such process" / "Could not find"
+ *      means it was already stopped and is success; ANY other failure REFUSES
+ *      -- a stand-down we could not perform must not be reported as a park.
+ *   3. The pre-existing fail-closed assertion is unchanged and still the last
+ *      word: an untrustworthy status, or a job STILL running after all of the
+ *      above, refuses exactly as before.
  */
 export async function executeParkedHarnessInstall(
   plan: ParkedHarnessInstallPlan,
   ops: ParkedInstallOps,
 ): Promise<void> {
-  await ops.writeFile(plan.wrapperPath, plan.wrapperContent, 0o755);
+  await writeIntoHoldDir(ops, plan.wrapperPath, plan.wrapperContent, 0o755);
   await ops.writeFile(plan.plistPath, plan.plistContent, 0o644);
   const disable = await ops.runLaunchctl(["disable", `system/${plan.harnessLabel}`]);
   if (disable.code !== 0) {
     throw new ReleaseBarrierError(
       `launchctl disable system/${plan.harnessLabel} exited ${disable.code}: ${disable.stderr.trim()}`,
+    );
+  }
+  const bootout = await ops.runLaunchctl(["bootout", `system/${plan.harnessLabel}`]);
+  if (bootout.code === 0) {
+    // A privileged, agent-stopping action actually happened. Never silent.
+    ops.notify(
+      `Stopped the already-running ${plan.harnessLabel} job (launchctl bootout) so the parked ` +
+        "install can hold; the release barrier restarts it after the gate generation commits.",
+    );
+  } else if (!BOOTOUT_NOT_RUNNING_RE.test(bootout.stderr)) {
+    throw new ReleaseBarrierError(
+      `could not stand down the running harness job: launchctl bootout system/${plan.harnessLabel} ` +
+        `exited ${bootout.code}: ${bootout.stderr.trim()}; refusing to report a park that was not asserted`,
     );
   }
   await ops.removeFile(plan.holdFilePath);

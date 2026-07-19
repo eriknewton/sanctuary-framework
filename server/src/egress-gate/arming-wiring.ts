@@ -43,7 +43,7 @@ import {
   createPublicKey,
   type KeyObject,
 } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -85,12 +85,13 @@ import {
   type HarnessDaemonStatus,
 } from "./harness-daemon.js";
 import {
-  AGENT_HARNESS_HOLD_DIR,
   holdFilePathForUid,
   planParkedHarnessInstall,
   renderHarnessReleaseHoldFile,
   runReleaseBarrierSequence,
+  writeIntoHoldDir,
   type CommittedGenerationIdentity,
+  type HoldDirWriteOps,
   type ReleaseBarrierOps,
   type ReleaseBarrierOutcome,
 } from "./release-barrier.js";
@@ -365,6 +366,37 @@ function realHarnessOps(): HarnessDaemonOps {
       await rm(path, { force: true });
     },
     runLaunchctl,
+  };
+}
+
+/**
+ * PRODUCTION hold-directory ensure (drill D1, 2026-07-18). Fed to
+ * {@link writeIntoHoldDir}, which is the only route into the root-owned hold
+ * dir; never called directly by a writer.
+ *
+ * `mkdir`'s `mode` argument is umask-masked, so the mode is applied by an
+ * EXPLICIT `chmod` afterwards (which also heals a directory an older build,
+ * or a hand-repair, left at the wrong mode). Ownership is re-asserted to
+ * root:wheel for the same reason. Every failure THROWS -- the previous
+ * `mkdir(...).catch(() => undefined)` here would have let a broken layout
+ * through to a write that then failed with a less legible error.
+ */
+export async function ensureAgentHarnessHoldDir(path: string, mode: number): Promise<void> {
+  await mkdir(path, { recursive: true });
+  await chown(path, 0, 0);
+  await chmod(path, mode);
+}
+
+/**
+ * The production {@link HoldDirWriteOps} pair: ensure the root-owned hold dir,
+ * then write the file atomically as root. Shared by the parked install
+ * (`wrap/auto-provision.ts`) and the release sequence's hold-file write below,
+ * so both writers into that directory use the SAME ensure.
+ */
+export function realHoldDirWriteOps(): HoldDirWriteOps {
+  return {
+    ensureHoldDir: ensureAgentHarnessHoldDir,
+    writeFile: atomicRootWrite,
   };
 }
 
@@ -825,8 +857,11 @@ export function createProductionReleaseBarrierOps(input: {
       await rm(holdPath, { force: true });
     },
     async writeHoldFile(record): Promise<void> {
-      await mkdir(AGENT_HARNESS_HOLD_DIR, { recursive: true, mode: 0o755 }).catch(() => undefined);
-      await atomicRootWrite(holdPath, renderHarnessReleaseHoldFile(record), 0o644);
+      // Drill D1: routed through the single hold-dir chokepoint (which derives
+      // the directory from `holdPath` and ensures it root-owned 0755 first),
+      // never a local mkdir. The old local `mkdir(...).catch(() => undefined)`
+      // is exactly the split-responsibility the chokepoint retires.
+      await writeIntoHoldDir(realHoldDirWriteOps(), holdPath, renderHarnessReleaseHoldFile(record), 0o644);
     },
     async bootSessionUuid(): Promise<string> {
       const { stdout } = await execFileAsync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"]);
