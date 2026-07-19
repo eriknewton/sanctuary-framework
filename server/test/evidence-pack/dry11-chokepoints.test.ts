@@ -457,7 +457,7 @@ describe("D11 X-1: hidden pack-relevant files cannot ship unmanifested", () => {
   });
 
   it("still tolerates inert OS metadata, so the tool stays usable", async () => {
-    await writeFile(join(dir, ".DS_Store"), " binary", "utf-8");
+    await writeFile(join(dir, ".DS_Store"), "\u0000binary", "utf-8");
     await writeFile(join(dir, "._01_evidence_pack.md"), "applefork", "utf-8");
     await expect(writePackDirectory(dir, simplePack())).resolves.toBeUndefined();
     const after = await readdir(dir);

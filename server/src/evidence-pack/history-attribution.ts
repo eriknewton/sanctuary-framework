@@ -27,6 +27,20 @@
  *  2. **It cannot be called without the discriminator.** The parameter object
  *     requires `ever_pruned` plus the at-cap determinability pair, so there is
  *     no route to a causal clause that skips them.
+ *
+ *     HONEST BOUND on what (2) does and does not buy (gate finding F1,
+ *     2026-07-18, established by a 12-cell brute force of the fact space, not
+ *     by code read): requiring the discriminator as a parameter forces it to be
+ *     PASSED, not to be DECISIVE. `buildDiagnosis` orders the `at_cap` arm
+ *     ABOVE `ever_pruned`, so with `ever_pruned === false` and the log at a
+ *     retention cap, 3 of 4 cells still emit the hedged "may have been pruned
+ *     by size/count (FIFO) retention" into the SIGNED artifact. That is NOT the
+ *     definitive false verdict D11-1 was (the language is hedged, so it does
+ *     not breach the stated bar, and it is not a regression), but this module
+ *     must not be read as guaranteeing that `ever_pruned === false` suppresses
+ *     every pruning clause. It does not. Reordering `at_cap` below the
+ *     discriminator is a semantic change and is queued for round 12, NOT done
+ *     here. Do not restate property (2) more strongly than this paragraph.
  *  3. **The vocabulary is confined here.** The pruning-assertion phrases exist
  *     as constants in this file only; `history-attribution-chokepoint.test.ts`
  *     fails if any other evidence-pack module reintroduces them, which is what
