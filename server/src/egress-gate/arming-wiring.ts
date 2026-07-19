@@ -844,6 +844,14 @@ export function createProductionReleaseBarrierOps(input: {
   internals?: {
     registry?: PfAnchorRegistry;
     probeAnchorLiveness?: (policy: { agent_uid: number; gate_port: number }) => Promise<PfLivenessResult>;
+    /**
+     * Fix-round 2 (2026-07-18): a seam for the launchd verbs this factory
+     * issues, so the not-loaded tolerance below can be tested against the
+     * shapes a clean host actually produces. It existed only as an untestable
+     * closure over the module-level runner, which is how it kept its own
+     * divergent regex through the F4 "one predicate" fix.
+     */
+    runLaunchctl?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
   };
 }): ReleaseBarrierOps {
   const registry = input.internals?.registry ?? createProductionAnchorRegistry();
@@ -852,6 +860,7 @@ export function createProductionReleaseBarrierOps(input: {
     ((policy: { agent_uid: number; gate_port: number }): Promise<PfLivenessResult> =>
       checkPfAnchorLiveness(createExecFilePfRunner(), policy));
   const print = input.print ?? ((): void => undefined);
+  const launchctl = input.internals?.runLaunchctl ?? runLaunchctl;
   const staging = createFsGenerationStagingStore();
   const harnessOps = realHarnessOps();
   const holdPath = holdFilePathForUid(input.agentUid);
@@ -913,25 +922,33 @@ export function createProductionReleaseBarrierOps(input: {
 
   return {
     async disableJob(): Promise<void> {
-      const r = await runLaunchctl(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      const r = await launchctl(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
       if (r.code !== 0) throw new Error(`launchctl disable exited ${r.code}: ${r.stderr.trim()}`);
     },
     async enableJob(): Promise<void> {
-      const r = await runLaunchctl(["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      const r = await launchctl(["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
       if (r.code !== 0) throw new Error(`launchctl enable exited ${r.code}: ${r.stderr.trim()}`);
     },
     async bootstrapJob(): Promise<void> {
       const plistPath = `/Library/LaunchDaemons/${AGENT_HARNESS_DAEMON_LABEL}.plist`;
-      const b = await runLaunchctl(["bootstrap", "system", plistPath]);
+      const b = await launchctl(["bootstrap", "system", plistPath]);
       if (b.code !== 0 && !/already bootstrapped/i.test(b.stderr)) {
         throw new Error(`launchctl bootstrap exited ${b.code}: ${b.stderr.trim()}`);
       }
-      const k = await runLaunchctl(["kickstart", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      const k = await launchctl(["kickstart", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
       if (k.code !== 0) throw new Error(`launchctl kickstart exited ${k.code}: ${k.stderr.trim()}`);
     },
     async bootoutJob(): Promise<void> {
-      const r = await runLaunchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-      if (r.code !== 0 && !/No such process|Could not find/i.test(r.stderr)) {
+      const r = await launchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      // FIX-ROUND 2 (2026-07-18): the ONE shared predicate, not a second
+      // hand-maintained regex. This site was the last production bootout still
+      // carrying its own narrow list (stderr-only, `No such process` /
+      // `Could not find`), which is precisely the divergence the F4 "one
+      // predicate" fix existed to end -- and it is reachable from the newly
+      // reachable release sequence's reassert-parked and bootstrap-cleanup
+      // steps, where a clean host reporting a not-loaded shape this regex does
+      // not know would refuse the fine-grained arm for no reason.
+      if (!launchctlBootoutWasNotLoaded(r)) {
         throw new Error(`launchctl bootout exited ${r.code}: ${r.stderr.trim()}`);
       }
     },

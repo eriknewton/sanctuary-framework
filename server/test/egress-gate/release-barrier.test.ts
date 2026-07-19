@@ -311,6 +311,16 @@ interface OpsLog {
   notices: string[];
   /** Every side effect in the order it happened (cross-op-kind ordering). */
   sequence: string[];
+  /**
+   * THE HOST, not the call record (fix-round 2, 2026-07-18). The re-gate's
+   * blocker survived a well-tested fix round because every assertion was about
+   * which functions ran. These three fields are the state a real operator would
+   * be left with, and the B1 tests below assert on THEM: the bytes on disk, the
+   * persistent launchd disable, and whether the agent is running.
+   */
+  files: Map<string, string>;
+  jobDisabled: boolean;
+  jobRunning: boolean;
 }
 
 function makeParkedOps(overrides?: {
@@ -324,8 +334,23 @@ function makeParkedOps(overrides?: {
   priorPlist?: string;
   /** Status samples returned in order (later ones drive the settle loop). */
   statusSamples?: Array<{ known: boolean; installed: boolean; running: boolean }>;
+  /** Make the revert's verified restart fail (it throws, as production's does). */
+  restoreRunningHarnessError?: string;
 }): { ops: ParkedInstallOps; log: OpsLog } {
-  const log: OpsLog = { writes: [], ensured: [], removed: [], launchctl: [], notices: [], sequence: [] };
+  const log: OpsLog = {
+    writes: [],
+    ensured: [],
+    removed: [],
+    launchctl: [],
+    notices: [],
+    sequence: [],
+    files: new Map(),
+    jobDisabled: false,
+    jobRunning: overrides?.statusSamples?.[0]?.running ?? overrides?.running ?? false,
+  };
+  if (overrides?.priorPlist !== undefined) {
+    log.files.set(AGENT_HARNESS_DAEMON_PLIST_PATH, overrides.priorPlist);
+  }
   let statusCall = 0;
   const ops: ParkedInstallOps = {
     async ensureHoldDir(path, mode) {
@@ -335,27 +360,45 @@ function makeParkedOps(overrides?: {
     },
     async readFile(path) {
       log.sequence.push(`read:${path}`);
-      return overrides?.priorPlist;
+      return log.files.get(path);
     },
-    async writeFile(path, _content, mode) {
+    async writeFile(path, content, mode) {
       log.writes.push({ path, mode });
       log.sequence.push(`write:${path}`);
+      log.files.set(path, content);
     },
     async removeFile(path) {
       log.removed.push(path);
       log.sequence.push(`remove:${path}`);
+      log.files.delete(path);
+    },
+    async restoreRunningHarness(plistContent) {
+      log.sequence.push("restoreRunningHarness");
+      if (overrides?.restoreRunningHarnessError !== undefined) {
+        throw new Error(overrides.restoreRunningHarnessError);
+      }
+      // Production wires this to `installAgentHarnessDaemon`, which refuses
+      // unless launchd reports a stable running pid -- so it resolving means
+      // the plist is back AND the job is up. Model exactly that.
+      log.files.set(AGENT_HARNESS_DAEMON_PLIST_PATH, plistContent);
+      log.jobDisabled = false;
+      log.jobRunning = true;
+    },
+    async clearJobDisable() {
+      log.sequence.push("clearJobDisable");
+      log.jobDisabled = false;
     },
     async runLaunchctl(args) {
       log.launchctl.push([...args]);
       log.sequence.push(`launchctl:${args.join(" ")}`);
       if (args[0] === "bootout") {
-        return {
-          code: overrides?.bootoutCode ?? 0,
-          stdout: "",
-          stderr: overrides?.bootoutStderr ?? "",
-        };
+        const code = overrides?.bootoutCode ?? 0;
+        if (code === 0) log.jobRunning = false;
+        return { code, stdout: "", stderr: overrides?.bootoutStderr ?? "" };
       }
-      return { code: overrides?.disableCode ?? 0, stdout: "", stderr: "boom" };
+      const disableCode = overrides?.disableCode ?? 0;
+      if (args[0] === "disable" && disableCode === 0) log.jobDisabled = true;
+      return { code: disableCode, stdout: "", stderr: "boom" };
     },
     async harnessStatus() {
       log.sequence.push("harnessStatus");
@@ -426,7 +469,13 @@ describe("executeParkedHarnessInstall", () => {
   });
 
   it("fails loud when the harness reports RUNNING after the park", async () => {
-    const { ops } = makeParkedOps({ running: true });
+    const { ops } = makeParkedOps({
+      // A running job ALWAYS has a plist on a real host; a running job without
+      // one is refused up front by its own gate (see the F5 tests below), so
+      // reaching the post-park assertion requires modelling the plist.
+      priorPlist: priorPlistFor("sanctuary-hermes"),
+      running: true,
+    });
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/RUNNING/);
   });
 
@@ -561,6 +610,7 @@ describe("executeParkedHarnessInstall", () => {
     // launchctl accepted the stop but the job is still running down. The old
     // code matched no tolerance and threw AFTER the plist was overwritten.
     const { ops, log } = makeParkedOps({
+      priorPlist: priorPlistFor("sanctuary-hermes"),
       bootoutCode: 36,
       bootoutStderr: "Boot-out failed: 36: Operation now in progress",
       statusSamples: [
@@ -577,6 +627,7 @@ describe("executeParkedHarnessInstall", () => {
 
   it("D2/F4: a job that NEVER stops still refuses -- settling delays the refusal, it does not remove it", async () => {
     const { ops } = makeParkedOps({
+      priorPlist: priorPlistFor("sanctuary-hermes"),
       bootoutCode: 36,
       bootoutStderr: "Boot-out failed: 36: Operation now in progress",
       statusSamples: [{ known: true, installed: true, running: true }],
@@ -590,14 +641,24 @@ describe("executeParkedHarnessInstall", () => {
     // Fail-closed: the stale hold file removal and the parked-status claim
     // never ran. Exactly ONE status call happened -- the read-only precondition
     // probe; the post-stand-down assertion was never reached.
-    expect(log.removed).toEqual([]);
+    expect(log.removed).not.toContain(plan.holdFilePath);
     expect(log.sequence.filter((s) => s === "harnessStatus")).toHaveLength(1);
+    // FIX-ROUND 2: and the clean host is CLEAN again. This run created the
+    // parked plist and the disable from nothing, so undoing means removing
+    // both -- not leaving a disabled label and a barrier plist for the next
+    // run to trip over.
+    expect(log.files.has(plan.plistPath)).toBe(false);
+    expect(log.jobDisabled).toBe(false);
   });
 
   it("D2: STILL refuses when the job reports running after a successful stand-down", async () => {
     // The pre-existing fail-closed assertion is the last line of defense and
     // must survive the stand-down being added in front of it.
-    const { ops, log } = makeParkedOps({ bootoutCode: 0, running: true });
+    const { ops, log } = makeParkedOps({
+      priorPlist: priorPlistFor("sanctuary-hermes"),
+      bootoutCode: 0,
+      running: true,
+    });
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/RUNNING/);
     expect(log.launchctl).toContainEqual(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
   });
@@ -685,7 +746,143 @@ describe("executeParkedHarnessInstall", () => {
     // generation commits" -- a promise nothing retracted on the abort paths.
     expect(notice).not.toMatch(/the release barrier starts it after/i);
     expect(notice).toMatch(/unless the exclusive-egress gate commits/i);
-    expect(notice).toMatch(/restored to how it was/i);
+    expect(notice).toMatch(/put back the way it was/i);
+    // FIX-ROUND 2: and it no longer states the restore as a guarantee. The
+    // restore can still fail; the notice names that instead of implying it
+    // cannot happen.
+    expect(notice).toMatch(/if that restore does not succeed this run says so/i);
+  });
+
+  // ------------------------------------------------------------------
+  // FIX-ROUND 2 (2026-07-18). Both gate families, independently: a
+  // post-mutation failure stood the agent down and never restored it, because
+  // the snapshot was returned only on the SUCCESS path. The notice above
+  // promises restoration; these assert the host actually gets it.
+  //
+  // EVERY ASSERTION HERE IS ABOUT OBSERVED STATE -- the plist bytes on disk,
+  // the persistent disable, whether the job is up. Round 1 was well-tested and
+  // still shipped this defect precisely because its assertions were about
+  // which functions got called.
+  // ------------------------------------------------------------------
+
+  const upgradeHostPlist = priorPlistFor("sanctuary-hermes");
+
+  /** The upgrade host the Mini1 drill hit: pre-S5 KeepAlive harness, running. */
+  function upgradeHostThatNeverStops() {
+    return makeParkedOps({
+      priorPlist: upgradeHostPlist,
+      bootoutCode: 0,
+      // The exact Mini1 condition: a KeepAlive job that restarts (or does not
+      // die within the settle bound), so the stopped-settle assertion throws
+      // AFTER the plist has been overwritten and the disable set.
+      statusSamples: [{ known: true, installed: true, running: true }],
+    });
+  }
+
+  it("B1: a post-mutation failure leaves the plist BYTES and the enable-state exactly as they were", async () => {
+    const { ops, log } = upgradeHostThatNeverStops();
+    await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/RUNNING/);
+    // The three things the operator would find on the host afterwards.
+    expect(log.files.get(plan.plistPath)).toBe(upgradeHostPlist);
+    expect(log.jobDisabled).toBe(false);
+    expect(log.jobRunning).toBe(true);
+  });
+
+  it("B1: the thrown error states the OBSERVED restore, and still carries the original failure", async () => {
+    const { ops } = upgradeHostThatNeverStops();
+    const err = await executeParkedHarnessInstall(plan, ops).catch((e: unknown) => e as Error);
+    // The original refusal is not swallowed by the recovery.
+    expect(err.message).toMatch(/reports RUNNING after a parked install/);
+    expect(err.message).toMatch(/put back/i);
+    expect(err.message).toMatch(/running again/i);
+    // ...and it does NOT claim the agent is stopped, because it is not.
+    expect(err.message).not.toMatch(/is STOPPED/);
+  });
+
+  it("B1: EVERY post-mutation throw site reverts, not just the assertion the drill happened to hit", async () => {
+    // A snapshot that only survives one code path is not a recovery mechanism.
+    // Drive each distinct failure AFTER the first write and assert the host is
+    // unchanged in all of them.
+    const cases: Array<{ name: string; overrides: Parameters<typeof makeParkedOps>[0] }> = [
+      { name: "disable non-zero", overrides: { disableCode: 5 } },
+      {
+        name: "bootout unrecognized failure",
+        overrides: { bootoutCode: 1, bootoutStderr: "Operation not permitted" },
+      },
+      {
+        name: "status unknown after the park",
+        overrides: {
+          statusSamples: [
+            { known: true, installed: true, running: true },
+            { known: false, installed: false, running: false },
+          ],
+        },
+      },
+      {
+        name: "job still running after the park",
+        overrides: { statusSamples: [{ known: true, installed: true, running: true }] },
+      },
+    ];
+    for (const { name, overrides } of cases) {
+      const { ops, log } = makeParkedOps({ priorPlist: upgradeHostPlist, ...overrides });
+      await expect(executeParkedHarnessInstall(plan, ops), name).rejects.toThrow();
+      expect(log.files.get(plan.plistPath), `${name}: prior plist bytes`).toBe(upgradeHostPlist);
+      expect(log.jobDisabled, `${name}: persistent disable`).toBe(false);
+    }
+  });
+
+  it("B1: when the revert CANNOT restart the agent, the error says the agent is STOPPED", async () => {
+    // The failure mode that must never be dressed up as a success.
+    const { ops, log } = makeParkedOps({
+      priorPlist: upgradeHostPlist,
+      statusSamples: [{ known: true, installed: true, running: true }],
+      restoreRunningHarnessError: "launchctl bootstrap exited 5: Input/output error",
+    });
+    const err = await executeParkedHarnessInstall(plan, ops).catch((e: unknown) => e as Error);
+    expect(err.message).toMatch(/could NOT be put back/);
+    expect(err.message).toMatch(/is STOPPED/);
+    expect(err.message).toMatch(/sanctuary protect --hermes/);
+    expect(err.message).not.toMatch(/put back: its previous plist is restored/);
+    // The plist still goes back even though the restart did not, so the
+    // operator is not left holding a barrier plist they cannot start.
+    expect(log.files.get(plan.plistPath)).toBe(upgradeHostPlist);
+  });
+
+  it("B1: a clean-host post-mutation failure removes what THIS run created, and says so without claiming a rescue", async () => {
+    const { ops, log } = makeParkedOps({ disableCode: 5 });
+    const err = await executeParkedHarnessInstall(plan, ops).catch((e: unknown) => e as Error);
+    expect(err.message).toMatch(/Nothing that existed before this run was modified/);
+    expect(err.message).not.toMatch(/is STOPPED/);
+    expect(log.files.has(plan.plistPath)).toBe(false);
+    expect(log.jobDisabled).toBe(false);
+  });
+
+  it("F5: refuses a RUNNING job with no plist to restore it from -- a stand-down we could not undo", async () => {
+    // Codex lens: launchd knows a running job, but nothing is at the plist
+    // path. We can stop it and have nothing to start it with. The only
+    // one-way door in this function, closed where closing it is free.
+    const { ops, log } = makeParkedOps({
+      statusSamples: [{ known: true, installed: true, running: true }],
+    });
+    await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/could not undo|cannot undo/i);
+    // Read-only refusal: the host is untouched.
+    expect(log.writes).toEqual([]);
+    expect(log.launchctl).toEqual([]);
+    expect(log.ensured).toEqual([]);
+    expect(log.jobRunning).toBe(true);
+  });
+
+  it("F5: a job that is INSTALLED but not running with no plist is fine -- there is nothing to strand", async () => {
+    const { ops } = makeParkedOps({
+      statusSamples: [
+        { known: true, installed: true, running: false },
+        { known: true, installed: false, running: false },
+      ],
+    });
+    await expect(executeParkedHarnessInstall(plan, ops)).resolves.toMatchObject({
+      preexistingJobModified: true,
+      wasRunning: false,
+    });
   });
 });
 
@@ -788,6 +985,73 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     const result = await revertParkedHarnessInstall(runningSnapshot, ops);
     expect(result.plistRestored).toBe(false);
     expect(result.errors.length).toBeGreaterThanOrEqual(2);
+  });
+
+  // ------------------------------------------------------------------
+  // FIX-ROUND 2 (2026-07-18) -- B2, found independently by both lenses. The
+  // production caller derived `restored` from `errors.length === 0`, which is a
+  // statement about how QUIETLY the revert failed. `restored` is now derived
+  // here, from observed state, and these are the two cases that separate the
+  // two definitions.
+  // ------------------------------------------------------------------
+
+  it("B2: a job that was running and could NOT be restarted is NOT restored, however cleanly the plist went back", async () => {
+    const { ops, log } = makeRevertOps({ restartError: "launchctl bootstrap exited 5" });
+    const result = await revertParkedHarnessInstall(runningSnapshot, ops);
+    // The plist genuinely IS back; that was never the question.
+    expect(result.plistRestored).toBe(true);
+    expect(log.writes).toEqual([{ path: AGENT_HARNESS_DAEMON_PLIST_PATH, content: PRIOR }]);
+    // The verdict is about the AGENT, and the agent is down.
+    expect(result.harnessRestarted).toBe(false);
+    expect(result.wasRunning).toBe(true);
+    expect(result.restored).toBe(false);
+  });
+
+  it("B2: a running job with NO captured prior plist reports a FAILED restore -- the exact silent case", async () => {
+    // Both lenses constructed this: `wasRunning: true` with
+    // `priorPlistContent: undefined` skips the restart branch rather than
+    // failing it, so NOTHING throws and the error list stays empty. Under the
+    // old rule that read as a successful restore while the operator's agent
+    // sat stopped. (The install now refuses this host before mutating; the
+    // revert must still be truthful about it -- defence in depth.)
+    const { ops } = makeRevertOps();
+    const result = await revertParkedHarnessInstall(
+      { ...runningSnapshot, priorPlistContent: undefined },
+      ops,
+    );
+    expect(result.harnessRestarted).toBe(false);
+    expect(result.plistRestored).toBe(true);
+    expect(result.restored).toBe(false);
+    // Silence is not evidence: the absence of a complaint became a complaint.
+    expect(result.errors.join(" ")).toMatch(/is STOPPED now/);
+    expect(result.errors.join(" ")).toMatch(/no captured prior plist/);
+  });
+
+  it("B2: the restores that genuinely succeeded still report restored:true", async () => {
+    const { ops } = makeRevertOps();
+    // Was running, restart verified.
+    await expect(revertParkedHarnessInstall(runningSnapshot, ops)).resolves.toMatchObject({
+      restored: true,
+      harnessRestarted: true,
+      wasRunning: true,
+    });
+    // Was NOT running: correctly not restarted, and correctly restored.
+    await expect(
+      revertParkedHarnessInstall({ ...runningSnapshot, wasRunning: false }, ops),
+    ).resolves.toMatchObject({ restored: true, harnessRestarted: false, wasRunning: false });
+    // Clean host: nothing pre-existing to put back.
+    await expect(
+      revertParkedHarnessInstall(
+        {
+          wasInstalled: false,
+          wasRunning: false,
+          preexistingJobModified: false,
+          plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
+          harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
+        },
+        ops,
+      ),
+    ).resolves.toMatchObject({ restored: true, nothingToRevert: true });
   });
 });
 

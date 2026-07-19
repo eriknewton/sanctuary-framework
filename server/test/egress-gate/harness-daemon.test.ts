@@ -441,8 +441,17 @@ describe("egress-gate/harness-daemon", () => {
       expect(ops.removals).toEqual([]);
     });
 
+    // NOTE on the `bootedOut` flag in the two mocks below (fix-round 2,
+    // 2026-07-18): `uninstallAgentHarnessDaemon` now re-reads `launchctl print`
+    // after its bootout and refuses to remove the plist over a job that is
+    // still running. These mocks previously reported a live pid FOREVER, even
+    // after a zero-exit bootout -- a host launchd cannot produce. Modelling the
+    // bootout is what lets them keep testing what they are about (an unstable
+    // install cleans its plist up) instead of accidentally testing the new
+    // guard. The still-running case has its own test further down.
     it("requires every stability sample to report the same running pid", async () => {
       let prints = 0;
+      let bootedOut = false;
       const ops = mockOps({
         runLaunchctl: (args) => {
           if (args[0] === "print") {
@@ -450,7 +459,7 @@ describe("egress-gate/harness-daemon", () => {
             if (prints === 1) {
               return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
             }
-            if (prints === 3) {
+            if (prints === 3 || bootedOut) {
               return Promise.resolve({
                 code: 0,
                 stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tstate = not running\n}\n`,
@@ -467,6 +476,7 @@ describe("egress-gate/harness-daemon", () => {
             return Promise.resolve({ code: 0, stdout: "", stderr: "" });
           }
           if (args[0] === "bootout") {
+            bootedOut = true;
             return Promise.resolve({ code: 0, stdout: "", stderr: "" });
           }
           return Promise.resolve({ code: 0, stdout: "", stderr: "" });
@@ -481,12 +491,20 @@ describe("egress-gate/harness-daemon", () => {
 
     it("rejects a harness whose running pid changes between stability samples", async () => {
       let prints = 0;
+      let bootedOut = false;
       const ops = mockOps({
         runLaunchctl: (args) => {
           if (args[0] === "print") {
             prints += 1;
             if (prints === 1) {
               return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+            }
+            if (bootedOut) {
+              return Promise.resolve({
+                code: 0,
+                stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tstate = not running\n}\n`,
+                stderr: "",
+              });
             }
             return Promise.resolve({
               code: 0,
@@ -498,6 +516,7 @@ describe("egress-gate/harness-daemon", () => {
             return Promise.resolve({ code: 0, stdout: "", stderr: "" });
           }
           if (args[0] === "bootout") {
+            bootedOut = true;
             return Promise.resolve({ code: 0, stdout: "", stderr: "" });
           }
           return Promise.resolve({ code: 0, stdout: "", stderr: "" });
@@ -554,6 +573,48 @@ describe("egress-gate/harness-daemon", () => {
       await expect(uninstallAgentHarnessDaemon(ops)).rejects.toThrow(
         /bootout system\/.* exited 5/,
       );
+      expect(ops.removals).toEqual([]);
+    });
+
+    // ------------------------------------------------------------------
+    // FIX-ROUND 2 (2026-07-18). The shared `launchctlBootoutWasNotLoaded`
+    // predicate justifies its generous match with "every caller re-reads
+    // `launchctl print` afterwards and refuses if the job is still running."
+    // The gate lens found that argument was FALSE at this function -- the
+    // first site the comment names. These make it true, and keep it true.
+    // ------------------------------------------------------------------
+
+    it("uninstall REFUSES to remove the plist when the job is still running after a TOLERATED bootout", async () => {
+      // The fail-open shape: the predicate says "already stopped" (so the
+      // bootout error is swallowed), but launchd still reports a live pid.
+      // Removing the plist here leaves a live confined harness with no unit
+      // file behind it while the ceremony reports success.
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n\tstate = running\n}\n`,
+              stderr: "",
+            });
+          }
+          return Promise.resolve({ code: 1, stdout: "", stderr: "service not loaded" });
+        },
+      });
+      await expect(uninstallAgentHarnessDaemon(ops)).rejects.toThrow(/STILL RUNNING after bootout/);
+      expect(ops.removals).toEqual([]);
+    });
+
+    it("uninstall REFUSES to remove the plist against an untrustworthy post-bootout status", async () => {
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            return Promise.resolve({ code: 1, stdout: "", stderr: "launchctl exploded" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+      await expect(uninstallAgentHarnessDaemon(ops)).rejects.toThrow(/trustworthy status after bootout/);
       expect(ops.removals).toEqual([]);
     });
   });

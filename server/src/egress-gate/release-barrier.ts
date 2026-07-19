@@ -137,8 +137,8 @@ export function releaseWrapperPath(dir: string = AGENT_HARNESS_HOLD_DIR): string
 
 /** A release-barrier input or on-disk record violated a constraint. Fail-closed. */
 export class ReleaseBarrierError extends Error {
-  constructor(message: string) {
-    super(`agent-harness release barrier: ${message}`);
+  constructor(message: string, options?: ErrorOptions) {
+    super(`agent-harness release barrier: ${message}`, options);
     this.name = "ReleaseBarrierError";
   }
 }
@@ -567,16 +567,26 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
 const HARNESS_STOP_SETTLE_SAMPLES = 20;
 const HARNESS_STOP_SETTLE_INTERVAL_MS = 250;
 
-/** Injected side effects for the parked install (root in production; mocks in tests). */
-export interface ParkedInstallOps extends HoldDirWriteOps {
+/**
+ * Injected side effects for the parked install (root in production; mocks in
+ * tests).
+ *
+ * IT EXTENDS THE *REVERT* OPS ON PURPOSE (fix-round 2, 2026-07-18). The parked
+ * install is destructive, and the re-gate found that its own post-mutation
+ * failures never reached the caller's restore chokepoint -- the snapshot was
+ * returned only on success, so a throw destroyed the one record of what to put
+ * back. The structural answer is that the function which performs the mutation
+ * owns undoing it, and the type now says so: a caller cannot ask for the
+ * destructive act without also handing over the means to reverse it. There is
+ * no ops shape that can mutate but not revert.
+ */
+export interface ParkedInstallOps extends HoldDirWriteOps, ParkedInstallRevertOps {
   /**
    * Read a file's contents, or `undefined` when it does not exist. Used to
    * SNAPSHOT the pre-existing harness plist before this install overwrites it
    * -- without the snapshot there is nothing to restore an aborted run to.
    */
   readFile(path: string): Promise<string | undefined>;
-  /** Remove the file at `path` (ENOENT is not an error). */
-  removeFile(path: string): Promise<void>;
   /** Run launchctl with argv (never a shell). */
   runLaunchctl(args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }>;
   /** The harness job's launchd status (the shipped `agentHarnessDaemonStatus`). */
@@ -691,6 +701,22 @@ function readPlistFirstProgramArgument(plistXml: string): string | undefined {
  * `bootstrappedThisRun: false` signal, which meant "pre-existing and
  * untouched" and stopped being true the moment this function started
  * overwriting pre-existing jobs.
+ *
+ *   c. REVERT INTERNALLY WHAT CANNOT BE CARRIED (fix-round 2, 2026-07-18).
+ *      Both gate families independently found (b) insufficient: the snapshot
+ *      only ever reached the caller on the SUCCESS path, so the assertion at
+ *      the bottom of phase 2 -- the exact one that fired on Mini1 -- stood the
+ *      agent down, threw, and destroyed the record of how to put it back. A
+ *      snapshot that exists only on the success path is not a recovery
+ *      mechanism. Phase 2 is therefore wrapped: ANY post-mutation failure
+ *      reverts HERE, inside the function that did the mutating, before the
+ *      error leaves. Nothing has to survive transit, and no caller has to
+ *      remember anything.
+ *
+ *      The thrown error then states what the revert was OBSERVED to achieve --
+ *      not what it attempted. If the agent could not be put back, the message
+ *      says the agent is STOPPED. The caller-side chokepoint (b) remains, and
+ *      covers the aborts that happen AFTER a successful install.
  */
 export async function executeParkedHarnessInstall(
   plan: ParkedHarnessInstallPlan,
@@ -746,6 +772,22 @@ export async function executeParkedHarnessInstall(
     }
   }
 
+  // UNRECOVERABLE-STAND-DOWN GATE (fix-round 2, 2026-07-18; found by the Codex
+  // lens). A job that launchd reports RUNNING but whose plist is not at the
+  // expected path is a drifted host: we can stop it, and we have nothing to
+  // start it again FROM. Standing it down would be a one-way door -- the only
+  // failure mode in this function where the operator's agent cannot be put
+  // back at all. Refuse in the read-only phase, where refusing is free.
+  if (before.running && priorPlistContent === undefined) {
+    throw new ReleaseBarrierError(
+      `launchd reports ${plan.harnessLabel} RUNNING but there is no plist at ${plan.plistPath} to restore it ` +
+        "from. This install would have to stop that agent, and could not start it again if this run later " +
+        "aborts. Refusing to make a stand-down we cannot undo. Take the job down deliberately first " +
+        "('sudo sanctuary unprotect', or 'sudo launchctl bootout system/" +
+        `${plan.harnessLabel}'), then re-run.`,
+    );
+  }
+
   const snapshot: HarnessStandDownSnapshot = {
     priorPlistContent,
     wasInstalled: before.installed,
@@ -755,7 +797,29 @@ export async function executeParkedHarnessInstall(
     harnessLabel: plan.harnessLabel,
   };
 
-  // ---- PHASE 2: mutate ---------------------------------------------------
+  // ---- PHASE 2: mutate, and UNDO OUR OWN MUTATION IF WE CANNOT FINISH -----
+  //
+  // Everything from here down is destructive. The `catch` is not decoration:
+  // it is the only thing standing between a failed assertion and an operator
+  // whose agent is stopped with their original plist overwritten. See (c) in
+  // the doc-comment above.
+  try {
+    await executeParkedHarnessInstallMutation(plan, ops);
+  } catch (err) {
+    throw await revertFailedParkedInstall(snapshot, ops, err);
+  }
+  return snapshot;
+}
+
+/**
+ * The destructive half of {@link executeParkedHarnessInstall}, extracted so
+ * that its caller's `try` unambiguously covers every mutation and every
+ * post-mutation assertion. Never call this directly: it has no revert.
+ */
+async function executeParkedHarnessInstallMutation(
+  plan: ParkedHarnessInstallPlan,
+  ops: ParkedInstallOps,
+): Promise<void> {
   await writeIntoHoldDir(ops, plan.holdDir, RELEASE_WRAPPER_FILENAME, plan.wrapperContent, 0o755);
   await ops.writeFile(plan.plistPath, plan.plistContent, 0o644);
   const disable = await ops.runLaunchctl(["disable", `system/${plan.harnessLabel}`]);
@@ -780,10 +844,18 @@ export async function executeParkedHarnessInstall(
     // generation commits" -- a commitment that never happens on the abort
     // paths, retracted by nothing). It now names the condition and states the
     // abort behaviour, which the flow actually implements.
+    // ...AND IT NO LONGER PROMISES AN OUTCOME (fix-round 2, 2026-07-18). The
+    // previous wording ended "it is restored to how it was before this run" --
+    // an unconditional guarantee, printed BEFORE the restore, by a code path
+    // that at the time could not deliver it on the one failure the drill hit.
+    // Every abort now does attempt the restore, and a restore that fails is
+    // reported loudly; so the honest sentence is the mechanism plus that
+    // caveat, not the guarantee.
     ops.notify(
       `Unloaded the existing ${plan.harnessLabel} job (launchctl bootout) so the parked install can hold. ` +
-        "It stays stopped unless the exclusive-egress gate commits; if this run does not get that far, " +
-        "it is restored to how it was before this run.",
+        "It stays stopped unless the exclusive-egress gate commits; if this run does not get that far, it " +
+        "is put back the way it was, and if that restore does not succeed this run says so explicitly " +
+        "rather than leaving you to notice.",
     );
   } else if (!launchctlBootoutWasNotLoaded(bootout) && !bootoutInProgress) {
     throw new ReleaseBarrierError(
@@ -809,7 +881,71 @@ export async function executeParkedHarnessInstall(
       "the harness job reports RUNNING after a parked install; the park did not hold (manual intervention required)",
     );
   }
-  return snapshot;
+}
+
+/**
+ * Undo a parked install that failed AFTER it started mutating, and return the
+ * error to throw -- one whose message states what the revert was OBSERVED to
+ * achieve.
+ *
+ * The wording rule this whole fix-round exists to enforce: never report an
+ * intent. "It is restored to how it was before this run" was printed on the way
+ * in by a code path that could not keep the promise. What comes out of here is
+ * derived from {@link ParkedInstallRevertResult.restored}, which is itself
+ * derived from observed post-restore state -- so a revert that did not put the
+ * agent back produces a message that says the agent is stopped.
+ */
+async function revertFailedParkedInstall(
+  snapshot: HarnessStandDownSnapshot,
+  ops: ParkedInstallOps,
+  cause: unknown,
+): Promise<ReleaseBarrierError> {
+  const original = describeError(cause);
+  let revert: ParkedInstallRevertResult;
+  try {
+    revert = await revertParkedHarnessInstall(snapshot, ops);
+  } catch (revertErr) {
+    // `revertParkedHarnessInstall` documents that it never throws. If that
+    // contract is ever broken, the original failure must still surface, and
+    // the operator must not be told anything was put back.
+    return new ReleaseBarrierError(
+      `${original}. The parked install then FAILED TO REVERT ITS OWN CHANGES (${describeError(revertErr)}). ` +
+        standDownStillStoppedAdvice(snapshot),
+      { cause },
+    );
+  }
+
+  if (revert.nothingToRevert) {
+    const trailing =
+      revert.errors.length === 0
+        ? "Nothing that existed before this run was modified; the parked install this run created was removed."
+        : `Nothing that existed before this run was modified, but this run's own parked install could not be ` +
+          `fully cleaned up: ${revert.errors.join("; ")}.`;
+    return new ReleaseBarrierError(`${original}. ${trailing}`, { cause });
+  }
+
+  if (revert.restored) {
+    return new ReleaseBarrierError(
+      `${original}. The pre-existing harness was put back: its previous plist is restored${
+        revert.harnessRestarted ? " and the job is running again" : " and it was not running before this run"
+      }.`,
+      { cause },
+    );
+  }
+
+  return new ReleaseBarrierError(
+    `${original}. The pre-existing harness could NOT be put back${
+      revert.errors.length === 0 ? "" : `: ${revert.errors.join("; ")}`
+    }. ${standDownStillStoppedAdvice(snapshot)}`,
+    { cause },
+  );
+}
+
+function standDownStillStoppedAdvice(snapshot: HarnessStandDownSnapshot): string {
+  return snapshot.wasRunning
+    ? `The agent harness (${snapshot.harnessLabel}) is STOPPED. Re-run 'sudo sanctuary protect --hermes' to ` +
+        "bring it back up under the previous (coarse) posture."
+    : `Check ${snapshot.plistPath} before re-running.`;
 }
 
 /**
@@ -839,7 +975,17 @@ export interface ParkedInstallRevertOps {
    * recovery routine, not a second one written for this path.
    */
   restoreRunningHarness(plistContent: string): Promise<void>;
-  /** Clear the persistent launchd disable this install set. */
+  /**
+   * Clear the persistent launchd disable this install set.
+   *
+   * HONEST BOUND (fix-round 2, 2026-07-18): production wires this to
+   * `setAgentHarnessJobDisabled(false)`, which checks the `launchctl enable`
+   * EXIT CODE and does not re-read the disabled state afterwards. So a
+   * `restored: true` verdict rests on an observed plist and an observed
+   * run-state, plus an unobserved-but-non-erroring enable. It is called out
+   * because the whole point of this fix-round is that unobserved steps get
+   * named rather than folded into a claim.
+   */
   clearJobDisable(): Promise<void>;
   /** Write a file with a mode. */
   writeFile(path: string, content: string, mode: number): Promise<void>;
@@ -855,6 +1001,23 @@ export interface ParkedInstallRevertResult {
   plistRestored: boolean;
   /** The job was running before and is running again. */
   harnessRestarted: boolean;
+  /** The job was running before the stand-down (echoed from the snapshot). */
+  wasRunning: boolean;
+  /**
+   * THE ONE VERDICT (fix-round 2, 2026-07-18). Derived HERE, from what was
+   * observed, so no caller has to re-derive it and get it wrong.
+   *
+   * The re-gate found both families reporting the same defect: the production
+   * caller mapped `restored` from `errors.length === 0`, which is a statement
+   * about how quietly the revert failed, not about whether the agent is back.
+   * A job that was running, could not be restarted, and raised no error read as
+   * a successful restore while the operator's agent sat stopped.
+   *
+   * The honest predicate is a conjunction of observations: the plist is back
+   * AND (the job is running again OR it was not running to begin with). An
+   * empty error list is necessary but never sufficient.
+   */
+  restored: boolean;
   /** Whatever could NOT be put back, in operator-facing words. Never thrown. */
   errors: string[];
 }
@@ -897,13 +1060,32 @@ export async function revertParkedHarnessInstall(
     } catch (err) {
       errors.push(`could not clear the launchd disable on system/${snapshot.harnessLabel}: ${describeError(err)}`);
     }
-    return { nothingToRevert: true, plistRestored, harnessRestarted: false, errors };
+    return {
+      nothingToRevert: true,
+      plistRestored,
+      harnessRestarted: false,
+      wasRunning: false,
+      restored: plistRestored && errors.length === 0,
+      errors,
+    };
   }
 
   if (snapshot.wasRunning && snapshot.priorPlistContent !== undefined) {
     try {
+      // `restoreRunningHarness` is contractually an OBSERVATION, not a
+      // request: production wires it to `installAgentHarnessDaemon`, which
+      // refuses unless launchd reports a STABLE running pid afterwards. It
+      // resolving is therefore evidence the job is up, which is the only basis
+      // on which `harnessRestarted: true` may ever be claimed.
       await ops.restoreRunningHarness(snapshot.priorPlistContent);
-      return { nothingToRevert: false, plistRestored: true, harnessRestarted: true, errors };
+      return {
+        nothingToRevert: false,
+        plistRestored: true,
+        harnessRestarted: true,
+        wasRunning: true,
+        restored: true,
+        errors,
+      };
     } catch (err) {
       errors.push(
         `the agent harness was stopped by this run and could NOT be restarted: ${describeError(err)}`,
@@ -929,7 +1111,29 @@ export async function revertParkedHarnessInstall(
   } catch (err) {
     errors.push(`could not clear the launchd disable on system/${snapshot.harnessLabel}: ${describeError(err)}`);
   }
-  return { nothingToRevert: false, plistRestored, harnessRestarted: false, errors };
+  if (snapshot.wasRunning && errors.length === 0) {
+    // REACHED WITH NO ERROR RAISED, YET THE AGENT IS DOWN. This is the exact
+    // shape the re-gate constructed: a job that was running before the
+    // stand-down, whose prior plist was never captured, so the restart branch
+    // above was skipped rather than failed. Nothing threw, so an
+    // `errors.length === 0` verdict called it a success. The absence of a
+    // complaint is not evidence of a running agent -- say so, out loud.
+    errors.push(
+      `the agent harness was running before this run and is STOPPED now: there is no captured prior plist ` +
+        `at ${snapshot.plistPath} to restart it from`,
+    );
+  }
+  return {
+    nothingToRevert: false,
+    plistRestored,
+    harnessRestarted: false,
+    wasRunning: snapshot.wasRunning,
+    // The conjunction, not the error count: a stand-down of a RUNNING job that
+    // reaches here was never restarted, so it is not restored no matter how
+    // cleanly the plist went back.
+    restored: plistRestored && !snapshot.wasRunning && errors.length === 0,
+    errors,
+  };
 }
 
 function describeError(err: unknown): string {

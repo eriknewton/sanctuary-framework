@@ -268,6 +268,11 @@ export function planAgentHarnessDaemonInstall(
  * launchd (re-checked after the failure) does not know the service, so the
  * "no half-installed unit left behind" promise can never strand a
  * bootstrapped service without its unit file.
+ *
+ * IT RETURNING IS AN OBSERVATION. Every exit path either throws or has just
+ * seen `agentHarnessDaemonStableRunning` come back true, so callers may -- and
+ * the parked-install revert does -- treat a resolved promise as evidence that
+ * the job is up, rather than as evidence that a bootstrap was requested.
  */
 export async function installAgentHarnessDaemon(
   plan: HarnessDaemonInstallPlan,
@@ -340,6 +345,18 @@ export async function installAgentHarnessDaemon(
  * harness with no unit file behind it while the ceremony reports success --
  * a silently-failed teardown. Fail loudly instead, before touching the
  * plist (same fail-closed teardown semantics as `disarmPfAnchor`).
+ *
+ * THE AUTHORITATIVE POST-CHECK (fix-round 2, 2026-07-18). The shared
+ * {@link launchctlBootoutWasNotLoaded} predicate justifies its generous match
+ * with "no caller relies on it alone: every one re-reads `launchctl print`
+ * afterwards and refuses if the job is still running". This function is the
+ * first site that comment names and was the one site where it was NOT true --
+ * it went from the predicate straight to `removeFile`. The gate lens was right
+ * that this is the fail-open direction (a teardown reporting success over a
+ * live harness whose unit file is now gone), and right that the argument
+ * should be made true rather than narrowed. The status re-read below is that
+ * check: an unknown status or a still-running job refuses BEFORE the plist is
+ * touched, exactly as the parked install's stopped-settle assertion does.
  */
 export async function uninstallAgentHarnessDaemon(ops: HarnessDaemonOps): Promise<void> {
   const label = `system/${AGENT_HARNESS_DAEMON_LABEL}`;
@@ -347,6 +364,19 @@ export async function uninstallAgentHarnessDaemon(ops: HarnessDaemonOps): Promis
   if (result.code !== 0 && !launchctlBootoutWasNotLoaded(result)) {
     throw new Error(
       `launchctl bootout ${label} exited ${result.code}: ${result.stderr.trim()}`,
+    );
+  }
+  const after = await agentHarnessDaemonStatus(ops);
+  if (!after.known) {
+    throw new Error(
+      `launchctl print ${label} did not return a trustworthy status after bootout; refusing to remove ` +
+        `${AGENT_HARNESS_DAEMON_PLIST_PATH} against unknown launchd state`,
+    );
+  }
+  if (after.running) {
+    throw new Error(
+      `${label} is STILL RUNNING after bootout; refusing to remove ${AGENT_HARNESS_DAEMON_PLIST_PATH} and ` +
+        "leave a live harness with no unit file behind it",
     );
   }
   await ops.removeFile(AGENT_HARNESS_DAEMON_PLIST_PATH);

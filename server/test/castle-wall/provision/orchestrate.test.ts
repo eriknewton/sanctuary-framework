@@ -113,7 +113,16 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     })),
     installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
     uninstallHarnessDaemon: vi.fn(async () => undefined),
-    restoreStoodDownHarness: vi.fn(async () => ({ restored: true, problems: [] as string[] })),
+    // The common case the chokepoint exists for: a RUNNING agent was stood
+    // down and was verifiably restarted. `harnessRestarted` is the field the
+    // fix-round-2 wording keys on -- the production op used to discard it, so
+    // a stopped agent read as "was restarted".
+    restoreStoodDownHarness: vi.fn(async () => ({
+      restored: true,
+      wasRunning: true,
+      harnessRestarted: true,
+      problems: [] as string[],
+    })),
     ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
     teardownPolicyDaemon: vi.fn(async () => undefined),
     preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
@@ -1399,6 +1408,8 @@ describe("castle-wall/provision/orchestrate", () => {
         arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
         restoreStoodDownHarness: vi.fn(async () => ({
           restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
           problems: ["launchctl bootstrap exited 5"],
         })),
       });
@@ -1422,6 +1433,136 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
       expect(String((result as { reason: string }).reason)).toMatch(/EROFS/);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // FIX-ROUND 2 (2026-07-18). Round 1's note was derived from a single
+    // boolean the production op computed from an empty error list. These
+    // assert the note is a function of what was OBSERVED, in each of the
+    // three shapes that boolean collapsed together.
+    // ────────────────────────────────────────────────────────────────────
+
+    it("B2: a restore that did NOT restart a running agent is never described as restarted", async () => {
+      // The exact case both lenses built: the job was running, it could not be
+      // restarted, and NOTHING raised an error. Under the old
+      // `errors.length === 0` rule this printed "was restarted and restored to
+      // its previous state" over a stopped agent.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["the agent harness was running before this run and is STOPPED now"],
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).not.toMatch(/was restarted/i);
+      expect(reason).not.toMatch(/restored to its previous state/i);
+      expect(reason).toMatch(/The agent is STOPPED/);
+      expect(reason).toMatch(/sanctuary protect --hermes/);
+    });
+
+    it("B2: the note keys on the VERDICT, not on the error list -- a silent failed restore is still loud", async () => {
+      // The literal shape the brief named: was running, could not be
+      // restarted, and NO errors raised. Production cannot produce this any
+      // more (the revert turns that silence into an error), which is exactly
+      // why it is pinned here: the note must be a function of `restored`, so
+      // that a future op which forgets to complain still cannot print
+      // "restarted" over a stopped agent.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: [] as string[],
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).not.toMatch(/was restarted/i);
+      expect(reason).toMatch(/The agent is STOPPED/);
+    });
+
+    it("B2: a job that was NOT running before is described as put back, not as restarted", async () => {
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: true,
+          wasRunning: false,
+          harnessRestarted: false,
+          problems: [] as string[],
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/was put back/i);
+      expect(reason).toMatch(/not running before this run, and is not running now/i);
+      expect(reason).not.toMatch(/was restarted/i);
+    });
+
+    it("MED: armed-rollback-failed restores the harness but NOT the re-home, and stops claiming otherwise", async () => {
+      // Sites 14/16 return directly, without `teardownDaemonAndRestore`, so
+      // the re-home stands. Restoring the harness there runs the agent under
+      // its PRE-run account and home -- whose secrets this run already moved.
+      // "Restored to its previous state" was simply false.
+      const ops = stoodDownOps({
+        postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+        disarm: vi.fn(async () => {
+          throw new Error("pfctl -d exited 1");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result.kind).toBe("armed-rollback-failed");
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/re-home was deliberately NOT reversed/i);
+      expect(reason).toMatch(/not a return to your previous state/i);
+    });
+
+    it("MED: the restore note cannot be silenced by an outcome that has no `reason` field", async () => {
+      // The restore DECISION defaults to safe (an allow-list). The NOTE used
+      // to default to SILENCE: `withHarnessRestoreNote` returned the outcome
+      // untouched when it had no `reason`, dropping even the loud
+      // agent-is-stopped message. No outcome shape can swallow it now.
+      const printed: string[] = [];
+      const reasonless = stoodDownOps({
+        print: vi.fn((line: string) => printed.push(line)),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["launchctl bootstrap exited 5"],
+        })),
+        // `armed` carries no `reason`. It cannot co-occur with a parked
+        // install today, which is exactly why the silence went unnoticed --
+        // so drive it explicitly rather than trust that it stays unreachable.
+        exclusiveEgress: undefined,
+      });
+      const coarse = await runProvisionFlow(baseCtx({ fineGrainedDeclared: false }), reasonless);
+      expect(coarse.kind).toBe("armed");
+      expect(printed.join("\n")).toMatch(/The agent is STOPPED/);
+    });
+
+    it("MED: a restore on the THROW path is reported too, instead of being swallowed with the error", async () => {
+      const printed: string[] = [];
+      const ops = stoodDownOps({
+        print: vi.fn((line: string) => printed.push(line)),
+        checkUidExistence: vi.fn(async () => {
+          throw new Error("dscl blew up");
+        }),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["launchctl bootstrap exited 5"],
+        })),
+      });
+      await expect(runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops)).rejects.toThrow(/dscl blew up/);
+      // The original error still wins as the outcome, but the operator is no
+      // longer left to discover their agent is down by noticing it is down.
+      expect(printed.join("\n")).toMatch(/The agent is STOPPED/);
     });
   });
 });

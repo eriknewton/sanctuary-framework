@@ -438,6 +438,7 @@ describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quar
     live: boolean;
     liveReasons?: string[];
     printed: string[];
+    runLaunchctl?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
   }) {
     return createProductionReleaseBarrierOps({
       agentUid: 502,
@@ -452,9 +453,54 @@ describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quar
       internals: {
         registry: input.registry,
         probeAnchorLiveness: async () => ({ live: input.live, reasons: input.liveReasons ?? [] }),
+        ...(input.runLaunchctl === undefined ? {} : { runLaunchctl: input.runLaunchctl }),
       },
     });
   }
+
+  // ------------------------------------------------------------------
+  // FIX-ROUND 2 (2026-07-18), Codex MED + LOW. This factory's `bootoutJob`
+  // was the LAST production bootout still carrying its own narrow regex
+  // (stderr-only, `No such process` / `Could not find`) after the F4 "one
+  // predicate" fix. It is reachable from the release sequence's
+  // reassert-parked and bootstrap-cleanup steps, so a clean host reporting a
+  // not-loaded shape the regex did not know refused the fine-grained arm for
+  // no reason. Same predicate, same shapes, now covered here.
+  // ------------------------------------------------------------------
+
+  it("bootoutJob tolerates every not-loaded shape the shared predicate does (a clean host must not refuse)", async () => {
+    const notLoaded: Array<{ code: number; stdout: string; stderr: string }> = [
+      { code: 3, stdout: "", stderr: "" }, // standalone ESRCH, no phrase
+      { code: 113, stdout: "", stderr: "" }, // standalone "could not find specified service"
+      { code: 1, stdout: "", stderr: "service not loaded" },
+      { code: 1, stdout: "", stderr: "Service is not loaded" },
+      { code: 1, stdout: "", stderr: "No such service" },
+      { code: 1, stdout: "", stderr: "does not exist" },
+      { code: 1, stdout: "Could not find service", stderr: "" }, // stdout, not stderr
+    ];
+    for (const result of notLoaded) {
+      const ops = mkOps({
+        registry: memRegistry([VALID_ENTRY]),
+        live: true,
+        printed: [],
+        runLaunchctl: async () => result,
+      });
+      await expect(
+        ops.bootoutJob(),
+        `bootout ${result.code} / ${JSON.stringify(result.stderr || result.stdout)} must read as not-loaded`,
+      ).resolves.toBeUndefined();
+    }
+  });
+
+  it("bootoutJob still THROWS on a genuine failure -- the tolerance widened, it did not vanish", async () => {
+    const ops = mkOps({
+      registry: memRegistry([VALID_ENTRY]),
+      live: true,
+      printed: [],
+      runLaunchctl: async () => ({ code: 5, stdout: "", stderr: "Operation not permitted" }),
+    });
+    await expect(ops.bootoutJob()).rejects.toThrow(/bootout exited 5/);
+  });
 
   it("a malformed SIBLING entry no longer fails the valid uid's rearm: live rules verify ok, the sibling is LOUD", async () => {
     const printed: string[] = [];

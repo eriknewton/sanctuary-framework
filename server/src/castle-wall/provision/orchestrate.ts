@@ -176,8 +176,24 @@ export interface ProvisionFlowOps {
    * MUST NOT THROW: it runs on a path that is already failing for some other
    * reason, and that reason is the more important message. It reports what it
    * could not put back so the caller can surface both.
+   *
+   * FIX-ROUND 2 (2026-07-18): the result carries the two OBSERVED facts the
+   * operator-facing sentence is built from, because the re-gate found the
+   * sentence being built from neither. `restored` used to be derived by the
+   * production op from an empty error list -- so a job that was running, could
+   * not be restarted, and raised no error printed "was restarted and restored
+   * to its previous state" while stopped. Every field here must be a statement
+   * about state that was looked at, never about a call that was made.
    */
-  restoreStoodDownHarness(): Promise<{ restored: boolean; problems: string[] }>;
+  restoreStoodDownHarness(): Promise<{
+    /** The pre-run state is genuinely back: plist restored AND the job's run-state matches. */
+    restored: boolean;
+    /** The job was running before this run stood it down. */
+    wasRunning: boolean;
+    /** OBSERVED running again. Only ever true when a restart was verified. */
+    harnessRestarted: boolean;
+    problems: string[];
+  }>;
   /**
    * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
    * bootstraps a LIVE root LaunchDaemon; every post-install abort branch
@@ -548,6 +564,10 @@ export async function runProvisionFlow(
   } catch (err) {
     // A step that THREW rather than returning an outcome is exactly the abort
     // path nobody enumerates. Restore, then let the original error surface.
+    // FIX-ROUND 2: the restore's own verdict is PRINTED here rather than
+    // swallowed. The thrown error still wins as the outcome, but a restore
+    // that left the agent stopped is news the operator needs regardless of
+    // what else went wrong, and this path had no way to tell them.
     if (standDown.owed) await restoreStoodDownHarnessQuietly(ops);
     throw err;
   }
@@ -556,40 +576,76 @@ export async function runProvisionFlow(
   }
   const restore = await ops.restoreStoodDownHarness().catch((err: unknown) => ({
     restored: false,
+    wasRunning: true,
+    harnessRestarted: false,
     problems: [err instanceof Error ? err.message : String(err)],
   }));
-  return withHarnessRestoreNote(outcome, restore);
+  const note = harnessRestoreNote(restore, outcome.kind);
+  if (!("reason" in outcome) || typeof outcome.reason !== "string") {
+    // FIX-ROUND 2 (MED): the restore DECISION defaults to safe (an allow-list
+    // of outcomes that own the harness, so a new abort restores). The restore
+    // NOTE used to default to SILENCE -- an outcome without a `reason` field
+    // dropped the message on the floor, including the loud one that names the
+    // agent as stopped. Today no such outcome co-occurs with a stand-down, but
+    // "currently unreachable" is how the last two blockers started. There is
+    // no longer a shape of outcome that can swallow it.
+    ops.print(note);
+    return outcome;
+  }
+  return { ...outcome, reason: `${outcome.reason} ${note}` } as ProvisionFlowOutcome;
 }
 
 /** Best-effort restore on the throw path; the original error must win. */
 async function restoreStoodDownHarnessQuietly(ops: ProvisionFlowOps): Promise<void> {
   try {
-    await ops.restoreStoodDownHarness();
+    const restore = await ops.restoreStoodDownHarness();
+    ops.print(harnessRestoreNote(restore, "aborted"));
   } catch {
     // The caller is already propagating a more important failure.
   }
 }
 
 /**
- * Fold the restore result into the outcome the operator sees. A SUCCESSFUL
- * restore is stated too, not just failures: the flow printed "unloaded the
- * existing job" on its way in, so the operator is owed the other half of that
- * sentence. A FAILED restore is loud and names the agent as still stopped --
- * never silent, never implied by omission.
+ * Outcomes that restore the harness but deliberately do NOT reverse the
+ * re-home (they return directly, without `teardownDaemonAndRestore`). The
+ * agent is put back, but under its pre-run account and home -- whose secrets
+ * this run already moved to the dedicated account. Saying "restored to its
+ * previous state" there is false in a way that matters: the restarted harness
+ * may not find its credentials.
  */
-function withHarnessRestoreNote(
-  outcome: ProvisionFlowOutcome,
-  restore: { restored: boolean; problems: string[] },
-): ProvisionFlowOutcome {
-  if (!("reason" in outcome) || typeof outcome.reason !== "string") {
-    return outcome;
-  }
-  const note = restore.restored
-    ? "The agent harness this run stood down was restarted and restored to its previous state."
-    : `The agent harness this run stood down could NOT be fully restored: ${restore.problems.join("; ")}. ` +
+const OUTCOMES_THAT_KEEP_THE_REHOME: ReadonlySet<string> = new Set(["armed-rollback-failed"]);
+
+/**
+ * The operator-facing sentence about the restore, built ONLY from observed
+ * facts (fix-round 2, 2026-07-18).
+ *
+ * The rule this PR has now had to learn twice: state what was seen, not what
+ * was attempted. `harnessRestarted` is true only when a restart was verified
+ * against launchd, and `wasRunning` distinguishes "correctly not restarted"
+ * from "should be running and is not" -- a distinction the previous single
+ * boolean collapsed, which is how a stopped agent got described as restarted.
+ */
+function harnessRestoreNote(
+  restore: { restored: boolean; wasRunning: boolean; harnessRestarted: boolean; problems: string[] },
+  outcomeKind: string,
+): string {
+  if (!restore.restored) {
+    return (
+      `The agent harness this run stood down could NOT be fully restored: ${restore.problems.join("; ")}. ` +
       "The agent is STOPPED. Re-run 'sudo sanctuary protect --hermes' to bring it back up under the " +
-      "previous (coarse) posture.";
-  return { ...outcome, reason: `${outcome.reason} ${note}` } as ProvisionFlowOutcome;
+      "previous (coarse) posture."
+    );
+  }
+  const what = restore.harnessRestarted
+    ? "was restarted and is running again"
+    : restore.wasRunning
+      ? "was put back"
+      : "was put back; it was not running before this run, and is not running now";
+  const scope = OUTCOMES_THAT_KEEP_THE_REHOME.has(outcomeKind)
+    ? " NOTE: the re-home was deliberately NOT reversed on this outcome, so the harness is back but its " +
+      "secrets remain on the dedicated account. This is not a return to your previous state."
+    : "";
+  return `The agent harness this run stood down ${what}.${scope}`;
 }
 
 async function runProvisionFlowSteps(

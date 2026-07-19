@@ -79,6 +79,7 @@ import {
   executeParkedHarnessInstall,
   revertParkedHarnessInstall,
   type HarnessStandDownSnapshot,
+  type ParkedInstallRevertOps,
 } from "../egress-gate/release-barrier.js";
 import {
   createInstallExclusiveEgressOps,
@@ -1186,6 +1187,13 @@ export async function runAutoProvisionForWrap(
             environment: resolved.environment,
           });
           const snapshot = await executeParkedHarnessInstall(plan, {
+            // Fix-round 2 (2026-07-18): the SAME revert ops the outcome
+            // chokepoint uses, handed to the install itself so a failure
+            // AFTER it has mutated undoes its own work before the error
+            // leaves. Previously the snapshot reached this scope only on the
+            // success path, so the one assertion that fired on Mini1 stood the
+            // agent down and destroyed the record of how to restore it.
+            ...realParkedInstallRevertOps(daemonOps),
             // Drill D1: the wrapper lands in the root-owned hold dir, which
             // nothing else in a first-ever install creates. `ensureHoldDir` is
             // the production ensure the release sequence's hold-file write
@@ -1256,34 +1264,24 @@ export async function runAutoProvisionForWrap(
     restoreStoodDownHarness: async () => {
       const snapshot = harnessStandDownSnapshot;
       if (snapshot === undefined) {
-        return { restored: true, problems: [] };
+        // Nothing was stood down, so nothing is owed. Said in the shape the
+        // orchestrator's wording keys on: no restart was needed, none happened.
+        return { restored: true, wasRunning: false, harnessRestarted: false, problems: [] };
       }
-      const daemonOps = realHarnessDaemonOps();
-      const result = await revertParkedHarnessInstall(snapshot, {
-        // The SAME enable + coarse-install pair the S5-6 degrade path
-        // (`startHarnessCoarse`) uses: clear the park's persistent disable,
-        // write the plist the snapshot captured, bootstrap, and verify a
-        // stable pid. Deliberately not a second recovery routine.
-        restoreRunningHarness: async (plistContent) => {
-          await setAgentHarnessJobDisabled(daemonOps, false);
-          await installAgentHarnessDaemon(
-            {
-              plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
-              plistContent,
-              bootstrapArgs: ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
-            },
-            daemonOps,
-          );
-        },
-        clearJobDisable: async () => {
-          await setAgentHarnessJobDisabled(daemonOps, false);
-        },
-        writeFile: daemonOps.writeFile,
-        removeFile: daemonOps.removeFile,
-      });
-      // A restore that put nothing back because there was nothing to put back
-      // is a successful restore, not a silent failure.
-      return { restored: result.errors.length === 0, problems: result.errors };
+      const result = await revertParkedHarnessInstall(snapshot, realParkedInstallRevertOps(realHarnessDaemonOps()));
+      // Fix-round 2 (2026-07-18): pass the OBSERVED verdict straight through.
+      // This used to be `result.errors.length === 0` -- a statement about how
+      // quietly the revert failed. `revertParkedHarnessInstall` now derives
+      // `restored` from post-restore state (plist back AND the job running
+      // again, or never running), so a stopped agent can no longer be reported
+      // as restored. `harnessRestarted` reaches the operator-facing wording
+      // instead of being discarded here.
+      return {
+        restored: result.restored,
+        wasRunning: result.wasRunning,
+        harnessRestarted: result.harnessRestarted,
+        problems: result.errors,
+      };
     },
     // Bug B (the one-flow gap): ensure a reachable Castle Wall POLICY daemon for
     // the target fortress BEFORE arming. Arming with no policy daemon deny-all-
@@ -2307,6 +2305,43 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
       return runLaunchctlWithTimeout(args);
     },
     sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  };
+}
+
+/**
+ * THE ONE production recovery routine for a parked install (fix-round 2,
+ * 2026-07-18). Used in BOTH places the stand-down can need undoing:
+ *
+ *   1. inside `executeParkedHarnessInstall`, when the install itself fails
+ *      after mutating (the Mini1 path -- the snapshot never leaves the
+ *      function, so the revert cannot live outside it); and
+ *   2. at the orchestrator's outcome chokepoint, when a LATER stage refuses.
+ *
+ * One routine, so the two paths cannot drift into disagreeing about what
+ * "restored" means. `restoreRunningHarness` is deliberately the same
+ * enable + coarse-install pair the S5-6 degrade path (`startHarnessCoarse`)
+ * uses, and `installAgentHarnessDaemon` refuses unless launchd reports a
+ * STABLE running pid -- so its resolving is an OBSERVATION that the agent is
+ * back up, never merely a request that it should be.
+ */
+function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallRevertOps {
+  return {
+    restoreRunningHarness: async (plistContent) => {
+      await setAgentHarnessJobDisabled(daemonOps, false);
+      await installAgentHarnessDaemon(
+        {
+          plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
+          plistContent,
+          bootstrapArgs: ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
+        },
+        daemonOps,
+      );
+    },
+    clearJobDisable: async () => {
+      await setAgentHarnessJobDisabled(daemonOps, false);
+    },
+    writeFile: daemonOps.writeFile,
+    removeFile: daemonOps.removeFile,
   };
 }
 
