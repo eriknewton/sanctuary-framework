@@ -64,15 +64,45 @@ function normalizeRuleLine(line: string): string {
   return line.trim().replace(/\s+/g, " ");
 }
 
+function anchorNamesFromBaseConfig(baseConf: string): ReadonlyMap<string, readonly string[]> {
+  const byDirective = new Map<string, Set<string>>();
+  for (const rawLine of baseConf.split("\n")) {
+    const line = normalizeRuleLine(rawLine);
+    if (line.length === 0 || line.startsWith("#")) continue;
+    const match = /^(scrub-anchor|anchor)\s+"([^"]+)"(?:\s|$)/.exec(line);
+    if (match === null) continue;
+    const directive = match[1]!;
+    const name = match[2]!;
+    const names = byDirective.get(directive) ?? new Set<string>();
+    names.add(name);
+    byDirective.set(directive, names);
+  }
+  return new Map([...byDirective.entries()].map(([directive, names]) => [directive, [...names].sort()]));
+}
+
+function normalizeRuleLineVariants(
+  line: string,
+  baseAnchorNames: ReadonlyMap<string, readonly string[]>,
+): string[] {
+  const normalized = normalizeRuleLine(line);
+  const strippedAnchor = /^(scrub-anchor|anchor)\s+"\/\*"(.*)$/.exec(normalized);
+  if (strippedAnchor === null) return [normalized];
+  const directive = strippedAnchor[1]!;
+  const suffix = strippedAnchor[2]!;
+  const names = baseAnchorNames.get(directive) ?? [];
+  if (names.length === 0) return [normalized];
+  return names.map((name) => `${directive} "${name}"${suffix}`);
+}
+
 /**
  * Extract the RULE lines from pfctl output: `pfctl -sr` prints one rule per
  * line; `pfctl -n -v -f` echoes rules plus blank lines and `@n` prefixes in
  * some modes. Strip prefixes/blanks conservatively.
  */
-function ruleLines(output: string): string[] {
+function ruleLines(output: string, baseAnchorNames: ReadonlyMap<string, readonly string[]>): string[] {
   return output
     .split("\n")
-    .map((line) => normalizeRuleLine(line.replace(/^@\d+\s+/, "")))
+    .flatMap((line) => normalizeRuleLineVariants(line.replace(/^@\d+\s+/, ""), baseAnchorNames))
     .filter((line) => line.length > 0);
 }
 
@@ -134,8 +164,9 @@ export async function diffTransientPfRules(
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 
-  const expected = new Set(ruleLines(normalized));
-  const runningRules = ruleLines(running.stdout);
+  const baseAnchorNames = anchorNamesFromBaseConfig(baseConf);
+  const expected = new Set(ruleLines(normalized, baseAnchorNames));
+  const runningRules = ruleLines(running.stdout, baseAnchorNames);
   const anchorCallPrefix = `anchor "${anchorName}"`;
   const foreign = runningRules.filter(
     (line) => !expected.has(line) && !line.startsWith(anchorCallPrefix),

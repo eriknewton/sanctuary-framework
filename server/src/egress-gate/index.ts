@@ -122,7 +122,10 @@ export {
   planGateAccountProvision,
   planAndCreateGateAccount,
   GateUidCollisionError,
+  GateAccountVerificationError,
   type GateAccountProvisionOptions,
+  type GateAccountProvisionOps,
+  type GateAccountRecord,
 } from "./gate-account.js";
 
 export {
@@ -250,6 +253,7 @@ export {
   egressGateRulesConfigPath,
   egressGateRuntimeStatePath,
   egressGateRuntimeUidDirPath,
+  gateDaemonLogDirForHome,
   parseEgressGateRuntimeState,
   renderEgressGateDaemonPlist,
   runEgressGateDaemon,
@@ -283,6 +287,7 @@ export {
   createProductionOracle,
   createProductionReleaseBarrierOps,
   createRepairExclusiveEgressOps,
+  ensureGateAccountHomeLayout,
   createUnprotectExclusiveEgressOps,
   ensureAgentHarnessHoldDir,
   ensureSupervisorOracleKeys,
@@ -300,6 +305,7 @@ export {
   type ExclusiveEgressBootSupervisorHandle,
   type ExclusiveEgressBootSupervisorInternals,
   type ExclusiveEgressWiringInput,
+  type GateAccountHomeLayoutOps,
   type PersistentParkContext,
   type PersistentParkDeps,
   type PortOwnerVerdict,

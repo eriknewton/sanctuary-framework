@@ -108,6 +108,7 @@ import {
   egressGateRulesConfigPath,
   egressGateRuntimeStatePath,
   egressGateRuntimeUidDirPath,
+  gateDaemonLogDirForHome,
   parseEgressGateRuntimeState,
   renderEgressGateDaemonPlist,
   type EgressGateRuntimeState,
@@ -561,6 +562,74 @@ interface BringUpState {
   gateAccountName: string;
 }
 
+/** Injected filesystem surface for the gate account home/log layout. */
+export interface GateAccountHomeLayoutOps {
+  mkdir(path: string): Promise<void>;
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  chmod(path: string, mode: number): Promise<void>;
+  lstat(path: string): Promise<{ isDirectory(): boolean; isSymbolicLink(): boolean; uid: number; gid: number; mode: number }>;
+}
+
+function realGateAccountHomeLayoutOps(): GateAccountHomeLayoutOps {
+  return {
+    async mkdir(path: string): Promise<void> {
+      try {
+        await mkdir(path, { recursive: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      }
+    },
+    chown,
+    chmod,
+    lstat,
+  };
+}
+
+/**
+ * Ensure the gate account's own home and log directory exist and are writable
+ * by the gate uid before the LaunchDaemon plist is rendered.
+ *
+ * The parent base is root-owned/traversable; the home and `logs` child are
+ * gate-owned 0700. Each step is lstat'd after chown/chmod so success is an
+ * observation of the final state, not a claim from calls returning.
+ */
+export async function ensureGateAccountHomeLayout(
+  input: { gateAccount: string; gateUid: number; gateHomeDirectory: string },
+  ops: GateAccountHomeLayoutOps = realGateAccountHomeLayoutOps(),
+): Promise<{ logDir: string }> {
+  const logDir = gateDaemonLogDirForHome({
+    gateAccount: input.gateAccount,
+    gateHomeDirectory: input.gateHomeDirectory,
+  });
+  const targets = [
+    { path: dirname(input.gateHomeDirectory), uid: 0, gid: 0, mode: 0o711, label: "gate home parent" },
+    { path: input.gateHomeDirectory, uid: input.gateUid, gid: input.gateUid, mode: 0o700, label: "gate home" },
+    { path: logDir, uid: input.gateUid, gid: input.gateUid, mode: 0o700, label: "gate log dir" },
+  ];
+  for (const target of targets) {
+    await ops.mkdir(target.path);
+    const before = await ops.lstat(target.path);
+    if (!before.isDirectory()) {
+      throw new Error(
+        `refusing to use ${target.path} as ${target.label}: it is a ` +
+          `${before.isSymbolicLink() ? "symlink" : "non-directory"}, not a real directory`,
+      );
+    }
+    await ops.chown(target.path, target.uid, target.gid);
+    await ops.chmod(target.path, target.mode);
+    const after = await ops.lstat(target.path);
+    const mode = after.mode & 0o777;
+    if (!after.isDirectory() || after.uid !== target.uid || mode !== target.mode) {
+      throw new Error(
+        `gate account home layout did not verify for ${target.path}: observed ` +
+          `${after.isDirectory() ? "directory" : after.isSymbolicLink() ? "symlink" : "non-directory"} ` +
+          `uid=${after.uid} mode=${mode.toString(8)}, expected uid=${target.uid} mode=${target.mode.toString(8)}`,
+      );
+    }
+  }
+  return { logDir };
+}
+
 /**
  * The full production bring-up: gate account -> generation G1-G5 (placeholder
  * bind, lsof owner check, registry pf arm, gate-readable config publish +
@@ -701,6 +770,7 @@ async function productionBringUp(
     renderEgressGateDaemonPlist({
       agentUid: input.agentUid,
       gateAccount: state.gateAccountName,
+      gateHomeDirectory: input.gateHomeDirectory,
       programArguments: [
         ...input.gateDaemonArgvPrefix,
         "castle-wall",
@@ -708,7 +778,6 @@ async function productionBringUp(
         `--agent-uid=${input.agentUid}`,
       ],
       fortressPath: input.fortressPath,
-      logDir: input.harnessLogDir,
     }),
     { mode: 0o644 },
   );
@@ -1155,6 +1224,11 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
       },
       input.accountOps,
     );
+    await ensureGateAccountHomeLayout({
+      gateAccount: account.accountName,
+      gateUid: account.uid,
+      gateHomeDirectory: input.gateHomeDirectory,
+    });
     const keys = await ensureSupervisorOracleKeys();
     state = { gateUid: account.uid, gateAccountName: account.accountName };
     oracle = createProductionOracle(keys.privateKey, account.uid);

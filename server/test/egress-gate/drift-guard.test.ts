@@ -21,6 +21,16 @@ const EXPECTED_RULES = [
   "anchor \"com.apple/*\" all",
 ];
 
+const STOCK_MACOS_RUNNING_RULES = [
+  "scrub-anchor \"com.apple/*\" all fragment reassemble",
+  "anchor \"com.apple/*\" all",
+];
+
+const STOCK_MACOS_BASE_DERIVED_RULES = [
+  "scrub-anchor \"/*\" all fragment reassemble",
+  "anchor \"/*\" all",
+];
+
 /** A runner whose -sr and -n -v -f outputs are scripted per test. */
 function scriptedRunner(script: {
   runningRules?: string[];
@@ -93,6 +103,33 @@ describe("egress-gate/drift-guard diffTransientPfRules", () => {
     });
     const diff = await diffTransientPfRules(runner, { mainConfPath });
     expect(diff.foreign).toEqual([]);
+  });
+
+  it("D5: stock macOS anchors compare equal when pfctl -n -v -f strips the anchor name to /*", async () => {
+    await writeFile(
+      mainConfPath,
+      'scrub-anchor "com.apple/*"\nanchor "com.apple/*"\n',
+    );
+    const runner = scriptedRunner({
+      runningRules: STOCK_MACOS_RUNNING_RULES,
+      parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([]);
+  });
+
+  it("D5: a genuinely foreign transient rule still refuses under the stock-anchor normalization", async () => {
+    await writeFile(
+      mainConfPath,
+      'scrub-anchor "com.apple/*"\nanchor "com.apple/*"\n',
+    );
+    const vpnRule = "pass in quick on utun3 all flags S/SA keep state";
+    const runner = scriptedRunner({
+      runningRules: [...STOCK_MACOS_RUNNING_RULES, vpnRule],
+      parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([vpnRule]);
   });
 
   it("fail-closed: pfctl -sr failure THROWS (never diff blind)", async () => {

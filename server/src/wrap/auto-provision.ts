@@ -1882,6 +1882,24 @@ async function confirmOnTty(promptText: string): Promise<boolean> {
 }
 
 function realAccountProvisionOps() {
+  const dsclErrorText = (err: unknown): string => {
+    const e = err as { stdout?: unknown; stderr?: unknown; message?: unknown };
+    return [e.stderr, e.stdout, e.message]
+      .filter((part): part is string => typeof part === "string" && part.length > 0)
+      .join("\n");
+  };
+  const dsclReadLooksAbsent = (err: unknown): boolean =>
+    /No such key|eDSRecordNotFound|DS Error: -14136|not found|Invalid Path/i.test(dsclErrorText(err));
+  const readAttribute = async (accountName: string, attribute: "UniqueID" | "NFSHomeDirectory"): Promise<string | undefined> => {
+    try {
+      const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-read", `/Users/${accountName}`, attribute]);
+      const match = new RegExp(`${attribute}:\\s*(\\S+)`).exec(stdout);
+      return match?.[1];
+    } catch (err) {
+      if (dsclReadLooksAbsent(err)) return undefined;
+      throw err;
+    }
+  };
   return {
     lookupAccountUid: async (accountName: string): Promise<number | undefined> => {
       try {
@@ -1901,6 +1919,33 @@ function realAccountProvisionOps() {
       }
       return highest;
     },
+    lookupAccountRecord: async (
+      accountName: string,
+    ): Promise<{ uid: number; homeDirectory?: string } | undefined> => {
+      const uidText = await readAttribute(accountName, "UniqueID");
+      if (uidText === undefined) return undefined;
+      const uid = Number(uidText);
+      if (!Number.isSafeInteger(uid) || uid <= 0) {
+        throw new Error(`dscl returned an invalid UniqueID for ${accountName}: ${uidText}`);
+      }
+      const homeDirectory = await readAttribute(accountName, "NFSHomeDirectory");
+      return { uid, ...(homeDirectory !== undefined ? { homeDirectory } : {}) };
+    },
+    deleteCreatedUser: async (accountName: string): Promise<void> => {
+      try {
+        await execFileAsync("/usr/sbin/sysadminctl", ["-deleteUser", accountName, "-keepHome"]);
+      } catch (sysadminctlErr) {
+        try {
+          await execFileAsync("/usr/bin/dscl", [".", "-delete", `/Users/${accountName}`]);
+        } catch (dsclErr) {
+          throw new Error(
+            `sysadminctl -deleteUser failed (${dsclErrorText(sysadminctlErr) || "no diagnostic"}); ` +
+              `dscl -delete also failed (${dsclErrorText(dsclErr) || "no diagnostic"})`,
+            { cause: dsclErr },
+          );
+        }
+      }
+    },
     createUser: async (
       accountName: string,
       uid: number,
@@ -1913,14 +1958,14 @@ function realAccountProvisionOps() {
       // production ops object satisfies the AccountProvisionOps interface
       // for the orchestration to call end to end during the drill.
       //
-      // FIX F7 (HIGH/PLAUSIBLE, Codex second family, 2026-07-07 fix-round):
-      // `-home` binds NFSHomeDirectory to the re-home target at create
-      // time, so the confined harness (running as this account) resolves
-      // ~/.hermes to where the secrets actually get moved, instead of
-      // whatever sysadminctl would otherwise default the home to. Verified
-      // with an explicit `dscl -create NFSHomeDirectory` follow-up (belt
-      // and suspenders: `-home` is documented sysadminctl behavior, but the
-      // dscl write makes the binding explicit and independently checkable).
+      // FIX F7 + S5 drill D4: `-home` is the directory-service writer for
+      // NFSHomeDirectory. Do NOT follow it with `dscl -create
+      // NFSHomeDirectory`: on Mini1/Tahoe that redundant post-create write
+      // returned eDSPermissionError after sysadminctl had already created the
+      // record, leaving a surviving partial gate account. The gate path now
+      // verifies the record through `lookupAccountRecord` and rolls back a
+      // fresh incomplete account instead of deriving success from this call
+      // returning.
       await execFileAsync("/usr/sbin/sysadminctl", [
         "-addUser",
         accountName,
@@ -1933,13 +1978,6 @@ function realAccountProvisionOps() {
         ...(comment ? ["-fullName", comment] : []),
       ]);
       await execFileAsync("/usr/bin/dscl", [".", "-create", `/Users/${accountName}`, "IsHidden", "1"]);
-      await execFileAsync("/usr/bin/dscl", [
-        ".",
-        "-create",
-        `/Users/${accountName}`,
-        "NFSHomeDirectory",
-        homeDirectory,
-      ]);
     },
   };
 }

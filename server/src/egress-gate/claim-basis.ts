@@ -251,6 +251,7 @@ export type ClaimSiteId =
   | "arming-wiring.boot-supervisor-shared-label-skip"
   | "arming-wiring.posture-gate-process-up"
   | "arming-wiring.posture-port-owner-verified"
+  | "arming-wiring.gate-account-home-layout"
   // --- egress-gate, other modules ---
   | "anchor-registry.apply-union-flush"
   | "pf-anchor.arm"
@@ -260,6 +261,8 @@ export type ClaimSiteId =
   | "liveness-oracle.verify"
   | "runtime-fs-plan.apply"
   | "runtime-fs-plan.mkdir-lstat"
+  | "gate-account.verify-record"
+  | "gate-account.rollback-incomplete"
   | "gate-credential.verify"
   // --- castle-wall/provision ---
   | "provision-account.execute-plan-uid"
@@ -1083,6 +1086,16 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     },
   },
 
+  "arming-wiring.gate-account-home-layout": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "ensureGateAccountHomeLayout",
+    claim: "the gate account home and log directory exist as real directories with the expected owner and mode",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "compute",
+    branches: "single",
+  },
+
   // ------------------------------------------------- other egress-gate mods
   "arming-wiring.contextless-repark-claim": {
     file: `${EG}/arming-wiring.ts`,
@@ -1216,6 +1229,24 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
         "this path is not a real directory, or is a symlink; the caller fails closed",
       basis: "observed",
     },
+  },
+  "gate-account.verify-record": {
+    file: `${EG}/gate-account.ts`,
+    symbol: "gateAccountRecordProblems",
+    claim: "the gate account directory-service record carries the expected uid and NFSHomeDirectory",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "compute",
+    branches: "single",
+  },
+  "gate-account.rollback-incomplete": {
+    file: `${EG}/gate-account.ts`,
+    symbol: "rollbackIncompleteGateAccount",
+    claim: "a partial gate account rollback is reported as observed absent, not observed, or not attempted with the reason named",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "compute",
+    branches: "single",
   },
   "gate-credential.verify": {
     file: `${EG}/gate-credential.ts`,

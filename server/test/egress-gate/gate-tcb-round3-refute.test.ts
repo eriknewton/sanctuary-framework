@@ -28,7 +28,7 @@ import {
   GateUidCollisionError,
   type GateAccountProvisionOptions,
 } from "../../src/egress-gate/gate-account.js";
-import type { AccountProvisionOps } from "../../src/egress-gate/../castle-wall/provision/account.js";
+import type { GateAccountProvisionOps } from "../../src/egress-gate/gate-account.js";
 import type { ExclusiveEgressGatePolicy } from "../../src/castle-wall/allowlist/gate-derivation.js";
 
 const AGENT_UID = 502;
@@ -154,14 +154,16 @@ describe("round-3 fix (2) refute: gate uid can never collide with the agent uid"
 
   it("the exclusion fires in planAndCreateGateAccount BEFORE any create side effect runs", async () => {
     let created = false;
-    const ops: AccountProvisionOps = {
+    const ops: GateAccountProvisionOps = {
       lookupAccountUid: () => Promise.resolve(undefined),
+      lookupAccountRecord: () => Promise.resolve(undefined),
       // highest is one below the agent uid so the computed create uid == agent uid.
       highestAssignedUid: () => Promise.resolve(AGENT_UID - 1),
       createUser: () => {
         created = true;
         return Promise.resolve();
       },
+      deleteCreatedUser: () => Promise.resolve(),
     };
     await expect(
       planAndCreateGateAccount(base({ ceiling: AGENT_UID }), ops),

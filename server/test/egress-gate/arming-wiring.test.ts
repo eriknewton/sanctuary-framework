@@ -18,7 +18,9 @@ import {
   createProductionReleaseBarrierOps,
   createRepairExclusiveEgressOps,
   createUnprotectExclusiveEgressOps,
+  ensureGateAccountHomeLayout,
   parkHarnessPersistently,
+  type GateAccountHomeLayoutOps,
   type RootOwnedDirEnsureOps,
   restoreCoarseCompositionProduction,
   verifyHarnessJobDisabled,
@@ -1017,5 +1019,102 @@ describe("applyRootOwnedDirEnsure (root-owned runtime directory policy)", () => 
   it("F7: refuses a plain FILE sitting where the directory should be", async () => {
     const { ops } = makeEnsureOps({ [HOLD]: "other" });
     await expect(applyRootOwnedDirEnsure(HOLD, 0o755, ops)).rejects.toThrow(/not a real directory/);
+  });
+});
+
+describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", () => {
+  interface FakeStat {
+    kind: "dir" | "symlink" | "other";
+    uid: number;
+    gid: number;
+    mode: number;
+  }
+
+  function makeGateHomeOps(initial: Record<string, FakeStat> = {}): {
+    ops: GateAccountHomeLayoutOps;
+    stats: Map<string, FakeStat>;
+    sequence: string[];
+  } {
+    const stats = new Map<string, FakeStat>(Object.entries(initial));
+    const sequence: string[] = [];
+    const dirStat = (uid = 0, gid = 0, mode = 0o755): FakeStat => ({ kind: "dir", uid, gid, mode });
+    return {
+      stats,
+      sequence,
+      ops: {
+        async mkdir(path) {
+          sequence.push(`mkdir:${path}`);
+          if (!stats.has(path)) stats.set(path, dirStat());
+        },
+        async chown(path, uid, gid) {
+          sequence.push(`chown:${path}:${uid}:${gid}`);
+          const st = stats.get(path);
+          if (st !== undefined) stats.set(path, { ...st, uid, gid });
+        },
+        async chmod(path, mode) {
+          sequence.push(`chmod:${path}:${mode.toString(8)}`);
+          const st = stats.get(path);
+          if (st !== undefined) stats.set(path, { ...st, mode });
+        },
+        async lstat(path) {
+          sequence.push(`lstat:${path}`);
+          const st = stats.get(path) ?? dirStat();
+          return {
+            uid: st.uid,
+            gid: st.gid,
+            mode: st.mode,
+            isDirectory: () => st.kind === "dir",
+            isSymbolicLink: () => st.kind === "symlink",
+          };
+        },
+      },
+    };
+  }
+
+  it("prepares the gate home and logs under the gate uid, not under the agent harness log dir", async () => {
+    const home = "/var/sanctuary-agents/sanctuary-gate-hermes";
+    const logDir = `${home}/logs`;
+    const { ops, stats, sequence } = makeGateHomeOps();
+    await expect(
+      ensureGateAccountHomeLayout(
+        { gateAccount: "sanctuary-gate-hermes", gateUid: 505, gateHomeDirectory: home },
+        ops,
+      ),
+    ).resolves.toEqual({ logDir });
+
+    expect(stats.get("/var/sanctuary-agents")).toMatchObject({ uid: 0, mode: 0o711 });
+    expect(stats.get(home)).toMatchObject({ uid: 505, gid: 505, mode: 0o700 });
+    expect(stats.get(logDir)).toMatchObject({ uid: 505, gid: 505, mode: 0o700 });
+    expect(sequence).toContain(`chown:${logDir}:505:505`);
+    expect(logDir).not.toBe("/var/sanctuary-agents/sanctuary-hermes/logs");
+  });
+
+  it("refuses an agent-account home paired with the gate account before touching it", async () => {
+    const { ops, sequence } = makeGateHomeOps();
+    await expect(
+      ensureGateAccountHomeLayout(
+        {
+          gateAccount: "sanctuary-gate-hermes",
+          gateUid: 505,
+          gateHomeDirectory: "/var/sanctuary-agents/sanctuary-hermes",
+        },
+        ops,
+      ),
+    ).rejects.toThrow(/cross-account logs/);
+    expect(sequence).toEqual([]);
+  });
+
+  it("refuses a symlink-shaped gate log dir before chown/chmod can apply through it", async () => {
+    const home = "/var/sanctuary-agents/sanctuary-gate-hermes";
+    const logDir = `${home}/logs`;
+    const { ops, sequence } = makeGateHomeOps({ [logDir]: { kind: "symlink", uid: 0, gid: 0, mode: 0o777 } });
+    await expect(
+      ensureGateAccountHomeLayout(
+        { gateAccount: "sanctuary-gate-hermes", gateUid: 505, gateHomeDirectory: home },
+        ops,
+      ),
+    ).rejects.toThrow(/symlink/);
+    expect(sequence).not.toContain(`chown:${logDir}:505:505`);
+    expect(sequence).not.toContain(`chmod:${logDir}:700`);
   });
 });

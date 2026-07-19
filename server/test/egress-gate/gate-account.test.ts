@@ -11,11 +11,47 @@ import {
   planGateAccountProvision,
   planAndCreateGateAccount,
   GateUidCollisionError,
+  GateAccountVerificationError,
   GATE_ACCOUNT_NAME_PREFIX,
+  type GateAccountProvisionOps,
+  type GateAccountRecord,
 } from "../../src/egress-gate/gate-account.js";
-import type { AccountProvisionOps } from "../../src/castle-wall/provision/account.js";
 
 const AGENT_UID = 502;
+
+function gateOps(input: {
+  existing?: GateAccountRecord;
+  highest?: number;
+  create?: (name: string, uid: number, home: string) => GateAccountRecord | Promise<GateAccountRecord>;
+} = {}): GateAccountProvisionOps & {
+  created: Array<{ name: string; uid: number; home: string }>;
+  deleted: string[];
+  record: GateAccountRecord | undefined;
+} {
+  const state = {
+    record: input.existing,
+    created: [] as Array<{ name: string; uid: number; home: string }>,
+    deleted: [] as string[],
+  };
+  return {
+    created: state.created,
+    deleted: state.deleted,
+    get record() {
+      return state.record;
+    },
+    lookupAccountUid: async () => state.record?.uid,
+    lookupAccountRecord: async () => state.record,
+    highestAssignedUid: async () => input.highest ?? 504,
+    createUser: async (name, uid, _comment, home) => {
+      state.created.push({ name, uid, home });
+      state.record = input.create !== undefined ? await input.create(name, uid, home) : { uid, homeDirectory: home };
+    },
+    deleteCreatedUser: async (name) => {
+      state.deleted.push(name);
+      state.record = undefined;
+    },
+  };
+}
 
 describe("egress-gate/gate-account", () => {
   it("derives a per-agent gate account name under the canonical prefix", () => {
@@ -74,22 +110,15 @@ describe("egress-gate/gate-account", () => {
   });
 
   it("planAndCreateGateAccount executes a create through injected ops and returns uid + name", async () => {
-    const created: Array<{ name: string; uid: number; home: string }> = [];
-    const ops: AccountProvisionOps = {
-      lookupAccountUid: () => Promise.resolve(undefined),
-      highestAssignedUid: () => Promise.resolve(504),
-      createUser: (name, uid, _comment, home) => {
-        created.push({ name, uid, home });
-        return Promise.resolve();
-      },
-    };
+    const ops = gateOps();
     const result = await planAndCreateGateAccount(
       { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-gate/hermes" },
       ops,
     );
     expect(result.accountName).toBe("sanctuary-gate-hermes");
     expect(result.uid).toBe(505);
-    expect(created).toEqual([
+    expect(result.observed).toContain("NFSHomeDirectory=/var/sanctuary-gate/hermes");
+    expect(ops.created).toEqual([
       { name: "sanctuary-gate-hermes", uid: 505, home: "/var/sanctuary-gate/hermes" },
     ]);
   });
@@ -148,21 +177,41 @@ describe("egress-gate/gate-account", () => {
   });
 
   it("planAndCreateGateAccount does not create when the plan is a skip (idempotent no-op)", async () => {
-    let creates = 0;
-    const ops: AccountProvisionOps = {
-      lookupAccountUid: () => Promise.resolve(511),
-      highestAssignedUid: () => Promise.resolve(511),
-      createUser: () => {
-        creates += 1;
-        return Promise.resolve();
-      },
-    };
+    const ops = gateOps({ existing: { uid: 511, homeDirectory: "/var/sanctuary-gate/hermes" }, highest: 511 });
     const result = await planAndCreateGateAccount(
       { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-gate/hermes" },
       ops,
     );
     expect(result.plan.action).toBe("skip");
     expect(result.uid).toBe(511);
-    expect(creates).toBe(0);
+    expect(ops.created).toEqual([]);
+  });
+
+  it("rolls back a fresh gate account when create returns but the home attribute is missing (D4 partial account)", async () => {
+    const ops = gateOps({ create: (_name, uid) => ({ uid }) });
+    await expect(
+      planAndCreateGateAccount(
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-gate/hermes" },
+        ops,
+      ),
+    ).rejects.toThrow(GateAccountVerificationError);
+    expect(ops.created).toEqual([
+      { name: "sanctuary-gate-hermes", uid: 505, home: "/var/sanctuary-gate/hermes" },
+    ]);
+    expect(ops.deleted).toEqual(["sanctuary-gate-hermes"]);
+    expect(ops.record).toBeUndefined();
+  });
+
+  it("rolls back an existing same-name partial gate account instead of treating it as an idempotent skip", async () => {
+    const ops = gateOps({ existing: { uid: 505 }, highest: 505 });
+    await expect(
+      planAndCreateGateAccount(
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-gate/hermes" },
+        ops,
+      ),
+    ).rejects.toThrow(/Existing gate account .* incomplete/);
+    expect(ops.created).toEqual([]);
+    expect(ops.deleted).toEqual(["sanctuary-gate-hermes"]);
+    expect(ops.record).toBeUndefined();
   });
 });
