@@ -12,6 +12,7 @@ import { join } from "node:path";
 import {
   parseWrapArgs,
   formatWrapSuccess,
+  protectionClaimFromAutoProvisionSummary,
   runWrap,
   validateDevDist,
   DevDistInvalidError,
@@ -20,6 +21,10 @@ import {
   type RunWrapDeps,
 } from "../../src/wrap/cli.js";
 import { SANCTUARY_VERSION } from "../../src/config.js";
+import {
+  protectionStateClaimFromObservation,
+  type ProtectionStateClaim,
+} from "../../src/egress-gate/protection-claim.js";
 
 /**
  * The published-version MCP entry the wrap writes (v1.6.1 install-path
@@ -32,6 +37,32 @@ const PINNED_SANCTUARY_ARGS = [
   `@sanctuary-framework/mcp-server@${SANCTUARY_VERSION}`,
   "sanctuary",
 ];
+
+function claim(state: "exclusive" | "coarse-only" | "unprotected" | "unknown"): ProtectionStateClaim {
+  switch (state) {
+    case "exclusive":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "exclusive_egress_observed",
+      });
+    case "coarse-only":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "coarse_wall_observed",
+      });
+    case "unprotected":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "not_enforcing_observed",
+      });
+    case "unknown":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "insufficient_evidence",
+        reasons: ["test"],
+      });
+  }
+}
 
 describe("validateDevDist (Finding 4, 2026-06-25)", () => {
   let dir: string;
@@ -173,13 +204,7 @@ describe("formatWrapSuccess", () => {
     browserOpened: true,
     passphraseLocation: "macOS Keychain",
     passphraseSource: "generated",
-    // Honesty (F4, v1.6.1): the "Your agent is protected / Castle Wall Full"
-    // hero is reserved for OBSERVED ENFORCEMENT EVIDENCE (the dashboard's
-    // adjudicated-flow standard), never daemon start alone. The baseline
-    // fixture models the fully-observed case; the daemon-started-only and
-    // not-armed cases are covered separately below.
-    castleWallArmed: true,
-    castleWallEnforcementObserved: true,
+    castleWallProtectionClaim: claim("exclusive"),
   };
 
   it("includes wrapped tool name and version", () => {
@@ -223,46 +248,33 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toMatch(/\bL[1-4]\b/);
   });
 
-  // F4 (v1.6.1 first-run honesty): daemon start alone must NOT claim
-  // "protected" / "Castle Wall Full". On a Mac with no approved system
-  // extension the userspace daemon starts (e.g. via
-  // SANCTUARY_CASTLE_LOCAL_SIGN=1) and filters NOTHING; only observed
-  // adjudicated-flow evidence (the dashboard's standard) earns the
-  // affirmative hero.
-  it("does NOT claim protected / Full when the daemon started without enforcement evidence", () => {
+  it("does NOT claim protected / Full when protection state is unknown", () => {
     const out = formatWrapSuccess({
       ...baseInfo,
-      castleWallEnforcementObserved: undefined,
+      castleWallProtectionClaim: claim("unknown"),
     });
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
-    expect(out).toContain(
-      "Castle Wall daemon started (enforcement not confirmed)"
-    );
+    expect(out).toContain("Castle Wall status unknown");
     expect(out).toContain("enforcement is not confirmed");
   });
 
-  // F4 defensive: an evidence signal without a started daemon is an
-  // inconsistent input; fail closed (never affirmative).
-  it("does NOT claim protected / Full when evidence is claimed but the daemon did not start", () => {
+  it("renders coarse-only as distinct non-green, never Full or NOT ARMED", () => {
     const out = formatWrapSuccess({
       ...baseInfo,
-      castleWallArmed: false,
-      castleWallEnforcementObserved: true,
+      castleWallProtectionClaim: claim("coarse-only"),
     });
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
-    expect(out).toContain("Castle Wall NOT ARMED");
+    expect(out).not.toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("only coarse Castle Wall enforcement is confirmed");
+    expect(out).toContain("Castle Wall coarse-only");
   });
 
-  // Honesty (audit seam #1): when the Castle Wall daemon failed to arm, the
-  // banner must NOT claim "protected" / "Castle Wall Full" — that contradicted
-  // the loud "traffic NOT filtered" warning printed seconds earlier.
-  it("does NOT claim protected / Full when Castle Wall did not arm", () => {
+  it("does NOT claim protected / Full when observed unprotected", () => {
     const out = formatWrapSuccess({
       ...baseInfo,
-      castleWallArmed: false,
-      castleWallEnforcementObserved: false,
+      castleWallProtectionClaim: claim("unprotected"),
     });
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
@@ -270,14 +282,78 @@ describe("formatWrapSuccess", () => {
     expect(out).toContain("enforcement is not confirmed");
   });
 
-  // Honesty (audit seam #1): with no arm signal threaded, default conservative —
-  // never render "Full" on presence/absence of a field alone.
-  it("renders unknown (never Full) when no arm signal is threaded", () => {
-    const { castleWallArmed: _omit, ...noSignal } = baseInfo;
-    const out = formatWrapSuccess(noSignal);
+  it("requires a protection-state claim to render the Castle Wall sentence", () => {
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: claim("unknown"),
+    });
     expect(out).not.toContain("Castle Wall Full");
     expect(out).toContain("Castle Wall status unknown");
     expect(out).not.toContain("Your agent is protected");
+  });
+
+  it("drill run 1: ensure-policy-daemon abort renders unprotected, not Full", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "ensure-policy-daemon",
+        reason: "policy daemon refused fortress",
+        rolledBack: true,
+      },
+    });
+    expect(protection?.state).toBe("unprotected");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall NOT ARMED");
+  });
+
+  it("drill run 2: arm abort renders unprotected", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "arm",
+        reason: "arm failed and disarm confirmed off",
+        rolledBack: true,
+      },
+    });
+    expect(protection?.state).toBe("unprotected");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("Castle Wall NOT ARMED");
+  });
+
+  it("drill run 3: bring-up abort with coarse wall enforcing renders coarse-only", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "exclusive-egress-unarmed-coarse-active",
+        uid: 503,
+        stage: "bring-up",
+        reason: "generation bring-up failed",
+        coarseCompositionRestored: true,
+        harnessStartedCoarse: true,
+        cleanupErrors: [],
+      },
+    });
+    expect(protection?.state).toBe("coarse-only");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).not.toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("Castle Wall coarse-only");
   });
 
   // F7 (v1.6.1 first-run honesty): on Hermes the tool/server counts derive

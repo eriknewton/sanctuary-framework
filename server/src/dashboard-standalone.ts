@@ -94,6 +94,42 @@ import {
   createStandaloneJoinApprover,
 } from "./mesh/lifecycle/index.js";
 
+type StandaloneProcessCleanup = () => void;
+
+const standaloneSignalCleanups = new Set<StandaloneProcessCleanup>();
+const standaloneExitCleanups = new Set<StandaloneProcessCleanup>();
+let standaloneProcessListenersInstalled = false;
+
+function runStandaloneSignalCleanups(): void {
+  const cleanups = [...standaloneSignalCleanups];
+  standaloneSignalCleanups.clear();
+  standaloneExitCleanups.clear();
+  for (const cleanup of cleanups) cleanup();
+}
+
+function runStandaloneExitCleanups(): void {
+  const cleanups = [...standaloneExitCleanups];
+  standaloneSignalCleanups.clear();
+  standaloneExitCleanups.clear();
+  for (const cleanup of cleanups) cleanup();
+}
+
+function registerStandaloneProcessCleanup(
+  cleanup: StandaloneProcessCleanup,
+  options: { runOnExit?: boolean } = {},
+): void {
+  standaloneSignalCleanups.add(cleanup);
+  if (options.runOnExit === true) {
+    standaloneExitCleanups.add(cleanup);
+  }
+  if (!standaloneProcessListenersInstalled) {
+    standaloneProcessListenersInstalled = true;
+    process.on("SIGINT", runStandaloneSignalCleanups);
+    process.on("SIGTERM", runStandaloneSignalCleanups);
+    process.on("exit", runStandaloneExitCleanups);
+  }
+}
+
 export interface StandaloneDashboardOptions {
   passphrase?: string;
   port?: number;
@@ -708,11 +744,11 @@ async function wireUnlockedDeps(args: {
       createExclusiveEgressPostureProducer({
         fortressPath: config.storage_path,
         coarseWallArmed: async (): Promise<boolean> => {
-          const { probeCastleWallEnforcementObserved } = await import("./wrap/cli.js");
-          // NO resolver passed here (the producer IS the resolver upstream);
-          // passing one would recurse. This reads the coarse enforcement
-          // evidence only.
-          return probeCastleWallEnforcementObserved(auditLog, config.storage_path);
+          const { probeCoarseCastleWallEnforcementObserved } = await import("./wrap/cli.js");
+          // The producer needs the coarse enforcement evidence only; protection
+          // claims are resolved after this provider has produced the capped
+          // verdict, avoiding recursion.
+          return probeCoarseCastleWallEnforcementObserved(auditLog, config.storage_path);
         },
       }),
     );
@@ -1241,9 +1277,7 @@ async function wireUnlockedDeps(args: {
     clearTenantRuntime(config.storage_path).catch(() => {});
     distressListener?.stop().catch(() => {});
   };
-  process.once("SIGINT", clearRuntime);
-  process.once("SIGTERM", clearRuntime);
-  process.once("exit", clearRuntime);
+  registerStandaloneProcessCleanup(clearRuntime, { runOnExit: true });
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
@@ -1310,6 +1344,5 @@ async function wireUnlockedDeps(args: {
   const saveBaseline = () => {
     baseline.save().catch(() => {});
   };
-  process.on("SIGINT", saveBaseline);
-  process.on("SIGTERM", saveBaseline);
+  registerStandaloneProcessCleanup(saveBaseline);
 }

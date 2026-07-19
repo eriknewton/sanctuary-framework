@@ -538,10 +538,10 @@ describe("S5-P: feature-fault-raise handles coarse_only without a suppression tr
   });
 });
 
-describe("S5-P: wrap first-run banner is cap-capable", () => {
-  it("probeCastleWallEnforcementObserved reads NOT observed (banner not Full) when the row caps to coarse_only", async () => {
-    const { probeCastleWallEnforcementObserved } = await import("../../src/wrap/cli.js");
-    const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+describe("S5-P: wrap first-run banner requires the capped protection claim", () => {
+  it("probeCastleWallProtectionClaim renders coarse-only when the capped row is coarse_only", async () => {
+    const { probeCastleWallProtectionClaim } = await import("../../src/wrap/cli.js");
+    const { mkdtemp, mkdir } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
     const storagePath = await mkdtemp(join(tmpdir(), "s5p-wrap-"));
@@ -550,17 +550,24 @@ describe("S5-P: wrap first-run banner is cap-capable", () => {
     const now = Date.now();
     await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
 
-    // No provider: today's behavior, the row is `active` => observed.
-    const observedNoProvider = await probeCastleWallEnforcementObserved(log, storagePath);
-    expect(observedNoProvider).toBe(true);
-
-    // With a capping provider (S5-6 will wire one): the row caps to
-    // coarse_only, so the affirmative "Full" banner is NOT earned.
-    const observedCapped = await probeCastleWallEnforcementObserved(
+    const claim = await probeCastleWallProtectionClaim(
       log,
       storagePath,
       async () => coarseOnlyStatus(),
     );
-    expect(observedCapped).toBe(false);
+    expect(claim.state).toBe("coarse-only");
+  });
+
+  it("provider failure renders unknown, never green", async () => {
+    const { probeCastleWallProtectionClaim } = await import("../../src/wrap/cli.js");
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const storagePath = await mkdtemp(join(tmpdir(), "s5p-wrap-"));
+    const log = newAuditLog();
+    const claim = await probeCastleWallProtectionClaim(log, storagePath, async () => {
+      throw new Error("registry unreadable");
+    });
+    expect(claim.state).toBe("unknown");
   });
 });

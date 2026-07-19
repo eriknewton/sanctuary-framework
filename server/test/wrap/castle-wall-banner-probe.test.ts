@@ -1,5 +1,6 @@
 /**
- * probeCastleWallEnforcementObserved gating (fix-round MED-4c for PR #843).
+ * Castle Wall wrap-banner enforcement probes (fix-round MED-4c for PR #843,
+ * protection-claim chokepoint 2026-07-19).
  *
  * The wrap success banner's affirmative "protected / Castle Wall Full" hero
  * is reserved for OBSERVED enforcement, judged by the SAME
@@ -20,13 +21,37 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { probeCastleWallEnforcementObserved } from "../../src/wrap/cli.js";
+import {
+  probeCastleWallProtectionClaim,
+  probeCoarseCastleWallEnforcementObserved,
+} from "../../src/wrap/cli.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
+import type { ExclusiveEgressStatus } from "../../src/principal-policy/posture.js";
 
-describe("probeCastleWallEnforcementObserved (F4 banner evidence gate)", () => {
+function exclusiveStatus(): ExclusiveEgressStatus {
+  return {
+    fine_grained_declared: true,
+    exclusive_egress_live: true,
+    mode: "exclusive",
+    agents: [],
+    reasons: [],
+  };
+}
+
+function coarseOnlyStatus(): ExclusiveEgressStatus {
+  return {
+    fine_grained_declared: true,
+    exclusive_egress_live: false,
+    mode: "coarse-only",
+    agents: [],
+    reasons: ["uid 503: coarse-only"],
+  };
+}
+
+describe("Castle Wall wrap-banner evidence probes", () => {
   let storagePath: string;
   let fortressId: string;
   let log: AuditLog;
@@ -60,24 +85,18 @@ describe("probeCastleWallEnforcementObserved (F4 banner evidence gate)", () => {
 
   it("fresh adjudicated evidence (egress_allowed, inside the freshness window) reads true", async () => {
     await appendCW("egress_allowed", 60_000);
-    expect(await probeCastleWallEnforcementObserved(log, storagePath)).toBe(
-      true,
-    );
+    expect(await probeCoarseCastleWallEnforcementObserved(log, storagePath)).toBe(true);
   });
 
   it("policy loads and heartbeats NEVER arm the banner (the honesty seam)", async () => {
     await appendCW("policy_loaded", 60_000);
     await appendCW("castle_wall_heartbeat", 60_000);
-    expect(await probeCastleWallEnforcementObserved(log, storagePath)).toBe(
-      false,
-    );
+    expect(await probeCoarseCastleWallEnforcementObserved(log, storagePath)).toBe(false);
   });
 
   it("stale adjudicated evidence (outside the 10-minute window) reads false", async () => {
     await appendCW("egress_allowed", 30 * 60_000);
-    expect(await probeCastleWallEnforcementObserved(log, storagePath)).toBe(
-      false,
-    );
+    expect(await probeCoarseCastleWallEnforcementObserved(log, storagePath)).toBe(false);
   });
 
   it("a probe error reads false (fail-closed), never true", async () => {
@@ -87,7 +106,39 @@ describe("probeCastleWallEnforcementObserved (F4 banner evidence gate)", () => {
       },
     } as unknown as AuditLog;
     expect(
-      await probeCastleWallEnforcementObserved(throwing, storagePath),
+      await probeCoarseCastleWallEnforcementObserved(throwing, storagePath),
     ).toBe(false);
+  });
+
+  it("protection claim renders exclusive only when the capped resolver proves exclusive-egress live", async () => {
+    await appendCW("egress_allowed", 60_000);
+    const claim = await probeCastleWallProtectionClaim(
+      log,
+      storagePath,
+      async () => exclusiveStatus(),
+    );
+    expect(claim.state).toBe("exclusive");
+  });
+
+  it("fresh coarse evidence without exclusive live maps to coarse-only, not green", async () => {
+    await appendCW("egress_allowed", 60_000);
+    const claim = await probeCastleWallProtectionClaim(
+      log,
+      storagePath,
+      async () => coarseOnlyStatus(),
+    );
+    expect(claim.state).toBe("coarse-only");
+  });
+
+  it("an unresolvable exclusive-egress provider maps to unknown, never green", async () => {
+    await appendCW("egress_allowed", 60_000);
+    const claim = await probeCastleWallProtectionClaim(
+      log,
+      storagePath,
+      async () => {
+        throw new Error("registry unreadable");
+      },
+    );
+    expect(claim.state).toBe("unknown");
   });
 });

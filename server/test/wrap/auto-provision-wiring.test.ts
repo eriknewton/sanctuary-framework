@@ -218,7 +218,10 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     const stderr = stderrSpy.mock.calls.flat().join("\n");
     expect(stderr).toContain("Dedicated agent account provisioned and Castle Wall armed (uid 503)");
     expect(stderr).not.toContain("Castle Wall NOT ARMED");
-    expect(stderr).toContain("Castle Wall daemon started (enforcement not confirmed)");
+    expect(stderr).toContain("Castle Wall coarse-only");
+    expect(stderr).toContain(
+      "Your agent is wrapped, but only coarse Castle Wall enforcement is confirmed.",
+    );
   });
 
   it("prefers --dev-dist as the auto-provision CLI binary for dogfood installs", async () => {

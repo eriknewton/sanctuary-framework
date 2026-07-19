@@ -236,6 +236,17 @@ export {
   type GateProcessStatus,
 } from "./posture.js";
 
+export {
+  protectionObservationFromFeatureHealth,
+  protectionStateAdvice,
+  protectionStateClaimFromObservation,
+  type ProtectionClaimState,
+  type ProtectionFeatureStatus,
+  type ProtectionStateAdvice,
+  type ProtectionStateClaim,
+  type ProtectionStateObservation,
+} from "./protection-claim.js";
+
 // Unified Protect Slice 5 S5-6: gate daemon + drift guard + production wiring.
 export {
   EGRESS_GATE_RUNTIME_DIR,
