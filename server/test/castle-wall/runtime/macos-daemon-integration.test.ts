@@ -715,7 +715,9 @@ describe("Castle Wall macOS daemon integration", () => {
 
     // Well past the grace window + many tick intervals: a deliberately
     // stood-down wall must never mature those decisions into a stall alarm.
-    // Real time advances here, but fakeNowMs intentionally does not.
+    // Advance the injected clock too; otherwise this assertion is vacuous
+    // because the watchdog's own time source would never see grace elapse.
+    fakeNowMs += 1600;
     await wait(100);
     let stalls = (
       await auditLog.query({ layer: "l1", limit: 5000 })

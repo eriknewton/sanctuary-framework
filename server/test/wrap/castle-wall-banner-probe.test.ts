@@ -63,6 +63,10 @@ function coarseFleetStatus(): ExclusiveEgressStatus {
   };
 }
 
+function currentWrapSince(ageMs: number = 2 * 60_000): Date {
+  return new Date(Date.now() - ageMs);
+}
+
 describe("Castle Wall wrap-banner evidence probes", () => {
   let storagePath: string;
   let fortressId: string;
@@ -193,7 +197,9 @@ describe("Castle Wall wrap-banner evidence probes", () => {
   });
 
   it("composed drill 1: newer wall_disarmed beats older fresh enforcement", async () => {
+    const livenessSince = currentWrapSince(6 * 60_000);
     await appendCW("egress_allowed", 5 * 60_000);
+    await appendCW("castle_wall_heartbeat", 4 * 60_000);
     await appendCW("wall_disarmed", 60_000);
     const claim = await resolveWrapProtectionClaim({
       auditLog: log,
@@ -206,7 +212,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           rolledBack: true,
         },
       },
-      castleWallDaemonStarted: true,
+      castleWallDaemonLivenessSince: livenessSince,
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
@@ -215,21 +221,43 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
   });
 
-  it("restores the wrap daemon gate: fresh probe evidence is unknown when no daemon started", async () => {
+  it("current-wrap daemon liveness is observed, not inferred from a handle", async () => {
+    const livenessSince = currentWrapSince();
     await appendCW("egress_allowed", 60_000);
     const claim = await resolveWrapProtectionClaim({
       auditLog: log,
       autoProvisionSummary: { ran: false },
-      castleWallDaemonStarted: false,
+      castleWallDaemonLivenessSince: livenessSince,
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
     });
     expect(claim.state).toBe("unknown");
+    expect(claim.reasons).toContain(
+      "Castle Wall daemon liveness was not observed during this wrap",
+    );
     expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
   });
 
+  it("a deliberately stopped transient daemon does not erase its observed current-wrap heartbeat", async () => {
+    const livenessSince = currentWrapSince();
+    await appendCW("egress_allowed", 60_000);
+    await appendCW("castle_wall_heartbeat", 30_000);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: { ran: false },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+    expect(claim.state).toBe("exclusive");
+    expect(claim.basis).toBe("exclusive_egress_observed");
+  });
+
   it("composed drill 2: arm abort without observed-off evidence stays probe-driven", async () => {
+    const livenessSince = currentWrapSince();
+    await appendCW("castle_wall_heartbeat", 60_000);
     const claim = await resolveWrapProtectionClaim({
       auditLog: log,
       autoProvisionSummary: {
@@ -241,7 +269,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           rolledBack: true,
         },
       },
-      castleWallDaemonStarted: true,
+      castleWallDaemonLivenessSince: livenessSince,
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
@@ -250,8 +278,10 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(claim.basis).toBe("insufficient_evidence");
   });
 
-  it("composed drill 3: degraded exclusive bring-up takes its claim from the real probe", async () => {
+  it("composed drill 3: degraded exclusive bring-up demotes a green coarse probe", async () => {
+    const livenessSince = currentWrapSince();
     await appendCW("egress_allowed", 60_000);
+    await appendCW("castle_wall_heartbeat", 30_000);
     const claim = await resolveWrapProtectionClaim({
       auditLog: log,
       autoProvisionSummary: {
@@ -266,17 +296,20 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           cleanupErrors: [],
         },
       },
-      castleWallDaemonStarted: true,
+      castleWallDaemonLivenessSince: livenessSince,
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => coarseFleetStatus(),
     });
-    expect(claim.state).toBe("exclusive");
-    expect(claim.basis).toBe("castle_wall_enforcement_observed");
+    expect(claim.state).toBe("coarse-only");
+    expect(claim.basis).toBe("exclusive_egress_unarmed_coarse_active");
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
   });
 
-  it("composed override: observed-off may override a green probe, but repark-failed may not", async () => {
+  it("composed override: observed-off and repark-failed demote a green probe", async () => {
+    const livenessSince = currentWrapSince();
     await appendCW("egress_allowed", 60_000);
+    await appendCW("castle_wall_heartbeat", 30_000);
     const observedOff = await resolveWrapProtectionClaim({
       auditLog: log,
       autoProvisionSummary: {
@@ -289,7 +322,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           disarmObservedOff: true,
         },
       },
-      castleWallDaemonStarted: true,
+      castleWallDaemonLivenessSince: livenessSince,
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => coarseFleetStatus(),
@@ -308,12 +341,13 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           reparkError: "launchctl disable failed",
         },
       },
-      castleWallDaemonStarted: true,
+      castleWallDaemonLivenessSince: livenessSince,
       storagePath,
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => coarseFleetStatus(),
     });
-    expect(reparkFailed.state).toBe("exclusive");
-    expect(reparkFailed.basis).toBe("castle_wall_enforcement_observed");
+    expect(reparkFailed.state).toBe("unknown");
+    expect(reparkFailed.basis).toBe("exclusive_egress_repark_failed");
+    expect(protectionStateAdvice(reparkFailed).castleWallLabel).not.toContain("Castle Wall Full");
   });
 });

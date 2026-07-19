@@ -103,7 +103,10 @@ import {
   type WrapCustodyResult,
 } from "./custody-flow.js";
 import { AuditLog } from "../operational/audit-log.js";
-import type { ExclusiveEgressStatus } from "../principal-policy/posture.js";
+import {
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  type ExclusiveEgressStatus,
+} from "../principal-policy/posture.js";
 import {
   protectionObservationFromFeatureHealth,
   protectionStateAdvice,
@@ -113,6 +116,12 @@ import {
   type ProtectionStateClaim,
   type ProtectionStateObservation,
 } from "../egress-gate/protection-claim.js";
+import {
+  CASTLE_WALL_AUDIT_LAYER,
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
+} from "../castle-wall/constants.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { SANCTUARY_VERSION } from "../config.js";
@@ -1036,9 +1045,10 @@ export type DashboardStarter = (opts: {
  * Castle-Wall-originated adjudicated-flow evidence as current for its bounded
  * freshness window (10 minutes today). A later `wall_disarmed` /
  * `filter_stopped` / `arm_lease_revoked` entry now demotes that evidence, and
- * the banner again requires a daemon that started during this wrap. Residual
- * bound: adjudicated-flow evidence is still a bounded-window observation, not
- * a proof of the exact packet-filter state at the print instant.
+ * the banner requires an observed current-wrap daemon heartbeat before it lets
+ * a probe render green. Residual bound: adjudicated-flow evidence and daemon
+ * liveness are still bounded-window observations, not proof of the exact
+ * packet-filter state at the print instant.
  */
 type CastleWallFeatureProbeInput =
   | { purpose: "coarse-wall" }
@@ -1101,6 +1111,65 @@ export async function probeCoarseCastleWallEnforcementObserved(
         purpose: "coarse-wall",
       })).status === "active"
     );
+  } catch {
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasCastleWallAuditProvenance(details: unknown): boolean {
+  return (
+    isRecord(details) &&
+    details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE
+  );
+}
+
+/**
+ * Current-wrap daemon liveness gate for the banner resolver. This observes a
+ * provenance-marked heartbeat after the daemon-start attempt and inside the
+ * existing freshness window. It never earns green by itself; it only prevents a
+ * handle lifetime or stale prior evidence from enabling a claim.
+ */
+export async function observeCurrentWrapCastleWallDaemonLiveness(
+  auditLog: AuditLog,
+  storagePath: string,
+  daemonLivenessSince: Date | undefined,
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  const sinceMs = daemonLivenessSince?.getTime();
+  if (sinceMs === undefined || !Number.isFinite(sinceMs)) {
+    return false;
+  }
+  const freshnessFloorMs = nowMs - DEFAULT_ENFORCEMENT_FRESHNESS_MS;
+  const querySinceMs = Math.max(sinceMs, freshnessFloorMs);
+  try {
+    const result = await auditLog.runEagerReads(() =>
+      auditLog.query({
+        layer: CASTLE_WALL_AUDIT_LAYER,
+        operation_type: CASTLE_WALL_HEARTBEAT_OPERATION,
+        identity_id: fortressIdFromStoragePath(storagePath),
+        since: new Date(querySinceMs).toISOString(),
+        limit: 1000,
+      }),
+    );
+    // audit-chokepoint-exempt: fail-closed liveness gate; raw integrity
+    // findings only block the banner from rendering green.
+    if (result.integrity_findings.length > 0) {
+      return false;
+    }
+    return result.entries.some((entry) => {
+      const ts = Date.parse(entry.timestamp);
+      return (
+        Number.isFinite(ts) &&
+        ts >= sinceMs &&
+        ts >= freshnessFloorMs &&
+        hasCastleWallAuditProvenance(entry.details)
+      );
+    });
   } catch {
     return false;
   }
@@ -1209,8 +1278,8 @@ function protectionObservationFromAutoProvisionSummary(
       };
     case "exclusive-egress-unarmed-coarse-active":
       return {
-        state: "unknown",
-        basis: "provision_outcome_not_observation",
+        state: "coarse-only",
+        basis: "exclusive_egress_unarmed_coarse_active",
         reasons: [outcome.reason, ...outcome.cleanupErrors],
       };
     case "armed-rollback-failed":
@@ -1262,16 +1331,22 @@ export function protectionClaimFromAutoProvisionSummary(
     : protectionStateClaimFromObservation(observation);
 }
 
-function autoProvisionClaimOverridesProbe(
+function autoProvisionClaimDemotesProbe(
   claim: ProtectionStateClaim | undefined,
 ): boolean {
-  return claim?.basis === "disarm_observed_off";
+  // Asymmetric invariant: auto-provision control flow may only downgrade a
+  // probe. It never creates or upgrades a green protection claim.
+  return (
+    claim?.basis === "disarm_observed_off" ||
+    claim?.basis === "exclusive_egress_repark_failed" ||
+    claim?.basis === "exclusive_egress_unarmed_coarse_active"
+  );
 }
 
 export async function resolveWrapProtectionClaim(input: {
   auditLog: AuditLog | undefined;
   autoProvisionSummary: AutoProvisionSummary;
-  castleWallDaemonStarted?: boolean;
+  castleWallDaemonLivenessSince?: Date;
   storagePath: string;
   providerTimeoutMs?: number;
   resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
@@ -1286,11 +1361,17 @@ export async function resolveWrapProtectionClaim(input: {
       reasons: ["no audit log was available to observe enforcement"],
     });
   }
-  if (input.castleWallDaemonStarted !== true) {
+  const daemonLivenessObserved =
+    await observeCurrentWrapCastleWallDaemonLiveness(
+      input.auditLog,
+      input.storagePath,
+      input.castleWallDaemonLivenessSince,
+    );
+  if (!daemonLivenessObserved) {
     return autoProvisionClaim ?? protectionStateClaimFromObservation({
       state: "unknown",
       basis: "provider_unavailable",
-      reasons: ["Castle Wall daemon did not start during this wrap"],
+      reasons: ["Castle Wall daemon liveness was not observed during this wrap"],
     });
   }
   let resolver: (() => Promise<ExclusiveEgressStatus | null>) | undefined;
@@ -1323,7 +1404,7 @@ export async function resolveWrapProtectionClaim(input: {
     resolver,
     { providerTimeoutMs: input.providerTimeoutMs },
   );
-  return autoProvisionClaimOverridesProbe(autoProvisionClaim)
+  return autoProvisionClaimDemotesProbe(autoProvisionClaim)
     ? autoProvisionClaim!
     : probedClaim;
 }
@@ -2163,6 +2244,7 @@ export async function runWrap(
   // the opt-in Linux producer-signed activation (FIX 3). Both expose `stop()`; we
   // keep only the common shape so the cleanup is uniform.
   let castleWallDaemon: { stop(): Promise<void> } | undefined;
+  let castleWallDaemonLivenessSince: Date | undefined;
   let unregisterCastleWallCleanup: (() => void) | undefined;
   const registerCastleWallCleanup = () => {
     if (!castleWallDaemon) return;
@@ -2174,6 +2256,7 @@ export async function runWrap(
   };
   const startCastleWallForWrap = async (auditLog: AuditLog, masterKey: Uint8Array) => {
     if (castleWallDaemon) return;
+    castleWallDaemonLivenessSince = new Date();
     const fortressId = fortressIdFromStoragePath(storagePath);
     const runtime = await import("../castle-wall/runtime/index.js");
 
@@ -2943,7 +3026,7 @@ export async function runWrap(
     const castleWallProtectionClaim = await resolveWrapProtectionClaim({
       auditLog: ndAuditLog,
       autoProvisionSummary,
-      castleWallDaemonStarted: castleWallDaemon !== undefined,
+      castleWallDaemonLivenessSince,
       storagePath,
     });
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
@@ -3288,7 +3371,7 @@ export async function runWrap(
   const castleWallProtectionClaim = await resolveWrapProtectionClaim({
     auditLog: wrapAuditLog,
     autoProvisionSummary,
-    castleWallDaemonStarted: castleWallDaemon !== undefined,
+    castleWallDaemonLivenessSince,
     storagePath,
   });
 

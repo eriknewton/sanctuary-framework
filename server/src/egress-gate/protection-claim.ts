@@ -41,7 +41,9 @@ export type ProtectionStateObservation =
     }
   | {
       state: "coarse-only";
-      basis: "exclusive_egress_cap_observed";
+      basis:
+        | "exclusive_egress_cap_observed"
+        | "exclusive_egress_unarmed_coarse_active";
       reasons?: readonly string[];
     }
   | {

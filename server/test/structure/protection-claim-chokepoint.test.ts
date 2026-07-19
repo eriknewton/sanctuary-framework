@@ -4,35 +4,13 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
-import {
-  PROTECTION_HERO_COPY,
-  protectionStateAdvice,
-  protectionStateClaimFromObservation,
-  type ProtectionStateObservation,
-} from "../../src/egress-gate/protection-claim.js";
+import { PROTECTION_HERO_COPY } from "../../src/egress-gate/protection-claim.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const SERVER_SRC = join(REPO_ROOT, "server", "src");
-
-const PROTECTION_PROSE = [
-  PROTECTION_HERO_COPY.green,
-  PROTECTION_HERO_COPY.nonGreen,
-  "Your agent is wrapped, but only coarse Castle Wall enforcement is confirmed.",
-  "Your agent is wrapped, but enforcement is not confirmed.",
-  "Your agent is wrapped, but enforcement state is not confirmed.",
-  "Your agent is wrapped, but exclusive-egress boot re-park is not confirmed.",
-  "Castle Wall Full",
-  "Castle Wall coarse-only (fine-grained egress not live)",
-  "Castle Wall NOT ARMED (traffic not filtered)",
-  "Castle Wall status unknown (not confirmed armed)",
-  "Castle Wall status unknown (daemon heartbeat missing; traffic may be blocked)",
-  "Castle Wall status unknown (exclusive-egress boot re-park failed)",
-  "Run 'sanctuary castle-wall status' to inspect live enforcement before relying on this wrap.",
-  "Run 'sudo sanctuary protect --repair-egress-gate' to repair fine-grained exclusive egress.",
-] as const;
-
 const CHOKEPOINT = "server/src/egress-gate/protection-claim.ts";
 const FROZEN_DASHBOARD_HERO = "server/src/dashboard/html.ts";
+const CHOKEPOINT_SOURCE_TEXT = readFileSync(join(REPO_ROOT, CHOKEPOINT), "utf8");
 
 function tsFiles(dir: string): string[] {
   const out: string[] = [];
@@ -65,6 +43,129 @@ function flattenConcat(node: ts.Node): string | undefined {
   }
   return undefined;
 }
+
+function propertyNameText(name: ts.PropertyName): string | undefined {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name)) return name.text;
+  return undefined;
+}
+
+function findProtectionStateAdviceFunction(
+  source: ts.SourceFile,
+): ts.FunctionDeclaration {
+  let found: ts.FunctionDeclaration | undefined;
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isFunctionDeclaration(node) &&
+      node.name?.text === "protectionStateAdvice"
+    ) {
+      found = node;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  if (found === undefined || found.body === undefined) {
+    throw new Error("protectionStateAdvice function not found");
+  }
+  return found;
+}
+
+function resolveAdvicePhraseExpression(
+  expression: ts.Expression,
+  localStrings: ReadonlyMap<string, string>,
+  source: ts.SourceFile,
+  unresolved: string[],
+): string | undefined {
+  const flattened = flattenConcat(expression);
+  if (flattened !== undefined) return flattened;
+  if (ts.isIdentifier(expression)) {
+    const value = localStrings.get(expression.text);
+    if (value !== undefined) return value;
+    unresolved.push(expression.getText(source));
+    return undefined;
+  }
+  if (
+    ts.isPropertyAccessExpression(expression) &&
+    ts.isIdentifier(expression.expression) &&
+    expression.expression.text === "PROTECTION_HERO_COPY"
+  ) {
+    const heroCopy = PROTECTION_HERO_COPY as Readonly<Record<string, string>>;
+    const value = heroCopy[expression.name.text];
+    if (value !== undefined) return value;
+  }
+  if (expression.kind === ts.SyntaxKind.NullKeyword) return undefined;
+  unresolved.push(expression.getText(source));
+  return undefined;
+}
+
+function extractProtectionStateAdvicePhrases(sourceText: string): {
+  phrases: string[];
+  unresolved: string[];
+} {
+  const source = ts.createSourceFile(
+    CHOKEPOINT,
+    sourceText,
+    ts.ScriptTarget.ESNext,
+    true,
+  );
+  const advice = findProtectionStateAdviceFunction(source);
+  const localStrings = new Map<string, string>();
+  for (const statement of advice.body!.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.initializer === undefined) {
+        continue;
+      }
+      const value = flattenConcat(declaration.initializer);
+      if (value !== undefined) localStrings.set(declaration.name.text, value);
+    }
+  }
+
+  const phrases = new Set<string>(Object.values(PROTECTION_HERO_COPY));
+  const unresolved: string[] = [];
+  const advicePhraseProperties = new Set([
+    "operatorSentence",
+    "castleWallLabel",
+    "imperative",
+  ]);
+
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isReturnStatement(node) &&
+      node.expression !== undefined &&
+      ts.isObjectLiteralExpression(node.expression)
+    ) {
+      for (const property of node.expression.properties) {
+        if (!ts.isPropertyAssignment(property)) continue;
+        const propertyName = propertyNameText(property.name);
+        if (
+          propertyName === undefined ||
+          !advicePhraseProperties.has(propertyName)
+        ) {
+          continue;
+        }
+        const phrase = resolveAdvicePhraseExpression(
+          property.initializer,
+          localStrings,
+          source,
+          unresolved,
+        );
+        if (phrase !== undefined) phrases.add(phrase);
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(advice.body);
+
+  return {
+    phrases: [...phrases].sort(),
+    unresolved: [...new Set(unresolved)].sort(),
+  };
+}
+
+const PROTECTION_PROSE_EXTRACTION =
+  extractProtectionStateAdvicePhrases(CHOKEPOINT_SOURCE_TEXT);
+const PROTECTION_PROSE = PROTECTION_PROSE_EXTRACTION.phrases;
 
 function scanProtectionProse(fileName: string, sourceText: string): string[] {
   const patterns = PROTECTION_PROSE.map((phrase) => ({
@@ -166,40 +267,40 @@ describe("protection-state claim chokepoint", () => {
     }
   });
 
-  it("registers every current protectionStateAdvice phrase", () => {
-    const observations: ProtectionStateObservation[] = [
-      { state: "exclusive", basis: "exclusive_egress_observed" },
-      { state: "coarse-only", basis: "exclusive_egress_cap_observed" },
-      { state: "unprotected", basis: "disarm_observed_off" },
-      {
-        state: "unknown",
-        basis: "insufficient_evidence",
-        reasons: ["test"],
-      },
-      {
-        state: "unknown",
-        basis: "daemon_liveness_missing",
-        reasons: ["test"],
-      },
-      {
-        state: "unknown",
-        basis: "exclusive_egress_repark_failed",
-        reasons: ["test"],
-      },
-    ];
-    const actual = new Set<string>([
-      PROTECTION_HERO_COPY.green,
-      PROTECTION_HERO_COPY.nonGreen,
-    ]);
-    for (const observation of observations) {
-      const advice = protectionStateAdvice(
-        protectionStateClaimFromObservation(observation),
-      );
-      actual.add(advice.operatorSentence);
-      actual.add(advice.castleWallLabel);
-      if (advice.imperative !== null) actual.add(advice.imperative);
-    }
+  it("derives every current protectionStateAdvice phrase from the advice source", () => {
+    expect(PROTECTION_PROSE_EXTRACTION.unresolved).toEqual([]);
+    expect(PROTECTION_PROSE).toContain(PROTECTION_HERO_COPY.green);
+    expect(PROTECTION_PROSE).toContain(PROTECTION_HERO_COPY.nonGreen);
+    expect(PROTECTION_PROSE).toContain("Castle Wall Full");
+    expect(PROTECTION_PROSE).toContain(
+      "Castle Wall status unknown (exclusive-egress boot re-park failed)",
+    );
+  });
 
-    expect([...actual].sort()).toEqual([...PROTECTION_PROSE].sort());
+  it("would fail registration for an injected advice phrase", () => {
+    const injected = CHOKEPOINT_SOURCE_TEXT.replace(
+      "  switch (claim.state) {",
+      `  if (claim.basis === "synthetic_unregistered") {
+    return {
+      green: true,
+      operatorSentence: "Your agent is fully protected and sealed.",
+      castleWallLabel: "Castle Wall Fortified",
+      imperative: null,
+    };
+  }
+  switch (claim.state) {`,
+    );
+    expect(injected).not.toEqual(CHOKEPOINT_SOURCE_TEXT);
+
+    const extraction = extractProtectionStateAdvicePhrases(injected);
+    const extra = extraction.phrases.filter(
+      (phrase) => !PROTECTION_PROSE.includes(phrase),
+    );
+
+    expect(extraction.unresolved).toEqual([]);
+    expect(extra.sort()).toEqual([
+      "Castle Wall Fortified",
+      "Your agent is fully protected and sealed.",
+    ]);
   });
 });
