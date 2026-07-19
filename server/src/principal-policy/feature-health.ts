@@ -68,7 +68,11 @@
  * without a live HTTP server or a running daemon.
  */
 
-import type { AuditLog, AuditEntry } from "../operational/audit-log.js";
+import type {
+  AuditEntry,
+  AuditIntegrityFinding,
+  SealedRegionVerdict,
+} from "../operational/audit-log.js";
 import {
   auditChainVerdictUntampered,
   auditChainVerdictSealedUnverifiedAtPrivilege,
@@ -828,8 +832,23 @@ export function assertExpectationFloorsWellFormed(
 
 assertExpectationFloorsWellFormed(SLICE1_FEATURE_REGISTRY);
 
+export interface FeatureHealthAuditReader {
+  query(options: {
+    since?: string;
+    layer?: AuditEntry["layer"];
+    operation_type?: string;
+    identity_id?: string;
+    limit?: number;
+  }): Promise<{
+    entries: AuditEntry[];
+    total: number;
+    integrity_findings: AuditIntegrityFinding[];
+  }>;
+  verifySealedRegion(): Promise<SealedRegionVerdict>;
+}
+
 export interface BuildFeatureHealthInput {
-  auditLog: AuditLog;
+  auditLog: FeatureHealthAuditReader;
   originMachine: string;
   /** Registry to evaluate. Defaults to the Slice-1 registry; injectable for tests. */
   registry?: ReadonlyArray<FeatureRegistryEntry>;

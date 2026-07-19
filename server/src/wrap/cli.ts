@@ -109,9 +109,10 @@ import {
 } from "../operational/audit-log.js";
 import {
   createDaemonAuditLog,
+  resolveDaemonStorePresence,
   verifyFortressAuditFullPicture,
 } from "../operational/audit-store-split.js";
-import type { SealedRegionVerdict } from "../operational/audit-store-split.js";
+import type { FeatureHealthAuditReader } from "../principal-policy/feature-health.js";
 import {
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   type ExclusiveEgressStatus,
@@ -1072,13 +1073,11 @@ type CastleWallFeatureProbeResult = {
   basis: ProtectionFeatureBasis | undefined;
 };
 
-type AuditQueryOptions = Parameters<AuditLog["query"]>[0];
-type AuditQueryResult = Awaited<ReturnType<AuditLog["query"]>>;
+type AuditQueryResult = Awaited<ReturnType<FeatureHealthAuditReader["query"]>>;
 
-interface WrapAuditEvidenceReader {
-  query(options: AuditQueryOptions): Promise<AuditQueryResult>;
+interface WrapAuditEvidenceReader extends FeatureHealthAuditReader {
   runEagerReads<T>(fn: () => Promise<T>): Promise<T>;
-  verifySealedRegion(): Promise<SealedRegionVerdict>;
+  incompleteEvidenceReasons?: readonly string[];
 }
 
 function compareAuditEntriesByTimestamp(a: AuditEntry, b: AuditEntry): number {
@@ -1097,33 +1096,99 @@ function daemonChainUnavailableFinding(message: string): AuditIntegrityFinding {
   };
 }
 
+function mergedAuditQueryTruncatedFinding(input: {
+  total: number;
+  returned: number;
+  limit: number;
+}): AuditIntegrityFinding {
+  return daemonChainUnavailableFinding(
+    `dual-chain audit query returned ${input.returned} of ${input.total} matching entries (limit ${input.limit}); read is incomplete`,
+  );
+}
+
 function mergeAuditQueryResults(
   operator: AuditQueryResult,
   daemon: AuditQueryResult,
   limit: number,
 ): AuditQueryResult {
+  const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
   const entries = [...operator.entries, ...daemon.entries]
     .sort(compareAuditEntriesByTimestamp)
-    .slice(-limit);
+    .slice(-safeLimit);
+  const total = operator.total + daemon.total;
+  const integrityFindings = [
+    ...operator.integrity_findings,
+    ...daemon.integrity_findings,
+  ];
+  if (total > entries.length) {
+    integrityFindings.push(
+      mergedAuditQueryTruncatedFinding({
+        total,
+        returned: entries.length,
+        limit: safeLimit,
+      }),
+    );
+  }
   return {
     entries,
-    total: operator.total + daemon.total,
-    integrity_findings: [
-      ...operator.integrity_findings,
-      ...daemon.integrity_findings,
-    ],
+    total,
+    integrity_findings: integrityFindings,
+  };
+}
+
+type WrapDualAuditEvidence =
+  | { kind: "operator_only" }
+  | {
+      kind: "dual_chain";
+      auditStorage: FilesystemStorage;
+      masterKey: Uint8Array;
+    }
+  | { kind: "invalid"; reason: string };
+
+function dualAuditEvidenceFromInput(input: {
+  auditStorage?: FilesystemStorage;
+  masterKey?: Uint8Array;
+}): WrapDualAuditEvidence {
+  if (input.auditStorage === undefined && input.masterKey === undefined) {
+    return { kind: "operator_only" };
+  }
+  if (input.auditStorage !== undefined && input.masterKey !== undefined) {
+    return {
+      kind: "dual_chain",
+      auditStorage: input.auditStorage,
+      masterKey: input.masterKey,
+    };
+  }
+  return {
+    kind: "invalid",
+    reason:
+      "dual-chain audit evidence requires both audit storage and master key",
   };
 }
 
 async function createWrapAuditEvidenceReader(input: {
   auditLog: AuditLog;
-  auditStorage?: FilesystemStorage;
-  masterKey?: Uint8Array;
+  dualAuditEvidence: WrapDualAuditEvidence;
 }): Promise<WrapAuditEvidenceReader> {
-  const { auditLog, auditStorage, masterKey } = input;
-  if (auditStorage === undefined || masterKey === undefined) {
+  const { auditLog, dualAuditEvidence } = input;
+  if (dualAuditEvidence.kind === "operator_only") {
     return auditLog;
   }
+  if (dualAuditEvidence.kind === "invalid") {
+    const finding = daemonChainUnavailableFinding(dualAuditEvidence.reason);
+    return {
+      query: async (options) => {
+        const operator = await auditLog.queryEager(options);
+        return {
+          ...operator,
+          integrity_findings: [...operator.integrity_findings, finding],
+        };
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  }
+  const { auditStorage, masterKey } = dualAuditEvidence;
 
   try {
     const fullPicture = await verifyFortressAuditFullPicture({
@@ -1132,6 +1197,33 @@ async function createWrapAuditEvidenceReader(input: {
     });
     if (fullPicture.daemon.status === "absent") {
       return auditLog;
+    }
+    if (fullPicture.daemon.status === "present_unreadable") {
+      const presence = await resolveDaemonStorePresence(auditStorage, masterKey);
+      const unreadableReason =
+        presence.kind === "present_unreadable" ? presence.reason : "io";
+      if (unreadableReason !== "privilege") {
+        const finding = daemonChainUnavailableFinding(
+          `daemon audit chain is present_unreadable/${unreadableReason}: ${fullPicture.daemon.note}`,
+        );
+        return {
+          query: async (options) => {
+            const operator = await auditLog.queryEager(options);
+            return {
+              ...operator,
+              integrity_findings: [...operator.integrity_findings, finding],
+            };
+          },
+          runEagerReads: (fn) => auditLog.runEagerReads(fn),
+          verifySealedRegion: () => auditLog.verifySealedRegion(),
+        };
+      }
+      return {
+        query: (options) => auditLog.queryEager(options),
+        runEagerReads: (fn) => auditLog.runEagerReads(fn),
+        verifySealedRegion: () => auditLog.verifySealedRegion(),
+        incompleteEvidenceReasons: [fullPicture.daemon.note],
+      };
     }
     if (fullPicture.daemon.status !== "verified") {
       const findings =
@@ -1189,6 +1281,24 @@ async function createWrapAuditEvidenceReader(input: {
   }
 }
 
+function appendProtectionObservationReasons(
+  observation: ProtectionStateObservation,
+  reasons: readonly string[] | undefined,
+): ProtectionStateObservation {
+  if (reasons === undefined || reasons.length === 0) return observation;
+  const merged = [...(observation.reasons ?? []), ...reasons];
+  switch (observation.state) {
+    case "exclusive":
+      return { ...observation, reasons: merged };
+    case "coarse-only":
+      return { ...observation, reasons: merged };
+    case "unprotected":
+      return { ...observation, reasons: merged };
+    case "unknown":
+      return { ...observation, reasons: merged };
+  }
+}
+
 async function readCastleWallEgressFeatureStatus(
   auditLog: WrapAuditEvidenceReader,
   storagePath: string,
@@ -1205,7 +1315,7 @@ async function readCastleWallEgressFeatureStatus(
   // callers of buildFeatureHealthPanel (H4 chokepoint).
   const panel = await auditLog.runEagerReads(() =>
     buildFeatureHealthPanel({
-      auditLog: auditLog as unknown as AuditLog,
+      auditLog,
       originMachine: fortressIdFromStoragePath(storagePath),
       pinnedProducerKeyB64url:
         keyLoad.status === "present" ? keyLoad.keyB64url : null,
@@ -1399,11 +1509,14 @@ export async function probeCastleWallProtectionClaim(
       { purpose: "protection-claim", exclusiveEgress },
     );
     return protectionStateClaimFromObservation(
-      protectionObservationFromFeatureHealth({
-        castleWallEgressStatus: castleWallEgress.status,
-        castleWallEgressBasis: castleWallEgress.basis,
-        exclusiveEgress,
-      }),
+      appendProtectionObservationReasons(
+        protectionObservationFromFeatureHealth({
+          castleWallEgressStatus: castleWallEgress.status,
+          castleWallEgressBasis: castleWallEgress.basis,
+          exclusiveEgress,
+        }),
+        auditLog.incompleteEvidenceReasons,
+      ),
     );
   } catch (err) {
     return protectionStateClaimFromObservation({
@@ -1618,8 +1731,10 @@ export async function resolveWrapProtectionClaim(input: {
   }
   const auditEvidence = await createWrapAuditEvidenceReader({
     auditLog: input.auditLog,
-    auditStorage: input.auditStorage,
-    masterKey: input.masterKey,
+    dualAuditEvidence: dualAuditEvidenceFromInput({
+      auditStorage: input.auditStorage,
+      masterKey: input.masterKey,
+    }),
   });
   const daemonLivenessObserved =
     await observeCurrentWrapCastleWallDaemonLiveness(

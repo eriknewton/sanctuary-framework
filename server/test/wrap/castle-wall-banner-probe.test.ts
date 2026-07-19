@@ -17,7 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -29,6 +29,7 @@ import {
 import { protectionStateAdvice } from "../../src/egress-gate/protection-claim.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import {
+  AUDIT_DAEMON_NAMESPACE,
   createDaemonAuditLog,
   migrateFortressAuditStoreSplit,
 } from "../../src/operational/audit-store-split.js";
@@ -88,6 +89,10 @@ describe("Castle Wall wrap-banner evidence probes", () => {
 
   afterEach(async () => {
     try {
+      await chmod(storagePath, 0o700).catch(() => undefined);
+      await chmod(join(storagePath, "state", AUDIT_DAEMON_NAMESPACE), 0o700).catch(
+        () => undefined,
+      );
       await rm(storagePath, { recursive: true, force: true });
     } catch {}
   });
@@ -133,6 +138,49 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     });
   }
 
+  async function appendOperatorProtectionEvidence(
+    auditLog: AuditLog,
+    identityId: string = fortressId,
+  ) {
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: "filter_started",
+      identity_id: identityId,
+      result: "success",
+      details: { socket_path: daemonSocketPath, source: daemonSource },
+      timestamp: new Date(Date.now() - 31_000).toISOString(),
+    });
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: "castle_wall_heartbeat",
+      identity_id: identityId,
+      result: "success",
+      details: {
+        socket_path: daemonSocketPath,
+        source: daemonSource,
+        daemon_mode: "full",
+        cw_source: "castle_wall_audit_consumer",
+      },
+      timestamp: new Date(Date.now() - 30_000).toISOString(),
+    });
+    await auditLog.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: identityId,
+      result: "success",
+      details: { cw_source: "castle_wall_audit_consumer" },
+      timestamp: new Date(Date.now() - 29_000).toISOString(),
+    });
+    await auditLog.flush();
+  }
+
+  async function appendDaemonProtectionEvidence(
+    daemonLog: AuditLog,
+    identityId: string = fortressId,
+  ) {
+    await appendOperatorProtectionEvidence(daemonLog, identityId);
+  }
+
   async function splitMigratedFortressWithDaemonEvidence() {
     const storage = new FilesystemStorage(join(storagePath, "state"));
     const masterKey = generateRandomKey();
@@ -148,42 +196,52 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     await migrateFortressAuditStoreSplit({ storage, masterKey });
 
     const daemonLog = createDaemonAuditLog(storage, masterKey);
-    await daemonLog.appendCritical({
-      layer: "l1",
-      operation: "filter_started",
-      identity_id: fortressId,
-      result: "success",
-      details: { socket_path: daemonSocketPath, source: daemonSource },
-      timestamp: new Date(Date.now() - 31_000).toISOString(),
-    });
-    await daemonLog.appendCritical({
-      layer: "l1",
-      operation: "castle_wall_heartbeat",
-      identity_id: fortressId,
-      result: "success",
-      details: {
-        socket_path: daemonSocketPath,
-        source: daemonSource,
-        daemon_mode: "full",
-        cw_source: "castle_wall_audit_consumer",
-      },
-      timestamp: new Date(Date.now() - 30_000).toISOString(),
-    });
-    await daemonLog.appendCritical({
-      layer: "l1",
-      operation: "egress_allowed",
-      identity_id: fortressId,
-      result: "success",
-      details: { cw_source: "castle_wall_audit_consumer" },
-      timestamp: new Date(Date.now() - 29_000).toISOString(),
-    });
-    await daemonLog.flush();
+    await appendDaemonProtectionEvidence(daemonLog);
 
     return {
       auditLog: new AuditLog(storage, masterKey),
       auditStorage: storage,
       masterKey,
+      statePath: join(storagePath, "state"),
     };
+  }
+
+  async function splitMigratedFortressWithOperatorEvidenceAndDaemonChain() {
+    const storage = new FilesystemStorage(join(storagePath, "state"));
+    const masterKey = generateRandomKey();
+    const operatorLog = new AuditLog(storage, masterKey);
+    await operatorLog.appendCritical({
+      layer: "l1",
+      operation: "identity_create",
+      identity_id: fortressId,
+      result: "success",
+      details: { source: "operator-chain-fixture" },
+    });
+    await operatorLog.flush();
+    await migrateFortressAuditStoreSplit({ storage, masterKey });
+    await appendOperatorProtectionEvidence(new AuditLog(storage, masterKey));
+    await appendDaemonProtectionEvidence(createDaemonAuditLog(storage, masterKey));
+    return {
+      auditLog: new AuditLog(storage, masterKey),
+      auditStorage: storage,
+      masterKey,
+      statePath: join(storagePath, "state"),
+    };
+  }
+
+  async function tamperDaemonEntry(statePath: string) {
+    const daemonDir = join(statePath, AUDIT_DAEMON_NAMESPACE);
+    const files = (await readdir(daemonDir)).filter((f) => f.startsWith("entry-")).sort();
+    const target = join(daemonDir, files[1]!);
+    const raw = JSON.parse(await readFile(target, "utf-8"));
+    raw.timestamp = "1999-01-01T00:00:00.000Z";
+    await writeFile(target, JSON.stringify(raw));
+  }
+
+  async function deleteMiddleDaemonEntry(statePath: string) {
+    const daemonDir = join(statePath, AUDIT_DAEMON_NAMESPACE);
+    const files = (await readdir(daemonDir)).filter((f) => f.startsWith("entry-")).sort();
+    await rm(join(daemonDir, files[1]!), { force: true });
   }
 
   it("fresh adjudicated evidence (egress_allowed, inside the freshness window) reads true", async () => {
@@ -368,6 +426,117 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(claim.state).toBe("exclusive");
     expect(claim.basis).toBe("exclusive_egress_observed");
     expect(protectionStateAdvice(claim).castleWallLabel).toBe("Castle Wall Full");
+  });
+
+  it("split-migrated fortress can reach green from operator evidence when the daemon chain is permission-unreadable", async () => {
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      return;
+    }
+    const livenessSince = currentWrapSince();
+    const { auditLog, auditStorage, masterKey, statePath } =
+      await splitMigratedFortressWithOperatorEvidenceAndDaemonChain();
+    const daemonDir = join(statePath, AUDIT_DAEMON_NAMESPACE);
+    await chmod(daemonDir, 0o000);
+    try {
+      const claim = await resolveWrapProtectionClaim({
+        auditLog,
+        auditStorage,
+        masterKey,
+        autoProvisionSummary: {
+          ran: true,
+          outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+        },
+        castleWallDaemonLivenessSince: livenessSince,
+        storagePath,
+        providerTimeoutMs: 20,
+        resolveExclusiveEgress: async () => exclusiveStatus(),
+      });
+
+      expect(claim.state).toBe("exclusive");
+      expect(claim.basis).toBe("exclusive_egress_observed");
+      expect(claim.reasons.join("\n")).toContain("daemon audit store exists");
+      expect(protectionStateAdvice(claim).castleWallLabel).toBe("Castle Wall Full");
+    } finally {
+      await chmod(daemonDir, 0o700).catch(() => undefined);
+    }
+  });
+
+  it("split-migrated fortress stays unknown when the readable daemon chain is byte-tampered", async () => {
+    const livenessSince = currentWrapSince();
+    const { auditLog, auditStorage, masterKey, statePath } =
+      await splitMigratedFortressWithOperatorEvidenceAndDaemonChain();
+    await tamperDaemonEntry(statePath);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog,
+      auditStorage,
+      masterKey,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.reasons).toContain(
+      "Castle Wall daemon liveness was not observed during this wrap",
+    );
+  });
+
+  it("split-migrated fortress stays unknown when the daemon chain has a mid-chain deletion", async () => {
+    const livenessSince = currentWrapSince();
+    const { auditLog, auditStorage, masterKey, statePath } =
+      await splitMigratedFortressWithOperatorEvidenceAndDaemonChain();
+    await deleteMiddleDaemonEntry(statePath);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog,
+      auditStorage,
+      masterKey,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.reasons).toContain(
+      "Castle Wall daemon liveness was not observed during this wrap",
+    );
+  });
+
+  it("split-migrated fortress stays unknown when the migrated daemon chain is missing", async () => {
+    const livenessSince = currentWrapSince();
+    const { auditLog, auditStorage, masterKey, statePath } =
+      await splitMigratedFortressWithOperatorEvidenceAndDaemonChain();
+    await rm(join(statePath, AUDIT_DAEMON_NAMESPACE), {
+      recursive: true,
+      force: true,
+    });
+    const claim = await resolveWrapProtectionClaim({
+      auditLog,
+      auditStorage,
+      masterKey,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.reasons).toContain(
+      "Castle Wall daemon liveness was not observed during this wrap",
+    );
   });
 
   it("failed filter_started cannot satisfy current-wrap daemon liveness", async () => {
