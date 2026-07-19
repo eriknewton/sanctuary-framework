@@ -28,7 +28,12 @@ import {
 } from "../../src/wrap/cli.js";
 import { protectionStateAdvice } from "../../src/egress-gate/protection-claim.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
+import {
+  createDaemonAuditLog,
+  migrateFortressAuditStoreSplit,
+} from "../../src/operational/audit-store-split.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import type { ExclusiveEgressStatus } from "../../src/principal-policy/posture.js";
@@ -106,12 +111,15 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     });
   }
 
-  async function appendDaemonStart(ageMs: number): Promise<void> {
+  async function appendDaemonStart(
+    ageMs: number,
+    result: "success" | "failure" = "success",
+  ): Promise<void> {
     await log.appendCritical({
       layer: "l1",
       operation: "filter_started",
       identity_id: fortressId,
-      result: "success",
+      result,
       details: { socket_path: daemonSocketPath, source: daemonSource },
       timestamp: new Date(Date.now() - ageMs).toISOString(),
     });
@@ -123,6 +131,59 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       source: daemonSource,
       daemon_mode: "full",
     });
+  }
+
+  async function splitMigratedFortressWithDaemonEvidence() {
+    const storage = new FilesystemStorage(join(storagePath, "state"));
+    const masterKey = generateRandomKey();
+    const operatorLog = new AuditLog(storage, masterKey);
+    await operatorLog.appendCritical({
+      layer: "l1",
+      operation: "identity_create",
+      identity_id: fortressId,
+      result: "success",
+      details: { source: "operator-chain-fixture" },
+    });
+    await operatorLog.flush();
+    await migrateFortressAuditStoreSplit({ storage, masterKey });
+
+    const daemonLog = createDaemonAuditLog(storage, masterKey);
+    await daemonLog.appendCritical({
+      layer: "l1",
+      operation: "filter_started",
+      identity_id: fortressId,
+      result: "success",
+      details: { socket_path: daemonSocketPath, source: daemonSource },
+      timestamp: new Date(Date.now() - 31_000).toISOString(),
+    });
+    await daemonLog.appendCritical({
+      layer: "l1",
+      operation: "castle_wall_heartbeat",
+      identity_id: fortressId,
+      result: "success",
+      details: {
+        socket_path: daemonSocketPath,
+        source: daemonSource,
+        daemon_mode: "full",
+        cw_source: "castle_wall_audit_consumer",
+      },
+      timestamp: new Date(Date.now() - 30_000).toISOString(),
+    });
+    await daemonLog.appendCritical({
+      layer: "l1",
+      operation: "egress_allowed",
+      identity_id: fortressId,
+      result: "success",
+      details: { cw_source: "castle_wall_audit_consumer" },
+      timestamp: new Date(Date.now() - 29_000).toISOString(),
+    });
+    await daemonLog.flush();
+
+    return {
+      auditLog: new AuditLog(storage, masterKey),
+      auditStorage: storage,
+      masterKey,
+    };
   }
 
   it("fresh adjudicated evidence (egress_allowed, inside the freshness window) reads true", async () => {
@@ -284,6 +345,77 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     });
     expect(claim.state).toBe("exclusive");
     expect(claim.basis).toBe("exclusive_egress_observed");
+  });
+
+  it("split-migrated fortress reaches green when current-wrap daemon evidence lives in _audit-daemon", async () => {
+    const livenessSince = currentWrapSince();
+    const { auditLog, auditStorage, masterKey } =
+      await splitMigratedFortressWithDaemonEvidence();
+    const claim = await resolveWrapProtectionClaim({
+      auditLog,
+      auditStorage,
+      masterKey,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+
+    expect(claim.state).toBe("exclusive");
+    expect(claim.basis).toBe("exclusive_egress_observed");
+    expect(protectionStateAdvice(claim).castleWallLabel).toBe("Castle Wall Full");
+  });
+
+  it("failed filter_started cannot satisfy current-wrap daemon liveness", async () => {
+    const livenessSince = currentWrapSince();
+    await appendCW("egress_allowed", 60_000);
+    await appendDaemonStart(31_000, "failure");
+    await appendDaemonHeartbeat(30_000);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.reasons).toContain(
+      "Castle Wall daemon liveness was not observed during this wrap",
+    );
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
+  });
+
+  it("heartbeat before its matching filter_started cannot satisfy current-wrap daemon liveness", async () => {
+    const livenessSince = currentWrapSince();
+    await appendCW("egress_allowed", 60_000);
+    await appendDaemonHeartbeat(30_000);
+    await appendDaemonStart(29_000);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.reasons).toContain(
+      "Castle Wall daemon liveness was not observed during this wrap",
+    );
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
   });
 
   it("marker-only same-process heartbeats do not satisfy current-wrap daemon liveness", async () => {

@@ -102,7 +102,16 @@ import {
   establishWrapCustody,
   type WrapCustodyResult,
 } from "./custody-flow.js";
-import { AuditLog } from "../operational/audit-log.js";
+import {
+  AuditLog,
+  type AuditEntry,
+  type AuditIntegrityFinding,
+} from "../operational/audit-log.js";
+import {
+  createDaemonAuditLog,
+  verifyFortressAuditFullPicture,
+} from "../operational/audit-store-split.js";
+import type { SealedRegionVerdict } from "../operational/audit-store-split.js";
 import {
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   type ExclusiveEgressStatus,
@@ -1063,8 +1072,125 @@ type CastleWallFeatureProbeResult = {
   basis: ProtectionFeatureBasis | undefined;
 };
 
+type AuditQueryOptions = Parameters<AuditLog["query"]>[0];
+type AuditQueryResult = Awaited<ReturnType<AuditLog["query"]>>;
+
+interface WrapAuditEvidenceReader {
+  query(options: AuditQueryOptions): Promise<AuditQueryResult>;
+  runEagerReads<T>(fn: () => Promise<T>): Promise<T>;
+  verifySealedRegion(): Promise<SealedRegionVerdict>;
+}
+
+function compareAuditEntriesByTimestamp(a: AuditEntry, b: AuditEntry): number {
+  const aMs = Date.parse(a.timestamp);
+  const bMs = Date.parse(b.timestamp);
+  if (Number.isFinite(aMs) && Number.isFinite(bMs) && aMs !== bMs) {
+    return aMs - bMs;
+  }
+  return a.timestamp.localeCompare(b.timestamp);
+}
+
+function daemonChainUnavailableFinding(message: string): AuditIntegrityFinding {
+  return {
+    kind: "storage_unavailable",
+    message,
+  };
+}
+
+function mergeAuditQueryResults(
+  operator: AuditQueryResult,
+  daemon: AuditQueryResult,
+  limit: number,
+): AuditQueryResult {
+  const entries = [...operator.entries, ...daemon.entries]
+    .sort(compareAuditEntriesByTimestamp)
+    .slice(-limit);
+  return {
+    entries,
+    total: operator.total + daemon.total,
+    integrity_findings: [
+      ...operator.integrity_findings,
+      ...daemon.integrity_findings,
+    ],
+  };
+}
+
+async function createWrapAuditEvidenceReader(input: {
+  auditLog: AuditLog;
+  auditStorage?: FilesystemStorage;
+  masterKey?: Uint8Array;
+}): Promise<WrapAuditEvidenceReader> {
+  const { auditLog, auditStorage, masterKey } = input;
+  if (auditStorage === undefined || masterKey === undefined) {
+    return auditLog;
+  }
+
+  try {
+    const fullPicture = await verifyFortressAuditFullPicture({
+      storage: auditStorage,
+      masterKey,
+    });
+    if (fullPicture.daemon.status === "absent") {
+      return auditLog;
+    }
+    if (fullPicture.daemon.status !== "verified") {
+      const findings =
+        fullPicture.daemon.status === "findings" &&
+        fullPicture.daemon.findings !== undefined
+          ? fullPicture.daemon.findings
+          : [
+              daemonChainUnavailableFinding(
+                `daemon audit chain is ${fullPicture.daemon.status}: ${fullPicture.daemon.note}`,
+              ),
+            ];
+      return {
+        query: async (options) => {
+          const operator = await auditLog.queryEager(options);
+          return {
+            ...operator,
+            integrity_findings: [...operator.integrity_findings, ...findings],
+          };
+        },
+        runEagerReads: (fn) => auditLog.runEagerReads(fn),
+        verifySealedRegion: () => auditLog.verifySealedRegion(),
+      };
+    }
+
+    const daemonLog = createDaemonAuditLog(auditStorage, masterKey, {
+      integrityMode: "lenient",
+    });
+    return {
+      query: async (options) => {
+        const limit = options.limit ?? 50;
+        const [operator, daemon] = await Promise.all([
+          auditLog.queryEager(options),
+          daemonLog.queryEager(options),
+        ]);
+        return mergeAuditQueryResults(operator, daemon, limit);
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  } catch (err) {
+    const finding = daemonChainUnavailableFinding(
+      `dual-chain audit evidence could not be verified: ${(err as Error).message}`,
+    );
+    return {
+      query: async (options) => {
+        const operator = await auditLog.queryEager(options);
+        return {
+          ...operator,
+          integrity_findings: [...operator.integrity_findings, finding],
+        };
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  }
+}
+
 async function readCastleWallEgressFeatureStatus(
-  auditLog: AuditLog,
+  auditLog: WrapAuditEvidenceReader,
   storagePath: string,
   input: CastleWallFeatureProbeInput,
 ): Promise<CastleWallFeatureProbeResult> {
@@ -1079,7 +1205,7 @@ async function readCastleWallEgressFeatureStatus(
   // callers of buildFeatureHealthPanel (H4 chokepoint).
   const panel = await auditLog.runEagerReads(() =>
     buildFeatureHealthPanel({
-      auditLog,
+      auditLog: auditLog as unknown as AuditLog,
       originMachine: fortressIdFromStoragePath(storagePath),
       pinnedProducerKeyB64url:
         keyLoad.status === "present" ? keyLoad.keyB64url : null,
@@ -1103,7 +1229,7 @@ async function readCastleWallEgressFeatureStatus(
  * requires the capped exclusive-egress verdict.
  */
 export async function probeCoarseCastleWallEnforcementObserved(
-  auditLog: AuditLog,
+  auditLog: WrapAuditEvidenceReader,
   storagePath: string,
 ): Promise<boolean> {
   try {
@@ -1164,7 +1290,7 @@ function currentWrapHeartbeatAttribution(details: unknown): string | undefined {
  * self-writes, or stale prior evidence from enabling a claim.
  */
 export async function observeCurrentWrapCastleWallDaemonLiveness(
-  auditLog: AuditLog,
+  auditLog: WrapAuditEvidenceReader,
   storagePath: string,
   daemonLivenessSince: Date | undefined,
   nowMs: number = Date.now(),
@@ -1175,37 +1301,48 @@ export async function observeCurrentWrapCastleWallDaemonLiveness(
   }
   const freshnessFloorMs = nowMs - DEFAULT_ENFORCEMENT_FRESHNESS_MS;
   try {
+    const limit = 10_000;
     const result = await auditLog.runEagerReads(() =>
       auditLog.query({
         layer: CASTLE_WALL_AUDIT_LAYER,
         identity_id: fortressIdFromStoragePath(storagePath),
         since: new Date(sinceMs).toISOString(),
-        limit: 1000,
+        limit,
       }),
     );
     // audit-chokepoint-exempt: fail-closed liveness gate; raw integrity
     // findings only block the banner from rendering green.
-    if (result.integrity_findings.length > 0) {
+    if (
+      result.integrity_findings.length > 0 ||
+      result.total > result.entries.length
+    ) {
       return false;
     }
-    const currentWrapDaemonStarts = new Set<string>();
+    const currentWrapDaemonStarts = new Map<string, number>();
     for (const entry of result.entries) {
       if (entry.operation !== CASTLE_WALL_DAEMON_START_OPERATION) continue;
+      if (entry.result !== "success") continue;
       const ts = Date.parse(entry.timestamp);
       if (!Number.isFinite(ts) || ts < sinceMs) continue;
       const key = daemonAttributionKey(entry.details);
-      if (key !== undefined) currentWrapDaemonStarts.add(key);
+      if (key === undefined) continue;
+      const previous = currentWrapDaemonStarts.get(key);
+      if (previous === undefined || ts > previous) {
+        currentWrapDaemonStarts.set(key, ts);
+      }
     }
     return result.entries.some((entry) => {
       if (entry.operation !== CASTLE_WALL_HEARTBEAT_OPERATION) return false;
+      if (entry.result !== "success") return false;
       const ts = Date.parse(entry.timestamp);
       const key = currentWrapHeartbeatAttribution(entry.details);
+      const startTs = key === undefined ? undefined : currentWrapDaemonStarts.get(key);
       return (
         Number.isFinite(ts) &&
         ts >= sinceMs &&
         ts >= freshnessFloorMs &&
-        key !== undefined &&
-        currentWrapDaemonStarts.has(key)
+        startTs !== undefined &&
+        ts >= startTs
       );
     });
   } catch {
@@ -1234,7 +1371,7 @@ async function withTimeout<T>(
 }
 
 export async function probeCastleWallProtectionClaim(
-  auditLog: AuditLog,
+  auditLog: WrapAuditEvidenceReader,
   storagePath: string,
   resolveExclusiveEgress: () => Promise<ExclusiveEgressStatus | null>,
   options: { providerTimeoutMs?: number } = {},
@@ -1285,7 +1422,7 @@ export async function probeCastleWallProtectionClaim(
  * unknown, never green.
  */
 async function createWrapProtectionResolver(
-  auditLog: AuditLog,
+  auditLog: WrapAuditEvidenceReader,
   storagePath: string,
 ): Promise<(() => Promise<ExclusiveEgressStatus | null>) | undefined> {
   if (process.platform !== "darwin") return undefined;
@@ -1455,6 +1592,8 @@ function unknownClaimWithAutoProvisionReasons(
 
 export async function resolveWrapProtectionClaim(input: {
   auditLog: AuditLog | undefined;
+  auditStorage?: FilesystemStorage;
+  masterKey?: Uint8Array;
   autoProvisionSummary: AutoProvisionSummary;
   castleWallDaemonLivenessSince?: Date;
   storagePath: string;
@@ -1477,9 +1616,14 @@ export async function resolveWrapProtectionClaim(input: {
       autoProvisionClaim,
     );
   }
+  const auditEvidence = await createWrapAuditEvidenceReader({
+    auditLog: input.auditLog,
+    auditStorage: input.auditStorage,
+    masterKey: input.masterKey,
+  });
   const daemonLivenessObserved =
     await observeCurrentWrapCastleWallDaemonLiveness(
-      input.auditLog,
+      auditEvidence,
       input.storagePath,
       input.castleWallDaemonLivenessSince,
     );
@@ -1498,7 +1642,7 @@ export async function resolveWrapProtectionClaim(input: {
     resolver =
       input.resolveExclusiveEgress ??
       (await createWrapProtectionResolver(
-        input.auditLog,
+        auditEvidence,
         input.storagePath,
       ));
   } catch (err) {
@@ -1524,7 +1668,7 @@ export async function resolveWrapProtectionClaim(input: {
     );
   }
   const probedClaim = await probeCastleWallProtectionClaim(
-    input.auditLog,
+    auditEvidence,
     input.storagePath,
     resolver,
     { providerTimeoutMs: input.providerTimeoutMs },
@@ -3072,6 +3216,8 @@ export async function runWrap(
     // points operators at the persistent dashboard.
 
     let ndAuditLog: AuditLog | undefined;
+    let ndAuditStorage: FilesystemStorage | undefined;
+    let ndAuditMasterKey: Uint8Array | undefined;
 
     // v1.3.0 (WWWWW, NNN regression): --no-dashboard wraps previously
     // skipped identity bootstrap because the creation lived after the
@@ -3085,6 +3231,8 @@ export async function runWrap(
         // re-deriving from key-params here could produce a DIFFERENT master
         // than the envelope holds - exactly the divergence this build ends.
         const ndDerived = { key: wrapCustody.masterKey };
+        ndAuditStorage = ndStorage;
+        ndAuditMasterKey = ndDerived.key;
         ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
         await bestEffortRecordWrapWorkloadRegistration({
           auditLog: ndAuditLog,
@@ -3148,6 +3296,8 @@ export async function runWrap(
     renderAutoProvisionOutcome(autoProvisionSummary);
     const castleWallProtectionClaim = await resolveWrapProtectionClaim({
       auditLog: ndAuditLog,
+      auditStorage: ndAuditStorage,
+      masterKey: ndAuditMasterKey,
       autoProvisionSummary,
       castleWallDaemonLivenessSince,
       storagePath,
@@ -3178,6 +3328,8 @@ export async function runWrap(
   // dashboard's /api/query-anonymity/pii route reports the truthful state.
   let wrapTierBPiiRedactorInstalled = false;
   let wrapAuditLog: AuditLog | undefined;
+  let wrapAuditStorage: FilesystemStorage | undefined;
+  let wrapAuditMasterKey: Uint8Array | undefined;
 
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
@@ -3255,6 +3407,8 @@ export async function runWrap(
       // instead of re-deriving from key-params - the spawned MCP server
       // unlocks the same envelope with the same passphrase.
       const derived = { key: wrapCustody.masterKey };
+      wrapAuditStorage = v11Storage;
+      wrapAuditMasterKey = derived.key;
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
       await bestEffortRecordWrapWorkloadRegistration({
         auditLog: wrapAuditLog,
@@ -3493,6 +3647,8 @@ export async function runWrap(
 
   const castleWallProtectionClaim = await resolveWrapProtectionClaim({
     auditLog: wrapAuditLog,
+    auditStorage: wrapAuditStorage,
+    masterKey: wrapAuditMasterKey,
     autoProvisionSummary,
     castleWallDaemonLivenessSince,
     storagePath,
