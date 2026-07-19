@@ -385,7 +385,7 @@ describe("formatWrapSuccess", () => {
     expect(out).toContain("exclusive-egress boot re-park is not confirmed");
   });
 
-  it("drill run 3: bring-up abort renders a coarse-only demotion, not full protection", () => {
+  it("drill run 3: bring-up abort needs a fresh probe before any coarse-only claim", () => {
     const protection = protectionClaimFromAutoProvisionSummary({
       ran: true,
       outcome: {
@@ -398,8 +398,8 @@ describe("formatWrapSuccess", () => {
         cleanupErrors: [],
       },
     });
-    expect(protection?.state).toBe("coarse-only");
-    expect(protection?.basis).toBe("exclusive_egress_unarmed_coarse_active");
+    expect(protection?.state).toBe("unknown");
+    expect(protection?.basis).toBe("provision_outcome_not_observation");
     const out = formatWrapSuccess({
       ...baseInfo,
       castleWallProtectionClaim: protection!,
@@ -407,7 +407,7 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
     expect(out).not.toContain("Castle Wall NOT ARMED");
-    expect(out).toContain("coarse-only");
+    expect(out).toContain("enforcement is not confirmed");
   });
 
   // F7 (v1.6.1 first-run honesty): on Hermes the tool/server counts derive

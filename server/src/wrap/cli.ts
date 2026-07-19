@@ -113,6 +113,7 @@ import {
   protectionStateClaimFromObservation,
   type ProtectionFeatureBasis,
   type ProtectionFeatureStatus,
+  type ProtectionClaimState,
   type ProtectionStateClaim,
   type ProtectionStateObservation,
 } from "../egress-gate/protection-claim.js";
@@ -1128,11 +1129,39 @@ function hasCastleWallAuditProvenance(details: unknown): boolean {
   );
 }
 
+const CASTLE_WALL_DAEMON_START_OPERATION = "filter_started" as const;
+
+function stringDetail(
+  details: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = details[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function daemonAttributionKey(details: unknown): string | undefined {
+  if (!isRecord(details)) return undefined;
+  const socketPath = stringDetail(details, "socket_path");
+  const source = stringDetail(details, "source");
+  if (socketPath === undefined || source === undefined) return undefined;
+  return `${source}\u0000${socketPath}`;
+}
+
+function currentWrapHeartbeatAttribution(details: unknown): string | undefined {
+  if (!isRecord(details) || !hasCastleWallAuditProvenance(details)) {
+    return undefined;
+  }
+  const daemonMode = details.daemon_mode;
+  if (daemonMode !== "full" && daemonMode !== "safe") return undefined;
+  return daemonAttributionKey(details);
+}
+
 /**
  * Current-wrap daemon liveness gate for the banner resolver. This observes a
- * provenance-marked heartbeat after the daemon-start attempt and inside the
- * existing freshness window. It never earns green by itself; it only prevents a
- * handle lifetime or stale prior evidence from enabling a claim.
+ * daemon-shaped, provenance-marked heartbeat after the daemon-start attempt and
+ * inside the existing freshness window, paired to this wrap's daemon start entry.
+ * It never earns green by itself; it only prevents a handle lifetime, marker-only
+ * self-writes, or stale prior evidence from enabling a claim.
  */
 export async function observeCurrentWrapCastleWallDaemonLiveness(
   auditLog: AuditLog,
@@ -1145,14 +1174,12 @@ export async function observeCurrentWrapCastleWallDaemonLiveness(
     return false;
   }
   const freshnessFloorMs = nowMs - DEFAULT_ENFORCEMENT_FRESHNESS_MS;
-  const querySinceMs = Math.max(sinceMs, freshnessFloorMs);
   try {
     const result = await auditLog.runEagerReads(() =>
       auditLog.query({
         layer: CASTLE_WALL_AUDIT_LAYER,
-        operation_type: CASTLE_WALL_HEARTBEAT_OPERATION,
         identity_id: fortressIdFromStoragePath(storagePath),
-        since: new Date(querySinceMs).toISOString(),
+        since: new Date(sinceMs).toISOString(),
         limit: 1000,
       }),
     );
@@ -1161,13 +1188,24 @@ export async function observeCurrentWrapCastleWallDaemonLiveness(
     if (result.integrity_findings.length > 0) {
       return false;
     }
-    return result.entries.some((entry) => {
+    const currentWrapDaemonStarts = new Set<string>();
+    for (const entry of result.entries) {
+      if (entry.operation !== CASTLE_WALL_DAEMON_START_OPERATION) continue;
       const ts = Date.parse(entry.timestamp);
+      if (!Number.isFinite(ts) || ts < sinceMs) continue;
+      const key = daemonAttributionKey(entry.details);
+      if (key !== undefined) currentWrapDaemonStarts.add(key);
+    }
+    return result.entries.some((entry) => {
+      if (entry.operation !== CASTLE_WALL_HEARTBEAT_OPERATION) return false;
+      const ts = Date.parse(entry.timestamp);
+      const key = currentWrapHeartbeatAttribution(entry.details);
       return (
         Number.isFinite(ts) &&
         ts >= sinceMs &&
         ts >= freshnessFloorMs &&
-        hasCastleWallAuditProvenance(entry.details)
+        key !== undefined &&
+        currentWrapDaemonStarts.has(key)
       );
     });
   } catch {
@@ -1278,8 +1316,8 @@ function protectionObservationFromAutoProvisionSummary(
       };
     case "exclusive-egress-unarmed-coarse-active":
       return {
-        state: "coarse-only",
-        basis: "exclusive_egress_unarmed_coarse_active",
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
         reasons: [outcome.reason, ...outcome.cleanupErrors],
       };
     case "armed-rollback-failed":
@@ -1331,16 +1369,88 @@ export function protectionClaimFromAutoProvisionSummary(
     : protectionStateClaimFromObservation(observation);
 }
 
-function autoProvisionClaimDemotesProbe(
-  claim: ProtectionStateClaim | undefined,
-): boolean {
-  // Asymmetric invariant: auto-provision control flow may only downgrade a
-  // probe. It never creates or upgrades a green protection claim.
-  return (
-    claim?.basis === "disarm_observed_off" ||
-    claim?.basis === "exclusive_egress_repark_failed" ||
-    claim?.basis === "exclusive_egress_unarmed_coarse_active"
-  );
+function autoProvisionCeilingFromSummary(
+  summary: AutoProvisionSummary,
+): ProtectionStateClaim | undefined {
+  if (!summary.ran || summary.outcome === undefined) return undefined;
+  const outcome = summary.outcome;
+  switch (outcome.kind) {
+    case "armed-exclusive-repark-failed":
+      return protectionStateClaimFromObservation({
+        state: "unknown",
+        basis: "exclusive_egress_repark_failed",
+        reasons: [outcome.reparkError],
+      });
+    case "exclusive-egress-unarmed-coarse-active":
+      if (
+        outcome.coarseCompositionRestored === true &&
+        outcome.harnessStartedCoarse === true
+      ) {
+        return protectionStateClaimFromObservation({
+          state: "coarse-only",
+          basis: "exclusive_egress_unarmed_coarse_active",
+          reasons: [outcome.reason, ...outcome.cleanupErrors],
+        });
+      }
+      return protectionStateClaimFromObservation({
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason, ...outcome.cleanupErrors],
+      });
+    case "aborted":
+    case "armed-then-rolled-back":
+    case "egress-unprovisioned-rolled-back":
+      if (outcome.disarmObservedOff === true) {
+        return protectionStateClaimFromObservation({
+          state: "unprotected",
+          basis: "disarm_observed_off",
+          reasons: [outcome.reason],
+        });
+      }
+      return undefined;
+    case "armed":
+    case "armed-exclusive":
+    case "armed-rollback-failed":
+    case "skipped-already-dedicated":
+    case "skipped-non-tty-cooperative-only":
+    case "declined-by-operator":
+      return undefined;
+  }
+}
+
+const protectionClaimStateOrder: Readonly<Record<ProtectionClaimState, number>> =
+  Object.freeze({
+    unprotected: 0,
+    unknown: 1,
+    "coarse-only": 2,
+    exclusive: 3,
+  });
+
+function applyAutoProvisionCeiling(
+  probedClaim: ProtectionStateClaim,
+  autoProvisionCeiling: ProtectionStateClaim | undefined,
+): ProtectionStateClaim {
+  if (autoProvisionCeiling === undefined) return probedClaim;
+  return protectionClaimStateOrder[autoProvisionCeiling.state] <=
+    protectionClaimStateOrder[probedClaim.state]
+    ? autoProvisionCeiling
+    : probedClaim;
+}
+
+function unknownClaimWithAutoProvisionReasons(
+  observation: ProtectionStateObservation,
+  autoProvisionSummaryClaim: ProtectionStateClaim | undefined,
+): ProtectionStateClaim {
+  if (autoProvisionSummaryClaim?.basis === "disarm_observed_off") {
+    return autoProvisionSummaryClaim;
+  }
+  return protectionStateClaimFromObservation({
+    ...observation,
+    reasons: [
+      ...(observation.reasons ?? []),
+      ...(autoProvisionSummaryClaim?.reasons ?? []),
+    ],
+  });
 }
 
 export async function resolveWrapProtectionClaim(input: {
@@ -1354,12 +1464,18 @@ export async function resolveWrapProtectionClaim(input: {
   const autoProvisionClaim = protectionClaimFromAutoProvisionSummary(
     input.autoProvisionSummary,
   );
+  const autoProvisionCeiling = autoProvisionCeilingFromSummary(
+    input.autoProvisionSummary,
+  );
   if (input.auditLog === undefined) {
-    return autoProvisionClaim ?? protectionStateClaimFromObservation({
-      state: "unknown",
-      basis: "provider_unavailable",
-      reasons: ["no audit log was available to observe enforcement"],
-    });
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: ["no audit log was available to observe enforcement"],
+      },
+      autoProvisionClaim,
+    );
   }
   const daemonLivenessObserved =
     await observeCurrentWrapCastleWallDaemonLiveness(
@@ -1368,11 +1484,14 @@ export async function resolveWrapProtectionClaim(input: {
       input.castleWallDaemonLivenessSince,
     );
   if (!daemonLivenessObserved) {
-    return autoProvisionClaim ?? protectionStateClaimFromObservation({
-      state: "unknown",
-      basis: "provider_unavailable",
-      reasons: ["Castle Wall daemon liveness was not observed during this wrap"],
-    });
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: ["Castle Wall daemon liveness was not observed during this wrap"],
+      },
+      autoProvisionClaim,
+    );
   }
   let resolver: (() => Promise<ExclusiveEgressStatus | null>) | undefined;
   try {
@@ -1383,20 +1502,26 @@ export async function resolveWrapProtectionClaim(input: {
         input.storagePath,
       ));
   } catch (err) {
-    return autoProvisionClaim ?? protectionStateClaimFromObservation({
-      state: "unknown",
-      basis: "provider_unavailable",
-      reasons: [
-        `exclusive-egress posture provider could not be loaded: ${(err as Error).message}`,
-      ],
-    });
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: [
+          `exclusive-egress posture provider could not be loaded: ${(err as Error).message}`,
+        ],
+      },
+      autoProvisionClaim,
+    );
   }
   if (resolver === undefined) {
-    return autoProvisionClaim ?? protectionStateClaimFromObservation({
-      state: "unknown",
-      basis: "provider_unavailable",
-      reasons: ["exclusive-egress posture provider was not available"],
-    });
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: ["exclusive-egress posture provider was not available"],
+      },
+      autoProvisionClaim,
+    );
   }
   const probedClaim = await probeCastleWallProtectionClaim(
     input.auditLog,
@@ -1404,9 +1529,7 @@ export async function resolveWrapProtectionClaim(input: {
     resolver,
     { providerTimeoutMs: input.providerTimeoutMs },
   );
-  return autoProvisionClaimDemotesProbe(autoProvisionClaim)
-    ? autoProvisionClaim!
-    : probedClaim;
+  return applyAutoProvisionCeiling(probedClaim, autoProvisionCeiling);
 }
 
 /**

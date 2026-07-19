@@ -87,15 +87,41 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     } catch {}
   });
 
+  const daemonSocketPath = "/tmp/sanctuary-test-castle.sock";
+  const daemonSource = "sanctuary-wrap";
+
   /** A Castle-Wall-originated entry carrying the provenance marker. */
-  async function appendCW(operation: string, ageMs: number): Promise<void> {
+  async function appendCW(
+    operation: string,
+    ageMs: number,
+    details: Record<string, unknown> = {},
+  ): Promise<void> {
     await log.appendCritical({
       layer: "l1",
       operation,
       identity_id: fortressId,
       result: "success",
-      details: { cw_source: "castle_wall_audit_consumer" },
+      details: { ...details, cw_source: "castle_wall_audit_consumer" },
       timestamp: new Date(Date.now() - ageMs).toISOString(),
+    });
+  }
+
+  async function appendDaemonStart(ageMs: number): Promise<void> {
+    await log.appendCritical({
+      layer: "l1",
+      operation: "filter_started",
+      identity_id: fortressId,
+      result: "success",
+      details: { socket_path: daemonSocketPath, source: daemonSource },
+      timestamp: new Date(Date.now() - ageMs).toISOString(),
+    });
+  }
+
+  async function appendDaemonHeartbeat(ageMs: number): Promise<void> {
+    await appendCW("castle_wall_heartbeat", ageMs, {
+      socket_path: daemonSocketPath,
+      source: daemonSource,
+      daemon_mode: "full",
     });
   }
 
@@ -199,7 +225,8 @@ describe("Castle Wall wrap-banner evidence probes", () => {
   it("composed drill 1: newer wall_disarmed beats older fresh enforcement", async () => {
     const livenessSince = currentWrapSince(6 * 60_000);
     await appendCW("egress_allowed", 5 * 60_000);
-    await appendCW("castle_wall_heartbeat", 4 * 60_000);
+    await appendDaemonStart(4 * 60_000 + 1_000);
+    await appendDaemonHeartbeat(4 * 60_000);
     await appendCW("wall_disarmed", 60_000);
     const claim = await resolveWrapProtectionClaim({
       auditLog: log,
@@ -239,7 +266,27 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
   });
 
-  it("a deliberately stopped transient daemon does not erase its observed current-wrap heartbeat", async () => {
+  it("flagship armed-exclusive path reaches green with current-wrap daemon liveness and fresh egress", async () => {
+    const livenessSince = currentWrapSince();
+    await appendCW("egress_allowed", 60_000);
+    await appendDaemonStart(31_000);
+    await appendDaemonHeartbeat(30_000);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+    expect(claim.state).toBe("exclusive");
+    expect(claim.basis).toBe("exclusive_egress_observed");
+  });
+
+  it("marker-only same-process heartbeats do not satisfy current-wrap daemon liveness", async () => {
     const livenessSince = currentWrapSince();
     await appendCW("egress_allowed", 60_000);
     await appendCW("castle_wall_heartbeat", 30_000);
@@ -251,13 +298,17 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       providerTimeoutMs: 20,
       resolveExclusiveEgress: async () => exclusiveStatus(),
     });
-    expect(claim.state).toBe("exclusive");
-    expect(claim.basis).toBe("exclusive_egress_observed");
+    expect(claim.state).toBe("unknown");
+    expect(claim.reasons).toContain(
+      "Castle Wall daemon liveness was not observed during this wrap",
+    );
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
   });
 
   it("composed drill 2: arm abort without observed-off evidence stays probe-driven", async () => {
     const livenessSince = currentWrapSince();
-    await appendCW("castle_wall_heartbeat", 60_000);
+    await appendDaemonStart(61_000);
+    await appendDaemonHeartbeat(60_000);
     const claim = await resolveWrapProtectionClaim({
       auditLog: log,
       autoProvisionSummary: {
@@ -281,7 +332,8 @@ describe("Castle Wall wrap-banner evidence probes", () => {
   it("composed drill 3: degraded exclusive bring-up demotes a green coarse probe", async () => {
     const livenessSince = currentWrapSince();
     await appendCW("egress_allowed", 60_000);
-    await appendCW("castle_wall_heartbeat", 30_000);
+    await appendDaemonStart(31_000);
+    await appendDaemonHeartbeat(30_000);
     const claim = await resolveWrapProtectionClaim({
       auditLog: log,
       autoProvisionSummary: {
@@ -306,10 +358,127 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(protectionStateAdvice(claim).castleWallLabel).not.toContain("Castle Wall Full");
   });
 
+  it("degraded exclusive bring-up cannot create a coarse-only claim before probing", async () => {
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: undefined,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: {
+          kind: "exclusive-egress-unarmed-coarse-active",
+          uid: 503,
+          stage: "bring-up",
+          reason: "generation bring-up failed",
+          coarseCompositionRestored: true,
+          harnessStartedCoarse: true,
+          cleanupErrors: ["cleanup marker failed"],
+        },
+      },
+      castleWallDaemonLivenessSince: currentWrapSince(),
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => coarseFleetStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.basis).toBe("provider_unavailable");
+    expect(claim.reasons).toContain("no audit log was available to observe enforcement");
+    expect(claim.reasons).toContain("generation bring-up failed");
+    expect(claim.reasons).toContain("cleanup marker failed");
+  });
+
+  it("degraded exclusive bring-up preserves the daemon-liveness no-probe reason", async () => {
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: {
+          kind: "exclusive-egress-unarmed-coarse-active",
+          uid: 503,
+          stage: "bring-up",
+          reason: "generation bring-up failed",
+          coarseCompositionRestored: true,
+          harnessStartedCoarse: true,
+          cleanupErrors: [],
+        },
+      },
+      castleWallDaemonLivenessSince: currentWrapSince(),
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => coarseFleetStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.reasons).toContain(
+      "Castle Wall daemon liveness was not observed during this wrap",
+    );
+    expect(claim.reasons).toContain("generation bring-up failed");
+  });
+
+  it("degraded exclusive bring-up cannot upgrade a fresh not-enforcing probe", async () => {
+    const livenessSince = currentWrapSince();
+    await appendDaemonStart(31_000);
+    await appendDaemonHeartbeat(30_000);
+    await appendCW("filter_crashed", 10_000);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: {
+          kind: "exclusive-egress-unarmed-coarse-active",
+          uid: 503,
+          stage: "bring-up",
+          reason: "generation bring-up failed",
+          coarseCompositionRestored: true,
+          harnessStartedCoarse: true,
+          cleanupErrors: [],
+        },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => coarseFleetStatus(),
+    });
+
+    expect(claim.state).toBe("unprotected");
+    expect(claim.basis).toBe("not_enforcing_observed");
+    expect(protectionStateAdvice(claim).castleWallLabel).toContain("NOT ARMED");
+  });
+
+  it("degraded exclusive bring-up cannot claim coarse-only when coarse fallback was not restored", async () => {
+    const livenessSince = currentWrapSince();
+    await appendCW("egress_allowed", 60_000);
+    await appendDaemonStart(31_000);
+    await appendDaemonHeartbeat(30_000);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: {
+          kind: "exclusive-egress-unarmed-coarse-active",
+          uid: 503,
+          stage: "bring-up",
+          reason: "coarse restore failed",
+          coarseCompositionRestored: false,
+          harnessStartedCoarse: false,
+          cleanupErrors: [],
+        },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => coarseFleetStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.basis).toBe("provision_outcome_not_observation");
+    expect(claim.reasons).toContain("coarse restore failed");
+  });
+
   it("composed override: observed-off and repark-failed demote a green probe", async () => {
     const livenessSince = currentWrapSince();
     await appendCW("egress_allowed", 60_000);
-    await appendCW("castle_wall_heartbeat", 30_000);
+    await appendDaemonStart(31_000);
+    await appendDaemonHeartbeat(30_000);
     const observedOff = await resolveWrapProtectionClaim({
       auditLog: log,
       autoProvisionSummary: {

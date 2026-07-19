@@ -132,16 +132,24 @@ function extractProtectionStateAdvicePhrases(sourceText: string): {
   const visit = (node: ts.Node): void => {
     if (
       ts.isReturnStatement(node) &&
-      node.expression !== undefined &&
-      ts.isObjectLiteralExpression(node.expression)
+      node.expression !== undefined
     ) {
+      if (!ts.isObjectLiteralExpression(node.expression)) {
+        unresolved.push(node.expression.getText(source));
+        ts.forEachChild(node, visit);
+        return;
+      }
       for (const property of node.expression.properties) {
-        if (!ts.isPropertyAssignment(property)) continue;
+        if (!ts.isPropertyAssignment(property)) {
+          unresolved.push(property.getText(source));
+          continue;
+        }
         const propertyName = propertyNameText(property.name);
-        if (
-          propertyName === undefined ||
-          !advicePhraseProperties.has(propertyName)
-        ) {
+        if (propertyName === undefined) {
+          unresolved.push(property.name.getText(source));
+          continue;
+        }
+        if (!advicePhraseProperties.has(propertyName)) {
           continue;
         }
         const phrase = resolveAdvicePhraseExpression(
@@ -302,5 +310,75 @@ describe("protection-state claim chokepoint", () => {
       "Castle Wall Fortified",
       "Your agent is fully protected and sealed.",
     ]);
+  });
+
+  it("fails closed when advice phrase extraction cannot model the return shape", () => {
+    const injectedBranches = [
+      `  if (claim.basis === "synthetic_spread") {
+    return {
+      green: true,
+      ...{
+        operatorSentence: "Your agent is fully protected and sealed.",
+        castleWallLabel: "Castle Wall Fortified",
+        imperative: null,
+      },
+    };
+  }
+`,
+      `  if (claim.basis === "synthetic_variable") {
+    const advice = {
+      green: true,
+      operatorSentence: "Your agent is fully protected and sealed.",
+      castleWallLabel: "Castle Wall Fortified",
+      imperative: null,
+    };
+    return advice;
+  }
+`,
+      `  if (claim.basis === "synthetic_ternary") {
+    return claim.state === "exclusive"
+      ? {
+          green: true,
+          operatorSentence: "Your agent is fully protected and sealed.",
+          castleWallLabel: "Castle Wall Fortified",
+          imperative: null,
+        }
+      : {
+          green: false,
+          operatorSentence: "Protection not confirmed.",
+          castleWallLabel: "Castle Wall status unknown (not confirmed armed)",
+          imperative: null,
+        };
+  }
+`,
+      `  if (claim.basis === "synthetic_computed") {
+    return {
+      green: true,
+      ["operatorSentence"]: "Your agent is fully protected and sealed.",
+      castleWallLabel: "Castle Wall Fortified",
+      imperative: null,
+    };
+  }
+`,
+      `  if (claim.basis === "synthetic_shorthand") {
+    const operatorSentence = "Your agent is fully protected and sealed.";
+    return {
+      green: true,
+      operatorSentence,
+      castleWallLabel: "Castle Wall Fortified",
+      imperative: null,
+    };
+  }
+`,
+    ];
+
+    for (const branch of injectedBranches) {
+      const injected = CHOKEPOINT_SOURCE_TEXT.replace(
+        "  switch (claim.state) {",
+        `${branch}  switch (claim.state) {`,
+      );
+      expect(injected).not.toEqual(CHOKEPOINT_SOURCE_TEXT);
+      expect(extractProtectionStateAdvicePhrases(injected).unresolved).not.toEqual([]);
+    }
   });
 });
