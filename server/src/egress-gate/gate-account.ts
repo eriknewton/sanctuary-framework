@@ -40,7 +40,9 @@
 import {
   describeServiceAccountRecord,
   planAccountCreate,
+  rollbackCreatedServiceAccount,
   SAFE_SERVICE_ACCOUNT_RE,
+  serviceAccountRepairGuidance,
   serviceAccountRecordProblems,
   type AccountProvisionOptions,
   type AccountProvisionOps,
@@ -156,55 +158,12 @@ export class GateAccountVerificationError extends Error {
 async function rollbackIncompleteGateAccount(
   ops: GateAccountProvisionOps,
   accountName: string,
-  input: { readonly thisRunMayHaveCreatedIt: boolean },
+  input: { readonly plannedUid: number | undefined },
 ): Promise<string> {
-  if (!input.thisRunMayHaveCreatedIt) {
+  if (input.plannedUid === undefined) {
     return "rollback NOT attempted: account record existed before this run; leaving it for inspection";
   }
-  let before: GateAccountRecord | undefined;
-  let beforeText: string;
-  let beforeWasRead = false;
-  try {
-    before = await ops.lookupAccountRecord(accountName);
-    beforeWasRead = true;
-    beforeText = describeServiceAccountRecord(before);
-  } catch (err) {
-    beforeText =
-      `pre-delete read failed (${err instanceof Error ? err.message : String(err)}); ` +
-      "attempting bounded deletion because this run may have created the record";
-  }
-  if (beforeWasRead && before === undefined) {
-    return "rollback not needed: account record was already absent";
-  }
-  try {
-    await ops.deleteCreatedUser(accountName);
-  } catch (err) {
-    let afterText: string;
-    try {
-      afterText = describeServiceAccountRecord(await ops.lookupAccountRecord(accountName));
-    } catch (readErr) {
-      afterText = `post-delete read failed (${readErr instanceof Error ? readErr.message : String(readErr)})`;
-    }
-    return (
-      `rollback deletion failed after observing ${beforeText} ` +
-      `(${err instanceof Error ? err.message : String(err)}); ${afterText}`
-    );
-  }
-  let after: GateAccountRecord | undefined;
-  try {
-    after = await ops.lookupAccountRecord(accountName);
-  } catch (err) {
-    return (
-      `rollback deletion command returned, but absence was NOT observed: ` +
-      `post-delete read failed (${err instanceof Error ? err.message : String(err)})`
-    );
-  }
-  if (after === undefined) {
-    return beforeWasRead
-      ? `rollback observed: ${accountName} account record is absent`
-      : `rollback observed: ${accountName} account record is absent after ${beforeText}`;
-  }
-  return `rollback NOT observed: ${describeServiceAccountRecord(after)} still exists`;
+  return (await rollbackCreatedServiceAccount(ops, accountName, input.plannedUid)).message;
 }
 
 /**
@@ -269,11 +228,12 @@ export async function planAndCreateGateAccount(
       };
     }
     const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
-      thisRunMayHaveCreatedIt: false,
+      plannedUid: undefined,
     });
     throw new GateAccountVerificationError(
       `Existing gate account "${provisionOptions.accountName}" is incomplete (${problems.join("; ")}). ` +
-        `${rollback}. Refusing to proceed with a partial gate account.`,
+        `${rollback}. Refusing to proceed with a partial gate account. ` +
+        serviceAccountRepairGuidance(provisionOptions.accountName, expected),
     );
   }
 
@@ -284,13 +244,15 @@ export async function planAndCreateGateAccount(
       provisionOptions.comment,
       provisionOptions.homeDirectory,
     );
+    await ops.hardenCreatedUser(plan.accountName);
   } catch (err) {
     const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
-      thisRunMayHaveCreatedIt: true,
+      plannedUid: plan.uid,
     });
     throw new GateAccountVerificationError(
       `Creating gate account "${provisionOptions.accountName}" failed ` +
-        `(${err instanceof Error ? err.message : String(err)}). ${rollback}.`,
+        `(${err instanceof Error ? err.message : String(err)}). ${rollback}. ` +
+        serviceAccountRepairGuidance(provisionOptions.accountName, expected),
       { cause: err },
     );
   }
@@ -300,22 +262,24 @@ export async function planAndCreateGateAccount(
     observed = await ops.lookupAccountRecord(provisionOptions.accountName);
   } catch (err) {
     const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
-      thisRunMayHaveCreatedIt: true,
+      plannedUid: plan.uid,
     });
     throw new GateAccountVerificationError(
       `Gate account "${provisionOptions.accountName}" create returned, but the post-create record could not be read ` +
-        `(${err instanceof Error ? err.message : String(err)}). ${rollback}.`,
+        `(${err instanceof Error ? err.message : String(err)}). ${rollback}. ` +
+        serviceAccountRepairGuidance(provisionOptions.accountName, expected),
       { cause: err },
     );
   }
   const problems = await serviceAccountRecordProblems(observed, expected, ops);
   if (problems.length > 0) {
     const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
-      thisRunMayHaveCreatedIt: true,
+      plannedUid: plan.uid,
     });
     throw new GateAccountVerificationError(
       `Gate account "${provisionOptions.accountName}" create did not verify (${problems.join("; ")}). ` +
-        `Observed ${describeServiceAccountRecord(observed)}. ${rollback}.`,
+        `Observed ${describeServiceAccountRecord(observed)}. ${rollback}. ` +
+        serviceAccountRepairGuidance(provisionOptions.accountName, expected),
     );
   }
   return {

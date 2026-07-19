@@ -77,6 +77,7 @@ import {
   buildAgentEgressReport,
   asUidTlsProbeArgv,
   asUidProbeReachableDecision,
+  parseServiceAccountIsHidden,
   type AgentEgressVerifyReport,
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
@@ -1832,7 +1833,8 @@ async function readRunningHermesGatewayUid(): Promise<number | undefined> {
  *   - the account NAME at this uid is exactly `expectedAccountName`
  *     (`sanctuary-<agentId>`), read via `dscl . -search /Users UniqueID` so
  *     the name<->uid binding comes from the directory service, not assumed;
- *   - `IsHidden` is `1`;
+ *   - `IsHidden` is truthy (`1`, `YES`, or `TRUE`; macOS uses `YES` on
+ *     some of its own hidden accounts);
  *   - the login shell is `/usr/bin/false` (no-login shape).
  * Any dscl failure, any missing field, or any mismatch resolves
  * `"indeterminate"`/`"not-dedicated"` -- fail-closed, never `"verified-dedicated"`
@@ -1866,7 +1868,8 @@ async function resolveAccountShapeVerdict(
       `/Users/${expectedAccountName}`,
       "IsHidden",
     ]);
-    if (!/IsHidden:\s*1/.test(hiddenOut)) {
+    const hiddenValue = /IsHidden:\s*(\S+)/.exec(hiddenOut)?.[1];
+    if (parseServiceAccountIsHidden(hiddenValue) !== true) {
       return "not-dedicated";
     }
     const { stdout: shellOut } = await execFileAsync("/usr/bin/dscl", [
@@ -1896,6 +1899,31 @@ async function confirmOnTty(promptText: string): Promise<boolean> {
   }
 }
 
+export async function canonicalizeHomeDirectory(
+  rawPath: string,
+  realpathFn: (path: string) => Promise<string> = realpath,
+): Promise<string> {
+  const normalized = normalizePath(rawPath);
+  const trimmed = normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
+  const pendingSegments: string[] = [];
+  let cursor = trimmed;
+  while (true) {
+    try {
+      const resolvedPrefix = await realpathFn(cursor);
+      const combined = pendingSegments.length === 0 ? resolvedPrefix : join(resolvedPrefix, ...pendingSegments);
+      const normalizedCombined = normalizePath(combined);
+      return normalizedCombined === "/" ? normalizedCombined : normalizedCombined.replace(/\/+$/, "");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      const parent = dirname(cursor);
+      if (parent === cursor) throw err;
+      pendingSegments.unshift(basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
 function realAccountProvisionOps() {
   const dsclErrorText = (err: unknown): string => {
     const e = err as { stdout?: unknown; stderr?: unknown; message?: unknown };
@@ -1916,27 +1944,6 @@ function realAccountProvisionOps() {
     } catch (err) {
       if (dsclReadLooksAbsent(err)) return undefined;
       throw err;
-    }
-  };
-  const canonicalizeHomeDirectory = async (rawPath: string): Promise<string> => {
-    const normalized = normalizePath(rawPath);
-    const trimmed = normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
-    const pendingSegments: string[] = [];
-    let cursor = trimmed;
-    while (true) {
-      try {
-        const resolvedPrefix = await realpath(cursor);
-        const combined = pendingSegments.length === 0 ? resolvedPrefix : join(resolvedPrefix, ...pendingSegments);
-        const normalizedCombined = normalizePath(combined);
-        return normalizedCombined === "/" ? normalizedCombined : normalizedCombined.replace(/\/+$/, "");
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
-        const parent = dirname(cursor);
-        if (parent === cursor) throw err;
-        pendingSegments.unshift(basename(cursor));
-        cursor = parent;
-      }
     }
   };
   return {
@@ -1971,10 +1978,11 @@ function realAccountProvisionOps() {
       const homeDirectory = await readAttribute(accountName, "NFSHomeDirectory");
       const hiddenText = await readAttribute(accountName, "IsHidden");
       const userShell = await readAttribute(accountName, "UserShell");
+      const parsedHidden = parseServiceAccountIsHidden(hiddenText);
       return {
         uid,
         ...(homeDirectory !== undefined ? { homeDirectory } : {}),
-        ...(hiddenText !== undefined ? { isHidden: hiddenText === "1" } : {}),
+        ...(parsedHidden !== undefined ? { isHidden: parsedHidden } : {}),
         ...(userShell !== undefined ? { userShell } : {}),
       };
     },
@@ -2009,9 +2017,8 @@ function realAccountProvisionOps() {
       // for NFSHomeDirectory. A redundant post-create `dscl -create
       // NFSHomeDirectory` remains only a plausible, unproven D4 suspect; a
       // hardware capture showing sysadminctl's read-back plus the redundant
-      // write failure would confirm it. The shared account path now verifies
-      // the record through `lookupAccountRecord` instead of deriving success
-      // from this call returning.
+      // write failure would confirm it. Post-create hardening now runs through
+      // `hardenCreatedUser`, inside the observed rollback envelope.
       await execFileAsync("/usr/sbin/sysadminctl", [
         "-addUser",
         accountName,
@@ -2023,6 +2030,8 @@ function realAccountProvisionOps() {
         homeDirectory,
         ...(comment ? ["-fullName", comment] : []),
       ]);
+    },
+    hardenCreatedUser: async (accountName: string): Promise<void> => {
       await execFileAsync("/usr/bin/dscl", [".", "-create", `/Users/${accountName}`, "IsHidden", "1"]);
     },
   };

@@ -2051,6 +2051,8 @@ export type BootAgentResolution =
       agentAccount: string;
       harnessArgv: string[];
       harnessLogDir: string;
+      gateAccount: string;
+      gateHomeDirectory: string;
       gateUid: number;
     }
   | { kind: "unresolvable"; reason: string };
@@ -2100,6 +2102,12 @@ export interface ExclusiveEgressBootSupervisorInternals {
   gateWaitIntervalMs?: number;
   loadMarker?: (fortressPath: string) => Promise<{ agent_uid: number; gate_uid: number } | null>;
   ensureRuntimeFs?: (input: { agentUid: number; gateUid: number }) => Promise<void>;
+  ensureGateHomeLayout?: (input: {
+    agentUid: number;
+    gateAccount: string;
+    gateUid: number;
+    gateHomeDirectory: string;
+  }) => Promise<{ logDir: string }>;
 }
 
 /**
@@ -2242,6 +2250,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
     (async (fortressPath: string): Promise<{ agent_uid: number; gate_uid: number } | null> =>
       loadExclusiveRoutingMarker(fortressPath));
   const ensureRuntimeFs = internals.ensureRuntimeFs ?? ensureExclusiveEgressRuntimeFs;
+  const ensureGateHomeLayout = internals.ensureGateHomeLayout ?? ensureGateAccountHomeLayout;
 
   let listing: BootRegistryListing;
   try {
@@ -2419,6 +2428,18 @@ export async function startExclusiveEgressBootSupervisor(input: {
           await ensureRuntimeFs({ agentUid, gateUid: ctx.gateUid });
         } catch (err) {
           input.print(`[castle-wall] boot: uid ${agentUid} runtime-fs assert failed: ${(err as Error).message}`);
+        }
+        try {
+          await ensureGateHomeLayout({
+            agentUid,
+            gateAccount: ctx.gateAccount,
+            gateUid: ctx.gateUid,
+            gateHomeDirectory: ctx.gateHomeDirectory,
+          });
+        } catch (err) {
+          input.print(
+            `[castle-wall] boot: uid ${agentUid} gate account home layout assert failed: ${(err as Error).message}`,
+          );
         }
         // Fix-round H2: START the gate daemon (RunAtLoad=false by contract;
         // nothing else starts it after a reboot), then let the barrier verify

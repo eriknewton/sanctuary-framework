@@ -59,6 +59,9 @@ export interface DiffTransientPfRulesOptions {
   anchorName?: string;
 }
 
+const PF_ANCHOR_DIRECTIVE_RE = /^(scrub-anchor|nat-anchor|rdr-anchor|dummynet-anchor|anchor)\s+"([^"]+)"(?:\s|$)/;
+const PF_STRIPPED_ANCHOR_DIRECTIVE_RE = /^(scrub-anchor|nat-anchor|rdr-anchor|dummynet-anchor|anchor)\s+"\/\*"(.*)$/;
+
 /** Normalize one printed pf rule line for set comparison. */
 function normalizeRuleLine(line: string): string {
   return line.trim().replace(/\s+/g, " ");
@@ -69,7 +72,7 @@ function anchorNamesFromBaseConfig(baseConf: string): ReadonlyMap<string, readon
   for (const rawLine of baseConf.split("\n")) {
     const line = normalizeRuleLine(rawLine);
     if (line.length === 0 || line.startsWith("#")) continue;
-    const match = /^(scrub-anchor|anchor)\s+"([^"]+)"(?:\s|$)/.exec(line);
+    const match = PF_ANCHOR_DIRECTIVE_RE.exec(line);
     if (match === null) continue;
     const directive = match[1]!;
     const name = match[2]!;
@@ -84,9 +87,9 @@ function normalizeExpectedRuleLine(
   line: string,
   baseAnchorNames: ReadonlyMap<string, readonly string[]>,
   positions: Map<string, number>,
-): string {
+): string | undefined {
   const normalized = normalizeRuleLine(line);
-  const strippedAnchor = /^(scrub-anchor|anchor)\s+"\/\*"(.*)$/.exec(normalized);
+  const strippedAnchor = PF_STRIPPED_ANCHOR_DIRECTIVE_RE.exec(normalized);
   if (strippedAnchor === null) return normalized;
   const directive = strippedAnchor[1]!;
   const suffix = strippedAnchor[2]!;
@@ -94,7 +97,7 @@ function normalizeExpectedRuleLine(
   const position = positions.get(directive) ?? 0;
   positions.set(directive, position + 1);
   const name = names[position];
-  if (name === undefined) return normalized;
+  if (name === undefined) return undefined;
   return `${directive} "${name}"${suffix}`;
 }
 
@@ -108,7 +111,7 @@ function expectedRuleLines(output: string, baseAnchorNames: ReadonlyMap<string, 
   return output
     .split("\n")
     .map((line) => normalizeExpectedRuleLine(line.replace(/^@\d+\s+/, ""), baseAnchorNames, positions))
-    .filter((line) => line.length > 0);
+    .filter((line): line is string => line !== undefined && line.length > 0);
 }
 
 function runningRuleLines(output: string): string[] {

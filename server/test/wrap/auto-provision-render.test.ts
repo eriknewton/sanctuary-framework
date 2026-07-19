@@ -186,7 +186,7 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     });
     expect(out).toHaveLength(1);
     expect(out[0]).toMatch(/^ {2}Note:/);
-    expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
+    expect(out[0]).toMatch(/No files were moved before this stop/);
     expect(out[0]).not.toMatch(/restore of your re-homed files FAILED/);
     expect(out[0]).not.toMatch(/WARNING/);
   });
@@ -218,12 +218,13 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/The dedicated account was created but no files were moved/);
   });
 
-  it("FIX R4-2: a pre-create neutral abort (accountCreated falsy) DOES say 'No dedicated account was created'", () => {
+  it("B1 round 2: a neutral abort with no observed account status does NOT claim no account was created", () => {
     const out = lines({
       ran: true,
       outcome: { kind: "aborted", stage: "root-check", reason: "requires root", rolledBack: false, rehomeAttempted: false },
     });
-    expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
+    expect(out[0]).toMatch(/No files were moved before this stop/);
+    expect(out[0]).not.toMatch(/No dedicated account was created/);
   });
 
   it("FIX R5-2: a restore CONFLICT (conflictPaths set) renders a data-safe Note, surfaces the conflict path, and NEVER says 'restore FAILED' or overwrite-from-backup", () => {

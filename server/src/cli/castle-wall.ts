@@ -2120,6 +2120,7 @@ export async function runSafeModeDaemon(
     const { startExclusiveEgressBootSupervisor, NON_HERMES_BOOT_PARK_REASON } = await import(
       "../egress-gate/arming-wiring.js"
     );
+    const { deriveGateAccountName } = await import("../egress-gate/index.js");
     const { loadExclusiveRoutingMarker } = await import("../castle-wall/allowlist/routing-marker.js");
     const { deriveAgentAccountName, resolveHermesGatewayArgv } = await import(
       "../castle-wall/provision/index.js"
@@ -2142,6 +2143,8 @@ export async function runSafeModeDaemon(
         }
         const accountName = deriveAgentAccountName(marker.agent_id);
         const agentHome = `/var/sanctuary-agents/${accountName}`;
+        const gateAccount = deriveGateAccountName(marker.agent_id);
+        const gateHomeDirectory = `/var/sanctuary-agents/${gateAccount}`;
         const { access } = await import("node:fs/promises");
         const pathExists = async (p: string): Promise<boolean> => {
           try {
@@ -2157,6 +2160,8 @@ export async function runSafeModeDaemon(
           agentAccount: accountName,
           harnessArgv: resolved.programArguments,
           harnessLogDir: `${agentHome}/logs`,
+          gateAccount,
+          gateHomeDirectory,
           gateUid: marker.gate_uid,
         };
       },

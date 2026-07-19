@@ -81,7 +81,7 @@ export interface DetectProvisionNeedInput {
    * FIX F6: the account-name/shape verdict for whichever uid was resolved
    * (harness-config or running-process), supplied by the caller's directory-
    * service probe (e.g. does the account at this uid have the name
-   * `sanctuary-<agentId>`, `IsHidden=1`, a no-login shell, and no admin
+   * `sanctuary-<agentId>`, a truthy hidden flag, a no-login shell, and no admin
    * group membership?). Only called by the caller when a uid was actually
    * resolved AND that uid clears the ceiling/console-owner test; leave
    * `undefined` (or omit) to get the fail-closed `"indeterminate"` default,

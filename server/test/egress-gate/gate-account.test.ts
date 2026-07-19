@@ -33,16 +33,19 @@ function gateOps(input: {
   create?: (name: string, uid: number, home: string) => GateAccountRecord | Promise<GateAccountRecord>;
 } = {}): GateAccountProvisionOps & {
   created: Array<{ name: string; uid: number; home: string }>;
+  hardened: string[];
   deleted: string[];
   record: GateAccountRecord | undefined;
 } {
   const state = {
     record: input.existing,
     created: [] as Array<{ name: string; uid: number; home: string }>,
+    hardened: [] as string[],
     deleted: [] as string[],
   };
   return {
     created: state.created,
+    hardened: state.hardened,
     deleted: state.deleted,
     get record() {
       return state.record;
@@ -53,7 +56,14 @@ function gateOps(input: {
     highestAssignedUid: async () => input.highest ?? 504,
     createUser: async (name, uid, _comment, home) => {
       state.created.push({ name, uid, home });
-      state.record = input.create !== undefined ? await input.create(name, uid, home) : completeGateRecord(uid, home);
+      state.record =
+        input.create !== undefined
+          ? await input.create(name, uid, home)
+          : { uid, homeDirectory: home, userShell: "/usr/bin/false" };
+    },
+    hardenCreatedUser: async (name) => {
+      state.hardened.push(name);
+      if (state.record !== undefined) state.record = { ...state.record, isHidden: true };
     },
     deleteCreatedUser: async (name) => {
       state.deleted.push(name);
@@ -130,6 +140,7 @@ describe("egress-gate/gate-account", () => {
     expect(ops.created).toEqual([
       { name: "sanctuary-gate-hermes", uid: 505, home: "/var/sanctuary-gate/hermes" },
     ]);
+    expect(ops.hardened).toEqual(["sanctuary-gate-hermes"]);
   });
 
   it("ALWAYS refuses a skip whose existing uid collides with the agent uid, even with NO excludeUids (Codex round-3)", () => {
@@ -194,6 +205,7 @@ describe("egress-gate/gate-account", () => {
     expect(result.plan.action).toBe("skip");
     expect(result.uid).toBe(511);
     expect(ops.created).toEqual([]);
+    expect(ops.hardened).toEqual([]);
   });
 
   it("rolls back a fresh gate account when create returns but the home attribute is missing (D4 partial account)", async () => {
@@ -209,6 +221,54 @@ describe("egress-gate/gate-account", () => {
     ]);
     expect(ops.deleted).toEqual(["sanctuary-gate-hermes"]);
     expect(ops.record).toBeUndefined();
+  });
+
+  it("B2: rolls back a fresh gate account when post-create hardening fails", async () => {
+    const ops = gateOps({
+      create: (_name, uid, home) => ({ uid, homeDirectory: home, userShell: "/usr/bin/false" }),
+    });
+    await expect(
+      planAndCreateGateAccount(
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-gate/hermes" },
+        {
+          ...ops,
+          hardenCreatedUser: async () => {
+            throw new Error("dscl IsHidden write failed");
+          },
+        },
+      ),
+    ).rejects.toThrow(/dscl IsHidden write failed.*rollback observed/s);
+    expect(ops.deleted).toEqual(["sanctuary-gate-hermes"]);
+    expect(ops.record).toBeUndefined();
+  });
+
+  it("H1: does NOT delete a concurrent gate account whose observed uid differs from this run's planned uid", async () => {
+    let lookupCalls = 0;
+    const deleted: string[] = [];
+    const ops: GateAccountProvisionOps = {
+      lookupAccountUid: async () => undefined,
+      canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+      highestAssignedUid: async () => 504,
+      lookupAccountRecord: async () => {
+        lookupCalls += 1;
+        if (lookupCalls === 1) return undefined;
+        return completeGateRecord(777);
+      },
+      createUser: async () => {
+        throw new Error("user already exists");
+      },
+      hardenCreatedUser: async () => undefined,
+      deleteCreatedUser: async (name) => {
+        deleted.push(name);
+      },
+    };
+    await expect(
+      planAndCreateGateAccount(
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-gate/hermes" },
+        ops,
+      ),
+    ).rejects.toThrow(/rollback NOT attempted.*uid 777 does not match this run's planned uid 505/s);
+    expect(deleted).toEqual([]);
   });
 
   it("B1/M2: refuses an existing same-name partial gate account without deleting it", async () => {
@@ -265,7 +325,7 @@ describe("egress-gate/gate-account", () => {
     expect(ops.record).toBeUndefined();
   });
 
-  it("H4: still attempts bounded deletion when a fresh-create rollback pre-read fails", async () => {
+  it("H1: does NOT delete when rollback cannot observe the record before deletion", async () => {
     let record: GateAccountRecord | undefined;
     let lookupCalls = 0;
     const deleted: string[] = [];
@@ -283,6 +343,7 @@ describe("egress-gate/gate-account", () => {
         record = completeGateRecord(uid, home);
         throw new Error("sysadminctl failed after create");
       },
+      hardenCreatedUser: async () => undefined,
       deleteCreatedUser: async (name) => {
         deleted.push(name);
         record = undefined;
@@ -293,7 +354,7 @@ describe("egress-gate/gate-account", () => {
         { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-gate/hermes" },
         ops,
       ),
-    ).rejects.toThrow(/rollback observed.*pre-delete read failed/s);
-    expect(deleted).toEqual(["sanctuary-gate-hermes"]);
+    ).rejects.toThrow(/rollback NOT attempted: pre-delete read failed/s);
+    expect(deleted).toEqual([]);
   });
 });

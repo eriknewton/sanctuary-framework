@@ -1383,16 +1383,17 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
   // restore. Render a neutral "nothing was changed; safe to re-run" line --
   // never the "restore of your re-homed files FAILED / do not re-run" alarm
   // the `rolledBack === false` branch below would otherwise print. This is the
-  // common no-sudo first attempt (stage "root-check").
+  // common no-sudo first attempt (stage "root-check"). Account existence is
+  // deliberately NOT inferred here; create-account failures carry their own
+  // observed rollback/repair text in `reason`.
   if (outcome.rehomeAttempted === false) {
     // FIX (round 5 / R4-2): key the account clause on `accountCreated`, not on
     // `rehomeAttempted` (which only tracks whether a MOVE happened). At the
     // rehome stage create-account has already succeeded, so an orphaned hidden
-    // account exists even though nothing moved -- claiming "no account was
-    // created" there would be a false all-clear.
+    // account exists even though nothing moved.
     const accountClause = outcome.accountCreated
       ? `The dedicated account was created but no files were moved (it will be reused on the next run).`
-      : `No dedicated account was created and nothing was moved.`;
+      : `No files were moved before this stop.`;
     return [
       `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
         `${accountClause} The cooperative wrap above still applies. ` +

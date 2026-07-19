@@ -76,6 +76,7 @@ function baseInternals(overrides: ExclusiveEgressBootSupervisorInternals = {}): 
     gateWaitIntervalMs: 1,
     loadMarker: async () => null,
     ensureRuntimeFs: async () => undefined,
+    ensureGateHomeLayout: async () => ({ logDir: "/var/sanctuary-agents/sanctuary-gate-hermes/logs" }),
     ...overrides,
   };
 }
@@ -85,6 +86,8 @@ const OK_CTX: BootAgentResolution = {
   agentAccount: "sanctuary-hermes",
   harnessArgv: ["/usr/local/bin/hermes"],
   harnessLogDir: "/var/sanctuary-agents/sanctuary-hermes/logs",
+  gateAccount: "sanctuary-gate-hermes",
+  gateHomeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
   gateUid: 511,
 };
 
@@ -180,6 +183,13 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
           events.push(`launchctl ${args.join(" ")}`);
           return { code: 0, stdout: "", stderr: "" };
         },
+        ensureRuntimeFs: async () => {
+          events.push("ensureRuntimeFs");
+        },
+        ensureGateHomeLayout: async (input) => {
+          events.push(`ensureGateHomeLayout ${input.gateAccount} ${input.gateUid} ${input.gateHomeDirectory}`);
+          return { logDir: `${input.gateHomeDirectory}/logs` };
+        },
         readRuntimeState: async () => {
           events.push("readRuntimeState");
           return JSON.stringify({ agent_uid: 502, gate_port: 40001, generation_id: 7, pid: 991, pid_start: "991-1000" });
@@ -195,13 +205,58 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     const bootstrapIdx = events.indexOf(
       "launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate.502.plist",
     );
+    const runtimeFsIdx = events.indexOf("ensureRuntimeFs");
+    const homeLayoutIdx = events.indexOf(
+      "ensureGateHomeLayout sanctuary-gate-hermes 511 /var/sanctuary-agents/sanctuary-gate-hermes",
+    );
     const kickIdx = events.indexOf("launchctl kickstart system/ai.sanctuaryprotocol.egress-gate.502");
     const readIdx = events.indexOf("readRuntimeState");
     const barrierIdx = events.indexOf("barrier");
+    expect(runtimeFsIdx).toBeGreaterThanOrEqual(0);
+    expect(homeLayoutIdx).toBeGreaterThan(runtimeFsIdx);
     expect(bootstrapIdx).toBeGreaterThanOrEqual(0);
+    expect(bootstrapIdx).toBeGreaterThan(homeLayoutIdx);
     expect(kickIdx).toBeGreaterThan(bootstrapIdx);
     expect(readIdx).toBeGreaterThan(kickIdx);
     expect(barrierIdx).toBeGreaterThan(readIdx);
+  });
+
+  it("a boot gate-home layout failure logs LOUDLY and still lets the barrier park fail-closed", async () => {
+    const printed: string[] = [];
+    let barrierRan = false;
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        ensureGateHomeLayout: async () => {
+          throw new Error("stale log owner uid=505 expected uid=511");
+        },
+        runBarrier: async () => {
+          barrierRan = true;
+          return {
+            kind: "parked",
+            stage: "gate-verify",
+            reason: "gate daemon log layout did not verify",
+            holdFileRemoved: true,
+            jobDisabled: true,
+            cleanupErrors: [],
+            parkedClaim: await assessHarnessParked({
+              probe: {
+                harnessStatus: async () => ({ known: true, installed: true, running: false }),
+                sleepMs: async () => undefined,
+              },
+            }),
+          };
+        },
+      }),
+    });
+    handle.stopOracleLoop();
+    expect(printed.join("\n")).toContain("gate account home layout assert failed");
+    expect(printed.join("\n")).toContain("stale log owner");
+    expect(barrierRan).toBe(true);
+    expect(handle.results[0]!.outcome.kind).toBe("parked");
   });
 
   it("a gate bootstrap failure logs LOUDLY and still runs the barrier (which parks fail-closed)", async () => {

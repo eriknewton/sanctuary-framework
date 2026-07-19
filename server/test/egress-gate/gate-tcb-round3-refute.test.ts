@@ -164,6 +164,7 @@ describe("round-3 fix (2) refute: gate uid can never collide with the agent uid"
         created = true;
         return Promise.resolve();
       },
+      hardenCreatedUser: () => Promise.resolve(),
       deleteCreatedUser: () => Promise.resolve(),
     };
     await expect(

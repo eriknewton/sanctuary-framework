@@ -1235,7 +1235,7 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     file: `${EG}/gate-account.ts`,
     symbol: "planAndCreateGateAccount",
     claim:
-      "the gate account directory-service record carries the expected uid, canonically matching NFSHomeDirectory, IsHidden=1, and UserShell=/usr/bin/false",
+      "the gate account directory-service record carries the expected uid, canonically matching NFSHomeDirectory, hidden-account truth, and UserShell=/usr/bin/false",
     basis: "observed",
     detectorBlind: true,
     layer: "compute",
@@ -1270,7 +1270,7 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     file: `${CW}/account.ts`,
     symbol: "executeAccountProvisionPlan",
     claim:
-      "the service account directory-service record carries the expected uid, canonically matching NFSHomeDirectory, IsHidden=1, and UserShell=/usr/bin/false",
+      "the service account directory-service record carries the expected uid, canonically matching NFSHomeDirectory, hidden-account truth, and UserShell=/usr/bin/false",
     basis: "observed",
     layer: "compute",
     branches: "single",

@@ -1,4 +1,4 @@
-import { normalize as normalizePath } from "node:path";
+import { isAbsolute, normalize as normalizePath } from "node:path";
 
 /**
  * Auto-provision Step 2 (Build 1): dedicated agent service-account plumbing.
@@ -96,14 +96,26 @@ export interface AccountProvisionOps {
   /** Return the highest uid currently assigned to any local account. */
   highestAssignedUid(): Promise<number>;
   /**
-   * Create the hidden, no-login service account with the given uid. Must
-   * set `IsHidden=1`, `UserShell=/usr/bin/false`, no admin group membership,
-   * and no interactive password (service-account shape), AND (fix F7) set
-   * `NFSHomeDirectory` to `homeDirectory` so the account's directory-service
-   * home matches the re-home target. Production backing is
-   * `sysadminctl -addUser` + `dscl`; drill-only, never invoked by tests.
+   * Create the no-login service account with the given uid. Must set
+   * `UserShell=/usr/bin/false`, no admin group membership, no interactive
+   * password, AND (fix F7) set `NFSHomeDirectory` to `homeDirectory` so the
+   * account's directory-service home matches the re-home target. Production
+   * backing is `sysadminctl -addUser`; drill-only, never invoked by tests.
    */
   createUser(accountName: string, uid: number, comment: string | undefined, homeDirectory: string): Promise<void>;
+  /**
+   * Apply post-create service-account hardening that `sysadminctl` cannot
+   * express directly, currently `IsHidden=1`. This is separate from
+   * {@link createUser} so a failed post-create `dscl` write is inside the
+   * observed rollback envelope, not an untracked partial mutation.
+   */
+  hardenCreatedUser(accountName: string): Promise<void>;
+  /**
+   * Bounded rollback of a service account this create path has just observed
+   * at the planned uid. Production must keep the home (`-keepHome`) so rollback
+   * never destroys operator-inspectable material.
+   */
+  deleteCreatedUser(accountName: string): Promise<void>;
 }
 
 /** A planned account-provision step. Pure. */
@@ -138,10 +150,35 @@ export class AccountProvisionVerificationError extends Error {
 export const EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN = true;
 export const EXPECTED_SERVICE_ACCOUNT_SHELL = "/usr/bin/false";
 
+export interface AccountProvisionRollbackResult {
+  readonly message: string;
+  readonly accountRecordObservedBeforeRollback: boolean;
+  readonly accountAbsenceObserved: boolean;
+  readonly accountMayRemain: boolean;
+}
+
+export function parseServiceAccountIsHidden(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "1" || normalized === "yes" || normalized === "true") return true;
+  if (normalized === "0" || normalized === "no" || normalized === "false") return false;
+  return false;
+}
+
 function normalizeComparableHome(path: string): string {
   const normalized = normalizePath(path);
   if (normalized === "/") return normalized;
   return normalized.replace(/\/+$/, "");
+}
+
+function homeDirectoryShapeProblem(path: string, label: string): string | undefined {
+  if (!isAbsolute(path)) {
+    return `${label} is ${path}, expected an absolute path`;
+  }
+  if (path.split("/").includes("..")) {
+    return `${label} is ${path}, expected a path with no ".." segments`;
+  }
+  return undefined;
 }
 
 async function canonicalizeComparableHome(
@@ -149,6 +186,17 @@ async function canonicalizeComparableHome(
   path: string,
 ): Promise<string> {
   return normalizeComparableHome(await ops.canonicalizeHomeDirectory(path));
+}
+
+export function serviceAccountRepairGuidance(
+  accountName: string,
+  expected: { readonly homeDirectory: string },
+): string {
+  return (
+    `Safe repair: preserve ${expected.homeDirectory}, repair "${accountName}" in place, then re-run. ` +
+    `Set NFSHomeDirectory=${expected.homeDirectory}, IsHidden=1 (or YES), and ` +
+    `UserShell=${EXPECTED_SERVICE_ACCOUNT_SHELL}; do not delete the account home to recover this state.`
+  );
 }
 
 export function describeServiceAccountRecord(record: ServiceAccountRecord | undefined): string {
@@ -173,21 +221,26 @@ export async function serviceAccountRecordProblems(
   if (record.homeDirectory === undefined) {
     problems.push(`NFSHomeDirectory is <missing>, expected ${expected.homeDirectory}`);
   } else {
-    try {
-      const observedCanonical = await canonicalizeComparableHome(ops, record.homeDirectory);
-      const expectedCanonical = await canonicalizeComparableHome(ops, expected.homeDirectory);
-      if (observedCanonical !== expectedCanonical) {
+    const observedShapeProblem = homeDirectoryShapeProblem(record.homeDirectory, "NFSHomeDirectory");
+    if (observedShapeProblem !== undefined) {
+      problems.push(`${observedShapeProblem}, expected ${expected.homeDirectory}`);
+    } else {
+      try {
+        const observedCanonical = await canonicalizeComparableHome(ops, record.homeDirectory);
+        const expectedCanonical = await canonicalizeComparableHome(ops, expected.homeDirectory);
+        if (observedCanonical !== expectedCanonical) {
+          problems.push(
+            `NFSHomeDirectory is ${record.homeDirectory} (canonical ${observedCanonical}), ` +
+              `expected ${expected.homeDirectory} (canonical ${expectedCanonical})`,
+          );
+        }
+      } catch (err) {
         problems.push(
-          `NFSHomeDirectory is ${record.homeDirectory} (canonical ${observedCanonical}), ` +
-            `expected ${expected.homeDirectory} (canonical ${expectedCanonical})`,
+          `NFSHomeDirectory canonicalization failed ` +
+            `(${err instanceof Error ? err.message : String(err)}); observed ${record.homeDirectory}, ` +
+            `expected ${expected.homeDirectory}`,
         );
       }
-    } catch (err) {
-      problems.push(
-        `NFSHomeDirectory canonicalization failed ` +
-          `(${err instanceof Error ? err.message : String(err)}); observed ${record.homeDirectory}, ` +
-          `expected ${expected.homeDirectory}`,
-      );
     }
   }
   if (record.isHidden !== EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN) {
@@ -237,8 +290,9 @@ export function planAccountCreate(
   // the re-home target, or the confined harness cannot find its moved
   // secrets. Refuse to plan a `create` without one rather than silently
   // falling back to whatever sysadminctl would otherwise default to.
-  if (!homeDirectory.startsWith("/") || homeDirectory.includes("..")) {
-    throw new Error(`Home directory must be an absolute path with no ".." segments (got: ${JSON.stringify(homeDirectory)}).`);
+  const expectedHomeProblem = homeDirectoryShapeProblem(homeDirectory, "Home directory");
+  if (expectedHomeProblem !== undefined) {
+    throw new Error(`${expectedHomeProblem} (got: ${JSON.stringify(homeDirectory)}).`);
   }
 
   if (probe.existingUid !== undefined) {
@@ -263,6 +317,92 @@ export function planAccountCreate(
   return { action: "create", accountName, uid };
 }
 
+export async function rollbackCreatedServiceAccount(
+  ops: Pick<AccountProvisionOps, "lookupAccountRecord" | "deleteCreatedUser">,
+  accountName: string,
+  plannedUid: number,
+): Promise<AccountProvisionRollbackResult> {
+  let before: ServiceAccountRecord | undefined;
+  try {
+    before = await ops.lookupAccountRecord(accountName);
+  } catch (err) {
+    return {
+      message:
+        `rollback NOT attempted: pre-delete read failed ` +
+        `(${err instanceof Error ? err.message : String(err)}); account state is unknown`,
+      accountRecordObservedBeforeRollback: false,
+      accountAbsenceObserved: false,
+      accountMayRemain: true,
+    };
+  }
+  if (before === undefined) {
+    return {
+      message: "rollback not needed: account record was already absent",
+      accountRecordObservedBeforeRollback: false,
+      accountAbsenceObserved: true,
+      accountMayRemain: false,
+    };
+  }
+  if (before.uid !== plannedUid) {
+    return {
+      message:
+        `rollback NOT attempted: observed ${describeServiceAccountRecord(before)}; ` +
+        `uid ${before.uid} does not match this run's planned uid ${plannedUid}`,
+      accountRecordObservedBeforeRollback: true,
+      accountAbsenceObserved: false,
+      accountMayRemain: true,
+    };
+  }
+  try {
+    await ops.deleteCreatedUser(accountName);
+  } catch (err) {
+    let afterText: string;
+    let accountMayRemain = true;
+    try {
+      const after = await ops.lookupAccountRecord(accountName);
+      afterText = describeServiceAccountRecord(after);
+      accountMayRemain = after !== undefined;
+    } catch (readErr) {
+      afterText = `post-delete read failed (${readErr instanceof Error ? readErr.message : String(readErr)})`;
+    }
+    return {
+      message:
+        `rollback deletion failed after observing ${describeServiceAccountRecord(before)} ` +
+        `(${err instanceof Error ? err.message : String(err)}); ${afterText}`,
+      accountRecordObservedBeforeRollback: true,
+      accountAbsenceObserved: !accountMayRemain,
+      accountMayRemain,
+    };
+  }
+  let after: ServiceAccountRecord | undefined;
+  try {
+    after = await ops.lookupAccountRecord(accountName);
+  } catch (err) {
+    return {
+      message:
+        `rollback deletion command returned, but absence was NOT observed: ` +
+        `post-delete read failed (${err instanceof Error ? err.message : String(err)})`,
+      accountRecordObservedBeforeRollback: true,
+      accountAbsenceObserved: false,
+      accountMayRemain: true,
+    };
+  }
+  if (after === undefined) {
+    return {
+      message: `rollback observed: ${accountName} account record is absent`,
+      accountRecordObservedBeforeRollback: true,
+      accountAbsenceObserved: true,
+      accountMayRemain: false,
+    };
+  }
+  return {
+    message: `rollback NOT observed: ${describeServiceAccountRecord(after)} still exists`,
+    accountRecordObservedBeforeRollback: true,
+    accountAbsenceObserved: false,
+    accountMayRemain: true,
+  };
+}
+
 /**
  * Execute a plan: for `skip`/`conflict`, no mutation. For `create`, calls
  * `ops.createUser`, then reads the directory-service record back and verifies
@@ -284,28 +424,44 @@ export async function executeAccountProvisionPlan(
     if (problems.length > 0) {
       throw new AccountProvisionVerificationError(
         `Existing service account "${plan.accountName}" is incomplete (${problems.join("; ")}). ` +
-          `Observed ${describeServiceAccountRecord(observed)}. Refusing to proceed; account was not created by this run.`,
+          `Observed ${describeServiceAccountRecord(observed)}. Refusing to proceed. ` +
+          serviceAccountRepairGuidance(plan.accountName, expected),
       );
     }
     return { uid: plan.uid, observed: describeServiceAccountRecord(observed) };
   }
   // FIX F7: bind NFSHomeDirectory to the re-home target at create time.
-  await ops.createUser(plan.accountName, plan.uid, options.comment, options.homeDirectory);
+  try {
+    await ops.createUser(plan.accountName, plan.uid, options.comment, options.homeDirectory);
+    await ops.hardenCreatedUser(plan.accountName);
+  } catch (err) {
+    const rollback = await rollbackCreatedServiceAccount(ops, plan.accountName, plan.uid);
+    throw new AccountProvisionVerificationError(
+      `Creating service account "${plan.accountName}" failed ` +
+        `(${err instanceof Error ? err.message : String(err)}). ${rollback.message}. ` +
+        serviceAccountRepairGuidance(plan.accountName, expected),
+      { cause: err },
+    );
+  }
   let observed: ServiceAccountRecord | undefined;
   try {
     observed = await ops.lookupAccountRecord(plan.accountName);
   } catch (err) {
+    const rollback = await rollbackCreatedServiceAccount(ops, plan.accountName, plan.uid);
     throw new AccountProvisionVerificationError(
       `Service account "${plan.accountName}" create returned, but the post-create record could not be read ` +
-        `(${err instanceof Error ? err.message : String(err)}). Refusing to proceed before arming.`,
+        `(${err instanceof Error ? err.message : String(err)}). ${rollback.message}. ` +
+        serviceAccountRepairGuidance(plan.accountName, expected),
       { cause: err },
     );
   }
   const problems = await serviceAccountRecordProblems(observed, expected, ops);
   if (problems.length > 0) {
+    const rollback = await rollbackCreatedServiceAccount(ops, plan.accountName, plan.uid);
     throw new AccountProvisionVerificationError(
       `Service account "${plan.accountName}" create did not verify (${problems.join("; ")}). ` +
-        `Observed ${describeServiceAccountRecord(observed)}. Refusing to proceed before arming.`,
+        `Observed ${describeServiceAccountRecord(observed)}. ${rollback.message}. ` +
+        serviceAccountRepairGuidance(plan.accountName, expected),
     );
   }
   return { uid: plan.uid, observed: describeServiceAccountRecord(observed) };

@@ -20,15 +20,19 @@ export {
   EXPECTED_SERVICE_ACCOUNT_SHELL,
   describeServiceAccountRecord,
   deriveAgentAccountName,
+  parseServiceAccountIsHidden,
   planAccountCreate,
   executeAccountProvisionPlan,
   planAndCreateAccount,
+  rollbackCreatedServiceAccount,
+  serviceAccountRepairGuidance,
   serviceAccountRecordProblems,
 } from "./account.js";
 export type {
   AccountProvisionOptions,
   AccountProvisionOps,
   AccountProvisionPlan,
+  AccountProvisionRollbackResult,
   ServiceAccountRecord,
 } from "./account.js";
 
