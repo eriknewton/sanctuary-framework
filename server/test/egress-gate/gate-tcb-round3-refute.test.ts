@@ -157,6 +157,7 @@ describe("round-3 fix (2) refute: gate uid can never collide with the agent uid"
     const ops: GateAccountProvisionOps = {
       lookupAccountUid: () => Promise.resolve(undefined),
       lookupAccountRecord: () => Promise.resolve(undefined),
+      canonicalizeHomeDirectory: (path) => Promise.resolve(path),
       // highest is one below the agent uid so the computed create uid == agent uid.
       highestAssignedUid: () => Promise.resolve(AGENT_UID - 1),
       createUser: () => {

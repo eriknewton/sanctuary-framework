@@ -29,8 +29,23 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, lstat, readFile, readlink, symlink, rm, cp } from "node:fs/promises";
-import { dirname, relative, resolve as pathResolve, sep } from "node:path";
+import {
+  mkdir,
+  rename,
+  copyFile,
+  chmod,
+  chown as fsChown,
+  lchown,
+  access,
+  lstat,
+  readFile,
+  readlink,
+  symlink,
+  rm,
+  cp,
+  realpath,
+} from "node:fs/promises";
+import { basename, dirname, join, normalize as normalizePath, relative, resolve as pathResolve, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
 import {
@@ -1890,7 +1905,10 @@ function realAccountProvisionOps() {
   };
   const dsclReadLooksAbsent = (err: unknown): boolean =>
     /No such key|eDSRecordNotFound|DS Error: -14136|not found|Invalid Path/i.test(dsclErrorText(err));
-  const readAttribute = async (accountName: string, attribute: "UniqueID" | "NFSHomeDirectory"): Promise<string | undefined> => {
+  const readAttribute = async (
+    accountName: string,
+    attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  ): Promise<string | undefined> => {
     try {
       const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-read", `/Users/${accountName}`, attribute]);
       const match = new RegExp(`${attribute}:\\s*(\\S+)`).exec(stdout);
@@ -1900,16 +1918,38 @@ function realAccountProvisionOps() {
       throw err;
     }
   };
+  const canonicalizeHomeDirectory = async (rawPath: string): Promise<string> => {
+    const normalized = normalizePath(rawPath);
+    const trimmed = normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
+    const pendingSegments: string[] = [];
+    let cursor = trimmed;
+    while (true) {
+      try {
+        const resolvedPrefix = await realpath(cursor);
+        const combined = pendingSegments.length === 0 ? resolvedPrefix : join(resolvedPrefix, ...pendingSegments);
+        const normalizedCombined = normalizePath(combined);
+        return normalizedCombined === "/" ? normalizedCombined : normalizedCombined.replace(/\/+$/, "");
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+        const parent = dirname(cursor);
+        if (parent === cursor) throw err;
+        pendingSegments.unshift(basename(cursor));
+        cursor = parent;
+      }
+    }
+  };
   return {
     lookupAccountUid: async (accountName: string): Promise<number | undefined> => {
-      try {
-        const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-read", `/Users/${accountName}`, "UniqueID"]);
-        const match = /UniqueID:\s*(\d+)/.exec(stdout);
-        return match ? Number(match[1]) : undefined;
-      } catch {
-        return undefined;
+      const uidText = await readAttribute(accountName, "UniqueID");
+      if (uidText === undefined) return undefined;
+      const uid = Number(uidText);
+      if (!Number.isSafeInteger(uid) || uid <= 0) {
+        throw new Error(`dscl returned an invalid UniqueID for ${accountName}: ${uidText}`);
       }
+      return uid;
     },
+    canonicalizeHomeDirectory,
     highestAssignedUid: async (): Promise<number> => {
       const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-list", "/Users", "UniqueID"]);
       let highest = PROVISION_CEILING - 1;
@@ -1921,7 +1961,7 @@ function realAccountProvisionOps() {
     },
     lookupAccountRecord: async (
       accountName: string,
-    ): Promise<{ uid: number; homeDirectory?: string } | undefined> => {
+    ): Promise<{ uid: number; homeDirectory?: string; isHidden?: boolean; userShell?: string } | undefined> => {
       const uidText = await readAttribute(accountName, "UniqueID");
       if (uidText === undefined) return undefined;
       const uid = Number(uidText);
@@ -1929,7 +1969,14 @@ function realAccountProvisionOps() {
         throw new Error(`dscl returned an invalid UniqueID for ${accountName}: ${uidText}`);
       }
       const homeDirectory = await readAttribute(accountName, "NFSHomeDirectory");
-      return { uid, ...(homeDirectory !== undefined ? { homeDirectory } : {}) };
+      const hiddenText = await readAttribute(accountName, "IsHidden");
+      const userShell = await readAttribute(accountName, "UserShell");
+      return {
+        uid,
+        ...(homeDirectory !== undefined ? { homeDirectory } : {}),
+        ...(hiddenText !== undefined ? { isHidden: hiddenText === "1" } : {}),
+        ...(userShell !== undefined ? { userShell } : {}),
+      };
     },
     deleteCreatedUser: async (accountName: string): Promise<void> => {
       try {
@@ -1958,14 +2005,13 @@ function realAccountProvisionOps() {
       // production ops object satisfies the AccountProvisionOps interface
       // for the orchestration to call end to end during the drill.
       //
-      // FIX F7 + S5 drill D4: `-home` is the directory-service writer for
-      // NFSHomeDirectory. Do NOT follow it with `dscl -create
-      // NFSHomeDirectory`: on Mini1/Tahoe that redundant post-create write
-      // returned eDSPermissionError after sysadminctl had already created the
-      // record, leaving a surviving partial gate account. The gate path now
-      // verifies the record through `lookupAccountRecord` and rolls back a
-      // fresh incomplete account instead of deriving success from this call
-      // returning.
+      // FIX F7 + S5 drill D4: `-home` is the primary directory-service writer
+      // for NFSHomeDirectory. A redundant post-create `dscl -create
+      // NFSHomeDirectory` remains only a plausible, unproven D4 suspect; a
+      // hardware capture showing sysadminctl's read-back plus the redundant
+      // write failure would confirm it. The shared account path now verifies
+      // the record through `lookupAccountRecord` instead of deriving success
+      // from this call returning.
       await execFileAsync("/usr/sbin/sysadminctl", [
         "-addUser",
         accountName,

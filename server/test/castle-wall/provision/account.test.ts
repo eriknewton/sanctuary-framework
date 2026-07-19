@@ -10,27 +10,47 @@ import { describe, it, expect } from "vitest";
 
 import {
   deriveAgentAccountName,
+  AccountProvisionVerificationError,
   planAccountCreate,
   executeAccountProvisionPlan,
   planAndCreateAccount,
   type AccountProvisionOps,
+  type ServiceAccountRecord,
 } from "../../../src/castle-wall/provision/account.js";
 
 const CEILING = 500;
 const HOME_DIR = "/var/sanctuary-agents/sanctuary-hermes";
 
-function mockOps(overrides: Partial<AccountProvisionOps> = {}): AccountProvisionOps & {
+function completeRecord(uid: number, homeDirectory: string = HOME_DIR): ServiceAccountRecord {
+  return { uid, homeDirectory, isHidden: true, userShell: "/usr/bin/false" };
+}
+
+function canonicalHome(path: string): string {
+  return path.replace(/^\/var(?=\/|$)/, "/private/var").replace(/\/+$/, "");
+}
+
+function mockOps(
+  overrides: Partial<AccountProvisionOps> & {
+    initialRecord?: ServiceAccountRecord;
+    createRecord?: (accountName: string, uid: number, homeDirectory: string) => ServiceAccountRecord;
+  } = {},
+): AccountProvisionOps & {
   created: Array<{ accountName: string; uid: number; comment: string | undefined; homeDirectory: string }>;
 } {
   const created: Array<{ accountName: string; uid: number; comment: string | undefined; homeDirectory: string }> = [];
+  const { initialRecord, createRecord, ...opsOverrides } = overrides;
+  let record = initialRecord;
   return {
     created,
-    lookupAccountUid: async () => undefined,
+    lookupAccountUid: async () => record?.uid,
+    lookupAccountRecord: async () => record,
+    canonicalizeHomeDirectory: async (path) => canonicalHome(path),
     highestAssignedUid: async () => 499,
     createUser: async (accountName, uid, comment, homeDirectory) => {
       created.push({ accountName, uid, comment, homeDirectory });
+      record = createRecord?.(accountName, uid, homeDirectory) ?? completeRecord(uid, homeDirectory);
     },
-    ...overrides,
+    ...opsOverrides,
   };
 }
 
@@ -154,7 +174,7 @@ describe("castle-wall/provision/account", () => {
     });
 
     it("does not call createUser for a skip plan (idempotent no-op)", async () => {
-      const ops = mockOps();
+      const ops = mockOps({ initialRecord: completeRecord(502) });
       const plan = planAccountCreate(
         { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
         { existingUid: 502, highestAssignedUid: 510 },
@@ -200,13 +220,52 @@ describe("castle-wall/provision/account", () => {
     });
 
     it("is idempotent: a second run against an ops that now reports the account existing plans skip", async () => {
-      const ops = mockOps({ lookupAccountUid: async () => 500, highestAssignedUid: async () => 510 });
+      const ops = mockOps({ initialRecord: completeRecord(500), highestAssignedUid: async () => 510 });
       const { plan, uid } = await planAndCreateAccount(
         { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
         ops,
       );
       expect(plan.action).toBe("skip");
       expect(uid).toBe(500);
+      expect(ops.created).toEqual([]);
+    });
+
+    it("H1: refuses before arming when the created agent account has no home read-back", async () => {
+      const ops = mockOps({
+        createRecord: (_name, uid) => ({ uid, isHidden: true, userShell: "/usr/bin/false" }),
+      });
+      await expect(
+        planAndCreateAccount(
+          { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+          ops,
+        ),
+      ).rejects.toThrow(AccountProvisionVerificationError);
+      expect(ops.created).toHaveLength(1);
+    });
+
+    it("B1/H1: accepts a symlink-resolved NFSHomeDirectory form after canonical comparison", async () => {
+      const ops = mockOps({
+        createRecord: (_name, uid) => completeRecord(uid, "/private/var/sanctuary-agents/sanctuary-hermes/"),
+      });
+      const result = await planAndCreateAccount(
+        { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+        ops,
+      );
+      expect(result.uid).toBe(500);
+      expect(result.observed).toContain("/private/var/sanctuary-agents/sanctuary-hermes/");
+    });
+
+    it("B2/H1: refuses a same uid/home service account missing hidden/no-login hardening", async () => {
+      const ops = mockOps({
+        initialRecord: { uid: 500, homeDirectory: HOME_DIR, userShell: "/bin/zsh" },
+        highestAssignedUid: async () => 510,
+      });
+      await expect(
+        planAndCreateAccount(
+          { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+          ops,
+        ),
+      ).rejects.toThrow(/IsHidden.*UserShell/);
       expect(ops.created).toEqual([]);
     });
   });

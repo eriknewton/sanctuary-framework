@@ -1089,7 +1089,8 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "arming-wiring.gate-account-home-layout": {
     file: `${EG}/arming-wiring.ts`,
     symbol: "ensureGateAccountHomeLayout",
-    claim: "the gate account home and log directory exist as real directories with the expected owner and mode",
+    claim:
+      "the gate account home/log directories and launchd stdout/stderr log files exist with the expected owner and mode",
     basis: "observed",
     detectorBlind: true,
     layer: "compute",
@@ -1232,8 +1233,9 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   },
   "gate-account.verify-record": {
     file: `${EG}/gate-account.ts`,
-    symbol: "gateAccountRecordProblems",
-    claim: "the gate account directory-service record carries the expected uid and NFSHomeDirectory",
+    symbol: "planAndCreateGateAccount",
+    claim:
+      "the gate account directory-service record carries the expected uid, canonically matching NFSHomeDirectory, IsHidden=1, and UserShell=/usr/bin/false",
     basis: "observed",
     detectorBlind: true,
     layer: "compute",
@@ -1242,7 +1244,8 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "gate-account.rollback-incomplete": {
     file: `${EG}/gate-account.ts`,
     symbol: "rollbackIncompleteGateAccount",
-    claim: "a partial gate account rollback is reported as observed absent, not observed, or not attempted with the reason named",
+    claim:
+      "a fresh-create gate account rollback is reported as observed absent, not observed, not needed, or not attempted with the reason named",
     basis: "observed",
     detectorBlind: true,
     layer: "compute",
@@ -1266,12 +1269,9 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "provision-account.execute-plan-uid": {
     file: `${CW}/account.ts`,
     symbol: "executeAccountProvisionPlan",
-    claim: "an account now exists at this uid",
-    basis: "documented-bound",
-    unobserved:
-      "the uid returned is the PLANNED one; `createUser` resolving is the whole basis and no re-lookup " +
-      "happens here. Bounded: `checkUidExistenceBeforeArm` (`uid-gate.ts`) performs the authoritative lookup " +
-      "before anything is armed, and the flow parks if it disagrees.",
+    claim:
+      "the service account directory-service record carries the expected uid, canonically matching NFSHomeDirectory, IsHidden=1, and UserShell=/usr/bin/false",
+    basis: "observed",
     layer: "compute",
     branches: "single",
   },

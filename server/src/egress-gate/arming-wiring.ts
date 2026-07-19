@@ -43,8 +43,8 @@ import {
   createPublicKey,
   type KeyObject,
 } from "node:crypto";
-import { chmod, chown, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, chown, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, normalize as normalizePath } from "node:path";
 
 import {
   PfAnchorRegistry,
@@ -103,6 +103,7 @@ import {
 import {
   GATE_ORACLE_PUBLIC_KEY_PATH,
   egressGateDaemonLabel,
+  egressGateDaemonLogPaths,
   egressGateDaemonPlistPath,
   egressGatePolicyConfigPath,
   egressGateRulesConfigPath,
@@ -154,6 +155,8 @@ export const GATE_ORACLE_PRIVATE_KEY_PATH = `${GATE_LIVENESS_DIR}/supervisor-ora
 const LAUNCHCTL_TIMEOUT_MS = 15_000;
 const GATE_RUNTIME_WAIT_BUDGET_MS = 15_000;
 const GATE_RUNTIME_WAIT_INTERVAL_MS = 250;
+export const GATE_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
+const GATE_ACCOUNT_HOME_BASE_RESOLVED = "/private/var/sanctuary-agents";
 
 /** Real O_EXCL lock ops (the shipped provision-lock discipline). */
 export function fsLockOps(): ProvisionLockOps {
@@ -565,9 +568,17 @@ interface BringUpState {
 /** Injected filesystem surface for the gate account home/log layout. */
 export interface GateAccountHomeLayoutOps {
   mkdir(path: string): Promise<void>;
+  ensureFile(path: string, mode: number): Promise<void>;
   chown(path: string, uid: number, gid: number): Promise<void>;
   chmod(path: string, mode: number): Promise<void>;
-  lstat(path: string): Promise<{ isDirectory(): boolean; isSymbolicLink(): boolean; uid: number; gid: number; mode: number }>;
+  lstat(path: string): Promise<{
+    isDirectory(): boolean;
+    isFile(): boolean;
+    isSymbolicLink(): boolean;
+    uid: number;
+    gid: number;
+    mode: number;
+  }>;
 }
 
 function realGateAccountHomeLayoutOps(): GateAccountHomeLayoutOps {
@@ -579,34 +590,69 @@ function realGateAccountHomeLayoutOps(): GateAccountHomeLayoutOps {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       }
     },
+    async ensureFile(path: string, mode: number): Promise<void> {
+      const handle = await open(path, "wx", mode);
+      await handle.close();
+    },
     chown,
     chmod,
     lstat,
   };
 }
 
+function normalizeLayoutPath(path: string): string {
+  const normalized = normalizePath(path);
+  if (normalized === "/") return normalized;
+  return normalized.replace(/\/+$/, "");
+}
+
+function assertGateHomeUnderFixedBase(gateHomeDirectory: string): void {
+  const parent = normalizeLayoutPath(dirname(gateHomeDirectory));
+  if (parent !== GATE_ACCOUNT_HOME_BASE && parent !== GATE_ACCOUNT_HOME_BASE_RESOLVED) {
+    throw new Error(
+      `refusing to prepare gate account home ${gateHomeDirectory}: parent ${parent} is outside ` +
+        `${GATE_ACCOUNT_HOME_BASE}`,
+    );
+  }
+}
+
+async function lstatIfExists(
+  ops: GateAccountHomeLayoutOps,
+  path: string,
+): Promise<Awaited<ReturnType<GateAccountHomeLayoutOps["lstat"]>> | undefined> {
+  try {
+    return await ops.lstat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+}
+
 /**
- * Ensure the gate account's own home and log directory exist and are writable
- * by the gate uid before the LaunchDaemon plist is rendered.
+ * Ensure the gate account's own home, log directory, and launchd stdout/stderr
+ * log files exist and are writable by the gate uid before the LaunchDaemon
+ * plist is rendered.
  *
- * The parent base is root-owned/traversable; the home and `logs` child are
- * gate-owned 0700. Each step is lstat'd after chown/chmod so success is an
- * observation of the final state, not a claim from calls returning.
+ * The parent base is fixed and root-owned/traversable; the home and `logs`
+ * child are gate-owned 0700, and the log files are gate-owned 0600. Each step
+ * is lstat'd after chown/chmod so success is an observation of the final
+ * state, not a claim from calls returning.
  */
 export async function ensureGateAccountHomeLayout(
-  input: { gateAccount: string; gateUid: number; gateHomeDirectory: string },
+  input: { agentUid: number; gateAccount: string; gateUid: number; gateHomeDirectory: string },
   ops: GateAccountHomeLayoutOps = realGateAccountHomeLayoutOps(),
 ): Promise<{ logDir: string }> {
+  assertGateHomeUnderFixedBase(input.gateHomeDirectory);
   const logDir = gateDaemonLogDirForHome({
     gateAccount: input.gateAccount,
     gateHomeDirectory: input.gateHomeDirectory,
   });
-  const targets = [
+  const dirTargets = [
     { path: dirname(input.gateHomeDirectory), uid: 0, gid: 0, mode: 0o711, label: "gate home parent" },
     { path: input.gateHomeDirectory, uid: input.gateUid, gid: input.gateUid, mode: 0o700, label: "gate home" },
     { path: logDir, uid: input.gateUid, gid: input.gateUid, mode: 0o700, label: "gate log dir" },
   ];
-  for (const target of targets) {
+  for (const target of dirTargets) {
     await ops.mkdir(target.path);
     const before = await ops.lstat(target.path);
     if (!before.isDirectory()) {
@@ -623,6 +669,37 @@ export async function ensureGateAccountHomeLayout(
       throw new Error(
         `gate account home layout did not verify for ${target.path}: observed ` +
           `${after.isDirectory() ? "directory" : after.isSymbolicLink() ? "symlink" : "non-directory"} ` +
+          `uid=${after.uid} mode=${mode.toString(8)}, expected uid=${target.uid} mode=${target.mode.toString(8)}`,
+      );
+    }
+  }
+  const logPaths = egressGateDaemonLogPaths({
+    agentUid: input.agentUid,
+    gateAccount: input.gateAccount,
+    gateHomeDirectory: input.gateHomeDirectory,
+  });
+  const fileTargets = [
+    { path: logPaths.stdoutPath, uid: input.gateUid, gid: input.gateUid, mode: 0o600, label: "gate stdout log file" },
+    { path: logPaths.stderrPath, uid: input.gateUid, gid: input.gateUid, mode: 0o600, label: "gate stderr log file" },
+  ];
+  for (const target of fileTargets) {
+    const before = await lstatIfExists(ops, target.path);
+    if (before === undefined) {
+      await ops.ensureFile(target.path, target.mode);
+    } else if (!before.isFile()) {
+      throw new Error(
+        `refusing to use ${target.path} as ${target.label}: it is a ` +
+          `${before.isSymbolicLink() ? "symlink" : "non-file"}, not a real file`,
+      );
+    }
+    await ops.chown(target.path, target.uid, target.gid);
+    await ops.chmod(target.path, target.mode);
+    const after = await ops.lstat(target.path);
+    const mode = after.mode & 0o777;
+    if (!after.isFile() || after.uid !== target.uid || mode !== target.mode) {
+      throw new Error(
+        `gate account home layout did not verify for ${target.path}: observed ` +
+          `${after.isFile() ? "file" : after.isSymbolicLink() ? "symlink" : "non-file"} ` +
           `uid=${after.uid} mode=${mode.toString(8)}, expected uid=${target.uid} mode=${target.mode.toString(8)}`,
       );
     }
@@ -1224,7 +1301,16 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
       },
       input.accountOps,
     );
+    input.print(`Observed gate account ${account.accountName}: ${account.observed}.`);
+    await input.audit("exclusive_egress_gate_account_observed", {
+      agent_id: input.agentId,
+      agent_uid: input.agentUid,
+      gate_account: account.accountName,
+      gate_uid: account.uid,
+      observed: account.observed,
+    });
     await ensureGateAccountHomeLayout({
+      agentUid: input.agentUid,
       gateAccount: account.accountName,
       gateUid: account.uid,
       gateHomeDirectory: input.gateHomeDirectory,

@@ -1,3 +1,5 @@
+import { normalize as normalizePath } from "node:path";
+
 /**
  * Auto-provision Step 2 (Build 1): dedicated agent service-account plumbing.
  *
@@ -63,6 +65,14 @@ export interface AccountProvisionOptions {
   homeDirectory: string;
 }
 
+/** The directory-service fields that settle the service-account shape this module creates. */
+export interface ServiceAccountRecord {
+  readonly uid: number;
+  readonly homeDirectory?: string;
+  readonly isHidden?: boolean;
+  readonly userShell?: string;
+}
+
 /** Filesystem/directory-service operations, injected so tests never touch the host. */
 export interface AccountProvisionOps {
   /**
@@ -71,6 +81,18 @@ export interface AccountProvisionOps {
    * probe failure (directory service unreachable, etc).
    */
   lookupAccountUid(accountName: string): Promise<number | undefined>;
+  /**
+   * Read the directory-service record for this account, or `undefined` when absent.
+   * This is the post-create/skip truth source; callers must not infer service
+   * account completeness from `createUser` returning.
+   */
+  lookupAccountRecord(accountName: string): Promise<ServiceAccountRecord | undefined>;
+  /**
+   * Resolve a home path into the comparison form used for `NFSHomeDirectory`.
+   * Production resolves symlinked prefixes (`/var` -> `/private/var`) and tests
+   * inject the same behavior deterministically.
+   */
+  canonicalizeHomeDirectory(path: string): Promise<string>;
   /** Return the highest uid currently assigned to any local account. */
   highestAssignedUid(): Promise<number>;
   /**
@@ -104,6 +126,80 @@ export type AccountProvisionPlan =
       requestedCeiling: number;
       reason: string;
     };
+
+/** Thrown when an observed account record does not match the service-account contract. */
+export class AccountProvisionVerificationError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "AccountProvisionVerificationError";
+  }
+}
+
+export const EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN = true;
+export const EXPECTED_SERVICE_ACCOUNT_SHELL = "/usr/bin/false";
+
+function normalizeComparableHome(path: string): string {
+  const normalized = normalizePath(path);
+  if (normalized === "/") return normalized;
+  return normalized.replace(/\/+$/, "");
+}
+
+async function canonicalizeComparableHome(
+  ops: Pick<AccountProvisionOps, "canonicalizeHomeDirectory">,
+  path: string,
+): Promise<string> {
+  return normalizeComparableHome(await ops.canonicalizeHomeDirectory(path));
+}
+
+export function describeServiceAccountRecord(record: ServiceAccountRecord | undefined): string {
+  if (record === undefined) return "account record absent";
+  return (
+    `account record uid=${record.uid}, NFSHomeDirectory=${record.homeDirectory ?? "<missing>"}, ` +
+    `IsHidden=${record.isHidden === undefined ? "<missing>" : record.isHidden ? "1" : "0"}, ` +
+    `UserShell=${record.userShell ?? "<missing>"}`
+  );
+}
+
+export async function serviceAccountRecordProblems(
+  record: ServiceAccountRecord | undefined,
+  expected: { readonly uid: number; readonly homeDirectory: string },
+  ops: Pick<AccountProvisionOps, "canonicalizeHomeDirectory">,
+): Promise<string[]> {
+  if (record === undefined) return ["account record is absent"];
+  const problems: string[] = [];
+  if (record.uid !== expected.uid) {
+    problems.push(`uid is ${record.uid}, expected ${expected.uid}`);
+  }
+  if (record.homeDirectory === undefined) {
+    problems.push(`NFSHomeDirectory is <missing>, expected ${expected.homeDirectory}`);
+  } else {
+    try {
+      const observedCanonical = await canonicalizeComparableHome(ops, record.homeDirectory);
+      const expectedCanonical = await canonicalizeComparableHome(ops, expected.homeDirectory);
+      if (observedCanonical !== expectedCanonical) {
+        problems.push(
+          `NFSHomeDirectory is ${record.homeDirectory} (canonical ${observedCanonical}), ` +
+            `expected ${expected.homeDirectory} (canonical ${expectedCanonical})`,
+        );
+      }
+    } catch (err) {
+      problems.push(
+        `NFSHomeDirectory canonicalization failed ` +
+          `(${err instanceof Error ? err.message : String(err)}); observed ${record.homeDirectory}, ` +
+          `expected ${expected.homeDirectory}`,
+      );
+    }
+  }
+  if (record.isHidden !== EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN) {
+    problems.push(
+      `IsHidden is ${record.isHidden === undefined ? "<missing>" : record.isHidden ? "1" : "0"}, expected 1`,
+    );
+  }
+  if (record.userShell !== EXPECTED_SERVICE_ACCOUNT_SHELL) {
+    problems.push(`UserShell is ${record.userShell ?? "<missing>"}, expected ${EXPECTED_SERVICE_ACCOUNT_SHELL}`);
+  }
+  return problems;
+}
 
 /**
  * Plan account provisioning. Pure decision logic given the two probe
@@ -169,24 +265,50 @@ export function planAccountCreate(
 
 /**
  * Execute a plan: for `skip`/`conflict`, no mutation. For `create`, calls
- * `ops.createUser`. Real creation is drill-only; unit tests inject a mock
- * `AccountProvisionOps` and assert against the recorded call, never a real
- * `sysadminctl`/`dscl` invocation.
+ * `ops.createUser`, then reads the directory-service record back and verifies
+ * the service-account shape. Real creation is drill-only; unit tests inject a
+ * mock `AccountProvisionOps`, never a real `sysadminctl`/`dscl` invocation.
  */
 export async function executeAccountProvisionPlan(
   plan: AccountProvisionPlan,
   options: AccountProvisionOptions,
   ops: AccountProvisionOps,
-): Promise<{ uid: number }> {
+): Promise<{ uid: number; observed: string }> {
   if (plan.action === "conflict") {
     throw new Error(plan.reason);
   }
+  const expected = { uid: plan.uid, homeDirectory: options.homeDirectory };
   if (plan.action === "skip") {
-    return { uid: plan.uid };
+    const observed = await ops.lookupAccountRecord(plan.accountName);
+    const problems = await serviceAccountRecordProblems(observed, expected, ops);
+    if (problems.length > 0) {
+      throw new AccountProvisionVerificationError(
+        `Existing service account "${plan.accountName}" is incomplete (${problems.join("; ")}). ` +
+          `Observed ${describeServiceAccountRecord(observed)}. Refusing to proceed; account was not created by this run.`,
+      );
+    }
+    return { uid: plan.uid, observed: describeServiceAccountRecord(observed) };
   }
   // FIX F7: bind NFSHomeDirectory to the re-home target at create time.
   await ops.createUser(plan.accountName, plan.uid, options.comment, options.homeDirectory);
-  return { uid: plan.uid };
+  let observed: ServiceAccountRecord | undefined;
+  try {
+    observed = await ops.lookupAccountRecord(plan.accountName);
+  } catch (err) {
+    throw new AccountProvisionVerificationError(
+      `Service account "${plan.accountName}" create returned, but the post-create record could not be read ` +
+        `(${err instanceof Error ? err.message : String(err)}). Refusing to proceed before arming.`,
+      { cause: err },
+    );
+  }
+  const problems = await serviceAccountRecordProblems(observed, expected, ops);
+  if (problems.length > 0) {
+    throw new AccountProvisionVerificationError(
+      `Service account "${plan.accountName}" create did not verify (${problems.join("; ")}). ` +
+        `Observed ${describeServiceAccountRecord(observed)}. Refusing to proceed before arming.`,
+    );
+  }
+  return { uid: plan.uid, observed: describeServiceAccountRecord(observed) };
 }
 
 /**
@@ -198,10 +320,11 @@ export async function executeAccountProvisionPlan(
 export async function planAndCreateAccount(
   options: AccountProvisionOptions,
   ops: AccountProvisionOps,
-): Promise<{ plan: AccountProvisionPlan; uid: number }> {
-  const existingUid = await ops.lookupAccountUid(options.accountName);
+): Promise<{ plan: AccountProvisionPlan; uid: number; observed: string }> {
+  const existingRecord = await ops.lookupAccountRecord(options.accountName);
+  const existingUid = existingRecord?.uid;
   const highestAssignedUid = await ops.highestAssignedUid();
   const plan = planAccountCreate(options, { existingUid, highestAssignedUid });
   const result = await executeAccountProvisionPlan(plan, options, ops);
-  return { plan, uid: result.uid };
+  return { plan, uid: result.uid, observed: result.observed };
 }

@@ -118,18 +118,41 @@ describe("egress-gate/drift-guard diffTransientPfRules", () => {
     expect(diff.foreign).toEqual([]);
   });
 
-  it("D5: a genuinely foreign transient rule still refuses under the stock-anchor normalization", async () => {
+  it("D5: a genuinely foreign transient anchor still refuses under the stock-anchor normalization", async () => {
     await writeFile(
       mainConfPath,
       'scrub-anchor "com.apple/*"\nanchor "com.apple/*"\n',
     );
-    const vpnRule = "pass in quick on utun3 all flags S/SA keep state";
+    const vpnRule = 'anchor "com.corp.vpn/*" on en0 all';
     const runner = scriptedRunner({
       runningRules: [...STOCK_MACOS_RUNNING_RULES, vpnRule],
       parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
     });
     const diff = await diffTransientPfRules(runner, { mainConfPath });
     expect(diff.foreign).toEqual([vpnRule]);
+  });
+
+  it('M1: a literal running anchor "/*" line remains the observed foreign rule', async () => {
+    await writeFile(mainConfPath, 'anchor "com.apple/*"\n');
+    const runningRule = 'anchor "/*" all';
+    const runner = scriptedRunner({
+      runningRules: [runningRule],
+      parseRules: ['anchor "/*" all'],
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([runningRule]);
+    expect(diff.runningCount).toBe(1);
+  });
+
+  it("M1: expected-side stripped-anchor expansion does not launder a new running suffix", async () => {
+    await writeFile(mainConfPath, 'anchor "com.apple/*"\nanchor "com.corp.vpn/*" on en0\n');
+    const runningRule = 'anchor "com.apple/*" on en0 all';
+    const runner = scriptedRunner({
+      runningRules: [runningRule],
+      parseRules: ['anchor "/*" all', 'anchor "/*" on en0 all'],
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([runningRule]);
   });
 
   it("fail-closed: pfctl -sr failure THROWS (never diff blind)", async () => {

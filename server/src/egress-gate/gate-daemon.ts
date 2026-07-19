@@ -219,6 +219,25 @@ export function gateDaemonLogDirForHome(input: {
   return join(input.gateHomeDirectory, GATE_DAEMON_LOG_DIR_NAME);
 }
 
+/** The exact stdout/stderr files launchd opens for one gate daemon. */
+export function egressGateDaemonLogPaths(input: {
+  agentUid: number;
+  gateAccount: string;
+  gateHomeDirectory: string;
+}): { stdoutPath: string; stderrPath: string } {
+  if (!Number.isInteger(input.agentUid) || input.agentUid <= 0) {
+    throw new Error(`egress-gate log paths require a positive integer uid (got ${String(input.agentUid)})`);
+  }
+  const logDir = gateDaemonLogDirForHome({
+    gateAccount: input.gateAccount,
+    gateHomeDirectory: input.gateHomeDirectory,
+  });
+  return {
+    stdoutPath: join(logDir, `egress-gate-${input.agentUid}.out.log`),
+    stderrPath: join(logDir, `egress-gate-${input.agentUid}.err.log`),
+  };
+}
+
 /**
  * Render the gate daemon plist. `RunAtLoad=false` + `KeepAlive={Crashed:true}`
  * deliberately: the ROOT SUPERVISOR sequences gate start inside the exclusive
@@ -245,16 +264,13 @@ export function renderEgressGateDaemonPlist(options: EgressGateDaemonPlistOption
     throw new Error(`fortress path must be absolute (got ${options.fortressPath})`);
   }
   assertNoControlChars(options.fortressPath, "fortress path");
-  const logDir = gateDaemonLogDirForHome({
-    gateAccount: options.gateAccount,
-    gateHomeDirectory: options.gateHomeDirectory,
-  });
+  const { stdoutPath, stderrPath } = egressGateDaemonLogPaths(options);
   const argsXml = options.programArguments
     .map((a) => `\t\t<string>${xmlEscape(a)}</string>`)
     .join("\n");
   const logXml =
-    `\t<key>StandardOutPath</key>\n\t<string>${xmlEscape(join(logDir, `egress-gate-${options.agentUid}.out.log`))}</string>\n` +
-    `\t<key>StandardErrorPath</key>\n\t<string>${xmlEscape(join(logDir, `egress-gate-${options.agentUid}.err.log`))}</string>\n`;
+    `\t<key>StandardOutPath</key>\n\t<string>${xmlEscape(stdoutPath)}</string>\n` +
+    `\t<key>StandardErrorPath</key>\n\t<string>${xmlEscape(stderrPath)}</string>\n`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

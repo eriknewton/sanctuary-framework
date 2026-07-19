@@ -36,6 +36,7 @@ import {
   gateCredentialTokenPath,
 } from "../../src/egress-gate/gate-credential.js";
 import {
+  egressGateDaemonLogPaths,
   egressGateDaemonPlistPath,
   egressGatePolicyConfigPath,
   egressGateRulesConfigPath,
@@ -1024,7 +1025,7 @@ describe("applyRootOwnedDirEnsure (root-owned runtime directory policy)", () => 
 
 describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", () => {
   interface FakeStat {
-    kind: "dir" | "symlink" | "other";
+    kind: "dir" | "file" | "symlink" | "other";
     uid: number;
     gid: number;
     mode: number;
@@ -1038,6 +1039,7 @@ describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", 
     const stats = new Map<string, FakeStat>(Object.entries(initial));
     const sequence: string[] = [];
     const dirStat = (uid = 0, gid = 0, mode = 0o755): FakeStat => ({ kind: "dir", uid, gid, mode });
+    const fileStat = (uid = 0, gid = 0, mode = 0o600): FakeStat => ({ kind: "file", uid, gid, mode });
     return {
       stats,
       sequence,
@@ -1045,6 +1047,10 @@ describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", 
         async mkdir(path) {
           sequence.push(`mkdir:${path}`);
           if (!stats.has(path)) stats.set(path, dirStat());
+        },
+        async ensureFile(path, mode) {
+          sequence.push(`ensureFile:${path}:${mode.toString(8)}`);
+          if (!stats.has(path)) stats.set(path, fileStat(0, 0, mode));
         },
         async chown(path, uid, gid) {
           sequence.push(`chown:${path}:${uid}:${gid}`);
@@ -1058,12 +1064,18 @@ describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", 
         },
         async lstat(path) {
           sequence.push(`lstat:${path}`);
-          const st = stats.get(path) ?? dirStat();
+          const st = stats.get(path);
+          if (st === undefined) {
+            const err = new Error(`ENOENT: ${path}`) as NodeJS.ErrnoException;
+            err.code = "ENOENT";
+            throw err;
+          }
           return {
             uid: st.uid,
             gid: st.gid,
             mode: st.mode,
             isDirectory: () => st.kind === "dir",
+            isFile: () => st.kind === "file",
             isSymbolicLink: () => st.kind === "symlink",
           };
         },
@@ -1077,15 +1089,24 @@ describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", 
     const { ops, stats, sequence } = makeGateHomeOps();
     await expect(
       ensureGateAccountHomeLayout(
-        { gateAccount: "sanctuary-gate-hermes", gateUid: 505, gateHomeDirectory: home },
+        { agentUid: 502, gateAccount: "sanctuary-gate-hermes", gateUid: 505, gateHomeDirectory: home },
         ops,
       ),
     ).resolves.toEqual({ logDir });
 
+    const { stdoutPath, stderrPath } = egressGateDaemonLogPaths({
+      agentUid: 502,
+      gateAccount: "sanctuary-gate-hermes",
+      gateHomeDirectory: home,
+    });
     expect(stats.get("/var/sanctuary-agents")).toMatchObject({ uid: 0, mode: 0o711 });
     expect(stats.get(home)).toMatchObject({ uid: 505, gid: 505, mode: 0o700 });
     expect(stats.get(logDir)).toMatchObject({ uid: 505, gid: 505, mode: 0o700 });
+    expect(stats.get(stdoutPath)).toMatchObject({ kind: "file", uid: 505, gid: 505, mode: 0o600 });
+    expect(stats.get(stderrPath)).toMatchObject({ kind: "file", uid: 505, gid: 505, mode: 0o600 });
     expect(sequence).toContain(`chown:${logDir}:505:505`);
+    expect(sequence).toContain(`chown:${stdoutPath}:505:505`);
+    expect(sequence).toContain(`chown:${stderrPath}:505:505`);
     expect(logDir).not.toBe("/var/sanctuary-agents/sanctuary-hermes/logs");
   });
 
@@ -1094,6 +1115,7 @@ describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", 
     await expect(
       ensureGateAccountHomeLayout(
         {
+          agentUid: 502,
           gateAccount: "sanctuary-gate-hermes",
           gateUid: 505,
           gateHomeDirectory: "/var/sanctuary-agents/sanctuary-hermes",
@@ -1110,11 +1132,49 @@ describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", 
     const { ops, sequence } = makeGateHomeOps({ [logDir]: { kind: "symlink", uid: 0, gid: 0, mode: 0o777 } });
     await expect(
       ensureGateAccountHomeLayout(
-        { gateAccount: "sanctuary-gate-hermes", gateUid: 505, gateHomeDirectory: home },
+        { agentUid: 502, gateAccount: "sanctuary-gate-hermes", gateUid: 505, gateHomeDirectory: home },
         ops,
       ),
     ).rejects.toThrow(/symlink/);
     expect(sequence).not.toContain(`chown:${logDir}:505:505`);
     expect(sequence).not.toContain(`chmod:${logDir}:700`);
+  });
+
+  it("H2: refuses a caller-supplied home outside the Sanctuary account base before any mutation", async () => {
+    const { ops, sequence } = makeGateHomeOps();
+    await expect(
+      ensureGateAccountHomeLayout(
+        {
+          agentUid: 502,
+          gateAccount: "sanctuary-gate-hermes",
+          gateUid: 505,
+          gateHomeDirectory: "/sanctuary-gate-hermes",
+        },
+        ops,
+      ),
+    ).rejects.toThrow(/outside \/var\/sanctuary-agents/);
+    expect(sequence).toEqual([]);
+  });
+
+  it("H3: re-owns stale launchd log files from a prior gate uid before reporting the layout verified", async () => {
+    const home = "/var/sanctuary-agents/sanctuary-gate-hermes";
+    const { stdoutPath, stderrPath } = egressGateDaemonLogPaths({
+      agentUid: 502,
+      gateAccount: "sanctuary-gate-hermes",
+      gateHomeDirectory: home,
+    });
+    const { ops, stats, sequence } = makeGateHomeOps({
+      [stdoutPath]: { kind: "file", uid: 505, gid: 505, mode: 0o600 },
+      [stderrPath]: { kind: "file", uid: 505, gid: 505, mode: 0o600 },
+    });
+    await ensureGateAccountHomeLayout(
+      { agentUid: 502, gateAccount: "sanctuary-gate-hermes", gateUid: 506, gateHomeDirectory: home },
+      ops,
+    );
+    expect(sequence).toContain(`lstat:${stdoutPath}`);
+    expect(sequence).toContain(`chown:${stdoutPath}:506:506`);
+    expect(sequence).toContain(`chmod:${stdoutPath}:600`);
+    expect(stats.get(stdoutPath)).toMatchObject({ kind: "file", uid: 506, gid: 506, mode: 0o600 });
+    expect(stats.get(stderrPath)).toMatchObject({ kind: "file", uid: 506, gid: 506, mode: 0o600 });
   });
 });

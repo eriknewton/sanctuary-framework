@@ -38,11 +38,14 @@
  */
 
 import {
+  describeServiceAccountRecord,
   planAccountCreate,
   SAFE_SERVICE_ACCOUNT_RE,
+  serviceAccountRecordProblems,
   type AccountProvisionOptions,
   type AccountProvisionOps,
   type AccountProvisionPlan,
+  type ServiceAccountRecord,
 } from "../castle-wall/provision/account.js";
 
 /** The canonical prefix for a per-agent gate service account. */
@@ -101,23 +104,15 @@ export interface GateAccountProvisionOptions {
 }
 
 /** The directory-service fields that settle whether a gate account is complete. */
-export interface GateAccountRecord {
-  readonly uid: number;
-  readonly homeDirectory?: string;
-}
+export type GateAccountRecord = ServiceAccountRecord;
 
 /** Gate-account ops must be able to observe and roll back a just-created record. */
 export interface GateAccountProvisionOps extends AccountProvisionOps {
   /**
-   * Read the current directory-service record for this account, or `undefined`
-   * when absent. A missing `homeDirectory` is an observation: the account is
-   * partial and must not be treated as idempotently provisioned.
-   */
-  lookupAccountRecord(accountName: string): Promise<GateAccountRecord | undefined>;
-  /**
-   * Delete a Sanctuary gate account that this provisioning path just created
-   * or found incomplete. This is NOT the routine unprovision account-removal
-   * flow; it is bounded rollback of a partial gate account.
+   * Delete a Sanctuary gate account that this provisioning path may have just
+   * created. This is NOT the routine unprovision account-removal flow; it is
+   * bounded rollback of a fresh failed create. Pre-existing records are never
+   * deleted here.
    */
   deleteCreatedUser(accountName: string): Promise<void>;
 }
@@ -158,42 +153,27 @@ export class GateAccountVerificationError extends Error {
   }
 }
 
-function describeGateAccountRecord(record: GateAccountRecord | undefined): string {
-  if (record === undefined) return "account record absent";
-  return `account record uid=${record.uid}, NFSHomeDirectory=${record.homeDirectory ?? "<missing>"}`;
-}
-
-function gateAccountRecordProblems(
-  record: GateAccountRecord | undefined,
-  expected: { readonly uid: number; readonly homeDirectory: string },
-): string[] {
-  if (record === undefined) return ["account record is absent"];
-  const problems: string[] = [];
-  if (record.uid !== expected.uid) {
-    problems.push(`uid is ${record.uid}, expected ${expected.uid}`);
-  }
-  if (record.homeDirectory !== expected.homeDirectory) {
-    problems.push(
-      `NFSHomeDirectory is ${record.homeDirectory ?? "<missing>"}, expected ${expected.homeDirectory}`,
-    );
-  }
-  return problems;
-}
-
 async function rollbackIncompleteGateAccount(
   ops: GateAccountProvisionOps,
   accountName: string,
+  input: { readonly thisRunMayHaveCreatedIt: boolean },
 ): Promise<string> {
+  if (!input.thisRunMayHaveCreatedIt) {
+    return "rollback NOT attempted: account record existed before this run; leaving it for inspection";
+  }
   let before: GateAccountRecord | undefined;
+  let beforeText: string;
+  let beforeWasRead = false;
   try {
     before = await ops.lookupAccountRecord(accountName);
+    beforeWasRead = true;
+    beforeText = describeServiceAccountRecord(before);
   } catch (err) {
-    return (
-      `rollback NOT attempted: could not observe the partial account before deletion ` +
-      `(${err instanceof Error ? err.message : String(err)})`
-    );
+    beforeText =
+      `pre-delete read failed (${err instanceof Error ? err.message : String(err)}); ` +
+      "attempting bounded deletion because this run may have created the record";
   }
-  if (before === undefined) {
+  if (beforeWasRead && before === undefined) {
     return "rollback not needed: account record was already absent";
   }
   try {
@@ -201,12 +181,12 @@ async function rollbackIncompleteGateAccount(
   } catch (err) {
     let afterText: string;
     try {
-      afterText = describeGateAccountRecord(await ops.lookupAccountRecord(accountName));
+      afterText = describeServiceAccountRecord(await ops.lookupAccountRecord(accountName));
     } catch (readErr) {
       afterText = `post-delete read failed (${readErr instanceof Error ? readErr.message : String(readErr)})`;
     }
     return (
-      `rollback deletion failed after observing ${describeGateAccountRecord(before)} ` +
+      `rollback deletion failed after observing ${beforeText} ` +
       `(${err instanceof Error ? err.message : String(err)}); ${afterText}`
     );
   }
@@ -220,9 +200,11 @@ async function rollbackIncompleteGateAccount(
     );
   }
   if (after === undefined) {
-    return `rollback observed: ${accountName} account record is absent`;
+    return beforeWasRead
+      ? `rollback observed: ${accountName} account record is absent`
+      : `rollback observed: ${accountName} account record is absent after ${beforeText}`;
   }
-  return `rollback NOT observed: ${describeGateAccountRecord(after)} still exists`;
+  return `rollback NOT observed: ${describeServiceAccountRecord(after)} still exists`;
 }
 
 /**
@@ -277,16 +259,18 @@ export async function planAndCreateGateAccount(
 
   const expected = { uid: plan.uid, homeDirectory: provisionOptions.homeDirectory };
   if (plan.action === "skip") {
-    const problems = gateAccountRecordProblems(existingRecord, expected);
+    const problems = await serviceAccountRecordProblems(existingRecord, expected, ops);
     if (problems.length === 0) {
       return {
         plan,
         uid: plan.uid,
         accountName: provisionOptions.accountName,
-        observed: describeGateAccountRecord(existingRecord),
+        observed: describeServiceAccountRecord(existingRecord),
       };
     }
-    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName);
+    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
+      thisRunMayHaveCreatedIt: false,
+    });
     throw new GateAccountVerificationError(
       `Existing gate account "${provisionOptions.accountName}" is incomplete (${problems.join("; ")}). ` +
         `${rollback}. Refusing to proceed with a partial gate account.`,
@@ -301,7 +285,9 @@ export async function planAndCreateGateAccount(
       provisionOptions.homeDirectory,
     );
   } catch (err) {
-    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName);
+    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
+      thisRunMayHaveCreatedIt: true,
+    });
     throw new GateAccountVerificationError(
       `Creating gate account "${provisionOptions.accountName}" failed ` +
         `(${err instanceof Error ? err.message : String(err)}). ${rollback}.`,
@@ -313,25 +299,29 @@ export async function planAndCreateGateAccount(
   try {
     observed = await ops.lookupAccountRecord(provisionOptions.accountName);
   } catch (err) {
-    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName);
+    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
+      thisRunMayHaveCreatedIt: true,
+    });
     throw new GateAccountVerificationError(
       `Gate account "${provisionOptions.accountName}" create returned, but the post-create record could not be read ` +
         `(${err instanceof Error ? err.message : String(err)}). ${rollback}.`,
       { cause: err },
     );
   }
-  const problems = gateAccountRecordProblems(observed, expected);
+  const problems = await serviceAccountRecordProblems(observed, expected, ops);
   if (problems.length > 0) {
-    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName);
+    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
+      thisRunMayHaveCreatedIt: true,
+    });
     throw new GateAccountVerificationError(
       `Gate account "${provisionOptions.accountName}" create did not verify (${problems.join("; ")}). ` +
-        `Observed ${describeGateAccountRecord(observed)}. ${rollback}.`,
+        `Observed ${describeServiceAccountRecord(observed)}. ${rollback}.`,
     );
   }
   return {
     plan,
     uid: plan.uid,
     accountName: provisionOptions.accountName,
-    observed: describeGateAccountRecord(observed),
+    observed: describeServiceAccountRecord(observed),
   };
 }

@@ -15,15 +15,21 @@ export { detectProvisionNeed } from "./detect.js";
 
 export {
   SAFE_SERVICE_ACCOUNT_RE,
+  AccountProvisionVerificationError,
+  EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN,
+  EXPECTED_SERVICE_ACCOUNT_SHELL,
+  describeServiceAccountRecord,
   deriveAgentAccountName,
   planAccountCreate,
   executeAccountProvisionPlan,
   planAndCreateAccount,
+  serviceAccountRecordProblems,
 } from "./account.js";
 export type {
   AccountProvisionOptions,
   AccountProvisionOps,
   AccountProvisionPlan,
+  ServiceAccountRecord,
 } from "./account.js";
 
 export { checkUidExistenceBeforeArm } from "./uid-gate.js";
