@@ -39,6 +39,8 @@ import {
   isUsableFigure,
 } from "./types.js";
 import { notCollectedInventorySnapshot } from "./inventory.js";
+import { IGNORED_OS_METADATA_LABEL } from "./pack-files.js";
+import { declareArtifactScope } from "./artifact-scope.js";
 import {
   claimFromCompleteRead,
   foldOutcome,
@@ -233,7 +235,25 @@ function renderCover(
  * witness. This is the MED-1 fix: a failed read can never print as a definitive
  * zero via the type, not merely via adjacent prose.
  */
-function toolInventoryLine(inv: InventorySnapshot): string {
+function toolInventoryLine(
+  inv: InventorySnapshot,
+  scope: { quarterLabel: string; generatedAt: string }
+): string {
+  // D11-2: the inventory is read at GENERATION time and printed under a
+  // reporting-quarter heading, so "AI tools inventoried: 0" in a Q1 pack reads
+  // as "the firm used no AI tools in Q1" when the truth is "the fortress has no
+  // registered tools as of today". The inventory SECTION disclosed that rows
+  // reflect the last persisted configuration, but the exec-summary bullet a
+  // reader actually reads carried no qualifier, and neither surface named the
+  // mismatch with the reporting quarter. Declared from the scope registry.
+  const scopeNote = declareArtifactScope("tool_inventory", {
+    quarterLabel: scope.quarterLabel,
+    generatedAt: scope.generatedAt,
+  });
+  return toolInventoryClaim(inv) + scopeNote;
+}
+
+function toolInventoryClaim(inv: InventorySnapshot): string {
   if (
     inv.agents.status === "read_failed" ||
     inv.mcp_servers.status === "read_failed"
@@ -283,10 +303,11 @@ function toolInventoryLine(inv: InventorySnapshot): string {
 function renderExecutiveSummary(
   aggregation: ReadOutcome<QuarterAggregation>,
   shortfall: ReadOutcome<ShortfallReport>,
-  inv: InventorySnapshot
+  inv: InventorySnapshot,
+  scope: { quarterLabel: string; generatedAt: string }
 ): PackSection {
   const machines = "1 (this Sanctuary install)";
-  const toolLine = toolInventoryLine(inv);
+  const toolLine = toolInventoryLine(inv, scope);
 
   // The decision-count bullets are DEFINITIVE claims (e.g. "0 denied"), so they
   // may only be drawn from a completed audit read. A read failure prints an
@@ -1281,9 +1302,56 @@ export interface DiscreteExportsView {
   anchor: DiscreteExportView;
 }
 
+/**
+ * D11-2: the SINGLE construction site for what the public-anchor export lets a
+ * reader confirm. Anchor receipts bind to checkpoint RECORDS; those records ship
+ * in the transparency bundle. So the strength of the claim is a function of both
+ * exports, and taking both as parameters is what stops the anchor arm from
+ * asserting confirmation from a dependency the pack did not include.
+ *
+ * The verifier itself already encodes this relationship: `anchor-verify.ts`
+ * raises an `anchor_beyond_bundle` finding when a receipt proves a counter the
+ * supplied bundle does not reach. A reader handed anchors without a bundle
+ * cannot run that check at all.
+ */
+function anchorConfirmationLines(
+  anchorFilename: string,
+  transparency: DiscreteExportView,
+  scope: { quarterLabel: string }
+): string[] {
+  const preamble =
+    `Included as \`${anchorFilename}\`. It carries the anchor receipts this ` +
+    "fortress recorded. It contains salted commitments handed over " +
+    "deliberately, never content." +
+    declareArtifactScope("anchor_evidence", {
+      quarterLabel: scope.quarterLabel,
+    });
+  if (transparency.outcome.status === "populated") {
+    return [
+      preamble +
+        " Checked against the transparency checkpoint bundle above, an auditor " +
+        "can confirm those checkpoints were publicly anchored (freshness and " +
+        "fork detection).",
+      "",
+    ];
+  }
+  return [
+    preamble +
+      " NOTE: the transparency checkpoint bundle is NOT included in this pack " +
+      "(see above for why), and anchor receipts are checked AGAINST those " +
+      "checkpoint records. So this file alone does NOT let an auditor confirm " +
+      "that this fortress's checkpoints were publicly anchored: it shows which " +
+      "checkpoint counters carry anchor receipts, but the records they bind to " +
+      "are not here to check them against. Obtain the transparency bundle " +
+      "before relying on these receipts for freshness or fork detection.",
+    "",
+  ];
+}
+
 function renderVerification(
   signerDid: string,
-  discreteExports: DiscreteExportsView
+  discreteExports: DiscreteExportsView,
+  scope: { quarterLabel: string }
 ): PackSection {
   const body = [
     "# Verifying this pack as a third party",
@@ -1306,12 +1374,16 @@ function renderVerification(
     "2. Verify the Ed25519 signature over that SHA-256 digest against the " +
       `signer public key in the manifest (signer: ${signerDid}).`,
     "3. Reconcile the DIRECTORY against the manifest: list the files you " +
-      "received and confirm every one is either recorded in the manifest's " +
-      "`files` list or is `00_pack_manifest.json` or `evidence-pack.pdf`. A " +
-      "file present here but absent from the manifest is NOT covered by these " +
-      "signatures and must not be relied on, even if it looks like a valid " +
-      "Sanctuary artifact and verifies on its own: it may be left over from a " +
-      "different reporting period.",
+      "received (including hidden ones, for example `ls -a`) and confirm every " +
+      "one is either recorded in the manifest's `files` list or is " +
+      "`00_pack_manifest.json` or `evidence-pack.pdf`. A file present here but " +
+      "absent from the manifest is NOT covered by these signatures and must " +
+      "not be relied on, even if it looks like a valid Sanctuary artifact and " +
+      "verifies on its own: it may be left over from a different reporting " +
+      "period. The ONLY exception is inert operating-system metadata, which " +
+      "the generator ignores and which carries no evidentiary content: " +
+      IGNORED_OS_METADATA_LABEL +
+      ". Any other file, hidden or not, is a reconciliation failure.",
     "4. (Optional) Verify the manifest's own `manifest_signature`. Reproduce the " +
       "canonical body EXACTLY: take the manifest JSON, DROP the " +
       "`manifest_signature` field, sort ALL object keys recursively in ASCII " +
@@ -1370,7 +1442,10 @@ function renderVerification(
         "A PASS (exit 0) confirms the signed checkpoint chain. A stale but " +
           "genesis-rooted bundle can still pass offline verification; only " +
           "public anchoring (below) plus a pinned log key adds freshness and " +
-          "fork detection.",
+          "fork detection." +
+          declareArtifactScope("transparency_bundle", {
+            quarterLabel: scope.quarterLabel,
+          }),
         "",
       ],
       emptyVerified: () => [
@@ -1400,7 +1475,13 @@ function renderVerification(
         "```",
         "",
         "The export carries encrypted payload bytes only (no plaintext content " +
-          "is exposed).",
+          "is exposed)." +
+          // D11-2: this file spans the whole retained log, so a reader
+          // comparing its record count against the in-quarter totals stated
+          // elsewhere would otherwise conclude the report understates.
+          declareArtifactScope("audit_chain", {
+            quarterLabel: scope.quarterLabel,
+          }),
         "",
       ],
       emptyVerified: () => [
@@ -1416,13 +1497,23 @@ function renderVerification(
     "### Public-anchor (Rekor) evidence",
     "",
     ...foldOutcome(discreteExports.anchor.outcome, {
-      populated: () => [
-        `Included as \`${discreteExports.anchor.filename}\`. It carries the ` +
-          "anchor receipts this fortress recorded, so an auditor can confirm those " +
-          "checkpoints were publicly anchored (freshness and fork detection). It " +
-          "contains salted commitments handed over deliberately, never content.",
-        "",
-      ],
+      // D11-2 (Codex lens, dry-bar round 11): the confirmation claim is
+      // cross-gated on the transparency bundle actually being IN the pack. The
+      // anchor receipts prove a checkpoint COUNTER was anchored; confirming
+      // that means checking the receipt against the checkpoint record it binds
+      // to, and those records live in the transparency bundle. When the bundle
+      // is absent (for example a multi-key checkpoint history makes it
+      // ungatherable, which is a state this pack reaches on its own), the pack
+      // used to say an auditor "can confirm those checkpoints were publicly
+      // anchored" from a dependency it had not shipped -- a definitive
+      // verification claim over evidence the reader does not hold. The claim is
+      // now built from what was actually included.
+      populated: () =>
+        anchorConfirmationLines(
+          discreteExports.anchor.filename,
+          discreteExports.transparency,
+          scope
+        ),
       // C4 (dry-bar): reached ONLY when a real read found no anchor evidence --
       // either anchoring was never enabled, or it is enabled but no checkpoint
       // has been anchored yet. State both honestly rather than asserting a
@@ -1539,7 +1630,10 @@ export function renderSections(params: {
       params.productName,
       params.shortfall
     ),
-    renderExecutiveSummary(params.aggregation, params.shortfall, inv),
+    renderExecutiveSummary(params.aggregation, params.shortfall, inv, {
+      quarterLabel: params.window.label,
+      generatedAt: params.generatedAt,
+    }),
     renderInventory(inv),
     renderGovernancePolicy(),
     renderTrainingAttestations(),
@@ -1552,7 +1646,9 @@ export function renderSections(params: {
     renderAccessLog(params.aggregation, params.shortfall),
     renderCustody(params.custody),
     renderIncidentResponse(),
-    renderVerification(params.signerDid, params.discreteExports),
+    renderVerification(params.signerDid, params.discreteExports, {
+      quarterLabel: params.window.label,
+    }),
     renderScopeAndLimits(),
     renderPerMachineAppendix(),
   ];

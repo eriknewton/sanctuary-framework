@@ -87,3 +87,19 @@ export {
 } from "./signer.js";
 export type { PackSigner } from "./signer.js";
 export { runEvidencePack } from "./cli.js";
+export {
+  diagnoseHistoryGap,
+  type HistoryGapAttribution,
+  type HistoryGapFacts,
+  type HistoryGapDiagnosis,
+} from "./history-attribution.js";
+export {
+  isPackRelevantEntry,
+  IGNORED_OS_METADATA,
+  IGNORED_OS_METADATA_LABEL,
+} from "./pack-files.js";
+export {
+  declareArtifactScope,
+  type PackArtifactId,
+  type ArtifactScope,
+} from "./artifact-scope.js";

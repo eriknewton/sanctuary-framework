@@ -31,6 +31,7 @@ import {
   isUsableTimestamp,
 } from "./types.js";
 import { isInWindow } from "./quarter.js";
+import { diagnoseHistoryGap } from "./history-attribution.js";
 import {
   populated,
   readFailed,
@@ -652,6 +653,19 @@ export function detectShortfall(
   // the single-store case -- two-family gate follow-up).
   const daemonExcluded = daemonStoreExcludedFromCensus(retention.daemon_store);
 
+  // D11-1: ONE causal diagnosis of the log's history, settled ONCE from the
+  // definitive discriminator, shared by every start-side arm that says anything
+  // about why the history begins where it does. The zero-coverage arm and the
+  // partial-coverage arm previously computed this independently and diverged:
+  // on the same fortress, one said "not that entries were pruned" and the other
+  // said "almost always means earlier entries were pruned". Sharing the
+  // constructed value is what makes that divergence unrepresentable.
+  const historyGap = diagnoseHistoryGap({
+    ever_pruned: retention.ever_pruned,
+    at_cap_determinable: atCapDeterminable,
+    at_cap: retentionAtCap,
+  });
+
   // START SIDE.
   let coveredFrom: string;
   let startShortfall: boolean;
@@ -703,19 +717,26 @@ export function detectShortfall(
     coveredFrom = window.start_inclusive;
     startShortfall = true;
     zeroOfQuarterCovered = true;
-    // The reason + advice differ: an entry at/after the QUARTER END is the
-    // pruned-history case (FIFO advice applies); an entry after the attestable
-    // end but BEFORE the quarter end post-dates the report itself (a future
-    // stamp), where FIFO-pruning advice would be a false diagnosis.
+    // The reason + advice differ: an entry at/after the QUARTER END raises the
+    // question of what happened to the earlier history; an entry after the
+    // attestable end but BEFORE the quarter end post-dates the report itself (a
+    // future stamp), where ANY history-gap diagnosis would be a false diagnosis
+    // (nothing is missing; the report simply cannot yet attest that far).
     const postQuarterEnd = earliestMs >= quarterEndMs;
     const reasonClause = postQuarterEnd
       ? "is at or after the quarter end"
       : "is after this report's attested coverage end (" +
         coveredToExclusive +
         "), so it post-dates the window this report can attest";
+    // D11-1: the causal half of this sentence is built by the SINGLE history
+    // attribution constructor, which consults `ever_pruned` -- the definitive
+    // discriminator -- on every path. Before this, the arm branched only on
+    // `postQuarterEnd` and told a never-pruned fortress "This almost always
+    // means earlier entries were pruned", contradicting a fact the pack held
+    // and contradicting the sibling arm below on the SAME fortress. There is
+    // now no route from here to a causal claim that skips the discriminator.
     const tailAdvice = postQuarterEnd
-      ? " This almost always means earlier entries were pruned by size/count " +
-        "(FIFO) retention; raise the retention cap or export monthly snapshots."
+      ? " " + historyGap.cause + historyGap.advice
       : " Regenerate after the entry's timestamp (and after the quarter closes) " +
         "for a report whose attested window can include it.";
     startExplanation = daemonExcluded
@@ -739,16 +760,15 @@ export function detectShortfall(
   } else if (earliestMs > quarterStartMs) {
     coveredFrom = retention.earliest_retained_at!;
     startShortfall = true;
-    // The DEFINITIVE discriminator is whether the log ever pruned (a rotation
-    // anchor). Only affirm "genuine inactivity, not pruning" when we KNOW the
-    // log never pruned AND it is DEFINITIVELY below both caps; otherwise do not
-    // reassure. P1-B: when at-cap is not determinable (a merged census with no
-    // per-store breakdown), `!retentionAtCap` is true only because at-cap was
-    // never asserted, NOT because we proved below-cap -- so require
-    // `atCapDeterminable` here to keep the flattering reassurance from firing
-    // from an unknown cap position.
-    const neverPruned =
-      retention.ever_pruned === false && atCapDeterminable && !retentionAtCap;
+    // D11-1: the DEFINITIVE discriminator (whether the log ever pruned) is now
+    // consulted once, by `diagnoseHistoryGap` above, for BOTH this arm and the
+    // zero-coverage arm. The `never_pruned` attribution encodes exactly the old
+    // local predicate -- ever_pruned === false AND at-cap determinable AND below
+    // cap -- so this arm's behaviour is unchanged while the zero-coverage arm
+    // gains the check it was missing. P1-B: at-cap determinability is part of
+    // that attribution, so an unknown cap position cannot fire the flattering
+    // reassurance.
+    const neverPruned = historyGap.attribution === "never_pruned";
     // C2 (dry-bar): `earliest_retained_at` / `ever_pruned` are the OPERATOR
     // store's facts (the daemon store merges into the scan only when readable).
     // When a root-owned daemon store is present but EXCLUDED, the "no recorded
@@ -772,18 +792,19 @@ export function detectShortfall(
           "activity before " +
           coveredFrom +
           ", not that entries were pruned. Coverage begins at that instant."
-      : "The retained audit window begins after the quarter start, and " +
-        (retentionAtCap
-          ? "the log is at a retention cap (entries or size), "
-          : retention.ever_pruned === true
-            ? "the log has pruned entries at least once, "
-            : "size-based pruning of large early entries cannot be ruled out, ") +
-        "so earlier-quarter entries may have been pruned by size/count (FIFO) " +
-        "retention. This report covers access history from " +
+      : // D11-1: the ENTIRE causal clause comes from the shared constructor,
+        // not from a second local branch on the same facts. This arm used to
+        // compose its own "may have been pruned by size/count (FIFO) retention"
+        // sentence, which is the same shape that survived ten rounds: a claim
+        // constructible outside the chokepoint. D11-3: the advice no longer says
+        // "raise the retention cap" -- the shipped server exposes no way to
+        // raise it (see history-attribution.ts).
+        "The retained audit window begins after the quarter start. " +
+        historyGap.cause +
+        " This report covers access history from " +
         coveredFrom +
-        " onward; whether the gap is pruning or genuine inactivity cannot be " +
-        "affirmed here. Raise the retention cap or export monthly snapshots to " +
-        "cover the full quarter." +
+        " onward." +
+        historyGap.advice +
         (daemonExcluded ? daemonPresentButExcludedSuffix(retention) : "");
   } else {
     coveredFrom = window.start_inclusive;

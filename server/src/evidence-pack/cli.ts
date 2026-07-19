@@ -30,6 +30,7 @@ import {
 } from "../operational/audit-store-split.js";
 import { fortressRanAuditStoreSplitMigration } from "../cli/audit-chain-export.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import { isPackRelevantEntry } from "./pack-files.js";
 import {
   anchorReceiptsPresentOnDisk,
   buildAnchorsExport,
@@ -139,15 +140,25 @@ function readFailureReason(lead: string, cause: unknown): string {
 //
 // Files this tool never writes are REFUSED, not deleted: sweeping an operator's
 // own file out of their directory would be a data-loss bug, and a foreign file
-// in the shipped directory is exactly what would falsify section 1. Dotfiles
-// (`.DS_Store` and friends) are ignored throughout: they are neither Markdown
-// nor export files, so they cannot falsify the claim, and refusing on them would
-// make the tool unusable on a machine whose file browser has opened the folder.
-
-/** True for a directory entry the pack's claims range over (dotfiles excluded). */
-function isPackRelevantEntry(name: string): boolean {
-  return !name.startsWith(".");
-}
+// in the shipped directory is exactly what would falsify section 1.
+//
+// D11-1 (Codex lens, dry-bar round 11): the exemption for files the claim does
+// NOT range over used to be "any name starting with a dot". That was a
+// deliberate usability tradeoff -- refusing on `.DS_Store` would make the tool
+// unusable on a machine whose file browser has opened the delivery folder -- but
+// it was too wide to keep the signed claim true. A hidden `.counsel-notes.md` is
+// still a Markdown file in the delivered directory, so it bypassed both the
+// pre-write foreign check and the post-write reconciliation while section 1
+// asserted every Markdown and export file in the pack is recorded in the
+// manifest. A conscious tradeoff that breaks an honesty claim is still a defect.
+//
+// The exemption is now a CLOSED, NAMED set of inert operating-system metadata,
+// defined once in `pack-files.ts` and published from there into BOTH the writer
+// below and the signed section-1 verification recipe. The shipped directory and
+// the signed prose read from one definition, so they cannot disagree about what
+// "every file" means. Anything hidden but NOT on that list -- any `.md`,
+// `.json`, `.jsonl`, or any other unrecognized dotfile -- is pack-relevant and
+// is refused or reconciled exactly like a visible file.
 
 /**
  * Write the pack so the output directory ends up containing EXACTLY this run's
