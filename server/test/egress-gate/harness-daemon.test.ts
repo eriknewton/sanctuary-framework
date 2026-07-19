@@ -19,6 +19,7 @@ import {
   uninstallAgentHarnessDaemon,
   agentHarnessDaemonStatus,
   kickstartAgentHarnessDaemon,
+  setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
 } from "../../src/egress-gate/harness-daemon.js";
 import { FORBIDDEN_PLIST_ENV } from "../../src/cli/castle-wall-boot.js";
@@ -38,20 +39,42 @@ function mockOps(overrides: Partial<HarnessDaemonOps> = {}): HarnessDaemonOps & 
   const removals: string[] = [];
   const launchctl: string[][] = [];
   let installed = false;
+  // A mini-host, not a stub-per-verb: the fix-round-3 install path branches on
+  // whether the bytes it writes DIFFER from what is on disk, and the
+  // enable/disable path reads launchd's override table back. Both are
+  // meaningless against ops that forget what they were told.
+  const disk = new Map<string, string>();
+  let disabled = false;
   return {
     writes,
     removals,
     launchctl,
     writeFile(path, content, mode) {
       writes.push({ path, content, mode });
+      disk.set(path, content);
       return Promise.resolve();
+    },
+    readFile(path) {
+      return Promise.resolve(disk.get(path));
     },
     removeFile(path) {
       removals.push(path);
+      disk.delete(path);
       return Promise.resolve();
     },
     runLaunchctl(args) {
       launchctl.push([...args]);
+      if (args[0] === "print-disabled") {
+        return Promise.resolve({
+          code: 0,
+          stdout: disabled ? `\t"${AGENT_HARNESS_DAEMON_LABEL}" => disabled\n` : "",
+          stderr: "",
+        });
+      }
+      if (args[0] === "disable" || args[0] === "enable") {
+        disabled = args[0] === "disable";
+        return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+      }
       if (args[0] === "print") {
         return installed
           ? Promise.resolve({
@@ -185,6 +208,9 @@ describe("egress-gate/harness-daemon", () => {
         // abort render prints -- "re-run 'sanctuary protect --hermes'" -- could
         // not work on any host whose label the park had disabled.
         ["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        // Fix-round 3: the enable is READ BACK against launchd's persistent
+        // override table. A zero exit is not the state.
+        ["print-disabled", "system"],
         ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
@@ -287,6 +313,9 @@ describe("egress-gate/harness-daemon", () => {
           if (args[0] === "enable") {
             return Promise.resolve({ code: 0, stdout: "", stderr: "" });
           }
+          if (args[0] === "print-disabled") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
           return Promise.resolve({ code: 5, stdout: "", stderr: "Bootstrap failed" });
         },
       });
@@ -332,6 +361,9 @@ describe("egress-gate/harness-daemon", () => {
           if (args[0] === "enable") {
             return Promise.resolve({ code: 0, stdout: "", stderr: "" });
           }
+          if (args[0] === "print-disabled") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
           return Promise.resolve({
             code: 5,
             stdout: "",
@@ -339,17 +371,97 @@ describe("egress-gate/harness-daemon", () => {
           });
         },
       });
-      await installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops);
+      // The bytes on disk ALREADY match what this install writes -- the
+      // genuine idempotent-re-run shape. (Fix-round 3 narrowed the no-reload
+      // fast path to exactly this case; see the changed-bytes tests below.)
+      const plan = planAgentHarnessDaemonInstall(BASE);
+      await ops.writeFile(plan.plistPath, plan.plistContent, 0o644);
+      ops.writes.length = 0;
+      await installAgentHarnessDaemon(plan, ops);
       // Plist bytes refreshed, no second bootstrap attempted, nothing removed.
       expect(ops.writes).toHaveLength(1);
       expect(calls).toEqual([
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        ["print-disabled", "system"],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
       ]);
       expect(ops.removals).toEqual([]);
+    });
+
+    // ROUND-3 REGRESSION (Claude finding 1). Writing a plist FILE does not
+    // reload launchd. The pre-fix `existing.installed` branch wrote new bytes,
+    // saw "a stable pid exists", and returned -- so the parked-install revert
+    // could restore the operator's plist to DISK while launchd kept running
+    // the confined barrier job, and the operator was told the harness was
+    // running again. The pid observed has to belong to the unit we wrote.
+    it("R3: an already-installed service whose plist bytes CHANGED is booted out and re-bootstrapped, not merely rewritten", async () => {
+      const calls: string[][] = [];
+      let loaded = true;
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          calls.push([...args]);
+          if (args[0] === "print") {
+            return Promise.resolve(
+              loaded
+                ? {
+                    code: 0,
+                    stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n}\n`,
+                    stderr: "",
+                  }
+                : { code: 113, stdout: "", stderr: "Could not find service" },
+            );
+          }
+          if (args[0] === "bootout") {
+            loaded = false;
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "bootstrap") {
+            loaded = true;
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          if (args[0] === "print-disabled") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+      // Disk holds a DIFFERENT unit (stand in for the parked barrier plist).
+      await ops.writeFile(AGENT_HARNESS_DAEMON_PLIST_PATH, "<plist><!-- BARRIER --></plist>", 0o644);
+      await installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops);
+      const verbs = calls.map((c) => c[0]);
+      expect(verbs).toContain("bootout");
+      expect(verbs).toContain("bootstrap");
+      // And in that order: the bootout precedes the bootstrap that loads the
+      // bytes we wrote.
+      expect(verbs.indexOf("bootout")).toBeLessThan(verbs.indexOf("bootstrap"));
+      expect(ops.removals).toEqual([]);
+    });
+
+    it("R3: refuses when the plist changed and the old job will not stop -- rather than report an install whose unit was never loaded", async () => {
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            return Promise.resolve({
+              code: 0,
+              stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n}\n`,
+              stderr: "",
+            });
+          }
+          if (args[0] === "print-disabled") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
+          // bootout claims success; the job stays up. Exactly the shape the
+          // shared not-loaded predicate's safety comment warns about.
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+      await ops.writeFile(AGENT_HARNESS_DAEMON_PLIST_PATH, "<plist><!-- BARRIER --></plist>", 0o644);
+      await expect(installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops)).rejects.toThrow(
+        /STILL RUNNING after bootout; refusing to report an install whose new unit was never loaded/,
+      );
     });
 
     it("bootstrap accepted but crash-looping harness does NOT report installed success", async () => {
@@ -605,6 +717,63 @@ describe("egress-gate/harness-daemon", () => {
       expect(ops.removals).toEqual([]);
     });
 
+    // ROUND-3 REGRESSION (Claude finding 2). The round-2 post-bootout check
+    // was a SINGLE sample while its comment claimed it settled "exactly as the
+    // parked install's stopped-settle assertion does" -- an assertion that
+    // samples 20x250ms precisely because this branch learned on Mini1 that a
+    // bootout's zero exit does not prove the process is reaped. One sample
+    // turns a job one sample away from gone into a refusal, on stock
+    // `sanctuary unprotect`, whose plist is KeepAlive: the harness comes back
+    // at next boot after the user asked for it to be gone.
+    it("R3: uninstall SETTLES -- a job that is still running on the first sample and gone on the second is torn down, not refused", async () => {
+      let prints = 0;
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            prints += 1;
+            return Promise.resolve(
+              prints === 1
+                ? {
+                    code: 0,
+                    stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 4242\n\tstate = stopping\n}\n`,
+                    stderr: "",
+                  }
+                : { code: 113, stdout: "", stderr: "Could not find service" },
+            );
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+      await uninstallAgentHarnessDaemon(ops);
+      expect(prints).toBeGreaterThan(1);
+      expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
+    });
+
+    // Finding 5: the EINPROGRESS asymmetry. The parked install tolerated and
+    // settled on it; this site threw. One shared pair of predicates now, so
+    // the two bootout sites behave the same way on the same launchd reply.
+    it("R3: uninstall tolerates an EINPROGRESS bootout and settles rather than throwing on it", async () => {
+      let prints = 0;
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            prints += 1;
+            return Promise.resolve(
+              prints === 1
+                ? { code: 0, stdout: `system/${AGENT_HARNESS_DAEMON_LABEL} = {\n\tpid = 77\n}\n`, stderr: "" }
+                : { code: 113, stdout: "", stderr: "Could not find service" },
+            );
+          }
+          if (args[0] === "bootout") {
+            return Promise.resolve({ code: 36, stdout: "", stderr: "Boot-out failed: 36: Operation now in progress" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+      await uninstallAgentHarnessDaemon(ops);
+      expect(ops.removals).toEqual([AGENT_HARNESS_DAEMON_PLIST_PATH]);
+    });
+
     it("uninstall REFUSES to remove the plist against an untrustworthy post-bootout status", async () => {
       const ops = mockOps({
         runLaunchctl: (args) => {
@@ -707,5 +876,70 @@ describe("egress-gate/harness-daemon", () => {
       });
       expect(await agentHarnessDaemonStatus(ops)).toEqual({ known: false, installed: false, running: false });
     });
+  });
+});
+
+// ROUND-3 (both lenses; Claude finding 3 / Codex non-blocking residual). Every
+// caller wrote "confirmed disabled/enabled" around a function that read the
+// `launchctl enable`/`disable` EXIT CODE and never re-read launchd's
+// persistent override database. The codebase already had the readback
+// (`print-disabled system`, what `verifyHarnessJobDisabled` uses), so the
+// resolution is to OBSERVE, not to disclose a bound.
+describe("setAgentHarnessJobDisabled reads the override database back (fix-round 3)", () => {
+  function overrideOps(overrides: {
+    disabledTable: boolean | "unreadable";
+    verbCode?: number;
+  }): HarnessDaemonOps & { launchctl: string[][] } {
+    const launchctl: string[][] = [];
+    return {
+      launchctl,
+      writeFile: async () => {},
+      readFile: async () => undefined,
+      removeFile: async () => {},
+      runLaunchctl: (args) => {
+        launchctl.push([...args]);
+        if (args[0] === "print-disabled") {
+          return overrides.disabledTable === "unreadable"
+            ? Promise.resolve({ code: 5, stdout: "", stderr: "Bootstrap failed: 5" })
+            : Promise.resolve({
+                code: 0,
+                stdout: overrides.disabledTable ? `\t"${AGENT_HARNESS_DAEMON_LABEL}" => disabled\n` : "",
+                stderr: "",
+              });
+        }
+        return Promise.resolve({ code: overrides.verbCode ?? 0, stdout: "", stderr: "" });
+      },
+      sleepMs: async () => {},
+    };
+  }
+
+  it("refuses when the verb exits 0 but the override table disagrees", async () => {
+    // The exact fail-open: `launchctl disable` returns 0, launchd's durable
+    // override state is untouched, and the park is reported as asserted.
+    const ops = overrideOps({ disabledTable: false });
+    await expect(setAgentHarnessJobDisabled(ops, true)).rejects.toThrow(
+      /still reports the job ENABLED; refusing to report the job disabled/,
+    );
+    expect(ops.launchctl.map((c) => c[0])).toContain("print-disabled");
+  });
+
+  it("refuses in the enable direction too", async () => {
+    const ops = overrideOps({ disabledTable: true });
+    await expect(setAgentHarnessJobDisabled(ops, false)).rejects.toThrow(
+      /still reports the job DISABLED; refusing to report the job enabled/,
+    );
+  });
+
+  it("refuses fail-closed when the override table cannot be read at all", async () => {
+    // "I could not tell" must never pass for "it is set".
+    const ops = overrideOps({ disabledTable: "unreadable" });
+    await expect(setAgentHarnessJobDisabled(ops, true)).rejects.toThrow(
+      /could not be read back .*; refusing to report the job disabled/,
+    );
+  });
+
+  it("accepts when the verb exits 0 and the table agrees", async () => {
+    await expect(setAgentHarnessJobDisabled(overrideOps({ disabledTable: true }), true)).resolves.toBeUndefined();
+    await expect(setAgentHarnessJobDisabled(overrideOps({ disabledTable: false }), false)).resolves.toBeUndefined();
   });
 });

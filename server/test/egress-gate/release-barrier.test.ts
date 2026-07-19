@@ -899,12 +899,17 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     log: RevertLog;
   } {
     const log: RevertLog = { restarted: [], disableCleared: 0, writes: [], removed: [] };
+    // Backed by a real map (fix-round 3, 2026-07-19): `plistRestored` is now
+    // READ BACK from disk rather than inferred from `writeFile` resolving, so
+    // ops that forget what they were told can no longer assert the claim.
+    const disk = new Map<string, string>();
     return {
       log,
       ops: {
         async restoreRunningHarness(plistContent) {
           if (overrides?.restartError !== undefined) throw new Error(overrides.restartError);
           log.restarted.push(plistContent);
+          disk.set(AGENT_HARNESS_DAEMON_PLIST_PATH, plistContent);
         },
         async clearJobDisable() {
           log.disableCleared += 1;
@@ -912,9 +917,14 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
         async writeFile(path, content) {
           if (overrides?.writeError !== undefined) throw new Error(overrides.writeError);
           log.writes.push({ path, content });
+          disk.set(path, content);
+        },
+        async readFile(path) {
+          return disk.get(path);
         },
         async removeFile(path) {
           log.removed.push(path);
+          disk.delete(path);
         },
       },
     };
@@ -929,6 +939,57 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
   };
+
+  // ROUND-3. `plistRestored` used to be set because `writeFile` resolved --
+  // disclosed as an "honest bound", which both lenses said was the wrong
+  // resolution for something the ops could simply read back. A resolved write
+  // is not a read: a truncating writer, a full filesystem, or a path that is
+  // not the file we think it is all resolve.
+  it("R3: a write that RESOLVES but does not land reports plistRestored:false and restored:false", async () => {
+    const log: RevertLog = { restarted: [], disableCleared: 0, writes: [], removed: [] };
+    const ops = {
+      async restoreRunningHarness() {
+        throw new Error("launchctl bootstrap exited 5");
+      },
+      async clearJobDisable() {
+        log.disableCleared += 1;
+      },
+      async writeFile(path: string, content: string) {
+        // Resolves. Writes nothing.
+        log.writes.push({ path, content });
+      },
+      async readFile() {
+        return undefined;
+      },
+      async removeFile(path: string) {
+        log.removed.push(path);
+      },
+    };
+    const result = await revertParkedHarnessInstall(runningSnapshot, ops);
+    expect(result.plistRestored).toBe(false);
+    expect(result.restored).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/does not match what was there before this run/);
+  });
+
+  it("R3: a clean-host revert whose removal silently leaves the file reports plistRestored:false", async () => {
+    const ops = {
+      async restoreRunningHarness() {},
+      async clearJobDisable() {},
+      async writeFile() {},
+      async readFile() {
+        return "<plist><!-- STILL HERE --></plist>";
+      },
+      async removeFile() {},
+    };
+    const result = await revertParkedHarnessInstall(
+      { ...runningSnapshot, preexistingJobModified: false, wasRunning: false },
+      ops,
+    );
+    expect(result.nothingToRevert).toBe(true);
+    expect(result.plistRestored).toBe(false);
+    expect(result.restored).toBe(false);
+    expect(result.errors.join(" ")).toMatch(/STILL PRESENT after removing it/);
+  });
 
   it("restores the operator's ORIGINAL plist bytes and restarts the agent that was running", async () => {
     const { ops, log } = makeRevertOps();

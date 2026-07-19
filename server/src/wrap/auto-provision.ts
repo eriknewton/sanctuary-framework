@@ -2295,6 +2295,15 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
       const { writeFile } = await import("node:fs/promises");
       await writeFile(path, content, { mode });
     },
+    readFile: async (path) => {
+      const { readFile } = await import("node:fs/promises");
+      try {
+        return await readFile(path, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw err;
+      }
+    },
     removeFile: async (path) => {
       const { unlink } = await import("node:fs/promises");
       await unlink(path).catch((err) => {
@@ -2321,8 +2330,11 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
  * "restored" means. `restoreRunningHarness` is deliberately the same
  * enable + coarse-install pair the S5-6 degrade path (`startHarnessCoarse`)
  * uses, and `installAgentHarnessDaemon` refuses unless launchd reports a
- * STABLE running pid -- so its resolving is an OBSERVATION that the agent is
- * back up, never merely a request that it should be.
+ * STABLE running pid FOR THE UNIT IT JUST WROTE -- since fix-round 3 it boots
+ * out and re-bootstraps whenever the bytes differ from what is on disk, so the
+ * pid it observes cannot be the barrier job the stand-down replaced. That is
+ * what makes its resolving an OBSERVATION that the agent is back up, rather
+ * than merely a request that it should be.
  */
 function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallRevertOps {
   return {
@@ -2341,6 +2353,7 @@ function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallR
       await setAgentHarnessJobDisabled(daemonOps, false);
     },
     writeFile: daemonOps.writeFile,
+    readFile: daemonOps.readFile,
     removeFile: daemonOps.removeFile,
   };
 }

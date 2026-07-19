@@ -557,6 +557,10 @@ describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quar
 
 describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: release binds to the CAPTURED generation)", () => {
   function mkBarrierOps(commitGen: number, calls: string[]): ReleaseBarrierOps {
+    // Stateful running flag (fix-round 3, 2026-07-19): reassert-parked now
+    // OBSERVES the stop, so an always-running stub refuses at stage one --
+    // which is the correct new behaviour and would have masked these tests.
+    let running = false;
     return {
       disableJob: async () => {
         calls.push("disableJob");
@@ -566,9 +570,11 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       },
       bootstrapJob: async () => {
         calls.push("bootstrapJob");
+        running = true;
       },
       bootoutJob: async () => {
         calls.push("bootoutJob");
+        running = false;
       },
       removeHoldFile: async () => undefined,
       writeHoldFile: async () => undefined,
@@ -578,7 +584,11 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502 }),
       writeReleasedPlist: async () => undefined,
       restoreParkedPlist: async () => undefined,
-      harnessStatus: async () => ({ known: true, installed: true, running: true, pid: 4242 }),
+      harnessStatus: async () =>
+        running
+          ? { known: true, installed: true, running: true, pid: 4242 }
+          : { known: true, installed: true, running: false },
+      sleepMs: async () => {},
     };
   }
 

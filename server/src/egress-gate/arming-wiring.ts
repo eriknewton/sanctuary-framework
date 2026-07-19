@@ -81,6 +81,7 @@ import {
   installAgentHarnessDaemon,
   launchctlBootoutWasNotLoaded,
   planAgentHarnessDaemonInstall,
+  readAgentHarnessJobDisabledOverride,
   setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
   type HarnessDaemonStatus,
@@ -364,6 +365,14 @@ function realHarnessOps(): HarnessDaemonOps {
   return {
     async writeFile(path, content, mode): Promise<void> {
       await writeFile(path, content, { mode });
+    },
+    async readFile(path): Promise<string | undefined> {
+      try {
+        return await readFile(path, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw err;
+      }
     },
     async removeFile(path): Promise<void> {
       await rm(path, { force: true });
@@ -920,14 +929,22 @@ export function createProductionReleaseBarrierOps(input: {
     return readCommittedFrom(await listQuarantineAware("commit-generation"));
   }
 
+  // The barrier's launchd surface, bound to THIS sequence's launchctl runner
+  // so the enable/disable readback (fix-round 3) uses the same one the rest of
+  // the sequence does.
+  const barrierHarnessOps: HarnessDaemonOps = { ...realHarnessOps(), runLaunchctl: launchctl };
+
   return {
     async disableJob(): Promise<void> {
-      const r = await launchctl(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-      if (r.code !== 0) throw new Error(`launchctl disable exited ${r.code}: ${r.stderr.trim()}`);
+      // Routed through `setAgentHarnessJobDisabled` (fix-round 3, 2026-07-19)
+      // rather than checking the exit code here: that function re-reads
+      // launchd's persistent override database, so `jobDisabled: true` in a
+      // parked outcome is an observation. This site was a hand-rolled second
+      // copy that only saw the exit code.
+      await setAgentHarnessJobDisabled(barrierHarnessOps, true);
     },
     async enableJob(): Promise<void> {
-      const r = await launchctl(["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-      if (r.code !== 0) throw new Error(`launchctl enable exited ${r.code}: ${r.stderr.trim()}`);
+      await setAgentHarnessJobDisabled(barrierHarnessOps, false);
     },
     async bootstrapJob(): Promise<void> {
       const plistPath = `/Library/LaunchDaemons/${AGENT_HARNESS_DAEMON_LABEL}.plist`;
@@ -948,12 +965,32 @@ export function createProductionReleaseBarrierOps(input: {
       // reachable release sequence's reassert-parked and bootstrap-cleanup
       // steps, where a clean host reporting a not-loaded shape this regex does
       // not know would refuse the fine-grained arm for no reason.
+      // FIX-ROUND 3 (2026-07-19): the predicate's safety argument -- "no caller
+      // relies on it alone; every one re-reads `launchctl print` afterwards and
+      // refuses if the job is still running" -- is now TRUE of this caller.
+      // `runReleaseBarrierSequence`'s reassert-parked stage performs that
+      // authoritative settled re-read before it proceeds to `rearmAnchor`; the
+      // abort-cleanup call sites are followed by a fail-closed parked outcome.
       if (!launchctlBootoutWasNotLoaded(r)) {
         throw new Error(`launchctl bootout exited ${r.code}: ${r.stderr.trim()}`);
       }
     },
     async removeHoldFile(): Promise<void> {
       await rm(holdPath, { force: true });
+      // READ BACK (fix-round 3, 2026-07-19). `holdFileRemoved: true` in a
+      // parked outcome told the operator the release material is gone; it used
+      // to mean only that `rm` did not throw. The hold file is what the S5-5
+      // wrapper consults to decide whether to exec, so a stale one surviving a
+      // park is the fail-open direction.
+      try {
+        await readFile(holdPath, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw new Error(`could not confirm the release hold file ${holdPath} is gone: ${(err as Error).message}`, {
+          cause: err,
+        });
+      }
+      throw new Error(`the release hold file ${holdPath} is STILL PRESENT after removal`);
     },
     async writeHoldFile(record): Promise<void> {
       // Drill D1: routed through the single hold-dir chokepoint, which ensures
@@ -1333,15 +1370,15 @@ export interface PersistentParkDeps {
 export async function verifyHarnessJobDisabled(
   runLaunchctlFn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }> = runLaunchctl,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const r = await runLaunchctlFn(["print-disabled", "system"]);
-  if (r.code !== 0) {
-    return { ok: false, reason: `launchctl print-disabled system exited ${r.code}: ${r.stderr.trim()}` };
-  }
-  // macOS prints either `"<label>" => disabled` (newer) or `"<label>" => true`.
-  const label = AGENT_HARNESS_DAEMON_LABEL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (new RegExp(`"${label}"\\s*=>\\s*(disabled|true)\\b`).test(r.stdout)) {
-    return { ok: true };
-  }
+  // ONE parser for the override table (fix-round 3, 2026-07-19): this used to
+  // carry its own copy of the `print-disabled` regex, and
+  // `setAgentHarnessJobDisabled`'s new readback would have been a second one.
+  const override = await readAgentHarnessJobDisabledOverride({
+    ...realHarnessOps(),
+    runLaunchctl: runLaunchctlFn,
+  });
+  if (!override.known) return { ok: false, reason: override.reason };
+  if (override.disabled) return { ok: true };
   return {
     ok: false,
     reason: `launchd's override database does not show ${AGENT_HARNESS_DAEMON_LABEL} disabled (the job can boot at next reboot)`,

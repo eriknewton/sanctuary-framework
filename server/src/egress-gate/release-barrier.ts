@@ -79,6 +79,7 @@ import { isAbsolute } from "node:path";
 import {
   AGENT_HARNESS_DAEMON_LABEL,
   AGENT_HARNESS_DAEMON_PLIST_PATH,
+  awaitHarnessStoppedVia,
   launchctlBootoutWasInProgress,
   launchctlBootoutWasNotLoaded,
   renderAgentHarnessDaemonPlist,
@@ -559,15 +560,6 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
 }
 
 /**
- * How many times the stand-down re-samples `launchctl print` while waiting for
- * a booted-out job to actually stop, and how long it waits between samples.
- * `bootout` can return EINPROGRESS for a job that takes time to die, and even
- * a zero exit does not guarantee the process is already reaped.
- */
-const HARNESS_STOP_SETTLE_SAMPLES = 20;
-const HARNESS_STOP_SETTLE_INTERVAL_MS = 250;
-
-/**
  * Injected side effects for the parked install (root in production; mocks in
  * tests).
  *
@@ -949,46 +941,62 @@ function standDownStillStoppedAdvice(snapshot: HarnessStandDownSnapshot): string
 }
 
 /**
- * Sample the harness status until launchd stops reporting it running, bounded.
- * Returns the LAST sample either way, so the caller's fail-closed assertions
- * (unknown status / still running) are unchanged -- this only decides how long
- * to wait before making them.
+ * The stand-down's stopped-settle, now the SHARED loop (fix-round 3): the same
+ * bound the teardown and the changed-plist reload use, so the three sites
+ * cannot drift into disagreeing about how long "stopped" takes to be true.
  */
 async function awaitHarnessStopped(ops: ParkedInstallOps): Promise<HarnessDaemonStatus> {
-  const sleep = ops.sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  let status = await ops.harnessStatus();
-  for (let i = 1; i < HARNESS_STOP_SETTLE_SAMPLES && status.known && status.running; i++) {
-    await sleep(HARNESS_STOP_SETTLE_INTERVAL_MS);
-    status = await ops.harnessStatus();
-  }
-  return status;
+  return awaitHarnessStoppedVia(() => ops.harnessStatus(), ops.sleepMs);
 }
 
 /** Injected side effects for {@link revertParkedHarnessInstall}. */
 export interface ParkedInstallRevertOps {
   /**
    * Put the harness back to `plistContent` AND back to a stable running state:
-   * clear the persistent launchd disable, write the plist, bootstrap, and
-   * verify a stable pid. Production wires this to the SAME
-   * `setAgentHarnessJobDisabled(false)` + `installAgentHarnessDaemon` pair the
-   * S5-6 degrade path (`startHarnessCoarse`) already uses -- deliberately one
-   * recovery routine, not a second one written for this path.
+   * clear the persistent launchd disable, write the plist, RELOAD launchd when
+   * the bytes changed, and verify a stable pid. Production wires this to the
+   * SAME `setAgentHarnessJobDisabled(false)` + `installAgentHarnessDaemon`
+   * pair the S5-6 degrade path (`startHarnessCoarse`) already uses --
+   * deliberately one recovery routine, not a second one written for this path.
+   *
+   * THE RELOAD IS LOAD-BEARING (fix-round 3, 2026-07-19). Through round 2 this
+   * comment named a `bootstrap` that `installAgentHarnessDaemon` did not
+   * perform when launchd already had the label: it wrote the plist FILE and
+   * checked that a stable pid existed. On this exact path that pid is the
+   * CONFINED barrier job -- the one the stand-down was supposed to have
+   * replaced -- so `harnessRestarted: true` meant "a pid exists", not "the
+   * restored plist is what is loaded", and disk and launchd could disagree
+   * while the operator was told the agent was back. `installAgentHarnessDaemon`
+   * now boots out and re-bootstraps whenever the bytes it writes differ from
+   * the bytes on disk, which is what makes this contract true.
    */
   restoreRunningHarness(plistContent: string): Promise<void>;
   /**
    * Clear the persistent launchd disable this install set.
    *
-   * HONEST BOUND (fix-round 2, 2026-07-18): production wires this to
-   * `setAgentHarnessJobDisabled(false)`, which checks the `launchctl enable`
-   * EXIT CODE and does not re-read the disabled state afterwards. So a
-   * `restored: true` verdict rests on an observed plist and an observed
-   * run-state, plus an unobserved-but-non-erroring enable. It is called out
-   * because the whole point of this fix-round is that unobserved steps get
-   * named rather than folded into a claim.
+   * OBSERVED (fix-round 3, 2026-07-19). Production wires this to
+   * `setAgentHarnessJobDisabled(false)`, which through round 2 checked the
+   * `launchctl enable` EXIT CODE only -- disclosed as an honest bound, and
+   * both round-3 lenses said disclosure was the wrong resolution for a claim
+   * the codebase already had the means to observe. It now re-reads launchd's
+   * persistent override database (`print-disabled system`) and throws when the
+   * state does not match or cannot be read, so a `restored: true` verdict
+   * rests on an observed plist, an observed run-state, AND an observed
+   * override state.
    */
   clearJobDisable(): Promise<void>;
   /** Write a file with a mode. */
   writeFile(path: string, content: string, mode: number): Promise<void>;
+  /**
+   * Read a file's contents, or `undefined` when it does not exist.
+   *
+   * REQUIRED so `plistRestored` can be an observation (fix-round 3,
+   * 2026-07-19). It previously came from `writeFile` resolving -- disclosed as
+   * an honest bound, but a resolved write is not a read: a truncating writer, a
+   * full filesystem, or a path that is not the file we think it is all resolve.
+   * The revert reads the plist back and compares before claiming it is back.
+   */
+  readFile(path: string): Promise<string | undefined>;
   /** Remove the file at `path` (ENOENT is not an error). */
   removeFile(path: string): Promise<void>;
 }
@@ -997,9 +1005,17 @@ export interface ParkedInstallRevertOps {
 export interface ParkedInstallRevertResult {
   /** Nothing pre-existing was modified, so there was nothing to undo. */
   nothingToRevert: boolean;
-  /** The prior plist bytes are back in place (or removed, if there were none). */
+  /**
+   * The prior plist bytes are back in place (or removed, if there were none),
+   * READ BACK FROM DISK after the write -- not inferred from the write
+   * resolving (fix-round 3, 2026-07-19).
+   */
   plistRestored: boolean;
-  /** The job was running before and is running again. */
+  /**
+   * The job was running before, and the RESTORED plist is what launchd has
+   * loaded and running now. Not "a pid exists": see the reload contract on
+   * {@link ParkedInstallRevertOps.restoreRunningHarness}.
+   */
   harnessRestarted: boolean;
   /** The job was running before the stand-down (echoed from the snapshot). */
   wasRunning: boolean;
@@ -1048,11 +1064,17 @@ export async function revertParkedHarnessInstall(
     // nothing, so "restore" means remove them again rather than leave a
     // disabled label and a stray barrier plist behind for the next run to
     // trip over.
-    let plistRestored = true;
+    let plistRestored = false;
     try {
       await ops.removeFile(snapshot.plistPath);
+      plistRestored = await confirmPlistOnDisk(ops, snapshot.plistPath, undefined);
+      if (!plistRestored) {
+        errors.push(
+          `the parked harness plist ${snapshot.plistPath} is STILL PRESENT after removing it (or could not be ` +
+            "read back to confirm)",
+        );
+      }
     } catch (err) {
-      plistRestored = false;
       errors.push(`could not remove the parked harness plist ${snapshot.plistPath}: ${describeError(err)}`);
     }
     try {
@@ -1102,7 +1124,16 @@ export async function revertParkedHarnessInstall(
     } else {
       await ops.removeFile(snapshot.plistPath);
     }
-    plistRestored = true;
+    // READ IT BACK (fix-round 3). `plistRestored` used to be set because the
+    // write resolved. The claim is about what is on disk, so it is now read
+    // from disk.
+    plistRestored = await confirmPlistOnDisk(ops, snapshot.plistPath, snapshot.priorPlistContent);
+    if (!plistRestored) {
+      errors.push(
+        `the harness plist ${snapshot.plistPath} does not match what was there before this run after the ` +
+          "restore (or could not be read back to confirm)",
+      );
+    }
   } catch (err) {
     errors.push(`could not restore the harness plist ${snapshot.plistPath}: ${describeError(err)}`);
   }
@@ -1134,6 +1165,23 @@ export async function revertParkedHarnessInstall(
     restored: plistRestored && !snapshot.wasRunning && errors.length === 0,
     errors,
   };
+}
+
+/**
+ * Read the plist back and answer whether disk holds `expected` (`undefined`
+ * meaning "no file"). Fail-closed: a read that throws answers false -- we
+ * could not confirm, so we do not claim.
+ */
+async function confirmPlistOnDisk(
+  ops: ParkedInstallRevertOps,
+  path: string,
+  expected: string | undefined,
+): Promise<boolean> {
+  try {
+    return (await ops.readFile(path)) === expected;
+  } catch {
+    return false;
+  }
 }
 
 function describeError(err: unknown): string {
@@ -1241,8 +1289,17 @@ export interface ReleaseBarrierOps {
    * mean STABLE-running (the exported `agentHarnessDaemonStableRunning`
    * sampling bar), not a single point sample: a kickstarted process that
    * immediately exits (a refusing wrapper) must read as not running.
+   *
+   * It MUST carry `pid` through even when it downgrades `running` to false:
+   * the reassert-parked stopped assertion treats ANY pid as disqualifying (see
+   * `probeHarnessStopped`), because an unstable pid is a live process.
    */
   harnessStatus(): Promise<HarnessDaemonStatus>;
+  /**
+   * Sleep between stopped-settle samples. Optional; tests inject a no-op so
+   * the reassert-parked settle is instant.
+   */
+  sleepMs?(ms: number): Promise<void>;
 }
 
 /** Terminal outcome of one release-sequence run. */
@@ -1275,11 +1332,25 @@ interface ParkCleanupResult {
 
 async function parkCleanup(
   ops: ReleaseBarrierOps,
-  input: { removeHold: boolean; disable: boolean; bootout?: boolean; restorePlist?: boolean },
+  input: {
+    removeHold: boolean;
+    disable: boolean;
+    bootout?: boolean;
+    restorePlist?: boolean;
+    /**
+     * What this call may ASSUME already holds because an earlier call in the
+     * same sequence observed it. Defaults to false for both: a step this call
+     * did not perform is not a state this call observed (fix-round 3,
+     * 2026-07-19 -- these two flags previously defaulted to `true` whenever
+     * the step was skipped, so the post-re-park cleanup reported
+     * `jobDisabled: true` having issued no disable at all).
+     */
+    carried?: { jobDisabled?: boolean; holdFileRemoved?: boolean };
+  },
 ): Promise<ParkCleanupResult> {
   const errors: string[] = [];
-  let jobDisabled = !input.disable;
-  let holdFileRemoved = !input.removeHold;
+  let jobDisabled = input.disable ? false : input.carried?.jobDisabled === true;
+  let holdFileRemoved = input.removeHold ? false : input.carried?.holdFileRemoved === true;
   if (input.bootout === true) {
     try {
       await ops.bootoutJob();
@@ -1339,7 +1410,11 @@ async function parkCleanup(
  *     crashed previous run -- or a coarse-mode-running harness on the repair
  *     path -- can never leak a releasable state OR a live process into this
  *     one; if the park cannot be asserted, the sequence refuses to proceed
- *     at all.
+ *     at all. "Asserted" means OBSERVED, not attempted: the bootout's success
+ *     is followed by a settled `harnessStatus()` read that must report a
+ *     trustworthy launchd state with no pid. Nothing downstream can establish
+ *     this after the fact -- the later running probes only prove SOME harness
+ *     is up at the end, never that the pre-existing one went down.
  */
 export async function runReleaseBarrierSequence(
   ctx: ReleaseBarrierContext,
@@ -1375,15 +1450,54 @@ export async function runReleaseBarrierSequence(
     };
   }
 
+  // ...AND PROVE IT STOPPED, BEFORE ANYTHING ELSE RUNS (fix-round 3 BLOCKER,
+  // 2026-07-19). `parkCleanup` above reports success when `bootoutJob`,
+  // `removeHoldFile`, `disableJob` and `restoreParkedPlist` did not throw --
+  // an INTENT, not an observation. Production's `bootoutJob` accepts success
+  // through the shared `launchctlBootoutWasNotLoaded` predicate, whose own
+  // safety argument is that "every caller re-reads `launchctl print`
+  // afterwards and refuses if the job is still running"; this sequence was a
+  // reachable caller that did not, which made that argument false.
+  //
+  // WHY THE LATER CHECKS DO NOT COVER THIS. The sequence's stable-running
+  // probes run AFTER enable + bootstrap, so all they establish is that SOME
+  // launchd-managed harness is running at the end. They cannot distinguish the
+  // post-G5 confined process from a pre-G5 (or coarse-mode) harness that
+  // survived the supposed park -- and the S5-5 wrapper/hold-file barrier
+  // controls new execs only; it cannot retroactively confine an already-live
+  // process. So a green release could be reported over an unproven one.
+  //
+  // Fail-closed both ways: still running refuses, and an UNKNOWABLE launchd
+  // state refuses too, because "I could not tell" is not a park.
+  {
+    const stopped = await probeHarnessStopped(ops);
+    if (!stopped.ok) {
+      return {
+        kind: "parked",
+        stage: "reassert-parked",
+        reason:
+          `the parked state was not asserted: ${stopped.reason}; refusing to run the release sequence over a ` +
+          "harness this run did not prove it stopped",
+        holdFileRemoved: initial.holdFileRemoved,
+        jobDisabled: initial.jobDisabled,
+        cleanupErrors: [],
+      };
+    }
+  }
+
   // Stage: rearm-anchor. Already parked; an abort here needs no new cleanup.
+  // The two flags are CARRIED FROM `initial`, not hardcoded (fix-round 3,
+  // 2026-07-19): they used to be literal `true`s on a branch that ran no op at
+  // all, justified by a comment rather than by anything that happened. If the
+  // reassert above did not observe them, this abort must not claim them.
   const rearm = await ops.rearmAnchor();
   if (!rearm.ok) {
     return {
       kind: "parked",
       stage: "rearm-anchor",
       reason: `pf anchor re-arm failed: ${rearm.reason}`,
-      holdFileRemoved: true,
-      jobDisabled: true,
+      holdFileRemoved: initial.holdFileRemoved,
+      jobDisabled: initial.jobDisabled,
       cleanupErrors: [],
     };
   }
@@ -1395,8 +1509,9 @@ export async function runReleaseBarrierSequence(
       kind: "parked",
       stage: "gate-verify",
       reason: `gate verification failed: ${gate.reasons.join("; ")}`,
-      holdFileRemoved: true,
-      jobDisabled: true,
+      // Carried from the observed reassert, not hardcoded. See rearm-anchor.
+      holdFileRemoved: initial.holdFileRemoved,
+      jobDisabled: initial.jobDisabled,
       cleanupErrors: [],
     };
   }
@@ -1609,7 +1724,15 @@ export async function runReleaseBarrierSequence(
   {
     const probe = await probeHarnessRunning(ops);
     if (!probe.ok) {
-      const cleanup = await parkCleanup(ops, { removeHold: true, disable: false, bootout: true });
+      const cleanup = await parkCleanup(ops, {
+        removeHold: true,
+        disable: false,
+        bootout: true,
+        // The re-park's `disableJob` immediately above DID run and DID return;
+        // production reads the override database back inside it. That is what
+        // licenses carrying the flag through a call that issues no disable.
+        carried: { jobDisabled: true },
+      });
       return {
         kind: "parked",
         stage: "verify-running",
@@ -1622,6 +1745,38 @@ export async function runReleaseBarrierSequence(
   }
 
   return { kind: "released", generation_id: committed.generation_id };
+}
+
+/**
+ * Fail-closed harness STOPPED probe: settles (a bootout's zero exit does not
+ * prove the process is reaped), then requires a trustworthy launchd state that
+ * reports no running pid. A throw, an unknown state, or a live pid all refuse.
+ */
+async function probeHarnessStopped(
+  ops: ReleaseBarrierOps,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  let status: HarnessDaemonStatus;
+  try {
+    status = await awaitHarnessStoppedVia(() => ops.harnessStatus(), ops.sleepMs);
+  } catch (err) {
+    return { ok: false, reason: `status probe errored: ${(err as Error).message}` };
+  }
+  if (!status.known) {
+    return { ok: false, reason: "launchctl did not return a trustworthy harness status after the bootout" };
+  }
+  if (status.running || status.pid !== undefined) {
+    // `pid` is checked SEPARATELY from `running` on purpose. Production wires
+    // `harnessStatus` to downgrade `running` to false when the pid is not
+    // STABLE across samples -- the right bar for "did it come up?", and the
+    // wrong one for "is it gone?": a crash-looping pre-G5 harness is a live
+    // process that would read as not-running. For the stopped direction any
+    // pid at all is disqualifying.
+    return {
+      ok: false,
+      reason: `the harness job still reports a pid (${status.pid ?? "unknown"}) after the bootout`,
+    };
+  }
+  return { ok: true };
 }
 
 /** Fail-closed harness liveness probe: unknown status or a throw is NOT running. */

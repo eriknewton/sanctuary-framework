@@ -694,11 +694,17 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-2: dirty registry
 
 describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-check before release)", () => {
   function mkBarrierOps(commitGen: number): ReleaseBarrierOps {
+    // Stateful (fix-round 3, 2026-07-19): reassert-parked OBSERVES the stop.
+    let running = false;
     return {
       disableJob: async () => undefined,
       enableJob: async () => undefined,
-      bootstrapJob: async () => undefined,
-      bootoutJob: async () => undefined,
+      bootstrapJob: async () => {
+        running = true;
+      },
+      bootoutJob: async () => {
+        running = false;
+      },
       removeHoldFile: async () => undefined,
       writeHoldFile: async () => undefined,
       bootSessionUuid: async () => "ABCDEF01-2345-6789-ABCD-EF0123456789",
@@ -707,7 +713,11 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-c
       commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502 }),
       writeReleasedPlist: async () => undefined,
       restoreParkedPlist: async () => undefined,
-      harnessStatus: async () => ({ known: true, installed: true, running: true, pid: 4242 }),
+      harnessStatus: async () =>
+        running
+          ? { known: true, installed: true, running: true, pid: 4242 }
+          : { known: true, installed: true, running: false },
+      sleepMs: async () => {},
     };
   }
 
