@@ -227,6 +227,15 @@ function brand<T extends Omit<ParkedClaim, typeof PARKED_CLAIM_BRAND>>(claim: T)
  */
 export type HarnessDisposition =
   | {
+      /**
+       * BRANDED (fix-round 5). The round-5 gate's LOW-4: `ParkedClaim` was
+       * unforgeable while the POSITIVE assertion that reaches the operator --
+       * "The agent is RUNNING in coarse-only mode" -- was free-form prose any
+       * module could construct. "Unforgeable" is this round's central claim,
+       * so it now holds on both arms: {@link startedCoarseDisposition} is the
+       * sole constructor, structurally, and the sentence is not a parameter.
+       */
+      readonly [PARKED_CLAIM_BRAND]: true;
       readonly disposition: "started-coarse";
       readonly observed: string;
       readonly sentence: string;
@@ -247,7 +256,25 @@ export function startedCoarseDisposition(): HarnessDisposition {
     observed: "the coarse harness install completed, which requires a stable running pid",
     sentence:
       "The agent is RUNNING in coarse-only mode (network-destination wall, no fine-grained gate).",
-  };
+  } as unknown as HarnessDisposition;
+}
+
+/**
+ * The MACHINE-READABLE form of a claim, for audit records (fix-round 5).
+ *
+ * Round 4's diagnosis had two halves: the operator prose was false, AND a
+ * downstream consumer reading the record saw a bare token with no run-state
+ * field at all, which made the falsehood silent rather than merely
+ * self-contradictory. `degradeLoud` was fixed to emit these two fields; the
+ * boot-release audit was not, and the round-5 gate found the asymmetry. One
+ * exported shape so the two records cannot drift into disagreeing about what
+ * they are called or what the basis is.
+ */
+export function parkedClaimAuditFields(claim: ParkedClaim): {
+  harness_run_state: string;
+  harness_run_state_basis: string;
+} {
+  return { harness_run_state: claim.state, harness_run_state_basis: claim.sentence };
 }
 
 /** The operator sentence for a disposition, from whichever branch it is. */

@@ -35,6 +35,7 @@ import type {
 import type { PfAnchorQuarantineRepairResult } from "../../egress-gate/anchor-registry.js";
 import {
   harnessDispositionSentence,
+  parkedClaimAuditFields,
   startedCoarseDisposition,
   type HarnessDisposition,
   type ParkedClaim,
@@ -291,7 +292,7 @@ async function degradeLoud(
   const harnessAudit =
     harness.disposition === "started-coarse"
       ? { harness_run_state: "running-coarse", harness_run_state_basis: harness.observed }
-      : { harness_run_state: harness.claim.state, harness_run_state_basis: harness.claim.sentence };
+      : parkedClaimAuditFields(harness.claim);
   await ops.audit(EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP, {
     agent_uid: ctx.agentUid,
     stage,
@@ -808,6 +809,14 @@ export async function runBootExclusiveEgressRelease(
             hold_file_removed: outcome.holdFileRemoved,
             job_disabled: outcome.jobDisabled,
             cleanup_errors: outcome.cleanupErrors,
+            // FIX-ROUND 5: symmetry with the degrade path's audit. `outcome:
+            // "parked"` here means only "the barrier did not release"; the
+            // type doc says so, but a SIEM consumer does not read type docs.
+            // Without these two fields this record reads as a park over a host
+            // where the code had just observed a live pid -- the same
+            // downstream-silence gap round 4 closed on `degradeLoud`, left
+            // asymmetric. The claim is in the record, not only in the prose.
+            ...parkedClaimAuditFields(outcome.parkedClaim),
           }
         : {}),
     });

@@ -55,6 +55,7 @@ import {
   renderHarnessReleaseHoldFile,
   renderReleaseExecWrapperScript,
   revertParkedHarnessInstall,
+  runStateOwed,
   type HarnessReleaseHoldRecord,
   type ParkedInstallOps,
 } from "../../src/egress-gate/release-barrier.js";
@@ -333,7 +334,7 @@ function makeParkedOps(overrides?: {
   /** Bytes the pre-existing harness plist holds, or undefined for a clean host. */
   priorPlist?: string;
   /** Status samples returned in order (later ones drive the settle loop). */
-  statusSamples?: Array<{ known: boolean; installed: boolean; running: boolean }>;
+  statusSamples?: Array<{ known: boolean; installed: boolean; running: boolean; pid?: number }>;
   /** Make the revert's verified restart fail (it throws, as production's does). */
   restoreRunningHarnessError?: string;
 }): { ops: ParkedInstallOps; log: OpsLog } {
@@ -831,8 +832,15 @@ describe("executeParkedHarnessInstall", () => {
     }
   });
 
-  it("B1: when the revert CANNOT restart the agent, the error says the agent is STOPPED", async () => {
+  it("B1: when the revert CANNOT restart the agent, the error says so and reports the OBSERVED run state", async () => {
     // The failure mode that must never be dressed up as a success.
+    //
+    // FIX-ROUND 5: this test used to demand the literal string "is STOPPED",
+    // which is how the round-5 HIGH got pinned in place -- the ops it drives
+    // model a harness that launchd reports RUNNING on every sample, so the
+    // assertion it encoded was that the code claim the opposite of its own
+    // ground truth. What must be true is that the restore failure is loud and
+    // the run state is the one that was read.
     const { ops, log } = makeParkedOps({
       priorPlist: upgradeHostPlist,
       statusSamples: [{ known: true, installed: true, running: true }],
@@ -840,7 +848,9 @@ describe("executeParkedHarnessInstall", () => {
     });
     const err = await executeParkedHarnessInstall(plan, ops).catch((e: unknown) => e as Error);
     expect(err.message).toMatch(/could NOT be put back/);
-    expect(err.message).toMatch(/is STOPPED/);
+    expect(err.message).toMatch(/could NOT be restarted/);
+    expect(err.message).toMatch(/The agent is RUNNING/);
+    expect(err.message).not.toMatch(/is stopped/i);
     expect(err.message).toMatch(/sanctuary protect --hermes/);
     expect(err.message).not.toMatch(/put back: its previous plist is restored/);
     // The plist still goes back even though the restart did not, so the
@@ -892,13 +902,24 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     disableCleared: number;
     writes: Array<{ path: string; content: string }>;
     removed: string[];
+    /** How many times the revert read the harness's launchd state. */
+    statusCalls: number;
   }
 
-  function makeRevertOps(overrides?: { restartError?: string; writeError?: string }): {
+  function makeRevertOps(overrides?: {
+    restartError?: string;
+    writeError?: string;
+    /**
+     * The launchd ground truth the revert's run-state probe reads (fix-round
+     * 5). Default: a genuinely stopped harness. `livePid` models the D2 shape
+     * -- a process that survived the stand-down and is alive on EVERY sample.
+     */
+    livePid?: number;
+  }): {
     ops: Parameters<typeof revertParkedHarnessInstall>[1];
     log: RevertLog;
   } {
-    const log: RevertLog = { restarted: [], disableCleared: 0, writes: [], removed: [] };
+    const log: RevertLog = { restarted: [], disableCleared: 0, writes: [], removed: [], statusCalls: 0 };
     // Backed by a real map (fix-round 3, 2026-07-19): `plistRestored` is now
     // READ BACK from disk rather than inferred from `writeFile` resolving, so
     // ops that forget what they were told can no longer assert the claim.
@@ -926,6 +947,15 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
           log.removed.push(path);
           disk.delete(path);
         },
+        async harnessStatus() {
+          log.statusCalls += 1;
+          return overrides?.livePid !== undefined
+            ? { known: true, installed: true, running: true, pid: overrides.livePid }
+            : { known: true, installed: true, running: false };
+        },
+        async sleepMs() {
+          /* instant under test */
+        },
       },
     };
   }
@@ -946,7 +976,7 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
   // is not a read: a truncating writer, a full filesystem, or a path that is
   // not the file we think it is all resolve.
   it("R3: a write that RESOLVES but does not land reports plistRestored:false and restored:false", async () => {
-    const log: RevertLog = { restarted: [], disableCleared: 0, writes: [], removed: [] };
+    const log: RevertLog = { restarted: [], disableCleared: 0, writes: [], removed: [], statusCalls: 0 };
     const ops = {
       async restoreRunningHarness() {
         throw new Error("launchctl bootstrap exited 5");
@@ -964,6 +994,11 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
       async removeFile(path: string) {
         log.removed.push(path);
       },
+      async harnessStatus() {
+        log.statusCalls += 1;
+        return { known: true, installed: true, running: false };
+      },
+      async sleepMs() {},
     };
     const result = await revertParkedHarnessInstall(runningSnapshot, ops);
     expect(result.plistRestored).toBe(false);
@@ -980,6 +1015,10 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
         return "<plist><!-- STILL HERE --></plist>";
       },
       async removeFile() {},
+      async harnessStatus() {
+        return { known: true, installed: false, running: false };
+      },
+      async sleepMs() {},
     };
     const result = await revertParkedHarnessInstall(
       { ...runningSnapshot, preexistingJobModified: false, wasRunning: false },
@@ -1084,8 +1123,128 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     expect(result.plistRestored).toBe(true);
     expect(result.restored).toBe(false);
     // Silence is not evidence: the absence of a complaint became a complaint.
-    expect(result.errors.join(" ")).toMatch(/is STOPPED now/);
+    expect(result.errors.join(" ")).toMatch(/this run did not restart it/);
     expect(result.errors.join(" ")).toMatch(/no captured prior plist/);
+    // FIX-ROUND 5: the run-state half of that sentence used to be "is STOPPED
+    // now", derived from control flow. It is now the chokepoint's, from an
+    // observation of the modelled launchd state (here: genuinely stopped).
+    expect(result.runState?.state).toBe("parked");
+    expect(result.errors.join(" ")).toContain(result.runState!.sentence);
+  });
+
+  // ---------------------------------------------------------------- ROUND 5
+  //
+  // THE TENTH INSTANCE. The round-5 gate reproduced, end to end over a
+  // modelled harness alive at pid 9001 on all 22 status calls, a message whose
+  // cause clause said "the harness job reports RUNNING after a parked install"
+  // and which then told the operator "The agent harness (...) is STOPPED.
+  // Re-run 'sudo sanctuary protect --hermes' to bring it back up" -- advice
+  // that loops the operator into re-running over a live agent.
+  //
+  // These tests assert on the RENDERED operator message and on the observed
+  // claim, not on which functions were called.
+
+  const r5Plan = planParkedHarnessInstall({
+    agentAccount: "sanctuary-hermes",
+    agentUid: 503,
+    harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
+  });
+
+  it("R5: a revert that cannot restart a LIVE harness reports it RUNNING, never STOPPED", async () => {
+    const { ops, log } = makeRevertOps({
+      restartError: "launchctl bootstrap exited 5",
+      livePid: 9001,
+    });
+    const result = await revertParkedHarnessInstall(runningSnapshot, ops);
+    expect(result.restored).toBe(false);
+    expect(result.harnessRestarted).toBe(false);
+    // The claim is an OBSERVATION, and the observation disqualifies the park.
+    expect(result.runState?.state).toBe("alive");
+    expect(result.runState?.sentence).toContain("9001");
+    // The live process was actually read, not assumed away.
+    expect(log.statusCalls).toBeGreaterThan(0);
+    // Nothing anywhere in this result says the agent is down.
+    const rendered = `${result.errors.join(" ")} ${result.runState?.sentence ?? ""}`;
+    expect(rendered).not.toMatch(/is stopped/i);
+    expect(rendered).not.toMatch(/is parked/i);
+  });
+
+  it("R5: the install's own abort over a live pid 9001 never says STOPPED and never says 'bring it back up'", async () => {
+    // The gate's probe G5, as a test. launchd reports the job RUNNING at pid
+    // 9001 on EVERY sample, so the park does not hold, the post-mutation
+    // assertion fires, and the revert's restart fails too -- the full Mini1 D2
+    // shape, which is the shape this whole branch exists to fix.
+    const { ops } = makeParkedOps({
+      priorPlist: priorPlistFor("sanctuary-hermes"),
+      statusSamples: [{ known: true, installed: true, running: true, pid: 9001 }],
+      restoreRunningHarnessError: "launchctl bootstrap exited 5",
+    });
+    const error = await executeParkedHarnessInstall(r5Plan, ops).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    expect(error, "the park must still refuse over a live harness").toBeDefined();
+    const message = error!.message;
+
+    // The cause clause is unchanged: the fail-closed assertion still fires.
+    expect(message).toMatch(/reports RUNNING after a parked install/);
+    // ...and the SAME message no longer contradicts it.
+    expect(message, "the tenth instance: a STOPPED claim over a live pid").not.toMatch(/is stopped/i);
+    expect(message).toContain("pid 9001");
+    // The harmful imperative is gone: the operator is not sent to re-run over
+    // a process that is up.
+    expect(message).not.toMatch(/protect --hermes' to bring it back up/i);
+    expect(message).toMatch(/Do NOT re-run/);
+  });
+
+  it("R5: over a harness that really did stop, the recovery advice is still given", async () => {
+    // The other half of the fix: weakening the claim must not cost the
+    // operator their recovery instruction when the park DID hold. 21 running
+    // samples drive the install's own settle loop to its refusal; the revert's
+    // probe then reads a genuinely stopped harness.
+    const running = { known: true, installed: true, running: true, pid: 9001 };
+    const { ops } = makeParkedOps({
+      priorPlist: priorPlistFor("sanctuary-hermes"),
+      statusSamples: [
+        ...Array.from({ length: 21 }, () => running),
+        { known: true, installed: true, running: false },
+      ],
+      restoreRunningHarnessError: "launchctl bootstrap exited 5",
+    });
+    const error = await executeParkedHarnessInstall(r5Plan, ops).then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    expect(error).toBeDefined();
+    const message = error!.message;
+    expect(message).toMatch(/reports RUNNING after a parked install/);
+    expect(message).toMatch(/The agent is PARKED \(not running\)/);
+    expect(message).toMatch(/protect --hermes' to bring it back up/);
+    expect(message).not.toMatch(/Do NOT re-run/);
+  });
+
+  it("R5: a run-state claim is present EXACTLY when the operator is owed one", async () => {
+    // The invariant `standDownAdvice` relies on. Without it a future branch
+    // could go silent here, which is the failure mode this subsystem keeps
+    // reproducing.
+    const cases: Array<{ name: string; snapshot: typeof runningSnapshot; restartError?: string }> = [
+      { name: "restart failed over a live harness", snapshot: runningSnapshot, restartError: "boom" },
+      { name: "no prior plist to restart from", snapshot: { ...runningSnapshot, priorPlistContent: undefined } },
+      { name: "restart succeeded", snapshot: runningSnapshot },
+      { name: "was not running", snapshot: { ...runningSnapshot, wasRunning: false } },
+      {
+        name: "clean host",
+        snapshot: { ...runningSnapshot, wasRunning: false, preexistingJobModified: false },
+      },
+    ];
+    for (const { name, snapshot, restartError } of cases) {
+      const { ops } = makeRevertOps(restartError === undefined ? {} : { restartError });
+      const result = await revertParkedHarnessInstall(snapshot, ops);
+      expect(
+        result.runState !== undefined,
+        `${name}: runState presence must match runStateOwed`,
+      ).toBe(runStateOwed(result));
+    }
   });
 
   it("B2: the restores that genuinely succeeded still report restored:true", async () => {

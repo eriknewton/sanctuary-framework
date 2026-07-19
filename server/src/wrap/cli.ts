@@ -1276,9 +1276,18 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `(uid ${outcome.uid}, generation ${outcome.generationId}). The agent's only sanctioned egress path is the gate.`,
       ];
     case "armed-exclusive-repark-failed":
+      // FIX-ROUND 5. This used to say "the agent is running confined" -- a
+      // positive run-state assertion composed at the RENDER layer, which is
+      // the thing the round-4 guard exists to forbid; it evaded the guard only
+      // by letter case. Its basis was also stale: the barrier's last
+      // stable-running probe ran BEFORE the re-park mutation that then threw.
+      // What IS observed here is the gate: a committed generation, live, with
+      // the agent's egress scoped to it. Say that, and leave run state to the
+      // one surface that reads it.
       return [
         `  WARNING: the exclusive-egress gate is LIVE (uid ${outcome.uid}, generation ${outcome.generationId}) and the ` +
-          `agent is running confined, but the persistent boot state could NOT be re-parked (${outcome.reparkError}). ` +
+          `agent's only sanctioned egress path is the gate, but the persistent boot state could NOT be re-parked ` +
+          `(${outcome.reparkError}). ` +
           `The NEXT boot could start the agent before the gate re-arms. Run 'sudo sanctuary protect --repair-egress-gate' now.`,
       ];
     case "exclusive-egress-unarmed-coarse-active": {

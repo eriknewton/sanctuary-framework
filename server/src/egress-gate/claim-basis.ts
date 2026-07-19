@@ -204,6 +204,7 @@ export type ClaimSiteId =
   | "release-barrier.revert-harness-restarted"
   | "release-barrier.revert-restored-verdict"
   | "release-barrier.revert-clean-host"
+  | "release-barrier.revert-run-state"
   | "release-barrier.park-cleanup-hold-removed"
   | "release-barrier.park-cleanup-job-disabled"
   | "release-barrier.park-cleanup-carried"
@@ -558,6 +559,20 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
         "this was not a clean host, or the clean-host revert did not complete",
       basis: "observed",
     },
+  },
+  "release-barrier.revert-run-state": {
+    file: `${EG}/release-barrier.ts`,
+    symbol: "revertParkedHarnessInstall",
+    claim:
+      "what the agent harness's run state IS after a revert that did not put a running agent back",
+    // The round-5 HIGH's remedy. The register had NO row for this claim
+    // because the claim was not computed anywhere: `standDownStillStoppedAdvice`
+    // asserted "the agent harness is STOPPED" straight from `wasRunning` plus
+    // a failed restore. It is now a `ParkedClaim` from `assessHarnessParked`,
+    // so it is observed, weakened, or explicitly unknown -- never inferred.
+    basis: "observed",
+    layer: "compute",
+    branches: "single",
   },
   "release-barrier.park-cleanup-hold-removed": {
     file: `${EG}/release-barrier.ts`,
@@ -1711,6 +1726,28 @@ export const RUN_STATE_PROSE_SOLE_OWNER = `${EG}/parked-claim.ts`;
  * The scan is PARSER-based (the TypeScript AST's string and template literals),
  * not a line scanner: doc comments must stay free to discuss parking in plain
  * English, and a line-oriented matcher cannot tell the two apart.
+ *
+ * MATCHING IS NORMALIZED, NOT LITERAL (fix-round 5, 2026-07-19). Round 4 wrote
+ * this list from the sentences it had just fixed and compared with a raw
+ * `includes`. Every surviving assertion in the subsystem was written `is
+ * STOPPED`, so the guard matched none of them: the round-5 HIGH was one
+ * `toLowerCase()` away from being caught by the round's own tool. Comparison
+ * now goes through {@link normalizeRunStateProse} on BOTH sides -- case-folded
+ * and whitespace-collapsed, so a sentence wrapped across lines in a template
+ * literal cannot hide either -- and the scanner additionally flattens
+ * `"a" + "b"` literal-concatenation chains before testing, closing the
+ * `"The agent is " + "PARKED"` split the round-5 Codex lens demonstrated.
+ *
+ * WHAT REMAINS LEXICAL, stated plainly rather than implied away. This guard
+ * catches a run-state sentence that is SPELLED like one of these phrases in
+ * source text. It does not and cannot catch: a phrase assembled through a
+ * template SUBSTITUTION or a variable (`` `The agent is ${state}` ``), a
+ * sentence held in a lookup table and printed by key, a synonym or a reordered
+ * equivalent ("no process is alive for the harness"), or prose built at
+ * runtime from data. It is a tripwire on the shape the defect has actually
+ * taken ten times, not a proof that no module can assert run state. The
+ * structural half of the rule is the {@link ParkedClaim} brand; this is the
+ * half that catches an author who never touched the type.
  */
 export const RUN_STATE_PROSE_PATTERNS: readonly string[] = [
   "is PARKED",
@@ -1725,9 +1762,32 @@ export const RUN_STATE_PROSE_PATTERNS: readonly string[] = [
 ];
 
 /**
+ * Fold the case and collapse the whitespace of a candidate string, so the
+ * ownership rule is not defeated by shouting or by a line wrap.
+ *
+ * Exported so the guard test and this register apply the SAME normalization --
+ * a pattern list normalized one way and compared another is how round 4's
+ * guard came to match nothing.
+ */
+export function normalizeRunStateProse(text: string): string {
+  return text.replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
  * Files the ownership rule is enforced over. `wrap/cli.ts` is on this list
  * because it is where the round-4 falsehood was actually READ by a human; the
  * register having no reach into it was the blind spot.
+ *
+ * WHAT IS NOT ON THIS LIST, named rather than left to be discovered
+ * (fix-round 5): `wrap/auto-provision.ts`, which contains two "PARKED"
+ * sentences on the repair and unprotect branches. They are deliberately out of
+ * scope rather than overlooked: both are gated on `verifyParkedPersistent`,
+ * which is a STRONGER observation than a {@link ParkedClaim} (not running AND
+ * job disabled in the override db AND hold file absent AND parked plist), and
+ * `parked-claim.ts` explicitly disclaims that persistent posture. Routing them
+ * through the chokepoint would weaken them. Adding the file with an exemption
+ * would buy nothing but a maintenance surface. The honest statement is that
+ * this guard's reach ends here.
  */
 export const RUN_STATE_PROSE_SCANNED_DIRS: readonly string[] = [
   "server/src/egress-gate",

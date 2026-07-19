@@ -39,6 +39,7 @@ import {
   RUN_STATE_PROSE_SCANNED_DIRS,
   RUN_STATE_PROSE_SCANNED_FILES,
   RUN_STATE_PROSE_SOLE_OWNER,
+  normalizeRunStateProse,
   claimLiteralRegex,
   type ClaimSiteDeclaration,
   type ClaimSiteId,
@@ -58,6 +59,63 @@ function countClaimLiterals(source: string): number {
     if (matched !== null) n += matched.length;
   }
   return n;
+}
+
+/**
+ * THE RUN-STATE PROSE SCANNER (extracted, fix-round 5). One implementation
+ * driven by both the real file sweep and the synthetic-source test below --
+ * round 4's guard was never exercised against a sentence it should catch, so
+ * nobody noticed it caught nothing.
+ *
+ * Returns one `file:line` offence per (literal, pattern) pair.
+ */
+function scanRunStateProse(fileName: string, sourceText: string): string[] {
+  const patterns = RUN_STATE_PROSE_PATTERNS.map((phrase) => ({
+    phrase,
+    needle: normalizeRunStateProse(phrase),
+  }));
+  const source = ts.createSourceFile(fileName, sourceText, ts.ScriptTarget.ESNext, true);
+  const isProseLiteral = (node: ts.Node): boolean =>
+    ts.isStringLiteral(node) ||
+    ts.isNoSubstitutionTemplateLiteral(node) ||
+    ts.isTemplateHead(node) ||
+    ts.isTemplateMiddle(node) ||
+    ts.isTemplateTail(node);
+  /** The rendered text of a `"a" + "b" + ...` chain, or undefined if any operand is not a literal. */
+  const flattenConcat = (node: ts.Node): string | undefined => {
+    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
+    if (ts.isParenthesizedExpression(node)) return flattenConcat(node.expression);
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = flattenConcat(node.left);
+      const right = flattenConcat(node.right);
+      return left !== undefined && right !== undefined ? left + right : undefined;
+    }
+    return undefined;
+  };
+
+  const offenders: string[] = [];
+  const seen = new Set<string>();
+  const check = (text: string, node: ts.Node): void => {
+    const normalized = normalizeRunStateProse(text);
+    for (const { phrase, needle } of patterns) {
+      if (!normalized.includes(needle)) continue;
+      const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
+      const offence = `${fileName}:${line + 1} contains run-state prose ${JSON.stringify(phrase)}`;
+      if (seen.has(offence)) continue;
+      seen.add(offence);
+      offenders.push(offence);
+    }
+  };
+  const visit = (node: ts.Node): void => {
+    if (isProseLiteral(node)) check(node.text, node);
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const flattened = flattenConcat(node);
+      if (flattened !== undefined) check(flattened, node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return offenders;
 }
 
 const entries = Object.entries(CLAIM_SITES) as Array<[ClaimSiteId, ClaimSiteDeclaration]>;
@@ -148,38 +206,52 @@ describe("claim register: the literal ratchet", () => {
       ),
     ].filter((f) => f !== RUN_STATE_PROSE_SOLE_OWNER && RUN_STATE_PROSE_EXEMPT[f] === undefined);
 
-    const offenders: string[] = [];
-    for (const file of files) {
-      const source = ts.createSourceFile(
-        file,
-        readSource(file),
-        ts.ScriptTarget.ESNext,
-        true,
-      );
-      const visit = (node: ts.Node): void => {
-        if (
-          ts.isStringLiteral(node) ||
-          ts.isNoSubstitutionTemplateLiteral(node) ||
-          ts.isTemplateHead(node) ||
-          ts.isTemplateMiddle(node) ||
-          ts.isTemplateTail(node)
-        ) {
-          for (const phrase of RUN_STATE_PROSE_PATTERNS) {
-            if (node.text.includes(phrase)) {
-              const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
-              offenders.push(`${file}:${line + 1} contains run-state prose ${JSON.stringify(phrase)}`);
-            }
-          }
-        }
-        ts.forEachChild(node, visit);
-      };
-      visit(source);
-    }
+    const offenders = files.flatMap((file) => scanRunStateProse(file, readSource(file)));
     // If this fails you have written a sentence about whether the agent is
     // running, somewhere other than `parked-claim.ts`. That is the round-4
     // defect. Do not reword around the pattern list: obtain a `ParkedClaim`
     // from `assessHarnessParked` and print its `sentence`.
     expect(offenders, "run-state prose outside the parked-claim chokepoint").toEqual([]);
+  });
+
+  it("R5: the guard catches the SHOUTED, WRAPPED and SPLIT forms it used to miss", () => {
+    // FIX-ROUND 5, the gate's Finding 2. Round 4 wrote the pattern list from
+    // the sentences it had just fixed ("is stopped") and compared with a raw
+    // `includes`, while every surviving assertion in the tree was written
+    // `is STOPPED`. Three real evasions sat in the tree with the build green,
+    // one of them the round-5 HIGH -- findable by this round's own tool, one
+    // `toLowerCase()` away.
+    //
+    // These are the ACTUAL sentences that evaded it, verbatim, plus the split
+    // form the Codex lens demonstrated. Asserted on the scanner's OUTPUT.
+    const evasions: Array<[string, string]> = [
+      [
+        "the round-5 HIGH, shouted",
+        'const s = `The agent harness (${label}) is STOPPED. Re-run to bring it back up.`;',
+      ],
+      [
+        "release-barrier.ts:1154, shouted",
+        'const s = "the agent harness was running before this run and is STOPPED now";',
+      ],
+      ["wrap/cli.ts:1281, lower case", 'const s = "the agent is running confined, but";'],
+      [
+        "wrapped across lines inside one template",
+        "const s = `the agent\n  is not\n  running right now`;",
+      ],
+      ["split across a concatenation", 'const s = "The agent is " + "PARKED" + " today";'],
+    ];
+    for (const [name, source] of evasions) {
+      expect(scanRunStateProse("synthetic.ts", source), `${name} must be caught`).not.toEqual([]);
+    }
+    // ...and the guard still leaves doc comments alone, which is the whole
+    // reason it is parser-based rather than a line scanner.
+    expect(
+      scanRunStateProse(
+        "synthetic.ts",
+        "/** Returns whether the agent is PARKED (not running) on this host. */\nexport const x = 1;",
+      ),
+      "doc comments must stay free to discuss parking in plain English",
+    ).toEqual([]);
   });
 
   it("does not silently lose a tracked file", () => {

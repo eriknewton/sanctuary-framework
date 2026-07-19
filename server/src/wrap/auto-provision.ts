@@ -2356,6 +2356,12 @@ function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallR
     writeFile: daemonOps.writeFile,
     readFile: daemonOps.readFile,
     removeFile: daemonOps.removeFile,
+    // Fix-round 5 (2026-07-19): the revert's run-state claim. Deliberately the
+    // PLAIN status read, not the stable-pid refinement `probeHarnessRunning`
+    // uses -- `assessHarnessParked` disqualifies a park on ANY pid, so a
+    // stability downgrade cannot change its verdict and would only nest a
+    // second settle loop inside the chokepoint's.
+    harnessStatus: () => agentHarnessDaemonStatus(daemonOps),
   };
 }
 

@@ -1236,19 +1236,24 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
       await installAgentHarnessDaemon(plan, harnessOps);
     },
     async assessHarnessParked() {
-      // THE chokepoint (fix-round 4). Same settled probe and same pid-strict
-      // bar as the release barrier's: `harnessStatus` carries `pid` through a
-      // downgraded `running` so a crash-looping survivor reads as ALIVE, not
-      // as parked.
+      // THE chokepoint (fix-round 4). Pid-strict: `assessHarnessParked`
+      // disqualifies a park on ANY pid, so a crash-looping survivor reads as
+      // ALIVE, not as parked.
+      //
+      // FIX-ROUND 5 (the gate's LOW-5, confirmed real): this used to refine
+      // `running` with `agentHarnessDaemonStableRunning` -- up to 30 samples
+      // at 500ms -- INSIDE `assessHarnessParked`'s own 20-sample settle loop.
+      // Over a live harness (the case this probe exists for) that nesting cost
+      // roughly 15-25s per abort, held under the provision lock, for a
+      // refinement that CANNOT change the verdict: the stability downgrade
+      // only ever moves `running` true->false, and a claim with a pid is
+      // `alive` either way. Removed, not merely bounded. `probeHarnessRunning`
+      // keeps the stable-pid bar, which is the right bar for "did it come up?"
+      // and the wrong one for "is it gone?".
       const harnessOps = realHarnessOps();
       return assessHarnessParked({
         probe: {
-          async harnessStatus(): Promise<HarnessDaemonStatus> {
-            const status = await agentHarnessDaemonStatus(harnessOps);
-            if (!status.known || !status.running) return status;
-            const stable = await agentHarnessDaemonStableRunning(harnessOps);
-            return { ...status, running: stable };
-          },
+          harnessStatus: (): Promise<HarnessDaemonStatus> => agentHarnessDaemonStatus(harnessOps),
         },
       });
     },

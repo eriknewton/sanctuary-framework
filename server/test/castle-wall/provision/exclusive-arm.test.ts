@@ -555,6 +555,30 @@ describe("runBootExclusiveEgressRelease", () => {
     );
   });
 
+  it("R5: the boot audit carries the run-state CLAIM, symmetrically with the degrade audit", async () => {
+    // FIX-ROUND 5, the gate's Finding 3. `degradeLoud`'s audit was changed in
+    // round 4 to carry `harness_run_state` + `harness_run_state_basis`, on the
+    // explicit reasoning that a consumer reading a bare token "used to receive
+    // the documented meaning 'the agent is parked' with no pid information at
+    // all, which made the falsehood SILENT downstream." This record emitted
+    // `outcome: "parked"` and DISCARDED the claim -- so a SIEM saw a park over
+    // a host where the code had just observed a live pid. Same gap, left
+    // asymmetric.
+    const audit = vi.fn(async () => undefined);
+    await runBootExclusiveEgressRelease([{ agent_uid: 502 }], {
+      releaseAgent: async () =>
+        await parkedBarrierOutcome({ known: true, installed: true, running: true, pid: 9001 }),
+      audit,
+      print: vi.fn(),
+    });
+    const details = audit.mock.calls[0]![1] as Record<string, unknown>;
+    // The outcome token still means only "the barrier did not release"...
+    expect(details.outcome).toBe("parked");
+    // ...and the record now says, machine-readably, that a live pid was seen.
+    expect(details.harness_run_state).toBe("alive");
+    expect(String(details.harness_run_state_basis)).toContain("9001");
+  });
+
   it("repark-failed boot release is surfaced as a WARNING, never a clean green line", async () => {
     const print = vi.fn();
     const results = await runBootExclusiveEgressRelease([{ agent_uid: 501 }], {
