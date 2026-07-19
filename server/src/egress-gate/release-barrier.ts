@@ -593,10 +593,16 @@ export async function executeParkedHarnessInstall(
   }
   const bootout = await ops.runLaunchctl(["bootout", `system/${plan.harnessLabel}`]);
   if (bootout.code === 0) {
-    // A privileged, agent-stopping action actually happened. Never silent.
+    // A privileged action on a pre-existing job actually happened. Never
+    // silent. HONEST WORDING: a zero exit means launchctl unloaded a job that
+    // WAS loaded; it does not by itself prove that job had a live process
+    // (a loaded-but-idle job also boots out cleanly). So this says "unloaded
+    // the existing job", which is exactly what was observed, rather than
+    // "stopped a running agent", which would claim more than the exit code
+    // establishes.
     ops.notify(
-      `Stopped the already-running ${plan.harnessLabel} job (launchctl bootout) so the parked ` +
-        "install can hold; the release barrier restarts it after the gate generation commits.",
+      `Unloaded the existing ${plan.harnessLabel} job (launchctl bootout) so the parked install ` +
+        "can hold; the release barrier starts it after the gate generation commits.",
     );
   } else if (!BOOTOUT_NOT_RUNNING_RE.test(bootout.stderr)) {
     throw new ReleaseBarrierError(
