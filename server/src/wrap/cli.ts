@@ -87,6 +87,7 @@ import {
 } from "./auto-provision.js";
 import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
 import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
+import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -1283,17 +1284,24 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
     case "exclusive-egress-unarmed-coarse-active": {
       // S5-6 degrade-loud: DISTINCT non-green state; every posture surface
       // renders coarse-only amber (S5-P). Never softened into a success line.
-      const agentState = outcome.harnessStartedCoarse
-        ? "The agent is RUNNING in coarse-only mode (network-destination wall, no fine-grained gate)."
-        : outcome.coarseCompositionRestored
-          ? "The agent is PARKED (not running): the manifest is back in coarse scope but the harness could not be started."
-          : "The agent is PARKED (not running) and the manifest could NOT be restored to coarse scope.";
+      // FIX-ROUND 4 (the round-4 HIGH landed exactly here). This branch used
+      // to compose its own run-state sentence from `harnessStartedCoarse`,
+      // whose false branch means "this run did not start it" and was printed
+      // as "The agent is PARKED (not running)" -- captured over a live pid
+      // 9001, in the same output whose reason string said the job still
+      // reported that pid. The render layer no longer decides run state at
+      // all: the sentence comes from the parked-claim chokepoint, which
+      // produced it from a settled observation or explicitly weakened it.
+      const agentState = harnessDispositionSentence(outcome.harness);
+      const manifestState = outcome.coarseCompositionRestored
+        ? "The manifest is back in coarse scope."
+        : "The manifest could NOT be restored to coarse scope.";
       const cleanupNote =
         outcome.cleanupErrors.length > 0 ? ` Cleanup problems: ${outcome.cleanupErrors.join("; ")}.` : "";
       return [
         `  WARNING: fine-grained exclusive egress could NOT come live at "${outcome.stage}" (${outcome.reason}). ` +
           `The coarse Castle Wall remains armed over the agent -- this is a DISTINCT NON-GREEN (coarse-only) state ` +
-          `on every posture surface, not full protection. ${agentState}${cleanupNote} ` +
+          `on every posture surface, not full protection. ${manifestState} ${agentState}${cleanupNote} ` +
           `Fix with: sudo sanctuary protect --repair-egress-gate`,
       ];
     }

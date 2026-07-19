@@ -1082,6 +1082,7 @@ export async function runAutoProvisionForWrap(
           runReleaseSequence: (committed) => lazyExclusiveOps().runReleaseSequence(committed),
           restoreCoarseComposition: (reason) => lazyExclusiveOps().restoreCoarseComposition(reason),
           startHarnessCoarse: () => lazyExclusiveOps().startHarnessCoarse(),
+          assessHarnessParked: () => lazyExclusiveOps().assessHarnessParked(),
           audit: (operation, details) => lazyExclusiveOps().audit(operation, details),
           print,
         }

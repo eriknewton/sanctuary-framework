@@ -35,6 +35,7 @@
  */
 
 import type { ProvisionNeedResult } from "./detect.js";
+import type { HarnessDisposition } from "../../egress-gate/parked-claim.js";
 import {
   runExclusiveEgressArming,
   type ExclusiveEgressArmOps,
@@ -494,11 +495,11 @@ export type ProvisionFlowOutcome =
    * surface): fine-grained was declared but the exclusive stack could not
    * come live; the PROVEN coarse wall stays armed. The manifest was
    * explicitly recomposed to coarse scope through the audited S5-4 fallback
-   * (`coarseCompositionRestored`) and the agent started in coarse mode
-   * (`harnessStartedCoarse`) -- either false means the agent is PARKED (not
-   * running) and the outcome says so loudly. ALWAYS a distinct non-green
-   * posture (`coarse-only` / amber on every surface); NEVER silent, NEVER
-   * fake-green.
+   * (`coarseCompositionRestored`). What happened to the AGENT PROCESS is
+   * `harness` and nothing else: a failed restore or a failed start is a fact
+   * about this run, never evidence that a process is gone. ALWAYS a distinct
+   * non-green posture (`coarse-only` / amber on every surface); NEVER silent,
+   * NEVER fake-green.
    */
   | {
       kind: "exclusive-egress-unarmed-coarse-active";
@@ -506,7 +507,13 @@ export type ProvisionFlowOutcome =
       stage: "bring-up" | "release";
       reason: string;
       coarseCompositionRestored: boolean;
-      harnessStartedCoarse: boolean;
+      /**
+       * What happened to the agent process. Fix-round 4 replaced the former
+       * `harnessStartedCoarse: boolean`, whose FALSE branch ("this run did not
+       * start it") was rendered here and at the CLI as "the agent is PARKED
+       * (not running)" over processes that were demonstrably alive.
+       */
+      harness: HarnessDisposition;
       cleanupErrors: string[];
     };
 
@@ -526,8 +533,12 @@ interface HarnessStandDownState {
  *     started the agent under a committed generation. Restoring the PRE-run
  *     plist here would tear a correctly-confined agent back to coarse.
  *   - `exclusive-egress-unarmed-coarse-active`: the S5-6 degrade path already
- *     decided the harness's disposition (`harnessStartedCoarse`) and says so
- *     loudly in its own outcome. A second restore would fight it.
+ *     decided the harness's disposition (`harness`) and says so loudly in its
+ *     own outcome, INCLUDING the case where it could not decide -- a degrade
+ *     whose claim is `alive` or `unknown` still suppresses the chokepoint
+ *     restore, because restoring a plist under a live process would fight it.
+ *     The suppression is right; what round 4 fixed is the CLAIM attached to
+ *     it, which used to say "parked" regardless.
  *
  * Deliberately an ALLOW-LIST of "already handled", not a deny-list of aborts:
  * a new abort kind added later defaults to restoring, which is the safe
@@ -617,13 +628,24 @@ const OUTCOMES_THAT_KEEP_THE_REHOME: ReadonlySet<string> = new Set(["armed-rollb
 
 /**
  * The operator-facing sentence about the restore, built ONLY from observed
- * facts (fix-round 2, 2026-07-18).
+ * facts (fix-round 2, 2026-07-18; tightened fix-round 4, 2026-07-19).
  *
- * The rule this PR has now had to learn twice: state what was seen, not what
- * was attempted. `harnessRestarted` is true only when a restart was verified
- * against launchd, and `wasRunning` distinguishes "correctly not restarted"
- * from "should be running and is not" -- a distinction the previous single
- * boolean collapsed, which is how a stopped agent got described as restarted.
+ * The rule this PR has now had to learn several times: state what was seen,
+ * not what was attempted. `harnessRestarted` is true only when a restart was
+ * verified against launchd, and `wasRunning` distinguishes "correctly not
+ * restarted" from "should be running and is not" -- a distinction the previous
+ * single boolean collapsed, which is how a stopped agent got described as
+ * restarted.
+ *
+ * FIX-ROUND 4 found two SURVIVING run-state assertions here, and found them
+ * with the round's own render-layer guard rather than by review: the failed-
+ * restore branch said "The agent is STOPPED" and the never-was-running branch
+ * said "is not running now". Both were derived from the restore having failed
+ * or not been attempted -- control flow -- over a process nothing here probed.
+ * This function is SYNCHRONOUS and has no launchd access, so the correct fix
+ * is the weakened form: it now states only what this RUN did, and makes no
+ * assertion about whether a process is alive. A caller that needs the run
+ * state must obtain a `ParkedClaim` from `assessHarnessParked`.
  */
 function harnessRestoreNote(
   restore: { restored: boolean; wasRunning: boolean; harnessRestarted: boolean; problems: string[] },
@@ -632,15 +654,15 @@ function harnessRestoreNote(
   if (!restore.restored) {
     return (
       `The agent harness this run stood down could NOT be fully restored: ${restore.problems.join("; ")}. ` +
-      "The agent is STOPPED. Re-run 'sudo sanctuary protect --hermes' to bring it back up under the " +
-      "previous (coarse) posture."
+      "This run did NOT bring it back up, and did not verify its run state. Re-run " +
+      "'sudo sanctuary protect --hermes' to bring it back up under the previous (coarse) posture."
     );
   }
   const what = restore.harnessRestarted
     ? "was restarted and is running again"
     : restore.wasRunning
       ? "was put back"
-      : "was put back; it was not running before this run, and is not running now";
+      : "was put back; it was not running before this run, and this run did not start it";
   const scope = OUTCOMES_THAT_KEEP_THE_REHOME.has(outcomeKind)
     ? " NOTE: the re-home was deliberately NOT reversed on this outcome, so the harness is back but its " +
       "secrets remain on the dedicated account. This is not a return to your previous state."
@@ -1336,7 +1358,7 @@ async function runProvisionFlowSteps(
     stage: exclusive.stage,
     reason: exclusive.reason,
     coarseCompositionRestored: exclusive.coarseCompositionRestored,
-    harnessStartedCoarse: exclusive.harnessStartedCoarse,
+    harness: exclusive.harness,
     cleanupErrors: exclusive.cleanupErrors,
   };
 }

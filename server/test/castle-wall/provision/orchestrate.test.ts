@@ -1227,7 +1227,7 @@ describe("castle-wall/provision/orchestrate", () => {
         uid: AGENT_UID,
         stage: "bring-up",
         coarseCompositionRestored: true,
-        harnessStartedCoarse: true,
+        harness: { disposition: "started-coarse" },
       });
       expect(String((result as { reason: string }).reason)).toMatch(/NOT live/);
       // The proven coarse wall was NOT disarmed by the degrade path.
@@ -1417,7 +1417,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const reason = String((result as { reason: string }).reason);
       expect(reason).toMatch(/could NOT be fully restored/);
       expect(reason).toMatch(/launchctl bootstrap exited 5/);
-      expect(reason).toMatch(/The agent is STOPPED/);
+      expect(reason).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
       expect(reason).toMatch(/sanctuary protect --hermes/);
       // The ORIGINAL abort reason is never displaced by the cleanup note.
       expect(reason).toMatch(/castle-wall enable exited 1/);
@@ -1460,7 +1460,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const reason = String((result as { reason: string }).reason);
       expect(reason).not.toMatch(/was restarted/i);
       expect(reason).not.toMatch(/restored to its previous state/i);
-      expect(reason).toMatch(/The agent is STOPPED/);
+      expect(reason).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
       expect(reason).toMatch(/sanctuary protect --hermes/);
     });
 
@@ -1483,7 +1483,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       const reason = String((result as { reason: string }).reason);
       expect(reason).not.toMatch(/was restarted/i);
-      expect(reason).toMatch(/The agent is STOPPED/);
+      expect(reason).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
     });
 
     it("B2: a job that was NOT running before is described as put back, not as restarted", async () => {
@@ -1499,7 +1499,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       const reason = String((result as { reason: string }).reason);
       expect(reason).toMatch(/was put back/i);
-      expect(reason).toMatch(/not running before this run, and is not running now/i);
+      expect(reason).toMatch(/not running before this run, and this run did not start it/i);
       expect(reason).not.toMatch(/was restarted/i);
     });
 
@@ -1542,7 +1542,7 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const coarse = await runProvisionFlow(baseCtx({ fineGrainedDeclared: false }), reasonless);
       expect(coarse.kind).toBe("armed");
-      expect(printed.join("\n")).toMatch(/The agent is STOPPED/);
+      expect(printed.join("\n")).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
     });
 
     it("MED: a restore on the THROW path is reported too, instead of being swallowed with the error", async () => {
@@ -1562,7 +1562,7 @@ describe("castle-wall/provision/orchestrate", () => {
       await expect(runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops)).rejects.toThrow(/dscl blew up/);
       // The original error still wins as the outcome, but the operator is no
       // longer left to discover their agent is down by noticing it is down.
-      expect(printed.join("\n")).toMatch(/The agent is STOPPED/);
+      expect(printed.join("\n")).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
     });
   });
 });

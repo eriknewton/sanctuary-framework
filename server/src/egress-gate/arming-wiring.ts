@@ -52,6 +52,7 @@ import {
   type PfAnchorQuarantineRepairResult,
 } from "./anchor-registry.js";
 import type { PfLivenessResult } from "./pf-anchor.js";
+import { assessHarnessParked } from "./parked-claim.js";
 import {
   GenerationCoordinator,
   bindEphemeralGatePort,
@@ -1234,6 +1235,23 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
       await setAgentHarnessJobDisabled(harnessOps, false);
       await installAgentHarnessDaemon(plan, harnessOps);
     },
+    async assessHarnessParked() {
+      // THE chokepoint (fix-round 4). Same settled probe and same pid-strict
+      // bar as the release barrier's: `harnessStatus` carries `pid` through a
+      // downgraded `running` so a crash-looping survivor reads as ALIVE, not
+      // as parked.
+      const harnessOps = realHarnessOps();
+      return assessHarnessParked({
+        probe: {
+          async harnessStatus(): Promise<HarnessDaemonStatus> {
+            const status = await agentHarnessDaemonStatus(harnessOps);
+            if (!status.known || !status.running) return status;
+            const stable = await agentHarnessDaemonStableRunning(harnessOps);
+            return { ...status, running: stable };
+          },
+        },
+      });
+    },
     audit: input.audit,
     print: input.print,
   };
@@ -2166,31 +2184,45 @@ export async function startExclusiveEgressBootSupervisor(input: {
             // Fix-round-3 HIGH-1: with bootout withheld, NOTHING above stopped
             // a harness already running from stale launchd state -- hold-file
             // removal blocks only the NEXT start (the exec wrapper), never a
-            // live process. VERIFY not-running (the same launchd status probe
-            // the repair path's park verify uses) before claiming PARKED; a
-            // running or unknowable job is a LOUD park-not-verified (the
-            // throw below maps to that distinct outcome), never a silent
-            // PARKED report over a live process. This probe runs BEFORE any
-            // resolved uid's release (phase-2 ordering), so a running job
-            // here is stale state by construction, not a fresh release.
-            const status = await agentHarnessDaemonStatus({ ...realHarnessOps(), runLaunchctl: launchctlFn });
-            if (!status.known || status.running) {
-              throw new Error(
-                `uid ${agentUid} re-park NOT verified: ` +
-                  (status.known
-                    ? `the shared harness job ${AGENT_HARNESS_DAEMON_LABEL} reports RUNNING (pid ${status.pid ?? "unknown"})`
-                    : `launchctl did not return a trustworthy status for the shared harness job ${AGENT_HARNESS_DAEMON_LABEL}`) +
-                  ` while bootout/disable were withheld (uid(s) ${resolvedUids.join(", ")} resolved for ` +
-                  "release on that host-singleton label); the hold file was removed so the exec wrapper " +
-                  "refuses any NEW start, but a process already running from stale launchd state was NOT " +
-                  "stopped; intervene manually",
-              );
-            }
+            // live process. The verification is the shared chokepoint below;
+            // this branch only records that the stronger stop was withheld.
+            // The probe runs BEFORE any resolved uid's release (phase-2
+            // ordering), so a running job here is stale state by construction,
+            // not a fresh release.
           }
           if (reassert.cleanupErrors.length > 0) {
             input.print(
               `[castle-wall] boot: uid ${agentUid} could NOT be fully re-parked while unresolvable ` +
                 `(${reassert.cleanupErrors.join("; ")}); treat the agent as possibly startable and intervene manually.`,
+            );
+          }
+          // Fix-round-4: the contextless re-park was the SEVENTH site claiming
+          // "parked" from control flow -- it returned a clean parked outcome
+          // whenever `reassertParkedWithoutContext` resolved, and its one probe
+          // (the shared-label-skipped branch above) was a SINGLE unsettled
+          // sample that ignored `pid` when `running` was downgraded. Both are
+          // now the shared chokepoint: settled, pid-strict, unknown-fails-
+          // closed. A non-parked claim on this path throws, which
+          // `runBootExclusiveEgressRelease` maps to the DISTINCT loud
+          // `park-not-verified` -- never a PARKED report over a live process.
+          const claim = await assessHarnessParked({
+            probe: {
+              harnessStatus: async () =>
+                agentHarnessDaemonStatus({ ...realHarnessOps(), runLaunchctl: launchctlFn }),
+            },
+          });
+          if (claim.state !== "parked") {
+            throw new Error(
+              `uid ${agentUid} re-park NOT verified for the shared harness job ` +
+                `${AGENT_HARNESS_DAEMON_LABEL}: ` +
+                (claim.state === "alive" ? claim.observed : claim.unobserved) +
+                (reassert.sharedLabelOpsSkipped
+                  ? ` while bootout/disable were withheld (uid(s) ${resolvedUids.join(", ")} resolved for ` +
+                    "release on that host-singleton label); the hold file was removed so the exec wrapper " +
+                    "refuses any NEW start, but a process already running from stale launchd state was NOT " +
+                    "stopped"
+                  : "; the re-park ops resolved but the job did not settle stopped") +
+                "; intervene manually",
             );
           }
           return {
@@ -2200,6 +2232,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
             holdFileRemoved: reassert.holdFileRemoved,
             jobDisabled: reassert.jobDisabled,
             cleanupErrors: reassert.cleanupErrors,
+            parkedClaim: claim,
           };
         }
         const ctx = resolution;

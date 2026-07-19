@@ -86,6 +86,7 @@ import {
   type AgentHarnessDaemonPlistOptions,
   type HarnessDaemonStatus,
 } from "./harness-daemon.js";
+import { assessHarnessParked, type ParkedClaim } from "./parked-claim.js";
 
 /** Root-owned parent directory for hold files + the exec wrapper (0755 root). */
 export const AGENT_HARNESS_HOLD_DIR = "/var/db/sanctuary/agent-harness";
@@ -1312,6 +1313,17 @@ export type ReleaseBarrierOutcome =
    * non-green (amber) state and retry the re-park; it is never a clean green.
    */
   | { kind: "released-repark-failed"; generation_id: number; reparkError: string }
+  /**
+   * The release did NOT happen. NOTE THE NAME IS ABOUT THE RELEASE, NOT ABOUT
+   * THE PROCESS: this outcome means "the barrier refused to release", which is
+   * NOT by itself evidence that the harness is stopped. Whether the agent is
+   * actually parked is {@link ParkedClaim} in `parkedClaim` and NOTHING ELSE.
+   * Round 4 of the gate found two live sites (the bootstrap and verify-running
+   * abort cleanups) returning this shape over a harness with a live pid, so the
+   * field is REQUIRED and unforgeable: `assessHarnessParked` is the only way to
+   * obtain one, which makes a returning-parked-without-observing a compile
+   * error rather than a review miss.
+   */
   | {
       kind: "parked";
       stage: ReleaseBarrierStage;
@@ -1322,6 +1334,12 @@ export type ReleaseBarrierOutcome =
       jobDisabled: boolean;
       /** Cleanup failures (LOUD; never swallowed). Empty on a clean abort. */
       cleanupErrors: string[];
+      /**
+       * THE run-state claim. `state: "parked"` is the only value that licenses
+       * saying the agent is not running; `"alive"` and `"unknown"` both mean
+       * this abort left a process that this run did not observe stop.
+       */
+      parkedClaim: ParkedClaim;
     };
 
 interface ParkCleanupResult {
@@ -1385,6 +1403,55 @@ async function parkCleanup(
 }
 
 /**
+ * THE SEQUENCE'S PARKED-OUTCOME CHOKEPOINT (fix-round 4, 2026-07-19).
+ *
+ * Every abort in {@link runReleaseBarrierSequence} returns through here, and
+ * here is the only place the sequence obtains a {@link ParkedClaim}. Round 3
+ * fixed this pattern at ONE site (the initial reassert) by adding a probe
+ * beside it; both remaining sites of the identical shape -- the bootstrap and
+ * verify-running abort cleanups, each of which runs `bootout: true` and then
+ * returned a CLEAN parked outcome -- survived to round 4, where Codex
+ * reproduced one host-free over a modelled harness at `running: true,
+ * pid: 4242`. Adding a third probe beside the third site is what produced this
+ * round; instead there is now exactly one door.
+ *
+ * EVERY abort probes, with no "the earlier reassert already observed stopped
+ * and nothing since could have started it" reasoning. That reasoning was true
+ * at most sites and quietly false at others (`enableJob` alone can let launchd
+ * start a bootstrapped-but-disabled job), and distinguishing the two by review
+ * is precisely the discipline that has failed six times. The cost is one
+ * settle loop on failure paths only.
+ *
+ * The single exception is a caller that ALREADY holds a claim from this same
+ * run (the reassert stage, which probes to decide whether to proceed at all):
+ * it passes that claim through rather than re-probing, so the outcome reports
+ * the observation the refusal was actually based on.
+ */
+async function parkedOutcome(
+  ops: ReleaseBarrierOps,
+  input: {
+    stage: ReleaseBarrierStage;
+    reason: string;
+    holdFileRemoved: boolean;
+    jobDisabled: boolean;
+    cleanupErrors: string[];
+    /** A claim already obtained THIS RUN; omit to probe now. */
+    claim?: ParkedClaim;
+  },
+): Promise<ReleaseBarrierOutcome> {
+  const parkedClaim = input.claim ?? (await assessHarnessParked({ probe: ops }));
+  return {
+    kind: "parked",
+    stage: input.stage,
+    reason: input.reason,
+    holdFileRemoved: input.holdFileRemoved,
+    jobDisabled: input.jobDisabled,
+    cleanupErrors: input.cleanupErrors,
+    parkedClaim,
+  };
+}
+
+/**
  * Run the release sequence: reassert-parked -> re-arm -> gate-verify ->
  * commit -> verify-committed -> hold-file -> released-plist -> enable ->
  * bootstrap -> verify-running -> re-park boot state -> verify-running.
@@ -1439,15 +1506,14 @@ export async function runReleaseBarrierSequence(
     restorePlist: true,
   });
   if (initial.errors.length > 0) {
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "reassert-parked",
       reason:
         "could not re-assert the parked state (bootout + disable + stale-hold-file removal + parked-plist restore); refusing to run the release sequence",
       holdFileRemoved: initial.holdFileRemoved,
       jobDisabled: initial.jobDisabled,
       cleanupErrors: initial.errors,
-    };
+    });
   }
 
   // ...AND PROVE IT STOPPED, BEFORE ANYTHING ELSE RUNS (fix-round 3 BLOCKER,
@@ -1470,18 +1536,21 @@ export async function runReleaseBarrierSequence(
   // Fail-closed both ways: still running refuses, and an UNKNOWABLE launchd
   // state refuses too, because "I could not tell" is not a park.
   {
-    const stopped = await probeHarnessStopped(ops);
-    if (!stopped.ok) {
-      return {
-        kind: "parked",
+    const claim = await assessHarnessParked({ probe: ops });
+    if (claim.state !== "parked") {
+      const seen = claim.state === "alive" ? claim.observed : claim.unobserved;
+      return await parkedOutcome(ops, {
         stage: "reassert-parked",
         reason:
-          `the parked state was not asserted: ${stopped.reason}; refusing to run the release sequence over a ` +
+          `the parked state was not asserted: ${seen}; refusing to run the release sequence over a ` +
           "harness this run did not prove it stopped",
         holdFileRemoved: initial.holdFileRemoved,
         jobDisabled: initial.jobDisabled,
         cleanupErrors: [],
-      };
+        // The claim this refusal is BASED ON; re-probing would report a second,
+        // later observation than the one that made the decision.
+        claim,
+      });
     }
   }
 
@@ -1492,28 +1561,26 @@ export async function runReleaseBarrierSequence(
   // reassert above did not observe them, this abort must not claim them.
   const rearm = await ops.rearmAnchor();
   if (!rearm.ok) {
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "rearm-anchor",
       reason: `pf anchor re-arm failed: ${rearm.reason}`,
       holdFileRemoved: initial.holdFileRemoved,
       jobDisabled: initial.jobDisabled,
       cleanupErrors: [],
-    };
+    });
   }
 
   // Stage: gate-verify.
   const gate = await ops.verifyGate();
   if (!gate.ok) {
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "gate-verify",
       reason: `gate verification failed: ${gate.reasons.join("; ")}`,
       // Carried from the observed reassert, not hardcoded. See rearm-anchor.
       holdFileRemoved: initial.holdFileRemoved,
       jobDisabled: initial.jobDisabled,
       cleanupErrors: [],
-    };
+    });
   }
 
   // Stage: commit-generation.
@@ -1522,14 +1589,13 @@ export async function runReleaseBarrierSequence(
     committed = await ops.commitGeneration();
   } catch (err) {
     const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "commit-generation",
       reason: `generation commit failed: ${(err as Error).message}`,
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
-    };
+    });
   }
   if (
     committed.agent_uid !== ctx.agentUid ||
@@ -1539,8 +1605,7 @@ export async function runReleaseBarrierSequence(
     // Identity keying (design: "the G5 commit names what it releases"). A
     // commit for a different uid, or a non-positive id, must never release.
     const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "commit-generation",
       reason:
         `committed generation identity mismatch: commit names uid ${String(committed.agent_uid)} ` +
@@ -1548,7 +1613,7 @@ export async function runReleaseBarrierSequence(
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
-    };
+    });
   }
 
   // Stage: verify-committed. Bind the verified identity to the COMMITTED one
@@ -1559,22 +1624,20 @@ export async function runReleaseBarrierSequence(
     const reverify = await ops.verifyGate();
     if (!reverify.ok) {
       const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
-      return {
-        kind: "parked",
+      return await parkedOutcome(ops, {
         stage: "verify-committed",
         reason: `post-commit gate verification failed: ${reverify.reasons.join("; ")}`,
         holdFileRemoved: cleanup.holdFileRemoved,
         jobDisabled: cleanup.jobDisabled,
         cleanupErrors: cleanup.errors,
-      };
+      });
     }
     if (
       reverify.observed.generation_id !== committed.generation_id ||
       reverify.observed.agent_uid !== committed.agent_uid
     ) {
       const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
-      return {
-        kind: "parked",
+      return await parkedOutcome(ops, {
         stage: "verify-committed",
         reason:
           `post-commit verification observed uid ${String(reverify.observed.agent_uid)} ` +
@@ -1584,18 +1647,17 @@ export async function runReleaseBarrierSequence(
         holdFileRemoved: cleanup.holdFileRemoved,
         jobDisabled: cleanup.jobDisabled,
         cleanupErrors: cleanup.errors,
-      };
+      });
     }
   } catch (err) {
     const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "verify-committed",
       reason: `post-commit gate verification errored: ${(err as Error).message}`,
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
-    };
+    });
   }
 
   // Stage: write-hold-file. Render first (validates every field fail-closed).
@@ -1611,14 +1673,13 @@ export async function runReleaseBarrierSequence(
     await ops.writeHoldFile(record);
   } catch (err) {
     const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "write-hold-file",
       reason: `hold-file write failed: ${(err as Error).message}`,
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
-    };
+    });
   }
 
   // Stage: write-released-plist. The parked plist embeds generation 0, which
@@ -1628,14 +1689,13 @@ export async function runReleaseBarrierSequence(
     await ops.writeReleasedPlist(committed);
   } catch (err) {
     const cleanup = await parkCleanup(ops, { removeHold: true, disable: true, restorePlist: true });
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "write-released-plist",
       reason: `released-plist write failed: ${(err as Error).message}`,
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
-    };
+    });
   }
 
   // Stage: enable. Strictly after commit + hold-file + released plist (the
@@ -1644,14 +1704,13 @@ export async function runReleaseBarrierSequence(
     await ops.enableJob();
   } catch (err) {
     const cleanup = await parkCleanup(ops, { removeHold: true, disable: true, restorePlist: true });
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "enable",
       reason: `enable failed: ${(err as Error).message}`,
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
-    };
+    });
   }
 
   // Stage: bootstrap (+ kickstart, inside the op).
@@ -1664,14 +1723,13 @@ export async function runReleaseBarrierSequence(
       bootout: true,
       restorePlist: true,
     });
-    return {
-      kind: "parked",
+    return await parkedOutcome(ops, {
       stage: "bootstrap",
       reason: `bootstrap failed: ${(err as Error).message}`,
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
-    };
+    });
   }
 
   // Stage: verify-running (post-bootstrap). A bootstrap/kickstart that
@@ -1688,14 +1746,13 @@ export async function runReleaseBarrierSequence(
         bootout: true,
         restorePlist: true,
       });
-      return {
-        kind: "parked",
+      return await parkedOutcome(ops, {
         stage: "verify-running",
-        reason: `harness is not running after bootstrap: ${probe.reason}`,
+        reason: `the harness did not reach a stable running state after bootstrap: ${probe.reason}`,
         holdFileRemoved: cleanup.holdFileRemoved,
         jobDisabled: cleanup.jobDisabled,
         cleanupErrors: cleanup.errors,
-      };
+      });
     }
   }
 
@@ -1733,51 +1790,25 @@ export async function runReleaseBarrierSequence(
         // licenses carrying the flag through a call that issues no disable.
         carried: { jobDisabled: true },
       });
-      return {
-        kind: "parked",
+      return await parkedOutcome(ops, {
         stage: "verify-running",
-        reason: `harness is not running after the boot-state re-park: ${probe.reason}`,
+        reason: `the harness did not reach a stable running state after the boot-state re-park: ${probe.reason}`,
         holdFileRemoved: cleanup.holdFileRemoved,
         jobDisabled: cleanup.jobDisabled,
         cleanupErrors: cleanup.errors,
-      };
+      });
     }
   }
 
   return { kind: "released", generation_id: committed.generation_id };
 }
 
-/**
- * Fail-closed harness STOPPED probe: settles (a bootout's zero exit does not
- * prove the process is reaped), then requires a trustworthy launchd state that
- * reports no running pid. A throw, an unknown state, or a live pid all refuse.
- */
-async function probeHarnessStopped(
-  ops: ReleaseBarrierOps,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
-  let status: HarnessDaemonStatus;
-  try {
-    status = await awaitHarnessStoppedVia(() => ops.harnessStatus(), ops.sleepMs);
-  } catch (err) {
-    return { ok: false, reason: `status probe errored: ${(err as Error).message}` };
-  }
-  if (!status.known) {
-    return { ok: false, reason: "launchctl did not return a trustworthy harness status after the bootout" };
-  }
-  if (status.running || status.pid !== undefined) {
-    // `pid` is checked SEPARATELY from `running` on purpose. Production wires
-    // `harnessStatus` to downgrade `running` to false when the pid is not
-    // STABLE across samples -- the right bar for "did it come up?", and the
-    // wrong one for "is it gone?": a crash-looping pre-G5 harness is a live
-    // process that would read as not-running. For the stopped direction any
-    // pid at all is disqualifying.
-    return {
-      ok: false,
-      reason: `the harness job still reports a pid (${status.pid ?? "unknown"}) after the bootout`,
-    };
-  }
-  return { ok: true };
-}
+// The former `probeHarnessStopped` lived here. It is now
+// `assessHarnessParked` in `parked-claim.ts` -- moved rather than kept,
+// because a stopped-probe that ANY site could choose not to call is exactly
+// the shape that let two of its three sibling sites skip it for four rounds.
+// The settle loop, the unknown-fails-closed rule, and the separate `pid`
+// check moved with it verbatim.
 
 /** Fail-closed harness liveness probe: unknown status or a throw is NOT running. */
 async function probeHarnessRunning(

@@ -33,6 +33,12 @@ import type {
   ReleaseBarrierOutcome,
 } from "../../egress-gate/release-barrier.js";
 import type { PfAnchorQuarantineRepairResult } from "../../egress-gate/anchor-registry.js";
+import {
+  harnessDispositionSentence,
+  startedCoarseDisposition,
+  type HarnessDisposition,
+  type ParkedClaim,
+} from "../../egress-gate/parked-claim.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EXCLUSIVE_EGRESS_ARMED_AUDIT_OP = "exclusive_egress_armed";
@@ -95,6 +101,16 @@ export interface ExclusiveEgressArmOps {
    */
   startHarnessCoarse(): Promise<void>;
   /**
+   * THE parked-claim probe (fix-round 4). Production wires this to
+   * `assessHarnessParked({ probe: { harnessStatus, sleepMs } })`. The degrade
+   * path calls it whenever it did NOT start the agent, because "we did not
+   * start it" is a fact about this run and says nothing about whether a
+   * process is alive -- which is exactly what the round-4 HIGH found being
+   * rendered to the operator as "The agent is PARKED (not running)" over a
+   * live pid 9001. MUST NOT throw (`assessHarnessParked` never does).
+   */
+  assessHarnessParked(): Promise<ParkedClaim>;
+  /**
    * Best-effort audit through the existing castle-wall CLI audit path with a
    * DISTINCT operation string. MUST never throw.
    */
@@ -115,18 +131,31 @@ export type ExclusiveEgressArmOutcome =
   | { kind: "exclusive-armed-repark-failed"; generationId: number; reparkError: string }
   /**
    * DEGRADE-LOUD (design answer 2 choice (b)): the exclusive stack could not
-   * come live; the coarse wall stays armed. `coarseCompositionRestored`
-   * reports whether the manifest is back in coarse (agent-functional) scope,
-   * and `harnessStartedCoarse` whether the agent is actually running -- BOTH
-   * false means the agent is parked + the operator must run the repair verb.
-   * Always a DISTINCT non-green posture (S5-P renders it amber everywhere).
+   * come live; the coarse wall stays armed. Always a DISTINCT non-green
+   * posture (S5-P renders it amber everywhere).
+   *
+   * `coarseCompositionRestored` reports whether the manifest is back in coarse
+   * (agent-functional) scope. Its TRUE branch is observed (the S5-4 compose
+   * ran its residue check and emitted the required audit); its FALSE branch
+   * asserts only that OUR restore failed -- it makes no claim about the
+   * agent's run state, which is `harness` and nothing else.
+   *
+   * `harness` replaced the former `harnessStartedCoarse: boolean` in fix-round
+   * 4. That boolean was correctly `observed` for its true branch, and its
+   * FALSE branch -- which means "this run did not start it" -- was rendered at
+   * four altitudes, ending at the operator CLI, as "The agent is PARKED (not
+   * running)", over a process the release barrier had just refused to proceed
+   * past BECAUSE it was running. A boolean carries two claims and only one of
+   * them was ever audited, so the field is now a named-branch union whose
+   * not-started arm carries an unforgeable {@link ParkedClaim}.
    */
   | {
       kind: "degraded-coarse-active";
       stage: "bring-up" | "release";
       reason: string;
       coarseCompositionRestored: boolean;
-      harnessStartedCoarse: boolean;
+      /** What happened to the agent process, per branch. Never a boolean. */
+      harness: HarnessDisposition;
       /** Cleanup problems that must stay loud (parked-state assertions etc). */
       cleanupErrors: string[];
     };
@@ -231,33 +260,54 @@ async function degradeLoud(
   } catch (err) {
     errors.push(`coarse composition restore failed: ${(err as Error).message}`);
   }
-  let harnessStartedCoarse = false;
+  let harness: HarnessDisposition | undefined;
   if (coarseCompositionRestored) {
     // Only start the agent over a manifest that is PROVEN back in coarse
     // (agent-reachable) scope; starting it over exclusive-scoped rules with
     // no live gate would confine it into silence.
     try {
       await ops.startHarnessCoarse();
-      harnessStartedCoarse = true;
+      harness = startedCoarseDisposition();
     } catch (err) {
-      errors.push(`coarse harness start failed (agent remains parked): ${(err as Error).message}`);
+      errors.push(
+        `coarse harness start failed (this run did not start the agent): ${(err as Error).message}`,
+      );
     }
   }
+  if (harness === undefined) {
+    // FIX-ROUND 4, the round's whole point. Reaching here means one of two
+    // things about THIS RUN -- the coarse restore failed, or the coarse start
+    // failed -- and NEITHER is a fact about whether a process is alive. The
+    // most common way to reach here is the release barrier refusing precisely
+    // BECAUSE a live process survived the bootout, in which case the agent is
+    // demonstrably up. So ask, do not infer.
+    harness = { disposition: "not-started", claim: await ops.assessHarnessParked() };
+  }
+  // The audit record carries the CLAIM, not a boolean: a posture surface or
+  // SIEM consumer reading `harness_started_coarse: false` used to receive the
+  // documented meaning "the agent is parked" with no pid information at all,
+  // which made the falsehood SILENT downstream rather than merely
+  // self-contradictory in the operator prose.
+  const harnessAudit =
+    harness.disposition === "started-coarse"
+      ? { harness_run_state: "running-coarse", harness_run_state_basis: harness.observed }
+      : { harness_run_state: harness.claim.state, harness_run_state_basis: harness.claim.sentence };
   await ops.audit(EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP, {
     agent_uid: ctx.agentUid,
     stage,
     reason,
     coarse_composition_restored: coarseCompositionRestored,
-    harness_started_coarse: harnessStartedCoarse,
+    harness_disposition: harness.disposition,
+    ...harnessAudit,
     cleanup_errors: errors,
   });
   ops.print(
     `Exclusive egress could NOT come live (${stage}): ${reason}. ` +
       (coarseCompositionRestored
-        ? harnessStartedCoarse
-          ? "The coarse Castle Wall remains armed and the agent is running in coarse-only mode (a distinct NON-GREEN state on every posture surface)."
-          : "The manifest is back in coarse scope but the agent could NOT be started; it remains parked."
-        : "The manifest could NOT be restored to coarse scope; the agent remains parked (fail-closed).") +
+        ? "The coarse Castle Wall remains armed and the manifest is back in coarse scope (a distinct NON-GREEN state on every posture surface). "
+        : "The manifest could NOT be restored to coarse scope. ") +
+      // The ONE sentence about run state, and it comes from the chokepoint.
+      harnessDispositionSentence(harness) +
       " Fix with: sudo sanctuary protect --repair-egress-gate",
   );
   return {
@@ -265,7 +315,7 @@ async function degradeLoud(
     stage,
     reason,
     coarseCompositionRestored,
-    harnessStartedCoarse,
+    harness,
     cleanupErrors: errors,
   };
 }
@@ -650,6 +700,12 @@ export interface BootReleaseResult {
         jobDisabled: boolean;
         /** Re-park op failures, LOUD and per-op (empty on a clean park). */
         cleanupErrors: string[];
+        /**
+         * The barrier's run-state claim (fix-round 4). `kind: "parked"` here
+         * means the barrier did not release; only `parkedClaim.state ===
+         * "parked"` means a process is known to be gone.
+         */
+        parkedClaim: ParkedClaim;
       }
     | {
         kind: "park-not-verified";
@@ -700,6 +756,7 @@ export async function runBootExclusiveEgressRelease(
           holdFileRemoved: release.holdFileRemoved,
           jobDisabled: release.jobDisabled,
           cleanupErrors: release.cleanupErrors,
+          parkedClaim: release.parkedClaim,
         };
       }
     } catch (err) {
@@ -718,9 +775,13 @@ export async function runBootExclusiveEgressRelease(
           "intervene manually. Fix with: sudo sanctuary protect --repair-egress-gate",
       );
     } else if (outcome.kind === "parked") {
+      // Fix-round 4: the run-state sentence is the CHOKEPOINT's, not this
+      // function's. It used to hardcode "remains PARKED (fail-closed)" from
+      // the outcome kind alone, which names only the fact that the barrier
+      // did not release.
       ops.print(
-        `[castle-wall] boot: uid ${agent.agent_uid} exclusive egress NOT live; the agent harness ` +
-          `remains PARKED (fail-closed): ${outcome.reason}.` +
+        `[castle-wall] boot: uid ${agent.agent_uid} exclusive egress NOT live: ${outcome.reason}. ` +
+          outcome.parkedClaim.sentence +
           (outcome.cleanupErrors.length > 0
             ? ` WARNING: re-park ops reported failures (hold file removed: ${outcome.holdFileRemoved}, ` +
               `job disabled: ${outcome.jobDisabled}): ${outcome.cleanupErrors.join("; ")}.`

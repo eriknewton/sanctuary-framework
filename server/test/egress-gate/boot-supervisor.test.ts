@@ -17,6 +17,8 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+
+import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import { generateKeyPairSync } from "node:crypto";
 
 import {
@@ -105,7 +107,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H1: no synthetic parked)
     expect(handle.results).toHaveLength(1);
     // Fix-round-2 BLOCKER-1: the parked outcome carries the REAL reassert
     // flags, so a caller can audit exactly what held the park.
-    expect(handle.results[0]!.outcome).toEqual({
+    expect(handle.results[0]!.outcome).toMatchObject({
       kind: "parked",
       reason: expect.stringContaining("no marker for uid 502"),
       holdFileRemoved: true,
@@ -118,6 +120,12 @@ describe("startExclusiveEgressBootSupervisor (fix-round H1: no synthetic parked)
       `launchctl bootout system/${AGENT_HARNESS_DAEMON_LABEL}`,
       "removeHold 502",
       `launchctl disable system/${AGENT_HARNESS_DAEMON_LABEL}`,
+      // Fix-round 4: the contextless re-park was the SEVENTH site claiming
+      // "parked" from control flow -- it reported a park whenever these three
+      // ops resolved. It now settles a launchd read before claiming anything,
+      // and throws to the distinct `park-not-verified` if it does not observe
+      // the job stopped.
+      `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL}`,
     ]);
   });
 
@@ -218,6 +226,15 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
             holdFileRemoved: true,
             jobDisabled: true,
             cleanupErrors: [],
+            // Fix-round 4: a parked outcome REQUIRES a run-state claim, and a
+            // claim cannot be hand-rolled -- tests model launchd and let the
+            // real chokepoint classify it, exactly as production does.
+            parkedClaim: await assessHarnessParked({
+              probe: {
+                harnessStatus: async () => ({ known: true, installed: true, running: false }),
+                sleepMs: async () => undefined,
+              },
+            }),
           };
         },
       }),
@@ -344,7 +361,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 BLOCKER-1: throws neve
       internals: baseInternals({ runLaunchctlFn: okLaunchctl(calls), removeHoldFile }),
     });
     handle.stopOracleLoop();
-    expect(handle.results[0]!.outcome).toEqual({
+    expect(handle.results[0]!.outcome).toMatchObject({
       kind: "parked",
       reason: expect.stringContaining("release-context resolver threw: hermes gateway entrypoint not found"),
       holdFileRemoved: true,
@@ -357,6 +374,12 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 BLOCKER-1: throws neve
       `launchctl bootout system/${AGENT_HARNESS_DAEMON_LABEL}`,
       "removeHold 502",
       `launchctl disable system/${AGENT_HARNESS_DAEMON_LABEL}`,
+      // Fix-round 4: the contextless re-park was the SEVENTH site claiming
+      // "parked" from control flow -- it reported a park whenever these three
+      // ops resolved. It now settles a launchd read before claiming anything,
+      // and throws to the distinct `park-not-verified` if it does not observe
+      // the job stopped.
+      `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL}`,
     ]);
   });
 
@@ -610,7 +633,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-1: shared-label s
     expect(stale.outcome.kind).toBe("park-not-verified");
     const reason = (stale.outcome as { reason: string }).reason;
     expect(reason).toContain("uid 502");
-    expect(reason).toContain("RUNNING (pid 4242)");
+    expect(reason).toContain("still reports a pid (4242)");
     expect(reason).toContain("withheld");
     expect(reason).toContain("601");
     // The shared-label ops stayed withheld (never issued for the stale uid).

@@ -23,15 +23,22 @@
  *     surface a reviewer must hold; it does not eliminate it.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, it, expect } from "vitest";
 
+import ts from "typescript";
+
 import {
   CLAIM_LITERAL_COUNTS,
   CLAIM_SITES,
+  RUN_STATE_PROSE_EXEMPT,
+  RUN_STATE_PROSE_PATTERNS,
+  RUN_STATE_PROSE_SCANNED_DIRS,
+  RUN_STATE_PROSE_SCANNED_FILES,
+  RUN_STATE_PROSE_SOLE_OWNER,
   claimLiteralRegex,
   type ClaimSiteDeclaration,
   type ClaimSiteId,
@@ -121,10 +128,104 @@ describe("claim register: the literal ratchet", () => {
     expect(drift, "claim-literal drift -- classify the new claim in claim-basis.ts").toEqual([]);
   });
 
+  it("keeps run-state prose in exactly ONE file", () => {
+    // THE RENDER-LAYER GUARD. Round 4's HIGH was a SENTENCE, and no count
+    // ratchet could have caught it. This is an ownership rule instead: the
+    // phrases that assert whether the agent process is alive may exist only in
+    // the chokepoint that can produce them from a settled observation. Every
+    // other surface prints `ParkedClaim.sentence`.
+    //
+    // PARSER-based on purpose: it walks the TypeScript AST's string and
+    // template literals, so doc comments stay free to discuss parking in plain
+    // English. A line scanner cannot tell prose from code and would either
+    // gag the comments or miss a multi-line template.
+    const files = [
+      ...RUN_STATE_PROSE_SCANNED_FILES,
+      ...RUN_STATE_PROSE_SCANNED_DIRS.flatMap((dir) =>
+        readdirSync(join(REPO_ROOT, dir))
+          .filter((f) => f.endsWith(".ts"))
+          .map((f) => `${dir}/${f}`),
+      ),
+    ].filter((f) => f !== RUN_STATE_PROSE_SOLE_OWNER && RUN_STATE_PROSE_EXEMPT[f] === undefined);
+
+    const offenders: string[] = [];
+    for (const file of files) {
+      const source = ts.createSourceFile(
+        file,
+        readSource(file),
+        ts.ScriptTarget.ESNext,
+        true,
+      );
+      const visit = (node: ts.Node): void => {
+        if (
+          ts.isStringLiteral(node) ||
+          ts.isNoSubstitutionTemplateLiteral(node) ||
+          ts.isTemplateHead(node) ||
+          ts.isTemplateMiddle(node) ||
+          ts.isTemplateTail(node)
+        ) {
+          for (const phrase of RUN_STATE_PROSE_PATTERNS) {
+            if (node.text.includes(phrase)) {
+              const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
+              offenders.push(`${file}:${line + 1} contains run-state prose ${JSON.stringify(phrase)}`);
+            }
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(source);
+    }
+    // If this fails you have written a sentence about whether the agent is
+    // running, somewhere other than `parked-claim.ts`. That is the round-4
+    // defect. Do not reword around the pattern list: obtain a `ParkedClaim`
+    // from `assessHarnessParked` and print its `sentence`.
+    expect(offenders, "run-state prose outside the parked-claim chokepoint").toEqual([]);
+  });
+
   it("does not silently lose a tracked file", () => {
     for (const file of Object.keys(CLAIM_LITERAL_COUNTS)) {
       expect(() => readSource(file), `${file} is tracked but unreadable`).not.toThrow();
     }
+  });
+
+  it("classifies BOTH branches of every boolean-backed row", () => {
+    // Fix-round 4, Part B blind spot 1. The register was one row per FLAG, and
+    // a boolean carries two claims: `harness-started-coarse` was correctly
+    // `observed` for its true branch while its FALSE branch -- the branch that
+    // was rendered as "The agent is PARKED (not running)" over a live pid --
+    // had no row at all. `branches: "boolean"` makes `negativeBranch` a
+    // COMPILE-time requirement; this test enforces the same content rules on
+    // the negative branch that the positive one has always had.
+    const offenders: string[] = [];
+    for (const [id, site] of entries) {
+      if (site.branches !== "boolean") continue;
+      const neg = site.negativeBranch;
+      if (neg.claim.trim().length === 0) {
+        offenders.push(`${id}: negative branch has an empty claim`);
+      }
+      const hasBound = neg.unobserved !== undefined && neg.unobserved.trim().length > 0;
+      if (neg.basis === "observed" && hasBound) {
+        offenders.push(`${id}: an observed negative branch must not carry an unobserved note`);
+      }
+      if (neg.basis !== "observed" && !hasBound) {
+        offenders.push(`${id}: a ${neg.basis} negative branch must name what is NOT observed`);
+      }
+    }
+    expect(offenders).toEqual([]);
+    // The shape is worthless if nobody uses it.
+    expect(entries.filter(([, s]) => s.branches === "boolean").length).toBeGreaterThan(20);
+  });
+
+  it("reaches the RENDER layer, not only where claims are computed", () => {
+    // Fix-round 4, Part B blind spot 2: the register had 95 rows and zero on
+    // the layer the operator actually reads, which is where the round-4 HIGH
+    // printed.
+    const render = entries.filter(([, site]) => site.layer === "render");
+    expect(render.length).toBeGreaterThan(0);
+    expect(
+      render.some(([, site]) => site.file === "server/src/wrap/cli.ts"),
+      "wrap/cli.ts is where the false sentence printed; it must be in the register",
+    ).toBe(true);
   });
 
   it("states its own bound: detector-blind rows exist and are declared, not hidden", () => {
