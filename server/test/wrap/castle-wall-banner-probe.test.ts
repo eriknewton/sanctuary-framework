@@ -51,6 +51,16 @@ function coarseOnlyStatus(): ExclusiveEgressStatus {
   };
 }
 
+function coarseFleetStatus(): ExclusiveEgressStatus {
+  return {
+    fine_grained_declared: false,
+    exclusive_egress_live: true,
+    mode: null,
+    agents: [],
+    reasons: [],
+  };
+}
+
 describe("Castle Wall wrap-banner evidence probes", () => {
   let storagePath: string;
   let fortressId: string;
@@ -118,6 +128,17 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       async () => exclusiveStatus(),
     );
     expect(claim.state).toBe("exclusive");
+  });
+
+  it("fresh coarse default evidence stays green when no fine-grained agent was declared", async () => {
+    await appendCW("egress_allowed", 60_000);
+    const claim = await probeCastleWallProtectionClaim(
+      log,
+      storagePath,
+      async () => coarseFleetStatus(),
+    );
+    expect(claim.state).toBe("exclusive");
+    expect(claim.basis).toBe("castle_wall_enforcement_observed");
   });
 
   it("fresh coarse evidence without exclusive live maps to coarse-only, not green", async () => {

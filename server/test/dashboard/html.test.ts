@@ -130,7 +130,21 @@ describe("renderDashboardHTML", () => {
 
   it("renders the hero copy from the exported HERO_COPY constant", () => {
     const html = renderDashboardHTML({ snapshot: makeSnapshot() });
-    expect(html).toContain(HERO_COPY);
+    expect(html).toContain(`<h1 id="hero-copy">${HERO_COPY}</h1>`);
+  });
+
+  it("does not render the protected hero copy for non-green snapshots", () => {
+    const html = renderDashboardHTML({
+      snapshot: makeSnapshot({
+        overall: {
+          status: "degraded",
+          light: "yellow",
+          headline: "Castle Wall enforcement not confirmed",
+        },
+      }),
+    });
+    expect(html).not.toContain(`<h1 id="hero-copy">${HERO_COPY}</h1>`);
+    expect(html).toContain('<h1 id="hero-copy">Protection not confirmed.</h1>');
   });
 
   it("renders the privacy boundary summary", () => {

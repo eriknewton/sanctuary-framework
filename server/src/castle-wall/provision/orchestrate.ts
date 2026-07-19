@@ -408,8 +408,18 @@ export type ProvisionFlowOutcome =
        * into a clean "rolled back; re-run" line (the honesty gap the P0 flagged).
        */
       wallMayBeArmed?: boolean;
+      /**
+       * Positive observed-off evidence from `ops.disarm()`. Absence means "not
+       * observed", never "off".
+       */
+      disarmObservedOff?: true;
     }
-  | { kind: "armed-then-rolled-back"; uid: number; reason: string }
+  | {
+      kind: "armed-then-rolled-back";
+      uid: number;
+      reason: string;
+      disarmObservedOff?: true;
+    }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string }
   /**
    * Egress-provision outcome vocabulary (design section 5): a DISTINCT local
@@ -426,6 +436,7 @@ export type ProvisionFlowOutcome =
       reason: string;
       /** False when the provisioned-rule scrub after fast-disarm could not be confirmed. */
       scrubbed: boolean;
+      disarmObservedOff?: true;
     }
   /**
    * S5-6 (Unified Protect Slice 5): the FULL fine-grained outcome -- coarse
@@ -921,6 +932,7 @@ export async function runProvisionFlow(
     // disarm leave the daemon UP + set wallMayBeArmed.
     let tearDownPolicyDaemon = false;
     let wallMayBeArmed = false;
+    let disarmObservedOff = false;
     let disarmNote: string | undefined;
     if (policyDaemonFreshlyInstalled) {
       try {
@@ -932,6 +944,7 @@ export async function runProvisionFlow(
           // was disarmed during rollback so the operator can confirm -- not a
           // bare "nothing happened" clean rollback.
           tearDownPolicyDaemon = true;
+          disarmObservedOff = true;
           disarmNote =
             "The content filter was disarmed as part of this rollback; confirm it is off with 'sanctuary castle-wall status'.";
         } else {
@@ -981,6 +994,7 @@ export async function runProvisionFlow(
       // P0 honesty gap: when the filter may still be armed (disarm could not
       // confirm), the CLI must NOT render a clean "rolled back; re-run" line.
       wallMayBeArmed: wallMayBeArmed ? true : undefined,
+      disarmObservedOff: disarmObservedOff ? true : undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
@@ -1015,8 +1029,10 @@ export async function runProvisionFlow(
     // entirely, the CLI's generic catch swallowed it into NO outcome, and
     // the wrap's own success banner still printed over an ARMED wall with a
     // FAILED rollback. Catch it and return a distinct, loud outcome instead.
+    let disarmObservedOff: boolean;
     try {
-      await ops.disarm();
+      const disarmResult = await ops.disarm();
+      disarmObservedOff = disarmResult.neConfirmedOff;
     } catch (disarmErr) {
       return {
         kind: "armed-rollback-failed",
@@ -1036,6 +1052,7 @@ export async function runProvisionFlow(
       kind: "armed-then-rolled-back",
       uid,
       reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.${scrubNote}`,
+      disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
 
@@ -1059,9 +1076,11 @@ export async function runProvisionFlow(
       `and must NOT reach the negative control; anything less confines the agent into ` +
       `non-functionality or proves nothing about confinement.`;
     let disarmed: boolean;
+    let disarmObservedOff: boolean;
     try {
-      await ops.disarm();
+      const disarmResult = await ops.disarm();
       disarmed = true;
+      disarmObservedOff = disarmResult.neConfirmedOff;
     } catch (disarmErr) {
       await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
         stage: "post-arm-as-uid-verify",
@@ -1093,6 +1112,7 @@ export async function runProvisionFlow(
       uid,
       reason: `${egressBaseReason} Fast-disarmed rather than leave a bricked-or-unconfined agent.${scrubNote}`,
       scrubbed: disarmed && scrubNote === "",
+      disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
 

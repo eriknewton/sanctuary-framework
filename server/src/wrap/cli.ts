@@ -1030,6 +1030,12 @@ export type DashboardStarter = (opts: {
  * The banner-facing path then requires the producer's capped verdict and
  * returns a branded ProtectionStateClaim; a missing or throwing provider
  * fails closed to unknown, never green.
+ *
+ * Known bounded staleness: the feature-health panel treats fresh
+ * Castle-Wall-originated adjudicated-flow evidence as current for its bounded
+ * freshness window (10 minutes today). This re-reads that evidence at banner
+ * time, but it does not prove the daemon is still alive at the exact print
+ * instant if a prior daemon died inside that window.
  */
 type CastleWallFeatureProbeInput =
   | { purpose: "coarse-wall" }
@@ -1159,34 +1165,18 @@ function protectionObservationFromAutoProvisionSummary(
   const outcome = summary.outcome;
   switch (outcome.kind) {
     case "armed-exclusive":
-      return {
-        state: "exclusive",
-        basis: "exclusive_egress_observed",
-        reasons: [`generation ${outcome.generationId}`],
-      };
     case "armed":
-      return {
-        state: "coarse-only",
-        basis: "coarse_wall_observed",
-        reasons: [`uid ${outcome.uid}`],
-      };
+      return undefined;
     case "armed-exclusive-repark-failed":
       return {
         state: "coarse-only",
-        basis: "exclusive_egress_cap_observed",
+        basis: "exclusive_egress_live_repark_failed",
         reasons: [outcome.reparkError],
       };
     case "exclusive-egress-unarmed-coarse-active":
-      if (outcome.coarseCompositionRestored && outcome.harnessStartedCoarse) {
-        return {
-          state: "coarse-only",
-          basis: "exclusive_egress_cap_observed",
-          reasons: [outcome.reason, ...outcome.cleanupErrors],
-        };
-      }
       return {
         state: "unknown",
-        basis: "insufficient_evidence",
+        basis: "provision_outcome_not_observation",
         reasons: [outcome.reason, ...outcome.cleanupErrors],
       };
     case "armed-rollback-failed":
@@ -1196,23 +1186,30 @@ function protectionObservationFromAutoProvisionSummary(
         reasons: [outcome.reason, outcome.disarmError],
       };
     case "aborted":
-      if (outcome.wallMayBeArmed === true) {
+      if (outcome.disarmObservedOff === true) {
         return {
-          state: "unknown",
-          basis: "insufficient_evidence",
+          state: "unprotected",
+          basis: "disarm_observed_off",
           reasons: [outcome.reason],
         };
       }
       return {
-        state: "unprotected",
-        basis: "not_enforcing_observed",
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
         reasons: [outcome.reason],
       };
     case "armed-then-rolled-back":
     case "egress-unprovisioned-rolled-back":
+      if (outcome.disarmObservedOff === true) {
+        return {
+          state: "unprotected",
+          basis: "disarm_observed_off",
+          reasons: [outcome.reason],
+        };
+      }
       return {
-        state: "unprotected",
-        basis: "not_enforcing_observed",
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
         reasons: [outcome.reason],
       };
     case "skipped-already-dedicated":
@@ -1231,6 +1228,15 @@ export function protectionClaimFromAutoProvisionSummary(
     : protectionStateClaimFromObservation(observation);
 }
 
+function autoProvisionClaimOverridesProbe(
+  claim: ProtectionStateClaim | undefined,
+): boolean {
+  return (
+    claim?.basis === "disarm_observed_off" ||
+    claim?.basis === "exclusive_egress_live_repark_failed"
+  );
+}
+
 async function resolveWrapProtectionClaim(input: {
   auditLog: AuditLog | undefined;
   autoProvisionSummary: AutoProvisionSummary;
@@ -1239,11 +1245,8 @@ async function resolveWrapProtectionClaim(input: {
   const autoProvisionClaim = protectionClaimFromAutoProvisionSummary(
     input.autoProvisionSummary,
   );
-  if (autoProvisionClaim !== undefined) {
-    return autoProvisionClaim;
-  }
   if (input.auditLog === undefined) {
-    return protectionStateClaimFromObservation({
+    return autoProvisionClaim ?? protectionStateClaimFromObservation({
       state: "unknown",
       basis: "provider_unavailable",
       reasons: ["no audit log was available to observe enforcement"],
@@ -1254,17 +1257,20 @@ async function resolveWrapProtectionClaim(input: {
     input.storagePath,
   );
   if (resolver === undefined) {
-    return protectionStateClaimFromObservation({
+    return autoProvisionClaim ?? protectionStateClaimFromObservation({
       state: "unknown",
       basis: "provider_unavailable",
       reasons: ["exclusive-egress posture provider was not available"],
     });
   }
-  return probeCastleWallProtectionClaim(
+  const probedClaim = await probeCastleWallProtectionClaim(
     input.auditLog,
     input.storagePath,
     resolver,
   );
+  return autoProvisionClaimOverridesProbe(autoProvisionClaim)
+    ? autoProvisionClaim!
+    : probedClaim;
 }
 
 /**

@@ -60,12 +60,12 @@ function claim(state: "exclusive" | "coarse-only" | "unprotected" | "unknown"): 
     case "coarse-only":
       return protectionStateClaimFromObservation({
         state,
-        basis: "coarse_wall_observed",
+        basis: "exclusive_egress_cap_observed",
       });
     case "unprotected":
       return protectionStateClaimFromObservation({
         state,
-        basis: "not_enforcing_observed",
+        basis: "disarm_observed_off",
       });
     case "unknown":
       return protectionStateClaimFromObservation({

@@ -206,7 +206,7 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     );
   });
 
-  it("threads an armed auto-provision outcome into the final no-dashboard Castle Wall banner", async () => {
+  it("does not turn an armed auto-provision outcome into a confirmed Castle Wall banner", async () => {
     await installHermesFixture();
     setTty(true);
     const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({
@@ -218,10 +218,11 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     const stderr = stderrSpy.mock.calls.flat().join("\n");
     expect(stderr).toContain("Dedicated agent account provisioned and Castle Wall armed (uid 503)");
     expect(stderr).not.toContain("Castle Wall NOT ARMED");
-    expect(stderr).toContain("Castle Wall coarse-only");
+    expect(stderr).not.toContain("Castle Wall coarse-only");
     expect(stderr).toContain(
-      "Your agent is wrapped, but only coarse Castle Wall enforcement is confirmed.",
+      "Your agent is wrapped, but enforcement is not confirmed.",
     );
+    expect(stderr).toContain("Castle Wall status unknown");
   });
 
   it("prefers --dev-dist as the auto-provision CLI binary for dogfood installs", async () => {

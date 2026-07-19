@@ -48,12 +48,12 @@ function claim(state: "exclusive" | "coarse-only" | "unprotected" | "unknown"): 
     case "coarse-only":
       return protectionStateClaimFromObservation({
         state,
-        basis: "coarse_wall_observed",
+        basis: "exclusive_egress_cap_observed",
       });
     case "unprotected":
       return protectionStateClaimFromObservation({
         state,
-        basis: "not_enforcing_observed",
+        basis: "disarm_observed_off",
       });
     case "unknown":
       return protectionStateClaimFromObservation({
@@ -292,7 +292,7 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toContain("Your agent is protected");
   });
 
-  it("drill run 1: ensure-policy-daemon abort renders unprotected, not Full", () => {
+  it("drill run 1: ensure-policy-daemon abort renders unknown, not NOT ARMED", () => {
     const protection = protectionClaimFromAutoProvisionSummary({
       ran: true,
       outcome: {
@@ -302,17 +302,40 @@ describe("formatWrapSuccess", () => {
         rolledBack: true,
       },
     });
-    expect(protection?.state).toBe("unprotected");
+    expect(protection?.state).toBe("unknown");
+    expect(protection?.basis).toBe("provision_outcome_not_observation");
     const out = formatWrapSuccess({
       ...baseInfo,
       castleWallProtectionClaim: protection!,
     });
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
-    expect(out).toContain("Castle Wall NOT ARMED");
+    expect(out).not.toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("Castle Wall status unknown");
   });
 
-  it("drill run 2: arm abort renders unprotected", () => {
+  it("drill run 2: arm abort without typed observed-off evidence renders unknown", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "arm",
+        reason: "arm failed",
+        rolledBack: true,
+      },
+    });
+    expect(protection?.state).toBe("unknown");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Your agent is protected");
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).not.toContain("Castle Wall NOT ARMED");
+    expect(out).toContain("Castle Wall status unknown");
+  });
+
+  it("drill run 2: arm abort renders unprotected only with typed observed-off evidence", () => {
     const protection = protectionClaimFromAutoProvisionSummary({
       ran: true,
       outcome: {
@@ -320,9 +343,11 @@ describe("formatWrapSuccess", () => {
         stage: "arm",
         reason: "arm failed and disarm confirmed off",
         rolledBack: true,
+        disarmObservedOff: true,
       },
     });
     expect(protection?.state).toBe("unprotected");
+    expect(protection?.basis).toBe("disarm_observed_off");
     const out = formatWrapSuccess({
       ...baseInfo,
       castleWallProtectionClaim: protection!,
@@ -332,7 +357,15 @@ describe("formatWrapSuccess", () => {
     expect(out).toContain("Castle Wall NOT ARMED");
   });
 
-  it("drill run 3: bring-up abort with coarse wall enforcing renders coarse-only", () => {
+  it("kind armed does not derive coarse-only from the outcome alone", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: { kind: "armed", uid: 503 },
+    });
+    expect(protection).toBeUndefined();
+  });
+
+  it("drill run 3: bring-up abort needs a fresh probe before any coarse-only claim", () => {
     const protection = protectionClaimFromAutoProvisionSummary({
       ran: true,
       outcome: {
@@ -345,7 +378,7 @@ describe("formatWrapSuccess", () => {
         cleanupErrors: [],
       },
     });
-    expect(protection?.state).toBe("coarse-only");
+    expect(protection?.state).toBe("unknown");
     const out = formatWrapSuccess({
       ...baseInfo,
       castleWallProtectionClaim: protection!,
@@ -353,7 +386,7 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toContain("Your agent is protected");
     expect(out).not.toContain("Castle Wall Full");
     expect(out).not.toContain("Castle Wall NOT ARMED");
-    expect(out).toContain("Castle Wall coarse-only");
+    expect(out).toContain("Castle Wall status unknown");
   });
 
   // F7 (v1.6.1 first-run honesty): on Hermes the tool/server counts derive

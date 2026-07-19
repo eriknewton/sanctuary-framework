@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const REPO_ROOT = join(fileURLToPath(import.meta.url), "..", "..", "..", "..");
+import ts from "typescript";
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const SERVER_SRC = join(REPO_ROOT, "server", "src");
 
 const PROTECTION_PROSE = [
@@ -29,80 +31,120 @@ function tsFiles(dir: string): string[] {
   return out;
 }
 
-function stripComments(source: string): string {
-  let out = "";
-  let quote: '"' | "'" | "`" | null = null;
-  let escaped = false;
-  let lineComment = false;
-  let blockComment = false;
-  for (let i = 0; i < source.length; i++) {
-    const ch = source[i]!;
-    const next = source[i + 1];
-    if (lineComment) {
-      if (ch === "\n") {
-        lineComment = false;
-        out += ch;
-      }
-      continue;
-    }
-    if (blockComment) {
-      if (ch === "*" && next === "/") {
-        blockComment = false;
-        i++;
-      } else if (ch === "\n") {
-        out += ch;
-      }
-      continue;
-    }
-    if (quote !== null) {
-      out += ch;
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === "/" && next === "/") {
-      lineComment = true;
-      i++;
-      continue;
-    }
-    if (ch === "/" && next === "*") {
-      blockComment = true;
-      i++;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === "`") {
-      quote = ch;
-    }
-    out += ch;
+function normalizeProtectionProse(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function flattenConcat(node: ts.Node): string | undefined {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
+    return node.text;
   }
-  return out;
+  if (ts.isParenthesizedExpression(node)) {
+    return flattenConcat(node.expression);
+  }
+  if (
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.PlusToken
+  ) {
+    const left = flattenConcat(node.left);
+    const right = flattenConcat(node.right);
+    return left !== undefined && right !== undefined ? left + right : undefined;
+  }
+  return undefined;
+}
+
+function scanProtectionProse(fileName: string, sourceText: string): string[] {
+  const patterns = PROTECTION_PROSE.map((phrase) => ({
+    phrase,
+    needle: normalizeProtectionProse(phrase),
+  }));
+  const source = ts.createSourceFile(
+    fileName,
+    sourceText,
+    ts.ScriptTarget.ESNext,
+    true,
+  );
+  const offenders: string[] = [];
+  const seen = new Set<string>();
+
+  const check = (text: string, node: ts.Node): void => {
+    const normalized = normalizeProtectionProse(text);
+    for (const { phrase, needle } of patterns) {
+      if (!normalized.includes(needle)) continue;
+      const { line } = source.getLineAndCharacterOfPosition(node.getStart(source));
+      const offence = `${fileName}:${line + 1} contains protection prose ${JSON.stringify(phrase)}`;
+      if (!seen.has(offence)) {
+        seen.add(offence);
+        offenders.push(offence);
+      }
+    }
+  };
+
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isStringLiteral(node) ||
+      ts.isNoSubstitutionTemplateLiteral(node) ||
+      ts.isTemplateHead(node) ||
+      ts.isTemplateMiddle(node) ||
+      ts.isTemplateTail(node)
+    ) {
+      check(node.text, node);
+    }
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.PlusToken
+    ) {
+      const flattened = flattenConcat(node);
+      if (flattened !== undefined) check(flattened, node);
+    }
+    ts.forEachChild(node, visit);
+  };
+
+  visit(source);
+  return offenders;
 }
 
 function allowedFilesFor(phrase: string): Set<string> {
   const allowed = new Set([CHOKEPOINT]);
   if (phrase === "Your agent is protected.") {
     // Frozen dashboard token: server/reorg-surface-manifest.md protects this
-    // exact HERO_COPY string and id="hero-copy"; this task must not change it.
+    // exact HERO_COPY string and id="hero-copy". Dashboard HTML tests prove it
+    // renders only when the snapshot is green.
     allowed.add(FROZEN_DASHBOARD_HERO);
   }
   return allowed;
 }
 
 describe("protection-state claim chokepoint", () => {
-  it("keeps exact protection-state prose in the claim chokepoint", () => {
-    // This is deliberately a lexical tripwire, not a proof of totality. It
-    // cannot catch template substitution, split lookup tables, or synonyms.
+  it("keeps protection-state prose in the claim chokepoint", () => {
+    // Parser-based, case-folded, and whitespace-collapsing. It catches string
+    // literals, no-substitution templates, static template spans, and literal
+    // concatenations. It still cannot catch runtime lookup tables, template
+    // substitutions, or synonyms that do not contain one of these phrases.
     const violations: string[] = [];
     for (const file of tsFiles(SERVER_SRC)) {
       const rel = relative(REPO_ROOT, file);
-      const source = stripComments(readFileSync(file, "utf8"));
-      for (const phrase of PROTECTION_PROSE) {
-        if (source.includes(phrase) && !allowedFilesFor(phrase).has(rel)) {
-          violations.push(`${rel}: ${phrase}`);
+      const source = readFileSync(file, "utf8");
+      for (const offence of scanProtectionProse(rel, source)) {
+        const phrase = PROTECTION_PROSE.find((p) =>
+          offence.includes(JSON.stringify(p)),
+        );
+        if (phrase !== undefined && !allowedFilesFor(phrase).has(rel)) {
+          violations.push(offence);
         }
       }
     }
     expect(violations).toEqual([]);
+  });
+
+  it("catches case, wrapped, and split protection prose forms", () => {
+    const samples = [
+      'const s = "your agent is PROTECTED.";',
+      "const s = `Castle Wall\\nFull`;",
+      'const s = "Castle " + "Wall NOT ARMED (traffic not filtered)";',
+    ];
+    for (const source of samples) {
+      expect(scanProtectionProse("synthetic.ts", source)).not.toEqual([]);
+    }
   });
 });
