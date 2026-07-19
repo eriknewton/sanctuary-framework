@@ -43,8 +43,8 @@ import {
   createPublicKey,
   type KeyObject,
 } from "node:crypto";
-import { chmod, chown, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, chown, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import {
   PfAnchorRegistry,
@@ -79,12 +79,15 @@ import {
   agentHarnessDaemonStatus,
   agentHarnessDaemonStableRunning,
   installAgentHarnessDaemon,
+  launchctlBootoutWasNotLoaded,
   planAgentHarnessDaemonInstall,
   setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
   type HarnessDaemonStatus,
 } from "./harness-daemon.js";
 import {
+  AGENT_HARNESS_HOLD_DIR,
+  holdFileNameForUid,
   holdFilePathForUid,
   planParkedHarnessInstall,
   renderHarnessReleaseHoldFile,
@@ -372,19 +375,98 @@ function realHarnessOps(): HarnessDaemonOps {
 /**
  * PRODUCTION hold-directory ensure (drill D1, 2026-07-18). Fed to
  * {@link writeIntoHoldDir}, which is the only route into the root-owned hold
- * dir; never called directly by a writer.
- *
- * `mkdir`'s `mode` argument is umask-masked, so the mode is applied by an
- * EXPLICIT `chmod` afterwards (which also heals a directory an older build,
- * or a hand-repair, left at the wrong mode). Ownership is re-asserted to
- * root:wheel for the same reason. Every failure THROWS -- the previous
- * `mkdir(...).catch(() => undefined)` here would have let a broken layout
- * through to a write that then failed with a less legible error.
+ * dir; never called directly by a writer. The policy (and the reasoning for
+ * each step) lives in {@link applyRootOwnedDirEnsure}; this is the thin
+ * production binding of real filesystem calls to it.
  */
 export async function ensureAgentHarnessHoldDir(path: string, mode: number): Promise<void> {
-  await mkdir(path, { recursive: true });
-  await chown(path, 0, 0);
-  await chmod(path, mode);
+  await applyRootOwnedDirEnsure(path, mode, realRootDirEnsureOps());
+}
+
+/**
+ * The injected surface {@link applyRootOwnedDirEnsure} runs over. Exists so the
+ * ensure POLICY -- including the `chown(0,0)` and the symlink refusal, neither
+ * of which a non-root test process can exercise against the real filesystem --
+ * is asserted directly instead of being trusted. (The pre-fix real-filesystem
+ * test substituted a hand-written ensure that dropped the chown entirely, so
+ * deleting that line from production changed no test.)
+ */
+export interface RootOwnedDirEnsureOps {
+  mkdir(path: string): Promise<void>;
+  /** `lstat`, NOT `stat`: the point is to see a symlink rather than follow it. */
+  lstatKind(path: string): Promise<"dir" | "symlink" | "other">;
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  chmod(path: string, mode: number): Promise<void>;
+}
+
+function realRootDirEnsureOps(): RootOwnedDirEnsureOps {
+  return {
+    async mkdir(path): Promise<void> {
+      await mkdir(path, { recursive: true });
+    },
+    async lstatKind(path): Promise<"dir" | "symlink" | "other"> {
+      const st = await lstat(path);
+      if (st.isSymbolicLink()) return "symlink";
+      return st.isDirectory() ? "dir" : "other";
+    },
+    async chown(path, uid, gid): Promise<void> {
+      await chown(path, uid, gid);
+    },
+    async chmod(path, mode): Promise<void> {
+      await chmod(path, mode);
+    },
+  };
+}
+
+/**
+ * Ensure a root-owned runtime directory AND its immediate parent exist as real
+ * root-owned directories with an explicit mode.
+ *
+ * `mkdir`'s `mode` argument is umask-masked, so the mode is applied by an
+ * EXPLICIT `chmod` afterwards (which also heals a directory an older build, or
+ * a hand-repair, left at the wrong mode). Ownership is re-asserted to
+ * root:wheel for the same reason. Every failure THROWS -- the previous
+ * `mkdir(...).catch(() => undefined)` would have let a broken layout through to
+ * a write that then failed with a less legible error.
+ *
+ * SYMLINK REFUSAL (Codex lens, empirically demonstrated 2026-07-18):
+ * `mkdir(p,{recursive:true})` SUCCEEDS when `p` is a symlink to a directory,
+ * and the subsequent `chmod(p, mode)` then changes the TARGET's mode while
+ * `lstat(p)` still reports a symlink. This code runs as root, so applying
+ * `chown(0,0)`/`chmod` through an attacker-shaped link, or writing release
+ * material into wherever it points, is not something to leave to the
+ * root-ownership of `/var/db`. An `lstat` after the mkdir refuses anything
+ * that is not a real directory, BEFORE any ownership or mode is applied.
+ *
+ * PARENT INCLUDED (Claude lens): on a first-ever install this call is what
+ * creates `/var/db/sanctuary` itself, and only the leaf was chmodded -- so the
+ * parent was left at `0777 & ~umask` and, under a hardened umask, the agent uid
+ * could not traverse to its own hold file. The runtime-FS plan healed it later,
+ * an ordering dependency nothing pinned. The parent is now ensured here, by the
+ * same code, at the same mode.
+ */
+export async function applyRootOwnedDirEnsure(
+  path: string,
+  mode: number,
+  ops: RootOwnedDirEnsureOps,
+): Promise<void> {
+  const parent = dirname(path);
+  // The parent is ensured first (mkdir -p would create it implicitly anyway;
+  // doing it explicitly is what lets us assert its shape and mode too). Guard
+  // against a degenerate path whose parent is itself.
+  const targets = parent === path || parent === "/" ? [path] : [parent, path];
+  for (const target of targets) {
+    await ops.mkdir(target);
+    const kind = await ops.lstatKind(target);
+    if (kind !== "dir") {
+      throw new Error(
+        `refusing to use ${target} as a root-owned runtime directory: it is a ${kind}, not a real directory. ` +
+          "Remove it and re-run (root-owned installer state is never applied through a symlink).",
+      );
+    }
+    await ops.chown(target, 0, 0);
+    await ops.chmod(target, mode);
+  }
 }
 
 /**
@@ -857,11 +939,17 @@ export function createProductionReleaseBarrierOps(input: {
       await rm(holdPath, { force: true });
     },
     async writeHoldFile(record): Promise<void> {
-      // Drill D1: routed through the single hold-dir chokepoint (which derives
-      // the directory from `holdPath` and ensures it root-owned 0755 first),
-      // never a local mkdir. The old local `mkdir(...).catch(() => undefined)`
-      // is exactly the split-responsibility the chokepoint retires.
-      await writeIntoHoldDir(realHoldDirWriteOps(), holdPath, renderHarnessReleaseHoldFile(record), 0o644);
+      // Drill D1: routed through the single hold-dir chokepoint, which ensures
+      // the directory root-owned 0755 and composes the file path itself, never
+      // a local mkdir. The old local `mkdir(...).catch(() => undefined)` is
+      // exactly the split-responsibility the chokepoint retires.
+      await writeIntoHoldDir(
+        realHoldDirWriteOps(),
+        AGENT_HARNESS_HOLD_DIR,
+        holdFileNameForUid(input.agentUid),
+        renderHarnessReleaseHoldFile(record),
+        0o644,
+      );
     },
     async bootSessionUuid(): Promise<string> {
       const { stdout } = await execFileAsync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"]);
@@ -1125,7 +1213,7 @@ export async function restoreCoarseCompositionProduction(
   // would leave a live-but-unaccounted-for daemon, and swallowing that was
   // the exact reviewed defect. The caller keeps the agent parked, loudly.
   const bootout = await launchctl(["bootout", `system/${egressGateDaemonLabel(input.agentUid)}`]);
-  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
     throw new Error(
       `coarse restore: could not stop the egress-gate daemon (launchctl bootout exited ${bootout.code}: ` +
         `${bootout.stderr.trim()}); refusing to tear down the gate surfaces under a possibly-live gate`,
@@ -1332,13 +1420,22 @@ export async function parkHarnessPersistently(
     deps.writeFileFn ?? (async (path: string, content: string, mode: number): Promise<void> => writeFile(path, content, { mode }));
   const removeFileFn = deps.removeFileFn ?? (async (path: string): Promise<void> => rm(path, { force: true }));
   const problems: string[] = [];
-  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
-    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
-  }
+  // ORDER: `disable` FIRST, then `bootout` -- identical to
+  // `executeParkedHarnessInstall`'s stand-down and for the same reason. The
+  // harness plist carries KeepAlive, so booting out an ENABLED job leaves a
+  // window in which launchd can restart it underneath us; disabling first
+  // closes that window. (Fix-round 2026-07-18: this helper and its unprotect
+  // sibling did bootout-then-disable, so the codebase stated two different
+  // orders for the same invariant. Neither gate lens proved the window
+  // observable here -- both helpers re-verify the full parked posture
+  // afterwards -- but one invariant gets one order.)
   const disable = await launchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
   if (disable.code !== 0) {
     problems.push(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
+  }
+  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
+    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
   }
   try {
     await removeFileFn(holdFilePathForUid(ctx.agentUid));
@@ -1498,13 +1595,15 @@ async function parkHarnessForUnprotect(
   const launchctlFn = deps.runLaunchctlFn ?? runLaunchctl;
   const removeFileFn = deps.removeFileFn ?? (async (path: string): Promise<void> => rm(path, { force: true }));
   const problems: string[] = [];
-  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
-    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
-  }
+  // Same disable-then-bootout order as `parkHarnessPersistently` above; see
+  // the ordering note there.
   const disable = await launchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
   if (disable.code !== 0) {
     problems.push(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
+  }
+  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
+    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
   }
   try {
     await removeFileFn(holdFilePathForUid(ctx.agentUid));
@@ -1623,7 +1722,7 @@ export function createUnprotectExclusiveEgressOps(
     async bootoutGateDaemon(): Promise<void> {
       const label = egressGateDaemonLabel(input.agentUid);
       const bootout = await launchctl(["bootout", `system/${label}`]);
-      if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+      if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
         throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
       }
     },
@@ -1795,7 +1894,7 @@ async function reassertParkedWithoutContext(input: {
   const errors: string[] = [];
   if (input.sharedLabelOpsAllowed) {
     const bootout = await input.runLaunchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-    if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+    if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
       errors.push(`bootout failed: launchctl exited ${bootout.code}: ${bootout.stderr.trim()}`);
     }
   }

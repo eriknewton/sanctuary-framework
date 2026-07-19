@@ -180,11 +180,60 @@ describe("egress-gate/harness-daemon", () => {
       expect(ops.writes[0]!.mode).toBe(0o644);
       expect(ops.launchctl).toEqual([
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        // Drill-D2 fix-round (F2): the coarse install CLEARS the persistent
+        // launchd disable before writing. Without it, the recovery command the
+        // abort render prints -- "re-run 'sanctuary protect --hermes'" -- could
+        // not work on any host whose label the park had disabled.
+        ["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
       ]);
+    });
+
+    // F2 (both gate lenses): the printed recovery path could not work. The
+    // park sets a PERSISTENT `launchctl disable`; nothing on the coarse path
+    // ever cleared it, so a recovery re-run bootstrapped a disabled label and
+    // failed its own stable-pid check. Asserted as behaviour -- the enable is
+    // issued, and it is issued BEFORE the plist write so a failed enable
+    // leaves the operator's plist untouched.
+    it("F2: clears a persistent launchd disable BEFORE writing the plist, so a recovery re-run can actually start the job", async () => {
+      const order: string[] = [];
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          order.push(`launchctl:${args[0]}`);
+          if (args[0] === "print") {
+            return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+        writeFile: () => {
+          order.push("write");
+          return Promise.resolve();
+        },
+      });
+      await installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops).catch(() => undefined);
+      expect(order).toContain("launchctl:enable");
+      expect(order.indexOf("launchctl:enable")).toBeLessThan(order.indexOf("write"));
+    });
+
+    it("F2: a failing enable refuses the install outright rather than writing a plist for a job that cannot start", async () => {
+      const ops = mockOps({
+        runLaunchctl: (args) => {
+          if (args[0] === "print") {
+            return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
+          }
+          if (args[0] === "enable") {
+            return Promise.resolve({ code: 9, stdout: "", stderr: "Operation not permitted" });
+          }
+          return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+        },
+      });
+      await expect(
+        installAgentHarnessDaemon(planAgentHarnessDaemonInstall(BASE), ops),
+      ).rejects.toThrow(/enable/);
+      expect(ops.writes).toEqual([]);
     });
 
     it("waits for launchd to report the first pid after accepting bootstrap", async () => {
@@ -234,6 +283,10 @@ describe("egress-gate/harness-daemon", () => {
           if (args[0] === "print") {
             return Promise.resolve({ code: 113, stdout: "", stderr: "Could not find service" });
           }
+          // The disable-clearing enable succeeds; the BOOTSTRAP is what fails.
+          if (args[0] === "enable") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
           return Promise.resolve({ code: 5, stdout: "", stderr: "Bootstrap failed" });
         },
       });
@@ -276,6 +329,9 @@ describe("egress-gate/harness-daemon", () => {
               stderr: "",
             });
           }
+          if (args[0] === "enable") {
+            return Promise.resolve({ code: 0, stdout: "", stderr: "" });
+          }
           return Promise.resolve({
             code: 5,
             stdout: "",
@@ -288,6 +344,7 @@ describe("egress-gate/harness-daemon", () => {
       expect(ops.writes).toHaveLength(1);
       expect(calls).toEqual([
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
+        ["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],
         ["print", `system/${AGENT_HARNESS_DAEMON_LABEL}`],

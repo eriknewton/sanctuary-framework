@@ -29,7 +29,7 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, lstat, readlink, symlink, rm, cp } from "node:fs/promises";
+import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, lstat, readFile, readlink, symlink, rm, cp } from "node:fs/promises";
 import { dirname, relative, resolve as pathResolve, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
@@ -66,15 +66,19 @@ import {
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
+  AGENT_HARNESS_DAEMON_PLIST_PATH,
   planAgentHarnessDaemonInstall,
   installAgentHarnessDaemon,
   uninstallAgentHarnessDaemon,
   agentHarnessDaemonStatus,
+  setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
 } from "../egress-gate/harness-daemon.js";
 import {
   planParkedHarnessInstall,
   executeParkedHarnessInstall,
+  revertParkedHarnessInstall,
+  type HarnessStandDownSnapshot,
 } from "../egress-gate/release-barrier.js";
 import {
   createInstallExclusiveEgressOps,
@@ -996,6 +1000,12 @@ export async function runAutoProvisionForWrap(
   // S5-6: the REAL harness argv captured at parked-install time (the release
   // barrier's argv-digest source). Set exactly once, only in exclusive mode.
   let capturedHarnessArgv: string[] | undefined;
+  // Drill-D2 fix-round (2026-07-18): what the harness looked like BEFORE the
+  // parked install stood it down -- prior plist bytes + prior installed/running
+  // state. The material `restoreStoodDownHarness` needs to put the operator's
+  // agent back on any abort. Set exactly once, only in exclusive mode, only
+  // when a parked install actually ran.
+  let harnessStandDownSnapshot: HarnessStandDownSnapshot | undefined;
 
   // S5-6: the exclusive-egress arming stage's production wiring. Built
   // LAZILY: the agent uid + harness argv are only known after the parked
@@ -1175,12 +1185,23 @@ export async function runAutoProvisionForWrap(
             logDir: harnessLogDir,
             environment: resolved.environment,
           });
-          await executeParkedHarnessInstall(plan, {
+          const snapshot = await executeParkedHarnessInstall(plan, {
             // Drill D1: the wrapper lands in the root-owned hold dir, which
             // nothing else in a first-ever install creates. `ensureHoldDir` is
             // the production ensure the release sequence's hold-file write
             // also uses, so both writers agree on one root-owned 0755 dir.
             ensureHoldDir: ensureAgentHarnessHoldDir,
+            // Drill-D2 fix-round: the SNAPSHOT source. The install is about to
+            // overwrite the singleton harness plist; without capturing the
+            // prior bytes first there is nothing to restore an aborted run to.
+            readFile: async (path) => {
+              try {
+                return await readFile(path, "utf8");
+              } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+                throw err;
+              }
+            },
             writeFile: daemonOps.writeFile,
             removeFile: daemonOps.removeFile,
             runLaunchctl: daemonOps.runLaunchctl,
@@ -1189,7 +1210,18 @@ export async function runAutoProvisionForWrap(
             // harness. Stopping the operator's live agent is never silent.
             notify: (message) => print(message),
           });
-          return { ok: true as const, bootstrappedThisRun: false, parked: true };
+          // Drill-D2 fix-round: hold the snapshot so an abort ANYWHERE
+          // downstream can put the operator's agent back exactly as it was.
+          // Reported to the orchestrator as `harnessStoodDown`, which -- unlike
+          // `bootstrappedThisRun: false` -- does not claim the pre-existing job
+          // was left alone.
+          harnessStandDownSnapshot = snapshot;
+          return {
+            ok: true as const,
+            bootstrappedThisRun: false,
+            parked: true,
+            harnessStoodDown: snapshot.preexistingJobModified,
+          };
         }
         const plan = planAgentHarnessDaemonInstall({
           agentAccount: accountName,
@@ -1216,6 +1248,42 @@ export async function runAutoProvisionForWrap(
     // reporting a clean rollback. Reuses the shipped fail-loud uninstaller.
     uninstallHarnessDaemon: async () => {
       await uninstallAgentHarnessDaemon(realHarnessDaemonOps());
+    },
+    // Drill-D2 fix-round: put a harness THIS run stood down back the way it
+    // was. Distinct from `uninstallHarnessDaemon`, which destroys a daemon
+    // this run CREATED -- here the job pre-existed, so the remedy is restore,
+    // never removal. Called from the orchestrator's single outcome chokepoint.
+    restoreStoodDownHarness: async () => {
+      const snapshot = harnessStandDownSnapshot;
+      if (snapshot === undefined) {
+        return { restored: true, problems: [] };
+      }
+      const daemonOps = realHarnessDaemonOps();
+      const result = await revertParkedHarnessInstall(snapshot, {
+        // The SAME enable + coarse-install pair the S5-6 degrade path
+        // (`startHarnessCoarse`) uses: clear the park's persistent disable,
+        // write the plist the snapshot captured, bootstrap, and verify a
+        // stable pid. Deliberately not a second recovery routine.
+        restoreRunningHarness: async (plistContent) => {
+          await setAgentHarnessJobDisabled(daemonOps, false);
+          await installAgentHarnessDaemon(
+            {
+              plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
+              plistContent,
+              bootstrapArgs: ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
+            },
+            daemonOps,
+          );
+        },
+        clearJobDisable: async () => {
+          await setAgentHarnessJobDisabled(daemonOps, false);
+        },
+        writeFile: daemonOps.writeFile,
+        removeFile: daemonOps.removeFile,
+      });
+      // A restore that put nothing back because there was nothing to put back
+      // is a successful restore, not a silent failure.
+      return { restored: result.errors.length === 0, problems: result.errors };
     },
     // Bug B (the one-flow gap): ensure a reachable Castle Wall POLICY daemon for
     // the target fortress BEFORE arming. Arming with no policy daemon deny-all-

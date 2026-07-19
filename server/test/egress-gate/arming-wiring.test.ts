@@ -13,11 +13,13 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  applyRootOwnedDirEnsure,
   createInstallExclusiveEgressOps,
   createProductionReleaseBarrierOps,
   createRepairExclusiveEgressOps,
   createUnprotectExclusiveEgressOps,
   parkHarnessPersistently,
+  type RootOwnedDirEnsureOps,
   restoreCoarseCompositionProduction,
   verifyHarnessJobDisabled,
   verifyHarnessParkedPersistent,
@@ -288,6 +290,14 @@ describe("parkHarnessPersistently (fix-round-2 HIGH-2: full persistent park)", (
     expect(calls).toContain(`disable system/${AGENT_HARNESS_DAEMON_LABEL}`);
     expect(calls).toContain("print-disabled system");
     expect(calls.some((c) => c.startsWith("print system/"))).toBe(true);
+    // F8 (2026-07-18 fix-round): DISABLE precedes BOOTOUT, the same order
+    // `executeParkedHarnessInstall` asserts and for the same reason -- the
+    // harness plist carries KeepAlive, so booting out an enabled job leaves a
+    // window for launchd to restart it. The codebase previously stated two
+    // different orders for one invariant.
+    expect(calls.indexOf(`disable system/${AGENT_HARNESS_DAEMON_LABEL}`)).toBeLessThan(
+      calls.indexOf(`bootout system/${AGENT_HARNESS_DAEMON_LABEL}`),
+    );
   });
 
   it("the reviewed defect: bootout ok + disable FAILS + probe says stopped must THROW, never a silent park claim", async () => {
@@ -852,5 +862,104 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     expect(fs.files.has(PARKED_PLAN.plistPath)).toBe(false);
     expect(fs.files.has(HOLD_PATH)).toBe(false);
     await expect(ops.verifyParkedPersistent()).resolves.toEqual({ ok: true });
+  });
+});
+
+/**
+ * The root-owned runtime-directory ensure policy (drill D1 + the 2026-07-18
+ * two-family gate's F5/F7 findings).
+ *
+ * Asserted against the POLICY function over injected ops rather than the real
+ * filesystem, because the two steps that matter most -- `chown(0,0)` and the
+ * symlink refusal -- cannot be exercised by a non-root test process against
+ * real `fs`. The previous coverage substituted a hand-written ensure that
+ * DROPPED the chown, so deleting the production chown line changed no test.
+ */
+describe("applyRootOwnedDirEnsure (root-owned runtime directory policy)", () => {
+  interface EnsureLog {
+    sequence: string[];
+  }
+
+  function makeEnsureOps(kinds: Record<string, "dir" | "symlink" | "other"> = {}): {
+    ops: RootOwnedDirEnsureOps;
+    log: EnsureLog;
+  } {
+    const log: EnsureLog = { sequence: [] };
+    return {
+      log,
+      ops: {
+        async mkdir(path) {
+          log.sequence.push(`mkdir:${path}`);
+        },
+        async lstatKind(path) {
+          log.sequence.push(`lstat:${path}`);
+          return kinds[path] ?? "dir";
+        },
+        async chown(path, uid, gid) {
+          log.sequence.push(`chown:${path}:${uid}:${gid}`);
+        },
+        async chmod(path, mode) {
+          log.sequence.push(`chmod:${path}:${mode.toString(8)}`);
+        },
+      },
+    };
+  }
+
+  const HOLD = "/var/db/sanctuary/agent-harness";
+  const PARENT = "/var/db/sanctuary";
+
+  it("chowns the directory to root:wheel -- the step the old non-root test branch silently dropped", async () => {
+    const { ops, log } = makeEnsureOps();
+    await applyRootOwnedDirEnsure(HOLD, 0o755, ops);
+    expect(log.sequence).toContain(`chown:${HOLD}:0:0`);
+    // chown BEFORE chmod: mode on a directory someone else owns is meaningless.
+    expect(log.sequence.indexOf(`chown:${HOLD}:0:0`)).toBeLessThan(
+      log.sequence.indexOf(`chmod:${HOLD}:755`),
+    );
+  });
+
+  it("applies an EXPLICIT chmod, because mkdir's mode argument is umask-masked", async () => {
+    const { ops, log } = makeEnsureOps();
+    await applyRootOwnedDirEnsure(HOLD, 0o755, ops);
+    expect(log.sequence).toContain(`chmod:${HOLD}:755`);
+    expect(log.sequence.indexOf(`mkdir:${HOLD}`)).toBeLessThan(
+      log.sequence.indexOf(`chmod:${HOLD}:755`),
+    );
+  });
+
+  it("F5: ensures the PARENT too, so a first-ever install does not leave /var/db/sanctuary at umask mercy", async () => {
+    // The leaf-only version left the parent at `0777 & ~umask`; under a
+    // hardened umask the agent uid could not traverse to its own hold file,
+    // and the only thing that healed it was a LATER, unpinned step.
+    const { ops, log } = makeEnsureOps();
+    await applyRootOwnedDirEnsure(HOLD, 0o755, ops);
+    expect(log.sequence).toContain(`chmod:${PARENT}:755`);
+    expect(log.sequence).toContain(`chown:${PARENT}:0:0`);
+    // Parent fully established before the leaf is touched at all.
+    expect(log.sequence.indexOf(`chmod:${PARENT}:755`)).toBeLessThan(
+      log.sequence.indexOf(`mkdir:${HOLD}`),
+    );
+  });
+
+  it("F7: REFUSES a symlink-shaped directory before applying any ownership or mode to its target", async () => {
+    // Empirically demonstrated by the Codex lens: mkdir(p,{recursive:true})
+    // succeeds when p is a symlink to a directory, and the following chmod
+    // then changes the TARGET's mode. Root-run installer code must not do
+    // that, whatever /var/db's ownership makes "unlikely".
+    const { ops, log } = makeEnsureOps({ [HOLD]: "symlink" });
+    await expect(applyRootOwnedDirEnsure(HOLD, 0o755, ops)).rejects.toThrow(/symlink/);
+    expect(log.sequence).not.toContain(`chown:${HOLD}:0:0`);
+    expect(log.sequence).not.toContain(`chmod:${HOLD}:755`);
+  });
+
+  it("F7: refuses a symlink at the PARENT as well, before touching the leaf", async () => {
+    const { ops, log } = makeEnsureOps({ [PARENT]: "symlink" });
+    await expect(applyRootOwnedDirEnsure(HOLD, 0o755, ops)).rejects.toThrow(/symlink/);
+    expect(log.sequence).not.toContain(`mkdir:${HOLD}`);
+  });
+
+  it("F7: refuses a plain FILE sitting where the directory should be", async () => {
+    const { ops } = makeEnsureOps({ [HOLD]: "other" });
+    await expect(applyRootOwnedDirEnsure(HOLD, 0o755, ops)).rejects.toThrow(/not a real directory/);
   });
 });

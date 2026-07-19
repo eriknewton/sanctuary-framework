@@ -279,6 +279,19 @@ export async function installAgentHarnessDaemon(
       `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL} did not return a trustworthy status; refusing to install or remove plist`,
     );
   }
+  // DRILL D2 FIX-ROUND (2026-07-18): clear any PERSISTENT launchd disable
+  // before installing. `launchctl disable` survives reboots and plist
+  // rewrites, and the S5-5 parked install (and the persistent-park helpers)
+  // deliberately set it. Without this, the operator-facing recovery
+  // instruction -- "re-run 'sanctuary protect --hermes'" -- could not work:
+  // the coarse install would write the normal plist, bootstrap a still-
+  // disabled label, and fail its own stable-pid check. A coarse install
+  // exists precisely to RUN the harness, so clearing the park's disable is
+  // the correct semantics here, not a relaxation: the fine-grained release
+  // barrier keeps its own park through `executeParkedHarnessInstall` and the
+  // wrapper/hold-file checks, neither of which routes through this function.
+  // Done BEFORE the plist write so a failed enable leaves the plist untouched.
+  await setAgentHarnessJobDisabled(ops, false);
   await ops.writeFile(plan.plistPath, plan.plistContent, 0o644);
   if (existing.installed) {
     if (!(await agentHarnessDaemonStableRunning(ops))) {
@@ -331,14 +344,62 @@ export async function installAgentHarnessDaemon(
 export async function uninstallAgentHarnessDaemon(ops: HarnessDaemonOps): Promise<void> {
   const label = `system/${AGENT_HARNESS_DAEMON_LABEL}`;
   const result = await ops.runLaunchctl(["bootout", label]);
-  const notLoaded =
-    result.code === 3 || /no such (process|service)|service not loaded/i.test(result.stderr);
-  if (result.code !== 0 && !notLoaded) {
+  if (result.code !== 0 && !launchctlBootoutWasNotLoaded(result)) {
     throw new Error(
       `launchctl bootout ${label} exited ${result.code}: ${result.stderr.trim()}`,
     );
   }
   await ops.removeFile(AGENT_HARNESS_DAEMON_PLIST_PATH);
+}
+
+/**
+ * THE ONE not-loaded predicate for `launchctl bootout` (drill D2 fix-round,
+ * 2026-07-18). Three call sites -- this module's teardown, the S5-5 parked
+ * install's stand-down, and the persistent-park helpers -- previously each
+ * carried a hand-maintained phrase list, and they disagreed: the narrowest
+ * dropped a standalone `code === 3` and `"service not loaded"`. On a clean
+ * host NOTHING is loaded, so every first-ever install depends on this
+ * matching; a miss reintroduces a D1-shaped clean-host blocker. One
+ * predicate, no second list to keep in sync.
+ *
+ * WHY A GENEROUS MATCH IS SAFE HERE. Calling a genuinely-failed bootout
+ * "already stopped" would be a fail-open on its own, so no caller may rely on
+ * this alone: every one of them re-reads `launchctl print` afterwards and
+ * refuses if the job is still running (see
+ * `executeParkedHarnessInstall`'s stopped-settle assertion and
+ * `verifyHarnessParkedPersistent`). This predicate decides only whether to
+ * refuse EARLY with a launchctl error or to proceed to that authoritative
+ * check.
+ */
+export function launchctlBootoutWasNotLoaded(result: LaunchctlResult): boolean {
+  if (result.code === 0) return true;
+  const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return (
+    result.code === 3 ||
+    result.code === 113 ||
+    text.includes("no such process") ||
+    text.includes("no such service") ||
+    text.includes("could not find") ||
+    text.includes("not find service") ||
+    text.includes("service not loaded") ||
+    text.includes("not loaded") ||
+    text.includes("does not exist")
+  );
+}
+
+/**
+ * `launchctl bootout` returning EINPROGRESS: the stop was ACCEPTED and is
+ * still running down. Distinct from both success and failure -- the job is
+ * on its way out but is not gone yet, so a caller must SETTLE (re-sample
+ * `launchctl print` until the job is not running) rather than either throw or
+ * assume it stopped. Before this it matched no tolerance and threw, which on
+ * the parked-install path meant refusing AFTER the plist had already been
+ * overwritten.
+ */
+export function launchctlBootoutWasInProgress(result: LaunchctlResult): boolean {
+  if (result.code === 0) return false;
+  const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return result.code === 36 || text.includes("operation now in progress") || text.includes("einprogress");
 }
 
 /**

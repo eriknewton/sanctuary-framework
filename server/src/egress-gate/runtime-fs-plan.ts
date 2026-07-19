@@ -151,15 +151,33 @@ export async function applyGateRuntimeFsPlan(
   }
 }
 
-/** Production ops (root): real mkdir (EEXIST-tolerant), chown, chmod. */
+/**
+ * Production ops (root): real mkdir (EEXIST-tolerant), chown, chmod.
+ *
+ * SYMLINK REFUSAL (Codex lens, 2026-07-18, demonstrated empirically in a temp
+ * dir): when `path` is a symlink to a directory, `mkdir` reports EEXIST and
+ * the following `chown(0,0)`/`chmod` then apply to the LINK TARGET, while
+ * `lstat` still reports a symlink. These ops run as root and this plan is what
+ * establishes the traversal invariant the gate + agent uids depend on, so a
+ * link-shaped runtime directory is refused before any ownership or mode is
+ * applied to whatever it points at, rather than trusting that `/var/db` being
+ * root-owned makes the shape impossible.
+ */
 export function createRealGateRuntimeFsOps(): GateRuntimeFsOps {
   return {
     async mkdir(path: string): Promise<void> {
-      const { mkdir } = await import("node:fs/promises");
+      const { lstat, mkdir } = await import("node:fs/promises");
       try {
         await mkdir(path);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      }
+      const st = await lstat(path);
+      if (!st.isDirectory()) {
+        throw new Error(
+          `${path} is a ${st.isSymbolicLink() ? "symlink" : "non-directory"}, not a real directory; ` +
+            "refusing to apply root ownership or mode through it. Remove it and re-run.",
+        );
       }
     },
     async chown(path: string, uid: number, gid: number): Promise<void> {

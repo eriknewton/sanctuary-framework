@@ -143,9 +143,41 @@ export interface ProvisionFlowOps {
          * release barrier is the exact BLOCKER-2 escape).
          */
         parked?: boolean;
+        /**
+         * S5-6 drill-D2 fix-round (2026-07-18): TRUE when the (parked) install
+         * MODIFIED a pre-existing harness job -- overwrote its plist, set a
+         * persistent launchd disable, and/or booted a loaded job out.
+         *
+         * This exists because `bootstrappedThisRun: false` used to mean "a
+         * genuinely pre-existing daemon was found and LEFT ALONE", which the
+         * parked install made false: it now stands the operator's live agent
+         * down before the flow is committed to anything. Keying an abort's
+         * cleanup on `bootstrappedThisRun` alone therefore left the agent
+         * stopped on every abort path. `uninstallHarnessDaemon` is still the
+         * wrong remedy here (this run did not create the job, so destroying it
+         * would be worse); the remedy is `restoreStoodDownHarness`.
+         */
+        harnessStoodDown?: boolean;
       }
     | { ok: false; error: string; daemonPreexisted: boolean }
   >;
+  /**
+   * Put a harness this run STOOD DOWN back the way it was (drill-D2
+   * fix-round). Called from exactly one place -- the outcome chokepoint at the
+   * bottom of `runProvisionFlow` -- for every outcome that is not one where
+   * the exclusive-egress stage has taken ownership of the harness.
+   *
+   * The single call site is the point. There are seven-plus places this flow
+   * can refuse between the parked install and the exclusive stage, and a
+   * per-site restore call is how the eighth one gets forgotten. Deciding once,
+   * from the OUTCOME, means an abort added later is covered without anyone
+   * remembering to cover it.
+   *
+   * MUST NOT THROW: it runs on a path that is already failing for some other
+   * reason, and that reason is the more important message. It reports what it
+   * could not put back so the caller can surface both.
+   */
+  restoreStoodDownHarness(): Promise<{ restored: boolean; problems: string[] }>;
   /**
    * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
    * bootstraps a LIVE root LaunchDaemon; every post-install abort branch
@@ -463,13 +495,107 @@ export type ProvisionFlowOutcome =
     };
 
 /**
+ * Mutable box threaded into the step sequence so the outcome chokepoint below
+ * knows whether the (destructive) fine-grained harness install stood a
+ * pre-existing agent down.
+ */
+interface HarnessStandDownState {
+  owed: boolean;
+}
+
+/**
+ * Outcomes after which the harness is NOT owed a restore, because the
+ * exclusive-egress stage has taken ownership of it:
+ *   - `armed-exclusive` / `armed-exclusive-repark-failed`: the release barrier
+ *     started the agent under a committed generation. Restoring the PRE-run
+ *     plist here would tear a correctly-confined agent back to coarse.
+ *   - `exclusive-egress-unarmed-coarse-active`: the S5-6 degrade path already
+ *     decided the harness's disposition (`harnessStartedCoarse`) and says so
+ *     loudly in its own outcome. A second restore would fight it.
+ *
+ * Deliberately an ALLOW-LIST of "already handled", not a deny-list of aborts:
+ * a new abort kind added later defaults to restoring, which is the safe
+ * direction. Getting on this list has to be a deliberate act.
+ */
+const OUTCOMES_THAT_OWN_THE_HARNESS: ReadonlySet<string> = new Set([
+  "armed-exclusive",
+  "armed-exclusive-repark-failed",
+  "exclusive-egress-unarmed-coarse-active",
+]);
+
+/**
  * Run the full one-flow orchestration. Every fail-closed branch below is
  * reachable purely through the injected ops, so unit tests can assert each
  * outcome without a real host.
+ *
+ * THE HARNESS-RESTORE CHOKEPOINT (drill-D2 fix-round, 2026-07-18). In
+ * fine-grained mode the harness install is destructive: it stops the
+ * operator's live agent. Everything between that step and the exclusive stage
+ * can still refuse, and both gate lenses found that none of those refusals put
+ * the agent back. Rather than add a restore call to each of them -- the shape
+ * that guarantees the next one added is missed -- the decision is made ONCE,
+ * here, from the outcome. Anything that is not an outcome where the exclusive
+ * stage owns the harness gets the agent restored, including a throw.
  */
 export async function runProvisionFlow(
   ctx: ProvisionFlowContext,
   ops: ProvisionFlowOps,
+): Promise<ProvisionFlowOutcome> {
+  const standDown: HarnessStandDownState = { owed: false };
+  let outcome: ProvisionFlowOutcome;
+  try {
+    outcome = await runProvisionFlowSteps(ctx, ops, standDown);
+  } catch (err) {
+    // A step that THREW rather than returning an outcome is exactly the abort
+    // path nobody enumerates. Restore, then let the original error surface.
+    if (standDown.owed) await restoreStoodDownHarnessQuietly(ops);
+    throw err;
+  }
+  if (!standDown.owed || OUTCOMES_THAT_OWN_THE_HARNESS.has(outcome.kind)) {
+    return outcome;
+  }
+  const restore = await ops.restoreStoodDownHarness().catch((err: unknown) => ({
+    restored: false,
+    problems: [err instanceof Error ? err.message : String(err)],
+  }));
+  return withHarnessRestoreNote(outcome, restore);
+}
+
+/** Best-effort restore on the throw path; the original error must win. */
+async function restoreStoodDownHarnessQuietly(ops: ProvisionFlowOps): Promise<void> {
+  try {
+    await ops.restoreStoodDownHarness();
+  } catch {
+    // The caller is already propagating a more important failure.
+  }
+}
+
+/**
+ * Fold the restore result into the outcome the operator sees. A SUCCESSFUL
+ * restore is stated too, not just failures: the flow printed "unloaded the
+ * existing job" on its way in, so the operator is owed the other half of that
+ * sentence. A FAILED restore is loud and names the agent as still stopped --
+ * never silent, never implied by omission.
+ */
+function withHarnessRestoreNote(
+  outcome: ProvisionFlowOutcome,
+  restore: { restored: boolean; problems: string[] },
+): ProvisionFlowOutcome {
+  if (!("reason" in outcome) || typeof outcome.reason !== "string") {
+    return outcome;
+  }
+  const note = restore.restored
+    ? "The agent harness this run stood down was restarted and restored to its previous state."
+    : `The agent harness this run stood down could NOT be fully restored: ${restore.problems.join("; ")}. ` +
+      "The agent is STOPPED. Re-run 'sudo sanctuary protect --hermes' to bring it back up under the " +
+      "previous (coarse) posture.";
+  return { ...outcome, reason: `${outcome.reason} ${note}` } as ProvisionFlowOutcome;
+}
+
+async function runProvisionFlowSteps(
+  ctx: ProvisionFlowContext,
+  ops: ProvisionFlowOps,
+  standDown: HarnessStandDownState,
 ): Promise<ProvisionFlowOutcome> {
   let uid: number;
   // Re-home results accumulated so far, threaded into every restore call
@@ -640,7 +766,57 @@ export async function runProvisionFlow(
     }
   }
 
-  // Step 6: install the harness daemon. Agent now runs at ruid = uid; wall
+  // Step 6 (Bug B, the one-flow gap): ensure a reachable Castle Wall POLICY
+  // daemon for the target fortress. Arming with no policy daemon deny-all-locks
+  // the box (filter on + daemon down); the arm's own probe refuses in that
+  // state, so on a box with no wall for this fortress the whole flow would
+  // otherwise roll back. Stand the policy daemon up here (install a fresh
+  // singleton boot service on a box with no wall; (re)start a stopped one that
+  // already targets this fortress; REFUSE to swap a wall that belongs to a
+  // DIFFERENT fortress -- one machine runs one wall). This step NEVER arms the
+  // filter and NEVER leaves the box filter-on/daemon-down.
+  //
+  // ORDER (drill-D2 fix-round, 2026-07-18): this used to run AFTER the harness
+  // install, as "step 6.5". It moved ahead of it because the harness install in
+  // fine-grained mode is DESTRUCTIVE -- it stands the operator's live agent
+  // down -- while this step is the flow's most likely refusal, and the one the
+  // 2026-07-18 drill actually hit ("one machine runs one wall"). Refusing here
+  // used to cost the operator a stopped agent that nothing restarted; refusing
+  // BEFORE the destructive step costs them nothing. The general rule the two
+  // gate lenses converged on: a step that cannot be undone runs only after
+  // every step that can still say no has said yes.
+  const ensure = await ops.ensurePolicyDaemon(ctx.fortressPath);
+  if (!ensure.ok) {
+    // Fail-closed: we never proceed to arm without a reachable policy daemon.
+    // Nothing has been installed or stood down yet (that is the whole point of
+    // this step's position), so the only thing to reverse is the re-home. A
+    // FRESH policy daemon this attempt stood up is still torn back down.
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, false, ensure.freshlyInstalled);
+    return {
+      kind: "aborted",
+      stage: "ensure-policy-daemon",
+      reason: withDaemonTeardownNote(ensure.error, td.daemonTeardownError, td.policyDaemonTeardownError),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      accountCreated,
+    };
+  }
+  // Only meaningful on the ok path: whether THIS run stood up the machine's wall
+  // from nothing. Every LATER abort branch below threads this into
+  // `teardownDaemonAndRestore` so a fresh install is torn back down while a
+  // pre-existing (or already-reachable) wall is left untouched.
+  const policyDaemonFreshlyInstalled = ensure.freshlyInstalled;
+  ops.print(
+    policyDaemonFreshlyInstalled
+      ? "Castle Wall policy daemon installed for this fortress; ready to arm."
+      : "Castle Wall policy daemon reachable for this fortress; ready to arm.",
+  );
+
+  // Step 6.5: install the harness daemon. Agent now runs at ruid = uid; wall
   // NOT yet armed. A failure here means we already moved secrets -- restore
   // them before reporting the abort (never leave a half-provisioned agent).
   const install = await ops.installHarnessDaemon(uid);
@@ -651,9 +827,15 @@ export async function runProvisionFlow(
     // signal (never the `!alreadyDedicated` heuristic, which does not track
     // daemon presence): a fresh daemon this attempt left live is removed; a
     // genuinely pre-existing daemon (R6-3) is preserved.
-    // This abort fires BEFORE the ensure-policy-daemon step (step 6.5), so no
-    // policy daemon was touched this run -- never tear one down here.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, !install.daemonPreexisted, false);
+    // ORDER CHANGE (2026-07-18): ensure-policy-daemon now runs BEFORE this
+    // step, so a policy daemon this run freshly installed must be torn back
+    // down here too (a pre-existing wall is still never touched).
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      !install.daemonPreexisted,
+      policyDaemonFreshlyInstalled,
+    );
     return {
       kind: "aborted",
       stage: "install-daemon",
@@ -671,6 +853,13 @@ export async function runProvisionFlow(
   // -- the post-install abort branches key their teardown on it (never on
   // `alreadyDedicated`, which does not track daemon presence).
   const daemonBootstrappedThisRun = install.bootstrappedThisRun;
+  // Drill-D2 fix-round: the SECOND, independent signal -- did this install
+  // stop/overwrite a job that was already there? From here on, ANY outcome
+  // that is not one where the exclusive stage owns the harness owes the
+  // operator a restore, handled once at the outcome chokepoint (see
+  // `runProvisionFlow`). Recorded before the barrier assertion below so even
+  // that abort restores.
+  standDown.owed = install.harnessStoodDown === true;
 
   // S5-6 BARRIER ASSERTION (fail-closed): in fine-grained mode the install
   // MUST have been the S5-5 PARKED form -- a bootstrapped (running) agent
@@ -678,7 +867,12 @@ export async function runProvisionFlow(
   // exists to close. Tear the daemon back down and abort rather than proceed
   // with an agent that is already running unconfined-by-the-gate.
   if (ctx.fineGrainedDeclared === true && install.parked !== true) {
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, daemonBootstrappedThisRun, false);
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      daemonBootstrappedThisRun,
+      policyDaemonFreshlyInstalled,
+    );
     return {
       kind: "aborted",
       stage: "install-daemon",
@@ -704,56 +898,9 @@ export async function runProvisionFlow(
       : "Harness daemon installed; agent now runs under the dedicated account.",
   );
 
-  // Step 6.5 (Bug B, the one-flow gap): ensure a reachable Castle Wall POLICY
-  // daemon for the target fortress BEFORE arming. Arming with no policy daemon
-  // deny-all-locks the box (filter on + daemon down); the arm's own probe
-  // refuses in that state, so on a box with no wall for this fortress the whole
-  // flow would otherwise roll back. Stand the policy daemon up here (install a
-  // fresh singleton boot service on a box with no wall; (re)start a stopped one
-  // that already targets this fortress; REFUSE to swap a wall that belongs to a
-  // DIFFERENT fortress -- one machine runs one wall). This step NEVER arms the
-  // filter and NEVER leaves the box filter-on/daemon-down.
-  const ensure = await ops.ensurePolicyDaemon(ctx.fortressPath);
-  if (!ensure.ok) {
-    // Fail-closed: we never proceed to arm without a reachable policy daemon.
-    // The harness daemon is LIVE by now (step 6 succeeded); tear it down iff
-    // this run stood it up, tear down a FRESH policy daemon iff this attempt
-    // stood one up (a refuse-to-swap abort leaves the machine's existing wall
-    // untouched -- ensure.freshlyInstalled is false there), then restore the
-    // re-home.
-    const td = await teardownDaemonAndRestore(
-      ops,
-      rehomeResults,
-      daemonBootstrappedThisRun,
-      ensure.freshlyInstalled,
-    );
-    return {
-      kind: "aborted",
-      stage: "ensure-policy-daemon",
-      reason: withDaemonTeardownNote(ensure.error, td.daemonTeardownError, td.policyDaemonTeardownError),
-      rolledBack: td.rolledBack,
-      backupPaths: td.backupPaths,
-      conflictPaths: td.conflictPaths,
-      failedPaths: td.failedPaths,
-      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
-      accountCreated,
-    };
-  }
-  // Only meaningful on the ok path: whether THIS run stood up the machine's wall
-  // from nothing. Every LATER abort branch below threads this into
-  // `teardownDaemonAndRestore` so a fresh install is torn back down while a
-  // pre-existing (or already-reachable) wall is left untouched.
-  const policyDaemonFreshlyInstalled = ensure.freshlyInstalled;
-  ops.print(
-    policyDaemonFreshlyInstalled
-      ? "Castle Wall policy daemon installed for this fortress; ready to arm."
-      : "Castle Wall policy daemon reachable for this fortress; ready to arm.",
-  );
-
   // Step 6.7 (confined-agent egress, design section 5 layer 1): provision the
   // harness's signed egress allow rules and statically verify them BEFORE
-  // arming. The policy daemon is reachable by construction (step 6.5 just
+  // arming. The policy daemon is reachable by construction (step 6 just
   // passed), so the publish rides the existing pinned-signer reload path.
   // Failure aborts before arm -- arming a wall the agent cannot function
   // behind is the exact confine-into-silence outcome this step exists to

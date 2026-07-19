@@ -74,11 +74,13 @@
  */
 
 import { createHash } from "node:crypto";
-import { dirname, isAbsolute } from "node:path";
+import { isAbsolute } from "node:path";
 
 import {
   AGENT_HARNESS_DAEMON_LABEL,
   AGENT_HARNESS_DAEMON_PLIST_PATH,
+  launchctlBootoutWasInProgress,
+  launchctlBootoutWasNotLoaded,
   renderAgentHarnessDaemonPlist,
   type AgentHarnessDaemonPlistOptions,
   type HarnessDaemonStatus,
@@ -113,10 +115,19 @@ export const RELEASE_WRAPPER_REFUSAL_EXIT_CODE = 78;
  */
 export const PARKED_EXPECTED_GENERATION = 0;
 
+/**
+ * Hold-file NAME (no directory) for one confined agent uid. Separate from the
+ * full path so {@link writeIntoHoldDir} can be handed a directory plus a bare
+ * file name and compose the two itself.
+ */
+export function holdFileNameForUid(agentUid: number): string {
+  assertAgentUid(agentUid);
+  return `${agentUid}.release`;
+}
+
 /** Hold-file path for one confined agent uid. */
 export function holdFilePathForUid(agentUid: number, dir: string = AGENT_HARNESS_HOLD_DIR): string {
-  assertAgentUid(agentUid);
-  return `${dir}/${agentUid}.release`;
+  return `${dir}/${holdFileNameForUid(agentUid)}`;
 }
 
 /** Canonical wrapper path (root-owned 0755, inside the root-owned hold dir). */
@@ -183,29 +194,41 @@ export interface HoldDirWriteOps {
  *
  * Adding a second `mkdir` next to the wrapper write would have fixed that one
  * call site and left the same latent split for the third writer. Instead, the
- * ensure is not a step a writer may forget: it is fused to the write. The
- * directory is derived from the file being written (`dirname`), so a caller
- * cannot ensure one directory and then write into another, and the ops
- * interface hands out no bare `writeFile` for a hold-dir path. A structural
- * test pins that no module writes a hold-dir path by any other route.
+ * ensure is not a step a writer may forget: it is fused to the write.
+ *
+ * FIX-ROUND (both gate lenses, 2026-07-18): the previous signature took a full
+ * FILE PATH and ensured `dirname(filePath)`, so its real contract was "ensure
+ * the parent of any absolute path, then write there" -- it never asserted the
+ * file was under a hold directory at all, while its doc-comment claimed to
+ * refuse anything that was not. The signature now takes the DIRECTORY and a
+ * bare FILE NAME and composes the path itself, so ensuring one directory and
+ * writing into another is not expressible: the directory ensured and the
+ * directory written to are the same value by construction. `fileName` must be
+ * a plain name (no separators, no `..`), which is what makes that guarantee
+ * hold rather than being a convention.
  */
 export async function writeIntoHoldDir(
   ops: HoldDirWriteOps,
-  filePath: string,
+  holdDir: string,
+  fileName: string,
   content: string,
   mode: number,
 ): Promise<void> {
-  if (!isAbsolute(filePath)) {
-    throw new ReleaseBarrierError(`hold-dir file path must be absolute (got ${JSON.stringify(filePath)})`);
+  if (!isAbsolute(holdDir)) {
+    throw new ReleaseBarrierError(`hold directory must be absolute (got ${JSON.stringify(holdDir)})`);
   }
-  const dir = dirname(filePath);
-  if (dir === "/" || dir === "." || dir.length === 0) {
+  if (holdDir === "/" || holdDir.endsWith("/")) {
     throw new ReleaseBarrierError(
-      `refusing to treat ${JSON.stringify(dir)} as the agent-harness hold directory`,
+      `refusing to treat ${JSON.stringify(holdDir)} as the agent-harness hold directory`,
     );
   }
-  await ops.ensureHoldDir(dir, AGENT_HARNESS_HOLD_DIR_MODE);
-  await ops.writeFile(filePath, content, mode);
+  if (fileName.length === 0 || fileName.includes("/") || fileName.includes("\\") || fileName === "." || fileName === "..") {
+    throw new ReleaseBarrierError(
+      `hold-dir file name must be a plain file name inside the hold directory (got ${JSON.stringify(fileName)})`,
+    );
+  }
+  await ops.ensureHoldDir(holdDir, AGENT_HARNESS_HOLD_DIR_MODE);
+  await ops.writeFile(`${holdDir}/${fileName}`, content, mode);
 }
 
 /**
@@ -483,10 +506,14 @@ export interface ParkedHarnessInstallOptions {
 export interface ParkedHarnessInstallPlan {
   plistPath: string;
   plistContent: string;
+  /** The root-owned directory the wrapper and hold file live in. */
+  holdDir: string;
   wrapperPath: string;
   wrapperContent: string;
   holdFilePath: string;
   harnessLabel: string;
+  /** The service account the parked plist runs the harness as. */
+  agentAccount: string;
 }
 
 /**
@@ -522,29 +549,40 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
   return {
     plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
     plistContent: renderAgentHarnessDaemonPlist(plistOptions),
+    holdDir,
     wrapperPath,
     wrapperContent: renderReleaseExecWrapperScript(),
     holdFilePath,
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
+    agentAccount: options.agentAccount,
   };
 }
 
 /**
- * launchctl `bootout` stderr that means "the job was not running", which is
- * SUCCESS for a stand-down. Kept byte-identical to the tolerance the shipped
- * `arming-wiring.ts` bootout ops already use, so the two never disagree about
- * what counts as "already stopped".
+ * How many times the stand-down re-samples `launchctl print` while waiting for
+ * a booted-out job to actually stop, and how long it waits between samples.
+ * `bootout` can return EINPROGRESS for a job that takes time to die, and even
+ * a zero exit does not guarantee the process is already reaped.
  */
-const BOOTOUT_NOT_RUNNING_RE = /No such process|Could not find|not find service/i;
+const HARNESS_STOP_SETTLE_SAMPLES = 20;
+const HARNESS_STOP_SETTLE_INTERVAL_MS = 250;
 
 /** Injected side effects for the parked install (root in production; mocks in tests). */
 export interface ParkedInstallOps extends HoldDirWriteOps {
+  /**
+   * Read a file's contents, or `undefined` when it does not exist. Used to
+   * SNAPSHOT the pre-existing harness plist before this install overwrites it
+   * -- without the snapshot there is nothing to restore an aborted run to.
+   */
+  readFile(path: string): Promise<string | undefined>;
   /** Remove the file at `path` (ENOENT is not an error). */
   removeFile(path: string): Promise<void>;
   /** Run launchctl with argv (never a shell). */
   runLaunchctl(args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }>;
   /** The harness job's launchd status (the shipped `agentHarnessDaemonStatus`). */
   harnessStatus(): Promise<HarnessDaemonStatus>;
+  /** Sleep (injected so the settle loop is instant under test). */
+  sleepMs?(ms: number): Promise<void>;
   /**
    * Surface one line to the operator running the flow. REQUIRED (not
    * optional): the stand-down below stops a live, privileged agent process,
@@ -553,6 +591,57 @@ export interface ParkedInstallOps extends HoldDirWriteOps {
    * must say so with an explicit no-op.
    */
   notify(message: string): void;
+}
+
+/**
+ * What the parked install found in place BEFORE it mutated anything, and what
+ * it therefore owes an aborting caller (drill D2 fix-round, 2026-07-18).
+ *
+ * The D2 stand-down made the install DESTRUCTIVE: it overwrites the singleton
+ * harness plist and stops a job that may be the operator's live agent. The
+ * flow that calls it can still refuse at any of several later gates, and
+ * before this snapshot existed nothing on any of those paths put the agent
+ * back -- the install reported `bootstrappedThisRun: false`, which used to
+ * mean "pre-existing and untouched" and was now a lie. This record is the
+ * honest signal AND the material needed to undo the act; see
+ * {@link revertParkedHarnessInstall}.
+ */
+export interface HarnessStandDownSnapshot {
+  /** The plist bytes in place before the install, or undefined if there was none. */
+  priorPlistContent?: string;
+  /** launchd knew (had bootstrapped) the job before the stand-down. */
+  wasInstalled: boolean;
+  /** launchd reported a running pid for the job before the stand-down. */
+  wasRunning: boolean;
+  /**
+   * TRUE when this install modified state that existed before this run: a
+   * plist it overwrote, or a loaded job it booted out. This -- not
+   * `bootstrappedThisRun` -- is what an abort path must key its restore on.
+   */
+  preexistingJobModified: boolean;
+  plistPath: string;
+  harnessLabel: string;
+}
+
+/** Pull a top-level `<key>K</key><string>V</string>` value out of a plist. */
+function readPlistStringValue(plistXml: string, key: string): string | undefined {
+  const re = new RegExp(`<key>${key}</key>\\s*<string>([\\s\\S]*?)</string>`);
+  const match = re.exec(plistXml);
+  if (match === null) return undefined;
+  return match[1]!
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+/** The first `ProgramArguments` entry of a rendered harness plist, if any. */
+function readPlistFirstProgramArgument(plistXml: string): string | undefined {
+  const arrayMatch = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plistXml);
+  if (arrayMatch === null) return undefined;
+  const first = /<string>([\s\S]*?)<\/string>/.exec(arrayMatch[1]!);
+  return first === null ? undefined : first[1];
 }
 
 /**
@@ -572,18 +661,102 @@ export interface ParkedInstallOps extends HoldDirWriteOps {
  *
  *   1. `disable` FIRST, so nothing can re-bootstrap the job underneath the
  *      bootout (the reverse order leaves a window where launchd restarts it).
- *   2. `bootout` the running instance. "No such process" / "Could not find"
- *      means it was already stopped and is success; ANY other failure REFUSES
- *      -- a stand-down we could not perform must not be reported as a park.
+ *   2. `bootout` the running instance, tolerating the ONE shared not-loaded
+ *      predicate (`launchctlBootoutWasNotLoaded`) and SETTLING on EINPROGRESS;
+ *      ANY other failure REFUSES -- a stand-down we could not perform must not
+ *      be reported as a park.
  *   3. The pre-existing fail-closed assertion is unchanged and still the last
  *      word: an untrustworthy status, or a job STILL running after all of the
  *      above, refuses exactly as before.
+ *
+ * THE STAND-DOWN IS DESTRUCTIVE, SO IT IS ALSO REVERSIBLE (fix-round after the
+ * two-family gate, 2026-07-18). Both lenses converged on the same blocker: the
+ * act above stops the operator's live agent, and the flow can still refuse at
+ * several gates AFTER it, none of which used to put the agent back. Two things
+ * changed, in this order of preference:
+ *
+ *   a. REFUSE BEFORE MUTATING. Every precondition that can still say no --
+ *      unknown launchd state, a plist belonging to a DIFFERENT service account,
+ *      an agent already running released under a committed generation -- is
+ *      checked in a read-only phase before the first write. A refusal there
+ *      costs nothing. (The caller does the same with the one-wall-per-machine
+ *      check, which now runs before this function is called at all.)
+ *   b. SNAPSHOT WHAT CANNOT BE REORDERED. What survives (a) returns a
+ *      {@link HarnessStandDownSnapshot}: the prior plist bytes plus the prior
+ *      installed/running state. {@link revertParkedHarnessInstall} consumes it
+ *      from ONE chokepoint in the caller, so a NEW abort site added later is
+ *      covered by construction rather than by remembering to add a call.
+ *
+ * The returned snapshot is also the honest replacement for the old
+ * `bootstrappedThisRun: false` signal, which meant "pre-existing and
+ * untouched" and stopped being true the moment this function started
+ * overwriting pre-existing jobs.
  */
 export async function executeParkedHarnessInstall(
   plan: ParkedHarnessInstallPlan,
   ops: ParkedInstallOps,
-): Promise<void> {
-  await writeIntoHoldDir(ops, plan.wrapperPath, plan.wrapperContent, 0o755);
+): Promise<HarnessStandDownSnapshot> {
+  // ---- PHASE 1: look, and refuse, BEFORE touching anything ---------------
+  //
+  // Everything in this phase is READ-ONLY. Both 2026-07-18 gate lenses landed
+  // on the same blocker: the stand-down performed an irreversible act before
+  // the checks that can still refuse the run had run. A refusal that happens
+  // here costs the operator nothing; the same refusal three lines later costs
+  // them a stopped agent.
+  const priorPlistContent = await ops.readFile(plan.plistPath);
+  const before = await ops.harnessStatus();
+  if (!before.known) {
+    throw new ReleaseBarrierError(
+      "launchctl did not return a trustworthy harness status BEFORE the parked install; refusing to " +
+        "overwrite the harness plist or stand a job down against unknown launchd state",
+    );
+  }
+
+  if (priorPlistContent !== undefined) {
+    // IDENTITY GATE. `plan.harnessLabel` is a HOST SINGLETON: one label, one
+    // plist, per machine. Booting it out is only ours to do if the job in
+    // place is the one this run is entitled to stop. A plist that runs a
+    // DIFFERENT service account, or that carries a different fortress, belongs
+    // to another install -- stopping it would be destroying a stranger's agent
+    // on the strength of a shared label.
+    const priorAccount = readPlistStringValue(priorPlistContent, "UserName");
+    if (priorAccount !== undefined && priorAccount !== plan.agentAccount) {
+      throw new ReleaseBarrierError(
+        `the existing ${plan.harnessLabel} job runs as "${priorAccount}", not the account this run is ` +
+          `provisioning ("${plan.agentAccount}"); one machine runs one agent harness under this label. ` +
+          "Refusing to stand down another install's agent. Unprotect the existing agent first " +
+          "('sudo sanctuary unprotect'), then re-run.",
+      );
+    }
+
+    // ALREADY-ARMED GATE (gate finding F3). A plist whose argv already routes
+    // through the release wrapper is a fine-grained install; if its job is
+    // RUNNING, the wrapper let it start, which means a generation is committed
+    // and this is a LIVE CONFINED AGENT. Re-running the installer is normal
+    // operator behaviour after a failure, and it must not boot that agent out
+    // at step 6 of 11 on the way to a run that may abort at any later gate.
+    const priorProgram = readPlistFirstProgramArgument(priorPlistContent);
+    if (priorProgram === plan.wrapperPath && before.running) {
+      throw new ReleaseBarrierError(
+        "the agent harness is ALREADY running under a committed exclusive-egress generation (its plist " +
+          "routes through the release wrapper and launchd reports it running). Refusing to stop a live " +
+          "confined agent to re-run an install it does not need. To re-verify or repair the gate, run " +
+          "'sudo sanctuary protect --repair-egress-gate'; to take it down, run 'sudo sanctuary unprotect'.",
+      );
+    }
+  }
+
+  const snapshot: HarnessStandDownSnapshot = {
+    priorPlistContent,
+    wasInstalled: before.installed,
+    wasRunning: before.running,
+    preexistingJobModified: priorPlistContent !== undefined || before.installed,
+    plistPath: plan.plistPath,
+    harnessLabel: plan.harnessLabel,
+  };
+
+  // ---- PHASE 2: mutate ---------------------------------------------------
+  await writeIntoHoldDir(ops, plan.holdDir, RELEASE_WRAPPER_FILENAME, plan.wrapperContent, 0o755);
   await ops.writeFile(plan.plistPath, plan.plistContent, 0o644);
   const disable = await ops.runLaunchctl(["disable", `system/${plan.harnessLabel}`]);
   if (disable.code !== 0) {
@@ -592,6 +765,7 @@ export async function executeParkedHarnessInstall(
     );
   }
   const bootout = await ops.runLaunchctl(["bootout", `system/${plan.harnessLabel}`]);
+  const bootoutInProgress = launchctlBootoutWasInProgress(bootout);
   if (bootout.code === 0) {
     // A privileged action on a pre-existing job actually happened. Never
     // silent. HONEST WORDING: a zero exit means launchctl unloaded a job that
@@ -600,18 +774,31 @@ export async function executeParkedHarnessInstall(
     // the existing job", which is exactly what was observed, rather than
     // "stopped a running agent", which would claim more than the exit code
     // establishes.
+    //
+    // AND IT PROMISES NOTHING IT CANNOT KEEP (gate finding: the previous
+    // wording told the operator "the release barrier starts it after the gate
+    // generation commits" -- a commitment that never happens on the abort
+    // paths, retracted by nothing). It now names the condition and states the
+    // abort behaviour, which the flow actually implements.
     ops.notify(
-      `Unloaded the existing ${plan.harnessLabel} job (launchctl bootout) so the parked install ` +
-        "can hold; the release barrier starts it after the gate generation commits.",
+      `Unloaded the existing ${plan.harnessLabel} job (launchctl bootout) so the parked install can hold. ` +
+        "It stays stopped unless the exclusive-egress gate commits; if this run does not get that far, " +
+        "it is restored to how it was before this run.",
     );
-  } else if (!BOOTOUT_NOT_RUNNING_RE.test(bootout.stderr)) {
+  } else if (!launchctlBootoutWasNotLoaded(bootout) && !bootoutInProgress) {
     throw new ReleaseBarrierError(
       `could not stand down the running harness job: launchctl bootout system/${plan.harnessLabel} ` +
         `exited ${bootout.code}: ${bootout.stderr.trim()}; refusing to report a park that was not asserted`,
     );
   }
   await ops.removeFile(plan.holdFilePath);
-  const status = await ops.harnessStatus();
+
+  // The pre-existing fail-closed assertion, now given time to be right.
+  // `bootout` can return EINPROGRESS, and even a zero exit does not prove the
+  // process is already reaped -- a single sample turned "stopping" into a
+  // refusal. Sampling until it stops only ever DELAYS a refusal; a job that
+  // never stops still refuses, exactly as before.
+  const status = await awaitHarnessStopped(ops);
   if (!status.known) {
     throw new ReleaseBarrierError(
       "launchctl did not return a trustworthy harness status after the parked install; refusing to report parked",
@@ -622,6 +809,131 @@ export async function executeParkedHarnessInstall(
       "the harness job reports RUNNING after a parked install; the park did not hold (manual intervention required)",
     );
   }
+  return snapshot;
+}
+
+/**
+ * Sample the harness status until launchd stops reporting it running, bounded.
+ * Returns the LAST sample either way, so the caller's fail-closed assertions
+ * (unknown status / still running) are unchanged -- this only decides how long
+ * to wait before making them.
+ */
+async function awaitHarnessStopped(ops: ParkedInstallOps): Promise<HarnessDaemonStatus> {
+  const sleep = ops.sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  let status = await ops.harnessStatus();
+  for (let i = 1; i < HARNESS_STOP_SETTLE_SAMPLES && status.known && status.running; i++) {
+    await sleep(HARNESS_STOP_SETTLE_INTERVAL_MS);
+    status = await ops.harnessStatus();
+  }
+  return status;
+}
+
+/** Injected side effects for {@link revertParkedHarnessInstall}. */
+export interface ParkedInstallRevertOps {
+  /**
+   * Put the harness back to `plistContent` AND back to a stable running state:
+   * clear the persistent launchd disable, write the plist, bootstrap, and
+   * verify a stable pid. Production wires this to the SAME
+   * `setAgentHarnessJobDisabled(false)` + `installAgentHarnessDaemon` pair the
+   * S5-6 degrade path (`startHarnessCoarse`) already uses -- deliberately one
+   * recovery routine, not a second one written for this path.
+   */
+  restoreRunningHarness(plistContent: string): Promise<void>;
+  /** Clear the persistent launchd disable this install set. */
+  clearJobDisable(): Promise<void>;
+  /** Write a file with a mode. */
+  writeFile(path: string, content: string, mode: number): Promise<void>;
+  /** Remove the file at `path` (ENOENT is not an error). */
+  removeFile(path: string): Promise<void>;
+}
+
+/** What {@link revertParkedHarnessInstall} actually managed to put back. */
+export interface ParkedInstallRevertResult {
+  /** Nothing pre-existing was modified, so there was nothing to undo. */
+  nothingToRevert: boolean;
+  /** The prior plist bytes are back in place (or removed, if there were none). */
+  plistRestored: boolean;
+  /** The job was running before and is running again. */
+  harnessRestarted: boolean;
+  /** Whatever could NOT be put back, in operator-facing words. Never thrown. */
+  errors: string[];
+}
+
+/**
+ * Undo {@link executeParkedHarnessInstall} (drill D2 fix-round, 2026-07-18).
+ *
+ * The install is destructive on any host that already had a harness: it
+ * overwrites the singleton plist with the barrier form, sets a PERSISTENT
+ * launchd disable, and boots the job out. Several gates downstream of it can
+ * still refuse the run. Every one of those refusals owes the operator their
+ * agent back, and the only honest way to do that is from the snapshot taken
+ * before the mutation -- re-rendering a plist would restore a plist we
+ * invented, not the one that was there.
+ *
+ * NEVER THROWS. A revert runs on a path that is already aborting for some
+ * other reason; swallowing that reason to report a cleanup failure would lose
+ * the more important message. Failures come back in `errors` for the caller to
+ * surface alongside the original abort.
+ */
+export async function revertParkedHarnessInstall(
+  snapshot: HarnessStandDownSnapshot,
+  ops: ParkedInstallRevertOps,
+): Promise<ParkedInstallRevertResult> {
+  const errors: string[] = [];
+  if (!snapshot.preexistingJobModified) {
+    // Clean host: this run created the parked plist and the disable from
+    // nothing, so "restore" means remove them again rather than leave a
+    // disabled label and a stray barrier plist behind for the next run to
+    // trip over.
+    let plistRestored = true;
+    try {
+      await ops.removeFile(snapshot.plistPath);
+    } catch (err) {
+      plistRestored = false;
+      errors.push(`could not remove the parked harness plist ${snapshot.plistPath}: ${describeError(err)}`);
+    }
+    try {
+      await ops.clearJobDisable();
+    } catch (err) {
+      errors.push(`could not clear the launchd disable on system/${snapshot.harnessLabel}: ${describeError(err)}`);
+    }
+    return { nothingToRevert: true, plistRestored, harnessRestarted: false, errors };
+  }
+
+  if (snapshot.wasRunning && snapshot.priorPlistContent !== undefined) {
+    try {
+      await ops.restoreRunningHarness(snapshot.priorPlistContent);
+      return { nothingToRevert: false, plistRestored: true, harnessRestarted: true, errors };
+    } catch (err) {
+      errors.push(
+        `the agent harness was stopped by this run and could NOT be restarted: ${describeError(err)}`,
+      );
+      // Fall through: even if the restart failed, put the PLIST back so the
+      // operator is not left with a barrier plist they cannot start.
+    }
+  }
+
+  let plistRestored = false;
+  try {
+    if (snapshot.priorPlistContent !== undefined) {
+      await ops.writeFile(snapshot.plistPath, snapshot.priorPlistContent, 0o644);
+    } else {
+      await ops.removeFile(snapshot.plistPath);
+    }
+    plistRestored = true;
+  } catch (err) {
+    errors.push(`could not restore the harness plist ${snapshot.plistPath}: ${describeError(err)}`);
+  }
+  try {
+    await ops.clearJobDisable();
+  } catch (err) {
+    errors.push(`could not clear the launchd disable on system/${snapshot.harnessLabel}: ${describeError(err)}`);
+  }
+  return { nothingToRevert: false, plistRestored, harnessRestarted: false, errors };
+}
+
+function describeError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /** The stages of the release sequence, in order; abort outcomes name one. */

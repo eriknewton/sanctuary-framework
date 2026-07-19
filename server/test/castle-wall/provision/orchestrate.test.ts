@@ -113,6 +113,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     })),
     installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
     uninstallHarnessDaemon: vi.fn(async () => undefined),
+    restoreStoodDownHarness: vi.fn(async () => ({ restored: true, problems: [] as string[] })),
     ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
     teardownPolicyDaemon: vi.fn(async () => undefined),
     preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
@@ -648,17 +649,24 @@ describe("castle-wall/provision/orchestrate", () => {
 
   // ── Bug B (the one-flow gap): ensure a policy daemon before arming ──────────
   describe("Bug B: ensurePolicyDaemon step (single-wall-per-machine, refuse-not-swap)", () => {
-    it("happy path calls ensurePolicyDaemon with ctx.fortressPath (between install-daemon and arm), still arms, tears down nothing", async () => {
+    it("happy path calls ensurePolicyDaemon with ctx.fortressPath BEFORE the harness install and before arm, still arms, tears down nothing", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
       expect(ops.ensurePolicyDaemon).toHaveBeenCalledWith(FORTRESS_PATH);
-      // Ordering: the policy daemon is ensured AFTER the harness daemon and
-      // BEFORE arming (arming with no policy daemon deny-all-locks the box).
+      // ORDER CHANGE (drill-D2 fix-round, 2026-07-18): the policy daemon is
+      // now ensured BEFORE the harness install, not after it. In fine-grained
+      // mode the harness install STOPS the operator's live agent, and this
+      // step -- the one-wall-per-machine refusal -- is the flow's most likely
+      // refusal and the one the 2026-07-18 drill actually hit. Refusing after
+      // the destructive step left the agent dead; refusing before it costs
+      // nothing. Still strictly before arming, which is the constraint this
+      // step originally existed for (arming with no policy daemon deny-all-
+      // locks the box).
       const ensureOrder = (ops.ensurePolicyDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       const installOrder = (ops.installHarnessDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       const armOrder = (ops.arm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-      expect(installOrder).toBeLessThan(ensureOrder);
+      expect(ensureOrder).toBeLessThan(installOrder);
       expect(ensureOrder).toBeLessThan(armOrder);
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
     });
@@ -684,9 +692,14 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon", rolledBack: true });
       expect(ops.arm).not.toHaveBeenCalled();
-      // The harness daemon was installed this run -> tear it down. The existing
-      // (different-fortress) wall is NEVER torn down -- refuse, not swap.
-      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      // ORDER CHANGE: the harness is never installed OR stood down on this
+      // path any more, because this refusal now happens first. That is the
+      // whole point -- the 2026-07-18 drill hit exactly this refusal, and
+      // post-D2-fix it would have left the operator's agent stopped with
+      // nothing to restart it. There is now nothing to tear down or restore.
+      expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+      expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
       expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
       expect((result as { reason: string }).reason).toMatch(/different fortress/);
@@ -727,7 +740,9 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon" });
       expect(ops.arm).not.toHaveBeenCalled();
       expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
-      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      // Reordered: no harness was installed yet, so there is nothing to tear
+      // down -- only the fresh wall this run stood up.
+      expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
     });
 
     it("a FAILED policy-daemon teardown on abort is surfaced LOUDLY (daemonTeardownFailed + a manual uninstall-boot note), never silently swallowed", async () => {
@@ -747,8 +762,13 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
     });
 
-    it("ensurePolicyDaemon is NOT called when an EARLIER step (install-daemon) fails -- it is strictly downstream of the harness daemon install", async () => {
+    it("a fresh policy daemon is torn back down when the LATER harness install fails (it now runs first, so its rollback must reach this branch)", async () => {
+      // The mirror of the old "ensurePolicyDaemon is strictly downstream of
+      // install-daemon" test. Reversing the order moved the rollback
+      // obligation with it: install-daemon aborting must now undo the wall
+      // this run stood up, which it did not have to before.
       const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
         installHarnessDaemon: vi.fn(async () => ({
           ok: false as const,
           error: "launchctl bootstrap exited 5",
@@ -757,7 +777,21 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
-      expect(ops.ensurePolicyDaemon).not.toHaveBeenCalled();
+      expect(ops.ensurePolicyDaemon).toHaveBeenCalledTimes(1);
+      expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    it("a PRE-EXISTING wall is still never torn down when the later harness install fails", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: false as const,
+          error: "launchctl bootstrap exited 5",
+          daemonPreexisted: false,
+        })),
+      });
+      await runProvisionFlow(baseCtx(), ops);
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
     });
 
@@ -1198,6 +1232,196 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
       expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Drill-D2 fix-round (2026-07-18): the harness-restore chokepoint.
+  //
+  // In fine-grained mode the harness install STOPS the operator's live agent.
+  // Both adversarial gate lenses found that every abort between that step and
+  // the exclusive stage left it dead, with an unrecoverable plist and printed
+  // guidance that could not work. These assert the OUTCOME -- the agent is put
+  // back -- rather than that a particular internal was invoked, because the
+  // gates specifically noted the prior tests would pass against subtly wrong
+  // implementations.
+  // ────────────────────────────────────────────────────────────────────────
+  describe("harness-restore chokepoint (the fine-grained install is destructive, so it is reversible)", () => {
+    const COMMITTED = { generation_id: 4, agent_uid: AGENT_UID, gate_port: 40001 };
+
+    function exclusiveOps() {
+      return {
+        bringUpGeneration: vi.fn(async () => COMMITTED),
+        runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
+        restoreCoarseComposition: vi.fn(async () => undefined),
+        startHarnessCoarse: vi.fn(async () => undefined),
+        audit: vi.fn(async () => undefined),
+        print: vi.fn(),
+      };
+    }
+
+    /** A fine-grained run whose parked install STOOD A PRE-EXISTING AGENT DOWN. */
+    function stoodDownOps(overrides: Partial<ProvisionFlowOps> = {}) {
+      return happyPathOps({
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: true as const,
+          bootstrappedThisRun: false,
+          parked: true,
+          harnessStoodDown: true,
+        })),
+        exclusiveEgress: exclusiveOps(),
+        ...overrides,
+      });
+    }
+
+    // The exhaustive form of the gate's "seven abort sites" finding. Each of
+    // these is a real refusal the flow can reach after the agent is stopped;
+    // ALL of them must put it back. Table-driven deliberately: adding a stage
+    // here is cheaper than discovering the eighth one on a drill host.
+    const abortSites: Array<{ stage: string; overrides: Partial<ProvisionFlowOps> }> = [
+      {
+        stage: "provision-egress",
+        overrides: {
+          provisionEgress: vi.fn(async () => ({ ok: false as const, error: "reload refused" })),
+        },
+      },
+      {
+        stage: "verify-before-arm",
+        overrides: { preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]) },
+      },
+      {
+        stage: "uid-existence-gate",
+        overrides: {
+          checkUidExistence: vi.fn(async () => ({ ok: false as const, reason: "uid 503 no longer exists" })),
+        },
+      },
+      {
+        stage: "arm",
+        overrides: { arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })) },
+      },
+    ];
+
+    for (const { stage, overrides } of abortSites) {
+      it(`restores the stood-down agent when the flow aborts at ${stage}`, async () => {
+        const ops = stoodDownOps(overrides);
+        const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+        expect(result).toMatchObject({ kind: "aborted", stage });
+        expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+        // The operator is TOLD, not left to infer it from silence.
+        expect(String((result as { reason: string }).reason)).toMatch(/stood down was restarted/i);
+      });
+    }
+
+    it("restores the agent on the post-arm rollback paths too (the outcomes that never routed through the teardown helper)", async () => {
+      // These two return `armed-then-rolled-back` / `egress-unprovisioned-
+      // rolled-back` instead of `aborted`, so a per-site restore bolted onto
+      // `teardownDaemonAndRestore` would have missed them entirely. Deciding
+      // from the OUTCOME is what covers them.
+      const postArm = stoodDownOps({
+        postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+      });
+      const postArmResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), postArm);
+      expect(postArmResult.kind).toBe("armed-then-rolled-back");
+      expect(postArm.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+
+      const asUid = stoodDownOps({
+        verifyAgentEgressAfterArm: vi.fn(async () => ({
+          ok: false as const,
+          rows: [{ name: "LLM", kind: "allow" as const, pass: false, detail: "blocked" }],
+        })),
+      });
+      const asUidResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), asUid);
+      expect(asUidResult.kind).toBe("egress-unprovisioned-rolled-back");
+      expect(asUid.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+    });
+
+    it("restores the agent when the barrier assertion rejects a non-parked install", async () => {
+      const ops = happyPathOps({
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: true as const,
+          bootstrappedThisRun: false,
+          harnessStoodDown: true,
+        })),
+        exclusiveEgress: exclusiveOps(),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+      expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+    });
+
+    it("restores the agent when a step THROWS rather than returning an outcome, and still surfaces the original error", async () => {
+      // The abort path nobody enumerates. A restore driven off the outcome
+      // would miss it, so the chokepoint covers the throw explicitly.
+      const ops = stoodDownOps({
+        checkUidExistence: vi.fn(async () => {
+          throw new Error("dscl blew up");
+        }),
+      });
+      await expect(runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops)).rejects.toThrow(/dscl blew up/);
+      expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT restore when the exclusive stage succeeded -- that would tear a correctly-confined agent back to coarse", async () => {
+      const ops = stoodDownOps();
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result.kind).toBe("armed-exclusive");
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
+    });
+
+    it("does NOT restore on the degrade-loud path -- that stage already decided the harness's disposition", async () => {
+      const exclusive = exclusiveOps();
+      exclusive.bringUpGeneration = vi.fn(async () => {
+        throw new Error("pf anchor liveness probe reported NOT live");
+      });
+      const ops = stoodDownOps({ exclusiveEgress: exclusive });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result.kind).toBe("exclusive-egress-unarmed-coarse-active");
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
+    });
+
+    it("does NOT restore when the install never stood anything down (a clean host has nothing to put back)", async () => {
+      const ops = happyPathOps({
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: true as const,
+          bootstrappedThisRun: false,
+          parked: true,
+          harnessStoodDown: false,
+        })),
+        exclusiveEgress: exclusiveOps(),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+      });
+      await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
+    });
+
+    it("a FAILED restore is LOUD: names the agent as stopped and gives a command, never a silent omission", async () => {
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          problems: ["launchctl bootstrap exited 5"],
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/could NOT be fully restored/);
+      expect(reason).toMatch(/launchctl bootstrap exited 5/);
+      expect(reason).toMatch(/The agent is STOPPED/);
+      expect(reason).toMatch(/sanctuary protect --hermes/);
+      // The ORIGINAL abort reason is never displaced by the cleanup note.
+      expect(reason).toMatch(/castle-wall enable exited 1/);
+    });
+
+    it("a THROWING restore op cannot take the flow down with it", async () => {
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => {
+          throw new Error("EROFS");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
+      expect(String((result as { reason: string }).reason)).toMatch(/EROFS/);
     });
   });
 });
