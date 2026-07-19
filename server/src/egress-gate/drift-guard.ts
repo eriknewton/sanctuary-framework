@@ -61,6 +61,8 @@ export interface DiffTransientPfRulesOptions {
 
 const PF_ANCHOR_DIRECTIVE_RE = /^(scrub-anchor|nat-anchor|rdr-anchor|dummynet-anchor|anchor)\s+"([^"]+)"(?:\s|$)/;
 const PF_STRIPPED_ANCHOR_DIRECTIVE_RE = /^(scrub-anchor|nat-anchor|rdr-anchor|dummynet-anchor|anchor)\s+"\/\*"(.*)$/;
+const PF_RULE_LINE_RE =
+  /^(set|table|scrub|scrub-anchor|nat|nat-anchor|rdr|rdr-anchor|dummynet|dummynet-anchor|anchor|load anchor|block|pass|match|antispoof|altq|queue)(?:\s|$)/;
 
 /** Normalize one printed pf rule line for set comparison. */
 function normalizeRuleLine(line: string): string {
@@ -101,6 +103,10 @@ function normalizeExpectedRuleLine(
   return `${directive} "${name}"${suffix}`;
 }
 
+function isPfRuleLine(line: string): boolean {
+  return PF_RULE_LINE_RE.test(line);
+}
+
 /**
  * Extract the RULE lines from pfctl output: `pfctl -sr` prints one rule per
  * line; `pfctl -n -v -f` echoes rules plus blank lines and `@n` prefixes in
@@ -110,7 +116,9 @@ function expectedRuleLines(output: string, baseAnchorNames: ReadonlyMap<string, 
   const positions = new Map<string, number>();
   return output
     .split("\n")
-    .map((line) => normalizeExpectedRuleLine(line.replace(/^@\d+\s+/, ""), baseAnchorNames, positions))
+    .map((line) => normalizeRuleLine(line.replace(/^@\d+\s+/, "")))
+    .filter((line) => line.length > 0 && isPfRuleLine(line))
+    .map((line) => normalizeExpectedRuleLine(line, baseAnchorNames, positions))
     .filter((line): line is string => line !== undefined && line.length > 0);
 }
 

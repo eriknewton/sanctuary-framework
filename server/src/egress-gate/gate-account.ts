@@ -39,9 +39,11 @@
 
 import {
   describeServiceAccountRecord,
+  lookupAccountRecordAfterCreate,
   planAccountCreate,
   rollbackCreatedServiceAccount,
   SAFE_SERVICE_ACCOUNT_RE,
+  serviceAccountConflictGuidance,
   serviceAccountRepairGuidance,
   serviceAccountRecordProblems,
   type AccountProvisionOptions,
@@ -108,16 +110,8 @@ export interface GateAccountProvisionOptions {
 /** The directory-service fields that settle whether a gate account is complete. */
 export type GateAccountRecord = ServiceAccountRecord;
 
-/** Gate-account ops must be able to observe and roll back a just-created record. */
-export interface GateAccountProvisionOps extends AccountProvisionOps {
-  /**
-   * Delete a Sanctuary gate account that this provisioning path may have just
-   * created. This is NOT the routine unprovision account-removal flow; it is
-   * bounded rollback of a fresh failed create. Pre-existing records are never
-   * deleted here.
-   */
-  deleteCreatedUser(accountName: string): Promise<void>;
-}
+/** Gate-account ops are the shared service-account observation/create surface. */
+export type GateAccountProvisionOps = AccountProvisionOps;
 
 /**
  * Build the shared {@link AccountProvisionOptions} for the gate account from the
@@ -137,11 +131,11 @@ export function gateAccountProvisionOptions(
 
 /** Thrown when a planned gate uid collides with an excluded (agent/operator) uid. */
 export class GateUidCollisionError extends Error {
-  constructor(uid: number, kind: "agent-or-operator") {
+  constructor(uid: number, kind: "agent-or-operator", recovery: string) {
     super(
       `Refusing to provision the gate service account at uid ${uid}: it collides with an excluded ` +
         `${kind} uid. The gate must run as neither the confined agent (kernel-denied) nor an operator ` +
-        `(allow-all open relay); choose a ceiling/name that yields a distinct dedicated uid.`,
+        `(allow-all open relay). ${recovery}`,
     );
     this.name = "GateUidCollisionError";
   }
@@ -170,9 +164,10 @@ async function rollbackIncompleteGateAccount(
  * Plan gate-account provisioning: pure decision over the two probe results,
  * delegating to the shipped {@link planAccountCreate} for the `skip`/`conflict`/
  * `create` semantics, THEN applying the fail-closed uid exclusion (Codex F2):
- * a `skip` or `create` whose uid lands on the agent uid or an operator uid is
- * refused ({@link GateUidCollisionError}) rather than silently accepted. A
- * `conflict` already refuses, so it passes through unchanged.
+ * a `create` whose computed uid lands on the agent uid or an operator uid is
+ * moved to the next non-excluded uid before any side effect, while a `skip`
+ * whose existing uid collides is refused ({@link GateUidCollisionError}).
+ * A `conflict` already refuses, so it passes through unchanged.
  */
 export function planGateAccountProvision(
   options: GateAccountProvisionOptions,
@@ -184,11 +179,25 @@ export function planGateAccountProvision(
         "the confined agent uid is required so the gate uid can be structurally excluded from it.",
     );
   }
-  const plan = planAccountCreate(gateAccountProvisionOptions(options), probe);
+  const provisionOptions = gateAccountProvisionOptions(options);
+  const plan = planAccountCreate(provisionOptions, probe);
   // The agent uid is ALWAYS excluded; excludeUids adds operator/console uids.
   const excluded = new Set<number>([options.agentUid, ...(options.excludeUids ?? [])]);
-  if ((plan.action === "skip" || plan.action === "create") && excluded.has(plan.uid)) {
-    throw new GateUidCollisionError(plan.uid, "agent-or-operator");
+  if (plan.action === "create" && excluded.has(plan.uid)) {
+    let uid = plan.uid;
+    while (excluded.has(uid)) uid += 1;
+    return { ...plan, uid };
+  }
+  if (plan.action === "skip" && excluded.has(plan.uid)) {
+    throw new GateUidCollisionError(
+      plan.uid,
+      "agent-or-operator",
+      serviceAccountConflictGuidance(plan.accountName, {
+        homeDirectory: provisionOptions.homeDirectory,
+        ceiling: provisionOptions.ceiling,
+        excludedUids: [...excluded],
+      }),
+    );
   }
   return plan;
 }
@@ -198,22 +207,43 @@ export function planGateAccountProvision(
  * ops (the real `sysadminctl`/`dscl` side effects are drill-only). Returns the
  * gate account's uid and the plan that produced it. The gate uid MUST differ
  * from both the operator and the agent uid; that separation is enforced by the
- * ceiling (the gate uid lands strictly above every assigned uid) and re-checked
- * by the arming slice before the gate is registered as a confined principal.
+ * ceiling plus the excluded-uid skip above, and re-checked by the arming slice
+ * before the gate is registered as a confined principal.
  */
 export async function planAndCreateGateAccount(
   options: GateAccountProvisionOptions,
   ops: GateAccountProvisionOps,
 ): Promise<{ plan: AccountProvisionPlan; uid: number; accountName: string; observed: string }> {
   const provisionOptions = gateAccountProvisionOptions(options);
-  const existingRecord = await ops.lookupAccountRecord(provisionOptions.accountName);
+  let existingRecord: GateAccountRecord | undefined;
+  try {
+    existingRecord = await ops.lookupAccountRecord(provisionOptions.accountName);
+  } catch (err) {
+    throw new GateAccountVerificationError(
+      `Existing gate account "${provisionOptions.accountName}" could not be read well enough to plan ` +
+        `(${err instanceof Error ? err.message : String(err)}). Refusing to create over an unknown or malformed ` +
+        `directory-service record. ` +
+        serviceAccountRepairGuidance(provisionOptions.accountName, {
+          homeDirectory: provisionOptions.homeDirectory,
+          uidFloor: provisionOptions.ceiling,
+          excludedUids: [options.agentUid, ...(options.excludeUids ?? [])],
+        }),
+      { cause: err },
+    );
+  }
   const existingUid = existingRecord?.uid;
   const highestAssignedUid = await ops.highestAssignedUid();
   // planGateAccountProvision applies the fail-closed agent/operator uid exclusion
   // (Codex F2) BEFORE any create side effect runs.
   const plan = planGateAccountProvision(options, { existingUid, highestAssignedUid });
   if (plan.action === "conflict") {
-    throw new Error(plan.reason);
+    throw new Error(
+      `${plan.reason} ${serviceAccountConflictGuidance(provisionOptions.accountName, {
+        homeDirectory: provisionOptions.homeDirectory,
+        ceiling: provisionOptions.ceiling,
+        excludedUids: [options.agentUid, ...(options.excludeUids ?? [])],
+      })}`,
+    );
   }
 
   const expected = { uid: plan.uid, homeDirectory: provisionOptions.homeDirectory };
@@ -259,7 +289,7 @@ export async function planAndCreateGateAccount(
 
   let observed: GateAccountRecord | undefined;
   try {
-    observed = await ops.lookupAccountRecord(provisionOptions.accountName);
+    observed = await lookupAccountRecordAfterCreate(ops, provisionOptions.accountName);
   } catch (err) {
     const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
       plannedUid: plan.uid,

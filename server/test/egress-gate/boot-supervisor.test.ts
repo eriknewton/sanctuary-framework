@@ -223,40 +223,74 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
 
   it("a boot gate-home layout failure logs LOUDLY and still lets the barrier park fail-closed", async () => {
     const printed: string[] = [];
-    let barrierRan = false;
+    const audits: Array<{ operation: string; details: Record<string, unknown> }> = [];
+    const barrierEvents: string[] = [];
+    const barrierOps: ReleaseBarrierOps = {
+      bootoutJob: async () => void barrierEvents.push("bootout"),
+      removeHoldFile: async () => void barrierEvents.push("removeHold"),
+      disableJob: async () => void barrierEvents.push("disable"),
+      restoreParkedPlist: async () => void barrierEvents.push("restoreParkedPlist"),
+      rearmAnchor: async () => {
+        barrierEvents.push("rearm");
+        return { ok: true };
+      },
+      verifyGate: async () => {
+        barrierEvents.push("verifyGate");
+        return { ok: false, reasons: ["gate daemon log layout did not verify"] };
+      },
+      commitGeneration: async () => {
+        throw new Error("commit must not run after gate verification fails");
+      },
+      bootSessionUuid: async () => "boot-session",
+      writeHoldFile: async () => {
+        throw new Error("hold file must not be written after gate verification fails");
+      },
+      writeReleasedPlist: async () => {
+        throw new Error("released plist must not be written after gate verification fails");
+      },
+      enableJob: async () => {
+        throw new Error("job must not be enabled after gate verification fails");
+      },
+      bootstrapJob: async () => {
+        throw new Error("harness must not bootstrap after gate verification fails");
+      },
+      harnessStatus: async () => ({ known: true, installed: true, running: false }),
+      sleepMs: async () => undefined,
+    };
     const handle = await startExclusiveEgressBootSupervisor({
       resolveAgent: async () => OK_CTX,
-      audit: async () => undefined,
+      audit: async (operation, details) => void audits.push({ operation, details }),
       print: (line) => printed.push(line),
       refreshIntervalMs: 60_000,
       internals: baseInternals({
         ensureGateHomeLayout: async () => {
           throw new Error("stale log owner uid=505 expected uid=511");
         },
-        runBarrier: async () => {
-          barrierRan = true;
-          return {
-            kind: "parked",
-            stage: "gate-verify",
-            reason: "gate daemon log layout did not verify",
-            holdFileRemoved: true,
-            jobDisabled: true,
-            cleanupErrors: [],
-            parkedClaim: await assessHarnessParked({
-              probe: {
-                harnessStatus: async () => ({ known: true, installed: true, running: false }),
-                sleepMs: async () => undefined,
-              },
-            }),
-          };
-        },
+        runBarrier: runReleaseBarrierSequence,
+        createBarrierOps: (() => barrierOps) as never,
       }),
     });
     handle.stopOracleLoop();
     expect(printed.join("\n")).toContain("gate account home layout assert failed");
     expect(printed.join("\n")).toContain("stale log owner");
-    expect(barrierRan).toBe(true);
-    expect(handle.results[0]!.outcome.kind).toBe("parked");
+    expect(printed.join("\n")).toContain("repair-egress-gate");
+    expect(barrierEvents).toEqual(["bootout", "removeHold", "disable", "restoreParkedPlist", "rearm", "verifyGate"]);
+    const layoutAudit = audits.find((entry) => entry.operation === "exclusive_egress_gate_home_layout_failed");
+    expect(layoutAudit?.details).toMatchObject({
+      agent_uid: 502,
+      gate_account: "sanctuary-gate-hermes",
+      gate_uid: 511,
+      gate_home_directory: "/var/sanctuary-agents/sanctuary-gate-hermes",
+      reason: "stale log owner uid=505 expected uid=511",
+      barrier_continues_fail_closed: true,
+    });
+    const outcome = handle.results[0]!.outcome;
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind === "parked") {
+      expect(outcome.reason).toContain("release barrier parked at stage gate-verify");
+      expect(outcome.reason).toContain("gate daemon log layout did not verify");
+      expect(outcome.parkedClaim.state).toBe("parked");
+    }
   });
 
   it("a gate bootstrap failure logs LOUDLY and still runs the barrier (which parks fail-closed)", async () => {

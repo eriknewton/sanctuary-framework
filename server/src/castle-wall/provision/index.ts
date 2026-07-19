@@ -23,8 +23,10 @@ export {
   parseServiceAccountIsHidden,
   planAccountCreate,
   executeAccountProvisionPlan,
+  lookupAccountRecordAfterCreate,
   planAndCreateAccount,
   rollbackCreatedServiceAccount,
+  serviceAccountConflictGuidance,
   serviceAccountRepairGuidance,
   serviceAccountRecordProblems,
 } from "./account.js";

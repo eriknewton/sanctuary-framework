@@ -1,4 +1,5 @@
 import { isAbsolute, normalize as normalizePath } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 /**
  * Auto-provision Step 2 (Build 1): dedicated agent service-account plumbing.
@@ -107,15 +108,9 @@ export interface AccountProvisionOps {
    * Apply post-create service-account hardening that `sysadminctl` cannot
    * express directly, currently `IsHidden=1`. This is separate from
    * {@link createUser} so a failed post-create `dscl` write is inside the
-   * observed rollback envelope, not an untracked partial mutation.
+   * observed recovery envelope, not an untracked partial mutation.
    */
   hardenCreatedUser(accountName: string): Promise<void>;
-  /**
-   * Bounded rollback of a service account this create path has just observed
-   * at the planned uid. Production must keep the home (`-keepHome`) so rollback
-   * never destroys operator-inspectable material.
-   */
-  deleteCreatedUser(accountName: string): Promise<void>;
 }
 
 /** A planned account-provision step. Pure. */
@@ -152,9 +147,6 @@ export const EXPECTED_SERVICE_ACCOUNT_SHELL = "/usr/bin/false";
 
 export interface AccountProvisionRollbackResult {
   readonly message: string;
-  readonly accountRecordObservedBeforeRollback: boolean;
-  readonly accountAbsenceObserved: boolean;
-  readonly accountMayRemain: boolean;
 }
 
 export function parseServiceAccountIsHidden(value: string | undefined): boolean | undefined {
@@ -190,12 +182,41 @@ async function canonicalizeComparableHome(
 
 export function serviceAccountRepairGuidance(
   accountName: string,
-  expected: { readonly homeDirectory: string },
+  expected: {
+    readonly homeDirectory: string;
+    readonly uid?: number;
+    readonly uidFloor?: number;
+    readonly excludedUids?: readonly number[];
+  },
 ): string {
+  const uidInstruction =
+    expected.uid !== undefined
+      ? String(expected.uid)
+      : `an unused integer >= ${expected.uidFloor ?? 1}` +
+        (expected.excludedUids !== undefined && expected.excludedUids.length > 0
+          ? ` and not one of ${[...new Set(expected.excludedUids)].sort((a, b) => a - b).join(", ")}`
+          : "");
   return (
     `Safe repair: preserve ${expected.homeDirectory}, repair "${accountName}" in place, then re-run. ` +
-    `Set NFSHomeDirectory=${expected.homeDirectory}, IsHidden=1 (or YES), and ` +
+    `Set UniqueID=${uidInstruction}, NFSHomeDirectory=${expected.homeDirectory}, IsHidden=1 (or YES), and ` +
     `UserShell=${EXPECTED_SERVICE_ACCOUNT_SHELL}; do not delete the account home to recover this state.`
+  );
+}
+
+export function serviceAccountConflictGuidance(
+  accountName: string,
+  expected: { readonly homeDirectory: string; readonly ceiling: number; readonly excludedUids?: readonly number[] },
+): string {
+  return (
+    `Recovery: if "${accountName}" is the intended Sanctuary service account, repair it in place with a valid ` +
+    `service uid and required attributes. ` +
+    serviceAccountRepairGuidance(accountName, {
+      homeDirectory: expected.homeDirectory,
+      uidFloor: expected.ceiling,
+      excludedUids: expected.excludedUids,
+    }) +
+    ` If it is unrelated, rename that account or choose a different agent id before rerunning; do not delete ` +
+    `the account home as part of recovery.`
   );
 }
 
@@ -267,7 +288,7 @@ export async function serviceAccountRecordProblems(
  *   Refuse rather than silently reassigning -- an account rename/uid change
  *   is out of scope and could strand file ownership.
  * - `create`: no account with this name exists. uid = lowest free integer
- *   strictly greater than both the ceiling and every currently-assigned uid,
+ *   at or above the ceiling and greater than every currently-assigned uid,
  *   so the new account can never collide with an existing one and is always
  *   >= ceiling (satisfying `validateAgentOrigin`'s floor).
  */
@@ -318,7 +339,7 @@ export function planAccountCreate(
 }
 
 export async function rollbackCreatedServiceAccount(
-  ops: Pick<AccountProvisionOps, "lookupAccountRecord" | "deleteCreatedUser">,
+  ops: Pick<AccountProvisionOps, "lookupAccountRecord">,
   accountName: string,
   plannedUid: number,
 ): Promise<AccountProvisionRollbackResult> {
@@ -329,78 +350,41 @@ export async function rollbackCreatedServiceAccount(
     return {
       message:
         `rollback NOT attempted: pre-delete read failed ` +
-        `(${err instanceof Error ? err.message : String(err)}); account state is unknown`,
-      accountRecordObservedBeforeRollback: false,
-      accountAbsenceObserved: false,
-      accountMayRemain: true,
+        `(${err instanceof Error ? err.message : String(err)}); account state is unknown and no account deletion was attempted`,
     };
   }
   if (before === undefined) {
     return {
-      message: "rollback not needed: account record was already absent",
-      accountRecordObservedBeforeRollback: false,
-      accountAbsenceObserved: true,
-      accountMayRemain: false,
-    };
-  }
-  if (before.uid !== plannedUid) {
-    return {
-      message:
-        `rollback NOT attempted: observed ${describeServiceAccountRecord(before)}; ` +
-        `uid ${before.uid} does not match this run's planned uid ${plannedUid}`,
-      accountRecordObservedBeforeRollback: true,
-      accountAbsenceObserved: false,
-      accountMayRemain: true,
-    };
-  }
-  try {
-    await ops.deleteCreatedUser(accountName);
-  } catch (err) {
-    let afterText: string;
-    let accountMayRemain = true;
-    try {
-      const after = await ops.lookupAccountRecord(accountName);
-      afterText = describeServiceAccountRecord(after);
-      accountMayRemain = after !== undefined;
-    } catch (readErr) {
-      afterText = `post-delete read failed (${readErr instanceof Error ? readErr.message : String(readErr)})`;
-    }
-    return {
-      message:
-        `rollback deletion failed after observing ${describeServiceAccountRecord(before)} ` +
-        `(${err instanceof Error ? err.message : String(err)}); ${afterText}`,
-      accountRecordObservedBeforeRollback: true,
-      accountAbsenceObserved: !accountMayRemain,
-      accountMayRemain,
-    };
-  }
-  let after: ServiceAccountRecord | undefined;
-  try {
-    after = await ops.lookupAccountRecord(accountName);
-  } catch (err) {
-    return {
-      message:
-        `rollback deletion command returned, but absence was NOT observed: ` +
-        `post-delete read failed (${err instanceof Error ? err.message : String(err)})`,
-      accountRecordObservedBeforeRollback: true,
-      accountAbsenceObserved: false,
-      accountMayRemain: true,
-    };
-  }
-  if (after === undefined) {
-    return {
-      message: `rollback observed: ${accountName} account record is absent`,
-      accountRecordObservedBeforeRollback: true,
-      accountAbsenceObserved: true,
-      accountMayRemain: false,
+      message: "rollback not needed: account record absence was observed before any account deletion was attempted",
     };
   }
   return {
-    message: `rollback NOT observed: ${describeServiceAccountRecord(after)} still exists`,
-    accountRecordObservedBeforeRollback: true,
-    accountAbsenceObserved: false,
-    accountMayRemain: true,
+    message:
+      `rollback deletion NOT attempted: observed ${describeServiceAccountRecord(before)} after a failed create ` +
+      `for planned uid ${plannedUid}; a name-based account delete is not atomic with that observation, so the ` +
+      `record is left in place for in-place repair`,
   };
+}
+
+const POST_CREATE_RECORD_READ_ATTEMPTS = 3;
+const POST_CREATE_RECORD_READ_RETRY_DELAY_MS = 50;
+
+export async function lookupAccountRecordAfterCreate(
+  ops: Pick<AccountProvisionOps, "lookupAccountRecord">,
+  accountName: string,
+): Promise<ServiceAccountRecord | undefined> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= POST_CREATE_RECORD_READ_ATTEMPTS; attempt += 1) {
+    try {
+      return await ops.lookupAccountRecord(accountName);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < POST_CREATE_RECORD_READ_ATTEMPTS) {
+        await sleep(POST_CREATE_RECORD_READ_RETRY_DELAY_MS);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -415,7 +399,12 @@ export async function executeAccountProvisionPlan(
   ops: AccountProvisionOps,
 ): Promise<{ uid: number; observed: string }> {
   if (plan.action === "conflict") {
-    throw new Error(plan.reason);
+    throw new Error(
+      `${plan.reason} ${serviceAccountConflictGuidance(plan.accountName, {
+        homeDirectory: options.homeDirectory,
+        ceiling: options.ceiling,
+      })}`,
+    );
   }
   const expected = { uid: plan.uid, homeDirectory: options.homeDirectory };
   if (plan.action === "skip") {
@@ -445,7 +434,7 @@ export async function executeAccountProvisionPlan(
   }
   let observed: ServiceAccountRecord | undefined;
   try {
-    observed = await ops.lookupAccountRecord(plan.accountName);
+    observed = await lookupAccountRecordAfterCreate(ops, plan.accountName);
   } catch (err) {
     const rollback = await rollbackCreatedServiceAccount(ops, plan.accountName, plan.uid);
     throw new AccountProvisionVerificationError(
@@ -477,7 +466,21 @@ export async function planAndCreateAccount(
   options: AccountProvisionOptions,
   ops: AccountProvisionOps,
 ): Promise<{ plan: AccountProvisionPlan; uid: number; observed: string }> {
-  const existingRecord = await ops.lookupAccountRecord(options.accountName);
+  let existingRecord: ServiceAccountRecord | undefined;
+  try {
+    existingRecord = await ops.lookupAccountRecord(options.accountName);
+  } catch (err) {
+    throw new AccountProvisionVerificationError(
+      `Existing service account "${options.accountName}" could not be read well enough to plan ` +
+        `(${err instanceof Error ? err.message : String(err)}). Refusing to create over an unknown or malformed ` +
+        `directory-service record. ` +
+        serviceAccountRepairGuidance(options.accountName, {
+          homeDirectory: options.homeDirectory,
+          uidFloor: options.ceiling,
+        }),
+      { cause: err },
+    );
+  }
   const existingUid = existingRecord?.uid;
   const highestAssignedUid = await ops.highestAssignedUid();
   const plan = planAccountCreate(options, { existingUid, highestAssignedUid });

@@ -607,7 +607,7 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       gateDaemonArgvPrefix: ["sanctuary"],
       excludeUids: [501],
       gateAccountCeiling: 599,
-      gateHomeDirectory: "/var/empty",
+      gateHomeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
       reloadPolicy: async () => ({ ok: true }),
       publishProvisionedRules: async () => ({ ok: true, ruleIds: [] }),
       audit: async () => undefined,

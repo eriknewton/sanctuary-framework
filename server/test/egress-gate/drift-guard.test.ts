@@ -58,6 +58,7 @@ function scriptedRunner(script: {
   runningCode?: number;
   parseRules?: string[];
   parseCode?: number;
+  parseStderr?: string;
 }): PfCommandRunner & { calls: string[][] } {
   const calls: string[][] = [];
   return {
@@ -75,7 +76,9 @@ function scriptedRunner(script: {
       return {
         code: script.parseCode ?? 0,
         stdout: `${(script.parseRules ?? EXPECTED_RULES).join("\n")}\n`,
-        stderr: script.parseCode !== undefined && script.parseCode !== 0 ? "pfctl: syntax error" : "",
+        stderr:
+          script.parseStderr ??
+          (script.parseCode !== undefined && script.parseCode !== 0 ? "pfctl: syntax error" : ""),
       };
     },
   };
@@ -131,6 +134,23 @@ describe("egress-gate/drift-guard diffTransientPfRules", () => {
     const runner = scriptedRunner({
       runningRules: STOCK_MACOS_RUNNING_RULES,
       parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([]);
+    expect(diff.expectedCount).toBe(STOCK_MACOS_RUNNING_RULES.length);
+    expect(diff.runningCount).toBe(STOCK_MACOS_RUNNING_RULES.length);
+  });
+
+  it("L1: expectedCount ignores pfctl normalization warnings written to stderr", async () => {
+    await writeFile(mainConfPath, STOCK_MACOS_BASE_CONFIG);
+    const runner = scriptedRunner({
+      runningRules: STOCK_MACOS_RUNNING_RULES,
+      parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
+      parseStderr: [
+        "pfctl: Use of -f option, could result in flushing of rules",
+        "present in the main ruleset",
+        "pfctl: load anchors",
+      ].join("\n"),
     });
     const diff = await diffTransientPfRules(runner, { mainConfPath });
     expect(diff.foreign).toEqual([]);

@@ -54,6 +54,8 @@ import {
   moveAsideStaleHermesRuntimeDestination,
   policyDaemonInstallBootArgs,
   resolvePolicyDaemonActionForAutoProvision,
+  decideDsclAttributeRead,
+  decideDsclRecordRead,
   runLaunchctlWithTimeout,
   LAUNCHCTL_TIMEOUT_MS,
   LAUNCHCTL_KILL_SIGNAL,
@@ -68,6 +70,62 @@ import {
   type RehomeOps,
 } from "../../src/castle-wall/provision/rehome.js";
 import { verifyReachabilityBeforeArm } from "../../src/castle-wall/provision/verify.js";
+
+describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix round-3 B1)", () => {
+  it("distinguishes an absent attribute from an absent record when No such key is on stderr with exit 0", () => {
+    expect(
+      decideDsclAttributeRead("UniqueID", {
+        code: 0,
+        stdout: "",
+        stderr: "No such key: UniqueID\n",
+      }),
+    ).toEqual({ kind: "attribute-absent" });
+    expect(
+      decideDsclRecordRead({
+        code: 0,
+        stdout: "RecordName: sanctuary-hermes\n",
+        stderr: "",
+      }),
+    ).toBe("present");
+  });
+
+  it("recognizes absent records from dscl eDSRecordNotFound diagnostics", () => {
+    const absent = {
+      code: 56,
+      stdout: "",
+      stderr: "/usr/bin/dscl DS Error: -14136 (eDSRecordNotFound)\n",
+    };
+    expect(decideDsclRecordRead(absent)).toBe("record-absent");
+    expect(decideDsclAttributeRead("UniqueID", absent)).toEqual({ kind: "record-absent" });
+  });
+
+  it("preserves the full attribute value instead of truncating at the first space", () => {
+    expect(
+      decideDsclAttributeRead("NFSHomeDirectory", {
+        code: 0,
+        stdout: "NFSHomeDirectory: /var/sanctuary agents/sanctuary-hermes\n",
+        stderr: "",
+      }),
+    ).toEqual({ kind: "value", value: "/var/sanctuary agents/sanctuary-hermes" });
+  });
+
+  it("returns unknown rather than claiming absence on unclassified dscl output", () => {
+    expect(
+      decideDsclRecordRead({
+        code: 5,
+        stdout: "",
+        stderr: "DirectoryService daemon unavailable",
+      }),
+    ).toBe("unknown");
+    expect(
+      decideDsclAttributeRead("UserShell", {
+        code: 0,
+        stdout: "",
+        stderr: "",
+      }),
+    ).toEqual({ kind: "unknown", diagnostic: "" });
+  });
+});
 
 describe("wrap/auto-provision real-ops chokepoint: credentialReadableAsUidDecision (fix R1)", () => {
   it("ENOENT (statResult undefined) -> false: an absent moved credential is never a pass", () => {

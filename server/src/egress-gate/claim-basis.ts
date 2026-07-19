@@ -1245,7 +1245,7 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     file: `${EG}/gate-account.ts`,
     symbol: "rollbackIncompleteGateAccount",
     claim:
-      "a fresh-create gate account rollback is reported as observed absent, not observed, not needed, or not attempted with the reason named",
+      "a fresh-create gate account recovery reports whether absence was observed before any deletion was attempted, or whether a record was left in place for repair; it never claims deletion",
     basis: "observed",
     detectorBlind: true,
     layer: "compute",

@@ -1924,37 +1924,120 @@ export async function canonicalizeHomeDirectory(
   }
 }
 
+export interface DsclReadResult {
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
+export type DsclRecordReadDecision = "present" | "record-absent" | "unknown";
+
+export type DsclAttributeReadDecision =
+  | { readonly kind: "value"; readonly value: string }
+  | { readonly kind: "attribute-absent" }
+  | { readonly kind: "record-absent" }
+  | { readonly kind: "unknown"; readonly diagnostic: string };
+
+const DSCL_RECORD_NOT_FOUND_RE = /eDSRecordNotFound|DS Error:\s*-14136|Invalid Path/i;
+const DSCL_NO_SUCH_KEY_RE = /No such key:/i;
+
+function dsclDiagnostic(result: DsclReadResult): string {
+  return [result.stderr, result.stdout]
+    .filter((part) => part.trim().length > 0)
+    .join("\n")
+    .trim();
+}
+
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function decideDsclRecordRead(result: DsclReadResult): DsclRecordReadDecision {
+  if (result.code === 0) return "present";
+  return DSCL_RECORD_NOT_FOUND_RE.test(dsclDiagnostic(result)) ? "record-absent" : "unknown";
+}
+
+export function decideDsclAttributeRead(
+  attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  result: DsclReadResult,
+): DsclAttributeReadDecision {
+  const diagnostic = dsclDiagnostic(result);
+  if (result.code !== 0) {
+    return DSCL_RECORD_NOT_FOUND_RE.test(diagnostic)
+      ? { kind: "record-absent" }
+      : { kind: "unknown", diagnostic };
+  }
+  const match = new RegExp(`^${escapeRegExpLiteral(attribute)}:\\s*(.*)$`, "m").exec(result.stdout);
+  if (match !== null) return { kind: "value", value: match[1]!.trim() };
+  if (DSCL_NO_SUCH_KEY_RE.test(diagnostic)) return { kind: "attribute-absent" };
+  return { kind: "unknown", diagnostic };
+}
+
 function realAccountProvisionOps() {
-  const dsclErrorText = (err: unknown): string => {
-    const e = err as { stdout?: unknown; stderr?: unknown; message?: unknown };
-    return [e.stderr, e.stdout, e.message]
-      .filter((part): part is string => typeof part === "string" && part.length > 0)
-      .join("\n");
+  const dsclReadResult = async (args: readonly string[]): Promise<DsclReadResult> => {
+    try {
+      const { stdout, stderr } = await execFileAsync("/usr/bin/dscl", [...args]);
+      return { code: 0, stdout, stderr };
+    } catch (err) {
+      const e = err as { code?: unknown; stdout?: unknown; stderr?: unknown; message?: unknown };
+      return {
+        code: typeof e.code === "number" ? e.code : 1,
+        stdout: typeof e.stdout === "string" ? e.stdout : "",
+        stderr:
+          typeof e.stderr === "string"
+            ? e.stderr
+            : typeof e.message === "string"
+              ? e.message
+              : "",
+      };
+    }
   };
-  const dsclReadLooksAbsent = (err: unknown): boolean =>
-    /No such key|eDSRecordNotFound|DS Error: -14136|not found|Invalid Path/i.test(dsclErrorText(err));
+  const recordExists = async (accountName: string): Promise<boolean> => {
+    const result = await dsclReadResult([".", "-read", `/Users/${accountName}`]);
+    const decision = decideDsclRecordRead(result);
+    if (decision === "present") return true;
+    if (decision === "record-absent") return false;
+    throw new Error(
+      `dscl could not determine whether ${accountName} exists (${dsclDiagnostic(result) || "no diagnostic"})`,
+    );
+  };
   const readAttribute = async (
     accountName: string,
     attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  ): Promise<{ kind: "value"; value: string } | { kind: "attribute-absent" } | { kind: "record-absent" }> => {
+    const result = await dsclReadResult([".", "-read", `/Users/${accountName}`, attribute]);
+    const decision = decideDsclAttributeRead(attribute, result);
+    if (decision.kind !== "unknown") return decision;
+    throw new Error(
+      `dscl could not read ${attribute} for ${accountName} (${decision.diagnostic || "no diagnostic"})`,
+    );
+  };
+  const readExistingAttribute = async (
+    accountName: string,
+    attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
   ): Promise<string | undefined> => {
-    try {
-      const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-read", `/Users/${accountName}`, attribute]);
-      const match = new RegExp(`${attribute}:\\s*(\\S+)`).exec(stdout);
-      return match?.[1];
-    } catch (err) {
-      if (dsclReadLooksAbsent(err)) return undefined;
-      throw err;
+    const read = await readAttribute(accountName, attribute);
+    if (read.kind === "value") return read.value;
+    if (read.kind === "attribute-absent") return undefined;
+    throw new Error(`directory-service record "${accountName}" disappeared while reading ${attribute}`);
+  };
+  const readExistingUid = async (accountName: string): Promise<number> => {
+    const uidText = await readExistingAttribute(accountName, "UniqueID");
+    if (uidText === undefined) {
+      throw new Error(
+        `directory-service record "${accountName}" exists but UniqueID is missing; refusing to treat it as absent`,
+      );
     }
+    const uid = Number(uidText);
+    if (!Number.isSafeInteger(uid) || uid <= 0) {
+      throw new Error(`dscl returned an invalid UniqueID for ${accountName}: ${uidText}`);
+    }
+    return uid;
   };
   return {
     lookupAccountUid: async (accountName: string): Promise<number | undefined> => {
-      const uidText = await readAttribute(accountName, "UniqueID");
-      if (uidText === undefined) return undefined;
-      const uid = Number(uidText);
-      if (!Number.isSafeInteger(uid) || uid <= 0) {
-        throw new Error(`dscl returned an invalid UniqueID for ${accountName}: ${uidText}`);
-      }
-      return uid;
+      if (!(await recordExists(accountName))) return undefined;
+      return readExistingUid(accountName);
     },
     canonicalizeHomeDirectory,
     highestAssignedUid: async (): Promise<number> => {
@@ -1969,15 +2052,11 @@ function realAccountProvisionOps() {
     lookupAccountRecord: async (
       accountName: string,
     ): Promise<{ uid: number; homeDirectory?: string; isHidden?: boolean; userShell?: string } | undefined> => {
-      const uidText = await readAttribute(accountName, "UniqueID");
-      if (uidText === undefined) return undefined;
-      const uid = Number(uidText);
-      if (!Number.isSafeInteger(uid) || uid <= 0) {
-        throw new Error(`dscl returned an invalid UniqueID for ${accountName}: ${uidText}`);
-      }
-      const homeDirectory = await readAttribute(accountName, "NFSHomeDirectory");
-      const hiddenText = await readAttribute(accountName, "IsHidden");
-      const userShell = await readAttribute(accountName, "UserShell");
+      if (!(await recordExists(accountName))) return undefined;
+      const uid = await readExistingUid(accountName);
+      const homeDirectory = await readExistingAttribute(accountName, "NFSHomeDirectory");
+      const hiddenText = await readExistingAttribute(accountName, "IsHidden");
+      const userShell = await readExistingAttribute(accountName, "UserShell");
       const parsedHidden = parseServiceAccountIsHidden(hiddenText);
       return {
         uid,
@@ -1985,21 +2064,6 @@ function realAccountProvisionOps() {
         ...(parsedHidden !== undefined ? { isHidden: parsedHidden } : {}),
         ...(userShell !== undefined ? { userShell } : {}),
       };
-    },
-    deleteCreatedUser: async (accountName: string): Promise<void> => {
-      try {
-        await execFileAsync("/usr/sbin/sysadminctl", ["-deleteUser", accountName, "-keepHome"]);
-      } catch (sysadminctlErr) {
-        try {
-          await execFileAsync("/usr/bin/dscl", [".", "-delete", `/Users/${accountName}`]);
-        } catch (dsclErr) {
-          throw new Error(
-            `sysadminctl -deleteUser failed (${dsclErrorText(sysadminctlErr) || "no diagnostic"}); ` +
-              `dscl -delete also failed (${dsclErrorText(dsclErr) || "no diagnostic"})`,
-            { cause: dsclErr },
-          );
-        }
-      }
     },
     createUser: async (
       accountName: string,
@@ -2018,7 +2082,7 @@ function realAccountProvisionOps() {
       // NFSHomeDirectory` remains only a plausible, unproven D4 suspect; a
       // hardware capture showing sysadminctl's read-back plus the redundant
       // write failure would confirm it. Post-create hardening now runs through
-      // `hardenCreatedUser`, inside the observed rollback envelope.
+      // `hardenCreatedUser`, inside the observed recovery envelope.
       await execFileAsync("/usr/sbin/sysadminctl", [
         "-addUser",
         accountName,

@@ -2437,9 +2437,27 @@ export async function startExclusiveEgressBootSupervisor(input: {
             gateHomeDirectory: ctx.gateHomeDirectory,
           });
         } catch (err) {
+          const reason = (err as Error).message;
           input.print(
-            `[castle-wall] boot: uid ${agentUid} gate account home layout assert failed: ${(err as Error).message}`,
+            `[castle-wall] boot: uid ${agentUid} gate account home layout assert failed: ${reason}; ` +
+              "the release barrier will still verify and park fail-closed. " +
+              "Repair: sudo sanctuary protect --repair-egress-gate",
           );
+          try {
+            await input.audit("exclusive_egress_gate_home_layout_failed", {
+              agent_uid: agentUid,
+              gate_account: ctx.gateAccount,
+              gate_uid: ctx.gateUid,
+              gate_home_directory: ctx.gateHomeDirectory,
+              reason,
+              barrier_continues_fail_closed: true,
+            });
+          } catch (auditErr) {
+            input.print(
+              `[castle-wall] boot: uid ${agentUid} could not record gate home layout failure audit ` +
+                `(${(auditErr as Error).message}); the release barrier will still verify and park fail-closed`,
+            );
+          }
         }
         // Fix-round H2: START the gate daemon (RunAtLoad=false by contract;
         // nothing else starts it after a reboot), then let the barrier verify
