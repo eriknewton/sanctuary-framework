@@ -14,7 +14,17 @@
 
 import { describe, it, expect } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, statSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  chmodSync,
+  rmSync,
+  statSync,
+  readFileSync,
+  openSync,
+  fstatSync,
+  closeSync,
+} from "node:fs";
 import { chmod, mkdir, rm, writeFile as fsWriteFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -546,13 +556,22 @@ describe("parked install against a REAL, NON-EXISTENT hold directory (drill D1)"
       const holdDirStat = statSync(holdDir);
       expect(holdDirStat.isDirectory()).toBe(true);
       expect(holdDirStat.mode & 0o777).toBe(AGENT_HARNESS_HOLD_DIR_MODE);
-      // ...and the wrapper is genuinely on disk inside it, executable. The
-      // stat + read below are the existence proof: both THROW if the install
-      // did not land the file, which is precisely the D1 failure mode.
-      const wrapperStat = statSync(realPlan.wrapperPath);
-      expect(wrapperStat.isFile()).toBe(true);
-      expect(wrapperStat.mode & 0o777).toBe(0o755);
-      expect(readFileSync(realPlan.wrapperPath, "utf8")).toBe(RELEASE_EXEC_WRAPPER_SCRIPT);
+      // ...and the wrapper is genuinely on disk inside it, executable. Mode
+      // and content are read through ONE file descriptor (open -> fstat ->
+      // read), so there is no path-resolved-twice window at all: separate
+      // `statSync(p)` + `readFileSync(p)` calls are the check-then-use shape
+      // CodeQL flags as js/file-system-race, and a single handle is the real
+      // fix rather than a suppression. `openSync` throws if the install never
+      // landed the wrapper, which is precisely the D1 failure mode.
+      const wrapperFd = openSync(realPlan.wrapperPath, "r");
+      try {
+        const wrapperStat = fstatSync(wrapperFd);
+        expect(wrapperStat.isFile()).toBe(true);
+        expect(wrapperStat.mode & 0o777).toBe(0o755);
+        expect(readFileSync(wrapperFd, "utf8")).toBe(RELEASE_EXEC_WRAPPER_SCRIPT);
+      } finally {
+        closeSync(wrapperFd);
+      }
       expect(launchctl.map((a) => a[0])).toEqual(["disable", "bootout"]);
     } finally {
       rmSync(tmpRoot, { recursive: true, force: true });
