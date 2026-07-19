@@ -1928,6 +1928,7 @@ export interface DsclReadResult {
   readonly code: number;
   readonly stdout: string;
   readonly stderr: string;
+  readonly execErrorCode?: string;
 }
 
 export type DsclRecordReadDecision = "present" | "record-absent" | "unknown";
@@ -1938,14 +1939,95 @@ export type DsclAttributeReadDecision =
   | { readonly kind: "record-absent" }
   | { readonly kind: "unknown"; readonly diagnostic: string };
 
+const DSCL_STDIO_MAXBUFFER_ERROR = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+const DSCL_DIAGNOSTIC_MAX_CHARS = 512;
 const DSCL_RECORD_NOT_FOUND_RE = /eDSRecordNotFound|DS Error:\s*-14136|Invalid Path/i;
-const DSCL_NO_SUCH_KEY_RE = /No such key:/i;
+const DSCL_NO_SUCH_KEY_RE = /^No such key:\s*([A-Za-z][A-Za-z0-9_-]*)\b/i;
+const DSCL_ATTRIBUTE_LINE_RE = /^([A-Za-z][A-Za-z0-9_-]*):(?:\s|$)/;
 
-function dsclDiagnostic(result: DsclReadResult): string {
+function dsclRawDiagnostic(result: Pick<DsclReadResult, "stdout" | "stderr">): string {
   return [result.stderr, result.stdout]
     .filter((part) => part.trim().length > 0)
     .join("\n")
     .trim();
+}
+
+function dsclDiagnosticLines(result: Pick<DsclReadResult, "stdout" | "stderr">): string[] {
+  return dsclRawDiagnostic(result)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+function allDsclDiagnosticLinesMatch(
+  result: Pick<DsclReadResult, "stdout" | "stderr">,
+  predicate: (line: string) => boolean,
+): boolean {
+  const lines = dsclDiagnosticLines(result);
+  return lines.length > 0 && lines.every(predicate);
+}
+
+function boundedDsclDiagnostic(summary: string): string {
+  if (summary.length <= DSCL_DIAGNOSTIC_MAX_CHARS) return summary;
+  return `${summary.slice(0, DSCL_DIAGNOSTIC_MAX_CHARS - "...<truncated>".length)}...<truncated>`;
+}
+
+function summarizeDsclNames(names: ReadonlySet<string>): string {
+  const sorted = [...names].sort((a, b) => a.localeCompare(b));
+  const shown = sorted.slice(0, 8);
+  return shown.join(", ") + (sorted.length > shown.length ? `, +${sorted.length - shown.length} more` : "");
+}
+
+function summarizeDsclStream(label: "stdout" | "stderr", content: string): string | undefined {
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return undefined;
+
+  const attributeNames = new Set<string>();
+  const missingAttributeNames = new Set<string>();
+  let recordNotFoundLines = 0;
+  let unclassifiedLines = 0;
+
+  for (const line of lines) {
+    const noSuchKey = DSCL_NO_SUCH_KEY_RE.exec(line);
+    if (noSuchKey !== null) {
+      missingAttributeNames.add(noSuchKey[1]!);
+      continue;
+    }
+    if (DSCL_RECORD_NOT_FOUND_RE.test(line)) {
+      recordNotFoundLines += 1;
+      continue;
+    }
+    const attribute = DSCL_ATTRIBUTE_LINE_RE.exec(line);
+    if (attribute !== null) {
+      attributeNames.add(attribute[1]!);
+      continue;
+    }
+    unclassifiedLines += 1;
+  }
+
+  const parts = [
+    `${label}: ${Buffer.byteLength(content, "utf8")} bytes`,
+    `${lines.length} line${lines.length === 1 ? "" : "s"}`,
+  ];
+  if (attributeNames.size > 0) parts.push(`attributes=[${summarizeDsclNames(attributeNames)}]`);
+  if (missingAttributeNames.size > 0) {
+    parts.push(`missing-attributes=[${summarizeDsclNames(missingAttributeNames)}]`);
+  }
+  if (recordNotFoundLines > 0) parts.push(`record-not-found-lines=${recordNotFoundLines}`);
+  if (unclassifiedLines > 0) parts.push(`unclassified-lines=${unclassifiedLines}`);
+  return parts.join(", ");
+}
+
+export function dsclDiagnostic(result: DsclReadResult): string {
+  const parts = [
+    result.execErrorCode !== undefined ? `exec-error=${result.execErrorCode}` : undefined,
+    summarizeDsclStream("stderr", result.stderr),
+    summarizeDsclStream("stdout", result.stdout),
+  ].filter((part): part is string => part !== undefined && part.length > 0);
+  return boundedDsclDiagnostic(parts.join("; "));
 }
 
 function escapeRegExpLiteral(value: string): string {
@@ -1954,23 +2036,37 @@ function escapeRegExpLiteral(value: string): string {
 
 export function decideDsclRecordRead(result: DsclReadResult): DsclRecordReadDecision {
   if (result.code === 0) return "present";
-  return DSCL_RECORD_NOT_FOUND_RE.test(dsclDiagnostic(result)) ? "record-absent" : "unknown";
+  if (result.execErrorCode === DSCL_STDIO_MAXBUFFER_ERROR) return "unknown";
+  if (result.execErrorCode !== undefined) return "unknown";
+  return allDsclDiagnosticLinesMatch(result, (line) => DSCL_RECORD_NOT_FOUND_RE.test(line))
+    ? "record-absent"
+    : "unknown";
 }
 
 export function decideDsclAttributeRead(
   attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
   result: DsclReadResult,
 ): DsclAttributeReadDecision {
-  const diagnostic = dsclDiagnostic(result);
   if (result.code !== 0) {
-    return DSCL_RECORD_NOT_FOUND_RE.test(diagnostic)
+    if (result.execErrorCode === DSCL_STDIO_MAXBUFFER_ERROR) {
+      return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+    }
+    if (result.execErrorCode !== undefined) {
+      return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+    }
+    return allDsclDiagnosticLinesMatch(result, (line) => DSCL_RECORD_NOT_FOUND_RE.test(line))
       ? { kind: "record-absent" }
-      : { kind: "unknown", diagnostic };
+      : { kind: "unknown", diagnostic: dsclDiagnostic(result) };
   }
   const match = new RegExp(`^${escapeRegExpLiteral(attribute)}:\\s*(.*)$`, "m").exec(result.stdout);
   if (match !== null) return { kind: "value", value: match[1]!.trim() };
-  if (DSCL_NO_SUCH_KEY_RE.test(diagnostic)) return { kind: "attribute-absent" };
-  return { kind: "unknown", diagnostic };
+  if (
+    result.stdout.trim().length === 0 &&
+    allDsclDiagnosticLinesMatch(result, (line) => DSCL_NO_SUCH_KEY_RE.test(line))
+  ) {
+    return { kind: "attribute-absent" };
+  }
+  return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
 }
 
 function realAccountProvisionOps() {
@@ -1982,6 +2078,7 @@ function realAccountProvisionOps() {
       const e = err as { code?: unknown; stdout?: unknown; stderr?: unknown; message?: unknown };
       return {
         code: typeof e.code === "number" ? e.code : 1,
+        ...(typeof e.code === "string" ? { execErrorCode: e.code } : {}),
         stdout: typeof e.stdout === "string" ? e.stdout : "",
         stderr:
           typeof e.stderr === "string"
@@ -1993,12 +2090,12 @@ function realAccountProvisionOps() {
     }
   };
   const recordExists = async (accountName: string): Promise<boolean> => {
-    const result = await dsclReadResult([".", "-read", `/Users/${accountName}`]);
-    const decision = decideDsclRecordRead(result);
-    if (decision === "present") return true;
-    if (decision === "record-absent") return false;
+    const result = await dsclReadResult([".", "-read", `/Users/${accountName}`, "UniqueID"]);
+    const decision = decideDsclAttributeRead("UniqueID", result);
+    if (decision.kind === "value" || decision.kind === "attribute-absent") return true;
+    if (decision.kind === "record-absent") return false;
     throw new Error(
-      `dscl could not determine whether ${accountName} exists (${dsclDiagnostic(result) || "no diagnostic"})`,
+      `dscl could not determine whether ${accountName} exists (${decision.diagnostic || "no diagnostic"})`,
     );
   };
   const readAttribute = async (

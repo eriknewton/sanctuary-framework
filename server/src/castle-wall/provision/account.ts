@@ -376,7 +376,11 @@ export async function lookupAccountRecordAfterCreate(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= POST_CREATE_RECORD_READ_ATTEMPTS; attempt += 1) {
     try {
-      return await ops.lookupAccountRecord(accountName);
+      const record = await ops.lookupAccountRecord(accountName);
+      if (record !== undefined) return record;
+      if (attempt < POST_CREATE_RECORD_READ_ATTEMPTS) {
+        await sleep(POST_CREATE_RECORD_READ_RETRY_DELAY_MS);
+      }
     } catch (err) {
       lastErr = err;
       if (attempt < POST_CREATE_RECORD_READ_ATTEMPTS) {
@@ -384,7 +388,8 @@ export async function lookupAccountRecordAfterCreate(
       }
     }
   }
-  throw lastErr;
+  if (lastErr !== undefined) throw lastErr;
+  return undefined;
 }
 
 /**

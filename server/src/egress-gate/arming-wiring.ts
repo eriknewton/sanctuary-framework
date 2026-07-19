@@ -2429,6 +2429,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
         } catch (err) {
           input.print(`[castle-wall] boot: uid ${agentUid} runtime-fs assert failed: ${(err as Error).message}`);
         }
+        let gateHomeLayoutFailure: string | undefined;
         try {
           await ensureGateHomeLayout({
             agentUid,
@@ -2438,9 +2439,10 @@ export async function startExclusiveEgressBootSupervisor(input: {
           });
         } catch (err) {
           const reason = (err as Error).message;
+          gateHomeLayoutFailure = reason;
           input.print(
             `[castle-wall] boot: uid ${agentUid} gate account home layout assert failed: ${reason}; ` +
-              "the release barrier will still verify and park fail-closed. " +
+              "the release barrier will refuse release and park fail-closed. " +
               "Repair: sudo sanctuary protect --repair-egress-gate",
           );
           try {
@@ -2497,6 +2499,22 @@ export async function startExclusiveEgressBootSupervisor(input: {
           rearm: "boot-rearm",
           print: input.print,
         });
+        const releaseBarrierOps: ReleaseBarrierOps =
+          gateHomeLayoutFailure === undefined
+            ? barrierOps
+            : {
+                ...barrierOps,
+                verifyGate: async () => {
+                  const gate = await barrierOps.verifyGate();
+                  return {
+                    ok: false,
+                    reasons: [
+                      `gate account home layout assertion failed before release: ${gateHomeLayoutFailure}`,
+                      ...(gate.ok ? [] : gate.reasons),
+                    ],
+                  };
+                },
+              };
         // Fix-round-3 MED-4: the release context (fortressPath, harnessArgv,
         // gateUid) was resolved from THIS registry entry in phase 1. Between
         // that resolution and the barrier's release, a concurrent repair or
@@ -2508,9 +2526,9 @@ export async function startExclusiveEgressBootSupervisor(input: {
         // the barrier maps to a loud fail-closed park at commit-generation.
         const resolvedGenerationId = entry.generation_id;
         const guardedOps: ReleaseBarrierOps = {
-          ...barrierOps,
+          ...releaseBarrierOps,
           commitGeneration: async (): Promise<CommittedGenerationIdentity> => {
-            const committed = await barrierOps.commitGeneration();
+            const committed = await releaseBarrierOps.commitGeneration();
             if (committed.generation_id !== resolvedGenerationId) {
               throw new Error(
                 `registry changed during boot release for uid ${agentUid}: resolution captured committed ` +

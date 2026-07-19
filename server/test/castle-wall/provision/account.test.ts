@@ -400,6 +400,34 @@ describe("castle-wall/provision/account", () => {
       expect(lookupCalls).toBe(4);
     });
 
+    it("H2: retries a transient absent post-create readback before treating the create as failed", async () => {
+      let lookupCalls = 0;
+      let record: ServiceAccountRecord | undefined;
+      const ops: AccountProvisionOps = {
+        lookupAccountUid: async () => record?.uid,
+        lookupAccountRecord: async () => {
+          lookupCalls += 1;
+          if (lookupCalls === 1) return undefined;
+          if (lookupCalls === 2) return undefined;
+          return record;
+        },
+        canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+        highestAssignedUid: async () => 499,
+        createUser: async (_accountName, uid, _comment, homeDirectory) => {
+          record = { uid, homeDirectory, userShell: "/usr/bin/false" };
+        },
+        hardenCreatedUser: async () => {
+          if (record !== undefined) record = { ...record, isHidden: true };
+        },
+      };
+      const result = await planAndCreateAccount(
+        { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+        ops,
+      );
+      expect(result.uid).toBe(500);
+      expect(lookupCalls).toBe(3);
+    });
+
     it("B1: an existing malformed record that cannot expose UniqueID stops planning and names full repair", async () => {
       let highestCalls = 0;
       let created = false;

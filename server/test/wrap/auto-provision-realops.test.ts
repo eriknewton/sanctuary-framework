@@ -56,6 +56,7 @@ import {
   resolvePolicyDaemonActionForAutoProvision,
   decideDsclAttributeRead,
   decideDsclRecordRead,
+  dsclDiagnostic,
   runLaunchctlWithTimeout,
   LAUNCHCTL_TIMEOUT_MS,
   LAUNCHCTL_KILL_SIGNAL,
@@ -124,6 +125,72 @@ describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix ro
         stderr: "",
       }),
     ).toEqual({ kind: "unknown", diagnostic: "" });
+  });
+
+  it("B4: the existence probe reads only UniqueID, never the whole account record", async () => {
+    const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
+    expect(source).toContain('[".", "-read", `/Users/${accountName}`, "UniqueID"]');
+    expect(source).not.toMatch(
+      /dsclReadResult\(\[\s*"\.",\s*"-read",\s*`\/Users\/\$\{accountName\}`\s*\]\)/,
+    );
+  });
+
+  it("B4: an execFile maxBuffer overflow is explicit unknown, not a normal exit-1 record absence", () => {
+    expect(
+      decideDsclRecordRead({
+        code: 1,
+        execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        stdout: "AuthenticationAuthority: secret-aa\n",
+        stderr: "",
+      }),
+    ).toBe("unknown");
+    const attributeDecision = decideDsclAttributeRead("UniqueID", {
+      code: 1,
+      execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      stdout: "AuthenticationAuthority: secret-aa\n",
+      stderr: "",
+    });
+    expect(attributeDecision.kind).toBe("unknown");
+    if (attributeDecision.kind === "unknown") {
+      expect(attributeDecision.diagnostic).toContain("exec-error=ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+      expect(attributeDecision.diagnostic).toContain("attributes=[AuthenticationAuthority]");
+      expect(attributeDecision.diagnostic).not.toContain("secret-aa");
+    }
+  });
+
+  it("B4: dscl diagnostics summarize oversized records without leaking value payloads", () => {
+    const hugeRecord = [
+      "AuthenticationAuthority: super-secret-auth-authority",
+      `JPEGPhoto: ${"A".repeat(1024 * 1024)}`,
+      "GeneratedUID: generated-secret-value",
+      "ShadowHashData: salted-sha512-password-verifier",
+    ].join("\n");
+    const diagnostic = dsclDiagnostic({
+      code: 1,
+      execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      stdout: hugeRecord,
+      stderr: "",
+    });
+    expect(diagnostic.length).toBeLessThanOrEqual(512);
+    expect(diagnostic).toContain("exec-error=ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+    expect(diagnostic).toContain("attributes=[AuthenticationAuthority");
+    expect(diagnostic).toContain("GeneratedUID");
+    expect(diagnostic).toContain("JPEGPhoto");
+    expect(diagnostic).toContain("ShadowHashData");
+    expect(diagnostic).not.toContain("super-secret-auth-authority");
+    expect(diagnostic).not.toContain("generated-secret-value");
+    expect(diagnostic).not.toContain("salted-sha512-password-verifier");
+    expect(diagnostic).not.toContain("A".repeat(64));
+  });
+
+  it("B4: mixed diagnostics are unknown, not record-absent by any-match", () => {
+    const mixed = {
+      code: 56,
+      stdout: "",
+      stderr: "DirectoryService daemon unavailable\n/usr/bin/dscl DS Error: -14136 (eDSRecordNotFound)\n",
+    };
+    expect(decideDsclRecordRead(mixed)).toBe("unknown");
+    expect(decideDsclAttributeRead("UniqueID", mixed).kind).toBe("unknown");
   });
 });
 

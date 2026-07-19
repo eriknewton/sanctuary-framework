@@ -221,7 +221,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     expect(barrierIdx).toBeGreaterThan(readIdx);
   });
 
-  it("a boot gate-home layout failure logs LOUDLY and still lets the barrier park fail-closed", async () => {
+  it("a boot gate-home layout failure logs LOUDLY and forces the release barrier to park fail-closed", async () => {
     const printed: string[] = [];
     const audits: Array<{ operation: string; details: Record<string, unknown> }> = [];
     const barrierEvents: string[] = [];
@@ -236,9 +236,10 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
       },
       verifyGate: async () => {
         barrierEvents.push("verifyGate");
-        return { ok: false, reasons: ["gate daemon log layout did not verify"] };
+        return { ok: true };
       },
       commitGeneration: async () => {
+        barrierEvents.push("commit");
         throw new Error("commit must not run after gate verification fails");
       },
       bootSessionUuid: async () => "boot-session",
@@ -273,6 +274,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     handle.stopOracleLoop();
     expect(printed.join("\n")).toContain("gate account home layout assert failed");
     expect(printed.join("\n")).toContain("stale log owner");
+    expect(printed.join("\n")).toContain("refuse release");
     expect(printed.join("\n")).toContain("repair-egress-gate");
     expect(barrierEvents).toEqual(["bootout", "removeHold", "disable", "restoreParkedPlist", "rearm", "verifyGate"]);
     const layoutAudit = audits.find((entry) => entry.operation === "exclusive_egress_gate_home_layout_failed");
@@ -288,7 +290,8 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     expect(outcome.kind).toBe("parked");
     if (outcome.kind === "parked") {
       expect(outcome.reason).toContain("release barrier parked at stage gate-verify");
-      expect(outcome.reason).toContain("gate daemon log layout did not verify");
+      expect(outcome.reason).toContain("gate account home layout assertion failed before release");
+      expect(outcome.reason).toContain("stale log owner uid=505 expected uid=511");
       expect(outcome.parkedClaim.state).toBe("parked");
     }
   });

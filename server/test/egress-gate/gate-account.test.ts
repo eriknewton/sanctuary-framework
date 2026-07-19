@@ -419,6 +419,34 @@ describe("egress-gate/gate-account", () => {
     expect(lookupCalls).toBe(4);
   });
 
+  it("H2: retries a transient absent post-create gate readback before treating the create as failed", async () => {
+    let lookupCalls = 0;
+    let record: GateAccountRecord | undefined;
+    const ops: GateAccountProvisionOps = {
+      lookupAccountUid: async () => record?.uid,
+      lookupAccountRecord: async () => {
+        lookupCalls += 1;
+        if (lookupCalls === 1) return undefined;
+        if (lookupCalls === 2) return undefined;
+        return record;
+      },
+      canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+      highestAssignedUid: async () => 504,
+      createUser: async (_name, uid, _comment, home) => {
+        record = { uid, homeDirectory: home, userShell: "/usr/bin/false" };
+      },
+      hardenCreatedUser: async () => {
+        if (record !== undefined) record = { ...record, isHidden: true };
+      },
+    };
+    const result = await planAndCreateGateAccount(
+      { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: GATE_HOME },
+      ops,
+    );
+    expect(result.uid).toBe(505);
+    expect(lookupCalls).toBe(3);
+  });
+
   it("H1: does NOT delete when rollback cannot observe the record before deletion", async () => {
     let record: GateAccountRecord | undefined;
     let lookupCalls = 0;
