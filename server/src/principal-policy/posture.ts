@@ -59,6 +59,7 @@ import {
 import {
   reverifyEntryProducerSignature,
   enforcementEntryCounts,
+  livenessEntryCounts,
   producerSignedDedupKey,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
@@ -151,9 +152,10 @@ export const CASTLE_WALL_LIVENESS_OPERATIONS: ReadonlySet<string> =
 
 /**
  * Castle Wall audit operations that record an INTENTIONAL stand-down — the
- * operator deliberately stopped the wall (`filter_stopped`) or revoked its arm
- * lease (`arm_lease_revoked`). Both stop the liveness heartbeat on purpose, so
- * the resulting heartbeat-then-silent pattern is NOT a silent death.
+ * operator deliberately stopped the wall (`filter_stopped`), revoked its arm
+ * lease (`arm_lease_revoked`), or the CLI recorded a completed
+ * `castle-wall disable` (`wall_disarmed`). These stop the liveness heartbeat on
+ * purpose, so the resulting heartbeat-then-silent pattern is NOT a silent death.
  *
  * This set exists to fix a false-RED defect (observability Slice 2): without it
  * a deliberately-stopped wall reads `dead_no_heartbeat`/red for ~24h, because
@@ -180,7 +182,11 @@ export const CASTLE_WALL_LIVENESS_OPERATIONS: ReadonlySet<string> =
  */
 export const CASTLE_WALL_STAND_DOWN_OPERATIONS: ReadonlySet<string> =
   Object.freeze(
-    new Set<string>(["filter_stopped", CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION]),
+    new Set<string>([
+      "filter_stopped",
+      CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+      "wall_disarmed",
+    ]),
   );
 
 /**
@@ -258,6 +264,8 @@ export interface CastleWallPosture {
     | "stale_evidence"
     | "no_evidence"
     | "not_enforcing_evidence"
+    | "intentionally_stopped"
+    | "daemon_liveness_unconfirmed"
     | "not_installed"
     // Slice P: a producer key is expected but the reader could not load it, so
     // the wall is reported `degraded` rather than green on a weaker basis.
@@ -489,6 +497,9 @@ export async function buildCastleWallPosture(
   };
   let latestEnforcementMs: number | null = null;
   let latestNotEnforcingMs: number | null = null;
+  let latestHeartbeatMs: number | null = null;
+  let latestFreshHeartbeatMs: number | null = null;
+  let latestStandDownMs: number | null = null;
   // Track the authenticity basis of the MOST RECENT arm-eligible enforcement
   // entry, so the posture honestly reports whether the green light rests on a
   // re-verified producer signature or merely the channel basis.
@@ -546,6 +557,8 @@ export async function buildCastleWallPosture(
     );
     const isArmEligible = CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op);
     const isNotEnforcing = CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op);
+    const isLiveness = CASTLE_WALL_LIVENESS_OPERATIONS.has(op);
+    const isStandDown = CASTLE_WALL_STAND_DOWN_OPERATIONS.has(op);
     // Only arm-eligible enforcement ops are gated by the signature. Not-enforcing
     // (fault) ops are NOT signed and must NEVER be dropped by the gate — they
     // fail toward RED/degraded (a dropped fault would leave a green-while-faulted
@@ -605,12 +618,43 @@ export async function buildCastleWallPosture(
         latestNotEnforcingMs = armTs;
       }
     }
+    if ((isLiveness || isStandDown) && tsValidForArm) {
+      if (!livenessEntryCounts(reResult.basis)) continue;
+      if (
+        reResult.basis === "producer_signed_verified" &&
+        !signedOperationMatchesEntry(entry.details ?? {}, op)
+      ) {
+        continue;
+      }
+      if (isLiveness) {
+        if (latestHeartbeatMs === null || armTs > latestHeartbeatMs) {
+          latestHeartbeatMs = armTs;
+        }
+        if (armTs >= freshnessFloor) {
+          latestFreshHeartbeatMs =
+            latestFreshHeartbeatMs === null
+              ? armTs
+              : Math.max(latestFreshHeartbeatMs, armTs);
+        }
+      }
+      if (isStandDown) {
+        if (latestStandDownMs === null || armTs > latestStandDownMs) {
+          latestStandDownMs = armTs;
+        }
+      }
+    }
   }
 
   const hasFreshEnforcement =
     latestEnforcementMs !== null && latestEnforcementMs >= freshnessFloor;
   const hasFreshNotEnforcing =
     latestNotEnforcingMs !== null && latestNotEnforcingMs >= freshnessFloor;
+  const hasFreshHeartbeat = latestFreshHeartbeatMs !== null;
+  const heartbeatProducerWasRunning = latestHeartbeatMs !== null;
+  const hasNewerStandDown =
+    latestEnforcementMs !== null &&
+    latestStandDownMs !== null &&
+    latestStandDownMs >= latestEnforcementMs;
 
   let armState: CastleWallArmState;
   let basis: CastleWallPosture["evidence_basis"];
@@ -622,6 +666,23 @@ export async function buildCastleWallPosture(
     // just the daemon-belief path.
     armState = "unknown";
     basis = "no_evidence";
+  } else if (
+    latestNotEnforcingMs !== null &&
+    latestNotEnforcingMs >= freshnessFloor &&
+    (latestEnforcementMs === null || latestNotEnforcingMs >= latestEnforcementMs)
+  ) {
+    armState = "degraded";
+    basis = "not_enforcing_evidence";
+  } else if (hasFreshEnforcement && hasNewerStandDown) {
+    armState = "unknown";
+    basis = "intentionally_stopped";
+  } else if (
+    hasFreshEnforcement &&
+    heartbeatProducerWasRunning &&
+    !hasFreshHeartbeat
+  ) {
+    armState = "unknown";
+    basis = "daemon_liveness_unconfirmed";
   } else if (hasFreshEnforcement) {
     armState = "armed";
     basis = "fresh_enforcement_evidence";

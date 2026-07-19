@@ -74,7 +74,11 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
-import { CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS } from "../castle-wall/constants.js";
+import {
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
+} from "../castle-wall/constants.js";
 import type {
   CastleWallMessage,
   DecisionResponse,
@@ -174,20 +178,16 @@ export interface CastleWallCommandContext {
    */
   agentOriginDescriptorProbe?: (fortressPath: string) => Promise<boolean>;
   /**
-   * Bug B P1 (disarm-first, fail-open sub-case): out-callback that surfaces,
-   * ALONGSIDE the numeric exit code, whether a `disable` AFFIRMATIVELY confirmed
-   * the NE preference is OFF. This is needed because `runDisable` returns 0 in
-   * THREE distinct meanings and the exit code alone collapses them: (B)
-   * confirmed disabled, (C) NE saved-disabled but post-change corroboration was
-   * inconclusive (still off -- the save is authoritative), and (A) the disable
-   * host-app invoke FAILED but the dead-man lease-revoke succeeded (fail-open
-   * NOW, but the NE preference may STILL be enabled -- a reboot-brick risk if a
-   * caller then removes the daemon). Fires with `false` on case A and `true` on
-   * B/C, immediately before the corresponding `return 0`. Never fires on the
-   * throwing (non-zero) paths. Only the auto-provision arm-abort rollback reads
-   * it; every other caller ignores it and the exit-code contract is unchanged.
+   * Bug B P1/B round-2: out-callback that surfaces the disable outcome
+   * ALONGSIDE the numeric exit code. `runDisable` can return 0 in three
+   * meanings: (B) status re-read observed disabled, (C) save-disabled returned
+   * ok but corroboration was inconclusive, and (A) the save did not complete
+   * but the dead-man lease revoke made the provider fail open. These must stay
+   * distinguishable because only (B) is an OBSERVED-off fact suitable for a
+   * protection claim; (C) is a recovery/control-flow success, not an
+   * observation. Never fires on non-zero paths.
    */
-  onDisableNeConfirmedOff?: (neConfirmedOff: boolean) => void;
+  onDisableNePreferenceOutcome?: (outcome: DisableNePreferenceOutcome) => void;
   /**
    * Override the agent-matchable-allow-rule counter used by the `enable`
    * no-egress brick guard (confined-agent egress design, section 5 layer 2;
@@ -274,6 +274,11 @@ export type HostAppInvoker = (
   binaryPath: string,
   args: string[],
 ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
+export type DisableNePreferenceOutcome =
+  | "corroborated_off"
+  | "save_accepted_inconclusive"
+  | "fail_open_deadman";
 
 /**
  * Runs `open` (or a test double). The default LaunchServices invoker launches
@@ -3684,6 +3689,7 @@ async function appendArmAuditBestEffort(
       verified_state: verifiedState,
       forced,
       ...extraDetails,
+      [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
     fortressPath,
     env,
@@ -4128,7 +4134,7 @@ async function runArmDisarm(
       // is NOT a confirmed filter-off; a caller must not treat it as safe to
       // remove the policy daemon (reboot could come up enabled + no daemon =
       // deny-all).
-      ctx.onDisableNeConfirmedOff?.(false);
+      ctx.onDisableNePreferenceOutcome?.("fail_open_deadman");
       return 0;
     }
     write(err, `castle-wall ${action} failed: ${detail}\n`);
@@ -4234,13 +4240,10 @@ async function runArmDisarm(
       "Castle Wall disarmed: content filter disabled (host app confirmed the save; status corroboration pending).\n",
     );
   }
-  // Bug B P1 (cases B/C): reaching here on a disable means the NE save-disabled
-  // host-app invoke SUCCEEDED (the case-A save-failed path returned earlier), so
-  // the NE preference is confirmed OFF -- whether corroboration positively
-  // confirmed it (B) or was inconclusive on Tahoe (C, the save is authoritative).
-  // Safe for a caller to remove the policy daemon.
   if (action === "disable") {
-    ctx.onDisableNeConfirmedOff?.(true);
+    ctx.onDisableNePreferenceOutcome?.(
+      confirmed ? "corroborated_off" : "save_accepted_inconclusive",
+    );
   }
   return 0;
 }

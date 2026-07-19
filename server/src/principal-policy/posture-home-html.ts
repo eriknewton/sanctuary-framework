@@ -554,7 +554,8 @@ export function renderPostureHomeHTML(): string {
   // Never leaks rule internals; phrases the honest non-green cases plainly.
   //
   // HONESTY: the liveness bases (alive_no_recent_enforcement / dead_no_heartbeat
-  // / intentionally_stopped / no_evidence_self_reporting) are SHARED between the
+  // / intentionally_stopped / daemon_liveness_unconfirmed /
+  // no_evidence_self_reporting) are SHARED between the
   // Castle Wall row and the broker DAEMON row, but they mean different things.
   // For Castle Wall, a fresh heartbeat means "armed but idle" (no flow filtered).
   // For the broker daemon it means ONLY "the process is up" - NOT that it would
@@ -589,7 +590,11 @@ export function renderPostureHomeHTML(): string {
       case "intentionally_stopped":
         return isBrokerDaemon
           ? "The broker daemon was intentionally stopped (clean shutdown); it is off on purpose, not dead."
-          : "The wall was intentionally stopped (operator stop or arm-lease revoke); it is off on purpose, not dead.";
+          : "The wall was intentionally stopped (operator stop, disable, or arm-lease revoke); it is off on purpose, not dead.";
+      case "daemon_liveness_unconfirmed":
+        return isBrokerDaemon
+          ? "Broker daemon liveness is not confirmed after recent activity; not rendered green."
+          : "The wall has prior enforcement evidence, but daemon liveness is not currently confirmed; not rendered green.";
       case "no_activity_event_driven":
         return row.broken_zero_detectable === false
           ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."

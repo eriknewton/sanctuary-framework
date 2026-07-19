@@ -1049,11 +1049,57 @@ describe("castle-wall enable/disable CLI verbs", () => {
     expect(calls.map((c) => c[2])).toEqual(["disable", "status"]);
   });
 
+  it.each([
+    {
+      label: "observed disabled",
+      status: { stdout: reportLine("status", "disabled", true), exitCode: 0 },
+      outcome: "corroborated_off",
+    },
+    {
+      label: "status timed out",
+      status: { stdout: "", stderr: "timeout", exitCode: 124 },
+      outcome: "save_accepted_inconclusive",
+    },
+    {
+      label: "status unparseable",
+      status: { stdout: "not json\n", exitCode: 0 },
+      outcome: "save_accepted_inconclusive",
+    },
+    {
+      label: "status unknown",
+      status: { stdout: reportLine("status", "unknown", true), exitCode: 0 },
+      outcome: "save_accepted_inconclusive",
+    },
+  ] as const)("B1 disable outcome: $label", async ({ status, outcome }) => {
+    const { hostAppPath, env } = await makeFixture();
+    const observed: string[] = [];
+    const { invoke } = makeInvoker({
+      disable: { stdout: reportLine("disable", "disabled", true), exitCode: 0 },
+      status,
+    });
+
+    const code = await runDisable([], {
+      out: new CaptureStream(),
+      err: new CaptureStream(),
+      env,
+      platform: "darwin",
+      hostAppCandidates: [hostAppPath],
+      hostAppInvoke: invoke,
+      onDisableNePreferenceOutcome: (value) => {
+        observed.push(value);
+      },
+    });
+
+    expect(code).toBe(0);
+    expect(observed).toEqual([outcome]);
+  });
+
   it("disable sends a revoke-flagged lease before claiming fail-open recovery", async () => {
     const { fortressPath, hostAppPath, env } = await makeFixture();
     const out = new CaptureStream();
     const err = new CaptureStream();
     const received: Array<Record<string, unknown>> = [];
+    const outcomes: string[] = [];
     const socketPath = join(fortressPath, "castle.sock");
     const server: Server = createServer((socket) => {
       let buffer = Buffer.alloc(0);
@@ -1098,11 +1144,15 @@ describe("castle-wall enable/disable CLI verbs", () => {
         platform: "darwin",
         hostAppCandidates: [hostAppPath],
         hostAppInvoke: invoke,
+        onDisableNePreferenceOutcome: (value) => {
+          outcomes.push(value);
+        },
       });
 
       expect(code).toBe(0);
       expect(err.text()).toContain("fail-open path is active");
       expect(out.text()).toContain("provider dead-man lease revoked");
+      expect(outcomes).toEqual(["fail_open_deadman"]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

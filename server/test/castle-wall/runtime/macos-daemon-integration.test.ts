@@ -663,6 +663,7 @@ describe("Castle Wall macOS daemon integration", () => {
 
   it("an arm-lease revoke stands the watchdog down (no stall post-revoke); a fresh arm re-engages it (Slice M fix-round MED)", async () => {
     const { fortressPath, masterKey, auditLog } = await provisionFortress();
+    let fakeNowMs = 1_000_000;
     let captured: {
       consumer: MacOSCastleWallListenerOptions["consumer"];
       onArmLease: MacOSCastleWallListenerOptions["onArmLease"];
@@ -676,10 +677,10 @@ describe("Castle Wall macOS daemon integration", () => {
       auditLog,
       platform: "darwin",
       activeConfigPath: activeConfigPath(fortressPath),
-      // Grace window comfortably wider than the audit appends + revoke write
-      // below, so the revoke ALWAYS lands inside the open divergence run
-      // (with a tiny grace the run can mature into a stall before the revoke
-      // is processed, and the test would assert the wrong thing).
+      // Inject time so full-suite scheduling latency cannot age the pre-revoke
+      // divergence past grace before the revoke callback runs. The test controls
+      // when grace elapses below.
+      now: () => fakeNowMs,
       emissionStallGraceMs: 1500,
       emissionLivenessTickSeconds: 0.01,
       listenerFactory(options) {
@@ -714,7 +715,8 @@ describe("Castle Wall macOS daemon integration", () => {
 
     // Well past the grace window + many tick intervals: a deliberately
     // stood-down wall must never mature those decisions into a stall alarm.
-    await wait(2500);
+    // Real time advances here, but fakeNowMs intentionally does not.
+    await wait(100);
     let stalls = (
       await auditLog.query({ layer: "l1", limit: 5000 })
     ).entries.filter((e) => e.operation === "audit_emission_stall");
@@ -732,7 +734,8 @@ describe("Castle Wall macOS daemon integration", () => {
     });
     await consumer.handleFlowDecisionRecorded(malformed);
     await consumer.handleFlowDecisionRecorded(malformed);
-    await wait(2500);
+    fakeNowMs += 1600;
+    await wait(200);
     await handle.stop();
 
     stalls = (

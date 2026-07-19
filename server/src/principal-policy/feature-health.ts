@@ -368,6 +368,11 @@ export type FeatureHealthBasis =
   // forger cannot use it to mute a real alarm into green - only into this
   // non-green `unknown`.
   | "intentionally_stopped"
+  // A Castle Wall heartbeat producer was seen in the digest, but a would-be
+  // fresh enforcement reading has no fresh heartbeat alongside it. This is not
+  // enough to assert "not filtering"; it is also not enough for point-in-time
+  // green. Demote to unknown until liveness is observed again.
+  | "daemon_liveness_unconfirmed"
   | "no_activity_event_driven"
   // Observability (event-floor slice): an event-driven feature WITH an OPT-IN,
   // operator-declared expectation floor whose activity in the window met or
@@ -1299,9 +1304,29 @@ export function evaluateFeatureHealth(args: {
       // closed to `unknown`.
       status = "unknown";
       basis = "freshness_scan_incomplete";
+    } else if (
+      latestFreshInvocationMs !== null &&
+      latestStandDownMs !== null &&
+      latestStandDownMs >= latestFreshInvocationMs
+    ) {
+      // PRESENCE-THEN-STAND-DOWN case: a newer intentional stop/disarm beats
+      // older fresh adjudication evidence. The older flow still happened, but it
+      // cannot support a point-in-time green claim after the wall was stood down.
+      status = "unknown";
+      basis = "intentionally_stopped";
+    } else if (
+      latestFreshInvocationMs !== null &&
+      heartbeatProducerWasRunning &&
+      !hasFreshHeartbeat
+    ) {
+      // PRESENCE-BUT-NO-LIVENESS case: this digest proves the daemon has a
+      // heartbeat producer, but no fresh heartbeat accompanies the would-be
+      // green adjudication. Do not assert green from a prior instance's bounded
+      // evidence while the producer is silent.
+      status = "unknown";
+      basis = "daemon_liveness_unconfirmed";
     } else if (latestFreshInvocationMs !== null) {
-      // PRESENCE case: fresh live-adjudication evidence. Green. A heartbeat never
-      // changes this branch (it cannot upgrade or downgrade real adjudication).
+      // PRESENCE case: fresh live-adjudication evidence. Green.
       status = "active";
       basis = "fresh_enforcement_evidence";
     } else if (hasFreshHeartbeat) {

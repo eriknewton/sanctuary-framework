@@ -98,6 +98,21 @@ export interface ProvisionFlowContext {
   fineGrainedDeclared?: boolean;
 }
 
+export type DisarmNePreferenceOutcome =
+  | "corroborated_off"
+  | "save_accepted_inconclusive"
+  | "fail_open_deadman";
+
+function disarmOutcomeObservedOff(outcome: DisarmNePreferenceOutcome): boolean {
+  return outcome === "corroborated_off";
+}
+
+function disarmOutcomeAllowsFreshDaemonTeardown(
+  outcome: DisarmNePreferenceOutcome,
+): boolean {
+  return outcome !== "fail_open_deadman";
+}
+
 /** The injected, side-effecting steps. Each corresponds to one stage of the target flow. */
 export interface ProvisionFlowOps {
   /** Ask the single "proceed? [y/N]" question. Only called when `isTty` is true. */
@@ -259,21 +274,18 @@ export interface ProvisionFlowOps {
    * freshly-installed policy daemon down.
    *
    * THROWS when the disarm hard-fails (the dead-man lever itself failed).
-   * On success (no throw) it returns `neConfirmedOff`:
-   *   - `true`  -> the NE preference was AFFIRMATIVELY saved OFF (confirmed, or
-   *     saved-disabled with only inconclusive corroboration -- the save is
-   *     authoritative). Safe to remove a freshly-installed policy daemon.
-   *   - `false` -> the disable did NOT confirm the NE preference is off (the
-   *     fail-open-after-lease-revoke sub-case: the provider is fail-OPEN now, so
-   *     it is NOT enforcing, but the NE preference may STILL be enabled and a
-   *     reboot could come up enabled with no daemon = deny-all). Must be treated
-   *     exactly like a disarm that could not confirm: leave the daemon UP.
-   *
-   * IMPORTANT: a non-throwing disarm guarantees the filter is NOT ENFORCING
-   * right now; it does NOT by itself guarantee the NE preference is off -- that
-   * is exactly what `neConfirmedOff` distinguishes.
+   * On success (no throw) it returns a three-way NE preference outcome:
+   *   - `corroborated_off` -> a status re-read observed disabled. This is the
+   *     ONLY outcome that may become a user-facing observed-off claim.
+   *   - `save_accepted_inconclusive` -> the save-disabled mutation returned ok,
+   *     but the status re-read did not observe disabled. This is usable as a
+   *     rollback control-flow result, never as an observation.
+   *   - `fail_open_deadman` -> the disable save did NOT complete, but the
+   *     authenticated dead-man lease revoke made the provider fail open now.
+   *     The NE preference may still be enabled and a reboot could come up
+   *     enabled with no daemon = deny-all; leave the daemon UP.
    */
-  disarm(): Promise<{ neConfirmedOff: boolean }>;
+  disarm(): Promise<{ nePreferenceOutcome: DisarmNePreferenceOutcome }>;
   /**
    * Restore re-home from backup, used on a fail-closed abort between create
    * and arm. FIX F2/F5 (2026-07-07 fix-round): returns whether the restore
@@ -922,14 +934,11 @@ export async function runProvisionFlow(
     // CONFIRMS the NE preference is off. Order is ALWAYS filter-off THEN
     // daemon-down.
     //
-    // P1 refinement: a non-throwing disarm guarantees the filter is not
-    // ENFORCING now, but NOT that the NE preference is off. The
-    // fail-open-after-lease-revoke sub-case returns success while the NE
-    // preference may STILL be enabled -- removing the daemon there risks a
-    // reboot-brick (the provider could come up enabled + no daemon = deny-all).
-    // So the teardown condition is `neConfirmedOff === true`, never merely
-    // "disarm did not throw". Both a throw AND a non-throwing-but-not-confirmed
-    // disarm leave the daemon UP + set wallMayBeArmed.
+    // P1 refinement: a non-throwing disarm can still be either a save-accepted
+    // result or the fail-open-after-lease-revoke sub-case. The latter may leave
+    // the NE preference enabled; removing the daemon there risks a reboot-brick
+    // (provider enabled + no daemon = deny-all). Teardown therefore depends on
+    // the explicit disable outcome, not merely "disarm did not throw."
     let tearDownPolicyDaemon = false;
     let wallMayBeArmed = false;
     let disarmObservedOff = false;
@@ -937,16 +946,14 @@ export async function runProvisionFlow(
     if (policyDaemonFreshlyInstalled) {
       try {
         const disarmResult = await ops.disarm();
-        if (disarmResult.neConfirmedOff) {
-          // NE preference AFFIRMATIVELY off (saved disabled -- confirmed, or
-          // saved with inconclusive corroboration where the save is
-          // authoritative). Safe to tear the fresh daemon down. Note the wall
-          // was disarmed during rollback so the operator can confirm -- not a
-          // bare "nothing happened" clean rollback.
+        if (disarmOutcomeAllowsFreshDaemonTeardown(disarmResult.nePreferenceOutcome)) {
           tearDownPolicyDaemon = true;
-          disarmObservedOff = true;
-          disarmNote =
-            "The content filter was disarmed as part of this rollback; confirm it is off with 'sanctuary castle-wall status'.";
+          disarmObservedOff = disarmOutcomeObservedOff(
+            disarmResult.nePreferenceOutcome,
+          );
+          disarmNote = disarmObservedOff
+            ? "The content filter was observed disabled as part of this rollback; confirm current state with 'sanctuary castle-wall status'."
+            : "The content-filter disable save was accepted during rollback, but status corroboration was inconclusive; observe live state before relying on it.";
         } else {
           // Disarm succeeded as a dead-man lever (not ENFORCING now) but did NOT
           // confirm the NE preference is off (fail-open after lease revoke). The
@@ -956,7 +963,7 @@ export async function runProvisionFlow(
           // and surface loudly.
           wallMayBeArmed = true;
           disarmNote =
-            "disarm reported success as a dead-man lever but did NOT confirm the NE preference is off (fail-open after lease revoke); the wall may still be enabled at the preference level";
+            "disarm reported success as a dead-man lever but did NOT save the NE preference disabled (fail-open after lease revoke); the wall may still be enabled at the preference level";
         }
       } catch (disarmErr) {
         // Disarm hard-failed: it could NOT confirm the filter is off. Do NOT
@@ -1032,7 +1039,9 @@ export async function runProvisionFlow(
     let disarmObservedOff: boolean;
     try {
       const disarmResult = await ops.disarm();
-      disarmObservedOff = disarmResult.neConfirmedOff;
+      disarmObservedOff = disarmOutcomeObservedOff(
+        disarmResult.nePreferenceOutcome,
+      );
     } catch (disarmErr) {
       return {
         kind: "armed-rollback-failed",
@@ -1080,7 +1089,9 @@ export async function runProvisionFlow(
     try {
       const disarmResult = await ops.disarm();
       disarmed = true;
-      disarmObservedOff = disarmResult.neConfirmedOff;
+      disarmObservedOff = disarmOutcomeObservedOff(
+        disarmResult.nePreferenceOutcome,
+      );
     } catch (disarmErr) {
       await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
         stage: "post-arm-as-uid-verify",

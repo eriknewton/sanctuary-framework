@@ -14,10 +14,14 @@ import {
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   CASTLE_WALL_LIVENESS_OPERATIONS,
   CASTLE_WALL_NOT_ENFORCING_OPERATIONS,
+  CASTLE_WALL_STAND_DOWN_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
 } from "../../src/principal-policy/posture.js";
-import { CASTLE_WALL_HEARTBEAT_OPERATION } from "../../src/castle-wall/constants.js";
+import {
+  CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
+} from "../../src/castle-wall/constants.js";
 import { ENFORCEMENT_EVIDENCE_EVENT_TYPES } from "../../src/castle-wall/runtime/audit-consumer.js";
 
 const FORTRESS = "fortress:test";
@@ -285,6 +289,17 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     }
   });
 
+  it("B2: the stand-down set includes the CLI disarm record and stays disjoint", () => {
+    expect([...CASTLE_WALL_STAND_DOWN_OPERATIONS].sort()).toEqual(
+      ["arm_lease_revoked", "filter_stopped", "wall_disarmed"].sort(),
+    );
+    for (const op of CASTLE_WALL_STAND_DOWN_OPERATIONS) {
+      expect(CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op)).toBe(false);
+      expect(CASTLE_WALL_LIVENESS_OPERATIONS.has(op)).toBe(false);
+      expect(CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op)).toBe(false);
+    }
+  });
+
   it("renders DEGRADED on fresh not-enforcing evidence (e.g. provider_unbound)", async () => {
     const { log } = newAuditLog();
     const now = Date.now();
@@ -311,6 +326,72 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       now,
     });
     expect(posture.arm_state).toBe("armed");
+  });
+
+  it("B2: fresher not-enforcing evidence demotes older fresh enforcement", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_blocked", new Date(now - 120_000).toISOString());
+    await appendCW(log, "provider_unbound", new Date(now - 30_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("degraded");
+    expect(posture.evidence_basis).toBe("not_enforcing_evidence");
+  });
+
+  it("B2: fresher wall_disarmed demotes older fresh enforcement", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, CASTLE_WALL_HEARTBEAT_OPERATION, new Date(now - 5 * 60_000).toISOString());
+    await appendCW(log, "egress_allowed", new Date(now - 4 * 60_000).toISOString());
+    await appendCW(log, "wall_disarmed", new Date(now - 60_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("intentionally_stopped");
+  });
+
+  it("B2: fresher arm lease revoke demotes older fresh enforcement", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, CASTLE_WALL_HEARTBEAT_OPERATION, new Date(now - 5 * 60_000).toISOString());
+    await appendCW(log, "egress_allowed", new Date(now - 4 * 60_000).toISOString());
+    await appendCW(
+      log,
+      CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+      new Date(now - 60_000).toISOString(),
+    );
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("intentionally_stopped");
+  });
+
+  it("B2: a previously-seen heartbeat producer with no fresh heartbeat cannot leave older adjudication green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, CASTLE_WALL_HEARTBEAT_OPERATION, new Date(now - 20 * 60_000).toISOString());
+    await appendCW(log, "egress_allowed", new Date(now - 9 * 60_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("daemon_liveness_unconfirmed");
   });
 
   it("never renders armed when the audit read is tainted, even with fresh enforcement evidence", async () => {

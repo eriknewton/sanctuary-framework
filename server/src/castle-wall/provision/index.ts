@@ -75,6 +75,7 @@ export type { HarnessArgvOps, ResolvedHarnessArgv } from "./harness-argv.js";
 
 export { runProvisionFlow } from "./orchestrate.js";
 export type {
+  DisarmNePreferenceOutcome,
   ProvisionFlowContext,
   ProvisionFlowOps,
   ProvisionFlowOutcome,

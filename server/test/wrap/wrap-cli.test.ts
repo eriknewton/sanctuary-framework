@@ -341,7 +341,7 @@ describe("formatWrapSuccess", () => {
       outcome: {
         kind: "aborted",
         stage: "arm",
-        reason: "arm failed and disarm confirmed off",
+        reason: "arm failed and disarm observed off",
         rolledBack: true,
         disarmObservedOff: true,
       },
@@ -363,6 +363,26 @@ describe("formatWrapSuccess", () => {
       outcome: { kind: "armed", uid: 503 },
     });
     expect(protection).toBeUndefined();
+  });
+
+  it("armed-exclusive-repark-failed is unknown until the probe observes live enforcement", () => {
+    const protection = protectionClaimFromAutoProvisionSummary({
+      ran: true,
+      outcome: {
+        kind: "armed-exclusive-repark-failed",
+        uid: 503,
+        generationId: 9,
+        reparkError: "launchctl disable failed",
+      },
+    });
+    expect(protection?.state).toBe("unknown");
+    expect(protection?.basis).toBe("exclusive_egress_repark_failed");
+    const out = formatWrapSuccess({
+      ...baseInfo,
+      castleWallProtectionClaim: protection!,
+    });
+    expect(out).not.toContain("Castle Wall Full");
+    expect(out).toContain("exclusive-egress boot re-park is not confirmed");
   });
 
   it("drill run 3: bring-up abort needs a fresh probe before any coarse-only claim", () => {

@@ -147,6 +147,23 @@ async function appendChannelHeartbeat(log: AuditLog, tsMs: number): Promise<void
   });
 }
 
+async function appendCW(
+  log: AuditLog,
+  operation: string,
+  tsMs: number,
+): Promise<void> {
+  await log.appendCritical({
+    layer: "l1",
+    operation,
+    identity_id: FORTRESS,
+    result: "success",
+    timestamp: new Date(tsMs).toISOString(),
+    details: {
+      [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    },
+  });
+}
+
 /**
  * A GENUINE intentional stand-down, the SHAPE THE REAL PRODUCER EMITS: a direct
  * channel-basis append carrying the `cw_source` marker and NO producer
@@ -214,9 +231,9 @@ async function appendForgedSignedStandDown(
 }
 
 describe("Slice 2 false-RED fix — stand-down op set is honest and disjoint", () => {
-  it("the stand-down set is filter_stopped + arm_lease_revoked", () => {
+  it("the stand-down set is filter_stopped + arm_lease_revoked + wall_disarmed", () => {
     expect([...CASTLE_WALL_STAND_DOWN_OPERATIONS].sort()).toEqual(
-      ["arm_lease_revoked", "filter_stopped"].sort(),
+      ["arm_lease_revoked", "filter_stopped", "wall_disarmed"].sort(),
     );
     expect(CASTLE_WALL_STAND_DOWN_OPERATIONS.has(CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION)).toBe(
       true,
@@ -229,6 +246,44 @@ describe("Slice 2 false-RED fix — stand-down op set is honest and disjoint", (
       expect(CASTLE_WALL_LIVENESS_OPERATIONS.has(op)).toBe(false);
       expect(CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op)).toBe(false);
     }
+  });
+});
+
+describe("B2 false-green fix — newer stand-down beats older fresh enforcement", () => {
+  for (const op of [
+    "filter_stopped",
+    "wall_disarmed",
+    CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+  ] as const) {
+    it(`${op} after egress_allowed demotes active to intentionally_stopped`, async () => {
+      const log = newLog();
+      await appendChannelHeartbeat(log, NOW - 5 * 60_000);
+      await appendCW(log, "egress_allowed", NOW - 4 * 60_000);
+      await appendChannelStandDown(log, op, NOW - 60_000);
+      const panel = await buildFeatureHealthPanel({
+        auditLog: log,
+        originMachine: FORTRESS,
+        now: NOW,
+      });
+      const cw = cwRow(panel);
+      expect(cw.status).toBe("unknown");
+      expect(cw.basis).toBe("intentionally_stopped");
+      expect(cw.status).not.toBe("active");
+    });
+  }
+
+  it("a previously-seen heartbeat producer with no fresh heartbeat demotes stale-instance green", async () => {
+    const log = newLog();
+    await appendChannelHeartbeat(log, NOW - 20 * 60_000);
+    await appendCW(log, "egress_allowed", NOW - 9 * 60_000);
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+    });
+    const cw = cwRow(panel);
+    expect(cw.status).toBe("unknown");
+    expect(cw.basis).toBe("daemon_liveness_unconfirmed");
   });
 });
 

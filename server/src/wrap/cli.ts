@@ -108,6 +108,7 @@ import {
   protectionObservationFromFeatureHealth,
   protectionStateAdvice,
   protectionStateClaimFromObservation,
+  type ProtectionFeatureBasis,
   type ProtectionFeatureStatus,
   type ProtectionStateClaim,
   type ProtectionStateObservation,
@@ -1033,9 +1034,11 @@ export type DashboardStarter = (opts: {
  *
  * Known bounded staleness: the feature-health panel treats fresh
  * Castle-Wall-originated adjudicated-flow evidence as current for its bounded
- * freshness window (10 minutes today). This re-reads that evidence at banner
- * time, but it does not prove the daemon is still alive at the exact print
- * instant if a prior daemon died inside that window.
+ * freshness window (10 minutes today). A later `wall_disarmed` /
+ * `filter_stopped` / `arm_lease_revoked` entry now demotes that evidence, and
+ * the banner again requires a daemon that started during this wrap. Residual
+ * bound: adjudicated-flow evidence is still a bounded-window observation, not
+ * a proof of the exact packet-filter state at the print instant.
  */
 type CastleWallFeatureProbeInput =
   | { purpose: "coarse-wall" }
@@ -1044,11 +1047,16 @@ type CastleWallFeatureProbeInput =
       exclusiveEgress: ExclusiveEgressStatus | null;
     };
 
+type CastleWallFeatureProbeResult = {
+  status: ProtectionFeatureStatus | undefined;
+  basis: ProtectionFeatureBasis | undefined;
+};
+
 async function readCastleWallEgressFeatureStatus(
   auditLog: AuditLog,
   storagePath: string,
   input: CastleWallFeatureProbeInput,
-): Promise<ProtectionFeatureStatus | undefined> {
+): Promise<CastleWallFeatureProbeResult> {
   const { buildFeatureHealthPanel } = await import(
     "../principal-policy/feature-health.js"
   );
@@ -1073,8 +1081,8 @@ async function readCastleWallEgressFeatureStatus(
         : {}),
     }),
   );
-  return panel.rows.find((r) => r.feature_id === "castle_wall_egress")
-    ?.status;
+  const row = panel.rows.find((r) => r.feature_id === "castle_wall_egress");
+  return { status: row?.status, basis: row?.basis };
 }
 
 /**
@@ -1091,10 +1099,30 @@ export async function probeCoarseCastleWallEnforcementObserved(
     return (
       (await readCastleWallEgressFeatureStatus(auditLog, storagePath, {
         purpose: "coarse-wall",
-      })) === "active"
+      })).status === "active"
     );
   } catch {
     return false;
+  }
+}
+
+export const WRAP_PROTECTION_PROVIDER_TIMEOUT_MS = 1_500;
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
   }
 }
 
@@ -1102,10 +1130,15 @@ export async function probeCastleWallProtectionClaim(
   auditLog: AuditLog,
   storagePath: string,
   resolveExclusiveEgress: () => Promise<ExclusiveEgressStatus | null>,
+  options: { providerTimeoutMs?: number } = {},
 ): Promise<ProtectionStateClaim> {
   let exclusiveEgress: ExclusiveEgressStatus | null;
   try {
-    exclusiveEgress = await resolveExclusiveEgress();
+    exclusiveEgress = await withTimeout(
+      resolveExclusiveEgress(),
+      options.providerTimeoutMs ?? WRAP_PROTECTION_PROVIDER_TIMEOUT_MS,
+      "exclusive-egress posture provider",
+    );
   } catch (err) {
     return protectionStateClaimFromObservation({
       state: "unknown",
@@ -1116,14 +1149,15 @@ export async function probeCastleWallProtectionClaim(
     });
   }
   try {
-    const castleWallEgressStatus = await readCastleWallEgressFeatureStatus(
+    const castleWallEgress = await readCastleWallEgressFeatureStatus(
       auditLog,
       storagePath,
       { purpose: "protection-claim", exclusiveEgress },
     );
     return protectionStateClaimFromObservation(
       protectionObservationFromFeatureHealth({
-        castleWallEgressStatus,
+        castleWallEgressStatus: castleWallEgress.status,
+        castleWallEgressBasis: castleWallEgress.basis,
         exclusiveEgress,
       }),
     );
@@ -1169,8 +1203,8 @@ function protectionObservationFromAutoProvisionSummary(
       return undefined;
     case "armed-exclusive-repark-failed":
       return {
-        state: "coarse-only",
-        basis: "exclusive_egress_live_repark_failed",
+        state: "unknown",
+        basis: "exclusive_egress_repark_failed",
         reasons: [outcome.reparkError],
       };
     case "exclusive-egress-unarmed-coarse-active":
@@ -1231,16 +1265,16 @@ export function protectionClaimFromAutoProvisionSummary(
 function autoProvisionClaimOverridesProbe(
   claim: ProtectionStateClaim | undefined,
 ): boolean {
-  return (
-    claim?.basis === "disarm_observed_off" ||
-    claim?.basis === "exclusive_egress_live_repark_failed"
-  );
+  return claim?.basis === "disarm_observed_off";
 }
 
-async function resolveWrapProtectionClaim(input: {
+export async function resolveWrapProtectionClaim(input: {
   auditLog: AuditLog | undefined;
   autoProvisionSummary: AutoProvisionSummary;
+  castleWallDaemonStarted?: boolean;
   storagePath: string;
+  providerTimeoutMs?: number;
+  resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
 }): Promise<ProtectionStateClaim> {
   const autoProvisionClaim = protectionClaimFromAutoProvisionSummary(
     input.autoProvisionSummary,
@@ -1252,10 +1286,30 @@ async function resolveWrapProtectionClaim(input: {
       reasons: ["no audit log was available to observe enforcement"],
     });
   }
-  const resolver = await createWrapProtectionResolver(
-    input.auditLog,
-    input.storagePath,
-  );
+  if (input.castleWallDaemonStarted !== true) {
+    return autoProvisionClaim ?? protectionStateClaimFromObservation({
+      state: "unknown",
+      basis: "provider_unavailable",
+      reasons: ["Castle Wall daemon did not start during this wrap"],
+    });
+  }
+  let resolver: (() => Promise<ExclusiveEgressStatus | null>) | undefined;
+  try {
+    resolver =
+      input.resolveExclusiveEgress ??
+      (await createWrapProtectionResolver(
+        input.auditLog,
+        input.storagePath,
+      ));
+  } catch (err) {
+    return autoProvisionClaim ?? protectionStateClaimFromObservation({
+      state: "unknown",
+      basis: "provider_unavailable",
+      reasons: [
+        `exclusive-egress posture provider could not be loaded: ${(err as Error).message}`,
+      ],
+    });
+  }
   if (resolver === undefined) {
     return autoProvisionClaim ?? protectionStateClaimFromObservation({
       state: "unknown",
@@ -1267,6 +1321,7 @@ async function resolveWrapProtectionClaim(input: {
     input.auditLog,
     input.storagePath,
     resolver,
+    { providerTimeoutMs: input.providerTimeoutMs },
   );
   return autoProvisionClaimOverridesProbe(autoProvisionClaim)
     ? autoProvisionClaim!
@@ -2888,6 +2943,7 @@ export async function runWrap(
     const castleWallProtectionClaim = await resolveWrapProtectionClaim({
       auditLog: ndAuditLog,
       autoProvisionSummary,
+      castleWallDaemonStarted: castleWallDaemon !== undefined,
       storagePath,
     });
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
@@ -3232,6 +3288,7 @@ export async function runWrap(
   const castleWallProtectionClaim = await resolveWrapProtectionClaim({
     auditLog: wrapAuditLog,
     autoProvisionSummary,
+    castleWallDaemonStarted: castleWallDaemon !== undefined,
     storagePath,
   });
 
