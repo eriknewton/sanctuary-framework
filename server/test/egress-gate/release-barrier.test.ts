@@ -2,11 +2,19 @@
  * Release-barrier primitives (Unified Protect Slice 5 S5-5): hold-file
  * render/parse, argv digest, wrapper script invariants, barrier plist form,
  * and the parked install (never bootstraps; fails loud on a live harness).
+ *
+ * S5-DRILL 2026-07-18 fix-round adds the two install-path defect classes the
+ * mocked suite could not see: D1, the hold-directory chokepoint, covered
+ * against a REAL filesystem with a directory that does not exist (a test that
+ * only asserted "the mkdir op was called" would reproduce the original blind
+ * spot); and D2, the parked-install stand-down, covered by asserting launchctl
+ * call ORDER (disable strictly before bootout, both before the status
+ * assertion) rather than mere presence.
  */
 
 import { describe, it, expect } from "vitest";
 import { execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync, chmodSync, rmSync, existsSync, statSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, chmodSync, rmSync, statSync, readFileSync } from "node:fs";
 import { chmod, mkdir, rm, writeFile as fsWriteFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -486,9 +494,12 @@ describe("parked install against a REAL, NON-EXISTENT hold directory (drill D1)"
   it("creates the missing hold directory and lands the wrapper 0755 inside it", async () => {
     const tmpRoot = mkdtempSync(join(tmpdir(), "s5-d1-holddir-"));
     try {
-      // Deliberately NOT created: this is the clean-host state.
+      // Deliberately NOT created: this is the clean-host state. Asserted by
+      // statSync THROWING rather than by an existsSync probe -- a
+      // check-then-use pair over a path we later write is the file-system
+      // race shape (CodeQL js/file-system-race), even inside a private tmpdir.
       const holdDir = join(tmpRoot, "var", "db", "sanctuary", "agent-harness");
-      expect(existsSync(holdDir)).toBe(false);
+      expect(() => statSync(holdDir)).toThrow(/ENOENT/);
 
       const realPlan = planParkedHarnessInstall({
         agentAccount: "sanctuary-hermes",
@@ -531,12 +542,16 @@ describe("parked install against a REAL, NON-EXISTENT hold directory (drill D1)"
         },
       );
 
-      // The directory the drill found missing now exists, root-owned-shaped 0755...
-      expect(statSync(holdDir).isDirectory()).toBe(true);
-      expect(statSync(holdDir).mode & 0o777).toBe(AGENT_HARNESS_HOLD_DIR_MODE);
-      // ...and the wrapper is genuinely on disk inside it, executable.
-      expect(existsSync(realPlan.wrapperPath)).toBe(true);
-      expect(statSync(realPlan.wrapperPath).mode & 0o777).toBe(0o755);
+      // The directory the drill found missing now exists, root-owned-shaped 0755.
+      const holdDirStat = statSync(holdDir);
+      expect(holdDirStat.isDirectory()).toBe(true);
+      expect(holdDirStat.mode & 0o777).toBe(AGENT_HARNESS_HOLD_DIR_MODE);
+      // ...and the wrapper is genuinely on disk inside it, executable. The
+      // stat + read below are the existence proof: both THROW if the install
+      // did not land the file, which is precisely the D1 failure mode.
+      const wrapperStat = statSync(realPlan.wrapperPath);
+      expect(wrapperStat.isFile()).toBe(true);
+      expect(wrapperStat.mode & 0o777).toBe(0o755);
       expect(readFileSync(realPlan.wrapperPath, "utf8")).toBe(RELEASE_EXEC_WRAPPER_SCRIPT);
       expect(launchctl.map((a) => a[0])).toEqual(["disable", "bootout"]);
     } finally {
