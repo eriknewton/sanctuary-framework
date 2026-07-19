@@ -1244,12 +1244,22 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
       // `running` with `agentHarnessDaemonStableRunning` -- up to 30 samples
       // at 500ms -- INSIDE `assessHarnessParked`'s own 20-sample settle loop.
       // Over a live harness (the case this probe exists for) that nesting cost
-      // roughly 15-25s per abort, held under the provision lock, for a
-      // refinement that CANNOT change the verdict: the stability downgrade
-      // only ever moves `running` true->false, and a claim with a pid is
-      // `alive` either way. Removed, not merely bounded. `probeHarnessRunning`
-      // keeps the stable-pid bar, which is the right bar for "did it come up?"
-      // and the wrong one for "is it gone?".
+      // roughly 15-25s per abort, held under the provision lock. Removed, not
+      // merely bounded. `probeHarnessRunning` keeps the stable-pid bar, which
+      // is the right bar for "did it come up?" and the wrong one for "is it
+      // gone?".
+      //
+      // FIX-ROUND 6 (the gate's Finding 3): round 5 justified this removal by
+      // claiming it "CANNOT change the verdict", and that argument was WRONG.
+      // For a status that is KNOWN and reports RUNNING with NO pid, the old
+      // wiring downgraded the running flag and the claim came back `parked`;
+      // this one returns `alive`, because `assessHarnessParked` keys on
+      // `running || pid !== undefined`. The verdict does change -- in the
+      // FAIL-CLOSED direction, which is why the removal stands. The honest
+      // statement is "it can only move a claim AWAY from parked", not "it
+      // cannot move a claim". Reachability was checked separately: the two
+      // sites that branch on `claim.state` both use their own unmodified
+      // probes, so no decision reads this one.
       const harnessOps = realHarnessOps();
       return assessHarnessParked({
         probe: {

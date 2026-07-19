@@ -283,3 +283,109 @@ export function harnessDispositionSentence(disposition: HarnessDisposition): str
     ? disposition.sentence
     : disposition.claim.sentence;
 }
+
+// ---------------------------------------------------------------------------
+// THE RECOVERY IMPERATIVE (fix-round 6, 2026-07-19)
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the operator can look, for a recovery instruction that names a place.
+ * Structurally satisfied by `HarnessStandDownSnapshot`, so the revert paths
+ * pass their own snapshot straight through.
+ */
+export interface HarnessRecoveryLocator {
+  readonly plistPath: string;
+  readonly harnessLabel: string;
+}
+
+/**
+ * A run-state SENTENCE plus the recovery INSTRUCTION that follows from it.
+ *
+ * WHY THIS TYPE EXISTS (the round-6 diagnosis, worth stating in full because
+ * five rounds of fixes missed it). Round 4 built the `ParkedClaim` chokepoint
+ * so that a DESCRIPTION of the agent's run state could only come from an
+ * observation. Round 5 threaded a claim into the parked install's own undo.
+ * Round 6's gate then found the eleventh instance of the same defect one hop
+ * away, in a sentence no part of that machinery governed:
+ *
+ *     "This run did NOT bring it back up, and did not verify its run state.
+ *      Re-run 'sudo sanctuary protect --hermes' to bring it back up under the
+ *      previous (coarse) posture."
+ *
+ * ...printed over a harness the run had probed twenty times and observed ALIVE
+ * at pid 9001. The claim was obtained three frames down and DISCARDED at an op
+ * boundary whose result type had no run-state field.
+ *
+ * Two things had gone unnoticed, and this type closes both:
+ *
+ *   1. **An instruction premised on a state is a claim about that state.**
+ *      "Re-run to bring it back up" asserts that there is something down to
+ *      bring up. The run-state prose guard governed only DESCRIPTIONS, so the
+ *      imperative matched no pattern and the build stayed green. The
+ *      imperative now lives HERE, in the sole-owner file, and
+ *      {@link RUN_STATE_PROSE_PATTERNS} covers its phrasings -- so composing
+ *      one anywhere else fails the build.
+ *
+ *   2. **Routing the DECISION is not routing the CLAIM.** The orchestrator's
+ *      outcome chokepoint decided, in one place, whether to restore. What got
+ *      PRINTED about that restore was rebuilt at each consumer. So the advice
+ *      is now a branded value: a consumer receives it or renders nothing, and
+ *      cannot compose a second copy that drifts.
+ *
+ * Consumers print {@link RunStateAdvice.text}. They never branch on
+ * {@link RunStateAdvice.claim} to choose words -- it is exposed so a caller
+ * that needs the STATE (an audit field, a test) has it without re-deriving.
+ */
+export interface RunStateAdvice {
+  readonly [PARKED_CLAIM_BRAND]: true;
+  /** The full operator-facing text: the run-state sentence plus the recovery step. */
+  readonly text: string;
+  /** The observation the text was derived from. */
+  readonly claim: ParkedClaim;
+}
+
+/**
+ * THE SOLE CONSTRUCTOR of run-state advice.
+ *
+ * Takes a {@link ParkedClaim} by value rather than a probe, because the honest
+ * moment to read the harness is after the last restore attempt, which only the
+ * caller knows. It cannot be called without one, which is the point.
+ *
+ * `priorPlistRestored: false` suppresses the "under the previous (coarse)
+ * posture" promise on the parked branch (round-6 gate, Finding 4): a re-run
+ * renders a FRESH coarse plist, and when this run could not put the operator's
+ * prior bytes back, those bytes are gone. Omit it when the caller genuinely
+ * does not know; the neutral wording is used and nothing is promised.
+ */
+export function runStateAdvice(
+  claim: ParkedClaim,
+  context?: {
+    readonly locator?: HarnessRecoveryLocator;
+    readonly priorPlistRestored?: boolean;
+  },
+): RunStateAdvice {
+  const locator = context?.locator;
+  const where =
+    locator !== undefined
+      ? `${locator.plistPath} and 'sudo launchctl print system/${locator.harnessLabel}'`
+      : "the harness plist and its launchd job";
+  let recovery: string;
+  if (claim.state === "parked") {
+    recovery =
+      context?.priorPlistRestored === false
+        ? "Re-run 'sudo sanctuary protect --hermes' to bring it back up -- but NOT under your previous " +
+          "configuration: this run could not put the previous harness plist back, so the re-run renders a " +
+          "fresh coarse plist rather than your prior bytes."
+        : "Re-run 'sudo sanctuary protect --hermes' to bring it back up under the previous (coarse) posture.";
+  } else if (claim.state === "alive") {
+    recovery =
+      `Do NOT re-run 'sudo sanctuary protect --hermes' expecting it to restart the agent: a live process ` +
+      `is there. Inspect ${where} first -- re-running would stand that process down again and hit the same ` +
+      "failure.";
+  } else {
+    recovery =
+      `Establish the harness's state before re-running (${where}): 'sudo sanctuary protect --hermes' ` +
+      "assumes it has to bring the agent up.";
+  }
+  return { text: `${claim.sentence} ${recovery}`, claim } as unknown as RunStateAdvice;
+}

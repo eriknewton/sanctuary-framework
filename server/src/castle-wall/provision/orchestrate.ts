@@ -35,7 +35,8 @@
  */
 
 import type { ProvisionNeedResult } from "./detect.js";
-import type { HarnessDisposition } from "../../egress-gate/parked-claim.js";
+import type { HarnessDisposition, RunStateAdvice } from "../../egress-gate/parked-claim.js";
+import { assessHarnessParked, runStateAdvice } from "../../egress-gate/parked-claim.js";
 import {
   runExclusiveEgressArming,
   type ExclusiveEgressArmOps,
@@ -185,6 +186,16 @@ export interface ProvisionFlowOps {
    * not be restarted, and raised no error printed "was restarted and restored
    * to its previous state" while stopped. Every field here must be a statement
    * about state that was looked at, never about a call that was made.
+   *
+   * FIX-ROUND 6 (2026-07-19): `runState` was the field that did not exist, and
+   * its absence was the eleventh instance of this subsystem's one defect. The
+   * production op ALREADY paid for a full settle loop and received a
+   * `ParkedClaim` reading `alive (pid 9001)` -- then dropped it at this
+   * boundary, because this type had nowhere to put it. `harnessRestoreNote`
+   * then told the operator "this run ... did not verify its run state" and sent
+   * them to re-run over a live agent. Routing the restore DECISION through one
+   * chokepoint did nothing for the SENTENCE printed about it; the claim now
+   * travels too.
    */
   restoreStoodDownHarness(): Promise<{
     /** The pre-run state is genuinely back: plist restored AND the job's run-state matches. */
@@ -194,6 +205,13 @@ export interface ProvisionFlowOps {
     /** OBSERVED running again. Only ever true when a restart was verified. */
     harnessRestarted: boolean;
     problems: string[];
+    /**
+     * The OBSERVED run state plus the recovery step that follows from it.
+     * PRESENT EXACTLY WHEN `runStateOwed({ wasRunning, harnessRestarted })`.
+     * Branded: only `runStateAdvice` in the parked-claim chokepoint can build
+     * one, so no consumer here can compose a second copy of this advice.
+     */
+    runState?: RunStateAdvice;
   }>;
   /**
    * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
@@ -585,12 +603,7 @@ export async function runProvisionFlow(
   if (!standDown.owed || OUTCOMES_THAT_OWN_THE_HARNESS.has(outcome.kind)) {
     return outcome;
   }
-  const restore = await ops.restoreStoodDownHarness().catch((err: unknown) => ({
-    restored: false,
-    wasRunning: true,
-    harnessRestarted: false,
-    problems: [err instanceof Error ? err.message : String(err)],
-  }));
+  const restore = await restoreStoodDownHarnessOrWeakenedClaim(ops);
   const note = harnessRestoreNote(restore, outcome.kind);
   if (!("reason" in outcome) || typeof outcome.reason !== "string") {
     // FIX-ROUND 2 (MED): the restore DECISION defaults to safe (an allow-list
@@ -609,10 +622,42 @@ export async function runProvisionFlow(
 /** Best-effort restore on the throw path; the original error must win. */
 async function restoreStoodDownHarnessQuietly(ops: ProvisionFlowOps): Promise<void> {
   try {
-    const restore = await ops.restoreStoodDownHarness();
-    ops.print(harnessRestoreNote(restore, "aborted"));
+    ops.print(harnessRestoreNote(await restoreStoodDownHarnessOrWeakenedClaim(ops), "aborted"));
   } catch {
     // The caller is already propagating a more important failure.
+  }
+}
+
+/**
+ * The restore op, with a THROWN op turned into an explicitly WEAKENED claim
+ * rather than into silence (fix-round 6).
+ *
+ * The old fallback synthesized `{ restored: false, wasRunning: true }` and
+ * nothing else. Under the invariant `runStateOwed` states, that shape OWES the
+ * operator a run-state sentence and had none to give -- so the renderer had no
+ * choice but to invent one, which is exactly how the eleventh instance got
+ * written. An op that threw is the textbook `cannotProbe` case: the claim says
+ * what was NOT observed, and the advice that follows tells the operator to
+ * establish the state themselves rather than to assume the agent is down.
+ */
+async function restoreStoodDownHarnessOrWeakenedClaim(
+  ops: ProvisionFlowOps,
+): Promise<Awaited<ReturnType<ProvisionFlowOps["restoreStoodDownHarness"]>>> {
+  try {
+    return await ops.restoreStoodDownHarness();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      restored: false,
+      wasRunning: true,
+      harnessRestarted: false,
+      problems: [message],
+      runState: runStateAdvice(
+        await assessHarnessParked({
+          cannotProbe: `the restore operation itself failed before any run-state read (${message})`,
+        }),
+      ),
+    };
   }
 }
 
@@ -646,16 +691,43 @@ const OUTCOMES_THAT_KEEP_THE_REHOME: ReadonlySet<string> = new Set(["armed-rollb
  * is the weakened form: it now states only what this RUN did, and makes no
  * assertion about whether a process is alive. A caller that needs the run
  * state must obtain a `ParkedClaim` from `assessHarnessParked`.
+ *
+ * FIX-ROUND 6 found that the weakened form was not the end of it. The failed-
+ * restore branch went on to say "and did not verify its run state" and to
+ * instruct "Re-run ... to bring it back up" -- over a harness the run HAD
+ * verified, across twenty samples, as alive at pid 9001. The observation was
+ * discarded one frame away at the op boundary. Two lessons are encoded here:
+ *
+ *   - A weakened claim states what was NOT observed. "Did not verify its run
+ *     state" states that no observation OCCURRED, which is a different and
+ *     falsifiable thing -- and it was false.
+ *   - An IMPERATIVE premised on a state is a claim about that state. This
+ *     function no longer composes one. Where a run state is owed it prints the
+ *     branded `RunStateAdvice` the op observed; where none is owed it makes no
+ *     run-state claim and issues no run-state instruction.
  */
 function harnessRestoreNote(
-  restore: { restored: boolean; wasRunning: boolean; harnessRestarted: boolean; problems: string[] },
+  restore: {
+    restored: boolean;
+    wasRunning: boolean;
+    harnessRestarted: boolean;
+    problems: string[];
+    runState?: RunStateAdvice;
+  },
   outcomeKind: string,
 ): string {
   if (!restore.restored) {
+    // `runState` is absent EXACTLY when none is owed -- i.e. nothing was
+    // running before this run, so there is no "bring it back up" to give and
+    // saying otherwise would be the same defect in the opposite direction.
+    const advice =
+      restore.runState !== undefined
+        ? restore.runState.text
+        : "Nothing was running before this run began, so no restart is owed; resolve the problem(s) above " +
+          "before re-running 'sudo sanctuary protect --hermes'.";
     return (
       `The agent harness this run stood down could NOT be fully restored: ${restore.problems.join("; ")}. ` +
-      "This run did NOT bring it back up, and did not verify its run state. Re-run " +
-      "'sudo sanctuary protect --hermes' to bring it back up under the previous (coarse) posture."
+      advice
     );
   }
   const what = restore.harnessRestarted

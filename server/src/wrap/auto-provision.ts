@@ -77,6 +77,7 @@ import {
 import {
   planParkedHarnessInstall,
   executeParkedHarnessInstall,
+  projectRevertToRestoreReport,
   revertParkedHarnessInstall,
   type HarnessStandDownSnapshot,
   type ParkedInstallRevertOps,
@@ -1269,7 +1270,6 @@ export async function runAutoProvisionForWrap(
         // orchestrator's wording keys on: no restart was needed, none happened.
         return { restored: true, wasRunning: false, harnessRestarted: false, problems: [] };
       }
-      const result = await revertParkedHarnessInstall(snapshot, realParkedInstallRevertOps(realHarnessDaemonOps()));
       // Fix-round 2 (2026-07-18): pass the OBSERVED verdict straight through.
       // This used to be `result.errors.length === 0` -- a statement about how
       // quietly the revert failed. `revertParkedHarnessInstall` now derives
@@ -1277,12 +1277,16 @@ export async function runAutoProvisionForWrap(
       // again, or never running), so a stopped agent can no longer be reported
       // as restored. `harnessRestarted` reaches the operator-facing wording
       // instead of being discarded here.
-      return {
-        restored: result.restored,
-        wasRunning: result.wasRunning,
-        harnessRestarted: result.harnessRestarted,
-        problems: result.errors,
-      };
+      //
+      // FIX-ROUND 6 (2026-07-19): this used to be a hand-rolled object literal
+      // listing four of the five fields, and the one it omitted was the
+      // OBSERVED run-state claim -- the eleventh instance of the subsystem's
+      // one defect. The projection is now a single shared function next to the
+      // type it projects, so the claim cannot be dropped by a caller who did
+      // not know it was there.
+      return projectRevertToRestoreReport(
+        await revertParkedHarnessInstall(snapshot, realParkedInstallRevertOps(realHarnessDaemonOps())),
+      );
     },
     // Bug B (the one-flow gap): ensure a reachable Castle Wall POLICY daemon for
     // the target fortress BEFORE arming. Arming with no policy daemon deny-all-

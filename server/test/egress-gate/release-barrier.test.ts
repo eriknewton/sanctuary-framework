@@ -1128,8 +1128,15 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     // FIX-ROUND 5: the run-state half of that sentence used to be "is STOPPED
     // now", derived from control flow. It is now the chokepoint's, from an
     // observation of the modelled launchd state (here: genuinely stopped).
-    expect(result.runState?.state).toBe("parked");
-    expect(result.errors.join(" ")).toContain(result.runState!.sentence);
+    expect(result.runState?.claim.state).toBe("parked");
+    // FIX-ROUND 6 (gate Finding 5): the sentence used to be appended to
+    // `errors` AS WELL as opening the advice, so every renderer printed it
+    // twice. The error now says what this run DID; the advice says what the
+    // agent IS, exactly once.
+    expect(result.errors.join(" ")).not.toContain(result.runState!.claim.sentence);
+    expect(result.runState!.text).toContain(result.runState!.claim.sentence);
+    // ...and the operator still gets their recovery step over an observed park.
+    expect(result.runState!.text).toMatch(/to bring it back up/);
   });
 
   // ---------------------------------------------------------------- ROUND 5
@@ -1159,14 +1166,18 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     expect(result.restored).toBe(false);
     expect(result.harnessRestarted).toBe(false);
     // The claim is an OBSERVATION, and the observation disqualifies the park.
-    expect(result.runState?.state).toBe("alive");
-    expect(result.runState?.sentence).toContain("9001");
+    expect(result.runState?.claim.state).toBe("alive");
+    expect(result.runState?.claim.sentence).toContain("9001");
     // The live process was actually read, not assumed away.
     expect(log.statusCalls).toBeGreaterThan(0);
-    // Nothing anywhere in this result says the agent is down.
-    const rendered = `${result.errors.join(" ")} ${result.runState?.sentence ?? ""}`;
+    // Nothing anywhere in this result says the agent is down, and nothing in
+    // it TELLS THE OPERATOR TO BRING IT UP (fix-round 6: the imperative is the
+    // half that survived five rounds of fixing the description).
+    const rendered = `${result.errors.join(" ")} ${result.runState?.text ?? ""}`;
     expect(rendered).not.toMatch(/is stopped/i);
     expect(rendered).not.toMatch(/is parked/i);
+    expect(rendered).not.toMatch(/to bring it back up/i);
+    expect(rendered).toMatch(/Do NOT re-run/);
   });
 
   it("R5: the install's own abort over a live pid 9001 never says STOPPED and never says 'bring it back up'", async () => {
@@ -1235,6 +1246,14 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
       {
         name: "clean host",
         snapshot: { ...runningSnapshot, wasRunning: false, preexistingJobModified: false },
+      },
+      // FIX-ROUND 6: the clean-host branch used to HARDCODE `wasRunning: false`
+      // and so could never owe a claim, whatever it was handed. Production
+      // cannot reach it with a running job, but an exported helper that
+      // normalizes its input away is the shape that suppresses an owed probe.
+      {
+        name: "clean host handed a RUNNING snapshot (production-unreachable, still honest)",
+        snapshot: { ...runningSnapshot, wasRunning: true, preexistingJobModified: false },
       },
     ];
     for (const { name, snapshot, restartError } of cases) {

@@ -254,6 +254,68 @@ describe("claim register: the literal ratchet", () => {
     ).toEqual([]);
   });
 
+  it("R6: the guard catches an IMPERATIVE that asserts run state without describing it", () => {
+    // FIX-ROUND 6, the gate's Finding 1. Round 5 closed the case-folding gap
+    // and predicted the class was now "the build fails". An eleventh instance
+    // shipped anyway, and this is why: BOTH of the last two instances were
+    // IMPERATIVES, and every pattern round 4 wrote governs a DESCRIPTION. The
+    // round-6 HIGH matched none of the nine patterns while being the sentence
+    // that actually sends an operator to stand a live agent down.
+    //
+    // These are the ACTUAL strings, verbatim from the sites they printed at.
+    const evasions: Array<[string, string]> = [
+      [
+        "the round-6 HIGH, orchestrate.ts:657 verbatim",
+        'const s = "This run did NOT bring it back up, and did not verify its run state. Re-run " +\n' +
+          '  "\'sudo sanctuary protect --hermes\' to bring it back up under the previous (coarse) posture.";',
+      ],
+      [
+        "the round-5 HIGH's imperative half, with no description at all",
+        "const s = `Re-run 'sudo sanctuary protect --hermes' to bring it back up.`;",
+      ],
+      [
+        "the alive-branch imperative",
+        'const s = "expecting it to restart the agent: a live process is there";',
+      ],
+      [
+        "the unknown-branch imperative",
+        'const s = "assumes it has to bring the agent up";',
+      ],
+    ];
+    for (const [name, source] of evasions) {
+      expect(scanRunStateProse("synthetic.ts", source), `${name} must be caught`).not.toEqual([]);
+    }
+
+    // THE NARROWNESS BOUND, asserted rather than asserted-about. Ordinary
+    // re-run advice that makes NO run-state claim must stay legal, or the
+    // guard gets exempted into uselessness at the six honest `wrap/cli.ts`
+    // sites that give it.
+    const legitimate: Array<[string, string]> = [
+      [
+        "a connectivity re-check failure",
+        "const s = `Re-run 'sanctuary protect --hermes' once the connectivity re-check passes.`;",
+      ],
+      [
+        "an unreconciled file",
+        "const s = `Reconcile the file(s) above, then re-run 'sanctuary protect --hermes'.`;",
+      ],
+      [
+        "what THIS RUN did, which is not a claim about the process",
+        'const s = "coarse harness start failed (this run did not start the agent)";',
+      ],
+    ];
+    for (const [name, source] of legitimate) {
+      expect(scanRunStateProse("synthetic.ts", source), `${name} must stay legal`).toEqual([]);
+    }
+    expect(
+      scanRunStateProse(
+        "synthetic.ts",
+        "/** Returns whether the agent is PARKED (not running) on this host. */\nexport const x = 1;",
+      ),
+      "doc comments must stay free to discuss parking in plain English",
+    ).toEqual([]);
+  });
+
   it("does not silently lose a tracked file", () => {
     for (const file of Object.keys(CLAIM_LITERAL_COUNTS)) {
       expect(() => readSource(file), `${file} is tracked but unreadable`).not.toThrow();

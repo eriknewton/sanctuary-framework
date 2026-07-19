@@ -10,6 +10,42 @@ import { describe, it, expect, vi } from "vitest";
 import { runProvisionFlow, type ProvisionFlowContext, type ProvisionFlowOps } from "../../../src/castle-wall/provision/orchestrate.js";
 import type { ProvisionNeedResult } from "../../../src/castle-wall/provision/detect.js";
 import type { RehomeStepResult } from "../../../src/castle-wall/provision/rehome.js";
+import {
+  assessHarnessParked,
+  runStateAdvice,
+  type RunStateAdvice,
+} from "../../../src/egress-gate/parked-claim.js";
+import {
+  projectRevertToRestoreReport,
+  revertParkedHarnessInstall,
+  runStateOwed,
+  type ParkedInstallRevertOps,
+} from "../../../src/egress-gate/release-barrier.js";
+import type { HarnessDaemonStatus } from "../../../src/egress-gate/harness-daemon.js";
+
+const HARNESS_LOCATOR = {
+  plistPath: "/Library/LaunchDaemons/ai.sanctuaryprotocol.agent-harness.plist",
+  harnessLabel: "ai.sanctuaryprotocol.agent-harness",
+};
+
+/**
+ * Build a run-state advice the way production must: through the chokepoint.
+ *
+ * FIX-ROUND 6. These tests cannot hand-roll one -- `RunStateAdvice` is branded
+ * and `runStateAdvice` is its sole constructor -- which is deliberate. The
+ * eleventh instance of this subsystem's defect existed precisely because the
+ * op boundary let a caller render run-state prose with NO claim in hand. A
+ * test that could fake one would be pinning the same hole.
+ */
+async function observedRunState(status: HarnessDaemonStatus): Promise<RunStateAdvice> {
+  const claim = await assessHarnessParked({
+    probe: { harnessStatus: async () => status, sleepMs: async () => {} },
+  });
+  return runStateAdvice(claim, { locator: HARNESS_LOCATOR });
+}
+
+const PARKED_STATUS: HarnessDaemonStatus = { known: true, installed: true, running: false };
+const LIVE_STATUS: HarnessDaemonStatus = { known: true, installed: true, running: true, pid: 9001 };
 
 const CEILING = 500;
 const AGENT_UID = 502;
@@ -1403,7 +1439,14 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
     });
 
-    it("a FAILED restore is LOUD: names the agent as stopped and gives a command, never a silent omission", async () => {
+    it("a FAILED restore is LOUD: it prints the OBSERVED run state and the recovery step that follows from it", async () => {
+      // FIX-ROUND 6. This test used to be titled "names the agent as stopped
+      // and gives a command" and pinned the sentence "This run did NOT bring
+      // it back up, and did not verify its run state" plus an unconditional
+      // "re-run protect --hermes". Round 4 had already stopped the note naming
+      // the agent as stopped; the title and the ungated command survived, and
+      // the round-6 gate reproduced that exact pair being printed over a
+      // harness the run had observed ALIVE. The note is now the observation.
       const ops = stoodDownOps({
         arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
         restoreStoodDownHarness: vi.fn(async () => ({
@@ -1411,16 +1454,164 @@ describe("castle-wall/provision/orchestrate", () => {
           wasRunning: true,
           harnessRestarted: false,
           problems: ["launchctl bootstrap exited 5"],
+          runState: await observedRunState(PARKED_STATUS),
         })),
       });
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       const reason = String((result as { reason: string }).reason);
       expect(reason).toMatch(/could NOT be fully restored/);
       expect(reason).toMatch(/launchctl bootstrap exited 5/);
-      expect(reason).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
-      expect(reason).toMatch(/sanctuary protect --hermes/);
+      // The run state is the OBSERVED one, and the recovery step follows from
+      // it: over a genuine park, "bring it back up" is the right instruction.
+      expect(reason).toMatch(/The agent is PARKED \(not running\)/);
+      expect(reason).toMatch(/to bring it back up/);
+      // ...and the claim the round-6 gate falsified is gone for good.
+      expect(reason).not.toMatch(/did not verify its run state/i);
       // The ORIGINAL abort reason is never displaced by the cleanup note.
       expect(reason).toMatch(/castle-wall enable exited 1/);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // FIX-ROUND 6 (2026-07-19) -- THE ELEVENTH INSTANCE.
+    //
+    // The caller-side chokepoint routed the restore DECISION to one place and
+    // rebuilt the CLAIM at each consumer. The production op spent a full
+    // 20-sample settle loop, received `alive (pid 9001)`, and DISCARDED it at
+    // the op boundary, whose result type had no run-state field -- after which
+    // this note told the operator the run "did not verify its run state" and
+    // sent them to re-run over the live agent.
+    //
+    // These assert on the RENDERED operator message, driven through the real
+    // flow, over a modelled harness that is alive on every sample.
+    // ────────────────────────────────────────────────────────────────────
+
+    it("R6: an OBSERVED LIVE harness is never described as unverified, and never draws a bring-it-back-up", async () => {
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["the agent harness was stopped by this run and could NOT be restarted: bootstrap exited 5"],
+          runState: await observedRunState(LIVE_STATUS),
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+
+      // 1. The falsehood: an observation DID occur, so the run may not say none did.
+      expect(reason, "the round-6 HIGH").not.toMatch(/did not verify its run state/i);
+      // 2. The imperative: following it stands a live agent down again.
+      expect(reason, "the round-5 HIGH's imperative, at the sibling site").not.toMatch(
+        /to bring it back up/i,
+      );
+      // 3. What the operator gets instead: the observation, and advice premised on it.
+      expect(reason).toMatch(/The agent is RUNNING \(pid 9001\)/);
+      expect(reason).toMatch(/Do NOT re-run/);
+      // The original abort still wins the message.
+      expect(reason).toMatch(/castle-wall enable exited 1/);
+    });
+
+    it("R6: the REAL revert's observed claim survives the production op projection end to end", async () => {
+      // The gate's probes K + K2, as a regression test. K drove the REAL
+      // `revertParkedHarnessInstall` over a crash-loop survivor (launchd
+      // returns pid 9001 on every sample) and showed the claim being dropped
+      // by the projection at `wrap/auto-provision.ts`; K2 fed that projection
+      // into the REAL `runProvisionFlow` and captured the false sentence.
+      // Nothing here is a mock of the thing under test: the claim comes from
+      // the real revert, and the prose from the real flow.
+      let statusCalls = 0;
+      const revertOps: ParkedInstallRevertOps = {
+        harnessStatus: async (): Promise<HarnessDaemonStatus> => {
+          statusCalls += 1;
+          return LIVE_STATUS;
+        },
+        sleepMs: async () => {},
+        restoreRunningHarness: async () => {
+          throw new Error("launchctl bootstrap exited 5");
+        },
+        clearJobDisable: async () => {},
+        writeFile: async () => {},
+        readFile: async () => "<plist>prior</plist>",
+        removeFile: async () => {},
+      };
+      const revert = await revertParkedHarnessInstall(
+        {
+          wasInstalled: true,
+          wasRunning: true,
+          preexistingJobModified: true,
+          priorPlistContent: "<plist>prior</plist>",
+          plistPath: HARNESS_LOCATOR.plistPath,
+          harnessLabel: HARNESS_LOCATOR.harnessLabel,
+        },
+        revertOps,
+      );
+
+      // Ground truth: the run really did read the harness, and read it alive.
+      expect(statusCalls).toBeGreaterThan(0);
+      expect(revert.runState?.claim.state).toBe("alive");
+      // The invariant that makes the projection below safe.
+      expect(revert.runState !== undefined).toBe(runStateOwed(revert));
+
+      // THE REAL PROJECTION -- the same function `wrap/auto-provision.ts`
+      // calls, not a copy of it. Copying it here is what the production op did,
+      // and the copy is where the claim was lost.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => projectRevertToRestoreReport(revert)),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+
+      expect(reason).toMatch(/The agent is RUNNING \(pid 9001\)/);
+      expect(reason).not.toMatch(/did not verify its run state/i);
+      expect(reason).not.toMatch(/to bring it back up/i);
+      expect(reason).toMatch(/Do NOT re-run/);
+    });
+
+    it("R6: a THROWING restore op yields an explicitly WEAKENED claim, not an invented one", async () => {
+      // The op threw, so nothing was observed -- but the old fallback
+      // synthesized `wasRunning: true` with no claim, which under
+      // `runStateOwed` OWES a run-state sentence and had none. That is how the
+      // renderer came to invent one. "I could not tell" is now said out loud.
+      const printed: string[] = [];
+      const ops = stoodDownOps({
+        print: vi.fn((line: string) => printed.push(line)),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => {
+          throw new Error("EROFS");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/EROFS/);
+      expect(reason).toMatch(/could NOT be established/);
+      expect(reason).toMatch(/Treat the agent as POSSIBLY RUNNING/);
+      // No park was observed, so no bring-it-back-up may be issued.
+      expect(reason).not.toMatch(/to bring it back up/i);
+      expect(reason).toMatch(/Establish the harness's state before re-running/);
+    });
+
+    it("R6: a job that was NOT running before gets no run-state claim and no restart instruction", async () => {
+      // The other direction of the same rule. `runStateOwed` is false here, so
+      // there is no claim -- and a note that invented "re-run to bring it back
+      // up" would be the identical defect with the sign flipped.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: false,
+          harnessRestarted: false,
+          problems: ["the parked harness plist is STILL PRESENT after removing it"],
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/STILL PRESENT/);
+      expect(reason).toMatch(/Nothing was running before this run began/);
+      expect(reason).not.toMatch(/to bring it back up/i);
+      // ...and it makes no claim about what the agent is doing NOW.
+      expect(reason).not.toMatch(/The agent is/);
     });
 
     it("a THROWING restore op cannot take the flow down with it", async () => {
@@ -1453,14 +1644,18 @@ describe("castle-wall/provision/orchestrate", () => {
           restored: false,
           wasRunning: true,
           harnessRestarted: false,
-          problems: ["the agent harness was running before this run and is STOPPED now"],
+          problems: ["the agent harness was running before this run and this run did not restart it"],
+          runState: await observedRunState(PARKED_STATUS),
         })),
       });
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       const reason = String((result as { reason: string }).reason);
       expect(reason).not.toMatch(/was restarted/i);
       expect(reason).not.toMatch(/restored to its previous state/i);
-      expect(reason).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
+      // FIX-ROUND 6: this used to pin "did not verify its run state" -- a
+      // sentence that was false whenever the op HAD verified it. What the note
+      // owes the operator is the observation, and it is here.
+      expect(reason).toMatch(/The agent is PARKED \(not running\)/);
       expect(reason).toMatch(/sanctuary protect --hermes/);
     });
 
@@ -1478,12 +1673,14 @@ describe("castle-wall/provision/orchestrate", () => {
           wasRunning: true,
           harnessRestarted: false,
           problems: [] as string[],
+          runState: await observedRunState(PARKED_STATUS),
         })),
       });
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       const reason = String((result as { reason: string }).reason);
       expect(reason).not.toMatch(/was restarted/i);
-      expect(reason).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
+      expect(reason).toMatch(/could NOT be fully restored/);
+      expect(reason).toMatch(/The agent is PARKED \(not running\)/);
     });
 
     it("B2: a job that was NOT running before is described as put back, not as restarted", async () => {
@@ -1534,6 +1731,7 @@ describe("castle-wall/provision/orchestrate", () => {
           wasRunning: true,
           harnessRestarted: false,
           problems: ["launchctl bootstrap exited 5"],
+          runState: await observedRunState(PARKED_STATUS),
         })),
         // `armed` carries no `reason`. It cannot co-occur with a parked
         // install today, which is exactly why the silence went unnoticed --
@@ -1542,7 +1740,8 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const coarse = await runProvisionFlow(baseCtx({ fineGrainedDeclared: false }), reasonless);
       expect(coarse.kind).toBe("armed");
-      expect(printed.join("\n")).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
+      expect(printed.join("\n")).toMatch(/could NOT be fully restored/);
+      expect(printed.join("\n")).toMatch(/The agent is PARKED \(not running\)/);
     });
 
     it("MED: a restore on the THROW path is reported too, instead of being swallowed with the error", async () => {
@@ -1557,12 +1756,14 @@ describe("castle-wall/provision/orchestrate", () => {
           wasRunning: true,
           harnessRestarted: false,
           problems: ["launchctl bootstrap exited 5"],
+          runState: await observedRunState(PARKED_STATUS),
         })),
       });
       await expect(runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops)).rejects.toThrow(/dscl blew up/);
       // The original error still wins as the outcome, but the operator is no
       // longer left to discover their agent is down by noticing it is down.
-      expect(printed.join("\n")).toMatch(/This run did NOT bring it back up, and did not verify its run state/);
+      expect(printed.join("\n")).toMatch(/could NOT be fully restored/);
+      expect(printed.join("\n")).toMatch(/The agent is PARKED \(not running\)/);
     });
   });
 });

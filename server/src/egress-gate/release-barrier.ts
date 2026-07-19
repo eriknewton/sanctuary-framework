@@ -88,8 +88,10 @@ import {
 } from "./harness-daemon.js";
 import {
   assessHarnessParked,
+  runStateAdvice,
   type ParkedClaim,
   type ParkedClaimProbeOps,
+  type RunStateAdvice,
 } from "./parked-claim.js";
 
 /** Root-owned parent directory for hold files + the exec wrapper (0755 root). */
@@ -912,7 +914,7 @@ async function revertFailedParkedInstall(
     return new ReleaseBarrierError(
       `${original}. The parked install then FAILED TO REVERT ITS OWN CHANGES (${describeError(revertErr)}). ` +
         (snapshot.wasRunning
-          ? standDownAdvice(snapshot, await assessHarnessParked({ probe: ops }))
+          ? runStateAdvice(await assessHarnessParked({ probe: ops }), { locator: snapshot }).text
           : `Check ${snapshot.plistPath} before re-running.`),
       { cause },
     );
@@ -941,7 +943,7 @@ async function revertFailedParkedInstall(
       revert.errors.length === 0 ? "" : `: ${revert.errors.join("; ")}`
     }. ${
       revert.runState !== undefined
-        ? standDownAdvice(snapshot, revert.runState)
+        ? revert.runState.text
         : `Check ${snapshot.plistPath} before re-running.`
     }`,
     { cause },
@@ -949,33 +951,20 @@ async function revertFailedParkedInstall(
 }
 
 /**
- * The advice that follows a revert which did not put the agent back.
+ * FIX-ROUND 6, 2026-07-19: `standDownAdvice` USED TO LIVE HERE, and that was
+ * the defect. It owned both the run-state sentence and the recovery imperative
+ * for the install's own undo -- while the caller-side chokepoint, three frames
+ * up, rendered its own second copy of the same advice from a result type that
+ * had no run-state field at all. Round 5 fixed this copy; the round-6 gate
+ * found the other one telling the operator "this run ... did not verify its
+ * run state" over a harness observed ALIVE at pid 9001.
  *
- * FIX-ROUND 5, 2026-07-19 (the round-5 HIGH; tenth instance of the subsystem's
- * one defect). This used to open with "The agent harness (<label>) is STOPPED"
- * -- a positive assertion about a process, derived from `snapshot.wasRunning`
- * plus a failed restore, over a harness nothing on the path had read -- and
- * then instruct the operator to "re-run to bring it back up". The gate
- * captured both sentences in the same message whose cause clause said the job
- * reported RUNNING, which is the D2 shape this branch exists to fix, and the
- * imperative loops the operator into re-running over a live agent.
- *
- * Now: the run-state sentence is the CHOKEPOINT's, and the imperative is
- * chosen from the claim rather than from control flow. "Bring it back up" is
- * only ever printed over an OBSERVED park.
+ * Two copies of this function is how the class propagated. So there is now
+ * ONE, `runStateAdvice` in the `parked-claim.ts` chokepoint, which owns the
+ * imperative for the same reason it already owned the sentence: an
+ * instruction premised on a state is a claim about that state. Every consumer
+ * receives a branded {@link RunStateAdvice} and prints its `text`.
  */
-function standDownAdvice(snapshot: HarnessStandDownSnapshot, runState: ParkedClaim): string {
-  const recovery =
-    runState.state === "parked"
-      ? "Re-run 'sudo sanctuary protect --hermes' to bring it back up under the previous (coarse) posture."
-      : runState.state === "alive"
-        ? `Do NOT re-run 'sudo sanctuary protect --hermes' expecting it to restart the agent: a live process ` +
-          `is there. Inspect ${snapshot.plistPath} and 'sudo launchctl print system/${snapshot.harnessLabel}' ` +
-          "first -- re-running would stand that process down again and hit the same failure."
-        : `Establish the harness's state before re-running ('sudo launchctl print system/${snapshot.harnessLabel}', ` +
-          `${snapshot.plistPath}): 'sudo sanctuary protect --hermes' assumes it has to bring the agent up.`;
-  return `${runState.sentence} ${recovery}`;
-}
 
 /**
  * The stand-down's stopped-settle, now the SHARED loop (fix-round 3): the same
@@ -1093,21 +1082,25 @@ export interface ParkedInstallRevertResult {
   errors: string[];
   /**
    * THE RUN-STATE CLAIM for this revert (fix-round 5, 2026-07-19), from the
-   * `assessHarnessParked` chokepoint -- never from control flow.
+   * `assessHarnessParked` chokepoint -- never from control flow. Carried as a
+   * branded {@link RunStateAdvice} since fix-round 6: the recovery instruction
+   * travels WITH the observation it is premised on, so a consumer physically
+   * cannot render one without the other (`.claim` is there for a caller that
+   * needs the state itself).
    *
    * PRESENT EXACTLY WHEN the revert did not put a previously-running agent
    * back: `wasRunning && !harnessRestarted`. Those are the only outcomes whose
-   * operator message must say something about whether the agent is up, and
-   * `standDownAdvice` refuses to say anything without one. It is ABSENT on the
-   * paths that need no such sentence (a clean host, a job that was not running,
-   * a restart observed to succeed) because probing there would spend a settle
+   * operator message must say something about whether the agent is up, and the
+   * renderers refuse to say anything without one. It is ABSENT on the paths
+   * that need no such sentence (a clean host, a job that was not running, a
+   * restart observed to succeed) because probing there would spend a settle
    * loop over a harness that is deliberately alive.
    *
    * `runStateOwed` below is the machine-checkable form of "present exactly
    * when"; `revert-run-state-claim-owed` in `claim-basis-structural.test.ts`
    * asserts the two agree, so a future branch cannot go silent here.
    */
-  runState?: ParkedClaim;
+  runState?: RunStateAdvice;
 }
 
 /**
@@ -1122,6 +1115,40 @@ export function runStateOwed(revert: {
   harnessRestarted: boolean;
 }): boolean {
   return revert.wasRunning && !revert.harnessRestarted;
+}
+
+/**
+ * The revert result, projected onto what the ORCHESTRATOR's restore op
+ * returns. THE ONE PROJECTION (fix-round 6, 2026-07-19).
+ *
+ * This function exists because the eleventh instance of this subsystem's one
+ * defect was not a wrong value, a wrong branch or a missing probe -- it was a
+ * hand-rolled object literal at `wrap/auto-provision.ts` that listed four of
+ * the five fields. The revert had already paid for a 20-sample settle loop and
+ * returned an OBSERVED `alive (pid 9001)`; the literal simply did not mention
+ * it, so the observation died at the op boundary and the renderer three frames
+ * up told the operator no observation had been made.
+ *
+ * A field that must survive a boundary cannot depend on each caller
+ * remembering to copy it. There is one projection, here, next to the type it
+ * projects and the `runStateOwed` invariant it must preserve; adding a field
+ * to {@link ParkedInstallRevertResult} that the operator is owed means adding
+ * it HERE, once, rather than at every consumer that forgot.
+ */
+export function projectRevertToRestoreReport(revert: ParkedInstallRevertResult): {
+  restored: boolean;
+  wasRunning: boolean;
+  harnessRestarted: boolean;
+  problems: string[];
+  runState?: RunStateAdvice;
+} {
+  return {
+    restored: revert.restored,
+    wasRunning: revert.wasRunning,
+    harnessRestarted: revert.harnessRestarted,
+    problems: revert.errors,
+    ...(revert.runState !== undefined ? { runState: revert.runState } : {}),
+  };
 }
 
 /**
@@ -1168,13 +1195,31 @@ export async function revertParkedHarnessInstall(
     } catch (err) {
       errors.push(`could not clear the launchd disable on system/${snapshot.harnessLabel}: ${describeError(err)}`);
     }
+    // FIX-ROUND 6 (Claude Finding 6 / Codex LOW-1). `wasRunning` was
+    // HARDCODED false here regardless of the snapshot. No production input
+    // reaches this branch with a running job -- the install marks
+    // `preexistingJobModified` whenever the before-state was installed, and
+    // the daemon parser only reports running with a pid -- but an exported
+    // helper that silently normalizes its input away is the exact shape that
+    // SUPPRESSES an owed run-state probe, which is this subsystem's one
+    // defect. So it echoes the snapshot and honours the same invariant every
+    // other branch does: if a previously-running agent was not observed back
+    // up, the operator is owed a claim, and the claim is read rather than
+    // assumed.
+    const cleanHostRunState = runStateOwed({ wasRunning: snapshot.wasRunning, harnessRestarted: false })
+      ? runStateAdvice(await assessHarnessParked({ probe: ops }), {
+          locator: snapshot,
+          priorPlistRestored: plistRestored,
+        })
+      : undefined;
     return {
       nothingToRevert: true,
       plistRestored,
       harnessRestarted: false,
-      wasRunning: false,
-      restored: plistRestored && errors.length === 0,
+      wasRunning: snapshot.wasRunning,
+      restored: plistRestored && !snapshot.wasRunning && errors.length === 0,
       errors,
+      ...(cleanHostRunState !== undefined ? { runState: cleanHostRunState } : {}),
     };
   }
 
@@ -1236,8 +1281,16 @@ export async function revertParkedHarnessInstall(
   // Deliberately AFTER every restore attempt above, so the claim describes the
   // host the operator is being handed, not the host mid-revert. It cannot
   // abort the abort: `assessHarnessParked` never throws.
+  //
+  // FIX-ROUND 6: the probe's result is turned into the branded advice HERE,
+  // where `plistRestored` is known, so the parked branch's "under the previous
+  // (coarse) posture" promise is suppressed when this run could not put the
+  // operator's prior plist bytes back (round-6 gate, Finding 4).
   const runState = runStateOwed({ wasRunning: snapshot.wasRunning, harnessRestarted: false })
-    ? await assessHarnessParked({ probe: ops })
+    ? runStateAdvice(await assessHarnessParked({ probe: ops }), {
+        locator: snapshot,
+        priorPlistRestored: plistRestored,
+      })
     : undefined;
 
   if (snapshot.wasRunning && errors.length === 0) {
@@ -1252,9 +1305,14 @@ export async function revertParkedHarnessInstall(
     // control-flow-derived and evading the round-4 prose guard by letter case.
     // What this run KNOWS is what it did (stood the job down, found no plist
     // to restart it from); what the agent is DOING comes from the chokepoint.
+    //
+    // FIX-ROUND 6 (gate Finding 5): the claim's sentence used to be appended
+    // HERE as well. Every renderer of `errors` also renders `runState.text`,
+    // which opens with that same sentence, so the operator read it twice. The
+    // error states what this run DID; the advice states what the agent IS.
     errors.push(
       `the agent harness was running before this run and this run did not restart it: there is no captured ` +
-        `prior plist at ${snapshot.plistPath} to restart it from. ${runState!.sentence}`,
+        `prior plist at ${snapshot.plistPath} to restart it from`,
     );
   }
   return {

@@ -282,6 +282,7 @@ export type ClaimSiteId =
   | "provision-exclusive-unprotect.unprotected"
   | "provision-orchestrate.harness-restore-note-restarted"
   | "provision-orchestrate.harness-restore-note-put-back"
+  | "provision-orchestrate.harness-restore-note-not-restored"
   | "provision-orchestrate.disarmed"
   | "provision-orchestrate.rules-scrubbed"
   | "provision-orchestrate.armed"
@@ -1476,6 +1477,23 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     layer: "compute",
     branches: "single",
   },
+  "provision-orchestrate.harness-restore-note-not-restored": {
+    file: `${CW}/orchestrate.ts`,
+    symbol: "harnessRestoreNote",
+    // THE ROUND-6 ROW. Both rows above cover `restored === true`; the FALSE
+    // branch -- the one that carried the false "did not verify its run state"
+    // sentence AND the unguarded "re-run to bring it back up" imperative --
+    // had no row at all, which is verbatim the boolean-carries-two-claims gap
+    // round 4 was supposed to close. The claim is now the branded
+    // `RunStateAdvice` the restore op observed, printed verbatim.
+    claim:
+      "the pre-run state is NOT back, plus (when one is owed) the agent's OBSERVED run state and the recovery " +
+      "step that follows from it",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "render",
+    branches: "single",
+  },
   "provision-orchestrate.disarmed": {
     file: `${CW}/orchestrate.ts`,
     symbol: "runProvisionFlowSteps",
@@ -1748,6 +1766,24 @@ export const RUN_STATE_PROSE_SOLE_OWNER = `${EG}/parked-claim.ts`;
  * taken ten times, not a proof that no module can assert run state. The
  * structural half of the rule is the {@link ParkedClaim} brand; this is the
  * half that catches an author who never touched the type.
+ *
+ * IMPERATIVES ARE CLAIMS (fix-round 6, 2026-07-19). Round 5 closed this list's
+ * case-folding gap and predicted the class was now "the build fails" rather
+ * than "a reviewer must notice". The round-6 gate found the eleventh instance
+ * anyway, and the reason is worth keeping: BOTH of the last two instances were
+ * IMPERATIVES, and every pattern above governs a DESCRIPTION. "Re-run
+ * 'sudo sanctuary protect --hermes' to bring it back up" asserts nothing about
+ * a process by the letter of this list, while being the sentence that actually
+ * causes an operator to stand a live agent down. An instruction premised on a
+ * state is a claim about that state, so the recovery imperative now lives in
+ * the sole-owner chokepoint alongside the sentence, and its phrasings are on
+ * this list.
+ *
+ * The imperative entries are deliberately NARROW. "Re-run 'sanctuary protect
+ * --hermes'" on its own is ordinary, honest advice at six sites in
+ * `wrap/cli.ts` that make no run-state claim at all (a failed connectivity
+ * re-check, an unreconciled file). What makes a phrase run-state prose is the
+ * premise that something is DOWN and this will bring it UP.
  */
 export const RUN_STATE_PROSE_PATTERNS: readonly string[] = [
   "is PARKED",
@@ -1759,6 +1795,11 @@ export const RUN_STATE_PROSE_PATTERNS: readonly string[] = [
   "not running)",
   "agent is RUNNING",
   "is stopped",
+  // Imperatives (fix-round 6). Each asserts, by its premise, that the agent is
+  // not currently up.
+  "bring it back up",
+  "bring the agent up",
+  "to restart the agent",
 ];
 
 /**
