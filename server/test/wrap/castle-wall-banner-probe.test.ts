@@ -17,6 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { startedCoarseDisposition, type HarnessDisposition } from "../../src/egress-gate/parked-claim.js";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -1234,7 +1235,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           stage: "bring-up",
           reason: "generation bring-up failed",
           coarseCompositionRestored: true,
-          harnessStartedCoarse: true,
+          harness: startedCoarseDisposition(),
           cleanupErrors: [],
         },
       },
@@ -1259,7 +1260,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           stage: "bring-up",
           reason: "generation bring-up failed",
           coarseCompositionRestored: true,
-          harnessStartedCoarse: true,
+          harness: startedCoarseDisposition(),
           cleanupErrors: ["cleanup marker failed"],
         },
       },
@@ -1287,7 +1288,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           stage: "bring-up",
           reason: "generation bring-up failed",
           coarseCompositionRestored: true,
-          harnessStartedCoarse: true,
+          harness: startedCoarseDisposition(),
           cleanupErrors: [],
         },
       },
@@ -1320,7 +1321,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           stage: "bring-up",
           reason: "generation bring-up failed",
           coarseCompositionRestored: true,
-          harnessStartedCoarse: true,
+          harness: startedCoarseDisposition(),
           cleanupErrors: [],
         },
       },
@@ -1351,7 +1352,7 @@ describe("Castle Wall wrap-banner evidence probes", () => {
           stage: "bring-up",
           reason: "coarse restore failed",
           coarseCompositionRestored: false,
-          harnessStartedCoarse: false,
+          harness: { disposition: "not-started" } as unknown as HarnessDisposition,
           cleanupErrors: [],
         },
       },

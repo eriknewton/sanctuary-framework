@@ -37,6 +37,7 @@ import type { ExclusiveEgressGatePolicy } from "../../src/castle-wall/allowlist/
 
 const AGENT_UID = 502;
 const GATE_PORT = 47201;
+const GATE_HOME = "/var/sanctuary-agents/sanctuary-gate-hermes";
 const sha256Hex = (v: string): string => createHash("sha256").update(v, "utf8").digest("hex");
 
 const policy: ExclusiveEgressGatePolicy = { agent_uid: AGENT_UID, gate_port: GATE_PORT };
@@ -95,14 +96,14 @@ describe("F1 refute: cross-principal client authenticator", () => {
 });
 
 // ---------------------------------------------------------------------------
-// F2: gate uid colliding with agent/operator uid is refused.
+// F2: gate uid colliding with agent/operator uid is excluded.
 // ---------------------------------------------------------------------------
 describe("F2 refute: gate-uid collision exclusion", () => {
   const opts = (excludeUids: number[]) => ({
     agentId: "hermes",
     agentUid: AGENT_UID,
     ceiling: 400,
-    homeDirectory: "/var/empty",
+    homeDirectory: GATE_HOME,
     excludeUids,
   });
 
@@ -117,7 +118,7 @@ describe("F2 refute: gate-uid collision exclusion", () => {
     // ceiling 501, highest 500 => create uid = max(501, 501) = 501 (operator).
     expect(() =>
       planGateAccountProvision(
-        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 501, homeDirectory: "/var/empty", excludeUids: [501] },
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 501, homeDirectory: GATE_HOME, excludeUids: [501] },
         { existingUid: undefined, highestAssignedUid: 500 },
       ),
     ).toThrow(GateUidCollisionError);
@@ -135,7 +136,7 @@ describe("F2 refute: gate-uid collision exclusion", () => {
     // longer lets a pre-existing sanctuary-gate account at the agent uid pass.
     expect(() =>
       planGateAccountProvision(
-        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 400, homeDirectory: "/var/empty" },
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 400, homeDirectory: GATE_HOME },
         { existingUid: AGENT_UID, highestAssignedUid: 600 },
       ),
     ).toThrow(GateUidCollisionError);

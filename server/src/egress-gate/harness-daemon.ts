@@ -35,6 +35,17 @@ const HARNESS_DAEMON_STABILITY_SAMPLES = 3;
 const HARNESS_DAEMON_STARTUP_ATTEMPTS = 30;
 const HARNESS_DAEMON_STABILITY_INTERVAL_MS = 500;
 
+/**
+ * THE ONE stopped-settle bound (fix-round 3, 2026-07-19). Every site that has
+ * to prove a booted-out job actually STOPPED uses these numbers via {@link
+ * awaitHarnessStoppedVia}: the parked install's stand-down, the `unprotect`
+ * teardown, the release sequence's reassert-parked, and the changed-plist
+ * reload. They were three separately-tuned checks (one of them a single
+ * sample) and they disagreed about how long "stopped" takes to become true.
+ */
+export const HARNESS_STOP_SETTLE_SAMPLES = 20;
+export const HARNESS_STOP_SETTLE_INTERVAL_MS = 250;
+
 type LaunchctlResult = { code: number; stdout: string; stderr: string };
 
 /**
@@ -223,6 +234,16 @@ ${keepAliveXml}
 export interface HarnessDaemonOps {
   /** Write `content` at `path` with the given mode (root-owned in prod). */
   writeFile(path: string, content: string, mode: number): Promise<void>;
+  /**
+   * Read a file's contents, or `undefined` when it does not exist.
+   *
+   * REQUIRED, not optional (fix-round 3, 2026-07-19). {@link
+   * installAgentHarnessDaemon} needs the CURRENT on-disk plist to decide
+   * whether writing the new bytes changed the unit -- and therefore whether
+   * launchd is still running the OLD configuration. An optional op would let a
+   * caller opt out of that check and get the fail-open the round-3 gate found.
+   */
+  readFile(path: string): Promise<string | undefined>;
   /** Remove the file at `path` (ENOENT is not an error). */
   removeFile(path: string): Promise<void>;
   /** Run launchctl with argv (never a shell). */
@@ -259,15 +280,31 @@ export function planAgentHarnessDaemonInstall(
  * ceremony). A naive write-then-rollback would overwrite the working unit
  * file and then delete it -- the running confined harness keeps running
  * until reboot, but its unit is gone and confinement silently does NOT
- * survive the next boot. So: when launchd already knows the service, this
- * refreshes the plist bytes and succeeds WITHOUT a second bootstrap
- * (applying changed plist content to the LIVE service still requires an
- * explicit uninstall + install ceremony).
+ * survive the next boot. So: when launchd already knows the service and the
+ * plist bytes are UNCHANGED, this succeeds without a second bootstrap.
+ *
+ * ...AND WHEN THE BYTES CHANGED IT RELOADS (fix-round 3, 2026-07-19). The
+ * round-3 gate found the fail-open in the branch above: writing a plist FILE
+ * does not reload launchd, so an `existing.installed` re-install used to write
+ * new bytes, observe "a stable pid exists", and return -- while the process it
+ * observed was still running the OLD unit. On the parked-install revert path
+ * that is exactly wrong: the disk holds the operator's restored plist, launchd
+ * holds the confined barrier job, and the operator is told the harness "is
+ * running again". A pid existing is not evidence that the RESTORED
+ * configuration is what is loaded. So when the on-disk bytes differ from the
+ * bytes being written, the job is booted out and bootstrapped afresh; only
+ * then can the stable-pid check be a statement about the unit we just wrote.
  *
  * Rollback on a genuine bootstrap failure removes the plist ONLY when
  * launchd (re-checked after the failure) does not know the service, so the
  * "no half-installed unit left behind" promise can never strand a
  * bootstrapped service without its unit file.
+ *
+ * IT RETURNING IS AN OBSERVATION -- OF THE UNIT IT WROTE. Every exit path
+ * either throws or has just seen `agentHarnessDaemonStableRunning` come back
+ * true for a job whose loaded configuration is the plist this call put on
+ * disk. That is the basis on which the parked-install revert may claim
+ * `harnessRestarted: true`.
  */
 export async function installAgentHarnessDaemon(
   plan: HarnessDaemonInstallPlan,
@@ -279,14 +316,52 @@ export async function installAgentHarnessDaemon(
       `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL} did not return a trustworthy status; refusing to install or remove plist`,
     );
   }
+  // DRILL D2 FIX-ROUND (2026-07-18): clear any PERSISTENT launchd disable
+  // before installing. `launchctl disable` survives reboots and plist
+  // rewrites, and the S5-5 parked install (and the persistent-park helpers)
+  // deliberately set it. Without this, the operator-facing recovery
+  // instruction -- "re-run 'sanctuary protect --hermes'" -- could not work:
+  // the coarse install would write the normal plist, bootstrap a still-
+  // disabled label, and fail its own stable-pid check. A coarse install
+  // exists precisely to RUN the harness, so clearing the park's disable is
+  // the correct semantics here, not a relaxation: the fine-grained release
+  // barrier keeps its own park through `executeParkedHarnessInstall` and the
+  // wrapper/hold-file checks, neither of which routes through this function.
+  // Done BEFORE the plist write so a failed enable leaves the plist untouched.
+  await setAgentHarnessJobDisabled(ops, false);
+  // Read BEFORE the write: after it, the two are equal by construction and
+  // the question "did this call change the unit?" is unanswerable.
+  const onDiskBefore = await ops.readFile(plan.plistPath);
   await ops.writeFile(plan.plistPath, plan.plistContent, 0o644);
   if (existing.installed) {
-    if (!(await agentHarnessDaemonStableRunning(ops))) {
+    if (onDiskBefore === plan.plistContent) {
+      // Unchanged bytes: the loaded job IS this plist, so a stable pid is an
+      // observation about the right subject.
+      if (!(await agentHarnessDaemonStableRunning(ops))) {
+        throw new Error(
+          `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL} did not report a stable running pid`,
+        );
+      }
+      return;
+    }
+    // Changed bytes: launchd is still running the OLD unit. Boot it out so the
+    // bootstrap below loads what we just wrote. `uninstallAgentHarnessDaemon`
+    // is not reusable here -- it removes the plist, which is the file we need.
+    const bootout = await ops.runLaunchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+    if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout) && !launchctlBootoutWasInProgress(bootout)) {
       throw new Error(
-        `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL} did not report a stable running pid`,
+        `the harness plist changed but launchctl bootout system/${AGENT_HARNESS_DAEMON_LABEL} exited ` +
+          `${bootout.code}: ${bootout.stderr.trim()}; refusing to report an install whose new unit was never loaded`,
       );
     }
-    return;
+    const stopped = await awaitAgentHarnessDaemonStopped(ops);
+    if (!stopped.known || stopped.running) {
+      throw new Error(
+        `the harness plist changed but system/${AGENT_HARNESS_DAEMON_LABEL} is ${
+          stopped.known ? "STILL RUNNING" : "in an untrustworthy launchd state"
+        } after bootout; refusing to report an install whose new unit was never loaded`,
+      );
+    }
   }
   const result = await ops.runLaunchctl(plan.bootstrapArgs);
   if (result.code !== 0) {
@@ -327,18 +402,102 @@ export async function installAgentHarnessDaemon(
  * harness with no unit file behind it while the ceremony reports success --
  * a silently-failed teardown. Fail loudly instead, before touching the
  * plist (same fail-closed teardown semantics as `disarmPfAnchor`).
+ *
+ * THE AUTHORITATIVE POST-CHECK (fix-round 2, 2026-07-18). The shared
+ * {@link launchctlBootoutWasNotLoaded} predicate justifies its generous match
+ * with "no caller relies on it alone: every one re-reads `launchctl print`
+ * afterwards and refuses if the job is still running". This function is the
+ * first site that comment names and was the one site where it was NOT true --
+ * it went from the predicate straight to `removeFile`. The gate lens was right
+ * that this is the fail-open direction (a teardown reporting success over a
+ * live harness whose unit file is now gone), and right that the argument
+ * should be made true rather than narrowed. The status re-read below is that
+ * check: an unknown status or a still-running job refuses BEFORE the plist is
+ * touched.
+ *
+ * IT SETTLES, BECAUSE A SINGLE SAMPLE IS WRONG (fix-round 3, 2026-07-19). The
+ * round-2 fix took one sample and its comment claimed it refused "exactly as
+ * the parked install's stopped-settle assertion does". It did not: that
+ * assertion samples {@link HARNESS_STOP_SETTLE_SAMPLES} times *because this
+ * branch learned on Mini1 that a bootout's zero exit does not prove the
+ * process is reaped*. A single sample turned a job one sample away from gone
+ * into a refusal -- on stock `sanctuary unprotect`, whose plist is KeepAlive,
+ * so the refusal leaves the harness to return at next boot. The same settle
+ * loop and the same EINPROGRESS tolerance now run here, so the comment and the
+ * code say the same thing and the two bootout sites are symmetric.
  */
 export async function uninstallAgentHarnessDaemon(ops: HarnessDaemonOps): Promise<void> {
   const label = `system/${AGENT_HARNESS_DAEMON_LABEL}`;
   const result = await ops.runLaunchctl(["bootout", label]);
-  const notLoaded =
-    result.code === 3 || /no such (process|service)|service not loaded/i.test(result.stderr);
-  if (result.code !== 0 && !notLoaded) {
+  if (result.code !== 0 && !launchctlBootoutWasNotLoaded(result) && !launchctlBootoutWasInProgress(result)) {
     throw new Error(
       `launchctl bootout ${label} exited ${result.code}: ${result.stderr.trim()}`,
     );
   }
+  const after = await awaitAgentHarnessDaemonStopped(ops);
+  if (!after.known) {
+    throw new Error(
+      `launchctl print ${label} did not return a trustworthy status after bootout; refusing to remove ` +
+        `${AGENT_HARNESS_DAEMON_PLIST_PATH} against unknown launchd state`,
+    );
+  }
+  if (after.running) {
+    throw new Error(
+      `${label} is STILL RUNNING after bootout; refusing to remove ${AGENT_HARNESS_DAEMON_PLIST_PATH} and ` +
+        "leave a live harness with no unit file behind it",
+    );
+  }
   await ops.removeFile(AGENT_HARNESS_DAEMON_PLIST_PATH);
+}
+
+/**
+ * THE ONE not-loaded predicate for `launchctl bootout` (drill D2 fix-round,
+ * 2026-07-18). Three call sites -- this module's teardown, the S5-5 parked
+ * install's stand-down, and the persistent-park helpers -- previously each
+ * carried a hand-maintained phrase list, and they disagreed: the narrowest
+ * dropped a standalone `code === 3` and `"service not loaded"`. On a clean
+ * host NOTHING is loaded, so every first-ever install depends on this
+ * matching; a miss reintroduces a D1-shaped clean-host blocker. One
+ * predicate, no second list to keep in sync.
+ *
+ * WHY A GENEROUS MATCH IS SAFE HERE. Calling a genuinely-failed bootout
+ * "already stopped" would be a fail-open on its own, so no caller may rely on
+ * this alone: every one of them re-reads `launchctl print` afterwards and
+ * refuses if the job is still running (see
+ * `executeParkedHarnessInstall`'s stopped-settle assertion and
+ * `verifyHarnessParkedPersistent`). This predicate decides only whether to
+ * refuse EARLY with a launchctl error or to proceed to that authoritative
+ * check.
+ */
+export function launchctlBootoutWasNotLoaded(result: LaunchctlResult): boolean {
+  if (result.code === 0) return true;
+  const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return (
+    result.code === 3 ||
+    result.code === 113 ||
+    text.includes("no such process") ||
+    text.includes("no such service") ||
+    text.includes("could not find") ||
+    text.includes("not find service") ||
+    text.includes("service not loaded") ||
+    text.includes("not loaded") ||
+    text.includes("does not exist")
+  );
+}
+
+/**
+ * `launchctl bootout` returning EINPROGRESS: the stop was ACCEPTED and is
+ * still running down. Distinct from both success and failure -- the job is
+ * on its way out but is not gone yet, so a caller must SETTLE (re-sample
+ * `launchctl print` until the job is not running) rather than either throw or
+ * assume it stopped. Before this it matched no tolerance and threw, which on
+ * the parked-install path meant refusing AFTER the plist had already been
+ * overwritten.
+ */
+export function launchctlBootoutWasInProgress(result: LaunchctlResult): boolean {
+  if (result.code === 0) return false;
+  const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+  return result.code === 36 || text.includes("operation now in progress") || text.includes("einprogress");
 }
 
 /**
@@ -346,7 +505,17 @@ export async function uninstallAgentHarnessDaemon(ops: HarnessDaemonOps): Promis
  * (S5-5 release barrier). Constraint: `disable` is the durable park (a
  * disabled job is not bootstrapped at boot and cannot be bootstrapped until
  * enabled); `enable` PERSISTS across boots, so the release sequence must
- * re-disable after a successful bootstrap. Throws on a non-zero exit.
+ * re-disable after a successful bootstrap.
+ *
+ * IT RETURNING IS AN OBSERVATION (fix-round 3, 2026-07-19). Through round 2
+ * this checked the `launchctl enable`/`disable` EXIT CODE and never re-read
+ * the override database, while callers -- `clearJobDisable`, the parked
+ * install, the release sequence's re-park -- wrote the word "confirmed" around
+ * it. Both round-3 lenses named it. The readback below closes it with the
+ * mechanism the codebase already had (`print-disabled system`, the same table
+ * `verifyHarnessJobDisabled` reads), so the claim is gated on state rather
+ * than disclosed as a bound. Fail-closed: an unreadable override table throws,
+ * because "I could not tell" must never pass for "it is set".
  */
 export async function setAgentHarnessJobDisabled(ops: HarnessDaemonOps, disabled: boolean): Promise<void> {
   const verb = disabled ? "disable" : "enable";
@@ -354,6 +523,20 @@ export async function setAgentHarnessJobDisabled(ops: HarnessDaemonOps, disabled
   if (result.code !== 0) {
     throw new Error(
       `launchctl ${verb} system/${AGENT_HARNESS_DAEMON_LABEL} exited ${result.code}: ${result.stderr.trim()}`,
+    );
+  }
+  const override = await readAgentHarnessJobDisabledOverride(ops);
+  if (!override.known) {
+    throw new Error(
+      `launchctl ${verb} system/${AGENT_HARNESS_DAEMON_LABEL} exited 0, but launchd's persistent override ` +
+        `state could not be read back (${override.reason}); refusing to report the job ${verb}d`,
+    );
+  }
+  if (override.disabled !== disabled) {
+    throw new Error(
+      `launchctl ${verb} system/${AGENT_HARNESS_DAEMON_LABEL} exited 0, but launchd's persistent override ` +
+        `database still reports the job ${override.disabled ? "DISABLED" : "ENABLED"}; refusing to report the ` +
+        `job ${verb}d`,
     );
   }
 }
@@ -448,6 +631,68 @@ export async function agentHarnessDaemonStableRunning(ops: HarnessDaemonOps): Pr
     if (stableSamples >= HARNESS_DAEMON_STABILITY_SAMPLES) return true;
   }
   return false;
+}
+
+/**
+ * Sample a harness status until launchd stops reporting it running, bounded by
+ * {@link HARNESS_STOP_SETTLE_SAMPLES}. Returns the LAST sample either way, so
+ * the caller's fail-closed assertions (unknown status / still running) are
+ * unchanged -- this only decides how long to wait before making them. Sampling
+ * can only ever DELAY a refusal: a job that never stops still refuses.
+ *
+ * Takes the sampler rather than the ops so the release sequence (whose ops
+ * expose `harnessStatus()` rather than `runLaunchctl`) shares this exact loop
+ * instead of carrying a second copy of it.
+ */
+export async function awaitHarnessStoppedVia(
+  sample: () => Promise<HarnessDaemonStatus>,
+  sleepMs?: (ms: number) => Promise<void>,
+): Promise<HarnessDaemonStatus> {
+  const sleep = sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const stillAlive = (s: HarnessDaemonStatus): boolean => s.known && (s.running || s.pid !== undefined);
+  let status = await sample();
+  for (let i = 1; i < HARNESS_STOP_SETTLE_SAMPLES && stillAlive(status); i++) {
+    await sleep(HARNESS_STOP_SETTLE_INTERVAL_MS);
+    status = await sample();
+  }
+  return status;
+}
+
+/** {@link awaitHarnessStoppedVia} bound to `launchctl print` through `ops`. */
+export async function awaitAgentHarnessDaemonStopped(ops: HarnessDaemonOps): Promise<HarnessDaemonStatus> {
+  return awaitHarnessStoppedVia(() => agentHarnessDaemonStatus(ops), ops.sleepMs);
+}
+
+/**
+ * Read launchd's PERSISTENT override database for the harness label
+ * (`launchctl print-disabled system`).
+ *
+ * Fail-closed and three-valued on purpose (fix-round 3, 2026-07-19): a
+ * non-zero exit means the override state is UNKNOWABLE, which is not the same
+ * as "not disabled". Absence of the label from a successfully-read table IS
+ * evidence of not-disabled -- launchd lists only labels carrying an override.
+ */
+export async function readAgentHarnessJobDisabledOverride(
+  ops: HarnessDaemonOps,
+): Promise<{ known: true; disabled: boolean } | { known: false; reason: string }> {
+  let result: LaunchctlResult;
+  try {
+    result = await ops.runLaunchctl(["print-disabled", "system"]);
+  } catch (err) {
+    return { known: false, reason: `launchctl print-disabled system errored: ${(err as Error).message}` };
+  }
+  if (result.code !== 0) {
+    return {
+      known: false,
+      reason: `launchctl print-disabled system exited ${result.code}: ${result.stderr.trim()}`,
+    };
+  }
+  // macOS prints either `"<label>" => disabled` (newer) or `"<label>" => true`.
+  const label = AGENT_HARNESS_DAEMON_LABEL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp(`"${label}"\\s*=>\\s*(disabled|true)\\b`).test(result.stdout)) {
+    return { known: true, disabled: true };
+  }
+  return { known: true, disabled: false };
 }
 
 function launchctlPrintWasNotLoaded(result: LaunchctlResult): boolean {

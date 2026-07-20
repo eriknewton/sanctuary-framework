@@ -22,18 +22,49 @@ import {
   type EgressGateRepairOps,
 } from "../../../src/castle-wall/provision/exclusive-arm.js";
 import type { ReleaseBarrierOutcome } from "../../../src/egress-gate/release-barrier.js";
+import { assessHarnessParked, type ParkedClaim } from "../../../src/egress-gate/parked-claim.js";
+import type { HarnessDaemonStatus } from "../../../src/egress-gate/harness-daemon.js";
 
 const AGENT_UID = 502;
 const COMMITTED = { generation_id: 7, agent_uid: AGENT_UID, gate_port: 49152 };
 const RELEASED: ReleaseBarrierOutcome = { kind: "released", generation_id: 7 };
-const PARKED: ReleaseBarrierOutcome = {
-  kind: "parked",
-  stage: "gate-verify",
-  reason: "gate verification failed: oracle not live",
-  holdFileRemoved: true,
-  jobDisabled: true,
-  cleanupErrors: [],
-};
+
+/**
+ * A `ParkedClaim` cannot be hand-rolled -- the type is branded so that
+ * `assessHarnessParked` is its only constructor. Tests therefore build claims
+ * the same way production does: by MODELLING launchd and letting the real
+ * chokepoint classify it. That is the point, not a nuisance: a test that could
+ * fabricate a "parked" claim would be able to assert the exact falsehood these
+ * four gate rounds kept shipping.
+ */
+async function claimFrom(status: Partial<HarnessDaemonStatus>): Promise<ParkedClaim> {
+  return assessHarnessParked({
+    probe: {
+      harnessStatus: async (): Promise<HarnessDaemonStatus> => ({
+        known: true,
+        installed: true,
+        running: false,
+        ...status,
+      }),
+      sleepMs: async () => undefined,
+    },
+  });
+}
+
+/** A barrier abort over a genuinely stopped harness. */
+async function parkedBarrierOutcome(
+  status: Partial<HarnessDaemonStatus> = {},
+): Promise<ReleaseBarrierOutcome> {
+  return {
+    kind: "parked",
+    stage: "gate-verify",
+    reason: "gate verification failed: oracle not live",
+    holdFileRemoved: true,
+    jobDisabled: true,
+    cleanupErrors: [],
+    parkedClaim: await claimFrom(status),
+  };
+}
 
 function armOps(overrides: Partial<ExclusiveEgressArmOps> = {}): ExclusiveEgressArmOps {
   return {
@@ -41,6 +72,7 @@ function armOps(overrides: Partial<ExclusiveEgressArmOps> = {}): ExclusiveEgress
     runReleaseSequence: vi.fn(async () => RELEASED),
     restoreCoarseComposition: vi.fn(async () => undefined),
     startHarnessCoarse: vi.fn(async () => undefined),
+    assessHarnessParked: vi.fn(async () => claimFrom({})),
     audit: vi.fn(async () => undefined),
     print: vi.fn(),
     ...overrides,
@@ -90,7 +122,7 @@ describe("runExclusiveEgressArming", () => {
       kind: "degraded-coarse-active",
       stage: "bring-up",
       coarseCompositionRestored: true,
-      harnessStartedCoarse: true,
+      harness: { disposition: "started-coarse" },
       cleanupErrors: [],
     });
     expect((outcome as { reason: string }).reason).toContain("pfctl -E exited 1");
@@ -102,7 +134,7 @@ describe("runExclusiveEgressArming", () => {
         agent_uid: AGENT_UID,
         stage: "bring-up",
         coarse_composition_restored: true,
-        harness_started_coarse: true,
+        harness_run_state: "running-coarse",
       }),
     );
     // The release barrier must never run after a failed bring-up.
@@ -121,7 +153,7 @@ describe("runExclusiveEgressArming", () => {
   it("release parked -> degrade-loud, carrying the barrier's cleanup errors forward", async () => {
     const ops = armOps({
       runReleaseSequence: vi.fn(async () => ({
-        ...PARKED,
+        ...(await parkedBarrierOutcome()),
         cleanupErrors: ["disable failed: launchctl timed out"],
       })),
     });
@@ -130,7 +162,7 @@ describe("runExclusiveEgressArming", () => {
       kind: "degraded-coarse-active",
       stage: "release",
       coarseCompositionRestored: true,
-      harnessStartedCoarse: true,
+      harness: { disposition: "started-coarse" },
     });
     expect((outcome as { cleanupErrors: string[] }).cleanupErrors).toContain(
       "disable failed: launchctl timed out",
@@ -162,7 +194,7 @@ describe("runExclusiveEgressArming", () => {
     expect(outcome).toMatchObject({
       kind: "degraded-coarse-active",
       coarseCompositionRestored: false,
-      harnessStartedCoarse: false,
+      harness: { disposition: "not-started" },
     });
     // FAIL-CLOSED: never start the agent over a manifest that may still be
     // exclusive-scoped with no live gate.
@@ -173,11 +205,15 @@ describe("runExclusiveEgressArming", () => {
     // The degraded audit still fires with the honest false flags.
     expect(ops.audit).toHaveBeenCalledWith(
       EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP,
-      expect.objectContaining({ coarse_composition_restored: false, harness_started_coarse: false }),
+      expect.objectContaining({
+        coarse_composition_restored: false,
+        harness_disposition: "not-started",
+        harness_run_state: "parked",
+      }),
     );
   });
 
-  it("degrade path: coarse start FAILS -> harnessStartedCoarse false (agent parked), restore still true", async () => {
+  it("degrade path: coarse start FAILS -> not-started with a PROBED claim, restore still true", async () => {
     const ops = armOps({
       bringUpGeneration: vi.fn(async () => {
         throw new Error("boom");
@@ -190,11 +226,14 @@ describe("runExclusiveEgressArming", () => {
     expect(outcome).toMatchObject({
       kind: "degraded-coarse-active",
       coarseCompositionRestored: true,
-      harnessStartedCoarse: false,
+      harness: { disposition: "not-started" },
     });
     expect((outcome as { cleanupErrors: string[] }).cleanupErrors.join(" ")).toContain(
       "bootstrap refused",
     );
+    // Fix-round 4: the run state came from the PROBE, not from the start
+    // having thrown.
+    expect(ops.assessHarnessParked).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -368,7 +407,7 @@ describe("runEgressGateRepair", () => {
 
   it("fix-round BLOCKER-3 + fix-round-2 HIGH-2: repair-failed never claims PARKED unverified, and the problems are ENUMERATED", async () => {
     const notOk = repairOps({
-      runReleaseSequence: vi.fn(async () => PARKED),
+      runReleaseSequence: vi.fn(async () => await parkedBarrierOutcome()),
       verifyParkedPersistent: vi.fn(async () => ({
         ok: false as const,
         // The HIGH-2 scenario: stopped NOW, but stale release material remains.
@@ -389,7 +428,7 @@ describe("runEgressGateRepair", () => {
       "override database",
     );
     const throwing = repairOps({
-      runReleaseSequence: vi.fn(async () => PARKED),
+      runReleaseSequence: vi.fn(async () => await parkedBarrierOutcome()),
       verifyParkedPersistent: vi.fn(async () => {
         throw new Error("probe died");
       }),
@@ -420,7 +459,7 @@ describe("runEgressGateRepair", () => {
   });
 
   it("a PARKED release outcome is repair-failed (never repaired without the barrier's released verdict)", async () => {
-    const ops = repairOps({ runReleaseSequence: vi.fn(async () => PARKED) });
+    const ops = repairOps({ runReleaseSequence: vi.fn(async () => await parkedBarrierOutcome()) });
     const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
     expect(outcome).toMatchObject({ kind: "repair-failed", stage: "release" });
     expect((outcome as { reason: string }).reason).toContain("gate-verify");
@@ -449,7 +488,7 @@ describe("runBootExclusiveEgressRelease", () => {
   it("per-agent isolation: one parked/throwing agent never blocks or releases another; all audited; never throws", async () => {
     const releaseAgent = vi.fn(async (uid: number): Promise<ReleaseBarrierOutcome> => {
       if (uid === 501) return RELEASED;
-      if (uid === 502) return PARKED;
+      if (uid === 502) return await parkedBarrierOutcome();
       throw new Error("registry corrupt for 503");
     });
     const audit = vi.fn(async () => undefined);
@@ -462,12 +501,13 @@ describe("runBootExclusiveEgressRelease", () => {
     expect(results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
     // The barrier-parked agent's outcome carries the REAL re-park flags
     // (fix-round-2 BLOCKER-1).
-    expect(results[1]!.outcome).toEqual({
+    expect(results[1]!.outcome).toMatchObject({
       kind: "parked",
       reason: expect.stringContaining("gate-verify"),
       holdFileRemoved: true,
       jobDisabled: true,
       cleanupErrors: [],
+      parkedClaim: { state: "parked" },
     });
     // Fix-round-2 BLOCKER-1: a THROWING release attempt is NOT a synthetic
     // "parked" -- no re-park op verifiably ran, and the outcome says so.
@@ -477,7 +517,7 @@ describe("runBootExclusiveEgressRelease", () => {
     // The parked agent gets the LOUD repair guidance; the not-verified one
     // gets the LOUDER possibly-startable warning.
     const printed = print.mock.calls.map((c) => String(c[0])).join("\n");
-    expect(printed).toContain("remains PARKED");
+    expect(printed).toContain("is PARKED (not running)");
     expect(printed).toContain("NOT verified");
     expect(printed).toContain("possibly startable");
     expect(printed).toContain("--repair-egress-gate");
@@ -488,7 +528,7 @@ describe("runBootExclusiveEgressRelease", () => {
     const print = vi.fn();
     const results = await runBootExclusiveEgressRelease([{ agent_uid: 502 }], {
       releaseAgent: async () => ({
-        ...PARKED,
+        ...(await parkedBarrierOutcome()),
         jobDisabled: false,
         cleanupErrors: ["disable failed: launchctl exited 5: override db locked"],
       }),
@@ -513,6 +553,30 @@ describe("runBootExclusiveEgressRelease", () => {
         cleanup_errors: ["disable failed: launchctl exited 5: override db locked"],
       }),
     );
+  });
+
+  it("R5: the boot audit carries the run-state CLAIM, symmetrically with the degrade audit", async () => {
+    // FIX-ROUND 5, the gate's Finding 3. `degradeLoud`'s audit was changed in
+    // round 4 to carry `harness_run_state` + `harness_run_state_basis`, on the
+    // explicit reasoning that a consumer reading a bare token "used to receive
+    // the documented meaning 'the agent is parked' with no pid information at
+    // all, which made the falsehood SILENT downstream." This record emitted
+    // `outcome: "parked"` and DISCARDED the claim -- so a SIEM saw a park over
+    // a host where the code had just observed a live pid. Same gap, left
+    // asymmetric.
+    const audit = vi.fn(async () => undefined);
+    await runBootExclusiveEgressRelease([{ agent_uid: 502 }], {
+      releaseAgent: async () =>
+        await parkedBarrierOutcome({ known: true, installed: true, running: true, pid: 9001 }),
+      audit,
+      print: vi.fn(),
+    });
+    const details = audit.mock.calls[0]![1] as Record<string, unknown>;
+    // The outcome token still means only "the barrier did not release"...
+    expect(details.outcome).toBe("parked");
+    // ...and the record now says, machine-readably, that a live pid was seen.
+    expect(details.harness_run_state).toBe("alive");
+    expect(String(details.harness_run_state_basis)).toContain("9001");
   });
 
   it("repark-failed boot release is surfaced as a WARNING, never a clean green line", async () => {

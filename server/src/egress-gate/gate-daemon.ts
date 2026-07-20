@@ -39,7 +39,7 @@
 
 import { readFile, mkdir, writeFile, rename, rm } from "node:fs/promises";
 import { createPublicKey, type KeyObject } from "node:crypto";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 
 import type { AllowlistRule } from "../castle-wall/allowlist/schema.js";
 import { validateExclusiveEgressGatePolicy } from "../castle-wall/allowlist/gate-derivation.js";
@@ -158,6 +158,7 @@ export function parseEgressGateRuntimeState(text: string, path: string): EgressG
 }
 
 const SAFE_ACCOUNT_RE = /^[a-z_][a-z0-9._-]{0,63}$/;
+const GATE_DAEMON_LOG_DIR_NAME = "logs";
 
 function xmlEscape(value: string): string {
   return value
@@ -181,12 +182,60 @@ export interface EgressGateDaemonPlistOptions {
   agentUid: number;
   /** The dedicated gate service account (NEVER root, NEVER the agent account). */
   gateAccount: string;
+  /** The dedicated gate service account's home directory. The renderer derives logs from this. */
+  gateHomeDirectory: string;
   /** Full argv of the gate daemon entrypoint (absolute program path first). */
   programArguments: string[];
   /** Absolute fortress path, rendered as SANCTUARY_STORAGE_PATH. */
   fortressPath: string;
-  /** Absolute log directory. */
-  logDir?: string;
+}
+
+/**
+ * Derive the gate daemon log directory from the gate account's own home.
+ *
+ * This intentionally does NOT accept an arbitrary log path. The LaunchDaemon
+ * runs as `gateAccount`, so stdout/stderr must live under that account's own
+ * home; a caller trying to point it at the agent account's 0700 log directory
+ * is refused during plist construction rather than becoming launchd
+ * `EX_CONFIG` on hardware.
+ */
+export function gateDaemonLogDirForHome(input: {
+  gateAccount: string;
+  gateHomeDirectory: string;
+}): string {
+  if (!SAFE_ACCOUNT_RE.test(input.gateAccount)) {
+    throw new Error(`gate account name is not a safe service-account name (got ${JSON.stringify(input.gateAccount)})`);
+  }
+  if (!isAbsolute(input.gateHomeDirectory)) {
+    throw new Error(`gate home directory must be absolute (got ${input.gateHomeDirectory})`);
+  }
+  assertNoControlChars(input.gateHomeDirectory, "gate home directory");
+  if (basename(input.gateHomeDirectory) !== input.gateAccount) {
+    throw new Error(
+      `gate home directory ${input.gateHomeDirectory} does not belong to gate account ${input.gateAccount}; ` +
+        "refusing to render a gate daemon with cross-account logs",
+    );
+  }
+  return join(input.gateHomeDirectory, GATE_DAEMON_LOG_DIR_NAME);
+}
+
+/** The exact stdout/stderr files launchd opens for one gate daemon. */
+export function egressGateDaemonLogPaths(input: {
+  agentUid: number;
+  gateAccount: string;
+  gateHomeDirectory: string;
+}): { stdoutPath: string; stderrPath: string } {
+  if (!Number.isInteger(input.agentUid) || input.agentUid <= 0) {
+    throw new Error(`egress-gate log paths require a positive integer uid (got ${String(input.agentUid)})`);
+  }
+  const logDir = gateDaemonLogDirForHome({
+    gateAccount: input.gateAccount,
+    gateHomeDirectory: input.gateHomeDirectory,
+  });
+  return {
+    stdoutPath: join(logDir, `egress-gate-${input.agentUid}.out.log`),
+    stderrPath: join(logDir, `egress-gate-${input.agentUid}.err.log`),
+  };
 }
 
 /**
@@ -215,18 +264,13 @@ export function renderEgressGateDaemonPlist(options: EgressGateDaemonPlistOption
     throw new Error(`fortress path must be absolute (got ${options.fortressPath})`);
   }
   assertNoControlChars(options.fortressPath, "fortress path");
-  const logDir = options.logDir;
-  if (logDir !== undefined && !isAbsolute(logDir)) {
-    throw new Error(`log dir must be absolute (got ${logDir})`);
-  }
+  const { stdoutPath, stderrPath } = egressGateDaemonLogPaths(options);
   const argsXml = options.programArguments
     .map((a) => `\t\t<string>${xmlEscape(a)}</string>`)
     .join("\n");
   const logXml =
-    logDir !== undefined
-      ? `\t<key>StandardOutPath</key>\n\t<string>${xmlEscape(join(logDir, `egress-gate-${options.agentUid}.out.log`))}</string>\n` +
-        `\t<key>StandardErrorPath</key>\n\t<string>${xmlEscape(join(logDir, `egress-gate-${options.agentUid}.err.log`))}</string>\n`
-      : "";
+    `\t<key>StandardOutPath</key>\n\t<string>${xmlEscape(stdoutPath)}</string>\n` +
+    `\t<key>StandardErrorPath</key>\n\t<string>${xmlEscape(stderrPath)}</string>\n`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

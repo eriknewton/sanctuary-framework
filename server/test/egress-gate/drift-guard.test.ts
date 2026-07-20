@@ -18,8 +18,39 @@ import { PF_ANCHOR_NAME, type PfCommandRunner } from "../../src/egress-gate/pf-a
 
 const EXPECTED_RULES = [
   "scrub-anchor \"com.apple/*\" all fragment reassemble",
+  "nat-anchor \"com.apple/*\" all",
+  "rdr-anchor \"com.apple/*\" all",
   "anchor \"com.apple/*\" all",
+  "dummynet-anchor \"com.apple/*\" all",
 ];
+
+const STOCK_MACOS_RUNNING_RULES = [
+  "scrub-anchor \"com.apple/*\" all fragment reassemble",
+  "nat-anchor \"com.apple/*\" all",
+  "rdr-anchor \"com.apple/*\" all",
+  "anchor \"com.apple/*\" all",
+  "dummynet-anchor \"com.apple/*\" all",
+];
+
+const STOCK_MACOS_BASE_DERIVED_RULES = [
+  "scrub-anchor \"/*\" all fragment reassemble",
+  "nat-anchor \"/*\" all",
+  "rdr-anchor \"/*\" all",
+  "anchor \"/*\" all",
+  "dummynet-anchor \"/*\" all",
+  "anchor \"/*\" all",
+  "anchor \"/*\" all",
+];
+
+const STOCK_MACOS_BASE_CONFIG = [
+  'scrub-anchor "com.apple/*" all fragment reassemble',
+  'nat-anchor "com.apple/*" all',
+  'rdr-anchor "com.apple/*" all',
+  'anchor "com.apple/*" all',
+  'dummynet-anchor "com.apple/*" all',
+  'load anchor "com.apple" from "/etc/pf.anchors/com.apple"',
+  "",
+].join("\n");
 
 /** A runner whose -sr and -n -v -f outputs are scripted per test. */
 function scriptedRunner(script: {
@@ -27,6 +58,7 @@ function scriptedRunner(script: {
   runningCode?: number;
   parseRules?: string[];
   parseCode?: number;
+  parseStderr?: string;
 }): PfCommandRunner & { calls: string[][] } {
   const calls: string[][] = [];
   return {
@@ -44,7 +76,9 @@ function scriptedRunner(script: {
       return {
         code: script.parseCode ?? 0,
         stdout: `${(script.parseRules ?? EXPECTED_RULES).join("\n")}\n`,
-        stderr: script.parseCode !== undefined && script.parseCode !== 0 ? "pfctl: syntax error" : "",
+        stderr:
+          script.parseStderr ??
+          (script.parseCode !== undefined && script.parseCode !== 0 ? "pfctl: syntax error" : ""),
       };
     },
   };
@@ -93,6 +127,69 @@ describe("egress-gate/drift-guard diffTransientPfRules", () => {
     });
     const diff = await diffTransientPfRules(runner, { mainConfPath });
     expect(diff.foreign).toEqual([]);
+  });
+
+  it("D5: stock macOS anchors compare equal against the real seven stripped-anchor lines", async () => {
+    await writeFile(mainConfPath, STOCK_MACOS_BASE_CONFIG);
+    const runner = scriptedRunner({
+      runningRules: STOCK_MACOS_RUNNING_RULES,
+      parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([]);
+    expect(diff.expectedCount).toBe(STOCK_MACOS_RUNNING_RULES.length);
+    expect(diff.runningCount).toBe(STOCK_MACOS_RUNNING_RULES.length);
+  });
+
+  it("L1: expectedCount ignores pfctl normalization warnings written to stderr", async () => {
+    await writeFile(mainConfPath, STOCK_MACOS_BASE_CONFIG);
+    const runner = scriptedRunner({
+      runningRules: STOCK_MACOS_RUNNING_RULES,
+      parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
+      parseStderr: [
+        "pfctl: Use of -f option, could result in flushing of rules",
+        "present in the main ruleset",
+        "pfctl: load anchors",
+      ].join("\n"),
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([]);
+    expect(diff.expectedCount).toBe(STOCK_MACOS_RUNNING_RULES.length);
+    expect(diff.runningCount).toBe(STOCK_MACOS_RUNNING_RULES.length);
+  });
+
+  it("D5: a genuinely foreign transient anchor still refuses under the stock-anchor normalization", async () => {
+    await writeFile(mainConfPath, STOCK_MACOS_BASE_CONFIG);
+    const vpnRule = 'anchor "com.corp.vpn/*" on en0 all';
+    const runner = scriptedRunner({
+      runningRules: [...STOCK_MACOS_RUNNING_RULES, vpnRule],
+      parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([vpnRule]);
+  });
+
+  it('M1: a literal running anchor "/*" line remains the observed foreign rule', async () => {
+    await writeFile(mainConfPath, STOCK_MACOS_BASE_CONFIG);
+    const runningRule = 'anchor "/*" all';
+    const runner = scriptedRunner({
+      runningRules: [runningRule],
+      parseRules: STOCK_MACOS_BASE_DERIVED_RULES,
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([runningRule]);
+    expect(diff.runningCount).toBe(1);
+  });
+
+  it("M1: expected-side stripped-anchor expansion does not launder a new running suffix", async () => {
+    await writeFile(mainConfPath, 'anchor "com.apple/*"\nanchor "com.corp.vpn/*" on en0\n');
+    const runningRule = 'anchor "com.apple/*" on en0 all';
+    const runner = scriptedRunner({
+      runningRules: [runningRule],
+      parseRules: ['anchor "/*" all', 'anchor "/*" on en0 all'],
+    });
+    const diff = await diffTransientPfRules(runner, { mainConfPath });
+    expect(diff.foreign).toEqual([runningRule]);
   });
 
   it("fail-closed: pfctl -sr failure THROWS (never diff blind)", async () => {

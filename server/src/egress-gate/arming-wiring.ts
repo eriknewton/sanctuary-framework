@@ -43,8 +43,8 @@ import {
   createPublicKey,
   type KeyObject,
 } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, chown, lstat, mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dirname, join, normalize as normalizePath } from "node:path";
 
 import {
   PfAnchorRegistry,
@@ -52,6 +52,7 @@ import {
   type PfAnchorQuarantineRepairResult,
 } from "./anchor-registry.js";
 import type { PfLivenessResult } from "./pf-anchor.js";
+import { assessHarnessParked } from "./parked-claim.js";
 import {
   GenerationCoordinator,
   bindEphemeralGatePort,
@@ -79,29 +80,36 @@ import {
   agentHarnessDaemonStatus,
   agentHarnessDaemonStableRunning,
   installAgentHarnessDaemon,
+  launchctlBootoutWasNotLoaded,
   planAgentHarnessDaemonInstall,
+  readAgentHarnessJobDisabledOverride,
   setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
   type HarnessDaemonStatus,
 } from "./harness-daemon.js";
 import {
   AGENT_HARNESS_HOLD_DIR,
+  holdFileNameForUid,
   holdFilePathForUid,
   planParkedHarnessInstall,
   renderHarnessReleaseHoldFile,
   runReleaseBarrierSequence,
+  writeIntoHoldDir,
   type CommittedGenerationIdentity,
+  type HoldDirWriteOps,
   type ReleaseBarrierOps,
   type ReleaseBarrierOutcome,
 } from "./release-barrier.js";
 import {
   GATE_ORACLE_PUBLIC_KEY_PATH,
   egressGateDaemonLabel,
+  egressGateDaemonLogPaths,
   egressGateDaemonPlistPath,
   egressGatePolicyConfigPath,
   egressGateRulesConfigPath,
   egressGateRuntimeStatePath,
   egressGateRuntimeUidDirPath,
+  gateDaemonLogDirForHome,
   parseEgressGateRuntimeState,
   renderEgressGateDaemonPlist,
   type EgressGateRuntimeState,
@@ -147,6 +155,8 @@ export const GATE_ORACLE_PRIVATE_KEY_PATH = `${GATE_LIVENESS_DIR}/supervisor-ora
 const LAUNCHCTL_TIMEOUT_MS = 15_000;
 const GATE_RUNTIME_WAIT_BUDGET_MS = 15_000;
 const GATE_RUNTIME_WAIT_INTERVAL_MS = 250;
+export const GATE_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
+const GATE_ACCOUNT_HOME_BASE_RESOLVED = "/private/var/sanctuary-agents";
 
 /** Real O_EXCL lock ops (the shipped provision-lock discipline). */
 export function fsLockOps(): ProvisionLockOps {
@@ -361,10 +371,128 @@ function realHarnessOps(): HarnessDaemonOps {
     async writeFile(path, content, mode): Promise<void> {
       await writeFile(path, content, { mode });
     },
+    async readFile(path): Promise<string | undefined> {
+      try {
+        return await readFile(path, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw err;
+      }
+    },
     async removeFile(path): Promise<void> {
       await rm(path, { force: true });
     },
     runLaunchctl,
+  };
+}
+
+/**
+ * PRODUCTION hold-directory ensure (drill D1, 2026-07-18). Fed to
+ * {@link writeIntoHoldDir}, which is the only route into the root-owned hold
+ * dir; never called directly by a writer. The policy (and the reasoning for
+ * each step) lives in {@link applyRootOwnedDirEnsure}; this is the thin
+ * production binding of real filesystem calls to it.
+ */
+export async function ensureAgentHarnessHoldDir(path: string, mode: number): Promise<void> {
+  await applyRootOwnedDirEnsure(path, mode, realRootDirEnsureOps());
+}
+
+/**
+ * The injected surface {@link applyRootOwnedDirEnsure} runs over. Exists so the
+ * ensure POLICY -- including the `chown(0,0)` and the symlink refusal, neither
+ * of which a non-root test process can exercise against the real filesystem --
+ * is asserted directly instead of being trusted. (The pre-fix real-filesystem
+ * test substituted a hand-written ensure that dropped the chown entirely, so
+ * deleting that line from production changed no test.)
+ */
+export interface RootOwnedDirEnsureOps {
+  mkdir(path: string): Promise<void>;
+  /** `lstat`, NOT `stat`: the point is to see a symlink rather than follow it. */
+  lstatKind(path: string): Promise<"dir" | "symlink" | "other">;
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  chmod(path: string, mode: number): Promise<void>;
+}
+
+function realRootDirEnsureOps(): RootOwnedDirEnsureOps {
+  return {
+    async mkdir(path): Promise<void> {
+      await mkdir(path, { recursive: true });
+    },
+    async lstatKind(path): Promise<"dir" | "symlink" | "other"> {
+      const st = await lstat(path);
+      if (st.isSymbolicLink()) return "symlink";
+      return st.isDirectory() ? "dir" : "other";
+    },
+    async chown(path, uid, gid): Promise<void> {
+      await chown(path, uid, gid);
+    },
+    async chmod(path, mode): Promise<void> {
+      await chmod(path, mode);
+    },
+  };
+}
+
+/**
+ * Ensure a root-owned runtime directory AND its immediate parent exist as real
+ * root-owned directories with an explicit mode.
+ *
+ * `mkdir`'s `mode` argument is umask-masked, so the mode is applied by an
+ * EXPLICIT `chmod` afterwards (which also heals a directory an older build, or
+ * a hand-repair, left at the wrong mode). Ownership is re-asserted to
+ * root:wheel for the same reason. Every failure THROWS -- the previous
+ * `mkdir(...).catch(() => undefined)` would have let a broken layout through to
+ * a write that then failed with a less legible error.
+ *
+ * SYMLINK REFUSAL (Codex lens, empirically demonstrated 2026-07-18):
+ * `mkdir(p,{recursive:true})` SUCCEEDS when `p` is a symlink to a directory,
+ * and the subsequent `chmod(p, mode)` then changes the TARGET's mode while
+ * `lstat(p)` still reports a symlink. This code runs as root, so applying
+ * `chown(0,0)`/`chmod` through an attacker-shaped link, or writing release
+ * material into wherever it points, is not something to leave to the
+ * root-ownership of `/var/db`. An `lstat` after the mkdir refuses anything
+ * that is not a real directory, BEFORE any ownership or mode is applied.
+ *
+ * PARENT INCLUDED (Claude lens): on a first-ever install this call is what
+ * creates `/var/db/sanctuary` itself, and only the leaf was chmodded -- so the
+ * parent was left at `0777 & ~umask` and, under a hardened umask, the agent uid
+ * could not traverse to its own hold file. The runtime-FS plan healed it later,
+ * an ordering dependency nothing pinned. The parent is now ensured here, by the
+ * same code, at the same mode.
+ */
+export async function applyRootOwnedDirEnsure(
+  path: string,
+  mode: number,
+  ops: RootOwnedDirEnsureOps,
+): Promise<void> {
+  const parent = dirname(path);
+  // The parent is ensured first (mkdir -p would create it implicitly anyway;
+  // doing it explicitly is what lets us assert its shape and mode too). Guard
+  // against a degenerate path whose parent is itself.
+  const targets = parent === path || parent === "/" ? [path] : [parent, path];
+  for (const target of targets) {
+    await ops.mkdir(target);
+    const kind = await ops.lstatKind(target);
+    if (kind !== "dir") {
+      throw new Error(
+        `refusing to use ${target} as a root-owned runtime directory: it is a ${kind}, not a real directory. ` +
+          "Remove it and re-run (root-owned installer state is never applied through a symlink).",
+      );
+    }
+    await ops.chown(target, 0, 0);
+    await ops.chmod(target, mode);
+  }
+}
+
+/**
+ * The production {@link HoldDirWriteOps} pair: ensure the root-owned hold dir,
+ * then write the file atomically as root. Shared by the parked install
+ * (`wrap/auto-provision.ts`) and the release sequence's hold-file write below,
+ * so both writers into that directory use the SAME ensure.
+ */
+export function realHoldDirWriteOps(): HoldDirWriteOps {
+  return {
+    ensureHoldDir: ensureAgentHarnessHoldDir,
+    writeFile: atomicRootWrite,
   };
 }
 
@@ -435,6 +563,148 @@ export interface ExclusiveEgressWiringInput {
 interface BringUpState {
   gateUid: number;
   gateAccountName: string;
+}
+
+/** Injected filesystem surface for the gate account home/log layout. */
+export interface GateAccountHomeLayoutOps {
+  mkdir(path: string): Promise<void>;
+  ensureFile(path: string, mode: number): Promise<void>;
+  chown(path: string, uid: number, gid: number): Promise<void>;
+  chmod(path: string, mode: number): Promise<void>;
+  lstat(path: string): Promise<{
+    isDirectory(): boolean;
+    isFile(): boolean;
+    isSymbolicLink(): boolean;
+    uid: number;
+    gid: number;
+    mode: number;
+  }>;
+}
+
+function realGateAccountHomeLayoutOps(): GateAccountHomeLayoutOps {
+  return {
+    async mkdir(path: string): Promise<void> {
+      try {
+        await mkdir(path, { recursive: true });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      }
+    },
+    async ensureFile(path: string, mode: number): Promise<void> {
+      const handle = await open(path, "wx", mode);
+      await handle.close();
+    },
+    chown,
+    chmod,
+    lstat,
+  };
+}
+
+function normalizeLayoutPath(path: string): string {
+  const normalized = normalizePath(path);
+  if (normalized === "/") return normalized;
+  return normalized.replace(/\/+$/, "");
+}
+
+function assertGateHomeUnderFixedBase(gateHomeDirectory: string): void {
+  const parent = normalizeLayoutPath(dirname(gateHomeDirectory));
+  if (parent !== GATE_ACCOUNT_HOME_BASE && parent !== GATE_ACCOUNT_HOME_BASE_RESOLVED) {
+    throw new Error(
+      `refusing to prepare gate account home ${gateHomeDirectory}: parent ${parent} is outside ` +
+        `${GATE_ACCOUNT_HOME_BASE}`,
+    );
+  }
+}
+
+async function lstatIfExists(
+  ops: GateAccountHomeLayoutOps,
+  path: string,
+): Promise<Awaited<ReturnType<GateAccountHomeLayoutOps["lstat"]>> | undefined> {
+  try {
+    return await ops.lstat(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw err;
+  }
+}
+
+/**
+ * Ensure the gate account's own home, log directory, and launchd stdout/stderr
+ * log files exist and are writable by the gate uid before the LaunchDaemon
+ * plist is rendered.
+ *
+ * The parent base is fixed and root-owned/traversable; the home and `logs`
+ * child are gate-owned 0700, and the log files are gate-owned 0600. Each step
+ * is lstat'd after chown/chmod so success is an observation of the final
+ * state, not a claim from calls returning.
+ */
+export async function ensureGateAccountHomeLayout(
+  input: { agentUid: number; gateAccount: string; gateUid: number; gateHomeDirectory: string },
+  ops: GateAccountHomeLayoutOps = realGateAccountHomeLayoutOps(),
+): Promise<{ logDir: string }> {
+  assertGateHomeUnderFixedBase(input.gateHomeDirectory);
+  const logDir = gateDaemonLogDirForHome({
+    gateAccount: input.gateAccount,
+    gateHomeDirectory: input.gateHomeDirectory,
+  });
+  const dirTargets = [
+    { path: dirname(input.gateHomeDirectory), uid: 0, gid: 0, mode: 0o711, label: "gate home parent" },
+    { path: input.gateHomeDirectory, uid: input.gateUid, gid: input.gateUid, mode: 0o700, label: "gate home" },
+    { path: logDir, uid: input.gateUid, gid: input.gateUid, mode: 0o700, label: "gate log dir" },
+  ];
+  for (const target of dirTargets) {
+    await ops.mkdir(target.path);
+    const before = await ops.lstat(target.path);
+    if (!before.isDirectory()) {
+      throw new Error(
+        `refusing to use ${target.path} as ${target.label}: it is a ` +
+          `${before.isSymbolicLink() ? "symlink" : "non-directory"}, not a real directory`,
+      );
+    }
+    await ops.chown(target.path, target.uid, target.gid);
+    await ops.chmod(target.path, target.mode);
+    const after = await ops.lstat(target.path);
+    const mode = after.mode & 0o777;
+    if (!after.isDirectory() || after.uid !== target.uid || mode !== target.mode) {
+      throw new Error(
+        `gate account home layout did not verify for ${target.path}: observed ` +
+          `${after.isDirectory() ? "directory" : after.isSymbolicLink() ? "symlink" : "non-directory"} ` +
+          `uid=${after.uid} mode=${mode.toString(8)}, expected uid=${target.uid} mode=${target.mode.toString(8)}`,
+      );
+    }
+  }
+  const logPaths = egressGateDaemonLogPaths({
+    agentUid: input.agentUid,
+    gateAccount: input.gateAccount,
+    gateHomeDirectory: input.gateHomeDirectory,
+  });
+  const fileTargets = [
+    { path: logPaths.stdoutPath, uid: input.gateUid, gid: input.gateUid, mode: 0o600, label: "gate stdout log file" },
+    { path: logPaths.stderrPath, uid: input.gateUid, gid: input.gateUid, mode: 0o600, label: "gate stderr log file" },
+  ];
+  for (const target of fileTargets) {
+    const before = await lstatIfExists(ops, target.path);
+    if (before === undefined) {
+      await ops.ensureFile(target.path, target.mode);
+    } else if (!before.isFile()) {
+      throw new Error(
+        `refusing to use ${target.path} as ${target.label}: it is a ` +
+          `${before.isSymbolicLink() ? "symlink" : "non-file"}, not a real file`,
+      );
+    }
+    await ops.chown(target.path, target.uid, target.gid);
+    await ops.chmod(target.path, target.mode);
+    const after = await ops.lstat(target.path);
+    const mode = after.mode & 0o777;
+    if (!after.isFile() || after.uid !== target.uid || mode !== target.mode) {
+      throw new Error(
+        `gate account home layout did not verify for ${target.path}: observed ` +
+          `${after.isFile() ? "file" : after.isSymbolicLink() ? "symlink" : "non-file"} ` +
+          `uid=${after.uid} mode=${mode.toString(8)}, expected uid=${target.uid} mode=${target.mode.toString(8)}`,
+      );
+    }
+  }
+  return { logDir };
 }
 
 /**
@@ -577,6 +847,7 @@ async function productionBringUp(
     renderEgressGateDaemonPlist({
       agentUid: input.agentUid,
       gateAccount: state.gateAccountName,
+      gateHomeDirectory: input.gateHomeDirectory,
       programArguments: [
         ...input.gateDaemonArgvPrefix,
         "castle-wall",
@@ -584,7 +855,6 @@ async function productionBringUp(
         `--agent-uid=${input.agentUid}`,
       ],
       fortressPath: input.fortressPath,
-      logDir: input.harnessLogDir,
     }),
     { mode: 0o644 },
   );
@@ -730,6 +1000,14 @@ export function createProductionReleaseBarrierOps(input: {
   internals?: {
     registry?: PfAnchorRegistry;
     probeAnchorLiveness?: (policy: { agent_uid: number; gate_port: number }) => Promise<PfLivenessResult>;
+    /**
+     * Fix-round 2 (2026-07-18): a seam for the launchd verbs this factory
+     * issues, so the not-loaded tolerance below can be tested against the
+     * shapes a clean host actually produces. It existed only as an untestable
+     * closure over the module-level runner, which is how it kept its own
+     * divergent regex through the F4 "one predicate" fix.
+     */
+    runLaunchctl?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
   };
 }): ReleaseBarrierOps {
   const registry = input.internals?.registry ?? createProductionAnchorRegistry();
@@ -738,6 +1016,7 @@ export function createProductionReleaseBarrierOps(input: {
     ((policy: { agent_uid: number; gate_port: number }): Promise<PfLivenessResult> =>
       checkPfAnchorLiveness(createExecFilePfRunner(), policy));
   const print = input.print ?? ((): void => undefined);
+  const launchctl = input.internals?.runLaunchctl ?? runLaunchctl;
   const staging = createFsGenerationStagingStore();
   const harnessOps = realHarnessOps();
   const holdPath = holdFilePathForUid(input.agentUid);
@@ -797,36 +1076,81 @@ export function createProductionReleaseBarrierOps(input: {
     return readCommittedFrom(await listQuarantineAware("commit-generation"));
   }
 
+  // The barrier's launchd surface, bound to THIS sequence's launchctl runner
+  // so the enable/disable readback (fix-round 3) uses the same one the rest of
+  // the sequence does.
+  const barrierHarnessOps: HarnessDaemonOps = { ...realHarnessOps(), runLaunchctl: launchctl };
+
   return {
     async disableJob(): Promise<void> {
-      const r = await runLaunchctl(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-      if (r.code !== 0) throw new Error(`launchctl disable exited ${r.code}: ${r.stderr.trim()}`);
+      // Routed through `setAgentHarnessJobDisabled` (fix-round 3, 2026-07-19)
+      // rather than checking the exit code here: that function re-reads
+      // launchd's persistent override database, so `jobDisabled: true` in a
+      // parked outcome is an observation. This site was a hand-rolled second
+      // copy that only saw the exit code.
+      await setAgentHarnessJobDisabled(barrierHarnessOps, true);
     },
     async enableJob(): Promise<void> {
-      const r = await runLaunchctl(["enable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-      if (r.code !== 0) throw new Error(`launchctl enable exited ${r.code}: ${r.stderr.trim()}`);
+      await setAgentHarnessJobDisabled(barrierHarnessOps, false);
     },
     async bootstrapJob(): Promise<void> {
       const plistPath = `/Library/LaunchDaemons/${AGENT_HARNESS_DAEMON_LABEL}.plist`;
-      const b = await runLaunchctl(["bootstrap", "system", plistPath]);
+      const b = await launchctl(["bootstrap", "system", plistPath]);
       if (b.code !== 0 && !/already bootstrapped/i.test(b.stderr)) {
         throw new Error(`launchctl bootstrap exited ${b.code}: ${b.stderr.trim()}`);
       }
-      const k = await runLaunchctl(["kickstart", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      const k = await launchctl(["kickstart", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
       if (k.code !== 0) throw new Error(`launchctl kickstart exited ${k.code}: ${k.stderr.trim()}`);
     },
     async bootoutJob(): Promise<void> {
-      const r = await runLaunchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-      if (r.code !== 0 && !/No such process|Could not find/i.test(r.stderr)) {
+      const r = await launchctl(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+      // FIX-ROUND 2 (2026-07-18): the ONE shared predicate, not a second
+      // hand-maintained regex. This site was the last production bootout still
+      // carrying its own narrow list (stderr-only, `No such process` /
+      // `Could not find`), which is precisely the divergence the F4 "one
+      // predicate" fix existed to end -- and it is reachable from the newly
+      // reachable release sequence's reassert-parked and bootstrap-cleanup
+      // steps, where a clean host reporting a not-loaded shape this regex does
+      // not know would refuse the fine-grained arm for no reason.
+      // FIX-ROUND 3 (2026-07-19): the predicate's safety argument -- "no caller
+      // relies on it alone; every one re-reads `launchctl print` afterwards and
+      // refuses if the job is still running" -- is now TRUE of this caller.
+      // `runReleaseBarrierSequence`'s reassert-parked stage performs that
+      // authoritative settled re-read before it proceeds to `rearmAnchor`; the
+      // abort-cleanup call sites are followed by a fail-closed parked outcome.
+      if (!launchctlBootoutWasNotLoaded(r)) {
         throw new Error(`launchctl bootout exited ${r.code}: ${r.stderr.trim()}`);
       }
     },
     async removeHoldFile(): Promise<void> {
       await rm(holdPath, { force: true });
+      // READ BACK (fix-round 3, 2026-07-19). `holdFileRemoved: true` in a
+      // parked outcome told the operator the release material is gone; it used
+      // to mean only that `rm` did not throw. The hold file is what the S5-5
+      // wrapper consults to decide whether to exec, so a stale one surviving a
+      // park is the fail-open direction.
+      try {
+        await readFile(holdPath, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw new Error(`could not confirm the release hold file ${holdPath} is gone: ${(err as Error).message}`, {
+          cause: err,
+        });
+      }
+      throw new Error(`the release hold file ${holdPath} is STILL PRESENT after removal`);
     },
     async writeHoldFile(record): Promise<void> {
-      await mkdir(AGENT_HARNESS_HOLD_DIR, { recursive: true, mode: 0o755 }).catch(() => undefined);
-      await atomicRootWrite(holdPath, renderHarnessReleaseHoldFile(record), 0o644);
+      // Drill D1: routed through the single hold-dir chokepoint, which ensures
+      // the directory root-owned 0755 and composes the file path itself, never
+      // a local mkdir. The old local `mkdir(...).catch(() => undefined)` is
+      // exactly the split-responsibility the chokepoint retires.
+      await writeIntoHoldDir(
+        realHoldDirWriteOps(),
+        AGENT_HARNESS_HOLD_DIR,
+        holdFileNameForUid(input.agentUid),
+        renderHarnessReleaseHoldFile(record),
+        0o644,
+      );
     },
     async bootSessionUuid(): Promise<string> {
       const { stdout } = await execFileAsync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"]);
@@ -977,6 +1301,20 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
       },
       input.accountOps,
     );
+    input.print(`Observed gate account ${account.accountName}: ${account.observed}.`);
+    await input.audit("exclusive_egress_gate_account_observed", {
+      agent_id: input.agentId,
+      agent_uid: input.agentUid,
+      gate_account: account.accountName,
+      gate_uid: account.uid,
+      observed: account.observed,
+    });
+    await ensureGateAccountHomeLayout({
+      agentUid: input.agentUid,
+      gateAccount: account.accountName,
+      gateUid: account.uid,
+      gateHomeDirectory: input.gateHomeDirectory,
+    });
     const keys = await ensureSupervisorOracleKeys();
     state = { gateUid: account.uid, gateAccountName: account.accountName };
     oracle = createProductionOracle(keys.privateKey, account.uid);
@@ -1057,6 +1395,38 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
       await setAgentHarnessJobDisabled(harnessOps, false);
       await installAgentHarnessDaemon(plan, harnessOps);
     },
+    async assessHarnessParked() {
+      // THE chokepoint (fix-round 4). Pid-strict: `assessHarnessParked`
+      // disqualifies a park on ANY pid, so a crash-looping survivor reads as
+      // ALIVE, not as parked.
+      //
+      // FIX-ROUND 5 (the gate's LOW-5, confirmed real): this used to refine
+      // `running` with `agentHarnessDaemonStableRunning` -- up to 30 samples
+      // at 500ms -- INSIDE `assessHarnessParked`'s own 20-sample settle loop.
+      // Over a live harness (the case this probe exists for) that nesting cost
+      // roughly 15-25s per abort, held under the provision lock. Removed, not
+      // merely bounded. `probeHarnessRunning` keeps the stable-pid bar, which
+      // is the right bar for "did it come up?" and the wrong one for "is it
+      // gone?".
+      //
+      // FIX-ROUND 6 (the gate's Finding 3): round 5 justified this removal by
+      // claiming it "CANNOT change the verdict", and that argument was WRONG.
+      // For a status that is KNOWN and reports RUNNING with NO pid, the old
+      // wiring downgraded the running flag and the claim came back `parked`;
+      // this one returns `alive`, because `assessHarnessParked` keys on
+      // `running || pid !== undefined`. The verdict does change -- in the
+      // FAIL-CLOSED direction, which is why the removal stands. The honest
+      // statement is "it can only move a claim AWAY from parked", not "it
+      // cannot move a claim". Reachability was checked separately: the two
+      // sites that branch on `claim.state` both use their own unmodified
+      // probes, so no decision reads this one.
+      const harnessOps = realHarnessOps();
+      return assessHarnessParked({
+        probe: {
+          harnessStatus: (): Promise<HarnessDaemonStatus> => agentHarnessDaemonStatus(harnessOps),
+        },
+      });
+    },
     audit: input.audit,
     print: input.print,
   };
@@ -1090,7 +1460,7 @@ export async function restoreCoarseCompositionProduction(
   // would leave a live-but-unaccounted-for daemon, and swallowing that was
   // the exact reviewed defect. The caller keeps the agent parked, loudly.
   const bootout = await launchctl(["bootout", `system/${egressGateDaemonLabel(input.agentUid)}`]);
-  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
     throw new Error(
       `coarse restore: could not stop the egress-gate daemon (launchctl bootout exited ${bootout.code}: ` +
         `${bootout.stderr.trim()}); refusing to tear down the gate surfaces under a possibly-live gate`,
@@ -1193,15 +1563,15 @@ export interface PersistentParkDeps {
 export async function verifyHarnessJobDisabled(
   runLaunchctlFn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }> = runLaunchctl,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-  const r = await runLaunchctlFn(["print-disabled", "system"]);
-  if (r.code !== 0) {
-    return { ok: false, reason: `launchctl print-disabled system exited ${r.code}: ${r.stderr.trim()}` };
-  }
-  // macOS prints either `"<label>" => disabled` (newer) or `"<label>" => true`.
-  const label = AGENT_HARNESS_DAEMON_LABEL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  if (new RegExp(`"${label}"\\s*=>\\s*(disabled|true)\\b`).test(r.stdout)) {
-    return { ok: true };
-  }
+  // ONE parser for the override table (fix-round 3, 2026-07-19): this used to
+  // carry its own copy of the `print-disabled` regex, and
+  // `setAgentHarnessJobDisabled`'s new readback would have been a second one.
+  const override = await readAgentHarnessJobDisabledOverride({
+    ...realHarnessOps(),
+    runLaunchctl: runLaunchctlFn,
+  });
+  if (!override.known) return { ok: false, reason: override.reason };
+  if (override.disabled) return { ok: true };
   return {
     ok: false,
     reason: `launchd's override database does not show ${AGENT_HARNESS_DAEMON_LABEL} disabled (the job can boot at next reboot)`,
@@ -1297,13 +1667,22 @@ export async function parkHarnessPersistently(
     deps.writeFileFn ?? (async (path: string, content: string, mode: number): Promise<void> => writeFile(path, content, { mode }));
   const removeFileFn = deps.removeFileFn ?? (async (path: string): Promise<void> => rm(path, { force: true }));
   const problems: string[] = [];
-  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
-    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
-  }
+  // ORDER: `disable` FIRST, then `bootout` -- identical to
+  // `executeParkedHarnessInstall`'s stand-down and for the same reason. The
+  // harness plist carries KeepAlive, so booting out an ENABLED job leaves a
+  // window in which launchd can restart it underneath us; disabling first
+  // closes that window. (Fix-round 2026-07-18: this helper and its unprotect
+  // sibling did bootout-then-disable, so the codebase stated two different
+  // orders for the same invariant. Neither gate lens proved the window
+  // observable here -- both helpers re-verify the full parked posture
+  // afterwards -- but one invariant gets one order.)
   const disable = await launchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
   if (disable.code !== 0) {
     problems.push(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
+  }
+  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
+    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
   }
   try {
     await removeFileFn(holdFilePathForUid(ctx.agentUid));
@@ -1463,13 +1842,15 @@ async function parkHarnessForUnprotect(
   const launchctlFn = deps.runLaunchctlFn ?? runLaunchctl;
   const removeFileFn = deps.removeFileFn ?? (async (path: string): Promise<void> => rm(path, { force: true }));
   const problems: string[] = [];
-  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-  if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
-    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
-  }
+  // Same disable-then-bootout order as `parkHarnessPersistently` above; see
+  // the ordering note there.
   const disable = await launchctlFn(["disable", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
   if (disable.code !== 0) {
     problems.push(`launchctl disable exited ${disable.code}: ${disable.stderr.trim()}`);
+  }
+  const bootout = await launchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
+    problems.push(`launchctl bootout exited ${bootout.code}: ${bootout.stderr.trim()}`);
   }
   try {
     await removeFileFn(holdFilePathForUid(ctx.agentUid));
@@ -1588,7 +1969,7 @@ export function createUnprotectExclusiveEgressOps(
     async bootoutGateDaemon(): Promise<void> {
       const label = egressGateDaemonLabel(input.agentUid);
       const bootout = await launchctl(["bootout", `system/${label}`]);
-      if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+      if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
         throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
       }
     },
@@ -1670,6 +2051,8 @@ export type BootAgentResolution =
       agentAccount: string;
       harnessArgv: string[];
       harnessLogDir: string;
+      gateAccount: string;
+      gateHomeDirectory: string;
       gateUid: number;
     }
   | { kind: "unresolvable"; reason: string };
@@ -1719,6 +2102,12 @@ export interface ExclusiveEgressBootSupervisorInternals {
   gateWaitIntervalMs?: number;
   loadMarker?: (fortressPath: string) => Promise<{ agent_uid: number; gate_uid: number } | null>;
   ensureRuntimeFs?: (input: { agentUid: number; gateUid: number }) => Promise<void>;
+  ensureGateHomeLayout?: (input: {
+    agentUid: number;
+    gateAccount: string;
+    gateUid: number;
+    gateHomeDirectory: string;
+  }) => Promise<{ logDir: string }>;
 }
 
 /**
@@ -1760,7 +2149,7 @@ async function reassertParkedWithoutContext(input: {
   const errors: string[] = [];
   if (input.sharedLabelOpsAllowed) {
     const bootout = await input.runLaunchctlFn(["bootout", `system/${AGENT_HARNESS_DAEMON_LABEL}`]);
-    if (bootout.code !== 0 && !/No such process|Could not find|not find service/i.test(bootout.stderr)) {
+    if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
       errors.push(`bootout failed: launchctl exited ${bootout.code}: ${bootout.stderr.trim()}`);
     }
   }
@@ -1861,6 +2250,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
     (async (fortressPath: string): Promise<{ agent_uid: number; gate_uid: number } | null> =>
       loadExclusiveRoutingMarker(fortressPath));
   const ensureRuntimeFs = internals.ensureRuntimeFs ?? ensureExclusiveEgressRuntimeFs;
+  const ensureGateHomeLayout = internals.ensureGateHomeLayout ?? ensureGateAccountHomeLayout;
 
   let listing: BootRegistryListing;
   try {
@@ -1978,31 +2368,45 @@ export async function startExclusiveEgressBootSupervisor(input: {
             // Fix-round-3 HIGH-1: with bootout withheld, NOTHING above stopped
             // a harness already running from stale launchd state -- hold-file
             // removal blocks only the NEXT start (the exec wrapper), never a
-            // live process. VERIFY not-running (the same launchd status probe
-            // the repair path's park verify uses) before claiming PARKED; a
-            // running or unknowable job is a LOUD park-not-verified (the
-            // throw below maps to that distinct outcome), never a silent
-            // PARKED report over a live process. This probe runs BEFORE any
-            // resolved uid's release (phase-2 ordering), so a running job
-            // here is stale state by construction, not a fresh release.
-            const status = await agentHarnessDaemonStatus({ ...realHarnessOps(), runLaunchctl: launchctlFn });
-            if (!status.known || status.running) {
-              throw new Error(
-                `uid ${agentUid} re-park NOT verified: ` +
-                  (status.known
-                    ? `the shared harness job ${AGENT_HARNESS_DAEMON_LABEL} reports RUNNING (pid ${status.pid ?? "unknown"})`
-                    : `launchctl did not return a trustworthy status for the shared harness job ${AGENT_HARNESS_DAEMON_LABEL}`) +
-                  ` while bootout/disable were withheld (uid(s) ${resolvedUids.join(", ")} resolved for ` +
-                  "release on that host-singleton label); the hold file was removed so the exec wrapper " +
-                  "refuses any NEW start, but a process already running from stale launchd state was NOT " +
-                  "stopped; intervene manually",
-              );
-            }
+            // live process. The verification is the shared chokepoint below;
+            // this branch only records that the stronger stop was withheld.
+            // The probe runs BEFORE any resolved uid's release (phase-2
+            // ordering), so a running job here is stale state by construction,
+            // not a fresh release.
           }
           if (reassert.cleanupErrors.length > 0) {
             input.print(
               `[castle-wall] boot: uid ${agentUid} could NOT be fully re-parked while unresolvable ` +
                 `(${reassert.cleanupErrors.join("; ")}); treat the agent as possibly startable and intervene manually.`,
+            );
+          }
+          // Fix-round-4: the contextless re-park was the SEVENTH site claiming
+          // "parked" from control flow -- it returned a clean parked outcome
+          // whenever `reassertParkedWithoutContext` resolved, and its one probe
+          // (the shared-label-skipped branch above) was a SINGLE unsettled
+          // sample that ignored `pid` when `running` was downgraded. Both are
+          // now the shared chokepoint: settled, pid-strict, unknown-fails-
+          // closed. A non-parked claim on this path throws, which
+          // `runBootExclusiveEgressRelease` maps to the DISTINCT loud
+          // `park-not-verified` -- never a PARKED report over a live process.
+          const claim = await assessHarnessParked({
+            probe: {
+              harnessStatus: async () =>
+                agentHarnessDaemonStatus({ ...realHarnessOps(), runLaunchctl: launchctlFn }),
+            },
+          });
+          if (claim.state !== "parked") {
+            throw new Error(
+              `uid ${agentUid} re-park NOT verified for the shared harness job ` +
+                `${AGENT_HARNESS_DAEMON_LABEL}: ` +
+                (claim.state === "alive" ? claim.observed : claim.unobserved) +
+                (reassert.sharedLabelOpsSkipped
+                  ? ` while bootout/disable were withheld (uid(s) ${resolvedUids.join(", ")} resolved for ` +
+                    "release on that host-singleton label); the hold file was removed so the exec wrapper " +
+                    "refuses any NEW start, but a process already running from stale launchd state was NOT " +
+                    "stopped"
+                  : "; the re-park ops resolved but the job did not settle stopped") +
+                "; intervene manually",
             );
           }
           return {
@@ -2012,6 +2416,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
             holdFileRemoved: reassert.holdFileRemoved,
             jobDisabled: reassert.jobDisabled,
             cleanupErrors: reassert.cleanupErrors,
+            parkedClaim: claim,
           };
         }
         const ctx = resolution;
@@ -2023,6 +2428,38 @@ export async function startExclusiveEgressBootSupervisor(input: {
           await ensureRuntimeFs({ agentUid, gateUid: ctx.gateUid });
         } catch (err) {
           input.print(`[castle-wall] boot: uid ${agentUid} runtime-fs assert failed: ${(err as Error).message}`);
+        }
+        let gateHomeLayoutFailure: string | undefined;
+        try {
+          await ensureGateHomeLayout({
+            agentUid,
+            gateAccount: ctx.gateAccount,
+            gateUid: ctx.gateUid,
+            gateHomeDirectory: ctx.gateHomeDirectory,
+          });
+        } catch (err) {
+          const reason = (err as Error).message;
+          gateHomeLayoutFailure = reason;
+          input.print(
+            `[castle-wall] boot: uid ${agentUid} gate account home layout assert failed: ${reason}; ` +
+              "the release barrier will refuse release and park fail-closed. " +
+              "Repair: sudo sanctuary protect --repair-egress-gate",
+          );
+          try {
+            await input.audit("exclusive_egress_gate_home_layout_failed", {
+              agent_uid: agentUid,
+              gate_account: ctx.gateAccount,
+              gate_uid: ctx.gateUid,
+              gate_home_directory: ctx.gateHomeDirectory,
+              reason,
+              barrier_continues_fail_closed: true,
+            });
+          } catch (auditErr) {
+            input.print(
+              `[castle-wall] boot: uid ${agentUid} could not record gate home layout failure audit ` +
+                `(${(auditErr as Error).message}); the release barrier will still verify and park fail-closed`,
+            );
+          }
         }
         // Fix-round H2: START the gate daemon (RunAtLoad=false by contract;
         // nothing else starts it after a reboot), then let the barrier verify
@@ -2062,6 +2499,22 @@ export async function startExclusiveEgressBootSupervisor(input: {
           rearm: "boot-rearm",
           print: input.print,
         });
+        const releaseBarrierOps: ReleaseBarrierOps =
+          gateHomeLayoutFailure === undefined
+            ? barrierOps
+            : {
+                ...barrierOps,
+                verifyGate: async () => {
+                  const gate = await barrierOps.verifyGate();
+                  return {
+                    ok: false,
+                    reasons: [
+                      `gate account home layout assertion failed before release: ${gateHomeLayoutFailure}`,
+                      ...(gate.ok ? [] : gate.reasons),
+                    ],
+                  };
+                },
+              };
         // Fix-round-3 MED-4: the release context (fortressPath, harnessArgv,
         // gateUid) was resolved from THIS registry entry in phase 1. Between
         // that resolution and the barrier's release, a concurrent repair or
@@ -2073,9 +2526,9 @@ export async function startExclusiveEgressBootSupervisor(input: {
         // the barrier maps to a loud fail-closed park at commit-generation.
         const resolvedGenerationId = entry.generation_id;
         const guardedOps: ReleaseBarrierOps = {
-          ...barrierOps,
+          ...releaseBarrierOps,
           commitGeneration: async (): Promise<CommittedGenerationIdentity> => {
-            const committed = await barrierOps.commitGeneration();
+            const committed = await releaseBarrierOps.commitGeneration();
             if (committed.generation_id !== resolvedGenerationId) {
               throw new Error(
                 `registry changed during boot release for uid ${agentUid}: resolution captured committed ` +

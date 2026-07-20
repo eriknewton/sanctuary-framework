@@ -54,6 +54,9 @@ import {
   moveAsideStaleHermesRuntimeDestination,
   policyDaemonInstallBootArgs,
   resolvePolicyDaemonActionForAutoProvision,
+  decideDsclAttributeRead,
+  decideDsclRecordRead,
+  dsclDiagnostic,
   runLaunchctlWithTimeout,
   LAUNCHCTL_TIMEOUT_MS,
   LAUNCHCTL_KILL_SIGNAL,
@@ -68,6 +71,137 @@ import {
   type RehomeOps,
 } from "../../src/castle-wall/provision/rehome.js";
 import { verifyReachabilityBeforeArm } from "../../src/castle-wall/provision/verify.js";
+
+describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix round-3 B1)", () => {
+  it("distinguishes an absent attribute from an absent record when No such key is on stderr with exit 0", () => {
+    expect(
+      decideDsclAttributeRead("UniqueID", {
+        code: 0,
+        stdout: "",
+        stderr: "No such key: UniqueID\n",
+      }),
+    ).toEqual({ kind: "attribute-absent" });
+    expect(
+      decideDsclRecordRead({
+        code: 0,
+        stdout: "RecordName: sanctuary-hermes\n",
+        stderr: "",
+      }),
+    ).toBe("present");
+  });
+
+  it("recognizes absent records from dscl eDSRecordNotFound diagnostics", () => {
+    const absent = {
+      code: 56,
+      stdout: "",
+      stderr: "/usr/bin/dscl DS Error: -14136 (eDSRecordNotFound)\n",
+    };
+    expect(decideDsclRecordRead(absent)).toBe("record-absent");
+    expect(decideDsclAttributeRead("UniqueID", absent)).toEqual({ kind: "record-absent" });
+  });
+
+  it("preserves the full attribute value instead of truncating at the first space", () => {
+    expect(
+      decideDsclAttributeRead("NFSHomeDirectory", {
+        code: 0,
+        stdout: "NFSHomeDirectory: /var/sanctuary agents/sanctuary-hermes\n",
+        stderr: "",
+      }),
+    ).toEqual({ kind: "value", value: "/var/sanctuary agents/sanctuary-hermes" });
+  });
+
+  it("returns unknown rather than claiming absence on unclassified dscl output", () => {
+    expect(
+      decideDsclRecordRead({
+        code: 5,
+        stdout: "",
+        stderr: "DirectoryService daemon unavailable",
+      }),
+    ).toBe("unknown");
+    expect(
+      decideDsclAttributeRead("UserShell", {
+        code: 0,
+        stdout: "",
+        stderr: "",
+      }),
+    ).toEqual({ kind: "unknown", diagnostic: "" });
+  });
+
+  it("B4: the existence probe reads only UniqueID, never the whole account record", async () => {
+    const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
+    expect(source).toContain('[".", "-read", `/Users/${accountName}`, "UniqueID"]');
+    expect(source).not.toMatch(
+      /dsclReadResult\(\[\s*"\.",\s*"-read",\s*`\/Users\/\$\{accountName\}`\s*\]\)/,
+    );
+  });
+
+  it("A3: agent account creation has a direct candidate-uid observation and excluded-uid backstop", async () => {
+    const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
+    expect(source).toContain("excludedUids: excludedAgentAccountUids");
+    expect(source).toContain("lookupAccountNamesByUid: async (uid: number)");
+    expect(source).toContain('[".", "-search", "/Users", "UniqueID", String(uid)]');
+    expect(source).toContain("...(runningAgentUid !== undefined ? [runningAgentUid] : [])");
+    expect(source).not.toContain('accountShapeVerdict !== "verified-dedicated" ? [candidateUid] : []');
+  });
+
+  it("B4: an execFile maxBuffer overflow is explicit unknown, not a normal exit-1 record absence", () => {
+    expect(
+      decideDsclRecordRead({
+        code: 1,
+        execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        stdout: "AuthenticationAuthority: secret-aa\n",
+        stderr: "",
+      }),
+    ).toBe("unknown");
+    const attributeDecision = decideDsclAttributeRead("UniqueID", {
+      code: 1,
+      execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      stdout: "AuthenticationAuthority: secret-aa\n",
+      stderr: "",
+    });
+    expect(attributeDecision.kind).toBe("unknown");
+    if (attributeDecision.kind === "unknown") {
+      expect(attributeDecision.diagnostic).toContain("exec-error=ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+      expect(attributeDecision.diagnostic).toContain("attributes=[AuthenticationAuthority]");
+      expect(attributeDecision.diagnostic).not.toContain("secret-aa");
+    }
+  });
+
+  it("B4: dscl diagnostics summarize oversized records without leaking value payloads", () => {
+    const hugeRecord = [
+      "AuthenticationAuthority: super-secret-auth-authority",
+      `JPEGPhoto: ${"A".repeat(1024 * 1024)}`,
+      "GeneratedUID: generated-secret-value",
+      "ShadowHashData: salted-sha512-password-verifier",
+    ].join("\n");
+    const diagnostic = dsclDiagnostic({
+      code: 1,
+      execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      stdout: hugeRecord,
+      stderr: "",
+    });
+    expect(diagnostic.length).toBeLessThanOrEqual(512);
+    expect(diagnostic).toContain("exec-error=ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+    expect(diagnostic).toContain("attributes=[AuthenticationAuthority");
+    expect(diagnostic).toContain("GeneratedUID");
+    expect(diagnostic).toContain("JPEGPhoto");
+    expect(diagnostic).toContain("ShadowHashData");
+    expect(diagnostic).not.toContain("super-secret-auth-authority");
+    expect(diagnostic).not.toContain("generated-secret-value");
+    expect(diagnostic).not.toContain("salted-sha512-password-verifier");
+    expect(diagnostic).not.toContain("A".repeat(64));
+  });
+
+  it("B4: mixed diagnostics are unknown, not record-absent by any-match", () => {
+    const mixed = {
+      code: 56,
+      stdout: "",
+      stderr: "DirectoryService daemon unavailable\n/usr/bin/dscl DS Error: -14136 (eDSRecordNotFound)\n",
+    };
+    expect(decideDsclRecordRead(mixed)).toBe("unknown");
+    expect(decideDsclAttributeRead("UniqueID", mixed).kind).toBe("unknown");
+  });
+});
 
 describe("wrap/auto-provision real-ops chokepoint: credentialReadableAsUidDecision (fix R1)", () => {
   it("ENOENT (statResult undefined) -> false: an absent moved credential is never a pass", () => {
@@ -1211,23 +1345,50 @@ describe("wrap/auto-provision real-ops chokepoint: symlink-safe recursive chmod/
 describe("wrap/auto-provision real-ops chokepoint: dscl -search parser (fix round-5 N4)", () => {
   it("parses the account name from the real PARENTHESIZED multi-line dscl -search output (the pre-fix regex never matched this)", () => {
     const realOutput = "eriknewton\t\tUniqueID = (\n    501\n)\n";
-    expect(parseDsclSearchAccountNames(realOutput)).toEqual(["eriknewton"]);
+    expect(parseDsclSearchAccountNames(realOutput, 501)).toEqual(["eriknewton"]);
+  });
+
+  it("parses quoted numeric uid values from dscl -search output", () => {
+    expect(parseDsclSearchAccountNames("nobody\t\tUniqueID = (\n    \"-2\"\n)\n", -2)).toEqual(["nobody"]);
+    expect(parseDsclSearchAccountNames("sanctuary-hermes\t\tUniqueID = (\n    \"503\"\n)\n", 503)).toEqual(["sanctuary-hermes"]);
   });
 
   it("also parses the single-line form (name  UniqueID = 501)", () => {
-    expect(parseDsclSearchAccountNames("sanctuary-hermes  UniqueID = 502\n")).toEqual(["sanctuary-hermes"]);
+    expect(parseDsclSearchAccountNames("sanctuary-hermes  UniqueID = 502\n", 502)).toEqual(["sanctuary-hermes"]);
   });
 
   it("returns every matched record name when a -search returns more than one", () => {
     const twoRecords = "first\t\tUniqueID = (\n    501\n)\nsecond\t\tUniqueID = (\n    501\n)\n";
-    expect(parseDsclSearchAccountNames(twoRecords)).toEqual(["first", "second"]);
+    expect(parseDsclSearchAccountNames(twoRecords, 501)).toEqual(["first", "second"]);
   });
 
-  it("returns [] on output with no UniqueID record line (fail-closed: no fabricated name)", () => {
-    expect(parseDsclSearchAccountNames("")).toEqual([]);
-    expect(parseDsclSearchAccountNames("NFSHomeDirectory: /Users/x\n")).toEqual([]);
-    // The value lines inside the parentheses must NOT be mistaken for names.
-    expect(parseDsclSearchAccountNames("    501\n)\n")).toEqual([]);
+  it("parses a holder record whose account name contains a space", () => {
+    expect(parseDsclSearchAccountNames("Legacy Admin\t\tUniqueID = (\n    503\n)\n", 503)).toEqual(["Legacy Admin"]);
+  });
+
+  it("returns [] only on empty output", () => {
+    expect(parseDsclSearchAccountNames("", 503)).toEqual([]);
+  });
+
+  it("rejects a parsed holder record whose UniqueID is not the searched uid", () => {
+    expect(() => parseDsclSearchAccountNames("sanctuary-gate-hermes  UniqueID = 999\n", 503)).toThrow(
+      /record "sanctuary-gate-hermes" reported UniqueID=999, expected 503/,
+    );
+  });
+
+  it("renders residue counts from the same non-empty line count", () => {
+    const stdout = "eriknewton\t\tUniqueID = (\n    501\n)\nNFSHomeDirectory: /Users/eriknewton\n";
+    expect(() => parseDsclSearchAccountNames(stdout, 501)).toThrow(
+      /returned 4 non-empty lines, but only 3 parsed\/accounted for \(1 unparsed at line 4\)/,
+    );
+  });
+
+  it.each([
+    ["localized attribute name", "Legacy Admin\t\tIdentifiantUnique = (\n    503\n)\n"],
+    ["trailing unmatched line", "eriknewton\t\tUniqueID = (\n    501\n)\nNFSHomeDirectory: /Users/x\n"],
+    ["stray continuation", "    501\n)\n"],
+  ])("throws on %s because unparsed dscl output is not evidence of absence", (_name, stdout) => {
+    expect(() => parseDsclSearchAccountNames(stdout, 503)).toThrow(/Unparsed output is not evidence of absence/);
   });
 });
 

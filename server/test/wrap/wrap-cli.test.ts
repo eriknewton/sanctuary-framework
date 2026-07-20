@@ -6,6 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { startedCoarseDisposition, type HarnessDisposition } from "../../src/egress-gate/parked-claim.js";
 import { mkdtemp, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -394,7 +395,7 @@ describe("formatWrapSuccess", () => {
         stage: "bring-up",
         reason: "generation bring-up failed",
         coarseCompositionRestored: true,
-        harnessStartedCoarse: true,
+        harness: startedCoarseDisposition(),
         cleanupErrors: [],
       },
     });
