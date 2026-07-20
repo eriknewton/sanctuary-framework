@@ -129,6 +129,26 @@ describe("Castle Wall macOS daemon integration", () => {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function auditTokenForRuid(uid: number): string {
+    const vals = [
+      0xffffffff,
+      uid,
+      uid,
+      uid,
+      uid,
+      0x00000269,
+      0x000186ae,
+      0x00000566,
+    ];
+    return vals
+      .map((value) => {
+        const bytes = new Uint8Array(4);
+        new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+        return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+      })
+      .join("");
+  }
+
   function makeMessageReader(socket: Socket): () => Promise<Record<string, unknown>> {
     let buffer = Buffer.alloc(0);
     let pending:
@@ -572,7 +592,7 @@ describe("Castle Wall macOS daemon integration", () => {
       type: "flow_decision_recorded",
       decision: "allow",
       destination: { host: "api.anthropic.com", ip: "104.18.32.10", port: 443, protocol: "tcp", hostname_source: "sni", opaque: false },
-      agent: { id: "agent-live", template: "coding-assistant" },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
       matched_rule_id: "rule-anthropic",
       recorded_at: "2026-05-11T12:00:00Z",
     } as unknown as Parameters<typeof consumer.handleFlowDecisionRecorded>[0];

@@ -192,6 +192,7 @@ export function buildCriticalEnvelopeFromDrainEvent(
       signatureB64url: drained.producer_signature_b64url ?? null,
       keyId: drained.producer_key_id ?? null,
     },
+    producerSubjectBinding: { kind: "signed_identity_id" },
   };
   return { kind: "ok", envelope };
 }

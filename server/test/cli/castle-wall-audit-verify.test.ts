@@ -113,12 +113,32 @@ describe("castle-wall audit-verify", () => {
       type: "flow_decision_recorded",
       decision,
       destination: { host: "api.anthropic.com", ip: "1.2.3.4", port: 443, protocol: "tcp" },
-      agent: { id: "agent-1", template: "coding-assistant" },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
       matched_rule_id: decision === "allow" ? "allow-anthropic" : null,
       // The audit consumer enforces signature FRESHNESS (5-min default max age
       // vs Date.now()), so a genuine signed entry must be recorded "now".
       recorded_at: recordedAt,
     };
+  }
+
+  function auditTokenForRuid(uid: number): string {
+    const vals = [
+      0xffffffff,
+      uid,
+      uid,
+      uid,
+      uid,
+      0x00000269,
+      0x000186ae,
+      0x00000566,
+    ];
+    return vals
+      .map((value) => {
+        const bytes = new Uint8Array(4);
+        new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+        return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+      })
+      .join("");
   }
 
   /** Build the genuine extension producer tuple the signing key would emit. */

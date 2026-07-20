@@ -282,7 +282,7 @@ export function buildExclusiveEgressPosture(
     mode = "unprotected";
   }
   if (mode !== "exclusive" && input.fine_grained_declared && !input.coarse_wall_armed) {
-    reasons.push("wall: coarse Castle Wall not armed over this agent");
+    reasons.push("wall: coarse Castle Wall enforcement not confirmed for this fortress");
   }
 
   return {

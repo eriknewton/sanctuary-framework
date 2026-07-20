@@ -872,7 +872,10 @@ function buildConciergePiiFilter(): ConciergePiiFilter {
  * Synthesize a stable fortress id from the storage path. Until v1.2 lands
  * a canonical fortress id source, the storage path hash is stable across
  * boots of the same fortress and unique across distinct fortresses on the
- * same host. Display only; not used for trust decisions.
+ * same host. This value is the local fortress namespace and the comparison
+ * basis for fortress-scoped liveness checks. It is not remote evidence, but it
+ * is a local trust anchor for separating one storage-backed fortress from
+ * another.
  */
 export function fortressIdFromStoragePath(storagePath: string): string {
   const digest = createHash("sha256").update(storagePath).digest("hex");

@@ -84,9 +84,9 @@ function walBody(seq: number): string {
     timestamp: new Date(FRESH_TS).toISOString(),
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "agent-1",
+    identity_id: FORTRESS,
     result: "blocked",
-    details: { agent_id: "agent-1", dest_host: "evil.example" },
+    details: { agent_id: FORTRESS, dest_host: "evil.example" },
   });
 }
 
@@ -105,7 +105,7 @@ async function appendGenuineSigned(
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
       seq,
-      agent_id: "agent-1",
+      agent_id: FORTRESS,
       dest_host: "evil.example",
       [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
       [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
@@ -418,6 +418,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const log = newLog();
     await appendGenuineSigned(log, priv, 1);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -438,6 +439,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const log = newLog();
     await appendForgedMarkerOnly(log);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -461,6 +463,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     // (the reader does not require re-verification without a pinned key).
     await appendGenuineSigned(log, ed25519.utils.randomPrivateKey(), 1);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: "m",
       platform: "darwin",
@@ -477,6 +480,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     // signal forces a non-armed degraded posture (never green on the channel basis).
     await appendGenuineSigned(log, ed25519.utils.randomPrivateKey(), 1);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -500,6 +504,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const log = newLog();
     await appendGenuineSigned(log, newPriv, 7);
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: "m",
       platform: "linux",

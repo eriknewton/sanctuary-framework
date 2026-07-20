@@ -35,6 +35,7 @@ import {
   verifyProducerSignature,
   type ProducerSignatureInput,
 } from "./producer-signature.js";
+import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
 import type { UnifiedInboxBridge } from "../../principal-policy/unified-inbox-bridge.js";
 import { ingestCastleWallBlockedEgress } from "../../principal-policy/unified-inbox-producers.js";
 
@@ -128,6 +129,23 @@ export interface CriticalEventEnvelope {
    * and verify, or the event is rejected (fail closed).
    */
   producer?: ProducerSignatureInput;
+  /**
+   * Subject-binding context for producer-signed verdicts. For macOS extension
+   * verdicts, the signed WAL body carries the raw audit token and the local
+   * runtime supplies the fortress id. For drain-shaped events whose signed WAL
+   * body already carries a canonical `identity_id`, the persist path uses that
+   * signed identity directly. A verified signature without one of these bindings
+   * is rejected before persistence so signed evidence can never inherit the
+   * unsigned envelope identity.
+   */
+  producerSubjectBinding?:
+    | {
+        kind: "macos_audit_token";
+        fortressId: string;
+      }
+    | {
+        kind: "signed_identity_id";
+      };
 }
 
 /** Metric-batch entry shape, mirroring the IPC message. */
@@ -403,12 +421,30 @@ export class AuditConsumer {
     if (sigOutcome.kind === "verified") {
       this.stats.producerSignatureAccepted += 1;
     }
+    const identityOutcome = persistedIdentityForEvent(envelope, sigOutcome);
+    if (identityOutcome.kind === "rejected") {
+      this.stats.producerSignatureRejections += 1;
+      await this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "producer_signature_rejected",
+        envelope.event.fortress_id ?? "unknown",
+        {
+          reason: identityOutcome.reason,
+          event_type: envelope.event.event_type,
+          seq: envelope.event.details.seq,
+        },
+        "failure"
+      );
+      await this.sink.flush();
+      await this.tryAck(envelope, "producer_signature_rejected");
+      throw new AuditChainError(identityOutcome.reason);
+    }
 
     try {
       await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
         envelope.event.event_type,
-        envelope.event.fortress_id,
+        identityOutcome.identityId,
         buildDetailsForEvent(envelope.event, sigOutcome),
         "success"
       );
@@ -420,7 +456,7 @@ export class AuditConsumer {
         await this.sink.append(
           CASTLE_WALL_AUDIT_LAYER,
           "castle_wall_blocked_egress",
-          envelope.event.fortress_id,
+          identityOutcome.identityId,
           {
             event_type: envelope.event.event_type,
             seq: envelope.event.details.seq,
@@ -894,6 +930,76 @@ function buildDetailsForEvent(
   // this marker (see CASTLE_WALL_AUDIT_PROVENANCE_KEY).
   out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
   return out;
+}
+
+function signedDetailsFromBody(
+  signedBody: Record<string, unknown>
+): Record<string, unknown> {
+  return signedBody.details !== null &&
+    typeof signedBody.details === "object" &&
+    !Array.isArray(signedBody.details)
+    ? (signedBody.details as Record<string, unknown>)
+    : {};
+}
+
+function persistedIdentityForEvent(
+  envelope: CriticalEventEnvelope,
+  signature: SignatureOutcome,
+):
+  | { kind: "ok"; identityId: string }
+  | { kind: "rejected"; reason: string } {
+  const subjectBinding = envelope.producerSubjectBinding;
+  if (signature.kind !== "verified") {
+    return { kind: "ok", identityId: envelope.event.fortress_id };
+  }
+  if (subjectBinding === undefined) {
+    return {
+      kind: "rejected",
+      reason: "producer_signed_without_subject_binding",
+    };
+  }
+  if (subjectBinding.kind === "macos_audit_token") {
+    const signedDetails = signedDetailsFromBody(signature.signedBody);
+    const agentId =
+      typeof signedDetails.agent_id === "string"
+        ? signedDetails.agent_id
+        : null;
+    if (agentId === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_missing_agent_id",
+      };
+    }
+    const subject = protectionSubjectFromMacOSAuditToken(
+      subjectBinding.fortressId,
+      agentId,
+    );
+    if (subject === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_agent_subject_unresolvable",
+      };
+    }
+    return { kind: "ok", identityId: subject };
+  }
+  if (subjectBinding.kind === "signed_identity_id") {
+    const identityId =
+      typeof signature.signedBody.identity_id === "string" &&
+      signature.signedBody.identity_id.length > 0
+        ? signature.signedBody.identity_id
+        : null;
+    if (identityId === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_missing_identity_id",
+      };
+    }
+    return { kind: "ok", identityId };
+  }
+  return {
+    kind: "rejected",
+    reason: "producer_signed_body_subject_binding_unknown",
+  };
 }
 
 function computeCanonicalHash(event: CastleWallAuditEvent): string {

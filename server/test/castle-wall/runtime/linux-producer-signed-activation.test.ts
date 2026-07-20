@@ -96,10 +96,10 @@ function walBody(freshTs: number): string {
     timestamp: new Date(freshTs).toISOString(),
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "fortress:test",
+    identity_id: "fortress:test/uid-503",
     fortress_id: "fortress:test",
     result: "blocked",
-    details: { agent_id: "agent-1", dest_host: "evil.example" },
+    details: { agent_id: "fortress:test/uid-503", dest_host: "evil.example" },
   });
 }
 
@@ -459,6 +459,9 @@ describe("C4 — P-2 drain mapping: drain event → critical envelope with produ
     expect(built.envelope.producer?.eventCanonicalJson).toBe(drained.event_canonical_json);
     expect(built.envelope.producer?.seq).toBe(1);
     expect(built.envelope.producer?.capturedAtUnixMs).toBe(drained.captured_at_unix_ms);
+    expect(built.envelope.producerSubjectBinding).toEqual({
+      kind: "signed_identity_id",
+    });
   });
 });
 

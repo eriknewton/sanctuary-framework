@@ -898,6 +898,11 @@ pub fn build_audit_event_canonical_json(
     );
     entry.insert(
         "identity_id".to_string(),
+        // Known open: this is the daemon request's agent NAME today, not the
+        // Sanctuary protection subject (`fortress/uid-N`) that the TypeScript
+        // exact-subject readers require. Until the Linux producer emits that
+        // canonical subject, Linux producer-signed evidence verifies but cannot
+        // green a per-agent claim; readers surface `subject_unbound_evidence`.
         serde_json::Value::String(request.agent_id.clone()),
     );
     entry.insert(

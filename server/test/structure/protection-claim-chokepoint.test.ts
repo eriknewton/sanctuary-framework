@@ -49,6 +49,251 @@ function propertyNameText(name: ts.PropertyName): string | undefined {
   return undefined;
 }
 
+function expressionName(expression: ts.Expression): string | undefined {
+  if (ts.isIdentifier(expression)) return expression.text;
+  if (ts.isPropertyAccessExpression(expression)) return expression.name.text;
+  return undefined;
+}
+
+function objectLiteralHasProperty(
+  object: ts.ObjectLiteralExpression,
+  property: string,
+): boolean {
+  return object.properties.some((p) => {
+    if (!ts.isPropertyAssignment(p) && !ts.isShorthandPropertyAssignment(p)) {
+      return false;
+    }
+    return propertyNameText(p.name) === property;
+  });
+}
+
+function objectLiteralPropertyAssignment(
+  object: ts.ObjectLiteralExpression,
+  property: string,
+): ts.PropertyAssignment | undefined {
+  for (const candidate of object.properties) {
+    if (
+      ts.isPropertyAssignment(candidate) &&
+      propertyNameText(candidate.name) === property
+    ) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function containsFortressScopedMode(node: ts.Node): boolean {
+  let found = false;
+  const visit = (candidate: ts.Node): void => {
+    if (found) return;
+    const initializer = ts.isPropertyAssignment(candidate)
+      ? ts.isAsExpression(candidate.initializer)
+        ? candidate.initializer.expression
+        : candidate.initializer
+      : undefined;
+    if (
+      ts.isPropertyAssignment(candidate) &&
+      propertyNameText(candidate.name) === "mode" &&
+      initializer !== undefined &&
+      ts.isStringLiteral(initializer) &&
+      initializer.text === "fortress_scoped"
+    ) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(candidate, visit);
+  };
+  visit(node);
+  return found;
+}
+
+function unwrapExpression(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (
+    ts.isParenthesizedExpression(current) ||
+    ts.isAsExpression(current) ||
+    ts.isSatisfiesExpression(current)
+  ) {
+    current = current.expression;
+  }
+  return current;
+}
+
+function isInputPurposeCoarseWallCheck(
+  expression: ts.Expression,
+  source: ts.SourceFile,
+): boolean {
+  const unwrapped = unwrapExpression(expression);
+  if (
+    !ts.isBinaryExpression(unwrapped) ||
+    unwrapped.operatorToken.kind !== ts.SyntaxKind.EqualsEqualsEqualsToken
+  ) {
+    return false;
+  }
+  const left = unwrapExpression(unwrapped.left);
+  const right = unwrapExpression(unwrapped.right);
+  const matches = (a: ts.Expression, b: ts.Expression): boolean =>
+    ts.isPropertyAccessExpression(a) &&
+    a.getText(source) === "input.purpose" &&
+    ts.isStringLiteral(b) &&
+    b.text === "coarse-wall";
+  return matches(left, right) || matches(right, left);
+}
+
+function isEmptyObjectLiteral(expression: ts.Expression): boolean {
+  const unwrapped = unwrapExpression(expression);
+  return ts.isObjectLiteralExpression(unwrapped) && unwrapped.properties.length === 0;
+}
+
+function hasStructurallyGatedCoarseWallSubjectMode(
+  object: ts.ObjectLiteralExpression,
+  source: ts.SourceFile,
+): boolean {
+  return object.properties.some((property) => {
+    if (!ts.isSpreadAssignment(property)) return false;
+    const spread = unwrapExpression(property.expression);
+    if (!ts.isConditionalExpression(spread)) return false;
+    if (!isInputPurposeCoarseWallCheck(spread.condition, source)) return false;
+    if (!isEmptyObjectLiteral(spread.whenFalse)) return false;
+    const whenTrue = unwrapExpression(spread.whenTrue);
+    if (!ts.isObjectLiteralExpression(whenTrue)) return false;
+    const subjectMode = objectLiteralPropertyAssignment(
+      whenTrue,
+      "protectionSubjectMatchMode",
+    );
+    return (
+      subjectMode !== undefined &&
+      containsFortressScopedMode(subjectMode.initializer)
+    );
+  });
+}
+
+function expressionMightBeBareFortressId(
+  expression: ts.Expression,
+  source: ts.SourceFile,
+): boolean {
+  const text = expression.getText(source);
+  return (
+    text === "fortressId" ||
+    text.endsWith(".fortressId") ||
+    text.includes("fortressIdFromStoragePath(")
+  );
+}
+
+function isAllowedCoarseWallFortressScopedCall(
+  fileName: string,
+  call: ts.CallExpression,
+  source: ts.SourceFile,
+): boolean {
+  if (fileName !== "server/src/wrap/cli.ts") return false;
+  if (expressionName(call.expression) !== "buildFeatureHealthPanel") return false;
+  const first = call.arguments[0];
+  return (
+    first !== undefined &&
+    ts.isObjectLiteralExpression(first) &&
+    hasStructurallyGatedCoarseWallSubjectMode(first, source)
+  );
+}
+
+function findProtectionSubjectScopeViolations(
+  fileName: string,
+  sourceText: string,
+): string[] {
+  const source = ts.createSourceFile(
+    fileName,
+    sourceText,
+    ts.ScriptTarget.ESNext,
+    true,
+  );
+  const builders = new Set([
+    "buildCastleWallPosture",
+    "buildFeatureHealthPanel",
+  ]);
+  const offenders: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const name = expressionName(node.expression);
+      const first = node.arguments[0];
+      if (
+        name !== undefined &&
+        builders.has(name) &&
+        first !== undefined &&
+        ts.isObjectLiteralExpression(first)
+      ) {
+        const { line } = source.getLineAndCharacterOfPosition(
+          node.getStart(source),
+        );
+        const hasFortressScoped = containsFortressScopedMode(first);
+        if (
+          hasFortressScoped &&
+          !isAllowedCoarseWallFortressScopedCall(fileName, node, source)
+        ) {
+          offenders.push(
+            `${fileName}:${line + 1} ${name} passes fortress_scoped outside the coarse-wall probe`,
+          );
+        }
+
+        const subject = objectLiteralPropertyAssignment(
+          first,
+          "protectionClaimSubject",
+        );
+        if (
+          subject !== undefined &&
+          expressionMightBeBareFortressId(subject.initializer, source) &&
+          !hasFortressScoped
+        ) {
+          offenders.push(
+            `${fileName}:${line + 1} ${name} passes a bare fortress id as protectionClaimSubject`,
+          );
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return offenders;
+}
+
+function findProtectionSubjectOmissions(
+  fileName: string,
+  sourceText: string,
+): string[] {
+  const source = ts.createSourceFile(
+    fileName,
+    sourceText,
+    ts.ScriptTarget.ESNext,
+    true,
+  );
+  const builders = new Set([
+    "buildCastleWallPosture",
+    "buildFeatureHealthPanel",
+  ]);
+  const offenders: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const name = expressionName(node.expression);
+      if (name !== undefined && builders.has(name)) {
+        const first = node.arguments[0];
+        const hasSubject =
+          first !== undefined &&
+          ts.isObjectLiteralExpression(first) &&
+          objectLiteralHasProperty(first, "protectionClaimSubject");
+        if (!hasSubject) {
+          const { line } = source.getLineAndCharacterOfPosition(
+            node.getStart(source),
+          );
+          offenders.push(
+            `${fileName}:${line + 1} ${name} omits protectionClaimSubject`,
+          );
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return offenders;
+}
+
 function findProtectionStateAdviceFunction(
   source: ts.SourceFile,
 ): ts.FunctionDeclaration {
@@ -262,6 +507,59 @@ describe("protection-state claim chokepoint", () => {
       }
     }
     expect(violations).toEqual([]);
+  });
+
+  it("every production posture/feature-health caller supplies protectionClaimSubject", () => {
+    const violations: string[] = [];
+    for (const file of tsFiles(SERVER_SRC)) {
+      const rel = relative(REPO_ROOT, file);
+      const source = readFileSync(file, "utf8");
+      violations.push(...findProtectionSubjectOmissions(rel, source));
+      violations.push(...findProtectionSubjectScopeViolations(rel, source));
+    }
+    expect(violations).toEqual([]);
+  });
+
+  it("structural guard rejects per-agent fortress_scoped and bare fortress subjects", () => {
+    const source = `
+      buildCastleWallPosture({
+        auditLog,
+        originMachine,
+        protectionClaimSubject: fortressIdFromStoragePath(storagePath),
+      });
+      buildFeatureHealthPanel({
+        auditLog,
+        originMachine,
+        protectionClaimSubject,
+        protectionSubjectMatchMode: { mode: "fortress_scoped", fortressId },
+      });
+    `;
+
+    expect(findProtectionSubjectScopeViolations("synthetic.ts", source)).toEqual([
+      "synthetic.ts:2 buildCastleWallPosture passes a bare fortress id as protectionClaimSubject",
+      "synthetic.ts:7 buildFeatureHealthPanel passes fortress_scoped outside the coarse-wall probe",
+    ]);
+  });
+
+  it("structural guard does not allow fortress_scoped from spoofed coarse-wall text", () => {
+    const source = `
+      buildFeatureHealthPanel({
+        auditLog,
+        originMachine,
+        protectionClaimSubject,
+        protectionSubjectMatchMode: { mode: "fortress_scoped", fortressId },
+        note: 'input.purpose === "coarse-wall" protectionSubjectMatchMode',
+      });
+    `;
+
+    expect(
+      findProtectionSubjectScopeViolations(
+        "server/src/wrap/cli.ts",
+        source,
+      ),
+    ).toEqual([
+      "server/src/wrap/cli.ts:2 buildFeatureHealthPanel passes fortress_scoped outside the coarse-wall probe",
+    ]);
   });
 
   it("catches case, wrapped, and split protection prose forms", () => {

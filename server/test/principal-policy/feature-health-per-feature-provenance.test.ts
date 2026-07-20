@@ -217,6 +217,7 @@ describe("per-feature provenance - end-to-end through the panel builder with a c
       details: { [BROKER_MARKER.key]: BROKER_MARKER.value },
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,

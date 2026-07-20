@@ -61,12 +61,17 @@ import {
   enforcementEntryCounts,
   livenessEntryCounts,
   producerSignedDedupKey,
+  subjectEvidenceForReverifiedEntry,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
 import {
   exclusiveEgressCapsAggregateGreen,
   type ExclusiveEgressStatus,
 } from "../egress-gate/posture.js";
+import {
+  castleWallEvidenceMatchesProtectionSubject,
+  fortressIdFromProtectionSubject,
+} from "../castle-wall/subject-binding.js";
 
 // Re-export the S5-P exclusive-egress posture surface for posture consumers
 // (routes, dashboard, CLI) so they import the wall-posture module they already
@@ -267,6 +272,9 @@ export interface CastleWallPosture {
     | "intentionally_stopped"
     | "daemon_liveness_unconfirmed"
     | "not_installed"
+    | "subject_unbound_evidence"
+    | "legacy_macos_audit_token"
+    | "subject_unresolvable"
     // Slice P: a producer key is expected but the reader could not load it, so
     // the wall is reported `degraded` rather than green on a weaker basis.
     | "producer_key_unavailable";
@@ -364,6 +372,15 @@ export interface BuildCastleWallPostureInput {
    * a failed posture read must not render the stronger claim.
    */
   exclusiveEgress?: ExclusiveEgressStatus | null;
+  /**
+   * Canonical confined-agent subject (`fortress/uid-N`) for a protection claim.
+   * When present, green-earning Castle Wall enforcement evidence must be stamped
+   * with the same subject. An unresolvable claim subject is explicit
+   * `subject_unresolvable`; mismatched/missing subjects are
+   * `subject_unbound_evidence`; legacy macOS 64-hex audit token identities are
+   * `legacy_macos_audit_token`. None is green.
+   */
+  protectionClaimSubject: string | null;
 }
 
 /**
@@ -500,6 +517,9 @@ export async function buildCastleWallPosture(
   let latestHeartbeatMs: number | null = null;
   let latestFreshHeartbeatMs: number | null = null;
   let latestStandDownMs: number | null = null;
+  let latestSubjectRejectedEnforcementMs: number | null = null;
+  let latestLegacyMacOSAuditTokenEnforcementMs: number | null = null;
+  let latestSubjectUnresolvableEnforcementMs: number | null = null;
   // Track the authenticity basis of the MOST RECENT arm-eligible enforcement
   // entry, so the posture honestly reports whether the green light rests on a
   // re-verified producer signature or merely the channel basis.
@@ -550,10 +570,14 @@ export async function buildCastleWallPosture(
     // When NO key is configured, the channel basis counts (the honest legacy /
     // macOS floor).
     const keyPresent = pinnedProducerKey !== null;
+    const subjectFortressId =
+      fortressIdFromProtectionSubject(input.protectionClaimSubject) ??
+      input.originMachine;
     const reResult = reverifyEntryProducerSignature(
       entry.details,
       pinnedProducerKey,
       input.verifyProducerSignature,
+      subjectFortressId,
     );
     const isArmEligible = CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op);
     const isNotEnforcing = CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op);
@@ -565,6 +589,43 @@ export async function buildCastleWallPosture(
     // wall). They keep the channel/marker basis.
     if (isArmEligible && !enforcementEntryCounts(reResult.basis, keyPresent)) {
       continue;
+    }
+
+    const armTs =
+      reResult.signedCapturedAtMs !== null ? reResult.signedCapturedAtMs : ts;
+    const tsValidForArm =
+      !Number.isNaN(armTs) && armTs <= now + ENFORCEMENT_FUTURE_SKEW_MS;
+
+    if (isArmEligible) {
+      const subjectMatch = castleWallEvidenceMatchesProtectionSubject(
+        input.protectionClaimSubject,
+        subjectEvidenceForReverifiedEntry(entry, reResult),
+      );
+      if (!subjectMatch.matches) {
+        if (
+          tsValidForArm &&
+          subjectMatch.reason === "subject_unresolvable" &&
+          (latestSubjectUnresolvableEnforcementMs === null ||
+            armTs > latestSubjectUnresolvableEnforcementMs)
+        ) {
+          latestSubjectUnresolvableEnforcementMs = armTs;
+        } else if (
+          tsValidForArm &&
+          subjectMatch.reason === "legacy_macos_audit_token" &&
+          (latestLegacyMacOSAuditTokenEnforcementMs === null ||
+            armTs > latestLegacyMacOSAuditTokenEnforcementMs)
+        ) {
+          latestLegacyMacOSAuditTokenEnforcementMs = armTs;
+        } else if (
+          tsValidForArm &&
+          subjectMatch.reason !== "subject_unresolvable" &&
+          (latestSubjectRejectedEnforcementMs === null ||
+            armTs > latestSubjectRejectedEnforcementMs)
+        ) {
+          latestSubjectRejectedEnforcementMs = armTs;
+        }
+        continue;
+      }
     }
 
     // Display verdict counts over the digest window. For a re-verified
@@ -601,11 +662,6 @@ export async function buildCastleWallPosture(
     // channel-basis / fault entries there is no signed time, so the top-level
     // timestamp is used (the honest no-key floor). Future-dated evidence beyond a
     // small skew is rejected for arming either way.
-    const armTs =
-      reResult.signedCapturedAtMs !== null ? reResult.signedCapturedAtMs : ts;
-    const tsValidForArm =
-      !Number.isNaN(armTs) && armTs <= now + ENFORCEMENT_FUTURE_SKEW_MS;
-
     if (isArmEligible && tsValidForArm) {
       if (latestEnforcementMs === null || armTs > latestEnforcementMs) {
         latestEnforcementMs = armTs;
@@ -649,6 +705,15 @@ export async function buildCastleWallPosture(
     latestEnforcementMs !== null && latestEnforcementMs >= freshnessFloor;
   const hasFreshNotEnforcing =
     latestNotEnforcingMs !== null && latestNotEnforcingMs >= freshnessFloor;
+  const hasFreshSubjectRejectedEnforcement =
+    latestSubjectRejectedEnforcementMs !== null &&
+    latestSubjectRejectedEnforcementMs >= freshnessFloor;
+  const hasFreshLegacyMacOSAuditTokenEnforcement =
+    latestLegacyMacOSAuditTokenEnforcementMs !== null &&
+    latestLegacyMacOSAuditTokenEnforcementMs >= freshnessFloor;
+  const hasFreshSubjectUnresolvableEnforcement =
+    latestSubjectUnresolvableEnforcementMs !== null &&
+    latestSubjectUnresolvableEnforcementMs >= freshnessFloor;
   const hasFreshHeartbeat = latestFreshHeartbeatMs !== null;
   const heartbeatProducerWasRunning = latestHeartbeatMs !== null;
   const hasNewerStandDown =
@@ -689,6 +754,15 @@ export async function buildCastleWallPosture(
   } else if (hasFreshNotEnforcing) {
     armState = "degraded";
     basis = "not_enforcing_evidence";
+  } else if (hasFreshSubjectUnresolvableEnforcement) {
+    armState = "unknown";
+    basis = "subject_unresolvable";
+  } else if (hasFreshLegacyMacOSAuditTokenEnforcement) {
+    armState = "unknown";
+    basis = "legacy_macos_audit_token";
+  } else if (hasFreshSubjectRejectedEnforcement) {
+    armState = "unknown";
+    basis = "subject_unbound_evidence";
   } else if (latestEnforcementMs !== null) {
     // Evidence exists but is older than the freshness window. Stale evidence
     // is NOT armed (the wall may have been disarmed since).
@@ -976,20 +1050,41 @@ export async function buildAuditDigest(
     // in-process entry (marker + claimed `producer_signed` but no valid sig)
     // fails re-verify and is NOT counted — closing the kernel-block inflation
     // hole. With no pinned key the count rests on the honest channel basis.
-    const isCastleWallBlockOrAllow =
+    const hasCastleWallProvenance =
       isRecord(entry.details) &&
       entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
-        CASTLE_WALL_AUDIT_PROVENANCE_VALUE &&
+        CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
+    const isCastleWallEnforcementEvidence =
+      hasCastleWallProvenance &&
+      CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(entry.operation);
+    const isCastleWallKernelVerdict =
+      isCastleWallEnforcementEvidence &&
       (entry.operation === "egress_blocked" ||
         entry.operation === "egress_allowed");
-    let kernelCounts = !isCastleWallBlockOrAllow;
-    if (isCastleWallBlockOrAllow) {
+    let kernelCounts = !isCastleWallKernelVerdict;
+    let signedAttribution =
+      null as ReturnType<typeof reverifyEntryProducerSignature> | null;
+    let signedOperationBoundForAttribution = false;
+    if (isCastleWallEnforcementEvidence) {
       const re = reverifyEntryProducerSignature(
         entry.details,
         pinnedProducerKey,
         input.verifyProducerSignature,
+        input.originMachine,
       );
-      kernelCounts = enforcementEntryCounts(re.basis, pinnedProducerKey !== null);
+      signedAttribution = re;
+      if (re.basis === "producer_signed_verified") {
+        signedOperationBoundForAttribution = signedOperationMatchesEntry(
+          entry.details ?? {},
+          entry.operation,
+        );
+      }
+      if (isCastleWallKernelVerdict) {
+        kernelCounts = enforcementEntryCounts(
+          re.basis,
+          pinnedProducerKey !== null,
+        );
+      }
       // For a re-verified producer-signed entry, bind the count to the SIGNATURE
       // rather than the forgeable top-level fields (codex re-review HIGH): (a)
       // the signed capture time must fall within the digest window, so a same-seq
@@ -999,23 +1094,23 @@ export async function buildAuditDigest(
       // onto a "block" entry to mis-count. Channel-basis (no-key) entries have no
       // signed time/op, so they keep the top-level-timestamp window bound applied
       // above (the honest no-key floor).
-      if (re.basis === "producer_signed_verified") {
+      if (isCastleWallKernelVerdict && re.basis === "producer_signed_verified") {
         const signedMs = re.signedCapturedAtMs;
         const inWindow =
           signedMs !== null && signedMs > now - windowMs && signedMs <= windowEndMs;
-        const opBound = signedOperationMatchesEntry(
-          entry.details ?? {},
-          entry.operation,
-        );
         const dedupKey = producerSignedDedupKey(entry.details ?? {});
         const isDuplicate = dedupKey !== null && seenSignedKeys.has(dedupKey);
         if (dedupKey !== null) seenSignedKeys.add(dedupKey);
-        kernelCounts = kernelCounts && inWindow && opBound && !isDuplicate;
+        kernelCounts =
+          kernelCounts &&
+          inWindow &&
+          signedOperationBoundForAttribution &&
+          !isDuplicate;
       }
     }
-    if (isCastleWallBlockOrAllow && kernelCounts && entry.operation === "egress_blocked")
+    if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_blocked")
       kernelBlocks += 1;
-    else if (isCastleWallBlockOrAllow && kernelCounts && entry.operation === "egress_allowed")
+    else if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_allowed")
       kernelAllows += 1;
     else if (entry.operation === APPROVAL_RESOLVED_OPERATION) {
       // Split by the recorded decision; fall back to the entry result
@@ -1030,7 +1125,36 @@ export async function buildAuditDigest(
       else if (decision === "denied") approvalsDenied += 1;
     }
 
-    perAgent.set(entry.identity_id, (perAgent.get(entry.identity_id) ?? 0) + 1);
+    let attributionIdentityId: string | null = entry.identity_id;
+    if (signedAttribution !== null && pinnedProducerKey !== null) {
+      // Attribution must be derived from signature-verified material for EVERY
+      // enforcement event type, not an enumerated subset: the previous fix
+      // covered two of three and looked complete. `operator_decision` gets here
+      // through the same enforcement set, with signed `egress_pending` bound to
+      // the persisted row by `signedOperationMatchesEntry`.
+      if (
+        signedAttribution.basis === "producer_signed_verified" &&
+        signedOperationBoundForAttribution
+      ) {
+        const signedSubjectEvidence = subjectEvidenceForReverifiedEntry(
+          entry,
+          signedAttribution,
+        );
+        attributionIdentityId =
+          typeof signedSubjectEvidence.identity_id === "string" &&
+          signedSubjectEvidence.identity_id.length > 0
+            ? signedSubjectEvidence.identity_id
+            : null;
+      } else {
+        attributionIdentityId = null;
+      }
+    }
+    if (attributionIdentityId !== null) {
+      perAgent.set(
+        attributionIdentityId,
+        (perAgent.get(attributionIdentityId) ?? 0) + 1,
+      );
+    }
   }
 
   const byAgent = Array.from(perAgent.entries())

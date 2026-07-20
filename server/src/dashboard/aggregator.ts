@@ -236,6 +236,12 @@ export interface AggregatorSources {
    * other surface. Absent = no producer wired = unchanged behavior.
    */
   resolveExclusiveEgressPosture?: () => Promise<ExclusiveEgressStatus | null>;
+  /**
+   * Canonical confined-agent subject (`fortress/uid-N`) for protection claims.
+   * When supplied, the dashboard hero shield only greens from Castle Wall
+   * evidence stamped with that subject.
+   */
+  resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
 }
 
 /**
@@ -852,6 +858,9 @@ export async function getProtectionSnapshot(
       const exclusiveEgress = sources.resolveExclusiveEgressPosture
         ? await sources.resolveExclusiveEgressPosture()
         : null;
+      const protectionClaimSubject = sources.resolveProtectionClaimSubject
+        ? await sources.resolveProtectionClaimSubject()
+        : null;
       const wall = await sources.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: sources.auditLog as AuditLog,
@@ -861,6 +870,7 @@ export async function getProtectionSnapshot(
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
           ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+          protectionClaimSubject,
         }),
       );
       wallArmState = wall.arm_state;

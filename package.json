@@ -3,7 +3,7 @@
   "private": true,
   "description": "Sanctuary repository root. Delegation surface for the menubar workspace. The canonical published package lives in server/.",
   "scripts": {
-    "lint": "npm --prefix server run lint",
+    "lint": "npm --prefix server run lint --",
     "typecheck": "npm --prefix server run typecheck",
     "test": "npm --prefix server test",
     "check:release-dependency-pins": "node scripts/check-release-dependency-pins.mjs",

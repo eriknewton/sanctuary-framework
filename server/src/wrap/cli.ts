@@ -133,6 +133,11 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   CASTLE_WALL_HEARTBEAT_OPERATION,
 } from "../castle-wall/constants.js";
+import {
+  castleWallEvidenceMatchesProtectionSubject,
+  protectionSubjectForUid,
+  resolveProtectionSubjectFromFortressPath,
+} from "../castle-wall/subject-binding.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { SANCTUARY_VERSION } from "../config.js";
@@ -1066,6 +1071,7 @@ type CastleWallFeatureProbeInput =
   | {
       purpose: "protection-claim";
       exclusiveEgress: ExclusiveEgressStatus | null;
+      protectionClaimSubject: string | null;
     };
 
 type CastleWallFeatureProbeResult = {
@@ -1078,6 +1084,32 @@ type AuditQueryResult = Awaited<ReturnType<FeatureHealthAuditReader["query"]>>;
 interface WrapAuditEvidenceReader extends FeatureHealthAuditReader {
   runEagerReads<T>(fn: () => Promise<T>): Promise<T>;
   incompleteEvidenceReasons?: readonly string[];
+}
+
+function protectionSubjectFromAutoProvisionSummary(
+  summary: AutoProvisionSummary,
+  fortressId: string,
+): string | null {
+  const outcome = summary.outcome;
+  if (outcome === undefined || !("uid" in outcome)) return null;
+  return protectionSubjectForUid(fortressId, outcome.uid);
+}
+
+async function resolveWrapProtectionClaimSubject(input: {
+  storagePath: string;
+  autoProvisionSummary: AutoProvisionSummary;
+}): Promise<string | null> {
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  return (
+    protectionSubjectFromAutoProvisionSummary(
+      input.autoProvisionSummary,
+      fortressId,
+    ) ??
+    (await resolveProtectionSubjectFromFortressPath(
+      input.storagePath,
+      fortressId,
+    )).subject
+  );
 }
 
 function compareAuditEntriesByTimestamp(a: AuditEntry, b: AuditEntry): number {
@@ -1326,6 +1358,18 @@ async function readCastleWallEgressFeatureStatus(
       input.exclusiveEgress !== null
         ? { exclusiveEgress: input.exclusiveEgress }
         : {}),
+      protectionClaimSubject:
+        input.purpose === "protection-claim"
+          ? input.protectionClaimSubject ?? null
+          : fortressIdFromStoragePath(storagePath),
+      ...(input.purpose === "coarse-wall"
+        ? {
+            protectionSubjectMatchMode: {
+              mode: "fortress_scoped" as const,
+              fortressId: fortressIdFromStoragePath(storagePath),
+            },
+          }
+        : {}),
     }),
   );
   const row = panel.rows.find((r) => r.feature_id === "castle_wall_egress");
@@ -1396,8 +1440,10 @@ function currentWrapHeartbeatAttribution(details: unknown): string | undefined {
  * Current-wrap daemon liveness gate for the banner resolver. This observes a
  * daemon-shaped, provenance-marked heartbeat after the daemon-start attempt and
  * inside the existing freshness window, paired to this wrap's daemon start entry.
- * It never earns green by itself; it only prevents a handle lifetime, marker-only
- * self-writes, or stale prior evidence from enabling a claim.
+ * The subject match is fortress-scoped because a heartbeat proves the daemon is
+ * alive for this fortress, not that any one confined agent has subject-bound
+ * enforcement evidence. It never earns green by itself; exact-subject
+ * enforcement evidence remains required downstream.
  */
 export async function observeCurrentWrapCastleWallDaemonLiveness(
   auditLog: WrapAuditEvidenceReader,
@@ -1412,10 +1458,14 @@ export async function observeCurrentWrapCastleWallDaemonLiveness(
   const freshnessFloorMs = nowMs - DEFAULT_ENFORCEMENT_FRESHNESS_MS;
   try {
     const limit = 10_000;
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const livenessMatchMode = {
+      mode: "fortress_scoped" as const,
+      fortressId,
+    };
     const result = await auditLog.runEagerReads(() =>
       auditLog.query({
         layer: CASTLE_WALL_AUDIT_LAYER,
-        identity_id: fortressIdFromStoragePath(storagePath),
         since: new Date(sinceMs).toISOString(),
         limit,
       }),
@@ -1432,6 +1482,15 @@ export async function observeCurrentWrapCastleWallDaemonLiveness(
     for (const entry of result.entries) {
       if (entry.operation !== CASTLE_WALL_DAEMON_START_OPERATION) continue;
       if (entry.result !== "success") continue;
+      if (
+        !castleWallEvidenceMatchesProtectionSubject(
+          null,
+          entry,
+          livenessMatchMode,
+        ).matches
+      ) {
+        continue;
+      }
       const ts = Date.parse(entry.timestamp);
       if (!Number.isFinite(ts) || ts < sinceMs) continue;
       const key = daemonAttributionKey(entry.details);
@@ -1444,6 +1503,15 @@ export async function observeCurrentWrapCastleWallDaemonLiveness(
     return result.entries.some((entry) => {
       if (entry.operation !== CASTLE_WALL_HEARTBEAT_OPERATION) return false;
       if (entry.result !== "success") return false;
+      if (
+        !castleWallEvidenceMatchesProtectionSubject(
+          null,
+          entry,
+          livenessMatchMode,
+        ).matches
+      ) {
+        return false;
+      }
       const ts = Date.parse(entry.timestamp);
       const key = currentWrapHeartbeatAttribution(entry.details);
       const startTs = key === undefined ? undefined : currentWrapDaemonStarts.get(key);
@@ -1484,7 +1552,10 @@ export async function probeCastleWallProtectionClaim(
   auditLog: WrapAuditEvidenceReader,
   storagePath: string,
   resolveExclusiveEgress: () => Promise<ExclusiveEgressStatus | null>,
-  options: { providerTimeoutMs?: number } = {},
+  options: {
+    providerTimeoutMs?: number;
+    protectionClaimSubject?: string | null;
+  } = {},
 ): Promise<ProtectionStateClaim> {
   let exclusiveEgress: ExclusiveEgressStatus | null;
   try {
@@ -1506,7 +1577,11 @@ export async function probeCastleWallProtectionClaim(
     const castleWallEgress = await readCastleWallEgressFeatureStatus(
       auditLog,
       storagePath,
-      { purpose: "protection-claim", exclusiveEgress },
+      {
+        purpose: "protection-claim",
+        exclusiveEgress,
+        protectionClaimSubject: options.protectionClaimSubject ?? null,
+      },
     );
     return protectionStateClaimFromObservation(
       appendProtectionObservationReasons(
@@ -1736,6 +1811,10 @@ export async function resolveWrapProtectionClaim(input: {
       masterKey: input.masterKey,
     }),
   });
+  const protectionClaimSubject = await resolveWrapProtectionClaimSubject({
+    storagePath: input.storagePath,
+    autoProvisionSummary: input.autoProvisionSummary,
+  });
   const daemonLivenessObserved =
     await observeCurrentWrapCastleWallDaemonLiveness(
       auditEvidence,
@@ -1747,7 +1826,9 @@ export async function resolveWrapProtectionClaim(input: {
       {
         state: "unknown",
         basis: "provider_unavailable",
-        reasons: ["Castle Wall daemon liveness was not observed during this wrap"],
+        reasons: [
+          "Castle Wall current-wrap daemon heartbeat could not be confirmed",
+        ],
       },
       autoProvisionClaim,
     );
@@ -1786,7 +1867,10 @@ export async function resolveWrapProtectionClaim(input: {
     auditEvidence,
     input.storagePath,
     resolver,
-    { providerTimeoutMs: input.providerTimeoutMs },
+    {
+      providerTimeoutMs: input.providerTimeoutMs,
+      protectionClaimSubject,
+    },
   );
   return applyAutoProvisionCeiling(probedClaim, autoProvisionCeiling);
 }
@@ -3567,6 +3651,11 @@ export async function runWrap(
           ...(brokerProducerKeyLoad.status === "unreadable"
             ? { brokerProducerKeyExpectedButUnavailable: true }
             : {}),
+          resolveProtectionClaimSubject: () =>
+            resolveProtectionSubjectFromFortressPath(
+              storagePath,
+              fortressIdFromStoragePath(storagePath),
+            ).then((result) => result.subject),
         });
       } catch {
         // Never let the producer-key probe fail wrap. On any unexpected throw the

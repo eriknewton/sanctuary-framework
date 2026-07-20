@@ -182,7 +182,7 @@ describe("S5-P exclusive-egress posture object (mocked probes)", () => {
     );
     expect(posture.mode).toBe("unprotected");
     expect(posture.reasons).toContain(
-      "wall: coarse Castle Wall not armed over this agent",
+      "wall: coarse Castle Wall enforcement not confirmed for this fortress",
     );
   });
 

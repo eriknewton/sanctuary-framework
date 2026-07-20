@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { generateRandomKey } from "../../src/core/random.js";
+import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import {
   handlePostureRoute,
@@ -16,6 +17,36 @@ import type { DetectedHarness } from "../../src/principal-policy/posture.js";
 import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
 
 const FORTRESS = "fortress:test";
+
+function subjectForUid(uid: number): string {
+  const subject = protectionSubjectForUid(FORTRESS, uid);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
+}
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
+const CLAIM_UID = 601;
+const CLAIM_TOKEN = auditTokenForRuid(CLAIM_UID);
+const CLAIM_SUBJECT = subjectForUid(CLAIM_UID);
 
 function wrappedAgent(id: string, harness: string): LocalAgentRecord {
   return {
@@ -87,6 +118,7 @@ function baseDeps(log: AuditLog | null, agents: LocalAgentRecord[]): PostureRout
       },
     ],
     platform: "darwin",
+    resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
   };
 }
 
@@ -113,9 +145,12 @@ describe("posture route layer", () => {
     await log.appendCritical({
       layer: "l1",
       operation: "egress_allowed",
-      identity_id: FORTRESS,
+      identity_id: CLAIM_SUBJECT,
       result: "success",
-      details: { cw_source: "castle_wall_audit_consumer" },
+      details: {
+        agent_id: CLAIM_TOKEN,
+        cw_source: "castle_wall_audit_consumer",
+      },
       timestamp: new Date(now - 30_000).toISOString(),
     });
     const base = await serve(baseDeps(log, [wrappedAgent("a1", "claude_code")]));
@@ -148,9 +183,12 @@ describe("posture route layer", () => {
     await log.appendCritical({
       layer: "l1",
       operation: "egress_allowed",
-      identity_id: FORTRESS,
+      identity_id: CLAIM_SUBJECT,
       result: "success",
-      details: { cw_source: "castle_wall_audit_consumer" },
+      details: {
+        agent_id: CLAIM_TOKEN,
+        cw_source: "castle_wall_audit_consumer",
+      },
       timestamp: new Date(Date.now() - 30_000).toISOString(),
     });
     const base = await serve(baseDeps(log, []));
@@ -164,9 +202,12 @@ describe("posture route layer", () => {
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: CLAIM_SUBJECT,
       result: "failure",
-      details: { cw_source: "castle_wall_audit_consumer" },
+      details: {
+        agent_id: CLAIM_TOKEN,
+        cw_source: "castle_wall_audit_consumer",
+      },
       timestamp: new Date(Date.now() - 15_000).toISOString(),
     });
     const second = await (await fetch(`${base}${POSTURE_API_PREFIX}/home`)).json();
@@ -187,9 +228,12 @@ describe("posture route layer", () => {
       await writer.appendCritical({
         layer: "l1",
         operation: "egress_allowed",
-        identity_id: FORTRESS,
+        identity_id: CLAIM_SUBJECT,
         result: "success",
-        details: { cw_source: "castle_wall_audit_consumer" },
+        details: {
+          agent_id: CLAIM_TOKEN,
+          cw_source: "castle_wall_audit_consumer",
+        },
       });
     }
     await writer.flush();
@@ -225,9 +269,12 @@ describe("posture route layer", () => {
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: CLAIM_SUBJECT,
       result: "success",
-      details: { cw_source: "castle_wall_audit_consumer" },
+      details: {
+        agent_id: CLAIM_TOKEN,
+        cw_source: "castle_wall_audit_consumer",
+      },
       timestamp: new Date(now - 30_000).toISOString(),
     });
     const base = await serve(baseDeps(log, []));
