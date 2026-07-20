@@ -243,6 +243,10 @@ export {
 } from "./posture.js";
 
 export {
+  GENERIC_UID_CONFINEMENT_REMEDY,
+} from "./operator-advice.js";
+
+export {
   protectionObservationFromFeatureHealth,
   protectionStateAdvice,
   protectionStateClaimFromObservation,

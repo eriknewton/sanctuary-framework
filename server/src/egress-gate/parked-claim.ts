@@ -371,6 +371,8 @@ export function runStateAdvice(
       : "the harness plist and its launchd job";
   let recovery: string;
   if (claim.state === "parked") {
+    // Correctly Hermes-scoped: production reaches this run-state recovery
+    // advice through `protect --hermes` auto-provision / release-barrier paths.
     recovery =
       context?.priorPlistRestored === false
         ? "Re-run 'sudo sanctuary protect --hermes' to bring it back up -- but NOT under your previous " +

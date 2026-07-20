@@ -74,6 +74,7 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import { GENERIC_UID_CONFINEMENT_REMEDY } from "../egress-gate/operator-advice.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -4006,8 +4007,7 @@ async function runArmDisarm(
           "Refusing to arm: no agent-origin descriptor is set for this fortress.\n" +
             "Arming would classify EVERY flow as `.agent`, so default-deny would cut\n" +
             "your OWN SSH / Tailscale / operator shell (the boot-cut).\n" +
-            "Set one first, then re-run enable:\n" +
-            "  sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500\n" +
+            `Set one first: ${GENERIC_UID_CONFINEMENT_REMEDY} Then re-run enable.\n` +
             "Or pass --force to arm agent-only anyway (you WILL lose operator access\n" +
             "unless another carve-out already exists).\n",
         );
@@ -4046,8 +4046,7 @@ async function runArmDisarm(
             "Refusing to arm: this fortress has ZERO agent-matchable allow rules, so the\n" +
               "confined agent would be default-denied for EVERYTHING (including its own\n" +
               "endpoints) -- confined into non-functionality, silently.\n" +
-              "Provision its egress first: sudo sanctuary protect --hermes (publishes the\n" +
-              "harness's signed allow rules), or add allow rules to\n" +
+              `${GENERIC_UID_CONFINEMENT_REMEDY} Also add agent-matchable allow rules to\n` +
               `${join(fortressPath, "policy", "egress", "rules")} and reload.\n` +
               "Or pass --allow-no-egress to arm a deliberate deny-all quarantine (audited).\n",
           );

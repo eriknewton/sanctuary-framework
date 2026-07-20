@@ -4,11 +4,13 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
+import { GENERIC_UID_CONFINEMENT_REMEDY } from "../../src/egress-gate/operator-advice.js";
 import { PROTECTION_HERO_COPY } from "../../src/egress-gate/protection-claim.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const SERVER_SRC = join(REPO_ROOT, "server", "src");
 const CHOKEPOINT = "server/src/egress-gate/protection-claim.ts";
+const GENERIC_ADVICE_OWNER = "server/src/egress-gate/operator-advice.ts";
 const FROZEN_DASHBOARD_HERO = "server/src/dashboard/html.ts";
 const CHOKEPOINT_SOURCE_TEXT = readFileSync(join(REPO_ROOT, CHOKEPOINT), "utf8");
 
@@ -367,6 +369,10 @@ function extractProtectionStateAdvicePhrases(sourceText: string): {
       if (value !== undefined) localStrings.set(declaration.name.text, value);
     }
   }
+  localStrings.set(
+    "GENERIC_UID_CONFINEMENT_REMEDY",
+    GENERIC_UID_CONFINEMENT_REMEDY,
+  );
 
   const phrases = new Set<string>(Object.values(PROTECTION_HERO_COPY));
   const unresolved: string[] = [];
@@ -475,6 +481,9 @@ function scanProtectionProse(fileName: string, sourceText: string): string[] {
 
 function allowedFilesFor(phrase: string): Set<string> {
   const allowed = new Set([CHOKEPOINT]);
+  if (phrase === GENERIC_UID_CONFINEMENT_REMEDY) {
+    allowed.add(GENERIC_ADVICE_OWNER);
+  }
   if (phrase === "Your agent is protected.") {
     // Frozen dashboard token: server/reorg-surface-manifest.md protects this
     // exact HERO_COPY string and id="hero-copy". Dashboard HTML tests prove it
