@@ -1311,14 +1311,12 @@ async function readCastleWallEgressFeatureStatus(
     "../castle-wall/runtime/producer-signature.js"
   );
   const keyLoad = await loadFortressProducerKey(storagePath);
-  const fortressId = fortressIdFromStoragePath(storagePath);
   // Eager-read scope: same one-verified-view discipline as the dashboard
   // callers of buildFeatureHealthPanel (H4 chokepoint).
   const panel = await auditLog.runEagerReads(() =>
     buildFeatureHealthPanel({
       auditLog,
-      originMachine: fortressId,
-      subjectIdentityId: fortressId,
+      originMachine: fortressIdFromStoragePath(storagePath),
       pinnedProducerKeyB64url:
         keyLoad.status === "present" ? keyLoad.keyB64url : null,
       ...(keyLoad.status === "unreadable"

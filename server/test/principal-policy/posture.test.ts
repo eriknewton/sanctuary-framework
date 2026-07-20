@@ -40,12 +40,11 @@ async function appendCW(
   operation: string,
   timestamp: string,
   result: "success" | "failure" = "success",
-  identityId: string = FORTRESS,
 ): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation,
-    identity_id: identityId,
+    identity_id: FORTRESS,
     result,
     details: { cw_source: "castle_wall_audit_consumer" },
     timestamp,
@@ -115,35 +114,12 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     const posture = await buildCastleWallPosture({
       auditLog: log,
       originMachine: FORTRESS,
-      subjectIdentityId: FORTRESS,
       platform: "darwin",
       now,
     });
     expect(posture.arm_state).toBe("armed");
     expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
     expect(posture.verdict_counts.allowed).toBe(1);
-  });
-
-  it("does NOT render armed from fresh Castle Wall evidence for a different identity", async () => {
-    const { log } = newAuditLog();
-    const now = Date.now();
-    await appendCW(
-      log,
-      "egress_allowed",
-      new Date(now - 60_000).toISOString(),
-      "success",
-      "foreign-agent",
-    );
-    const posture = await buildCastleWallPosture({
-      auditLog: log,
-      originMachine: FORTRESS,
-      subjectIdentityId: FORTRESS,
-      platform: "darwin",
-      now,
-    });
-    expect(posture.arm_state).toBe("unknown");
-    expect(posture.evidence_basis).toBe("no_evidence");
-    expect(posture.verdict_counts.allowed).toBe(0);
   });
 
   it("does NOT render armed when the only evidence is stale (older than the freshness window)", async () => {

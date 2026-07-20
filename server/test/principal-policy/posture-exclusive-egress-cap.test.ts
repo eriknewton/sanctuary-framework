@@ -33,7 +33,6 @@ import {
   renderPostureHomeHTML,
 } from "../../src/principal-policy/posture-home-html.js";
 import { renderTable } from "../../src/cli/status.js";
-import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import {
   buildExclusiveEgressPosture,
   summarizeExclusiveEgressStatus,
@@ -49,12 +48,11 @@ async function appendCW(
   log: AuditLog,
   operation: string,
   timestamp: string,
-  identityId: string = FORTRESS,
 ): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation,
-    identity_id: identityId,
+    identity_id: FORTRESS,
     result: "success",
     details: { cw_source: "castle_wall_audit_consumer" },
     timestamp,
@@ -550,12 +548,7 @@ describe("S5-P: wrap first-run banner requires the capped protection claim", () 
     await mkdir(join(storagePath, "policy", "egress"), { recursive: true });
     const log = newAuditLog();
     const now = Date.now();
-    await appendCW(
-      log,
-      "egress_allowed",
-      new Date(now - 60_000).toISOString(),
-      fortressIdFromStoragePath(storagePath),
-    );
+    await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
 
     const claim = await probeCastleWallProtectionClaim(
       log,

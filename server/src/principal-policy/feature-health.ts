@@ -850,12 +850,6 @@ export interface FeatureHealthAuditReader {
 export interface BuildFeatureHealthInput {
   auditLog: FeatureHealthAuditReader;
   originMachine: string;
-  /**
-   * Optional subject binding for protection claims about one identity. When set,
-   * Castle Wall green-earning invocation/liveness evidence must carry this
-   * exact audit `identity_id`; foreign same-fortress agent traffic is ignored.
-   */
-  subjectIdentityId?: string;
   /** Registry to evaluate. Defaults to the Slice-1 registry; injectable for tests. */
   registry?: ReadonlyArray<FeatureRegistryEntry>;
   now?: number;
@@ -937,7 +931,6 @@ export function evaluateFeatureHealth(args: {
    */
   freshnessComplete?: boolean;
   originMachine: string;
-  subjectIdentityId?: string;
   now: number;
   freshnessWindowMs: number;
   integrityOk: boolean;
@@ -964,7 +957,6 @@ export function evaluateFeatureHealth(args: {
 }): FeatureHealthRow {
   const { feature, entries, originMachine, now, freshnessWindowMs, integrityOk } =
     args;
-  const subjectIdentityId = args.subjectIdentityId;
   const pinnedProducerKey = args.pinnedProducerKeyB64url ?? null;
   const producerKeyExpectedButUnavailable =
     args.producerKeyExpectedButUnavailable === true;
@@ -1028,14 +1020,6 @@ export function evaluateFeatureHealth(args: {
     const isLiveness = livenessOps !== undefined && livenessOps.has(op);
     const isStandDown = standDownOps !== undefined && standDownOps.has(op);
     if (!isInvocation && !isFault && !isLiveness && !isStandDown) return null;
-    if (
-      feature.id === "castle_wall_egress" &&
-      (isInvocation || isLiveness) &&
-      subjectIdentityId !== undefined &&
-      entry.identity_id !== subjectIdentityId
-    ) {
-      return null;
-    }
     // Gate ONLY green-earning invocation evidence AND liveness heartbeats; never
     // gate fault recognition. (For Castle Wall, invocationOps / faultOps /
     // livenessOps are mutually disjoint, so a fault entry is never dropped here.)
@@ -1774,9 +1758,6 @@ export async function buildFeatureHealthPanel(
       freshnessEntries: inFreshness,
       freshnessComplete,
       originMachine: input.originMachine,
-      ...(input.subjectIdentityId !== undefined
-        ? { subjectIdentityId: input.subjectIdentityId }
-        : {}),
       now,
       freshnessWindowMs,
       integrityOk,
