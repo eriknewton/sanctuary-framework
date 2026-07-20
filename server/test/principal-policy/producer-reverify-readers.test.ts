@@ -30,6 +30,7 @@ import {
   buildAuditDigest,
 } from "../../src/principal-policy/posture.js";
 import { buildFeatureHealthPanel } from "../../src/principal-policy/feature-health.js";
+import { fortressIdFromStoragePath } from "../../src/dashboard/v1_1/wiring.js";
 import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
@@ -57,6 +58,26 @@ function toBase64url(bytes: Uint8Array): string {
 
 const daemonPriv = ed25519.utils.randomPrivateKey();
 const daemonPubB64 = toBase64url(ed25519.getPublicKey(daemonPriv));
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
 
 function newLog(): AuditLog {
   return new AuditLog(new MemoryStorage(), generateRandomKey());
@@ -155,6 +176,46 @@ async function appendRelabeledSigned(
     details: {
       seq: input.seq,
       agent_id: input.signedIdentityId,
+      dest_host: "evil.example",
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+        CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    },
+  });
+}
+
+async function appendMacOSSignedAuditToken(
+  log: AuditLog,
+  input: {
+    seq: number;
+    signedAuditToken: string;
+    persistedIdentityId: string;
+  },
+): Promise<void> {
+  const canonical = JSON.stringify({
+    timestamp: new Date(FRESH_TS).toISOString(),
+    layer: "l1",
+    operation: "egress_blocked",
+    result: "blocked",
+    details: { agent_id: input.signedAuditToken, dest_host: "evil.example" },
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(canonical, FRESH_TS, input.seq),
+    daemonPriv,
+  );
+  await log.appendCritical({
+    layer: "l1",
+    operation: "egress_blocked",
+    identity_id: input.persistedIdentityId,
+    result: "success",
+    timestamp: new Date(FRESH_TS).toISOString(),
+    details: {
+      seq: input.seq,
+      agent_id: input.signedAuditToken,
       dest_host: "evil.example",
       [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
       [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
@@ -312,6 +373,7 @@ describe("Slice R — HEADLINE NEGATIVE: a forged in-process entry never renders
       const digest = await buildAuditDigest({
         auditLog: log,
         originMachine: FORTRESS,
+        protectionClaimSubject: FORTRESS,
         now: NOW,
         pinnedProducerKeyB64url: daemonPubB64,
       });
@@ -425,6 +487,7 @@ describe("Slice R — read-side subject binding rejects producer-signed relabels
       const digest = await buildAuditDigest({
         auditLog: log,
         originMachine: FORTRESS,
+        protectionClaimSubject: FORTRESS,
         now: NOW,
         pinnedProducerKeyB64url: daemonPubB64,
       });
@@ -442,6 +505,41 @@ describe("Slice R — read-side subject binding rejects producer-signed relabels
     });
   }
 
+  it("digest and posture join on the storage-path fortress subject for macOS signed audit-token evidence", async () => {
+    const log = newLog();
+    const storagePath = "/var/sanctuary/fortress-alpha";
+    const subjectFortressId = fortressIdFromStoragePath(storagePath);
+    const signedAuditToken = auditTokenForRuid(503);
+    const postureSubject = `${subjectFortressId}/uid-503`;
+    const originMachine = `fortress:${storagePath}`;
+    await appendMacOSSignedAuditToken(log, {
+      seq: 0,
+      signedAuditToken,
+      persistedIdentityId: postureSubject,
+    });
+
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: postureSubject,
+      auditLog: log,
+      originMachine,
+      platform: "macos",
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+    const digest = await buildAuditDigest({
+      auditLog: log,
+      originMachine,
+      protectionClaimSubject: postureSubject,
+      now: NOW,
+      pinnedProducerKeyB64url: daemonPubB64,
+    });
+
+    expect(posture.arm_state).toBe("armed");
+    expect(digest.by_agent).toEqual([
+      { identity_id: postureSubject, operations: 1 },
+    ]);
+  });
+
   it("digest omits producer-signed attribution when the signed operation does not bind to the enforcement row", async () => {
     const log = newLog();
     await appendRelabeledSigned(log, {
@@ -455,6 +553,7 @@ describe("Slice R — read-side subject binding rejects producer-signed relabels
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -494,6 +593,7 @@ describe("Slice R — read-side subject binding rejects producer-signed relabels
       const digest = await buildAuditDigest({
         auditLog: log,
         originMachine: FORTRESS,
+        protectionClaimSubject: FORTRESS,
         now: NOW,
         pinnedProducerKeyB64url: daemonPubB64,
       });
@@ -549,6 +649,7 @@ describe("Slice R — codex HIGH #1: key-bearing reader rejects channel/legacy-b
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -704,6 +805,7 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -828,6 +930,7 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -887,6 +990,7 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -915,6 +1019,7 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });
@@ -956,6 +1061,7 @@ describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and re
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now: NOW,
       pinnedProducerKeyB64url: daemonPubB64,
     });

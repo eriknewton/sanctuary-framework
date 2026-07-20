@@ -2,6 +2,7 @@ import {
   exclusiveEgressCapsAggregateGreen,
   type ExclusiveEgressStatus,
 } from "./posture.js";
+import { GENERIC_UID_CONFINEMENT_REMEDY } from "./operator-advice.js";
 
 /**
  * Protection-copy chokepoint for the wrap success banner and legacy dashboard
@@ -270,7 +271,7 @@ export function protectionStateAdvice(
             "Your agent is wrapped, but enforcement is not confirmed for this confined agent.",
           castleWallLabel:
             "Castle Wall status unknown (no subject-bound enforcement evidence)",
-          imperative: inspectImperative,
+          imperative: GENERIC_UID_CONFINEMENT_REMEDY,
         };
       }
       if (claim.basis === "legacy_macos_audit_token") {
@@ -290,7 +291,7 @@ export function protectionStateAdvice(
             "Your agent is wrapped, but its confinement identity could not be read.",
           castleWallLabel:
             "Castle Wall status unknown (agent confinement identity unreadable)",
-          imperative: inspectImperative,
+          imperative: GENERIC_UID_CONFINEMENT_REMEDY,
         };
       }
       return {

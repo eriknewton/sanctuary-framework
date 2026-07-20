@@ -690,11 +690,19 @@ async function buildWallPosture(
   );
 }
 
-async function buildDigest(deps: PostureRouteDeps): Promise<AuditDigest> {
+async function buildDigest(
+  deps: PostureRouteDeps,
+  preResolvedProtectionClaimSubject?: string | null,
+): Promise<AuditDigest> {
+  const protectionClaimSubject =
+    preResolvedProtectionClaimSubject !== undefined
+      ? preResolvedProtectionClaimSubject
+      : await resolveProtectionClaimSubject(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildAuditDigest({
       auditLog: deps.auditLog as AuditLog,
       originMachine: deps.originMachine,
+      protectionClaimSubject,
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()
@@ -1033,7 +1041,7 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   const [castleWall, digest, unwrapped, featureHealth, custodyExit, federation] =
     await Promise.all([
       buildWallPosture(deps, exclusiveEgress, protectionClaimSubject),
-      buildDigest(deps),
+      buildDigest(deps, protectionClaimSubject),
       buildUnwrapped(deps),
       buildFeatureHealth(deps, exclusiveEgress, protectionClaimSubject),
       buildCustodyExit(deps),

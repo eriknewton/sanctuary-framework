@@ -1718,6 +1718,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${EG}/harness-daemon.ts`]: 12,
   [`${EG}/index.ts`]: 0,
   [`${EG}/liveness-oracle.ts`]: 2,
+  [`${EG}/operator-advice.ts`]: 0,
   [`${EG}/parity.ts`]: 0,
   [`${EG}/parked-claim.ts`]: 1,
   [`${EG}/peer-identity.ts`]: 0,
