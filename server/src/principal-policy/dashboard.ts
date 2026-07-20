@@ -60,7 +60,10 @@ import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer 
 import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
-import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import {
+  fortressIdFromStoragePath,
+  type V11Bindings,
+} from "../dashboard/v1_1/wiring.js";
 import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
 import {
   getProtectionSnapshot,
@@ -111,6 +114,7 @@ import {
   type CastleWallPosture,
   type ExclusiveEgressStatus,
 } from "./posture.js";
+import { resolveProtectionSubjectFromFortressPath } from "../castle-wall/subject-binding.js";
 import {
   createPostureStreamRegistry,
   type PostureStreamRegistry,
@@ -1285,6 +1289,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
     // raises an OS notification (coarse-only stays loud on the surface, not a
     // notification - the ratified tight fault-class set is unchanged).
     const exclusiveEgress = await this.resolveExclusiveEgressPosture();
+    const protectionClaimSubject = await this.resolveProtectionClaimSubject();
     return auditLog.runEagerReads(() =>
       buildFeatureHealthPanel({
         auditLog,
@@ -1301,6 +1306,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           ? { brokerProducerKeyExpectedButUnavailable: true }
           : {}),
         ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+        protectionClaimSubject,
       }),
     );
   }
@@ -1686,6 +1692,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
       brokerProducerKeyExpectedButUnavailable:
         brokerLoad?.status === "unreadable",
+      resolveProtectionClaimSubject: () =>
+        this.resolveProtectionClaimSubject(),
       // Wire the shared registry so the SSE live-refresh stream is available and
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
@@ -1893,6 +1901,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // aggregate-green cap so /v1/status and the posture routes can never
       // diverge on green.
       const exclusiveEgress = await this.resolveExclusiveEgressPosture();
+      const protectionClaimSubject = await this.resolveProtectionClaimSubject();
       return await this.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: this.auditLog as AuditLog,
@@ -1903,6 +1912,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
           ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+          protectionClaimSubject,
         }),
       );
     } catch {
@@ -2196,6 +2206,17 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         err instanceof Error ? err.message : String(err),
       );
     }
+  }
+
+  private async resolveProtectionClaimSubject(): Promise<string | null> {
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (storagePath === undefined || storagePath.length === 0) return null;
+    const fortressId =
+      this.v11Bindings?.fortressId ?? fortressIdFromStoragePath(storagePath);
+    return (await resolveProtectionSubjectFromFortressPath(
+      storagePath,
+      fortressId,
+    )).subject;
   }
 
   /**
@@ -7060,6 +7081,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // resolver every other surface uses, so the shield's wall arm-state
       // (via the ONE canonical shaper) caps green identically.
       resolveExclusiveEgressPosture: () => this.resolveExclusiveEgressPosture(),
+      resolveProtectionClaimSubject: () => this.resolveProtectionClaimSubject(),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,

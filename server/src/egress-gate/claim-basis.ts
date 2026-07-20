@@ -1723,6 +1723,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${EG}/peer-identity.ts`]: 0,
   [`${EG}/pf-anchor.ts`]: 0,
   [`${EG}/posture.ts`]: 1,
+  [`${EG}/protection-claim.ts`]: 0,
   [`${EG}/release-barrier.ts`]: 15,
   [`${EG}/runtime-fs-plan.ts`]: 0,
 };

@@ -381,6 +381,7 @@ describe("per-plugin feature-health: quiet plugin is green-neutral, not red (inv
     // The honest broken-zero disclosure rides the WIRED panel surface
     // (`broken_zero_undetectable_for_event_driven`), so assert it there.
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -406,6 +407,7 @@ describe("per-plugin feature-health: composition with the native panel", () => {
     await appendDecision(log, [contribution("acme", "deny")], NOW - 1000);
 
     const without = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -413,6 +415,7 @@ describe("per-plugin feature-health: composition with the native panel", () => {
     expect(without.plugin_rows).toEqual([]);
 
     const withPlugins = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -430,6 +433,7 @@ describe("per-plugin feature-health: composition with the native panel", () => {
     const log = newAuditLog();
     await appendDecision(log, [contribution("acme", "deny")], NOW - 1000);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,

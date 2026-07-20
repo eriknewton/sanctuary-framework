@@ -919,6 +919,7 @@ describe("agent-audit-allowlist: STRUCTURE TRIPWIRE (comprehensive — agent-fac
     // this tripwire discovers, so it needs no row here.
     "cli/audit.ts",
     "cli/castle-wall.ts",
+    "wrap/cli.ts",
     // compliance report generation — operator artifact
     "compliance/eu_ai_act/generator.ts",
     // law-firm evidence pack — operator artifact. The CLI reads the full audit

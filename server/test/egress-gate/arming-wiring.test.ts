@@ -11,8 +11,12 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
+  createExclusiveEgressPostureProducer,
   applyRootOwnedDirEnsure,
   createInstallExclusiveEgressOps,
   createProductionReleaseBarrierOps,
@@ -30,7 +34,10 @@ import {
   type ExclusiveEgressWiringInput,
   type PersistentParkContext,
 } from "../../src/egress-gate/arming-wiring.js";
-import { PfAnchorRegistry } from "../../src/egress-gate/anchor-registry.js";
+import {
+  PfAnchorRegistry,
+  PfAnchorRegistryStateError,
+} from "../../src/egress-gate/anchor-registry.js";
 import {
   gateCredentialAcceptPath,
   gateCredentialTokenPath,
@@ -72,6 +79,30 @@ function execStub(input: { pid: number; uid: number; lstart?: string | Error }) 
     throw new Error(`unexpected exec: ${file}`);
   });
 }
+
+describe("egress-gate/arming-wiring posture producer", () => {
+  it("B3: corrupt registry state throws instead of collapsing to no fine-grained agent", async () => {
+    const fortressPath = await mkdtemp(join(tmpdir(), "sanctuary-egress-producer-"));
+    try {
+      const producer = createExclusiveEgressPostureProducer(
+        {
+          fortressPath,
+          coarseWallArmed: async () => true,
+        },
+        {
+          registry: {
+            list: async () => {
+              throw new PfAnchorRegistryStateError("corrupt registry");
+            },
+          },
+        },
+      );
+      await expect(producer()).rejects.toBeInstanceOf(PfAnchorRegistryStateError);
+    } finally {
+      await rm(fortressPath, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("egress-gate/arming-wiring verifyLoopbackTcpPortOwner", () => {
   it("ok when the listener pid (and uid, when expected) match", async () => {

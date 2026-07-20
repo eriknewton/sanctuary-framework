@@ -2723,27 +2723,18 @@ export function createExclusiveEgressPostureProducer(input: {
   fortressPath: string;
   /** The same coarse-wall evidence surface the caller already trusts. */
   coarseWallArmed: () => Promise<boolean>;
-}): () => Promise<ExclusiveEgressStatus | null> {
+}, deps: {
+  registry?: Pick<PfAnchorRegistry, "list">;
+} = {}): () => Promise<ExclusiveEgressStatus | null> {
   return async (): Promise<ExclusiveEgressStatus | null> => {
     const marker = await loadExclusiveRoutingMarker(input.fortressPath).catch((err) => {
       // A malformed marker is a fail-closed cap, not a null.
       throw err instanceof Error ? err : new Error(String(err));
     });
-    const registry = createProductionAnchorRegistry();
-    let entries: { agent_uid: number; gate_port: number; fortress_path: string; generation_id?: number; tombstone?: boolean }[];
-    let dirty: boolean;
-    try {
-      const listed = await registry.list();
-      entries = listed.entries;
-      dirty = listed.dirty;
-    } catch (err) {
-      // No registry file at all + no marker = affirmatively no fine-grained
-      // agent; any OTHER failure caps green.
-      if (marker === null && (err as { name?: string }).name === "PfAnchorRegistryStateError") {
-        return null;
-      }
-      throw err;
-    }
+    const registry = deps.registry ?? createProductionAnchorRegistry();
+    const listed = await registry.list();
+    const entries = listed.entries;
+    const dirty = listed.dirty;
     if (marker === null && entries.length === 0) {
       return null;
     }

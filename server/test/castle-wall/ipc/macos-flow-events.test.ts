@@ -42,6 +42,7 @@ import {
 } from "../../../src/castle-wall/runtime/index.js";
 import type { EmissionLivenessNotes } from "../../../src/castle-wall/audit/emission-liveness.js";
 import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
+import { protectionSubjectForUid } from "../../../src/castle-wall/subject-binding.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
 import {
@@ -179,6 +180,7 @@ function buildConsumer(args?: {
   defaultApprovalTimeoutSeconds?: number;
   pinnedProducerKeyB64url?: string | null;
   now?: () => number;
+  fortressId?: string;
 }) {
   const auditSinkBundle = makeAuditSink();
   const queueBundle = makeApprovalQueue();
@@ -192,9 +194,36 @@ function buildConsumer(args?: {
     auditSink: auditSinkBundle.sink,
     defaultApprovalTimeoutSeconds: args?.defaultApprovalTimeoutSeconds ?? 30,
     pinnedProducerKeyB64url: args?.pinnedProducerKeyB64url ?? null,
+    ...(args?.fortressId ? { fortressId: args.fortressId } : {}),
     ...(args?.now ? { now: args.now } : {}),
   });
   return { consumer, auditSinkBundle, queueBundle, manifestProvider };
+}
+
+function subjectForUid(fortressId: string, uid: number): string {
+  const subject = protectionSubjectForUid(fortressId, uid);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
+}
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
 }
 
 function signedMacOSProducerFor(
@@ -321,7 +350,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-7", template: "coding-assistant" },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
       matched_rule_id: "rule-anthropic",
       recorded_at: "2026-05-11T12:00:00Z",
     };
@@ -331,7 +360,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     const entry = auditSinkBundle.entries[0];
     expect(entry?.layer).toBe("l1");
     expect(entry?.operation).toBe("egress_allowed");
-    expect(entry?.identityId).toBe("agent-7");
+    expect(entry?.identityId).toBe(subjectForUid("fortress-test", 503));
     expect(entry?.result).toBe("success");
     // #381: the matched rule id is written into the stored entry so the
     // operator can attribute the flow. Property #11 (no agent leak) is enforced
@@ -347,6 +376,74 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     );
     expect(consumer.getStats().decisionsRecorded).toBe(1);
     expect(consumer.getStats().decisionsRejected).toBe(0);
+  });
+
+  it("derives the persisted macOS evidence subject from audit_token ruid on the channel path", async () => {
+    const fortressId = "fortress-test";
+    const agentUid = 503;
+    const token = auditTokenForRuid(agentUid);
+    const { consumer, auditSinkBundle } = buildConsumer({ fortressId });
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: token, template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: "2026-05-11T12:00:00Z",
+    };
+
+    await consumer.handleFlowDecisionRecorded(notification);
+
+    const entry = auditSinkBundle.entries[0];
+    expect(entry?.identityId).toBe(subjectForUid(fortressId, agentUid));
+    expect(entry?.details?.agent_id).toBe(token);
+    expect(entry?.details?.agent_template).toBe("coding-assistant");
+  });
+
+  it("rejects a forged canonical-looking agent.id instead of stamping it as evidence", async () => {
+    const forgedSubject = "fortress-malformed-drive/uid-503";
+    const { consumer, auditSinkBundle } = buildConsumer({
+      fortressId: "fortress-malformed-drive",
+    });
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: forgedSubject, template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: "2026-05-11T12:00:00Z",
+    };
+
+    await consumer.handleFlowDecisionRecorded(notification);
+
+    expect(
+      auditSinkBundle.entries.some(
+        (entry) =>
+          entry.operation === "egress_allowed" &&
+          entry.identityId === forgedSubject,
+      ),
+    ).toBe(false);
+    expect(auditSinkBundle.entries).toHaveLength(1);
+    expect(auditSinkBundle.entries[0]?.operation).toBe("flow_decision_rejected");
+    expect(auditSinkBundle.entries[0]?.details?.reason).toMatch(
+      /audit_token_t/,
+    );
+    expect(consumer.getStats().decisionsRecorded).toBe(0);
+    expect(consumer.getStats().decisionsRejected).toBe(1);
   });
 
   it("a REAL macOS allow flow arms buildCastleWallPosture (end-to-end, marker from the writer not the test)", async () => {
@@ -373,7 +470,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-7", template: "coding-assistant" },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
       matched_rule_id: "rule-anthropic",
       recorded_at: new Date().toISOString(),
     };
@@ -384,6 +481,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
       auditLog: log,
       originMachine: "fortress-test",
       platform: "darwin",
+      protectionClaimSubject: subjectForUid("fortress-test", 503),
     });
     expect(posture.arm_state).toBe("armed");
     expect(posture.evidence_basis).toBe("fresh_enforcement_evidence");
@@ -408,7 +506,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-7", template: "coding-assistant" },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
       matched_rule_id: "rule-anthropic",
       recorded_at: "2026-05-11T12:00:00.000Z",
     };
@@ -435,6 +533,143 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
     expect(consumer.getStats().decisionsRejected).toBe(0);
   });
 
+  it("producer-signed macOS evidence arms only the independently derived matching claim subject", async () => {
+    const fortressId = "fortress-test";
+    const agentUid = 503;
+    const token = auditTokenForRuid(agentUid);
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    const capturedAtUnixMs = Date.now();
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE], "sigA"),
+      approvalQueue: makeApprovalQueue().queue,
+      auditSink: log as unknown as AuditSink,
+      defaultApprovalTimeoutSeconds: 30,
+      pinnedProducerKeyB64url: publicKeyB64url,
+      fortressId,
+      now: () => capturedAtUnixMs + 1000,
+    });
+    const notification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: token, template: "coding-assistant" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: new Date(capturedAtUnixMs).toISOString(),
+    };
+    notification.producer = signedMacOSProducerFor(notification, privateKey, {
+      capturedAtUnixMs,
+    });
+
+    await consumer.handleFlowDecisionRecorded(notification);
+
+    const matching = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: fortressId,
+      platform: "darwin",
+      now: capturedAtUnixMs + 1000,
+      pinnedProducerKeyB64url: publicKeyB64url,
+      protectionClaimSubject: subjectForUid(fortressId, agentUid),
+    });
+    expect(matching.arm_state).toBe("armed");
+
+    const foreign = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: fortressId,
+      platform: "darwin",
+      now: capturedAtUnixMs + 1000,
+      pinnedProducerKeyB64url: publicKeyB64url,
+      protectionClaimSubject: subjectForUid(fortressId, agentUid + 1),
+    });
+    expect(foreign.arm_state).toBe("unknown");
+    expect(foreign.evidence_basis).toBe("subject_unbound_evidence");
+  });
+
+  it("binds producer-signed macOS subject attribution to the signed body when the unsigned envelope agent is swapped", async () => {
+    const fortressId = "fortress-test";
+    const signedUid = 65;
+    const swappedEnvelopeUid = 503;
+    const signedToken = auditTokenForRuid(signedUid);
+    const swappedToken = auditTokenForRuid(swappedEnvelopeUid);
+    const privateKey = ed25519.utils.randomPrivateKey();
+    const publicKeyB64url = toBase64url(ed25519.getPublicKey(privateKey));
+    const capturedAtUnixMs = Date.now();
+    const log = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const consumer = new MacOSFlowEventConsumer({
+      manifestProvider: makeManifestProvider([SAMPLE_RULE], "sigA"),
+      approvalQueue: makeApprovalQueue().queue,
+      auditSink: log as unknown as AuditSink,
+      defaultApprovalTimeoutSeconds: 30,
+      pinnedProducerKeyB64url: publicKeyB64url,
+      fortressId,
+      now: () => capturedAtUnixMs + 1000,
+    });
+    const signedNotification: FlowDecisionRecordedNotification = {
+      type: "flow_decision_recorded",
+      decision: "allow",
+      destination: {
+        host: "api.anthropic.com",
+        ip: "104.18.32.10",
+        port: 443,
+        protocol: "tcp",
+        hostname_source: "sni",
+        opaque: false,
+      },
+      agent: { id: signedToken, template: "system" },
+      matched_rule_id: "rule-anthropic",
+      recorded_at: new Date(capturedAtUnixMs).toISOString(),
+    };
+    const producer = signedMacOSProducerFor(signedNotification, privateKey, {
+      capturedAtUnixMs,
+    });
+    const swappedNotification: FlowDecisionRecordedNotification = {
+      ...signedNotification,
+      agent: { id: swappedToken, template: "coding-assistant" },
+      producer,
+    };
+
+    await consumer.handleFlowDecisionRecorded(swappedNotification);
+    await log.flush();
+
+    const entries = (await log.query({ layer: "l1", limit: 20 })).entries;
+    const persisted = entries.find((e) => e.operation === "egress_allowed");
+    expect(persisted?.identity_id).toBe(subjectForUid(fortressId, signedUid));
+    expect(persisted?.identity_id).not.toBe(
+      subjectForUid(fortressId, swappedEnvelopeUid),
+    );
+    expect(persisted?.details?.agent_id).toBe(signedToken);
+
+    const swappedPosture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: fortressId,
+      platform: "darwin",
+      now: capturedAtUnixMs + 1000,
+      pinnedProducerKeyB64url: publicKeyB64url,
+      protectionClaimSubject: subjectForUid(fortressId, swappedEnvelopeUid),
+    });
+    expect(swappedPosture.arm_state).toBe("unknown");
+    expect(swappedPosture.evidence_basis).toBe("subject_unbound_evidence");
+
+    const signedPosture = await buildCastleWallPosture({
+      auditLog: log,
+      originMachine: fortressId,
+      platform: "darwin",
+      now: capturedAtUnixMs + 1000,
+      pinnedProducerKeyB64url: publicKeyB64url,
+      protectionClaimSubject: subjectForUid(fortressId, signedUid),
+    });
+    expect(signedPosture.arm_state).toBe("armed");
+    expect(signedPosture.producer_authenticity).toBe("producer_signed");
+  });
+
   it("rejects an unsigned macOS verdict when an audit-producer key is pinned", async () => {
     const privateKey = ed25519.utils.randomPrivateKey();
     const { consumer, auditSinkBundle } = buildConsumer({
@@ -451,7 +686,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-7", template: "coding-assistant" },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
       matched_rule_id: "rule-anthropic",
       recorded_at: "2026-05-11T12:00:00.000Z",
     };
@@ -483,7 +718,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-7", template: "coding-assistant" },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
       matched_rule_id: "rule-anthropic",
       recorded_at: "2026-05-11T12:00:00.000Z",
     };
@@ -518,7 +753,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: null,
         opaque: true,
       },
-      agent: { id: "agent-9", template: "ops-runner" },
+      agent: { id: auditTokenForRuid(509), template: "ops-runner" },
       matched_rule_id: null,
       recorded_at: "2026-05-11T12:01:00Z",
     };
@@ -545,7 +780,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-7", template: "coding-assistant" },
+      agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
       recorded_at: "2026-05-11T12:00:00Z",
     };
     await consumer.handleFlowDecisionRecorded(notification);
@@ -571,7 +806,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: null,
         opaque: false,
       },
-      agent: { id: "agent-9", template: "ops-runner" },
+      agent: { id: auditTokenForRuid(509), template: "ops-runner" },
       matched_rule_id: null,
       recorded_at: "2026-05-11T12:01:00Z",
     } as unknown as FlowDecisionRecordedNotification;
@@ -598,7 +833,7 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-1", template: "research-assistant" },
+      agent: { id: auditTokenForRuid(501), template: "research-assistant" },
       matched_rule_id: "rule-1",
       recorded_at: "2026-05-11T12:00:00Z",
     };
@@ -624,6 +859,25 @@ describe("MacOSFlowEventConsumer : flow_decision_recorded", () => {
         agent: { id: "", template: "research-assistant" },
       })
     ).toMatch(/agent/);
+    expect(
+      validateFlowDecisionRecorded({
+        ...valid,
+        agent: {
+          id: "fortress-malformed-drive/uid-503",
+          template: "research-assistant",
+        },
+      })
+    ).toMatch(/audit_token_t/);
+    expect(protectionSubjectForUid("fortress-test", 0)).toBeNull();
+    expect(
+      validateFlowDecisionRecorded({
+        ...valid,
+        agent: {
+          id: auditTokenForRuid(0),
+          template: "research-assistant",
+        },
+      })
+    ).toMatch(/audit_token_t/);
     expect(
       validateFlowDecisionRecorded({
         ...valid,
@@ -666,7 +920,7 @@ describe("MacOSFlowEventConsumer : emission-liveness feed (Slice M)", () => {
       hostname_source: "sni",
       opaque: false,
     },
-    agent: { id: "agent-live", template: "coding-assistant" },
+    agent: { id: auditTokenForRuid(503), template: "coding-assistant" },
     matched_rule_id: "rule-anthropic",
     recorded_at: "2026-05-11T12:00:00Z",
   };

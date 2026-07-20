@@ -21,8 +21,8 @@
  *   4. The MED-2 crash-window warning fires for surface X even when a
  *      DIFFERENT surface Y's wrap-meta exists (regression for the
  *      tenant-global suppression).
- *   5. castleWallProtectionConfirmed is THE banner honesty gate (truth
- *      table pinned; refactor-only, never weaken).
+ *   5. The wrap banner renders protection prose only from a branded
+ *      ProtectionStateClaim.
  *   6. checkPinnedVersionResolvable outcomes + the honest wrap-output
  *      downgrade on unpublished/unreachable pins (never blocks the wrap).
  *   7. Unwrap of a wrap-created file preserves its final contents as a
@@ -108,12 +108,15 @@ import type { AddressInfo } from "node:net";
 
 import {
   runWrap,
-  castleWallProtectionConfirmed,
   checkPinnedVersionResolvable,
   resolveNpmRegistryForProbe,
   formatWrapSuccess,
   formatWrapSuccessNoDashboard,
 } from "../../src/wrap/cli.js";
+import {
+  protectionStateClaimFromObservation,
+  type ProtectionStateClaim,
+} from "../../src/egress-gate/protection-claim.js";
 import {
   backupConfig,
   findLatestBackup,
@@ -132,6 +135,32 @@ import {
 } from "../helpers/hermes-parity.js";
 
 const CRASH_WINDOW_MARKER = "already contains a Sanctuary entry";
+
+function claim(state: "exclusive" | "coarse-only" | "unprotected" | "unknown"): ProtectionStateClaim {
+  switch (state) {
+    case "exclusive":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "exclusive_egress_observed",
+      });
+    case "coarse-only":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "exclusive_egress_cap_observed",
+      });
+    case "unprotected":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "disarm_observed_off",
+      });
+    case "unknown":
+      return protectionStateClaimFromObservation({
+        state,
+        basis: "insufficient_evidence",
+        reasons: ["test"],
+      });
+  }
+}
 
 // The parse-parity sidecar seam is a test-only module hook, not a public
 // runWrap dep (DI-bypass closed 2026-07-03). makeDeps() installs an agreeing
@@ -1315,24 +1344,33 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
     expect(stderrOutput()).not.toContain(CRASH_WINDOW_MARKER);
   });
 
-  // ── Finding 5: THE banner honesty gate (refactor-only; never weaken) ──
+  // ── Finding 5: branded protection-state claim gate ─────────────────
 
-  it("castleWallProtectionConfirmed truth table: ONLY armed && observed is confirmed", () => {
-    expect(castleWallProtectionConfirmed(true, true)).toBe(true);
-    // Every other combination — false, undefined, absent signal — reads
-    // NOT confirmed. Weakening any row here is a security defect.
-    const notConfirmed: Array<[boolean | undefined, boolean | undefined]> = [
-      [true, false],
-      [true, undefined],
-      [false, true],
-      [false, false],
-      [false, undefined],
-      [undefined, true],
-      [undefined, false],
-      [undefined, undefined],
-    ];
-    for (const [armed, observed] of notConfirmed) {
-      expect(castleWallProtectionConfirmed(armed, observed)).toBe(false);
+  it("the success banner renders green only for the exclusive protection claim", () => {
+    const base = {
+      toolName: "Claude Code",
+      version: "9.9.9",
+      toolCount: 3,
+      serverCount: 2,
+      dashboardUrl: "http://127.0.0.1:3501",
+      browserOpened: false,
+      passphraseLocation: "test-keychain",
+      passphraseSource: "generated",
+      castleWallProtectionClaim: claim("unknown"),
+    };
+    expect(
+      formatWrapSuccess({
+        ...base,
+        castleWallProtectionClaim: claim("exclusive"),
+      }),
+    ).toContain("Your agent is protected");
+    for (const state of ["coarse-only", "unprotected", "unknown"] as const) {
+      const out = formatWrapSuccess({
+        ...base,
+        castleWallProtectionClaim: claim(state),
+      });
+      expect(out).not.toContain("Your agent is protected");
+      expect(out).not.toContain("Castle Wall Full");
     }
   });
 
@@ -1931,6 +1969,7 @@ describe("surface-scoped wrap-meta + backups, orphan guard, banner gate, pin pro
       browserOpened: false,
       passphraseLocation: "test-keychain",
       passphraseSource: "generated",
+      castleWallProtectionClaim: claim("unknown"),
     };
 
     it("an unpublished pin renders a loud warning in BOTH success surfaces", () => {

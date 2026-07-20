@@ -240,6 +240,12 @@ export interface PostureRouteDeps {
   /** Broker liveness producer key exists or is expected but could not be read. */
   brokerProducerKeyExpectedButUnavailable?: boolean;
   /**
+   * Canonical confined-agent subject (`fortress/uid-N`) for protection claims.
+   * When provided, Castle Wall green evidence must bind to this subject across
+   * posture and feature-health readers.
+   */
+  resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
+  /**
    * Shared active-stream registry for the SSE live-refresh endpoint
    * (`/api/posture/stream`). Supplied by the dashboard so the concurrency cap is
    * enforced across all open streams on the server. When ABSENT, the stream
@@ -299,6 +305,17 @@ async function resolveExclusiveEgress(
     return failedExclusiveEgressStatus(
       err instanceof Error ? err.message : String(err),
     );
+  }
+}
+
+async function resolveProtectionClaimSubject(
+  deps: PostureRouteDeps,
+): Promise<string | null> {
+  if (!deps.resolveProtectionClaimSubject) return null;
+  try {
+    return await deps.resolveProtectionClaimSubject();
+  } catch {
+    return null;
   }
 }
 
@@ -642,6 +659,7 @@ async function buildWallPosture(
    * where a single resolve per request is correct).
    */
   preResolvedExclusiveEgress?: ExclusiveEgressStatus | null,
+  preResolvedProtectionClaimSubject?: string | null,
 ): Promise<CastleWallPosture> {
   // S5-P: resolve the exclusive-egress posture BEFORE the eager read scope so
   // the provider (which may read its own state surfaces) never nests inside the
@@ -650,6 +668,10 @@ async function buildWallPosture(
     preResolvedExclusiveEgress !== undefined
       ? preResolvedExclusiveEgress
       : await resolveExclusiveEgress(deps);
+  const protectionClaimSubject =
+    preResolvedProtectionClaimSubject !== undefined
+      ? preResolvedProtectionClaimSubject
+      : await resolveProtectionClaimSubject(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildCastleWallPosture({
       auditLog: deps.auditLog as AuditLog,
@@ -663,6 +685,7 @@ async function buildWallPosture(
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
       ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+      protectionClaimSubject,
     }),
   );
 }
@@ -712,6 +735,7 @@ async function buildFeatureHealth(
    * route path).
    */
   preResolvedExclusiveEgress?: ExclusiveEgressStatus | null,
+  preResolvedProtectionClaimSubject?: string | null,
 ): Promise<FeatureHealthPanel> {
   // S5-P: same fail-closed resolve as the wall posture, so the
   // `castle_wall_egress` row and the banner cap green identically.
@@ -719,6 +743,10 @@ async function buildFeatureHealth(
     preResolvedExclusiveEgress !== undefined
       ? preResolvedExclusiveEgress
       : await resolveExclusiveEgress(deps);
+  const protectionClaimSubject =
+    preResolvedProtectionClaimSubject !== undefined
+      ? preResolvedProtectionClaimSubject
+      : await resolveProtectionClaimSubject(deps);
   return (deps.auditLog as AuditLog).runEagerReads(() =>
     buildFeatureHealthPanel({
       auditLog: deps.auditLog as AuditLog,
@@ -727,6 +755,7 @@ async function buildFeatureHealth(
       // Read-only projection over the same audit read; never enforcement-bearing.
       includePluginRows: true,
       ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+      protectionClaimSubject,
       ...(deps.now ? { now: deps.now() } : {}),
       pinnedProducerKeyB64url: deps.resolvePinnedProducerKey
         ? deps.resolvePinnedProducerKey()
@@ -1000,12 +1029,13 @@ async function buildHome(deps: PostureRouteDeps): Promise<PostureHome> {
   // let an intermittent provider cap one surface (wall pill) while the other
   // (feature-health row) still rendered green from a second, luckier read.
   const exclusiveEgress = await resolveExclusiveEgress(deps);
+  const protectionClaimSubject = await resolveProtectionClaimSubject(deps);
   const [castleWall, digest, unwrapped, featureHealth, custodyExit, federation] =
     await Promise.all([
-      buildWallPosture(deps, exclusiveEgress),
+      buildWallPosture(deps, exclusiveEgress, protectionClaimSubject),
       buildDigest(deps),
       buildUnwrapped(deps),
-      buildFeatureHealth(deps, exclusiveEgress),
+      buildFeatureHealth(deps, exclusiveEgress, protectionClaimSubject),
       buildCustodyExit(deps),
       buildFederationSummary(deps),
     ]);

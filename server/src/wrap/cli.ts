@@ -103,8 +103,42 @@ import {
   establishWrapCustody,
   type WrapCustodyResult,
 } from "./custody-flow.js";
-import { AuditLog } from "../operational/audit-log.js";
-import type { ExclusiveEgressStatus } from "../principal-policy/posture.js";
+import {
+  AuditLog,
+  type AuditEntry,
+  type AuditIntegrityFinding,
+} from "../operational/audit-log.js";
+import {
+  createDaemonAuditLog,
+  resolveDaemonStorePresence,
+  verifyFortressAuditFullPicture,
+} from "../operational/audit-store-split.js";
+import type { FeatureHealthAuditReader } from "../principal-policy/feature-health.js";
+import {
+  DEFAULT_ENFORCEMENT_FRESHNESS_MS,
+  type ExclusiveEgressStatus,
+} from "../principal-policy/posture.js";
+import {
+  protectionObservationFromFeatureHealth,
+  protectionStateAdvice,
+  protectionStateClaimFromObservation,
+  type ProtectionFeatureBasis,
+  type ProtectionFeatureStatus,
+  type ProtectionClaimState,
+  type ProtectionStateClaim,
+  type ProtectionStateObservation,
+} from "../egress-gate/protection-claim.js";
+import {
+  CASTLE_WALL_AUDIT_LAYER,
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
+} from "../castle-wall/constants.js";
+import {
+  castleWallEvidenceMatchesProtectionSubject,
+  protectionSubjectForUid,
+  resolveProtectionSubjectFromFortressPath,
+} from "../castle-wall/subject-binding.js";
 import { SubstrateSelector } from "../intelligence/selector.js";
 import { installConsentGatedRedactor } from "../intelligence/privacy-tier2-redactor.js";
 import { SANCTUARY_VERSION } from "../config.js";
@@ -127,6 +161,32 @@ import {
 } from "./recovery-key-disclosure.js";
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
+
+type ProcessShutdownCleanup = () => void;
+
+const processShutdownCleanups = new Set<ProcessShutdownCleanup>();
+let processShutdownListenersInstalled = false;
+
+function runProcessShutdownCleanups(): void {
+  const cleanups = [...processShutdownCleanups];
+  processShutdownCleanups.clear();
+  for (const cleanup of cleanups) cleanup();
+}
+
+function registerProcessShutdownCleanup(
+  cleanup: ProcessShutdownCleanup,
+): () => void {
+  processShutdownCleanups.add(cleanup);
+  if (!processShutdownListenersInstalled) {
+    processShutdownListenersInstalled = true;
+    process.on("SIGINT", runProcessShutdownCleanups);
+    process.on("SIGTERM", runProcessShutdownCleanups);
+    process.on("exit", runProcessShutdownCleanups);
+  }
+  return () => {
+    processShutdownCleanups.delete(cleanup);
+  };
+}
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -992,120 +1052,828 @@ export type DashboardStarter = (opts: {
 // ── Main: wrap ──────────────────────────────────────────────────────
 
 /**
- * F4 (v1.6.1 first-run honesty): the affirmative "Your agent is protected. /
- * Castle Wall Full" hero is reserved for OBSERVED enforcement, judged by the
- * SAME adjudicated-flow-evidence standard the dashboard uses (feature-health
- * panel: only fresh, provenance- and producer-signature-gated
- * egress_allowed / egress_blocked / operator_decision evidence arms the
- * wall; daemon presence, heartbeats, and policy loads never do). A started
- * userspace daemon proves nothing about the system extension actually
- * filtering traffic; on a sysext-less Mac the daemon starts and filters
- * nothing. Fail-closed: any probe failure reads as not-observed.
+ * Wrap protection-state observation. The coarse evidence helper reads the
+ * dashboard's adjudicated-flow standard for the exclusive-egress producer.
+ * The banner-facing path then requires the producer's capped verdict and
+ * returns a branded ProtectionStateClaim; a missing or throwing provider
+ * fails closed to unknown, never green.
  *
- * Known bounded staleness (accepted tradeoff, harden round): the panel's
- * evidence-freshness window is DEFAULT_ENFORCEMENT_FRESHNESS_MS (10
- * minutes) - the SAME standard the dashboard applies - so adjudicated-flow
- * evidence written by a PRIOR daemon/extension instance inside that window
- * still reads "active". An operator who tears enforcement down and re-runs
- * wrap within minutes can therefore see the one-shot protected banner off
- * the dead instance's evidence; the dashboard self-corrects when the
- * window expires, this banner does not. A stricter banner-only window
- * would diverge from the dashboard standard and false-negative on
- * genuinely-armed hosts whose most recent adjudicated flow is minutes old.
- *
- * Exported (module-level, not a runWrap closure) so the fail-closed gating
- * is unit-testable against a real audit log without standing up the whole
- * wrap flow.
+ * Known bounded staleness: the feature-health panel treats fresh
+ * Castle-Wall-originated adjudicated-flow evidence as current for its bounded
+ * freshness window (10 minutes today). A later `wall_disarmed` /
+ * `filter_stopped` / `arm_lease_revoked` entry now demotes that evidence, and
+ * the banner requires an observed current-wrap daemon heartbeat before it lets
+ * a probe render green. Residual bound: adjudicated-flow evidence and daemon
+ * liveness are still bounded-window observations, not proof of the exact
+ * packet-filter state at the print instant.
  */
-export async function probeCastleWallEnforcementObserved(
-  auditLog: AuditLog,
-  storagePath: string,
-  /**
-   * S5-P: an OPTIONAL fail-closed exclusive-egress posture resolver. The
-   * affirmative "Your agent is protected. / Castle Wall Full" first-run banner
-   * is earned by `castle_wall_egress === "active"`; under the S5-P cap a
-   * fine-grained-provisioned agent whose exclusive stack is not live reads the
-   * DISTINCT `coarse_only`, so the banner must NOT claim "Full" then. This
-   * param makes the banner CAP-CAPABLE: when a producer is wired (S5-6) the
-   * caller passes it and the row caps; ABSENT (today, and every coarse-only-
-   * unprovisioned install) the panel is byte-identical to before. The resolver
-   * MUST already be fail-closed (map a provider throw to
-   * `failedExclusiveEgressStatus`); this probe additionally swallows a throw
-   * to `false` (never "observed") so a resolver bug can only under-claim.
-   */
-  resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>,
-): Promise<boolean> {
-  try {
-    const { buildFeatureHealthPanel } = await import(
-      "../principal-policy/feature-health.js"
-    );
-    const { loadFortressProducerKey } = await import(
-      "../castle-wall/runtime/producer-signature.js"
-    );
-    const keyLoad = await loadFortressProducerKey(storagePath);
-    const exclusiveEgress = resolveExclusiveEgress
-      ? await resolveExclusiveEgress()
-      : null;
-    // Eager-read scope: same one-verified-view discipline as the dashboard
-    // callers of buildFeatureHealthPanel (H4 chokepoint).
-    const panel = await auditLog.runEagerReads(() =>
-      buildFeatureHealthPanel({
-        auditLog,
-        originMachine: fortressIdFromStoragePath(storagePath),
-        pinnedProducerKeyB64url:
-          keyLoad.status === "present" ? keyLoad.keyB64url : null,
-        ...(keyLoad.status === "unreadable"
-          ? { producerKeyExpectedButUnavailable: true }
-          : {}),
-        ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+type CastleWallFeatureProbeInput =
+  | { purpose: "coarse-wall" }
+  | {
+      purpose: "protection-claim";
+      exclusiveEgress: ExclusiveEgressStatus | null;
+      protectionClaimSubject: string | null;
+    };
+
+type CastleWallFeatureProbeResult = {
+  status: ProtectionFeatureStatus | undefined;
+  basis: ProtectionFeatureBasis | undefined;
+};
+
+type AuditQueryResult = Awaited<ReturnType<FeatureHealthAuditReader["query"]>>;
+
+interface WrapAuditEvidenceReader extends FeatureHealthAuditReader {
+  runEagerReads<T>(fn: () => Promise<T>): Promise<T>;
+  incompleteEvidenceReasons?: readonly string[];
+}
+
+function protectionSubjectFromAutoProvisionSummary(
+  summary: AutoProvisionSummary,
+  fortressId: string,
+): string | null {
+  const outcome = summary.outcome;
+  if (outcome === undefined || !("uid" in outcome)) return null;
+  return protectionSubjectForUid(fortressId, outcome.uid);
+}
+
+async function resolveWrapProtectionClaimSubject(input: {
+  storagePath: string;
+  autoProvisionSummary: AutoProvisionSummary;
+}): Promise<string | null> {
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  return (
+    protectionSubjectFromAutoProvisionSummary(
+      input.autoProvisionSummary,
+      fortressId,
+    ) ??
+    (await resolveProtectionSubjectFromFortressPath(
+      input.storagePath,
+      fortressId,
+    )).subject
+  );
+}
+
+function compareAuditEntriesByTimestamp(a: AuditEntry, b: AuditEntry): number {
+  const aMs = Date.parse(a.timestamp);
+  const bMs = Date.parse(b.timestamp);
+  if (Number.isFinite(aMs) && Number.isFinite(bMs) && aMs !== bMs) {
+    return aMs - bMs;
+  }
+  return a.timestamp.localeCompare(b.timestamp);
+}
+
+function daemonChainUnavailableFinding(message: string): AuditIntegrityFinding {
+  return {
+    kind: "storage_unavailable",
+    message,
+  };
+}
+
+function mergedAuditQueryTruncatedFinding(input: {
+  total: number;
+  returned: number;
+  limit: number;
+}): AuditIntegrityFinding {
+  return daemonChainUnavailableFinding(
+    `dual-chain audit query returned ${input.returned} of ${input.total} matching entries (limit ${input.limit}); read is incomplete`,
+  );
+}
+
+function mergeAuditQueryResults(
+  operator: AuditQueryResult,
+  daemon: AuditQueryResult,
+  limit: number,
+): AuditQueryResult {
+  const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 50;
+  const entries = [...operator.entries, ...daemon.entries]
+    .sort(compareAuditEntriesByTimestamp)
+    .slice(-safeLimit);
+  const total = operator.total + daemon.total;
+  const integrityFindings = [
+    ...operator.integrity_findings,
+    ...daemon.integrity_findings,
+  ];
+  if (total > entries.length) {
+    integrityFindings.push(
+      mergedAuditQueryTruncatedFinding({
+        total,
+        returned: entries.length,
+        limit: safeLimit,
       }),
     );
-    const row = panel.rows.find(
-      (r) => r.feature_id === "castle_wall_egress",
+  }
+  return {
+    entries,
+    total,
+    integrity_findings: integrityFindings,
+  };
+}
+
+type WrapDualAuditEvidence =
+  | { kind: "operator_only" }
+  | {
+      kind: "dual_chain";
+      auditStorage: FilesystemStorage;
+      masterKey: Uint8Array;
+    }
+  | { kind: "invalid"; reason: string };
+
+function dualAuditEvidenceFromInput(input: {
+  auditStorage?: FilesystemStorage;
+  masterKey?: Uint8Array;
+}): WrapDualAuditEvidence {
+  if (input.auditStorage === undefined && input.masterKey === undefined) {
+    return { kind: "operator_only" };
+  }
+  if (input.auditStorage !== undefined && input.masterKey !== undefined) {
+    return {
+      kind: "dual_chain",
+      auditStorage: input.auditStorage,
+      masterKey: input.masterKey,
+    };
+  }
+  return {
+    kind: "invalid",
+    reason:
+      "dual-chain audit evidence requires both audit storage and master key",
+  };
+}
+
+async function createWrapAuditEvidenceReader(input: {
+  auditLog: AuditLog;
+  dualAuditEvidence: WrapDualAuditEvidence;
+}): Promise<WrapAuditEvidenceReader> {
+  const { auditLog, dualAuditEvidence } = input;
+  if (dualAuditEvidence.kind === "operator_only") {
+    return auditLog;
+  }
+  if (dualAuditEvidence.kind === "invalid") {
+    const finding = daemonChainUnavailableFinding(dualAuditEvidence.reason);
+    return {
+      query: async (options) => {
+        const operator = await auditLog.queryEager(options);
+        return {
+          ...operator,
+          integrity_findings: [...operator.integrity_findings, finding],
+        };
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  }
+  const { auditStorage, masterKey } = dualAuditEvidence;
+
+  try {
+    const fullPicture = await verifyFortressAuditFullPicture({
+      storage: auditStorage,
+      masterKey,
+    });
+    if (fullPicture.daemon.status === "absent") {
+      return auditLog;
+    }
+    if (fullPicture.daemon.status === "present_unreadable") {
+      const presence = await resolveDaemonStorePresence(auditStorage, masterKey);
+      const unreadableReason =
+        presence.kind === "present_unreadable" ? presence.reason : "io";
+      if (unreadableReason !== "privilege") {
+        const finding = daemonChainUnavailableFinding(
+          `daemon audit chain is present_unreadable/${unreadableReason}: ${fullPicture.daemon.note}`,
+        );
+        return {
+          query: async (options) => {
+            const operator = await auditLog.queryEager(options);
+            return {
+              ...operator,
+              integrity_findings: [...operator.integrity_findings, finding],
+            };
+          },
+          runEagerReads: (fn) => auditLog.runEagerReads(fn),
+          verifySealedRegion: () => auditLog.verifySealedRegion(),
+        };
+      }
+      return {
+        query: (options) => auditLog.queryEager(options),
+        runEagerReads: (fn) => auditLog.runEagerReads(fn),
+        verifySealedRegion: () => auditLog.verifySealedRegion(),
+        incompleteEvidenceReasons: [fullPicture.daemon.note],
+      };
+    }
+    if (fullPicture.daemon.status !== "verified") {
+      const findings =
+        fullPicture.daemon.status === "findings" &&
+        fullPicture.daemon.findings !== undefined
+          ? fullPicture.daemon.findings
+          : [
+              daemonChainUnavailableFinding(
+                `daemon audit chain is ${fullPicture.daemon.status}: ${fullPicture.daemon.note}`,
+              ),
+            ];
+      return {
+        query: async (options) => {
+          const operator = await auditLog.queryEager(options);
+          return {
+            ...operator,
+            integrity_findings: [...operator.integrity_findings, ...findings],
+          };
+        },
+        runEagerReads: (fn) => auditLog.runEagerReads(fn),
+        verifySealedRegion: () => auditLog.verifySealedRegion(),
+      };
+    }
+
+    const daemonLog = createDaemonAuditLog(auditStorage, masterKey, {
+      integrityMode: "lenient",
+    });
+    return {
+      query: async (options) => {
+        const limit = options.limit ?? 50;
+        const [operator, daemon] = await Promise.all([
+          auditLog.queryEager(options),
+          daemonLog.queryEager(options),
+        ]);
+        return mergeAuditQueryResults(operator, daemon, limit);
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  } catch (err) {
+    const finding = daemonChainUnavailableFinding(
+      `dual-chain audit evidence could not be verified: ${(err as Error).message}`,
     );
-    // Only a genuine `active` earns the affirmative banner: `coarse_only`
-    // (S5-P cap) is a distinct non-green state and reads NOT observed here.
-    return row?.status === "active";
+    return {
+      query: async (options) => {
+        const operator = await auditLog.queryEager(options);
+        return {
+          ...operator,
+          integrity_findings: [...operator.integrity_findings, finding],
+        };
+      },
+      runEagerReads: (fn) => auditLog.runEagerReads(fn),
+      verifySealedRegion: () => auditLog.verifySealedRegion(),
+    };
+  }
+}
+
+function appendProtectionObservationReasons(
+  observation: ProtectionStateObservation,
+  reasons: readonly string[] | undefined,
+): ProtectionStateObservation {
+  if (reasons === undefined || reasons.length === 0) return observation;
+  const merged = [...(observation.reasons ?? []), ...reasons];
+  switch (observation.state) {
+    case "exclusive":
+      return { ...observation, reasons: merged };
+    case "coarse-only":
+      return { ...observation, reasons: merged };
+    case "unprotected":
+      return { ...observation, reasons: merged };
+    case "unknown":
+      return { ...observation, reasons: merged };
+  }
+}
+
+async function readCastleWallEgressFeatureStatus(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+  input: CastleWallFeatureProbeInput,
+): Promise<CastleWallFeatureProbeResult> {
+  const { buildFeatureHealthPanel } = await import(
+    "../principal-policy/feature-health.js"
+  );
+  const { loadFortressProducerKey } = await import(
+    "../castle-wall/runtime/producer-signature.js"
+  );
+  const keyLoad = await loadFortressProducerKey(storagePath);
+  // Eager-read scope: same one-verified-view discipline as the dashboard
+  // callers of buildFeatureHealthPanel (H4 chokepoint).
+  const panel = await auditLog.runEagerReads(() =>
+    buildFeatureHealthPanel({
+      auditLog,
+      originMachine: fortressIdFromStoragePath(storagePath),
+      pinnedProducerKeyB64url:
+        keyLoad.status === "present" ? keyLoad.keyB64url : null,
+      ...(keyLoad.status === "unreadable"
+        ? { producerKeyExpectedButUnavailable: true }
+        : {}),
+      ...(input.purpose === "protection-claim" &&
+      input.exclusiveEgress !== null
+        ? { exclusiveEgress: input.exclusiveEgress }
+        : {}),
+      protectionClaimSubject:
+        input.purpose === "protection-claim"
+          ? input.protectionClaimSubject ?? null
+          : fortressIdFromStoragePath(storagePath),
+      ...(input.purpose === "coarse-wall"
+        ? {
+            protectionSubjectMatchMode: {
+              mode: "fortress_scoped" as const,
+              fortressId: fortressIdFromStoragePath(storagePath),
+            },
+          }
+        : {}),
+    }),
+  );
+  const row = panel.rows.find((r) => r.feature_id === "castle_wall_egress");
+  return { status: row?.status, basis: row?.basis };
+}
+
+/**
+ * Coarse-wall evidence probe for callers that are building the exclusive-
+ * egress provider itself. It deliberately does NOT render protection prose:
+ * protection rendering goes through `probeCastleWallProtectionClaim`, which
+ * requires the capped exclusive-egress verdict.
+ */
+export async function probeCoarseCastleWallEnforcementObserved(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+): Promise<boolean> {
+  try {
+    return (
+      (await readCastleWallEgressFeatureStatus(auditLog, storagePath, {
+        purpose: "coarse-wall",
+      })).status === "active"
+    );
   } catch {
     return false;
   }
 }
 
-/**
- * THE banner honesty gate (F4, v1.6.1 first-run honesty), deduplicated
- * (2026-07-02 hardening: the same predicate was hand-computed in four
- * places, so a future edit could weaken one copy and desynchronize the
- * banners). The affirmative "Your agent is protected. / Castle Wall Full"
- * hero is earned ONLY when BOTH hold:
- *   - the Castle Wall daemon started during this wrap (`armed === true`), AND
- *   - real enforcement evidence was observed (`enforcementObserved === true`,
- *     per probeCastleWallEnforcementObserved's fail-closed standard).
- * Anything else (false, undefined, or an absent signal) reads NOT
- * confirmed. SECURITY/HONESTY INVARIANT: refactor-only; never weaken this
- * predicate (truth table pinned in test/wrap/wrap-surface-scoped-meta.test.ts;
- * the rendered-banner combinations are pinned in test/wrap/wrap-cli.test.ts).
- */
-export function castleWallProtectionConfirmed(
-  armed: boolean | undefined,
-  enforcementObserved: boolean | undefined,
-): boolean {
-  return armed === true && enforcementObserved === true;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasCastleWallAuditProvenance(details: unknown): boolean {
+  return (
+    isRecord(details) &&
+    details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
+      CASTLE_WALL_AUDIT_PROVENANCE_VALUE
+  );
+}
+
+const CASTLE_WALL_DAEMON_START_OPERATION = "filter_started" as const;
+
+function stringDetail(
+  details: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = details[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function daemonAttributionKey(details: unknown): string | undefined {
+  if (!isRecord(details)) return undefined;
+  const socketPath = stringDetail(details, "socket_path");
+  const source = stringDetail(details, "source");
+  if (socketPath === undefined || source === undefined) return undefined;
+  return `${source}\u0000${socketPath}`;
+}
+
+function currentWrapHeartbeatAttribution(details: unknown): string | undefined {
+  if (!isRecord(details) || !hasCastleWallAuditProvenance(details)) {
+    return undefined;
+  }
+  const daemonMode = details.daemon_mode;
+  if (daemonMode !== "full" && daemonMode !== "safe") return undefined;
+  return daemonAttributionKey(details);
 }
 
 /**
- * The evidence-probe half of the banner honesty gate, shared by the
- * dashboard and --no-dashboard wrap paths (2026-07-02 dedupe): the F4
- * probe only runs when the daemon actually started this wrap AND an audit
- * log is available to read evidence from; every other state is fail-closed
- * false (never "observed").
+ * Current-wrap daemon liveness gate for the banner resolver. This observes a
+ * daemon-shaped, provenance-marked heartbeat after the daemon-start attempt and
+ * inside the existing freshness window, paired to this wrap's daemon start entry.
+ * The subject match is fortress-scoped because a heartbeat proves the daemon is
+ * alive for this fortress, not that any one confined agent has subject-bound
+ * enforcement evidence. It never earns green by itself; exact-subject
+ * enforcement evidence remains required downstream.
  */
-async function probeEnforcementObservedIfArmed(
-  daemon: { stop(): Promise<void> } | undefined,
-  auditLog: AuditLog | undefined,
+export async function observeCurrentWrapCastleWallDaemonLiveness(
+  auditLog: WrapAuditEvidenceReader,
   storagePath: string,
+  daemonLivenessSince: Date | undefined,
+  nowMs: number = Date.now(),
 ): Promise<boolean> {
-  if (daemon === undefined || auditLog === undefined) return false;
-  return probeCastleWallEnforcementObserved(auditLog, storagePath);
+  const sinceMs = daemonLivenessSince?.getTime();
+  if (sinceMs === undefined || !Number.isFinite(sinceMs)) {
+    return false;
+  }
+  const freshnessFloorMs = nowMs - DEFAULT_ENFORCEMENT_FRESHNESS_MS;
+  try {
+    const limit = 10_000;
+    const fortressId = fortressIdFromStoragePath(storagePath);
+    const livenessMatchMode = {
+      mode: "fortress_scoped" as const,
+      fortressId,
+    };
+    const result = await auditLog.runEagerReads(() =>
+      auditLog.query({
+        layer: CASTLE_WALL_AUDIT_LAYER,
+        since: new Date(sinceMs).toISOString(),
+        limit,
+      }),
+    );
+    // audit-chokepoint-exempt: fail-closed liveness gate; raw integrity
+    // findings only block the banner from rendering green.
+    if (
+      result.integrity_findings.length > 0 ||
+      result.total > result.entries.length
+    ) {
+      return false;
+    }
+    const currentWrapDaemonStarts = new Map<string, number>();
+    for (const entry of result.entries) {
+      if (entry.operation !== CASTLE_WALL_DAEMON_START_OPERATION) continue;
+      if (entry.result !== "success") continue;
+      if (
+        !castleWallEvidenceMatchesProtectionSubject(
+          null,
+          entry,
+          livenessMatchMode,
+        ).matches
+      ) {
+        continue;
+      }
+      const ts = Date.parse(entry.timestamp);
+      if (!Number.isFinite(ts) || ts < sinceMs) continue;
+      const key = daemonAttributionKey(entry.details);
+      if (key === undefined) continue;
+      const previous = currentWrapDaemonStarts.get(key);
+      if (previous === undefined || ts > previous) {
+        currentWrapDaemonStarts.set(key, ts);
+      }
+    }
+    return result.entries.some((entry) => {
+      if (entry.operation !== CASTLE_WALL_HEARTBEAT_OPERATION) return false;
+      if (entry.result !== "success") return false;
+      if (
+        !castleWallEvidenceMatchesProtectionSubject(
+          null,
+          entry,
+          livenessMatchMode,
+        ).matches
+      ) {
+        return false;
+      }
+      const ts = Date.parse(entry.timestamp);
+      const key = currentWrapHeartbeatAttribution(entry.details);
+      const startTs = key === undefined ? undefined : currentWrapDaemonStarts.get(key);
+      return (
+        Number.isFinite(ts) &&
+        ts >= sinceMs &&
+        ts >= freshnessFloorMs &&
+        startTs !== undefined &&
+        ts >= startTs
+      );
+    });
+  } catch {
+    return false;
+  }
+}
+
+export const WRAP_PROTECTION_PROVIDER_TIMEOUT_MS = 1_500;
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+export async function probeCastleWallProtectionClaim(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+  resolveExclusiveEgress: () => Promise<ExclusiveEgressStatus | null>,
+  options: {
+    providerTimeoutMs?: number;
+    protectionClaimSubject?: string | null;
+  } = {},
+): Promise<ProtectionStateClaim> {
+  let exclusiveEgress: ExclusiveEgressStatus | null;
+  try {
+    exclusiveEgress = await withTimeout(
+      resolveExclusiveEgress(),
+      options.providerTimeoutMs ?? WRAP_PROTECTION_PROVIDER_TIMEOUT_MS,
+      "exclusive-egress posture provider",
+    );
+  } catch (err) {
+    return protectionStateClaimFromObservation({
+      state: "unknown",
+      basis: "provider_unavailable",
+      reasons: [
+        `exclusive-egress posture provider could not be resolved: ${(err as Error).message}`,
+      ],
+    });
+  }
+  try {
+    const castleWallEgress = await readCastleWallEgressFeatureStatus(
+      auditLog,
+      storagePath,
+      {
+        purpose: "protection-claim",
+        exclusiveEgress,
+        protectionClaimSubject: options.protectionClaimSubject ?? null,
+      },
+    );
+    return protectionStateClaimFromObservation(
+      appendProtectionObservationReasons(
+        protectionObservationFromFeatureHealth({
+          castleWallEgressStatus: castleWallEgress.status,
+          castleWallEgressBasis: castleWallEgress.basis,
+          exclusiveEgress,
+        }),
+        auditLog.incompleteEvidenceReasons,
+      ),
+    );
+  } catch (err) {
+    return protectionStateClaimFromObservation({
+      state: "unknown",
+      basis: "read_failed",
+      reasons: [
+        `Castle Wall enforcement evidence could not be read: ${(err as Error).message}`,
+      ],
+    });
+  }
+}
+
+/**
+ * Build the production exclusive-egress resolver required before a protection
+ * claim can be rendered from feature-health evidence. Absent resolver means
+ * unknown, never green.
+ */
+async function createWrapProtectionResolver(
+  auditLog: WrapAuditEvidenceReader,
+  storagePath: string,
+): Promise<(() => Promise<ExclusiveEgressStatus | null>) | undefined> {
+  if (process.platform !== "darwin") return undefined;
+  const { createExclusiveEgressPostureProducer } = await import(
+    "../egress-gate/arming-wiring.js"
+  );
+  return createExclusiveEgressPostureProducer({
+    fortressPath: storagePath,
+    coarseWallArmed: () =>
+      probeCoarseCastleWallEnforcementObserved(auditLog, storagePath),
+  });
+}
+
+function protectionObservationFromAutoProvisionSummary(
+  summary: AutoProvisionSummary,
+): ProtectionStateObservation | undefined {
+  if (!summary.ran || summary.outcome === undefined) return undefined;
+  const outcome = summary.outcome;
+  switch (outcome.kind) {
+    case "armed-exclusive":
+    case "armed":
+      return undefined;
+    case "armed-exclusive-repark-failed":
+      return {
+        state: "unknown",
+        basis: "exclusive_egress_repark_failed",
+        reasons: [outcome.reparkError],
+      };
+    case "exclusive-egress-unarmed-coarse-active":
+      return {
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason, ...outcome.cleanupErrors],
+      };
+    case "armed-rollback-failed":
+      return {
+        state: "unknown",
+        basis: "insufficient_evidence",
+        reasons: [outcome.reason, outcome.disarmError],
+      };
+    case "aborted":
+      if (outcome.disarmObservedOff === true) {
+        return {
+          state: "unprotected",
+          basis: "disarm_observed_off",
+          reasons: [outcome.reason],
+        };
+      }
+      return {
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason],
+      };
+    case "armed-then-rolled-back":
+    case "egress-unprovisioned-rolled-back":
+      if (outcome.disarmObservedOff === true) {
+        return {
+          state: "unprotected",
+          basis: "disarm_observed_off",
+          reasons: [outcome.reason],
+        };
+      }
+      return {
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason],
+      };
+    case "skipped-already-dedicated":
+    case "skipped-non-tty-cooperative-only":
+    case "declined-by-operator":
+      return undefined;
+  }
+}
+
+export function protectionClaimFromAutoProvisionSummary(
+  summary: AutoProvisionSummary,
+): ProtectionStateClaim | undefined {
+  const observation = protectionObservationFromAutoProvisionSummary(summary);
+  return observation === undefined
+    ? undefined
+    : protectionStateClaimFromObservation(observation);
+}
+
+function autoProvisionCeilingFromSummary(
+  summary: AutoProvisionSummary,
+): ProtectionStateClaim | undefined {
+  if (!summary.ran || summary.outcome === undefined) return undefined;
+  const outcome = summary.outcome;
+  switch (outcome.kind) {
+    case "armed-exclusive-repark-failed":
+      return protectionStateClaimFromObservation({
+        state: "unknown",
+        basis: "exclusive_egress_repark_failed",
+        reasons: [outcome.reparkError],
+      });
+    case "exclusive-egress-unarmed-coarse-active":
+      if (
+        outcome.coarseCompositionRestored === true &&
+        outcome.harness.disposition === "started-coarse"
+      ) {
+        return protectionStateClaimFromObservation({
+          state: "coarse-only",
+          basis: "exclusive_egress_unarmed_coarse_active",
+          reasons: [outcome.reason, ...outcome.cleanupErrors],
+        });
+      }
+      return protectionStateClaimFromObservation({
+        state: "unknown",
+        basis: "provision_outcome_not_observation",
+        reasons: [outcome.reason, ...outcome.cleanupErrors],
+      });
+    case "aborted":
+    case "armed-then-rolled-back":
+    case "egress-unprovisioned-rolled-back":
+      if (outcome.disarmObservedOff === true) {
+        return protectionStateClaimFromObservation({
+          state: "unprotected",
+          basis: "disarm_observed_off",
+          reasons: [outcome.reason],
+        });
+      }
+      return undefined;
+    case "armed":
+    case "armed-exclusive":
+    case "armed-rollback-failed":
+    case "skipped-already-dedicated":
+    case "skipped-non-tty-cooperative-only":
+    case "declined-by-operator":
+      return undefined;
+  }
+}
+
+const protectionClaimStateOrder: Readonly<Record<ProtectionClaimState, number>> =
+  Object.freeze({
+    unprotected: 0,
+    unknown: 1,
+    "coarse-only": 2,
+    exclusive: 3,
+  });
+
+function applyAutoProvisionCeiling(
+  probedClaim: ProtectionStateClaim,
+  autoProvisionCeiling: ProtectionStateClaim | undefined,
+): ProtectionStateClaim {
+  if (autoProvisionCeiling === undefined) return probedClaim;
+  return protectionClaimStateOrder[autoProvisionCeiling.state] <=
+    protectionClaimStateOrder[probedClaim.state]
+    ? autoProvisionCeiling
+    : probedClaim;
+}
+
+function unknownClaimWithAutoProvisionReasons(
+  observation: ProtectionStateObservation,
+  autoProvisionSummaryClaim: ProtectionStateClaim | undefined,
+): ProtectionStateClaim {
+  if (autoProvisionSummaryClaim?.basis === "disarm_observed_off") {
+    return autoProvisionSummaryClaim;
+  }
+  return protectionStateClaimFromObservation({
+    ...observation,
+    reasons: [
+      ...(observation.reasons ?? []),
+      ...(autoProvisionSummaryClaim?.reasons ?? []),
+    ],
+  });
+}
+
+export async function resolveWrapProtectionClaim(input: {
+  auditLog: AuditLog | undefined;
+  auditStorage?: FilesystemStorage;
+  masterKey?: Uint8Array;
+  autoProvisionSummary: AutoProvisionSummary;
+  castleWallDaemonLivenessSince?: Date;
+  storagePath: string;
+  providerTimeoutMs?: number;
+  resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
+}): Promise<ProtectionStateClaim> {
+  const autoProvisionClaim = protectionClaimFromAutoProvisionSummary(
+    input.autoProvisionSummary,
+  );
+  const autoProvisionCeiling = autoProvisionCeilingFromSummary(
+    input.autoProvisionSummary,
+  );
+  if (input.auditLog === undefined) {
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: ["no audit log was available to observe enforcement"],
+      },
+      autoProvisionClaim,
+    );
+  }
+  const auditEvidence = await createWrapAuditEvidenceReader({
+    auditLog: input.auditLog,
+    dualAuditEvidence: dualAuditEvidenceFromInput({
+      auditStorage: input.auditStorage,
+      masterKey: input.masterKey,
+    }),
+  });
+  const protectionClaimSubject = await resolveWrapProtectionClaimSubject({
+    storagePath: input.storagePath,
+    autoProvisionSummary: input.autoProvisionSummary,
+  });
+  const daemonLivenessObserved =
+    await observeCurrentWrapCastleWallDaemonLiveness(
+      auditEvidence,
+      input.storagePath,
+      input.castleWallDaemonLivenessSince,
+    );
+  if (!daemonLivenessObserved) {
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: [
+          "Castle Wall current-wrap daemon heartbeat could not be confirmed",
+        ],
+      },
+      autoProvisionClaim,
+    );
+  }
+  let resolver: (() => Promise<ExclusiveEgressStatus | null>) | undefined;
+  try {
+    resolver =
+      input.resolveExclusiveEgress ??
+      (await createWrapProtectionResolver(
+        auditEvidence,
+        input.storagePath,
+      ));
+  } catch (err) {
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: [
+          `exclusive-egress posture provider could not be loaded: ${(err as Error).message}`,
+        ],
+      },
+      autoProvisionClaim,
+    );
+  }
+  if (resolver === undefined) {
+    return unknownClaimWithAutoProvisionReasons(
+      {
+        state: "unknown",
+        basis: "provider_unavailable",
+        reasons: ["exclusive-egress posture provider was not available"],
+      },
+      autoProvisionClaim,
+    );
+  }
+  const probedClaim = await probeCastleWallProtectionClaim(
+    auditEvidence,
+    input.storagePath,
+    resolver,
+    {
+      providerTimeoutMs: input.providerTimeoutMs,
+      protectionClaimSubject,
+    },
+  );
+  return applyAutoProvisionCeiling(probedClaim, autoProvisionCeiling);
 }
 
 /**
@@ -1122,8 +1890,8 @@ async function probeEnforcementObservedIfArmed(
  * status line, it never blocks or reverts the wrap that already happened.
  * Any error thrown by the auto-provision flow is caught here and reported
  * as a note, never allowed to turn an otherwise-successful cooperative wrap
- * into a hard CLI failure (the wall staying un-armed is exactly the state
- * the honesty gate already renders correctly via `castleWallArmed`).
+ * into a hard CLI failure. The terminal banner later resolves a protection
+ * claim from the observed final state, not from this control-flow boundary.
  */
 async function maybeRunAutoProvisionForWrap(
   agentConfig: { platform: AgentPlatform },
@@ -1960,17 +2728,19 @@ export async function runWrap(
   // the opt-in Linux producer-signed activation (FIX 3). Both expose `stop()`; we
   // keep only the common shape so the cleanup is uniform.
   let castleWallDaemon: { stop(): Promise<void> } | undefined;
+  let castleWallDaemonLivenessSince: Date | undefined;
+  let unregisterCastleWallCleanup: (() => void) | undefined;
   const registerCastleWallCleanup = () => {
     if (!castleWallDaemon) return;
+    unregisterCastleWallCleanup?.();
     const stop = () => {
       castleWallDaemon?.stop().catch(() => {});
     };
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
-    process.once("exit", stop);
+    unregisterCastleWallCleanup = registerProcessShutdownCleanup(stop);
   };
   const startCastleWallForWrap = async (auditLog: AuditLog, masterKey: Uint8Array) => {
     if (castleWallDaemon) return;
+    castleWallDaemonLivenessSince = new Date();
     const fortressId = fortressIdFromStoragePath(storagePath);
     const runtime = await import("../castle-wall/runtime/index.js");
 
@@ -2015,6 +2785,8 @@ export async function runWrap(
   const stopTransientCastleWallDaemonForAutoProvision = async () => {
     const daemon = castleWallDaemon;
     castleWallDaemon = undefined;
+    unregisterCastleWallCleanup?.();
+    unregisterCastleWallCleanup = undefined;
     await daemon?.stop();
   };
 
@@ -2660,9 +3432,9 @@ export async function runWrap(
     // and the auto-open browser path; print a concise success line that
     // points operators at the persistent dashboard.
 
-    // F4: enforcement-evidence signal for the success banner; false unless
-    // the fail-closed probe below observes dashboard-standard evidence.
-    let ndEnforcementObserved = false;
+    let ndAuditLog: AuditLog | undefined;
+    let ndAuditStorage: FilesystemStorage | undefined;
+    let ndAuditMasterKey: Uint8Array | undefined;
 
     // v1.3.0 (WWWWW, NNN regression): --no-dashboard wraps previously
     // skipped identity bootstrap because the creation lived after the
@@ -2676,7 +3448,9 @@ export async function runWrap(
         // re-deriving from key-params here could produce a DIFFERENT master
         // than the envelope holds - exactly the divergence this build ends.
         const ndDerived = { key: wrapCustody.masterKey };
-        const ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
+        ndAuditStorage = ndStorage;
+        ndAuditMasterKey = ndDerived.key;
+        ndAuditLog = new AuditLog(ndStorage, ndDerived.key);
         await bestEffortRecordWrapWorkloadRegistration({
           auditLog: ndAuditLog,
           storagePath,
@@ -2714,13 +3488,6 @@ export async function runWrap(
           });
         }
         await ndAuditLog.flush();
-        // F4: probe for real enforcement evidence (adjudicated flows) so the
-        // banner can distinguish "daemon started" from "observed enforcing".
-        ndEnforcementObserved = await probeEnforcementObservedIfArmed(
-          castleWallDaemon,
-          ndAuditLog,
-          storagePath,
-        );
       } catch (err) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel.
         console.error(
@@ -2744,7 +3511,14 @@ export async function runWrap(
       stopTransientCastleWallDaemonForAutoProvision,
     );
     renderAutoProvisionOutcome(autoProvisionSummary);
-    const castleWallArmedByAutoProvision = autoProvisionSummary.outcome?.kind === "armed";
+    const castleWallProtectionClaim = await resolveWrapProtectionClaim({
+      auditLog: ndAuditLog,
+      auditStorage: ndAuditStorage,
+      masterKey: ndAuditMasterKey,
+      autoProvisionSummary,
+      castleWallDaemonLivenessSince,
+      storagePath,
+    });
     const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
     printWrapSuccessNoDashboard({
       toolName,
@@ -2754,13 +3528,7 @@ export async function runWrap(
       platform: agentConfig.platform,
       passphraseLocation,
       passphraseSource,
-      // Honest arm outcome: castleWallDaemon is only defined when
-      // startCastleWallForWrap succeeded; on a start failure the catch above
-      // ran warnCastleWallDaemonNotStarted and left it undefined. Daemon
-      // start alone never renders "protected"; that needs the F4 evidence
-      // signal below.
-      castleWallArmed: castleWallDaemon !== undefined || castleWallArmedByAutoProvision,
-      castleWallEnforcementObserved: ndEnforcementObserved,
+      castleWallProtectionClaim,
       // 2026-07-02 hardening: the dead-pin warning must survive to the
       // terminal-final success surface, not only the mid-flow warning.
       pinnedVersionResolvability: pinResolvability,
@@ -2777,6 +3545,8 @@ export async function runWrap(
   // dashboard's /api/query-anonymity/pii route reports the truthful state.
   let wrapTierBPiiRedactorInstalled = false;
   let wrapAuditLog: AuditLog | undefined;
+  let wrapAuditStorage: FilesystemStorage | undefined;
+  let wrapAuditMasterKey: Uint8Array | undefined;
 
   // Start the dashboard in-process.
   const authToken = generateAuthToken();
@@ -2854,6 +3624,8 @@ export async function runWrap(
       // instead of re-deriving from key-params - the spawned MCP server
       // unlocks the same envelope with the same passphrase.
       const derived = { key: wrapCustody.masterKey };
+      wrapAuditStorage = v11Storage;
+      wrapAuditMasterKey = derived.key;
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
       await bestEffortRecordWrapWorkloadRegistration({
         auditLog: wrapAuditLog,
@@ -2897,6 +3669,11 @@ export async function runWrap(
           ...(brokerProducerKeyLoad.status === "unreadable"
             ? { brokerProducerKeyExpectedButUnavailable: true }
             : {}),
+          resolveProtectionClaimSubject: () =>
+            resolveProtectionSubjectFromFortressPath(
+              storagePath,
+              fortressIdFromStoragePath(storagePath),
+            ).then((result) => result.subject),
         });
       } catch {
         // Never let the producer-key probe fail wrap. On any unexpected throw the
@@ -3044,7 +3821,6 @@ export async function runWrap(
     stopTransientCastleWallDaemonForAutoProvision,
   );
   renderAutoProvisionOutcome(autoProvisionSummary);
-  const castleWallArmedByAutoProvision = autoProvisionSummary.outcome?.kind === "armed";
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
@@ -3074,9 +3850,7 @@ export async function runWrap(
   const cleanupRuntime = () => {
     clearTenantRuntime(storagePath).catch(() => {});
   };
-  process.once("SIGINT", cleanupRuntime);
-  process.once("SIGTERM", cleanupRuntime);
-  process.once("exit", cleanupRuntime);
+  registerProcessShutdownCleanup(cleanupRuntime);
 
   // Auto-open in browser.
   const toolName = toolNameFor(agentConfig.platform, agentConfig.servers);
@@ -3093,13 +3867,14 @@ export async function runWrap(
     await wrapAuditLog.flush();
   }
 
-  // F4: probe for real enforcement evidence (adjudicated flows) so the banner
-  // can distinguish "daemon started" from "observed enforcing". Fail-closed.
-  const enforcementObserved = await probeEnforcementObservedIfArmed(
-    castleWallDaemon,
-    wrapAuditLog,
+  const castleWallProtectionClaim = await resolveWrapProtectionClaim({
+    auditLog: wrapAuditLog,
+    auditStorage: wrapAuditStorage,
+    masterKey: wrapAuditMasterKey,
+    autoProvisionSummary,
+    castleWallDaemonLivenessSince,
     storagePath,
-  );
+  });
 
   printWrapSuccess({
     toolName,
@@ -3113,11 +3888,7 @@ export async function runWrap(
     passphraseSource,
     intelligenceHealthy,
     intelligenceError,
-    // Honest arm outcome: defined only when startCastleWallForWrap succeeded.
-    // Daemon start alone never renders "protected"; that needs the F4
-    // evidence signal below.
-    castleWallArmed: castleWallDaemon !== undefined || castleWallArmedByAutoProvision,
-    castleWallEnforcementObserved: enforcementObserved,
+    castleWallProtectionClaim,
     // 2026-07-02 hardening: the dead-pin warning must survive to the
     // terminal-final success surface, not only the mid-flow warning.
     pinnedVersionResolvability: pinResolvability,
@@ -3214,27 +3985,7 @@ interface WrapSuccessInfo {
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
-  /**
-   * Whether the Castle Wall USERSPACE DAEMON started during this wrap.
-   * `true` => daemon started - which says NOTHING about enforcement (on a
-   * Mac with no approved system extension the daemon starts and filters
-   * nothing); `false` => the loud "NOT armed" warning fired and traffic is
-   * not being filtered; `undefined` => no signal was threaded into the
-   * banner (treated conservatively). Daemon start alone NEVER earns the
-   * affirmative "protected / Castle Wall Full" hero; that requires
-   * `castleWallEnforcementObserved` (F4, v1.6.1 first-run honesty).
-   */
-  castleWallArmed?: boolean;
-  /**
-   * Whether REAL enforcement evidence was observed: fresh adjudicated-flow
-   * evidence (egress_allowed / egress_blocked / operator_decision), judged
-   * by the SAME provenance- and producer-signature-gated standard the
-   * dashboard's feature-health panel uses. ONLY this (together with
-   * `castleWallArmed === true`) earns the affirmative "Your agent is
-   * protected. / Castle Wall Full" hero; daemon presence, heartbeats, and
-   * policy loads never do.
-   */
-  castleWallEnforcementObserved?: boolean;
+  castleWallProtectionClaim: ProtectionStateClaim;
   /**
    * Wrap-time registry probe outcome for the version-pinned MCP entry
    * (2026-07-02 hardening). "unpublished" renders a loud warning INSIDE the
@@ -3277,32 +4028,18 @@ export function formatWrapSuccess(info: WrapSuccessInfo): string {
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
-  // Honesty: the load-bearing enforcement layer is Castle Wall. Reserve the
-  // affirmative "Castle Wall Full" hero claim for OBSERVED ENFORCEMENT
-  // (F4, v1.6.1): fresh adjudicated-flow evidence on the dashboard's
-  // standard, never daemon start alone. A daemon that merely started
-  // (`castleWallArmed === true`, no evidence) renders the honest
-  // "wrapped, but enforcement is not confirmed" hero; a failed start
-  // (`false`) or an absent signal (`undefined`) never renders "Full".
-  const enforcementObserved = castleWallProtectionConfirmed(
-    info.castleWallArmed,
-    info.castleWallEnforcementObserved,
-  );
-  const castleWallLabel = renderCastleWallBannerLabel(
-    info.castleWallArmed,
-    enforcementObserved,
-  );
-  const heroPrefix = enforcementObserved
-    ? b("Your agent is protected.")
-    : b("Your agent is wrapped, but enforcement is not confirmed.");
+  const protection = protectionStateAdvice(info.castleWallProtectionClaim);
   // Honesty (Finding 3, 2026-06-25): Charter and Heralds are "ready" after a
   // wrap, not "Full". "Full" is a superlative reserved for observed/verified
   // state (as Castle Wall and Sentinels already are); printing "Charter Full /
   // Heralds Full" unconditionally (even under --no-dashboard, even when nothing
   // was exercised) was the same overclaim the load-bearing-layer fix removed.
   lines.push(
-    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
+    `  ${b(protection.operatorSentence)} ${protection.castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
   );
+  if (protection.imperative !== null) {
+    lines.push(`  ${protection.imperative}`);
+  }
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`; // yellow
     lines.push("");
@@ -3364,29 +4101,6 @@ function renderPinResolvabilityBannerLines(info: {
 }
 
 /**
- * Render the Castle Wall segment of the wrap success banner from the real
- * outcome. Honesty discipline (F4, v1.6.1): "Castle Wall Full" is only
- * printed on OBSERVED ENFORCEMENT (fresh adjudicated-flow evidence on the
- * dashboard's standard). A daemon that merely started renders "daemon
- * started (enforcement not confirmed)"; a failed start renders a loud
- * "NOT ARMED"; an absent signal renders "status unknown". Never "Full" on
- * daemon presence alone.
- */
-function renderCastleWallBannerLabel(
-  armed: boolean | undefined,
-  enforcementObserved: boolean,
-): string {
-  if (castleWallProtectionConfirmed(armed, enforcementObserved)) {
-    return "Castle Wall Full";
-  }
-  if (armed === true) {
-    return "Castle Wall daemon started (enforcement not confirmed)";
-  }
-  if (armed === false) return "Castle Wall NOT ARMED (traffic not filtered)";
-  return "Castle Wall status unknown (not confirmed armed)";
-}
-
-/**
  * Render the upstream tools/servers count line. F7 (v1.6.1 first-run
  * honesty): on Hermes the counts derive from the legacy cli-config.json
  * surface Hermes does not consult for MCP routing, so a first run would
@@ -3422,13 +4136,7 @@ interface WrapSuccessNoDashboardInfo {
   passphraseSource: string;
   intelligenceHealthy?: boolean;
   intelligenceError?: string;
-  /** See WrapSuccessInfo.castleWallArmed; same daemon-start-only semantics. */
-  castleWallArmed?: boolean;
-  /**
-   * See WrapSuccessInfo.castleWallEnforcementObserved; same
-   * evidence-only-affirmative discipline.
-   */
-  castleWallEnforcementObserved?: boolean;
+  castleWallProtectionClaim: ProtectionStateClaim;
   /**
    * See WrapSuccessInfo.pinnedVersionResolvability; same banner-honesty
    * discipline (an unpublished pin must be visible on the terminal-final
@@ -3467,23 +4175,13 @@ export function formatWrapSuccessNoDashboard(
   const sentinelsStatus = info.intelligenceHealthy === false
     ? "Sentinels Degraded (intelligence disabled)"
     : "Sentinels Degraded (no TEE)";
-  // Honesty: same outcome discipline as formatWrapSuccess (F4, v1.6.1) \u2014
-  // reserve the affirmative "protected" / "Castle Wall Full" hero for
-  // observed enforcement evidence, never daemon start alone.
-  const enforcementObserved = castleWallProtectionConfirmed(
-    info.castleWallArmed,
-    info.castleWallEnforcementObserved,
-  );
-  const castleWallLabel = renderCastleWallBannerLabel(
-    info.castleWallArmed,
-    enforcementObserved,
-  );
-  const heroPrefix = enforcementObserved
-    ? b("Your agent is protected.")
-    : b("Your agent is wrapped, but enforcement is not confirmed.");
+  const protection = protectionStateAdvice(info.castleWallProtectionClaim);
   lines.push(
-    `  ${heroPrefix} ${castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
+    `  ${b(protection.operatorSentence)} ${protection.castleWallLabel} / ${sentinelsStatus} / Charter: ready / Heralds: ready.`,
   );
+  if (protection.imperative !== null) {
+    lines.push(`  ${protection.imperative}`);
+  }
   if (info.intelligenceHealthy === false && info.intelligenceError) {
     const w = (s: string) => `\x1b[33m${s}\x1b[0m`;
     lines.push("");

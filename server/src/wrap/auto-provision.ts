@@ -63,6 +63,7 @@ import {
   PROVISION_LOCK_PATH,
   ProvisionLockHeldError,
   type ProvisionLockOps,
+  type DisarmNePreferenceOutcome,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
   type RehomeStepResult,
@@ -1658,22 +1659,21 @@ export async function runAutoProvisionForWrap(
       // arm op above) so the fast post-arm rollback lever cannot miss the wall
       // it just armed on a non-default fortress.
       //
-      // Bug B P1: capture whether the disable AFFIRMATIVELY confirmed the NE
-      // preference is OFF, surfaced alongside the exit code via the
-      // onDisableNeConfirmedOff out-callback (runDisable's numeric contract is
-      // unchanged for every other caller). A non-throwing disarm alone is NOT
-      // sufficient to remove a freshly-installed policy daemon -- the
-      // fail-open-after-lease-revoke sub-case returns success while the NE
-      // preference may still be enabled -- so the orchestrator tears the fresh
-      // daemon down only when `neConfirmedOff === true`.
-      let neConfirmedOff = false;
+      // Bug B P1/B round-2: capture the disable outcome alongside the exit
+      // code. Only `corroborated_off` is observed-off evidence; a
+      // save-accepted-but-inconclusive disable remains a rollback result, not a
+      // protection claim.
+      let nePreferenceOutcome: DisarmNePreferenceOutcome | undefined;
       const code = await runDisable(["--fortress", wallFortressPath], {
-        onDisableNeConfirmedOff: (confirmed) => {
-          neConfirmedOff = confirmed;
+        onDisableNePreferenceOutcome: (outcome) => {
+          nePreferenceOutcome = outcome;
         },
       });
       throwIfDisarmFailed(code);
-      return { neConfirmedOff };
+      if (nePreferenceOutcome === undefined) {
+        throw new Error("castle-wall disable did not report an NE preference outcome");
+      }
+      return { nePreferenceOutcome };
     },
     restoreRehome: async (results: RehomeStepResult[]) => {
       // FIX F2/F3 (2026-07-07 fix-round): thread the OPERATOR's uid/gid

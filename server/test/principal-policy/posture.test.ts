@@ -14,13 +14,47 @@ import {
   CASTLE_WALL_ENFORCEMENT_OPERATIONS,
   CASTLE_WALL_LIVENESS_OPERATIONS,
   CASTLE_WALL_NOT_ENFORCING_OPERATIONS,
+  CASTLE_WALL_STAND_DOWN_OPERATIONS,
   type DetectedHarness,
   type ReachRule,
 } from "../../src/principal-policy/posture.js";
-import { CASTLE_WALL_HEARTBEAT_OPERATION } from "../../src/castle-wall/constants.js";
+import {
+  CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+  CASTLE_WALL_HEARTBEAT_OPERATION,
+} from "../../src/castle-wall/constants.js";
 import { ENFORCEMENT_EVIDENCE_EVENT_TYPES } from "../../src/castle-wall/runtime/audit-consumer.js";
+import { protectionSubjectFromMacOSAuditToken } from "../../src/castle-wall/subject-binding.js";
 
 const FORTRESS = "fortress:test";
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
+function subjectFromProducerToken(token: string): string {
+  const subject = protectionSubjectFromMacOSAuditToken(FORTRESS, token);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
+}
+
+const CLAIM_TOKEN = auditTokenForRuid(503);
+const CLAIM_SUBJECT = subjectFromProducerToken(CLAIM_TOKEN);
 
 function newAuditLog(): { log: AuditLog; storage: MemoryStorage } {
   const storage = new MemoryStorage();
@@ -36,13 +70,17 @@ async function appendCW(
   operation: string,
   timestamp: string,
   result: "success" | "failure" = "success",
+  identityId = CLAIM_SUBJECT,
 ): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation,
-    identity_id: FORTRESS,
+    identity_id: identityId,
     result,
-    details: { cw_source: "castle_wall_audit_consumer" },
+    details: {
+      agent_id: CLAIM_TOKEN,
+      cw_source: "castle_wall_audit_consumer",
+    },
     timestamp,
   });
 }
@@ -57,7 +95,7 @@ async function appendForgedL1(
   await log.appendCritical({
     layer: "l1",
     operation,
-    identity_id: FORTRESS,
+    identity_id: CLAIM_SUBJECT,
     result: "success",
     details: { cw_source: "not-castle-wall" },
     timestamp,
@@ -92,6 +130,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
   it("renders UNKNOWN, never armed, when there is no enforcement evidence", async () => {
     const { log } = newAuditLog();
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -108,6 +147,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     // A real allow verdict 1 minute ago.
     await appendCW(log, "egress_allowed", new Date(now - 60_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -124,6 +164,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     // A verdict from 30 minutes ago, outside the 10-minute window.
     await appendCW(log, "egress_blocked", new Date(now - 30 * 60_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -141,6 +182,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     // Evidence stamped 2 hours into the future.
     await appendCW(log, "egress_allowed", new Date(now + 2 * 60 * 60_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -155,6 +197,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     // A forged/foreign L1 `egress_blocked` with no Castle Wall provenance.
     await appendForgedL1(log, "egress_blocked", new Date(now - 30_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -171,6 +214,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     const now = Date.now();
     await appendCW(log, "filter_started", new Date(now - 30_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -187,6 +231,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     const now = Date.now();
     await appendCW(log, "policy_loaded", new Date(now - 30_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -203,6 +248,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     const now = Date.now();
     await appendCW(log, "policy_loaded", new Date(now - 30_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -224,6 +270,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     await appendCW(log, "policy_loaded", new Date(now - 45_000).toISOString());
     await appendCW(log, "egress_allowed", new Date(now - 30_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -247,6 +294,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     // A manifest reload 1 minute ago: fresh, but manifest-load is not adjudication.
     await appendCW(log, "policy_loaded", new Date(now - 60_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -285,11 +333,23 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     }
   });
 
+  it("B2: the stand-down set includes the CLI disarm record and stays disjoint", () => {
+    expect([...CASTLE_WALL_STAND_DOWN_OPERATIONS].sort()).toEqual(
+      ["arm_lease_revoked", "filter_stopped", "wall_disarmed"].sort(),
+    );
+    for (const op of CASTLE_WALL_STAND_DOWN_OPERATIONS) {
+      expect(CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op)).toBe(false);
+      expect(CASTLE_WALL_LIVENESS_OPERATIONS.has(op)).toBe(false);
+      expect(CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op)).toBe(false);
+    }
+  });
+
   it("renders DEGRADED on fresh not-enforcing evidence (e.g. provider_unbound)", async () => {
     const { log } = newAuditLog();
     const now = Date.now();
     await appendCW(log, "provider_unbound", new Date(now - 30_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
@@ -305,12 +365,83 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
     await appendCW(log, "provider_unbound", new Date(now - 120_000).toISOString());
     await appendCW(log, "egress_blocked", new Date(now - 30_000).toISOString());
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "darwin",
       now,
     });
     expect(posture.arm_state).toBe("armed");
+  });
+
+  it("B2: fresher not-enforcing evidence demotes older fresh enforcement", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, "egress_blocked", new Date(now - 120_000).toISOString());
+    await appendCW(log, "provider_unbound", new Date(now - 30_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("degraded");
+    expect(posture.evidence_basis).toBe("not_enforcing_evidence");
+  });
+
+  it("B2: fresher wall_disarmed demotes older fresh enforcement", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, CASTLE_WALL_HEARTBEAT_OPERATION, new Date(now - 5 * 60_000).toISOString());
+    await appendCW(log, "egress_allowed", new Date(now - 4 * 60_000).toISOString());
+    await appendCW(log, "wall_disarmed", new Date(now - 60_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("intentionally_stopped");
+  });
+
+  it("B2: fresher arm lease revoke demotes older fresh enforcement", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, CASTLE_WALL_HEARTBEAT_OPERATION, new Date(now - 5 * 60_000).toISOString());
+    await appendCW(log, "egress_allowed", new Date(now - 4 * 60_000).toISOString());
+    await appendCW(
+      log,
+      CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+      new Date(now - 60_000).toISOString(),
+    );
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("intentionally_stopped");
+  });
+
+  it("B2: a previously-seen heartbeat producer with no fresh heartbeat cannot leave older adjudication green", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(log, CASTLE_WALL_HEARTBEAT_OPERATION, new Date(now - 20 * 60_000).toISOString());
+    await appendCW(log, "egress_allowed", new Date(now - 9 * 60_000).toISOString());
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
+      auditLog: log,
+      originMachine: FORTRESS,
+      platform: "darwin",
+      now,
+    });
+    expect(posture.arm_state).toBe("unknown");
+    expect(posture.evidence_basis).toBe("daemon_liveness_unconfirmed");
   });
 
   it("never renders armed when the audit read is tainted, even with fresh enforcement evidence", async () => {
@@ -324,7 +455,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
             timestamp: new Date(now - 30_000).toISOString(),
             layer: "l1" as const,
             operation: "egress_allowed",
-            identity_id: FORTRESS,
+            identity_id: CLAIM_SUBJECT,
             result: "success" as const,
           },
         ],
@@ -335,6 +466,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
       }),
     };
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       auditLog: taintedLog as any,
       originMachine: FORTRESS,
@@ -348,6 +480,7 @@ describe("G4 — Castle Wall posture (enforcement-evidenced)", () => {
   it("carries origin_machine for /v1-compatible shapes", async () => {
     const { log } = newAuditLog();
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: CLAIM_SUBJECT,
       auditLog: log,
       originMachine: "fortress:abc",
       platform: "linux",
@@ -375,7 +508,7 @@ describe("G2 — today's audit story digest", () => {
     expect(digest.kernel_blocks).toBe(1);
     expect(digest.failures).toBe(1);
     expect(digest.chain_verified).toBe(true);
-    expect(digest.by_agent[0]?.identity_id).toBe(FORTRESS);
+    expect(digest.by_agent[0]?.identity_id).toBe(CLAIM_SUBJECT);
     expect(digest.by_agent[0]?.operations).toBe(3);
   });
 

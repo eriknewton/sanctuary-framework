@@ -43,8 +43,11 @@ import {
   type MacOSApprovalQueue,
   type MacOSManifestProvider,
 } from "../../../src/castle-wall/runtime/index.js";
+import { protectionSubjectForUid } from "../../../src/castle-wall/subject-binding.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
+
+const FORTRESS_ID = "fortress-test";
 
 const SAMPLE_RULE: AllowlistRule = {
   id: "rule-allow-anthropic",
@@ -92,6 +95,37 @@ function makeApprovalQueue(): {
   return { queue, enqueued };
 }
 
+function subjectForUid(uid: number): string {
+  const subject = protectionSubjectForUid(FORTRESS_ID, uid);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
+}
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
+const AGENT_TEST_TOKEN = auditTokenForRuid(503);
+const AGENT_TEST_SUBJECT = subjectForUid(503);
+const AGENT_PENDING_TOKEN = auditTokenForRuid(504);
+const AGENT_COUNTER_TOKEN = auditTokenForRuid(505);
+
 function makeManifestProvider(rules: AllowlistRule[]): MacOSManifestProvider {
   return {
     currentSnapshot() {
@@ -107,7 +141,7 @@ function makeSignedManifest(rules: AllowlistRule[], signature: string): SignedMa
   return {
     manifest: {
       schema_version: 1,
-      fortress_id: "fortress-test",
+      fortress_id: FORTRESS_ID,
       issued_at: "2026-05-14T00:00:00Z",
       rules: rules.map((rule) => ({
         rule_id: rule.id,
@@ -390,7 +424,7 @@ describe("MacOSFlowIpcListener", () => {
       consumer,
       generateNonce: () => new Uint8Array(32).fill(0x5a),
       handshakeSigner: {
-        fortressId: "fortress-test",
+        fortressId: FORTRESS_ID,
         signingKeyId: "identity-v1",
         signNonce: (nonce) => {
           signedNonce = nonce;
@@ -409,7 +443,7 @@ describe("MacOSFlowIpcListener", () => {
     expect(challenge.type).toBe("handshake_challenge");
     expect(response).toMatchObject({
       type: "handshake_response",
-      fortress_id: "fortress-test",
+      fortress_id: FORTRESS_ID,
       signing_key_id: "identity-v1",
     });
     expect((response as { nonce_signature_b64url: string }).nonce_signature_b64url).toBe(
@@ -463,7 +497,7 @@ describe("MacOSFlowIpcListener", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-test", template: "coding-assistant" },
+      agent: { id: AGENT_TEST_TOKEN, template: "coding-assistant" },
       matched_rule_id: null,
       recorded_at: "2026-05-12T13:00:00Z",
     };
@@ -473,7 +507,7 @@ describe("MacOSFlowIpcListener", () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(h.audit.entries).toHaveLength(1);
     expect(h.audit.entries[0]?.operation).toBe("egress_blocked");
-    expect(h.audit.entries[0]?.identityId).toBe("agent-test");
+    expect(h.audit.entries[0]?.identityId).toBe(AGENT_TEST_SUBJECT);
     expect(h.listener.getStats().framesDecoded).toBeGreaterThanOrEqual(1);
   });
 
@@ -496,7 +530,7 @@ describe("MacOSFlowIpcListener", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-pending", template: "coding-assistant" },
+      agent: { id: AGENT_PENDING_TOKEN, template: "coding-assistant" },
       expires_in_seconds: 60,
     };
     socket.write(envelope(notif));
@@ -504,7 +538,7 @@ describe("MacOSFlowIpcListener", () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(h.approvals.enqueued).toHaveLength(1);
     expect(h.approvals.enqueued[0]?.requestId).toBe("req-pending-1");
-    expect(h.approvals.enqueued[0]?.agentId).toBe("agent-pending");
+    expect(h.approvals.enqueued[0]?.agentId).toBe(AGENT_PENDING_TOKEN);
   });
 
   it("unregisters subscribers when the socket closes", async () => {
@@ -640,7 +674,7 @@ describe("MacOSFlowIpcListener", () => {
           hostname_source: "sni",
           opaque: false,
         },
-        agent: { id: "agent-test", template: "coding-assistant" },
+        agent: { id: AGENT_TEST_TOKEN, template: "coding-assistant" },
         matched_rule_id: null,
         recorded_at: "2026-05-12T13:00:00Z",
       };
@@ -682,7 +716,7 @@ describe("MacOSFlowIpcListener", () => {
         hostname_source: "sni",
         opaque: false,
       },
-      agent: { id: "agent-counter", template: "coding-assistant" },
+      agent: { id: AGENT_COUNTER_TOKEN, template: "coding-assistant" },
       matched_rule_id: "rule-allow-anthropic",
       recorded_at: "2026-05-12T13:00:00Z",
     };

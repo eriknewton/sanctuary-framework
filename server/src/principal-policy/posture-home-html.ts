@@ -554,7 +554,8 @@ export function renderPostureHomeHTML(): string {
   // Never leaks rule internals; phrases the honest non-green cases plainly.
   //
   // HONESTY: the liveness bases (alive_no_recent_enforcement / dead_no_heartbeat
-  // / intentionally_stopped / no_evidence_self_reporting) are SHARED between the
+  // / intentionally_stopped / daemon_liveness_unconfirmed /
+  // no_evidence_self_reporting) are SHARED between the
   // Castle Wall row and the broker DAEMON row, but they mean different things.
   // For Castle Wall, a fresh heartbeat means "armed but idle" (no flow filtered).
   // For the broker daemon it means ONLY "the process is up" - NOT that it would
@@ -589,7 +590,17 @@ export function renderPostureHomeHTML(): string {
       case "intentionally_stopped":
         return isBrokerDaemon
           ? "The broker daemon was intentionally stopped (clean shutdown); it is off on purpose, not dead."
-          : "The wall was intentionally stopped (operator stop or arm-lease revoke); it is off on purpose, not dead.";
+          : "The wall was intentionally stopped (operator stop, disable, or arm-lease revoke); it is off on purpose, not dead.";
+      case "daemon_liveness_unconfirmed":
+        return isBrokerDaemon
+          ? "Broker daemon liveness is not confirmed after recent activity; not rendered green."
+          : "The wall has prior enforcement evidence, but daemon liveness is not currently confirmed; not rendered green.";
+      case "subject_unbound_evidence":
+        return "Castle Wall has recent enforcement evidence, but it is not attributed to this confined agent.";
+      case "legacy_macos_audit_token":
+        return "Evidence predates the subject-binding format; re-arm Castle Wall to produce subject-bound evidence.";
+      case "subject_unresolvable":
+        return "This agent's confinement identity could not be read, so no enforcement evidence can be bound to it.";
       case "no_activity_event_driven":
         return row.broken_zero_detectable === false
           ? "No activity in window. A silently-disabled feature is undetectable here, so this is shown as unconfirmed, not green."
@@ -1534,7 +1545,7 @@ export function renderPostureHomeHTML(): string {
     // assert coarse protection when the worst mode is unprotected.
     var coarseMeaning =
       w.exclusive_egress && w.exclusive_egress.mode === "unprotected"
-        ? "A fine-grained agent is UNPROTECTED: its exclusive-egress stack is not live AND the coarse wall is not armed over it. Not green by design."
+        ? "A fine-grained agent is UNPROTECTED: its exclusive-egress stack is not live AND coarse Castle Wall enforcement is not confirmed for this fortress. Not green by design."
         : "The coarse wall is enforcing, but a fine-grained agent's exclusive-egress stack (gate, pf, generation) is NOT live. Not green by design.";
     var meaning = w.arm_state === "armed"
       ? "The operating system is blocking unauthorized outbound connections from wrapped agents."

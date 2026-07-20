@@ -69,6 +69,7 @@ describe("F2 HIGH-1: verified_suffix_only renders amber, not affirmative green",
   it("feature-health: sets the amber caveat but keeps audit_integrity_ok true (no crying wolf)", async () => {
     const now = Date.now();
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: suffixOnlyAuditLog([]),
       originMachine: FORTRESS,
       now,
@@ -84,6 +85,7 @@ describe("F2 HIGH-1: verified_suffix_only renders amber, not affirmative green",
   it("posture: arm gate is NOT blocked by suffix-only, and the amber caveat is set", async () => {
     const now = Date.now();
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
       auditLog: suffixOnlyAuditLog([freshEnforcementEntry(now)]),
       originMachine: FORTRESS,
       platform: "darwin",
@@ -114,6 +116,7 @@ describe("F2 HIGH-1: verified_suffix_only renders amber, not affirmative green",
     } as unknown as AuditLog;
 
     const posture = await buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
       auditLog: verifiedLog,
       originMachine: FORTRESS,
       platform: "darwin",

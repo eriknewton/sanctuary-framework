@@ -324,6 +324,23 @@ describe("posture home — feature-health panel honesty", () => {
     expect(fnSource).not.toMatch(/unknown[^\n]*pill green/);
     expect(fnSource).toContain('unconfirmed") return \'<span class="pill amber">');
   });
+
+  it("explains subject-binding non-green bases with distinct non-daemon copy", () => {
+    const html = renderPostureHomeHTML();
+
+    expect(html).toContain('case "subject_unbound_evidence":');
+    expect(html).toContain(
+      "Castle Wall has recent enforcement evidence, but it is not attributed to this confined agent.",
+    );
+    expect(html).toContain('case "legacy_macos_audit_token":');
+    expect(html).toContain(
+      "Evidence predates the subject-binding format; re-arm Castle Wall to produce subject-bound evidence.",
+    );
+    expect(html).toContain('case "subject_unresolvable":');
+    expect(html).toContain(
+      "This agent's confinement identity could not be read, so no enforcement evidence can be bound to it.",
+    );
+  });
 });
 
 describe("posture home - Today's story plain summary toggle", () => {

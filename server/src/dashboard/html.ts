@@ -10,6 +10,10 @@
  */
 
 import type { ProtectionSnapshot } from "./aggregator.js";
+import {
+  PROTECTION_HERO_COPY,
+  protectionHeroCopyForLight,
+} from "../egress-gate/protection-claim.js";
 
 // Re-export the multi-tenant renderer so dashboard consumers can import a
 // single module for both modes.
@@ -19,7 +23,8 @@ export {
 } from "./multi-html.js";
 
 /** Hero copy. Change here if we ever A/B test. */
-export const HERO_COPY = "Your agent is protected.";
+export const HERO_COPY = PROTECTION_HERO_COPY.green;
+const NON_GREEN_HERO_COPY = PROTECTION_HERO_COPY.nonGreen;
 
 export interface DashboardHTMLOptions {
   snapshot: ProtectionSnapshot;
@@ -161,6 +166,7 @@ function l4EvidenceBlock(l4: ProtectionSnapshot["layers"]["l4"]): string {
 export function renderDashboardHTML(options: DashboardHTMLOptions): string {
   const { snapshot } = options;
   const { overall, agent, layers, activity, pending_approvals, audit, privacy, upstream_servers } = snapshot;
+  const heroCopy = protectionHeroCopyForLight(overall.light);
 
   const activityRows = activity.length === 0
     ? `<tr class="empty"><td colspan="5">Waiting for tool calls…</td></tr>`
@@ -580,7 +586,7 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
         <path class="shield-mark" d="M85 102 L96 113 L118 90"></path>
       </svg>
     </div>
-    <h1 id="hero-copy">${escHtml(HERO_COPY)}</h1>
+    <h1 id="hero-copy">${escHtml(heroCopy)}</h1>
     <p class="hero-sub" id="hero-sub">${escHtml(overall.headline)}</p>
     <div class="identity-line" id="identity-line">
       <span class="name" id="agent-name">${escHtml(agent.display_name)}</span>
@@ -688,12 +694,18 @@ details.audit-details .audit-filters { display: flex; gap: 6px; padding: 0 18px 
   function fmtTime(iso) {
     try { return new Date(iso).toLocaleTimeString(); } catch { return iso; }
   }
+  const HERO_COPY_TEXT = ${JSON.stringify(HERO_COPY)};
+  const NON_GREEN_HERO_COPY_TEXT = ${JSON.stringify(NON_GREEN_HERO_COPY)};
+  function heroCopyForLight(light) {
+    return light === "green" ? HERO_COPY_TEXT : NON_GREEN_HERO_COPY_TEXT;
+  }
 
   function renderShield(light, headline) {
     const shield = document.getElementById("shield");
     if (!shield) return;
     shield.classList.remove("green", "yellow", "red");
     shield.classList.add(light);
+    document.getElementById("hero-copy").textContent = heroCopyForLight(light);
     document.getElementById("hero-sub").textContent = headline;
   }
 

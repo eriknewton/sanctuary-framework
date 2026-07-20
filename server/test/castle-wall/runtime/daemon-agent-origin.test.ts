@@ -47,6 +47,26 @@ function makeSigningKey(): { signer: ManifestSigner; publicKey: Uint8Array } {
   };
 }
 
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
 describe("castle-wall/runtime/daemon-agent-origin", () => {
   describe("agent-origin in signed manifest", () => {
     it("includes a valid uid-mode agent-origin in the signed manifest body", async () => {
@@ -173,7 +193,7 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
           hostname_source: "sni",
           opaque: false,
         },
-        agent: { id: "test-agent", template: "unknown" },
+        agent: { id: auditTokenForRuid(503), template: "unknown" },
         matched_rule_id: "operator-baseline-uid",
         recorded_at: new Date().toISOString(),
       };
@@ -195,7 +215,7 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
           hostname_source: null,
           opaque: true,
         },
-        agent: { id: "tailscaled", template: "system" },
+        agent: { id: auditTokenForRuid(65), template: "system" },
         matched_rule_id: "essentials-tailscaled",
         recorded_at: new Date().toISOString(),
       };
@@ -217,7 +237,7 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
           hostname_source: "sni",
           opaque: false,
         },
-        agent: { id: "test-agent", template: "unknown" },
+        agent: { id: auditTokenForRuid(503), template: "unknown" },
         matched_rule_id: "allow-anthropic-api",
         recorded_at: new Date().toISOString(),
       };
@@ -238,7 +258,7 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
           hostname_source: "sni",
           opaque: false,
         },
-        agent: { id: "test-agent", template: "unknown" },
+        agent: { id: auditTokenForRuid(503), template: "unknown" },
         matched_rule_id: "deny-blocked-example",
         recorded_at: new Date().toISOString(),
       };
@@ -260,7 +280,7 @@ describe("castle-wall/runtime/daemon-agent-origin", () => {
           hostname_source: "sni",
           opaque: false,
         },
-        agent: { id: "test-agent", template: "unknown" },
+        agent: { id: auditTokenForRuid(503), template: "unknown" },
         matched_rule_id: null,
         recorded_at: new Date().toISOString(),
       };

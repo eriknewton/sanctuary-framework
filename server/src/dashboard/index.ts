@@ -105,6 +105,8 @@ export interface StartDashboardOptions {
   resolveBrokerPinnedProducerKey?: () => string | null;
   /** Broker liveness producer key exists or is expected but could not be read. */
   brokerProducerKeyExpectedButUnavailable?: boolean;
+  /** Canonical confined-agent protection subject (`fortress/uid-N`). */
+  resolveProtectionClaimSubject?: () => string | null | Promise<string | null>;
   /**
    * Read-only fleet-roster provider (wrap "Protect" dashboard). Forwarded to the
    * dashboard server, where it feeds both `GET /api/fleet/roster` and the
@@ -157,6 +159,9 @@ export async function startDashboard(
       : {}),
     ...(options.brokerProducerKeyExpectedButUnavailable
       ? { brokerProducerKeyExpectedButUnavailable: true }
+      : {}),
+    ...(options.resolveProtectionClaimSubject
+      ? { resolveProtectionClaimSubject: options.resolveProtectionClaimSubject }
       : {}),
     activity,
     pendingApprovals: pending,

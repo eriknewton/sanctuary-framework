@@ -165,7 +165,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: AGENT_UID })),
     arm: vi.fn(async () => ({ ok: true as const })),
     postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
-    disarm: vi.fn(async () => ({ neConfirmedOff: true as const })),
+    disarm: vi.fn(async () => ({ nePreferenceOutcome: "corroborated_off" as const })),
     restoreRehome: vi.fn(async () => ({
       fullyRestored: true,
       restoredCount: REHOME_RESULTS.length,
@@ -495,7 +495,7 @@ describe("castle-wall/provision/orchestrate", () => {
         if (err !== undefined) {
           throw err;
         }
-        return { neConfirmedOff: true };
+        return { nePreferenceOutcome: "corroborated_off" as const };
       }),
     });
     const result = await runProvisionFlow(baseCtx(), ops);
@@ -867,6 +867,22 @@ describe("castle-wall/provision/orchestrate", () => {
       expect((result as { reason: string }).reason).toMatch(/disarmed as part of this rollback|castle-wall status/i);
     });
 
+    it("B1: save-accepted-but-inconclusive disarm does not become observed-off evidence", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        disarm: vi.fn(async () => ({
+          nePreferenceOutcome: "save_accepted_inconclusive" as const,
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
+      expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
+      expect((result as { disarmObservedOff?: true }).disarmObservedOff).toBeUndefined();
+      expect((result as { wallMayBeArmed?: true }).wallMayBeArmed).toBeUndefined();
+      expect((result as { reason: string }).reason).toContain("status corroboration was inconclusive");
+    });
+
     it("P0 honesty gap: arm ok:false + fresh daemon + disarm THROWS leaves the policy daemon UP (never boots it out into a lockout), sets wallMayBeArmed, and is NOT a clean rollback", async () => {
       const ops = happyPathOps({
         ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
@@ -890,18 +906,18 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(reason).toMatch(/castle-wall disable/);
     });
 
-    it("P1 (fail-open-after-lease-revoke): arm ok:false + fresh daemon + disarm returns neConfirmedOff:FALSE leaves the daemon UP (never a reboot-brick) + sets wallMayBeArmed, even though disarm did NOT throw", async () => {
+    it("P1 (fail-open-after-lease-revoke): arm ok:false + fresh daemon + disarm returns fail_open_deadman leaves the daemon UP (never a reboot-brick) + sets wallMayBeArmed, even though disarm did NOT throw", async () => {
       const ops = happyPathOps({
         ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
         arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
         // Disarm did NOT throw (it succeeded as a dead-man lever, fail-open),
-        // but the NE preference was NOT confirmed off -- the exact P1 sub-case.
-        disarm: vi.fn(async () => ({ neConfirmedOff: false })),
+        // but the NE preference was NOT observed off -- the exact P1 sub-case.
+        disarm: vi.fn(async () => ({ nePreferenceOutcome: "fail_open_deadman" as const })),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "arm", wallMayBeArmed: true });
       expect(ops.disarm).toHaveBeenCalledTimes(1);
-      // CRITICAL: a non-throwing-but-not-confirmed disarm must NOT tear the fresh
+      // CRITICAL: a non-throwing-but-not-observed-off disarm must NOT tear the fresh
       // daemon down -- removing it while the NE preference may still be enabled
       // risks a reboot-brick (provider up enabled + no daemon = deny-all).
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();

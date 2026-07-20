@@ -53,6 +53,7 @@ import {
   type AuditSink,
   type CriticalEventEnvelope,
 } from "./audit-consumer.js";
+import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
 
 /** The runtime's view of a registered macOS subscriber. */
 export interface MacOSSubscriber {
@@ -109,6 +110,13 @@ export interface MacOSFlowEventConsumerInput {
   approvalQueue: MacOSApprovalQueue;
   auditSink: AuditSink;
   /**
+   * Stable fortress id whose wall is producing these events. Required for the
+   * macOS subject binding that turns the per-process audit_token_t into the
+   * canonical `fortress/uid` claim subject. Tests that omit it fall back to the
+   * signed manifest fortress id.
+   */
+  fortressId?: string;
+  /**
    * Default approval timeout in seconds, used when the extension reports
    * `expires_in_seconds <= 0`. Mirrors the existing
    * `CASTLE_WALL_DEFAULT_PROMPT_TIMEOUT_SECONDS` knob; passed in so tests
@@ -143,6 +151,7 @@ export class MacOSFlowEventConsumer {
   private readonly manifestProvider: MacOSManifestProvider;
   private readonly approvalQueue: MacOSApprovalQueue;
   private readonly auditSink: AuditSink;
+  private readonly fortressId: string;
   private readonly defaultApprovalTimeoutSeconds: number;
   private readonly producerAuditConsumer: AuditConsumer | null;
   private readonly emissionLiveness: EmissionLivenessNotes | null;
@@ -161,6 +170,7 @@ export class MacOSFlowEventConsumer {
     this.manifestProvider = input.manifestProvider;
     this.approvalQueue = input.approvalQueue;
     this.auditSink = input.auditSink;
+    this.fortressId = resolveMacOSFlowFortressId(input);
     this.defaultApprovalTimeoutSeconds = input.defaultApprovalTimeoutSeconds;
     this.emissionLiveness = input.emissionLiveness ?? null;
     this.producerAuditConsumer =
@@ -252,7 +262,7 @@ export class MacOSFlowEventConsumer {
     // it persists below. Noted FIRST so every downstream reject path counts
     // as decided-but-not-emitted divergence, never as silence.
     this.emissionLiveness?.noteDecision("flow_decision_recorded");
-    const reason = validateFlowDecisionRecorded(notification);
+    const reason = validateFlowDecisionRecorded(notification, this.fortressId);
     if (reason !== null) {
       this.stats.decisionsRejected += 1;
       this.emissionLiveness?.noteRejection(`validation:${reason}`);
@@ -271,7 +281,7 @@ export class MacOSFlowEventConsumer {
     if (this.producerAuditConsumer !== null) {
       try {
         await this.producerAuditConsumer.ingestCritical(
-          buildProducerSignedEnvelope(notification, eventType)
+          buildProducerSignedEnvelope(notification, eventType, this.fortressId)
         );
         this.stats.decisionsRecorded += 1;
         this.emissionLiveness?.noteEmission();
@@ -322,12 +332,18 @@ export class MacOSFlowEventConsumer {
     // update). The operator reads the unredacted entry via the Castle Wall CLI /
     // dashboard.
     try {
+      const subject = macOSFlowProtectionSubject(
+        this.fortressId,
+        notification.agent.id,
+      );
       await this.auditSink.append(
         CASTLE_WALL_AUDIT_LAYER,
         eventType,
-        notification.agent.id,
+        subject,
         {
           agent: notification.agent,
+          agent_id: notification.agent.id,
+          agent_template: notification.agent.template,
           destination: notification.destination,
           decision: notification.decision,
           rule_id: notification.matched_rule_id ?? null,
@@ -442,12 +458,13 @@ export class MacOSFlowEventConsumer {
 
 function buildProducerSignedEnvelope(
   notification: FlowDecisionRecordedNotification,
-  eventType: "egress_allowed" | "egress_blocked"
+  eventType: "egress_allowed" | "egress_blocked",
+  fortressId: string,
 ): CriticalEventEnvelope {
   const producer = normalizeProducerSignature(notification.producer);
   const event = buildAuditEvent({
     timestamp: notification.recorded_at,
-    fortress_id: notification.agent.id,
+    fortress_id: fortressId,
     event_type: eventType,
     agent: notification.agent,
     destination: notification.destination,
@@ -474,7 +491,19 @@ function buildProducerSignedEnvelope(
           },
         }
       : {}),
+    producerSubjectBinding: {
+      kind: "macos_audit_token",
+      fortressId,
+    },
   };
+}
+
+function macOSFlowProtectionSubject(fortressId: string, agentId: string): string {
+  const subject = protectionSubjectFromMacOSAuditToken(fortressId, agentId);
+  if (subject === null) {
+    throw new Error("agent.id must be a non-root macOS audit_token_t hex");
+  }
+  return subject;
 }
 
 function normalizeProducerSignature(
@@ -502,7 +531,8 @@ function normalizeProducerSignature(
  * valid; returns a short reason string otherwise.
  */
 export function validateFlowDecisionRecorded(
-  notification: FlowDecisionRecordedNotification
+  notification: FlowDecisionRecordedNotification,
+  fortressId = "validation",
 ): string | null {
   if (notification.type !== "flow_decision_recorded") {
     return `unexpected message type: ${String(notification.type)}`;
@@ -512,6 +542,9 @@ export function validateFlowDecisionRecorded(
   }
   if (!notification.agent || typeof notification.agent.id !== "string" || notification.agent.id.length === 0) {
     return "missing agent.id";
+  }
+  if (protectionSubjectFromMacOSAuditToken(fortressId, notification.agent.id) === null) {
+    return "agent.id must be a non-root macOS audit_token_t hex";
   }
   if (!notification.destination || typeof notification.destination.ip !== "string") {
     return "missing destination.ip";
@@ -524,6 +557,28 @@ export function validateFlowDecisionRecorded(
     return "matched_rule_id must be string or null";
   }
   return null;
+}
+
+function resolveMacOSFlowFortressId(input: MacOSFlowEventConsumerInput): string {
+  if (typeof input.fortressId === "string" && input.fortressId.length > 0) {
+    return input.fortressId;
+  }
+  try {
+    const manifestFortressId =
+      input.manifestProvider.currentSnapshot().signed_manifest?.manifest
+        ?.fortress_id;
+    if (
+      typeof manifestFortressId === "string" &&
+      manifestFortressId.length > 0
+    ) {
+      return manifestFortressId;
+    }
+  } catch {
+    // The provider is still allowed to fail when a manifest is actually read;
+    // construction itself must not hard-crash for tests/CLI readers that never
+    // subscribe to the manifest.
+  }
+  return "unknown";
 }
 
 /**

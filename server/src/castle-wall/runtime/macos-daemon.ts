@@ -58,6 +58,7 @@ import {
 } from "../../storage/custody-fs.js";
 import { MacOSFlowEventConsumer } from "./macos-flow-events.js";
 import { MacOSFlowIpcListener } from "./macos-ipc-listener.js";
+import { protectionSubjectFromAgentOrigin } from "../subject-binding.js";
 import {
   CASTLE_WALL_ACTIVE_CONFIG_PATH,
   CASTLE_WALL_ACTIVE_CONFIG_LEGACY_PATH,
@@ -542,6 +543,9 @@ export async function startMacOSCastleWallDaemon(
   }
   const pinnedPublicKeySha256 = sha256Hex(signer.publicKey);
   const agentOrigin = await resolveAgentOrigin(input.fortressPath, input.agentOrigin);
+  const protectionClaimSubject =
+    protectionSubjectFromAgentOrigin(input.fortressId, agentOrigin) ??
+    input.fortressId;
   const operatorBaseline = await resolveOperatorBaseline(
     input.fortressPath,
     input.operatorBaseline,
@@ -836,6 +840,7 @@ export async function startMacOSCastleWallDaemon(
     auditSink: input.auditLog,
     defaultApprovalTimeoutSeconds: 30,
     pinnedProducerKeyB64url: auditProducerKey?.keyB64url ?? null,
+    fortressId: input.fortressId,
     emissionLiveness: emissionLivenessWatchdog,
   });
 
@@ -957,11 +962,12 @@ export async function startMacOSCastleWallDaemon(
         await input.auditLog.append(
           "l1",
           CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
-          input.fortressId,
+          protectionClaimSubject,
           {
             socket_path: socketPath,
             source: auditSource,
             daemon_mode: daemonMode,
+            fortress_id: input.fortressId,
             // Provenance marker LAST, from constructed fields only.
             [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
           },
@@ -1001,8 +1007,8 @@ export async function startMacOSCastleWallDaemon(
     await input.auditLog.append(
       "l1",
       "filter_started",
-      input.fortressId,
-      { socket_path: socketPath, source: auditSource },
+      protectionClaimSubject,
+      { socket_path: socketPath, source: auditSource, fortress_id: input.fortressId },
       "success",
     );
     await input.auditLog.flush();
@@ -1090,11 +1096,12 @@ export async function startMacOSCastleWallDaemon(
         await input.auditLog.append(
           "l1",
           CASTLE_WALL_HEARTBEAT_OPERATION,
-          input.fortressId,
+          protectionClaimSubject,
           {
             socket_path: socketPath,
             source: auditSource,
             daemon_mode: daemonMode,
+            fortress_id: input.fortressId,
             // #912 MED-1: a non-zero count means a reload outcome audit write
             // was not confirmed within its deadline (deadline or persist
             // failure) since the last successfully carried marker. See the
@@ -1420,10 +1427,11 @@ export async function startMacOSCastleWallDaemon(
           await input.auditLog.append(
             "l1",
             "filter_stopped",
-            input.fortressId,
+            protectionClaimSubject,
             {
               socket_path: socketPath,
               source: auditSource,
+              fortress_id: input.fortressId,
               ...(degradedCountAtStop > 0
                 ? { audit_write_degraded_count: degradedCountAtStop }
                 : {}),
