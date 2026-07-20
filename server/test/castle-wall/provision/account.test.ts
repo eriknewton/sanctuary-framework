@@ -611,6 +611,34 @@ describe("castle-wall/provision/account", () => {
       expect(record).toEqual(completeRecord(500));
     });
 
+    it("accepts a case-variant canonical post-create holder name as the created account", async () => {
+      let record: ServiceAccountRecord | undefined;
+      let uidLookupCalls = 0;
+      const ops: AccountProvisionOps = {
+        lookupAccountUid: async () => record?.uid,
+        lookupAccountRecord: async () => record,
+        canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+        highestAssignedUid: async () => 499,
+        lookupAccountNamesByUid: async () => {
+          uidLookupCalls += 1;
+          return uidLookupCalls === 1 ? [] : ["Sanctuary-Hermes"];
+        },
+        createUser: async (_accountName, uid, _comment, homeDirectory) => {
+          record = { uid, homeDirectory, userShell: "/usr/bin/false" };
+        },
+        hardenCreatedUser: async () => {
+          if (record !== undefined) record = { ...record, isHidden: true };
+        },
+      };
+      const result = await planAndCreateAccount(
+        { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+        ops,
+      );
+      expect(result.uid).toBe(500);
+      expect(uidLookupCalls).toBe(2);
+      expect(record).toEqual(completeRecord(500));
+    });
+
     it("still refuses a persistent post-create uid collision without record-shape repair advice", async () => {
       let record: ServiceAccountRecord | undefined;
       let uidLookupCalls = 0;

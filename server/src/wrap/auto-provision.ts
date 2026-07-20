@@ -759,7 +759,7 @@ async function resolveOperatorIdentity(): Promise<OperatorIdentity | undefined> 
 }
 
 const DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE = /^(.+?)\s+UniqueID\s*=\s*(.*)$/;
-const DSCL_UNIQUE_ID_VALUE_RE = /^-?\d+$/;
+const DSCL_UNIQUE_ID_VALUE_RE = /^(?:"(-?\d+)"|(-?\d+))$/;
 
 interface DsclSearchAccountRecord {
   readonly accountName: string;
@@ -767,8 +767,9 @@ interface DsclSearchAccountRecord {
 }
 
 function parseDsclSearchUidValue(rawValue: string): number | undefined {
-  if (!DSCL_UNIQUE_ID_VALUE_RE.test(rawValue)) return undefined;
-  const uid = Number(rawValue);
+  const match = DSCL_UNIQUE_ID_VALUE_RE.exec(rawValue);
+  if (match === null) return undefined;
+  const uid = Number(match[1] ?? match[2]);
   return Number.isSafeInteger(uid) ? uid : undefined;
 }
 

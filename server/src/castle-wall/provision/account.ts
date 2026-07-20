@@ -511,6 +511,18 @@ function describeAccountNames(names: readonly string[]): string {
   return [...new Set(names)].sort().map((name) => JSON.stringify(name)).join(", ");
 }
 
+function directoryServiceAccountNamesEqual(left: string, right: string): boolean {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+function foreignUidHolders(accountName: string, holders: readonly string[]): string[] {
+  return holders.filter((name) => !directoryServiceAccountNamesEqual(name, accountName));
+}
+
+function uidHeldOnlyByServiceAccount(accountName: string, holders: readonly string[]): boolean {
+  return holders.length > 0 && holders.every((name) => directoryServiceAccountNamesEqual(name, accountName));
+}
+
 function postCreateUidHolderConflictGuidance(accountName: string): string {
   return (
     `Recovery: do not treat the create as successful until the uid lookup returns only ` +
@@ -587,7 +599,7 @@ async function assertCreatedUidHeldOnlyByCreatedAccount(
       holders = await ops.lookupAccountNamesByUid(plan.uid);
       lastErr = undefined;
       const uniqueHolders = [...new Set(holders)];
-      const foreignHolders = uniqueHolders.filter((name) => name !== plan.accountName);
+      const foreignHolders = foreignUidHolders(plan.accountName, uniqueHolders);
       if (foreignHolders.length > 0) {
         throw new AccountProvisionVerificationError(
           `post-create uid lookup for service account "${plan.accountName}" at uid ${plan.uid} found ` +
@@ -595,7 +607,7 @@ async function assertCreatedUidHeldOnlyByCreatedAccount(
             postCreateUidHolderConflictGuidance(plan.accountName),
         );
       }
-      if (uniqueHolders.length === 1 && uniqueHolders[0] === plan.accountName) return;
+      if (uidHeldOnlyByServiceAccount(plan.accountName, uniqueHolders)) return;
     } catch (err) {
       if (err instanceof AccountProvisionVerificationError) throw err;
       holders = undefined;
@@ -639,7 +651,7 @@ async function assertExistingUidHeldOnlyByServiceAccount(
   }
 
   const uniqueHolders = [...new Set(holders)];
-  const foreignHolders = uniqueHolders.filter((name) => name !== plan.accountName);
+  const foreignHolders = foreignUidHolders(plan.accountName, uniqueHolders);
   if (foreignHolders.length > 0) {
     throw new AccountProvisionVerificationError(
       `Existing service account "${plan.accountName}" at uid ${plan.uid} shares that uid with ` +
@@ -647,7 +659,7 @@ async function assertExistingUidHeldOnlyByServiceAccount(
         existingUidHolderConflictGuidance(plan.accountName, plan.uid, foreignHolders),
     );
   }
-  if (uniqueHolders.length !== 1 || uniqueHolders[0] !== plan.accountName) {
+  if (!uidHeldOnlyByServiceAccount(plan.accountName, uniqueHolders)) {
     throw new AccountProvisionVerificationError(
       `Existing service account "${plan.accountName}" at uid ${plan.uid} could not be directly confirmed as the ` +
         `only holder of that uid; lookup found ${

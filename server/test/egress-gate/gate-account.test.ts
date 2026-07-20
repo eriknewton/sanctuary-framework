@@ -332,6 +332,22 @@ describe("egress-gate/gate-account", () => {
     expect(ops.hardened).toEqual([]);
   });
 
+  it("skips successfully when DirectoryService returns the gate account with canonical case", async () => {
+    const ops = gateOps({
+      existing: completeGateRecord(511),
+      highest: 511,
+      uidNames: ["Sanctuary-Gate-Hermes"],
+    });
+    const result = await planAndCreateGateAccount(
+      { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes" },
+      ops,
+    );
+    expect(result.plan.action).toBe("skip");
+    expect(result.uid).toBe(511);
+    expect(ops.created).toEqual([]);
+    expect(ops.hardened).toEqual([]);
+  });
+
   it("refuses a skip when an existing gate account uid is shared with a live account", async () => {
     const ops = gateOps({
       existing: completeGateRecord(511),

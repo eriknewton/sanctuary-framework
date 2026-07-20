@@ -1348,6 +1348,11 @@ describe("wrap/auto-provision real-ops chokepoint: dscl -search parser (fix roun
     expect(parseDsclSearchAccountNames(realOutput, 501)).toEqual(["eriknewton"]);
   });
 
+  it("parses quoted numeric uid values from dscl -search output", () => {
+    expect(parseDsclSearchAccountNames("nobody\t\tUniqueID = (\n    \"-2\"\n)\n", -2)).toEqual(["nobody"]);
+    expect(parseDsclSearchAccountNames("sanctuary-hermes\t\tUniqueID = (\n    \"503\"\n)\n", 503)).toEqual(["sanctuary-hermes"]);
+  });
+
   it("also parses the single-line form (name  UniqueID = 501)", () => {
     expect(parseDsclSearchAccountNames("sanctuary-hermes  UniqueID = 502\n", 502)).toEqual(["sanctuary-hermes"]);
   });
