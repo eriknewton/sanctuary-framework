@@ -53,6 +53,10 @@ import {
   readPersistedLocalAgents,
   writePersistedLocalAgents,
 } from "../../hub/agent-registry-persistence.js";
+import {
+  agentRecordAttributionIds,
+  publicAgentIdForVerifiedAttribution,
+} from "../../hub/agent-attribution.js";
 import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
 import type { LocalAgentRecord } from "../../contracts/v1.1/local-agent-records.js";
@@ -776,11 +780,7 @@ function buildConciergeContextProviders(args: {
           ),
         )
         .slice(-30)
-        .map((e) => {
-          const agentId =
-            auditEntryAgentId(e, auditAttribution) ?? "_fortress";
-          return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
-        });
+        .map((e) => formatConciergeActivityLine(e, auditAttribution, records));
       if (lines.length === 0) return "(no recent activity)";
       return lines.join("\n");
     },
@@ -869,7 +869,12 @@ function buildConciergeContextFetchers(args: {
       );
       const filtered = agentNameHint
         ? owned.filter((e) => {
-            const agentId = auditEntryAgentId(e, auditAttribution) ?? "";
+            const agentId =
+              publicAgentIdForConciergeActivity(
+                e,
+                auditAttribution,
+                records,
+              ) ?? "";
             return agentId
               .toLowerCase()
               .includes(agentNameHint.toLowerCase());
@@ -878,11 +883,7 @@ function buildConciergeContextFetchers(args: {
       const tail = (filtered.length > 0 ? filtered : owned).slice(-20);
       if (tail.length === 0) return "(no activity)";
       return tail
-        .map((e) => {
-          const agentId =
-            auditEntryAgentId(e, auditAttribution) ?? "_fortress";
-          return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
-        })
+        .map((e) => formatConciergeActivityLine(e, auditAttribution, records))
         .join("\n");
     },
     audit_log: async () => {
@@ -925,27 +926,42 @@ function buildConciergeContextFetchers(args: {
   };
 }
 
+type ConciergeAuditAttribution = Awaited<
+  ReturnType<AuditAttributionOptionsResolver>
+>;
+
+function publicAgentIdForConciergeActivity(
+  entry: Parameters<typeof auditEntryAgentId>[0],
+  auditAttribution: ConciergeAuditAttribution,
+  records: ReadonlyArray<LocalAgentRecord>,
+): string | null {
+  const verifiedSubject = auditEntryAgentId(entry, auditAttribution);
+  return verifiedSubject === null
+    ? null
+    : publicAgentIdForVerifiedAttribution(verifiedSubject, records);
+}
+
+function formatConciergeActivityLine(
+  entry: Parameters<typeof auditEntryAgentId>[0],
+  auditAttribution: ConciergeAuditAttribution,
+  records: ReadonlyArray<LocalAgentRecord>,
+): string {
+  const agentId =
+    publicAgentIdForConciergeActivity(entry, auditAttribution, records) ??
+    "_fortress";
+  return `${entry.timestamp}  ${entry.layer}.${entry.operation}  agent=${agentId}  result=${entry.result}`;
+}
+
 function entryBelongsToConciergeScope(
   entry: Parameters<typeof auditEntryAgentId>[0],
   identityId: string,
   records: ReadonlyArray<LocalAgentRecord>,
-  auditAttribution: Awaited<ReturnType<AuditAttributionOptionsResolver>>,
+  auditAttribution: ConciergeAuditAttribution,
 ): boolean {
   if (entry.identity_id === identityId) return true;
   const agentId = auditEntryAgentId(entry, auditAttribution);
   if (agentId === null) return false;
-  return records.some((record) => localAgentAttributionIds(record).has(agentId));
-}
-
-function localAgentAttributionIds(record: LocalAgentRecord): Set<string> {
-  const ids = new Set<string>([record.agent_id]);
-  if (
-    typeof record.protection_subject === "string" &&
-    record.protection_subject.length > 0
-  ) {
-    ids.add(record.protection_subject);
-  }
-  return ids;
+  return records.some((record) => agentRecordAttributionIds(record).has(agentId));
 }
 
 /**

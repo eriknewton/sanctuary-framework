@@ -361,6 +361,46 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
     });
   });
 
+  it("resolves macOS signed protection subjects to the wrapped id in concierge recent-activity lines", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const storage = new MemoryStorage();
+      const masterKey = randomBytes(32);
+      const auditLog = new AuditLog(storage, masterKey);
+      const fortressId = "fortress:test";
+      const identityId = "operator-macos-prod";
+      const protectionSubject = subjectForUid(fortressId, 503);
+      const record = makeLocalAgent({
+        agent_id: "agent-macos-prod",
+        identity_id: identityId,
+        protection_subject: protectionSubject,
+      });
+      writePersistedLocalAgents(storagePath, [record]);
+
+      const signed = signedMacOSEgressEntry({ fortressId, uid: 503 });
+      await auditLog.appendCritical(signed);
+      await auditLog.flush();
+
+      const { selector, captured } = makeCapturingSelector();
+      const bindings = buildV11Bindings({
+        identityId,
+        fortressId,
+        storagePath,
+        auditLog,
+        storage,
+        masterKey,
+        intelligenceSelector: selector,
+        pinnedProducerKeyB64url: producerPubB64,
+      });
+
+      await bindings.operatorChatService!.sendConcierge("show recent activity");
+
+      expect(captured.context).toContain(
+        "2026-07-20T10:20:00.000Z  l1.egress_blocked  agent=agent-macos-prod  result=success",
+      );
+      expect(captured.context).not.toContain(`agent=${protectionSubject}`);
+    });
+  });
+
   it("does not invent a wrapped id for unmatched macOS signed protection subjects", async () => {
     await withTmpFortress(async (storagePath) => {
       const storage = new MemoryStorage();
@@ -401,6 +441,45 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
           limit: 10,
         });
       expect(filteredByUnmatchedWrappedId).toHaveLength(0);
+    });
+  });
+
+  it("renders unmatched macOS signed protection subjects raw in concierge recent-activity lines", async () => {
+    await withTmpFortress(async (storagePath) => {
+      const storage = new MemoryStorage();
+      const masterKey = randomBytes(32);
+      const auditLog = new AuditLog(storage, masterKey);
+      const fortressId = "fortress:test";
+      const protectionSubject = subjectForUid(fortressId, 503);
+      const identityId = protectionSubject;
+      const unrelatedRecord = makeLocalAgent({
+        agent_id: "agent-forged-label",
+        identity_id: identityId,
+        protection_subject: subjectForUid(fortressId, 777),
+      });
+      writePersistedLocalAgents(storagePath, [unrelatedRecord]);
+
+      const signed = signedMacOSEgressEntry({ fortressId, uid: 503 });
+      await auditLog.appendCritical(signed);
+      await auditLog.flush();
+
+      const { selector, captured } = makeCapturingSelector();
+      const bindings = buildV11Bindings({
+        identityId,
+        fortressId,
+        storagePath,
+        auditLog,
+        storage,
+        masterKey,
+        intelligenceSelector: selector,
+        pinnedProducerKeyB64url: producerPubB64,
+      });
+
+      await bindings.operatorChatService!.sendConcierge("show recent activity");
+      expect(captured.context).toContain(
+        `2026-07-20T10:20:00.000Z  l1.egress_blocked  agent=${protectionSubject}  result=success`,
+      );
+      expect(captured.context).not.toContain("agent=agent-forged-label");
     });
   });
 });
