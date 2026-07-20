@@ -12,8 +12,18 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import type { AuditEntry } from "../../../src/operational/audit-log.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+} from "../../../src/castle-wall/constants.js";
 import {
   EnforcementExporter,
   EnforcementExportStreamer,
@@ -34,8 +44,56 @@ import {
   type ExportCursorStore,
   type VerifiedChainSource,
 } from "../../../src/castle-wall/export/index.js";
+import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 
 // ── Test doubles ──────────────────────────────────────────────────────────────
+
+const PRODUCER_PRIV = ed25519.utils.randomPrivateKey();
+const PRODUCER_PUB_B64 = toBase64url(ed25519.getPublicKey(PRODUCER_PRIV));
+const SIGNED_AT_MS = 1_777_777_777_777;
+const SUBJECT_FORTRESS_ID = "fortress:test";
+const CLAUDE_AGENT_SUBJECT = `${SUBJECT_FORTRESS_ID}/uid-503`;
+const SIGNED_MAP_OPTIONS = {
+  pinnedProducerKeyB64url: PRODUCER_PUB_B64,
+  subjectFortressId: SUBJECT_FORTRESS_ID,
+};
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function withProducerSignature(entry: AuditEntry, identityId: string): AuditEntry {
+  const seq = typeof entry.details?.seq === "number" ? entry.details.seq : 31;
+  const body = JSON.stringify({
+    timestamp: entry.timestamp,
+    layer: entry.layer,
+    operation: entry.operation,
+    identity_id: identityId,
+    result: entry.result,
+    details: entry.details ?? {},
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, SIGNED_AT_MS, seq),
+    PRODUCER_PRIV,
+  );
+  return {
+    ...entry,
+    identity_id: identityId,
+    details: {
+      ...(entry.details ?? {}),
+      seq,
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: SIGNED_AT_MS,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+        CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    },
+  };
+}
 
 /**
  * A deterministic synthetic chain hash for a sequence. The fake chain is
@@ -87,16 +145,17 @@ function egressDeny(seq: number, host: string, extra: Record<string, unknown> = 
   sequence: number;
   entry: AuditEntry;
 } {
+  const entry: AuditEntry = {
+    timestamp: `2026-07-10T00:00:0${seq}.000Z`,
+    layer: "l1",
+    operation: "egress_blocked",
+    identity_id: CLAUDE_AGENT_SUBJECT,
+    result: "failure",
+    details: { destination: { host, port: 443, protocol: "tcp" }, rule_id: `rule-${seq}`, ...extra },
+  };
   return {
     sequence: seq,
-    entry: {
-      timestamp: `2026-07-10T00:00:0${seq}.000Z`,
-      layer: "l1",
-      operation: "egress_blocked",
-      identity_id: "system",
-      result: "success",
-      details: { destination: { host, port: 443, protocol: "tcp" }, rule_id: `rule-${seq}`, ...extra },
-    },
+    entry: withProducerSignature(entry, CLAUDE_AGENT_SUBJECT),
   };
 }
 
@@ -180,6 +239,7 @@ describe("durable cursor resumes after a mid-run crash", () => {
       audit: audit1,
       batchSize: 2,
       maxRetries: 0, // fail fast on the crash
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: noSleep,
     });
 
@@ -201,6 +261,7 @@ describe("durable cursor resumes after a mid-run crash", () => {
         run2Audits.push({ op, result, details });
       },
       batchSize: 2,
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: noSleep,
     });
     const outcome = await streamer2.runOnce(chainSource(chain));
@@ -231,6 +292,7 @@ describe("durable cursor resumes after a mid-run crash", () => {
         audits.push({ op, result, details });
       },
       batchSize: 10,
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: noSleep,
     });
     const outcome = await streamer.runOnce(chainSource(chain));
@@ -257,6 +319,7 @@ describe("durable cursor resumes after a mid-run crash", () => {
       audit: async (op, details, result) => {
         audits.push({ op, result, details });
       },
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: noSleep,
     });
     await streamer.runOnce(chainSource(chain));
@@ -289,6 +352,7 @@ describe("cursor tamper defenses: refuse-or-reset LOUD, never silently blind", (
       },
       warn: (m) => warns.push(m),
       batchSize: 10,
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: noSleep,
     });
     return { streamer, lines, audits, warns };
@@ -459,6 +523,7 @@ describe("bounded retry then fail closed", () => {
       cursor,
       audit,
       maxRetries: 2, // 3 total attempts
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: noSleep,
     });
 
@@ -504,6 +569,7 @@ describe("bounded retry then fail closed", () => {
       cursor,
       audit,
       maxRetries: 3,
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: noSleep,
     });
     const outcome = await streamer.runOnce(chainSource([egressDeny(0, "a.example")]));

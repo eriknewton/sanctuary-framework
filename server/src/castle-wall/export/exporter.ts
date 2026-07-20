@@ -23,7 +23,10 @@
 
 import type { AuditEntry } from "../../operational/audit-log.js";
 import type { EnforcementEvent } from "./schema.js";
-import { mapEntriesToEnforcementEvents } from "./map.js";
+import {
+  mapEntriesToEnforcementEvents,
+  type EnforcementEventMapOptions,
+} from "./map.js";
 import {
   ENFORCEMENT_EXPORT_EMITTED,
   ENFORCEMENT_EXPORT_ENABLED,
@@ -73,6 +76,11 @@ export interface EnforcementExporterDeps {
    * endpoint in a test.
    */
   fetchImpl?: typeof fetch;
+  /**
+   * Optional read-side attribution verification context for mapping Castle Wall
+   * agent fields from producer-signed evidence.
+   */
+  mapOptions?: EnforcementEventMapOptions;
 }
 
 /** Result of an `enable()` call. */
@@ -188,7 +196,9 @@ export class EnforcementExporter {
    * refusal and RE-THROWS (never falls back, never silently drops).
    */
   async exportEntries(entries: readonly AuditEntry[]): Promise<ExportOutcome> {
-    return this.exportEvents(mapEntriesToEnforcementEvents(entries));
+    return this.exportEvents(
+      mapEntriesToEnforcementEvents(entries, this.deps.mapOptions),
+    );
   }
 
   /** Deliver already-mapped events. See {@link exportEntries}. */

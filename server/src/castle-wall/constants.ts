@@ -157,6 +157,36 @@ export const CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED = "producer_signed" as c
 export const CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED =
   "channel_authenticated_unsigned" as const;
 
+/** WAL-chain sequence key grafted onto persisted details by the audit consumer. */
+export const CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY = "seq" as const;
+
+/** Prior-entry hash key grafted onto persisted details by the audit consumer. */
+export const CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY =
+  "prior_sha256_hex" as const;
+
+/**
+ * Detail keys added by the TypeScript audit consumer outside the producer's
+ * signed canonical body. Read-side row binding strips exactly this set before
+ * comparing the persisted row to the signed body; adding a new writer-added
+ * carrier key requires adding it here, or re-verify fails closed.
+ */
+export const CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS = [
+  // WAL-chain metadata is authenticated by the consumer before persistence and
+  // bound into the producer-signature input, but it is not evidence payload.
+  CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+  CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+  // Signature reconstruction carrier fields. These prove the body; they are
+  // not fields inside the body.
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  // Consumer provenance is stamped after the producer body is accepted.
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+] as const;
+
 /** IPC framing header per scope-lock section 5 (LSP-style). */
 export const CASTLE_WALL_IPC_CONTENT_LENGTH_HEADER = "Content-Length" as const;
 

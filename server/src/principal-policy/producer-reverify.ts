@@ -44,6 +44,10 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
 } from "../castle-wall/constants.js";
 import {
+  parseCastleWallSignedCanonicalBody,
+  signedCanonicalIdentityId,
+} from "../castle-wall/audit-attribution.js";
+import {
   fortressIdFromProtectionSubject,
   isLegacyMacOSAuditTokenHex,
   protectionSubjectFromMacOSAuditToken,
@@ -60,23 +64,11 @@ import {
   verifyBrokerProducerSignature,
   type BrokerProducerSignatureInput,
 } from "../broker-mcp/producer-signature.js";
-
-function parseCastleWallSignedCanonicalBody(
-  details: Record<string, unknown>,
-): Record<string, unknown> | null {
-  const canonical = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
-  if (typeof canonical !== "string") return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(canonical);
-  } catch {
-    return null;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return null;
-  }
-  return parsed as Record<string, unknown>;
-}
+import {
+  verifyProducerSignature,
+  type ProducerSignatureInput,
+  type ProducerSignatureVerdict,
+} from "../castle-wall/runtime/producer-signature.js";
 
 /**
  * The RAW `operation` string the persisted SIGNED canonical body attests to,
@@ -133,35 +125,6 @@ function macOSSubjectFromSignedCanonicalDetails(
   return protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
 }
 
-/**
- * The subject from the persisted SIGNED canonical body.
- *
- * This is the subject authority for a re-verified producer-signed entry. The
- * top-level audit row's `identity_id` is chosen by the in-process writer that
- * appended the row, so a reader must never use it for a producer-signed subject
- * decision after the signature verifies.
- *
- * The reader derives the choice from signed content, not from any persisted
- * detail selector. A canonical `identity_id` for the expected fortress wins. If
- * none is present, a signed macOS audit token in `details.agent_id` can resolve
- * to a subject. Anything else returns null so subject-bound readers fail closed.
- */
-export function signedCanonicalIdentityId(
-  details: Record<string, unknown>,
-  subjectFortressId?: string | null,
-): string | null {
-  const parsed = parseCastleWallSignedCanonicalBody(details);
-  if (parsed === null) return null;
-  const identitySubject = subjectFromSignedCanonicalValue(
-    parsed.identity_id,
-    subjectFortressId,
-  );
-  return (
-    identitySubject ??
-    macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId)
-  );
-}
-
 export type SignedCanonicalSubjectIssue = "pre_canonical_linux_agent_name";
 
 /**
@@ -194,11 +157,6 @@ export function signedCanonicalSubjectIssue(
   }
   return "pre_canonical_linux_agent_name";
 }
-import {
-  verifyProducerSignature,
-  type ProducerSignatureInput,
-  type ProducerSignatureVerdict,
-} from "../castle-wall/runtime/producer-signature.js";
 
 /**
  * The injectable verify function shape — defaults to `verifyProducerSignature`

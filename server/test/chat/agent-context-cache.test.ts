@@ -8,6 +8,7 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 import {
   AgentContextCache,
   buildSnapshot,
@@ -20,8 +21,92 @@ import {
 import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-records.js";
 import type { HubAgentRegistrySource } from "../../src/hub/types.js";
 import type { AuditLog, AuditEntry } from "../../src/operational/audit-log.js";
+import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
+import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+} from "../../src/castle-wall/constants.js";
 
 const NOW = new Date("2026-05-10T15:00:00.000Z").getTime();
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const producerPriv = ed25519.utils.randomPrivateKey();
+const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
+const SIGNED_AT_MS = 1_777_777_777_777;
+const FORTRESS_ID = "fortress:test";
+function subjectForUid(uid: number): string {
+  const subject = protectionSubjectForUid(FORTRESS_ID, uid);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
+}
+const OPENCLAW_SUBJECT = subjectForUid(501);
+const CLINE_SUBJECT = subjectForUid(502);
+const VICTIM_SUBJECT = subjectForUid(503);
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
+function withProducerSignature(
+  entry: AuditEntry,
+  identityId: string,
+): AuditEntry {
+  const seq = typeof entry.details?.seq === "number" ? entry.details.seq : 93;
+  const body = JSON.stringify({
+    timestamp: entry.timestamp,
+    layer: entry.layer,
+    operation: entry.operation,
+    identity_id: identityId,
+    result: entry.result,
+    details: entry.details ?? {},
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, SIGNED_AT_MS, seq),
+    producerPriv,
+  );
+  return {
+    ...entry,
+    identity_id: identityId,
+    details: {
+      ...(entry.details ?? {}),
+      seq,
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: SIGNED_AT_MS,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+        CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    },
+  };
+}
 
 function makeRecord(
   agentId: string,
@@ -86,11 +171,23 @@ function makeStubRegistry(records: LocalAgentRecord[]): HubAgentRegistrySource {
 
 describe("buildSnapshot derivation (Tau-5)", () => {
   it("counts audit + composition + egress events scoped to the agent", () => {
-    const record = makeRecord("OpenClaw", { channel_template_id: "research" });
+    const record = makeRecord("OpenClaw", {
+      channel_template_id: "research",
+      protection_subject: OPENCLAW_SUBJECT,
+    });
     const recentEntries = [
-      makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
-      makeEntry("OpenClaw", "composition_receipt_packed", 30 * 60 * 1000),
-      makeEntry("OpenClaw", "context_gate_filter", 60 * 60 * 1000),
+      withProducerSignature(
+        makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
+        OPENCLAW_SUBJECT,
+      ),
+      withProducerSignature(
+        makeEntry("OpenClaw", "composition_receipt_packed", 30 * 60 * 1000),
+        OPENCLAW_SUBJECT,
+      ),
+      withProducerSignature(
+        makeEntry("OpenClaw", "context_gate_filter", 60 * 60 * 1000),
+        OPENCLAW_SUBJECT,
+      ),
       makeEntry("Cline", "policy_change", 5 * 60 * 1000), // owned by another agent
       makeEntry(null, "system_event", 5 * 60 * 1000), // unscoped
     ];
@@ -99,12 +196,127 @@ describe("buildSnapshot derivation (Tau-5)", () => {
       recentEntries,
       nowMs: NOW,
       verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      },
     });
     expect(snap.recent_audit_count_24h).toBe(3);
     expect(snap.recent_concordia_receipts_count_24h).toBe(1);
     expect(snap.recent_egress_count_24h).toBe(1);
     expect(snap.template).toBe("research");
     expect(snap.recent_verascore_delta_24h).toBeNull();
+  });
+
+  it("does not count forged unsigned Castle Wall evidence for a victim agent", () => {
+    const record = makeRecord("victim-agent-b");
+    const recentEntries: AuditEntry[] = [
+      {
+        timestamp: new Date(NOW - 5 * 60 * 1000).toISOString(),
+        layer: "l1",
+        operation: "egress_blocked",
+        identity_id: "op-1",
+        result: "success",
+        details: {
+          agent_id: "victim-agent-b",
+          dest_host: "evil.example",
+          dest_ip: "203.0.113.55",
+          dest_port: 443,
+          dest_protocol: "tcp",
+        },
+      },
+    ];
+
+    const snap = buildSnapshot({
+      record,
+      recentEntries,
+      nowMs: NOW,
+      verascoreSource: undefined,
+    });
+
+    expect(snap.recent_audit_count_24h).toBe(0);
+    expect(snap.recent_egress_count_24h).toBe(0);
+    expect(snap.current_work_summary).toBeNull();
+  });
+
+  it("counts legitimate producer-signed Castle Wall evidence when attribution context is supplied", () => {
+    const record = makeRecord("victim-agent-b", {
+      protection_subject: VICTIM_SUBJECT,
+    });
+    const signed = withProducerSignature(
+      {
+        timestamp: new Date(NOW - 5 * 60 * 1000).toISOString(),
+        layer: "l1",
+        operation: "egress_blocked",
+        identity_id: VICTIM_SUBJECT,
+        result: "success",
+        details: {
+          agent_id: "victim-agent-b",
+          agent_template: "claude-code",
+          dest_host: "legitimate.example.com",
+          dest_ip: "198.51.100.10",
+          dest_port: 443,
+          dest_protocol: "tcp",
+        },
+      },
+      VICTIM_SUBJECT,
+    );
+
+    const snap = buildSnapshot({
+      record,
+      recentEntries: [signed],
+      nowMs: NOW,
+      verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      },
+    });
+
+    expect(snap.recent_audit_count_24h).toBe(1);
+    expect(snap.recent_egress_count_24h).toBe(1);
+    expect(snap.current_work_summary).toBe("performed egress_blocked");
+  });
+
+  it("counts macOS producer-signed Castle Wall evidence by protection subject", () => {
+    const protectionSubject = protectionSubjectForUid(FORTRESS_ID, 503);
+    expect(protectionSubject).not.toBeNull();
+    const record = makeRecord("victim-agent-b", {
+      protection_subject: protectionSubject!,
+    });
+    const signed = withProducerSignature(
+      {
+        timestamp: new Date(NOW - 5 * 60 * 1000).toISOString(),
+        layer: "l1",
+        operation: "egress_blocked",
+        identity_id: protectionSubject!,
+        result: "success",
+        details: {
+          agent_id: auditTokenForRuid(503),
+          agent_template: "claude-code",
+          dest_host: "legitimate.example.com",
+          dest_ip: "198.51.100.10",
+          dest_port: 443,
+          dest_protocol: "tcp",
+        },
+      },
+      protectionSubject!,
+    );
+
+    const snap = buildSnapshot({
+      record,
+      recentEntries: [signed],
+      nowMs: NOW,
+      verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      },
+    });
+
+    expect(snap.recent_audit_count_24h).toBe(1);
+    expect(snap.recent_egress_count_24h).toBe(1);
+    expect(snap.current_work_summary).toBe("performed egress_blocked");
   });
 
   it("flags 'active' on recent activity, 'idle' on >1h, 'stuck' on harness_error", () => {
@@ -138,30 +350,56 @@ describe("buildSnapshot derivation (Tau-5)", () => {
   });
 
   it("flags has_pending_approvals when an approval-class audit event surfaces for the agent", () => {
-    const record = makeRecord("Cline");
+    const record = makeRecord("Cline", {
+      protection_subject: CLINE_SUBJECT,
+    });
     const recentEntries = [
-      makeEntry("Cline", "approval_request", 10 * 60 * 1000),
+      withProducerSignature(
+        makeEntry("Cline", "approval_request", 10 * 60 * 1000),
+        CLINE_SUBJECT,
+      ),
     ];
     const snap = buildSnapshot({
       record,
       recentEntries,
       nowMs: NOW,
       verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      },
     });
     expect(snap.state_flags).toContain("has_pending_approvals");
   });
 
   it("derives current_work_summary from the most recent audit event", () => {
-    const record = makeRecord("Cline");
+    const record = makeRecord("Cline", {
+      protection_subject: CLINE_SUBJECT,
+    });
     const recentEntries = [
-      makeEntry("Cline", "policy_change", 1 * 60 * 60 * 1000),
-      makeEntry("Cline", "composition_receipt_packed", 5 * 60 * 1000, "failure"),
+      withProducerSignature(
+        makeEntry("Cline", "policy_change", 1 * 60 * 60 * 1000),
+        CLINE_SUBJECT,
+      ),
+      withProducerSignature(
+        makeEntry(
+          "Cline",
+          "composition_receipt_packed",
+          5 * 60 * 1000,
+          "failure",
+        ),
+        CLINE_SUBJECT,
+      ),
     ];
     const snap = buildSnapshot({
       record,
       recentEntries,
       nowMs: NOW,
       verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      },
     });
     expect(snap.current_work_summary).toBe("failed composition_receipt_packed");
   });
@@ -284,16 +522,32 @@ describe("generateProactiveStarter (Tau-5 starter generation)", () => {
 
 describe("AgentContextCache lifecycle (Tau-5)", () => {
   it("refresh aggregates registry + audit-log data into per-agent snapshots", async () => {
-    const records = [makeRecord("OpenClaw"), makeRecord("Cline")];
+    const records = [
+      makeRecord("OpenClaw", { protection_subject: OPENCLAW_SUBJECT }),
+      makeRecord("Cline", { protection_subject: CLINE_SUBJECT }),
+    ];
     const entries = [
-      makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
-      makeEntry("OpenClaw", "composition_receipt_packed", 10 * 60 * 1000),
-      makeEntry("Cline", "approval_request", 5 * 60 * 1000),
+      withProducerSignature(
+        makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
+        OPENCLAW_SUBJECT,
+      ),
+      withProducerSignature(
+        makeEntry("OpenClaw", "composition_receipt_packed", 10 * 60 * 1000),
+        OPENCLAW_SUBJECT,
+      ),
+      withProducerSignature(
+        makeEntry("Cline", "approval_request", 5 * 60 * 1000),
+        CLINE_SUBJECT,
+      ),
     ];
     const cache = new AgentContextCache({
       identityId: "op-1",
       agentRegistry: makeStubRegistry(records),
       auditLog: makeStubAuditLog(entries),
+      resolveAuditAttribution: () => ({
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      }),
       clock: () => NOW,
     });
     const snaps = await cache.refresh();

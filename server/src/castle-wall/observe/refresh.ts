@@ -192,6 +192,13 @@ export interface RefreshDeps {
   /** Mutual exclusion across concurrent refreshes (Codex gate BLOCKER; see {@link RefreshLock}). */
   lock: RefreshLock;
   now: Date;
+  /**
+   * Pinned Castle Wall audit-producer key for read-side attribution. Without a
+   * key, attribution-sensitive rows do not fold into observe candidates.
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /** Local fortress id needed to resolve macOS signed audit-token subjects. */
+  subjectFortressId?: string | null;
 }
 
 export type RefreshOutcome =
@@ -447,7 +454,10 @@ async function runRefresh(deps: RefreshDeps): Promise<RefreshOutcome> {
       ) {
         lastReviewSequence = sequence;
       }
-      const event = flowEventFromAuditEntry(entry);
+      const event = flowEventFromAuditEntry(entry, {
+        pinnedProducerKeyB64url: deps.pinnedProducerKeyB64url ?? null,
+        subjectFortressId: deps.subjectFortressId ?? null,
+      });
       if (event) events.push({ sequence, event });
     },
     reset: () => {

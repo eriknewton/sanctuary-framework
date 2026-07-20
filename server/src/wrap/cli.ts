@@ -3511,6 +3511,11 @@ export async function runWrap(
       stopTransientCastleWallDaemonForAutoProvision,
     );
     renderAutoProvisionOutcome(autoProvisionSummary);
+    bestEffortUpsertLocalAgentProtectionSubject({
+      storagePath,
+      record: localAgentRecord,
+      autoProvisionSummary,
+    });
     const castleWallProtectionClaim = await resolveWrapProtectionClaim({
       auditLog: ndAuditLog,
       auditStorage: ndAuditStorage,
@@ -3821,6 +3826,11 @@ export async function runWrap(
     stopTransientCastleWallDaemonForAutoProvision,
   );
   renderAutoProvisionOutcome(autoProvisionSummary);
+  bestEffortUpsertLocalAgentProtectionSubject({
+    storagePath,
+    record: localAgentRecord,
+    autoProvisionSummary,
+  });
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 
@@ -4860,6 +4870,41 @@ function buildLocalAgentRecord(input: {
       can_change_template: true,
     },
   };
+}
+
+function withProtectionSubjectAlias(
+  record: LocalAgentRecord,
+  protectionSubject: string | null,
+): LocalAgentRecord {
+  return protectionSubject === null
+    ? record
+    : { ...record, protection_subject: protectionSubject };
+}
+
+function bestEffortUpsertLocalAgentProtectionSubject(input: {
+  storagePath: string;
+  record: LocalAgentRecord;
+  autoProvisionSummary: AutoProvisionSummary;
+}): void {
+  const fortressId = fortressIdFromStoragePath(input.storagePath);
+  const protectionSubject = protectionSubjectFromAutoProvisionSummary(
+    input.autoProvisionSummary,
+    fortressId,
+  );
+  if (protectionSubject === null) return;
+  try {
+    upsertPersistedLocalAgent(
+      input.storagePath,
+      withProtectionSubjectAlias(input.record, protectionSubject),
+    );
+  } catch (err) {
+    // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
+    console.error(
+      `  Note: hub agent protection subject not persisted ` +
+        `(${(err as Error).message}). ` +
+        `Recent macOS Castle Wall activity may not correlate to this agent until wrap is rerun.`,
+    );
+  }
 }
 
 async function recordWrapWorkloadRegistration(input: {

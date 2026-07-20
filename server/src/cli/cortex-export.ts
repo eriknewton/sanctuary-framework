@@ -25,6 +25,7 @@
  * is unit-testable hermetically -- no real `~/.sanctuary`, no real network.
  */
 
+import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -46,6 +47,7 @@ import {
   FileExportCursorStore,
   readExportConfig,
   stdoutLineWriter,
+  type EnforcementEventMapOptions,
   type EnforcementExportConfig,
   type ExportApprover,
   type ExportAudit,
@@ -54,6 +56,7 @@ import {
   type StreamRunOutcome,
   type VerifiedChainSource,
 } from "../castle-wall/export/index.js";
+import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
 
 export interface CortexExportCommandArgs {
   argv: string[];
@@ -160,6 +163,8 @@ export interface ExportPipelineDeps {
   fileWriter?: LineWriter;
   /** Injected fetch for the http sink (real `fetch` in production; mocked in tests). */
   fetchImpl?: typeof fetch;
+  /** Read-side attribution verification context for mapped Castle Wall rows. */
+  mapOptions?: EnforcementEventMapOptions;
   /** Batch size / retry budget forwarded to the streamer. */
   batchSize?: number;
   maxRetries?: number;
@@ -178,6 +183,7 @@ export async function runExportPipeline(deps: ExportPipelineDeps): Promise<Expor
     audit: deps.audit,
     ...(deps.fileWriter ? { fileWriter: deps.fileWriter } : {}),
     ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    ...(deps.mapOptions ? { mapOptions: deps.mapOptions } : {}),
   });
 
   const enable = await exporter.enable();
@@ -189,6 +195,7 @@ export async function runExportPipeline(deps: ExportPipelineDeps): Promise<Expor
     exporter,
     cursor: deps.cursor,
     audit: deps.audit,
+    ...(deps.mapOptions ? { mapOptions: deps.mapOptions } : {}),
     ...(deps.batchSize !== undefined ? { batchSize: deps.batchSize } : {}),
     ...(deps.maxRetries !== undefined ? { maxRetries: deps.maxRetries } : {}),
     ...(deps.retryBackoffMs !== undefined ? { retryBackoffMs: deps.retryBackoffMs } : {}),
@@ -293,6 +300,11 @@ function resolveFortressArg(fortress: string | undefined, env: NodeJS.ProcessEnv
   return isAbsolute(fortress) ? fortress : resolve(process.cwd(), fortress);
 }
 
+function fortressIdForAttribution(storagePath: string): string {
+  const digest = createHash("sha256").update(storagePath).digest("hex");
+  return `fortress-${digest.slice(0, 16)}`;
+}
+
 export async function runCortexExportCommand(args: CortexExportCommandArgs): Promise<number> {
   const argv = args.argv;
   const out = args.out ?? process.stdout;
@@ -360,6 +372,19 @@ async function cmdRun(
     // Present-but-invalid cortex-export.json throws here (fail closed). A missing
     // file means the safe default: local file sink, no network, no approval.
     const exportConfig = await readExportConfig(config.storage_path);
+    const producerKeyLoad = await loadFortressProducerKey(config.storage_path);
+    if (producerKeyLoad.status === "unreadable") {
+      write(
+        err,
+        `Error: Castle Wall audit producer key is unavailable (${producerKeyLoad.reason}); refusing to export unverifiable agent attribution.\n`,
+      );
+      return 1;
+    }
+    const mapOptions: EnforcementEventMapOptions = {
+      pinnedProducerKeyB64url:
+        producerKeyLoad.status === "present" ? producerKeyLoad.keyB64url : null,
+      subjectFortressId: fortressIdForAttribution(config.storage_path),
+    };
 
     // A best-effort local audit append (a failed audit never blocks the operator
     // verb; the export lifecycle is recorded on a best-effort basis, same posture
@@ -400,6 +425,7 @@ async function cmdRun(
       source: auditLog,
       cursor,
       fileWriter,
+      mapOptions,
       // Real fetch for the http sink; the sink is only ever armed behind the gate.
       fetchImpl: fetch,
     });

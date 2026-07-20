@@ -18,9 +18,21 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
+import type { AuditEntry } from "../../src/operational/audit-log.js";
+import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+} from "../../src/castle-wall/constants.js";
 import {
   HUB_AGENT_CONTROL_ACTIONS,
   HUB_API_PREFIX,
@@ -62,6 +74,46 @@ import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 
 const IDENTITY_ID = "operator-test-001";
 const FORTRESS_ID = "fortress-test-001";
+const PRODUCER_PRIV = ed25519.utils.randomPrivateKey();
+const PRODUCER_PUB_B64 = toBase64url(ed25519.getPublicKey(PRODUCER_PRIV));
+const SIGNED_AT_MS = 1_777_777_777_777;
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function withProducerSignature(entry: AuditEntry, identityId: string): AuditEntry {
+  const seq = typeof entry.details?.seq === "number" ? entry.details.seq : 31;
+  const body = JSON.stringify({
+    timestamp: entry.timestamp,
+    layer: entry.layer,
+    operation: entry.operation,
+    identity_id: identityId,
+    result: entry.result,
+    details: entry.details ?? {},
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, SIGNED_AT_MS, seq),
+    PRODUCER_PRIV,
+  );
+  return {
+    ...entry,
+    identity_id: identityId,
+    details: {
+      ...(entry.details ?? {}),
+      seq,
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: SIGNED_AT_MS,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+        CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    },
+  };
+}
 
 function makeAgent(
   overrides: Partial<LocalAgentRecord> = {},
@@ -275,6 +327,8 @@ interface RigOptions {
   authConfig?: AuthConfig;
   policySummaries?: HubPolicySummary[];
   budgetSummaries?: HubBudgetSummary[];
+  pinnedProducerKeyB64url?: string | null;
+  subjectFortressId?: string | null;
 }
 
 async function startRig(options: RigOptions = {}): Promise<TestRig> {
@@ -293,7 +347,12 @@ async function startRig(options: RigOptions = {}): Promise<TestRig> {
     fortressId: FORTRESS_ID,
     agentRegistry: registry,
     inboxSources: makeInboxSources(inboxState),
-    activitySources: { auditLog, identityId: IDENTITY_ID },
+    activitySources: {
+      auditLog,
+      identityId: IDENTITY_ID,
+      pinnedProducerKeyB64url: options.pinnedProducerKeyB64url ?? null,
+      subjectFortressId: options.subjectFortressId ?? FORTRESS_ID,
+    },
     policyBudgetSources: {
       listPolicySummaries: () => policySummaries,
       listBudgetSummaries: () => budgetSummaries,
@@ -837,7 +896,7 @@ describe("Hub agent control endpoints (Test 4)", () => {
     );
     expect(engaged).toBeDefined();
     expect(engaged!.category).toBe("lifecycle");
-    expect(engaged!.agent_id).toBe("agent-alpha");
+    expect(engaged!.agent_id).toBeUndefined();
   });
 
   it("Tier 1 unwrap approval emits agent_unwrap_engaged lifecycle activity", async () => {
@@ -991,7 +1050,7 @@ describe("Hub agent control endpoints (Test 4)", () => {
     );
     expect(engaged).toBeDefined();
     expect(engaged!.category).toBe("lifecycle");
-    expect(engaged!.agent_id).toBe("agent-alpha");
+    expect(engaged!.agent_id).toBeUndefined();
   });
 
   it("Tier 1 policy_change denial does NOT emit agent_policy_change_engaged lifecycle activity", async () => {
@@ -1172,7 +1231,12 @@ describe("Hub policy/template bind custody routes require bearer under loopback 
 describe("Hub activity feed pagination (Test 5)", () => {
   let rig: TestRig;
 
-  beforeEach(async () => (rig = await startRig()));
+  beforeEach(async () => {
+    rig = await startRig({
+      pinnedProducerKeyB64url: PRODUCER_PUB_B64,
+      subjectFortressId: FORTRESS_ID,
+    });
+  });
   afterEach(async () => rig.stop());
 
   it("respects since + limit", async () => {
@@ -1225,14 +1289,36 @@ describe("Hub activity feed pagination (Test 5)", () => {
   });
 
   it("filter by agent_id and category narrows results", async () => {
+    const betaSubject = `${FORTRESS_ID}/uid-504`;
+    rig.registry.put(
+      makeAgent({
+        agent_id: "agent-beta",
+        protection_subject: betaSubject,
+      }),
+    );
     await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
       agent_id: "agent-alpha",
     });
     await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
       agent_id: "agent-beta",
     });
-    await rig.auditLog.append("l2", "egress_blocked", IDENTITY_ID, {
-      agent_id: "agent-beta",
+    const signed = withProducerSignature({
+      timestamp: new Date().toISOString(),
+      layer: "l2",
+      operation: "agent_upstream_call",
+      identity_id: "agent-beta",
+      result: "success",
+      details: {
+        agent_id: "agent-beta",
+      },
+    }, betaSubject);
+    await rig.auditLog.appendCritical({
+      timestamp: signed.timestamp,
+      layer: signed.layer,
+      operation: signed.operation,
+      identity_id: signed.identity_id,
+      result: signed.result,
+      details: signed.details,
     });
     await rig.auditLog.flush();
 
@@ -1247,6 +1333,40 @@ describe("Hub activity feed pagination (Test 5)", () => {
     expect(body.data.entries.length).toBe(1);
     expect(body.data.entries[0]!.agent_id).toBe("agent-beta");
     expect(body.data.entries[0]!.category).toBe("egress");
+  });
+
+  it("unsigned unlisted agent rows attribute nothing and stay unfilterable", async () => {
+    await rig.auditLog.append("l2", "zzz_unknown_op", IDENTITY_ID, {
+      agent_id: "victim-agent-b",
+    });
+    await rig.auditLog.flush();
+
+    const all = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?limit=10`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const allBody = (await all.json()) as {
+      ok: true;
+      data: {
+        entries: Array<{
+          agent_id?: string;
+          attestation?: { state: string };
+        }>;
+      };
+    };
+    expect(allBody.data.entries).toHaveLength(1);
+    expect(allBody.data.entries[0]!.agent_id).toBeUndefined();
+    expect(allBody.data.entries[0]!.attestation!.state).toBe("degraded");
+
+    const filtered = await fetch(
+      `${rig.url}${HUB_API_PREFIX}/activity?agent_id=victim-agent-b&limit=10`,
+      { headers: withAuth({}, rig.authToken) },
+    );
+    const filteredBody = (await filtered.json()) as {
+      ok: true;
+      data: { entries: unknown[] };
+    };
+    expect(filteredBody.data.entries).toHaveLength(0);
   });
 });
 

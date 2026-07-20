@@ -68,6 +68,13 @@
  */
 
 import type { AuditLog } from "../operational/audit-log.js";
+import type { AuditEntry } from "../operational/audit-log.js";
+import {
+  auditEntryAgentId,
+  type AuditAttributionOptions,
+  type AuditAttributionOptionsResolver,
+} from "../castle-wall/audit-attribution.js";
+import { agentRecordAttributionIds } from "../hub/agent-attribution.js";
 import type { HubAgentRegistrySource } from "../hub/types.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 
@@ -149,6 +156,8 @@ export interface AgentContextCacheDeps {
   auditLog: AuditLog;
   /** Optional Verascore delta source. When absent, deltas degrade to null. */
   verascoreSource?: VerascoreDeltaSource;
+  /** Optional live Castle Wall producer-key attribution context resolver. */
+  resolveAuditAttribution?: AuditAttributionOptionsResolver;
   /** Hook invoked when a refresh throws. Defaults to a no-op. */
   onRefreshError?: (error: unknown) => void;
   /** Deterministic clock for tests. Defaults to `Date.now`. */
@@ -181,6 +190,9 @@ export class AgentContextCache {
   private readonly agentRegistry: HubAgentRegistrySource;
   private readonly auditLog: AuditLog;
   private readonly verascoreSource: VerascoreDeltaSource | undefined;
+  private readonly resolveAuditAttribution:
+    | AuditAttributionOptionsResolver
+    | undefined;
   private readonly onRefreshError: (error: unknown) => void;
   private readonly clock: () => number;
   private readonly cadenceMs: number;
@@ -196,6 +208,7 @@ export class AgentContextCache {
     this.agentRegistry = deps.agentRegistry;
     this.auditLog = deps.auditLog;
     this.verascoreSource = deps.verascoreSource;
+    this.resolveAuditAttribution = deps.resolveAuditAttribution;
     this.onRefreshError = deps.onRefreshError ?? (() => {});
     this.clock = deps.clock ?? (() => Date.now());
     this.cadenceMs =
@@ -235,9 +248,20 @@ export class AgentContextCache {
         since: sinceIso,
         limit: 500,
       });
-      const ownedRecent = recent.entries.filter(
-        (e) => e.identity_id === this.identityId,
-      );
+      const auditAttribution = this.resolveAuditAttribution
+        ? await this.resolveAuditAttribution()
+        : {};
+      const recordAttributionIds = new Set<string>();
+      for (const record of records) {
+        for (const id of agentRecordAttributionIds(record)) {
+          recordAttributionIds.add(id);
+        }
+      }
+      const ownedRecent = recent.entries.filter((e) => {
+        if (e.identity_id === this.identityId) return true;
+        const agentId = auditEntryAgentId(e, auditAttribution);
+        return agentId !== null && recordAttributionIds.has(agentId);
+      });
 
       const next: AgentContextSnapshot[] = records.map((record) =>
         buildSnapshot({
@@ -245,6 +269,7 @@ export class AgentContextCache {
           recentEntries: ownedRecent,
           nowMs,
           verascoreSource: this.verascoreSource,
+          auditAttribution,
         }),
       );
 
@@ -323,14 +348,10 @@ export class AgentContextCache {
 
 interface BuildSnapshotInputs {
   record: LocalAgentRecord;
-  recentEntries: ReadonlyArray<{
-    timestamp: string;
-    operation: string;
-    result: "success" | "failure";
-    details?: Record<string, unknown>;
-  }>;
+  recentEntries: ReadonlyArray<AuditEntry>;
   nowMs: number;
   verascoreSource: VerascoreDeltaSource | undefined;
+  auditAttribution?: AuditAttributionOptions;
 }
 
 /**
@@ -342,12 +363,10 @@ export function buildSnapshot(
   inputs: BuildSnapshotInputs,
 ): AgentContextSnapshot {
   const { record, recentEntries, nowMs, verascoreSource } = inputs;
+  const recordAttributionIds = agentRecordAttributionIds(record);
   const ownedByAgent = recentEntries.filter((e) => {
-    const agentId =
-      e.details && typeof e.details["agent_id"] === "string"
-        ? (e.details["agent_id"] as string)
-        : null;
-    return agentId === record.agent_id;
+    const agentId = auditEntryAgentId(e, inputs.auditAttribution ?? {});
+    return agentId !== null && recordAttributionIds.has(agentId);
   });
 
   const auditCount = ownedByAgent.length;

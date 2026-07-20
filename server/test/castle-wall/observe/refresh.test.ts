@@ -18,6 +18,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { StateStore } from "../../../src/cognitive/state-store.js";
@@ -25,7 +26,17 @@ import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { createIdentity } from "../../../src/core/identity.js";
 import { derivePurposeKey } from "../../../src/core/key-derivation.js";
-import { CASTLE_WALL_SCHEMA_VERSION_V1 } from "../../../src/castle-wall/constants.js";
+import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  CASTLE_WALL_SCHEMA_VERSION_V1,
+} from "../../../src/castle-wall/constants.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import { ObserveStore } from "../../../src/castle-wall/observe/store.js";
 import {
@@ -46,8 +57,55 @@ interface Harness {
   store: ObserveStore;
   lock: RefreshLock;
   masterKey: Uint8Array;
+  pinnedProducerKeyB64url: string;
   /** Replace the audit log with a brand-new chain on FRESH storage (simulates an audit-store reset/rebuild underneath a persisted observe store). */
   resetAuditChain(): void;
+}
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const producerPriv = ed25519.utils.randomPrivateKey();
+const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
+const SIGNED_AT_MS = 1_777_777_777_777;
+const FORTRESS_ID = "fortress:test";
+const AGENT_1_SUBJECT = `${FORTRESS_ID}/uid-501`;
+let nextSignedSeq = 1;
+
+function signedDetailsFor(input: {
+  timestamp: string;
+  operation: string;
+  identityId: string;
+  result: "success" | "failure";
+  details: Record<string, unknown>;
+}): Record<string, unknown> {
+  const seq = nextSignedSeq++;
+  const body = JSON.stringify({
+    timestamp: input.timestamp,
+    layer: "l1",
+    operation: input.operation,
+    identity_id: input.identityId,
+    result: input.result,
+    details: input.details,
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, SIGNED_AT_MS, seq),
+    producerPriv,
+  );
+  return {
+    ...input.details,
+    seq,
+    [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+    [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+      CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+    [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+    [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: SIGNED_AT_MS,
+    [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+      CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  };
 }
 
 function makeHarness(): Harness {
@@ -66,6 +124,7 @@ function makeHarness(): Harness {
     store,
     lock: inProcessRefreshLock(),
     masterKey,
+    pinnedProducerKeyB64url: producerPubB64,
     resetAuditChain() {
       harness.auditLog = new AuditLog(new MemoryStorage(), masterKey);
     },
@@ -98,26 +157,34 @@ async function appendBlocked(
     timestamp?: string;
   } = {},
 ): Promise<void> {
+  const timestamp = overrides.timestamp ?? new Date().toISOString();
+  const details = {
+    agent: { id: "agent-1", template: overrides.template ?? "claude-code" },
+    destination: {
+      ...(overrides.host !== undefined
+        ? overrides.host === null
+          ? {}
+          : { host: overrides.host }
+        : { host: "api.example.com" }),
+      ip: overrides.ip ?? "203.0.113.5",
+      port: overrides.port ?? 443,
+      protocol: overrides.protocol ?? "tcp",
+      hostname_source: "sni",
+    },
+  };
   await auditLog.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "castle-wall-daemon",
+    identity_id: AGENT_1_SUBJECT,
     result: "failure",
-    ...(overrides.timestamp !== undefined ? { timestamp: overrides.timestamp } : {}),
-    details: {
-      agent: { id: "agent-1", template: overrides.template ?? "claude-code" },
-      destination: {
-        ...(overrides.host !== undefined
-          ? overrides.host === null
-            ? {}
-            : { host: overrides.host }
-          : { host: "api.example.com" }),
-        ip: overrides.ip ?? "203.0.113.5",
-        port: overrides.port ?? 443,
-        protocol: overrides.protocol ?? "tcp",
-        hostname_source: "sni",
-      },
-    },
+    timestamp,
+    details: signedDetailsFor({
+      timestamp,
+      operation: "egress_blocked",
+      identityId: AGENT_1_SUBJECT,
+      result: "failure",
+      details,
+    }),
   });
 }
 
@@ -138,21 +205,30 @@ async function appendBlockedFlat(
     template?: string;
   } = {},
 ): Promise<void> {
+  const timestamp = new Date().toISOString();
+  const details = {
+    agent_id: "agent-1",
+    agent_template: overrides.template ?? "claude-code",
+    ...(overrides.host === null ? {} : { dest_host: overrides.host ?? "api.example.com" }),
+    dest_ip: overrides.ip ?? "203.0.113.5",
+    dest_port: overrides.port ?? 443,
+    dest_protocol: overrides.protocol ?? "tcp",
+    opaque: false,
+    decision_provenance: "default_deny",
+  };
   await auditLog.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "castle-wall-daemon",
+    identity_id: AGENT_1_SUBJECT,
     result: "failure",
-    details: {
-      agent_id: "agent-1",
-      agent_template: overrides.template ?? "claude-code",
-      ...(overrides.host === null ? {} : { dest_host: overrides.host ?? "api.example.com" }),
-      dest_ip: overrides.ip ?? "203.0.113.5",
-      dest_port: overrides.port ?? 443,
-      dest_protocol: overrides.protocol ?? "tcp",
-      opaque: false,
-      decision_provenance: "default_deny",
-    },
+    timestamp,
+    details: signedDetailsFor({
+      timestamp,
+      operation: "egress_blocked",
+      identityId: AGENT_1_SUBJECT,
+      result: "failure",
+      details,
+    }),
   });
 }
 
@@ -178,6 +254,8 @@ async function refresh(harness: Harness, rules: AllowlistRule[] = []) {
     readAllowlist: verifiedAllowlist(rules),
     lock: harness.lock,
     now: new Date("2026-07-14T12:00:00.000Z"),
+    pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
+    subjectFortressId: FORTRESS_ID,
   });
 }
 
@@ -378,7 +456,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   it("round-3 HIGH counterpart: an agent_ids scope suppresses exactly that instance", async () => {
     const harness = makeHarness();
     await appendBlocked(harness.auditLog); // agent-1 / claude-code
-    const instanceRule = { ...allowRule(), scope: { agent_ids: ["agent-1"] } };
+    const instanceRule = { ...allowRule(), scope: { agent_ids: [AGENT_1_SUBJECT] } };
     const outcome = await refresh(harness, [instanceRule]);
     expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
     expect((await harness.store.listCandidates()).size).toBe(0);
@@ -496,7 +574,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   it("#897 finding 2: a macOS default-resolver 'unknown' row and a Linux-daemon 'unknown' row diverge under the SAME allow rule (macOS stays pending, Linux is suppressed)", () => {
     const covering = [{ ...allowRule(), scope: { template_ids: ["unknown"] } }];
     const base = {
-      agent_id: "agent-1",
+      agent_id: AGENT_1_SUBJECT,
       agent_template: "unknown",
       host: "api.example.com",
       ip: "203.0.113.5",
@@ -557,7 +635,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
     // Simulate the pre-watermark engine having refreshed twice (times_seen
     // doubled to 4), with no watermark record.
     await harness.store.putCandidate({
-      agent_id: "agent-1",
+      agent_id: AGENT_1_SUBJECT,
       agent_template: "claude-code",
       host: "api.example.com",
       ip: "203.0.113.5",
@@ -581,7 +659,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
     // Store holds a candidate, but the audit chain has no matching entries
     // (fully pruned): the recompute folds nothing and must leave it alone.
     await harness.store.putCandidate({
-      agent_id: "agent-1",
+      agent_id: AGENT_1_SUBJECT,
       agent_template: "claude-code",
       host: "aged-out.example.com",
       ip: "203.0.113.77",
@@ -705,7 +783,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
     // inflated count. Present rows heal from full retained history.
     await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
     await harness.store.putCandidate({
-      agent_id: "agent-1",
+      agent_id: AGENT_1_SUBJECT,
       agent_template: "claude-code",
       host: "api.example.com",
       ip: "203.0.113.5",
@@ -735,19 +813,27 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
         onEntry: (item: { sequence: number; entry_hash: string; entry: unknown }) => void;
       }): Promise<void> {
         for (const sequence of [6, 7]) {
+          const timestamp = `2026-07-14T10:0${sequence}:00.000Z`;
+          const details = {
+            agent: { id: "agent-1", template: "claude-code" },
+            destination: { host: "pruned.example.net", ip: "198.51.100.9", port: 443, protocol: "tcp", hostname_source: "sni" },
+          };
           consumer.onEntry({
             sequence,
             entry_hash: `hash-${sequence}`,
             entry: {
-              timestamp: `2026-07-14T10:0${sequence}:00.000Z`,
+              timestamp,
               layer: "l1",
               operation: "egress_blocked",
-              identity_id: "castle-wall-daemon",
+              identity_id: AGENT_1_SUBJECT,
               result: "failure",
-              details: {
-                agent: { id: "agent-1", template: "claude-code" },
-                destination: { host: "pruned.example.net", ip: "198.51.100.9", port: 443, protocol: "tcp", hostname_source: "sni" },
-              },
+              details: signedDetailsFor({
+                timestamp,
+                operation: "egress_blocked",
+                identityId: AGENT_1_SUBJECT,
+                result: "failure",
+                details,
+              }),
             },
           });
         }
@@ -765,6 +851,8 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
       readAllowlist: verifiedAllowlist([]),
       lock: harness.lock,
       now: new Date("2026-07-14T12:00:00.000Z"),
+      pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
+      subjectFortressId: FORTRESS_ID,
     });
     expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
     expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
@@ -785,6 +873,8 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
         },
       },
       now: new Date("2026-07-14T12:00:00.000Z"),
+      pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
+      subjectFortressId: FORTRESS_ID,
     });
     expect(outcome.status).toBe("refreshed");
     expect((await onlyCandidate(harness.store)).times_seen).toBe(1);
