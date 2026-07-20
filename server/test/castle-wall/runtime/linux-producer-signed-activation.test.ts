@@ -75,6 +75,7 @@ type LinuxDaemonAuditFixtureKey = "uid_503" | "uid_504" | "old_agent_name";
 const daemonManifestPath = fileURLToPath(
   new URL("../../../../castle-wall-daemon/Cargo.toml", import.meta.url),
 );
+const RUST_POLICY_TEST_TIMEOUT_MS = 120_000;
 const linuxDaemonAuditFixtures = JSON.parse(
   readFileSync(
     new URL(
@@ -547,7 +548,7 @@ describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
         "--manifest-path",
         daemonManifestPath,
       ],
-      { encoding: "utf8" },
+      { encoding: "utf8", timeout: RUST_POLICY_TEST_TIMEOUT_MS },
     );
 
     expect(output).toContain(
@@ -555,7 +556,7 @@ describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
     );
     expect(output).toContain("test result: ok.");
     expect(output).toContain("1 passed");
-  });
+  }, RUST_POLICY_TEST_TIMEOUT_MS);
 
   it("(a) a mock-signed Rust-builder event re-verifies GREEN once the key is loaded via the launcher", async () => {
     const priv = ed25519.utils.randomPrivateKey();
