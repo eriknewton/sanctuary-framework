@@ -19,6 +19,7 @@
 import { createHash } from "node:crypto";
 
 import type { AuditEntry } from "../operational/audit-log.js";
+import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import type {
   HubActivityFeedEntry,
   HubDisplayTemplateArg,
@@ -28,6 +29,7 @@ import {
   verifiedCastleWallAuditAttribution,
   type AuditAttributionOptions,
 } from "../castle-wall/audit-attribution.js";
+import { publicAgentIdForVerifiedAttribution } from "./agent-attribution.js";
 import type { HubActivitySources } from "./types.js";
 import {
   HUB_ACTIVITY_DEFAULT_LIMIT,
@@ -151,8 +153,12 @@ function buildTemplateArgs(
 function extractAgentIdHint(
   entry: AuditEntry,
   attribution: AuditAttributionOptions,
+  localAgents: ReadonlyArray<LocalAgentRecord>,
 ): string | undefined {
-  return auditEntryAgentId(entry, attribution) ?? undefined;
+  const verifiedSubject = auditEntryAgentId(entry, attribution);
+  return verifiedSubject === null
+    ? undefined
+    : publicAgentIdForVerifiedAttribution(verifiedSubject, localAgents);
 }
 
 /**
@@ -187,8 +193,9 @@ function deriveAttestationState(
 function projectEntry(
   entry: AuditEntry,
   attribution: AuditAttributionOptions,
+  localAgents: ReadonlyArray<LocalAgentRecord>,
 ): HubActivityFeedEntry {
-  const agentIdHint = extractAgentIdHint(entry, attribution);
+  const agentIdHint = extractAgentIdHint(entry, attribution, localAgents);
   const category = categorizeOperation(entry.layer, entry.operation);
   const entryId = `${entry.timestamp}|${entry.operation}|${entry.identity_id}`;
   return {
@@ -219,6 +226,12 @@ async function resolveActivityAttribution(
   };
 }
 
+function listActivityLocalAgents(
+  sources: HubActivitySources,
+): ReadonlyArray<LocalAgentRecord> {
+  return sources.listLocalAgents ? sources.listLocalAgents() : [];
+}
+
 /**
  * Pull a filtered, paginated activity feed projection from the audit log.
  */
@@ -238,6 +251,7 @@ export async function aggregateActivity(
     ...(filter.since !== undefined ? { since: filter.since } : {}),
   });
   const attribution = await resolveActivityAttribution(sources);
+  const localAgents = listActivityLocalAgents(sources);
 
   const projected = queryResult.entries
     .filter(
@@ -245,7 +259,7 @@ export async function aggregateActivity(
         e.identity_id === sources.identityId ||
         verifiedCastleWallAuditAttribution(e, attribution) !== null,
     )
-    .map((entry) => projectEntry(entry, attribution));
+    .map((entry) => projectEntry(entry, attribution, localAgents));
 
   let filtered = projected;
   if (filter.agent_id) {

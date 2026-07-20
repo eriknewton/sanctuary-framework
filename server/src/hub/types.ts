@@ -214,6 +214,11 @@ export interface HubActivitySources {
    * into an unknown-agent state at construction time.
    */
   resolveAuditAttribution?: AuditAttributionOptionsResolver;
+  /**
+   * Optional local agent registry snapshot used to translate verified
+   * protection subjects back to the wrapped agent id for public hub surfaces.
+   */
+  listLocalAgents?: () => LocalAgentRecord[];
 }
 
 // -----------------------------------------------------------------------

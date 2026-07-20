@@ -74,6 +74,7 @@ import {
   type AuditAttributionOptions,
   type AuditAttributionOptionsResolver,
 } from "../castle-wall/audit-attribution.js";
+import { agentRecordAttributionIds } from "../hub/agent-attribution.js";
 import type { HubAgentRegistrySource } from "../hub/types.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 
@@ -445,17 +446,6 @@ export function buildSnapshot(
     recent_verascore_delta_24h: verascore,
     state_flags: orderedFlags,
   };
-}
-
-function agentRecordAttributionIds(record: LocalAgentRecord): Set<string> {
-  const ids = new Set<string>([record.agent_id]);
-  if (
-    typeof record.protection_subject === "string" &&
-    record.protection_subject.length > 0
-  ) {
-    ids.add(record.protection_subject);
-  }
-  return ids;
 }
 
 function deriveCurrentWorkSummary(
