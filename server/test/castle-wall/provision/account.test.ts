@@ -50,8 +50,9 @@ function mockOps(
   const created: Array<{ accountName: string; uid: number; comment: string | undefined; homeDirectory: string }> = [];
   const hardened: string[] = [];
   const deleted: string[] = [];
-  const { initialRecord, uidNames = [], createRecord, createThrowsAfterRecord, ...opsOverrides } = overrides;
+  const { initialRecord, uidNames, createRecord, createThrowsAfterRecord, ...opsOverrides } = overrides;
   let record = initialRecord;
+  let recordAccountName: string | undefined = initialRecord === undefined ? undefined : "sanctuary-hermes";
   return {
     created,
     hardened,
@@ -63,9 +64,11 @@ function mockOps(
     lookupAccountRecord: async () => record,
     canonicalizeHomeDirectory: async (path) => canonicalHome(path),
     highestAssignedUid: async () => 499,
-    lookupAccountNamesByUid: async () => uidNames,
+    lookupAccountNamesByUid: async (uid) =>
+      uidNames ?? (record !== undefined && record.uid === uid && recordAccountName !== undefined ? [recordAccountName] : []),
     createUser: async (accountName, uid, comment, homeDirectory) => {
       created.push({ accountName, uid, comment, homeDirectory });
+      recordAccountName = accountName;
       record =
         createRecord?.(accountName, uid, homeDirectory) ?? {
           uid,
@@ -310,8 +313,39 @@ describe("castle-wall/provision/account", () => {
       expect(ops.hardened).toEqual([]);
     });
 
-    it("refuses an agent-account create whose computed uid collides with a known-live excluded uid", async () => {
-      const ops = mockOps({ highestAssignedUid: async () => 502 });
+    it("checks direct uid observation before the caller-supplied excluded uid backstop", async () => {
+      let uidLookupCalls = 0;
+      const ops = mockOps({
+        highestAssignedUid: async () => 502,
+        lookupAccountNamesByUid: async () => {
+          uidLookupCalls += 1;
+          return [];
+        },
+      });
+      let err: unknown;
+      try {
+        await planAndCreateAccount(
+          {
+            accountName: "sanctuary-hermes-two",
+            ceiling: CEILING,
+            homeDirectory: "/var/sanctuary-agents/two",
+            excludedUids: [503],
+          },
+          ops,
+        );
+      } catch (caught) {
+        err = caught;
+      }
+      expect(uidLookupCalls).toBe(1);
+      expect(err).toBeInstanceOf(AccountProvisionVerificationError);
+      expect(err instanceof Error ? err.message : String(err)).toMatch(/caller-supplied excluded uid set \(503\)/);
+      expect(err instanceof Error ? err.message : String(err)).not.toMatch(/known-live/);
+      expect(ops.created).toEqual([]);
+      expect(ops.hardened).toEqual([]);
+    });
+
+    it("lets the direct uid observation win when an excluded computed uid is actually assigned", async () => {
+      const ops = mockOps({ highestAssignedUid: async () => 502, uidNames: ["Legacy Admin"] });
       await expect(
         planAndCreateAccount(
           {
@@ -322,7 +356,7 @@ describe("castle-wall/provision/account", () => {
           },
           ops,
         ),
-      ).rejects.toThrow(/known-live excluded uid \(503\)/);
+      ).rejects.toThrow(/uid 503.*"Legacy Admin".*UID census is only a candidate-selection input/s);
       expect(ops.created).toEqual([]);
       expect(ops.hardened).toEqual([]);
     });
@@ -440,6 +474,7 @@ describe("castle-wall/provision/account", () => {
 
     it("H2: retries transient post-create record reads before treating the create as failed", async () => {
       let lookupCalls = 0;
+      let uidLookupCalls = 0;
       let record: ServiceAccountRecord | undefined;
       const ops: AccountProvisionOps = {
         lookupAccountUid: async () => record?.uid,
@@ -451,7 +486,10 @@ describe("castle-wall/provision/account", () => {
         },
         canonicalizeHomeDirectory: async (path) => canonicalHome(path),
         highestAssignedUid: async () => 499,
-        lookupAccountNamesByUid: async () => [],
+        lookupAccountNamesByUid: async () => {
+          uidLookupCalls += 1;
+          return uidLookupCalls === 1 ? [] : ["sanctuary-hermes"];
+        },
         createUser: async (_accountName, uid, _comment, homeDirectory) => {
           record = { uid, homeDirectory, userShell: "/usr/bin/false" };
         },
@@ -465,10 +503,41 @@ describe("castle-wall/provision/account", () => {
       );
       expect(result.uid).toBe(500);
       expect(lookupCalls).toBe(4);
+      expect(uidLookupCalls).toBe(2);
+    });
+
+    it("refuses and enters the rollback envelope when a uid gains another holder after create", async () => {
+      let record: ServiceAccountRecord | undefined;
+      let uidLookupCalls = 0;
+      const ops: AccountProvisionOps = {
+        lookupAccountUid: async () => record?.uid,
+        lookupAccountRecord: async () => record,
+        canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+        highestAssignedUid: async () => 499,
+        lookupAccountNamesByUid: async () => {
+          uidLookupCalls += 1;
+          return uidLookupCalls === 1 ? [] : ["sanctuary-hermes", "Legacy Admin"];
+        },
+        createUser: async (_accountName, uid, _comment, homeDirectory) => {
+          record = { uid, homeDirectory, userShell: "/usr/bin/false" };
+        },
+        hardenCreatedUser: async () => {
+          if (record !== undefined) record = { ...record, isHidden: true };
+        },
+      };
+      await expect(
+        planAndCreateAccount(
+          { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+          ops,
+        ),
+      ).rejects.toThrow(/post-create uid-holder check failed.*"Legacy Admin".*rollback deletion NOT attempted/s);
+      expect(uidLookupCalls).toBe(2);
+      expect(record).toEqual(completeRecord(500));
     });
 
     it("H2: retries a transient absent post-create readback before treating the create as failed", async () => {
       let lookupCalls = 0;
+      let uidLookupCalls = 0;
       let record: ServiceAccountRecord | undefined;
       const ops: AccountProvisionOps = {
         lookupAccountUid: async () => record?.uid,
@@ -480,7 +549,10 @@ describe("castle-wall/provision/account", () => {
         },
         canonicalizeHomeDirectory: async (path) => canonicalHome(path),
         highestAssignedUid: async () => 499,
-        lookupAccountNamesByUid: async () => [],
+        lookupAccountNamesByUid: async () => {
+          uidLookupCalls += 1;
+          return uidLookupCalls === 1 ? [] : ["sanctuary-hermes"];
+        },
         createUser: async (_accountName, uid, _comment, homeDirectory) => {
           record = { uid, homeDirectory, userShell: "/usr/bin/false" };
         },
@@ -494,6 +566,7 @@ describe("castle-wall/provision/account", () => {
       );
       expect(result.uid).toBe(500);
       expect(lookupCalls).toBe(3);
+      expect(uidLookupCalls).toBe(2);
     });
 
     it("M-1: a clean absent post-create observation clears any stale read error", async () => {

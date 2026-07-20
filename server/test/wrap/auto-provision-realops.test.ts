@@ -140,6 +140,8 @@ describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix ro
     expect(source).toContain("excludedUids: excludedAgentAccountUids");
     expect(source).toContain("lookupAccountNamesByUid: async (uid: number)");
     expect(source).toContain('[".", "-search", "/Users", "UniqueID", String(uid)]');
+    expect(source).toContain("...(runningAgentUid !== undefined ? [runningAgentUid] : [])");
+    expect(source).not.toContain('accountShapeVerdict !== "verified-dedicated" ? [candidateUid] : []');
   });
 
   it("B4: an execFile maxBuffer overflow is explicit unknown, not a normal exit-1 record absence", () => {
@@ -1355,11 +1357,20 @@ describe("wrap/auto-provision real-ops chokepoint: dscl -search parser (fix roun
     expect(parseDsclSearchAccountNames(twoRecords)).toEqual(["first", "second"]);
   });
 
-  it("returns [] on output with no UniqueID record line (fail-closed: no fabricated name)", () => {
+  it("parses a holder record whose account name contains a space", () => {
+    expect(parseDsclSearchAccountNames("Legacy Admin\t\tUniqueID = (\n    503\n)\n")).toEqual(["Legacy Admin"]);
+  });
+
+  it("returns [] only on empty output", () => {
     expect(parseDsclSearchAccountNames("")).toEqual([]);
-    expect(parseDsclSearchAccountNames("NFSHomeDirectory: /Users/x\n")).toEqual([]);
-    // The value lines inside the parentheses must NOT be mistaken for names.
-    expect(parseDsclSearchAccountNames("    501\n)\n")).toEqual([]);
+  });
+
+  it.each([
+    ["localized attribute name", "Legacy Admin\t\tIdentifiantUnique = (\n    503\n)\n"],
+    ["trailing unmatched line", "eriknewton\t\tUniqueID = (\n    501\n)\nNFSHomeDirectory: /Users/x\n"],
+    ["stray continuation", "    501\n)\n"],
+  ])("throws on %s because unparsed dscl output is not evidence of absence", (_name, stdout) => {
+    expect(() => parseDsclSearchAccountNames(stdout)).toThrow(/Unparsed output is not evidence of absence/);
   });
 });
 

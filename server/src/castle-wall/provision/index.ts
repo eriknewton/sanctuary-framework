@@ -22,6 +22,7 @@ export {
   describeServiceAccountRecord,
   deriveAgentAccountName,
   parseServiceAccountIsHidden,
+  parseDsclOutputWithNoUnparsedResidue,
   planAccountCreate,
   executeAccountProvisionPlan,
   lookupAccountRecordAfterCreate,

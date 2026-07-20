@@ -206,9 +206,9 @@ export function planGateAccountProvision(
  * Probe + plan + execute the gate service account in one call, over injected
  * ops (the real `sysadminctl`/`dscl` side effects are drill-only). Returns the
  * gate account's uid and the plan that produced it. The gate uid MUST differ
- * from both the operator and the agent uid; that separation is enforced by the
- * ceiling plus the excluded-uid refusal above, and re-checked by the arming
- * slice before the gate is registered as a confined principal.
+ * from both the operator and the agent uid; this provisioning path enforces
+ * that with the ceiling plus excluded-uid refusal above, while arming separately
+ * re-checks the gate uid is not the agent uid before registration.
  */
 export async function planAndCreateGateAccount(
   options: GateAccountProvisionOptions,

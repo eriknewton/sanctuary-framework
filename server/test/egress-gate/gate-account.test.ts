@@ -15,6 +15,7 @@ import {
   type GateAccountProvisionOps,
   type GateAccountRecord,
 } from "../../src/egress-gate/gate-account.js";
+import { parseDsclSearchAccountNames } from "../../src/wrap/auto-provision.js";
 
 const AGENT_UID = 502;
 
@@ -41,6 +42,7 @@ function gateOps(input: {
 } {
   const state = {
     record: input.existing,
+    recordName: input.existing === undefined ? undefined as string | undefined : "sanctuary-gate-hermes",
     created: [] as Array<{ name: string; uid: number; home: string }>,
     hardened: [] as string[],
     deleted: [] as string[],
@@ -56,9 +58,11 @@ function gateOps(input: {
     lookupAccountRecord: async () => state.record,
     canonicalizeHomeDirectory: async (path) => canonicalHome(path),
     highestAssignedUid: async () => input.highest ?? 504,
-    lookupAccountNamesByUid: async () => input.uidNames ?? [],
+    lookupAccountNamesByUid: async (uid) =>
+      input.uidNames ?? (state.record !== undefined && state.record.uid === uid && state.recordName !== undefined ? [state.recordName] : []),
     createUser: async (name, uid, _comment, home) => {
       state.created.push({ name, uid, home });
+      state.recordName = name;
       state.record =
         input.create !== undefined
           ? await input.create(name, uid, home)
@@ -228,6 +232,34 @@ describe("egress-gate/gate-account", () => {
         ops,
       ),
     ).rejects.toThrow(/uid 503.*"sanctuary-agent".*UID census is only a candidate-selection input/s);
+    expect(ops.created).toEqual([]);
+    expect(ops.hardened).toEqual([]);
+  });
+
+  it.each([
+    ["space-named holder", "Legacy Admin\t\tUniqueID = (\n    503\n)\n", /"Legacy Admin"/],
+    ["localized attribute residue", "eriknewton\t\tIdentifiantUnique = (\n    503\n)\n", /could not be directly observed as unassigned/],
+  ])("refuses a gate create when dscl search output contains %s", async (_name, searchOut, refusal) => {
+    const ops = gateOps({
+      highest: 502,
+      create: (name, uid, home) => completeGateRecord(uid, home),
+    });
+    const guardedOps: GateAccountProvisionOps = {
+      ...ops,
+      lookupAccountNamesByUid: async () => parseDsclSearchAccountNames(searchOut),
+    };
+    await expect(
+      planAndCreateGateAccount(
+        {
+          agentId: "hermes",
+          agentUid: AGENT_UID,
+          ceiling: 500,
+          homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
+          excludeUids: [501],
+        },
+        guardedOps,
+      ),
+    ).rejects.toThrow(refusal);
     expect(ops.created).toEqual([]);
     expect(ops.hardened).toEqual([]);
   });
@@ -453,6 +485,7 @@ describe("egress-gate/gate-account", () => {
 
   it("H2: retries transient post-create record reads before treating the gate create as failed", async () => {
     let lookupCalls = 0;
+    let uidLookupCalls = 0;
     let record: GateAccountRecord | undefined;
     const ops: GateAccountProvisionOps = {
       lookupAccountUid: async () => record?.uid,
@@ -464,7 +497,10 @@ describe("egress-gate/gate-account", () => {
       },
       canonicalizeHomeDirectory: async (path) => canonicalHome(path),
       highestAssignedUid: async () => 504,
-      lookupAccountNamesByUid: async () => [],
+      lookupAccountNamesByUid: async () => {
+        uidLookupCalls += 1;
+        return uidLookupCalls === 1 ? [] : ["sanctuary-gate-hermes"];
+      },
       createUser: async (_name, uid, _comment, home) => {
         record = { uid, homeDirectory: home, userShell: "/usr/bin/false" };
       },
@@ -478,10 +514,12 @@ describe("egress-gate/gate-account", () => {
     );
     expect(result.uid).toBe(505);
     expect(lookupCalls).toBe(4);
+    expect(uidLookupCalls).toBe(2);
   });
 
   it("H2: retries a transient absent post-create gate readback before treating the create as failed", async () => {
     let lookupCalls = 0;
+    let uidLookupCalls = 0;
     let record: GateAccountRecord | undefined;
     const ops: GateAccountProvisionOps = {
       lookupAccountUid: async () => record?.uid,
@@ -493,7 +531,10 @@ describe("egress-gate/gate-account", () => {
       },
       canonicalizeHomeDirectory: async (path) => canonicalHome(path),
       highestAssignedUid: async () => 504,
-      lookupAccountNamesByUid: async () => [],
+      lookupAccountNamesByUid: async () => {
+        uidLookupCalls += 1;
+        return uidLookupCalls === 1 ? [] : ["sanctuary-gate-hermes"];
+      },
       createUser: async (_name, uid, _comment, home) => {
         record = { uid, homeDirectory: home, userShell: "/usr/bin/false" };
       },
@@ -507,6 +548,7 @@ describe("egress-gate/gate-account", () => {
     );
     expect(result.uid).toBe(505);
     expect(lookupCalls).toBe(3);
+    expect(uidLookupCalls).toBe(2);
   });
 
   it("H1: does NOT delete when rollback cannot observe the record before deletion", async () => {

@@ -162,7 +162,78 @@ export class AccountProvisionVerificationError extends Error {
 export const EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN = true;
 export const EXPECTED_SERVICE_ACCOUNT_SHELL = "/usr/bin/false";
 
-const DSCL_UNIQUE_ID_LIST_LINE_RE = /^\s*(\S+)\s+(-?\d+)\s*$/;
+const DSCL_UNIQUE_ID_LIST_LINE_RE = /^(.+?)\s+(-?\d+)\s*$/;
+
+interface DsclResidueParserResult<T> {
+  readonly value: T;
+  readonly nextLineIndex: number;
+}
+
+type DsclResidueParser<T> = (
+  lines: readonly string[],
+  lineIndex: number,
+) => DsclResidueParserResult<T> | undefined;
+
+function countNonEmptyLines(stdout: string): number {
+  return stdout.split(/\r?\n/).filter((line) => line.trim().length > 0).length;
+}
+
+/**
+ * Parse dscl stdout only when every non-empty line is consumed by the parser.
+ * Unparsed output is not evidence of absence: a search/list result with residue
+ * is unknown DirectoryService state and must fail closed rather than proving a
+ * uid free.
+ */
+export function parseDsclOutputWithNoUnparsedResidue<T>(
+  stdout: string,
+  context: string,
+  parseAt: DsclResidueParser<T>,
+): T[] {
+  const lines = stdout.split(/\r?\n/);
+  const values: T[] = [];
+  const residueLineNumbers: number[] = [];
+  let parsedNonEmptyLines = 0;
+  let totalNonEmptyLines = 0;
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index]!;
+    if (line.trim().length === 0) {
+      index += 1;
+      continue;
+    }
+    totalNonEmptyLines += 1;
+    const parsed = parseAt(lines, index);
+    if (
+      parsed === undefined ||
+      parsed.nextLineIndex <= index ||
+      parsed.nextLineIndex > lines.length
+    ) {
+      residueLineNumbers.push(index + 1);
+      index += 1;
+      continue;
+    }
+    for (let consumedIndex = index; consumedIndex < parsed.nextLineIndex; consumedIndex += 1) {
+      if (lines[consumedIndex]!.trim().length > 0) parsedNonEmptyLines += 1;
+    }
+    values.push(parsed.value);
+    index = parsed.nextLineIndex;
+  }
+
+  if (residueLineNumbers.length > 0) {
+    const shown = residueLineNumbers.slice(0, 8).join(", ");
+    const suffix = residueLineNumbers.length > 8 ? `, +${residueLineNumbers.length - 8} more` : "";
+    throw new AccountUidEnumerationError(
+      `Refusing to trust ${context}: dscl output returned ${totalNonEmptyLines} non-empty ` +
+        `line${totalNonEmptyLines === 1 ? "" : "s"}, but only ${parsedNonEmptyLines} parsed/accounted for ` +
+        `(${residueLineNumbers.length} unparsed at line${residueLineNumbers.length === 1 ? "" : "s"} ` +
+        `${shown}${suffix}). Unparsed output is not evidence of absence; repair DirectoryService output ` +
+        `before rerunning.`,
+    );
+  }
+
+  return values;
+}
 
 export interface AccountProvisionRollbackResult {
   readonly message: string;
@@ -256,6 +327,25 @@ export function describeServiceAccountRecord(record: ServiceAccountRecord | unde
   );
 }
 
+interface DsclUidListRecord {
+  readonly accountName: string;
+  readonly uid: number;
+}
+
+function parseDsclUidListRecordAt(
+  lines: readonly string[],
+  lineIndex: number,
+): DsclResidueParserResult<DsclUidListRecord> | undefined {
+  const line = lines[lineIndex]!;
+  if (/^\s/.test(line)) return undefined;
+  const match = DSCL_UNIQUE_ID_LIST_LINE_RE.exec(line);
+  if (match === null) return undefined;
+  const accountName = match[1]!.trimEnd();
+  const uid = Number(match[2]);
+  if (accountName.length === 0 || !Number.isSafeInteger(uid)) return undefined;
+  return { value: { accountName, uid }, nextLineIndex: lineIndex + 1 };
+}
+
 /**
  * Parse `dscl . -list /Users UniqueID` output into the highest visible UID.
  * Negative UIDs are valid on macOS (`nobody -2`) and must parse rather than be
@@ -270,43 +360,23 @@ export function parseHighestAssignedUidFromDsclList(stdout: string, floor: numbe
     throw new AccountUidEnumerationError(`UID enumeration floor must be a safe integer (got ${String(floor)}).`);
   }
 
+  const records = parseDsclOutputWithNoUnparsedResidue(
+    stdout,
+    "dscl . -list /Users UniqueID",
+    parseDsclUidListRecordAt,
+  );
   let highest = floor;
-  let total = 0;
-  let parsed = 0;
   let sawRootUidZero = false;
-  const badLineNumbers: number[] = [];
-  const lines = stdout.split(/\r?\n/);
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]!;
-    if (line.trim().length === 0) continue;
-    total += 1;
-    const match = DSCL_UNIQUE_ID_LIST_LINE_RE.exec(line);
-    const uid = match === null ? Number.NaN : Number(match[2]);
-    if (match === null || !Number.isSafeInteger(uid)) {
-      badLineNumbers.push(index + 1);
-      continue;
-    }
-    parsed += 1;
-    if (match[1] === "root" && uid === 0) sawRootUidZero = true;
-    highest = Math.max(highest, uid);
-  }
-
-  if (badLineNumbers.length > 0) {
-    const shown = badLineNumbers.slice(0, 8).join(", ");
-    const suffix = badLineNumbers.length > 8 ? `, +${badLineNumbers.length - 8} more` : "";
-    throw new AccountUidEnumerationError(
-      `Refusing to choose a service uid: dscl . -list /Users UniqueID returned ${total} non-empty ` +
-        `line${total === 1 ? "" : "s"}, but only ${parsed} parsed as "<account> <uid>" ` +
-        `(${badLineNumbers.length} unparseable at line${badLineNumbers.length === 1 ? "" : "s"} ${shown}${suffix}). ` +
-        `Run /usr/bin/dscl . -list /Users UniqueID locally and repair DirectoryService output before rerunning; ` +
-        `silent UID drops can allocate a new service account onto a live account.`,
-    );
+  for (const record of records) {
+    if (record.accountName === "root" && record.uid === 0) sawRootUidZero = true;
+    highest = Math.max(highest, record.uid);
   }
 
   if (!sawRootUidZero) {
+    const total = countNonEmptyLines(stdout);
     throw new AccountUidEnumerationError(
       `Refusing to choose a service uid: dscl . -list /Users UniqueID returned ${total} non-empty ` +
-        `line${total === 1 ? "" : "s"} and ${parsed} parsed record${parsed === 1 ? "" : "s"}, but did not ` +
+        `line${total === 1 ? "" : "s"} and ${records.length} parsed record${records.length === 1 ? "" : "s"}, but did not ` +
         `include the required macOS local-node root uid record (root 0). ` +
         `Run /usr/bin/dscl . -list /Users UniqueID locally and rerun only after it returns the local root record; ` +
         `an untrusted UID census is not a safe input for service-account allocation.`,
@@ -447,8 +517,8 @@ function assertPlanAvoidsExcludedUids(plan: AccountProvisionPlan, options: Accou
   const excluded = sortedUniqueSafeUids(options.excludedUids);
   if (!excluded.includes(plan.uid)) return;
   throw new AccountProvisionVerificationError(
-    `Refusing to use uid ${plan.uid} for service account "${plan.accountName}": it collides with a known-live ` +
-      `excluded uid (${excluded.join(", ")}). ` +
+    `Refusing to use uid ${plan.uid} for service account "${plan.accountName}": it is in the caller-supplied ` +
+      `excluded uid set (${excluded.join(", ")}). ` +
       serviceAccountConflictGuidance(plan.accountName, {
         homeDirectory: options.homeDirectory,
         ceiling: options.ceiling,
@@ -483,6 +553,36 @@ async function assertCreateUidUnassigned(
     `Refusing to create service account "${plan.accountName}" at uid ${plan.uid}: direct uid lookup found ` +
       `${describeAccountNames(holders)} already assigned to that uid. ` +
       `The UID census is only a candidate-selection input; it is not proof that the candidate uid is unassigned. ` +
+      serviceAccountConflictGuidance(plan.accountName, {
+        homeDirectory: options.homeDirectory,
+        ceiling: options.ceiling,
+        excludedUids: options.excludedUids,
+      }),
+  );
+}
+
+async function assertCreatedUidHeldOnlyByCreatedAccount(
+  plan: Extract<AccountProvisionPlan, { action: "create" }>,
+  options: AccountProvisionOptions,
+  ops: Pick<AccountProvisionOps, "lookupAccountNamesByUid">,
+): Promise<void> {
+  let holders: readonly string[];
+  try {
+    holders = await ops.lookupAccountNamesByUid(plan.uid);
+  } catch (err) {
+    throw new AccountProvisionVerificationError(
+      `post-create uid lookup for service account "${plan.accountName}" at uid ${plan.uid} failed ` +
+        `(${err instanceof Error ? err.message : String(err)})`,
+      { cause: err },
+    );
+  }
+
+  const uniqueHolders = [...new Set(holders)];
+  if (uniqueHolders.length === 1 && uniqueHolders[0] === plan.accountName) return;
+  throw new AccountProvisionVerificationError(
+    `post-create uid lookup for service account "${plan.accountName}" at uid ${plan.uid} found ` +
+      `${uniqueHolders.length === 0 ? "no account names" : describeAccountNames(uniqueHolders)}; ` +
+      `expected only ${JSON.stringify(plan.accountName)}. ` +
       serviceAccountConflictGuidance(plan.accountName, {
         homeDirectory: options.homeDirectory,
         ceiling: options.ceiling,
@@ -566,9 +666,9 @@ export async function executeAccountProvisionPlan(
       })}`,
     );
   }
-  assertPlanAvoidsExcludedUids(plan, options);
   const expected = { uid: plan.uid, homeDirectory: options.homeDirectory };
   if (plan.action === "skip") {
+    assertPlanAvoidsExcludedUids(plan, options);
     const observed = await ops.lookupAccountRecord(plan.accountName);
     const problems = await serviceAccountRecordProblems(observed, expected, ops);
     if (problems.length > 0) {
@@ -581,6 +681,7 @@ export async function executeAccountProvisionPlan(
     return { uid: plan.uid, observed: describeServiceAccountRecord(observed) };
   }
   await assertCreateUidUnassigned(plan, options, ops);
+  assertPlanAvoidsExcludedUids(plan, options);
   // FIX F7: bind NFSHomeDirectory to the re-home target at create time.
   try {
     await ops.createUser(plan.accountName, plan.uid, options.comment, options.homeDirectory);
@@ -589,6 +690,17 @@ export async function executeAccountProvisionPlan(
     const rollback = await rollbackCreatedServiceAccount(ops, plan.accountName, plan.uid);
     throw new AccountProvisionVerificationError(
       `Creating service account "${plan.accountName}" failed ` +
+        `(${err instanceof Error ? err.message : String(err)}). ${rollback.message}. ` +
+        serviceAccountRepairGuidance(plan.accountName, expected),
+      { cause: err },
+    );
+  }
+  try {
+    await assertCreatedUidHeldOnlyByCreatedAccount(plan, options, ops);
+  } catch (err) {
+    const rollback = await rollbackCreatedServiceAccount(ops, plan.accountName, plan.uid);
+    throw new AccountProvisionVerificationError(
+      `Service account "${plan.accountName}" create returned, but the post-create uid-holder check failed ` +
         `(${err instanceof Error ? err.message : String(err)}). ${rollback.message}. ` +
         serviceAccountRepairGuidance(plan.accountName, expected),
       { cause: err },

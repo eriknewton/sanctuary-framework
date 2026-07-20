@@ -78,6 +78,7 @@ import {
   asUidTlsProbeArgv,
   asUidProbeReachableDecision,
   parseHighestAssignedUidFromDsclList,
+  parseDsclOutputWithNoUnparsedResidue,
   parseServiceAccountIsHidden,
   type AgentEgressVerifyReport,
 } from "../castle-wall/provision/index.js";
@@ -756,32 +757,53 @@ async function resolveOperatorIdentity(): Promise<OperatorIdentity | undefined> 
   return { uid: sudoIdentity.uid, gid: sudoIdentity.gid, home };
 }
 
+const DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE = /^(.+?)\s+UniqueID\s*=\s*(.*)$/;
+const DSCL_UNIQUE_ID_VALUE_RE = /^-?\d+$/;
+
+function parseDsclSearchAccountNameAt(
+  lines: readonly string[],
+  lineIndex: number,
+): { readonly value: string; readonly nextLineIndex: number } | undefined {
+  const line = lines[lineIndex]!;
+  if (/^\s/.test(line)) return undefined;
+  const match = DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE.exec(line);
+  if (match === null) return undefined;
+  const accountName = match[1]!.trimEnd();
+  if (accountName.length === 0) return undefined;
+
+  const rawValue = match[2]!.trim();
+  if (DSCL_UNIQUE_ID_VALUE_RE.test(rawValue)) {
+    return { value: accountName, nextLineIndex: lineIndex + 1 };
+  }
+  if (rawValue !== "(") return undefined;
+
+  const values: string[] = [];
+  let cursor = lineIndex + 1;
+  while (cursor < lines.length) {
+    const trimmed = lines[cursor]!.trim();
+    cursor += 1;
+    if (trimmed.length === 0) continue;
+    if (trimmed === ")") {
+      if (values.length !== 1 || !DSCL_UNIQUE_ID_VALUE_RE.test(values[0]!)) return undefined;
+      return { value: accountName, nextLineIndex: cursor };
+    }
+    values.push(trimmed);
+  }
+  return undefined;
+}
+
 /**
- * FIX (round 5, item N4): parse the record names out of `dscl . -search
- * /Users UniqueID <n>` output. `dscl -search` emits the matched attribute in
- * the PARENTHESIZED, multi-line plist form, e.g.
- *
- *   eriknewton\t\tUniqueID = (
- *       501
- *   )
- *
- * The pre-fix parser was `/^(\S+)\s+UniqueID\s*=\s*\d+/m`, which requires the
- * uid digits on the SAME line as `UniqueID =` and therefore NEVER matched the
- * real `= (` form: every uid-fallback home lookup and every
- * `resolveAccountShapeVerdict` account-name check silently missed. This
- * parser matches the record-name line (`name  UniqueID =`) whether the value
- * is parenthesized-multiline or single-line, and returns ALL matched record
- * names (a `-search` can in principle return more than one record). Exported
- * so the seam can drive it against captured real dscl output.
+ * Parse the record names out of `dscl . -search /Users UniqueID <n>` output.
+ * The parser uses the shared no-residue dscl discipline: unparsed output is not
+ * evidence of absence, so non-empty unfamiliar lines throw instead of returning
+ * an empty holder list.
  */
 export function parseDsclSearchAccountNames(stdout: string): string[] {
-  const names: string[] = [];
-  const re = /^(\S+)\s+UniqueID\s*=/gm;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(stdout)) !== null) {
-    names.push(m[1]);
-  }
-  return names;
+  return parseDsclOutputWithNoUnparsedResidue(
+    stdout,
+    "dscl . -search /Users UniqueID <uid>",
+    parseDsclSearchAccountNameAt,
+  );
 }
 
 /** Look up a NFSHomeDirectory by account name (preferred) or uid, via dscl. Fail-closed: any error or unparsed output resolves undefined. */
@@ -992,9 +1014,13 @@ export async function runAutoProvisionForWrap(
     candidateUid !== undefined && candidateUid >= PROVISION_CEILING && candidateUid !== consoleOwnerUid
       ? await resolveAccountShapeVerdict(accountName, candidateUid)
       : undefined;
+  // Caller-supplied excluded uids are a backstop for live identities observed
+  // outside the dscl uid lookup. A stale harness-config uid may be free after
+  // account deletion; the direct uid observation in planAndCreateAccount settles
+  // that instead of treating configured state as known-live.
   const excludedAgentAccountUids = [
     consoleOwnerUid,
-    ...(candidateUid !== undefined && accountShapeVerdict !== "verified-dedicated" ? [candidateUid] : []),
+    ...(runningAgentUid !== undefined ? [runningAgentUid] : []),
   ];
   const detectResult = detectProvisionNeed({
     harnessConfiguredUid,
