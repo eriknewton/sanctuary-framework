@@ -11,6 +11,13 @@
 import { describe, it, expect } from "vitest";
 import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
 import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
+import {
+  assessHarnessParked,
+  startedCoarseDisposition,
+  type HarnessDisposition,
+  type ParkedClaim,
+} from "../../src/egress-gate/parked-claim.js";
+import type { HarnessDaemonStatus } from "../../src/egress-gate/harness-daemon.js";
 
 function lines(summary: AutoProvisionSummary): string[] {
   return renderAutoProvisionOutcomeLines(summary);
@@ -179,7 +186,7 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     });
     expect(out).toHaveLength(1);
     expect(out[0]).toMatch(/^ {2}Note:/);
-    expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
+    expect(out[0]).toMatch(/No files were moved before this stop/);
     expect(out[0]).not.toMatch(/restore of your re-homed files FAILED/);
     expect(out[0]).not.toMatch(/WARNING/);
   });
@@ -211,12 +218,13 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/The dedicated account was created but no files were moved/);
   });
 
-  it("FIX R4-2: a pre-create neutral abort (accountCreated falsy) DOES say 'No dedicated account was created'", () => {
+  it("B1 round 2: a neutral abort with no observed account status does NOT claim no account was created", () => {
     const out = lines({
       ran: true,
       outcome: { kind: "aborted", stage: "root-check", reason: "requires root", rolledBack: false, rehomeAttempted: false },
     });
-    expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
+    expect(out[0]).toMatch(/No files were moved before this stop/);
+    expect(out[0]).not.toMatch(/No dedicated account was created/);
   });
 
   it("FIX R5-2: a restore CONFLICT (conflictPaths set) renders a data-safe Note, surfaces the conflict path, and NEVER says 'restore FAILED' or overwrite-from-backup", () => {
@@ -275,5 +283,103 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/restore of your re-homed files FAILED/);
     expect(out[0]).toContain("/var/root/x.bak");
     expect(out[0]).toContain("/Users/op/.hermes/.env.restored-conflict");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-ROUND 4: the render layer, which had ZERO register rows and ZERO tests
+// for what the operator is told about the agent's run state.
+// ---------------------------------------------------------------------------
+
+/**
+ * The round-4 HIGH printed HERE. `grep -rn "remains parked\|PARKED (not
+ * running)" test/` returned nothing before this block: the barrier gate had
+ * regression tests, and nothing asserted what the operator READS when it
+ * fires. These tests are Claude's E3 probe reproduced end to end -- the
+ * degrade outcome that arises when a live process survived the bootout, driven
+ * through the real render function, asserting on the character stream.
+ */
+describe("wrap/cli: the degrade line never asserts a run state it did not observe", () => {
+  function degradeSummary(harness: HarnessDisposition): AutoProvisionSummary {
+    return {
+      ran: true,
+      outcome: {
+        kind: "exclusive-egress-unarmed-coarse-active",
+        uid: 502,
+        stage: "release",
+        reason:
+          "release barrier parked at stage reassert-parked: the parked state was not asserted: " +
+          "a settled launchd read still reports a pid (9001) for the harness job",
+        coarseCompositionRestored: true,
+        harness,
+        cleanupErrors: [],
+      },
+    };
+  }
+
+  async function claim(status: Partial<HarnessDaemonStatus>): Promise<ParkedClaim> {
+    return assessHarnessParked({
+      probe: {
+        harnessStatus: async (): Promise<HarnessDaemonStatus> => ({
+          known: true,
+          installed: true,
+          running: false,
+          ...status,
+        }),
+        sleepMs: async () => undefined,
+      },
+    });
+  }
+
+  it("a SURVIVING process is never described as parked (the round-4 HIGH)", async () => {
+    // Ground truth: pid 9001 is alive throughout, which is the entire reason
+    // the barrier refused. The pre-fix render said, in the same sentence that
+    // reported the pid: "The agent is PARKED (not running)".
+    const out = lines(
+      degradeSummary({ disposition: "not-started", claim: await claim({ running: true, pid: 9001 }) }),
+    ).join(" ");
+    expect(out).toContain("9001");
+    expect(out).toContain("The agent is RUNNING (pid 9001)");
+    expect(out).not.toContain("PARKED");
+    expect(out).not.toContain("not running");
+    // Still LOUD and still routed to the repair verb.
+    expect(out).toContain("WARNING");
+    expect(out).toContain("--repair-egress-gate");
+  });
+
+  it("an UNKNOWABLE run state is rendered as possibly-running, never as parked", async () => {
+    const out = lines(
+      degradeSummary({ disposition: "not-started", claim: await claim({ known: false }) }),
+    ).join(" ");
+    expect(out).toContain("POSSIBLY RUNNING");
+    expect(out).not.toContain("is PARKED");
+  });
+
+  it("a genuinely stopped agent IS described as parked (the fix is not blanket hedging)", async () => {
+    const out = lines(
+      degradeSummary({ disposition: "not-started", claim: await claim({}) }),
+    ).join(" ");
+    expect(out).toContain("The agent is PARKED (not running)");
+  });
+
+  it("a coarse-started agent is still described as running in coarse-only mode", () => {
+    const out = lines(degradeSummary(startedCoarseDisposition())).join(" ");
+    expect(out).toContain("RUNNING in coarse-only mode");
+    expect(out).not.toContain("PARKED");
+  });
+
+  it("a FAILED coarse restore is reported as a manifest fact, not as a run-state claim", async () => {
+    // The `coarseCompositionRestored: false` sub-case. Pre-fix this printed
+    // "The agent is PARKED (not running) and the manifest could NOT be
+    // restored" -- one clause observed, one invented.
+    const summary = degradeSummary({
+      disposition: "not-started",
+      claim: await claim({ running: true, pid: 9001 }),
+    });
+    (summary.outcome as { coarseCompositionRestored: boolean }).coarseCompositionRestored = false;
+    const out = lines(summary).join(" ");
+    expect(out).toContain("manifest could NOT be restored to coarse scope");
+    expect(out).toContain("The agent is RUNNING (pid 9001)");
+    expect(out).not.toContain("PARKED");
   });
 });

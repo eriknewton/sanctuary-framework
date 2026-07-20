@@ -17,6 +17,8 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+
+import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import { generateKeyPairSync } from "node:crypto";
 
 import {
@@ -74,6 +76,7 @@ function baseInternals(overrides: ExclusiveEgressBootSupervisorInternals = {}): 
     gateWaitIntervalMs: 1,
     loadMarker: async () => null,
     ensureRuntimeFs: async () => undefined,
+    ensureGateHomeLayout: async () => ({ logDir: "/var/sanctuary-agents/sanctuary-gate-hermes/logs" }),
     ...overrides,
   };
 }
@@ -83,6 +86,8 @@ const OK_CTX: BootAgentResolution = {
   agentAccount: "sanctuary-hermes",
   harnessArgv: ["/usr/local/bin/hermes"],
   harnessLogDir: "/var/sanctuary-agents/sanctuary-hermes/logs",
+  gateAccount: "sanctuary-gate-hermes",
+  gateHomeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
   gateUid: 511,
 };
 
@@ -105,7 +110,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H1: no synthetic parked)
     expect(handle.results).toHaveLength(1);
     // Fix-round-2 BLOCKER-1: the parked outcome carries the REAL reassert
     // flags, so a caller can audit exactly what held the park.
-    expect(handle.results[0]!.outcome).toEqual({
+    expect(handle.results[0]!.outcome).toMatchObject({
       kind: "parked",
       reason: expect.stringContaining("no marker for uid 502"),
       holdFileRemoved: true,
@@ -118,6 +123,12 @@ describe("startExclusiveEgressBootSupervisor (fix-round H1: no synthetic parked)
       `launchctl bootout system/${AGENT_HARNESS_DAEMON_LABEL}`,
       "removeHold 502",
       `launchctl disable system/${AGENT_HARNESS_DAEMON_LABEL}`,
+      // Fix-round 4: the contextless re-park was the SEVENTH site claiming
+      // "parked" from control flow -- it reported a park whenever these three
+      // ops resolved. It now settles a launchd read before claiming anything,
+      // and throws to the distinct `park-not-verified` if it does not observe
+      // the job stopped.
+      `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL}`,
     ]);
   });
 
@@ -172,6 +183,13 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
           events.push(`launchctl ${args.join(" ")}`);
           return { code: 0, stdout: "", stderr: "" };
         },
+        ensureRuntimeFs: async () => {
+          events.push("ensureRuntimeFs");
+        },
+        ensureGateHomeLayout: async (input) => {
+          events.push(`ensureGateHomeLayout ${input.gateAccount} ${input.gateUid} ${input.gateHomeDirectory}`);
+          return { logDir: `${input.gateHomeDirectory}/logs` };
+        },
         readRuntimeState: async () => {
           events.push("readRuntimeState");
           return JSON.stringify({ agent_uid: 502, gate_port: 40001, generation_id: 7, pid: 991, pid_start: "991-1000" });
@@ -187,13 +205,95 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     const bootstrapIdx = events.indexOf(
       "launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate.502.plist",
     );
+    const runtimeFsIdx = events.indexOf("ensureRuntimeFs");
+    const homeLayoutIdx = events.indexOf(
+      "ensureGateHomeLayout sanctuary-gate-hermes 511 /var/sanctuary-agents/sanctuary-gate-hermes",
+    );
     const kickIdx = events.indexOf("launchctl kickstart system/ai.sanctuaryprotocol.egress-gate.502");
     const readIdx = events.indexOf("readRuntimeState");
     const barrierIdx = events.indexOf("barrier");
+    expect(runtimeFsIdx).toBeGreaterThanOrEqual(0);
+    expect(homeLayoutIdx).toBeGreaterThan(runtimeFsIdx);
     expect(bootstrapIdx).toBeGreaterThanOrEqual(0);
+    expect(bootstrapIdx).toBeGreaterThan(homeLayoutIdx);
     expect(kickIdx).toBeGreaterThan(bootstrapIdx);
     expect(readIdx).toBeGreaterThan(kickIdx);
     expect(barrierIdx).toBeGreaterThan(readIdx);
+  });
+
+  it("a boot gate-home layout failure logs LOUDLY and forces the release barrier to park fail-closed", async () => {
+    const printed: string[] = [];
+    const audits: Array<{ operation: string; details: Record<string, unknown> }> = [];
+    const barrierEvents: string[] = [];
+    const barrierOps: ReleaseBarrierOps = {
+      bootoutJob: async () => void barrierEvents.push("bootout"),
+      removeHoldFile: async () => void barrierEvents.push("removeHold"),
+      disableJob: async () => void barrierEvents.push("disable"),
+      restoreParkedPlist: async () => void barrierEvents.push("restoreParkedPlist"),
+      rearmAnchor: async () => {
+        barrierEvents.push("rearm");
+        return { ok: true };
+      },
+      verifyGate: async () => {
+        barrierEvents.push("verifyGate");
+        return { ok: true };
+      },
+      commitGeneration: async () => {
+        barrierEvents.push("commit");
+        throw new Error("commit must not run after gate verification fails");
+      },
+      bootSessionUuid: async () => "boot-session",
+      writeHoldFile: async () => {
+        throw new Error("hold file must not be written after gate verification fails");
+      },
+      writeReleasedPlist: async () => {
+        throw new Error("released plist must not be written after gate verification fails");
+      },
+      enableJob: async () => {
+        throw new Error("job must not be enabled after gate verification fails");
+      },
+      bootstrapJob: async () => {
+        throw new Error("harness must not bootstrap after gate verification fails");
+      },
+      harnessStatus: async () => ({ known: true, installed: true, running: false }),
+      sleepMs: async () => undefined,
+    };
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async (operation, details) => void audits.push({ operation, details }),
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        ensureGateHomeLayout: async () => {
+          throw new Error("stale log owner uid=505 expected uid=511");
+        },
+        runBarrier: runReleaseBarrierSequence,
+        createBarrierOps: (() => barrierOps) as never,
+      }),
+    });
+    handle.stopOracleLoop();
+    expect(printed.join("\n")).toContain("gate account home layout assert failed");
+    expect(printed.join("\n")).toContain("stale log owner");
+    expect(printed.join("\n")).toContain("refuse release");
+    expect(printed.join("\n")).toContain("repair-egress-gate");
+    expect(barrierEvents).toEqual(["bootout", "removeHold", "disable", "restoreParkedPlist", "rearm", "verifyGate"]);
+    const layoutAudit = audits.find((entry) => entry.operation === "exclusive_egress_gate_home_layout_failed");
+    expect(layoutAudit?.details).toMatchObject({
+      agent_uid: 502,
+      gate_account: "sanctuary-gate-hermes",
+      gate_uid: 511,
+      gate_home_directory: "/var/sanctuary-agents/sanctuary-gate-hermes",
+      reason: "stale log owner uid=505 expected uid=511",
+      barrier_continues_fail_closed: true,
+    });
+    const outcome = handle.results[0]!.outcome;
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind === "parked") {
+      expect(outcome.reason).toContain("release barrier parked at stage gate-verify");
+      expect(outcome.reason).toContain("gate account home layout assertion failed before release");
+      expect(outcome.reason).toContain("stale log owner uid=505 expected uid=511");
+      expect(outcome.parkedClaim.state).toBe("parked");
+    }
   });
 
   it("a gate bootstrap failure logs LOUDLY and still runs the barrier (which parks fail-closed)", async () => {
@@ -218,6 +318,15 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
             holdFileRemoved: true,
             jobDisabled: true,
             cleanupErrors: [],
+            // Fix-round 4: a parked outcome REQUIRES a run-state claim, and a
+            // claim cannot be hand-rolled -- tests model launchd and let the
+            // real chokepoint classify it, exactly as production does.
+            parkedClaim: await assessHarnessParked({
+              probe: {
+                harnessStatus: async () => ({ known: true, installed: true, running: false }),
+                sleepMs: async () => undefined,
+              },
+            }),
           };
         },
       }),
@@ -344,7 +453,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 BLOCKER-1: throws neve
       internals: baseInternals({ runLaunchctlFn: okLaunchctl(calls), removeHoldFile }),
     });
     handle.stopOracleLoop();
-    expect(handle.results[0]!.outcome).toEqual({
+    expect(handle.results[0]!.outcome).toMatchObject({
       kind: "parked",
       reason: expect.stringContaining("release-context resolver threw: hermes gateway entrypoint not found"),
       holdFileRemoved: true,
@@ -357,6 +466,12 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 BLOCKER-1: throws neve
       `launchctl bootout system/${AGENT_HARNESS_DAEMON_LABEL}`,
       "removeHold 502",
       `launchctl disable system/${AGENT_HARNESS_DAEMON_LABEL}`,
+      // Fix-round 4: the contextless re-park was the SEVENTH site claiming
+      // "parked" from control flow -- it reported a park whenever these three
+      // ops resolved. It now settles a launchd read before claiming anything,
+      // and throws to the distinct `park-not-verified` if it does not observe
+      // the job stopped.
+      `launchctl print system/${AGENT_HARNESS_DAEMON_LABEL}`,
     ]);
   });
 
@@ -610,7 +725,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-1: shared-label s
     expect(stale.outcome.kind).toBe("park-not-verified");
     const reason = (stale.outcome as { reason: string }).reason;
     expect(reason).toContain("uid 502");
-    expect(reason).toContain("RUNNING (pid 4242)");
+    expect(reason).toContain("still reports a pid (4242)");
     expect(reason).toContain("withheld");
     expect(reason).toContain("601");
     // The shared-label ops stayed withheld (never issued for the stale uid).
@@ -694,11 +809,17 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-2: dirty registry
 
 describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-check before release)", () => {
   function mkBarrierOps(commitGen: number): ReleaseBarrierOps {
+    // Stateful (fix-round 3, 2026-07-19): reassert-parked OBSERVES the stop.
+    let running = false;
     return {
       disableJob: async () => undefined,
       enableJob: async () => undefined,
-      bootstrapJob: async () => undefined,
-      bootoutJob: async () => undefined,
+      bootstrapJob: async () => {
+        running = true;
+      },
+      bootoutJob: async () => {
+        running = false;
+      },
       removeHoldFile: async () => undefined,
       writeHoldFile: async () => undefined,
       bootSessionUuid: async () => "ABCDEF01-2345-6789-ABCD-EF0123456789",
@@ -707,7 +828,11 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-c
       commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502 }),
       writeReleasedPlist: async () => undefined,
       restoreParkedPlist: async () => undefined,
-      harnessStatus: async () => ({ known: true, installed: true, running: true, pid: 4242 }),
+      harnessStatus: async () =>
+        running
+          ? { known: true, installed: true, running: true, pid: 4242 }
+          : { known: true, installed: true, running: false },
+      sleepMs: async () => {},
     };
   }
 

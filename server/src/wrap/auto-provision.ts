@@ -29,8 +29,23 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, lstat, readlink, symlink, rm, cp } from "node:fs/promises";
-import { dirname, relative, resolve as pathResolve, sep } from "node:path";
+import {
+  mkdir,
+  rename,
+  copyFile,
+  chmod,
+  chown as fsChown,
+  lchown,
+  access,
+  lstat,
+  readFile,
+  readlink,
+  symlink,
+  rm,
+  cp,
+  realpath,
+} from "node:fs/promises";
+import { basename, dirname, join, normalize as normalizePath, relative, resolve as pathResolve, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
 import {
@@ -62,24 +77,35 @@ import {
   buildAgentEgressReport,
   asUidTlsProbeArgv,
   asUidProbeReachableDecision,
+  parseHighestAssignedUidFromDsclList,
+  parseDsclOutputWithNoUnparsedResidue,
+  parseServiceAccountIsHidden,
+  AccountUidEnumerationError,
   type AgentEgressVerifyReport,
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
+  AGENT_HARNESS_DAEMON_PLIST_PATH,
   planAgentHarnessDaemonInstall,
   installAgentHarnessDaemon,
   uninstallAgentHarnessDaemon,
   agentHarnessDaemonStatus,
+  setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
 } from "../egress-gate/harness-daemon.js";
 import {
   planParkedHarnessInstall,
   executeParkedHarnessInstall,
+  projectRevertToRestoreReport,
+  revertParkedHarnessInstall,
+  type HarnessStandDownSnapshot,
+  type ParkedInstallRevertOps,
 } from "../egress-gate/release-barrier.js";
 import {
   createInstallExclusiveEgressOps,
   createRepairExclusiveEgressOps,
   createUnprotectExclusiveEgressOps,
+  ensureAgentHarnessHoldDir,
   type ExclusiveEgressWiringInput,
 } from "../egress-gate/arming-wiring.js";
 import { deriveGateAccountName } from "../egress-gate/gate-account.js";
@@ -732,32 +758,84 @@ async function resolveOperatorIdentity(): Promise<OperatorIdentity | undefined> 
   return { uid: sudoIdentity.uid, gid: sudoIdentity.gid, home };
 }
 
-/**
- * FIX (round 5, item N4): parse the record names out of `dscl . -search
- * /Users UniqueID <n>` output. `dscl -search` emits the matched attribute in
- * the PARENTHESIZED, multi-line plist form, e.g.
- *
- *   eriknewton\t\tUniqueID = (
- *       501
- *   )
- *
- * The pre-fix parser was `/^(\S+)\s+UniqueID\s*=\s*\d+/m`, which requires the
- * uid digits on the SAME line as `UniqueID =` and therefore NEVER matched the
- * real `= (` form: every uid-fallback home lookup and every
- * `resolveAccountShapeVerdict` account-name check silently missed. This
- * parser matches the record-name line (`name  UniqueID =`) whether the value
- * is parenthesized-multiline or single-line, and returns ALL matched record
- * names (a `-search` can in principle return more than one record). Exported
- * so the seam can drive it against captured real dscl output.
- */
-export function parseDsclSearchAccountNames(stdout: string): string[] {
-  const names: string[] = [];
-  const re = /^(\S+)\s+UniqueID\s*=/gm;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(stdout)) !== null) {
-    names.push(m[1]);
+const DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE = /^(.+?)\s+UniqueID\s*=\s*(.*)$/;
+const DSCL_UNIQUE_ID_VALUE_RE = /^(?:"(-?\d+)"|(-?\d+))$/;
+
+interface DsclSearchAccountRecord {
+  readonly accountName: string;
+  readonly uid: number;
+}
+
+function parseDsclSearchUidValue(rawValue: string): number | undefined {
+  const match = DSCL_UNIQUE_ID_VALUE_RE.exec(rawValue);
+  if (match === null) return undefined;
+  const uid = Number(match[1] ?? match[2]);
+  return Number.isSafeInteger(uid) ? uid : undefined;
+}
+
+function parseDsclSearchAccountRecordAt(
+  lines: readonly string[],
+  lineIndex: number,
+): { readonly value: DsclSearchAccountRecord; readonly nextLineIndex: number } | undefined {
+  const line = lines[lineIndex]!;
+  if (/^\s/.test(line)) return undefined;
+  const match = DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE.exec(line);
+  if (match === null) return undefined;
+  const accountName = match[1]!.trimEnd();
+  if (accountName.length === 0) return undefined;
+
+  const rawValue = match[2]!.trim();
+  const sameLineUid = parseDsclSearchUidValue(rawValue);
+  if (sameLineUid !== undefined) {
+    return { value: { accountName, uid: sameLineUid }, nextLineIndex: lineIndex + 1 };
   }
-  return names;
+  if (rawValue !== "(") return undefined;
+
+  const values: string[] = [];
+  let cursor = lineIndex + 1;
+  while (cursor < lines.length) {
+    const trimmed = lines[cursor]!.trim();
+    cursor += 1;
+    if (trimmed.length === 0) continue;
+    if (trimmed === ")") {
+      if (values.length !== 1) return undefined;
+      const uid = parseDsclSearchUidValue(values[0]!);
+      if (uid === undefined) return undefined;
+      return { value: { accountName, uid }, nextLineIndex: cursor };
+    }
+    values.push(trimmed);
+  }
+  return undefined;
+}
+
+/**
+ * Parse the record names out of `dscl . -search /Users UniqueID <n>` output.
+ * The parser uses the shared no-residue dscl discipline: unparsed output is not
+ * evidence of absence, so non-empty unfamiliar lines throw instead of returning
+ * an empty holder list.
+ */
+export function parseDsclSearchAccountNames(stdout: string, searchedUid: number): string[] {
+  if (!Number.isSafeInteger(searchedUid)) {
+    throw new AccountUidEnumerationError(
+      `Refusing to trust dscl . -search /Users UniqueID <uid>: searched uid must be a safe integer ` +
+        `(got ${String(searchedUid)}).`,
+    );
+  }
+  const records = parseDsclOutputWithNoUnparsedResidue(
+    stdout,
+    `dscl . -search /Users UniqueID ${searchedUid}`,
+    parseDsclSearchAccountRecordAt,
+  );
+  for (const record of records) {
+    if (record.uid !== searchedUid) {
+      throw new AccountUidEnumerationError(
+        `Refusing to trust dscl . -search /Users UniqueID ${searchedUid}: record ` +
+          `${JSON.stringify(record.accountName)} reported UniqueID=${record.uid}, expected ${searchedUid}. ` +
+          `Search output must prove the requested name-to-uid binding.`,
+      );
+    }
+  }
+  return records.map((record) => record.accountName);
 }
 
 /** Look up a NFSHomeDirectory by account name (preferred) or uid, via dscl. Fail-closed: any error or unparsed output resolves undefined. */
@@ -777,7 +855,7 @@ async function lookupHomeDirectory(user: string | undefined, uid: number): Promi
     ]);
     // FIX (round 5, item N4): parse the parenthesized dscl -search output
     // shape (the pre-fix same-line-digits regex never matched it).
-    const [accountName] = parseDsclSearchAccountNames(searchOut);
+    const [accountName] = parseDsclSearchAccountNames(searchOut, uid);
     if (accountName === undefined) return undefined;
     const { stdout } = await execFileAsync("/usr/bin/dscl", [
       ".",
@@ -968,6 +1046,14 @@ export async function runAutoProvisionForWrap(
     candidateUid !== undefined && candidateUid >= PROVISION_CEILING && candidateUid !== consoleOwnerUid
       ? await resolveAccountShapeVerdict(accountName, candidateUid)
       : undefined;
+  // Caller-supplied excluded uids are a backstop for live identities observed
+  // outside the dscl uid lookup. A stale harness-config uid may be free after
+  // account deletion; the direct uid observation in planAndCreateAccount settles
+  // that instead of treating configured state as known-live.
+  const excludedAgentAccountUids = [
+    consoleOwnerUid,
+    ...(runningAgentUid !== undefined ? [runningAgentUid] : []),
+  ];
   const detectResult = detectProvisionNeed({
     harnessConfiguredUid,
     runningAgentUid,
@@ -995,6 +1081,12 @@ export async function runAutoProvisionForWrap(
   // S5-6: the REAL harness argv captured at parked-install time (the release
   // barrier's argv-digest source). Set exactly once, only in exclusive mode.
   let capturedHarnessArgv: string[] | undefined;
+  // Drill-D2 fix-round (2026-07-18): what the harness looked like BEFORE the
+  // parked install stood it down -- prior plist bytes + prior installed/running
+  // state. The material `restoreStoodDownHarness` needs to put the operator's
+  // agent back on any abort. Set exactly once, only in exclusive mode, only
+  // when a parked install actually ran.
+  let harnessStandDownSnapshot: HarnessStandDownSnapshot | undefined;
 
   // S5-6: the exclusive-egress arming stage's production wiring. Built
   // LAZILY: the agent uid + harness argv are only known after the parked
@@ -1070,6 +1162,7 @@ export async function runAutoProvisionForWrap(
           runReleaseSequence: (committed) => lazyExclusiveOps().runReleaseSequence(committed),
           restoreCoarseComposition: (reason) => lazyExclusiveOps().restoreCoarseComposition(reason),
           startHarnessCoarse: () => lazyExclusiveOps().startHarnessCoarse(),
+          assessHarnessParked: () => lazyExclusiveOps().assessHarnessParked(),
           audit: (operation, details) => lazyExclusiveOps().audit(operation, details),
           print,
         }
@@ -1084,7 +1177,12 @@ export async function runAutoProvisionForWrap(
       // time, so the confined harness resolves ~/.hermes to where the
       // secrets actually get moved.
       return planAndCreateAccount(
-        { accountName, ceiling: PROVISION_CEILING, homeDirectory: newAccountHome },
+        {
+          accountName,
+          ceiling: PROVISION_CEILING,
+          homeDirectory: newAccountHome,
+          excludedUids: excludedAgentAccountUids,
+        },
         realAccountProvisionOps(),
       );
     },
@@ -1174,13 +1272,50 @@ export async function runAutoProvisionForWrap(
             logDir: harnessLogDir,
             environment: resolved.environment,
           });
-          await executeParkedHarnessInstall(plan, {
+          const snapshot = await executeParkedHarnessInstall(plan, {
+            // Fix-round 2 (2026-07-18): the SAME revert ops the outcome
+            // chokepoint uses, handed to the install itself so a failure
+            // AFTER it has mutated undoes its own work before the error
+            // leaves. Previously the snapshot reached this scope only on the
+            // success path, so the one assertion that fired on Mini1 stood the
+            // agent down and destroyed the record of how to restore it.
+            ...realParkedInstallRevertOps(daemonOps),
+            // Drill D1: the wrapper lands in the root-owned hold dir, which
+            // nothing else in a first-ever install creates. `ensureHoldDir` is
+            // the production ensure the release sequence's hold-file write
+            // also uses, so both writers agree on one root-owned 0755 dir.
+            ensureHoldDir: ensureAgentHarnessHoldDir,
+            // Drill-D2 fix-round: the SNAPSHOT source. The install is about to
+            // overwrite the singleton harness plist; without capturing the
+            // prior bytes first there is nothing to restore an aborted run to.
+            readFile: async (path) => {
+              try {
+                return await readFile(path, "utf8");
+              } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+                throw err;
+              }
+            },
             writeFile: daemonOps.writeFile,
             removeFile: daemonOps.removeFile,
             runLaunchctl: daemonOps.runLaunchctl,
             harnessStatus: () => agentHarnessDaemonStatus(daemonOps),
+            // Drill D2: the parked install stands down an already-running
+            // harness. Stopping the operator's live agent is never silent.
+            notify: (message) => print(message),
           });
-          return { ok: true as const, bootstrappedThisRun: false, parked: true };
+          // Drill-D2 fix-round: hold the snapshot so an abort ANYWHERE
+          // downstream can put the operator's agent back exactly as it was.
+          // Reported to the orchestrator as `harnessStoodDown`, which -- unlike
+          // `bootstrappedThisRun: false` -- does not claim the pre-existing job
+          // was left alone.
+          harnessStandDownSnapshot = snapshot;
+          return {
+            ok: true as const,
+            bootstrappedThisRun: false,
+            parked: true,
+            harnessStoodDown: snapshot.preexistingJobModified,
+          };
         }
         const plan = planAgentHarnessDaemonInstall({
           agentAccount: accountName,
@@ -1207,6 +1342,35 @@ export async function runAutoProvisionForWrap(
     // reporting a clean rollback. Reuses the shipped fail-loud uninstaller.
     uninstallHarnessDaemon: async () => {
       await uninstallAgentHarnessDaemon(realHarnessDaemonOps());
+    },
+    // Drill-D2 fix-round: put a harness THIS run stood down back the way it
+    // was. Distinct from `uninstallHarnessDaemon`, which destroys a daemon
+    // this run CREATED -- here the job pre-existed, so the remedy is restore,
+    // never removal. Called from the orchestrator's single outcome chokepoint.
+    restoreStoodDownHarness: async () => {
+      const snapshot = harnessStandDownSnapshot;
+      if (snapshot === undefined) {
+        // Nothing was stood down, so nothing is owed. Said in the shape the
+        // orchestrator's wording keys on: no restart was needed, none happened.
+        return { restored: true, wasRunning: false, harnessRestarted: false, problems: [] };
+      }
+      // Fix-round 2 (2026-07-18): pass the OBSERVED verdict straight through.
+      // This used to be `result.errors.length === 0` -- a statement about how
+      // quietly the revert failed. `revertParkedHarnessInstall` now derives
+      // `restored` from post-restore state (plist back AND the job running
+      // again, or never running), so a stopped agent can no longer be reported
+      // as restored. `harnessRestarted` reaches the operator-facing wording
+      // instead of being discarded here.
+      //
+      // FIX-ROUND 6 (2026-07-19): this used to be a hand-rolled object literal
+      // listing four of the five fields, and the one it omitted was the
+      // OBSERVED run-state claim -- the eleventh instance of the subsystem's
+      // one defect. The projection is now a single shared function next to the
+      // type it projects, so the claim cannot be dropped by a caller who did
+      // not know it was there.
+      return projectRevertToRestoreReport(
+        await revertParkedHarnessInstall(snapshot, realParkedInstallRevertOps(realHarnessDaemonOps())),
+      );
     },
     // Bug B (the one-flow gap): ensure a reachable Castle Wall POLICY daemon for
     // the target fortress BEFORE arming. Arming with no policy daemon deny-all-
@@ -1737,7 +1901,8 @@ async function readRunningHermesGatewayUid(): Promise<number | undefined> {
  *   - the account NAME at this uid is exactly `expectedAccountName`
  *     (`sanctuary-<agentId>`), read via `dscl . -search /Users UniqueID` so
  *     the name<->uid binding comes from the directory service, not assumed;
- *   - `IsHidden` is `1`;
+ *   - `IsHidden` is truthy (`1`, `YES`, or `TRUE`; macOS uses `YES` on
+ *     some of its own hidden accounts);
  *   - the login shell is `/usr/bin/false` (no-login shape).
  * Any dscl failure, any missing field, or any mismatch resolves
  * `"indeterminate"`/`"not-dedicated"` -- fail-closed, never `"verified-dedicated"`
@@ -1761,7 +1926,7 @@ async function resolveAccountShapeVerdict(
     // and the alreadyDedicated fast-path could never confirm a genuinely
     // dedicated account. Parse the real shape and require the expected account
     // name to be among the matched records.
-    const searchedNames = parseDsclSearchAccountNames(searchOut);
+    const searchedNames = parseDsclSearchAccountNames(searchOut, candidateUid);
     if (!searchedNames.includes(expectedAccountName)) {
       return "not-dedicated";
     }
@@ -1771,7 +1936,8 @@ async function resolveAccountShapeVerdict(
       `/Users/${expectedAccountName}`,
       "IsHidden",
     ]);
-    if (!/IsHidden:\s*1/.test(hiddenOut)) {
+    const hiddenValue = /IsHidden:\s*(\S+)/.exec(hiddenOut)?.[1];
+    if (parseServiceAccountIsHidden(hiddenValue) !== true) {
       return "not-dedicated";
     }
     const { stdout: shellOut } = await execFileAsync("/usr/bin/dscl", [
@@ -1801,25 +1967,274 @@ async function confirmOnTty(promptText: string): Promise<boolean> {
   }
 }
 
+export async function canonicalizeHomeDirectory(
+  rawPath: string,
+  realpathFn: (path: string) => Promise<string> = realpath,
+): Promise<string> {
+  const normalized = normalizePath(rawPath);
+  const trimmed = normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
+  const pendingSegments: string[] = [];
+  let cursor = trimmed;
+  while (true) {
+    try {
+      const resolvedPrefix = await realpathFn(cursor);
+      const combined = pendingSegments.length === 0 ? resolvedPrefix : join(resolvedPrefix, ...pendingSegments);
+      const normalizedCombined = normalizePath(combined);
+      return normalizedCombined === "/" ? normalizedCombined : normalizedCombined.replace(/\/+$/, "");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      const parent = dirname(cursor);
+      if (parent === cursor) throw err;
+      pendingSegments.unshift(basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+export interface DsclReadResult {
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly execErrorCode?: string;
+}
+
+export type DsclRecordReadDecision = "present" | "record-absent" | "unknown";
+
+export type DsclAttributeReadDecision =
+  | { readonly kind: "value"; readonly value: string }
+  | { readonly kind: "attribute-absent" }
+  | { readonly kind: "record-absent" }
+  | { readonly kind: "unknown"; readonly diagnostic: string };
+
+const DSCL_STDIO_MAXBUFFER_ERROR = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+const DSCL_DIAGNOSTIC_MAX_CHARS = 512;
+const DSCL_RECORD_NOT_FOUND_RE = /eDSRecordNotFound|DS Error:\s*-14136|Invalid Path/i;
+const DSCL_NO_SUCH_KEY_RE = /^No such key:\s*([A-Za-z][A-Za-z0-9_-]*)\b/i;
+const DSCL_ATTRIBUTE_LINE_RE = /^([A-Za-z][A-Za-z0-9_-]*):(?:\s|$)/;
+
+function dsclRawDiagnostic(result: Pick<DsclReadResult, "stdout" | "stderr">): string {
+  return [result.stderr, result.stdout]
+    .filter((part) => part.trim().length > 0)
+    .join("\n")
+    .trim();
+}
+
+function dsclDiagnosticLines(result: Pick<DsclReadResult, "stdout" | "stderr">): string[] {
+  return dsclRawDiagnostic(result)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+function allDsclDiagnosticLinesMatch(
+  result: Pick<DsclReadResult, "stdout" | "stderr">,
+  predicate: (line: string) => boolean,
+): boolean {
+  const lines = dsclDiagnosticLines(result);
+  return lines.length > 0 && lines.every(predicate);
+}
+
+function boundedDsclDiagnostic(summary: string): string {
+  if (summary.length <= DSCL_DIAGNOSTIC_MAX_CHARS) return summary;
+  return `${summary.slice(0, DSCL_DIAGNOSTIC_MAX_CHARS - "...<truncated>".length)}...<truncated>`;
+}
+
+function summarizeDsclNames(names: ReadonlySet<string>): string {
+  const sorted = [...names].sort((a, b) => a.localeCompare(b));
+  const shown = sorted.slice(0, 8);
+  return shown.join(", ") + (sorted.length > shown.length ? `, +${sorted.length - shown.length} more` : "");
+}
+
+function summarizeDsclStream(label: "stdout" | "stderr", content: string): string | undefined {
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return undefined;
+
+  const attributeNames = new Set<string>();
+  const missingAttributeNames = new Set<string>();
+  let recordNotFoundLines = 0;
+  let unclassifiedLines = 0;
+
+  for (const line of lines) {
+    const noSuchKey = DSCL_NO_SUCH_KEY_RE.exec(line);
+    if (noSuchKey !== null) {
+      missingAttributeNames.add(noSuchKey[1]!);
+      continue;
+    }
+    if (DSCL_RECORD_NOT_FOUND_RE.test(line)) {
+      recordNotFoundLines += 1;
+      continue;
+    }
+    const attribute = DSCL_ATTRIBUTE_LINE_RE.exec(line);
+    if (attribute !== null) {
+      attributeNames.add(attribute[1]!);
+      continue;
+    }
+    unclassifiedLines += 1;
+  }
+
+  const parts = [
+    `${label}: ${Buffer.byteLength(content, "utf8")} bytes`,
+    `${lines.length} line${lines.length === 1 ? "" : "s"}`,
+  ];
+  if (attributeNames.size > 0) parts.push(`attributes=[${summarizeDsclNames(attributeNames)}]`);
+  if (missingAttributeNames.size > 0) {
+    parts.push(`missing-attributes=[${summarizeDsclNames(missingAttributeNames)}]`);
+  }
+  if (recordNotFoundLines > 0) parts.push(`record-not-found-lines=${recordNotFoundLines}`);
+  if (unclassifiedLines > 0) parts.push(`unclassified-lines=${unclassifiedLines}`);
+  return parts.join(", ");
+}
+
+export function dsclDiagnostic(result: DsclReadResult): string {
+  const parts = [
+    result.execErrorCode !== undefined ? `exec-error=${result.execErrorCode}` : undefined,
+    summarizeDsclStream("stderr", result.stderr),
+    summarizeDsclStream("stdout", result.stdout),
+  ].filter((part): part is string => part !== undefined && part.length > 0);
+  return boundedDsclDiagnostic(parts.join("; "));
+}
+
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function decideDsclRecordRead(result: DsclReadResult): DsclRecordReadDecision {
+  // Test-only retained: production existence probes read explicit attributes.
+  if (result.code === 0) return "present";
+  if (result.execErrorCode === DSCL_STDIO_MAXBUFFER_ERROR) return "unknown";
+  if (result.execErrorCode !== undefined) return "unknown";
+  return allDsclDiagnosticLinesMatch(result, (line) => DSCL_RECORD_NOT_FOUND_RE.test(line))
+    ? "record-absent"
+    : "unknown";
+}
+
+export function decideDsclAttributeRead(
+  attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  result: DsclReadResult,
+): DsclAttributeReadDecision {
+  if (result.code !== 0) {
+    if (result.execErrorCode === DSCL_STDIO_MAXBUFFER_ERROR) {
+      return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+    }
+    if (result.execErrorCode !== undefined) {
+      return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+    }
+    return allDsclDiagnosticLinesMatch(result, (line) => DSCL_RECORD_NOT_FOUND_RE.test(line))
+      ? { kind: "record-absent" }
+      : { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+  }
+  const match = new RegExp(`^${escapeRegExpLiteral(attribute)}:\\s*(.*)$`, "m").exec(result.stdout);
+  if (match !== null) return { kind: "value", value: match[1]!.trim() };
+  if (
+    result.stdout.trim().length === 0 &&
+    allDsclDiagnosticLinesMatch(result, (line) => DSCL_NO_SUCH_KEY_RE.test(line))
+  ) {
+    return { kind: "attribute-absent" };
+  }
+  return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+}
+
 function realAccountProvisionOps() {
+  const dsclReadResult = async (args: readonly string[]): Promise<DsclReadResult> => {
+    try {
+      const { stdout, stderr } = await execFileAsync("/usr/bin/dscl", [...args]);
+      return { code: 0, stdout, stderr };
+    } catch (err) {
+      const e = err as { code?: unknown; stdout?: unknown; stderr?: unknown; message?: unknown };
+      return {
+        code: typeof e.code === "number" ? e.code : 1,
+        ...(typeof e.code === "string" ? { execErrorCode: e.code } : {}),
+        stdout: typeof e.stdout === "string" ? e.stdout : "",
+        stderr:
+          typeof e.stderr === "string"
+            ? e.stderr
+            : typeof e.message === "string"
+              ? e.message
+              : "",
+      };
+    }
+  };
+  const recordExists = async (accountName: string): Promise<boolean> => {
+    const result = await dsclReadResult([".", "-read", `/Users/${accountName}`, "UniqueID"]);
+    const decision = decideDsclAttributeRead("UniqueID", result);
+    if (decision.kind === "value" || decision.kind === "attribute-absent") return true;
+    if (decision.kind === "record-absent") return false;
+    throw new Error(
+      `dscl could not determine whether ${accountName} exists (${decision.diagnostic || "no diagnostic"})`,
+    );
+  };
+  const readAttribute = async (
+    accountName: string,
+    attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  ): Promise<{ kind: "value"; value: string } | { kind: "attribute-absent" } | { kind: "record-absent" }> => {
+    const result = await dsclReadResult([".", "-read", `/Users/${accountName}`, attribute]);
+    const decision = decideDsclAttributeRead(attribute, result);
+    if (decision.kind !== "unknown") return decision;
+    throw new Error(
+      `dscl could not read ${attribute} for ${accountName} (${decision.diagnostic || "no diagnostic"})`,
+    );
+  };
+  const readExistingAttribute = async (
+    accountName: string,
+    attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  ): Promise<string | undefined> => {
+    const read = await readAttribute(accountName, attribute);
+    if (read.kind === "value") return read.value;
+    if (read.kind === "attribute-absent") return undefined;
+    throw new Error(`directory-service record "${accountName}" disappeared while reading ${attribute}`);
+  };
+  const readExistingUid = async (accountName: string): Promise<number> => {
+    const uidText = await readExistingAttribute(accountName, "UniqueID");
+    if (uidText === undefined) {
+      throw new Error(
+        `directory-service record "${accountName}" exists but UniqueID is missing; refusing to treat it as absent`,
+      );
+    }
+    const uid = Number(uidText);
+    if (!Number.isSafeInteger(uid) || uid <= 0) {
+      throw new Error(`dscl returned an invalid UniqueID for ${accountName}: ${uidText}`);
+    }
+    return uid;
+  };
   return {
     lookupAccountUid: async (accountName: string): Promise<number | undefined> => {
-      try {
-        const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-read", `/Users/${accountName}`, "UniqueID"]);
-        const match = /UniqueID:\s*(\d+)/.exec(stdout);
-        return match ? Number(match[1]) : undefined;
-      } catch {
-        return undefined;
-      }
+      if (!(await recordExists(accountName))) return undefined;
+      return readExistingUid(accountName);
     },
+    canonicalizeHomeDirectory,
     highestAssignedUid: async (): Promise<number> => {
       const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-list", "/Users", "UniqueID"]);
-      let highest = PROVISION_CEILING - 1;
-      for (const line of stdout.split("\n")) {
-        const match = /\s(\d+)\s*$/.exec(line);
-        if (match) highest = Math.max(highest, Number(match[1]));
+      return parseHighestAssignedUidFromDsclList(stdout, PROVISION_CEILING - 1);
+    },
+    lookupAccountNamesByUid: async (uid: number): Promise<readonly string[]> => {
+      if (!Number.isSafeInteger(uid)) {
+        throw new Error(`uid must be a safe integer for direct lookup (got ${String(uid)})`);
       }
-      return highest;
+      const result = await dsclReadResult([".", "-search", "/Users", "UniqueID", String(uid)]);
+      if (result.code !== 0) {
+        throw new Error(`dscl could not search accounts by uid ${uid} (${dsclDiagnostic(result)})`);
+      }
+      return parseDsclSearchAccountNames(result.stdout, uid);
+    },
+    lookupAccountRecord: async (
+      accountName: string,
+    ): Promise<{ uid: number; homeDirectory?: string; isHidden?: boolean; userShell?: string } | undefined> => {
+      if (!(await recordExists(accountName))) return undefined;
+      const uid = await readExistingUid(accountName);
+      const homeDirectory = await readExistingAttribute(accountName, "NFSHomeDirectory");
+      const hiddenText = await readExistingAttribute(accountName, "IsHidden");
+      const userShell = await readExistingAttribute(accountName, "UserShell");
+      const parsedHidden = parseServiceAccountIsHidden(hiddenText);
+      return {
+        uid,
+        ...(homeDirectory !== undefined ? { homeDirectory } : {}),
+        ...(parsedHidden !== undefined ? { isHidden: parsedHidden } : {}),
+        ...(userShell !== undefined ? { userShell } : {}),
+      };
     },
     createUser: async (
       accountName: string,
@@ -1833,14 +2248,12 @@ function realAccountProvisionOps() {
       // production ops object satisfies the AccountProvisionOps interface
       // for the orchestration to call end to end during the drill.
       //
-      // FIX F7 (HIGH/PLAUSIBLE, Codex second family, 2026-07-07 fix-round):
-      // `-home` binds NFSHomeDirectory to the re-home target at create
-      // time, so the confined harness (running as this account) resolves
-      // ~/.hermes to where the secrets actually get moved, instead of
-      // whatever sysadminctl would otherwise default the home to. Verified
-      // with an explicit `dscl -create NFSHomeDirectory` follow-up (belt
-      // and suspenders: `-home` is documented sysadminctl behavior, but the
-      // dscl write makes the binding explicit and independently checkable).
+      // FIX F7 + S5 drill D4: `-home` is the primary directory-service writer
+      // for NFSHomeDirectory. A redundant post-create `dscl -create
+      // NFSHomeDirectory` remains only a plausible, unproven D4 suspect; a
+      // hardware capture showing sysadminctl's read-back plus the redundant
+      // write failure would confirm it. Post-create hardening now runs through
+      // `hardenCreatedUser`, inside the observed recovery envelope.
       await execFileAsync("/usr/sbin/sysadminctl", [
         "-addUser",
         accountName,
@@ -1852,14 +2265,9 @@ function realAccountProvisionOps() {
         homeDirectory,
         ...(comment ? ["-fullName", comment] : []),
       ]);
+    },
+    hardenCreatedUser: async (accountName: string): Promise<void> => {
       await execFileAsync("/usr/bin/dscl", [".", "-create", `/Users/${accountName}`, "IsHidden", "1"]);
-      await execFileAsync("/usr/bin/dscl", [
-        ".",
-        "-create",
-        `/Users/${accountName}`,
-        "NFSHomeDirectory",
-        homeDirectory,
-      ]);
     },
   };
 }
@@ -2220,6 +2628,15 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
       const { writeFile } = await import("node:fs/promises");
       await writeFile(path, content, { mode });
     },
+    readFile: async (path) => {
+      const { readFile } = await import("node:fs/promises");
+      try {
+        return await readFile(path, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw err;
+      }
+    },
     removeFile: async (path) => {
       const { unlink } = await import("node:fs/promises");
       await unlink(path).catch((err) => {
@@ -2230,6 +2647,53 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
       return runLaunchctlWithTimeout(args);
     },
     sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  };
+}
+
+/**
+ * THE ONE production recovery routine for a parked install (fix-round 2,
+ * 2026-07-18). Used in BOTH places the stand-down can need undoing:
+ *
+ *   1. inside `executeParkedHarnessInstall`, when the install itself fails
+ *      after mutating (the Mini1 path -- the snapshot never leaves the
+ *      function, so the revert cannot live outside it); and
+ *   2. at the orchestrator's outcome chokepoint, when a LATER stage refuses.
+ *
+ * One routine, so the two paths cannot drift into disagreeing about what
+ * "restored" means. `restoreRunningHarness` is deliberately the same
+ * enable + coarse-install pair the S5-6 degrade path (`startHarnessCoarse`)
+ * uses, and `installAgentHarnessDaemon` refuses unless launchd reports a
+ * STABLE running pid FOR THE UNIT IT JUST WROTE -- since fix-round 3 it boots
+ * out and re-bootstraps whenever the bytes differ from what is on disk, so the
+ * pid it observes cannot be the barrier job the stand-down replaced. That is
+ * what makes its resolving an OBSERVATION that the agent is back up, rather
+ * than merely a request that it should be.
+ */
+function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallRevertOps {
+  return {
+    restoreRunningHarness: async (plistContent) => {
+      await setAgentHarnessJobDisabled(daemonOps, false);
+      await installAgentHarnessDaemon(
+        {
+          plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
+          plistContent,
+          bootstrapArgs: ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
+        },
+        daemonOps,
+      );
+    },
+    clearJobDisable: async () => {
+      await setAgentHarnessJobDisabled(daemonOps, false);
+    },
+    writeFile: daemonOps.writeFile,
+    readFile: daemonOps.readFile,
+    removeFile: daemonOps.removeFile,
+    // Fix-round 5 (2026-07-19): the revert's run-state claim. Deliberately the
+    // PLAIN status read, not the stable-pid refinement `probeHarnessRunning`
+    // uses -- `assessHarnessParked` disqualifies a park on ANY pid, so a
+    // stability downgrade cannot change its verdict and would only nest a
+    // second settle loop inside the chokepoint's.
+    harnessStatus: () => agentHarnessDaemonStatus(daemonOps),
   };
 }
 

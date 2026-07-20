@@ -59,9 +59,52 @@ export interface DiffTransientPfRulesOptions {
   anchorName?: string;
 }
 
+const PF_ANCHOR_DIRECTIVE_RE = /^(scrub-anchor|nat-anchor|rdr-anchor|dummynet-anchor|anchor)\s+"([^"]+)"(?:\s|$)/;
+const PF_STRIPPED_ANCHOR_DIRECTIVE_RE = /^(scrub-anchor|nat-anchor|rdr-anchor|dummynet-anchor|anchor)\s+"\/\*"(.*)$/;
+const PF_RULE_LINE_RE =
+  /^(set|table|scrub|scrub-anchor|nat|nat-anchor|rdr|rdr-anchor|dummynet|dummynet-anchor|anchor|load anchor|block|pass|match|antispoof|altq|queue)(?:\s|$)/;
+
 /** Normalize one printed pf rule line for set comparison. */
 function normalizeRuleLine(line: string): string {
   return line.trim().replace(/\s+/g, " ");
+}
+
+function anchorNamesFromBaseConfig(baseConf: string): ReadonlyMap<string, readonly string[]> {
+  const byDirective = new Map<string, string[]>();
+  for (const rawLine of baseConf.split("\n")) {
+    const line = normalizeRuleLine(rawLine);
+    if (line.length === 0 || line.startsWith("#")) continue;
+    const match = PF_ANCHOR_DIRECTIVE_RE.exec(line);
+    if (match === null) continue;
+    const directive = match[1]!;
+    const name = match[2]!;
+    const names = byDirective.get(directive) ?? [];
+    names.push(name);
+    byDirective.set(directive, names);
+  }
+  return byDirective;
+}
+
+function normalizeExpectedRuleLine(
+  line: string,
+  baseAnchorNames: ReadonlyMap<string, readonly string[]>,
+  positions: Map<string, number>,
+): string | undefined {
+  const normalized = normalizeRuleLine(line);
+  const strippedAnchor = PF_STRIPPED_ANCHOR_DIRECTIVE_RE.exec(normalized);
+  if (strippedAnchor === null) return normalized;
+  const directive = strippedAnchor[1]!;
+  const suffix = strippedAnchor[2]!;
+  const names = baseAnchorNames.get(directive) ?? [];
+  const position = positions.get(directive) ?? 0;
+  positions.set(directive, position + 1);
+  const name = names[position];
+  if (name === undefined) return undefined;
+  return `${directive} "${name}"${suffix}`;
+}
+
+function isPfRuleLine(line: string): boolean {
+  return PF_RULE_LINE_RE.test(line);
 }
 
 /**
@@ -69,7 +112,19 @@ function normalizeRuleLine(line: string): string {
  * line; `pfctl -n -v -f` echoes rules plus blank lines and `@n` prefixes in
  * some modes. Strip prefixes/blanks conservatively.
  */
-function ruleLines(output: string): string[] {
+function expectedRuleLines(output: string, baseAnchorNames: ReadonlyMap<string, readonly string[]>): string[] {
+  const positions = new Map<string, number>();
+  return output
+    .split("\n")
+    .map((line) => normalizeRuleLine(line.replace(/^@\d+\s+/, "")))
+    .filter((line) => line.length > 0 && isPfRuleLine(line))
+    .map((line) => normalizeExpectedRuleLine(line, baseAnchorNames, positions))
+    .filter((line): line is string => line !== undefined && line.length > 0);
+}
+
+function runningRuleLines(output: string): string[] {
+  // Running output is already the observation. Do not expand stripped wildcard
+  // anchors here, or the refusal can print rules the host never had.
   return output
     .split("\n")
     .map((line) => normalizeRuleLine(line.replace(/^@\d+\s+/, "")))
@@ -134,8 +189,9 @@ export async function diffTransientPfRules(
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
 
-  const expected = new Set(ruleLines(normalized));
-  const runningRules = ruleLines(running.stdout);
+  const baseAnchorNames = anchorNamesFromBaseConfig(baseConf);
+  const expected = new Set(expectedRuleLines(normalized, baseAnchorNames));
+  const runningRules = runningRuleLines(running.stdout);
   const anchorCallPrefix = `anchor "${anchorName}"`;
   const foreign = runningRules.filter(
     (line) => !expected.has(line) && !line.startsWith(anchorCallPrefix),

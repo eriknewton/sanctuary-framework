@@ -10,10 +10,14 @@
  */
 
 import { describe, expect, it } from "vitest";
+import { lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   SANCTUARY_VAR_DB_DIR,
   applyGateRuntimeFsPlan,
+  createRealGateRuntimeFsOps,
   planExclusiveEgressRuntimeFs,
   type GateRuntimeFsOps,
   type GateRuntimeFsStep,
@@ -140,5 +144,63 @@ describe("applyGateRuntimeFsPlan", () => {
     ).rejects.toThrow(/chown \/var\/db\/sanctuary\/gate-runtime\/502 failed: EPERM/);
     // Nothing after the failing step ran (gate-cred was never touched).
     expect(calls.some((c) => c.includes("gate-cred"))).toBe(false);
+  });
+});
+
+/**
+ * F7 (Codex lens, 2026-07-18): the PRODUCTION ops, against a real filesystem.
+ *
+ * The plan tests above use recorder ops, which by construction cannot show
+ * what `mkdir`/`chmod` do to a symlink. The lens demonstrated empirically that
+ * `mkdir` reports EEXIST on a symlink-to-directory and the following `chmod`
+ * then changes the TARGET's mode. This code runs as root and establishes the
+ * traversal invariant the gate and agent uids depend on, so it must refuse
+ * that shape rather than rely on `/var/db` being root-owned. Runs entirely in
+ * a private tmpdir and needs no privileges.
+ */
+describe("createRealGateRuntimeFsOps mkdir (F7: refuses symlink-shaped runtime dirs)", () => {
+  it("accepts a real directory and is idempotent over an existing one", async () => {
+    const root = mkdtempSync(join(tmpdir(), "s5-fsplan-ok-"));
+    try {
+      const target = join(root, "gate-runtime");
+      const ops = createRealGateRuntimeFsOps();
+      await ops.mkdir(target);
+      await ops.mkdir(target); // second call must not throw
+      expect(lstatSync(target).isDirectory()).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("REFUSES a path that is a symlink to a directory, so no chown/chmod ever reaches the target", async () => {
+    const root = mkdtempSync(join(tmpdir(), "s5-fsplan-link-"));
+    try {
+      const realTarget = join(root, "elsewhere");
+      const linkPath = join(root, "gate-cred");
+      mkdirSync(realTarget, { mode: 0o700 });
+      symlinkSync(realTarget, linkPath);
+      const modeBefore = lstatSync(realTarget).mode & 0o777;
+
+      const ops = createRealGateRuntimeFsOps();
+      await expect(ops.mkdir(linkPath)).rejects.toThrow(/symlink/);
+
+      // The property that matters: the link target was not re-shaped.
+      expect(lstatSync(realTarget).mode & 0o777).toBe(modeBefore);
+      expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("REFUSES a plain file sitting where a runtime directory should be", async () => {
+    const root = mkdtempSync(join(tmpdir(), "s5-fsplan-file-"));
+    try {
+      const filePath = join(root, "gate-liveness");
+      writeFileSync(filePath, "not a directory");
+      const ops = createRealGateRuntimeFsOps();
+      await expect(ops.mkdir(filePath)).rejects.toThrow(/non-directory/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

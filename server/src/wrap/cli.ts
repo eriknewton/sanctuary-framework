@@ -87,6 +87,7 @@ import {
 } from "./auto-provision.js";
 import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
 import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
+import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -1275,25 +1276,41 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
           `(uid ${outcome.uid}, generation ${outcome.generationId}). The agent's only sanctioned egress path is the gate.`,
       ];
     case "armed-exclusive-repark-failed":
+      // FIX-ROUND 5. This used to say "the agent is running confined" -- a
+      // positive run-state assertion composed at the RENDER layer, which is
+      // the thing the round-4 guard exists to forbid; it evaded the guard only
+      // by letter case. Its basis was also stale: the barrier's last
+      // stable-running probe ran BEFORE the re-park mutation that then threw.
+      // What IS observed here is the gate: a committed generation, live, with
+      // the agent's egress scoped to it. Say that, and leave run state to the
+      // one surface that reads it.
       return [
         `  WARNING: the exclusive-egress gate is LIVE (uid ${outcome.uid}, generation ${outcome.generationId}) and the ` +
-          `agent is running confined, but the persistent boot state could NOT be re-parked (${outcome.reparkError}). ` +
+          `agent's only sanctioned egress path is the gate, but the persistent boot state could NOT be re-parked ` +
+          `(${outcome.reparkError}). ` +
           `The NEXT boot could start the agent before the gate re-arms. Run 'sudo sanctuary protect --repair-egress-gate' now.`,
       ];
     case "exclusive-egress-unarmed-coarse-active": {
       // S5-6 degrade-loud: DISTINCT non-green state; every posture surface
       // renders coarse-only amber (S5-P). Never softened into a success line.
-      const agentState = outcome.harnessStartedCoarse
-        ? "The agent is RUNNING in coarse-only mode (network-destination wall, no fine-grained gate)."
-        : outcome.coarseCompositionRestored
-          ? "The agent is PARKED (not running): the manifest is back in coarse scope but the harness could not be started."
-          : "The agent is PARKED (not running) and the manifest could NOT be restored to coarse scope.";
+      // FIX-ROUND 4 (the round-4 HIGH landed exactly here). This branch used
+      // to compose its own run-state sentence from `harnessStartedCoarse`,
+      // whose false branch means "this run did not start it" and was printed
+      // as "The agent is PARKED (not running)" -- captured over a live pid
+      // 9001, in the same output whose reason string said the job still
+      // reported that pid. The render layer no longer decides run state at
+      // all: the sentence comes from the parked-claim chokepoint, which
+      // produced it from a settled observation or explicitly weakened it.
+      const agentState = harnessDispositionSentence(outcome.harness);
+      const manifestState = outcome.coarseCompositionRestored
+        ? "The manifest is back in coarse scope."
+        : "The manifest could NOT be restored to coarse scope.";
       const cleanupNote =
         outcome.cleanupErrors.length > 0 ? ` Cleanup problems: ${outcome.cleanupErrors.join("; ")}.` : "";
       return [
         `  WARNING: fine-grained exclusive egress could NOT come live at "${outcome.stage}" (${outcome.reason}). ` +
           `The coarse Castle Wall remains armed over the agent -- this is a DISTINCT NON-GREEN (coarse-only) state ` +
-          `on every posture surface, not full protection. ${agentState}${cleanupNote} ` +
+          `on every posture surface, not full protection. ${manifestState} ${agentState}${cleanupNote} ` +
           `Fix with: sudo sanctuary protect --repair-egress-gate`,
       ];
     }
@@ -1366,16 +1383,17 @@ function abortedProvisionLines(outcome: Extract<ProvisionFlowOutcome, { kind: "a
   // restore. Render a neutral "nothing was changed; safe to re-run" line --
   // never the "restore of your re-homed files FAILED / do not re-run" alarm
   // the `rolledBack === false` branch below would otherwise print. This is the
-  // common no-sudo first attempt (stage "root-check").
+  // common no-sudo first attempt (stage "root-check"). Account existence is
+  // deliberately NOT inferred here; create-account failures carry their own
+  // observed rollback/repair text in `reason`.
   if (outcome.rehomeAttempted === false) {
     // FIX (round 5 / R4-2): key the account clause on `accountCreated`, not on
     // `rehomeAttempted` (which only tracks whether a MOVE happened). At the
     // rehome stage create-account has already succeeded, so an orphaned hidden
-    // account exists even though nothing moved -- claiming "no account was
-    // created" there would be a false all-clear.
+    // account exists even though nothing moved.
     const accountClause = outcome.accountCreated
       ? `The dedicated account was created but no files were moved (it will be reused on the next run).`
-      : `No dedicated account was created and nothing was moved.`;
+      : `No files were moved before this stop.`;
     return [
       `  Note: automatic account provisioning stopped at "${outcome.stage}" (${outcome.reason}). ` +
         `${accountClause} The cooperative wrap above still applies. ` +

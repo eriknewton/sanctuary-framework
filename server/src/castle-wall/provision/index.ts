@@ -15,15 +15,30 @@ export { detectProvisionNeed } from "./detect.js";
 
 export {
   SAFE_SERVICE_ACCOUNT_RE,
+  AccountUidEnumerationError,
+  AccountProvisionVerificationError,
+  EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN,
+  EXPECTED_SERVICE_ACCOUNT_SHELL,
+  describeServiceAccountRecord,
   deriveAgentAccountName,
+  parseServiceAccountIsHidden,
+  parseDsclOutputWithNoUnparsedResidue,
   planAccountCreate,
   executeAccountProvisionPlan,
+  lookupAccountRecordAfterCreate,
+  parseHighestAssignedUidFromDsclList,
   planAndCreateAccount,
+  rollbackCreatedServiceAccount,
+  serviceAccountConflictGuidance,
+  serviceAccountRepairGuidance,
+  serviceAccountRecordProblems,
 } from "./account.js";
 export type {
   AccountProvisionOptions,
   AccountProvisionOps,
   AccountProvisionPlan,
+  AccountProvisionRollbackResult,
+  ServiceAccountRecord,
 } from "./account.js";
 
 export { checkUidExistenceBeforeArm } from "./uid-gate.js";

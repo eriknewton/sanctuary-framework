@@ -5,7 +5,7 @@
  *       whole probe, so the construction-time cross-check and the runtime verify
  *       read the SAME immutable snapshot (no divergence bypass);
  *   (2) gate-account makes `agentUid` REQUIRED and ALWAYS excluded from the gate
- *       uid (collision refused even with excludeUids omitted; non-positive
+ *       uid (create plans refuse on it, skip plans refuse, non-positive
  *       agentUid rejected).
  * Every test is an ATTACK; the assertion is that the bypass FAILS.
  */
@@ -28,11 +28,12 @@ import {
   GateUidCollisionError,
   type GateAccountProvisionOptions,
 } from "../../src/egress-gate/gate-account.js";
-import type { AccountProvisionOps } from "../../src/egress-gate/../castle-wall/provision/account.js";
+import type { GateAccountProvisionOps } from "../../src/egress-gate/gate-account.js";
 import type { ExclusiveEgressGatePolicy } from "../../src/castle-wall/allowlist/gate-derivation.js";
 
 const AGENT_UID = 502;
 const GATE_PORT = 47311;
+const GATE_HOME = "/var/sanctuary-agents/sanctuary-gate-hermes";
 const policy: ExclusiveEgressGatePolicy = { agent_uid: AGENT_UID, gate_port: GATE_PORT };
 
 // ---------------------------------------------------------------------------
@@ -120,14 +121,17 @@ describe("round-3 fix (2) refute: gate uid can never collide with the agent uid"
     agentId: "hermes",
     agentUid: AGENT_UID,
     ceiling: 400,
-    homeDirectory: "/var/empty",
+    homeDirectory: GATE_HOME,
     ...over,
   });
 
   it("REFUSES a create plan whose computed uid lands on the agent uid, excludeUids OMITTED", () => {
     // ceiling 502, highest 501 => create uid = max(502, 502) = 502 = AGENT_UID.
     expect(() =>
-      planGateAccountProvision(base({ ceiling: AGENT_UID }), { existingUid: undefined, highestAssignedUid: AGENT_UID - 1 }),
+      planGateAccountProvision(base({ ceiling: AGENT_UID }), {
+        existingUid: undefined,
+        highestAssignedUid: AGENT_UID - 1,
+      }),
     ).toThrow(GateUidCollisionError);
   });
 
@@ -152,24 +156,37 @@ describe("round-3 fix (2) refute: gate uid can never collide with the agent uid"
     expect(plan.uid).not.toBe(AGENT_UID);
   });
 
-  it("the exclusion fires in planAndCreateGateAccount BEFORE any create side effect runs", async () => {
-    let created = false;
-    const ops: AccountProvisionOps = {
+  it("the create exclusion refuses before any create side effect runs", async () => {
+    let record:
+      | { uid: number; homeDirectory: string; isHidden?: boolean; userShell: string }
+      | undefined;
+    let createdUid: number | undefined;
+    let lookupCalls = 0;
+    const ops: GateAccountProvisionOps = {
       lookupAccountUid: () => Promise.resolve(undefined),
+      lookupAccountRecord: () => {
+        lookupCalls += 1;
+        return Promise.resolve(lookupCalls === 1 ? undefined : record);
+      },
+      canonicalizeHomeDirectory: (path) => Promise.resolve(path),
       // highest is one below the agent uid so the computed create uid == agent uid.
       highestAssignedUid: () => Promise.resolve(AGENT_UID - 1),
-      createUser: () => {
-        created = true;
+      lookupAccountNamesByUid: () => Promise.resolve([]),
+      createUser: (_accountName, uid, _comment, homeDirectory) => {
+        createdUid = uid;
+        record = { uid, homeDirectory, userShell: "/usr/bin/false" };
+        return Promise.resolve();
+      },
+      hardenCreatedUser: () => {
+        if (record !== undefined) record = { ...record, isHidden: true };
         return Promise.resolve();
       },
     };
-    await expect(
-      planAndCreateGateAccount(base({ ceiling: AGENT_UID }), ops),
-    ).rejects.toBeInstanceOf(GateUidCollisionError);
-    expect(created).toBe(false); // never provisioned onto the agent uid
+    await expect(planAndCreateGateAccount(base({ ceiling: AGENT_UID }), ops)).rejects.toThrow(GateUidCollisionError);
+    expect(createdUid).toBeUndefined();
   });
 
-  it("still refuses the agent uid even when excludeUids lists only OPERATOR uids (agent uid is structural)", () => {
+  it("still excludes the agent uid even when excludeUids lists only OPERATOR uids (agent uid is structural)", () => {
     expect(() =>
       planGateAccountProvision(base({ ceiling: AGENT_UID, excludeUids: [501, 0] }), {
         existingUid: undefined,

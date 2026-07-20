@@ -13,11 +13,15 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  applyRootOwnedDirEnsure,
   createInstallExclusiveEgressOps,
   createProductionReleaseBarrierOps,
   createRepairExclusiveEgressOps,
   createUnprotectExclusiveEgressOps,
+  ensureGateAccountHomeLayout,
   parkHarnessPersistently,
+  type GateAccountHomeLayoutOps,
+  type RootOwnedDirEnsureOps,
   restoreCoarseCompositionProduction,
   verifyHarnessJobDisabled,
   verifyHarnessParkedPersistent,
@@ -32,6 +36,7 @@ import {
   gateCredentialTokenPath,
 } from "../../src/egress-gate/gate-credential.js";
 import {
+  egressGateDaemonLogPaths,
   egressGateDaemonPlistPath,
   egressGatePolicyConfigPath,
   egressGateRulesConfigPath,
@@ -288,6 +293,14 @@ describe("parkHarnessPersistently (fix-round-2 HIGH-2: full persistent park)", (
     expect(calls).toContain(`disable system/${AGENT_HARNESS_DAEMON_LABEL}`);
     expect(calls).toContain("print-disabled system");
     expect(calls.some((c) => c.startsWith("print system/"))).toBe(true);
+    // F8 (2026-07-18 fix-round): DISABLE precedes BOOTOUT, the same order
+    // `executeParkedHarnessInstall` asserts and for the same reason -- the
+    // harness plist carries KeepAlive, so booting out an enabled job leaves a
+    // window for launchd to restart it. The codebase previously stated two
+    // different orders for one invariant.
+    expect(calls.indexOf(`disable system/${AGENT_HARNESS_DAEMON_LABEL}`)).toBeLessThan(
+      calls.indexOf(`bootout system/${AGENT_HARNESS_DAEMON_LABEL}`),
+    );
   });
 
   it("the reviewed defect: bootout ok + disable FAILS + probe says stopped must THROW, never a silent park claim", async () => {
@@ -428,6 +441,7 @@ describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quar
     live: boolean;
     liveReasons?: string[];
     printed: string[];
+    runLaunchctl?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
   }) {
     return createProductionReleaseBarrierOps({
       agentUid: 502,
@@ -442,9 +456,54 @@ describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quar
       internals: {
         registry: input.registry,
         probeAnchorLiveness: async () => ({ live: input.live, reasons: input.liveReasons ?? [] }),
+        ...(input.runLaunchctl === undefined ? {} : { runLaunchctl: input.runLaunchctl }),
       },
     });
   }
+
+  // ------------------------------------------------------------------
+  // FIX-ROUND 2 (2026-07-18), Codex MED + LOW. This factory's `bootoutJob`
+  // was the LAST production bootout still carrying its own narrow regex
+  // (stderr-only, `No such process` / `Could not find`) after the F4 "one
+  // predicate" fix. It is reachable from the release sequence's
+  // reassert-parked and bootstrap-cleanup steps, so a clean host reporting a
+  // not-loaded shape the regex did not know refused the fine-grained arm for
+  // no reason. Same predicate, same shapes, now covered here.
+  // ------------------------------------------------------------------
+
+  it("bootoutJob tolerates every not-loaded shape the shared predicate does (a clean host must not refuse)", async () => {
+    const notLoaded: Array<{ code: number; stdout: string; stderr: string }> = [
+      { code: 3, stdout: "", stderr: "" }, // standalone ESRCH, no phrase
+      { code: 113, stdout: "", stderr: "" }, // standalone "could not find specified service"
+      { code: 1, stdout: "", stderr: "service not loaded" },
+      { code: 1, stdout: "", stderr: "Service is not loaded" },
+      { code: 1, stdout: "", stderr: "No such service" },
+      { code: 1, stdout: "", stderr: "does not exist" },
+      { code: 1, stdout: "Could not find service", stderr: "" }, // stdout, not stderr
+    ];
+    for (const result of notLoaded) {
+      const ops = mkOps({
+        registry: memRegistry([VALID_ENTRY]),
+        live: true,
+        printed: [],
+        runLaunchctl: async () => result,
+      });
+      await expect(
+        ops.bootoutJob(),
+        `bootout ${result.code} / ${JSON.stringify(result.stderr || result.stdout)} must read as not-loaded`,
+      ).resolves.toBeUndefined();
+    }
+  });
+
+  it("bootoutJob still THROWS on a genuine failure -- the tolerance widened, it did not vanish", async () => {
+    const ops = mkOps({
+      registry: memRegistry([VALID_ENTRY]),
+      live: true,
+      printed: [],
+      runLaunchctl: async () => ({ code: 5, stdout: "", stderr: "Operation not permitted" }),
+    });
+    await expect(ops.bootoutJob()).rejects.toThrow(/bootout exited 5/);
+  });
 
   it("a malformed SIBLING entry no longer fails the valid uid's rearm: live rules verify ok, the sibling is LOUD", async () => {
     const printed: string[] = [];
@@ -501,6 +560,10 @@ describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quar
 
 describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: release binds to the CAPTURED generation)", () => {
   function mkBarrierOps(commitGen: number, calls: string[]): ReleaseBarrierOps {
+    // Stateful running flag (fix-round 3, 2026-07-19): reassert-parked now
+    // OBSERVES the stop, so an always-running stub refuses at stage one --
+    // which is the correct new behaviour and would have masked these tests.
+    let running = false;
     return {
       disableJob: async () => {
         calls.push("disableJob");
@@ -510,9 +573,11 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       },
       bootstrapJob: async () => {
         calls.push("bootstrapJob");
+        running = true;
       },
       bootoutJob: async () => {
         calls.push("bootoutJob");
+        running = false;
       },
       removeHoldFile: async () => undefined,
       writeHoldFile: async () => undefined,
@@ -522,7 +587,11 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502 }),
       writeReleasedPlist: async () => undefined,
       restoreParkedPlist: async () => undefined,
-      harnessStatus: async () => ({ known: true, installed: true, running: true, pid: 4242 }),
+      harnessStatus: async () =>
+        running
+          ? { known: true, installed: true, running: true, pid: 4242 }
+          : { known: true, installed: true, running: false },
+      sleepMs: async () => {},
     };
   }
 
@@ -538,7 +607,7 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       gateDaemonArgvPrefix: ["sanctuary"],
       excludeUids: [501],
       gateAccountCeiling: 599,
-      gateHomeDirectory: "/var/empty",
+      gateHomeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
       reloadPolicy: async () => ({ ok: true }),
       publishProvisionedRules: async () => ({ ok: true, ruleIds: [] }),
       audit: async () => undefined,
@@ -852,5 +921,260 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     expect(fs.files.has(PARKED_PLAN.plistPath)).toBe(false);
     expect(fs.files.has(HOLD_PATH)).toBe(false);
     await expect(ops.verifyParkedPersistent()).resolves.toEqual({ ok: true });
+  });
+});
+
+/**
+ * The root-owned runtime-directory ensure policy (drill D1 + the 2026-07-18
+ * two-family gate's F5/F7 findings).
+ *
+ * Asserted against the POLICY function over injected ops rather than the real
+ * filesystem, because the two steps that matter most -- `chown(0,0)` and the
+ * symlink refusal -- cannot be exercised by a non-root test process against
+ * real `fs`. The previous coverage substituted a hand-written ensure that
+ * DROPPED the chown, so deleting the production chown line changed no test.
+ */
+describe("applyRootOwnedDirEnsure (root-owned runtime directory policy)", () => {
+  interface EnsureLog {
+    sequence: string[];
+  }
+
+  function makeEnsureOps(kinds: Record<string, "dir" | "symlink" | "other"> = {}): {
+    ops: RootOwnedDirEnsureOps;
+    log: EnsureLog;
+  } {
+    const log: EnsureLog = { sequence: [] };
+    return {
+      log,
+      ops: {
+        async mkdir(path) {
+          log.sequence.push(`mkdir:${path}`);
+        },
+        async lstatKind(path) {
+          log.sequence.push(`lstat:${path}`);
+          return kinds[path] ?? "dir";
+        },
+        async chown(path, uid, gid) {
+          log.sequence.push(`chown:${path}:${uid}:${gid}`);
+        },
+        async chmod(path, mode) {
+          log.sequence.push(`chmod:${path}:${mode.toString(8)}`);
+        },
+      },
+    };
+  }
+
+  const HOLD = "/var/db/sanctuary/agent-harness";
+  const PARENT = "/var/db/sanctuary";
+
+  it("chowns the directory to root:wheel -- the step the old non-root test branch silently dropped", async () => {
+    const { ops, log } = makeEnsureOps();
+    await applyRootOwnedDirEnsure(HOLD, 0o755, ops);
+    expect(log.sequence).toContain(`chown:${HOLD}:0:0`);
+    // chown BEFORE chmod: mode on a directory someone else owns is meaningless.
+    expect(log.sequence.indexOf(`chown:${HOLD}:0:0`)).toBeLessThan(
+      log.sequence.indexOf(`chmod:${HOLD}:755`),
+    );
+  });
+
+  it("applies an EXPLICIT chmod, because mkdir's mode argument is umask-masked", async () => {
+    const { ops, log } = makeEnsureOps();
+    await applyRootOwnedDirEnsure(HOLD, 0o755, ops);
+    expect(log.sequence).toContain(`chmod:${HOLD}:755`);
+    expect(log.sequence.indexOf(`mkdir:${HOLD}`)).toBeLessThan(
+      log.sequence.indexOf(`chmod:${HOLD}:755`),
+    );
+  });
+
+  it("F5: ensures the PARENT too, so a first-ever install does not leave /var/db/sanctuary at umask mercy", async () => {
+    // The leaf-only version left the parent at `0777 & ~umask`; under a
+    // hardened umask the agent uid could not traverse to its own hold file,
+    // and the only thing that healed it was a LATER, unpinned step.
+    const { ops, log } = makeEnsureOps();
+    await applyRootOwnedDirEnsure(HOLD, 0o755, ops);
+    expect(log.sequence).toContain(`chmod:${PARENT}:755`);
+    expect(log.sequence).toContain(`chown:${PARENT}:0:0`);
+    // Parent fully established before the leaf is touched at all.
+    expect(log.sequence.indexOf(`chmod:${PARENT}:755`)).toBeLessThan(
+      log.sequence.indexOf(`mkdir:${HOLD}`),
+    );
+  });
+
+  it("F7: REFUSES a symlink-shaped directory before applying any ownership or mode to its target", async () => {
+    // Empirically demonstrated by the Codex lens: mkdir(p,{recursive:true})
+    // succeeds when p is a symlink to a directory, and the following chmod
+    // then changes the TARGET's mode. Root-run installer code must not do
+    // that, whatever /var/db's ownership makes "unlikely".
+    const { ops, log } = makeEnsureOps({ [HOLD]: "symlink" });
+    await expect(applyRootOwnedDirEnsure(HOLD, 0o755, ops)).rejects.toThrow(/symlink/);
+    expect(log.sequence).not.toContain(`chown:${HOLD}:0:0`);
+    expect(log.sequence).not.toContain(`chmod:${HOLD}:755`);
+  });
+
+  it("F7: refuses a symlink at the PARENT as well, before touching the leaf", async () => {
+    const { ops, log } = makeEnsureOps({ [PARENT]: "symlink" });
+    await expect(applyRootOwnedDirEnsure(HOLD, 0o755, ops)).rejects.toThrow(/symlink/);
+    expect(log.sequence).not.toContain(`mkdir:${HOLD}`);
+  });
+
+  it("F7: refuses a plain FILE sitting where the directory should be", async () => {
+    const { ops } = makeEnsureOps({ [HOLD]: "other" });
+    await expect(applyRootOwnedDirEnsure(HOLD, 0o755, ops)).rejects.toThrow(/not a real directory/);
+  });
+});
+
+describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", () => {
+  interface FakeStat {
+    kind: "dir" | "file" | "symlink" | "other";
+    uid: number;
+    gid: number;
+    mode: number;
+  }
+
+  function makeGateHomeOps(initial: Record<string, FakeStat> = {}): {
+    ops: GateAccountHomeLayoutOps;
+    stats: Map<string, FakeStat>;
+    sequence: string[];
+  } {
+    const stats = new Map<string, FakeStat>(Object.entries(initial));
+    const sequence: string[] = [];
+    const dirStat = (uid = 0, gid = 0, mode = 0o755): FakeStat => ({ kind: "dir", uid, gid, mode });
+    const fileStat = (uid = 0, gid = 0, mode = 0o600): FakeStat => ({ kind: "file", uid, gid, mode });
+    return {
+      stats,
+      sequence,
+      ops: {
+        async mkdir(path) {
+          sequence.push(`mkdir:${path}`);
+          if (!stats.has(path)) stats.set(path, dirStat());
+        },
+        async ensureFile(path, mode) {
+          sequence.push(`ensureFile:${path}:${mode.toString(8)}`);
+          if (!stats.has(path)) stats.set(path, fileStat(0, 0, mode));
+        },
+        async chown(path, uid, gid) {
+          sequence.push(`chown:${path}:${uid}:${gid}`);
+          const st = stats.get(path);
+          if (st !== undefined) stats.set(path, { ...st, uid, gid });
+        },
+        async chmod(path, mode) {
+          sequence.push(`chmod:${path}:${mode.toString(8)}`);
+          const st = stats.get(path);
+          if (st !== undefined) stats.set(path, { ...st, mode });
+        },
+        async lstat(path) {
+          sequence.push(`lstat:${path}`);
+          const st = stats.get(path);
+          if (st === undefined) {
+            const err = new Error(`ENOENT: ${path}`) as NodeJS.ErrnoException;
+            err.code = "ENOENT";
+            throw err;
+          }
+          return {
+            uid: st.uid,
+            gid: st.gid,
+            mode: st.mode,
+            isDirectory: () => st.kind === "dir",
+            isFile: () => st.kind === "file",
+            isSymbolicLink: () => st.kind === "symlink",
+          };
+        },
+      },
+    };
+  }
+
+  it("prepares the gate home and logs under the gate uid, not under the agent harness log dir", async () => {
+    const home = "/var/sanctuary-agents/sanctuary-gate-hermes";
+    const logDir = `${home}/logs`;
+    const { ops, stats, sequence } = makeGateHomeOps();
+    await expect(
+      ensureGateAccountHomeLayout(
+        { agentUid: 502, gateAccount: "sanctuary-gate-hermes", gateUid: 505, gateHomeDirectory: home },
+        ops,
+      ),
+    ).resolves.toEqual({ logDir });
+
+    const { stdoutPath, stderrPath } = egressGateDaemonLogPaths({
+      agentUid: 502,
+      gateAccount: "sanctuary-gate-hermes",
+      gateHomeDirectory: home,
+    });
+    expect(stats.get("/var/sanctuary-agents")).toMatchObject({ uid: 0, mode: 0o711 });
+    expect(stats.get(home)).toMatchObject({ uid: 505, gid: 505, mode: 0o700 });
+    expect(stats.get(logDir)).toMatchObject({ uid: 505, gid: 505, mode: 0o700 });
+    expect(stats.get(stdoutPath)).toMatchObject({ kind: "file", uid: 505, gid: 505, mode: 0o600 });
+    expect(stats.get(stderrPath)).toMatchObject({ kind: "file", uid: 505, gid: 505, mode: 0o600 });
+    expect(sequence).toContain(`chown:${logDir}:505:505`);
+    expect(sequence).toContain(`chown:${stdoutPath}:505:505`);
+    expect(sequence).toContain(`chown:${stderrPath}:505:505`);
+    expect(logDir).not.toBe("/var/sanctuary-agents/sanctuary-hermes/logs");
+  });
+
+  it("refuses an agent-account home paired with the gate account before touching it", async () => {
+    const { ops, sequence } = makeGateHomeOps();
+    await expect(
+      ensureGateAccountHomeLayout(
+        {
+          agentUid: 502,
+          gateAccount: "sanctuary-gate-hermes",
+          gateUid: 505,
+          gateHomeDirectory: "/var/sanctuary-agents/sanctuary-hermes",
+        },
+        ops,
+      ),
+    ).rejects.toThrow(/cross-account logs/);
+    expect(sequence).toEqual([]);
+  });
+
+  it("refuses a symlink-shaped gate log dir before chown/chmod can apply through it", async () => {
+    const home = "/var/sanctuary-agents/sanctuary-gate-hermes";
+    const logDir = `${home}/logs`;
+    const { ops, sequence } = makeGateHomeOps({ [logDir]: { kind: "symlink", uid: 0, gid: 0, mode: 0o777 } });
+    await expect(
+      ensureGateAccountHomeLayout(
+        { agentUid: 502, gateAccount: "sanctuary-gate-hermes", gateUid: 505, gateHomeDirectory: home },
+        ops,
+      ),
+    ).rejects.toThrow(/symlink/);
+    expect(sequence).not.toContain(`chown:${logDir}:505:505`);
+    expect(sequence).not.toContain(`chmod:${logDir}:700`);
+  });
+
+  it("H2: refuses a caller-supplied home outside the Sanctuary account base before any mutation", async () => {
+    const { ops, sequence } = makeGateHomeOps();
+    await expect(
+      ensureGateAccountHomeLayout(
+        {
+          agentUid: 502,
+          gateAccount: "sanctuary-gate-hermes",
+          gateUid: 505,
+          gateHomeDirectory: "/sanctuary-gate-hermes",
+        },
+        ops,
+      ),
+    ).rejects.toThrow(/outside \/var\/sanctuary-agents/);
+    expect(sequence).toEqual([]);
+  });
+
+  it("H3: re-owns stale launchd log files from a prior gate uid before reporting the layout verified", async () => {
+    const home = "/var/sanctuary-agents/sanctuary-gate-hermes";
+    const { stdoutPath, stderrPath } = egressGateDaemonLogPaths({
+      agentUid: 502,
+      gateAccount: "sanctuary-gate-hermes",
+      gateHomeDirectory: home,
+    });
+    const { ops, stats, sequence } = makeGateHomeOps({
+      [stdoutPath]: { kind: "file", uid: 505, gid: 505, mode: 0o600 },
+      [stderrPath]: { kind: "file", uid: 505, gid: 505, mode: 0o600 },
+    });
+    await ensureGateAccountHomeLayout(
+      { agentUid: 502, gateAccount: "sanctuary-gate-hermes", gateUid: 506, gateHomeDirectory: home },
+      ops,
+    );
+    expect(sequence).toContain(`lstat:${stdoutPath}`);
+    expect(sequence).toContain(`chown:${stdoutPath}:506:506`);
+    expect(sequence).toContain(`chmod:${stdoutPath}:600`);
+    expect(stats.get(stdoutPath)).toMatchObject({ kind: "file", uid: 506, gid: 506, mode: 0o600 });
+    expect(stats.get(stderrPath)).toMatchObject({ kind: "file", uid: 506, gid: 506, mode: 0o600 });
   });
 });

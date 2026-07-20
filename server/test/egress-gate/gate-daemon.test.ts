@@ -22,6 +22,7 @@ import {
   egressGatePolicyConfigPath,
   egressGateRulesConfigPath,
   egressGateRuntimeStatePath,
+  gateDaemonLogDirForHome,
   parseEgressGateRuntimeState,
   renderEgressGateDaemonPlist,
   runEgressGateDaemon,
@@ -68,6 +69,7 @@ describe("egress-gate/gate-daemon renderEgressGateDaemonPlist", () => {
   const base = {
     agentUid: AGENT_UID,
     gateAccount: "sanctuary-gate-hermes",
+    gateHomeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
     programArguments: ["/usr/local/bin/sanctuary", "castle-wall", "egress-gate-daemon", "--agent-uid=502"],
     fortressPath: "/Users/operator/.sanctuary",
   };
@@ -78,6 +80,23 @@ describe("egress-gate/gate-daemon renderEgressGateDaemonPlist", () => {
     expect(plist).toContain("<key>RunAtLoad</key>\n\t<false/>");
     expect(plist).toContain("<key>Crashed</key>");
     expect(plist).toContain("ai.sanctuaryprotocol.egress-gate.502");
+  });
+
+  it("derives stdout/stderr under the gate account's own home, never a caller-supplied foreign log dir", () => {
+    const plist = renderEgressGateDaemonPlist(base);
+    expect(gateDaemonLogDirForHome(base)).toBe("/var/sanctuary-agents/sanctuary-gate-hermes/logs");
+    expect(plist).toContain("/var/sanctuary-agents/sanctuary-gate-hermes/logs/egress-gate-502.out.log");
+    expect(plist).toContain("/var/sanctuary-agents/sanctuary-gate-hermes/logs/egress-gate-502.err.log");
+    expect(plist).not.toContain("/var/sanctuary-agents/sanctuary-hermes/logs");
+  });
+
+  it("REFUSES a gate account paired with the agent account home (the D6 launchd EX_CONFIG shape)", () => {
+    expect(() =>
+      renderEgressGateDaemonPlist({
+        ...base,
+        gateHomeDirectory: "/var/sanctuary-agents/sanctuary-hermes",
+      }),
+    ).toThrow(/cross-account logs/);
   });
 
   it("REFUSES to render a gate daemon running as root (the gate is TCB but must never hold root)", () => {
@@ -93,6 +112,7 @@ describe("egress-gate/gate-daemon renderEgressGateDaemonPlist", () => {
       /absolute program path/,
     );
     expect(() => renderEgressGateDaemonPlist({ ...base, fortressPath: "relative" })).toThrow(/must be absolute/);
+    expect(() => renderEgressGateDaemonPlist({ ...base, gateHomeDirectory: "relative" })).toThrow(/must be absolute/);
   });
 });
 

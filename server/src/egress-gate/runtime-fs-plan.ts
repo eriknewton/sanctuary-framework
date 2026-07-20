@@ -44,7 +44,9 @@
  * injected ops, so tests pin the EXACT ownership/mode/order sequence.
  */
 
-import { join } from "node:path";
+import { basename, join } from "node:path";
+
+import { AGENT_HARNESS_HOLD_DIR, AGENT_HARNESS_HOLD_DIR_MODE } from "./release-barrier.js";
 
 /** The root of every exclusive-egress runtime surface. */
 export const SANCTUARY_VAR_DB_DIR = "/var/db/sanctuary";
@@ -117,8 +119,11 @@ export function planExclusiveEgressRuntimeFs(input: GateRuntimeFsPlanInput): Gat
     // 0644 pinned supervisor public key; the 0600 private key stays root's).
     ...rootDir(dir("gate-liveness"), 0o711),
     // Hold dir: agent uid reads the hold file + exec wrapper (integrity by
-    // root ownership; no secret content).
-    ...rootDir(dir("agent-harness"), 0o755),
+    // root ownership; no secret content). Name AND mode come from the
+    // release-barrier constants, so this plan and the parked install's
+    // hold-dir chokepoint (`writeIntoHoldDir`) can never state two different
+    // layouts for the same directory (drill D1, 2026-07-18).
+    ...rootDir(dir(basename(AGENT_HARNESS_HOLD_DIR)), AGENT_HARNESS_HOLD_DIR_MODE),
   ];
 }
 
@@ -146,15 +151,33 @@ export async function applyGateRuntimeFsPlan(
   }
 }
 
-/** Production ops (root): real mkdir (EEXIST-tolerant), chown, chmod. */
+/**
+ * Production ops (root): real mkdir (EEXIST-tolerant), chown, chmod.
+ *
+ * SYMLINK REFUSAL (Codex lens, 2026-07-18, demonstrated empirically in a temp
+ * dir): when `path` is a symlink to a directory, `mkdir` reports EEXIST and
+ * the following `chown(0,0)`/`chmod` then apply to the LINK TARGET, while
+ * `lstat` still reports a symlink. These ops run as root and this plan is what
+ * establishes the traversal invariant the gate + agent uids depend on, so a
+ * link-shaped runtime directory is refused before any ownership or mode is
+ * applied to whatever it points at, rather than trusting that `/var/db` being
+ * root-owned makes the shape impossible.
+ */
 export function createRealGateRuntimeFsOps(): GateRuntimeFsOps {
   return {
     async mkdir(path: string): Promise<void> {
-      const { mkdir } = await import("node:fs/promises");
+      const { lstat, mkdir } = await import("node:fs/promises");
       try {
         await mkdir(path);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      }
+      const st = await lstat(path);
+      if (!st.isDirectory()) {
+        throw new Error(
+          `${path} is a ${st.isSymbolicLink() ? "symlink" : "non-directory"}, not a real directory; ` +
+            "refusing to apply root ownership or mode through it. Remove it and re-run.",
+        );
       }
     },
     async chown(path: string, uid: number, gid: number): Promise<void> {

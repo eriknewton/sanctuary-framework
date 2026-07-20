@@ -36,6 +36,12 @@ function makeOps(overrides?: Partial<Record<keyof ReleaseBarrierOps, unknown>>):
   const calls: string[] = [];
   const written: HarnessReleaseHoldRecord[] = [];
   const releasedPlists: CommittedGenerationIdentity[] = [];
+  // A MINI-HOST, not a per-verb stub (fix-round 3, 2026-07-19). The old base
+  // ops answered `harnessStatus` with "running" unconditionally, including
+  // BEFORE the bootstrap -- which is precisely the state the round-3 blocker
+  // says must refuse, and precisely why no test caught that the sequence never
+  // asked. The flag now tracks the launchd verbs.
+  let running = false;
   const base: ReleaseBarrierOps = {
     async disableJob() {
       calls.push("disable");
@@ -45,9 +51,11 @@ function makeOps(overrides?: Partial<Record<keyof ReleaseBarrierOps, unknown>>):
     },
     async bootstrapJob() {
       calls.push("bootstrap");
+      running = true;
     },
     async bootoutJob() {
       calls.push("bootout");
+      running = false;
     },
     async removeHoldFile() {
       calls.push("removeHold");
@@ -81,8 +89,11 @@ function makeOps(overrides?: Partial<Record<keyof ReleaseBarrierOps, unknown>>):
     },
     async harnessStatus() {
       calls.push("harnessStatus");
-      return { known: true, installed: true, running: true, pid: 4242 };
+      return running
+        ? { known: true, installed: true, running: true, pid: 4242 }
+        : { known: true, installed: true, running: false };
     },
+    sleepMs: async () => {},
   };
   const ops = { ...base, ...(overrides as Partial<ReleaseBarrierOps>) };
   return { ops, calls, written, releasedPlists };
@@ -98,6 +109,11 @@ describe("runReleaseBarrierSequence: happy path", () => {
       "removeHold", // reassert-parked: stale hold cleared
       "disable", // reassert-parked: persistent park asserted
       "restoreParkedPlist", // reassert-parked: a crashed run's released plist cleared
+      // Fix-round 3 BLOCKER: the park is now OBSERVED before anything else
+      // runs. Without this probe the sequence proceeded on the strength of
+      // `bootoutJob` not throwing, and the later running checks could not tell
+      // the released process from a pre-G5 one that survived the park.
+      "harnessStatus",
       "rearm",
       "verifyGate",
       "commit",
@@ -208,7 +224,7 @@ describe("runReleaseBarrierSequence: abort branches (fail-closed, hold removed, 
       },
     });
     const outcome = await runReleaseBarrierSequence(CTX, ops);
-    expect(outcome).toEqual({
+    expect(outcome).toMatchObject({
       kind: "parked",
       stage: "rearm-anchor",
       reason: "pf anchor re-arm failed: pfctl exited 1",
@@ -570,7 +586,7 @@ describe("runReleaseBarrierSequence: verify-running (liveness; fix-round HIGH-3)
     expect(outcome.kind).toBe("parked");
     if (outcome.kind !== "parked") return;
     expect(outcome.stage).toBe("verify-running");
-    expect(outcome.reason).toContain("not running after bootstrap");
+    expect(outcome.reason).toContain("did not reach a stable running state after bootstrap");
     expect(outcome.holdFileRemoved).toBe(true);
     expect(outcome.jobDisabled).toBe(true);
     expect(calls).toContain("bootout");
@@ -578,8 +594,17 @@ describe("runReleaseBarrierSequence: verify-running (liveness; fix-round HIGH-3)
   });
 
   it("parks fail-closed when the status is untrustworthy or the probe throws", async () => {
+    // Untrustworthy only AFTER the bootstrap, so this stays a verify-running
+    // test; the reassert-parked equivalents are asserted separately below.
+    let bootstrapped = false;
     const { ops: unknownOps } = makeOps({
-      harnessStatus: async () => ({ known: false, installed: false, running: false }),
+      bootstrapJob: async () => {
+        bootstrapped = true;
+      },
+      harnessStatus: async () =>
+        bootstrapped
+          ? { known: false, installed: false, running: false }
+          : { known: true, installed: true, running: false },
     });
     const unknown = await runReleaseBarrierSequence(CTX, unknownOps);
     expect(unknown.kind).toBe("parked");
@@ -587,8 +612,13 @@ describe("runReleaseBarrierSequence: verify-running (liveness; fix-round HIGH-3)
     expect(unknown.stage).toBe("verify-running");
     expect(unknown.reason).toContain("trustworthy");
 
+    let threwArmed = false;
     const { ops: throwOps } = makeOps({
+      bootstrapJob: async () => {
+        threwArmed = true;
+      },
       harnessStatus: async () => {
+        if (!threwArmed) return { known: true, installed: true, running: false };
         throw new Error("launchctl hung");
       },
     });
@@ -599,14 +629,85 @@ describe("runReleaseBarrierSequence: verify-running (liveness; fix-round HIGH-3)
     expect(threw.reason).toContain("launchctl hung");
   });
 
+  // ROUND-3 BLOCKER (Codex finding 1). `parkCleanup` reports success when
+  // `bootoutJob`/`removeHoldFile`/`disableJob`/`restoreParkedPlist` did not
+  // throw -- an intent. Production's `bootoutJob` accepts success through the
+  // shared not-loaded predicate, so a launchd shape that tolerates the bootout
+  // while the job keeps running used to carry a LIVE pre-G5 harness straight
+  // into rearm/verify/commit, and the final stable-running check could not
+  // tell it from the released one.
+  describe("reassert-parked is OBSERVED, not intended (fix-round 3 BLOCKER)", () => {
+    it("refuses BEFORE rearm when bootout resolves but the job is still running", async () => {
+      const { ops, calls } = makeOps({
+        // Resolves -- exactly what the shared predicate tolerates.
+        bootoutJob: async () => {
+          calls.push("bootout");
+        },
+        harnessStatus: async () => {
+          calls.push("harnessStatus");
+          return { known: true, installed: true, running: true, pid: 4242 };
+        },
+      });
+      const outcome = await runReleaseBarrierSequence(CTX, ops);
+      expect(outcome.kind).toBe("parked");
+      if (outcome.kind !== "parked") return;
+      expect(outcome.stage).toBe("reassert-parked");
+      expect(outcome.reason).toContain("still reports a pid");
+      // THE POINT: nothing downstream of the barrier line ran.
+      expect(calls).not.toContain("rearm");
+      expect(calls).not.toContain("commit");
+      expect(calls).not.toContain("writeHold");
+      expect(calls).not.toContain("enable");
+      expect(calls).not.toContain("bootstrap");
+    });
+
+    it("refuses when launchd's state is unknowable after the bootout", async () => {
+      const { ops, calls } = makeOps({
+        harnessStatus: async () => ({ known: false, installed: false, running: false }),
+      });
+      const outcome = await runReleaseBarrierSequence(CTX, ops);
+      expect(outcome.kind).toBe("parked");
+      if (outcome.kind !== "parked") return;
+      expect(outcome.stage).toBe("reassert-parked");
+      expect(outcome.reason).toContain("trustworthy");
+      expect(calls).not.toContain("rearm");
+    });
+
+    it("refuses when the probe throws, and when a pid survives an unstable-downgraded status", async () => {
+      const { ops: throwOps } = makeOps({
+        harnessStatus: async () => {
+          throw new Error("launchctl hung");
+        },
+      });
+      const threw = await runReleaseBarrierSequence(CTX, throwOps);
+      expect(threw.kind).toBe("parked");
+      if (threw.kind !== "parked") return;
+      expect(threw.stage).toBe("reassert-parked");
+
+      // Production downgrades `running` to false for a pid that is not STABLE
+      // across samples -- the right bar for "did it come up", the wrong one for
+      // "is it gone". A crash-looping pre-G5 harness is a live process.
+      const { ops: flapOps, calls } = makeOps({
+        harnessStatus: async () => ({ known: true, installed: true, running: false, pid: 9001 }),
+      });
+      const flapped = await runReleaseBarrierSequence(CTX, flapOps);
+      expect(flapped.kind).toBe("parked");
+      if (flapped.kind !== "parked") return;
+      expect(flapped.stage).toBe("reassert-parked");
+      expect(flapped.reason).toContain("9001");
+      expect(calls).not.toContain("rearm");
+    });
+  });
+
   it("parks when the harness dies across the boot-state re-park (released is never claimed for a dead harness)", async () => {
     let probeCount = 0;
     const { ops, calls } = makeOps({
       harnessStatus: async () => {
         probeCount += 1;
         calls.push("harnessStatus");
-        // Alive after bootstrap; dead after the re-park.
-        return probeCount === 1
+        // Probe 1 is reassert-parked (must be STOPPED); probe 2 is
+        // post-bootstrap (alive); probe 3 is post-re-park (dead).
+        return probeCount === 2
           ? { known: true, installed: true, running: true, pid: 4242 }
           : { known: true, installed: true, running: false };
       },
@@ -620,5 +721,142 @@ describe("runReleaseBarrierSequence: verify-running (liveness; fix-round HIGH-3)
     // The re-park already disabled the job; the cleanup boots the dead job out.
     expect(outcome.jobDisabled).toBe(true);
     expect(calls).toContain("bootout");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-ROUND 4: the parked-claim chokepoint
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 3 fixed the "parked by intent" pattern at ONE site and both remaining
+ * sites of the identical shape survived. These tests are Codex's round-4
+ * counterexample, reproduced: `bootoutJob` resolves, launchd still reports a
+ * live pid, and the abort must NOT come back claiming the agent is parked.
+ *
+ * They assert on OBSERVED STATE and on the claim the outcome carries, not on
+ * which ops were called: "the probe was invoked" is exactly the kind of
+ * control-flow assertion this whole branch exists to stop trusting.
+ */
+describe("runReleaseBarrierSequence: no abort claims parked over a live process", () => {
+  /** A mini-host whose bootout is a LIAR: it resolves and the process lives. */
+  function makeSurvivorOps(overrides?: Partial<Record<keyof ReleaseBarrierOps, unknown>>) {
+    const made = makeOps({
+      // Codex's counterexample: the bootout resolves cleanly...
+      async bootoutJob() {
+        /* resolves, changes nothing */
+      },
+      // ...and launchd keeps reporting the live pid throughout.
+      async harnessStatus() {
+        return { known: true, installed: true, running: true, pid: 4242 };
+      },
+      ...overrides,
+    });
+    return made;
+  }
+
+  it("bootstrap abort: a surviving pid makes the outcome refuse the parked claim (Codex round-4 HIGH-1)", async () => {
+    const { ops } = makeSurvivorOps({
+      async bootstrapJob() {
+        throw new Error("kickstart failed after start");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    // The barrier did not release -- but that is a fact about the RELEASE.
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    // ...and the run-state claim is the honest one. Before fix-round 4 this
+    // outcome came back clean with no claim at all.
+    expect(outcome.parkedClaim.state).toBe("alive");
+    expect(outcome.parkedClaim.observed).toContain("4242");
+    // THE RENDERED SENTENCE, which is what a human actually reads.
+    expect(outcome.parkedClaim.sentence).toContain("RUNNING (pid 4242)");
+    expect(outcome.parkedClaim.sentence).not.toContain("PARKED");
+  });
+
+  it("verify-running abort: same shape, same refusal", async () => {
+    // A STATEFUL host, so this test reaches verify-running rather than being
+    // turned back at the initial reassert (which would make it pass for the
+    // wrong reason). Timeline: reassert observes genuinely stopped -> bootstrap
+    // starts a process -> the wrapper refuses, so `running` downgrades to false
+    // while the pid PERSISTS -> the abort's bootout lies and the pid survives.
+    let phase: "before" | "after" = "before";
+    const { ops } = makeOps({
+      async bootstrapJob() {
+        phase = "after";
+      },
+      async bootoutJob() {
+        /* resolves, changes nothing -- the round-4 lying bootout */
+      },
+      async harnessStatus() {
+        return phase === "before"
+          ? { known: true, installed: true, running: false }
+          : { known: true, installed: true, running: false, pid: 4242 };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    // Proves we got past the reassert gate and aborted where intended.
+    expect(outcome.stage).toBe("verify-running");
+    // `running: false` with a pid is the crash-looping survivor: the pid check
+    // is separate from `running` precisely so this reads ALIVE, not parked.
+    expect(outcome.parkedClaim.state).toBe("alive");
+    expect(outcome.parkedClaim.sentence).toContain("4242");
+    expect(outcome.parkedClaim.sentence).not.toContain("PARKED");
+  });
+
+  it("an UNKNOWABLE launchd state is never a park (fail-closed both ways)", async () => {
+    const { ops } = makeOps({
+      async bootstrapJob() {
+        throw new Error("kickstart failed after start");
+      },
+      async harnessStatus() {
+        return { known: false, installed: false, running: false };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.parkedClaim.state).toBe("unknown");
+    expect(outcome.parkedClaim.sentence).toContain("POSSIBLY RUNNING");
+    expect(outcome.parkedClaim.sentence).not.toContain("PARKED");
+  });
+
+  it("a genuinely stopped harness DOES get the parked claim (the guard is not just 'always refuse')", async () => {
+    const { ops } = makeOps({
+      async bootstrapJob() {
+        throw new Error("kickstart failed after start");
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.parkedClaim.state).toBe("parked");
+    expect(outcome.parkedClaim.sentence).toContain("is PARKED (not running)");
+  });
+
+  it("EVERY parked outcome carries a claim -- no abort stage is exempt", async () => {
+    // The point of a chokepoint is that it has no holes, so enumerate the
+    // abort stages rather than spot-checking the two a reviewer named.
+    const aborts: Array<[string, Partial<Record<keyof ReleaseBarrierOps, unknown>>]> = [
+      ["rearm-anchor", { async rearmAnchor() { return { ok: false as const, reason: "pf down" }; } }],
+      ["gate-verify", { async verifyGate() { return { ok: false as const, reasons: ["oracle dead"] }; } }],
+      ["commit-generation", { async commitGeneration() { throw new Error("commit failed"); } }],
+      ["write-hold-file", { async writeHoldFile() { throw new Error("disk full"); } }],
+      ["write-released-plist", { async writeReleasedPlist() { throw new Error("plist write failed"); } }],
+      ["enable", { async enableJob() { throw new Error("enable refused"); } }],
+      ["bootstrap", { async bootstrapJob() { throw new Error("bootstrap refused"); } }],
+    ];
+    for (const [stage, override] of aborts) {
+      const { ops } = makeOps(override);
+      const outcome = await runReleaseBarrierSequence(CTX, ops);
+      expect(outcome.kind, `${stage} must park`).toBe("parked");
+      if (outcome.kind !== "parked") continue;
+      expect(outcome.stage, `${stage} stage`).toBe(stage);
+      // A ParkedClaim cannot be forged, so its mere presence proves the
+      // chokepoint ran. Its VALUE proves what was observed.
+      expect(outcome.parkedClaim.state, `${stage} claim state`).toBe("parked");
+    }
   });
 });
