@@ -110,6 +110,86 @@ describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix ro
     ).toEqual({ kind: "value", value: "/var/sanctuary agents/sanctuary-hermes" });
   });
 
+  it("S5 drill: parses the native IsHidden capture without losing absent-record classifications or suffix anchoring", () => {
+    // Captured from the drill host with od -c: dsAttrTypeNative:IsHidden: 1\n.
+    const capturedNativeIsHiddenStdout = "dsAttrTypeNative:IsHidden: 1\n";
+    expect(Buffer.byteLength(capturedNativeIsHiddenStdout, "utf8")).toBe(29);
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 0,
+        stdout: capturedNativeIsHiddenStdout,
+        stderr: "",
+      }),
+    ).toEqual({ kind: "value", value: "1" });
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 0,
+        stdout: "IsHidden: 1\n",
+        stderr: "",
+      }),
+    ).toEqual({ kind: "value", value: "1" });
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 0,
+        stdout: "",
+        stderr: "No such key: IsHidden\n",
+      }),
+    ).toEqual({ kind: "attribute-absent" });
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 56,
+        stdout: "",
+        stderr: "/usr/bin/dscl DS Error: -14136 (eDSRecordNotFound)\n",
+      }),
+    ).toEqual({ kind: "record-absent" });
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 0,
+        stdout: "NotIsHidden: 1\n",
+        stderr: "",
+      }).kind,
+    ).toBe("unknown");
+  });
+
+  it("S5 drill: diagnoses the native IsHidden capture as an attribute line", () => {
+    const capturedNativeIsHiddenStdout = "dsAttrTypeNative:IsHidden: 1\n";
+    const diagnostic = dsclDiagnostic({
+      code: 0,
+      stdout: capturedNativeIsHiddenStdout,
+      stderr: "",
+    });
+    expect(diagnostic).toContain("stdout: 29 bytes");
+    expect(diagnostic).toContain("attributes=[IsHidden]");
+    expect(diagnostic).not.toContain("unclassified-lines");
+  });
+
+  it("diagnoses an underscore-prefixed native attribute rather than calling it residue", () => {
+    // Real macOS emits native attributes whose names begin with an underscore,
+    // e.g. `dscl . -read /Users/<x> _writers_passwd`. Naming no attribute here
+    // is what sent an operator to repair a healthy account on 2026-07-20.
+    const diagnostic = dsclDiagnostic({
+      code: 0,
+      stdout: "dsAttrTypeNative:_writers_passwd: eriknewton\n",
+      stderr: "",
+    });
+    expect(diagnostic).toContain("attributes=[_writers_passwd]");
+    expect(diagnostic).not.toContain("unclassified-lines");
+  });
+
+  it("still counts genuinely unparseable dscl output as residue", () => {
+    // The fail-closed property must survive widening the attribute charclass.
+    expect(dsclDiagnostic({ code: 0, stdout: "total nonsense here\n", stderr: "" })).toContain(
+      "unclassified-lines=1",
+    );
+    expect(
+      dsclDiagnostic({
+        code: 0,
+        stdout: "dsAttrTypeNative:dsAttrTypeNative:IsHidden: 1\n",
+        stderr: "",
+      }),
+    ).toContain("unclassified-lines=1");
+  });
+
   it("returns unknown rather than claiming absence on unclassified dscl output", () => {
     expect(
       decideDsclRecordRead({
