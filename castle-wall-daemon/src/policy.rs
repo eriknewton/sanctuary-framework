@@ -654,11 +654,25 @@ impl PolicySnapshot {
 
 fn confined_agent_uid_from_loaded_manifest(loaded: &LoadedManifest) -> Option<u32> {
     let origin = loaded.signed.manifest.agent_origin.as_ref()?;
-    if origin.mode == "uid" {
-        origin.agent_uid.filter(|uid| *uid > 0)
-    } else {
-        None
+    if origin.mode != "uid" {
+        return None;
     }
+
+    let agent_uid = origin.agent_uid?;
+    if agent_uid < 1 || agent_uid < origin.system_uid_allow_ceiling {
+        return None;
+    }
+
+    if let Some(gate_uid) = origin.gate_uid {
+        if gate_uid < 1
+            || gate_uid < origin.system_uid_allow_ceiling
+            || gate_uid == agent_uid
+        {
+            return None;
+        }
+    }
+
+    Some(agent_uid)
 }
 
 /// Validate a parsed rule's match axes at snapshot-build time (codex round-4
@@ -1537,12 +1551,58 @@ mod tests {
             agent_runtime_port_range: None,
             agent_uid: Some(503),
             gate_uid: Some(504),
-            system_uid_allow_ceiling: 999,
+            system_uid_allow_ceiling: 500,
         });
 
         let snap = PolicySnapshot::from_loaded_manifest(&loaded).expect("snapshot");
 
         assert_eq!(snap.confined_agent_uid, Some(503));
+    }
+
+    #[test]
+    fn snapshot_refuses_uid_mode_agent_origin_below_system_uid_ceiling() {
+        let r1 = rule(
+            "uuid-1",
+            RuleMatch {
+                host: Some(vec!["api.anthropic.com".to_string()]),
+                port: Some(vec![443]),
+                protocol: Some("tcp".to_string()),
+                ..Default::default()
+            },
+            RuleScope::default(),
+            RuleDisposition::Allow,
+        );
+        let mut loaded = synthetic_loaded(vec![
+            ("rule-0.json".to_string(), r1),
+            ("rule-habeas.json".to_string(), habeas_local_rule()),
+        ]);
+        loaded.signed.manifest.agent_origin = Some(AgentOrigin {
+            mode: "uid".to_string(),
+            egress_helper_signing_id: None,
+            egress_helper_team_id: None,
+            agent_runtime_port_range: None,
+            agent_uid: Some(65),
+            gate_uid: None,
+            system_uid_allow_ceiling: 500,
+        });
+
+        let snap = PolicySnapshot::from_loaded_manifest(&loaded).expect("snapshot");
+
+        assert_eq!(snap.confined_agent_uid, None);
+
+        let body = build_audit_event_canonical_json(
+            &Verdict::Deny {
+                reason: DeniedReason::DefaultDeny,
+            },
+            &req(Some("evil.example"), 443, "tcp"),
+            "fortress:test",
+            snap.confined_agent_uid,
+            "2026-05-05T01:02:03Z",
+        )
+        .unwrap();
+        let parsed = parse_canonical(&body);
+        assert_ne!(parsed["identity_id"], json!("fortress:test/uid-65"));
+        assert_eq!(parsed["identity_id"], json!("agent-1"));
     }
 
     #[test]
@@ -2024,6 +2084,9 @@ mod tests {
 
     #[test]
     fn linux_audit_fixture_vectors_are_emitted_by_the_audit_builder() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../server/test/castle-wall/fixtures/linux-daemon-canonical-subject-audit-vectors.json"
+        )).unwrap();
         let v = Verdict::Deny {
             reason: DeniedReason::DefaultDeny,
         };
@@ -2050,15 +2113,12 @@ mod tests {
             "2026-05-05T01:02:03Z",
         ).unwrap();
 
+        assert_eq!(uid_503, fixture["uid_503"].as_str().unwrap());
+        assert_eq!(uid_504, fixture["uid_504"].as_str().unwrap());
         assert_eq!(
-            parse_canonical(&uid_503)["identity_id"],
-            json!("fortress:test/uid-503")
+            old_agent_name,
+            fixture["old_agent_name"].as_str().unwrap()
         );
-        assert_eq!(
-            parse_canonical(&uid_504)["identity_id"],
-            json!("fortress:test/uid-504")
-        );
-        assert_eq!(parse_canonical(&old_agent_name)["identity_id"], json!("agent-1"));
 
         if std::env::var("SANCTUARY_CAPTURE_LINUX_AUDIT_FIXTURES").as_deref() == Ok("1") {
             println!("uid_503={uid_503}");

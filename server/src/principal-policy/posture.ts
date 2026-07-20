@@ -62,6 +62,7 @@ import {
   livenessEntryCounts,
   producerSignedDedupKey,
   subjectEvidenceForReverifiedEntry,
+  signedCanonicalSubjectIssue,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
 import {
@@ -274,6 +275,7 @@ export interface CastleWallPosture {
     | "not_installed"
     | "subject_unbound_evidence"
     | "legacy_macos_audit_token"
+    | "pre_canonical_linux_agent_name"
     | "subject_unresolvable"
     // Slice P: a producer key is expected but the reader could not load it, so
     // the wall is reported `degraded` rather than green on a weaker basis.
@@ -378,7 +380,8 @@ export interface BuildCastleWallPostureInput {
    * with the same subject. An unresolvable claim subject is explicit
    * `subject_unresolvable`; mismatched/missing subjects are
    * `subject_unbound_evidence`; legacy macOS 64-hex audit token identities are
-   * `legacy_macos_audit_token`. None is green.
+   * `legacy_macos_audit_token`; old Linux daemon agent-name identities are
+   * `pre_canonical_linux_agent_name`. None is green.
    */
   protectionClaimSubject: string | null;
 }
@@ -519,6 +522,7 @@ export async function buildCastleWallPosture(
   let latestStandDownMs: number | null = null;
   let latestSubjectRejectedEnforcementMs: number | null = null;
   let latestLegacyMacOSAuditTokenEnforcementMs: number | null = null;
+  let latestPreCanonicalLinuxAgentNameEnforcementMs: number | null = null;
   let latestSubjectUnresolvableEnforcementMs: number | null = null;
   // Track the authenticity basis of the MOST RECENT arm-eligible enforcement
   // entry, so the posture honestly reports whether the green light rests on a
@@ -602,6 +606,10 @@ export async function buildCastleWallPosture(
         subjectEvidenceForReverifiedEntry(entry, reResult),
       );
       if (!subjectMatch.matches) {
+        const subjectIssue =
+          reResult.basis === "producer_signed_verified" && isRecord(entry.details)
+            ? signedCanonicalSubjectIssue(entry.details, subjectFortressId)
+            : null;
         if (
           tsValidForArm &&
           subjectMatch.reason === "subject_unresolvable" &&
@@ -616,6 +624,13 @@ export async function buildCastleWallPosture(
             armTs > latestLegacyMacOSAuditTokenEnforcementMs)
         ) {
           latestLegacyMacOSAuditTokenEnforcementMs = armTs;
+        } else if (
+          tsValidForArm &&
+          subjectIssue === "pre_canonical_linux_agent_name" &&
+          (latestPreCanonicalLinuxAgentNameEnforcementMs === null ||
+            armTs > latestPreCanonicalLinuxAgentNameEnforcementMs)
+        ) {
+          latestPreCanonicalLinuxAgentNameEnforcementMs = armTs;
         } else if (
           tsValidForArm &&
           subjectMatch.reason !== "subject_unresolvable" &&
@@ -711,6 +726,9 @@ export async function buildCastleWallPosture(
   const hasFreshLegacyMacOSAuditTokenEnforcement =
     latestLegacyMacOSAuditTokenEnforcementMs !== null &&
     latestLegacyMacOSAuditTokenEnforcementMs >= freshnessFloor;
+  const hasFreshPreCanonicalLinuxAgentNameEnforcement =
+    latestPreCanonicalLinuxAgentNameEnforcementMs !== null &&
+    latestPreCanonicalLinuxAgentNameEnforcementMs >= freshnessFloor;
   const hasFreshSubjectUnresolvableEnforcement =
     latestSubjectUnresolvableEnforcementMs !== null &&
     latestSubjectUnresolvableEnforcementMs >= freshnessFloor;
@@ -760,6 +778,9 @@ export async function buildCastleWallPosture(
   } else if (hasFreshLegacyMacOSAuditTokenEnforcement) {
     armState = "unknown";
     basis = "legacy_macos_audit_token";
+  } else if (hasFreshPreCanonicalLinuxAgentNameEnforcement) {
+    armState = "unknown";
+    basis = "pre_canonical_linux_agent_name";
   } else if (hasFreshSubjectRejectedEnforcement) {
     armState = "unknown";
     basis = "subject_unbound_evidence";

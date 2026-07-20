@@ -1,31 +1,32 @@
 /**
- * C4 (tamper-proof half) — end-to-end Linux producer-signed activation.
+ * C4 (tamper-proof half) - deterministic Linux producer-signed binding harness.
  *
- * Slice L1/R/P built the producer-signing daemon + the re-verifying consumer +
- * the single-source key loader, but nothing in PRODUCTION launched the daemon
- * with the key flags, bound a transport, or ran the drain pull-loop that feeds
- * signed events into the consumer. This suite exercises that now-built path
- * (`linux-daemon.ts` launcher + `linux-audit-drain.ts` pull-loop +
- * `linux-activation-gate.ts` opt-in/fail-closed gate) end-to-end against a mock
- * systemd + a mock daemon that serves real `audit_drain_response` frames.
+ * This suite exercises the binding half of the Linux path against mock systemd
+ * and a mock daemon transport. The signed event bodies come from the Rust audit
+ * builder fixture, not from a live privileged Linux daemon drain. The Linux
+ * manifest-publication half that stamps `agent_origin` does not exist yet, so
+ * this test suite does not claim live Linux green or S5 drill success.
  *
  * The four pre-declared acceptance cases (spec P-4):
- *   (a) a real daemon-signed event re-verifies GREEN because the key is now
- *       loaded via the launcher (consumer ACCEPTS the producer signature);
+ *   (a) a Rust-builder event signed by the mock daemon key re-verifies GREEN in
+ *       this harness when the claim subject matches;
  *   (b) a forged in-process entry renders NON-green BECAUSE the key is loaded
  *       (consumer REJECTS it — not key-null);
  *   (c) macOS / no-key path stays on the channel basis (no regression);
  *   (d) fail-closed when the daemon won't start or the key is unreadable
  *       (activation THROWS → not-armed, never green, never channel fallback).
  *
- * DRILL-ACCEPTANCE NOTE: this is test/smoke coverage. The production-arm
- * capability claim still requires a CAPTURED DRILL on real Linux hardware.
+ * DRILL-ACCEPTANCE NOTE: this is test/smoke coverage only. No Linux capability
+ * claim is made until the missing publication half is implemented and drilled on
+ * real Linux hardware.
  */
 
 import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -71,6 +72,9 @@ import {
 import { RuntimeLinuxActivationError } from "../../../src/castle-wall/runtime/errors.js";
 
 type LinuxDaemonAuditFixtureKey = "uid_503" | "uid_504" | "old_agent_name";
+const daemonManifestPath = fileURLToPath(
+  new URL("../../../../castle-wall-daemon/Cargo.toml", import.meta.url),
+);
 const linuxDaemonAuditFixtures = JSON.parse(
   readFileSync(
     new URL(
@@ -114,7 +118,7 @@ function walBody(
   return linuxDaemonAuditFixtures[fixture];
 }
 
-/** A genuine daemon-signed drain event (signed with the daemon's priv key). */
+/** A valid mock-signed drain event using the daemon-key test fixture. */
 function signedDrainEvent(
   priv: Uint8Array,
   seq: number,
@@ -534,7 +538,26 @@ describe("C4 — P-2 drain mapping: drain event → critical envelope with produ
 });
 
 describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
-  it("(a) a real daemon-signed event re-verifies GREEN once the key is loaded via the launcher", async () => {
+  it("(a) Rust policy refuses system uid origins before canonical subject audit emission", () => {
+    const output = execFileSync(
+      "cargo",
+      [
+        "test",
+        "snapshot_refuses_uid_mode_agent_origin_below_system_uid_ceiling",
+        "--manifest-path",
+        daemonManifestPath,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(output).toContain(
+      "snapshot_refuses_uid_mode_agent_origin_below_system_uid_ceiling",
+    );
+    expect(output).toContain("test result: ok.");
+    expect(output).toContain("1 passed");
+  });
+
+  it("(a) a mock-signed Rust-builder event re-verifies GREEN once the key is loaded via the launcher", async () => {
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     await publishPubKey(tmp, pub);
@@ -650,7 +673,7 @@ describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
     }
   });
 
-  it("(d) old-format Linux agent-name signed evidence fails closed as subject-unbound and never greens", async () => {
+  it("(d) old-format Linux agent-name signed evidence fails closed as pre-canonical and never greens", async () => {
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     const activated = await activateAndDrainCapturedFixture({
@@ -669,7 +692,7 @@ describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
       });
 
       expect(posture.arm_state).toBe("unknown");
-      expect(posture.evidence_basis).toBe("subject_unbound_evidence");
+      expect(posture.evidence_basis).toBe("pre_canonical_linux_agent_name");
       expect(posture.producer_authenticity).toBe("not_applicable");
       expect(posture.verdict_counts.blocked).toBe(0);
     } finally {

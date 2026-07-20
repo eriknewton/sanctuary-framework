@@ -599,6 +599,8 @@ export function renderPostureHomeHTML(): string {
         return "Castle Wall has recent enforcement evidence, but it is not attributed to this confined agent.";
       case "legacy_macos_audit_token":
         return "Evidence predates the subject-binding format; re-arm Castle Wall to produce subject-bound evidence.";
+      case "pre_canonical_linux_agent_name":
+        return "Linux evidence predates canonical subject binding; upgrade the daemon path before claiming this agent is protected.";
       case "subject_unresolvable":
         return "This agent's confinement identity could not be read, so no enforcement evidence can be bound to it.";
       case "no_activity_event_driven":

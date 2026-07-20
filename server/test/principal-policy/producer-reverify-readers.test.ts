@@ -48,6 +48,7 @@ import {
 } from "../../src/castle-wall/constants.js";
 
 const FORTRESS = "fortress:test";
+const SUBJECT = `${FORTRESS}/uid-503`;
 const NOW = 1_750_000_000_000;
 // A timestamp safely inside the freshness window AND inside the 5-min sig age.
 const FRESH_TS = NOW - 1000;
@@ -111,7 +112,7 @@ function signedWalResult(operation: SignedWalOperation): string {
  */
 function walBody(
   seq: number,
-  identityId: string = FORTRESS,
+  identityId: string = SUBJECT,
   operation: SignedWalOperation = "egress_blocked",
 ): string {
   return JSON.stringify({
@@ -125,7 +126,7 @@ function walBody(
 }
 
 /**
- * Append a GENUINE daemon-signed enforcement entry, the way the consumer
+ * Append a valid producer-signed enforcement entry, the way the consumer
  * persists it after verifying: provenance marker + basis=producer_signed + the
  * real signature + the R-1 re-verification inputs (canonical + captured_at).
  */
@@ -135,12 +136,12 @@ async function appendGenuineSigned(log: AuditLog, seq: number): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "success",
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
       seq,
-      agent_id: FORTRESS,
+      agent_id: SUBJECT,
       dest_host: "evil.example",
       [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
       [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
@@ -324,7 +325,7 @@ async function appendForged(
   await log.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "success",
     timestamp: new Date(ts).toISOString(),
     details,
@@ -336,7 +337,7 @@ async function appendChannelUnsigned(log: AuditLog): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "success",
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
@@ -361,7 +362,7 @@ describe("Slice R — HEADLINE NEGATIVE: a forged in-process entry never renders
       await appendForged(log, variant);
 
       const posture = await buildCastleWallPosture({
-        protectionClaimSubject: FORTRESS,
+        protectionClaimSubject: SUBJECT,
         auditLog: log,
         originMachine: FORTRESS,
         platform: "linux",
@@ -395,7 +396,7 @@ describe("Slice R — HEADLINE NEGATIVE: a forged in-process entry never renders
       await appendForged(log, variant);
 
       const panel = await buildFeatureHealthPanel({
-        protectionClaimSubject: FORTRESS,
+        protectionClaimSubject: SUBJECT,
         auditLog: log,
         originMachine: FORTRESS,
         now: NOW,
@@ -619,7 +620,7 @@ describe("Slice R — codex HIGH #1: key-bearing reader rejects channel/legacy-b
     const log = newLog();
     await appendChannelUnsigned(log);
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -637,13 +638,13 @@ describe("Slice R — codex HIGH #1: key-bearing reader rejects channel/legacy-b
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(FRESH_TS).toISOString(),
       details: { seq: 0, [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE },
     });
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -670,7 +671,7 @@ describe("Slice R — codex HIGH #1: key-bearing reader rejects channel/legacy-b
     const log = newLog();
     await appendChannelUnsigned(log);
     const panel = await buildFeatureHealthPanel({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -687,13 +688,13 @@ describe("Slice R — codex HIGH #2: policy_loaded cannot arm without re-verific
     await log.appendCritical({
       layer: "l1",
       operation: "policy_loaded",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(FRESH_TS).toISOString(),
       details: { seq: 0, [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE },
     });
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -710,13 +711,13 @@ describe("Slice R — codex HIGH #2: policy_loaded cannot arm without re-verific
     await log.appendCritical({
       layer: "l1",
       operation: "policy_loaded",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(FRESH_TS).toISOString(),
       details: { seq: 0, [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE },
     });
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "macos",
@@ -746,15 +747,15 @@ describe("Slice R — codex HIGH #3: same-seq replay with a forged-fresh top-lev
       timestamp: new Date(OLD_TS).toISOString(),
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "blocked",
-      details: { agent_id: FORTRESS },
+      details: { agent_id: SUBJECT },
     });
     const sig = ed25519.sign(producerSigningBytes(canonical, OLD_TS, 0), daemonPriv);
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       // Forged-fresh top-level timestamp (an in-process replayer's lever).
       timestamp: new Date(FRESH_TS).toISOString(),
@@ -771,7 +772,7 @@ describe("Slice R — codex HIGH #3: same-seq replay with a forged-fresh top-lev
       },
     });
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -792,15 +793,15 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
       timestamp: new Date(OLD_TS).toISOString(),
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "blocked",
-      details: { agent_id: FORTRESS },
+      details: { agent_id: SUBJECT },
     });
     const sig = ed25519.sign(producerSigningBytes(canonical, OLD_TS, 0), daemonPriv);
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(FRESH_TS).toISOString(), // forged-fresh top-level ts
       details: {
@@ -832,15 +833,15 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
       timestamp: new Date(FRESH_TS).toISOString(),
       layer: "l1",
       operation: "egress_approved",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
-      details: { agent_id: FORTRESS },
+      details: { agent_id: SUBJECT },
     });
     const sig = ed25519.sign(producerSigningBytes(allowCanonical, FRESH_TS, 0), daemonPriv);
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked", // stapled onto the wrong slot
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(FRESH_TS).toISOString(),
       details: {
@@ -855,7 +856,7 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
       },
     });
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -876,15 +877,15 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
       timestamp: new Date(OLD_TS).toISOString(),
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "blocked",
-      details: { agent_id: FORTRESS },
+      details: { agent_id: SUBJECT },
     });
     const sig = ed25519.sign(producerSigningBytes(canonical, OLD_TS, 0), daemonPriv);
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(FRESH_TS).toISOString(),
       details: {
@@ -899,7 +900,7 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
       },
     });
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -920,15 +921,15 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
       timestamp: new Date(FRESH_TS).toISOString(),
       layer: "l1",
       operation: "egress_approved",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
-      details: { agent_id: FORTRESS },
+      details: { agent_id: SUBJECT },
     });
     const sig = ed25519.sign(producerSigningBytes(allowCanonical, FRESH_TS, 0), daemonPriv);
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked", // stapled onto the WRONG operation slot
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(FRESH_TS).toISOString(),
       details: {
@@ -967,7 +968,7 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
       await log.appendCritical({
         layer: "l1",
         operation: "egress_blocked",
-        identity_id: FORTRESS,
+        identity_id: SUBJECT,
         result: "success",
         // distinct top-level timestamps, but identical signed tuple
         timestamp: new Date(FRESH_TS + i).toISOString(),
@@ -989,7 +990,7 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
     const log = newLog();
     await appendDuplicateSigned(log, 5);
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -1017,7 +1018,7 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
     const log = newLog();
     await appendDuplicateSigned(log, 5);
     const panel = await buildFeatureHealthPanel({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -1041,7 +1042,7 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
     });
     expect(digest.kernel_blocks).toBe(2);
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -1052,13 +1053,13 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
   });
 });
 
-describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and renders green", () => {
+describe("Slice R — POSITIVE: a valid producer-signed entry re-verifies and renders green", () => {
   it("posture: genuine signed entry arms with producer_signed authenticity", async () => {
     const log = newLog();
     await appendGenuineSigned(log, 0);
 
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -1089,7 +1090,7 @@ describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and re
     await appendGenuineSigned(log, 0);
 
     const panel = await buildFeatureHealthPanel({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -1108,15 +1109,15 @@ describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and re
       timestamp: new Date(OLD_TS).toISOString(),
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "blocked",
-      details: { agent_id: FORTRESS },
+      details: { agent_id: SUBJECT },
     });
     const sig = ed25519.sign(producerSigningBytes(canonical, OLD_TS, 0), daemonPriv);
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(OLD_TS).toISOString(),
       details: {
@@ -1132,7 +1133,7 @@ describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and re
     });
 
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -1152,7 +1153,7 @@ describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and re
       ed25519.getPublicKey(ed25519.utils.randomPrivateKey()),
     );
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "linux",
@@ -1170,7 +1171,7 @@ describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel 
     await appendChannelUnsigned(log);
 
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "macos",
@@ -1188,7 +1189,7 @@ describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel 
     await appendGenuineSigned(log, 0);
 
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "macos",
@@ -1202,7 +1203,7 @@ describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel 
   it("unknown-never-green still holds: no evidence at all → unknown, not_applicable", async () => {
     const log = newLog();
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "macos",
@@ -1217,7 +1218,7 @@ describe("Slice R — FALLBACK (macOS parity): no pinned key → honest channel 
     const log = newLog();
     await appendForged(log, "missing_sig");
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       platform: "macos",

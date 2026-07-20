@@ -65,6 +65,7 @@ export type ProtectionStateObservation =
         | "exclusive_egress_repark_failed"
         | "subject_unbound_evidence"
         | "legacy_macos_audit_token"
+        | "pre_canonical_linux_agent_name"
         | "subject_unresolvable";
       reasons: readonly string[];
     };
@@ -195,6 +196,15 @@ export function protectionObservationFromFeatureHealth(input: {
       ],
     };
   }
+  if (input.castleWallEgressBasis === "pre_canonical_linux_agent_name") {
+    return {
+      state: "unknown",
+      basis: "pre_canonical_linux_agent_name",
+      reasons: [
+        "Castle Wall has recent Linux evidence from a pre-canonical daemon; upgrade the daemon path so evidence is bound to this confined agent subject",
+      ],
+    };
+  }
   if (input.castleWallEgressBasis === "subject_unresolvable") {
     return {
       state: "unknown",
@@ -281,6 +291,16 @@ export function protectionStateAdvice(
             "Your agent is wrapped, but its Castle Wall evidence uses the older macOS identity format.",
           castleWallLabel:
             "Castle Wall status unknown (legacy audit-token evidence)",
+          imperative: inspectImperative,
+        };
+      }
+      if (claim.basis === "pre_canonical_linux_agent_name") {
+        return {
+          green: false,
+          operatorSentence:
+            "Your agent is wrapped, but its Castle Wall evidence was produced by a pre-canonical Linux daemon.",
+          castleWallLabel:
+            "Castle Wall status unknown (pre-canonical Linux evidence)",
           imperative: inspectImperative,
         };
       }

@@ -3,15 +3,15 @@
  * close on Linux without regressing the macOS / no-key channel basis.
  *
  * Slice L1 made the Linux daemon sign each enforcement event; Slice R made the
- * readers re-verify that signature against a pinned key. But nothing loaded the
- * key from disk in prod, so the crypto close was inert (key-null channel basis
- * on both sides). Slice P wires the SINGLE-SOURCE loader
+ * readers re-verify that signature against a pinned key. This suite exercises
+ * the key-loading binding with mocked signed events; it does not prove live
+ * Linux capability. Slice P wires the SINGLE-SOURCE loader
  * (`loadFortressProducerKey` → `<storage>/policy/egress/audit-producer.pub`) into
  * BOTH the consumer (lifecycle) and the readers (posture/dashboard), so:
  *
- *   (1) a real daemon-signed event re-verifies GREEN because the key is loaded;
+ *   (1) a mock-signed event re-verifies GREEN because the key is loaded;
  *   (2) a forged in-process entry renders NON-green BECAUSE the key is loaded
- *       (the activation made the close real — not key-null);
+ *       (the key-loaded harness is not key-null);
  *   (3) macOS / no-key stays channel-basis green (unknown-never-green preserved);
  *   (4) key-published-but-unreadable fails HONESTLY (degraded), never channel-green;
  *   (5) explicit rotation does not break verification.
@@ -60,6 +60,7 @@ import {
 } from "../../../src/castle-wall/constants.js";
 
 const FORTRESS = "fortress:test";
+const SUBJECT = `${FORTRESS}/uid-503`;
 const NOW = 1_750_000_000_000;
 const FRESH_TS = NOW - 1000;
 const LINUX_PRODUCER_KEY_LOAD = { platform: "linux" as const };
@@ -86,9 +87,9 @@ function walBody(seq: number): string {
     timestamp: new Date(FRESH_TS).toISOString(),
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "blocked",
-    details: { agent_id: FORTRESS, dest_host: "evil.example" },
+    details: { agent_id: SUBJECT, dest_host: "evil.example" },
   });
 }
 
@@ -102,12 +103,12 @@ async function appendGenuineSigned(
   await log.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "success",
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
       seq,
-      agent_id: FORTRESS,
+      agent_id: SUBJECT,
       dest_host: "evil.example",
       [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
       [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]: CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
@@ -126,7 +127,7 @@ async function appendForgedMarkerOnly(log: AuditLog): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "success",
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
@@ -413,7 +414,7 @@ describe("Slice P — consumer activation (startCastleWall via fortressStoragePa
 });
 
 describe("Slice P — reader activation end-to-end (provisioned key on disk)", () => {
-  it("(1) a real daemon-signed event re-verifies GREEN once the key is loaded", async () => {
+  it("(1) a mock-signed event re-verifies GREEN once the key is loaded", async () => {
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     await publishPubKey(tmp, pub);
@@ -424,7 +425,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const log = newLog();
     await appendGenuineSigned(log, priv, 1);
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -445,7 +446,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const log = newLog();
     await appendForgedMarkerOnly(log);
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -469,7 +470,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     // (the reader does not require re-verification without a pinned key).
     await appendGenuineSigned(log, ed25519.utils.randomPrivateKey(), 1);
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "darwin",
@@ -486,7 +487,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     // signal forces a non-armed degraded posture (never green on the channel basis).
     await appendGenuineSigned(log, ed25519.utils.randomPrivateKey(), 1);
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "linux",
@@ -510,7 +511,7 @@ describe("Slice P — reader activation end-to-end (provisioned key on disk)", (
     const log = newLog();
     await appendGenuineSigned(log, newPriv, 7);
     const posture = await buildCastleWallPosture({
-      protectionClaimSubject: FORTRESS,
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: "m",
       platform: "linux",

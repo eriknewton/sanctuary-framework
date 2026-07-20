@@ -132,10 +132,9 @@ export const CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY =
   "cw_producer_captured_at_ms" as const;
 
 /**
- * `details` key recording the explicit subject-binding rule used when a
- * producer-signed entry was written. Read-side re-verification must select the
- * signed subject by this persisted kind, not by sniffing signed-body contents.
- * This is additive at rest; existing detail keys are unchanged.
+ * `details` key recording the consumer-side subject-binding rule used when a
+ * producer-signed entry was written. The key is not producer-signed and has no
+ * read-side authority; readers derive subjects from verified signed bytes.
  */
 export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY =
   "cw_producer_subject_binding" as const;

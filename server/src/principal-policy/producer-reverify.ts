@@ -40,13 +40,14 @@ import {
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
-  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
-  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
-  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
 } from "../castle-wall/constants.js";
-import { protectionSubjectFromMacOSAuditToken } from "../castle-wall/subject-binding.js";
+import {
+  fortressIdFromProtectionSubject,
+  isLegacyMacOSAuditTokenHex,
+  protectionSubjectFromMacOSAuditToken,
+} from "../castle-wall/subject-binding.js";
 import {
   BROKER_EVIDENCE_BASIS_DETAIL_KEY,
   BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED,
@@ -103,8 +104,11 @@ export function signedCanonicalOperation(
 
 function subjectFromSignedCanonicalValue(
   value: unknown,
+  subjectFortressId?: string | null,
 ): string | null {
   if (typeof value !== "string" || value.length === 0) return null;
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  if (fortressIdFromProtectionSubject(value) !== subjectFortressId) return null;
   return value;
 }
 
@@ -129,23 +133,6 @@ function macOSSubjectFromSignedCanonicalDetails(
   return protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
 }
 
-type CastleWallProducerSubjectBindingKind =
-  | typeof CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN
-  | typeof CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID;
-
-function persistedCastleWallProducerSubjectBindingKind(
-  details: Record<string, unknown>,
-): CastleWallProducerSubjectBindingKind | null {
-  const kind = details[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY];
-  if (
-    kind === CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN ||
-    kind === CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID
-  ) {
-    return kind;
-  }
-  return null;
-}
-
 /**
  * The subject from the persisted SIGNED canonical body.
  *
@@ -154,12 +141,10 @@ function persistedCastleWallProducerSubjectBindingKind(
  * appended the row, so a reader must never use it for a producer-signed subject
  * decision after the signature verifies.
  *
- * The write side persists the explicit binding mode it used:
- * macOS resolves a raw signed audit token from signed `details.agent_id` plus
- * the local fortress id, while signed-identity producers use signed
- * `identity_id` directly. The reader selects by that persisted kind only; a
- * missing/unknown kind returns null so subject-bound readers fail closed rather
- * than resurrecting the old content-sniffing path.
+ * The reader derives the choice from signed content, not from any persisted
+ * detail selector. A canonical `identity_id` for the expected fortress wins. If
+ * none is present, a signed macOS audit token in `details.agent_id` can resolve
+ * to a subject. Anything else returns null so subject-bound readers fail closed.
  */
 export function signedCanonicalIdentityId(
   details: Record<string, unknown>,
@@ -167,14 +152,47 @@ export function signedCanonicalIdentityId(
 ): string | null {
   const parsed = parseCastleWallSignedCanonicalBody(details);
   if (parsed === null) return null;
-  const bindingKind = persistedCastleWallProducerSubjectBindingKind(details);
-  if (bindingKind === CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN) {
-    return macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId);
+  const identitySubject = subjectFromSignedCanonicalValue(
+    parsed.identity_id,
+    subjectFortressId,
+  );
+  return (
+    identitySubject ??
+    macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId)
+  );
+}
+
+export type SignedCanonicalSubjectIssue = "pre_canonical_linux_agent_name";
+
+/**
+ * Classify a verified producer-signed body whose subject could not be accepted.
+ *
+ * Callers use this only after the producer signature has verified. It lets
+ * operator-facing surfaces distinguish old Linux daemon output (`identity_id` was
+ * still an agent name) from a canonical subject mismatch, while keeping both
+ * states non-green.
+ */
+export function signedCanonicalSubjectIssue(
+  details: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): SignedCanonicalSubjectIssue | null {
+  const parsed = parseCastleWallSignedCanonicalBody(details);
+  if (parsed === null) return null;
+  const identityId = parsed.identity_id;
+  if (typeof identityId !== "string" || identityId.length === 0) return null;
+  if (subjectFromSignedCanonicalValue(identityId, subjectFortressId) !== null) {
+    return null;
   }
-  if (bindingKind === CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID) {
-    return subjectFromSignedCanonicalValue(parsed.identity_id);
+  if (macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId) !== null) {
+    return null;
   }
-  return null;
+  if (
+    fortressIdFromProtectionSubject(identityId) !== null ||
+    isLegacyMacOSAuditTokenHex(identityId)
+  ) {
+    return null;
+  }
+  return "pre_canonical_linux_agent_name";
 }
 import {
   verifyProducerSignature,

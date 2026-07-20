@@ -336,6 +336,10 @@ describe("posture home — feature-health panel honesty", () => {
     expect(html).toContain(
       "Evidence predates the subject-binding format; re-arm Castle Wall to produce subject-bound evidence.",
     );
+    expect(html).toContain('case "pre_canonical_linux_agent_name":');
+    expect(html).toContain(
+      "Linux evidence predates canonical subject binding; upgrade the daemon path before claiming this agent is protected.",
+    );
     expect(html).toContain('case "subject_unresolvable":');
     expect(html).toContain(
       "This agent's confinement identity could not be read, so no enforcement evidence can be bound to it.",
