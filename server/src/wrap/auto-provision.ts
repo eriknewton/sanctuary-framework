@@ -2010,8 +2010,8 @@ export type DsclAttributeReadDecision =
 const DSCL_STDIO_MAXBUFFER_ERROR = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
 const DSCL_DIAGNOSTIC_MAX_CHARS = 512;
 const DSCL_RECORD_NOT_FOUND_RE = /eDSRecordNotFound|DS Error:\s*-14136|Invalid Path/i;
-const DSCL_NO_SUCH_KEY_RE = /^No such key:\s*([A-Za-z][A-Za-z0-9_-]*)\b/i;
-const DSCL_ATTRIBUTE_LINE_RE = /^(?:dsAttrTypeNative:)?([A-Za-z][A-Za-z0-9_-]*):(?:\s|$)/;
+const DSCL_NO_SUCH_KEY_RE = /^No such key:\s*([A-Za-z_][A-Za-z0-9_-]*)\b/i;
+const DSCL_ATTRIBUTE_LINE_RE = /^(?:dsAttrTypeNative:)?([A-Za-z_][A-Za-z0-9_-]*):(?:\s|$)/;
 
 function dsclRawDiagnostic(result: Pick<DsclReadResult, "stdout" | "stderr">): string {
   return [result.stderr, result.stdout]

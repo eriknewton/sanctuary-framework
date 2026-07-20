@@ -163,6 +163,33 @@ describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix ro
     expect(diagnostic).not.toContain("unclassified-lines");
   });
 
+  it("diagnoses an underscore-prefixed native attribute rather than calling it residue", () => {
+    // Real macOS emits native attributes whose names begin with an underscore,
+    // e.g. `dscl . -read /Users/<x> _writers_passwd`. Naming no attribute here
+    // is what sent an operator to repair a healthy account on 2026-07-20.
+    const diagnostic = dsclDiagnostic({
+      code: 0,
+      stdout: "dsAttrTypeNative:_writers_passwd: eriknewton\n",
+      stderr: "",
+    });
+    expect(diagnostic).toContain("attributes=[_writers_passwd]");
+    expect(diagnostic).not.toContain("unclassified-lines");
+  });
+
+  it("still counts genuinely unparseable dscl output as residue", () => {
+    // The fail-closed property must survive widening the attribute charclass.
+    expect(dsclDiagnostic({ code: 0, stdout: "total nonsense here\n", stderr: "" })).toContain(
+      "unclassified-lines=1",
+    );
+    expect(
+      dsclDiagnostic({
+        code: 0,
+        stdout: "dsAttrTypeNative:dsAttrTypeNative:IsHidden: 1\n",
+        stderr: "",
+      }),
+    ).toContain("unclassified-lines=1");
+  });
+
   it("returns unknown rather than claiming absence on unclassified dscl output", () => {
     expect(
       decideDsclRecordRead({
