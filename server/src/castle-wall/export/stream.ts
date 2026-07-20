@@ -33,7 +33,10 @@
  */
 
 import type { AuditEntry } from "../../operational/audit-log.js";
-import { mapAuditEntryToEnforcementEvent } from "./map.js";
+import {
+  mapAuditEntryToEnforcementEvent,
+  type EnforcementEventMapOptions,
+} from "./map.js";
 import type { EnforcementEvent } from "./schema.js";
 import type { EnforcementExporter, ExportAudit } from "./exporter.js";
 import { EXPORT_CURSOR_START, type ExportCursorStore } from "./cursor.js";
@@ -126,6 +129,11 @@ export interface EnforcementExportStreamerDeps extends EnforcementExportStreamer
    * Defaults to `process.stderr`; injected so tests stay hermetic.
    */
   warn?: (message: string) => void;
+  /**
+   * Optional read-side attribution verification context for mapping Castle Wall
+   * agent fields from producer-signed evidence.
+   */
+  mapOptions?: EnforcementEventMapOptions;
 }
 
 /** Outcome of a single `runOnce()`. */
@@ -311,7 +319,10 @@ export class EnforcementExportStreamer {
         }
         if (item.sequence === fromCursor) hashAtCursor = item.entry_hash;
         if (item.sequence <= fromCursor) return;
-        const event = mapAuditEntryToEnforcementEvent(item.entry);
+        const event = mapAuditEntryToEnforcementEvent(
+          item.entry,
+          this.deps.mapOptions,
+        );
         if (event !== null) buffered.push({ sequence: item.sequence, entryHash: item.entry_hash, event });
       },
       reset: () => {

@@ -197,6 +197,15 @@ export interface HubActivitySources {
    * here so v1.2 can scope per-identity without breaking the API.
    */
   identityId: string;
+  /**
+   * Optional Castle Wall audit-producer key used to re-verify producer-signed
+   * evidence before projecting agent attribution.
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /**
+   * Local fortress id needed to resolve macOS signed audit-token subjects.
+   */
+  subjectFortressId?: string | null;
 }
 
 // -----------------------------------------------------------------------

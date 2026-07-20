@@ -34,6 +34,7 @@ import { join } from "node:path";
 import { defaultConfig, type SanctuaryConfig } from "../../config.js";
 import { exportExitBundle } from "../../exit/bundle.js";
 import type { AuditLog } from "../../operational/audit-log.js";
+import { auditEntryAgentId } from "../../castle-wall/audit-attribution.js";
 import { IdentityManager } from "../../cognitive/tools.js";
 import {
   HubService,
@@ -648,10 +649,7 @@ function buildConciergeContextProviders(args: {
         .filter((e) => e.identity_id === args.identityId)
         .slice(-30)
         .map((e) => {
-          const agentId =
-            (e.details && typeof e.details["agent_id"] === "string"
-              ? (e.details["agent_id"] as string)
-              : null) ?? "_fortress";
+          const agentId = auditEntryAgentId(e) ?? "_fortress";
           return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
         });
       if (lines.length === 0) return "(no recent activity)";
@@ -734,10 +732,7 @@ function buildConciergeContextFetchers(args: {
       );
       const filtered = agentNameHint
         ? owned.filter((e) => {
-            const agentId =
-              e.details && typeof e.details["agent_id"] === "string"
-                ? (e.details["agent_id"] as string)
-                : "";
+            const agentId = auditEntryAgentId(e) ?? "";
             return agentId
               .toLowerCase()
               .includes(agentNameHint.toLowerCase());
@@ -747,10 +742,7 @@ function buildConciergeContextFetchers(args: {
       if (tail.length === 0) return "(no activity)";
       return tail
         .map((e) => {
-          const agentId =
-            (e.details && typeof e.details["agent_id"] === "string"
-              ? (e.details["agent_id"] as string)
-              : null) ?? "_fortress";
+          const agentId = auditEntryAgentId(e) ?? "_fortress";
           return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
         })
         .join("\n");

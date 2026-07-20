@@ -90,4 +90,39 @@ describe("Activity feed: per-action attestation projection", () => {
     const fragment = entries[0]!.attestation!.fragment;
     expect(fragment).toMatch(/^[0-9a-f]{4}\.\.[0-9a-f]{2}$/);
   });
+
+  it("forged unsigned Castle Wall entries do not attribute to a victim or render verified", async () => {
+    await rig.auditLog.append(
+      "l1",
+      "egress_blocked",
+      IDENTITY_ID,
+      {
+        agent_id: "victim-agent-b",
+        dest_host: "evil.example",
+        dest_ip: "203.0.113.99",
+        dest_port: 443,
+        dest_protocol: "tcp",
+      },
+      "success",
+    );
+    await rig.auditLog.flush();
+
+    const entries = await aggregateActivity(
+      { auditLog: rig.auditLog, identityId: IDENTITY_ID },
+      { limit: 10 },
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.agent_id).toBeUndefined();
+    expect(entries[0]!.display_template_args).not.toContainEqual({
+      kind: "agent_id",
+      value: "victim-agent-b",
+    });
+    expect(entries[0]!.attestation!.state).toBe("degraded");
+
+    const filtered = await aggregateActivity(
+      { auditLog: rig.auditLog, identityId: IDENTITY_ID },
+      { agent_id: "victim-agent-b", limit: 10 },
+    );
+    expect(filtered).toHaveLength(0);
+  });
 });

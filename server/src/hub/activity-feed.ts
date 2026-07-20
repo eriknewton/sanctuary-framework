@@ -23,6 +23,11 @@ import type {
   HubActivityFeedEntry,
   HubDisplayTemplateArg,
 } from "../contracts/v1.1/hub-events.js";
+import {
+  auditEntryAgentId,
+  isCastleWallAttributionSensitiveEntry,
+  verifiedCastleWallAuditAttribution,
+} from "../castle-wall/audit-attribution.js";
 import type { HubActivitySources } from "./types.js";
 import {
   HUB_ACTIVITY_DEFAULT_LIMIT,
@@ -139,15 +144,21 @@ function buildTemplateArgs(
 }
 
 /**
- * Pull a safe `agent_id` hint out of the audit entry's details if present.
- * The contract requires only safe metadata; we copy `agent_id` only if
- * it's a string. No other fields cross the boundary.
+ * Pull a safe `agent_id` hint out of the audit entry. Castle Wall attribution
+ * is projected only when the persisted producer signature re-verifies and the
+ * subject is derived from the signed canonical body. Non-Castle-Wall rows keep
+ * the legacy details hint behavior.
  */
-function extractAgentIdHint(entry: AuditEntry): string | undefined {
-  const details = entry.details as Record<string, unknown> | undefined;
-  if (!details) return undefined;
-  const value = details.agent_id;
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+function extractAgentIdHint(
+  entry: AuditEntry,
+  sources: HubActivitySources,
+): string | undefined {
+  return (
+    auditEntryAgentId(entry, {
+      pinnedProducerKeyB64url: sources.pinnedProducerKeyB64url ?? null,
+      subjectFortressId: sources.subjectFortressId ?? null,
+    }) ?? undefined
+  );
 }
 
 /**
@@ -166,19 +177,30 @@ function deriveAttestationFragment(entryId: string): string {
 /**
  * Map an audit-entry result onto an attestation render state.
  *
- * Success entries render `verified`; failure entries render `degraded`.
- * Future v1.x work may enrich this (e.g. distinguish kernel-level egress
- * drops from policy-level denials), but the audit-entry result is the
- * stable signal available at projection time today.
+ * Castle Wall attribution-sensitive entries render `verified` only when the
+ * persisted producer signature re-verifies. Other audit families keep the
+ * legacy success/failure projection.
  */
 function deriveAttestationState(
   entry: AuditEntry,
+  sources: HubActivitySources,
 ): "verified" | "degraded" {
+  if (isCastleWallAttributionSensitiveEntry(entry)) {
+    return verifiedCastleWallAuditAttribution(entry, {
+      pinnedProducerKeyB64url: sources.pinnedProducerKeyB64url ?? null,
+      subjectFortressId: sources.subjectFortressId ?? null,
+    }) !== null
+      ? "verified"
+      : "degraded";
+  }
   return entry.result === "success" ? "verified" : "degraded";
 }
 
-function projectEntry(entry: AuditEntry): HubActivityFeedEntry {
-  const agentIdHint = extractAgentIdHint(entry);
+function projectEntry(
+  entry: AuditEntry,
+  sources: HubActivitySources,
+): HubActivityFeedEntry {
+  const agentIdHint = extractAgentIdHint(entry, sources);
   const category = categorizeOperation(entry.layer, entry.operation);
   const entryId = `${entry.timestamp}|${entry.operation}|${entry.identity_id}`;
   return {
@@ -191,7 +213,7 @@ function projectEntry(entry: AuditEntry): HubActivityFeedEntry {
     display_template_id: templateIdFor(category, entry.operation),
     display_template_args: buildTemplateArgs(entry, agentIdHint),
     attestation: {
-      state: deriveAttestationState(entry),
+      state: deriveAttestationState(entry, sources),
       fragment: deriveAttestationFragment(entryId),
     },
   };
@@ -218,7 +240,7 @@ export async function aggregateActivity(
 
   const projected = queryResult.entries
     .filter((e) => e.identity_id === sources.identityId)
-    .map(projectEntry);
+    .map((entry) => projectEntry(entry, sources));
 
   let filtered = projected;
   if (filter.agent_id) {

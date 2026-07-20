@@ -107,6 +107,37 @@ describe("buildSnapshot derivation (Tau-5)", () => {
     expect(snap.recent_verascore_delta_24h).toBeNull();
   });
 
+  it("does not count forged unsigned Castle Wall evidence for a victim agent", () => {
+    const record = makeRecord("victim-agent-b");
+    const recentEntries: AuditEntry[] = [
+      {
+        timestamp: new Date(NOW - 5 * 60 * 1000).toISOString(),
+        layer: "l1",
+        operation: "egress_blocked",
+        identity_id: "op-1",
+        result: "success",
+        details: {
+          agent_id: "victim-agent-b",
+          dest_host: "evil.example",
+          dest_ip: "203.0.113.55",
+          dest_port: 443,
+          dest_protocol: "tcp",
+        },
+      },
+    ];
+
+    const snap = buildSnapshot({
+      record,
+      recentEntries,
+      nowMs: NOW,
+      verascoreSource: undefined,
+    });
+
+    expect(snap.recent_audit_count_24h).toBe(0);
+    expect(snap.recent_egress_count_24h).toBe(0);
+    expect(snap.current_work_summary).toBeNull();
+  });
+
   it("flags 'active' on recent activity, 'idle' on >1h, 'stuck' on harness_error", () => {
     // Active
     const recent = makeRecord("R", {

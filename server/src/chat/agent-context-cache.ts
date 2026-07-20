@@ -68,6 +68,8 @@
  */
 
 import type { AuditLog } from "../operational/audit-log.js";
+import type { AuditEntry } from "../operational/audit-log.js";
+import { auditEntryAgentId } from "../castle-wall/audit-attribution.js";
 import type { HubAgentRegistrySource } from "../hub/types.js";
 import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 
@@ -323,12 +325,7 @@ export class AgentContextCache {
 
 interface BuildSnapshotInputs {
   record: LocalAgentRecord;
-  recentEntries: ReadonlyArray<{
-    timestamp: string;
-    operation: string;
-    result: "success" | "failure";
-    details?: Record<string, unknown>;
-  }>;
+  recentEntries: ReadonlyArray<AuditEntry>;
   nowMs: number;
   verascoreSource: VerascoreDeltaSource | undefined;
 }
@@ -343,10 +340,7 @@ export function buildSnapshot(
 ): AgentContextSnapshot {
   const { record, recentEntries, nowMs, verascoreSource } = inputs;
   const ownedByAgent = recentEntries.filter((e) => {
-    const agentId =
-      e.details && typeof e.details["agent_id"] === "string"
-        ? (e.details["agent_id"] as string)
-        : null;
+    const agentId = auditEntryAgentId(e);
     return agentId === record.agent_id;
   });
 

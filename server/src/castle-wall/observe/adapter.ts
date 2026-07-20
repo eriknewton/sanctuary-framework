@@ -49,10 +49,21 @@
  */
 
 import type { AuditEntry } from "../../operational/audit-log.js";
+import {
+  verifiedCastleWallAuditAttribution,
+  type AuditAttributionOptions,
+} from "../audit-attribution.js";
 import type { FlowObservationEvent, HostnameSource, ObserveProvenance } from "./types.js";
 
 /** The stored `operation` tag for a denied flow (see `runtime/macos-flow-events.ts` / `audit/events.ts` CastleWallEventType). */
 const BLOCKED_OPERATION = "egress_blocked";
+
+export interface FlowEventAdapterOptions extends AuditAttributionOptions {}
+
+interface VerifiedFlowAttribution {
+  agentId: string;
+  agentTemplate: string;
+}
 
 function isHostnameSource(value: unknown): value is HostnameSource {
   return value === "dns" || value === "sni" || value === "url" || value === "socket";
@@ -77,10 +88,11 @@ function isProtocol(value: unknown): value is "tcp" | "udp" {
  */
 export function flowEventsFromAuditEntries(
   entries: readonly AuditEntry[],
+  options: FlowEventAdapterOptions = {},
 ): FlowObservationEvent[] {
   const events: FlowObservationEvent[] = [];
   for (const entry of entries) {
-    const event = flowEventFromAuditEntry(entry);
+    const event = flowEventFromAuditEntry(entry, options);
     if (event) events.push(event);
   }
   return events;
@@ -94,10 +106,19 @@ export function flowEventsFromAuditEntries(
  * chokepoint (`refresh.ts`) so entries are adapted-or-dropped as the
  * verified chain streams past instead of materializing an `AuditEntry[]`.
  */
-export function flowEventFromAuditEntry(entry: AuditEntry): FlowObservationEvent | null {
+export function flowEventFromAuditEntry(
+  entry: AuditEntry,
+  options: FlowEventAdapterOptions = {},
+): FlowObservationEvent | null {
   if (entry.operation !== BLOCKED_OPERATION) return null;
   const details = entry.details;
   if (!details) return null;
+  const attribution = verifiedCastleWallAuditAttribution(entry, options);
+  if (attribution === null || attribution.agentTemplate === null) return null;
+  const flowAttribution: VerifiedFlowAttribution = {
+    agentId: attribution.agentId,
+    agentTemplate: attribution.agentTemplate,
+  };
 
   // Try the NESTED shape first (macOS default-resolver path). If its required
   // objects are absent, fall through to the FLAT shape (Linux daemon / macOS
@@ -105,7 +126,10 @@ export function flowEventFromAuditEntry(entry: AuditEntry): FlowObservationEvent
   // nested row carries no `dest_*` fields and a flat row carries no
   // `agent`/`destination` objects -- so at most one arm ever yields an event
   // (no double-fold). See the module header for the honeypot exclusion.
-  return flowEventFromNestedDetails(entry, details) ?? flowEventFromFlatDetails(entry, details);
+  return (
+    flowEventFromNestedDetails(entry, details, flowAttribution) ??
+    flowEventFromFlatDetails(entry, details, flowAttribution)
+  );
 }
 
 /**
@@ -116,10 +140,8 @@ export function flowEventFromAuditEntry(entry: AuditEntry): FlowObservationEvent
 function flowEventFromNestedDetails(
   entry: AuditEntry,
   details: NonNullable<AuditEntry["details"]>,
+  attribution: VerifiedFlowAttribution,
 ): FlowObservationEvent | null {
-  const agent = details.agent as { id?: unknown; template?: unknown } | undefined;
-  if (!agent || typeof agent.id !== "string" || typeof agent.template !== "string") return null;
-
   const destination = details.destination as
     | {
         host?: unknown;
@@ -140,7 +162,7 @@ function flowEventFromNestedDetails(
 
   return {
     timestamp: entry.timestamp,
-    agent: { id: agent.id, template: agent.template },
+    agent: { id: attribution.agentId, template: attribution.agentTemplate },
     destination: { host, ip, port: destination.port, protocol: destination.protocol },
     hostname_source: isHostnameSource(destination.hostname_source) ? destination.hostname_source : null,
     disposition: "denied",
@@ -163,11 +185,8 @@ function flowEventFromNestedDetails(
 function flowEventFromFlatDetails(
   entry: AuditEntry,
   details: NonNullable<AuditEntry["details"]>,
+  attribution: VerifiedFlowAttribution,
 ): FlowObservationEvent | null {
-  const agentId = details.agent_id;
-  const agentTemplate = details.agent_template;
-  if (typeof agentId !== "string" || typeof agentTemplate !== "string") return null;
-
   const port = details.dest_port;
   if (typeof port !== "number") return null;
   const protocol = details.dest_protocol;
@@ -203,7 +222,7 @@ function flowEventFromFlatDetails(
 
   return {
     timestamp: entry.timestamp,
-    agent: { id: agentId, template: agentTemplate },
+    agent: { id: attribution.agentId, template: attribution.agentTemplate },
     destination: { host, ip, port, protocol },
     // The flat producers carry no per-flow hostname_source field (the daemon's
     // generic destination has none); mirror the nested arm's null default.

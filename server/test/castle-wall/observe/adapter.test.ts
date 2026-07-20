@@ -8,8 +8,67 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 import { flowEventsFromAuditEntries } from "../../../src/castle-wall/observe/adapter.js";
+import { foldObservations } from "../../../src/castle-wall/observe/fold.js";
+import { synthesizeCandidateRules } from "../../../src/castle-wall/observe/synthesize.js";
+import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+} from "../../../src/castle-wall/constants.js";
 import type { AuditEntry } from "../../../src/operational/audit-log.js";
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const producerPriv = ed25519.utils.randomPrivateKey();
+const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
+const SIGNED_AT_MS = 1_777_777_777_777;
+const SIGNED_ATTRIBUTION = {
+  pinnedProducerKeyB64url: producerPubB64,
+  subjectFortressId: "fortress:test",
+};
+
+function withProducerSignature(entry: AuditEntry, identityId: string): AuditEntry {
+  const seq =
+    typeof entry.details?.seq === "number" ? entry.details.seq : 41;
+  const body = JSON.stringify({
+    timestamp: entry.timestamp,
+    layer: entry.layer,
+    operation: entry.operation,
+    identity_id: identityId,
+    result: entry.result,
+    details: entry.details ?? {},
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, SIGNED_AT_MS, seq),
+    producerPriv,
+  );
+  return {
+    ...entry,
+    identity_id: identityId,
+    details: {
+      ...(entry.details ?? {}),
+      seq,
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: SIGNED_AT_MS,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+        CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    },
+  };
+}
 
 function blockedEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
   return {
@@ -31,7 +90,10 @@ function blockedEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
 
 describe("flowEventsFromAuditEntries", () => {
   it("extracts a well-formed denied flow from an egress_blocked entry", () => {
-    const events = flowEventsFromAuditEntries([blockedEntry()]);
+    const events = flowEventsFromAuditEntries(
+      [withProducerSignature(blockedEntry(), "agent-1")],
+      SIGNED_ATTRIBUTION,
+    );
     expect(events).toHaveLength(1);
     expect(events[0]).toEqual({
       timestamp: "2026-07-07T10:00:00.000Z",
@@ -54,13 +116,16 @@ describe("flowEventsFromAuditEntries", () => {
   });
 
   it("defaults hostname_source to null when the Linux daemon's generic destination shape omits it", () => {
-    const entry = blockedEntry({
-      details: {
-        agent: { id: "agent-1", template: "claude-code" },
-        destination: { host: "new-tool.example.com", ip: "203.0.113.9", port: 443, protocol: "tcp" },
-      },
-    });
-    const events = flowEventsFromAuditEntries([entry]);
+    const entry = withProducerSignature(
+      blockedEntry({
+        details: {
+          agent: { id: "agent-1", template: "claude-code" },
+          destination: { host: "new-tool.example.com", ip: "203.0.113.9", port: 443, protocol: "tcp" },
+        },
+      }),
+      "agent-1",
+    );
+    const events = flowEventsFromAuditEntries([entry], SIGNED_ATTRIBUTION);
     expect(events[0]!.hostname_source).toBeNull();
   });
 
@@ -101,7 +166,7 @@ describe("flowEventsFromAuditEntries", () => {
   describe("flat-shape (Linux daemon / producer-signed body)", () => {
     /** A Linux daemon egress_blocked body: flat dest_* + agent_* + the daemon's unconditional `decision_provenance` fingerprint. */
     function daemonFlatEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
-      return {
+      return withProducerSignature({
         timestamp: "2026-07-07T11:00:00.000Z",
         layer: "l1",
         operation: "egress_blocked",
@@ -118,11 +183,14 @@ describe("flowEventsFromAuditEntries", () => {
           decision_provenance: "default_deny",
         },
         ...overrides,
-      };
+      }, "agent-9");
     }
 
     it("folds a Linux daemon FLAT-shape egress_blocked row (regression: was returning null, folding zero daemon events)", () => {
-      const events = flowEventsFromAuditEntries([daemonFlatEntry()]);
+      const events = flowEventsFromAuditEntries(
+        [daemonFlatEntry()],
+        SIGNED_ATTRIBUTION,
+      );
       expect(events).toHaveLength(1);
       expect(events[0]).toEqual({
         timestamp: "2026-07-07T11:00:00.000Z",
@@ -135,7 +203,10 @@ describe("flowEventsFromAuditEntries", () => {
     });
 
     it("tags a row carrying the daemon's decision_provenance fingerprint as provenance 'linux_daemon'", () => {
-      const events = flowEventsFromAuditEntries([daemonFlatEntry()]);
+      const events = flowEventsFromAuditEntries(
+        [daemonFlatEntry()],
+        SIGNED_ATTRIBUTION,
+      );
       expect(events[0]!.provenance).toBe("linux_daemon");
     });
 
@@ -151,7 +222,7 @@ describe("flowEventsFromAuditEntries", () => {
           decision_provenance: "default_deny",
         },
       });
-      const events = flowEventsFromAuditEntries([entry]);
+      const events = flowEventsFromAuditEntries([entry], SIGNED_ATTRIBUTION);
       expect(events).toHaveLength(1);
       expect(events[0]!.destination.host).toBeNull();
       expect(events[0]!.destination.ip).toBe("198.51.100.7");
@@ -173,7 +244,7 @@ describe("flowEventsFromAuditEntries", () => {
           source: "macos_extension",
         },
       });
-      const events = flowEventsFromAuditEntries([entry]);
+      const events = flowEventsFromAuditEntries([entry], SIGNED_ATTRIBUTION);
       expect(events).toHaveLength(1);
       expect(events[0]!.provenance).toBe("macos");
     });
@@ -190,7 +261,7 @@ describe("flowEventsFromAuditEntries", () => {
           source: "macos_extension", // ...but positively macOS-sourced
         },
       });
-      const events = flowEventsFromAuditEntries([entry]);
+      const events = flowEventsFromAuditEntries([entry], SIGNED_ATTRIBUTION);
       expect(events).toHaveLength(1);
       expect(events[0]!.provenance).toBe("macos");
     });
@@ -199,21 +270,21 @@ describe("flowEventsFromAuditEntries", () => {
       const entry = daemonFlatEntry({
         details: { agent_id: "a", agent_template: "t", dest_ip: "1.2.3.4", dest_port: 7, dest_protocol: "1", decision_provenance: "x" },
       });
-      expect(flowEventsFromAuditEntries([entry])).toHaveLength(0);
+      expect(flowEventsFromAuditEntries([entry], SIGNED_ATTRIBUTION)).toHaveLength(0);
     });
 
     it("skips a flat row missing dest_port", () => {
       const entry = daemonFlatEntry({
         details: { agent_id: "a", agent_template: "t", dest_ip: "1.2.3.4", dest_protocol: "tcp", decision_provenance: "x" },
       });
-      expect(flowEventsFromAuditEntries([entry])).toHaveLength(0);
+      expect(flowEventsFromAuditEntries([entry], SIGNED_ATTRIBUTION)).toHaveLength(0);
     });
 
     it("skips a flat row with an invalid dest_protocol", () => {
       const entry = daemonFlatEntry({
         details: { agent_id: "a", agent_template: "t", dest_ip: "1.2.3.4", dest_port: 443, dest_protocol: "quic", decision_provenance: "x" },
       });
-      expect(flowEventsFromAuditEntries([entry])).toHaveLength(0);
+      expect(flowEventsFromAuditEntries([entry], SIGNED_ATTRIBUTION)).toHaveLength(0);
     });
   });
 
@@ -235,5 +306,32 @@ describe("flowEventsFromAuditEntries", () => {
       },
     });
     expect(flowEventsFromAuditEntries([honeypot])).toHaveLength(0);
+  });
+
+  it("forged unsigned flat Castle Wall rows do not become or widen an allow-rule scope", () => {
+    const forged = blockedEntry({
+      details: {
+        agent_id: "victim-agent-b",
+        agent_template: "victim-template",
+        dest_host: "evil.example.com",
+        dest_ip: "203.0.113.5",
+        dest_port: 443,
+        dest_protocol: "tcp",
+        decision_provenance: "default_deny",
+      },
+    });
+
+    const events = flowEventsFromAuditEntries([forged]);
+    const folded = foldObservations(events);
+    const { rules } = synthesizeCandidateRules(
+      folded,
+      "2026-07-07T12:00:00.000Z",
+      () => "per_instance_domain",
+    );
+
+    expect(events).toHaveLength(0);
+    expect(folded).toHaveLength(0);
+    expect(rules).toHaveLength(0);
+    expect(JSON.stringify(rules)).not.toContain("victim-agent-b");
   });
 });

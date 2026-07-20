@@ -333,4 +333,30 @@ describe("Psi-2 - producer wiring", () => {
     expect(entries.find((e) => e.agent_id === "agent_repeat")?.severity).toBe("alert");
     expect(entries.find((e) => e.agent_id === "agent_fatal")?.severity).toBe("critical");
   });
+
+  it("does not attribute forged unsigned Castle Wall error evidence to a victim agent", async () => {
+    const { auditLog, bridge } = rig();
+    await auditLog.append("l1", "egress_blocked", IDENTITY, {
+      context: "wrapped_agent",
+      severity: "error",
+      agent_id: "victim-agent-b",
+      error_class: "E_FORGED_CASTLE_WALL",
+      dest_host: "evil.example",
+      dest_ip: "203.0.113.92",
+      dest_port: 443,
+      dest_protocol: "tcp",
+    });
+    await auditLog.flush();
+
+    const entries = await ingestWrappedAgentErrors({
+      auditLog,
+      bridge,
+      now: new Date("2026-05-09T13:00:00.000Z"),
+    });
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.agent_id).toBe("unknown");
+    expect(JSON.stringify(entries)).not.toContain("victim-agent-b");
+    expect(JSON.stringify(entries)).not.toContain("verified");
+  });
 });

@@ -44,9 +44,9 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
 } from "../castle-wall/constants.js";
 import {
-  isLegacyMacOSAuditTokenHex,
-  protectionSubjectFromMacOSAuditToken,
-} from "../castle-wall/subject-binding.js";
+  parseCastleWallSignedCanonicalBody,
+  signedCanonicalIdentityId,
+} from "../castle-wall/audit-attribution.js";
 import {
   BROKER_EVIDENCE_BASIS_DETAIL_KEY,
   BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED,
@@ -59,23 +59,6 @@ import {
   verifyBrokerProducerSignature,
   type BrokerProducerSignatureInput,
 } from "../broker-mcp/producer-signature.js";
-
-function parseCastleWallSignedCanonicalBody(
-  details: Record<string, unknown>,
-): Record<string, unknown> | null {
-  const canonical = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
-  if (typeof canonical !== "string") return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(canonical);
-  } catch {
-    return null;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return null;
-  }
-  return parsed as Record<string, unknown>;
-}
 
 /**
  * The RAW `operation` string the persisted SIGNED canonical body attests to,
@@ -99,78 +82,6 @@ export function signedCanonicalOperation(
   if (parsed === null) return null;
   const op = parsed.operation;
   return typeof op === "string" ? op : null;
-}
-
-function subjectFromSignedCanonicalValue(
-  value: unknown,
-): string | null {
-  if (typeof value !== "string" || value.length === 0) return null;
-  return value;
-}
-
-type MacOSSignedSubjectResolution =
-  | { status: "absent" }
-  | { status: "resolved"; subject: string }
-  | { status: "unresolvable" };
-
-function macOSSubjectFromSignedCanonicalDetails(
-  parsed: Record<string, unknown>,
-  subjectFortressId?: string | null,
-): MacOSSignedSubjectResolution {
-  const parsedDetails = parsed.details;
-  if (
-    parsedDetails === null ||
-    typeof parsedDetails !== "object" ||
-    Array.isArray(parsedDetails)
-  ) {
-    return { status: "absent" };
-  }
-  const details = parsedDetails as Record<string, unknown>;
-  if (!Object.prototype.hasOwnProperty.call(details, "agent_id")) {
-    return { status: "absent" };
-  }
-  const agentId = details.agent_id;
-  if (!isLegacyMacOSAuditTokenHex(agentId)) {
-    return { status: "absent" };
-  }
-  if (subjectFortressId === null || subjectFortressId === undefined) {
-    return { status: "unresolvable" };
-  }
-  const subject = protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
-  return subject === null
-    ? { status: "unresolvable" }
-    : { status: "resolved", subject };
-}
-
-/**
- * The subject from the persisted SIGNED canonical body.
- *
- * This is the subject authority for a re-verified producer-signed entry. The
- * top-level audit row's `identity_id` is chosen by the in-process writer that
- * appended the row, so a reader must never use it for a producer-signed subject
- * decision after the signature verifies.
- *
- * The write side has two binding modes: macOS resolves a raw signed audit token
- * from signed `details.agent_id` plus the local fortress id, while signed-
- * identity producers use signed `identity_id` directly. The reader mirrors that
- * precedence and never treats an arbitrary signed `agent_id` string as a subject
- * fallback. Returns null on parse failure / missing subject so subject-bound
- * readers fail closed.
- */
-export function signedCanonicalIdentityId(
-  details: Record<string, unknown>,
-  subjectFortressId?: string | null,
-): string | null {
-  const parsed = parseCastleWallSignedCanonicalBody(details);
-  if (parsed === null) return null;
-  const macOSSubject = macOSSubjectFromSignedCanonicalDetails(
-    parsed,
-    subjectFortressId,
-  );
-  if (macOSSubject.status === "resolved") return macOSSubject.subject;
-  if (macOSSubject.status === "unresolvable") return null;
-  const identitySubject = subjectFromSignedCanonicalValue(parsed.identity_id);
-  return identitySubject;
 }
 import {
   verifyProducerSignature,

@@ -8,8 +8,19 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import type { AuditEntry } from "../../../src/operational/audit-log.js";
+import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+} from "../../../src/castle-wall/constants.js";
 import {
   DEFAULT_EXPORT_SINK,
   EnforcementExportConfigError,
@@ -29,6 +40,52 @@ import {
 } from "../../../src/castle-wall/export/index.js";
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const producerPriv = ed25519.utils.randomPrivateKey();
+const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
+const SIGNED_AT_MS = 1_777_777_777_777;
+const SIGNED_MAP_OPTIONS = {
+  pinnedProducerKeyB64url: producerPubB64,
+  subjectFortressId: "fortress:test",
+};
+
+function withProducerSignature(entry: AuditEntry, identityId: string): AuditEntry {
+  const seq =
+    typeof entry.details?.seq === "number" ? entry.details.seq : 42;
+  const body = JSON.stringify({
+    timestamp: entry.timestamp,
+    layer: entry.layer,
+    operation: entry.operation === "egress_allowed" ? "egress_allowed" : entry.operation,
+    identity_id: identityId,
+    result: entry.result,
+    details: entry.details ?? {},
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, SIGNED_AT_MS, seq),
+    producerPriv,
+  );
+  return {
+    ...entry,
+    identity_id: identityId,
+    details: {
+      ...(entry.details ?? {}),
+      seq,
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: SIGNED_AT_MS,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+        CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    },
+  };
+}
 
 /** An egress-deny entry in the UNSIGNED/channel shape (nested destination/agent). */
 function egressDenyEntry(extraDetails: Record<string, unknown> = {}): AuditEntry {
@@ -50,7 +107,7 @@ function egressDenyEntry(extraDetails: Record<string, unknown> = {}): AuditEntry
 
 /** An egress-allow entry in the SIGNED/flat shape (dest_host / agent_id / rule_id_matched). */
 function egressAllowFlatEntry(): AuditEntry {
-  return {
+  return withProducerSignature({
     timestamp: "2026-07-10T00:01:00.000Z",
     layer: "l1",
     operation: "egress_allowed",
@@ -62,10 +119,11 @@ function egressAllowFlatEntry(): AuditEntry {
       dest_port: 443,
       dest_protocol: "tcp",
       agent_id: "claude-code-1",
+      agent_template: "coding-assistant",
       rule_id_matched: "rule-allow-anthropic",
-      cw_producer_signed_canonical: "SECRET-SIGNED-BLOB-should-not-leak",
+      secret_note: "SECRET-SIGNED-BLOB-should-not-leak",
     },
-  };
+  }, "claude-code-1");
 }
 
 function policyLoadedEntry(): AuditEntry {
@@ -118,7 +176,7 @@ const alwaysDeny: ExportApprover = async () => ({ allowed: false, reason: "opera
 // ── Closed mapping ────────────────────────────────────────────────────────────
 
 describe("mapAuditEntryToEnforcementEvent", () => {
-  it("maps an egress deny (nested shape) to a frozen egress_decision event", () => {
+  it("maps an unsigned egress deny (nested shape) but omits unverified attribution", () => {
     const event = mapAuditEntryToEnforcementEvent(egressDenyEntry());
     expect(event).toEqual({
       schema: ENFORCEMENT_EVENT_SCHEMA,
@@ -130,14 +188,17 @@ describe("mapAuditEntryToEnforcementEvent", () => {
       destination_port: 443,
       destination_protocol: "tcp",
       rule_id: "rule-deny-evil",
-      agent_id: "claude-code-1",
-      agent_template: "coding-assistant",
+      agent_id: null,
+      agent_template: null,
       enforcement_point: "castle_wall",
     });
   });
 
   it("maps an egress allow (flat signed shape) reading dest_host / rule_id_matched", () => {
-    const event = mapAuditEntryToEnforcementEvent(egressAllowFlatEntry());
+    const event = mapAuditEntryToEnforcementEvent(
+      egressAllowFlatEntry(),
+      SIGNED_MAP_OPTIONS,
+    );
     expect(event).toMatchObject({
       event_class: "egress_decision",
       decision: "allow",
@@ -147,7 +208,35 @@ describe("mapAuditEntryToEnforcementEvent", () => {
       destination_protocol: "tcp",
       rule_id: "rule-allow-anthropic",
       agent_id: "claude-code-1",
+      agent_template: "coding-assistant",
     });
+  });
+
+  it("does not export forged unsigned Castle Wall agent attribution", () => {
+    const entry: AuditEntry = {
+      timestamp: "2026-07-10T00:01:30.000Z",
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "system",
+      result: "success",
+      details: {
+        dest_host: "evil.example.com",
+        dest_ip: "203.0.113.5",
+        dest_port: 443,
+        dest_protocol: "tcp",
+        rule_id_matched: "rule-default-deny",
+        agent_id: "victim-agent-b",
+        agent_template: "victim-template",
+      },
+    };
+    const event = mapAuditEntryToEnforcementEvent(entry);
+    expect(event).toMatchObject({
+      event_class: "egress_decision",
+      agent_id: null,
+      agent_template: null,
+    });
+    expect(JSON.stringify(event)).not.toContain("victim-agent-b");
+    expect(JSON.stringify(event)).not.toContain("victim-template");
   });
 
   it("maps a policy_loaded entry to a policy_change carrying attribution but NO contents", () => {
