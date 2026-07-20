@@ -332,6 +332,22 @@ describe("egress-gate/gate-account", () => {
     expect(ops.hardened).toEqual([]);
   });
 
+  it("refuses a skip when an existing gate account uid is shared with a live account", async () => {
+    const ops = gateOps({
+      existing: completeGateRecord(511),
+      highest: 511,
+      uidNames: ["sanctuary-gate-hermes", "live-operator"],
+    });
+    await expect(
+      planAndCreateGateAccount(
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes" },
+        ops,
+      ),
+    ).rejects.toThrow(/uid 511.*"live-operator".*Rename or reassign the colliding account "live-operator" away from uid 511/s);
+    expect(ops.created).toEqual([]);
+    expect(ops.hardened).toEqual([]);
+  });
+
   it("leaves a fresh partial gate account in place for repair when the home attribute is missing", async () => {
     const ops = gateOps({ create: (_name, uid) => ({ uid, isHidden: true, userShell: "/usr/bin/false" }) });
     await expect(

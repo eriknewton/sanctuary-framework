@@ -373,6 +373,22 @@ describe("castle-wall/provision/account", () => {
       expect(ops.hardened).toEqual([]);
     });
 
+    it("refuses a skip when the existing service account shares its uid with another holder", async () => {
+      const ops = mockOps({
+        initialRecord: completeRecord(500),
+        highestAssignedUid: async () => 510,
+        uidNames: ["sanctuary-hermes", "Legacy Admin"],
+      });
+      await expect(
+        planAndCreateAccount(
+          { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+          ops,
+        ),
+      ).rejects.toThrow(/uid 500.*"Legacy Admin".*Rename or reassign the colliding account "Legacy Admin" away from uid 500/s);
+      expect(ops.created).toEqual([]);
+      expect(ops.hardened).toEqual([]);
+    });
+
     it("B1/B2: leaves an observed fresh shared account in place when primary create mutates then throws", async () => {
       const ops = mockOps({
         createThrowsAfterRecord: new Error("dscl IsHidden write failed after sysadminctl created account"),
@@ -531,7 +547,38 @@ describe("castle-wall/provision/account", () => {
           ops,
         ),
       ).rejects.toThrow(/post-create uid-holder check failed.*"Legacy Admin".*rollback deletion NOT attempted/s);
-      expect(uidLookupCalls).toBe(4);
+      expect(uidLookupCalls).toBe(2);
+      expect(record).toEqual(completeRecord(500));
+    });
+
+    it("refuses an observed foreign post-create uid holder even if a later lookup would clear", async () => {
+      let record: ServiceAccountRecord | undefined;
+      let uidLookupCalls = 0;
+      const ops: AccountProvisionOps = {
+        lookupAccountUid: async () => record?.uid,
+        lookupAccountRecord: async () => record,
+        canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+        highestAssignedUid: async () => 499,
+        lookupAccountNamesByUid: async () => {
+          uidLookupCalls += 1;
+          if (uidLookupCalls === 1) return [];
+          if (uidLookupCalls === 2) return ["Legacy Admin", "sanctuary-hermes"];
+          return ["sanctuary-hermes"];
+        },
+        createUser: async (_accountName, uid, _comment, homeDirectory) => {
+          record = { uid, homeDirectory, userShell: "/usr/bin/false" };
+        },
+        hardenCreatedUser: async () => {
+          if (record !== undefined) record = { ...record, isHidden: true };
+        },
+      };
+      await expect(
+        planAndCreateAccount(
+          { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+          ops,
+        ),
+      ).rejects.toThrow(/post-create uid-holder check failed.*"Legacy Admin".*expected only "sanctuary-hermes"/s);
+      expect(uidLookupCalls).toBe(2);
       expect(record).toEqual(completeRecord(500));
     });
 
@@ -596,7 +643,7 @@ describe("castle-wall/provision/account", () => {
       const message = err instanceof Error ? err.message : String(err);
       expect(message).toMatch(/post-create uid-holder check failed.*"Legacy Admin".*rollback deletion NOT attempted/s);
       expect(message).not.toMatch(/Safe repair|Set UniqueID|repair "sanctuary-hermes" in place/s);
-      expect(uidLookupCalls).toBe(4);
+      expect(uidLookupCalls).toBe(2);
       expect(record).toEqual(completeRecord(500));
     });
 

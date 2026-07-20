@@ -519,6 +519,14 @@ function postCreateUidHolderConflictGuidance(accountName: string): string {
   );
 }
 
+function existingUidHolderConflictGuidance(accountName: string, uid: number, foreignHolders: readonly string[]): string {
+  return (
+    `Recovery: uid ${uid} must be held only by ${JSON.stringify(accountName)} before rerunning. ` +
+    `Rename or reassign the colliding account${foreignHolders.length === 1 ? "" : "s"} ` +
+    `${describeAccountNames(foreignHolders)} away from uid ${uid}; do not delete account homes as part of recovery.`
+  );
+}
+
 function assertPlanAvoidsExcludedUids(plan: AccountProvisionPlan, options: AccountProvisionOptions): void {
   if (plan.action === "conflict") return;
   const excluded = sortedUniqueSafeUids(options.excludedUids);
@@ -579,8 +587,17 @@ async function assertCreatedUidHeldOnlyByCreatedAccount(
       holders = await ops.lookupAccountNamesByUid(plan.uid);
       lastErr = undefined;
       const uniqueHolders = [...new Set(holders)];
+      const foreignHolders = uniqueHolders.filter((name) => name !== plan.accountName);
+      if (foreignHolders.length > 0) {
+        throw new AccountProvisionVerificationError(
+          `post-create uid lookup for service account "${plan.accountName}" at uid ${plan.uid} found ` +
+            `${describeAccountNames(uniqueHolders)}; expected only ${JSON.stringify(plan.accountName)}. ` +
+            postCreateUidHolderConflictGuidance(plan.accountName),
+        );
+      }
       if (uniqueHolders.length === 1 && uniqueHolders[0] === plan.accountName) return;
     } catch (err) {
+      if (err instanceof AccountProvisionVerificationError) throw err;
       holders = undefined;
       lastErr = err;
     }
@@ -604,6 +621,40 @@ async function assertCreatedUidHeldOnlyByCreatedAccount(
       `expected only ${JSON.stringify(plan.accountName)}. ` +
       postCreateUidHolderConflictGuidance(plan.accountName),
   );
+}
+
+async function assertExistingUidHeldOnlyByServiceAccount(
+  plan: Extract<AccountProvisionPlan, { action: "skip" }>,
+  ops: Pick<AccountProvisionOps, "lookupAccountNamesByUid">,
+): Promise<void> {
+  let holders: readonly string[];
+  try {
+    holders = await ops.lookupAccountNamesByUid(plan.uid);
+  } catch (err) {
+    throw new AccountProvisionVerificationError(
+      `Existing service account "${plan.accountName}" at uid ${plan.uid} could not be checked for shared uid ` +
+        `holders (${err instanceof Error ? err.message : String(err)}). Refusing to proceed until direct uid lookup is available.`,
+      { cause: err },
+    );
+  }
+
+  const uniqueHolders = [...new Set(holders)];
+  const foreignHolders = uniqueHolders.filter((name) => name !== plan.accountName);
+  if (foreignHolders.length > 0) {
+    throw new AccountProvisionVerificationError(
+      `Existing service account "${plan.accountName}" at uid ${plan.uid} shares that uid with ` +
+        `${describeAccountNames(foreignHolders)}. Refusing to proceed. ` +
+        existingUidHolderConflictGuidance(plan.accountName, plan.uid, foreignHolders),
+    );
+  }
+  if (uniqueHolders.length !== 1 || uniqueHolders[0] !== plan.accountName) {
+    throw new AccountProvisionVerificationError(
+      `Existing service account "${plan.accountName}" at uid ${plan.uid} could not be directly confirmed as the ` +
+        `only holder of that uid; lookup found ${
+          uniqueHolders.length === 0 ? "no account names" : describeAccountNames(uniqueHolders)
+        }. Refusing to proceed until the directory-service uid lookup returns only ${JSON.stringify(plan.accountName)}.`,
+    );
+  }
 }
 
 export async function rollbackCreatedServiceAccount(
@@ -693,6 +744,7 @@ export async function executeAccountProvisionPlan(
           serviceAccountRepairGuidance(plan.accountName, expected),
       );
     }
+    await assertExistingUidHeldOnlyByServiceAccount(plan, ops);
     return { uid: plan.uid, observed: describeServiceAccountRecord(observed) };
   }
   await assertCreateUidUnassigned(plan, options, ops);
