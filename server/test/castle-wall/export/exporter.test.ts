@@ -50,9 +50,12 @@ function toBase64url(bytes: Uint8Array): string {
 const producerPriv = ed25519.utils.randomPrivateKey();
 const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
 const SIGNED_AT_MS = 1_777_777_777_777;
+const SUBJECT_FORTRESS_ID = "fortress:test";
+const CLAUDE_AGENT_SUBJECT = `${SUBJECT_FORTRESS_ID}/uid-503`;
+const VICTIM_AGENT_SUBJECT = `${SUBJECT_FORTRESS_ID}/uid-504`;
 const SIGNED_MAP_OPTIONS = {
   pinnedProducerKeyB64url: producerPubB64,
-  subjectFortressId: "fortress:test",
+  subjectFortressId: SUBJECT_FORTRESS_ID,
 };
 
 function withProducerSignature(entry: AuditEntry, identityId: string): AuditEntry {
@@ -106,7 +109,7 @@ function egressDenyEntry(extraDetails: Record<string, unknown> = {}): AuditEntry
 }
 
 function signedEgressDenyEntry(extraDetails: Record<string, unknown> = {}): AuditEntry {
-  return withProducerSignature(egressDenyEntry(extraDetails), "claude-code-1");
+  return withProducerSignature(egressDenyEntry(extraDetails), CLAUDE_AGENT_SUBJECT);
 }
 
 /** An egress-allow entry in the SIGNED/flat shape (dest_host / agent_id / rule_id_matched). */
@@ -127,7 +130,7 @@ function egressAllowFlatEntry(): AuditEntry {
       rule_id_matched: "rule-allow-anthropic",
       secret_note: "SECRET-SIGNED-BLOB-should-not-leak",
     },
-  }, "claude-code-1");
+  }, CLAUDE_AGENT_SUBJECT);
 }
 
 function policyLoadedEntry(): AuditEntry {
@@ -218,7 +221,7 @@ describe("mapAuditEntryToEnforcementEvent", () => {
       destination_port: 443,
       destination_protocol: "tcp",
       rule_id: "rule-deny-evil",
-      agent_id: "claude-code-1",
+      agent_id: CLAUDE_AGENT_SUBJECT,
       agent_template: "coding-assistant",
       enforcement_point: "castle_wall",
     });
@@ -237,7 +240,7 @@ describe("mapAuditEntryToEnforcementEvent", () => {
       destination_port: 443,
       destination_protocol: "tcp",
       rule_id: "rule-allow-anthropic",
-      agent_id: "claude-code-1",
+      agent_id: CLAUDE_AGENT_SUBJECT,
       agent_template: "coding-assistant",
     });
   });
@@ -271,7 +274,7 @@ describe("mapAuditEntryToEnforcementEvent", () => {
         timestamp: "2026-07-10T00:01:45.000Z",
         layer: "l1",
         operation: "egress_blocked",
-        identity_id: "victim-agent-b",
+        identity_id: VICTIM_AGENT_SUBJECT,
         result: "success",
         details: {
           agent_id: "victim-agent-b",
@@ -283,7 +286,7 @@ describe("mapAuditEntryToEnforcementEvent", () => {
           rule_id_matched: "rule-legitimate",
         },
       },
-      "victim-agent-b",
+      VICTIM_AGENT_SUBJECT,
     );
     const stapled: AuditEntry = {
       ...signed,

@@ -21,12 +21,34 @@ pub struct ManifestRuleEntry {
     pub sha256: String,
 }
 
+/// Optional agent-origin metadata stamped by the Sanctuary manifest publisher.
+/// Linux uid-mode manifests bind the wall to the confined agent's ruid; the
+/// daemon uses that uid to emit the same `fortress/uid-N` protection subject the
+/// server/macOS path already expects.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentOrigin {
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_helper_signing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_helper_team_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_runtime_port_range: Option<[u32; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_uid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_uid: Option<u32>,
+    pub system_uid_allow_ceiling: u32,
+}
+
 /// Unsigned manifest. Canonical-JSON of this shape is the signing input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllowlistManifest {
     pub schema_version: u32,
     pub fortress_id: String,
     pub issued_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_origin: Option<AgentOrigin>,
     pub rules: Vec<ManifestRuleEntry>,
 }
 
@@ -388,6 +410,7 @@ mod tests {
             schema_version: SCHEMA_VERSION_V1,
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-04T00:00:00Z".to_string(),
+            agent_origin: None,
             rules: vec![ManifestRuleEntry {
                 rule_id: "uuid-1".to_string(),
                 file: "rule-1.json".to_string(),

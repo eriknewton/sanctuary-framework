@@ -51,9 +51,11 @@ import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-
 const PRODUCER_PRIV = ed25519.utils.randomPrivateKey();
 const PRODUCER_PUB_B64 = toBase64url(ed25519.getPublicKey(PRODUCER_PRIV));
 const SIGNED_AT_MS = 1_777_777_777_777;
+const SUBJECT_FORTRESS_ID = "fortress:test";
+const CLAUDE_AGENT_SUBJECT = `${SUBJECT_FORTRESS_ID}/uid-503`;
 const SIGNED_MAP_OPTIONS = {
   pinnedProducerKeyB64url: PRODUCER_PUB_B64,
-  subjectFortressId: "fortress:test",
+  subjectFortressId: SUBJECT_FORTRESS_ID,
 };
 
 function toBase64url(bytes: Uint8Array): string {
@@ -147,13 +149,13 @@ function egressDeny(seq: number, host: string, extra: Record<string, unknown> = 
     timestamp: `2026-07-10T00:00:0${seq}.000Z`,
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "claude-code-1",
+    identity_id: CLAUDE_AGENT_SUBJECT,
     result: "failure",
     details: { destination: { host, port: 443, protocol: "tcp" }, rule_id: `rule-${seq}`, ...extra },
   };
   return {
     sequence: seq,
-    entry: withProducerSignature(entry, "claude-code-1"),
+    entry: withProducerSignature(entry, CLAUDE_AGENT_SUBJECT),
   };
 }
 

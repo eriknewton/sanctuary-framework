@@ -33,9 +33,13 @@ function toBase64url(bytes: Uint8Array): string {
 const producerPriv = ed25519.utils.randomPrivateKey();
 const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
 const SIGNED_AT_MS = 1_777_777_777_777;
+const SUBJECT_FORTRESS_ID = "fortress:test";
+const AGENT_1_SUBJECT = `${SUBJECT_FORTRESS_ID}/uid-501`;
+const AGENT_9_SUBJECT = `${SUBJECT_FORTRESS_ID}/uid-509`;
+const VICTIM_AGENT_SUBJECT = `${SUBJECT_FORTRESS_ID}/uid-504`;
 const SIGNED_ATTRIBUTION = {
   pinnedProducerKeyB64url: producerPubB64,
-  subjectFortressId: "fortress:test",
+  subjectFortressId: SUBJECT_FORTRESS_ID,
 };
 
 function withProducerSignature(entry: AuditEntry, identityId: string): AuditEntry {
@@ -75,7 +79,7 @@ function blockedEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
     timestamp: "2026-07-07T10:00:00.000Z",
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "agent-1",
+    identity_id: AGENT_1_SUBJECT,
     result: "success",
     details: {
       agent: { id: "agent-1", template: "claude-code" },
@@ -91,13 +95,13 @@ function blockedEntry(overrides: Partial<AuditEntry> = {}): AuditEntry {
 describe("flowEventsFromAuditEntries", () => {
   it("extracts a well-formed denied flow from an egress_blocked entry", () => {
     const events = flowEventsFromAuditEntries(
-      [withProducerSignature(blockedEntry(), "agent-1")],
+      [withProducerSignature(blockedEntry(), AGENT_1_SUBJECT)],
       SIGNED_ATTRIBUTION,
     );
     expect(events).toHaveLength(1);
     expect(events[0]).toEqual({
       timestamp: "2026-07-07T10:00:00.000Z",
-      agent: { id: "agent-1", template: "claude-code" },
+      agent: { id: AGENT_1_SUBJECT, template: "claude-code" },
       destination: { host: "new-tool.example.com", ip: "203.0.113.9", port: 443, protocol: "tcp" },
       hostname_source: "sni",
       disposition: "denied",
@@ -123,7 +127,7 @@ describe("flowEventsFromAuditEntries", () => {
           destination: { host: "new-tool.example.com", ip: "203.0.113.9", port: 443, protocol: "tcp" },
         },
       }),
-      "agent-1",
+      AGENT_1_SUBJECT,
     );
     const events = flowEventsFromAuditEntries([entry], SIGNED_ATTRIBUTION);
     expect(events[0]!.hostname_source).toBeNull();
@@ -170,7 +174,7 @@ describe("flowEventsFromAuditEntries", () => {
         timestamp: "2026-07-07T11:00:00.000Z",
         layer: "l1",
         operation: "egress_blocked",
-        identity_id: "agent-9",
+        identity_id: AGENT_9_SUBJECT,
         result: "failure",
         details: {
           agent_id: "agent-9",
@@ -183,7 +187,7 @@ describe("flowEventsFromAuditEntries", () => {
           decision_provenance: "default_deny",
         },
         ...overrides,
-      }, "agent-9");
+      }, AGENT_9_SUBJECT);
     }
 
     it("folds a Linux daemon FLAT-shape egress_blocked row (regression: was returning null, folding zero daemon events)", () => {
@@ -194,7 +198,7 @@ describe("flowEventsFromAuditEntries", () => {
       expect(events).toHaveLength(1);
       expect(events[0]).toEqual({
         timestamp: "2026-07-07T11:00:00.000Z",
-        agent: { id: "agent-9", template: "claude-code" },
+        agent: { id: AGENT_9_SUBJECT, template: "claude-code" },
         destination: { host: "flat-tool.example.com", ip: "198.51.100.7", port: 443, protocol: "tcp" },
         hostname_source: null,
         disposition: "denied",
@@ -338,7 +342,7 @@ describe("flowEventsFromAuditEntries", () => {
   it("rejects a valid victim signature stapled onto a forged row before observe synthesis can scope it", () => {
     const signed = withProducerSignature(
       blockedEntry({
-        identity_id: "victim-agent-b",
+        identity_id: VICTIM_AGENT_SUBJECT,
         details: {
           agent_id: "victim-agent-b",
           agent_template: "claude-code",
@@ -349,7 +353,7 @@ describe("flowEventsFromAuditEntries", () => {
           decision_provenance: "default_deny",
         },
       }),
-      "victim-agent-b",
+      VICTIM_AGENT_SUBJECT,
     );
     const stapled: AuditEntry = {
       ...signed,

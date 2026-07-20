@@ -48,6 +48,11 @@ import {
   signedCanonicalIdentityId,
 } from "../castle-wall/audit-attribution.js";
 import {
+  fortressIdFromProtectionSubject,
+  isLegacyMacOSAuditTokenHex,
+  protectionSubjectFromMacOSAuditToken,
+} from "../castle-wall/subject-binding.js";
+import {
   BROKER_EVIDENCE_BASIS_DETAIL_KEY,
   BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED,
   BROKER_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
@@ -59,6 +64,11 @@ import {
   verifyBrokerProducerSignature,
   type BrokerProducerSignatureInput,
 } from "../broker-mcp/producer-signature.js";
+import {
+  verifyProducerSignature,
+  type ProducerSignatureInput,
+  type ProducerSignatureVerdict,
+} from "../castle-wall/runtime/producer-signature.js";
 
 /**
  * The RAW `operation` string the persisted SIGNED canonical body attests to,
@@ -83,11 +93,70 @@ export function signedCanonicalOperation(
   const op = parsed.operation;
   return typeof op === "string" ? op : null;
 }
-import {
-  verifyProducerSignature,
-  type ProducerSignatureInput,
-  type ProducerSignatureVerdict,
-} from "../castle-wall/runtime/producer-signature.js";
+
+function subjectFromSignedCanonicalValue(
+  value: unknown,
+  subjectFortressId?: string | null,
+): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  if (fortressIdFromProtectionSubject(value) !== subjectFortressId) return null;
+  return value;
+}
+
+function macOSSubjectFromSignedCanonicalDetails(
+  parsed: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): string | null {
+  const parsedDetails = parsed.details;
+  if (
+    parsedDetails === null ||
+    typeof parsedDetails !== "object" ||
+    Array.isArray(parsedDetails)
+  ) {
+    return null;
+  }
+  const details = parsedDetails as Record<string, unknown>;
+  const agentId = details.agent_id;
+  if (typeof agentId !== "string") {
+    return null;
+  }
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  return protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
+}
+
+export type SignedCanonicalSubjectIssue = "pre_canonical_linux_agent_name";
+
+/**
+ * Classify a verified producer-signed body whose subject could not be accepted.
+ *
+ * Callers use this only after the producer signature has verified. It lets
+ * operator-facing surfaces distinguish old Linux daemon output (`identity_id` was
+ * still an agent name) from a canonical subject mismatch, while keeping both
+ * states non-green.
+ */
+export function signedCanonicalSubjectIssue(
+  details: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): SignedCanonicalSubjectIssue | null {
+  const parsed = parseCastleWallSignedCanonicalBody(details);
+  if (parsed === null) return null;
+  const identityId = parsed.identity_id;
+  if (typeof identityId !== "string" || identityId.length === 0) return null;
+  if (subjectFromSignedCanonicalValue(identityId, subjectFortressId) !== null) {
+    return null;
+  }
+  if (macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId) !== null) {
+    return null;
+  }
+  if (
+    fortressIdFromProtectionSubject(identityId) !== null ||
+    isLegacyMacOSAuditTokenHex(identityId)
+  ) {
+    return null;
+  }
+  return "pre_canonical_linux_agent_name";
+}
 
 /**
  * The injectable verify function shape — defaults to `verifyProducerSignature`

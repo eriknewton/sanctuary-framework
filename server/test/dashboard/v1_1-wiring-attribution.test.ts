@@ -254,54 +254,67 @@ describe("v1.1 dashboard wiring Castle Wall attribution", () => {
   });
 
   it("threads the producer key so legitimate signed Castle Wall activity remains attributable", async () => {
-    const storage = new MemoryStorage();
-    const masterKey = randomBytes(32);
-    const auditLog = new AuditLog(storage, masterKey);
-    const identityId = "op-1";
-    const signed = withProducerSignature(
-      {
-        timestamp: "2026-07-20T10:10:00.000Z",
-        layer: "l1",
-        operation: "egress_blocked",
+    await withTmpFortress(async (storagePath) => {
+      const storage = new MemoryStorage();
+      const masterKey = randomBytes(32);
+      const auditLog = new AuditLog(storage, masterKey);
+      const fortressId = "fortress-dashboard-attribution";
+      const identityId = "operator-dashboard-attribution";
+      const agentId = "op-1";
+      const protectionSubject = subjectForUid(fortressId, 503);
+      const record = makeLocalAgent({
+        agent_id: agentId,
         identity_id: identityId,
-        result: "success",
-        details: {
-          agent_id: identityId,
-          agent_template: "claude-code",
-          dest_host: "legitimate.example.com",
-          dest_ip: "198.51.100.10",
-          dest_port: 443,
-          dest_protocol: "tcp",
+        protection_subject: protectionSubject,
+      });
+      writePersistedLocalAgents(storagePath, [record]);
+
+      const signed = withProducerSignature(
+        {
+          timestamp: "2026-07-20T10:10:00.000Z",
+          layer: "l1",
+          operation: "egress_blocked",
+          identity_id: protectionSubject,
+          result: "success",
+          details: {
+            agent_id: agentId,
+            agent_template: "claude-code",
+            dest_host: "legitimate.example.com",
+            dest_ip: "198.51.100.10",
+            dest_port: 443,
+            dest_protocol: "tcp",
+          },
         },
-      },
-      identityId,
-    );
-    await auditLog.appendCritical(signed);
-    await auditLog.flush();
+        protectionSubject,
+      );
+      await auditLog.appendCritical(signed);
+      await auditLog.flush();
 
-    const { selector, captured } = makeCapturingSelector();
-    const bindings = buildV11Bindings({
-      identityId,
-      fortressId: "fortress-dashboard-attribution",
-      auditLog,
-      storage,
-      masterKey,
-      intelligenceSelector: selector,
-      pinnedProducerKeyB64url: producerPubB64,
+      const { selector, captured } = makeCapturingSelector();
+      const bindings = buildV11Bindings({
+        identityId,
+        fortressId,
+        storagePath,
+        auditLog,
+        storage,
+        masterKey,
+        intelligenceSelector: selector,
+        pinnedProducerKeyB64url: producerPubB64,
+      });
+
+      const activity = await bindings.hubService.listActivity({
+        agent_id: agentId,
+        limit: 10,
+      });
+      expect(activity).toHaveLength(1);
+      expect(activity[0]!.agent_id).toBe(agentId);
+      expect(activity[0]!.attestation!.state).toBe("verified");
+
+      await bindings.operatorChatService!.sendConcierge("show recent activity");
+
+      expect(captured.context).toContain(`agent=${agentId}`);
+      expect(captured.context).not.toContain("agent=_fortress");
     });
-
-    const activity = await bindings.hubService.listActivity({
-      agent_id: identityId,
-      limit: 10,
-    });
-    expect(activity).toHaveLength(1);
-    expect(activity[0]!.agent_id).toBe(identityId);
-    expect(activity[0]!.attestation!.state).toBe("verified");
-
-    await bindings.operatorChatService!.sendConcierge("show recent activity");
-
-    expect(captured.context).toContain(`agent=${identityId}`);
-    expect(captured.context).not.toContain("agent=_fortress");
   });
 
   it("resolves macOS signed protection subjects to the wrapped id for activity and inspect", async () => {

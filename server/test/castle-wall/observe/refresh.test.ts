@@ -71,6 +71,8 @@ function toBase64url(bytes: Uint8Array): string {
 const producerPriv = ed25519.utils.randomPrivateKey();
 const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
 const SIGNED_AT_MS = 1_777_777_777_777;
+const FORTRESS_ID = "fortress:test";
+const AGENT_1_SUBJECT = `${FORTRESS_ID}/uid-501`;
 let nextSignedSeq = 1;
 
 function signedDetailsFor(input: {
@@ -173,13 +175,13 @@ async function appendBlocked(
   await auditLog.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "agent-1",
+    identity_id: AGENT_1_SUBJECT,
     result: "failure",
     timestamp,
     details: signedDetailsFor({
       timestamp,
       operation: "egress_blocked",
-      identityId: "agent-1",
+      identityId: AGENT_1_SUBJECT,
       result: "failure",
       details,
     }),
@@ -217,13 +219,13 @@ async function appendBlockedFlat(
   await auditLog.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "agent-1",
+    identity_id: AGENT_1_SUBJECT,
     result: "failure",
     timestamp,
     details: signedDetailsFor({
       timestamp,
       operation: "egress_blocked",
-      identityId: "agent-1",
+      identityId: AGENT_1_SUBJECT,
       result: "failure",
       details,
     }),
@@ -253,7 +255,7 @@ async function refresh(harness: Harness, rules: AllowlistRule[] = []) {
     lock: harness.lock,
     now: new Date("2026-07-14T12:00:00.000Z"),
     pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
-    subjectFortressId: "fortress:test",
+    subjectFortressId: FORTRESS_ID,
   });
 }
 
@@ -454,7 +456,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   it("round-3 HIGH counterpart: an agent_ids scope suppresses exactly that instance", async () => {
     const harness = makeHarness();
     await appendBlocked(harness.auditLog); // agent-1 / claude-code
-    const instanceRule = { ...allowRule(), scope: { agent_ids: ["agent-1"] } };
+    const instanceRule = { ...allowRule(), scope: { agent_ids: [AGENT_1_SUBJECT] } };
     const outcome = await refresh(harness, [instanceRule]);
     expect(outcome.status === "refreshed" && outcome.suppressed_allowed).toBe(1);
     expect((await harness.store.listCandidates()).size).toBe(0);
@@ -572,7 +574,7 @@ describe("allowlist-aware fold + prune (R3-1b, chokepoint requirement 2)", () =>
   it("#897 finding 2: a macOS default-resolver 'unknown' row and a Linux-daemon 'unknown' row diverge under the SAME allow rule (macOS stays pending, Linux is suppressed)", () => {
     const covering = [{ ...allowRule(), scope: { template_ids: ["unknown"] } }];
     const base = {
-      agent_id: "agent-1",
+      agent_id: AGENT_1_SUBJECT,
       agent_template: "unknown",
       host: "api.example.com",
       ip: "203.0.113.5",
@@ -633,7 +635,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
     // Simulate the pre-watermark engine having refreshed twice (times_seen
     // doubled to 4), with no watermark record.
     await harness.store.putCandidate({
-      agent_id: "agent-1",
+      agent_id: AGENT_1_SUBJECT,
       agent_template: "claude-code",
       host: "api.example.com",
       ip: "203.0.113.5",
@@ -657,7 +659,7 @@ describe("recompute heal (pre-watermark stores and reset chains)", () => {
     // Store holds a candidate, but the audit chain has no matching entries
     // (fully pruned): the recompute folds nothing and must leave it alone.
     await harness.store.putCandidate({
-      agent_id: "agent-1",
+      agent_id: AGENT_1_SUBJECT,
       agent_template: "claude-code",
       host: "aged-out.example.com",
       ip: "203.0.113.77",
@@ -781,7 +783,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
     // inflated count. Present rows heal from full retained history.
     await appendReviewMarker(harness.auditLog, "castle_wall_observe_discard");
     await harness.store.putCandidate({
-      agent_id: "agent-1",
+      agent_id: AGENT_1_SUBJECT,
       agent_template: "claude-code",
       host: "api.example.com",
       ip: "203.0.113.5",
@@ -823,12 +825,12 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
               timestamp,
               layer: "l1",
               operation: "egress_blocked",
-              identity_id: "agent-1",
+              identity_id: AGENT_1_SUBJECT,
               result: "failure",
               details: signedDetailsFor({
                 timestamp,
                 operation: "egress_blocked",
-                identityId: "agent-1",
+                identityId: AGENT_1_SUBJECT,
                 result: "failure",
                 details,
               }),
@@ -850,7 +852,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
       lock: harness.lock,
       now: new Date("2026-07-14T12:00:00.000Z"),
       pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
-      subjectFortressId: "fortress:test",
+      subjectFortressId: FORTRESS_ID,
     });
     expect(outcome.status === "refreshed" && outcome.mode).toBe("recompute");
     expect((await onlyCandidate(harness.store)).times_seen).toBe(2);
@@ -872,7 +874,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
       },
       now: new Date("2026-07-14T12:00:00.000Z"),
       pinnedProducerKeyB64url: harness.pinnedProducerKeyB64url,
-      subjectFortressId: "fortress:test",
+      subjectFortressId: FORTRESS_ID,
     });
     expect(outcome.status).toBe("refreshed");
     expect((await onlyCandidate(harness.store)).times_seen).toBe(1);

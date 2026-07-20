@@ -132,6 +132,18 @@ export const CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY =
   "cw_producer_captured_at_ms" as const;
 
 /**
+ * `details` key recording the consumer-side subject-binding rule used when a
+ * producer-signed entry was written. The key is not producer-signed and has no
+ * read-side authority; readers derive subjects from verified signed bytes.
+ */
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY =
+  "cw_producer_subject_binding" as const;
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN =
+  "macos_audit_token" as const;
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID =
+  "signed_identity_id" as const;
+
+/**
  * `details` key recording the authenticity basis the consumer established for
  * this entry. `producer_signed` means a producer signature was verified
  * against the pinned key (the in-process forgery hole is closed for this
@@ -169,6 +181,7 @@ export const CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS = [
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   // Consumer provenance is stamped after the producer body is accepted.
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,

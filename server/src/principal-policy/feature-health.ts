@@ -99,6 +99,7 @@ import {
   brokerLivenessEntryCounts,
   producerSignedDedupKey,
   subjectEvidenceForReverifiedEntry,
+  signedCanonicalSubjectIssue,
   brokerProducerSignedDedupKey,
   brokerSignedOperationMatchesEntry,
   signedCanonicalOperation,
@@ -417,6 +418,7 @@ export type FeatureHealthBasis =
   | "exclusive_egress_not_live"
   | "subject_unbound_evidence"
   | "legacy_macos_audit_token"
+  | "pre_canonical_linux_agent_name"
   | "subject_unresolvable";
 
 /**
@@ -917,7 +919,8 @@ export interface BuildFeatureHealthInput {
    * When present, the `castle_wall_egress` row only counts green-earning
    * enforcement evidence for that subject. An unresolvable claim subject becomes
    * `subject_unresolvable`; legacy 64-hex macOS audit-token identities become
-   * `legacy_macos_audit_token`; mismatched subjects become
+   * `legacy_macos_audit_token`; old Linux daemon agent-name identities become
+   * `pre_canonical_linux_agent_name`; mismatched subjects become
    * `subject_unbound_evidence`.
    */
   protectionClaimSubject: string | null;
@@ -1046,6 +1049,8 @@ export function evaluateFeatureHealth(args: {
         subjectRejected: boolean;
         /** True when evidence uses the pre-subject 64-hex macOS audit-token id. */
         legacyMacOSAuditToken: boolean;
+        /** True when signed Linux evidence still uses an agent-name identity. */
+        preCanonicalLinuxAgentName: boolean;
         /** True when the claim subject could not be resolved at all. */
         subjectUnresolvable: boolean;
       }
@@ -1166,6 +1171,7 @@ export function evaluateFeatureHealth(args: {
     const tsValid = !Number.isNaN(ts) && ts <= now + ENFORCEMENT_FUTURE_SKEW_MS;
     let subjectRejected = false;
     let legacyMacOSAuditToken = false;
+    let preCanonicalLinuxAgentName = false;
     let subjectUnresolvable = false;
     if (
       feature.id === "castle_wall_egress" &&
@@ -1179,10 +1185,21 @@ export function evaluateFeatureHealth(args: {
         args.protectionSubjectMatchMode,
       );
       if (!subjectMatch.matches) {
+        const subjectIssue =
+          reResultForSubject?.basis === "producer_signed_verified" &&
+          isRecord(entry.details)
+            ? signedCanonicalSubjectIssue(
+                entry.details,
+                fortressIdFromProtectionSubject(args.protectionClaimSubject) ??
+                  args.originMachine,
+              )
+            : null;
         if (subjectMatch.reason === "subject_unresolvable") {
           subjectUnresolvable = true;
         } else if (subjectMatch.reason === "legacy_macos_audit_token") {
           legacyMacOSAuditToken = true;
+        } else if (subjectIssue === "pre_canonical_linux_agent_name") {
+          preCanonicalLinuxAgentName = true;
         } else {
           subjectRejected = true;
         }
@@ -1192,7 +1209,10 @@ export function evaluateFeatureHealth(args: {
       ts,
       tsValid,
       isInvocation:
-        subjectRejected || legacyMacOSAuditToken || subjectUnresolvable
+        subjectRejected ||
+        legacyMacOSAuditToken ||
+        preCanonicalLinuxAgentName ||
+        subjectUnresolvable
           ? false
           : isInvocation,
       isFault,
@@ -1202,6 +1222,7 @@ export function evaluateFeatureHealth(args: {
       signedSeq,
       subjectRejected,
       legacyMacOSAuditToken,
+      preCanonicalLinuxAgentName,
       subjectUnresolvable,
     };
   };
@@ -1295,6 +1316,7 @@ export function evaluateFeatureHealth(args: {
   let latestFreshFaultMs: number | null = null;
   let latestFreshSubjectRejectedInvocationMs: number | null = null;
   let latestFreshLegacyMacOSAuditTokenInvocationMs: number | null = null;
+  let latestFreshPreCanonicalLinuxAgentNameInvocationMs: number | null = null;
   let latestFreshSubjectUnresolvableInvocationMs: number | null = null;
   // Slice 2: the most recent FRESH, producer-gated liveness heartbeat. Only used
   // to split the absence-of-enforcement case into alive-idle vs silently-dead; it
@@ -1323,6 +1345,13 @@ export function evaluateFeatureHealth(args: {
         c.ts > latestFreshLegacyMacOSAuditTokenInvocationMs)
     ) {
       latestFreshLegacyMacOSAuditTokenInvocationMs = c.ts;
+    }
+    if (
+      c.preCanonicalLinuxAgentName &&
+      (latestFreshPreCanonicalLinuxAgentNameInvocationMs === null ||
+        c.ts > latestFreshPreCanonicalLinuxAgentNameInvocationMs)
+    ) {
+      latestFreshPreCanonicalLinuxAgentNameInvocationMs = c.ts;
     }
     if (
       feature.rejectNonMonotonicSignedLiveness === true &&
@@ -1449,6 +1478,9 @@ export function evaluateFeatureHealth(args: {
     } else if (latestFreshLegacyMacOSAuditTokenInvocationMs !== null) {
       status = "unknown";
       basis = "legacy_macos_audit_token";
+    } else if (latestFreshPreCanonicalLinuxAgentNameInvocationMs !== null) {
+      status = "unknown";
+      basis = "pre_canonical_linux_agent_name";
     } else if (latestFreshSubjectRejectedInvocationMs !== null) {
       status = "unknown";
       basis = "subject_unbound_evidence";

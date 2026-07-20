@@ -1289,6 +1289,13 @@ describe("Hub activity feed pagination (Test 5)", () => {
   });
 
   it("filter by agent_id and category narrows results", async () => {
+    const betaSubject = `${FORTRESS_ID}/uid-504`;
+    rig.registry.put(
+      makeAgent({
+        agent_id: "agent-beta",
+        protection_subject: betaSubject,
+      }),
+    );
     await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
       agent_id: "agent-alpha",
     });
@@ -1304,7 +1311,7 @@ describe("Hub activity feed pagination (Test 5)", () => {
       details: {
         agent_id: "agent-beta",
       },
-    }, "agent-beta");
+    }, betaSubject);
     await rig.auditLog.appendCritical({
       timestamp: signed.timestamp,
       layer: signed.layer,

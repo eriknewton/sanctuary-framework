@@ -36,6 +36,9 @@ import {
 } from "../../src/castle-wall/constants.js";
 
 const IDENTITY_ID = "operator-attestation-projection-001";
+const TEST_FORTRESS_ID = "fortress:test";
+const VICTIM_AGENT_ID = "victim-agent-b";
+const VICTIM_SUBJECT = `${TEST_FORTRESS_ID}/uid-503`;
 
 interface Rig {
   auditLog: AuditLog;
@@ -91,10 +94,10 @@ function signedVictimEgressEntry(): AuditEntry {
       timestamp: "2026-07-20T10:00:00.000Z",
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: "victim-agent-b",
+      identity_id: VICTIM_SUBJECT,
       result: "success",
       details: {
-        agent_id: "victim-agent-b",
+        agent_id: VICTIM_AGENT_ID,
         agent_template: "claude-code",
         dest_host: "legitimate.example.com",
         dest_ip: "198.51.100.10",
@@ -102,7 +105,7 @@ function signedVictimEgressEntry(): AuditEntry {
         dest_protocol: "tcp",
       },
     },
-    "victim-agent-b",
+    VICTIM_SUBJECT,
   );
 }
 
@@ -146,12 +149,15 @@ describe("Activity feed: per-action attestation projection", () => {
         auditLog: rig.auditLog,
         identityId: signed.identity_id,
         pinnedProducerKeyB64url: producerPubB64,
-        subjectFortressId: "fortress:test",
+        subjectFortressId: TEST_FORTRESS_ID,
+        listLocalAgents: () => [
+          { agent_id: VICTIM_AGENT_ID, protection_subject: VICTIM_SUBJECT },
+        ],
       },
       { limit: 10 },
     );
     expect(entries).toHaveLength(1);
-    expect(entries[0]!.agent_id).toBe("victim-agent-b");
+    expect(entries[0]!.agent_id).toBe(VICTIM_AGENT_ID);
     expect(entries[0]!.attestation!.state).toBe("verified");
   });
 
@@ -259,7 +265,7 @@ describe("Activity feed: per-action attestation projection", () => {
         auditLog: rig.auditLog,
         identityId: IDENTITY_ID,
         pinnedProducerKeyB64url: producerPubB64,
-        subjectFortressId: "fortress:test",
+        subjectFortressId: TEST_FORTRESS_ID,
       },
       { limit: 10 },
     );
@@ -279,7 +285,7 @@ describe("Activity feed: per-action attestation projection", () => {
         auditLog: rig.auditLog,
         identityId: IDENTITY_ID,
         pinnedProducerKeyB64url: producerPubB64,
-        subjectFortressId: "fortress:test",
+        subjectFortressId: TEST_FORTRESS_ID,
       },
       { agent_id: "victim-agent-b", limit: 10 },
     );
@@ -305,9 +311,9 @@ describe("Activity feed: per-action attestation projection", () => {
     const entries = await aggregateActivity(
       {
         auditLog: rig.auditLog,
-        identityId: "victim-agent-b",
+        identityId: signed.identity_id,
         pinnedProducerKeyB64url: producerPubB64,
-        subjectFortressId: "fortress:test",
+        subjectFortressId: TEST_FORTRESS_ID,
       },
       { limit: 10 },
     );
@@ -319,9 +325,9 @@ describe("Activity feed: per-action attestation projection", () => {
     const filtered = await aggregateActivity(
       {
         auditLog: rig.auditLog,
-        identityId: "victim-agent-b",
+        identityId: signed.identity_id,
         pinnedProducerKeyB64url: producerPubB64,
-        subjectFortressId: "fortress:test",
+        subjectFortressId: TEST_FORTRESS_ID,
       },
       { agent_id: "victim-agent-b", limit: 10 },
     );
@@ -345,7 +351,7 @@ describe("Activity feed: per-action attestation projection", () => {
         auditLog: rig.auditLog,
         identityId: signed.identity_id,
         pinnedProducerKeyB64url: producerPubB64,
-        subjectFortressId: "fortress:test",
+        subjectFortressId: TEST_FORTRESS_ID,
       },
       { limit: 10 },
     );
@@ -365,7 +371,7 @@ describe("Activity feed: per-action attestation projection", () => {
     expect(
       auditEntryAgentId(persisted, {
         pinnedProducerKeyB64url: producerPubB64,
-        subjectFortressId: "fortress:test",
+        subjectFortressId: TEST_FORTRESS_ID,
       }),
     ).toBeNull();
   });

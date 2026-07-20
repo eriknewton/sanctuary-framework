@@ -45,6 +45,14 @@ const producerPriv = ed25519.utils.randomPrivateKey();
 const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
 const SIGNED_AT_MS = 1_777_777_777_777;
 const FORTRESS_ID = "fortress:test";
+function subjectForUid(uid: number): string {
+  const subject = protectionSubjectForUid(FORTRESS_ID, uid);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
+}
+const OPENCLAW_SUBJECT = subjectForUid(501);
+const CLINE_SUBJECT = subjectForUid(502);
+const VICTIM_SUBJECT = subjectForUid(503);
 
 function auditTokenForRuid(uid: number): string {
   const vals = [
@@ -163,19 +171,22 @@ function makeStubRegistry(records: LocalAgentRecord[]): HubAgentRegistrySource {
 
 describe("buildSnapshot derivation (Tau-5)", () => {
   it("counts audit + composition + egress events scoped to the agent", () => {
-    const record = makeRecord("OpenClaw", { channel_template_id: "research" });
+    const record = makeRecord("OpenClaw", {
+      channel_template_id: "research",
+      protection_subject: OPENCLAW_SUBJECT,
+    });
     const recentEntries = [
       withProducerSignature(
         makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
-        "OpenClaw",
+        OPENCLAW_SUBJECT,
       ),
       withProducerSignature(
         makeEntry("OpenClaw", "composition_receipt_packed", 30 * 60 * 1000),
-        "OpenClaw",
+        OPENCLAW_SUBJECT,
       ),
       withProducerSignature(
         makeEntry("OpenClaw", "context_gate_filter", 60 * 60 * 1000),
-        "OpenClaw",
+        OPENCLAW_SUBJECT,
       ),
       makeEntry("Cline", "policy_change", 5 * 60 * 1000), // owned by another agent
       makeEntry(null, "system_event", 5 * 60 * 1000), // unscoped
@@ -229,13 +240,15 @@ describe("buildSnapshot derivation (Tau-5)", () => {
   });
 
   it("counts legitimate producer-signed Castle Wall evidence when attribution context is supplied", () => {
-    const record = makeRecord("victim-agent-b");
+    const record = makeRecord("victim-agent-b", {
+      protection_subject: VICTIM_SUBJECT,
+    });
     const signed = withProducerSignature(
       {
         timestamp: new Date(NOW - 5 * 60 * 1000).toISOString(),
         layer: "l1",
         operation: "egress_blocked",
-        identity_id: "victim-agent-b",
+        identity_id: VICTIM_SUBJECT,
         result: "success",
         details: {
           agent_id: "victim-agent-b",
@@ -246,7 +259,7 @@ describe("buildSnapshot derivation (Tau-5)", () => {
           dest_protocol: "tcp",
         },
       },
-      "victim-agent-b",
+      VICTIM_SUBJECT,
     );
 
     const snap = buildSnapshot({
@@ -337,11 +350,13 @@ describe("buildSnapshot derivation (Tau-5)", () => {
   });
 
   it("flags has_pending_approvals when an approval-class audit event surfaces for the agent", () => {
-    const record = makeRecord("Cline");
+    const record = makeRecord("Cline", {
+      protection_subject: CLINE_SUBJECT,
+    });
     const recentEntries = [
       withProducerSignature(
         makeEntry("Cline", "approval_request", 10 * 60 * 1000),
-        "Cline",
+        CLINE_SUBJECT,
       ),
     ];
     const snap = buildSnapshot({
@@ -358,11 +373,13 @@ describe("buildSnapshot derivation (Tau-5)", () => {
   });
 
   it("derives current_work_summary from the most recent audit event", () => {
-    const record = makeRecord("Cline");
+    const record = makeRecord("Cline", {
+      protection_subject: CLINE_SUBJECT,
+    });
     const recentEntries = [
       withProducerSignature(
         makeEntry("Cline", "policy_change", 1 * 60 * 60 * 1000),
-        "Cline",
+        CLINE_SUBJECT,
       ),
       withProducerSignature(
         makeEntry(
@@ -371,7 +388,7 @@ describe("buildSnapshot derivation (Tau-5)", () => {
           5 * 60 * 1000,
           "failure",
         ),
-        "Cline",
+        CLINE_SUBJECT,
       ),
     ];
     const snap = buildSnapshot({
@@ -505,19 +522,22 @@ describe("generateProactiveStarter (Tau-5 starter generation)", () => {
 
 describe("AgentContextCache lifecycle (Tau-5)", () => {
   it("refresh aggregates registry + audit-log data into per-agent snapshots", async () => {
-    const records = [makeRecord("OpenClaw"), makeRecord("Cline")];
+    const records = [
+      makeRecord("OpenClaw", { protection_subject: OPENCLAW_SUBJECT }),
+      makeRecord("Cline", { protection_subject: CLINE_SUBJECT }),
+    ];
     const entries = [
       withProducerSignature(
         makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
-        "OpenClaw",
+        OPENCLAW_SUBJECT,
       ),
       withProducerSignature(
         makeEntry("OpenClaw", "composition_receipt_packed", 10 * 60 * 1000),
-        "OpenClaw",
+        OPENCLAW_SUBJECT,
       ),
       withProducerSignature(
         makeEntry("Cline", "approval_request", 5 * 60 * 1000),
-        "Cline",
+        CLINE_SUBJECT,
       ),
     ];
     const cache = new AgentContextCache({

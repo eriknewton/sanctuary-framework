@@ -21,6 +21,7 @@ import {
   CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
 } from "./constants.js";
 import {
+  fortressIdFromProtectionSubject,
   isLegacyMacOSAuditTokenHex,
   protectionSubjectFromMacOSAuditToken,
 } from "./subject-binding.js";
@@ -122,8 +123,13 @@ function canonicalJsonEquals(left: unknown, right: unknown): boolean {
   }
 }
 
-function subjectFromSignedCanonicalValue(value: unknown): string | null {
+function subjectFromSignedCanonicalValue(
+  value: unknown,
+  subjectFortressId?: string | null,
+): string | null {
   if (typeof value !== "string" || value.length === 0) return null;
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  if (fortressIdFromProtectionSubject(value) !== subjectFortressId) return null;
   return value;
 }
 
@@ -168,26 +174,34 @@ export function signedCanonicalIdentityId(
 ): string | null {
   const parsed = parseCastleWallSignedCanonicalBody(details);
   if (parsed === null) return null;
+  const identitySubject = subjectFromSignedCanonicalValue(
+    parsed.identity_id,
+    subjectFortressId,
+  );
+  if (identitySubject !== null) return identitySubject;
   const macOSSubject = macOSSubjectFromSignedCanonicalDetails(
     parsed,
     subjectFortressId,
   );
   if (macOSSubject.status === "resolved") return macOSSubject.subject;
-  if (macOSSubject.status === "unresolvable") return null;
-  return subjectFromSignedCanonicalValue(parsed.identity_id);
+  return null;
 }
 
 function signedCanonicalBodyIdentityId(
   body: Record<string, unknown>,
   subjectFortressId?: string | null,
 ): string | null {
+  const identitySubject = subjectFromSignedCanonicalValue(
+    body.identity_id,
+    subjectFortressId,
+  );
+  if (identitySubject !== null) return identitySubject;
   const macOSSubject = macOSSubjectFromSignedCanonicalDetails(
     body,
     subjectFortressId,
   );
   if (macOSSubject.status === "resolved") return macOSSubject.subject;
-  if (macOSSubject.status === "unresolvable") return null;
-  return subjectFromSignedCanonicalValue(body.identity_id);
+  return null;
 }
 
 export function isCastleWallAttributionSensitiveEntry(
@@ -270,6 +284,7 @@ function normalizedSignedBodyForPersistedComparison(
       out[key] = value;
     }
   }
+  out.identity_id = signedSubject;
   return out;
 }
 
