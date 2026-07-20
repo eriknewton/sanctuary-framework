@@ -531,7 +531,72 @@ describe("castle-wall/provision/account", () => {
           ops,
         ),
       ).rejects.toThrow(/post-create uid-holder check failed.*"Legacy Admin".*rollback deletion NOT attempted/s);
-      expect(uidLookupCalls).toBe(2);
+      expect(uidLookupCalls).toBe(4);
+      expect(record).toEqual(completeRecord(500));
+    });
+
+    it("retries a lagging post-create uid-holder lookup and succeeds once the created account appears", async () => {
+      let record: ServiceAccountRecord | undefined;
+      let uidLookupCalls = 0;
+      const ops: AccountProvisionOps = {
+        lookupAccountUid: async () => record?.uid,
+        lookupAccountRecord: async () => record,
+        canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+        highestAssignedUid: async () => 499,
+        lookupAccountNamesByUid: async () => {
+          uidLookupCalls += 1;
+          if (uidLookupCalls <= 2) return [];
+          return ["sanctuary-hermes"];
+        },
+        createUser: async (_accountName, uid, _comment, homeDirectory) => {
+          record = { uid, homeDirectory, userShell: "/usr/bin/false" };
+        },
+        hardenCreatedUser: async () => {
+          if (record !== undefined) record = { ...record, isHidden: true };
+        },
+      };
+      const result = await planAndCreateAccount(
+        { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+        ops,
+      );
+      expect(result.uid).toBe(500);
+      expect(uidLookupCalls).toBe(3);
+      expect(record).toEqual(completeRecord(500));
+    });
+
+    it("still refuses a persistent post-create uid collision without record-shape repair advice", async () => {
+      let record: ServiceAccountRecord | undefined;
+      let uidLookupCalls = 0;
+      const ops: AccountProvisionOps = {
+        lookupAccountUid: async () => record?.uid,
+        lookupAccountRecord: async () => record,
+        canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+        highestAssignedUid: async () => 499,
+        lookupAccountNamesByUid: async () => {
+          uidLookupCalls += 1;
+          return uidLookupCalls === 1 ? [] : ["sanctuary-hermes", "Legacy Admin"];
+        },
+        createUser: async (_accountName, uid, _comment, homeDirectory) => {
+          record = { uid, homeDirectory, userShell: "/usr/bin/false" };
+        },
+        hardenCreatedUser: async () => {
+          if (record !== undefined) record = { ...record, isHidden: true };
+        },
+      };
+      let err: unknown;
+      try {
+        await planAndCreateAccount(
+          { accountName: "sanctuary-hermes", ceiling: CEILING, homeDirectory: HOME_DIR },
+          ops,
+        );
+      } catch (caught) {
+        err = caught;
+      }
+      expect(err).toBeInstanceOf(AccountProvisionVerificationError);
+      const message = err instanceof Error ? err.message : String(err);
+      expect(message).toMatch(/post-create uid-holder check failed.*"Legacy Admin".*rollback deletion NOT attempted/s);
+      expect(message).not.toMatch(/Safe repair|Set UniqueID|repair "sanctuary-hermes" in place/s);
+      expect(uidLookupCalls).toBe(4);
       expect(record).toEqual(completeRecord(500));
     });
 

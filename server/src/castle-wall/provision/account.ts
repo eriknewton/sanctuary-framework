@@ -193,7 +193,7 @@ export function parseDsclOutputWithNoUnparsedResidue<T>(
   const values: T[] = [];
   const residueLineNumbers: number[] = [];
   let parsedNonEmptyLines = 0;
-  let totalNonEmptyLines = 0;
+  const totalNonEmptyLines = countNonEmptyLines(stdout);
   let index = 0;
 
   while (index < lines.length) {
@@ -202,7 +202,6 @@ export function parseDsclOutputWithNoUnparsedResidue<T>(
       index += 1;
       continue;
     }
-    totalNonEmptyLines += 1;
     const parsed = parseAt(lines, index);
     if (
       parsed === undefined ||
@@ -512,6 +511,14 @@ function describeAccountNames(names: readonly string[]): string {
   return [...new Set(names)].sort().map((name) => JSON.stringify(name)).join(", ");
 }
 
+function postCreateUidHolderConflictGuidance(accountName: string): string {
+  return (
+    `Recovery: do not treat the create as successful until the uid lookup returns only ` +
+    `${JSON.stringify(accountName)}. Inspect the other holder names, rename or reassign unrelated accounts, ` +
+    `or choose a different agent id before rerunning; do not delete the account home as part of recovery.`
+  );
+}
+
 function assertPlanAvoidsExcludedUids(plan: AccountProvisionPlan, options: AccountProvisionOptions): void {
   if (plan.action === "conflict") return;
   const excluded = sortedUniqueSafeUids(options.excludedUids);
@@ -563,31 +570,39 @@ async function assertCreateUidUnassigned(
 
 async function assertCreatedUidHeldOnlyByCreatedAccount(
   plan: Extract<AccountProvisionPlan, { action: "create" }>,
-  options: AccountProvisionOptions,
   ops: Pick<AccountProvisionOps, "lookupAccountNamesByUid">,
 ): Promise<void> {
-  let holders: readonly string[];
-  try {
-    holders = await ops.lookupAccountNamesByUid(plan.uid);
-  } catch (err) {
+  let holders: readonly string[] | undefined;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= POST_CREATE_RECORD_READ_ATTEMPTS; attempt += 1) {
+    try {
+      holders = await ops.lookupAccountNamesByUid(plan.uid);
+      lastErr = undefined;
+      const uniqueHolders = [...new Set(holders)];
+      if (uniqueHolders.length === 1 && uniqueHolders[0] === plan.accountName) return;
+    } catch (err) {
+      holders = undefined;
+      lastErr = err;
+    }
+    if (attempt < POST_CREATE_RECORD_READ_ATTEMPTS) {
+      await sleep(POST_CREATE_RECORD_READ_RETRY_DELAY_MS);
+    }
+  }
+
+  if (lastErr !== undefined) {
     throw new AccountProvisionVerificationError(
       `post-create uid lookup for service account "${plan.accountName}" at uid ${plan.uid} failed ` +
-        `(${err instanceof Error ? err.message : String(err)})`,
-      { cause: err },
+        `(${lastErr instanceof Error ? lastErr.message : String(lastErr)})`,
+      { cause: lastErr },
     );
   }
 
-  const uniqueHolders = [...new Set(holders)];
-  if (uniqueHolders.length === 1 && uniqueHolders[0] === plan.accountName) return;
+  const uniqueHolders = [...new Set(holders ?? [])];
   throw new AccountProvisionVerificationError(
     `post-create uid lookup for service account "${plan.accountName}" at uid ${plan.uid} found ` +
       `${uniqueHolders.length === 0 ? "no account names" : describeAccountNames(uniqueHolders)}; ` +
       `expected only ${JSON.stringify(plan.accountName)}. ` +
-      serviceAccountConflictGuidance(plan.accountName, {
-        homeDirectory: options.homeDirectory,
-        ceiling: options.ceiling,
-        excludedUids: options.excludedUids,
-      }),
+      postCreateUidHolderConflictGuidance(plan.accountName),
   );
 }
 
@@ -696,13 +711,12 @@ export async function executeAccountProvisionPlan(
     );
   }
   try {
-    await assertCreatedUidHeldOnlyByCreatedAccount(plan, options, ops);
+    await assertCreatedUidHeldOnlyByCreatedAccount(plan, ops);
   } catch (err) {
     const rollback = await rollbackCreatedServiceAccount(ops, plan.accountName, plan.uid);
     throw new AccountProvisionVerificationError(
       `Service account "${plan.accountName}" create returned, but the post-create uid-holder check failed ` +
-        `(${err instanceof Error ? err.message : String(err)}). ${rollback.message}. ` +
-        serviceAccountRepairGuidance(plan.accountName, expected),
+        `(${err instanceof Error ? err.message : String(err)}). ${rollback.message}.`,
       { cause: err },
     );
   }

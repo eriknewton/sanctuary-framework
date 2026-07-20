@@ -80,6 +80,7 @@ import {
   parseHighestAssignedUidFromDsclList,
   parseDsclOutputWithNoUnparsedResidue,
   parseServiceAccountIsHidden,
+  AccountUidEnumerationError,
   type AgentEgressVerifyReport,
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
@@ -760,10 +761,21 @@ async function resolveOperatorIdentity(): Promise<OperatorIdentity | undefined> 
 const DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE = /^(.+?)\s+UniqueID\s*=\s*(.*)$/;
 const DSCL_UNIQUE_ID_VALUE_RE = /^-?\d+$/;
 
-function parseDsclSearchAccountNameAt(
+interface DsclSearchAccountRecord {
+  readonly accountName: string;
+  readonly uid: number;
+}
+
+function parseDsclSearchUidValue(rawValue: string): number | undefined {
+  if (!DSCL_UNIQUE_ID_VALUE_RE.test(rawValue)) return undefined;
+  const uid = Number(rawValue);
+  return Number.isSafeInteger(uid) ? uid : undefined;
+}
+
+function parseDsclSearchAccountRecordAt(
   lines: readonly string[],
   lineIndex: number,
-): { readonly value: string; readonly nextLineIndex: number } | undefined {
+): { readonly value: DsclSearchAccountRecord; readonly nextLineIndex: number } | undefined {
   const line = lines[lineIndex]!;
   if (/^\s/.test(line)) return undefined;
   const match = DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE.exec(line);
@@ -772,8 +784,9 @@ function parseDsclSearchAccountNameAt(
   if (accountName.length === 0) return undefined;
 
   const rawValue = match[2]!.trim();
-  if (DSCL_UNIQUE_ID_VALUE_RE.test(rawValue)) {
-    return { value: accountName, nextLineIndex: lineIndex + 1 };
+  const sameLineUid = parseDsclSearchUidValue(rawValue);
+  if (sameLineUid !== undefined) {
+    return { value: { accountName, uid: sameLineUid }, nextLineIndex: lineIndex + 1 };
   }
   if (rawValue !== "(") return undefined;
 
@@ -784,8 +797,10 @@ function parseDsclSearchAccountNameAt(
     cursor += 1;
     if (trimmed.length === 0) continue;
     if (trimmed === ")") {
-      if (values.length !== 1 || !DSCL_UNIQUE_ID_VALUE_RE.test(values[0]!)) return undefined;
-      return { value: accountName, nextLineIndex: cursor };
+      if (values.length !== 1) return undefined;
+      const uid = parseDsclSearchUidValue(values[0]!);
+      if (uid === undefined) return undefined;
+      return { value: { accountName, uid }, nextLineIndex: cursor };
     }
     values.push(trimmed);
   }
@@ -798,12 +813,28 @@ function parseDsclSearchAccountNameAt(
  * evidence of absence, so non-empty unfamiliar lines throw instead of returning
  * an empty holder list.
  */
-export function parseDsclSearchAccountNames(stdout: string): string[] {
-  return parseDsclOutputWithNoUnparsedResidue(
+export function parseDsclSearchAccountNames(stdout: string, searchedUid: number): string[] {
+  if (!Number.isSafeInteger(searchedUid)) {
+    throw new AccountUidEnumerationError(
+      `Refusing to trust dscl . -search /Users UniqueID <uid>: searched uid must be a safe integer ` +
+        `(got ${String(searchedUid)}).`,
+    );
+  }
+  const records = parseDsclOutputWithNoUnparsedResidue(
     stdout,
-    "dscl . -search /Users UniqueID <uid>",
-    parseDsclSearchAccountNameAt,
+    `dscl . -search /Users UniqueID ${searchedUid}`,
+    parseDsclSearchAccountRecordAt,
   );
+  for (const record of records) {
+    if (record.uid !== searchedUid) {
+      throw new AccountUidEnumerationError(
+        `Refusing to trust dscl . -search /Users UniqueID ${searchedUid}: record ` +
+          `${JSON.stringify(record.accountName)} reported UniqueID=${record.uid}, expected ${searchedUid}. ` +
+          `Search output must prove the requested name-to-uid binding.`,
+      );
+    }
+  }
+  return records.map((record) => record.accountName);
 }
 
 /** Look up a NFSHomeDirectory by account name (preferred) or uid, via dscl. Fail-closed: any error or unparsed output resolves undefined. */
@@ -823,7 +854,7 @@ async function lookupHomeDirectory(user: string | undefined, uid: number): Promi
     ]);
     // FIX (round 5, item N4): parse the parenthesized dscl -search output
     // shape (the pre-fix same-line-digits regex never matched it).
-    const [accountName] = parseDsclSearchAccountNames(searchOut);
+    const [accountName] = parseDsclSearchAccountNames(searchOut, uid);
     if (accountName === undefined) return undefined;
     const { stdout } = await execFileAsync("/usr/bin/dscl", [
       ".",
@@ -1894,7 +1925,7 @@ async function resolveAccountShapeVerdict(
     // and the alreadyDedicated fast-path could never confirm a genuinely
     // dedicated account. Parse the real shape and require the expected account
     // name to be among the matched records.
-    const searchedNames = parseDsclSearchAccountNames(searchOut);
+    const searchedNames = parseDsclSearchAccountNames(searchOut, candidateUid);
     if (!searchedNames.includes(expectedAccountName)) {
       return "not-dedicated";
     }
@@ -2186,7 +2217,7 @@ function realAccountProvisionOps() {
       if (result.code !== 0) {
         throw new Error(`dscl could not search accounts by uid ${uid} (${dsclDiagnostic(result)})`);
       }
-      return parseDsclSearchAccountNames(result.stdout);
+      return parseDsclSearchAccountNames(result.stdout, uid);
     },
     lookupAccountRecord: async (
       accountName: string,

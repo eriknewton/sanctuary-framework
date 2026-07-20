@@ -1345,24 +1345,37 @@ describe("wrap/auto-provision real-ops chokepoint: symlink-safe recursive chmod/
 describe("wrap/auto-provision real-ops chokepoint: dscl -search parser (fix round-5 N4)", () => {
   it("parses the account name from the real PARENTHESIZED multi-line dscl -search output (the pre-fix regex never matched this)", () => {
     const realOutput = "eriknewton\t\tUniqueID = (\n    501\n)\n";
-    expect(parseDsclSearchAccountNames(realOutput)).toEqual(["eriknewton"]);
+    expect(parseDsclSearchAccountNames(realOutput, 501)).toEqual(["eriknewton"]);
   });
 
   it("also parses the single-line form (name  UniqueID = 501)", () => {
-    expect(parseDsclSearchAccountNames("sanctuary-hermes  UniqueID = 502\n")).toEqual(["sanctuary-hermes"]);
+    expect(parseDsclSearchAccountNames("sanctuary-hermes  UniqueID = 502\n", 502)).toEqual(["sanctuary-hermes"]);
   });
 
   it("returns every matched record name when a -search returns more than one", () => {
     const twoRecords = "first\t\tUniqueID = (\n    501\n)\nsecond\t\tUniqueID = (\n    501\n)\n";
-    expect(parseDsclSearchAccountNames(twoRecords)).toEqual(["first", "second"]);
+    expect(parseDsclSearchAccountNames(twoRecords, 501)).toEqual(["first", "second"]);
   });
 
   it("parses a holder record whose account name contains a space", () => {
-    expect(parseDsclSearchAccountNames("Legacy Admin\t\tUniqueID = (\n    503\n)\n")).toEqual(["Legacy Admin"]);
+    expect(parseDsclSearchAccountNames("Legacy Admin\t\tUniqueID = (\n    503\n)\n", 503)).toEqual(["Legacy Admin"]);
   });
 
   it("returns [] only on empty output", () => {
-    expect(parseDsclSearchAccountNames("")).toEqual([]);
+    expect(parseDsclSearchAccountNames("", 503)).toEqual([]);
+  });
+
+  it("rejects a parsed holder record whose UniqueID is not the searched uid", () => {
+    expect(() => parseDsclSearchAccountNames("sanctuary-gate-hermes  UniqueID = 999\n", 503)).toThrow(
+      /record "sanctuary-gate-hermes" reported UniqueID=999, expected 503/,
+    );
+  });
+
+  it("renders residue counts from the same non-empty line count", () => {
+    const stdout = "eriknewton\t\tUniqueID = (\n    501\n)\nNFSHomeDirectory: /Users/eriknewton\n";
+    expect(() => parseDsclSearchAccountNames(stdout, 501)).toThrow(
+      /returned 4 non-empty lines, but only 3 parsed\/accounted for \(1 unparsed at line 4\)/,
+    );
   });
 
   it.each([
@@ -1370,7 +1383,7 @@ describe("wrap/auto-provision real-ops chokepoint: dscl -search parser (fix roun
     ["trailing unmatched line", "eriknewton\t\tUniqueID = (\n    501\n)\nNFSHomeDirectory: /Users/x\n"],
     ["stray continuation", "    501\n)\n"],
   ])("throws on %s because unparsed dscl output is not evidence of absence", (_name, stdout) => {
-    expect(() => parseDsclSearchAccountNames(stdout)).toThrow(/Unparsed output is not evidence of absence/);
+    expect(() => parseDsclSearchAccountNames(stdout, 503)).toThrow(/Unparsed output is not evidence of absence/);
   });
 });
 

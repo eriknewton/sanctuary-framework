@@ -246,7 +246,7 @@ describe("egress-gate/gate-account", () => {
     });
     const guardedOps: GateAccountProvisionOps = {
       ...ops,
-      lookupAccountNamesByUid: async () => parseDsclSearchAccountNames(searchOut),
+      lookupAccountNamesByUid: async (uid) => parseDsclSearchAccountNames(searchOut, uid),
     };
     await expect(
       planAndCreateGateAccount(
@@ -262,6 +262,36 @@ describe("egress-gate/gate-account", () => {
     ).rejects.toThrow(refusal);
     expect(ops.created).toEqual([]);
     expect(ops.hardened).toEqual([]);
+  });
+
+  it("refuses when the post-create uid search returns the created name bound to a different uid", async () => {
+    let uidLookupCalls = 0;
+    let record: GateAccountRecord | undefined;
+    const ops: GateAccountProvisionOps = {
+      lookupAccountUid: async () => record?.uid,
+      lookupAccountRecord: async () => record,
+      canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+      highestAssignedUid: async () => 502,
+      lookupAccountNamesByUid: async (uid) => {
+        uidLookupCalls += 1;
+        if (uidLookupCalls === 1) return [];
+        return parseDsclSearchAccountNames("sanctuary-gate-hermes  UniqueID = 999\n", uid);
+      },
+      createUser: async (_name, uid, _comment, home) => {
+        record = { uid, homeDirectory: home, userShell: "/usr/bin/false" };
+      },
+      hardenCreatedUser: async () => {
+        if (record !== undefined) record = { ...record, isHidden: true };
+      },
+    };
+    await expect(
+      planAndCreateGateAccount(
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: GATE_HOME },
+        ops,
+      ),
+    ).rejects.toThrow(/record "sanctuary-gate-hermes" reported UniqueID=999, expected 503/);
+    expect(uidLookupCalls).toBe(4);
+    expect(record).toEqual(completeGateRecord(503));
   });
 
   it("requires a positive agentUid (fail-closed: the exclusion cannot be skipped)", () => {
