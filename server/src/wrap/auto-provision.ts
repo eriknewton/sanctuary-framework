@@ -1936,7 +1936,7 @@ async function resolveAccountShapeVerdict(
       `/Users/${expectedAccountName}`,
       "IsHidden",
     ]);
-    const hiddenValue = /IsHidden:\s*(\S+)/.exec(hiddenOut)?.[1];
+    const hiddenValue = dsclAttributeValueLineRegExp("IsHidden").exec(hiddenOut)?.[1]?.trim();
     if (parseServiceAccountIsHidden(hiddenValue) !== true) {
       return "not-dedicated";
     }
@@ -2011,7 +2011,7 @@ const DSCL_STDIO_MAXBUFFER_ERROR = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
 const DSCL_DIAGNOSTIC_MAX_CHARS = 512;
 const DSCL_RECORD_NOT_FOUND_RE = /eDSRecordNotFound|DS Error:\s*-14136|Invalid Path/i;
 const DSCL_NO_SUCH_KEY_RE = /^No such key:\s*([A-Za-z][A-Za-z0-9_-]*)\b/i;
-const DSCL_ATTRIBUTE_LINE_RE = /^([A-Za-z][A-Za-z0-9_-]*):(?:\s|$)/;
+const DSCL_ATTRIBUTE_LINE_RE = /^(?:dsAttrTypeNative:)?([A-Za-z][A-Za-z0-9_-]*):(?:\s|$)/;
 
 function dsclRawDiagnostic(result: Pick<DsclReadResult, "stdout" | "stderr">): string {
   return [result.stderr, result.stdout]
@@ -2102,6 +2102,10 @@ function escapeRegExpLiteral(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function dsclAttributeValueLineRegExp(attribute: string): RegExp {
+  return new RegExp(`^(?:dsAttrTypeNative:)?${escapeRegExpLiteral(attribute)}:\\s*(.*)$`, "m");
+}
+
 export function decideDsclRecordRead(result: DsclReadResult): DsclRecordReadDecision {
   // Test-only retained: production existence probes read explicit attributes.
   if (result.code === 0) return "present";
@@ -2127,7 +2131,7 @@ export function decideDsclAttributeRead(
       ? { kind: "record-absent" }
       : { kind: "unknown", diagnostic: dsclDiagnostic(result) };
   }
-  const match = new RegExp(`^${escapeRegExpLiteral(attribute)}:\\s*(.*)$`, "m").exec(result.stdout);
+  const match = dsclAttributeValueLineRegExp(attribute).exec(result.stdout);
   if (match !== null) return { kind: "value", value: match[1]!.trim() };
   if (
     result.stdout.trim().length === 0 &&
