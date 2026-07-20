@@ -58,7 +58,7 @@ import type { FlowObservationEvent, HostnameSource, ObserveProvenance } from "./
 /** The stored `operation` tag for a denied flow (see `runtime/macos-flow-events.ts` / `audit/events.ts` CastleWallEventType). */
 const BLOCKED_OPERATION = "egress_blocked";
 
-export interface FlowEventAdapterOptions extends AuditAttributionOptions {}
+export type FlowEventAdapterOptions = AuditAttributionOptions;
 
 interface VerifiedFlowAttribution {
   agentId: string;

@@ -68,7 +68,7 @@ const REDACTED_SENTINEL = "[redacted]";
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\u0000-\u001F\u007F]+/g;
 
-export interface EnforcementEventMapOptions extends AuditAttributionOptions {}
+export type EnforcementEventMapOptions = AuditAttributionOptions;
 
 /** Read a scalar string detail key, or null. Never recurses, never coerces objects. */
 function readString(details: Record<string, unknown> | undefined, key: string): string | null {
