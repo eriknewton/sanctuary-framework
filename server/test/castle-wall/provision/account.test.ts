@@ -10,7 +10,10 @@ import { describe, it, expect } from "vitest";
 
 import {
   deriveAgentAccountName,
+  AccountUidEnumerationError,
   AccountProvisionVerificationError,
+  lookupAccountRecordAfterCreate,
+  parseHighestAssignedUidFromDsclList,
   parseServiceAccountIsHidden,
   planAccountCreate,
   executeAccountProvisionPlan,
@@ -95,6 +98,27 @@ describe("castle-wall/provision/account", () => {
 
     it("preserves an absent attribute as absent", () => {
       expect(parseServiceAccountIsHidden(undefined)).toBeUndefined();
+    });
+  });
+
+  describe("parseHighestAssignedUidFromDsclList", () => {
+    it("parses negative macOS uids instead of dropping their lines", () => {
+      const stdout = "nobody -2\nagentmac 501\nsanctuary-hermes 502\n";
+      expect(parseHighestAssignedUidFromDsclList(stdout, CEILING - 1)).toBe(502);
+    });
+
+    it("fails closed on any unparseable non-empty uid enumeration line", () => {
+      expect(() => parseHighestAssignedUidFromDsclList("agentmac 501\nmalformed-line\n", CEILING - 1)).toThrow(
+        AccountUidEnumerationError,
+      );
+      expect(() => parseHighestAssignedUidFromDsclList("agentmac 501\nmalformed-line\n", CEILING - 1)).toThrow(
+        /only 1 parsed.*line 2/s,
+      );
+    });
+
+    it("returns the floor for empty uid enumeration output", () => {
+      expect(parseHighestAssignedUidFromDsclList("", CEILING - 1)).toBe(CEILING - 1);
+      expect(parseHighestAssignedUidFromDsclList("\n  \n", CEILING - 1)).toBe(CEILING - 1);
     });
   });
 
@@ -425,6 +449,22 @@ describe("castle-wall/provision/account", () => {
         ops,
       );
       expect(result.uid).toBe(500);
+      expect(lookupCalls).toBe(3);
+    });
+
+    it("M-1: a clean absent post-create observation clears any stale read error", async () => {
+      let lookupCalls = 0;
+      const observed = await lookupAccountRecordAfterCreate(
+        {
+          lookupAccountRecord: async () => {
+            lookupCalls += 1;
+            if (lookupCalls === 1) throw new Error("transient first read failed");
+            return undefined;
+          },
+        },
+        "sanctuary-hermes",
+      );
+      expect(observed).toBeUndefined();
       expect(lookupCalls).toBe(3);
     });
 

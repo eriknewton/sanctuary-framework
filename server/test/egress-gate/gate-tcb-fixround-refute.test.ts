@@ -114,14 +114,14 @@ describe("F2 refute: gate-uid collision exclusion", () => {
     ).toThrow(GateUidCollisionError);
   });
 
-  it("MOVES a `create` plan whose computed uid lands on an operator uid", () => {
+  it("REFUSES a `create` plan whose computed uid lands on an operator uid", () => {
     // ceiling 501, highest 500 => create uid = max(501, 501) = 501 (operator).
-    const plan = planGateAccountProvision(
-      { agentId: "hermes", agentUid: AGENT_UID, ceiling: 501, homeDirectory: GATE_HOME, excludeUids: [501] },
-      { existingUid: undefined, highestAssignedUid: 500 },
-    );
-    expect(plan.action).toBe("create");
-    expect(plan.uid).toBe(AGENT_UID + 1);
+    expect(() =>
+      planGateAccountProvision(
+        { agentId: "hermes", agentUid: AGENT_UID, ceiling: 501, homeDirectory: GATE_HOME, excludeUids: [501] },
+        { existingUid: undefined, highestAssignedUid: 500 },
+      ),
+    ).toThrow(GateUidCollisionError);
   });
 
   it("does NOT falsely refuse a legitimate distinct create uid (control)", () => {

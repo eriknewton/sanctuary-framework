@@ -15,6 +15,7 @@ export { detectProvisionNeed } from "./detect.js";
 
 export {
   SAFE_SERVICE_ACCOUNT_RE,
+  AccountUidEnumerationError,
   AccountProvisionVerificationError,
   EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN,
   EXPECTED_SERVICE_ACCOUNT_SHELL,
@@ -24,6 +25,7 @@ export {
   planAccountCreate,
   executeAccountProvisionPlan,
   lookupAccountRecordAfterCreate,
+  parseHighestAssignedUidFromDsclList,
   planAndCreateAccount,
   rollbackCreatedServiceAccount,
   serviceAccountConflictGuidance,

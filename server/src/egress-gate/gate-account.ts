@@ -165,8 +165,8 @@ async function rollbackIncompleteGateAccount(
  * delegating to the shipped {@link planAccountCreate} for the `skip`/`conflict`/
  * `create` semantics, THEN applying the fail-closed uid exclusion (Codex F2):
  * a `create` whose computed uid lands on the agent uid or an operator uid is
- * moved to the next non-excluded uid before any side effect, while a `skip`
- * whose existing uid collides is refused ({@link GateUidCollisionError}).
+ * refused before any side effect, and a `skip` whose existing uid collides is
+ * refused ({@link GateUidCollisionError}).
  * A `conflict` already refuses, so it passes through unchanged.
  */
 export function planGateAccountProvision(
@@ -184,9 +184,21 @@ export function planGateAccountProvision(
   // The agent uid is ALWAYS excluded; excludeUids adds operator/console uids.
   const excluded = new Set<number>([options.agentUid, ...(options.excludeUids ?? [])]);
   if (plan.action === "create" && excluded.has(plan.uid)) {
-    let uid = plan.uid;
-    while (excluded.has(uid)) uid += 1;
-    return { ...plan, uid };
+    // Invariant: planAccountCreate computes max(ceiling, highestAssignedUid + 1).
+    // With complete enumeration, that uid exceeds every assigned uid. Since the
+    // excluded uids are assigned agent/operator accounts, reaching this branch
+    // proves enumeration under-reported. Choosing an alternate uid would be a
+    // guess against stale host state and can hand the gate's allow rules to a
+    // live account.
+    throw new GateUidCollisionError(
+      plan.uid,
+      "agent-or-operator",
+      serviceAccountConflictGuidance(plan.accountName, {
+        homeDirectory: provisionOptions.homeDirectory,
+        ceiling: provisionOptions.ceiling,
+        excludedUids: [...excluded],
+      }),
+    );
   }
   if (plan.action === "skip" && excluded.has(plan.uid)) {
     throw new GateUidCollisionError(
@@ -207,8 +219,8 @@ export function planGateAccountProvision(
  * ops (the real `sysadminctl`/`dscl` side effects are drill-only). Returns the
  * gate account's uid and the plan that produced it. The gate uid MUST differ
  * from both the operator and the agent uid; that separation is enforced by the
- * ceiling plus the excluded-uid skip above, and re-checked by the arming slice
- * before the gate is registered as a confined principal.
+ * ceiling plus the excluded-uid refusal above, and re-checked by the arming
+ * slice before the gate is registered as a confined principal.
  */
 export async function planAndCreateGateAccount(
   options: GateAccountProvisionOptions,

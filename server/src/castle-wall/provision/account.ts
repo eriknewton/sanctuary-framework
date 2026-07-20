@@ -145,8 +145,18 @@ export class AccountProvisionVerificationError extends Error {
 export const EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN = true;
 export const EXPECTED_SERVICE_ACCOUNT_SHELL = "/usr/bin/false";
 
+const DSCL_UNIQUE_ID_LIST_LINE_RE = /^\s*\S+\s+(-?\d+)\s*$/;
+
 export interface AccountProvisionRollbackResult {
   readonly message: string;
+}
+
+/** Thrown when local account UID enumeration cannot be trusted. */
+export class AccountUidEnumerationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AccountUidEnumerationError";
+  }
 }
 
 export function parseServiceAccountIsHidden(value: string | undefined): boolean | undefined {
@@ -227,6 +237,51 @@ export function describeServiceAccountRecord(record: ServiceAccountRecord | unde
     `IsHidden=${record.isHidden === undefined ? "<missing>" : record.isHidden ? "1" : "0"}, ` +
     `UserShell=${record.userShell ?? "<missing>"}`
   );
+}
+
+/**
+ * Parse `dscl . -list /Users UniqueID` output into the highest assigned UID.
+ * Negative UIDs are valid on macOS (`nobody -2`) and must parse rather than be
+ * silently dropped. Any non-empty unparseable line fails closed because a
+ * partial UID census can allocate a new service account onto a live account.
+ */
+export function parseHighestAssignedUidFromDsclList(stdout: string, floor: number): number {
+  if (!Number.isSafeInteger(floor)) {
+    throw new AccountUidEnumerationError(`UID enumeration floor must be a safe integer (got ${String(floor)}).`);
+  }
+
+  let highest = floor;
+  let total = 0;
+  let parsed = 0;
+  const badLineNumbers: number[] = [];
+  const lines = stdout.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (line.trim().length === 0) continue;
+    total += 1;
+    const match = DSCL_UNIQUE_ID_LIST_LINE_RE.exec(line);
+    const uid = match === null ? Number.NaN : Number(match[1]);
+    if (match === null || !Number.isSafeInteger(uid)) {
+      badLineNumbers.push(index + 1);
+      continue;
+    }
+    parsed += 1;
+    highest = Math.max(highest, uid);
+  }
+
+  if (badLineNumbers.length > 0) {
+    const shown = badLineNumbers.slice(0, 8).join(", ");
+    const suffix = badLineNumbers.length > 8 ? `, +${badLineNumbers.length - 8} more` : "";
+    throw new AccountUidEnumerationError(
+      `Refusing to choose a service uid: dscl . -list /Users UniqueID returned ${total} non-empty ` +
+        `line${total === 1 ? "" : "s"}, but only ${parsed} parsed as "<account> <uid>" ` +
+        `(${badLineNumbers.length} unparseable at line${badLineNumbers.length === 1 ? "" : "s"} ${shown}${suffix}). ` +
+        `Run /usr/bin/dscl . -list /Users UniqueID locally and repair DirectoryService output before rerunning; ` +
+        `silent UID drops can allocate a new service account onto a live account.`,
+    );
+  }
+
+  return highest;
 }
 
 export async function serviceAccountRecordProblems(
@@ -377,6 +432,7 @@ export async function lookupAccountRecordAfterCreate(
   for (let attempt = 1; attempt <= POST_CREATE_RECORD_READ_ATTEMPTS; attempt += 1) {
     try {
       const record = await ops.lookupAccountRecord(accountName);
+      lastErr = undefined;
       if (record !== undefined) return record;
       if (attempt < POST_CREATE_RECORD_READ_ATTEMPTS) {
         await sleep(POST_CREATE_RECORD_READ_RETRY_DELAY_MS);

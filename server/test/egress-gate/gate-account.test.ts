@@ -10,6 +10,7 @@ import {
   gateAccountProvisionOptions,
   planGateAccountProvision,
   planAndCreateGateAccount,
+  GateUidCollisionError,
   GATE_ACCOUNT_NAME_PREFIX,
   type GateAccountProvisionOps,
   type GateAccountRecord,
@@ -159,21 +160,45 @@ describe("egress-gate/gate-account", () => {
     ).toThrow(/excluded agent-or-operator uid.*UniqueID.*NFSHomeDirectory/s);
   });
 
-  it("moves a create plan past excluded agent/operator uids before any side effect", () => {
-    // ceiling 500, highest 500 -> computed uid 501; 501 and agent uid 502 are excluded, so choose 503.
-    const plan = planGateAccountProvision(
-      {
-        agentId: "hermes",
-        agentUid: AGENT_UID,
-        ceiling: 500,
-        homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
-        excludeUids: [501],
-      },
-      { existingUid: undefined, highestAssignedUid: 500 },
-    );
-    expect(plan.action).toBe("create");
-    if (plan.action === "create") expect(plan.uid).toBe(503);
+  it("refuses a create plan whose computed uid lands on an excluded agent/operator uid before any side effect", () => {
+    // ceiling 500, highest 500 -> computed uid 501; since 501 is excluded, the
+    // UID census is stale and no alternate UID can be guessed safely.
+    expect(() =>
+      planGateAccountProvision(
+        {
+          agentId: "hermes",
+          agentUid: AGENT_UID,
+          ceiling: 500,
+          homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
+          excludeUids: [501],
+        },
+        { existingUid: undefined, highestAssignedUid: 500 },
+      ),
+    ).toThrow(GateUidCollisionError);
   });
+
+  for (const { highestAssignedUid, excludedUid } of [
+    { highestAssignedUid: 502, excludedUid: 503 },
+    { highestAssignedUid: 500, excludedUid: 501 },
+  ]) {
+    it(`refuses stale enumeration proof case highest=${highestAssignedUid} excluded=${excludedUid} before create`, async () => {
+      const ops = gateOps({ highest: highestAssignedUid });
+      await expect(
+        planAndCreateGateAccount(
+          {
+            agentId: "hermes",
+            agentUid: AGENT_UID,
+            ceiling: 500,
+            homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
+            excludeUids: [excludedUid],
+          },
+          ops,
+        ),
+      ).rejects.toThrow(GateUidCollisionError);
+      expect(ops.created).toEqual([]);
+      expect(ops.hardened).toEqual([]);
+    });
+  }
 
   it("requires a positive agentUid (fail-closed: the exclusion cannot be skipped)", () => {
     expect(() =>

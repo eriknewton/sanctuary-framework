@@ -77,6 +77,7 @@ import {
   buildAgentEgressReport,
   asUidTlsProbeArgv,
   asUidProbeReachableDecision,
+  parseHighestAssignedUidFromDsclList,
   parseServiceAccountIsHidden,
   type AgentEgressVerifyReport,
 } from "../castle-wall/provision/index.js";
@@ -2035,6 +2036,7 @@ function escapeRegExpLiteral(value: string): string {
 }
 
 export function decideDsclRecordRead(result: DsclReadResult): DsclRecordReadDecision {
+  // Test-only retained: production existence probes read explicit attributes.
   if (result.code === 0) return "present";
   if (result.execErrorCode === DSCL_STDIO_MAXBUFFER_ERROR) return "unknown";
   if (result.execErrorCode !== undefined) return "unknown";
@@ -2139,12 +2141,7 @@ function realAccountProvisionOps() {
     canonicalizeHomeDirectory,
     highestAssignedUid: async (): Promise<number> => {
       const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-list", "/Users", "UniqueID"]);
-      let highest = PROVISION_CEILING - 1;
-      for (const line of stdout.split("\n")) {
-        const match = /\s(\d+)\s*$/.exec(line);
-        if (match) highest = Math.max(highest, Number(match[1]));
-      }
-      return highest;
+      return parseHighestAssignedUidFromDsclList(stdout, PROVISION_CEILING - 1);
     },
     lookupAccountRecord: async (
       accountName: string,
