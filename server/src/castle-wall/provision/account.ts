@@ -511,8 +511,30 @@ function describeAccountNames(names: readonly string[]): string {
   return [...new Set(names)].sort().map((name) => JSON.stringify(name)).join(", ");
 }
 
+/**
+ * DirectoryService account-name reads are case-insensitive for ASCII on this
+ * macOS path, but non-ASCII codepoints that Unicode-lowercase into ASCII are
+ * still distinct records here (for example U+212A KELVIN SIGN -> "k"). Folding
+ * those to ASCII would classify a foreign uid holder as this service account.
+ */
+function directoryServiceAsciiCaseFold(name: string): string {
+  return name.replace(/[A-Z]/g, (char) => char.toLowerCase());
+}
+
 function directoryServiceAccountNamesEqual(left: string, right: string): boolean {
-  return left.toLowerCase() === right.toLowerCase();
+  return directoryServiceAsciiCaseFold(left) === directoryServiceAsciiCaseFold(right);
+}
+
+function uniqueDirectoryServiceAccountNames(names: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const name of names) {
+    const folded = directoryServiceAsciiCaseFold(name);
+    if (seen.has(folded)) continue;
+    seen.add(folded);
+    unique.push(name);
+  }
+  return unique;
 }
 
 function foreignUidHolders(accountName: string, holders: readonly string[]): string[] {
@@ -598,7 +620,7 @@ async function assertCreatedUidHeldOnlyByCreatedAccount(
     try {
       holders = await ops.lookupAccountNamesByUid(plan.uid);
       lastErr = undefined;
-      const uniqueHolders = [...new Set(holders)];
+      const uniqueHolders = uniqueDirectoryServiceAccountNames(holders);
       const foreignHolders = foreignUidHolders(plan.accountName, uniqueHolders);
       if (foreignHolders.length > 0) {
         throw new AccountProvisionVerificationError(
@@ -626,7 +648,7 @@ async function assertCreatedUidHeldOnlyByCreatedAccount(
     );
   }
 
-  const uniqueHolders = [...new Set(holders ?? [])];
+  const uniqueHolders = uniqueDirectoryServiceAccountNames(holders ?? []);
   throw new AccountProvisionVerificationError(
     `post-create uid lookup for service account "${plan.accountName}" at uid ${plan.uid} found ` +
       `${uniqueHolders.length === 0 ? "no account names" : describeAccountNames(uniqueHolders)}; ` +
@@ -650,7 +672,7 @@ async function assertExistingUidHeldOnlyByServiceAccount(
     );
   }
 
-  const uniqueHolders = [...new Set(holders)];
+  const uniqueHolders = uniqueDirectoryServiceAccountNames(holders);
   const foreignHolders = foreignUidHolders(plan.accountName, uniqueHolders);
   if (foreignHolders.length > 0) {
     throw new AccountProvisionVerificationError(

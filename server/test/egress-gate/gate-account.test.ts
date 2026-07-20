@@ -20,6 +20,9 @@ import { parseDsclSearchAccountNames } from "../../src/wrap/auto-provision.js";
 const AGENT_UID = 502;
 
 const GATE_HOME = "/var/sanctuary-agents/sanctuary-gate-hermes";
+const WORKER_GATE_HOME = "/var/sanctuary-agents/sanctuary-gate-worker";
+const KELVIN_SIGN = "\u{212A}";
+const KELVIN_WORKER_GATE_HOLDER = `sanctuary-gate-wor${KELVIN_SIGN}er`;
 
 function completeGateRecord(uid: number, homeDirectory = GATE_HOME): GateAccountRecord {
   return { uid, homeDirectory, isHidden: true, userShell: "/usr/bin/false" };
@@ -294,6 +297,33 @@ describe("egress-gate/gate-account", () => {
     expect(record).toEqual(completeGateRecord(503));
   });
 
+  it("refuses a U+212A Kelvin-sign post-create holder as a foreign gate account", async () => {
+    expect(KELVIN_SIGN.toLowerCase()).toBe("k");
+    let uidLookupCalls = 0;
+    let record: GateAccountRecord | undefined;
+    const ops: GateAccountProvisionOps = {
+      lookupAccountUid: async () => record?.uid,
+      lookupAccountRecord: async () => record,
+      canonicalizeHomeDirectory: async (path) => canonicalHome(path),
+      highestAssignedUid: async () => 504,
+      lookupAccountNamesByUid: async () => {
+        uidLookupCalls += 1;
+        return uidLookupCalls === 1 ? [] : [KELVIN_WORKER_GATE_HOLDER];
+      },
+      createUser: async (_name, uid, _comment, home) => {
+        record = { uid, homeDirectory: home, userShell: "/usr/bin/false" };
+      },
+      hardenCreatedUser: async () => {
+        if (record !== undefined) record = { ...record, isHidden: true };
+      },
+    };
+    await expect(
+      planAndCreateGateAccount({ agentId: "worker", agentUid: AGENT_UID, ceiling: 500, homeDirectory: WORKER_GATE_HOME }, ops),
+    ).rejects.toThrow(KELVIN_WORKER_GATE_HOLDER);
+    expect(uidLookupCalls).toBe(2);
+    expect(record).toEqual(completeGateRecord(505, WORKER_GATE_HOME));
+  });
+
   it("requires a positive agentUid (fail-closed: the exclusion cannot be skipped)", () => {
     expect(() =>
       planGateAccountProvision(
@@ -344,6 +374,20 @@ describe("egress-gate/gate-account", () => {
     );
     expect(result.plan.action).toBe("skip");
     expect(result.uid).toBe(511);
+    expect(ops.created).toEqual([]);
+    expect(ops.hardened).toEqual([]);
+  });
+
+  it("refuses a U+212A Kelvin-sign holder on the skip path as a foreign gate account", async () => {
+    expect(KELVIN_SIGN.toLowerCase()).toBe("k");
+    const ops = gateOps({
+      existing: completeGateRecord(511, WORKER_GATE_HOME),
+      highest: 511,
+      uidNames: [KELVIN_WORKER_GATE_HOLDER],
+    });
+    await expect(
+      planAndCreateGateAccount({ agentId: "worker", agentUid: AGENT_UID, ceiling: 500, homeDirectory: WORKER_GATE_HOME }, ops),
+    ).rejects.toThrow(KELVIN_WORKER_GATE_HOLDER);
     expect(ops.created).toEqual([]);
     expect(ops.hardened).toEqual([]);
   });
