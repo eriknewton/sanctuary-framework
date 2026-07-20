@@ -44,6 +44,7 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
 } from "../castle-wall/constants.js";
 import {
+  fortressIdFromProtectionSubject,
   isLegacyMacOSAuditTokenHex,
   protectionSubjectFromMacOSAuditToken,
 } from "../castle-wall/subject-binding.js";
@@ -103,43 +104,33 @@ export function signedCanonicalOperation(
 
 function subjectFromSignedCanonicalValue(
   value: unknown,
+  subjectFortressId?: string | null,
 ): string | null {
   if (typeof value !== "string" || value.length === 0) return null;
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  if (fortressIdFromProtectionSubject(value) !== subjectFortressId) return null;
   return value;
 }
-
-type MacOSSignedSubjectResolution =
-  | { status: "absent" }
-  | { status: "resolved"; subject: string }
-  | { status: "unresolvable" };
 
 function macOSSubjectFromSignedCanonicalDetails(
   parsed: Record<string, unknown>,
   subjectFortressId?: string | null,
-): MacOSSignedSubjectResolution {
+): string | null {
   const parsedDetails = parsed.details;
   if (
     parsedDetails === null ||
     typeof parsedDetails !== "object" ||
     Array.isArray(parsedDetails)
   ) {
-    return { status: "absent" };
+    return null;
   }
   const details = parsedDetails as Record<string, unknown>;
-  if (!Object.prototype.hasOwnProperty.call(details, "agent_id")) {
-    return { status: "absent" };
-  }
   const agentId = details.agent_id;
-  if (!isLegacyMacOSAuditTokenHex(agentId)) {
-    return { status: "absent" };
+  if (typeof agentId !== "string") {
+    return null;
   }
-  if (subjectFortressId === null || subjectFortressId === undefined) {
-    return { status: "unresolvable" };
-  }
-  const subject = protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
-  return subject === null
-    ? { status: "unresolvable" }
-    : { status: "resolved", subject };
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  return protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
 }
 
 /**
@@ -150,12 +141,10 @@ function macOSSubjectFromSignedCanonicalDetails(
  * appended the row, so a reader must never use it for a producer-signed subject
  * decision after the signature verifies.
  *
- * The write side has two binding modes: macOS resolves a raw signed audit token
- * from signed `details.agent_id` plus the local fortress id, while signed-
- * identity producers use signed `identity_id` directly. The reader mirrors that
- * precedence and never treats an arbitrary signed `agent_id` string as a subject
- * fallback. Returns null on parse failure / missing subject so subject-bound
- * readers fail closed.
+ * The reader derives the choice from signed content, not from any persisted
+ * detail selector. A canonical `identity_id` for the expected fortress wins. If
+ * none is present, a signed macOS audit token in `details.agent_id` can resolve
+ * to a subject. Anything else returns null so subject-bound readers fail closed.
  */
 export function signedCanonicalIdentityId(
   details: Record<string, unknown>,
@@ -163,14 +152,47 @@ export function signedCanonicalIdentityId(
 ): string | null {
   const parsed = parseCastleWallSignedCanonicalBody(details);
   if (parsed === null) return null;
-  const macOSSubject = macOSSubjectFromSignedCanonicalDetails(
-    parsed,
+  const identitySubject = subjectFromSignedCanonicalValue(
+    parsed.identity_id,
     subjectFortressId,
   );
-  if (macOSSubject.status === "resolved") return macOSSubject.subject;
-  if (macOSSubject.status === "unresolvable") return null;
-  const identitySubject = subjectFromSignedCanonicalValue(parsed.identity_id);
-  return identitySubject;
+  return (
+    identitySubject ??
+    macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId)
+  );
+}
+
+export type SignedCanonicalSubjectIssue = "pre_canonical_linux_agent_name";
+
+/**
+ * Classify a verified producer-signed body whose subject could not be accepted.
+ *
+ * Callers use this only after the producer signature has verified. It lets
+ * operator-facing surfaces distinguish old Linux daemon output (`identity_id` was
+ * still an agent name) from a canonical subject mismatch, while keeping both
+ * states non-green.
+ */
+export function signedCanonicalSubjectIssue(
+  details: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): SignedCanonicalSubjectIssue | null {
+  const parsed = parseCastleWallSignedCanonicalBody(details);
+  if (parsed === null) return null;
+  const identityId = parsed.identity_id;
+  if (typeof identityId !== "string" || identityId.length === 0) return null;
+  if (subjectFromSignedCanonicalValue(identityId, subjectFortressId) !== null) {
+    return null;
+  }
+  if (macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId) !== null) {
+    return null;
+  }
+  if (
+    fortressIdFromProtectionSubject(identityId) !== null ||
+    isLegacyMacOSAuditTokenHex(identityId)
+  ) {
+    return null;
+  }
+  return "pre_canonical_linux_agent_name";
 }
 import {
   verifyProducerSignature,

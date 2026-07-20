@@ -1,30 +1,32 @@
 /**
- * C4 (tamper-proof half) — end-to-end Linux producer-signed activation.
+ * C4 (tamper-proof half) - deterministic Linux producer-signed binding harness.
  *
- * Slice L1/R/P built the producer-signing daemon + the re-verifying consumer +
- * the single-source key loader, but nothing in PRODUCTION launched the daemon
- * with the key flags, bound a transport, or ran the drain pull-loop that feeds
- * signed events into the consumer. This suite exercises that now-built path
- * (`linux-daemon.ts` launcher + `linux-audit-drain.ts` pull-loop +
- * `linux-activation-gate.ts` opt-in/fail-closed gate) end-to-end against a mock
- * systemd + a mock daemon that serves real `audit_drain_response` frames.
+ * This suite exercises the binding half of the Linux path against mock systemd
+ * and a mock daemon transport. The signed event bodies come from the Rust audit
+ * builder fixture, not from a live privileged Linux daemon drain. The Linux
+ * manifest-publication half that stamps `agent_origin` does not exist yet, so
+ * this test suite does not claim live Linux green or S5 drill success.
  *
  * The four pre-declared acceptance cases (spec P-4):
- *   (a) a real daemon-signed event re-verifies GREEN because the key is now
- *       loaded via the launcher (consumer ACCEPTS the producer signature);
+ *   (a) a Rust-builder event signed by the mock daemon key re-verifies GREEN in
+ *       this harness when the claim subject matches;
  *   (b) a forged in-process entry renders NON-green BECAUSE the key is loaded
  *       (consumer REJECTS it — not key-null);
  *   (c) macOS / no-key path stays on the channel basis (no regression);
  *   (d) fail-closed when the daemon won't start or the key is unreadable
  *       (activation THROWS → not-armed, never green, never channel fallback).
  *
- * DRILL-ACCEPTANCE NOTE: this is test/smoke coverage. The production-arm
- * capability claim still requires a CAPTURED DRILL on real Linux hardware.
+ * DRILL-ACCEPTANCE NOTE: this is test/smoke coverage only. No Linux capability
+ * claim is made until the missing publication half is implemented and drilled on
+ * real Linux hardware.
  */
 
+import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
@@ -40,6 +42,7 @@ import { derivePurposeKey } from "../../../src/core/key-derivation.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
+import { buildCastleWallPosture } from "../../../src/principal-policy/posture.js";
 import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 import {
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
@@ -68,6 +71,25 @@ import {
 } from "../../../src/castle-wall/runtime/linux-activation-gate.js";
 import { RuntimeLinuxActivationError } from "../../../src/castle-wall/runtime/errors.js";
 
+type LinuxDaemonAuditFixtureKey = "uid_503" | "uid_504" | "old_agent_name";
+const daemonManifestPath = fileURLToPath(
+  new URL("../../../../castle-wall-daemon/Cargo.toml", import.meta.url),
+);
+const RUST_POLICY_TEST_TIMEOUT_MS = 120_000;
+const linuxDaemonAuditFixtures = JSON.parse(
+  readFileSync(
+    new URL(
+      "../fixtures/linux-daemon-canonical-subject-audit-vectors.json",
+      import.meta.url,
+    ),
+    "utf8",
+  ),
+) as Record<LinuxDaemonAuditFixtureKey, string> & {
+  captured_by: string;
+  captured_from: string;
+  captured_at_note: string;
+};
+
 // The audit consumer's freshness gate compares the signed `captured_at_unix_ms`
 // against the REAL `Date.now()` (no clock injection through the lifecycle path),
 // so signed events must carry a timestamp fresh relative to wall-clock — exactly
@@ -90,27 +112,22 @@ async function publishPubKey(storage: string, pubBytes: Uint8Array): Promise<voi
   await writeFile(join(dir, "audit-producer.pub"), Buffer.from(pubBytes));
 }
 
-/** The daemon's signed WAL body (canonical JSON) for one enforcement event. */
-function walBody(freshTs: number): string {
-  return JSON.stringify({
-    timestamp: new Date(freshTs).toISOString(),
-    layer: "l1",
-    operation: "egress_blocked",
-    identity_id: "fortress:test/uid-503",
-    fortress_id: "fortress:test",
-    result: "blocked",
-    details: { agent_id: "fortress:test/uid-503", dest_host: "evil.example" },
-  });
+/** Captured daemon audit-builder canonical JSON for one enforcement event. */
+function walBody(
+  fixture: LinuxDaemonAuditFixtureKey = "uid_503",
+): string {
+  return linuxDaemonAuditFixtures[fixture];
 }
 
-/** A genuine daemon-signed drain event (signed with the daemon's priv key). */
+/** A valid mock-signed drain event using the daemon-key test fixture. */
 function signedDrainEvent(
   priv: Uint8Array,
   seq: number,
-  priorHash: string | null
+  priorHash: string | null,
+  fixture: LinuxDaemonAuditFixtureKey = "uid_503",
 ): AuditDrainEvent {
   const freshTs = freshNow();
-  const canonical = walBody(freshTs);
+  const canonical = walBody(fixture);
   const sig = ed25519.sign(producerSigningBytes(canonical, freshTs, seq), priv);
   return {
     seq,
@@ -124,9 +141,13 @@ function signedDrainEvent(
 }
 
 /** A forged drain event: claims producer_signed but carries NO valid signature. */
-function forgedDrainEvent(seq: number, priorHash: string | null): AuditDrainEvent {
+function forgedDrainEvent(
+  seq: number,
+  priorHash: string | null,
+  fixture: LinuxDaemonAuditFixtureKey = "uid_503",
+): AuditDrainEvent {
   const freshTs = freshNow();
-  const canonical = walBody(freshTs);
+  const canonical = walBody(fixture);
   return {
     seq,
     captured_at_unix_ms: freshTs,
@@ -301,6 +322,57 @@ function keyMaterial() {
   };
 }
 
+async function activateAndDrainCapturedFixture(input: {
+  privateKey: Uint8Array;
+  publicKey: Uint8Array;
+  fixture: LinuxDaemonAuditFixtureKey;
+}): Promise<{
+  auditLog: AuditLog;
+  stop: () => Promise<void>;
+  pinnedProducerKeyB64url: string;
+}> {
+  await publishPubKey(tmp, input.publicKey);
+  const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+  const mock = buildMockDaemon([
+    signedDrainEvent(input.privateKey, 1, null, input.fixture),
+  ]);
+  const { runner } = activeSystemctl();
+  const { fs } = memoryFs();
+
+  const outcomeP = maybeActivateLinuxProducerSignedCastleWall({
+    fortressId: "fortress:test",
+    fortressStoragePath: tmp,
+    key: keyMaterial(),
+    auditSink: auditLog,
+    platform: "linux",
+    explicitOptIn: true,
+    systemctl: runner,
+    fs,
+    dropInDir: "/etc/systemd/system/sanctuary-castle-wall.service.d",
+    connectTransport: async () => mock.transport,
+    startDrainLoop: false,
+  });
+  await mock.sendChallenge();
+  const outcome = await outcomeP;
+  expect(outcome.activated).toBe(true);
+  if (!outcome.activated) throw new Error("linux activation did not arm");
+
+  const drainResult = await drainOnce(
+    outcome.activation.lifecycle.client(),
+    outcome.activation.lifecycle.audit(),
+    null,
+    256,
+  );
+  expect(drainResult.drained).toBe(1);
+  expect(mock.acks).toContain(1);
+
+  return {
+    auditLog,
+    stop: () => outcome.activation.stop(),
+    pinnedProducerKeyB64url: toBase64url(input.publicKey),
+  };
+}
+
 describe("C4 — opt-in gate (off by default, never surprise default-on)", () => {
   it("is OFF by default (no env flag → not requested)", () => {
     expect(isLinuxProducerSignedActivationRequested({ env: {} })).toBe(false);
@@ -454,6 +526,7 @@ describe("C4 — P-2 drain mapping: drain event → critical envelope with produ
     expect(built.kind).toBe("ok");
     if (built.kind !== "ok") return;
     expect(built.envelope.event.event_type).toBe("egress_blocked");
+    expect(built.envelope.event.fortress_id).toBe("fortress:test");
     expect(built.envelope.event.details.seq).toBe(1);
     expect(built.envelope.producer?.signatureB64url).toBe(drained.producer_signature_b64url);
     expect(built.envelope.producer?.eventCanonicalJson).toBe(drained.event_canonical_json);
@@ -466,7 +539,26 @@ describe("C4 — P-2 drain mapping: drain event → critical envelope with produ
 });
 
 describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
-  it("(a) a real daemon-signed event re-verifies GREEN once the key is loaded via the launcher", async () => {
+  it("(a) Rust policy refuses system uid origins before canonical subject audit emission", () => {
+    const output = execFileSync(
+      "cargo",
+      [
+        "test",
+        "snapshot_refuses_uid_mode_agent_origin_below_system_uid_ceiling",
+        "--manifest-path",
+        daemonManifestPath,
+      ],
+      { encoding: "utf8", timeout: RUST_POLICY_TEST_TIMEOUT_MS },
+    );
+
+    expect(output).toContain(
+      "snapshot_refuses_uid_mode_agent_origin_below_system_uid_ceiling",
+    );
+    expect(output).toContain("test result: ok.");
+    expect(output).toContain("1 passed");
+  }, RUST_POLICY_TEST_TIMEOUT_MS);
+
+  it("(a) a mock-signed Rust-builder event re-verifies GREEN once the key is loaded via the launcher", async () => {
     const priv = ed25519.utils.randomPrivateKey();
     const pub = ed25519.getPublicKey(priv);
     await publishPubKey(tmp, pub);
@@ -511,7 +603,102 @@ describe("C4 — P-4 end-to-end (a)-(d), deterministic", () => {
     // The daemon was acked through seq 1 (WAL truncation point).
     expect(mock.acks).toContain(1);
 
+    const posture = await buildCastleWallPosture({
+      protectionClaimSubject: "fortress:test/uid-503",
+      auditLog,
+      originMachine: "fortress:test",
+      platform: "linux",
+      now: Date.now(),
+      pinnedProducerKeyB64url: toBase64url(pub),
+    });
+    expect(posture.arm_state).toBe("armed");
+    expect(posture.producer_authenticity).toBe("producer_signed");
+    expect(posture.verdict_counts.blocked).toBe(1);
+
     await outcome.activation.stop();
+  });
+
+  it("(a-c) subject-bound Linux evidence greens only for the correct confined uid and refuses both relabel directions", async () => {
+    const priv = ed25519.utils.randomPrivateKey();
+    const pub = ed25519.getPublicKey(priv);
+    const cases: Array<{
+      fixture: LinuxDaemonAuditFixtureKey;
+      signedSubject: string;
+      wrongClaim: string;
+    }> = [
+      {
+        fixture: "uid_503",
+        signedSubject: "fortress:test/uid-503",
+        wrongClaim: "fortress:test/uid-504",
+      },
+      {
+        fixture: "uid_504",
+        signedSubject: "fortress:test/uid-504",
+        wrongClaim: "fortress:test/uid-503",
+      },
+    ];
+
+    for (const relabelCase of cases) {
+      const activated = await activateAndDrainCapturedFixture({
+        privateKey: priv,
+        publicKey: pub,
+        fixture: relabelCase.fixture,
+      });
+      try {
+        const correct = await buildCastleWallPosture({
+          protectionClaimSubject: relabelCase.signedSubject,
+          auditLog: activated.auditLog,
+          originMachine: "fortress:test",
+          platform: "linux",
+          now: Date.now(),
+          pinnedProducerKeyB64url: activated.pinnedProducerKeyB64url,
+        });
+        expect(correct.arm_state).toBe("armed");
+        expect(correct.producer_authenticity).toBe("producer_signed");
+
+        const wrong = await buildCastleWallPosture({
+          protectionClaimSubject: relabelCase.wrongClaim,
+          auditLog: activated.auditLog,
+          originMachine: "fortress:test",
+          platform: "linux",
+          now: Date.now(),
+          pinnedProducerKeyB64url: activated.pinnedProducerKeyB64url,
+        });
+        expect(wrong.arm_state).toBe("unknown");
+        expect(wrong.evidence_basis).toBe("subject_unbound_evidence");
+        expect(wrong.producer_authenticity).toBe("not_applicable");
+        expect(wrong.verdict_counts.blocked).toBe(0);
+      } finally {
+        await activated.stop();
+      }
+    }
+  });
+
+  it("(d) old-format Linux agent-name signed evidence fails closed as pre-canonical and never greens", async () => {
+    const priv = ed25519.utils.randomPrivateKey();
+    const pub = ed25519.getPublicKey(priv);
+    const activated = await activateAndDrainCapturedFixture({
+      privateKey: priv,
+      publicKey: pub,
+      fixture: "old_agent_name",
+    });
+    try {
+      const posture = await buildCastleWallPosture({
+        protectionClaimSubject: "fortress:test/uid-503",
+        auditLog: activated.auditLog,
+        originMachine: "fortress:test",
+        platform: "linux",
+        now: Date.now(),
+        pinnedProducerKeyB64url: activated.pinnedProducerKeyB64url,
+      });
+
+      expect(posture.arm_state).toBe("unknown");
+      expect(posture.evidence_basis).toBe("pre_canonical_linux_agent_name");
+      expect(posture.producer_authenticity).toBe("not_applicable");
+      expect(posture.verdict_counts.blocked).toBe(0);
+    } finally {
+      await activated.stop();
+    }
   });
 
   it("(b) a forged in-process entry is NON-green BECAUSE the key is loaded (rejected, not accepted)", async () => {

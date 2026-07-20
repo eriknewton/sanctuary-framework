@@ -43,6 +43,7 @@ import {
   CASTLE_WALL_AUDIT_LAYER,
   CASTLE_WALL_SCHEMA_VERSION_V1,
 } from "../constants.js";
+import { fortressIdFromProtectionSubject } from "../subject-binding.js";
 import type { AuditConsumer, CriticalEventEnvelope } from "./audit-consumer.js";
 import type { IpcClient } from "./ipc-client.js";
 
@@ -143,12 +144,12 @@ export function buildCriticalEnvelopeFromDrainEvent(
   // control events the daemon may also drain.
   const eventType = WAL_OPERATION_TO_EVENT_TYPE[operation] ?? operation;
 
+  const signedIdentityId =
+    typeof body.identity_id === "string" ? body.identity_id : null;
   const fortressId =
     typeof body.fortress_id === "string" && body.fortress_id.length > 0
       ? body.fortress_id
-      : typeof body.identity_id === "string"
-        ? body.identity_id
-        : "unknown";
+      : fortressIdFromProtectionSubject(signedIdentityId) ?? "unknown";
   const timestamp =
     typeof body.timestamp === "string" ? body.timestamp : new Date(drained.captured_at_unix_ms).toISOString();
 

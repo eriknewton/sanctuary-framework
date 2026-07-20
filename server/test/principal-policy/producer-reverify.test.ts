@@ -8,6 +8,7 @@ import { ed25519 } from "@noble/curves/ed25519";
 import {
   reverifyEntryProducerSignature,
   enforcementEntryCounts,
+  signedCanonicalSubjectIssue,
 } from "../../src/principal-policy/producer-reverify.js";
 import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
 import {
@@ -146,8 +147,9 @@ describe("reverifyEntryProducerSignature", () => {
       identity_id: "LIE",
       details: { agent_id: auditTokenForRuid(0) },
     });
+    const details = signedDetails(canonical);
     const result = reverifyEntryProducerSignature(
-      signedDetails(canonical),
+      details,
       pubB64,
       undefined,
       "fortress:test",
@@ -157,7 +159,7 @@ describe("reverifyEntryProducerSignature", () => {
     expect(result.signedIdentityId).toBeNull();
   });
 
-  it("keeps the legacy no-agent_id path on signed identity_id", () => {
+  it("uses a canonical signed identity_id for the expected fortress", () => {
     const canonical = JSON.stringify({
       layer: "l1",
       operation: "egress_blocked",
@@ -175,7 +177,7 @@ describe("reverifyEntryProducerSignature", () => {
     expect(result.signedIdentityId).toBe("fortress:test/uid-503");
   });
 
-  it("does not reinterpret a 64-hex signed identity_id as a macOS audit token", () => {
+  it("rejects a non-canonical 64-hex signed identity_id instead of reinterpreting it as a macOS audit token", () => {
     const hexIdentity = auditTokenForRuid(503);
     const canonical = JSON.stringify({
       layer: "l1",
@@ -191,7 +193,108 @@ describe("reverifyEntryProducerSignature", () => {
     );
 
     expect(result.basis).toBe("producer_signed_verified");
-    expect(result.signedIdentityId).toBe(hexIdentity);
+    expect(result.signedIdentityId).toBeNull();
+  });
+
+  it("rejects old Linux agent-name signed identity_id values as pre-canonical evidence", () => {
+    const canonical = JSON.stringify({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "agent-1",
+      details: { dest_host: "api.example" },
+    });
+    const details = signedDetails(canonical);
+    const result = reverifyEntryProducerSignature(
+      details,
+      pubB64,
+      undefined,
+      "fortress:test",
+    );
+
+    expect(result.basis).toBe("producer_signed_verified");
+    expect(result.signedIdentityId).toBeNull();
+    expect(signedCanonicalSubjectIssue(details, "fortress:test")).toBe(
+      "pre_canonical_linux_agent_name",
+    );
+  });
+
+  it("rejects signed identity_id values from a different fortress", () => {
+    const canonical = JSON.stringify({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "fortress:other/uid-503",
+      details: { dest_host: "api.example" },
+    });
+    const details = signedDetails(canonical);
+    const result = reverifyEntryProducerSignature(
+      details,
+      pubB64,
+      undefined,
+      "fortress:test",
+    );
+
+    expect(result.basis).toBe("producer_signed_verified");
+    expect(result.signedIdentityId).toBeNull();
+    expect(signedCanonicalSubjectIssue(details, "fortress:test")).toBeNull();
+  });
+
+  it("derives a canonical signed identity_id without any persisted selector", () => {
+    const canonical = JSON.stringify({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "fortress:test/uid-503",
+      details: { dest_host: "api.example" },
+    });
+    const details = signedDetails(canonical);
+
+    const result = reverifyEntryProducerSignature(
+      details,
+      pubB64,
+      undefined,
+      "fortress:test",
+    );
+
+    expect(result.basis).toBe("producer_signed_verified");
+    expect(result.signedIdentityId).toBe("fortress:test/uid-503");
+  });
+
+  it("falls back to the signed macOS audit token when signed identity_id is not canonical", () => {
+    const canonical = JSON.stringify({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "macos-extension",
+      details: { agent_id: auditTokenForRuid(503) },
+    });
+    const details = signedDetails(canonical);
+
+    const result = reverifyEntryProducerSignature(
+      details,
+      pubB64,
+      undefined,
+      "fortress:test",
+    );
+
+    expect(result.basis).toBe("producer_signed_verified");
+    expect(result.signedIdentityId).toBe("fortress:test/uid-503");
+  });
+
+  it("prefers a canonical signed identity_id over a macOS-looking signed details.agent_id", () => {
+    const canonical = JSON.stringify({
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "fortress:test/uid-504",
+      details: { agent_id: auditTokenForRuid(503) },
+    });
+
+    const result = reverifyEntryProducerSignature(
+      signedDetails(canonical),
+      pubB64,
+      undefined,
+      "fortress:test",
+    );
+
+    expect(result.basis).toBe("producer_signed_verified");
+    expect(result.signedIdentityId).toBe("fortress:test/uid-504");
   });
 });
 

@@ -149,7 +149,7 @@ impl DaemonHandle {
             .as_ref()
             .ok_or(AttemptError::WalUnwired)?;
 
-        let verdict = {
+        let (verdict, audit_fortress_id, audit_confined_agent_uid) = {
             let guard = store
                 .lock()
                 .map_err(|_| AttemptError::ManifestStorePoisoned)?;
@@ -158,10 +158,18 @@ impl DaemonHandle {
             // returns the same shape, so we surface the no-snapshot case
             // through the same code path.
             match guard.current_snapshot() {
-                Some(snap) => snap.evaluate(request),
-                None => Verdict::Deny {
-                    reason: crate::policy::DeniedReason::DefaultDeny,
-                },
+                Some(snap) => (
+                    snap.evaluate(request),
+                    snap.fortress_id.clone(),
+                    snap.confined_agent_uid,
+                ),
+                None => (
+                    Verdict::Deny {
+                        reason: crate::policy::DeniedReason::DefaultDeny,
+                    },
+                    self.config.fortress_id.clone(),
+                    None,
+                ),
             }
         };
 
@@ -169,6 +177,8 @@ impl DaemonHandle {
         let event_canonical_json = build_audit_event_canonical_json(
             &verdict,
             request,
+            &audit_fortress_id,
+            audit_confined_agent_uid,
             &timestamp_iso,
         )
         .map_err(AttemptError::AuditCanonicalize)?;
@@ -230,6 +240,8 @@ impl DaemonHandle {
                 let fail_closed_canonical_json = build_audit_event_canonical_json(
                     &fail_closed_verdict,
                     request,
+                    &audit_fortress_id,
+                    audit_confined_agent_uid,
                     &timestamp_iso,
                 )
                 .map_err(AttemptError::AuditCanonicalize)?;
@@ -723,6 +735,7 @@ mod tests {
             schema_version: 1,
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
+            agent_origin: None,
             rules: vec![
                 ManifestRuleEntry {
                     rule_id: rule_id.to_string(),

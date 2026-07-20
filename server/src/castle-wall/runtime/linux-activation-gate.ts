@@ -25,10 +25,10 @@
  *
  * # Drill-acceptance caveat (never overclaim)
  *
- * Activating this gate wires the close end-to-end IN CODE on Linux. The external
- * capability claim ("the fake-arm hole is closed in prod on Linux") still
- * requires a CAPTURED DRILL on real Linux hardware. Until then the honest status
- * is "test/smoke-passed, drill-acceptance pending."
+ * Activating this gate wires only the producer-signed binding/activation half.
+ * Linux still lacks the manifest-publication half that stamps `agent_origin`, so
+ * no Linux capability claim is made here. The claim is unavailable until that
+ * half exists and a CAPTURED DRILL on real Linux hardware passes.
  */
 
 import { startCastleWall, type CastleWallLifecycleHandle } from "./lifecycle.js";

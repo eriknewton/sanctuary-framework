@@ -22,6 +22,9 @@ import {
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
@@ -445,7 +448,7 @@ export class AuditConsumer {
         CASTLE_WALL_AUDIT_LAYER,
         envelope.event.event_type,
         identityOutcome.identityId,
-        buildDetailsForEvent(envelope.event, sigOutcome),
+        buildDetailsForEvent(envelope, sigOutcome),
         "success"
       );
       if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
@@ -867,9 +870,10 @@ function parseSignedBody(
 
 /** Build the `details` payload from an event, omitting redundant top-level fields. */
 function buildDetailsForEvent(
-  event: CastleWallAuditEvent,
+  envelope: CriticalEventEnvelope,
   signature: SignatureOutcome
 ): Record<string, unknown> {
+  const { event } = envelope;
   // For a PRODUCER-SIGNED entry the authoritative evidence is the SIGNED BODY,
   // not the attacker-controllable `CastleWallAuditEvent`. We persist the signed
   // body's own `details` (agent_id, dest_*, decision_provenance, rule_id_matched,
@@ -904,6 +908,13 @@ function buildDetailsForEvent(
       signature.eventCanonicalJson;
     out[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY] =
       signature.capturedAtUnixMs;
+    if (envelope.producerSubjectBinding?.kind === "macos_audit_token") {
+      out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY] =
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN;
+    } else if (envelope.producerSubjectBinding?.kind === "signed_identity_id") {
+      out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY] =
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID;
+    }
     out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED;
     out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
@@ -923,6 +934,7 @@ function buildDetailsForEvent(
   // read-side consumer might mistake for a verified signature.
   delete out[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
   delete out[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY];
+  delete out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY];
   out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
     CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED;
   // Provenance LAST, so a forged `event.details.cw_source` cannot survive into

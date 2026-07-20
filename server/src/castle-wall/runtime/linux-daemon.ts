@@ -29,12 +29,11 @@
  *
  * # Drill-acceptance caveat (never overclaim)
  *
- * This wires the producer-signed close end-to-end IN CODE on Linux behind an
- * opt-in gate. The external claim that "the fake-arm hole is closed in prod on
- * Linux" still requires a CAPTURED DRILL on real Linux hardware (daemon signs →
- * server pulls + re-verifies → forged entry rejected → dashboard honestly
- * non-green). Until that drill is captured the honest status is:
- * "test/smoke-passed, drill-acceptance pending."
+ * This wires only the producer-signed binding/activation half behind an opt-in
+ * gate. Linux still lacks the manifest-publication half that stamps
+ * `agent_origin`, so this module does not make a Linux capability claim. That
+ * claim is unavailable until the missing half exists and a CAPTURED DRILL on real
+ * Linux hardware passes.
  */
 
 import { createConnection } from "node:net";
