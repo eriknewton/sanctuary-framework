@@ -334,4 +334,44 @@ describe("flowEventsFromAuditEntries", () => {
     expect(rules).toHaveLength(0);
     expect(JSON.stringify(rules)).not.toContain("victim-agent-b");
   });
+
+  it("rejects a valid victim signature stapled onto a forged row before observe synthesis can scope it", () => {
+    const signed = withProducerSignature(
+      blockedEntry({
+        identity_id: "victim-agent-b",
+        details: {
+          agent_id: "victim-agent-b",
+          agent_template: "claude-code",
+          dest_host: "legitimate.example.com",
+          dest_ip: "198.51.100.10",
+          dest_port: 443,
+          dest_protocol: "tcp",
+          decision_provenance: "default_deny",
+        },
+      }),
+      "victim-agent-b",
+    );
+    const stapled: AuditEntry = {
+      ...signed,
+      details: {
+        ...signed.details,
+        dest_host: "evil.example.com",
+        dest_ip: "203.0.113.200",
+      },
+    };
+
+    const events = flowEventsFromAuditEntries([stapled], SIGNED_ATTRIBUTION);
+    const folded = foldObservations(events);
+    const { rules } = synthesizeCandidateRules(
+      folded,
+      "2026-07-07T12:00:00.000Z",
+      () => "per_instance_domain",
+    );
+
+    expect(events).toHaveLength(0);
+    expect(folded).toHaveLength(0);
+    expect(rules).toHaveLength(0);
+    expect(JSON.stringify(rules)).not.toContain("victim-agent-b");
+    expect(JSON.stringify(rules)).not.toContain("agent_ids");
+  });
 });

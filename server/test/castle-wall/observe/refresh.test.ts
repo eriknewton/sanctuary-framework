@@ -173,7 +173,7 @@ async function appendBlocked(
   await auditLog.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "castle-wall-daemon",
+    identity_id: "agent-1",
     result: "failure",
     timestamp,
     details: signedDetailsFor({
@@ -217,7 +217,7 @@ async function appendBlockedFlat(
   await auditLog.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "castle-wall-daemon",
+    identity_id: "agent-1",
     result: "failure",
     timestamp,
     details: signedDetailsFor({
@@ -823,7 +823,7 @@ describe("Codex-gate hardening (two-family gate fix round, 2026-07-14)", () => {
               timestamp,
               layer: "l1",
               operation: "egress_blocked",
-              identity_id: "castle-wall-daemon",
+              identity_id: "agent-1",
               result: "failure",
               details: signedDetailsFor({
                 timestamp,

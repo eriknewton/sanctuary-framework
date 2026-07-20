@@ -17,15 +17,92 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import { MemoryStorage } from "../../src/storage/memory.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { aggregateActivity } from "../../src/hub/activity-feed.js";
+import type { AuditEntry } from "../../src/operational/audit-log.js";
+import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+} from "../../src/castle-wall/constants.js";
 
 const IDENTITY_ID = "operator-attestation-projection-001";
 
 interface Rig {
   auditLog: AuditLog;
+}
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+const producerPriv = ed25519.utils.randomPrivateKey();
+const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
+const SIGNED_AT_MS = 1_777_777_777_777;
+
+function withProducerSignature(
+  entry: AuditEntry,
+  identityId: string,
+): AuditEntry {
+  const seq = typeof entry.details?.seq === "number" ? entry.details.seq : 77;
+  const body = JSON.stringify({
+    timestamp: entry.timestamp,
+    layer: entry.layer,
+    operation: entry.operation,
+    identity_id: identityId,
+    result: entry.result,
+    details: entry.details ?? {},
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, SIGNED_AT_MS, seq),
+    producerPriv,
+  );
+  return {
+    ...entry,
+    identity_id: identityId,
+    details: {
+      ...(entry.details ?? {}),
+      seq,
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: SIGNED_AT_MS,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+        CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    },
+  };
+}
+
+function signedVictimEgressEntry(): AuditEntry {
+  return withProducerSignature(
+    {
+      timestamp: "2026-07-20T10:00:00.000Z",
+      layer: "l1",
+      operation: "egress_blocked",
+      identity_id: "victim-agent-b",
+      result: "success",
+      details: {
+        agent_id: "victim-agent-b",
+        agent_template: "claude-code",
+        dest_host: "legitimate.example.com",
+        dest_ip: "198.51.100.10",
+        dest_port: 443,
+        dest_protocol: "tcp",
+      },
+    },
+    "victim-agent-b",
+  );
 }
 
 async function startRig(): Promise<Rig> {
@@ -121,6 +198,105 @@ describe("Activity feed: per-action attestation projection", () => {
 
     const filtered = await aggregateActivity(
       { auditLog: rig.auditLog, identityId: IDENTITY_ID },
+      { agent_id: "victim-agent-b", limit: 10 },
+    );
+    expect(filtered).toHaveLength(0);
+  });
+
+  it("fails closed for off-list Castle Wall operations and wrong-layer Castle Wall operation tags", async () => {
+    const cases: Array<{ layer: AuditEntry["layer"]; operation: string }> = [
+      { layer: "l1", operation: "agent_upstream_call" },
+      { layer: "l2", operation: "egress_blocked" },
+      { layer: "l3", operation: "egress_blocked" },
+      { layer: "l4", operation: "egress_blocked" },
+    ];
+    for (const item of cases) {
+      await rig.auditLog.append(
+        item.layer,
+        item.operation,
+        IDENTITY_ID,
+        {
+          agent_id: "victim-agent-b",
+          agent_template: "claude-code",
+          dest_host: "evil.example",
+          dest_ip: "203.0.113.99",
+          dest_port: 443,
+          dest_protocol: "tcp",
+        },
+        "success",
+      );
+    }
+    await rig.auditLog.flush();
+
+    const entries = await aggregateActivity(
+      {
+        auditLog: rig.auditLog,
+        identityId: IDENTITY_ID,
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: "fortress:test",
+      },
+      { limit: 10 },
+    );
+
+    expect(entries).toHaveLength(cases.length);
+    for (const entry of entries) {
+      expect(entry.agent_id).toBeUndefined();
+      expect(entry.display_template_args).not.toContainEqual({
+        kind: "agent_id",
+        value: "victim-agent-b",
+      });
+      expect(entry.attestation!.state).toBe("degraded");
+    }
+
+    const filtered = await aggregateActivity(
+      {
+        auditLog: rig.auditLog,
+        identityId: IDENTITY_ID,
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: "fortress:test",
+      },
+      { agent_id: "victim-agent-b", limit: 10 },
+    );
+    expect(filtered).toHaveLength(0);
+  });
+
+  it("rejects a valid victim signature stapled onto a forged activity row", async () => {
+    const signed = signedVictimEgressEntry();
+    await rig.auditLog.appendCritical({
+      layer: signed.layer,
+      operation: signed.operation,
+      identity_id: signed.identity_id,
+      timestamp: signed.timestamp,
+      result: signed.result,
+      details: {
+        ...signed.details,
+        dest_host: "evil.example.com",
+        dest_ip: "203.0.113.200",
+      },
+    });
+    await rig.auditLog.flush();
+
+    const entries = await aggregateActivity(
+      {
+        auditLog: rig.auditLog,
+        identityId: "victim-agent-b",
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: "fortress:test",
+      },
+      { limit: 10 },
+    );
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.agent_id).toBeUndefined();
+    expect(entries[0]!.attestation!.state).toBe("degraded");
+
+    const filtered = await aggregateActivity(
+      {
+        auditLog: rig.auditLog,
+        identityId: "victim-agent-b",
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: "fortress:test",
+      },
       { agent_id: "victim-agent-b", limit: 10 },
     );
     expect(filtered).toHaveLength(0);

@@ -1231,7 +1231,7 @@ describe("Hub activity feed pagination (Test 5)", () => {
     await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {
       agent_id: "agent-beta",
     });
-    await rig.auditLog.append("l2", "egress_blocked", IDENTITY_ID, {
+    await rig.auditLog.append("l2", "agent_upstream_call", IDENTITY_ID, {
       agent_id: "agent-beta",
     });
     await rig.auditLog.flush();

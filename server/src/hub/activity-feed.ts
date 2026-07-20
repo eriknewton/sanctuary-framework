@@ -27,6 +27,7 @@ import {
   auditEntryAgentId,
   isCastleWallAttributionSensitiveEntry,
   verifiedCastleWallAuditAttribution,
+  type AuditAttributionOptions,
 } from "../castle-wall/audit-attribution.js";
 import type { HubActivitySources } from "./types.js";
 import {
@@ -151,14 +152,9 @@ function buildTemplateArgs(
  */
 function extractAgentIdHint(
   entry: AuditEntry,
-  sources: HubActivitySources,
+  attribution: AuditAttributionOptions,
 ): string | undefined {
-  return (
-    auditEntryAgentId(entry, {
-      pinnedProducerKeyB64url: sources.pinnedProducerKeyB64url ?? null,
-      subjectFortressId: sources.subjectFortressId ?? null,
-    }) ?? undefined
-  );
+  return auditEntryAgentId(entry, attribution) ?? undefined;
 }
 
 /**
@@ -183,13 +179,10 @@ function deriveAttestationFragment(entryId: string): string {
  */
 function deriveAttestationState(
   entry: AuditEntry,
-  sources: HubActivitySources,
+  attribution: AuditAttributionOptions,
 ): "verified" | "degraded" {
   if (isCastleWallAttributionSensitiveEntry(entry)) {
-    return verifiedCastleWallAuditAttribution(entry, {
-      pinnedProducerKeyB64url: sources.pinnedProducerKeyB64url ?? null,
-      subjectFortressId: sources.subjectFortressId ?? null,
-    }) !== null
+    return verifiedCastleWallAuditAttribution(entry, attribution) !== null
       ? "verified"
       : "degraded";
   }
@@ -198,9 +191,9 @@ function deriveAttestationState(
 
 function projectEntry(
   entry: AuditEntry,
-  sources: HubActivitySources,
+  attribution: AuditAttributionOptions,
 ): HubActivityFeedEntry {
-  const agentIdHint = extractAgentIdHint(entry, sources);
+  const agentIdHint = extractAgentIdHint(entry, attribution);
   const category = categorizeOperation(entry.layer, entry.operation);
   const entryId = `${entry.timestamp}|${entry.operation}|${entry.identity_id}`;
   return {
@@ -213,9 +206,21 @@ function projectEntry(
     display_template_id: templateIdFor(category, entry.operation),
     display_template_args: buildTemplateArgs(entry, agentIdHint),
     attestation: {
-      state: deriveAttestationState(entry, sources),
+      state: deriveAttestationState(entry, attribution),
       fragment: deriveAttestationFragment(entryId),
     },
+  };
+}
+
+async function resolveActivityAttribution(
+  sources: HubActivitySources,
+): Promise<AuditAttributionOptions> {
+  if (sources.resolveAuditAttribution) {
+    return sources.resolveAuditAttribution();
+  }
+  return {
+    pinnedProducerKeyB64url: sources.pinnedProducerKeyB64url ?? null,
+    subjectFortressId: sources.subjectFortressId ?? null,
   };
 }
 
@@ -237,10 +242,11 @@ export async function aggregateActivity(
     limit: Math.max(limit * 4, limit),
     ...(filter.since !== undefined ? { since: filter.since } : {}),
   });
+  const attribution = await resolveActivityAttribution(sources);
 
   const projected = queryResult.entries
     .filter((e) => e.identity_id === sources.identityId)
-    .map((entry) => projectEntry(entry, sources));
+    .map((entry) => projectEntry(entry, attribution));
 
   let filtered = projected;
   if (filter.agent_id) {

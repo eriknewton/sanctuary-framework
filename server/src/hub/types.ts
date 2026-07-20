@@ -9,6 +9,7 @@
  */
 
 import type { AuditLog } from "../operational/audit-log.js";
+import type { AuditAttributionOptionsResolver } from "../castle-wall/audit-attribution.js";
 import type {
   HubAgentStatus,
   HubInboxKind,
@@ -206,6 +207,13 @@ export interface HubActivitySources {
    * Local fortress id needed to resolve macOS signed audit-token subjects.
    */
   subjectFortressId?: string | null;
+  /**
+   * Optional live resolver for Castle Wall read-side attribution. Production
+   * readers use this so an absent producer key is retried after provisioning
+   * and a present key is cached, rather than freezing legitimate signed rows
+   * into an unknown-agent state at construction time.
+   */
+  resolveAuditAttribution?: AuditAttributionOptionsResolver;
 }
 
 // -----------------------------------------------------------------------

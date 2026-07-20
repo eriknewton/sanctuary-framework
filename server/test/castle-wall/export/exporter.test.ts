@@ -239,6 +239,49 @@ describe("mapAuditEntryToEnforcementEvent", () => {
     expect(JSON.stringify(event)).not.toContain("victim-template");
   });
 
+  it("does not export victim attribution from a valid signature stapled onto a forged row", () => {
+    const signed = withProducerSignature(
+      {
+        timestamp: "2026-07-10T00:01:45.000Z",
+        layer: "l1",
+        operation: "egress_blocked",
+        identity_id: "victim-agent-b",
+        result: "success",
+        details: {
+          agent_id: "victim-agent-b",
+          agent_template: "claude-code",
+          dest_host: "legitimate.example.com",
+          dest_ip: "198.51.100.10",
+          dest_port: 443,
+          dest_protocol: "tcp",
+          rule_id_matched: "rule-legitimate",
+        },
+      },
+      "victim-agent-b",
+    );
+    const stapled: AuditEntry = {
+      ...signed,
+      details: {
+        ...signed.details,
+        dest_host: "evil.example.com",
+        dest_ip: "203.0.113.200",
+        rule_id_matched: "rule-default-deny",
+      },
+    };
+
+    const event = mapAuditEntryToEnforcementEvent(stapled, SIGNED_MAP_OPTIONS);
+
+    expect(event).toMatchObject({
+      event_class: "egress_decision",
+      decision: "deny",
+      destination_host: "evil.example.com",
+      agent_id: null,
+      agent_template: null,
+    });
+    expect(JSON.stringify(event)).not.toContain("victim-agent-b");
+    expect(JSON.stringify(event)).not.toContain("claude-code");
+  });
+
   it("maps a policy_loaded entry to a policy_change carrying attribution but NO contents", () => {
     const event = mapAuditEntryToEnforcementEvent(policyLoadedEntry());
     expect(event).toEqual({

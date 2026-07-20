@@ -34,7 +34,14 @@ import { join } from "node:path";
 import { defaultConfig, type SanctuaryConfig } from "../../config.js";
 import { exportExitBundle } from "../../exit/bundle.js";
 import type { AuditLog } from "../../operational/audit-log.js";
-import { auditEntryAgentId } from "../../castle-wall/audit-attribution.js";
+import {
+  auditEntryAgentId,
+  type AuditAttributionOptionsResolver,
+} from "../../castle-wall/audit-attribution.js";
+import {
+  loadFortressProducerKey,
+  type ProducerKeyLoad,
+} from "../../castle-wall/runtime/producer-signature.js";
 import { IdentityManager } from "../../cognitive/tools.js";
 import {
   HubService,
@@ -174,6 +181,22 @@ export interface BuildV11BindingsInputs {
    * binding reports inactive.
    */
   tierBPiiRedactorInstalled?: boolean;
+  /**
+   * Optional fixed Castle Wall producer public key for read-side audit
+   * attribution. Production callers usually omit this and let the wiring load
+   * from `storagePath`; tests can inject a deterministic key.
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /**
+   * Optional live attribution resolver. When supplied it wins over the fixed
+   * key/storage loader and lets an entry point share an already-loaded key cache.
+   */
+  resolveAuditAttribution?: AuditAttributionOptionsResolver;
+  /**
+   * Optional warning sink for producer-key load failures. Default is stderr via
+   * `console.error`; tests can inject a no-op when exercising unreadable keys.
+   */
+  warnProducerKeyUnavailable?: (reason: string) => void;
 }
 
 /** Anomaly-detection binding mounted behind the dashboard auth chokepoint. */
@@ -336,6 +359,73 @@ class CapabilityErrorAgentController implements HubAgentController {
   }
 }
 
+function buildAuditAttributionResolver(
+  inputs: BuildV11BindingsInputs,
+): AuditAttributionOptionsResolver {
+  if (inputs.resolveAuditAttribution) return inputs.resolveAuditAttribution;
+  const staticKey = inputs.pinnedProducerKeyB64url ?? null;
+  const subjectFortressId = inputs.fortressId;
+  if (staticKey !== null) {
+    return () => ({
+      pinnedProducerKeyB64url: staticKey,
+      subjectFortressId,
+    });
+  }
+
+  const storagePath = inputs.storagePath;
+  if (storagePath === undefined) {
+    return () => ({
+      pinnedProducerKeyB64url: null,
+      subjectFortressId,
+    });
+  }
+
+  let cached: ProducerKeyLoad | undefined;
+  let lastWarnedReason: string | null = null;
+  const warn =
+    inputs.warnProducerKeyUnavailable ??
+    ((reason: string) => {
+      // SAFETY: stderr is the only operator-visible channel available in this
+      // sync wiring helper; no key material is printed, only the load status.
+      // Visible fail-honest path: a present-but-unusable key means Castle Wall
+      // agent attribution is deliberately omitted until the key can be read.
+      console.error(
+        `Warning: Castle Wall audit attribution unavailable (${reason}).`,
+      );
+    });
+
+  return async () => {
+    if (cached?.status === "present") {
+      return {
+        pinnedProducerKeyB64url: cached.keyB64url,
+        subjectFortressId,
+      };
+    }
+    let load: ProducerKeyLoad;
+    try {
+      load = await loadFortressProducerKey(storagePath);
+    } catch {
+      load = { status: "unreadable", reason: "producer_key_load_threw" };
+    }
+    if (load.status === "present") {
+      cached = load;
+      lastWarnedReason = null;
+      return {
+        pinnedProducerKeyB64url: load.keyB64url,
+        subjectFortressId,
+      };
+    }
+    if (load.status === "unreadable" && load.reason !== lastWarnedReason) {
+      lastWarnedReason = load.reason;
+      warn(load.reason);
+    }
+    return {
+      pinnedProducerKeyB64url: null,
+      subjectFortressId,
+    };
+  };
+}
+
 /**
  * Construct the v1.1 hub bindings the dashboard entry points share. Caller
  * keeps ownership of the returned `HubService`; pass it through to the
@@ -367,6 +457,7 @@ export function buildV11Bindings(
   void pruneExpiredDidWebKeysOnUnlock(inputs).catch(() => {
     // Best-effort unlock pruning must not block dashboard construction.
   });
+  const resolveAuditAttribution = buildAuditAttributionResolver(inputs);
 
   // WP-V1.2-4: construct the operator-chat service when the caller has
   // wired the fortress storage + master key. Concierge surface depends
@@ -421,6 +512,7 @@ export function buildV11Bindings(
         auditLog: inputs.auditLog,
         identityId: inputs.identityId,
         registry,
+        resolveAuditAttribution,
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
       // Rho-2.5: thread the live Tier B config so the concierge smart-mode
@@ -449,6 +541,7 @@ export function buildV11Bindings(
         auditLog: inputs.auditLog,
         identityId: inputs.identityId,
         registry,
+        resolveAuditAttribution,
       }),
       ...(inputs.intelligenceSelector
         ? {
@@ -546,6 +639,8 @@ export function buildV11Bindings(
     activitySources: {
       auditLog: inputs.auditLog,
       identityId: inputs.identityId,
+      subjectFortressId: inputs.fortressId,
+      resolveAuditAttribution,
     },
     policyBudgetSources: {
       listPolicySummaries: () => [],
@@ -641,15 +736,18 @@ function buildConciergeContextProviders(args: {
   auditLog: AuditLog;
   identityId: string;
   registry: InMemoryLocalAgentRegistry;
+  resolveAuditAttribution: AuditAttributionOptionsResolver;
 }): ConciergeContextProviders {
   return {
     recentActivity: async () => {
       const result = await args.auditLog.query({ limit: 30 });
+      const auditAttribution = await args.resolveAuditAttribution();
       const lines = result.entries
         .filter((e) => e.identity_id === args.identityId)
         .slice(-30)
         .map((e) => {
-          const agentId = auditEntryAgentId(e) ?? "_fortress";
+          const agentId =
+            auditEntryAgentId(e, auditAttribution) ?? "_fortress";
           return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
         });
       if (lines.length === 0) return "(no recent activity)";
@@ -693,6 +791,7 @@ function buildConciergeContextFetchers(args: {
   auditLog: AuditLog;
   identityId: string;
   registry: InMemoryLocalAgentRegistry;
+  resolveAuditAttribution: AuditAttributionOptionsResolver;
 }): ContextFetchers {
   const empty = async () => "";
   return {
@@ -727,12 +826,13 @@ function buildConciergeContextFetchers(args: {
     },
     agent_activity: async (agentNameHint) => {
       const result = await args.auditLog.query({ limit: 50 });
+      const auditAttribution = await args.resolveAuditAttribution();
       const owned = result.entries.filter(
         (e) => e.identity_id === args.identityId,
       );
       const filtered = agentNameHint
         ? owned.filter((e) => {
-            const agentId = auditEntryAgentId(e) ?? "";
+            const agentId = auditEntryAgentId(e, auditAttribution) ?? "";
             return agentId
               .toLowerCase()
               .includes(agentNameHint.toLowerCase());
@@ -742,7 +842,8 @@ function buildConciergeContextFetchers(args: {
       if (tail.length === 0) return "(no activity)";
       return tail
         .map((e) => {
-          const agentId = auditEntryAgentId(e) ?? "_fortress";
+          const agentId =
+            auditEntryAgentId(e, auditAttribution) ?? "_fortress";
           return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
         })
         .join("\n");

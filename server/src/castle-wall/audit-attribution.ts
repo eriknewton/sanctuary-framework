@@ -9,6 +9,7 @@
  */
 
 import type { AuditEntry } from "../operational/audit-log.js";
+import { canonicalize } from "../mesh/canonical-json.js";
 import {
   CASTLE_WALL_AUDIT_LAYER,
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
@@ -57,6 +58,27 @@ const CASTLE_WALL_ATTRIBUTION_SENSITIVE_OPERATIONS: ReadonlySet<string> =
     ]),
   );
 
+const CASTLE_WALL_SIGNED_OPERATION_TO_AUDIT_OPERATION: ReadonlyMap<string, string> =
+  new Map([
+    ["egress_blocked", "egress_blocked"],
+    ["egress_allowed", "egress_allowed"],
+    ["egress_approved", "egress_allowed"],
+    ["egress_pending", "operator_decision"],
+  ]);
+
+const ROW_BINDING_IGNORED_DETAIL_KEYS: ReadonlySet<string> = Object.freeze(
+  new Set<string>([
+    "seq",
+    "prior_sha256_hex",
+    CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+    CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+    CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+    CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+    CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+    CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  ]),
+);
+
 export interface AuditAttributionOptions {
   /**
    * Pinned producer public key used to re-verify persisted Castle Wall producer
@@ -77,6 +99,10 @@ export type VerifyProducerSignatureFn = (
   input: ProducerSignatureInput,
   pinnedProducerKeyB64url: string,
 ) => ProducerSignatureVerdict;
+
+export type AuditAttributionOptionsResolver = () =>
+  | AuditAttributionOptions
+  | Promise<AuditAttributionOptions>;
 
 export interface VerifiedCastleWallAuditAttribution {
   status: "verified";
@@ -112,6 +138,25 @@ function signedCanonicalDetails(
   body: Record<string, unknown>,
 ): Record<string, unknown> {
   return isRecord(body.details) ? body.details : {};
+}
+
+function normalizedEvidenceDetails(
+  details: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  if (!details) return {};
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(details)) {
+    if (!ROW_BINDING_IGNORED_DETAIL_KEYS.has(key)) out[key] = value;
+  }
+  return out;
+}
+
+function canonicalJsonEquals(left: unknown, right: unknown): boolean {
+  try {
+    return canonicalize(left) === canonicalize(right);
+  } catch {
+    return false;
+  }
 }
 
 function subjectFromSignedCanonicalValue(value: unknown): string | null {
@@ -169,10 +214,23 @@ export function signedCanonicalIdentityId(
   return subjectFromSignedCanonicalValue(parsed.identity_id);
 }
 
+function signedCanonicalBodyIdentityId(
+  body: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): string | null {
+  const macOSSubject = macOSSubjectFromSignedCanonicalDetails(
+    body,
+    subjectFortressId,
+  );
+  if (macOSSubject.status === "resolved") return macOSSubject.subject;
+  if (macOSSubject.status === "unresolvable") return null;
+  return subjectFromSignedCanonicalValue(body.identity_id);
+}
+
 export function isCastleWallAttributionSensitiveEntry(
   entry: Pick<AuditEntry, "layer" | "operation" | "details">,
 ): boolean {
-  if (entry.layer !== CASTLE_WALL_AUDIT_LAYER) return false;
+  if (entry.layer === CASTLE_WALL_AUDIT_LAYER) return true;
   if (CASTLE_WALL_ATTRIBUTION_SENSITIVE_OPERATIONS.has(entry.operation)) {
     return true;
   }
@@ -189,10 +247,45 @@ function parseSignedBodyFromDetails(
   return body === null ? { kind: "error" } : { kind: "ok", body };
 }
 
+function signedOperationMatchesPersistedEntry(
+  signedOperation: unknown,
+  persistedOperation: string,
+): boolean {
+  if (typeof signedOperation !== "string" || signedOperation.length === 0) {
+    return false;
+  }
+  const mapped =
+    CASTLE_WALL_SIGNED_OPERATION_TO_AUDIT_OPERATION.get(signedOperation) ??
+    signedOperation;
+  return mapped === persistedOperation;
+}
+
+function signedBodyMatchesPersistedEntry(
+  entry: AuditEntry,
+  body: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): boolean {
+  if (entry.layer !== CASTLE_WALL_AUDIT_LAYER) return false;
+  if (body.layer !== CASTLE_WALL_AUDIT_LAYER) return false;
+  if (body.timestamp !== entry.timestamp) return false;
+  if (!signedOperationMatchesPersistedEntry(body.operation, entry.operation)) {
+    return false;
+  }
+  const signedSubject = signedCanonicalBodyIdentityId(body, subjectFortressId);
+  if (signedSubject === null || signedSubject !== entry.identity_id) {
+    return false;
+  }
+
+  const persistedDetails = normalizedEvidenceDetails(entry.details);
+  const signedDetails = normalizedEvidenceDetails(signedCanonicalDetails(body));
+  return canonicalJsonEquals(persistedDetails, signedDetails);
+}
+
 /**
  * Re-verify one Castle Wall audit row and return signature-derived
  * attribution. Any missing field, absent key, rejected signature, or missing
- * signed subject returns null.
+ * signed subject returns null. A valid detached signature is not enough: the
+ * signed canonical body must also bind to the persisted row being projected.
  */
 export function verifiedCastleWallAuditAttribution(
   entry: AuditEntry,
@@ -240,7 +333,19 @@ export function verifiedCastleWallAuditAttribution(
 
   const parsed = parseSignedBodyFromDetails(details);
   if (parsed.kind !== "ok") return null;
-  const agentId = signedCanonicalIdentityId(details, options.subjectFortressId);
+  if (
+    !signedBodyMatchesPersistedEntry(
+      entry,
+      parsed.body,
+      options.subjectFortressId,
+    )
+  ) {
+    return null;
+  }
+  const agentId = signedCanonicalBodyIdentityId(
+    parsed.body,
+    options.subjectFortressId,
+  );
   if (agentId === null) return null;
   const signedDetails = signedCanonicalDetails(parsed.body);
   const nestedAgent = isRecord(signedDetails.agent) ? signedDetails.agent : null;

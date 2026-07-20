@@ -6,7 +6,10 @@
  */
 
 import type { AuditEntry, AuditLog } from "../operational/audit-log.js";
-import { auditEntryAgentId } from "../castle-wall/audit-attribution.js";
+import {
+  auditEntryAgentId,
+  type AuditAttributionOptions,
+} from "../castle-wall/audit-attribution.js";
 import type { CastleWallAuditEvent } from "../castle-wall/audit/events.js";
 import type {
   UnifiedInboxBridge,
@@ -164,20 +167,24 @@ export async function ingestWrappedAgentErrors(params: {
   bridge: UnifiedInboxBridge;
   since?: string;
   now?: Date;
+  auditAttribution?: AuditAttributionOptions;
 }): Promise<UnifiedInboxEntry[]> {
   const now = params.now ?? new Date();
   const since =
     params.since ?? new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
   const result = await params.auditLog.query({ since, limit: 100_000 });
-  const errorEntries = result.entries.filter(isWrappedAgentError);
+  const auditAttribution = params.auditAttribution ?? {};
+  const errorEntries = result.entries.filter((entry) =>
+    isWrappedAgentError(entry, auditAttribution),
+  );
   const recentByAgentClass = new Map<string, number>();
   for (const entry of errorEntries) {
-    const key = `${auditEntryAgentId(entry) ?? "unknown"}:${stringDetail(entry, "error_class") ?? entry.operation}`;
+    const key = `${auditEntryAgentId(entry, auditAttribution) ?? "unknown"}:${stringDetail(entry, "error_class") ?? entry.operation}`;
     recentByAgentClass.set(key, (recentByAgentClass.get(key) ?? 0) + 1);
   }
   const ingested: UnifiedInboxEntry[] = [];
   for (const entry of errorEntries) {
-    const agentId = auditEntryAgentId(entry) ?? "unknown";
+    const agentId = auditEntryAgentId(entry, auditAttribution) ?? "unknown";
     const errorClass = stringDetail(entry, "error_class") ?? entry.operation;
     const key = `${agentId}:${errorClass}`;
     const fatal = booleanDetail(entry, "fatal") === true;
@@ -233,11 +240,15 @@ function removedHeaderNames(entry: AuditEntry): string[] {
   return out;
 }
 
-function isWrappedAgentError(entry: AuditEntry): boolean {
+function isWrappedAgentError(
+  entry: AuditEntry,
+  auditAttribution: AuditAttributionOptions,
+): boolean {
   const severity = stringDetail(entry, "severity");
   const context = stringDetail(entry, "context") ?? stringDetail(entry, "source");
   return (
     (severity === "error" || booleanDetail(entry, "fatal") === true) &&
-    (context === "wrapped_agent" || auditEntryAgentId(entry) !== null)
+    (context === "wrapped_agent" ||
+      auditEntryAgentId(entry, auditAttribution) !== null)
   );
 }
