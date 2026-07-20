@@ -32,6 +32,9 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
 } from "../../../src/castle-wall/constants.js";
 import type { CastleWallAuditEvent } from "../../../src/castle-wall/audit/events.js";
 
@@ -225,6 +228,9 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     expect(persisted!.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]).toBe(
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED
     );
+    expect(persisted!.details?.[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]).toBe(
+      CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
+    );
     // Evidence is sourced from the SIGNED body, not the event.
     expect(persisted!.details?.agent_id).toBe(AGENT.id);
     expect(persisted!.details?.dest_host).toBe(DEST.host);
@@ -250,6 +256,9 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     expect(
       persisted!.details?.[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY],
     ).toBe(env.producer!.capturedAtUnixMs);
+    expect(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY],
+    ).toBe(CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN);
     // seq is preserved from the chain-authenticated event details.
     expect(persisted!.details?.seq).toBe(0);
     // Together with sig/kid, this is the full ProducerSignatureInput. Round-trip
@@ -425,6 +434,9 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
     expect(persisted!.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]).toBe(
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED
     );
+    expect(persisted!.details?.[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]).toBe(
+      CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
+    );
     // The SIGNED body's values are persisted; the fabricated ones are gone.
     expect(persisted!.details?.agent_id).toBe(AGENT.id);
     expect(persisted!.details?.dest_host).toBe(DEST.host);
@@ -550,6 +562,8 @@ describe("audit-consumer producer-authenticity (NO pinned key — legacy basis)"
         // mistakes them for a verifiable signature.
         [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: "{\"forged\":true}",
         [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: 123,
+        [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+          CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
       },
     });
     await consumer.ingestCritical({ event, ack: async () => {} });
@@ -566,6 +580,9 @@ describe("audit-consumer producer-authenticity (NO pinned key — legacy basis)"
     ).toBeUndefined();
     expect(
       persisted!.details?.[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]
+    ).toBeUndefined();
+    expect(
+      persisted!.details?.[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY],
     ).toBeUndefined();
     expect(persisted!.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]).toBe(
       CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED

@@ -40,13 +40,13 @@ import {
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
 } from "../castle-wall/constants.js";
-import {
-  isLegacyMacOSAuditTokenHex,
-  protectionSubjectFromMacOSAuditToken,
-} from "../castle-wall/subject-binding.js";
+import { protectionSubjectFromMacOSAuditToken } from "../castle-wall/subject-binding.js";
 import {
   BROKER_EVIDENCE_BASIS_DETAIL_KEY,
   BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED,
@@ -108,38 +108,42 @@ function subjectFromSignedCanonicalValue(
   return value;
 }
 
-type MacOSSignedSubjectResolution =
-  | { status: "absent" }
-  | { status: "resolved"; subject: string }
-  | { status: "unresolvable" };
-
 function macOSSubjectFromSignedCanonicalDetails(
   parsed: Record<string, unknown>,
   subjectFortressId?: string | null,
-): MacOSSignedSubjectResolution {
+): string | null {
   const parsedDetails = parsed.details;
   if (
     parsedDetails === null ||
     typeof parsedDetails !== "object" ||
     Array.isArray(parsedDetails)
   ) {
-    return { status: "absent" };
+    return null;
   }
   const details = parsedDetails as Record<string, unknown>;
-  if (!Object.prototype.hasOwnProperty.call(details, "agent_id")) {
-    return { status: "absent" };
-  }
   const agentId = details.agent_id;
-  if (!isLegacyMacOSAuditTokenHex(agentId)) {
-    return { status: "absent" };
+  if (typeof agentId !== "string") {
+    return null;
   }
-  if (subjectFortressId === null || subjectFortressId === undefined) {
-    return { status: "unresolvable" };
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  return protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
+}
+
+type CastleWallProducerSubjectBindingKind =
+  | typeof CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN
+  | typeof CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID;
+
+function persistedCastleWallProducerSubjectBindingKind(
+  details: Record<string, unknown>,
+): CastleWallProducerSubjectBindingKind | null {
+  const kind = details[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY];
+  if (
+    kind === CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN ||
+    kind === CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID
+  ) {
+    return kind;
   }
-  const subject = protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
-  return subject === null
-    ? { status: "unresolvable" }
-    : { status: "resolved", subject };
+  return null;
 }
 
 /**
@@ -150,12 +154,12 @@ function macOSSubjectFromSignedCanonicalDetails(
  * appended the row, so a reader must never use it for a producer-signed subject
  * decision after the signature verifies.
  *
- * The write side has two binding modes: macOS resolves a raw signed audit token
- * from signed `details.agent_id` plus the local fortress id, while signed-
- * identity producers use signed `identity_id` directly. The reader mirrors that
- * precedence and never treats an arbitrary signed `agent_id` string as a subject
- * fallback. Returns null on parse failure / missing subject so subject-bound
- * readers fail closed.
+ * The write side persists the explicit binding mode it used:
+ * macOS resolves a raw signed audit token from signed `details.agent_id` plus
+ * the local fortress id, while signed-identity producers use signed
+ * `identity_id` directly. The reader selects by that persisted kind only; a
+ * missing/unknown kind returns null so subject-bound readers fail closed rather
+ * than resurrecting the old content-sniffing path.
  */
 export function signedCanonicalIdentityId(
   details: Record<string, unknown>,
@@ -163,14 +167,14 @@ export function signedCanonicalIdentityId(
 ): string | null {
   const parsed = parseCastleWallSignedCanonicalBody(details);
   if (parsed === null) return null;
-  const macOSSubject = macOSSubjectFromSignedCanonicalDetails(
-    parsed,
-    subjectFortressId,
-  );
-  if (macOSSubject.status === "resolved") return macOSSubject.subject;
-  if (macOSSubject.status === "unresolvable") return null;
-  const identitySubject = subjectFromSignedCanonicalValue(parsed.identity_id);
-  return identitySubject;
+  const bindingKind = persistedCastleWallProducerSubjectBindingKind(details);
+  if (bindingKind === CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN) {
+    return macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId);
+  }
+  if (bindingKind === CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID) {
+    return subjectFromSignedCanonicalValue(parsed.identity_id);
+  }
+  return null;
 }
 import {
   verifyProducerSignature,

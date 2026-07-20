@@ -43,6 +43,8 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
 } from "../../src/castle-wall/constants.js";
 
 const FORTRESS = "fortress:test";
@@ -58,6 +60,10 @@ function toBase64url(bytes: Uint8Array): string {
 
 const daemonPriv = ed25519.utils.randomPrivateKey();
 const daemonPubB64 = toBase64url(ed25519.getPublicKey(daemonPriv));
+const signedIdentitySubjectBindingDetails = {
+  [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+    CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
+} as const;
 
 function auditTokenForRuid(uid: number): string {
   const vals = [
@@ -141,6 +147,7 @@ async function appendGenuineSigned(log: AuditLog, seq: number): Promise<void> {
       [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      ...signedIdentitySubjectBindingDetails,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -183,6 +190,7 @@ async function appendRelabeledSigned(
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
         CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      ...signedIdentitySubjectBindingDetails,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -265,6 +273,7 @@ async function appendSignedWithoutSubject(
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
         CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      ...signedIdentitySubjectBindingDetails,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -291,6 +300,7 @@ async function appendForged(
     [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
     [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
     [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    ...signedIdentitySubjectBindingDetails,
     [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   };
   let ts = FRESH_TS;
@@ -756,6 +766,7 @@ describe("Slice R — codex HIGH #3: same-seq replay with a forged-fresh top-lev
         [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
         [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: OLD_TS,
         [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        ...signedIdentitySubjectBindingDetails,
         [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
     });
@@ -799,6 +810,7 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
         [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
         [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: OLD_TS,
         [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        ...signedIdentitySubjectBindingDetails,
         [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
     });
@@ -838,6 +850,7 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
         [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: allowCanonical,
         [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
         [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        ...signedIdentitySubjectBindingDetails,
         [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
     });
@@ -881,6 +894,7 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
         [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
         [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: OLD_TS,
         [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        ...signedIdentitySubjectBindingDetails,
         [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
     });
@@ -924,6 +938,7 @@ describe("Slice R — codex re-review HIGH: digest kernel counts bind to the sig
         [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: allowCanonical,
         [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
         [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        ...signedIdentitySubjectBindingDetails,
         [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
     });
@@ -963,6 +978,7 @@ describe("Slice R — codex round-4 HIGH: a duplicated fresh signed tuple counts
           [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
           [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
           [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+          ...signedIdentitySubjectBindingDetails,
           [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
         },
       });
@@ -1110,6 +1126,7 @@ describe("Slice R — POSITIVE: a genuine daemon-signed entry re-verifies and re
         [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
         [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: OLD_TS,
         [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+        ...signedIdentitySubjectBindingDetails,
         [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
       },
     });

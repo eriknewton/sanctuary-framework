@@ -132,6 +132,19 @@ export const CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY =
   "cw_producer_captured_at_ms" as const;
 
 /**
+ * `details` key recording the explicit subject-binding rule used when a
+ * producer-signed entry was written. Read-side re-verification must select the
+ * signed subject by this persisted kind, not by sniffing signed-body contents.
+ * This is additive at rest; existing detail keys are unchanged.
+ */
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY =
+  "cw_producer_subject_binding" as const;
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN =
+  "macos_audit_token" as const;
+export const CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID =
+  "signed_identity_id" as const;
+
+/**
  * `details` key recording the authenticity basis the consumer established for
  * this entry. `producer_signed` means a producer signature was verified
  * against the pinned key (the in-process forgery hole is closed for this

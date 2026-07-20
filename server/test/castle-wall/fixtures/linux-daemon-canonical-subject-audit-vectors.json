@@ -1,0 +1,8 @@
+{
+  "captured_by": "SANCTUARY_CAPTURE_LINUX_AUDIT_FIXTURES=1 cargo test linux_audit_fixture_vectors_are_emitted_by_the_audit_builder -- --nocapture",
+  "captured_from": "castle-wall-daemon/src/policy.rs build_audit_event_canonical_json",
+  "captured_at_note": "Captured in this worktree on 2026-07-20. Full privileged NFQUEUE/systemd daemon execution was not available in this macOS workspace.",
+  "uid_503": "{\"details\":{\"agent_id\":\"agent-1\",\"agent_template\":\"claude-code\",\"decision_provenance\":\"default_deny\",\"dest_host\":\"evil.example\",\"dest_ip\":\"203.0.113.10\",\"dest_port\":443,\"dest_protocol\":\"tcp\",\"opaque\":false},\"fortress_id\":\"fortress:test\",\"identity_id\":\"fortress:test/uid-503\",\"layer\":\"l1\",\"operation\":\"egress_blocked\",\"result\":\"failure\",\"timestamp\":\"2026-05-05T01:02:03Z\"}",
+  "uid_504": "{\"details\":{\"agent_id\":\"agent-1\",\"agent_template\":\"claude-code\",\"decision_provenance\":\"default_deny\",\"dest_host\":\"evil.example\",\"dest_ip\":\"203.0.113.10\",\"dest_port\":443,\"dest_protocol\":\"tcp\",\"opaque\":false},\"fortress_id\":\"fortress:test\",\"identity_id\":\"fortress:test/uid-504\",\"layer\":\"l1\",\"operation\":\"egress_blocked\",\"result\":\"failure\",\"timestamp\":\"2026-05-05T01:02:03Z\"}",
+  "old_agent_name": "{\"details\":{\"agent_id\":\"agent-1\",\"agent_template\":\"claude-code\",\"decision_provenance\":\"default_deny\",\"dest_host\":\"evil.example\",\"dest_ip\":\"203.0.113.10\",\"dest_port\":443,\"dest_protocol\":\"tcp\",\"opaque\":false},\"fortress_id\":\"fortress:test\",\"identity_id\":\"agent-1\",\"layer\":\"l1\",\"operation\":\"egress_blocked\",\"result\":\"failure\",\"timestamp\":\"2026-05-05T01:02:03Z\"}"
+}
