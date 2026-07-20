@@ -23,6 +23,7 @@ import {
 } from "../../src/wrap/cli.js";
 import { SANCTUARY_VERSION } from "../../src/config.js";
 import {
+  protectionStateAdvice,
   protectionStateClaimFromObservation,
   type ProtectionStateClaim,
 } from "../../src/egress-gate/protection-claim.js";
@@ -258,6 +259,29 @@ describe("formatWrapSuccess", () => {
     expect(out).not.toContain("Castle Wall Full");
     expect(out).toContain("Castle Wall status unknown");
     expect(out).toContain("enforcement is not confirmed");
+  });
+
+  it("points unbindable subject evidence at the uid confinement path without turning green", () => {
+    const expectedImperative =
+      "Re-run 'sudo sanctuary protect --hermes --exclusive-egress' to provision uid confinement; " +
+      "that path arms Castle Wall with '--agent-uid' so per-agent enforcement evidence can bind to this wrapped agent.";
+    const cases = [
+      "subject_unbound_evidence",
+      "subject_unresolvable",
+    ] as const;
+
+    for (const basis of cases) {
+      const protection = protectionStateClaimFromObservation({
+        state: "unknown",
+        basis,
+        reasons: ["test"],
+      });
+      const advice = protectionStateAdvice(protection);
+      expect(protection.state).toBe("unknown");
+      expect(protection.basis).toBe(basis);
+      expect(advice.green).toBe(false);
+      expect(advice.imperative).toBe(expectedImperative);
+    }
   });
 
   it("renders coarse-only as distinct non-green, never Full or NOT ARMED", () => {

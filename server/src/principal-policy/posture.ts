@@ -917,6 +917,7 @@ export interface AuditDigest {
 export interface BuildAuditDigestInput {
   auditLog: AuditLog;
   originMachine: string;
+  protectionClaimSubject: string | null;
   now?: number;
   windowMs?: number;
   /**
@@ -961,6 +962,9 @@ export async function buildAuditDigest(
   const windowStart = new Date(now - windowMs).toISOString();
   const windowEnd = new Date(now).toISOString();
   const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
+  const subjectFortressId =
+    fortressIdFromProtectionSubject(input.protectionClaimSubject) ??
+    input.originMachine;
 
   // Slice P fail-honest: a producer key is expected but the reader could not
   // load it. Report an unverified chain with zero kernel counts rather than let
@@ -1070,7 +1074,7 @@ export async function buildAuditDigest(
         entry.details,
         pinnedProducerKey,
         input.verifyProducerSignature,
-        input.originMachine,
+        subjectFortressId,
       );
       signedAttribution = re;
       if (re.basis === "producer_signed_verified") {

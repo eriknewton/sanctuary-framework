@@ -207,6 +207,7 @@ function findProtectionSubjectScopeViolations(
   );
   const builders = new Set([
     "buildCastleWallPosture",
+    "buildAuditDigest",
     "buildFeatureHealthPanel",
   ]);
   const offenders: string[] = [];
@@ -266,6 +267,7 @@ function findProtectionSubjectOmissions(
   );
   const builders = new Set([
     "buildCastleWallPosture",
+    "buildAuditDigest",
     "buildFeatureHealthPanel",
   ]);
   const offenders: string[] = [];
@@ -509,7 +511,7 @@ describe("protection-state claim chokepoint", () => {
     expect(violations).toEqual([]);
   });
 
-  it("every production posture/feature-health caller supplies protectionClaimSubject", () => {
+  it("every production posture/feature-health/digest caller supplies protectionClaimSubject", () => {
     const violations: string[] = [];
     for (const file of tsFiles(SERVER_SRC)) {
       const rel = relative(REPO_ROOT, file);

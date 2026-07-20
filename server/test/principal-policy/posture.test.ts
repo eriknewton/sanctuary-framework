@@ -501,6 +501,7 @@ describe("G2 — today's audit story digest", () => {
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now,
     });
     expect(digest.total_operations).toBe(3);
@@ -534,6 +535,7 @@ describe("G2 — today's audit story digest", () => {
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now,
     });
     expect(digest.approvals_granted).toBe(1);
@@ -547,6 +549,7 @@ describe("G2 — today's audit story digest", () => {
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now,
     });
     expect(digest.total_operations).toBe(0);
@@ -559,6 +562,7 @@ describe("G2 — today's audit story digest", () => {
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now,
     });
     expect(digest.total_operations).toBe(0);
@@ -574,6 +578,7 @@ describe("G2 — today's audit story digest", () => {
     const digest = await buildAuditDigest({
       auditLog: log,
       originMachine: FORTRESS,
+      protectionClaimSubject: FORTRESS,
       now,
     });
     // They still count as operations, but NOT as kernel verdicts.

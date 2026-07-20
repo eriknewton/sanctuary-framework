@@ -217,6 +217,9 @@ export function protectionStateAdvice(
     "Run 'sanctuary castle-wall status' to inspect live enforcement before relying on this wrap.";
   const repairImperative =
     "Run 'sudo sanctuary protect --repair-egress-gate' to repair fine-grained exclusive egress.";
+  const bindSubjectImperative =
+    "Re-run 'sudo sanctuary protect --hermes --exclusive-egress' to provision uid confinement; " +
+    "that path arms Castle Wall with '--agent-uid' so per-agent enforcement evidence can bind to this wrapped agent.";
   switch (claim.state) {
     case "exclusive":
       return {
@@ -270,7 +273,7 @@ export function protectionStateAdvice(
             "Your agent is wrapped, but enforcement is not confirmed for this confined agent.",
           castleWallLabel:
             "Castle Wall status unknown (no subject-bound enforcement evidence)",
-          imperative: inspectImperative,
+          imperative: bindSubjectImperative,
         };
       }
       if (claim.basis === "legacy_macos_audit_token") {
@@ -290,7 +293,7 @@ export function protectionStateAdvice(
             "Your agent is wrapped, but its confinement identity could not be read.",
           castleWallLabel:
             "Castle Wall status unknown (agent confinement identity unreadable)",
-          imperative: inspectImperative,
+          imperative: bindSubjectImperative,
         };
       }
       return {
