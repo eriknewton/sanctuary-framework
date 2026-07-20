@@ -215,7 +215,7 @@ describe("audit-consumer producer-authenticity (pinned key configured)", () => {
 
     const persisted = sink.entries.find((e) => e.operation === "egress_blocked");
     expect(persisted).toBeDefined();
-    expect(persisted!.result).toBe("success");
+    expect(persisted!.result).toBe("failure");
     expect(persisted!.details?.[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]).toBe(
       env.producer!.signatureB64url
     );

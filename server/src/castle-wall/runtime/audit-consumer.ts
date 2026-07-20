@@ -25,6 +25,8 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
+  CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+  CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
 } from "../constants.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
 import type {
@@ -446,7 +448,7 @@ export class AuditConsumer {
         envelope.event.event_type,
         identityOutcome.identityId,
         buildDetailsForEvent(envelope.event, sigOutcome),
-        "success"
+        resultForSignatureOutcome(sigOutcome),
       );
       if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
         ingestCastleWallBlockedEgress({
@@ -578,13 +580,17 @@ export class AuditConsumer {
     if (details === null || details === undefined) {
       return { kind: "error", reason: "chain_fields_missing" };
     }
-    const hasSeq = Object.prototype.hasOwnProperty.call(event.details, "seq");
+    const hasSeq = Object.prototype.hasOwnProperty.call(
+      event.details,
+      CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+    );
     const hasPriorHash = Object.prototype.hasOwnProperty.call(
       event.details,
-      "prior_sha256_hex"
+      CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
     );
-    const seq = event.details.seq;
-    const priorHash = event.details.prior_sha256_hex;
+    const seq = event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
+    const priorHash =
+      event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY];
     if (
       !hasSeq ||
       typeof seq !== "number" ||
@@ -696,7 +702,8 @@ export class AuditConsumer {
     // the consumer's chain already rejects seq regressions; require the signed
     // seq to match the event's own seq so a signature lifted from one event
     // cannot be stapled onto a different-seq event.
-    const eventSeq = envelope.event.details.seq;
+    const eventSeq =
+      envelope.event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
     if (typeof eventSeq === "number" && eventSeq !== envelope.producer.seq) {
       return { kind: "rejected", reason: "producer_signature_seq_mismatch" };
     }
@@ -707,14 +714,22 @@ export class AuditConsumer {
         ? (parsed.body.details as Record<string, unknown>)
         : {};
     if (
-      Object.prototype.hasOwnProperty.call(signedDetails, "seq") &&
-      signedDetails.seq !== envelope.producer.seq
+      Object.prototype.hasOwnProperty.call(
+        signedDetails,
+        CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+      ) &&
+      signedDetails[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] !==
+        envelope.producer.seq
     ) {
       return { kind: "rejected", reason: "producer_signed_body_seq_mismatch" };
     }
     if (
-      Object.prototype.hasOwnProperty.call(signedDetails, "prior_sha256_hex") &&
-      signedDetails.prior_sha256_hex !== envelope.event.details.prior_sha256_hex
+      Object.prototype.hasOwnProperty.call(
+        signedDetails,
+        CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+      ) &&
+      signedDetails[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY] !==
+        envelope.event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY]
     ) {
       return {
         kind: "rejected",
@@ -887,11 +902,23 @@ function buildDetailsForEvent(
         : {};
     const out: Record<string, unknown> = { ...signedDetails };
     // Preserve the chain bookkeeping the upstream WAL-chain check authenticated.
-    if (Object.prototype.hasOwnProperty.call(event.details, "seq")) {
-      out.seq = event.details.seq;
+    if (
+      Object.prototype.hasOwnProperty.call(
+        event.details,
+        CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+      )
+    ) {
+      out[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] =
+        event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
     }
-    if (Object.prototype.hasOwnProperty.call(event.details, "prior_sha256_hex")) {
-      out.prior_sha256_hex = event.details.prior_sha256_hex;
+    if (
+      Object.prototype.hasOwnProperty.call(
+        event.details,
+        CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+      )
+    ) {
+      out[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY] =
+        event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY];
     }
     out[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY] = signature.signatureB64url;
     out[CASTLE_WALL_PRODUCER_KID_DETAIL_KEY] = signature.keyId;
@@ -930,6 +957,15 @@ function buildDetailsForEvent(
   // this marker (see CASTLE_WALL_AUDIT_PROVENANCE_KEY).
   out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
   return out;
+}
+
+function resultForSignatureOutcome(
+  signature: SignatureOutcome,
+): "success" | "failure" {
+  if (signature.kind !== "verified") return "success";
+  const result = signature.signedBody.result;
+  if (result === "failure" || result === "blocked") return "failure";
+  return "success";
 }
 
 function signedDetailsFromBody(

@@ -94,7 +94,7 @@ function egressDenyEntry(extraDetails: Record<string, unknown> = {}): AuditEntry
     layer: "l1",
     operation: "egress_blocked",
     identity_id: "system",
-    result: "success",
+    result: "failure",
     details: {
       destination: { host: "evil.example.com", ip: "203.0.113.5", port: 443, protocol: "tcp" },
       agent: { id: "claude-code-1", template: "coding-assistant" },
@@ -103,6 +103,10 @@ function egressDenyEntry(extraDetails: Record<string, unknown> = {}): AuditEntry
       ...extraDetails,
     },
   };
+}
+
+function signedEgressDenyEntry(extraDetails: Record<string, unknown> = {}): AuditEntry {
+  return withProducerSignature(egressDenyEntry(extraDetails), "claude-code-1");
 }
 
 /** An egress-allow entry in the SIGNED/flat shape (dest_host / agent_id / rule_id_matched). */
@@ -176,8 +180,34 @@ const alwaysDeny: ExportApprover = async () => ({ allowed: false, reason: "opera
 // ── Closed mapping ────────────────────────────────────────────────────────────
 
 describe("mapAuditEntryToEnforcementEvent", () => {
-  it("maps an unsigned egress deny (nested shape) but omits unverified attribution", () => {
+  it("drops an unsigned egress deny rather than exporting an unverified decision", () => {
     const event = mapAuditEntryToEnforcementEvent(egressDenyEntry());
+    expect(event).toBeNull();
+  });
+
+  it("drops unsigned wrong-layer egress rows instead of exporting forged decisions", () => {
+    const layers: AuditEntry["layer"][] = ["l2", "l3", "l4"];
+    for (const layer of layers) {
+      const event = mapAuditEntryToEnforcementEvent({
+        ...egressDenyEntry(),
+        layer,
+        details: {
+          dest_host: "evil.example.com",
+          dest_ip: "203.0.113.5",
+          dest_port: 443,
+          dest_protocol: "tcp",
+          agent_id: "victim-agent-b",
+        },
+      });
+      expect(event).toBeNull();
+    }
+  });
+
+  it("maps a signed egress deny (nested shape)", () => {
+    const event = mapAuditEntryToEnforcementEvent(
+      signedEgressDenyEntry(),
+      SIGNED_MAP_OPTIONS,
+    );
     expect(event).toEqual({
       schema: ENFORCEMENT_EVENT_SCHEMA,
       event_class: "egress_decision",
@@ -188,8 +218,8 @@ describe("mapAuditEntryToEnforcementEvent", () => {
       destination_port: 443,
       destination_protocol: "tcp",
       rule_id: "rule-deny-evil",
-      agent_id: null,
-      agent_template: null,
+      agent_id: "claude-code-1",
+      agent_template: "coding-assistant",
       enforcement_point: "castle_wall",
     });
   });
@@ -230,11 +260,7 @@ describe("mapAuditEntryToEnforcementEvent", () => {
       },
     };
     const event = mapAuditEntryToEnforcementEvent(entry);
-    expect(event).toMatchObject({
-      event_class: "egress_decision",
-      agent_id: null,
-      agent_template: null,
-    });
+    expect(event).toBeNull();
     expect(JSON.stringify(event)).not.toContain("victim-agent-b");
     expect(JSON.stringify(event)).not.toContain("victim-template");
   });
@@ -271,13 +297,7 @@ describe("mapAuditEntryToEnforcementEvent", () => {
 
     const event = mapAuditEntryToEnforcementEvent(stapled, SIGNED_MAP_OPTIONS);
 
-    expect(event).toMatchObject({
-      event_class: "egress_decision",
-      decision: "deny",
-      destination_host: "evil.example.com",
-      agent_id: null,
-      agent_template: null,
-    });
+    expect(event).toBeNull();
     expect(JSON.stringify(event)).not.toContain("victim-agent-b");
     expect(JSON.stringify(event)).not.toContain("claude-code");
   });
@@ -335,8 +355,8 @@ describe("mapAuditEntryToEnforcementEvent", () => {
   });
 
   it("collapses a redacted rule-id to null rather than resurfacing a sibling key", () => {
-    const entry = egressDenyEntry({ rule_id: "[redacted]", rule_id_matched: "leaked-rule" });
-    const event = mapAuditEntryToEnforcementEvent(entry);
+    const entry = signedEgressDenyEntry({ rule_id: "[redacted]", rule_id_matched: "leaked-rule" });
+    const event = mapAuditEntryToEnforcementEvent(entry, SIGNED_MAP_OPTIONS);
     expect(event).toMatchObject({ event_class: "egress_decision", rule_id: null });
   });
 });
@@ -346,13 +366,13 @@ describe("mapAuditEntryToEnforcementEvent", () => {
 describe("closed schema drops anything not on the allowlist (honesty regression)", () => {
   it("never emits an injected secret planted in details", () => {
     const SECRET = "sk-super-secret-token-DO-NOT-LEAK";
-    const entry = egressDenyEntry({
+    const entry = signedEgressDenyEntry({
       api_key: SECRET,
       reason: `threshold 5/min; ${SECRET}`,
       free_text_note: SECRET,
       nested: { deep: { secret: SECRET } },
     });
-    const event = mapAuditEntryToEnforcementEvent(entry);
+    const event = mapAuditEntryToEnforcementEvent(entry, SIGNED_MAP_OPTIONS);
     const serialized = JSON.stringify(event);
     expect(serialized).not.toContain(SECRET);
     // Only the frozen field set is present.
@@ -459,6 +479,7 @@ describe("default file sink never touches the network", () => {
     const fetchSpy = vi.fn();
     const exporter = new EnforcementExporter({
       config: { sink: "file", enabled: false },
+      mapOptions: SIGNED_MAP_OPTIONS,
       approve: alwaysApprove,
       audit: noopAudit,
       fileWriter: (line) => {
@@ -471,7 +492,11 @@ describe("default file sink never touches the network", () => {
     expect(enabled).toEqual({ status: "enabled", touchesNetwork: false });
     expect(exporter.touchesNetwork()).toBe(false);
 
-    const outcome = await exporter.exportEntries([egressDenyEntry(), policyLoadedEntry(), distressEntry()]);
+    const outcome = await exporter.exportEntries([
+      signedEgressDenyEntry(),
+      policyLoadedEntry(),
+      distressEntry(),
+    ]);
     expect(outcome).toEqual({ status: "delivered", count: 3 });
     expect(lines).toHaveLength(3);
     expect(fetchSpy).not.toHaveBeenCalled();
@@ -600,6 +625,7 @@ describe("HTTP push refuses without opt-in + pinned destination + Tier-1 approva
     const audits: string[] = [];
     const exporter = new EnforcementExporter({
       config: httpConfig,
+      mapOptions: SIGNED_MAP_OPTIONS,
       approve: alwaysApprove,
       audit: async (op) => {
         audits.push(op);
@@ -607,7 +633,7 @@ describe("HTTP push refuses without opt-in + pinned destination + Tier-1 approva
       fetchImpl,
     });
     await exporter.enable();
-    const outcome = await exporter.exportEntries([egressDenyEntry()]);
+    const outcome = await exporter.exportEntries([signedEgressDenyEntry()]);
     expect(outcome).toEqual({ status: "delivered", count: 1 });
     expect(seen).toHaveLength(1);
     expect(seen[0].url).toBe("https://collector.example/xsiam");
@@ -633,6 +659,7 @@ describe("unreachable pinned destination FAILS LOUD (never falls back, never sil
     const audits: { op: string; result: string }[] = [];
     const exporter = new EnforcementExporter({
       config: httpConfig,
+      mapOptions: SIGNED_MAP_OPTIONS,
       approve: alwaysApprove,
       audit: async (op, _details, result) => {
         audits.push({ op, result });
@@ -640,7 +667,9 @@ describe("unreachable pinned destination FAILS LOUD (never falls back, never sil
       fetchImpl,
     });
     await exporter.enable();
-    await expect(exporter.exportEntries([egressDenyEntry()])).rejects.toThrow(/delivery failed|ECONNREFUSED/);
+    await expect(
+      exporter.exportEntries([signedEgressDenyEntry()]),
+    ).rejects.toThrow(/delivery failed|ECONNREFUSED/);
     expect(audits.some((a) => a.op === ENFORCEMENT_EXPORT_REFUSED && a.result === "failure")).toBe(true);
     // Crucially: no EMITTED audit was written (never reports success on failure).
     expect(audits.some((a) => a.op === ENFORCEMENT_EXPORT_EMITTED)).toBe(false);
@@ -655,9 +684,11 @@ describe("unreachable pinned destination FAILS LOUD (never falls back, never sil
       fetchImpl,
     });
     await exporter.enable();
-    await expect(exporter.exportEvents(mapEntriesToEnforcementEvents([egressDenyEntry()]))).rejects.toThrow(
-      /HTTP 503/,
-    );
+    await expect(
+      exporter.exportEvents(
+        mapEntriesToEnforcementEvents([signedEgressDenyEntry()], SIGNED_MAP_OPTIONS),
+      ),
+    ).rejects.toThrow(/HTTP 503/);
   });
 
   it("does not follow a redirect off the pinned host", async () => {

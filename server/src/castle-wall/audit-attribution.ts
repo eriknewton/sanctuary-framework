@@ -11,16 +11,14 @@
 import type { AuditEntry } from "../operational/audit-log.js";
 import { canonicalize } from "../mesh/canonical-json.js";
 import {
-  CASTLE_WALL_AUDIT_LAYER,
-  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
-  CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
-  CASTLE_WALL_HEARTBEAT_OPERATION,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+  CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS,
+  CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
 } from "./constants.js";
 import {
   isLegacyMacOSAuditTokenHex,
@@ -32,32 +30,6 @@ import {
   type ProducerSignatureVerdict,
 } from "./runtime/producer-signature.js";
 
-const CASTLE_WALL_ATTRIBUTION_SENSITIVE_OPERATIONS: ReadonlySet<string> =
-  Object.freeze(
-    new Set<string>([
-      "egress_blocked",
-      "egress_allowed",
-      "operator_decision",
-      "policy_loaded",
-      "policy_validation_failed",
-      "filter_started",
-      "filter_stopped",
-      "filter_crashed",
-      "provider_unbound",
-      "queue_saturated",
-      "no_wall_engaged",
-      "no_wall_expired",
-      "wal_overflow",
-      "external_firewall_clobber",
-      "egress_metric_batch",
-      "flow_decision_rejected",
-      "audit_event_rejected",
-      "producer_signature_rejected",
-      CASTLE_WALL_HEARTBEAT_OPERATION,
-      CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
-    ]),
-  );
-
 const CASTLE_WALL_SIGNED_OPERATION_TO_AUDIT_OPERATION: ReadonlyMap<string, string> =
   new Map([
     ["egress_blocked", "egress_blocked"],
@@ -66,17 +38,8 @@ const CASTLE_WALL_SIGNED_OPERATION_TO_AUDIT_OPERATION: ReadonlyMap<string, strin
     ["egress_pending", "operator_decision"],
   ]);
 
-const ROW_BINDING_IGNORED_DETAIL_KEYS: ReadonlySet<string> = Object.freeze(
-  new Set<string>([
-    "seq",
-    "prior_sha256_hex",
-    CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
-    CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
-    CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
-    CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
-    CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
-    CASTLE_WALL_AUDIT_PROVENANCE_KEY,
-  ]),
+const ROW_BINDING_IGNORED_DETAIL_KEYS: ReadonlySet<string> = new Set(
+  CASTLE_WALL_SIGNED_ROW_BINDING_IGNORED_DETAIL_KEYS,
 );
 
 export interface AuditAttributionOptions {
@@ -228,16 +191,11 @@ function signedCanonicalBodyIdentityId(
 }
 
 export function isCastleWallAttributionSensitiveEntry(
-  entry: Pick<AuditEntry, "layer" | "operation" | "details">,
+  _entry: Pick<AuditEntry, "layer" | "operation" | "details">,
 ): boolean {
-  if (entry.layer === CASTLE_WALL_AUDIT_LAYER) return true;
-  if (CASTLE_WALL_ATTRIBUTION_SENSITIVE_OPERATIONS.has(entry.operation)) {
-    return true;
-  }
-  return (
-    entry.details?.[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] !== undefined ||
-    entry.details?.[CASTLE_WALL_AUDIT_PROVENANCE_KEY] !== undefined
-  );
+  // Compatibility export: attribution is sensitive by default for every audit
+  // row. Do not narrow this back to a layer/operation allowlist.
+  return true;
 }
 
 function parseSignedBodyFromDetails(
@@ -260,25 +218,78 @@ function signedOperationMatchesPersistedEntry(
   return mapped === persistedOperation;
 }
 
+function normalizedSignedOperation(operation: unknown): unknown {
+  if (typeof operation !== "string" || operation.length === 0) {
+    return operation;
+  }
+  return (
+    CASTLE_WALL_SIGNED_OPERATION_TO_AUDIT_OPERATION.get(operation) ??
+    operation
+  );
+}
+
+function normalizedSignedResult(result: unknown): unknown {
+  if (result === "blocked") return "failure";
+  if (result === "pending") return "success";
+  return result;
+}
+
+function normalizedPersistedRowForSignedComparison(
+  entry: AuditEntry,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(
+    entry as AuditEntry & Record<string, unknown>,
+  )) {
+    out[key] =
+      key === "details" && isRecord(value)
+        ? normalizedEvidenceDetails(value)
+        : value;
+  }
+  return out;
+}
+
+function normalizedSignedBodyForPersistedComparison(
+  body: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): Record<string, unknown> | null {
+  const signedSubject = signedCanonicalBodyIdentityId(body, subjectFortressId);
+  if (signedSubject === null) return null;
+
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (key === "operation") {
+      out.operation = normalizedSignedOperation(value);
+    } else if (key === "result") {
+      out.result = normalizedSignedResult(value);
+    } else if (key === "identity_id") {
+      out.identity_id = signedSubject;
+    } else if (key === "details" && isRecord(value)) {
+      out.details = normalizedEvidenceDetails(value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
 function signedBodyMatchesPersistedEntry(
   entry: AuditEntry,
   body: Record<string, unknown>,
   subjectFortressId?: string | null,
 ): boolean {
-  if (entry.layer !== CASTLE_WALL_AUDIT_LAYER) return false;
-  if (body.layer !== CASTLE_WALL_AUDIT_LAYER) return false;
-  if (body.timestamp !== entry.timestamp) return false;
   if (!signedOperationMatchesPersistedEntry(body.operation, entry.operation)) {
     return false;
   }
-  const signedSubject = signedCanonicalBodyIdentityId(body, subjectFortressId);
-  if (signedSubject === null || signedSubject !== entry.identity_id) {
-    return false;
-  }
-
-  const persistedDetails = normalizedEvidenceDetails(entry.details);
-  const signedDetails = normalizedEvidenceDetails(signedCanonicalDetails(body));
-  return canonicalJsonEquals(persistedDetails, signedDetails);
+  const signedComparable = normalizedSignedBodyForPersistedComparison(
+    body,
+    subjectFortressId,
+  );
+  if (signedComparable === null) return false;
+  return canonicalJsonEquals(
+    normalizedPersistedRowForSignedComparison(entry),
+    signedComparable,
+  );
 }
 
 /**
@@ -291,7 +302,6 @@ export function verifiedCastleWallAuditAttribution(
   entry: AuditEntry,
   options: AuditAttributionOptions = {},
 ): VerifiedCastleWallAuditAttribution | null {
-  if (!isCastleWallAttributionSensitiveEntry(entry)) return null;
   const details = entry.details;
   if (!details) return null;
   if (
@@ -309,7 +319,7 @@ export function verifiedCastleWallAuditAttribution(
     details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
   const capturedAtUnixMs =
     details[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY];
-  const seq = details.seq;
+  const seq = details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
   if (
     typeof signatureB64url !== "string" ||
     typeof keyId !== "string" ||
@@ -367,52 +377,26 @@ export function verifiedCastleWallAuditAttribution(
   };
 }
 
-function rawAgentIdFromDetails(details: Record<string, unknown> | undefined): string | null {
-  if (!details) return null;
-  const nested = isRecord(details.agent) ? details.agent.id : undefined;
-  if (typeof nested === "string" && nested.length > 0) return nested;
-  const flat = details.agent_id;
-  return typeof flat === "string" && flat.length > 0 ? flat : null;
-}
-
-function rawAgentTemplateFromDetails(
-  details: Record<string, unknown> | undefined,
-): string | null {
-  if (!details) return null;
-  const nested = isRecord(details.agent) ? details.agent.template : undefined;
-  if (typeof nested === "string" && nested.length > 0) return nested;
-  const flat = details.agent_template;
-  return typeof flat === "string" && flat.length > 0 ? flat : null;
-}
-
 /**
- * Agent id for general audit readers. Castle Wall attribution-sensitive rows
- * use only signature-verified attribution; non-Castle-Wall rows retain the
- * legacy metadata hint behavior.
+ * Agent id for general audit readers. Attribution is default-deny: only a
+ * re-verified producer-signed row projects an agent. Forgeable details metadata
+ * never projects attribution.
  */
 export function auditEntryAgentId(
   entry: AuditEntry,
   options: AuditAttributionOptions = {},
 ): string | null {
-  if (isCastleWallAttributionSensitiveEntry(entry)) {
-    return verifiedCastleWallAuditAttribution(entry, options)?.agentId ?? null;
-  }
-  return rawAgentIdFromDetails(entry.details);
+  return verifiedCastleWallAuditAttribution(entry, options)?.agentId ?? null;
 }
 
 /**
- * Agent template for general audit readers. Castle Wall attribution-sensitive
- * rows use only signature-verified signed-body details; non-Castle-Wall rows
- * retain the legacy metadata hint behavior.
+ * Agent template for general audit readers. Attribution is default-deny: only a
+ * re-verified producer-signed row projects a template. Forgeable details
+ * metadata never projects attribution.
  */
 export function auditEntryAgentTemplate(
   entry: AuditEntry,
   options: AuditAttributionOptions = {},
 ): string | null {
-  if (isCastleWallAttributionSensitiveEntry(entry)) {
-    return (
-      verifiedCastleWallAuditAttribution(entry, options)?.agentTemplate ?? null
-    );
-  }
-  return rawAgentTemplateFromDetails(entry.details);
+  return verifiedCastleWallAuditAttribution(entry, options)?.agentTemplate ?? null;
 }

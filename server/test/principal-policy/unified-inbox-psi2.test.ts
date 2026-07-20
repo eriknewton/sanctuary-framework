@@ -329,9 +329,20 @@ describe("Psi-2 - producer wiring", () => {
       bridge,
       since: "2026-05-09T00:00:00.000Z",
     });
-    expect(entries.find((e) => e.agent_id === "agent_err")?.severity).toBe("warn");
-    expect(entries.find((e) => e.agent_id === "agent_repeat")?.severity).toBe("alert");
-    expect(entries.find((e) => e.agent_id === "agent_fatal")?.severity).toBe("critical");
+    expect(
+      entries.find((e) => e.summary.includes("(TransientNetworkError)"))
+        ?.severity,
+    ).toBe("warn");
+    expect(
+      entries.find((e) => e.summary.includes("(RetryableToolError)"))
+        ?.severity,
+    ).toBe("alert");
+    expect(
+      entries.find((e) => e.summary.includes("(FatalHarnessExit)"))?.severity,
+    ).toBe("critical");
+    expect(entries.map((e) => e.agent_id)).toEqual(
+      entries.map(() => "unknown"),
+    );
   });
 
   it("does not attribute forged unsigned Castle Wall error evidence to a victim agent", async () => {

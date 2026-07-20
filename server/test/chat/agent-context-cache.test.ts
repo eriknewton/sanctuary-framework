@@ -22,6 +22,7 @@ import type { LocalAgentRecord } from "../../src/contracts/v1.1/local-agent-reco
 import type { HubAgentRegistrySource } from "../../src/hub/types.js";
 import type { AuditLog, AuditEntry } from "../../src/operational/audit-log.js";
 import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
+import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
@@ -43,6 +44,27 @@ function toBase64url(bytes: Uint8Array): string {
 const producerPriv = ed25519.utils.randomPrivateKey();
 const producerPubB64 = toBase64url(ed25519.getPublicKey(producerPriv));
 const SIGNED_AT_MS = 1_777_777_777_777;
+const FORTRESS_ID = "fortress:test";
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
 
 function withProducerSignature(
   entry: AuditEntry,
@@ -143,9 +165,18 @@ describe("buildSnapshot derivation (Tau-5)", () => {
   it("counts audit + composition + egress events scoped to the agent", () => {
     const record = makeRecord("OpenClaw", { channel_template_id: "research" });
     const recentEntries = [
-      makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
-      makeEntry("OpenClaw", "composition_receipt_packed", 30 * 60 * 1000),
-      makeEntry("OpenClaw", "context_gate_filter", 60 * 60 * 1000),
+      withProducerSignature(
+        makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
+        "OpenClaw",
+      ),
+      withProducerSignature(
+        makeEntry("OpenClaw", "composition_receipt_packed", 30 * 60 * 1000),
+        "OpenClaw",
+      ),
+      withProducerSignature(
+        makeEntry("OpenClaw", "context_gate_filter", 60 * 60 * 1000),
+        "OpenClaw",
+      ),
       makeEntry("Cline", "policy_change", 5 * 60 * 1000), // owned by another agent
       makeEntry(null, "system_event", 5 * 60 * 1000), // unscoped
     ];
@@ -154,6 +185,10 @@ describe("buildSnapshot derivation (Tau-5)", () => {
       recentEntries,
       nowMs: NOW,
       verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      },
     });
     expect(snap.recent_audit_count_24h).toBe(3);
     expect(snap.recent_concordia_receipts_count_24h).toBe(1);
@@ -221,7 +256,48 @@ describe("buildSnapshot derivation (Tau-5)", () => {
       verascoreSource: undefined,
       auditAttribution: {
         pinnedProducerKeyB64url: producerPubB64,
-        subjectFortressId: "fortress:test",
+        subjectFortressId: FORTRESS_ID,
+      },
+    });
+
+    expect(snap.recent_audit_count_24h).toBe(1);
+    expect(snap.recent_egress_count_24h).toBe(1);
+    expect(snap.current_work_summary).toBe("performed egress_blocked");
+  });
+
+  it("counts macOS producer-signed Castle Wall evidence by protection subject", () => {
+    const protectionSubject = protectionSubjectForUid(FORTRESS_ID, 503);
+    expect(protectionSubject).not.toBeNull();
+    const record = makeRecord("victim-agent-b", {
+      protection_subject: protectionSubject!,
+    });
+    const signed = withProducerSignature(
+      {
+        timestamp: new Date(NOW - 5 * 60 * 1000).toISOString(),
+        layer: "l1",
+        operation: "egress_blocked",
+        identity_id: protectionSubject!,
+        result: "success",
+        details: {
+          agent_id: auditTokenForRuid(503),
+          agent_template: "claude-code",
+          dest_host: "legitimate.example.com",
+          dest_ip: "198.51.100.10",
+          dest_port: 443,
+          dest_protocol: "tcp",
+        },
+      },
+      protectionSubject!,
+    );
+
+    const snap = buildSnapshot({
+      record,
+      recentEntries: [signed],
+      nowMs: NOW,
+      verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
       },
     });
 
@@ -263,13 +339,20 @@ describe("buildSnapshot derivation (Tau-5)", () => {
   it("flags has_pending_approvals when an approval-class audit event surfaces for the agent", () => {
     const record = makeRecord("Cline");
     const recentEntries = [
-      makeEntry("Cline", "approval_request", 10 * 60 * 1000),
+      withProducerSignature(
+        makeEntry("Cline", "approval_request", 10 * 60 * 1000),
+        "Cline",
+      ),
     ];
     const snap = buildSnapshot({
       record,
       recentEntries,
       nowMs: NOW,
       verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      },
     });
     expect(snap.state_flags).toContain("has_pending_approvals");
   });
@@ -277,14 +360,29 @@ describe("buildSnapshot derivation (Tau-5)", () => {
   it("derives current_work_summary from the most recent audit event", () => {
     const record = makeRecord("Cline");
     const recentEntries = [
-      makeEntry("Cline", "policy_change", 1 * 60 * 60 * 1000),
-      makeEntry("Cline", "composition_receipt_packed", 5 * 60 * 1000, "failure"),
+      withProducerSignature(
+        makeEntry("Cline", "policy_change", 1 * 60 * 60 * 1000),
+        "Cline",
+      ),
+      withProducerSignature(
+        makeEntry(
+          "Cline",
+          "composition_receipt_packed",
+          5 * 60 * 1000,
+          "failure",
+        ),
+        "Cline",
+      ),
     ];
     const snap = buildSnapshot({
       record,
       recentEntries,
       nowMs: NOW,
       verascoreSource: undefined,
+      auditAttribution: {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      },
     });
     expect(snap.current_work_summary).toBe("failed composition_receipt_packed");
   });
@@ -409,14 +507,27 @@ describe("AgentContextCache lifecycle (Tau-5)", () => {
   it("refresh aggregates registry + audit-log data into per-agent snapshots", async () => {
     const records = [makeRecord("OpenClaw"), makeRecord("Cline")];
     const entries = [
-      makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
-      makeEntry("OpenClaw", "composition_receipt_packed", 10 * 60 * 1000),
-      makeEntry("Cline", "approval_request", 5 * 60 * 1000),
+      withProducerSignature(
+        makeEntry("OpenClaw", "policy_change", 5 * 60 * 1000),
+        "OpenClaw",
+      ),
+      withProducerSignature(
+        makeEntry("OpenClaw", "composition_receipt_packed", 10 * 60 * 1000),
+        "OpenClaw",
+      ),
+      withProducerSignature(
+        makeEntry("Cline", "approval_request", 5 * 60 * 1000),
+        "Cline",
+      ),
     ];
     const cache = new AgentContextCache({
       identityId: "op-1",
       agentRegistry: makeStubRegistry(records),
       auditLog: makeStubAuditLog(entries),
+      resolveAuditAttribution: () => ({
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: FORTRESS_ID,
+      }),
       clock: () => NOW,
     });
     const snaps = await cache.refresh();

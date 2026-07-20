@@ -55,6 +55,7 @@ import {
 } from "../../hub/agent-registry-persistence.js";
 import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
+import type { LocalAgentRecord } from "../../contracts/v1.1/local-agent-records.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
 import type { ReputationStore } from "../../reputation/reputation-store.js";
 import { loadPrincipalPolicy } from "../../principal-policy/loader.js";
@@ -62,6 +63,7 @@ import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import type { StorageBackend } from "../../storage/interface.js";
 import {
   ConciergeMemoryStore,
+  AgentContextCache,
   OperatorChatService,
   OperatorChatStore,
   type ConciergeContextProviders,
@@ -501,6 +503,26 @@ export function buildV11Bindings(
       // hiccup should not block hub construction. The next unlock
       // re-runs the prune.
     });
+    const agentContextCache = new AgentContextCache({
+      identityId: inputs.identityId,
+      agentRegistry: registry,
+      auditLog: inputs.auditLog,
+      resolveAuditAttribution,
+      onRefreshError: (error) => {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        const warn =
+          inputs.warnProducerKeyUnavailable ??
+          ((reason: string) => {
+            // SAFETY: startup/degradation warning to local server stderr only.
+            console.error(
+              `Warning: Castle Wall audit attribution unavailable (${reason}).`,
+            );
+          });
+        warn(`agent_context_cache_refresh_failed:${message}`);
+      },
+    });
+    void agentContextCache.refresh();
     operatorChatService = new OperatorChatService({
       store: chatStore,
       auditLog: inputs.auditLog,
@@ -551,6 +573,7 @@ export function buildV11Bindings(
             }),
           }
         : {}),
+      conciergeAgentContextCache: agentContextCache,
     });
   }
 
@@ -742,8 +765,16 @@ function buildConciergeContextProviders(args: {
     recentActivity: async () => {
       const result = await args.auditLog.query({ limit: 30 });
       const auditAttribution = await args.resolveAuditAttribution();
+      const records = args.registry.list({ identity_id: args.identityId });
       const lines = result.entries
-        .filter((e) => e.identity_id === args.identityId)
+        .filter((e) =>
+          entryBelongsToConciergeScope(
+            e,
+            args.identityId,
+            records,
+            auditAttribution,
+          ),
+        )
         .slice(-30)
         .map((e) => {
           const agentId =
@@ -827,8 +858,14 @@ function buildConciergeContextFetchers(args: {
     agent_activity: async (agentNameHint) => {
       const result = await args.auditLog.query({ limit: 50 });
       const auditAttribution = await args.resolveAuditAttribution();
-      const owned = result.entries.filter(
-        (e) => e.identity_id === args.identityId,
+      const records = args.registry.list({ identity_id: args.identityId });
+      const owned = result.entries.filter((e) =>
+        entryBelongsToConciergeScope(
+          e,
+          args.identityId,
+          records,
+          auditAttribution,
+        ),
       );
       const filtered = agentNameHint
         ? owned.filter((e) => {
@@ -850,8 +887,15 @@ function buildConciergeContextFetchers(args: {
     },
     audit_log: async () => {
       const result = await args.auditLog.query({ limit: 30 });
-      const owned = result.entries.filter(
-        (e) => e.identity_id === args.identityId,
+      const auditAttribution = await args.resolveAuditAttribution();
+      const records = args.registry.list({ identity_id: args.identityId });
+      const owned = result.entries.filter((e) =>
+        entryBelongsToConciergeScope(
+          e,
+          args.identityId,
+          records,
+          auditAttribution,
+        ),
       );
       if (owned.length === 0) return "(no audit log entries)";
       return owned
@@ -879,6 +923,29 @@ function buildConciergeContextFetchers(args: {
     },
     verascore_deltas: empty,
   };
+}
+
+function entryBelongsToConciergeScope(
+  entry: Parameters<typeof auditEntryAgentId>[0],
+  identityId: string,
+  records: ReadonlyArray<LocalAgentRecord>,
+  auditAttribution: Awaited<ReturnType<AuditAttributionOptionsResolver>>,
+): boolean {
+  if (entry.identity_id === identityId) return true;
+  const agentId = auditEntryAgentId(entry, auditAttribution);
+  if (agentId === null) return false;
+  return records.some((record) => localAgentAttributionIds(record).has(agentId));
+}
+
+function localAgentAttributionIds(record: LocalAgentRecord): Set<string> {
+  const ids = new Set<string>([record.agent_id]);
+  if (
+    typeof record.protection_subject === "string" &&
+    record.protection_subject.length > 0
+  ) {
+    ids.add(record.protection_subject);
+  }
+  return ids;
 }
 
 /**

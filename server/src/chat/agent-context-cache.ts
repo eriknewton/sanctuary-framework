@@ -247,12 +247,20 @@ export class AgentContextCache {
         since: sinceIso,
         limit: 500,
       });
-      const ownedRecent = recent.entries.filter(
-        (e) => e.identity_id === this.identityId,
-      );
       const auditAttribution = this.resolveAuditAttribution
         ? await this.resolveAuditAttribution()
         : {};
+      const recordAttributionIds = new Set<string>();
+      for (const record of records) {
+        for (const id of agentRecordAttributionIds(record)) {
+          recordAttributionIds.add(id);
+        }
+      }
+      const ownedRecent = recent.entries.filter((e) => {
+        if (e.identity_id === this.identityId) return true;
+        const agentId = auditEntryAgentId(e, auditAttribution);
+        return agentId !== null && recordAttributionIds.has(agentId);
+      });
 
       const next: AgentContextSnapshot[] = records.map((record) =>
         buildSnapshot({
@@ -354,9 +362,10 @@ export function buildSnapshot(
   inputs: BuildSnapshotInputs,
 ): AgentContextSnapshot {
   const { record, recentEntries, nowMs, verascoreSource } = inputs;
+  const recordAttributionIds = agentRecordAttributionIds(record);
   const ownedByAgent = recentEntries.filter((e) => {
     const agentId = auditEntryAgentId(e, inputs.auditAttribution ?? {});
-    return agentId === record.agent_id;
+    return agentId !== null && recordAttributionIds.has(agentId);
   });
 
   const auditCount = ownedByAgent.length;
@@ -436,6 +445,17 @@ export function buildSnapshot(
     recent_verascore_delta_24h: verascore,
     state_flags: orderedFlags,
   };
+}
+
+function agentRecordAttributionIds(record: LocalAgentRecord): Set<string> {
+  const ids = new Set<string>([record.agent_id]);
+  if (
+    typeof record.protection_subject === "string" &&
+    record.protection_subject.length > 0
+  ) {
+    ids.add(record.protection_subject);
+  }
+  return ids;
 }
 
 function deriveCurrentWorkSummary(

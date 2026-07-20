@@ -20,8 +20,7 @@
 
 import type { AuditEntry } from "../../operational/audit-log.js";
 import {
-  auditEntryAgentId,
-  auditEntryAgentTemplate,
+  verifiedCastleWallAuditAttribution,
   type AuditAttributionOptions,
 } from "../audit-attribution.js";
 import {
@@ -150,7 +149,10 @@ function ruleIdOf(details: Record<string, unknown> | undefined): string | null {
 function mapEgressDecision(
   entry: AuditEntry,
   options: EnforcementEventMapOptions = {},
-): EgressDecisionEvent {
+): EgressDecisionEvent | null {
+  const attribution = verifiedCastleWallAuditAttribution(entry, options);
+  if (attribution === null) return null;
+
   // Coarse decision is derived from the operation TYPE, not the fine-grained
   // stored `decision` value. The fine-grained value (allow_once / deny_always /
   // timeout_default_deny) is a policy-tier signal; the public schema promises a
@@ -167,8 +169,8 @@ function mapEgressDecision(
     destination_port: destinationPortOf(details),
     destination_protocol: destinationProtocolOf(details),
     rule_id: ruleIdOf(details),
-    agent_id: auditEntryAgentId(entry, options),
-    agent_template: auditEntryAgentTemplate(entry, options),
+    agent_id: attribution.agentId,
+    agent_template: attribution.agentTemplate,
     enforcement_point: ENFORCEMENT_POINT_CASTLE_WALL,
   };
 }

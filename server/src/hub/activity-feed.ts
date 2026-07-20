@@ -25,7 +25,6 @@ import type {
 } from "../contracts/v1.1/hub-events.js";
 import {
   auditEntryAgentId,
-  isCastleWallAttributionSensitiveEntry,
   verifiedCastleWallAuditAttribution,
   type AuditAttributionOptions,
 } from "../castle-wall/audit-attribution.js";
@@ -145,10 +144,9 @@ function buildTemplateArgs(
 }
 
 /**
- * Pull a safe `agent_id` hint out of the audit entry. Castle Wall attribution
- * is projected only when the persisted producer signature re-verifies and the
- * subject is derived from the signed canonical body. Non-Castle-Wall rows keep
- * the legacy details hint behavior.
+ * Pull a safe `agent_id` hint out of the audit entry. Attribution is projected
+ * only when the persisted producer signature re-verifies and the subject is
+ * derived from the signed canonical body.
  */
 function extractAgentIdHint(
   entry: AuditEntry,
@@ -173,20 +171,17 @@ function deriveAttestationFragment(entryId: string): string {
 /**
  * Map an audit-entry result onto an attestation render state.
  *
- * Castle Wall attribution-sensitive entries render `verified` only when the
- * persisted producer signature re-verifies. Other audit families keep the
- * legacy success/failure projection.
+ * Entries render `verified` only when the persisted producer signature
+ * re-verifies. A successful unsigned row may be chain-valid, but it is not
+ * attribution-verified and must render degraded.
  */
 function deriveAttestationState(
   entry: AuditEntry,
   attribution: AuditAttributionOptions,
 ): "verified" | "degraded" {
-  if (isCastleWallAttributionSensitiveEntry(entry)) {
-    return verifiedCastleWallAuditAttribution(entry, attribution) !== null
-      ? "verified"
-      : "degraded";
-  }
-  return entry.result === "success" ? "verified" : "degraded";
+  return verifiedCastleWallAuditAttribution(entry, attribution) !== null
+    ? "verified"
+    : "degraded";
 }
 
 function projectEntry(
@@ -245,7 +240,11 @@ export async function aggregateActivity(
   const attribution = await resolveActivityAttribution(sources);
 
   const projected = queryResult.entries
-    .filter((e) => e.identity_id === sources.identityId)
+    .filter(
+      (e) =>
+        e.identity_id === sources.identityId ||
+        verifiedCastleWallAuditAttribution(e, attribution) !== null,
+    )
     .map((entry) => projectEntry(entry, attribution));
 
   let filtered = projected;

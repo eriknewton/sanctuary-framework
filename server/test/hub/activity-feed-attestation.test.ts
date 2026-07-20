@@ -3,8 +3,8 @@
  *
  * Asserts that `aggregateActivity` populates the optional `attestation`
  * field on every projected `HubActivityFeedEntry`:
- *   1. Successful audit entries render `state: "verified"`.
- *   2. Failed audit entries render `state: "degraded"`.
+ *   1. Unsigned audit entries render `state: "degraded"` even on success.
+ *   2. Producer-signed audit entries render `state: "verified"`.
  *   3. Distinct entry ids derive distinct fragments.
  *   4. Fragment shape is `<4hex>..<2hex>` (matches Sprint Piece 2 gallery).
  *
@@ -23,6 +23,7 @@ import { MemoryStorage } from "../../src/storage/memory.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { aggregateActivity } from "../../src/hub/activity-feed.js";
 import type { AuditEntry } from "../../src/operational/audit-log.js";
+import { auditEntryAgentId } from "../../src/castle-wall/audit-attribution.js";
 import { producerSigningBytes } from "../../src/castle-wall/runtime/producer-signature.js";
 import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
@@ -117,7 +118,7 @@ describe("Activity feed: per-action attestation projection", () => {
   beforeEach(async () => (rig = await startRig()));
   afterEach(() => undefined);
 
-  it("successful entries render attestation.state = 'verified'", async () => {
+  it("successful unsigned entries render attestation.state = 'degraded'", async () => {
     await rig.auditLog.append("l2", "policy_decision", IDENTITY_ID, {}, "success");
     await rig.auditLog.flush();
     const entries = await aggregateActivity(
@@ -126,6 +127,31 @@ describe("Activity feed: per-action attestation projection", () => {
     );
     expect(entries).toHaveLength(1);
     expect(entries[0]!.attestation).toBeDefined();
+    expect(entries[0]!.attestation!.state).toBe("degraded");
+  });
+
+  it("producer-signed entries render attestation.state = 'verified'", async () => {
+    const signed = signedVictimEgressEntry();
+    await rig.auditLog.appendCritical({
+      layer: signed.layer,
+      operation: signed.operation,
+      identity_id: signed.identity_id,
+      timestamp: signed.timestamp,
+      result: signed.result,
+      details: signed.details,
+    });
+    await rig.auditLog.flush();
+    const entries = await aggregateActivity(
+      {
+        auditLog: rig.auditLog,
+        identityId: signed.identity_id,
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: "fortress:test",
+      },
+      { limit: 10 },
+    );
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.agent_id).toBe("victim-agent-b");
     expect(entries[0]!.attestation!.state).toBe("verified");
   });
 
@@ -300,5 +326,47 @@ describe("Activity feed: per-action attestation projection", () => {
       { agent_id: "victim-agent-b", limit: 10 },
     );
     expect(filtered).toHaveLength(0);
+  });
+
+  it("rejects a valid signature when the persisted top-level result is changed", async () => {
+    const signed = signedVictimEgressEntry();
+    await rig.auditLog.appendCritical({
+      layer: signed.layer,
+      operation: signed.operation,
+      identity_id: signed.identity_id,
+      timestamp: signed.timestamp,
+      result: "failure",
+      details: signed.details,
+    });
+    await rig.auditLog.flush();
+
+    const entries = await aggregateActivity(
+      {
+        auditLog: rig.auditLog,
+        identityId: signed.identity_id,
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: "fortress:test",
+      },
+      { limit: 10 },
+    );
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]!.agent_id).toBeUndefined();
+    expect(entries[0]!.attestation!.state).toBe("degraded");
+  });
+
+  it("rejects a valid signature when a new top-level persisted field is unbound", async () => {
+    const signed = signedVictimEgressEntry();
+    const persisted = {
+      ...signed,
+      unbound_top_level_field: "must-not-be-ignored",
+    } as AuditEntry & { unbound_top_level_field: string };
+
+    expect(
+      auditEntryAgentId(persisted, {
+        pinnedProducerKeyB64url: producerPubB64,
+        subjectFortressId: "fortress:test",
+      }),
+    ).toBeNull();
   });
 });
