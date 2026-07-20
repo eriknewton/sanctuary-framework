@@ -42,6 +42,7 @@ import {
   auditChainVerdictClaimsClean,
   auditChainVerdictUntampered,
   auditChainVerdictSealedUnverifiedAtPrivilege,
+  type AuditEntry,
   type AuditLog,
   type AuditChainVerdict,
   type AuditChainVerdictStatus,
@@ -81,6 +82,13 @@ export {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function auditEntryBelongsToSubject(
+  entry: AuditEntry,
+  subjectIdentityId: string | undefined,
+): boolean {
+  return subjectIdentityId === undefined || entry.identity_id === subjectIdentityId;
 }
 
 /**
@@ -323,6 +331,13 @@ export interface CastleWallPosture {
 export interface BuildCastleWallPostureInput {
   auditLog: AuditLog;
   originMachine: string;
+  /**
+   * Optional subject binding for claims about one agent/fortress identity.
+   * `originMachine` is the output attribution label for broader dashboard
+   * surfaces; when a caller is making a protection claim for a specific subject,
+   * green-earning evidence must carry this exact audit `identity_id`.
+   */
+  subjectIdentityId?: string;
   platform?: NodeJS.Platform;
   now?: number;
   freshnessWindowMs?: number;
@@ -559,6 +574,12 @@ export async function buildCastleWallPosture(
     const isNotEnforcing = CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op);
     const isLiveness = CASTLE_WALL_LIVENESS_OPERATIONS.has(op);
     const isStandDown = CASTLE_WALL_STAND_DOWN_OPERATIONS.has(op);
+    if (
+      (isArmEligible || isLiveness) &&
+      !auditEntryBelongsToSubject(entry, input.subjectIdentityId)
+    ) {
+      continue;
+    }
     // Only arm-eligible enforcement ops are gated by the signature. Not-enforcing
     // (fault) ops are NOT signed and must NEVER be dropped by the gate — they
     // fail toward RED/degraded (a dropped fault would leave a green-while-faulted

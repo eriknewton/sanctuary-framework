@@ -29,11 +29,12 @@ async function appendCW(
   operation: string,
   timestamp: string,
   result: "success" | "failure" = "success",
+  identityId: string = FORTRESS,
 ): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation,
-    identity_id: FORTRESS,
+    identity_id: identityId,
     result,
     details: { cw_source: "castle_wall_audit_consumer" },
     timestamp,
@@ -161,6 +162,7 @@ describe("feature-health panel — the four mandatory color assertions", () => {
     const panel = await buildFeatureHealthPanel({
       auditLog: log,
       originMachine: FORTRESS,
+      subjectIdentityId: FORTRESS,
       now,
     });
     const cw = row(panel, "castle_wall_egress");
@@ -206,6 +208,7 @@ describe("feature-health panel — the four mandatory color assertions", () => {
     const panel = await buildFeatureHealthPanel({
       auditLog: log,
       originMachine: FORTRESS,
+      subjectIdentityId: FORTRESS,
       now,
     });
     const cw = row(panel, "castle_wall_egress");
@@ -228,6 +231,28 @@ describe("feature-health — green is earned correctly", () => {
     const cw = row(panel, "castle_wall_egress");
     expect(cw.status).toBe("active");
     expect(cw.basis).toBe("fresh_enforcement_evidence");
+  });
+
+  it("Castle Wall stays unknown when fresh live-adjudication evidence belongs to a different identity", async () => {
+    const { log } = newAuditLog();
+    const now = Date.now();
+    await appendCW(
+      log,
+      "egress_allowed",
+      new Date(now - 60_000).toISOString(),
+      "success",
+      "foreign-agent",
+    );
+    const panel = await buildFeatureHealthPanel({
+      auditLog: log,
+      originMachine: FORTRESS,
+      subjectIdentityId: FORTRESS,
+      now,
+    });
+    const cw = row(panel, "castle_wall_egress");
+    expect(cw.status).toBe("unknown");
+    expect(cw.basis).toBe("no_evidence_self_reporting");
+    expect(cw.invocation_count).toBe(0);
   });
 
   it("policy_loaded alone does NOT arm Castle Wall (the honesty seam — stays unknown)", async () => {

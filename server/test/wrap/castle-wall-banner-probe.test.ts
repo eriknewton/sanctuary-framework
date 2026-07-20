@@ -105,11 +105,12 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     operation: string,
     ageMs: number,
     details: Record<string, unknown> = {},
+    identityId: string = fortressId,
   ): Promise<void> {
     await log.appendCritical({
       layer: "l1",
       operation,
-      identity_id: fortressId,
+      identity_id: identityId,
       result: "success",
       details: { ...details, cw_source: "castle_wall_audit_consumer" },
       timestamp: new Date(Date.now() - ageMs).toISOString(),
@@ -142,6 +143,14 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     auditLog: AuditLog,
     identityId: string = fortressId,
   ) {
+    await appendDaemonLivenessEvidence(auditLog, identityId);
+    await appendEgressEvidence(auditLog, identityId);
+  }
+
+  async function appendDaemonLivenessEvidence(
+    auditLog: AuditLog,
+    identityId: string = fortressId,
+  ) {
     await auditLog.appendCritical({
       layer: "l1",
       operation: "filter_started",
@@ -163,6 +172,13 @@ describe("Castle Wall wrap-banner evidence probes", () => {
       },
       timestamp: new Date(Date.now() - 30_000).toISOString(),
     });
+    await auditLog.flush();
+  }
+
+  async function appendEgressEvidence(
+    auditLog: AuditLog,
+    identityId: string = fortressId,
+  ) {
     await auditLog.appendCritical({
       layer: "l1",
       operation: "egress_allowed",
@@ -405,6 +421,30 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(claim.basis).toBe("exclusive_egress_observed");
   });
 
+  it("foreign-identity fresh egress cannot render the current in-memory banner green", async () => {
+    const livenessSince = currentWrapSince();
+    await appendCW("egress_allowed", 60_000, {}, "foreign-agent");
+    await appendDaemonStart(31_000);
+    await appendDaemonHeartbeat(30_000);
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: log,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.basis).toBe("insufficient_evidence");
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain(
+      "Castle Wall Full",
+    );
+  });
+
   it("split-migrated fortress reaches green when current-wrap daemon evidence lives in _audit-daemon", async () => {
     const livenessSince = currentWrapSince();
     const { auditLog, auditStorage, masterKey } =
@@ -426,6 +466,46 @@ describe("Castle Wall wrap-banner evidence probes", () => {
     expect(claim.state).toBe("exclusive");
     expect(claim.basis).toBe("exclusive_egress_observed");
     expect(protectionStateAdvice(claim).castleWallLabel).toBe("Castle Wall Full");
+  });
+
+  it("foreign-identity fresh egress cannot render the split _audit-daemon banner green", async () => {
+    const livenessSince = currentWrapSince();
+    const storage = new FilesystemStorage(join(storagePath, "state"));
+    const masterKey = generateRandomKey();
+    const operatorLog = new AuditLog(storage, masterKey);
+    await operatorLog.appendCritical({
+      layer: "l1",
+      operation: "identity_create",
+      identity_id: fortressId,
+      result: "success",
+      details: { source: "operator-chain-fixture" },
+    });
+    await operatorLog.flush();
+    await migrateFortressAuditStoreSplit({ storage, masterKey });
+
+    const daemonLog = createDaemonAuditLog(storage, masterKey);
+    await appendDaemonLivenessEvidence(daemonLog, fortressId);
+    await appendEgressEvidence(daemonLog, "foreign-agent");
+
+    const claim = await resolveWrapProtectionClaim({
+      auditLog: new AuditLog(storage, masterKey),
+      auditStorage: storage,
+      masterKey,
+      autoProvisionSummary: {
+        ran: true,
+        outcome: { kind: "armed-exclusive", uid: 503, generationId: 9 },
+      },
+      castleWallDaemonLivenessSince: livenessSince,
+      storagePath,
+      providerTimeoutMs: 20,
+      resolveExclusiveEgress: async () => exclusiveStatus(),
+    });
+
+    expect(claim.state).toBe("unknown");
+    expect(claim.basis).toBe("insufficient_evidence");
+    expect(protectionStateAdvice(claim).castleWallLabel).not.toContain(
+      "Castle Wall Full",
+    );
   });
 
   it("split-migrated fortress can reach green from operator evidence when the daemon chain is permission-unreadable", async () => {
