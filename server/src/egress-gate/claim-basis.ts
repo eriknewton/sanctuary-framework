@@ -1670,10 +1670,12 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
 /**
  * Per-file counts of DETECTOR-VISIBLE claim literals, as of fix-round 3.
  *
- * This is the ratchet. `claim-basis-structural.test.ts` recomputes these and
- * fails when a file's count moves, which forces the author of a new claim to
- * come here and classify it. A count that legitimately changes is updated in
- * the same commit as the claim -- that is the whole mechanism.
+ * This is the ratchet. `claim-basis-structural.test.ts` derives the tracked
+ * file set from the scoped source directories, recomputes these counts, and
+ * fails when either a file is missing from this map or a count moves. A count
+ * that legitimately changes is updated in the same commit as the claim -- that
+ * is the whole mechanism. Zero-literal files are listed intentionally: absence
+ * means "untracked", not "zero".
  *
  * BOUND, STATED PLAINLY: this catches claims the detector's literal set
  * matches. It does not catch a new `Promise<void>`-shaped claim; those live in
@@ -1688,20 +1690,41 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
  * not a count.
  */
 export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
-  [`${EG}/arming-wiring.ts`]: 21,
-  [`${EG}/gate-credential.ts`]: 2,
-  [`${EG}/harness-daemon.ts`]: 12,
-  [`${EG}/liveness-oracle.ts`]: 2,
-  [`${EG}/posture.ts`]: 1,
-  [`${EG}/parked-claim.ts`]: 1,
-  [`${EG}/release-barrier.ts`]: 15,
+  [`${CW}/account.ts`]: 1,
+  [`${CW}/detect.ts`]: 0,
   [`${CW}/egress.ts`]: 4,
   [`${CW}/exclusive-arm.ts`]: 3,
   [`${CW}/exclusive-unprotect.ts`]: 4,
+  [`${CW}/harness-argv.ts`]: 0,
+  [`${CW}/index.ts`]: 0,
+  [`${CW}/lockfile.ts`]: 0,
   [`${CW}/orchestrate.ts`]: 9,
+  [`${CW}/policy-daemon.ts`]: 0,
+  [`${CW}/rehome.ts`]: 0,
   [`${CW}/uid-gate.ts`]: 2,
   [`${CW}/unprovision.ts`]: 4,
   [`${CW}/verify.ts`]: 1,
+  [`${EG}/anchor-registry.ts`]: 0,
+  [`${EG}/arming-wiring.ts`]: 21,
+  [`${EG}/claim-basis.ts`]: 3,
+  [`${EG}/drift-guard.ts`]: 0,
+  [`${EG}/exec-runner.ts`]: 0,
+  [`${EG}/gate-account.ts`]: 0,
+  [`${EG}/gate-client-auth.ts`]: 0,
+  [`${EG}/gate-credential.ts`]: 2,
+  [`${EG}/gate-daemon.ts`]: 0,
+  [`${EG}/gate-server.ts`]: 0,
+  [`${EG}/generation.ts`]: 0,
+  [`${EG}/harness-daemon.ts`]: 12,
+  [`${EG}/index.ts`]: 0,
+  [`${EG}/liveness-oracle.ts`]: 2,
+  [`${EG}/parity.ts`]: 0,
+  [`${EG}/parked-claim.ts`]: 1,
+  [`${EG}/peer-identity.ts`]: 0,
+  [`${EG}/pf-anchor.ts`]: 0,
+  [`${EG}/posture.ts`]: 1,
+  [`${EG}/release-barrier.ts`]: 15,
+  [`${EG}/runtime-fs-plan.ts`]: 0,
 };
 
 /**

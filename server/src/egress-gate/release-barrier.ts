@@ -79,7 +79,6 @@ import { isAbsolute } from "node:path";
 import {
   AGENT_HARNESS_DAEMON_LABEL,
   AGENT_HARNESS_DAEMON_PLIST_PATH,
-  awaitHarnessStoppedVia,
   launchctlBootoutWasInProgress,
   launchctlBootoutWasNotLoaded,
   renderAgentHarnessDaemonPlist,
@@ -620,7 +619,7 @@ export interface HarnessStandDownSnapshot {
   priorPlistContent?: string;
   /** launchd knew (had bootstrapped) the job before the stand-down. */
   wasInstalled: boolean;
-  /** launchd reported a running pid for the job before the stand-down. */
+  /** launchd reported a live pid, stable or not, for the job before the stand-down. */
   wasRunning: boolean;
   /**
    * TRUE when this install modified state that existed before this run: a
@@ -736,6 +735,10 @@ export async function executeParkedHarnessInstall(
         "overwrite the harness plist or stand a job down against unknown launchd state",
     );
   }
+  // The production status op may downgrade `running` to false when the pid is
+  // not stable. That is useful for "started" assertions, but for stand-down
+  // rollback any pid means this run is about to stop a live process.
+  const beforeLive = before.running || before.pid !== undefined;
 
   if (priorPlistContent !== undefined) {
     // IDENTITY GATE. `plan.harnessLabel` is a HOST SINGLETON: one label, one
@@ -761,7 +764,7 @@ export async function executeParkedHarnessInstall(
     // operator behaviour after a failure, and it must not boot that agent out
     // at step 6 of 11 on the way to a run that may abort at any later gate.
     const priorProgram = readPlistFirstProgramArgument(priorPlistContent);
-    if (priorProgram === plan.wrapperPath && before.running) {
+    if (priorProgram === plan.wrapperPath && beforeLive) {
       throw new ReleaseBarrierError(
         "the agent harness is ALREADY running under a committed exclusive-egress generation (its plist " +
           "routes through the release wrapper and launchd reports it running). Refusing to stop a live " +
@@ -777,7 +780,7 @@ export async function executeParkedHarnessInstall(
   // start it again FROM. Standing it down would be a one-way door -- the only
   // failure mode in this function where the operator's agent cannot be put
   // back at all. Refuse in the read-only phase, where refusing is free.
-  if (before.running && priorPlistContent === undefined) {
+  if (beforeLive && priorPlistContent === undefined) {
     throw new ReleaseBarrierError(
       `launchd reports ${plan.harnessLabel} RUNNING but there is no plist at ${plan.plistPath} to restore it ` +
         "from. This install would have to stop that agent, and could not start it again if this run later " +
@@ -790,7 +793,7 @@ export async function executeParkedHarnessInstall(
   const snapshot: HarnessStandDownSnapshot = {
     priorPlistContent,
     wasInstalled: before.installed,
-    wasRunning: before.running,
+    wasRunning: beforeLive,
     preexistingJobModified: priorPlistContent !== undefined || before.installed,
     plistPath: plan.plistPath,
     harnessLabel: plan.harnessLabel,
@@ -869,15 +872,16 @@ async function executeParkedHarnessInstallMutation(
   // process is already reaped -- a single sample turned "stopping" into a
   // refusal. Sampling until it stops only ever DELAYS a refusal; a job that
   // never stops still refuses, exactly as before.
-  const status = await awaitHarnessStopped(ops);
-  if (!status.known) {
+  const claim = await assessHarnessParked({ probe: ops });
+  if (claim.state === "unknown") {
     throw new ReleaseBarrierError(
       "launchctl did not return a trustworthy harness status after the parked install; refusing to report parked",
     );
   }
-  if (status.running) {
+  if (claim.state === "alive") {
     throw new ReleaseBarrierError(
-      "the harness job reports RUNNING after a parked install; the park did not hold (manual intervention required)",
+      `the harness job reports RUNNING after a parked install (${claim.observed}); the park did not hold ` +
+        "(manual intervention required)",
     );
   }
 }
@@ -965,15 +969,6 @@ async function revertFailedParkedInstall(
  * instruction premised on a state is a claim about that state. Every consumer
  * receives a branded {@link RunStateAdvice} and prints its `text`.
  */
-
-/**
- * The stand-down's stopped-settle, now the SHARED loop (fix-round 3): the same
- * bound the teardown and the changed-plist reload use, so the three sites
- * cannot drift into disagreeing about how long "stopped" takes to be true.
- */
-async function awaitHarnessStopped(ops: ParkedInstallOps): Promise<HarnessDaemonStatus> {
-  return awaitHarnessStoppedVia(() => ops.harnessStatus(), ops.sleepMs);
-}
 
 /**
  * Injected side effects for {@link revertParkedHarnessInstall}.
@@ -1630,9 +1625,10 @@ async function parkedOutcome(
  *     both after bootstrap and after the final boot-state re-park -- a
  *     kickstart whose process immediately exits (a refusing wrapper) is a
  *     parked abort, never a silent green.
- *   - EVERY abort branch removes the hold file, leaves the job disabled, and
- *     (once the released plist may be on disk) restores the parked plist
- *     (fail-closed; a cleanup failure is reported, never swallowed).
+ *   - Parked abort outcomes remove the hold file, leave the job disabled, and
+ *     (once the released plist may be on disk) restore the parked plist
+ *     (fail-closed; a cleanup failure is reported, never swallowed). Throws
+ *     before such an outcome are caller-degraded rather than represented here.
  *   - The FIRST step re-asserts the parked state (bootout any live job +
  *     disable + remove any stale hold file + restore the parked plist) so a
  *     crashed previous run -- or a coarse-mode-running harness on the repair

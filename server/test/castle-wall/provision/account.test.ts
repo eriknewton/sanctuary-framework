@@ -103,7 +103,7 @@ describe("castle-wall/provision/account", () => {
 
   describe("parseHighestAssignedUidFromDsclList", () => {
     it("parses negative macOS uids instead of dropping their lines", () => {
-      const stdout = "nobody -2\nagentmac 501\nsanctuary-hermes 502\n";
+      const stdout = "nobody -2\nagentmac 501\nroot 0\nsanctuary-hermes 502\n";
       expect(parseHighestAssignedUidFromDsclList(stdout, CEILING - 1)).toBe(502);
     });
 
@@ -116,9 +116,19 @@ describe("castle-wall/provision/account", () => {
       );
     });
 
-    it("returns the floor for empty uid enumeration output", () => {
-      expect(parseHighestAssignedUidFromDsclList("", CEILING - 1)).toBe(CEILING - 1);
-      expect(parseHighestAssignedUidFromDsclList("\n  \n", CEILING - 1)).toBe(CEILING - 1);
+    it.each([
+      ["empty", ""],
+      ["whitespace-only", "\n  \n\t"],
+      ["CRLF-only", "\r\n\r\n"],
+      ["truncated-without-root", "daemon 1\nnobody -2\nagentmac 501\n"],
+    ])("refuses %s uid enumeration output because the complete local census must include root uid 0", (_name, stdout) => {
+      expect(() => parseHighestAssignedUidFromDsclList(stdout, CEILING - 1)).toThrow(AccountUidEnumerationError);
+      expect(() => parseHighestAssignedUidFromDsclList(stdout, CEILING - 1)).toThrow(/root uid record \(root 0\)/);
+    });
+
+    it("parses a realistic complete census and returns the highest uid", () => {
+      const stdout = "daemon 1\nnobody -2\nroot 0\nagentmac 501\n";
+      expect(parseHighestAssignedUidFromDsclList(stdout, CEILING - 1)).toBe(501);
     });
   });
 

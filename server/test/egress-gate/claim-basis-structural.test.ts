@@ -46,6 +46,7 @@ import {
 } from "../../src/egress-gate/claim-basis.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const CLAIM_LITERAL_SCANNED_DIRS = ["server/src/egress-gate", "server/src/castle-wall/provision"] as const;
 
 function readSource(repoRelative: string): string {
   return readFileSync(join(REPO_ROOT, repoRelative), "utf8");
@@ -171,6 +172,15 @@ describe("claim register: every claim is observed, weakened, or documented", () 
 describe("claim register: the literal ratchet", () => {
   it("matches the recorded per-file claim-literal counts", () => {
     const drift: string[] = [];
+    const tracked = Object.keys(CLAIM_LITERAL_COUNTS).sort();
+    const expectedFiles = CLAIM_LITERAL_SCANNED_DIRS.flatMap((dir) =>
+      readdirSync(join(REPO_ROOT, dir))
+        .filter((f) => f.endsWith(".ts"))
+        .map((f) => `${dir}/${f}`),
+    ).sort();
+    expect(tracked, "claim-literal ratchet must track every scoped source file, including zero-count files").toEqual(
+      expectedFiles,
+    );
     for (const [file, expected] of Object.entries(CLAIM_LITERAL_COUNTS)) {
       const actual = countClaimLiterals(readSource(file));
       if (actual !== expected) {

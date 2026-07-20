@@ -145,7 +145,7 @@ export class AccountProvisionVerificationError extends Error {
 export const EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN = true;
 export const EXPECTED_SERVICE_ACCOUNT_SHELL = "/usr/bin/false";
 
-const DSCL_UNIQUE_ID_LIST_LINE_RE = /^\s*\S+\s+(-?\d+)\s*$/;
+const DSCL_UNIQUE_ID_LIST_LINE_RE = /^\s*(\S+)\s+(-?\d+)\s*$/;
 
 export interface AccountProvisionRollbackResult {
   readonly message: string;
@@ -244,6 +244,9 @@ export function describeServiceAccountRecord(record: ServiceAccountRecord | unde
  * Negative UIDs are valid on macOS (`nobody -2`) and must parse rather than be
  * silently dropped. Any non-empty unparseable line fails closed because a
  * partial UID census can allocate a new service account onto a live account.
+ * A complete macOS local-node census always contains `root 0`; because dscl
+ * emits names alphabetically, root appears near the end, so a census without it
+ * is either empty, not the local node, or truncated before the tail.
  */
 export function parseHighestAssignedUidFromDsclList(stdout: string, floor: number): number {
   if (!Number.isSafeInteger(floor)) {
@@ -253,6 +256,7 @@ export function parseHighestAssignedUidFromDsclList(stdout: string, floor: numbe
   let highest = floor;
   let total = 0;
   let parsed = 0;
+  let sawRootUidZero = false;
   const badLineNumbers: number[] = [];
   const lines = stdout.split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
@@ -260,12 +264,13 @@ export function parseHighestAssignedUidFromDsclList(stdout: string, floor: numbe
     if (line.trim().length === 0) continue;
     total += 1;
     const match = DSCL_UNIQUE_ID_LIST_LINE_RE.exec(line);
-    const uid = match === null ? Number.NaN : Number(match[1]);
+    const uid = match === null ? Number.NaN : Number(match[2]);
     if (match === null || !Number.isSafeInteger(uid)) {
       badLineNumbers.push(index + 1);
       continue;
     }
     parsed += 1;
+    if (match[1] === "root" && uid === 0) sawRootUidZero = true;
     highest = Math.max(highest, uid);
   }
 
@@ -278,6 +283,16 @@ export function parseHighestAssignedUidFromDsclList(stdout: string, floor: numbe
         `(${badLineNumbers.length} unparseable at line${badLineNumbers.length === 1 ? "" : "s"} ${shown}${suffix}). ` +
         `Run /usr/bin/dscl . -list /Users UniqueID locally and repair DirectoryService output before rerunning; ` +
         `silent UID drops can allocate a new service account onto a live account.`,
+    );
+  }
+
+  if (!sawRootUidZero) {
+    throw new AccountUidEnumerationError(
+      `Refusing to choose a service uid: dscl . -list /Users UniqueID returned ${total} non-empty ` +
+        `line${total === 1 ? "" : "s"} and ${parsed} parsed record${parsed === 1 ? "" : "s"}, but did not ` +
+        `include the required macOS local-node root uid record (root 0). ` +
+        `Run /usr/bin/dscl . -list /Users UniqueID locally and rerun only after it returns a complete local-user ` +
+        `census including root; an incomplete UID census can allocate a new service account onto a live account.`,
     );
   }
 

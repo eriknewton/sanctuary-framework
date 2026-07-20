@@ -175,6 +175,18 @@ describe("egress-gate/gate-account", () => {
         { existingUid: undefined, highestAssignedUid: 500 },
       ),
     ).toThrow(GateUidCollisionError);
+    expect(() =>
+      planGateAccountProvision(
+        {
+          agentId: "hermes",
+          agentUid: AGENT_UID,
+          ceiling: 500,
+          homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
+          excludeUids: [501],
+        },
+        { existingUid: undefined, highestAssignedUid: 500 },
+      ),
+    ).toThrow(/allow-all open relay/);
   });
 
   for (const { highestAssignedUid, excludedUid } of [

@@ -480,6 +480,18 @@ describe("executeParkedHarnessInstall", () => {
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/RUNNING/);
   });
 
+  it("fails loud when the harness has a live pid even if running is false", async () => {
+    const { ops, log } = makeParkedOps({
+      priorPlist: priorPlistFor("sanctuary-hermes"),
+      statusSamples: [
+        { known: true, installed: true, running: false, pid: 9001 },
+        { known: true, installed: true, running: false, pid: 9001 },
+      ],
+    });
+    await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/pid \(9001\)/);
+    expect(log.jobRunning).toBe(true);
+  });
+
   it("fails loud when the harness status is not trustworthy", async () => {
     const { ops } = makeParkedOps({ known: false });
     await expect(executeParkedHarnessInstall(plan, ops)).rejects.toThrow(/trustworthy/);
