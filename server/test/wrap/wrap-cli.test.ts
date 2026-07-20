@@ -263,8 +263,9 @@ describe("formatWrapSuccess", () => {
 
   it("points unbindable subject evidence at the uid confinement path without turning green", () => {
     const expectedImperative =
-      "Re-run 'sudo sanctuary protect --hermes --exclusive-egress' to provision uid confinement; " +
-      "that path arms Castle Wall with '--agent-uid' so per-agent enforcement evidence can bind to this wrapped agent.";
+      "Ensure this wrapped agent is uid-confined, then bind Castle Wall to that uid with " +
+      "'sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500'; " +
+      "reload or re-arm Castle Wall so per-agent enforcement evidence can bind to this wrapped agent.";
     const cases = [
       "subject_unbound_evidence",
       "subject_unresolvable",
@@ -281,6 +282,7 @@ describe("formatWrapSuccess", () => {
       expect(protection.basis).toBe(basis);
       expect(advice.green).toBe(false);
       expect(advice.imperative).toBe(expectedImperative);
+      expect(advice.imperative).not.toContain("--hermes");
     }
   });
 

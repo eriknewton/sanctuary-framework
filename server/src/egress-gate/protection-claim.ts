@@ -218,8 +218,9 @@ export function protectionStateAdvice(
   const repairImperative =
     "Run 'sudo sanctuary protect --repair-egress-gate' to repair fine-grained exclusive egress.";
   const bindSubjectImperative =
-    "Re-run 'sudo sanctuary protect --hermes --exclusive-egress' to provision uid confinement; " +
-    "that path arms Castle Wall with '--agent-uid' so per-agent enforcement evidence can bind to this wrapped agent.";
+    "Ensure this wrapped agent is uid-confined, then bind Castle Wall to that uid with " +
+    "'sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500'; " +
+    "reload or re-arm Castle Wall so per-agent enforcement evidence can bind to this wrapped agent.";
   switch (claim.state) {
     case "exclusive":
       return {
