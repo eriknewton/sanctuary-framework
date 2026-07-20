@@ -1242,10 +1242,10 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     branches: "single",
   },
   "gate-account.rollback-incomplete": {
-    file: `${EG}/gate-account.ts`,
-    symbol: "rollbackIncompleteGateAccount",
+    file: `${CW}/account.ts`,
+    symbol: "rollbackCreatedServiceAccount",
     claim:
-      "a fresh-create gate account recovery reports whether absence was observed before any deletion was attempted, or whether a record was left in place for repair; it never claims deletion",
+      "a fresh-create gate account recovery inherits the shared observed account rollback: it reports whether absence was observed before any deletion was attempted, or whether a record was left in place for repair; it never claims deletion",
     basis: "observed",
     detectorBlind: true,
     layer: "compute",

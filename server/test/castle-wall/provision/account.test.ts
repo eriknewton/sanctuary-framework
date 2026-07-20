@@ -37,6 +37,7 @@ function canonicalHome(path: string): string {
 function mockOps(
   overrides: Partial<AccountProvisionOps> & {
     initialRecord?: ServiceAccountRecord;
+    uidNames?: readonly string[];
     createRecord?: (accountName: string, uid: number, homeDirectory: string) => ServiceAccountRecord;
     createThrowsAfterRecord?: Error;
 } = {},
@@ -49,7 +50,7 @@ function mockOps(
   const created: Array<{ accountName: string; uid: number; comment: string | undefined; homeDirectory: string }> = [];
   const hardened: string[] = [];
   const deleted: string[] = [];
-  const { initialRecord, createRecord, createThrowsAfterRecord, ...opsOverrides } = overrides;
+  const { initialRecord, uidNames = [], createRecord, createThrowsAfterRecord, ...opsOverrides } = overrides;
   let record = initialRecord;
   return {
     created,
@@ -62,6 +63,7 @@ function mockOps(
     lookupAccountRecord: async () => record,
     canonicalizeHomeDirectory: async (path) => canonicalHome(path),
     highestAssignedUid: async () => 499,
+    lookupAccountNamesByUid: async () => uidNames,
     createUser: async (accountName, uid, comment, homeDirectory) => {
       created.push({ accountName, uid, comment, homeDirectory });
       record =
@@ -296,6 +298,35 @@ describe("castle-wall/provision/account", () => {
       expect(ops.hardened).toEqual(["sanctuary-hermes"]);
     });
 
+    it("refuses the truncated-census case when the computed uid is directly observed as assigned", async () => {
+      const ops = mockOps({ highestAssignedUid: async () => 502, uidNames: ["sanctuary-agent"] });
+      await expect(
+        planAndCreateAccount(
+          { accountName: "sanctuary-hermes-two", ceiling: CEILING, homeDirectory: "/var/sanctuary-agents/two" },
+          ops,
+        ),
+      ).rejects.toThrow(/uid 503.*"sanctuary-agent".*UID census is only a candidate-selection input/s);
+      expect(ops.created).toEqual([]);
+      expect(ops.hardened).toEqual([]);
+    });
+
+    it("refuses an agent-account create whose computed uid collides with a known-live excluded uid", async () => {
+      const ops = mockOps({ highestAssignedUid: async () => 502 });
+      await expect(
+        planAndCreateAccount(
+          {
+            accountName: "sanctuary-hermes-two",
+            ceiling: CEILING,
+            homeDirectory: "/var/sanctuary-agents/two",
+            excludedUids: [503],
+          },
+          ops,
+        ),
+      ).rejects.toThrow(/known-live excluded uid \(503\)/);
+      expect(ops.created).toEqual([]);
+      expect(ops.hardened).toEqual([]);
+    });
+
     it("is idempotent: a second run against an ops that now reports the account existing plans skip", async () => {
       const ops = mockOps({ initialRecord: completeRecord(500), highestAssignedUid: async () => 510 });
       const { plan, uid } = await planAndCreateAccount(
@@ -377,6 +408,7 @@ describe("castle-wall/provision/account", () => {
         },
         canonicalizeHomeDirectory: async (path) => canonicalHome(path),
         highestAssignedUid: async () => 499,
+        lookupAccountNamesByUid: async () => (record === undefined ? [] : ["sanctuary-hermes"]),
         createUser: async () => {
           throw new Error("user already exists");
         },
@@ -419,6 +451,7 @@ describe("castle-wall/provision/account", () => {
         },
         canonicalizeHomeDirectory: async (path) => canonicalHome(path),
         highestAssignedUid: async () => 499,
+        lookupAccountNamesByUid: async () => [],
         createUser: async (_accountName, uid, _comment, homeDirectory) => {
           record = { uid, homeDirectory, userShell: "/usr/bin/false" };
         },
@@ -447,6 +480,7 @@ describe("castle-wall/provision/account", () => {
         },
         canonicalizeHomeDirectory: async (path) => canonicalHome(path),
         highestAssignedUid: async () => 499,
+        lookupAccountNamesByUid: async () => [],
         createUser: async (_accountName, uid, _comment, homeDirectory) => {
           record = { uid, homeDirectory, userShell: "/usr/bin/false" };
         },
@@ -493,6 +527,7 @@ describe("castle-wall/provision/account", () => {
           highestCalls += 1;
           return 499;
         },
+        lookupAccountNamesByUid: async () => [],
         createUser: async () => {
           created = true;
         },

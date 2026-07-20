@@ -38,14 +38,11 @@
  */
 
 import {
-  describeServiceAccountRecord,
-  lookupAccountRecordAfterCreate,
+  executeAccountProvisionPlan,
   planAccountCreate,
-  rollbackCreatedServiceAccount,
   SAFE_SERVICE_ACCOUNT_RE,
   serviceAccountConflictGuidance,
   serviceAccountRepairGuidance,
-  serviceAccountRecordProblems,
   type AccountProvisionOptions,
   type AccountProvisionOps,
   type AccountProvisionPlan,
@@ -121,11 +118,13 @@ export type GateAccountProvisionOps = AccountProvisionOps;
 export function gateAccountProvisionOptions(
   options: GateAccountProvisionOptions,
 ): AccountProvisionOptions {
+  const excludedUids = [options.agentUid, ...(options.excludeUids ?? [])];
   return {
     accountName: deriveGateAccountName(options.agentId),
     ceiling: options.ceiling,
     homeDirectory: options.homeDirectory,
     comment: options.comment ?? `Sanctuary exclusive-egress gate service account for agent ${options.agentId}`,
+    excludedUids,
   };
 }
 
@@ -147,17 +146,6 @@ export class GateAccountVerificationError extends Error {
     super(message, options);
     this.name = "GateAccountVerificationError";
   }
-}
-
-async function rollbackIncompleteGateAccount(
-  ops: GateAccountProvisionOps,
-  accountName: string,
-  input: { readonly plannedUid: number | undefined },
-): Promise<string> {
-  if (input.plannedUid === undefined) {
-    return "rollback NOT attempted: account record existed before this run; leaving it for inspection";
-  }
-  return (await rollbackCreatedServiceAccount(ops, accountName, input.plannedUid)).message;
 }
 
 /**
@@ -248,86 +236,11 @@ export async function planAndCreateGateAccount(
   // planGateAccountProvision applies the fail-closed agent/operator uid exclusion
   // (Codex F2) BEFORE any create side effect runs.
   const plan = planGateAccountProvision(options, { existingUid, highestAssignedUid });
-  if (plan.action === "conflict") {
-    throw new Error(
-      `${plan.reason} ${serviceAccountConflictGuidance(provisionOptions.accountName, {
-        homeDirectory: provisionOptions.homeDirectory,
-        ceiling: provisionOptions.ceiling,
-        excludedUids: [options.agentUid, ...(options.excludeUids ?? [])],
-      })}`,
-    );
-  }
-
-  const expected = { uid: plan.uid, homeDirectory: provisionOptions.homeDirectory };
-  if (plan.action === "skip") {
-    const problems = await serviceAccountRecordProblems(existingRecord, expected, ops);
-    if (problems.length === 0) {
-      return {
-        plan,
-        uid: plan.uid,
-        accountName: provisionOptions.accountName,
-        observed: describeServiceAccountRecord(existingRecord),
-      };
-    }
-    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
-      plannedUid: undefined,
-    });
-    throw new GateAccountVerificationError(
-      `Existing gate account "${provisionOptions.accountName}" is incomplete (${problems.join("; ")}). ` +
-        `${rollback}. Refusing to proceed with a partial gate account. ` +
-        serviceAccountRepairGuidance(provisionOptions.accountName, expected),
-    );
-  }
-
-  try {
-    await ops.createUser(
-      plan.accountName,
-      plan.uid,
-      provisionOptions.comment,
-      provisionOptions.homeDirectory,
-    );
-    await ops.hardenCreatedUser(plan.accountName);
-  } catch (err) {
-    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
-      plannedUid: plan.uid,
-    });
-    throw new GateAccountVerificationError(
-      `Creating gate account "${provisionOptions.accountName}" failed ` +
-        `(${err instanceof Error ? err.message : String(err)}). ${rollback}. ` +
-        serviceAccountRepairGuidance(provisionOptions.accountName, expected),
-      { cause: err },
-    );
-  }
-
-  let observed: GateAccountRecord | undefined;
-  try {
-    observed = await lookupAccountRecordAfterCreate(ops, provisionOptions.accountName);
-  } catch (err) {
-    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
-      plannedUid: plan.uid,
-    });
-    throw new GateAccountVerificationError(
-      `Gate account "${provisionOptions.accountName}" create returned, but the post-create record could not be read ` +
-        `(${err instanceof Error ? err.message : String(err)}). ${rollback}. ` +
-        serviceAccountRepairGuidance(provisionOptions.accountName, expected),
-      { cause: err },
-    );
-  }
-  const problems = await serviceAccountRecordProblems(observed, expected, ops);
-  if (problems.length > 0) {
-    const rollback = await rollbackIncompleteGateAccount(ops, provisionOptions.accountName, {
-      plannedUid: plan.uid,
-    });
-    throw new GateAccountVerificationError(
-      `Gate account "${provisionOptions.accountName}" create did not verify (${problems.join("; ")}). ` +
-        `Observed ${describeServiceAccountRecord(observed)}. ${rollback}. ` +
-        serviceAccountRepairGuidance(provisionOptions.accountName, expected),
-    );
-  }
+  const result = await executeAccountProvisionPlan(plan, provisionOptions, ops);
   return {
     plan,
-    uid: plan.uid,
+    uid: result.uid,
     accountName: provisionOptions.accountName,
-    observed: describeServiceAccountRecord(observed),
+    observed: result.observed,
   };
 }

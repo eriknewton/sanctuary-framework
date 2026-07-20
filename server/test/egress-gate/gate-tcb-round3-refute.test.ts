@@ -171,6 +171,7 @@ describe("round-3 fix (2) refute: gate uid can never collide with the agent uid"
       canonicalizeHomeDirectory: (path) => Promise.resolve(path),
       // highest is one below the agent uid so the computed create uid == agent uid.
       highestAssignedUid: () => Promise.resolve(AGENT_UID - 1),
+      lookupAccountNamesByUid: () => Promise.resolve([]),
       createUser: (_accountName, uid, _comment, homeDirectory) => {
         createdUid = uid;
         record = { uid, homeDirectory, userShell: "/usr/bin/false" };

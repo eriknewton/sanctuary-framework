@@ -135,6 +135,13 @@ describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix ro
     );
   });
 
+  it("A3: agent account creation has a direct candidate-uid observation and excluded-uid backstop", async () => {
+    const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
+    expect(source).toContain("excludedUids: excludedAgentAccountUids");
+    expect(source).toContain("lookupAccountNamesByUid: async (uid: number)");
+    expect(source).toContain('[".", "-search", "/Users", "UniqueID", String(uid)]');
+  });
+
   it("B4: an execFile maxBuffer overflow is explicit unknown, not a normal exit-1 record absence", () => {
     expect(
       decideDsclRecordRead({

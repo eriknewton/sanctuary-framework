@@ -992,6 +992,10 @@ export async function runAutoProvisionForWrap(
     candidateUid !== undefined && candidateUid >= PROVISION_CEILING && candidateUid !== consoleOwnerUid
       ? await resolveAccountShapeVerdict(accountName, candidateUid)
       : undefined;
+  const excludedAgentAccountUids = [
+    consoleOwnerUid,
+    ...(candidateUid !== undefined && accountShapeVerdict !== "verified-dedicated" ? [candidateUid] : []),
+  ];
   const detectResult = detectProvisionNeed({
     harnessConfiguredUid,
     runningAgentUid,
@@ -1115,7 +1119,12 @@ export async function runAutoProvisionForWrap(
       // time, so the confined harness resolves ~/.hermes to where the
       // secrets actually get moved.
       return planAndCreateAccount(
-        { accountName, ceiling: PROVISION_CEILING, homeDirectory: newAccountHome },
+        {
+          accountName,
+          ceiling: PROVISION_CEILING,
+          homeDirectory: newAccountHome,
+          excludedUids: excludedAgentAccountUids,
+        },
         realAccountProvisionOps(),
       );
     },
@@ -2142,6 +2151,16 @@ function realAccountProvisionOps() {
     highestAssignedUid: async (): Promise<number> => {
       const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-list", "/Users", "UniqueID"]);
       return parseHighestAssignedUidFromDsclList(stdout, PROVISION_CEILING - 1);
+    },
+    lookupAccountNamesByUid: async (uid: number): Promise<readonly string[]> => {
+      if (!Number.isSafeInteger(uid)) {
+        throw new Error(`uid must be a safe integer for direct lookup (got ${String(uid)})`);
+      }
+      const result = await dsclReadResult([".", "-search", "/Users", "UniqueID", String(uid)]);
+      if (result.code !== 0) {
+        throw new Error(`dscl could not search accounts by uid ${uid} (${dsclDiagnostic(result)})`);
+      }
+      return parseDsclSearchAccountNames(result.stdout);
     },
     lookupAccountRecord: async (
       accountName: string,

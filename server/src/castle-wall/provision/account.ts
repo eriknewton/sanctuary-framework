@@ -64,6 +64,12 @@ export interface AccountProvisionOptions {
    * `planAccountCreate` throws if this is absent for a `create` plan.
    */
   homeDirectory: string;
+  /**
+   * Known-live uids this service account must never reuse. This is a
+   * caller-provided backstop for live principals the UID census might miss
+   * (for example the console operator or a previously-observed agent/gate uid).
+   */
+  excludedUids?: readonly number[];
 }
 
 /** The directory-service fields that settle the service-account shape this module creates. */
@@ -94,8 +100,19 @@ export interface AccountProvisionOps {
    * inject the same behavior deterministically.
    */
   canonicalizeHomeDirectory(path: string): Promise<string>;
-  /** Return the highest uid currently assigned to any local account. */
+  /**
+   * Return the highest uid visible in the local account census. This is only
+   * a candidate-selection input; create safety is settled by a direct
+   * per-candidate uid lookup immediately before `createUser`.
+   */
   highestAssignedUid(): Promise<number>;
+  /**
+   * Return account names currently assigned to this exact uid, using a bounded
+   * uid-specific directory-service lookup (for example
+   * `dscl . -search /Users UniqueID <uid>`). A lookup failure must throw so the
+   * create path refuses rather than treating unknown state as unassigned.
+   */
+  lookupAccountNamesByUid(uid: number): Promise<readonly string[]>;
   /**
    * Create the no-login service account with the given uid. Must set
    * `UserShell=/usr/bin/false`, no admin group membership, no interactive
@@ -240,13 +257,13 @@ export function describeServiceAccountRecord(record: ServiceAccountRecord | unde
 }
 
 /**
- * Parse `dscl . -list /Users UniqueID` output into the highest assigned UID.
+ * Parse `dscl . -list /Users UniqueID` output into the highest visible UID.
  * Negative UIDs are valid on macOS (`nobody -2`) and must parse rather than be
  * silently dropped. Any non-empty unparseable line fails closed because a
- * partial UID census can allocate a new service account onto a live account.
- * A complete macOS local-node census always contains `root 0`; because dscl
- * emits names alphabetically, root appears near the end, so a census without it
- * is either empty, not the local node, or truncated before the tail.
+ * malformed UID census is not a trustworthy candidate-selection input. `root 0`
+ * remains a cheap local-node sanity signal, not a completeness proof: names can
+ * sort after root, so create safety is settled by a direct lookup of the exact
+ * candidate uid before mutation.
  */
 export function parseHighestAssignedUidFromDsclList(stdout: string, floor: number): number {
   if (!Number.isSafeInteger(floor)) {
@@ -291,8 +308,8 @@ export function parseHighestAssignedUidFromDsclList(stdout: string, floor: numbe
       `Refusing to choose a service uid: dscl . -list /Users UniqueID returned ${total} non-empty ` +
         `line${total === 1 ? "" : "s"} and ${parsed} parsed record${parsed === 1 ? "" : "s"}, but did not ` +
         `include the required macOS local-node root uid record (root 0). ` +
-        `Run /usr/bin/dscl . -list /Users UniqueID locally and rerun only after it returns a complete local-user ` +
-        `census including root; an incomplete UID census can allocate a new service account onto a live account.`,
+        `Run /usr/bin/dscl . -list /Users UniqueID locally and rerun only after it returns the local root record; ` +
+        `an untrusted UID census is not a safe input for service-account allocation.`,
     );
   }
 
@@ -357,10 +374,10 @@ export async function serviceAccountRecordProblems(
  *   of the same name, or a prior provision used a different ceiling).
  *   Refuse rather than silently reassigning -- an account rename/uid change
  *   is out of scope and could strand file ownership.
- * - `create`: no account with this name exists. uid = lowest free integer
- *   at or above the ceiling and greater than every currently-assigned uid,
- *   so the new account can never collide with an existing one and is always
- *   >= ceiling (satisfying `validateAgentOrigin`'s floor).
+ * - `create`: no account with this name exists. uid = the candidate integer
+ *   at or above the ceiling and greater than the highest uid visible in the
+ *   census. Execution must still directly observe that this exact candidate
+ *   uid is unassigned before creating it.
  */
 export function planAccountCreate(
   options: AccountProvisionOptions,
@@ -406,6 +423,72 @@ export function planAccountCreate(
 
   const uid = Math.max(ceiling, probe.highestAssignedUid + 1);
   return { action: "create", accountName, uid };
+}
+
+function sortedUniqueSafeUids(uids: readonly number[] | undefined): number[] {
+  const unique = new Set<number>();
+  for (const uid of uids ?? []) {
+    if (!Number.isSafeInteger(uid)) {
+      throw new AccountProvisionVerificationError(
+        `Excluded uid must be a safe integer (got ${String(uid)}); refusing to rely on a malformed live-uid backstop.`,
+      );
+    }
+    unique.add(uid);
+  }
+  return [...unique].sort((a, b) => a - b);
+}
+
+function describeAccountNames(names: readonly string[]): string {
+  return [...new Set(names)].sort().map((name) => JSON.stringify(name)).join(", ");
+}
+
+function assertPlanAvoidsExcludedUids(plan: AccountProvisionPlan, options: AccountProvisionOptions): void {
+  if (plan.action === "conflict") return;
+  const excluded = sortedUniqueSafeUids(options.excludedUids);
+  if (!excluded.includes(plan.uid)) return;
+  throw new AccountProvisionVerificationError(
+    `Refusing to use uid ${plan.uid} for service account "${plan.accountName}": it collides with a known-live ` +
+      `excluded uid (${excluded.join(", ")}). ` +
+      serviceAccountConflictGuidance(plan.accountName, {
+        homeDirectory: options.homeDirectory,
+        ceiling: options.ceiling,
+        excludedUids: excluded,
+      }),
+  );
+}
+
+async function assertCreateUidUnassigned(
+  plan: Extract<AccountProvisionPlan, { action: "create" }>,
+  options: AccountProvisionOptions,
+  ops: Pick<AccountProvisionOps, "lookupAccountNamesByUid">,
+): Promise<void> {
+  let holders: readonly string[];
+  try {
+    holders = await ops.lookupAccountNamesByUid(plan.uid);
+  } catch (err) {
+    throw new AccountProvisionVerificationError(
+      `Refusing to create service account "${plan.accountName}" at uid ${plan.uid}: the candidate uid could not ` +
+        `be directly observed as unassigned ` +
+        `(${err instanceof Error ? err.message : String(err)}). ` +
+        serviceAccountRepairGuidance(plan.accountName, {
+          homeDirectory: options.homeDirectory,
+          uidFloor: options.ceiling,
+          excludedUids: options.excludedUids,
+        }),
+      { cause: err },
+    );
+  }
+  if (holders.length === 0) return;
+  throw new AccountProvisionVerificationError(
+    `Refusing to create service account "${plan.accountName}" at uid ${plan.uid}: direct uid lookup found ` +
+      `${describeAccountNames(holders)} already assigned to that uid. ` +
+      `The UID census is only a candidate-selection input; it is not proof that the candidate uid is unassigned. ` +
+      serviceAccountConflictGuidance(plan.accountName, {
+        homeDirectory: options.homeDirectory,
+        ceiling: options.ceiling,
+        excludedUids: options.excludedUids,
+      }),
+  );
 }
 
 export async function rollbackCreatedServiceAccount(
@@ -479,9 +562,11 @@ export async function executeAccountProvisionPlan(
       `${plan.reason} ${serviceAccountConflictGuidance(plan.accountName, {
         homeDirectory: options.homeDirectory,
         ceiling: options.ceiling,
+        excludedUids: options.excludedUids,
       })}`,
     );
   }
+  assertPlanAvoidsExcludedUids(plan, options);
   const expected = { uid: plan.uid, homeDirectory: options.homeDirectory };
   if (plan.action === "skip") {
     const observed = await ops.lookupAccountRecord(plan.accountName);
@@ -495,6 +580,7 @@ export async function executeAccountProvisionPlan(
     }
     return { uid: plan.uid, observed: describeServiceAccountRecord(observed) };
   }
+  await assertCreateUidUnassigned(plan, options, ops);
   // FIX F7: bind NFSHomeDirectory to the re-home target at create time.
   try {
     await ops.createUser(plan.accountName, plan.uid, options.comment, options.homeDirectory);

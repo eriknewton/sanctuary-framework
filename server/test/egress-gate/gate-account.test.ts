@@ -31,6 +31,7 @@ function canonicalHome(path: string): string {
 function gateOps(input: {
   existing?: GateAccountRecord;
   highest?: number;
+  uidNames?: readonly string[];
   create?: (name: string, uid: number, home: string) => GateAccountRecord | Promise<GateAccountRecord>;
 } = {}): GateAccountProvisionOps & {
   created: Array<{ name: string; uid: number; home: string }>;
@@ -55,6 +56,7 @@ function gateOps(input: {
     lookupAccountRecord: async () => state.record,
     canonicalizeHomeDirectory: async (path) => canonicalHome(path),
     highestAssignedUid: async () => input.highest ?? 504,
+    lookupAccountNamesByUid: async () => input.uidNames ?? [],
     createUser: async (name, uid, _comment, home) => {
       state.created.push({ name, uid, home });
       state.record =
@@ -212,6 +214,24 @@ describe("egress-gate/gate-account", () => {
     });
   }
 
+  it("refuses a gate create when direct uid lookup finds a live non-excluded account dropped by the census", async () => {
+    const ops = gateOps({ highest: 502, uidNames: ["sanctuary-agent"] });
+    await expect(
+      planAndCreateGateAccount(
+        {
+          agentId: "hermes",
+          agentUid: AGENT_UID,
+          ceiling: 500,
+          homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",
+          excludeUids: [501],
+        },
+        ops,
+      ),
+    ).rejects.toThrow(/uid 503.*"sanctuary-agent".*UID census is only a candidate-selection input/s);
+    expect(ops.created).toEqual([]);
+    expect(ops.hardened).toEqual([]);
+  });
+
   it("requires a positive agentUid (fail-closed: the exclusion cannot be skipped)", () => {
     expect(() =>
       planGateAccountProvision(
@@ -301,6 +321,7 @@ describe("egress-gate/gate-account", () => {
         record = completeGateRecord(777);
         return record;
       },
+      lookupAccountNamesByUid: async () => [],
       createUser: async () => {
         throw new Error("user already exists");
       },
@@ -328,6 +349,7 @@ describe("egress-gate/gate-account", () => {
         record = completeGateRecord(505);
         return record;
       },
+      lookupAccountNamesByUid: async () => (record === undefined ? [] : ["sanctuary-gate-hermes"]),
       createUser: async () => {
         throw new Error("user already exists");
       },
@@ -349,7 +371,7 @@ describe("egress-gate/gate-account", () => {
         { agentId: "hermes", agentUid: AGENT_UID, ceiling: 500, homeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes" },
         ops,
       ),
-    ).rejects.toThrow(/Existing gate account .* incomplete/);
+    ).rejects.toThrow(/Existing service account .* incomplete/);
     expect(ops.created).toEqual([]);
     expect(ops.deleted).toEqual([]);
     expect(ops.record).toEqual({ uid: 505 });
@@ -370,6 +392,7 @@ describe("egress-gate/gate-account", () => {
         highestCalls += 1;
         return 504;
       },
+      lookupAccountNamesByUid: async () => [],
       createUser: async () => {
         created = true;
       },
@@ -441,6 +464,7 @@ describe("egress-gate/gate-account", () => {
       },
       canonicalizeHomeDirectory: async (path) => canonicalHome(path),
       highestAssignedUid: async () => 504,
+      lookupAccountNamesByUid: async () => [],
       createUser: async (_name, uid, _comment, home) => {
         record = { uid, homeDirectory: home, userShell: "/usr/bin/false" };
       },
@@ -469,6 +493,7 @@ describe("egress-gate/gate-account", () => {
       },
       canonicalizeHomeDirectory: async (path) => canonicalHome(path),
       highestAssignedUid: async () => 504,
+      lookupAccountNamesByUid: async () => [],
       createUser: async (_name, uid, _comment, home) => {
         record = { uid, homeDirectory: home, userShell: "/usr/bin/false" };
       },
@@ -497,6 +522,7 @@ describe("egress-gate/gate-account", () => {
         if (lookupCalls === 2) throw new Error("DirectoryService read failed");
         return record;
       },
+      lookupAccountNamesByUid: async () => [],
       createUser: async (_name, uid, _comment, home) => {
         record = completeGateRecord(uid, home);
         throw new Error("sysadminctl failed after create");
