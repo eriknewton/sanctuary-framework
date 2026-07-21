@@ -24,7 +24,7 @@
  *    event-driven features." Self-reporting features (Castle Wall) can prove
  *    their own liveness via fresh enforcement evidence, so they earn `armed`;
  *    a fault op flips them to `fault`/red. Slice 2 closes the "daemon silently
- *    died" gap: a periodic, producer-signed liveness heartbeat lets the
+ *    died" gap: a periodic, channel-authenticated (unsigned) liveness heartbeat lets the
  *    absence-of-enforcement case split into an honest alive-but-idle (`unknown`,
  *    `alive_no_recent_enforcement`) vs a silently-dead wall (`fault`/red,
  *    `dead_no_heartbeat`) - the latter the alarm Slice 1 left as a silent
@@ -1398,8 +1398,8 @@ export function evaluateFeatureHealth(args: {
   } else if (feature.liveness === "self_reporting") {
     // Self-reporting: green ONLY on fresh live-adjudication evidence; a fresh
     // fault is red and takes precedence over green ALWAYS. Slice 2 closes the
-    // "daemon silently died" gap Slice 1 left: a periodic, producer-signed
-    // liveness heartbeat lets the ABSENCE-of-enforcement case split into an
+    // "daemon silently died" gap Slice 1 left: a periodic, channel-authenticated
+    // (unsigned) liveness heartbeat lets the ABSENCE-of-enforcement case split into an
     // honest alive-but-idle (`unknown`) vs silently-dead (`fault`/red) reading.
     // The heartbeat NEVER moves the PRESENCE case to green - green stays gated on
     // fresh live-adjudication evidence only.
