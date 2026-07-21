@@ -46,7 +46,11 @@ import { buildCastleWallPosture } from "../../../src/principal-policy/posture.js
 import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 import {
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED,
 } from "../../../src/castle-wall/constants.js";
+import { verifiedCastleWallAuditAttribution } from "../../../src/castle-wall/audit-attribution.js";
+import type { AuditEntry } from "../../../src/operational/audit-log.js";
 import {
   renderProducerKeyDropIn,
   launchLinuxCastleWallDaemon,
@@ -1133,6 +1137,100 @@ describe("C4 — round-3 HIGH: NOT-ARMED record durability + settled-refusal vs 
     }) as AuditSink["append"];
     return appended;
   }
+
+  /**
+   * Spy that records the FULL appended entries (operation + details), so a test
+   * can assert the details a specific record carried, not just its operation.
+   */
+  function spyAppendEntries(
+    log: AuditLog,
+  ): Array<{ operation: string; details?: Record<string, unknown> }> {
+    const entries: Array<{ operation: string; details?: Record<string, unknown> }> = [];
+    const orig = log.append.bind(log);
+    (log as unknown as { append: AuditSink["append"] }).append = ((
+      layer: "l1",
+      operation: string,
+      id: string,
+      details?: Record<string, unknown>,
+      result?: "success" | "failure",
+    ) => {
+      entries.push({ operation, details });
+      return orig(layer, operation, id, details, result);
+    }) as AuditSink["append"];
+    return entries;
+  }
+
+  it("(honesty) the NOT-ARMED castle_wall_drain_failed record uses an UNSIGNED fault basis (never producer_signed) and the read-side attributor fail-closed-rejects it", async () => {
+    // The fault record is a consumer-emitted NOT-ARMED signal written when the
+    // daemon link wedges. It carries NO producer signature, so it must NEVER
+    // claim the `producer_signed` authenticity basis (the mislabel this fixes).
+    // A published key lets activation pass the FIX-1 gate; the fault fires on a
+    // wedged transport, not on any signature check, so the key value is moot.
+    const priv = ed25519.utils.randomPrivateKey();
+    await publishPubKey(tmp, ed25519.getPublicKey(priv));
+    const auditLog = new AuditLog(new MemoryStorage(), generateRandomKey());
+    const entries = spyAppendEntries(auditLog);
+
+    const { activation, scheduled } = await activateWithCapturedLoop({
+      auditSink: auditLog,
+      drainQueue: [],
+    });
+
+    // Wedge the daemon link so the next drain cycle faults → markDrainUnhealthy
+    // → durable NOT-ARMED record.
+    const client = activation.lifecycle.client();
+    (client as unknown as { drainRequest: () => Promise<never> }).drainRequest =
+      async () => {
+        throw new Error("daemon link dropped");
+      };
+    for (let i = 0; i < 100 && scheduled.length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    expect(scheduled.length).toBeGreaterThanOrEqual(1);
+    scheduled[scheduled.length - 1]!();
+    for (let i = 0; i < 100 && activation.drainHealthy(); i++) {
+      await new Promise((r) => setTimeout(r, 1));
+    }
+    await activation.whenDrainSettled();
+    expect(activation.drainHealthy()).toBe(false);
+
+    const faultRecord = entries.find(
+      (e) => e.operation === "castle_wall_drain_failed",
+    );
+    expect(faultRecord).toBeDefined();
+    const details = faultRecord!.details ?? {};
+
+    // HONESTY: the basis is the unsigned fault-specific string, NOT the
+    // producer-signed basis a real verified signature would earn.
+    expect(details.evidence_basis).toBe(
+      CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED,
+    );
+    expect(details.evidence_basis).not.toBe(
+      CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    );
+    expect(details.armed).toBe(false);
+
+    // FAIL-CLOSED: even with a pinned producer key available, the read-side
+    // attributor never treats this fault record as producer-attributed
+    // evidence. It carries no `cw_evidence_basis=producer_signed` marker and no
+    // signature, so verified attribution returns null — it can never be
+    // projected as an armed/attributed agent.
+    const entry: AuditEntry = {
+      timestamp: new Date().toISOString(),
+      layer: "l1",
+      operation: "castle_wall_drain_failed",
+      identity_id: "fortress:test",
+      result: "failure",
+      details,
+    };
+    expect(
+      verifiedCastleWallAuditAttribution(entry, {
+        pinnedProducerKeyB64url: "A".repeat(43),
+      }),
+    ).toBeNull();
+
+    await activation.stop();
+  });
 
   it("(b) a SETTLED producer-signature refusal does NOT stop the drain / does NOT trip NOT-ARMED", async () => {
     // The forger mints the marker but no valid signature. The live consumer
