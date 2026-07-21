@@ -5,7 +5,10 @@ import { dirname, join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { canonicalize } from "../../../src/mesh/canonical-json.js";
-import type { AllowlistManifest } from "../../../src/castle-wall/allowlist/manifest.js";
+import type {
+  AllowlistManifest,
+  SignedManifest,
+} from "../../../src/castle-wall/allowlist/manifest.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 
 interface ManifestParityFixture {
@@ -15,6 +18,19 @@ interface ManifestParityFixture {
   expected_canonical_json_hex: string;
   test_public_key_b64url: string;
   test_signature_b64url: string;
+}
+
+interface ManifestSignatureCase {
+  name: string;
+  signed_manifest: SignedManifest;
+  expected_canonical_json_b64: string;
+  expected_canonical_json_hex: string;
+  test_signature_b64url: string;
+}
+
+interface ManifestSignatureFixture {
+  test_public_key_b64url: string;
+  cases: ManifestSignatureCase[];
 }
 
 async function loadFixture(): Promise<ManifestParityFixture> {
@@ -33,6 +49,12 @@ async function loadNamedFixture(name: string): Promise<ManifestParityFixture> {
   const here = dirname(fileURLToPath(import.meta.url));
   const fixturePath = join(here, `../fixtures/${name}.json`);
   return JSON.parse(await readFile(fixturePath, "utf8")) as ManifestParityFixture;
+}
+
+async function loadSignatureFixture(name: string): Promise<ManifestSignatureFixture> {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const fixturePath = join(here, `../fixtures/${name}.json`);
+  return JSON.parse(await readFile(fixturePath, "utf8")) as ManifestSignatureFixture;
 }
 
 describe("castle-wall manifest canonical parity vector", () => {
@@ -286,6 +308,58 @@ describe("castle-wall manifest canonical parity vector", () => {
         .update(Buffer.from(ruleCanonical))
         .digest("hex");
       expect(digest).toBe(fixture.manifest_signed_body.rules[index]?.sha256);
+    }
+  });
+
+  it("operator-baseline signature fixture: TS canonicalizer verifies all Rust-consumed cases", async () => {
+    const fixture = await loadSignatureFixture("manifest-operator-baseline-cross-lang");
+    const cases = new Map(fixture.cases.map((entry) => [entry.name, entry]));
+
+    expect(cases.get("without-operator-baseline")?.signed_manifest.manifest)
+      .not.toHaveProperty("operator_baseline");
+    expect(
+      cases.get("with-operator-baseline")?.signed_manifest.manifest.operator_baseline,
+    ).toEqual({
+      essentials: [
+        {
+          name: "allfields",
+          signing_id: "com.example.operator.allfields",
+          team_id: "TEAM123456",
+          source_app_identifier: "com.example.operator.source",
+        },
+        {
+          name: "teamonly",
+          team_id: "TEAM654321",
+        },
+      ],
+    });
+    expect(
+      cases.get("empty-operator-baseline")?.signed_manifest.manifest.operator_baseline,
+    ).toEqual({ essentials: [] });
+
+    for (const entry of fixture.cases) {
+      const actualCanonical = new TextEncoder().encode(
+        canonicalize(entry.signed_manifest.manifest),
+      );
+      expect(Buffer.from(actualCanonical).toString("hex")).toBe(
+        entry.expected_canonical_json_hex,
+      );
+      expect(
+        Buffer.compare(
+          Buffer.from(actualCanonical),
+          Buffer.from(entry.expected_canonical_json_b64, "base64"),
+        ),
+      ).toBe(0);
+      expect(entry.signed_manifest.signature.signature_b64url).toBe(
+        entry.test_signature_b64url,
+      );
+      expect(
+        ed25519.verify(
+          Buffer.from(entry.test_signature_b64url, "base64url"),
+          actualCanonical,
+          Buffer.from(fixture.test_public_key_b64url, "base64url"),
+        ),
+      ).toBe(true);
     }
   });
 });

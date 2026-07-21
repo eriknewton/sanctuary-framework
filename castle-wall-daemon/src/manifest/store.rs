@@ -369,6 +369,7 @@ mod tests {
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
             agent_origin: None,
+            operator_baseline: None,
             rules: entries,
         };
         let canonical = canonicalize_to_bytes(&serde_json::to_value(&manifest).unwrap()).unwrap();
