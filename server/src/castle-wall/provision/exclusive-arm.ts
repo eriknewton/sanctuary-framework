@@ -44,6 +44,14 @@ import {
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EXCLUSIVE_EGRESS_ARMED_AUDIT_OP = "exclusive_egress_armed";
 export const EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP = "exclusive_egress_degraded_coarse_active";
+/**
+ * D8 self-heal (2026-07-22): the reconcile preflight removed an ORPHANED
+ * exclusive-routing marker left by a hard-interrupted prior arm. Distinct op
+ * so a fleet operator can prove the self-heal fired and inspect why the marker
+ * was judged orphaned (never a silent mutation -- non-negotiable invariant 3).
+ */
+export const EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP =
+  "exclusive_routing_stale_marker_reconciled";
 export const EGRESS_GATE_REPAIR_AUDIT_OP = "egress_gate_repair";
 export const EGRESS_GATE_REPAIR_REFUSED_AUDIT_OP = "egress_gate_repair_refused";
 export const EGRESS_GATE_REPAIR_OVERRIDE_AUDIT_OP = "egress_gate_repair_override";
@@ -54,6 +62,22 @@ export interface ExclusiveGenerationIdentity {
   generation_id: number;
   agent_uid: number;
   gate_port: number;
+}
+
+/**
+ * Outcome of {@link ExclusiveEgressArmOps.reconcileStaleExclusiveRouting}
+ * (D8 self-heal). `reconciled: true` means an ORPHANED marker (no live
+ * confinement anywhere) was removed; `reconciled: false` means there was
+ * nothing to do (marker absent) OR the marker was KEPT because confinement
+ * may be live (`reason` says which). A malformed marker is NOT reported here:
+ * it THROWS (fail-closed, the caller must not arm over an unreadable routing
+ * mode).
+ */
+export interface StaleExclusiveRoutingReconcileResult {
+  /** True ONLY when a provably-orphaned marker was removed. */
+  reconciled: boolean;
+  /** Why the marker was kept (present only when `reconciled` is false and a marker existed). */
+  reason?: string;
 }
 
 /**
@@ -93,6 +117,25 @@ export interface ExclusiveEgressArmOps {
    * LOUDLY rather than starting it over an exclusive-scoped manifest).
    */
   restoreCoarseComposition(reason: string): Promise<void>;
+  /**
+   * D8 SELF-HEAL PREFLIGHT (2026-07-22): before the arm's early coarse
+   * publish+reload, remove an ORPHANED exclusive-routing marker that a
+   * hard-interrupted prior arm (crash / killed process / dropped `ssh -tt`)
+   * left behind. A stale marker wedges EVERY subsequent arm: the coarse
+   * publish's reload makes the signing daemon compose in EXCLUSIVE mode
+   * against the freshly-published COARSE (agent-scoped) rules, correctly find
+   * agent-reachable direct allows, and fail closed (the composition invariant
+   * working as designed) -- so the flow never gets past provision-egress.
+   *
+   * SAFETY (invariant 2, fail toward confinement): removing the marker forces
+   * the next reload to compose COARSE, which would DE-CONFINE a live agent, so
+   * this removes ONLY when it can prove NO live confinement exists (no S5-1
+   * registry entry for the uid -- committed OR staged -- AND no gate daemon
+   * serving the recorded port). When uncertain it KEEPS the marker. A malformed
+   * marker THROWS (fail-closed; the caller must abort rather than arm over an
+   * unreadable routing mode). Idempotent. Emits a DISTINCT audit op on removal.
+   */
+  reconcileStaleExclusiveRouting(): Promise<StaleExclusiveRoutingReconcileResult>;
   /**
    * Start the harness in COARSE mode after a successful coarse restore (the
    * degrade-loud path's "the coarse wall is proven protection" semantics):

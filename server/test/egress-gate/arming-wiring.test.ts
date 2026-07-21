@@ -11,7 +11,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -27,6 +27,10 @@ import {
   type GateAccountHomeLayoutOps,
   type RootOwnedDirEnsureOps,
   restoreCoarseCompositionProduction,
+  reconcileStaleExclusiveRoutingProduction,
+  describeGateDaemonStderrTail,
+  waitForGateRuntime,
+  GATE_DAEMON_STDERR_TAIL_MAX_LINES,
   verifyHarnessJobDisabled,
   verifyHarnessParkedPersistent,
   verifyLoopbackTcpPortOwner,
@@ -56,7 +60,12 @@ import {
   planParkedHarnessInstall,
   type ReleaseBarrierOps,
 } from "../../src/egress-gate/release-barrier.js";
-import { exclusiveRoutingMarkerPath } from "../../src/castle-wall/allowlist/routing-marker.js";
+import {
+  exclusiveRoutingMarkerPath,
+  ExclusiveRoutingMarkerError,
+  type ExclusiveRoutingMarker,
+} from "../../src/castle-wall/allowlist/routing-marker.js";
+import { EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP } from "../../src/castle-wall/provision/exclusive-arm.js";
 import { EXCLUSIVE_EGRESS_GATE_FILENAME } from "../../src/castle-wall/allowlist/gate-derivation.js";
 import { ProvisionLockHeldError } from "../../src/castle-wall/provision/lockfile.js";
 
@@ -1207,5 +1216,314 @@ describe("ensureGateAccountHomeLayout (D6 gate-owned log directory invariant)", 
     expect(sequence).toContain(`chmod:${stdoutPath}:600`);
     expect(stats.get(stdoutPath)).toMatchObject({ kind: "file", uid: 506, gid: 506, mode: 0o600 });
     expect(stats.get(stderrPath)).toMatchObject({ kind: "file", uid: 506, gid: 506, mode: 0o600 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D8 self-heal (2026-07-22): reconcileStaleExclusiveRoutingProduction removes
+// an ORPHANED exclusive-routing marker before re-arm, but ONLY when it can
+// prove no live confinement exists (invariant 2, fail toward confinement). The
+// side effects are seamed so the decision is asserted host-free.
+// ---------------------------------------------------------------------------
+
+describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)", () => {
+  const FORTRESS = "/fortress/recon";
+  const MARKER: ExclusiveRoutingMarker = {
+    version: 1,
+    mode: "exclusive",
+    agent_uid: 707,
+    gate_uid: 708,
+    agent_id: "hermes",
+    agent_template: "hermes",
+  };
+  const MARKER_PATH = exclusiveRoutingMarkerPath(FORTRESS);
+  const GATE_POLICY_PATH = join(FORTRESS, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME);
+
+  function reconInput(): {
+    agentUid: number;
+    fortressPath: string;
+    audit: ReturnType<typeof vi.fn>;
+    print: ReturnType<typeof vi.fn>;
+  } {
+    return {
+      agentUid: MARKER.agent_uid,
+      fortressPath: FORTRESS,
+      audit: vi.fn(async () => undefined),
+      print: vi.fn(),
+    };
+  }
+  const enoent = (): NodeJS.ErrnoException => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  function runtimeStateJson(
+    overrides: Partial<{ agent_uid: number; gate_port: number; generation_id: number; pid: number; pid_start: string }> = {},
+  ): string {
+    return JSON.stringify({
+      agent_uid: MARKER.agent_uid,
+      gate_port: 49222,
+      generation_id: 5,
+      pid: 4242,
+      pid_start: "4242-1721600000000",
+      ...overrides,
+    });
+  }
+
+  it("marker ABSENT -> no-op {reconciled:false}, no writes, no audit", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => null,
+      listRegistry: async () => ({ entries: [] }),
+      removeFile,
+    });
+    expect(result).toEqual({ reconciled: false });
+    expect(removeFile).not.toHaveBeenCalled();
+    expect(input.audit).not.toHaveBeenCalled();
+  });
+
+  it("ORPHANED (no registry entry for the uid, no gate runtime state) -> removes marker + gate policy, distinct audit, {reconciled:true}", async () => {
+    const input = reconInput();
+    const removed: string[] = [];
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      // A SIBLING uid is present, not ours -- so no entry for THIS uid.
+      listRegistry: async () => ({ entries: [{ agent_uid: 999 }] }),
+      readRuntimeState: async () => {
+        throw enoent();
+      },
+      removeFile: async (p) => {
+        removed.push(p);
+      },
+    });
+    expect(result).toEqual({ reconciled: true });
+    // EXACT restoreCoarseComposition removal pair, in order.
+    expect(removed).toEqual([MARKER_PATH, GATE_POLICY_PATH]);
+    expect(input.audit).toHaveBeenCalledWith(
+      EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP,
+      expect.objectContaining({ agent_uid: MARKER.agent_uid, marker_gate_uid: MARKER.gate_uid }),
+    );
+  });
+
+  it("KEEPS the marker when the S5-1 registry still has an entry for the uid (no de-confinement)", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry: async () => ({ entries: [{ agent_uid: MARKER.agent_uid }] }),
+      removeFile,
+    });
+    expect(result.reconciled).toBe(false);
+    expect(result.reason).toMatch(/registry still has an entry/);
+    expect(removeFile).not.toHaveBeenCalled();
+    expect(input.audit).not.toHaveBeenCalled();
+  });
+
+  it("KEEPS the marker on the crashed-mid-bring-up edge: a registry entry present at G3 but never committed still counts as present", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    // Membership in the committed set is the guard, so a generation the
+    // coordinator armed at G3 but a crash never committed at G5 reads as
+    // potentially-live and is KEPT -- the repair verb recovers it, not this
+    // preflight. (The seam abstracts the registry; committed vs staged look
+    // identical here BY DESIGN -- the reconcile does not distinguish them.)
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry: async () => ({ entries: [{ agent_uid: MARKER.agent_uid }] }),
+      readRuntimeState: async () => {
+        throw enoent();
+      },
+      removeFile,
+    });
+    expect(result.reconciled).toBe(false);
+    expect(removeFile).not.toHaveBeenCalled();
+  });
+
+  it("KEEPS the marker when a gate daemon is owner-verified serving (second liveness dimension)", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    const verifyPortOwner = vi.fn(async () => ({ ok: true as const }));
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      // No registry entry -> reach the gate check; a live gate keeps the marker.
+      listRegistry: async () => ({ entries: [] }),
+      readRuntimeState: async () => runtimeStateJson(),
+      verifyPortOwner,
+      removeFile,
+    });
+    expect(result.reconciled).toBe(false);
+    expect(result.reason).toMatch(/gate liveness .* is yes/);
+    // The owner check ran against the MARKER's gate uid and the recorded port.
+    expect(verifyPortOwner).toHaveBeenCalledWith(
+      expect.objectContaining({ port: 49222, expectedUid: MARKER.gate_uid, expectedPid: 4242 }),
+    );
+    expect(removeFile).not.toHaveBeenCalled();
+  });
+
+  it("KEEPS the marker when a runtime state exists but does NOT owner-verify (uncertain -> fail toward confinement)", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry: async () => ({ entries: [] }),
+      readRuntimeState: async () => runtimeStateJson(),
+      verifyPortOwner: async () => ({ ok: false as const, reason: "listener lookup failed: no listener" }),
+      removeFile,
+    });
+    expect(result.reconciled).toBe(false);
+    expect(result.reason).toMatch(/uncertain/);
+    expect(removeFile).not.toHaveBeenCalled();
+  });
+
+  it("MALFORMED marker SURFACES (throws) -- does NOT silently proceed or remove", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    await expect(
+      reconcileStaleExclusiveRoutingProduction(input, {
+        loadMarker: async () => {
+          throw new ExclusiveRoutingMarkerError("not valid JSON");
+        },
+        listRegistry: async () => ({ entries: [] }),
+        removeFile,
+      }),
+    ).rejects.toThrow(ExclusiveRoutingMarkerError);
+    expect(removeFile).not.toHaveBeenCalled();
+    expect(input.audit).not.toHaveBeenCalled();
+  });
+
+  it("is IDEMPOTENT: a second run over the now-removed marker is a no-op", async () => {
+    const input = reconInput();
+    const removed: string[] = [];
+    let markerPresent = true;
+    const deps = {
+      loadMarker: async (): Promise<ExclusiveRoutingMarker | null> => (markerPresent ? { ...MARKER } : null),
+      listRegistry: async (): Promise<{ entries: { agent_uid: number }[] }> => ({ entries: [] }),
+      readRuntimeState: async (): Promise<string> => {
+        throw enoent();
+      },
+      removeFile: async (p: string): Promise<void> => {
+        removed.push(p);
+        markerPresent = false;
+      },
+    };
+    const first = await reconcileStaleExclusiveRoutingProduction(input, deps);
+    const second = await reconcileStaleExclusiveRoutingProduction(input, deps);
+    expect(first).toEqual({ reconciled: true });
+    expect(second).toEqual({ reconciled: false });
+    // Exactly ONE removal pair total (marker + gate policy), never four.
+    expect(removed).toEqual([MARKER_PATH, GATE_POLICY_PATH]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Change 2 (2026-07-22): the arm's 15s "did not publish runtime state" timeout
+// is self-describing -- it folds a BOUNDED, secret-scrubbed tail of the gate
+// daemon's stderr log (its real exit reason) into the thrown error.
+// ---------------------------------------------------------------------------
+
+describe("describeGateDaemonStderrTail (bounded gate-daemon stderr diagnostics)", () => {
+  it("present + readable -> returns the log path and its content (real bounded read)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gate-stderr-"));
+    try {
+      const p = join(dir, "egress-gate-707.err.log");
+      await writeFile(p, "bind: address already in use\nexiting non-zero\n");
+      const out = await describeGateDaemonStderrTail(p);
+      expect(out).toContain(p);
+      expect(out).toContain("bind: address already in use");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("absent -> names the path and says the log was not present (no throw)", async () => {
+    const out = await describeGateDaemonStderrTail("/no/such/gate/err.log");
+    expect(out).toContain("/no/such/gate/err.log");
+    expect(out).toMatch(/not present/);
+  });
+
+  it("unreadable (non-ENOENT) -> names the path and says it could not be read (no throw, no swallow)", async () => {
+    const out = await describeGateDaemonStderrTail("/x/err.log", {
+      readTail: async () => {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      },
+    });
+    expect(out).toContain("/x/err.log");
+    expect(out).toMatch(/could not be read/);
+    expect(out).toContain("EACCES");
+  });
+
+  it("oversized log -> tail is byte- AND line-bounded (only the last N lines survive)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gate-stderr-big-"));
+    try {
+      const p = join(dir, "egress-gate-707.err.log");
+      // 200 lines, ~37 bytes each => ~7.4KB, far past the 2KB byte cap.
+      const lines = Array.from({ length: 200 }, (_, i) => `line ${i} ${"x".repeat(30)}`);
+      await writeFile(p, lines.join("\n") + "\n");
+      const out = await describeGateDaemonStderrTail(p);
+      expect(out).toContain("(tail truncated)");
+      // The earliest lines are gone (byte + line bounded).
+      expect(out).not.toContain("line 0 ");
+      expect(out).not.toContain("line 100 ");
+      // At most N content lines survive in the tail body.
+      const body = out.split("real exit reason:\n")[1] ?? "";
+      const bodyLines = body.split("\n").filter((l) => l.length > 0);
+      expect(bodyLines.length).toBeLessThanOrEqual(GATE_DAEMON_STDERR_TAIL_MAX_LINES);
+      // And the LAST line is retained.
+      expect(out).toContain("line 199 ");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("PEM private-key material in the tail is REDACTED (invariant 6 defense-in-depth)", async () => {
+    const pem = "-----BEGIN PRIVATE KEY-----\nMIGkAgEBBDAsecretsecretsecret\n-----END PRIVATE KEY-----";
+    const out = await describeGateDaemonStderrTail("/x/err.log", {
+      readTail: async () => ({ text: `startup ok\n${pem}\nlistening`, truncated: false }),
+    });
+    expect(out).toContain("[REDACTED PEM PRIVATE-KEY BLOCK]");
+    expect(out).not.toContain("MIGkAgEBBDAsecretsecretsecret");
+  });
+});
+
+describe("waitForGateRuntime timeout diagnostics (Change 2)", () => {
+  const NEVER_ENOENT = async (): Promise<string> => {
+    throw Object.assign(new Error("ENOENT: no such file"), { code: "ENOENT" });
+  };
+
+  it("times out with a readable gate-daemon err.log present -> error CONTAINS the path and a bounded tail", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "gate-wait-"));
+    try {
+      const errLog = join(dir, "egress-gate-707.err.log");
+      await writeFile(errLog, "launchd: could not bind gate port 49222 (EADDRINUSE)\n");
+      const call = (): Promise<unknown> =>
+        waitForGateRuntime(707, 5, 49222, {
+          readState: NEVER_ENOENT,
+          budgetMs: 5,
+          intervalMs: 1,
+          gateDaemonStderrPath: errLog,
+        });
+      // The daemon's REAL exit reason (from its stderr) is now in the error.
+      await expect(call()).rejects.toThrow(/did not publish a matching runtime state[\s\S]*EADDRINUSE/);
+      // And the log's absolute path is named.
+      await expect(call()).rejects.toThrow(new RegExp(errLog.replace(/[.]/g, "\\.")));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("times out with the err.log ABSENT -> error names the path and says it was unavailable (still throws)", async () => {
+    const missing = "/no/such/gate/egress-gate-707.err.log";
+    const call = (): Promise<unknown> =>
+      waitForGateRuntime(707, 5, 49222, {
+        readState: NEVER_ENOENT,
+        budgetMs: 5,
+        intervalMs: 1,
+        gateDaemonStderrPath: missing,
+      });
+    await expect(call()).rejects.toThrow(/did not publish a matching runtime state/);
+    await expect(call()).rejects.toThrow(/not present/);
+  });
+
+  it("without a stderr path -> unchanged bare timeout error (pure addition to the error path)", async () => {
+    await expect(
+      waitForGateRuntime(707, 5, 49222, { readState: NEVER_ENOENT, budgetMs: 5, intervalMs: 1 }),
+    ).rejects.toThrow(/did not publish a matching runtime state within 5ms/);
   });
 });

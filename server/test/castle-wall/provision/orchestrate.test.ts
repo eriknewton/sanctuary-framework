@@ -1191,6 +1191,8 @@ describe("castle-wall/provision/orchestrate", () => {
         bringUpGeneration: vi.fn(async () => COMMITTED),
         runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
         restoreCoarseComposition: vi.fn(async () => undefined),
+        // D8: no stale marker by default (the preflight is a no-op here).
+        reconcileStaleExclusiveRouting: vi.fn(async () => ({ reconciled: false })),
         startHarnessCoarse: vi.fn(async () => undefined),
         audit: vi.fn(async () => undefined),
         print: vi.fn(),
@@ -1294,6 +1296,40 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
       expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
     });
+
+    it("D8 REGRESSION: a stale exclusive-routing marker from a crashed prior arm is reconciled BEFORE provision-egress, and the arm PROCEEDS to a live exclusive arm", async () => {
+      const exclusive = happyExclusiveOps();
+      // The 2026-07-21 hardware wedge: an interrupted prior arm left a stale
+      // marker on the fortress. The preflight self-heals it (orphaned, no live
+      // confinement present); pre-fix, the daemon composed EXCLUSIVE over the
+      // coarse rules provision-egress publishes and failed closed, so the flow
+      // never got past provision-egress.
+      exclusive.reconcileStaleExclusiveRouting = vi.fn(async () => ({ reconciled: true }));
+      const { ops } = fineGrainedOps(exclusive);
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      // The flow proceeded all the way to a live exclusive arm.
+      expect(result).toEqual({ kind: "armed-exclusive", uid: AGENT_UID, generationId: COMMITTED.generation_id });
+      expect(exclusive.reconcileStaleExclusiveRouting).toHaveBeenCalledTimes(1);
+      // The reconcile ran strictly BEFORE provision-egress (the wedge point) and
+      // AFTER the parked install (proving the harness is parked, not running).
+      const reconcileOrder = exclusive.reconcileStaleExclusiveRouting.mock.invocationCallOrder[0]!;
+      const provisionOrder = (ops.provisionEgress as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const installOrder = (ops.installHarnessDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      expect(installOrder).toBeLessThan(reconcileOrder);
+      expect(reconcileOrder).toBeLessThan(provisionOrder);
+    });
+
+    it("D8 fail-closed: a marker the reconcile cannot read (throws) ABORTS before provision-egress -- never arms over an unreadable routing mode", async () => {
+      const exclusive = happyExclusiveOps();
+      exclusive.reconcileStaleExclusiveRouting = vi.fn(async () => {
+        throw new Error("exclusive-routing marker: exclusive-routing.json is not valid JSON");
+      });
+      const { ops } = fineGrainedOps(exclusive);
+      await expect(runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops)).rejects.toThrow(/not valid JSON/);
+      // provision-egress and the arm never ran (fail-closed before any egress mutation).
+      expect(ops.provisionEgress).not.toHaveBeenCalled();
+      expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────────
@@ -1315,6 +1351,8 @@ describe("castle-wall/provision/orchestrate", () => {
         bringUpGeneration: vi.fn(async () => COMMITTED),
         runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
         restoreCoarseComposition: vi.fn(async () => undefined),
+        // D8: no stale marker by default (the preflight is a no-op here).
+        reconcileStaleExclusiveRouting: vi.fn(async () => ({ reconciled: false })),
         startHarnessCoarse: vi.fn(async () => undefined),
         audit: vi.fn(async () => undefined),
         print: vi.fn(),
