@@ -127,6 +127,7 @@ import {
   exclusiveRoutingMarkerPath,
   loadExclusiveRoutingMarker,
   renderExclusiveRoutingMarker,
+  type ExclusiveRoutingMarker,
 } from "../castle-wall/allowlist/routing-marker.js";
 import {
   EXCLUSIVE_EGRESS_GATE_FILENAME,
@@ -135,9 +136,11 @@ import { composeExclusiveRoutingRules } from "../castle-wall/allowlist/exclusive
 import type {
   ExclusiveEgressArmOps,
   ExclusiveGenerationIdentity,
+  StaleExclusiveRoutingReconcileResult,
 } from "../castle-wall/provision/exclusive-arm.js";
 import {
   runBootExclusiveEgressRelease,
+  EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP,
   type BootReleaseResult,
 } from "../castle-wall/provision/exclusive-arm.js";
 import type { EgressGateUnprotectOps } from "../castle-wall/provision/exclusive-unprotect.js";
@@ -866,7 +869,19 @@ async function productionBringUp(
   if (kick.code !== 0) {
     throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
   }
-  const runtime = await waitForGateRuntime(input.agentUid, committed.generation_id, committed.gate_port);
+  // Change 2: hand waitForGateRuntime this gate daemon's own stderr log path so
+  // a timeout surfaces the daemon's REAL exit reason (bind/spawn failure)
+  // instead of a bare "runtime state never appeared". Deriving the path reuses
+  // the exact account + home the plist above was rendered with, so it is
+  // proven-valid by the time we get here.
+  const gateStderrPath = egressGateDaemonLogPaths({
+    agentUid: input.agentUid,
+    gateAccount: state.gateAccountName,
+    gateHomeDirectory: input.gateHomeDirectory,
+  }).stderrPath;
+  const runtime = await waitForGateRuntime(input.agentUid, committed.generation_id, committed.gate_port, {
+    gateDaemonStderrPath: gateStderrPath,
+  });
   const owner = await verifyLoopbackTcpPortOwner({
     port: committed.gate_port,
     expectedPid: runtime.pid,
@@ -896,7 +911,143 @@ async function productionBringUp(
   };
 }
 
-async function waitForGateRuntime(
+/** Change 2: max bytes of the gate-daemon stderr log folded into an arm-timeout error. */
+export const GATE_DAEMON_STDERR_TAIL_MAX_BYTES = 2048;
+/** Change 2: max lines of that tail (whichever bound trips first). */
+export const GATE_DAEMON_STDERR_TAIL_MAX_LINES = 20;
+
+/**
+ * Read a BOUNDED tail of a file: at most `maxBytes` from the END, via a single
+ * open+stat+positional read so a huge/rotated log can never be slurped whole
+ * into memory. Throws (ENOENT/EACCES/...) on an unreadable path -- the caller
+ * classifies. `truncated` is true when bytes before the window were dropped.
+ */
+async function readBoundedFileTail(
+  path: string,
+  maxBytes: number,
+): Promise<{ text: string; truncated: boolean }> {
+  const handle = await open(path, "r");
+  try {
+    const { size } = await handle.stat();
+    const start = size > maxBytes ? size - maxBytes : 0;
+    const length = size - start;
+    if (length <= 0) return { text: "", truncated: false };
+    const buf = Buffer.alloc(length);
+    // Respect the ACTUAL bytes read: a truncation/rotation between stat and read
+    // can return fewer bytes, and decoding the zero-filled tail would emit
+    // trailing NUL padding into the surfaced diagnostics.
+    const { bytesRead } = await handle.read(buf, 0, length, start);
+    return { text: buf.subarray(0, bytesRead).toString("utf8"), truncated: start > 0 };
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Scrub the one secret shape that could conceivably reach a log file -- a PEM
+ * private-key block -- before a stderr tail is folded into a user-facing error
+ * (non-negotiable invariant 6: private keys never appear in any log/error/
+ * diagnostic). In practice the gate daemon never logs key material (it only
+ * PINS the oracle PUBLIC key and writes bind/policy/`[egress-gate]`-event
+ * diagnostics), so this is defense-in-depth for a future log line, not a live
+ * leak; it stays surgical (PEM blocks only) so real diagnostics survive intact.
+ *
+ * ACCEPTED RESIDUAL (re-gate 2026-07-22, consciously NOT fixed): a MARKERLESS
+ * base64 fragment -- a PEM whose BEGIN fell more than {@link
+ * GATE_DAEMON_STDERR_TAIL_MAX_BYTES} before EOF AND whose END is not yet in the
+ * tail window -- is not scrubbed (no BEGIN/END marker survives in the tail to
+ * anchor on). We accept it because (a) the gate daemon logs no key material
+ * (verified by three review lenses), so this is defense-in-depth for a
+ * hypothetical future log line, not a live leak, and (b) a broad "redact any
+ * long base64 run" heuristic would risk swallowing the very bind/startup
+ * diagnostics Change 2 exists to surface, defeating the feature. This is a
+ * considered limitation, not an oversight; do NOT add a base64 heuristic here.
+ */
+function redactSecretsFromLogTail(text: string): string {
+  // (a) Complete PEM private-key blocks.
+  let out = text.replace(
+    /-----BEGIN[^-]*PRIVATE KEY-----[\s\S]*?-----END[^-]*PRIVATE KEY-----/g,
+    "[REDACTED PEM PRIVATE-KEY BLOCK]",
+  );
+  // (b) A DANGLING END with no preceding BEGIN: the byte-tail cut can start
+  // MID-key (its BEGIN fell before the 2KB window), leaving a bare base64 body
+  // that ends in an END marker. Redact from the tail start through that END.
+  const endMatch = /-----END[^-]*PRIVATE KEY-----/.exec(out);
+  if (endMatch !== null && !/-----BEGIN[^-]*PRIVATE KEY-----/.test(out.slice(0, endMatch.index))) {
+    out = "[REDACTED PARTIAL PEM PRIVATE-KEY BLOCK]" + out.slice(endMatch.index + endMatch[0].length);
+  }
+  // (c) A DANGLING BEGIN with no END after it (a truncated key write): the body
+  // from the BEGIN to the tail end is secret. (Any complete block was already
+  // consumed by (a), so a surviving BEGIN has no matching END.)
+  out = out.replace(
+    /-----BEGIN[^-]*PRIVATE KEY-----[\s\S]*$/g,
+    "[REDACTED PARTIAL PEM PRIVATE-KEY BLOCK]",
+  );
+  return out;
+}
+
+/**
+ * Build a BOUNDED, secret-scrubbed diagnostic block naming the gate daemon's
+ * stderr log and (when readable) a size-/line-capped tail of it, for folding
+ * into a {@link waitForGateRuntime} TIMEOUT error (Change 2). This is the
+ * honest replacement for the multi-session "runtime state never appeared"
+ * phantom hunt: the daemon's ACTUAL exit reason (a port bind failure, a
+ * launchd spawn failure, a stale-dist/stale-marker confound) is written ONLY
+ * to this stderr log (`egress-gate-<uid>.err.log`), which the arm otherwise
+ * never read -- so every such failure looked identical and got misread as a
+ * missing directory.
+ *
+ * NEVER throws and NEVER unbounded: an absent log says so (the daemon likely
+ * never started), an unreadable log says so, and a huge log is read only at
+ * its byte tail then capped to {@link GATE_DAEMON_STDERR_TAIL_MAX_LINES} lines.
+ * The returned string begins with a leading space and is safe to append.
+ */
+export async function describeGateDaemonStderrTail(
+  stderrPath: string,
+  deps?: { readTail?: (path: string, maxBytes: number) => Promise<{ text: string; truncated: boolean }> },
+): Promise<string> {
+  const readTail = deps?.readTail ?? readBoundedFileTail;
+  let tail: { text: string; truncated: boolean };
+  try {
+    tail = await readTail(stderrPath, GATE_DAEMON_STDERR_TAIL_MAX_BYTES);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return (
+        ` The gate daemon's stderr log (${stderrPath}) is not present -- the daemon likely never ` +
+        "started (e.g. a launchd spawn failure), so it wrote no diagnostics."
+      );
+    }
+    return ` The gate daemon's stderr log (${stderrPath}) could not be read: ${(err as Error).message}.`;
+  }
+  const scrubbed = redactSecretsFromLogTail(tail.text);
+  const lines = scrubbed.split("\n");
+  // Drop a trailing empty line from a final newline so the line cap counts real
+  // content lines, then keep at most the last N.
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  if (lines.length === 0) {
+    return ` The gate daemon's stderr log (${stderrPath}) is present but empty; no diagnostics were written.`;
+  }
+  const lineTruncated = lines.length > GATE_DAEMON_STDERR_TAIL_MAX_LINES;
+  const kept = lineTruncated ? lines.slice(lines.length - GATE_DAEMON_STDERR_TAIL_MAX_LINES) : lines;
+  const truncatedNote = tail.truncated || lineTruncated ? " (tail truncated)" : "";
+  return (
+    ` The gate daemon's stderr log (${stderrPath}) tail${truncatedNote} follows -- this is the ` +
+    `daemon's real exit reason:\n${kept.join("\n")}`
+  );
+}
+
+/**
+ * Poll for the gate daemon's runtime-state file to name EXACTLY the committed
+ * {generation, port, uid}, up to a 15s budget. Returns the parsed state on a
+ * match; on TIMEOUT it throws (fail-closed: the caller never proceeds toward
+ * release without a verified runtime state). Change 2 (2026-07-22): when a
+ * `gateDaemonStderrPath` is supplied, the timeout error also carries a
+ * bounded, secret-scrubbed tail of the daemon's stderr log -- the daemon's
+ * REAL exit reason, which the arm previously never read. Exported for the
+ * seam-driven tests of that timeout path; production callers are
+ * {@link productionBringUp} (install) and {@link bootstrapGateDaemonForBoot}.
+ */
+export async function waitForGateRuntime(
   agentUid: number,
   generationId: number,
   gatePort: number,
@@ -904,6 +1055,16 @@ async function waitForGateRuntime(
     readState?: (agentUid: number) => Promise<string>;
     budgetMs?: number;
     intervalMs?: number;
+    /**
+     * Change 2 (diagnosability): on TIMEOUT, fold a bounded, secret-scrubbed
+     * tail of THIS gate-daemon stderr log into the thrown error, so the
+     * daemon's real exit reason surfaces instead of a bare "runtime state
+     * never appeared". Absent = today's behavior. Pure addition to the error
+     * path -- the 15s budget, the poll, and the success return are untouched.
+     */
+    gateDaemonStderrPath?: string;
+    /** TEST SEAM for the tail describer (production uses the real bounded read). */
+    describeStderrTail?: (path: string) => Promise<string>;
   },
 ): Promise<EgressGateRuntimeState> {
   const budgetMs = deps?.budgetMs ?? GATE_RUNTIME_WAIT_BUDGET_MS;
@@ -926,8 +1087,21 @@ async function waitForGateRuntime(
     if (Date.now() >= deadline) break;
     await new Promise((r) => setTimeout(r, intervalMs));
   }
+  // Change 2: fold the gate daemon's own stderr tail into the timeout error.
+  // Gathering diagnostics must NEVER convert the timeout into a different
+  // failure, so it is bounded (readBoundedFileTail) and caught: an absent /
+  // unreadable log is named in the message, never swallowed and never fatal.
+  let diagnostics = "";
+  if (deps?.gateDaemonStderrPath !== undefined) {
+    const describe = deps.describeStderrTail ?? describeGateDaemonStderrTail;
+    try {
+      diagnostics = await describe(deps.gateDaemonStderrPath);
+    } catch (err) {
+      diagnostics = ` (could not gather gate-daemon stderr diagnostics: ${(err as Error).message})`;
+    }
+  }
   throw new Error(
-    `gate daemon did not publish a matching runtime state within ${budgetMs}ms: ${lastError ?? "runtime state never appeared"}`,
+    `gate daemon did not publish a matching runtime state within ${budgetMs}ms: ${lastError ?? "runtime state never appeared"}.${diagnostics}`,
   );
 }
 
@@ -948,6 +1122,13 @@ export async function bootstrapGateDaemonForBoot(input: {
   readState?: (agentUid: number) => Promise<string>;
   waitBudgetMs?: number;
   waitIntervalMs?: number;
+  /**
+   * Change 2 (boot-path parity): the gate daemon's stderr log path, so a
+   * boot-time gate-runtime timeout surfaces the daemon's real exit reason too
+   * (the install path derives + passes the same). Optional; absent = bare
+   * timeout, today's behavior.
+   */
+  gateDaemonStderrPath?: string;
 }): Promise<void> {
   const run = input.runLaunchctlFn ?? runLaunchctl;
   const label = egressGateDaemonLabel(input.agentUid);
@@ -968,6 +1149,7 @@ export async function bootstrapGateDaemonForBoot(input: {
       ...(input.readState !== undefined ? { readState: input.readState } : {}),
       ...(input.waitBudgetMs !== undefined ? { budgetMs: input.waitBudgetMs } : {}),
       ...(input.waitIntervalMs !== undefined ? { intervalMs: input.waitIntervalMs } : {}),
+      ...(input.gateDaemonStderrPath !== undefined ? { gateDaemonStderrPath: input.gateDaemonStderrPath } : {}),
     });
   }
 }
@@ -1380,6 +1562,12 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
     async restoreCoarseComposition(reason): Promise<void> {
       await restoreCoarseCompositionProduction(input, reason);
     },
+    async reconcileStaleExclusiveRouting(): Promise<StaleExclusiveRoutingReconcileResult> {
+      // D8 preflight: no gate-account bring-up needed -- the gate uid comes
+      // from the marker, and the reconcile only reads the registry/runtime
+      // state and (when orphaned) removes the marker + gate policy.
+      return reconcileStaleExclusiveRoutingProduction(input);
+    },
     async startHarnessCoarse(): Promise<void> {
       // The degrade path re-renders the PLAIN (RunAtLoad/KeepAlive) plist and
       // brings the harness up through the shipped coarse install path
@@ -1532,6 +1720,231 @@ export async function restoreCoarseCompositionProduction(
       },
     },
   });
+}
+
+/**
+ * D8 self-heal (2026-07-22): remove an ORPHANED exclusive-routing marker a
+ * hard-interrupted prior arm left on disk, so the next arm's coarse
+ * publish+reload does not wedge on the composition invariant (see the op
+ * doc-comment on `ExclusiveEgressArmOps.reconcileStaleExclusiveRouting`).
+ *
+ * The removal is the EXACT pair {@link restoreCoarseCompositionProduction}
+ * uses (marker + gate policy file), so the on-disk effect of a self-heal is
+ * byte-identical to a clean coarse restore's marker teardown -- there is no
+ * second, divergent removal path to keep in sync.
+ *
+ * LIVENESS is judged CONSERVATIVELY (invariant 2, fail toward confinement).
+ * The marker is removed ONLY when EVERY guard shows no live confinement:
+ *
+ *   0. The marker's declared `agent_uid` equals the ARM TARGET (`input.agentUid`).
+ *      A marker for a different uid is judged against the wrong subject (another
+ *      uid may be live), so a mismatch KEEPS it fail-closed -- no cross-uid
+ *      reconcile.
+ *   1. The S5-1 registry is CLEAN for this uid: not `dirty`, no quarantined
+ *      entries, and no committed/mid-bring-up entry for the uid. A `dirty` or
+ *      quarantined registry is an uncertain S5-1 state (a generation staged but
+ *      not committed forces `dirty`), and a generation the coordinator armed at
+ *      G3 (present in `entries`) reads as potentially-live -- either KEEPS the
+ *      marker (the repair verb, not this preflight, recovers such state).
+ *   2. No gate daemon serving the recorded port. A present runtime-state file
+ *      that does not owner-verify is UNCERTAIN (KEEP); and even with the runtime
+ *      state ABSENT, a surviving gate-daemon PLIST is UNCERTAIN (launchd could
+ *      restart the gate -- a partial teardown TOCTOU), so "no gate serving"
+ *      requires NO runtime state AND NO plist.
+ *
+ * Any uncertainty (cross-uid marker, dirty/quarantined registry, unreadable/
+ * unparseable runtime state, a surviving plist, an owner check that cannot
+ * confirm) KEEPS the marker. A malformed MARKER throws (the load contract): the
+ * caller must abort rather than arm over an unreadable mode. Idempotent: a
+ * second run finds the marker gone and is a no-op.
+ */
+export async function reconcileStaleExclusiveRoutingProduction(
+  input: Pick<ExclusiveEgressWiringInput, "agentUid" | "fortressPath" | "audit" | "print">,
+  /** TEST SEAMS: registry/marker/runtime/owner/plist/rm recorders (production uses the real ops). */
+  deps?: {
+    loadMarker?: (fortressPath: string) => Promise<ExclusiveRoutingMarker | null>;
+    listRegistry?: () => Promise<{
+      entries: { agent_uid: number }[];
+      dirty: boolean;
+      quarantined: { index: number; reason: string }[];
+    }>;
+    readRuntimeState?: (agentUid: number) => Promise<string>;
+    verifyPortOwner?: typeof verifyLoopbackTcpPortOwner;
+    /** True when the gate daemon plist for the uid exists (fail-closed to true on an ambiguous stat). */
+    plistExists?: (agentUid: number) => Promise<boolean>;
+    removeFile?: (path: string) => Promise<void>;
+  },
+): Promise<StaleExclusiveRoutingReconcileResult> {
+  const loadMarker = deps?.loadMarker ?? loadExclusiveRoutingMarker;
+  const listRegistry =
+    deps?.listRegistry ??
+    (async (): Promise<{
+      entries: { agent_uid: number }[];
+      dirty: boolean;
+      quarantined: { index: number; reason: string }[];
+    }> => createProductionAnchorRegistry().listQuarantined());
+  const readRuntimeState =
+    deps?.readRuntimeState ??
+    (async (uid: number): Promise<string> => readFile(egressGateRuntimeStatePath(uid), "utf8"));
+  const verifyPortOwner = deps?.verifyPortOwner ?? verifyLoopbackTcpPortOwner;
+  const plistExists = deps?.plistExists ?? defaultGateDaemonPlistExists;
+  const removeFile = deps?.removeFile ?? (async (path: string): Promise<void> => rm(path, { force: true }));
+
+  // A malformed marker THROWS here (loadExclusiveRoutingMarker's fail-closed
+  // contract); we deliberately do NOT catch it -- arming over an unreadable
+  // routing mode is exactly what the marker exists to prevent.
+  const marker = await loadMarker(input.fortressPath);
+  if (marker === null) {
+    // Absent === coarse mode; nothing to reconcile (also the idempotent path).
+    return { reconciled: false };
+  }
+
+  // Guard 0 (BLOCKER, fail-closed): scope every liveness judgement to THIS arm.
+  // A marker declaring a different uid must not be judged orphaned against the
+  // wrong subject while that other uid may be live.
+  if (marker.agent_uid !== input.agentUid) {
+    return {
+      reconciled: false,
+      reason:
+        `marker declares agent uid ${marker.agent_uid} != arm target ${input.agentUid}; ` +
+        "refusing to reconcile a cross-uid marker (fail toward confinement)",
+    };
+  }
+
+  // Dimension 1 (primary, per the root-cause): an uncertain S5-1 state (dirty
+  // or quarantined) OR any registry entry for the uid -- committed or a G3
+  // generation not yet committed at G5 -- means confinement may be live. KEEP.
+  const registry = await listRegistry();
+  if (registry.dirty || registry.quarantined.length > 0) {
+    return {
+      reconciled: false,
+      reason:
+        `the S5-1 anchor registry is in an uncertain state (dirty=${registry.dirty}, ` +
+        `quarantined=${registry.quarantined.length}); keeping the marker fail-closed until repair`,
+    };
+  }
+  if (registry.entries.some((e) => e.agent_uid === marker.agent_uid)) {
+    return {
+      reconciled: false,
+      reason:
+        `the S5-1 anchor registry still has an entry for uid ${marker.agent_uid} (committed or ` +
+        "mid-bring-up); the marker may reflect live confinement, keeping it (repair, not reconcile, " +
+        "recovers a mid-bring-up generation)",
+    };
+  }
+
+  // Dimension 2: a gate daemon serving (or a plist that could restart one) keeps
+  // the marker too; only a positively-absent gate is "not serving".
+  const gate = await probeRecordedGateServing(marker, { readRuntimeState, verifyPortOwner, plistExists });
+  if (gate.serving !== "no") {
+    return {
+      reconciled: false,
+      reason: `gate liveness for uid ${marker.agent_uid} is ${gate.serving} (${gate.detail}); keeping the marker`,
+    };
+  }
+
+  // PROVABLY ORPHANED: no registry entry AND no serving gate. Remove the marker
+  // + gate policy with the EXACT pair restoreCoarseCompositionProduction uses,
+  // audit LOUD (invariant 3), and return reconciled.
+  await removeFile(exclusiveRoutingMarkerPath(input.fortressPath));
+  await removeFile(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME));
+  await input.audit(EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP, {
+    agent_uid: marker.agent_uid,
+    marker_agent_uid: marker.agent_uid,
+    marker_gate_uid: marker.gate_uid,
+    reason:
+      `no S5-1 registry entry and no serving gate for uid ${marker.agent_uid} (${gate.detail}); ` +
+      "an interrupted prior arm left this exclusive-routing marker orphaned -- removed so the arm can proceed",
+  });
+  input.print(
+    `Reconciled a stale exclusive-routing marker for uid ${marker.agent_uid} (no live confinement present).`,
+  );
+  return { reconciled: true };
+}
+
+/**
+ * Does the gate daemon plist for a uid exist? Used to close a partial-teardown
+ * TOCTOU: a registry entry can be removed while the gate daemon PLIST survives,
+ * and launchd can restart the gate from it. ENOENT === absent; any other stat
+ * error is treated as PRESENT (fail-closed: we could not confirm absence).
+ */
+async function defaultGateDaemonPlistExists(agentUid: number): Promise<boolean> {
+  try {
+    await lstat(egressGateDaemonPlistPath(agentUid));
+    return true;
+  } catch (err) {
+    // ENOENT === provably absent; ANY other stat error means we could not
+    // confirm absence, so fail closed to "present" (KEEP the marker). This is
+    // an expression, not a `true` literal, precisely because it is a
+    // documented-bound (not observed) claim; the observed claim is the
+    // lstat-success branch above (see `arming-wiring.gate-plist-exists`).
+    return (err as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+}
+
+/**
+ * Is a gate daemon actually SERVING the port the recorded runtime state names?
+ * "yes" = an owner-verified live listener (KEEP the marker); "no" = NO runtime
+ * state AND NO surviving gate-daemon plist, i.e. no gate at all (a removal
+ * candidate); "uncertain" = a runtime state exists but could not be confirmed
+ * live, OR the runtime state is absent but the plist survives (launchd could
+ * restart the gate) -- both KEEP, fail toward confinement. The gate uid comes
+ * from the MARKER (the runtime state does not carry it), so a listener under a
+ * different uid on the recorded port is not this agent's gate serving.
+ */
+async function probeRecordedGateServing(
+  marker: ExclusiveRoutingMarker,
+  deps: {
+    readRuntimeState: (agentUid: number) => Promise<string>;
+    verifyPortOwner: typeof verifyLoopbackTcpPortOwner;
+    plistExists: (agentUid: number) => Promise<boolean>;
+  },
+): Promise<{ serving: "yes" | "no" | "uncertain"; detail: string }> {
+  let text: string;
+  try {
+    text = await deps.readRuntimeState(marker.agent_uid);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      // Runtime state absent -- but a surviving plist means launchd can restart
+      // the gate (partial teardown TOCTOU), so "no" requires BOTH absent.
+      if (await deps.plistExists(marker.agent_uid)) {
+        return {
+          serving: "uncertain",
+          detail: "no gate runtime-state file, but the gate daemon plist is present (launchd could restart the gate)",
+        };
+      }
+      return { serving: "no", detail: "no gate runtime-state file and no gate daemon plist present" };
+    }
+    return { serving: "uncertain", detail: `gate runtime state unreadable: ${(err as Error).message}` };
+  }
+  let state: EgressGateRuntimeState;
+  try {
+    state = parseEgressGateRuntimeState(text, egressGateRuntimeStatePath(marker.agent_uid));
+  } catch (err) {
+    return { serving: "uncertain", detail: `gate runtime state unparseable: ${(err as Error).message}` };
+  }
+  if (state.agent_uid !== marker.agent_uid) {
+    return {
+      serving: "uncertain",
+      detail: `runtime state names uid ${state.agent_uid} but the marker names ${marker.agent_uid}`,
+    };
+  }
+  const owner = await deps.verifyPortOwner({
+    port: state.gate_port,
+    expectedPid: state.pid,
+    expectedUid: marker.gate_uid,
+    expectedPidStart: state.pid_start,
+  });
+  if (owner.ok) {
+    return {
+      serving: "yes",
+      detail: `gate daemon pid ${state.pid} owns port ${state.gate_port} under gate uid ${marker.gate_uid}`,
+    };
+  }
+  return {
+    serving: "uncertain",
+    detail: `recorded gate on port ${state.gate_port} did not owner-verify (${owner.reason})`,
+  };
 }
 
 /** What the persistent-park helpers need to know about the agent. */
@@ -2473,6 +2886,21 @@ export async function startExclusiveEgressBootSupervisor(input: {
             entry.generation_id > 0
               ? { generationId: entry.generation_id, gatePort: entry.gate_port }
               : null;
+          // Change 2 (boot-path parity): derive the gate daemon stderr path the
+          // same way the install path does, so a boot-time gate-runtime timeout
+          // surfaces the daemon's real exit reason. Deriving must never disrupt
+          // the boot path (it stays resilient), so an ill-formed account/home
+          // just yields no path.
+          let bootGateStderrPath: string | undefined;
+          try {
+            bootGateStderrPath = egressGateDaemonLogPaths({
+              agentUid,
+              gateAccount: ctx.gateAccount,
+              gateHomeDirectory: ctx.gateHomeDirectory,
+            }).stderrPath;
+          } catch {
+            bootGateStderrPath = undefined;
+          }
           await bootstrapGateDaemonForBoot({
             agentUid,
             expected,
@@ -2480,6 +2908,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
             ...(internals.readRuntimeState !== undefined ? { readState: internals.readRuntimeState } : {}),
             ...(internals.gateWaitBudgetMs !== undefined ? { waitBudgetMs: internals.gateWaitBudgetMs } : {}),
             ...(internals.gateWaitIntervalMs !== undefined ? { waitIntervalMs: internals.gateWaitIntervalMs } : {}),
+            ...(bootGateStderrPath !== undefined ? { gateDaemonStderrPath: bootGateStderrPath } : {}),
           });
         } catch (err) {
           input.print(

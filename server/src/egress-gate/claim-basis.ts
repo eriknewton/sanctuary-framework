@@ -252,6 +252,7 @@ export type ClaimSiteId =
   | "arming-wiring.posture-gate-process-up"
   | "arming-wiring.posture-port-owner-verified"
   | "arming-wiring.gate-account-home-layout"
+  | "arming-wiring.gate-plist-exists"
   // --- egress-gate, other modules ---
   | "anchor-registry.apply-union-flush"
   | "pf-anchor.arm"
@@ -1096,6 +1097,21 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     layer: "compute",
     branches: "single",
   },
+  "arming-wiring.gate-plist-exists": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "defaultGateDaemonPlistExists",
+    claim:
+      "the gate daemon plist for the uid is present (an lstat succeeded), so the D8 reconcile keeps the " +
+      "exclusive-routing marker: launchd could restart the gate from a plist a partial teardown left behind",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "compute",
+    // Single branch: only the lstat-SUCCESS path yields the observed `true`.
+    // The catch's fail-closed "present" is a boolean EXPRESSION (documented
+    // bound, not a `true` literal), so the ratchet does not -- and should not --
+    // count it as an observed claim.
+    branches: "single",
+  },
 
   // ------------------------------------------------- other egress-gate mods
   "arming-wiring.contextless-repark-claim": {
@@ -1705,7 +1721,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/unprovision.ts`]: 4,
   [`${CW}/verify.ts`]: 1,
   [`${EG}/anchor-registry.ts`]: 0,
-  [`${EG}/arming-wiring.ts`]: 21,
+  [`${EG}/arming-wiring.ts`]: 22,
   [`${EG}/claim-basis.ts`]: 3,
   [`${EG}/drift-guard.ts`]: 0,
   [`${EG}/exec-runner.ts`]: 0,

@@ -1071,6 +1071,33 @@ async function runProvisionFlowSteps(
       : "Harness daemon installed; agent now runs under the dedicated account.",
   );
 
+  // D8 SELF-HEAL PREFLIGHT (2026-07-22): only the fine-grained arm path runs
+  // the coarse publish+reload just below, and only that reload wedges on a
+  // STALE exclusive-routing marker a hard-interrupted prior arm left behind
+  // (the daemon composes EXCLUSIVE against the freshly-published COARSE rules,
+  // finds agent-reachable direct allows, and correctly fails closed -- the
+  // composition invariant working as designed). Run it AFTER the parked-install
+  // barrier above (so we know the harness is parked, not running) and BEFORE
+  // provision-egress. reconcileStaleExclusiveRouting removes the marker ONLY
+  // when it can prove no live confinement exists (no registry entry AND no
+  // serving gate), keeps it otherwise, and THROWS on a marker it cannot read
+  // -- which aborts fail-closed here (runProvisionFlow's catch restores the
+  // stood-down harness), never arming over an unreadable routing mode.
+  if (ctx.fineGrainedDeclared === true && ops.exclusiveEgress !== undefined) {
+    const reconcile = await ops.exclusiveEgress.reconcileStaleExclusiveRouting();
+    if (reconcile.reconciled) {
+      ops.print(
+        "Reconciled a stale exclusive-routing marker from an interrupted prior arm (no live " +
+          "confinement present); proceeding.",
+      );
+    } else if (reconcile.reason !== undefined) {
+      // A marker was present but KEPT (confinement may be live). Surface why --
+      // diagnosability is this PR's second theme, and otherwise the operator
+      // gets nothing before a possible provision-egress wedge below.
+      ops.print(`Exclusive-routing marker present but KEPT: ${reconcile.reason}.`);
+    }
+  }
+
   // Step 6.7 (confined-agent egress, design section 5 layer 1): provision the
   // harness's signed egress allow rules and statically verify them BEFORE
   // arming. The policy daemon is reachable by construction (step 6 just
