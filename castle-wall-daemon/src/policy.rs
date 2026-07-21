@@ -1479,6 +1479,7 @@ mod tests {
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
             agent_origin: None,
+            operator_baseline: None,
             rules: entries,
         };
         let mut rule_files: HashMap<String, Vec<u8>> = HashMap::new();
@@ -1678,6 +1679,7 @@ mod tests {
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
             agent_origin: None,
+            operator_baseline: None,
             rules: vec![entry],
         };
         let mut rule_files = HashMap::new();
@@ -1749,6 +1751,7 @@ mod tests {
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-05T00:00:00Z".to_string(),
             agent_origin: None,
+            operator_baseline: None,
             rules: vec![entry],
         };
         let mut rule_files = HashMap::new();

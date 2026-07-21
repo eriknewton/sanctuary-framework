@@ -41,6 +41,25 @@ pub struct AgentOrigin {
     pub system_uid_allow_ceiling: u32,
 }
 
+/// Optional operator/system-essential baseline allowlist covered by the same
+/// manifest signature as the allowlist rules.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorBaselineEssential {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_app_identifier: Option<String>,
+}
+
+/// Wrapper shape for the TS `OperatorBaseline`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorBaseline {
+    pub essentials: Vec<OperatorBaselineEssential>,
+}
+
 /// Unsigned manifest. Canonical-JSON of this shape is the signing input.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AllowlistManifest {
@@ -49,6 +68,8 @@ pub struct AllowlistManifest {
     pub issued_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_origin: Option<AgentOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_baseline: Option<OperatorBaseline>,
     pub rules: Vec<ManifestRuleEntry>,
 }
 
@@ -411,6 +432,7 @@ mod tests {
             fortress_id: "deadbeef".to_string(),
             issued_at: "2026-05-04T00:00:00Z".to_string(),
             agent_origin: None,
+            operator_baseline: None,
             rules: vec![ManifestRuleEntry {
                 rule_id: "uuid-1".to_string(),
                 file: "rule-1.json".to_string(),
