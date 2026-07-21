@@ -1330,6 +1330,21 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.provisionEgress).not.toHaveBeenCalled();
       expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
     });
+
+    it("D8 diagnosability: a marker that is KEPT (confinement may be live) SURFACES the reason before the flow continues", async () => {
+      const exclusive = happyExclusiveOps();
+      exclusive.reconcileStaleExclusiveRouting = vi.fn(async () => ({
+        reconciled: false,
+        reason: "the S1 anchor registry is in an uncertain state (dirty=true, quarantined=0)",
+      }));
+      const printed: string[] = [];
+      const { ops } = fineGrainedOps(exclusive, { print: vi.fn((line: string) => printed.push(line)) });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      // The marker was kept, the flow still armed, and the operator was told WHY
+      // the marker was kept (diagnosability before any subsequent wedge).
+      expect(result).toEqual({ kind: "armed-exclusive", uid: AGENT_UID, generationId: COMMITTED.generation_id });
+      expect(printed.join("\n")).toMatch(/marker present but KEPT: .*uncertain state/);
+    });
   });
 
   // ────────────────────────────────────────────────────────────────────────

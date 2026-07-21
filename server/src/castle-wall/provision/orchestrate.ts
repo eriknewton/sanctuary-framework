@@ -1090,6 +1090,11 @@ async function runProvisionFlowSteps(
         "Reconciled a stale exclusive-routing marker from an interrupted prior arm (no live " +
           "confinement present); proceeding.",
       );
+    } else if (reconcile.reason !== undefined) {
+      // A marker was present but KEPT (confinement may be live). Surface why --
+      // diagnosability is this PR's second theme, and otherwise the operator
+      // gets nothing before a possible provision-egress wedge below.
+      ops.print(`Exclusive-routing marker present but KEPT: ${reconcile.reason}.`);
     }
   }
 

@@ -1253,6 +1253,15 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     };
   }
   const enoent = (): NodeJS.ErrnoException => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  /** Clean registry snapshot (not dirty, nothing quarantined) with optional entries. */
+  const cleanRegistry = (
+    entries: { agent_uid: number }[] = [],
+  ): { entries: { agent_uid: number }[]; dirty: boolean; quarantined: { index: number; reason: string }[] } => ({
+    entries,
+    dirty: false,
+    quarantined: [],
+  });
+  const noPlist = async (): Promise<boolean> => false;
   function runtimeStateJson(
     overrides: Partial<{ agent_uid: number; gate_port: number; generation_id: number; pid: number; pid_start: string }> = {},
   ): string {
@@ -1271,7 +1280,7 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     const removeFile = vi.fn(async () => undefined);
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
       loadMarker: async () => null,
-      listRegistry: async () => ({ entries: [] }),
+      listRegistry: async () => cleanRegistry(),
       removeFile,
     });
     expect(result).toEqual({ reconciled: false });
@@ -1279,16 +1288,36 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     expect(input.audit).not.toHaveBeenCalled();
   });
 
-  it("ORPHANED (no registry entry for the uid, no gate runtime state) -> removes marker + gate policy, distinct audit, {reconciled:true}", async () => {
+  it("FIX-1 cross-uid: a marker declaring a DIFFERENT uid than the arm target is KEPT fail-closed (never judged against the wrong subject)", async () => {
+    // Arm target 999; marker declares 707. Another uid may be live, so we must
+    // not reconcile this marker against uid 999's liveness.
+    const input = { agentUid: 999, fortressPath: FORTRESS, audit: vi.fn(async () => undefined), print: vi.fn() };
+    const removeFile = vi.fn(async () => undefined);
+    const listRegistry = vi.fn(async () => cleanRegistry());
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry,
+      removeFile,
+    });
+    expect(result.reconciled).toBe(false);
+    expect(result.reason).toMatch(/cross-uid marker/);
+    // The guard is BEFORE any liveness probe: no registry read, no removal.
+    expect(listRegistry).not.toHaveBeenCalled();
+    expect(removeFile).not.toHaveBeenCalled();
+    expect(input.audit).not.toHaveBeenCalled();
+  });
+
+  it("ORPHANED (no registry entry for the uid, clean registry, no runtime state, no plist) -> removes marker + gate policy, distinct audit, {reconciled:true}", async () => {
     const input = reconInput();
     const removed: string[] = [];
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
       loadMarker: async () => ({ ...MARKER }),
       // A SIBLING uid is present, not ours -- so no entry for THIS uid.
-      listRegistry: async () => ({ entries: [{ agent_uid: 999 }] }),
+      listRegistry: async () => cleanRegistry([{ agent_uid: 999 }]),
       readRuntimeState: async () => {
         throw enoent();
       },
+      plistExists: noPlist,
       removeFile: async (p) => {
         removed.push(p);
       },
@@ -1302,12 +1331,12 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     );
   });
 
-  it("KEEPS the marker when the S5-1 registry still has an entry for the uid (no de-confinement)", async () => {
+  it("KEEPS the marker when the S5-1 registry still has a committed entry for the uid (no de-confinement)", async () => {
     const input = reconInput();
     const removeFile = vi.fn(async () => undefined);
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
       loadMarker: async () => ({ ...MARKER }),
-      listRegistry: async () => ({ entries: [{ agent_uid: MARKER.agent_uid }] }),
+      listRegistry: async () => cleanRegistry([{ agent_uid: MARKER.agent_uid }]),
       removeFile,
     });
     expect(result.reconciled).toBe(false);
@@ -1316,23 +1345,41 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     expect(input.audit).not.toHaveBeenCalled();
   });
 
-  it("KEEPS the marker on the crashed-mid-bring-up edge: a registry entry present at G3 but never committed still counts as present", async () => {
+  it("FIX-2 crashed-mid-bring-up: a DIRTY registry (a G3 generation staged but never committed forces dirty) is KEPT fail-closed", async () => {
     const input = reconInput();
     const removeFile = vi.fn(async () => undefined);
-    // Membership in the committed set is the guard, so a generation the
-    // coordinator armed at G3 but a crash never committed at G5 reads as
-    // potentially-live and is KEPT -- the repair verb recovers it, not this
-    // preflight. (The seam abstracts the registry; committed vs staged look
-    // identical here BY DESIGN -- the reconcile does not distinguish them.)
+    // A generation the coordinator armed at G3 but a crash never committed at G5
+    // forces the registry DIRTY. That is an uncertain S5-1 state; the repair
+    // verb, not this preflight, recovers it. Runtime state ENOENT + no plist
+    // would otherwise pass dimension 2, proving the DIRTY guard is what keeps it.
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
       loadMarker: async () => ({ ...MARKER }),
-      listRegistry: async () => ({ entries: [{ agent_uid: MARKER.agent_uid }] }),
+      listRegistry: async () => ({ entries: [{ agent_uid: MARKER.agent_uid }], dirty: true, quarantined: [] }),
       readRuntimeState: async () => {
         throw enoent();
       },
+      plistExists: noPlist,
       removeFile,
     });
     expect(result.reconciled).toBe(false);
+    expect(result.reason).toMatch(/uncertain state.*dirty=true/);
+    expect(removeFile).not.toHaveBeenCalled();
+  });
+
+  it("FIX-2 KEEPS the marker when the registry has a QUARANTINED entry (uncertain S5-1 state), even with no entry for the uid", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry: async () => ({ entries: [], dirty: false, quarantined: [{ index: 0, reason: "malformed" }] }),
+      readRuntimeState: async () => {
+        throw enoent();
+      },
+      plistExists: noPlist,
+      removeFile,
+    });
+    expect(result.reconciled).toBe(false);
+    expect(result.reason).toMatch(/uncertain state.*quarantined=1/);
     expect(removeFile).not.toHaveBeenCalled();
   });
 
@@ -1343,7 +1390,7 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
       loadMarker: async () => ({ ...MARKER }),
       // No registry entry -> reach the gate check; a live gate keeps the marker.
-      listRegistry: async () => ({ entries: [] }),
+      listRegistry: async () => cleanRegistry(),
       readRuntimeState: async () => runtimeStateJson(),
       verifyPortOwner,
       removeFile,
@@ -1362,13 +1409,30 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     const removeFile = vi.fn(async () => undefined);
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
       loadMarker: async () => ({ ...MARKER }),
-      listRegistry: async () => ({ entries: [] }),
+      listRegistry: async () => cleanRegistry(),
       readRuntimeState: async () => runtimeStateJson(),
       verifyPortOwner: async () => ({ ok: false as const, reason: "listener lookup failed: no listener" }),
       removeFile,
     });
     expect(result.reconciled).toBe(false);
     expect(result.reason).toMatch(/uncertain/);
+    expect(removeFile).not.toHaveBeenCalled();
+  });
+
+  it("FIX-3 partial-teardown TOCTOU: runtime state ABSENT but the gate daemon PLIST survives -> uncertain -> KEEP (launchd could restart the gate)", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry: async () => cleanRegistry(),
+      readRuntimeState: async () => {
+        throw enoent();
+      },
+      plistExists: async () => true,
+      removeFile,
+    });
+    expect(result.reconciled).toBe(false);
+    expect(result.reason).toMatch(/plist is present/);
     expect(removeFile).not.toHaveBeenCalled();
   });
 
@@ -1380,7 +1444,7 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
         loadMarker: async () => {
           throw new ExclusiveRoutingMarkerError("not valid JSON");
         },
-        listRegistry: async () => ({ entries: [] }),
+        listRegistry: async () => cleanRegistry(),
         removeFile,
       }),
     ).rejects.toThrow(ExclusiveRoutingMarkerError);
@@ -1394,10 +1458,15 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     let markerPresent = true;
     const deps = {
       loadMarker: async (): Promise<ExclusiveRoutingMarker | null> => (markerPresent ? { ...MARKER } : null),
-      listRegistry: async (): Promise<{ entries: { agent_uid: number }[] }> => ({ entries: [] }),
+      listRegistry: async (): Promise<{
+        entries: { agent_uid: number }[];
+        dirty: boolean;
+        quarantined: { index: number; reason: string }[];
+      }> => cleanRegistry(),
       readRuntimeState: async (): Promise<string> => {
         throw enoent();
       },
+      plistExists: noPlist,
       removeFile: async (p: string): Promise<void> => {
         removed.push(p);
         markerPresent = false;
@@ -1479,6 +1548,33 @@ describe("describeGateDaemonStderrTail (bounded gate-daemon stderr diagnostics)"
     });
     expect(out).toContain("[REDACTED PEM PRIVATE-KEY BLOCK]");
     expect(out).not.toContain("MIGkAgEBBDAsecretsecretsecret");
+  });
+
+  it("FIX-4 boundary-split PEM: a tail that STARTS mid-key body ending in END (BEGIN fell before the window) is redacted", async () => {
+    // The 2KB byte-tail cut can start inside a key: the leading base64 body up
+    // to a dangling END is secret and must not leak.
+    const out = await describeGateDaemonStderrTail("/x/err.log", {
+      readTail: async () => ({
+        text: "c2VjcmV0Ym9keWJhc2U2NGtleW1hdGVyaWFs\n-----END PRIVATE KEY-----\nlistening on port 49222",
+        truncated: true,
+      }),
+    });
+    expect(out).toContain("[REDACTED PARTIAL PEM PRIVATE-KEY BLOCK]");
+    expect(out).not.toContain("c2VjcmV0Ym9keWJhc2U2NGtleW1hdGVyaWFs");
+    // Ordinary diagnostics after the key are preserved.
+    expect(out).toContain("listening on port 49222");
+  });
+
+  it("FIX-4 boundary-split PEM: a DANGLING BEGIN with no END (truncated key write) redacts the body to tail end", async () => {
+    const out = await describeGateDaemonStderrTail("/x/err.log", {
+      readTail: async () => ({
+        text: "starting up\n-----BEGIN PRIVATE KEY-----\nMIGkAgEBBDAtruncatedbodybytes",
+        truncated: false,
+      }),
+    });
+    expect(out).toContain("[REDACTED PARTIAL PEM PRIVATE-KEY BLOCK]");
+    expect(out).not.toContain("MIGkAgEBBDAtruncatedbodybytes");
+    expect(out).toContain("starting up");
   });
 });
 
