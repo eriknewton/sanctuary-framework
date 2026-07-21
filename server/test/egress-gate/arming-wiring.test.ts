@@ -1597,8 +1597,10 @@ describe("waitForGateRuntime timeout diagnostics (Change 2)", () => {
         });
       // The daemon's REAL exit reason (from its stderr) is now in the error.
       await expect(call()).rejects.toThrow(/did not publish a matching runtime state[\s\S]*EADDRINUSE/);
-      // And the log's absolute path is named.
-      await expect(call()).rejects.toThrow(new RegExp(errLog.replace(/[.]/g, "\\.")));
+      // And the log's absolute path is named. `toThrow(string)` is a CONTAINS
+      // check, so assert the literal path (a stricter, escaping-free check than
+      // building a regex from a filesystem path).
+      await expect(call()).rejects.toThrow(errLog);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

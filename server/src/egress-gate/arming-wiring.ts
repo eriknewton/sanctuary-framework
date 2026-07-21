@@ -951,6 +951,17 @@ async function readBoundedFileTail(
  * PINS the oracle PUBLIC key and writes bind/policy/`[egress-gate]`-event
  * diagnostics), so this is defense-in-depth for a future log line, not a live
  * leak; it stays surgical (PEM blocks only) so real diagnostics survive intact.
+ *
+ * ACCEPTED RESIDUAL (re-gate 2026-07-22, consciously NOT fixed): a MARKERLESS
+ * base64 fragment -- a PEM whose BEGIN fell more than {@link
+ * GATE_DAEMON_STDERR_TAIL_MAX_BYTES} before EOF AND whose END is not yet in the
+ * tail window -- is not scrubbed (no BEGIN/END marker survives in the tail to
+ * anchor on). We accept it because (a) the gate daemon logs no key material
+ * (verified by three review lenses), so this is defense-in-depth for a
+ * hypothetical future log line, not a live leak, and (b) a broad "redact any
+ * long base64 run" heuristic would risk swallowing the very bind/startup
+ * diagnostics Change 2 exists to surface, defeating the feature. This is a
+ * considered limitation, not an oversight; do NOT add a base64 heuristic here.
  */
 function redactSecretsFromLogTail(text: string): string {
   // (a) Complete PEM private-key blocks.
