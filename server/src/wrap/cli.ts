@@ -969,7 +969,9 @@ async function reportHermesYamlDryRun(options: WrapOptions): Promise<void> {
     // Preview the parse-parity guard too: a dry run should report that the
     // real run would refuse (disagreement or PyYAML-unavailable) rather than
     // previewing an edit that would not actually happen. Production uses the
-    // real sidecar; only test code overrides it via __hermesParityTestHook.
+    // real sidecar, resolving the python interpreter by PyYAML importability
+    // across a CODE-CONTROLLED candidate list (no caller or env input); the
+    // __hermesParityTestHook DI seam is test-only and stays non-injectable.
     await assertHermesYamlParseParity(existingYaml, __hermesParityTestHook.parity);
     const plan = planHermesYamlInjection(existingYaml, {
       command,
@@ -2935,11 +2937,15 @@ export async function runWrap(
       // surface is backed up or rewritten, so a refusal leaves everything
       // untouched.
       //
-      // The sidecar is NON-injectable on this production mutating path: it
-      // always uses the real default python3 PyYAML parse. Only test code can
-      // override it, via __hermesParityTestHook (not a public dep), so a
-      // programmatic caller cannot pass an agreeing no-op parity and edit
-      // config.yaml without the real validator (DI-bypass closed 2026-07-03).
+      // The sidecar DI seam is NON-injectable on this production mutating
+      // path: the __hermesParityTestHook override is test-only (not a public
+      // dep), so a programmatic caller cannot pass an agreeing no-op parity and
+      // edit config.yaml without the real validator (DI-bypass closed
+      // 2026-07-03). The production path always runs a REAL PyYAML parse; it
+      // resolves WHICH python3 to run by probing a CODE-CONTROLLED candidate
+      // list (see hermesParityPythonCandidates) for PyYAML importability. No
+      // caller argument and no environment variable can steer that selection,
+      // so the parse cannot be pointed at an attacker-chosen interpreter.
       await assertHermesYamlParseParity(
         existingYaml,
         __hermesParityTestHook.parity
