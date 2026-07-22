@@ -2750,6 +2750,27 @@ export async function startExclusiveEgressBootSupervisor(input: {
       });
       results.push({ agent_uid: entry.agent_uid, outcome: { kind: "park-not-verified", reason } });
     }
+    // HONESTY (2026-07-23 follow-up to the empty-registry fall-through above):
+    // with an EMPTY registry the per-entry loop emits nothing, yet the oracle
+    // refresh loop ALSO cannot start here (it needs these keys). The
+    // fall-through this function now relies on promises that a later-armed agent
+    // is picked up by that loop -- a promise BROKEN when the keys are
+    // unavailable. Returning a silent no-op would hide it, so say it loudly: an
+    // agent armed after this boot would otherwise hit the exact 503
+    // liveness_refused the fall-through was meant to prevent, with no signal why.
+    if (entries.length === 0) {
+      input.print(
+        `[castle-wall] boot: supervisor oracle keys unavailable (${(err as Error).message}); ` +
+          "the exclusive-egress liveness refresh loop did NOT start. The registry is empty now, so no " +
+          "confined agent exists yet, but any agent armed after this boot will NOT get its liveness token refreshed " +
+          "and its gate will deny ALL egress within one token TTL. " +
+          "Repair: sudo sanctuary protect --repair-egress-gate",
+      );
+      await input.audit("exclusive_egress_boot_release", {
+        outcome: "oracle-loop-not-started",
+        reason: `supervisor oracle keys unavailable: ${(err as Error).message}`,
+      });
+    }
     return { results, stopOracleLoop: () => undefined };
   }
   // Gate-uid cache for the refresh loop (seeded by the boot release, extended
