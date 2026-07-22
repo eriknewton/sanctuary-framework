@@ -50,6 +50,7 @@ import {
   type LinuxAuditDrainOptions,
 } from "./linux-audit-drain.js";
 import { loadFortressProducerKey } from "./producer-signature.js";
+import { CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED } from "../constants.js";
 import { RuntimeLinuxActivationError } from "./errors.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -383,7 +384,12 @@ export async function activateLinuxProducerSignedCastleWall(
           input.fortressId,
           {
             reason: err.message,
-            evidence_basis: "producer_signed",
+            // HONESTY: this is a consumer-emitted NOT-ARMED fault signal, NOT
+            // accepted enforcement evidence, and it carries NO producer
+            // signature - so it must never claim the `producer_signed` basis.
+            // Read-side attributors already fail-closed-reject a record without
+            // a verified producer signature; the honest label matches that.
+            evidence_basis: CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED,
             armed: false,
             note: "drain transport/persistence fault - wall is NOT armed (signed enforcement evidence is not reaching the consumer)",
           },

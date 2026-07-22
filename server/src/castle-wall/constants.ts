@@ -30,9 +30,12 @@ export const CASTLE_WALL_AUDIT_PROVENANCE_VALUE =
  * Audit operation name for the periodic Castle Wall daemon LIVENESS heartbeat
  * (observability Slice 2). The daemon appends an `l1` audit entry under this
  * operation on an audit-cadence interval (~30-60s), stamped with the same
- * `cw_source` provenance marker and producer-signature basis that enforcement
- * evidence uses, so the reader can tell an alive-but-idle wall from one that
- * silently died in a quiet window.
+ * `cw_source` provenance marker that enforcement evidence carries. Unlike
+ * signed enforcement evidence, the heartbeat is a DIRECT audit append (not
+ * routed through the signing consumer), so a genuine beat is channel-basis
+ * (marker only, NO producer signature) on every host, Linux included (see
+ * `runtime/macos-daemon.ts`). The reader uses it to tell an alive-but-idle wall
+ * from one that silently died in a quiet window.
  *
  * HONESTY: a heartbeat proves the daemon process is ALIVE, NOT that it
  * adjudicated a real flow. It is deliberately kept OUT of
@@ -156,6 +159,18 @@ export const CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY = "cw_evidence_basis" as cons
 export const CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED = "producer_signed" as const;
 export const CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED =
   "channel_authenticated_unsigned" as const;
+/**
+ * Basis for a consumer-emitted NOT-ARMED drain FAULT signal (e.g. the
+ * `castle_wall_drain_failed` record the Linux activation gate writes when the
+ * daemon link wedges). It is NOT accepted enforcement evidence and carries NO
+ * producer signature - the TypeScript gate emits it locally to record that the
+ * daemon's signed evidence has stopped reaching the consumer. Labeling it
+ * honestly (never `producer_signed`) keeps the fault record from claiming an
+ * authenticity it does not have; every read-side attributor already re-verifies
+ * and fail-closed-rejects a record lacking a verified producer signature.
+ */
+export const CASTLE_WALL_EVIDENCE_BASIS_DRAIN_FAULT_UNSIGNED =
+  "drain_fault_unsigned" as const;
 
 /** WAL-chain sequence key grafted onto persisted details by the audit consumer. */
 export const CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY = "seq" as const;

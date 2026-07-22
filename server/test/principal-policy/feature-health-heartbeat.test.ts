@@ -4,7 +4,9 @@
  * Slice 1 (#516) left a green-while-dead gap: a wall that silently dies (process
  * killed, sysext unbound) in a QUIET window read `unknown`/no_evidence, because
  * nothing emitted liveness in quiet windows. Slice 2 adds a periodic,
- * producer-signed `castle_wall_heartbeat` and the reader logic that turns a
+ * channel-basis `castle_wall_heartbeat` (the real producer emits it as a DIRECT,
+ * unsigned audit append with only the `cw_source` marker — see the
+ * `appendChannelHeartbeat` fixture below) and the reader logic that turns a
  * MISSING heartbeat into an honest `dead_no_heartbeat`/`fault` alarm while a
  * FRESH heartbeat reports the honest alive-but-idle `unknown`.
  *
@@ -12,9 +14,12 @@
  * are pinned hard:
  *
  *   1. A heartbeat is NOT enforcement evidence; it NEVER earns active/green.
- *   2. The heartbeat is gated by the SAME producer-signature re-verify path as
- *      `egress_blocked` — a FORGED heartbeat (right op + cw_source marker but
- *      bad/missing producer signature) must NOT count on a key-bearing host.
+ *   2. The real producer's beat is channel-basis (marker only, NO producer
+ *      signature), so a GENUINE beat counts even on a key-bearing host — the
+ *      liveness gate is deliberately LOOSER than the enforcement-evidence
+ *      signature gate `egress_blocked` uses. What IS dropped on a key-bearing
+ *      host is a FORGED beat that CLAIMS `producer_signed` with a bad/missing
+ *      signature; a genuine unsigned beat is not.
  *   3. Fault precedence is unchanged: a fresh fault still beats a fresh
  *      heartbeat.
  *   4. A tainted/integrity-failed read still fails closed to `unknown`.
