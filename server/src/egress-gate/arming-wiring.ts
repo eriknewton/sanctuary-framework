@@ -2688,9 +2688,22 @@ export async function startExclusiveEgressBootSupervisor(input: {
         "Other agents proceed. Repair: sudo sanctuary protect --repair-egress-gate",
     );
   }
-  if (entries.length === 0) {
-    return { results: [], stopOracleLoop: () => undefined };
-  }
+  // NOTE (fix 2026-07-23): do NOT early-return on an empty registry. The
+  // persistent oracle refresh loop below RE-SCANS the registry every tick and
+  // is the only thing that keeps a confined agent's short-TTL liveness token
+  // fresh; the gate denies every CONNECT the moment that token expires. If the
+  // boot daemon starts with an EMPTY registry (a fresh boot with no prior
+  // confined agent, or any start after the registry was emptied by an unprotect)
+  // and we returned here, NO loop would exist -- so an agent armed LATER (its
+  // arm mints exactly ONE token) would never get a refresh, its token would
+  // expire within one TTL, and its gate would fail-closed-deny ALL egress,
+  // confining the agent into non-functionality until the daemon next restarts
+  // with a non-empty registry. Fall through instead: the boot-release phase is a
+  // no-op over the empty entry set (runBootExclusiveEgressRelease([]) -> []) and
+  // the refresh loop starts and picks up any subsequently-armed agent. Proven by
+  // the 2026-07-23 S5 positive-through-gate drill (RESULTS in
+  // Review/Sanctuary/drill-evidence-2026-07-23/): daemon kickstarted on an empty
+  // registry, then armed -> gate 503 liveness_refused deterministically.
 
   // PHASE 1 (fix-round-2 HIGH-3): resolve EVERY entry before any side
   // effect, so contextless re-parks can be ordered strictly before any
