@@ -435,6 +435,60 @@ describe("startExclusiveEgressBootSupervisor (fix-round H3: persistent registry-
     expect(refreshCalls.length).toBeGreaterThan(0);
     expect(new Set(refreshCalls as number[])).toEqual(new Set([502]));
   });
+
+  it("an agent armed AFTER a boot with an EMPTY registry still gets its token refreshed (the loop starts regardless)", async () => {
+    // The 2026-07-23 S5 positive-through-gate drill defect: when the boot
+    // daemon starts with an EMPTY registry (a fresh boot with no prior confined
+    // agent, or any start after an unprotect emptied it) the pre-fix code
+    // early-returned with a NO-OP stopOracleLoop, so the persistent refresh loop
+    // never existed. An agent armed LATER (its arm mints exactly one token)
+    // then never got a refresh, its short-TTL liveness token expired, and its
+    // gate denied ALL egress (fail-closed non-functional) until the next daemon
+    // restart with a non-empty registry. The loop must start regardless so a
+    // later-armed agent is picked up by the re-scan.
+    const lateEntry: BootRegistryEntry = {
+      agent_uid: 601,
+      gate_port: 40002,
+      fortress_path: "/fortress/b",
+      generation_id: 3,
+    };
+    let scans = 0;
+    const refreshCalls: {
+      gateUid: number;
+      binding: { agentUid: number; gatePort: number; generationId: number };
+    }[] = [];
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX, // never called: no entries at boot
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 5,
+      internals: baseInternals({
+        listRegistryEntries: async () => {
+          scans += 1;
+          // Boot read (scan 1): EMPTY. Later ticks: the post-boot-armed agent
+          // (the install CLI committed it after the daemon was already up).
+          return { entries: scans <= 1 ? [] : [lateEntry], quarantined: [], dirty: false };
+        },
+        loadMarker: async (fortressPath) =>
+          fortressPath === "/fortress/b" ? { agent_uid: 601, gate_uid: 612 } : null,
+        createOracle: ((_priv: never, gateUid: number) => ({
+          refresh: async (binding: { agentUid: number; gatePort: number; generationId: number }) => {
+            refreshCalls.push({ gateUid, binding });
+            return null;
+          },
+        })) as never,
+      }),
+    });
+    // No boot-release ran (empty registry), but the loop must be LIVE, not the
+    // pre-fix no-op: stopOracleLoop clears a REAL running timer.
+    expect(handle.results).toHaveLength(0);
+    await sleep(80);
+    handle.stopOracleLoop();
+    // Pre-fix: refreshCalls stays EMPTY (no loop ever ran) and this fails.
+    const late = refreshCalls.filter((c) => c.gateUid === 612);
+    expect(late.length).toBeGreaterThan(0);
+    expect(late[0]!.binding).toEqual({ agentUid: 601, gatePort: 40002, generationId: 3 });
+  });
 });
 
 describe("startExclusiveEgressBootSupervisor (fix-round-2 BLOCKER-1: throws never bypass the real re-park)", () => {
