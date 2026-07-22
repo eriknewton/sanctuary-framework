@@ -917,6 +917,26 @@ export function policyDaemonInstallBootArgs(
   return args;
 }
 
+/**
+ * Resolve the argv prefix that launches the exclusive-egress gate daemon.
+ *
+ * The gate daemon runs as the confined gate service account, whose launchd
+ * PATH has no `node`. Both a supplied `--binary` path and the fallback CLI
+ * path are `.js` entrypoints carrying a `#!/usr/bin/env node` shebang, which
+ * fails with `env: node: No such file or directory` under that account and
+ * crashes the daemon at startup (the "D9" gate-daemon crash proven on
+ * hardware 2026-07-21). Pinning `process.execPath` (an absolute interpreter)
+ * makes the launch independent of the account's PATH.
+ *
+ * Single chokepoint for both provisioning builders so the two call sites can
+ * never drift back to a bare shebang-dependent argv.
+ */
+export function resolveGateDaemonArgvPrefix(cliBinary?: string): string[] {
+  return cliBinary !== undefined && cliBinary.length > 0
+    ? [process.execPath, cliBinary]
+    : [process.execPath, process.argv[1] ?? "sanctuary"];
+}
+
 export interface AutoProvisionPolicyDaemonSignals {
   socketReachable: boolean;
   diskForThisFortress: boolean;
@@ -1114,10 +1134,7 @@ export async function runAutoProvisionForWrap(
       harnessArgv: capturedHarnessArgv,
       harnessLogDir: resolveHarnessDaemonLogDir(newAccountHome),
       agentTemplate: agentId,
-      gateDaemonArgvPrefix:
-        options.cliBinary !== undefined && options.cliBinary.length > 0
-          ? [options.cliBinary]
-          : [process.execPath, process.argv[1] ?? "sanctuary"],
+      gateDaemonArgvPrefix: resolveGateDaemonArgvPrefix(options.cliBinary),
       excludeUids: [consoleOwnerUid],
       gateAccountCeiling: PROVISION_CEILING,
       gateHomeDirectory: `${NEW_ACCOUNT_HOME_BASE}/${deriveGateAccountName(agentId)}`,
@@ -2732,7 +2749,7 @@ export async function uninstallAutoProvisionedHarnessDaemon(): Promise<void> {
  * plumbing, or account ops. `auditSource` distinguishes the verbs in the
  * audit trail.
  */
-function buildHermesExclusiveCliWiring(input: {
+export function buildHermesExclusiveCliWiring(input: {
   agentUid: number;
   accountName: string;
   newAccountHome: string;
@@ -2760,10 +2777,7 @@ function buildHermesExclusiveCliWiring(input: {
     harnessArgv: input.harnessArgv,
     harnessLogDir: resolveHarnessDaemonLogDir(input.newAccountHome),
     agentTemplate: agentId,
-    gateDaemonArgvPrefix:
-      input.cliBinary !== undefined && input.cliBinary.length > 0
-        ? [input.cliBinary]
-        : [process.execPath, process.argv[1] ?? "sanctuary"],
+    gateDaemonArgvPrefix: resolveGateDaemonArgvPrefix(input.cliBinary),
     excludeUids: [input.operatorUid],
     gateAccountCeiling: PROVISION_CEILING,
     gateHomeDirectory: `${NEW_ACCOUNT_HOME_BASE}/${deriveGateAccountName(agentId)}`,

@@ -61,6 +61,8 @@ import {
   LAUNCHCTL_TIMEOUT_MS,
   LAUNCHCTL_KILL_SIGNAL,
   runAgentEgressProbesAsUid,
+  buildHermesExclusiveCliWiring,
+  resolveGateDaemonArgvPrefix,
 } from "../../src/wrap/auto-provision.js";
 import { HERMES_ENDPOINT_SET } from "../../src/castle-wall/provision/egress.js";
 import {
@@ -1832,5 +1834,61 @@ describe("confined-agent egress: runAgentEgressProbesAsUid (injected execFile, n
     expect(attempts.get("https://example.com:443/")).toBe(1);
     const control = report.rows[report.rows.length - 1]!;
     expect(control.pass).toBe(false);
+  });
+});
+
+describe("resolveGateDaemonArgvPrefix: gate-daemon interpreter chokepoint (real D9)", () => {
+  // Both provisioning builders route through this single helper, so pinning it
+  // here guards BOTH construction sites (the inline builder in
+  // runAutoProvisionForWrap AND buildHermesExclusiveCliWiring) against drifting
+  // back to a bare `[cliBinary]` shebang-dependent argv.
+  it("prefixes the node interpreter when a cliBinary is supplied (the D9 crash path)", () => {
+    const cliBinary = "/opt/sanctuary/dist/cli.js";
+    const prefix = resolveGateDaemonArgvPrefix(cliBinary);
+    expect(prefix[0]).toBe(process.execPath);
+    expect(prefix[1]).toBe(cliBinary);
+    // The bare-binary form the bug rode in on must never be the whole prefix.
+    expect(prefix).not.toEqual([cliBinary]);
+  });
+
+  it("prefixes the node interpreter when cliBinary is empty or undefined (the else branch that already worked)", () => {
+    expect(resolveGateDaemonArgvPrefix(undefined)[0]).toBe(process.execPath);
+    expect(resolveGateDaemonArgvPrefix("")[0]).toBe(process.execPath);
+  });
+});
+
+describe("buildHermesExclusiveCliWiring: gate-daemon interpreter prefix (real D9)", () => {
+  const baseInput = (cliBinary?: string) => ({
+    agentUid: 503,
+    accountName: "_sanctuary-hermes",
+    newAccountHome: "/var/empty/_sanctuary-hermes",
+    wallFortressPath: "/tmp/fortress",
+    harnessArgv: [process.execPath, "/opt/agent.js"],
+    operatorUid: 501,
+    auditSource: "test",
+    print: () => {},
+    // accountOps is not consulted when computing gateDaemonArgvPrefix.
+    accountOps: {} as never,
+    cliBinary,
+  });
+
+  it("prefixes the gate-daemon argv with the node interpreter when a cliBinary is supplied, so the daemon launches under a confined account whose launchd PATH has no `node`", () => {
+    // The confined gate account (uid 504) has no `node` on its launchd PATH.
+    // A bare `[cliBinary]` prefix relies on the `#!/usr/bin/env node` shebang,
+    // which fails with `env: node: No such file or directory` -- the real "D9"
+    // gate-daemon startup crash proven on hardware 2026-07-21. The interpreter
+    // must be pinned explicitly via process.execPath.
+    const cliBinary = "/opt/sanctuary/dist/cli.js";
+    const wiring = buildHermesExclusiveCliWiring(baseInput(cliBinary));
+    expect(wiring.gateDaemonArgvPrefix[0]).toBe(process.execPath);
+    expect(wiring.gateDaemonArgvPrefix[1]).toBe(cliBinary);
+    // The bare-binary form (which the shebang crash rode in on) must never be
+    // the whole prefix.
+    expect(wiring.gateDaemonArgvPrefix).not.toEqual([cliBinary]);
+  });
+
+  it("still pins the interpreter when no cliBinary is supplied (the else branch that already worked)", () => {
+    const wiring = buildHermesExclusiveCliWiring(baseInput(undefined));
+    expect(wiring.gateDaemonArgvPrefix[0]).toBe(process.execPath);
   });
 });
