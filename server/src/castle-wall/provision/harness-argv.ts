@@ -48,8 +48,13 @@ export interface ResolveHermesGatewayArgvOptions {
 /**
  * Candidate absolute interpreter paths to probe, in preference order. Kept
  * explicit (not PATH search) because LaunchDaemons do not source shell profiles.
+ *
+ * Exported as the single source of truth for the "system python interpreters to
+ * probe" list: the Hermes config.yaml parse-parity guard
+ * (wrap/hermes-yaml-parse-parity.ts) reuses this same ordered list so the two
+ * python-resolution paths never drift.
  */
-const SYSTEM_PYTHON3_CANDIDATES = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"];
+export const SYSTEM_PYTHON3_CANDIDATES = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"];
 
 const VENV_SITE_PACKAGES_CANDIDATES = [
   "venv/lib/python3.14/site-packages",

@@ -27,6 +27,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   assertHermesYamlParseParity,
+  hermesParityPythonCandidates,
+  PYYAML_PARSE_PROGRAM,
   HermesYamlParityRefusedError,
   type SidecarExec,
   type ParseParityOptions,
@@ -322,7 +324,205 @@ describe("assertHermesYamlParseParity - top-level non-mapping REFUSES (mocked)",
   });
 });
 
-// -- Real-sidecar tests (skipped when python3 + PyYAML absent) ------------
+// -- Interpreter resolution by PyYAML importability (mocked, deterministic) --
+//
+// These pin the resolver's precedence WITHOUT depending on which real python on
+// the host actually carries PyYAML -- the exact hazard that sank the first fix
+// (first-EXISTING != first-with-PyYAML, and a dev Mac is the INVERSE of the
+// drill host). The injected exec decides per-candidate whether that interpreter
+// "has PyYAML", so every case is deterministic and platform-agnostic.
+
+/**
+ * A sidecar that RECORDS the interpreters it was asked to run, and answers
+ * per-interpreter: `withPyYaml` interpreters return a successful agreeing parse
+ * (exit 0); interpreters in `absent` return exit code null (could not run at
+ * all); everything else returns IMPORT_MISSING (exit 20: "ran but no PyYAML").
+ * Lets a test assert BOTH the outcome and exactly which candidates were probed.
+ */
+function recordingResolverExec(opts: {
+  withPyYaml: string[];
+  absent?: string[];
+  view?: { hasBlock: boolean; entryNames: string[] };
+}): { exec: SidecarExec; calls: string[] } {
+  const calls: string[] = [];
+  // Default agreeing view: matches the scanner's read of the single-entry
+  // `mcp_servers: { weather }` yaml these tests use, so a successful resolve
+  // passes the parity check. (Resolution, not parity semantics, is under test
+  // here.)
+  const view = opts.view ?? { hasBlock: true, entryNames: ["weather"] };
+  const absent = new Set(opts.absent ?? []);
+  const withPyYaml = new Set(opts.withPyYaml);
+  const exec: SidecarExec = async (command) => {
+    calls.push(command);
+    if (absent.has(command)) return { stdout: "", stderr: "", code: null };
+    if (withPyYaml.has(command)) {
+      return { stdout: JSON.stringify(view), stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 20 }; // ran, no PyYAML
+  };
+  return { exec, calls };
+}
+
+describe("assertHermesYamlParseParity - interpreter resolution precedence (mocked)", () => {
+  const yaml = "mcp_servers:\n  weather:\n    command: \"uvx\"\n";
+  const HOMEBREW = "/opt/homebrew/bin/python3";
+  const USRLOCAL = "/usr/local/bin/python3";
+  const SYSTEM = "/usr/bin/python3";
+
+  it("candidate list is the absolute SYSTEM_PYTHON3_CANDIDATES only (no bare python3 / PATH / env input)", () => {
+    expect(hermesParityPythonCandidates()).toEqual([HOMEBREW, USRLOCAL, SYSTEM]);
+  });
+
+  it("runs the parse interpreter in a hardened import environment (`-E` ahead of `-c`)", async () => {
+    // Defense-in-depth: the fail-closed validator must not import an
+    // attacker-planted `yaml` via PYTHONPATH/cwd. Every parse invocation passes
+    // `-E` (ignore PYTHONPATH/PYTHONHOME) before `-c`; the cwd vector is closed
+    // by the sys.path absolute-only filter inside the parse program itself.
+    let seenArgs: string[] | undefined;
+    const exec: SidecarExec = async (_command, args) => {
+      seenArgs = args;
+      return {
+        stdout: JSON.stringify({ hasBlock: true, entryNames: ["weather"] }),
+        stderr: "",
+        code: 0,
+      };
+    };
+    await expect(
+      assertHermesYamlParseParity(yaml, { exec })
+    ).resolves.toBeUndefined();
+    expect(seenArgs?.[0]).toBe("-E");
+    expect(seenArgs?.[1]).toBe("-c");
+  });
+
+  it("parse program sanitizes sys.path BEFORE importing any non-builtin (no cwd import-hijack of json/yaml)", () => {
+    // `import json`/`import yaml` do sys.path lookups; if either ran before the
+    // sys.path filter, a cwd-planted ./json.py or ./yaml.py could forge the
+    // parse output (this program emits its result via json.dumps). Only `sys`
+    // (a builtin, never resolved via sys.path) may be imported before the
+    // filter drops the `-c` '' cwd entry.
+    const lines = PYYAML_PARSE_PROGRAM.split("\n");
+    const filterIdx = lines.findIndex(
+      (l) => l.includes("sys.path") && l.includes("startswith")
+    );
+    expect(filterIdx).toBeGreaterThan(0);
+    const importsBeforeFilter = lines
+      .slice(0, filterIdx)
+      .filter((l) => /^\s*(import|from)\b/.test(l));
+    expect(importsBeforeFilter).toEqual(["import sys"]);
+  });
+
+  it("THE REGRESSION HOST: homebrew python exists but lacks PyYAML while a later candidate has it -> selects the one WITH PyYAML", async () => {
+    // The first fix picked homebrew-first BY EXISTENCE and shipped RED on
+    // exactly this shape. The resolver must skip the PyYAML-less homebrew
+    // python and resolve the system python that can actually import yaml.
+    const { exec, calls } = recordingResolverExec({ withPyYaml: [SYSTEM] });
+    await expect(
+      assertHermesYamlParseParity(yaml, { exec })
+    ).resolves.toBeUndefined();
+    // Probed homebrew (no PyYAML) -> usr/local (no PyYAML) -> system (has it),
+    // and stopped there (never fell through to bare python3).
+    expect(calls).toEqual([HOMEBREW, USRLOCAL, SYSTEM]);
+  });
+
+  it("selects the homebrew python when IT is the one with PyYAML (drill-host shape)", async () => {
+    const { exec, calls } = recordingResolverExec({ withPyYaml: [HOMEBREW] });
+    await expect(
+      assertHermesYamlParseParity(yaml, { exec })
+    ).resolves.toBeUndefined();
+    expect(calls).toEqual([HOMEBREW]); // stopped at the first, which had PyYAML
+  });
+
+  it("an explicit pythonPath is used as-is and NEVER falls back when it lacks PyYAML", async () => {
+    // Precedence top: an explicit interpreter pin must fail closed rather than
+    // silently resolving a different python behind the caller's back.
+    const { exec, calls } = recordingResolverExec({ withPyYaml: [SYSTEM] });
+    const err = await assertHermesYamlParseParity(yaml, {
+      exec,
+      pythonPath: "/pinned/python3",
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe(
+      "sidecar-unavailable"
+    );
+    expect(calls).toEqual(["/pinned/python3"]); // no fallback to SYSTEM
+  });
+
+  it("an explicit EMPTY-STRING pythonPath still pins and fails closed (no truthiness fallback)", async () => {
+    // Regression guard for the `!== undefined` fix: an empty-string pin is an
+    // explicit (if invalid) interpreter choice and must NOT fall through to the
+    // candidate list. It pins [""], which cannot run, so the guard fails closed.
+    const { exec, calls } = recordingResolverExec({
+      withPyYaml: [SYSTEM],
+      absent: [""],
+    });
+    const err = await assertHermesYamlParseParity(yaml, {
+      exec,
+      pythonPath: "",
+    }).catch((e) => e);
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe(
+      "sidecar-unavailable"
+    );
+    expect(calls).toEqual([""]); // pinned to "", never fell back to SYSTEM
+  });
+
+  it("refuses fail-closed (never reaching for a PATH python3) with a PyYAML-mentioning message when NO absolute candidate has PyYAML", async () => {
+    const { exec, calls } = recordingResolverExec({ withPyYaml: [] });
+    const err = await assertHermesYamlParseParity(yaml, { exec }).catch(
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe(
+      "sidecar-unavailable"
+    );
+    expect((err as HermesYamlParityRefusedError).message).toContain("PyYAML");
+    // Tried exactly the three absolute candidates and then failed closed --
+    // never fell back to a PATH-resolved bare "python3".
+    expect(calls).toEqual([HOMEBREW, USRLOCAL, SYSTEM]);
+  });
+
+  it("a candidate WITH PyYAML that rejects the file does NOT fall through to another python", async () => {
+    // exit 21 (unparseable) means a real parser refused the FILE -- the file is
+    // the problem, not the interpreter, so the resolver must stop, not keep
+    // trying other pythons hoping for a different answer.
+    const calls: string[] = [];
+    const exec: SidecarExec = async (command) => {
+      calls.push(command);
+      // homebrew lacks PyYAML (skip); usr/local HAS PyYAML but the file is bad.
+      if (command === HOMEBREW) return { stdout: "", stderr: "", code: 20 };
+      return { stdout: "", stderr: "", code: 21 };
+    };
+    const err = await assertHermesYamlParseParity(yaml, { exec }).catch(
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe(
+      "sidecar-unavailable"
+    );
+    expect(calls).toEqual([HOMEBREW, USRLOCAL]); // stopped at the first with PyYAML
+  });
+});
+
+// -- Real-sidecar tests (skipped when bare `python3` cannot import PyYAML) --
+//
+// The gate stays keyed to bare `python3` (the production resolver now uses
+// ABSOLUTE candidates only). This keeps the real-tests run/skip decision -- and
+// therefore the Linux-CI passing count -- independent of the resolver's
+// candidate set: coupling the gate to the absolute candidates could flip these
+// tests' run/skip status on some hosts and make the `.test-baseline` count
+// platform-dependent. The resolver's precedence (including the exact
+// regression-host case) is covered deterministically by the injected-exec unit
+// tests above; the drill host validates the real fix via the actual
+// `protect --hermes` CLI, not vitest.
+//
+// HONEST caveat (the resolver no longer has a bare-`python3` fallback): the gate
+// and the resolver CAN diverge on a host where bare `python3` imports yaml but
+// none of the three absolute candidates does (e.g. a pyenv/conda/asdf box whose
+// only PyYAML sits on a shim `python3`). There the gate runs these real tests
+// while the resolver fail-closes, so a case like "resolves on real agreement"
+// would spuriously FAIL. That is fail-SAFE (a false RED, never a false GREEN),
+// touches no production surface, and is accepted to keep the CI baseline
+// deterministic.
 
 function hasRealPyYaml(): boolean {
   try {
