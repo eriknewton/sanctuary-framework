@@ -349,7 +349,8 @@ describe("FederationJoinerTrustRootStore", () => {
     const masterKey = await testMasterKey(storage);
     const { record } = buildJoinerRecord();
     const store = new FederationJoinerTrustRootStore(storage, masterKey);
-    await store.save(record);
+    // Setup write routes through the only public write path (the locked chokepoint).
+    await store.lockedUpdate(() => record);
 
     const raw = await storage.read(
       FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
@@ -591,10 +592,10 @@ describe("adoptFederationJoinerPlannedRoot (planned auto-adopt)", () => {
     const masterKey = await testMasterKey(storage);
     const { record, home } = buildJoinerRecord();
     // Simulate a joiner that already adopted a planned rotation at serial 5.
-    await new FederationJoinerTrustRootStore(storage, masterKey).save({
-      ...record,
-      adopted_rotation_serial: 5,
-    });
+    // Setup routes through the only public write path (the locked chokepoint).
+    await new FederationJoinerTrustRootStore(storage, masterKey).lockedUpdate(
+      () => ({ ...record, adopted_rotation_serial: 5 }),
+    );
     // A cert at serial 5 (equal, not advancing) must be rejected.
     const rotation = buildPlannedRotation({
       current: record,
@@ -1216,6 +1217,54 @@ describe("cross-class refusal + retired custody-core is gone", () => {
     // The kept additive fields remain part of the surface.
     expect(typeof surface.adoptFederationJoinerPlannedRoot).toBe("function");
     expect(typeof surface.persistFederationJoinerTrustRoot).toBe("function");
+  });
+
+  it("no public raw writer: the store exposes load() + lockedUpdate() but NOT a bypass save()", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const store = new FederationJoinerTrustRootStore(storage, masterKey);
+    // The raw `save()` writer is GONE from the public surface; the grow-only
+    // anti-rollback invariant is STRUCTURALLY enforced (there is no public write
+    // path that bypasses the locked chokepoint), not merely conventional.
+    expect(
+      (store as unknown as Record<string, unknown>).save,
+    ).toBeUndefined();
+    expect(typeof store.load).toBe("function");
+    expect(typeof store.lockedUpdate).toBe("function");
+  });
+
+  it("chokepoint: even a STALE mutation through lockedUpdate cannot drop the revoked set / floor", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    const deadK1 = toBase64url(randomBytes(32));
+    // Seed {deadK1}/floor 5 via the public writer.
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadK1],
+      highestRevocationSerial: 5,
+    });
+    // A direct lockedUpdate whose mutation returns a record carrying NO
+    // revoked/floor (a stale caller) must NOT drop them - the chokepoint merges
+    // grow-only against the current-under-lock record.
+    const store = new FederationJoinerTrustRootStore(storage, masterKey);
+    await store.lockedUpdate((current) => ({
+      fortress_id: current!.fortress_id,
+      node_id: current!.node_id,
+      pinned_master_pubkey: current!.pinned_master_pubkey,
+      issuing_principal_cert: current!.issuing_principal_cert,
+      local_node_cert: current!.local_node_cert,
+      local_node_private_key: current!.local_node_private_key,
+      // deliberately NO revoked_root_pubkeys / highest_revocation_serial
+    }));
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.revoked_root_pubkeys?.has(deadK1)).toBe(true);
+    expect(loaded?.record.highest_revocation_serial).toBe(5);
   });
 });
 

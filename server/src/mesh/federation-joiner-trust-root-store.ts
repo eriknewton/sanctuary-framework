@@ -176,7 +176,100 @@ export class FederationJoinerTrustRootStore {
     }
   }
 
-  async save(record: FederationJoinerTrustRootRecord): Promise<void> {
+  /**
+   * The ONLY write path for the joiner record. There is deliberately NO public
+   * raw writer: the grow-only anti-rollback invariant is STRUCTURALLY enforced,
+   * not merely conventional. Under the `.joiner-trust-root.lock` cross-process
+   * lock it:
+   *   1. Loads the CURRENT record fail-closed (MED-1): `load()` returns null ONLY
+   *      for a genuinely-absent record; a decode/transient throw is RE-THROWN,
+   *      never treated as "absent" (which would let a lower floor overwrite -
+   *      AGENTS.md rule 5).
+   *   2. Applies the caller's `mutate(current)` to get the intended next record.
+   *   3. ALWAYS enforces the grow-only anti-rollback invariant against the CURRENT
+   *      on-disk record loaded UNDER THE LOCK: the revoked-root set is `current
+   *      UNION next` and the compromise floor is `max(current, next)` - never
+   *      dropped or lowered; a mutation that tries to LOWER the floor is refused
+   *      loudly. (The planned `adopted_rotation_serial` is per-lineage - reset on
+   *      a fresh join, advanced on a planned adopt - so it is the mutator's to set
+   *      and is NOT merged here.)
+   *   4. Raw-writes the merged record (`#writeRaw` re-runs full validation) and
+   *      releases the lock in `finally`.
+   *
+   * SERIALIZATION ACCURACY: the lock is real only on a FilesystemStorage backend
+   * (`withCrossProcessLock` engages the O_EXCL lockfile). On a non-filesystem
+   * backend (in-memory / tests) it DEGRADES to a direct, NON-serialized run - two
+   * overlapping calls there are NOT mutually excluded. That is acceptable because
+   * the shipped production writer is a one-shot CLI process on FilesystemStorage;
+   * non-fs rigs are single-caller test harnesses. (An in-process async mutex would
+   * add defense-in-depth for non-fs multi-caller rigs but is not required.)
+   */
+  async lockedUpdate(
+    mutate: (
+      current: FederationJoinerTrustRootRecord | null,
+    ) => FederationJoinerTrustRootRecord,
+  ): Promise<FederationJoinerTrustRootRecord> {
+    return withCrossProcessLock(
+      this.storage,
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_LOCK_FILE,
+      async () => {
+        let current: FederationJoinerTrustRootRecord | null;
+        try {
+          current = await this.load();
+        } catch (err) {
+          throw new FederationJoinerTrustRootStoreError(
+            `refusing to update the joiner trust root over an unreadable ` +
+              `existing record (${publicErrorReason(err)}): the grow-only ` +
+              `revoked-root set and anti-rollback floor cannot be safely merged ` +
+              `when the existing record cannot be decoded`,
+          );
+        }
+
+        const next = mutate(current);
+
+        const currentRevoked = normalizeRevokedRootPubkeys(
+          current?.revoked_root_pubkeys,
+        );
+        const currentFloor = normalizeHighestRevocationSerial(
+          current?.highest_revocation_serial,
+        );
+        const nextFloor = normalizeHighestRevocationSerial(
+          next.highest_revocation_serial,
+        );
+        if (nextFloor > 0 && nextFloor < currentFloor) {
+          throw new FederationJoinerTrustRootStoreError(
+            `revocation serial ${nextFloor} is below the recorded anti-rollback ` +
+              `floor ${currentFloor}; refusing to lower the monotonic floor`,
+          );
+        }
+        const mergedRevoked = new Set<string>(currentRevoked);
+        for (const pubkey of normalizeRevokedRootPubkeys(
+          next.revoked_root_pubkeys,
+        )) {
+          mergedRevoked.add(pubkey);
+        }
+        const mergedFloor = Math.max(currentFloor, nextFloor);
+
+        const merged: FederationJoinerTrustRootRecord = {
+          ...next,
+          revoked_root_pubkeys:
+            mergedRevoked.size > 0 ? mergedRevoked : undefined,
+          highest_revocation_serial: mergedFloor > 0 ? mergedFloor : undefined,
+        };
+        await this.#writeRaw(merged);
+        return merged;
+      },
+    );
+  }
+
+  /**
+   * Raw encrypt-and-write. TRUE PRIVATE (`#`): reachable ONLY from
+   * {@link lockedUpdate}, so NO code path (public API, other module code, or a
+   * test) can write this record without the cross-process lock + grow-only merge.
+   * Validates before any ciphertext is produced.
+   */
+  async #writeRaw(record: FederationJoinerTrustRootRecord): Promise<void> {
     validateJoinerRecord(record);
     const serialized = stringToBytes(
       JSON.stringify(encodePersistedRecord(record)),
@@ -259,34 +352,14 @@ export async function loadFederationJoinerTrustRoot(
 }
 
 /**
- * The SINGLE locked, grow-only-enforcing write CHOKEPOINT for the joiner trust
- * root. EVERY writer routes through here (`persistFederationJoinerTrustRoot` for
- * join/rejoin, and the planned-adopt re-pin), so no unlocked writer can race a
- * locked one and drop the anti-rollback state. It:
- *
- *   1. Acquires the `.joiner-trust-root.lock` cross-process lock in `_federation`.
- *      SERIALIZATION ACCURACY: the lock is real only on a FilesystemStorage
- *      backend (`withCrossProcessLock` engages the O_EXCL lockfile). On a
- *      non-filesystem backend (in-memory / tests) it DEGRADES to a direct,
- *      NON-serialized run - two overlapping calls there are NOT mutually
- *      excluded. That is acceptable because the shipped production writer is a
- *      one-shot CLI process on FilesystemStorage; non-fs rigs are single-caller
- *      test harnesses. (An in-process async mutex would add defense-in-depth for
- *      non-fs multi-caller rigs but is not required.)
- *   2. Loads the CURRENT record under the lock, FAIL-CLOSED on a load error
- *      (MED-1): `store.load()` returns null ONLY for a genuinely-absent record;
- *      a decode/transient throw is RE-THROWN (never treated as "absent", which
- *      would let a lower floor overwrite - AGENTS.md rule 5).
- *   3. Applies the caller's `mutate(current)` to get the intended next record.
- *   4. ALWAYS enforces the grow-only anti-rollback invariant against the CURRENT
- *      on-disk record loaded UNDER THE LOCK (not any earlier stale load): the
- *      revoked-root set is `current UNION next` and the compromise floor is
- *      `max(current, next)` - never dropped or lowered; a mutation that tries to
- *      LOWER the floor is refused loudly. (The planned `adopted_rotation_serial`
- *      is per-lineage - reset on a fresh join, advanced on a planned adopt - so
- *      it is the mutator's to set and is NOT merged here.)
- *   5. Saves the merged record (`store.save` re-runs full validation) and
- *      releases the lock in `finally`.
+ * Module-level convenience seam for the single locked, grow-only-enforcing write
+ * CHOKEPOINT (`FederationJoinerTrustRootStore.lockedUpdate`). EVERY writer routes
+ * through this one path - `persistFederationJoinerTrustRoot` (join/rejoin) and the
+ * planned-adopt re-pin - so no unlocked writer can race a locked one and drop the
+ * anti-rollback state. The raw encrypt-and-write is a TRUE-PRIVATE method
+ * (`#writeRaw`) reachable ONLY from `lockedUpdate`, so the grow-only invariant is
+ * STRUCTURALLY enforced (there is no public raw writer to bypass it), not merely
+ * conventional. See `lockedUpdate` for the full step-by-step contract.
  */
 async function lockedUpdateJoinerTrustRoot(
   storage: StorageBackend,
@@ -295,57 +368,8 @@ async function lockedUpdateJoinerTrustRoot(
     current: FederationJoinerTrustRootRecord | null,
   ) => FederationJoinerTrustRootRecord,
 ): Promise<FederationJoinerTrustRootRecord> {
-  const store = new FederationJoinerTrustRootStore(storage, masterKey);
-  return withCrossProcessLock(
-    storage,
-    FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
-    FEDERATION_JOINER_TRUST_ROOT_LOCK_FILE,
-    async () => {
-      let current: FederationJoinerTrustRootRecord | null;
-      try {
-        current = await store.load();
-      } catch (err) {
-        throw new FederationJoinerTrustRootStoreError(
-          `refusing to update the joiner trust root over an unreadable existing ` +
-            `record (${publicErrorReason(err)}): the grow-only revoked-root set ` +
-            `and anti-rollback floor cannot be safely merged when the existing ` +
-            `record cannot be decoded`,
-        );
-      }
-
-      const next = mutate(current);
-
-      const currentRevoked = normalizeRevokedRootPubkeys(
-        current?.revoked_root_pubkeys,
-      );
-      const currentFloor = normalizeHighestRevocationSerial(
-        current?.highest_revocation_serial,
-      );
-      const nextFloor = normalizeHighestRevocationSerial(
-        next.highest_revocation_serial,
-      );
-      if (nextFloor > 0 && nextFloor < currentFloor) {
-        throw new FederationJoinerTrustRootStoreError(
-          `revocation serial ${nextFloor} is below the recorded anti-rollback ` +
-            `floor ${currentFloor}; refusing to lower the monotonic floor`,
-        );
-      }
-      const mergedRevoked = new Set<string>(currentRevoked);
-      for (const pubkey of normalizeRevokedRootPubkeys(
-        next.revoked_root_pubkeys,
-      )) {
-        mergedRevoked.add(pubkey);
-      }
-      const mergedFloor = Math.max(currentFloor, nextFloor);
-
-      const merged: FederationJoinerTrustRootRecord = {
-        ...next,
-        revoked_root_pubkeys: mergedRevoked.size > 0 ? mergedRevoked : undefined,
-        highest_revocation_serial: mergedFloor > 0 ? mergedFloor : undefined,
-      };
-      await store.save(merged);
-      return merged;
-    },
+  return new FederationJoinerTrustRootStore(storage, masterKey).lockedUpdate(
+    mutate,
   );
 }
 
