@@ -133,9 +133,12 @@ The live path has two legs:
    Stated precisely, what the regression tests prove: the disabled
    default is byte-identical to the pre-Tier-B behavior; with Tier B
    on, the query and context legs are both treated before egress; a
-   config record that exists but cannot be decoded FAILS the query
-   (`query_anonymity_pii_config_unreadable`), never a silent
-   un-rewritten send. Two scoped non-claims: smart mode restores
+   config record that cannot be read (storage throw, reason
+   `read_failed`) or cannot be decoded (reason `decode_failed`) FAILS
+   the query with `query_anonymity_pii_config_unreadable`, and only a
+   genuinely absent record evaluates to the default-off posture, so an
+   unknown posture is never a silent un-rewritten send. Two scoped
+   non-claims: smart mode restores
    intent-preserved classes to originals by ratified design (the
    always-on concierge Tier 1 filter still re-covers its own classes
    on the composed text), and regex residuals can still reach the

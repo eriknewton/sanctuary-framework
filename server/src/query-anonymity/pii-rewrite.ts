@@ -32,8 +32,10 @@
  *     (b) regex residuals can still reach the `privacy-filter-tier-2`
  *     helper surface via LLM-assist, which matters only if that
  *     surface is bound to a remote substrate (open follow-up); (c) a
- *     corrupt config record FAILS the query (never a silent
- *     un-rewritten send). The consent-gated Tier 2 redactor
+ *     config record that cannot be READ (storage throw) or DECODED
+ *     FAILS the query; only a genuinely absent record evaluates to
+ *     the default-off posture (never a silent un-rewritten send on
+ *     an unknown posture). The consent-gated Tier 2 redactor
  *     (`intelligence/privacy-tier2-redactor.ts`, installed on every
  *     production selector by `installConsentGatedRedactor`)
  *     additionally covers the frontier-with-filter egress substrate.
@@ -121,10 +123,14 @@ export const PII_REWRITE_AUDIT_OPS = {
   CONFIG_UPDATED: "query_anonymity_pii_config_updated",
   CONSENT_RECORDED: "query_anonymity_pii_consent_recorded",
   /**
-   * A Tier B config record EXISTS but could not be decoded (corrupt
-   * payload, wrong-fortress AAD, version mismatch). The live query
-   * path fails the query on this state rather than silently sending
-   * un-rewritten text (hard-constraint 5: never silently degrade).
+   * The Tier B config could not be established: either a record
+   * EXISTS but could not be decoded (corrupt payload, wrong-fortress
+   * AAD, version mismatch; `reason: "decode_failed"`) or the storage
+   * read itself THREW (I/O error, lock contention, permissions;
+   * `reason: "read_failed"`). The live query path fails the query on
+   * both states rather than silently sending un-rewritten text
+   * (hard-constraint 5: never silently degrade). Only a genuinely
+   * ABSENT record evaluates to the default-off posture.
    */
   CONFIG_UNREADABLE: "query_anonymity_pii_config_unreadable",
 } as const;

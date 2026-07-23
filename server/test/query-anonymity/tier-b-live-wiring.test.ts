@@ -165,13 +165,19 @@ interface HarnessOptions {
   withPiiFilter?: boolean;
   classifier?: ReturnType<typeof fixedClassifier>;
   summarizeText?: string;
+  /** Storage backend for the PiiConfigStore ONLY (fault injection). */
+  configStorage?: ConstructorParameters<typeof PiiConfigStore>[0]["storage"];
 }
 
 async function makeHarness(opts: HarnessOptions = {}) {
   const storage = new MemoryStorage();
   const masterKey = generateRandomKey();
   const auditLog = new AuditLog(storage, masterKey);
-  const config = new PiiConfigStore({ storage, masterKey, fortressId: FORTRESS });
+  const config = new PiiConfigStore({
+    storage: opts.configStorage ?? storage,
+    masterKey,
+    fortressId: FORTRESS,
+  });
   if (opts.patch) await config.patch(opts.patch);
   const { selector, calls } = makeSelector({ summarizeText: opts.summarizeText });
   const service = new OperatorChatService({
@@ -463,9 +469,47 @@ describe("Rho-2.5 corrupt-config fail-closed (F5)", () => {
     );
     // Nothing egressed: the failure happened before any selector call.
     expect(calls.length).toBe(0);
-    const ops = (await auditedOps(auditLog)).map((e) => e.operation);
-    expect(ops).toContain(PII_REWRITE_AUDIT_OPS.CONFIG_UNREADABLE);
-    expect(ops).not.toContain(PII_REWRITE_AUDIT_OPS.PII_REWRITTEN);
+    const entries = await auditedOps(auditLog);
+    const unreadable = entries.find(
+      (e) => e.operation === PII_REWRITE_AUDIT_OPS.CONFIG_UNREADABLE,
+    );
+    expect(unreadable).toBeDefined();
+    expect((unreadable!.details as { reason?: string }).reason).toBe(
+      "decode_failed",
+    );
+    expect(entries.map((e) => e.operation)).not.toContain(
+      PII_REWRITE_AUDIT_OPS.PII_REWRITTEN,
+    );
+  });
+
+  it("fails the query loudly when the config storage read throws", async () => {
+    // A storage-layer THROW (I/O error, lock contention, permissions)
+    // leaves the operator's posture unknown. Unlike a genuinely-absent
+    // record (default-off), this must never silently send raw text:
+    // an enabled+consented fortress whose storage hiccups would
+    // otherwise egress un-rewritten queries with no trace.
+    const throwingStorage = {
+      read: vi.fn().mockRejectedValue(new Error("EIO: storage read failed")),
+      write: vi.fn().mockRejectedValue(new Error("EIO: storage write failed")),
+    } as unknown as ConstructorParameters<typeof PiiConfigStore>[0]["storage"];
+    const { service, auditLog, calls } = await makeHarness({
+      configStorage: throwingStorage,
+    });
+    await expect(service.sendConcierge(PII_QUERY)).rejects.toThrow(
+      /could not be read/,
+    );
+    expect(calls.length).toBe(0);
+    const entries = await auditedOps(auditLog);
+    const unreadable = entries.find(
+      (e) => e.operation === PII_REWRITE_AUDIT_OPS.CONFIG_UNREADABLE,
+    );
+    expect(unreadable).toBeDefined();
+    expect((unreadable!.details as { reason?: string }).reason).toBe(
+      "read_failed",
+    );
+    expect(entries.map((e) => e.operation)).not.toContain(
+      PII_REWRITE_AUDIT_OPS.PII_REWRITTEN,
+    );
   });
 });
 

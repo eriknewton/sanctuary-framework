@@ -88,7 +88,11 @@ import {
   type ConciergeProactiveStarter,
 } from "./agent-context-cache.js";
 import { classifyQueryIntent, type IntentClassifier } from "../query-anonymity/intent-classifier.js";
-import type { PiiConfigStore } from "../query-anonymity/pii-config-store.js";
+import {
+  PiiConfigReadFailed,
+  type PiiConfigStore,
+  type PiiQueryGates,
+} from "../query-anonymity/pii-config-store.js";
 import {
   PII_REWRITE_AUDIT_OPS,
   emitPiiRewriteAudit,
@@ -598,27 +602,43 @@ export class OperatorChatService {
       this.queryAnonymityFortressId ?? "fortress:operator-chat";
     if (this.substrateSelector && this.queryAnonymityConfig) {
       // Rho-2.5 live Tier B gate. One store read decides smart vs basic
-      // vs off. An ABSENT config record evaluates to the canonical
-      // default (off, no consent): no rewrite, and no protection is
-      // claimed. A config record that EXISTS but cannot be decoded is a
-      // different state entirely: the operator's persisted privacy
-      // posture is unknown, so per hard-constraint 5 (never silently
-      // degrade) the query FAILS with an actionable error instead of
-      // silently egressing un-rewritten text.
-      const gates = await this.queryAnonymityConfig.evaluateForQuery();
-      if (gates === null) {
+      // vs off. An ABSENT config record (storage read succeeds, no
+      // record) evaluates to the canonical default (off, no consent):
+      // no rewrite, and no protection is claimed. Two failure states
+      // are different: a record that EXISTS but cannot be decoded
+      // (gates === null) and a storage read that THROWS
+      // (PiiConfigReadFailed). In both, the operator's persisted
+      // privacy posture is UNKNOWN, so per hard-constraint 5 (never
+      // silently degrade) the query FAILS with an actionable error
+      // instead of silently egressing un-rewritten text.
+      let gates: PiiQueryGates | null;
+      let configFailure: "decode_failed" | "read_failed" | null = null;
+      try {
+        gates = await this.queryAnonymityConfig.evaluateForQuery();
+        if (gates === null) configFailure = "decode_failed";
+      } catch (err) {
+        if (!(err instanceof PiiConfigReadFailed)) throw err;
+        gates = null;
+        configFailure = "read_failed";
+      }
+      if (gates === null || configFailure !== null) {
         void this.auditLog.append(
           "l2",
           PII_REWRITE_AUDIT_OPS.CONFIG_UNREADABLE,
           this.identityId,
-          { fortress_id: tierBFortressId },
+          { fortress_id: tierBFortressId, reason: configFailure },
           "failure",
         );
         throw new Error(
-          "Tier B PII-rewrite config exists but cannot be decoded, so the " +
-            "operator's privacy posture for this fortress is unknown. " +
-            "Refusing to send the query. Reset the config via " +
-            "PATCH /api/query-anonymity/pii/config and retry.",
+          configFailure === "read_failed"
+            ? "Tier B PII-rewrite config could not be read from storage, " +
+              "so the operator's privacy posture for this fortress is " +
+              "unknown. Refusing to send the query. Retry once fortress " +
+              "storage is healthy."
+            : "Tier B PII-rewrite config exists but cannot be decoded, so " +
+              "the operator's privacy posture for this fortress is " +
+              "unknown. Refusing to send the query. Reset the config via " +
+              "PATCH /api/query-anonymity/pii/config and retry.",
         );
       }
       // Both legs below require the recorded consent snapshot (defense
