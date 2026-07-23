@@ -541,12 +541,14 @@ export function buildV11Bindings(
         resolveAuditAttribution,
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
-      // Rho-2.5: thread the live Tier B config so the concierge smart-mode
-      // rewrite path reads `shouldRewriteSmartMode()` at invocation time.
-      // The reverse-mapping store (encrypted, per-fortress) is required
-      // for the smart-mode path to fire end-to-end (store mappings ->
-      // restore at render); wired here when storage + master key + a
-      // storage path are available.
+      // Rho-2.5: thread the live Tier B config so the concierge rewrite
+      // path reads the gates (`evaluateForQuery()`) at invocation time:
+      // smart mode when `smart_mode_enabled`, basic anonymize-all when
+      // only `enabled`. The reverse-mapping store (encrypted,
+      // per-fortress) is required for the smart-mode path to fire
+      // end-to-end (store mappings -> restore at render); wired here when
+      // storage + master key + a storage path are available. Without it,
+      // smart mode degrades to the basic anonymize-all rewrite.
       ...(piiConfigStore
         ? {
             queryAnonymityConfig: piiConfigStore,

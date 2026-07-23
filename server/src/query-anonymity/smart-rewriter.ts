@@ -12,6 +12,7 @@ import {
   PII_CATEGORIES,
   rewritePiiWithLlm,
   type PiiCategory,
+  type PiiRewriteResult,
   type PiiRewriteSelector,
 } from "./pii-rewrite.js";
 import {
@@ -28,6 +29,16 @@ export interface SmartRewriteResult {
   anonymized_classes: PiiClass[];
   preserved_classes: PiiClass[];
   fallback_reason?: "classifier_failed" | "low_confidence";
+  /**
+   * Stats from the underlying Rho-2 PII pass, carried so the live
+   * concierge path (Rho-2.5 wiring) can emit the
+   * `query_anonymity_pii_rewritten` audit event without re-running
+   * the rewrite.
+   */
+  pii_rewrite: Pick<
+    PiiRewriteResult,
+    "redaction_counts" | "llm_assist_ran" | "llm_residual_count"
+  >;
 }
 
 export interface ReverseMapping {
@@ -89,6 +100,7 @@ export async function smartRewrite(
     intent,
     anonymized_classes: [...anonymized],
     preserved_classes: [...preserved],
+    pii_rewrite: piiStats(pii),
   };
 }
 
@@ -190,6 +202,17 @@ function anonymizeAll(
     anonymized_classes: [...anonymized],
     preserved_classes: [],
     fallback_reason: reason,
+    pii_rewrite: piiStats(pii),
+  };
+}
+
+function piiStats(
+  pii: PiiRewriteResult,
+): SmartRewriteResult["pii_rewrite"] {
+  return {
+    redaction_counts: pii.redaction_counts,
+    llm_assist_ran: pii.llm_assist_ran,
+    llm_residual_count: pii.llm_residual_count,
   };
 }
 

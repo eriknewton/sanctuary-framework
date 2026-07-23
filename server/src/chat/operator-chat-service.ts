@@ -89,6 +89,10 @@ import {
 } from "./agent-context-cache.js";
 import { classifyQueryIntent, type IntentClassifier } from "../query-anonymity/intent-classifier.js";
 import type { PiiConfigStore } from "../query-anonymity/pii-config-store.js";
+import {
+  emitPiiRewriteAudit,
+  rewritePiiWithLlm,
+} from "../query-anonymity/pii-rewrite.js";
 import type { ReverseMappingStore } from "../query-anonymity/reverse-mapping-store.js";
 import {
   emitReverseMappingUsedAudit,
@@ -270,11 +274,19 @@ export interface OperatorChatServiceDeps {
    */
   conciergeAgentStateBudget?: number;
   /**
-   * Rho-3 smart-mode query anonymity. Optional so existing service
-   * wiring remains unchanged; when present and smart mode is enabled,
-   * the operator query is smart-rewritten before the concierge
-   * substrate call, reverse mappings are stored per query id, and the
-   * response is restored server-side before display.
+   * Tier B query anonymity (Rho-2.5 live wiring). Optional so existing
+   * service wiring remains unchanged. When the config store is present
+   * and the operator opted in with recorded consent:
+   *   - smart mode (Rho-3): the operator query is smart-rewritten
+   *     before the concierge substrate call, reverse mappings are
+   *     stored per query id, and the response is restored server-side
+   *     before display;
+   *   - basic Tier B (Rho-2): the query is anonymize-all rewritten
+   *     (regex + LLM-assist) before the substrate call, with no
+   *     render-time restoration.
+   * Both paths emit `query_anonymity_pii_rewritten`. Default-off: with
+   * the toggle off the substrate query is byte-identical to the
+   * pre-Tier-B behavior.
    */
   queryAnonymityConfig?: PiiConfigStore;
   queryAnonymityReverseMappingStore?: ReverseMappingStore;
@@ -532,15 +544,26 @@ export class OperatorChatService {
 
     let substrateQuery = filterResult.filtered;
     let reverseMappingQueryId: string | null = null;
-    if (
-      this.substrateSelector &&
-      this.queryAnonymityConfig &&
-      this.queryAnonymityReverseMappingStore
-    ) {
-      const smartEnabled = await this.queryAnonymityConfig
-        .shouldRewriteSmartMode()
-        .catch(() => false);
-      if (smartEnabled) {
+    if (this.substrateSelector && this.queryAnonymityConfig) {
+      // Rho-2.5 live Tier B gate. One store read decides smart vs basic
+      // vs off. A decode failure (null gates) means no rewrite, matching
+      // the consent-gated redactor's fail-toward-no-claimed-protection
+      // posture: the substrate still receives the un-rewritten text and
+      // nothing claims otherwise, because the
+      // `query_anonymity_pii_rewritten` audit op fires only on a rewrite
+      // that actually ran. Both branches below additionally require the
+      // recorded consent snapshot (defense in depth; the store's patch
+      // gate already refuses enabling without consent).
+      const gates = await this.queryAnonymityConfig
+        .evaluateForQuery()
+        .catch(() => null);
+      const fortressId =
+        this.queryAnonymityFortressId ?? "fortress:operator-chat";
+      if (
+        gates?.smart &&
+        gates.consented &&
+        this.queryAnonymityReverseMappingStore
+      ) {
         const classifier =
           this.queryAnonymityIntentClassifier ??
           ({
@@ -556,8 +579,6 @@ export class OperatorChatService {
         await this.queryAnonymityReverseMappingStore
           .store(queryId, result.reverse_map)
           .catch(() => undefined);
-        const fortressId =
-          this.queryAnonymityFortressId ?? "fortress:operator-chat";
         if (result.fallback_reason) {
           emitSmartModeFallbackAudit({
             auditLog: this.auditLog,
@@ -573,6 +594,37 @@ export class OperatorChatService {
           fortressId,
           queryId,
           result,
+        });
+        emitPiiRewriteAudit({
+          auditLog: this.auditLog,
+          identityId: this.identityId,
+          fortressId,
+          redactionCounts: result.pii_rewrite.redaction_counts,
+          llmAssistRan: result.pii_rewrite.llm_assist_ran,
+          llmResidualCount: result.pii_rewrite.llm_residual_count,
+          consentedToTradeOff: gates.consented,
+        });
+      } else if (gates?.rewrite && gates.consented) {
+        // Basic Tier B (Rho-2.5): `enabled` without smart mode, or smart
+        // mode on a binding without a reverse-mapping store. Anonymize-all
+        // with no render-time restoration (that is smart mode's job). The
+        // input is `substrateQuery` (the concierge-PII-filtered text), so
+        // Tier B composes ON TOP of the existing filter and turning it on
+        // only ever removes more from the outbound query.
+        const result = await rewritePiiWithLlm(
+          substrateQuery,
+          this.substrateSelector,
+          { identityId: this.identityId },
+        );
+        substrateQuery = result.rewritten;
+        emitPiiRewriteAudit({
+          auditLog: this.auditLog,
+          identityId: this.identityId,
+          fortressId,
+          redactionCounts: result.redaction_counts,
+          llmAssistRan: result.llm_assist_ran,
+          llmResidualCount: result.llm_residual_count,
+          consentedToTradeOff: gates.consented,
         });
       }
     }

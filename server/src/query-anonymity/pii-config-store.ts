@@ -236,6 +236,31 @@ export class PiiConfigStore {
   }
 
   /**
+   * One-read gate evaluation for the live query path (Rho-2.5 wiring).
+   * Returns every signal a rewrite call site needs from a single store
+   * read: the basic Tier B gate, the smart-mode gate, and the consent
+   * snapshot the `query_anonymity_pii_rewritten` audit event records.
+   *
+   * Returns `null` on config decode failure (corrupt payload, wrong
+   * fortress, version mismatch), matching `get()`. Callers treat null
+   * as "no rewrite" and must not claim protection for the call (the
+   * pii_rewritten audit op fires only on a real rewrite, so a null
+   * here can never be misreported as scrubbing).
+   *
+   * `shouldRewrite` / `shouldRewriteSmartMode` delegate here so the
+   * gate logic lives in exactly one place.
+   */
+  async evaluateForQuery(): Promise<PiiQueryGates | null> {
+    const config = await this.get();
+    if (!config) return null;
+    return {
+      rewrite: config.enabled || config.smart_mode_enabled,
+      smart: config.smart_mode_enabled,
+      consented: config.consented_to_trade_off,
+    };
+  }
+
+  /**
    * Whether Tier B should fire for THIS call. Combines the
    * per-fortress flag with an optional per-query override.
    *
@@ -247,17 +272,17 @@ export class PiiConfigStore {
    */
   async shouldRewrite(perQueryOverride?: boolean): Promise<boolean> {
     if (perQueryOverride === false) return false;
-    const config = await this.get();
-    if (!config) return false;
+    const gates = await this.evaluateForQuery();
+    if (!gates) return false;
     if (perQueryOverride === true) {
-      if (!config.consented_to_trade_off) {
+      if (!gates.consented) {
         throw new PiiConsentRequired(
           "per-query opt-in requires recorded consent",
         );
       }
       return true;
     }
-    return config.enabled || config.smart_mode_enabled;
+    return gates.rewrite;
   }
 
   /**
@@ -267,18 +292,31 @@ export class PiiConfigStore {
    */
   async shouldRewriteSmartMode(perQueryOverride?: boolean): Promise<boolean> {
     if (perQueryOverride === false) return false;
-    const config = await this.get();
-    if (!config) return false;
+    const gates = await this.evaluateForQuery();
+    if (!gates) return false;
     if (perQueryOverride === true) {
-      if (!config.consented_to_trade_off) {
+      if (!gates.consented) {
         throw new PiiConsentRequired(
           "per-query smart-mode opt-in requires recorded consent",
         );
       }
       return true;
     }
-    return config.smart_mode_enabled;
+    return gates.smart;
   }
+}
+
+/**
+ * Result of `PiiConfigStore.evaluateForQuery()`: the per-call gate
+ * signals for the live Tier B rewrite path.
+ */
+export interface PiiQueryGates {
+  /** Basic Tier B gate: `enabled || smart_mode_enabled`. */
+  rewrite: boolean;
+  /** Rho-3 smart-mode gate: `smart_mode_enabled`. */
+  smart: boolean;
+  /** Consent snapshot for audit emission and defense-in-depth gating. */
+  consented: boolean;
 }
 
 /** Raised when consent has not been recorded but enable is requested. */

@@ -108,18 +108,36 @@ Opt-in because rewrite affects LLM functionality:
 - Operator's address in a "schedule a delivery to <street>" prompt
   may force the LLM to ask for clarification.
 
-**Status: NOT in Rho-1.** Tier B awaits Erik's morning read on:
+**Status: SHIPPED and wired live (Rho-2 primitive + Rho-3 smart mode +
+Rho-2.5 live wiring).** Ratified decisions: default-OFF, opt-in
+per-fortress toggle, consent-gated (the operator must acknowledge the
+trade-off explainer before the toggle can flip on), with a per-query
+override in the config store API.
 
-1. Default-on vs opt-in.
-2. Prompt-engineering surface (how the operator overrides for
-   functionality-critical queries).
-3. Substrate-selector functionality impact (which substrate
-   surfaces accept PII-rewritten prompts cleanly vs. degrade).
+The live path has two legs:
 
-The Rho-1 module structure is forward-compatible with Tier B:
-`stripHeaders` is at the HTTP layer; Tier B would add a parallel
-`rewriteContentPii` at the request-body layer, wired through the
-same selector hook. No Tier B knobs in `principal-policy.yaml` yet.
+1. **Concierge query path** (`chat/operator-chat-service.ts`): when the
+   fortress opted in with recorded consent, the operator query is
+   rewritten BEFORE the substrate-selector call, so the selector only
+   ever carries rewritten text. Smart mode (`smart_mode_enabled`) runs
+   the intent-aware rewrite with encrypted reverse mappings restored at
+   render time; the basic toggle (`enabled`) runs anonymize-all
+   (regex + LLM-assist on residuals) with no restoration. Both legs
+   emit a `query_anonymity_pii_rewritten` audit event per rewrite with
+   per-category counts and the consent snapshot. With the toggle off
+   (the default) the substrate query is byte-identical to the
+   pre-Tier-B behavior.
+2. **Frontier egress redactor**
+   (`intelligence/privacy-tier2-redactor.ts`): every production
+   `SubstrateSelector` installs the consent-gated Tier 2 redactor via
+   the `installConsentGatedRedactor` chokepoint, covering the
+   frontier-with-filter substrate. It reads the live `PiiConfigStore`
+   per call and passes text through unchanged when Tier B is off.
+
+Operator surface: `/api/query-anonymity/pii` (config read/patch with
+the consent gate, trade-off explainer, stateless rewrite preview). The
+route reports `effective_tier_b_enabled` derived from the live config
+plus the redactor-installed signal (never-overclaim rule).
 
 ## Tier 3a: network-path anonymity (two-hop egress proxy), Slice 1
 

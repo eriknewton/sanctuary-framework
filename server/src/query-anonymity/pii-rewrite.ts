@@ -19,13 +19,17 @@
  *     `{ redacted, placeholders }`. Rho-3 smart mode (iteration-14)
  *     consumes the placeholders for context-aware re-mapping at
  *     concierge render time.
- *   - **Substrate-selector call carries rewritten text only ONCE Tier B is
- *     wired into the live path.** Tier B is NOT yet wired into the production
- *     substrate selector (deferred; see `effectiveTierBEnabled` and the DEBT
- *     note in pii-rewrite-routes.ts), so today the original query text still
- *     reaches the substrate. When wired, the caller replaces the field on its
- *     request object before calling the selector so the original text does not
- *     cross the outbound boundary.
+ *   - **Substrate-selector call carries rewritten text only.** Wired
+ *     live as of Rho-2.5: the concierge path
+ *     (`chat/operator-chat-service.ts`) rewrites the operator query
+ *     BEFORE invoking the selector when the fortress opted in with
+ *     recorded consent (smart mode via `smartRewrite`, basic mode via
+ *     `rewritePiiWithLlm` here), and the consent-gated Tier 2 redactor
+ *     (`intelligence/privacy-tier2-redactor.ts`, installed on every
+ *     production selector by `installConsentGatedRedactor`) covers the
+ *     frontier-with-filter egress substrate. The caller replaces the
+ *     query field on its request object before calling the selector so
+ *     the original text does not cross the outbound boundary.
  *
  * Castle-walking discipline:
  *   - No new outbound surface. LLM-assist re-uses the existing
@@ -42,9 +46,10 @@
  *     split off to its own build for cleaner test surface + lower
  *     divergence risk.
  *   - **Live wiring into the substrate-selector invoke pipeline**:
- *     deferred to a Rho-2.5 boot-wiring follow-up. This module ships
- *     the primitive + config + routes; consumers (selector wrapper
- *     and/or selector mid-flight call site) attach to it.
+ *     LANDED as the Rho-2.5 follow-up (see the design bullet above).
+ *     This module ships the primitive + config + routes; the live
+ *     consumers are the concierge chat service and the consent-gated
+ *     Tier 2 redactor.
  *
  * Audit emission:
  *   - `query_anonymity_pii_rewritten` fires per rewrite call with
@@ -56,6 +61,7 @@ import type {
   SubstrateSelector,
 } from "../intelligence/selector.js";
 import type { Surface } from "../intelligence/types.js";
+import type { AuditLog } from "../operational/audit-log.js";
 
 // ── Public types ─────────────────────────────────────────────────────
 
@@ -111,6 +117,38 @@ export const PII_REWRITE_AUDIT_OPS = {
 
 export type PiiRewriteAuditOp =
   (typeof PII_REWRITE_AUDIT_OPS)[keyof typeof PII_REWRITE_AUDIT_OPS];
+
+/**
+ * Emits the `query_anonymity_pii_rewritten` audit event with
+ * per-category counts. Called by the LIVE Rho-2.5 wiring in
+ * `chat/operator-chat-service.ts` on every Tier B rewrite that
+ * actually ran (both the basic anonymize-all path and the Rho-3
+ * smart-mode path), so the op fires only when a query was genuinely
+ * rewritten before the substrate call. Lives here (not in the route
+ * module) so live-path consumers never import the HTTP route chain.
+ */
+export function emitPiiRewriteAudit(opts: {
+  auditLog: AuditLog;
+  identityId: string;
+  fortressId: string;
+  redactionCounts: Record<string, number>;
+  llmAssistRan: boolean;
+  llmResidualCount: number;
+  consentedToTradeOff: boolean;
+}): void {
+  void opts.auditLog.append(
+    "l2",
+    PII_REWRITE_AUDIT_OPS.PII_REWRITTEN,
+    opts.identityId,
+    {
+      fortress_id: opts.fortressId,
+      redaction_counts: opts.redactionCounts,
+      llm_assist_ran: opts.llmAssistRan,
+      llm_residual_count: opts.llmResidualCount,
+      consented_to_trade_off: opts.consentedToTradeOff,
+    },
+  );
+}
 
 /** Surface name fixed at the type level for LLM-assist invocations. */
 export const PII_REWRITE_LLM_SURFACE: Surface = "privacy-filter-tier-2";
