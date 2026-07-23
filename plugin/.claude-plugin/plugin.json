@@ -1,14 +1,15 @@
 {
   "name": "sanctuary-framework",
   "version": "0.3.0",
-  "description": "Sovereignty infrastructure for the agentic economy. Gives your agent encrypted state, self-custodied identity, selective disclosure, portable reputation, and sovereignty verification — including a sovereignty audit tool that detects gaps in OpenClaw and other agent harnesses.",
+  "description": "The firewall and control panel for your AI agents. Wraps any MCP-compatible agent with encrypted state, approval gates, a portable identity and reputation, and an audit tool that finds security and privacy gaps in your current setup.",
   "author": {
     "name": "Erik Newton",
     "homepage": "https://github.com/eriknewton/sanctuary-framework"
   },
   "license": "Apache-2.0",
   "keywords": [
-    "sovereignty",
+    "security",
+    "firewall",
     "encryption",
     "identity",
     "reputation",
