@@ -327,9 +327,23 @@ ${logXml}\t<key>RunAtLoad</key>
  * SINGLE CHOKEPOINT for all THREE gate-daemon plist producers -- install +
  * repair (`wrap/auto-provision.ts`, which re-exports this) AND the boot
  * self-heal (`arming-wiring.ts` `startExclusiveEgressBootSupervisor`) -- so no
- * call site can ever drift back to a bare shebang-dependent argv. At boot
- * `process.execPath` is the boot daemon's own absolute node, so the prefix is
- * absolute there too.
+ * call site can ever emit a bare shebang-dependent argv[0]: every producer
+ * prepends `process.execPath`, which Node guarantees absolute. Note this makes
+ * argv[0] ABSOLUTE at every site; it does NOT make the resolved prefix
+ * IDENTICAL across sites -- install passes the persisted `--binary`, boot
+ * passes nothing and re-derives from live `process.argv` -- see the callers.
+ * At boot `process.execPath` is the boot daemon's own absolute node, so the
+ * healed prefix is correct + account-PATH-independent there too.
+ *
+ * PACKAGING ASSUMPTION (accepted, latent -- PR #994 review LOW-3): the fallback
+ * branch `[process.execPath, process.argv[1] ?? "sanctuary"]` is correct only
+ * for a NODE-SHEBANG-SCRIPT distribution, where `process.argv[1]` at boot
+ * re-materialises the CLI script path. A future single-executable (SEA/pkg)
+ * build would make `process.execPath` the binary and `process.argv[1]` the
+ * subcommand token, yielding a corrupt argv -- but that packaging would ALSO
+ * break the install path today, so it is latent, not live; and the `?? "sanctuary"`
+ * relative fallback is itself fail-closed (a relative argv[0] the renderer
+ * rejects, or a relative script that crashes the gate -> the barrier parks).
  */
 export function resolveGateDaemonArgvPrefix(cliBinary?: string): string[] {
   return cliBinary !== undefined && cliBinary.length > 0
@@ -348,10 +362,15 @@ function gateDaemonProgramSuffix(agentUid: number): string[] {
  *
  * ONE builder for BOTH the install bring-up (`arming-wiring.ts`
  * `productionBringUp`) and the boot self-heal (`startExclusiveEgressBootSupervisor`),
- * so the two can never drift on the interpreter prefix or the subcommand argv.
- * {@link renderEgressGateDaemonPlist} throws unless `programArguments[0]` is
- * absolute -- the fail-closed backstop that keeps a bare-`node`/`env node` argv
- * off disk.
+ * so the two can never drift on the SUBCOMMAND SUFFIX
+ * ({@link gateDaemonProgramSuffix}) or the plist RENDER. It does NOT unify the
+ * interpreter PREFIX: that is resolved independently per site by
+ * {@link resolveGateDaemonArgvPrefix} (install: the persisted `--binary`; boot:
+ * live `process.execPath`), by design -- at boot the prefix self-corrects to
+ * the boot daemon's own absolute node (the #986 property). What IS guaranteed
+ * everywhere: {@link renderEgressGateDaemonPlist} throws unless
+ * `programArguments[0]` is absolute -- the fail-closed backstop that keeps a
+ * bare-`node`/`env node` argv off disk.
  */
 export function buildGateDaemonPlistContent(input: {
   agentUid: number;

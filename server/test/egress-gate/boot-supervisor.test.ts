@@ -20,6 +20,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import { generateKeyPairSync } from "node:crypto";
+import { isAbsolute } from "node:path";
 
 import {
   NON_HERMES_BOOT_PARK_REASON,
@@ -793,6 +794,41 @@ describe("startExclusiveEgressBootSupervisor (boot self-heal: stale pre-#986 gat
     );
     expect(writeIdx).toBeGreaterThanOrEqual(0);
     expect(bootstrapIdx).toBeGreaterThan(writeIdx);
+    expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+  });
+
+  it("boot-prefix parity (#986 invariant): the BOOT self-heal writes an ABSOLUTE argv[0] from the live boot process, independent of any persisted --binary", async () => {
+    // MED-1 (PR #994 review): the shared builder unifies only the subcommand
+    // suffix + render; the interpreter PREFIX is resolved INDEPENDENTLY at boot.
+    // The byte-identical guard hard-codes the same prefix on both sides, so it
+    // never exercises the boot-site derivation. This test drives the REAL boot
+    // self-heal (real resolveGateDaemonArgvPrefix + real buildGateDaemonPlistContent
+    // inside startExclusiveEgressBootSupervisor -- neither is mocked) and pins
+    // the actual #986 invariant: the healed argv[0] is ABSOLUTE and is the boot
+    // process's OWN node, NOT whatever binary an install may have recorded.
+    let writtenContent: string | undefined;
+    const PERSISTED_STALE_BINARY = "/some/prior/install/recorded/cli.js";
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        writeGateDaemonPlist: async (_plistPath, plistContent) => {
+          writtenContent = plistContent;
+        },
+        runBarrier: async () => RELEASED,
+      }),
+    });
+    handle.stopOracleLoop();
+    const argv0 = firstProgramArgument(writtenContent!);
+    // The real #986 invariant: argv[0] is ABSOLUTE (account-PATH-independent).
+    expect(isAbsolute(argv0)).toBe(true);
+    // ...derived from THIS boot process's own interpreter...
+    expect(argv0).toBe(process.execPath);
+    // ...and NOT a persisted --binary: the boot self-heal passes NO cliBinary,
+    // so nothing an install recorded can reach the healed prefix.
+    expect(argv0).not.toBe(PERSISTED_STALE_BINARY);
     expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
   });
 
