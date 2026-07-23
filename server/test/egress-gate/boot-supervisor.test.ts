@@ -560,6 +560,45 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 BLOCKER-1: throws neve
       },
     ]);
   });
+
+  it("keys-failure on an EMPTY registry says the oracle loop did NOT start (loud + audited), not a silent no-op", async () => {
+    // Follow-up to the empty-registry fall-through (#988). With the early-return
+    // gone, an ensureKeys failure is now REACHED on an empty registry: the
+    // per-entry park loop emits nothing (no entries) AND the oracle refresh loop
+    // cannot start (it needs these keys), so #988's promise that a later-armed
+    // agent gets picked up is BROKEN. The pre-fix path returned a SILENT no-op;
+    // this asserts the supervisor says so loudly + records it, so an operator is
+    // not left to discover it as an unexplained 503 on the next arm.
+    const printed: string[] = [];
+    const audits: { op: string; details: Record<string, unknown> }[] = [];
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX, // never called: empty registry
+      audit: async (op, details) => void audits.push({ op, details }),
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        listRegistryEntries: async () => ({ entries: [], quarantined: [], dirty: false }),
+        ensureKeys: async () => {
+          throw new Error("EACCES: /var/db/sanctuary/gate-liveness");
+        },
+      }),
+    });
+    handle.stopOracleLoop(); // must be safe: the loop never started
+    expect(handle.results).toHaveLength(0);
+    // The loud honesty line names the not-started loop + the repair verb.
+    const loud = printed.find(
+      (l) => /refresh loop did NOT start/.test(l) && /repair-egress-gate/.test(l),
+    );
+    expect(loud, `printed: ${JSON.stringify(printed)}`).toBeDefined();
+    expect(loud!).toContain("EACCES");
+    // ...and a durable audit record (distinct from the per-agent park outcome).
+    expect(audits).toEqual([
+      {
+        op: "exclusive_egress_boot_release",
+        details: expect.objectContaining({ outcome: "oracle-loop-not-started" }),
+      },
+    ]);
+  });
 });
 
 describe("startExclusiveEgressBootSupervisor (fix-round-2 HIGH-3: host-singleton label protected across uids)", () => {
