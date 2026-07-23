@@ -71,8 +71,6 @@
 4	integrations/crewai/README.md
 7	integrations/langchain/README.md
 14	integrations/ping-identity/README.md
-1	plugin/.claude-plugin/plugin.json
-23	plugin/skills/sanctuary/SKILL.md
 4	quickstart/README.md
 40	rfcs/RFC-0001-sanctuary-mcp-server.md
 8	rfcs/RFC-0002-principal-policy-operational-approval.md
