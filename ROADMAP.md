@@ -76,7 +76,7 @@ Risky operations (key rotation, state export, identity deletion, reputation impo
 
 Outbound queries strip operator-identifying headers (client-IP, fingerprint, correlation-ID, User-Agent, cookies, persistent session tokens) by default. Operator-opt-in PII rewrite available per channel: deterministic pseudonymous substitution before the query leaves the substrate selector. **Why it matters:** the agent can still be identified-by-asking unless the query layer itself is anonymized. No comparator we surveyed ships this at strength.
 
-*Status: Tiers 1 + 2 shipped. ASSURANCE_MATRIX row "Query anonymity (selective disclosure)" is proven.*
+*Status: Tiers 1 + 2 shipped. ASSURANCE_MATRIX row "Query anonymity (selective disclosure)" is proven. The operator-opt-in Tier B PII rewrite is now wired into the live substrate path (Rho-2.5), with cross-turn context scrubbing at the assembled-context egress chokepoint and fail-closed handling when the PII config is unreadable.*
 
 ### Portable identity, state export, recovery flows
 
