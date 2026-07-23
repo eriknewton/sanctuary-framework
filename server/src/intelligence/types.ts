@@ -71,6 +71,74 @@ export const SUBSTRATE_CHOICES: readonly SubstrateChoice[] = [
 ] as const;
 
 /**
+ * Ratified posture (Erik, 2026-07-23): the `privacy-filter-tier-2`
+ * surface is PINNED local-only. This surface is the internal plumbing
+ * of a privacy feature (Tier B PII rewrite LLM-assist + smart-mode
+ * intent classification): text still bearing PII residuals flows
+ * through it, so binding it to a remote substrate would turn the
+ * privacy filter itself into an egress channel. Same prohibition on
+ * silent relaxation as everywhere else in the codebase; there is NO
+ * override flag.
+ *
+ * Enforced at two layers:
+ *   1. Config-write: `setPerSurfaceChoice` refuses a non-local binding
+ *      for this surface (`Tier2BindingPinnedError`), and
+ *      `applyChoiceToAllSurfaces` skips it (reported, not fatal).
+ *   2. Invoke-time: the selector resolves this surface to `local`
+ *      regardless of what a persisted (pre-existing or tampered)
+ *      config says, with a one-time per-process
+ *      `query_anonymity_tier2_binding_pinned` audit event.
+ *
+ * `disabled` stays allowed: the pin means never-remote, not must-LLM.
+ * With no local substrate the Rho-2 caller degrades to regex-only.
+ */
+export const TIER2_PINNED_SURFACE: Surface = "privacy-filter-tier-2";
+
+/** The only substrate choices the pinned surface may bind to. */
+export const TIER2_PIN_ALLOWED_CHOICES: readonly SubstrateChoice[] = [
+  "local",
+  "disabled",
+] as const;
+
+/**
+ * Whether binding `substrate` to `surface` violates the tier-2 local
+ * pin. THE single predicate for the ratified posture; the config-write
+ * gate, the fan-out skip, and the invoke-time chokepoint all call this
+ * so the pin can never be half-enforced.
+ */
+export function isTier2PinViolation(
+  surface: Surface,
+  substrate: SubstrateChoice,
+): boolean {
+  return (
+    surface === TIER2_PINNED_SURFACE &&
+    !TIER2_PIN_ALLOWED_CHOICES.includes(substrate)
+  );
+}
+
+/**
+ * Raised when a config write asks to bind the pinned
+ * `privacy-filter-tier-2` surface to a non-local substrate. The
+ * message names the ratified posture so the refusal is actionable.
+ */
+export class Tier2BindingPinnedError extends Error {
+  readonly code = "tier2_pinned_local" as const;
+  constructor(substrate: SubstrateChoice) {
+    super(
+      "The privacy-filter-tier-2 surface is pinned local-only (ratified " +
+        "posture 2026-07-23) and cannot be bound to " +
+        substrate +
+        ": a privacy feature's internal plumbing must not be " +
+        "configurable into an egress channel. Allowed choices for this " +
+        "surface: " +
+        TIER2_PIN_ALLOWED_CHOICES.join(", ") +
+        ".",
+    );
+    this.name = "Tier2BindingPinnedError";
+  }
+}
+
+/**
  * Local-model picks for the Ollama-backed local substrate.
  *
  * Bundled tiers per position paper §5 hardware-tier table:
