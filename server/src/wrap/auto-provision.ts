@@ -118,6 +118,7 @@ import {
   type ExclusiveRoutingResidueTeardown,
 } from "../egress-gate/arming-wiring.js";
 import { deriveGateAccountName } from "../egress-gate/gate-account.js";
+import { resolveGateDaemonArgvPrefix } from "../egress-gate/gate-daemon.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
@@ -987,25 +988,12 @@ export function policyDaemonInstallBootArgs(
   return args;
 }
 
-/**
- * Resolve the argv prefix that launches the exclusive-egress gate daemon.
- *
- * The gate daemon runs as the confined gate service account, whose launchd
- * PATH has no `node`. Both a supplied `--binary` path and the fallback CLI
- * path are `.js` entrypoints carrying a `#!/usr/bin/env node` shebang, which
- * fails with `env: node: No such file or directory` under that account and
- * crashes the daemon at startup (the "D9" gate-daemon crash proven on
- * hardware 2026-07-21). Pinning `process.execPath` (an absolute interpreter)
- * makes the launch independent of the account's PATH.
- *
- * Single chokepoint for both provisioning builders so the two call sites can
- * never drift back to a bare shebang-dependent argv.
- */
-export function resolveGateDaemonArgvPrefix(cliBinary?: string): string[] {
-  return cliBinary !== undefined && cliBinary.length > 0
-    ? [process.execPath, cliBinary]
-    : [process.execPath, process.argv[1] ?? "sanctuary"];
-}
+// `resolveGateDaemonArgvPrefix` moved to `../egress-gate/gate-daemon.ts` so the
+// boot self-heal (`startExclusiveEgressBootSupervisor`) can share the SAME
+// chokepoint without an import cycle (wrap -> egress-gate/arming-wiring ->
+// wrap). Imported above and re-exported here for the historical import site
+// (tests + external callers import it from this module).
+export { resolveGateDaemonArgvPrefix };
 
 export interface AutoProvisionPolicyDaemonSignals {
   socketReachable: boolean;

@@ -29,6 +29,11 @@ import {
   type ExclusiveEgressBootSupervisorInternals,
 } from "../../src/egress-gate/arming-wiring.js";
 import {
+  buildGateDaemonPlistContent,
+  egressGateDaemonPlistPath,
+  renderEgressGateDaemonPlist,
+} from "../../src/egress-gate/gate-daemon.js";
+import {
   PfAnchorRegistry,
   PF_ANCHOR_REGISTRY_STATE_VERSION,
   type PfAnchorRegistryState,
@@ -96,6 +101,10 @@ function baseInternals(overrides: ExclusiveEgressBootSupervisorInternals = {}): 
     loadMarker: async () => null,
     ensureRuntimeFs: async () => undefined,
     ensureGateHomeLayout: async () => ({ logDir: "/var/sanctuary-agents/sanctuary-gate-hermes/logs" }),
+    // Hermetic default: the boot self-heal writes the gate plist to a real
+    // system path (/Library/LaunchDaemons); tests that don't care about it
+    // stub it to a no-op so they never touch the host.
+    writeGateDaemonPlist: async () => undefined,
     ...overrides,
   };
 }
@@ -712,6 +721,178 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
       expect(outcome.reason).toContain("unproven launchd state");
       expect(outcome.parkedClaim.state).toBe("parked");
     }
+  });
+});
+
+describe("startExclusiveEgressBootSupervisor (boot self-heal: stale pre-#986 gate plist rewritten absolute)", () => {
+  // The first program-argument in a rendered gate-daemon plist (the interpreter).
+  const PROGRAM_ARGS_ARRAY_OPEN = "<key>ProgramArguments</key>\n\t<array>\n";
+  function firstProgramArgument(plistContent: string): string {
+    const arrStart = plistContent.indexOf(PROGRAM_ARGS_ARRAY_OPEN);
+    expect(arrStart).toBeGreaterThanOrEqual(0);
+    const firstStringOpen = plistContent.indexOf("<string>", arrStart + PROGRAM_ARGS_ARRAY_OPEN.length);
+    const firstStringClose = plistContent.indexOf("</string>", firstStringOpen);
+    return plistContent.slice(firstStringOpen + "<string>".length, firstStringClose);
+  }
+
+  // A pre-#986 on-disk plist: the interpreter was a bare `node` (non-absolute),
+  // which crashes the gate daemon under the gate account's PATH-less launchd.
+  // The CURRENT renderer refuses to emit that (the fail-closed argv[0] guard),
+  // so synthesize the stale on-disk shape by hand from a correct plist.
+  const CORRECT_PLIST = buildGateDaemonPlistContent({
+    agentUid: 502,
+    gateAccount: OK_CTX.gateAccount,
+    gateHomeDirectory: OK_CTX.gateHomeDirectory,
+    gateDaemonArgvPrefix: [process.execPath, "/opt/sanctuary/cli.js"],
+    fortressPath: ENTRY.fortress_path,
+  }).plistContent;
+  const STALE_NON_ABSOLUTE_PLIST = CORRECT_PLIST.replace(
+    `<string>${process.execPath}</string>`,
+    "<string>node</string>",
+  );
+
+  it("rewrites the on-disk plist to an ABSOLUTE-interpreter argv BEFORE bootstrapping the gate daemon", async () => {
+    const events: string[] = [];
+    let writtenPath: string | undefined;
+    let writtenContent: string | undefined;
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        writeGateDaemonPlist: async (plistPath, plistContent) => {
+          events.push("writePlist");
+          writtenPath = plistPath;
+          writtenContent = plistContent;
+        },
+        runLaunchctlFn: async (args) => {
+          events.push(`launchctl ${args.join(" ")}`);
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        runBarrier: async () => {
+          events.push("barrier");
+          return RELEASED;
+        },
+      }),
+    });
+    handle.stopOracleLoop();
+    // The plist was written to the canonical per-uid path...
+    expect(writtenPath).toBe(egressGateDaemonPlistPath(502));
+    // ...its interpreter is this process's ABSOLUTE node (the #986 invariant)...
+    expect(firstProgramArgument(writtenContent!)).toBe(process.execPath);
+    // ...and it is NOT the stale pre-#986 content (self-heal actually changed it,
+    // when the on-disk content was the non-absolute form). The fixture is
+    // genuinely broken (a bare `node` interpreter).
+    expect(firstProgramArgument(STALE_NON_ABSOLUTE_PLIST)).toBe("node");
+    expect(writtenContent).not.toBe(STALE_NON_ABSOLUTE_PLIST);
+    // The rewrite happened BEFORE the (mocked) bootstrap of the on-disk plist.
+    const writeIdx = events.indexOf("writePlist");
+    const bootstrapIdx = events.indexOf(
+      "launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate.502.plist",
+    );
+    expect(writeIdx).toBeGreaterThanOrEqual(0);
+    expect(bootstrapIdx).toBeGreaterThan(writeIdx);
+    expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+  });
+
+  it("is idempotent: an already-absolute plist is re-written to the SAME correct content and boot still proceeds", async () => {
+    let writtenContent: string | undefined;
+    let bootstrapped = false;
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        writeGateDaemonPlist: async (_plistPath, plistContent) => {
+          writtenContent = plistContent;
+        },
+        runLaunchctlFn: async (args) => {
+          if (args[0] === "bootstrap") bootstrapped = true;
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        runBarrier: async () => RELEASED,
+      }),
+    });
+    handle.stopOracleLoop();
+    // Rewriting the correct plist is a no-op in effect: the content equals the
+    // canonical builder's output (the SAME builder the install path uses).
+    const canonical = buildGateDaemonPlistContent({
+      agentUid: 502,
+      gateAccount: OK_CTX.gateAccount,
+      gateHomeDirectory: OK_CTX.gateHomeDirectory,
+      gateDaemonArgvPrefix: [process.execPath, process.argv[1] ?? "sanctuary"],
+      fortressPath: ENTRY.fortress_path,
+    }).plistContent;
+    expect(writtenContent).toBe(canonical);
+    expect(firstProgramArgument(writtenContent!)).toBe(process.execPath);
+    expect(bootstrapped).toBe(true);
+    expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+  });
+
+  it("a self-heal WRITE failure is caught + logged LOUDLY + audited, and boot STILL bootstraps (no throw escapes)", async () => {
+    const printed: string[] = [];
+    const audited: Array<{ op: string; details: Record<string, unknown> }> = [];
+    let bootstrapped = false;
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async (op, details) => void audited.push({ op, details }),
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        writeGateDaemonPlist: async () => {
+          throw new Error("EACCES: /Library/LaunchDaemons is read-only");
+        },
+        runLaunchctlFn: async (args) => {
+          if (args[0] === "bootstrap") bootstrapped = true;
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        runBarrier: async () => RELEASED,
+      }),
+    });
+    handle.stopOracleLoop();
+    // No throw escaped the boot path...
+    expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+    // ...the failure is LOUD...
+    expect(printed.join("\n")).toContain("gate plist self-heal failed");
+    expect(printed.join("\n")).toContain("EACCES");
+    expect(printed.join("\n")).toContain("Repair: sudo sanctuary protect --repair-egress-gate");
+    // ...audited with the fail-closed marker...
+    const selfHeal = audited.find((a) => a.op === "exclusive_egress_gate_plist_self_heal_failed");
+    expect(selfHeal).toBeDefined();
+    expect(selfHeal!.details).toMatchObject({ agent_uid: 502, barrier_continues_fail_closed: true });
+    // ...and boot STILL bootstrapped the (existing) plist (the barrier parks
+    // fail-closed on its own if the on-disk plist is still broken).
+    expect(bootstrapped).toBe(true);
+  });
+
+  it("byte-identical guard: buildGateDaemonPlistContent equals the historical inline install render", async () => {
+    // Pins the extraction: the shared builder MUST reproduce, byte-for-byte, the
+    // argv shape the install path (productionBringUp) wrote inline before the
+    // refactor -- prefix, then `castle-wall egress-gate-daemon --agent-uid=<uid>`.
+    const gateDaemonArgvPrefix = [process.execPath, "/opt/sanctuary/cli.js"];
+    const built = buildGateDaemonPlistContent({
+      agentUid: 502,
+      gateAccount: OK_CTX.gateAccount,
+      gateHomeDirectory: OK_CTX.gateHomeDirectory,
+      gateDaemonArgvPrefix,
+      fortressPath: ENTRY.fortress_path,
+    });
+    const historical = renderEgressGateDaemonPlist({
+      agentUid: 502,
+      gateAccount: OK_CTX.gateAccount,
+      gateHomeDirectory: OK_CTX.gateHomeDirectory,
+      programArguments: [
+        ...gateDaemonArgvPrefix,
+        "castle-wall",
+        "egress-gate-daemon",
+        "--agent-uid=502",
+      ],
+      fortressPath: ENTRY.fortress_path,
+    });
+    expect(built.plistPath).toBe(egressGateDaemonPlistPath(502));
+    expect(built.plistContent).toBe(historical);
   });
 });
 
