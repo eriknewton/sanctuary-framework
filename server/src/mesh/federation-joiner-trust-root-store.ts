@@ -292,7 +292,7 @@ export async function persistFederationJoinerTrustRoot(opts: {
   // corrupt/unreadable existing record cannot supply a floor, so recovery is not
   // blocked (it decodes to an empty floor); under a custody compromise the attacker
   // already controls the store, which is out of scope for this floor.
-  let existing: FederationJoinerTrustRootRecord | null = null;
+  let existing: FederationJoinerTrustRootRecord | null;
   try {
     existing = await store.load();
   } catch {
