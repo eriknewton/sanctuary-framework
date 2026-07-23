@@ -81,7 +81,10 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await rig.stop();
-  await rm(fortressPath, { recursive: true, force: true });
+  // maxRetries/retryDelay: recursive teardown races the OS releasing child
+  // handles under parallel CI, throwing ENOTEMPTY. Bounded retries are the
+  // repo's established mitigation (see audit-log-concurrent-write.test.ts).
+  await rm(fortressPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
 });
 
 describe("federation admin verbs open their own /v1 session (drill 401 gap)", () => {
