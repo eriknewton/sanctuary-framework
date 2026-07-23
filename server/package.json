@@ -1,7 +1,7 @@
 {
   "name": "@sanctuary-framework/mcp-server",
   "version": "1.6.1",
-  "description": "Your agent, your machine, your keys. An MCP server that adds encrypted state, approval gates, and a portable identity to any AI agent.",
+  "description": "The open source standard for secure, private AI: a wall the operating system enforces in both directions, and your data under your own keys, portable anywhere. Any agent, local or cloud, solo or fleet.",
   "type": "module",
   "main": "dist/index.cjs",
   "module": "dist/index.js",
