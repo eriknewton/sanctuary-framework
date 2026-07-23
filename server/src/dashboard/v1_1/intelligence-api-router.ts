@@ -31,6 +31,7 @@ import {
   SUBSTRATE_CHOICES,
   SURFACES,
   FRONTIER_PROVIDERS,
+  Tier2BindingPinnedError,
   type FallbackBehavior,
   type FrontierProvider,
   type HybridRoutingRules,
@@ -396,8 +397,19 @@ export async function handleIntelligenceRoute(
           );
         }
       }
-      await deps.selector.applyChoiceToAllSurfaces(body.substrate, { localModelPick });
-      writeJSON(res, 200, { ok: true, data: sanitizeConfig(deps.selector) });
+      const bulkResult = await deps.selector.applyChoiceToAllSurfaces(
+        body.substrate,
+        { localModelPick },
+      );
+      // Additive: surfaces the fan-out skipped because of a local-only
+      // pin (ratified 2026-07-23: privacy-filter-tier-2). Empty array
+      // when nothing was skipped, so the picker UI can show an explicit
+      // "not applied to N pinned surface(s)" note.
+      writeJSON(res, 200, {
+        ok: true,
+        data: sanitizeConfig(deps.selector),
+        skipped_pinned_surfaces: bulkResult.skippedPinnedSurfaces,
+      });
       return true;
     }
 
@@ -465,7 +477,17 @@ export async function handleIntelligenceRoute(
             );
           }
         }
-        await deps.selector.setPerSurfaceChoice(surface, body.substrate);
+        try {
+          await deps.selector.setPerSurfaceChoice(surface, body.substrate);
+        } catch (err) {
+          // Ratified 2026-07-23: the tier-2 surface is pinned local-only.
+          // Surface the refusal as a 409 with the posture-naming message
+          // rather than a generic 500.
+          if (err instanceof Tier2BindingPinnedError) {
+            throw new IntelligenceRouterError(409, err.code, err.message);
+          }
+          throw err;
+        }
         writeJSON(res, 200, { ok: true, data: sanitizeConfig(deps.selector) });
         return true;
       }

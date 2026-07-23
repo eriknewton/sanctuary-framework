@@ -1070,7 +1070,7 @@ describe("SubstrateSelector, Finding VV recent failures + badge degrade", () => 
 
 // v1.2.0-rc.1 Finding SS: Apply-to-all-surfaces
 describe("SubstrateSelector, Finding SS bulk apply", () => {
-  it("applyChoiceToAllSurfaces sets every surface to the same substrate", async () => {
+  it("applyChoiceToAllSurfaces sets every non-pinned surface to the same substrate", async () => {
     const { selector } = buildSelector();
     await selector.load();
     await selector.applyChoiceToAllSurfaces("venice");
@@ -1080,11 +1080,14 @@ describe("SubstrateSelector, Finding SS bulk apply", () => {
       "direct-agent-gate-advisor",
       "sentinel-scoring",
       "gate-explanation",
-      "privacy-filter-tier-2",
       "template-suggestion",
     ] as const) {
       expect(cfg.perSurface[surface]).toBe("venice");
     }
+    // Ratified 2026-07-23: privacy-filter-tier-2 is pinned local-only,
+    // so the venice fan-out skips it (covered in depth by
+    // tier2-local-pin.test.ts).
+    expect(cfg.perSurface["privacy-filter-tier-2"]).toBe("local");
     expect(cfg.applyToAllSurfaces).toBe(true);
   });
 
@@ -1103,7 +1106,9 @@ describe("SubstrateSelector, Finding SS bulk apply", () => {
     };
     expect(details.kind).toBe("bulk_substrate_chosen");
     expect(details.substrate).toBe("venice");
-    expect(details.surface_count).toBe(6);
+    // 5, not 6: the pinned privacy-filter-tier-2 surface is skipped by
+    // a venice fan-out (ratified 2026-07-23).
+    expect(details.surface_count).toBe(5);
     expect(details.tradeoff_text_hash).toBe(tradeoffTextHash("venice"));
     expect(details.prior_substrates.concierge).toBe("local");
     expect(details.prior_substrates["gate-explanation"]).toBe("disabled");

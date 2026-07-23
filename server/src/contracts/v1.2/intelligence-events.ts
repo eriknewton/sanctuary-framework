@@ -198,6 +198,30 @@ export interface IntelligenceBulkSubstrateChosenPayload extends IntelligenceAudi
   tradeoff_text_hash: string;
   /** Per-surface substrate the operator overrode; null if the surface had no prior binding. */
   prior_substrates: Partial<Record<Surface, SubstrateChoice | null>>;
+  /**
+   * Surfaces the fan-out SKIPPED because the requested substrate would
+   * violate a local-only pin (the ratified 2026-07-23
+   * `privacy-filter-tier-2` posture). Additive; absent on payloads
+   * emitted before the pin existed and on fan-outs that skip nothing.
+   */
+  pinned_surfaces_skipped?: Surface[];
+}
+
+/**
+ * The invoke-time chokepoint found a persisted non-local binding for
+ * the pinned `privacy-filter-tier-2` surface and overrode it to
+ * `local` (ratified 2026-07-23 posture). Emitted once per process on
+ * the first override; the persisted config is left as-is so the
+ * operator can see and correct the tampered or grandfathered value.
+ */
+export interface IntelligenceTier2BindingPinnedPayload extends IntelligenceAuditPayloadHeader {
+  kind: "tier2_binding_pinned";
+  /** The pinned surface (always privacy-filter-tier-2 in v1.2). */
+  surface: Surface;
+  /** The non-local substrate the persisted config asked for. */
+  persisted_substrate: SubstrateChoice;
+  /** The substrate invocations actually resolve to. */
+  pinned_to: "local";
 }
 
 /** Discriminated union of every v1.2 intelligence audit payload. */
@@ -208,4 +232,5 @@ export type IntelligenceAuditPayload =
   | IntelligencePiiRedactionEventPayload
   | IntelligenceConfigLoadedPayload
   | IntelligenceConfigResetPayload
-  | IntelligenceBulkSubstrateChosenPayload;
+  | IntelligenceBulkSubstrateChosenPayload
+  | IntelligenceTier2BindingPinnedPayload;

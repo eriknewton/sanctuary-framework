@@ -29,9 +29,11 @@
  *     intent-preserved classes to originals by ratified design, so
  *     those originals DO egress on the query leg (subject to the
  *     always-on concierge Tier 1 filter re-covering its own classes);
- *     (b) regex residuals can still reach the `privacy-filter-tier-2`
- *     helper surface via LLM-assist, which matters only if that
- *     surface is bound to a remote substrate (open follow-up); (c) a
+ *     (b) regex residuals reach the `privacy-filter-tier-2` helper
+ *     surface via LLM-assist, but that surface is PINNED local-only
+ *     (ratified 2026-07-23; see `TIER2_PINNED_SURFACE` in
+ *     intelligence/types.ts), so residuals never leave the host
+ *     through it; (c) a
  *     config record that cannot be READ (storage throw) or DECODED
  *     FAILS the query; only a genuinely absent record evaluates to
  *     the default-off posture (never a silent un-rewritten send on

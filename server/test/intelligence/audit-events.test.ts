@@ -13,6 +13,7 @@ describe("audit operation name constants", () => {
       CONFIG_LOADED: "intelligence_config_loaded",
       CONFIG_RESET: "intelligence_config_reset",
       BULK_SUBSTRATE_CHOSEN: "intelligence_bulk_substrate_chosen",
+      TIER2_BINDING_PINNED: "query_anonymity_tier2_binding_pinned",
     });
   });
 

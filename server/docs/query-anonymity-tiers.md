@@ -137,14 +137,29 @@ The live path has two legs:
    `read_failed`) or cannot be decoded (reason `decode_failed`) FAILS
    the query with `query_anonymity_pii_config_unreadable`, and only a
    genuinely absent record evaluates to the default-off posture, so an
-   unknown posture is never a silent un-rewritten send. Two scoped
-   non-claims: smart mode restores
-   intent-preserved classes to originals by ratified design (the
-   always-on concierge Tier 1 filter still re-covers its own classes
-   on the composed text), and regex residuals can still reach the
-   `privacy-filter-tier-2` helper surface via LLM-assist, which
-   matters only if that surface is bound to a remote substrate (open
-   follow-up, escalated).
+   unknown posture is never a silent un-rewritten send. One scoped
+   non-claim: smart mode restores intent-preserved classes to
+   originals by ratified design (the always-on concierge Tier 1
+   filter still re-covers its own classes on the composed text).
+
+**Ratified posture (2026-07-23): the `privacy-filter-tier-2` surface
+is pinned local-only.** This surface is the internal plumbing of the
+Tier B privacy feature: LLM-assist redaction and smart-mode intent
+classification both route text that can still carry PII residuals
+through it. A privacy feature's internal plumbing must not be
+configurable into an egress channel, the same prohibition on silent
+relaxation applied everywhere else in the codebase, so there is no
+override flag. Enforcement is two-layer: the config-write path
+refuses a non-local binding for this surface (the bulk "apply to all
+surfaces" fan-out skips it and reports the skip instead of failing),
+and the selector resolves this surface to `local` at invoke time
+regardless of what a persisted (pre-existing or tampered) config
+says, emitting a one-time `query_anonymity_tier2_binding_pinned`
+audit event when it overrides. The fallback chain also never carries
+this surface past `local`. The pin means never-remote, not must-LLM:
+`disabled` stays allowed, and when no local substrate is available
+the rewrite degrades to the regex-only result rather than blocking
+the query.
 2. **Frontier egress redactor**
    (`intelligence/privacy-tier2-redactor.ts`): every production
    `SubstrateSelector` installs the consent-gated Tier 2 redactor via
