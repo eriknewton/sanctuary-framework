@@ -107,10 +107,30 @@ describe("sanctuary federation adopt (planned auto-adopt CLI)", () => {
     expect(err.text()).toContain("not a valid federation");
   });
 
-  it("refuses when no operator credential is present (exit 1)", async () => {
+  it("refuses a missing --pinned-master (A-full, exit 1)", async () => {
     const err = collector();
     const code = await runFederationAdopt({
       argv: ["--renew", "--fortress-url", "http://x", "--rotation-cert", ROTATION_CERT],
+      env: { SANCTUARY_PASSPHRASE: "pw" },
+      out: collector().stream,
+      err: err.stream,
+    });
+    expect(code).toBe(1);
+    expect(err.text()).toContain("--pinned-master");
+  });
+
+  it("refuses when no operator credential is present (exit 1)", async () => {
+    const err = collector();
+    const code = await runFederationAdopt({
+      argv: [
+        "--renew",
+        "--fortress-url",
+        "http://x",
+        "--rotation-cert",
+        ROTATION_CERT,
+        "--pinned-master",
+        PINNED_K2,
+      ],
       env: {},
       out: collector().stream,
       err: err.stream,
@@ -153,7 +173,15 @@ describe("sanctuary federation adopt (planned auto-adopt CLI)", () => {
       }) as unknown as FederationJoinerPlannedRootAdoptResult;
 
     const code = await runFederationAdopt({
-      argv: ["--renew", "--fortress-url", "http://x", "--rotation-cert", ROTATION_CERT],
+      argv: [
+        "--renew",
+        "--fortress-url",
+        "http://x",
+        "--rotation-cert",
+        ROTATION_CERT,
+        "--pinned-master",
+        PINNED_K2,
+      ],
       env: { SANCTUARY_PASSPHRASE: "pw" },
       out: out.stream,
       err: collector().stream,
@@ -183,7 +211,15 @@ describe("sanctuary federation adopt (planned auto-adopt CLI)", () => {
       }) as unknown as FederationJoinerPlannedRootAdoptResult;
     const heldErr = collector();
     const held = await runFederationAdopt({
-      argv: ["--renew", "--fortress-url", "http://x", "--rotation-cert", ROTATION_CERT],
+      argv: [
+        "--renew",
+        "--fortress-url",
+        "http://x",
+        "--rotation-cert",
+        ROTATION_CERT,
+        "--pinned-master",
+        PINNED_K2,
+      ],
       env: { SANCTUARY_PASSPHRASE: "pw" },
       out: collector().stream,
       err: heldErr.stream,
@@ -200,7 +236,15 @@ describe("sanctuary federation adopt (planned auto-adopt CLI)", () => {
         currentPinnedMaster: null,
       }) as unknown as FederationJoinerPlannedRootAdoptResult;
     const unreachable = await runFederationAdopt({
-      argv: ["--renew", "--fortress-url", "http://x", "--rotation-cert", ROTATION_CERT],
+      argv: [
+        "--renew",
+        "--fortress-url",
+        "http://x",
+        "--rotation-cert",
+        ROTATION_CERT,
+        "--pinned-master",
+        PINNED_K2,
+      ],
       env: { SANCTUARY_PASSPHRASE: "pw" },
       out: collector().stream,
       err: collector().stream,
@@ -347,10 +391,11 @@ describe("sanctuary federation rejoin (compromise manual re-join CLI)", () => {
       return 0;
     };
 
+    const out = collector();
     const code = await runFederationRejoin({
       argv: validArgv(),
       env: {},
-      out: collector().stream,
+      out: out.stream,
       err: collector().stream,
       join: joinSeam,
       persistRejoinedJoinerTrustRoot: persistSeam,
@@ -362,6 +407,11 @@ describe("sanctuary federation rejoin (compromise manual re-join CLI)", () => {
     expect(capturedArgv).toContain("--bootstrap-token");
     expect(persistArgs?.revokedOldMasterPubkey).toBe(K1_PUB);
     expect(persistArgs?.revocationSerial).toBe(5);
+    // LOW-2: reports the recorded revocation (observation-shaped, public only).
+    const printed = out.text();
+    expect(printed).toContain('"rejoined": true');
+    expect(printed).toContain(K1_PUB);
+    expect(printed).toContain('"revocation_serial": 5');
   });
 });
 

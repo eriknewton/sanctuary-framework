@@ -54,6 +54,7 @@ import type { NodeMode } from "../mesh/constants.js";
 import {
   adoptFederationJoinerPlannedRoot,
   persistFederationJoinerTrustRoot,
+  FederationJoinerTrustRootStoreError,
   FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
   FEDERATION_JOINER_TRUST_ROOT_KEY,
   type FederationJoinerPlannedRootAdoptResult,
@@ -472,7 +473,8 @@ export async function runFederationJoin(args: {
         persisted = true;
       } catch (persistErr) {
         const reason =
-          persistErr instanceof OperatorSigningError
+          persistErr instanceof OperatorSigningError ||
+          persistErr instanceof FederationJoinerTrustRootStoreError
             ? persistErr.message
             : "the issued certificate does not chain to --pinned-master, or the " +
               "local fortress could not be opened";
@@ -598,6 +600,7 @@ interface AdoptFlags {
   renew: boolean;
   fortressUrl?: string;
   rotationCertArg?: string;
+  pinnedMasterArg?: string;
   passphrase?: string;
   recoveryKey?: string;
   fortressPath?: string;
@@ -612,6 +615,7 @@ function parseAdoptFlags(argv: string[], env: NodeJS.ProcessEnv): AdoptFlags {
     renew: argv.includes("--renew"),
     fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
     rotationCertArg: flag("--rotation-cert"),
+    pinnedMasterArg: flag("--pinned-master"),
     passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
     recoveryKey: env.SANCTUARY_RECOVERY_KEY,
     fortressPath: flag("--fortress"),
@@ -683,6 +687,33 @@ export async function runFederationAdopt(args: {
     );
     return 1;
   }
+  // A-FULL: the operator's OUT-OF-BAND expected new root is REQUIRED. Verifying
+  // the K1-signed cert is not enough trust when K1 may be compromised; the
+  // adopted anchor must match a root the operator confirms by hand.
+  if (!flags.pinnedMasterArg) {
+    err.write(
+      "sanctuary federation adopt: --pinned-master <K2 json | @file> is required " +
+        "(the OUT-OF-BAND expected NEW fortress-master public key; a K1-signed " +
+        "rotation cert alone is not a sufficient trust anchor when K1 may be " +
+        "compromised)\n",
+    );
+    return 1;
+  }
+  const pinnedMasterJson = await readInlineOrFile(flags.pinnedMasterArg);
+  if (pinnedMasterJson === null) {
+    err.write(
+      "sanctuary federation adopt: could not read --pinned-master (bad @file path?)\n",
+    );
+    return 1;
+  }
+  const expectedPinnedMaster = parsePinnedMaster(pinnedMasterJson);
+  if (expectedPinnedMaster === null) {
+    err.write(
+      "sanctuary federation adopt: --pinned-master is not a valid " +
+        "FortressMasterPublicKey (needs public_key, fortress_id, created_at)\n",
+    );
+    return 1;
+  }
   if (!flags.passphrase && !flags.recoveryKey) {
     err.write(
       "sanctuary federation adopt: needs an unlocked operator identity to read " +
@@ -696,6 +727,7 @@ export async function runFederationAdopt(args: {
   try {
     result = await perform({
       rotationCert,
+      expectedPinnedMaster,
       fortressUrl: flags.fortressUrl,
       request,
       ...(flags.passphrase !== undefined ? { passphrase: flags.passphrase } : {}),
@@ -759,6 +791,10 @@ function plannedAdoptHeldReason(reason: string): string {
     case "rotation_cert_invalid":
       return "the rotation cert did not verify under the currently pinned root " +
         "(wrong signer, bad signature, or a stale/replayed serial)";
+    case "adopted_root_mismatch_operator_pin":
+      return "the new root the rotation cert attests does not match the " +
+        "operator-supplied --pinned-master; a K1-signed cert alone is not a " +
+        "sufficient anchor when K1 may be compromised";
     case "reissue_denied":
       return "the fortress refused to reissue this node's cert (revoked node, " +
         "revoked old root, or no recorded rotation lineage)";
@@ -787,6 +823,7 @@ function plannedAdoptHeldReason(reason: string): string {
  */
 export async function performPlannedAdoptFromCli(opts: {
   rotationCert: FederationRootRotationCertificate;
+  expectedPinnedMaster: FortressMasterPublicKey;
   fortressUrl: string;
   request: typeof dashboardRequest;
   passphrase?: string;
@@ -803,6 +840,7 @@ export async function performPlannedAdoptFromCli(opts: {
       storage: signer.storage,
       masterKey: signer.masterKey,
       rotationCert: opts.rotationCert,
+      expectedPinnedMaster: opts.expectedPinnedMaster,
       reissue: (req) =>
         reissueNodeCertViaHttp(req, opts.fortressUrl, opts.request),
     });
@@ -1139,7 +1177,7 @@ export async function runFederationRejoin(args: {
     ...(flags.fortressPath !== undefined ? ["--fortress", flags.fortressPath] : []),
   ];
 
-  return runJoin({
+  const code = await runJoin({
     argv: joinArgv,
     env,
     out,
@@ -1147,6 +1185,28 @@ export async function runFederationRejoin(args: {
     ...(args.request !== undefined ? { request: args.request } : {}),
     persistJoinerTrustRoot: persist,
   });
+
+  // LOW-2 (review 2026-07-24): the wrapper's whole reason to exist is recording
+  // the dead old root, so report it (observation-shaped, public material only).
+  // Design section 7: "re-joined against operator-supplied K2; recorded K1
+  // revoked at serial N."
+  if (code === 0) {
+    out.write(
+      `${JSON.stringify(
+        {
+          rejoined: true,
+          result:
+            "re-joined against the operator-supplied new root; recorded the old " +
+            "root revoked with an anti-rollback serial floor",
+          recorded_revoked_old_master: revokedOldMaster,
+          revocation_serial: revocationSerial,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+  }
+  return code;
 }
 
 /**
@@ -3106,7 +3166,7 @@ Joiner verb -- runs on the joining node:
 Recover after a rotate-root -- run on the joining node:
   Planned rotation (the old root is still honest):
   sanctuary federation adopt --renew --fortress-url <url> \\
-    --rotation-cert <json | @file> \\
+    --rotation-cert <json | @file> --pinned-master <K2 json | @file> \\
     [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
 
   Compromise rotation (the old root is in enemy hands):
@@ -3115,17 +3175,23 @@ Recover after a rotate-root -- run on the joining node:
     --revoked-old-master <K1 pubkey> --revocation-serial <n> \\
     [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
 
-  adopt    PLANNED-rotation auto-adopt. After the operator runs
-           'rotate-root --renew' on the home fortress, a machine that was OFFLINE
-           (or a new machine) moves from pinning the OLD root to the NEW one. It
-           verifies the K1-signed rotation certificate under the root it CURRENTLY
-           pins, runs the node-cert reissue proof-of-possession round against the
-           existing endpoint (no new route), re-verifies the reissued cert chains
-           to the NEW root the rotation cert attests (never the server response),
-           and atomically re-pins it. Fail-closed: any doubt HOLDS the old trust
-           anchor loudly and adopts nothing. Classical-only: a HYBRID rotation
-           cert is refused (no silent post-quantum downgrade). Prints only PUBLIC
-           material. Exit: 0 adopted, 1 usage, 2 fortress unreachable, 3 held.
+  adopt    PLANNED-rotation adopt. After the operator runs 'rotate-root --renew'
+           on the home fortress, a machine that was OFFLINE (or a new machine)
+           moves from pinning the OLD root to the NEW one. It verifies the
+           K1-signed rotation certificate under the root it CURRENTLY pins, then
+           asserts the NEW root the cert attests byte-matches the OPERATOR-supplied
+           --pinned-master (REQUIRED, out of band): a K1-signed cert alone is not a
+           sufficient trust anchor when K1 may be compromised, so the adopted
+           anchor is operator-confirmed and a forged K1->K2' cert fails closed even
+           against an UNDETECTED compromise. It then runs the node-cert reissue
+           proof-of-possession round against the existing endpoint (no new route),
+           re-verifies the reissued cert chains to that operator-pinned NEW root
+           (never the server response), and atomically re-pins it. Fail-closed: any
+           doubt HOLDS the old trust anchor loudly and adopts nothing. Classical-
+           only: a HYBRID rotation cert is refused (no silent post-quantum
+           downgrade). Prints only PUBLIC material. The fully hands-off convenience
+           is intentionally dropped for the unconditional guarantee. Exit: 0
+           adopted, 1 usage, 2 fortress unreachable, 3 held.
 
   rejoin   COMPROMISE-rotation manual re-join. After 'rotate-root --compromised',
            nothing the OLD root signed can be believed, so there is NO automatic

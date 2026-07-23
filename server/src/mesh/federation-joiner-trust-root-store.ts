@@ -262,9 +262,12 @@ export async function loadFederationJoinerTrustRoot(
  * The optional `revokedRootPubkeys` / `highestRevocationSerial` let a COMPROMISE
  * manual re-join (`sanctuary federation rejoin`) record the now-dead old root
  * (K1) into the fresh K2 record with an anti-rollback floor, so a later K1 (or
- * K1-signed artifact) is refused locally. They are additive and grow-only: the
- * new pinned master must NOT itself be in the revoked set (`validateJoinerRecord`
- * fails closed), and a non-empty revoked set REQUIRES a positive serial floor.
+ * K1-signed artifact) is refused locally. They are additive and GROW-ONLY: the
+ * supplied roots are UNIONed into any existing record's revoked set (never
+ * replace it), the persisted floor is `Math.max(existing, supplied)` (never
+ * lowered), a strictly-below-floor serial is REFUSED loudly, the new pinned
+ * master must NOT itself be in the merged set (`validateJoinerRecord` fails
+ * closed), and a non-empty revoked set REQUIRES a positive serial floor.
  */
 export async function persistFederationJoinerTrustRoot(opts: {
   storage: StorageBackend;
@@ -277,7 +280,55 @@ export async function persistFederationJoinerTrustRoot(opts: {
   highestRevocationSerial?: number;
   audit?: ProvisionOrLoadFederationJoinerTrustRootOptions["audit"];
 }): Promise<ProvisionedFederationJoinerTrustRoot> {
-  const revokedRootPubkeys = new Set<string>(opts.revokedRootPubkeys ?? []);
+  const store = new FederationJoinerTrustRootStore(opts.storage, opts.masterKey);
+
+  // Grow-only merge (MED fix 2026-07-24): the joiner's revoked-root set and its
+  // monotonic revocation floor are GROW-ONLY. A re-join (or any re-persist) must
+  // UNION the supplied revoked roots into whatever the existing record already
+  // recorded and NEVER lower the floor. Without this, a stale/lower-serial re-join
+  // would shrink the set (fresh `[K1]` replacing a larger set) or roll the floor
+  // back, re-enabling replay of revocations between the old and new floor. Mirrors
+  // the issuer-side Math.max merge (`v1/federation-sync-state-store.ts`). A
+  // corrupt/unreadable existing record cannot supply a floor, so recovery is not
+  // blocked (it decodes to an empty floor); under a custody compromise the attacker
+  // already controls the store, which is out of scope for this floor.
+  let existing: FederationJoinerTrustRootRecord | null = null;
+  try {
+    existing = await store.load();
+  } catch {
+    existing = null;
+  }
+  const existingRevoked = normalizeRevokedRootPubkeys(
+    existing?.revoked_root_pubkeys,
+  );
+  const existingFloor = normalizeHighestRevocationSerial(
+    existing?.highest_revocation_serial,
+  );
+  const suppliedFloor =
+    opts.highestRevocationSerial !== undefined && opts.highestRevocationSerial > 0
+      ? opts.highestRevocationSerial
+      : 0;
+  // Reject a strictly-below-floor serial LOUDLY (fail-closed) rather than
+  // persisting it; an equal serial (idempotent re-run) or a higher one proceeds.
+  if (suppliedFloor > 0 && suppliedFloor < existingFloor) {
+    await auditJoinerTrustRoot(opts.audit, {
+      operation: "federation_joiner_trust_root_save",
+      result: "failure",
+      details: {
+        reason: "revocation_serial_below_floor",
+        supplied: suppliedFloor,
+        floor: existingFloor,
+      },
+    });
+    throw new FederationJoinerTrustRootStoreError(
+      `revocation serial ${suppliedFloor} is below the recorded anti-rollback ` +
+        `floor ${existingFloor}; refusing to lower the monotonic floor`,
+    );
+  }
+  const mergedRevoked = new Set<string>(existingRevoked);
+  for (const pubkey of opts.revokedRootPubkeys ?? []) mergedRevoked.add(pubkey);
+  const mergedFloor = Math.max(existingFloor, suppliedFloor);
+
   const record: FederationJoinerTrustRootRecord = {
     fortress_id: opts.pinnedMasterPubkey.fortress_id,
     node_id: opts.localNodeCert.node_id,
@@ -285,15 +336,9 @@ export async function persistFederationJoinerTrustRoot(opts: {
     issuing_principal_cert: clonePrincipalCert(opts.issuingPrincipalCert),
     local_node_cert: cloneNodeCert(opts.localNodeCert),
     local_node_private_key: Uint8Array.from(opts.localNodePrivateKey),
-    ...(revokedRootPubkeys.size > 0
-      ? { revoked_root_pubkeys: revokedRootPubkeys }
-      : {}),
-    ...(opts.highestRevocationSerial !== undefined &&
-    opts.highestRevocationSerial > 0
-      ? { highest_revocation_serial: opts.highestRevocationSerial }
-      : {}),
+    ...(mergedRevoked.size > 0 ? { revoked_root_pubkeys: mergedRevoked } : {}),
+    ...(mergedFloor > 0 ? { highest_revocation_serial: mergedFloor } : {}),
   };
-  const store = new FederationJoinerTrustRootStore(opts.storage, opts.masterKey);
   try {
     await store.save(record);
   } catch (err) {
@@ -364,6 +409,7 @@ export type FederationJoinerPlannedRootAdoptRejectionReason =
   | "hybrid_rotation_unsupported"
   | "rotation_signer_revoked"
   | "rotation_cert_invalid"
+  | "adopted_root_mismatch_operator_pin"
   | "reissue_denied"
   | "reissue_unreachable"
   | "server_root_mismatch"
@@ -416,9 +462,18 @@ export type FederationJoinerPlannedRootAdoptResult =
 /**
  * Adopt a PLANNED-rotated issuer root on a JOINER.
  *
- * Safe to automate precisely because the trust decision is anchored on the
- * K1-signed rotation certificate, which ONLY an honest K1 could produce (in the
- * planned class K1 is, by definition, not compromised). The steps, in order:
+ * A-FULL trust model (ratified 2026-07-24): the adopted anchor is confirmed by
+ * the OPERATOR out of band, NOT inferred from the K1-signed rotation cert alone.
+ * Verifying a K1-signed cert proves K1 AUTHORIZED the succession and lets us run
+ * the lighter reissue-not-rejoin ceremony, but a K1 signature is NOT sufficient
+ * TRUST when K1 may be COMPROMISED (a K1 holder can forge a valid K1->K2' cert).
+ * So every planned adopt REQUIRES `expectedPinnedMaster`: the operator's
+ * out-of-band expected NEW root. The cert's `new_master` must byte-match it or
+ * the adopt fails closed. This is the SAME "never infer the anchor from the
+ * network" discipline (constraint 4) the compromise re-join uses; planned adopt
+ * now anchors on it too, so a forged K2' cert fails even against an UNDETECTED
+ * compromise. The fully hands-off convenience is intentionally dropped for the
+ * unconditional guarantee. The steps, in order:
  *
  *   1. Load the current (K1-pinned) record; missing/unavailable -> held.
  *   2. Refuse a HYBRID rotation cert LOUDLY (classical-only slice; no silent
@@ -430,11 +485,13 @@ export type FederationJoinerPlannedRootAdoptResult =
  *   4. Verify the rotation cert under the CURRENTLY pinned master with the
  *      monotonic adopted-serial floor (rejects wrong-master, bad signature,
  *      fortress mismatch, and a stale/replayed serial).
- *   5. Learn K2 from THAT verified cert (`rotationCert.new_master`), run the
- *      injected reissue proof-of-possession round, and confirm the server echoed
- *      the same K2 (defense-in-depth; the trust source is the cert, not the
- *      response).
- *   6. Re-verify the reissued chain terminates at K2, then atomically re-pin K2
+ *   5. Learn K2 from THAT verified cert (`rotationCert.new_master`) and assert it
+ *      byte-matches the OPERATOR-supplied `expectedPinnedMaster`; a mismatch (a
+ *      forged K2' cert, even one K1 legitimately signed) -> held, adopt nothing.
+ *   6. Run the injected reissue proof-of-possession round, and confirm the server
+ *      echoed the same K2 (defense-in-depth; the trust source is the cert +
+ *      operator pin, never the response).
+ *   7. Re-verify the reissued chain terminates at K2, then atomically re-pin K2
  *      via the store save (which re-runs the FULL chain verification).
  *
  * Any failure leaves the old record untouched and surfaces
@@ -445,6 +502,13 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
   storage: StorageBackend;
   masterKey: Uint8Array;
   rotationCert: FederationRootRotationCertificate;
+  /**
+   * A-FULL: the operator's OUT-OF-BAND expected NEW root (K2). The cert's
+   * `new_master` MUST byte-match this or the adopt fails closed. This is what
+   * defeats a forged K1->K2' cert under an UNDETECTED compromise: the attacker
+   * cannot make the operator carry K2' by hand.
+   */
+  expectedPinnedMaster: FortressMasterPublicKey;
   reissue: (
     req: FederationJoinerPlannedRootAdoptReissueRequest,
   ) => Promise<FederationJoinerPlannedRootAdoptReissueResult>;
@@ -471,6 +535,24 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
   // Classical-only: a hybrid rotation cert cannot be verified on this path.
   // Refuse LOUDLY rather than verify only the classical Ed25519 half (a silent
   // post-quantum downgrade). Hybrid planned-adopt is a deferred follow-on.
+  //
+  // LOW-1 (review 2026-07-24), REFUSAL-REASON IMPRECISION IS ACCEPTABLE: this
+  // guard keys on `hybrid_rotation`, which the frozen rotation-cert signed body
+  // EXCLUDES (`trust-root.ts::rotationCertSignedBody`). An attacker can strip the
+  // field from a public hybrid cert to defeat this LOUD refusal. Binding the
+  // hybrid determination to a signed field would require a wire change to a
+  // frozen surface, so we keep this best-effort loud refusal and rely on the
+  // downstream fail-closed guarantees, which HOLD even when the field is
+  // stripped: (a) A-FULL requires the cert's `new_master` to byte-match the
+  // operator's out-of-band pin, and an operator following the classical-only
+  // guidance never pins a hybrid root as a full classical trust anchor; (b) the
+  // honest issuer's reissue endpoint refuses a hybrid fortress outright
+  // (`v1/federation.ts` `hybrid_reissue_unsupported`) -> `reissue_denied`; and
+  // (c) against a malicious server the returned chain cannot terminate at the
+  // genuine K2 without K2's private key -> `reissued_chain_invalid`. So a
+  // classical adopt can NEVER silently downgrade a hybrid root; the only loss on
+  // a stripped field is that the operator sees `reissue_denied` /
+  // `reissued_chain_invalid` instead of the loud `hybrid_rotation_unsupported`.
   if (
     (opts.rotationCert as { hybrid_rotation?: unknown }).hybrid_rotation !==
     undefined
@@ -525,6 +607,25 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
   const newPinnedMaster: FortressMasterPublicKey = {
     ...opts.rotationCert.new_master,
   };
+
+  // A-FULL (HIGH fix 2026-07-24): the trust anchor is OPERATOR-CONFIRMED. Even a
+  // valid K1-signed cert is insufficient when K1 may be compromised (a K1 holder
+  // can forge a K1->K2' cert). The cert's `new_master` MUST byte-match the
+  // operator's out-of-band expected root, so a forged K2' fails closed here even
+  // against an undetected compromise. The attacker cannot make the operator
+  // carry K2' by hand.
+  if (!samePinnedMasterExact(newPinnedMaster, opts.expectedPinnedMaster)) {
+    await auditPlannedAdoptFailure(
+      opts.audit,
+      "adopted_root_mismatch_operator_pin",
+      { fortress_id: current.fortress_id, node_id: current.node_id },
+    );
+    return held(
+      "adopted_root_mismatch_operator_pin",
+      currentPinned,
+      rotationSerial,
+    );
+  }
 
   let reissued: FederationJoinerPlannedRootAdoptReissueResult;
   try {
@@ -675,6 +776,24 @@ function samePinnedIdentity(
   b: FortressMasterPublicKey,
 ): boolean {
   return a.public_key === b.public_key && a.fortress_id === b.fortress_id;
+}
+
+/**
+ * Byte-exact match across ALL fields (including `created_at`) for the A-FULL
+ * operator-pin assertion. The honest issuer treats a rotation cert's `new_master`
+ * and the pinned master it prints as byte-identical (the reissue endpoint's own
+ * `samePinnedMaster` compares all three fields), so an operator who pastes the
+ * exact `rotate-root` output matches exactly; any discrepancy fails closed.
+ */
+function samePinnedMasterExact(
+  a: FortressMasterPublicKey,
+  b: FortressMasterPublicKey,
+): boolean {
+  return (
+    a.public_key === b.public_key &&
+    a.fortress_id === b.fortress_id &&
+    a.created_at === b.created_at
+  );
 }
 
 /** A rotation-cert verify error message is PUBLIC (no key material). */
