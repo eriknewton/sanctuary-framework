@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { randomBytes } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ed25519 } from "@noble/curves/ed25519";
 
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
 import { buildChallengeMessage } from "../../src/v1/ceremony.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { establishMaster } from "../../src/core/master-custody.js";
 import {
   bytesToString,
@@ -546,6 +550,42 @@ describe("adoptFederationJoinerPlannedRoot (planned auto-adopt)", () => {
     rotation.newIssuingPrincipalPrivateKey.fill(0);
   });
 
+  it("LOW: an absent operator pin returns a clean held result, not a TypeError", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    await saveJoiner(storage, masterKey, record);
+    const rotation = buildPlannedRotation({ current: record, home });
+    let reissueCalled = false;
+
+    // A direct JS caller passes no pin (the CLI makes it required, but the core
+    // must fail closed-as-specified rather than throw).
+    const rejected = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: undefined as unknown as FortressMasterPublicKey,
+      reissue: async () => {
+        reissueCalled = true;
+        return rotation.reissue();
+      },
+    });
+
+    expect(rejected).toEqual(
+      expect.objectContaining({
+        adopted: false,
+        state: "held_old_trust",
+        reason: "adopted_root_mismatch_operator_pin",
+      }),
+    );
+    expect(reissueCalled).toBe(false);
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      record.pinned_master_pubkey.public_key,
+    );
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
   it("rejects a rotation cert whose serial does not advance the adopted serial (replay)", async () => {
     const storage = new MemoryStorage();
     const masterKey = await testMasterKey(storage);
@@ -902,6 +942,106 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
     expect(loaded?.record.revoked_root_pubkeys?.has(deadKPrev)).toBe(true);
     expect(loaded?.record.revoked_root_pubkeys?.has(deadK1)).toBe(true);
     expect(loaded?.record.highest_revocation_serial).toBe(6);
+  });
+
+  it("MED-1: a persist over an UNREADABLE existing record fails closed (never resets the floor)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record } = buildJoinerRecord();
+    const deadK1 = toBase64url(randomBytes(32));
+    // Seed a valid record: floor 5, {deadK1}.
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadK1],
+      highestRevocationSerial: 5,
+    });
+    // Corrupt the at-rest ciphertext so load() THROWS (not returns null).
+    const raw = await storage.read(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+    );
+    const payload = JSON.parse(bytesToString(raw!)) as { ct: string };
+    const ctChars = payload.ct.split("");
+    ctChars[0] = ctChars[0] === "A" ? "B" : "A";
+    payload.ct = ctChars.join("");
+    const tampered = stringToBytes(JSON.stringify(payload));
+    await storage.write(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+      tampered,
+    );
+    // A rejoin at a LOWER serial must FAIL CLOSED, not overwrite / lower the floor.
+    await expect(
+      persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+        revokedRootPubkeys: [toBase64url(randomBytes(32))],
+        highestRevocationSerial: 2,
+      }),
+    ).rejects.toThrow(/unreadable joiner record|cannot be decoded/i);
+    // The corrupt blob is UNCHANGED (not overwritten with a lower floor).
+    const after = await storage.read(
+      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+      FEDERATION_JOINER_TRUST_ROOT_KEY,
+    );
+    expect(bytesToString(after!)).toBe(bytesToString(tampered));
+  });
+
+  it("MED-2: concurrent persists serialize via the cross-process lock (union + max preserved)", async () => {
+    // The cross-process lock only engages on a filesystem backend (it degrades to
+    // a direct run on the in-memory rig), so this uses a real FilesystemStorage.
+    const dir = await mkdtemp(join(tmpdir(), "joiner-lock-"));
+    try {
+      const storage = new FilesystemStorage(join(dir, "state"));
+      const { masterKey } = await establishMaster({
+        storage,
+        passphrase: `lock-${randomBytes(6).toString("hex")}`,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+      });
+      const { record } = buildJoinerRecord();
+      const deadA = toBase64url(randomBytes(32));
+      const deadB = toBase64url(randomBytes(32));
+      const base = {
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+      };
+      // Two overlapping rejoin persists, each recording a DIFFERENT dead root at
+      // the SAME serial (so neither is legitimately below-floor whichever wins the
+      // lock first). The lock serializes the read-modify-write so the second sees
+      // the first's write and UNIONs; without it, last-writer-wins would drop one
+      // revoked key entirely.
+      await Promise.all([
+        persistFederationJoinerTrustRoot({
+          ...base,
+          revokedRootPubkeys: [deadA],
+          highestRevocationSerial: 5,
+        }),
+        persistFederationJoinerTrustRoot({
+          ...base,
+          revokedRootPubkeys: [deadB],
+          highestRevocationSerial: 5,
+        }),
+      ]);
+      const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+      expect(loaded?.record.revoked_root_pubkeys?.has(deadA)).toBe(true);
+      expect(loaded?.record.revoked_root_pubkeys?.has(deadB)).toBe(true);
+      expect(loaded?.record.highest_revocation_serial).toBe(5);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
