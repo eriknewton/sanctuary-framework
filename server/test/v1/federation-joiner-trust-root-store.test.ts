@@ -1043,6 +1043,103 @@ describe("compromise manual re-join (persist records the dead K1)", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it("chokepoint: a planned adopt PRESERVES the current revoked set + floor (adopt mutation carries none)", async () => {
+    const storage = new MemoryStorage();
+    const masterKey = await testMasterKey(storage);
+    const { record, home } = buildJoinerRecord();
+    const deadForeign = toBase64url(randomBytes(32));
+    // The joiner already recorded a dead root at floor 5 (e.g. from an earlier
+    // compromise re-join of a different lineage). A planned adopt's mutation
+    // carries NO revoked/floor - the chokepoint must merge-preserve these.
+    await persistFederationJoinerTrustRoot({
+      storage,
+      masterKey,
+      pinnedMasterPubkey: record.pinned_master_pubkey,
+      issuingPrincipalCert: record.issuing_principal_cert,
+      localNodeCert: record.local_node_cert,
+      localNodePrivateKey: record.local_node_private_key,
+      revokedRootPubkeys: [deadForeign],
+      highestRevocationSerial: 5,
+    });
+    const rotation = buildPlannedRotation({ current: record, home });
+
+    const adopted = await adoptFederationJoinerPlannedRoot({
+      storage,
+      masterKey,
+      rotationCert: rotation.rotationCert,
+      expectedPinnedMaster: rotation.newPinnedMaster,
+      reissue: rotation.reissue,
+    });
+    expect(adopted.adopted).toBe(true);
+
+    const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+    // Re-pinned to K2, but the anti-rollback state is INTACT (not dropped).
+    expect(loaded?.record.pinned_master_pubkey.public_key).toBe(
+      rotation.newPinnedMaster.public_key,
+    );
+    expect(loaded?.record.revoked_root_pubkeys?.has(deadForeign)).toBe(true);
+    expect(loaded?.record.highest_revocation_serial).toBe(5);
+    expect(loaded?.record.adopted_rotation_serial).toBe(1);
+    rotation.newIssuingPrincipalPrivateKey.fill(0);
+  });
+
+  it("chokepoint: concurrent adopt + rejoin preserves the union revoked set + max floor (FilesystemStorage)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "joiner-chokepoint-"));
+    try {
+      const storage = new FilesystemStorage(join(dir, "state"));
+      const { masterKey } = await establishMaster({
+        storage,
+        passphrase: `cp-${randomBytes(6).toString("hex")}`,
+        firstRun: { installMode: "headless", mintRecoveryKey: false },
+      });
+      const { record, home } = buildJoinerRecord();
+      const k1Pub = record.pinned_master_pubkey.public_key;
+      // Seed the base record (pin=K1, no revoked).
+      await persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: record.pinned_master_pubkey,
+        issuingPrincipalCert: record.issuing_principal_cert,
+        localNodeCert: record.local_node_cert,
+        localNodePrivateKey: record.local_node_private_key,
+      });
+      // Adopt: a genuine K1->K2 planned rotation (via the injected reissue).
+      const rotationAdopt = buildPlannedRotation({ current: record, home });
+      // Rejoin: a fresh K1->K2' re-pin recording K1 revoked at floor 5.
+      const rotationRejoin = buildPlannedRotation({ current: record, home });
+
+      // Fire both concurrently. Depending on lock order, adopt either commits then
+      // is superseded, or is refused under the lock because K1 got revoked - EITHER
+      // WAY the rejoin's anti-rollback update (K1 revoked, floor 5) must survive.
+      const adoptP = adoptFederationJoinerPlannedRoot({
+        storage,
+        masterKey,
+        rotationCert: rotationAdopt.rotationCert,
+        expectedPinnedMaster: rotationAdopt.newPinnedMaster,
+        reissue: rotationAdopt.reissue,
+      });
+      const rejoinP = persistFederationJoinerTrustRoot({
+        storage,
+        masterKey,
+        pinnedMasterPubkey: rotationRejoin.newPinnedMaster,
+        issuingPrincipalCert: rotationRejoin.newIssuingPrincipalCert,
+        localNodeCert: rotationRejoin.reissuedNodeCert,
+        localNodePrivateKey: record.local_node_private_key,
+        revokedRootPubkeys: [k1Pub],
+        highestRevocationSerial: 5,
+      });
+      await Promise.all([adoptP, rejoinP]);
+
+      const loaded = await loadFederationJoinerTrustRoot({ storage, masterKey });
+      expect(loaded?.record.revoked_root_pubkeys?.has(k1Pub)).toBe(true);
+      expect(loaded?.record.highest_revocation_serial).toBe(5);
+      rotationAdopt.newIssuingPrincipalPrivateKey.fill(0);
+      rotationRejoin.newIssuingPrincipalPrivateKey.fill(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════

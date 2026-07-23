@@ -259,6 +259,97 @@ export async function loadFederationJoinerTrustRoot(
 }
 
 /**
+ * The SINGLE locked, grow-only-enforcing write CHOKEPOINT for the joiner trust
+ * root. EVERY writer routes through here (`persistFederationJoinerTrustRoot` for
+ * join/rejoin, and the planned-adopt re-pin), so no unlocked writer can race a
+ * locked one and drop the anti-rollback state. It:
+ *
+ *   1. Acquires the `.joiner-trust-root.lock` cross-process lock in `_federation`.
+ *      SERIALIZATION ACCURACY: the lock is real only on a FilesystemStorage
+ *      backend (`withCrossProcessLock` engages the O_EXCL lockfile). On a
+ *      non-filesystem backend (in-memory / tests) it DEGRADES to a direct,
+ *      NON-serialized run - two overlapping calls there are NOT mutually
+ *      excluded. That is acceptable because the shipped production writer is a
+ *      one-shot CLI process on FilesystemStorage; non-fs rigs are single-caller
+ *      test harnesses. (An in-process async mutex would add defense-in-depth for
+ *      non-fs multi-caller rigs but is not required.)
+ *   2. Loads the CURRENT record under the lock, FAIL-CLOSED on a load error
+ *      (MED-1): `store.load()` returns null ONLY for a genuinely-absent record;
+ *      a decode/transient throw is RE-THROWN (never treated as "absent", which
+ *      would let a lower floor overwrite - AGENTS.md rule 5).
+ *   3. Applies the caller's `mutate(current)` to get the intended next record.
+ *   4. ALWAYS enforces the grow-only anti-rollback invariant against the CURRENT
+ *      on-disk record loaded UNDER THE LOCK (not any earlier stale load): the
+ *      revoked-root set is `current UNION next` and the compromise floor is
+ *      `max(current, next)` - never dropped or lowered; a mutation that tries to
+ *      LOWER the floor is refused loudly. (The planned `adopted_rotation_serial`
+ *      is per-lineage - reset on a fresh join, advanced on a planned adopt - so
+ *      it is the mutator's to set and is NOT merged here.)
+ *   5. Saves the merged record (`store.save` re-runs full validation) and
+ *      releases the lock in `finally`.
+ */
+async function lockedUpdateJoinerTrustRoot(
+  storage: StorageBackend,
+  masterKey: Uint8Array,
+  mutate: (
+    current: FederationJoinerTrustRootRecord | null,
+  ) => FederationJoinerTrustRootRecord,
+): Promise<FederationJoinerTrustRootRecord> {
+  const store = new FederationJoinerTrustRootStore(storage, masterKey);
+  return withCrossProcessLock(
+    storage,
+    FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
+    FEDERATION_JOINER_TRUST_ROOT_LOCK_FILE,
+    async () => {
+      let current: FederationJoinerTrustRootRecord | null;
+      try {
+        current = await store.load();
+      } catch (err) {
+        throw new FederationJoinerTrustRootStoreError(
+          `refusing to update the joiner trust root over an unreadable existing ` +
+            `record (${publicErrorReason(err)}): the grow-only revoked-root set ` +
+            `and anti-rollback floor cannot be safely merged when the existing ` +
+            `record cannot be decoded`,
+        );
+      }
+
+      const next = mutate(current);
+
+      const currentRevoked = normalizeRevokedRootPubkeys(
+        current?.revoked_root_pubkeys,
+      );
+      const currentFloor = normalizeHighestRevocationSerial(
+        current?.highest_revocation_serial,
+      );
+      const nextFloor = normalizeHighestRevocationSerial(
+        next.highest_revocation_serial,
+      );
+      if (nextFloor > 0 && nextFloor < currentFloor) {
+        throw new FederationJoinerTrustRootStoreError(
+          `revocation serial ${nextFloor} is below the recorded anti-rollback ` +
+            `floor ${currentFloor}; refusing to lower the monotonic floor`,
+        );
+      }
+      const mergedRevoked = new Set<string>(currentRevoked);
+      for (const pubkey of normalizeRevokedRootPubkeys(
+        next.revoked_root_pubkeys,
+      )) {
+        mergedRevoked.add(pubkey);
+      }
+      const mergedFloor = Math.max(currentFloor, nextFloor);
+
+      const merged: FederationJoinerTrustRootRecord = {
+        ...next,
+        revoked_root_pubkeys: mergedRevoked.size > 0 ? mergedRevoked : undefined,
+        highest_revocation_serial: mergedFloor > 0 ? mergedFloor : undefined,
+      };
+      await store.save(merged);
+      return merged;
+    },
+  );
+}
+
+/**
  * Persist a joiner record obtained from a real join ceremony.
  *
  * The `pinnedMasterPubkey` is the out-of-band trust anchor: the issued cert
@@ -270,12 +361,12 @@ export async function loadFederationJoinerTrustRoot(
  * The optional `revokedRootPubkeys` / `highestRevocationSerial` let a COMPROMISE
  * manual re-join (`sanctuary federation rejoin`) record the now-dead old root
  * (K1) into the fresh K2 record with an anti-rollback floor, so a later K1 (or
- * K1-signed artifact) is refused locally. They are additive and GROW-ONLY: the
- * supplied roots are UNIONed into any existing record's revoked set (never
- * replace it), the persisted floor is `Math.max(existing, supplied)` (never
- * lowered), a strictly-below-floor serial is REFUSED loudly, the new pinned
- * master must NOT itself be in the merged set (`validateJoinerRecord` fails
- * closed), and a non-empty revoked set REQUIRES a positive serial floor.
+ * K1-signed artifact) is refused locally. This routes through the single
+ * `lockedUpdateJoinerTrustRoot` chokepoint, so the supplied roots are UNIONed
+ * into any existing record's revoked set (never replace it), the floor is
+ * `Math.max(existing, supplied)` (never lowered), a strictly-below-floor serial
+ * is REFUSED loudly, and the new pinned master must NOT itself be in the merged
+ * set (`validateJoinerRecord` fails closed).
  */
 export async function persistFederationJoinerTrustRoot(opts: {
   storage: StorageBackend;
@@ -288,94 +379,36 @@ export async function persistFederationJoinerTrustRoot(opts: {
   highestRevocationSerial?: number;
   audit?: ProvisionOrLoadFederationJoinerTrustRootOptions["audit"];
 }): Promise<ProvisionedFederationJoinerTrustRoot> {
-  const store = new FederationJoinerTrustRootStore(opts.storage, opts.masterKey);
   // The node private key is copied once here so it can be zeroed on ANY failure
   // (lock, load-error, below-floor, or save throw) without touching the caller's.
   const localNodePrivateKey = Uint8Array.from(opts.localNodePrivateKey);
 
   let record: FederationJoinerTrustRootRecord;
   try {
-    // MED-2 (re-gate 2026-07-24): the grow-only merge is a read-modify-write, so
-    // two concurrent rejoin persists could both read the same floor and last-
-    // writer-wins could drop a revoked key or lower the floor. Serialize the WHOLE
-    // RMW across processes with the same O_EXCL lock the sync-state store uses
-    // (`withCrossProcessLock`). On non-filesystem rigs the lock degrades to a
-    // direct run; that is safe here because the ONLY production writer is a
-    // one-shot CLI process (`join --persist` / `rejoin` / `adopt`) that calls this
-    // exactly once and exits, so there is no in-PROCESS concurrency to serialize -
-    // the only real overlap is CROSS-process (two CLI invocations), which the lock
-    // covers on the filesystem backend.
-    record = await withCrossProcessLock(
+    // Route through the single locked chokepoint. The mutation produces a FRESH
+    // record from the join result (a fresh join is a NEW lineage, so the planned
+    // `adopted_rotation_serial` resets to 0); the chokepoint UNIONs any existing
+    // revoked set and MAXes the compromise floor, so this can never drop a
+    // concurrent writer's anti-rollback state, and a strictly-below-floor supplied
+    // serial is refused.
+    record = await lockedUpdateJoinerTrustRoot(
       opts.storage,
-      FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
-      FEDERATION_JOINER_TRUST_ROOT_LOCK_FILE,
-      async () => {
-        // MED-1 (re-gate 2026-07-24): DISTINGUISH a genuinely-absent record from a
-        // load ERROR. `store.load()` returns null for an absent record but THROWS
-        // on an undecryptable / tampered / transient-I/O blob. A throw must FAIL
-        // CLOSED (AGENTS.md rule 5): an anti-rollback floor cannot be reset just
-        // because the existing record could not be decoded. Treating a load error
-        // as "no record" would let a supplied lower serial pass the below-floor
-        // check and OVERWRITE with a lowered floor - a fail-open on monotonic
-        // state. Only a true absence proceeds as a fresh record.
-        let existing: FederationJoinerTrustRootRecord | null;
-        try {
-          existing = await store.load();
-        } catch (err) {
-          throw new FederationJoinerTrustRootStoreError(
-            `refusing to persist over an unreadable joiner record ` +
-              `(${publicErrorReason(err)}): the grow-only revoked-root set and ` +
-              `anti-rollback floor cannot be safely merged when the existing ` +
-              `record cannot be decoded`,
-          );
-        }
-
-        // Grow-only merge: UNION the supplied revoked roots into whatever the
-        // existing record already recorded (never replace) and NEVER lower the
-        // floor. Without this a stale/lower-serial re-join could shrink the set or
-        // roll the floor back, re-enabling replay of revocations between the old
-        // and new floor. Mirrors the issuer-side Math.max merge.
-        const existingRevoked = normalizeRevokedRootPubkeys(
-          existing?.revoked_root_pubkeys,
-        );
-        const existingFloor = normalizeHighestRevocationSerial(
-          existing?.highest_revocation_serial,
-        );
-        const suppliedFloor =
-          opts.highestRevocationSerial !== undefined &&
-          opts.highestRevocationSerial > 0
-            ? opts.highestRevocationSerial
-            : 0;
-        // Reject a strictly-below-floor serial LOUDLY; an equal serial (idempotent
-        // re-run) or a higher one proceeds.
-        if (suppliedFloor > 0 && suppliedFloor < existingFloor) {
-          throw new FederationJoinerTrustRootStoreError(
-            `revocation serial ${suppliedFloor} is below the recorded ` +
-              `anti-rollback floor ${existingFloor}; refusing to lower the ` +
-              `monotonic floor`,
-          );
-        }
-        const mergedRevoked = new Set<string>(existingRevoked);
-        for (const pubkey of opts.revokedRootPubkeys ?? []) {
-          mergedRevoked.add(pubkey);
-        }
-        const mergedFloor = Math.max(existingFloor, suppliedFloor);
-
-        const next: FederationJoinerTrustRootRecord = {
-          fortress_id: opts.pinnedMasterPubkey.fortress_id,
-          node_id: opts.localNodeCert.node_id,
-          pinned_master_pubkey: { ...opts.pinnedMasterPubkey },
-          issuing_principal_cert: clonePrincipalCert(opts.issuingPrincipalCert),
-          local_node_cert: cloneNodeCert(opts.localNodeCert),
-          local_node_private_key: localNodePrivateKey,
-          ...(mergedRevoked.size > 0
-            ? { revoked_root_pubkeys: mergedRevoked }
-            : {}),
-          ...(mergedFloor > 0 ? { highest_revocation_serial: mergedFloor } : {}),
-        };
-        await store.save(next);
-        return next;
-      },
+      opts.masterKey,
+      () => ({
+        fortress_id: opts.pinnedMasterPubkey.fortress_id,
+        node_id: opts.localNodeCert.node_id,
+        pinned_master_pubkey: { ...opts.pinnedMasterPubkey },
+        issuing_principal_cert: clonePrincipalCert(opts.issuingPrincipalCert),
+        local_node_cert: cloneNodeCert(opts.localNodeCert),
+        local_node_private_key: localNodePrivateKey,
+        ...(opts.revokedRootPubkeys && opts.revokedRootPubkeys.length > 0
+          ? { revoked_root_pubkeys: new Set(opts.revokedRootPubkeys) }
+          : {}),
+        ...(opts.highestRevocationSerial !== undefined &&
+        opts.highestRevocationSerial > 0
+          ? { highest_revocation_serial: opts.highestRevocationSerial }
+          : {}),
+      }),
     );
   } catch (err) {
     localNodePrivateKey.fill(0);
@@ -736,28 +769,60 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
     return held("reissued_chain_invalid", currentPinned, rotationSerial);
   }
 
-  const highestRevocationSerial = normalizeHighestRevocationSerial(
-    current.highest_revocation_serial,
-  );
-  const next: FederationJoinerTrustRootRecord = {
-    fortress_id: current.fortress_id,
-    node_id: current.node_id,
-    pinned_master_pubkey: newPinnedMaster,
-    issuing_principal_cert: clonePrincipalCert(reissued.issuingPrincipalCert),
-    local_node_cert: cloneNodeCert(reissued.certificate),
-    local_node_private_key: Uint8Array.from(current.local_node_private_key),
-    // Carry the grow-only revoked-root set + revocation floor forward unchanged.
-    ...(revoked.size > 0 ? { revoked_root_pubkeys: new Set(revoked) } : {}),
-    ...(highestRevocationSerial > 0
-      ? { highest_revocation_serial: highestRevocationSerial }
-      : {}),
-    adopted_rotation_serial: rotationSerial,
-  };
-
+  // Final re-pin: route the SAVE through the single locked chokepoint, expressed
+  // as a mutation over the CURRENT-under-lock record. The network reissue above
+  // is already complete, so the cross-process lock is NEVER held across a network
+  // call. The chokepoint merge-preserves the current revoked set + floor, so a
+  // concurrent rejoin's anti-rollback update can never be clobbered by adopt's
+  // stale earlier load. Under the lock we RE-CHECK the cross-class guard against
+  // the CURRENT-under-lock revoked set: a concurrent compromise re-join may have
+  // revoked K1 (the rotation signer) AFTER our unlocked decision, in which case
+  // re-pinning through that now-dead root is refused (never re-anchor on a
+  // revoked root just because our unlocked snapshot predated the revocation).
+  const repinNodeKey = Uint8Array.from(current.local_node_private_key);
+  let repinned: FederationJoinerTrustRootRecord;
   try {
-    await store.save(next);
+    repinned = await lockedUpdateJoinerTrustRoot(
+      opts.storage,
+      opts.masterKey,
+      (underLock) => {
+        if (underLock === null) {
+          throw new JoinerPlannedAdoptConflictError("joiner_trust_root_missing");
+        }
+        const revokedUnderLock = normalizeRevokedRootPubkeys(
+          underLock.revoked_root_pubkeys,
+        );
+        if (
+          revokedUnderLock.has(opts.rotationCert.old_master_pubkey) ||
+          revokedUnderLock.has(underLock.pinned_master_pubkey.public_key)
+        ) {
+          throw new JoinerPlannedAdoptConflictError("rotation_signer_revoked");
+        }
+        return {
+          fortress_id: underLock.fortress_id,
+          node_id: underLock.node_id,
+          pinned_master_pubkey: newPinnedMaster,
+          issuing_principal_cert: clonePrincipalCert(
+            reissued.issuingPrincipalCert,
+          ),
+          local_node_cert: cloneNodeCert(reissued.certificate),
+          local_node_private_key: repinNodeKey,
+          // Planned floor advances to this cert's serial; the chokepoint keeps
+          // the (compromise) revoked set + floor from the current-under-lock
+          // record, so adopt never drops a concurrent rejoin's revocation.
+          adopted_rotation_serial: rotationSerial,
+        };
+      },
+    );
   } catch (err) {
-    next.local_node_private_key.fill(0);
+    repinNodeKey.fill(0);
+    if (err instanceof JoinerPlannedAdoptConflictError) {
+      await auditPlannedAdoptFailure(opts.audit, err.reason, {
+        fortress_id: current.fortress_id,
+        node_id: current.node_id,
+      });
+      return held(err.reason, currentPinned, rotationSerial);
+    }
     await auditPlannedAdoptFailure(opts.audit, "persist_failed", {
       error_class: errorName(err),
       fortress_id: current.fortress_id,
@@ -770,8 +835,8 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
     operation: "federation_joiner_planned_root_adopt",
     result: "success",
     details: {
-      fortress_id: next.fortress_id,
-      node_id: next.node_id,
+      fortress_id: repinned.fortress_id,
+      node_id: repinned.node_id,
       previous_master_pubkey: currentPinned.public_key,
       new_master_pubkey: newPinnedMaster.public_key,
       rotation_serial: rotationSerial,
@@ -784,9 +849,22 @@ export async function adoptFederationJoinerPlannedRoot(opts: {
     previousPinnedMaster: currentPinned,
     pinnedMaster: { ...newPinnedMaster },
     rotationSerial,
-    record: next,
-    context: joinerContextFromRecord(next),
+    record: repinned,
+    context: joinerContextFromRecord(repinned),
   };
+}
+
+/**
+ * Internal refusal thrown by the planned-adopt mutation to signal an under-lock
+ * conflict (a concurrent write changed the record between adopt's unlocked
+ * decision and its locked save). Carries the held-old-trust reason the caller
+ * surfaces. Never leaves this module.
+ */
+class JoinerPlannedAdoptConflictError extends Error {
+  constructor(readonly reason: FederationJoinerPlannedRootAdoptRejectionReason) {
+    super(reason);
+    this.name = "JoinerPlannedAdoptConflictError";
+  }
 }
 
 function held(
