@@ -16,8 +16,10 @@
  */
 
 import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Writable } from "node:stream";
+import { ed25519 } from "@noble/curves/ed25519";
 import { loadConfig } from "../config.js";
 import { toBase64url, fromBase64url } from "../core/encoding.js";
 import { generateIdentityId } from "../core/identity.js";
@@ -43,15 +45,20 @@ import {
 } from "../mesh/operator-cloud-provision.js";
 import type { BootstrapToken, JoinRequest } from "../mesh/lifecycle/types.js";
 import type {
+  FederationRootRotationCertificate,
   FortressMasterPublicKey,
   NodeIdentityCertificate,
   PrincipalCertificate,
 } from "../mesh/types.js";
 import type { NodeMode } from "../mesh/constants.js";
 import {
+  adoptFederationJoinerPlannedRoot,
   persistFederationJoinerTrustRoot,
   FEDERATION_JOINER_TRUST_ROOT_NAMESPACE,
   FEDERATION_JOINER_TRUST_ROOT_KEY,
+  type FederationJoinerPlannedRootAdoptResult,
+  type FederationJoinerPlannedRootAdoptReissueRequest,
+  type FederationJoinerPlannedRootAdoptReissueResult,
 } from "../mesh/federation-joiner-trust-root-store.js";
 import {
   provisionOrLoadFederationTrustRoot,
@@ -80,7 +87,11 @@ import {
   CustodyUnlockError,
   CustodyRotationInProgressError,
 } from "../core/master-custody.js";
-import { federationEventHash, type FederationEvent } from "../v1/federation.js";
+import {
+  buildFederationReissueNodeCertProofMessage,
+  federationEventHash,
+  type FederationEvent,
+} from "../v1/federation.js";
 import {
   FEDERATION_SYNC_WIRE_VERSION,
   federationOperatorAuthorityOrigin,
@@ -574,6 +585,615 @@ export async function persistJoinerTrustRootFromJoin(opts: {
   } finally {
     signer.masterKey.fill(0);
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// `sanctuary federation adopt --renew` (planned-rotation joiner auto-adopt)
+// ═══════════════════════════════════════════════════════════════════════
+
+const FEDERATION_REISSUE_NODE_CERT_PATH =
+  "/v1/federation/rotate/reissue-node-cert";
+
+interface AdoptFlags {
+  renew: boolean;
+  fortressUrl?: string;
+  rotationCertArg?: string;
+  passphrase?: string;
+  recoveryKey?: string;
+  fortressPath?: string;
+}
+
+function parseAdoptFlags(argv: string[], env: NodeJS.ProcessEnv): AdoptFlags {
+  const flag = (name: string): string | undefined => {
+    const i = argv.indexOf(name);
+    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+  };
+  return {
+    renew: argv.includes("--renew"),
+    fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
+    rotationCertArg: flag("--rotation-cert"),
+    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    recoveryKey: env.SANCTUARY_RECOVERY_KEY,
+    fortressPath: flag("--fortress"),
+  };
+}
+
+/**
+ * `sanctuary federation adopt --renew`. Joiner-side driver for a PLANNED
+ * rotate-root: verify the K1-signed rotation cert under the locally pinned K1,
+ * run the reissue proof-of-possession round against the EXISTING reissue
+ * endpoint (no new route), re-verify the returned chain to the K2 learned from
+ * that cert (never the server response), and atomically re-pin K2. Prints only
+ * PUBLIC material. Catalog exit codes: 0 adopted, 1 usage, 2 fortress
+ * unreachable, 3 refused / held-old-trust.
+ */
+export async function runFederationAdopt(args: {
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  request?: typeof dashboardRequest;
+  /**
+   * Seam: unlock the local fortress + run the planned-adopt core. Defaults to
+   * the real custody-unlocking implementation; tests inject a stub to assert the
+   * verb's flag parsing, exit-code mapping, and printing without a real fortress.
+   */
+  performPlannedAdopt?: typeof performPlannedAdoptFromCli;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const request = args.request ?? dashboardRequest;
+  const perform = args.performPlannedAdopt ?? performPlannedAdoptFromCli;
+  const flags = parseAdoptFlags(args.argv, env);
+
+  if (!flags.renew) {
+    err.write(
+      "sanctuary federation adopt: --renew is required (this verb adopts a " +
+        "PLANNED rotation only; a COMPROMISE rotation is re-joined by hand with " +
+        "'sanctuary federation rejoin')\n",
+    );
+    return 1;
+  }
+  if (!flags.fortressUrl) {
+    err.write(
+      "sanctuary federation adopt: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n",
+    );
+    return 1;
+  }
+  if (!flags.rotationCertArg) {
+    err.write(
+      "sanctuary federation adopt: --rotation-cert <json | @file> is required " +
+        "(the K1-signed rotation certificate, received out of band)\n",
+    );
+    return 1;
+  }
+  const rotationCertJson = await readInlineOrFile(flags.rotationCertArg);
+  if (rotationCertJson === null) {
+    err.write(
+      "sanctuary federation adopt: could not read --rotation-cert (bad @file path?)\n",
+    );
+    return 1;
+  }
+  const rotationCert = parseRotationCert(rotationCertJson);
+  if (rotationCert === null) {
+    err.write(
+      "sanctuary federation adopt: --rotation-cert is not a valid federation " +
+        "root-rotation certificate\n",
+    );
+    return 1;
+  }
+  if (!flags.passphrase && !flags.recoveryKey) {
+    err.write(
+      "sanctuary federation adopt: needs an unlocked operator identity to read " +
+        "and re-pin the local joiner store (SANCTUARY_PASSPHRASE, --passphrase, " +
+        "or SANCTUARY_RECOVERY_KEY)\n",
+    );
+    return 1;
+  }
+
+  let result: FederationJoinerPlannedRootAdoptResult;
+  try {
+    result = await perform({
+      rotationCert,
+      fortressUrl: flags.fortressUrl,
+      request,
+      ...(flags.passphrase !== undefined ? { passphrase: flags.passphrase } : {}),
+      ...(flags.recoveryKey !== undefined ? { recoveryKey: flags.recoveryKey } : {}),
+      ...(flags.fortressPath !== undefined ? { fortressPath: flags.fortressPath } : {}),
+    });
+  } catch (cause) {
+    if (cause instanceof OperatorSigningError) {
+      err.write(`sanctuary federation adopt: ${cause.message}\n`);
+      return 3;
+    }
+    err.write(`sanctuary federation adopt: unexpected error: ${String(cause)}\n`);
+    return 1;
+  }
+
+  if (result.adopted) {
+    out.write(
+      `${JSON.stringify(
+        {
+          adopted: true,
+          // Observation-shaped: assert only what was verified, never
+          // "the fortress is secure now".
+          result:
+            "re-pinned the new federation root; the reissued node cert chains " +
+            "to it under this fortress at the adopted rotation serial",
+          fortress_id: result.record.fortress_id,
+          node_id: result.record.node_id,
+          previous_pinned_master: result.previousPinnedMaster,
+          pinned_master: result.pinnedMaster,
+          rotation_serial: result.rotationSerial,
+          node_cert: result.record.local_node_cert,
+          issuing_principal_cert: result.record.issuing_principal_cert,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    return 0;
+  }
+
+  err.write(
+    `sanctuary federation adopt: held the old trust anchor (nothing adopted): ` +
+      `${plannedAdoptHeldReason(result.reason)}` +
+      `${result.detail ? ` (${result.detail})` : ""}\n`,
+  );
+  return result.reason === "reissue_unreachable" ? 2 : 3;
+}
+
+function plannedAdoptHeldReason(reason: string): string {
+  switch (reason) {
+    case "joiner_trust_root_missing":
+      return "this machine has no persisted joiner trust root to re-pin";
+    case "joiner_trust_root_unavailable":
+      return "the local joiner store could not be opened or decoded";
+    case "hybrid_rotation_unsupported":
+      return "the rotation cert is HYBRID (post-quantum); classical-only adopt " +
+        "refuses it rather than silently drop the post-quantum half";
+    case "rotation_signer_revoked":
+      return "the rotation cert is signed by a root this machine has locally " +
+        "revoked (a compromised old root can never re-anchor trust)";
+    case "rotation_cert_invalid":
+      return "the rotation cert did not verify under the currently pinned root " +
+        "(wrong signer, bad signature, or a stale/replayed serial)";
+    case "reissue_denied":
+      return "the fortress refused to reissue this node's cert (revoked node, " +
+        "revoked old root, or no recorded rotation lineage)";
+    case "reissue_unreachable":
+      return "the fortress was unreachable for the reissue round";
+    case "server_root_mismatch":
+      return "the fortress returned a different root than the rotation cert " +
+        "attests; the server response is never the trust source";
+    case "reissued_identity_mismatch":
+      return "the reissued cert is not for this node's existing key";
+    case "reissued_chain_invalid":
+      return "the reissued cert does not chain to the new root the rotation " +
+        "cert attests";
+    case "persist_failed":
+      return "the re-pin could not be written; the old trust anchor is intact";
+    default:
+      return reason;
+  }
+}
+
+/**
+ * Real planned-adopt driver: open the local fortress headless (keychain-safe,
+ * fails closed in a headless session) and run the pure adopt core, wiring the
+ * reissue proof-of-possession round to the live HTTP endpoint. Zeroes the master
+ * key after use.
+ */
+export async function performPlannedAdoptFromCli(opts: {
+  rotationCert: FederationRootRotationCertificate;
+  fortressUrl: string;
+  request: typeof dashboardRequest;
+  passphrase?: string;
+  recoveryKey?: string;
+  fortressPath?: string;
+}): Promise<FederationJoinerPlannedRootAdoptResult> {
+  const signer = await openOperatorSigner({
+    ...(opts.passphrase !== undefined ? { passphrase: opts.passphrase } : {}),
+    ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
+    ...(opts.fortressPath !== undefined ? { fortressPath: opts.fortressPath } : {}),
+  });
+  try {
+    return await adoptFederationJoinerPlannedRoot({
+      storage: signer.storage,
+      masterKey: signer.masterKey,
+      rotationCert: opts.rotationCert,
+      reissue: (req) =>
+        reissueNodeCertViaHttp(req, opts.fortressUrl, opts.request),
+    });
+  } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
+/**
+ * Drive the reissue proof-of-possession round against the EXISTING reissue
+ * endpoint (challenge -> node-key proof -> complete). The node private key comes
+ * from the loaded joiner record and never leaves this process. A 401/403 denial
+ * is a fail-closed "denied"; any transport failure is "unreachable".
+ */
+async function reissueNodeCertViaHttp(
+  req: FederationJoinerPlannedRootAdoptReissueRequest,
+  fortressUrl: string,
+  request: typeof dashboardRequest,
+): Promise<FederationJoinerPlannedRootAdoptReissueResult> {
+  const ctx: DashboardRequestContext = { dashboardUrl: fortressUrl, authToken: "" };
+  const nodeId = req.current.node_id;
+
+  let challenge: { challenge_id?: unknown; challenge?: unknown };
+  try {
+    challenge = (await request(
+      FEDERATION_REISSUE_NODE_CERT_PATH,
+      { method: "POST", body: JSON.stringify({ action: "challenge", node_id: nodeId }) },
+      ctx,
+    )) as { challenge_id?: unknown; challenge?: unknown };
+  } catch (cause) {
+    return mapReissueTransportError(cause);
+  }
+  if (
+    typeof challenge.challenge_id !== "string" ||
+    typeof challenge.challenge !== "string"
+  ) {
+    return { ok: false, reason: "denied" };
+  }
+
+  const proofMessage = buildFederationReissueNodeCertProofMessage({
+    fortressId: req.current.fortress_id,
+    nodeId,
+    challengeId: challenge.challenge_id,
+    challenge: challenge.challenge,
+    currentNodeCert: req.current.local_node_cert,
+    currentIssuingPrincipalCert: req.current.issuing_principal_cert,
+    rotationCert: req.rotationCert,
+  });
+  const signature = ed25519.sign(proofMessage, req.current.local_node_private_key);
+
+  let completed: {
+    certificate?: unknown;
+    issuing_principal_cert?: unknown;
+    pinned_master?: unknown;
+  };
+  try {
+    completed = (await request(
+      FEDERATION_REISSUE_NODE_CERT_PATH,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          action: "complete",
+          node_id: nodeId,
+          challenge_id: challenge.challenge_id,
+          challenge: challenge.challenge,
+          current_node_cert: req.current.local_node_cert,
+          current_issuing_principal_cert: req.current.issuing_principal_cert,
+          rotation_cert: req.rotationCert,
+          node_signature: toBase64url(signature),
+        }),
+      },
+      ctx,
+    )) as {
+      certificate?: unknown;
+      issuing_principal_cert?: unknown;
+      pinned_master?: unknown;
+    };
+  } catch (cause) {
+    return mapReissueTransportError(cause);
+  } finally {
+    signature.fill(0);
+  }
+
+  if (
+    typeof completed.certificate !== "object" ||
+    completed.certificate === null ||
+    typeof completed.issuing_principal_cert !== "object" ||
+    completed.issuing_principal_cert === null ||
+    typeof completed.pinned_master !== "object" ||
+    completed.pinned_master === null
+  ) {
+    return { ok: false, reason: "denied" };
+  }
+  return {
+    ok: true,
+    certificate: completed.certificate as NodeIdentityCertificate,
+    issuingPrincipalCert: completed.issuing_principal_cert as PrincipalCertificate,
+    serverPinnedMaster: completed.pinned_master as FortressMasterPublicKey,
+  };
+}
+
+function mapReissueTransportError(
+  cause: unknown,
+): FederationJoinerPlannedRootAdoptReissueResult {
+  if (cause instanceof DashboardRequestError) {
+    return { ok: false, reason: cause.kind === "auth" ? "denied" : "unreachable" };
+  }
+  return { ok: false, reason: "unreachable" };
+}
+
+/** Read a `--flag <json | @file>` argument. `@path` reads the file; else inline. */
+async function readInlineOrFile(value: string): Promise<string | null> {
+  if (value.startsWith("@")) {
+    try {
+      return await readFile(value.slice(1), "utf8");
+    } catch {
+      return null;
+    }
+  }
+  return value;
+}
+
+/** Parse + structurally validate a federation root-rotation certificate JSON. */
+function parseRotationCert(
+  json: string,
+): FederationRootRotationCertificate | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const cert = parsed as Record<string, unknown>;
+  if (cert.kind !== "federation-root-rotation") return null;
+  if (
+    typeof cert.fortress_id !== "string" ||
+    cert.fortress_id.length === 0 ||
+    typeof cert.old_master_pubkey !== "string" ||
+    cert.old_master_pubkey.length === 0 ||
+    typeof cert.rotation_serial !== "number" ||
+    typeof cert.rotated_at !== "string" ||
+    typeof cert.old_master_signature !== "string" ||
+    cert.old_master_signature.length === 0 ||
+    typeof cert.new_master !== "object" ||
+    cert.new_master === null
+  ) {
+    return null;
+  }
+  const nm = cert.new_master as Record<string, unknown>;
+  if (
+    typeof nm.public_key !== "string" ||
+    nm.public_key.length === 0 ||
+    typeof nm.fortress_id !== "string" ||
+    typeof nm.created_at !== "string"
+  ) {
+    return null;
+  }
+  // hybrid_rotation (if present) is passed through unchanged so the store's
+  // classical-only guard can refuse it LOUDLY rather than silently downgrade.
+  return parsed as FederationRootRotationCertificate;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// `sanctuary federation rejoin` (compromise-rotation manual re-join wrapper)
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Old-key-signed artifacts a compromise re-join must NEVER accept. */
+const REJOIN_FORBIDDEN_FLAGS: readonly string[] = [
+  "--rotation-cert",
+  "--rotation-certificate",
+  "--adoption-bundle",
+  "--adoption-attestation",
+];
+
+interface RejoinFlags {
+  fortressUrl?: string;
+  bootstrapTokenJson?: string;
+  masterSecretB64?: string;
+  pinnedMasterJson?: string;
+  revokedOldMaster?: string;
+  revocationSerialRaw?: string;
+  passphrase?: string;
+  recoveryKey?: string;
+  fortressPath?: string;
+  forbiddenPresent: string[];
+}
+
+function parseRejoinFlags(argv: string[], env: NodeJS.ProcessEnv): RejoinFlags {
+  const flag = (name: string): string | undefined => {
+    const i = argv.indexOf(name);
+    return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
+  };
+  return {
+    fortressUrl: flag("--fortress-url") ?? env.SANCTUARY_FORTRESS_URL,
+    bootstrapTokenJson: flag("--bootstrap-token"),
+    masterSecretB64: flag("--master-secret") ?? env.SANCTUARY_FORTRESS_MASTER_SECRET,
+    pinnedMasterJson: flag("--pinned-master"),
+    revokedOldMaster: flag("--revoked-old-master"),
+    revocationSerialRaw: flag("--revocation-serial"),
+    passphrase: flag("--passphrase") ?? env.SANCTUARY_PASSPHRASE,
+    recoveryKey: env.SANCTUARY_RECOVERY_KEY,
+    fortressPath: flag("--fortress"),
+    forbiddenPresent: REJOIN_FORBIDDEN_FLAGS.filter((name) => argv.includes(name)),
+  };
+}
+
+/**
+ * `sanctuary federation rejoin`. A GUARDED convenience wrapper over
+ * `federation join --persist` for the COMPROMISE class. It is a fresh join
+ * against the operator-supplied NEW root (K2): it never verifies, adopts, or
+ * even accepts any old-key-signed artifact. It REQUIRES the out-of-band K2
+ * pinned master + a FRESH bootstrap token + the new master secret, and records
+ * the now-dead old root (K1) into the re-joined record with an anti-rollback
+ * serial floor so a later K1 (or K1-signed rotation cert) is refused locally.
+ *
+ * Exit codes are the join catalog: 0 re-joined + persisted, 1 usage, 2 fortress
+ * unreachable, 3 join denied / persist refused.
+ */
+export async function runFederationRejoin(args: {
+  argv: string[];
+  env?: NodeJS.ProcessEnv;
+  out?: Writable;
+  err?: Writable;
+  request?: typeof dashboardRequest;
+  /** Seam: the join ceremony this wraps (defaults to the real one). */
+  join?: typeof runFederationJoin;
+  /** Seam: the revocation-recording persist (defaults to the real one). */
+  persistRejoinedJoinerTrustRoot?: typeof persistRejoinedJoinerTrustRootFromJoin;
+}): Promise<number> {
+  const env = args.env ?? process.env;
+  const out = args.out ?? process.stdout;
+  const err = args.err ?? process.stderr;
+  const runJoin = args.join ?? runFederationJoin;
+  const persistRejoin =
+    args.persistRejoinedJoinerTrustRoot ?? persistRejoinedJoinerTrustRootFromJoin;
+  const flags = parseRejoinFlags(args.argv, env);
+
+  if (flags.forbiddenPresent.length > 0) {
+    err.write(
+      `sanctuary federation rejoin: refuses ${flags.forbiddenPresent.join(", ")} ` +
+        `-- a compromise re-join NEVER accepts an adoption bundle, a rotation ` +
+        `cert, or any old-key-signed artifact; it is a fresh join against the ` +
+        `operator-supplied new root\n`,
+    );
+    return 1;
+  }
+  if (!flags.fortressUrl) {
+    err.write(
+      "sanctuary federation rejoin: --fortress-url (or SANCTUARY_FORTRESS_URL) is required\n",
+    );
+    return 1;
+  }
+  if (!flags.pinnedMasterJson) {
+    err.write(
+      "sanctuary federation rejoin: --pinned-master <K2 json> is required " +
+        "(the OUT-OF-BAND new fortress-master public key; the server response is " +
+        "never the trust source)\n",
+    );
+    return 1;
+  }
+  const pinnedMaster = parsePinnedMaster(flags.pinnedMasterJson);
+  if (pinnedMaster === null) {
+    err.write(
+      "sanctuary federation rejoin: --pinned-master is not a valid " +
+        "FortressMasterPublicKey (needs public_key, fortress_id, created_at)\n",
+    );
+    return 1;
+  }
+  if (!flags.bootstrapTokenJson) {
+    err.write(
+      "sanctuary federation rejoin: a FRESH --bootstrap-token <json> is required " +
+        "(a compromise rotation does not grandfather old authorizations)\n",
+    );
+    return 1;
+  }
+  if (!flags.masterSecretB64) {
+    err.write(
+      "sanctuary federation rejoin: the NEW fortress master secret is required " +
+        "(--master-secret or SANCTUARY_FORTRESS_MASTER_SECRET, base64url)\n",
+    );
+    return 1;
+  }
+  if (!flags.revokedOldMaster) {
+    err.write(
+      "sanctuary federation rejoin: --revoked-old-master <K1 pubkey> is required " +
+        "(recorded into revoked_root_pubkeys so a later K1 is refused locally)\n",
+    );
+    return 1;
+  }
+  const revocationSerial = parsePositiveInt(flags.revocationSerialRaw);
+  if (revocationSerial === null) {
+    err.write(
+      "sanctuary federation rejoin: --revocation-serial <positive integer> is " +
+        "required (the anti-rollback floor for the recorded revocation)\n",
+    );
+    return 1;
+  }
+  if (flags.revokedOldMaster === pinnedMaster.public_key) {
+    err.write(
+      "sanctuary federation rejoin: --revoked-old-master must not equal the new " +
+        "--pinned-master (a fortress cannot re-pin a root it is revoking)\n",
+    );
+    return 1;
+  }
+  if (!flags.passphrase && !flags.recoveryKey) {
+    err.write(
+      "sanctuary federation rejoin: needs an unlocked operator identity to write " +
+        "the re-joined trust root (SANCTUARY_PASSPHRASE, --passphrase, or " +
+        "SANCTUARY_RECOVERY_KEY)\n",
+    );
+    return 1;
+  }
+
+  const revokedOldMaster = flags.revokedOldMaster;
+  const persist: typeof persistJoinerTrustRootFromJoin = (o) =>
+    persistRejoin({
+      ...o,
+      revokedOldMasterPubkey: revokedOldMaster,
+      revocationSerial,
+    });
+
+  const joinArgv: string[] = [
+    "--fortress-url",
+    flags.fortressUrl,
+    "--bootstrap-token",
+    flags.bootstrapTokenJson,
+    "--master-secret",
+    flags.masterSecretB64,
+    "--pinned-master",
+    flags.pinnedMasterJson,
+    "--persist",
+    ...(flags.passphrase !== undefined ? ["--passphrase", flags.passphrase] : []),
+    ...(flags.fortressPath !== undefined ? ["--fortress", flags.fortressPath] : []),
+  ];
+
+  return runJoin({
+    argv: joinArgv,
+    env,
+    out,
+    err,
+    ...(args.request !== undefined ? { request: args.request } : {}),
+    persistJoinerTrustRoot: persist,
+  });
+}
+
+/**
+ * Compromise re-join persist: the same keychain-safe custody-unlocking path the
+ * plain join persist uses, but it ALSO records the now-dead old root (K1) into
+ * `revoked_root_pubkeys` with the revocation serial as the anti-rollback floor.
+ * `persistFederationJoinerTrustRoot` re-runs the full cert-chain verification
+ * against the new K2 pinned master and fails closed if K1 equals the pinned
+ * master (a fortress cannot re-pin a root it is revoking).
+ */
+export async function persistRejoinedJoinerTrustRootFromJoin(opts: {
+  pinnedMaster: FortressMasterPublicKey;
+  issuingPrincipalCert: PrincipalCertificate;
+  localNodeCert: NodeIdentityCertificate;
+  localNodePrivateKey: Uint8Array;
+  passphrase?: string;
+  recoveryKey?: string;
+  fortressPath?: string;
+  revokedOldMasterPubkey: string;
+  revocationSerial: number;
+}): Promise<void> {
+  const signer = await openOperatorSigner({
+    ...(opts.passphrase !== undefined ? { passphrase: opts.passphrase } : {}),
+    ...(opts.recoveryKey !== undefined ? { recoveryKey: opts.recoveryKey } : {}),
+    ...(opts.fortressPath !== undefined ? { fortressPath: opts.fortressPath } : {}),
+  });
+  try {
+    await persistFederationJoinerTrustRoot({
+      storage: signer.storage,
+      masterKey: signer.masterKey,
+      pinnedMasterPubkey: opts.pinnedMaster,
+      issuingPrincipalCert: opts.issuingPrincipalCert,
+      localNodeCert: opts.localNodeCert,
+      localNodePrivateKey: opts.localNodePrivateKey,
+      revokedRootPubkeys: [opts.revokedOldMasterPubkey],
+      highestRevocationSerial: opts.revocationSerial,
+    });
+  } finally {
+    signer.masterKey.fill(0);
+  }
+}
+
+function parsePositiveInt(raw: string | undefined): number | null {
+  if (raw === undefined) return null;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 1) return null;
+  return n;
 }
 
 interface AdminFlags {
@@ -2482,6 +3102,42 @@ Joiner verb -- runs on the joining node:
            a certificate that does not chain to it. It opens the local fortress,
            so an operator credential is required (SANCTUARY_PASSPHRASE /
            --passphrase / SANCTUARY_RECOVERY_KEY).
+
+Recover after a rotate-root -- run on the joining node:
+  Planned rotation (the old root is still honest):
+  sanctuary federation adopt --renew --fortress-url <url> \\
+    --rotation-cert <json | @file> \\
+    [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
+
+  Compromise rotation (the old root is in enemy hands):
+  sanctuary federation rejoin --fortress-url <url> \\
+    --pinned-master <K2 json> --bootstrap-token <fresh json> --master-secret <new b64url> \\
+    --revoked-old-master <K1 pubkey> --revocation-serial <n> \\
+    [--passphrase <s> | SANCTUARY_PASSPHRASE | SANCTUARY_RECOVERY_KEY] [--fortress <path>]
+
+  adopt    PLANNED-rotation auto-adopt. After the operator runs
+           'rotate-root --renew' on the home fortress, a machine that was OFFLINE
+           (or a new machine) moves from pinning the OLD root to the NEW one. It
+           verifies the K1-signed rotation certificate under the root it CURRENTLY
+           pins, runs the node-cert reissue proof-of-possession round against the
+           existing endpoint (no new route), re-verifies the reissued cert chains
+           to the NEW root the rotation cert attests (never the server response),
+           and atomically re-pins it. Fail-closed: any doubt HOLDS the old trust
+           anchor loudly and adopts nothing. Classical-only: a HYBRID rotation
+           cert is refused (no silent post-quantum downgrade). Prints only PUBLIC
+           material. Exit: 0 adopted, 1 usage, 2 fortress unreachable, 3 held.
+
+  rejoin   COMPROMISE-rotation manual re-join. After 'rotate-root --compromised',
+           nothing the OLD root signed can be believed, so there is NO automatic
+           adoption: this is a fresh join against the operator-supplied NEW root.
+           It REQUIRES the OUT-OF-BAND --pinned-master (K2), a FRESH
+           --bootstrap-token, the new --master-secret, and --revoked-old-master +
+           --revocation-serial so the re-joined record records the dead K1 with an
+           anti-rollback floor (a later K1 or K1-signed rotation cert is then
+           refused locally). It NEVER accepts an adoption bundle, a rotation cert,
+           or any old-key-signed artifact. A guarded wrapper over 'join --persist';
+           bare 'join --persist' plus 'revoke' serves the same purpose with more
+           footguns. Exit: 0 re-joined, 1 usage, 2 fortress unreachable, 3 denied.
 `;
 
 export async function runFederationCommand(args: {
@@ -2507,6 +3163,12 @@ export async function runFederationCommand(args: {
   }
   if (sub === "join") {
     return runFederationJoin({ ...args, argv: args.argv.slice(1) });
+  }
+  if (sub === "adopt") {
+    return runFederationAdopt({ ...args, argv: args.argv.slice(1) });
+  }
+  if (sub === "rejoin") {
+    return runFederationRejoin({ ...args, argv: args.argv.slice(1) });
   }
   if (sub === "enable" || sub === "disable") {
     return runFederationEnableDisable({
