@@ -108,18 +108,54 @@ Opt-in because rewrite affects LLM functionality:
 - Operator's address in a "schedule a delivery to <street>" prompt
   may force the LLM to ask for clarification.
 
-**Status: NOT in Rho-1.** Tier B awaits Erik's morning read on:
+**Status: SHIPPED and wired live (Rho-2 primitive + Rho-3 smart mode +
+Rho-2.5 live wiring).** Ratified decisions: default-OFF, opt-in
+per-fortress toggle, consent-gated (the operator must acknowledge the
+trade-off explainer before the toggle can flip on), with a per-query
+override in the config store API.
 
-1. Default-on vs opt-in.
-2. Prompt-engineering surface (how the operator overrides for
-   functionality-critical queries).
-3. Substrate-selector functionality impact (which substrate
-   surfaces accept PII-rewritten prompts cleanly vs. degrade).
+The live path has two legs:
 
-The Rho-1 module structure is forward-compatible with Tier B:
-`stripHeaders` is at the HTTP layer; Tier B would add a parallel
-`rewriteContentPii` at the request-body layer, wired through the
-same selector hook. No Tier B knobs in `principal-policy.yaml` yet.
+1. **Concierge query path** (`chat/operator-chat-service.ts`): when the
+   fortress opted in with recorded consent, the Tier B treatment is
+   applied to BOTH the operator query and the assembled prior-turns
+   context before the substrate-selector summarize call. Secrets,
+   credentials, account numbers, and file paths are scrubbed ahead of
+   the rewrite so they never reach the helper surfaces. Smart mode
+   (`smart_mode_enabled`) runs the intent-aware rewrite with encrypted
+   reverse mappings restored at render time; the basic toggle
+   (`enabled`) runs anonymize-all (regex + LLM-assist on residuals)
+   with no restoration. Both legs emit a
+   `query_anonymity_pii_rewritten` audit event with per-category
+   counts (preserved classes zeroed and listed separately), a `leg`
+   marker, and the consent snapshot.
+
+   Stated precisely, what the regression tests prove: the disabled
+   default is byte-identical to the pre-Tier-B behavior; with Tier B
+   on, the query and context legs are both treated before egress; a
+   config record that cannot be read (storage throw, reason
+   `read_failed`) or cannot be decoded (reason `decode_failed`) FAILS
+   the query with `query_anonymity_pii_config_unreadable`, and only a
+   genuinely absent record evaluates to the default-off posture, so an
+   unknown posture is never a silent un-rewritten send. Two scoped
+   non-claims: smart mode restores
+   intent-preserved classes to originals by ratified design (the
+   always-on concierge Tier 1 filter still re-covers its own classes
+   on the composed text), and regex residuals can still reach the
+   `privacy-filter-tier-2` helper surface via LLM-assist, which
+   matters only if that surface is bound to a remote substrate (open
+   follow-up, escalated).
+2. **Frontier egress redactor**
+   (`intelligence/privacy-tier2-redactor.ts`): every production
+   `SubstrateSelector` installs the consent-gated Tier 2 redactor via
+   the `installConsentGatedRedactor` chokepoint, covering the
+   frontier-with-filter substrate. It reads the live `PiiConfigStore`
+   per call and passes text through unchanged when Tier B is off.
+
+Operator surface: `/api/query-anonymity/pii` (config read/patch with
+the consent gate, trade-off explainer, stateless rewrite preview). The
+route reports `effective_tier_b_enabled` derived from the live config
+plus the redactor-installed signal (never-overclaim rule).
 
 ## Tier 3a: network-path anonymity (two-hop egress proxy), Slice 1
 
