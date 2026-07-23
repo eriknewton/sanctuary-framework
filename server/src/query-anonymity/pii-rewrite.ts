@@ -19,17 +19,24 @@
  *     `{ redacted, placeholders }`. Rho-3 smart mode (iteration-14)
  *     consumes the placeholders for context-aware re-mapping at
  *     concierge render time.
- *   - **Substrate-selector call carries rewritten text only.** Wired
- *     live as of Rho-2.5: the concierge path
- *     (`chat/operator-chat-service.ts`) rewrites the operator query
- *     BEFORE invoking the selector when the fortress opted in with
- *     recorded consent (smart mode via `smartRewrite`, basic mode via
- *     `rewritePiiWithLlm` here), and the consent-gated Tier 2 redactor
+ *   - **Live wiring (Rho-2.5), stated precisely.** When the fortress
+ *     opted in with recorded consent, the concierge path
+ *     (`chat/operator-chat-service.ts`) applies the Tier B treatment
+ *     to BOTH the operator query and the assembled prior-turns context
+ *     before the summarize call (smart mode via `smartRewrite`, basic
+ *     mode via `rewritePiiWithLlm` here; secrets/credentials scrubbed
+ *     ahead of both). What this does NOT mean: (a) smart mode restores
+ *     intent-preserved classes to originals by ratified design, so
+ *     those originals DO egress on the query leg (subject to the
+ *     always-on concierge Tier 1 filter re-covering its own classes);
+ *     (b) regex residuals can still reach the `privacy-filter-tier-2`
+ *     helper surface via LLM-assist, which matters only if that
+ *     surface is bound to a remote substrate (open follow-up); (c) a
+ *     corrupt config record FAILS the query (never a silent
+ *     un-rewritten send). The consent-gated Tier 2 redactor
  *     (`intelligence/privacy-tier2-redactor.ts`, installed on every
- *     production selector by `installConsentGatedRedactor`) covers the
- *     frontier-with-filter egress substrate. The caller replaces the
- *     query field on its request object before calling the selector so
- *     the original text does not cross the outbound boundary.
+ *     production selector by `installConsentGatedRedactor`)
+ *     additionally covers the frontier-with-filter egress substrate.
  *
  * Castle-walking discipline:
  *   - No new outbound surface. LLM-assist re-uses the existing
@@ -113,6 +120,13 @@ export const PII_REWRITE_AUDIT_OPS = {
   PII_REWRITTEN: "query_anonymity_pii_rewritten",
   CONFIG_UPDATED: "query_anonymity_pii_config_updated",
   CONSENT_RECORDED: "query_anonymity_pii_consent_recorded",
+  /**
+   * A Tier B config record EXISTS but could not be decoded (corrupt
+   * payload, wrong-fortress AAD, version mismatch). The live query
+   * path fails the query on this state rather than silently sending
+   * un-rewritten text (hard-constraint 5: never silently degrade).
+   */
+  CONFIG_UNREADABLE: "query_anonymity_pii_config_unreadable",
 } as const;
 
 export type PiiRewriteAuditOp =
@@ -131,10 +145,21 @@ export function emitPiiRewriteAudit(opts: {
   auditLog: AuditLog;
   identityId: string;
   fortressId: string;
+  /**
+   * Per-category counts of redactions that SURVIVED to the outbound
+   * text. Smart mode restores intent-preserved classes before the
+   * substrate call; the emitter must pass counts with those classes
+   * zeroed (plus `preservedClasses`) so the record never claims a
+   * redaction that was restored.
+   */
   redactionCounts: Record<string, number>;
   llmAssistRan: boolean;
   llmResidualCount: number;
   consentedToTradeOff: boolean;
+  /** PII classes intent-preservation restored to originals (smart mode). */
+  preservedClasses?: readonly string[];
+  /** Which outbound text this rewrite covered. Defaults to "query". */
+  leg?: "query" | "prior_context";
 }): void {
   void opts.auditLog.append(
     "l2",
@@ -146,6 +171,8 @@ export function emitPiiRewriteAudit(opts: {
       llm_assist_ran: opts.llmAssistRan,
       llm_residual_count: opts.llmResidualCount,
       consented_to_trade_off: opts.consentedToTradeOff,
+      preserved_classes: [...(opts.preservedClasses ?? [])],
+      leg: opts.leg ?? "query",
     },
   );
 }

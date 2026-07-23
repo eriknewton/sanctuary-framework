@@ -33,7 +33,11 @@ export interface SmartRewriteResult {
    * Stats from the underlying Rho-2 PII pass, carried so the live
    * concierge path (Rho-2.5 wiring) can emit the
    * `query_anonymity_pii_rewritten` audit event without re-running
-   * the rewrite.
+   * the rewrite. `redaction_counts` reflects redactions that SURVIVED
+   * to the outbound query: intent-preserved classes were restored to
+   * originals, so their counts are zeroed here (the audit record must
+   * never claim a redaction that was restored; the preserved classes
+   * are reported separately via `preserved_classes`).
    */
   pii_rewrite: Pick<
     PiiRewriteResult,
@@ -100,7 +104,7 @@ export async function smartRewrite(
     intent,
     anonymized_classes: [...anonymized],
     preserved_classes: [...preserved],
-    pii_rewrite: piiStats(pii),
+    pii_rewrite: piiStats(pii, preserved),
   };
 }
 
@@ -208,9 +212,19 @@ function anonymizeAll(
 
 function piiStats(
   pii: PiiRewriteResult,
+  preserved?: ReadonlySet<PiiClass>,
 ): SmartRewriteResult["pii_rewrite"] {
+  // Zero out classes whose placeholders were restored to originals:
+  // those redactions did NOT survive to the outbound query, and the
+  // audit record must not claim them.
+  const counts = { ...pii.redaction_counts };
+  if (preserved) {
+    for (const cls of preserved) {
+      if (cls in counts) counts[cls] = 0;
+    }
+  }
   return {
-    redaction_counts: pii.redaction_counts,
+    redaction_counts: counts,
     llm_assist_ran: pii.llm_assist_ran,
     llm_residual_count: pii.llm_residual_count,
   };

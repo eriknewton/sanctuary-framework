@@ -8,7 +8,11 @@
 
 import type { SubstrateSelector } from "../intelligence/selector.js";
 import type { Surface } from "../intelligence/types.js";
-import { PII_CATEGORIES, type PiiCategory } from "./pii-rewrite.js";
+import {
+  PII_CATEGORIES,
+  rewritePiiRegexOnly,
+  type PiiCategory,
+} from "./pii-rewrite.js";
 
 export type QueryIntentCategory =
   | "location_grounded"
@@ -49,11 +53,20 @@ export async function classifyQueryIntent(
   query: string,
   selector: QueryIntentSelector,
 ): Promise<QueryIntent> {
+  // The classify surface (`privacy-filter-tier-2`) is operator-bindable
+  // to a remote substrate, so the RAW query must not be embedded in the
+  // prompt. The Rho-2 regex pass placeholds the seven PII categories
+  // first; intent classification keys on query STRUCTURE ("who is
+  // [NAME_0]?", "restaurants near [STREET_ADDRESS_0]"), which the
+  // category-stable placeholders preserve. Residuals the regex misses
+  // are a known exposure on non-local bindings (escalated; see the
+  // Rho-2.5 review follow-ups) and are not widened here.
+  const scrubbedQuery = rewritePiiRegexOnly(query).rewritten;
   const prompt = [
     "Classify the operator query for Rho-3 query anonymity smart mode.",
     `PII classes: ${PII_CATEGORIES.join(", ")}.`,
     "Return the intent category whose original PII is needed for a useful answer.",
-    `Query: ${query}`,
+    `Query: ${scrubbedQuery}`,
   ].join("\n");
   const response = await selector.invokeClassify(QUERY_INTENT_CLASSIFIER_SURFACE, {
     kind: "classify",

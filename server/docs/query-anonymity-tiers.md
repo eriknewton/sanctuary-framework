@@ -117,16 +117,31 @@ override in the config store API.
 The live path has two legs:
 
 1. **Concierge query path** (`chat/operator-chat-service.ts`): when the
-   fortress opted in with recorded consent, the operator query is
-   rewritten BEFORE the substrate-selector call, so the selector only
-   ever carries rewritten text. Smart mode (`smart_mode_enabled`) runs
-   the intent-aware rewrite with encrypted reverse mappings restored at
-   render time; the basic toggle (`enabled`) runs anonymize-all
-   (regex + LLM-assist on residuals) with no restoration. Both legs
-   emit a `query_anonymity_pii_rewritten` audit event per rewrite with
-   per-category counts and the consent snapshot. With the toggle off
-   (the default) the substrate query is byte-identical to the
-   pre-Tier-B behavior.
+   fortress opted in with recorded consent, the Tier B treatment is
+   applied to BOTH the operator query and the assembled prior-turns
+   context before the substrate-selector summarize call. Secrets,
+   credentials, account numbers, and file paths are scrubbed ahead of
+   the rewrite so they never reach the helper surfaces. Smart mode
+   (`smart_mode_enabled`) runs the intent-aware rewrite with encrypted
+   reverse mappings restored at render time; the basic toggle
+   (`enabled`) runs anonymize-all (regex + LLM-assist on residuals)
+   with no restoration. Both legs emit a
+   `query_anonymity_pii_rewritten` audit event with per-category
+   counts (preserved classes zeroed and listed separately), a `leg`
+   marker, and the consent snapshot.
+
+   Stated precisely, what the regression tests prove: the disabled
+   default is byte-identical to the pre-Tier-B behavior; with Tier B
+   on, the query and context legs are both treated before egress; a
+   config record that exists but cannot be decoded FAILS the query
+   (`query_anonymity_pii_config_unreadable`), never a silent
+   un-rewritten send. Two scoped non-claims: smart mode restores
+   intent-preserved classes to originals by ratified design (the
+   always-on concierge Tier 1 filter still re-covers its own classes
+   on the composed text), and regex residuals can still reach the
+   `privacy-filter-tier-2` helper surface via LLM-assist, which
+   matters only if that surface is bound to a remote substrate (open
+   follow-up, escalated).
 2. **Frontier egress redactor**
    (`intelligence/privacy-tier2-redactor.ts`): every production
    `SubstrateSelector` installs the consent-gated Tier 2 redactor via
