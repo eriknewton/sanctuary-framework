@@ -49,7 +49,11 @@ if {![regexp {^[1-9][0-9]*$} $agent_uid]} {
     exit 2
 }
 
-spawn sudo $wrapper arm \
+# `-n`: never prompt for a password. The NOPASSWD grant covers this exact
+# wrapper path, so a prompt here means the grant is missing or does not apply,
+# and an unattended run must FAIL FAST on that rather than sit at a password
+# prompt until the timeout burns the night.
+spawn sudo -n $wrapper arm \
     --storage $storage \
     --operator-account $operator \
     --agent-account $agent_account \

@@ -103,7 +103,7 @@ report() {
 # (`--operator-account root` plus a caller-supplied URL) was a review finding.
 as_account() {
   local acct="$1"; shift
-  sudo -u "$acct" -- "$@"
+  sudo -n -u "$acct" -- "$@"
 }
 
 # curl that reports only a status code, never follows redirects into somewhere
@@ -199,7 +199,7 @@ fi
 rot=1
 rot_fail=0
 while [ "$rot" -le "$REPEATS" ]; do
-  if sudo "$WRAPPER" repair \
+  if sudo -n "$WRAPPER" repair \
       --storage "$STORAGE" --operator-account "$OPERATOR" \
       --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
       >> "$EVIDENCE/f1-rotation.log" 2>&1
@@ -227,7 +227,7 @@ else
   report F1-F2 FAIL "$rot_fail of $REPEATS rotation cycles failed or strangled the agent"
 fi
 
-sudo "$WRAPPER" gate-state \
+sudo -n "$WRAPPER" gate-state \
   --storage "$STORAGE" --operator-account "$OPERATOR" \
   > "$EVIDENCE/gate-state.log" 2>&1 || true
 

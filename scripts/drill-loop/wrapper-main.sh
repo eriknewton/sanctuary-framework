@@ -284,7 +284,10 @@ wrapper_verb_arm() {
   if [ -z "$ARG_AGENT" ] || [ -z "$AGENT_UID" ]; then
     wrapper_die 'arm requires --agent-account and --agent-uid'
   fi
-  wrapper_cli protect --exclusive-egress --agent-account "$ARG_AGENT" --agent-uid "$ARG_AGENT_UID"
+  # Pass the RAIL'S output, not the raw argument. The rail proved the two are
+  # equal, so this is not a behavior change today; it is the habit that stops a
+  # later edit from reintroducing a validated-then-unvalidated split.
+  wrapper_cli protect --exclusive-egress --agent-account "$ARG_AGENT" --agent-uid "$AGENT_UID"
   printf 'WRAPPER=OK verb=arm storage=%s\n' "$STORAGE"
 }
 

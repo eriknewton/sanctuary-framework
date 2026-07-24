@@ -161,6 +161,36 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.sanctuary.drill-loop.
 installed onto the daily driver, and it verifies the installed hash after
 writing.
 
+## Known open items before the first unattended night
+
+Stated here rather than discovered at 3am:
+
+- **The drivers need a second sudo grant, or the as-agent probes will fail.**
+  The NOPASSWD grant covers only `/usr/local/sbin/sanctuary-drill-wrapper`. The
+  probe battery and the teardown check also run `sudo -u <agent> curl` and
+  `sudo -n pfctl -s rules` directly, which that grant does not cover. Every such
+  call uses `sudo -n`, so an unattended run FAILS FAST and says so instead of
+  sitting at a password prompt until the timeout burns the night, but the
+  grant question has to be settled (either widen it deliberately, or route
+  those probes through wrapper verbs) before the loop can produce a green
+  night. Routing them through the wrapper is the better answer; it is not built
+  yet.
+- **None of the drivers has ever run against a live gate.** `run-loop.sh`,
+  `preflight.sh`, `run-probe-battery.sh`, `teardown-verify.sh` and
+  `arm-expect.exp` are written and reviewed but carry zero runtime evidence.
+  The rails are the part that is proven.
+- **Mini2's local short hostname is unconfirmed.** It sits in the allowlist as
+  `mini2`, which is its Tailscale name. If the machine answers to something
+  else, the wrapper refuses there until the list is edited and re-reviewed.
+  Refusing is the correct failure mode.
+- **The path rail is inherently time-of-check-to-time-of-use exposed.** It
+  validates a path and then hands the string to a separate process. Between
+  those two moments the path could in principle be replaced. The exposure is
+  bounded by the fact that the directory is operator-owned and the loop runs as
+  the operator (so it is a self-attack, not a privilege boundary), and closing
+  it properly needs `openat`-style file-descriptor handoff, which bash cannot
+  express. Worth knowing rather than pretending otherwise.
+
 ## Disposable fortresses
 
 The loop mints `~/.sanctuary-loop-<stamp>-<n>` per iteration and tears it down

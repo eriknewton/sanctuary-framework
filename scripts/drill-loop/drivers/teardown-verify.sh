@@ -68,13 +68,13 @@ LOG="$EVIDENCE/teardown.log"
 
 # --- tear down ------------------------------------------------------------
 TEARDOWN_RC=0
-sudo "$WRAPPER" unprotect \
+sudo -n "$WRAPPER" unprotect \
   --storage "$STORAGE" --operator-account "$OPERATOR" \
   --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
   >> "$LOG" 2>&1 || TEARDOWN_RC=$?
 printf 'TEARDOWN rc=%s\n' "$TEARDOWN_RC"
 
-sudo "$WRAPPER" clean-markers \
+sudo -n "$WRAPPER" clean-markers \
   --storage "$STORAGE" --operator-account "$OPERATOR" \
   >> "$LOG" 2>&1 || true
 
@@ -93,7 +93,7 @@ else
   clean_pass registry
 fi
 
-anchor_rules="$(sudo pfctl -a com.sanctuary/egress -s rules 2>/dev/null || printf '')"
+anchor_rules="$(sudo -n pfctl -a com.sanctuary/egress -s rules 2>/dev/null || printf '')"
 printf 'pf anchor rules after teardown:\n%s\n' "$anchor_rules" >> "$LOG"
 if [ -n "$anchor_rules" ]; then
   clean_fail pf-anchor 'pf anchor still carries rules'
@@ -123,7 +123,7 @@ fi
 # The agent uid must be free again. A teardown that leaves the agent confined
 # is exactly as broken as one that leaves the gate armed, it just fails in the
 # direction that looks safe.
-agent_code="$(sudo -u "$AGENT" curl -sS -o /dev/null -w '%{http_code}' \
+agent_code="$(sudo -n -u "$AGENT" curl -sS -o /dev/null -w '%{http_code}' \
   --max-time 15 --connect-timeout 8 https://example.com 2>/dev/null || printf '000')"
 printf 'post-teardown agent status=%s\n' "$agent_code" >> "$LOG"
 case "$agent_code" in
