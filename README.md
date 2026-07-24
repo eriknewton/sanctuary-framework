@@ -4,7 +4,9 @@
 [![npm version](https://img.shields.io/npm/v/@sanctuary-framework/mcp-server.svg)](https://www.npmjs.com/package/@sanctuary-framework/mcp-server)
 [![License](https://img.shields.io/npm/l/@sanctuary-framework/mcp-server.svg)](LICENSE)
 
-**The firewall and control panel for your AI agents.**
+**Your agent will know you better than you know yourself. Make sure that stays between you.**
+
+Sanctuary is the open source standard for secure, private AI: a wall the operating system enforces in both directions, and your data under your own keys, portable anywhere. Any agent, local or cloud, solo or fleet. One command to get started. One dashboard to secure them all.
 
 Sanctuary wraps any AI agent, on your machine or in your cloud, so every action it takes is blocked at the network layer if you did not allow it, signed with keys only you hold, and logged to an audit trail you can actually read. One dashboard manages the security and privacy of every agent you run, whether that is one agent on your laptop or a whole fleet across your machines. Your data, and the reputation your agents build, stay on hardware you control, and you can pick them up and leave whenever you want. No lock-in.
 
@@ -20,7 +22,7 @@ That one command puts the wall, the keys, the audit trail, and the dashboard aro
 
 **The claim underneath everything: custody.** Plenty of tools can sandbox an agent when the agent, or its harness, chooses to run inside one. Sanctuary is built for the harder promise: the wall is imposed by the operator and does not depend on the agent's cooperation, the keys never leave hardware you control, and no vendor, including us, sits in the path or can decrypt your state. Every public capability claim traces to a proven row in the [Assurance Matrix](ASSURANCE_MATRIX.md), with its limits stated on the row.
 
-Why this exists: [What Sovereign Actually Means](https://sanctuaryprotocol.ai/2026/03/30/what-sovereign-actually-means.html).
+Why this exists: [The Base Layer](https://sanctuaryprotocol.ai/2026/07/23/the-base-layer.html).
 
 ---
 
