@@ -22,7 +22,14 @@
 # satisfied by a build that fell through silently.
 #
 # Usage:
-#   probe.sh storage <home> <candidate>
+#   probe.sh storage <anchor> <candidate>
+#   probe.sh run-id <id>
+#   probe.sh derive <base> <operator> <run-id>
+#   probe.sh safe-subpath <root> <relative-path>
+#   probe.sh trusted-chain <label> <path>
+#   probe.sh trusted-component <path> <owner-uid> <mode> <self-uid>
+#   probe.sh caller-binding <self-uid> <sudo-user> <operator>
+#   probe.sh etime <etime-string>
 #   probe.sh host <primary> [alias...]
 #   probe.sh account <label> <account>
 #   probe.sh uid <label> <account> <uid>
@@ -56,6 +63,42 @@ case "$kind" in
     STORAGE="$(rails_assert_disposable_storage "$@")" || die "storage rail rejected: ${2:-<missing>}"
     if [ -z "$STORAGE" ]; then die 'empty storage after rail'; fi
     printf 'PROBE=ACCEPT storage=%s\n' "$STORAGE"
+    ;;
+  run-id)
+    # Arity forwarded verbatim so the rail's own check is what fires.
+    RUN_ID="$(rails_assert_run_id "$@")" || die "run-id rail rejected: ${1:-<missing>}"
+    if [ -z "$RUN_ID" ]; then die 'empty run id after rail'; fi
+    printf 'PROBE=ACCEPT run-id=%s\n' "$RUN_ID"
+    ;;
+  derive)
+    DERIVED="$(rails_derive_disposable_storage "$@")" || die "derive rail rejected"
+    if [ -z "$DERIVED" ]; then die 'empty derived path after rail'; fi
+    printf 'PROBE=ACCEPT derived=%s\n' "$DERIVED"
+    ;;
+  safe-subpath)
+    SAFE="$(rails_assert_safe_subpath "$@")" || die "safe-subpath rail rejected: ${2:-<missing>}"
+    if [ -z "$SAFE" ]; then die 'empty path after the safe-subpath rail'; fi
+    printf 'PROBE=ACCEPT safe-subpath=%s\n' "$SAFE"
+    ;;
+  trusted-chain)
+    CHAIN="$(rails_assert_trusted_dir_chain "$@")" || die "trusted-chain rail rejected: ${2:-<missing>}"
+    if [ -z "$CHAIN" ]; then die 'empty path after the trusted-chain rail'; fi
+    printf 'PROBE=ACCEPT trusted-chain=%s\n' "$CHAIN"
+    ;;
+  trusted-component)
+    # The PURE predicate, driven directly. It prints nothing, so the mandatory
+    # form here is the subshell one the wrapper uses for its non-printing rails.
+    ( rails_assert_trusted_component "$@" ) || die "trusted-component rail rejected: ${1:-<missing>}"
+    printf 'PROBE=ACCEPT trusted-component=%s\n' "${1:-}"
+    ;;
+  caller-binding)
+    ( rails_assert_caller_binding "$@" ) || die "caller-binding rail rejected"
+    printf 'PROBE=ACCEPT caller-binding=%s\n' "${3:-}"
+    ;;
+  etime)
+    SECS="$(rails_etime_to_seconds "$@")" || die "etime rail rejected: ${1:-<missing>}"
+    if [ -z "$SECS" ]; then die 'empty seconds after the etime rail'; fi
+    printf 'PROBE=ACCEPT seconds=%s\n' "$SECS"
     ;;
   host)
     if [ "$#" -lt 1 ]; then die 'host needs at least <primary>'; fi

@@ -28,7 +28,7 @@
 #      command substitution it terminates the subshell with status 20, which
 #      the MANDATORY call-site form turns into a parent abort:
 #
-#          STORAGE="$(rails_assert_disposable_storage "$HOME_DIR" "$IN")" \
+#          STORAGE="$(rails_assert_disposable_storage "$ANCHOR" "$IN")" \
 #            || die "storage rail rejected: $IN"
 #
 #      Both shapes fail closed. What must NEVER happen is a `$(...)` call whose
@@ -67,8 +67,51 @@
 # erroring; unconditional assignment already gives the security property.
 
 # The one directory-name prefix the loop may ever operate on, directly under
-# the operator's home. Declared as a standing disposable row in FORTRESS_KEYS.md.
+# the per-operator directory of RAILS_DISPOSABLE_BASE below. Declared as a
+# standing disposable row in FORTRESS_KEYS.md.
 RAILS_DISPOSABLE_PREFIX='.sanctuary-loop-'
+
+# ###########################################################################
+# THE ROOT-OWNED BASE. This is the one line to change if the location moves,
+# and this comment is the reason it may not move casually.
+#
+# SECURITY PROPERTY: no component of this path may be writable by the operator
+# account. That single property is what turns the path rail from a guess into a
+# decision. An unprivileged caller cannot create, rename, or replace any
+# component of the path the root wrapper walks, so there is no
+# time-of-check-to-time-of-use window to win, and there is no operator-writable
+# intermediate for a symlink to hide in.
+#
+# It exists because the 2026-07-25 re-review round proved BOTH halves of the
+# alternative wrong, by execution, against fake fortresses in a temp home:
+#
+#   * an unchecked INTERMEDIATE component (`state/`, `state/_audit/`) let a
+#     root-run `rm` delete a file inside a real fortress while every rail
+#     passed, and
+#   * the accepted directory could be swapped for a symlink to a real fortress
+#     AFTER validation and BEFORE use, winning the race in 44 attempts.
+#
+# Both were possible only because the disposable fortress lived under the
+# operator's own home, which the operator owns and can therefore rewrite.
+# Moving this constant back under an operator-writable directory reopens both.
+#
+# The drill hosts are Macs, where /private/var is the canonical root-owned
+# location and /var is a symlink to it. The wrapper creates this directory
+# itself, as root, mode 0755, and re-verifies the whole chain before use, so
+# there is no separate install step to forget.
+# ###########################################################################
+RAILS_DISPOSABLE_BASE='/private/var/sanctuary-drill'
+
+# Directories a root-run script may resolve a command name from. Deliberately
+# excludes /usr/local/bin: on a Mac with Homebrew that directory is
+# OPERATOR-WRITABLE, and `#!/usr/bin/env bash` there selects an
+# operator-writable interpreter to run as root. See the assembled header in
+# build-wrapper.sh, which pins PATH to exactly this list.
+RAILS_SYSTEM_BIN_DIRS='/usr/bin /bin /usr/sbin /sbin'
+
+# Longest run identifier the caller may supply. A run id is NOT a path: it
+# cannot contain a slash, and the wrapper composes the path from it.
+RAILS_RUN_ID_MAX=64
 
 # Hosts that may NEVER run the privileged wrapper, checked BEFORE the allowlist
 # and not overridable by any argument. Erik's MacBook Air is his daily driver.
@@ -82,9 +125,9 @@ RAILS_HOST_DENY='eriks-macbook-air eriksmacbookair erik-macbook-air erikmbp'
 RAILS_HOST_ALLOW='agents-mac-mini mini2'
 
 # Fortress paths that are never disposable, checked BEFORE the allowlist so the
-# ordering matches the host rail's proven deny-first shape. The `$HOME`-relative
-# entries are expanded by the caller's home argument; the absolute entries cover
-# the known drill accounts even if the home argument were wrong.
+# ordering matches the host rail's proven deny-first shape. The relative entries
+# are expanded against the caller's ANCHOR argument; the absolute entries cover
+# the known drill accounts even if the anchor argument were wrong.
 RAILS_DENY_RELATIVE='.sanctuary .sanctuary-protect-drill .sanctuary-s5-drill .sanctuary-slicem-drill .sanctuary-b2-drill .sanctuary-a2b2-drill sanctuary-v1.1-test sanctuary-fortress-key-backups'
 RAILS_DENY_ABSOLUTE='/Users/agentmac/.sanctuary /Users/eriknewton/.sanctuary /var/root/.sanctuary /root/.sanctuary'
 
@@ -102,6 +145,51 @@ rails__die() {
   exit "$RAILS_REJECT_STATUS"
 }
 
+# ---------------------------------------------------------------------------
+# ABSOLUTE COMMAND RESOLUTION (BLOCKER 2, 2026-07-25 re-review)
+# ---------------------------------------------------------------------------
+#
+# The re-review planted a `hostname` binary earlier in PATH and made the root
+# artifact print `WRAPPER=ACCEPT` **on the operator's MacBook Air**, the one
+# machine the design says must be structurally unable to run it. The
+# "un-overridable" host denylist was exactly as strong as whatever `hostname`
+# resolved to. A planted `bash` substituted the interpreter outright.
+#
+# So there are now two layers, and both are asserted by a structural test:
+#
+#   1. the assembled artifact pins PATH to RAILS_SYSTEM_BIN_DIRS as its first
+#      executable line, and uses an absolute interpreter in its shebang;
+#   2. every security-relevant command goes through the resolver below, which
+#      only ever looks in root-owned system directories, whatever PATH says.
+#
+# Layer 2 is what makes layer 1 belt-and-suspenders rather than the whole
+# defense, and it holds in the DRIVERS too, which run under the operator's own
+# PATH and get no sudo secure_path.
+
+# Absolute path to a system command, or nonzero if it is not in a root-owned
+# system directory. Never consults PATH.
+rails__abs_cmd() {
+  local name="$1" d
+  for d in $RAILS_SYSTEM_BIN_DIRS; do
+    if [ -x "$d/$name" ]; then printf '%s' "$d/$name"; return 0; fi
+  done
+  return 1
+}
+
+# Run a system command by absolute path. Status 127 if it is not present in a
+# root-owned system directory, which is the same status a missing command gets.
+rails__sys() {
+  local name="$1" abs
+  shift
+  if ! abs="$(rails__abs_cmd "$name")"; then return 127; fi
+  "$abs" "$@"
+}
+
+# Effective uid of THIS process, read through the absolute resolver.
+rails__euid() {
+  rails__sys id -u 2>/dev/null || printf ''
+}
+
 # Physically resolve an existing DIRECTORY. Returns nonzero (does not die) so
 # callers can attach a specific message; every caller must check.
 rails__resolve_dir() {
@@ -110,22 +198,19 @@ rails__resolve_dir() {
 
 # Octal file mode, GNU stat then BSD stat. Returns nonzero if neither works.
 rails__stat_mode() {
-  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || return 1
+  rails__sys stat -c '%a' "$1" 2>/dev/null || rails__sys stat -f '%Lp' "$1" 2>/dev/null || return 1
 }
 
 # Numeric owner uid, GNU stat then BSD stat.
 rails__stat_owner_uid() {
-  stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null || return 1
+  rails__sys stat -c '%u' "$1" 2>/dev/null || rails__sys stat -f '%u' "$1" 2>/dev/null || return 1
 }
 
-# `id -u <account>` via an ABSOLUTE path where one exists. A root-run wrapper
-# that resolved `id` through PATH would let a caller who can influence PATH
-# decide what every account resolves to, which is the whole account rail. sudo's
-# secure_path already narrows this; the absolute path removes the question.
+# `id -u <account>` via an ABSOLUTE path. A root-run wrapper that resolved `id`
+# through PATH would let a caller who can influence PATH decide what every
+# account resolves to, which is the whole account rail.
 rails__id_u() {
-  if [ -x /usr/bin/id ]; then /usr/bin/id -u "$1" 2>/dev/null; return $?; fi
-  if [ -x /bin/id ]; then /bin/id -u "$1" 2>/dev/null; return $?; fi
-  id -u "$1" 2>/dev/null
+  rails__sys id -u "$1" 2>/dev/null
 }
 
 # Collapse runs of `/` and strip trailing `/` from an ABSOLUTE path.
@@ -156,19 +241,39 @@ rails__squeeze_slashes() {
 }
 
 rails__now() {
-  date +%s
+  rails__sys date +%s
 }
 
 rails__sleep_tick() {
-  sleep 0.2 2>/dev/null || sleep 1
+  rails__sys sleep 0.2 2>/dev/null || rails__sys sleep 1
 }
 
 # Lowercase, strip any domain suffix, so `Eriks-MacBook-Air.local`,
-# `ERIKS-MACBOOK-AIR` and `eriks-macbook-air` are all one identity.
+# `ERIKS-MACBOOK-AIR` and `eriks-macbook-air` are all one identity. This is the
+# CONSERVATIVE form, and it is what the ALLOWLIST matches on: it must never
+# make two genuinely different machine names collide.
 rails__normalize_host() {
   local h="$1"
   h="${h%%.*}"
-  printf '%s' "$h" | tr '[:upper:]' '[:lower:]'
+  printf '%s' "$h" | rails__sys tr '[:upper:]' '[:lower:]'
+}
+
+# The AGGRESSIVE form, used only by the DENYLIST. Everything that is not a
+# lowercase letter or a digit is deleted, so all of these are one identity:
+#
+#   Eriks-MacBook-Air        -> eriksmacbookair
+#   Eriks-MacBook-Air.local  -> eriksmacbookair
+#   Erik's MacBook Air       -> eriksmacbookair     (`scutil --get ComputerName`)
+#
+# The asymmetry is deliberate and it only ever runs in the safe direction: a
+# coarser match can produce MORE refusals and never more acceptances. The
+# review found that the ComputerName alias was being passed to the rail and
+# then matching nothing, because a denylist of space-separated words cannot
+# hold `Erik's MacBook Air`. It can hold `eriksmacbookair`.
+rails__normalize_host_strict() {
+  local h="$1"
+  h="${h%%.*}"
+  printf '%s' "$h" | rails__sys tr '[:upper:]' '[:lower:]' | rails__sys tr -cd 'a-z0-9'
 }
 
 # SHA-256 of a file, GNU then BSD tooling, bare hex digest on stdout.
@@ -176,11 +281,11 @@ rails_sha256_file() {
   if [ "$#" -ne 1 ]; then rails__die "rails_sha256_file: expected 1 arg, got $#"; fi
   if [ ! -f "$1" ]; then rails__die "rails_sha256_file: not a regular file: $1"; fi
   local out
-  if out="$(sha256sum "$1" 2>/dev/null)"; then
+  if out="$(rails__sys sha256sum "$1" 2>/dev/null)"; then
     printf '%s\n' "${out%% *}"
     return 0
   fi
-  if out="$(shasum -a 256 "$1" 2>/dev/null)"; then
+  if out="$(rails__sys shasum -a 256 "$1" 2>/dev/null)"; then
     printf '%s\n' "${out%% *}"
     return 0
   fi
@@ -192,9 +297,9 @@ rails_sha256_file() {
 # real fortress" class, and runs BEFORE the allowlist by construction: every
 # caller invokes it first.
 rails__assert_not_denylisted() {
-  local home="$1" p="$2" stage="$3" entry
+  local anchor="$1" p="$2" stage="$3" entry
   for entry in $RAILS_DENY_RELATIVE; do
-    if [ "$p" = "$home/$entry" ]; then
+    if [ "$p" = "$anchor/$entry" ]; then
       rails__die "$stage path is a protected fortress, never disposable: $p"
     fi
   done
@@ -203,8 +308,8 @@ rails__assert_not_denylisted() {
       rails__die "$stage path is a protected fortress, never disposable: $p"
     fi
   done
-  if [ "$p" = "$home" ]; then
-    rails__die "$stage path is the home directory itself: $p"
+  if [ "$p" = "$anchor" ]; then
+    rails__die "$stage path is the anchor directory itself: $p"
   fi
   if [ "$p" = "/" ]; then
     rails__die "$stage path is the filesystem root"
@@ -217,37 +322,353 @@ rails__assert_not_denylisted() {
 }
 
 # ---------------------------------------------------------------------------
+# BLOCKER 1 (2026-07-25 round 2) - eliminate the attacker-supplied path
+# ---------------------------------------------------------------------------
+#
+# Round 1's defect class was "a rail rejection never reached the code that used
+# the value". Round 2's was worse and subtler: "a rail APPROVED a value, and
+# then the code used something else." Three independent lenses found the same
+# verb from three directions, and two of them wrote working exploits.
+#
+# The fix is not another check. Validating a path an attacker supplies is a
+# losing game, so the caller stops supplying one:
+#
+#   rails_assert_run_id             the caller supplies a run IDENTIFIER, which
+#                                   is not a path and cannot contain a slash.
+#   rails_derive_disposable_storage the wrapper COMPOSES the path itself, under
+#                                   a base it compiled in.
+#   rails_assert_trusted_dir_chain  every component of that base is root-owned
+#                                   and not operator-writable, so no component
+#                                   can be created, renamed or replaced by the
+#                                   caller. This is what kills the TOCTOU class
+#                                   rather than narrowing its window.
+#   rails_assert_safe_subpath       the ONE resolution chokepoint every
+#                                   privileged filesystem operation goes
+#                                   through, resolving EVERY component and
+#                                   refusing any symlink anywhere in the chain.
+#
+# All four are needed and they are not redundant: derivation removes the input,
+# the root-owned base removes the race, and the chokepoint removes the
+# unchecked-intermediate walk. `clean-markers`, `preflight.sh` and
+# `teardown-verify.sh` all call the chokepoint; no verb walks a path by hand.
+
+# A RUN IDENTIFIER, not a path. The caller may choose it; it may not contain a
+# slash, a relative component, a control character or anything outside a
+# conservative charset, and it can therefore never name a directory.
+rails_assert_run_id() {
+  if [ "$#" -ne 1 ]; then
+    rails__die "rails_assert_run_id: expected 1 arg (run id), got $#"
+  fi
+  local id="$1"
+  if [ -z "$id" ]; then rails__die "empty run id"; fi
+  if [ "${#id}" -gt "$RAILS_RUN_ID_MAX" ]; then
+    rails__die "run id longer than $RAILS_RUN_ID_MAX characters: $id"
+  fi
+  case "$id" in
+    *[!A-Za-z0-9._-]*) rails__die "run id contains disallowed characters: $id" ;;
+  esac
+  # A leading dot or dash would let a run id read as `.`, `..` or an option.
+  case "$id" in
+    [!A-Za-z0-9]*) rails__die "run id must start with a letter or a digit: $id" ;;
+  esac
+  printf '%s\n' "$id"
+}
+
+# Compose the disposable fortress path. PURE: it validates and prints, it never
+# touches the filesystem, and it is the ONLY place the path is spelled out.
+#
+#   <base>/<operator-account>/.sanctuary-loop-<run-id>
+#
+# The per-operator directory exists so two drill accounts on one host cannot
+# collide, and so the leaf's parent is a directory the wrapper created rather
+# than one the caller named.
+rails_derive_disposable_storage() {
+  if [ "$#" -ne 3 ]; then
+    rails__die "rails_derive_disposable_storage: expected 3 args (base, operator, run_id), got $#"
+  fi
+  local base="$1" operator="$2" run_id="$3" id
+  if [ -z "$base" ]; then rails__die "empty disposable base"; fi
+  case "$base" in /*) ;; *) rails__die "disposable base is not an absolute path: $base" ;; esac
+  case "$base/" in
+    */../*|*/./*) rails__die "disposable base contains a relative component: $base" ;;
+  esac
+  # The operator name has already passed the account rail at every production
+  # call site; re-screening it here means this function is safe on its own.
+  case "$operator" in
+    [a-z_]*) ;;
+    *) rails__die "operator account must start with a lowercase letter or underscore: $operator" ;;
+  esac
+  case "$operator" in
+    *[!a-z0-9_-]*) rails__die "operator account contains disallowed characters: $operator" ;;
+  esac
+  id="$(rails_assert_run_id "$run_id")" || rails__die "run id rejected: $run_id"
+  if [ -z "$id" ]; then rails__die "empty run id after rail"; fi
+  printf '%s\n' "$(rails__squeeze_slashes "$base")/$operator/$RAILS_DISPOSABLE_PREFIX$id"
+}
+
+# The PURE half of the trusted-chain rail, split out so the security logic is
+# testable exhaustively without root and without a fixture filesystem, exactly
+# the way `rails_assert_nonroot_uid` is. Production and the tests run THIS
+# function; only the source of the three facts differs.
+#
+# A component is trusted when:
+#   * it is owned by root, or by the very process doing the walking (so an
+#     unprivileged driver can validate its own sandbox, while the root wrapper
+#     accepts nothing but root); AND
+#   * it is not group- or other-writable, UNLESS it carries the sticky bit, in
+#     which case only the entry's own owner may rename or remove entries in it
+#     and replacement is still impossible (this is what makes /tmp safe as a
+#     path component and what lets the batteries run in a temp directory).
+rails_assert_trusted_component() {
+  if [ "$#" -ne 4 ]; then
+    rails__die "rails_assert_trusted_component: expected 4 args (path, owner_uid, mode, self_uid), got $#"
+  fi
+  local p="$1" owner="$2" mode="$3" self="$4"
+  case "$owner" in
+    ''|*[!0-9]*) rails__die "unparseable owner uid for $p: '$owner'" ;;
+  esac
+  case "$self" in
+    ''|*[!0-9]*) rails__die "unparseable self uid while walking $p: '$self'" ;;
+  esac
+  case "$mode" in
+    ''|*[!0-7]*) rails__die "unparseable octal mode for $p: '$mode'" ;;
+  esac
+  if [ "$owner" -ne 0 ] && [ "$owner" != "$self" ]; then
+    rails__die "path component $p is owned by uid $owner, which is neither root nor this process (uid $self); it could be replaced under us"
+  fi
+  if [ $(( 8#$mode & 8#22 )) -ne 0 ] && [ $(( 8#$mode & 8#1000 )) -eq 0 ]; then
+    rails__die "path component $p is group- or world-writable without the sticky bit (mode $mode); its entries could be replaced under us"
+  fi
+}
+
+# Walk EVERY component of an absolute directory path and require each one to be
+# a real, non-symlink, trusted directory. Prints the resolved path.
+#
+# The base is a COMPILED-IN CONSTANT, never caller input, so resolving it once
+# with `cd -P` first is safe and is what makes this work on a Mac, where /var
+# and /tmp are themselves symlinks into /private. Every component of the
+# RESOLVED path is then required to be a real directory.
+rails_assert_trusted_dir_chain() {
+  if [ "$#" -ne 2 ]; then
+    rails__die "rails_assert_trusted_dir_chain: expected 2 args (label, path), got $#"
+  fi
+  local label="$1" p="$2" self resolved acc='' seg mode owner
+  if [ -z "$p" ]; then rails__die "$label: empty path"; fi
+  case "$p" in /*) ;; *) rails__die "$label: not an absolute path: $p" ;; esac
+  p="$(rails__squeeze_slashes "$p")"
+  self="$(rails__euid)"
+  if [ -z "$self" ]; then rails__die "$label: cannot determine this process's uid"; fi
+  # The FINAL component of the given path is lstat'd before anything is
+  # resolved. Intermediates are allowed to be symlinks because the base is a
+  # compiled-in constant and /var is a symlink into /private on every Mac; the
+  # LEAF is the component an attacker would swap, and the walk below then
+  # re-proves that every component of the resolved chain is a real, trusted
+  # directory.
+  if [ -L "$p" ]; then
+    rails__die "$label: $p is a symlink; refusing to treat it as a trusted directory"
+  fi
+  if ! resolved="$(rails__resolve_dir "$p")"; then
+    rails__die "$label: does not resolve to an existing directory: $p"
+  fi
+  if [ "$resolved" = '/' ]; then rails__die "$label: resolves to the filesystem root: $p"; fi
+
+  local oldifs="$IFS" noglob_was_set=''
+  case "$-" in *f*) noglob_was_set='yes' ;; esac
+  set -f
+  IFS='/'
+  # shellcheck disable=SC2086
+  set -- $resolved
+  IFS="$oldifs"
+  if [ -z "$noglob_was_set" ]; then set +f; fi
+
+  for seg in "$@"; do
+    if [ -z "$seg" ]; then continue; fi
+    acc="$acc/$seg"
+    if [ -L "$acc" ]; then
+      rails__die "$label: path component $acc is a symlink; refusing to walk it"
+    fi
+    if [ ! -d "$acc" ]; then
+      rails__die "$label: path component $acc is not a directory"
+    fi
+    if ! mode="$(rails__stat_mode "$acc")"; then rails__die "$label: cannot stat $acc"; fi
+    if ! owner="$(rails__stat_owner_uid "$acc")"; then rails__die "$label: cannot read owner of $acc"; fi
+    rails_assert_trusted_component "$acc" "$owner" "$mode" "$self" \
+      || rails__die "$label: untrusted path component $acc"
+  done
+  printf '%s\n' "$resolved"
+}
+
+# THE resolution chokepoint. Every privileged filesystem operation that reaches
+# INSIDE an already-approved root goes through this and nothing else.
+#
+#   TARGET="$(rails_assert_safe_subpath "$STORAGE" 'state/_audit/.audit-write.lock')" || die
+#
+# It resolves the chain component by component and refuses if ANY component,
+# intermediate or final, is a symlink. The executed exploit deleted a real
+# fortress's audit lock as root because `[ -L "$target" ]` lstats only the
+# FINAL component while `state/` and `state/_audit/` were followed by the
+# kernel without ever being looked at.
+#
+# A component that does not exist is not an error: the whole point is that the
+# caller may then safely conclude the target is absent. What is refused is
+# TRAVERSING something that is not what it appears to be.
+rails_assert_safe_subpath() {
+  if [ "$#" -ne 2 ]; then
+    rails__die "rails_assert_safe_subpath: expected 2 args (root, relative path), got $#"
+  fi
+  local root="$1" rel="$2" acc seg rroot
+  if [ -z "$root" ]; then rails__die "safe-subpath: empty root"; fi
+  case "$root" in /*) ;; *) rails__die "safe-subpath: root is not an absolute path: $root" ;; esac
+  if [ -z "$rel" ]; then rails__die "safe-subpath: empty relative path under $root"; fi
+  case "$rel" in
+    /*) rails__die "safe-subpath: relative path must not be absolute: $rel" ;;
+  esac
+  case "$rel" in
+    *$'\n'*|*$'\t'*|*$'\r'*) rails__die "safe-subpath: relative path contains a control character" ;;
+  esac
+  case "$rel" in
+    *[!A-Za-z0-9._/-]*) rails__die "safe-subpath: relative path contains disallowed characters: $rel" ;;
+  esac
+  case "/$rel/" in
+    */../*|*/./*|*//*) rails__die "safe-subpath: relative path contains a relative or empty component: $rel" ;;
+  esac
+
+  # The root must itself still be a real, self-resolving directory at this
+  # moment. Under the root-owned base nothing can have changed it, and asserting
+  # it anyway is what keeps this function correct if the base ever moves.
+  if [ -L "$root" ]; then rails__die "safe-subpath: root $root is a symlink"; fi
+  if ! rroot="$(rails__resolve_dir "$root")"; then
+    rails__die "safe-subpath: root does not resolve to an existing directory: $root"
+  fi
+  if [ "$rroot" != "$(rails__squeeze_slashes "$root")" ]; then
+    rails__die "safe-subpath: root must be given in canonical resolved form; $root resolves to $rroot"
+  fi
+
+  acc="$rroot"
+  local oldifs="$IFS" noglob_was_set=''
+  case "$-" in *f*) noglob_was_set='yes' ;; esac
+  set -f
+  IFS='/'
+  # shellcheck disable=SC2086
+  set -- $rel
+  IFS="$oldifs"
+  if [ -z "$noglob_was_set" ]; then set +f; fi
+
+  for seg in "$@"; do
+    if [ -z "$seg" ]; then continue; fi
+    acc="$acc/$seg"
+    if [ -L "$acc" ]; then
+      rails__die "safe-subpath: component $acc is a symlink; refusing to follow it"
+    fi
+    if [ -d "$acc" ]; then
+      # An existing intermediate directory must resolve to itself. Redundant
+      # with the lstat above by design: two independent ways to notice.
+      local racc
+      if ! racc="$(rails__resolve_dir "$acc")"; then
+        rails__die "safe-subpath: component $acc does not resolve"
+      fi
+      if [ "$racc" != "$acc" ]; then
+        rails__die "safe-subpath: component $acc resolves elsewhere ($racc); refusing"
+      fi
+    fi
+  done
+  printf '%s\n' "$acc"
+}
+
+# M1 - bind the privileged caller to the account it claims to be acting for.
+#
+# PURE predicate so the uid-0 branch is testable without root. `SUDO_USER`
+# appeared nowhere in the reviewed artifact, so the grant holder could point the
+# wrapper at any other account's directory. Failing when SUDO_USER is EMPTY and
+# the process is root is deliberate: this wrapper is only ever reached through
+# sudo, and "root with no caller identity" is a state it should refuse rather
+# than guess about.
+rails_assert_caller_binding() {
+  if [ "$#" -ne 3 ]; then
+    rails__die "rails_assert_caller_binding: expected 3 args (self_uid, sudo_user, operator), got $#"
+  fi
+  local self="$1" sudo_user="$2" operator="$3"
+  case "$self" in
+    ''|*[!0-9]*) rails__die "caller binding: self uid is not numeric: '$self'" ;;
+  esac
+  if [ "$self" -ne 0 ]; then return 0; fi
+  if [ -z "$sudo_user" ]; then
+    rails__die "caller binding: running as root with no SUDO_USER; this wrapper is only ever reached through sudo"
+  fi
+  if [ "$sudo_user" != "$operator" ]; then
+    rails__die "caller binding: sudo caller is '$sudo_user' but --operator-account says '$operator'; refusing to act for another account"
+  fi
+}
+
+# Convert a `ps -o etime=` value to seconds. Pure, so preflight's daemon
+# freshness check has a testable core. Accepts [[DD-]HH:]MM:SS.
+rails_etime_to_seconds() {
+  if [ "$#" -ne 1 ]; then
+    rails__die "rails_etime_to_seconds: expected 1 arg (etime), got $#"
+  fi
+  local e="$1" days=0 rest hh=0 mm ss
+  # Strip the surrounding whitespace ps pads with.
+  e="${e#"${e%%[![:space:]]*}"}"
+  e="${e%"${e##*[![:space:]]}"}"
+  if [ -z "$e" ]; then rails__die "empty etime"; fi
+  case "$e" in
+    *-*) days="${e%%-*}"; rest="${e#*-}" ;;
+    *)   rest="$e" ;;
+  esac
+  case "$days" in
+    ''|*[!0-9]*) rails__die "unparseable etime day field: $e" ;;
+  esac
+  case "$rest" in
+    *:*:*) hh="${rest%%:*}"; rest="${rest#*:}"; mm="${rest%%:*}"; ss="${rest#*:}" ;;
+    *:*)   mm="${rest%%:*}"; ss="${rest#*:}" ;;
+    *)     rails__die "unparseable etime: $e" ;;
+  esac
+  case "$hh$mm$ss" in
+    ''|*[!0-9]*) rails__die "unparseable etime field: $e" ;;
+  esac
+  printf '%s\n' "$(( (10#$days * 86400) + (10#$hh * 3600) + (10#$mm * 60) + 10#$ss ))"
+}
+
+# ---------------------------------------------------------------------------
 # R2 / BLOCKER - the disposable-storage rail
 # ---------------------------------------------------------------------------
 #
 # Prints the CANONICAL RESOLVED path on stdout and nothing else, so the
 # mandatory call-site form captures a value it can trust:
 #
-#   STORAGE="$(rails_assert_disposable_storage "$HOME_DIR" "$IN")" || die "..."
+#   STORAGE="$(rails_assert_disposable_storage "$ANCHOR" "$IN")" || die "..."
 #   [ -n "$STORAGE" ] || die "empty storage after rail"
 #
 # Rejects, in order: bad arity, empty/relative/control-character input, `.` and
 # `..` components, DENYLIST (lexical), then the allowlist (basename prefix and
 # charset), then a symlinked final component, then resolution of the parent
-# chain with a re-assertion of both dirname==home and the basename prefix on
+# chain with a re-assertion of both dirname==ANCHOR and the basename prefix on
 # the RESOLVED path, then the DENYLIST again on the resolved path, then a
 # post-condition that an existing target resolves to itself.
 #
-# The symlink case is the specific R2 fail-open: `~/.sanctuary-loop-evil` as a
-# symlink to `~/.sanctuary` passes every lexical check and the CLI follows it.
+# The symlink case is the specific R2 fail-open: a `.sanctuary-loop-evil`
+# symlink to a real fortress passes every lexical check and the CLI follows it.
+#
+# ANCHOR, NOT HOME. The anchor is `<RAILS_DISPOSABLE_BASE>/<operator>`, a
+# ROOT-OWNED directory the wrapper created, not the operator's home. This rail
+# is check-then-use by construction, and the ONLY thing that makes
+# check-then-use sound is that no unprivileged caller can change any component
+# of the path between the two moments. Point it back at an operator-writable
+# directory and the 2026-07-25 race (won in 44 attempts, against the real
+# artifact) comes back with it.
 rails_assert_disposable_storage() {
   if [ "$#" -ne 2 ]; then
-    rails__die "rails_assert_disposable_storage: expected 2 args (home, candidate), got $#"
+    rails__die "rails_assert_disposable_storage: expected 2 args (anchor, candidate), got $#"
   fi
-  local home_in="$1" cand="$2"
+  local anchor_in="$1" cand="$2"
 
-  if [ -z "$home_in" ]; then rails__die "empty home argument"; fi
+  if [ -z "$anchor_in" ]; then rails__die "empty anchor argument"; fi
   if [ -z "$cand" ]; then
     rails__die "empty storage path: empty resolves to the REAL default fortress, never treat it as unset"
   fi
 
-  case "$home_in" in /*) ;; *) rails__die "home is not an absolute path: $home_in" ;; esac
-  home_in="$(rails__squeeze_slashes "$home_in")"
+  case "$anchor_in" in /*) ;; *) rails__die "anchor is not an absolute path: $anchor_in" ;; esac
+  anchor_in="$(rails__squeeze_slashes "$anchor_in")"
   case "$cand" in /*) ;; *) rails__die "storage path is not an absolute path: $cand" ;; esac
   # ANSI-C quoting, NOT command substitution: `$(printf '\n')` strips the
   # trailing newline and yields the EMPTY string, which turns the pattern into
@@ -271,7 +692,7 @@ rails_assert_disposable_storage() {
   esac
 
   # DENYLIST FIRST (mirrors the host rail's proven ordering).
-  rails__assert_not_denylisted "$home_in" "$norm" 'lexical'
+  rails__assert_not_denylisted "$anchor_in" "$norm" 'lexical'
 
   local base="${norm##*/}"
   local dir="${norm%/*}"
@@ -293,16 +714,16 @@ rails_assert_disposable_storage() {
   fi
 
   # R2: resolve, then RE-ASSERT the lexical properties on the resolved form.
-  local rhome rdir
-  if ! rhome="$(rails__resolve_dir "$home_in")"; then
-    rails__die "home does not resolve to an existing directory: $home_in"
+  local ranchor rdir
+  if ! ranchor="$(rails__resolve_dir "$anchor_in")"; then
+    rails__die "anchor does not resolve to an existing directory: $anchor_in"
   fi
-  if [ "$rhome" = "/" ]; then rails__die "home resolves to the filesystem root; refusing"; fi
+  if [ "$ranchor" = "/" ]; then rails__die "anchor resolves to the filesystem root; refusing"; fi
   if ! rdir="$(rails__resolve_dir "$dir")"; then
     rails__die "parent directory does not resolve to an existing directory: $dir"
   fi
-  if [ "$rdir" != "$rhome" ]; then
-    rails__die "resolved parent ($rdir) is not the resolved home ($rhome)"
+  if [ "$rdir" != "$ranchor" ]; then
+    rails__die "resolved parent ($rdir) is not the approved anchor ($ranchor)"
   fi
 
   local resolved="$rdir/$base"
@@ -310,7 +731,7 @@ rails_assert_disposable_storage() {
     "$RAILS_DISPOSABLE_PREFIX"?*) ;;
     *) rails__die "resolved basename lost the disposable prefix: $resolved" ;;
   esac
-  rails__assert_not_denylisted "$rhome" "$resolved" 'resolved'
+  rails__assert_not_denylisted "$ranchor" "$resolved" 'resolved'
 
   # Post-condition: if the target already exists it must be a plain directory
   # that resolves to itself. Redundant with the `-L` check by design.
@@ -349,16 +770,20 @@ rails_assert_disposable_storage() {
 # path always uses these compiled-in lists.
 rails_assert_host_allowed() {
   if [ "$#" -lt 1 ]; then rails__die "rails_assert_host_allowed: expected at least 1 arg"; fi
-  local n e norm
+  local n e norm strict
   for n in "$@"; do
     if [ -z "$n" ]; then rails__die "empty host identity supplied"; fi
     norm="$(rails__normalize_host "$n")"
     if [ -z "$norm" ]; then rails__die "host identity normalizes to empty: $n"; fi
+    strict="$(rails__normalize_host_strict "$n")"
+    if [ -z "$strict" ]; then rails__die "host identity normalizes to empty: $n"; fi
     for e in $RAILS_HOST_DENY; do
-      # Both sides are normalized, so a list entry that someone later types
-      # with capitals still matches. A denylist that silently stops matching
-      # because of a capital letter is the worst possible bug in this file.
-      if [ "$norm" = "$(rails__normalize_host "$e")" ]; then
+      # BOTH sides go through the aggressive form, so a list entry that someone
+      # later types with capitals, hyphens, spaces or an apostrophe still
+      # matches. A denylist that silently stops matching because of punctuation
+      # is the worst possible bug in this file, and the review found exactly
+      # that for `scutil --get ComputerName`.
+      if [ "$strict" = "$(rails__normalize_host_strict "$e")" ]; then
         rails__die "host '$norm' is on the un-overridable denylist (daily driver); refusing"
       fi
     done
@@ -540,12 +965,12 @@ rails_lock_acquire() {
   local holder readback stale
 
   while :; do
-    if mkdir "$lock" 2>/dev/null; then
+    if rails__sys mkdir "$lock" 2>/dev/null; then
       printf '%s\n' "$$" > "$lock/pid"
       # Compare-after-write: only the mkdir winner can have created this
       # directory, so reading back anything else means the world is not what we
       # think it is. Stop rather than proceed.
-      readback="$(cat "$lock/pid" 2>/dev/null || printf '')"
+      readback="$(rails__sys cat "$lock/pid" 2>/dev/null || printf '')"
       if [ "$readback" != "$$" ]; then
         rails__die "lock pid readback mismatch (wrote $$, read '$readback'); refusing"
       fi
@@ -558,7 +983,7 @@ rails_lock_acquire() {
       continue
     fi
 
-    holder="$(cat "$lock/pid" 2>/dev/null || printf '')"
+    holder="$(rails__sys cat "$lock/pid" 2>/dev/null || printf '')"
 
     if [ -n "$holder" ]; then
       case "$holder" in
@@ -569,18 +994,18 @@ rails_lock_acquire() {
         rails__die "drill lock $lock is held by live pid $holder; refusing to interleave"
       fi
       # Dead holder: try to become the single reclaimer.
-      if mkdir "$reclaim" 2>/dev/null; then
+      if rails__sys mkdir "$reclaim" 2>/dev/null; then
         # Re-read the facts while holding the reclaim right.
         if [ -d "$lock" ]; then
-          holder="$(cat "$lock/pid" 2>/dev/null || printf '')"
+          holder="$(rails__sys cat "$lock/pid" 2>/dev/null || printf '')"
           if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             stale="$lock.stale.$$"
-            if mv "$lock" "$stale" 2>/dev/null; then
-              rm -rf "$stale"
+            if rails__sys mv "$lock" "$stale" 2>/dev/null; then
+              rails__sys rm -rf "$stale"
             fi
           fi
         fi
-        rmdir "$reclaim" 2>/dev/null || true
+        rails__sys rmdir "$reclaim" 2>/dev/null || true
       fi
       rails__sleep_tick
     else
@@ -590,14 +1015,14 @@ rails_lock_acquire() {
       if [ "$empty_since" -eq 0 ]; then
         empty_since="$(rails__now)"
       elif [ $(( $(rails__now) - empty_since )) -ge 5 ]; then
-        if mkdir "$reclaim" 2>/dev/null; then
+        if rails__sys mkdir "$reclaim" 2>/dev/null; then
           if [ -d "$lock" ] && [ ! -s "$lock/pid" ]; then
             stale="$lock.stale.$$"
-            if mv "$lock" "$stale" 2>/dev/null; then
-              rm -rf "$stale"
+            if rails__sys mv "$lock" "$stale" 2>/dev/null; then
+              rails__sys rm -rf "$stale"
             fi
           fi
-          rmdir "$reclaim" 2>/dev/null || true
+          rails__sys rmdir "$reclaim" 2>/dev/null || true
         fi
         empty_since=0
       fi
@@ -619,11 +1044,11 @@ rails_lock_release() {
   if [ "$#" -ne 1 ]; then rails__die "rails_lock_release: expected 1 arg (lockdir), got $#"; fi
   local lock="$1" holder
   if [ ! -d "$lock" ]; then return 0; fi
-  holder="$(cat "$lock/pid" 2>/dev/null || printf '')"
+  holder="$(rails__sys cat "$lock/pid" 2>/dev/null || printf '')"
   if [ "$holder" != "$$" ]; then
     rails__die "refusing to release lock $lock held by pid '$holder' (this process is $$)"
   fi
-  rm -rf "$lock"
+  rails__sys rm -rf "$lock"
 }
 
 # ---------------------------------------------------------------------------

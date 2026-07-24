@@ -10,50 +10,58 @@ import { execFileSync, spawnSync } from "node:child_process";
  *
  * WHY THIS FILE EXISTS AND WHAT SHAPE IT HAS
  *
- * The first version of that harness shipped CI-green and was then reviewed
- * UNSOUND: a REJECTED `--storage` path armed the operator's real `~/.sanctuary`
- * fortress as root. CI missed it for a structural reason worth stating plainly,
- * because it is the reason this file is shaped the way it is.
+ * The first version of that harness shipped CI-green and was reviewed UNSOUND:
+ * a REJECTED `--storage` path armed the operator's real `~/.sanctuary` fortress
+ * as root. The old tests only ever exercised HOST-REJECT-FIRST, so every case
+ * died at the first rail and NO case ever reached the path rail. Coverage of
+ * the happy prefix of a gauntlet tells you nothing about the rest of it.
  *
- * The old tests only ever exercised HOST-REJECT-FIRST. Every case ran on a
- * machine the host rail refuses, so every case went red at the first rail and
- * NO case ever reached the path rail at all. The suite was green and the path
- * rail was untested. Coverage of the happy prefix of a gauntlet tells you
- * nothing about the rest of it.
+ * The SECOND version fixed that and was reviewed UNSOUND again, by three
+ * independent lenses, two of which wrote working exploits:
  *
- * So the fixes here are to the coverage SHAPE, not only to the code:
+ *   - `clean-markers` deleted a file inside a (fake) real fortress as root,
+ *     through an unchecked INTERMEDIATE symlink, with every rail passing;
+ *   - the accepted storage directory could be swapped for a symlink to a real
+ *     fortress AFTER validation and BEFORE use, winning in 44 attempts;
+ *   - a planted `hostname` on PATH made the artifact print WRAPPER=ACCEPT on
+ *     the operator's MacBook Air.
  *
- *   1. The host rail is deliberately STUBBED TO PASS for the wrapper-level
- *      cases, exactly as the review prescribed, so execution reaches the path
- *      rail. The host rail's own deny-first behavior is proven separately at
- *      the rail level, where it can be driven on any machine.
- *   2. Every rejection asserts BOTH halves: a nonzero exit AND no ACCEPT token
- *      anywhere in the output. "Nonzero exit" alone would have been satisfied
- *      by a build that printed ACCEPT and failed later; "no ACCEPT" alone would
- *      have been satisfied by one that fell through silently.
- *   3. Rejections assert the REASON. Drill doctrine: a deny for the wrong
- *      reason is a fail, not a pass. Several fixtures below have more than one
- *      thing wrong with them, and a rail that rejected the symlink case because
- *      of a typo in its prefix check would look identical to one that rejected
- *      it because it refuses to follow symlinks.
+ * And the reason the suite stayed green through all of it was structural
+ * again, one level up: it exercised every RAIL and only the one VERB that
+ * touches nothing, and the function deciding which home the path rail anchored
+ * to was stubbed out in both batteries.
+ *
+ * So the coverage rules this file now holds are:
+ *
+ *   1. The host rail is deliberately STUBBED TO PASS for wrapper-level cases,
+ *      so execution reaches the path rail. Its own deny-first behavior is
+ *      proven separately at rail level, where it runs on any machine.
+ *   2. Every rejection asserts BOTH halves: a nonzero exit AND no ACCEPT token.
+ *   3. Rejections assert the REASON. A deny for the wrong reason is a fail.
  *   4. The happy path is asserted too. A rail that rejects everything is not
- *      sound, it is broken, and it would pass a suite that only checks
- *      rejections.
+ *      sound, it is broken.
+ *   5. EVERY VERB gets a case, not just the oracle, and the two verbs that
+ *      were exploited get the exploits themselves as fixtures.
+ *   6. The layers the PR body calls load-bearing are asserted STRUCTURALLY on
+ *      the shipped artifact, so deleting one goes red instead of silently
+ *      leaving the suite green.
+ *   7. What is overridden in a battery is CONSTANTS, never functions, and the
+ *      shipped values of those constants are themselves asserted.
  *
- * Nothing here touches a real fortress. The `~/.sanctuary` denylist case and
- * the symlink-to-the-fortress case are reproduced against a FAKE `.sanctuary`
- * inside a temp home. That exercises the identical code path (final component
- * is a symlink; resolved target is a denylisted fortress name) with no way for
- * a test run to reach the operator's actual data.
+ * Nothing here touches a real fortress. Every fortress in every case is a fake
+ * one inside a temp directory.
  */
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const DRILL_LOOP = path.join(REPO_ROOT, "scripts", "drill-loop");
-const RAILS = path.join(DRILL_LOOP, "lib", "rails.sh");
 const PROBE = path.join(DRILL_LOOP, "lib", "probe.sh");
-const WRAPPER_MAIN = path.join(DRILL_LOOP, "wrapper-main.sh");
 const BUILD_WRAPPER = path.join(DRILL_LOOP, "build-wrapper.sh");
+const SELFTEST = path.join(DRILL_LOOP, "selftest.sh");
 const SHA_FILE = path.join(DRILL_LOOP, "wrapper.sha256");
+
+/** The value the SHIPPED artifact must carry. Asserted, never overridden. */
+const SHIPPED_BASE = "/private/var/sanctuary-drill";
+const SHIPPED_PATH_LINE = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
 
 interface Ran {
   status: number;
@@ -61,8 +69,11 @@ interface Ran {
 }
 
 /** Run a probe (or any command) and capture status plus merged output. */
-function run(cmd: string, args: string[]): Ran {
-  const r = spawnSync(cmd, args, { encoding: "utf8" });
+function run(cmd: string, args: string[], env?: NodeJS.ProcessEnv): Ran {
+  const r = spawnSync(cmd, args, {
+    encoding: "utf8",
+    ...(env ? { env: { ...process.env, ...env } } : {}),
+  });
   return {
     status: r.status ?? -1,
     out: `${r.stdout ?? ""}${r.stderr ?? ""}`,
@@ -95,7 +106,13 @@ function expectAccept(r: Ran, contains: string): void {
 }
 
 let sandbox: string;
-let home: string;
+/**
+ * The root-owned base's stand-in, and the per-operator ANCHOR under it. The
+ * storage rail anchors to the ANCHOR now, not to a home directory: see the
+ * BLOCKER 1 block in lib/rails.sh for why that difference is the fix.
+ */
+let base: string;
+let anchor: string;
 let me: string;
 let myUid: number;
 
@@ -105,13 +122,21 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-  sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "sanctuary-drill-rails-"));
-  home = path.join(sandbox, "home");
-  fs.mkdirSync(home, { recursive: true });
-  // A stand-in for the operator's real default fortress. The denylist and the
-  // symlink cases both aim at THIS, never at the real one.
-  fs.mkdirSync(path.join(home, ".sanctuary"));
-  fs.mkdirSync(path.join(home, ".sanctuary-loop-good"));
+  // Canonicalized: on a Mac `os.tmpdir()` sits under /var/folders and /var is a
+  // symlink into /private, so an uncanonicalized fixture path is not equal to
+  // its own resolution. The rails deliberately require canonical input, since a
+  // rail that accepted "something that resolves to the right place" would be
+  // accepting the exact shape the symlink exploits used.
+  sandbox = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "sanctuary-drill-rails-"))
+  );
+  base = path.join(sandbox, "base");
+  anchor = path.join(base, me);
+  fs.mkdirSync(anchor, { recursive: true });
+  // A stand-in for a real default fortress. The denylist and the symlink cases
+  // both aim at THIS, never at a real one.
+  fs.mkdirSync(path.join(anchor, ".sanctuary"));
+  fs.mkdirSync(path.join(anchor, ".sanctuary-loop-good"));
   fs.mkdirSync(path.join(sandbox, "outside", ".sanctuary-loop-outside"), {
     recursive: true,
   });
@@ -125,133 +150,397 @@ describe("drill-loop rails: disposable-storage rail (the BLOCKER and the HIGH)",
   it("rejects an EMPTY storage path, the most dangerous value in the system", () => {
     // An empty SANCTUARY_STORAGE_PATH is not "unset": resolveStoragePath in
     // server/src/paths.ts falls back to <home>/.sanctuary, the REAL fortress.
-    // The reviewed build reached `export SANCTUARY_STORAGE_PATH=""` and armed
-    // it as root.
-    expectReject(probe("storage", home, ""), "empty storage path");
+    expectReject(probe("storage", anchor, ""), "empty storage path");
   });
 
   it("rejects a MISSING storage argument at the rail's own arity check", () => {
-    expectReject(probe("storage", home), "expected 2 args");
+    expectReject(probe("storage", anchor), "expected 2 args");
   });
 
   it("rejects the default fortress by denylist", () => {
     expectReject(
-      probe("storage", home, path.join(home, ".sanctuary")),
+      probe("storage", anchor, path.join(anchor, ".sanctuary")),
       /protected fortress|default fortress directory/
     );
   });
 
   it("rejects a .sanctuary-loop-* SYMLINK pointing at the fortress", () => {
-    // The HIGH finding. Lexical checks all pass: the basename has the right
-    // prefix, the dirname is home, there is no `..`. Only an lstat catches it.
-    const evil = path.join(home, ".sanctuary-loop-evil");
-    fs.symlinkSync(path.join(home, ".sanctuary"), evil);
-    expectReject(probe("storage", home, evil), "final component is a symlink");
+    const evil = path.join(anchor, ".sanctuary-loop-evil");
+    fs.symlinkSync(path.join(anchor, ".sanctuary"), evil);
+    expectReject(probe("storage", anchor, evil), "final component is a symlink");
   });
 
   it("rejects a symlink even when its target is harmless", () => {
-    // The rail refuses to FOLLOW a symlink as root at all, rather than
-    // reasoning about where this particular one points today.
     const benign = path.join(sandbox, "benign");
     fs.mkdirSync(benign);
-    const link = path.join(home, ".sanctuary-loop-benign");
+    const link = path.join(anchor, ".sanctuary-loop-benign");
     fs.symlinkSync(benign, link);
-    expectReject(probe("storage", home, link), "final component is a symlink");
+    expectReject(probe("storage", anchor, link), "final component is a symlink");
   });
 
   it("rejects traversal back to the fortress", () => {
     expectReject(
-      probe("storage", home, `${home}/.sanctuary-loop-x/../.sanctuary`),
+      probe("storage", anchor, `${anchor}/.sanctuary-loop-x/../.sanctuary`),
       "relative component"
     );
   });
 
   it("rejects traversal with a trailing slash", () => {
     expectReject(
-      probe("storage", home, `${home}/.sanctuary-loop-x/../`),
+      probe("storage", anchor, `${anchor}/.sanctuary-loop-x/../`),
       "relative component"
     );
   });
 
   it("rejects a single-dot component", () => {
     expectReject(
-      probe("storage", home, `${home}/./.sanctuary-loop-dot`),
+      probe("storage", anchor, `${anchor}/./.sanctuary-loop-dot`),
       "relative component"
     );
   });
 
-  it("rejects a path OUTSIDE home that has a valid-looking basename", () => {
+  it("rejects a path OUTSIDE the anchor that has a valid-looking basename", () => {
     expectReject(
-      probe("storage", home, path.join(sandbox, "outside", ".sanctuary-loop-outside")),
-      "is not the resolved home"
+      probe("storage", anchor, path.join(sandbox, "outside", ".sanctuary-loop-outside")),
+      "is not the approved anchor"
     );
   });
 
-  it("rejects a path whose PARENT is a symlink into home", () => {
-    // The parent chain is resolved with `cd -P`, so a symlinked intermediate
-    // cannot smuggle the path out of (or into) home.
+  it("rejects a path whose PARENT is a symlink into the anchor", () => {
     const elsewhere = path.join(sandbox, "elsewhere");
     fs.mkdirSync(elsewhere);
-    const parentLink = path.join(sandbox, "home-alias");
+    const parentLink = path.join(sandbox, "anchor-alias");
     fs.symlinkSync(elsewhere, parentLink);
     expectReject(
-      probe("storage", home, path.join(parentLink, ".sanctuary-loop-x")),
-      "is not the resolved home"
+      probe("storage", anchor, path.join(parentLink, ".sanctuary-loop-x")),
+      "is not the approved anchor"
     );
   });
 
   it("rejects a relative path", () => {
-    expectReject(probe("storage", home, ".sanctuary-loop-rel"), "not an absolute path");
+    expectReject(probe("storage", anchor, ".sanctuary-loop-rel"), "not an absolute path");
   });
 
   it("rejects a basename without the disposable prefix", () => {
     expectReject(
-      probe("storage", home, path.join(home, "scratch")),
+      probe("storage", anchor, path.join(anchor, "scratch")),
       "not a disposable loop fortress"
     );
   });
 
   it("rejects the bare prefix with no stamp", () => {
     expectReject(
-      probe("storage", home, path.join(home, ".sanctuary-loop-")),
+      probe("storage", anchor, path.join(anchor, ".sanctuary-loop-")),
       "not a disposable loop fortress"
     );
   });
 
   it("rejects a basename with shell metacharacters", () => {
     expectReject(
-      probe("storage", home, path.join(home, ".sanctuary-loop-a;rm -rf /")),
+      probe("storage", anchor, path.join(anchor, ".sanctuary-loop-a;rm -rf /")),
       "disallowed characters"
     );
   });
 
   it("rejects a path containing a newline", () => {
-    expectReject(probe("storage", home, `${home}/.sanctuary-loop-a\nb`), "newline");
+    expectReject(probe("storage", anchor, `${anchor}/.sanctuary-loop-a\nb`), "newline");
   });
 
   it("rejects an existing target that is a regular file", () => {
-    const asFile = path.join(home, ".sanctuary-loop-file");
+    const asFile = path.join(anchor, ".sanctuary-loop-file");
     fs.writeFileSync(asFile, "x");
-    expectReject(probe("storage", home, asFile), "not a directory");
+    expectReject(probe("storage", anchor, asFile), "not a directory");
   });
 
   // The happy path. A rail that rejects everything is broken, not strict.
   it("ACCEPTS a genuine disposable fortress and prints its resolved path", () => {
-    const good = path.join(home, ".sanctuary-loop-good");
-    const r = probe("storage", home, good);
+    const good = path.join(anchor, ".sanctuary-loop-good");
+    const r = probe("storage", anchor, good);
     expectAccept(r, "PROBE=ACCEPT");
     expect(r.out).toContain(fs.realpathSync(good));
   });
 
   it("ACCEPTS a valid path that does not exist yet", () => {
-    expectAccept(probe("storage", home, path.join(home, ".sanctuary-loop-fresh")), "PROBE=ACCEPT");
+    expectAccept(probe("storage", anchor, path.join(anchor, ".sanctuary-loop-fresh")), "PROBE=ACCEPT");
   });
 
   it("ACCEPTS and canonicalizes duplicate and trailing slashes", () => {
-    const r = probe("storage", home, `${home}//.sanctuary-loop-good/`);
+    const r = probe("storage", anchor, `${anchor}//.sanctuary-loop-good/`);
     expectAccept(r, "PROBE=ACCEPT");
-    expect(r.out).toContain(fs.realpathSync(path.join(home, ".sanctuary-loop-good")));
+    expect(r.out).toContain(fs.realpathSync(path.join(anchor, ".sanctuary-loop-good")));
     expect(r.out).not.toContain("//.sanctuary");
+  });
+});
+
+/**
+ * BLOCKER 1, round 2. The caller no longer supplies a path at all, so there is
+ * nothing to race, swap, or symlink. These cases prove the input that replaced
+ * it cannot be turned back into one.
+ */
+describe("drill-loop rails: the run id is not a path", () => {
+  it("ACCEPTS a plain stamp-shaped run id", () => {
+    expectAccept(probe("run-id", "20260725T0230-1"), "PROBE=ACCEPT");
+  });
+
+  it("rejects an empty run id", () => {
+    expectReject(probe("run-id", ""), "empty run id");
+  });
+
+  it("rejects a run id containing a slash", () => {
+    expectReject(probe("run-id", "a/b"), "disallowed characters");
+  });
+
+  it("rejects a traversal-shaped run id", () => {
+    expectReject(probe("run-id", "../../.sanctuary"), "disallowed characters");
+  });
+
+  it("rejects a run id that starts with a dot, which could read as . or ..", () => {
+    expectReject(probe("run-id", ".."), "must start with a letter or a digit");
+  });
+
+  it("rejects an option-shaped run id", () => {
+    expectReject(probe("run-id", "-rf"), "must start with a letter or a digit");
+  });
+
+  it("rejects an over-long run id", () => {
+    expectReject(probe("run-id", "a".repeat(80)), "longer than 64 characters");
+  });
+
+  it("rejects a run id with shell metacharacters", () => {
+    expectReject(probe("run-id", "a;rm -rf /"), "disallowed characters");
+  });
+
+  it("DERIVES the storage path from base, operator and run id", () => {
+    const r = probe("derive", base, me, "x1");
+    expectAccept(r, "PROBE=ACCEPT");
+    expect(r.out).toContain(path.join(base, me, ".sanctuary-loop-x1"));
+  });
+
+  it("refuses to derive from a relative base", () => {
+    expectReject(probe("derive", "relative/base", me, "x1"), "not an absolute path");
+  });
+
+  it("refuses to derive from a base containing a traversal", () => {
+    expectReject(probe("derive", "/var/../etc", me, "x1"), "relative component");
+  });
+
+  it("refuses to derive for an operator name that is not an account name", () => {
+    expectReject(
+      probe("derive", base, "Root Account", "x1"),
+      "must start with a lowercase letter"
+    );
+    expectReject(probe("derive", base, "a/b", "x1"), "disallowed characters");
+  });
+});
+
+/**
+ * The root-owned base is what actually kills the TOCTOU class: an unprivileged
+ * caller cannot create, rename or replace any component of the path the root
+ * wrapper walks. The per-component predicate is PURE, so the security logic is
+ * driven exhaustively here without root and without a fixture filesystem, the
+ * same way the uid-0-alias refusal is.
+ */
+describe("drill-loop rails: the trusted (root-owned) directory chain", () => {
+  it("accepts a component owned by root", () => {
+    expectAccept(probe("trusted-component", "/some/dir", "0", "755", "501"), "PROBE=ACCEPT");
+  });
+
+  it("accepts a component owned by the very process doing the walking", () => {
+    expectAccept(probe("trusted-component", "/some/dir", "501", "700", "501"), "PROBE=ACCEPT");
+  });
+
+  it("rejects a component owned by a THIRD party, who could replace it under us", () => {
+    expectReject(
+      probe("trusted-component", "/some/dir", "999", "755", "501"),
+      "neither root nor this process"
+    );
+  });
+
+  it("rejects a group-writable component", () => {
+    expectReject(
+      probe("trusted-component", "/some/dir", "0", "775", "501"),
+      "group- or world-writable"
+    );
+  });
+
+  it("rejects a world-writable component", () => {
+    expectReject(
+      probe("trusted-component", "/some/dir", "0", "777", "501"),
+      "group- or world-writable"
+    );
+  });
+
+  it("accepts a world-writable component that carries the STICKY bit", () => {
+    // This is /tmp. Sticky means only an entry's own owner may rename or
+    // remove it, so an existing component cannot be replaced under us.
+    expectAccept(probe("trusted-component", "/tmp", "0", "1777", "501"), "PROBE=ACCEPT");
+  });
+
+  it("rejects an unparseable mode rather than guessing", () => {
+    expectReject(probe("trusted-component", "/some/dir", "0", "rwx", "501"), "unparseable octal mode");
+  });
+
+  it("walks a REAL system directory chain and accepts it", () => {
+    // /usr exists and is root-owned on both macOS and Linux.
+    expectAccept(probe("trusted-chain", "base", "/usr"), "PROBE=ACCEPT");
+  });
+
+  it("walks the sandbox chain and accepts it", () => {
+    expectAccept(probe("trusted-chain", "base", base), "PROBE=ACCEPT");
+  });
+
+  it("refuses a base that is a SYMLINK", () => {
+    const link = path.join(sandbox, "base-link");
+    fs.symlinkSync(base, link);
+    expectReject(probe("trusted-chain", "base", link), "is a symlink");
+  });
+
+  it("refuses a base that does not exist", () => {
+    expectReject(
+      probe("trusted-chain", "base", path.join(sandbox, "no-such-base")),
+      "does not resolve"
+    );
+  });
+
+  it("refuses a relative base", () => {
+    expectReject(probe("trusted-chain", "base", "relative"), "not an absolute path");
+  });
+
+  it("refuses the filesystem root as a base", () => {
+    expectReject(probe("trusted-chain", "base", "/"), "filesystem root");
+  });
+});
+
+/**
+ * THE ONE RESOLUTION CHOKEPOINT. `clean-markers`, `preflight.sh` and
+ * `teardown-verify.sh` all reach inside the storage directory through this and
+ * nothing else. The executed exploit deleted a real fortress's audit lock as
+ * root because the reviewed code lstat'd only the FINAL component.
+ */
+describe("drill-loop rails: safe-subpath, the resolution chokepoint", () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = path.join(anchor, ".sanctuary-loop-good");
+    fs.mkdirSync(path.join(root, "state", "_audit"), { recursive: true });
+    fs.writeFileSync(path.join(root, "state", "_audit", ".audit-write.lock"), "lock");
+  });
+
+  it("ACCEPTS a genuine nested target and prints its path", () => {
+    const r = probe("safe-subpath", root, "state/_audit/.audit-write.lock");
+    expectAccept(r, "PROBE=ACCEPT");
+    expect(r.out).toContain(path.join(root, "state", "_audit", ".audit-write.lock"));
+  });
+
+  it("ACCEPTS a target that does not exist yet, so a caller may conclude it is absent", () => {
+    expectAccept(probe("safe-subpath", root, "exclusive-routing.json"), "PROBE=ACCEPT");
+  });
+
+  it("refuses a symlinked INTERMEDIATE component, which is the executed exploit", () => {
+    fs.rmSync(path.join(root, "state"), { recursive: true, force: true });
+    fs.symlinkSync(path.join(anchor, ".sanctuary"), path.join(root, "state"));
+    expectReject(
+      probe("safe-subpath", root, "state/_audit/.audit-write.lock"),
+      "is a symlink"
+    );
+  });
+
+  it("refuses a symlinked FINAL component", () => {
+    const target = path.join(root, "state", "_audit", ".audit-write.lock");
+    fs.rmSync(target);
+    fs.symlinkSync(path.join(anchor, ".sanctuary"), target);
+    expectReject(
+      probe("safe-subpath", root, "state/_audit/.audit-write.lock"),
+      "is a symlink"
+    );
+  });
+
+  it("refuses a traversal out of the root", () => {
+    expectReject(
+      probe("safe-subpath", root, "../../.sanctuary/state"),
+      "relative or empty component"
+    );
+  });
+
+  it("refuses an absolute path where a relative one belongs", () => {
+    expectReject(probe("safe-subpath", root, "/etc/passwd"), "must not be absolute");
+  });
+
+  it("refuses a relative path with shell metacharacters", () => {
+    expectReject(probe("safe-subpath", root, "state/$(id)"), "disallowed characters");
+  });
+
+  it("refuses an empty relative path", () => {
+    expectReject(probe("safe-subpath", root, ""), "empty relative path");
+  });
+
+  it("refuses a root that is not in canonical resolved form", () => {
+    // A rail that accepted "some path that resolves to the right place" would
+    // be accepting the exact shape the symlink exploits used.
+    const alias = path.join(sandbox, "root-alias");
+    fs.symlinkSync(root, alias);
+    expectReject(
+      probe("safe-subpath", alias, "exclusive-routing.json"),
+      /is a symlink|canonical resolved form/
+    );
+  });
+});
+
+/**
+ * M1: `SUDO_USER` appeared nowhere in the reviewed artifact, so the grant
+ * holder could aim the wrapper at any other account's directory. PURE
+ * predicate, so the uid-0 branch is testable without root.
+ */
+describe("drill-loop rails: the caller binding", () => {
+  it("does not bind an UNPRIVILEGED caller, which is not the concern", () => {
+    expectAccept(probe("caller-binding", "501", "", "agentmac"), "PROBE=ACCEPT");
+  });
+
+  it("accepts root when SUDO_USER matches the operator account", () => {
+    expectAccept(probe("caller-binding", "0", "agentmac", "agentmac"), "PROBE=ACCEPT");
+  });
+
+  it("refuses root with NO SUDO_USER rather than guessing who called", () => {
+    expectReject(probe("caller-binding", "0", "", "agentmac"), "no SUDO_USER");
+  });
+
+  it("refuses root acting for an account other than the sudo caller", () => {
+    expectReject(
+      probe("caller-binding", "0", "agentmac", "someone-else"),
+      "refusing to act for another account"
+    );
+  });
+
+  it("refuses a non-numeric self uid", () => {
+    expectReject(probe("caller-binding", "root", "agentmac", "agentmac"), "not numeric");
+  });
+});
+
+/** The parsing core of preflight's real D7 daemon-freshness check. */
+describe("drill-loop rails: etime parsing", () => {
+  it("parses mm:ss", () => {
+    expectAccept(probe("etime", "02:05"), "seconds=125");
+  });
+
+  it("parses hh:mm:ss", () => {
+    expectAccept(probe("etime", "01:02:05"), "seconds=3725");
+  });
+
+  it("parses dd-hh:mm:ss", () => {
+    expectAccept(probe("etime", "1-02:03:04"), "seconds=93784");
+  });
+
+  it("tolerates the whitespace ps pads with", () => {
+    expectAccept(probe("etime", "   02:05  "), "seconds=125");
+  });
+
+  it("refuses a value it cannot parse rather than returning 0", () => {
+    expectReject(probe("etime", "soon"), "unparseable");
+  });
+
+  it("does not read a leading zero as octal", () => {
+    // `08` and `09` are the classic bash arithmetic trap here.
+    expectAccept(probe("etime", "08:09"), "seconds=489");
   });
 });
 
@@ -268,41 +557,28 @@ describe("drill-loop rails: host rail (the part that held, kept intact)", () => 
     expectReject(probe("host", "ERIKS-MACBOOK-AIR.local"), "un-overridable denylist");
   });
 
+  it("rejects the daily driver by its ComputerName, spaces and apostrophe included", () => {
+    // `scutil --get ComputerName` returns "Erik’s MacBook Air". A denylist of
+    // space-separated words cannot hold that literally, so the denylist
+    // compares an aggressively normalized form. Before the fix this name was
+    // rejected by the ALLOWLIST (fail closed) while the rail's own comment
+    // claimed the denylist covered it.
+    expectReject(probe("host", "Erik’s MacBook Air"), "un-overridable denylist");
+  });
+
+  it("rejects the ComputerName form even as an extra 'allow' argument", () => {
+    expectReject(
+      probe("host", "agents-mac-mini", "Erik’s MacBook Air"),
+      "un-overridable denylist"
+    );
+  });
+
   it("rejects the daily driver even when passed as an extra 'allow' argument", () => {
-    // Every name supplied is screened against the denylist; only the primary is
-    // matched against the allowlist. So an extra argument can only ever cause a
-    // rejection. There is deliberately no argument, flag, or environment
-    // variable anywhere in this harness that can ADD a host.
     expectReject(probe("host", "agents-mac-mini", "Eriks-MacBook-Air"), "un-overridable denylist");
   });
 
   it("accepts a legitimate drill host", () => {
     expectAccept(probe("host", "agents-mac-mini"), "PROBE=ACCEPT");
-  });
-
-  it("exposes no environment or flag override anywhere in the shipped surface", () => {
-    // The structural half of the claim above: not "we did not add one today"
-    // but "there is none in the artifact that actually runs as root". Comment
-    // lines are stripped, because these files explain at length WHY no override
-    // exists and a scanner that cannot tell an explanation from an
-    // implementation would force those explanations to be deleted.
-    const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], {
-      encoding: "utf8",
-    });
-    const sudoers = fs.readFileSync(
-      path.join(DRILL_LOOP, "sudoers.d", "sanctuary-drill"),
-      "utf8"
-    );
-    const stripComments = (s: string): string =>
-      s
-        .split("\n")
-        .filter((line) => !/^\s*#/.test(line))
-        .join("\n");
-
-    for (const forbidden of ["env_keep", "DRILL_LOOP_ALLOWED_HOSTS", "allow-host"]) {
-      expect(stripComments(assembled), `assembled wrapper must not contain ${forbidden}`).not.toContain(forbidden);
-      expect(stripComments(sudoers), `sudoers grant must not contain ${forbidden}`).not.toContain(forbidden);
-    }
   });
 });
 
@@ -312,11 +588,6 @@ describe("drill-loop rails: account rail (the operator-account pivot)", () => {
   });
 
   it("rejects an account that RESOLVES to uid 0 under another name", () => {
-    // A name-only check is bypassable through an aliased uid-0 account, which
-    // is why the uid half exists as its own predicate. It is driven directly
-    // here because this machine has no uid-0 alias and creating one to satisfy
-    // a test would be a worse idea than the test is worth. Production and this
-    // test run the same function; only the source of the uid differs.
     expectReject(probe("uid", "operator", "toor", "0"), "refusing root by uid");
   });
 
@@ -346,8 +617,6 @@ describe("drill-loop rails: account rail (the operator-account pivot)", () => {
 
   it("accepts a valid non-root account and prints its uid", () => {
     if (myUid === 0) {
-      // Running the suite as root is not a supported configuration for this
-      // case: the current account IS root, so the rail correctly refuses it.
       expectReject(probe("account", "operator", me), /root/);
       return;
     }
@@ -367,9 +636,6 @@ describe("drill-loop rails: account rail (the operator-account pivot)", () => {
 
 describe("drill-loop rails: secret-file permissions", () => {
   it("rejects a GROUP-WRITABLE 0660 passphrase file", () => {
-    // The LOW finding: the reviewed check inspected only the last octal digit
-    // (`*[2367]`), so 0660 passed while the comment claimed group-writable was
-    // refused. The mask is against 022 now.
     const p = path.join(sandbox, "pass.txt");
     fs.writeFileSync(p, "x");
     fs.chmodSync(p, 0o660);
@@ -430,15 +696,8 @@ describe("drill-loop rails: loop lock (nightly and interactive must not interlea
   });
 
   it("lets EXACTLY ONE of two concurrent reclaimers of a stale lock proceed", () => {
-    // The MED finding: `mv -> rm -rf -> mkdir` let two processes both observe
-    // one stale lock and both proceed. The subtler steal it opens is worse: A
-    // renames the stale lock away, B legitimately wins the fresh mkdir, and C
-    // (still acting on its own earlier observation) renames B's LIVE lock away
-    // and proceeds too. Reclaim now happens under its own single-winner
-    // reclaim lock with the staleness facts RE-READ while holding it.
     const lock = path.join(sandbox, "loop.lock");
     fs.mkdirSync(lock);
-    // A pid that is certainly dead: spawn something trivial and let it exit.
     const dead = spawnSync("bash", ["-c", "echo $$"], { encoding: "utf8" });
     const deadPid = (dead.stdout ?? "").trim();
     expect(deadPid).toMatch(/^\d+$/);
@@ -447,10 +706,7 @@ describe("drill-loop rails: loop lock (nightly and interactive must not interlea
     // The winner HOLDS the lock for five seconds. Without a hold this test
     // proves nothing: the first process would acquire and release faster than
     // the second could contend, and two sequential acquisitions of a free lock
-    // would look like a race that never happened. (That is not hypothetical -
-    // the first version of this test failed exactly that way under a loaded
-    // full-suite run and passed when run alone.) The hold is also what keeps
-    // the steal window open long enough for a broken reclaim to fall into it.
+    // would look like a race that never happened.
     const a = spawnSync(
       "bash",
       ["-c", `"$0" lock "$1" 20 5 &  "$0" lock "$1" 20 5 &  wait`, PROBE, lock],
@@ -465,25 +721,18 @@ describe("drill-loop rails: loop lock (nightly and interactive must not interlea
 
 describe("drill-loop rails: wrapper assembly and drift", () => {
   it("the committed wrapper.sha256 matches a fresh assembly from the repo", () => {
-    // This is what turns "somebody edited rails.sh and forgot to rebuild" into
-    // a red test rather than a wrapper whose behavior no longer matches the
-    // hash that was reviewed.
     const r = run("bash", [BUILD_WRAPPER, "--verify-hash"]);
     expect(r.status, r.out).toBe(0);
     expect(r.out).toContain("wrapper hash OK");
   });
 
   it("the assembled wrapper is SELF-CONTAINED: it sources nothing at runtime", () => {
-    // A root-run wrapper that sourced lib/rails.sh out of the operator-writable
-    // repo would make any repo write a root code-execution primitive. Assembly
-    // exists precisely so it does not have to.
     const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], { encoding: "utf8" });
     const executable = assembled
       .split("\n")
       .filter((line) => !/^\s*#/.test(line))
       .join("\n");
     expect(executable).not.toMatch(/^\s*(\.|source)\s+/m);
-    // and it really does carry the rails inline
     expect(executable).toContain("rails_assert_disposable_storage()");
     expect(executable).toContain("wrapper_run_rails()");
   });
@@ -533,7 +782,6 @@ describe("drill-loop rails: wrapper assembly and drift", () => {
     const assembled = path.join(sandbox, "assembled");
     execFileSync("bash", [BUILD_WRAPPER, assembled], { stdio: "ignore" });
     if (myUid === 0) {
-      // As root the fixture IS root-owned, so assert the mode half instead.
       fs.chmodSync(assembled, 0o777);
       expectReject(probe("wrapper-ownership", assembled), "group- or world-writable");
       return;
@@ -551,151 +799,399 @@ describe("drill-loop rails: wrapper assembly and drift", () => {
 });
 
 /**
- * THE REGRESSION THAT WOULD HAVE CAUGHT THE BLOCKER.
+ * THE STRUCTURAL ASSERTIONS.
  *
- * These cases run the REAL wrapper body over the REAL rails, with the host rail
- * stubbed to PASS so execution actually reaches the path rail. That stub is the
- * whole point: without it, every case dies at the host rail and the path rail
- * is never touched, which is exactly how the unsound build stayed green.
+ * The coverage re-review found that three of the four layers the PR body calls
+ * load-bearing had NO test at all: deleting `set -euo pipefail` from the
+ * header, the gauntlet's non-empty post-condition, or the `wrapper_cli` guard
+ * left the suite fully green. And the constant the path rail anchors to was
+ * stubbed in both batteries, so mutating it to `/var/root` kept all 59 tests
+ * passing.
  *
- * The composed script is the shipped `lib/rails.sh` plus the shipped
- * `wrapper-main.sh`, with two narrow overrides appended AFTER both:
- *
- *   RAILS_HOST_ALLOW / RAILS_HOST_DENY - stub the host rail to pass.
- *   wrapper_home_of - point the operator's home at a temp directory, so no
- *     case reads or writes a real home.
- *
- * `wrapper-main.sh` deliberately ends with definitions and no entrypoint;
- * build-wrapper.sh appends `wrapper_main "$@"` as the artifact's footer. That
- * is what makes this composition possible without any test-mode branch existing
- * in the shipped code.
+ * These cases assert those properties on the SHIPPED artifact, which no
+ * override in any battery can fake.
  */
-describe("drill-loop wrapper: the check oracle must not lie", () => {
+describe("drill-loop wrapper: the shipped artifact's own structure", () => {
+  let assembled: string;
+
+  beforeEach(() => {
+    assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], { encoding: "utf8" });
+  });
+
+  const executableLines = (s: string): string =>
+    s
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .join("\n");
+
+  it("uses an ABSOLUTE interpreter, not `env bash`", () => {
+    // `#!/usr/bin/env bash` asks PATH which bash to be. A planted `bash`
+    // substituted the interpreter of this root-run artifact outright, and even
+    // with a clean PATH, Homebrew's operator-writable /opt/homebrew/bin/bash
+    // wins on a Mac.
+    expect(assembled.split("\n")[0]).toBe("#!/bin/bash");
+  });
+
+  it("pins PATH before any external command can run", () => {
+    const lines = assembled.split("\n");
+    const pathAt = lines.findIndex((l) => l.trim() === SHIPPED_PATH_LINE);
+    expect(pathAt, "the assembled artifact must pin PATH").toBeGreaterThan(0);
+    // Nothing executable may precede it.
+    const before = lines.slice(0, pathAt).filter((l) => l.trim() !== "" && !/^\s*#/.test(l));
+    expect(before, `these executable lines run before PATH is pinned: ${before.join(" | ")}`).toEqual([]);
+    expect(assembled).toContain("export PATH");
+    // /usr/local/bin is operator-writable on a Mac and must not be in it.
+    expect(SHIPPED_PATH_LINE).not.toContain("/usr/local/bin");
+  });
+
+  it("sets `set -euo pipefail` in its header", () => {
+    // BLOCKER-defence layer 1. Deleting it left the reviewed suite green.
+    expect(assembled).toContain("\nset -euo pipefail\n");
+  });
+
+  it("keeps BOTH non-empty storage post-conditions", () => {
+    // BLOCKER-defence layers 3 and 4: one after the rail, one immediately
+    // before the single place SANCTUARY_STORAGE_PATH is exported. Deleting
+    // either left the reviewed suite green.
+    const guards = executableLines(assembled).match(/\[ -z "\$STORAGE" \]/g) ?? [];
+    expect(guards.length, "expected the post-rail guard AND the wrapper_cli guard").toBeGreaterThanOrEqual(2);
+    expect(assembled).toContain("refusing to invoke the CLI with an empty storage path");
+  });
+
+  it("carries the SHIPPED root-owned base, not a battery's override", () => {
+    // The reviewed build's equivalent anchor was a FUNCTION stubbed in both
+    // batteries; mutating it to /var/root kept every test green. It is a
+    // constant now, and this is the assertion no override can fake.
+    expect(assembled).toContain(`RAILS_DISPOSABLE_BASE='${SHIPPED_BASE}'`);
+  });
+
+  it("has NO --storage flag and no other caller-supplied path", () => {
+    // The whole of BLOCKER 1: an attacker cannot race a value they never
+    // supply. `--base` exists on the unprivileged drivers for the batteries;
+    // it must never reach the root artifact. The usage text still SAYS
+    // "--storage" in the sentence explaining that it does not exist, so this
+    // looks for the parser arm, not the string.
+    const exec = executableLines(assembled);
+    expect(exec).not.toMatch(/^\s*--storage\)/m);
+    expect(exec).not.toMatch(/^\s*--base\)/m);
+    expect(exec).toMatch(/^\s*--run-id\)/m);
+    expect(exec).not.toContain("ARG_STORAGE");
+  });
+
+  it("no longer looks up anybody's home directory", () => {
+    // `wrapper_home_of` was the stub that made the rail's anchor untested in
+    // both batteries. It is gone rather than better-tested. The NOTE at the
+    // bottom of wrapper-main.sh names it while explaining that, so this looks
+    // at executable lines only.
+    const exec = executableLines(assembled);
+    expect(exec).not.toContain("wrapper_home_of");
+    expect(exec).not.toContain("NFSHomeDirectory");
+  });
+
+  it("resolves its host identity by ABSOLUTE path, not through PATH", () => {
+    const exec = executableLines(assembled);
+    expect(exec).toContain("rails__sys hostname");
+    expect(exec).toContain("rails__sys scutil");
+    expect(exec).toMatch(/RAILS_SYSTEM_BIN_DIRS='\/usr\/bin \/bin \/usr\/sbin \/sbin'/);
+  });
+
+  it("exposes no environment or flag override anywhere in the shipped surface", () => {
+    const sudoers = fs.readFileSync(
+      path.join(DRILL_LOOP, "sudoers.d", "sanctuary-drill"),
+      "utf8"
+    );
+    for (const forbidden of ["env_keep", "DRILL_LOOP_ALLOWED_HOSTS", "allow-host"]) {
+      expect(executableLines(assembled), `assembled wrapper must not contain ${forbidden}`).not.toContain(forbidden);
+      expect(executableLines(sudoers), `sudoers grant must not contain ${forbidden}`).not.toContain(forbidden);
+    }
+  });
+
+  it("the sudoers grant pins secure_path", () => {
+    const sudoers = fs.readFileSync(
+      path.join(DRILL_LOOP, "sudoers.d", "sanctuary-drill"),
+      "utf8"
+    );
+    expect(executableLines(sudoers)).toContain('secure_path="/usr/bin:/bin:/usr/sbin:/sbin"');
+  });
+});
+
+/**
+ * THE REGRESSION THAT WOULD HAVE CAUGHT BOTH BLOCKERS.
+ *
+ * These cases run the REAL assembled artifact, byte for byte, with TWO
+ * CONSTANT overrides spliced in immediately before its entrypoint line:
+ *
+ *   RAILS_HOST_ALLOW / RAILS_HOST_DENY - stub the host rail to pass, so
+ *     execution reaches the path rail. Without this every case dies at the
+ *     host rail, which is exactly how the first unsound build stayed green.
+ *   RAILS_DISPOSABLE_BASE - point the root-owned base at a temp directory, so
+ *     nothing here reads or writes a real one.
+ *
+ * Both are CONSTANTS whose shipped values are asserted above. The reviewed
+ * batteries overrode a FUNCTION instead, with no such assertion, and that is
+ * why mutating it left 59 tests green.
+ */
+describe("drill-loop wrapper: every verb, not just the oracle", () => {
   let testWrapper: string;
+  let victim: string;
 
   beforeEach(() => {
     const hostname = execFileSync("hostname", ["-s"], { encoding: "utf8" }).trim();
     testWrapper = path.join(sandbox, "test-wrapper");
-
-    // Start from the REAL assembled artifact, byte for byte, and inject the two
-    // overrides immediately before its entrypoint line. Composing the parts by
-    // hand instead would silently drop whatever the builder's header sets -
-    // and the header is where `set -euo pipefail` lives, which is one of the
-    // layers that stops a rail rejection from falling through. A test that
-    // supplies its own header would be testing a shell configuration the
-    // shipped wrapper does not necessarily have.
-    const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], {
-      encoding: "utf8",
-    });
+    const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], { encoding: "utf8" });
     const entrypoint = 'wrapper_main "$@"';
     const at = assembled.lastIndexOf(entrypoint);
     expect(at, "assembled wrapper must end with the wrapper_main entrypoint").toBeGreaterThan(0);
     const overrides = [
       `RAILS_HOST_ALLOW='${hostname.toLowerCase()}'`,
       "RAILS_HOST_DENY=''",
-      `wrapper_home_of() { printf '%s\\n' '${home}'; }`,
+      `RAILS_DISPOSABLE_BASE='${base}'`,
       "",
     ].join("\n");
-    fs.writeFileSync(
-      testWrapper,
-      assembled.slice(0, at) + overrides + assembled.slice(at),
-      { mode: 0o755 }
-    );
+    fs.writeFileSync(testWrapper, assembled.slice(0, at) + overrides + assembled.slice(at), {
+      mode: 0o755,
+    });
+
+    // A stand-in for a real fortress, OUTSIDE the disposable base. Every
+    // exploit case below aims at this.
+    victim = path.join(sandbox, "fake-fortress");
+    fs.mkdirSync(path.join(victim, "state", "_audit"), { recursive: true });
+    fs.writeFileSync(path.join(victim, "state", "_audit", ".audit-write.lock"), "FORTRESS");
+    fs.writeFileSync(path.join(victim, "exclusive-routing.json"), "FORTRESS");
   });
 
   function wrapper(...args: string[]): Ran {
     return run("bash", [testWrapper, ...args]);
   }
 
-  it("prints REJECT, never ACCEPT, for a path the rails reject", () => {
-    // The reviewed build printed `WRAPPER=ACCEPT storage=` here, because the
-    // rail's `die` happened inside a command substitution and killed only the
-    // subshell. The parent then exported an empty SANCTUARY_STORAGE_PATH, which
-    // resolves to the REAL default fortress, and armed it as root.
-    const r = wrapper("check", "--storage", path.join(home, ".sanctuary"), "--operator-account", me);
+  const loopDir = (id: string): string => path.join(base, me, `.sanctuary-loop-${id}`);
+
+  it("refuses --storage, because the flag no longer exists", () => {
+    const r = wrapper("check", "--storage", victim, "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=ACCEPT");
+    expect(r.out).toContain("unknown or unsupported argument");
+  });
+
+  it("refuses an EMPTY --run-id, and says which layer refused it", () => {
+    // The reviewed suite had a case named "refuses an empty --storage at both
+    // layers" that entered only ONE layer and asserted no reason at all.
+    const r = wrapper("check", "--run-id", "", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain("WRAPPER=REJECT");
-    expect(r.out).toContain("storage rail rejected");
-    // and specifically never the empty-storage fall-through
-    expect(r.out).not.toMatch(/storage=\s*$/m);
+    expect(r.out, "the wrapper's own required-argument guard is the layer that fires").toContain(
+      "--run-id is required"
+    );
   });
 
-  it("prints REJECT for a symlinked disposable path", () => {
-    const evil = path.join(home, ".sanctuary-loop-evil");
-    fs.symlinkSync(path.join(home, ".sanctuary"), evil);
-    const r = wrapper("check", "--storage", evil, "--operator-account", me);
+  it("refuses a traversal-shaped run id, and prints REJECT", () => {
+    const r = wrapper("check", "--run-id", "../../.sanctuary", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
-    expect(r.out).toContain("storage rail rejected");
+    expect(r.out).toContain("WRAPPER=REJECT");
+    expect(r.out).toContain("run id rejected");
   });
 
-  it("refuses an empty --storage at both layers", () => {
-    const r = wrapper("check", "--storage", "", "--operator-account", me);
+  it("prints WRAPPER=REJECT for a HOST rejection too, not only a path one", () => {
+    // Review finding L2: `rails__die` exits, so a DIRECTLY called rail
+    // terminated the script before the oracle's REJECT token was printed, and
+    // `check` had two different contracts depending on which rail said no.
+    const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], { encoding: "utf8" });
+    const at = assembled.lastIndexOf('wrapper_main "$@"');
+    const hostDenied = path.join(sandbox, "host-denied-wrapper");
+    fs.writeFileSync(
+      hostDenied,
+      assembled.slice(0, at) +
+        `RAILS_DISPOSABLE_BASE='${base}'\n` +
+        assembled.slice(at),
+      { mode: 0o755 }
+    );
+    const r = run("bash", [hostDenied, "check", "--run-id", "good1", "--operator-account", me]);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
+    expect(r.out, "a host rejection must print the same oracle token as any other").toContain(
+      "WRAPPER=REJECT"
+    );
+    expect(r.out).toContain("host rail rejected");
   });
 
   it("refuses --operator-account root before any sudo -u could happen", () => {
-    // The MED finding: the reviewed build passed --operator-account straight
-    // through to `sudo -u`, so `root` plus a caller-supplied URL yielded curl
-    // as root.
-    const r = wrapper(
-      "check",
-      "--storage",
-      path.join(home, ".sanctuary-loop-good"),
-      "--operator-account",
-      "root"
-    );
+    const r = wrapper("check", "--run-id", "good1", "--operator-account", "root");
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain("operator account rejected");
   });
 
   it("refuses an unknown flag rather than passing it through", () => {
-    const r = wrapper(
-      "check",
-      "--storage",
-      path.join(home, ".sanctuary-loop-good"),
-      "--operator-account",
-      me,
-      "--danger"
-    );
+    const r = wrapper("check", "--run-id", "good1", "--operator-account", me, "--danger");
     expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain("unknown or unsupported argument");
   });
 
   it("refuses an unknown verb", () => {
-    const r = wrapper("definitely-not-a-verb", "--storage", path.join(home, ".sanctuary-loop-good"), "--operator-account", me);
+    const r = wrapper("definitely-not-a-verb", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain("unknown verb");
   });
 
-  it("ACCEPTS a genuinely valid invocation, with a non-empty storage value", () => {
+  it("ACCEPTS a genuine invocation and mints a root-owned-shaped directory", () => {
     if (myUid === 0) {
-      // As root the operator rail refuses the current account, correctly.
-      const r = wrapper(
-        "check",
-        "--storage",
-        path.join(home, ".sanctuary-loop-good"),
-        "--operator-account",
-        me
-      );
+      const r = wrapper("check", "--run-id", "good1", "--operator-account", me);
       expect(r.status).not.toBe(0);
       expect(r.out).toContain("operator account rejected");
       return;
     }
-    const r = wrapper(
-      "check",
-      "--storage",
-      path.join(home, ".sanctuary-loop-good"),
-      "--operator-account",
-      me
-    );
+    const r = wrapper("check", "--run-id", "good1", "--operator-account", me);
     expect(r.status, r.out).toBe(0);
     expect(r.out).toContain("WRAPPER=ACCEPT");
-    expect(r.out).toContain(fs.realpathSync(path.join(home, ".sanctuary-loop-good")));
-    // the post-condition the reviewed build lacked
+    expect(r.out).toContain(loopDir("good1"));
     expect(r.out).not.toMatch(/storage=\s/);
+    expect(fs.statSync(loopDir("good1")).isDirectory()).toBe(true);
+  });
+
+  it("mint creates the disposable fortress", () => {
+    if (myUid === 0) return;
+    const r = wrapper("mint", "--run-id", "good1", "--operator-account", me);
+    expectAccept(r, "WRAPPER=OK verb=mint");
+    expect(fs.existsSync(loopDir("good1"))).toBe(true);
+  });
+
+  it("clean-markers removes the loop's own markers", () => {
+    if (myUid === 0) return;
+    expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
+    const marker = path.join(loopDir("good1"), "exclusive-routing.json");
+    fs.writeFileSync(marker, "x");
+    const r = wrapper("clean-markers", "--run-id", "good1", "--operator-account", me);
+    expectAccept(r, "WRAPPER=OK verb=clean-markers");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  it("clean-markers refuses a symlinked INTERMEDIATE and the fortress file SURVIVES", () => {
+    // THE EXECUTED EXPLOIT. `[ -L "$target" ]` lstats only the FINAL
+    // component, so `state/` and `state/_audit/` were followed by the kernel
+    // and never looked at, and a root `rm` deleted a real fortress's audit
+    // write lock while every rail passed.
+    if (myUid === 0) return;
+    expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
+    fs.symlinkSync(path.join(victim, "state"), path.join(loopDir("good1"), "state"));
+    const r = wrapper("clean-markers", "--run-id", "good1", "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain("is a symlink");
+    expect(
+      fs.existsSync(path.join(victim, "state", "_audit", ".audit-write.lock")),
+      "the wrapper reached OUTSIDE the storage directory and deleted a fortress file"
+    ).toBe(true);
+  });
+
+  it("clean-markers refuses a symlinked FINAL component and the fortress file SURVIVES", () => {
+    if (myUid === 0) return;
+    expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
+    fs.mkdirSync(path.join(loopDir("good1"), "state", "_audit"), { recursive: true });
+    fs.symlinkSync(
+      path.join(victim, "state", "_audit", ".audit-write.lock"),
+      path.join(loopDir("good1"), "state", "_audit", ".audit-write.lock")
+    );
+    const r = wrapper("clean-markers", "--run-id", "good1", "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain("is a symlink");
+    expect(fs.existsSync(path.join(victim, "state", "_audit", ".audit-write.lock"))).toBe(true);
+  });
+
+  it("SURVIVES the TOCTOU race that swapped the accepted directory for a symlink", () => {
+    // Codex won this in 44 attempts against the reviewed build. Note that this
+    // sandbox is the WEAKER configuration: in production the base is
+    // root-owned, so the racer could not create the leaf at all.
+    if (myUid === 0) return;
+    expectAccept(wrapper("mint", "--run-id", "race", "--operator-account", me), "verb=mint");
+    const dir = loopDir("race");
+    const racer = spawnSync(
+      "bash",
+      [
+        "-c",
+        `for i in $(seq 1 200); do rm -rf "$1" 2>/dev/null; ln -s "$2" "$1" 2>/dev/null; rm -f "$1" 2>/dev/null; mkdir "$1" 2>/dev/null; done &
+         for i in $(seq 1 40); do bash "$0" clean-markers --run-id race --operator-account "$3" >/dev/null 2>&1; done
+         wait`,
+        testWrapper,
+        dir,
+        victim,
+        me,
+      ],
+      { encoding: "utf8", timeout: 120_000 }
+    );
+    expect(racer.error).toBeUndefined();
+    expect(
+      fs.existsSync(path.join(victim, "exclusive-routing.json")),
+      "the race was won: a fortress marker outside the storage directory was deleted"
+    ).toBe(true);
+  });
+
+  it("kickstart-daemons reports a FAILED restart instead of printing OK over it", () => {
+    // The reviewed verb ran `launchctl kickstart ... || true` and then printed
+    // `WRAPPER=OK verb=kickstart-daemons` unconditionally. The kickstart IS
+    // the verb's whole job, so its status is the verb's status. There is no
+    // Sanctuary gate daemon on a test machine, so this must fail.
+    if (myUid === 0) return;
+    const r = wrapper("kickstart-daemons", "--run-id", "good1", "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=OK verb=kickstart-daemons");
+    expect(r.out).toContain("kickstart failed for");
+  });
+
+  it("arm refuses without an agent account, before touching the CLI", () => {
+    if (myUid === 0) return;
+    const r = wrapper("arm", "--run-id", "good1", "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain("arm requires");
+  });
+
+  it("repair refuses a missing CLI rather than exec-ing whatever is there", () => {
+    if (myUid === 0) return;
+    const r = wrapper("repair", "--run-id", "good1", "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain("CLI not found");
+  });
+
+  it("unprotect refuses a missing CLI", () => {
+    if (myUid === 0) return;
+    const r = wrapper("unprotect", "--run-id", "good1", "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain("CLI not found");
+  });
+
+  it("EVERY verb refuses a traversal run id before doing anything", () => {
+    if (myUid === 0) return;
+    for (const verb of [
+      "check",
+      "mint",
+      "clean-markers",
+      "gate-state",
+      "kickstart-daemons",
+      "arm",
+      "repair",
+      "unprotect",
+      "pf-anchor-rules",
+    ]) {
+      const r = wrapper(verb, "--run-id", "../../.sanctuary", "--operator-account", me);
+      expect(r.status, `${verb} accepted a traversal run id`).not.toBe(0);
+      expect(r.out, `${verb} printed ACCEPT for a traversal run id`).not.toContain("WRAPPER=ACCEPT");
+      expect(r.out).toContain("run id rejected");
+    }
+  });
+});
+
+/**
+ * The two batteries used to be different sets of cases while the README said
+ * "Both run the same cases" (59 vs 52, differing in both directions). Running
+ * the standalone battery FROM here makes drift between them impossible: the
+ * drill host and CI execute the same file.
+ */
+describe("drill-loop: the standalone battery is the same battery", () => {
+  it("selftest.sh passes in full", () => {
+    const r = run("bash", [SELFTEST]);
+    expect(r.status, r.out).toBe(0);
+    expect(r.out).toMatch(/\n\d+ passed, 0 failed/);
   });
 });

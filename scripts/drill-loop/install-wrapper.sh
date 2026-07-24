@@ -34,10 +34,15 @@ die() {
 
 if [ "$(id -u)" -ne 0 ]; then die 'must run as root (sudo)'; fi
 
-# Same host rail the wrapper enforces, applied to the install itself.
-rails_assert_host_allowed \
-  "$(hostname -s 2>/dev/null || printf 'unknown')" \
-  "$(hostname -f 2>/dev/null || printf 'unknown')" \
+# Same host rail the wrapper enforces, applied to the install itself. The
+# subshell makes the rail's `exit` a status this script can act on, so the
+# refusal message is this file's and not a bare RAILS_REJECT line; and
+# `hostname` / `scutil` go through the absolute resolver, because the review
+# defeated the host rail with a planted `hostname` on PATH.
+( rails_assert_host_allowed \
+    "$(rails__sys hostname -s 2>/dev/null || printf 'unknown')" \
+    "$(rails__sys hostname -f 2>/dev/null || printf 'unknown')" \
+    "$(rails__sys scutil --get ComputerName 2>/dev/null || printf 'no-computer-name')" ) \
   || die 'host rail rejected this machine; refusing to install'
 
 "$HERE/build-wrapper.sh" --verify-hash >/dev/null \
@@ -54,8 +59,13 @@ chmod 0755 "$DEST_DIR"
 install -o root -g wheel -m 0755 "$TMP" "$DEST" 2>/dev/null \
   || install -o root -g root -m 0755 "$TMP" "$DEST"
 
-WANT="$(tr -d ' \t\n\r' < "$HERE/wrapper.sha256")"
-GOT="$(rails_sha256_file "$DEST")"
+# The mandatory call-site form, here too. This was the one asserting-rail call
+# in the tree without an explicit `|| die`; it was safe only because this file
+# has `set -e`, and relying on `set -e` alone is precisely the thing this
+# codebase decided not to do after round 1.
+WANT="$(tr -d ' \t\n\r' < "$HERE/wrapper.sha256")" || die 'cannot read the committed hash'
+GOT="$(rails_sha256_file "$DEST")" || die "cannot hash the installed wrapper at $DEST"
+if [ -z "$GOT" ]; then die 'empty hash after the sha rail'; fi
 if [ "$GOT" != "$WANT" ]; then die "installed hash $GOT != committed $WANT"; fi
 
 printf 'installed %s (root-owned 0755, sha256 %s)\n' "$DEST" "$GOT"

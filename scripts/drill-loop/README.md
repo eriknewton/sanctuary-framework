@@ -12,29 +12,65 @@ the loop the following night.
 
 ## The rails are the product
 
-This harness escalates to root under a NOPASSWD sudoers grant. Its first version
-was reviewed UNSOUND: a REJECTED `--storage` path armed the operator's real
-`~/.sanctuary` fortress as root, because the rail's rejection happened inside a
-command substitution and killed only a subshell. The parent continued with an
-empty storage value, and an empty `SANCTUARY_STORAGE_PATH` resolves to the real
-default fortress.
+This harness escalates to root under a NOPASSWD sudoers grant, and it has been
+reviewed UNSOUND twice. Both rounds are worth stating plainly, because the
+current design is a direct answer to the second one.
 
-So the ordering here is deliberate. `lib/rails.sh` came first, its battery came
-second, and the loop was built on top only once the battery was green. A harness
-that runs beautifully but can be talked into touching a real fortress is worth
-negative value.
+**Round 1.** A REJECTED `--storage` path armed the operator's real
+`~/.sanctuary` fortress as root: the rail's rejection happened inside a command
+substitution and killed only a subshell, the parent continued with an empty
+storage value, and an empty `SANCTUARY_STORAGE_PATH` resolves to the real
+default fortress. Class: *a rail rejection never reached the code that used the
+value.*
+
+**Round 2.** Three independent lenses, two UNSOUND verdicts, two working
+exploits. `clean-markers` deleted a file inside a fortress as root through an
+unchecked INTERMEDIATE symlink, with every rail passing. The accepted storage
+directory could be swapped for a symlink to a fortress after validation and
+before use, winning in 44 attempts. And a planted `hostname` on PATH made the
+artifact print `WRAPPER=ACCEPT` on the operator's MacBook Air, the one machine
+the design says is structurally unable to run it. Class: *a rail APPROVED a
+value, and then the code used something else.*
+
+Round 1 was fixed by getting five named call sites right. That is what left the
+class open. So round 2 is fixed at the class level instead:
+
+**The caller no longer supplies a path.** There is no `--storage` flag. The
+caller supplies a `--run-id`, which cannot contain a slash, and the wrapper
+composes the path itself under a base it compiled in. An attacker cannot race,
+swap or symlink a value they never supply.
+
+**The base is root-owned and not operator-writable.** Every component of
+`/private/var/sanctuary-drill/<operator>/.sanctuary-loop-<run-id>` is created by
+root, verified component by component before use, and cannot be created,
+renamed or replaced by an unprivileged caller. This is what actually kills the
+time-of-check-to-time-of-use class, rather than narrowing its window.
+
+**Every privileged filesystem operation goes through ONE resolution
+chokepoint.** `rails_assert_safe_subpath` walks every component and refuses any
+symlink anywhere in the chain. `clean-markers`, `preflight.sh` and
+`teardown-verify.sh` all use it; no verb walks a path by hand.
+
+The ordering here stays deliberate: `lib/rails.sh` first, its battery second,
+the loop on top only once the battery was green. A harness that runs beautifully
+but can be talked into touching a real fortress is worth negative value.
 
 ### What it refuses
 
 | Refusal | Enforced by |
 | --- | --- |
-| Any storage path outside `~/.sanctuary-loop-<stamp>` | `rails_assert_disposable_storage` allowlist |
+| A caller-supplied storage path, at all | there is no `--storage` flag; the wrapper derives the path |
+| A run id that is not a plain identifier | `rails_assert_run_id`: no slash, no traversal, no leading dot or dash |
+| A storage path outside `<base>/<operator>/.sanctuary-loop-<id>` | `rails_assert_disposable_storage`, anchored on a root-owned directory |
+| A base whose chain is not root-owned and non-writable | `rails_assert_trusted_dir_chain`, every component |
+| A symlink ANYWHERE in a path a privileged verb walks | `rails_assert_safe_subpath`, the one chokepoint |
 | Any known fortress path, checked before the allowlist | denylist, lexical and resolved |
-| An empty storage path, at two independent layers | the rail, and the wrapper's required-argument guard |
-| A `.sanctuary-loop-*` that is a symlink | `[ -L ]` lstat, plus parent-chain resolution |
+| An empty storage value | the rail, the post-rail guard, and the guard before the one export |
 | Any host but a compiled-in drill host | `rails_assert_host_allowed`, deny-first, fail closed |
-| The operator's daily-driver MacBook, unconditionally | denylist checked before the allowlist, no override exists |
+| The operator's daily-driver MacBook, under any of its names | denylist on an aggressively normalized form, before the allowlist |
+| A PATH-planted `hostname`, `stat`, `rm` or interpreter | absolute shebang, pinned PATH, `rails__sys` absolute resolution, `secure_path` |
 | `--operator-account root`, by name and by uid | `rails_assert_non_root_account` |
+| Acting for an account other than the sudo caller | `rails_assert_caller_binding` |
 | A group- or world-accessible passphrase file | `rails_assert_secret_file_perms`, masked against 022 and 077 |
 | Interleaving a scheduled run with an interactive drill | `rails_lock_acquire`, atomic single-winner reclaim |
 | Running a wrapper that does not match its reviewed hash | `rails_assert_wrapper_integrity` |
@@ -44,6 +80,11 @@ that can add a host or widen the storage allowlist. The sudoers grant carries no
 `env_keep`, so sudo's `env_reset` strips anything a caller might try to smuggle
 in, and the privileged path always uses its compiled-in lists. A test asserts
 that the assembled artifact contains no such override outside a comment.
+
+One claim this file used to make and no longer does: that *nothing whatsoever*
+could make the wrapper run on the MacBook. A planted file did, through PATH.
+What is true after the fix is narrower and is stated in
+`sudoers.d/sanctuary-drill`.
 
 ## Layout
 
@@ -84,24 +125,50 @@ file. One check catches both "you edited the repo and forgot to reinstall" and
 ## Running the battery
 
 ```sh
-scripts/drill-loop/selftest.sh          # standalone, on any machine, ~2 seconds
+scripts/drill-loop/selftest.sh          # standalone, on any machine, ~8 seconds
 cd server && npx vitest run test/drill-loop/rails.test.ts
 ```
 
-Both run the same cases. The standalone copy exists because the machine that
-actually matters is the drill host, and the drill host does not run the
-TypeScript suite. Run it there before any nightly loop and after any wrapper
-reinstall.
+The standalone battery exists because the machine that actually matters is the
+drill host, and the drill host does not run the TypeScript suite. Run it there
+before any nightly loop and after any wrapper reinstall.
 
-Every rejection case asserts three things: a nonzero exit, no ACCEPT token in
-the output, and the expected REASON. The reason half matters as much as the
-others. A deny for the wrong reason is a failure, not a pass, and that is not
-pedantry: the 2026-07-24 drill's negative probes all "passed" while the gate was
+The two are no longer separate sets of cases that a README claims are the same.
+The README used to say "Both run the same cases" while vitest had 59 and
+`selftest.sh` had 52, differing in both directions. Now **vitest runs
+`selftest.sh` as one of its own cases**, so the drill host and CI execute the
+same file and drift between them is impossible. vitest adds cases on top that
+need node (structural assertions on the assembled artifact, the TOCTOU race
+harness), and `selftest.sh` composes its test wrapper from the real
+`build-wrapper.sh --stdout` output rather than hand-concatenating the parts, so
+the battery that runs on the drill host tests the SHIPPED header, including the
+pinned PATH and `set -euo pipefail`.
+
+Most rejection cases assert three things: a nonzero exit, no ACCEPT token in the
+output, and the expected REASON. The reason half matters as much as the others.
+A deny for the wrong reason is a failure, not a pass, and that is not pedantry:
+the 2026-07-24 drill's negative probes all "passed" while the gate was
 strangling every request for an unrelated cause, which hid a live defect for a
-full day.
+full day. A handful of wrapper-level cases assert the first two and name the
+layer instead of a reason string; they say so where they are.
 
 The happy path is asserted too. A rail that rejects everything is not sound, it
 is broken, and it would sail through a suite that only checks rejections.
+
+### Proven by mutation, not by assertion
+
+The round-2 coverage review found that three of the four layers the PR body
+called load-bearing could be DELETED with the suite still fully green, and that
+the function deciding which directory the path rail anchored to was stubbed out
+in both batteries. So every fix in this round was proven the same way that
+review proved its findings: break the property, watch a named test go red,
+restore it. The mutation table is in the PR body. What it covers, in short:
+
+- both executed exploits, replayed end to end through the real verb;
+- the TOCTOU race, replayed as a test;
+- each of the four BLOCKER-defence layers, individually deleted;
+- the shipped constants (base, PATH, shebang), individually changed;
+- each false-green fix, individually reverted.
 
 ## Running the loop
 
@@ -139,6 +206,14 @@ gone, the pf anchor is clear, the markers are gone, the locks are gone, and the
 agent's uid can reach the network again. `--unprotect-egress-gate` exiting 0 is
 a claim, not evidence.
 
+And a check that COULD NOT observe is not a clean check. The reviewed version
+read a refused `sudo -n pfctl` as CLEAN, because a refused sudo, a pf error and
+a genuinely empty anchor were all one empty string, on a grant the README itself
+said did not exist. Every observation now fails CLOSED when it cannot be made,
+and names which one it was. That is the 2026-06-24 "claimed all drills dry"
+failure, and the whole point of automating drills is that it must not be
+automated too.
+
 ### Output
 
 Per iteration: an evidence bundle (console, gate state, audit excerpts, timings)
@@ -165,36 +240,69 @@ writing.
 
 Stated here rather than discovered at 3am:
 
-- **The drivers need a second sudo grant, or the as-agent probes will fail.**
-  The NOPASSWD grant covers only `/usr/local/sbin/sanctuary-drill-wrapper`. The
-  probe battery and the teardown check also run `sudo -u <agent> curl` and
-  `sudo -n pfctl -s rules` directly, which that grant does not cover. Every such
-  call uses `sudo -n`, so an unattended run FAILS FAST and says so instead of
-  sitting at a password prompt until the timeout burns the night, but the
-  grant question has to be settled (either widen it deliberately, or route
-  those probes through wrapper verbs) before the loop can produce a green
-  night. Routing them through the wrapper is the better answer; it is not built
-  yet.
+- **The as-agent probes still need a second sudo grant.** The NOPASSWD grant
+  covers only `/usr/local/sbin/sanctuary-drill-wrapper`. The pf-anchor read no
+  longer needs anything extra (it goes through the wrapper's `pf-anchor-rules`
+  verb), but the probe battery and the teardown check still run
+  `sudo -n -u <agent> curl`, which the grant does not cover. Two things are now
+  true that were not before: the probe battery asks ONCE up front and reports
+  every probe as SKIP with the reason rather than measuring nothing and calling
+  it green, and `teardown-verify.sh` reports "could not RUN the as-agent probe"
+  as DIRTY rather than as clean. **Widening the sudoers line to
+  `NOPASSWD: /usr/bin/curl` or `(ALL) NOPASSWD: ALL` is not an acceptable
+  resolution** and `sudoers.d/sanctuary-drill` records why; the supported
+  answers are a grant for exactly `sudo -u <agent-account> /usr/bin/curl`, or a
+  wrapper verb.
 - **None of the drivers has ever run against a live gate.** `run-loop.sh`,
-  `preflight.sh`, `run-probe-battery.sh`, `teardown-verify.sh` and
-  `arm-expect.exp` are written and reviewed but carry zero runtime evidence.
-  The rails are the part that is proven.
+  `preflight.sh`, `run-probe-battery.sh` and `arm-expect.exp` carry zero
+  runtime evidence against a real Sanctuary gate. `teardown-verify.sh` is the
+  exception and only partly: its verify-clean logic is now driven end to end by
+  the battery against a stubbed `sudo`, which is what makes the pf fail-closed
+  behavior a test rather than an argument. The rails are the part that is
+  proven.
+- **`N2` is not implemented and is no longer claimed.** The battery's header
+  used to declare eight probes and implement six, while a green night asserted
+  "every probe passed for the right reason". `N2` (request with no token
+  denied) belongs to the gate's fail-closed client-auth mode; this drill runs
+  the advisory peer mode, where an ordinary curl carries no
+  proxy-authorization header and the question is not meaningful. `P3` (a second
+  arm over a live confined agent is refused and the gate survives) WAS a real
+  gap and is now implemented. The loop's finding string is the battery's own
+  `PROBE=SUMMARY` line, naming what ran and what was skipped.
 - **Mini2's local short hostname is unconfirmed.** It sits in the allowlist as
   `mini2`, which is its Tailscale name. If the machine answers to something
   else, the wrapper refuses there until the list is edited and re-reviewed.
   Refusing is the correct failure mode.
-- **The path rail is inherently time-of-check-to-time-of-use exposed.** It
-  validates a path and then hands the string to a separate process. Between
-  those two moments the path could in principle be replaced. The exposure is
-  bounded by the fact that the directory is operator-owned and the loop runs as
-  the operator (so it is a self-attack, not a privilege boundary), and closing
-  it properly needs `openat`-style file-descriptor handoff, which bash cannot
-  express. Worth knowing rather than pretending otherwise.
+- **The path rail is still check-then-use, and that is now sound for a stated
+  reason rather than an accepted risk.** The rail validates a path and hands
+  the string on; what changed is that no component of that path is writable by
+  an unprivileged caller, so there is nothing to change between the two
+  moments. The previous version of this section said the exposure was "bounded
+  by the fact that the directory is operator-owned and the loop runs as the
+  operator (so it is a self-attack, not a privilege boundary), and closing it
+  properly needs `openat`-style file-descriptor handoff, which bash cannot
+  express." **Both halves of that were wrong**, and a reviewer proved it: it IS
+  a privilege boundary, because winning the race made ROOT open a real
+  fortress, and the fix needed ownership, not `openat`. If
+  `RAILS_DISPOSABLE_BASE` is ever moved back under an operator-writable
+  directory, that finding comes back with it.
 
 ## Disposable fortresses
 
-The loop mints `~/.sanctuary-loop-<stamp>-<n>` per iteration and tears it down
-each night. These carry no recovery obligation and are covered by one standing
-row in `FORTRESS_KEYS.md` rather than a row per night. The loop never runs
-`nuke`, `rotate-master` or `reset-passphrase` against anything, and the rails
-make a non-disposable target unreachable rather than merely discouraged.
+The loop mints `/private/var/sanctuary-drill/<operator>/.sanctuary-loop-<id>`
+per iteration and tears it down each night. These carry no recovery obligation
+and are covered by one standing row in `FORTRESS_KEYS.md` rather than a row per
+night. The loop never runs `nuke`, `rotate-master` or `reset-passphrase` against
+anything, and the rails make a non-disposable target unreachable rather than
+merely discouraged.
+
+**Operational cost of the root-owned base, stated plainly.** The disposable
+fortress is no longer in the operator's home and is no longer operator-owned.
+The operator can read and traverse it (it is mode 0755) but cannot write into
+it; the Sanctuary CLI runs as root under the wrapper, so the state it writes was
+root's either way. Two consequences to know about: evidence bundles still live
+under the operator's home and are unaffected, and anything that needs to WRITE
+inside a disposable fortress as the operator has to go through a wrapper verb.
+Nothing in the current ladder does. If that changes, the answer is ownership or
+permissions on the root-created leaf, NOT moving the base back into
+operator-writable space.

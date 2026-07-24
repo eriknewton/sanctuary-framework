@@ -9,12 +9,16 @@
 # about the product's confirmation gate is weakened or skipped; the loop just
 # answers it.
 #
-# Every path and account argument has ALREADY passed the rails in run-loop.sh
-# before this script is invoked, and the wrapper re-runs the full rail gauntlet
-# on its own arguments regardless. This script adds no trust.
+# Every argument has ALREADY passed the rails in run-loop.sh before this script
+# is invoked, and the wrapper re-runs the full rail gauntlet on its own
+# arguments regardless. This script adds no trust.
+#
+# It passes a RUN ID, not a path. The wrapper composes the storage path itself
+# under a root-owned base it compiled in, so there is no path here for this
+# script to get wrong.
 #
 # Usage:
-#   arm-expect.exp <wrapper> <storage> <operator-account> <agent-account> <agent-uid>
+#   arm-expect.exp <wrapper> <run-id> <operator-account> <agent-account> <agent-uid>
 
 set timeout 300
 
@@ -24,7 +28,7 @@ if {[llength $argv] != 5} {
 }
 
 set wrapper       [lindex $argv 0]
-set storage       [lindex $argv 1]
+set run_id        [lindex $argv 1]
 set operator      [lindex $argv 2]
 set agent_account [lindex $argv 3]
 set agent_uid     [lindex $argv 4]
@@ -32,8 +36,8 @@ set agent_uid     [lindex $argv 4]
 # Refuse outright rather than pass a suspicious value through to a root-run
 # wrapper. The wrapper would reject these too; failing here makes the loop log
 # say which layer noticed.
-if {![regexp {^/[^\n]*/\.sanctuary-loop-[A-Za-z0-9._-]+$} $storage]} {
-    puts "arm-expect.exp: storage path is not a disposable loop fortress: $storage"
+if {![regexp {^[A-Za-z0-9][A-Za-z0-9._-]*$} $run_id]} {
+    puts "arm-expect.exp: run id is not a plain identifier: $run_id"
     exit 2
 }
 if {![regexp {^[a-z_][a-z0-9_-]*$} $operator] || $operator eq "root"} {
@@ -54,7 +58,7 @@ if {![regexp {^[1-9][0-9]*$} $agent_uid]} {
 # and an unattended run must FAIL FAST on that rather than sit at a password
 # prompt until the timeout burns the night.
 spawn sudo -n $wrapper arm \
-    --storage $storage \
+    --run-id $run_id \
     --operator-account $operator \
     --agent-account $agent_account \
     --agent-uid $agent_uid

@@ -34,7 +34,7 @@ die() {
 
 emit() {
   cat <<'HEADER'
-#!/usr/bin/env bash
+#!/bin/bash
 #
 # sanctuary-drill-wrapper - GENERATED ARTIFACT. DO NOT EDIT.
 #
@@ -50,7 +50,30 @@ emit() {
 # This file runs as ROOT under a NOPASSWD sudoers grant. It is deliberately
 # self-contained: it sources nothing at runtime, so no write to the repo (or to
 # any other operator-writable path) can become root code execution.
+#
+# WHY THE SHEBANG IS ABSOLUTE AND WHY PATH IS THE FIRST EXECUTABLE LINE
+#
+# The 2026-07-25 re-review defeated the previous header, twice, by execution:
+#
+#   * a planted `bash` earlier in PATH substituted the INTERPRETER of a
+#     root-run artifact outright, because `#!/usr/bin/env bash` asks PATH which
+#     bash to be. Even with a well-formed PATH, on a Mac with Homebrew that
+#     selects /opt/homebrew/bin/bash, an OPERATOR-WRITABLE interpreter, to run
+#     as root. That case needs no manipulation at all.
+#   * a planted `hostname` made the wrapper print WRAPPER=ACCEPT on the
+#     operator's MacBook Air, the one machine the design says is structurally
+#     unable to run it. The "un-overridable" host denylist was exactly as
+#     strong as whatever `hostname` resolved to.
+#
+# So: an absolute interpreter, and PATH pinned to root-owned system
+# directories BEFORE any external command can run. /usr/local/bin is
+# deliberately absent; it is operator-writable on a Mac. The sudoers grant adds
+# `secure_path` as well, and lib/rails.sh resolves every security-relevant
+# command by absolute path regardless of PATH. Three layers, because two of
+# them were shown to be defeatable on their own.
 
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 set -euo pipefail
 IFS=$' \t\n'
 umask 022

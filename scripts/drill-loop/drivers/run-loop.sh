@@ -7,7 +7,7 @@
 # any API credential and nothing about it depends on a login session staying
 # alive. Intelligence enters afterwards, reading the artifacts in the morning.
 #
-#   preflight -> provision + arm -> probe battery -> teardown -> verify-clean -> capture
+#   kickstart daemons -> mint -> preflight -> arm -> probes -> teardown -> verify
 #
 # EXECUTION POLICY: MAXIMUM FORWARD PROGRESS
 #
@@ -102,10 +102,17 @@ if [ "$ITERATIONS" -lt 1 ]; then die '--iterations must be at least 1'; fi
 # HOST. Deny-first, compiled-in allowlist, fail closed. Several observed
 # identities so a machine answering to the daily driver's name under any of
 # them is refused.
-rails_assert_host_allowed \
-  "$(hostname -s 2>/dev/null || printf '')" \
-  "$(hostname -f 2>/dev/null || hostname 2>/dev/null || printf '')" \
-  || rail_stop "host rail refused $(hostname -s 2>/dev/null || printf 'unknown')"
+# The subshell is mandatory, not cosmetic: `rails__die` calls `exit`, so a
+# DIRECT call would terminate this script before `rail_stop` could print the
+# machine-readable LOOP=STOP token. Wrapping it turns the exit into a status
+# the `||` can act on, exactly as the command-substitution form does.
+# `hostname` and `scutil` go through the absolute resolver because the review
+# defeated this rail with a planted `hostname` on PATH.
+( rails_assert_host_allowed \
+    "$(rails__sys hostname -s 2>/dev/null || printf '')" \
+    "$(rails__sys hostname -f 2>/dev/null || rails__sys hostname 2>/dev/null || printf '')" \
+    "$(rails__sys scutil --get ComputerName 2>/dev/null || printf 'no-computer-name')" ) \
+  || rail_stop "host rail refused $(rails__sys hostname -s 2>/dev/null || printf 'unknown')"
 
 OPERATOR_UID="$(rails_assert_non_root_account operator "$OPERATOR")" \
   || rail_stop "operator account rejected: $OPERATOR"
@@ -115,7 +122,7 @@ AGENT_UID="$(rails_assert_account_uid agent "$AGENT" "$AGENT_UID_IN")" \
 [ -n "$AGENT_UID" ] || rail_stop 'empty agent uid after rail'
 
 if [ -n "$PASSFILE" ]; then
-  rails_assert_secret_file_perms "$PASSFILE" "$OPERATOR" \
+  ( rails_assert_secret_file_perms "$PASSFILE" "$OPERATOR" ) \
     || rail_stop "passphrase-file rail rejected: $PASSFILE"
 fi
 
@@ -128,7 +135,7 @@ cleanup_assembled() { rm -f "$ASSEMBLED"; }
 trap cleanup_assembled EXIT
 "$ROOT/build-wrapper.sh" --stdout > "$ASSEMBLED" \
   || rail_stop 'could not re-assemble the wrapper from the repo'
-rails_assert_wrapper_integrity "$ASSEMBLED" "$INSTALLED_WRAPPER" "$ROOT/wrapper.sha256" \
+( rails_assert_wrapper_integrity "$ASSEMBLED" "$INSTALLED_WRAPPER" "$ROOT/wrapper.sha256" ) \
   || rail_stop 'wrapper integrity rail refused'
 
 if [ -z "$BUILD_SHA" ]; then
@@ -164,6 +171,16 @@ json_escape() {
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
 }
 
+# The battery's own account of what it ran, verbatim, so this loop can never
+# summarize it as more than it was. The reviewed loop wrote 'every probe passed
+# for the right reason' on a zero exit, while the battery documented eight
+# probes and implemented six.
+probe_summary() {
+  local line
+  line="$(rails__sys grep -m1 '^PROBE=SUMMARY' "$1" 2>/dev/null || printf '')"
+  if [ -n "$line" ]; then printf '%s' "$line"; else printf 'the probe battery produced no SUMMARY line'; fi
+}
+
 emit_finding() {
   # emit_finding <iteration> <step> <result> <taint> <detail> <artifacts>
   printf '{"iteration":%s,"step":"%s","result":"%s","tainted_by":"%s","detail":"%s","artifacts":"%s","build_sha":"%s","ts":"%s"}\n' \
@@ -181,20 +198,59 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   mkdir -p "$IEV"
   printf 'LOOP=ITERATION n=%s evidence=%s\n' "$ITER" "$IEV"
 
-  # A fresh disposable fortress per iteration, minted under the ONLY prefix the
-  # rails allow, then re-asserted through the rail before anything uses it.
-  STORAGE_IN="$OPERATOR_HOME/.sanctuary-loop-$STAMP-$ITER"
-  STORAGE="$(rails_assert_disposable_storage "$OPERATOR_HOME" "$STORAGE_IN")" \
-    || rail_stop "storage rail rejected the minted path: $STORAGE_IN"
-  [ -n "$STORAGE" ] || rail_stop 'empty storage after rail'
+  # A fresh disposable fortress per iteration. The loop supplies a RUN ID,
+  # never a path: the ROOT wrapper composes the path itself under a root-owned
+  # base it compiled in, and creates it. This driver derives the same string
+  # locally only so it can READ the result, and re-asserts it through the rail
+  # before doing so.
+  RUN_ID="$STAMP-$ITER"
+  ( rails_assert_run_id "$RUN_ID" >/dev/null ) || rail_stop "run id rejected: $RUN_ID"
 
   # Preconditions, tracked so a failed step only skips what genuinely depends
   # on it. `armed` gates the through-gate probes; nothing gates teardown.
   ARMED=''
   TAINT=''
 
+  # --- step 0: the daemons must be on the dist under test -----------------
+  # D7 was "the gate daemon was serving a stale dist". The wrapper has had a
+  # `kickstart-daemons` verb since the first build and NO driver called it, so
+  # the spec's "daemon freshly kickstarted on the current dist" was not wired
+  # up anywhere. It is now, and preflight independently checks the result.
+  if sudo -n "$INSTALLED_WRAPPER" kickstart-daemons \
+       --run-id "$RUN_ID" --operator-account "$OPERATOR" > "$IEV/kickstart.log" 2>&1
+  then
+    emit_finding "$ITER" kickstart PASS '' 'gate and resolver daemons restarted on the current dist' "$IEV/kickstart.log"
+  else
+    emit_finding "$ITER" kickstart FAIL '' 'a daemon did not restart; the iteration would measure stale or absent code' "$IEV/kickstart.log"
+    TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
+    TAINT='kickstart'
+    if [ -n "$STOP_FIRST" ]; then NIGHT_STOPPED='kickstart'; break; fi
+    ITER=$((ITER + 1))
+    continue
+  fi
+
+  # --- step 0b: mint the disposable fortress, as root, root-owned ---------
+  if ! sudo -n "$INSTALLED_WRAPPER" mint \
+       --run-id "$RUN_ID" --operator-account "$OPERATOR" > "$IEV/mint.log" 2>&1
+  then
+    emit_finding "$ITER" mint FAIL "$TAINT" 'the wrapper could not mint the disposable fortress' "$IEV/mint.log"
+    TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
+    if [ -n "$STOP_FIRST" ]; then NIGHT_STOPPED='mint'; break; fi
+    ITER=$((ITER + 1))
+    continue
+  fi
+
+  DERIVED="$(rails_derive_disposable_storage "$RAILS_DISPOSABLE_BASE" "$OPERATOR" "$RUN_ID")" \
+    || rail_stop "run id rejected: $RUN_ID"
+  [ -n "$DERIVED" ] || rail_stop 'empty derived storage path'
+  ANCHOR="$(rails_assert_trusted_dir_chain 'operator anchor' "$RAILS_DISPOSABLE_BASE/$OPERATOR")" \
+    || rail_stop 'operator anchor is not a trusted root-owned chain'
+  STORAGE="$(rails_assert_disposable_storage "$ANCHOR" "$DERIVED")" \
+    || rail_stop "storage rail rejected the derived path: $DERIVED"
+  [ -n "$STORAGE" ] || rail_stop 'empty storage after rail'
+
   # --- step 1: preflight ---------------------------------------------------
-  if "$HERE/preflight.sh" --storage "$STORAGE" --home "$OPERATOR_HOME" \
+  if "$HERE/preflight.sh" --run-id "$RUN_ID" --operator-account "$OPERATOR" \
        --build-sha "$BUILD_SHA" --agent-uid "$AGENT_UID" \
        > "$IEV/preflight.log" 2>&1
   then
@@ -213,7 +269,7 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
 
   # --- step 2: provision + arm --------------------------------------------
   if "$ROOT/expect/arm-expect.exp" \
-       "$INSTALLED_WRAPPER" "$STORAGE" "$OPERATOR" "$AGENT" "$AGENT_UID" \
+       "$INSTALLED_WRAPPER" "$RUN_ID" "$OPERATOR" "$AGENT" "$AGENT_UID" \
        > "$IEV/arm.log" 2>&1
   then
     ARMED='yes'
@@ -228,13 +284,13 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   # Precondition: the gate is armed. Probing THROUGH a gate that never armed
   # produces cascade artifacts, not findings, so it is skipped and labeled.
   if [ -n "$ARMED" ]; then
-    if "$HERE/run-probe-battery.sh" --storage "$STORAGE" --home "$OPERATOR_HOME" \
+    if "$HERE/run-probe-battery.sh" --run-id "$RUN_ID" \
          --operator-account "$OPERATOR" --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
          --evidence-dir "$IEV" > "$IEV/probes.log" 2>&1
     then
-      emit_finding "$ITER" probes PASS "$TAINT" 'every probe passed for the right reason' "$IEV/probes.log"
+      emit_finding "$ITER" probes PASS "$TAINT" "$(probe_summary "$IEV/probes.log")" "$IEV/probes.log"
     else
-      emit_finding "$ITER" probes FAIL "$TAINT" 'one or more probes failed' "$IEV/probes.log"
+      emit_finding "$ITER" probes FAIL "$TAINT" "$(probe_summary "$IEV/probes.log")" "$IEV/probes.log"
       TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
       if [ -z "$TAINT" ]; then TAINT='probes'; fi
     fi
@@ -246,7 +302,7 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   # No precondition: teardown is attempted no matter what happened above,
   # because leaving state behind is the one thing that poisons every later
   # iteration.
-  if "$HERE/teardown-verify.sh" --storage "$STORAGE" --home "$OPERATOR_HOME" \
+  if "$HERE/teardown-verify.sh" --run-id "$RUN_ID" \
        --operator-account "$OPERATOR" --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
        --evidence-dir "$IEV" > "$IEV/teardown.log" 2>&1
   then

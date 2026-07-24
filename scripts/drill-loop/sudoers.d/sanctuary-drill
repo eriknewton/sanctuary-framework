@@ -5,20 +5,42 @@
 #
 # Install (Erik, one time, on a drill host only):
 #   sudo scripts/drill-loop/install-wrapper.sh
-#   sudo visudo -f /etc/sudoers.d/sanctuary-drill     # paste the line below
+#   sudo visudo -f /etc/sudoers.d/sanctuary-drill     # paste the lines below
 #   sudo chmod 0440 /etc/sudoers.d/sanctuary-drill
 #   sudo visudo -c                                    # syntax check
 #
 # WHY THERE IS NO env_keep
 #
-# The wrapper's host allowlist and disposable-path allowlist are compiled into
-# the assembled artifact, never read from the environment. sudo's default
-# env_reset then strips everything the caller might try to smuggle in. That
-# combination is the reason the host rail survived adversarial review: on the
-# operator's daily-driver MacBook there is no variable, flag, or argument that
-# can make the wrapper run. Adding env_keep here would give that away.
+# The wrapper's host allowlist, its disposable-path base and the fortress
+# denylist are compiled into the assembled artifact, never read from the
+# environment. sudo's default env_reset then strips everything the caller might
+# try to smuggle in. Adding env_keep here would give that away.
 #
-# WHY THE TARGET IS ONE ABSOLUTE PATH
+# WHY secure_path IS SET
+#
+# env_reset does NOT by itself replace PATH on macOS, which historically ships
+# no secure_path (this is why `sudo make install` picks up a user's PATH on a
+# Mac and not on Debian). The 2026-07-25 re-review used that to defeat the host
+# rail: a planted `hostname` earlier in PATH made the wrapper print
+# WRAPPER=ACCEPT on the operator's daily-driver MacBook Air. secure_path is one
+# of the three layers that closes it; the other two are in the artifact itself
+# (an absolute shebang plus a pinned PATH as its first executable line, and
+# absolute resolution of every security-relevant command inside lib/rails.sh).
+#
+# WHAT IS AND IS NOT TRUE ABOUT THE DAILY DRIVER
+#
+# TRUE: no variable, flag, or argument accepted by this wrapper can add a host
+# to its allowlist or remove one from its denylist. That claim survived
+# adversarial review twice, over more than a dozen argument shapes.
+#
+# NOT a claim this file makes any more: that nothing whatsoever can make the
+# wrapper run on the MacBook. A planted FILE did, through PATH, and the honest
+# statement after the fix is narrower. The wrapper resolves its host identity
+# with absolute paths under a pinned PATH, so PATH manipulation no longer
+# reaches it; someone who can already write to /usr/bin or /sbin on the
+# operator's machine has root there by other means anyway.
+#
+# WHY THE TARGET IS ONE ABSOLUTE PATH, AND WHY IT MUST STAY THAT WAY
 #
 # The grant names exactly one root-owned file. install-wrapper.sh writes it
 # root:wheel 0755 into /usr/local/sbin (a root-owned directory), and the driver
@@ -26,6 +48,16 @@
 # hash and a fresh assembly from the repo. So the grant cannot be pointed at
 # operator-writable content.
 #
+# The probe battery also wants `sudo -u <agent> curl`, which this grant does
+# NOT cover, and it must not be resolved by widening this file. Granting
+# `NOPASSWD: /usr/bin/curl` or `(ALL) NOPASSWD: ALL` hands over a far broader
+# primitive than the wrapper ever did and would make every rail in this harness
+# beside the point. The supported resolutions are a separate, narrowly scoped
+# grant for exactly `sudo -u <agent-account> /usr/bin/curl`, or routing the
+# probe through a wrapper verb. Recorded here so a future session under time
+# pressure does not take the easy road.
+#
 # Replace agentmac with the drill host's operator account if it differs.
 
+Defaults:agentmac secure_path="/usr/bin:/bin:/usr/sbin:/sbin"
 agentmac ALL=(root) NOPASSWD: /usr/local/sbin/sanctuary-drill-wrapper
