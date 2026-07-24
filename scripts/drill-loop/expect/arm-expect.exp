@@ -1,0 +1,80 @@
+#!/usr/bin/env expect
+#
+# arm-expect.exp - drive the exclusive-egress arm through its TTY confirmation.
+#
+# Arming asks for an interactive confirmation on a real terminal, which is
+# correct: it is a destructive, host-wide change and a human should have to say
+# so. An unattended loop still needs to exercise that exact code path rather
+# than some bypass, so expect supplies the confirmation over a pty. Nothing
+# about the product's confirmation gate is weakened or skipped; the loop just
+# answers it.
+#
+# Every path and account argument has ALREADY passed the rails in run-loop.sh
+# before this script is invoked, and the wrapper re-runs the full rail gauntlet
+# on its own arguments regardless. This script adds no trust.
+#
+# Usage:
+#   arm-expect.exp <wrapper> <storage> <operator-account> <agent-account> <agent-uid>
+
+set timeout 300
+
+if {[llength $argv] != 5} {
+    puts "arm-expect.exp: expected 5 arguments, got [llength $argv]"
+    exit 2
+}
+
+set wrapper       [lindex $argv 0]
+set storage       [lindex $argv 1]
+set operator      [lindex $argv 2]
+set agent_account [lindex $argv 3]
+set agent_uid     [lindex $argv 4]
+
+# Refuse outright rather than pass a suspicious value through to a root-run
+# wrapper. The wrapper would reject these too; failing here makes the loop log
+# say which layer noticed.
+if {![regexp {^/[^\n]*/\.sanctuary-loop-[A-Za-z0-9._-]+$} $storage]} {
+    puts "arm-expect.exp: storage path is not a disposable loop fortress: $storage"
+    exit 2
+}
+if {![regexp {^[a-z_][a-z0-9_-]*$} $operator] || $operator eq "root"} {
+    puts "arm-expect.exp: bad operator account: $operator"
+    exit 2
+}
+if {![regexp {^[a-z_][a-z0-9_-]*$} $agent_account]} {
+    puts "arm-expect.exp: bad agent account: $agent_account"
+    exit 2
+}
+if {![regexp {^[1-9][0-9]*$} $agent_uid]} {
+    puts "arm-expect.exp: agent uid must be a positive integer: $agent_uid"
+    exit 2
+}
+
+spawn sudo $wrapper arm \
+    --storage $storage \
+    --operator-account $operator \
+    --agent-account $agent_account \
+    --agent-uid $agent_uid
+
+expect {
+    -re {(?i)refusing|WRAPPER=REJECT} {
+        puts "\narm-expect.exp: the wrapper refused; not answering any prompt"
+        exit 1
+    }
+    -re {(?i)type .?ARM.? to confirm} {
+        send "ARM\r"
+        exp_continue
+    }
+    -re {(?i)\(y/n\)|\[y/N\]|continue\?} {
+        send "y\r"
+        exp_continue
+    }
+    timeout {
+        puts "\narm-expect.exp: timed out waiting for the arm to complete"
+        exit 1
+    }
+    eof
+}
+
+catch wait result
+set exit_status [lindex $result 3]
+exit $exit_status

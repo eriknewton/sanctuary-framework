@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ai.sanctuary.drill-loop - nightly autonomous drill loop.
+
+  NOT LOADED BY THIS REPO. Documented, reviewable, and deliberately unloaded:
+  loading it belongs with the sudoers grant, after an independent review
+  confirms the rails fail closed.
+
+  Install on a drill host only:
+    cp scripts/drill-loop/ai.sanctuary.drill-loop.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.sanctuary.drill-loop.plist
+
+  WHY EVERY PATH HERE IS ABSOLUTE
+
+  This is the D9 / #986 lesson written down as a file. A ProgramArguments entry
+  of a bare `node` or `bash` resolves fine from an interactive shell and does
+  not resolve under launchd, which inherits almost no PATH. That mismatch cost
+  a full drill session: the plist looked correct, the command worked when typed
+  by hand, and the daemon silently never started. Preflight now checks the
+  installed daemon plists for the same mistake.
+
+  It runs as a LaunchAgent in the operator's GUI session rather than a
+  LaunchDaemon, because the loop must run as the operator (not root) and only
+  escalates through the reviewed wrapper.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.sanctuary.drill-loop</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/agentmac/Code/Sanctuary/scripts/drill-loop/drivers/run-loop.sh</string>
+    <string>--mode</string>
+    <string>sweep</string>
+    <string>--iterations</string>
+    <string>20</string>
+    <string>--operator-account</string>
+    <string>agentmac</string>
+    <string>--agent-account</string>
+    <string>sanctuary-agent</string>
+    <string>--agent-uid</string>
+    <string>503</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>2</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/agentmac/sanctuary-drill-loop-evidence/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/agentmac/sanctuary-drill-loop-evidence/launchd.err.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/agentmac/Code/Sanctuary</string>
+
+  <!--
+    No environment override for the rails. The host allowlist, the disposable
+    path prefix and the fortress denylist are compiled into the wrapper, and
+    sudo carries no env_keep, so nothing set here could reach them anyway. PATH
+    is set only so the ordinary tools the drivers call resolve under launchd.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin</string>
+  </dict>
+</dict>
+</plist>

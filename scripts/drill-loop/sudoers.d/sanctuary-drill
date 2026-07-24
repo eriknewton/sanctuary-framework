@@ -1,0 +1,31 @@
+# /etc/sudoers.d/sanctuary-drill
+#
+# NOT INSTALLED BY THIS REPO. This file is here so the exact grant is
+# reviewable in version control before anybody types it into visudo.
+#
+# Install (Erik, one time, on a drill host only):
+#   sudo scripts/drill-loop/install-wrapper.sh
+#   sudo visudo -f /etc/sudoers.d/sanctuary-drill     # paste the line below
+#   sudo chmod 0440 /etc/sudoers.d/sanctuary-drill
+#   sudo visudo -c                                    # syntax check
+#
+# WHY THERE IS NO env_keep
+#
+# The wrapper's host allowlist and disposable-path allowlist are compiled into
+# the assembled artifact, never read from the environment. sudo's default
+# env_reset then strips everything the caller might try to smuggle in. That
+# combination is the reason the host rail survived adversarial review: on the
+# operator's daily-driver MacBook there is no variable, flag, or argument that
+# can make the wrapper run. Adding env_keep here would give that away.
+#
+# WHY THE TARGET IS ONE ABSOLUTE PATH
+#
+# The grant names exactly one root-owned file. install-wrapper.sh writes it
+# root:wheel 0755 into /usr/local/sbin (a root-owned directory), and the driver
+# refuses to run unless the installed file's SHA-256 matches both the committed
+# hash and a fresh assembly from the repo. So the grant cannot be pointed at
+# operator-writable content.
+#
+# Replace agentmac with the drill host's operator account if it differs.
+
+agentmac ALL=(root) NOPASSWD: /usr/local/sbin/sanctuary-drill-wrapper
