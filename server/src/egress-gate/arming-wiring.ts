@@ -846,8 +846,9 @@ async function productionBringUp(
   // 2026-07-24 S5-3 fix (Option 1): install + (re)load the PRIVILEGED
   // peer-resolver daemon (root) BEFORE the gate daemon starts serving, so the
   // gate's peer lookups have somewhere to dial from its very first CONNECT.
-  // Mirrors the gate daemon's own bootstrap sequence below, one daemon per
-  // confined agent (see `peer-resolver-daemon.ts`).
+  // Shares the gate daemon's reload chokepoint below
+  // ({@link reloadLaunchdDaemonForBringUp}), one daemon per confined agent
+  // (see `peer-resolver-daemon.ts`).
   //
   // Fix-round BLOCKER (2026-07-24): `--gate-port=${committed.gate_port}` is
   // baked into THIS plist's argv from the SAME `committed` generation that
@@ -887,10 +888,10 @@ async function productionBringUp(
   await reloadPeerResolverDaemonForBringUp({ agentUid: input.agentUid, resolverPlistPath });
 
   // Hand the committed port from the root placeholder to the gate daemon:
-  // release, install the gate daemon plist, bootstrap, then wait for the
-  // runtime state naming EXACTLY this {port, generation} and verify the
-  // listener's owner (fail-closed: any mismatch throws; the S5-5 barrier will
-  // ALSO re-verify before unpark).
+  // release, install the gate daemon plist, RELOAD (force-replace the running
+  // process), then wait for the runtime state naming EXACTLY this
+  // {port, generation} and verify the listener's owner (fail-closed: any
+  // mismatch throws; the S5-5 barrier will ALSO re-verify before unpark).
   if (lastBinding !== null) {
     await (lastBinding as GateBinding).release();
   }
@@ -912,14 +913,21 @@ async function productionBringUp(
     }),
     { mode: 0o644 },
   );
-  const bootstrap = await runLaunchctl(["bootstrap", "system", plistPath]);
-  if (bootstrap.code !== 0 && !/already bootstrapped|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)) {
-    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
-  }
-  const kick = await runLaunchctl(["kickstart", `system/${label}`]);
-  if (kick.code !== 0) {
-    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
-  }
+  // FIX-ROUND-4 BLOCKER (2026-07-25, hardware-proven N=2). The gate plist argv
+  // is unchanged (`--agent-uid` only; the gate reads its port/generation from
+  // committed state), so on a repair/rotation the OLD gate daemon is still
+  // loaded+running. A raw `bootstrap` no-ops ("already bootstrapped") and a
+  // raw `kickstart` (no `-k`) no-ops (already running), so the gate kept
+  // serving the OLD committed generation while pf confined the agent to the
+  // NEW port -> the agent was strangled. Route through the SAME
+  // bootout->settle->bootstrap->kickstart chokepoint the peer-resolver reload
+  // uses, so the running gate is force-replaced and re-reads the new committed
+  // generation. Fail CLOSED: if the old gate will not settle/reap, this THROWS
+  // rather than arm over an unproven-reaped gate. (The boot path's benign
+  // `Bootstrap failed: 5: Input/output error` tolerance is deliberately NOT
+  // carried here: post-settle, an IO error is a real failure, not the
+  // already-loaded race the boot path may legitimately hit.)
+  await reloadLaunchdDaemonForBringUp({ label, plistPath });
   // Change 2: hand waitForGateRuntime this gate daemon's own stderr log path so
   // a timeout surfaces the daemon's REAL exit reason (bind/spawn failure)
   // instead of a bare "runtime state never appeared". Deriving the path reuses
@@ -1240,13 +1248,14 @@ export async function bootstrapPeerResolverDaemonForBoot(input: {
 /**
  * {@link agentHarnessDaemonStatus}'s `launchctl print` parse, generalized to
  * an arbitrary label and an injected `run` function (fix-round 3,
- * 2026-07-24). The peer-resolver reload below needs the SAME
- * running/not-running read the harness teardown uses -- through
- * `runLaunchctlFn` (this module's test seam) rather than `HarnessDaemonOps`,
- * and against `peerResolverDaemonLabel(agentUid)` rather than the fixed
- * harness label.
+ * 2026-07-24; label-neutralized fix-round 4, 2026-07-25). Both the
+ * peer-resolver reload AND the gate-daemon reload (via
+ * {@link reloadLaunchdDaemonForBringUp}) need the SAME running/not-running
+ * settle read the harness teardown uses -- through `runLaunchctlFn` (this
+ * module's test seam) rather than `HarnessDaemonOps`, and against an arbitrary
+ * `system/<label>` rather than the fixed harness label.
  */
-async function peerResolverDaemonStatus(
+async function launchdDaemonStatusByLabel(
   run: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>,
   label: string,
 ): Promise<HarnessDaemonStatus> {
@@ -1269,21 +1278,27 @@ async function peerResolverDaemonStatus(
 }
 
 /**
- * (RE)LOAD one agent's PEER-RESOLVER daemon during a production bring-up
- * (install / repair / rotation), where the on-disk resolver plist has just
- * been REWRITTEN with a possibly-new `--gate-port` argv.
+ * (RE)LOAD one agent's privileged launchd daemon during a production bring-up
+ * (install / repair / rotation), where the on-disk plist has just been
+ * REWRITTEN. THE SHARED CHOKEPOINT for the S5 daemon-reload class: both the
+ * peer-resolver reload ({@link reloadPeerResolverDaemonForBringUp}) and the
+ * gate-daemon reload (in {@link productionBringUp}) route through here, so a
+ * third daemon can never reintroduce the reap-race / stale-argv class this
+ * function's history is a record of.
  *
  * FIX-ROUND-2 BLOCKER (2026-07-24 re-gate). The reload must actually REPLACE
  * the loaded launchd job definition. A plain `launchctl bootstrap` of an
  * ALREADY-bootstrapped label does NOT swap in the rewritten plist's argv, and
  * a plain `launchctl kickstart` (no `-k`) does NOT restart an already-running
  * process. So after a repair/rotation that changes the gate port, the RUNNING
- * resolver would keep its OLD `--gate-port` and match peers against a stale
- * port -- the fail-open the re-gate caught. The fix: `bootout` the old job
- * FIRST, THEN bootstrap the rewritten plist + kickstart, so the new argv is
- * guaranteed loaded on EVERY bring-up. The v2 matched-port-in-response client
- * reject (`peer-resolver-protocol.ts`) is the FAIL-CLOSED backstop if a
- * reload is ever missed.
+ * daemon would keep its OLD committed generation and serve a stale port -- the
+ * peer-resolver fail-open the re-gate caught, and (fix-round 4, 2026-07-25) the
+ * hardware-proven gate-daemon strangle: `--repair-egress-gate` rotated the pf
+ * anchor + resolver to a fresh port but the raw `bootstrap+kickstart` below
+ * no-op'd on the still-running gate, so pf confined the agent to a port
+ * nothing served. The fix: `bootout` the old job FIRST, THEN bootstrap the
+ * rewritten plist + kickstart, so the new process is guaranteed to come up and
+ * re-read the new committed generation on EVERY bring-up.
  *
  * FIX-ROUND-3 (2026-07-24 THIRD re-gate, both lenses, SOUND-WITH-FIXES). The
  * round-2 fix above tolerated a not-loaded bootout and then went STRAIGHT to
@@ -1297,29 +1312,33 @@ async function peerResolverDaemonStatus(
  * a moment later (F1). This mirrors the harness teardown's SAME two-part fix:
  * tolerate EINPROGRESS same as not-loaded, then SETTLE via
  * `launchctl print` (reusing {@link awaitHarnessStoppedVia}, the harness
- * module's own settle loop, against a resolver-specific sampler) BEFORE
+ * module's own settle loop, against {@link launchdDaemonStatusByLabel}) BEFORE
  * bootstrapping, and fail closed -- refuse the bring-up -- if the old job
- * will not settle. Refusing to arm over a resolver that cannot be proven
- * reloaded is correct: an armed-but-stale resolver would strangle the agent,
+ * will not settle. Refusing to arm over a daemon that cannot be proven
+ * reloaded is correct: an armed-but-stale daemon would strangle the agent,
  * and refusing to arm is a louder, more recoverable failure than that.
  *
  * Once the settle loop has PROVEN the label unloaded, a bootstrap that
  * reports "already loaded" is no longer a legitimate no-op (unlike the boot
  * path, which may race a concurrent load) -- it means the print readback was
- * wrong, so it is treated as an error like any other bootstrap failure.
+ * wrong, so it is treated as an error like any other bootstrap failure. This
+ * is why the strict semantics here deliberately do NOT carry the boot path's
+ * `Bootstrap failed: 5: Input/output error` tolerance: post-settle, an IO
+ * error is a real failure, not the benign already-loaded race.
  *
- * The BOOT path ({@link bootstrapPeerResolverDaemonForBoot}) deliberately does
- * NOT bootout-first: a reboot re-launches from the CURRENT on-disk plist and
- * nothing rewrites it there, so argv cannot drift.
+ * The BOOT paths ({@link bootstrapPeerResolverDaemonForBoot},
+ * {@link bootstrapGateDaemonForBoot}) deliberately do NOT bootout-first: a
+ * reboot re-launches from the CURRENT on-disk plist and nothing rewrites it
+ * there, so argv cannot drift.
  */
-export async function reloadPeerResolverDaemonForBringUp(input: {
-  agentUid: number;
-  resolverPlistPath: string;
+export async function reloadLaunchdDaemonForBringUp(input: {
+  label: string;
+  plistPath: string;
   runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
   sleepMs?: (ms: number) => Promise<void>;
 }): Promise<void> {
   const run = input.runLaunchctlFn ?? runLaunchctl;
-  const label = peerResolverDaemonLabel(input.agentUid);
+  const label = input.label;
   // Force the loaded job definition to be replaced: bootout the old one
   // FIRST. A not-loaded bootout (clean first install, nothing running yet)
   // is success, and an EINPROGRESS bootout (the stop was accepted and is
@@ -1334,23 +1353,23 @@ export async function reloadPeerResolverDaemonForBringUp(input: {
   // on Mini1; see `harness-daemon.ts:406-427`). Re-sample `launchctl print`
   // until the job is proven not-running BEFORE bootstrapping, so bootstrap
   // loads the NEW argv instead of no-op'ing on "already loaded".
-  const after = await awaitHarnessStoppedVia(() => peerResolverDaemonStatus(run, label), input.sleepMs);
+  const after = await awaitHarnessStoppedVia(() => launchdDaemonStatusByLabel(run, label), input.sleepMs);
   if (!after.known) {
     throw new Error(
       `launchctl print system/${label} did not return a trustworthy status after bootout; refusing to bring up ` +
-        "the peer resolver against unknown launchd state (the OLD resolver may still be serving a stale gate port)",
+        "the daemon against unknown launchd state (the OLD daemon may still be serving a stale gate generation)",
     );
   }
   if (after.running) {
     throw new Error(
-      `system/${label} is STILL RUNNING after bootout; refusing to bring up the peer resolver rather than arm ` +
-        "the agent over a resolver that may still answer with the OLD gate port",
+      `system/${label} is STILL RUNNING after bootout; refusing to bring up the daemon rather than arm ` +
+        "the agent over a daemon that may still serve the OLD gate generation",
     );
   }
   // Proven unloaded: an "already loaded"-shaped bootstrap result here would
   // contradict the readback above, so it is no longer a tolerated no-op --
   // treat any bootstrap failure as an error.
-  const bootstrap = await run(["bootstrap", "system", input.resolverPlistPath]);
+  const bootstrap = await run(["bootstrap", "system", input.plistPath]);
   if (bootstrap.code !== 0) {
     throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
   }
@@ -1358,6 +1377,29 @@ export async function reloadPeerResolverDaemonForBringUp(input: {
   if (kick.code !== 0) {
     throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
   }
+}
+
+/**
+ * (RE)LOAD one agent's PEER-RESOLVER daemon during a production bring-up. Thin
+ * wrapper over the shared {@link reloadLaunchdDaemonForBringUp} chokepoint
+ * (fix-round 4, 2026-07-25): the resolver plist has just been REWRITTEN with a
+ * possibly-new `--gate-port` argv, so the reload must force-replace the running
+ * job. The v2 matched-port-in-response client reject
+ * (`peer-resolver-protocol.ts`) is the FAIL-CLOSED backstop if a reload is ever
+ * missed. See the chokepoint's doc for the full round-2/3 rationale.
+ */
+export async function reloadPeerResolverDaemonForBringUp(input: {
+  agentUid: number;
+  resolverPlistPath: string;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  sleepMs?: (ms: number) => Promise<void>;
+}): Promise<void> {
+  await reloadLaunchdDaemonForBringUp({
+    label: peerResolverDaemonLabel(input.agentUid),
+    plistPath: input.resolverPlistPath,
+    runLaunchctlFn: input.runLaunchctlFn,
+    sleepMs: input.sleepMs,
+  });
 }
 
 /**
