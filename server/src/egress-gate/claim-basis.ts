@@ -253,6 +253,8 @@ export type ClaimSiteId =
   | "arming-wiring.posture-port-owner-verified"
   | "arming-wiring.gate-account-home-layout"
   | "arming-wiring.gate-plist-exists"
+  | "arming-wiring.peer-resolver-status"
+  | "arming-wiring.peer-resolver-reload-settled"
   // --- egress-gate, other modules ---
   | "anchor-registry.apply-union-flush"
   | "pf-anchor.arm"
@@ -1112,6 +1114,32 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     // count it as an observed claim.
     branches: "single",
   },
+  // FIX-ROUND-3 (2026-07-24 THIRD re-gate, both lenses SOUND-WITH-FIXES): the
+  // peer-resolver reload now needs the SAME `launchctl print` status parse
+  // `harness-daemon.status` already carries for the harness's own label, just
+  // pointed at `peerResolverDaemonLabel(agentUid)` through the injected `run`
+  // function instead of `HarnessDaemonOps`. Same shape, same basis.
+  "arming-wiring.peer-resolver-status": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "peerResolverDaemonStatus",
+    claim: "launchd knows / does not know this resolver job, and it has this pid",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim: "launchd does NOT know this resolver job, or its state is unknowable",
+      basis: "observed",
+    },
+  },
+  "arming-wiring.peer-resolver-reload-settled": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "reloadPeerResolverDaemonForBringUp",
+    claim: "the old resolver job settled to stopped before the rewritten plist was bootstrapped",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "compute",
+    branches: "single",
+  },
 
   // ------------------------------------------------- other egress-gate mods
   "arming-wiring.contextless-repark-claim": {
@@ -1721,7 +1749,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/unprovision.ts`]: 4,
   [`${CW}/verify.ts`]: 1,
   [`${EG}/anchor-registry.ts`]: 0,
-  [`${EG}/arming-wiring.ts`]: 22,
+  [`${EG}/arming-wiring.ts`]: 28,
   [`${EG}/claim-basis.ts`]: 3,
   [`${EG}/drift-guard.ts`]: 0,
   [`${EG}/exec-runner.ts`]: 0,

@@ -79,8 +79,11 @@ import {
   AGENT_HARNESS_DAEMON_PLIST_PATH,
   agentHarnessDaemonStatus,
   agentHarnessDaemonStableRunning,
+  awaitHarnessStoppedVia,
   installAgentHarnessDaemon,
+  launchctlBootoutWasInProgress,
   launchctlBootoutWasNotLoaded,
+  launchctlPrintWasNotLoaded,
   planAgentHarnessDaemonInstall,
   readAgentHarnessJobDisabledOverride,
   setAgentHarnessJobDisabled,
@@ -1235,6 +1238,37 @@ export async function bootstrapPeerResolverDaemonForBoot(input: {
 }
 
 /**
+ * {@link agentHarnessDaemonStatus}'s `launchctl print` parse, generalized to
+ * an arbitrary label and an injected `run` function (fix-round 3,
+ * 2026-07-24). The peer-resolver reload below needs the SAME
+ * running/not-running read the harness teardown uses -- through
+ * `runLaunchctlFn` (this module's test seam) rather than `HarnessDaemonOps`,
+ * and against `peerResolverDaemonLabel(agentUid)` rather than the fixed
+ * harness label.
+ */
+async function peerResolverDaemonStatus(
+  run: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>,
+  label: string,
+): Promise<HarnessDaemonStatus> {
+  let result: { code: number; stdout: string; stderr: string };
+  try {
+    result = await run(["print", `system/${label}`]);
+  } catch {
+    return { known: false, installed: false, running: false };
+  }
+  if (result.code !== 0) {
+    return launchctlPrintWasNotLoaded(result)
+      ? { known: true, installed: false, running: false }
+      : { known: false, installed: false, running: false };
+  }
+  const pidMatch = /^\s*pid\s*=\s*(\d+)\s*$/m.exec(result.stdout);
+  if (pidMatch) {
+    return { known: true, installed: true, running: true, pid: Number(pidMatch[1]) };
+  }
+  return { known: true, installed: true, running: false };
+}
+
+/**
  * (RE)LOAD one agent's PEER-RESOLVER daemon during a production bring-up
  * (install / repair / rotation), where the on-disk resolver plist has just
  * been REWRITTEN with a possibly-new `--gate-port` argv.
@@ -1246,13 +1280,33 @@ export async function bootstrapPeerResolverDaemonForBoot(input: {
  * process. So after a repair/rotation that changes the gate port, the RUNNING
  * resolver would keep its OLD `--gate-port` and match peers against a stale
  * port -- the fail-open the re-gate caught. The fix: `bootout` the old job
- * FIRST (a not-loaded bootout is success -- mirrors the boot bootstrap's
- * already-loaded tolerance, so a clean first install does not refuse), THEN
- * bootstrap the rewritten plist + kickstart, so the new argv is guaranteed
- * loaded on EVERY bring-up. The v2 matched-port-in-response client reject
- * (`peer-resolver-protocol.ts`) is the FAIL-CLOSED backstop if a reload is
- * ever missed. Throws on a genuine launchctl failure -- the caller aborts the
- * bring-up rather than serve over a possibly-stale resolver.
+ * FIRST, THEN bootstrap the rewritten plist + kickstart, so the new argv is
+ * guaranteed loaded on EVERY bring-up. The v2 matched-port-in-response client
+ * reject (`peer-resolver-protocol.ts`) is the FAIL-CLOSED backstop if a
+ * reload is ever missed.
+ *
+ * FIX-ROUND-3 (2026-07-24 THIRD re-gate, both lenses, SOUND-WITH-FIXES). The
+ * round-2 fix above tolerated a not-loaded bootout and then went STRAIGHT to
+ * bootstrap -- exactly the shape `uninstallAgentHarnessDaemon` had before ITS
+ * own fix-round 2/3 (`harness-daemon.ts:406-427`): a bootout's accepted exit
+ * does not prove the OLD process is reaped, so a plain bootstrap of a
+ * still-loaded label no-ops (the running job keeps its stale argv) while
+ * reporting success (F2, the reap race). Separately, a TRANSIENT EINPROGRESS
+ * bootout (the stop was accepted and is still running down) matched neither
+ * tolerance and threw, spuriously aborting a bring-up that would have settled
+ * a moment later (F1). This mirrors the harness teardown's SAME two-part fix:
+ * tolerate EINPROGRESS same as not-loaded, then SETTLE via
+ * `launchctl print` (reusing {@link awaitHarnessStoppedVia}, the harness
+ * module's own settle loop, against a resolver-specific sampler) BEFORE
+ * bootstrapping, and fail closed -- refuse the bring-up -- if the old job
+ * will not settle. Refusing to arm over a resolver that cannot be proven
+ * reloaded is correct: an armed-but-stale resolver would strangle the agent,
+ * and refusing to arm is a louder, more recoverable failure than that.
+ *
+ * Once the settle loop has PROVEN the label unloaded, a bootstrap that
+ * reports "already loaded" is no longer a legitimate no-op (unlike the boot
+ * path, which may race a concurrent load) -- it means the print readback was
+ * wrong, so it is treated as an error like any other bootstrap failure.
  *
  * The BOOT path ({@link bootstrapPeerResolverDaemonForBoot}) deliberately does
  * NOT bootout-first: a reboot re-launches from the CURRENT on-disk plist and
@@ -1262,20 +1316,42 @@ export async function reloadPeerResolverDaemonForBringUp(input: {
   agentUid: number;
   resolverPlistPath: string;
   runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  sleepMs?: (ms: number) => Promise<void>;
 }): Promise<void> {
   const run = input.runLaunchctlFn ?? runLaunchctl;
   const label = peerResolverDaemonLabel(input.agentUid);
-  // Force the loaded job definition to be replaced: bootout the old one FIRST.
-  // A not-loaded bootout (clean first install, nothing running yet) is success.
+  // Force the loaded job definition to be replaced: bootout the old one
+  // FIRST. A not-loaded bootout (clean first install, nothing running yet)
+  // is success, and an EINPROGRESS bootout (the stop was accepted and is
+  // still running down) is not a failure either -- the settle loop below
+  // waits it out rather than throwing on a transient in-flight stop.
   const bootout = await run(["bootout", `system/${label}`]);
-  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout) && !launchctlBootoutWasInProgress(bootout)) {
     throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
   }
+  // SETTLE BEFORE BOOTSTRAP: a tolerated bootout does not prove the old
+  // process is reaped (the exact lesson `uninstallAgentHarnessDaemon` learned
+  // on Mini1; see `harness-daemon.ts:406-427`). Re-sample `launchctl print`
+  // until the job is proven not-running BEFORE bootstrapping, so bootstrap
+  // loads the NEW argv instead of no-op'ing on "already loaded".
+  const after = await awaitHarnessStoppedVia(() => peerResolverDaemonStatus(run, label), input.sleepMs);
+  if (!after.known) {
+    throw new Error(
+      `launchctl print system/${label} did not return a trustworthy status after bootout; refusing to bring up ` +
+        "the peer resolver against unknown launchd state (the OLD resolver may still be serving a stale gate port)",
+    );
+  }
+  if (after.running) {
+    throw new Error(
+      `system/${label} is STILL RUNNING after bootout; refusing to bring up the peer resolver rather than arm ` +
+        "the agent over a resolver that may still answer with the OLD gate port",
+    );
+  }
+  // Proven unloaded: an "already loaded"-shaped bootstrap result here would
+  // contradict the readback above, so it is no longer a tolerated no-op --
+  // treat any bootstrap failure as an error.
   const bootstrap = await run(["bootstrap", "system", input.resolverPlistPath]);
-  if (
-    bootstrap.code !== 0 &&
-    !/already bootstrapped|service already loaded|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)
-  ) {
+  if (bootstrap.code !== 0) {
     throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
   }
   const kick = await run(["kickstart", `system/${label}`]);
