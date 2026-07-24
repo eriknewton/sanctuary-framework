@@ -130,7 +130,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
       const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("connect");
-      emitter.emit("data", encodePeerResolveResponse({ v: 1, ok: false, reason: "rate_limited" }));
+      emitter.emit("data", encodePeerResolveResponse({ v: 2, ok: false, reason: "rate_limited" }));
       await expect(promise).resolves.toEqual({ code: 127, stdout: "" });
     });
   });
@@ -143,7 +143,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
       const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("connect");
-      emitter.emit("data", encodePeerResolveResponse({ v: 1, ok: true, peer: { uid: 502, pid: 20439 } }));
+      emitter.emit("data", encodePeerResolveResponse({ v: 2, ok: true, peer: { uid: 502, pid: 20439 }, gatePort: GATE_PORT }));
       const result = await promise;
       expect(result.code).toBe(0);
       expect(parseLsofPeer(result.stdout, 52344, /* selfPid */ 1, GATE_PORT)).toEqual({ pid: 20439, uid: 502 });
@@ -156,10 +156,54 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
       const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("connect");
-      emitter.emit("data", encodePeerResolveResponse({ v: 1, ok: true, peer: null }));
+      emitter.emit("data", encodePeerResolveResponse({ v: 2, ok: true, peer: null, gatePort: GATE_PORT }));
       const result = await promise;
       expect(result).toEqual({ code: 0, stdout: "" });
       expect(parseLsofPeer(result.stdout, 52344, 1, GATE_PORT)).toBeNull();
+    });
+  });
+
+  describe("SECURITY (fix-round-2 BLOCKER): reject a resolved answer whose matched gatePort drifted from this gate's own policy port", () => {
+    it("fail-before/pass-after: a resolved AGENT peer whose response gatePort != the client's own gatePort is REJECTED (synthetic failure), never synthesized into an agent-uid match", async () => {
+      // The stale-resolver wrong-ALLOW: a resolver still matching an OLD port
+      // (say A) answers `{ok:true, peer:{uid:AGENT}, gatePort:A}`, but THIS
+      // gate now enforces port B. Pre-fix (no port check) the client would
+      // synthesize an agent-uid stdout stamped with B and hand back a match ->
+      // wrong-ALLOW at decideGateClientAuth. Post-fix the client rejects on
+      // A != B and returns the synthetic non-zero failure -> peer_unresolved
+      // deny. This test FAILS on the pre-fix client (which returns
+      // {code:0, stdout:<agent-uid record>}) and PASSES after.
+      const emitter = new EventEmitter() as unknown as Socket;
+      (emitter as unknown as { write: () => boolean; destroy: () => void }).write = () => true;
+      (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
+      const promise = runner.run("lsof", LSOF_ARGS(52344));
+      emitter.emit("connect");
+      // Daemon matched against a DIFFERENT (stale) port than this gate's own.
+      emitter.emit(
+        "data",
+        encodePeerResolveResponse({ v: 2, ok: true, peer: { uid: AGENT_UID, pid: 20439 }, gatePort: GATE_PORT + 1 }),
+      );
+      const result = await promise;
+      expect(result).toEqual({ code: 127, stdout: "" });
+      // Belt-and-suspenders: whatever came back must NOT parse to the agent uid.
+      expect(parseLsofPeer(result.stdout, 52344, 1, GATE_PORT)).toBeNull();
+    });
+
+    it("the matching path is UNCHANGED: a resolved peer whose response gatePort EQUALS the client's own gatePort still synthesizes an agent-uid stdout", async () => {
+      const emitter = new EventEmitter() as unknown as Socket;
+      (emitter as unknown as { write: () => boolean; destroy: () => void }).write = () => true;
+      (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
+      const promise = runner.run("lsof", LSOF_ARGS(52344));
+      emitter.emit("connect");
+      emitter.emit(
+        "data",
+        encodePeerResolveResponse({ v: 2, ok: true, peer: { uid: AGENT_UID, pid: 20439 }, gatePort: GATE_PORT }),
+      );
+      const result = await promise;
+      expect(result.code).toBe(0);
+      expect(parseLsofPeer(result.stdout, 52344, 1, GATE_PORT)).toEqual({ pid: 20439, uid: AGENT_UID });
     });
   });
 });

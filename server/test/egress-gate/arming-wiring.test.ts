@@ -28,6 +28,7 @@ import {
   type RootOwnedDirEnsureOps,
   restoreCoarseCompositionProduction,
   reconcileStaleExclusiveRoutingProduction,
+  reloadPeerResolverDaemonForBringUp,
   describeGateDaemonStderrTail,
   waitForGateRuntime,
   GATE_DAEMON_STDERR_TAIL_MAX_LINES,
@@ -54,7 +55,7 @@ import {
   egressGateRuntimeUidDirPath,
 } from "../../src/egress-gate/gate-daemon.js";
 import { gateLivenessTokenPath } from "../../src/egress-gate/liveness-oracle.js";
-import { peerResolverDaemonPlistPath } from "../../src/egress-gate/peer-resolver-daemon.js";
+import { peerResolverDaemonLabel, peerResolverDaemonPlistPath } from "../../src/egress-gate/peer-resolver-daemon.js";
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
 import {
   holdFilePathForUid,
@@ -1654,5 +1655,103 @@ describe("waitForGateRuntime timeout diagnostics (Change 2)", () => {
     await expect(
       waitForGateRuntime(707, 5, 49222, { readState: NEVER_ENOENT, budgetMs: 5, intervalMs: 1 }),
     ).rejects.toThrow(/did not publish a matching runtime state within 5ms/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix-round-2 BLOCKER (2026-07-24 re-gate): the peer-resolver RELOAD on a
+// production bring-up must force-replace the loaded launchd job (bootout
+// FIRST, then bootstrap + kickstart) so a rewritten `--gate-port` argv is
+// guaranteed loaded after a repair/rotation. A plain bootstrap of an
+// already-loaded label + a plain kickstart (no -k) would leave the running
+// resolver on its OLD port -> the stale-resolver fail-open the re-gate caught.
+// ---------------------------------------------------------------------------
+describe("reloadPeerResolverDaemonForBringUp (fix-round-2 BLOCKER: force-reload the resolver argv)", () => {
+  const AGENT_UID = 502;
+  const RESOLVER_LABEL = peerResolverDaemonLabel(AGENT_UID);
+  const RESOLVER_PLIST = peerResolverDaemonPlistPath(AGENT_UID);
+
+  function recordingLaunchctl(
+    handlers: Partial<Record<"bootout" | "bootstrap" | "kickstart", { code: number; stderr?: string }>> = {},
+  ): {
+    fn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+    calls: string[];
+  } {
+    const calls: string[] = [];
+    return {
+      calls,
+      fn: (args) => {
+        const verb = args[0] as "bootout" | "bootstrap" | "kickstart";
+        calls.push(args.join(" "));
+        const h = handlers[verb];
+        return Promise.resolve({ code: h?.code ?? 0, stdout: "", stderr: h?.stderr ?? "" });
+      },
+    };
+  }
+
+  it("boots the OLD job OUT before bootstrapping the rewritten plist, then kickstarts (exact order)", async () => {
+    const { fn, calls } = recordingLaunchctl();
+    await reloadPeerResolverDaemonForBringUp({
+      agentUid: AGENT_UID,
+      resolverPlistPath: RESOLVER_PLIST,
+      runLaunchctlFn: fn,
+    });
+    expect(calls).toEqual([
+      `bootout system/${RESOLVER_LABEL}`,
+      `bootstrap system ${RESOLVER_PLIST}`,
+      `kickstart system/${RESOLVER_LABEL}`,
+    ]);
+    // The bootout MUST precede the bootstrap (the whole point of the fix).
+    expect(calls.indexOf(`bootout system/${RESOLVER_LABEL}`)).toBeLessThan(
+      calls.indexOf(`bootstrap system ${RESOLVER_PLIST}`),
+    );
+  });
+
+  it("TOLERATES a not-loaded bootout (clean first install: nothing was running) and proceeds to bootstrap", async () => {
+    for (const notLoaded of [
+      { code: 3, stderr: "Boot-out failed: 3: No such process" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 1, stderr: "service not loaded" },
+    ]) {
+      const { fn, calls } = recordingLaunchctl({ bootout: notLoaded });
+      await expect(
+        reloadPeerResolverDaemonForBringUp({
+          agentUid: AGENT_UID,
+          resolverPlistPath: RESOLVER_PLIST,
+          runLaunchctlFn: fn,
+        }),
+      ).resolves.toBeUndefined();
+      // It did not throw AND it went on to bootstrap + kickstart.
+      expect(calls).toContain(`bootstrap system ${RESOLVER_PLIST}`);
+      expect(calls).toContain(`kickstart system/${RESOLVER_LABEL}`);
+    }
+  });
+
+  it("THROWS on a GENUINE bootout failure (the tolerance did not swallow a real stop failure), never proceeding to bootstrap", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      bootout: { code: 5, stderr: "Boot-out failed: 5: Input/output error" },
+    });
+    await expect(
+      reloadPeerResolverDaemonForBringUp({
+        agentUid: AGENT_UID,
+        resolverPlistPath: RESOLVER_PLIST,
+        runLaunchctlFn: fn,
+      }),
+    ).rejects.toThrow(/bootout .* exited 5/);
+    expect(calls).not.toContain(`bootstrap system ${RESOLVER_PLIST}`);
+  });
+
+  it("tolerates an already-bootstrapped bootstrap result (idempotent reload), still kickstarts", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      bootstrap: { code: 1, stderr: "service already loaded" },
+    });
+    await expect(
+      reloadPeerResolverDaemonForBringUp({
+        agentUid: AGENT_UID,
+        resolverPlistPath: RESOLVER_PLIST,
+        runLaunchctlFn: fn,
+      }),
+    ).resolves.toBeUndefined();
+    expect(calls).toContain(`kickstart system/${RESOLVER_LABEL}`);
   });
 });

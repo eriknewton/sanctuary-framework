@@ -840,7 +840,7 @@ async function productionBringUp(
   const credAuthority = createFsGateCredentialAuthority({ gateUid: state.gateUid });
   await credAuthority.mint({ agentUid: input.agentUid, generationId: committed.generation_id });
 
-  // 2026-07-24 S5-3 fix (Option 1): install + bootstrap the PRIVILEGED
+  // 2026-07-24 S5-3 fix (Option 1): install + (re)load the PRIVILEGED
   // peer-resolver daemon (root) BEFORE the gate daemon starts serving, so the
   // gate's peer lookups have somewhere to dial from its very first CONNECT.
   // Mirrors the gate daemon's own bootstrap sequence below, one daemon per
@@ -850,12 +850,20 @@ async function productionBringUp(
   // baked into THIS plist's argv from the SAME `committed` generation that
   // published the gate's own policy (`gen.gate_port` above) -- root-written,
   // never derived from anything the (unprivileged) gate daemon says over the
-  // resolver socket. `productionBringUp` re-renders + re-bootstraps
-  // (kickstart restarts the process) this plist on EVERY bring-up including
-  // rotation/repair, so a port change always lands here in lockstep with the
-  // gate's own committed port; a mere reboot reuses this on-disk plist
-  // unchanged via `bootstrapPeerResolverDaemonForBoot`.
-  const resolverLabel = peerResolverDaemonLabel(input.agentUid);
+  // resolver socket.
+  //
+  // Fix-round-2 BLOCKER (2026-07-24 re-gate): the RELOAD must actually replace
+  // the loaded launchd job -- a plain `bootstrap` of an already-loaded label
+  // does NOT swap in the rewritten argv, and a plain `kickstart` (no `-k`)
+  // does NOT restart an already-running process, so a port change on
+  // repair/rotation would otherwise leave the RUNNING resolver on its OLD
+  // `--gate-port` (the earlier "kickstart restarts ... in lockstep" claim was
+  // false). `reloadPeerResolverDaemonForBringUp` boots the old job OUT first,
+  // THEN bootstraps the rewritten plist + kickstarts, guaranteeing the new
+  // argv is loaded on every bring-up. The v2 matched-port-in-response client
+  // reject is the fail-closed backstop. A mere reboot reuses this on-disk
+  // plist unchanged via `bootstrapPeerResolverDaemonForBoot` (argv cannot
+  // drift on the boot path -- nothing rewrites the plist there).
   const resolverPlistPath = peerResolverDaemonPlistPath(input.agentUid);
   await writeFile(
     resolverPlistPath,
@@ -873,19 +881,7 @@ async function productionBringUp(
     }),
     { mode: 0o644 },
   );
-  const resolverBootstrap = await runLaunchctl(["bootstrap", "system", resolverPlistPath]);
-  if (
-    resolverBootstrap.code !== 0 &&
-    !/already bootstrapped|Bootstrap failed: 5: Input\/output error/i.test(resolverBootstrap.stderr)
-  ) {
-    throw new Error(
-      `launchctl bootstrap ${resolverLabel} exited ${resolverBootstrap.code}: ${resolverBootstrap.stderr.trim()}`,
-    );
-  }
-  const resolverKick = await runLaunchctl(["kickstart", `system/${resolverLabel}`]);
-  if (resolverKick.code !== 0) {
-    throw new Error(`launchctl kickstart ${resolverLabel} exited ${resolverKick.code}: ${resolverKick.stderr.trim()}`);
-  }
+  await reloadPeerResolverDaemonForBringUp({ agentUid: input.agentUid, resolverPlistPath });
 
   // Hand the committed port from the root placeholder to the gate daemon:
   // release, install the gate daemon plist, bootstrap, then wait for the
@@ -1226,6 +1222,56 @@ export async function bootstrapPeerResolverDaemonForBoot(input: {
   const label = peerResolverDaemonLabel(input.agentUid);
   const plistPath = peerResolverDaemonPlistPath(input.agentUid);
   const bootstrap = await run(["bootstrap", "system", plistPath]);
+  if (
+    bootstrap.code !== 0 &&
+    !/already bootstrapped|service already loaded|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)
+  ) {
+    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
+  }
+  const kick = await run(["kickstart", `system/${label}`]);
+  if (kick.code !== 0) {
+    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
+  }
+}
+
+/**
+ * (RE)LOAD one agent's PEER-RESOLVER daemon during a production bring-up
+ * (install / repair / rotation), where the on-disk resolver plist has just
+ * been REWRITTEN with a possibly-new `--gate-port` argv.
+ *
+ * FIX-ROUND-2 BLOCKER (2026-07-24 re-gate). The reload must actually REPLACE
+ * the loaded launchd job definition. A plain `launchctl bootstrap` of an
+ * ALREADY-bootstrapped label does NOT swap in the rewritten plist's argv, and
+ * a plain `launchctl kickstart` (no `-k`) does NOT restart an already-running
+ * process. So after a repair/rotation that changes the gate port, the RUNNING
+ * resolver would keep its OLD `--gate-port` and match peers against a stale
+ * port -- the fail-open the re-gate caught. The fix: `bootout` the old job
+ * FIRST (a not-loaded bootout is success -- mirrors the boot bootstrap's
+ * already-loaded tolerance, so a clean first install does not refuse), THEN
+ * bootstrap the rewritten plist + kickstart, so the new argv is guaranteed
+ * loaded on EVERY bring-up. The v2 matched-port-in-response client reject
+ * (`peer-resolver-protocol.ts`) is the FAIL-CLOSED backstop if a reload is
+ * ever missed. Throws on a genuine launchctl failure -- the caller aborts the
+ * bring-up rather than serve over a possibly-stale resolver.
+ *
+ * The BOOT path ({@link bootstrapPeerResolverDaemonForBoot}) deliberately does
+ * NOT bootout-first: a reboot re-launches from the CURRENT on-disk plist and
+ * nothing rewrites it there, so argv cannot drift.
+ */
+export async function reloadPeerResolverDaemonForBringUp(input: {
+  agentUid: number;
+  resolverPlistPath: string;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+}): Promise<void> {
+  const run = input.runLaunchctlFn ?? runLaunchctl;
+  const label = peerResolverDaemonLabel(input.agentUid);
+  // Force the loaded job definition to be replaced: bootout the old one FIRST.
+  // A not-loaded bootout (clean first install, nothing running yet) is success.
+  const bootout = await run(["bootout", `system/${label}`]);
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
+    throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
+  }
+  const bootstrap = await run(["bootstrap", "system", input.resolverPlistPath]);
   if (
     bootstrap.code !== 0 &&
     !/already bootstrapped|service already loaded|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)

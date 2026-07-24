@@ -22,25 +22,26 @@ describe("egress-gate/peer-resolver-protocol", () => {
     it("encodes and parses back an exact request", () => {
       const req = { v: PEER_RESOLVER_PROTOCOL_VERSION, clientPort: 52344 } as const;
       const encoded = encodePeerResolveRequest(req);
-      expect(encoded.toString("utf8")).toBe('{"v":1,"clientPort":52344}\n');
+      expect(encoded.toString("utf8")).toBe('{"v":2,"clientPort":52344}\n');
       expect(parsePeerResolveRequest(encoded.toString("utf8").trimEnd())).toEqual(req);
     });
 
-    it("rejects a wrong version", () => {
-      expect(parsePeerResolveRequest('{"v":2,"clientPort":1}')).toBeNull();
+    it("rejects a wrong version (a legacy v1 request is fail-closed at the v2 parser)", () => {
+      expect(parsePeerResolveRequest('{"v":1,"clientPort":1}')).toBeNull();
+      expect(parsePeerResolveRequest('{"v":3,"clientPort":1}')).toBeNull();
     });
 
     it("rejects extra fields (the narrow-surface invariant: no command/argv can ever be smuggled in)", () => {
-      expect(parsePeerResolveRequest('{"v":1,"clientPort":1,"command":"rm -rf /"}')).toBeNull();
-      expect(parsePeerResolveRequest('{"v":1,"clientPort":1,"args":["-rf","/"]}')).toBeNull();
+      expect(parsePeerResolveRequest('{"v":2,"clientPort":1,"command":"rm -rf /"}')).toBeNull();
+      expect(parsePeerResolveRequest('{"v":2,"clientPort":1,"args":["-rf","/"]}')).toBeNull();
     });
 
     it("rejects a missing clientPort", () => {
-      expect(parsePeerResolveRequest('{"v":1}')).toBeNull();
+      expect(parsePeerResolveRequest('{"v":2}')).toBeNull();
     });
 
     it("rejects out-of-range / non-integer ports", () => {
-      for (const bad of ['{"v":1,"clientPort":0}', '{"v":1,"clientPort":65536}', '{"v":1,"clientPort":1.5}', '{"v":1,"clientPort":"52344"}', '{"v":1,"clientPort":-1}']) {
+      for (const bad of ['{"v":2,"clientPort":0}', '{"v":2,"clientPort":65536}', '{"v":2,"clientPort":1.5}', '{"v":2,"clientPort":"52344"}', '{"v":2,"clientPort":-1}']) {
         expect(parsePeerResolveRequest(bad)).toBeNull();
       }
     });
@@ -53,26 +54,26 @@ describe("egress-gate/peer-resolver-protocol", () => {
     });
 
     it("rejects a frame over the byte budget before even attempting JSON.parse", () => {
-      const huge = `{"v":1,"clientPort":1,"pad":"${"x".repeat(PEER_RESOLVER_MAX_FRAME_BYTES)}"}`;
+      const huge = `{"v":2,"clientPort":1,"pad":"${"x".repeat(PEER_RESOLVER_MAX_FRAME_BYTES)}"}`;
       expect(parsePeerResolveRequest(huge)).toBeNull();
     });
 
     it("encodePeerResolveRequest throws rather than silently truncate an over-budget frame", () => {
       // Not reachable through the typed API today (the shape has no field that
       // could grow this large), but pin the fail-loud contract for a future edit.
-      expect(() => encodePeerResolveRequest({ v: 1, clientPort: 1 })).not.toThrow();
+      expect(() => encodePeerResolveRequest({ v: 2, clientPort: 1 })).not.toThrow();
     });
   });
 
   describe("response round trip", () => {
-    it("encodes and parses back a resolved peer", () => {
-      const resp = { v: PEER_RESOLVER_PROTOCOL_VERSION, ok: true, peer: { uid: 502, pid: 777 } } as const;
+    it("encodes and parses back a resolved peer (with the daemon's matched gatePort)", () => {
+      const resp = { v: PEER_RESOLVER_PROTOCOL_VERSION, ok: true, peer: { uid: 502, pid: 777 }, gatePort: 19998 } as const;
       const encoded = encodePeerResolveResponse(resp);
       expect(parsePeerResolveResponse(encoded.toString("utf8").trimEnd())).toEqual(resp);
     });
 
-    it("encodes and parses back a null (unresolved) peer", () => {
-      const resp = { v: PEER_RESOLVER_PROTOCOL_VERSION, ok: true, peer: null } as const;
+    it("encodes and parses back a null (unresolved) peer (gatePort still present)", () => {
+      const resp = { v: PEER_RESOLVER_PROTOCOL_VERSION, ok: true, peer: null, gatePort: 19998 } as const;
       expect(parsePeerResolveResponse(encodePeerResolveResponse(resp).toString("utf8").trimEnd())).toEqual(resp);
     });
 
@@ -82,24 +83,40 @@ describe("egress-gate/peer-resolver-protocol", () => {
     });
 
     it("rejects ok:true with a malformed peer (non-integer uid/pid, negative, extra fields)", () => {
-      expect(parsePeerResolveResponse('{"v":1,"ok":true,"peer":{"uid":"502","pid":777}}')).toBeNull();
-      expect(parsePeerResolveResponse('{"v":1,"ok":true,"peer":{"uid":-1,"pid":777}}')).toBeNull();
-      expect(parsePeerResolveResponse('{"v":1,"ok":true,"peer":{"uid":502,"pid":777,"extra":1}}')).toBeNull();
-      expect(parsePeerResolveResponse('{"v":1,"ok":true,"peer":[502,777]}')).toBeNull();
+      // gatePort present + valid on each, so the ONLY reason for rejection is the malformed peer.
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":{"uid":"502","pid":777},"gatePort":19998}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":{"uid":-1,"pid":777},"gatePort":19998}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":{"uid":502,"pid":777,"extra":1},"gatePort":19998}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":[502,777],"gatePort":19998}')).toBeNull();
     });
 
     it("rejects ok:false without a string reason, and rejects a non-boolean ok", () => {
-      expect(parsePeerResolveResponse('{"v":1,"ok":false}')).toBeNull();
-      expect(parsePeerResolveResponse('{"v":1,"ok":false,"reason":123}')).toBeNull();
-      expect(parsePeerResolveResponse('{"v":1,"ok":"true","peer":null}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":false}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":false,"reason":123}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":"true","peer":null,"gatePort":19998}')).toBeNull();
     });
 
-    it("rejects a wrong version", () => {
+    it("rejects a wrong version (a legacy v1 ok response is fail-closed at the v2 client)", () => {
+      expect(parsePeerResolveResponse('{"v":1,"ok":true,"peer":null,"gatePort":19998}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":1,"ok":true,"peer":{"uid":502,"pid":777}}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":3,"ok":true,"peer":null,"gatePort":19998}')).toBeNull();
+    });
+
+    it("v2 REQUIRES gatePort on an ok response: missing, out-of-range, or an extra 5th key is rejected", () => {
+      // Missing gatePort (the old v1 3-key shape) -> null.
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":{"uid":502,"pid":777}}')).toBeNull();
       expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":null}')).toBeNull();
+      // Out-of-range / non-integer gatePort -> null.
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":null,"gatePort":0}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":null,"gatePort":65536}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":null,"gatePort":1.5}')).toBeNull();
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":null,"gatePort":"19998"}')).toBeNull();
+      // A 5th key (exactly {v, ok, peer, gatePort} only) -> null.
+      expect(parsePeerResolveResponse('{"v":2,"ok":true,"peer":null,"gatePort":19998,"extra":1}')).toBeNull();
     });
 
     it("rejects a frame over the byte budget", () => {
-      const huge = `{"v":1,"ok":false,"reason":"${"x".repeat(PEER_RESOLVER_MAX_FRAME_BYTES)}"}`;
+      const huge = `{"v":2,"ok":false,"reason":"${"x".repeat(PEER_RESOLVER_MAX_FRAME_BYTES)}"}`;
       expect(parsePeerResolveResponse(huge)).toBeNull();
     });
 

@@ -41,8 +41,19 @@
  * This module never authenticates a caller; it only shapes bytes.
  */
 
-/** On-wire protocol version. Bumping this is a breaking change on both ends. */
-export const PEER_RESOLVER_PROTOCOL_VERSION = 1 as const;
+/**
+ * On-wire protocol version. Bumping this is a breaking change on both ends.
+ *
+ * v2 (fix-round-2, 2026-07-24 re-gate BLOCKER): the ok response now carries
+ * `gatePort` -- the port the DAEMON actually matched the 4-tuple against, its
+ * OWN argv-derived value. The client compares it to the gate's current policy
+ * port and REJECTS on mismatch, so a stale resolver whose loaded argv drifted
+ * (matched an old port) can never be relabeled as if it matched the current
+ * gate port. Adding a required field is the breaking change this header warns
+ * about; both ends ship together, and a stale v1 daemon then fails this v2
+ * parser -> fail-closed (a deny), never a silent accept.
+ */
+export const PEER_RESOLVER_PROTOCOL_VERSION = 2 as const;
 
 /** Hard cap on one frame's encoded bytes (request OR response), before any parse. */
 export const PEER_RESOLVER_MAX_FRAME_BYTES = 512;
@@ -58,6 +69,15 @@ export interface PeerResolveOkResponse {
   v: typeof PEER_RESOLVER_PROTOCOL_VERSION;
   ok: true;
   peer: { uid: number; pid: number } | null;
+  /**
+   * The gate port the DAEMON matched the 4-tuple against (its OWN
+   * argv-derived `deps.gatePort`, NEVER anything from the wire request). The
+   * client rejects any answer whose `gatePort` differs from the gate's
+   * current policy port (fix-round-2 BLOCKER): that closes the stale-resolver
+   * wrong-ALLOW where a daemon still matching an old port `A` gets its answer
+   * relabeled as if it matched the current port `B`.
+   */
+  gatePort: number;
 }
 
 /** A bounded, non-throwing failure (malformed request, rate-limited, lookup faulted). */
@@ -100,7 +120,7 @@ export function encodePeerResolveResponse(resp: PeerResolveResponse): Buffer {
 
 /**
  * Strictly parse one request line. Rejects anything that is not EXACTLY
- * `{ v: 1, clientPort: <valid TCP port> }` -- no extra fields, no coercion.
+ * `{ v: 2, clientPort: <valid TCP port> }` -- no extra fields, no coercion.
  * Returns `null` on any deviation (the server treats that as a bounded
  * protocol-error response, never a throw).
  */
@@ -139,10 +159,17 @@ export function parsePeerResolveResponse(raw: string): PeerResolveResponse | nul
   const r = parsed as Record<string, unknown>;
   if (r.v !== PEER_RESOLVER_PROTOCOL_VERSION) return null;
   if (r.ok === true) {
+    // v2 (fix-round-2): the ok response is EXACTLY `{v, ok, peer, gatePort}`
+    // (4 keys). `gatePort` is REQUIRED and range-validated on EVERY ok answer
+    // (resolved AND unresolved) so the client always has the daemon's matched
+    // port to compare against; a missing/garbage port is rejected here, which
+    // the client treats as a fail-closed non-resolution.
     const keys = Object.keys(r);
-    if (keys.length !== 3 || !keys.includes("peer")) return null;
+    if (keys.length !== 4 || !keys.includes("peer") || !keys.includes("gatePort")) return null;
+    if (!isValidPort(r.gatePort)) return null;
+    const gatePort = r.gatePort;
     const peer = r.peer;
-    if (peer === null) return { v: PEER_RESOLVER_PROTOCOL_VERSION, ok: true, peer: null };
+    if (peer === null) return { v: PEER_RESOLVER_PROTOCOL_VERSION, ok: true, peer: null, gatePort };
     if (typeof peer !== "object" || Array.isArray(peer)) return null;
     const peerKeys = Object.keys(peer as Record<string, unknown>);
     if (
@@ -160,6 +187,7 @@ export function parsePeerResolveResponse(raw: string): PeerResolveResponse | nul
       v: PEER_RESOLVER_PROTOCOL_VERSION,
       ok: true,
       peer: { uid: (peer as { uid: number }).uid, pid: (peer as { pid: number }).pid },
+      gatePort,
     };
   }
   if (r.ok === false) {

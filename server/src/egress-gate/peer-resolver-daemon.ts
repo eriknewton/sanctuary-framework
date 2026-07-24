@@ -346,7 +346,7 @@ function handleConnection(
     buffer += chunk.toString("utf8");
     if (Buffer.byteLength(buffer, "utf8") > PEER_RESOLVER_MAX_FRAME_BYTES) {
       ctx.onEvent({ kind: "request_denied", agentUid: ctx.agentUid, reason: "malformed_request" });
-      respond({ v: 1, ok: false, reason: "malformed_request" });
+      respond({ v: 2, ok: false, reason: "malformed_request" });
       return;
     }
     const nl = buffer.indexOf("\n");
@@ -355,7 +355,7 @@ function handleConnection(
     const req = parsePeerResolveRequest(line);
     if (req === null) {
       ctx.onEvent({ kind: "request_denied", agentUid: ctx.agentUid, reason: "malformed_request" });
-      respond({ v: 1, ok: false, reason: "malformed_request" });
+      respond({ v: 2, ok: false, reason: "malformed_request" });
       return;
     }
     // One syntactically valid request accepted: any further bytes on this
@@ -364,7 +364,7 @@ function handleConnection(
     requestAccepted = true;
     if (!ctx.acquireSlot()) {
       ctx.onEvent({ kind: "request_denied", agentUid: ctx.agentUid, reason: "rate_limited" });
-      respond({ v: 1, ok: false, reason: "rate_limited" });
+      respond({ v: 2, ok: false, reason: "rate_limited" });
       return;
     }
     const selfPid = process.pid;
@@ -373,7 +373,7 @@ function handleConnection(
       .then((result) => {
         if (result.code !== 0) {
           ctx.onEvent({ kind: "request_resolved", agentUid: ctx.agentUid, clientPort: req.clientPort, resolvedUid: null });
-          respond({ v: 1, ok: true, peer: null });
+          respond({ v: 2, ok: true, peer: null, gatePort: ctx.gatePort });
           return;
         }
         // FULL-4-TUPLE MATCH (fix-round BLOCKER): gatePort is THIS daemon's
@@ -386,7 +386,12 @@ function handleConnection(
           clientPort: req.clientPort,
           resolvedUid: peer?.uid ?? null,
         });
-        respond({ v: 1, ok: true, peer });
+        // v2 (fix-round-2 BLOCKER): stamp the response with the port THIS
+        // daemon actually matched against (`ctx.gatePort`, its OWN
+        // argv-derived value), so the client can reject a stale answer whose
+        // matched port drifted from the gate's current policy port. NEVER a
+        // value from `req`.
+        respond({ v: 2, ok: true, peer, gatePort: ctx.gatePort });
       })
       .catch((err: unknown) => {
         ctx.onEvent({
@@ -397,7 +402,7 @@ function handleConnection(
         });
         // Fail-closed: a faulted lookup answers unresolved, never a crash and
         // never a default-allow shape.
-        respond({ v: 1, ok: true, peer: null });
+        respond({ v: 2, ok: true, peer: null, gatePort: ctx.gatePort });
       })
       .finally(() => ctx.releaseSlot());
   });

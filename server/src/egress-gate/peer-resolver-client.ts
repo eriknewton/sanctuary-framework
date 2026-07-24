@@ -139,7 +139,7 @@ export function createPrivilegedPeerRunner(options: PrivilegedPeerRunnerOptions)
         let buffer = "";
         socket.on("connect", () => {
           try {
-            socket.write(encodePeerResolveRequest({ v: 1, clientPort }));
+            socket.write(encodePeerResolveRequest({ v: 2, clientPort }));
           } catch {
             settle(FAILURE_RESULT);
           }
@@ -160,6 +160,18 @@ export function createPrivilegedPeerRunner(options: PrivilegedPeerRunnerOptions)
           }
           if (resp.peer === null) {
             settle({ code: 0, stdout: "" });
+            return;
+          }
+          // FAIL-CLOSED ON PORT DRIFT (fix-round-2 BLOCKER, the load-bearing
+          // security check): only synthesize a match if the DAEMON matched the
+          // 4-tuple against the SAME port this gate currently enforces. A stale
+          // resolver whose loaded argv drifted (matched an old port `A`) answers
+          // with `resp.gatePort === A`; this gate's own policy port is `gatePort
+          // === B`. Without this check the client would relabel that stale
+          // answer as if it matched `B` and hand back an agent-uid stdout -> a
+          // wrong-ALLOW. Reject instead: deny (peer_unresolved), never synthesize.
+          if (resp.gatePort !== gatePort) {
+            settle(FAILURE_RESULT);
             return;
           }
           settle({ code: 0, stdout: synthesizeLsofStdout(clientPort, resp.peer, gatePort) });

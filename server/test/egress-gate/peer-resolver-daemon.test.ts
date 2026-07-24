@@ -155,7 +155,7 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
     return new Promise((resolve, reject) => {
       const socket = createConnection(socketPath);
       let buffer = "";
-      socket.on("connect", () => socket.write(encodePeerResolveRequest({ v: 1, clientPort })));
+      socket.on("connect", () => socket.write(encodePeerResolveRequest({ v: 2, clientPort })));
       socket.on("data", (chunk) => {
         buffer += chunk.toString("utf8");
         const nl = buffer.indexOf("\n");
@@ -237,7 +237,7 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
     });
     try {
       const resp = await rawRequest(handle.socketPath, 52344);
-      expect(resp).toEqual({ v: 1, ok: true, peer: { uid: AGENT_UID, pid: 20439 } });
+      expect(resp).toEqual({ v: 2, ok: true, peer: { uid: AGENT_UID, pid: 20439 }, gatePort: GATE_PORT });
       expect(runner.calls[0]).toEqual(["lsof", "-nP", "-Fpun", "-iTCP@127.0.0.1:52344"]);
       const resolved = events.find((e) => e.kind === "request_resolved");
       expect(resolved).toMatchObject({ kind: "request_resolved", clientPort: 52344, resolvedUid: AGENT_UID });
@@ -259,7 +259,7 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
     });
     try {
       const resp = await rawRequest(handle.socketPath, 52344);
-      expect(resp).toEqual({ v: 1, ok: true, peer: null });
+      expect(resp).toEqual({ v: 2, ok: true, peer: null, gatePort: GATE_PORT });
     } finally {
       await handle.close();
     }
@@ -278,11 +278,11 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
     });
     try {
       const resp = await rawRequest(handle.socketPath, 52344);
-      expect(resp).toEqual({ v: 1, ok: true, peer: null });
+      expect(resp).toEqual({ v: 2, ok: true, peer: null, gatePort: GATE_PORT });
       expect(events.some((e) => e.kind === "request_faulted")).toBe(true);
       // The daemon is still alive and serves the NEXT request normally.
       const second = await rawRequest(handle.socketPath, 52345);
-      expect(second).toEqual({ v: 1, ok: true, peer: null });
+      expect(second).toEqual({ v: 2, ok: true, peer: null, gatePort: GATE_PORT });
     } finally {
       await handle.close();
     }
@@ -301,7 +301,7 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
       const resp = await new Promise((resolve, reject) => {
         const socket = createConnection(handle.socketPath);
         let buffer = "";
-        socket.on("connect", () => socket.write('{"v":1,"clientPort":"not-a-port"}\n'));
+        socket.on("connect", () => socket.write('{"v":2,"clientPort":"not-a-port"}\n'));
         socket.on("data", (chunk) => {
           buffer += chunk.toString("utf8");
           const nl = buffer.indexOf("\n");
@@ -313,7 +313,7 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
         socket.on("error", reject);
         setTimeout(() => reject(new Error("timeout")), 3000).unref();
       });
-      expect(resp).toEqual({ v: 1, ok: false, reason: "malformed_request" });
+      expect(resp).toEqual({ v: 2, ok: false, reason: "malformed_request" });
       expect(events.some((e) => e.kind === "request_denied" && e.reason === "malformed_request")).toBe(true);
     } finally {
       await handle.close();
@@ -344,11 +344,11 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
       const p3 = rawRequest(handle.socketPath, 1003); // over the cap of 2
       await new Promise((r) => setTimeout(r, 50));
       const third = await p3;
-      expect(third).toEqual({ v: 1, ok: false, reason: "rate_limited" });
+      expect(third).toEqual({ v: 2, ok: false, reason: "rate_limited" });
       // Release the two held lookups so the daemon can close cleanly.
       for (const release of releasers.splice(0)) release();
-      expect(await p1).toEqual({ v: 1, ok: true, peer: null });
-      expect(await p2).toEqual({ v: 1, ok: true, peer: null });
+      expect(await p1).toEqual({ v: 2, ok: true, peer: null, gatePort: GATE_PORT });
+      expect(await p2).toEqual({ v: 2, ok: true, peer: null, gatePort: GATE_PORT });
       expect(events.some((e) => e.kind === "request_denied" && e.reason === "rate_limited")).toBe(true);
     } finally {
       await handle.close();
@@ -407,7 +407,7 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
     });
     try {
       const resp = await rawRequest(handle.socketPath, 52344);
-      expect(resp).toEqual({ v: 1, ok: true, peer: { uid: OPERATOR_UID, pid: OPERATOR_PID } });
+      expect(resp).toEqual({ v: 2, ok: true, peer: { uid: OPERATOR_UID, pid: OPERATOR_PID }, gatePort: GATE_PORT });
       // Never the agent -- the wrong-ALLOW this regression exists to prove closed.
       expect((resp as { peer: { uid: number } }).peer.uid).not.toBe(AGENT_UID);
       const resolved = events.find((e) => e.kind === "request_resolved");
@@ -500,7 +500,7 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
           // slots. Post-fix, `requestAccepted` is set the instant the FIRST
           // line parses, so lines 2-5 are silently dropped.
           for (let i = 0; i < 5; i++) {
-            socket.write(encodePeerResolveRequest({ v: 1, clientPort: 1000 + i }));
+            socket.write(encodePeerResolveRequest({ v: 2, clientPort: 1000 + i }));
           }
         });
         socket.on("data", (chunk) => {
@@ -519,7 +519,7 @@ describe("egress-gate/peer-resolver-daemon runPeerResolverDaemon (real UDS, host
       await new Promise((r) => setTimeout(r, 50));
       expect(dispatches).toBe(1);
       for (const release of releasers.splice(0)) release();
-      expect(await responsePromise).toEqual({ v: 1, ok: true, peer: null });
+      expect(await responsePromise).toEqual({ v: 2, ok: true, peer: null, gatePort: GATE_PORT });
     } finally {
       await handle.close();
     }
