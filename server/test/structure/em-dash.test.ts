@@ -25,8 +25,9 @@
  * internal code comments are explicitly permitted (this matches
  * test/cli/no-em-dash-in-cli.test.ts). The doc surface is scanned whole; only
  * the code surface is comment-stripped (via the shared `stripCodeComments`, a
- * TS-SCANNER strip — not a regex — so em-dashes inside string literals that
- * contain comment tokens are NOT lost). The scope + strip are shared with the
+ * TypeScript PARSER-backed strip — not a regex or a hand-rolled scanner — so
+ * em-dashes inside string/template/regex literals that contain comment tokens
+ * are NOT lost). The scope + strip are shared with the
  * baseline generator (gen-em-dash-baseline.ts), so they cannot drift.
  *
  * CODE SCOPE: the em-dash code scan now covers ALL first-party JS/TS source
@@ -90,7 +91,7 @@ function emDashCount(rel: string): number {
   const abs = join(REPO_ROOT, rel);
   if (!existsSync(abs)) return 0;
   let txt = readFileSync(abs, "utf8");
-  if (isFirstPartySourceCode(rel)) txt = stripCodeComments(txt);
+  if (isFirstPartySourceCode(rel)) txt = stripCodeComments(txt, rel);
   let n = 0;
   let idx = txt.indexOf(EM_DASH);
   while (idx !== -1) {

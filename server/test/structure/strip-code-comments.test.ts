@@ -2,29 +2,52 @@
  * Guard-integrity regression tests for `stripCodeComments`
  * (registry row `sanctuary-structure-guard-stripcodecomments-desync`).
  *
- * THE BUG (fixed alongside this file): `stripCodeComments` (public-surface.ts)
- * tokenizes source with the TypeScript SCANNER so the no-em-dash / no-CIMC
- * structure guards see executable code + string literals but never code
- * comments. It never called `scanner.reScanTemplateToken()` at interpolation
- * boundaries, so the scanner's plain `scan()` treated the `}` that closes a
- * `${...}` interpolation as an ordinary `CloseBraceToken` and then re-lexed
- * the template's TAIL as if it were bare code. A `//` (or `/* *\/`) that is
- * really user-visible STRING content in that tail was therefore mis-read as a
- * comment and stripped -- hiding a real em-dash or CIMC mention from the
- * MANDATORY guards behind what looks like, but is not, a comment marker.
+ * THE BUG, ROUND 1 (fixed alongside this file, then found still incomplete):
+ * `stripCodeComments` (public-surface.ts) originally tokenized source with the
+ * raw TypeScript SCANNER plus a hand-rolled template-interpolation brace-depth
+ * counter, so the no-em-dash / no-CIMC structure guards would see executable
+ * code + string literals but never code comments. Round 1 fixed the scanner
+ * never calling `scanner.reScanTemplateToken()` at a `${...}` close-brace.
+ * Tests 1 and 2 below are that exploit.
+ *
+ * THE BUG, ROUND 2 (parse-parity review, 2026-07-24): round 1's brace-depth
+ * counter is STILL unsound, because whether a `/` starts a RegExpLiteral or a
+ * division operator is a GRAMMAR fact a context-free scanner cannot always
+ * get right. A template interpolation containing a regex literal with an
+ * unmatched `{` -- `` `a${/{/.test(s)} // tail—`; `` -- made the hand-rolled
+ * counter miscount the regex's `{` as a real `OpenBraceToken`, so the counter
+ * never reached zero at the true interpolation-closing `}` and the template's
+ * TAIL (real string content, including the em-dash) got re-lexed as bare code
+ * and stripped as a comment. Test 5 below is this exact exploit.
+ *
+ * THE FIX (round 2): `stripCodeComments` no longer scans token-by-token at
+ * all. It parses the source with `ts.createSourceFile` (the real TypeScript
+ * PARSER, which resolves regex-vs-division and template continuation
+ * correctly by construction), walks every token via `getChildren()`, and
+ * blanks only the byte ranges the parser itself reports as comment trivia.
+ * A comment range can never overlap a string/template/regex literal, because
+ * those are each a single token and a comment range is, by definition, trivia
+ * strictly BETWEEN two tokens. This closes the entire class of bug: no
+ * scanner-side brace/regex/template bookkeeping is needed or present anymore.
  *
  * These tests exercise `stripCodeComments` directly (the shared primitive the
  * em-dash and CIMC guards build on), not the full guard machinery, so the
  * proof is about the strip itself: it must never delete real string/template
  * content, and it must still do its actual job of removing true comments.
  *
- * Tests 1 and 2 are the actual exploit: they FAIL on the pre-fix scanner (the
- * em-dash / CIMC-shaped text gets stripped) and PASS after (verified by
- * running this file against the pre-fix `stripCodeComments` via `git stash`;
- * see the fix PR description for the transcript). Tests 3 and 4 are
- * regression guards proving the fix does not loosen or break the function's
- * actual job (true comments are still stripped; ordinary template forms still
- * round-trip byte-for-byte).
+ * Tests 1 and 2 are the round-1 exploit: they FAIL on the pre-round-1 scanner
+ * and PASS after (verified via `git stash` against the pre-fix commit; see the
+ * fix PR description). Test 5 is the round-2 exploit: verified to FAIL (strips
+ * the em-dash) against the round-1 scanner-plus-brace-counter implementation
+ * committed in this PR at cee3c43d, and to PASS against the round-2
+ * parser-backed implementation in this file. Tests 6-8 are further
+ * grammar-ambiguous shapes (division that looks like a regex, a regex literal
+ * containing a `}`, and both together in one template) added for robustness;
+ * 6 and 7 individually did not trigger the round-1 bug (verified), but 8
+ * (both together) did -- all four pass on the round-2 parser-backed fix.
+ * Tests 3 and 4 are regression guards proving the fix does not loosen or
+ * break the function's actual job (true comments are still stripped; ordinary
+ * template forms still round-trip byte-for-byte).
  */
 
 import { describe, expect, it } from "vitest";
@@ -86,5 +109,49 @@ describe("stripCodeComments (guard-integrity: template-literal tail desync)", ()
       const stripped = stripCodeComments(source);
       expect(stripped, `round-trip mismatch for: ${source}`).toBe(source);
     }
+  });
+
+  it("5. THE ROUND-2 EXPLOIT: a regex literal with an unmatched brace inside a template interpolation no longer desyncs the strip", () => {
+    // `/{/.test(s)` is a regex literal whose body is a single unmatched `{`.
+    // A scanner-only brace counter (round 1's approach) miscounts that `{` as
+    // a real OpenBraceToken, so it never sees the interpolation's real
+    // closing `}` as the boundary -- everything after gets re-lexed as bare
+    // code and the `//` is misread as a comment, stripping the em-dash. The
+    // real parser knows `/{/.test(s)` is one RegExpLiteral token, so the
+    // interpolation-closing `}` and the TemplateTail after it are recovered
+    // correctly and the tail (including the em-dash) survives untouched.
+    const source = "const x = `a${/{/.test(s)} // tail—`;";
+    const stripped = stripCodeComments(source);
+
+    expect(stripped).toContain("—");
+    expect(stripped).toBe(source); // nothing here is a real comment
+  });
+
+  it("6. division that looks like it could open a regex, inside an interpolation", () => {
+    const source = "const x = `${a / b} // x—`;";
+    const stripped = stripCodeComments(source);
+
+    expect(stripped).toContain("—");
+    expect(stripped).toBe(source);
+  });
+
+  it("7. a regex literal containing a `}` inside an interpolation", () => {
+    const source = "const x = `a${/}/.test(s)} // tail—`;";
+    const stripped = stripCodeComments(source);
+
+    expect(stripped).toContain("—");
+    expect(stripped).toBe(source);
+  });
+
+  it("8. a template whose interpolations mix division AND an unmatched-brace regex", () => {
+    // Combines cases 6 and 7 in one source: a division in the first
+    // interpolation, an unmatched-brace regex in the second. This shape also
+    // desynced the round-1 brace counter (verified against the round-1
+    // implementation committed at cee3c43d).
+    const source = "const x = `${a/b}${/{/.test(c)} // tail—`;";
+    const stripped = stripCodeComments(source);
+
+    expect(stripped).toContain("—");
+    expect(stripped).toBe(source);
   });
 });
