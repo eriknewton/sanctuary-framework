@@ -374,6 +374,34 @@ export function serverSrcTrackedTs(): string[] {
  * user-visible em-dash. The scanner tokenises correctly, so such a `//` is part
  * of the string token and is preserved. Shared here so em-dash.test.ts and
  * gen-em-dash-baseline.ts always use the same strip (or they drift the baseline).
+ *
+ * TEMPLATE-LITERAL CONTINUATION (guard-integrity fix, registry row
+ * `sanctuary-structure-guard-stripcodecomments-desync`): the plain scanner
+ * does NOT continue a template literal past an interpolation on its own. After
+ * a `TemplateHead` (`` `...${ ``) `scan()` reads the interpolation expression's
+ * tokens, but the `}` that closes it is returned as an ordinary
+ * `CloseBraceToken` -- getting the `TemplateMiddle` (`` }...${ ``) or
+ * `TemplateTail` (`` }...` ``) that actually follows requires calling
+ * `scanner.reScanTemplateToken()` AT that `}`. Without it, everything after
+ * the `}` is re-lexed as if it were ordinary code, so a `//` or `/* *\/`
+ * sequence that is really user-visible STRING content in the template's tail
+ * gets mis-tokenized as a comment and stripped (hiding a real em-dash or a
+ * CIMC mention), and/or a later genuine comment can be missed entirely once
+ * the scanner has drifted out of sync with the true token stream.
+ *
+ * `templateDepths` tracks, for each currently-open interpolation, how many
+ * ordinary `{`/`}` pairs are nested inside its expression (a STACK, not a
+ * single flag, because a template can nest inside its own interpolation, e.g.
+ * `` `a${`b${c}d`}e` ``). On `TemplateHead` a new counter starts at 0. Inside
+ * an interpolation, `{` increments the top counter and `}` decrements it --
+ * that is a real nested brace (an object literal, a block, ...). Only when a
+ * `}` would take the top counter BELOW 0 does it actually close the `${`; at
+ * that point we call `reScanTemplateToken` instead of accepting the
+ * `CloseBraceToken`, and keep its text verbatim (it is template string
+ * content, never a comment, no matter what it looks like). A `TemplateTail`
+ * result pops the counter (the template is fully closed); a `TemplateMiddle`
+ * result means the same interpolation position reopens a new `${`, so the
+ * counter resets to 0 rather than popping.
  */
 export function stripCodeComments(source: string): string {
   const scanner = ts.createScanner(
@@ -383,8 +411,31 @@ export function stripCodeComments(source: string): string {
     source,
   );
   let out = "";
+  // One entry per currently-open template interpolation (`${`); see the
+  // doc comment above for what each counter tracks.
+  const templateDepths: number[] = [];
   let token = scanner.scan();
   while (token !== ts.SyntaxKind.EndOfFileToken) {
+    if (
+      token === ts.SyntaxKind.CloseBraceToken &&
+      templateDepths.length > 0 &&
+      templateDepths[templateDepths.length - 1] === 0
+    ) {
+      // This `}` closes a template interpolation, not an ordinary brace --
+      // re-read from here as the TemplateMiddle/TemplateTail that follows.
+      token = scanner.reScanTemplateToken(/*isTaggedTemplate*/ false);
+      out += scanner.getTokenText();
+      if (token === ts.SyntaxKind.TemplateTail) {
+        templateDepths.pop();
+      } else {
+        // TemplateMiddle: this interpolation is done, but its `${` reopens
+        // a fresh one at the same stack position.
+        templateDepths[templateDepths.length - 1] = 0;
+      }
+      token = scanner.scan();
+      continue;
+    }
+
     if (
       token !== ts.SyntaxKind.SingleLineCommentTrivia &&
       token !== ts.SyntaxKind.MultiLineCommentTrivia
@@ -396,6 +447,21 @@ export function stripCodeComments(source: string): string {
       // line numbers) is preserved without keeping comment-resident em-dashes.
       out += scanner.getTokenText().replace(/[^\n]/g, "");
     }
+
+    if (token === ts.SyntaxKind.TemplateHead) {
+      templateDepths.push(0);
+    } else if (
+      token === ts.SyntaxKind.OpenBraceToken &&
+      templateDepths.length > 0
+    ) {
+      templateDepths[templateDepths.length - 1]++;
+    } else if (
+      token === ts.SyntaxKind.CloseBraceToken &&
+      templateDepths.length > 0
+    ) {
+      templateDepths[templateDepths.length - 1]--;
+    }
+
     token = scanner.scan();
   }
   return out;
