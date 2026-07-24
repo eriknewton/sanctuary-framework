@@ -1257,8 +1257,10 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     const args1 = args.slice(1);
     const uidArg = args1.find((a) => a.startsWith("--agent-uid="));
     const gateUidArg = args1.find((a) => a.startsWith("--gate-uid="));
+    const gatePortArg = args1.find((a) => a.startsWith("--gate-port="));
     const agentUid = uidArg !== undefined ? Number(uidArg.slice("--agent-uid=".length)) : NaN;
     const gateUid = gateUidArg !== undefined ? Number(gateUidArg.slice("--gate-uid=".length)) : NaN;
+    const gatePort = gatePortArg !== undefined ? Number(gatePortArg.slice("--gate-port=".length)) : NaN;
     if (!Number.isInteger(agentUid) || agentUid <= 0) {
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       console.error("peer-resolver-daemon requires --agent-uid=<positive integer>");
@@ -1269,9 +1271,18 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
       console.error("peer-resolver-daemon requires --gate-uid=<positive integer>");
       return 2;
     }
+    // 2026-07-24 fix-round BLOCKER: the gate port MUST come from this
+    // daemon's OWN root-written startup config (this argv, baked into the
+    // plist at arming time), never from a wire request -- see
+    // peer-resolver-daemon.ts's module header.
+    if (!Number.isInteger(gatePort) || gatePort <= 0 || gatePort > 65535) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --gate-port=<valid TCP port>");
+      return 2;
+    }
     const { runPeerResolverDaemon } = await import("./egress-gate/peer-resolver-daemon.js");
     try {
-      const handle = await runPeerResolverDaemon({ agentUid, gateUid });
+      const handle = await runPeerResolverDaemon({ agentUid, gateUid, gatePort });
       const stop = async (): Promise<void> => {
         try {
           await handle.close();

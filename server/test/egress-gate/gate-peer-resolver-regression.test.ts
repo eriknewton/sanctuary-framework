@@ -183,6 +183,7 @@ async function startResolverAndGate(input: {
   const resolverHandle = await runPeerResolverDaemon({
     agentUid: AGENT_UID,
     gateUid: GATE_UID,
+    gatePort: GATE_PORT,
     socketDir,
     runner: simulatedRootLsof(input.peerUid),
     fsOps: fakeFsOps(),
@@ -199,7 +200,11 @@ async function startResolverAndGate(input: {
     // THE FIX: the real privileged client, talking to the real resolver
     // daemon above -- NOT a mocked PeerCommandRunner, NOT the old
     // createExecFilePeerRunner() that started this whole investigation.
-    peerRunner: createPrivilegedPeerRunner({ agentUid: AGENT_UID, socketPath: resolverHandle.socketPath }),
+    peerRunner: createPrivilegedPeerRunner({
+      agentUid: AGENT_UID,
+      gatePort: GATE_PORT,
+      socketPath: resolverHandle.socketPath,
+    }),
     onEvent: (e) => events.push(e),
     isRoutable: () => true,
   });
@@ -298,6 +303,7 @@ describe("REGRESSION (Mini1 2026-07-24 drill): privileged-resolver-backed TCB ga
       // Points at a socket path with NOTHING listening (resolver never started).
       peerRunner: createPrivilegedPeerRunner({
         agentUid: AGENT_UID,
+        gatePort: GATE_PORT,
         socketPath: join(socketDir, "502.sock"),
       }),
       onEvent: (e) => events.push(e),

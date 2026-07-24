@@ -845,6 +845,16 @@ async function productionBringUp(
   // gate's peer lookups have somewhere to dial from its very first CONNECT.
   // Mirrors the gate daemon's own bootstrap sequence below, one daemon per
   // confined agent (see `peer-resolver-daemon.ts`).
+  //
+  // Fix-round BLOCKER (2026-07-24): `--gate-port=${committed.gate_port}` is
+  // baked into THIS plist's argv from the SAME `committed` generation that
+  // published the gate's own policy (`gen.gate_port` above) -- root-written,
+  // never derived from anything the (unprivileged) gate daemon says over the
+  // resolver socket. `productionBringUp` re-renders + re-bootstraps
+  // (kickstart restarts the process) this plist on EVERY bring-up including
+  // rotation/repair, so a port change always lands here in lockstep with the
+  // gate's own committed port; a mere reboot reuses this on-disk plist
+  // unchanged via `bootstrapPeerResolverDaemonForBoot`.
   const resolverLabel = peerResolverDaemonLabel(input.agentUid);
   const resolverPlistPath = peerResolverDaemonPlistPath(input.agentUid);
   await writeFile(
@@ -857,6 +867,7 @@ async function productionBringUp(
         "peer-resolver-daemon",
         `--agent-uid=${input.agentUid}`,
         `--gate-uid=${state.gateUid}`,
+        `--gate-port=${committed.gate_port}`,
       ],
       fortressPath: input.fortressPath,
     }),

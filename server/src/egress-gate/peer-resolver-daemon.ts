@@ -22,13 +22,37 @@
  *
  * SCOPING (the security-sensitive core; the two-family adversarial gate
  * focuses here):
+ *   - FULL-4-TUPLE MATCH, GATE PORT NEVER CALLER-SUPPLIED (fix-round
+ *     BLOCKER, `PR1003_PeerResolver_AdversarialReview_Codex_2026-07-24.md`).
+ *     The wire request carries ONLY `clientPort` (`peer-resolver-protocol.ts`
+ *     has no field for a port the caller could assert); this daemon knows
+ *     `gatePort` from its OWN construction dependency (`deps.gatePort`,
+ *     sourced in production from a `--gate-port=<port>` argv baked into this
+ *     daemon's OWN LaunchDaemon plist by the root arming sequence at the
+ *     SAME moment it commits the gate's port -- see `arming-wiring.ts`'s
+ *     `productionBringUp`). A caller that could supply the gate port itself
+ *     could ask this daemon to match against an arbitrary remote and turn it
+ *     into a general port-pair oracle; requiring the daemon's OWN
+ *     root-written value closes that. `parseLsofPeer` (`peer-identity.ts`)
+ *     then requires the FULL tuple -- local `127.0.0.1:<clientPort>` AND
+ *     remote `127.0.0.1:<gatePort>` -- not the local port alone: with
+ *     `SO_REUSEADDR`, an unrelated agent-owned socket can share the SAME
+ *     local port as the real gate connection with a DIFFERENT remote, and a
+ *     local-only match could return the agent's uid for a connection that
+ *     was never actually made to the gate.
  *   - INVOCABLE ONLY BY THE GATE UID. Node exposes no `SO_PEERCRED`/
  *     `getpeereid` (the same gap `supervisor/socket-server.ts` documents), so
  *     the boundary is filesystem permission: the parent dir is root 0711
  *     (traversal without listing, mirrors `GATE_LIVENESS_DIR`), and the
  *     socket FILE is root-created then CHOWNED to the one gate uid it serves,
  *     mode 0600 -- a different uid's `connect()` gets EPERM at the kernel,
- *     never reaching this process's code at all.
+ *     never reaching this process's code at all. The bind-to-chmod WINDOW is
+ *     also closed (fix-round HIGH): `process.umask(0o077)` wraps the
+ *     `listen()` call itself, so the socket is NEVER created world-writable
+ *     even transiently under a permissive ambient umask, and the plist's own
+ *     `Umask` key is a second, independent layer (defense-in-depth: holds
+ *     even if a future launchd default or a caller of this binary changes
+ *     the ambient umask before exec).
  *   - RATE-LIMITED. A concurrency cap on in-flight `lsof` executions (this
  *     process now pays the root-subprocess-amplification cost the OLD design
  *     worried about the gate paying as itself -- see `PEER_RESOLVER_MAX_
@@ -105,6 +129,17 @@ export const PEER_RESOLVER_LOOKUP_TIMEOUT_MS = 2_000;
 
 /** Idle-socket reap timeout (a connection that never sends a full request line). */
 export const PEER_RESOLVER_IDLE_TIMEOUT_MS = 5_000;
+
+/**
+ * The restrictive umask applied around `server.listen()` (fix-round HIGH):
+ * owner rwx only, no group/other bits, so the resolver socket can never be
+ * created world- or group-writable even for the instant between bind() and
+ * the explicit `chmod(0o600)` below. Also rendered into the plist's `Umask`
+ * key (as its DECIMAL value -- launchd's `Umask` integer is passed straight
+ * to the syscall, not parsed as octal text; 0o077 decimal IS 63) so the
+ * restriction holds even before this module's own code runs.
+ */
+export const PEER_RESOLVER_SOCKET_UMASK = 0o077;
 
 function xmlEscape(value: string): string {
   return value
@@ -184,6 +219,8 @@ ${argsXml}
 \t<string>${xmlEscape(stdoutPath)}</string>
 \t<key>StandardErrorPath</key>
 \t<string>${xmlEscape(stderrPath)}</string>
+\t<key>Umask</key>
+\t<integer>${PEER_RESOLVER_SOCKET_UMASK}</integer>
 \t<key>RunAtLoad</key>
 \t<false/>
 \t<key>KeepAlive</key>
@@ -198,7 +235,7 @@ ${argsXml}
 
 /** Audit/observability events the resolver daemon emits. */
 export type PeerResolverEvent =
-  | { kind: "listening"; agentUid: number; socketPath: string }
+  | { kind: "listening"; agentUid: number; socketPath: string; gatePort: number }
   | { kind: "request_denied"; agentUid: number; reason: "malformed_request" | "rate_limited" }
   | { kind: "request_resolved"; agentUid: number; clientPort: number; resolvedUid: number | null }
   | { kind: "request_faulted"; agentUid: number; clientPort: number; message: string }
@@ -210,6 +247,16 @@ export interface PeerResolverDaemonDeps {
   agentUid: number;
   /** The gate service uid allowed to connect (the socket is chowned to this uid). */
   gateUid: number;
+  /**
+   * The gate's OWN committed port (fix-round BLOCKER). REQUIRED, and NEVER
+   * read from the wire request -- production sources this from the SAME
+   * `--gate-port=<port>` argv this daemon's own root-written LaunchDaemon
+   * plist was rendered with at arming time (`arming-wiring.ts`), never from
+   * anything the (unprivileged) gate daemon says over the socket. Every
+   * lookup requires the matched record's remote endpoint to equal exactly
+   * this port (`peer-identity.ts`'s `parseLsofPeer`).
+   */
+  gatePort: number;
   /** The privileged command runner (default: real `lsof` via execFile; this process runs as root). */
   runner?: PeerCommandRunner;
   /** Socket parent-dir override (tests). */
@@ -264,6 +311,7 @@ function handleConnection(
   socket: Socket,
   ctx: {
     agentUid: number;
+    gatePort: number;
     runner: PeerCommandRunner;
     onEvent: (event: PeerResolverEvent) => void;
     acquireSlot: () => boolean;
@@ -272,6 +320,16 @@ function handleConnection(
 ): void {
   let buffer = "";
   let handled = false;
+  // Fix-round LOW: ONE request per connection, contract-enforced. Set the
+  // instant the FIRST syntactically valid request line is recognized --
+  // BEFORE the (async) lookup dispatches, not only when `respond()` finally
+  // fires. Without this, additional pipelined newline-terminated lines
+  // arriving while the first lookup is still in flight would each re-enter
+  // this handler and dispatch their OWN root `lsof`, letting one connection
+  // consume multiple lookup slots (the header's documented "ONE request then
+  // ONE response per connection" was aspirational, not enforced, before
+  // this).
+  let requestAccepted = false;
   const respond = (resp: PeerResolveResponse): void => {
     if (handled) return;
     handled = true;
@@ -284,7 +342,7 @@ function handleConnection(
   socket.setTimeout(PEER_RESOLVER_IDLE_TIMEOUT_MS, () => socket.destroy());
   socket.on("error", () => undefined);
   socket.on("data", (chunk: Buffer) => {
-    if (handled) return;
+    if (handled || requestAccepted) return;
     buffer += chunk.toString("utf8");
     if (Buffer.byteLength(buffer, "utf8") > PEER_RESOLVER_MAX_FRAME_BYTES) {
       ctx.onEvent({ kind: "request_denied", agentUid: ctx.agentUid, reason: "malformed_request" });
@@ -300,6 +358,10 @@ function handleConnection(
       respond({ v: 1, ok: false, reason: "malformed_request" });
       return;
     }
+    // One syntactically valid request accepted: any further bytes on this
+    // connection are ignored from here on, whether or not this request ends
+    // up rate-limited.
+    requestAccepted = true;
     if (!ctx.acquireSlot()) {
       ctx.onEvent({ kind: "request_denied", agentUid: ctx.agentUid, reason: "rate_limited" });
       respond({ v: 1, ok: false, reason: "rate_limited" });
@@ -314,7 +376,10 @@ function handleConnection(
           respond({ v: 1, ok: true, peer: null });
           return;
         }
-        const peer = parseLsofPeer(result.stdout, req.clientPort, selfPid);
+        // FULL-4-TUPLE MATCH (fix-round BLOCKER): gatePort is THIS daemon's
+        // OWN construction dependency, never anything from `req`, so the
+        // match can never be steered by the wire caller. See peer-identity.ts.
+        const peer = parseLsofPeer(result.stdout, req.clientPort, selfPid, ctx.gatePort);
         ctx.onEvent({
           kind: "request_resolved",
           agentUid: ctx.agentUid,
@@ -356,6 +421,9 @@ export async function runPeerResolverDaemon(deps: PeerResolverDaemonDeps): Promi
   if (deps.agentUid === deps.gateUid) {
     throw new Error("peer-resolver daemon: agent uid and gate uid must be distinct principals");
   }
+  if (!Number.isInteger(deps.gatePort) || deps.gatePort < 1 || deps.gatePort > 65535) {
+    throw new Error(`peer-resolver daemon: gate port must be a valid TCP port (got ${String(deps.gatePort)})`);
+  }
   const dir = deps.socketDir ?? PEER_RESOLVER_DIR;
   const socketPath = peerResolverSocketPath(deps.agentUid, dir);
   const runner = deps.runner ?? createExecFilePeerRunner(deps.lookupTimeoutMs);
@@ -386,25 +454,46 @@ export async function runPeerResolverDaemon(deps: PeerResolverDaemonDeps): Promi
   };
 
   const server = createServer((socket) =>
-    handleConnection(socket, { agentUid: deps.agentUid, runner, onEvent, acquireSlot, releaseSlot }),
+    handleConnection(socket, {
+      agentUid: deps.agentUid,
+      gatePort: deps.gatePort,
+      runner,
+      onEvent,
+      acquireSlot,
+      releaseSlot,
+    }),
   );
   server.on("error", (err) => {
     onEvent({ kind: "daemon_error", agentUid: deps.agentUid, message: err.message });
   });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(socketPath, () => {
-      server.removeListener("error", reject);
-      resolve();
+  // UMASK WINDOW (fix-round HIGH): `server.listen()` creates the UDS under
+  // the AMBIENT umask, which can be as permissive as 0 (world-writable
+  // 0777) well before the explicit chmod below ever runs. Force a
+  // restrictive umask around JUST the listen() call, then restore the
+  // process's prior umask immediately once the socket exists -- this
+  // process's other file creations (none in the steady state, but never
+  // assume) must not silently inherit a narrower umask than the caller set.
+  // The plist's own `Umask` key (renderPeerResolverDaemonPlist) is a second,
+  // independent layer that holds even before this code runs.
+  const priorUmask = process.umask(PEER_RESOLVER_SOCKET_UMASK);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, () => {
+        server.removeListener("error", reject);
+        resolve();
+      });
     });
-  });
+  } finally {
+    process.umask(priorUmask);
+  }
   // UID CONFINEMENT (the security-sensitive step): chmod BEFORE chown so the
   // window between bind() and the final permissions is never world-connectable
   // even transiently, then chown to the ONE gate uid this resolver serves.
   await fsOps.chmod(socketPath, 0o600);
   await fsOps.chown(socketPath, deps.gateUid, -1);
 
-  onEvent({ kind: "listening", agentUid: deps.agentUid, socketPath });
+  onEvent({ kind: "listening", agentUid: deps.agentUid, socketPath, gatePort: deps.gatePort });
 
   return {
     server,

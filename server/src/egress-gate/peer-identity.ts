@@ -43,10 +43,26 @@
  * MECHANISM (minimalism ladder): the platform's `lsof` is shelled out to
  * (never a shell string, argv only) instead of adding a native `libproc`
  * dependency. `lsof -nP -Fpun -iTCP@127.0.0.1:<port>` prints the owning
- * pid/uid of every socket on that port; the entry whose LOCAL endpoint is
- * the client's ephemeral port (its name field starts
- * `127.0.0.1:<clientPort>->`) is the peer. The gate's own socket on the
- * same connection has the inverse orientation and is skipped. DEBT: a
+ * pid/uid of every socket on that port; the entry whose FULL loopback
+ * 4-tuple is `127.0.0.1:<clientPort>-><gateHost>:<gatePort>` (an EXACT
+ * match, both endpoints) is the peer. The gate's own socket on the same
+ * connection has the inverse orientation and is skipped.
+ *
+ * FULL-4-TUPLE MATCH (fix-round BLOCKER, `PR1003_PeerResolver_
+ * AdversarialReview_Codex_2026-07-24.md`): `lsof -iTCP@127.0.0.1:<port>`
+ * lists every socket on that LOCAL port, from every uid, regardless of
+ * remote endpoint. With `SO_REUSEADDR` two loopback sockets can share one
+ * local port with different remotes; matching on the LOCAL endpoint alone
+ * (the pre-fix behavior) could pick an agent-owned socket that happens to
+ * reuse the gate's ephemeral client port for something else entirely, and
+ * misattribute a non-agent CONNECT as the agent -- a wrong-ALLOW. Requiring
+ * the REMOTE endpoint to equal the caller's own known `gatePort` closes
+ * this: the caller must always supply the port ITS OWN gate is bound to
+ * (`peer-resolver-daemon.ts` sources it from its own root-written CLI
+ * config, never the wire request; `gate-server.ts` sources it from the
+ * policy it was constructed with), never a value an adversary could steer.
+ * `parseLsofPeer` stays PURE: it takes `gatePort` as a parameter and makes
+ * no policy decision of its own. DEBT: a
  * `proc_pidinfo`/`PROC_PIDFDSOCKETINFO` native path would avoid the lsof
  * dependency (in BOTH the legacy in-process caller and the privileged
  * resolver daemon) at the cost of a native module; the 2026-07-24 fix ships
@@ -90,7 +106,11 @@ export function createExecFilePeerRunner(
 
 /**
  * Parse `lsof -Fpun` field output into per-process socket records and find
- * the one whose LOCAL endpoint is `127.0.0.1:<clientPort>`.
+ * the one whose FULL loopback 4-tuple is EXACTLY
+ * `127.0.0.1:<clientPort>->127.0.0.1:<gatePort>` -- both the local AND the
+ * remote endpoint, not the local endpoint alone (fix-round BLOCKER: see the
+ * module header). `gatePort` must be a value the CALLER independently knows
+ * to be its own gate's port; it is never inferred from `output` itself.
  *
  * lsof field format: each process starts with `p<pid>`, followed by
  * `u<uid>` and one or more file sets whose network name field is
@@ -100,10 +120,17 @@ export function parseLsofPeer(
   output: string,
   clientPort: number,
   selfPid: number,
+  gatePort: number,
 ): LoopbackPeerIdentity | null {
+  if (!Number.isInteger(gatePort) || gatePort < 1 || gatePort > 65535) {
+    // No well-formed gate port to match against: no record can ever
+    // legitimately match, so refuse to scan rather than risk a caller bug
+    // (an absent/invalid gatePort) silently degrading to a local-only match.
+    return null;
+  }
   let pid: number | null = null;
   let uid: number | null = null;
-  const localPrefix = `127.0.0.1:${clientPort}->`;
+  const fullTuple = `127.0.0.1:${clientPort}->127.0.0.1:${gatePort}`;
   for (const line of output.split("\n")) {
     if (line.length === 0) continue;
     const tag = line[0];
@@ -117,7 +144,7 @@ export function parseLsofPeer(
       uid = Number.isInteger(parsed) ? parsed : null;
     } else if (tag === "n") {
       if (
-        rest.startsWith(localPrefix) &&
+        rest === fullTuple &&
         pid !== null &&
         uid !== null &&
         pid !== selfPid
@@ -133,6 +160,15 @@ export function parseLsofPeer(
 export interface ResolveLoopbackPeerOptions {
   /** The connected client's ephemeral port (socket.remotePort). */
   clientPort: number;
+  /**
+   * The gate's OWN port (fix-round BLOCKER): the resolved peer's remote
+   * endpoint must equal this exactly, or it is not a match. REQUIRED and
+   * never optional -- callers must source it from their own authenticated
+   * config (`policy.gate_port` in-process for `gate-server.ts`), never let
+   * it default or be inferred, so there is no silent path back to the
+   * pre-fix local-endpoint-only match.
+   */
+  gatePort: number;
   /** Our own pid, excluded from candidates (defaults to process.pid). */
   selfPid?: number;
   runner?: PeerCommandRunner;
@@ -140,7 +176,8 @@ export interface ResolveLoopbackPeerOptions {
 
 /**
  * Resolve the loopback peer's pid/uid, or `null` when it cannot be
- * determined (lsof missing, raced socket, unparseable output). THIS FUNCTION
+ * determined (lsof missing, raced socket, unparseable output, no record
+ * whose full 4-tuple matches `{clientPort, gatePort}`). THIS FUNCTION
  * never blocks anything itself -- it only reports `null` or a resolved
  * identity. Whether a caller's `null` becomes a deny depends on the calling
  * gate mode (see the module header): advisory in the legacy Slice 2 path,
@@ -149,8 +186,11 @@ export interface ResolveLoopbackPeerOptions {
 export async function resolveLoopbackPeer(
   options: ResolveLoopbackPeerOptions,
 ): Promise<LoopbackPeerIdentity | null> {
-  const { clientPort } = options;
+  const { clientPort, gatePort } = options;
   if (!Number.isInteger(clientPort) || clientPort < 1 || clientPort > 65535) {
+    return null;
+  }
+  if (!Number.isInteger(gatePort) || gatePort < 1 || gatePort > 65535) {
     return null;
   }
   const runner = options.runner ?? createExecFilePeerRunner();
@@ -164,5 +204,5 @@ export async function resolveLoopbackPeer(
   if (result.code !== 0) {
     return null;
   }
-  return parseLsofPeer(result.stdout, clientPort, selfPid);
+  return parseLsofPeer(result.stdout, clientPort, selfPid, gatePort);
 }

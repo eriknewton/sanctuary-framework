@@ -447,7 +447,9 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     activePeerLookups += 1;
     let peer: Awaited<ReturnType<typeof resolveLoopbackPeer>>;
     try {
-      peer = await resolveLoopbackPeer({ clientPort, runner: peerRunner });
+      // gatePort is THIS gate's own committed port (policy.gate_port), never
+      // caller-supplied -- fix-round BLOCKER, see peer-identity.ts.
+      peer = await resolveLoopbackPeer({ clientPort, gatePort: policy.gate_port, runner: peerRunner });
     } finally {
       activePeerLookups -= 1;
     }
@@ -572,6 +574,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
           try {
             peer = await resolveLoopbackPeer({
               clientPort,
+              gatePort: policy.gate_port,
               runner: boundPeerRunner,
             });
           } finally {

@@ -72,7 +72,7 @@ function peerRunnerReporting(uid: number): PeerCommandRunner {
     run: (_c, args) => {
       const portArg = /:(\d+)$/.exec(args[2] ?? "");
       const clientPort = portArg ? Number(portArg[1]) : 0;
-      return Promise.resolve({ code: 0, stdout: [`p999`, `u${uid}`, `n127.0.0.1:${clientPort}->127.0.0.1:x`, ""].join("\n") });
+      return Promise.resolve({ code: 0, stdout: [`p999`, `u${uid}`, `n127.0.0.1:${clientPort}->127.0.0.1:19997`, ""].join("\n") });
     },
   };
 }

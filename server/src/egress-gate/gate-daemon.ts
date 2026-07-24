@@ -444,6 +444,9 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
     deps.peerRunner ??
     createPrivilegedPeerRunner({
       agentUid: deps.agentUid,
+      // gatePort is THIS daemon's own loaded+validated policy port (fix-round
+      // BLOCKER) -- never anything the resolver daemon's answer carries.
+      gatePort: policy.gate_port,
       socketPath: peerResolverSocketPath(deps.agentUid, deps.peerResolverDir ?? PEER_RESOLVER_DIR),
     });
 

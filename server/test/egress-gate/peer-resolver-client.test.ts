@@ -27,6 +27,7 @@ import { encodePeerResolveResponse } from "../../src/egress-gate/peer-resolver-p
 const AGENT_UID = 502;
 const GATE_UID = 511;
 const LSOF_ARGS = (port: number): string[] => ["-nP", "-Fpun", `-iTCP@127.0.0.1:${port}`];
+const GATE_PORT = 19998;
 
 function fakeFsOps() {
   return {
@@ -39,7 +40,7 @@ function fakeFsOps() {
 
 describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
   it("refuses a non-positive agent uid at construction", () => {
-    expect(() => createPrivilegedPeerRunner({ agentUid: 0 })).toThrow(/agent uid must be a positive integer/);
+    expect(() => createPrivilegedPeerRunner({ agentUid: 0, gatePort: GATE_PORT })).toThrow(/agent uid must be a positive integer/);
   });
 
   describe("scope discipline: only ever proxies the ONE expected lsof invocation shape", () => {
@@ -47,6 +48,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
       let dialed = false;
       const runner = createPrivilegedPeerRunner({
         agentUid: AGENT_UID,
+        gatePort: GATE_PORT,
         connect: () => {
           dialed = true;
           return new EventEmitter() as unknown as Socket;
@@ -61,6 +63,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
       let dialed = false;
       const runner = createPrivilegedPeerRunner({
         agentUid: AGENT_UID,
+        gatePort: GATE_PORT,
         connect: () => {
           dialed = true;
           return new EventEmitter() as unknown as Socket;
@@ -76,6 +79,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
     it("connect() throwing synchronously resolves the synthetic failure", async () => {
       const runner = createPrivilegedPeerRunner({
         agentUid: AGENT_UID,
+        gatePort: GATE_PORT,
         connect: () => {
           throw new Error("ENOENT: no such socket");
         },
@@ -86,7 +90,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
     it("a socket 'error' event resolves the synthetic failure", async () => {
       const emitter = new EventEmitter() as unknown as Socket;
       (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
-      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, connect: () => emitter });
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("error", new Error("ECONNREFUSED"));
       await expect(promise).resolves.toEqual({ code: 127, stdout: "" });
@@ -95,7 +99,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
     it("a socket 'close' before any response resolves the synthetic failure", async () => {
       const emitter = new EventEmitter() as unknown as Socket;
       (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
-      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, connect: () => emitter });
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("close");
       await expect(promise).resolves.toEqual({ code: 127, stdout: "" });
@@ -104,7 +108,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
     it("a TIMEOUT (no response ever arrives) resolves the synthetic failure, never hangs the caller", async () => {
       const emitter = new EventEmitter() as unknown as Socket;
       (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
-      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, connect: () => emitter, timeoutMs: 20 });
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter, timeoutMs: 20 });
       await expect(runner.run("lsof", LSOF_ARGS(52344))).resolves.toEqual({ code: 127, stdout: "" });
     });
 
@@ -112,7 +116,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
       const emitter = new EventEmitter() as unknown as Socket;
       (emitter as unknown as { write: () => boolean; destroy: () => void }).write = () => true;
       (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
-      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, connect: () => emitter });
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("connect");
       emitter.emit("data", Buffer.from("not json at all\n"));
@@ -123,7 +127,7 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
       const emitter = new EventEmitter() as unknown as Socket;
       (emitter as unknown as { write: () => boolean; destroy: () => void }).write = () => true;
       (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
-      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, connect: () => emitter });
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("connect");
       emitter.emit("data", encodePeerResolveResponse({ v: 1, ok: false, reason: "rate_limited" }));
@@ -136,26 +140,26 @@ describe("egress-gate/peer-resolver-client createPrivilegedPeerRunner", () => {
       const emitter = new EventEmitter() as unknown as Socket;
       (emitter as unknown as { write: () => boolean; destroy: () => void }).write = () => true;
       (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
-      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, connect: () => emitter });
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("connect");
       emitter.emit("data", encodePeerResolveResponse({ v: 1, ok: true, peer: { uid: 502, pid: 20439 } }));
       const result = await promise;
       expect(result.code).toBe(0);
-      expect(parseLsofPeer(result.stdout, 52344, /* selfPid */ 1)).toEqual({ pid: 20439, uid: 502 });
+      expect(parseLsofPeer(result.stdout, 52344, /* selfPid */ 1, GATE_PORT)).toEqual({ pid: 20439, uid: 502 });
     });
 
     it("an unresolved (peer:null) response synthesizes empty stdout, parsing to null", async () => {
       const emitter = new EventEmitter() as unknown as Socket;
       (emitter as unknown as { write: () => boolean; destroy: () => void }).write = () => true;
       (emitter as unknown as { destroy: () => void }).destroy = () => undefined;
-      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, connect: () => emitter });
+      const runner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, connect: () => emitter });
       const promise = runner.run("lsof", LSOF_ARGS(52344));
       emitter.emit("connect");
       emitter.emit("data", encodePeerResolveResponse({ v: 1, ok: true, peer: null }));
       const result = await promise;
       expect(result).toEqual({ code: 0, stdout: "" });
-      expect(parseLsofPeer(result.stdout, 52344, 1)).toBeNull();
+      expect(parseLsofPeer(result.stdout, 52344, 1, GATE_PORT)).toBeNull();
     });
   });
 });
@@ -186,23 +190,25 @@ describe("egress-gate/peer-resolver-client + peer-resolver-daemon: real end-to-e
     handle = await runPeerResolverDaemon({
       agentUid: AGENT_UID,
       gateUid: GATE_UID,
+      gatePort: GATE_PORT,
       socketDir,
       runner: rootRunner,
       fsOps: fakeFsOps(),
       onEvent: () => undefined,
     });
-    const clientRunner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, socketPath: handle.socketPath });
+    const clientRunner = createPrivilegedPeerRunner({ agentUid: AGENT_UID, gatePort: GATE_PORT, socketPath: handle.socketPath });
     // The EXACT same call `peer-identity.ts`'s resolveLoopbackPeer makes, unmodified.
-    const peer = await resolveLoopbackPeer({ clientPort: 52344, selfPid: 1, runner: clientRunner });
+    const peer = await resolveLoopbackPeer({ clientPort: 52344, gatePort: GATE_PORT, selfPid: 1, runner: clientRunner });
     expect(peer).toEqual({ pid: 20439, uid: 502 });
   });
 
   it("resolver daemon unreachable (never started): the client's transport failure denies fail-closed, never throws", async () => {
     const clientRunner = createPrivilegedPeerRunner({
       agentUid: AGENT_UID,
+      gatePort: GATE_PORT,
       socketPath: join(socketDir, "999.sock"), // nothing listening here
     });
-    const peer = await resolveLoopbackPeer({ clientPort: 52344, selfPid: 1, runner: clientRunner });
+    const peer = await resolveLoopbackPeer({ clientPort: 52344, gatePort: GATE_PORT, selfPid: 1, runner: clientRunner });
     expect(peer).toBeNull();
   });
 });

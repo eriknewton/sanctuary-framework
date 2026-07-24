@@ -49,6 +49,16 @@ const FAILURE_RESULT = { code: SYNTHETIC_FAILURE_CODE, stdout: "" } as const;
 export interface PrivilegedPeerRunnerOptions {
   /** The confined agent uid this gate serves (selects the resolver socket). */
   agentUid: number;
+  /**
+   * THIS gate's own committed port (fix-round BLOCKER; `policy.gate_port` at
+   * the `gate-daemon.ts` wiring site). REQUIRED -- embedded into the
+   * synthesized lsof-shaped stdout as the REMOTE endpoint so it survives the
+   * round trip through the UNCHANGED, now full-4-tuple-matching
+   * `parseLsofPeer` (`peer-identity.ts`). Sourced from the gate daemon's own
+   * loaded+validated policy, never from anything the resolver daemon's
+   * answer itself carries.
+   */
+  gatePort: number;
   /** Socket path override (default: {@link peerResolverSocketPath}(agentUid)). */
   socketPath?: string;
   /** Round-trip timeout override. */
@@ -66,9 +76,15 @@ function extractClientPort(args: readonly string[]): number | null {
   return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : null;
 }
 
-/** Synthesize the minimal lsof-`-Fpun`-shaped stdout `parseLsofPeer` expects. */
-function synthesizeLsofStdout(clientPort: number, peer: { uid: number; pid: number }): string {
-  return [`p${peer.pid}`, `u${peer.uid}`, `n127.0.0.1:${clientPort}->127.0.0.1:0`, ""].join("\n");
+/**
+ * Synthesize the minimal lsof-`-Fpun`-shaped stdout `parseLsofPeer` expects.
+ * `gatePort` is THIS caller's own gate port (never the resolver's answer),
+ * embedded as the remote endpoint so the full-4-tuple match in
+ * `parseLsofPeer` (fix-round BLOCKER) succeeds for a genuinely-scoped
+ * resolver answer.
+ */
+function synthesizeLsofStdout(clientPort: number, peer: { uid: number; pid: number }, gatePort: number): string {
+  return [`p${peer.pid}`, `u${peer.uid}`, `n127.0.0.1:${clientPort}->127.0.0.1:${gatePort}`, ""].join("\n");
 }
 
 /**
@@ -81,6 +97,10 @@ export function createPrivilegedPeerRunner(options: PrivilegedPeerRunnerOptions)
   if (!Number.isInteger(options.agentUid) || options.agentUid <= 0) {
     throw new Error(`privileged peer runner: agent uid must be a positive integer (got ${String(options.agentUid)})`);
   }
+  if (!Number.isInteger(options.gatePort) || options.gatePort < 1 || options.gatePort > 65535) {
+    throw new Error(`privileged peer runner: gate port must be a valid TCP port (got ${String(options.gatePort)})`);
+  }
+  const gatePort = options.gatePort;
   const socketPath = options.socketPath ?? peerResolverSocketPath(options.agentUid);
   const timeoutMs = options.timeoutMs ?? PRIVILEGED_PEER_RUNNER_TIMEOUT_MS;
   const connect = options.connect ?? ((path: string): Socket => createConnection(path));
@@ -142,7 +162,7 @@ export function createPrivilegedPeerRunner(options: PrivilegedPeerRunnerOptions)
             settle({ code: 0, stdout: "" });
             return;
           }
-          settle({ code: 0, stdout: synthesizeLsofStdout(clientPort, resp.peer) });
+          settle({ code: 0, stdout: synthesizeLsofStdout(clientPort, resp.peer, gatePort) });
         });
         socket.on("error", () => settle(FAILURE_RESULT));
         socket.on("close", () => settle(FAILURE_RESULT));
