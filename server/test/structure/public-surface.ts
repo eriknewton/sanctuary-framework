@@ -368,35 +368,122 @@ export function serverSrcTrackedTs(): string[] {
 /**
  * Strip JS/TS comments so a source file is scanned for em-dashes in EXECUTABLE
  * code / STRING LITERALS only (the no-em-dash rule exempts code comments but
- * NOT user-visible strings). Uses the TypeScript SCANNER, not a regex: a regex
- * stripper would wrongly delete `//` or `/* *\/` sequences that appear INSIDE a
- * string literal (e.g. `const m = "status // bad — visible"`), hiding a real
- * user-visible em-dash. The scanner tokenises correctly, so such a `//` is part
- * of the string token and is preserved. Shared here so em-dash.test.ts and
- * gen-em-dash-baseline.ts always use the same strip (or they drift the baseline).
+ * NOT user-visible strings). Shared here so em-dash.test.ts and
+ * gen-em-dash-baseline.ts always use the same strip (or they drift the
+ * baseline).
+ *
+ * PARSER-BACKED, NOT SCANNER-BACKED (guard-integrity fix round 2, registry row
+ * `sanctuary-structure-guard-stripcodecomments-desync`): a first attempt at
+ * this function drove the raw TypeScript SCANNER token-by-token and tracked
+ * template-interpolation brace depth by hand so it could tell a real
+ * `CloseBraceToken` apart from the `}` that closes a `` ${...} `` interpolation.
+ * That is unsound in general: whether a `/` starts a RegExpLiteral or a
+ * division operator is a GRAMMAR fact (it depends on what kind of token can
+ * legally precede it), not something a context-free scanner can always get
+ * right by counting braces. A template interpolation containing a regex
+ * literal with an unmatched brace --
+ * `` const x = `a${/{/.test(s)} // tail—`; `` -- desynced the hand-rolled
+ * brace counter: the scanner read the regex's `{` as an ordinary
+ * `OpenBraceToken`, so the real interpolation-closing `}` looked like it still
+ * had one more nested brace to close, and the template's tail (real STRING
+ * content, including a genuine em-dash after what merely LOOKS like `//`) got
+ * re-lexed as bare code and stripped as a comment. No amount of additional
+ * brace-tracking closes this class of bug, because the scanner alone never
+ * has enough context to disambiguate regex-vs-division; only a real parser
+ * does.
+ *
+ * So this function now hands the source to `ts.createSourceFile` -- the same
+ * parser TypeScript itself uses -- and asks it, via `node.getChildren()`,
+ * which byte ranges are COMMENT TRIVIA. The parser resolves every regex vs.
+ * division, template head/middle/tail, and nested-brace ambiguity correctly by
+ * construction (that is its actual job), so a comment range this function
+ * receives can never overlap a string, template, or regex literal: those are
+ * each a single token in the parser's output, and a "comment range" is by
+ * definition a span of TRIVIA the parser found strictly BETWEEN two tokens,
+ * never inside one. Concretely, walking `getChildren()` down to every leaf
+ * token and collecting `ts.getLeadingCommentRanges` at each token's full start
+ * (`node.pos`, which includes leading trivia) plus `ts.getTrailingCommentRanges`
+ * at each token's end covers every comment in the file exactly once (the two
+ * calls overlap on same-line trailing comments; ranges are deduped by exact
+ * [pos, end) so nothing is double-counted). Walking all the way to
+ * `sourceFile.endOfFileToken` (also a real child token) catches a dangling
+ * comment with no following statement. Only the identified comment ranges are
+ * blanked -- same-length, newline-preserving, exactly as the prior
+ * implementation did -- so line numbers survive and every character of every
+ * string/template/regex literal is guaranteed to pass through untouched. If
+ * this function ever under-collects a genuine comment (it should not, but if
+ * some exotic trivia shape slips past both calls), the failure mode is a
+ * harmless false positive -- a comment em-dash left in place -- never a
+ * stripped string/template em-dash; the reverse (over-collecting, i.e. ever
+ * treating literal content as a comment) is structurally impossible because
+ * ranges come only from the parser's own trivia boundaries.
+ *
+ * `rel` (optional, repo-relative path) selects the parse `ScriptKind`: `.tsx`/
+ * `.jsx` parse as `ts.ScriptKind.TSX` (JSX changes how `<` is tokenized), every
+ * other in-scope extension (`.ts`, `.mts`, `.cts`, `.js`, `.mjs`, `.cjs`, and no
+ * `rel` at all) parses as `ts.ScriptKind.TS`. Today's first-party source tree
+ * has zero `.tsx`/`.jsx` files (verified against `firstPartySourceFiles()`),
+ * so this is pure future-proofing against a file extension `isFirstPartySourceCode`
+ * already accepts (see `SERVER_SRC_CODE_EXT` above) but no current file uses.
  */
-export function stripCodeComments(source: string): string {
-  const scanner = ts.createScanner(
-    ts.ScriptTarget.Latest,
-    /*skipTrivia*/ false,
-    ts.LanguageVariant.Standard,
-    source,
-  );
-  let out = "";
-  let token = scanner.scan();
-  while (token !== ts.SyntaxKind.EndOfFileToken) {
-    if (
-      token !== ts.SyntaxKind.SingleLineCommentTrivia &&
-      token !== ts.SyntaxKind.MultiLineCommentTrivia
-    ) {
-      // keep the raw text of every non-comment token (incl. whitespace/strings)
-      out += scanner.getTokenText();
-    } else {
-      // replace the comment with newlines so line structure (and any error
-      // line numbers) is preserved without keeping comment-resident em-dashes.
-      out += scanner.getTokenText().replace(/[^\n]/g, "");
+function scriptKindFor(rel: string | undefined): ts.ScriptKind {
+  const e = rel ? ext(rel) : "";
+  return e === "tsx" || e === "jsx" ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+}
+
+/**
+ * Collect every comment's [pos, end) byte range in `sourceFile`, deduped and
+ * sorted by position. See the `stripCodeComments` doc comment above for why
+ * walking `getChildren()` to every leaf token and combining leading + trailing
+ * comment ranges at each token cannot include a string/template/regex byte.
+ */
+function collectCommentRanges(
+  sourceFile: ts.SourceFile,
+): Array<{ pos: number; end: number }> {
+  const text = sourceFile.text;
+  const seen = new Set<string>();
+  const ranges: Array<{ pos: number; end: number }> = [];
+
+  function add(rs: ts.CommentRange[] | undefined): void {
+    if (!rs) return;
+    for (const r of rs) {
+      const key = `${r.pos}:${r.end}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        ranges.push({ pos: r.pos, end: r.end });
+      }
     }
-    token = scanner.scan();
+  }
+
+  function visit(node: ts.Node): void {
+    add(ts.getLeadingCommentRanges(text, node.pos));
+    add(ts.getTrailingCommentRanges(text, node.end));
+    node.getChildren(sourceFile).forEach(visit);
+  }
+
+  visit(sourceFile);
+  return ranges.sort((a, b) => a.pos - b.pos);
+}
+
+export function stripCodeComments(source: string, rel?: string): string {
+  const sourceFile = ts.createSourceFile(
+    rel ?? "source.ts",
+    source,
+    ts.ScriptTarget.Latest,
+    /*setParentNodes*/ true,
+    scriptKindFor(rel),
+  );
+  const ranges = collectCommentRanges(sourceFile);
+
+  let out = source;
+  // Blank ranges back-to-front so earlier offsets stay valid as we splice.
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    const { pos, end } = ranges[i];
+    // Replace the comment with newlines only, so line structure (and any
+    // error line numbers) is preserved without keeping comment-resident
+    // em-dashes -- identical blanking behavior to the prior implementation.
+    const blanked = source.slice(pos, end).replace(/[^\n]/g, "");
+    out = out.slice(0, pos) + blanked + out.slice(end);
   }
   return out;
 }
