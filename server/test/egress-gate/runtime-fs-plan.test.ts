@@ -25,6 +25,7 @@ import {
 import { EGRESS_GATE_RUNTIME_DIR, egressGateRuntimeUidDirPath, egressGateRuntimeStatePath } from "../../src/egress-gate/gate-daemon.js";
 import { GATE_CRED_DIR } from "../../src/egress-gate/gate-credential.js";
 import { GATE_LIVENESS_DIR } from "../../src/egress-gate/liveness-oracle.js";
+import { PEER_RESOLVER_DIR } from "../../src/egress-gate/peer-resolver-daemon.js";
 import { AGENT_HARNESS_HOLD_DIR } from "../../src/egress-gate/release-barrier.js";
 
 const AGENT_UID = 502;
@@ -56,6 +57,12 @@ describe("planExclusiveEgressRuntimeFs", () => {
       { op: "mkdir", path: "/var/db/sanctuary/gate-liveness" },
       { op: "chown", path: "/var/db/sanctuary/gate-liveness", uid: 0, gid: 0 },
       { op: "chmod", path: "/var/db/sanctuary/gate-liveness", mode: 0o711 },
+      // 2026-07-24 S5-3 fix: same traversal model for the privileged
+      // peer-resolver's per-agent socket (the socket FILE itself is bound +
+      // chowned to the gate uid by peer-resolver-daemon.ts, not this plan).
+      { op: "mkdir", path: "/var/db/sanctuary/gate-peer-resolver" },
+      { op: "chown", path: "/var/db/sanctuary/gate-peer-resolver", uid: 0, gid: 0 },
+      { op: "chmod", path: "/var/db/sanctuary/gate-peer-resolver", mode: 0o711 },
       // Hold dir: agent uid reads the hold file + wrapper.
       { op: "mkdir", path: "/var/db/sanctuary/agent-harness" },
       { op: "chown", path: "/var/db/sanctuary/agent-harness", uid: 0, gid: 0 },
@@ -69,6 +76,7 @@ describe("planExclusiveEgressRuntimeFs", () => {
     expect(mkdirs).toContain(EGRESS_GATE_RUNTIME_DIR);
     expect(mkdirs).toContain(GATE_CRED_DIR);
     expect(mkdirs).toContain(GATE_LIVENESS_DIR);
+    expect(mkdirs).toContain(PEER_RESOLVER_DIR);
     expect(mkdirs).toContain(AGENT_HARNESS_HOLD_DIR);
     expect(mkdirs).toContain(egressGateRuntimeUidDirPath(AGENT_UID));
     expect(mkdirs[0]).toBe(SANCTUARY_VAR_DB_DIR);
@@ -124,7 +132,8 @@ describe("applyGateRuntimeFsPlan", () => {
     expect(calls).toContain(`chown /var/db/sanctuary/gate-runtime/502 ${GATE_UID}:0`);
     expect(calls).toContain("chmod /var/db/sanctuary/gate-cred 0o711");
     expect(calls).toContain("chmod /var/db/sanctuary/gate-liveness 0o711");
-    expect(calls).toHaveLength(18);
+    expect(calls).toContain("chmod /var/db/sanctuary/gate-peer-resolver 0o711");
+    expect(calls).toHaveLength(21);
   });
 
   it("fail-closed: the first failing step throws (named) and nothing continues", async () => {

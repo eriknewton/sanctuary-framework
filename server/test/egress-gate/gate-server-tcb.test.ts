@@ -78,7 +78,7 @@ function peerRunnerReporting(uid: number): PeerCommandRunner {
       const clientPort = portArg ? Number(portArg[1]) : 0;
       return Promise.resolve({
         code: 0,
-        stdout: [`p999`, `u${uid}`, `n127.0.0.1:${clientPort}->127.0.0.1:x`, ""].join("\n"),
+        stdout: [`p999`, `u${uid}`, `n127.0.0.1:${clientPort}->127.0.0.1:19998`, ""].join("\n"),
       });
     },
   };
@@ -383,7 +383,7 @@ describe("egress-gate/gate-server TCB fail-closed client auth", () => {
     peerRunnerObj.run = (_c, args) => {
       const portArg = /:(\d+)$/.exec(args[2] ?? "");
       const clientPort = portArg ? Number(portArg[1]) : 0;
-      return Promise.resolve({ code: 0, stdout: [`p1`, `u999`, `n127.0.0.1:${clientPort}->127.0.0.1:x`, ""].join("\n") });
+      return Promise.resolve({ code: 0, stdout: [`p1`, `u999`, `n127.0.0.1:${clientPort}->127.0.0.1:19998`, ""].join("\n") });
     };
     const result = await rawConnect(port, `127.0.0.1:${upstream.port}`, validHeader);
     expect(result.statusLine).toBe("HTTP/1.1 200 Connection Established"); // original check + runner still used

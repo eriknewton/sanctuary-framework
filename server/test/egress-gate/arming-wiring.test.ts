@@ -28,6 +28,8 @@ import {
   type RootOwnedDirEnsureOps,
   restoreCoarseCompositionProduction,
   reconcileStaleExclusiveRoutingProduction,
+  reloadPeerResolverDaemonForBringUp,
+  reloadLaunchdDaemonForBringUp,
   describeGateDaemonStderrTail,
   waitForGateRuntime,
   GATE_DAEMON_STDERR_TAIL_MAX_LINES,
@@ -47,6 +49,7 @@ import {
   gateCredentialTokenPath,
 } from "../../src/egress-gate/gate-credential.js";
 import {
+  egressGateDaemonLabel,
   egressGateDaemonLogPaths,
   egressGateDaemonPlistPath,
   egressGatePolicyConfigPath,
@@ -54,7 +57,8 @@ import {
   egressGateRuntimeUidDirPath,
 } from "../../src/egress-gate/gate-daemon.js";
 import { gateLivenessTokenPath } from "../../src/egress-gate/liveness-oracle.js";
-import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
+import { peerResolverDaemonLabel, peerResolverDaemonPlistPath } from "../../src/egress-gate/peer-resolver-daemon.js";
+import { AGENT_HARNESS_DAEMON_LABEL, HARNESS_STOP_SETTLE_SAMPLES } from "../../src/egress-gate/harness-daemon.js";
 import {
   holdFilePathForUid,
   planParkedHarnessInstall,
@@ -837,6 +841,35 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     );
   });
 
+  it("bootoutGateDaemon (2026-07-24 S5-3 fix): ALSO boots out the peer-resolver daemon, gate FIRST", async () => {
+    const calls: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      runLaunchctl: async (args) => {
+        calls.push(args.join(" "));
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await ops.bootoutGateDaemon();
+    expect(calls).toEqual([
+      "bootout system/ai.sanctuaryprotocol.egress-gate.601",
+      "bootout system/ai.sanctuaryprotocol.egress-gate-peer-resolver.601",
+    ]);
+  });
+
+  it("bootoutGateDaemon: a peer-resolver-only failure (gate stops fine) THROWS with the resolver label named", async () => {
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      runLaunchctl: async (args) => {
+        if (args.join(" ").includes("peer-resolver")) {
+          return { code: 5, stdout: "", stderr: "Boot-out failed: 5: Input/output error" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await expect(ops.bootoutGateDaemon()).rejects.toThrow(
+      /bootout ai\.sanctuaryprotocol\.egress-gate-peer-resolver\.601 exited 5/,
+    );
+  });
+
   it("credential + oracle teardown removes EXACTLY the single-source uid-keyed paths (no constructed authority needed)", async () => {
     const removed: string[] = [];
     const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
@@ -863,6 +896,7 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     await ops.removeGateSurfaces();
     expect(removed).toEqual([
       egressGateDaemonPlistPath(601),
+      peerResolverDaemonPlistPath(601),
       egressGatePolicyConfigPath(601),
       egressGateRulesConfigPath(601),
       egressGateRuntimeUidDirPath(601),
@@ -1623,5 +1657,322 @@ describe("waitForGateRuntime timeout diagnostics (Change 2)", () => {
     await expect(
       waitForGateRuntime(707, 5, 49222, { readState: NEVER_ENOENT, budgetMs: 5, intervalMs: 1 }),
     ).rejects.toThrow(/did not publish a matching runtime state within 5ms/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix-round-2 BLOCKER (2026-07-24 re-gate): the peer-resolver RELOAD on a
+// production bring-up must force-replace the loaded launchd job (bootout
+// FIRST, then bootstrap + kickstart) so a rewritten `--gate-port` argv is
+// guaranteed loaded after a repair/rotation. A plain bootstrap of an
+// already-loaded label + a plain kickstart (no -k) would leave the running
+// resolver on its OLD port -> the stale-resolver fail-open the re-gate caught.
+//
+// FIX-ROUND-3 (2026-07-24 THIRD re-gate, both lenses, SOUND-WITH-FIXES): the
+// round-2 fix above went straight from a tolerated bootout to bootstrap,
+// which does not prove the old process was reaped (F2, the reap race) and
+// threw on a transient EINPROGRESS bootout that would have settled a moment
+// later (F1). The reload now mirrors `uninstallAgentHarnessDaemon`'s settle
+// discipline (`harness-daemon.ts:429-451`): tolerate EINPROGRESS same as
+// not-loaded, settle via `launchctl print` before bootstrapping, and fail
+// closed if the old job will not settle.
+// ---------------------------------------------------------------------------
+describe("reloadPeerResolverDaemonForBringUp (fix-round-2 BLOCKER + fix-round-3 settle discipline)", () => {
+  const AGENT_UID = 502;
+  const RESOLVER_LABEL = peerResolverDaemonLabel(AGENT_UID);
+  const RESOLVER_PLIST = peerResolverDaemonPlistPath(AGENT_UID);
+
+  /** `launchctl print system/<RESOLVER_LABEL>` stdout reporting a running pid. */
+  function runningPrintStdout(pid: number): string {
+    return `system/${RESOLVER_LABEL} = {\n\tpid = ${pid}\n\tstate = running\n}\n`;
+  }
+
+  function recordingLaunchctl(
+    handlers: Partial<Record<"bootout" | "bootstrap" | "kickstart", { code: number; stderr?: string }>> & {
+      /**
+       * `launchctl print system/<label>` response(s) for the settle loop. A
+       * single response repeats for every sample; an array is consumed
+       * in call order and its LAST entry repeats once exhausted. Defaults to
+       * "not loaded" so the settle loop resolves on its first sample when a
+       * test does not care about the settle behavior itself.
+       */
+      print?: { code: number; stdout?: string; stderr?: string } | Array<{ code: number; stdout?: string; stderr?: string }>;
+    } = {},
+  ): {
+    fn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+    calls: string[];
+  } {
+    const calls: string[] = [];
+    let printCallCount = 0;
+    return {
+      calls,
+      fn: (args) => {
+        const verb = args[0] as "bootout" | "bootstrap" | "kickstart" | "print";
+        calls.push(args.join(" "));
+        if (verb === "print") {
+          const responses = handlers.print;
+          const fallback = { code: 113, stdout: "", stderr: "Could not find service" };
+          if (Array.isArray(responses)) {
+            const idx = Math.min(printCallCount, responses.length - 1);
+            printCallCount += 1;
+            const resp = responses[idx] ?? fallback;
+            return Promise.resolve({ code: resp.code, stdout: resp.stdout ?? "", stderr: resp.stderr ?? "" });
+          }
+          printCallCount += 1;
+          const resp = responses ?? fallback;
+          return Promise.resolve({ code: resp.code, stdout: resp.stdout ?? "", stderr: resp.stderr ?? "" });
+        }
+        const h = handlers[verb];
+        return Promise.resolve({ code: h?.code ?? 0, stdout: "", stderr: h?.stderr ?? "" });
+      },
+    };
+  }
+
+  /** Calls the function under test with a no-op sleep so settle-loop tests run instantly. */
+  function reload(
+    fn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>,
+  ): Promise<void> {
+    return reloadPeerResolverDaemonForBringUp({
+      agentUid: AGENT_UID,
+      resolverPlistPath: RESOLVER_PLIST,
+      runLaunchctlFn: fn,
+      sleepMs: async () => {},
+    });
+  }
+
+  it("boots the OLD job OUT, settles via print, THEN bootstraps the rewritten plist, then kickstarts (exact order)", async () => {
+    const { fn, calls } = recordingLaunchctl();
+    await expect(reload(fn)).resolves.toBeUndefined();
+    expect(calls).toEqual([
+      `bootout system/${RESOLVER_LABEL}`,
+      `print system/${RESOLVER_LABEL}`,
+      `bootstrap system ${RESOLVER_PLIST}`,
+      `kickstart system/${RESOLVER_LABEL}`,
+    ]);
+    // The bootout MUST precede the settle print, which MUST precede the
+    // bootstrap (the whole point of both the round-2 and round-3 fixes).
+    expect(calls.indexOf(`bootout system/${RESOLVER_LABEL}`)).toBeLessThan(
+      calls.indexOf(`print system/${RESOLVER_LABEL}`),
+    );
+    expect(calls.indexOf(`print system/${RESOLVER_LABEL}`)).toBeLessThan(
+      calls.indexOf(`bootstrap system ${RESOLVER_PLIST}`),
+    );
+  });
+
+  it("TOLERATES a not-loaded bootout (clean first install: nothing was running) and proceeds to bootstrap", async () => {
+    for (const notLoaded of [
+      { code: 3, stderr: "Boot-out failed: 3: No such process" },
+      { code: 113, stderr: "Could not find service" },
+      { code: 1, stderr: "service not loaded" },
+    ]) {
+      const { fn, calls } = recordingLaunchctl({ bootout: notLoaded });
+      await expect(reload(fn)).resolves.toBeUndefined();
+      // It did not throw AND it went on to bootstrap + kickstart.
+      expect(calls).toContain(`bootstrap system ${RESOLVER_PLIST}`);
+      expect(calls).toContain(`kickstart system/${RESOLVER_LABEL}`);
+    }
+  });
+
+  it("THROWS on a GENUINE bootout failure (the tolerance did not swallow a real stop failure), never proceeding to settle or bootstrap", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      bootout: { code: 5, stderr: "Boot-out failed: 5: Input/output error" },
+    });
+    await expect(reload(fn)).rejects.toThrow(/bootout .* exited 5/);
+    expect(calls).not.toContain(`print system/${RESOLVER_LABEL}`);
+    expect(calls).not.toContain(`bootstrap system ${RESOLVER_PLIST}`);
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX-ROUND-3 regression tests (THIRD re-gate, both lenses SOUND-WITH-FIXES,
+  // 2026-07-24). Mirrors `uninstallAgentHarnessDaemon`'s settle discipline
+  // (harness-daemon.ts:429-451): tolerate EINPROGRESS (F1), settle before
+  // bootstrap (F2a), and fail closed if the old job never settles (F2b).
+  // -------------------------------------------------------------------------
+
+  it("T-F1: TOLERATES an EINPROGRESS bootout (transient in-flight stop) and settles before bootstrapping", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      bootout: { code: 36, stderr: "Boot-out failed: 36: Operation now in progress" },
+      print: [
+        { code: 0, stdout: runningPrintStdout(4242) }, // still tearing down
+        { code: 113, stderr: "Could not find service" }, // now gone
+      ],
+    });
+    await expect(reload(fn)).resolves.toBeUndefined();
+    const printCalls = calls.filter((c) => c === `print system/${RESOLVER_LABEL}`);
+    expect(printCalls.length).toBe(2); // it settled, not a single sample
+    expect(calls).toContain(`bootstrap system ${RESOLVER_PLIST}`);
+    expect(calls).toContain(`kickstart system/${RESOLVER_LABEL}`);
+    // Bootstrap only fires after the settle loop's LAST print call.
+    expect(calls.lastIndexOf(`print system/${RESOLVER_LABEL}`)).toBeLessThan(
+      calls.indexOf(`bootstrap system ${RESOLVER_PLIST}`),
+    );
+  });
+
+  it("T-F2a: SETTLES before bootstrapping -- bootout returns 0 but the job reports RUNNING for several samples, bootstrap fires only once print reports STOPPED", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      print: [
+        { code: 0, stdout: runningPrintStdout(4242) },
+        { code: 0, stdout: runningPrintStdout(4242) },
+        { code: 0, stdout: runningPrintStdout(4242) },
+        { code: 113, stderr: "Could not find service" },
+      ],
+    });
+    await expect(reload(fn)).resolves.toBeUndefined();
+    const printCalls = calls.filter((c) => c === `print system/${RESOLVER_LABEL}`);
+    expect(printCalls.length).toBe(4);
+    expect(calls.lastIndexOf(`print system/${RESOLVER_LABEL}`)).toBeLessThan(
+      calls.indexOf(`bootstrap system ${RESOLVER_PLIST}`),
+    );
+    expect(calls).toContain(`kickstart system/${RESOLVER_LABEL}`);
+  });
+
+  it("T-F2b: FAILS CLOSED when the old job never settles -- still running through every sample, THROWS and never bootstraps+kickstarts a stale resolver", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      print: { code: 0, stdout: runningPrintStdout(4242) }, // always running
+    });
+    await expect(reload(fn)).rejects.toThrow(/STILL RUNNING after bootout/);
+    expect(calls).not.toContain(`bootstrap system ${RESOLVER_PLIST}`);
+    expect(calls).not.toContain(`kickstart system/${RESOLVER_LABEL}`);
+    // Bounded, not infinite: exactly HARNESS_STOP_SETTLE_SAMPLES print samples.
+    const printCalls = calls.filter((c) => c === `print system/${RESOLVER_LABEL}`);
+    expect(printCalls.length).toBe(HARNESS_STOP_SETTLE_SAMPLES);
+  });
+
+  it("after a PROVEN-unloaded settle, an 'already loaded' bootstrap contradicts the readback and THROWS rather than being tolerated", async () => {
+    // Point 4 of the fix-round-3 spec: unlike the boot path (which may
+    // legitimately race a concurrent load), this reload just OBSERVED the
+    // label unloaded via the settle loop, so a bootstrap that now reports
+    // "already loaded" means the readback was wrong -- refuse rather than
+    // report success over a state that contradicts what was just proven.
+    const { fn, calls } = recordingLaunchctl({
+      bootstrap: { code: 1, stderr: "service already loaded" },
+      // default print => not loaded on the first sample, so settle proves
+      // the label unloaded before bootstrap ever runs.
+    });
+    await expect(reload(fn)).rejects.toThrow(/bootstrap .* exited 1/);
+    expect(calls).not.toContain(`kickstart system/${RESOLVER_LABEL}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-ROUND-4 BLOCKER (2026-07-25, hardware-proven N=2): the GATE-DAEMON reload
+// in `productionBringUp` must force-replace the running gate the SAME way the
+// peer-resolver reload does. The pre-fix gate block used a raw
+// `bootstrap + kickstart(no -k)` that no-ops on an already-running daemon, so a
+// `sudo sanctuary protect --repair-egress-gate` rotated the pf anchor + port
+// but never restarted the gate -> pf confined the agent to a port nothing
+// served -> the agent was strangled (fail-CLOSED, not a wrong-allow). The fix
+// routes the gate through the SHARED `reloadLaunchdDaemonForBringUp` chokepoint
+// (bootout FIRST -> settle-until-reaped -> bootstrap -> kickstart), so the gate
+// reload inherits the resolver's proven settle discipline by construction.
+// These tests pin that chokepoint against the GATE label so a future
+// regression cannot quietly drop the gate back to the raw no-op'ing pattern.
+// ---------------------------------------------------------------------------
+describe("reloadLaunchdDaemonForBringUp (fix-round-4: shared chokepoint; the GATE reload settles like the resolver)", () => {
+  const AGENT_UID = 507;
+  const GATE_LABEL = egressGateDaemonLabel(AGENT_UID);
+  const GATE_PLIST = egressGateDaemonPlistPath(AGENT_UID);
+
+  /** `launchctl print system/<GATE_LABEL>` stdout reporting a running pid. */
+  function runningPrintStdout(pid: number): string {
+    return `system/${GATE_LABEL} = {\n\tpid = ${pid}\n\tstate = running\n}\n`;
+  }
+
+  function recordingLaunchctl(
+    handlers: Partial<Record<"bootout" | "bootstrap" | "kickstart", { code: number; stderr?: string }>> & {
+      print?: { code: number; stdout?: string; stderr?: string } | Array<{ code: number; stdout?: string; stderr?: string }>;
+    } = {},
+  ): {
+    fn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+    calls: string[];
+  } {
+    const calls: string[] = [];
+    let printCallCount = 0;
+    return {
+      calls,
+      fn: (args) => {
+        const verb = args[0] as "bootout" | "bootstrap" | "kickstart" | "print";
+        calls.push(args.join(" "));
+        if (verb === "print") {
+          const responses = handlers.print;
+          const fallback = { code: 113, stdout: "", stderr: "Could not find service" };
+          if (Array.isArray(responses)) {
+            const idx = Math.min(printCallCount, responses.length - 1);
+            printCallCount += 1;
+            const resp = responses[idx] ?? fallback;
+            return Promise.resolve({ code: resp.code, stdout: resp.stdout ?? "", stderr: resp.stderr ?? "" });
+          }
+          printCallCount += 1;
+          const resp = responses ?? fallback;
+          return Promise.resolve({ code: resp.code, stdout: resp.stdout ?? "", stderr: resp.stderr ?? "" });
+        }
+        const h = handlers[verb];
+        return Promise.resolve({ code: h?.code ?? 0, stdout: "", stderr: h?.stderr ?? "" });
+      },
+    };
+  }
+
+  /** Calls the chokepoint with the GATE label + a no-op sleep. */
+  function reload(
+    fn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>,
+  ): Promise<void> {
+    return reloadLaunchdDaemonForBringUp({
+      label: GATE_LABEL,
+      plistPath: GATE_PLIST,
+      runLaunchctlFn: fn,
+      sleepMs: async () => {},
+    });
+  }
+
+  it("boots the OLD gate job OUT, settles via print, THEN bootstraps the rewritten plist, then kickstarts (exact order) -- the repair/rotation replace-the-running-process fix", async () => {
+    const { fn, calls } = recordingLaunchctl();
+    await expect(reload(fn)).resolves.toBeUndefined();
+    expect(calls).toEqual([
+      `bootout system/${GATE_LABEL}`,
+      `print system/${GATE_LABEL}`,
+      `bootstrap system ${GATE_PLIST}`,
+      `kickstart system/${GATE_LABEL}`,
+    ]);
+    // The bootout MUST precede the settle print, which MUST precede the
+    // bootstrap: this is the whole point of the fix -- a raw bootstrap on the
+    // still-running gate no-ops and leaves the strangling old process serving.
+    expect(calls.indexOf(`bootout system/${GATE_LABEL}`)).toBeLessThan(
+      calls.indexOf(`print system/${GATE_LABEL}`),
+    );
+    expect(calls.indexOf(`print system/${GATE_LABEL}`)).toBeLessThan(
+      calls.indexOf(`bootstrap system ${GATE_PLIST}`),
+    );
+  });
+
+  it("TOLERATES a not-loaded bootout (fresh arm: nothing running yet) and proceeds to bootstrap + kickstart", async () => {
+    const { fn, calls } = recordingLaunchctl({ bootout: { code: 113, stderr: "Could not find service" } });
+    await expect(reload(fn)).resolves.toBeUndefined();
+    expect(calls).toContain(`bootstrap system ${GATE_PLIST}`);
+    expect(calls).toContain(`kickstart system/${GATE_LABEL}`);
+  });
+
+  it("FAILS CLOSED when the OLD gate never settles -- still running through every sample, THROWS and never bootstraps+kickstarts a gate over the strangled agent", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      print: { code: 0, stdout: runningPrintStdout(13651) }, // the hardware-proven strangling pid, always running
+    });
+    await expect(reload(fn)).rejects.toThrow(/STILL RUNNING after bootout/);
+    expect(calls).not.toContain(`bootstrap system ${GATE_PLIST}`);
+    expect(calls).not.toContain(`kickstart system/${GATE_LABEL}`);
+    // Bounded, not infinite: exactly HARNESS_STOP_SETTLE_SAMPLES print samples.
+    const printCalls = calls.filter((c) => c === `print system/${GATE_LABEL}`);
+    expect(printCalls.length).toBe(HARNESS_STOP_SETTLE_SAMPLES);
+  });
+
+  it("no longer TOLERATES a Bootstrap IO error after a proven-unloaded settle (matches the resolver's strict semantics; the pre-fix gate block swallowed this)", async () => {
+    // The raw gate block this fix removed tolerated
+    // `Bootstrap failed: 5: Input/output error`. Post-settle the label is
+    // PROVEN unloaded, so an IO-error bootstrap is a real failure, not the
+    // benign already-loaded race -- it must THROW, not be swallowed.
+    const { fn, calls } = recordingLaunchctl({
+      bootstrap: { code: 5, stderr: "Bootstrap failed: 5: Input/output error" },
+      // default print => not loaded, so settle proves unloaded before bootstrap.
+    });
+    await expect(reload(fn)).rejects.toThrow(/bootstrap .* exited 5/);
+    expect(calls).not.toContain(`kickstart system/${GATE_LABEL}`);
   });
 });

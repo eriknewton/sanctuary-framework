@@ -253,6 +253,9 @@ export type ClaimSiteId =
   | "arming-wiring.posture-port-owner-verified"
   | "arming-wiring.gate-account-home-layout"
   | "arming-wiring.gate-plist-exists"
+  | "arming-wiring.peer-resolver-status"
+  | "arming-wiring.peer-resolver-reload-settled"
+  | "arming-wiring.gate-daemon-reload-settled"
   // --- egress-gate, other modules ---
   | "anchor-registry.apply-union-flush"
   | "pf-anchor.arm"
@@ -1112,6 +1115,49 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     // count it as an observed claim.
     branches: "single",
   },
+  // FIX-ROUND-3 (2026-07-24 THIRD re-gate, both lenses SOUND-WITH-FIXES): the
+  // daemon reload needs the SAME `launchctl print` status parse
+  // `harness-daemon.status` already carries for the harness's own label, just
+  // pointed at an arbitrary `system/<label>` through the injected `run`
+  // function instead of `HarnessDaemonOps`. Same shape, same basis.
+  // Label-neutralized fix-round 4 (2026-07-25): now the shared settle read for
+  // BOTH the peer-resolver and the gate-daemon reload.
+  "arming-wiring.peer-resolver-status": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "launchdDaemonStatusByLabel",
+    claim: "launchd knows / does not know this daemon job, and it has this pid",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim: "launchd does NOT know this daemon job, or its state is unknowable",
+      basis: "observed",
+    },
+  },
+  "arming-wiring.peer-resolver-reload-settled": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "reloadPeerResolverDaemonForBringUp",
+    claim: "the old resolver job settled to stopped before the rewritten plist was bootstrapped",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "compute",
+    branches: "single",
+  },
+  // FIX-ROUND-4 (2026-07-25, hardware-proven N=2): the gate-daemon reload in
+  // `productionBringUp` now routes through the SAME settle chokepoint
+  // (`reloadLaunchdDaemonForBringUp`) as the resolver, so its "old job reaped
+  // before bootstrap" claim is the exact detector-blind `Promise<void>` shape
+  // as the resolver row above. Parallel row so the register stays honest that
+  // the gate reload makes this claim too.
+  "arming-wiring.gate-daemon-reload-settled": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "reloadLaunchdDaemonForBringUp",
+    claim: "the old gate daemon settled to stopped before the rewritten plist was bootstrapped",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "compute",
+    branches: "single",
+  },
 
   // ------------------------------------------------- other egress-gate mods
   "arming-wiring.contextless-repark-claim": {
@@ -1721,7 +1767,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/unprovision.ts`]: 4,
   [`${CW}/verify.ts`]: 1,
   [`${EG}/anchor-registry.ts`]: 0,
-  [`${EG}/arming-wiring.ts`]: 22,
+  [`${EG}/arming-wiring.ts`]: 28,
   [`${EG}/claim-basis.ts`]: 3,
   [`${EG}/drift-guard.ts`]: 0,
   [`${EG}/exec-runner.ts`]: 0,
@@ -1738,6 +1784,9 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${EG}/parity.ts`]: 0,
   [`${EG}/parked-claim.ts`]: 1,
   [`${EG}/peer-identity.ts`]: 0,
+  [`${EG}/peer-resolver-client.ts`]: 0,
+  [`${EG}/peer-resolver-daemon.ts`]: 4,
+  [`${EG}/peer-resolver-protocol.ts`]: 3,
   [`${EG}/pf-anchor.ts`]: 0,
   [`${EG}/posture.ts`]: 1,
   [`${EG}/protection-claim.ts`]: 0,

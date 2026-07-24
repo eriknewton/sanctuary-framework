@@ -36,23 +36,32 @@
  *
  * SUBPROCESS AMPLIFICATION IS BOUNDED (the confined agent is the adversary
  * on this socket and can open CONNECTs in a tight loop; each probe/lookup
- * spawns a child as the gate's NON-agent uid, so unbounded concurrency
- * would let the agent degrade the enforcement host past its own uid's
- * process limits -- a confused-deputy resource amplification):
+ * spawns a child as the gate's NON-agent uid -- or, since the 2026-07-24 S5-3
+ * TCB fix, dials the privileged peer-resolver daemon instead of spawning
+ * locally, moving the actual subprocess cost to that root process, which
+ * enforces its OWN independent concurrency cap
+ * (`PEER_RESOLVER_MAX_CONCURRENT_LOOKUPS`, `peer-resolver-daemon.ts`) -- so
+ * unbounded concurrency would let the agent degrade the enforcement host past
+ * its own uid's process limits -- a confused-deputy resource amplification):
  *   - a coalescing-safe liveness probe is SINGLE-FLIGHT: concurrent
  *     requests share one in-flight probe instead of each spawning pfctl
  *     (this also bounds the not-live case, where the no-negative-caching
  *     rule would otherwise make every request pay its own probe);
- *   - advisory peer lookups are capped at PEER_LOOKUP_MAX_CONCURRENT;
- *     at the cap the lookup is SKIPPED (peer_unresolved) rather than
- *     queued, because queuing would just move the amplification into
- *     memory. Skipping is safe precisely because peer identity is
- *     advisory-only and never gates the decision.
+ *   - peer lookups (both the legacy advisory path and the TCB path) are
+ *     capped at PEER_LOOKUP_MAX_CONCURRENT in-flight calls to the injected
+ *     `peerRunner`; at the cap the lookup is SKIPPED (peer_unresolved /
+ *     skipped_cap) rather than queued, because queuing would just move the
+ *     amplification into memory. Skipping is always safe in the legacy path
+ *     (peer identity is advisory there); in TCB mode a skip is a genuine DENY
+ *     (see `gate-client-auth.ts`), which the 2026-07-24 fix left UNCHANGED --
+ *     it is now the rare case, not the common one (see that module's
+ *     reconciled availability-bound comment).
  *
  * PEER IDENTITY (Slice 2) is advisory-only IN THE LEGACY PATH: a resolved peer
  * uid that is not the agent uid emits a loud `peer_uid_mismatch` event; it never
  * grants and never (alone) denies. The TOCTOU window is documented in
- * `peer-identity.ts`.
+ * `peer-identity.ts`. In FAIL-CLOSED TCB MODE (Slice 5 S5-3, below), the same
+ * lookup is a REQUIRED second lens instead: see `gate-client-auth.ts`.
  *
  * FAIL-CLOSED CLIENT AUTH (Slice 5 S5-3): when a `clientAuth` authenticator is
  * supplied the gate runs in TCB mode -- every CONNECT must present a current,
@@ -438,7 +447,9 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
     activePeerLookups += 1;
     let peer: Awaited<ReturnType<typeof resolveLoopbackPeer>>;
     try {
-      peer = await resolveLoopbackPeer({ clientPort, runner: peerRunner });
+      // gatePort is THIS gate's own committed port (policy.gate_port), never
+      // caller-supplied -- fix-round BLOCKER, see peer-identity.ts.
+      peer = await resolveLoopbackPeer({ clientPort, gatePort: policy.gate_port, runner: peerRunner });
     } finally {
       activePeerLookups -= 1;
     }
@@ -563,6 +574,7 @@ export function createExclusiveEgressGate(options: ExclusiveEgressGateOptions): 
           try {
             peer = await resolveLoopbackPeer({
               clientPort,
+              gatePort: policy.gate_port,
               runner: boundPeerRunner,
             });
           } finally {

@@ -105,6 +105,41 @@ export {
 } from "./peer-identity.js";
 
 export {
+  PEER_RESOLVER_PROTOCOL_VERSION,
+  PEER_RESOLVER_MAX_FRAME_BYTES,
+  encodePeerResolveRequest,
+  encodePeerResolveResponse,
+  parsePeerResolveRequest,
+  parsePeerResolveResponse,
+  type PeerResolveRequest,
+  type PeerResolveResponse,
+  type PeerResolveOkResponse,
+  type PeerResolveErrResponse,
+} from "./peer-resolver-protocol.js";
+
+export {
+  PEER_RESOLVER_DIR,
+  PEER_RESOLVER_DAEMON_LABEL_PREFIX,
+  PEER_RESOLVER_MAX_CONCURRENT_LOOKUPS,
+  PEER_RESOLVER_LOOKUP_TIMEOUT_MS,
+  peerResolverSocketPath,
+  peerResolverDaemonLabel,
+  peerResolverDaemonPlistPath,
+  renderPeerResolverDaemonPlist,
+  runPeerResolverDaemon,
+  type PeerResolverEvent,
+  type PeerResolverDaemonDeps,
+  type PeerResolverDaemonHandle,
+  type PeerResolverDaemonPlistOptions,
+} from "./peer-resolver-daemon.js";
+
+export {
+  PRIVILEGED_PEER_RUNNER_TIMEOUT_MS,
+  createPrivilegedPeerRunner,
+  type PrivilegedPeerRunnerOptions,
+} from "./peer-resolver-client.js";
+
+export {
   GATE_BIND_HOST,
   PEER_LOOKUP_MAX_CONCURRENT,
   createExclusiveEgressGate,

@@ -79,8 +79,11 @@ import {
   AGENT_HARNESS_DAEMON_PLIST_PATH,
   agentHarnessDaemonStatus,
   agentHarnessDaemonStableRunning,
+  awaitHarnessStoppedVia,
   installAgentHarnessDaemon,
+  launchctlBootoutWasInProgress,
   launchctlBootoutWasNotLoaded,
+  launchctlPrintWasNotLoaded,
   planAgentHarnessDaemonInstall,
   readAgentHarnessJobDisabledOverride,
   setAgentHarnessJobDisabled,
@@ -114,6 +117,11 @@ import {
   renderEgressGateDaemonPlist,
   type EgressGateRuntimeState,
 } from "./gate-daemon.js";
+import {
+  peerResolverDaemonLabel,
+  peerResolverDaemonPlistPath,
+  renderPeerResolverDaemonPlist,
+} from "./peer-resolver-daemon.js";
 import { diffTransientPfRules } from "./drift-guard.js";
 import { ensureExclusiveEgressRuntimeFs } from "./runtime-fs-plan.js";
 import {
@@ -835,11 +843,55 @@ async function productionBringUp(
   const credAuthority = createFsGateCredentialAuthority({ gateUid: state.gateUid });
   await credAuthority.mint({ agentUid: input.agentUid, generationId: committed.generation_id });
 
+  // 2026-07-24 S5-3 fix (Option 1): install + (re)load the PRIVILEGED
+  // peer-resolver daemon (root) BEFORE the gate daemon starts serving, so the
+  // gate's peer lookups have somewhere to dial from its very first CONNECT.
+  // Shares the gate daemon's reload chokepoint below
+  // ({@link reloadLaunchdDaemonForBringUp}), one daemon per confined agent
+  // (see `peer-resolver-daemon.ts`).
+  //
+  // Fix-round BLOCKER (2026-07-24): `--gate-port=${committed.gate_port}` is
+  // baked into THIS plist's argv from the SAME `committed` generation that
+  // published the gate's own policy (`gen.gate_port` above) -- root-written,
+  // never derived from anything the (unprivileged) gate daemon says over the
+  // resolver socket.
+  //
+  // Fix-round-2 BLOCKER (2026-07-24 re-gate): the RELOAD must actually replace
+  // the loaded launchd job -- a plain `bootstrap` of an already-loaded label
+  // does NOT swap in the rewritten argv, and a plain `kickstart` (no `-k`)
+  // does NOT restart an already-running process, so a port change on
+  // repair/rotation would otherwise leave the RUNNING resolver on its OLD
+  // `--gate-port` (the earlier "kickstart restarts ... in lockstep" claim was
+  // false). `reloadPeerResolverDaemonForBringUp` boots the old job OUT first,
+  // THEN bootstraps the rewritten plist + kickstarts, guaranteeing the new
+  // argv is loaded on every bring-up. The v2 matched-port-in-response client
+  // reject is the fail-closed backstop. A mere reboot reuses this on-disk
+  // plist unchanged via `bootstrapPeerResolverDaemonForBoot` (argv cannot
+  // drift on the boot path -- nothing rewrites the plist there).
+  const resolverPlistPath = peerResolverDaemonPlistPath(input.agentUid);
+  await writeFile(
+    resolverPlistPath,
+    renderPeerResolverDaemonPlist({
+      agentUid: input.agentUid,
+      programArguments: [
+        ...input.gateDaemonArgvPrefix,
+        "castle-wall",
+        "peer-resolver-daemon",
+        `--agent-uid=${input.agentUid}`,
+        `--gate-uid=${state.gateUid}`,
+        `--gate-port=${committed.gate_port}`,
+      ],
+      fortressPath: input.fortressPath,
+    }),
+    { mode: 0o644 },
+  );
+  await reloadPeerResolverDaemonForBringUp({ agentUid: input.agentUid, resolverPlistPath });
+
   // Hand the committed port from the root placeholder to the gate daemon:
-  // release, install the gate daemon plist, bootstrap, then wait for the
-  // runtime state naming EXACTLY this {port, generation} and verify the
-  // listener's owner (fail-closed: any mismatch throws; the S5-5 barrier will
-  // ALSO re-verify before unpark).
+  // release, install the gate daemon plist, RELOAD (force-replace the running
+  // process), then wait for the runtime state naming EXACTLY this
+  // {port, generation} and verify the listener's owner (fail-closed: any
+  // mismatch throws; the S5-5 barrier will ALSO re-verify before unpark).
   if (lastBinding !== null) {
     await (lastBinding as GateBinding).release();
   }
@@ -861,14 +913,21 @@ async function productionBringUp(
     }),
     { mode: 0o644 },
   );
-  const bootstrap = await runLaunchctl(["bootstrap", "system", plistPath]);
-  if (bootstrap.code !== 0 && !/already bootstrapped|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)) {
-    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
-  }
-  const kick = await runLaunchctl(["kickstart", `system/${label}`]);
-  if (kick.code !== 0) {
-    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
-  }
+  // FIX-ROUND-4 BLOCKER (2026-07-25, hardware-proven N=2). The gate plist argv
+  // is unchanged (`--agent-uid` only; the gate reads its port/generation from
+  // committed state), so on a repair/rotation the OLD gate daemon is still
+  // loaded+running. A raw `bootstrap` no-ops ("already bootstrapped") and a
+  // raw `kickstart` (no `-k`) no-ops (already running), so the gate kept
+  // serving the OLD committed generation while pf confined the agent to the
+  // NEW port -> the agent was strangled. Route through the SAME
+  // bootout->settle->bootstrap->kickstart chokepoint the peer-resolver reload
+  // uses, so the running gate is force-replaced and re-reads the new committed
+  // generation. Fail CLOSED: if the old gate will not settle/reap, this THROWS
+  // rather than arm over an unproven-reaped gate. (The boot path's benign
+  // `Bootstrap failed: 5: Input/output error` tolerance is deliberately NOT
+  // carried here: post-settle, an IO error is a real failure, not the
+  // already-loaded race the boot path may legitimately hit.)
+  await reloadLaunchdDaemonForBringUp({ label, plistPath });
   // Change 2: hand waitForGateRuntime this gate daemon's own stderr log path so
   // a timeout surfaces the daemon's REAL exit reason (bind/spawn failure)
   // instead of a bare "runtime state never appeared". Deriving the path reuses
@@ -1152,6 +1211,195 @@ export async function bootstrapGateDaemonForBoot(input: {
       ...(input.gateDaemonStderrPath !== undefined ? { gateDaemonStderrPath: input.gateDaemonStderrPath } : {}),
     });
   }
+}
+
+/**
+ * Bootstrap + kickstart one agent's PEER-RESOLVER daemon LaunchDaemon
+ * (2026-07-24 S5-3 fix). Same H2 rationale as {@link bootstrapGateDaemonForBoot}
+ * -- `RunAtLoad=false`, so without this nothing re-starts the privileged
+ * resolver after a reboot, and every CONNECT would deny again exactly as the
+ * Mini1 drill found. No runtime-state file to wait for (the resolver
+ * publishes nothing; the gate's own `waitForGateRuntime` is the boot
+ * sequence's readiness gate), so this is bootstrap+kickstart only. Throws on
+ * failure; the boot caller logs loudly and lets the barrier's `verifyGate`
+ * produce the honest parked outcome (a gate that cannot resolve peers denies
+ * fail-closed, it does not silently degrade).
+ */
+export async function bootstrapPeerResolverDaemonForBoot(input: {
+  agentUid: number;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+}): Promise<void> {
+  const run = input.runLaunchctlFn ?? runLaunchctl;
+  const label = peerResolverDaemonLabel(input.agentUid);
+  const plistPath = peerResolverDaemonPlistPath(input.agentUid);
+  const bootstrap = await run(["bootstrap", "system", plistPath]);
+  if (
+    bootstrap.code !== 0 &&
+    !/already bootstrapped|service already loaded|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)
+  ) {
+    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
+  }
+  const kick = await run(["kickstart", `system/${label}`]);
+  if (kick.code !== 0) {
+    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
+  }
+}
+
+/**
+ * {@link agentHarnessDaemonStatus}'s `launchctl print` parse, generalized to
+ * an arbitrary label and an injected `run` function (fix-round 3,
+ * 2026-07-24; label-neutralized fix-round 4, 2026-07-25). Both the
+ * peer-resolver reload AND the gate-daemon reload (via
+ * {@link reloadLaunchdDaemonForBringUp}) need the SAME running/not-running
+ * settle read the harness teardown uses -- through `runLaunchctlFn` (this
+ * module's test seam) rather than `HarnessDaemonOps`, and against an arbitrary
+ * `system/<label>` rather than the fixed harness label.
+ */
+async function launchdDaemonStatusByLabel(
+  run: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>,
+  label: string,
+): Promise<HarnessDaemonStatus> {
+  let result: { code: number; stdout: string; stderr: string };
+  try {
+    result = await run(["print", `system/${label}`]);
+  } catch {
+    return { known: false, installed: false, running: false };
+  }
+  if (result.code !== 0) {
+    return launchctlPrintWasNotLoaded(result)
+      ? { known: true, installed: false, running: false }
+      : { known: false, installed: false, running: false };
+  }
+  const pidMatch = /^\s*pid\s*=\s*(\d+)\s*$/m.exec(result.stdout);
+  if (pidMatch) {
+    return { known: true, installed: true, running: true, pid: Number(pidMatch[1]) };
+  }
+  return { known: true, installed: true, running: false };
+}
+
+/**
+ * (RE)LOAD one agent's privileged launchd daemon during a production bring-up
+ * (install / repair / rotation), where the on-disk plist has just been
+ * REWRITTEN. THE SHARED CHOKEPOINT for the S5 daemon-reload class: both the
+ * peer-resolver reload ({@link reloadPeerResolverDaemonForBringUp}) and the
+ * gate-daemon reload (in {@link productionBringUp}) route through here, so a
+ * third daemon can never reintroduce the reap-race / stale-argv class this
+ * function's history is a record of.
+ *
+ * FIX-ROUND-2 BLOCKER (2026-07-24 re-gate). The reload must actually REPLACE
+ * the loaded launchd job definition. A plain `launchctl bootstrap` of an
+ * ALREADY-bootstrapped label does NOT swap in the rewritten plist's argv, and
+ * a plain `launchctl kickstart` (no `-k`) does NOT restart an already-running
+ * process. So after a repair/rotation that changes the gate port, the RUNNING
+ * daemon would keep its OLD committed generation and serve a stale port -- the
+ * peer-resolver fail-open the re-gate caught, and (fix-round 4, 2026-07-25) the
+ * hardware-proven gate-daemon strangle: `--repair-egress-gate` rotated the pf
+ * anchor + resolver to a fresh port but the raw `bootstrap+kickstart` below
+ * no-op'd on the still-running gate, so pf confined the agent to a port
+ * nothing served. The fix: `bootout` the old job FIRST, THEN bootstrap the
+ * rewritten plist + kickstart, so the new process is guaranteed to come up and
+ * re-read the new committed generation on EVERY bring-up.
+ *
+ * FIX-ROUND-3 (2026-07-24 THIRD re-gate, both lenses, SOUND-WITH-FIXES). The
+ * round-2 fix above tolerated a not-loaded bootout and then went STRAIGHT to
+ * bootstrap -- exactly the shape `uninstallAgentHarnessDaemon` had before ITS
+ * own fix-round 2/3 (`harness-daemon.ts:406-427`): a bootout's accepted exit
+ * does not prove the OLD process is reaped, so a plain bootstrap of a
+ * still-loaded label no-ops (the running job keeps its stale argv) while
+ * reporting success (F2, the reap race). Separately, a TRANSIENT EINPROGRESS
+ * bootout (the stop was accepted and is still running down) matched neither
+ * tolerance and threw, spuriously aborting a bring-up that would have settled
+ * a moment later (F1). This mirrors the harness teardown's SAME two-part fix:
+ * tolerate EINPROGRESS same as not-loaded, then SETTLE via
+ * `launchctl print` (reusing {@link awaitHarnessStoppedVia}, the harness
+ * module's own settle loop, against {@link launchdDaemonStatusByLabel}) BEFORE
+ * bootstrapping, and fail closed -- refuse the bring-up -- if the old job
+ * will not settle. Refusing to arm over a daemon that cannot be proven
+ * reloaded is correct: an armed-but-stale daemon would strangle the agent,
+ * and refusing to arm is a louder, more recoverable failure than that.
+ *
+ * Once the settle loop has PROVEN the label unloaded, a bootstrap that
+ * reports "already loaded" is no longer a legitimate no-op (unlike the boot
+ * path, which may race a concurrent load) -- it means the print readback was
+ * wrong, so it is treated as an error like any other bootstrap failure. This
+ * is why the strict semantics here deliberately do NOT carry the boot path's
+ * `Bootstrap failed: 5: Input/output error` tolerance: post-settle, an IO
+ * error is a real failure, not the benign already-loaded race.
+ *
+ * The BOOT paths ({@link bootstrapPeerResolverDaemonForBoot},
+ * {@link bootstrapGateDaemonForBoot}) deliberately do NOT bootout-first: a
+ * reboot re-launches from the CURRENT on-disk plist and nothing rewrites it
+ * there, so argv cannot drift.
+ */
+export async function reloadLaunchdDaemonForBringUp(input: {
+  label: string;
+  plistPath: string;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  sleepMs?: (ms: number) => Promise<void>;
+}): Promise<void> {
+  const run = input.runLaunchctlFn ?? runLaunchctl;
+  const label = input.label;
+  // Force the loaded job definition to be replaced: bootout the old one
+  // FIRST. A not-loaded bootout (clean first install, nothing running yet)
+  // is success, and an EINPROGRESS bootout (the stop was accepted and is
+  // still running down) is not a failure either -- the settle loop below
+  // waits it out rather than throwing on a transient in-flight stop.
+  const bootout = await run(["bootout", `system/${label}`]);
+  if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout) && !launchctlBootoutWasInProgress(bootout)) {
+    throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
+  }
+  // SETTLE BEFORE BOOTSTRAP: a tolerated bootout does not prove the old
+  // process is reaped (the exact lesson `uninstallAgentHarnessDaemon` learned
+  // on Mini1; see `harness-daemon.ts:406-427`). Re-sample `launchctl print`
+  // until the job is proven not-running BEFORE bootstrapping, so bootstrap
+  // loads the NEW argv instead of no-op'ing on "already loaded".
+  const after = await awaitHarnessStoppedVia(() => launchdDaemonStatusByLabel(run, label), input.sleepMs);
+  if (!after.known) {
+    throw new Error(
+      `launchctl print system/${label} did not return a trustworthy status after bootout; refusing to bring up ` +
+        "the daemon against unknown launchd state (the OLD daemon may still be serving a stale gate generation)",
+    );
+  }
+  if (after.running) {
+    throw new Error(
+      `system/${label} is STILL RUNNING after bootout; refusing to bring up the daemon rather than arm ` +
+        "the agent over a daemon that may still serve the OLD gate generation",
+    );
+  }
+  // Proven unloaded: an "already loaded"-shaped bootstrap result here would
+  // contradict the readback above, so it is no longer a tolerated no-op --
+  // treat any bootstrap failure as an error.
+  const bootstrap = await run(["bootstrap", "system", input.plistPath]);
+  if (bootstrap.code !== 0) {
+    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
+  }
+  const kick = await run(["kickstart", `system/${label}`]);
+  if (kick.code !== 0) {
+    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
+  }
+}
+
+/**
+ * (RE)LOAD one agent's PEER-RESOLVER daemon during a production bring-up. Thin
+ * wrapper over the shared {@link reloadLaunchdDaemonForBringUp} chokepoint
+ * (fix-round 4, 2026-07-25): the resolver plist has just been REWRITTEN with a
+ * possibly-new `--gate-port` argv, so the reload must force-replace the running
+ * job. The v2 matched-port-in-response client reject
+ * (`peer-resolver-protocol.ts`) is the FAIL-CLOSED backstop if a reload is ever
+ * missed. See the chokepoint's doc for the full round-2/3 rationale.
+ */
+export async function reloadPeerResolverDaemonForBringUp(input: {
+  agentUid: number;
+  resolverPlistPath: string;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  sleepMs?: (ms: number) => Promise<void>;
+}): Promise<void> {
+  await reloadLaunchdDaemonForBringUp({
+    label: peerResolverDaemonLabel(input.agentUid),
+    plistPath: input.resolverPlistPath,
+    runLaunchctlFn: input.runLaunchctlFn,
+    sleepMs: input.sleepMs,
+  });
 }
 
 /**
@@ -1654,6 +1902,17 @@ export async function restoreCoarseCompositionProduction(
         `${bootout.stderr.trim()}); refusing to tear down the gate surfaces under a possibly-live gate`,
     );
   }
+  // 0b. The PRIVILEGED peer-resolver daemon down too (2026-07-24 S5-3 fix):
+  // it holds no gate-serving surface itself, but leaving a root process live
+  // for an agent whose gate just stopped is unaccounted-for privilege, the
+  // same M5 reasoning as step 0. A not-loaded bootout is success.
+  const resolverBootout = await launchctl(["bootout", `system/${peerResolverDaemonLabel(input.agentUid)}`]);
+  if (resolverBootout.code !== 0 && !launchctlBootoutWasNotLoaded(resolverBootout)) {
+    throw new Error(
+      `coarse restore: could not stop the peer-resolver daemon (launchctl bootout exited ${resolverBootout.code}: ` +
+        `${resolverBootout.stderr.trim()}); refusing to tear down the gate surfaces under a possibly-live root resolver`,
+    );
+  }
   // 1. Marker + gate policy OFF next: from the next compose the daemon is in
   // plain coarse mode (gate-scoped rules briefly compose coarse -- the agent
   // has no direct allows in that window, which is the safe direction).
@@ -1683,8 +1942,10 @@ export async function restoreCoarseCompositionProduction(
     await createFsGateCredentialAuthority({ gateUid }).revoke(input.agentUid);
   }
   // 3. Plist + config copies + the per-uid runtime dir off (daemon already
-  // stopped in step 0).
+  // stopped in step 0), including the peer-resolver plist (daemon already
+  // stopped in step 0b).
   await removeFile(egressGateDaemonPlistPath(input.agentUid));
+  await removeFile(peerResolverDaemonPlistPath(input.agentUid));
   await removeFile(egressGatePolicyConfigPath(input.agentUid));
   await removeFile(egressGateRulesConfigPath(input.agentUid));
   await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
@@ -2380,10 +2641,22 @@ export function createUnprotectExclusiveEgressOps(
       verifyHarnessParkedPersistent(parkCtx, parkDeps),
     recoverGeneration: () => (deps.recoverGeneration ?? productionRecoverGeneration)(input.agentUid),
     async bootoutGateDaemon(): Promise<void> {
+      // Gate daemon FIRST (unchanged order/error shape -- callers/tests key
+      // off this exact failure message), then the PRIVILEGED peer-resolver
+      // daemon (2026-07-24 S5-3 fix): leaving a root process live for an
+      // agent whose gate just stopped is unaccounted-for privilege, the same
+      // M5 reasoning `restoreCoarseCompositionProduction` applies.
       const label = egressGateDaemonLabel(input.agentUid);
       const bootout = await launchctl(["bootout", `system/${label}`]);
       if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
         throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
+      }
+      const resolverLabel = peerResolverDaemonLabel(input.agentUid);
+      const resolverBootout = await launchctl(["bootout", `system/${resolverLabel}`]);
+      if (resolverBootout.code !== 0 && !launchctlBootoutWasNotLoaded(resolverBootout)) {
+        throw new Error(
+          `launchctl bootout ${resolverLabel} exited ${resolverBootout.code}: ${resolverBootout.stderr.trim()}`,
+        );
       }
     },
     async invalidateOracleToken(): Promise<void> {
@@ -2395,9 +2668,10 @@ export function createUnprotectExclusiveEgressOps(
     },
     async removeGateSurfaces(): Promise<void> {
       // The leaving uid is the sole exclusive agent (step 0 invariant), so
-      // every surface is torn down. PER-UID surfaces (the gate daemon was
-      // already booted out, step 3):
+      // every surface is torn down. PER-UID surfaces (the gate + resolver
+      // daemons were already booted out, step 3):
       await removeFile(egressGateDaemonPlistPath(input.agentUid));
+      await removeFile(peerResolverDaemonPlistPath(input.agentUid));
       await removeFile(egressGatePolicyConfigPath(input.agentUid));
       await removeFile(egressGateRulesConfigPath(input.agentUid));
       await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
@@ -2907,6 +3181,21 @@ export async function startExclusiveEgressBootSupervisor(input: {
                 `(${(auditErr as Error).message}); the release barrier will still verify and park fail-closed`,
             );
           }
+        }
+        // 2026-07-24 S5-3 fix: START the PRIVILEGED peer-resolver daemon
+        // FIRST (same RunAtLoad=false H2 rationale, one daemon per confined
+        // agent, `bootstrapPeerResolverDaemonForBoot`). A bootstrap failure
+        // here logs loudly and still lets the gate daemon start below and the
+        // barrier verify: a gate with no reachable resolver denies every
+        // CONNECT fail-closed (peer_unresolved), the honest degraded outcome,
+        // never a crash and never a silent widen.
+        try {
+          await bootstrapPeerResolverDaemonForBoot({ agentUid, runLaunchctlFn: launchctlFn });
+        } catch (err) {
+          input.print(
+            `[castle-wall] boot: uid ${agentUid} peer-resolver daemon bootstrap failed (${(err as Error).message}); ` +
+              "the gate will deny CONNECTs fail-closed (peer_unresolved) until this is repaired.",
+          );
         }
         // Fix-round H2: START the gate daemon (RunAtLoad=false by contract;
         // nothing else starts it after a reboot), then let the barrier verify

@@ -695,7 +695,16 @@ export async function readAgentHarnessJobDisabledOverride(
   return { known: true, disabled: false };
 }
 
-function launchctlPrintWasNotLoaded(result: LaunchctlResult): boolean {
+/**
+ * Exported (fix-round 3, 2026-07-24) so the peer-resolver reload's own
+ * settle loop (`arming-wiring.ts`'s `reloadPeerResolverDaemonForBringUp`) can
+ * parse `launchctl print system/<label>` with the SAME predicate this
+ * module's own {@link agentHarnessDaemonStatus} uses, rather than carrying a
+ * second hand-maintained phrase list for a different label -- the exact
+ * one-predicate rationale {@link launchctlBootoutWasNotLoaded} documents
+ * above for bootout.
+ */
+export function launchctlPrintWasNotLoaded(result: LaunchctlResult): boolean {
   if (result.code === 0) return false;
   const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
   return (

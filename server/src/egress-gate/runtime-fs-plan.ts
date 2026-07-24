@@ -36,6 +36,11 @@
  *   ¦                                     .accept -> gate uid 0600, .token -> agent uid 0600)
  *   +- gate-liveness                      root 0711  (gate reads its 0600 token +
  *   ¦                                     the 0644 pinned oracle public key)
+ *   +- gate-peer-resolver                 root 0711  (traversal w/o listing;
+ *   ¦                                     <agent_uid>.sock -> root-bound, then chowned to
+ *   ¦                                     the GATE uid 0600 by peer-resolver-daemon.ts itself
+ *   ¦                                     at listen time -- 2026-07-24 S5-3 fix, see that
+ *   ¦                                     module; this dir only needs to pre-exist traversable)
  *   +- agent-harness                      root 0755  (agent uid reads hold file + wrapper)
  *
  * Applied by ROOT at arming time (install + repair, `productionBringUp`) and
@@ -118,6 +123,13 @@ export function planExclusiveEgressRuntimeFs(input: GateRuntimeFsPlanInput): Gat
     // Liveness dir: same traversal model (gate reads its 0600 token + the
     // 0644 pinned supervisor public key; the 0600 private key stays root's).
     ...rootDir(dir("gate-liveness"), 0o711),
+    // Peer-resolver dir (2026-07-24 S5-3 fix): same traversal model. The
+    // per-agent `<agent_uid>.sock` FILE inside it is bound + chowned to the
+    // gate uid by `peer-resolver-daemon.ts` itself at listen time (parity
+    // with how the liveness oracle owns its own token-file chown); this plan
+    // only owns the parent directory, so a resolver daemon that has not
+    // started yet still has somewhere traversable to bind into.
+    ...rootDir(dir("gate-peer-resolver"), 0o711),
     // Hold dir: agent uid reads the hold file + exec wrapper (integrity by
     // root ownership; no secret content). Name AND mode come from the
     // release-barrier constants, so this plan and the parked install's
