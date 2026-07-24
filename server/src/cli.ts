@@ -1247,6 +1247,55 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
     }
   }
 
+  if (command === "peer-resolver-daemon") {
+    // 2026-07-24 S5-3 fix (Option 1): the PRIVILEGED root helper the gate
+    // daemon dials to resolve a loopback CONNECT peer's uid (the gate daemon
+    // itself stays unprivileged and cannot see a different uid's socket --
+    // see `peer-resolver-daemon.ts`). Spawned by launchd as ROOT (no
+    // UserName in its plist), one per confined agent, alongside that agent's
+    // gate daemon.
+    const args1 = args.slice(1);
+    const uidArg = args1.find((a) => a.startsWith("--agent-uid="));
+    const gateUidArg = args1.find((a) => a.startsWith("--gate-uid="));
+    const agentUid = uidArg !== undefined ? Number(uidArg.slice("--agent-uid=".length)) : NaN;
+    const gateUid = gateUidArg !== undefined ? Number(gateUidArg.slice("--gate-uid=".length)) : NaN;
+    if (!Number.isInteger(agentUid) || agentUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --agent-uid=<positive integer>");
+      return 2;
+    }
+    if (!Number.isInteger(gateUid) || gateUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --gate-uid=<positive integer>");
+      return 2;
+    }
+    const { runPeerResolverDaemon } = await import("./egress-gate/peer-resolver-daemon.js");
+    try {
+      const handle = await runPeerResolverDaemon({ agentUid, gateUid });
+      const stop = async (): Promise<void> => {
+        try {
+          await handle.close();
+        } finally {
+          process.exit(0);
+        }
+      };
+      process.on("SIGTERM", () => {
+        void stop();
+      });
+      process.on("SIGINT", () => {
+        void stop();
+      });
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`[egress-gate-peer-resolver] serving uid ${agentUid} on ${handle.socketPath}`);
+      // Holds the event loop open; shutdown exits via the signal handlers above.
+      return await new Promise<number>(() => undefined);
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`peer-resolver daemon failed to start: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(
     `Unknown subcommand: ${command}. Try: sanctuary castle-wall --help`

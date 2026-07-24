@@ -9,9 +9,9 @@
  * root, no pf.
  */
 
-import { createServer } from "node:net";
-import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { connect, createServer } from "node:net";
+import { createHash, generateKeyPairSync } from "node:crypto";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -28,6 +28,14 @@ import {
   runEgressGateDaemon,
 } from "../../src/egress-gate/gate-daemon.js";
 import { createGateClientAuthenticator } from "../../src/egress-gate/gate-client-auth.js";
+import { peerResolverSocketPath } from "../../src/egress-gate/peer-resolver-daemon.js";
+import type { PeerCommandRunner } from "../../src/egress-gate/peer-identity.js";
+import {
+  GATE_CREDENTIAL_VERSION,
+  formatGateCredentialHeader,
+  type GateAcceptSource,
+  type GateCredentialAcceptRecord,
+} from "../../src/egress-gate/gate-credential.js";
 
 const AGENT_UID = 502;
 
@@ -249,5 +257,147 @@ describe("egress-gate/gate-daemon runEgressGateDaemon", () => {
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
+  });
+});
+
+/**
+ * 2026-07-24 S5-3 fix: the DEFAULT peer runner is the PRIVILEGED resolver
+ * client, not the old local `createExecFilePeerRunner()`. Proven two ways:
+ * (a) with no resolver daemon reachable at the derived socket path, every
+ * CONNECT denies `peer_unresolved` fail-closed (never a crash, never a
+ * silent allow); (b) `deps.peerRunner` remains a first-class override, same
+ * as every other injected dependency on this daemon.
+ */
+describe("egress-gate/gate-daemon peerRunner wiring (2026-07-24 S5-3 fix)", () => {
+  let dir: string;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "sanctuary-gate-daemon-peer-test-"));
+  });
+
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function rawConnect(port: number, authority: string, proxyAuth?: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const socket = connect(port, "127.0.0.1", () => {
+        const authLine = proxyAuth ? `Proxy-Authorization: ${proxyAuth}\r\n` : "";
+        socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n${authLine}\r\n`);
+      });
+      let data = "";
+      socket.on("data", (chunk) => (data += chunk.toString("utf8")));
+      socket.on("end", () => resolve(data.split("\r\n")[0] ?? ""));
+      socket.on("error", reject);
+      setTimeout(() => socket.destroy(new Error("timeout")), 3000).unref();
+    });
+  }
+
+  /** A real, valid generation-bound bearer credential (accept record + header). */
+  function validCredential(generationId: number): { acceptSource: GateAcceptSource; header: string } {
+    const secret = "deadbeefcafef00d"; // must be lowercase-hex (parseGateCredentialHeader)
+    const accept: GateCredentialAcceptRecord = {
+      version: GATE_CREDENTIAL_VERSION,
+      generation_id: generationId,
+      secret_sha256: createHash("sha256").update(secret, "utf8").digest("hex"),
+    };
+    return {
+      acceptSource: { current: async () => accept },
+      header: formatGateCredentialHeader({ generation_id: generationId, secret }),
+    };
+  }
+
+  /**
+   * Real oracle keypair + a real signed-and-written liveness token (no chown
+   * -- this test runs unprivileged, and `createFsLivenessTokenSource` only
+   * ever reads the file, never checks ownership), so the daemon's REAL
+   * liveness gate passes and the CONNECT actually reaches peer resolution
+   * instead of failing earlier at 503.
+   */
+  async function primeLiveOracle(input: {
+    gatePort: number;
+    generationId: number;
+  }): Promise<{ loadOraclePublicKey: () => Promise<ReturnType<typeof generateKeyPairSync>["publicKey"]> }> {
+    const { canonicalLivenessPayload } = await import("../../src/egress-gate/liveness-oracle.js");
+    const { sign } = await import("node:crypto");
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const claims = {
+      version: 1 as const,
+      agent_uid: AGENT_UID,
+      gate_port: input.gatePort,
+      generation_id: input.generationId,
+      live: true,
+      expires_at: Date.now() + 60_000,
+    };
+    const sig = sign(null, canonicalLivenessPayload(claims), privateKey).toString("base64");
+    await writeFile(join(dir, `${AGENT_UID}.token`), JSON.stringify({ ...claims, sig }), "utf8");
+    return { loadOraclePublicKey: async () => publicKey };
+  }
+
+  it("DEFAULT peerRunner: with no resolver daemon reachable, denies peer_unresolved (fail-closed, never a crash) -- proves the default is no longer local-only lsof", async () => {
+    const port = await freeLoopbackPort();
+    const { loadOraclePublicKey } = await primeLiveOracle({ gatePort: port, generationId: 9 });
+    const { acceptSource, header } = validCredential(9);
+    const events: unknown[] = [];
+    const handle = await runEgressGateDaemon({
+      agentUid: AGENT_UID,
+      loadGatePolicy: async () => JSON.stringify({ agent_uid: AGENT_UID, gate_port: port, generation_id: 9 }),
+      loadRules: async () => [],
+      loadOraclePublicKey,
+      clientAuth: createGateClientAuthenticator({ agentUid: AGENT_UID, acceptSource }),
+      runtimeDir: dir,
+      livenessDir: dir,
+      credDir: dir,
+      peerResolverDir: dir, // nothing listens at dir/502.sock in this test
+      onEvent: (e) => events.push(e),
+    });
+    try {
+      // A VALID credential -- so a denial can only come from the peer lens,
+      // which is exactly what this test is isolating.
+      const statusLine = await rawConnect(handle.gate.port, "127.0.0.1:1", header);
+      expect(statusLine).toBe("HTTP/1.1 403 Forbidden");
+      expect(
+        (events as { kind: string; reason?: string }[]).some(
+          (e) => e.kind === "client_denied" && e.reason === "peer_unresolved",
+        ),
+      ).toBe(true);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("deps.peerRunner override is honored (a scripted runner still wires through unchanged)", async () => {
+    const port = await freeLoopbackPort();
+    const { loadOraclePublicKey } = await primeLiveOracle({ gatePort: port, generationId: 9 });
+    const { acceptSource, header } = validCredential(9);
+    let ranScripted = false;
+    const trackedRunner: PeerCommandRunner = {
+      run: (): Promise<{ code: number; stdout: string }> => {
+        ranScripted = true;
+        return Promise.resolve({ code: 0, stdout: "" }); // unresolved, deterministic
+      },
+    };
+    const handle = await runEgressGateDaemon({
+      agentUid: AGENT_UID,
+      loadGatePolicy: async () => JSON.stringify({ agent_uid: AGENT_UID, gate_port: port, generation_id: 9 }),
+      loadRules: async () => [],
+      loadOraclePublicKey,
+      clientAuth: createGateClientAuthenticator({ agentUid: AGENT_UID, acceptSource }),
+      runtimeDir: dir,
+      livenessDir: dir,
+      credDir: dir,
+      peerRunner: trackedRunner,
+      onEvent: () => undefined,
+    });
+    try {
+      await rawConnect(handle.gate.port, "127.0.0.1:1", header);
+      expect(ranScripted).toBe(true);
+    } finally {
+      await handle.close();
+    }
+  });
+
+  it("the default socket path is derived from peerResolverSocketPath(agentUid, peerResolverDir ?? PEER_RESOLVER_DIR)", () => {
+    expect(peerResolverSocketPath(AGENT_UID, "/tmp/x")).toBe("/tmp/x/502.sock");
   });
 });

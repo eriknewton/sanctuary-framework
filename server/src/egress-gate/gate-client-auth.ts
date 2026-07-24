@@ -28,6 +28,24 @@
  * never read as a defect. The bearer credential is exactly why peer resolution
  * can be the STRICTER of the two without being the only one.
  *
+ * RECONCILED 2026-07-24 (Mini1 drill finding + fix,
+ * `Gate_Peer_Resolution_Fix_Build_Spec_2026-07-24.md`): the comment above
+ * describes the RARE-failure case this rule was DESIGNED for. On current main
+ * before the fix, resolution instead failed the DETERMINISTIC common case
+ * (100% of real agent connects, `peer_unresolved`): the unprivileged gate uid
+ * cannot `lsof` the confined agent's cross-uid socket at all, so every
+ * connect denied regardless of load. The fix
+ * (`peer-resolver-client.ts`/`peer-resolver-daemon.ts`) does not touch this
+ * decision function or its DENY-on-unresolved posture -- unresolved still
+ * denies, bearer still never overrides peer, exactly as designed. It fixes
+ * WHO can resolve the peer (a privileged root helper instead of the
+ * unprivileged gate), so `unresolved` becomes this comment's originally
+ * intended rare race/saturation case again instead of the universal case.
+ * The `PEER_LOOKUP_MAX_CONCURRENT` cap in `gate-server.ts` is UNCHANGED by
+ * this fix (left at its existing conservative value); re-tuning it needs real
+ * concurrent-load evidence from the Erik-present drill, not a guess, and is
+ * tracked as a follow-on rather than guessed here.
+ *
  * PURE + INJECTED. {@link decideGateClientAuth} is a pure function over the two
  * lens results; {@link createGateClientAuthenticator} wires it to an injected
  * accept-source (reads the root-written `.accept` file) so it is host-free in

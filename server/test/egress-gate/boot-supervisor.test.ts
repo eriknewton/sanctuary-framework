@@ -219,6 +219,19 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     expect(kickIdx).toBeGreaterThan(bootstrapIdx);
     expect(readIdx).toBeGreaterThan(kickIdx);
     expect(barrierIdx).toBeGreaterThan(readIdx);
+    // 2026-07-24 S5-3 fix: the PRIVILEGED peer-resolver daemon is ALSO
+    // bootstrapped on every boot (RunAtLoad=false, same H2 rationale) --
+    // BEFORE the gate daemon's own bootstrap, so the gate's first CONNECT
+    // after a reboot has somewhere to resolve peers from immediately.
+    const resolverBootstrapIdx = events.indexOf(
+      "launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate-peer-resolver.502.plist",
+    );
+    const resolverKickIdx = events.indexOf(
+      "launchctl kickstart system/ai.sanctuaryprotocol.egress-gate-peer-resolver.502",
+    );
+    expect(resolverBootstrapIdx).toBeGreaterThanOrEqual(0);
+    expect(resolverKickIdx).toBeGreaterThan(resolverBootstrapIdx);
+    expect(bootstrapIdx).toBeGreaterThan(resolverKickIdx);
   });
 
   it("a boot gate-home layout failure logs LOUDLY and forces the release barrier to park fail-closed", async () => {

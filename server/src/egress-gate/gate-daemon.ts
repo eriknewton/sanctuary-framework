@@ -9,6 +9,17 @@
  * the coalescing-forbidden oracle probe), and a real `peerRunner` (without
  * one every CONNECT would deny, fail-closed but useless).
  *
+ * PEER RUNNER = THE PRIVILEGED RESOLVER CLIENT (2026-07-24 fix, Option 1,
+ * `Gate_Peer_Resolution_Fix_Build_Spec_2026-07-24.md`). This daemon is
+ * deliberately UNPRIVILEGED (below), so it cannot itself `lsof` a different
+ * uid's socket -- the Mini1 2026-07-24 drill proved that shelling `lsof`
+ * locally (the pre-fix default) resolves NOTHING cross-uid and denies every
+ * real agent connect. The default `peerRunner` is now
+ * `createPrivilegedPeerRunner` (`peer-resolver-client.ts`), which dials the
+ * ROOT-owned `peer-resolver-daemon.ts` LaunchDaemon over a per-agent-uid-
+ * scoped Unix domain socket instead. `deps.peerRunner` remains overridable
+ * (tests inject a scripted `PeerCommandRunner` directly, as before).
+ *
  * PROCESS SHAPE (design answer 1): one daemon per confined agent, label
  * `ai.sanctuaryprotocol.egress-gate.<agent_uid>`, `UserName` = the gate
  * service account (NEVER root -- root would defeat the S5-0 gate-uid kernel
@@ -51,7 +62,9 @@ import {
 import { createOracleLivenessProbe, createFsLivenessTokenSource, GATE_LIVENESS_DIR } from "./liveness-oracle.js";
 import { createGateClientAuthenticator, type GateClientAuthenticator } from "./gate-client-auth.js";
 import { createFsGateAcceptSource, GATE_CRED_DIR } from "./gate-credential.js";
-import { createExecFilePeerRunner } from "./peer-identity.js";
+import type { PeerCommandRunner } from "./peer-identity.js";
+import { createPrivilegedPeerRunner } from "./peer-resolver-client.js";
+import { PEER_RESOLVER_DIR, peerResolverSocketPath } from "./peer-resolver-daemon.js";
 
 /**
  * Root-owned runtime dir (0755 root, EXPLICIT chmod via `runtime-fs-plan.ts`).
@@ -318,6 +331,15 @@ export interface EgressGateDaemonDeps {
   livenessDir?: string;
   /** Credential accept-record dir override (tests). */
   credDir?: string;
+  /**
+   * Peer-resolution runner (default: {@link createPrivilegedPeerRunner}
+   * pointed at this agent's peer-resolver daemon socket -- the 2026-07-24
+   * fix, see the module header). Tests inject a scripted `PeerCommandRunner`
+   * directly, same as before this fix.
+   */
+  peerRunner?: PeerCommandRunner;
+  /** Peer-resolver socket parent-dir override (tests; default {@link PEER_RESOLVER_DIR}). */
+  peerResolverDir?: string;
   /** Event sink (default: stderr lines; production also ships the unified log). */
   onEvent?: (event: EgressGateEvent) => void;
 }
@@ -414,6 +436,17 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
       process.stderr.write(`[egress-gate] ${JSON.stringify(event)}\n`);
     });
 
+  // 2026-07-24 fix (Option 1): the default peer runner dials the PRIVILEGED
+  // root resolver instead of shelling `lsof` as this (unprivileged) daemon's
+  // own uid -- see the module header. `peerResolverDir` lets tests point at a
+  // temp socket dir without touching `/var/db/sanctuary`.
+  const peerRunner =
+    deps.peerRunner ??
+    createPrivilegedPeerRunner({
+      agentUid: deps.agentUid,
+      socketPath: peerResolverSocketPath(deps.agentUid, deps.peerResolverDir ?? PEER_RESOLVER_DIR),
+    });
+
   // The S5-6 wiring contract: oracle probe + peerRunner + clientAuth, and
   // singleFlightLiveness OMITTED (the construction guard auto-disables it for
   // the coalescing-forbidden oracle probe).
@@ -421,7 +454,7 @@ export async function runEgressGateDaemon(deps: EgressGateDaemonDeps): Promise<E
     policy,
     rules,
     livenessProbe,
-    peerRunner: createExecFilePeerRunner(),
+    peerRunner,
     clientAuth,
     onEvent,
   });

@@ -114,6 +114,11 @@ import {
   renderEgressGateDaemonPlist,
   type EgressGateRuntimeState,
 } from "./gate-daemon.js";
+import {
+  peerResolverDaemonLabel,
+  peerResolverDaemonPlistPath,
+  renderPeerResolverDaemonPlist,
+} from "./peer-resolver-daemon.js";
 import { diffTransientPfRules } from "./drift-guard.js";
 import { ensureExclusiveEgressRuntimeFs } from "./runtime-fs-plan.js";
 import {
@@ -835,6 +840,42 @@ async function productionBringUp(
   const credAuthority = createFsGateCredentialAuthority({ gateUid: state.gateUid });
   await credAuthority.mint({ agentUid: input.agentUid, generationId: committed.generation_id });
 
+  // 2026-07-24 S5-3 fix (Option 1): install + bootstrap the PRIVILEGED
+  // peer-resolver daemon (root) BEFORE the gate daemon starts serving, so the
+  // gate's peer lookups have somewhere to dial from its very first CONNECT.
+  // Mirrors the gate daemon's own bootstrap sequence below, one daemon per
+  // confined agent (see `peer-resolver-daemon.ts`).
+  const resolverLabel = peerResolverDaemonLabel(input.agentUid);
+  const resolverPlistPath = peerResolverDaemonPlistPath(input.agentUid);
+  await writeFile(
+    resolverPlistPath,
+    renderPeerResolverDaemonPlist({
+      agentUid: input.agentUid,
+      programArguments: [
+        ...input.gateDaemonArgvPrefix,
+        "castle-wall",
+        "peer-resolver-daemon",
+        `--agent-uid=${input.agentUid}`,
+        `--gate-uid=${state.gateUid}`,
+      ],
+      fortressPath: input.fortressPath,
+    }),
+    { mode: 0o644 },
+  );
+  const resolverBootstrap = await runLaunchctl(["bootstrap", "system", resolverPlistPath]);
+  if (
+    resolverBootstrap.code !== 0 &&
+    !/already bootstrapped|Bootstrap failed: 5: Input\/output error/i.test(resolverBootstrap.stderr)
+  ) {
+    throw new Error(
+      `launchctl bootstrap ${resolverLabel} exited ${resolverBootstrap.code}: ${resolverBootstrap.stderr.trim()}`,
+    );
+  }
+  const resolverKick = await runLaunchctl(["kickstart", `system/${resolverLabel}`]);
+  if (resolverKick.code !== 0) {
+    throw new Error(`launchctl kickstart ${resolverLabel} exited ${resolverKick.code}: ${resolverKick.stderr.trim()}`);
+  }
+
   // Hand the committed port from the root placeholder to the gate daemon:
   // release, install the gate daemon plist, bootstrap, then wait for the
   // runtime state naming EXACTLY this {port, generation} and verify the
@@ -1151,6 +1192,38 @@ export async function bootstrapGateDaemonForBoot(input: {
       ...(input.waitIntervalMs !== undefined ? { intervalMs: input.waitIntervalMs } : {}),
       ...(input.gateDaemonStderrPath !== undefined ? { gateDaemonStderrPath: input.gateDaemonStderrPath } : {}),
     });
+  }
+}
+
+/**
+ * Bootstrap + kickstart one agent's PEER-RESOLVER daemon LaunchDaemon
+ * (2026-07-24 S5-3 fix). Same H2 rationale as {@link bootstrapGateDaemonForBoot}
+ * -- `RunAtLoad=false`, so without this nothing re-starts the privileged
+ * resolver after a reboot, and every CONNECT would deny again exactly as the
+ * Mini1 drill found. No runtime-state file to wait for (the resolver
+ * publishes nothing; the gate's own `waitForGateRuntime` is the boot
+ * sequence's readiness gate), so this is bootstrap+kickstart only. Throws on
+ * failure; the boot caller logs loudly and lets the barrier's `verifyGate`
+ * produce the honest parked outcome (a gate that cannot resolve peers denies
+ * fail-closed, it does not silently degrade).
+ */
+export async function bootstrapPeerResolverDaemonForBoot(input: {
+  agentUid: number;
+  runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+}): Promise<void> {
+  const run = input.runLaunchctlFn ?? runLaunchctl;
+  const label = peerResolverDaemonLabel(input.agentUid);
+  const plistPath = peerResolverDaemonPlistPath(input.agentUid);
+  const bootstrap = await run(["bootstrap", "system", plistPath]);
+  if (
+    bootstrap.code !== 0 &&
+    !/already bootstrapped|service already loaded|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)
+  ) {
+    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
+  }
+  const kick = await run(["kickstart", `system/${label}`]);
+  if (kick.code !== 0) {
+    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
   }
 }
 
@@ -1654,6 +1727,17 @@ export async function restoreCoarseCompositionProduction(
         `${bootout.stderr.trim()}); refusing to tear down the gate surfaces under a possibly-live gate`,
     );
   }
+  // 0b. The PRIVILEGED peer-resolver daemon down too (2026-07-24 S5-3 fix):
+  // it holds no gate-serving surface itself, but leaving a root process live
+  // for an agent whose gate just stopped is unaccounted-for privilege, the
+  // same M5 reasoning as step 0. A not-loaded bootout is success.
+  const resolverBootout = await launchctl(["bootout", `system/${peerResolverDaemonLabel(input.agentUid)}`]);
+  if (resolverBootout.code !== 0 && !launchctlBootoutWasNotLoaded(resolverBootout)) {
+    throw new Error(
+      `coarse restore: could not stop the peer-resolver daemon (launchctl bootout exited ${resolverBootout.code}: ` +
+        `${resolverBootout.stderr.trim()}); refusing to tear down the gate surfaces under a possibly-live root resolver`,
+    );
+  }
   // 1. Marker + gate policy OFF next: from the next compose the daemon is in
   // plain coarse mode (gate-scoped rules briefly compose coarse -- the agent
   // has no direct allows in that window, which is the safe direction).
@@ -1683,8 +1767,10 @@ export async function restoreCoarseCompositionProduction(
     await createFsGateCredentialAuthority({ gateUid }).revoke(input.agentUid);
   }
   // 3. Plist + config copies + the per-uid runtime dir off (daemon already
-  // stopped in step 0).
+  // stopped in step 0), including the peer-resolver plist (daemon already
+  // stopped in step 0b).
   await removeFile(egressGateDaemonPlistPath(input.agentUid));
+  await removeFile(peerResolverDaemonPlistPath(input.agentUid));
   await removeFile(egressGatePolicyConfigPath(input.agentUid));
   await removeFile(egressGateRulesConfigPath(input.agentUid));
   await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
@@ -2380,10 +2466,22 @@ export function createUnprotectExclusiveEgressOps(
       verifyHarnessParkedPersistent(parkCtx, parkDeps),
     recoverGeneration: () => (deps.recoverGeneration ?? productionRecoverGeneration)(input.agentUid),
     async bootoutGateDaemon(): Promise<void> {
+      // Gate daemon FIRST (unchanged order/error shape -- callers/tests key
+      // off this exact failure message), then the PRIVILEGED peer-resolver
+      // daemon (2026-07-24 S5-3 fix): leaving a root process live for an
+      // agent whose gate just stopped is unaccounted-for privilege, the same
+      // M5 reasoning `restoreCoarseCompositionProduction` applies.
       const label = egressGateDaemonLabel(input.agentUid);
       const bootout = await launchctl(["bootout", `system/${label}`]);
       if (bootout.code !== 0 && !launchctlBootoutWasNotLoaded(bootout)) {
         throw new Error(`launchctl bootout ${label} exited ${bootout.code}: ${bootout.stderr.trim()}`);
+      }
+      const resolverLabel = peerResolverDaemonLabel(input.agentUid);
+      const resolverBootout = await launchctl(["bootout", `system/${resolverLabel}`]);
+      if (resolverBootout.code !== 0 && !launchctlBootoutWasNotLoaded(resolverBootout)) {
+        throw new Error(
+          `launchctl bootout ${resolverLabel} exited ${resolverBootout.code}: ${resolverBootout.stderr.trim()}`,
+        );
       }
     },
     async invalidateOracleToken(): Promise<void> {
@@ -2395,9 +2493,10 @@ export function createUnprotectExclusiveEgressOps(
     },
     async removeGateSurfaces(): Promise<void> {
       // The leaving uid is the sole exclusive agent (step 0 invariant), so
-      // every surface is torn down. PER-UID surfaces (the gate daemon was
-      // already booted out, step 3):
+      // every surface is torn down. PER-UID surfaces (the gate + resolver
+      // daemons were already booted out, step 3):
       await removeFile(egressGateDaemonPlistPath(input.agentUid));
+      await removeFile(peerResolverDaemonPlistPath(input.agentUid));
       await removeFile(egressGatePolicyConfigPath(input.agentUid));
       await removeFile(egressGateRulesConfigPath(input.agentUid));
       await removeFile(egressGateRuntimeUidDirPath(input.agentUid));
@@ -2907,6 +3006,21 @@ export async function startExclusiveEgressBootSupervisor(input: {
                 `(${(auditErr as Error).message}); the release barrier will still verify and park fail-closed`,
             );
           }
+        }
+        // 2026-07-24 S5-3 fix: START the PRIVILEGED peer-resolver daemon
+        // FIRST (same RunAtLoad=false H2 rationale, one daemon per confined
+        // agent, `bootstrapPeerResolverDaemonForBoot`). A bootstrap failure
+        // here logs loudly and still lets the gate daemon start below and the
+        // barrier verify: a gate with no reachable resolver denies every
+        // CONNECT fail-closed (peer_unresolved), the honest degraded outcome,
+        // never a crash and never a silent widen.
+        try {
+          await bootstrapPeerResolverDaemonForBoot({ agentUid, runLaunchctlFn: launchctlFn });
+        } catch (err) {
+          input.print(
+            `[castle-wall] boot: uid ${agentUid} peer-resolver daemon bootstrap failed (${(err as Error).message}); ` +
+              "the gate will deny CONNECTs fail-closed (peer_unresolved) until this is repaired.",
+          );
         }
         // Fix-round H2: START the gate daemon (RunAtLoad=false by contract;
         // nothing else starts it after a reboot), then let the barrier verify

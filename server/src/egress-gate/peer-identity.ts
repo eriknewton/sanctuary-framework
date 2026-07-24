@@ -1,26 +1,44 @@
 /**
- * Loopback-TCP peer-identity recovery (Unified Protect Slice 2).
+ * Loopback-TCP peer-identity recovery (Unified Protect Slice 2; RECONCILED
+ * 2026-07-24 for the S5-3 fail-closed contract, `Gate_Peer_Resolution_Fix_
+ * Build_Spec_2026-07-24.md`).
  *
- * The gate channel pivoted from UDS to loopback TCP (Wave-A Q1), which cost
- * the easy `getpeereid` peer-uid read. This module recovers the connecting
- * client's pid/uid by mapping the loopback 4-tuple back to the owning
- * process.
+ * The gate channel pivoted from UDS to loopback TCP (Wave-A Q1) to keep
+ * standard `HTTPS_PROXY`-over-TCP compatibility ("works with any
+ * agent/harness"; a UDS proxy socket needs client support almost nothing
+ * has). That pivot cost the easy `getpeereid` peer-uid read. This module
+ * recovers the connecting client's pid/uid by mapping the loopback 4-tuple
+ * back to the owning process.
  *
- * STANCE: ADVISORY-ONLY (design open-decision 3, CTO-confirmed). The
- * PRIMARY control is the kernel wall confinement (per-uid classification at
- * the sysext) plus the pf loopback anchor; peer identity at the gate is a
- * second lens. There is an inherent TOCTOU window: the client socket can
- * close and its ephemeral port be reused between `accept()` and the query.
- * The window is DOCUMENTED, not fixed; consequently:
+ * THIS MODULE'S OWN CONTRACT IS UNCHANGED AND POLICY-NEUTRAL: `null` means
+ * only "could not resolve," never a decision. WHAT A CALLER DOES WITH `null`
+ * DEPENDS ENTIRELY ON WHICH GATE MODE IS ASKING -- there are now TWO, and a
+ * stale single-mode framing here previously read as a universal truth it was
+ * not:
  *
- *   - a peer-uid MISMATCH is logged loudly (audit event) but the request is
- *     still policy-evaluated on its own merits;
- *   - a peer-uid MATCH never grants anything by itself (never grant on
- *     peer-id alone);
- *   - a resolution failure resolves to `null` and the gate proceeds on the
- *     primary controls (the failure is surfaced as an event, not a deny,
- *     because peer-id is advisory; the fail-closed control is the pf
- *     liveness check in `gate-server.ts`).
+ *   - LEGACY / ADVISORY MODE (Slice 2, `gate-server.ts`'s branch when no
+ *     `clientAuth` is configured): a MISMATCH is logged loudly but the
+ *     request is still policy-evaluated on its own merits; a MATCH never
+ *     grants anything by itself; an unresolved `null` is surfaced as an
+ *     event, NOT a deny (the fail-closed control in this mode is the pf
+ *     liveness check, not peer identity).
+ *   - FAIL-CLOSED / TCB MODE (Slice 5 S5-3, `gate-client-auth.ts`, the
+ *     production wiring since S5-6): peer identity is a REQUIRED second
+ *     lens. The SAME `null` this module returns is a HARD DENY there
+ *     (`peer_unresolved`) -- bearer credential alone never overrides it.
+ *
+ * THE 2026-07-24 DRILL FINDING, for why this reconciliation exists: in TCB
+ * mode, an UNPRIVILEGED gate uid running `lsof` cannot see a DIFFERENT uid's
+ * socket, so this module's `resolveLoopbackPeer` returned `null` on EVERY
+ * real agent CONNECT (100%, hardware-confirmed), and S5-3's fail-closed
+ * `null -> deny` rule strangled the agent completely. The fix
+ * (`peer-resolver-client.ts` / `peer-resolver-daemon.ts`) does not touch this
+ * module's decision logic at all -- `parseLsofPeer` and `resolveLoopbackPeer`
+ * are UNCHANGED and reused server-side by the new privileged resolver too. It
+ * changes only WHICH `PeerCommandRunner` production TCB wiring injects: a
+ * client that dials a root-owned resolver instead of shelling `lsof` locally,
+ * so the SAME lookup that used to fail 100% of the time now succeeds for the
+ * common case, and `null` genuinely means the rare race/TOCTOU case again.
  *
  * MECHANISM (minimalism ladder): the platform's `lsof` is shelled out to
  * (never a shell string, argv only) instead of adding a native `libproc`
@@ -30,12 +48,17 @@
  * `127.0.0.1:<clientPort>->`) is the peer. The gate's own socket on the
  * same connection has the inverse orientation and is skipped. DEBT: a
  * `proc_pidinfo`/`PROC_PIDFDSOCKETINFO` native path would avoid the lsof
- * dependency at the cost of a native module; deferred until a drill shows
- * lsof is too slow or unreliable.
+ * dependency (in BOTH the legacy in-process caller and the privileged
+ * resolver daemon) at the cost of a native module; the 2026-07-24 fix ships
+ * root-`lsof` as the interim mechanism (per spec, acceptable to ship first)
+ * and files the native path as a follow-on, deferred until a drill shows
+ * `lsof` is too slow or unreliable.
  *
  * Drill acceptance (design Slice 2 criterion: resolves the agent uid for a
  * real agent connection and a non-agent uid for an operator connection,
- * N>=3) is PENDING.
+ * N>=3) is PENDING -- see `Mini1_S5_PositiveThroughGate_Drill_Runbook_2026-07-23.md`;
+ * this is the Erik-present DoD for the 2026-07-24 fix, not proven by this
+ * module's own (host-free) unit tests.
  */
 
 import { createExecFileRunner } from "./exec-runner.js";
@@ -117,8 +140,11 @@ export interface ResolveLoopbackPeerOptions {
 
 /**
  * Resolve the loopback peer's pid/uid, or `null` when it cannot be
- * determined (lsof missing, raced socket, unparseable output). `null` NEVER
- * blocks the request: peer identity is advisory (see module header).
+ * determined (lsof missing, raced socket, unparseable output). THIS FUNCTION
+ * never blocks anything itself -- it only reports `null` or a resolved
+ * identity. Whether a caller's `null` becomes a deny depends on the calling
+ * gate mode (see the module header): advisory in the legacy Slice 2 path,
+ * a hard `peer_unresolved` deny in the S5-3 TCB path.
  */
 export async function resolveLoopbackPeer(
   options: ResolveLoopbackPeerOptions,

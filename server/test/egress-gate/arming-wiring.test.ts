@@ -54,6 +54,7 @@ import {
   egressGateRuntimeUidDirPath,
 } from "../../src/egress-gate/gate-daemon.js";
 import { gateLivenessTokenPath } from "../../src/egress-gate/liveness-oracle.js";
+import { peerResolverDaemonPlistPath } from "../../src/egress-gate/peer-resolver-daemon.js";
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
 import {
   holdFilePathForUid,
@@ -837,6 +838,35 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     );
   });
 
+  it("bootoutGateDaemon (2026-07-24 S5-3 fix): ALSO boots out the peer-resolver daemon, gate FIRST", async () => {
+    const calls: string[] = [];
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      runLaunchctl: async (args) => {
+        calls.push(args.join(" "));
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await ops.bootoutGateDaemon();
+    expect(calls).toEqual([
+      "bootout system/ai.sanctuaryprotocol.egress-gate.601",
+      "bootout system/ai.sanctuaryprotocol.egress-gate-peer-resolver.601",
+    ]);
+  });
+
+  it("bootoutGateDaemon: a peer-resolver-only failure (gate stops fine) THROWS with the resolver label named", async () => {
+    const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
+      runLaunchctl: async (args) => {
+        if (args.join(" ").includes("peer-resolver")) {
+          return { code: 5, stdout: "", stderr: "Boot-out failed: 5: Input/output error" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    });
+    await expect(ops.bootoutGateDaemon()).rejects.toThrow(
+      /bootout ai\.sanctuaryprotocol\.egress-gate-peer-resolver\.601 exited 5/,
+    );
+  });
+
   it("credential + oracle teardown removes EXACTLY the single-source uid-keyed paths (no constructed authority needed)", async () => {
     const removed: string[] = [];
     const ops = createUnprotectExclusiveEgressOps(UNPROTECT_INPUT, {
@@ -863,6 +893,7 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     await ops.removeGateSurfaces();
     expect(removed).toEqual([
       egressGateDaemonPlistPath(601),
+      peerResolverDaemonPlistPath(601),
       egressGatePolicyConfigPath(601),
       egressGateRulesConfigPath(601),
       egressGateRuntimeUidDirPath(601),
