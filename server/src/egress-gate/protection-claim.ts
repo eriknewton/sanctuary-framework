@@ -60,6 +60,20 @@ export type ProtectionStateObservation =
         | "provider_unavailable"
         | "read_failed"
         | "insufficient_evidence"
+        /**
+         * F-ARMSUMMARY. The generic unknown bases above render as "Castle Wall
+         * status unknown (not confirmed armed)". After a run whose OWN arm step
+         * reported success, that sentence reads as a flat contradiction of the
+         * success line printed moments earlier -- the 2026-07-26 Mini1 drill
+         * captured all three claims in one successful run (`L1-arm-exclusive.log`
+         * lines 16, 65 and 75) while independent measurement said armed.
+         *
+         * This basis carries the SAME verdict (unknown, never green) with the
+         * qualifier that resolves the contradiction. It claims nothing new: "this
+         * run's arm step reported success" is a statement about control flow and
+         * is worded as one, and enforcement is still reported as unobserved.
+         */
+        | "armed_this_run_enforcement_unobserved"
         | "provision_outcome_not_observation"
         | "daemon_liveness_missing"
         | "exclusive_egress_repark_failed"
@@ -221,6 +235,94 @@ export function protectionObservationFromFeatureHealth(input: {
   };
 }
 
+/**
+ * The generic unknown bases: the ones whose advice is the bare "Castle Wall
+ * status unknown (not confirmed armed)". Every OTHER unknown basis already
+ * names what specifically could not be established and must be left alone.
+ */
+const GENERIC_UNKNOWN_BASES: ReadonlySet<string> = new Set([
+  "provider_unavailable",
+  "read_failed",
+  "insufficient_evidence",
+]);
+
+/**
+ * F-ARMSUMMARY, half one. THE one place the wrap banner reconciles what the
+ * run DID with what the run OBSERVED.
+ *
+ * A wrap whose arm step succeeded and whose enforcement evidence has not
+ * arrived yet used to close on "Castle Wall status unknown (not confirmed
+ * armed)" -- true about the evidence, and unreadable next to the success line
+ * the same run printed. The verdict is unchanged (unknown, never green, same
+ * imperative); only the sentence acquires the qualifier that makes the two
+ * lines consistent.
+ *
+ * `armStepReportedSuccess` is exactly what its name says: the run's own
+ * provisioning outcome, which this codebase deliberately does NOT treat as an
+ * observation of enforcement (see the `provision_outcome_not_observation`
+ * basis). It is therefore only ever allowed to change WORDING, never state,
+ * never green, and never to upgrade a specific unknown basis into a vaguer one.
+ */
+export function reconcileProtectionClaimWithArmOutcome(
+  claim: ProtectionStateClaim,
+  armStepReportedSuccess: boolean,
+): ProtectionStateClaim {
+  if (!armStepReportedSuccess) return claim;
+  if (claim.state !== "unknown") return claim;
+  if (!GENERIC_UNKNOWN_BASES.has(claim.basis)) return claim;
+  return protectionStateClaimFromObservation({
+    state: "unknown",
+    basis: "armed_this_run_enforcement_unobserved",
+    reasons: claim.reasons,
+  });
+}
+
+/**
+ * F-ARMSUMMARY, half two. The operator-facing copy for a Castle Wall daemon
+ * that this run FAILED TO START.
+ *
+ * The old copy opened "WARNING: Castle Wall is NOT armed ... outbound traffic
+ * is NOT filtered" for every start failure, derived from the exception alone.
+ * Nothing at that point in the flow observes the host. In the 2026-07-26 Mini1
+ * drill the reason printed directly underneath the words "Castle Wall is NOT
+ * armed" was "A Castle Wall SAFE-MODE boot daemon (PID 1432) is currently
+ * enforcing this fortress" -- the message contradicted itself in two adjacent
+ * lines, and measurement (`Content filter: enabled`, lease `armed`, the
+ * confined uid measurably confined) agreed with the reason, not the headline.
+ *
+ * So the headline is now a function of the failure, and the one thing this
+ * code genuinely knows is stated first: THIS RUN did not start a daemon. It
+ * makes no claim about whether the host is filtering, because it did not look.
+ * Same shape as the observed-confinement sentence on the provisioning surface.
+ *
+ * Returns the headline lines; the caller adds the reason and any migration
+ * guidance. Exported so the failure -> sentence mapping is asserted directly.
+ */
+export function castleWallDaemonStartFailureHeadline(
+  failureMessage: string,
+): readonly string[] {
+  if (CASTLE_WALL_ALREADY_HELD_RE.test(failureMessage)) {
+    return [
+      "  NOTE: this run did not start a Castle Wall daemon, because another one",
+      "  already holds this fortress. Enforcement is whatever THAT daemon is doing;",
+      "  this run neither armed nor disarmed anything.",
+    ];
+  }
+  return [
+    "  WARNING: this run did not start the Castle Wall enforcement daemon, so it",
+    "  did not arm anything. Whether this host is filtering outbound traffic right",
+    "  now was NOT checked here; confirm it before relying on this wrap.",
+  ];
+}
+
+/**
+ * Failure messages that mean "a Castle Wall daemon is already holding this
+ * fortress" -- i.e. the start failed BECAUSE something is already enforcing.
+ * Saying "NOT armed" over one of these is not an under-claim, it is wrong.
+ */
+const CASTLE_WALL_ALREADY_HELD_RE =
+  /\b(already (running|enforcing|armed|holds|holding))\b|\bis currently enforcing\b|\bboot daemon\b.*\benforcing\b/i;
+
 export function protectionStateAdvice(
   claim: ProtectionStateClaim,
 ): ProtectionStateAdvice {
@@ -301,6 +403,17 @@ export function protectionStateAdvice(
             "Your agent is wrapped, but its Castle Wall evidence was produced by a pre-canonical Linux daemon.",
           castleWallLabel:
             "Castle Wall status unknown (pre-canonical Linux evidence)",
+          imperative: inspectImperative,
+        };
+      }
+      if (claim.basis === "armed_this_run_enforcement_unobserved") {
+        return {
+          green: false,
+          operatorSentence:
+            "Your agent is wrapped. This run's arm step reported success, but enforcement " +
+            "has not been observed yet, so protection is not confirmed.",
+          castleWallLabel:
+            "Castle Wall status unknown (this run's arm step reported success; enforcement not yet observed)",
           imperative: inspectImperative,
         };
       }

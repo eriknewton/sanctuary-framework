@@ -76,6 +76,7 @@ import {
   disarmPfAnchor,
   type ArmPfAnchorResult,
   type ArmPfAnchorUnionOptions,
+  type DisarmPfAnchorResult,
   type PfAnchorUnionEntry,
   type PfCommandRunner,
   type PfLivenessResult,
@@ -194,7 +195,19 @@ export interface PfAnchorRegistryOps {
     entries: readonly PfAnchorUnionEntry[],
     options: ArmPfAnchorUnionOptions,
   ) => Promise<ArmPfAnchorResult>;
-  disarm?: (options: { anchorName: string; enableToken?: string }) => Promise<void>;
+  /**
+   * Flush the anchor and release the pf enable reference. The result is
+   * OPTIONAL for injected doubles: production threads
+   * {@link disarmPfAnchor}, whose {@link DisarmPfAnchorResult} reports whether
+   * the reference was released or was already gone (the post-reboot stale-token
+   * case, F-PFBOOT). The registry does not branch on it -- either way the
+   * reference no longer needs releasing and the committed entry may be cleared
+   * -- but the value is carried so a caller that wants to REPORT it can.
+   */
+  disarm?: (options: {
+    anchorName: string;
+    enableToken?: string;
+  }) => Promise<void | DisarmPfAnchorResult>;
   unionLiveness?: (
     entries: readonly PfAnchorUnionEntry[],
     anchorName: string,

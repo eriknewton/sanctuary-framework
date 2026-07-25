@@ -29,6 +29,7 @@ export {
   renderPfMainRulesetHook,
   checkPfAnchorLiveness,
   checkPfAnchorUnionLiveness,
+  observePfEnabled,
   findPreemptingQuickPassRules,
   findLoopbackSkipLines,
   armPfAnchor,
@@ -42,6 +43,9 @@ export {
   type ArmPfAnchorUnionOptions,
   type ArmPfAnchorResult,
   type DisarmPfAnchorOptions,
+  type DisarmPfAnchorResult,
+  type PfEnabledObservation,
+  type PfEnableReferenceDisposition,
 } from "./pf-anchor.js";
 
 export {
@@ -285,6 +289,8 @@ export {
   protectionObservationFromFeatureHealth,
   protectionStateAdvice,
   protectionStateClaimFromObservation,
+  reconcileProtectionClaimWithArmOutcome,
+  castleWallDaemonStartFailureHeadline,
   type ProtectionClaimState,
   type ProtectionFeatureStatus,
   type ProtectionStateAdvice,

@@ -119,9 +119,11 @@ import {
   type ExclusiveEgressStatus,
 } from "../principal-policy/posture.js";
 import {
+  castleWallDaemonStartFailureHeadline,
   protectionObservationFromFeatureHealth,
   protectionStateAdvice,
   protectionStateClaimFromObservation,
+  reconcileProtectionClaimWithArmOutcome,
   type ProtectionFeatureBasis,
   type ProtectionFeatureStatus,
   type ProtectionClaimState,
@@ -1781,7 +1783,7 @@ function unknownClaimWithAutoProvisionReasons(
   });
 }
 
-export async function resolveWrapProtectionClaim(input: {
+interface WrapProtectionClaimInput {
   auditLog: AuditLog | undefined;
   auditStorage?: FilesystemStorage;
   masterKey?: Uint8Array;
@@ -1790,7 +1792,28 @@ export async function resolveWrapProtectionClaim(input: {
   storagePath: string;
   providerTimeoutMs?: number;
   resolveExclusiveEgress?: () => Promise<ExclusiveEgressStatus | null>;
-}): Promise<ProtectionStateClaim> {
+}
+
+/**
+ * Resolve the wrap banner's protection claim, then reconcile its WORDING with
+ * what this run did (F-ARMSUMMARY). The reconciliation is applied here, once,
+ * over every return path below: the drill's contradictory closing line came
+ * from a `provider_unavailable` / `insufficient_evidence` unknown, and those
+ * are produced at five different early returns.
+ */
+export async function resolveWrapProtectionClaim(
+  input: WrapProtectionClaimInput,
+): Promise<ProtectionStateClaim> {
+  const claim = await resolveWrapProtectionClaimUnreconciled(input);
+  return reconcileProtectionClaimWithArmOutcome(
+    claim,
+    autoProvisionArmStepReportedSuccess(input.autoProvisionSummary),
+  );
+}
+
+async function resolveWrapProtectionClaimUnreconciled(
+  input: WrapProtectionClaimInput,
+): Promise<ProtectionStateClaim> {
   const autoProvisionClaim = protectionClaimFromAutoProvisionSummary(
     input.autoProvisionSummary,
   );
@@ -1876,6 +1899,19 @@ export async function resolveWrapProtectionClaim(input: {
     },
   );
   return applyAutoProvisionCeiling(probedClaim, autoProvisionCeiling);
+}
+
+/**
+ * True when THIS RUN's auto-provision reached an arm outcome. A statement
+ * about control flow, named as one -- see
+ * {@link reconcileProtectionClaimWithArmOutcome}, the only thing allowed to
+ * consume it, and only to qualify wording.
+ */
+function autoProvisionArmStepReportedSuccess(
+  summary: AutoProvisionSummary,
+): boolean {
+  if (!summary.ran || summary.outcome === undefined) return false;
+  return summary.outcome.kind === "armed" || summary.outcome.kind === "armed-exclusive";
 }
 
 /**
@@ -4700,7 +4736,7 @@ async function unwrap(dryRun: boolean): Promise<void> {
  * start during `wrap`. Wrap is best-effort with respect to the daemon (a start
  * failure never blocks wrapping the agent), but a silent "Note:" let an
  * upgrade quietly leave a previously-armed host UNARMED. This makes the
- * not-armed state loud, and - on macOS, when the failure is the A2/B2
+ * failed-to-start state loud, and - on macOS, when the failure is the A2/B2
  * helper-signing default having no reachable signer - prints the exact
  * migration path (install the helper + point at the shim, or opt back into the
  * legacy local-signing key). See the A2/B2 re-drill verdict's migration caveat.
@@ -4715,8 +4751,10 @@ function warnCastleWallDaemonNotStarted(err: unknown): void {
   const lines = [
     "",
     "  ====================================================================",
-    "  WARNING: Castle Wall is NOT armed. Your agent is wrapped, but the",
-    "  enforcement wall did not start, so outbound traffic is NOT filtered.",
+    // F-ARMSUMMARY: the headline is derived from the failure, in the copy
+    // chokepoint, instead of asserting "Castle Wall is NOT armed" from a
+    // control-flow position that never looked at the host.
+    ...castleWallDaemonStartFailureHeadline(message),
     `  Reason: ${message}`,
   ];
   if (helperMigration) {

@@ -274,15 +274,19 @@ describe("egress-gate/pf-anchor union primitives", () => {
     });
 
     it("releases its OWN acquired -E reference on a post-enable failure, and does NOT flush (gate finding)", async () => {
-      // Load + hook + enable succeed, but the anchor never becomes live (pf
-      // reports Disabled), so settle times out AFTER -E acquired a reference.
+      // Load + hook + enable succeed, but the anchor never becomes live (its
+      // printed rules carry a stray permissive line), so settle times out
+      // AFTER -E acquired a reference. NOTE the settle failure is deliberately
+      // NOT "pf reports Disabled": that state now fails earlier and louder
+      // through the F-PFBOOT invariant assertion, which has its own test below.
       const runner = scriptedRunner([
         { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
         mainRulesCall(ok(MAIN_RULESET_HOOKED)),
         { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 777\n") },
-        // liveness: pf reports DISABLED -> never live -> settle times out
-        infoCall(ok("Status: Disabled\n")),
-        anchorRulesCall(ok(canonicalUnionPrint([A]))),
+        infoCall(ok(PF_INFO_ENABLED)),
+        anchorRulesCall(
+          ok(`${canonicalUnionPrint([A])}pass quick on lo0 inet proto tcp all user = 601\n`),
+        ),
         ifacesCall(ok(PF_IFACES_CLEAN)),
         // the release on failure:
         { match: (_c, a) => a[0] === "-X" && a[1] === "777", result: ok("") },
@@ -303,11 +307,18 @@ describe("egress-gate/pf-anchor union primitives", () => {
     });
 
     it("does NOT release a token it did not acquire (existing token belongs to a prior arm)", async () => {
+      // pf is OBSERVED enabled, so the supplied token names a live reference:
+      // the arm must neither re-enable nor release it. The settle failure comes
+      // from the anchor contents (a stray rule), not from pf being disabled --
+      // see the F-PFBOOT tests below for the disabled case, which is a DIFFERENT
+      // situation and must NOT be conflated with this one.
       const runner = scriptedRunner([
         { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
         mainRulesCall(ok(MAIN_RULESET_HOOKED)),
-        infoCall(ok("Status: Disabled\n")), // never live
-        anchorRulesCall(ok(canonicalUnionPrint([A]))),
+        infoCall(ok(PF_INFO_ENABLED)),
+        anchorRulesCall(
+          ok(`${canonicalUnionPrint([A])}pass quick on lo0 inet proto tcp all user = 601\n`),
+        ),
         ifacesCall(ok(PF_IFACES_CLEAN)),
       ]);
       await expect(
@@ -321,9 +332,149 @@ describe("egress-gate/pf-anchor union primitives", () => {
         }),
       ).rejects.toThrow(/settle-probe timed out/);
       // Never -X the existing token (a prior arm / other uid still depends on it),
-      // and never -E (already enabled).
+      // and never -E (pf is observed enabled, so the reference is live).
       expect(runner.calls.some((c) => c[1] === "-X")).toBe(false);
       expect(runner.calls.some((c) => c[1] === "-E")).toBe(false);
+    });
+
+    // ── F-PFBOOT (HIGH, wrong-allow) ───────────────────────────────────────
+    // 2026-07-26 Mini1 drill, N=5 unattended reboots, 0 passes. A `pfctl -E`
+    // reference is volatile kernel state; the registry file that persists its
+    // token is not. The arm path read the token as proof that pf was enabled,
+    // so after every reboot it skipped `pfctl -E`, pf stayed Disabled, the
+    // anchor's rules stayed loaded but inert, and the confined uid silently
+    // regained loopback reach (sshd / Screen Sharing / Ollama / PostgreSQL
+    // CONNECTED 3/3 each, versus blocked 3/3 armed on the same boot). The
+    // registry then went dirty and arm / --repair-egress-gate /
+    // --unprotect-egress-gate all deadlocked on the same missing `-E`.
+    //
+    // "persisted token + pf actually disabled" is the exact state a reboot
+    // produces, and no test covered it.
+    describe("armPfAnchorUnion pf-enable is observed, not inferred (F-PFBOOT)", () => {
+      /**
+       * `pfctl -s info` that reads DISABLED until `pfctl -E` runs, then
+       * ENABLED -- i.e. a real host on the boot after an arm, where the
+       * registry still carries the token from before the reboot.
+       */
+      function rebootedHostRunner(
+        entries: Array<{ agent_uid: number; gate_port: number }>,
+        freshToken: string,
+      ): PfCommandRunner & { calls: string[][] } {
+        let pfEnabled = false;
+        return scriptedRunner([
+          { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+          mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+          {
+            match: (_c, a) => a[0] === "-E",
+            get result(): PfCommandResult {
+              pfEnabled = true;
+              return ok(`pf enabled\nToken : ${freshToken}\n`);
+            },
+          } as ScriptedCall,
+          {
+            match: (_c, a) => a[0] === "-s" && a[1] === "info",
+            get result(): PfCommandResult {
+              return ok(pfEnabled ? PF_INFO_ENABLED : "Status: Disabled\n");
+            },
+          } as ScriptedCall,
+          anchorRulesCall(ok(canonicalUnionPrint(entries))),
+          ifacesCall(ok(PF_IFACES_CLEAN)),
+        ]);
+      }
+
+      it("re-enables pf when a persisted token is supplied but pf is actually DISABLED, and returns the FRESH token", async () => {
+        // The drill's real token, carried across five generations while dead.
+        const runner = rebootedHostRunner([A], "424242");
+        const res = await armPfAnchorUnion(runner, [A], {
+          mainConfPath: "/dev/null",
+          existingEnableToken: "11053539743168208596",
+          ...settleFast,
+        });
+        // pf was re-enabled exactly once...
+        expect(runner.calls.filter((c) => c[1] === "-E").length).toBe(1);
+        // ...and the caller gets the FRESH token to persist in place of the
+        // stale one, which is what stops the dead token surviving forever.
+        expect(res.enableToken).toBe("424242");
+        // The stale reference is never `-X`ed: it does not exist to release.
+        expect(runner.calls.some((c) => c[1] === "-X")).toBe(false);
+      });
+
+      it("re-enables when pf's status is UNREADABLE (cannot confirm enabled is not confirmation)", async () => {
+        let pfReadable = false;
+        const runner = scriptedRunner([
+          { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+          mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+          {
+            match: (_c, a) => a[0] === "-E",
+            get result(): PfCommandResult {
+              pfReadable = true;
+              return ok("pf enabled\nToken : 909\n");
+            },
+          } as ScriptedCall,
+          {
+            match: (_c, a) => a[0] === "-s" && a[1] === "info",
+            get result(): PfCommandResult {
+              // Unreadable before the enable; readable afterwards, so the
+              // settle probe can still confirm the anchor.
+              return pfReadable
+                ? ok(PF_INFO_ENABLED)
+                : { code: 1, stdout: "", stderr: "pfctl: /dev/pf: Device busy" };
+            },
+          } as ScriptedCall,
+          anchorRulesCall(ok(canonicalUnionPrint([A]))),
+          ifacesCall(ok(PF_IFACES_CLEAN)),
+        ]);
+        const res = await armPfAnchorUnion(runner, [A], {
+          mainConfPath: "/dev/null",
+          existingEnableToken: "11053539743168208596",
+          ...settleFast,
+        });
+        expect(runner.calls.filter((c) => c[1] === "-E").length).toBe(1);
+        expect(res.enableToken).toBe("909");
+      });
+
+      it("REFUSES to report armed when pfctl -E exits 0 but pf is still not enabled (fail direction: park, never wrong-allow)", async () => {
+        // The invariant is asserted rather than assumed: a 0-exit `-E` that
+        // did not actually enable pf must fail the arm immediately, not be
+        // discovered as a generic settle timeout (and never as reach the
+        // confined agent should not have).
+        const runner = scriptedRunner([
+          { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+          mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+          { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 31337\n") },
+          infoCall(ok("Status: Disabled\n")), // never becomes Enabled
+          anchorRulesCall(ok(canonicalUnionPrint([A]))),
+          ifacesCall(ok(PF_IFACES_CLEAN)),
+          { match: (_c, a) => a[0] === "-X", result: ok("") },
+        ]);
+        await expect(
+          armPfAnchorUnion(runner, [A], {
+            mainConfPath: "/dev/null",
+            existingEnableToken: "11053539743168208596",
+            ...settleFast,
+          }),
+        ).rejects.toThrow(/pf is still not enabled/);
+        // The reference THIS call acquired is released, so a failed arm never
+        // leaks an enable reference.
+        expect(runner.calls.some((c) => c[1] === "-X" && c[2] === "31337")).toBe(true);
+      });
+
+      it("still skips -E for an in-boot mutation (reference counting is preserved when pf is observed enabled)", async () => {
+        // The regression guard for the fix itself: re-enabling on EVERY
+        // mutation would leak references a single `-X` could never release.
+        const runner = scriptedRunner([
+          { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+          mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+          ...liveScript([A, B]),
+        ]);
+        const res = await armPfAnchorUnion(runner, [A, B], {
+          mainConfPath: "/dev/null",
+          existingEnableToken: "999",
+          ...settleFast,
+        });
+        expect(runner.calls.filter((c) => c[1] === "-E").length).toBe(0);
+        expect(res.enableToken).toBe("999");
+      });
     });
 
     it("fails closed when pfctl -E exits 0 but prints no numeric token (gate finding)", async () => {

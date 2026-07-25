@@ -261,6 +261,8 @@ export type ClaimSiteId =
   | "pf-anchor.arm"
   | "pf-anchor.arm-union"
   | "pf-anchor.disarm"
+  | "pf-anchor.observe-pf-enabled"
+  | "pf-anchor.enable-reference-already-gone"
   | "liveness-oracle.mint"
   | "liveness-oracle.verify"
   | "runtime-fs-plan.apply"
@@ -1198,6 +1200,40 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
         "pfctl exit codes only on both branches; the anchor is not re-listed either way.",
     },
   },
+  "pf-anchor.observe-pf-enabled": {
+    file: `${EG}/pf-anchor.ts`,
+    symbol: "observePfEnabled",
+    claim:
+      "pf's global enable state right now, as `pfctl -s info` reports it, or that it could not be read",
+    // The known-and-enabled branch is a claim about a READ, not about the world:
+    // it says only "pfctl answered and this is what it said". The world-claim
+    // it carries (`enabled`) is the literal parse of that answer, and the
+    // unreadable case is REPRESENTED rather than collapsed into false. This is
+    // the chokepoint added for F-PFBOOT, where the arm path had been reading a
+    // persisted `pfctl -E` token as if it were an observation of pf's state; a
+    // reboot zeroes the reference and leaves the token, so the record said
+    // enabled while the anchor enforced nothing.
+    basis: "observed",
+    layer: "compute",
+    branches: "single",
+  },
+  "pf-anchor.enable-reference-already-gone": {
+    file: `${EG}/pf-anchor.ts`,
+    symbol: "already-gone",
+    claim:
+      "the pf enable reference named by the persisted token does not exist, so teardown has nothing to release",
+    // Positive evidence on BOTH routes to this disposition: pfctl itself said
+    // the token is invalid, or pf is observed not enabled (in which case no
+    // reference can exist). Every other `-X` failure still throws.
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim:
+        "the `pfctl -X` failure is not explained by an absent reference; teardown REFUSES rather than clearing state over it",
+      basis: "observed",
+    },
+  },
   "pf-anchor.arm": {
     file: `${EG}/pf-anchor.ts`,
     symbol: "armPfAnchor",
@@ -1787,7 +1823,10 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${EG}/peer-resolver-client.ts`]: 0,
   [`${EG}/peer-resolver-daemon.ts`]: 4,
   [`${EG}/peer-resolver-protocol.ts`]: 3,
-  [`${EG}/pf-anchor.ts`]: 0,
+  // 2: the known-branch of `PfEnabledObservation` (its type
+  // declaration and the one `return` that produces it). F-PFBOOT's chokepoint
+  // -- see `pf-anchor.observe-pf-enabled` above for why that claim is observed.
+  [`${EG}/pf-anchor.ts`]: 2,
   [`${EG}/posture.ts`]: 1,
   [`${EG}/protection-claim.ts`]: 0,
   [`${EG}/release-barrier.ts`]: 15,

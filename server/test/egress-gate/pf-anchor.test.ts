@@ -596,9 +596,87 @@ describe("egress-gate/pf-anchor", () => {
         { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("rules cleared") },
         { match: (_c, a) => a[0] === "-X", result: ok("") },
       ]);
-      await disarmPfAnchor(runner, { enableToken: "4204204242" });
+      const res = await disarmPfAnchor(runner, { enableToken: "4204204242" });
       expect(runner.calls[0]).toEqual(["pfctl", "-a", PF_ANCHOR_NAME, "-F", "all"]);
       expect(runner.calls[1]).toEqual(["pfctl", "-X", "4204204242"]);
+      expect(res.enableReference).toBe("released");
+    });
+
+    it("reports none-supplied when there is no token to release", async () => {
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("") },
+      ]);
+      const res = await disarmPfAnchor(runner);
+      expect(res.enableReference).toBe("none-supplied");
+      expect(runner.calls.some((c) => c[1] === "-X")).toBe(false);
+    });
+
+    // ── F-PFBOOT teardown recovery (drill section 7.1) ─────────────────────
+    // The 2026-07-26 Mini1 drill could not clear a `committed` registry entry
+    // by ANY product path: `--unprotect-egress-gate` got past the settle probe
+    // and then died on `pfctl -X ... token invalid`, because the token it was
+    // releasing had been zeroed by a reboot. The entry was left inert on the
+    // host and the drill declared it as residue it could not clear. A teardown
+    // must be able to clear its own state when the kernel reference it
+    // recorded is already gone.
+    it("completes teardown when pfctl -X reports the token INVALID (the reference a reboot zeroed)", async () => {
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("rules cleared") },
+        {
+          match: (_c, a) => a[0] === "-X",
+          result: { code: 1, stdout: "", stderr: "pfctl: pf: token invalid" },
+        },
+      ]);
+      const res = await disarmPfAnchor(runner, { enableToken: "11053539743168208596" });
+      expect(res.enableReference).toBe("already-gone");
+      expect(res.staleReason).toMatch(/invalid/);
+      // The flush -- the part that actually removes enforcement rules -- ran.
+      expect(runner.calls[0]).toEqual(["pfctl", "-a", PF_ANCHOR_NAME, "-F", "all"]);
+    });
+
+    it("completes teardown when -X fails and pf is OBSERVED not enabled (no reference can exist)", async () => {
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("") },
+        { match: (_c, a) => a[0] === "-X", result: { code: 1, stdout: "", stderr: "pfctl: failed" } },
+        { match: (_c, a) => a[0] === "-s" && a[1] === "info", result: ok("Status: Disabled\n") },
+      ]);
+      const res = await disarmPfAnchor(runner, { enableToken: "11053539743168208596" });
+      expect(res.enableReference).toBe("already-gone");
+      expect(res.staleReason).toMatch(/pf is observed NOT enabled/);
+    });
+
+    it("STILL throws on an unexplained -X failure while pf is enabled (leniency is scoped to observed staleness)", async () => {
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("") },
+        {
+          match: (_c, a) => a[0] === "-X",
+          result: { code: 1, stdout: "", stderr: "pfctl: Operation not permitted" },
+        },
+        {
+          match: (_c, a) => a[0] === "-s" && a[1] === "info",
+          result: ok("Status: Enabled for 0 days 00:01:02\n"),
+        },
+      ]);
+      await expect(
+        disarmPfAnchor(runner, { enableToken: "4204204242" }),
+      ).rejects.toThrow(/pfctl -X exited 1/);
+    });
+
+    it("STILL throws when -X fails and pf's status is UNREADABLE (never clear state over a failure we cannot explain)", async () => {
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-F", result: ok("") },
+        {
+          match: (_c, a) => a[0] === "-X",
+          result: { code: 1, stdout: "", stderr: "pfctl: Operation not permitted" },
+        },
+        {
+          match: (_c, a) => a[0] === "-s" && a[1] === "info",
+          result: { code: 1, stdout: "", stderr: "pfctl: /dev/pf: Device busy" },
+        },
+      ]);
+      await expect(
+        disarmPfAnchor(runner, { enableToken: "4204204242" }),
+      ).rejects.toThrow(/pfctl -X exited 1/);
     });
 
     it("throws when the flush fails (a silent no-op disarm is worse)", async () => {

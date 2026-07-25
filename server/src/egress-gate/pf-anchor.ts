@@ -46,6 +46,17 @@
  * unparseable output is NOT live. The gate server refuses to proxy when
  * this check fails, and posture surfaces MUST report not-protected.
  *
+ * PF STATE IS OBSERVED, NEVER INFERRED FROM A RECORD (F-PFBOOT, 2026-07-26
+ * Mini1 drill). A `pfctl -E` reference token is volatile kernel state; the
+ * registry file that persists it is not. Reading a persisted token as proof
+ * that pf was enabled meant that after every reboot the arm path skipped
+ * `pfctl -E`, pf stayed disabled, this anchor's rules stayed loaded but inert,
+ * and the confined uid silently regained loopback reach -- a wrong-allow, not
+ * a fail-closed park. Every decision here that depends on pf's enable state
+ * now routes through {@link observePfEnabled}; a token is honoured only over
+ * an observed-enabled pf, and a teardown whose recorded reference the kernel
+ * no longer has completes instead of stranding the fortress.
+ *
  * All privileged commands run through an injected {@link PfCommandRunner}
  * so the logic is unit-testable without root or a real pf.
  */
@@ -356,6 +367,73 @@ export interface PfLivenessResult {
 }
 
 /**
+ * What `pfctl -s info` said about pf's global enable state, right now.
+ *
+ * A discriminated union on purpose: "we could not look" must be
+ * REPRESENTABLE. Collapsing an unreadable pf into `enabled: false` (or,
+ * worse, into `true`) is how a claim about the world gets made from
+ * something that is not an observation of it.
+ */
+export type PfEnabledObservation =
+  | { known: true; enabled: boolean }
+  | { known: false; reason: string };
+
+/** The one regex in this module that decides what "pf is enabled" looks like. */
+const PF_STATUS_ENABLED_RE = /^Status:\s+Enabled\b/m;
+
+/**
+ * THE pf-enabled predicate. Every decision in this module that depends on
+ * "is pf actually enabled right now" routes through here, so there is exactly
+ * one place that knows how to read it and exactly one thing to mutate in a
+ * test.
+ *
+ * WHY THIS IS A NAMED CHOKEPOINT (F-PFBOOT, 2026-07-26 Mini1 drill, N=5
+ * unattended reboots, 0 passes): a `pfctl -E` reference token is VOLATILE
+ * kernel state, but the registry that persists it is a durable file that
+ * outlives a reboot. The arm path used to read the persisted token as proof
+ * that pf was enabled. After every reboot it therefore skipped `pfctl -E`,
+ * pf stayed `Status: Disabled`, the anchor rules stayed loaded but enforced
+ * NOTHING, and the confined uid silently regained loopback reach to sshd,
+ * Screen Sharing, Ollama and PostgreSQL (measured CONNECTED 3/3 each, against
+ * blocked 3/3 in the armed control on the same boot). The record said
+ * "enabled"; the world said otherwise. Probe the predicate, never trust the
+ * record.
+ *
+ * NEVER THROWS: an unreadable pf is `{ known: false }`, and each caller
+ * decides its own fail direction from that explicitly.
+ */
+export async function observePfEnabled(
+  runner: PfCommandRunner,
+): Promise<PfEnabledObservation> {
+  let info: PfCommandResult;
+  try {
+    info = await runner.run("pfctl", ["-s", "info"]);
+  } catch (err) {
+    return {
+      known: false,
+      reason: `pfctl -s info failed to run: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (info.code !== 0) {
+    return { known: false, reason: `pfctl -s info exited ${info.code}` };
+  }
+  return { known: true, enabled: PF_STATUS_ENABLED_RE.test(info.stdout) };
+}
+
+/**
+ * The liveness checks' shared rendering of {@link observePfEnabled}: the
+ * not-live reason strings for an unreadable or disabled pf. Returns an empty
+ * array when pf is observed enabled.
+ */
+function pfEnabledLivenessReasons(observed: PfEnabledObservation): string[] {
+  if (!observed.known) return [observed.reason];
+  if (!observed.enabled) {
+    return ["pf is not enabled (pfctl -s info lacks 'Status: Enabled')"];
+  }
+  return [];
+}
+
+/**
  * Check, by positive evidence, that the per-uid anchor is loaded AND pf is
  * enabled AND the MAIN ruleset actually calls the anchor AND pf actually
  * evaluates lo0 packets through that call. Fail-closed: any error,
@@ -391,20 +469,7 @@ export async function checkPfAnchorLiveness(
   }
   const reasons: string[] = [];
 
-  let info: PfCommandResult;
-  try {
-    info = await runner.run("pfctl", ["-s", "info"]);
-  } catch (err) {
-    return {
-      live: false,
-      reasons: [`pfctl -s info failed to run: ${err instanceof Error ? err.message : String(err)}`],
-    };
-  }
-  if (info.code !== 0) {
-    reasons.push(`pfctl -s info exited ${info.code}`);
-  } else if (!/^Status:\s+Enabled\b/m.test(info.stdout)) {
-    reasons.push("pf is not enabled (pfctl -s info lacks 'Status: Enabled')");
-  }
+  reasons.push(...pfEnabledLivenessReasons(await observePfEnabled(runner)));
 
   let rules: PfCommandResult;
   try {
@@ -574,20 +639,7 @@ export async function checkPfAnchorUnionLiveness(
   }
   const reasons: string[] = [];
 
-  let info: PfCommandResult;
-  try {
-    info = await runner.run("pfctl", ["-s", "info"]);
-  } catch (err) {
-    return {
-      live: false,
-      reasons: [`pfctl -s info failed to run: ${err instanceof Error ? err.message : String(err)}`],
-    };
-  }
-  if (info.code !== 0) {
-    reasons.push(`pfctl -s info exited ${info.code}`);
-  } else if (!/^Status:\s+Enabled\b/m.test(info.stdout)) {
-    reasons.push("pf is not enabled (pfctl -s info lacks 'Status: Enabled')");
-  }
+  reasons.push(...pfEnabledLivenessReasons(await observePfEnabled(runner)));
 
   let rules: PfCommandResult;
   try {
@@ -785,12 +837,20 @@ export interface ArmPfAnchorUnionOptions extends ArmPfAnchorOptions {
   /**
    * The `pfctl -E` reference token this fortress already holds, when pf was
    * enabled by a PRIOR arm of this anchor (the registry threads its committed
-   * token here). When present, {@link armPfAnchorUnion} does NOT call
-   * `pfctl -E` again -- each `-E` bumps pf's enable reference count and returns
-   * a NEW token, so re-enabling on every mutation would leak references that a
-   * single `-X` at teardown could never fully release, leaving pf stuck
-   * enabled. When absent, this is the first arm: `pfctl -E` runs and the new
-   * token is returned for the caller to persist and release at final disarm.
+   * token here). When present AND pf is OBSERVED enabled,
+   * {@link armPfAnchorUnion} does NOT call `pfctl -E` again -- each `-E` bumps
+   * pf's enable reference count and returns a NEW token, so re-enabling on
+   * every mutation would leak references that a single `-X` at teardown could
+   * never fully release, leaving pf stuck enabled.
+   *
+   * THE TOKEN IS A RECORD, NOT A GUARANTEE (F-PFBOOT). A `-E` reference lives
+   * in the kernel and a reboot zeroes it, while the registry file carrying
+   * this token survives. So a supplied token is honoured only when
+   * {@link observePfEnabled} confirms pf is actually enabled; when pf is
+   * disabled the token names a reference that no longer exists, `pfctl -E`
+   * runs, and the FRESH token comes back in
+   * {@link ArmPfAnchorResult.enableToken} for the caller to persist in place
+   * of the stale one. When absent, this is the first arm.
    */
   existingEnableToken?: string;
 }
@@ -806,8 +866,11 @@ export interface ArmPfAnchorUnionOptions extends ArmPfAnchorOptions {
  * and un-preempted.
  *
  * Two deliberate differences from {@link armPfAnchor}:
- *   - It NEVER re-enables pf when `existingEnableToken` is supplied (reference
- *     counting -- see {@link ArmPfAnchorUnionOptions.existingEnableToken}).
+ *   - It does not re-enable pf when `existingEnableToken` is supplied AND pf
+ *     is OBSERVED enabled (reference counting -- see
+ *     {@link ArmPfAnchorUnionOptions.existingEnableToken}). A supplied token
+ *     over a DISABLED pf is a stale record of a reference a reboot zeroed, and
+ *     re-acquires (F-PFBOOT).
  *   - ON FAILURE IT DOES NOT FLUSH THE ANCHOR (Codex B2). A flush would drop
  *     every other confined uid's rules; the anchor is a shared multi-uid
  *     surface now. The caller (the registry) owns rollback: it re-asserts the
@@ -848,8 +911,47 @@ export async function armPfAnchorUnion(
 
     await installAnchorHookIfAbsent(runner, anchorName, rulesFile, mainConfPath, dir);
 
-    // Enable pf ONLY if we do not already hold a reference token (first arm).
-    if (options.existingEnableToken === undefined) {
+    // Enable pf unless we hold a reference AND pf is OBSERVED enabled.
+    //
+    // F-PFBOOT (HIGH, wrong-allow; 2026-07-26 Mini1 drill, N=5 unattended
+    // reboots, 0 passes): this used to skip `pfctl -E` on the record alone --
+    // `if (options.existingEnableToken === undefined)`. A `-E` reference is
+    // volatile kernel state that a reboot zeroes; the registry file that
+    // carries the token is not. Every boot after the first therefore found a
+    // persisted token, concluded a reference was held, never re-enabled pf,
+    // and left the anchor's rules loaded but inert -- the confined uid
+    // silently regained loopback reach (sshd / Screen Sharing / Ollama /
+    // PostgreSQL CONNECTED 3/3 each, against blocked 3/3 armed on the same
+    // boot). Then the settle probe below timed out on `Status: Enabled`, the
+    // rollback failed for the same reason, the registry went dirty, the oracle
+    // withheld the freshness token, and arm/repair/unprotect all deadlocked on
+    // the same missing `-E` with no product path out.
+    //
+    // So the decision is now a function of an OBSERVATION, not of the record:
+    //   - token held AND pf observed enabled  -> reuse (reference counting is
+    //     preserved for every in-boot mutation, the case the token exists for);
+    //   - token held AND pf observed DISABLED -> the reference the token names
+    //     is gone (this is the normal post-reboot case, not an error case);
+    //     re-acquire and return the fresh token so the caller replaces the
+    //     stale one;
+    //   - pf UNREADABLE -> treated as "not enabled" and re-acquired. That can
+    //     at worst bump pf's enable refcount by one (pf sticks enabled after
+    //     teardown -- over-enforcing); assuming the record instead risks pf
+    //     staying disabled while we report armed, which is the wrong-allow
+    //     this finding is about. If pfctl is genuinely broken the `-E` below
+    //     fails too and the arm throws, which parks the agent.
+    //
+    // NOT observable: whether the token still names a LIVE reference when pf
+    // is enabled. pf offers no non-destructive way to test one (`-X` releases
+    // it). A third party re-enabling pf after a reboot therefore leaves a
+    // token we keep but cannot release; `disarmPfAnchor` handles that at
+    // release time rather than pretending to know here.
+    const pfBeforeEnable = await observePfEnabled(runner);
+    const holdsLiveEnableReference =
+      options.existingEnableToken !== undefined &&
+      pfBeforeEnable.known &&
+      pfBeforeEnable.enabled;
+    if (!holdsLiveEnableReference) {
       const enable = await runner.run("pfctl", ["-E"]);
       if (enable.code !== 0) {
         throw new Error(`pfctl -E exited ${enable.code}: ${enable.stderr.trim()}`);
@@ -866,6 +968,23 @@ export async function armPfAnchorUnion(
       }
       enableToken = tokenMatch[1];
       acquiredToken = tokenMatch[1];
+
+      // ASSERT the invariant instead of assuming the verb achieved it. A
+      // 0-exit `-E` that left pf disabled would otherwise be discovered only
+      // as a 5-second settle timeout with a generic message, and (before this
+      // fix) as a wrong-allow in the field. Only DEFINITE negative evidence
+      // throws here: an unreadable pf is left to the settle probe, which is
+      // fail-closed anyway, so a transient pfctl read failure cannot turn into
+      // an availability cliff.
+      const pfAfterEnable = await observePfEnabled(runner);
+      if (pfAfterEnable.known && !pfAfterEnable.enabled) {
+        throw new Error(
+          `pfctl -E exited 0 and returned token ${tokenMatch[1]}, but pf is still not ` +
+            "enabled (pfctl -s info lacks 'Status: Enabled'); refusing to report an armed " +
+            "anchor that enforces nothing. The agent stays parked rather than regaining " +
+            "unfiltered loopback reach",
+        );
+      }
     }
 
     // Settle-probe on the EXACT union: require N consecutive live results.
@@ -1035,10 +1154,56 @@ export interface DisarmPfAnchorOptions {
 }
 
 /**
+ * pfctl's own words for "that reference does not exist". A `pfctl -X` against
+ * a token the kernel has never heard of (the shape a reboot leaves behind)
+ * exits 1 with `pfctl: pf: token invalid` on stderr.
+ */
+const PF_TOKEN_INVALID_RE = /token\s+invalid/i;
+
+/** What {@link disarmPfAnchor} did with the enable reference it was handed. */
+export type PfEnableReferenceDisposition =
+  /** No token was supplied; there was nothing to release. */
+  | "none-supplied"
+  /** `pfctl -X` succeeded: the reference this fortress held is released. */
+  | "released"
+  /**
+   * The token was supplied but the kernel has no such reference (a reboot
+   * zeroed pf's reference table, or pf is not enabled at all). Nothing to
+   * release and nothing leaked; teardown proceeds.
+   */
+  | "already-gone";
+
+/** Result of {@link disarmPfAnchor}. */
+export interface DisarmPfAnchorResult {
+  enableReference: PfEnableReferenceDisposition;
+  /** Present only for `already-gone`: the evidence that led to that call. */
+  staleReason?: string;
+}
+
+/**
  * Disarm symmetry: flush every rule out of the Sanctuary anchor, then
  * release the pf enable reference taken at arm time (when a token was
  * captured). Throws on failure: a disarm that silently did nothing would
  * leave state the operator believes is gone.
+ *
+ * ONE DELIBERATE EXCEPTION, and it is a recovery path, not a leniency
+ * (F-PFBOOT, drill section 7.1): a `pfctl -X` that fails because the token
+ * names a reference the kernel does not have is NOT a teardown failure. It is
+ * the truth about a token a reboot invalidated. Before this, the persisted
+ * stale token made `--unprotect-egress-gate` throw
+ * (`pfctl: pf: token invalid`), which left a `committed` registry entry the
+ * product could not clear by any path -- the operator's only escape hatch was
+ * dead, and the drill had to leave the residue on the host. So a `-X` failure
+ * is now checked against an OBSERVATION before it is believed:
+ *   - pfctl says the token is invalid, or pf is observed NOT enabled: the
+ *     reference is definitionally gone. Report `already-gone` and let teardown
+ *     complete -- there is no reference left to leak, and the flush above
+ *     (the part that actually removes enforcement rules) already succeeded.
+ *   - anything else (pfctl missing, permission denied, an unreadable pf while
+ *     `-X` failed for some other reason): still THROWS. We do not clear state
+ *     over a failure we cannot explain.
+ * Note the fail direction: an unreleased reference leaves pf ENABLED, which
+ * over-enforces. It can never leave an agent with reach it should not have.
  *
  * The MAIN-RULESET call rule installed at arm time is deliberately left in
  * place: with the sub-anchor flushed empty it evaluates nothing (inert),
@@ -1049,19 +1214,40 @@ export interface DisarmPfAnchorOptions {
 export async function disarmPfAnchor(
   runner: PfCommandRunner,
   options: DisarmPfAnchorOptions = {},
-): Promise<void> {
+): Promise<DisarmPfAnchorResult> {
   const anchorName = options.anchorName ?? PF_ANCHOR_NAME;
   const flush = await runner.run("pfctl", ["-a", anchorName, "-F", "all"]);
   if (flush.code !== 0) {
     throw new Error(`pfctl -a ${anchorName} -F all exited ${flush.code}: ${flush.stderr.trim()}`);
   }
-  if (options.enableToken !== undefined) {
-    if (!/^\d+$/.test(options.enableToken)) {
-      throw new Error("disarmPfAnchor: enableToken must be a numeric pfctl reference token");
-    }
-    const release = await runner.run("pfctl", ["-X", options.enableToken]);
-    if (release.code !== 0) {
-      throw new Error(`pfctl -X exited ${release.code}: ${release.stderr.trim()}`);
-    }
+  if (options.enableToken === undefined) {
+    return { enableReference: "none-supplied" };
   }
+  if (!/^\d+$/.test(options.enableToken)) {
+    throw new Error("disarmPfAnchor: enableToken must be a numeric pfctl reference token");
+  }
+  const release = await runner.run("pfctl", ["-X", options.enableToken]);
+  if (release.code === 0) {
+    return { enableReference: "released" };
+  }
+  const stderr = release.stderr.trim();
+  if (PF_TOKEN_INVALID_RE.test(`${stderr}\n${release.stdout}`)) {
+    return {
+      enableReference: "already-gone",
+      staleReason:
+        `pfctl -X reported the enable token ${options.enableToken} invalid; the kernel holds no ` +
+        "such reference (a reboot zeroes pf's reference table while the registry file survives), " +
+        "so there is nothing to release and teardown continues",
+    };
+  }
+  const pf = await observePfEnabled(runner);
+  if (pf.known && !pf.enabled) {
+    return {
+      enableReference: "already-gone",
+      staleReason:
+        `pfctl -X exited ${release.code} (${stderr}) and pf is observed NOT enabled, so the ` +
+        `reference named by token ${options.enableToken} cannot exist; teardown continues`,
+    };
+  }
+  throw new Error(`pfctl -X exited ${release.code}: ${stderr}`);
 }

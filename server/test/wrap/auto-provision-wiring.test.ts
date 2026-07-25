@@ -219,10 +219,18 @@ describe("runWrap: maybeRunAutoProvisionForWrap gating", () => {
     expect(stderr).toContain("Dedicated agent account provisioned and Castle Wall armed (uid 503)");
     expect(stderr).not.toContain("Castle Wall NOT ARMED");
     expect(stderr).not.toContain("Castle Wall coarse-only");
-    expect(stderr).toContain(
-      "Your agent is wrapped, but enforcement is not confirmed.",
-    );
+    // Still NOT green, and still "unknown": the arm outcome is not an
+    // observation of enforcement and never becomes one.
     expect(stderr).toContain("Castle Wall status unknown");
+    expect(stderr).not.toContain("Your agent is protected.");
+    // F-ARMSUMMARY: but the closing line no longer flatly contradicts the
+    // success line the SAME run printed three lines earlier. The 2026-07-26
+    // Mini1 drill caught this run printing "Castle Wall armed ... gate is
+    // LIVE" and then "Castle Wall status unknown (not confirmed armed)".
+    expect(stderr).toContain(
+      "This run's arm step reported success, but enforcement has not been observed yet",
+    );
+    expect(stderr).not.toContain("(not confirmed armed)");
   });
 
   it("prefers --dev-dist as the auto-provision CLI binary for dogfood installs", async () => {
