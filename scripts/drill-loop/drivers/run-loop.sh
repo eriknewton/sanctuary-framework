@@ -29,12 +29,18 @@
 # Usage:
 #   run-loop.sh --mode sweep|soak|reboot --iterations N \
 #     --operator-account <a> --agent-account <a> --agent-uid <n> \
-#     [--evidence-root <dir>] [--passphrase-file <f>] [--build-sha <sha>] \
+#     [--evidence-root <dir>] [--build-sha <sha>] \
 #     [--stop-at-first-divergence]
 #
 # --stop-at-first-divergence is an INTERACTIVE debugging flag. It is never used
 # by the scheduled run; a nightly loop that stops at the first bug wastes the
 # night.
+#
+# There is no `--passphrase-file`. It was rail-checked here and passed to
+# nothing (the TTY confirmation is answered by expect/arm-expect.exp), and the
+# wrapper's matching flag was validated root-run surface with no consumer. Both
+# are gone rather than better documented; that is round 2's `--endpoint` finding
+# under a new name.
 
 set -euo pipefail
 
@@ -51,6 +57,19 @@ die() {
   exit 2
 }
 
+# ROUND-3 BLOCKER 1. See the long note in run-probe-battery.sh. Both privileged
+# wrapper invocations in this file went through a PATH-resolved `sudo`.
+PATH="$RAILS_SYSTEM_PATH"
+export PATH
+SUDO="$(rails_require_cmd sudo)" || die 'sudo is not in a root-owned system directory; refusing to drive a drill night through an unresolvable tool'
+GIT="$(rails_require_cmd git)" || die 'git is not in a root-owned system directory'
+GREP="$(rails_require_cmd grep)" || die 'grep is not in a root-owned system directory'
+SED="$(rails_require_cmd sed)" || die 'sed is not in a root-owned system directory'
+DATE="$(rails_require_cmd date)" || die 'date is not in a root-owned system directory'
+MKDIR="$(rails_require_cmd mkdir)" || die 'mkdir is not in a root-owned system directory'
+MKTEMP="$(rails_require_cmd mktemp)" || die 'mktemp is not in a root-owned system directory'
+RM="$(rails_require_cmd rm)" || die 'rm is not in a root-owned system directory'
+
 # A safety-rail trip is stop-the-night, and it is loud.
 rail_stop() {
   printf 'LOOP=STOP reason=safety-rail detail=%s\n' "$*"
@@ -64,7 +83,6 @@ OPERATOR=''
 AGENT=''
 AGENT_UID_IN=''
 EVIDENCE_ROOT=''
-PASSFILE=''
 BUILD_SHA=''
 STOP_FIRST=''
 OPERATOR_HOME="${HOME:-}"
@@ -77,7 +95,6 @@ while [ "$#" -gt 0 ]; do
     --agent-account)            AGENT="${2:-}"; shift 2 ;;
     --agent-uid)                AGENT_UID_IN="${2:-}"; shift 2 ;;
     --evidence-root)            EVIDENCE_ROOT="${2:-}"; shift 2 ;;
-    --passphrase-file)          PASSFILE="${2:-}"; shift 2 ;;
     --build-sha)                BUILD_SHA="${2:-}"; shift 2 ;;
     --home)                     OPERATOR_HOME="${2:-}"; shift 2 ;;
     --stop-at-first-divergence) STOP_FIRST='yes'; shift ;;
@@ -123,32 +140,45 @@ AGENT_UID="$(rails_assert_account_uid agent "$AGENT" "$AGENT_UID_IN")" \
   || rail_stop "agent account rejected: $AGENT"
 [ -n "$AGENT_UID" ] || rail_stop 'empty agent uid after rail'
 
-if [ -n "$PASSFILE" ]; then
-  ( rails_assert_secret_file_perms "$PASSFILE" "$OPERATOR" ) \
-    || rail_stop "passphrase-file rail rejected: $PASSFILE"
-fi
+# The AGENT PRINCIPAL, against the compiled-in allowlist. The root wrapper runs
+# this rail too and its verdict is the one that matters; running it here as well
+# means the loop stops at its own layer with a legible reason instead of every
+# verb refusing one at a time.
+( rails_assert_agent_account_allowed "$AGENT" ) \
+  || rail_stop "agent account is not on the compiled-in drill agent allowlist: $AGENT"
 
 # WRAPPER INTEGRITY. Re-assemble from the repo, then require the repo, the
 # committed hash and the INSTALLED file to agree. This is what catches both
 # "you edited the repo and forgot to reinstall" and "someone edited the
 # installed wrapper", and it runs before the loop can invoke it even once.
-ASSEMBLED="$(mktemp "${TMPDIR:-/tmp}/sanctuary-drill-wrapper-check.XXXXXX")"
-cleanup_assembled() { rm -f "$ASSEMBLED"; }
+ASSEMBLED="$("$MKTEMP" "${TMPDIR:-/tmp}/sanctuary-drill-wrapper-check.XXXXXX")"
+cleanup_assembled() { "$RM" -f "$ASSEMBLED"; }
 trap cleanup_assembled EXIT
 "$ROOT/build-wrapper.sh" --stdout > "$ASSEMBLED" \
   || rail_stop 'could not re-assemble the wrapper from the repo'
 ( rails_assert_wrapper_integrity "$ASSEMBLED" "$INSTALLED_WRAPPER" "$ROOT/wrapper.sha256" ) \
   || rail_stop 'wrapper integrity rail refused'
 
+# THE GRANT TARGET'S DIRECTORY, not just the file. `rails_assert_wrapper_*`
+# checks the wrapper's own ownership and mode and never the chain above it
+# (round-3 M3). On an Intel Mac, Homebrew owns `/usr/local`, so an
+# operator-writable `/usr/local/sbin` would let the operator replace the exact
+# path the NOPASSWD grant names.
+( rails_assert_trusted_dir_chain 'grant target dir' "${INSTALLED_WRAPPER%/*}" >/dev/null ) \
+  || rail_stop "the directory holding the NOPASSWD grant target is not a trusted root-owned chain: ${INSTALLED_WRAPPER%/*}"
+
 if [ -z "$BUILD_SHA" ]; then
-  BUILD_SHA="$(git -C "$REPO" rev-parse HEAD 2>/dev/null || printf '')"
+  BUILD_SHA="$("$GIT" -C "$REPO" rev-parse HEAD 2>/dev/null || printf '')"
 fi
 
-STAMP="$(date +%Y%m%dT%H%M%S)"
+# LOWERCASE `t`, not `T`. The run id is `<stamp>-<iteration>` and run ids are
+# lowercase-only now, because the drill hosts' APFS volume is case-insensitive
+# and `...T...` / `...t...` were two accepted ids naming ONE directory entry.
+STAMP="$("$DATE" +%Y%m%dt%H%M%S)"
 if [ -z "$EVIDENCE_ROOT" ]; then
   EVIDENCE_ROOT="$OPERATOR_HOME/sanctuary-drill-loop-evidence/$STAMP"
 fi
-mkdir -p "$EVIDENCE_ROOT"
+"$MKDIR" -p "$EVIDENCE_ROOT"
 FINDINGS="$EVIDENCE_ROOT/FINDINGS.jsonl"
 : > "$FINDINGS"
 
@@ -170,7 +200,7 @@ printf 'LOOP=START mode=%s iterations=%s build_sha=%s evidence=%s\n' \
 
 json_escape() {
   # Minimal JSON string escaping for the fields we actually emit.
-  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
+  printf '%s' "$1" | "$SED" -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/	/\\t/g'
 }
 
 # The battery's own account of what it ran, verbatim, so this loop can never
@@ -179,8 +209,18 @@ json_escape() {
 # probes and implemented six.
 probe_summary() {
   local line
-  line="$(rails__sys grep -m1 '^PROBE=SUMMARY' "$1" 2>/dev/null || printf '')"
+  line="$("$GREP" -m1 '^PROBE=SUMMARY' "$1" 2>/dev/null || printf '')"
   if [ -n "$line" ]; then printf '%s' "$line"; else printf 'the probe battery produced no SUMMARY line'; fi
+}
+
+# THE RESULT OF A PROBE RUN. The fold itself lives in lib/rails.sh as
+# `rails_probe_result`, a pure function driven exhaustively by both batteries;
+# see the long note there for why a skipped probe can never become a PASS.
+probe_result() {
+  local out
+  out="$(rails_probe_result "$1" "$2")" || rail_stop "probe-result rail rejected: rc=$1"
+  if [ -z "$out" ]; then rail_stop 'empty result after the probe-result rail'; fi
+  printf '%s' "$out"
 }
 
 emit_finding() {
@@ -188,7 +228,7 @@ emit_finding() {
   printf '{"iteration":%s,"step":"%s","result":"%s","tainted_by":"%s","detail":"%s","artifacts":"%s","build_sha":"%s","ts":"%s"}\n' \
     "$1" "$(json_escape "$2")" "$(json_escape "$3")" "$(json_escape "$4")" \
     "$(json_escape "$5")" "$(json_escape "$6")" "$(json_escape "${BUILD_SHA:-unknown}")" \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$FINDINGS"
+    "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$FINDINGS"
 }
 
 ITER=1
@@ -197,7 +237,7 @@ TOTAL_FAILURES=0
 
 while [ "$ITER" -le "$ITERATIONS" ]; do
   IEV="$EVIDENCE_ROOT/iteration-$ITER"
-  mkdir -p "$IEV"
+  "$MKDIR" -p "$IEV"
   printf 'LOOP=ITERATION n=%s evidence=%s\n' "$ITER" "$IEV"
 
   # A fresh disposable fortress per iteration. The loop supplies a RUN ID,
@@ -218,8 +258,18 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   # `kickstart-daemons` verb since the first build and NO driver called it, so
   # the spec's "daemon freshly kickstarted on the current dist" was not wired
   # up anywhere. It is now, and preflight independently checks the result.
-  if sudo -n "$INSTALLED_WRAPPER" kickstart-daemons \
-       --run-id "$RUN_ID" --operator-account "$OPERATOR" > "$IEV/kickstart.log" 2>&1
+  #
+  # ROUND-3 H3: the labels this verb restarted were
+  # `com.sanctuary.egress-gate{,-peer-resolver}` and the product's are
+  # `ai.sanctuaryprotocol.egress-gate{,-peer-resolver}.<agent uid>`. Wrong
+  # prefix AND no uid suffix, and this call site passed no `--agent-uid` at all,
+  # so the labels could not have been fixed from here even with the right
+  # prefix. A failed kickstart is (correctly) fatal to the iteration, so the
+  # loop as shipped could not complete a single iteration on any host.
+  if "$SUDO" -n "$INSTALLED_WRAPPER" kickstart-daemons \
+       --run-id "$RUN_ID" --operator-account "$OPERATOR" \
+       --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
+       > "$IEV/kickstart.log" 2>&1
   then
     emit_finding "$ITER" kickstart PASS '' 'gate and resolver daemons restarted on the current dist' "$IEV/kickstart.log"
   else
@@ -232,7 +282,7 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   fi
 
   # --- step 0b: mint the disposable fortress, as root, root-owned ---------
-  if ! sudo -n "$INSTALLED_WRAPPER" mint \
+  if ! "$SUDO" -n "$INSTALLED_WRAPPER" mint \
        --run-id "$RUN_ID" --operator-account "$OPERATOR" > "$IEV/mint.log" 2>&1
   then
     emit_finding "$ITER" mint FAIL "$TAINT" 'the wrapper could not mint the disposable fortress' "$IEV/mint.log"
@@ -253,7 +303,7 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
 
   # --- step 1: preflight ---------------------------------------------------
   if "$HERE/preflight.sh" --run-id "$RUN_ID" --operator-account "$OPERATOR" \
-       --build-sha "$BUILD_SHA" --agent-uid "$AGENT_UID" \
+       --build-sha "$BUILD_SHA" --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
        > "$IEV/preflight.log" 2>&1
   then
     emit_finding "$ITER" preflight PASS '' 'all preflight checks passed' "$IEV/preflight.log"
@@ -286,13 +336,14 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   # Precondition: the gate is armed. Probing THROUGH a gate that never armed
   # produces cascade artifacts, not findings, so it is skipped and labeled.
   if [ -n "$ARMED" ]; then
-    if "$HERE/run-probe-battery.sh" --run-id "$RUN_ID" \
-         --operator-account "$OPERATOR" --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
-         --evidence-dir "$IEV" > "$IEV/probes.log" 2>&1
-    then
-      emit_finding "$ITER" probes PASS "$TAINT" "$(probe_summary "$IEV/probes.log")" "$IEV/probes.log"
-    else
-      emit_finding "$ITER" probes FAIL "$TAINT" "$(probe_summary "$IEV/probes.log")" "$IEV/probes.log"
+    PROBE_RC=0
+    "$HERE/run-probe-battery.sh" --run-id "$RUN_ID" \
+      --operator-account "$OPERATOR" --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
+      --evidence-dir "$IEV" > "$IEV/probes.log" 2>&1 || PROBE_RC=$?
+    PROBE_SUMMARY="$(probe_summary "$IEV/probes.log")"
+    PROBE_RESULT="$(probe_result "$PROBE_RC" "$PROBE_SUMMARY")"
+    emit_finding "$ITER" probes "$PROBE_RESULT" "$TAINT" "$PROBE_SUMMARY" "$IEV/probes.log"
+    if [ "$PROBE_RESULT" != 'PASS' ]; then
       TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
       if [ -z "$TAINT" ]; then TAINT='probes'; fi
     fi

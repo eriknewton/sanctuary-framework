@@ -121,6 +121,12 @@ but can be talked into touching a real fortress is worth negative value.
 | `--operator-account root`, by name and by uid | `rails_assert_non_root_account` |
 | Acting for an account other than the sudo caller | `rails_assert_caller_binding` |
 | A group- or world-accessible passphrase file | `rails_assert_secret_file_perms`, masked against 022 and 077 |
+| An agent account outside the compiled-in agent allowlist | `rails_assert_agent_account_allowed`; `--agent-account` is a SELECTION from a compiled-in list, not a value |
+| An UPPERCASE run id, which aliases a lowercase one on case-insensitive APFS | `rails_assert_run_id`, lowercase-only, rejected rather than folded |
+| A hardware lookup that HANGS | `rails__sys_timeout`; a timeout is a REJECT like every other unusable lookup |
+| A driver observation made through a PATH-resolved tool | `rails_require_cmd` in every driver; a structural test forbids a bare command name in driver code |
+| A check that could not OBSERVE, reported as clean | tri-state verdicts: `VERIFY=UNOBSERVED` / `PREFLIGHT=FAIL` are distinct from DIRTY and both stop the night |
+| A skipped probe, summarized as a pass | `rails_probe_result`: exit status AND the battery's own `verified=yes` must agree |
 | Interleaving a scheduled run with an interactive drill | `rails_lock_acquire`, atomic single-winner reclaim |
 | Running a wrapper that does not match its reviewed hash | `rails_assert_wrapper_integrity` |
 
@@ -154,7 +160,7 @@ scripts/drill-loop/
     run-loop.sh                 the loop: sweep N | soak N | reboot K
     preflight.sh                every historical defect layer as a permanent check
     run-probe-battery.sh        the pre-declared probe ladder
-    teardown-verify.sh          teardown plus OBSERVED-state verification
+    teardown-verify.sh          teardown, OBSERVED-state verification, retirement
   expect/arm-expect.exp         answers the arm confirmation over a pty
 ```
 
@@ -229,6 +235,11 @@ scripts/drill-loop/drivers/run-loop.sh \
   --agent-account sanctuary-agent --agent-uid 503
 ```
 
+`--agent-account` must be on `RAILS_AGENT_ACCOUNT_ALLOW`, which ships empty. It
+is a SELECTION from a compiled-in list, not a value the caller supplies: it
+decides which principal a root-run `protect --exclusive-egress` acts against, so
+it gets the same treatment the storage path, the CLI path and the host got.
+
 Modes: `sweep N` (the default, maximum forward progress), `soak N` (green-path
 focus, for flake-rate and determinism counts), `reboot K` (reboot survival).
 `--stop-at-first-divergence` exists for interactive debugging and is never
@@ -279,7 +290,8 @@ Not done by this repository, and deliberately so.
 #    Read-only. Installs nothing, changes nothing, contacts nothing.
 scripts/drill-loop/host-fingerprint.sh
 #    ...paste the fingerprint into RAILS_HOST_ALLOW_FP in lib/rails.sh, name
-#    the machine in a comment, then:
+#    the machine in a comment, put the drill agent account in
+#    RAILS_AGENT_ACCOUNT_ALLOW in the same diff, then:
 scripts/drill-loop/build-wrapper.sh --write-hash
 #    ...and get that diff re-reviewed. It is the entire host allowlist.
 
@@ -300,18 +312,27 @@ denylist), and it verifies the installed hash after writing.
 Stated here rather than discovered at 3am:
 
 - **The as-agent probes still need a second sudo grant.** The NOPASSWD grant
-  covers only `/usr/local/sbin/sanctuary-drill-wrapper`. The pf-anchor read no
-  longer needs anything extra (it goes through the wrapper's `pf-anchor-rules`
-  verb), but the probe battery and the teardown check still run
-  `sudo -n -u <agent> curl`, which the grant does not cover. Two things are now
-  true that were not before: the probe battery asks ONCE up front and reports
-  every probe as SKIP with the reason rather than measuring nothing and calling
-  it green, and `teardown-verify.sh` reports "could not RUN the as-agent probe"
-  as DIRTY rather than as clean. **Widening the sudoers line to
+  covers only `/usr/local/sbin/sanctuary-drill-wrapper`. The pf-anchor read, the
+  registry read, the in-fortress marker/lock read and the gate-log read all go
+  through wrapper verbs now and need nothing extra, but the probe battery and
+  the teardown check still run `sudo -n -u <agent> curl`, which the grant does
+  not cover. When it is missing the probe battery asks ONCE up front, reports
+  every probe as SKIP with the reason, and exits NONZERO with `verified=no`, so
+  the loop records the step as UNVERIFIED and never as a pass; and
+  `teardown-verify.sh` reports "could not RUN the as-agent probe" as UNOBSERVED,
+  which stops the night. **Widening the sudoers line to
   `NOPASSWD: /usr/bin/curl` or `(ALL) NOPASSWD: ALL` is not an acceptable
   resolution** and `sudoers.d/sanctuary-drill` records why; the supported
   answers are a grant for exactly `sudo -u <agent-account> /usr/bin/curl`, or a
   wrapper verb.
+- **No drill AGENT ACCOUNT is on the allowlist yet, so every verb that takes an
+  agent principal refuses.** `RAILS_AGENT_ACCOUNT_ALLOW` ships empty for the
+  same reason `RAILS_HOST_ALLOW_FP` does. `--agent-account` was the one
+  caller-supplied input that steers what root does to whom: it was checked for
+  shape and non-rootness and then handed to a root-run
+  `protect --exclusive-egress`, so the grant holder could point that at any
+  non-root local account. Provision it in the same reviewed diff as the host
+  fingerprint.
 - **None of the drivers has ever run against a live gate.** `run-loop.sh`,
   `preflight.sh`, `run-probe-battery.sh` and `arm-expect.exp` carry zero
   runtime evidence against a real Sanctuary gate. `teardown-verify.sh` is the
@@ -328,14 +349,18 @@ Stated here rather than discovered at 3am:
   arm over a live confined agent is refused and the gate survives) WAS a real
   gap and is now implemented. The loop's finding string is the battery's own
   `PROBE=SUMMARY` line, naming what ran and what was skipped.
-- **The drivers cannot READ inside the fortress once the product tightens it,
-  and they now say so instead of reporting clean.** `tightenStoragePermissions`
-  chmods the fortress to 0700 on every server start and the fortress is
-  root-owned, so `preflight.sh`'s stale-marker and zero-byte-lock checks and
-  `teardown-verify.sh`'s marker and lock checks cannot be made by an
-  unprivileged driver after the first arm. All four read absence as good, so
-  reporting them PASS would be a false green. They fail loudly instead. The
-  real fix is a wrapper verb that reads those paths as root; it is not built.
+- **CLOSED (round 3): the drivers now READ inside the fortress, as root.**
+  `tightenStoragePermissions` chmods the fortress to 0700 on every server start
+  and the fortress is root-owned, so `preflight.sh`'s stale-marker and
+  zero-byte-lock checks and `teardown-verify.sh`'s marker and lock checks could
+  not be made by an unprivileged driver after the first arm. All four read
+  absence as good, so reporting them PASS was a false green; refusing to
+  conclude was the honest stopgap. The real fix -- a wrapper verb reading those
+  paths as root -- is now built (`fortress-state`), alongside `registry-state`
+  for the root-owned 0600 pf-anchor registry and `gate-log` for the gate service
+  account's 0700 log directory. Every one of those checks is TRI-STATE:
+  OBSERVED-CLEAN, OBSERVED-DIRTY, or COULD-NOT-OBSERVE, and the third is a hard
+  failure that is never folded into either of the others.
 - **No drill host is on the allowlist yet, so the wrapper refuses everywhere.**
   `RAILS_HOST_ALLOW_FP` is empty: Mini1's and Mini2's hardware fingerprints
   have not been measured, because doing so means running
@@ -362,7 +387,13 @@ Stated here rather than discovered at 3am:
 ## Disposable fortresses
 
 The loop mints `/private/var/sanctuary-drill/<operator>/.sanctuary-loop-<id>`
-per iteration and tears it down each night. These carry no recovery obligation
+per iteration and RETIRES it at the end of that iteration, through the wrapper's
+`retire` verb, which `teardown-verify.sh` calls after every observation has been
+made. (Round 3 found that nothing removed them at all while this sentence
+claimed a nightly teardown, so they would have accumulated as root-owned
+directories one per iteration forever, and teardown-verify's
+"the whole disposable fortress is gone" branch was unreachable dead code that
+read as a covered case.) These carry no recovery obligation
 and are covered by one standing row in `FORTRESS_KEYS.md` rather than a row per
 night. The loop never runs `nuke`, `rotate-master` or `reset-passphrase` against
 anything, and the rails make a non-disposable target unreachable rather than
@@ -388,8 +419,10 @@ when the fortress cannot be traversed at all, and an explicit
 `storage-observable` check covers the traversable-but-unreadable case. **Neither
 one reports clean.**
 
-Reading those paths through a wrapper verb is the real fix and is not built.
-Until it is, the honest position is the one above: the check is loud about not
-having been made. That is the same rule as the pf anchor, applied to the other
-side of the same wall. Whatever the fix, it is ownership or permissions on the
-root-created leaf, NOT moving the base back into operator-writable space.
+Reading those paths through a wrapper verb was named here as the real fix and is
+now built: `fortress-state`, `registry-state` and `gate-log` read the root-owned
+surfaces as root, through the same `rails_assert_safe_subpath` chokepoint the
+privileged verbs use, and the drivers classify what comes back into
+OBSERVED-CLEAN / OBSERVED-DIRTY / COULD-NOT-OBSERVE. The last of those is a hard
+failure and is never folded into either of the others, because "the host is
+dirty" and "this harness is blind" are different mornings.

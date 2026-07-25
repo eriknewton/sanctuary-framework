@@ -39,16 +39,25 @@
 #
 # THE SAME RULE APPLIED TO THE BATTERY ITSELF. A probe that could not RUN is
 # reported SKIP with the reason, never PASS, and the summary line names which
-# probes ran and which did not, so no caller can summarize this file's output as
-# "every probe passed" when two of them never executed.
+# probes ran and which did not.
+#
+# AND A SKIPPED BATTERY IS NOT A GREEN BATTERY. Round 3 (Codex finding 2) found
+# that saying so was not enough: a skipped `N3` left `FAILED` at zero, this file
+# exited 0, and `run-loop.sh` recorded the whole probe step as `"result":"PASS"`.
+# A declared negative probe that never observed the reason it exists to prove,
+# summarized as a pass, IS the 2026-07-24 false-green class. So SKIP is now
+# counted, the summary carries an explicit `verified=yes|no`, and this file
+# exits 3 (UNVERIFIED) when anything was skipped. There is no arrangement of
+# outputs in which a skip can be read as a pass.
 #
 # Usage:
 #   run-probe-battery.sh --run-id <id> --operator-account <a> \
 #     --agent-account <a> --agent-uid <n> --evidence-dir <d> \
 #     [--allowed-endpoint <url>]... [--blocked-endpoint <url>]... [--base <dir>]
 #
-# Emits one `PROBE=<name> RESULT=<PASS|FAIL|SKIP> ...` line per probe and exits
-# nonzero if any probe FAILED.
+# Emits one `PROBE=<name> RESULT=<PASS|FAIL|SKIP> ...` line per probe.
+# Exit: 0 every declared probe RAN and passed; 1 a probe FAILED;
+#       2 usage or a precondition; 3 UNVERIFIED (a declared probe was skipped).
 
 set -euo pipefail
 
@@ -63,6 +72,35 @@ die() {
   printf 'probe-battery: %s\n' "$*" >&2
   exit 2
 }
+
+# ---------------------------------------------------------------------------
+# ROUND-3 BLOCKER 1: THE EVIDENCE PATH GETS THE PRIVILEGE PATH'S TREATMENT
+# ---------------------------------------------------------------------------
+#
+# Round 2 closed the PATH class in the root wrapper and left it wide open here.
+# Under the stated threat model the attacker controls the environment at this
+# unprivileged call site, and this file's entire output is observations. Codex
+# planted a `sudo` earlier in PATH and got:
+#
+#   PROBE=P1 RESULT=PASS ... PROBE=N3 RESULT=PASS ...
+#   PROBE=SUMMARY failures=0 ran=P1,P1-reason,N1,N3,P2-operator,P3,F1-F2 skipped=
+#
+# with no real sudo, no installed wrapper, no pfctl and no agent account. Full
+# green evidence for a drill that never happened.
+#
+# So: PATH is pinned from the rails' single source of truth as a belt, and every
+# tool the evidence rests on is resolved ONCE, absolutely, through
+# `rails_require_cmd`, which refuses anything outside a root-owned system
+# directory rather than falling back to PATH. Nothing below invokes a bare
+# command name.
+PATH="$RAILS_SYSTEM_PATH"
+export PATH
+SUDO="$(rails_require_cmd sudo)" || die 'sudo is not in a root-owned system directory; refusing to gather evidence through an unresolvable tool'
+CURL="$(rails_require_cmd curl)" || die 'curl is not in a root-owned system directory'
+GREP="$(rails_require_cmd grep)" || die 'grep is not in a root-owned system directory'
+TRUE_BIN="$(rails_require_cmd true)" || die 'true is not in a root-owned system directory'
+MKDIR="$(rails_require_cmd mkdir)" || die 'mkdir is not in a root-owned system directory'
+TR="$(rails_require_cmd tr)" || die 'tr is not in a root-owned system directory'
 
 RUN_ID=''
 OPERATOR=''
@@ -92,7 +130,7 @@ done
 
 [ -n "$EVIDENCE" ] || die '--evidence-dir is required'
 [ -n "$RUN_ID" ] || die '--run-id is required'
-mkdir -p "$EVIDENCE"
+"$MKDIR" -p "$EVIDENCE"
 
 # Rails first, in the mandatory form, before anything is executed.
 OPERATOR_UID="$(rails_assert_non_root_account operator "$OPERATOR")" \
@@ -125,7 +163,14 @@ if [ -z "$ALLOWED" ]; then ALLOWED=' https://api.venice.ai https://api.telegram.
 if [ -z "$BLOCKED" ]; then BLOCKED=' https://example.com'; fi
 for url in $ALLOWED $BLOCKED; do screen_endpoint "$url"; done
 
+# THE DECLARED LADDER. Named here, once, so the summary can report the exact
+# set that was declared against the exact set that ran. A probe that is not in
+# this list cannot be reported, and one that is in it and never reported is a
+# hole the summary names rather than hides.
+DECLARED_PROBES='P1 P1-reason N1 N3 P2-operator P3 F1-F2'
+
 FAILED=0
+SKIPPED_COUNT=0
 RAN=''
 SKIPPED=''
 report() {
@@ -133,16 +178,31 @@ report() {
   case "$2" in
     FAIL) FAILED=$((FAILED + 1)); RAN="$RAN,$1" ;;
     PASS) RAN="$RAN,$1" ;;
-    SKIP) SKIPPED="$SKIPPED,$1" ;;
+    SKIP) SKIPPED_COUNT=$((SKIPPED_COUNT + 1)); SKIPPED="$SKIPPED,$1" ;;
+    *)    die "report: unknown result '$2' for probe $1" ;;
   esac
+}
+
+# The ONE place this file decides what its own run was worth. `verified=no`
+# whenever anything was skipped, and the exit status agrees with the token, so a
+# caller cannot pick the convenient one of the two.
+emit_summary() {
+  local verified='yes'
+  if [ "$SKIPPED_COUNT" -ne 0 ]; then verified='no'; fi
+  printf 'PROBE=SUMMARY failures=%s skipped_count=%s verified=%s declared=%s ran=%s skipped=%s\n' \
+    "$FAILED" "$SKIPPED_COUNT" "$verified" \
+    "$(printf '%s' "$DECLARED_PROBES" | "$TR" ' ' ',')" \
+    "${RAN#,}" "${SKIPPED#,}"
 }
 
 # Run a command AS a validated non-root account. The account came through the
 # account rail above, so `sudo -u` can never be handed root here; that pivot
 # (`--operator-account root` plus a caller-supplied URL) was a review finding.
+# `$SUDO` is the ABSOLUTE path resolved at the top of this file; a planted
+# `sudo` on PATH cannot answer for it.
 as_account() {
   local acct="$1"; shift
-  sudo -n -u "$acct" -- "$@"
+  "$SUDO" -n -u "$acct" -- "$@"
 }
 
 # PRECONDITION. Every probe below observes the world through `sudo -n -u`, and
@@ -151,12 +211,11 @@ as_account() {
 # it every probe would return 000, N1 and P2 would fail for a reason that has
 # nothing to do with the gate, and the night would be spent diagnosing the
 # harness. So ask once, up front, and say so loudly.
-if ! as_account "$OPERATOR" /usr/bin/true >/dev/null 2>&1; then
-  for p in P1 P1-reason N1 N3 P2-operator P3 F1-F2; do
+if ! as_account "$OPERATOR" "$TRUE_BIN" >/dev/null 2>&1; then
+  for p in $DECLARED_PROBES; do
     report "$p" SKIP "precondition unmet: 'sudo -n -u $OPERATOR' is not permitted on this host"
   done
-  printf 'PROBE=SUMMARY failures=%s ran=%s skipped=%s\n' \
-    "$FAILED" "${RAN#,}" "${SKIPPED#,}"
+  emit_summary
   printf 'probe-battery: the as-account grant is missing; NOTHING was measured\n' >&2
   exit 2
 fi
@@ -165,12 +224,46 @@ fi
 # unexpected, and cannot hang the night.
 http_status() {
   local acct="$1" url="$2"
-  as_account "$acct" curl -sS -o /dev/null -w '%{http_code}' \
+  as_account "$acct" "$CURL" -sS -o /dev/null -w '%{http_code}' \
     --max-time 15 --connect-timeout 8 "$url" 2>/dev/null || printf '000'
 }
 
-gate_log_tail() {
-  as_account "$OPERATOR" tail -n 200 "$STORAGE/logs/egress-gate.log" 2>/dev/null || printf ''
+# THE REASON HALF'S EVIDENCE SOURCE (round-3 M5).
+#
+# This used to read `$STORAGE/logs/egress-gate.log`, which nothing writes and
+# which an unprivileged process could not read anyway once the product chmods
+# the root-owned fortress to 0700. Both failures produced the empty string, so
+# `P1-reason` was permanently SKIP, `N3` was permanently SKIP and `N1` failed
+# for the wrong reason: the half of the ladder that exists BECAUSE the
+# 2026-07-24 drill hid a live `peer_unresolved` strangle behind green-looking
+# denials was structurally dead.
+#
+# It now goes through the wrapper's `gate-log` verb, which reads the paths the
+# product actually writes, as root, and exits NONZERO when there is no log to
+# read. So "the gate said X" and "I could not see what the gate said" are two
+# different answers here, which is the whole point.
+GATE_LOG_CACHE="$EVIDENCE/gate-log.txt"
+GATE_LOG_RC=0
+read_gate_log() {
+  GATE_LOG_RC=0
+  "$SUDO" -n "$WRAPPER" gate-log \
+    --run-id "$RUN_ID" --operator-account "$OPERATOR" \
+    --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
+    > "$GATE_LOG_CACHE" 2>&1 || GATE_LOG_RC=$?
+  return 0
+}
+
+# Did the gate log carry <pattern>? Three answers, never two:
+#   0  observed, and it matched
+#   1  observed, and it did not match
+#   2  COULD NOT OBSERVE (no log, or the read failed)
+gate_log_says() {
+  read_gate_log
+  if [ "$GATE_LOG_RC" -ne 0 ]; then return 2; fi
+  # -F: these patterns are LITERAL tokens, and a path or uid read as a
+  # regular expression could match something adjacent to what was meant.
+  if "$GREP" -q -F -- "$1" "$GATE_LOG_CACHE"; then return 0; fi
+  return 1
 }
 
 # --- P1: positive through-gate, N repeats ---------------------------------
@@ -196,12 +289,25 @@ fi
 # The reason half of P1: the gate must have RESOLVED the peer uid. A green
 # status code with peer_unresolved in the log is the 2026-07-24 strangle
 # wearing a passing costume.
-if gate_log_tail | grep -q "peer=$AGENT_UID"; then
+#
+# THREE outcomes, not two. "the log says the peer resolved" (PASS), "the log
+# says peer_unresolved" (FAIL) and "there is no log to read" (SKIP, which now
+# makes the whole battery UNVERIFIED) are different facts and are reported as
+# different facts.
+p1r=0
+gate_log_says "peer=$AGENT_UID" || p1r=$?
+if [ "$p1r" -eq 2 ]; then
+  report P1-reason SKIP "could not READ the gate log (wrapper gate-log rc=$GATE_LOG_RC); the reason half CANNOT be evaluated"
+elif [ "$p1r" -eq 0 ]; then
   report P1-reason PASS "gate resolved peer=$AGENT_UID"
-elif gate_log_tail | grep -q 'peer_unresolved'; then
-  report P1-reason FAIL 'gate log shows peer_unresolved; the peer resolver is not working'
 else
-  report P1-reason SKIP 'gate log did not carry a peer field; cannot confirm the reason'
+  p1u=0
+  gate_log_says 'peer_unresolved' || p1u=$?
+  if [ "$p1u" -eq 0 ]; then
+    report P1-reason FAIL 'gate log shows peer_unresolved; the peer resolver is not working'
+  else
+    report P1-reason FAIL "the gate log was read and carries no peer field for uid $AGENT_UID; the through-gate status codes cannot be attributed to a resolved peer"
+  fi
 fi
 
 # --- N1: off-manifest endpoint denied, for the right reason ---------------
@@ -209,7 +315,11 @@ for url in $BLOCKED; do
   code="$(http_status "$AGENT" "$url")"
   printf 'n1 url=%s code=%s\n' "$url" "$code" >> "$EVIDENCE/n1-off-manifest.log"
   if [ "$code" = '000' ] || [ "$code" = '403' ]; then
-    if gate_log_tail | grep -q 'allowlist'; then
+    n1r=0
+    gate_log_says 'allowlist' || n1r=$?
+    if [ "$n1r" -eq 2 ]; then
+      report N1 SKIP "off-manifest $url was denied (code $code) but the gate log could not be READ (rc=$GATE_LOG_RC), so the REASON is unmeasured"
+    elif [ "$n1r" -eq 0 ]; then
       report N1 PASS "off-manifest $url denied by the allowlist"
     else
       report N1 FAIL "off-manifest $url denied (code $code) but not for an allowlist reason"
@@ -220,15 +330,25 @@ for url in $BLOCKED; do
 done
 
 # --- N3: a valid request from the WRONG uid must be denied ----------------
+#
+# Round 3 (Codex finding 2): the absence of `peer_uid_mismatch` used to be SKIP.
+# It is not a skip. The probe RAN: a request was made from a non-agent uid and
+# the gate log was read. Absence of the denial reason means the reason was not
+# observed, which is a FAILURE of the thing the probe exists to prove. SKIP is
+# reserved for "the log could not be read at all".
 for url in $ALLOWED; do
   code="$(http_status "$OPERATOR" "$url")"
   printf 'n3 url=%s operator_code=%s\n' "$url" "$code" >> "$EVIDENCE/n3-wrong-uid.log"
   break
 done
-if gate_log_tail | grep -q 'peer_uid_mismatch'; then
+n3r=0
+gate_log_says 'peer_uid_mismatch' || n3r=$?
+if [ "$n3r" -eq 2 ]; then
+  report N3 SKIP "could not READ the gate log (wrapper gate-log rc=$GATE_LOG_RC); the wrong-uid denial reason CANNOT be evaluated"
+elif [ "$n3r" -eq 0 ]; then
   report N3 PASS 'a request from a non-agent uid was denied with peer_uid_mismatch'
 else
-  report N3 SKIP 'no peer_uid_mismatch observed in this window'
+  report N3 FAIL 'the gate log was read and shows no peer_uid_mismatch for the non-agent request; a denial for an unobserved reason is the 2026-07-24 false-green class'
 fi
 
 # --- P2: per-uid differential --------------------------------------------
@@ -253,7 +373,7 @@ fi
 # still intact afterwards. A refusal that kills the running gate is a failure,
 # not a pass; that is the same strangle shape as F2.
 p3_arm_rc=0
-sudo -n "$WRAPPER" arm \
+"$SUDO" -n "$WRAPPER" arm \
   --run-id "$RUN_ID" --operator-account "$OPERATOR" \
   --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
   >> "$EVIDENCE/p3-second-arm.log" 2>&1 || p3_arm_rc=$?
@@ -281,7 +401,7 @@ fi
 rot=1
 rot_fail=0
 while [ "$rot" -le "$REPEATS" ]; do
-  if sudo -n "$WRAPPER" repair \
+  if "$SUDO" -n "$WRAPPER" repair \
       --run-id "$RUN_ID" --operator-account "$OPERATOR" \
       --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
       >> "$EVIDENCE/f1-rotation.log" 2>&1
@@ -309,10 +429,24 @@ else
   report F1-F2 FAIL "$rot_fail of $REPEATS rotation cycles failed or strangled the agent"
 fi
 
-sudo -n "$WRAPPER" gate-state \
+"$SUDO" -n "$WRAPPER" gate-state \
   --run-id "$RUN_ID" --operator-account "$OPERATOR" \
+  --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
   > "$EVIDENCE/gate-state.log" 2>&1 || true
 
-printf 'PROBE=SUMMARY failures=%s ran=%s skipped=%s\n' \
-  "$FAILED" "${RAN#,}" "${SKIPPED#,}"
+# A declared probe that never reported at all would otherwise vanish from both
+# the ran and the skipped list, so it is counted as unverified here rather than
+# silently omitted. This is the same rule the file applies to its probes,
+# applied to the file.
+for p in $DECLARED_PROBES; do
+  case ",$RAN,$SKIPPED," in
+    *",$p,"*) ;;
+    *) report "$p" SKIP 'declared but never reported; the battery did not reach it' ;;
+  esac
+done
+
+emit_summary
 if [ "$FAILED" -ne 0 ]; then exit 1; fi
+# UNVERIFIED. Distinct from both green and failed, and NONZERO, so no caller can
+# turn a skipped declared probe into a pass by reading only the exit status.
+if [ "$SKIPPED_COUNT" -ne 0 ]; then exit 3; fi

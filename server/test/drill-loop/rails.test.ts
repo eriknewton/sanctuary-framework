@@ -56,6 +56,7 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const DRILL_LOOP = path.join(REPO_ROOT, "scripts", "drill-loop");
 const PROBE = path.join(DRILL_LOOP, "lib", "probe.sh");
 const RAILS = path.join(DRILL_LOOP, "lib", "rails.sh");
+const DRIVERS = path.join(DRILL_LOOP, "drivers");
 const BUILD_WRAPPER = path.join(DRILL_LOOP, "build-wrapper.sh");
 const SELFTEST = path.join(DRILL_LOOP, "selftest.sh");
 const SHA_FILE = path.join(DRILL_LOOP, "wrapper.sha256");
@@ -128,15 +129,60 @@ let localFingerprint = "";
 let hasHardwareIdentity = false;
 
 /**
- * The wrapper-level cases need a machine with a hardware identity, because the
- * host rail now decides on one. Linux CI has no IOPlatformExpertDevice, so
- * there the rail correctly refuses before reaching anything else and these
- * cases would all assert the wrong reason. The rail-level cases above carry
- * the coverage on every platform; these carry the end-to-end verb coverage on
- * the platform the drill actually runs on.
+ * HOW THE WRAPPER-LEVEL CASES BEHAVE ON A MACHINE WITH NO HARDWARE IDENTITY,
+ * AND WHY THEY NO LONGER RETURN SILENTLY.
+ *
+ * ROUND-3 H4. The commit that turned CI green made all 20 wrapper-level cases
+ * -- every verb, both round-2 exploit fixtures, the TOCTOU fixture -- `return`
+ * early on any hardware-less machine. A vitest `it()` that returns early
+ * PASSES. There was no `it.skip`, no `ctx.skip()` and no annotation, and the
+ * case count was 151 either way, so `.test-baseline` could not notice. Linux CI
+ * is the authoritative gate under the coordinator's baseline-floor rule, so on
+ * the gate that actually decides, all 20 cases were green having asserted
+ * nothing. That is structurally the same miss as round 2's stubbed
+ * `wrapper_home_of`, one layer up, introduced deliberately.
+ *
+ * `ctx.skip()` would make it visible, and would also drop the passing count on
+ * Linux below the baseline floor, which is a strict-upward ratchet. So instead:
+ *
+ *   1. NO CASE IS SILENT. On a hardware-less machine every wrapper case still
+ *      RUNS the real artifact and asserts a real property -- that it refuses,
+ *      prints the machine-readable REJECT token, never prints ACCEPT, and (for
+ *      the exploit fixtures) that the victim fortress survives. That is not a
+ *      consolation assertion: "the wrapper fails closed with no hardware
+ *      identity" is exactly the property the host rail exists to have.
+ *   2. THE CASES ARE COUNTED. Every case increments a counter, and a final case
+ *      asserts the exact expected number executed, and that on a machine WITH a
+ *      hardware identity the same number took the FULL path. A case that
+ *      vanishes changes a number, and a forced hardware-less branch on the
+ *      drill platform goes red.
+ *
+ * `wrapperFullPath()` is what a case calls to learn which half it is in; the
+ * counting is a side effect of asking, so a case cannot be counted without
+ * asking and cannot ask without being counted.
  */
-function skipWrapperCases(): boolean {
-  return myUid === 0 || !hasHardwareIdentity;
+const WRAPPER_LEVEL_CASES = 27;
+let wrapperCasesExecuted = 0;
+let wrapperCasesFullPath = 0;
+
+function wrapperFullPath(): boolean {
+  wrapperCasesExecuted += 1;
+  const full = myUid !== 0 && hasHardwareIdentity;
+  if (full) wrapperCasesFullPath += 1;
+  return full;
+}
+
+/**
+ * The assertion a wrapper case makes when this machine cannot get past the host
+ * rail: the artifact ran, it refused, and it said so in the machine-readable
+ * shape every other refusal uses.
+ */
+function expectHostRailRefusal(r: Ran): void {
+  expect(r.status, `expected a nonzero exit; output was:\n${r.out}`).not.toBe(0);
+  expect(r.out, "a hardware-less machine must never see an ACCEPT token").not.toContain(
+    "WRAPPER=ACCEPT"
+  );
+  expect(r.out, "every refusal prints the same machine-readable token").toContain("WRAPPER=REJECT");
 }
 
 beforeAll(() => {
@@ -310,7 +356,30 @@ describe("drill-loop rails: disposable-storage rail (the BLOCKER and the HIGH)",
  */
 describe("drill-loop rails: the run id is not a path", () => {
   it("ACCEPTS a plain stamp-shaped run id", () => {
-    expectAccept(probe("run-id", "20260725T0230-1"), "PROBE=ACCEPT");
+    expectAccept(probe("run-id", "20260725t0230-1"), "PROBE=ACCEPT");
+  });
+
+  it("REJECTS an uppercase run id, because APFS is case-insensitive", () => {
+    // ROUND-3 MED, found independently by both lenses and reproduced by Codex.
+    // The drill hosts are Macs, whose default APFS volume is case-insensitive,
+    // so `A` and `a` were two accepted, DISTINCT run ids deriving to two
+    // distinct path strings naming ONE directory entry: two runs sharing a
+    // disposable fortress and an evidence identity while every rail said they
+    // were separate.
+    expectReject(probe("run-id", "20260725T0230-1"), "disallowed characters");
+    expectReject(probe("run-id", "A"), "disallowed characters");
+    expectAccept(probe("run-id", "a"), "PROBE=ACCEPT");
+  });
+
+  it("REJECTS rather than silently folding case", () => {
+    // Not normalized down: the evidence has to show the exact id the caller
+    // supplied, and a rail that quietly rewrites its input is a rail whose
+    // output nobody can reason about.
+    const r = probe("run-id", "Ab");
+    expectReject(r, "disallowed characters");
+    expect(r.out, "the rail must not have folded the value to lowercase").not.toContain(
+      "run-id=ab"
+    );
   });
 
   it("rejects an empty run id", () => {
@@ -326,11 +395,11 @@ describe("drill-loop rails: the run id is not a path", () => {
   });
 
   it("rejects a run id that starts with a dot, which could read as . or ..", () => {
-    expectReject(probe("run-id", ".."), "must start with a letter or a digit");
+    expectReject(probe("run-id", ".."), "must start with a lowercase letter or a digit");
   });
 
   it("rejects an option-shaped run id", () => {
-    expectReject(probe("run-id", "-rf"), "must start with a letter or a digit");
+    expectReject(probe("run-id", "-rf"), "must start with a lowercase letter or a digit");
   });
 
   it("rejects an over-long run id", () => {
@@ -1128,6 +1197,150 @@ describe("drill-loop wrapper: the shipped artifact's own structure", () => {
     }
   });
 
+  it("ships an EMPTY agent-account allowlist, so root acts for nobody yet", () => {
+    // ROUND-3 M2. Same posture as the empty host allowlist: an unprovisioned
+    // harness refuses rather than acting for whatever account it is handed.
+    expect(assembled).toContain("RAILS_AGENT_ACCOUNT_ALLOW=''");
+  });
+
+  it("carries the four READ verbs the drivers observe through", () => {
+    // BLOCKER 3: the drivers could not observe the root-owned registry, the
+    // gate log, or the inside of a 0700 fortress, and folded "could not read"
+    // into "clean". These verbs are the half that lets them actually look.
+    const verbs = assembled.match(/^WRAPPER_VERBS='([^']*)'/m);
+    expect(verbs, "the assembled wrapper must declare its verb list").not.toBeNull();
+    for (const verb of ["registry-state", "fortress-state", "gate-log", "pf-anchor-rules"]) {
+      expect(verbs![1].split(" ")).toContain(verb);
+    }
+    // ...and `retire`, without which the disposable fortresses accumulate
+    // forever while the README claims a nightly teardown (M1).
+    expect(verbs![1].split(" ")).toContain("retire");
+  });
+
+  it("has NO --passphrase-file flag: validated root surface with no consumer", () => {
+    const exec = executableLines(assembled);
+    expect(exec).not.toMatch(/^\s*--passphrase-file\)/m);
+    expect(exec).not.toContain("ARG_PASSFILE");
+  });
+
+  it("keeps ONE PATH value across the header, the rails, and the drivers", () => {
+    // The header hard-codes PATH because it runs BEFORE lib/rails.sh is
+    // concatenated in, and the drivers pin theirs from `RAILS_SYSTEM_PATH`.
+    // Three spellings of one security decision is how they drift apart, so
+    // this asserts they agree.
+    const rails = fs.readFileSync(RAILS, "utf8");
+    const binDirs = rails.match(/^RAILS_SYSTEM_BIN_DIRS='([^']*)'/m);
+    const sysPath = rails.match(/^RAILS_SYSTEM_PATH='([^']*)'/m);
+    expect(binDirs, "lib/rails.sh must declare RAILS_SYSTEM_BIN_DIRS").not.toBeNull();
+    expect(sysPath, "lib/rails.sh must declare RAILS_SYSTEM_PATH").not.toBeNull();
+    expect(sysPath![1]).toBe(binDirs![1].split(" ").join(":"));
+    expect(SHIPPED_PATH_LINE).toBe(`PATH=${sysPath![1]}`);
+    // /usr/local/bin is operator-writable on a Mac and must be in none of them.
+    expect(binDirs![1]).not.toContain("/usr/local/bin");
+  });
+
+  it("the DRIVERS resolve every observation tool absolutely, never through PATH", () => {
+    // ROUND-3 BLOCKER 1, structurally. Round 2 closed the PATH class in the
+    // root wrapper and left it open in the unprivileged drivers, whose entire
+    // output is observations. Codex planted a `sudo` earlier in PATH and got a
+    // fully green probe ladder and a clean teardown with no real sudo, no
+    // installed wrapper, no pfctl and no agent account.
+    //
+    // This scans for a bare command NAME in COMMAND POSITION. `rails__sys grep`
+    // is fine (the resolver holds the command position); `grep -q ...` is not.
+    const forbidden = [
+      "sudo",
+      "curl",
+      "tail",
+      "grep",
+      "sed",
+      "awk",
+      "head",
+      "tr",
+      "stat",
+      "pfctl",
+      "launchctl",
+      "ioreg",
+      "git",
+      "ps",
+      "date",
+      "mktemp",
+      "mkdir",
+      "rm",
+      "cat",
+      "id",
+    ].join("|");
+    // Command position: line start, or right after ; & | ( ) && || $( then do else !
+    const bare = new RegExp(
+      String.raw`(?:^|[;&|(]|\bthen\b|\bdo\b|\belse\b|!)\s*(?:${forbidden})\b`,
+      "m"
+    );
+    // Comments are stripped first (these files EXPLAIN the attack at length),
+    // and so are STRING LITERALS: a message that says "sudo -n -u <agent> is
+    // not covered by the grant" is documentation, not an invocation, and a
+    // scanner that cannot tell them apart forces the documentation out.
+    //
+    // Stripped PER LINE, never across the file: a quote-pairing walk over the
+    // whole text merges statements together at the first unbalanced quote and
+    // then reports one enormous bogus line, which is a scanner that cannot be
+    // trusted either way.
+    const stripStrings = (line: string): string =>
+      line.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/'[^']*'/g, "''");
+    for (const driver of fs.readdirSync(DRIVERS)) {
+      const src = executableLines(fs.readFileSync(path.join(DRIVERS, driver), "utf8"));
+      const offending = src
+        .split("\n")
+        .map(stripStrings)
+        .filter((line) => bare.test(line))
+        .filter((line) => !/^\s*(?:PATH=|export PATH)/.test(line));
+      expect(
+        offending,
+        `${driver} invokes a bare command name; a planted binary on PATH answers for it:\n` +
+          offending.join("\n")
+      ).toEqual([]);
+    }
+  });
+
+  it("the DRIVERS pin PATH from the rails' single source of truth", () => {
+    for (const driver of fs.readdirSync(DRIVERS)) {
+      const src = fs.readFileSync(path.join(DRIVERS, driver), "utf8");
+      expect(src, `${driver} must pin PATH`).toContain('PATH="$RAILS_SYSTEM_PATH"');
+      expect(src, `${driver} must export the pinned PATH`).toContain("export PATH");
+      expect(
+        src,
+        `${driver} must resolve sudo through the absolute resolver`
+      ).toContain('SUDO="$(rails_require_cmd sudo)"');
+    }
+  });
+
+  it("install-wrapper VERIFIES before it installs, and removes a mismatch", () => {
+    // ROUND-3 M3. It used to `install` first and hash second, so on any
+    // mismatch it exited leaving a root-owned 0755 file that did NOT match the
+    // committed hash sitting at exactly the path the NOPASSWD grant names.
+    // `run-loop.sh` would refuse to use it; a hand-run `sudo
+    // /usr/local/sbin/sanctuary-drill-wrapper` would not.
+    //
+    // This script cannot be executed here (it needs uid 0 and it writes to
+    // /usr/local/sbin), so the ORDER is asserted structurally. That is a weaker
+    // proof than running it and is stated as such.
+    const src = fs.readFileSync(path.join(DRILL_LOOP, "install-wrapper.sh"), "utf8");
+    const exec = executableLines(src);
+    const stagedCompare = exec.indexOf('if [ "$STAGED" != "$WANT" ]');
+    const installAt = exec.search(/^install -o root/m);
+    expect(stagedCompare, "install-wrapper must compare the staged hash").toBeGreaterThan(-1);
+    expect(installAt, "install-wrapper must install the artifact").toBeGreaterThan(-1);
+    expect(
+      stagedCompare,
+      "the committed-hash comparison must happen BEFORE anything is written to the grant target"
+    ).toBeLessThan(installAt);
+    // ...and a post-install mismatch removes the artifact rather than leaving
+    // an unreviewed root-owned file at the grant target.
+    expect(exec).toMatch(/rm -f "\$DEST"\n\s*die "installed hash/);
+    // ...and the DIRECTORY the grant rests on is chain-verified, which
+    // `rails_assert_wrapper_ownership` never does (it checks only the file).
+    expect(exec).toContain("rails_assert_trusted_dir_chain 'grant target dir'");
+  });
+
   it("the sudoers grant pins secure_path", () => {
     const sudoers = fs.readFileSync(
       path.join(DRILL_LOOP, "sudoers.d", "sanctuary-drill"),
@@ -1155,10 +1368,17 @@ describe("drill-loop wrapper: the shipped artifact's own structure", () => {
  */
 describe("drill-loop wrapper: every verb, not just the oracle", () => {
   let testWrapper: string;
+  let agentWrapper: string;
   let victim: string;
 
-  beforeEach(() => {
-    testWrapper = path.join(sandbox, "test-wrapper");
+  /**
+   * CONSTANTS ONLY, spliced in immediately before the entrypoint. Never a
+   * function: the reviewed batteries overrode `wrapper_home_of`, a FUNCTION,
+   * and mutating it left every test green. Every constant overridden here has
+   * its SHIPPED value asserted in the structural describe above, so an override
+   * cannot hide a change to what runs as root.
+   */
+  function compose(dest: string, agentAllow: string): void {
     const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], { encoding: "utf8" });
     const entrypoint = 'wrapper_main "$@"';
     const at = assembled.lastIndexOf(entrypoint);
@@ -1172,11 +1392,23 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
       "RAILS_HOST_DENY_FP=''",
       "RAILS_HOST_DENY=''",
       `RAILS_DISPOSABLE_BASE='${base}'`,
+      `RAILS_AGENT_ACCOUNT_ALLOW='${agentAllow}'`,
       "",
     ].join("\n");
-    fs.writeFileSync(testWrapper, assembled.slice(0, at) + overrides + assembled.slice(at), {
+    fs.writeFileSync(dest, assembled.slice(0, at) + overrides + assembled.slice(at), {
       mode: 0o755,
     });
+  }
+
+  beforeEach(() => {
+    testWrapper = path.join(sandbox, "test-wrapper");
+    agentWrapper = path.join(sandbox, "test-wrapper-agent");
+    // The DEFAULT test wrapper keeps the SHIPPED (empty) agent allowlist, so
+    // the refusal it produces is the shipped behavior and not a fixture.
+    compose(testWrapper, "");
+    // And one with this account allowlisted, so the agent-taking verbs can be
+    // exercised past that rail and the rail is seen to say yes as well as no.
+    compose(agentWrapper, me);
 
     // A stand-in for a real fortress, OUTSIDE the disposable base. Every
     // exploit case below aims at this.
@@ -1190,21 +1422,46 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     return run("bash", [testWrapper, ...args]);
   }
 
+  function agentWrapperRun(...args: string[]): Ran {
+    return run("bash", [agentWrapper, ...args]);
+  }
+
   const loopDir = (id: string): string => path.join(base, me, `.sanctuary-loop-${id}`);
 
   it("refuses --storage, because the flag no longer exists", () => {
-    if (skipWrapperCases()) return;
+    wrapperFullPath();
+    // No branch needed: argument parsing happens BEFORE any rail, so this is
+    // the same assertion on every platform.
     const r = wrapper("check", "--storage", victim, "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain("unknown or unsupported argument");
   });
 
+  it("refuses the dead --passphrase-file flag, which reached no verb", () => {
+    // ROUND-3 L1: parsed and rail-checked root-run surface with no consumer,
+    // which is round 2's `--endpoint` finding under a new name. Deleted rather
+    // than better documented.
+    wrapperFullPath();
+    const r = wrapper(
+      "check",
+      "--run-id",
+      "good1",
+      "--operator-account",
+      me,
+      "--passphrase-file",
+      "/dev/null"
+    );
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=ACCEPT");
+    expect(r.out).toContain("unknown or unsupported argument");
+  });
+
   it("refuses an EMPTY --run-id, and says which layer refused it", () => {
-    if (skipWrapperCases()) return;
     // The reviewed suite had a case named "refuses an empty --storage at both
     // layers" that entered only ONE layer and asserted no reason at all.
     const r = wrapper("check", "--run-id", "", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain("WRAPPER=REJECT");
@@ -1214,27 +1471,34 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("refuses a traversal-shaped run id, and prints REJECT", () => {
-    if (skipWrapperCases()) return;
     const r = wrapper("check", "--run-id", "../../.sanctuary", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain("WRAPPER=REJECT");
     expect(r.out).toContain("run id rejected");
   });
 
+  it("refuses an UPPERCASE run id, which aliases a lowercase one on APFS", () => {
+    const r = wrapper("check", "--run-id", "GOOD1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=ACCEPT");
+    expect(r.out).toContain("run id rejected");
+  });
+
   it("prints WRAPPER=REJECT for a HOST rejection too, not only a path one", () => {
-    if (skipWrapperCases()) return;
     // Review finding L2: `rails__die` exits, so a DIRECTLY called rail
     // terminated the script before the oracle's REJECT token was printed, and
     // `check` had two different contracts depending on which rail said no.
+    // This case needs no platform branch: the SHIPPED host allowlist is empty,
+    // so the shipped artifact refuses everywhere, which is the point.
     const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], { encoding: "utf8" });
     const at = assembled.lastIndexOf('wrapper_main "$@"');
     const hostDenied = path.join(sandbox, "host-denied-wrapper");
     fs.writeFileSync(
       hostDenied,
-      assembled.slice(0, at) +
-        `RAILS_DISPOSABLE_BASE='${base}'\n` +
-        assembled.slice(at),
+      assembled.slice(0, at) + `RAILS_DISPOSABLE_BASE='${base}'\n` + assembled.slice(at),
       { mode: 0o755 }
     );
     const r = run("bash", [hostDenied, "check", "--run-id", "good1", "--operator-account", me]);
@@ -1243,19 +1507,19 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     expect(r.out, "a host rejection must print the same oracle token as any other").toContain(
       "WRAPPER=REJECT"
     );
-    expect(r.out).toContain("host rail rejected");
+    expect(r.out).toMatch(/host rail rejected|cannot establish this machine hardware identity/);
   });
 
   it("refuses --operator-account root before any sudo -u could happen", () => {
-    if (skipWrapperCases()) return;
     const r = wrapper("check", "--run-id", "good1", "--operator-account", "root");
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain("operator account rejected");
   });
 
   it("refuses an unknown flag rather than passing it through", () => {
-    if (skipWrapperCases()) return;
+    wrapperFullPath();
     const r = wrapper("check", "--run-id", "good1", "--operator-account", me, "--danger");
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
@@ -1263,7 +1527,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("refuses an unknown verb", () => {
-    if (skipWrapperCases()) return;
+    wrapperFullPath();
     const r = wrapper("definitely-not-a-verb", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
@@ -1271,8 +1535,8 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("ACCEPTS a genuine invocation and mints a root-owned-shaped directory", () => {
-    if (skipWrapperCases()) return;
     const r = wrapper("check", "--run-id", "good1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status, r.out).toBe(0);
     expect(r.out).toContain("WRAPPER=ACCEPT");
     expect(r.out).toContain(loopDir("good1"));
@@ -1281,18 +1545,122 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("mint creates the disposable fortress", () => {
-    if (skipWrapperCases()) return;
     const r = wrapper("mint", "--run-id", "good1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expectAccept(r, "WRAPPER=OK verb=mint");
     expect(fs.existsSync(loopDir("good1"))).toBe(true);
   });
 
+  it("retire removes the whole disposable fortress", () => {
+    // ROUND-3 M1: nothing removed them, ever, while the README said the loop
+    // "tears it down each night". Unbounded accumulation of root-owned
+    // directories, one per iteration forever, AND a dead `[ ! -d "$STORAGE" ]`
+    // branch in teardown-verify that read as a covered case.
+    const minted = wrapper("mint", "--run-id", "good1", "--operator-account", me);
+    const r = wrapper("retire", "--run-id", "good1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
+    expectAccept(minted, "WRAPPER=OK verb=mint");
+    expectAccept(r, "WRAPPER=OK verb=retire");
+    expect(
+      fs.existsSync(loopDir("good1")),
+      "retire exited 0 and the disposable fortress is still there"
+    ).toBe(false);
+  });
+
+  it("fortress-state names a state for every entry, including present-empty", () => {
+    // BLOCKER 3. The unprivileged drivers read a fortress the product chmods to
+    // 0700 on every start, and absence-means-good is what "cannot look inside"
+    // returns. Root reads it now, and a ZERO-LENGTH audit lock -- which is
+    // UNBREAKABLE by design and bricks a fortress permanently -- is its own
+    // state rather than folded into `present`.
+    const minted = wrapper("mint", "--run-id", "good1", "--operator-account", me);
+    const full = wrapperFullPath();
+    if (full) {
+      expectAccept(minted, "verb=mint");
+      fs.mkdirSync(path.join(loopDir("good1"), "state", "_audit"), { recursive: true });
+      fs.writeFileSync(path.join(loopDir("good1"), "state", "_audit", ".audit-write.lock"), "");
+      fs.writeFileSync(path.join(loopDir("good1"), "exclusive-routing.json"), "x");
+    }
+    const r = wrapper("fortress-state", "--run-id", "good1", "--operator-account", me);
+    if (!full) return expectHostRailRefusal(r);
+    expectAccept(r, "WRAPPER=OK verb=fortress-state");
+    expect(r.out).toContain("FORTRESS entry=exclusive-routing.json state=present");
+    expect(r.out).toContain("FORTRESS entry=state/_audit/.audit-write.lock state=present-empty");
+    expect(r.out).toContain("FORTRESS entry=state/.provision.lock state=absent");
+    expect(r.out).toContain("WRAPPER=FORTRESS-END");
+  });
+
+  it("fortress-state REFUSES a symlinked entry rather than classifying it", () => {
+    // Written first as "reports it as state=symlink", and the real artifact
+    // said no: `rails_assert_safe_subpath` refuses any symlink in the chain
+    // before the classifier can see one, so a `state=symlink` branch would have
+    // been an unreachable predicate that read as a covered case. This asserts
+    // what the code actually does, which is the stronger behavior.
+    //
+    // The property still matters: `[ -e ]` is FALSE for a dangling symlink, so
+    // a hand-rolled check would report a symlinked marker as ABSENT, which is
+    // the absence-means-good class wearing a different hat. The driver reads
+    // this failure as COULD-NOT-OBSERVE, never as clean.
+    const minted = wrapper("mint", "--run-id", "good1", "--operator-account", me);
+    const full = wrapperFullPath();
+    if (full) {
+      expectAccept(minted, "verb=mint");
+      fs.symlinkSync(
+        path.join(sandbox, "no-such-target"),
+        path.join(loopDir("good1"), "exclusive-routing.json")
+      );
+    }
+    const r = wrapper("fortress-state", "--run-id", "good1", "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=OK verb=fortress-state");
+    if (!full) return expectHostRailRefusal(r);
+    expect(r.out).toContain("is a symlink");
+  });
+
+  it("registry-state distinguishes ABSENT from unreadable", () => {
+    // H1 / Codex #3. The reviewed check folded "no match", "cannot read" and
+    // "not there" into one CLEAN verdict, against a path the product does not
+    // use. There is no registry on a test machine, so the answer must be the
+    // explicit ABSENT token rather than an empty success.
+    const r = wrapper("registry-state", "--run-id", "good1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
+    expectAccept(r, "WRAPPER=REGISTRY-ABSENT");
+    expect(r.out).toContain("WRAPPER=OK verb=registry-state state=absent");
+  });
+
+  it("gate-log REFUSES when there is no log, rather than returning nothing", () => {
+    // M5. The reason half of the probe ladder read a path nothing writes and
+    // could not have read it anyway, so `P1-reason` and `N3` were permanently
+    // SKIP: the half of the ladder that exists because a live `peer_unresolved`
+    // strangle hid behind green-looking denials for a day was structurally
+    // dead. "There is no log" must be an error, not an empty answer.
+    const r = agentWrapperRun(
+      "gate-log",
+      "--run-id",
+      "good1",
+      "--operator-account",
+      me,
+      "--agent-account",
+      me,
+      "--agent-uid",
+      String(myUid)
+    );
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=OK verb=gate-log");
+    expect(r.out).toContain("CANNOT be evaluated");
+  });
+
   it("clean-markers removes the loop's own markers", () => {
-    if (skipWrapperCases()) return;
-    expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
+    const minted = wrapper("mint", "--run-id", "good1", "--operator-account", me);
+    const full = wrapperFullPath();
     const marker = path.join(loopDir("good1"), "exclusive-routing.json");
-    fs.writeFileSync(marker, "x");
+    if (full) {
+      expectAccept(minted, "verb=mint");
+      fs.writeFileSync(marker, "x");
+    }
     const r = wrapper("clean-markers", "--run-id", "good1", "--operator-account", me);
+    if (!full) return expectHostRailRefusal(r);
     expectAccept(r, "WRAPPER=OK verb=clean-markers");
     expect(fs.existsSync(marker)).toBe(false);
   });
@@ -1302,38 +1670,52 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     // component, so `state/` and `state/_audit/` were followed by the kernel
     // and never looked at, and a root `rm` deleted a real fortress's audit
     // write lock while every rail passed.
-    if (skipWrapperCases()) return;
-    expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
-    fs.symlinkSync(path.join(victim, "state"), path.join(loopDir("good1"), "state"));
+    //
+    // The victim-survives half is asserted on EVERY platform: it is the actual
+    // property, and a hardware-less machine refusing at the host rail is one
+    // more way for it to hold.
+    const minted = wrapper("mint", "--run-id", "good1", "--operator-account", me);
+    const full = wrapperFullPath();
+    if (full) {
+      expectAccept(minted, "verb=mint");
+      fs.symlinkSync(path.join(victim, "state"), path.join(loopDir("good1"), "state"));
+    }
     const r = wrapper("clean-markers", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
-    expect(r.out).toContain("is a symlink");
     expect(
       fs.existsSync(path.join(victim, "state", "_audit", ".audit-write.lock")),
       "the wrapper reached OUTSIDE the storage directory and deleted a fortress file"
     ).toBe(true);
+    if (!full) return expectHostRailRefusal(r);
+    expect(r.out).toContain("is a symlink");
   });
 
   it("clean-markers refuses a symlinked FINAL component and the fortress file SURVIVES", () => {
-    if (skipWrapperCases()) return;
-    expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
-    fs.mkdirSync(path.join(loopDir("good1"), "state", "_audit"), { recursive: true });
-    fs.symlinkSync(
-      path.join(victim, "state", "_audit", ".audit-write.lock"),
-      path.join(loopDir("good1"), "state", "_audit", ".audit-write.lock")
-    );
+    const minted = wrapper("mint", "--run-id", "good1", "--operator-account", me);
+    const full = wrapperFullPath();
+    if (full) {
+      expectAccept(minted, "verb=mint");
+      fs.mkdirSync(path.join(loopDir("good1"), "state", "_audit"), { recursive: true });
+      fs.symlinkSync(
+        path.join(victim, "state", "_audit", ".audit-write.lock"),
+        path.join(loopDir("good1"), "state", "_audit", ".audit-write.lock")
+      );
+    }
     const r = wrapper("clean-markers", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
-    expect(r.out).toContain("is a symlink");
     expect(fs.existsSync(path.join(victim, "state", "_audit", ".audit-write.lock"))).toBe(true);
+    if (!full) return expectHostRailRefusal(r);
+    expect(r.out).toContain("is a symlink");
   });
 
   it("SURVIVES the TOCTOU race that swapped the accepted directory for a symlink", () => {
     // Codex won this in 44 attempts against the reviewed build. Note that this
     // sandbox is the WEAKER configuration: in production the base is
     // root-owned, so the racer could not create the leaf at all.
-    if (skipWrapperCases()) return;
-    expectAccept(wrapper("mint", "--run-id", "race", "--operator-account", me), "verb=mint");
+    const full = wrapperFullPath();
+    if (full) {
+      expectAccept(wrapper("mint", "--run-id", "race", "--operator-account", me), "verb=mint");
+    }
     const dir = loopDir("race");
     const racer = spawnSync(
       "bash",
@@ -1356,16 +1738,66 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     ).toBe(true);
   });
 
+  it("the agent-taking verbs refuse without an agent principal", () => {
+    // ROUND-3 H3: the product's daemon labels are `<prefix>.<agent uid>`, and
+    // `kickstart-daemons` had no `--agent-uid` in its call path at all. A verb
+    // whose whole subject is one confined agent must say so rather than compose
+    // a label out of an empty string.
+    const full = wrapperFullPath();
+    for (const verb of ["kickstart-daemons", "gate-state", "gate-log"]) {
+      const r = wrapper(verb, "--run-id", "good1", "--operator-account", me);
+      expect(r.status, `${verb} accepted a missing agent principal`).not.toBe(0);
+      expect(r.out).not.toContain("WRAPPER=ACCEPT");
+      if (full) expect(r.out).toContain("requires --agent-account and --agent-uid");
+    }
+  });
+
+  it("refuses an agent account that is not on the compiled-in allowlist", () => {
+    // ROUND-3 M2: `--agent-account` was the surviving caller-supplied steering
+    // input, and it is the one that decides WHO root acts against. This uses
+    // the wrapper carrying the SHIPPED (empty) allowlist, so the refusal is the
+    // shipped behavior rather than a fixture.
+    const r = wrapper(
+      "arm",
+      "--run-id",
+      "good1",
+      "--operator-account",
+      me,
+      "--agent-account",
+      me,
+      "--agent-uid",
+      String(myUid)
+    );
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=ACCEPT");
+    expect(r.out).toContain("not on the compiled-in drill agent allowlist");
+  });
+
   it("kickstart-daemons reports a FAILED restart instead of printing OK over it", () => {
     // The reviewed verb ran `launchctl kickstart ... || true` and then printed
     // `WRAPPER=OK verb=kickstart-daemons` unconditionally. The kickstart IS
     // the verb's whole job, so its status is the verb's status. There is no
-    // Sanctuary gate daemon on a test machine, so this must fail.
-    if (skipWrapperCases()) return;
-    const r = wrapper("kickstart-daemons", "--run-id", "good1", "--operator-account", me);
+    // Sanctuary gate daemon on a test machine, so this must fail -- and it
+    // proves the agent allowlist says YES as well as no.
+    const r = agentWrapperRun(
+      "kickstart-daemons",
+      "--run-id",
+      "good1",
+      "--operator-account",
+      me,
+      "--agent-account",
+      me,
+      "--agent-uid",
+      String(myUid)
+    );
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=OK verb=kickstart-daemons");
     expect(r.out).toContain("kickstart failed for");
+    // ...and the labels it tried are the PRODUCT's, per confined uid (H3).
+    expect(r.out).toContain(`ai.sanctuaryprotocol.egress-gate.${myUid}`);
+    expect(r.out).toContain(`ai.sanctuaryprotocol.egress-gate-peer-resolver.${myUid}`);
   });
 
   it("pf-anchor-rules refuses when pfctl could not be run at all", () => {
@@ -1374,51 +1806,90 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     // an empty anchor and call it success. "Could not read" and "read, and it
     // was empty" have to be two different answers, or the stop-the-night check
     // is back to reporting CLEAN having observed nothing.
-    if (skipWrapperCases()) return;
     const r = wrapper("pf-anchor-rules", "--run-id", "good1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=OK verb=pf-anchor-rules");
-    expect(r.out).toContain("could not read the pf anchor");
+    // ...and it asks about the anchor the PRODUCT arms (H2).
+    expect(r.out).toContain("could not read the pf anchor sanctuary.egress-gate");
   });
 
   it("arm refuses without an agent account, before touching the CLI", () => {
-    if (skipWrapperCases()) return;
     const r = wrapper("arm", "--run-id", "good1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("arm requires");
   });
 
   it("repair refuses a missing CLI rather than exec-ing whatever is there", () => {
-    if (skipWrapperCases()) return;
     const r = wrapper("repair", "--run-id", "good1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("CLI not found");
   });
 
   it("unprotect refuses a missing CLI", () => {
-    if (skipWrapperCases()) return;
     const r = wrapper("unprotect", "--run-id", "good1", "--operator-account", me);
+    if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("CLI not found");
   });
 
   it("EVERY verb refuses a traversal run id before doing anything", () => {
-    if (skipWrapperCases()) return;
+    const full = wrapperFullPath();
     for (const verb of [
       "check",
       "mint",
       "clean-markers",
+      "retire",
       "gate-state",
       "kickstart-daemons",
       "arm",
       "repair",
       "unprotect",
       "pf-anchor-rules",
+      "registry-state",
+      "fortress-state",
+      "gate-log",
     ]) {
       const r = wrapper(verb, "--run-id", "../../.sanctuary", "--operator-account", me);
       expect(r.status, `${verb} accepted a traversal run id`).not.toBe(0);
       expect(r.out, `${verb} printed ACCEPT for a traversal run id`).not.toContain("WRAPPER=ACCEPT");
-      expect(r.out).toContain("run id rejected");
+      expect(r.out).toContain("WRAPPER=REJECT");
+      if (full) expect(r.out).toContain("run id rejected");
+    }
+  });
+
+  /**
+   * THE COUNT. This is the case that makes H4 impossible to reintroduce.
+   *
+   * A wrapper-level case that vanishes -- deleted, renamed out of the file, or
+   * turned back into a silent early `return` -- changes `wrapperCasesExecuted`
+   * and this goes red. And on the platform the drill actually runs on, every
+   * one of them must have taken the FULL path: forcing the hardware-less branch
+   * on a Mac drops `wrapperCasesFullPath` and this goes red too.
+   *
+   * The reviewed suite could lose all 20 of these with the count identical at
+   * 151 either way, which is precisely why `.test-baseline` could not see it.
+   *
+   * Vitest runs cases within a describe in declaration order, so this one runs
+   * last and sees the final counters.
+   */
+  it("EXECUTED every wrapper-level case, and this is the count that proves it", () => {
+    expect(
+      wrapperCasesExecuted,
+      `expected ${WRAPPER_LEVEL_CASES} wrapper-level cases to have executed; a case that ` +
+        "vanishes or returns silently is the round-3 H4 defect, and the count is how it is seen"
+    ).toBe(WRAPPER_LEVEL_CASES);
+    if (myUid !== 0 && hasHardwareIdentity) {
+      expect(
+        wrapperCasesFullPath,
+        "on a machine with a hardware identity EVERY wrapper case must take the full path"
+      ).toBe(WRAPPER_LEVEL_CASES);
+    } else {
+      expect(wrapperCasesFullPath, "on a hardware-less machine no case can take the full path").toBe(
+        0
+      );
     }
   });
 });

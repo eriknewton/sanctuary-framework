@@ -109,9 +109,70 @@ RAILS_DISPOSABLE_BASE='/private/var/sanctuary-drill'
 # build-wrapper.sh, which pins PATH to exactly this list.
 RAILS_SYSTEM_BIN_DIRS='/usr/bin /bin /usr/sbin /sbin'
 
+# The SAME list in PATH form, so the unprivileged drivers can pin their own PATH
+# from the single source of truth rather than each repeating the string. A
+# structural test asserts these two constants and the assembled wrapper's
+# hard-coded header line all agree; the header cannot use the constant because
+# it runs BEFORE lib/rails.sh is concatenated in.
+RAILS_SYSTEM_PATH='/usr/bin:/bin:/usr/sbin:/sbin'
+
 # Longest run identifier the caller may supply. A run id is NOT a path: it
 # cannot contain a slash, and the wrapper composes the path from it.
 RAILS_RUN_ID_MAX=64
+
+# How long the hardware-identity lookup may take before it is a REJECTION.
+#
+# Round-3 (Codex finding 5): every unusable `ioreg` answer failed closed except
+# one, because a HANG is not an answer at all. An unattended night whose host
+# rail hangs is a night that produced no evidence and no refusal either. A
+# timeout is a REJECT, like every other unusable lookup.
+RAILS_IOREG_TIMEOUT_SECONDS=10
+
+# ###########################################################################
+# PRODUCT-FACING IDENTIFIERS. These are the names, paths and labels of the
+# SANCTUARY PRODUCT, not of this harness, and they are the whole reason round 3
+# was UNSOUND: every one of them was wrong, so three named-defect checks
+# reported PASS/CLEAN having observed nothing, and step 0 of every iteration
+# kickstarted labels that do not exist.
+#
+# CORRECTING THE STRINGS IS THE SYMPTOM, NOT THE FIX. The fix is that
+# `server/test/drill-loop/product-identifiers.test.ts` imports the product's own
+# exports and asserts that these constants (as carried by the SHIPPED assembled
+# artifact) are derived from them. The product renames things; when it does,
+# that test goes red instead of this harness silently resuming its lying.
+#
+# Never edit one of these to "fix" a failing pin test. The pin test failing
+# means the product moved and this harness has not: follow the product.
+# ###########################################################################
+
+# `PF_ANCHOR_NAME`, server/src/egress-gate/pf-anchor.ts.
+RAILS_PRODUCT_PF_ANCHOR='sanctuary.egress-gate'
+
+# `EGRESS_GATE_DAEMON_LABEL_PREFIX`, server/src/egress-gate/gate-daemon.ts.
+# The live label is `<prefix>.<agent uid>`: one daemon per confined agent.
+RAILS_PRODUCT_GATE_LABEL_PREFIX='ai.sanctuaryprotocol.egress-gate'
+
+# `PEER_RESOLVER_DAEMON_LABEL_PREFIX`,
+# server/src/egress-gate/peer-resolver-daemon.ts. Same per-uid shape.
+RAILS_PRODUCT_RESOLVER_LABEL_PREFIX='ai.sanctuaryprotocol.egress-gate-peer-resolver'
+
+# `PF_ANCHOR_REGISTRY_PATH`, server/src/egress-gate/anchor-registry.ts.
+# ROOT-OWNED 0600 inside a 0700 directory, which is why correcting the path
+# alone does not fix the check that reads it: an unprivileged `grep` still
+# cannot read it and still lands in the "clean" branch. It is read through the
+# wrapper's `registry-state` verb, as root, and the driver distinguishes
+# read-and-empty from could-not-read.
+RAILS_PRODUCT_ANCHOR_REGISTRY='/var/db/sanctuary/egress-anchor-registry.json'
+
+# `GATE_ACCOUNT_HOME_BASE`, server/src/egress-gate/arming-wiring.ts, and
+# `GATE_ACCOUNT_NAME_PREFIX`, server/src/egress-gate/gate-account.ts. The gate
+# daemon's stdout/stderr land in `<home>/logs/egress-gate-<uid>.{out,err}.log`
+# (`egressGateDaemonLogPaths`), i.e. in the GATE SERVICE ACCOUNT's home, NOT in
+# the fortress. The harness read `<fortress>/logs/egress-gate.log`, which
+# nothing writes, so the reason-half of the probe ladder was structurally dead.
+RAILS_PRODUCT_GATE_HOME_BASE='/var/sanctuary-agents'
+RAILS_PRODUCT_GATE_ACCOUNT_PREFIX='sanctuary-gate-'
+RAILS_PRODUCT_GATE_LOG_DIR='logs'
 
 # ###########################################################################
 # HOST IDENTITY IS A HARDWARE FINGERPRINT, NOT A NAME.
@@ -178,6 +239,30 @@ RAILS_HOST_ALLOW_FP=''
 # safety rail. Matched on the aggressively normalized form.
 RAILS_HOST_DENY='eriks-macbook-air eriksmacbookair erik-macbook-air erikmbp'
 
+# ###########################################################################
+# THE AGENT PRINCIPAL, COMPILED IN.
+#
+# Round 3 (M2): this design's whole thesis is "eliminate the attacker-supplied
+# value instead of validating it", and it was applied to the storage path, the
+# CLI path, the verbs, the pf anchor and the daemon labels -- but NOT to the one
+# argument that steers WHAT ROOT DOES TO WHOM. `--agent-account` was validated
+# for shape and non-rootness and then handed to `protect --exclusive-egress`
+# running as root, so the grant holder could point a root-run exclusive-egress
+# arm at any non-root local account: pf confinement rules, a harness
+# LaunchDaemon and a gate service account provisioned against a uid the drill
+# has nothing to do with.
+#
+# So the permitted agent account(s) are compiled in, exactly the way the host
+# allowlist is, and `--agent-account` may now only SELECT from this list.
+#
+# DELIBERATELY EMPTY, for the same reason RAILS_HOST_ALLOW_FP is: no drill host
+# has been provisioned, so no drill agent account has been named. Empty means
+# every verb that takes an agent principal refuses, which is the correct
+# failure mode. Provision it in the same reviewed diff as the host fingerprint
+# (see README "Install"), space separated, and re-review: this list is the
+# entire set of principals root will act against.
+RAILS_AGENT_ACCOUNT_ALLOW=''
+
 # Fortress paths that are never disposable, checked BEFORE the allowlist so the
 # ordering matches the host rail's proven deny-first shape. The relative entries
 # are expanded against the caller's ANCHOR argument; the absolute entries cover
@@ -239,6 +324,90 @@ rails__sys() {
   "$abs" "$@"
 }
 
+# Absolute path to a command the caller's EVIDENCE depends on, or a REJECTION.
+#
+# ROUND-3 BLOCKER 1. `rails__sys` was used everywhere the privileged wrapper
+# looked at the world, and nowhere the unprivileged DRIVERS did. The drivers ran
+# bare `sudo`, `curl`, `tail` and `grep`, resolved through the operator's own
+# PATH with no sudo `secure_path` in front of them, so a planted `sudo` earlier
+# in PATH returned whatever observations the driver wanted to see: Codex
+# executed it and got a fully green probe battery and a clean teardown with no
+# real sudo, no installed wrapper, no pfctl and no agent account.
+#
+# The privileged path was hardened and the EVIDENCE path was not. This is what
+# holds the evidence path to the same standard: a driver resolves every tool its
+# conclusions rest on ONCE, up front, through this function, and then invokes
+# only the absolute result. A tool that is not in a root-owned system directory
+# is a hard refusal, never a fallback to whatever PATH offers.
+rails_require_cmd() {
+  if [ "$#" -ne 1 ]; then
+    rails__die "rails_require_cmd: expected 1 arg (command name), got $#"
+  fi
+  local name="$1" abs
+  if [ -z "$name" ]; then rails__die "rails_require_cmd: empty command name"; fi
+  if ! abs="$(rails__abs_cmd "$name")"; then
+    rails__die "required command '$name' is not present in a root-owned system directory ($RAILS_SYSTEM_BIN_DIRS); refusing rather than resolving it through PATH (fail closed)"
+  fi
+  printf '%s\n' "$abs"
+}
+
+# Run a system command by absolute path under a wall-clock deadline.
+#
+# Status 124 on expiry, the GNU `timeout` convention. macOS ships no
+# `timeout(1)` and bash 3.2 has no `wait -n`, so this is the portable shape: run
+# in the background, poll, then TERM and KILL. Output is buffered to a temp file
+# so the caller still gets it on the success path.
+#
+# The reason this exists at all is Codex round-3 finding 5: every unusable
+# `ioreg` answer failed closed EXCEPT a hang, and a rail that hangs produced
+# neither evidence nor a refusal.
+rails__sys_timeout() {
+  if [ "$#" -lt 2 ]; then
+    rails__die "rails__sys_timeout: expected <seconds> <command> [args...], got $#"
+  fi
+  local secs="$1" name="$2"
+  shift 2
+  case "$secs" in
+    ''|*[!0-9]*) rails__die "rails__sys_timeout: seconds is not numeric: '$secs'" ;;
+  esac
+  local abs out marker rc=0 pid watchdog
+  if ! abs="$(rails__abs_cmd "$name")"; then return 127; fi
+  if ! out="$(rails__sys mktemp "${TMPDIR:-/tmp}/rails-timeout.XXXXXX" 2>/dev/null)"; then
+    rails__die "rails__sys_timeout: could not create a temp file for '$name'"
+  fi
+  marker="$out.timeout"
+  "$abs" "$@" >"$out" 2>/dev/null &
+  pid=$!
+  # A WATCHDOG rather than a polling loop, so the FAST path costs nothing: the
+  # host rail runs on every single wrapper invocation, and a poll granularity
+  # coarse enough to be cheap is also coarse enough to add a second to each of
+  # them. `wait` returns the instant the command does.
+  #
+  # The watchdog's own stdout is closed off deliberately: this whole function is
+  # called inside a command substitution, and a lingering `sleep` holding the
+  # inherited pipe open would hang the caller rather than time anything out.
+  (
+    rails__sys sleep "$secs"
+    if kill -0 "$pid" 2>/dev/null; then
+      : > "$marker"
+      kill -TERM "$pid" 2>/dev/null || true
+      rails__sys sleep 1
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  ) >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$pid" || rc=$?
+  kill -TERM "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  if [ -f "$marker" ]; then
+    rails__sys rm -f -- "$out" "$marker" 2>/dev/null || true
+    return 124
+  fi
+  rails__sys cat -- "$out" 2>/dev/null || true
+  rails__sys rm -f -- "$out" "$marker" 2>/dev/null || true
+  return "$rc"
+}
+
 # Effective uid of THIS process, read through the absolute resolver.
 rails__euid() {
   rails__sys id -u 2>/dev/null || printf ''
@@ -250,9 +419,45 @@ rails__resolve_dir() {
   ( CDPATH='' cd -P -- "$1" >/dev/null 2>&1 && pwd -P ) || return 1
 }
 
-# Octal file mode, GNU stat then BSD stat. Returns nonzero if neither works.
+# Octal file mode INCLUDING the setuid/setgid/STICKY bits. GNU stat, then BSD.
+#
+# ROUND-3 L2. The BSD branch used to read `%Lp`, which drops the high bits:
+# measured on this Mac, `/private/tmp` is `%Lp=777` while its real mode is
+# `1777`. So `8#$mode & 8#1000` was ALWAYS zero on macOS and the sticky-bit
+# carve-out in `rails_assert_trusted_component` -- documented as "what makes
+# /tmp safe as a path component" -- could never fire on the platform the drill
+# actually runs on. A security predicate that behaves differently on macOS and
+# Linux while being documented as if it worked on both is a defect even when it
+# fails in the safe direction.
+#
+# `%Op` is the FULL `st_mode` in octal, file-type bits included (`41777` for a
+# sticky directory, `100644` for a regular file). The permission word is the low
+# TWELVE bits, i.e. the last FOUR octal digits, so that is what is taken.
+# Concatenating `%Mp%Lp` is NOT equivalent: `%Lp` is not zero-padded (mode 0007
+# prints as `7`), so mode 1007 would concatenate to `17`.
+#
+# STATED PLAINLY, because it is a LOOSENING on macOS and should be reviewed as
+# one: with the sticky bit now visible, a world-writable STICKY component is
+# accepted on macOS where it used to be refused, which is what Linux has always
+# done. The reviewer's two options were "read %Op" or "delete the carve-out";
+# the carve-out cannot be deleted because it is load-bearing on Linux CI, where
+# `$TMPDIR` is unset and the batteries run under a 1777 `/tmp`. What contains
+# the loosening is that `RAILS_DISPOSABLE_BASE` is a COMPILED-IN constant whose
+# shipped value is asserted structurally, so no caller can aim the chain at
+# `/private/tmp` in the first place. A mode reader that misreports the mode is
+# wrong whichever direction it errs in.
 rails__stat_mode() {
-  rails__sys stat -c '%a' "$1" 2>/dev/null || rails__sys stat -f '%Lp' "$1" 2>/dev/null || return 1
+  local m
+  if m="$(rails__sys stat -c '%a' "$1" 2>/dev/null)"; then
+    printf '%s' "$m"
+    return 0
+  fi
+  if m="$(rails__sys stat -f '%Op' "$1" 2>/dev/null)"; then
+    if [ "${#m}" -gt 4 ]; then m="${m#"${m%????}"}"; fi
+    printf '%s' "$m"
+    return 0
+  fi
+  return 1
 }
 
 # Numeric owner uid, GNU stat then BSD stat.
@@ -418,14 +623,145 @@ rails_assert_run_id() {
   if [ "${#id}" -gt "$RAILS_RUN_ID_MAX" ]; then
     rails__die "run id longer than $RAILS_RUN_ID_MAX characters: $id"
   fi
+  # LOWERCASE ONLY, and the reason is the filesystem rather than taste.
+  #
+  # ROUND-3 MED (both lenses): the drill hosts are Macs, whose default APFS
+  # volume is CASE-INSENSITIVE. `A` and `a` were two accepted, distinct run ids
+  # that derive to two distinct path STRINGS naming ONE directory entry, so two
+  # runs could operate on one disposable fortress and one evidence identity
+  # while every rail said they were separate. Codex reproduced it.
+  #
+  # Rejected rather than silently folded: the evidence must show the exact id
+  # the caller supplied, and a rail that quietly rewrites its input is a rail
+  # whose output nobody can reason about.
   case "$id" in
-    *[!A-Za-z0-9._-]*) rails__die "run id contains disallowed characters: $id" ;;
+    *[!a-z0-9._-]*) rails__die "run id contains disallowed characters (lowercase a-z, 0-9, dot, underscore and dash only; the drill hosts' filesystem is case-insensitive, so an uppercase id would alias a lowercase one): $id" ;;
   esac
   # A leading dot or dash would let a run id read as `.`, `..` or an option.
   case "$id" in
-    [!A-Za-z0-9]*) rails__die "run id must start with a letter or a digit: $id" ;;
+    [!a-z0-9]*) rails__die "run id must start with a lowercase letter or a digit: $id" ;;
   esac
   printf '%s\n' "$id"
+}
+
+# ---------------------------------------------------------------------------
+# PRODUCT-FACING IDENTIFIER COMPOSERS
+# ---------------------------------------------------------------------------
+#
+# The product's daemon labels are PER AGENT UID (`<prefix>.<uid>`), which is why
+# no substitution of the harness's old reverse-DNS prefix could ever have fixed
+# them: the uid suffix was missing too, and the verb that used them had no
+# `--agent-uid` in its call path at all.
+
+rails__assert_agent_uid_shape() {
+  local label="$1" uid="$2"
+  case "$uid" in
+    ''|*[!0-9]*) rails__die "$label: agent uid is not a plain non-negative integer: '$uid'" ;;
+  esac
+  if [ "$uid" -eq 0 ]; then rails__die "$label: agent uid 0; refusing"; fi
+}
+
+# `egressGateDaemonLabel(uid)`, server/src/egress-gate/gate-daemon.ts.
+rails_product_gate_label() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_product_gate_label: expected 1 arg (agent uid), got $#"; fi
+  rails__assert_agent_uid_shape 'gate daemon label' "$1"
+  printf '%s.%s\n' "$RAILS_PRODUCT_GATE_LABEL_PREFIX" "$1"
+}
+
+# `peerResolverDaemonLabel(uid)`, server/src/egress-gate/peer-resolver-daemon.ts.
+rails_product_resolver_label() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_product_resolver_label: expected 1 arg (agent uid), got $#"; fi
+  rails__assert_agent_uid_shape 'peer-resolver daemon label' "$1"
+  printf '%s.%s\n' "$RAILS_PRODUCT_RESOLVER_LABEL_PREFIX" "$1"
+}
+
+# Both labels, space separated, in the order the wrapper restarts them.
+rails_product_daemon_labels() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_product_daemon_labels: expected 1 arg (agent uid), got $#"; fi
+  local gate resolver
+  gate="$(rails_product_gate_label "$1")" || rails__die "gate label rejected for uid $1"
+  resolver="$(rails_product_resolver_label "$1")" || rails__die "resolver label rejected for uid $1"
+  printf '%s %s\n' "$gate" "$resolver"
+}
+
+# ---------------------------------------------------------------------------
+# THE AGENT PRINCIPAL ALLOWLIST (round-3 M2)
+# ---------------------------------------------------------------------------
+#
+# Compiled in, deny-by-default, and PURE in the same way the fingerprint
+# decision is: value in, list in, verdict out, so the ACCEPT path is testable
+# even though the shipped list is empty. Production passes
+# `$RAILS_AGENT_ACCOUNT_ALLOW` and nothing else; there is no flag, argument or
+# environment variable anywhere in this harness that reaches the list.
+rails_assert_agent_account_against() {
+  if [ "$#" -ne 2 ]; then
+    rails__die "rails_assert_agent_account_against: expected 2 args (account, allowlist), got $#"
+  fi
+  local acct="$1" allow="$2" e
+  if [ -z "$acct" ]; then rails__die "empty agent account; refusing (fail closed)"; fi
+  if [ -z "$allow" ]; then
+    rails__die "the drill AGENT-ACCOUNT allowlist is EMPTY, so root will act for no agent principal; name the drill agent account in RAILS_AGENT_ACCOUNT_ALLOW alongside the host fingerprint (refusing, fail closed)"
+  fi
+  for e in $allow; do
+    if [ "$acct" = "$e" ]; then return 0; fi
+  done
+  rails__die "agent account '$acct' is not on the compiled-in drill agent allowlist; refusing to point a root-run exclusive-egress arm at an account this drill was not provisioned for (fail closed)"
+}
+
+# The production chokepoint: shape rail first, then the compiled-in allowlist.
+rails_assert_agent_account_allowed() {
+  if [ "$#" -ne 1 ]; then
+    rails__die "rails_assert_agent_account_allowed: expected 1 arg (account), got $#"
+  fi
+  rails_assert_agent_account_against "$1" "$RAILS_AGENT_ACCOUNT_ALLOW"
+}
+
+# ---------------------------------------------------------------------------
+# THE AGGREGATION RULE: A SKIP CAN NEVER BECOME A PASS (round-3, Codex #2)
+# ---------------------------------------------------------------------------
+#
+# `run-probe-battery.sh` reported `N3 SKIP`, left its failure count at zero,
+# exited 0, and `run-loop.sh` wrote `"result":"PASS"` for the whole probe step
+# into FINDINGS.jsonl. A declared negative probe that never observed the reason
+# it exists to prove, banked as a pass. That is the 2026-07-24 false-green class
+# with a machine doing the summarizing.
+#
+# So the fold is a PURE FUNCTION here rather than an `if` in the loop, for the
+# same reason `rails_assert_nonroot_uid` and `rails_assert_fingerprint_against`
+# are: it can then be driven exhaustively over every (status, summary) pair,
+# including the pairs a live night would take weeks to produce.
+#
+# TWO INDEPENDENT SIGNALS MUST AGREE before this says PASS: the battery's exit
+# status must be 0 AND its own summary line must say `verified=yes`. Either one
+# alone would be a single point of failure, and not having one of those is this
+# harness's entire subject. Anything else is UNVERIFIED or FAIL.
+#
+#   rails_probe_result <exit-status> <summary-line>  ->  PASS | UNVERIFIED | FAIL
+rails_probe_result() {
+  if [ "$#" -ne 2 ]; then
+    rails__die "rails_probe_result: expected 2 args (status, summary), got $#"
+  fi
+  local rc="$1" summary="$2"
+  case "$rc" in
+    ''|*[!0-9]*) rails__die "rails_probe_result: status is not numeric: '$rc'" ;;
+  esac
+  # A missing or unparseable summary is UNVERIFIED, never PASS: a battery that
+  # did not say what it measured has not been read.
+  case "$summary" in
+    *'verified=no'*)  printf 'UNVERIFIED\n'; return 0 ;;
+    *'verified=yes'*) ;;
+    *)                printf 'UNVERIFIED\n'; return 0 ;;
+  esac
+  # Belt: a summary claiming `verified=yes` while NAMING skipped probes is
+  # self-contradictory, and the safe reading of a contradiction is the
+  # unverified one. `skipped=` is the summary's last field, so anything after it
+  # is a non-empty skip list.
+  case "$summary" in
+    *'skipped='?*) printf 'UNVERIFIED\n'; return 0 ;;
+  esac
+  if [ "$rc" -eq 0 ]; then printf 'PASS\n'; return 0; fi
+  if [ "$rc" -eq 3 ]; then printf 'UNVERIFIED\n'; return 0; fi
+  printf 'FAIL\n'
 }
 
 # Compose the disposable fortress path. PURE: it validates and prints, it never
@@ -757,8 +1093,11 @@ rails_assert_disposable_storage() {
     "$RAILS_DISPOSABLE_PREFIX"?*) ;;
     *) rails__die "basename is not a disposable loop fortress (${RAILS_DISPOSABLE_PREFIX}<stamp>): $base" ;;
   esac
+  # Lowercase only, for the same case-insensitive-APFS reason the run id is:
+  # `.sanctuary-loop-A` and `.sanctuary-loop-a` are two strings and one
+  # directory entry on the drill hosts.
   case "$base" in
-    *[!A-Za-z0-9._-]*) rails__die "basename contains disallowed characters: $base" ;;
+    *[!a-z0-9._-]*) rails__die "basename contains disallowed characters (lowercase only; the drill hosts' filesystem is case-insensitive): $base" ;;
   esac
 
   # R2: never follow an operator-writable symlink as root. `-L` is an lstat, so
@@ -915,8 +1254,13 @@ rails_assert_fingerprint_against() {
 # Prints a 64-character lowercase hex fingerprint, or dies. There is no
 # "unknown" return value: this rail has no third answer.
 rails_host_fingerprint_local() {
-  local out uuid
-  out="$(rails__sys ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null || printf '')"
+  local out uuid rc=0
+  # BOUNDED. A hang is not an answer, and an unattended host rail that hangs
+  # produces neither evidence nor a refusal (Codex round-3 finding 5).
+  out="$(rails__sys_timeout "$RAILS_IOREG_TIMEOUT_SECONDS" ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    rails__die "reading this machine's hardware identity TIMED OUT after ${RAILS_IOREG_TIMEOUT_SECONDS}s (ioreg did not answer); refusing (fail closed)"
+  fi
   if [ -z "$out" ]; then
     rails__die "cannot read this machine's hardware identity (ioreg produced nothing); refusing (fail closed)"
   fi

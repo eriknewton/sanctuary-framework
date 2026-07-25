@@ -36,8 +36,10 @@ set agent_uid     [lindex $argv 4]
 # Refuse outright rather than pass a suspicious value through to a root-run
 # wrapper. The wrapper would reject these too; failing here makes the loop log
 # say which layer noticed.
-if {![regexp {^[A-Za-z0-9][A-Za-z0-9._-]*$} $run_id]} {
-    puts "arm-expect.exp: run id is not a plain identifier: $run_id"
+# Lowercase only, matching rails_assert_run_id: the drill hosts' APFS volume is
+# case-insensitive, so `A` and `a` are two ids and one directory.
+if {![regexp {^[a-z0-9][a-z0-9._-]*$} $run_id]} {
+    puts "arm-expect.exp: run id is not a plain lowercase identifier: $run_id"
     exit 2
 }
 if {![regexp {^[a-z_][a-z0-9_-]*$} $operator] || $operator eq "root"} {
@@ -63,9 +65,18 @@ spawn sudo -n $wrapper arm \
     --agent-account $agent_account \
     --agent-uid $agent_uid
 
+# ANCHORED TO THE WRAPPER'S OWN TOKENS (round-3 L4). This used to match
+# `(?i)refusing`, so ANY benign product line containing the word "refusing"
+# mid-arm aborted the leg -- and aborted it by `exit 1` without waiting, leaving
+# the spawned `sudo` child running. The wrapper emits exactly two refusal
+# shapes and they are both machine tokens, so those are what this matches.
 expect {
-    -re {(?i)refusing|WRAPPER=REJECT} {
+    -re {WRAPPER=REJECT|RAILS_REJECT:} {
         puts "\narm-expect.exp: the wrapper refused; not answering any prompt"
+        exit 1
+    }
+    -re {sudo: a password is required|sudo: no tty present} {
+        puts "\narm-expect.exp: the NOPASSWD grant for the wrapper is missing; failing fast rather than burning the night at a prompt"
         exit 1
     }
     -re {(?i)type .?ARM.? to confirm} {

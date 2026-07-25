@@ -11,13 +11,30 @@
 #   * the exclusive-routing marker is gone
 #   * no lock files are left behind, and in particular no zero-length ones
 #   * the agent uid is unconfined again
+#   * and the disposable fortress itself is retired
 #
 # A CHECK THAT COULD NOT OBSERVE IS NOT A CLEAN CHECK. The reviewed build did
 # `rules="$(sudo -n pfctl ... || printf '')"` and read the empty string as
 # CLEAN, while the README said plainly that the pfctl grant does not exist. On
 # the first unattended night that check would have reported CLEAN having
-# observed nothing at all. Every observation below now fails CLOSED when it
-# cannot be made, and says which one it was.
+# observed nothing at all.
+#
+# ROUND 3 FOUND THAT RULE APPLIED IN TWO PLACES AND MISSED IN THREE. Every check
+# below is now explicitly TRI-STATE:
+#
+#   OBSERVED-CLEAN     the observation was made and it was clean
+#   OBSERVED-DIRTY     the observation was made and state was left behind
+#   COULD-NOT-OBSERVE  the observation could not be made at all
+#
+# The third is a HARD FAILURE and is never folded into either of the others. It
+# is reported as `VERIFY=UNOBSERVED`, which is a distinct token from
+# `VERIFY=DIRTY`, so a reader can tell "the host is dirty" from "this harness is
+# blind" -- two very different mornings.
+#
+# The registry and the in-fortress marker/lock reads now go through ROOT wrapper
+# verbs (`registry-state`, `fortress-state`), because the things they look at
+# are root-owned 0600/0700 and an unprivileged read of them returns exactly what
+# "clean" used to look like.
 #
 # A failure here is one of the loop's TWO stop-the-night exceptions. Continuing
 # past a dirty teardown wedges the host and every later iteration is born
@@ -25,7 +42,9 @@
 #
 # Usage: teardown-verify.sh --run-id <id> --operator-account <a>
 #          --agent-account <a> --agent-uid <n> --evidence-dir <d> [--base <dir>]
-# Exit:  0 torn down and verified clean; 1 dirty (STOP THE NIGHT); 2 usage
+#          [--no-retire]
+# Exit:  0 torn down and verified clean; 1 dirty or unobservable (STOP THE
+#        NIGHT); 2 usage
 
 set -euo pipefail
 
@@ -41,6 +60,17 @@ die() {
   exit 2
 }
 
+# ROUND-3 BLOCKER 1. See the long note in run-probe-battery.sh: a planted `sudo`
+# earlier in PATH produced a completely clean teardown verdict for a teardown
+# that never happened. Every tool this file's verdict rests on is resolved once,
+# absolutely, and PATH is pinned as a belt rather than as the defense.
+PATH="$RAILS_SYSTEM_PATH"
+export PATH
+SUDO="$(rails_require_cmd sudo)" || die 'sudo is not in a root-owned system directory; refusing to verify a teardown through an unresolvable tool'
+CURL="$(rails_require_cmd curl)" || die 'curl is not in a root-owned system directory'
+GREP="$(rails_require_cmd grep)" || die 'grep is not in a root-owned system directory'
+MKDIR="$(rails_require_cmd mkdir)" || die 'mkdir is not in a root-owned system directory'
+
 RUN_ID=''
 OPERATOR=''
 AGENT=''
@@ -50,6 +80,7 @@ EVIDENCE=''
 # wrapper takes no base argument, so a --base here cannot redirect anything
 # that runs as root. It exists so the batteries can drive this file end to end.
 BASE="$RAILS_DISPOSABLE_BASE"
+RETIRE='yes'
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -59,13 +90,14 @@ while [ "$#" -gt 0 ]; do
     --agent-uid)        AGENT_UID_IN="${2:-}"; shift 2 ;;
     --evidence-dir)     EVIDENCE="${2:-}"; shift 2 ;;
     --base)             BASE="${2:-}"; shift 2 ;;
+    --no-retire)        RETIRE=''; shift ;;
     *) die "unknown argument: $1" ;;
   esac
 done
 
 [ -n "$EVIDENCE" ] || die '--evidence-dir is required'
 [ -n "$RUN_ID" ] || die '--run-id is required'
-mkdir -p "$EVIDENCE"
+"$MKDIR" -p "$EVIDENCE"
 
 OPERATOR_UID="$(rails_assert_non_root_account operator "$OPERATOR")" \
   || die "operator account rejected: $OPERATOR"
@@ -82,55 +114,68 @@ STORAGE="$(rails_assert_disposable_storage "$ANCHOR" "$DERIVED")" \
 
 LOG="$EVIDENCE/teardown.log"
 
-safe_under_storage() {
-  rails_assert_safe_subpath "$STORAGE" "$1" || die "unsafe path under the storage directory: $1"
-}
-
-# Can this process see inside the fortress at all? The marker and lock checks
-# below read ABSENCE as CLEAN, and a directory this process cannot traverse
-# looks exactly like a directory with nothing left in it.
-#
-# Live concern, not hypothetical: `tightenStoragePermissions` chmods the whole
-# fortress to 0700 on every server start, and the disposable fortress is
-# ROOT-owned (BLOCKER 1's fix). So after the first arm this unprivileged driver
-# cannot read into it, and "the markers are gone" would be a conclusion drawn
-# from not being allowed to look. Reading these through a wrapper verb is the
-# real fix and is named as an open item in the README; refusing to call it
-# clean is the correct behavior until then.
-storage_observable() {
-  if [ ! -d "$STORAGE" ]; then return 1; fi
-  if [ ! -r "$STORAGE" ]; then return 1; fi
-  if [ ! -x "$STORAGE" ]; then return 1; fi
-  return 0
-}
-
 # --- tear down ------------------------------------------------------------
 TEARDOWN_RC=0
-sudo -n "$WRAPPER" unprotect \
+"$SUDO" -n "$WRAPPER" unprotect \
   --run-id "$RUN_ID" --operator-account "$OPERATOR" \
   --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
   >> "$LOG" 2>&1 || TEARDOWN_RC=$?
 printf 'TEARDOWN rc=%s\n' "$TEARDOWN_RC"
 
 CLEAN_MARKERS_RC=0
-sudo -n "$WRAPPER" clean-markers \
+"$SUDO" -n "$WRAPPER" clean-markers \
   --run-id "$RUN_ID" --operator-account "$OPERATOR" \
   >> "$LOG" 2>&1 || CLEAN_MARKERS_RC=$?
 printf 'CLEAN_MARKERS rc=%s\n' "$CLEAN_MARKERS_RC"
 
 # --- verify OBSERVED state, whatever the teardown claimed -----------------
+#
+# THREE verdicts, and the third one is the round-3 fix. `clean_unobserved` is
+# NOT `clean_fail` with a different message: it is a distinct token so the
+# morning can tell "the host is dirty" from "this harness is blind", and it is
+# counted separately so neither number can be read as the other. Both stop the
+# night; only one of them means there is state to clean up.
 DIRTY=0
+UNOBSERVED=0
 clean_pass() { printf 'VERIFY=CLEAN check=%s %s\n' "$1" "${2:-}"; }
 clean_fail() {
   printf 'VERIFY=DIRTY check=%s reason=%s\n' "$1" "$2"
   DIRTY=$((DIRTY + 1))
 }
+clean_unobserved() {
+  printf 'VERIFY=UNOBSERVED check=%s reason=%s\n' "$1" "$2"
+  UNOBSERVED=$((UNOBSERVED + 1))
+}
 
-registry='/Library/Application Support/Sanctuary/egress-gate/registry.json'
-if [ -f "$registry" ] && rails__sys grep -q -- "$STORAGE" "$registry" 2>/dev/null; then
-  clean_fail registry "registry still references $STORAGE"
+# --- the pf-anchor REGISTRY, read as root ---------------------------------
+#
+# ROUND-3 H1 / Codex finding 3, and this is the one where correcting the path
+# alone would have made things look worse and be no better. The reviewed code
+# was
+#
+#   if [ -f "$registry" ] && grep -q -- "$STORAGE" "$registry" 2>/dev/null
+#   then dirty; else CLEAN; fi
+#
+# against `/Library/Application Support/Sanctuary/egress-gate/registry.json`,
+# which appears NOWHERE in server/src. The product's registry is
+# `/var/db/sanctuary/egress-anchor-registry.json`, root-owned 0600 inside a 0700
+# directory -- so with the path corrected, an unprivileged `grep` returns 2 and
+# the SAME `else` branch still prints CLEAN. "no match", "cannot read" and "not
+# there" were one verdict, and two of the three are not clean.
+REGISTRY_RC=0
+registry_out="$("$SUDO" -n "$WRAPPER" registry-state \
+  --run-id "$RUN_ID" --operator-account "$OPERATOR" 2>&1)" || REGISTRY_RC=$?
+printf 'registry read rc=%s:\n%s\n' "$REGISTRY_RC" "$registry_out" >> "$LOG"
+if [ "$REGISTRY_RC" -ne 0 ]; then
+  clean_unobserved registry "could not READ the pf-anchor registry (rc=$REGISTRY_RC); an unread registry is not a clean registry"
+elif printf '%s\n' "$registry_out" | "$GREP" -q '^WRAPPER=REGISTRY-ABSENT'; then
+  clean_pass registry 'no registry file on this host'
+elif printf '%s\n' "$registry_out" | "$GREP" -q -F -- "$STORAGE"; then
+  clean_fail registry "the registry still references $STORAGE"
+elif printf '%s\n' "$registry_out" | "$GREP" -q '^WRAPPER=REGISTRY-END'; then
+  clean_pass registry 'read, and it does not reference this fortress'
 else
-  clean_pass registry
+  clean_unobserved registry 'the registry-state verb exited 0 without a REGISTRY-END marker; the read cannot be trusted'
 fi
 
 # THE FAIL-OPEN THAT WAS. This goes through a wrapper verb, which the NOPASSWD
@@ -138,11 +183,11 @@ fi
 # when pfctl itself could not run, so "refused", "errored" and "empty anchor"
 # are three different answers instead of one empty string.
 ANCHOR_RC=0
-anchor_out="$(sudo -n "$WRAPPER" pf-anchor-rules \
+anchor_out="$("$SUDO" -n "$WRAPPER" pf-anchor-rules \
   --run-id "$RUN_ID" --operator-account "$OPERATOR" 2>&1)" || ANCHOR_RC=$?
 printf 'pf anchor read rc=%s:\n%s\n' "$ANCHOR_RC" "$anchor_out" >> "$LOG"
 if [ "$ANCHOR_RC" -ne 0 ]; then
-  clean_fail pf-anchor "could not READ the pf anchor (rc=$ANCHOR_RC); a check that observed nothing is not a clean verdict"
+  clean_unobserved pf-anchor "could not READ the pf anchor (rc=$ANCHOR_RC); a check that observed nothing is not a clean verdict"
 else
   anchor_rules="$(printf '%s\n' "$anchor_out" \
     | rails__sys sed -n '/WRAPPER=PF-ANCHOR-BEGIN/,/WRAPPER=PF-ANCHOR-END/p' \
@@ -154,43 +199,62 @@ else
   fi
 fi
 
-if storage_observable; then
-  clean_pass storage-observable "$STORAGE"
+# --- the fortress's own marker and lock files, read AS ROOT ----------------
+#
+# The unprivileged version of this could not be made to work, and saying so was
+# the previous round's honest stopgap. `tightenStoragePermissions` chmods the
+# fortress to 0700 on every server start and the fortress is root-owned, so from
+# the first arm onward this process cannot look inside it at all. Absence and
+# not-allowed-to-look are the same observation from here, and absence is what
+# these checks call clean.
+#
+# Root can look. `fortress-state` names a state for every entry, and there is no
+# state that means "I did not look" -- an entry the verb could not classify
+# makes the verb fail, and a verb that failed is UNOBSERVED here.
+FORTRESS_RC=0
+fortress_out="$("$SUDO" -n "$WRAPPER" fortress-state \
+  --run-id "$RUN_ID" --operator-account "$OPERATOR" 2>&1)" || FORTRESS_RC=$?
+printf 'fortress-state rc=%s:\n%s\n' "$FORTRESS_RC" "$fortress_out" >> "$LOG"
 
-  # The mandatory call-site form here too: `safe_under_storage` dies inside the
-  # command substitution, so without the `||` the abort would depend on
-  # `set -e` alone. That is the round-1 silhouette and this codebase does not
-  # rely on it.
-  marker="$(safe_under_storage 'exclusive-routing.json')" \
-    || die 'safe-subpath rail rejected exclusive-routing.json'
-  [ -n "$marker" ] || die 'empty path after the safe-subpath rail'
-  if [ -e "$marker" ]; then
-    clean_fail marker 'exclusive-routing.json survived teardown'
-  else
-    clean_pass marker
-  fi
+fortress_entry_state() {
+  local line
+  line="$(printf '%s\n' "$fortress_out" | "$GREP" -m1 "^FORTRESS entry=$1 state=" || printf '')"
+  if [ -z "$line" ]; then printf ''; return 0; fi
+  printf '%s' "${line##*state=}"
+}
+
+if [ "$FORTRESS_RC" -ne 0 ]; then
+  # ONE unobserved finding, not three clean ones.
+  clean_unobserved fortress-state "could not READ the disposable fortress through the wrapper (rc=$FORTRESS_RC); the marker and lock checks CANNOT be made, and their absence-means-clean logic would report CLEAN having observed nothing"
+elif ! printf '%s\n' "$fortress_out" | "$GREP" -q '^WRAPPER=FORTRESS-END'; then
+  clean_unobserved fortress-state 'the fortress-state verb exited 0 without a FORTRESS-END marker; the read cannot be trusted'
+else
+  clean_pass fortress-state "$STORAGE"
+
+  marker_state="$(fortress_entry_state 'exclusive-routing.json')"
+  case "$marker_state" in
+    absent)  clean_pass marker ;;
+    '')      clean_unobserved marker 'the fortress read carried no state for exclusive-routing.json' ;;
+    *)       clean_fail marker "exclusive-routing.json survived teardown (state=$marker_state)" ;;
+  esac
 
   left_locks=''
+  unread_locks=''
   for rel in 'state/_audit/.audit-write.lock' 'state/.provision.lock'; do
-    lock="$(safe_under_storage "$rel")" || die "safe-subpath rail rejected: $rel"
-    [ -n "$lock" ] || die "empty path after the safe-subpath rail: $rel"
-    if [ -e "$lock" ]; then left_locks="$left_locks $lock"; fi
+    lock_state="$(fortress_entry_state "$rel")"
+    case "$lock_state" in
+      absent) ;;
+      '')     unread_locks="$unread_locks $rel" ;;
+      *)      left_locks="$left_locks $rel(state=$lock_state)" ;;
+    esac
   done
-  if [ -n "$left_locks" ]; then
+  if [ -n "$unread_locks" ]; then
+    clean_unobserved locks "the fortress read carried no state for:$unread_locks"
+  elif [ -n "$left_locks" ]; then
     clean_fail locks "lock file(s) survived teardown:$left_locks"
   else
     clean_pass locks
   fi
-elif [ ! -d "$STORAGE" ]; then
-  # A teardown that removed the whole disposable fortress is a clean outcome,
-  # and there is genuinely nothing left to observe inside it.
-  clean_pass storage-observable "$STORAGE is gone"
-  clean_pass marker 'the whole disposable fortress is gone'
-  clean_pass locks 'the whole disposable fortress is gone'
-else
-  # ONE dirty finding, not two clean ones. An unreadable fortress makes the
-  # marker and lock checks meaningless, and "absent" is what they call clean.
-  clean_fail storage-observable "cannot read into $STORAGE as $(rails__sys id -un); the marker and lock checks CANNOT be made, and their absence-means-clean logic would report CLEAN having observed nothing"
 fi
 
 # The agent uid must be free again. A teardown that leaves the agent confined
@@ -203,11 +267,11 @@ fi
 # observation that could not be made, not as a confined agent and not as a
 # clean one.
 AGENT_PROBE_RC=0
-agent_code="$(sudo -n -u "$AGENT" curl -sS -o /dev/null -w '%{http_code}' \
+agent_code="$("$SUDO" -n -u "$AGENT" "$CURL" -sS -o /dev/null -w '%{http_code}' \
   --max-time 15 --connect-timeout 8 https://example.com 2>>"$LOG")" || AGENT_PROBE_RC=$?
 printf 'post-teardown agent status=%s probe_rc=%s\n' "${agent_code:-<none>}" "$AGENT_PROBE_RC" >> "$LOG"
 if [ "$AGENT_PROBE_RC" -ne 0 ] && [ -z "$agent_code" ]; then
-  clean_fail agent-unconfined "could not RUN the as-agent probe (sudo -n -u $AGENT rc=$AGENT_PROBE_RC); the grant for it does not exist, so this check observed nothing"
+  clean_unobserved agent-unconfined "could not RUN the as-agent probe (sudo -n -u $AGENT rc=$AGENT_PROBE_RC); the grant for it does not exist, so this check observed nothing"
 else
   case "$agent_code" in
     2*|3*) clean_pass agent-unconfined "agent uid $AGENT_UID reaches the network again" ;;
@@ -215,7 +279,33 @@ else
   esac
 fi
 
-printf 'VERIFY=SUMMARY dirty=%s teardown_rc=%s clean_markers_rc=%s operator_uid=%s\n' \
-  "$DIRTY" "$TEARDOWN_RC" "$CLEAN_MARKERS_RC" "$OPERATOR_UID"
+# --- retire the disposable fortress ---------------------------------------
+#
+# ROUND-3 M1: nothing removed these, ever, while the README said the loop "tears
+# it down each night". That is unbounded accumulation of root-owned directories
+# under the base, one per iteration forever. Retirement runs LAST, after every
+# observation has been made, so it can never destroy the evidence the checks
+# above are drawing their verdicts from.
+RETIRE_RC=0
+if [ -n "$RETIRE" ]; then
+  "$SUDO" -n "$WRAPPER" retire \
+    --run-id "$RUN_ID" --operator-account "$OPERATOR" \
+    >> "$LOG" 2>&1 || RETIRE_RC=$?
+  if [ "$RETIRE_RC" -eq 0 ]; then
+    clean_pass retire "$STORAGE removed"
+  else
+    clean_fail retire "the disposable fortress could not be retired (rc=$RETIRE_RC); root-owned directories would accumulate under $BASE"
+  fi
+else
+  printf 'VERIFY=SKIPPED check=retire reason=--no-retire was passed\n'
+fi
 
-if [ "$DIRTY" -ne 0 ] || [ "$TEARDOWN_RC" -ne 0 ] || [ "$CLEAN_MARKERS_RC" -ne 0 ]; then exit 1; fi
+printf 'VERIFY=SUMMARY dirty=%s unobserved=%s teardown_rc=%s clean_markers_rc=%s retire_rc=%s operator_uid=%s\n' \
+  "$DIRTY" "$UNOBSERVED" "$TEARDOWN_RC" "$CLEAN_MARKERS_RC" "$RETIRE_RC" "$OPERATOR_UID"
+
+# UNOBSERVED stops the night exactly as hard as DIRTY. The whole subject of this
+# file is that they are different facts, not that one of them is survivable.
+if [ "$DIRTY" -ne 0 ] || [ "$UNOBSERVED" -ne 0 ] \
+   || [ "$TEARDOWN_RC" -ne 0 ] || [ "$CLEAN_MARKERS_RC" -ne 0 ] || [ "$RETIRE_RC" -ne 0 ]; then
+  exit 1
+fi

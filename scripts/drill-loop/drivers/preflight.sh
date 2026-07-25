@@ -22,8 +22,17 @@
 # A preflight failure is a FINDING: captured, iteration aborted cleanly, loop
 # continues. It is not a crash and it is not silent.
 #
+# AND A CHECK THAT COULD NOT OBSERVE IS A FAILING CHECK, NEVER A PASSING ONE.
+# Round 3 found three checks in this file reporting PASS having measured nothing:
+# `orphan-registry` looked at a path the product does not use and read
+# "not found" as "not there"; `plist-absolute-node` passed when the plists whose
+# whole content it screens were ABSENT; and the marker/lock checks read a
+# fortress this process is not allowed to look inside. The registry and the
+# fortress are now read through ROOT wrapper verbs, and an absent input set is a
+# FAILURE rather than an empty success.
+#
 # Usage: preflight.sh --run-id <id> --operator-account <a> --build-sha <sha>
-#          [--agent-uid <n>] [--base <dir>]
+#          --agent-account <a> --agent-uid <n> [--base <dir>]
 # Exit:  0 all checks passed
 #        1 one or more checks failed (details on stdout, machine-readable)
 
@@ -35,14 +44,25 @@ REPO="$(CDPATH='' cd -P -- "$ROOT/../.." && pwd -P)"
 # shellcheck source=../lib/rails.sh
 . "$ROOT/lib/rails.sh"
 
+WRAPPER='/usr/local/sbin/sanctuary-drill-wrapper'
+
 die() {
   printf 'preflight: %s\n' "$*" >&2
   exit 2
 }
 
+# ROUND-3 BLOCKER 1. See the long note in run-probe-battery.sh. This file's
+# entire output is observations, so every tool it observes through is resolved
+# absolutely, once, and PATH is pinned as a belt rather than as the defense.
+PATH="$RAILS_SYSTEM_PATH"
+export PATH
+SUDO="$(rails_require_cmd sudo)" || die 'sudo is not in a root-owned system directory; refusing to preflight through an unresolvable tool'
+GREP="$(rails_require_cmd grep)" || die 'grep is not in a root-owned system directory'
+
 RUN_ID=''
 OPERATOR=''
 BUILD_SHA=''
+AGENT=''
 AGENT_UID=''
 # WHY THIS DRIVER ACCEPTS --base AND THE ROOT WRAPPER DOES NOT.
 #
@@ -60,6 +80,7 @@ while [ "$#" -gt 0 ]; do
     --run-id)           RUN_ID="${2:-}"; shift 2 ;;
     --operator-account) OPERATOR="${2:-}"; shift 2 ;;
     --build-sha)        BUILD_SHA="${2:-}"; shift 2 ;;
+    --agent-account)    AGENT="${2:-}"; shift 2 ;;
     --agent-uid)        AGENT_UID="${2:-}"; shift 2 ;;
     --base)             BASE="${2:-}"; shift 2 ;;
     *) die "unknown argument: $1" ;;
@@ -68,6 +89,11 @@ done
 
 [ -n "$RUN_ID" ] || die '--run-id is required'
 [ -n "$OPERATOR" ] || die '--operator-account is required'
+# The daemon labels and the plist paths this file screens are PER AGENT UID, so
+# without one there is nothing to look at and the D7/D9 checks would pass by
+# examining an empty set. That is the round-3 class; it is a usage error here.
+[ -n "$AGENT_UID" ] || die '--agent-uid is required: every daemon label and plist path this file checks is per confined uid'
+[ -n "$AGENT" ] || die '--agent-account is required alongside --agent-uid'
 
 # Rails, in the mandatory form. The path is DERIVED, never supplied: see the
 # BLOCKER 1 block in lib/rails.sh.
@@ -89,38 +115,31 @@ check_fail() {
   FAILURES=$((FAILURES + 1))
 }
 
-# Read a path under the storage directory through the ONE chokepoint. The
-# reviewed build used `[ -f "$STORAGE/state/_audit/.audit-write.lock" ]`, which
-# follows a symlinked `state/` exactly the way the root verb did. This runs
-# unprivileged, so the consequence was a LYING preflight rather than a root
-# primitive, and "verify means OBSERVED state" is the doctrine this file
-# exists to enforce.
-safe_under_storage() {
-  rails_assert_safe_subpath "$STORAGE" "$1" || die "unsafe path under the storage directory: $1"
-}
-
-# --- CAN THIS PROCESS SEE INSIDE THE FORTRESS AT ALL? ---------------------
+# --- READ INSIDE THE FORTRESS AS ROOT, ONCE -------------------------------
 #
-# This has to come before every check that reads a path under $STORAGE,
-# because those checks read ABSENCE as GOOD. "no stale marker", "no zero-byte
-# lock", "no orphaned lock" are all conclusions drawn from a file not being
-# there, and a directory this process cannot traverse looks exactly like a
-# directory with nothing in it.
-#
-# It is a live concern, not a hypothetical: `tightenStoragePermissions` in
+# Every check below that looks at a path under $STORAGE reads ABSENCE as GOOD:
+# "no stale marker", "no zero-byte lock". A directory this process cannot
+# traverse looks exactly like a directory with nothing in it, and it is a live
+# concern rather than a hypothetical -- `tightenStoragePermissions` in
 # server/src/storage/permissions.ts chmods the whole fortress to 0700 on every
-# server start, and the disposable fortress is created ROOT-owned (that is
-# BLOCKER 1's fix). So from the first arm onward, this unprivileged driver
-# cannot read into it, and every absence-based check below would report PASS
-# having observed nothing.
+# server start, and the disposable fortress is created ROOT-owned. So from the
+# first arm onward an unprivileged read of it returns precisely what "clean"
+# looks like.
 #
-# Reporting it is the correct behavior for now; reading these paths through a
-# wrapper verb is the real fix and is named as an open item in the README.
-storage_observable() {
-  if [ ! -d "$STORAGE" ]; then return 1; fi
-  if [ ! -r "$STORAGE" ]; then return 1; fi
-  if [ ! -x "$STORAGE" ]; then return 1; fi
-  return 0
+# The previous round's answer was to refuse to conclude, which was honest and
+# useless. This is the fix: root reads it, through the wrapper's
+# `fortress-state` verb, which walks each path through the same
+# `rails_assert_safe_subpath` chokepoint the privileged verbs use and gives
+# every entry a NAMED state. There is no state meaning "I did not look".
+FORTRESS_RC=0
+FORTRESS_OUT="$("$SUDO" -n "$WRAPPER" fortress-state \
+  --run-id "$RUN_ID" --operator-account "$OPERATOR" 2>&1)" || FORTRESS_RC=$?
+
+fortress_entry_state() {
+  local line
+  line="$(printf '%s\n' "$FORTRESS_OUT" | "$GREP" -m1 "^FORTRESS entry=$1 state=" || printf '')"
+  if [ -z "$line" ]; then printf ''; return 0; fi
+  printf '%s' "${line##*state=}"
 }
 
 # --- the SHA the iteration says it is testing -----------------------------
@@ -173,7 +192,15 @@ file_mtime() {
   rails__sys stat -c '%Y' "$1" 2>/dev/null || rails__sys stat -f '%m' "$1" 2>/dev/null || return 1
 }
 
-for label in com.sanctuary.egress-gate com.sanctuary.egress-gate-peer-resolver; do
+# The labels and plist paths are PER AGENT UID and come from the pinned product
+# constants. The reviewed values (`com.sanctuary.egress-gate{,-peer-resolver}`,
+# no uid suffix) matched nothing the product installs, so this loop screened an
+# empty set every time.
+DAEMON_LABELS="$(rails_product_daemon_labels "$AGENT_UID")" \
+  || die "could not compose the product daemon labels for uid $AGENT_UID"
+[ -n "$DAEMON_LABELS" ] || die 'empty daemon label list after the rail'
+
+for label in $DAEMON_LABELS; do
   plist="/Library/LaunchDaemons/$label.plist"
   if [ ! -f "$plist" ]; then
     check_fail "daemon-dist-$label" "no plist at $plist; the daemon is not installed"
@@ -209,72 +236,97 @@ for label in com.sanctuary.egress-gate com.sanctuary.egress-gate-peer-resolver; 
 done
 
 # --- D8: no stale exclusive-routing marker --------------------------------
-if storage_observable; then
-  check_pass storage-observable "$STORAGE"
+if [ "$FORTRESS_RC" -ne 0 ]; then
+  # ONE failure, not three passes. An unread fortress makes every absence-based
+  # check below meaningless, and "absent" is what they call good.
+  check_fail fortress-state "could not READ the disposable fortress through the wrapper (rc=$FORTRESS_RC); the stale-marker and zero-byte-lock checks CANNOT be made, and their absence-means-good logic would report PASS having observed nothing"
+elif ! printf '%s\n' "$FORTRESS_OUT" | "$GREP" -q '^WRAPPER=FORTRESS-END'; then
+  check_fail fortress-state 'the fortress-state verb exited 0 without a FORTRESS-END marker; the read cannot be trusted'
+else
+  check_pass fortress-state "$STORAGE"
 
-  # The mandatory call-site form here too. `safe_under_storage` dies inside the
-  # command substitution, so without the `||` the abort would depend on
-  # `set -e` alone, and relying on `set -e` alone is exactly what this codebase
-  # decided not to do after round 1.
-  marker="$(safe_under_storage 'exclusive-routing.json')" \
-    || die 'safe-subpath rail rejected exclusive-routing.json'
-  [ -n "$marker" ] || die 'empty path after the safe-subpath rail'
-  if [ -e "$marker" ]; then
-    check_fail stale-marker "$marker exists before arm"
-  else
-    check_pass stale-marker
-  fi
+  marker_state="$(fortress_entry_state 'exclusive-routing.json')"
+  case "$marker_state" in
+    absent) check_pass stale-marker ;;
+    '')     check_fail stale-marker 'the fortress read carried no state for exclusive-routing.json; the check could not be made' ;;
+    *)      check_fail stale-marker "exclusive-routing.json exists before arm (state=$marker_state)" ;;
+  esac
 
   # --- 0-byte locks brick a fortress permanently --------------------------
+  # `present-empty` is the whole finding: a zero-length audit write lock is
+  # UNBREAKABLE by design and bricks a fortress permanently. It is a distinct
+  # state from `present` for exactly that reason.
   zero_locks=''
+  unread_locks=''
   for rel in 'state/_audit/.audit-write.lock' 'state/.provision.lock'; do
-    lock="$(safe_under_storage "$rel")" || die "safe-subpath rail rejected: $rel"
-    [ -n "$lock" ] || die "empty path after the safe-subpath rail: $rel"
-    if [ -f "$lock" ] && [ ! -s "$lock" ]; then
-      zero_locks="$zero_locks $lock"
-    fi
+    lock_state="$(fortress_entry_state "$rel")"
+    case "$lock_state" in
+      present-empty) zero_locks="$zero_locks $rel" ;;
+      '')            unread_locks="$unread_locks $rel" ;;
+      *)             ;;
+    esac
   done
-  if [ -n "$zero_locks" ]; then
+  if [ -n "$unread_locks" ]; then
+    check_fail zero-byte-lock "the fortress read carried no state for:$unread_locks"
+  elif [ -n "$zero_locks" ]; then
     check_fail zero-byte-lock "zero-length lock file(s):$zero_locks"
   else
     check_pass zero-byte-lock
   fi
-else
-  # ONE failure, not three passes. An unreadable fortress makes every
-  # absence-based check below meaningless, and "absent" is what they call good.
-  check_fail storage-observable "cannot read into $STORAGE as $(rails__sys id -un); the stale-marker and zero-byte-lock checks CANNOT be made, and their absence-means-good logic would report PASS having observed nothing"
 fi
 
 # --- 07-22: no orphaned registry entry for this storage path --------------
-registry='/Library/Application Support/Sanctuary/egress-gate/registry.json'
-if [ -f "$registry" ]; then
-  if rails__sys grep -q -- "$STORAGE" "$registry" 2>/dev/null; then
-    check_fail orphan-registry "registry already references $STORAGE"
-  else
-    check_pass orphan-registry
-  fi
+#
+# Read AS ROOT through the wrapper. The reviewed check looked at
+# `/Library/Application Support/Sanctuary/egress-gate/registry.json`, which
+# appears NOWHERE in server/src, and folded "not found" into "not there". The
+# product's registry is root-owned 0600 inside a 0700 directory, so correcting
+# the path alone would have left this reporting PASS on a `grep` that returned
+# "permission denied".
+REGISTRY_RC=0
+registry_out="$("$SUDO" -n "$WRAPPER" registry-state \
+  --run-id "$RUN_ID" --operator-account "$OPERATOR" 2>&1)" || REGISTRY_RC=$?
+if [ "$REGISTRY_RC" -ne 0 ]; then
+  check_fail orphan-registry "could not READ the pf-anchor registry (rc=$REGISTRY_RC); an unread registry is not an empty registry"
+elif printf '%s\n' "$registry_out" | "$GREP" -q '^WRAPPER=REGISTRY-ABSENT'; then
+  check_pass orphan-registry 'no registry file on this host'
+elif printf '%s\n' "$registry_out" | "$GREP" -q -F -- "$STORAGE"; then
+  check_fail orphan-registry "the registry already references $STORAGE"
+elif printf '%s\n' "$registry_out" | "$GREP" -q '^WRAPPER=REGISTRY-END'; then
+  check_pass orphan-registry 'read, and it does not reference this fortress'
 else
-  check_pass orphan-registry 'no registry file yet'
+  check_fail orphan-registry 'the registry-state verb exited 0 without a REGISTRY-END marker; the read cannot be trusted'
 fi
 
 # --- D9 / #986: launchd plists must name node by ABSOLUTE path ------------
+#
+# A check whose whole input set is MISSING must not pass. The reviewed version
+# screened two plist paths that no product install ever creates, found neither,
+# and printed PASS for the D9 layer having read nothing at all.
 plist_problem=''
-for plist in \
-  /Library/LaunchDaemons/com.sanctuary.egress-gate.plist \
-  /Library/LaunchDaemons/com.sanctuary.egress-gate-peer-resolver.plist
-do
-  if [ -f "$plist" ]; then
-    # A ProgramArguments entry of a bare `node` resolves under an interactive
-    # shell and not under launchd, which is exactly how D9 hid.
-    if rails__sys grep -qE '<string>node</string>' "$plist" 2>/dev/null; then
-      plist_problem="$plist_problem $plist"
-    fi
+plist_absent=''
+plist_seen=0
+for label in $DAEMON_LABELS; do
+  plist="/Library/LaunchDaemons/$label.plist"
+  if [ ! -f "$plist" ]; then
+    plist_absent="$plist_absent $plist"
+    continue
+  fi
+  plist_seen=$((plist_seen + 1))
+  # A ProgramArguments entry of a bare `node` resolves under an interactive
+  # shell and not under launchd, which is exactly how D9 hid.
+  if rails__sys grep -qE '<string>node</string>' "$plist" 2>/dev/null; then
+    plist_problem="$plist_problem $plist"
   fi
 done
 if [ -n "$plist_problem" ]; then
   check_fail plist-absolute-node "PATH-relative node in:$plist_problem"
+elif [ -n "$plist_absent" ]; then
+  check_fail plist-absolute-node "no plist to screen at:$plist_absent; a check whose whole input set is missing has not passed, it has not run"
+elif [ "$plist_seen" -eq 0 ]; then
+  check_fail plist-absolute-node 'no daemon plists were screened at all'
 else
-  check_pass plist-absolute-node
+  check_pass plist-absolute-node "screened $plist_seen plist(s)"
 fi
 
 # --- #987: PyYAML must be importable BY THE INTERPRETER THE HARNESS USES --

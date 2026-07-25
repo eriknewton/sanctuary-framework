@@ -27,9 +27,11 @@
 #   probe.sh derive <base> <operator> <run-id>
 #   probe.sh safe-subpath <root> <relative-path>
 #   probe.sh trusted-chain <label> <path>
+#   probe.sh stat-mode <path>
 #   probe.sh trusted-component <path> <owner-uid> <mode> <self-uid>
 #   probe.sh caller-binding <self-uid> <sudo-user> <operator>
 #   probe.sh etime <etime-string>
+#   probe.sh probe-result <exit-status> <probe-summary-line>
 #   probe.sh fingerprint-against <fingerprint> <deny-list> <allow-list>
 #   probe.sh host <fingerprint> [observed-name...]
 #   probe.sh host-observed <fingerprint> [observed-name...]
@@ -88,6 +90,19 @@ case "$kind" in
     if [ -z "$CHAIN" ]; then die 'empty path after the trusted-chain rail'; fi
     printf 'PROBE=ACCEPT trusted-chain=%s\n' "$CHAIN"
     ;;
+  stat-mode)
+    # The MODE READER, driven on a real path. Split out because the sticky-bit
+    # carve-out in `rails_assert_trusted_component` is decided on this
+    # function's output, and on macOS the BSD branch used to read `%Lp`, which
+    # DROPS the high bits: `/private/tmp` measured `777` for a directory whose
+    # real mode is `1777`, so the carve-out could never fire on the platform the
+    # drill runs on. A predicate that behaves differently on macOS and Linux
+    # while documented as working on both is a defect even when it fails safe.
+    if [ "$#" -ne 1 ]; then die 'stat-mode needs <path>'; fi
+    MODE="$(rails__stat_mode "$1")" || die "cannot stat: $1"
+    if [ -z "$MODE" ]; then die 'empty mode after the stat reader'; fi
+    printf 'PROBE=ACCEPT mode=%s\n' "$MODE"
+    ;;
   trusted-component)
     # The PURE predicate, driven directly. It prints nothing, so the mandatory
     # form here is the subshell one the wrapper uses for its non-printing rails.
@@ -102,6 +117,14 @@ case "$kind" in
     SECS="$(rails_etime_to_seconds "$@")" || die "etime rail rejected: ${1:-<missing>}"
     if [ -z "$SECS" ]; then die 'empty seconds after the etime rail'; fi
     printf 'PROBE=ACCEPT seconds=%s\n' "$SECS"
+    ;;
+  probe-result)
+    # The fold `run-loop.sh` writes into FINDINGS.jsonl. Driven here so every
+    # (status, summary) pair can be asserted, including the ones a live night
+    # would take weeks to produce.
+    RESULT="$(rails_probe_result "$@")" || die "probe-result rail rejected"
+    if [ -z "$RESULT" ]; then die 'empty result after the probe-result rail'; fi
+    printf 'PROBE=ACCEPT probe-result=%s\n' "$RESULT"
     ;;
   host)
     # host <fingerprint> [observed-name...]. The FINGERPRINT is the decision;

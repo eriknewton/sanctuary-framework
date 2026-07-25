@@ -30,13 +30,28 @@ WRAPPER_CLI='/usr/local/bin/sanctuary'
 
 # Verbs this wrapper will run. Anything else is refused. There is no
 # passthrough verb and no `--` escape into a general shell.
-WRAPPER_VERBS='check mint kickstart-daemons arm repair unprotect clean-markers gate-state pf-anchor-rules'
+#
+# The four READ verbs (`registry-state`, `fortress-state`, `gate-log`,
+# `pf-anchor-rules`) exist because of the round-3 class: the unprivileged
+# drivers drew conclusions from files they were not allowed to read. The real
+# registry is root-`0600` inside a `0700` directory, the gate log lives in the
+# gate service account's `0700` home, and the product chmods the fortress to
+# `0700` on every start. Every one of those reads returned "not found", which
+# the drivers folded into "not there", which they reported as clean. A driver
+# that cannot observe must be given a way to observe, or told plainly that it
+# could not; these verbs are the first half and the drivers' tri-state verdicts
+# are the second.
+WRAPPER_VERBS='check mint kickstart-daemons arm repair unprotect clean-markers retire gate-state pf-anchor-rules registry-state fortress-state gate-log'
 
-# The launchd labels this wrapper is permitted to restart. Compiled in.
-WRAPPER_DAEMON_LABELS='com.sanctuary.egress-gate com.sanctuary.egress-gate-peer-resolver'
+# How much of the gate log a single `gate-log` call returns.
+WRAPPER_GATE_LOG_LINES=200
 
-# The pf anchor the drill arms. Compiled in: never from argv.
-WRAPPER_PF_ANCHOR='com.sanctuary/egress'
+# NOTE: the pf anchor name and the launchd labels are NOT declared here any
+# more. They are `RAILS_PRODUCT_*` constants in lib/rails.sh, pinned to the
+# product's own exports by server/test/drill-loop/product-identifiers.test.ts.
+# Round 3 found all four of this harness's product-facing identifiers wrong at
+# once, which is what made a green night possible for three named defect layers
+# it never measured; a second declaration site is how that happens again.
 
 wrapper_die() {
   printf 'WRAPPER=REJECT reason=%s\n' "$*"
@@ -48,30 +63,44 @@ wrapper_usage() {
   cat >&2 <<'USAGE'
 sanctuary-drill-wrapper <verb> --run-id <id> --operator-account <acct>
                         [--agent-account <acct> --agent-uid <n>]
-                        [--passphrase-file <file>]
 
 verbs:
   check             run every rail and print the verdict; the only thing it
                     changes is that this run's own empty disposable directory
                     exists afterwards, root-owned, like every other verb
   mint              same, said out loud, for a driver that wants only that
-  kickstart-daemons restart the gate + peer-resolver daemons on the current dist
+  kickstart-daemons restart this agent's gate + peer-resolver daemons
+                    (needs --agent-account and --agent-uid: the product's
+                    labels are per confined uid)
   arm               protect --exclusive-egress against the disposable fortress
   repair            protect --repair-egress-gate (the gate-port rotation path)
   unprotect         protect --unprotect-egress-gate (teardown)
   clean-markers     remove loop-owned markers and stale locks under the storage dir
-  gate-state        read-only gate/registry state dump
+  retire            remove this run's whole disposable fortress
+  gate-state        read-only gate/registry state dump (needs --agent-uid)
   pf-anchor-rules   print the pf anchor's rules; nonzero if pf could not be read
+  registry-state    print the root-owned pf-anchor registry; nonzero if it
+                    exists and could not be read
+  fortress-state    report the marker and lock files inside this run's fortress
+                    AS ROOT, so a driver observes rather than guesses
+  gate-log          tail this agent's gate + peer-resolver daemon logs; nonzero
+                    if there is no log to read (needs --agent-uid)
 
 THERE IS NO --storage FLAG. The caller supplies a RUN ID, which is not a path
 and cannot contain a slash; the wrapper composes the storage path itself under
 a root-owned base it compiled in. That is the fix for the 2026-07-25 BLOCKER:
 an attacker cannot race, swap, or symlink a value they never supply.
 
+THERE IS NO --passphrase-file FLAG either. It was parsed and rail-checked and
+reached no verb: validated root-run surface with no consumer, which is round
+2's `--endpoint` finding under a new name. It is gone rather than better
+documented.
+
 Every account argument passes lib/rails.sh before use. The wrapper refuses to
-run on any host outside its compiled-in allowlist, refuses any real fortress by
-both allowlist and denylist, and refuses to act for an account other than the
-one sudo says invoked it.
+run on any host outside its compiled-in allowlist, refuses to act for an agent
+account outside its compiled-in agent allowlist, refuses any real fortress by
+both allowlist and denylist, and refuses to act for an operator account other
+than the one sudo says invoked it.
 USAGE
 }
 
@@ -84,7 +113,6 @@ ARG_RUN_ID=''
 ARG_OPERATOR=''
 ARG_AGENT=''
 ARG_AGENT_UID=''
-ARG_PASSFILE=''
 
 wrapper_parse_args() {
   if [ "$#" -lt 1 ]; then
@@ -113,9 +141,6 @@ wrapper_parse_args() {
       --agent-uid)
         if [ "$#" -lt 2 ]; then wrapper_die '--agent-uid needs a value'; fi
         ARG_AGENT_UID="$2"; shift 2 ;;
-      --passphrase-file)
-        if [ "$#" -lt 2 ]; then wrapper_die '--passphrase-file needs a value'; fi
-        ARG_PASSFILE="$2"; shift 2 ;;
       *)
         wrapper_die "unknown or unsupported argument: $1" ;;
     esac
@@ -199,10 +224,21 @@ wrapper_run_rails() {
     || wrapper_die "operator account rejected: $ARG_OPERATOR"
   if [ -z "$OPERATOR_UID" ]; then wrapper_die 'empty operator uid after rail'; fi
 
-  # 3. AGENT ACCOUNT + UID pairing (this part held in review; keep it).
+  # 3. AGENT ACCOUNT + UID pairing (this part held in review; keep it), plus
+  #    the COMPILED-IN AGENT ALLOWLIST.
+  #
+  #    Round-3 M2: `--agent-account` was the one surviving caller-supplied
+  #    steering input, and it is the input that decides WHO root acts against.
+  #    Shape and non-rootness were checked; membership was not, so the grant
+  #    holder could aim a root-run `protect --exclusive-egress` at any non-root
+  #    local account. The allowlist rail runs BEFORE the uid pairing, so an
+  #    account this drill was never provisioned for is refused before anything
+  #    looks it up.
   if [ -n "$ARG_AGENT" ] || [ -n "$ARG_AGENT_UID" ]; then
     if [ -z "$ARG_AGENT" ]; then wrapper_die '--agent-uid given without --agent-account'; fi
     if [ -z "$ARG_AGENT_UID" ]; then wrapper_die '--agent-account given without --agent-uid'; fi
+    wrapper_rail rails_assert_agent_account_allowed "$ARG_AGENT" \
+      || wrapper_die "agent account is not on the compiled-in drill agent allowlist: $ARG_AGENT"
     AGENT_UID="$(rails_assert_account_uid 'agent' "$ARG_AGENT" "$ARG_AGENT_UID")" \
       || wrapper_die "agent account rejected: $ARG_AGENT"
     if [ -z "$AGENT_UID" ]; then wrapper_die 'empty agent uid after rail'; fi
@@ -220,11 +256,15 @@ wrapper_run_rails() {
   DERIVED="$(rails_derive_disposable_storage "$RAILS_DISPOSABLE_BASE" "$ARG_OPERATOR" "$ARG_RUN_ID")" \
     || wrapper_die "run id rejected: $ARG_RUN_ID"
   if [ -z "$DERIVED" ]; then wrapper_die 'empty derived storage path'; fi
+}
 
-  # 5. PASSPHRASE FILE, when supplied.
-  if [ -n "$ARG_PASSFILE" ]; then
-    wrapper_rail rails_assert_secret_file_perms "$ARG_PASSFILE" "$ARG_OPERATOR" \
-      || wrapper_die "passphrase-file rail rejected: $ARG_PASSFILE"
+# Verbs whose whole subject is one confined agent need that agent's uid,
+# because every product-facing identifier they touch is per-uid. Stated as its
+# own guard so the failure is "this verb needs an agent" rather than a label
+# composed from an empty string.
+wrapper_require_agent() {
+  if [ -z "$ARG_AGENT" ] || [ -z "$AGENT_UID" ]; then
+    wrapper_die "$WRAPPER_VERB requires --agent-account and --agent-uid"
   fi
 }
 
@@ -354,9 +394,22 @@ wrapper_verb_mint() {
 # The reviewed build ran `launchctl kickstart ... || true` and then printed
 # WRAPPER=OK unconditionally, which made a failed restart read as a success.
 # The kickstart IS this verb's entire job, so its status IS the verb's status.
+#
+# ROUND 3 (H3): the labels were `com.sanctuary.egress-gate{,-peer-resolver}` and
+# the product's are `ai.sanctuaryprotocol.egress-gate{,-peer-resolver}.<uid>`.
+# Both halves were wrong -- a different reverse-DNS prefix AND no uid suffix --
+# so no prefix substitution could have fixed them, and this verb had no
+# `--agent-uid` in its call path at all. Since this is step 0 of every
+# iteration and a failed kickstart is (correctly) fatal, the loop as shipped
+# could not complete a single iteration. The labels now come from
+# `rails_product_daemon_labels`, which is pinned to the product's exports.
 wrapper_verb_kickstart_daemons() {
-  local label failed='' restarted=''
-  for label in $WRAPPER_DAEMON_LABELS; do
+  wrapper_require_agent
+  local labels label failed='' restarted=''
+  labels="$(rails_product_daemon_labels "$AGENT_UID")" \
+    || wrapper_die "could not compose the product daemon labels for uid $AGENT_UID"
+  if [ -z "$labels" ]; then wrapper_die 'empty daemon label list after the rail'; fi
+  for label in $labels; do
     if rails__sys launchctl kickstart -k "system/$label" >/dev/null 2>&1; then
       restarted="$restarted $label"
     else
@@ -370,9 +423,7 @@ wrapper_verb_kickstart_daemons() {
 }
 
 wrapper_verb_arm() {
-  if [ -z "$ARG_AGENT" ] || [ -z "$AGENT_UID" ]; then
-    wrapper_die 'arm requires --agent-account and --agent-uid'
-  fi
+  wrapper_require_agent
   # Pass the RAIL'S output, not the raw argument. The rail proved the two are
   # equal, so this is not a behavior change today; it is the habit that stops a
   # later edit from reintroducing a validated-then-unvalidated split.
@@ -426,15 +477,223 @@ wrapper_verb_clean_markers() {
   printf 'WRAPPER=OK verb=clean-markers storage=%s\n' "$STORAGE"
 }
 
+# Read-only state dump. It used to print `WRAPPER=OK verb=gate-state`
+# UNCONDITIONALLY after printing `(no ... daemon)` and `(no anchor rules)`
+# (round-3 L3), which is the same shape as the `kickstart-daemons` fail-open one
+# function above it: an evidence file that looks like a successful read of two
+# daemons that do not exist under those labels. A dump verb that observed
+# NOTHING is not an OK dump.
 wrapper_verb_gate_state() {
-  local label
+  wrapper_require_agent
+  local labels label observed=0
+  labels="$(rails_product_daemon_labels "$AGENT_UID")" \
+    || wrapper_die "could not compose the product daemon labels for uid $AGENT_UID"
   printf -- '--- launchctl ---\n'
-  for label in $WRAPPER_DAEMON_LABELS; do
-    rails__sys launchctl print "system/$label" 2>/dev/null || printf '(no %s daemon)\n' "$label"
+  for label in $labels; do
+    if rails__sys launchctl print "system/$label" 2>/dev/null; then
+      observed=$(( observed + 1 ))
+    else
+      printf '(no %s daemon)\n' "$label"
+    fi
   done
   printf -- '--- pf anchor ---\n'
-  rails__sys pfctl -a "$WRAPPER_PF_ANCHOR" -s rules 2>/dev/null || printf '(no anchor rules)\n'
-  printf 'WRAPPER=OK verb=gate-state\n'
+  if rails__sys pfctl -a "$RAILS_PRODUCT_PF_ANCHOR" -s rules 2>/dev/null; then
+    observed=$(( observed + 1 ))
+  else
+    printf '(pf anchor %s could not be read)\n' "$RAILS_PRODUCT_PF_ANCHOR"
+  fi
+  if [ "$observed" -eq 0 ]; then
+    wrapper_die "gate-state observed NOTHING: neither daemon under $labels answered and the pf anchor $RAILS_PRODUCT_PF_ANCHOR could not be read; an empty dump is not a successful read"
+  fi
+  printf 'WRAPPER=OK verb=gate-state observed=%s agent_uid=%s\n' "$observed" "$AGENT_UID"
+}
+
+# Read the ROOT-OWNED pf-anchor registry, and say plainly which of the three
+# answers this is: absent, present-and-readable, or present-and-unreadable.
+#
+# ROUND-3 H1 / Codex finding 3. Both `preflight.sh` and `teardown-verify.sh` did
+#
+#     if [ -f "$registry" ] && grep -q -- "$STORAGE" "$registry" 2>/dev/null
+#     then dirty; else clean; fi
+#
+# against a path the product does not use. Correcting the path alone makes it
+# WORSE-looking and no better: the real registry is root-`0600` inside a `0700`
+# directory, so an unprivileged `grep` returns 2 and the `else` branch still
+# says CLEAN. "no match", "cannot read" and "not there" were one verdict. Root
+# can actually read it, so root is who reads it.
+wrapper_verb_registry_state() {
+  local reg="$RAILS_PRODUCT_ANCHOR_REGISTRY" content rc=0
+  if [ -L "$reg" ]; then
+    wrapper_die "the pf-anchor registry path is a symlink; refusing to follow it as root: $reg"
+  fi
+  if [ ! -e "$reg" ]; then
+    printf 'WRAPPER=REGISTRY-ABSENT path=%s\n' "$reg"
+    printf 'WRAPPER=OK verb=registry-state state=absent path=%s\n' "$reg"
+    return 0
+  fi
+  if [ ! -f "$reg" ]; then
+    wrapper_die "the pf-anchor registry path exists and is not a regular file: $reg"
+  fi
+  content="$(rails__sys cat -- "$reg" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    wrapper_die "could not READ the pf-anchor registry at $reg (cat rc=$rc); a check that observed nothing is not a clean verdict"
+  fi
+  printf 'WRAPPER=REGISTRY-BEGIN path=%s\n' "$reg"
+  printf '%s' "$content"
+  printf '\nWRAPPER=REGISTRY-END\n'
+  printf 'WRAPPER=OK verb=registry-state state=present path=%s\n' "$reg"
+}
+
+# Report the marker and lock files inside THIS run's disposable fortress, AS
+# ROOT, through the one resolution chokepoint.
+#
+# ROUND-3, the builder's own finding taken the rest of the way:
+# `tightenStoragePermissions` chmods the fortress to 0700 on every server start
+# and the fortress is root-owned, so from the first arm onward the unprivileged
+# drivers cannot look inside it. Their stale-marker, zero-byte-lock, marker and
+# lock checks all read ABSENCE as GOOD, and a directory you may not traverse is
+# indistinguishable from an empty one. Refusing to conclude was the honest
+# stopgap; this is the fix. Every entry gets a NAMED state, and there is no
+# state that means "I did not look".
+wrapper_verb_fortress_state() {
+  local rel target
+  printf 'WRAPPER=FORTRESS-BEGIN storage=%s\n' "$STORAGE"
+  for rel in \
+    'exclusive-routing.json' \
+    'state/_audit/.audit-write.lock' \
+    'state/.provision.lock'
+  do
+    # A SYMLINKED ENTRY NEVER REACHES THE CLASSIFIER. `rails_assert_safe_subpath`
+    # refuses any symlink anywhere in the chain, so this verb FAILS on one
+    # rather than giving it a state, and the driver reads that as
+    # COULD-NOT-OBSERVE. That is the stronger answer and it is why there is no
+    # `state=symlink` branch below: it would be unreachable, and an unreachable
+    # security predicate that reads as covered is its own finding class (the
+    # round-3 sticky-bit note).
+    #
+    # It matters that this is the chokepoint and not a local `[ -L ]`: `[ -e ]`
+    # is FALSE for a dangling symlink, so a hand-rolled check would report a
+    # symlinked marker as ABSENT, which is the absence-means-good class wearing
+    # a different hat.
+    target="$(wrapper_safe_path "$rel")" \
+      || wrapper_die "unsafe path under the storage directory: $rel"
+    if [ -z "$target" ]; then wrapper_die "empty path after the safe-subpath rail: $rel"; fi
+    if [ ! -e "$target" ]; then
+      printf 'FORTRESS entry=%s state=absent\n' "$rel"
+    elif [ ! -f "$target" ]; then
+      printf 'FORTRESS entry=%s state=not-a-regular-file\n' "$rel"
+    elif [ ! -s "$target" ]; then
+      # A ZERO-LENGTH audit write lock is UNBREAKABLE by design and bricks a
+      # fortress permanently; it gets its own state, never folded into
+      # "present".
+      printf 'FORTRESS entry=%s state=present-empty\n' "$rel"
+    else
+      printf 'FORTRESS entry=%s state=present\n' "$rel"
+    fi
+  done
+  printf 'WRAPPER=FORTRESS-END\n'
+  printf 'WRAPPER=OK verb=fortress-state storage=%s\n' "$STORAGE"
+}
+
+# Tail this agent's gate and peer-resolver daemon logs, AS ROOT, from the paths
+# the product actually writes.
+#
+# ROUND-3 M5. The probe battery read `<fortress>/logs/egress-gate.log`, which
+# NOTHING writes, and could not have read it anyway (root-owned 0700 fortress).
+# The gate daemon's stdout/stderr go to
+# `<gate account home>/logs/egress-gate-<uid>.{out,err}.log` inside a 0700 home
+# owned by the gate service uid; the peer resolver's go to
+# `<fortress>/logs/peer-resolver-<uid>.{out,err}.log`. So `P1-reason` was always
+# SKIP, `N3` was always SKIP and `N1` always failed for the wrong reason: the
+# reason-half of the ladder -- the half that exists because the 2026-07-24 drill
+# hid a live `peer_unresolved` strangle behind green-looking denials for a full
+# day -- was structurally dead.
+#
+# The gate account name embeds the AGENT ID, which this harness does not know,
+# so the gate homes are enumerated under the product's fixed base and matched on
+# the per-uid LOG FILE NAME, which does identify the agent uid exactly.
+wrapper_verb_gate_log() {
+  wrapper_require_agent
+  local base="$RAILS_PRODUCT_GATE_HOME_BASE" home stream f found=0 rel target
+  if [ -L "$base" ]; then
+    wrapper_die "the gate account home base is a symlink; refusing to follow it as root: $base"
+  fi
+  if [ -d "$base" ]; then
+    for home in "$base"/"$RAILS_PRODUCT_GATE_ACCOUNT_PREFIX"*; do
+      if [ -L "$home" ]; then
+        wrapper_die "gate account home $home is a symlink; refusing to follow it as root"
+      fi
+      if [ ! -d "$home" ]; then continue; fi
+      for stream in out err; do
+        f="$home/$RAILS_PRODUCT_GATE_LOG_DIR/egress-gate-$AGENT_UID.$stream.log"
+        if [ -L "$f" ]; then wrapper_die "gate log $f is a symlink; refusing to follow it as root"; fi
+        if [ ! -f "$f" ]; then continue; fi
+        found=$(( found + 1 ))
+        printf 'WRAPPER=GATE-LOG-BEGIN file=%s\n' "$f"
+        rails__sys tail -n "$WRAPPER_GATE_LOG_LINES" -- "$f" \
+          || wrapper_die "could not read the gate log $f"
+        printf '\nWRAPPER=GATE-LOG-END file=%s\n' "$f"
+      done
+    done
+  fi
+
+  # The peer resolver logs under the FORTRESS, so they go through the same
+  # resolution chokepoint every other in-fortress path does.
+  for stream in out err; do
+    rel="$RAILS_PRODUCT_GATE_LOG_DIR/peer-resolver-$AGENT_UID.$stream.log"
+    target="$(wrapper_safe_path "$rel")" \
+      || wrapper_die "unsafe path under the storage directory: $rel"
+    if [ -z "$target" ]; then wrapper_die "empty path after the safe-subpath rail: $rel"; fi
+    if [ ! -f "$target" ]; then continue; fi
+    found=$(( found + 1 ))
+    printf 'WRAPPER=GATE-LOG-BEGIN file=%s\n' "$target"
+    rails__sys tail -n "$WRAPPER_GATE_LOG_LINES" -- "$target" \
+      || wrapper_die "could not read the peer-resolver log $target"
+    printf '\nWRAPPER=GATE-LOG-END file=%s\n' "$target"
+  done
+
+  if [ "$found" -eq 0 ]; then
+    wrapper_die "no gate or peer-resolver log for agent uid $AGENT_UID under $base or $STORAGE/$RAILS_PRODUCT_GATE_LOG_DIR; the reason half of the probe ladder CANNOT be evaluated, and a probe that observed nothing is not a probe that passed"
+  fi
+  printf 'WRAPPER=OK verb=gate-log agent_uid=%s files=%s\n' "$AGENT_UID" "$found"
+}
+
+# Remove this run's whole disposable fortress.
+#
+# ROUND-3 M1: nothing removed them, while the README said the loop "tears it
+# down each night". Consequences were unbounded accumulation of root-owned
+# directories under the base, one per iteration forever, AND a dead
+# `[ ! -d "$STORAGE" ]` branch in teardown-verify whose three `clean_pass` lines
+# read as a covered case that could never be reached.
+#
+# This is the most dangerous line in the file, so it is the most re-checked. By
+# the time it runs, `wrapper_run_rails` and `wrapper_ensure_storage` have
+# already proven: every component of the chain is a root-owned, non-symlink,
+# non-writable directory; the leaf is not a symlink; the leaf's parent resolves
+# to the approved anchor; the basename carries the disposable prefix; and the
+# path is not on the fortress denylist lexically OR after resolution. The rail
+# is then re-run on the value about to be removed, and its own output -- not the
+# variable -- is what `rm` is handed.
+wrapper_verb_retire() {
+  local again
+  again="$(rails_assert_disposable_storage "$ANCHOR" "$STORAGE")" \
+    || wrapper_die "the storage rail refused the path retire was about to remove: $STORAGE"
+  if [ -z "$again" ]; then wrapper_die 'empty path after the storage rail; refusing to remove anything'; fi
+  if [ "$again" != "$STORAGE" ]; then
+    wrapper_die "the storage rail re-resolved $STORAGE to $again; refusing to remove either"
+  fi
+  case "${again##*/}" in
+    "$RAILS_DISPOSABLE_PREFIX"?*) ;;
+    *) wrapper_die "refusing to remove a path whose basename is not a disposable loop fortress: $again" ;;
+  esac
+  if [ "${again%/*}" != "$ANCHOR" ]; then
+    wrapper_die "refusing to remove $again: its parent is not the approved operator anchor $ANCHOR"
+  fi
+  rails__sys rm -rf -- "$again" || wrapper_die "could not remove the disposable fortress: $again"
+  if [ -e "$again" ]; then
+    wrapper_die "the disposable fortress SURVIVED removal: $again"
+  fi
+  printf 'WRAPPER=OK verb=retire removed=%s\n' "$again"
 }
 
 # Read the pf anchor's rules, and say plainly whether pf could be read at all.
@@ -446,16 +705,23 @@ wrapper_verb_gate_state() {
 # stop-the-night check now gets a status it cannot confuse, and it needs no
 # second sudo grant, because the wrapper is already what the NOPASSWD line
 # covers.
+#
+# ROUND 3 (H2): this was the fix the previous round was proudest of, and it was
+# closed against the WRONG ANCHOR. It asked `pfctl` about `com.sanctuary/egress`
+# while the product arms `sanctuary.egress-gate`, so depending on pfctl's exit
+# status for an unknown anchor it either reported CLEAN while the real anchor
+# was still armed, or stopped the night every time. The name now comes from
+# `RAILS_PRODUCT_PF_ANCHOR`, pinned to the product's own `PF_ANCHOR_NAME`.
 wrapper_verb_pf_anchor_rules() {
   local rules rc=0
-  rules="$(rails__sys pfctl -a "$WRAPPER_PF_ANCHOR" -s rules 2>/dev/null)" || rc=$?
+  rules="$(rails__sys pfctl -a "$RAILS_PRODUCT_PF_ANCHOR" -s rules 2>/dev/null)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    wrapper_die "could not read the pf anchor $WRAPPER_PF_ANCHOR (pfctl rc=$rc); a check that observed nothing is not a clean verdict"
+    wrapper_die "could not read the pf anchor $RAILS_PRODUCT_PF_ANCHOR (pfctl rc=$rc); a check that observed nothing is not a clean verdict"
   fi
   printf 'WRAPPER=PF-ANCHOR-BEGIN\n'
   printf '%s' "$rules"
   printf '\nWRAPPER=PF-ANCHOR-END\n'
-  printf 'WRAPPER=OK verb=pf-anchor-rules anchor=%s\n' "$WRAPPER_PF_ANCHOR"
+  printf 'WRAPPER=OK verb=pf-anchor-rules anchor=%s\n' "$RAILS_PRODUCT_PF_ANCHOR"
 }
 
 wrapper_main() {
@@ -466,11 +732,15 @@ wrapper_main() {
     check)             wrapper_verb_check ;;
     mint)              wrapper_verb_mint ;;
     pf-anchor-rules)   wrapper_verb_pf_anchor_rules ;;
+    registry-state)    wrapper_verb_registry_state ;;
+    fortress-state)    wrapper_verb_fortress_state ;;
+    gate-log)          wrapper_verb_gate_log ;;
     kickstart-daemons) wrapper_verb_kickstart_daemons ;;
     arm)               wrapper_verb_arm ;;
     repair)            wrapper_verb_repair ;;
     unprotect)         wrapper_verb_unprotect ;;
     clean-markers)     wrapper_verb_clean_markers ;;
+    retire)            wrapper_verb_retire ;;
     gate-state)        wrapper_verb_gate_state ;;
     *)                 wrapper_die "unreachable: unhandled verb $WRAPPER_VERB" ;;
   esac

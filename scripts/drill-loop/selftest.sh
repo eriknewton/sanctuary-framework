@@ -171,12 +171,21 @@ expect_accept 'normalizes slashes' ".sanctuary-loop-good" \
   -- "$PROBE" storage "$HOME_DIR" "$HOME_DIR//.sanctuary-loop-good/"
 
 printf '== run-id rail (the caller no longer supplies a path at all) ==\n'
-expect_accept 'plain run id' 'PROBE=ACCEPT'          -- "$PROBE" run-id '20260725T0230-1'
+expect_accept 'plain run id' 'PROBE=ACCEPT'          -- "$PROBE" run-id '20260725t0230-1'
+# LOWERCASE ONLY. `A` and `a` were two accepted run ids and ONE directory entry
+# on the case-insensitive APFS volume the drill hosts run (round-3 MED, both
+# lenses). Rejected rather than folded: the evidence must show the exact id the
+# caller supplied.
+expect_reject 'UPPERCASE run id (case-insensitive APFS alias)' 'disallowed characters' \
+  -- "$PROBE" run-id '20260725T0230-1'
+expect_reject 'a single uppercase letter aliases its lowercase twin' 'disallowed characters' \
+  -- "$PROBE" run-id 'A'
+expect_accept 'its lowercase twin is accepted' 'PROBE=ACCEPT' -- "$PROBE" run-id 'a'
 expect_reject 'empty run id' 'empty run id'          -- "$PROBE" run-id ''
 expect_reject 'run id with a slash' 'disallowed characters' -- "$PROBE" run-id 'a/b'
 expect_reject 'run id traversal' 'disallowed characters'    -- "$PROBE" run-id '../evil'
-expect_reject 'run id leading dot' 'must start with a letter or a digit' -- "$PROBE" run-id '.hidden'
-expect_reject 'option-shaped run id' 'must start with a letter or a digit' -- "$PROBE" run-id '-rf'
+expect_reject 'run id leading dot' 'must start with a lowercase letter or a digit' -- "$PROBE" run-id '.hidden'
+expect_reject 'option-shaped run id' 'must start with a lowercase letter or a digit' -- "$PROBE" run-id '-rf'
 expect_reject 'over-long run id' 'longer than' \
   -- "$PROBE" run-id 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 expect_accept 'derivation composes the path' ".sanctuary-loop-x1" \
@@ -185,6 +194,29 @@ expect_reject 'derivation refuses a relative base' 'not an absolute path' \
   -- "$PROBE" derive 'relative/base' "$ME" 'x1'
 expect_reject 'derivation refuses root as operator' 'disallowed characters' \
   -- "$PROBE" derive "$BASE" 'ro ot' 'x1'
+
+printf '== the aggregation rule: a SKIP can never become a PASS ==\n'
+#
+# ROUND-3, Codex finding 2. The battery said `N3 SKIP`, left its failure count
+# at zero, exited 0, and run-loop.sh wrote `"result":"PASS"` into
+# FINDINGS.jsonl. Both signals must agree before this says PASS.
+SUM_OK='PROBE=SUMMARY failures=0 skipped_count=0 verified=yes declared=a,b ran=a,b skipped='
+SUM_SKIP='PROBE=SUMMARY failures=0 skipped_count=1 verified=no declared=a,b ran=a skipped=b'
+SUM_LIAR='PROBE=SUMMARY failures=0 skipped_count=1 verified=yes declared=a,b ran=a skipped=b'
+expect_accept 'a clean battery is a PASS' 'probe-result=PASS' \
+  -- "$PROBE" probe-result 0 "$SUM_OK"
+expect_accept 'a skipped probe is UNVERIFIED, never PASS' 'probe-result=UNVERIFIED' \
+  -- "$PROBE" probe-result 3 "$SUM_SKIP"
+expect_accept 'a skipped probe that somehow exited 0 is STILL not a PASS' 'probe-result=UNVERIFIED' \
+  -- "$PROBE" probe-result 0 "$SUM_SKIP"
+expect_accept 'a summary claiming verified=yes while NAMING skips is UNVERIFIED' 'probe-result=UNVERIFIED' \
+  -- "$PROBE" probe-result 0 "$SUM_LIAR"
+expect_accept 'a missing summary line is UNVERIFIED, never PASS' 'probe-result=UNVERIFIED' \
+  -- "$PROBE" probe-result 0 'the probe battery produced no SUMMARY line'
+expect_accept 'a genuinely failed battery is a FAIL' 'probe-result=FAIL' \
+  -- "$PROBE" probe-result 1 "$SUM_OK"
+expect_reject 'a non-numeric status is refused' 'status is not numeric' \
+  -- "$PROBE" probe-result 'zero' "$SUM_OK"
 
 printf '== trusted-chain rail (the root-owned base) ==\n'
 expect_accept 'a real system directory' 'PROBE=ACCEPT'  -- "$PROBE" trusted-chain base /usr
@@ -207,6 +239,29 @@ expect_reject 'world-writable component' 'group- or world-writable' \
   -- "$PROBE" trusted-component /some/dir 0 777 501
 expect_accept 'world-writable but STICKY (this is /tmp)' 'PROBE=ACCEPT' \
   -- "$PROBE" trusted-component /tmp 0 1777 501
+
+# ...AND THE MODE READER THE CARVE-OUT IS DECIDED ON (round-3 L2).
+#
+# The predicate above is fed by `rails__stat_mode`, whose BSD branch used to
+# read `%Lp` -- which DROPS the high bits. Measured on this Mac, `/private/tmp`
+# reports `%Lp=777` for a directory whose real mode is `1777`, so on the ONLY
+# platform this harness will ever run on, `8#$mode & 8#1000` was always zero and
+# the sticky carve-out documented as "what makes /tmp safe as a path component"
+# could never fire. The direction was fail-closed, so it was not a hole; it was
+# a security predicate that behaved differently on macOS and Linux while being
+# documented as if it worked on both. These two cases are what make the reader
+# and the predicate agree.
+STICKYDIR="$SANDBOX/sticky"
+mkdir -p "$STICKYDIR"
+chmod 1777 "$STICKYDIR"
+expect_accept 'the mode reader SEES the sticky bit' 'mode=1777' \
+  -- "$PROBE" stat-mode "$STICKYDIR"
+expect_accept 'a sticky world-writable component is accepted end to end' 'PROBE=ACCEPT' \
+  -- "$PROBE" trusted-chain base "$STICKYDIR"
+chmod 0777 "$STICKYDIR"
+expect_reject 'the SAME component without the sticky bit is refused' 'without the sticky bit' \
+  -- "$PROBE" trusted-chain base "$STICKYDIR"
+chmod 0755 "$STICKYDIR"
 
 printf '== safe-subpath rail (the ONE resolution chokepoint) ==\n'
 SUB="$ANCHOR/.sanctuary-loop-good"
@@ -289,6 +344,35 @@ expect_reject 'an upper-case fingerprint' 'not lowercase hex' \
   -- "$PROBE" fingerprint-against 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' "$FP_DENIED" "$FP_ALLOWED"
 expect_reject 'an EMPTY allowlist admits nothing' 'allowlist is EMPTY' \
   -- "$PROBE" fingerprint-against "$FP_ALLOWED" "$FP_DENIED" ''
+
+printf '== host rail: a HANGING hardware lookup is a rejection ==\n'
+#
+# ROUND-3, Codex finding 5. Every unusable `ioreg` answer failed closed --
+# absent, empty, malformed, lower-case, non-UUID -- except one: a HANG is not an
+# answer at all, and a host rail that hangs produces neither evidence nor a
+# refusal. An unattended night would simply not happen and nothing would say so.
+#
+# The lookup is bounded by a watchdog rather than a polling loop, because this
+# rail runs on EVERY wrapper invocation and a poll coarse enough to be cheap is
+# also coarse enough to add a second to each of them.
+SLOWDIR="$SANDBOX/slow-ioreg"
+mkdir -p "$SLOWDIR/bin"
+printf '#!/bin/bash\nsleep 60\n' > "$SLOWDIR/bin/ioreg"
+chmod +x "$SLOWDIR/bin/ioreg"
+sed -e "s|^RAILS_SYSTEM_BIN_DIRS=.*|RAILS_SYSTEM_BIN_DIRS='$SLOWDIR/bin /usr/bin /bin /usr/sbin /sbin'|" \
+    -e 's|^RAILS_IOREG_TIMEOUT_SECONDS=.*|RAILS_IOREG_TIMEOUT_SECONDS=2|' \
+    "$HERE/lib/rails.sh" > "$SLOWDIR/rails.sh"
+SLOW_START="$(date +%s)"
+expect_reject 'a hanging ioreg is a REJECT, not a hang' 'TIMED OUT' \
+  -- bash -c ". '$SLOWDIR/rails.sh'; rails_host_fingerprint_local"
+SLOW_ELAPSED=$(( $(date +%s) - SLOW_START ))
+if [ "$SLOW_ELAPSED" -le 10 ]; then
+  printf 'ok    the hardware lookup was bounded (%ss, deadline 2s)\n' "$SLOW_ELAPSED"
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL  *** the bounded hardware lookup took %ss; the deadline is not being enforced ***\n' "$SLOW_ELAPSED"
+  FAIL=$((FAIL + 1))
+fi
 
 printf '== host rail: the UUID -> fingerprint reduction ==\n'
 expect_accept 'a well-formed hardware UUID' 'PROBE=ACCEPT' \
@@ -478,17 +562,36 @@ TEST_WRAPPER="$SANDBOX/test-wrapper"
 # than the old name one: the lookup, the shape validation and the hashing all
 # actually run, and only the LIST is substituted.
 LOCAL_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_local" 2>/dev/null || printf '')"
-"$HERE/build-wrapper.sh" --stdout \
-  | awk -v fp="$LOCAL_FP" -v base="$BASE" '
-      $0 == "wrapper_main \"$@\"" {
-        print "RAILS_HOST_ALLOW_FP=\047" fp "\047"
-        print "RAILS_HOST_DENY_FP=\047\047"
-        print "RAILS_HOST_DENY=\047\047"
-        print "RAILS_DISPOSABLE_BASE=\047" base "\047"
-      }
-      { print }
-    ' > "$TEST_WRAPPER"
-chmod +x "$TEST_WRAPPER"
+
+# compose_wrapper <out> <agent-allowlist>
+#
+# CONSTANTS ONLY, spliced in immediately before the entrypoint. Never a
+# function: the reviewed batteries overrode `wrapper_home_of`, a FUNCTION, and
+# mutating it left every test green. Every constant overridden here has its
+# SHIPPED value asserted separately, so an override cannot hide a change to what
+# actually runs as root.
+compose_wrapper() {
+  "$HERE/build-wrapper.sh" --stdout \
+    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" '
+        $0 == "wrapper_main \"$@\"" {
+          print "RAILS_HOST_ALLOW_FP=\047" fp "\047"
+          print "RAILS_HOST_DENY_FP=\047\047"
+          print "RAILS_HOST_DENY=\047\047"
+          print "RAILS_DISPOSABLE_BASE=\047" base "\047"
+          print "RAILS_AGENT_ACCOUNT_ALLOW=\047" agents "\047"
+        }
+        { print }
+      ' > "$1"
+  chmod +x "$1"
+}
+
+# The DEFAULT test wrapper keeps the SHIPPED (empty) agent allowlist, so the
+# refusal it produces is the shipped behavior rather than a fixture.
+compose_wrapper "$TEST_WRAPPER" ''
+# And one with this account on the agent allowlist, so the agent-taking verbs
+# can be exercised past that rail.
+TEST_WRAPPER_AGENT="$SANDBOX/test-wrapper-agent"
+compose_wrapper "$TEST_WRAPPER_AGENT" "$ME"
 
 # The wrapper-level cases need a machine with a hardware identity, because the
 # host rail decides on one. Linux has no IOPlatformExpertDevice, so there the
@@ -603,8 +706,6 @@ expect_reject 'unprotect refuses a missing CLI' 'CLI not found' \
   -- "$TEST_WRAPPER" unprotect --run-id 'good1' --operator-account "$ME"
 # `kickstart-daemons` must report the FAILURE of the thing that is its whole
 # job. The reviewed verb ran `|| true` and printed WRAPPER=OK regardless.
-expect_reject 'kickstart-daemons reports a failed restart' 'kickstart failed for' \
-  -- "$TEST_WRAPPER" kickstart-daemons --run-id 'good1' --operator-account "$ME"
 # The verb behind the pf fail-closed fix, driven directly. `pfctl` needs root
 # (and does not exist on Linux at all), so a non-root run here MUST refuse
 # rather than print an empty anchor and call it success. That is the whole
@@ -613,8 +714,63 @@ if [ "$(id -u)" -ne 0 ]; then
   expect_reject 'pf-anchor-rules refuses when pfctl cannot run' 'could not read the pf anchor' \
     -- "$TEST_WRAPPER" pf-anchor-rules --run-id 'good1' --operator-account "$ME"
 fi
+# The verbs whose whole subject is ONE confined agent must say so rather than
+# compose a product label out of an empty string. Round 3: `kickstart-daemons`
+# had no `--agent-uid` in its call path at all, and the product's labels are
+# per-uid, so the labels it restarted could not have existed.
+for v in kickstart-daemons gate-state gate-log; do
+  expect_reject "verb $v refuses without an agent principal" 'requires --agent-account and --agent-uid' \
+    -- "$TEST_WRAPPER" "$v" --run-id 'good1' --operator-account "$ME"
+done
+# THE AGENT PRINCIPAL IS COMPILED IN (round-3 M2). `--agent-account` was the one
+# surviving caller-supplied steering input and it is the one that decides who
+# root acts against. The test wrapper does NOT override
+# RAILS_AGENT_ACCOUNT_ALLOW, so the shipped empty list is what refuses here.
+expect_reject 'an agent account not on the compiled-in allowlist is refused' \
+  'not on the compiled-in drill agent allowlist' \
+  -- "$TEST_WRAPPER" arm --run-id 'good1' --operator-account "$ME" \
+     --agent-account "$ME" --agent-uid "$(id -u)"
+# --passphrase-file was validated root-run surface that reached no verb.
+expect_reject 'the dead --passphrase-file flag is gone' 'unknown or unsupported argument' \
+  -- "$TEST_WRAPPER" check --run-id 'good1' --operator-account "$ME" --passphrase-file /dev/null
+# `retire` removes the whole disposable fortress (round-3 M1: nothing did, ever,
+# while the README claimed a nightly teardown).
+mkdir -p "$ANCHOR/.sanctuary-loop-retireme"
+expect_accept 'retire removes the disposable fortress' 'WRAPPER=OK verb=retire' \
+  -- "$TEST_WRAPPER" retire --run-id 'retireme' --operator-account "$ME"
+if [ -e "$ANCHOR/.sanctuary-loop-retireme" ]; then
+  printf 'FAIL  *** retire exited 0 and the fortress is still there ***\n'
+  FAIL=$((FAIL + 1))
+else
+  printf 'ok    the retired fortress is actually gone\n'
+  PASS=$((PASS + 1))
+fi
+# `fortress-state` names a state for every entry, and `present-empty` is its own
+# state because a ZERO-LENGTH audit lock bricks a fortress permanently.
+mkdir -p "$LOOPDIR/state/_audit"
+: > "$LOOPDIR/state/_audit/.audit-write.lock"
+printf 'x' > "$LOOPDIR/exclusive-routing.json"
+expect_accept 'fortress-state reports a present marker' 'FORTRESS entry=exclusive-routing.json state=present' \
+  -- "$TEST_WRAPPER" fortress-state --run-id 'good1' --operator-account "$ME"
+expect_accept 'fortress-state distinguishes a ZERO-LENGTH lock' \
+  'FORTRESS entry=state/_audit/.audit-write.lock state=present-empty' \
+  -- "$TEST_WRAPPER" fortress-state --run-id 'good1' --operator-account "$ME"
+rm -f "$LOOPDIR/exclusive-routing.json" "$LOOPDIR/state/_audit/.audit-write.lock"
+expect_accept 'fortress-state reports absence as absence' 'FORTRESS entry=exclusive-routing.json state=absent' \
+  -- "$TEST_WRAPPER" fortress-state --run-id 'good1' --operator-account "$ME"
+# `gate-log` must REFUSE when there is no log, because the reason-half of the
+# probe ladder cannot be evaluated from a log that does not exist.
+expect_reject 'gate-log refuses when there is no log to read' 'CANNOT be evaluated' \
+  -- "$TEST_WRAPPER_AGENT" gate-log --run-id 'good1' --operator-account "$ME" \
+     --agent-account "$ME" --agent-uid "$(id -u)"
+# ...and the same account IS accepted once it is on the allowlist, so the rail
+# has been seen to say yes as well as no.
+expect_reject 'an allowlisted agent account passes the agent rail and dies later' 'kickstart failed for' \
+  -- "$TEST_WRAPPER_AGENT" kickstart-daemons --run-id 'good1' --operator-account "$ME" \
+     --agent-account "$ME" --agent-uid "$(id -u)"
 # Every verb refuses a bad run id before doing anything at all.
-for v in mint clean-markers gate-state kickstart-daemons repair unprotect pf-anchor-rules; do
+for v in mint clean-markers gate-state kickstart-daemons repair unprotect retire \
+         pf-anchor-rules registry-state fortress-state gate-log; do
   expect_reject "verb $v refuses a traversal run id" 'run id rejected' \
     -- "$TEST_WRAPPER" "$v" --run-id '../../.sanctuary' --operator-account "$ME"
 done
@@ -627,15 +783,28 @@ printf '== teardown-verify: a check that could not OBSERVE is not CLEAN ==\n'
 # having observed nothing, which is the 2026-06-24 "claimed all drills dry"
 # failure automated and running every night.
 #
-# The driver is UNPRIVILEGED, so it can be driven for real here with a stub
-# `sudo` earlier in PATH. That is what makes this a test rather than an
-# argument: delete the fail-closed branch and this case goes red.
+# HOW THE STUB IS REACHED, AND WHY IT IS NOT PATH ANY MORE.
+#
+# ROUND-3 BLOCKER 1: the previous version of this battery put a stub `sudo`
+# earlier in PATH, which worked because the drivers resolved `sudo` through
+# PATH. That is the defect: Codex used the same trick to make the real probe
+# battery print a full green ladder and the real teardown print CLEAN, with no
+# sudo, no wrapper, no pfctl and no agent account.
+#
+# The drivers now resolve every tool their evidence rests on through
+# `rails__abs_cmd`, which only ever looks in `$RAILS_SYSTEM_BIN_DIRS`. So the
+# battery composes a SANDBOX COPY of the harness whose `RAILS_SYSTEM_BIN_DIRS`
+# CONSTANT names the stub directory first -- exactly the same discipline the
+# wrapper battery uses, a constant and never a function -- and the SHIPPED value
+# of that constant is asserted separately. There is no environment variable and
+# no flag that reaches the resolver in production.
 STUBBIN="$SANDBOX/stubbin"
 mkdir -p "$STUBBIN"
 cat > "$STUBBIN/sudo" <<'STUB'
 #!/bin/bash
-# Stub `sudo` for the driver battery. Understands the two shapes the drivers
-# use: `sudo -n <wrapper> <verb> ...` and `sudo -n -u <acct> -- <cmd> ...`.
+# TEST-ONLY stand-in for sudo. Understands the two shapes the drivers use:
+# `sudo -n <wrapper> <verb> ...` and `sudo -n -u <acct> -- <abs-cmd> ...`.
+if [ -n "${STUB_SUDO_LOG:-}" ]; then printf '%s\n' "$*" >> "$STUB_SUDO_LOG"; fi
 args=("$@")
 for a in "${args[@]}"; do
   case "$a" in
@@ -650,12 +819,55 @@ for a in "${args[@]}"; do
       echo 'WRAPPER=OK verb=pf-anchor-rules'
       exit 0
       ;;
+    registry-state)
+      case "${STUB_REGISTRY:-absent}" in
+        refused) echo 'sudo: a password is required' >&2; exit 1 ;;
+        absent)  echo 'WRAPPER=REGISTRY-ABSENT path=/var/db/sanctuary/egress-anchor-registry.json'
+                 echo 'WRAPPER=OK verb=registry-state state=absent'; exit 0 ;;
+        *)       echo 'WRAPPER=REGISTRY-BEGIN path=/var/db/sanctuary/egress-anchor-registry.json'
+                 printf '%s\n' "${STUB_REGISTRY_BODY:-}"
+                 echo 'WRAPPER=REGISTRY-END'
+                 echo 'WRAPPER=OK verb=registry-state state=present'; exit 0 ;;
+      esac
+      ;;
+    fortress-state)
+      if [ "${STUB_FORTRESS:-ok}" = 'refused' ]; then
+        echo 'sudo: a password is required' >&2
+        exit 1
+      fi
+      echo "WRAPPER=FORTRESS-BEGIN storage=${STUB_STORAGE:-}"
+      printf 'FORTRESS entry=exclusive-routing.json state=%s\n' "${STUB_MARKER:-absent}"
+      printf 'FORTRESS entry=state/_audit/.audit-write.lock state=%s\n' "${STUB_AUDIT_LOCK:-absent}"
+      printf 'FORTRESS entry=state/.provision.lock state=%s\n' "${STUB_PROVISION_LOCK:-absent}"
+      echo 'WRAPPER=FORTRESS-END'
+      echo 'WRAPPER=OK verb=fortress-state'
+      exit 0
+      ;;
+    gate-log)
+      if [ "${STUB_GATE_LOG:-refused}" = 'refused' ]; then
+        echo 'WRAPPER=REJECT reason=no gate log' >&2
+        exit 20
+      fi
+      echo 'WRAPPER=GATE-LOG-BEGIN file=stub'
+      printf '%s\n' "${STUB_GATE_LOG_BODY:-}"
+      echo 'WRAPPER=GATE-LOG-END file=stub'
+      echo 'WRAPPER=OK verb=gate-log'
+      exit 0
+      ;;
+    retire)                  exit "${STUB_RETIRE_RC:-0}" ;;
     unprotect|clean-markers) exit "${STUB_WRAPPER_RC:-0}" ;;
-    curl)
+    *curl)
       if [ "${STUB_CURL:-ok}" = 'refused' ]; then
         echo 'sudo: a password is required' >&2
         exit 1
       fi
+      # The BLOCKED endpoint answers with a denial, so a battery run's only
+      # remaining problem can be the one the case is about.
+      for u in "${args[@]}"; do
+        case "$u" in
+          https://example.com) echo "${STUB_BLOCKED_CODE:-${STUB_CURL_CODE:-200}}"; exit 0 ;;
+        esac
+      done
       echo "${STUB_CURL_CODE:-200}"; exit 0 ;;
   esac
 done
@@ -663,32 +875,173 @@ exit 0
 STUB
 chmod +x "$STUBBIN/sudo"
 
+# The sandbox harness: byte-identical drivers, ONE constant substituted.
+HARNESS="$SANDBOX/harness"
+mkdir -p "$HARNESS/lib"
+cp -R "$HERE/drivers" "$HARNESS/drivers"
+cp "$HERE/lib/probe.sh" "$HARNESS/lib/probe.sh"
+sed "s|^RAILS_SYSTEM_BIN_DIRS='/usr/bin /bin /usr/sbin /sbin'\$|RAILS_SYSTEM_BIN_DIRS='$STUBBIN /usr/bin /bin /usr/sbin /sbin'|" \
+  "$HERE/lib/rails.sh" > "$HARNESS/lib/rails.sh"
+# A substitution that silently did not happen would leave this battery testing
+# the real /usr/bin/sudo and reporting whatever that did. That is the same class
+# as everything else in this file, so it is checked rather than assumed.
+if grep -q "^RAILS_SYSTEM_BIN_DIRS='$STUBBIN " "$HARNESS/lib/rails.sh"; then
+  printf 'ok    the driver battery resolves its tools through the rails CONSTANT, not PATH\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL  *** the RAILS_SYSTEM_BIN_DIRS override did not apply; this battery would test nothing ***\n'
+  FAIL=$((FAIL + 1))
+fi
+
 TD_EV="$SANDBOX/teardown-evidence"
 run_teardown() {
-  PATH="$STUBBIN:$PATH" "$HERE/drivers/teardown-verify.sh" \
+  STUB_STORAGE="$LOOPDIR" "$HARNESS/drivers/teardown-verify.sh" \
     --run-id 'good1' --operator-account "$ME" \
     --agent-account "$ME" --agent-uid "$(id -u)" \
-    --evidence-dir "$TD_EV" --base "$BASE" 2>&1
+    --evidence-dir "$TD_EV" --base "$BASE" --no-retire 2>&1
 }
+
+# THE BLOCKER-1 REGRESSION ITSELF. Same stub, same driver, reachable ONLY
+# through PATH this time: the SHIPPED harness, whose resolver does not consult
+# PATH. A planted `sudo` must produce NO observations at all.
+printf '== a PATH-planted sudo cannot forge evidence (round-3 BLOCKER 1) ==\n'
+PLANT_LOG="$SANDBOX/planted-sudo.log"
+: > "$PLANT_LOG"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+planted_out="$(PATH="$STUBBIN:$PATH" STUB_SUDO_LOG="$PLANT_LOG" \
+  STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 STUB_FORTRESS=ok \
+  "$HERE/drivers/teardown-verify.sh" \
+    --run-id 'good1' --operator-account "$ME" \
+    --agent-account "$ME" --agent-uid "$(id -u)" \
+    --evidence-dir "$SANDBOX/planted-evidence" --base "$BASE" --no-retire 2>&1)"
+planted_rc=$?
+set -e
+if [ -s "$PLANT_LOG" ]; then
+  printf 'FAIL  *** the planted sudo on PATH was invoked; the drivers still resolve through PATH ***\n'
+  note "log: $(cat "$PLANT_LOG")"
+  FAIL=$((FAIL + 1))
+else
+  printf 'ok    the planted sudo on PATH was never invoked\n'
+  PASS=$((PASS + 1))
+fi
+case "$planted_out" in
+  *'VERIFY=CLEAN check=pf-anchor'*|*'VERIFY=CLEAN check=registry'*)
+    printf 'FAIL  *** a PATH-planted sudo produced a CLEAN verdict; the round-3 BLOCKER is back ***\n'
+    note "output: $planted_out"
+    FAIL=$((FAIL + 1)) ;;
+  *)
+    if [ "$planted_rc" -ne 0 ]; then
+      printf 'ok    a PATH-planted sudo produced no clean verdict and a nonzero exit (%s)\n' "$planted_rc"
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  a PATH-planted sudo run exited 0\n'
+      note "output: $planted_out"
+      FAIL=$((FAIL + 1))
+    fi ;;
+esac
 
 set +e   # declared exception: these runs are EXPECTED to exit nonzero
 out="$(STUB_PF=refused run_teardown)"; rc=$?
 set -e
 case "$out" in
-  *'VERIFY=DIRTY check=pf-anchor'*)
+  *'VERIFY=UNOBSERVED check=pf-anchor'*)
     if [ "$rc" -ne 0 ]; then
-      printf 'ok    a pf anchor that could not be READ is DIRTY, not clean (exit %s)\n' "$rc"
+      printf 'ok    a pf anchor that could not be READ is UNOBSERVED, not clean (exit %s)\n' "$rc"
       PASS=$((PASS + 1))
     else
-      printf 'FAIL  teardown-verify said DIRTY but exited 0\n'
+      printf 'FAIL  teardown-verify said UNOBSERVED but exited 0\n'
       FAIL=$((FAIL + 1))
     fi
     ;;
   *)
-    printf 'FAIL  *** a refused pf read was reported CLEAN; the fail-open is back ***\n'
+    printf 'FAIL  *** a refused pf read was not reported UNOBSERVED; the fail-open is back ***\n'
     note "output: $out"
     FAIL=$((FAIL + 1))
     ;;
+esac
+
+# --- THE REGISTRY, TRI-STATE (round-3 H1 / Codex finding 3) ---------------
+#
+# Three inputs, three DIFFERENT verdicts. The reviewed code collapsed all of
+# them into "clean", and correcting the path alone would not have changed that:
+# the real registry is root-0600, so an unprivileged read of it lands in exactly
+# the same `else`.
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 STUB_REGISTRY=refused run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=UNOBSERVED check=registry'*)
+    printf 'ok    a registry that could not be READ is UNOBSERVED, not clean\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** an unreadable registry was not reported UNOBSERVED ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 \
+       STUB_REGISTRY=present STUB_REGISTRY_BODY="{\"committed\":[{\"fortress\":\"$LOOPDIR\"}]}" \
+       run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=DIRTY check=registry'*)
+    printf 'ok    a registry still naming this fortress is DIRTY\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** an orphaned registry entry was not reported dirty ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 \
+       STUB_REGISTRY=present STUB_REGISTRY_BODY='{"committed":[]}' run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=CLEAN check=registry read, and it does not reference this fortress'*)
+    printf 'ok    a registry that WAS read and does not name this fortress is clean\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  a read, unrelated registry was not reported clean\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# --- THE FORTRESS, TRI-STATE ----------------------------------------------
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 STUB_FORTRESS=refused run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=UNOBSERVED check=fortress-state'*)
+    case "$out" in
+      *'VERIFY=CLEAN check=marker'*|*'VERIFY=CLEAN check=locks'*)
+        printf 'FAIL  *** a marker/lock check was CLEAN on a fortress that was never read ***\n'
+        note "output: $out"; FAIL=$((FAIL + 1)) ;;
+      *)
+        printf 'ok    an unread fortress is ONE unobserved finding, not three clean ones\n'
+        PASS=$((PASS + 1)) ;;
+    esac ;;
+  *)
+    printf 'FAIL  *** an unread fortress was not reported UNOBSERVED ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 STUB_MARKER=present run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=DIRTY check=marker'*)
+    printf 'ok    a marker that survived teardown is DIRTY\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  a surviving marker was not reported dirty\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 STUB_AUDIT_LOCK=present-empty run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=DIRTY check=locks'*)
+    printf 'ok    a zero-length audit lock that survived teardown is DIRTY\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  a surviving zero-length lock was not reported dirty\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
 set +e   # declared exception
@@ -737,15 +1090,9 @@ esac
 # process cannot traverse looks exactly like a directory with nothing left in
 # it. This is live, not hypothetical: `tightenStoragePermissions` chmods the
 # whole fortress to 0700 on every server start, and the disposable fortress is
-# ROOT-owned, so after the first arm the unprivileged driver genuinely cannot
-# look inside. Reporting CLEAN there would be the 2026-06-24 failure again.
-# Two layers can produce that refusal and the case asserts the PROPERTY rather
-# than either layer, because which one fires depends on how the fortress became
-# unreadable. As an unprivileged process the reachable state is "cannot
-# traverse", and the storage rail's own `cd -P` post-condition catches it first
-# and exits hard; the explicit `storage_observable` check covers the
-# traversable-but-not-readable case (a 0711 fortress owned by someone else),
-# which cannot be constructed here without root.
+# ROOT-owned. Root reads it through `fortress-state` now, but the driver still
+# has to RESOLVE the path, and the storage rail's own `cd -P` post-condition is
+# what stops it hard when it cannot even traverse there.
 chmod 0000 "$LOOPDIR"
 set +e   # declared exception
 out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 run_teardown)"; rc=$?
@@ -777,11 +1124,180 @@ set +e   # declared exception
 out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL=refused run_teardown)"; rc=$?
 set -e
 case "$out" in
-  *'VERIFY=DIRTY check=agent-unconfined reason=could not RUN the as-agent probe'*)
-    printf 'ok    an as-agent probe that could not RUN is DIRTY, and says which\n'
+  *'VERIFY=UNOBSERVED check=agent-unconfined reason=could not RUN the as-agent probe'*)
+    printf 'ok    an as-agent probe that could not RUN is UNOBSERVED, and says which\n'
     PASS=$((PASS + 1)) ;;
   *)
     printf 'FAIL  a probe that could not run was not reported as unobservable\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# --- RETIREMENT (round-3 M1) ----------------------------------------------
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 \
+       STUB_STORAGE="$LOOPDIR" "$HARNESS/drivers/teardown-verify.sh" \
+         --run-id 'good1' --operator-account "$ME" \
+         --agent-account "$ME" --agent-uid "$(id -u)" \
+         --evidence-dir "$TD_EV" --base "$BASE" 2>&1)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=CLEAN check=retire'*)
+    printf 'ok    teardown retires the disposable fortress by default\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  teardown did not retire the disposable fortress\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 STUB_RETIRE_RC=1 \
+       STUB_STORAGE="$LOOPDIR" "$HARNESS/drivers/teardown-verify.sh" \
+         --run-id 'good1' --operator-account "$ME" \
+         --agent-account "$ME" --agent-uid "$(id -u)" \
+         --evidence-dir "$TD_EV" --base "$BASE" 2>&1)"; rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  case "$out" in
+    *'VERIFY=DIRTY check=retire'*)
+      printf 'ok    a fortress that could not be retired stops the night\n'; PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  a failed retire was not reported dirty\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+else
+  printf 'FAIL  a failed retire exited 0\n'
+  note "output: $out"; FAIL=$((FAIL + 1))
+fi
+
+# --- PREFLIGHT: A CHECK THAT OBSERVED NOTHING HAS NOT PASSED --------------
+#
+# Three checks in this file reported PASS having measured nothing (round-3 H1):
+# `orphan-registry` watched a path the product does not use, `plist-absolute-node`
+# passed when its entire input set was absent, and the marker/lock checks read a
+# fortress the process is not allowed to look inside.
+printf '== preflight: a check that observed nothing has not passed ==\n'
+PF_EV="$SANDBOX/preflight-evidence"
+mkdir -p "$PF_EV"
+run_preflight() {
+  STUB_STORAGE="$LOOPDIR" "$HARNESS/drivers/preflight.sh" \
+    --run-id 'good1' --operator-account "$ME" \
+    --agent-account "$ME" --agent-uid "$(id -u)" \
+    --base "$BASE" 2>&1
+}
+set +e   # declared exception: preflight is EXPECTED to fail on a non-drill host
+out="$(run_preflight)"; rc=$?
+set -e
+# The D9 layer: no plist to screen is a FAILURE, not an empty success.
+case "$out" in
+  *'PREFLIGHT=FAIL check=plist-absolute-node'*'no plist to screen'*)
+    printf 'ok    an absent plist set FAILS the D9 check instead of passing it\n'
+    PASS=$((PASS + 1)) ;;
+  *'PREFLIGHT=PASS check=plist-absolute-node'*)
+    printf 'FAIL  *** the D9 check PASSED having screened nothing ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  *)
+    printf 'FAIL  the D9 check produced no recognizable verdict\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+# The labels it looks for are the PRODUCT's, per confined uid.
+case "$out" in
+  *"daemon-dist-ai.sanctuaryprotocol.egress-gate.$(id -u)"*)
+    printf 'ok    preflight screens the product per-uid daemon labels\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** preflight is not using the product daemon labels ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+set +e   # declared exception
+out="$(STUB_REGISTRY=refused run_preflight)"; rc=$?
+set -e
+case "$out" in
+  *'PREFLIGHT=FAIL check=orphan-registry'*'could not READ'*)
+    printf 'ok    a registry that could not be READ FAILS preflight\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** an unreadable registry did not fail preflight ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+set +e   # declared exception
+out="$(STUB_FORTRESS=refused run_preflight)"; rc=$?
+set -e
+case "$out" in
+  *'PREFLIGHT=PASS check=stale-marker'*|*'PREFLIGHT=PASS check=zero-byte-lock'*)
+    printf 'FAIL  *** an absence-means-good check PASSED on a fortress never read ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  *'PREFLIGHT=FAIL check=fortress-state'*)
+    printf 'ok    an unread fortress is ONE preflight failure, not two passes\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  an unread fortress produced no recognizable preflight verdict\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+set +e   # declared exception
+out="$(STUB_AUDIT_LOCK=present-empty run_preflight)"; rc=$?
+set -e
+case "$out" in
+  *'PREFLIGHT=FAIL check=zero-byte-lock'*)
+    printf 'ok    a zero-length audit lock is caught before an iteration starts\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** a zero-byte lock was not caught ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# --- THE PROBE BATTERY: A SKIP IS NOT A PASS (Codex round-3 finding 2) ----
+#
+# The battery reported `N3 SKIP`, left FAILED at zero, exited 0, and the loop
+# wrote `"result":"PASS"` for the whole probe step. Two independent things now
+# have to be true before that can happen: exit 0 AND `verified=yes`.
+printf '== the probe battery: a skipped probe cannot become a pass ==\n'
+PB_EV="$SANDBOX/probe-evidence"
+run_probes() {
+  STUB_STORAGE="$LOOPDIR" "$HARNESS/drivers/run-probe-battery.sh" \
+    --run-id 'good1' --operator-account "$ME" \
+    --agent-account "$ME" --agent-uid "$(id -u)" \
+    --evidence-dir "$PB_EV" --base "$BASE" --repeats 1 2>&1
+}
+set +e   # declared exception
+out="$(STUB_GATE_LOG=refused STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+set -e
+case "$out" in
+  *'verified=no'*)
+    if [ "$rc" -ne 0 ]; then
+      printf 'ok    an unreadable gate log makes the battery verified=no and exit %s\n' "$rc"
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  *** the battery said verified=no and exited 0 ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  *** a battery that could not read the gate log did not say verified=no ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+case "$out" in
+  *'PROBE=SUMMARY'*'skipped=P1-reason'*)
+    printf 'ok    the summary NAMES the probes that did not run\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  the summary did not name the skipped probes\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+# And the round-3 N3 rule: the log WAS read and carries no peer_uid_mismatch, so
+# the probe RAN and did not observe its reason. That is a FAIL, not a SKIP.
+set +e   # declared exception
+out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_BODY="peer=$(id -u) allowlist" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+set -e
+case "$out" in
+  *'PROBE=N3 RESULT=FAIL'*)
+    printf 'ok    a read gate log with no peer_uid_mismatch FAILS N3 rather than skipping it\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** an unobserved N3 denial reason was not a FAIL ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+# ...and the reason half now produces evidence at all, which it structurally
+# could not before (round-3 M5: it read a path nothing writes).
+case "$out" in
+  *'PROBE=P1-reason RESULT=PASS'*)
+    printf 'ok    the reason half of the ladder can now actually be evaluated\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  the reason half still produced no verdict from a readable gate log\n'
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
