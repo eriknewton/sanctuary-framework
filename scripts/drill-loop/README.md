@@ -120,7 +120,7 @@ but can be talked into touching a real fortress is worth negative value.
 | A PATH-planted `hostname`, `stat`, `rm` or interpreter | absolute shebang, pinned PATH, `rails__sys` absolute resolution, `secure_path` |
 | `--operator-account root`, by name and by uid | `rails_assert_non_root_account` |
 | Acting for an account other than the sudo caller | `rails_assert_caller_binding` |
-| A group- or world-accessible passphrase file | `rails_assert_secret_file_perms`, masked against 022 and 077 |
+| A group- or world-accessible passphrase file | `rails_assert_secret_file_perms`, masked against 022 and 077. NO PRODUCTION CALLER today: `--passphrase-file` was validated root-run surface that reached no verb and is gone, so this is a tested library rail waiting for a consumer, not a refusal the harness currently makes |
 | An agent account outside the compiled-in agent allowlist | `rails_assert_agent_account_allowed`; `--agent-account` is a SELECTION from a compiled-in list, not a value |
 | An UPPERCASE run id, which aliases a lowercase one on case-insensitive APFS | `rails_assert_run_id`, lowercase-only, rejected rather than folded |
 | A hardware lookup that HANGS | `rails__sys_timeout`; a timeout is a REJECT like every other unusable lookup |
