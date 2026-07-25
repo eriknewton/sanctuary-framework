@@ -111,6 +111,7 @@ import {
   createRepairExclusiveEgressOps,
   createUnprotectExclusiveEgressOps,
   ensureAgentHarnessHoldDir,
+  clearExclusiveRoutingResidueWithoutAccount,
   observeAgentConfinementProduction,
   reconcileStaleExclusiveRoutingProduction,
   type ExclusiveEgressWiringInput,
@@ -1783,9 +1784,10 @@ export async function runAutoProvisionForWrap(
     // production reconcile DIRECTLY rather than through
     // `buildExclusiveWiringInput`, which throws before the parked install has
     // resolved a uid -- this gate runs before any of that.
-    reconcileExclusiveRoutingResidue: (armTargetUid) =>
+    reconcileExclusiveRoutingResidue: (armTargetUid, intent) =>
       reconcileStaleExclusiveRoutingProduction({
         agentUid: armTargetUid,
+        intent,
         fortressPath: wallFortressPath,
         audit: castleWallAuditBestEffort,
         print,
@@ -3084,9 +3086,17 @@ export async function runEgressGateRepairForCli(options: {
   const accountOps = realAccountProvisionOps();
   const agentUid = await accountOps.lookupAccountUid(accountName);
   if (agentUid === undefined || agentUid === null) {
+    // FIX F3 (adversarial review, 2026-07-26): this used to point at
+    // `--hermes --exclusive-egress`, which is precisely the command the
+    // exclusive-routing residue gate refuses when a marker survives the
+    // account. Repair -> provision -> refused -> repair was a closed loop with
+    // a manual `rm` as its only exit. The residue teardown lives on the
+    // unprotect verb (it is a teardown, not a repair), so name that instead.
     print(
       `No dedicated agent account "${accountName}" exists; nothing to repair. ` +
-        "Provision first: sudo sanctuary protect --hermes --exclusive-egress",
+        "If this fortress still carries leftover exclusive-egress state from an interrupted arm, " +
+        "clear it with: sudo sanctuary protect --unprotect-egress-gate. " +
+        "Otherwise provision first: sudo sanctuary protect --hermes --exclusive-egress",
     );
     return 2;
   }
@@ -3221,11 +3231,56 @@ export async function runEgressGateUnprotectForCli(options: {
   const accountOps = realAccountProvisionOps();
   const agentUid = await accountOps.lookupAccountUid(accountName);
   if (agentUid === undefined || agentUid === null) {
-    print(
-      `No dedicated agent account "${accountName}" exists; nothing to unprotect. ` +
-        "(Account removal is a separate, operator-present step and is never bundled here.)",
-    );
-    return 2;
+    // FIX F3 (adversarial review, 2026-07-26): "nothing to unprotect" was FALSE
+    // whenever the account went away while the fortress kept its
+    // exclusive-routing files (a drill teardown, a restored fortress, an
+    // unprotect that died between parking the harness and removing the marker).
+    // In that state the provision run is refused by the residue gate, repair
+    // exits 2, and this verb exited 2 -- a closed loop whose only exit was an
+    // undocumented manual `rm`. The residue teardown makes this verb TRUE, and
+    // it is the verb the gate's refusal sentence names.
+    const teardown = await clearExclusiveRoutingResidueWithoutAccount({
+      fortressPath: wallFortressPath,
+      audit: async (operation, details) => {
+        try {
+          const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+          await appendCastleWallCliAuditBestEffort(
+            operation,
+            { source: "sanctuary-protect-unprotect", ...details },
+            wallFortressPath,
+            process.env,
+            process.stderr,
+          );
+        } catch {
+          // Best-effort by contract.
+        }
+      },
+      print,
+    });
+    switch (teardown.kind) {
+      case "no-residue":
+        print(
+          `No dedicated agent account "${accountName}" exists and this fortress carries no ` +
+            "exclusive-routing state; nothing to unprotect. " +
+            "(Account removal is a separate, operator-present step and is never bundled here.)",
+        );
+        return 2;
+      case "cleared":
+        print(
+          `No dedicated agent account "${accountName}" exists, but this fortress still carried ` +
+            `leftover exclusive-egress state, and it has been CLEARED: ${teardown.detail}. ` +
+            "The fortress is back on coarse composition; provisioning can now run.",
+        );
+        return 0;
+      case "refused":
+        print(
+          `No dedicated agent account "${accountName}" exists, and the exclusive-egress state on ` +
+            `this fortress is NOT residue: ${teardown.reason}. Nothing was changed (removing the ` +
+            "routing marker alone would leave the pf anchor and any gate daemon armed for that uid). " +
+            "Re-create the dedicated agent account, then re-run this command for the full teardown.",
+        );
+        return 2;
+    }
   }
   // MED-1 (teardown wedge on a damaged install): argv resolution needs the
   // re-homed Hermes runtime tree (runtime files + system python + venv). If it

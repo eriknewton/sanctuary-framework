@@ -18,6 +18,7 @@ import {
   type ParkedClaim,
 } from "../../src/egress-gate/parked-claim.js";
 import type { HarnessDaemonStatus } from "../../src/egress-gate/harness-daemon.js";
+import { describeExclusiveRoutingResidueRefusal } from "../../src/castle-wall/provision/orchestrate.js";
 
 function lines(summary: AutoProvisionSummary): string[] {
   return renderAutoProvisionOutcomeLines(summary);
@@ -204,10 +205,10 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
       outcome: {
         kind: "aborted",
         stage: "exclusive-routing-residue",
-        reason:
-          "Refusing to provision: an exclusive-routing marker is present in this fortress and was KEPT " +
-          "(a gate is serving port 40001). Nothing has been changed. Clear the exclusive-egress state with: " +
-          "'sudo sanctuary protect --unprotect-egress-gate'.",
+        reason: describeExclusiveRoutingResidueRefusal({
+          kind: "kept-live",
+          reason: "a gate daemon owns port 40001 under gate uid 708",
+        }),
         rolledBack: false,
         rehomeAttempted: false,
       },

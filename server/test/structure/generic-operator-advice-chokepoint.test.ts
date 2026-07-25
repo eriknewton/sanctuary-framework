@@ -169,7 +169,7 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
   {
     file: "server/src/wrap/auto-provision.ts",
     scope: "runEgressGateRepairForCli",
-    snippet: "Provision first: sudo sanctuary protect --hermes --exclusive-egress",
+    snippet: "Otherwise provision first: sudo sanctuary protect --hermes --exclusive-egress",
     expectedCount: 1,
     reason: "egress-gate repair still delegates to the Hermes provisioning command",
   },

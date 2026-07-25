@@ -11,6 +11,7 @@ import {
   runProvisionFlow,
   describeObservedAgentConfinement,
   describeExclusiveRoutingResidueRefusal,
+  exclusiveRoutingResidueRefusal,
   type ProvisionFlowContext,
   type ProvisionFlowOps,
 } from "../../../src/castle-wall/provision/orchestrate.js";
@@ -187,13 +188,25 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       confinedUids: [],
       exclusiveRoutingMarkerPresent: false,
     })),
-    // FIX F-COARSE-AFTER-EXCLUSIVE (class half): the mode-independent
-    // pre-mutation residue gate. Default = no marker on disk (`reconciled:
-    // false` with NO reason is the op's marker-absent contract), so the gate
-    // is a no-op for every test that is not about it.
-    reconcileExclusiveRoutingResidue: vi.fn(async () => ({ reconciled: false })),
+    // FIX F-COARSE-AFTER-EXCLUSIVE (class half): the mode-independent residue
+    // gate. Default = no marker on disk, so the gate is a no-op for every test
+    // that is not about it.
+    reconcileExclusiveRoutingResidue: vi.fn(async () => ({ kind: "clear" as const })),
     ...overrides,
   };
+}
+
+/**
+ * A residue op for a marker that is PROVABLY ORPHANED. The `"observe"` call
+ * judges it without touching anything; only the `"clear"` call removes it. This
+ * split is the whole point of FIX F1: the judgement may run before the operator
+ * confirm, the removal may not.
+ */
+function residueOp(): ReturnType<typeof vi.fn> {
+  const detail = "no S5-1 registry entry and no serving gate for uid 707";
+  return vi.fn(async (_armTargetUid: number | undefined, intent: "observe" | "clear") =>
+    intent === "observe" ? { kind: "orphaned" as const, detail } : { kind: "reconciled" as const, detail },
+  );
 }
 
 describe("castle-wall/provision/orchestrate", () => {
@@ -1480,27 +1493,28 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
     });
 
-    it("D8 REGRESSION: a stale exclusive-routing marker from a crashed prior arm is reconciled BEFORE ANY MUTATION, and the arm PROCEEDS to a live exclusive arm", async () => {
+    it("D8 REGRESSION: a stale exclusive-routing marker from a crashed prior arm is cleared BEFORE ANY MUTATION, and the arm PROCEEDS to a live exclusive arm", async () => {
       // The 2026-07-21 hardware wedge: an interrupted prior arm left a stale
       // marker on the fortress. The gate self-heals it (orphaned, no live
       // confinement present); pre-fix, the daemon composed EXCLUSIVE over the
       // coarse rules provision-egress publishes and failed closed, so the flow
       // never got past provision-egress.
       const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
-        reconcileExclusiveRoutingResidue: vi.fn(async () => ({ reconciled: true })),
+        reconcileExclusiveRoutingResidue: residueOp(),
       });
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       // The flow proceeded all the way to a live exclusive arm.
       expect(result).toEqual({ kind: "armed-exclusive", uid: AGENT_UID, generationId: COMMITTED.generation_id });
       const residue = ops.reconcileExclusiveRoutingResidue as ReturnType<typeof vi.fn>;
-      expect(residue).toHaveBeenCalledTimes(1);
-      // The reconcile ran strictly BEFORE the first mutation (createAccount) and
+      // Judged once, cleared once.
+      expect(residue.mock.calls.map((c) => c[1])).toEqual(["observe", "clear"]);
+      // The clear ran strictly BEFORE the first mutation (createAccount) and
       // therefore before provision-egress (the wedge point) and the arm.
-      const residueOrder = residue.mock.invocationCallOrder[0]!;
+      const clearOrder = residue.mock.invocationCallOrder[1]!;
       const createOrder = (ops.createAccount as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
       const provisionOrder = (ops.provisionEgress as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
-      expect(residueOrder).toBeLessThan(createOrder);
-      expect(residueOrder).toBeLessThan(provisionOrder);
+      expect(clearOrder).toBeLessThan(createOrder);
+      expect(clearOrder).toBeLessThan(provisionOrder);
       expect(exclusive.bringUpGeneration).toHaveBeenCalledTimes(1);
     });
 
@@ -1528,7 +1542,7 @@ describe("castle-wall/provision/orchestrate", () => {
       // in a refusal AFTER the host has been changed.
       const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
         reconcileExclusiveRoutingResidue: vi.fn(async () => ({
-          reconciled: false,
+          kind: "kept-uncertain" as const,
           reason: "the S1 anchor registry is in an uncertain state (dirty=true, quarantined=0)",
         })),
       });
@@ -1553,30 +1567,33 @@ describe("castle-wall/provision/orchestrate", () => {
   // by the exclusive composition rules the leftover marker imposes, and was
   // refused AFTER mutating the host.
   //
-  // The gate is now mode-independent and pre-mutation. These assert both
-  // properties on the COARSE path, where every one of them was previously
-  // absent.
+  // The gate is now mode-independent, and its irreversible half sits AFTER the
+  // one confirm (FIX F1/F2, 2026-07-26). These assert both properties on the
+  // COARSE path, where every one of them was previously absent.
   // ────────────────────────────────────────────────────────────────────────
-  describe("exclusive-routing residue gate (mode-independent, pre-mutation)", () => {
+  describe("exclusive-routing residue gate (mode-independent, consent-ordered)", () => {
     it("REGRESSION (coarse): a run with NO exclusive mode declared and NO exclusive ops wired STILL runs the residue gate", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
       // Pre-fix this op did not exist on the coarse path at all: the self-heal
       // was gated on a mode the wedging component (the signing daemon) does
-      // not read.
+      // not read. With no marker on disk the judgement is the only call.
       expect(ops.reconcileExclusiveRoutingResidue).toHaveBeenCalledTimes(1);
+      expect(ops.reconcileExclusiveRoutingResidue).toHaveBeenCalledWith(undefined, "observe");
       expect(ops.exclusiveEgress).toBeUndefined();
     });
 
-    it("REGRESSION (coarse, the drill command): a KEPT marker REFUSES before any mutation and names the way out", async () => {
+    it("REGRESSION (coarse, the drill command): a live gate REFUSES before any mutation and names the way out", async () => {
       // The drill: a failed exclusive arm left exclusive-routing.json +
       // exclusive-egress-gate.json behind, and the next plain coarse
       // `protect --hermes --provision-agent-account` run was refused with the
-      // host already changed. It must now refuse with nothing changed.
+      // host already changed. It must now refuse with nothing changed. On the
+      // real F-COARSE-AFTER-EXCLUSIVE host the S5-1 registry held a committed
+      // entry, so this -- KEPT, not self-healed -- is the drill's own verdict.
       const ops = happyPathOps({
         reconcileExclusiveRoutingResidue: vi.fn(async () => ({
-          reconciled: false,
+          kind: "kept-live" as const,
           reason: "the S5-1 anchor registry still has an entry for uid 503 (committed or mid-bring-up)",
         })),
       });
@@ -1589,9 +1606,9 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const reason = (result as { reason: string }).reason;
       expect(reason).toMatch(/entry for uid 503/);
-      expect(reason).toMatch(/Nothing has been changed\./);
+      expect(reason).toMatch(/No account was created, nothing was re-homed, and no Castle Wall change was made/);
       expect(reason).toMatch(/sudo sanctuary protect --unprotect-egress-gate/);
-      // Pre-mutation means PRE-EVERYTHING, including the operator confirm.
+      // Refused before the confirm, and before every mutation.
       expect(ops.confirm).not.toHaveBeenCalled();
       expect(ops.createAccount).not.toHaveBeenCalled();
       expect(ops.rehome).not.toHaveBeenCalled();
@@ -1616,43 +1633,183 @@ describe("castle-wall/provision/orchestrate", () => {
     });
 
     it("REGRESSION (coarse): a provably-orphaned marker is SELF-HEALED and the coarse run proceeds to arm", async () => {
-      const ops = happyPathOps({
-        reconcileExclusiveRoutingResidue: vi.fn(async () => ({ reconciled: true })),
-      });
+      const ops = happyPathOps({ reconcileExclusiveRoutingResidue: residueOp() });
       const printed: string[] = [];
       (ops as { print: (line: string) => void }).print = (line: string) => printed.push(line);
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
-      expect(printed.join("\n")).toMatch(/Reconciled a stale exclusive-routing marker/);
+      // The removal is NAMED before the confirm, so the operator's yes covers it.
+      expect(printed.join("\n")).toMatch(/will be cleared if you proceed/);
+      // FIX F7: the flow does NOT re-print the self-heal fact. The production
+      // reconcile prints it (with the uid) at the moment it removes the files;
+      // both printing meant the operator read the same fact twice.
+      expect(printed.filter((l) => /Reconciled a stale exclusive-routing marker/.test(l))).toEqual([]);
     });
 
     it("scopes the reconcile to the uid this run RESOLVED, and passes undefined when none is resolved", async () => {
       const dedicated = happyPathOps();
       await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), dedicated);
-      expect(dedicated.reconcileExclusiveRoutingResidue).toHaveBeenCalledWith(AGENT_UID);
+      expect(dedicated.reconcileExclusiveRoutingResidue).toHaveBeenCalledWith(AGENT_UID, "observe");
 
       const fresh = happyPathOps();
       await runProvisionFlow(baseCtx({ detectResult: NEEDS_PROVISIONING }), fresh);
       // NEEDS_PROVISIONING resolved nothing; a marker then has no subject to be
       // judged against, and the production reconcile keeps it fail-closed.
-      expect(fresh.reconcileExclusiveRoutingResidue).toHaveBeenCalledWith(undefined);
+      expect(fresh.reconcileExclusiveRoutingResidue).toHaveBeenCalledWith(undefined, "observe");
     });
 
+    // ── FIX F1 (adversarial review, 2026-07-26) ──────────────────────────
+    // The first cut ran the WHOLE gate -- the self-heal's two `rm`s included --
+    // above the non-TTY refusal and the pre-declined return. A scripted run and
+    // an explicit decline therefore deleted `exclusive-routing.json` and
+    // `exclusive-egress-gate.json` from the operator's fortress and then
+    // reported that provisioning had been skipped. These three assert the
+    // property the PR claimed and did not have.
+    it("F1: a NON-TTY run never reaches the residue gate at all (it was never going to arm)", async () => {
+      const ops = happyPathOps({ reconcileExclusiveRoutingResidue: residueOp() });
+      const result = await runProvisionFlow(baseCtx({ isTty: false }), ops);
+      expect(result).toMatchObject({ kind: "skipped-non-tty-cooperative-only" });
+      // Pre-fix: called, and the marker + gate policy were already deleted.
+      expect(ops.reconcileExclusiveRoutingResidue).not.toHaveBeenCalled();
+    });
+
+    it("F1: an explicitly DECLINED run (--no-provision-agent-account) never reaches the residue gate", async () => {
+      const ops = happyPathOps({ reconcileExclusiveRoutingResidue: residueOp() });
+      const result = await runProvisionFlow(baseCtx({ preAnsweredProvision: false }), ops);
+      expect(result).toEqual({ kind: "declined-by-operator" });
+      expect(ops.reconcileExclusiveRoutingResidue).not.toHaveBeenCalled();
+    });
+
+    it("F1: an operator who answers 'n' at the confirm leaves the marker ON DISK -- the irreversible half never runs", async () => {
+      // The gate JUDGES before the confirm (so a doomed run is not confirmed)
+      // and REMOVES after it. This is the case the placement-only fix misses:
+      // the judgement is allowed, the removal is not.
+      const residue = residueOp();
+      const ops = happyPathOps({
+        reconcileExclusiveRoutingResidue: residue,
+        confirm: vi.fn(async () => false),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "declined-by-operator" });
+      expect(residue.mock.calls.map((c) => c[1])).toEqual(["observe"]);
+      expect(residue).not.toHaveBeenCalledWith(expect.anything(), "clear");
+    });
+
+    it("F1: the CLEAR half re-probes, and a marker that went live during the confirm ABORTS with the host untouched", async () => {
+      // The judgement-to-removal window spans operator think-time. Trusting the
+      // observation across it would mean removing a marker whose confinement
+      // came live in between -- a de-confinement. The clear call is authoritative.
+      const ops = happyPathOps({
+        reconcileExclusiveRoutingResidue: vi.fn(async (_uid: number | undefined, intent: "observe" | "clear") =>
+          intent === "observe"
+            ? { kind: "orphaned" as const, detail: "no registry entry and no serving gate for uid 707" }
+            : { kind: "kept-live" as const, reason: "a gate daemon now owns port 40001 under gate uid 708" },
+        ),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
+      expect((result as { reason: string }).reason).toMatch(/owns port 40001/);
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(ops.rehome).not.toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    // ── FIX F2/F3/F5 (adversarial review, 2026-07-26): the sentences ─────
     it("the refusal sentence is built from the VERDICT, and makes no claim about whether the wall is armed", () => {
-      const kept = describeExclusiveRoutingResidueRefusal({ kind: "kept", reason: "a gate is serving port 40001" });
-      expect(kept).toMatch(/present in this fortress and was KEPT \(a gate is serving port 40001\)/);
-      expect(kept).toMatch(/Nothing has been changed\./);
-      expect(kept).toMatch(/--unprotect-egress-gate/);
-      expect(kept).toMatch(/--repair-egress-gate/);
-      const unreadable = describeExclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "EACCES" });
-      expect(unreadable).toMatch(/could NOT be read \(EACCES\)/);
-      expect(unreadable).toMatch(/routing mode is unknown/);
-      // The armed/not-armed claim belongs to describeObservedAgentConfinement,
-      // which derives it from a probe. This sentence must not invent one.
-      for (const sentence of [kept, unreadable]) {
+      const sentences = [
+        describeExclusiveRoutingResidueRefusal({ kind: "kept-live", reason: "a gate is serving port 40001" }),
+        describeExclusiveRoutingResidueRefusal({ kind: "kept-uncertain", reason: "the registry is dirty" }),
+        describeExclusiveRoutingResidueRefusal({
+          kind: "kept-unknown-subject",
+          reason: "no subject",
+          markerAgentUid: 707,
+        }),
+        describeExclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "EACCES" }),
+      ];
+      for (const sentence of sentences) {
+        // The armed/not-armed claim belongs to describeObservedAgentConfinement,
+        // which derives it from a probe. This sentence must not invent one.
         expect(sentence).not.toMatch(/wall was NOT armed/i);
         expect(sentence).not.toMatch(/did not arm the wall/i);
+        // FIX F2: no counterfactual about a step this run does not reach. The
+        // refusing run never gets to arming, so it cannot report what arming
+        // would have done -- that is the same shape as the defect this whole
+        // fix exists downstream of.
+        expect(sentence).not.toMatch(/would be refused at the arming step/);
+        // FIX F5: "Nothing has been changed." was false at the command level --
+        // the cooperative wrap has already rewritten config by this point. The
+        // claim is scoped to what this flow did not do.
+        expect(sentence).not.toMatch(/Nothing has been changed/);
+        expect(sentence).toMatch(
+          /No account was created, nothing was re-homed, and no Castle Wall change was made by this run\./,
+        );
+        expect(sentence).toMatch(/--unprotect-egress-gate/);
       }
+    });
+
+    it("F2: a LIVE gate and an UNCERTAIN surface get different sentences and different remedies", () => {
+      const live = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-live",
+        reason: "the S5-1 anchor registry still has an entry for uid 503",
+      });
+      // The common instance of this refusal is a HEALTHY, correctly armed host.
+      // Telling that operator to unprotect tells them to de-confine a working
+      // agent and leave the harness parked and down, so "nothing needs doing"
+      // comes first and the cost of the teardown is stated.
+      expect(live).toMatch(/already has exclusive-egress confinement in place/);
+      expect(live).toMatch(/If the confinement already in place is the one you want, nothing needs doing/);
+      expect(live).toMatch(/leaves the harness parked and down/);
+      expect(live).not.toMatch(/could NOT be shown to be stale/);
+
+      const uncertain = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-uncertain",
+        reason: "the S5-1 anchor registry is in an uncertain state (dirty=true, quarantined=0)",
+      });
+      expect(uncertain).toMatch(/could NOT be shown to be stale/);
+      expect(uncertain).toMatch(/--repair-egress-gate/);
+      expect(uncertain).not.toMatch(/nothing needs doing/);
+    });
+
+    it("F3: the unknown-subject refusal names the verb that actually works when the agent account is gone", () => {
+      // The accepted wrong-refuse. Its old justification -- "it names the verb
+      // that clears it" -- was false: both named verbs resolved their subject
+      // with lookupAccountUid("_sanctuary-hermes"), so with the account gone
+      // unprotect exited 2 ("nothing to unprotect") and repair exited 2 telling
+      // the operator to run the very command this gate refuses. The sentence
+      // now names ONE verb, and that verb has a no-account residue teardown.
+      const sentence = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-unknown-subject",
+        reason: "this run has not resolved an agent uid to scope it against",
+        markerAgentUid: 707,
+      });
+      expect(sentence).toMatch(/marker for agent uid 707/);
+      expect(sentence).toMatch(/resolved no agent uid to scope it against/);
+      expect(sentence).toMatch(/--unprotect-egress-gate/);
+      expect(sentence).toMatch(/removes this residue even when the dedicated agent account is gone/);
+      // Repair is NOT offered here: it exits 2 in exactly this state.
+      expect(sentence).not.toMatch(/--repair-egress-gate/);
+    });
+
+    it("F4: the op boundary is a TOTAL union -- a keep can no longer be spelled by omission", () => {
+      // The op used to return `{ reconciled: boolean; reason?: string }`, so a
+      // wiring that KEPT a marker but omitted the reason read as "clear" and the
+      // run walked into the wedge. That is the two-fields-that-can-disagree
+      // shape #1006 deleted at the park boundary. Every verdict now carries its
+      // own discriminant, and the refusal narrowing is a switch: a new kind is
+      // a type error at this seam, not a silent "keep going".
+      expect(exclusiveRoutingResidueRefusal({ kind: "clear" })).toBeUndefined();
+      expect(exclusiveRoutingResidueRefusal({ kind: "orphaned", detail: "d" })).toBeUndefined();
+      expect(exclusiveRoutingResidueRefusal({ kind: "reconciled", detail: "d" })).toBeUndefined();
+      expect(exclusiveRoutingResidueRefusal({ kind: "kept-live", reason: "r" })).toMatchObject({ kind: "kept-live" });
+      expect(exclusiveRoutingResidueRefusal({ kind: "kept-uncertain", reason: "r" })).toMatchObject({
+        kind: "kept-uncertain",
+      });
+      expect(
+        exclusiveRoutingResidueRefusal({ kind: "kept-unknown-subject", reason: "r", markerAgentUid: 707 }),
+      ).toMatchObject({ kind: "kept-unknown-subject" });
+      expect(exclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "d" })).toMatchObject({
+        kind: "unreadable",
+      });
     });
   });
 

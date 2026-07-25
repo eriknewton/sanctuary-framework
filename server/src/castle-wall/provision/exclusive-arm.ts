@@ -65,15 +65,11 @@ export interface ExclusiveGenerationIdentity {
 }
 
 /**
- * Outcome of the exclusive-routing residue reconcile (D8 self-heal), whose
- * ONE caller is the mode-independent pre-mutation gate
- * `ProvisionFlowOps.reconcileExclusiveRoutingResidue` in `orchestrate.ts`.
- * `reconciled: true` means an ORPHANED marker (no live confinement anywhere)
- * was removed; `reconciled: false` means there was nothing to do (marker
- * absent) OR the marker was KEPT because confinement may be live (`reason`
- * says which, and is present exactly when a marker existed). A malformed
- * marker is NOT reported here: it THROWS (fail-closed, the caller must not
- * arm over an unreadable routing mode).
+ * What the exclusive-routing residue gate OBSERVED on disk, and -- on a
+ * `"clear"` intent -- what it did about it. The ONE caller is the
+ * mode-independent gate `ProvisionFlowOps.reconcileExclusiveRoutingResidue`
+ * in `orchestrate.ts` (plus the no-account teardown fallback the
+ * `--unprotect-egress-gate` verb uses).
  *
  * FIX F-COARSE-AFTER-EXCLUSIVE (class half, 2026-07-26): this type used to
  * belong to an op on {@link ExclusiveEgressArmOps}, which is wired ONLY when
@@ -81,13 +77,56 @@ export interface ExclusiveGenerationIdentity {
  * the plain COARSE run that hit the defect. The reconcile now hangs off the
  * mode-independent flow ops instead; the type stays here because the coarse
  * restore it shares its removal pair with lives in this stage.
+ *
+ * FIX F4 (adversarial review, 2026-07-26): this WAS `{ reconciled: boolean;
+ * reason?: string }`, i.e. two fields that can disagree -- a wiring that kept
+ * a marker but forgot the `reason` read as "nothing there" and the run walked
+ * into the wedge. That is the same shape #1006 deleted at the park boundary.
+ * The union is now TOTAL at the op boundary: "kept" cannot be spelled by
+ * omission, and each keep carries the reason its own operator sentence needs.
+ *
+ * FIX F1/F2 (adversarial review, 2026-07-26): `orphaned` is separate from
+ * `reconciled` because the JUDGEMENT and the irreversible REMOVAL are now two
+ * steps: the flow judges before the operator confirm (so it never asks anyone
+ * to confirm a doomed run) and removes only after the confirm has said yes.
  */
-export interface StaleExclusiveRoutingReconcileResult {
-  /** True ONLY when a provably-orphaned marker was removed. */
-  reconciled: boolean;
-  /** Why the marker was kept (present only when `reconciled` is false and a marker existed). */
-  reason?: string;
-}
+export type ExclusiveRoutingResidue =
+  /** No marker on disk. Coarse composition; the run may proceed. */
+  | { kind: "clear" }
+  /**
+   * A marker is present and PROVABLY orphaned (no registry entry, no serving
+   * gate, no gate plist), and this call was an `"observe"`: it has NOT been
+   * removed. The caller may remove it with a second `"clear"` call once every
+   * step that can still say no has said yes.
+   */
+  | { kind: "orphaned"; detail: string }
+  /** A provably-orphaned marker WAS removed by this call. The run may proceed. */
+  | { kind: "reconciled"; detail: string }
+  /**
+   * A marker is present and confinement for its uid looks LIVE (a committed or
+   * mid-bring-up S5-1 registry entry, or an owner-verified gate daemon serving
+   * the recorded port). This is not residue: a re-run cannot compose over it.
+   */
+  | { kind: "kept-live"; reason: string }
+  /**
+   * A marker is present and could NOT be shown to be stale (dirty or
+   * quarantined registry, unreadable/unparseable gate runtime state, a
+   * surviving gate plist, a cross-uid marker). Fail toward confinement: KEEP.
+   */
+  | { kind: "kept-uncertain"; reason: string }
+  /**
+   * A marker is present but this run resolved NO agent uid to scope it
+   * against, so guard 0 has no subject and a reconcile would be a cross-uid
+   * reconcile. Distinct from `kept-uncertain` because it is the one keep whose
+   * subject account may be gone entirely, and so needs its own way out.
+   */
+  | { kind: "kept-unknown-subject"; reason: string; markerAgentUid: number }
+  /**
+   * The marker could not be read at all (the load contract THROWS on a
+   * present-but-malformed marker; the flow turns that throw into this). The
+   * run must REFUSE, fail-closed: "could not look" is never "nothing there".
+   */
+  | { kind: "unreadable"; detail: string };
 
 /**
  * Injected side effects for the exclusive-egress arming stage. Production
