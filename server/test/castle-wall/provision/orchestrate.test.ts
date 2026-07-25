@@ -7,7 +7,12 @@
 
 import { describe, it, expect, vi } from "vitest";
 
-import { runProvisionFlow, type ProvisionFlowContext, type ProvisionFlowOps } from "../../../src/castle-wall/provision/orchestrate.js";
+import {
+  runProvisionFlow,
+  describeObservedAgentConfinement,
+  type ProvisionFlowContext,
+  type ProvisionFlowOps,
+} from "../../../src/castle-wall/provision/orchestrate.js";
 import type { ProvisionNeedResult } from "../../../src/castle-wall/provision/detect.js";
 import type { RehomeStepResult } from "../../../src/castle-wall/provision/rehome.js";
 import {
@@ -136,7 +141,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
       dnsRulePresent: true,
     })),
-    scrubProvisionedEgress: vi.fn(async () => undefined),
+    restoreProvisionedEgressToPreRunState: vi.fn(async () => ({ restored: true, reloadOk: true, problems: [] })),
     verifyAgentEgressAfterArm: vi.fn(async () => passingEgressReport()),
     auditEgress: vi.fn(async () => undefined),
     createAccount: vi.fn(async () => ({
@@ -172,6 +177,14 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       attemptedCount: REHOME_RESULTS.length,
       backupPaths: REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
       conflictPaths: [],
+    })),
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half): the default is a host with
+    // NOTHING confined, which is what the pre-fix flat sentence assumed. The
+    // regression tests below override it with the drill's actual state.
+    observeAgentConfinement: vi.fn(async () => ({
+      known: true as const,
+      confinedUids: [],
+      exclusiveRoutingMarkerPresent: false,
     })),
     ...overrides,
   };
@@ -963,7 +976,7 @@ describe("castle-wall/provision/orchestrate", () => {
           rule_ids: ["provisioned-hermes-abc123def456"],
         }),
       );
-      expect(ops.scrubProvisionedEgress).not.toHaveBeenCalled();
+      expect(ops.restoreProvisionedEgressToPreRunState).not.toHaveBeenCalled();
     });
 
     it("refuse-to-arm (fail-closed): provisionEgress ok:false aborts at 'provision-egress' BEFORE arm, scrubs any partial publish, and audits egress_provision_refused", async () => {
@@ -979,7 +992,7 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toMatchObject({ kind: "aborted", stage: "provision-egress", rolledBack: true });
       expect(ops.arm).not.toHaveBeenCalled();
       // A partial publish must never survive a refused run (no orphan grants).
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
       expect(ops.auditEgress).toHaveBeenCalledWith(
         "egress_provision_refused",
         expect.objectContaining({ stage: "provision-egress", disarm_outcome: "not-armed" }),
@@ -992,6 +1005,91 @@ describe("castle-wall/provision/orchestrate", () => {
       // The per-endpoint table was printed.
       const printed = (ops.print as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
       expect(printed.some((line) => /\[FAIL\] LLM \(Venice\)/.test(line))).toBe(true);
+    });
+
+    // -----------------------------------------------------------------------
+    // FIX F-COARSE-AFTER-EXCLUSIVE, honesty half (HIGH, Mini1 re-drill
+    // 2026-07-26). This abort printed the flat sentence "The wall was NOT
+    // armed". At the instant it printed on the drill host, pf was
+    // `Status: Enabled`, the gate registry showed
+    // `committed: [{agent_uid: 503, generation_id: 23}]`, and the confined
+    // agent was 0/9 reachable INCLUDING its own manifest. The sentence was
+    // true about the CODE PATH and false about the HOST.
+    // -----------------------------------------------------------------------
+    const refusingEgressOps = (
+      observe: ProvisionFlowOps["observeAgentConfinement"],
+    ): ProvisionFlowOps =>
+      happyPathOps({
+        provisionEgress: vi.fn(async () => ({
+          ok: false as const,
+          error: "policy reload after publishing egress rules failed: Exclusive routing composition rejected",
+          checks: [],
+          dnsRulePresent: true,
+        })),
+        observeAgentConfinement: observe,
+      });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a refused run over an ALREADY-CONFINED host never claims nothing is armed", async () => {
+      const result = await runProvisionFlow(
+        baseCtx(),
+        refusingEgressOps(
+          vi.fn(async () => ({
+            known: true as const,
+            confinedUids: [503],
+            exclusiveRoutingMarkerPresent: true,
+          })),
+        ),
+      );
+      const reason = (result as { reason: string }).reason;
+      // The pre-fix sentence, verbatim, must not be reachable.
+      expect(reason).not.toMatch(/The wall was NOT armed/);
+      // What IS said comes from the observation.
+      expect(reason).toMatch(/This run did not arm the wall, BUT/);
+      expect(reason).toMatch(/uid\(s\) 503 are confined/);
+      expect(reason).toMatch(/exclusive-routing marker/);
+      // And it names the product path that provably clears it (the drill's D9).
+      expect(reason).toMatch(/--unprotect-egress-gate/);
+    });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a clean host is described as clean, and an UNOBSERVABLE host as unknown", async () => {
+      const clean = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => ({ known: true as const, confinedUids: [], exclusiveRoutingMarkerPresent: false })),
+      ));
+      expect((clean as { reason: string }).reason).toMatch(/no per-agent egress confinement was observed/);
+      expect((clean as { reason: string }).reason).not.toMatch(/unprotect-egress-gate/);
+
+      // "Could not look" must never collapse into "nothing is armed".
+      const unknown = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => ({ known: false as const, reason: "the egress-gate registry could not be read: EACCES" })),
+      ));
+      const unknownReason = (unknown as { reason: string }).reason;
+      expect(unknownReason).toMatch(/could NOT be observed/);
+      expect(unknownReason).toMatch(/EACCES/);
+      expect(unknownReason).not.toMatch(/no per-agent egress confinement was observed/);
+
+      // A THROWING probe is also unknown, never quiet, and never fatal.
+      const threw = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => Promise.reject(new Error("probe exploded"))),
+      ));
+      expect((threw as { reason: string }).reason).toMatch(/probe threw: probe exploded/);
+    });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): describeObservedAgentConfinement is a pure function of the observation", () => {
+      // The render chokepoint asserted directly: the same observation must
+      // produce the same sentence regardless of which caller reached it.
+      expect(
+        describeObservedAgentConfinement({ known: true, confinedUids: [], exclusiveRoutingMarkerPresent: false }),
+      ).toBe("This run did not arm the wall, and no per-agent egress confinement was observed on this host.");
+      const markerOnly = describeObservedAgentConfinement({
+        known: true,
+        confinedUids: [],
+        exclusiveRoutingMarkerPresent: true,
+      });
+      // A marker with NO committed uid is still exclusive composition, and is
+      // still enough to refuse the coarse path -- so it must not read clean.
+      expect(markerOnly).toMatch(/exclusive-routing marker/);
+      expect(markerOnly).toMatch(/--unprotect-egress-gate/);
+      expect(markerOnly).not.toMatch(/no per-agent egress confinement was observed/);
     });
 
     it("post-arm as-uid verify failure fast-disarms, scrubs the provisioned rules, audits egress_provision_refused, and returns the DISTINCT egress-unprovisioned-rolled-back outcome", async () => {
@@ -1015,13 +1113,13 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toMatchObject({
         kind: "egress-unprovisioned-rolled-back",
         uid: AGENT_UID,
-        scrubbed: true,
+        egressRestoredToPreRunState: true,
       });
       expect(ops.disarm).toHaveBeenCalledTimes(1);
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
       // Fast-disarm ordering: filter off BEFORE the rule scrub.
       const disarmOrder = (ops.disarm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-      const scrubOrder = (ops.scrubProvisionedEgress as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const scrubOrder = (ops.restoreProvisionedEgressToPreRunState as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       expect(disarmOrder).toBeLessThan(scrubOrder);
       expect(ops.auditEgress).toHaveBeenCalledWith(
         "egress_provision_refused",
@@ -1107,7 +1205,7 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "uid-existence-gate" });
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
     });
 
     it("a FAILED egress scrub on abort is surfaced LOUDLY in the reason, never silently swallowed", async () => {
@@ -1117,13 +1215,13 @@ describe("castle-wall/provision/orchestrate", () => {
           accountName: "sanctuary-hermes",
           reason: "account does not exist",
         })),
-        scrubProvisionedEgress: vi.fn(async () => {
+        restoreProvisionedEgressToPreRunState: vi.fn(async () => {
           throw new Error("EACCES: rules dir not writable");
         }),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       const reason = (result as { reason: string }).reason;
-      expect(reason).toMatch(/provisioned egress allow rules could NOT be scrubbed/);
+      expect(reason).toMatch(/egress allow rules could NOT be restored to their pre-run state/);
       expect(reason).toMatch(/EACCES: rules dir not writable/);
     });
 
@@ -1138,7 +1236,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon" });
       expect(ops.provisionEgress).not.toHaveBeenCalled();
-      expect(ops.scrubProvisionedEgress).not.toHaveBeenCalled();
+      expect(ops.restoreProvisionedEgressToPreRunState).not.toHaveBeenCalled();
     });
 
     it("the Tier-1 confirm plan-print names every egress grant BEFORE the confirm, with the exfil-risk marking on messaging hosts", async () => {
@@ -1178,7 +1276,88 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "armed-then-rolled-back", uid: AGENT_UID });
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * FIX F-REVOKE (Mini1 confined-Hermes drill 2026-07-26): the rollback is
+     * only allowed to read as clean when the pre-run rule state was OBSERVED
+     * back AND is being served. On hardware the operator got "the re-homed
+     * paths were restored to your account" while six signed allow rules a
+     * previous run had published were gone and the live agent could reach
+     * nothing.
+     */
+    describe("F-REVOKE: a rollback that did not restore the agent's grants says so loudly", () => {
+      it("REGRESSION: an unrestored rule set warns that a still-running agent may reach nothing, and names the recovery command", async () => {
+        const ops = happyPathOps({
+          checkUidExistence: vi.fn(async () => ({
+            ok: false as const,
+            accountName: "sanctuary-hermes",
+            reason: "account does not exist",
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: false,
+            reloadOk: false,
+            problems: ["provisioned-hermes-abc123def456 was not restored"],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        const reason = (result as { reason: string }).reason;
+        expect(reason).toMatch(/MAY NOW REACH NOTHING/);
+        expect(reason).toMatch(/sudo sanctuary protect --hermes/);
+        expect(reason).toMatch(/provisioned-hermes-abc123def456 was not restored/);
+      });
+
+      it("REGRESSION: rules back on disk but no confirmed reload is reported as not-yet-serving, with the reload command", async () => {
+        const ops = happyPathOps({
+          checkUidExistence: vi.fn(async () => ({
+            ok: false as const,
+            accountName: "sanctuary-hermes",
+            reason: "account does not exist",
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: true,
+            reloadOk: false,
+            problems: [],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        const reason = (result as { reason: string }).reason;
+        expect(reason).toMatch(/restored on disk but the policy daemon did NOT confirm/);
+        expect(reason).toMatch(/sanctuary castle-wall reload/);
+      });
+
+      it("REGRESSION: the post-arm outcome does NOT claim the pre-run rule state was restored when the reload was unconfirmed", async () => {
+        const ops = happyPathOps({
+          verifyAgentEgressAfterArm: vi.fn(async () => ({
+            ok: false,
+            rows: [
+              {
+                name: "LLM (Venice)",
+                host: "api.venice.ai",
+                port: 443,
+                expected: "reachable" as const,
+                observed: "blocked" as const,
+                pass: false,
+              },
+            ],
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: true,
+            reloadOk: false,
+            problems: [],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        expect(result).toMatchObject({
+          kind: "egress-unprovisioned-rolled-back",
+          egressRestoredToPreRunState: false,
+        });
+        expect(ops.auditEgress).toHaveBeenCalledWith(
+          "egress_provision_refused",
+          expect.objectContaining({ egress_rules_restored_to_pre_run_state: false }),
+        );
+      });
     });
   });
 

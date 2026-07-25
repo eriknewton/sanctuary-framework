@@ -298,14 +298,31 @@ export interface ProvisionFlowOps {
     | { ok: false; error: string; checks?: EndpointStaticCheck[]; dnsRulePresent?: boolean }
   >;
   /**
-   * Remove every provisioned egress rule this flow's harness owns from the
-   * signed manifest source (verified: no `provisioned-<harness>-*` rule
-   * survives). Used on abort/rollback after `provisionEgress` succeeded so a
-   * failed provision run never leaves orphan grants (design section 6; a
-   * stale allow surviving teardown would combine with any future evaluator
-   * widening into a standing grant). Idempotent + fail-loud.
+   * Put this harness's provisioned egress rules back to the state
+   * `provisionEgress` found them in, and VERIFY the result by reading the
+   * signing source back. Used on abort/rollback after `provisionEgress` ran.
+   *
+   * Design section 6 says a failed run must leave no orphan grants, and on a
+   * FIRST run the pre-run state is "no provisioned rules", so this still
+   * removes everything the run added. FIX F-REVOKE (Mini1 drill 2026-07-26):
+   * the pre-fix op was an unconditional scrub of every
+   * `provisioned-<harness>-*` rule, which on a SECOND run also revoked the
+   * grants a previous successful provision had published and this run never
+   * touched -- taking a live, correctly-confined agent from "reaches its own
+   * manifest" to "reaches nothing" underneath an operator-facing message that
+   * read like a clean rollback.
+   *
+   * Never throws (it runs on abort paths, where a throw would mask the
+   * original failure). `restored: false` or `reloadOk: false` MUST reach the
+   * operator as loud, actionable guidance -- see {@link restoreEgressBestEffort}.
    */
-  scrubProvisionedEgress(): Promise<void>;
+  restoreProvisionedEgressToPreRunState(): Promise<{
+    /** Observed: the rules directory matches the pre-run capture byte-for-byte. */
+    restored: boolean;
+    /** Observed: the running policy daemon reloaded, so the restored set is actually being served. */
+    reloadOk: boolean;
+    problems: string[];
+  }>;
   /**
    * Post-arm as-uid egress verification (design section 5, the check the
    * 2026-07-09 drill proved DNS-only probes cannot make): a probe process
@@ -392,6 +409,78 @@ export interface ProvisionFlowOps {
    * a parked agent and no path to release it).
    */
   exclusiveEgress?: ExclusiveEgressArmOps;
+  /**
+   * OBSERVE the host's CURRENT per-agent egress confinement, for the abort
+   * paths that must say something about enforcement state.
+   *
+   * FIX F-COARSE-AFTER-EXCLUSIVE, honesty half (HIGH, Mini1 re-drill
+   * 2026-07-26). The provision-egress abort printed the flat sentence "The
+   * wall was NOT armed". On the drill host, at the instant that sentence was
+   * printed, pf was `Status: Enabled`, the gate registry showed
+   * `committed: [{agent_uid: 503, generation_id: 23}]`, and the confined agent
+   * was 0/9 reachable INCLUDING its own manifest. The product told the
+   * operator nothing was armed while the machine was enforcing. The sentence
+   * was true about the CODE PATH ("this run did not reach the arm step") and
+   * false about the HOST -- which is the exact class this codebase forbids.
+   *
+   * So enforcement-state prose is now derived from an OBSERVATION. MUST never
+   * throw: an unobservable host is reported as unobserved, never as "nothing
+   * is armed".
+   */
+  observeAgentConfinement(): Promise<ObservedAgentConfinement>;
+}
+
+/**
+ * What {@link ProvisionFlowOps.observeAgentConfinement} saw. Deliberately a
+ * discriminated union: "we could not look" must be representable, because
+ * collapsing it into `false` is how "nothing is armed" gets said about a host
+ * that is enforcing.
+ */
+export type ObservedAgentConfinement =
+  | {
+      known: true;
+      /** Uids with a committed per-uid egress-gate confinement right now. */
+      confinedUids: number[];
+      /** True when the fortress carries an exclusive-routing marker. */
+      exclusiveRoutingMarkerPresent: boolean;
+    }
+  | { known: false; reason: string };
+
+/**
+ * THE enforcement-state sentence for a refused (never-armed-by-this-run)
+ * provisioning attempt -- the single place this claim is put into words, and
+ * it is a function of the OBSERVATION, not of the caller's position in the
+ * control flow. Exported so the mapping observation -> sentence is asserted
+ * directly.
+ *
+ * The first clause is always the same, because it is the one thing the code
+ * path genuinely knows: THIS RUN did not arm anything. Everything after it
+ * comes from what was measured.
+ */
+export function describeObservedAgentConfinement(observed: ObservedAgentConfinement): string {
+  if (!observed.known) {
+    return (
+      "This run did not arm the wall. The host's CURRENT enforcement state could NOT be observed " +
+      `(${observed.reason}), so this run makes no claim about it -- check it with: ` +
+      "'sanctuary castle-wall status'."
+    );
+  }
+  if (observed.confinedUids.length === 0 && !observed.exclusiveRoutingMarkerPresent) {
+    return "This run did not arm the wall, and no per-agent egress confinement was observed on this host.";
+  }
+  const parts: string[] = [];
+  if (observed.confinedUids.length > 0) {
+    parts.push(`uid(s) ${observed.confinedUids.join(", ")} are confined by a committed egress gate`);
+  }
+  if (observed.exclusiveRoutingMarkerPresent) {
+    parts.push("the fortress carries an exclusive-routing marker");
+  }
+  return (
+    "This run did not arm the wall, BUT per-agent egress confinement from an EARLIER run is live on " +
+    `this host (${parts.join("; ")}). A confined agent may be reaching nothing right now, and while ` +
+    "the exclusive routing composition stands this coarse path will keep being refused. Clear it with: " +
+    "'sudo sanctuary protect --unprotect-egress-gate'."
+  );
 }
 
 /**
@@ -505,16 +594,23 @@ export type ProvisionFlowOutcome =
    * variant, never a widened shared enum (the file-grant round-4 lesson).
    * The wall ARMED, but the post-arm AS-UID egress verification failed (an
    * endpoint unreachable as the agent uid, or the negative control
-   * reachable), so the flow fast-disarmed (fix B2) and scrubbed the
-   * provisioned rules rather than leave a confined-into-silence agent or an
-   * unverified grant. The agent stays re-homed under its dedicated account.
+   * reachable), so the flow fast-disarmed (fix B2) and put the provisioned
+   * rules back to their pre-run state rather than leave a confined-into-silence
+   * agent or an unverified grant. The agent stays re-homed under its dedicated
+   * account.
    */
   | {
       kind: "egress-unprovisioned-rolled-back";
       uid: number;
       reason: string;
-      /** False when the provisioned-rule scrub after fast-disarm could not be confirmed. */
-      scrubbed: boolean;
+      /**
+       * FIX F-REVOKE: OBSERVED -- the harness's provisioned rules match the
+       * pre-run capture and the daemon confirmed the reload. On a first run the
+       * pre-run state is "none", so this is the old scrub claim; on a re-run it
+       * additionally asserts a previous run's grants SURVIVED. False when
+       * either could not be confirmed (the outcome carries the loud note).
+       */
+      egressRestoredToPreRunState: boolean;
       disarmObservedOff?: true;
     }
   /**
@@ -1132,17 +1228,20 @@ async function runProvisionFlowSteps(
       policyDaemonFreshlyInstalled,
       true,
     );
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half): OBSERVE before claiming.
+    // See `describeObservedAgentConfinement`.
+    const observedConfinement = await observeConfinementSafely(ops);
     return {
       kind: "aborted",
       stage: "provision-egress",
       reason: withDaemonTeardownNote(
         `refusing to arm: the egress path for the confined agent could not be provisioned and verified ` +
-          `(${egress.error}). The wall was NOT armed; the agent would have been confined into ` +
-          `non-functionality. ` +
+          `(${egress.error}). ${describeObservedAgentConfinement(observedConfinement)} ` +
+          `The agent would have been confined into non-functionality. ` +
           describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
         td.daemonTeardownError,
         td.policyDaemonTeardownError,
-        td.egressScrubError,
+        td.egressRestoreNote,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
@@ -1194,7 +1293,7 @@ async function runProvisionFlowSteps(
           describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
         td.daemonTeardownError,
         td.policyDaemonTeardownError,
-        td.egressScrubError,
+        td.egressRestoreNote,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
@@ -1228,7 +1327,7 @@ async function runProvisionFlowSteps(
         existenceCheck.reason,
         td.daemonTeardownError,
         td.policyDaemonTeardownError,
-        td.egressScrubError,
+        td.egressRestoreNote,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
@@ -1312,7 +1411,7 @@ async function runProvisionFlowSteps(
           armResult.error,
           td.daemonTeardownError,
           td.policyDaemonTeardownError,
-          td.egressScrubError,
+          td.egressRestoreNote,
         ),
         wallMayBeArmed,
         disarmNote,
@@ -1376,15 +1475,15 @@ async function runProvisionFlowSteps(
         disarmError: (disarmErr as Error).message,
       };
     }
-    // No orphan grants on a rolled-back run (design section 6): scrub the
-    // egress rules this run provisioned. Best-effort + fail-loud (folded into
+    // No orphan grants on a rolled-back run (design section 6): put the egress
+    // rules back to their pre-run state. Best-effort + fail-loud (folded into
     // the reason); the wall is already down, so a surviving rule is inert
     // until a future arm, but it must still be surfaced, never silent.
-    const scrubNote = await scrubEgressBestEffort(ops, egressProvisionedThisRun);
+    const restoreNote = await restoreEgressBestEffort(ops, egressProvisionedThisRun);
     return {
       kind: "armed-then-rolled-back",
       uid,
-      reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.${scrubNote}`,
+      reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.${egressRestoreReasonSuffix(restoreNote)}`,
       disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
@@ -1432,7 +1531,7 @@ async function runProvisionFlowSteps(
         disarmError: (disarmErr as Error).message,
       };
     }
-    const scrubNote = await scrubEgressBestEffort(ops, egressProvisionedThisRun);
+    const restoreNote = await restoreEgressBestEffort(ops, egressProvisionedThisRun);
     await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
       stage: "post-arm-as-uid-verify",
       harness: ctx.agentId,
@@ -1440,13 +1539,13 @@ async function runProvisionFlowSteps(
       declared_endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
       probe_rows: egressVerify.rows,
       disarm_outcome: "fast-disarmed",
-      rules_scrubbed: scrubNote === "",
+      egress_rules_restored_to_pre_run_state: restoreNote === "",
     });
     return {
       kind: "egress-unprovisioned-rolled-back",
       uid,
-      reason: `${egressBaseReason} Fast-disarmed rather than leave a bricked-or-unconfined agent.${scrubNote}`,
-      scrubbed: disarmed && scrubNote === "",
+      reason: `${egressBaseReason} Fast-disarmed rather than leave a bricked-or-unconfined agent.${egressRestoreReasonSuffix(restoreNote)}`,
+      egressRestoredToPreRunState: disarmed && restoreNote === "",
       disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
@@ -1494,26 +1593,65 @@ async function runProvisionFlowSteps(
 }
 
 /**
- * Best-effort provisioned-rule scrub for the rolled-back branches. Returns
- * "" on success (or when nothing was provisioned this run), or a loud
- * manual-recovery note to append to the outcome reason on failure. Never
- * throws.
+ * Best-effort provisioned-rule restore for the rolled-back branches. Returns
+ * "" when the pre-run rule set was restored AND is being served again (or when
+ * nothing was provisioned this run), or a bare, loud manual-recovery sentence
+ * naming the recovery path otherwise. Never throws.
+ *
+ * FIX F-REVOKE: the note distinguishes the two failure shapes, because they
+ * strand the operator differently. `restored: false` means the rule FILES may
+ * be wrong on disk. `reloadOk: false` means the files are right but the
+ * running daemon has not picked them up, so a still-running agent may be
+ * reaching nothing until it does. The sentence is returned UNWRAPPED so the
+ * two consumers (an inline reason suffix and {@link withDaemonTeardownNote})
+ * punctuate it their own way without either owning a second copy of the words.
  */
-async function scrubEgressBestEffort(
+async function restoreEgressBestEffort(
   ops: ProvisionFlowOps,
   egressProvisionedThisRun: boolean,
 ): Promise<string> {
   if (!egressProvisionedThisRun) return "";
+  let result: { restored: boolean; reloadOk: boolean; problems: string[] };
   try {
-    await ops.scrubProvisionedEgress();
-    return "";
+    result = await ops.restoreProvisionedEgressToPreRunState();
   } catch (err) {
+    result = { restored: false, reloadOk: false, problems: [(err as Error).message] };
+  }
+  if (!result.restored) {
     return (
-      ` (NOTE: the provisioned egress allow rules could NOT be scrubbed automatically: ` +
-      `${(err as Error).message}. They are inert while the wall is disarmed, but remove the ` +
-      `provisioned-* rule files under <fortress>/policy/egress/rules/ before re-arming manually.)`
+      `WARNING: the agent's egress allow rules could NOT be restored to their pre-run state ` +
+      `(${result.problems.join("; ")}). A CONFINED AGENT THAT IS STILL RUNNING MAY NOW REACH NOTHING. ` +
+      `Recover with: sudo sanctuary protect --hermes (re-provisions and republishes the agent's grants), ` +
+      `or inspect the provisioned-* rule files under <fortress>/policy/egress/rules/ directly.`
     );
   }
+  if (!result.reloadOk) {
+    return (
+      `WARNING: the agent's egress allow rules were restored on disk but the policy daemon did NOT confirm ` +
+      `a reload, so the running wall may still be serving the composition from this failed run. ` +
+      `Apply it with: sudo sanctuary castle-wall reload.`
+    );
+  }
+  return "";
+}
+
+/**
+ * Run {@link ProvisionFlowOps.observeAgentConfinement} without letting it
+ * change the abort's outcome. A probe that throws is UNKNOWN, never "nothing
+ * is confined" -- the whole point of the fix is that an unobservable host must
+ * not be described as a quiet one.
+ */
+async function observeConfinementSafely(ops: ProvisionFlowOps): Promise<ObservedAgentConfinement> {
+  try {
+    return await ops.observeAgentConfinement();
+  } catch (err) {
+    return { known: false, reason: `confinement probe threw: ${(err as Error).message}` };
+  }
+}
+
+/** Punctuate a {@link restoreEgressBestEffort} sentence for appending to an outcome reason. */
+function egressRestoreReasonSuffix(note: string): string {
+  return note === "" ? "" : ` (${note})`;
 }
 
 function describeRestoreForReason(
@@ -1589,7 +1727,7 @@ async function teardownDaemonAndRestore(
   results: RehomeStepResult[],
   tearDownDaemon: boolean,
   tearDownPolicyDaemon: boolean,
-  scrubEgress = false,
+  restoreEgress = false,
 ): Promise<{
   rolledBack: boolean | "partial";
   backupPaths: string[];
@@ -1597,7 +1735,8 @@ async function teardownDaemonAndRestore(
   failedPaths: string[];
   daemonTeardownError?: string;
   policyDaemonTeardownError?: string;
-  egressScrubError?: string;
+  /** The loud note from {@link restoreEgressBestEffort}, or undefined when the pre-run rule set is back and being served. */
+  egressRestoreNote?: string;
 }> {
   // FIX (round 5 / R6-3): only tear the harness daemon down when THIS run stood
   // it up (the fresh-provision path). On the alreadyDedicated re-run path the
@@ -1630,17 +1769,12 @@ async function teardownDaemonAndRestore(
       policyDaemonTeardownError = (err as Error).message;
     }
   }
-  // Confined-agent egress (design section 6): rules this run provisioned are
-  // scrubbed on abort so a failed run never leaves orphan grants. Best-effort
-  // + fail-loud (folded into the abort reason), never blocks the restore.
-  let egressScrubError: string | undefined;
-  if (scrubEgress) {
-    try {
-      await ops.scrubProvisionedEgress();
-    } catch (err) {
-      egressScrubError = (err as Error).message;
-    }
-  }
+  // Confined-agent egress (design section 6 + FIX F-REVOKE): the harness's
+  // rules are put back to the state this run found them in, so a failed run
+  // leaves neither orphan grants (first run: pre-run state is "none") nor a
+  // strangled agent (re-run: a previous run's grants survive). Best-effort +
+  // fail-loud (folded into the abort reason), never blocks the restore.
+  const egressRestoreNote = (await restoreEgressBestEffort(ops, restoreEgress)) || undefined;
   const restore = await safeRestore(ops, results);
   return {
     rolledBack: restore.rolledBack,
@@ -1649,7 +1783,7 @@ async function teardownDaemonAndRestore(
     failedPaths: restore.failedPaths,
     daemonTeardownError,
     policyDaemonTeardownError,
-    egressScrubError,
+    egressRestoreNote,
   };
 }
 
@@ -1664,7 +1798,7 @@ function withDaemonTeardownNote(
   reason: string,
   daemonTeardownError?: string,
   policyDaemonTeardownError?: string,
-  egressScrubError?: string,
+  egressRestoreNote?: string,
 ): string {
   const notes: string[] = [];
   if (daemonTeardownError !== undefined) {
@@ -1680,11 +1814,11 @@ function withDaemonTeardownNote(
         `A root LaunchDaemon may still be running -- run 'sudo sanctuary castle-wall uninstall-boot --yes' to remove it before re-running.`,
     );
   }
-  if (egressScrubError !== undefined) {
-    notes.push(
-      `the provisioned egress allow rules could NOT be scrubbed automatically: ${egressScrubError}. ` +
-        `Remove the provisioned-* rule files under <fortress>/policy/egress/rules/ before re-arming manually.`,
-    );
+  if (egressRestoreNote !== undefined) {
+    // FIX F-REVOKE: already a complete, actionable sentence (it names which of
+    // the two failure shapes happened and the recovery command); folding it in
+    // verbatim keeps ONE author of that wording rather than two that can drift.
+    notes.push(egressRestoreNote);
   }
   if (notes.length === 0) {
     return reason;

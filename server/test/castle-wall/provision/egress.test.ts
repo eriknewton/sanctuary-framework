@@ -24,6 +24,8 @@ import {
   verifyProvisionedEgressStatically,
   publishProvisionedEgressRules,
   scrubProvisionedEgressRules,
+  snapshotProvisionedEgressRules,
+  restoreProvisionedEgressRules,
   readEgressRulesFromDisk,
   egressRulesDir,
   buildAgentEgressProbeSpecs,
@@ -303,6 +305,175 @@ describe("castle-wall/provision/egress: publish + scrub (hermetic tmp fortress)"
     });
     expect(result.removedRuleIds.length).toBeGreaterThan(0);
     expect(result.reloadOk).toBe(false);
+  });
+
+  /**
+   * FIX F-REVOKE (HIGH, Mini1 confined-Hermes drill 2026-07-26). On hardware a
+   * refused SECOND arm reported "the re-homed paths were restored" and "no
+   * files were moved before this stop" while having revoked all six signed
+   * allow rules a PREVIOUS successful run had published. The live agent went
+   * from reaching its own manifest to reaching nothing, with no product CLI
+   * path back. Fail-closed, never a wrong-allow, but an adopter trap.
+   */
+  describe("F-REVOKE: snapshot + restore instead of a blanket scrub", () => {
+    it("REGRESSION: restoring to a NON-EMPTY pre-run capture keeps a previous run's grants alive, byte-for-byte", async () => {
+      const fortress = await makeFortress();
+      const reload = async () => ({ ok: true });
+      // Run 1: a successful provision publishes the agent's grants.
+      await publishProvisionedEgressRules({
+        fortressPath: fortress,
+        endpointSet: HERMES_ENDPOINT_SET,
+        reloadPolicy: reload,
+      });
+      // Run 2 captures them, then publishes over them and fails somewhere later.
+      const snapshot = await snapshotProvisionedEgressRules(fortress, "hermes");
+      expect(snapshot.length).toBe(HERMES_ENDPOINT_SET.endpoints.length);
+      const dir = egressRulesDir(fortress);
+      // Simulate run 2's mutation: an extra rule published, one overwritten.
+      await writeFile(join(dir, "provisioned-hermes-aaaaaaaaaaaa.json"), "{}");
+      await writeFile(join(dir, snapshot[0]!.filename), "{}");
+
+      const result = await restoreProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        snapshot,
+        reloadPolicy: reload,
+      });
+
+      expect(result.restored).toBe(true);
+      expect(result.reloadOk).toBe(true);
+      expect(result.problems).toEqual([]);
+      expect(result.removedRuleIds).toEqual(["provisioned-hermes-aaaaaaaaaaaa"]);
+      // The pre-run grants are back, exactly as they were -- this is the whole
+      // finding: the pre-fix scrub left this directory EMPTY.
+      const after = await snapshotProvisionedEgressRules(fortress, "hermes");
+      expect(after).toEqual(snapshot);
+      const persisted = await readEgressRulesFromDisk(fortress);
+      expect(verifyProvisionedEgressStatically(persisted, HERMES_ENDPOINT_SET, RESOLVERS, NOW).ok).toBe(true);
+    });
+
+    it("an EMPTY pre-run capture still removes everything this run published (no orphan grants on a first run)", async () => {
+      const fortress = await makeFortress();
+      const snapshot = await snapshotProvisionedEgressRules(fortress, "hermes");
+      expect(snapshot).toEqual([]);
+      await publishProvisionedEgressRules({
+        fortressPath: fortress,
+        endpointSet: HERMES_ENDPOINT_SET,
+        reloadPolicy: async () => ({ ok: true }),
+      });
+      const result = await restoreProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        snapshot,
+      });
+      expect(result.restored).toBe(true);
+      expect(result.removedRuleIds).toHaveLength(HERMES_ENDPOINT_SET.endpoints.length);
+      expect(await snapshotProvisionedEgressRules(fortress, "hermes")).toEqual([]);
+    });
+
+    it("VERIFIES rather than reports: a restore whose write did not land reports restored:false and names the rule", async () => {
+      const fortress = await makeFortress();
+      // A capture that references the rules dir path as a FILE makes the
+      // rewrite impossible, so the read-back cannot match.
+      const snapshot = [{ filename: "provisioned-hermes-abcdefabcdef.json", content: '{"id":"x"}' }];
+      const dir = egressRulesDir(fortress);
+      await mkdir(join(dir, "provisioned-hermes-abcdefabcdef.json"), { recursive: true });
+      const result = await restoreProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        snapshot,
+      });
+      expect(result.restored).toBe(false);
+      expect(result.restoredRuleIds).toEqual([]);
+      expect(result.problems.join(" ")).toMatch(/rewriting the provisioned rule files failed|abcdefabcdef/);
+    });
+
+    it("reports a rule that survived the restore but was not in the capture (never silently accepts extra grants)", async () => {
+      const fortress = await makeFortress();
+      const dir = egressRulesDir(fortress);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "provisioned-hermes-bbbbbbbbbbbb.json"), "{}");
+      // A capture that is missing the file on disk AND cannot remove it would
+      // be exotic; assert the simpler invariant directly through the read-back:
+      // a restore to an empty capture must leave nothing behind.
+      const result = await restoreProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        snapshot: [],
+      });
+      expect(result.restored).toBe(true);
+      expect(result.removedRuleIds).toEqual(["provisioned-hermes-bbbbbbbbbbbb"]);
+    });
+
+    it("restore never touches operator-authored or other-harness rules", async () => {
+      const fortress = await makeFortress();
+      const dir = egressRulesDir(fortress);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "operator-custom.json"), JSON.stringify({ any: "thing" }));
+      await writeFile(join(dir, "provisioned-otherharness-111111111111.json"), "{}");
+      await publishProvisionedEgressRules({
+        fortressPath: fortress,
+        endpointSet: HERMES_ENDPOINT_SET,
+        reloadPolicy: async () => ({ ok: true }),
+      });
+      await restoreProvisionedEgressRules({ fortressPath: fortress, harnessId: "hermes", snapshot: [] });
+      const filenames = await readdir(dir);
+      expect(filenames).toContain("operator-custom.json");
+      expect(filenames).toContain("provisioned-otherharness-111111111111.json");
+    });
+
+    it("an unconfirmed reload is reported (files right on disk, running daemon not yet serving them)", async () => {
+      const fortress = await makeFortress();
+      await publishProvisionedEgressRules({
+        fortressPath: fortress,
+        endpointSet: HERMES_ENDPOINT_SET,
+        reloadPolicy: async () => ({ ok: true }),
+      });
+      const snapshot = await snapshotProvisionedEgressRules(fortress, "hermes");
+      const result = await restoreProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        snapshot,
+        reloadPolicy: async () => ({ ok: false, error: "daemon gone" }),
+      });
+      expect(result.restored).toBe(true);
+      expect(result.reloadOk).toBe(false);
+    });
+
+    it("a reload that THROWS is reported as unconfirmed, never as success", async () => {
+      const fortress = await makeFortress();
+      const result = await restoreProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        snapshot: [],
+        reloadPolicy: async () => {
+          throw new Error("socket closed");
+        },
+      });
+      expect(result.reloadOk).toBe(false);
+    });
+
+    it("refuses a snapshot entry that is not a plain provisioned-<harness>-*.json filename (never writes outside the rules dir)", async () => {
+      const fortress = await makeFortress();
+      const result = await restoreProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        snapshot: [
+          { filename: "provisioned-hermes-../../../../etc/evil.json", content: "{}" },
+          { filename: "operator-custom.json", content: "{}" },
+        ],
+      });
+      expect(result.restored).toBe(false);
+      expect(result.problems).toHaveLength(2);
+      expect(result.problems.join(" ")).toMatch(/refusing to restore/);
+      // Nothing was written anywhere.
+      expect(await snapshotProvisionedEgressRules(fortress, "hermes")).toEqual([]);
+    });
+
+    it("snapshot of a never-provisioned fortress is empty, not an error", async () => {
+      const fresh = await makeFortress();
+      expect(await snapshotProvisionedEgressRules(fresh, "hermes")).toEqual([]);
+    });
   });
 
   it("readEgressRulesFromDisk throws on an INVALID rule file (fail-closed: verification against a ruleset the daemon would refuse is meaningless)", async () => {

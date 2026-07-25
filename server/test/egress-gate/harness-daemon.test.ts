@@ -15,6 +15,9 @@ import {
   HARNESS_FORBIDDEN_PLIST_ENV,
   renderAgentHarnessDaemonPlist,
   planAgentHarnessDaemonInstall,
+  planCoarseHarnessDaemonInstall,
+  harnessLaunchSpec,
+  REQUIRED_HARNESS_LAUNCH_ENV,
   installAgentHarnessDaemon,
   uninstallAgentHarnessDaemon,
   agentHarnessDaemonStatus,
@@ -941,5 +944,66 @@ describe("setAgentHarnessJobDisabled reads the override database back (fix-round
   it("accepts when the verb exits 0 and the table agrees", async () => {
     await expect(setAgentHarnessJobDisabled(overrideOps({ disabledTable: true }), true)).resolves.toBeUndefined();
     await expect(setAgentHarnessJobDisabled(overrideOps({ disabledTable: false }), false)).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX F-HARNESSENV (HIGH, Mini1 confined-Hermes re-drill 2026-07-26)
+// ---------------------------------------------------------------------------
+describe("harnessLaunchSpec (the argv+environment chokepoint)", () => {
+  const goodEnv = {
+    HERMES_ACCEPT_HOOKS: "1",
+    HOME: "/var/sanctuary-agents/sanctuary-hermes",
+    PYTHONPATH: "/var/sanctuary-agents/sanctuary-hermes/.hermes/hermes-agent",
+  };
+
+  it("carries argv and environment as ONE frozen value", () => {
+    const spec = harnessLaunchSpec({ programArguments: ["/opt/venv/bin/python", "-m", "x"], environment: goodEnv });
+    expect(spec.programArguments).toEqual(["/opt/venv/bin/python", "-m", "x"]);
+    expect(spec.environment).toEqual(goodEnv);
+    expect(Object.isFrozen(spec)).toBe(true);
+    expect(Object.isFrozen(spec.environment)).toBe(true);
+  });
+
+  it("REFUSES a launch missing any required environment name, naming the missing ones", () => {
+    for (const missing of REQUIRED_HARNESS_LAUNCH_ENV) {
+      const environment: Record<string, string> = { ...goodEnv };
+      delete environment[missing];
+      expect(() => harnessLaunchSpec({ programArguments: ["/opt/venv/bin/python"], environment })).toThrow(
+        new RegExp(missing),
+      );
+    }
+    // Present-but-empty is missing: an empty PYTHONPATH is the same failure as
+    // no PYTHONPATH, and the drill's crash came from an unset one.
+    expect(() =>
+      harnessLaunchSpec({ programArguments: ["/opt/venv/bin/python"], environment: { ...goodEnv, PYTHONPATH: "" } }),
+    ).toThrow(/PYTHONPATH/);
+  });
+
+  it("REFUSES an empty or relative argv (a LaunchDaemon does not search PATH)", () => {
+    expect(() => harnessLaunchSpec({ programArguments: [], environment: goodEnv })).toThrow(/non-empty argv/);
+    expect(() => harnessLaunchSpec({ programArguments: ["python"], environment: goodEnv })).toThrow(/ABSOLUTE/);
+  });
+
+  it("planCoarseHarnessDaemonInstall renders the environment (the degraded coarse RESTORE path)", () => {
+    // The drill's coarse restore rendered the plain plist from a bare argv, so
+    // the very step that puts the agent back the way it was produced a plist
+    // the agent could not start under ("coarse harness start failed").
+    const plan = planCoarseHarnessDaemonInstall({
+      agentAccount: "sanctuary-hermes",
+      harnessLaunch: harnessLaunchSpec({
+        programArguments: ["/opt/venv/bin/python", "-m", "x"],
+        environment: goodEnv,
+      }),
+      fortressPath: "/Users/operator/.sanctuary",
+    });
+    for (const [name, value] of Object.entries(goodEnv)) {
+      expect(plan.plistContent).toContain(`<key>${name}</key>`);
+      expect(plan.plistContent).toContain(`<string>${value}</string>`);
+    }
+    expect(plan.plistContent).toContain("<key>SANCTUARY_STORAGE_PATH</key>");
+    // Still the PLAIN (coarse) form, not the barrier form.
+    expect(plan.plistContent).toContain("<key>RunAtLoad</key>\n\t<true/>");
+    expect(plan.plistContent).not.toContain("Disabled");
   });
 });

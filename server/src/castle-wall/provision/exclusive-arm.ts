@@ -349,7 +349,14 @@ async function degradeLoud(
     `Exclusive egress could NOT come live (${stage}): ${reason}. ` +
       (coarseCompositionRestored
         ? "The coarse Castle Wall remains armed and the manifest is back in coarse scope (a distinct NON-GREEN state on every posture surface). "
-        : "The manifest could NOT be restored to coarse scope. ") +
+        : // FIX F-COARSE-AFTER-EXCLUSIVE: an unrestored coarse composition
+          // means the fortress is STILL in exclusive routing composition, and
+          // in that state the plain coarse arm path is refused -- so "re-run
+          // the repair" (below) is not by itself a way out. Name the product
+          // path that provably clears it.
+          "The manifest could NOT be restored to coarse scope, so the fortress is STILL in EXCLUSIVE " +
+          "routing composition: a plain 'sudo sanctuary protect --hermes' will be REFUSED until it is " +
+          "cleared with 'sudo sanctuary protect --unprotect-egress-gate'. ") +
       // The ONE sentence about run state, and it comes from the chokepoint.
       harnessDispositionSentence(harness) +
       " Fix with: sudo sanctuary protect --repair-egress-gate",
@@ -443,6 +450,24 @@ export interface EgressGateRepairOps {
   bringUpGeneration(): Promise<ExclusiveGenerationIdentity>;
   /** Same as {@link ExclusiveEgressArmOps.runReleaseSequence}. */
   runReleaseSequence(committed: ExclusiveGenerationIdentity): Promise<ReleaseBarrierOutcome>;
+  /**
+   * Same as {@link ExclusiveEgressArmOps.restoreCoarseComposition}: the AUDITED
+   * S5-4 coarse-only restore (gate daemons down, exclusive marker + gate policy
+   * removed, registry entry + credential + token torn down, endpoint rules
+   * republished agent-scoped, composition verified residue-free).
+   *
+   * FIX F-COARSE-AFTER-EXCLUSIVE (HIGH, Mini1 re-drill 2026-07-26). The arm
+   * path already degraded to coarse on every failure; the REPAIR path did not.
+   * So a repair whose bring-up committed a generation and whose release then
+   * failed left the fortress in EXCLUSIVE routing composition with the agent
+   * parked -- and the next plain `sudo sanctuary protect --hermes`, a command
+   * that had worked 25 minutes earlier, was refused by the exclusive
+   * composition invariant ("agent-reachable direct endpoint allow(s) survived
+   * composition"). Nothing in the product cleared that except the operator
+   * knowing to run `--unprotect-egress-gate`. A failed repair must leave the
+   * fortress in a composition the coarse path can still arm.
+   */
+  restoreCoarseComposition(reason: string): Promise<void>;
   /** Best-effort audit (distinct local ops). MUST never throw. */
   audit(operation: string, details: Record<string, unknown>): Promise<void>;
   print(line: string): void;
@@ -478,6 +503,25 @@ export type EgressGateRepairOutcome =
       reason: string;
       parkedStateVerified: boolean;
       parkedStateProblems: string[];
+      /**
+       * FIX F-COARSE-AFTER-EXCLUSIVE: what the fortress's ROUTING COMPOSITION
+       * was left in, so the operator is never told a failed repair is inert
+       * when it has actually left the host in a mode that refuses the coarse
+       * arm path.
+       *
+       *  - `"restored"`: the audited coarse-only restore ran and verified; a
+       *    plain `sudo sanctuary protect --hermes` will work again.
+       *  - `"not-attempted"`: this failure happened BEFORE the bring-up put
+       *    the fortress into exclusive composition, so there was nothing this
+       *    run needed to undo.
+       *  - `"exclusive-left"`: the restore was owed and FAILED. The fortress
+       *    is still in exclusive routing composition; the coarse path will be
+       *    refused until `--unprotect-egress-gate` clears it. `error` carries
+       *    the restore failure.
+       */
+      coarseComposition: "restored" | "not-attempted" | "exclusive-left";
+      /** Present only when `coarseComposition === "exclusive-left"`. */
+      coarseRestoreError?: string;
     };
 
 /**
@@ -506,7 +550,28 @@ export async function runEgressGateRepair(
   const failParked = async (
     stage: "park" | "quarantine-repair" | "recover" | "bring-up" | "release",
     reason: string,
+    /**
+     * FIX F-COARSE-AFTER-EXCLUSIVE: true for the stages that run AFTER the
+     * bring-up has put the fortress into exclusive routing composition. Those
+     * are exactly the failures that used to strand the host in a mode where
+     * the plain coarse arm is refused.
+     */
+    exclusiveCompositionOwed: boolean,
   ): Promise<EgressGateRepairOutcome> => {
+    let coarseComposition: "restored" | "not-attempted" | "exclusive-left" = "not-attempted";
+    let coarseRestoreError: string | undefined;
+    if (exclusiveCompositionOwed) {
+      try {
+        await ops.restoreCoarseComposition(reason);
+        coarseComposition = "restored";
+      } catch (err) {
+        coarseComposition = "exclusive-left";
+        coarseRestoreError = (err as Error).message;
+      }
+    }
+    // Parked state is probed AFTER the restore: the restore re-publishes the
+    // manifest and tears gate surfaces down, so a claim taken before it would
+    // describe a host state that no longer exists by the time it is printed.
     let parked: { ok: true } | { ok: false; problems: string[] };
     try {
       parked = await ops.verifyParkedPersistent();
@@ -519,6 +584,8 @@ export async function runEgressGateRepair(
       reason,
       parkedStateVerified: parked.ok,
       parkedStateProblems: parked.ok ? [] : parked.problems,
+      coarseComposition,
+      ...(coarseRestoreError !== undefined ? { coarseRestoreError } : {}),
     };
   };
   // Override is TTY-ONLY (design: "interactive TTY only"): a non-interactive
@@ -583,7 +650,7 @@ export async function runEgressGateRepair(
   try {
     await ops.parkHarness();
   } catch (err) {
-    return failParked("park", `could not park the harness before repair: ${(err as Error).message}`);
+    return failParked("park", `could not park the harness before repair: ${(err as Error).message}`, false);
   }
 
   // Stage: quarantine-repair (fix-round-4 P2). MUST run before any other
@@ -668,25 +735,26 @@ export async function runEgressGateRepair(
     return failParked(
       "quarantine-repair",
       `quarantined-registry repair failed (registry left untouched, still dirty): ${(err as Error).message}`,
+      false,
     );
   }
 
   try {
     await ops.recoverGeneration();
   } catch (err) {
-    return failParked("recover", (err as Error).message);
+    return failParked("recover", (err as Error).message, false);
   }
   let committed: ExclusiveGenerationIdentity;
   try {
     committed = await ops.bringUpGeneration();
   } catch (err) {
-    return failParked("bring-up", (err as Error).message);
+    return failParked("bring-up", (err as Error).message, true);
   }
   let release: ReleaseBarrierOutcome;
   try {
     release = await ops.runReleaseSequence(committed);
   } catch (err) {
-    return failParked("release", (err as Error).message);
+    return failParked("release", (err as Error).message, true);
   }
   if (release.kind === "released") {
     await ops.audit(EGRESS_GATE_REPAIR_AUDIT_OP, {
@@ -708,7 +776,11 @@ export async function runEgressGateRepair(
       reparkError: release.reparkError,
     };
   }
-  return failParked("release", `release barrier parked at stage ${release.stage}: ${release.reason}`);
+  // FIX F-COARSE-AFTER-EXCLUSIVE: THE drill's actual path. The bring-up
+  // committed a generation (fortress now in exclusive composition) and the
+  // barrier then refused to release. Pre-fix this returned with the fortress
+  // still exclusive, which is what made the next plain coarse arm refuse.
+  return failParked("release", `release barrier parked at stage ${release.stage}: ${release.reason}`, true);
 }
 
 // ---------------------------------------------------------------------------

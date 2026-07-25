@@ -85,8 +85,8 @@ export type {
   UnprovisionStepOutcome,
 } from "./unprovision.js";
 
-export { resolveHermesGatewayArgv } from "./harness-argv.js";
-export type { HarnessArgvOps, ResolvedHarnessArgv } from "./harness-argv.js";
+export { resolveHermesGatewayArgv, realHarnessArgvOps } from "./harness-argv.js";
+export type { HarnessArgvOps, InterpreterVersion, ResolvedHarnessArgv } from "./harness-argv.js";
 
 export { runProvisionFlow } from "./orchestrate.js";
 export type {
@@ -117,6 +117,8 @@ export {
   readEgressRulesFromDisk,
   publishProvisionedEgressRules,
   scrubProvisionedEgressRules,
+  snapshotProvisionedEgressRules,
+  restoreProvisionedEgressRules,
   buildAgentEgressProbeSpecs,
   buildAgentEgressReport,
   asUidTlsProbeArgv,
@@ -133,6 +135,9 @@ export type {
   PublishProvisionedEgressResult,
   ScrubProvisionedEgressInput,
   ScrubProvisionedEgressResult,
+  ProvisionedEgressRuleFile,
+  RestoreProvisionedEgressInput,
+  RestoreProvisionedEgressResult,
   AgentEgressProbeSpec,
   AgentEgressProbeRow,
   AgentEgressVerifyReport,

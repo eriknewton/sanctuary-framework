@@ -252,6 +252,7 @@ function repairOps(overrides: Partial<EgressGateRepairOps> = {}): EgressGateRepa
     recoverGeneration: vi.fn(async () => undefined),
     bringUpGeneration: vi.fn(async () => ({ ...COMMITTED })),
     runReleaseSequence: vi.fn(async () => RELEASED),
+    restoreCoarseComposition: vi.fn(async () => undefined),
     audit: vi.fn(async () => undefined),
     print: vi.fn(),
     ...overrides,
@@ -361,6 +362,68 @@ describe("runEgressGateRepair", () => {
         parkedStateProblems: [],
       });
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX F-COARSE-AFTER-EXCLUSIVE (HIGH, Mini1 re-drill 2026-07-26)
+  //
+  // The arm path already degraded to coarse on every failure. The REPAIR path
+  // did not: its bring-up committed a generation (putting the fortress into
+  // exclusive routing composition) and, when the release then failed, it
+  // returned with the fortress still exclusive. On the drill host that made the
+  // next plain `sudo sanctuary protect --hermes` -- the command that had worked
+  // 25 minutes earlier -- refuse with "agent-reachable direct endpoint allow(s)
+  // survived composition", with the agent 0/9 reachable and no product path
+  // named. Only `--unprotect-egress-gate` cleared it.
+  // -------------------------------------------------------------------------
+  it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a release failure AFTER bring-up restores the coarse composition", async () => {
+    const ops = repairOps({ runReleaseSequence: vi.fn(async () => await parkedBarrierOutcome()) });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toMatchObject({
+      kind: "repair-failed",
+      stage: "release",
+      coarseComposition: "restored",
+    });
+    expect(ops.restoreCoarseComposition).toHaveBeenCalledTimes(1);
+    // The restore is told WHY, so its audited coarse-fallback record carries
+    // the originating reason rather than a generic string.
+    expect(vi.mocked(ops.restoreCoarseComposition).mock.calls[0]![0]).toContain("release barrier parked");
+  });
+
+  it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a THROWN release also restores coarse; a failure BEFORE bring-up does not", async () => {
+    const thrown = repairOps({ runReleaseSequence: vi.fn(async () => Promise.reject(new Error("launchctl"))) });
+    expect(await runEgressGateRepair(REPAIR_CTX, thrown)).toMatchObject({
+      stage: "release",
+      coarseComposition: "restored",
+    });
+
+    // Nothing this run did put the fortress into exclusive composition, so
+    // there is nothing to undo -- and claiming a restore would be its own
+    // false statement about host state.
+    for (const overrides of [
+      { parkHarness: vi.fn(async () => Promise.reject(new Error("still running"))) },
+      { recoverGeneration: vi.fn(async () => Promise.reject(new Error("locked"))) },
+    ]) {
+      const ops = repairOps(overrides as Partial<EgressGateRepairOps>);
+      expect(await runEgressGateRepair(REPAIR_CTX, ops)).toMatchObject({
+        coarseComposition: "not-attempted",
+      });
+      expect(ops.restoreCoarseComposition).not.toHaveBeenCalled();
+    }
+  });
+
+  it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a FAILED coarse restore is reported as exclusive-left, never silently", async () => {
+    const ops = repairOps({
+      runReleaseSequence: vi.fn(async () => await parkedBarrierOutcome()),
+      restoreCoarseComposition: vi.fn(async () => Promise.reject(new Error("coarse republish failed"))),
+    });
+    const outcome = await runEgressGateRepair(REPAIR_CTX, ops);
+    expect(outcome).toMatchObject({
+      kind: "repair-failed",
+      stage: "release",
+      coarseComposition: "exclusive-left",
+      coarseRestoreError: "coarse republish failed",
+    });
   });
 
   it("fix-round BLOCKER-3: the harness is PARKED (verified) after the drift gate and BEFORE any mutation", async () => {

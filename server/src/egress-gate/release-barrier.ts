@@ -84,6 +84,7 @@ import {
   renderAgentHarnessDaemonPlist,
   type AgentHarnessDaemonPlistOptions,
   type HarnessDaemonStatus,
+  type HarnessLaunchSpec,
 } from "./harness-daemon.js";
 import {
   assessHarnessParked,
@@ -491,14 +492,22 @@ export interface ParkedHarnessInstallOptions {
   agentAccount: string;
   /** The confined agent uid (names the hold file). */
   agentUid: number;
-  /** The REAL harness argv the wrapper will digest-check and exec. */
-  harnessArgv: string[];
+  /**
+   * The REAL harness launch the wrapper will digest-check and exec: argv AND
+   * the environment that argv needs, as ONE value.
+   *
+   * FIX F-HARNESSENV: this used to be a bare `harnessArgv: string[]` beside an
+   * OPTIONAL `environment`, and every re-render in `arming-wiring.ts` passed
+   * the former and omitted the latter -- so the plist the agent was actually
+   * released under started the gateway with no `PYTHONPATH`. A
+   * {@link HarnessLaunchSpec} cannot be built without a validated environment,
+   * so the two can no longer be separated at any call site.
+   */
+  harnessLaunch: HarnessLaunchSpec;
   /** Passed through to the plist renderer. */
   fortressPath?: string;
   /** Passed through to the plist renderer. */
   logDir?: string;
-  /** Passed through to the plist renderer (forbidden-env list still applies). */
-  environment?: Record<string, string>;
   /** Hold dir override (tests only). Default {@link AGENT_HARNESS_HOLD_DIR}. */
   holdDir?: string;
   /**
@@ -541,14 +550,16 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
     holdFilePath,
     expectedGenerationId: options.expectedGenerationId ?? PARKED_EXPECTED_GENERATION,
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
-    harnessArgv: options.harnessArgv,
+    harnessArgv: options.harnessLaunch.programArguments,
   });
   const plistOptions: AgentHarnessDaemonPlistOptions = {
     agentAccount: options.agentAccount,
     programArguments,
     fortressPath: options.fortressPath,
     logDir: options.logDir,
-    environment: options.environment,
+    // FIX F-HARNESSENV: derived from the SAME value the argv came from, so a
+    // parked/released re-render can never drop it.
+    environment: options.harnessLaunch.environment,
     disabled: true,
     runAtLoad: false,
     keepAliveCrashedOnly: true,

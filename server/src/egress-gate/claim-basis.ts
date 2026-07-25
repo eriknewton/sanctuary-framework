@@ -256,6 +256,7 @@ export type ClaimSiteId =
   | "arming-wiring.peer-resolver-status"
   | "arming-wiring.peer-resolver-reload-settled"
   | "arming-wiring.gate-daemon-reload-settled"
+  | "arming-wiring.observe-agent-confinement"
   // --- egress-gate, other modules ---
   | "anchor-registry.apply-union-flush"
   | "pf-anchor.arm"
@@ -294,11 +295,15 @@ export type ClaimSiteId =
   | "provision-orchestrate.rules-scrubbed"
   | "provision-orchestrate.armed"
   | "provision-orchestrate.rehome-restored-note"
+  | "provision-orchestrate.observed-agent-confinement"
   | "provision-unprovision.disarm-ok"
   | "provision-unprovision.uninstall-daemon-ok"
   | "provision-unprovision.scrub-ok"
   | "provision-unprovision.restore-rehome-ok"
   | "provision-unprovision.fully-ok"
+  // --- castle-wall/provision (FIX F-REVOKE + F-INTERP, 2026-07-26) ---
+  | "provision-egress.restore-reload-ok"
+  | "provision-harness-argv.path-exists"
   // --- wrap/cli.ts (THE RENDER LAYER -- had zero rows before fix-round 4) ---
   | "wrap-cli.degrade-agent-state";
 
@@ -932,10 +937,40 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
         "which of the two cases holds; that is distinguished in the caller's error text, not in the boolean.",
     },
   },
+  "arming-wiring.observe-agent-confinement": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "observeAgentConfinementProduction",
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half). The refused-run sentence
+    // used to be "The wall was NOT armed", a claim derived from the CODE PATH
+    // while the drill host was measurably enforcing (pf enabled, generation 23
+    // committed, agent 0/9). This row is the replacement's basis: the claim is
+    // now a READ of the committed registry set + the fortress routing marker.
+    // The negative arm matters as much as the positive one -- an unreadable
+    // registry or marker is UNKNOWN, never "nothing is confined".
+    claim:
+      "the uids currently confined by a committed egress gate, and whether the fortress carries an " +
+      "exclusive-routing marker",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim:
+        "the host's confinement state could NOT be read (registry or marker unreadable); NO claim is made " +
+        "about whether anything is armed",
+      basis: "observed",
+    },
+  },
   "arming-wiring.verify-parked-persistent": {
     file: `${EG}/arming-wiring.ts`,
     symbol: "verifyHarnessParkedPersistent",
-    claim: "not running, persistently disabled, no hold file, parked plist on disk",
+    // FIX F-HARNESSENV: the plist half of this claim now has two forms. With a
+    // resolved harness launch it is the byte-compare against the rendered
+    // parked barrier form; WITHOUT one (the S5-7 MED-1 condition) there is no
+    // renderable form, so the posture required is that the plist be ABSENT
+    // (absent === unbootable). Both are reads of the on-disk plist.
+    claim:
+      "not running, persistently disabled, no hold file, and the parked plist on disk (or, with no resolvable " +
+      "harness launch, no plist at all)",
     basis: "observed",
     layer: "compute",
     branches: "boolean",
@@ -1587,6 +1622,23 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     layer: "render",
     branches: "single",
   },
+  "provision-orchestrate.observed-agent-confinement": {
+    file: `${CW}/orchestrate.ts`,
+    symbol: "describeObservedAgentConfinement",
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half), RENDER side. The sentence
+    // an abort prints about enforcement state is now a pure function of the
+    // observation (`arming-wiring.observe-agent-confinement`), never of which
+    // branch the reader reached. The only thing it asserts from control flow
+    // is "THIS RUN did not arm the wall", which is the one fact the code path
+    // genuinely owns.
+    claim:
+      "this run armed nothing, plus the OBSERVED per-agent egress confinement on the host (or an explicit " +
+      "could-not-observe)",
+    basis: "observed",
+    detectorBlind: true,
+    layer: "render",
+    branches: "single",
+  },
   "provision-orchestrate.disarmed": {
     file: `${CW}/orchestrate.ts`,
     symbol: "runProvisionFlowSteps",
@@ -1608,13 +1660,19 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "provision-orchestrate.rules-scrubbed": {
     file: `${CW}/orchestrate.ts`,
     symbol: "runProvisionFlowSteps",
-    claim: "the provisioned egress rules were scrubbed",
+    // FIX F-REVOKE (2026-07-26): the claim used to be "the provisioned egress
+    // rules were scrubbed", which asserted REMOVAL on both branches. On a
+    // second `protect` run the rules being removed were a PREVIOUS run's live
+    // grants, so the true claim is now about restoration to the pre-run
+    // capture, and it is observed by a byte-for-byte read-back plus a
+    // confirmed daemon reload.
+    claim: "the provisioned egress rules were restored to their pre-run state and are being served",
     basis: "observed",
     layer: "compute",
     branches: "boolean",
     negativeBranch: {
       claim:
-        "the provisioned rules were NOT scrubbed; the outcome carries the manual-recovery note",
+        "the pre-run rule state was NOT restored (or the reload was not confirmed); the outcome carries the manual-recovery note",
       basis: "observed",
     },
   },
@@ -1710,6 +1768,33 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     branches: "single",
     detectorBlind: true,
   },
+  // FIX F-REVOKE (2026-07-26): the two new literals the drill's third finding
+  // introduced, classified rather than counted away.
+  "provision-egress.restore-reload-ok": {
+    file: `${CW}/egress.ts`,
+    symbol: "restoreProvisionedEgressRules",
+    claim: "the restored pre-run rule set is being served by the running policy daemon",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim:
+        "the reload was requested and did NOT confirm (or threw); the rules are on disk but may not be serving",
+      basis: "observed",
+    },
+  },
+  "provision-harness-argv.path-exists": {
+    file: `${CW}/harness-argv.ts`,
+    symbol: "realHarnessArgvOps",
+    claim: "the path is present and accessible to THIS process",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim: "the path could not be accessed by this process",
+      basis: "observed",
+    },
+  },
   "provision-unprovision.fully-ok": {
     file: `${CW}/unprovision.ts`,
     symbol: "unprovisionFullyOk",
@@ -1754,20 +1839,20 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
 export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/account.ts`]: 1,
   [`${CW}/detect.ts`]: 0,
-  [`${CW}/egress.ts`]: 4,
+  [`${CW}/egress.ts`]: 5,
   [`${CW}/exclusive-arm.ts`]: 3,
   [`${CW}/exclusive-unprotect.ts`]: 4,
-  [`${CW}/harness-argv.ts`]: 0,
+  [`${CW}/harness-argv.ts`]: 1,
   [`${CW}/index.ts`]: 0,
   [`${CW}/lockfile.ts`]: 0,
-  [`${CW}/orchestrate.ts`]: 9,
+  [`${CW}/orchestrate.ts`]: 10,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,
   [`${CW}/uid-gate.ts`]: 2,
   [`${CW}/unprovision.ts`]: 4,
   [`${CW}/verify.ts`]: 1,
   [`${EG}/anchor-registry.ts`]: 0,
-  [`${EG}/arming-wiring.ts`]: 28,
+  [`${EG}/arming-wiring.ts`]: 31,
   [`${EG}/claim-basis.ts`]: 3,
   [`${EG}/drift-guard.ts`]: 0,
   [`${EG}/exec-runner.ts`]: 0,

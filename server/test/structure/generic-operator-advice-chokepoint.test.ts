@@ -47,6 +47,62 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "the provisioning orchestrator is reached from the Hermes-gated auto-provision path",
   },
   {
+    // FIX F-REVOKE (2026-07-26): the rollback note names the ONE command that
+    // republishes the agent's grants after a restore could not put them back.
+    file: "server/src/castle-wall/provision/orchestrate.ts",
+    scope: "restoreEgressBestEffort",
+    snippet: "Recover with: sudo sanctuary protect --hermes (re-provisions and republishes the agent's grants), ",
+    exact: true,
+    expectedCount: 1,
+    reason: "the provisioning orchestrator is reached from the Hermes-gated auto-provision path",
+  },
+  {
+    // FIX F-INTERP (2026-07-26): both refusals name the Hermes reinstall +
+    // re-protect path, because the fault is a re-homed Hermes runtime whose
+    // interpreter the agent uid cannot use.
+    file: "server/src/castle-wall/provision/harness-argv.ts",
+    scope: "resolveHermesGatewayArgv",
+    snippet: "Repair the re-homed Hermes runtime (reinstall Hermes as the operator, then re-run 'sudo sanctuary protect --hermes').",
+    exact: true,
+    expectedCount: 1,
+    reason: "harness-argv resolves ONLY the Hermes gateway; its refusals are Hermes-scoped by construction",
+  },
+  {
+    file: "server/src/castle-wall/provision/harness-argv.ts",
+    scope: "resolveHermesGatewayArgv",
+    snippet: "then re-run 'sudo sanctuary protect --hermes'.",
+    exact: true,
+    expectedCount: 1,
+    reason: "harness-argv resolves ONLY the Hermes gateway; its refusals are Hermes-scoped by construction",
+  },
+  {
+    // FIX F-COARSE-AFTER-EXCLUSIVE (2026-07-26): when the coarse restore FAILS
+    // the fortress is left in exclusive routing composition, in which the plain
+    // Hermes arm is REFUSED -- so the degrade message must name that command as
+    // the one that will not work, and name the verb that clears it.
+    file: "server/src/castle-wall/provision/exclusive-arm.ts",
+    scope: "degradeLoud",
+    snippet: "will be REFUSED until it is",
+    expectedCount: 3,
+    reason: "the exclusive-egress arming stage is only reached from the Hermes-gated auto-provision path",
+  },
+  {
+    // FIX F-COARSE-AFTER-EXCLUSIVE (2026-07-26): the repair verb's sentence
+    // about what the fortress's routing composition was left in.
+    file: "server/src/wrap/auto-provision.ts",
+    scope: "describeRepairCoarseComposition",
+    snippet: "path works again.",
+    expectedCount: 2,
+    reason: "the repair verb is Hermes-only (`--repair-egress-gate` provisions the Hermes agent account)",
+  },
+  {
+    file: "server/src/wrap/auto-provision.ts",
+    scope: "describeRepairCoarseComposition",
+    snippet: "will be REFUSED by the composition invariant",
+    expectedCount: 1,
+    reason: "the repair verb is Hermes-only (`--repair-egress-gate` provisions the Hermes agent account)",
+  },
+  {
     file: "server/src/cli.ts",
     scope: "printWrapHelpEarly",
     snippet: "sanctuary protect --hermes         Protect Hermes Agent",
