@@ -22,7 +22,7 @@
  * inversion durable (a new operator-attribution detail key cannot leak).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,7 @@ import ts from "typescript";
 import { createSanctuaryServer } from "../../src/index.js";
 import { AuditLog, BROKER_OPS } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
   redactAuditEntryForAgent,
@@ -98,6 +99,27 @@ function binding(identityId: string) {
     requester_identity_fingerprint: fingerprintIdentityId(identityId),
   };
 }
+
+
+// Fortress hermeticity: `createSanctuaryServer` boots the real server, and its
+// step 20 writes the config unconditionally. With `HOME` left alone that write
+// lands on the operator's own `~/.sanctuary/sanctuary.json` -- measured, not
+// inferred: this file was one of five bisected as rewriting it on every suite
+// run. Injecting `MemoryStorage` is not enough, because `config.storage_path`
+// still comes from `defaultConfig()`'s `join(homedir(), ".sanctuary")`.
+// Moving `HOME` redirects the mkdir, the permission tightening, and the config
+// write onto a throwaway directory without changing anything under test.
+// `saveConfig` now fails such a write closed under Vitest, so removing this
+// isolation turns the leak into a loud failure rather than a silent one.
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+
+beforeEach(async () => {
+  fortressHome = await createTempHome("sanctuary-audit-allowlist");
+});
+
+afterEach(async () => {
+  await fortressHome.cleanup();
+});
 
 describe("agent-audit-allowlist: unit (redactAuditEntryForAgent)", () => {
   it("(a) emits ONLY {timestamp, operation, result, has_details} — never reason/threshold/details", () => {

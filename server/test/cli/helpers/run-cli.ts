@@ -28,6 +28,29 @@
  *      a transient failure the helper throws a descriptive error rather than
  *      returning a coerced `1`, so a future regression reads as the
  *      contention / spawn problem it is instead of "expected 1 to be 0".
+ *
+ * What this helper is, and is NOT, the single place for
+ * -----------------------------------------------------
+ * `runCliRaw` is the shared SPAWN helper for tests that can use `execFile`.
+ * Three test files route through it today (`audit-chain-help`, `help-routing`,
+ * `per-subcommand-help`), so it is NOT "the single place every CLI-subprocess
+ * test spawns through", and an earlier version of the comment below said so
+ * incorrectly. Tests that need piped stdin cannot use it at all, because
+ * `execFile` has no `input` option.
+ *
+ * The genuinely shared concern is the child's ENVIRONMENT, which is why the
+ * fortress isolation lives in the separately exported `isolateChildFortress`.
+ * A direct spawner opts into hermeticity without inheriting the retry
+ * machinery; `test/cli/exit-tier1-tty.test.ts` does exactly that.
+ *
+ * Known remaining direct spawners, and why they are acceptable:
+ *   - `test/transparency/auditor-pack-drill.test.ts` spawns
+ *     `dist/verify-transparency.js`, a standalone verifier that reads only the
+ *     explicit `--input` / `--public-key-file` paths it is given and never
+ *     resolves a fortress.
+ *   - `test/mcp-child/fortress-refusal.test.ts` and
+ *     `test/transparency/cli-transparency-bundled.test.ts` already name their
+ *     fortress explicitly (`SANCTUARY_FORTRESS_PATH`, `--fortress`).
  */
 
 import { execFile } from "node:child_process";
@@ -97,6 +120,68 @@ const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Give a spawned child its own throwaway fortress, mutating `env` in place.
+ *
+ * THIS, not `runCliRaw`, is the chokepoint. A spawned CLI is still part of the
+ * test, but it is a fresh process, so none of the in-process isolation a test
+ * does (overriding HOME in a `beforeEach`, passing an explicit `storagePath`)
+ * reaches it. Left alone the child resolves the operator's own `~/.sanctuary`
+ * and both reads real custody and writes into it, which is one of the ways
+ * that fortress's backup directory grew to thousands of files.
+ *
+ * An earlier version of this logic lived inline in `runCliRaw` and was
+ * described there as covering "the single place every CLI-subprocess test
+ * spawns through". It was not: only three test files route through
+ * `runCliRaw`, and `test/cli/exit-tier1-tty.test.ts` spawned the built CLI
+ * directly (it needs piped stdin, which `execFile` cannot supply). Extracting
+ * the isolation lets a direct spawner opt in without inheriting the retry
+ * machinery, which is the actual shared concern.
+ *
+ * THE TWO VARIABLES ISOLATE INDEPENDENTLY. The previous gate was
+ * all-or-nothing: naming EITHER variable skipped isolation entirely, so a
+ * caller who supplied only `SANCTUARY_STORAGE_PATH` silently kept the
+ * operator's real `HOME` -- and `HOME` is what `keychainServiceFor`,
+ * `fallbackFilePath`, and every `~/.hermes`-style sibling artifact read.
+ * `temp-fortress.ts` argues at length that both must move together; this now
+ * holds that line. A caller who names a variable still wins for that variable.
+ *
+ * @param env       The child environment to mutate.
+ * @param callerEnv The caller-supplied overrides, consulted to decide which
+ *                  variables the caller has already chosen.
+ * @returns A cleanup that removes the temp directory, safe to call always.
+ */
+export async function isolateChildFortress(
+  env: NodeJS.ProcessEnv,
+  callerEnv?: NodeJS.ProcessEnv,
+): Promise<() => Promise<void>> {
+  const callerHome = callerEnv?.HOME;
+  const needHome = callerHome === undefined;
+  const needStoragePath = callerEnv?.SANCTUARY_STORAGE_PATH === undefined;
+  if (!needHome && !needStoragePath) return async () => {};
+
+  // Only mint a temp directory when we are actually the ones supplying HOME.
+  // When the caller named HOME and we are only filling in the storage path,
+  // there is nothing to create and nothing to clean up.
+  let childHome: string | undefined;
+  if (needHome) {
+    // mkdtemp: atomic fresh 0o700 dir (CodeQL js/insecure-temporary-file).
+    childHome = await mkdtemp(join(tmpdir(), "sanctuary-run-cli-home-"));
+    env.HOME = childHome;
+    env.USERPROFILE = childHome;
+  }
+  if (needStoragePath) {
+    // Compose against whichever home the child will actually see, so the
+    // fortress and the home never point at different places.
+    env.SANCTUARY_STORAGE_PATH = join(childHome ?? callerHome!, ".sanctuary");
+  }
+  return async () => {
+    if (childHome === undefined) return;
+    // A leftover temp dir is not worth failing a test over; the OS reaps it.
+    await rm(childHome, { recursive: true, force: true }).catch(() => {});
+  };
+}
+
+/**
  * Lower-level entry point with full options. Exported for the helper's own
  * regression tests; production callers use `runCli`.
  */
@@ -113,31 +198,12 @@ export async function runCliRaw(
   const env: NodeJS.ProcessEnv = { ...process.env, NODE_NO_WARNINGS: "1", ...opts.env };
   delete env.SANCTUARY_PASSPHRASE;
 
-  // Hermetic child fortress. A spawned CLI is still part of the test, but it
-  // is a fresh process, so none of the in-process isolation a test does
-  // (overriding HOME in a beforeEach, passing an explicit storagePath) reaches
-  // it. Left alone the child resolves the operator's own `~/.sanctuary` and
-  // both reads real custody and writes into it, which is one of the ways that
-  // fortress's backup directory grew to thousands of files. Isolate here, at
-  // the single place every CLI-subprocess test spawns through, rather than in
-  // each test.
-  //
-  // A caller who names a fortress wins: isolation is SKIPPED entirely when
-  // `opts.env` carries HOME or SANCTUARY_STORAGE_PATH, so a test that
-  // deliberately points the child at a fixture fortress keeps doing so. Note
-  // this cannot be left to the `...opts.env` spread above, because the
-  // assignments below run after it and would clobber the caller's choice.
-  const isolate =
-    opts.env?.HOME === undefined && opts.env?.SANCTUARY_STORAGE_PATH === undefined;
-  // mkdtemp: atomic fresh 0o700 dir (CodeQL js/insecure-temporary-file).
-  const childHome = isolate
-    ? await mkdtemp(join(tmpdir(), "sanctuary-run-cli-home-"))
-    : undefined;
-  if (childHome !== undefined) {
-    env.HOME = childHome;
-    env.USERPROFILE = childHome;
-    env.SANCTUARY_STORAGE_PATH = join(childHome, ".sanctuary");
-  }
+  // Hermetic child fortress. See `isolateChildFortress` for why this is
+  // necessary and where the bound sits. A caller who names HOME or
+  // SANCTUARY_STORAGE_PATH keeps their choice for THAT variable; note this
+  // cannot be left to the `...opts.env` spread above, because the helper's
+  // assignments run after it and would otherwise clobber the caller's choice.
+  const cleanupChildHome = await isolateChildFortress(env, opts.env);
 
   try {
     return await attemptRunCli({
@@ -149,10 +215,7 @@ export async function runCliRaw(
       backoffMs,
     });
   } finally {
-    if (childHome !== undefined) {
-      // A leftover temp dir is not worth failing a test over; the OS reaps it.
-      await rm(childHome, { recursive: true, force: true }).catch(() => {});
-    }
+    await cleanupChildHome();
   }
 }
 

@@ -5,11 +5,12 @@
  */
 
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { ConfigLoadError } from "./errors/config-error.js";
+import { assertHermeticStoragePath } from "./paths.js";
 
 const require = createRequire(import.meta.url);
 const { version: PKG_VERSION } = require("../package.json");
@@ -270,10 +271,22 @@ export function defaultConfig(): SanctuaryConfig {
     // directory. Most callers immediately override storage_path (from the
     // config file, an explicit temp path, or SANCTUARY_STORAGE_PATH), so
     // failing here would fire on hundreds of already-isolated tests that never
-    // go near the operator's fortress. The hermeticity guard sits on the
-    // RESOLUTION path (paths.ts) and on the places this value is used to open
+    // go near the operator's fortress.
+    //
+    // CORRECTION (adversarial review of this PR). An earlier version of this
+    // comment claimed the guard sits "on the places this value is used to open
     // storage, which is where reaching the real fortress actually costs
-    // something.
+    // something", with the implication that leaving this join unguarded was
+    // free. It was not. This value flowed unguarded into `saveConfig` via
+    // `index.ts` step 20, and five test files that boot the server therefore
+    // REWROTE the operator's real `~/.sanctuary/sanctuary.json` on every suite
+    // run. Measured, not inferred: an idle control froze the mtime, and two
+    // consecutive full-suite runs each moved it.
+    //
+    // The seam is now closed at the write itself: `saveConfig` below calls
+    // `assertHermeticStoragePath` on the directory it is about to write, so an
+    // unguarded default that reaches a real write fails closed under Vitest.
+    // Constructing the value stays free; SPENDING it does not.
     storage_path: join(homedir(), ".sanctuary"),
     state: {
       encryption: "aes-256-gcm",
@@ -347,6 +360,53 @@ export function defaultConfig(): SanctuaryConfig {
  *
  * Precedence (highest wins): CLI flags > env vars > config file > defaults
  * This matches the standard config precedence pattern used by most tools.
+ *
+ * DOCUMENTED BEHAVIOUR CHANGE: `storage_path` from the config file, and
+ * which keychain entry holds the master passphrase
+ * ------------------------------------------------------------------------
+ * `loadConfig().storage_path` and `paths.resolveStoragePath()` are two
+ * different answers to "which fortress", and they can disagree. They diverge
+ * in exactly one case: `SANCTUARY_STORAGE_PATH` is unset AND the config file
+ * at `~/.sanctuary/sanctuary.json` carries a `storage_path` key pointing
+ * somewhere else.
+ *
+ *   loadConfig().storage_path  -> the config file's value  (e.g. /srv/agent-b)
+ *   resolveStoragePath()       -> <home>/.sanctuary
+ *
+ * The CLI verbs that derive a fortress master key (`sentinel`, `anomaly`,
+ * `auto-trigger`, `policy drafts activate`, `template init`) now scope their
+ * passphrase lookup to `loadConfig().storage_path` -- the fortress they
+ * actually open. Previously the lookup re-resolved ambiently inside
+ * `getOrCreatePassphrase()` and therefore used `resolveStoragePath()`.
+ *
+ * For such an operator the keychain service name consulted changes:
+ *
+ *   before:  sanctuary-passphrase                       (the HOME-default name)
+ *   after:   sanctuary-passphrase-<sha256(storage_path)[0:16]>
+ *
+ * This is INTENTIONAL, and it is the point of the change: the credential that
+ * unlocks a fortress should be named after that fortress, not after whichever
+ * directory the process happened to resolve from the environment. The old
+ * behaviour meant two fortresses on one host could share one keychain entry.
+ *
+ * The failure mode when it bites is bounded and FAIL-CLOSED, verified against
+ * `core/master-custody.ts`: the fortress-named entry does not exist yet, so
+ * `getOrCreatePassphrase` mints a new random passphrase and writes a new
+ * keyring entry, and `establishMaster` then fails to unwrap the existing
+ * custody envelope and THROWS `CustodyUnlockError`. It does NOT re-mint a
+ * master and does NOT re-encrypt or orphan data. The operator sees a hard
+ * unlock error plus one spurious keyring entry, and recovers by naming the
+ * fortress explicitly (`--fortress <path>` or `SANCTUARY_STORAGE_PATH`), which
+ * makes both readers agree again.
+ *
+ * Reachability is low: nothing in this codebase produces a divergent config,
+ * because `saveConfig` writes to `join(config.storage_path, "sanctuary.json")`
+ * and so a self-written config is always self-consistent. It requires a
+ * hand-edited file or an external provisioner.
+ *
+ * Preferred long-term resolution is to retire the config-file `storage_path`
+ * key so there is exactly one way to name a fortress. That is a deprecation
+ * with its own migration and is deliberately not folded into this change.
  */
 export async function loadConfig(
   configPath?: string
@@ -613,6 +673,18 @@ async function quarantineConfigFile(path: string): Promise<string | undefined> {
  * state. This is the root-cause fix for the config-load race that surfaced as
  * "SyntaxError: Unexpected end of JSON input" under parallel test runs; the
  * empty-read tolerance in loadConfig is the defense-in-depth half.
+ *
+ * Hermeticity: this is the WRITE chokepoint for the config file, so it is
+ * where the test-isolation guard belongs. `defaultConfig()` composes
+ * `<home>/.sanctuary` with the raw join on purpose (it is only building a
+ * default, and hundreds of already-isolated tests would trip a guard there),
+ * but that unguarded value reached this function through `index.ts` step 20
+ * and rewrote the operator's real `~/.sanctuary/sanctuary.json` on every suite
+ * run. Guarding the construction is wrong; guarding the moment the value is
+ * spent on a real write is right. Under Vitest a write into the operator's own
+ * fortress now throws `NonHermeticStoragePathError`, whose message names
+ * `createTempFortress()` as the fix. Production is untouched: the guard is
+ * inert unless `VITEST` is set.
  */
 export async function saveConfig(
   config: SanctuaryConfig,
@@ -620,6 +692,7 @@ export async function saveConfig(
 ): Promise<void> {
   const path =
     configPath ?? join(config.storage_path, "sanctuary.json");
+  assertHermeticStoragePath(dirname(path));
   const tmpPath = `${path}.tmp.${process.pid}.${randomBytes(6).toString("hex")}`;
   try {
     // Create the temp file 0o600 from the start so the secret-bearing config

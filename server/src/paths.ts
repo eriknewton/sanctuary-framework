@@ -189,6 +189,15 @@ export function homeFortressPath(home: string = homedir()): string {
  * the per-tenant path its caller already chose: that is the bug this module's
  * guard exists to make loud.
  *
+ * NOT the same answer as `loadConfig().storage_path`. This function reads only
+ * `SANCTUARY_STORAGE_PATH` and the home default; `loadConfig` additionally
+ * merges a `storage_path` key from the config FILE. They diverge when that key
+ * is present and the env var is not, and that divergence changes which
+ * keychain entry holds a fortress's master passphrase. See the "DOCUMENTED
+ * BEHAVIOUR CHANGE" block on `loadConfig` in `config.ts` for the full
+ * consequence and its fail-closed bound. Pick deliberately: the fortress you
+ * OPEN and the fortress you name the passphrase after must be the same one.
+ *
  * @param env Optional env object (for tests). Defaults to `process.env`.
  * @param home Optional home directory override (for tests). Defaults to `os.homedir()`.
  */

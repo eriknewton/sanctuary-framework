@@ -143,3 +143,45 @@ describe("runCliRaw child fortress isolation", () => {
     expect(stdout.trim()).toBe("/tmp/caller-chosen-home");
   }, 30_000);
 });
+
+// ── Independent isolation of HOME and SANCTUARY_STORAGE_PATH ─────────
+//
+// The gate used to be all-or-nothing: naming EITHER variable skipped isolation
+// entirely. A caller who supplied only SANCTUARY_STORAGE_PATH therefore kept
+// the operator's real HOME in the child, and HOME is what keychainServiceFor,
+// fallbackFilePath, and every `~/.hermes`-style sibling artifact read. No
+// caller tripped it, which is exactly why it needed a test rather than a
+// reader noticing.
+
+describe("runCliRaw isolates HOME and SANCTUARY_STORAGE_PATH independently", () => {
+  const PRINT_BOTH = [
+    "-e",
+    "console.log(JSON.stringify({home:process.env.HOME,fortress:process.env.SANCTUARY_STORAGE_PATH}))",
+  ];
+
+  it("still isolates HOME when the caller names only the fortress", async () => {
+    const { stdout } = await runCliRaw([], {
+      command: process.execPath,
+      prefixArgs: PRINT_BOTH,
+      env: { SANCTUARY_STORAGE_PATH: "/tmp/caller-chosen-fortress-only" },
+    });
+    const seen = JSON.parse(stdout.trim()) as { home: string; fortress: string };
+    expect(seen.fortress).toBe("/tmp/caller-chosen-fortress-only");
+    expect(seen.home).not.toBe(userInfo().homedir);
+    expect(seen.home).toContain("sanctuary-run-cli-home-");
+  }, 30_000);
+
+  it("still isolates the fortress when the caller names only HOME", async () => {
+    const { stdout } = await runCliRaw([], {
+      command: process.execPath,
+      prefixArgs: PRINT_BOTH,
+      env: { HOME: "/tmp/caller-chosen-home-only" },
+    });
+    const seen = JSON.parse(stdout.trim()) as { home: string; fortress: string };
+    expect(seen.home).toBe("/tmp/caller-chosen-home-only");
+    // Composed against the caller's home, so it stays inside the fortress the
+    // caller was pointing at rather than jumping to an unrelated temp dir.
+    expect(seen.fortress).toBe(join("/tmp/caller-chosen-home-only", ".sanctuary"));
+    expect(seen.fortress).not.toBe(join(userInfo().homedir, ".sanctuary"));
+  }, 30_000);
+});

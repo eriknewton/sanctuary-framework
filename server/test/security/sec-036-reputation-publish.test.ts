@@ -10,10 +10,11 @@
  * 4. reputation_publish is explicitly classified as Tier 1
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createSanctuaryServer } from "../../src/index.js";
 import { DEFAULT_POLICY } from "../../src/principal-policy/loader.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 
 async function listTools(server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"]) {
   const request = {
@@ -26,6 +27,27 @@ async function listTools(server: Awaited<ReturnType<typeof createSanctuaryServer
   if (!handler) throw new Error("tools/list handler not registered");
   return await handler(request, {});
 }
+
+
+// Fortress hermeticity: `createSanctuaryServer` boots the real server, and its
+// step 20 writes the config unconditionally. With `HOME` left alone that write
+// lands on the operator's own `~/.sanctuary/sanctuary.json` -- measured, not
+// inferred: this file was one of five bisected as rewriting it on every suite
+// run. Injecting `MemoryStorage` is not enough, because `config.storage_path`
+// still comes from `defaultConfig()`'s `join(homedir(), ".sanctuary")`.
+// Moving `HOME` redirects the mkdir, the permission tightening, and the config
+// write onto a throwaway directory without changing anything under test.
+// `saveConfig` now fails such a write closed under Vitest, so removing this
+// isolation turns the leak into a loud failure rather than a silent one.
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+
+beforeEach(async () => {
+  fortressHome = await createTempHome("sanctuary-sec036");
+});
+
+afterEach(async () => {
+  await fortressHome.cleanup();
+});
 
 describe("SEC-036/037/039: reputation_publish security", () => {
   // Phase D: reputation_publish was moved to Tier 3 (auto-allow with audit).
