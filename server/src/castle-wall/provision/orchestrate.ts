@@ -409,6 +409,78 @@ export interface ProvisionFlowOps {
    * a parked agent and no path to release it).
    */
   exclusiveEgress?: ExclusiveEgressArmOps;
+  /**
+   * OBSERVE the host's CURRENT per-agent egress confinement, for the abort
+   * paths that must say something about enforcement state.
+   *
+   * FIX F-COARSE-AFTER-EXCLUSIVE, honesty half (HIGH, Mini1 re-drill
+   * 2026-07-26). The provision-egress abort printed the flat sentence "The
+   * wall was NOT armed". On the drill host, at the instant that sentence was
+   * printed, pf was `Status: Enabled`, the gate registry showed
+   * `committed: [{agent_uid: 503, generation_id: 23}]`, and the confined agent
+   * was 0/9 reachable INCLUDING its own manifest. The product told the
+   * operator nothing was armed while the machine was enforcing. The sentence
+   * was true about the CODE PATH ("this run did not reach the arm step") and
+   * false about the HOST -- which is the exact class this codebase forbids.
+   *
+   * So enforcement-state prose is now derived from an OBSERVATION. MUST never
+   * throw: an unobservable host is reported as unobserved, never as "nothing
+   * is armed".
+   */
+  observeAgentConfinement(): Promise<ObservedAgentConfinement>;
+}
+
+/**
+ * What {@link ProvisionFlowOps.observeAgentConfinement} saw. Deliberately a
+ * discriminated union: "we could not look" must be representable, because
+ * collapsing it into `false` is how "nothing is armed" gets said about a host
+ * that is enforcing.
+ */
+export type ObservedAgentConfinement =
+  | {
+      known: true;
+      /** Uids with a committed per-uid egress-gate confinement right now. */
+      confinedUids: number[];
+      /** True when the fortress carries an exclusive-routing marker. */
+      exclusiveRoutingMarkerPresent: boolean;
+    }
+  | { known: false; reason: string };
+
+/**
+ * THE enforcement-state sentence for a refused (never-armed-by-this-run)
+ * provisioning attempt -- the single place this claim is put into words, and
+ * it is a function of the OBSERVATION, not of the caller's position in the
+ * control flow. Exported so the mapping observation -> sentence is asserted
+ * directly.
+ *
+ * The first clause is always the same, because it is the one thing the code
+ * path genuinely knows: THIS RUN did not arm anything. Everything after it
+ * comes from what was measured.
+ */
+export function describeObservedAgentConfinement(observed: ObservedAgentConfinement): string {
+  if (!observed.known) {
+    return (
+      "This run did not arm the wall. The host's CURRENT enforcement state could NOT be observed " +
+      `(${observed.reason}), so this run makes no claim about it -- check it with: ` +
+      "sanctuary castle-wall status"
+    );
+  }
+  if (observed.confinedUids.length === 0 && !observed.exclusiveRoutingMarkerPresent) {
+    return "This run did not arm the wall, and no per-agent egress confinement was observed on this host.";
+  }
+  const parts: string[] = [];
+  if (observed.confinedUids.length > 0) {
+    parts.push(`uid(s) ${observed.confinedUids.join(", ")} are confined by a committed egress gate`);
+  }
+  if (observed.exclusiveRoutingMarkerPresent) {
+    parts.push("the fortress carries an exclusive-routing marker");
+  }
+  return (
+    "This run did not arm the wall, BUT per-agent egress confinement from an EARLIER run is live on " +
+    `this host (${parts.join("; ")}). A confined agent may be reaching nothing right now, and while ` +
+    "the exclusive routing composition stands this coarse path will keep being refused. Clear it with: " +
+    "sudo sanctuary protect --unprotect-egress-gate"
+  );
 }
 
 /**
@@ -1156,13 +1228,16 @@ async function runProvisionFlowSteps(
       policyDaemonFreshlyInstalled,
       true,
     );
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half): OBSERVE before claiming.
+    // See `describeObservedAgentConfinement`.
+    const observedConfinement = await observeConfinementSafely(ops);
     return {
       kind: "aborted",
       stage: "provision-egress",
       reason: withDaemonTeardownNote(
         `refusing to arm: the egress path for the confined agent could not be provisioned and verified ` +
-          `(${egress.error}). The wall was NOT armed; the agent would have been confined into ` +
-          `non-functionality. ` +
+          `(${egress.error}). ${describeObservedAgentConfinement(observedConfinement)} ` +
+          `The agent would have been confined into non-functionality. ` +
           describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
         td.daemonTeardownError,
         td.policyDaemonTeardownError,
@@ -1558,6 +1633,20 @@ async function restoreEgressBestEffort(
     );
   }
   return "";
+}
+
+/**
+ * Run {@link ProvisionFlowOps.observeAgentConfinement} without letting it
+ * change the abort's outcome. A probe that throws is UNKNOWN, never "nothing
+ * is confined" -- the whole point of the fix is that an unobservable host must
+ * not be described as a quiet one.
+ */
+async function observeConfinementSafely(ops: ProvisionFlowOps): Promise<ObservedAgentConfinement> {
+  try {
+    return await ops.observeAgentConfinement();
+  } catch (err) {
+    return { known: false, reason: `confinement probe threw: ${(err as Error).message}` };
+  }
 }
 
 /** Punctuate a {@link restoreEgressBestEffort} sentence for appending to an outcome reason. */

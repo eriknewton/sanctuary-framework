@@ -58,7 +58,7 @@ import {
 } from "../../src/egress-gate/gate-daemon.js";
 import { gateLivenessTokenPath } from "../../src/egress-gate/liveness-oracle.js";
 import { peerResolverDaemonLabel, peerResolverDaemonPlistPath } from "../../src/egress-gate/peer-resolver-daemon.js";
-import { AGENT_HARNESS_DAEMON_LABEL, HARNESS_STOP_SETTLE_SAMPLES } from "../../src/egress-gate/harness-daemon.js";
+import { AGENT_HARNESS_DAEMON_LABEL, HARNESS_STOP_SETTLE_SAMPLES, harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
 import {
   holdFilePathForUid,
   planParkedHarnessInstall,
@@ -245,10 +245,18 @@ describe("restoreCoarseCompositionProduction (fix-round M5: gate daemon stopped 
 // only when the FULL persistent posture is verified).
 // ---------------------------------------------------------------------------
 
+const TEST_LAUNCH = harnessLaunchSpec({
+  programArguments: ["/usr/local/bin/hermes"],
+  environment: {
+    HOME: "/var/sanctuary-agents/sanctuary-hermes",
+    PYTHONPATH: "/var/sanctuary-agents/sanctuary-hermes/.hermes/hermes-agent",
+  },
+});
+
 const PARK_CTX: PersistentParkContext = {
   agentUid: 502,
   agentAccount: "sanctuary-hermes",
-  harnessArgv: ["/usr/local/bin/hermes"],
+  harnessLaunch: TEST_LAUNCH,
   fortressPath: "/fortress/a",
   harnessLogDir: "/var/sanctuary-agents/sanctuary-hermes/logs",
 };
@@ -256,7 +264,7 @@ const PARK_CTX: PersistentParkContext = {
 const PARKED_PLAN = planParkedHarnessInstall({
   agentAccount: PARK_CTX.agentAccount,
   agentUid: PARK_CTX.agentUid,
-  harnessArgv: PARK_CTX.harnessArgv,
+  harnessLaunch: TEST_LAUNCH,
   fortressPath: PARK_CTX.fortressPath,
   logDir: PARK_CTX.harnessLogDir,
 });
@@ -379,6 +387,52 @@ describe("parkHarnessPersistently (fix-round-2 HIGH-2: full persistent park)", (
       /reports RUNNING \(pid 4242\)/,
     );
   });
+
+  it("REGRESSION (F-HARNESSENV): the parked-plist RESTORE carries the harness environment", async () => {
+    // The drill's park re-render dropped HOME/PYTHONPATH and kept only
+    // SANCTUARY_STORAGE_PATH, so the plist the park left behind (and the one
+    // the release re-rendered from) could not start the re-homed gateway.
+    const { fn } = parkLaunchctl();
+    const fs = parkFs();
+    await parkHarnessPersistently(PARK_CTX, { runLaunchctlFn: fn, ...fs });
+    const written = fs.files.get(PARKED_PLAN.plistPath)!;
+    for (const [name, value] of Object.entries(TEST_LAUNCH.environment)) {
+      expect(written, `parked plist is missing ${name}`).toContain(`<key>${name}</key>`);
+      expect(written).toContain(`<string>${value}</string>`);
+    }
+  });
+
+  it("REGRESSION (F-HARNESSENV): with NO resolvable harness launch the park REFUSES to write a placeholder plist", async () => {
+    // Pre-fix, an unresolvable launch was papered over with a `/usr/bin/false`
+    // placeholder argv, which the parked-form COMPARISON then rendered against.
+    // A restore that cannot render the real form must fail loudly; the
+    // plist-REMOVAL park (the S5-7 MED-1 disposition) owns that condition.
+    const { fn } = parkLaunchctl();
+    const fs = parkFs();
+    const noLaunch = { ...PARK_CTX, harnessLaunch: undefined } as PersistentParkContext;
+    await expect(parkHarnessPersistently(noLaunch, { runLaunchctlFn: fn, ...fs })).rejects.toThrow(
+      /parked-plist restore failed: .*could not be resolved/,
+    );
+    expect(fs.files.has(PARKED_PLAN.plistPath)).toBe(false);
+  });
+
+  it("REGRESSION (F-HARNESSENV): with no resolvable launch the parked POSTURE requires an ABSENT plist", async () => {
+    const { fn } = parkLaunchctl();
+    const noLaunch = { ...PARK_CTX, harnessLaunch: undefined } as PersistentParkContext;
+    // Absent plist === unbootable === parked.
+    await expect(
+      verifyHarnessParkedPersistent(noLaunch, { runLaunchctlFn: fn, ...parkFs() }),
+    ).resolves.toEqual({ ok: true });
+    // A plist that is still on disk cannot be verified against any rendered
+    // form, so the posture fails LOUDLY rather than comparing against a
+    // placeholder nobody would ever write.
+    const verdict = await verifyHarnessParkedPersistent(noLaunch, {
+      runLaunchctlFn: fn,
+      ...parkFs({ [PARKED_PLAN.plistPath]: PARKED_PLAN.plistContent }),
+    });
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { problems: string[] }).problems.join(" ")).toMatch(/still present/);
+  });
 });
 
 describe("verifyHarnessParkedPersistent (fix-round-2 HIGH-2: posture verify enumerates every failed check)", () => {
@@ -401,7 +455,7 @@ describe("verifyHarnessParkedPersistent (fix-round-2 HIGH-2: posture verify enum
     const releasedPlan = planParkedHarnessInstall({
       agentAccount: PARK_CTX.agentAccount,
       agentUid: PARK_CTX.agentUid,
-      harnessArgv: PARK_CTX.harnessArgv,
+      harnessLaunch: TEST_LAUNCH,
       fortressPath: PARK_CTX.fortressPath,
       logDir: PARK_CTX.harnessLogDir,
       expectedGenerationId: 7, // a RELEASED plist form
@@ -490,7 +544,7 @@ describe("createProductionReleaseBarrierOps rearmAnchor (fix-round-3 MED-3: quar
     return createProductionReleaseBarrierOps({
       agentUid: 502,
       agentAccount: "sanctuary-hermes",
-      harnessArgv: ["/usr/local/bin/hermes"],
+      harnessLaunch: TEST_LAUNCH,
       fortressPath: "/fortress/a",
       harnessLogDir: "/tmp/sanctuary-test-logs",
       gateUid: 511,
@@ -645,7 +699,7 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       agentUid: 502,
       agentAccount: "sanctuary-hermes",
       fortressPath: "/fortress/a",
-      harnessArgv: ["/usr/local/bin/hermes"],
+      harnessLaunch: TEST_LAUNCH,
       harnessLogDir: "/tmp/sanctuary-test-logs",
       agentTemplate: "hermes",
       gateDaemonArgvPrefix: ["sanctuary"],
@@ -716,7 +770,7 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     agentId: "hermes",
     agentAccount: "sanctuary-hermes",
     fortressPath: "/fortress/a",
-    harnessArgv: ["/usr/local/bin/hermes"],
+    harnessLaunch: TEST_LAUNCH,
     harnessLogDir: "/var/sanctuary-agents/sanctuary-hermes/logs",
     audit: async () => {},
     print: () => {},
@@ -955,7 +1009,7 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
     ...UNPROTECT_INPUT,
     agentUid: PARK_CTX.agentUid,
     agentAccount: PARK_CTX.agentAccount,
-    harnessArgv: PARK_CTX.harnessArgv,
+    harnessLaunch: TEST_LAUNCH,
     fortressPath: PARK_CTX.fortressPath,
     harnessLogDir: PARK_CTX.harnessLogDir,
   } as unknown as ExclusiveEgressWiringInput;
@@ -982,7 +1036,7 @@ describe("createUnprotectExclusiveEgressOps (S5-7 production wiring)", () => {
       [HOLD_PATH]: "stale hold file",
     });
     const ops = createUnprotectExclusiveEgressOps(
-      { ...PARK_INPUT, parkPlistFallbackRemoval: true } as unknown as ExclusiveEgressWiringInput,
+      { ...PARK_INPUT, harnessLaunch: undefined } as unknown as ExclusiveEgressWiringInput,
       {
         parkDeps: { runLaunchctlFn: fn, ...fs },
       },

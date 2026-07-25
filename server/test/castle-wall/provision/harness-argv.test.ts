@@ -12,12 +12,17 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import {
   resolveHermesGatewayArgv,
   interpreterVersionProbeArgv,
   parseInterpreterVersion,
   parseVenvSitePackagesVersion,
+  runInterpreterProbeBounded,
   INTERPRETER_VERSION_PROBE_SOURCE,
   type HarnessArgvOps,
   type InterpreterVersion,
@@ -59,7 +64,7 @@ describe("castle-wall/provision/harness-argv", () => {
       });
       const resolved = await resolveHermesGatewayArgv(ops, { agentHome, agentUid: AGENT_UID });
       expect(resolved.harnessId).toBe("hermes");
-      expect(resolved.programArguments).toEqual([
+      expect(resolved.launch.programArguments).toEqual([
         venvPython,
         "-m",
         "hermes_cli.main",
@@ -69,7 +74,7 @@ describe("castle-wall/provision/harness-argv", () => {
       ]);
       // The venv interpreter carries its own site-packages; PYTHONPATH is only
       // the source tree hermes_cli lives in.
-      expect(resolved.environment).toEqual({
+      expect(resolved.launch.environment).toEqual({
         HERMES_ACCEPT_HOOKS: "1",
         HOME: agentHome,
         PYTHONPATH: hermesAgentDir,
@@ -94,8 +99,8 @@ describe("castle-wall/provision/harness-argv", () => {
         [systemPython]: { major: 3, minor: 11 },
       });
       const resolved = await resolveHermesGatewayArgv(ops, { agentHome, agentUid: AGENT_UID });
-      expect(resolved.programArguments[0]).toBe(systemPython);
-      expect(resolved.environment?.PYTHONPATH).toBe(`${hermesAgentDir}:${sitePackages}`);
+      expect(resolved.launch.programArguments[0]).toBe(systemPython);
+      expect(resolved.launch.environment.PYTHONPATH).toBe(`${hermesAgentDir}:${sitePackages}`);
     });
 
     it("skips a matching-version system interpreter the AGENT UID cannot execute, and takes the next one that it can", async () => {
@@ -105,7 +110,7 @@ describe("castle-wall/provision/harness-argv", () => {
         "/usr/bin/python3": { major: 3, minor: 11 },
       });
       const resolved = await resolveHermesGatewayArgv(ops, { agentHome, agentUid: AGENT_UID });
-      expect(resolved.programArguments[0]).toBe("/usr/bin/python3");
+      expect(resolved.launch.programArguments[0]).toBe("/usr/bin/python3");
     });
 
     it("REGRESSION (F-INTERP): a venv interpreter that EXISTS but is not executable by the agent uid is not chosen on existence alone", async () => {
@@ -115,7 +120,7 @@ describe("castle-wall/provision/harness-argv", () => {
         [systemPython]: { major: 3, minor: 11 },
       });
       const resolved = await resolveHermesGatewayArgv(ops, { agentHome, agentUid: AGENT_UID });
-      expect(resolved.programArguments[0]).toBe(systemPython);
+      expect(resolved.launch.programArguments[0]).toBe(systemPython);
     });
 
     it("probes as the AGENT uid, never as the caller (root)", async () => {
@@ -154,7 +159,7 @@ describe("castle-wall/provision/harness-argv", () => {
         [systemPython]: { major: 3, minor: 11 },
       });
       const resolved = await resolveHermesGatewayArgv(ops, { agentHome, agentUid: AGENT_UID });
-      expect(resolved.programArguments[0]?.startsWith("/")).toBe(true);
+      expect(resolved.launch.programArguments[0]?.startsWith("/")).toBe(true);
     });
 
     it("fail-closed: throws when the re-homed runtime is absent (never guesses a global python)", async () => {
@@ -187,7 +192,7 @@ describe("castle-wall/provision/harness-argv", () => {
         [venvPython]: { major: 3, minor: 11 },
       });
       const resolved = await resolveHermesGatewayArgv(ops, { agentHome, agentUid: AGENT_UID });
-      expect(resolved.programArguments[0]).toBe(venvPython);
+      expect(resolved.launch.programArguments[0]).toBe(venvPython);
     });
   });
 
@@ -225,4 +230,90 @@ describe("castle-wall/provision/harness-argv", () => {
       expect(parseVenvSitePackagesVersion("/somewhere/lib/site-packages")).toBeUndefined();
     });
   });
+});
+
+// ---------------------------------------------------------------------------
+// FIX (Codex adversarial review, HIGH, 2026-07-26): the as-uid interpreter
+// probe's timeout must be a HARD deadline over the whole process TREE.
+//
+// The pre-fix probe used `promisify(execFile)(..., { timeout })`, whose kill
+// signal is `SIGTERM` and which then WAITS for the child to exit. A candidate
+// that ignores `SIGTERM` therefore hangs the caller -- and the FIRST candidate
+// this module probes is the agent-home venv interpreter, which the module
+// documents as AGENT-WRITABLE. So a hostile interpreter could hang `protect`
+// and the root boot supervisor instead of failing closed to a parked agent.
+//
+// These tests drive REAL processes (`/bin/sh`, no sudo, nothing outside a
+// private tmpdir), because the defect lives entirely in the child-process
+// primitive and a mocked child would prove nothing.
+// ---------------------------------------------------------------------------
+describe("runInterpreterProbeBounded (hard deadline, process-group kill)", () => {
+  it("settles at the deadline even when the child IGNORES SIGTERM (the reviewer's reproduction)", async () => {
+    const timeoutMs = 300;
+    const started = Date.now();
+    const result = await runInterpreterProbeBounded(
+      { file: "/bin/sh", args: ["-c", 'trap "" TERM; while true; do sleep 1; done'] },
+      timeoutMs,
+    );
+    const elapsed = Date.now() - started;
+    // Fail-closed: a probe that could not be measured is "this uid cannot
+    // execute this interpreter", never a version.
+    expect(result).toBeUndefined();
+    // THE ASSERTION. Pre-fix this promise did not settle until an EXTERNAL
+    // SIGKILL arrived; the reviewer measured 1203ms against a 200ms timeout.
+    // The bound allows generous scheduling slop and is still far below any
+    // wait-for-a-SIGTERM-ignoring-child time.
+    expect(elapsed).toBeLessThan(timeoutMs + 2_000);
+  }, 20_000);
+
+  it("kills the whole process GROUP, so an interpreter spawned by sudo cannot survive the deadline", async () => {
+    // The production probe's direct child is `/usr/bin/sudo` and the
+    // interpreter is ITS child, so killing only the direct child leaves the
+    // interpreter running. This models that shape: a SIGTERM-ignoring parent
+    // whose background grandchild keeps appending to a file forever.
+    const dir = mkdtempSync(join(tmpdir(), "probe-group-"));
+    try {
+      const marker = join(dir, "grandchild.log");
+      const script = join(dir, "parent.sh");
+      const parentScript = [
+        "#!/bin/sh",
+        'trap "" TERM',
+        `( while true; do echo tick >> ${marker}; sleep 0.05; done ) &`,
+        "while true; do sleep 1; done",
+      ].join("\n");
+      writeFileSync(script, parentScript);
+      chmodSync(script, 0o755);
+
+      const result = await runInterpreterProbeBounded({ file: "/bin/sh", args: [script] }, 400);
+      expect(result).toBeUndefined();
+
+      // Give the kill a moment to land, then prove the GRANDCHILD stopped
+      // writing: two samples 600ms apart must be identical.
+      await delay(400);
+      const first = existsSync(marker) ? readFileSync(marker, "utf8").length : 0;
+      await delay(600);
+      const second = existsSync(marker) ? readFileSync(marker, "utf8").length : 0;
+      expect(second).toBe(first);
+      // Sanity: the grandchild really did run before the deadline, so a passing
+      // assertion above cannot be a never-started false negative.
+      expect(first).toBeGreaterThan(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("returns the child's stdout on a clean exit, and undefined on a non-zero exit", async () => {
+    await expect(
+      runInterpreterProbeBounded({ file: "/bin/sh", args: ["-c", "echo 3.11"] }, 5_000),
+    ).resolves.toBe("3.11\n");
+    await expect(
+      runInterpreterProbeBounded({ file: "/bin/sh", args: ["-c", "echo 3.11; exit 3"] }, 5_000),
+    ).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("a spawn failure (no such file) is undefined, never a throw", async () => {
+    await expect(
+      runInterpreterProbeBounded({ file: "/nonexistent/interpreter", args: [] }, 5_000),
+    ).resolves.toBeUndefined();
+  }, 20_000);
 });

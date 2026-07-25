@@ -76,6 +76,33 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "harness-argv resolves ONLY the Hermes gateway; its refusals are Hermes-scoped by construction",
   },
   {
+    // FIX F-COARSE-AFTER-EXCLUSIVE (2026-07-26): when the coarse restore FAILS
+    // the fortress is left in exclusive routing composition, in which the plain
+    // Hermes arm is REFUSED -- so the degrade message must name that command as
+    // the one that will not work, and name the verb that clears it.
+    file: "server/src/castle-wall/provision/exclusive-arm.ts",
+    scope: "degradeLoud",
+    snippet: "will be REFUSED until it is",
+    expectedCount: 3,
+    reason: "the exclusive-egress arming stage is only reached from the Hermes-gated auto-provision path",
+  },
+  {
+    // FIX F-COARSE-AFTER-EXCLUSIVE (2026-07-26): the repair verb's sentence
+    // about what the fortress's routing composition was left in.
+    file: "server/src/wrap/auto-provision.ts",
+    scope: "describeRepairCoarseComposition",
+    snippet: "path works again.",
+    expectedCount: 2,
+    reason: "the repair verb is Hermes-only (`--repair-egress-gate` provisions the Hermes agent account)",
+  },
+  {
+    file: "server/src/wrap/auto-provision.ts",
+    scope: "describeRepairCoarseComposition",
+    snippet: "will be REFUSED by the composition invariant",
+    expectedCount: 1,
+    reason: "the repair verb is Hermes-only (`--repair-egress-gate` provisions the Hermes agent account)",
+  },
+  {
     file: "server/src/cli.ts",
     scope: "printWrapHelpEarly",
     snippet: "sanctuary protect --hermes         Protect Hermes Agent",

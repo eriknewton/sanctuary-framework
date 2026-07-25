@@ -33,7 +33,7 @@ import {
   PF_ANCHOR_REGISTRY_STATE_VERSION,
   type PfAnchorRegistryState,
 } from "../../src/egress-gate/anchor-registry.js";
-import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
+import { AGENT_HARNESS_DAEMON_LABEL, harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
 import {
   runReleaseBarrierSequence,
   type ReleaseBarrierOps,
@@ -84,7 +84,10 @@ function baseInternals(overrides: ExclusiveEgressBootSupervisorInternals = {}): 
 const OK_CTX: BootAgentResolution = {
   kind: "ok",
   agentAccount: "sanctuary-hermes",
-  harnessArgv: ["/usr/local/bin/hermes"],
+  harnessLaunch: harnessLaunchSpec({
+    programArguments: ["/usr/local/bin/hermes"],
+    environment: { HOME: "/var/sanctuary-agents/sanctuary-hermes", PYTHONPATH: "/var/sanctuary-agents/sanctuary-hermes/.hermes/hermes-agent" },
+  }),
   harnessLogDir: "/var/sanctuary-agents/sanctuary-hermes/logs",
   gateAccount: "sanctuary-gate-hermes",
   gateHomeDirectory: "/var/sanctuary-agents/sanctuary-gate-hermes",

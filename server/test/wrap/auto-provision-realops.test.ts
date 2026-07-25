@@ -63,9 +63,11 @@ import {
   LAUNCHCTL_KILL_SIGNAL,
   runAgentEgressProbesAsUid,
   buildHermesExclusiveCliWiring,
+  describeRepairCoarseComposition,
   resolveGateDaemonArgvPrefix,
 } from "../../src/wrap/auto-provision.js";
 import { HERMES_ENDPOINT_SET } from "../../src/castle-wall/provision/egress.js";
+import { harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
 import {
   planRehome,
   executeRehomePlan,
@@ -1984,7 +1986,10 @@ describe("buildHermesExclusiveCliWiring: gate-daemon interpreter prefix (real D9
     accountName: "_sanctuary-hermes",
     newAccountHome: "/var/empty/_sanctuary-hermes",
     wallFortressPath: "/tmp/fortress",
-    harnessArgv: [process.execPath, "/opt/agent.js"],
+    harnessLaunch: harnessLaunchSpec({
+      programArguments: [process.execPath, "/opt/agent.js"],
+      environment: { HOME: "/var/empty/_sanctuary-hermes", PYTHONPATH: "/var/empty/_sanctuary-hermes/.hermes/hermes-agent" },
+    }),
     operatorUid: 501,
     auditSource: "test",
     print: () => {},
@@ -2011,5 +2016,40 @@ describe("buildHermesExclusiveCliWiring: gate-daemon interpreter prefix (real D9
   it("still pins the interpreter when no cliBinary is supplied (the else branch that already worked)", () => {
     const wiring = buildHermesExclusiveCliWiring(baseInput(undefined));
     expect(wiring.gateDaemonArgvPrefix[0]).toBe(process.execPath);
+  });
+
+  it("REGRESSION (F-HARNESSENV): an UNRESOLVED harness launch is absent, not a /usr/bin/false placeholder, and drives the plist-removal park", () => {
+    // Pre-fix the unprotect path invented `harnessArgv: ["/usr/bin/false"]`
+    // plus a separate `parkPlistFallbackRemoval: true` -- two fields for one
+    // condition, and the placeholder was what the parked-form COMPARISON
+    // rendered against. The condition is now representable directly.
+    const { harnessLaunch: _drop, ...withoutLaunch } = baseInput(undefined);
+    const wiring = buildHermesExclusiveCliWiring(withoutLaunch);
+    expect(wiring.harnessLaunch).toBeUndefined();
+    expect(JSON.stringify(wiring)).not.toContain("/usr/bin/false");
+    expect(Object.keys(wiring)).not.toContain("parkPlistFallbackRemoval");
+  });
+});
+
+describe("describeRepairCoarseComposition (F-COARSE-AFTER-EXCLUSIVE, operator sentence)", () => {
+  it("says nothing when this run never entered exclusive composition", () => {
+    expect(describeRepairCoarseComposition("not-attempted")).toBe("");
+  });
+
+  it("confirms the coarse path works again after a restored composition", () => {
+    const sentence = describeRepairCoarseComposition("restored");
+    expect(sentence).toMatch(/COARSE routing composition/);
+    expect(sentence).toMatch(/protect --hermes/);
+    expect(sentence).not.toMatch(/unprotect-egress-gate/);
+  });
+
+  it("names the REFUSAL and the product path that clears it when the fortress is left exclusive", () => {
+    // The drill's operator experience: a plain `protect --hermes` refused with
+    // no product path named. `--unprotect-egress-gate` is the one that works.
+    const sentence = describeRepairCoarseComposition("exclusive-left", "coarse republish failed");
+    expect(sentence).toMatch(/EXCLUSIVE routing composition/);
+    expect(sentence).toMatch(/will be REFUSED/);
+    expect(sentence).toMatch(/coarse republish failed/);
+    expect(sentence).toMatch(/sudo sanctuary protect --unprotect-egress-gate/);
   });
 });

@@ -56,6 +56,90 @@ type LaunchctlResult = { code: number; stdout: string; stderr: string };
  */
 export const HARNESS_FORBIDDEN_PLIST_ENV = ["SANCTUARY_PASSPHRASE", "SANCTUARY_RECOVERY_KEY"];
 
+// ---------------------------------------------------------------------------
+// FIX F-HARNESSENV (HIGH, Mini1 confined-Hermes re-drill 2026-07-26)
+// ---------------------------------------------------------------------------
+//
+// The park install rendered the harness plist WITH the resolved environment
+// (`HOME`, `PYTHONPATH`, `HERMES_ACCEPT_HOOKS`); every LATER re-render -- the
+// release plist, the park re-render, the degraded coarse restore, the
+// parked-form comparison -- rendered it WITHOUT, because the arming-wiring
+// context carried `harnessArgv: string[]` and nothing else. The released
+// gateway then started with no `PYTHONPATH`, fell through to Hermes' editable
+// -install meta-path finder, stat'd the operator's pre-re-home path, and died
+// with `PermissionError [Errno 13]`. Four independent writers, one missing
+// field each; measured 3/3 on direct arms and 1/1 on `--repair-egress-gate`.
+//
+// THE FIX IS A CHOKEPOINT, NOT FOUR STRING EDITS. A harness launch is ONE
+// value: the argv AND the environment that argv needs, resolved together and
+// travelling together. {@link HarnessLaunchSpec} is that value. It is BRANDED
+// with a module-private symbol, so the ONLY way to obtain one is
+// {@link harnessLaunchSpec}, which validates both halves. Every carrier that
+// used to hold a bare `harnessArgv` now holds a spec, so a writer literally
+// has no argv to render without the environment beside it, and a FIFTH writer
+// added later inherits the property for free rather than having to remember it.
+declare const HARNESS_LAUNCH_SPEC_BRAND: unique symbol;
+
+/**
+ * A complete, validated harness launch descriptor: the absolute argv plus the
+ * environment that argv needs to run. Constructible ONLY via
+ * {@link harnessLaunchSpec} (the brand is module-private), so an argv can
+ * never reach a plist writer without its environment.
+ */
+export type HarnessLaunchSpec = {
+  readonly programArguments: readonly string[];
+  readonly environment: Readonly<Record<string, string>>;
+} & { readonly [HARNESS_LAUNCH_SPEC_BRAND]: "harness-launch" };
+
+/**
+ * Environment names a harness launch MUST carry.
+ *
+ * HONEST SCOPE: v1 confines exactly one harness, the Hermes gateway, and its
+ * argv is resolved by `castle-wall/provision/harness-argv.ts`, whose BOTH
+ * branches set `HOME` and `PYTHONPATH` (a re-homed editable install cannot
+ * import `hermes_cli` without them -- that is precisely F-HARNESSENV). These
+ * are therefore facts about the only launch the product can build today, not a
+ * guess about a future one. A non-Python harness must extend this to a
+ * per-harness required set; it must NEVER be relaxed to "optional", because
+ * optional is the shape the bug had.
+ */
+export const REQUIRED_HARNESS_LAUNCH_ENV = ["HOME", "PYTHONPATH"] as const;
+
+/**
+ * Build a {@link HarnessLaunchSpec}, fail-closed. Throws when the argv is
+ * empty / relative, or when any {@link REQUIRED_HARNESS_LAUNCH_ENV} name is
+ * missing or empty -- at RESOLUTION time, with the missing names listed,
+ * rather than as a launchd start that dies on an import error nobody sees.
+ */
+export function harnessLaunchSpec(input: {
+  programArguments: readonly string[];
+  environment: Readonly<Record<string, string>>;
+}): HarnessLaunchSpec {
+  const argv = [...input.programArguments];
+  if (argv.length === 0) {
+    throw new Error("A harness launch needs a non-empty argv; refusing to build an unlaunchable harness spec.");
+  }
+  if (!isAbsolute(argv[0]!)) {
+    throw new Error(
+      `A harness launch needs an ABSOLUTE program path (got: ${argv[0]!}); LaunchDaemons do not search PATH.`,
+    );
+  }
+  const environment: Record<string, string> = { ...input.environment };
+  const missing = REQUIRED_HARNESS_LAUNCH_ENV.filter((name) => (environment[name] ?? "") === "");
+  if (missing.length > 0) {
+    throw new Error(
+      `A harness launch is missing required environment: ${missing.join(", ")}. ` +
+        "Refusing to build a launch spec whose plist would start the harness without the environment " +
+        "its interpreter needs (FIX F-HARNESSENV: the released gateway then resolves imports from the " +
+        "operator's pre-re-home path and dies on a permission error).",
+    );
+  }
+  return Object.freeze({
+    programArguments: Object.freeze(argv),
+    environment: Object.freeze(environment),
+  }) as HarnessLaunchSpec;
+}
+
 /**
  * POSIX-ish service-account name: lowercase start, then a conservative
  * charset. Deliberately rejects anything that could smuggle plist markup or
@@ -97,7 +181,7 @@ export interface AgentHarnessDaemonPlistOptions {
   /** Absolute log directory; defaults to <fortressPath>/logs when set. */
   logDir?: string;
   /** Extra environment entries (validated against the forbidden list). */
-  environment?: Record<string, string>;
+  environment?: Readonly<Record<string, string>>;
   /** KeepAlive (restart on exit). Default true. */
   keepAlive?: boolean;
   /**
@@ -268,6 +352,30 @@ export function planAgentHarnessDaemonInstall(
     plistContent: renderAgentHarnessDaemonPlist(options),
     bootstrapArgs: ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
   };
+}
+
+/**
+ * FIX F-HARNESSENV: the ONLY way the provisioning/arming paths plan a PLAIN
+ * (coarse) harness install. It takes the whole {@link HarnessLaunchSpec} and
+ * derives BOTH the argv and the environment from it, so the coarse install and
+ * the degraded coarse RESTORE cannot disagree about what the harness needs to
+ * run. `planAgentHarnessDaemonInstall` stays as the low-level renderer plan for
+ * generic/unit use; a structural test pins the arming + provisioning modules to
+ * this function so a future writer cannot reintroduce the bare-argv shape.
+ */
+export function planCoarseHarnessDaemonInstall(options: {
+  agentAccount: string;
+  harnessLaunch: HarnessLaunchSpec;
+  fortressPath?: string;
+  logDir?: string;
+}): HarnessDaemonInstallPlan {
+  return planAgentHarnessDaemonInstall({
+    agentAccount: options.agentAccount,
+    programArguments: [...options.harnessLaunch.programArguments],
+    environment: options.harnessLaunch.environment,
+    ...(options.fortressPath !== undefined ? { fortressPath: options.fortressPath } : {}),
+    ...(options.logDir !== undefined ? { logDir: options.logDir } : {}),
+  });
 }
 
 /**

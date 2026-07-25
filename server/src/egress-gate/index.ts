@@ -217,8 +217,11 @@ export {
   AGENT_HARNESS_DAEMON_LABEL,
   AGENT_HARNESS_DAEMON_PLIST_PATH,
   HARNESS_FORBIDDEN_PLIST_ENV,
+  REQUIRED_HARNESS_LAUNCH_ENV,
+  harnessLaunchSpec,
   renderAgentHarnessDaemonPlist,
   planAgentHarnessDaemonInstall,
+  planCoarseHarnessDaemonInstall,
   installAgentHarnessDaemon,
   uninstallAgentHarnessDaemon,
   setAgentHarnessJobDisabled,
@@ -229,6 +232,7 @@ export {
   type HarnessDaemonOps,
   type HarnessDaemonInstallPlan,
   type HarnessDaemonStatus,
+  type HarnessLaunchSpec,
 } from "./harness-daemon.js";
 
 export {

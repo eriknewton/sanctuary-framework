@@ -58,6 +58,8 @@
  * args -- validation is the daemon module's job, not duplicated here.
  */
 
+import { harnessLaunchSpec, type HarnessLaunchSpec } from "../../egress-gate/harness-daemon.js";
+
 /** A CPython feature version, as reported by the interpreter itself. */
 export interface InterpreterVersion {
   major: number;
@@ -81,11 +83,17 @@ export interface HarnessArgvOps {
   probeInterpreterAsUid(path: string, uid: number): Promise<InterpreterVersion | undefined>;
 }
 
-/** Resolved harness invocation, ready to pass into `AgentHarnessDaemonPlistOptions.programArguments`. */
+/**
+ * Resolved harness invocation.
+ *
+ * FIX F-HARNESSENV: the argv and the environment it needs are ONE value
+ * ({@link HarnessLaunchSpec}), not two sibling fields one of which is
+ * optional. Every plist writer downstream consumes the whole `launch`, so no
+ * consumer can carry the argv forward and drop the environment.
+ */
 export interface ResolvedHarnessArgv {
   harnessId: string;
-  programArguments: string[];
-  environment?: Record<string, string>;
+  launch: HarnessLaunchSpec;
 }
 
 export interface ResolveHermesGatewayArgvOptions {
@@ -209,14 +217,16 @@ export async function resolveHermesGatewayArgv(
   if (venvVersion !== undefined) {
     return {
       harnessId: "hermes",
-      // The venv interpreter puts its OWN site-packages on sys.path, so
-      // PYTHONPATH carries only the source tree `hermes_cli` lives in.
-      programArguments: [venvPython, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
-      environment: {
-        HERMES_ACCEPT_HOOKS: "1",
-        HOME: agentHome,
-        PYTHONPATH: hermesAgentDir,
-      },
+      launch: harnessLaunchSpec({
+        programArguments: [venvPython, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
+        // The venv interpreter puts its OWN site-packages on sys.path, so
+        // PYTHONPATH carries only the source tree `hermes_cli` lives in.
+        environment: {
+          HERMES_ACCEPT_HOOKS: "1",
+          HOME: agentHome,
+          PYTHONPATH: hermesAgentDir,
+        },
+      }),
     };
   }
   rejections.push(`${venvPython} could not be executed as uid ${agentUid}`);
@@ -260,12 +270,14 @@ export async function resolveHermesGatewayArgv(
     }
     return {
       harnessId: "hermes",
-      programArguments: [candidate, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
-      environment: {
-        HERMES_ACCEPT_HOOKS: "1",
-        HOME: agentHome,
-        PYTHONPATH: `${hermesAgentDir}:${sitePackages}`,
-      },
+      launch: harnessLaunchSpec({
+        programArguments: [candidate, "-m", "hermes_cli.main", "gateway", "run", "--accept-hooks"],
+        environment: {
+          HERMES_ACCEPT_HOOKS: "1",
+          HOME: agentHome,
+          PYTHONPATH: `${hermesAgentDir}:${sitePackages}`,
+        },
+      }),
     };
   }
   throw new Error(
@@ -307,6 +319,123 @@ export function interpreterVersionProbeArgv(uid: number, interpreterPath: string
 /** Bound on one probe. A hung interpreter must never hang a boot-time argv resolution. */
 export const INTERPRETER_PROBE_TIMEOUT_MS = 10_000;
 
+/** Cap on probe stdout kept in memory; a version line is 8 bytes. */
+const INTERPRETER_PROBE_STDOUT_CAP = 4096;
+
+/**
+ * Run ONE as-uid interpreter probe under a HARD deadline, and return whatever
+ * the child printed to stdout by the deadline (`undefined` on spawn failure,
+ * non-zero exit, signal death, or timeout).
+ *
+ * FIX (Codex adversarial review, HIGH, 2026-07-26). This was
+ * `promisify(execFile)(file, args, { timeout })`, and that bound is NOT hard:
+ * Node's `timeout` sends the default `SIGTERM` and then keeps waiting for the
+ * child to exit, so a candidate that IGNORES `SIGTERM` hangs the caller
+ * indefinitely. The reviewer reproduced it: with a `trap "" TERM` child and a
+ * 200ms timeout, the callback did not fire until an external `SIGKILL` at
+ * 1200ms. That matters here because the FIRST candidate is the agent-home venv
+ * interpreter, which this module's own header documents as AGENT-WRITABLE --
+ * so a hostile or corrupted interpreter could hang `protect` and, worse, the
+ * root boot supervisor's argv resolution, instead of failing closed to a
+ * parked agent.
+ *
+ * Three properties, all deliberate:
+ *
+ *  1. HARD DEADLINE. The returned promise settles at the deadline, whatever
+ *     the child does. It is a race between "child closed" and "deadline", NOT
+ *     a wait-for-exit after a signal.
+ *  2. `SIGKILL`, NOT `SIGTERM`. `SIGKILL` cannot be trapped or ignored.
+ *  3. PROCESS GROUP, NOT PROCESS. The direct child is `/usr/bin/sudo` and the
+ *     interpreter is ITS child, so killing only the direct child can leave the
+ *     interpreter running (and holding the inherited stdout pipe). `detached:
+ *     true` puts the child in its own process group and the timeout kills the
+ *     GROUP (`kill(-pid)`), which reaches sudo's descendants.
+ *
+ * Exported for the regression test, which drives a real `SIGTERM`-ignoring
+ * `/bin/sh` (no sudo, no host mutation) and asserts settlement near the
+ * deadline rather than after external cleanup.
+ */
+export async function runInterpreterProbeBounded(
+  argv: { file: string; args: string[] },
+  timeoutMs: number,
+): Promise<string | undefined> {
+  const { spawn } = await import("node:child_process");
+  return new Promise<string | undefined>((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(argv.file, argv.args, {
+        // Own process group, so the deadline can kill sudo AND the interpreter
+        // it spawned rather than only the direct child.
+        detached: true,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      resolve(undefined);
+      return;
+    }
+
+    let settled = false;
+    let stdout = "";
+    // Set on `exit` (which fires BEFORE `close`, and before the pid can be
+    // recycled). Without it, a child that exits in the same turn the deadline
+    // fires could have its pid reused and `kill(-pid)` would signal an
+    // unrelated process group.
+    let exited = false;
+
+    // THE BOUND. Created before the handlers below and deliberately NOT
+    // `unref`ed: an unref'd deadline could be skipped if every other handle
+    // went away, which is the one thing this function must never do. Its
+    // callback runs asynchronously, so referring to `settle`/`killGroup`
+    // (declared just below) is safe.
+    const timer = setTimeout(() => {
+      // Settle FIRST, then kill: the caller is bounded even if the kill itself
+      // fails (an unkillable/uninterruptible child must not extend the bound).
+      settle(undefined);
+      killGroup();
+    }, timeoutMs);
+
+    const settle = (value: string | undefined): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+
+    /** Kill the whole group; fall back to the direct child if the group is gone. */
+    const killGroup = (): void => {
+      const pid = child.pid;
+      if (exited || pid === undefined) return;
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already reaped; nothing to kill.
+        }
+      }
+    };
+
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (chunk: string) => {
+      if (stdout.length < INTERPRETER_PROBE_STDOUT_CAP) {
+        stdout += chunk;
+      }
+    });
+    child.stdout?.on("error", () => undefined);
+    child.on("error", () => {
+      exited = true;
+      settle(undefined);
+    });
+    child.on("exit", () => {
+      exited = true;
+    });
+    child.on("close", (code, signal) => {
+      settle(code === 0 && signal === null ? stdout : undefined);
+    });
+  });
+}
+
 /**
  * Production {@link HarnessArgvOps}. The single construction point for every
  * caller (protect, repair, unprotect, and the safe-mode boot supervisor), so
@@ -330,20 +459,13 @@ export function realHarnessArgvOps(): HarnessArgvOps {
       } catch {
         return undefined;
       }
-      try {
-        const { execFile } = await import("node:child_process");
-        const { promisify } = await import("node:util");
-        const run = promisify(execFile);
-        const { stdout } = await run(argv.file, argv.args, {
-          timeout: INTERPRETER_PROBE_TIMEOUT_MS,
-          encoding: "utf8",
-        });
-        return parseInterpreterVersion(stdout);
-      } catch {
-        // Any spawn error, nonzero exit, signal death, or timeout reads as
-        // "this uid cannot execute this interpreter" (fail-closed).
-        return undefined;
-      }
+      // Any spawn error, nonzero exit, signal death, or timeout reads as
+      // "this uid cannot execute this interpreter" (fail-closed) -- and the
+      // timeout is a HARD, process-group-wide deadline (see
+      // {@link runInterpreterProbeBounded}).
+      const stdout = await runInterpreterProbeBounded(argv, INTERPRETER_PROBE_TIMEOUT_MS);
+      if (stdout === undefined) return undefined;
+      return parseInterpreterVersion(stdout);
     },
   };
 }

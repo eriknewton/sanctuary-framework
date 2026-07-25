@@ -90,12 +90,13 @@ import {
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
   AGENT_HARNESS_DAEMON_PLIST_PATH,
-  planAgentHarnessDaemonInstall,
+  planCoarseHarnessDaemonInstall,
   installAgentHarnessDaemon,
   uninstallAgentHarnessDaemon,
   agentHarnessDaemonStatus,
   setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
+  type HarnessLaunchSpec,
 } from "../egress-gate/harness-daemon.js";
 import {
   planParkedHarnessInstall,
@@ -110,6 +111,7 @@ import {
   createRepairExclusiveEgressOps,
   createUnprotectExclusiveEgressOps,
   ensureAgentHarnessHoldDir,
+  observeAgentConfinementProduction,
   type ExclusiveEgressWiringInput,
 } from "../egress-gate/arming-wiring.js";
 import { deriveGateAccountName } from "../egress-gate/gate-account.js";
@@ -1162,9 +1164,11 @@ export async function runAutoProvisionForWrap(
   // restore. `undefined` means the capture never ran (no publish happened), and
   // the restore op refuses rather than inventing a pre-run state.
   let preRunProvisionedEgressRules: ProvisionedEgressRuleFile[] | undefined;
-  // S5-6: the REAL harness argv captured at parked-install time (the release
-  // barrier's argv-digest source). Set exactly once, only in exclusive mode.
-  let capturedHarnessArgv: string[] | undefined;
+  // S5-6: the REAL harness LAUNCH captured at parked-install time (the release
+  // barrier's argv-digest source AND the environment every later plist
+  // re-render needs -- FIX F-HARNESSENV). Set exactly once, only in exclusive
+  // mode.
+  let capturedHarnessLaunch: HarnessLaunchSpec | undefined;
   // Drill-D2 fix-round (2026-07-18): what the harness looked like BEFORE the
   // parked install stood it down -- prior plist bytes + prior installed/running
   // state. The material `restoreStoodDownHarness` needs to put the operator's
@@ -1179,9 +1183,9 @@ export async function runAutoProvisionForWrap(
   // contract violation and throws (fail-closed; the orchestrator maps it to
   // the degrade-loud outcome, which leaves the agent parked).
   const buildExclusiveWiringInput = (): ExclusiveEgressWiringInput => {
-    if (resolvedAgentUidGid === undefined || capturedHarnessArgv === undefined) {
+    if (resolvedAgentUidGid === undefined || capturedHarnessLaunch === undefined) {
       throw new Error(
-        "exclusive-egress stage invoked before the parked harness install resolved the agent uid/argv (contract violation)",
+        "exclusive-egress stage invoked before the parked harness install resolved the agent uid/launch (contract violation)",
       );
     }
     const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
@@ -1194,7 +1198,7 @@ export async function runAutoProvisionForWrap(
       agentUid: resolvedAgentUidGid.uid,
       agentAccount: accountName,
       fortressPath: wallFortressPath,
-      harnessArgv: capturedHarnessArgv,
+      harnessLaunch: capturedHarnessLaunch,
       harnessLogDir: resolveHarnessDaemonLogDir(newAccountHome),
       agentTemplate: agentId,
       gateDaemonArgvPrefix: resolveGateDaemonArgvPrefix(options.cliBinary),
@@ -1363,14 +1367,13 @@ export async function runAutoProvisionForWrap(
           // NOTHING is bootstrapped: the release barrier starts the agent
           // strictly after the gate generation commits. The REAL harness argv
           // is captured for the barrier's argv-digest.
-          capturedHarnessArgv = resolved.programArguments;
+          capturedHarnessLaunch = resolved.launch;
           const plan = planParkedHarnessInstall({
             agentAccount: accountName,
             agentUid: uid,
-            harnessArgv: resolved.programArguments,
+            harnessLaunch: resolved.launch,
             fortressPath: process.env.SANCTUARY_STORAGE_PATH,
             logDir: harnessLogDir,
-            environment: resolved.environment,
           });
           const snapshot = await executeParkedHarnessInstall(plan, {
             // Fix-round 2 (2026-07-18): the SAME revert ops the outcome
@@ -1417,12 +1420,11 @@ export async function runAutoProvisionForWrap(
             harnessStoodDown: snapshot.preexistingJobModified,
           };
         }
-        const plan = planAgentHarnessDaemonInstall({
+        const plan = planCoarseHarnessDaemonInstall({
           agentAccount: accountName,
-          programArguments: resolved.programArguments,
+          harnessLaunch: resolved.launch,
           fortressPath: process.env.SANCTUARY_STORAGE_PATH,
           logDir: harnessLogDir,
-          environment: resolved.environment,
         });
         await installAgentHarnessDaemon(plan, daemonOps);
         return { ok: true as const, bootstrappedThisRun: before.known && !before.installed };
@@ -1759,6 +1761,11 @@ export async function runAutoProvisionForWrap(
     // somehow still undefined, fail closed to an unreachable synthetic probe
     // rather than defaulting to the CONSOLE owner's uid, which would silently
     // check readability against the wrong identity.
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half): the real observation behind
+    // the refused-run enforcement sentence. Reads the committed egress-gate
+    // registry + this fortress's exclusive-routing marker; never throws, and
+    // an unreadable surface reports UNKNOWN rather than "nothing is confined".
+    observeAgentConfinement: () => observeAgentConfinementProduction(wallFortressPath),
     preArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, credentialDestPathsToVerify),
     checkUidExistence: async (uid) => {
       const { checkUidExistenceBeforeArm } = await import("../castle-wall/provision/uid-gate.js");
@@ -2870,14 +2877,19 @@ export function buildHermesExclusiveCliWiring(input: {
   accountName: string;
   newAccountHome: string;
   wallFortressPath: string;
-  harnessArgv: string[];
+  /**
+   * FIX F-HARNESSENV: the resolved harness launch (argv + environment), or
+   * `undefined` when the re-homed runtime could not be resolved. `undefined`
+   * IS the S5-7 MED-1 condition, so it now drives the plist-removal park
+   * directly instead of a separate `parkPlistFallbackRemoval` boolean that a
+   * caller had to remember to set in lockstep with a placeholder argv.
+   */
+  harnessLaunch?: HarnessLaunchSpec;
   operatorUid: number;
   auditSource: string;
   print: (line: string) => void;
   accountOps: ReturnType<typeof realAccountProvisionOps>;
   cliBinary?: string;
-  /** S5-7 MED-1: argv-unavailable fallback park (remove the plist, not restore). */
-  parkPlistFallbackRemoval?: boolean;
 }): ExclusiveEgressWiringInput {
   const agentId = "hermes";
   const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
@@ -2890,7 +2902,7 @@ export function buildHermesExclusiveCliWiring(input: {
     agentUid: input.agentUid,
     agentAccount: input.accountName,
     fortressPath: input.wallFortressPath,
-    harnessArgv: input.harnessArgv,
+    ...(input.harnessLaunch !== undefined ? { harnessLaunch: input.harnessLaunch } : {}),
     harnessLogDir: resolveHarnessDaemonLogDir(input.newAccountHome),
     agentTemplate: agentId,
     gateDaemonArgvPrefix: resolveGateDaemonArgvPrefix(input.cliBinary),
@@ -2925,8 +2937,38 @@ export function buildHermesExclusiveCliWiring(input: {
     },
     print: input.print,
     accountOps: input.accountOps,
-    ...(input.parkPlistFallbackRemoval === true ? { parkPlistFallbackRemoval: true } : {}),
   };
+}
+
+/**
+ * FIX F-COARSE-AFTER-EXCLUSIVE: the ONE place a failed repair's routing-mode
+ * consequence is put into words, derived from the outcome field the sequence
+ * SET from what it actually did (or failed to do) -- never from the code path
+ * the reader happens to be standing in. Exported so the sentence is asserted
+ * directly rather than only through the CLI runner (which is darwin/root-gated).
+ */
+export function describeRepairCoarseComposition(
+  composition: "restored" | "not-attempted" | "exclusive-left",
+  restoreError?: string,
+): string {
+  switch (composition) {
+    case "not-attempted":
+      // The failure preceded the bring-up, so this run never put the fortress
+      // into exclusive composition. Say nothing about a mode we did not touch.
+      return "";
+    case "restored":
+      return (
+        " The fortress was returned to COARSE routing composition (audited), so the plain " +
+        "'sudo sanctuary protect --hermes' path works again."
+      );
+    case "exclusive-left":
+      return (
+        " WARNING: this run left the fortress in EXCLUSIVE routing composition and could NOT restore " +
+        `coarse (${restoreError ?? "no detail"}). While it stays that way, a plain ` +
+        "'sudo sanctuary protect --hermes' will be REFUSED by the composition invariant, and a confined " +
+        "agent may be reaching nothing. Clear it with: sudo sanctuary protect --unprotect-egress-gate"
+      );
+  }
 }
 
 /**
@@ -3024,13 +3066,13 @@ export async function runEgressGateRepairForCli(options: {
     );
     return 2;
   }
-  let harnessArgv: string[];
+  let harnessLaunch: HarnessLaunchSpec;
   try {
     const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
       agentHome: newAccountHome,
       agentUid,
     });
-    harnessArgv = resolved.programArguments;
+    harnessLaunch = resolved.launch;
   } catch (err) {
     print(`Could not resolve the harness argv for the repair (${(err as Error).message}); refusing.`);
     return 2;
@@ -3040,7 +3082,7 @@ export async function runEgressGateRepairForCli(options: {
     accountName,
     newAccountHome,
     wallFortressPath,
-    harnessArgv,
+    harnessLaunch,
     operatorUid: operatorIdentity.uid,
     auditSource: "sanctuary-protect-repair",
     print,
@@ -3095,7 +3137,12 @@ export async function runEgressGateRepairForCli(options: {
               "parked plist on disk; fail-closed). Investigate, then re-run the repair."
             : "WARNING: the agent's parked state could NOT be fully verified -- it may be startable now " +
               `or at the next boot. Failed checks: ${outcome.parkedStateProblems.join("; ") || "no probe detail"}. ` +
-              "Investigate immediately."),
+              "Investigate immediately.") +
+          // FIX F-COARSE-AFTER-EXCLUSIVE: say what the fortress's ROUTING
+          // COMPOSITION was left in. Pre-fix a failed repair said only
+          // "re-run the repair" while having left the host in a mode that
+          // refuses the plain coarse arm, with no product path named.
+          describeRepairCoarseComposition(outcome.coarseComposition, outcome.coarseRestoreError),
       );
       return 2;
   }
@@ -3163,37 +3210,39 @@ export async function runEgressGateUnprotectForCli(options: {
   // credential all persist -- a fail-closed dead-end with no recovery path. The
   // argv is only needed to RE-RENDER the parked plist; an ABSENT plist is
   // equally unbootable (and `verifyHarnessParkedPersistent` accepts it), so we
-  // fall back to a plist-REMOVAL park and still complete the teardown. A
-  // harmless absolute placeholder keeps the parked-plan renderer from throwing;
-  // it is never written to disk (the plist is removed on this path).
-  let harnessArgv: string[];
-  let parkPlistFallbackRemoval = false;
+  // fall back to a plist-REMOVAL park and still complete the teardown.
+  //
+  // FIX F-HARNESSENV: the pre-fix code invented a `/usr/bin/false` PLACEHOLDER
+  // argv here purely to keep the parked-plan renderer from throwing, and set a
+  // separate `parkPlistFallbackRemoval` boolean beside it. Two fields, one
+  // condition, and the placeholder was also what the parked-form COMPARISON
+  // rendered against. An UNRESOLVED launch is now simply `undefined`, and the
+  // removal disposition is derived from it downstream.
+  let harnessLaunch: HarnessLaunchSpec | undefined;
   try {
     const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
       agentHome: newAccountHome,
       agentUid,
     });
-    harnessArgv = resolved.programArguments;
+    harnessLaunch = resolved.launch;
   } catch (err) {
     print(
       `Could not resolve the harness argv for the unprotect (${(err as Error).message}); ` +
         "falling back to a plist-removal park -- the harness will be left unbootable (no parked plist) and " +
         "the teardown will still complete. (The re-homed Hermes runtime tree looks damaged or removed.)",
     );
-    harnessArgv = ["/usr/bin/false"];
-    parkPlistFallbackRemoval = true;
+    harnessLaunch = undefined;
   }
   const wiring = buildHermesExclusiveCliWiring({
     agentUid,
     accountName,
     newAccountHome,
     wallFortressPath,
-    harnessArgv,
+    ...(harnessLaunch !== undefined ? { harnessLaunch } : {}),
     operatorUid: operatorIdentity.uid,
     auditSource: "sanctuary-protect-unprotect",
     print,
     accountOps,
-    parkPlistFallbackRemoval,
     ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
   });
   const outcome = await runEgressGateUnprotect(

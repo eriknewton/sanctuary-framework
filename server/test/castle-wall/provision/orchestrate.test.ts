@@ -7,7 +7,12 @@
 
 import { describe, it, expect, vi } from "vitest";
 
-import { runProvisionFlow, type ProvisionFlowContext, type ProvisionFlowOps } from "../../../src/castle-wall/provision/orchestrate.js";
+import {
+  runProvisionFlow,
+  describeObservedAgentConfinement,
+  type ProvisionFlowContext,
+  type ProvisionFlowOps,
+} from "../../../src/castle-wall/provision/orchestrate.js";
 import type { ProvisionNeedResult } from "../../../src/castle-wall/provision/detect.js";
 import type { RehomeStepResult } from "../../../src/castle-wall/provision/rehome.js";
 import {
@@ -172,6 +177,14 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       attemptedCount: REHOME_RESULTS.length,
       backupPaths: REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
       conflictPaths: [],
+    })),
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half): the default is a host with
+    // NOTHING confined, which is what the pre-fix flat sentence assumed. The
+    // regression tests below override it with the drill's actual state.
+    observeAgentConfinement: vi.fn(async () => ({
+      known: true as const,
+      confinedUids: [],
+      exclusiveRoutingMarkerPresent: false,
     })),
     ...overrides,
   };
@@ -992,6 +1005,91 @@ describe("castle-wall/provision/orchestrate", () => {
       // The per-endpoint table was printed.
       const printed = (ops.print as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
       expect(printed.some((line) => /\[FAIL\] LLM \(Venice\)/.test(line))).toBe(true);
+    });
+
+    // -----------------------------------------------------------------------
+    // FIX F-COARSE-AFTER-EXCLUSIVE, honesty half (HIGH, Mini1 re-drill
+    // 2026-07-26). This abort printed the flat sentence "The wall was NOT
+    // armed". At the instant it printed on the drill host, pf was
+    // `Status: Enabled`, the gate registry showed
+    // `committed: [{agent_uid: 503, generation_id: 23}]`, and the confined
+    // agent was 0/9 reachable INCLUDING its own manifest. The sentence was
+    // true about the CODE PATH and false about the HOST.
+    // -----------------------------------------------------------------------
+    const refusingEgressOps = (
+      observe: ProvisionFlowOps["observeAgentConfinement"],
+    ): ProvisionFlowOps =>
+      happyPathOps({
+        provisionEgress: vi.fn(async () => ({
+          ok: false as const,
+          error: "policy reload after publishing egress rules failed: Exclusive routing composition rejected",
+          checks: [],
+          dnsRulePresent: true,
+        })),
+        observeAgentConfinement: observe,
+      });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a refused run over an ALREADY-CONFINED host never claims nothing is armed", async () => {
+      const result = await runProvisionFlow(
+        baseCtx(),
+        refusingEgressOps(
+          vi.fn(async () => ({
+            known: true as const,
+            confinedUids: [503],
+            exclusiveRoutingMarkerPresent: true,
+          })),
+        ),
+      );
+      const reason = (result as { reason: string }).reason;
+      // The pre-fix sentence, verbatim, must not be reachable.
+      expect(reason).not.toMatch(/The wall was NOT armed/);
+      // What IS said comes from the observation.
+      expect(reason).toMatch(/This run did not arm the wall, BUT/);
+      expect(reason).toMatch(/uid\(s\) 503 are confined/);
+      expect(reason).toMatch(/exclusive-routing marker/);
+      // And it names the product path that provably clears it (the drill's D9).
+      expect(reason).toMatch(/--unprotect-egress-gate/);
+    });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a clean host is described as clean, and an UNOBSERVABLE host as unknown", async () => {
+      const clean = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => ({ known: true as const, confinedUids: [], exclusiveRoutingMarkerPresent: false })),
+      ));
+      expect((clean as { reason: string }).reason).toMatch(/no per-agent egress confinement was observed/);
+      expect((clean as { reason: string }).reason).not.toMatch(/unprotect-egress-gate/);
+
+      // "Could not look" must never collapse into "nothing is armed".
+      const unknown = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => ({ known: false as const, reason: "the egress-gate registry could not be read: EACCES" })),
+      ));
+      const unknownReason = (unknown as { reason: string }).reason;
+      expect(unknownReason).toMatch(/could NOT be observed/);
+      expect(unknownReason).toMatch(/EACCES/);
+      expect(unknownReason).not.toMatch(/no per-agent egress confinement was observed/);
+
+      // A THROWING probe is also unknown, never quiet, and never fatal.
+      const threw = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => Promise.reject(new Error("probe exploded"))),
+      ));
+      expect((threw as { reason: string }).reason).toMatch(/probe threw: probe exploded/);
+    });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): describeObservedAgentConfinement is a pure function of the observation", () => {
+      // The render chokepoint asserted directly: the same observation must
+      // produce the same sentence regardless of which caller reached it.
+      expect(
+        describeObservedAgentConfinement({ known: true, confinedUids: [], exclusiveRoutingMarkerPresent: false }),
+      ).toBe("This run did not arm the wall, and no per-agent egress confinement was observed on this host.");
+      const markerOnly = describeObservedAgentConfinement({
+        known: true,
+        confinedUids: [],
+        exclusiveRoutingMarkerPresent: true,
+      });
+      // A marker with NO committed uid is still exclusive composition, and is
+      // still enough to refuse the coarse path -- so it must not read clean.
+      expect(markerOnly).toMatch(/exclusive-routing marker/);
+      expect(markerOnly).toMatch(/--unprotect-egress-gate/);
+      expect(markerOnly).not.toMatch(/no per-agent egress confinement was observed/);
     });
 
     it("post-arm as-uid verify failure fast-disarms, scrubs the provisioned rules, audits egress_provision_refused, and returns the DISTINCT egress-unprovisioned-rolled-back outcome", async () => {

@@ -2161,7 +2161,9 @@ export async function runSafeModeDaemon(
         return {
           kind: "ok" as const,
           agentAccount: accountName,
-          harnessArgv: resolved.programArguments,
+          // FIX F-HARNESSENV: the boot release re-renders the harness plist, so
+          // it carries the WHOLE launch (argv + environment), never a bare argv.
+          harnessLaunch: resolved.launch,
           harnessLogDir: `${agentHome}/logs`,
           gateAccount,
           gateHomeDirectory,

@@ -35,6 +35,7 @@ import {
   AGENT_HARNESS_DAEMON_LABEL,
   AGENT_HARNESS_DAEMON_PLIST_PATH,
   renderAgentHarnessDaemonPlist,
+  harnessLaunchSpec,
 } from "../../src/egress-gate/harness-daemon.js";
 import {
   AGENT_HARNESS_HOLD_DIR,
@@ -59,6 +60,17 @@ import {
   type HarnessReleaseHoldRecord,
   type ParkedInstallOps,
 } from "../../src/egress-gate/release-barrier.js";
+
+/**
+ * FIX F-HARNESSENV: a `HarnessLaunchSpec` is the ONLY thing the parked planner
+ * accepts, and it cannot be built without the required environment -- so even
+ * a test cannot express the argv-without-environment shape that shipped.
+ */
+const testLaunch = (programArguments: string[]): ReturnType<typeof harnessLaunchSpec> =>
+  harnessLaunchSpec({
+    programArguments,
+    environment: { HOME: "/var/sanctuary-agents/sanctuary-hermes", PYTHONPATH: "/var/sanctuary-agents/sanctuary-hermes/.hermes/hermes-agent" },
+  });
 
 const RECORD: HarnessReleaseHoldRecord = {
   generation_id: 7,
@@ -242,7 +254,7 @@ describe("barrier plist form", () => {
   const plan = planParkedHarnessInstall({
     agentAccount: "sanctuary-hermes",
     agentUid: 503,
-    harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
+    harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
     fortressPath: "/Users/op/.sanctuary",
   });
 
@@ -272,10 +284,46 @@ describe("barrier plist form", () => {
     const released = planParkedHarnessInstall({
       agentAccount: "sanctuary-hermes",
       agentUid: 503,
-      harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
+      harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
       expectedGenerationId: 42,
     });
     expect(released.plistContent).toContain("<string>42</string>");
+  });
+
+  it("REGRESSION (F-HARNESSENV): the RELEASE re-render carries the harness environment, not just SANCTUARY_STORAGE_PATH", () => {
+    // THE DRILL'S DEFECT, pinned. `D4-plist-versions.log` snapshotted every
+    // distinct version of the harness plist during one exclusive arm: the park
+    // INSTALL carried HOME + PYTHONPATH, and the RELEASE plist -- the one the
+    // agent is actually started under -- carried only SANCTUARY_STORAGE_PATH.
+    // The released gateway therefore had no PYTHONPATH, fell through to
+    // Hermes' editable-install finder, and died on PermissionError.
+    const launch = testLaunch(["/usr/local/bin/node", "/opt/harness.js"]);
+    const parked = planParkedHarnessInstall({
+      agentAccount: "sanctuary-hermes",
+      agentUid: 503,
+      harnessLaunch: launch,
+      fortressPath: "/Users/op/.sanctuary",
+    });
+    const released = planParkedHarnessInstall({
+      agentAccount: "sanctuary-hermes",
+      agentUid: 503,
+      harnessLaunch: launch,
+      fortressPath: "/Users/op/.sanctuary",
+      expectedGenerationId: 42,
+    });
+    for (const [form, plist] of [
+      ["parked", parked.plistContent],
+      ["released", released.plistContent],
+    ] as const) {
+      for (const [name, value] of Object.entries(launch.environment)) {
+        expect(plist, `${form} plist is missing ${name}`).toContain(`<key>${name}</key>`);
+        expect(plist, `${form} plist is missing the value of ${name}`).toContain(`<string>${value}</string>`);
+      }
+      // The fortress env is still rendered; the bug was that it was the ONLY one.
+      expect(plist).toContain("<key>SANCTUARY_STORAGE_PATH</key>");
+    }
+    // The ONLY difference between the two forms is the generation id.
+    expect(released.plistContent.replace("<string>42</string>", "<string>0</string>")).toBe(parked.plistContent);
   });
 
   it("legacy render (no barrier options) is byte-identical to the pre-S5-5 form", () => {
@@ -291,10 +339,10 @@ describe("barrier plist form", () => {
 
   it("plan refuses a root account and a non-positive uid (renderer validation still applies)", () => {
     expect(() =>
-      planParkedHarnessInstall({ agentAccount: "root", agentUid: 503, harnessArgv: ["/x"] }),
+      planParkedHarnessInstall({ agentAccount: "root", agentUid: 503, harnessLaunch: testLaunch(["/x"]) }),
     ).toThrow(/root/);
     expect(() =>
-      planParkedHarnessInstall({ agentAccount: "sanctuary-hermes", agentUid: 0, harnessArgv: ["/x"] }),
+      planParkedHarnessInstall({ agentAccount: "sanctuary-hermes", agentUid: 0, harnessLaunch: testLaunch(["/x"]) }),
     ).toThrow(ReleaseBarrierError);
   });
 
@@ -446,7 +494,7 @@ describe("executeParkedHarnessInstall", () => {
   const plan = planParkedHarnessInstall({
     agentAccount: "sanctuary-hermes",
     agentUid: 503,
-    harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
+    harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
   });
 
   it("writes wrapper 0755 + plist 0644, disables, stands down, removes any stale hold file, and NEVER bootstraps", async () => {
@@ -1166,7 +1214,7 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
   const r5Plan = planParkedHarnessInstall({
     agentAccount: "sanctuary-hermes",
     agentUid: 503,
-    harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
+    harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
   });
 
   it("R5: a revert that cannot restart a LIVE harness reports it RUNNING, never STOPPED", async () => {
@@ -1334,7 +1382,7 @@ describe("parked install against a REAL, NON-EXISTENT hold directory (drill D1)"
       const realPlan = planParkedHarnessInstall({
         agentAccount: "sanctuary-hermes",
         agentUid: 503,
-        harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
+        harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
         holdDir,
       });
       expect(realPlan.wrapperPath).toBe(join(holdDir, "release-exec-wrapper.sh"));
@@ -1511,7 +1559,7 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
       const planOptions = {
         agentAccount: "sanctuary-hermes",
         agentUid,
-        harnessArgv,
+        harnessLaunch: testLaunch(harnessArgv),
         holdDir: dir,
       };
       const parkedPlan = planParkedHarnessInstall(planOptions);
