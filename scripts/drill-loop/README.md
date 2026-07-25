@@ -269,6 +269,14 @@ Stated here rather than discovered at 3am:
   arm over a live confined agent is refused and the gate survives) WAS a real
   gap and is now implemented. The loop's finding string is the battery's own
   `PROBE=SUMMARY` line, naming what ran and what was skipped.
+- **The drivers cannot READ inside the fortress once the product tightens it,
+  and they now say so instead of reporting clean.** `tightenStoragePermissions`
+  chmods the fortress to 0700 on every server start and the fortress is
+  root-owned, so `preflight.sh`'s stale-marker and zero-byte-lock checks and
+  `teardown-verify.sh`'s marker and lock checks cannot be made by an
+  unprivileged driver after the first arm. All four read absence as good, so
+  reporting them PASS would be a false green. They fail loudly instead. The
+  real fix is a wrapper verb that reads those paths as root; it is not built.
 - **Mini2's local short hostname is unconfirmed.** It sits in the allowlist as
   `mini2`, which is its Tailscale name. If the machine answers to something
   else, the wrapper refuses there until the list is edited and re-reviewed.
@@ -298,11 +306,26 @@ merely discouraged.
 
 **Operational cost of the root-owned base, stated plainly.** The disposable
 fortress is no longer in the operator's home and is no longer operator-owned.
-The operator can read and traverse it (it is mode 0755) but cannot write into
-it; the Sanctuary CLI runs as root under the wrapper, so the state it writes was
-root's either way. Two consequences to know about: evidence bundles still live
-under the operator's home and are unaffected, and anything that needs to WRITE
-inside a disposable fortress as the operator has to go through a wrapper verb.
-Nothing in the current ladder does. If that changes, the answer is ownership or
-permissions on the root-created leaf, NOT moving the base back into
-operator-writable space.
+The wrapper creates it root-owned at 0755, so the operator can read and traverse
+it and cannot write into it; the Sanctuary CLI runs as root under the wrapper,
+so the state it writes was root's either way. Evidence bundles still live under
+the operator's home and are unaffected.
+
+**And one consequence that a reviewer should hold this PR to.** The product's
+`tightenStoragePermissions` (`server/src/storage/permissions.ts`) chmods the
+whole fortress to **0700 on every server start**. Combined with a root-owned
+fortress, that means the unprivileged drivers lose read access to it from the
+first arm onward. That matters because `preflight.sh` and `teardown-verify.sh`
+draw conclusions from ABSENCE ("no stale marker", "no lock left behind"), and a
+directory you are not allowed to look into is indistinguishable from an empty
+one. So both drivers now refuse to draw an absence conclusion they could not
+observe: the storage rail's own resolution post-condition stops the run hard
+when the fortress cannot be traversed at all, and an explicit
+`storage-observable` check covers the traversable-but-unreadable case. **Neither
+one reports clean.**
+
+Reading those paths through a wrapper verb is the real fix and is not built.
+Until it is, the honest position is the one above: the check is loud about not
+having been made. That is the same rule as the pf anchor, applied to the other
+side of the same wall. Whatever the fix, it is ownership or permissions on the
+root-created leaf, NOT moving the base back into operator-writable space.

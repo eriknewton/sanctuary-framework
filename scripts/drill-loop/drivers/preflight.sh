@@ -99,6 +99,30 @@ safe_under_storage() {
   rails_assert_safe_subpath "$STORAGE" "$1" || die "unsafe path under the storage directory: $1"
 }
 
+# --- CAN THIS PROCESS SEE INSIDE THE FORTRESS AT ALL? ---------------------
+#
+# This has to come before every check that reads a path under $STORAGE,
+# because those checks read ABSENCE as GOOD. "no stale marker", "no zero-byte
+# lock", "no orphaned lock" are all conclusions drawn from a file not being
+# there, and a directory this process cannot traverse looks exactly like a
+# directory with nothing in it.
+#
+# It is a live concern, not a hypothetical: `tightenStoragePermissions` in
+# server/src/storage/permissions.ts chmods the whole fortress to 0700 on every
+# server start, and the disposable fortress is created ROOT-owned (that is
+# BLOCKER 1's fix). So from the first arm onward, this unprivileged driver
+# cannot read into it, and every absence-based check below would report PASS
+# having observed nothing.
+#
+# Reporting it is the correct behavior for now; reading these paths through a
+# wrapper verb is the real fix and is named as an open item in the README.
+storage_observable() {
+  if [ ! -d "$STORAGE" ]; then return 1; fi
+  if [ ! -r "$STORAGE" ]; then return 1; fi
+  if [ ! -x "$STORAGE" ]; then return 1; fi
+  return 0
+}
+
 # --- the SHA the iteration says it is testing -----------------------------
 # NOT D7, and no longer labeled as if it were. run-loop.sh defaults
 # --build-sha to HEAD of this same checkout, so comparing it to HEAD is a
@@ -185,25 +209,40 @@ for label in com.sanctuary.egress-gate com.sanctuary.egress-gate-peer-resolver; 
 done
 
 # --- D8: no stale exclusive-routing marker --------------------------------
-marker="$(safe_under_storage 'exclusive-routing.json')"
-if [ -e "$marker" ]; then
-  check_fail stale-marker "$marker exists before arm"
-else
-  check_pass stale-marker
-fi
+if storage_observable; then
+  check_pass storage-observable "$STORAGE"
 
-# --- 0-byte locks brick a fortress permanently ----------------------------
-zero_locks=''
-for rel in 'state/_audit/.audit-write.lock' 'state/.provision.lock'; do
-  lock="$(safe_under_storage "$rel")"
-  if [ -f "$lock" ] && [ ! -s "$lock" ]; then
-    zero_locks="$zero_locks $lock"
+  # The mandatory call-site form here too. `safe_under_storage` dies inside the
+  # command substitution, so without the `||` the abort would depend on
+  # `set -e` alone, and relying on `set -e` alone is exactly what this codebase
+  # decided not to do after round 1.
+  marker="$(safe_under_storage 'exclusive-routing.json')" \
+    || die 'safe-subpath rail rejected exclusive-routing.json'
+  [ -n "$marker" ] || die 'empty path after the safe-subpath rail'
+  if [ -e "$marker" ]; then
+    check_fail stale-marker "$marker exists before arm"
+  else
+    check_pass stale-marker
   fi
-done
-if [ -n "$zero_locks" ]; then
-  check_fail zero-byte-lock "zero-length lock file(s):$zero_locks"
+
+  # --- 0-byte locks brick a fortress permanently --------------------------
+  zero_locks=''
+  for rel in 'state/_audit/.audit-write.lock' 'state/.provision.lock'; do
+    lock="$(safe_under_storage "$rel")" || die "safe-subpath rail rejected: $rel"
+    [ -n "$lock" ] || die "empty path after the safe-subpath rail: $rel"
+    if [ -f "$lock" ] && [ ! -s "$lock" ]; then
+      zero_locks="$zero_locks $lock"
+    fi
+  done
+  if [ -n "$zero_locks" ]; then
+    check_fail zero-byte-lock "zero-length lock file(s):$zero_locks"
+  else
+    check_pass zero-byte-lock
+  fi
 else
-  check_pass zero-byte-lock
+  # ONE failure, not three passes. An unreadable fortress makes every
+  # absence-based check below meaningless, and "absent" is what they call good.
+  check_fail storage-observable "cannot read into $STORAGE as $(rails__sys id -un); the stale-marker and zero-byte-lock checks CANNOT be made, and their absence-means-good logic would report PASS having observed nothing"
 fi
 
 # --- 07-22: no orphaned registry entry for this storage path --------------

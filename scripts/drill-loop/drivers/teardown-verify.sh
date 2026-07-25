@@ -86,6 +86,24 @@ safe_under_storage() {
   rails_assert_safe_subpath "$STORAGE" "$1" || die "unsafe path under the storage directory: $1"
 }
 
+# Can this process see inside the fortress at all? The marker and lock checks
+# below read ABSENCE as CLEAN, and a directory this process cannot traverse
+# looks exactly like a directory with nothing left in it.
+#
+# Live concern, not hypothetical: `tightenStoragePermissions` chmods the whole
+# fortress to 0700 on every server start, and the disposable fortress is
+# ROOT-owned (BLOCKER 1's fix). So after the first arm this unprivileged driver
+# cannot read into it, and "the markers are gone" would be a conclusion drawn
+# from not being allowed to look. Reading these through a wrapper verb is the
+# real fix and is named as an open item in the README; refusing to call it
+# clean is the correct behavior until then.
+storage_observable() {
+  if [ ! -d "$STORAGE" ]; then return 1; fi
+  if [ ! -r "$STORAGE" ]; then return 1; fi
+  if [ ! -x "$STORAGE" ]; then return 1; fi
+  return 0
+}
+
 # --- tear down ------------------------------------------------------------
 TEARDOWN_RC=0
 sudo -n "$WRAPPER" unprotect \
@@ -136,22 +154,43 @@ else
   fi
 fi
 
-marker="$(safe_under_storage 'exclusive-routing.json')"
-if [ -e "$marker" ]; then
-  clean_fail marker 'exclusive-routing.json survived teardown'
-else
-  clean_pass marker
-fi
+if storage_observable; then
+  clean_pass storage-observable "$STORAGE"
 
-left_locks=''
-for rel in 'state/_audit/.audit-write.lock' 'state/.provision.lock'; do
-  lock="$(safe_under_storage "$rel")"
-  if [ -e "$lock" ]; then left_locks="$left_locks $lock"; fi
-done
-if [ -n "$left_locks" ]; then
-  clean_fail locks "lock file(s) survived teardown:$left_locks"
+  # The mandatory call-site form here too: `safe_under_storage` dies inside the
+  # command substitution, so without the `||` the abort would depend on
+  # `set -e` alone. That is the round-1 silhouette and this codebase does not
+  # rely on it.
+  marker="$(safe_under_storage 'exclusive-routing.json')" \
+    || die 'safe-subpath rail rejected exclusive-routing.json'
+  [ -n "$marker" ] || die 'empty path after the safe-subpath rail'
+  if [ -e "$marker" ]; then
+    clean_fail marker 'exclusive-routing.json survived teardown'
+  else
+    clean_pass marker
+  fi
+
+  left_locks=''
+  for rel in 'state/_audit/.audit-write.lock' 'state/.provision.lock'; do
+    lock="$(safe_under_storage "$rel")" || die "safe-subpath rail rejected: $rel"
+    [ -n "$lock" ] || die "empty path after the safe-subpath rail: $rel"
+    if [ -e "$lock" ]; then left_locks="$left_locks $lock"; fi
+  done
+  if [ -n "$left_locks" ]; then
+    clean_fail locks "lock file(s) survived teardown:$left_locks"
+  else
+    clean_pass locks
+  fi
+elif [ ! -d "$STORAGE" ]; then
+  # A teardown that removed the whole disposable fortress is a clean outcome,
+  # and there is genuinely nothing left to observe inside it.
+  clean_pass storage-observable "$STORAGE is gone"
+  clean_pass marker 'the whole disposable fortress is gone'
+  clean_pass locks 'the whole disposable fortress is gone'
 else
-  clean_pass locks
+  # ONE dirty finding, not two clean ones. An unreadable fortress makes the
+  # marker and lock checks meaningless, and "absent" is what they call clean.
+  clean_fail storage-observable "cannot read into $STORAGE as $(rails__sys id -un); the marker and lock checks CANNOT be made, and their absence-means-clean logic would report CLEAN having observed nothing"
 fi
 
 # The agent uid must be free again. A teardown that leaves the agent confined

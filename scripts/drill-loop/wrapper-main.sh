@@ -400,7 +400,13 @@ wrapper_verb_clean_markers() {
     'state/_audit/.audit-write.lock' \
     'state/.provision.lock'
   do
-    target="$(wrapper_safe_path "$rel")"
+    # The mandatory form, including here. `wrapper_safe_path` dies inside this
+    # command substitution, so without the `||` the abort would depend on
+    # `set -e` alone, and relying on `set -e` alone is exactly what this
+    # codebase decided not to do after round 1.
+    target="$(wrapper_safe_path "$rel")" \
+      || wrapper_die "unsafe path under the storage directory: $rel"
+    if [ -z "$target" ]; then wrapper_die "empty path after the safe-subpath rail: $rel"; fi
     if [ -f "$target" ]; then
       rails__sys rm -f -- "$target"
       printf 'WRAPPER=OK removed %s\n' "$target"

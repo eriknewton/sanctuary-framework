@@ -644,6 +644,44 @@ case "$out" in
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
+# AN UNREADABLE FORTRESS IS NOT AN EMPTY ONE.
+#
+# The marker and lock checks read ABSENCE as CLEAN, and a directory this
+# process cannot traverse looks exactly like a directory with nothing left in
+# it. This is live, not hypothetical: `tightenStoragePermissions` chmods the
+# whole fortress to 0700 on every server start, and the disposable fortress is
+# ROOT-owned, so after the first arm the unprivileged driver genuinely cannot
+# look inside. Reporting CLEAN there would be the 2026-06-24 failure again.
+# Two layers can produce that refusal and the case asserts the PROPERTY rather
+# than either layer, because which one fires depends on how the fortress became
+# unreadable. As an unprivileged process the reachable state is "cannot
+# traverse", and the storage rail's own `cd -P` post-condition catches it first
+# and exits hard; the explicit `storage_observable` check covers the
+# traversable-but-not-readable case (a 0711 fortress owned by someone else),
+# which cannot be constructed here without root.
+chmod 0000 "$LOOPDIR"
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 run_teardown)"; rc=$?
+set -e
+chmod 0755 "$LOOPDIR"
+if [ "$rc" -ne 0 ]; then
+  printf 'ok    an unreadable fortress is a loud nonzero stop (exit %s)\n' "$rc"
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL  *** an unreadable fortress exited 0 ***\n'
+  note "output: $out"
+  FAIL=$((FAIL + 1))
+fi
+case "$out" in
+  *'VERIFY=CLEAN check=marker'*|*'VERIFY=CLEAN check=locks'*)
+    printf 'FAIL  *** a marker/lock check reported CLEAN on a fortress it could not read ***\n'
+    note "output: $out"
+    FAIL=$((FAIL + 1)) ;;
+  *)
+    printf 'ok    no absence-means-clean verdict was drawn from what could not be seen\n'
+    PASS=$((PASS + 1)) ;;
+esac
+
 # The OTHER half, which is a different branch: the as-agent probe could not be
 # RUN at all, because `sudo -n -u <agent>` is not covered by the reviewed grant.
 # "Could not observe" must be DIRTY and must say so, not be folded into "still
