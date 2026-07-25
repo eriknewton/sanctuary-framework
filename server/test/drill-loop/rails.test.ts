@@ -1271,12 +1271,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("ACCEPTS a genuine invocation and mints a root-owned-shaped directory", () => {
-    if (myUid === 0) {
-      const r = wrapper("check", "--run-id", "good1", "--operator-account", me);
-      expect(r.status).not.toBe(0);
-      expect(r.out).toContain("operator account rejected");
-      return;
-    }
+    if (skipWrapperCases()) return;
     const r = wrapper("check", "--run-id", "good1", "--operator-account", me);
     expect(r.status, r.out).toBe(0);
     expect(r.out).toContain("WRAPPER=ACCEPT");

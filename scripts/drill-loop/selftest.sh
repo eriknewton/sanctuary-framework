@@ -37,6 +37,7 @@ HERE="$(CDPATH='' cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROBE="$HERE/lib/probe.sh"
 
 PASS=0
+SKIPPED=0
 FAIL=0
 SANDBOX=''
 
@@ -488,10 +489,32 @@ LOCAL_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_local" 2>/de
       { print }
     ' > "$TEST_WRAPPER"
 chmod +x "$TEST_WRAPPER"
-if [ -z "$LOCAL_FP" ]; then
-  printf 'FAIL  could not read this machine hardware fingerprint; the wrapper cases below cannot run\n'
-  FAIL=$((FAIL + 1))
+
+# The wrapper-level cases need a machine with a hardware identity, because the
+# host rail decides on one. Linux has no IOPlatformExpertDevice, so there the
+# rail correctly refuses before reaching anything else and every case below
+# would assert the wrong reason.
+#
+# SKIP, LOUDLY AND COUNTED, never silently. This file's whole subject is that a
+# check which could not be made must not be reported as a check that passed,
+# and that rule applies to the battery itself first of all. The rail-level
+# cases above carry the coverage on every platform; these carry the end-to-end
+# verb coverage on the platform the drill actually runs on, which is the only
+# platform where the wrapper will ever be installed.
+WRAPPER_CASES='yes'
+case "$LOCAL_FP" in
+  [0-9a-f]*) [ "${#LOCAL_FP}" -eq 64 ] || WRAPPER_CASES='' ;;
+  *) WRAPPER_CASES='' ;;
+esac
+if [ -z "$WRAPPER_CASES" ]; then
+  printf 'SKIP  the wrapper-level cases: this machine has no hardware identity\n'
+  printf '      (no IOPlatformExpertDevice; the host rail decides on hardware, so\n'
+  printf '       every wrapper case here would refuse for that reason and prove\n'
+  printf '       nothing). The rail-level cases above ran in full.\n'
+  SKIPPED=$((SKIPPED + 1))
 fi
+
+if [ -n "$WRAPPER_CASES" ]; then
 
 printf '== the shipped header is what the battery runs ==\n'
 HEADER_BAD=0
@@ -762,6 +785,8 @@ case "$out" in
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
+fi   # end of the wrapper-level cases
+
 printf '== no host override anywhere in the shipped surface ==\n'
 SHIPPED="$SANDBOX/wrapper-shipped"
 "$HERE/build-wrapper.sh" "$SHIPPED" >/dev/null
@@ -787,5 +812,8 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
+printf '\n%s passed, %s failed, %s section(s) skipped\n' "$PASS" "$FAIL" "$SKIPPED"
+if [ "$SKIPPED" -ne 0 ]; then
+  printf 'NOTE: a skipped section is NOT a passed section. See the SKIP lines above.\n'
+fi
 if [ "$FAIL" -ne 0 ]; then exit 1; fi
