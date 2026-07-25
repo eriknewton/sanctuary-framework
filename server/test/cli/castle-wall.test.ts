@@ -12,6 +12,7 @@ import {
   type PersistedAuditEnvelopeV2,
 } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { hashToString } from "../../src/core/hashing.js";
 import { bytesToString, stringToBytes, toBase64url } from "../../src/core/encoding.js";
@@ -1493,20 +1494,31 @@ describe("castle-wall operability fixes (drill 2026-06-13: F1/F2a/F2b/F3)", () =
     // We don't let it proceed to real state (no shim resolvable, no invoke), so
     // it returns 1 at the shim-resolution wall — but the announcement (which
     // runs FIRST) must already carry the default-fortress note.
-    const err = new CaptureStream();
-    const code = await runRePin([], {
-      out: new CaptureStream(),
-      err,
-      env: {},
-      platform: "darwin",
-      signerClientCandidates: [],
-      fileExistsFn: async () => false,
-    });
-    expect(code).toBe(1); // hit the shim-unknown wall, no state touched
-    expect(err.text()).toContain("Re-pinning trust anchor for fortress:");
-    expect(err.text()).toContain(
-      "(default fortress; set SANCTUARY_STORAGE_PATH to target another)",
-    );
+    //
+    // HOME is redirected (not SANCTUARY_STORAGE_PATH, which would defeat the
+    // branch under test) so "the default fortress" is a temp path, never the
+    // operator's own.
+    const tempHome = await createTempHome("sanctuary-cw-default-fortress");
+    try {
+      const err = new CaptureStream();
+      const code = await runRePin([], {
+        out: new CaptureStream(),
+        err,
+        env: {},
+        platform: "darwin",
+        signerClientCandidates: [],
+        fileExistsFn: async () => false,
+      });
+      expect(code).toBe(1); // hit the shim-unknown wall, no state touched
+      expect(err.text()).toContain(
+        `Re-pinning trust anchor for fortress: ${tempHome.defaultFortressPath}`,
+      );
+      expect(err.text()).toContain(
+        "(default fortress; set SANCTUARY_STORAGE_PATH to target another)",
+      );
+    } finally {
+      await tempHome.cleanup();
+    }
   });
 
   // ── F2b: don't mask a successful migration behind a post-migration error ──

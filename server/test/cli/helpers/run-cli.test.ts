@@ -9,8 +9,9 @@
  * deterministically, independent of the real dist/cli.js or machine load.
  */
 import { describe, it, expect } from "vitest";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import {
   runCli,
@@ -82,4 +83,63 @@ describe("runCliRaw resilience (CLI-subprocess flake fix)", () => {
     expect(code).toBe(0);
     expect(stdout).toContain("Usage:");
   }, CLI_SUBPROCESS_TEST_TIMEOUT_MS);
+});
+
+// ── Child fortress isolation ─────────────────────────────────────────
+//
+// A spawned CLI is a fresh process, so none of the in-process isolation a test
+// does reaches it. Left alone the child resolves the operator's own
+// `~/.sanctuary`, reads real custody, and writes into it. These pin that the
+// helper hands every child its own fortress, and that a caller who names one
+// still wins.
+
+describe("runCliRaw child fortress isolation", () => {
+  /** Print the fortress the child would resolve, without importing src. */
+  const PRINT_RESOLVED = [
+    "-e",
+    "const os=require('node:os');const p=require('node:path');" +
+      "console.log(process.env.SANCTUARY_STORAGE_PATH||p.join(os.homedir(),'.sanctuary'))",
+  ];
+
+  it("gives the child a fortress that is not the operator's own", async () => {
+    const { code, stdout } = await runCliRaw([], {
+      command: process.execPath,
+      prefixArgs: PRINT_RESOLVED,
+    });
+    expect(code).toBe(0);
+    const resolved = stdout.trim();
+    // The account record, not $HOME: the operator's real fortress is the one
+    // path the child must never resolve, however this process moved HOME.
+    expect(resolved).not.toBe(join(userInfo().homedir, ".sanctuary"));
+    expect(resolved).toContain("sanctuary-run-cli-home-");
+  }, 30_000);
+
+  it("removes the child's temporary home afterwards", async () => {
+    const { stdout } = await runCliRaw([], {
+      command: process.execPath,
+      prefixArgs: ["-e", "console.log(process.env.HOME)"],
+    });
+    const childHome = stdout.trim();
+    expect(childHome).toContain("sanctuary-run-cli-home-");
+    // Isolation that leaks a directory per spawn just moves the pollution.
+    expect(existsSync(childHome)).toBe(false);
+  }, 30_000);
+
+  it("lets a caller-supplied fortress win over the default isolation", async () => {
+    const { stdout } = await runCliRaw([], {
+      command: process.execPath,
+      prefixArgs: PRINT_RESOLVED,
+      env: { SANCTUARY_STORAGE_PATH: "/tmp/caller-chosen-fortress" },
+    });
+    expect(stdout.trim()).toBe("/tmp/caller-chosen-fortress");
+  }, 30_000);
+
+  it("lets a caller-supplied HOME win over the default isolation", async () => {
+    const { stdout } = await runCliRaw([], {
+      command: process.execPath,
+      prefixArgs: ["-e", "console.log(process.env.HOME)"],
+      env: { HOME: "/tmp/caller-chosen-home" },
+    });
+    expect(stdout.trim()).toBe("/tmp/caller-chosen-home");
+  }, 30_000);
 });

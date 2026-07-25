@@ -763,9 +763,16 @@ async function runExportPassphrase(args: string[]): Promise<void> {
   const { readStoredPassphrase, PassphraseUnreadableError } = await import(
     "./wrap/passphrase.js"
   );
+  // Resolve the fortress HERE, at the CLI entry point, and pass it down.
+  // Ambient resolution is correct at this layer -- for `sanctuary
+  // export-passphrase` the operator's own environment IS the input -- but it
+  // is stated rather than left implicit, so no leaf module has to reach for
+  // process state on its own.
+  const { resolveStoragePath } = await import("./paths.js");
+  const storagePath = resolveStoragePath();
   let stored: Awaited<ReturnType<typeof readStoredPassphrase>>;
   try {
-    stored = await readStoredPassphrase();
+    stored = await readStoredPassphrase({ storagePath });
   } catch (err) {
     if (err instanceof PassphraseUnreadableError) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.

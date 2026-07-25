@@ -265,6 +265,15 @@ export interface ConfigSecurityPosture {
 export function defaultConfig(): SanctuaryConfig {
   return {
     version: PKG_VERSION,
+    // Deliberately the raw join, NOT the guarded homeFortressPath(): this is
+    // the CONSTRUCTION of a default value, not a decision to touch that
+    // directory. Most callers immediately override storage_path (from the
+    // config file, an explicit temp path, or SANCTUARY_STORAGE_PATH), so
+    // failing here would fire on hundreds of already-isolated tests that never
+    // go near the operator's fortress. The hermeticity guard sits on the
+    // RESOLUTION path (paths.ts) and on the places this value is used to open
+    // storage, which is where reaching the real fortress actually costs
+    // something.
     storage_path: join(homedir(), ".sanctuary"),
     state: {
       encryption: "aes-256-gcm",

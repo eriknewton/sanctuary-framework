@@ -171,6 +171,24 @@ export function getPlatformPaths(): Record<AgentPlatform, string[]> {
  * Multi-tenancy: each Sanctuary instance keeps its backups under its own
  * `SANCTUARY_STORAGE_PATH/backup` so `sanctuary wrap --unwrap` on one
  * agent cannot pick up a meta pointer written by a sibling instance.
+ *
+ * KNOWN GAP (deliberate, bounded): this resolves ambiently rather than taking
+ * the storage path its caller already resolved. Ambient resolution belongs at
+ * a CLI entry point, not in a leaf like this one. It is nonetheless correct in
+ * production today because every entry into the wrap surface promotes
+ * `--fortress` / `SANCTUARY_FORTRESS_PATH` onto `SANCTUARY_STORAGE_PATH`
+ * before anything resolves (`promoteFortressToStoragePath` in wrap/cli.ts), so
+ * this read and the caller's read cannot disagree. It is right by construction
+ * of the caller, not by its own construction, which is a fragile place to be.
+ *
+ * Threading a storage path through this module means adding a parameter to
+ * nine exported functions and their private helpers, and updating roughly 170
+ * call expressions across nine test files, for zero behaviour change today.
+ * That churn in the module carrying the wrap-meta TOCTOU and symlink defences
+ * was judged the larger risk. Until it is done, the recurrence this guards
+ * against is caught by `assertHermeticStoragePath` in paths.ts, which fails
+ * the resolution closed under Vitest, so a test can no longer silently write
+ * into the operator's own backup directory.
  */
 function backupDir(): string {
   return join(resolveStoragePath(), "backup");

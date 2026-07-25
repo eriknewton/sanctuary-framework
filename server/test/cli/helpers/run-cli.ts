@@ -31,6 +31,8 @@
  */
 
 import { execFile } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -111,6 +113,59 @@ export async function runCliRaw(
   const env: NodeJS.ProcessEnv = { ...process.env, NODE_NO_WARNINGS: "1", ...opts.env };
   delete env.SANCTUARY_PASSPHRASE;
 
+  // Hermetic child fortress. A spawned CLI is still part of the test, but it
+  // is a fresh process, so none of the in-process isolation a test does
+  // (overriding HOME in a beforeEach, passing an explicit storagePath) reaches
+  // it. Left alone the child resolves the operator's own `~/.sanctuary` and
+  // both reads real custody and writes into it, which is one of the ways that
+  // fortress's backup directory grew to thousands of files. Isolate here, at
+  // the single place every CLI-subprocess test spawns through, rather than in
+  // each test.
+  //
+  // A caller who names a fortress wins: isolation is SKIPPED entirely when
+  // `opts.env` carries HOME or SANCTUARY_STORAGE_PATH, so a test that
+  // deliberately points the child at a fixture fortress keeps doing so. Note
+  // this cannot be left to the `...opts.env` spread above, because the
+  // assignments below run after it and would clobber the caller's choice.
+  const isolate =
+    opts.env?.HOME === undefined && opts.env?.SANCTUARY_STORAGE_PATH === undefined;
+  // mkdtemp: atomic fresh 0o700 dir (CodeQL js/insecure-temporary-file).
+  const childHome = isolate
+    ? await mkdtemp(join(tmpdir(), "sanctuary-run-cli-home-"))
+    : undefined;
+  if (childHome !== undefined) {
+    env.HOME = childHome;
+    env.USERPROFILE = childHome;
+    env.SANCTUARY_STORAGE_PATH = join(childHome, ".sanctuary");
+  }
+
+  try {
+    return await attemptRunCli({
+      command,
+      argv: [...prefixArgs, ...args],
+      env,
+      attemptTimeoutMs,
+      maxAttempts,
+      backoffMs,
+    });
+  } finally {
+    if (childHome !== undefined) {
+      // A leftover temp dir is not worth failing a test over; the OS reaps it.
+      await rm(childHome, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+}
+
+async function attemptRunCli(spec: {
+  command: string;
+  argv: string[];
+  env: NodeJS.ProcessEnv;
+  attemptTimeoutMs: number;
+  maxAttempts: number;
+  backoffMs: (nextAttempt: number) => number;
+}): Promise<RunCliResult> {
+  const { command, argv, env, attemptTimeoutMs, maxAttempts, backoffMs } = spec;
+
   let lastErr: any;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (attempt > 1) {
@@ -118,7 +173,7 @@ export async function runCliRaw(
       if (wait > 0) await sleep(wait);
     }
     try {
-      const { stdout, stderr } = await execFileAsync(command, [...prefixArgs, ...args], {
+      const { stdout, stderr } = await execFileAsync(command, argv, {
         timeout: attemptTimeoutMs,
         env,
       });
@@ -137,7 +192,7 @@ export async function runCliRaw(
 
   throw new Error(
     `runCli failed after ${maxAttempts} attempt(s) ` +
-      `[${[...prefixArgs, ...args].join(" ")}]: killed=${lastErr?.killed} ` +
+      `[${argv.join(" ")}]: killed=${lastErr?.killed} ` +
       `signal=${JSON.stringify(lastErr?.signal)} code=${JSON.stringify(lastErr?.code)} ` +
       `errno=${lastErr?.errno} message=${lastErr?.message}`,
   );

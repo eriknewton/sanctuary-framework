@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:net";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 
 import { parseFrame } from "../../src/castle-wall/ipc/framing.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 import { AuditLog } from "../../src/operational/audit-log.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 import { generateRandomKey } from "../../src/core/random.js";
@@ -849,26 +850,34 @@ describe("castle-wall enable/disable CLI verbs", () => {
   });
 
   it("enable accepts a boot service that targets the default fortress", async () => {
-    const defaultFortressPath = join(homedir(), ".sanctuary");
-    const plistDir = await mkdtemp(join(tmpdir(), "sanctuary-cw-default-boot-"));
-    tempDirs.push(plistDir);
-    const plistPath = join(plistDir, "boot.plist");
-    await writeFile(plistPath, makeBootPlist(defaultFortressPath));
-    const err = new CaptureStream();
+    // HOME is redirected (not SANCTUARY_STORAGE_PATH, which would defeat the
+    // default-fortress branch under test) so "the default fortress" is a temp
+    // path, never the operator's own.
+    const tempHome = await createTempHome("sanctuary-cw-default-boot-home");
+    try {
+      const defaultFortressPath = tempHome.defaultFortressPath;
+      const plistDir = await mkdtemp(join(tmpdir(), "sanctuary-cw-default-boot-"));
+      tempDirs.push(plistDir);
+      const plistPath = join(plistDir, "boot.plist");
+      await writeFile(plistPath, makeBootPlist(defaultFortressPath));
+      const err = new CaptureStream();
 
-    const code = await runEnable([], {
-      out: new CaptureStream(),
-      err,
-      env: {},
-      platform: "darwin",
-      daemonProbe: async () => true,
-      bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, defaultFortressPath),
-    });
+      const code = await runEnable([], {
+        out: new CaptureStream(),
+        err,
+        env: {},
+        platform: "darwin",
+        daemonProbe: async () => true,
+        bootServiceReadyProbe: makeBootServiceReadyProbe(plistPath, defaultFortressPath),
+      });
 
-    expect(code).toBe(2);
-    expect(err.text()).toContain("requires either --ttl");
-    expect(err.text()).not.toContain("no persistent Castle Wall boot service");
-    expect(err.text()).not.toContain("targets a different fortress");
+      expect(code).toBe(2);
+      expect(err.text()).toContain("requires either --ttl");
+      expect(err.text()).not.toContain("no persistent Castle Wall boot service");
+      expect(err.text()).not.toContain("targets a different fortress");
+    } finally {
+      await tempHome.cleanup();
+    }
   });
 
   it("enable --force bypasses the boot-service composition guard (#450 item 5)", async () => {
