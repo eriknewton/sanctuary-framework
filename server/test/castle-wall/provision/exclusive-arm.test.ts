@@ -71,7 +71,6 @@ function armOps(overrides: Partial<ExclusiveEgressArmOps> = {}): ExclusiveEgress
     bringUpGeneration: vi.fn(async () => ({ ...COMMITTED })),
     runReleaseSequence: vi.fn(async () => RELEASED),
     restoreCoarseComposition: vi.fn(async () => undefined),
-    reconcileStaleExclusiveRouting: vi.fn(async () => ({ reconciled: false })),
     startHarnessCoarse: vi.fn(async () => undefined),
     assessHarnessParked: vi.fn(async () => claimFrom({})),
     audit: vi.fn(async () => undefined),

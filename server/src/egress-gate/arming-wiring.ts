@@ -1833,12 +1833,6 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
     async restoreCoarseComposition(reason): Promise<void> {
       await restoreCoarseCompositionProduction(input, reason);
     },
-    async reconcileStaleExclusiveRouting(): Promise<StaleExclusiveRoutingReconcileResult> {
-      // D8 preflight: no gate-account bring-up needed -- the gate uid comes
-      // from the marker, and the reconcile only reads the registry/runtime
-      // state and (when orphaned) removes the marker + gate policy.
-      return reconcileStaleExclusiveRoutingProduction(input);
-    },
     async startHarnessCoarse(): Promise<void> {
       // The degrade path re-renders the PLAIN (RunAtLoad/KeepAlive) plist and
       // brings the harness up through the shipped coarse install path
@@ -2066,9 +2060,10 @@ export async function observeAgentConfinementProduction(
 
 /**
  * D8 self-heal (2026-07-22): remove an ORPHANED exclusive-routing marker a
- * hard-interrupted prior arm left on disk, so the next arm's coarse
+ * hard-interrupted prior arm left on disk, so the next run's coarse
  * publish+reload does not wedge on the composition invariant (see the op
- * doc-comment on `ExclusiveEgressArmOps.reconcileStaleExclusiveRouting`).
+ * doc-comment on `ProvisionFlowOps.reconcileExclusiveRoutingResidue`, the
+ * mode-independent pre-mutation gate that is this function's ONE caller).
  *
  * The removal is the EXACT pair {@link restoreCoarseCompositionProduction}
  * uses (marker + gate policy file), so the on-disk effect of a self-heal is
@@ -2094,14 +2089,30 @@ export async function observeAgentConfinementProduction(
  *      restart the gate -- a partial teardown TOCTOU), so "no gate serving"
  *      requires NO runtime state AND NO plist.
  *
- * Any uncertainty (cross-uid marker, dirty/quarantined registry, unreadable/
- * unparseable runtime state, a surviving plist, an owner check that cannot
- * confirm) KEEPS the marker. A malformed MARKER throws (the load contract): the
- * caller must abort rather than arm over an unreadable mode. Idempotent: a
- * second run finds the marker gone and is a no-op.
+ * Any uncertainty (cross-uid marker, UNKNOWN subject uid, dirty/quarantined
+ * registry, unreadable/unparseable runtime state, a surviving plist, an owner
+ * check that cannot confirm) KEEPS the marker. A malformed MARKER throws (the
+ * load contract): the caller must abort rather than arm over an unreadable
+ * mode. Idempotent: a second run finds the marker gone and is a no-op.
+ *
+ * FIX F-COARSE-AFTER-EXCLUSIVE (class half, 2026-07-26): `input.agentUid` is
+ * now `number | undefined`, because this reconcile is called from the
+ * MODE-INDEPENDENT, PRE-MUTATION residue gate in `runProvisionFlow` -- a
+ * point at which a fresh-provision run has not resolved (or created) an agent
+ * uid at all. `undefined` is the honest "no subject to scope this marker to",
+ * and it takes the SAME fail-closed branch as a cross-uid mismatch (guard 0):
+ * KEEP, with a reason the caller turns into a refusal. It is never treated as
+ * a wildcard match.
  */
 export async function reconcileStaleExclusiveRoutingProduction(
-  input: Pick<ExclusiveEgressWiringInput, "agentUid" | "fortressPath" | "audit" | "print">,
+  input: Pick<ExclusiveEgressWiringInput, "fortressPath" | "audit" | "print"> & {
+    /**
+     * The uid this run has resolved as the agent's run-as identity, or
+     * `undefined` when none is resolved yet. Only a marker declaring THIS uid
+     * is ever judged orphaned; see guard 0.
+     */
+    agentUid: number | undefined;
+  },
   /** TEST SEAMS: registry/marker/runtime/owner/plist/rm recorders (production uses the real ops). */
   deps?: {
     loadMarker?: (fortressPath: string) => Promise<ExclusiveRoutingMarker | null>;
@@ -2143,7 +2154,19 @@ export async function reconcileStaleExclusiveRoutingProduction(
 
   // Guard 0 (BLOCKER, fail-closed): scope every liveness judgement to THIS arm.
   // A marker declaring a different uid must not be judged orphaned against the
-  // wrong subject while that other uid may be live.
+  // wrong subject while that other uid may be live. An UNKNOWN subject
+  // (`undefined`, the pre-mutation gate on a run that has not resolved a uid)
+  // takes the same branch: no subject means no scoped judgement, and a
+  // wildcard would be exactly the cross-uid reconcile this guard forbids.
+  if (input.agentUid === undefined) {
+    return {
+      reconciled: false,
+      reason:
+        `a marker for agent uid ${marker.agent_uid} is present, but this run has not resolved an ` +
+        "agent uid to scope it against; refusing to reconcile a marker for an unknown subject " +
+        "(fail toward confinement)",
+    };
+  }
   if (marker.agent_uid !== input.agentUid) {
     return {
       reconciled: false,

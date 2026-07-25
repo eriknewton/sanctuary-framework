@@ -1395,6 +1395,36 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     expect(input.audit).not.toHaveBeenCalled();
   });
 
+  it("FIX F-COARSE-AFTER-EXCLUSIVE: an UNKNOWN subject uid (the pre-mutation gate on a fresh run) KEEPS the marker fail-closed and is never a wildcard", async () => {
+    // The mode-independent residue gate runs BEFORE the account exists, so it
+    // can have no uid to scope the marker against. `undefined` must take the
+    // same fail-closed branch as a cross-uid mismatch: no subject, no scoped
+    // liveness judgement, no removal.
+    const input = {
+      agentUid: undefined,
+      fortressPath: FORTRESS,
+      audit: vi.fn(async () => undefined),
+      print: vi.fn(),
+    };
+    const removeFile = vi.fn(async () => undefined);
+    const listRegistry = vi.fn(async () => cleanRegistry());
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry,
+      // Everything below says "provably orphaned"; the guard must still keep it.
+      readRuntimeState: async () => {
+        throw enoent();
+      },
+      plistExists: noPlist,
+      removeFile,
+    });
+    expect(result.reconciled).toBe(false);
+    expect(result.reason).toMatch(/has not resolved an agent uid/);
+    expect(listRegistry).not.toHaveBeenCalled();
+    expect(removeFile).not.toHaveBeenCalled();
+    expect(input.audit).not.toHaveBeenCalled();
+  });
+
   it("ORPHANED (no registry entry for the uid, clean registry, no runtime state, no plist) -> removes marker + gate policy, distinct audit, {reconciled:true}", async () => {
     const input = reconInput();
     const removed: string[] = [];

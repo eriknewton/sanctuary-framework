@@ -112,6 +112,7 @@ import {
   createUnprotectExclusiveEgressOps,
   ensureAgentHarnessHoldDir,
   observeAgentConfinementProduction,
+  reconcileStaleExclusiveRoutingProduction,
   type ExclusiveEgressWiringInput,
 } from "../egress-gate/arming-wiring.js";
 import { deriveGateAccountName } from "../egress-gate/gate-account.js";
@@ -1176,6 +1177,29 @@ export async function runAutoProvisionForWrap(
   // when a parked install actually ran.
   let harnessStandDownSnapshot: HarnessStandDownSnapshot | undefined;
 
+  // The ONE best-effort CLI audit closure for this flow's fortress. Hoisted
+  // out of `buildExclusiveWiringInput` so the mode-independent residue gate
+  // below can audit through the same sink WITHOUT constructing the exclusive
+  // wiring input (which throws before the parked install has resolved a uid,
+  // and which must not be a precondition for a coarse run).
+  const castleWallAuditBestEffort = async (
+    operation: string,
+    details: Record<string, unknown>,
+  ): Promise<void> => {
+    try {
+      const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+      await appendCastleWallCliAuditBestEffort(
+        operation,
+        { source: "sanctuary-protect", ...details },
+        wallFortressPath,
+        process.env,
+        process.stderr,
+      );
+    } catch {
+      // Best-effort by contract.
+    }
+  };
+
   // S5-6: the exclusive-egress arming stage's production wiring. Built
   // LAZILY: the agent uid + harness argv are only known after the parked
   // install ran, and the stage is only ever invoked after it (orchestrate
@@ -1217,20 +1241,7 @@ export async function runAutoProvisionForWrap(
           ? { ok: true as const, ruleIds: published.ruleIds }
           : { ok: false as const, error: published.error };
       },
-      audit: async (operation, details) => {
-        try {
-          const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
-          await appendCastleWallCliAuditBestEffort(
-            operation,
-            { source: "sanctuary-protect", ...details },
-            wallFortressPath,
-            process.env,
-            process.stderr,
-          );
-        } catch {
-          // Best-effort by contract.
-        }
-      },
+      audit: castleWallAuditBestEffort,
       print,
       accountOps: realAccountProvisionOps(),
     };
@@ -1246,7 +1257,6 @@ export async function runAutoProvisionForWrap(
           bringUpGeneration: () => lazyExclusiveOps().bringUpGeneration(),
           runReleaseSequence: (committed) => lazyExclusiveOps().runReleaseSequence(committed),
           restoreCoarseComposition: (reason) => lazyExclusiveOps().restoreCoarseComposition(reason),
-          reconcileStaleExclusiveRouting: () => lazyExclusiveOps().reconcileStaleExclusiveRouting(),
           startHarnessCoarse: () => lazyExclusiveOps().startHarnessCoarse(),
           assessHarnessParked: () => lazyExclusiveOps().assessHarnessParked(),
           audit: (operation, details) => lazyExclusiveOps().audit(operation, details),
@@ -1766,6 +1776,20 @@ export async function runAutoProvisionForWrap(
     // registry + this fortress's exclusive-routing marker; never throws, and
     // an unreadable surface reports UNKNOWN rather than "nothing is confined".
     observeAgentConfinement: () => observeAgentConfinementProduction(wallFortressPath),
+    // FIX F-COARSE-AFTER-EXCLUSIVE (class half): wired UNCONDITIONALLY, not
+    // under `options.exclusiveEgress === true`. The self-heal used to be
+    // reachable only through `exclusiveEgressOps` above, so the plain coarse
+    // run that hit the defect could not run it. Deliberately calls the
+    // production reconcile DIRECTLY rather than through
+    // `buildExclusiveWiringInput`, which throws before the parked install has
+    // resolved a uid -- this gate runs before any of that.
+    reconcileExclusiveRoutingResidue: (armTargetUid) =>
+      reconcileStaleExclusiveRoutingProduction({
+        agentUid: armTargetUid,
+        fortressPath: wallFortressPath,
+        audit: castleWallAuditBestEffort,
+        print,
+      }),
     preArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, credentialDestPathsToVerify),
     checkUidExistence: async (uid) => {
       const { checkUidExistenceBeforeArm } = await import("../castle-wall/provision/uid-gate.js");

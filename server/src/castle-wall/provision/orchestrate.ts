@@ -40,6 +40,7 @@ import { assessHarnessParked, runStateAdvice } from "../../egress-gate/parked-cl
 import {
   runExclusiveEgressArming,
   type ExclusiveEgressArmOps,
+  type StaleExclusiveRoutingReconcileResult,
 } from "./exclusive-arm.js";
 import type { AccountProvisionPlan } from "./account.js";
 import type { RehomePlan, RehomeStepResult } from "./rehome.js";
@@ -428,6 +429,90 @@ export interface ProvisionFlowOps {
    * is armed".
    */
   observeAgentConfinement(): Promise<ObservedAgentConfinement>;
+  /**
+   * THE exclusive-routing residue gate (FIX F-COARSE-AFTER-EXCLUSIVE, class
+   * half, 2026-07-26). Reconcile a leftover `exclusive-routing.json` marker
+   * (plus its `exclusive-egress-gate.json`) that an interrupted or failed
+   * prior arm left in the fortress, and report what was decided.
+   *
+   * WHY THIS IS MODE-INDEPENDENT, and why it hangs here rather than off
+   * `exclusiveEgress`: the signing daemon
+   * (`castle-wall/runtime/macos-daemon.ts`) picks the manifest composition
+   * from MARKER PRESENCE ALONE. It has never consulted, and cannot consult,
+   * which mode the operator asked this CLI run for. So a leftover marker
+   * makes the daemon compose EXCLUSIVE against a plain coarse run's
+   * agent-scoped rules, find agent-reachable direct allows, and correctly
+   * refuse to produce a manifest. The self-heal used to be reachable ONLY
+   * when `fineGrainedDeclared` was true AND the exclusive ops were wired --
+   * i.e. it was gated on the one signal the wedging component does not read.
+   * That asymmetry IS the defect: on the Mini1 re-drill the plain
+   * `protect --hermes --provision-agent-account` run never ran the reconcile
+   * at all, was judged by exclusive composition rules, and was refused.
+   *
+   * CONTRACT:
+   *  - Called ONCE, BEFORE any mutation (before the confirm, the account
+   *    create, the re-home, and every daemon install), on EVERY run.
+   *  - `armTargetUid` is the uid this run resolved as the agent's run-as
+   *    identity, or `undefined` when none is resolved. A marker declaring a
+   *    different uid, or any marker when the subject is `undefined`, is KEPT
+   *    fail-closed rather than reconciled against the wrong subject.
+   *  - MAY THROW: a present-but-unreadable marker is the fail-closed contract
+   *    of `loadExclusiveRoutingMarker`. The flow turns the throw into the
+   *    explicit `unreadable` verdict (see {@link ExclusiveRoutingResidue});
+   *    "could not look" must never collapse into "nothing is there".
+   */
+  reconcileExclusiveRoutingResidue(
+    armTargetUid: number | undefined,
+  ): Promise<StaleExclusiveRoutingReconcileResult>;
+}
+
+/**
+ * What the pre-mutation residue gate decided. A discriminated union for the
+ * same reason {@link ObservedAgentConfinement} is one: "we could not look"
+ * must be representable and must fail closed, not be flattened into "clear".
+ */
+export type ExclusiveRoutingResidue =
+  /** No marker on disk. Coarse composition; the run may proceed. */
+  | { kind: "clear" }
+  /** A provably-orphaned marker was removed. The run may proceed. */
+  | { kind: "reconciled" }
+  /**
+   * A marker is present and was KEPT: confinement may be live, or the marker
+   * could not be scoped to this run's subject. The run must REFUSE -- every
+   * downstream path composes against this marker.
+   */
+  | { kind: "kept"; reason: string }
+  /** The marker could not be read at all. The run must REFUSE, fail-closed. */
+  | { kind: "unreadable"; detail: string };
+
+/**
+ * THE refusal sentence for a run blocked by exclusive-routing residue -- the
+ * single place this claim is put into words, exported so the mapping
+ * verdict -> sentence is asserted directly rather than through the flow.
+ *
+ * It states what was OBSERVED on disk (a marker, and why it was kept or could
+ * not be read), what that means for this run (every composition from here is
+ * judged by exclusive rules, so proceeding would wedge), that nothing has been
+ * changed yet, and the ONE verb that clears it. It makes no claim about
+ * whether the wall is armed: that is a different observation, and inventing it
+ * from control flow is the defect this whole fix exists to close.
+ */
+export function describeExclusiveRoutingResidueRefusal(
+  residue: Extract<ExclusiveRoutingResidue, { kind: "kept" | "unreadable" }>,
+): string {
+  const observed =
+    residue.kind === "kept"
+      ? `an exclusive-routing marker is present in this fortress and was KEPT (${residue.reason})`
+      : `this fortress's exclusive-routing marker could NOT be read (${residue.detail}), so the ` +
+        "routing mode is unknown";
+  return (
+    `Refusing to provision: ${observed}. While that marker stands, the signing daemon composes ` +
+    "EVERY manifest under the exclusive-routing rules regardless of the mode this run asked for, " +
+    "so this run would be refused at the arming step after changing the host. Nothing has been " +
+    "changed. Clear the exclusive-egress state with: 'sudo sanctuary protect " +
+    "--unprotect-egress-gate' (or recover an interrupted arm with 'sudo sanctuary protect " +
+    "--repair-egress-gate'), then re-run this command."
+  );
 }
 
 /**
@@ -927,6 +1012,30 @@ async function runProvisionFlowSteps(
     };
   }
 
+  // EXCLUSIVE-ROUTING RESIDUE GATE (FIX F-COARSE-AFTER-EXCLUSIVE, class half,
+  // 2026-07-26). MODE-INDEPENDENT and PRE-MUTATION: it runs on every run,
+  // coarse or fine-grained, before the confirm and before anything on the host
+  // changes. See `ProvisionFlowOps.reconcileExclusiveRoutingResidue` for why
+  // mode cannot be a condition here (the daemon composes on marker presence
+  // alone). Placed after the detect defensive check so `detectResult.resolved`
+  // is settled, and before plan-and-print so an operator is not asked to
+  // confirm a run that is already doomed.
+  const residue = await reconcileResidueSafely(ops, ctx.detectResult.resolved?.uid);
+  if (residue.kind === "reconciled") {
+    ops.print(
+      "Reconciled a stale exclusive-routing marker left by an interrupted prior arm (no live " +
+        "confinement present); proceeding.",
+    );
+  } else if (residue.kind !== "clear") {
+    return {
+      kind: "aborted",
+      stage: "exclusive-routing-residue",
+      reason: describeExclusiveRoutingResidueRefusal(residue),
+      rolledBack: false,
+      rehomeAttempted: false,
+    };
+  }
+
   // Step 2: plan-and-print. No mutation yet, either branch.
   ops.print(
     ctx.detectResult.alreadyDedicated
@@ -1167,32 +1276,16 @@ async function runProvisionFlowSteps(
       : "Harness daemon installed; agent now runs under the dedicated account.",
   );
 
-  // D8 SELF-HEAL PREFLIGHT (2026-07-22): only the fine-grained arm path runs
-  // the coarse publish+reload just below, and only that reload wedges on a
-  // STALE exclusive-routing marker a hard-interrupted prior arm left behind
-  // (the daemon composes EXCLUSIVE against the freshly-published COARSE rules,
-  // finds agent-reachable direct allows, and correctly fails closed -- the
-  // composition invariant working as designed). Run it AFTER the parked-install
-  // barrier above (so we know the harness is parked, not running) and BEFORE
-  // provision-egress. reconcileStaleExclusiveRouting removes the marker ONLY
-  // when it can prove no live confinement exists (no registry entry AND no
-  // serving gate), keeps it otherwise, and THROWS on a marker it cannot read
-  // -- which aborts fail-closed here (runProvisionFlow's catch restores the
-  // stood-down harness), never arming over an unreadable routing mode.
-  if (ctx.fineGrainedDeclared === true && ops.exclusiveEgress !== undefined) {
-    const reconcile = await ops.exclusiveEgress.reconcileStaleExclusiveRouting();
-    if (reconcile.reconciled) {
-      ops.print(
-        "Reconciled a stale exclusive-routing marker from an interrupted prior arm (no live " +
-          "confinement present); proceeding.",
-      );
-    } else if (reconcile.reason !== undefined) {
-      // A marker was present but KEPT (confinement may be live). Surface why --
-      // diagnosability is this PR's second theme, and otherwise the operator
-      // gets nothing before a possible provision-egress wedge below.
-      ops.print(`Exclusive-routing marker present but KEPT: ${reconcile.reason}.`);
-    }
-  }
+  // D8 SELF-HEAL: NOT here any more. The reconcile used to sit at this point,
+  // gated on `fineGrainedDeclared === true && ops.exclusiveEgress !== undefined`,
+  // on the theory that only the fine-grained arm path runs a coarse
+  // publish+reload that a stale marker could wedge. That theory was wrong in
+  // the direction that matters: the daemon composes EXCLUSIVE on MARKER
+  // PRESENCE ALONE, so a plain coarse run wedges identically -- which is
+  // exactly what F-COARSE-AFTER-EXCLUSIVE caught on the Mini1 re-drill. The
+  // gate is now MODE-INDEPENDENT and PRE-MUTATION, near the top of this
+  // function; by the time control reaches here the residue is provably clear
+  // or reconciled, and no mode can skip it.
 
   // Step 6.7 (confined-agent egress, design section 5 layer 1): provision the
   // harness's signed egress allow rules and statically verify them BEFORE
@@ -1647,6 +1740,31 @@ async function observeConfinementSafely(ops: ProvisionFlowOps): Promise<Observed
   } catch (err) {
     return { known: false, reason: `confinement probe threw: ${(err as Error).message}` };
   }
+}
+
+/**
+ * Run {@link ProvisionFlowOps.reconcileExclusiveRoutingResidue} and turn its
+ * three possible fates into the explicit {@link ExclusiveRoutingResidue}
+ * union. A THROWN op is `unreadable`, NEVER `clear`: the op throws precisely
+ * when a marker is present but cannot be parsed, so treating a throw as "no
+ * residue" would mean proceeding under a routing mode nothing established --
+ * the exact wrong-allow this gate exists to prevent. `reconciled: false` with
+ * no `reason` is the marker-absent case by the op's contract; `reconciled:
+ * false` WITH a reason means a marker exists and was kept.
+ */
+async function reconcileResidueSafely(
+  ops: ProvisionFlowOps,
+  armTargetUid: number | undefined,
+): Promise<ExclusiveRoutingResidue> {
+  let result: StaleExclusiveRoutingReconcileResult;
+  try {
+    result = await ops.reconcileExclusiveRoutingResidue(armTargetUid);
+  } catch (err) {
+    return { kind: "unreadable", detail: `the residue reconcile threw: ${(err as Error).message}` };
+  }
+  if (result.reconciled) return { kind: "reconciled" };
+  if (result.reason !== undefined) return { kind: "kept", reason: result.reason };
+  return { kind: "clear" };
 }
 
 /** Punctuate a {@link restoreEgressBestEffort} sentence for appending to an outcome reason. */

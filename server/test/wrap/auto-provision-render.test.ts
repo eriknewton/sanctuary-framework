@@ -194,6 +194,32 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).not.toMatch(/WARNING/);
   });
 
+  it("FIX F-COARSE-AFTER-EXCLUSIVE: the exclusive-routing-residue abort renders NEUTRAL (it is pre-mutation), never the 'restore FAILED' alarm", () => {
+    // The residue gate is the earliest abort in the flow: nothing has been
+    // created, moved, installed, or armed. If it ever stopped reporting
+    // `rehomeAttempted: false` this renderer would tell the operator their
+    // re-homed files need manual recovery, over a run that moved none.
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "exclusive-routing-residue",
+        reason:
+          "Refusing to provision: an exclusive-routing marker is present in this fortress and was KEPT " +
+          "(a gate is serving port 40001). Nothing has been changed. Clear the exclusive-egress state with: " +
+          "'sudo sanctuary protect --unprotect-egress-gate'.",
+        rolledBack: false,
+        rehomeAttempted: false,
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/^ {2}Note:/);
+    expect(out[0]).toMatch(/No files were moved before this stop/);
+    expect(out[0]).toMatch(/--unprotect-egress-gate/);
+    expect(out[0]).not.toMatch(/restore of your re-homed files FAILED/);
+    expect(out[0]).not.toMatch(/WARNING/);
+  });
+
   it("FIX R3-2: rolledBack:false WITHOUT rehomeAttempted:false still shows the LOUD restore-failed frame (a genuine failed restore after a real re-home)", () => {
     const out = lines({
       ran: true,
