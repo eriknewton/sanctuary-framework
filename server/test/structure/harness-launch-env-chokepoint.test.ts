@@ -31,26 +31,52 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const SERVER_SRC = join(REPO_ROOT, "server/src");
 
 /**
- * The modules that CONSUME a resolved harness launch and cause a harness plist
- * to be written. Each is a writer the drill caught (or the call site that feeds
- * one). `egress-gate/harness-daemon.ts` and `egress-gate/release-barrier.ts`
- * are deliberately NOT here: they are where the launch spec is DERIVED into
- * argv + environment, which is the one place that split may legally happen.
+ * The ONLY modules allowed to split a harness launch back into a separate argv
+ * and environment: `harness-daemon.ts` DEFINES the low-level renderer and the
+ * launch-carrying planner, and `release-barrier.ts` derives the parked/released
+ * form from a whole spec. Everything else in `server/src` is a consumer.
+ *
+ * ALLOWLIST, NOT A HAND-MAINTAINED CONSUMER LIST (deliberate). A list of known
+ * writers is exactly the shape that let four writers each miss the same field:
+ * it only checks the places someone remembered. Scanning every source file and
+ * allowlisting the two derivation points means a NEW consumer is covered the
+ * moment it exists, with no one having to add it here.
  */
-const LAUNCH_CONSUMER_FILES = [
-  "server/src/egress-gate/arming-wiring.ts",
-  "server/src/wrap/auto-provision.ts",
-  "server/src/cli/castle-wall.ts",
+const LAUNCH_SPLIT_ALLOWED = [
+  "server/src/egress-gate/harness-daemon.ts",
+  "server/src/egress-gate/release-barrier.ts",
 ] as const;
+
+/**
+ * `release-barrier.ts` legitimately declares a `harnessArgv` field on
+ * `BuildBarrierProgramArgumentsInput` / the release-sequence context: those are
+ * the WRAPPER DIGEST inputs, not plist renders, so no environment belongs
+ * beside them.
+ */
+const BARE_ARGV_FIELD_ALLOWED = ["server/src/egress-gate/release-barrier.ts"] as const;
+
+function tsFilesUnder(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...tsFilesUnder(full));
+    } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".d.ts")) {
+      out.push(relative(REPO_ROOT, full));
+    }
+  }
+  return out;
+}
 
 /** Planners that take a whole {@link HarnessLaunchSpec} and derive both halves. */
 const LAUNCH_CARRYING_PLANNERS = ["planParkedHarnessInstall", "planCoarseHarnessDaemonInstall"] as const;
@@ -91,9 +117,12 @@ function line(source: ts.SourceFile, node: ts.Node): number {
 }
 
 describe("F-HARNESSENV: the harness-plist writers cannot separate argv from environment", () => {
-  it("no launch consumer reaches past the launch-carrying planners to a split argv/env entry point", () => {
+  it("NO module outside the two derivation points reaches a split argv/env entry point", () => {
     const offenders: string[] = [];
-    for (const file of LAUNCH_CONSUMER_FILES) {
+    let scanned = 0;
+    for (const file of tsFilesUnder(SERVER_SRC)) {
+      if ((LAUNCH_SPLIT_ALLOWED as readonly string[]).includes(file)) continue;
+      scanned += 1;
       const source = parse(file);
       forEachCall(source, (call) => {
         const name = calleeName(call);
@@ -102,6 +131,7 @@ describe("F-HARNESSENV: the harness-plist writers cannot separate argv from envi
         }
       });
     }
+    expect(scanned, "the structural scan found no source files -- the guard has gone blind").toBeGreaterThan(100);
     expect(
       offenders,
       "a harness-plist writer is rendering from a separate argv + environment again (F-HARNESSENV). " +
@@ -112,7 +142,7 @@ describe("F-HARNESSENV: the harness-plist writers cannot separate argv from envi
   it("every launch-carrying planner call passes harnessLaunch (never a bare argv)", () => {
     const offenders: string[] = [];
     let calls = 0;
-    for (const file of LAUNCH_CONSUMER_FILES) {
+    for (const file of tsFilesUnder(SERVER_SRC)) {
       const source = parse(file);
       forEachCall(source, (call) => {
         const name = calleeName(call);
@@ -140,12 +170,14 @@ describe("F-HARNESSENV: the harness-plist writers cannot separate argv from envi
     expect(offenders).toEqual([]);
   });
 
-  it("no carrier type in the arming/provisioning path still declares a bare harnessArgv field", () => {
+  it("NO carrier type anywhere still declares a bare harnessArgv field", () => {
     // The type system already rejects `harnessArgv` on the carriers, but only
     // for `server/src` (tests are transpiled, not typechecked). This keeps the
-    // declaration side honest in one place a reader can point at.
+    // declaration side honest in one place a reader can point at -- and scans
+    // everything rather than the two files someone remembered.
     const offenders: string[] = [];
-    for (const file of ["server/src/egress-gate/arming-wiring.ts", "server/src/castle-wall/provision/harness-argv.ts"]) {
+    for (const file of tsFilesUnder(SERVER_SRC)) {
+      if ((BARE_ARGV_FIELD_ALLOWED as readonly string[]).includes(file)) continue;
       const source = parse(file);
       const walk = (node: ts.Node): void => {
         if (ts.isPropertySignature(node) && node.name !== undefined && ts.isIdentifier(node.name)) {
