@@ -361,6 +361,18 @@ Stated here rather than discovered at 3am:
   account's 0700 log directory. Every one of those checks is TRI-STATE:
   OBSERVED-CLEAN, OBSERVED-DIRTY, or COULD-NOT-OBSERVE, and the third is a hard
   failure that is never folded into either of the others.
+- **CLOSED (round 4): `gate-log` has one privileged-read chokepoint.** The
+  gate logs live outside the disposable fortress, and the first repair handled
+  that with call-site lstat checks before handing the mutable path to `tail`.
+  That was still a root read substitution primitive. The wrapper now composes
+  the exact product gate account, resolves every log and registry read through
+  the same helper, descends directories with physical-cwd checks, opens the
+  final file once, verifies the fd identity, and reads from that fd.
+- **CLOSED (round 4): probe reasons are causally bounded.** The battery takes
+  wrapper-issued log cursors before P1, N1 and N3, then reads only bytes
+  appended after the request boundary. N3 also requires the current wrong-uid
+  request to be denied; a 2xx/3xx response is a loud FAIL even if a stale
+  `peer_uid_mismatch` token exists elsewhere.
 - **No drill host is on the allowlist yet, so the wrapper refuses everywhere.**
   `RAILS_HOST_ALLOW_FP` is empty: Mini1's and Mini2's hardware fingerprints
   have not been measured, because doing so means running
@@ -389,9 +401,11 @@ Stated here rather than discovered at 3am:
 The loop mints `/private/var/sanctuary-drill/<operator>/.sanctuary-loop-<id>`
 per iteration and RETIRES it at the end of that iteration, through the wrapper's
 `retire` verb, which `teardown-verify.sh` calls after every observation has been
-made. (Round 3 found that nothing removed them at all while this sentence
-claimed a nightly teardown, so they would have accumulated as root-owned
-directories one per iteration forever, and teardown-verify's
+made. Early aborts after `kickstart-daemons`, `mint`, or `preflight` also call
+the same `retire` verb before advancing or stopping; a failed early retire is
+recorded as a dirty stop. (Round 3 found that nothing removed them at all while
+this sentence claimed a nightly teardown, so they would have accumulated as
+root-owned directories one per iteration forever, and teardown-verify's
 "the whole disposable fortress is gone" branch was unreachable dead code that
 read as a covered case.) These carry no recovery obligation
 and are covered by one standing row in `FORTRESS_KEYS.md` rather than a row per

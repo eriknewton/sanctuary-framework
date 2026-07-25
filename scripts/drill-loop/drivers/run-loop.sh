@@ -231,6 +231,22 @@ emit_finding() {
     "$("$DATE" -u +%Y-%m-%dT%H:%M:%SZ)" >> "$FINDINGS"
 }
 
+retire_iteration() {
+  # retire_iteration <iteration> <run-id> <evidence-dir> <taint> <reason>
+  local iter="$1" run_id="$2" iev="$3" taint="$4" reason="$5" log rc=0
+  log="$iev/retire-$reason.log"
+  if "$SUDO" -n "$INSTALLED_WRAPPER" retire \
+       --run-id "$run_id" --operator-account "$OPERATOR" > "$log" 2>&1
+  then
+    emit_finding "$iter" retire PASS "$taint" "retired disposable fortress after $reason" "$log"
+    return 0
+  else
+    rc=$?
+  fi
+  emit_finding "$iter" retire FAIL "$taint" "could not retire disposable fortress after $reason (rc=$rc); host may be dirty" "$log"
+  return "$rc"
+}
+
 ITER=1
 NIGHT_STOPPED=''
 TOTAL_FAILURES=0
@@ -276,6 +292,11 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
     emit_finding "$ITER" kickstart FAIL '' 'a daemon did not restart; the iteration would measure stale or absent code' "$IEV/kickstart.log"
     TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
     TAINT='kickstart'
+    if ! retire_iteration "$ITER" "$RUN_ID" "$IEV" "$TAINT" 'kickstart-failure'; then
+      TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
+      NIGHT_STOPPED='retire-after-kickstart'
+      break
+    fi
     if [ -n "$STOP_FIRST" ]; then NIGHT_STOPPED='kickstart'; break; fi
     ITER=$((ITER + 1))
     continue
@@ -287,6 +308,12 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   then
     emit_finding "$ITER" mint FAIL "$TAINT" 'the wrapper could not mint the disposable fortress' "$IEV/mint.log"
     TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
+    if [ -z "$TAINT" ]; then TAINT='mint'; fi
+    if ! retire_iteration "$ITER" "$RUN_ID" "$IEV" "$TAINT" 'mint-failure'; then
+      TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
+      NIGHT_STOPPED='retire-after-mint'
+      break
+    fi
     if [ -n "$STOP_FIRST" ]; then NIGHT_STOPPED='mint'; break; fi
     ITER=$((ITER + 1))
     continue
@@ -314,6 +341,11 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
     # A preflight failure is a finding, not a crash. The iteration aborts
     # cleanly rather than measuring a host we already know is wrong, but the
     # loop keeps going.
+    if ! retire_iteration "$ITER" "$RUN_ID" "$IEV" "$TAINT" 'preflight-failure'; then
+      TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
+      NIGHT_STOPPED='retire-after-preflight'
+      break
+    fi
     if [ -n "$STOP_FIRST" ]; then NIGHT_STOPPED='preflight'; break; fi
     ITER=$((ITER + 1))
     continue

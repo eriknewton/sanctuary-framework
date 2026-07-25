@@ -161,7 +161,7 @@ let hasHardwareIdentity = false;
  * counting is a side effect of asking, so a case cannot be counted without
  * asking and cannot ask without being counted.
  */
-const WRAPPER_LEVEL_CASES = 27;
+const WRAPPER_LEVEL_CASES = 28;
 let wrapperCasesExecuted = 0;
 let wrapperCasesFullPath = 0;
 
@@ -1378,7 +1378,11 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
    * its SHIPPED value asserted in the structural describe above, so an override
    * cannot hide a change to what runs as root.
    */
-  function compose(dest: string, agentAllow: string): void {
+  function compose(
+    dest: string,
+    agentAllow: string,
+    options: { gateHomeBase?: string; systemBinDirs?: string } = {}
+  ): void {
     const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], { encoding: "utf8" });
     const entrypoint = 'wrapper_main "$@"';
     const at = assembled.lastIndexOf(entrypoint);
@@ -1393,6 +1397,8 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
       "RAILS_HOST_DENY=''",
       `RAILS_DISPOSABLE_BASE='${base}'`,
       `RAILS_AGENT_ACCOUNT_ALLOW='${agentAllow}'`,
+      ...(options.gateHomeBase ? [`RAILS_PRODUCT_GATE_HOME_BASE='${options.gateHomeBase}'`] : []),
+      ...(options.systemBinDirs ? [`RAILS_SYSTEM_BIN_DIRS='${options.systemBinDirs}'`] : []),
       "",
     ].join("\n");
     fs.writeFileSync(dest, assembled.slice(0, at) + overrides + assembled.slice(at), {
@@ -1649,6 +1655,67 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=OK verb=gate-log");
     expect(r.out).toContain("CANNOT be evaluated");
+  });
+
+  it("gate-log reads from a checked fd, not a mutable pathname", () => {
+    // ROUND-4 BLOCKER 1. The reviewed fix lstat'd the final log path and then
+    // passed that path to tail. A gate-owned process could replace the file
+    // between those two operations and make the root wrapper print another
+    // file. This tail stub makes that substitution deterministic: old code
+    // prints SECRET-TAIL-SUBSTITUTED, fixed code reads from stdin.
+    const full = wrapperFullPath();
+    const gateBase = path.join(sandbox, "gate-homes");
+    const agentId = me.startsWith("sanctuary-") ? me.slice("sanctuary-".length) : me;
+    const gateHome = path.join(gateBase, `sanctuary-gate-${agentId}`);
+    const logDir = path.join(gateHome, "logs");
+    fs.mkdirSync(logDir, { recursive: true });
+    const attackLog = path.join(logDir, `egress-gate-${myUid}.out.log`);
+    fs.writeFileSync(attackLog, `SAFE-GATE-LOG peer=${myUid}\n`);
+    const victimLog = path.join(sandbox, "gate-tail-victim.log");
+    fs.writeFileSync(victimLog, "SECRET-TAIL-SUBSTITUTED\n");
+    const tailBin = path.join(sandbox, "tailbin");
+    fs.mkdirSync(tailBin);
+    fs.writeFileSync(
+      path.join(tailBin, "tail"),
+      `#!/bin/bash
+args=("$@")
+last="\${args[$((\${#args[@]}-1))]}"
+if [ -n "\${DRILL_TEST_ATTACK_PATH:-}" ] && [ "$last" = "$DRILL_TEST_ATTACK_PATH" ]; then
+  rm -f -- "$last"
+  ln -s -- "$DRILL_TEST_VICTIM" "$last"
+fi
+exec /usr/bin/tail "$@"
+`,
+      { mode: 0o755 }
+    );
+    const gateWrapper = path.join(sandbox, "test-wrapper-gate-tail");
+    compose(gateWrapper, me, {
+      gateHomeBase: gateBase,
+      systemBinDirs: `${tailBin} /usr/bin /bin /usr/sbin /sbin`,
+    });
+    const r = run(
+      "bash",
+      [
+        gateWrapper,
+        "gate-log",
+        "--run-id",
+        "good1",
+        "--operator-account",
+        me,
+        "--agent-account",
+        me,
+        "--agent-uid",
+        String(myUid),
+      ],
+      {
+        DRILL_TEST_ATTACK_PATH: attackLog,
+        DRILL_TEST_VICTIM: victimLog,
+      }
+    );
+    expect(r.out, "root printed the substituted file").not.toContain("SECRET-TAIL-SUBSTITUTED");
+    if (!full) return expectHostRailRefusal(r);
+    expectAccept(r, "WRAPPER=OK verb=gate-log");
+    expect(r.out).toContain("SAFE-GATE-LOG");
   });
 
   it("clean-markers removes the loop's own markers", () => {

@@ -14,8 +14,12 @@ import {
   peerResolverDaemonLabel,
 } from "../../src/egress-gate/peer-resolver-daemon.js";
 import { PF_ANCHOR_REGISTRY_PATH } from "../../src/egress-gate/anchor-registry.js";
-import { GATE_ACCOUNT_NAME_PREFIX } from "../../src/egress-gate/gate-account.js";
+import {
+  GATE_ACCOUNT_NAME_PREFIX,
+  deriveGateAccountName,
+} from "../../src/egress-gate/gate-account.js";
 import { GATE_ACCOUNT_HOME_BASE } from "../../src/egress-gate/arming-wiring.js";
+import { deriveAgentAccountName } from "../../src/castle-wall/provision/account.js";
 
 /**
  * THE PIN. This file is the chokepoint for the round-3 BLOCKER, and it is worth
@@ -134,11 +138,27 @@ describe("drill-loop: product identifiers are pinned to the product's own export
     expect(shellConst(railsSrc, "RAILS_PRODUCT_GATE_HOME_BASE", "lib/rails.sh")).toBe(
       GATE_ACCOUNT_HOME_BASE
     );
+    expect(shellConst(railsSrc, "RAILS_PRODUCT_AGENT_ACCOUNT_PREFIX", "lib/rails.sh")).toBe(
+      "sanctuary-"
+    );
     expect(shellConst(railsSrc, "RAILS_PRODUCT_GATE_ACCOUNT_PREFIX", "lib/rails.sh")).toBe(
       GATE_ACCOUNT_NAME_PREFIX
     );
     expect(shellConst(assembled, "RAILS_PRODUCT_GATE_HOME_BASE", "the assembled wrapper")).toBe(
       GATE_ACCOUNT_HOME_BASE
+    );
+  });
+
+  it("derives the exact gate account from the product's agent account", () => {
+    const agentId = "hermes";
+    const agentAccount = deriveAgentAccountName(agentId);
+    const gateAccount = deriveGateAccountName(agentId);
+    expect(railsCompose("rails_product_agent_id_from_account", agentAccount)).toBe(agentId);
+    expect(railsCompose("rails_product_gate_account_for_agent_account", agentAccount)).toBe(
+      gateAccount
+    );
+    expect(railsCompose("rails_product_gate_home_for_agent_account", agentAccount)).toBe(
+      path.join(GATE_ACCOUNT_HOME_BASE, gateAccount)
     );
   });
 
@@ -165,7 +185,7 @@ describe("drill-loop: product identifiers are pinned to the product's own export
     // reason-half of the ladder -- the half that exists because a live
     // `peer_unresolved` strangle hid behind green-looking denials for a full
     // day -- was structurally dead.
-    const gateAccount = `${GATE_ACCOUNT_NAME_PREFIX}hermes`;
+    const gateAccount = deriveGateAccountName("hermes");
     const gateHome = path.join(GATE_ACCOUNT_HOME_BASE, gateAccount);
     const { stdoutPath } = egressGateDaemonLogPaths({
       agentUid: AGENT_UID,
@@ -174,9 +194,11 @@ describe("drill-loop: product identifiers are pinned to the product's own export
     });
 
     const base = shellConst(railsSrc, "RAILS_PRODUCT_GATE_HOME_BASE", "lib/rails.sh");
-    const prefix = shellConst(railsSrc, "RAILS_PRODUCT_GATE_ACCOUNT_PREFIX", "lib/rails.sh");
     const logDir = shellConst(railsSrc, "RAILS_PRODUCT_GATE_LOG_DIR", "lib/rails.sh");
-    const harnessPath = `${base}/${prefix}hermes/${logDir}/egress-gate-${AGENT_UID}.out.log`;
+    const harnessPath = `${base}/${railsCompose(
+      "rails_product_gate_account_for_agent_account",
+      deriveAgentAccountName("hermes")
+    )}/${logDir}/egress-gate-${AGENT_UID}.out.log`;
 
     expect(harnessPath).toBe(stdoutPath);
   });

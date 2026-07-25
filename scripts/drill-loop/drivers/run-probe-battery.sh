@@ -242,14 +242,57 @@ http_status() {
 # product actually writes, as root, and exits NONZERO when there is no log to
 # read. So "the gate said X" and "I could not see what the gate said" are two
 # different answers here, which is the whole point.
-GATE_LOG_CACHE="$EVIDENCE/gate-log.txt"
 GATE_LOG_RC=0
-read_gate_log() {
+GATE_LOG_GATE_OUT='0,0,0,0'
+GATE_LOG_GATE_ERR='0,0,0,0'
+GATE_LOG_PEER_OUT='0,0,0,0'
+GATE_LOG_PEER_ERR='0,0,0,0'
+capture_gate_log_cursor() {
+  local out="$1" rc=0 line rest key cursor
+  GATE_LOG_GATE_OUT=''
+  GATE_LOG_GATE_ERR=''
+  GATE_LOG_PEER_OUT=''
+  GATE_LOG_PEER_ERR=''
+  "$SUDO" -n "$WRAPPER" gate-log \
+    --run-id "$RUN_ID" --operator-account "$OPERATOR" \
+    --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
+    --log-cursor-only > "$out" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then return "$rc"; fi
+  while IFS= read -r line; do
+    case "$line" in
+      WRAPPER=GATE-LOG-CURSOR\ key=*\ cursor=*\ file=*)
+        rest="${line#WRAPPER=GATE-LOG-CURSOR key=}"
+        key="${rest%% cursor=*}"
+        cursor="${line#* cursor=}"
+        cursor="${cursor%% file=*}"
+        cursor="$(rails_assert_log_cursor "$cursor")" || return 2
+        case "$key" in
+          gate_out) GATE_LOG_GATE_OUT="$cursor" ;;
+          gate_err) GATE_LOG_GATE_ERR="$cursor" ;;
+          peer_out) GATE_LOG_PEER_OUT="$cursor" ;;
+          peer_err) GATE_LOG_PEER_ERR="$cursor" ;;
+        esac
+        ;;
+    esac
+  done < "$out"
+  if [ -z "$GATE_LOG_GATE_OUT" ] || [ -z "$GATE_LOG_GATE_ERR" ] || \
+     [ -z "$GATE_LOG_PEER_OUT" ] || [ -z "$GATE_LOG_PEER_ERR" ]; then
+    return 2
+  fi
+  return 0
+}
+
+read_gate_log_since_cursor() {
+  local out="$1"
   GATE_LOG_RC=0
   "$SUDO" -n "$WRAPPER" gate-log \
     --run-id "$RUN_ID" --operator-account "$OPERATOR" \
     --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
-    > "$GATE_LOG_CACHE" 2>&1 || GATE_LOG_RC=$?
+    --since-gate-out "$GATE_LOG_GATE_OUT" \
+    --since-gate-err "$GATE_LOG_GATE_ERR" \
+    --since-peer-out "$GATE_LOG_PEER_OUT" \
+    --since-peer-err "$GATE_LOG_PEER_ERR" \
+    > "$out" 2>&1 || GATE_LOG_RC=$?
   return 0
 }
 
@@ -257,17 +300,20 @@ read_gate_log() {
 #   0  observed, and it matched
 #   1  observed, and it did not match
 #   2  COULD NOT OBSERVE (no log, or the read failed)
-gate_log_says() {
-  read_gate_log
+gate_log_since_says() {
+  local pattern="$1" evidence="$2"
+  read_gate_log_since_cursor "$evidence"
   if [ "$GATE_LOG_RC" -ne 0 ]; then return 2; fi
   # -F: these patterns are LITERAL tokens, and a path or uid read as a
   # regular expression could match something adjacent to what was meant.
-  if "$GREP" -q -F -- "$1" "$GATE_LOG_CACHE"; then return 0; fi
+  if "$GREP" -q -F -- "$pattern" "$evidence"; then return 0; fi
   return 1
 }
 
 # --- P1: positive through-gate, N repeats ---------------------------------
 p1_fail=0
+p1_cursor_rc=0
+capture_gate_log_cursor "$EVIDENCE/gate-log-p1.cursor" || p1_cursor_rc=$?
 for url in $ALLOWED; do
   i=1
   while [ "$i" -le "$REPEATS" ]; do
@@ -295,34 +341,46 @@ fi
 # makes the whole battery UNVERIFIED) are different facts and are reported as
 # different facts.
 p1r=0
-gate_log_says "peer=$AGENT_UID" || p1r=$?
-if [ "$p1r" -eq 2 ]; then
-  report P1-reason SKIP "could not READ the gate log (wrapper gate-log rc=$GATE_LOG_RC); the reason half CANNOT be evaluated"
-elif [ "$p1r" -eq 0 ]; then
-  report P1-reason PASS "gate resolved peer=$AGENT_UID"
+if [ "$p1_cursor_rc" -ne 0 ]; then
+  report P1-reason SKIP "could not take a gate-log cursor before P1 (wrapper gate-log rc=$p1_cursor_rc); the reason half CANNOT be evaluated"
+elif gate_log_since_says "peer=$AGENT_UID" "$EVIDENCE/gate-log-p1.txt"; then
+  report P1-reason PASS "gate resolved peer=$AGENT_UID in bytes appended during P1"
 else
-  p1u=0
-  gate_log_says 'peer_unresolved' || p1u=$?
-  if [ "$p1u" -eq 0 ]; then
-    report P1-reason FAIL 'gate log shows peer_unresolved; the peer resolver is not working'
+  p1r=$?
+  if [ "$p1r" -eq 2 ]; then
+    report P1-reason SKIP "could not READ the gate-log window after P1 (wrapper gate-log rc=$GATE_LOG_RC); the reason half CANNOT be evaluated"
   else
-    report P1-reason FAIL "the gate log was read and carries no peer field for uid $AGENT_UID; the through-gate status codes cannot be attributed to a resolved peer"
+    p1u=0
+    gate_log_since_says 'peer_unresolved' "$EVIDENCE/gate-log-p1.txt" || p1u=$?
+    if [ "$p1u" -eq 0 ]; then
+      report P1-reason FAIL 'gate log window for P1 shows peer_unresolved; the peer resolver is not working'
+    elif [ "$p1u" -eq 2 ]; then
+      report P1-reason SKIP "could not READ the gate-log window after P1 (wrapper gate-log rc=$GATE_LOG_RC); the reason half CANNOT be evaluated"
+    else
+      report P1-reason FAIL "the gate-log window for P1 carries no peer field for uid $AGENT_UID; the through-gate status codes cannot be attributed to a resolved peer"
+    fi
   fi
 fi
 
 # --- N1: off-manifest endpoint denied, for the right reason ---------------
 for url in $BLOCKED; do
+  n1_cursor_rc=0
+  capture_gate_log_cursor "$EVIDENCE/gate-log-n1.cursor" || n1_cursor_rc=$?
   code="$(http_status "$AGENT" "$url")"
   printf 'n1 url=%s code=%s\n' "$url" "$code" >> "$EVIDENCE/n1-off-manifest.log"
   if [ "$code" = '000' ] || [ "$code" = '403' ]; then
-    n1r=0
-    gate_log_says 'allowlist' || n1r=$?
-    if [ "$n1r" -eq 2 ]; then
-      report N1 SKIP "off-manifest $url was denied (code $code) but the gate log could not be READ (rc=$GATE_LOG_RC), so the REASON is unmeasured"
-    elif [ "$n1r" -eq 0 ]; then
-      report N1 PASS "off-manifest $url denied by the allowlist"
+    if [ "$n1_cursor_rc" -ne 0 ]; then
+      report N1 SKIP "off-manifest $url was denied (code $code) but the gate-log cursor could not be taken first (rc=$n1_cursor_rc), so the REASON is unmeasured"
     else
-      report N1 FAIL "off-manifest $url denied (code $code) but not for an allowlist reason"
+      n1r=0
+      gate_log_since_says 'allowlist' "$EVIDENCE/gate-log-n1.txt" || n1r=$?
+      if [ "$n1r" -eq 2 ]; then
+        report N1 SKIP "off-manifest $url was denied (code $code) but the gate-log window could not be READ (rc=$GATE_LOG_RC), so the REASON is unmeasured"
+      elif [ "$n1r" -eq 0 ]; then
+        report N1 PASS "off-manifest $url denied by the allowlist in the current log window"
+      else
+        report N1 FAIL "off-manifest $url denied (code $code) but not for an allowlist reason in the current log window"
+      fi
     fi
   else
     report N1 FAIL "off-manifest $url returned $code; expected a denial"
@@ -336,19 +394,27 @@ done
 # the gate log was read. Absence of the denial reason means the reason was not
 # observed, which is a FAILURE of the thing the probe exists to prove. SKIP is
 # reserved for "the log could not be read at all".
+n3_cursor_rc=0
+capture_gate_log_cursor "$EVIDENCE/gate-log-n3.cursor" || n3_cursor_rc=$?
 for url in $ALLOWED; do
   code="$(http_status "$OPERATOR" "$url")"
   printf 'n3 url=%s operator_code=%s\n' "$url" "$code" >> "$EVIDENCE/n3-wrong-uid.log"
   break
 done
-n3r=0
-gate_log_says 'peer_uid_mismatch' || n3r=$?
-if [ "$n3r" -eq 2 ]; then
-  report N3 SKIP "could not READ the gate log (wrapper gate-log rc=$GATE_LOG_RC); the wrong-uid denial reason CANNOT be evaluated"
-elif [ "$n3r" -eq 0 ]; then
-  report N3 PASS 'a request from a non-agent uid was denied with peer_uid_mismatch'
+if [ "$code" != '000' ] && [ "$code" != '403' ]; then
+  report N3 FAIL "a request from the wrong uid SUCCEEDED with code $code; stale peer_uid_mismatch evidence cannot make this pass"
+elif [ "$n3_cursor_rc" -ne 0 ]; then
+  report N3 SKIP "wrong-uid $url was denied (code $code) but the gate-log cursor could not be taken first (rc=$n3_cursor_rc), so the REASON is unmeasured"
 else
-  report N3 FAIL 'the gate log was read and shows no peer_uid_mismatch for the non-agent request; a denial for an unobserved reason is the 2026-07-24 false-green class'
+  n3r=0
+  gate_log_since_says 'peer_uid_mismatch' "$EVIDENCE/gate-log-n3.txt" || n3r=$?
+  if [ "$n3r" -eq 2 ]; then
+    report N3 SKIP "could not READ the gate-log window after the wrong-uid request (wrapper gate-log rc=$GATE_LOG_RC); the wrong-uid denial reason CANNOT be evaluated"
+  elif [ "$n3r" -eq 0 ]; then
+    report N3 PASS 'the current request from a non-agent uid was denied with peer_uid_mismatch'
+  else
+    report N3 FAIL 'the gate-log window for the non-agent request shows no peer_uid_mismatch; a denial for an unobserved reason is the 2026-07-24 false-green class'
+  fi
 fi
 
 # --- P2: per-uid differential --------------------------------------------

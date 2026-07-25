@@ -170,6 +170,12 @@ RAILS_PRODUCT_ANCHOR_REGISTRY='/var/db/sanctuary/egress-anchor-registry.json'
 # (`egressGateDaemonLogPaths`), i.e. in the GATE SERVICE ACCOUNT's home, NOT in
 # the fortress. The harness read `<fortress>/logs/egress-gate.log`, which
 # nothing writes, so the reason-half of the probe ladder was structurally dead.
+#
+# The gate account is exact, never prefix-enumerated: product wiring derives
+# `sanctuary-<agent id>` for the agent account and `sanctuary-gate-<agent id>`
+# for the gate account. The shell composer below mirrors that relation and is
+# pinned by `product-identifiers.test.ts`.
+RAILS_PRODUCT_AGENT_ACCOUNT_PREFIX='sanctuary-'
 RAILS_PRODUCT_GATE_HOME_BASE='/var/sanctuary-agents'
 RAILS_PRODUCT_GATE_ACCOUNT_PREFIX='sanctuary-gate-'
 RAILS_PRODUCT_GATE_LOG_DIR='logs'
@@ -465,6 +471,21 @@ rails__stat_owner_uid() {
   rails__sys stat -c '%u' "$1" 2>/dev/null || rails__sys stat -f '%u' "$1" 2>/dev/null || return 1
 }
 
+# File size in bytes, GNU stat then BSD stat.
+rails__stat_size() {
+  rails__sys stat -c '%s' "$1" 2>/dev/null || rails__sys stat -f '%z' "$1" 2>/dev/null || return 1
+}
+
+# Stable identity for an opened regular file: inode, owner uid, group id.
+#
+# This intentionally omits device on macOS because `stat /dev/fd/<n>` reports
+# the `/dev/fd` device while preserving the target inode/uid/gid. That is still
+# enough to catch the reviewed gate-log substitution: the file lstat'd before
+# open and the fd read afterwards are different objects.
+rails__stat_identity() {
+  rails__sys stat -c '%i,%u,%g' "$1" 2>/dev/null || rails__sys stat -f '%i,%u,%g' "$1" 2>/dev/null || return 1
+}
+
 # `id -u <account>` via an ABSOLUTE path. A root-run wrapper that resolved `id`
 # through PATH would let a caller who can influence PATH decide what every
 # account resolves to, which is the whole account rail.
@@ -684,6 +705,44 @@ rails_product_daemon_labels() {
   printf '%s %s\n' "$gate" "$resolver"
 }
 
+rails_product_agent_id_from_account() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_product_agent_id_from_account: expected 1 arg (agent account), got $#"; fi
+  local acct="$1" id
+  if [ -z "$acct" ]; then rails__die "empty agent account; cannot derive the gate account"; fi
+  case "$acct" in
+    *[!a-z0-9._-]*) rails__die "agent account contains characters that cannot derive a safe gate account: $acct" ;;
+  esac
+  case "$acct" in
+    "$RAILS_PRODUCT_AGENT_ACCOUNT_PREFIX"?*) id="${acct#"$RAILS_PRODUCT_AGENT_ACCOUNT_PREFIX"}" ;;
+    *) id="$acct" ;;
+  esac
+  if [ -z "$id" ]; then rails__die "empty agent id derived from account $acct"; fi
+  case "$id" in
+    *[!a-z0-9._-]*) rails__die "agent id contains characters that cannot derive a safe gate account: $id" ;;
+  esac
+  printf '%s\n' "$id"
+}
+
+# `deriveGateAccountName(agentId)`, server/src/egress-gate/gate-account.ts,
+# composed from the agent account the root wrapper already validated and
+# allowlisted. This pins the one gate home to inspect; `gate-log` must never
+# enumerate every prefix-matching home again.
+rails_product_gate_account_for_agent_account() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_product_gate_account_for_agent_account: expected 1 arg (agent account), got $#"; fi
+  local id gate
+  id="$(rails_product_agent_id_from_account "$1")" || rails__die "could not derive agent id from $1"
+  gate="$RAILS_PRODUCT_GATE_ACCOUNT_PREFIX$id"
+  if [ "${#gate}" -gt 64 ]; then rails__die "derived gate account is longer than 64 characters: $gate"; fi
+  printf '%s\n' "$gate"
+}
+
+rails_product_gate_home_for_agent_account() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_product_gate_home_for_agent_account: expected 1 arg (agent account), got $#"; fi
+  local gate
+  gate="$(rails_product_gate_account_for_agent_account "$1")" || rails__die "could not derive gate account from $1"
+  printf '%s/%s\n' "$(rails__squeeze_slashes "$RAILS_PRODUCT_GATE_HOME_BASE")" "$gate"
+}
+
 # ---------------------------------------------------------------------------
 # THE AGENT PRINCIPAL ALLOWLIST (round-3 M2)
 # ---------------------------------------------------------------------------
@@ -762,6 +821,34 @@ rails_probe_result() {
   if [ "$rc" -eq 0 ]; then printf 'PASS\n'; return 0; fi
   if [ "$rc" -eq 3 ]; then printf 'UNVERIFIED\n'; return 0; fi
   printf 'FAIL\n'
+}
+
+# Cursor token used by the probe battery to bind a log reason to bytes appended
+# after a specific request boundary. Shape: `size,inode,uid,gid`, or
+# `0,0,0,0` for "the file did not exist at the cursor".
+rails_assert_log_cursor() {
+  if [ "$#" -ne 1 ]; then
+    rails__die "rails_assert_log_cursor: expected 1 arg (cursor), got $#"
+  fi
+  local token="$1" oldifs="$IFS" a b c d extra
+  if [ -z "$token" ]; then rails__die "empty log cursor"; fi
+  case "$token" in
+    *[!0-9,]*) rails__die "log cursor contains disallowed characters: $token" ;;
+  esac
+  IFS=','
+  # shellcheck disable=SC2086
+  set -- $token
+  IFS="$oldifs"
+  if [ "$#" -ne 4 ]; then rails__die "log cursor must have four numeric fields (size,inode,uid,gid): $token"; fi
+  a="$1"; b="$2"; c="$3"; d="$4"; extra="${5:-}"
+  if [ -n "$extra" ]; then rails__die "log cursor has extra fields: $token"; fi
+  for n in "$a" "$b" "$c" "$d"; do
+    case "$n" in
+      ''|*[!0-9]*) rails__die "log cursor field is not numeric: $token" ;;
+    esac
+    if [ "${#n}" -gt 18 ]; then rails__die "log cursor field is implausibly long: $token"; fi
+  done
+  printf '%s,%s,%s,%s\n' "$a" "$b" "$c" "$d"
 }
 
 # Compose the disposable fortress path. PURE: it validates and prints, it never

@@ -84,7 +84,9 @@ verbs:
   fortress-state    report the marker and lock files inside this run's fortress
                     AS ROOT, so a driver observes rather than guesses
   gate-log          tail this agent's gate + peer-resolver daemon logs; nonzero
-                    if there is no log to read (needs --agent-uid)
+                    if there is no log to read (needs --agent-uid);
+                    --log-cursor-only records per-log cursors and
+                    --since-<stream> prints only bytes appended after them
 
 THERE IS NO --storage FLAG. The caller supplies a RUN ID, which is not a path
 and cannot contain a slash; the wrapper composes the storage path itself under
@@ -113,6 +115,11 @@ ARG_RUN_ID=''
 ARG_OPERATOR=''
 ARG_AGENT=''
 ARG_AGENT_UID=''
+ARG_LOG_CURSOR_ONLY=''
+ARG_SINCE_GATE_OUT='0,0,0,0'
+ARG_SINCE_GATE_ERR='0,0,0,0'
+ARG_SINCE_PEER_OUT='0,0,0,0'
+ARG_SINCE_PEER_ERR='0,0,0,0'
 
 wrapper_parse_args() {
   if [ "$#" -lt 1 ]; then
@@ -141,6 +148,28 @@ wrapper_parse_args() {
       --agent-uid)
         if [ "$#" -lt 2 ]; then wrapper_die '--agent-uid needs a value'; fi
         ARG_AGENT_UID="$2"; shift 2 ;;
+      --log-cursor-only)
+        ARG_LOG_CURSOR_ONLY='yes'; shift ;;
+      --since-gate-out)
+        if [ "$#" -lt 2 ]; then wrapper_die '--since-gate-out needs a value'; fi
+        ARG_SINCE_GATE_OUT="$(rails_assert_log_cursor "$2")" \
+          || wrapper_die "bad gate stdout log cursor: ${2:-<missing>}"
+        shift 2 ;;
+      --since-gate-err)
+        if [ "$#" -lt 2 ]; then wrapper_die '--since-gate-err needs a value'; fi
+        ARG_SINCE_GATE_ERR="$(rails_assert_log_cursor "$2")" \
+          || wrapper_die "bad gate stderr log cursor: ${2:-<missing>}"
+        shift 2 ;;
+      --since-peer-out)
+        if [ "$#" -lt 2 ]; then wrapper_die '--since-peer-out needs a value'; fi
+        ARG_SINCE_PEER_OUT="$(rails_assert_log_cursor "$2")" \
+          || wrapper_die "bad peer stdout log cursor: ${2:-<missing>}"
+        shift 2 ;;
+      --since-peer-err)
+        if [ "$#" -lt 2 ]; then wrapper_die '--since-peer-err needs a value'; fi
+        ARG_SINCE_PEER_ERR="$(rails_assert_log_cursor "$2")" \
+          || wrapper_die "bad peer stderr log cursor: ${2:-<missing>}"
+        shift 2 ;;
       *)
         wrapper_die "unknown or unsupported argument: $1" ;;
     esac
@@ -327,6 +356,194 @@ wrapper_safe_path() {
     || wrapper_die "unsafe path under the storage directory: $1"
   if [ -z "$p" ]; then wrapper_die "empty path after the safe-subpath rail: $1"; fi
   printf '%s\n' "$p"
+}
+
+# Global return slot used so unsafe-path failures cannot be accidentally
+# collapsed into "file absent" by command substitution.
+WRAPPER_SAFE_TARGET=''
+WRAPPER_SAFE_OPEN_SIZE=''
+WRAPPER_SAFE_OPEN_IDENTITY=''
+
+# Resolve an OPTIONAL existing regular file under an already-approved root.
+# The resolver walks every component through `rails_assert_safe_subpath`; a
+# missing final file returns 1, while a symlink, traversal, non-regular file or
+# unsafe root is a wrapper rejection.
+wrapper_resolve_optional_file_under() {
+  local root="$1" rel="$2" label="$3" p
+  WRAPPER_SAFE_TARGET=''
+  p="$(rails_assert_safe_subpath "$root" "$rel")" \
+    || wrapper_die "unsafe $label path under $root: $rel"
+  if [ -z "$p" ]; then wrapper_die "empty $label path after the safe-subpath rail: $rel"; fi
+  if [ ! -e "$p" ]; then return 1; fi
+  if [ ! -f "$p" ]; then wrapper_die "$label path exists and is not a regular file: $p"; fi
+  WRAPPER_SAFE_TARGET="$p"
+  return 0
+}
+
+wrapper_cursor_size() {
+  printf '%s' "${1%%,*}"
+}
+
+wrapper_cursor_identity() {
+  local rest="${1#*,}"
+  printf '%s' "$rest"
+}
+
+wrapper_open_safe_file_under() {
+  local root="$1" rel="$2" label="$3" checked oldpwd parent_rel leaf expected actual oldifs noglob_was_set='' seg
+  WRAPPER_SAFE_TARGET=''
+  WRAPPER_SAFE_OPEN_SIZE=''
+  WRAPPER_SAFE_OPEN_IDENTITY=''
+  exec 9<&- 2>/dev/null || true
+  checked="$(rails_assert_safe_subpath "$root" "$rel")" \
+    || wrapper_die "unsafe $label path under $root: $rel"
+  if [ -z "$checked" ]; then wrapper_die "empty $label path after the safe-subpath rail: $rel"; fi
+  WRAPPER_SAFE_TARGET="$checked"
+  oldpwd="$(pwd -P 2>/dev/null || printf '/')"
+  cd -P "$root" || wrapper_die "could not enter safe root for $label: $root"
+  expected="$root"
+  parent_rel="${rel%/*}"
+  leaf="${rel##*/}"
+  if [ "$parent_rel" = "$rel" ]; then parent_rel=''; fi
+
+  if [ -n "$parent_rel" ]; then
+    oldifs="$IFS"
+    case "$-" in *f*) noglob_was_set='yes' ;; esac
+    set -f
+    IFS='/'
+    # shellcheck disable=SC2086
+    set -- $parent_rel
+    IFS="$oldifs"
+    if [ -z "$noglob_was_set" ]; then set +f; fi
+    for seg in "$@"; do
+      if [ -z "$seg" ]; then continue; fi
+      expected="$expected/$seg"
+      if [ -L "$seg" ]; then
+        wrapper_die "$label path component $expected is a symlink; refusing to follow it"
+      fi
+      if [ ! -e "$seg" ]; then
+        cd -P "$oldpwd" 2>/dev/null || cd -P / || wrapper_die "could not restore cwd after absent $label"
+        return 1
+      fi
+      if [ ! -d "$seg" ]; then
+        wrapper_die "$label path component $expected is not a directory"
+      fi
+      cd -P "$seg" || wrapper_die "could not enter $label path component $expected"
+      actual="$(pwd -P)" || wrapper_die "could not resolve cwd after entering $label path component $expected"
+      if [ "$actual" != "$expected" ]; then
+        wrapper_die "$label path component $expected resolved outside the approved root; refusing"
+      fi
+    done
+  fi
+
+  if [ -L "$leaf" ]; then
+    wrapper_die "$label path $checked is a symlink; refusing to follow it"
+  fi
+  if [ ! -e "$leaf" ]; then
+    cd -P "$oldpwd" 2>/dev/null || cd -P / || wrapper_die "could not restore cwd after absent $label"
+    return 1
+  fi
+  if [ ! -f "$leaf" ]; then
+    wrapper_die "$label path exists and is not a regular file: $checked"
+  fi
+  WRAPPER_SAFE_OPEN_IDENTITY="$(rails__stat_identity "$leaf")" \
+    || wrapper_die "could not stat identity for $label before open: $checked"
+  WRAPPER_SAFE_OPEN_SIZE="$(rails__stat_size "$leaf")" \
+    || wrapper_die "could not stat size for $label before open: $checked"
+  exec 9< "$leaf" || wrapper_die "could not open $label: $checked"
+  if [ "$(rails__stat_identity /dev/fd/9)" != "$WRAPPER_SAFE_OPEN_IDENTITY" ]; then
+    exec 9<&-
+    wrapper_die "$label changed between path resolution and fd open; refusing to read a substituted path: $checked"
+  fi
+  cd -P "$oldpwd" 2>/dev/null || cd -P / || wrapper_die "could not restore cwd after opening $label"
+  return 0
+}
+
+wrapper_emit_log_cursor() {
+  local key="$1" root="$2" rel="$3" label="$4"
+  if wrapper_open_safe_file_under "$root" "$rel" "$label"; then
+    printf 'WRAPPER=GATE-LOG-CURSOR key=%s cursor=%s,%s file=%s\n' \
+      "$key" "$WRAPPER_SAFE_OPEN_SIZE" "$WRAPPER_SAFE_OPEN_IDENTITY" "$WRAPPER_SAFE_TARGET"
+    exec 9<&-
+  else
+    printf 'WRAPPER=GATE-LOG-CURSOR key=%s cursor=0,0,0,0 file=absent\n' "$key"
+  fi
+}
+
+wrapper_cat_safe_file_under() {
+  local root="$1" rel="$2" label="$3" target
+  wrapper_open_safe_file_under "$root" "$rel" "$label" || return 1
+  target="$WRAPPER_SAFE_TARGET"
+  rails__sys cat <&9 || { exec 9<&-; wrapper_die "could not read $label from its checked fd: $target"; }
+  exec 9<&-
+  return 0
+}
+
+wrapper_tail_safe_file_under() {
+  local root="$1" rel="$2" label="$3" cursor="$4" target size since cursor_id start
+  cursor="$(rails_assert_log_cursor "$cursor")" \
+    || wrapper_die "bad log cursor for $label: $cursor"
+  since="$(wrapper_cursor_size "$cursor")"
+  cursor_id="$(wrapper_cursor_identity "$cursor")"
+  if ! wrapper_open_safe_file_under "$root" "$rel" "$label"; then
+    if [ "$cursor_id" != '0,0,0' ]; then
+      wrapper_die "$label disappeared after cursor $cursor; the appended log window cannot be trusted"
+    fi
+    return 1
+  fi
+  target="$WRAPPER_SAFE_TARGET"
+  size="$WRAPPER_SAFE_OPEN_SIZE"
+  if [ "$cursor_id" != '0,0,0' ]; then
+    if [ "$WRAPPER_SAFE_OPEN_IDENTITY" != "$cursor_id" ]; then
+      wrapper_die "$label identity changed since cursor $cursor; refusing to attribute stale log bytes: $target"
+    fi
+    if [ $((10#$size)) -lt $((10#$since)) ]; then
+      wrapper_die "$label shrank since cursor $cursor; refusing to attribute a rotated or truncated log: $target"
+    fi
+  fi
+  printf 'WRAPPER=GATE-LOG-BEGIN file=%s cursor=%s\n' "$target" "$cursor"
+  if [ "$cursor" = '0,0,0,0' ]; then
+    rails__sys tail -n "$WRAPPER_GATE_LOG_LINES" <&9 \
+      || { exec 9<&-; wrapper_die "could not read $label from its checked fd: $target"; }
+  else
+    start=$((10#$since + 1))
+    rails__sys tail -c +"$start" <&9 \
+      || { exec 9<&-; wrapper_die "could not read appended bytes from $label: $target"; }
+  fi
+  exec 9<&-
+  printf '\nWRAPPER=GATE-LOG-END file=%s\n' "$target"
+  return 0
+}
+
+wrapper_prepare_gate_log_root() {
+  WRAPPER_SAFE_TARGET=''
+  if [ ! -e "$RAILS_PRODUCT_GATE_HOME_BASE" ]; then return 1; fi
+  WRAPPER_SAFE_TARGET="$(rails_assert_trusted_dir_chain 'gate account home base' "$RAILS_PRODUCT_GATE_HOME_BASE")" \
+    || wrapper_die "gate account home base is not a trusted root-owned chain: $RAILS_PRODUCT_GATE_HOME_BASE"
+  if [ -z "$WRAPPER_SAFE_TARGET" ]; then wrapper_die 'empty gate account home base after trusted-chain rail'; fi
+  return 0
+}
+
+wrapper_resolve_absolute_optional_file() {
+  local abs="$1" label="$2" parent leaf root
+  WRAPPER_SAFE_TARGET=''
+  if [ -z "$abs" ]; then wrapper_die "empty absolute path for $label"; fi
+  case "$abs" in /*) ;; *) wrapper_die "$label path is not absolute: $abs" ;; esac
+  case "$abs" in
+    *$'\n'*|*$'\t'*|*$'\r'*) wrapper_die "$label path contains a control character" ;;
+  esac
+  abs="$(rails__squeeze_slashes "$abs")"
+  case "$abs/" in
+    */../*|*/./*) wrapper_die "$label path contains a relative component: $abs" ;;
+  esac
+  parent="${abs%/*}"
+  leaf="${abs##*/}"
+  if [ -z "$parent" ] || [ "$parent" = "$abs" ]; then parent='/'; fi
+  if [ ! -e "$parent" ]; then return 1; fi
+  root="$(rails_assert_trusted_dir_chain "$label parent" "$parent")" \
+    || wrapper_die "$label parent is not a trusted root-owned chain: $parent"
+  if [ -z "$root" ]; then wrapper_die "empty trusted parent for $label: $parent"; fi
+  wrapper_resolve_optional_file_under "$root" "$leaf" "$label"
 }
 
 # The compiled-in CLI must be a root-owned, non-symlink, non-group-writable
@@ -522,19 +739,16 @@ wrapper_verb_gate_state() {
 # says CLEAN. "no match", "cannot read" and "not there" were one verdict. Root
 # can actually read it, so root is who reads it.
 wrapper_verb_registry_state() {
-  local reg="$RAILS_PRODUCT_ANCHOR_REGISTRY" content rc=0
-  if [ -L "$reg" ]; then
-    wrapper_die "the pf-anchor registry path is a symlink; refusing to follow it as root: $reg"
-  fi
-  if [ ! -e "$reg" ]; then
+  local reg="$RAILS_PRODUCT_ANCHOR_REGISTRY" content rc=0 parent leaf root
+  if ! wrapper_resolve_absolute_optional_file "$reg" 'pf-anchor registry'; then
     printf 'WRAPPER=REGISTRY-ABSENT path=%s\n' "$reg"
     printf 'WRAPPER=OK verb=registry-state state=absent path=%s\n' "$reg"
     return 0
   fi
-  if [ ! -f "$reg" ]; then
-    wrapper_die "the pf-anchor registry path exists and is not a regular file: $reg"
-  fi
-  content="$(rails__sys cat -- "$reg" 2>/dev/null)" || rc=$?
+  parent="${WRAPPER_SAFE_TARGET%/*}"
+  leaf="${WRAPPER_SAFE_TARGET##*/}"
+  root="$parent"
+  content="$(wrapper_cat_safe_file_under "$root" "$leaf" 'pf-anchor registry')" || rc=$?
   if [ "$rc" -ne 0 ]; then
     wrapper_die "could not READ the pf-anchor registry at $reg (cat rc=$rc); a check that observed nothing is not a clean verdict"
   fi
@@ -595,8 +809,8 @@ wrapper_verb_fortress_state() {
   printf 'WRAPPER=OK verb=fortress-state storage=%s\n' "$STORAGE"
 }
 
-# Tail this agent's gate and peer-resolver daemon logs, AS ROOT, from the paths
-# the product actually writes.
+# Tail this agent's gate and peer-resolver daemon logs, AS ROOT, from the exact
+# paths the product actually writes.
 #
 # ROUND-3 M5. The probe battery read `<fortress>/logs/egress-gate.log`, which
 # NOTHING writes, and could not have read it anyway (root-owned 0700 fortress).
@@ -609,71 +823,57 @@ wrapper_verb_fortress_state() {
 # hid a live `peer_unresolved` strangle behind green-looking denials for a full
 # day -- was structurally dead.
 #
-# The gate account name embeds the AGENT ID, which this harness does not know,
-# so the gate homes are enumerated under the product's fixed base and matched on
-# the per-uid LOG FILE NAME, which does identify the agent uid exactly.
+# ROUND-4 BLOCKER 1. The first pass then hand-checked base/home/logdir/file and
+# invoked `tail` on the same mutable pathname under a gate-owned directory. That
+# merely moved the unchecked-component class: a reviewer swapped the final log
+# between the checks and `tail`, and the wrapper printed a file outside the
+# gate log. This verb now has no path-specific hand rail. It composes one exact
+# gate home from the product's account derivation, resolves every log path
+# through `rails_assert_safe_subpath`, opens the file once, verifies the opened
+# fd still has the lstat'd identity, and reads from that fd rather than
+# reopening the pathname.
 wrapper_verb_gate_log() {
   wrapper_require_agent
-  # EVERY COMPONENT IS lstat'd, not just the final one.
-  #
-  # The gate homes live OUTSIDE `$STORAGE`, so they cannot go through
-  # `rails_assert_safe_subpath` (which is anchored on a rail-approved root), and
-  # `rails_assert_trusted_dir_chain` is the wrong rail too: a gate home is
-  # legitimately owned by the GATE SERVICE UID, not by root, so requiring
-  # root-or-self ownership would refuse every real one.
-  #
-  # What is left is the discipline both of those rails share, applied by hand
-  # and stated: base, home, LOG DIR and file are each lstat'd before the next is
-  # touched. The log dir matters as much as the others -- `[ -L "$f" ]` lstats
-  # only the FINAL component, so a symlinked `logs/` would be followed by the
-  # kernel and never looked at, which is precisely the round-2
-  # unchecked-intermediate exploit. Here it would let the gate uid make ROOT
-  # `tail` an arbitrary file into the evidence bundle.
-  local base="$RAILS_PRODUCT_GATE_HOME_BASE" home logdir stream f found=0 rel target
-  if [ -L "$base" ]; then
-    wrapper_die "the gate account home base is a symlink; refusing to follow it as root: $base"
+  local gate_base='' gate_account found=0 rel stream key cursor
+  gate_account="$(rails_product_gate_account_for_agent_account "$ARG_AGENT")" \
+    || wrapper_die "could not derive the product gate account from agent account $ARG_AGENT"
+
+  if wrapper_prepare_gate_log_root; then
+    gate_base="$WRAPPER_SAFE_TARGET"
   fi
-  if [ -d "$base" ]; then
-    for home in "$base"/"$RAILS_PRODUCT_GATE_ACCOUNT_PREFIX"*; do
-      if [ -L "$home" ]; then
-        wrapper_die "gate account home $home is a symlink; refusing to follow it as root"
-      fi
-      if [ ! -d "$home" ]; then continue; fi
-      logdir="$home/$RAILS_PRODUCT_GATE_LOG_DIR"
-      if [ -L "$logdir" ]; then
-        wrapper_die "gate log directory $logdir is a symlink; refusing to follow it as root"
-      fi
-      if [ ! -d "$logdir" ]; then continue; fi
-      for stream in out err; do
-        f="$logdir/egress-gate-$AGENT_UID.$stream.log"
-        if [ -L "$f" ]; then wrapper_die "gate log $f is a symlink; refusing to follow it as root"; fi
-        if [ ! -f "$f" ]; then continue; fi
+
+  for stream in out err; do
+    rel="$gate_account/$RAILS_PRODUCT_GATE_LOG_DIR/egress-gate-$AGENT_UID.$stream.log"
+    if [ "$stream" = 'out' ]; then key='gate_out'; cursor="$ARG_SINCE_GATE_OUT"; else key='gate_err'; cursor="$ARG_SINCE_GATE_ERR"; fi
+    if [ -n "$gate_base" ]; then
+      if [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
+        wrapper_emit_log_cursor "$key" "$gate_base" "$rel" "$key"
+      elif wrapper_tail_safe_file_under "$gate_base" "$rel" "$key" "$cursor"; then
         found=$(( found + 1 ))
-        printf 'WRAPPER=GATE-LOG-BEGIN file=%s\n' "$f"
-        rails__sys tail -n "$WRAPPER_GATE_LOG_LINES" -- "$f" \
-          || wrapper_die "could not read the gate log $f"
-        printf '\nWRAPPER=GATE-LOG-END file=%s\n' "$f"
-      done
-    done
-  fi
+      fi
+    elif [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
+      printf 'WRAPPER=GATE-LOG-CURSOR key=%s cursor=0,0,0,0 file=absent\n' "$key"
+    fi
+  done
 
   # The peer resolver logs under the FORTRESS, so they go through the same
   # resolution chokepoint every other in-fortress path does.
   for stream in out err; do
     rel="$RAILS_PRODUCT_GATE_LOG_DIR/peer-resolver-$AGENT_UID.$stream.log"
-    target="$(wrapper_safe_path "$rel")" \
-      || wrapper_die "unsafe path under the storage directory: $rel"
-    if [ -z "$target" ]; then wrapper_die "empty path after the safe-subpath rail: $rel"; fi
-    if [ ! -f "$target" ]; then continue; fi
-    found=$(( found + 1 ))
-    printf 'WRAPPER=GATE-LOG-BEGIN file=%s\n' "$target"
-    rails__sys tail -n "$WRAPPER_GATE_LOG_LINES" -- "$target" \
-      || wrapper_die "could not read the peer-resolver log $target"
-    printf '\nWRAPPER=GATE-LOG-END file=%s\n' "$target"
+    if [ "$stream" = 'out' ]; then key='peer_out'; cursor="$ARG_SINCE_PEER_OUT"; else key='peer_err'; cursor="$ARG_SINCE_PEER_ERR"; fi
+    if [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
+      wrapper_emit_log_cursor "$key" "$STORAGE" "$rel" "$key"
+    elif wrapper_tail_safe_file_under "$STORAGE" "$rel" "$key" "$cursor"; then
+      found=$(( found + 1 ))
+    fi
   done
 
+  if [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
+    printf 'WRAPPER=OK verb=gate-log mode=cursor agent_uid=%s gate_account=%s\n' "$AGENT_UID" "$gate_account"
+    return 0
+  fi
   if [ "$found" -eq 0 ]; then
-    wrapper_die "no gate or peer-resolver log for agent uid $AGENT_UID under $base or $STORAGE/$RAILS_PRODUCT_GATE_LOG_DIR; the reason half of the probe ladder CANNOT be evaluated, and a probe that observed nothing is not a probe that passed"
+    wrapper_die "no gate or peer-resolver log for agent uid $AGENT_UID under $RAILS_PRODUCT_GATE_HOME_BASE/$gate_account or $STORAGE/$RAILS_PRODUCT_GATE_LOG_DIR; the reason half of the probe ladder CANNOT be evaluated, and a probe that observed nothing is not a probe that passed"
   fi
   printf 'WRAPPER=OK verb=gate-log agent_uid=%s files=%s\n' "$AGENT_UID" "$found"
 }

@@ -572,7 +572,7 @@ LOCAL_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_local" 2>/de
 # actually runs as root.
 compose_wrapper() {
   "$HERE/build-wrapper.sh" --stdout \
-    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" '
+    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" -v bins="${4:-}" '
         $0 == "wrapper_main \"$@\"" {
           print "RAILS_HOST_ALLOW_FP=\047" fp "\047"
           print "RAILS_HOST_DENY_FP=\047\047"
@@ -580,6 +580,7 @@ compose_wrapper() {
           print "RAILS_DISPOSABLE_BASE=\047" base "\047"
           print "RAILS_AGENT_ACCOUNT_ALLOW=\047" agents "\047"
           print "RAILS_PRODUCT_GATE_HOME_BASE=\047" gatebase "\047"
+          if (bins != "") print "RAILS_SYSTEM_BIN_DIRS=\047" bins "\047"
         }
         { print }
       ' > "$1"
@@ -765,14 +766,11 @@ expect_reject 'gate-log refuses when there is no log to read' 'CANNOT be evaluat
   -- "$TEST_WRAPPER_AGENT" gate-log --run-id 'good1' --operator-account "$ME" \
      --agent-account "$ME" --agent-uid "$(id -u)"
 
-# --- gate-log reads OUTSIDE the fortress, so it lstats EVERY component ----
+# --- gate-log reads OUTSIDE the fortress through the same chokepoint -------
 #
-# The gate homes are not under `$STORAGE`, so `rails_assert_safe_subpath` (which
-# is anchored on a rail-approved root) cannot cover them, and
-# `rails_assert_trusted_dir_chain` is the wrong rail too: a gate home is
-# legitimately owned by the GATE SERVICE UID, not root. What is left is the
-# discipline both rails share, applied by hand: base, home, LOG DIR and file are
-# each lstat'd before the next is touched.
+# The gate homes are not under `$STORAGE`, which is exactly why this verb must
+# extend the path-resolution chokepoint to that root instead of hand-checking a
+# few components at the call site.
 #
 # The LOG DIR is the component that matters and the one a first pass at this verb
 # missed. `[ -L "$f" ]` lstats only the FINAL component, so a symlinked `logs/`
@@ -780,7 +778,8 @@ expect_reject 'gate-log refuses when there is no log to read' 'CANNOT be evaluat
 # round-2 unchecked-intermediate exploit -- here it would let the gate uid make
 # ROOT `tail` an arbitrary file into the evidence bundle.
 GATEBASE="$SANDBOX/gate-homes"
-GATEHOME="$GATEBASE/sanctuary-gate-drill"
+GATEACCOUNT="$(bash -c ". '$HERE/lib/rails.sh'; rails_product_gate_account_for_agent_account '$ME'")"
+GATEHOME="$GATEBASE/$GATEACCOUNT"
 mkdir -p "$GATEHOME/logs"
 printf 'peer=%s allowlist ok\n' "$(id -u)" > "$GATEHOME/logs/egress-gate-$(id -u).out.log"
 TEST_WRAPPER_GATE="$SANDBOX/test-wrapper-gate"
@@ -798,7 +797,7 @@ mkdir -p "$GATE_VICTIM"
 printf 'SECRET-OUTSIDE-THE-GATE-HOME\n' > "$GATE_VICTIM/egress-gate-$(id -u).out.log"
 rm -rf "${GATEHOME:?}/logs"
 ln -s "$GATE_VICTIM" "$GATEHOME/logs"
-expect_reject 'a SYMLINKED gate log directory is refused' 'log directory' \
+expect_reject 'a SYMLINKED gate log directory is refused' 'unsafe gate_out path' \
   -- "$TEST_WRAPPER_GATE" gate-log --run-id 'good1' --operator-account "$ME" \
      --agent-account "$ME" --agent-uid "$(id -u)"
 set +e   # declared exception: this run is EXPECTED to exit nonzero
@@ -814,6 +813,48 @@ case "$gate_out" in
     PASS=$((PASS + 1)) ;;
 esac
 rm -f "$GATEHOME/logs"
+mkdir -p "$GATEHOME/logs"
+ATTACK_LOG="$GATEHOME/logs/egress-gate-$(id -u).out.log"
+printf 'SAFE-GATE-LOG peer=%s\n' "$(id -u)" > "$ATTACK_LOG"
+TAIL_VICTIM="$SANDBOX/gate-tail-victim.log"
+printf 'SECRET-TAIL-SUBSTITUTED\n' > "$TAIL_VICTIM"
+TAILBIN="$SANDBOX/tailbin"
+mkdir -p "$TAILBIN"
+cat > "$TAILBIN/tail" <<'TAILSTUB'
+#!/bin/bash
+args=("$@")
+last="${args[$((${#args[@]}-1))]}"
+if [ -n "${DRILL_TEST_ATTACK_PATH:-}" ] && [ "$last" = "$DRILL_TEST_ATTACK_PATH" ]; then
+  rm -f -- "$last"
+  ln -s -- "$DRILL_TEST_VICTIM" "$last"
+fi
+exec /usr/bin/tail "$@"
+TAILSTUB
+chmod +x "$TAILBIN/tail"
+TEST_WRAPPER_GATE_TAIL="$SANDBOX/test-wrapper-gate-tail"
+compose_wrapper "$TEST_WRAPPER_GATE_TAIL" "$ME" "$GATEBASE" "$TAILBIN /usr/bin /bin /usr/sbin /sbin"
+set +e   # declared exception: this run may reject if the path is substituted
+gate_out="$(DRILL_TEST_ATTACK_PATH="$ATTACK_LOG" DRILL_TEST_VICTIM="$TAIL_VICTIM" \
+  "$TEST_WRAPPER_GATE_TAIL" gate-log --run-id 'good1' --operator-account "$ME" \
+  --agent-account "$ME" --agent-uid "$(id -u)" 2>&1)"
+gate_rc=$?
+set -e
+case "$gate_out" in
+  *SECRET-TAIL-SUBSTITUTED*)
+    printf 'FAIL  *** gate-log reopened a mutable pathname and printed a substituted file ***\n'
+    FAIL=$((FAIL + 1)) ;;
+  *SAFE-GATE-LOG*)
+    if [ "$gate_rc" -eq 0 ]; then
+      printf 'ok    gate-log reads the checked fd, not a path tail can be raced under it\n'
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  gate-log avoided the secret but exited %s\n' "$gate_rc"
+      note "output: $gate_out"; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  gate-log neither read the safe log nor exposed the substitution clearly\n'
+    note "output: $gate_out"; FAIL=$((FAIL + 1)) ;;
+esac
 # ...and the same account IS accepted once it is on the allowlist, so the rail
 # has been seen to say yes as well as no.
 expect_reject 'an allowlisted agent account passes the agent rail and dies later' 'kickstart failed for' \
@@ -899,12 +940,32 @@ for a in "${args[@]}"; do
         echo 'WRAPPER=REJECT reason=no gate log' >&2
         exit 20
       fi
+      cursor_only=''
+      since_mode=''
+      for x in "${args[@]}"; do
+        if [ "$x" = '--log-cursor-only' ]; then cursor_only='yes'; fi
+        case "$x" in --since-*) since_mode='yes' ;; esac
+      done
+      if [ -n "$cursor_only" ]; then
+        cursor="${STUB_GATE_LOG_CURSOR:-0,0,0,0}"
+        for key in gate_out gate_err peer_out peer_err; do
+          printf 'WRAPPER=GATE-LOG-CURSOR key=%s cursor=%s file=stub\n' "$key" "$cursor"
+        done
+        echo 'WRAPPER=OK verb=gate-log mode=cursor'
+        exit 0
+      fi
       echo 'WRAPPER=GATE-LOG-BEGIN file=stub'
-      printf '%s\n' "${STUB_GATE_LOG_BODY:-}"
+      if [ -n "$since_mode" ] && [ -n "${STUB_GATE_LOG_SINCE_BODY+x}" ]; then
+        printf '%s\n' "$STUB_GATE_LOG_SINCE_BODY"
+      else
+        printf '%s\n' "${STUB_GATE_LOG_BODY:-}"
+      fi
       echo 'WRAPPER=GATE-LOG-END file=stub'
       echo 'WRAPPER=OK verb=gate-log'
       exit 0
       ;;
+    kickstart-daemons)       exit "${STUB_KICKSTART_RC:-0}" ;;
+    mint)                    exit "${STUB_MINT_RC:-0}" ;;
     retire)                  exit "${STUB_RETIRE_RC:-0}" ;;
     unprotect|clean-markers) exit "${STUB_WRAPPER_RC:-0}" ;;
     *curl)
@@ -925,18 +986,48 @@ done
 exit 0
 STUB
 chmod +x "$STUBBIN/sudo"
+LOOP_UUID='DC6E6D25-7885-5B37-948A-5C942737CFF4'
+LOOP_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_of '$LOOP_UUID'")"
+cat > "$STUBBIN/ioreg" <<STUB
+#!/bin/bash
+printf '%s\n' '    "IOPlatformUUID" = "$LOOP_UUID"'
+STUB
+chmod +x "$STUBBIN/ioreg"
 
-# The sandbox harness: byte-identical drivers, ONE constant substituted.
+# The sandbox harness: byte-identical drivers, with only fixture constants
+# substituted so the tests can run without touching the real host state.
 HARNESS="$SANDBOX/harness"
 mkdir -p "$HARNESS/lib"
 cp -R "$HERE/drivers" "$HARNESS/drivers"
 cp "$HERE/lib/probe.sh" "$HARNESS/lib/probe.sh"
-sed "s|^RAILS_SYSTEM_BIN_DIRS='/usr/bin /bin /usr/sbin /sbin'\$|RAILS_SYSTEM_BIN_DIRS='$STUBBIN /usr/bin /bin /usr/sbin /sbin'|" \
+cp "$HERE/build-wrapper.sh" "$HARNESS/build-wrapper.sh"
+cp "$HERE/wrapper-main.sh" "$HARNESS/wrapper-main.sh"
+cp "$HERE/wrapper.sha256" "$HARNESS/wrapper.sha256"
+LOOP_WRAPPER="$SANDBOX/fake-installed-wrapper"
+: > "$LOOP_WRAPPER"
+chmod +x "$LOOP_WRAPPER"
+sed "s|^INSTALLED_WRAPPER=.*|INSTALLED_WRAPPER='$LOOP_WRAPPER'|" \
+  "$HERE/drivers/run-loop.sh" > "$HARNESS/drivers/run-loop.sh"
+chmod +x "$HARNESS/drivers/run-loop.sh"
+sed -e "s|^RAILS_SYSTEM_BIN_DIRS='/usr/bin /bin /usr/sbin /sbin'\$|RAILS_SYSTEM_BIN_DIRS='$STUBBIN /usr/bin /bin /usr/sbin /sbin'|" \
+  -e "s|^RAILS_DISPOSABLE_BASE=.*|RAILS_DISPOSABLE_BASE='$BASE'|" \
+  -e "s|^RAILS_AGENT_ACCOUNT_ALLOW=.*|RAILS_AGENT_ACCOUNT_ALLOW='$ME'|" \
+  -e "s|^RAILS_HOST_ALLOW_FP=.*|RAILS_HOST_ALLOW_FP='$LOOP_FP'|" \
+  -e "s|^RAILS_HOST_DENY_FP=.*|RAILS_HOST_DENY_FP=''|" \
+  -e "s|^RAILS_HOST_DENY=.*|RAILS_HOST_DENY=''|" \
   "$HERE/lib/rails.sh" > "$HARNESS/lib/rails.sh"
+cat >> "$HARNESS/lib/rails.sh" <<'STUB'
+
+# TEST ONLY: run-loop flow tests need to reach the ladder without installing a
+# root-owned grant target. Production run-loop.sh still asserts the real
+# integrity rail; the TypeScript structural suite pins that call site.
+rails_assert_wrapper_integrity() { return 0; }
+STUB
 # A substitution that silently did not happen would leave this battery testing
 # the real /usr/bin/sudo and reporting whatever that did. That is the same class
 # as everything else in this file, so it is checked rather than assumed.
-if grep -q "^RAILS_SYSTEM_BIN_DIRS='$STUBBIN " "$HARNESS/lib/rails.sh"; then
+if grep -q "^RAILS_SYSTEM_BIN_DIRS='$STUBBIN " "$HARNESS/lib/rails.sh" &&
+   grep -q "^RAILS_DISPOSABLE_BASE='$BASE'\$" "$HARNESS/lib/rails.sh"; then
   printf 'ok    the driver battery resolves its tools through the rails CONSTANT, not PATH\n'
   PASS=$((PASS + 1))
 else
@@ -1292,6 +1383,84 @@ case "$out" in
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
+# --- RUN-LOOP: EARLY FAILURES STILL RETIRE THE DISPOSABLE FORTRESS --------
+printf '== run-loop: early failures retire the disposable fortress ==\n'
+run_loop_once() {
+  local root="$1" sudo_log="${2:-}" kickstart_rc="${3:-}" mint_rc="${4:-}" retire_rc="${5:-}"
+  mkdir -p "$root/home"
+  STUB_SUDO_LOG="$sudo_log" \
+  STUB_KICKSTART_RC="$kickstart_rc" \
+  STUB_MINT_RC="$mint_rc" \
+  STUB_RETIRE_RC="$retire_rc" \
+  "$HARNESS/drivers/run-loop.sh" --mode sweep --iterations 1 \
+    --operator-account "$ME" --agent-account "$ME" --agent-uid "$(id -u)" \
+    --evidence-root "$root/evidence" --build-sha test-sha --home "$root/home" 2>&1
+}
+
+KICK_LOOP="$SANDBOX/loop-kickstart"
+KICK_SUDO_LOG="$SANDBOX/loop-kickstart-sudo.log"
+set +e   # declared exception
+out="$(run_loop_once "$KICK_LOOP" "$KICK_SUDO_LOG" 7 '' '')"; rc=$?
+set -e
+kick_findings="$(cat "$KICK_LOOP/evidence/FINDINGS.jsonl" 2>/dev/null || true)"
+case "$(cat "$KICK_SUDO_LOG" 2>/dev/null || true):$kick_findings:$out" in
+  *kickstart-daemons*retire*'"step":"kickstart","result":"FAIL"'*'"step":"retire","result":"PASS"'*)
+    if [ "$rc" -ne 0 ]; then
+      printf 'ok    a kickstart failure runs retire before the iteration exits\n'
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  kickstart failed and retired, but run-loop exited 0\n'
+      note "output: $out"; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  *** a kickstart failure did not run and record retire ***\n'
+    note "sudo log: $(cat "$KICK_SUDO_LOG" 2>/dev/null || true)"
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+PREFLIGHT_LOOP="$SANDBOX/loop-preflight"
+PREFLIGHT_SUDO_LOG="$SANDBOX/loop-preflight-sudo.log"
+set +e   # declared exception
+out="$(run_loop_once "$PREFLIGHT_LOOP" "$PREFLIGHT_SUDO_LOG" '' '' '')"; rc=$?
+set -e
+preflight_findings="$(cat "$PREFLIGHT_LOOP/evidence/FINDINGS.jsonl" 2>/dev/null || true)"
+case "$(cat "$PREFLIGHT_SUDO_LOG" 2>/dev/null || true):$preflight_findings:$out" in
+  *kickstart-daemons*mint*retire*'"step":"preflight","result":"FAIL"'*'"step":"retire","result":"PASS"'*)
+    if [ "$rc" -ne 0 ]; then
+      printf 'ok    a preflight failure retires the minted disposable fortress\n'
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  preflight failed and retired, but run-loop exited 0\n'
+      note "output: $out"; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  *** a preflight failure did not run and record retire ***\n'
+    note "sudo log: $(cat "$PREFLIGHT_SUDO_LOG" 2>/dev/null || true)"
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+DIRTY_LOOP="$SANDBOX/loop-retire-dirty"
+DIRTY_SUDO_LOG="$SANDBOX/loop-retire-dirty-sudo.log"
+set +e   # declared exception
+out="$(run_loop_once "$DIRTY_LOOP" "$DIRTY_SUDO_LOG" 7 '' 9)"; rc=$?
+set -e
+dirty_findings="$(cat "$DIRTY_LOOP/evidence/FINDINGS.jsonl" 2>/dev/null || true)"
+case "$dirty_findings:$out" in
+  *'"step":"retire","result":"FAIL"'*'retire-after-kickstart'*)
+    if [ "$rc" -ne 0 ]; then
+      printf 'ok    an early retire failure is a dirty stop, not a silent leftover\n'
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  retire failed but run-loop exited 0\n'
+      note "output: $out"; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  *** failed early retire was not recorded as a dirty stop ***\n'
+    note "sudo log: $(cat "$DIRTY_SUDO_LOG" 2>/dev/null || true)"
+    note "findings: $dirty_findings"
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
 # --- THE PROBE BATTERY: A SKIP IS NOT A PASS (Codex round-3 finding 2) ----
 #
 # The battery reported `N3 SKIP`, left FAILED at zero, exited 0, and the loop
@@ -1328,17 +1497,18 @@ case "$out" in
     printf 'FAIL  the summary did not name the skipped probes\n'
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
-# And the round-3 N3 rule: the log WAS read and carries no peer_uid_mismatch, so
-# the probe RAN and did not observe its reason. That is a FAIL, not a SKIP.
+# And the round-4 N3 rule: a wrong-uid request that SUCCEEDED is a FAIL before
+# the log reason is even considered. Stale or even current-looking
+# peer_uid_mismatch text cannot turn an allowed request into a passing denial.
 set +e   # declared exception
-out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_BODY="peer=$(id -u) allowlist" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_BODY="peer=$(id -u) allowlist peer_uid_mismatch" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
 set -e
 case "$out" in
-  *'PROBE=N3 RESULT=FAIL'*)
-    printf 'ok    a read gate log with no peer_uid_mismatch FAILS N3 rather than skipping it\n'
+  *'PROBE=N3 RESULT=FAIL'*'SUCCEEDED with code 200'*)
+    printf 'ok    a wrong-uid request that SUCCEEDED is N3 FAIL, never stale-log PASS\n'
     PASS=$((PASS + 1)) ;;
   *)
-    printf 'FAIL  *** an unobserved N3 denial reason was not a FAIL ***\n'
+    printf 'FAIL  *** a successful wrong-uid request was not a loud N3 FAIL ***\n'
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 # ...and the reason half now produces evidence at all, which it structurally
@@ -1349,6 +1519,17 @@ case "$out" in
     PASS=$((PASS + 1)) ;;
   *)
     printf 'FAIL  the reason half still produced no verdict from a readable gate log\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+set +e   # declared exception
+out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_BODY='old allowlist' STUB_GATE_LOG_SINCE_BODY="peer=$(id -u)" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+set -e
+case "$out" in
+  *'PROBE=N1 RESULT=FAIL'*'current log window'*)
+    printf 'ok    stale allowlist text outside the current window cannot pass N1\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** stale allowlist text satisfied N1 without current evidence ***\n'
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
