@@ -440,8 +440,12 @@ describe("egress-gate/pf-anchor", () => {
       const result = await armPfAnchor(runner, POLICY, {
         settleDelayMs: 1,
         sleep: () => Promise.resolve(),
+        bootSession: async () => "4E4A2428-2FBD-4164-B6B6-B1FDA7DA43BD",
       });
-      expect(result.enableToken).toBe("4204204242");
+      expect(result.enableReference).toEqual({
+        token: "4204204242",
+        boot_session_uuid: "4E4A2428-2FBD-4164-B6B6-B1FDA7DA43BD",
+      });
       expect(result.settleProbes).toBeGreaterThanOrEqual(2);
       const loaded = runner.calls.find((c) => c[1] === "-a" && c[3] === "-f");
       expect(loaded?.[2]).toBe(PF_ANCHOR_NAME);
@@ -488,8 +492,9 @@ describe("egress-gate/pf-anchor", () => {
           mainConfPath: baseConfPath,
           settleDelayMs: 1,
           sleep: () => Promise.resolve(),
+          bootSession: async () => "4E4A2428-2FBD-4164-B6B6-B1FDA7DA43BD",
         });
-        expect(result.enableToken).toBe("4204204242");
+        expect(result.enableReference?.token).toBe("4204204242");
         // The composed main ruleset preserves the operator's base config...
         expect(composed).toContain('anchor "com.apple/*"');
         expect(composed).toContain('load anchor "com.apple" from "/etc/pf.anchors/com.apple"');

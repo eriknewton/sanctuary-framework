@@ -62,6 +62,7 @@ import {
   type GateBinding,
 } from "./generation.js";
 import { createExecFilePfRunner, checkPfAnchorLiveness } from "./pf-anchor.js";
+import { readBootSessionUuid } from "./pf-enable-state.js";
 import {
   GateLivenessOracle,
   createFsLivenessOracleOps,
@@ -1591,12 +1592,11 @@ export function createProductionReleaseBarrierOps(input: {
         0o644,
       );
     },
-    async bootSessionUuid(): Promise<string> {
-      const { stdout } = await execFileAsync("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"]);
-      const uuid = stdout.trim();
-      if (uuid.length === 0) throw new Error("kern.bootsessionuuid is empty");
-      return uuid;
-    },
+    // ONE reader for the whole subsystem (`pf-enable-state.ts`). The release
+    // barrier's hold-file binding and the pf enable reference's binding must
+    // never disagree about which boot this is; two local sysctl shims is how
+    // that disagreement would arrive.
+    bootSessionUuid: readBootSessionUuid,
     async rearmAnchor(): Promise<{ ok: true } | { ok: false; reason: string }> {
       if (input.rearm === "install-noop") return { ok: true };
       try {

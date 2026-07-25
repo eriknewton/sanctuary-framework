@@ -102,6 +102,16 @@ describe("egress-gate/pf-anchor tombstone (S5-2 M4)", () => {
         if (a === "-sr") return { code: 0, stdout: `anchor "${PF_ANCHOR_NAME}" on lo0\n`, stderr: "" };
         if (a === "-v -s Interfaces") return { code: 0, stdout: "lo0\n", stderr: "" };
         if (a === "-E") return { code: 0, stdout: "Token : 42\n", stderr: "" };
+        // The enable-reference chokepoint attributes the reference by token.
+        if (a === "-s References") {
+          return {
+            code: 0,
+            stdout:
+              "TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n" +
+              "4063     pfctl                        42                       0 days 00:00:00\n",
+            stderr: "",
+          };
+        }
         return { code: 0, stdout: "", stderr: "" };
       },
     };
@@ -110,8 +120,9 @@ describe("egress-gate/pf-anchor tombstone (S5-2 M4)", () => {
       settleConsecutive: 1,
       settleDelayMs: 0,
       sleep: async () => {},
+      bootSession: async () => "4E4A2428-2FBD-4164-B6B6-B1FDA7DA43BD",
     });
-    expect(res.enableToken).toBe("42");
+    expect(res.enableReference?.token).toBe("42");
     // The anchor load happened (a `-f` into the anchor).
     expect(calls.some((c) => c.startsWith(`-a ${PF_ANCHOR_NAME} -f`))).toBe(true);
   });

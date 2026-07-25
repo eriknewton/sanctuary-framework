@@ -77,14 +77,27 @@ function memLock(): ProvisionLockOps & { acquired: number } {
 }
 
 const okArm = (token?: string): ArmPfAnchorResult =>
-  token === undefined ? { settleProbes: 1 } : { settleProbes: 1, enableToken: token };
+  token === undefined
+    ? { settleProbes: 1 }
+    : { settleProbes: 1, enableReference: { token, boot_session_uuid: BOOT_SESSION_UUID } };
+
+/**
+ * A fixed boot session for the arm mocks. The registry persists the token and
+ * this binding as ONE fact, so the assertions below check the pair, not a
+ * bare token (F-PFBOOT: a token with no provenance is indistinguishable from a
+ * token a reboot invalidated).
+ */
+const BOOT_SESSION_UUID = "4E4A2428-2FBD-4164-B6B6-B1FDA7DA43BD";
 const live: PfLivenessResult = { live: true, reasons: [] };
 const notLive: PfLivenessResult = { live: false, reasons: ["drift"] };
 
 /** Build a registry with recording mocks; returns the registry + spies. */
 function makeRegistry(opts: {
   initial?: PfAnchorRegistryState | null;
-  armImpl?: (entries: readonly { agent_uid: number }[], options: { existingEnableToken?: string }) => Promise<ArmPfAnchorResult>;
+  armImpl?: (
+    entries: readonly { agent_uid: number }[],
+    options: { existingEnableReference?: { token: string } },
+  ) => Promise<ArmPfAnchorResult>;
   disarmImpl?: (options: { enableToken?: string }) => Promise<void>;
   livenessImpl?: () => Promise<PfLivenessResult>;
   forensicsImpl?: (payload: string) => Promise<string>;
@@ -102,11 +115,14 @@ function makeRegistry(opts: {
     armUnion: async (entries, options) => {
       armCalls.push({
         uids: entries.map((e) => e.agent_uid),
-        ...(options.existingEnableToken !== undefined
-          ? { existingEnableToken: options.existingEnableToken }
+        ...(options.existingEnableReference !== undefined
+          ? { existingEnableToken: options.existingEnableReference.token }
           : {}),
       });
-      return (opts.armImpl ?? (async () => okArm(options.existingEnableToken ?? "1")))(entries, options);
+      return (opts.armImpl ?? (async () => okArm(options.existingEnableReference?.token ?? "1")))(
+        entries,
+        options,
+      );
     },
     disarm: async (options) => {
       disarmCalls.push({ ...(options.enableToken !== undefined ? { enableToken: options.enableToken } : {}) });
@@ -412,11 +428,11 @@ describe("egress-gate/anchor-registry", () => {
       armUnion: async (entries, options) => {
         armCalls.push({
           uids: entries.map((e) => e.agent_uid),
-          ...(options.existingEnableToken !== undefined
-            ? { existingEnableToken: options.existingEnableToken }
+          ...(options.existingEnableReference !== undefined
+            ? { existingEnableToken: options.existingEnableReference.token }
             : {}),
         });
-        return okArm(options.existingEnableToken ?? "2"); // fresh -E yields token "2"
+        return okArm(options.existingEnableReference?.token ?? "2"); // fresh -E yields token "2"
       },
       disarm: async (options) => {
         disarmCalls.push({ ...(options.enableToken !== undefined ? { enableToken: options.enableToken } : {}) });
@@ -451,7 +467,7 @@ describe("egress-gate/anchor-registry", () => {
       store,
       lock: memLock(),
       runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
-      armUnion: async (_entries, options) => okArm(options.existingEnableToken ?? "1"),
+      armUnion: async (_entries, options) => okArm(options.existingEnableReference?.token ?? "1"),
       disarm: async (options) => {
         disarmCalls.push({ ...(options.enableToken !== undefined ? { enableToken: options.enableToken } : {}) });
       },
@@ -862,7 +878,7 @@ describe("egress-gate/anchor-registry fix-round-5 (P1 generation floor on remova
       store,
       lock: memLock(),
       runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
-      armUnion: async () => ({ settleProbes: 1, enableToken: "1" }),
+      armUnion: async () => okArm("1"),
       disarm: async () => {},
       unionLiveness: async () => live,
       quarantineForensics: async (payload) => {
@@ -893,7 +909,7 @@ describe("egress-gate/anchor-registry fix-round-5 (P1 generation floor on remova
         store: createFsRegistryStore(path),
         lock: memLock(),
         runner: { async run() { return { code: 0, stdout: "", stderr: "" }; } },
-        armUnion: async () => ({ settleProbes: 1, enableToken: "1" }),
+        armUnion: async () => okArm("1"),
         disarm: async () => {},
         unionLiveness: async () => live,
         quarantineForensics: createFsQuarantineForensicsWriter(path),
