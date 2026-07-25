@@ -31,6 +31,77 @@ jobs:
           xcodebuild -version
           swift --version
 
+      # Preflight: name the missing credential instead of dying inside Keychain.
+      #
+      # 2026-06-16 (run 27641268243) this job's only execution failed with
+      # "SecKeychainItemImport: One or more parameters passed to a function were
+      # not valid." That message reads like a malformed or expired certificate.
+      # It was neither: none of the five Apple secrets had ever been set, so
+      # P12_BASE64 was empty, `base64 --decode` produced a 0-byte file, and
+      # `security import` rejected it as a bad parameter. The real fault was
+      # six steps upstream of the error text, and the release pipeline sat
+      # silently broken for six weeks because nothing said which input was absent.
+      #
+      # Absence must be representable. Check every secret this job consumes,
+      # report ALL that are missing in one pass rather than one failure per run,
+      # and never print a value.
+      - name: Preflight signing and notarization credentials
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          missing=""
+          for name in P12_BASE64 P12_PASSWORD NOTARY_APPLE_ID NOTARY_PASSWORD TEAM_ID; do
+            eval "value=\${$name}"
+            if [ -z "$value" ]; then
+              missing="$missing $name"
+            fi
+          done
+
+          if [ -n "$missing" ]; then
+            echo "::error::Apple release credentials are not configured on this repository."
+            echo "Missing (empty or unset):$missing"
+            echo ""
+            echo "Secret names, in repository Settings > Secrets and variables > Actions:"
+            echo "  APPLE_DEVELOPER_ID_P12           base64 of the Developer ID Application .p12"
+            echo "  APPLE_DEVELOPER_ID_P12_PASSWORD  the password used when exporting that .p12"
+            echo "  APPLE_NOTARY_APPLE_ID            Apple ID used for notarytool"
+            echo "  APPLE_NOTARY_PASSWORD            app-specific password for that Apple ID"
+            echo "  APPLE_TEAM_ID                    Developer Team ID"
+            echo ""
+            echo "See .github/RELEASING.md for the export procedure."
+            exit 1
+          fi
+
+          # Validate the p12 decodes and is really PKCS#12 before Keychain sees
+          # it, so a truncated or mis-pasted secret reports as such rather than
+          # as an opaque Keychain parameter error. Password is NOT checked here:
+          # a wrong password must fail at import, not leak a distinguishing
+          # signal from a step whose output is public.
+          if ! printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/preflight.p12" 2>/dev/null; then
+            echo "::error::APPLE_DEVELOPER_ID_P12 is not valid base64. Re-export and re-paste it."
+            rm -f "$RUNNER_TEMP/preflight.p12"
+            exit 1
+          fi
+
+          if [ ! -s "$RUNNER_TEMP/preflight.p12" ]; then
+            echo "::error::APPLE_DEVELOPER_ID_P12 decoded to an empty file."
+            rm -f "$RUNNER_TEMP/preflight.p12"
+            exit 1
+          fi
+
+          if ! openssl asn1parse -inform DER -in "$RUNNER_TEMP/preflight.p12" >/dev/null 2>&1; then
+            echo "::error::APPLE_DEVELOPER_ID_P12 decoded to $(wc -c < "$RUNNER_TEMP/preflight.p12" | tr -d ' ') bytes that are not a PKCS#12 container."
+            rm -f "$RUNNER_TEMP/preflight.p12"
+            exit 1
+          fi
+
+          rm -f "$RUNNER_TEMP/preflight.p12"
+          echo "All five Apple credentials are present and the .p12 parses."
+
       - name: Import signing certificate
         env:
           P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
@@ -42,7 +113,7 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          echo "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" \
             -k "$KEYCHAIN_PATH" \
             -P "$P12_PASSWORD" \
