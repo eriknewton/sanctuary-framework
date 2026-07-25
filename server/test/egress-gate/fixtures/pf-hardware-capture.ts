@@ -31,6 +31,35 @@
  * reported `rc=0` for a FAILING `pfctl -X`. The exit codes below come from the
  * re-measured, un-piped `T2` log. T1 is used here only for its stdout text,
  * never for an exit code.
+ *
+ * TWO PROVENANCE BOUNDS, so nobody later reads INFERENCE as MEASUREMENT:
+ *
+ *  1. THE CAPTURES ARE FILTERED. Every drill script piped pfctl through
+ *     `grep -v ALTQ` (`t1.sh:15`, `t2.sh:15,22,29,...`), so the logs omit
+ *     pfctl's `No ALTQ support in kernel` / `ALTQ related functions disabled`
+ *     warnings. On the drilled host `pfctl -E` really printed FOUR lines, not
+ *     the two below (`T1-pf-reference-observation.log:53-56`). The constants
+ *     here are byte-exact extracts of what the logs CONTAIN, which is the
+ *     filtered stream.
+ *  2. THE STDOUT/STDERR SPLIT FOR `-s info` AND `-s References` IS INFERRED,
+ *     NOT MEASURED. Both were captured with `2>&1`, so no captured evidence
+ *     separates their streams. The inference is sound and narrow: T2 section B
+ *     captured `pfctl -E` with the streams SEPARATED and reported `stdout: []`,
+ *     so the ALTQ warnings are on stderr for at least that verb, and
+ *     `observePfEnabled` / `parsePfEnableReferenceTokens` read `.stdout` only.
+ *     If that inference is wrong the failure is SAFE, not silent: an ALTQ line
+ *     reaching the References parser yields `fields[1] === "ALTQ"`, which is
+ *     non-numeric, which returns `null`, which is `unknown`, which re-acquires.
+ *     The cost is one `-E`/`-X` churn per mutation, never a wrong-allow. A
+ *     stream-separated `-s info` / `-s References` probe is OWED to the next
+ *     drill, and until it is captured this bound stands.
+ *
+ * ONE DATE RECONCILIATION, so a future reader is not chasing a phantom second
+ * run: the drill's evidence directory and the artifacts referencing it are
+ * named `2026-07-26`, while every log inside is stamped
+ * `2026-07-25T17:59-19:01Z`. They are the SAME single run. The directory name
+ * is kept as-is because it is the on-disk path other modules cite; the log
+ * timestamps are the authority on when it ran.
  */
 
 /* eslint-disable no-irregular-whitespace */

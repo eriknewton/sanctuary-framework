@@ -75,6 +75,7 @@ import {
   type PfEnableReference,
   type PfEnableReferenceDisposition,
   type PfEnableReferenceEnsured,
+  type PfEnableReferenceRelease,
 } from "./pf-enable-state.js";
 
 import {
@@ -745,6 +746,19 @@ export interface ArmPfAnchorResult {
   enableReference?: PfEnableReference;
   /** True when THIS arm ran `pfctl -E` rather than reusing a verified reference. */
   acquiredEnableReference?: boolean;
+  /**
+   * What happened to the reference the acquire SUPERSEDED, when there was one.
+   * Absent on a reuse and on a first arm.
+   *
+   * Carried out of the chokepoint verbatim -- `reason` included -- because a
+   * superseded release that could not be accounted for leaves the kernel
+   * holding an ORPHANED enable reference with no registry row naming it, and
+   * dropping the reason here is what made that condition invisible. It
+   * over-enforces (pf stays enabled) and can never be a wrong-allow, but an
+   * operator who runs `--unprotect-egress-gate` and finds pf still enabled is
+   * entitled to the sentence that explains why. Log it; do not act on it.
+   */
+  supersededEnableRelease?: PfEnableReferenceRelease;
   /** What the enable-reference chokepoint observed, for logs and diagnostics. */
   enableEvidence?: string[];
   /** How many liveness probes ran during the settle phase. */
@@ -942,6 +956,9 @@ export async function armPfAnchorUnion(
       settleProbes: probes,
       enableReference: ensured.reference,
       acquiredEnableReference: ensured.acquired,
+      ...(ensured.supersededRelease !== undefined
+        ? { supersededEnableRelease: ensured.supersededRelease }
+        : {}),
       enableEvidence: ensured.evidence,
     };
   } catch (err) {
@@ -953,7 +970,24 @@ export async function armPfAnchorUnion(
     // (gate-round finding -- unbounded leak on retry + silent host-firewall
     // posture change). We only release what WE acquired this call (an existing
     // token belongs to a prior arm and stays live).
-    if (acquiredToken !== undefined) {
+    //
+    // ONE EXCEPTION, AND IT IS THE WHOLE POINT OF THIS MODULE (fix-round F1).
+    // When the acquire SUPERSEDED a reference that was really released, the
+    // reference this call took is no longer an ADDITION -- it is the only thing
+    // holding pf up, for every confined uid on the host, including ones this
+    // mutation never touched. Giving it back would take the count to zero under
+    // a loaded anchor and unconfine a BYSTANDER uid until the registry
+    // rollback's own `-E` (unbounded if that rollback also fails). Keeping it is
+    // an orphaned reference: over-enforcing, releasable, and visible in
+    // `pfctl -s References` -- which is the fail direction this module chose
+    // everywhere else, so the failure path chooses it too.
+    //
+    // `already-gone` is NOT this case: it means the kernel held no such
+    // reference, so nothing that was holding pf up was destroyed and the
+    // reference we took really is ours alone to give back. `undefined` means no
+    // supersession happened at all (a first arm). Both still release.
+    const supersededWasReleased = ensured?.supersededRelease?.disposition === "released";
+    if (acquiredToken !== undefined && !supersededWasReleased) {
       await releasePfEnableReference({ runner }, acquiredToken).catch(() => undefined);
     }
     throw err;

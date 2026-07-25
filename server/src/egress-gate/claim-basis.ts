@@ -1257,7 +1257,17 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     symbol: "armPfAnchorUnion",
     claim:
       "the union is loaded, hooked, live, and pf is held enabled by a reference THIS fortress owns",
-    basis: "observed",
+    basis: "weakened",
+    unobserved:
+      "the LOAD/HOOK/LIVE half is fully observed -- the settle-probe re-reads pf's status, the " +
+      "anchor's exact rules, the main ruleset's call rule, the skip flags and the preempting-quick " +
+      "scan. The OWNERSHIP half is not read back by this verb at all: the settle-probe never runs " +
+      "`pfctl -s References`, so ownership is delegated whole to `pf-enable-state.ensure`, whose own " +
+      "row is `weakened` for one branch -- when the post-acquire `pfctl -s References` is unreadable " +
+      "or unparseable, that observation is recorded rather than thrown, and ownership then rests on " +
+      "`pfctl -E` exiting 0 with a token. A composed claim is graded by its weakest input, so this " +
+      "row inherits that weakening instead of re-laundering it as `observed` one layer up. The " +
+      "`enableEvidence` vector says which branch a given arm took.",
     detectorBlind: true,
     layer: "compute",
     branches: "boolean",

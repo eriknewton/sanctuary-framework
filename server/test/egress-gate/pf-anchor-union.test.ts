@@ -446,6 +446,131 @@ describe("egress-gate/pf-anchor union primitives", () => {
       expect(runner.calls.some((c) => c[1] === "-E")).toBe(false);
     });
 
+    it("carries the superseded release OUT, reason included, when it could not be accounted for", async () => {
+      // FIX-ROUND F3. An unaccountable `pfctl -X` on the superseded token means
+      // the registry drops that token from its record while the kernel may
+      // still hold the reference: an ORPHAN with no row naming it. It
+      // over-enforces (pf stays enabled) and can never be a wrong-allow, but it
+      // is what leaves an operator staring at a pf that is still enabled after
+      // an unprotect with nothing to read. The reason string used to be
+      // discarded at this boundary; now it reaches the caller.
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 222\n") },
+        referencesCall(ok(referenceTable(["111", "222"]))),
+        // Neither captured absence message, and pf is observed ENABLED, so the
+        // release is unexplained and `releasePfEnableReference` throws.
+        {
+          match: (_c, a) => a[0] === "-X" && a[1] === "111",
+          result: { code: 1, stdout: "", stderr: "pfctl: DIOCSTOPREF: Device busy" },
+        },
+        ...liveScript([A]),
+      ]);
+      const res = await armPfAnchorUnion(runner, [A], {
+        mainConfPath: "/dev/null",
+        // A previous boot, so the resolver reaches `not-ours` with no pfctl call.
+        existingEnableReference: { token: "111", boot_session_uuid: "AAAAAAAA-0000-4000-8000-000000000001" },
+        bootSession: BOOT_SESSION,
+        ...settleFast,
+      });
+      expect(res.supersededEnableRelease?.disposition).toBe("already-gone");
+      expect(res.supersededEnableRelease?.reason).toMatch(/could not be released/);
+      expect(res.supersededEnableRelease?.reason).toMatch(/Device busy/);
+    });
+
+    it("does NOT release its acquired reference when the acquire SUPERSEDED a live one (bystander uid)", async () => {
+      // FIX-ROUND F1. The failure path must never take pf's reference count to
+      // zero under a loaded anchor. The six-step shape, all of it reachable:
+      //
+      //   1. The host is already confining uid A under live token 111.
+      //   2. The operator adds uid B, so the registry re-arms the union.
+      //   3. The resolver's `pfctl -s info` hits a TRANSIENT failure (a slow
+      //      fork, EAGAIN under memory pressure, an execFile timeout), so the
+      //      verdict is `unknown` -- which re-acquires by design.
+      //   4. `-E` mints 222 and the superseded 111 is RELEASED (exit 0). 222 is
+      //      now the ONLY reference holding pf up.
+      //   5. The settle probe fails (uid B's rules never appear).
+      //   6. Releasing 222 here would DISABLE pf -- and uid A, which was
+      //      correctly confined and is not even the subject of this mutation,
+      //      would regain full loopback reach until the registry rollback's own
+      //      `-E`. That is a wrong-allow on a bystander.
+      //
+      // The reference is deliberately left ORPHANED instead: an extra pf enable
+      // reference over-enforces, is releasable, and is visible in
+      // `pfctl -s References`. That is this module's stated fail direction.
+      let infoCalls = 0;
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        {
+          match: (_c: string, a: readonly string[]) => a[0] === "-s" && a[1] === "info",
+          // Call 1 is the resolver's probe and fails transiently -> `unknown`.
+          // Every later call (post-acquire assertion, settle probe) succeeds.
+          get result(): PfCommandResult {
+            infoCalls += 1;
+            return infoCalls === 1
+              ? { code: 1, stdout: "", stderr: "pfctl: fork: Resource temporarily unavailable" }
+              : ok(PF_INFO_ENABLED);
+          },
+        } as ScriptedCall,
+        { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 222\n") },
+        referencesCall(ok(referenceTable(["111", "222"]))),
+        // The superseded release SUCCEEDS: 111 is really gone after this.
+        { match: (_c, a) => a[0] === "-X" && a[1] === "111", result: ok("") },
+        anchorRulesCall(ok(canonicalUnionPrint([A]))), // uid B missing -> never live
+        ifacesCall(ok(PF_IFACES_CLEAN)),
+      ]);
+      await expect(
+        armPfAnchorUnion(runner, [A, B], {
+          mainConfPath: "/dev/null",
+          existingEnableReference: { token: "111", boot_session_uuid: BOOT_SESSION_UUID },
+          bootSession: BOOT_SESSION,
+          settleConsecutive: 1,
+          settleDelayMs: 0,
+          settleTimeoutMs: 30,
+          sleep: async () => {},
+        }),
+      ).rejects.toThrow(/settle-probe timed out/);
+      // The superseded reference really was released, so 222 is load-bearing.
+      expect(runner.calls.some((c) => c[1] === "-X" && c[2] === "111")).toBe(true);
+      // THE ASSERTION: 222 is NOT given back. Releasing it would disable pf for
+      // every OTHER confined uid on this host.
+      expect(runner.calls.some((c) => c[1] === "-X" && c[2] === "222")).toBe(false);
+      expect(runner.calls.some((c) => c.includes("-F"))).toBe(false);
+    });
+
+    it("STILL releases its acquired reference when nothing live was superseded", async () => {
+      // The complement of the test above, so the F1 fix cannot be widened into
+      // "never release on failure". Here the recorded token is from a PREVIOUS
+      // boot, so the superseded release reports `already-gone` -- nothing that
+      // was holding pf up was destroyed, and the reference this call took is
+      // the one it added, so it must be given back.
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 333\n") },
+        referencesCall(ok(referenceTable(["333"]))),
+        { match: (_c, a) => a[0] === "-X" && a[1] === "111", result: { code: 1, stdout: "", stderr: "pfctl: pf: token invalid" } },
+        infoCall(ok(PF_INFO_ENABLED)),
+        anchorRulesCall(ok(canonicalUnionPrint([A]))), // uid B missing -> never live
+        ifacesCall(ok(PF_IFACES_CLEAN)),
+        { match: (_c, a) => a[0] === "-X" && a[1] === "333", result: ok("") },
+      ]);
+      await expect(
+        armPfAnchorUnion(runner, [A, B], {
+          mainConfPath: "/dev/null",
+          existingEnableReference: { token: "111", boot_session_uuid: "AAAAAAAA-0000-4000-8000-000000000001" },
+          bootSession: BOOT_SESSION,
+          settleConsecutive: 1,
+          settleDelayMs: 0,
+          settleTimeoutMs: 30,
+          sleep: async () => {},
+        }),
+      ).rejects.toThrow(/settle-probe timed out/);
+      expect(runner.calls.some((c) => c[1] === "-X" && c[2] === "333")).toBe(true);
+    });
+
     it("fails closed when pfctl -E exits 0 but prints no numeric token (gate finding)", async () => {
       const runner = scriptedRunner([
         { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
