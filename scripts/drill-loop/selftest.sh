@@ -572,13 +572,14 @@ LOCAL_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_local" 2>/de
 # actually runs as root.
 compose_wrapper() {
   "$HERE/build-wrapper.sh" --stdout \
-    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" '
+    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" '
         $0 == "wrapper_main \"$@\"" {
           print "RAILS_HOST_ALLOW_FP=\047" fp "\047"
           print "RAILS_HOST_DENY_FP=\047\047"
           print "RAILS_HOST_DENY=\047\047"
           print "RAILS_DISPOSABLE_BASE=\047" base "\047"
           print "RAILS_AGENT_ACCOUNT_ALLOW=\047" agents "\047"
+          print "RAILS_PRODUCT_GATE_HOME_BASE=\047" gatebase "\047"
         }
         { print }
       ' > "$1"
@@ -763,6 +764,56 @@ expect_accept 'fortress-state reports absence as absence' 'FORTRESS entry=exclus
 expect_reject 'gate-log refuses when there is no log to read' 'CANNOT be evaluated' \
   -- "$TEST_WRAPPER_AGENT" gate-log --run-id 'good1' --operator-account "$ME" \
      --agent-account "$ME" --agent-uid "$(id -u)"
+
+# --- gate-log reads OUTSIDE the fortress, so it lstats EVERY component ----
+#
+# The gate homes are not under `$STORAGE`, so `rails_assert_safe_subpath` (which
+# is anchored on a rail-approved root) cannot cover them, and
+# `rails_assert_trusted_dir_chain` is the wrong rail too: a gate home is
+# legitimately owned by the GATE SERVICE UID, not root. What is left is the
+# discipline both rails share, applied by hand: base, home, LOG DIR and file are
+# each lstat'd before the next is touched.
+#
+# The LOG DIR is the component that matters and the one a first pass at this verb
+# missed. `[ -L "$f" ]` lstats only the FINAL component, so a symlinked `logs/`
+# would be followed by the kernel and never looked at, which is exactly the
+# round-2 unchecked-intermediate exploit -- here it would let the gate uid make
+# ROOT `tail` an arbitrary file into the evidence bundle.
+GATEBASE="$SANDBOX/gate-homes"
+GATEHOME="$GATEBASE/sanctuary-gate-drill"
+mkdir -p "$GATEHOME/logs"
+printf 'peer=%s allowlist ok\n' "$(id -u)" > "$GATEHOME/logs/egress-gate-$(id -u).out.log"
+TEST_WRAPPER_GATE="$SANDBOX/test-wrapper-gate"
+compose_wrapper "$TEST_WRAPPER_GATE" "$ME" "$GATEBASE"
+expect_accept 'gate-log reads the log the PRODUCT writes' 'WRAPPER=OK verb=gate-log' \
+  -- "$TEST_WRAPPER_GATE" gate-log --run-id 'good1' --operator-account "$ME" \
+     --agent-account "$ME" --agent-uid "$(id -u)"
+expect_accept 'gate-log returns the gate log CONTENT' "peer=$(id -u) allowlist ok" \
+  -- "$TEST_WRAPPER_GATE" gate-log --run-id 'good1' --operator-account "$ME" \
+     --agent-account "$ME" --agent-uid "$(id -u)"
+# Now make the LOG DIR a symlink at a victim holding a secret. Root must refuse
+# rather than tail whatever the link points at.
+GATE_VICTIM="$SANDBOX/gate-log-victim"
+mkdir -p "$GATE_VICTIM"
+printf 'SECRET-OUTSIDE-THE-GATE-HOME\n' > "$GATE_VICTIM/egress-gate-$(id -u).out.log"
+rm -rf "${GATEHOME:?}/logs"
+ln -s "$GATE_VICTIM" "$GATEHOME/logs"
+expect_reject 'a SYMLINKED gate log directory is refused' 'log directory' \
+  -- "$TEST_WRAPPER_GATE" gate-log --run-id 'good1' --operator-account "$ME" \
+     --agent-account "$ME" --agent-uid "$(id -u)"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+gate_out="$("$TEST_WRAPPER_GATE" gate-log --run-id 'good1' --operator-account "$ME" \
+  --agent-account "$ME" --agent-uid "$(id -u)" 2>&1)"
+set -e
+case "$gate_out" in
+  *SECRET-OUTSIDE-THE-GATE-HOME*)
+    printf 'FAIL  *** root followed a symlinked log dir and printed a file outside the gate home ***\n'
+    FAIL=$((FAIL + 1)) ;;
+  *)
+    printf 'ok    the file behind the symlinked log dir was never read\n'
+    PASS=$((PASS + 1)) ;;
+esac
+rm -f "$GATEHOME/logs"
 # ...and the same account IS accepted once it is on the allowlist, so the rail
 # has been seen to say yes as well as no.
 expect_reject 'an allowlisted agent account passes the agent rail and dies later' 'kickstart failed for' \

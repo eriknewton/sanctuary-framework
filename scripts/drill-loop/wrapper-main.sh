@@ -614,7 +614,22 @@ wrapper_verb_fortress_state() {
 # the per-uid LOG FILE NAME, which does identify the agent uid exactly.
 wrapper_verb_gate_log() {
   wrapper_require_agent
-  local base="$RAILS_PRODUCT_GATE_HOME_BASE" home stream f found=0 rel target
+  # EVERY COMPONENT IS lstat'd, not just the final one.
+  #
+  # The gate homes live OUTSIDE `$STORAGE`, so they cannot go through
+  # `rails_assert_safe_subpath` (which is anchored on a rail-approved root), and
+  # `rails_assert_trusted_dir_chain` is the wrong rail too: a gate home is
+  # legitimately owned by the GATE SERVICE UID, not by root, so requiring
+  # root-or-self ownership would refuse every real one.
+  #
+  # What is left is the discipline both of those rails share, applied by hand
+  # and stated: base, home, LOG DIR and file are each lstat'd before the next is
+  # touched. The log dir matters as much as the others -- `[ -L "$f" ]` lstats
+  # only the FINAL component, so a symlinked `logs/` would be followed by the
+  # kernel and never looked at, which is precisely the round-2
+  # unchecked-intermediate exploit. Here it would let the gate uid make ROOT
+  # `tail` an arbitrary file into the evidence bundle.
+  local base="$RAILS_PRODUCT_GATE_HOME_BASE" home logdir stream f found=0 rel target
   if [ -L "$base" ]; then
     wrapper_die "the gate account home base is a symlink; refusing to follow it as root: $base"
   fi
@@ -624,8 +639,13 @@ wrapper_verb_gate_log() {
         wrapper_die "gate account home $home is a symlink; refusing to follow it as root"
       fi
       if [ ! -d "$home" ]; then continue; fi
+      logdir="$home/$RAILS_PRODUCT_GATE_LOG_DIR"
+      if [ -L "$logdir" ]; then
+        wrapper_die "gate log directory $logdir is a symlink; refusing to follow it as root"
+      fi
+      if [ ! -d "$logdir" ]; then continue; fi
       for stream in out err; do
-        f="$home/$RAILS_PRODUCT_GATE_LOG_DIR/egress-gate-$AGENT_UID.$stream.log"
+        f="$logdir/egress-gate-$AGENT_UID.$stream.log"
         if [ -L "$f" ]; then wrapper_die "gate log $f is a symlink; refusing to follow it as root"; fi
         if [ ! -f "$f" ]; then continue; fi
         found=$(( found + 1 ))
