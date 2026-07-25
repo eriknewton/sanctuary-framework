@@ -136,7 +136,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
       dnsRulePresent: true,
     })),
-    scrubProvisionedEgress: vi.fn(async () => undefined),
+    restoreProvisionedEgressToPreRunState: vi.fn(async () => ({ restored: true, reloadOk: true, problems: [] })),
     verifyAgentEgressAfterArm: vi.fn(async () => passingEgressReport()),
     auditEgress: vi.fn(async () => undefined),
     createAccount: vi.fn(async () => ({
@@ -963,7 +963,7 @@ describe("castle-wall/provision/orchestrate", () => {
           rule_ids: ["provisioned-hermes-abc123def456"],
         }),
       );
-      expect(ops.scrubProvisionedEgress).not.toHaveBeenCalled();
+      expect(ops.restoreProvisionedEgressToPreRunState).not.toHaveBeenCalled();
     });
 
     it("refuse-to-arm (fail-closed): provisionEgress ok:false aborts at 'provision-egress' BEFORE arm, scrubs any partial publish, and audits egress_provision_refused", async () => {
@@ -979,7 +979,7 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toMatchObject({ kind: "aborted", stage: "provision-egress", rolledBack: true });
       expect(ops.arm).not.toHaveBeenCalled();
       // A partial publish must never survive a refused run (no orphan grants).
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
       expect(ops.auditEgress).toHaveBeenCalledWith(
         "egress_provision_refused",
         expect.objectContaining({ stage: "provision-egress", disarm_outcome: "not-armed" }),
@@ -1015,13 +1015,13 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toMatchObject({
         kind: "egress-unprovisioned-rolled-back",
         uid: AGENT_UID,
-        scrubbed: true,
+        egressRestoredToPreRunState: true,
       });
       expect(ops.disarm).toHaveBeenCalledTimes(1);
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
       // Fast-disarm ordering: filter off BEFORE the rule scrub.
       const disarmOrder = (ops.disarm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-      const scrubOrder = (ops.scrubProvisionedEgress as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const scrubOrder = (ops.restoreProvisionedEgressToPreRunState as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       expect(disarmOrder).toBeLessThan(scrubOrder);
       expect(ops.auditEgress).toHaveBeenCalledWith(
         "egress_provision_refused",
@@ -1107,7 +1107,7 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "uid-existence-gate" });
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
     });
 
     it("a FAILED egress scrub on abort is surfaced LOUDLY in the reason, never silently swallowed", async () => {
@@ -1117,13 +1117,13 @@ describe("castle-wall/provision/orchestrate", () => {
           accountName: "sanctuary-hermes",
           reason: "account does not exist",
         })),
-        scrubProvisionedEgress: vi.fn(async () => {
+        restoreProvisionedEgressToPreRunState: vi.fn(async () => {
           throw new Error("EACCES: rules dir not writable");
         }),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       const reason = (result as { reason: string }).reason;
-      expect(reason).toMatch(/provisioned egress allow rules could NOT be scrubbed/);
+      expect(reason).toMatch(/egress allow rules could NOT be restored to their pre-run state/);
       expect(reason).toMatch(/EACCES: rules dir not writable/);
     });
 
@@ -1138,7 +1138,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon" });
       expect(ops.provisionEgress).not.toHaveBeenCalled();
-      expect(ops.scrubProvisionedEgress).not.toHaveBeenCalled();
+      expect(ops.restoreProvisionedEgressToPreRunState).not.toHaveBeenCalled();
     });
 
     it("the Tier-1 confirm plan-print names every egress grant BEFORE the confirm, with the exfil-risk marking on messaging hosts", async () => {
@@ -1178,7 +1178,88 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "armed-then-rolled-back", uid: AGENT_UID });
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * FIX F-REVOKE (Mini1 confined-Hermes drill 2026-07-26): the rollback is
+     * only allowed to read as clean when the pre-run rule state was OBSERVED
+     * back AND is being served. On hardware the operator got "the re-homed
+     * paths were restored to your account" while six signed allow rules a
+     * previous run had published were gone and the live agent could reach
+     * nothing.
+     */
+    describe("F-REVOKE: a rollback that did not restore the agent's grants says so loudly", () => {
+      it("REGRESSION: an unrestored rule set warns that a still-running agent may reach nothing, and names the recovery command", async () => {
+        const ops = happyPathOps({
+          checkUidExistence: vi.fn(async () => ({
+            ok: false as const,
+            accountName: "sanctuary-hermes",
+            reason: "account does not exist",
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: false,
+            reloadOk: false,
+            problems: ["provisioned-hermes-abc123def456 was not restored"],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        const reason = (result as { reason: string }).reason;
+        expect(reason).toMatch(/MAY NOW REACH NOTHING/);
+        expect(reason).toMatch(/sudo sanctuary protect --hermes/);
+        expect(reason).toMatch(/provisioned-hermes-abc123def456 was not restored/);
+      });
+
+      it("REGRESSION: rules back on disk but no confirmed reload is reported as not-yet-serving, with the reload command", async () => {
+        const ops = happyPathOps({
+          checkUidExistence: vi.fn(async () => ({
+            ok: false as const,
+            accountName: "sanctuary-hermes",
+            reason: "account does not exist",
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: true,
+            reloadOk: false,
+            problems: [],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        const reason = (result as { reason: string }).reason;
+        expect(reason).toMatch(/restored on disk but the policy daemon did NOT confirm/);
+        expect(reason).toMatch(/sanctuary castle-wall reload/);
+      });
+
+      it("REGRESSION: the post-arm outcome does NOT claim the pre-run rule state was restored when the reload was unconfirmed", async () => {
+        const ops = happyPathOps({
+          verifyAgentEgressAfterArm: vi.fn(async () => ({
+            ok: false,
+            rows: [
+              {
+                name: "LLM (Venice)",
+                host: "api.venice.ai",
+                port: 443,
+                expected: "reachable" as const,
+                observed: "blocked" as const,
+                pass: false,
+              },
+            ],
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: true,
+            reloadOk: false,
+            problems: [],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        expect(result).toMatchObject({
+          kind: "egress-unprovisioned-rolled-back",
+          egressRestoredToPreRunState: false,
+        });
+        expect(ops.auditEgress).toHaveBeenCalledWith(
+          "egress_provision_refused",
+          expect.objectContaining({ egress_rules_restored_to_pre_run_state: false }),
+        );
+      });
     });
   });
 

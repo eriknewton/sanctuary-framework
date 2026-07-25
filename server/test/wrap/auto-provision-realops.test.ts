@@ -33,7 +33,7 @@
  * per the re-gate spec's chokepoint requirement.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -48,6 +48,7 @@ import {
   disarmExitCodeDecision,
   hermesEndpointProbes,
   allHermesCredentialDestPaths,
+  resolveCredentialDestPathsToVerify,
   resolveWallFortressPath,
   resolveHarnessDaemonLogDir,
   hermesRuntimeRehomePaths,
@@ -1702,7 +1703,11 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
     expect(credTargets[0]!.name).toContain(".hermes/.env");
   });
 
-  it("FIX R6-5: with no explicit moved-list (alreadyDedicated path), it falls back to the full adapter set (the account is presumed complete)", () => {
+  // FIX F-ALREADYDEDICATED: this `undefined` branch is no longer reachable
+  // from production -- `resolveCredentialDestPathsToVerify` (covered below)
+  // supplies a MEASURED set on the alreadyDedicated path too. Kept as the
+  // defensive last resort for a caller with no knowledge at all.
+  it("with no explicit list at all (defensive last resort, not a production path), it falls back to the full adapter set", () => {
     const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502);
     const credTargets = targets.filter((t) => t.name.includes("moved credential"));
     expect(credTargets).toHaveLength(6);
@@ -1715,6 +1720,122 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
     const guard = targets.find((t) => t.name.includes("nothing to confine"));
     expect(guard).toBeDefined();
     expect(await guard!.probe()).toBe(false);
+  });
+});
+
+/**
+ * FIX F-ALREADYDEDICATED (HIGH, Mini1 confined-Hermes drill 2026-07-26).
+ *
+ * On hardware the FIRST `protect --hermes` armed, and every SECOND and later
+ * run refused at verify-before-arm on `.hermes/auth.json`,
+ * `.google_workspace_mcp/credentials`, `.workspace-mcp/cli-tokens` and
+ * `.hermes/google-mcp-creds` -- four files a Hermes install with no Google
+ * Workspace MCP and no OAuth login has never had. Cause: the alreadyDedicated
+ * path skips re-home, left the moved-set `undefined`, and fell back to the
+ * full static adapter list. That is what made the exclusive-egress gate
+ * unarmable (and therefore what left drills P5 and #994 unmeasured).
+ *
+ * The fix does NOT widen the check: it recovers "what was actually moved" by
+ * OBSERVING the account, so a present-but-unreadable credential still fails
+ * and an account with nothing on it still refuses.
+ */
+describe("wrap/auto-provision: credential set to verify on the alreadyDedicated path (fix F-ALREADYDEDICATED)", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "sanctuary-alreadydedicated-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const realExistsNoFollow = async (p: string): Promise<boolean> => {
+    try {
+      await lstat(p);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+  };
+
+  it("REGRESSION: with no moved set (re-home did not run), the verified set is OBSERVED from the account -- credentials the install never had are never probed", async () => {
+    // The exact drill install: .env + config.yaml present, no OAuth/Google MCP.
+    await mkdir(join(dir, ".hermes"), { recursive: true });
+    await writeFile(join(dir, ".hermes", ".env"), "X=1\n");
+    await writeFile(join(dir, ".hermes", "config.yaml"), "a: 1\n");
+
+    const resolved = await resolveCredentialDestPathsToVerify({
+      movedThisRun: undefined,
+      newAccountHome: dir,
+      existsNoFollow: realExistsNoFollow,
+    });
+
+    expect(resolved.sort()).toEqual([".hermes/.env", ".hermes/config.yaml"]);
+    // The four the pre-fix static fallback demanded, and the install never had.
+    expect(resolved).not.toContain(".hermes/auth.json");
+    expect(resolved).not.toContain(".google_workspace_mcp/credentials");
+    expect(resolved).not.toContain(".workspace-mcp/cli-tokens");
+    expect(resolved).not.toContain(".hermes/google-mcp-creds");
+  });
+
+  it("REGRESSION: the resulting probe list lets a partial install arm -- only the observed credentials are probed", async () => {
+    await mkdir(join(dir, ".hermes"), { recursive: true });
+    await writeFile(join(dir, ".hermes", ".env"), "X=1\n");
+    const resolved = await resolveCredentialDestPathsToVerify({
+      movedThisRun: undefined,
+      newAccountHome: dir,
+      existsNoFollow: realExistsNoFollow,
+    });
+    const credTargets = hermesEndpointProbes(dir, 502, 502, resolved).filter((t) =>
+      t.name.includes("moved credential"),
+    );
+    expect(credTargets).toHaveLength(1);
+    expect(credTargets[0]!.name).toContain(".hermes/.env");
+  });
+
+  it("does NOT widen into a fail-open: an account with no credential at all returns [], which the R7-2 guard turns into a refusal", async () => {
+    const resolved = await resolveCredentialDestPathsToVerify({
+      movedThisRun: undefined,
+      newAccountHome: dir,
+      existsNoFollow: realExistsNoFollow,
+    });
+    expect(resolved).toEqual([]);
+    const guard = hermesEndpointProbes(dir, 502, 502, resolved).find((t) =>
+      t.name.includes("nothing to confine"),
+    );
+    expect(guard).toBeDefined();
+    expect(await guard!.probe()).toBe(false);
+  });
+
+  it("a DANGLING symlink at a credential path counts as present and is probed (fail-closed), never dropped from the verified set", async () => {
+    await mkdir(join(dir, ".hermes"), { recursive: true });
+    await symlink(join(dir, ".hermes", "gone"), join(dir, ".hermes", ".env"));
+    const resolved = await resolveCredentialDestPathsToVerify({
+      movedThisRun: undefined,
+      newAccountHome: dir,
+      existsNoFollow: realExistsNoFollow,
+    });
+    expect(resolved).toEqual([".hermes/.env"]);
+  });
+
+  it("the FRESH path is untouched: an explicit moved set passes through unchanged, including the empty set", async () => {
+    await mkdir(join(dir, ".hermes"), { recursive: true });
+    await writeFile(join(dir, ".hermes", "auth.json"), "{}\n");
+    // The account holds auth.json, but re-home says only .env moved: the moved
+    // set wins, because on the fresh path it is the stronger fact.
+    expect(
+      await resolveCredentialDestPathsToVerify({
+        movedThisRun: [".hermes/.env"],
+        newAccountHome: dir,
+        existsNoFollow: realExistsNoFollow,
+      }),
+    ).toEqual([".hermes/.env"]);
+    expect(
+      await resolveCredentialDestPathsToVerify({
+        movedThisRun: [],
+        newAccountHome: dir,
+        existsNoFollow: realExistsNoFollow,
+      }),
+    ).toEqual([]);
   });
 });
 

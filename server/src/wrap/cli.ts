@@ -2029,13 +2029,17 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
       // Confined-agent egress (design section 5): the wall armed but the
       // post-arm AS-UID egress verification failed (an endpoint unreachable
       // as the agent uid, or the negative control reachable), so the flow
-      // fast-disarmed and scrubbed the provisioned rules rather than leave a
-      // confined-into-silence agent or an unverified grant. Honest framing:
-      // the per-endpoint PASS/FAIL table was already printed by the flow.
+      // fast-disarmed and put the provisioned rules back to their pre-run state
+      // rather than leave a confined-into-silence agent or an unverified grant.
+      // Honest framing: the per-endpoint PASS/FAIL table was already printed by
+      // the flow. FIX F-REVOKE: the claim is "restored to their pre-run state",
+      // which on a first run means removed and on a re-run means a previous
+      // run's grants survived -- the old "were scrubbed" wording asserted
+      // removal on both, and on a re-run that was the agent-strangling case.
       return [
         `  Note: Castle Wall armed, then was fast-disarmed because the as-agent-uid egress verification failed ` +
           `(${outcome.reason}). The agent still runs under its dedicated, re-homed account; only enforcement came down` +
-          `${outcome.scrubbed ? " and the provisioned egress rules were scrubbed" : ""}. ` +
+          `${outcome.egressRestoredToPreRunState ? " and the provisioned egress rules were restored to their pre-run state" : ""}. ` +
           `Re-run 'sanctuary protect --hermes' once the per-endpoint failures above are resolved.`,
       ];
     case "armed-exclusive":

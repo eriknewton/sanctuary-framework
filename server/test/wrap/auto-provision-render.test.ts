@@ -63,35 +63,38 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/connectivity re-check passes/);
   });
 
-  it("egress-unprovisioned-rolled-back -> honest Note frame: fast-disarmed, agent stays re-homed, scrub state surfaced, retry guidance", () => {
+  it("egress-unprovisioned-rolled-back -> honest Note frame: fast-disarmed, agent stays re-homed, egress-restore state surfaced, retry guidance", () => {
     const out = lines({
       ran: true,
       outcome: {
         kind: "egress-unprovisioned-rolled-back",
         uid: 503,
         reason: "post-arm as-uid egress verification failed for: LLM (Venice). Fast-disarmed rather than leave a bricked-or-unconfined agent.",
-        scrubbed: true,
+        egressRestoredToPreRunState: true,
       },
     });
     expect(out).toHaveLength(1);
     expect(out[0]).toMatch(/fast-disarmed/i);
     expect(out[0]).toMatch(/as-agent-uid egress verification failed/);
-    expect(out[0]).toMatch(/provisioned egress rules were scrubbed/);
+    // FIX F-REVOKE: the claim is "restored to their pre-run state", not
+    // "scrubbed" -- on a re-run the pre-run state includes a previous run's
+    // live grants, and asserting removal there was the agent-strangling case.
+    expect(out[0]).toMatch(/provisioned egress rules were restored to their pre-run state/);
     expect(out[0]).toMatch(/still runs under its dedicated, re-homed account/);
     expect(out[0]).toMatch(/Re-run 'sanctuary protect --hermes'/);
   });
 
-  it("egress-unprovisioned-rolled-back with scrubbed:false does NOT claim the rules were scrubbed", () => {
+  it("egress-unprovisioned-rolled-back with egressRestoredToPreRunState:false does NOT claim the pre-run rule state was restored", () => {
     const out = lines({
       ran: true,
       outcome: {
         kind: "egress-unprovisioned-rolled-back",
         uid: 503,
         reason: "post-arm as-uid egress verification failed for: negative control.",
-        scrubbed: false,
+        egressRestoredToPreRunState: false,
       },
     });
-    expect(out[0]).not.toMatch(/were scrubbed/);
+    expect(out[0]).not.toMatch(/were restored to their pre-run state/);
   });
 
   it("armed-rollback-failed -> LOUDEST manual-disarm guidance", () => {

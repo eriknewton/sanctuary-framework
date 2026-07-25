@@ -2128,7 +2128,7 @@ export async function runSafeModeDaemon(
     );
     const { deriveGateAccountName } = await import("../egress-gate/index.js");
     const { loadExclusiveRoutingMarker } = await import("../castle-wall/allowlist/routing-marker.js");
-    const { deriveAgentAccountName, resolveHermesGatewayArgv } = await import(
+    const { deriveAgentAccountName, resolveHermesGatewayArgv, realHarnessArgvOps } = await import(
       "../castle-wall/provision/index.js"
     );
     exclusiveEgressSupervisor = await startExclusiveEgressBootSupervisor({
@@ -2151,16 +2151,13 @@ export async function runSafeModeDaemon(
         const agentHome = `/var/sanctuary-agents/${accountName}`;
         const gateAccount = deriveGateAccountName(marker.agent_id);
         const gateHomeDirectory = `/var/sanctuary-agents/${gateAccount}`;
-        const { access } = await import("node:fs/promises");
-        const pathExists = async (p: string): Promise<boolean> => {
-          try {
-            await access(p);
-            return true;
-          } catch {
-            return false;
-          }
-        };
-        const resolved = await resolveHermesGatewayArgv({ pathExists }, { agentHome });
+        // FIX F-INTERP: one shared production probe set (never a hand-rolled
+        // `pathExists` here), and the argv is resolved for the AGENT uid the
+        // boot release will actually run the harness as.
+        const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
+          agentHome,
+          agentUid: marker.agent_uid,
+        });
         return {
           kind: "ok" as const,
           agentAccount: accountName,

@@ -299,6 +299,9 @@ export type ClaimSiteId =
   | "provision-unprovision.scrub-ok"
   | "provision-unprovision.restore-rehome-ok"
   | "provision-unprovision.fully-ok"
+  // --- castle-wall/provision (FIX F-REVOKE + F-INTERP, 2026-07-26) ---
+  | "provision-egress.restore-reload-ok"
+  | "provision-harness-argv.path-exists"
   // --- wrap/cli.ts (THE RENDER LAYER -- had zero rows before fix-round 4) ---
   | "wrap-cli.degrade-agent-state";
 
@@ -1608,13 +1611,19 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "provision-orchestrate.rules-scrubbed": {
     file: `${CW}/orchestrate.ts`,
     symbol: "runProvisionFlowSteps",
-    claim: "the provisioned egress rules were scrubbed",
+    // FIX F-REVOKE (2026-07-26): the claim used to be "the provisioned egress
+    // rules were scrubbed", which asserted REMOVAL on both branches. On a
+    // second `protect` run the rules being removed were a PREVIOUS run's live
+    // grants, so the true claim is now about restoration to the pre-run
+    // capture, and it is observed by a byte-for-byte read-back plus a
+    // confirmed daemon reload.
+    claim: "the provisioned egress rules were restored to their pre-run state and are being served",
     basis: "observed",
     layer: "compute",
     branches: "boolean",
     negativeBranch: {
       claim:
-        "the provisioned rules were NOT scrubbed; the outcome carries the manual-recovery note",
+        "the pre-run rule state was NOT restored (or the reload was not confirmed); the outcome carries the manual-recovery note",
       basis: "observed",
     },
   },
@@ -1710,6 +1719,33 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     branches: "single",
     detectorBlind: true,
   },
+  // FIX F-REVOKE (2026-07-26): the two new literals the drill's third finding
+  // introduced, classified rather than counted away.
+  "provision-egress.restore-reload-ok": {
+    file: `${CW}/egress.ts`,
+    symbol: "restoreProvisionedEgressRules",
+    claim: "the restored pre-run rule set is being served by the running policy daemon",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim:
+        "the reload was requested and did NOT confirm (or threw); the rules are on disk but may not be serving",
+      basis: "observed",
+    },
+  },
+  "provision-harness-argv.path-exists": {
+    file: `${CW}/harness-argv.ts`,
+    symbol: "realHarnessArgvOps",
+    claim: "the path is present and accessible to THIS process",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim: "the path could not be accessed by this process",
+      basis: "observed",
+    },
+  },
   "provision-unprovision.fully-ok": {
     file: `${CW}/unprovision.ts`,
     symbol: "unprovisionFullyOk",
@@ -1754,10 +1790,10 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
 export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/account.ts`]: 1,
   [`${CW}/detect.ts`]: 0,
-  [`${CW}/egress.ts`]: 4,
+  [`${CW}/egress.ts`]: 5,
   [`${CW}/exclusive-arm.ts`]: 3,
   [`${CW}/exclusive-unprotect.ts`]: 4,
-  [`${CW}/harness-argv.ts`]: 0,
+  [`${CW}/harness-argv.ts`]: 1,
   [`${CW}/index.ts`]: 0,
   [`${CW}/lockfile.ts`]: 0,
   [`${CW}/orchestrate.ts`]: 9,
