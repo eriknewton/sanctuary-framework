@@ -247,6 +247,41 @@ describe("castle-wall/provision/harness-argv", () => {
 // private tmpdir), because the defect lives entirely in the child-process
 // primitive and a mocked child would prove nothing.
 // ---------------------------------------------------------------------------
+/** `kill(pid, 0)`: alive (or alive-but-not-ours) vs. definitively gone. */
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Poll until `pid` is gone, so a slow box reads as slow rather than as a failure. */
+async function expectDead(pid: number, withinMs: number): Promise<void> {
+  const deadline = Date.now() + withinMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return;
+    await delay(25);
+  }
+  expect(isAlive(pid), `pid ${pid} survived the probe deadline (F-PROBE-PGROUP-ESCAPE)`).toBe(false);
+}
+
+/**
+ * Best-effort cleanup so a FAILING run (which is exactly the mutation run) does
+ * not leak a spinning shell into CI. Signals the pid only, never `-pid`: the
+ * recorded pid is not necessarily a group leader, and signalling a group id we
+ * did not create is how a test starts killing unrelated processes.
+ */
+function reap(pid: number | undefined): void {
+  if (pid === undefined || !Number.isSafeInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Already gone.
+  }
+}
+
 describe("runInterpreterProbeBounded (hard deadline, process-group kill)", () => {
   it("settles at the deadline even when the child IGNORES SIGTERM (the reviewer's reproduction)", async () => {
     const timeoutMs = 300;
@@ -301,6 +336,113 @@ describe("runInterpreterProbeBounded (hard deadline, process-group kill)", () =>
       rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it("kills a same-group descendant even when the direct child EXITS first (F-PROBE-PGROUP-ESCAPE)", async () => {
+    // THE UNTESTED MIDDLE the re-review found. The test above keeps the direct
+    // child ALIVE, so the pre-fix `exited` gate never engaged. Here the direct
+    // child forks a descendant into the SAME process group (a plain `&` in a
+    // non-interactive shell does not change process group), hands it the
+    // inherited stdout pipe, and EXITS IMMEDIATELY. Pre-fix, `child.on("exit")`
+    // set `exited = true`, the deadline declined to send `kill(-pid)` at all,
+    // and the descendant ran on past the bound.
+    const dir = mkdtempSync(join(tmpdir(), "probe-pgroup-escape-"));
+    let escapee: number | undefined;
+    try {
+      const marker = join(dir, "descendant.log");
+      const pidFile = join(dir, "descendant.pid");
+      const script = join(dir, "exit-and-leave-a-descendant.sh");
+      writeFileSync(
+        script,
+        [
+          "#!/bin/sh",
+          `( while true; do echo tick >> ${marker}; sleep 0.05; done ) &`,
+          `echo $! > ${pidFile}`,
+          "echo 3.11",
+          "exit 0",
+        ].join("\n"),
+      );
+      chmodSync(script, 0o755);
+
+      const timeoutMs = 400;
+      const started = Date.now();
+      const result = await runInterpreterProbeBounded({ file: "/bin/sh", args: [script] }, timeoutMs);
+      const elapsed = Date.now() - started;
+
+      // Fail-closed, and bounded: `close` never fires (the descendant holds the
+      // stdout pipe), so this is the deadline path even though the direct child
+      // exited in single-digit milliseconds.
+      expect(result).toBeUndefined();
+      expect(elapsed).toBeGreaterThanOrEqual(timeoutMs - 50);
+      expect(elapsed).toBeLessThan(timeoutMs + 2_000);
+
+      escapee = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+      expect(Number.isSafeInteger(escapee)).toBe(true);
+      expect(escapee).toBeGreaterThan(0);
+      // Sanity: the descendant really did run, so a pass below cannot be a
+      // never-started false negative.
+      expect(existsSync(marker) ? readFileSync(marker, "utf8").length : 0).toBeGreaterThan(0);
+
+      // THE ASSERTION. The descendant must be gone. Polled rather than sampled
+      // once, so a slow CI box reads as slow, not as a failure.
+      await expectDead(escapee, 5_000);
+    } finally {
+      reap(escapee);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("still settles at the deadline when a descendant ESCAPES the group via setsid (documented scope)", async () => {
+    // A descendant that calls `setsid(2)` before the deadline leaves the
+    // process group, so process-group kill cannot reach it -- documented in
+    // `runInterpreterProbeBounded` as out of scope for CLEANUP, because the
+    // probe already runs as the agent's own uid and agent-uid code can spawn a
+    // survivor without going near this probe. What must NOT degrade is the
+    // CALLER's bound: the escapee holds the inherited stdout pipe open, so
+    // `close` never fires, and the deadline must still settle and still drop
+    // our handles. This test pins that.
+    const dir = mkdtempSync(join(tmpdir(), "probe-setsid-escape-"));
+    let escapee: number | undefined;
+    try {
+      const pidFile = join(dir, "escapee.pid");
+      const script = join(dir, "escape.cjs");
+      writeFileSync(
+        script,
+        [
+          'const { spawn } = require("node:child_process");',
+          'const { writeFileSync } = require("node:fs");',
+          // `detached: true` is Node's setsid: a NEW session and process group.
+          // `stdio` fd 1 hands it OUR inherited stdout pipe, so the pipe stays
+          // open after this process exits.
+          'const child = spawn(process.execPath, ["-e", "setTimeout(() => undefined, 30000)"], {',
+          "  detached: true,",
+          '  stdio: ["ignore", 1, "ignore"],',
+          "});",
+          `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+          "child.unref();",
+          'console.log("3.11");',
+        ].join("\n"),
+      );
+
+      const timeoutMs = 500;
+      const started = Date.now();
+      const result = await runInterpreterProbeBounded({ file: process.execPath, args: [script] }, timeoutMs);
+      const elapsed = Date.now() - started;
+
+      expect(result).toBeUndefined();
+      // `>=` proves this really is the DEADLINE path: the escaped descendant is
+      // holding the pipe, so `close` cannot have fired early and made the test
+      // pass without exercising the cleanup at all.
+      expect(elapsed).toBeGreaterThanOrEqual(timeoutMs - 50);
+      expect(elapsed).toBeLessThan(timeoutMs + 3_000);
+
+      escapee = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+      expect(Number.isSafeInteger(escapee)).toBe(true);
+      expect(escapee).toBeGreaterThan(0);
+    } finally {
+      reap(escapee);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("returns the child's stdout on a clean exit, and undefined on a non-zero exit", async () => {
     await expect(

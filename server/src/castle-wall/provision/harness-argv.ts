@@ -339,7 +339,7 @@ const INTERPRETER_PROBE_STDOUT_CAP = 4096;
  * root boot supervisor's argv resolution, instead of failing closed to a
  * parked agent.
  *
- * Three properties, all deliberate:
+ * Four properties, all deliberate:
  *
  *  1. HARD DEADLINE. The returned promise settles at the deadline, whatever
  *     the child does. It is a race between "child closed" and "deadline", NOT
@@ -350,10 +350,56 @@ const INTERPRETER_PROBE_STDOUT_CAP = 4096;
  *     interpreter running (and holding the inherited stdout pipe). `detached:
  *     true` puts the child in its own process group and the timeout kills the
  *     GROUP (`kill(-pid)`), which reaches sudo's descendants.
+ *  4. HANDLE RELEASE. The deadline also destroys our end of the inherited
+ *     stdout pipe and `unref`s the child handle, so nothing the probe leaves
+ *     behind can hold the provisioning process's event loop open past the
+ *     bound.
  *
- * Exported for the regression test, which drives a real `SIGTERM`-ignoring
- * `/bin/sh` (no sudo, no host mutation) and asserts settlement near the
- * deadline rather than after external cleanup.
+ * FIX F-PROBE-PGROUP-ESCAPE (Codex re-review, HIGH, 2026-07-26). Property 3
+ * was gated on a `child.on("exit")` flag: if the direct child had exited, the
+ * deadline skipped `kill(-pid)` entirely. That flag is the DIRECT CHILD's
+ * exit and says NOTHING about the process group. A hostile interpreter forks a
+ * descendant into the same group (which inherits the stdout pipe) and exits
+ * immediately; `exit` fires, the deadline declines to signal, and the
+ * descendant runs on. The reviewer reproduced it standalone: the promise
+ * settled at the 300ms deadline but the forked descendant was still alive and
+ * still writing afterwards. The gate is now `close`, and the difference is the
+ * whole fix:
+ *
+ *   - `exit`  = the direct child was reaped. Says nothing about the group.
+ *   - `close` = every writer of the inherited stdout pipe is gone.
+ *
+ * `close` is also what makes the group id safe to signal. A pid is not recycled
+ * while it is still in use as the id of a NON-EMPTY process group (Linux holds
+ * the `struct pid` for `PIDTYPE_PGID`; XNU's pid allocator skips pids that
+ * `pgfind()` resolves). So "a descendant still holds the pipe" implies "the
+ * group is non-empty" implies "`-pid` still addresses OUR group". Conversely,
+ * once `close` has fired we do not signal at all -- not because the group is
+ * PROVEN empty (a descendant could close its own stdout and stay alive), but
+ * because a probe that closed cleanly is the normal path and an
+ * already-detached-from-our-pipe survivor is the same out-of-scope case as the
+ * session escapee below, for the same reason. Residual, documented rather than
+ * eliminated: a descendant that has already left the group while holding the
+ * pipe could leave the group empty, and a pid-space wraparound inside one probe
+ * deadline could then point `-pid` at an unrelated group.
+ *
+ * SCOPE OF THE KILL, STATED HONESTLY. Process-group kill reaches same-group
+ * descendants. It cannot reach a descendant that calls `setsid(2)` (or is
+ * spawned `detached`) before the deadline, because that descendant is no longer
+ * in the group; POSIX offers no portable handle on it, and macOS has no cgroup
+ * or pid-namespace equivalent to bound it with. That case is deliberately OUT
+ * OF SCOPE for cleanup, and it costs no security property: the probe already
+ * runs as the AGENT's own uid, so agent-uid code that wants a surviving process
+ * can simply spawn one without going near this probe. The property this
+ * function must hold, and does hold in that case, is the CALLER's bound: the
+ * promise still settles at the deadline and we still drop every handle, so a
+ * session-escaping descendant cannot hang `protect` or the root boot
+ * supervisor. It survives; it does not stall us, and it gains nothing.
+ *
+ * Exported for the regression tests, which drive real processes (`/bin/sh` and
+ * `node`, no sudo, nothing outside a private tmpdir): a `SIGTERM`-ignoring
+ * child, a same-group descendant whose parent exits immediately, and a
+ * session-escaping descendant.
  */
 export async function runInterpreterProbeBounded(
   argv: { file: string; args: string[] },
@@ -376,22 +422,23 @@ export async function runInterpreterProbeBounded(
 
     let settled = false;
     let stdout = "";
-    // Set on `exit` (which fires BEFORE `close`, and before the pid can be
-    // recycled). Without it, a child that exits in the same turn the deadline
-    // fires could have its pid reused and `kill(-pid)` would signal an
-    // unrelated process group.
-    let exited = false;
+    // `close`, NOT `exit`. `close` means every writer of the inherited stdout
+    // pipe is gone, which is the only evidence available here that the process
+    // group is empty. `exit` is the direct child only, and gating the kill on
+    // it was F-PROBE-PGROUP-ESCAPE (see the doc comment).
+    let closed = false;
 
     // THE BOUND. Created before the handlers below and deliberately NOT
     // `unref`ed: an unref'd deadline could be skipped if every other handle
     // went away, which is the one thing this function must never do. Its
-    // callback runs asynchronously, so referring to `settle`/`killGroup`
+    // callback runs asynchronously, so referring to `settle`/`abandon`
     // (declared just below) is safe.
     const timer = setTimeout(() => {
-      // Settle FIRST, then kill: the caller is bounded even if the kill itself
-      // fails (an unkillable/uninterruptible child must not extend the bound).
+      // Settle FIRST, then clean up: the caller is bounded even if the cleanup
+      // itself fails (an unkillable/uninterruptible child must not extend the
+      // bound).
       settle(undefined);
-      killGroup();
+      abandon();
     }, timeoutMs);
 
     const settle = (value: string | undefined): void => {
@@ -401,10 +448,36 @@ export async function runInterpreterProbeBounded(
       resolve(value);
     };
 
-    /** Kill the whole group; fall back to the direct child if the group is gone. */
-    const killGroup = (): void => {
+    /**
+     * Deadline cleanup: drop OUR handles on the probe, then `SIGKILL` its
+     * process group. In that order, because the handle release is the half that
+     * protects THIS process and must happen even if the kill throws.
+     */
+    const abandon = (): void => {
+      // (1) Stop a surviving descendant from holding this process open through
+      //     the stdout pipe it inherited, and stop the child handle itself from
+      //     keeping the event loop ref'd.
+      const out = child.stdout;
+      if (out !== null && out !== undefined) {
+        out.removeAllListeners("data");
+        try {
+          out.destroy();
+        } catch {
+          // Already torn down; nothing to release.
+        }
+      }
+      try {
+        child.unref();
+      } catch {
+        // Already reaped; nothing to unref.
+      }
+
+      // (2) Kill the GROUP. Skipped only when `close` has fired, i.e. when no
+      //     writer of the pipe is left and there is nothing to kill; see the
+      //     doc comment for why that, and not `exit`, is the safe gate.
+      if (closed) return;
       const pid = child.pid;
-      if (exited || pid === undefined) return;
+      if (pid === undefined) return;
       try {
         process.kill(-pid, "SIGKILL");
       } catch {
@@ -424,13 +497,12 @@ export async function runInterpreterProbeBounded(
     });
     child.stdout?.on("error", () => undefined);
     child.on("error", () => {
-      exited = true;
+      // A spawn failure has no process and no group; settling clears the
+      // deadline, so `abandon` never runs and never signals a stale pid.
       settle(undefined);
     });
-    child.on("exit", () => {
-      exited = true;
-    });
     child.on("close", (code, signal) => {
+      closed = true;
       settle(code === 0 && signal === null ? stdout : undefined);
     });
   });

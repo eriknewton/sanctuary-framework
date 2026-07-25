@@ -28,6 +28,15 @@
  * MUTATION-CHECKED: point any consumer at `planAgentHarnessDaemonInstall` /
  * `renderAgentHarnessDaemonPlist`, or drop `harnessLaunch` from a planner call,
  * and this file goes red.
+ *
+ * FIX (Codex re-review, 2026-07-26): the first guard matched CALLEE TEXT only,
+ * so `import { renderAgentHarnessDaemonPlist as render }` and then `render(...)`
+ * walked straight past it -- and both low-level entry points are still exported
+ * from the `egress-gate` barrel, so that import is one line away. The guard now
+ * matches on the BOUND NAME (`import { X as y }`, `const { X: y } = ...`), not
+ * on how the local alias is spelled at the call site, which is what makes the
+ * "mutation-checked" claim above actually true. A consumer cannot call these
+ * without naming them at a binding site.
  */
 
 import { describe, it, expect } from "vitest";
@@ -104,6 +113,36 @@ function calleeName(node: ts.CallExpression): string | undefined {
   return undefined;
 }
 
+/**
+ * Every place a split entry point is BOUND to a local name, whatever that local
+ * name is: `import { X }`, `import { X as y }`, `const { X } = ...`, and
+ * `const { X: y } = await import(...)`. Matching the bound name rather than the
+ * call-site spelling is what closes the alias bypass -- you cannot call one of
+ * these without naming it here first (a namespace access such as
+ * `egressGate.X(...)` is still caught by the callee scan below).
+ */
+function splitEntryPointBindings(source: ts.SourceFile): { name: string; node: ts.Node }[] {
+  const found: { name: string; node: ts.Node }[] = [];
+  const record = (imported: ts.Identifier | undefined, node: ts.Node): void => {
+    if (imported === undefined) return;
+    if ((SPLIT_ARGV_ENV_ENTRY_POINTS as readonly string[]).includes(imported.text)) {
+      found.push({ name: imported.text, node });
+    }
+  };
+  const walk = (node: ts.Node): void => {
+    if (ts.isImportSpecifier(node)) {
+      // `propertyName` is set only for `X as y`; otherwise the name IS the import.
+      record(node.propertyName ?? node.name, node);
+    } else if (ts.isBindingElement(node)) {
+      const key = node.propertyName ?? node.name;
+      if (ts.isIdentifier(key)) record(key, node);
+    }
+    ts.forEachChild(node, walk);
+  };
+  ts.forEachChild(source, walk);
+  return found;
+}
+
 function forEachCall(source: ts.SourceFile, visit: (call: ts.CallExpression) => void): void {
   const walk = (node: ts.Node): void => {
     if (ts.isCallExpression(node)) visit(node);
@@ -124,6 +163,9 @@ describe("F-HARNESSENV: the harness-plist writers cannot separate argv from envi
       if ((LAUNCH_SPLIT_ALLOWED as readonly string[]).includes(file)) continue;
       scanned += 1;
       const source = parse(file);
+      for (const binding of splitEntryPointBindings(source)) {
+        offenders.push(`${file}:${line(source, binding.node)} binds ${binding.name}`);
+      }
       forEachCall(source, (call) => {
         const name = calleeName(call);
         if (name !== undefined && (SPLIT_ARGV_ENV_ENTRY_POINTS as readonly string[]).includes(name)) {
