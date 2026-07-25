@@ -113,16 +113,70 @@ RAILS_SYSTEM_BIN_DIRS='/usr/bin /bin /usr/sbin /sbin'
 # cannot contain a slash, and the wrapper composes the path from it.
 RAILS_RUN_ID_MAX=64
 
-# Hosts that may NEVER run the privileged wrapper, checked BEFORE the allowlist
-# and not overridable by any argument. Erik's MacBook Air is his daily driver.
-# Normalized form: lowercase, domain suffix stripped.
-RAILS_HOST_DENY='eriks-macbook-air eriksmacbookair erik-macbook-air erikmbp'
+# ###########################################################################
+# HOST IDENTITY IS A HARDWARE FINGERPRINT, NOT A NAME.
+#
+# A live audit of the real machines (2026-07-25) killed the name-based
+# allowlist outright:
+#
+#   Mini1, the intended drill host:  hostname -s = "Mac"
+#                                    scutil HostName = UNSET
+#                                    scutil LocalHostName = Agents-Mac-mini
+#                                    scutil ComputerName  = Agent's Mac mini
+#   MBA, which must NEVER run it:    hostname -s = Eriks-MacBook-Air
+#
+# Two things follow, and both are fatal to the old design:
+#
+#   1. Allowing Mini1 by `hostname -s` means putting the literal string "Mac"
+#      on the allowlist. A large fraction of default-configured Macs answer
+#      exactly that. An allowlist containing "Mac" is close to no allowlist at
+#      all: it silently converts "fail closed on an unknown host" into "pass on
+#      many unknown hosts". There is no version of that which is safe to ship.
+#   2. `scutil --get HostName` is unset on Mini1, so any branch that leans on
+#      it gets an empty string there. An empty identity must be a REJECT, never
+#      a skip and never a non-match that reads as "well, it isn't the MacBook".
+#
+# And a name is forgeable anyway: BLOCKER 2 was a planted `hostname` on PATH
+# producing WRAPPER=ACCEPT on the MacBook Air. A check whose input an attacker
+# can write is not a check.
+#
+# So the DECISION is made on the machine's hardware UUID (IOPlatformUUID, read
+# from ioreg by absolute path), and the allowlist and the denylist live in the
+# SAME identifier space. A denylist keyed on names beside an allowlist keyed on
+# hardware would silently stop matching, which is the single worst bug this
+# file can have.
+#
+# What is stored here is the SHA-256 of the UUID, not the UUID. This is a
+# public repository; a fingerprint compares exactly, carries no raw machine
+# identifier, and is not reversible into one.
+# ###########################################################################
 
-# The only hosts that may run it. Compiled in, fail closed on anything else.
-# `agents-mac-mini` is Mini1. `mini2` is provisional: if Mini2's local short
-# hostname turns out to differ, the wrapper will refuse there until this list
-# is edited and re-reviewed. Refusing is the correct failure mode.
-RAILS_HOST_ALLOW='agents-mac-mini mini2'
+# Machines that may NEVER run the privileged wrapper. Checked BEFORE the
+# allowlist, in the same space as the allowlist, not overridable by anything.
+# Currently: Erik's MacBook Air, his daily driver. MEASURED, not guessed.
+RAILS_HOST_DENY_FP='0b97135457bbb970241f6c37af3ced6e4477163e92ca5258dc9f549cea0d8f34'
+
+# The only machines that may run it.
+#
+# DELIBERATELY EMPTY. Mini1's and Mini2's fingerprints have not been measured:
+# the audit above was an observation of names only, and this session did not
+# and must not reach those machines. An empty allowlist means the wrapper
+# refuses EVERYWHERE, which is the correct failure mode and the same posture
+# the harness already takes toward an unknown host.
+#
+# To provision, on the drill host, once, alongside the sudoers grant:
+#
+#     scripts/drill-loop/host-fingerprint.sh
+#
+# and paste the printed fingerprint here, with the machine named in a comment.
+# Re-review the diff: this list is the whole host allowlist.
+RAILS_HOST_ALLOW_FP=''
+
+# NAME denylist, kept as a BELT and never as the mechanism. Names cannot ADD a
+# host (there is no name allowlist any more), so an entry here can only ever
+# cause a refusal, which is the only direction a forgeable input may push a
+# safety rail. Matched on the aggressively normalized form.
+RAILS_HOST_DENY='eriks-macbook-air eriksmacbookair erik-macbook-air erikmbp'
 
 # Fortress paths that are never disposable, checked BEFORE the allowlist so the
 # ordering matches the host rail's proven deny-first shape. The relative entries
@@ -769,8 +823,17 @@ rails_assert_disposable_storage() {
 # sudoers grant carries no env_keep, so sudo's env_reset means the privileged
 # path always uses these compiled-in lists.
 rails_assert_host_allowed() {
-  if [ "$#" -lt 1 ]; then rails__die "rails_assert_host_allowed: expected at least 1 arg"; fi
-  local n e norm strict
+  if [ "$#" -lt 1 ]; then
+    rails__die "rails_assert_host_allowed: expected at least 1 arg (fingerprint)"
+  fi
+  local fp="$1" n e norm strict
+  shift
+
+  # NAME BELT, first, and deny-only. Every observed name is screened; none of
+  # them can ADD a host, because there is no name allowlist. That asymmetry is
+  # the point: names are forgeable (a planted `hostname` on PATH defeated the
+  # previous design on the real MacBook Air), so a name may push this rail
+  # toward refusal and never toward acceptance.
   for n in "$@"; do
     if [ -z "$n" ]; then rails__die "empty host identity supplied"; fi
     norm="$(rails__normalize_host "$n")"
@@ -784,16 +847,106 @@ rails_assert_host_allowed() {
       # is the worst possible bug in this file, and the review found exactly
       # that for `scutil --get ComputerName`.
       if [ "$strict" = "$(rails__normalize_host_strict "$e")" ]; then
-        rails__die "host '$norm' is on the un-overridable denylist (daily driver); refusing"
+        rails__die "host '$norm' is on the un-overridable name denylist (daily driver); refusing"
       fi
     done
   done
-  local primary
-  primary="$(rails__normalize_host "$1")"
-  for e in $RAILS_HOST_ALLOW; do
-    if [ "$primary" = "$(rails__normalize_host "$e")" ]; then return 0; fi
+
+  # THE DECISION, on the hardware fingerprint, against the compiled-in lists.
+  rails_assert_fingerprint_against "$fp" "$RAILS_HOST_DENY_FP" "$RAILS_HOST_ALLOW_FP"
+}
+
+# The PURE half of the fingerprint decision: value in, lists in, verdict out.
+#
+# Split out for the same reason `rails_assert_nonroot_uid` is: the shipped
+# allowlist is DELIBERATELY EMPTY until a drill host is measured, so the only
+# way to exercise the ACCEPT path is to drive the predicate with lists. A rail
+# nobody has ever seen say yes is not a rail anyone should trust, and an
+# allowlist that has never been shown to admit anything is not obviously
+# distinguishable from one that is broken.
+#
+# Production passes the compiled-in constants and nothing else; there is no
+# argument, flag or environment variable anywhere in the harness that reaches
+# these lists.
+rails_assert_fingerprint_against() {
+  if [ "$#" -ne 3 ]; then
+    rails__die "rails_assert_fingerprint_against: expected 3 args (fingerprint, deny, allow), got $#"
+  fi
+  local fp="$1" deny="$2" allow="$3" e
+
+  # Fail closed on anything that is not a well-formed fingerprint: empty, an
+  # error string, a truncated read and an unparseable one are all REFUSALS,
+  # never "well, it isn't the MacBook, so it must be fine".
+  if [ -z "$fp" ]; then
+    rails__die "no host fingerprint supplied; refusing (fail closed)"
+  fi
+  if [ "${#fp}" -ne 64 ]; then
+    rails__die "host fingerprint is not 64 hex characters; refusing (fail closed)"
+  fi
+  case "$fp" in
+    *[!0-9a-f]*) rails__die "host fingerprint is not lowercase hex; refusing (fail closed)" ;;
+  esac
+
+  # DENY FIRST, in the SAME identifier space as the allowlist. A denylist keyed
+  # on names beside an allowlist keyed on hardware would silently stop
+  # matching, which is the single worst bug this file can have.
+  for e in $deny; do
+    if [ "$fp" = "$e" ]; then
+      rails__die "this machine's hardware fingerprint is on the un-overridable denylist (daily driver); refusing"
+    fi
   done
-  rails__die "host '$primary' is not on the compiled-in drill-host allowlist; refusing (fail closed)"
+  if [ -z "$allow" ]; then
+    rails__die "the drill-host allowlist is EMPTY, so no machine may run this; run scripts/drill-loop/host-fingerprint.sh on the drill host and add its fingerprint to RAILS_HOST_ALLOW_FP (refusing, fail closed)"
+  fi
+  for e in $allow; do
+    if [ "$fp" = "$e" ]; then return 0; fi
+  done
+  rails__die "this machine's hardware fingerprint is not on the compiled-in drill-host allowlist; refusing (fail closed)"
+}
+
+# Read this machine's hardware UUID and reduce it to a fingerprint.
+#
+# `ioreg` by ABSOLUTE path: an attacker who can put an `ioreg` on PATH could
+# otherwise answer this question for us, which is precisely how the name-based
+# rail was defeated. The UUID's shape is checked strictly (8-4-4-4-12 uppercase
+# hex) so a truncated read, an error message, or a lookup on a machine that has
+# no such property CANNOT be mistaken for an identity.
+#
+# Prints a 64-character lowercase hex fingerprint, or dies. There is no
+# "unknown" return value: this rail has no third answer.
+rails_host_fingerprint_local() {
+  local out uuid
+  out="$(rails__sys ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null || printf '')"
+  if [ -z "$out" ]; then
+    rails__die "cannot read this machine's hardware identity (ioreg produced nothing); refusing (fail closed)"
+  fi
+  uuid="$(printf '%s\n' "$out" | rails__sys sed -n 's/.*"IOPlatformUUID" = "\([^"]*\)".*/\1/p' | rails__sys head -1)"
+  if [ -z "$uuid" ]; then
+    rails__die "this machine reports no IOPlatformUUID; refusing (fail closed)"
+  fi
+  rails_host_fingerprint_of "$uuid"
+}
+
+# The PURE half: UUID in, fingerprint out. Split out so the shape validation
+# and the hashing are testable exhaustively without depending on what machine
+# the battery happens to run on.
+rails_host_fingerprint_of() {
+  if [ "$#" -ne 1 ]; then
+    rails__die "rails_host_fingerprint_of: expected 1 arg (uuid), got $#"
+  fi
+  local uuid="$1" fp
+  if [ -z "$uuid" ]; then rails__die "empty hardware UUID; refusing (fail closed)"; fi
+  if [ "${#uuid}" -ne 36 ]; then
+    rails__die "hardware UUID is not 36 characters; refusing (fail closed): $uuid"
+  fi
+  case "$uuid" in
+    [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]-[0-9A-F][0-9A-F][0-9A-F][0-9A-F]-[0-9A-F][0-9A-F][0-9A-F][0-9A-F]-[0-9A-F][0-9A-F][0-9A-F][0-9A-F]-[0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]) ;;
+    *) rails__die "hardware UUID is not in 8-4-4-4-12 uppercase-hex form; refusing (fail closed)" ;;
+  esac
+  fp="$(printf '%s' "$uuid" | { rails__sys sha256sum 2>/dev/null || rails__sys shasum -a 256 2>/dev/null; } | rails__sys awk '{print $1}')"
+  if [ -z "$fp" ]; then rails__die "could not hash the hardware UUID; refusing (fail closed)"; fi
+  if [ "${#fp}" -ne 64 ]; then rails__die "hardware fingerprint is not 64 hex characters; refusing"; fi
+  printf '%s\n' "$fp"
 }
 
 # Screen EVERY observed identity, dropping none, skipping only the empty ones.
@@ -815,17 +968,22 @@ rails_assert_host_allowed() {
 # refused, because then nothing was observed at all.
 rails_assert_host_allowed_observed() {
   if [ "$#" -lt 1 ]; then
-    rails__die "rails_assert_host_allowed_observed: expected at least 1 arg"
+    rails__die "rails_assert_host_allowed_observed: expected at least 1 arg (fingerprint)"
   fi
-  local n
+  local fp="$1" n
+  shift
   local -a observed=()
   for n in "$@"; do
     if [ -n "$n" ]; then observed+=("$n"); fi
   done
+  # Zero observed NAMES is fine: Mini1 has no `scutil --get HostName` at all,
+  # and the decision does not rest on names anyway. Zero FINGERPRINT is not
+  # fine, and `rails_assert_host_allowed` refuses it.
   if [ "${#observed[@]}" -eq 0 ]; then
-    rails__die "no host identity could be observed; refusing (fail closed)"
+    rails_assert_host_allowed "$fp"
+    return $?
   fi
-  rails_assert_host_allowed "${observed[@]}"
+  rails_assert_host_allowed "$fp" "${observed[@]}"
 }
 
 # ---------------------------------------------------------------------------

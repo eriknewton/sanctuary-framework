@@ -169,17 +169,28 @@ wrapper_run_rails() {
   #    names can only ever cause rejection. `hostname` and `scutil` are resolved
   #    by ABSOLUTE path: the review defeated this rail on the real MacBook by
   #    planting a `hostname` binary earlier in PATH.
-  local h_short h_full h_computer
+  #    THE DECISION IS THE HARDWARE FINGERPRINT. Names are a deny-only belt.
+  #    A live audit of the real machines found Mini1 answering `hostname -s`
+  #    with the literal string "Mac", so a name allowlist able to admit Mini1
+  #    would admit a large fraction of default-configured Macs. There is no
+  #    name allowlist any more.
+  local h_fp h_short h_full h_computer h_local
+  h_fp="$(rails_host_fingerprint_local)" \
+    || wrapper_die 'cannot establish this machine hardware identity; refusing'
+  if [ -z "$h_fp" ]; then wrapper_die 'empty host fingerprint after rail'; fi
   h_short="$(rails__sys hostname -s 2>/dev/null || printf '')"
   h_full="$(rails__sys hostname -f 2>/dev/null || rails__sys hostname 2>/dev/null || printf '')"
   h_computer="$(rails__sys scutil --get ComputerName 2>/dev/null || printf '')"
-  if [ -z "$h_short" ]; then wrapper_die 'cannot determine hostname; refusing'; fi
+  h_local="$(rails__sys scutil --get LocalHostName 2>/dev/null || printf '')"
   # ONE call, no branches, every observed identity handed over. The reviewed
   # build chose between three if/elif branches that passed different subsets,
   # and one of them silently DROPPED the ComputerName alias. The rail skips the
-  # empty ones itself, so there is nothing here to get wrong.
-  wrapper_rail rails_assert_host_allowed_observed "$h_short" "$h_full" "$h_computer" \
-    || wrapper_die "host rail rejected $h_short"
+  # empty ones itself, so there is nothing here to get wrong. `scutil --get
+  # HostName` is deliberately not consulted: it is UNSET on the drill host, and
+  # a lookup that is empty on the machine we care about teaches nothing.
+  wrapper_rail rails_assert_host_allowed_observed \
+      "$h_fp" "$h_short" "$h_full" "$h_computer" "$h_local" \
+    || wrapper_die "host rail rejected this machine (${h_short:-unnamed})"
 
   # 2. OPERATOR ACCOUNT, before any `sudo -u`. The reviewed build passed this
   #    straight through, so `--operator-account root` plus a caller-supplied URL

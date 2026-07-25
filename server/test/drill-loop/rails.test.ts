@@ -55,6 +55,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 const REPO_ROOT = path.resolve(__dirname, "..", "..", "..");
 const DRILL_LOOP = path.join(REPO_ROOT, "scripts", "drill-loop");
 const PROBE = path.join(DRILL_LOOP, "lib", "probe.sh");
+const RAILS = path.join(DRILL_LOOP, "lib", "rails.sh");
 const BUILD_WRAPPER = path.join(DRILL_LOOP, "build-wrapper.sh");
 const SELFTEST = path.join(DRILL_LOOP, "selftest.sh");
 const SHA_FILE = path.join(DRILL_LOOP, "wrapper.sha256");
@@ -115,10 +116,40 @@ let base: string;
 let anchor: string;
 let me: string;
 let myUid: number;
+/**
+ * This machine's REAL hardware fingerprint, read through the real rail. The
+ * wrapper battery substitutes the allowlist, not the lookup, so the ioreg
+ * read, the UUID shape validation and the hashing all genuinely run.
+ *
+ * Empty on a machine with no IOPlatformExpertDevice (i.e. Linux CI), where the
+ * wrapper-level cases are skipped and the rail-level cases carry the coverage.
+ */
+let localFingerprint = "";
+let hasHardwareIdentity = false;
+
+/**
+ * The wrapper-level cases need a machine with a hardware identity, because the
+ * host rail now decides on one. Linux CI has no IOPlatformExpertDevice, so
+ * there the rail correctly refuses before reaching anything else and these
+ * cases would all assert the wrong reason. The rail-level cases above carry
+ * the coverage on every platform; these carry the end-to-end verb coverage on
+ * the platform the drill actually runs on.
+ */
+function skipWrapperCases(): boolean {
+  return myUid === 0 || !hasHardwareIdentity;
+}
 
 beforeAll(() => {
   me = os.userInfo().username;
   myUid = typeof process.getuid === "function" ? process.getuid() : 1000;
+  const r = run("bash", [
+    "-c",
+    `. "${RAILS}"; rails_host_fingerprint_local`,
+  ]);
+  if (r.status === 0) {
+    localFingerprint = r.out.trim();
+    hasHardwareIdentity = /^[0-9a-f]{64}$/.test(localFingerprint);
+  }
 });
 
 beforeEach(() => {
@@ -567,73 +598,196 @@ describe("drill-loop rails: etime parsing", () => {
   });
 });
 
-describe("drill-loop rails: host rail (the part that held, kept intact)", () => {
-  it("rejects an unknown host, failing closed", () => {
-    expectReject(probe("host", "some-random-box"), "not on the compiled-in drill-host allowlist");
+/**
+ * THE HOST RAIL DECIDES ON HARDWARE, NOT ON A NAME.
+ *
+ * A live audit of the real machines (2026-07-25) killed the name allowlist:
+ *
+ *   Mini1, the intended drill host: `hostname -s` = "Mac", `scutil --get
+ *     HostName` UNSET, LocalHostName "Agents-Mac-mini", ComputerName
+ *     "Agent's Mac mini".
+ *   MBA, which must never run it: `hostname -s` = "Eriks-MacBook-Air".
+ *
+ * Allowing Mini1 by short name means putting the literal string "Mac" on the
+ * allowlist, and a large fraction of default-configured Macs answer exactly
+ * that. An allowlist containing "Mac" silently converts "fail closed on an
+ * unknown host" into "pass on many unknown hosts". Names are forgeable anyway:
+ * BLOCKER 2 was a planted `hostname` producing WRAPPER=ACCEPT on the MacBook.
+ *
+ * So the decision is the machine's hardware UUID, the allowlist and denylist
+ * live in the SAME identifier space, and names survive only as a deny-only
+ * belt that can push the rail toward refusal and never toward acceptance.
+ */
+describe("drill-loop rails: host rail, decided on hardware", () => {
+  const ALLOWED = "1".repeat(64);
+  const DENIED = "2".repeat(64);
+  const UNKNOWN = "3".repeat(64);
+
+  // THE REQUIRED CASE from the machine audit.
+  for (const generic of ["Mac", "Macintosh", "MacBook-Pro", "localhost", "Mac.localdomain"]) {
+    it(`the generic name "${generic}" is not sufficient to pass the host rail`, () => {
+      const r = probe("host-observed", UNKNOWN, generic, "", "", "");
+      expect(r.status).not.toBe(0);
+      expect(r.out).not.toContain("ACCEPT");
+      expect(r.out, "a name must never be what admits a machine").toMatch(/fingerprint|allowlist/);
+    });
+  }
+
+  it("accepts the allowlisted hardware", () => {
+    expectAccept(probe("fingerprint-against", ALLOWED, DENIED, ALLOWED), "PROBE=ACCEPT");
   });
 
-  it("rejects the operator's daily driver by short name", () => {
-    expectReject(probe("host", "Eriks-MacBook-Air"), "un-overridable denylist");
+  it("refuses the denylisted hardware", () => {
+    expectReject(
+      probe("fingerprint-against", DENIED, DENIED, ALLOWED),
+      "un-overridable denylist"
+    );
   });
 
-  it("rejects the daily driver however it is spelled", () => {
-    expectReject(probe("host", "ERIKS-MACBOOK-AIR.local"), "un-overridable denylist");
+  it("refuses denylisted hardware that is ALSO on the allowlist", () => {
+    // Deny beats allow, in the SAME identifier space. A denylist keyed on
+    // names beside an allowlist keyed on hardware would silently stop
+    // matching, which is the single worst bug this rail can have.
+    expectReject(
+      probe("fingerprint-against", DENIED, DENIED, `${DENIED} ${ALLOWED}`),
+      "un-overridable denylist"
+    );
   });
 
-  it("rejects the daily driver by its ComputerName, spaces and apostrophe included", () => {
+  it("refuses hardware that is on neither list", () => {
+    expectReject(
+      probe("fingerprint-against", UNKNOWN, DENIED, ALLOWED),
+      "not on the compiled-in drill-host allowlist"
+    );
+  });
+
+  // EVERY unusable lookup is a REJECT, never a skip, never a non-match that
+  // reads as "well, it isn't the MacBook, so it must be fine".
+  it("refuses an EMPTY fingerprint", () => {
+    expectReject(probe("fingerprint-against", "", DENIED, ALLOWED), "no host fingerprint supplied");
+  });
+
+  it("refuses a truncated fingerprint", () => {
+    expectReject(probe("fingerprint-against", "1111", DENIED, ALLOWED), "not 64 hex characters");
+  });
+
+  it("refuses an error string where a fingerprint belongs", () => {
+    expectReject(
+      probe("fingerprint-against", "ioreg: command not found", DENIED, ALLOWED),
+      "not 64 hex characters"
+    );
+  });
+
+  it("refuses an upper-case fingerprint rather than matching case-insensitively", () => {
+    expectReject(
+      probe("fingerprint-against", "A".repeat(64), DENIED, ALLOWED),
+      "not lowercase hex"
+    );
+  });
+
+  it("admits NOTHING when the allowlist is empty", () => {
+    // Which is the shipped state, until a drill host is measured.
+    expectReject(probe("fingerprint-against", ALLOWED, DENIED, ""), "allowlist is EMPTY");
+  });
+
+  it("the SHIPPED allowlist is empty and the SHIPPED denylist is not", () => {
+    // The shipped lists, asserted directly, because no override can fake this
+    // and because an accidentally-populated allowlist is the one change here
+    // that would matter most.
+    const rails = fs.readFileSync(path.join(DRILL_LOOP, "lib", "rails.sh"), "utf8");
+    expect(rails).toMatch(/^RAILS_HOST_ALLOW_FP=''$/m);
+    expect(rails).toMatch(/^RAILS_HOST_DENY_FP='[0-9a-f]{64}'$/m);
+    // and the generic name allowlist is gone, not merely unused
+    expect(rails).not.toMatch(/^RAILS_HOST_ALLOW=/m);
+  });
+});
+
+describe("drill-loop rails: the UUID to fingerprint reduction", () => {
+  const UUID = "DC6E6D25-7885-5B37-948A-5C942737CFF4";
+
+  it("reduces a well-formed hardware UUID", () => {
+    const r = probe("host-fingerprint-of", UUID);
+    expectAccept(r, "PROBE=ACCEPT");
+    expect(r.out).toMatch(/fingerprint=[0-9a-f]{64}/);
+  });
+
+  it("is a stable function: same machine, same fingerprint", () => {
+    const a = probe("host-fingerprint-of", UUID).out;
+    const b = probe("host-fingerprint-of", UUID).out;
+    const c = probe("host-fingerprint-of", `A${UUID.slice(1)}`).out;
+    expect(a).toBe(b);
+    expect(a).not.toBe(c);
+  });
+
+  it("refuses an empty UUID", () => {
+    expectReject(probe("host-fingerprint-of", ""), "empty hardware UUID");
+  });
+
+  it("refuses a truncated UUID", () => {
+    expectReject(probe("host-fingerprint-of", "DC6E6D25-7885"), "not 36 characters");
+  });
+
+  it("refuses an error message where a UUID belongs", () => {
+    // Both the too-short and the exactly-36-characters shapes, because a
+    // truncated read and a chatty error are different failures.
+    expectReject(
+      probe("host-fingerprint-of", "ioreg: could not find IOPlatformExpertDevice"),
+      "not 36 characters"
+    );
+    expectReject(
+      probe("host-fingerprint-of", "ioreg: could not find IOPlatformExpe"),
+      "uppercase-hex form"
+    );
+  });
+
+  it("refuses a same-length value that is not a UUID", () => {
+    expectReject(
+      probe("host-fingerprint-of", "ZZZZZZZZ-7885-5B37-948A-5C942737CFF4"),
+      "uppercase-hex form"
+    );
+  });
+});
+
+describe("drill-loop rails: names are a DENY-ONLY belt", () => {
+  const ALLOWED = "1".repeat(64);
+
+  it("refuses the daily driver by short name even on allowlisted hardware", () => {
+    expectReject(probe("host", ALLOWED, "Eriks-MacBook-Air"), "un-overridable name denylist");
+  });
+
+  it("refuses the daily driver however it is spelled", () => {
+    expectReject(probe("host", ALLOWED, "ERIKS-MACBOOK-AIR.local"), "un-overridable name denylist");
+  });
+
+  it("refuses the daily driver by its ComputerName, spaces and apostrophe included", () => {
     // `scutil --get ComputerName` returns "Erik’s MacBook Air". A denylist of
-    // space-separated words cannot hold that literally, so the denylist
-    // compares an aggressively normalized form. Before the fix this name was
-    // rejected by the ALLOWLIST (fail closed) while the rail's own comment
-    // claimed the denylist covered it.
-    expectReject(probe("host", "Erik’s MacBook Air"), "un-overridable denylist");
+    // space-separated words cannot hold that literally, so it compares an
+    // aggressively normalized form.
+    expectReject(probe("host", ALLOWED, "Erik’s MacBook Air"), "un-overridable name denylist");
   });
 
-  it("rejects the ComputerName form even as an extra 'allow' argument", () => {
+  it("screens an observed name in a MIDDLE position", () => {
     expectReject(
-      probe("host", "agents-mac-mini", "Erik’s MacBook Air"),
-      "un-overridable denylist"
+      probe("host-observed", ALLOWED, "Mac", "Eriks-MacBook-Air", "", ""),
+      "un-overridable name denylist"
     );
   });
 
-  it("rejects the daily driver even when passed as an extra 'allow' argument", () => {
-    expectReject(probe("host", "agents-mac-mini", "Eriks-MacBook-Air"), "un-overridable denylist");
-  });
-
-  it("accepts a legitimate drill host", () => {
-    expectAccept(probe("host", "agents-mac-mini"), "PROBE=ACCEPT");
-  });
-
-  /**
-   * The wrapper's ACTUAL call shape: three observed identities, any of which
-   * may be empty. The reviewed wrapper chose between three if/elif branches
-   * that passed different subsets, and one of them SILENTLY DROPPED the
-   * ComputerName alias. A rail can only refuse what it is shown, so a branch
-   * that drops an identity is a fail-open however strict the rail is.
-   */
-  it("screens an identity in the SECOND position", () => {
-    expectReject(
-      probe("host-observed", "agents-mac-mini", "Eriks-MacBook-Air", ""),
-      "un-overridable denylist"
-    );
-  });
-
-  it("screens an identity in the THIRD position when the second is empty", () => {
+  it("screens an observed name in the LAST position when the others are empty", () => {
     // This is the exact branch the reviewed `elif` chain dropped.
     expectReject(
-      probe("host-observed", "agents-mac-mini", "", "Erik’s MacBook Air"),
-      "un-overridable denylist"
+      probe("host-observed", ALLOWED, "Mac", "", "", "Erik’s MacBook Air"),
+      "un-overridable name denylist"
     );
   });
 
-  it("accepts when only the short name could be observed", () => {
-    // An empty identity is skipped, not refused: "this box has no
-    // ComputerName" is not a reason to refuse a legitimate drill host.
-    expectAccept(probe("host-observed", "agents-mac-mini", "", ""), "PROBE=ACCEPT");
-  });
-
-  it("refuses when NOTHING could be observed", () => {
-    expectReject(probe("host-observed", "", "", ""), "no host identity could be observed");
+  it("does not require ANY name: the drill host reports no scutil HostName", () => {
+    // Zero observed names must still reach the fingerprint decision, and that
+    // decision must be the thing that refuses.
+    expectReject(
+      probe("host-observed", "3".repeat(64), "", "", "", ""),
+      /allowlist|fingerprint/
+    );
   });
 });
 
@@ -957,7 +1111,7 @@ describe("drill-loop wrapper: the shipped artifact's own structure", () => {
     // asserts the call site itself.
     const exec = executableLines(assembled);
     expect(exec).toContain(
-      'rails_assert_host_allowed_observed "$h_short" "$h_full" "$h_computer"'
+      'rails_assert_host_allowed_observed \\\n      "$h_fp" "$h_short" "$h_full" "$h_computer" "$h_local"'
     );
     // and no branchy variant survives alongside it
     expect(exec).not.toMatch(/elif \[ -n "\$h_full" \]/);
@@ -1004,14 +1158,18 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   let victim: string;
 
   beforeEach(() => {
-    const hostname = execFileSync("hostname", ["-s"], { encoding: "utf8" }).trim();
     testWrapper = path.join(sandbox, "test-wrapper");
     const assembled = execFileSync("bash", [BUILD_WRAPPER, "--stdout"], { encoding: "utf8" });
     const entrypoint = 'wrapper_main "$@"';
     const at = assembled.lastIndexOf(entrypoint);
     expect(at, "assembled wrapper must end with the wrapper_main entrypoint").toBeGreaterThan(0);
+    // The host override is this machine's REAL hardware fingerprint, read
+    // through the real `rails_host_fingerprint_local`. That is a stronger stub
+    // than the old name one: the ioreg lookup, the UUID shape validation and
+    // the hashing all actually run, and only the LIST is substituted.
     const overrides = [
-      `RAILS_HOST_ALLOW='${hostname.toLowerCase()}'`,
+      `RAILS_HOST_ALLOW_FP='${localFingerprint}'`,
+      "RAILS_HOST_DENY_FP=''",
       "RAILS_HOST_DENY=''",
       `RAILS_DISPOSABLE_BASE='${base}'`,
       "",
@@ -1035,6 +1193,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   const loopDir = (id: string): string => path.join(base, me, `.sanctuary-loop-${id}`);
 
   it("refuses --storage, because the flag no longer exists", () => {
+    if (skipWrapperCases()) return;
     const r = wrapper("check", "--storage", victim, "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
@@ -1042,6 +1201,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("refuses an EMPTY --run-id, and says which layer refused it", () => {
+    if (skipWrapperCases()) return;
     // The reviewed suite had a case named "refuses an empty --storage at both
     // layers" that entered only ONE layer and asserted no reason at all.
     const r = wrapper("check", "--run-id", "", "--operator-account", me);
@@ -1054,6 +1214,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("refuses a traversal-shaped run id, and prints REJECT", () => {
+    if (skipWrapperCases()) return;
     const r = wrapper("check", "--run-id", "../../.sanctuary", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
@@ -1062,6 +1223,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("prints WRAPPER=REJECT for a HOST rejection too, not only a path one", () => {
+    if (skipWrapperCases()) return;
     // Review finding L2: `rails__die` exits, so a DIRECTLY called rail
     // terminated the script before the oracle's REJECT token was printed, and
     // `check` had two different contracts depending on which rail said no.
@@ -1085,6 +1247,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("refuses --operator-account root before any sudo -u could happen", () => {
+    if (skipWrapperCases()) return;
     const r = wrapper("check", "--run-id", "good1", "--operator-account", "root");
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
@@ -1092,6 +1255,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("refuses an unknown flag rather than passing it through", () => {
+    if (skipWrapperCases()) return;
     const r = wrapper("check", "--run-id", "good1", "--operator-account", me, "--danger");
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
@@ -1099,6 +1263,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("refuses an unknown verb", () => {
+    if (skipWrapperCases()) return;
     const r = wrapper("definitely-not-a-verb", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=ACCEPT");
@@ -1121,14 +1286,14 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("mint creates the disposable fortress", () => {
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     const r = wrapper("mint", "--run-id", "good1", "--operator-account", me);
     expectAccept(r, "WRAPPER=OK verb=mint");
     expect(fs.existsSync(loopDir("good1"))).toBe(true);
   });
 
   it("clean-markers removes the loop's own markers", () => {
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
     const marker = path.join(loopDir("good1"), "exclusive-routing.json");
     fs.writeFileSync(marker, "x");
@@ -1142,7 +1307,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     // component, so `state/` and `state/_audit/` were followed by the kernel
     // and never looked at, and a root `rm` deleted a real fortress's audit
     // write lock while every rail passed.
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
     fs.symlinkSync(path.join(victim, "state"), path.join(loopDir("good1"), "state"));
     const r = wrapper("clean-markers", "--run-id", "good1", "--operator-account", me);
@@ -1155,7 +1320,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("clean-markers refuses a symlinked FINAL component and the fortress file SURVIVES", () => {
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     expectAccept(wrapper("mint", "--run-id", "good1", "--operator-account", me), "verb=mint");
     fs.mkdirSync(path.join(loopDir("good1"), "state", "_audit"), { recursive: true });
     fs.symlinkSync(
@@ -1172,7 +1337,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     // Codex won this in 44 attempts against the reviewed build. Note that this
     // sandbox is the WEAKER configuration: in production the base is
     // root-owned, so the racer could not create the leaf at all.
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     expectAccept(wrapper("mint", "--run-id", "race", "--operator-account", me), "verb=mint");
     const dir = loopDir("race");
     const racer = spawnSync(
@@ -1201,7 +1366,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     // `WRAPPER=OK verb=kickstart-daemons` unconditionally. The kickstart IS
     // the verb's whole job, so its status is the verb's status. There is no
     // Sanctuary gate daemon on a test machine, so this must fail.
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     const r = wrapper("kickstart-daemons", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=OK verb=kickstart-daemons");
@@ -1214,7 +1379,7 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     // an empty anchor and call it success. "Could not read" and "read, and it
     // was empty" have to be two different answers, or the stop-the-night check
     // is back to reporting CLEAN having observed nothing.
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     const r = wrapper("pf-anchor-rules", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=OK verb=pf-anchor-rules");
@@ -1222,28 +1387,28 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
   });
 
   it("arm refuses without an agent account, before touching the CLI", () => {
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     const r = wrapper("arm", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("arm requires");
   });
 
   it("repair refuses a missing CLI rather than exec-ing whatever is there", () => {
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     const r = wrapper("repair", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("CLI not found");
   });
 
   it("unprotect refuses a missing CLI", () => {
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     const r = wrapper("unprotect", "--run-id", "good1", "--operator-account", me);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("CLI not found");
   });
 
   it("EVERY verb refuses a traversal run id before doing anything", () => {
-    if (myUid === 0) return;
+    if (skipWrapperCases()) return;
     for (const verb of [
       "check",
       "mint",

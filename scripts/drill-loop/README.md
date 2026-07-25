@@ -51,6 +51,52 @@ chokepoint.** `rails_assert_safe_subpath` walks every component and refuses any
 symlink anywhere in the chain. `clean-markers`, `preflight.sh` and
 `teardown-verify.sh` all use it; no verb walks a path by hand.
 
+### And the host rail decides on hardware, not on a name
+
+A live audit of the real machines (2026-07-25) killed the name-based allowlist
+outright. Measured, not assumed:
+
+| | `hostname -s` | `scutil HostName` | `scutil LocalHostName` | `scutil ComputerName` |
+| --- | --- | --- | --- | --- |
+| Mini1, the intended drill host | **`Mac`** | **unset** | `Agents-Mac-mini` | `Agent's Mac mini` |
+| MBA, which must never run this | `Eriks-MacBook-Air` | unset | `Eriks-MacBook-Air` | `Erik's MacBook Air` |
+
+Allowing Mini1 by short name means putting the literal string **`Mac`** on the
+allowlist, and a large fraction of default-configured Macs answer exactly that.
+An allowlist containing `Mac` is close to no allowlist at all: it silently turns
+"fail closed on an unknown host" into "pass on many unknown hosts". And
+`scutil --get HostName` is unset on the drill host, so any branch leaning on it
+gets an empty string there.
+
+Names are forgeable anyway. BLOCKER 2 was a planted `hostname` on PATH producing
+`WRAPPER=ACCEPT` on the MacBook Air.
+
+So the decision is the machine's **hardware UUID** (`IOPlatformUUID`, read from
+`ioreg` by absolute path), the allowlist and the denylist live in the **same
+identifier space** (a denylist keyed on names beside an allowlist keyed on
+hardware would silently stop matching), and every unusable lookup is a REFUSAL
+rather than a non-match. Names survive only as a deny-only belt: they can push
+the rail toward refusal and never toward acceptance.
+
+What is committed is the SHA-256 of the UUID, not the UUID. This is a public
+repository; a fingerprint compares exactly, carries no raw machine identifier,
+and does not reverse into one.
+
+**`RAILS_HOST_ALLOW_FP` ships EMPTY**, so the wrapper currently refuses on every
+machine. Mini1's and Mini2's fingerprints have not been measured; the audit
+above observed names only and this work did not reach those machines. Empty is
+the correct state, and it is the same posture the harness already took toward an
+unknown host. To provision, on the drill host, once, alongside the sudoers
+grant:
+
+```sh
+scripts/drill-loop/host-fingerprint.sh     # read-only; installs nothing
+```
+
+then paste the printed fingerprint into `RAILS_HOST_ALLOW_FP`, name the machine
+in a comment, run `build-wrapper.sh --write-hash`, and get the diff re-reviewed.
+That list is the entire host allowlist.
+
 The ordering here stays deliberate: `lib/rails.sh` first, its battery second,
 the loop on top only once the battery was green. A harness that runs beautifully
 but can be talked into touching a real fortress is worth negative value.
@@ -66,8 +112,11 @@ but can be talked into touching a real fortress is worth negative value.
 | A symlink ANYWHERE in a path a privileged verb walks | `rails_assert_safe_subpath`, the one chokepoint |
 | Any known fortress path, checked before the allowlist | denylist, lexical and resolved |
 | An empty storage value | the rail, the post-rail guard, and the guard before the one export |
-| Any host but a compiled-in drill host | `rails_assert_host_allowed`, deny-first, fail closed |
-| The operator's daily-driver MacBook, under any of its names | denylist on an aggressively normalized form, before the allowlist |
+| Any machine but a compiled-in drill host | `rails_assert_host_allowed`, decided on the HARDWARE FINGERPRINT, deny-first, fail closed |
+| The operator's daily-driver MacBook, by hardware | its fingerprint is on the un-overridable denylist, in the same identifier space as the allowlist |
+| The operator's daily-driver MacBook, under any of its names | a deny-only name belt on an aggressively normalized form |
+| A machine that merely CLAIMS a drill host's name | there is no name allowlist; a name can only ever cause a refusal |
+| A hardware lookup that is empty, errored or unparseable | refused, never treated as "not the MacBook, therefore fine" |
 | A PATH-planted `hostname`, `stat`, `rm` or interpreter | absolute shebang, pinned PATH, `rails__sys` absolute resolution, `secure_path` |
 | `--operator-account root`, by name and by uid | `rails_assert_non_root_account` |
 | Acting for an account other than the sudo caller | `rails_assert_caller_binding` |
@@ -99,6 +148,7 @@ scripts/drill-loop/
   install-wrapper.sh            root install to /usr/local/sbin (DOCUMENTED, NOT RUN)
   sudoers.d/sanctuary-drill     the exact NOPASSWD grant, reviewable (NOT INSTALLED)
   selftest.sh                   the rail battery, standalone, no node required
+  host-fingerprint.sh           print THIS machine's drill-host fingerprint (read-only)
   ai.sanctuary.drill-loop.plist nightly launchd job (DOCUMENTED, NOT LOADED)
   drivers/
     run-loop.sh                 the loop: sweep N | soak N | reboot K
@@ -225,6 +275,14 @@ divergence, artifact paths, and any taint label.
 Not done by this repository, and deliberately so.
 
 ```sh
+# 0. FIRST, on the drill host: measure it and put it on the allowlist.
+#    Read-only. Installs nothing, changes nothing, contacts nothing.
+scripts/drill-loop/host-fingerprint.sh
+#    ...paste the fingerprint into RAILS_HOST_ALLOW_FP in lib/rails.sh, name
+#    the machine in a comment, then:
+scripts/drill-loop/build-wrapper.sh --write-hash
+#    ...and get that diff re-reviewed. It is the entire host allowlist.
+
 sudo scripts/drill-loop/install-wrapper.sh
 sudo visudo -f /etc/sudoers.d/sanctuary-drill   # paste sudoers.d/sanctuary-drill
 sudo visudo -c
@@ -232,9 +290,10 @@ cp scripts/drill-loop/ai.sanctuary.drill-loop.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.sanctuary.drill-loop.plist
 ```
 
-`install-wrapper.sh` runs the same host rail the wrapper does, so it cannot be
-installed onto the daily driver, and it verifies the installed hash after
-writing.
+Step 0 is not optional: with an empty allowlist the wrapper refuses everywhere,
+which is deliberate. `install-wrapper.sh` runs the same host rail the wrapper
+does, so it cannot be installed onto the daily driver (whose hardware is on the
+denylist), and it verifies the installed hash after writing.
 
 ## Known open items before the first unattended night
 
@@ -277,10 +336,15 @@ Stated here rather than discovered at 3am:
   unprivileged driver after the first arm. All four read absence as good, so
   reporting them PASS would be a false green. They fail loudly instead. The
   real fix is a wrapper verb that reads those paths as root; it is not built.
-- **Mini2's local short hostname is unconfirmed.** It sits in the allowlist as
-  `mini2`, which is its Tailscale name. If the machine answers to something
-  else, the wrapper refuses there until the list is edited and re-reviewed.
-  Refusing is the correct failure mode.
+- **No drill host is on the allowlist yet, so the wrapper refuses everywhere.**
+  `RAILS_HOST_ALLOW_FP` is empty: Mini1's and Mini2's hardware fingerprints
+  have not been measured, because doing so means running
+  `host-fingerprint.sh` ON those machines and this work did not reach them.
+  This supersedes the older "Mini2's local short hostname is unconfirmed" item,
+  which the machine audit made moot: the drill host answers `hostname -s` with
+  the literal string `Mac`, so no name-based list was ever going to work.
+  Refusing everywhere is the correct failure mode until step 0 of the install
+  is done.
 - **The path rail is still check-then-use, and that is now sound for a stated
   reason rather than an accepted risk.** The rail validates a path and hands
   the string on; what changed is that no component of that path is writable by

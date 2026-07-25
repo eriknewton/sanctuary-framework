@@ -40,10 +40,12 @@ if [ "$(id -u)" -ne 0 ]; then die 'must run as root (sudo)'; fi
 # `hostname` / `scutil` go through the absolute resolver, because the review
 # defeated the host rail with a planted `hostname` on PATH.
 ( rails_assert_host_allowed_observed \
+    "$(rails_host_fingerprint_local)" \
     "$(rails__sys hostname -s 2>/dev/null || printf '')" \
     "$(rails__sys hostname -f 2>/dev/null || printf '')" \
-    "$(rails__sys scutil --get ComputerName 2>/dev/null || printf '')" ) \
-  || die 'host rail rejected this machine; refusing to install'
+    "$(rails__sys scutil --get ComputerName 2>/dev/null || printf '')" \
+    "$(rails__sys scutil --get LocalHostName 2>/dev/null || printf '')" ) \
+  || die 'host rail rejected this machine; refusing to install (if this IS a drill host, run scripts/drill-loop/host-fingerprint.sh and add its fingerprint to RAILS_HOST_ALLOW_FP)'
 
 "$HERE/build-wrapper.sh" --verify-hash >/dev/null \
   || die 'assembled wrapper does not match wrapper.sha256; run build-wrapper.sh --write-hash and re-review'

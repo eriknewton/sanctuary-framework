@@ -247,40 +247,94 @@ expect_accept 'hh:mm:ss'     'seconds=3725'  -- "$PROBE" etime '01:02:05'
 expect_accept 'dd-hh:mm:ss'  'seconds=93784' -- "$PROBE" etime '1-02:03:04'
 expect_reject 'garbage etime' 'unparseable'  -- "$PROBE" etime 'soon'
 
-printf '== host rail ==\n'
-expect_reject 'unknown host' 'not on the compiled-in drill-host allowlist' \
-  -- "$PROBE" host 'some-random-box'
-expect_reject 'daily driver by short name' 'un-overridable denylist' \
-  -- "$PROBE" host 'Eriks-MacBook-Air'
-expect_reject 'daily driver with .local' 'un-overridable denylist' \
-  -- "$PROBE" host 'Eriks-MacBook-Air.local'
-expect_reject 'daily driver as an alias' 'un-overridable denylist' \
-  -- "$PROBE" host 'agents-mac-mini' 'Eriks-MacBook-Air'
-# The `scutil --get ComputerName` form. It carries spaces and a curly
-# apostrophe, so a space-separated denylist cannot hold it literally; the
-# denylist compares an aggressively normalized form for exactly this reason.
-# Before the fix this name was rejected by the ALLOWLIST (fail closed) while
-# the rail's own comment claimed the denylist covered it.
-expect_reject 'daily driver as its ComputerName' 'un-overridable denylist' \
-  -- "$PROBE" host "Erik's MacBook Air"
-expect_reject 'ComputerName as an extra alias' 'un-overridable denylist' \
-  -- "$PROBE" host 'agents-mac-mini' "Erik's MacBook Air"
-expect_accept 'a legitimate drill host' 'PROBE=ACCEPT' -- "$PROBE" host 'agents-mac-mini'
+printf '== host rail: the decision is a HARDWARE FINGERPRINT ==\n'
+#
+# A live audit of the real machines (2026-07-25) measured the intended drill
+# host answering `hostname -s` with the literal string "Mac", and reporting no
+# `scutil --get HostName` at all. A name allowlist able to admit that machine
+# would admit a large fraction of default-configured Macs. There is no name
+# allowlist any more; names are a deny-only belt.
+FP_ALLOWED='1111111111111111111111111111111111111111111111111111111111111111'
+FP_DENIED='2222222222222222222222222222222222222222222222222222222222222222'
+FP_UNKNOWN='3333333333333333333333333333333333333333333333333333333333333333'
 
-# The wrapper's ACTUAL call shape: three observed identities, any of which may
-# be empty. The reviewed wrapper chose between three if/elif branches that
-# passed different subsets, and one of them silently DROPPED the ComputerName
-# alias. A rail can only refuse what it is shown.
-expect_accept 'observed: only a short name' 'PROBE=ACCEPT' \
-  -- "$PROBE" host-observed 'agents-mac-mini' '' ''
-expect_accept 'observed: short name plus a full name' 'PROBE=ACCEPT' \
-  -- "$PROBE" host-observed 'agents-mac-mini' 'agents-mac-mini.local' ''
-expect_reject 'observed: a denied name in the SECOND position' 'un-overridable denylist' \
-  -- "$PROBE" host-observed 'agents-mac-mini' 'Eriks-MacBook-Air' ''
-expect_reject 'observed: a denied name in the THIRD position, no second' 'un-overridable denylist' \
-  -- "$PROBE" host-observed 'agents-mac-mini' '' "Erik's MacBook Air"
-expect_reject 'observed: nothing at all was observed' 'no host identity could be observed' \
-  -- "$PROBE" host-observed '' '' ''
+# THE REQUIRED CASE: a generic default Mac name is not sufficient to pass.
+for generic in 'Mac' 'Macintosh' 'MacBook-Pro' 'localhost' 'Mac.localdomain' 'mini2'; do
+  expect_reject "generic name '$generic' cannot pass the host rail" 'fingerprint' \
+    -- "$PROBE" host-observed "$FP_UNKNOWN" "$generic" '' '' ''
+done
+# ...and not even when it IS the drill host's real name, if the hardware is not
+# on the list. The name never decides.
+expect_reject 'the drill host by name, unknown hardware' 'not on the compiled-in drill-host allowlist' \
+  -- "$PROBE" fingerprint-against "$FP_UNKNOWN" "$FP_DENIED" "$FP_ALLOWED"
+
+expect_accept 'the allowlisted hardware' 'PROBE=ACCEPT' \
+  -- "$PROBE" fingerprint-against "$FP_ALLOWED" "$FP_DENIED" "$FP_ALLOWED"
+expect_reject 'the denylisted hardware' 'un-overridable denylist' \
+  -- "$PROBE" fingerprint-against "$FP_DENIED" "$FP_DENIED" "$FP_ALLOWED"
+# Deny beats allow, in the SAME identifier space, whatever the order of the
+# lists. A denylist keyed on names beside an allowlist keyed on hardware would
+# silently stop matching; this is the case that would notice.
+expect_reject 'denied hardware that is ALSO on the allowlist' 'un-overridable denylist' \
+  -- "$PROBE" fingerprint-against "$FP_DENIED" "$FP_DENIED" "$FP_DENIED $FP_ALLOWED"
+# EVERY unusable lookup is a REJECT, never a skip and never a non-match.
+expect_reject 'an EMPTY fingerprint' 'no host fingerprint supplied' \
+  -- "$PROBE" fingerprint-against '' "$FP_DENIED" "$FP_ALLOWED"
+expect_reject 'a truncated fingerprint' 'not 64 hex characters' \
+  -- "$PROBE" fingerprint-against '1111' "$FP_DENIED" "$FP_ALLOWED"
+expect_reject 'an error string where a fingerprint belongs' 'not 64 hex characters' \
+  -- "$PROBE" fingerprint-against 'ioreg: command not found' "$FP_DENIED" "$FP_ALLOWED"
+expect_reject 'an upper-case fingerprint' 'not lowercase hex' \
+  -- "$PROBE" fingerprint-against 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' "$FP_DENIED" "$FP_ALLOWED"
+expect_reject 'an EMPTY allowlist admits nothing' 'allowlist is EMPTY' \
+  -- "$PROBE" fingerprint-against "$FP_ALLOWED" "$FP_DENIED" ''
+
+printf '== host rail: the UUID -> fingerprint reduction ==\n'
+expect_accept 'a well-formed hardware UUID' 'PROBE=ACCEPT' \
+  -- "$PROBE" host-fingerprint-of 'DC6E6D25-7885-5B37-948A-5C942737CFF4'
+expect_reject 'an empty UUID' 'empty hardware UUID' \
+  -- "$PROBE" host-fingerprint-of ''
+expect_reject 'a truncated UUID' 'not 36 characters' \
+  -- "$PROBE" host-fingerprint-of 'DC6E6D25-7885'
+expect_reject 'an error message where a UUID belongs' 'not 36 characters' \
+  -- "$PROBE" host-fingerprint-of 'ioreg: could not find IOPlatformExpertDevice'
+expect_reject 'a lowercase UUID' 'uppercase-hex form' \
+  -- "$PROBE" host-fingerprint-of 'dc6e6d25-7885-5b37-948a-5c942737cff4'
+expect_reject 'a same-length non-UUID' 'uppercase-hex form' \
+  -- "$PROBE" host-fingerprint-of 'ZZZZZZZZ-7885-5B37-948A-5C942737CFF4'
+# The reduction must be a FUNCTION: same UUID, same fingerprint, every time.
+FP_A="$("$PROBE" host-fingerprint-of 'DC6E6D25-7885-5B37-948A-5C942737CFF4')"
+FP_B="$("$PROBE" host-fingerprint-of 'DC6E6D25-7885-5B37-948A-5C942737CFF4')"
+FP_C="$("$PROBE" host-fingerprint-of 'AC6E6D25-7885-5B37-948A-5C942737CFF4')"
+if [ "$FP_A" = "$FP_B" ] && [ "$FP_A" != "$FP_C" ]; then
+  printf 'ok    the fingerprint is stable per machine and differs between machines\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL  the fingerprint is not a stable per-machine function\n'
+  FAIL=$((FAIL + 1))
+fi
+
+printf '== host rail: names are a DENY-ONLY belt ==\n'
+expect_reject 'daily driver by short name' 'un-overridable name denylist' \
+  -- "$PROBE" host "$FP_ALLOWED" 'Eriks-MacBook-Air'
+expect_reject 'daily driver with .local' 'un-overridable name denylist' \
+  -- "$PROBE" host "$FP_ALLOWED" 'Eriks-MacBook-Air.local'
+# The `scutil --get ComputerName` form carries spaces and a curly apostrophe,
+# so a space-separated denylist cannot hold it literally; the denylist compares
+# an aggressively normalized form for exactly this reason.
+expect_reject 'daily driver as its ComputerName' 'un-overridable name denylist' \
+  -- "$PROBE" host "$FP_ALLOWED" "Erik's MacBook Air"
+# The wrapper's ACTUAL call shape. The reviewed wrapper chose between three
+# if/elif branches that passed different subsets, and one of them silently
+# DROPPED the ComputerName alias. A rail can only refuse what it is shown.
+expect_reject 'observed: a denied name in the SECOND position' 'un-overridable name denylist' \
+  -- "$PROBE" host-observed "$FP_ALLOWED" 'Mac' 'Eriks-MacBook-Air' '' ''
+expect_reject 'observed: a denied name in the LAST position, others empty' 'un-overridable name denylist' \
+  -- "$PROBE" host-observed "$FP_ALLOWED" 'Mac' '' '' "Erik's MacBook Air"
+# Mini1 reports NO scutil HostName at all, so zero observed names must not be
+# an error: the decision does not rest on names.
+expect_reject 'observed: no names at all still reaches the fingerprint' 'allowlist' \
+  -- "$PROBE" host-observed "$FP_UNKNOWN" '' '' '' ''
 
 printf '== account rail ==\n'
 expect_reject 'root by name' 'refusing the root account by name' \
@@ -418,16 +472,26 @@ printf '== wrapper check oracle (the BLOCKER regression) ==\n'
 # header. The header is where the pinned PATH, `set -euo pipefail`, `IFS` and
 # `umask` live, and two of those are BLOCKER-defence layers.
 TEST_WRAPPER="$SANDBOX/test-wrapper"
+# The host allowlist override is now this machine's REAL hardware fingerprint,
+# read through the real `rails_host_fingerprint_local`. That is a stronger stub
+# than the old name one: the lookup, the shape validation and the hashing all
+# actually run, and only the LIST is substituted.
+LOCAL_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_local" 2>/dev/null || printf '')"
 "$HERE/build-wrapper.sh" --stdout \
-  | awk -v host="$(hostname -s)" -v base="$BASE" '
+  | awk -v fp="$LOCAL_FP" -v base="$BASE" '
       $0 == "wrapper_main \"$@\"" {
-        print "RAILS_HOST_ALLOW=\047" tolower(host) "\047"
+        print "RAILS_HOST_ALLOW_FP=\047" fp "\047"
+        print "RAILS_HOST_DENY_FP=\047\047"
         print "RAILS_HOST_DENY=\047\047"
         print "RAILS_DISPOSABLE_BASE=\047" base "\047"
       }
       { print }
     ' > "$TEST_WRAPPER"
 chmod +x "$TEST_WRAPPER"
+if [ -z "$LOCAL_FP" ]; then
+  printf 'FAIL  could not read this machine hardware fingerprint; the wrapper cases below cannot run\n'
+  FAIL=$((FAIL + 1))
+fi
 
 printf '== the shipped header is what the battery runs ==\n'
 HEADER_BAD=0

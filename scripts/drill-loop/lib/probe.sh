@@ -30,7 +30,10 @@
 #   probe.sh trusted-component <path> <owner-uid> <mode> <self-uid>
 #   probe.sh caller-binding <self-uid> <sudo-user> <operator>
 #   probe.sh etime <etime-string>
-#   probe.sh host <primary> [alias...]
+#   probe.sh fingerprint-against <fingerprint> <deny-list> <allow-list>
+#   probe.sh host <fingerprint> [observed-name...]
+#   probe.sh host-observed <fingerprint> [observed-name...]
+#   probe.sh host-fingerprint-of <hardware-uuid>
 #   probe.sh account <label> <account>
 #   probe.sh uid <label> <account> <uid>
 #   probe.sh account-uid <label> <account> <expected-uid>
@@ -101,16 +104,33 @@ case "$kind" in
     printf 'PROBE=ACCEPT seconds=%s\n' "$SECS"
     ;;
   host)
-    if [ "$#" -lt 1 ]; then die 'host needs at least <primary>'; fi
-    ( rails_assert_host_allowed "$@" ) || die "host rail rejected: $1"
-    printf 'PROBE=ACCEPT host=%s\n' "$1"
+    # host <fingerprint> [observed-name...]. The FINGERPRINT is the decision;
+    # names are a deny-only belt.
+    if [ "$#" -lt 1 ]; then die 'host needs at least <fingerprint>'; fi
+    ( rails_assert_host_allowed "$@" ) || die "host rail rejected"
+    printf 'PROBE=ACCEPT host-fingerprint=%s\n' "$1"
     ;;
   host-observed)
-    # The wrapper's ACTUAL call shape: three observed identities, any of which
-    # may be empty. Drives the collection, not just the comparison.
-    if [ "$#" -lt 1 ]; then die 'host-observed needs at least <primary>'; fi
-    ( rails_assert_host_allowed_observed "$@" ) || die "host rail rejected: ${1:-<empty>}"
+    # The wrapper's ACTUAL call shape: a fingerprint plus several observed
+    # names, any of which may be empty. Drives the collection, not just the
+    # comparison.
+    if [ "$#" -lt 1 ]; then die 'host-observed needs at least <fingerprint>'; fi
+    ( rails_assert_host_allowed_observed "$@" ) || die "host rail rejected"
     printf 'PROBE=ACCEPT host-observed=%s\n' "${1:-<empty>}"
+    ;;
+  fingerprint-against)
+    # The PURE decision: <fingerprint> <deny-list> <allow-list>. This is the
+    # only way to exercise the ACCEPT path, because the shipped allowlist is
+    # deliberately empty until a drill host is measured.
+    if [ "$#" -ne 3 ]; then die 'fingerprint-against needs <fp> <deny> <allow>'; fi
+    ( rails_assert_fingerprint_against "$1" "$2" "$3" ) || die "fingerprint rail rejected"
+    printf 'PROBE=ACCEPT fingerprint-against=%s\n' "$1"
+    ;;
+  host-fingerprint-of)
+    if [ "$#" -ne 1 ]; then die 'host-fingerprint-of needs <uuid>'; fi
+    FP="$(rails_host_fingerprint_of "$1")" || die "host fingerprint rail rejected: $1"
+    if [ -z "$FP" ]; then die 'empty fingerprint after rail'; fi
+    printf 'PROBE=ACCEPT fingerprint=%s\n' "$FP"
     ;;
   account)
     if [ "$#" -ne 2 ]; then die 'account needs <label> <account>'; fi
