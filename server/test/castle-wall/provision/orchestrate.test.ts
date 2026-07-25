@@ -29,6 +29,10 @@ import {
   type ParkedInstallRevertOps,
 } from "../../../src/egress-gate/release-barrier.js";
 import type { HarnessDaemonStatus } from "../../../src/egress-gate/harness-daemon.js";
+// FIX G8 (re-gate, 2026-07-26): the throw -> verdict classification keys on the
+// REAL error the marker load contract raises, so the fakes below raise that
+// class rather than a hand-rolled `Error` that happens to read like one.
+import { ExclusiveRoutingMarkerError } from "../../../src/castle-wall/allowlist/routing-marker.js";
 
 const HARNESS_LOCATOR = {
   plistPath: "/Library/LaunchDaemons/ai.sanctuaryprotocol.agent-harness.plist",
@@ -192,6 +196,10 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     // gate. Default = no marker on disk, so the gate is a no-op for every test
     // that is not about it.
     reconcileExclusiveRoutingResidue: vi.fn(async () => ({ kind: "clear" as const })),
+    // FIX G3 (re-gate 2026-07-26): the residue gate's FALLBACK subject. Default
+    // = no dedicated account exists, which is the state every pre-existing test
+    // was implicitly written against.
+    lookupDedicatedAccountUid: vi.fn(async () => undefined),
     ...overrides,
   };
 }
@@ -1520,8 +1528,9 @@ describe("castle-wall/provision/orchestrate", () => {
 
     it("D8 fail-closed: a marker the gate cannot read (throws) ABORTS with nothing changed -- never arms over an unreadable routing mode", async () => {
       const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
+        // The real op raises the marker load contract's own error class (G8).
         reconcileExclusiveRoutingResidue: vi.fn(async () => {
-          throw new Error("exclusive-routing marker: exclusive-routing.json is not valid JSON");
+          throw new ExclusiveRoutingMarkerError("exclusive-routing.json is not valid JSON");
         }),
       });
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
@@ -1620,8 +1629,10 @@ describe("castle-wall/provision/orchestrate", () => {
 
     it("REGRESSION (coarse): a marker that cannot be READ refuses fail-closed -- 'could not look' is never 'nothing there'", async () => {
       const ops = happyPathOps({
+        // The real op raises the marker load contract's own error class; the
+        // sentence classification (G8) keys on it, so the fake must too.
         reconcileExclusiveRoutingResidue: vi.fn(async () => {
-          throw new Error("exclusive-routing marker: unknown version 2");
+          throw new ExclusiveRoutingMarkerError("exclusive-routing marker: unknown version 2");
         }),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
@@ -1724,7 +1735,11 @@ describe("castle-wall/provision/orchestrate", () => {
           reason: "no subject",
           markerAgentUid: 707,
         }),
-        describeExclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "EACCES" }),
+        describeExclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "EACCES", source: "marker" }),
+        // G5: the ONE refusal reachable after a mutation. With nothing removed
+        // the flat "no Castle Wall change" claim is still true, so it belongs
+        // in this invariant loop; the removed-something case is asserted below.
+        describeExclusiveRoutingResidueRefusal({ kind: "removal-failed", detail: "EROFS", removed: [] }),
       ];
       for (const sentence of sentences) {
         // The armed/not-armed claim belongs to describeObservedAgentConfinement,
@@ -1783,11 +1798,80 @@ describe("castle-wall/provision/orchestrate", () => {
         markerAgentUid: 707,
       });
       expect(sentence).toMatch(/marker for agent uid 707/);
-      expect(sentence).toMatch(/resolved no agent uid to scope it against/);
+      expect(sentence).toMatch(/could not determine the agent's run-as identity/);
       expect(sentence).toMatch(/--unprotect-egress-gate/);
-      expect(sentence).toMatch(/removes this residue even when the dedicated agent account is gone/);
       // Repair is NOT offered here: it exits 2 in exactly this state.
       expect(sentence).not.toMatch(/--repair-egress-gate/);
+    });
+
+    // ── FIX G2 (re-gate, 2026-07-26) ────────────────────────────────────
+    it("G2: the unknown-subject sentence promises the removal CONDITIONALLY, because the teardown it names refuses on live state", () => {
+      const sentence = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-unknown-subject",
+        reason: "this run has not resolved an agent uid to scope it against",
+        markerAgentUid: 707,
+      });
+      // The pre-fix sentence promised the removal UNCONDITIONALLY ("which
+      // removes this residue even when the dedicated agent account is gone").
+      // `clearExclusiveRoutingResidueWithoutAccount` REFUSES whenever uid 707
+      // still has a registry entry or a gate that could serve, so that promise
+      // was false on exactly the branch that refuses -- the sentence class this
+      // change exists to eliminate.
+      expect(sentence).not.toMatch(/gate', which removes this residue even when/);
+      expect(sentence).toMatch(/when nothing is still armed for uid 707 it removes the residue/);
+      expect(sentence).toMatch(/when something IS still armed for that uid it changes nothing/);
+    });
+
+    // ── FIX G6 (re-gate, 2026-07-26) ────────────────────────────────────
+    it("G6: the unknown-subject sentence does not assert 'no running agent' from a probe that returns undefined on failure", () => {
+      const sentence = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-unknown-subject",
+        reason: "r",
+        markerAgentUid: 707,
+      });
+      // `readRunningHermesGatewayUid` is `try { ps } catch { return undefined }`,
+      // so a ps failure, a PATH problem, and a sandbox restriction are
+      // indistinguishable from "no process". detect.ts is careful and says
+      // "could NOT determine"; this sentence used to flatten that into a
+      // positive claim.
+      expect(sentence).not.toMatch(/and no running agent\b/);
+      expect(sentence).toMatch(/no agent process was found/);
+    });
+
+    // ── FIX G8 (re-gate, 2026-07-26) ────────────────────────────────────
+    it("G8: 'unreadable' blames the MARKER only when the marker is what failed", () => {
+      const marker = describeExclusiveRoutingResidueRefusal({
+        kind: "unreadable",
+        detail: "the residue reconcile threw: cannot read .../exclusive-routing.json (EACCES)",
+        source: "marker",
+      });
+      expect(marker).toMatch(/exclusive-routing marker could NOT be read/);
+      expect(marker).toMatch(/--unprotect-egress-gate/);
+
+      // The verdict is produced by ANY throw out of the op. A malformed anchor
+      // registry leaves the marker perfectly readable, and removing it fixes
+      // nothing -- so neither the claim nor the remedy may be the marker's.
+      const other = describeExclusiveRoutingResidueRefusal({
+        kind: "unreadable",
+        detail: "the residue reconcile threw: PfAnchorRegistryStateError: registry file is not valid JSON",
+        source: "residue-check",
+      });
+      expect(other).toMatch(/residue check could NOT complete/);
+      expect(other).not.toMatch(/marker could NOT be read/);
+      expect(other).toMatch(/the marker itself may be perfectly readable, so removing it is not the remedy/);
+    });
+
+    // ── FIX G5 (re-gate, 2026-07-26) ────────────────────────────────────
+    it("G5: a removal that failed PART WAY states what it removed instead of claiming no Castle Wall change", () => {
+      const sentence = describeExclusiveRoutingResidueRefusal({
+        kind: "removal-failed",
+        detail: "removing the exclusive-egress gate policy file (/f/policy/egress/x.json) failed: EROFS",
+        removed: ["the exclusive-routing marker (/f/allowlist/exclusive-routing.json)"],
+      });
+      expect(sentence).not.toMatch(/no Castle Wall change was made by this run/);
+      expect(sentence).toMatch(/this run DID change Castle Wall state/);
+      expect(sentence).toMatch(/it removed the exclusive-routing marker \(\/f\/allowlist\/exclusive-routing\.json\)/);
+      expect(sentence).toMatch(/FAILED part way/);
     });
 
     it("F4: the op boundary is a TOTAL union -- a keep can no longer be spelled by omission", () => {
@@ -1807,9 +1891,131 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(
         exclusiveRoutingResidueRefusal({ kind: "kept-unknown-subject", reason: "r", markerAgentUid: 707 }),
       ).toMatchObject({ kind: "kept-unknown-subject" });
-      expect(exclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "d" })).toMatchObject({
+      expect(exclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "d", source: "marker" })).toMatchObject({
         kind: "unreadable",
       });
+      expect(exclusiveRoutingResidueRefusal({ kind: "removal-failed", detail: "d", removed: [] })).toMatchObject({
+        kind: "removal-failed",
+      });
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // FIX G3 (re-gate, 2026-07-26): the residue gate's SUBJECT.
+    //
+    // `readHarnessConfiguredUid()` is hardcoded `undefined` in v1, so
+    // `detectResult.resolved` comes ONLY from a `ps` grep for a RUNNING Hermes
+    // gateway. It is therefore `undefined` on every run whose agent is merely
+    // stopped, crashed, parked, or booting -- which made `kept-unknown-subject`
+    // the DOMINANT keep in production, and its remedy is a destructive teardown
+    // that leaves a healthy host parked and down.
+    // ────────────────────────────────────────────────────────────────────
+    describe("G3: the residue gate's fallback subject (a stopped agent is not an unknown subject)", () => {
+      /** A ctx whose detect probe resolved NO uid: the agent is simply not running. */
+      function stoppedAgentCtx(): ReturnType<typeof baseCtx> {
+        const ctx = baseCtx();
+        return {
+          ...ctx,
+          detectResult: { ...ctx.detectResult, alreadyDedicated: false, resolved: undefined },
+        };
+      }
+
+      it("scopes the gate to the DEDICATED ACCOUNT's uid when this run resolved none, so a stopped agent gets a real verdict", async () => {
+        const reconcile = vi.fn(async () => ({ kind: "clear" as const }));
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: vi.fn(async () => 503),
+        });
+        await runProvisionFlow(stoppedAgentCtx(), ops);
+        // Pre-fix this was called with `undefined` and guard 0 refused the run.
+        expect(reconcile).toHaveBeenCalledWith(503, "observe");
+        expect(reconcile).not.toHaveBeenCalledWith(undefined, "observe");
+      });
+
+      it("uses the SAME subject for the clear half as for the observe half the operator confirmed", async () => {
+        const detail = "no S5-1 registry entry and no serving gate for uid 503";
+        const reconcile = vi.fn(async (_uid: number | undefined, intent: "observe" | "clear") =>
+          intent === "observe" ? { kind: "orphaned" as const, detail } : { kind: "reconciled" as const, detail },
+        );
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: vi.fn(async () => 503),
+        });
+        await runProvisionFlow(stoppedAgentCtx(), ops);
+        expect(reconcile.mock.calls).toEqual([
+          [503, "observe"],
+          [503, "clear"],
+        ]);
+      });
+
+      it("does NOT relax guard 0: no account -> still an unknown subject, still refused", async () => {
+        const reconcile = vi.fn(async () => ({
+          kind: "kept-unknown-subject" as const,
+          reason: "no subject",
+          markerAgentUid: 707,
+        }));
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: vi.fn(async () => undefined),
+        });
+        const result = await runProvisionFlow(stoppedAgentCtx(), ops);
+        expect(reconcile).toHaveBeenCalledWith(undefined, "observe");
+        expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
+        expect(ops.arm).not.toHaveBeenCalled();
+      });
+
+      it("a lookup that THROWS is not a subject: the gate falls back to undefined and refuses, never to a guess", async () => {
+        const reconcile = vi.fn(async () => ({
+          kind: "kept-unknown-subject" as const,
+          reason: "no subject",
+          markerAgentUid: 707,
+        }));
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: vi.fn(async () => {
+            throw new Error("dscl: could not read the directory service");
+          }),
+        });
+        const result = await runProvisionFlow(stoppedAgentCtx(), ops);
+        expect(reconcile).toHaveBeenCalledWith(undefined, "observe");
+        expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
+        expect(ops.createAccount).not.toHaveBeenCalled();
+      });
+
+      it("an ALREADY-RESOLVED uid wins: the fallback lookup is not consulted at all", async () => {
+        const lookup = vi.fn(async () => 503);
+        const reconcile = vi.fn(async () => ({ kind: "clear" as const }));
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: lookup,
+        });
+        await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+        expect(lookup).not.toHaveBeenCalled();
+        expect(reconcile).toHaveBeenCalledWith(AGENT_UID, "observe");
+      });
+    });
+
+    // ── FIX G8 (re-gate): the throw -> verdict classification ────────────
+    it("G8: a MARKER load throw is source 'marker'; any other throw out of the op is source 'residue-check'", async () => {
+      const markerRun = await runProvisionFlow(
+        baseCtx(),
+        happyPathOps({
+          reconcileExclusiveRoutingResidue: vi.fn(async () => {
+            throw new ExclusiveRoutingMarkerError("cannot read exclusive-routing.json (EACCES)");
+          }),
+        }),
+      );
+      expect((markerRun as { reason: string }).reason).toMatch(/exclusive-routing marker could NOT be read/);
+
+      const otherRun = await runProvisionFlow(
+        baseCtx(),
+        happyPathOps({
+          reconcileExclusiveRoutingResidue: vi.fn(async () => {
+            throw new Error("PfAnchorRegistryStateError: registry file is not valid JSON");
+          }),
+        }),
+      );
+      expect((otherRun as { reason: string }).reason).toMatch(/residue check could NOT complete/);
+      expect((otherRun as { reason: string }).reason).not.toMatch(/marker could NOT be read/);
     });
   });
 

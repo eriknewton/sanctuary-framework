@@ -10,7 +10,7 @@
 
 import { describe, it, expect } from "vitest";
 import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
-import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
+import { describeNoAccountResidueTeardown, type AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
 import {
   assessHarnessParked,
   startedCoarseDisposition,
@@ -411,5 +411,56 @@ describe("wrap/cli: the degrade line never asserts a run state it did not observ
     expect(out).toContain("manifest could NOT be restored to coarse scope");
     expect(out).toContain("The agent is RUNNING (pid 9001)");
     expect(out).not.toContain("PARKED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX G2/G5 (re-gate, 2026-07-26): the NO-ACCOUNT residue teardown's operator
+// sentence. `runEgressGateUnprotectForCli` is darwin+root gated, so the mapping
+// verdict -> sentence is exported and asserted here directly.
+// ---------------------------------------------------------------------------
+describe("describeNoAccountResidueTeardown (the --unprotect-egress-gate exit when the agent account is gone)", () => {
+  const ACCOUNT = "sanctuary-hermes";
+
+  it("cleared -> exit 0 and says provisioning can now run", () => {
+    const out = describeNoAccountResidueTeardown(ACCOUNT, {
+      kind: "cleared",
+      detail: "no registry entry and no serving gate for uid 503",
+    });
+    expect(out.code).toBe(0);
+    expect(out.line).toMatch(/provisioning can now run/);
+  });
+
+  it("G2: refused -> the operator is given a REAL path out, not just 'Re-create the dedicated agent account'", () => {
+    // The pre-fix sentence ended at "Re-create the dedicated agent account,
+    // then re-run this command", which names NO product verb: there is no
+    // command that creates the account without provisioning, and provisioning
+    // is refused by the same residue gate that sends the operator here. That
+    // restored the closed loop one state over.
+    const out = describeNoAccountResidueTeardown(ACCOUNT, {
+      kind: "refused",
+      reason: "the S5-1 anchor registry still has an entry for uid 503",
+    });
+    expect(out.code).toBe(2);
+    // File-level statement of what carries the confinement: available in EVERY
+    // state, including the one where no verb applies.
+    expect(out.line).toMatch(/\/var\/db\/sanctuary\/egress-anchor-registry\.json/);
+    expect(out.line).toMatch(/\/Library\/LaunchDaemons\/ai\.sanctuaryprotocol\.egress-gate\.<uid>\.plist/);
+    // And a named verb for the state where one does apply.
+    expect(out.line).toMatch(/--repair-egress-gate/);
+    expect(out.line).toMatch(/Nothing was changed/);
+  });
+
+  it("G5: partial -> states what WAS removed and never claims nothing was changed", () => {
+    const out = describeNoAccountResidueTeardown(ACCOUNT, {
+      kind: "partial",
+      reason: "removing the exclusive-egress gate policy file (/f/policy/egress/x.json) failed: EROFS",
+      removed: ["the exclusive-routing marker (/f/allowlist/exclusive-routing.json)"],
+    });
+    expect(out.code).toBe(2);
+    expect(out.line).not.toMatch(/Nothing was changed/);
+    expect(out.line).toMatch(/FAILED part way/);
+    expect(out.line).toMatch(/This run DID remove the exclusive-routing marker/);
+    expect(out.line).toMatch(/mixed state/);
   });
 });

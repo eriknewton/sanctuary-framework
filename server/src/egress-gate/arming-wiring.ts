@@ -2207,27 +2207,46 @@ export async function reconcileStaleExclusiveRoutingProduction(
         `quarantined=${registry.quarantined.length}); keeping the marker fail-closed until repair`,
     };
   }
-  if (registry.entries.some((e) => e.agent_uid === marker.agent_uid)) {
-    // LIVE, not uncertain: a committed (or coordinator-armed, not-yet-committed)
-    // registry entry is a positive observation that confinement exists for this
-    // uid. The operator sentence for this case must NOT read as "we could not
-    // tell" -- see `describeExclusiveRoutingResidueRefusal`.
-    return {
-      kind: "kept-live",
-      reason:
-        `the S5-1 anchor registry still has an entry for uid ${marker.agent_uid} (committed or ` +
-        "mid-bring-up); the marker may reflect live confinement, keeping it (repair, not reconcile, " +
-        "recovers a mid-bring-up generation)",
-    };
-  }
+  const registryEntryPresent = registry.entries.some((e) => e.agent_uid === marker.agent_uid);
 
   // Dimension 2: a gate daemon serving (or a plist that could restart one) keeps
   // the marker too; only a positively-absent gate is "not serving". "yes" is an
   // owner-verified LIVE listener; "uncertain" is exactly what its name says.
+  //
+  // FIX G7 (re-gate, 2026-07-26): the registry check used to RETURN `kept-live`
+  // before this probe ever ran. But a registry entry is a RECORD, and by its own
+  // reason string it covers a "mid-bring-up" generation -- i.e. possibly the
+  // interrupted arm this whole gate is about. `kept-live`'s operator sentence
+  // offers "nothing needs doing", which is the wrong advice for a wedged host.
+  // So the ONLY thing that earns `kept-live` now is the owner-verified live
+  // listener, which is an OBSERVATION; the registry entry is probed alongside it
+  // and, without a live listener, reports as the uncertainty it is. The healthy
+  // armed host still gets `kept-live` (it has both), so nothing was lost.
   const gate = await probeRecordedGateServing(marker, { readRuntimeState, verifyPortOwner, plistExists });
+  if (gate.serving === "yes") {
+    return {
+      kind: "kept-live",
+      reason:
+        `gate liveness for uid ${marker.agent_uid} is yes (${gate.detail})` +
+        (registryEntryPresent ? `, and the S5-1 anchor registry has an entry for that uid` : "") +
+        "; keeping the marker",
+    };
+  }
+  if (registryEntryPresent) {
+    return {
+      kind: "kept-uncertain",
+      reason:
+        `the S5-1 anchor registry still has an entry for uid ${marker.agent_uid} (committed or ` +
+        `mid-bring-up) and no live gate listener was verified (${gate.detail}); the marker may ` +
+        "reflect live confinement or an interrupted arm, keeping it (repair, not reconcile, " +
+        "recovers a mid-bring-up generation)",
+    };
+  }
   if (gate.serving !== "no") {
-    const reason = `gate liveness for uid ${marker.agent_uid} is ${gate.serving} (${gate.detail}); keeping the marker`;
-    return gate.serving === "yes" ? { kind: "kept-live", reason } : { kind: "kept-uncertain", reason };
+    return {
+      kind: "kept-uncertain",
+      reason: `gate liveness for uid ${marker.agent_uid} is ${gate.serving} (${gate.detail}); keeping the marker`,
+    };
   }
 
   // PROVABLY ORPHANED: no registry entry AND no serving gate.
@@ -2243,18 +2262,58 @@ export async function reconcileStaleExclusiveRoutingProduction(
 
   // Remove the marker + gate policy with the EXACT pair
   // restoreCoarseCompositionProduction uses, audit LOUD (invariant 3).
-  await removeFile(exclusiveRoutingMarkerPath(input.fortressPath));
-  await removeFile(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME));
+  //
+  // FIX G5 (re-gate, 2026-07-26): the audit is written BEFORE the first removal
+  // and each removal is TRACKED. The pre-fix order was remove, remove, audit,
+  // so a marker removal that succeeded followed by a gate-policy removal that
+  // threw (EPERM/EROFS/EIO, an immutable flag, a read-only remount mid-run)
+  // left BOTH no audit record (invariant 3 broken) and a caller rendering "no
+  // Castle Wall change was made by this run" over a fortress that had just been
+  // put back on coarse composition. The throw is now a verdict that carries
+  // what was in fact removed.
   await input.audit(EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP, {
     agent_uid: marker.agent_uid,
     marker_agent_uid: marker.agent_uid,
     marker_gate_uid: marker.gate_uid,
-    reason: `${detail} -- removed so the arm can proceed`,
+    reason: `${detail} -- removing the marker + gate policy so the arm can proceed`,
   });
+  const removal = await removeExclusiveRoutingResiduePair(input.fortressPath, removeFile);
+  if (!removal.ok) return { kind: "removal-failed", detail: removal.detail, removed: removal.removed };
   input.print(
     `Reconciled a stale exclusive-routing marker for uid ${marker.agent_uid} (no live confinement present).`,
   );
   return { kind: "reconciled", detail };
+}
+
+/**
+ * Remove the exclusive-routing marker + gate policy pair, TRACKING what was
+ * actually deleted so a part-way failure can be reported as what it is rather
+ * than propagating a throw over which a caller renders "nothing changed"
+ * (FIX G5, re-gate 2026-07-26). The pair and its order match
+ * `restoreCoarseCompositionProduction`.
+ */
+async function removeExclusiveRoutingResiduePair(
+  fortressPath: string,
+  removeFile: (path: string) => Promise<void>,
+): Promise<{ ok: true; removed: string[] } | { ok: false; detail: string; removed: string[] }> {
+  const pair: readonly (readonly [string, string])[] = [
+    ["the exclusive-routing marker", exclusiveRoutingMarkerPath(fortressPath)],
+    ["the exclusive-egress gate policy file", join(fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME)],
+  ];
+  const removed: string[] = [];
+  for (const [label, path] of pair) {
+    try {
+      await removeFile(path);
+    } catch (err) {
+      return {
+        ok: false,
+        detail: `removing ${label} (${path}) failed: ${(err as Error).message}`,
+        removed,
+      };
+    }
+    removed.push(`${label} (${path})`);
+  }
+  return { ok: true, removed };
 }
 
 /** What {@link clearExclusiveRoutingResidueWithoutAccount} found and did. */
@@ -2264,7 +2323,13 @@ export type ExclusiveRoutingResidueTeardown =
   /** Leftover exclusive-routing state was removed. */
   | { kind: "cleared"; detail: string }
   /** A marker is present but is NOT residue (confinement for its uid looks live). Nothing changed. */
-  | { kind: "refused"; reason: string };
+  | { kind: "refused"; reason: string }
+  /**
+   * FIX G5 (re-gate, 2026-07-26): the teardown ran and FAILED PART WAY.
+   * `removed` names what it did delete. Distinct from `refused`, whose whole
+   * operator sentence is built on "nothing was changed".
+   */
+  | { kind: "partial"; reason: string; removed: string[] };
 
 /**
  * FIX F3 (adversarial review, 2026-07-26): clear leftover exclusive-routing
@@ -2290,23 +2355,47 @@ export type ExclusiveRoutingResidueTeardown =
  * is untouched; this is a different caller, with a subject, and an explicit
  * operator teardown request behind it.
  *
- * An UNREADABLE marker is removed rather than refused: the account-present
- * teardown path also `rm`s the marker without parsing it, the marker's only
- * function is to select a manifest composition, and with no account there is
- * nothing running at the uid it names. Refusing here would rebuild the same
- * dead end one layer down.
+ * FIX G1 (re-gate, 2026-07-26): an UNREADABLE marker is NO LONGER removed on an
+ * inference. The pre-fix code reasoned "with no account there is nothing running
+ * at the uid it names" and deleted the pair, but `loadExclusiveRoutingMarker`
+ * returns `null` ONLY on ENOENT and THROWS on every other read failure -- EACCES,
+ * EIO, EISDIR, ELOOP, a root-squashed network fortress, a storage path pointing
+ * at a half-mounted volume. In every one of those the marker's `agent_uid` is
+ * present and VALID; it simply was not read. Deleting it then created exactly the
+ * hazard the readable branch names as its reason to refuse: an interrupted arm's
+ * pf anchor, S5-1 registry entry and launchd-restartable gate daemon survive
+ * while the fortress goes back to coarse composition, and the next arm sails
+ * through the residue gate (marker absent -> `clear`) straight over them.
+ * "Could not look" must never authorise a destructive action. The uid-free half
+ * of the orphan proof costs one read: if the S5-1 anchor registry is provably
+ * CLEAN and EMPTY then no per-uid confinement exists for any uid, so whatever
+ * uid the unreadable marker names cannot be confined either, and only then is
+ * the removal proved rather than guessed.
  */
 export async function clearExclusiveRoutingResidueWithoutAccount(
   input: Pick<ExclusiveEgressWiringInput, "fortressPath" | "audit" | "print">,
-  /** TEST SEAMS: marker load, the scoped reconcile, and the file remover. */
+  /** TEST SEAMS: marker load, the registry probe, the scoped reconcile, and the file remover. */
   deps?: {
     loadMarker?: (fortressPath: string) => Promise<ExclusiveRoutingMarker | null>;
     reconcile?: (agentUid: number) => Promise<ExclusiveRoutingResidue>;
     removeFile?: (path: string) => Promise<void>;
+    /** FIX G1: the uid-free half of the orphan proof, used when the marker cannot be read. */
+    listRegistry?: () => Promise<{
+      entries: { agent_uid: number }[];
+      dirty: boolean;
+      quarantined: { index: number; reason: string }[];
+    }>;
   },
 ): Promise<ExclusiveRoutingResidueTeardown> {
   const loadMarker = deps?.loadMarker ?? loadExclusiveRoutingMarker;
   const removeFile = deps?.removeFile ?? (async (path: string): Promise<void> => rm(path, { force: true }));
+  const listRegistry =
+    deps?.listRegistry ??
+    (async (): Promise<{
+      entries: { agent_uid: number }[];
+      dirty: boolean;
+      quarantined: { index: number; reason: string }[];
+    }> => createProductionAnchorRegistry().listQuarantined());
   const reconcile =
     deps?.reconcile ??
     ((agentUid: number): Promise<ExclusiveRoutingResidue> =>
@@ -2316,23 +2405,30 @@ export async function clearExclusiveRoutingResidueWithoutAccount(
   try {
     marker = await loadMarker(input.fortressPath);
   } catch (err) {
-    const detail = `the exclusive-routing marker could not be read (${(err as Error).message})`;
-    await removeFile(exclusiveRoutingMarkerPath(input.fortressPath));
-    await removeFile(join(input.fortressPath, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME));
-    await input.audit(EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP, {
-      agent_uid: null,
-      reason: `${detail}; the dedicated agent account is gone, so the marker + gate policy were removed as residue`,
+    return clearUnreadableExclusiveRoutingResidue(input, `${(err as Error).message}`, {
+      listRegistry,
+      removeFile,
     });
-    return {
-      kind: "cleared",
-      detail:
-        `${detail}, so no uid could be read from it. The marker and gate policy files were removed; ` +
-        "no registry entry, pf anchor, or gate daemon was touched (there was no uid to scope them to)",
-    };
   }
   if (marker === null) return { kind: "no-residue" };
 
-  const residue = await reconcile(marker.agent_uid);
+  // FIX G4 (re-gate, 2026-07-26): `loadMarker` was guarded and this call was
+  // not, so a malformed anchor registry (`PfAnchorRegistryStateError`), a marker
+  // corrupted between the outer load and the inner one, or a non-ENOENT
+  // `removeFile` failure escaped this function as an unhandled rejection --
+  // `wrap/cli.ts` awaits the exit code with no try/catch. Before this delta the
+  // branch was `print(...); return 2;` and could not throw at all.
+  let residue: ExclusiveRoutingResidue;
+  try {
+    residue = await reconcile(marker.agent_uid);
+  } catch (err) {
+    return {
+      kind: "refused",
+      reason:
+        `the exclusive-egress residue check for uid ${marker.agent_uid} could not complete ` +
+        `(${(err as Error).message}), so nothing on this fortress could be proved to be residue`,
+    };
+  }
   switch (residue.kind) {
     case "reconciled":
       return { kind: "cleared", detail: residue.detail };
@@ -2344,12 +2440,75 @@ export async function clearExclusiveRoutingResidueWithoutAccount(
     case "kept-uncertain":
     case "kept-unknown-subject":
       return { kind: "refused", reason: residue.reason };
+    case "removal-failed":
+      // FIX G5: the removal half ran and stopped part way. Say so; do NOT let
+      // this render under a "nothing was changed" frame.
+      return { kind: "partial", reason: residue.detail, removed: residue.removed };
     case "orphaned":
     case "unreadable":
       // Unreachable with `intent: "clear"` and a marker-derived subject; keep
       // the branch total rather than letting a future kind fall through silently.
       return { kind: "refused", reason: `the residue reconcile returned an unexpected verdict (${residue.kind})` };
   }
+}
+
+/**
+ * FIX G1: the UNREADABLE-marker half of {@link clearExclusiveRoutingResidueWithoutAccount}.
+ * Removal here requires a positive orphan proof; a proof that cannot be
+ * established is a REFUSAL, never a removal.
+ */
+async function clearUnreadableExclusiveRoutingResidue(
+  input: Pick<ExclusiveEgressWiringInput, "fortressPath" | "audit" | "print">,
+  loadErrorMessage: string,
+  deps: {
+    listRegistry: () => Promise<{
+      entries: { agent_uid: number }[];
+      dirty: boolean;
+      quarantined: { index: number; reason: string }[];
+    }>;
+    removeFile: (path: string) => Promise<void>;
+  },
+): Promise<ExclusiveRoutingResidueTeardown> {
+  const detail = `the exclusive-routing marker could not be read (${loadErrorMessage})`;
+  let registry: { entries: { agent_uid: number }[]; dirty: boolean; quarantined: { index: number; reason: string }[] };
+  try {
+    registry = await deps.listRegistry();
+  } catch (err) {
+    return {
+      kind: "refused",
+      reason:
+        `${detail}, and the S5-1 anchor registry could not be read either ` +
+        `(${(err as Error).message}), so nothing here could be proved orphaned. Removing the marker ` +
+        "on that basis would be a guess, and a wrong guess de-confines a live agent",
+    };
+  }
+  if (registry.dirty || registry.quarantined.length > 0 || registry.entries.length > 0) {
+    return {
+      kind: "refused",
+      reason:
+        `${detail}, so no uid could be read from it -- and the S5-1 anchor registry is NOT provably ` +
+        `empty (entries=${registry.entries.length}, dirty=${registry.dirty}, ` +
+        `quarantined=${registry.quarantined.length}), so per-uid confinement exists and the ` +
+        "unreadable marker may name it. Removing the marker alone would leave the pf anchor and any " +
+        "gate daemon armed for that uid while the signing daemon went back to composing coarse",
+    };
+  }
+
+  const proof =
+    "the S5-1 anchor registry is clean, has nothing quarantined, and holds NO entries at all, so no " +
+    "per-uid confinement exists for any uid and the marker cannot be naming a live one";
+  await input.audit(EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP, {
+    agent_uid: null,
+    reason: `${detail}; ${proof}; removing the marker + gate policy as residue`,
+  });
+  const removal = await removeExclusiveRoutingResiduePair(input.fortressPath, deps.removeFile);
+  if (!removal.ok) return { kind: "partial", reason: removal.detail, removed: removal.removed };
+  return {
+    kind: "cleared",
+    detail:
+      `${detail}, so no uid could be read from it, but ${proof}. The marker and gate policy files ` +
+      "were removed; no registry entry, pf anchor, or gate daemon was touched",
+  };
 }
 
 /**

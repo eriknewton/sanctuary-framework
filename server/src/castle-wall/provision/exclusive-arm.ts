@@ -122,11 +122,29 @@ export type ExclusiveRoutingResidue =
    */
   | { kind: "kept-unknown-subject"; reason: string; markerAgentUid: number }
   /**
-   * The marker could not be read at all (the load contract THROWS on a
-   * present-but-malformed marker; the flow turns that throw into this). The
-   * run must REFUSE, fail-closed: "could not look" is never "nothing there".
+   * The residue check could not complete. The run must REFUSE, fail-closed:
+   * "could not look" is never "nothing there".
+   *
+   * FIX G8 (re-gate, 2026-07-26): `source` exists because this verdict is
+   * produced by ANY throw out of the op, and the operator sentence used to
+   * assert the MARKER was at fault on every one of them. `"marker"` is the
+   * load contract firing on a present-but-unreadable/malformed marker (the
+   * remedy that removes the marker without parsing it is on point).
+   * `"residue-check"` is some OTHER surface the check reads throwing -- a
+   * malformed anchor registry, for instance -- where the marker's own
+   * readability is UNKNOWN and removing it fixes nothing.
    */
-  | { kind: "unreadable"; detail: string };
+  | { kind: "unreadable"; detail: string; source: "marker" | "residue-check" }
+  /**
+   * FIX G5 (re-gate, 2026-07-26): a `"clear"` intent ran the removal half and
+   * it FAILED PART WAY. `removed` names, in order, what this call actually did
+   * delete before the failure, so the refusal sentence can state what changed
+   * on the fortress instead of asserting that nothing did. The pre-fix code
+   * let the second `removeFile`'s throw propagate, which rendered "no Castle
+   * Wall change was made by this run" over a fortress that had just been put
+   * back on coarse composition.
+   */
+  | { kind: "removal-failed"; detail: string; removed: string[] };
 
 /**
  * Injected side effects for the exclusive-egress arming stage. Production
