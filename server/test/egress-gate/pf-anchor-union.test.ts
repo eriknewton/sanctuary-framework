@@ -92,6 +92,31 @@ const ifacesCall = (result: PfCommandResult): ScriptedCall => ({
   result,
 });
 
+const referencesCall = (result: PfCommandResult): ScriptedCall => ({
+  match: (_c, a) => a[0] === "-s" && a[1] === "References",
+  result,
+});
+
+/**
+ * `pfctl -s References` output in the shape captured on hardware
+ * (`fixtures/pf-hardware-capture.ts`): a `TOKENS:` line, a column header, then
+ * one row per held reference. Tokens are rendered into the real column layout
+ * rather than a shape of the test author's invention.
+ */
+function referenceTable(tokens: readonly string[]): string {
+  if (tokens.length === 0) return "No pf starter references held\n";
+  const rows = tokens.map(
+    (t, i) => `${4063 + i}     pfctl                        ${t}     0 days 00:00:00`,
+  );
+  return ["TOKENS:", "PID      Process Name                 TOKEN                    TIMESTAMP", ...rows, ""].join(
+    "\n",
+  );
+}
+
+/** A fixed boot session so no test shells out to sysctl. */
+const BOOT_SESSION_UUID = "4E4A2428-2FBD-4164-B6B6-B1FDA7DA43BD";
+const BOOT_SESSION = async (): Promise<string> => BOOT_SESSION_UUID;
+
 /** A liveness script that is fully LIVE for the given union. */
 function liveScript(entries: Array<{ agent_uid: number; gate_port: number }>): ScriptedCall[] {
   return [
@@ -224,15 +249,17 @@ describe("egress-gate/pf-anchor union primitives", () => {
         } as ScriptedCall,
         { match: (_c, a) => a.length === 2 && a[0] === "-f", result: ok("") }, // hook install
         { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 12345\n") }, // enable
+        referencesCall(ok(referenceTable(["12345"]))),
         infoCall(ok(PF_INFO_ENABLED)),
         anchorRulesCall(ok(canonicalUnionPrint([A, B]))),
         ifacesCall(ok(PF_IFACES_CLEAN)),
       ]);
       const res = await armPfAnchorUnion(runner, [A, B], {
         mainConfPath: "/dev/null",
+        bootSession: BOOT_SESSION,
         ...settleFast,
       });
-      expect(res.enableToken).toBe("12345");
+      expect(res.enableReference).toEqual({ token: "12345", boot_session_uuid: BOOT_SESSION_UUID });
       // pf -E was called exactly once.
       expect(runner.calls.filter((c) => c[1] === "-E").length).toBe(1);
       // The hook install (pfctl -f <mainfile>) fired because the first probe was unhooked.
@@ -240,19 +267,85 @@ describe("egress-gate/pf-anchor union primitives", () => {
       expect(runner.calls.some((c) => c[1] === "-f" && c.length === 3)).toBe(true);
     });
 
-    it("does NOT re-enable pf when an existingEnableToken is supplied (reference counting)", async () => {
+    it("does NOT re-enable pf when the supplied reference is CONFIRMED ours and live (reference counting)", async () => {
+      // Reference counting is preserved for the case the token exists for: an
+      // in-boot re-arm. What changed is that the record alone no longer earns
+      // the reuse -- pf must be enabled AND the reference table must attribute
+      // token 999 to us.
       const runner = scriptedRunner([
         { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
         mainRulesCall(ok(MAIN_RULESET_HOOKED)), // already hooked -> no hook install
+        referencesCall(ok(referenceTable(["999"]))),
         ...liveScript([A]),
       ]);
       const res = await armPfAnchorUnion(runner, [A], {
         mainConfPath: "/dev/null",
-        existingEnableToken: "999",
+        existingEnableReference: { token: "999", boot_session_uuid: BOOT_SESSION_UUID },
+        bootSession: BOOT_SESSION,
         ...settleFast,
       });
-      expect(res.enableToken).toBe("999");
+      expect(res.enableReference).toEqual({ token: "999", boot_session_uuid: BOOT_SESSION_UUID });
+      expect(res.acquiredEnableReference).toBe(false);
       expect(runner.calls.filter((c) => c[1] === "-E").length).toBe(0);
+    });
+
+    it("F-PFBOOT: RE-ENABLES pf when the supplied reference is from a PREVIOUS boot", async () => {
+      // The measured post-reboot state: the persisted token is byte-identical
+      // to its pre-reboot value while pf is Status: Disabled and the anchor is
+      // enforcing nothing. The old predicate (`token supplied -> skip -E`) left
+      // pf disabled here, which is the wrong-allow.
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 24680\n") },
+        referencesCall(ok(referenceTable(["24680"]))),
+        { match: (_c, a) => a[0] === "-X", result: { code: 1, stdout: "", stderr: "pfctl: pf not enabled" } },
+        ...liveScript([A]),
+      ]);
+      const res = await armPfAnchorUnion(runner, [A], {
+        mainConfPath: "/dev/null",
+        existingEnableReference: { token: "999", boot_session_uuid: "AAAAAAAA-0000-4000-8000-000000000001" },
+        bootSession: BOOT_SESSION,
+        ...settleFast,
+      });
+      expect(res.acquiredEnableReference).toBe(true);
+      expect(res.enableReference).toEqual({ token: "24680", boot_session_uuid: BOOT_SESSION_UUID });
+      expect(runner.calls.filter((c) => c[1] === "-E").length).toBe(1);
+    });
+
+    it("F-PFTHIRDPARTY: RE-ENABLES pf when it is held up by a reference that is not ours", async () => {
+      // pf reads Status: Enabled and our record looks plausible, but the
+      // reference table attributes the only reference to somebody else. On
+      // hardware, reusing here meant the gate was declared LIVE on a reference
+      // whose release destroyed confinement in the same boot and generation.
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 13579\n") },
+        // Before -E only the third party's token is held; after, both are.
+        (() => {
+          let seen = 0;
+          return {
+            match: (_c: string, a: readonly string[]) => a[0] === "-s" && a[1] === "References",
+            get result(): PfCommandResult {
+              seen += 1;
+              return ok(referenceTable(seen === 1 ? ["3557565746035151565"] : ["13579", "3557565746035151565"]));
+            },
+          } as ScriptedCall;
+        })(),
+        { match: (_c, a) => a[0] === "-X", result: { code: 1, stdout: "", stderr: "pfctl: pf: token invalid" } },
+        ...liveScript([A]),
+      ]);
+      const res = await armPfAnchorUnion(runner, [A], {
+        mainConfPath: "/dev/null",
+        existingEnableReference: { token: "999", boot_session_uuid: BOOT_SESSION_UUID },
+        bootSession: BOOT_SESSION,
+        ...settleFast,
+      });
+      expect(res.acquiredEnableReference).toBe(true);
+      expect(res.enableReference?.token).toBe("13579");
+      // The third party's reference is never released: it is not ours.
+      expect(runner.calls.some((c) => c[1] === "-X" && c[2] === "3557565746035151565")).toBe(false);
     });
 
     it("throws WITHOUT flushing the anchor on a load failure (Codex B2)", async () => {
@@ -274,15 +367,16 @@ describe("egress-gate/pf-anchor union primitives", () => {
     });
 
     it("releases its OWN acquired -E reference on a post-enable failure, and does NOT flush (gate finding)", async () => {
-      // Load + hook + enable succeed, but the anchor never becomes live (pf
-      // reports Disabled), so settle times out AFTER -E acquired a reference.
+      // Load + hook + enable succeed and pf really does come up, but the anchor
+      // never becomes live (its rules do not match the union), so settle times
+      // out AFTER -E acquired a reference.
       const runner = scriptedRunner([
         { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
         mainRulesCall(ok(MAIN_RULESET_HOOKED)),
         { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 777\n") },
-        // liveness: pf reports DISABLED -> never live -> settle times out
-        infoCall(ok("Status: Disabled\n")),
-        anchorRulesCall(ok(canonicalUnionPrint([A]))),
+        referencesCall(ok(referenceTable(["777"]))),
+        infoCall(ok(PF_INFO_ENABLED)),
+        anchorRulesCall(ok(canonicalUnionPrint([B]))), // wrong uid -> never live
         ifacesCall(ok(PF_IFACES_CLEAN)),
         // the release on failure:
         { match: (_c, a) => a[0] === "-X" && a[1] === "777", result: ok("") },
@@ -290,6 +384,7 @@ describe("egress-gate/pf-anchor union primitives", () => {
       await expect(
         armPfAnchorUnion(runner, [A], {
           mainConfPath: "/dev/null",
+          bootSession: BOOT_SESSION,
           settleConsecutive: 1,
           settleDelayMs: 0,
           settleTimeoutMs: 30,
@@ -302,26 +397,51 @@ describe("egress-gate/pf-anchor union primitives", () => {
       expect(runner.calls.some((c) => c.includes("-F"))).toBe(false);
     });
 
-    it("does NOT release a token it did not acquire (existing token belongs to a prior arm)", async () => {
+    it("REFUSES rather than reporting a reference when -E leaves pf disabled, and gives the token back", async () => {
+      // A 0-exit `pfctl -E` is not evidence that pf is enabled. Previously
+      // this shape surfaced only as a generic settle timeout; now the
+      // invariant is asserted at the point it was supposed to be established,
+      // and the reference this call took is released rather than leaked.
       const runner = scriptedRunner([
         { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
         mainRulesCall(ok(MAIN_RULESET_HOOKED)),
-        infoCall(ok("Status: Disabled\n")), // never live
-        anchorRulesCall(ok(canonicalUnionPrint([A]))),
+        { match: (_c, a) => a[0] === "-E", result: ok("pf enabled\nToken : 888\n") },
+        infoCall(ok("Status: Disabled\n")),
+        { match: (_c, a) => a[0] === "-X" && a[1] === "888", result: ok("") },
+      ]);
+      await expect(
+        armPfAnchorUnion(runner, [A], {
+          mainConfPath: "/dev/null",
+          bootSession: BOOT_SESSION,
+          ...settleFast,
+        }),
+      ).rejects.toThrow(/but pf is still not enabled/);
+      expect(runner.calls.some((c) => c[1] === "-X" && c[2] === "888")).toBe(true);
+      expect(runner.calls.some((c) => c.includes("-F"))).toBe(false);
+    });
+
+    it("does NOT release a reference it did not acquire (it belongs to a prior arm)", async () => {
+      const runner = scriptedRunner([
+        { match: (_c, a) => a[0] === "-a" && a[2] === "-f", result: ok("") },
+        mainRulesCall(ok(MAIN_RULESET_HOOKED)),
+        referencesCall(ok(referenceTable(["555"]))), // confirmed ours and live
+        infoCall(ok(PF_INFO_ENABLED)),
+        anchorRulesCall(ok(canonicalUnionPrint([B]))), // wrong uid -> never live
         ifacesCall(ok(PF_IFACES_CLEAN)),
       ]);
       await expect(
         armPfAnchorUnion(runner, [A], {
           mainConfPath: "/dev/null",
-          existingEnableToken: "555",
+          existingEnableReference: { token: "555", boot_session_uuid: BOOT_SESSION_UUID },
+          bootSession: BOOT_SESSION,
           settleConsecutive: 1,
           settleDelayMs: 0,
           settleTimeoutMs: 30,
           sleep: async () => {},
         }),
       ).rejects.toThrow(/settle-probe timed out/);
-      // Never -X the existing token (a prior arm / other uid still depends on it),
-      // and never -E (already enabled).
+      // Never -X the existing reference (a prior arm / other uid still depends
+      // on it), and never -E (we already hold a confirmed live reference).
       expect(runner.calls.some((c) => c[1] === "-X")).toBe(false);
       expect(runner.calls.some((c) => c[1] === "-E")).toBe(false);
     });

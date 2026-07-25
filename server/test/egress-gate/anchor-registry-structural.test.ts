@@ -56,6 +56,35 @@ describe("egress-gate/anchor-registry structural guard (Codex B2)", () => {
     }
     expect(offenders).toEqual([]);
   });
+
+  it("no egress-gate module other than pf-enable-state.ts invokes pfctl -E or -X", () => {
+    // THE ANTI-DRIFT RATCHET FOR THE ENABLE-REFERENCE CHOKEPOINT.
+    //
+    // The pf enable reference is volatile kernel state; the record of it is a
+    // durable file. Reasoning about that asymmetry inline was got wrong at
+    // three call sites in `pf-anchor.ts` and cost two HIGH wrong-allows on
+    // hardware (2026-07-26 Mini1): a token that outlived the reboot that
+    // zeroed it, and a global `Status: Enabled` read mistaken for evidence
+    // that the reference holding pf up was ours.
+    //
+    // `pf-enable-state.ts` now owns acquire, resolve and release end to end.
+    // This test is what keeps that true: a second `pfctl -E` or `pfctl -X`
+    // anywhere else in this module is a second door onto the same state, and
+    // the whole point of the chokepoint is that there is no second door.
+    const OWNER = "pf-enable-state.ts";
+    const offenders: string[] = [];
+    for (const file of readdirSync(EGRESS_GATE_SRC)) {
+      if (!file.endsWith(".ts") || file === OWNER || file === "index.ts") continue;
+      const text = readFileSync(join(EGRESS_GATE_SRC, file), "utf8");
+      for (const [flag, label] of [
+        [/\[\s*["']-E["']/, "pfctl -E (acquire)"],
+        [/\[\s*["']-X["']/, "pfctl -X (release)"],
+      ] as Array<[RegExp, string]>) {
+        if (flag.test(text)) offenders.push(`${file}: invokes ${label} outside ${OWNER}`);
+      }
+    }
+    expect(offenders).toEqual([]);
+  });
 });
 
 describe("egress-gate/anchor-registry FS store", () => {
