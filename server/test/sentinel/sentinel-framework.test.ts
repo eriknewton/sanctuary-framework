@@ -22,6 +22,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
+import { useTestPassphrase } from "../helpers/temp-fortress.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type Server } from "node:http";
@@ -803,8 +804,14 @@ describe("WP-V1.3-1 Phi-1 CLI subscribe + persistence", () => {
   let outBuf: string;
   let outStream: NodeJS.WritableStream;
 
+  let restorePassphrase: () => void;
+
   beforeEach(async () => {
     storagePath = await mkdtemp(join(tmpdir(), "sanctuary-sentinel-cli-"));
+    // Pin the passphrase so deriveSentinelMasterKey never falls through to
+    // the OS keyring: against a fresh temp fortress that resolver would
+    // GENERATE and store a new login-keychain entry on every run.
+    restorePassphrase = useTestPassphrase();
     outBuf = "";
     outStream = {
       write(chunk: string | Buffer): boolean {
@@ -815,6 +822,7 @@ describe("WP-V1.3-1 Phi-1 CLI subscribe + persistence", () => {
   });
 
   afterEach(async () => {
+    restorePassphrase();
     if (storagePath) {
       await rm(storagePath, { recursive: true, force: true });
     }

@@ -318,7 +318,7 @@ not a junk drawer. Do not move these casually.
 | `cli.ts` | The binary entry point: parses argv, owns `TOP_LEVEL_SUBCOMMANDS` dispatch, lazy-imports each `cli/` handler. |
 | `router.ts` | MCP plumbing (`ToolDefinition`/`toolResult`). Imported as `../router.js` by nearly every module. |
 | `config.ts` | `SanctuaryConfig`. Imported widely as `../config.js`. |
-| `paths.ts` | `resolveStoragePath` + path constants. |
+| `paths.ts` | `resolveStoragePath` + path constants. Also the INTENDED fortress-default chokepoint going forward: `homeFortressPath()` is where `<home>/.sanctuary` should be composed, and new code must not open-code that join. It is not yet the only one: roughly fifteen sites still compose it directly, including `config.ts` (deliberate, and documented there) and the `wrap/` keychain-naming helpers. `assertHermeticStoragePath()` fails a Vitest run closed when a resolution lands on the operator's own fortress, and `saveConfig` applies the same guard at the config write, so a test can no longer silently read real custody or write into `~/.sanctuary`. Escape hatch `SANCTUARY_ALLOW_OPERATOR_FORTRESS=1`; test-side fix is `test/helpers/temp-fortress.ts`. |
 | `version.ts` | The version constant. |
 
 Note: there are 10 other loose root files (`sanctuary-tools.ts`, `sovereignty-profile.ts`,

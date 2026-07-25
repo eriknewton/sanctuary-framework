@@ -46,10 +46,12 @@
  * make a reorg pass.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { createTempHome } from "../helpers/temp-fortress.js";
 
 import { createSanctuaryServer } from "../../src/index.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
@@ -113,6 +115,24 @@ async function listToolDescriptions(
   )) as { tools: Array<{ name: string; description?: unknown }> };
   return result.tools.map((t) => ({ name: t.name, description: t.description }));
 }
+
+
+// Fortress hermeticity: the tool-catalog extractor boots the real server, and
+// `createSanctuaryServer` step 20 writes the config unconditionally. With
+// `HOME` left alone that write lands on the operator's own
+// `~/.sanctuary/sanctuary.json`. Moving `HOME` redirects the mkdir, the
+// permission tightening, and the config write onto a throwaway directory
+// without changing the surface under snapshot. `saveConfig` fails such a write
+// closed under Vitest, so removing this turns the leak into a loud failure.
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+
+beforeEach(async () => {
+  fortressHome = await createTempHome("sanctuary-reorg-surface");
+});
+
+afterEach(async () => {
+  await fortressHome.cleanup();
+});
 
 describe("reorg surface snapshot: MCP tools/list wire shape", () => {
   it("the agent-facing tool catalog matches the committed wire golden (names + inputSchema + order + count)", async () => {

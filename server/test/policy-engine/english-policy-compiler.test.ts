@@ -24,7 +24,7 @@
  * Xi-1 inherits that property by routing through the selector.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Writable } from "node:stream";
@@ -34,6 +34,7 @@ import {
   type AuditEntry,
 } from "../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../src/storage/memory.js";
+import { createTempFortress } from "../helpers/temp-fortress.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import {
   EnglishPolicyCompiler,
@@ -398,6 +399,17 @@ describe("Xi-1 — HTTP routes", () => {
 // ── CLI subcommands ─────────────────────────────────────────────────
 
 describe("Xi-1 — CLI subcommands", () => {
+  // Each CLI invocation gets its own fortress. `policy compile` resolves a
+  // storage path to look for an intelligence substrate; without this it
+  // resolved the operator's own `~/.sanctuary` and read real state.
+  let fortress: Awaited<ReturnType<typeof createTempFortress>>;
+  beforeEach(async () => {
+    fortress = await createTempFortress("sanctuary-policy-cli");
+  });
+  afterEach(async () => {
+    await fortress.cleanup();
+  });
+
   it("policy compile produces a structured output containing the compiled rule", async () => {
     const out = new CollectStream();
     const err = new CollectStream();
@@ -405,6 +417,7 @@ describe("Xi-1 — CLI subcommands", () => {
       argv: ["compile", "always require approval for state_export"],
       out,
       err,
+      storagePath: fortress.storagePath,
     });
     expect(code).toBe(0);
     expect(out.text).toContain("tier1_add_operation");
@@ -437,6 +450,7 @@ describe("Xi-1 — CLI subcommands", () => {
         argv: ["compile", "whenever the agent seems confused, pause and ask me"],
         out,
         err,
+        storagePath: fortress.storagePath,
       });
       expect(code).toBe(0);
       // Output should contain low confidence (no deterministic match, no LLM)
@@ -465,6 +479,7 @@ describe("Xi-1 — CLI subcommands", () => {
       argv: ["compile", "always require approval for state_export"],
       out,
       err,
+      storagePath: fortress.storagePath,
     });
     expect(code).toBe(0);
     expect(out.text).toContain("compile_confidence: high");

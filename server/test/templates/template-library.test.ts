@@ -12,7 +12,7 @@
  *   8. Baseline + CI (tested by the guard, not inline)
  */
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519";
 import { randomBytes } from "@noble/hashes/utils";
 import {
@@ -32,6 +32,7 @@ import { validateCompiledPolicyShape } from "../../src/policy-engine/canonical-p
 import { encodePolicyBlob, decodePolicyBlob } from "../../src/policy-engine/canonical-policy.js";
 import { canonicalizeToBytes } from "../../src/mesh/canonical-json.js";
 import { runTemplateCommand } from "../../src/templates/cli.js";
+import { createTempFortress } from "../helpers/temp-fortress.js";
 
 // ═══════════════════════════════════════════════════════════════════════
 // Test fixtures
@@ -50,6 +51,17 @@ const NODE_KEY = makeNodeKey();
 // ═══════════════════════════════════════════════════════════════════════
 // AC-1: Five templates load end-to-end
 // ═══════════════════════════════════════════════════════════════════════
+
+// Every test in this file that drives a CLI verb resolves a fortress. Without
+// a per-test fortress those verbs resolved the operator's own `~/.sanctuary`,
+// read its real custody, and wrote audit entries into it.
+let __fortress: Awaited<ReturnType<typeof createTempFortress>>;
+beforeEach(async () => {
+  __fortress = await createTempFortress("sanctuary-template-cli");
+});
+afterEach(async () => {
+  await __fortress.cleanup();
+});
 
 describe("AC-1: Five templates load end-to-end", () => {
   beforeEach(() => clearTemplateCache());

@@ -34,6 +34,7 @@ import {
 import type { Erc8004Registration } from "../key-17/erc8004-identity-signer.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
 import { readStoredPassphrase } from "../wrap/passphrase.js";
+import { resolveStoragePath } from "../paths.js";
 
 export interface Erc8004CommandArgs {
   argv: string[];
@@ -135,14 +136,24 @@ async function loadFortressIdentity(
   if (fortressFlag) {
     process.env.SANCTUARY_STORAGE_PATH = fortressFlag;
   }
+  // Resolve to a CONCRETE path here rather than passing
+  // `fortressFlag ?? undefined` down. The old form was right only by
+  // construction of the caller: `undefined` makes the callee re-resolve
+  // ambiently, and it happened to land on the same answer solely because the
+  // line above promoted --fortress onto SANCTUARY_STORAGE_PATH first. That is
+  // the "correct because of what the caller did three lines earlier" posture
+  // this module's structural gate exists to retire, and the gate cannot see
+  // it: `storagePath: <expr>` reads as naming a fortress even when the
+  // expression is `undefined`. Resolving once, here, makes the answer
+  // explicit and byte-identical to what the callee would have computed
+  // (`resolveStoragePath(process.env, homedir())`).
+  const storagePath = resolveStoragePath(process.env);
   let passphrase: string | undefined =
     flagValue(argv, "--passphrase") ?? env.SANCTUARY_PASSPHRASE;
   const recoveryKey = env.SANCTUARY_RECOVERY_KEY;
   if (!passphrase && !recoveryKey) {
     try {
-      const stored = await readStoredPassphrase({
-        storagePath: fortressFlag ?? undefined,
-      });
+      const stored = await readStoredPassphrase({ storagePath });
       if (stored) {
         passphrase = stored.value;
       }

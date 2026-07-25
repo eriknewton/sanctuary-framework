@@ -15,6 +15,7 @@ import { runDidWebCommand } from "../../src/cli/did-web.js";
 import { runTemplateCommand } from "../../src/templates/cli.js";
 import type { HealthProbeResult } from "../../src/cli/agents/health.js";
 import type { TenantDescriptor } from "../../src/cli/agents/discovery.js";
+import { createTempFortress } from "../helpers/temp-fortress.js";
 
 class StringWritable extends Writable {
   chunks: string[] = [];
@@ -103,6 +104,17 @@ async function isolateConfigHome(): Promise<{ restore: () => Promise<void> }> {
     },
   };
 }
+
+// Every test in this file that drives a CLI verb resolves a fortress. Without
+// a per-test fortress those verbs resolved the operator's own `~/.sanctuary`,
+// read its real custody, and wrote audit entries into it.
+let __fortress: Awaited<ReturnType<typeof createTempFortress>>;
+beforeEach(async () => {
+  __fortress = await createTempFortress("sanctuary-singleton-audit");
+});
+afterEach(async () => {
+  await __fortress.cleanup();
+});
 
 describe("agents config audit writes (ZZZZZ pr 3/3)", () => {
   let home: string;
