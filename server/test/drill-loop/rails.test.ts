@@ -402,6 +402,29 @@ describe("drill-loop rails: the trusted (root-owned) directory chain", () => {
     );
   });
 
+  it("refuses a base whose own directory is world-writable", () => {
+    // The walker must actually CALL the per-component predicate. Without this
+    // case, replacing the call with `true` left the whole suite green: the
+    // predicate's own cases pass because they drive it directly.
+    const wide = path.join(sandbox, "wide-base");
+    fs.mkdirSync(wide);
+    fs.chmodSync(wide, 0o777);
+    expectReject(probe("trusted-chain", "base", wide), "group- or world-writable");
+  });
+
+  it("refuses a base whose INTERMEDIATE component is world-writable", () => {
+    // And it must walk EVERY component, not just the leaf. The leaf here is
+    // fine; its parent is not.
+    const wide = path.join(sandbox, "wide-parent");
+    const inner = path.join(wide, "inner");
+    fs.mkdirSync(inner, { recursive: true });
+    fs.chmodSync(inner, 0o755);
+    fs.chmodSync(wide, 0o777);
+    const r = probe("trusted-chain", "base", inner);
+    expectReject(r, "group- or world-writable");
+    expect(r.out, "the rejection must name the INTERMEDIATE component").toContain(wide);
+  });
+
   it("refuses a relative base", () => {
     expectReject(probe("trusted-chain", "base", "relative"), "not an absolute path");
   });
@@ -579,6 +602,38 @@ describe("drill-loop rails: host rail (the part that held, kept intact)", () => 
 
   it("accepts a legitimate drill host", () => {
     expectAccept(probe("host", "agents-mac-mini"), "PROBE=ACCEPT");
+  });
+
+  /**
+   * The wrapper's ACTUAL call shape: three observed identities, any of which
+   * may be empty. The reviewed wrapper chose between three if/elif branches
+   * that passed different subsets, and one of them SILENTLY DROPPED the
+   * ComputerName alias. A rail can only refuse what it is shown, so a branch
+   * that drops an identity is a fail-open however strict the rail is.
+   */
+  it("screens an identity in the SECOND position", () => {
+    expectReject(
+      probe("host-observed", "agents-mac-mini", "Eriks-MacBook-Air", ""),
+      "un-overridable denylist"
+    );
+  });
+
+  it("screens an identity in the THIRD position when the second is empty", () => {
+    // This is the exact branch the reviewed `elif` chain dropped.
+    expectReject(
+      probe("host-observed", "agents-mac-mini", "", "Erik’s MacBook Air"),
+      "un-overridable denylist"
+    );
+  });
+
+  it("accepts when only the short name could be observed", () => {
+    // An empty identity is skipped, not refused: "this box has no
+    // ComputerName" is not a reason to refuse a legitimate drill host.
+    expectAccept(probe("host-observed", "agents-mac-mini", "", ""), "PROBE=ACCEPT");
+  });
+
+  it("refuses when NOTHING could be observed", () => {
+    expectReject(probe("host-observed", "", "", ""), "no host identity could be observed");
   });
 });
 
@@ -895,6 +950,19 @@ describe("drill-loop wrapper: the shipped artifact's own structure", () => {
     expect(exec).toMatch(/RAILS_SYSTEM_BIN_DIRS='\/usr\/bin \/bin \/usr\/sbin \/sbin'/);
   });
 
+  it("hands EVERY observed host identity to the rail, in one branchless call", () => {
+    // The reviewed wrapper's if/elif chain dropped the ComputerName alias in
+    // one of its branches. A rail can only refuse what it is shown, and no
+    // rail-level test can see an argument the caller never passes, so this
+    // asserts the call site itself.
+    const exec = executableLines(assembled);
+    expect(exec).toContain(
+      'rails_assert_host_allowed_observed "$h_short" "$h_full" "$h_computer"'
+    );
+    // and no branchy variant survives alongside it
+    expect(exec).not.toMatch(/elif \[ -n "\$h_full" \]/);
+  });
+
   it("exposes no environment or flag override anywhere in the shipped surface", () => {
     const sudoers = fs.readFileSync(
       path.join(DRILL_LOOP, "sudoers.d", "sanctuary-drill"),
@@ -1138,6 +1206,19 @@ describe("drill-loop wrapper: every verb, not just the oracle", () => {
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=OK verb=kickstart-daemons");
     expect(r.out).toContain("kickstart failed for");
+  });
+
+  it("pf-anchor-rules refuses when pfctl could not be run at all", () => {
+    // The verb behind the pf fail-closed fix. `pfctl` needs root, and does not
+    // exist on Linux at all, so a non-root run must REFUSE rather than print
+    // an empty anchor and call it success. "Could not read" and "read, and it
+    // was empty" have to be two different answers, or the stop-the-night check
+    // is back to reporting CLEAN having observed nothing.
+    if (myUid === 0) return;
+    const r = wrapper("pf-anchor-rules", "--run-id", "good1", "--operator-account", me);
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain("WRAPPER=OK verb=pf-anchor-rules");
+    expect(r.out).toContain("could not read the pf anchor");
   });
 
   it("arm refuses without an agent account, before touching the CLI", () => {

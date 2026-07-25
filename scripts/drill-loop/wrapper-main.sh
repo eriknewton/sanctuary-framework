@@ -174,14 +174,11 @@ wrapper_run_rails() {
   h_full="$(rails__sys hostname -f 2>/dev/null || rails__sys hostname 2>/dev/null || printf '')"
   h_computer="$(rails__sys scutil --get ComputerName 2>/dev/null || printf '')"
   if [ -z "$h_short" ]; then wrapper_die 'cannot determine hostname; refusing'; fi
-  # Aliases are only passed when non-empty: an empty identity is itself a
-  # rejection inside the rail, and "this box has no ComputerName" is not a
-  # reason to refuse a legitimate drill host. Built as a list so no branch can
-  # silently DROP an alias, which the reviewed build's `elif` chain did.
-  local -a host_names=("$h_short")
-  if [ -n "$h_full" ]; then host_names+=("$h_full"); fi
-  if [ -n "$h_computer" ]; then host_names+=("$h_computer"); fi
-  wrapper_rail rails_assert_host_allowed "${host_names[@]}" \
+  # ONE call, no branches, every observed identity handed over. The reviewed
+  # build chose between three if/elif branches that passed different subsets,
+  # and one of them silently DROPPED the ComputerName alias. The rail skips the
+  # empty ones itself, so there is nothing here to get wrong.
+  wrapper_rail rails_assert_host_allowed_observed "$h_short" "$h_full" "$h_computer" \
     || wrapper_die "host rail rejected $h_short"
 
   # 2. OPERATOR ACCOUNT, before any `sudo -u`. The reviewed build passed this

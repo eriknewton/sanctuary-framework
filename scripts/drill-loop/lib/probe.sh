@@ -102,8 +102,15 @@ case "$kind" in
     ;;
   host)
     if [ "$#" -lt 1 ]; then die 'host needs at least <primary>'; fi
-    rails_assert_host_allowed "$@" || die "host rail rejected: $1"
+    ( rails_assert_host_allowed "$@" ) || die "host rail rejected: $1"
     printf 'PROBE=ACCEPT host=%s\n' "$1"
+    ;;
+  host-observed)
+    # The wrapper's ACTUAL call shape: three observed identities, any of which
+    # may be empty. Drives the collection, not just the comparison.
+    if [ "$#" -lt 1 ]; then die 'host-observed needs at least <primary>'; fi
+    ( rails_assert_host_allowed_observed "$@" ) || die "host rail rejected: ${1:-<empty>}"
+    printf 'PROBE=ACCEPT host-observed=%s\n' "${1:-<empty>}"
     ;;
   account)
     if [ "$#" -ne 2 ]; then die 'account needs <label> <account>'; fi

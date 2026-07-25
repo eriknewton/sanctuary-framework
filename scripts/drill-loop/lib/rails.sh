@@ -796,6 +796,38 @@ rails_assert_host_allowed() {
   rails__die "host '$primary' is not on the compiled-in drill-host allowlist; refusing (fail closed)"
 }
 
+# Screen EVERY observed identity, dropping none, skipping only the empty ones.
+#
+# This exists because the reviewed wrapper collected `hostname -s`, `hostname -f`
+# and `scutil --get ComputerName` and then chose between three `if`/`elif`
+# branches that passed different subsets: when `hostname -f` was empty but
+# ComputerName was not, the ComputerName alias was SILENTLY DROPPED. A rail can
+# only refuse what it is shown, so a branch that drops an identity is a
+# fail-open no matter how strict the rail is.
+#
+# Putting the collection in ONE function with no branches makes that
+# impossible, and makes it testable without needing a machine whose
+# `scutil --get ComputerName` happens to be interesting: pass three values, one
+# of them denied, and the rail must refuse whichever position it is in.
+#
+# An empty identity is skipped rather than refused: "this box has no
+# ComputerName" is not a reason to refuse a legitimate drill host. All-empty is
+# refused, because then nothing was observed at all.
+rails_assert_host_allowed_observed() {
+  if [ "$#" -lt 1 ]; then
+    rails__die "rails_assert_host_allowed_observed: expected at least 1 arg"
+  fi
+  local n
+  local -a observed=()
+  for n in "$@"; do
+    if [ -n "$n" ]; then observed+=("$n"); fi
+  done
+  if [ "${#observed[@]}" -eq 0 ]; then
+    rails__die "no host identity could be observed; refusing (fail closed)"
+  fi
+  rails_assert_host_allowed "${observed[@]}"
+}
+
 # ---------------------------------------------------------------------------
 # R3 - account rails
 # ---------------------------------------------------------------------------

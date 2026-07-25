@@ -108,10 +108,10 @@ if [ "$ITERATIONS" -lt 1 ]; then die '--iterations must be at least 1'; fi
 # the `||` can act on, exactly as the command-substitution form does.
 # `hostname` and `scutil` go through the absolute resolver because the review
 # defeated this rail with a planted `hostname` on PATH.
-( rails_assert_host_allowed \
+( rails_assert_host_allowed_observed \
     "$(rails__sys hostname -s 2>/dev/null || printf '')" \
     "$(rails__sys hostname -f 2>/dev/null || rails__sys hostname 2>/dev/null || printf '')" \
-    "$(rails__sys scutil --get ComputerName 2>/dev/null || printf 'no-computer-name')" ) \
+    "$(rails__sys scutil --get ComputerName 2>/dev/null || printf '')" ) \
   || rail_stop "host rail refused $(rails__sys hostname -s 2>/dev/null || printf 'unknown')"
 
 OPERATOR_UID="$(rails_assert_non_root_account operator "$OPERATOR")" \

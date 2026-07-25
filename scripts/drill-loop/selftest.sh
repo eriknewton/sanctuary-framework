@@ -267,6 +267,21 @@ expect_reject 'ComputerName as an extra alias' 'un-overridable denylist' \
   -- "$PROBE" host 'agents-mac-mini' "Erik's MacBook Air"
 expect_accept 'a legitimate drill host' 'PROBE=ACCEPT' -- "$PROBE" host 'agents-mac-mini'
 
+# The wrapper's ACTUAL call shape: three observed identities, any of which may
+# be empty. The reviewed wrapper chose between three if/elif branches that
+# passed different subsets, and one of them silently DROPPED the ComputerName
+# alias. A rail can only refuse what it is shown.
+expect_accept 'observed: only a short name' 'PROBE=ACCEPT' \
+  -- "$PROBE" host-observed 'agents-mac-mini' '' ''
+expect_accept 'observed: short name plus a full name' 'PROBE=ACCEPT' \
+  -- "$PROBE" host-observed 'agents-mac-mini' 'agents-mac-mini.local' ''
+expect_reject 'observed: a denied name in the SECOND position' 'un-overridable denylist' \
+  -- "$PROBE" host-observed 'agents-mac-mini' 'Eriks-MacBook-Air' ''
+expect_reject 'observed: a denied name in the THIRD position, no second' 'un-overridable denylist' \
+  -- "$PROBE" host-observed 'agents-mac-mini' '' "Erik's MacBook Air"
+expect_reject 'observed: nothing at all was observed' 'no host identity could be observed' \
+  -- "$PROBE" host-observed '' '' ''
+
 printf '== account rail ==\n'
 expect_reject 'root by name' 'refusing the root account by name' \
   -- "$PROBE" account operator 'root'
@@ -503,6 +518,14 @@ expect_reject 'unprotect refuses a missing CLI' 'CLI not found' \
 # job. The reviewed verb ran `|| true` and printed WRAPPER=OK regardless.
 expect_reject 'kickstart-daemons reports a failed restart' 'kickstart failed for' \
   -- "$TEST_WRAPPER" kickstart-daemons --run-id 'good1' --operator-account "$ME"
+# The verb behind the pf fail-closed fix, driven directly. `pfctl` needs root
+# (and does not exist on Linux at all), so a non-root run here MUST refuse
+# rather than print an empty anchor and call it success. That is the whole
+# point: "could not read" and "read, and it was empty" must be two answers.
+if [ "$(id -u)" -ne 0 ]; then
+  expect_reject 'pf-anchor-rules refuses when pfctl cannot run' 'could not read the pf anchor' \
+    -- "$TEST_WRAPPER" pf-anchor-rules --run-id 'good1' --operator-account "$ME"
+fi
 # Every verb refuses a bad run id before doing anything at all.
 for v in mint clean-markers gate-state kickstart-daemons repair unprotect pf-anchor-rules; do
   expect_reject "verb $v refuses a traversal run id" 'run id rejected' \
@@ -541,7 +564,12 @@ for a in "${args[@]}"; do
       exit 0
       ;;
     unprotect|clean-markers) exit "${STUB_WRAPPER_RC:-0}" ;;
-    curl) echo "${STUB_CURL_CODE:-200}"; exit 0 ;;
+    curl)
+      if [ "${STUB_CURL:-ok}" = 'refused' ]; then
+        echo 'sudo: a password is required' >&2
+        exit 1
+      fi
+      echo "${STUB_CURL_CODE:-200}"; exit 0 ;;
   esac
 done
 exit 0
@@ -613,6 +641,22 @@ case "$out" in
     PASS=$((PASS + 1)) ;;
   *)
     printf 'FAIL  a still-confined agent was not reported dirty\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# The OTHER half, which is a different branch: the as-agent probe could not be
+# RUN at all, because `sudo -n -u <agent>` is not covered by the reviewed grant.
+# "Could not observe" must be DIRTY and must say so, not be folded into "still
+# confined" and not be read as clean.
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL=refused run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=DIRTY check=agent-unconfined reason=could not RUN the as-agent probe'*)
+    printf 'ok    an as-agent probe that could not RUN is DIRTY, and says which\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  a probe that could not run was not reported as unobservable\n'
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 

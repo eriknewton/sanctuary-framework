@@ -39,10 +39,10 @@ if [ "$(id -u)" -ne 0 ]; then die 'must run as root (sudo)'; fi
 # refusal message is this file's and not a bare RAILS_REJECT line; and
 # `hostname` / `scutil` go through the absolute resolver, because the review
 # defeated the host rail with a planted `hostname` on PATH.
-( rails_assert_host_allowed \
-    "$(rails__sys hostname -s 2>/dev/null || printf 'unknown')" \
-    "$(rails__sys hostname -f 2>/dev/null || printf 'unknown')" \
-    "$(rails__sys scutil --get ComputerName 2>/dev/null || printf 'no-computer-name')" ) \
+( rails_assert_host_allowed_observed \
+    "$(rails__sys hostname -s 2>/dev/null || printf '')" \
+    "$(rails__sys hostname -f 2>/dev/null || printf '')" \
+    "$(rails__sys scutil --get ComputerName 2>/dev/null || printf '')" ) \
   || die 'host rail rejected this machine; refusing to install'
 
 "$HERE/build-wrapper.sh" --verify-hash >/dev/null \
