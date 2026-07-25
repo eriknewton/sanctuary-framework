@@ -166,9 +166,32 @@ REGISTRY_RC=0
 registry_out="$("$SUDO" -n "$WRAPPER" registry-state \
   --run-id "$RUN_ID" --operator-account "$OPERATOR" 2>&1)" || REGISTRY_RC=$?
 printf 'registry read rc=%s:\n%s\n' "$REGISTRY_RC" "$registry_out" >> "$LOG"
+# ROUND-5 L2, taken past the token swap. The verb prints the registry file's
+# own BYTES between REGISTRY-BEGIN and REGISTRY-END, and its VERDICT after
+# them. A `grep` over the combined output therefore reads a machine token out
+# of a CONTENT REGION -- which is the defect, not the particular token, and
+# just renaming the token would have left it. The verdict is always the LAST
+# `WRAPPER=OK verb=registry-state state=` line by construction (content is
+# printed before it), so that is what is read. Pure shell, no external
+# command: every tool a driver's evidence rests on must be absolutely
+# resolved, and a bare `tail` here would be the round-3 BLOCKER-1 shape.
+registry_verdict=''
+while IFS= read -r _rline; do
+  case "$_rline" in
+    'WRAPPER=OK verb=registry-state state='*)
+      _rline="${_rline#WRAPPER=OK verb=registry-state state=}"
+      registry_verdict="${_rline%% *}"
+      ;;
+  esac
+done <<REGISTRY_VERDICT_EOF
+$registry_out
+REGISTRY_VERDICT_EOF
+
 if [ "$REGISTRY_RC" -ne 0 ]; then
   clean_unobserved registry "could not READ the pf-anchor registry (rc=$REGISTRY_RC); an unread registry is not a clean registry"
-elif printf '%s\n' "$registry_out" | "$GREP" -q '^WRAPPER=REGISTRY-ABSENT'; then
+elif [ "$registry_verdict" = 'absent' ]; then
+  # ROUND-5 L2, same as preflight.sh: key on the verb's single-line VERDICT,
+  # never on a token that can also appear inside the content region it prints.
   clean_pass registry 'no registry file on this host'
 elif printf '%s\n' "$registry_out" | "$GREP" -q -F -- "$STORAGE"; then
   clean_fail registry "the registry still references $STORAGE"

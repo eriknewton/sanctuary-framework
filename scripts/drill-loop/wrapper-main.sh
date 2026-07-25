@@ -41,7 +41,7 @@ WRAPPER_CLI='/usr/local/bin/sanctuary'
 # that cannot observe must be given a way to observe, or told plainly that it
 # could not; these verbs are the first half and the drivers' tri-state verdicts
 # are the second.
-WRAPPER_VERBS='check mint kickstart-daemons arm repair unprotect clean-markers retire gate-state pf-anchor-rules registry-state fortress-state gate-log'
+WRAPPER_VERBS='check mint kickstart-daemons arm repair unprotect clean-markers retire gate-state pf-anchor-rules registry-state fortress-state gate-log gate-port'
 
 # How much of the gate log a single `gate-log` call returns.
 WRAPPER_GATE_LOG_LINES=200
@@ -87,6 +87,12 @@ verbs:
                     if there is no log to read (needs --agent-uid);
                     --log-cursor-only records per-log cursors and
                     --since-<stream> prints only bytes appended after them
+  gate-port         report the port the gate daemon ACTUALLY bound for this
+                    agent uid, and the generation it belongs to, read as root
+                    from the daemon's own runtime state (needs --agent-uid).
+                    Without this the drivers cannot address the gate at all:
+                    it is a loopback CONNECT proxy on a per-generation port and
+                    nothing redirects traffic into it.
 
 THERE IS NO --storage FLAG. The caller supplies a RUN ID, which is not a path
 and cannot contain a slash; the wrapper composes the storage path itself under
@@ -401,6 +407,17 @@ wrapper_open_safe_file_under() {
   WRAPPER_SAFE_TARGET="$checked"
   oldpwd="$(pwd -P 2>/dev/null || printf '/')"
   cd -P "$root" || wrapper_die "could not enter safe root for $label: $root"
+  # ROUND-5 L4. Every DESCENDED component gets a `pwd -P`-vs-expected assertion
+  # below; the root itself did not. The property was held by an invariant
+  # somewhere else (`rails_assert_safe_subpath` refuses a non-canonical root,
+  # and `rails_assert_trusted_dir_chain` returns a resolved one), which is
+  # exactly the shape of the round-2 unchecked-intermediate finding: a
+  # guarantee asserted at a distance instead of at the point that depends on
+  # it. It is one line, and it is now here.
+  actual="$(pwd -P)" || wrapper_die "could not resolve cwd after entering the safe root for $label: $root"
+  if [ "$actual" != "$root" ]; then
+    wrapper_die "$label safe root $root resolved to $actual; refusing to read under a root that is not what it says"
+  fi
   expected="$root"
   parent_rel="${rel%/*}"
   leaf="${rel##*/}"
@@ -832,9 +849,26 @@ wrapper_verb_fortress_state() {
 # through `rails_assert_safe_subpath`, opens the file once, verifies the opened
 # fd still has the lstat'd identity, and reads from that fd rather than
 # reopening the pathname.
+# ROUND-5 M3. The four streams are NOT interchangeable and this verb treated
+# them as if they were. `allowlist`, `peer=` and `peer_uid_mismatch` are
+# written by the GATE DAEMON, whose log lives in the gate service account's
+# home; the peer-resolver's logs live in the disposable fortress. When
+# `wrapper_prepare_gate_log_root` returned 1 the two gate streams were skipped
+# SILENTLY, and a single readable peer-resolver log made `found=1` and this
+# verb exit 0. The driver then grepped for a gate reason, missed, and reported
+# `N1 FAIL "denied but not for an allowlist reason"` -- a GATE-BLAMED FAILURE
+# for a HARNESS-BLIND condition. It fails in the safe direction and tells the
+# wrong story in the morning, which is the failure mode that cost a full day on
+# 2026-07-24.
+#
+# So read mode now emits one `WRAPPER=GATE-LOG-READ key=<k> state=read|absent`
+# line PER STREAM, exactly as cursor mode already did, and the driver decides
+# per PATTERN which stream class would have carried it. "The stream that would
+# have carried this reason was absent" is then a distinct answer from "the
+# stream was read and the reason was not in it", which is the whole point.
 wrapper_verb_gate_log() {
   wrapper_require_agent
-  local gate_base='' gate_account found=0 rel stream key cursor
+  local gate_base='' gate_account found=0 rel stream key cursor root
   gate_account="$(rails_product_gate_account_for_agent_account "$ARG_AGENT")" \
     || wrapper_die "could not derive the product gate account from agent account $ARG_AGENT"
 
@@ -842,17 +876,67 @@ wrapper_verb_gate_log() {
     gate_base="$WRAPPER_SAFE_TARGET"
   fi
 
+  # CURSOR MODE prints no content, so its per-key lines can be interleaved.
+  if [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
+    for stream in out err; do
+      rel="$gate_account/$RAILS_PRODUCT_GATE_LOG_DIR/egress-gate-$AGENT_UID.$stream.log"
+      if [ "$stream" = 'out' ]; then key='gate_out'; else key='gate_err'; fi
+      if [ -n "$gate_base" ]; then
+        wrapper_emit_log_cursor "$key" "$gate_base" "$rel" "$key"
+      else
+        printf 'WRAPPER=GATE-LOG-CURSOR key=%s cursor=0,0,0,0 file=absent\n' "$key"
+      fi
+    done
+    for stream in out err; do
+      rel="$RAILS_PRODUCT_GATE_LOG_DIR/peer-resolver-$AGENT_UID.$stream.log"
+      if [ "$stream" = 'out' ]; then key='peer_out'; else key='peer_err'; fi
+      wrapper_emit_log_cursor "$key" "$STORAGE" "$rel" "$key"
+    done
+    printf 'WRAPPER=OK verb=gate-log mode=cursor agent_uid=%s gate_account=%s\n' "$AGENT_UID" "$gate_account"
+    return 0
+  fi
+
+  # READ MODE: THE PER-STREAM REPORT COMES FIRST, BEFORE ANY CONTENT.
+  #
+  # This ordering is load-bearing and it is a defect I found in my own first
+  # pass at the M3 fix. Emitting `WRAPPER=GATE-LOG-READ` after each stream's
+  # bytes puts a machine token INSIDE the content region, and the gate log is
+  # written by the gate service uid. A log line reading
+  # `WRAPPER=GATE-LOG-READ key=gate_out state=read` would then have told the
+  # driver a stream had been read that had not: exactly the round-5 L2 class
+  # (a token trusted from inside content) committed while closing round-5 M3.
+  #
+  # So the header pass decides read-vs-absent with `wrapper_open_safe_file_under`,
+  # which prints NOTHING, emits all four verdicts, and closes the region with a
+  # sentinel the driver stops parsing at. The tail pass then re-runs the FULL
+  # resolution and cursor checks, so a file swapped between the two passes dies
+  # there rather than being attributed: the header can only ever be more
+  # pessimistic than the content, never more optimistic.
+  for stream in gate_out gate_err peer_out peer_err; do
+    case "$stream" in
+      gate_out) key='gate_out'; rel="$gate_account/$RAILS_PRODUCT_GATE_LOG_DIR/egress-gate-$AGENT_UID.out.log" ;;
+      gate_err) key='gate_err'; rel="$gate_account/$RAILS_PRODUCT_GATE_LOG_DIR/egress-gate-$AGENT_UID.err.log" ;;
+      peer_out) key='peer_out'; rel="$RAILS_PRODUCT_GATE_LOG_DIR/peer-resolver-$AGENT_UID.out.log" ;;
+      *)        key='peer_err'; rel="$RAILS_PRODUCT_GATE_LOG_DIR/peer-resolver-$AGENT_UID.err.log" ;;
+    esac
+    case "$stream" in
+      gate_*) root="$gate_base" ;;
+      *)      root="$STORAGE" ;;
+    esac
+    if [ -n "$root" ] && wrapper_open_safe_file_under "$root" "$rel" "$key"; then
+      exec 9<&-
+      printf 'WRAPPER=GATE-LOG-READ key=%s state=read\n' "$key"
+    else
+      printf 'WRAPPER=GATE-LOG-READ key=%s state=absent\n' "$key"
+    fi
+  done
+  printf 'WRAPPER=GATE-LOG-CONTENT-BEGIN\n'
+
   for stream in out err; do
     rel="$gate_account/$RAILS_PRODUCT_GATE_LOG_DIR/egress-gate-$AGENT_UID.$stream.log"
     if [ "$stream" = 'out' ]; then key='gate_out'; cursor="$ARG_SINCE_GATE_OUT"; else key='gate_err'; cursor="$ARG_SINCE_GATE_ERR"; fi
-    if [ -n "$gate_base" ]; then
-      if [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
-        wrapper_emit_log_cursor "$key" "$gate_base" "$rel" "$key"
-      elif wrapper_tail_safe_file_under "$gate_base" "$rel" "$key" "$cursor"; then
-        found=$(( found + 1 ))
-      fi
-    elif [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
-      printf 'WRAPPER=GATE-LOG-CURSOR key=%s cursor=0,0,0,0 file=absent\n' "$key"
+    if [ -n "$gate_base" ] && wrapper_tail_safe_file_under "$gate_base" "$rel" "$key" "$cursor"; then
+      found=$(( found + 1 ))
     fi
   done
 
@@ -861,21 +945,75 @@ wrapper_verb_gate_log() {
   for stream in out err; do
     rel="$RAILS_PRODUCT_GATE_LOG_DIR/peer-resolver-$AGENT_UID.$stream.log"
     if [ "$stream" = 'out' ]; then key='peer_out'; cursor="$ARG_SINCE_PEER_OUT"; else key='peer_err'; cursor="$ARG_SINCE_PEER_ERR"; fi
-    if [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
-      wrapper_emit_log_cursor "$key" "$STORAGE" "$rel" "$key"
-    elif wrapper_tail_safe_file_under "$STORAGE" "$rel" "$key" "$cursor"; then
+    if wrapper_tail_safe_file_under "$STORAGE" "$rel" "$key" "$cursor"; then
       found=$(( found + 1 ))
     fi
   done
 
-  if [ -n "$ARG_LOG_CURSOR_ONLY" ]; then
-    printf 'WRAPPER=OK verb=gate-log mode=cursor agent_uid=%s gate_account=%s\n' "$AGENT_UID" "$gate_account"
-    return 0
-  fi
   if [ "$found" -eq 0 ]; then
     wrapper_die "no gate or peer-resolver log for agent uid $AGENT_UID under $RAILS_PRODUCT_GATE_HOME_BASE/$gate_account or $STORAGE/$RAILS_PRODUCT_GATE_LOG_DIR; the reason half of the probe ladder CANNOT be evaluated, and a probe that observed nothing is not a probe that passed"
   fi
   printf 'WRAPPER=OK verb=gate-log agent_uid=%s files=%s\n' "$AGENT_UID" "$found"
+}
+
+# THE PORT THE GATE ACTUALLY BOUND. Read as root from the gate daemon's own
+# published runtime state, and reported with the generation it belongs to.
+#
+# ROUND-5 B1, the blocker this verb exists for. The exclusive-egress gate is a
+# CONNECT proxy on `127.0.0.1:<gate_port>`; the pf anchor passes that one
+# loopback destination for the agent uid and block-drops the rest, and there is
+# no `rdr`, so NOTHING is transparently redirected into the gate. A request
+# only traverses the gate if the client was pointed at the port. The port is
+# chosen per generation by a bind-first on `127.0.0.1:0`, so it cannot be
+# compiled in. The harness had no way to learn it -- `gate_port` occurred in
+# the whole `scripts/drill-loop` tree only inside comments and inside a
+# `RESULT=PASS ... through the gate` string -- so every probe in the ladder was
+# a bare `curl` that could not have gone through the gate, `N3` could never
+# produce the `peer_uid_mismatch` it exists to observe, and `P1`/`F1-F2`
+# printed through-gate PASS lines for requests that provably were not.
+#
+# THREE ANSWERS, NEVER TWO. `present` (with port + generation), `absent` (no
+# gate has published state for this uid: a real, legitimate condition before
+# arming and after teardown), and a hard refusal when the document exists and
+# cannot be read or does not parse. A driver that cannot tell those apart is
+# how "no gate port" becomes "port 0" becomes a green-looking probe.
+wrapper_verb_gate_port() {
+  wrapper_require_agent
+  local state_path content rc=0 parent leaf port generation
+  state_path="$(rails_product_gate_runtime_state_path "$AGENT_UID")" \
+    || wrapper_die "could not compose the gate runtime state path for uid $AGENT_UID"
+  if [ -z "$state_path" ]; then wrapper_die 'empty gate runtime state path after the composer'; fi
+
+  if ! wrapper_resolve_absolute_optional_file "$state_path" 'gate runtime state'; then
+    printf 'WRAPPER=GATE-PORT state=absent path=%s\n' "$state_path"
+    printf 'WRAPPER=OK verb=gate-port state=absent agent_uid=%s path=%s\n' "$AGENT_UID" "$state_path"
+    return 0
+  fi
+  parent="${WRAPPER_SAFE_TARGET%/*}"
+  leaf="${WRAPPER_SAFE_TARGET##*/}"
+  content="$(wrapper_cat_safe_file_under "$parent" "$leaf" 'gate runtime state')" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    wrapper_die "could not READ the gate runtime state at $state_path (cat rc=$rc); a port this wrapper did not read is not a port a probe may aim at"
+  fi
+  port="$(rails_json_flat_number "$content" gate_port)" \
+    || wrapper_die "the gate runtime state at $state_path carries no readable gate_port"
+  port="$(rails_assert_tcp_port "$port")" \
+    || wrapper_die "the gate runtime state at $state_path names an impossible gate_port"
+  generation="$(rails_json_flat_number "$content" generation_id)" \
+    || wrapper_die "the gate runtime state at $state_path carries no readable generation_id"
+  # The uid the DOCUMENT names must be the uid the caller asked about. Reading
+  # one uid's state and reporting it as another's would be this harness's own
+  # defect class committed by the wrapper.
+  local stated_uid
+  stated_uid="$(rails_json_flat_number "$content" agent_uid)" \
+    || wrapper_die "the gate runtime state at $state_path carries no readable agent_uid"
+  if [ "$stated_uid" != "$AGENT_UID" ]; then
+    wrapper_die "the gate runtime state at $state_path names agent uid $stated_uid, not $AGENT_UID; refusing to report another agent's gate port"
+  fi
+  printf 'WRAPPER=GATE-PORT state=present port=%s generation=%s agent_uid=%s path=%s\n' \
+    "$port" "$generation" "$AGENT_UID" "$state_path"
+  printf 'WRAPPER=OK verb=gate-port state=present agent_uid=%s port=%s generation=%s\n' \
+    "$AGENT_UID" "$port" "$generation"
 }
 
 # Remove this run's whole disposable fortress.
@@ -955,6 +1093,7 @@ wrapper_main() {
     registry-state)    wrapper_verb_registry_state ;;
     fortress-state)    wrapper_verb_fortress_state ;;
     gate-log)          wrapper_verb_gate_log ;;
+    gate-port)         wrapper_verb_gate_port ;;
     kickstart-daemons) wrapper_verb_kickstart_daemons ;;
     arm)               wrapper_verb_arm ;;
     repair)            wrapper_verb_repair ;;

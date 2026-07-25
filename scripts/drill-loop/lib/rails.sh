@@ -180,6 +180,24 @@ RAILS_PRODUCT_GATE_HOME_BASE='/var/sanctuary-agents'
 RAILS_PRODUCT_GATE_ACCOUNT_PREFIX='sanctuary-gate-'
 RAILS_PRODUCT_GATE_LOG_DIR='logs'
 
+# `EGRESS_GATE_RUNTIME_DIR` + `egressGateRuntimeStatePath`,
+# server/src/egress-gate/gate-daemon.ts. The gate daemon publishes
+# `<dir>/<agent uid>/state.json` AFTER a successful bind, carrying the port it
+# actually bound and the generation it belongs to.
+#
+# ROUND-5 B1. This constant is why the harness can finally reach its own
+# subject. The gate is an `HTTPS_PROXY` CONNECT proxy on `127.0.0.1:<port>`;
+# the pf anchor's rules are `on lo0 ... user = <agent uid>` with no `rdr`, so
+# nothing is transparently redirected and a bare `curl` NEVER traverses the
+# gate. The port is chosen per generation (bind-first on `127.0.0.1:0`), so it
+# cannot be compiled in either. `gate_port` appeared in this harness only
+# inside comments and inside a PASS string, which is exactly how "reachable
+# through the gate" survived four review rounds attached to requests that could
+# not have gone through it. The wrapper's `gate-port` verb reads this document
+# as root and the battery proxies to what it says.
+RAILS_PRODUCT_GATE_RUNTIME_DIR='/var/db/sanctuary/gate-runtime'
+RAILS_PRODUCT_GATE_RUNTIME_STATE_FILE='state.json'
+
 # ###########################################################################
 # HOST IDENTITY IS A HARDWARE FINGERPRINT, NOT A NAME.
 #
@@ -696,6 +714,15 @@ rails_product_resolver_label() {
   printf '%s.%s\n' "$RAILS_PRODUCT_RESOLVER_LABEL_PREFIX" "$1"
 }
 
+# `egressGateRuntimeStatePath(uid)`, server/src/egress-gate/gate-daemon.ts.
+# The document that names the port the gate ACTUALLY bound for this uid.
+rails_product_gate_runtime_state_path() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_product_gate_runtime_state_path: expected 1 arg (agent uid), got $#"; fi
+  rails__assert_agent_uid_shape 'gate runtime state path' "$1"
+  printf '%s/%s/%s\n' \
+    "$(rails__squeeze_slashes "$RAILS_PRODUCT_GATE_RUNTIME_DIR")" "$1" "$RAILS_PRODUCT_GATE_RUNTIME_STATE_FILE"
+}
+
 # Both labels, space separated, in the order the wrapper restarts them.
 rails_product_daemon_labels() {
   if [ "$#" -ne 1 ]; then rails__die "rails_product_daemon_labels: expected 1 arg (agent uid), got $#"; fi
@@ -821,6 +848,190 @@ rails_probe_result() {
   if [ "$rc" -eq 0 ]; then printf 'PASS\n'; return 0; fi
   if [ "$rc" -eq 3 ]; then printf 'UNVERIFIED\n'; return 0; fi
   printf 'FAIL\n'
+}
+
+# ###########################################################################
+# THE ROUND-6 CHOKEPOINT: A VERDICT MAY NOT OUTRUN ITS OBSERVATION
+# ###########################################################################
+#
+# Six review rounds found six "different" defects that are ONE defect:
+#
+#   r1-r2  a rejected `--storage` still armed the real fortress, because `die`
+#          inside `$(...)` killed only the subshell.
+#   r3     the harness manufactured green evidence from a planted `sudo`.
+#   r4     `N3` could report `verified=yes` while the current wrong-uid request
+#          had SUCCEEDED.
+#   r5 B1  `P1` and `F1-F2` printed `RESULT=PASS "... through the gate"` for
+#          bare `curl` calls that were never pointed at the gate.
+#   r5 M1  `--repeats 0` produced PASS / `verified=yes` / exit 0 having made
+#          ZERO requests.
+#   r5 M2  `N3`'s verdict read a `$code` its own loop may never have written -
+#          the value came from the N1 loop.
+#   r5 M3  an ABSENT gate log became a gate-blamed FAIL instead of a
+#          could-not-observe.
+#
+# THE CLASS: every one of those verdicts was computed from something other than
+# the thing it claimed to have measured. Patching them one at a time produces a
+# round 7 with a seventh instance. So the seam moves: a probe no longer decides
+# anything from ambient shell state. It RECORDS observations, each one naming
+# the probe that made it, the mechanism it went through, and whether it was
+# observed at all; and a verdict must name the specific observations that
+# justify it. The four rails below are the pure, exhaustively drivable half of
+# that chokepoint (`lib/probe.sh` drives every one of them); the ledger itself
+# lives in `drivers/run-probe-battery.sh`, which is its only consumer.
+#
+# Four properties follow structurally rather than by inspection:
+#
+#   1. a verdict with no observation cannot be a PASS, because the basis is a
+#      required argument and an empty basis is not a basis. "I made zero
+#      requests" is therefore UNOBSERVED, always, and `--repeats 0` cannot
+#      produce a green battery.
+#   2. a verdict cannot borrow another probe's observation, because every
+#      record carries its probe and a cross-probe basis is refused.
+#   3. "I could not observe" is a different record state from "I observed a
+#      denial", so the two can never be folded into one verdict.
+#   4. a claim that NAMES a mechanism ("through the gate") may only be emitted
+#      by a basis that exercised it (`rails_assert_claim_supported`).
+
+# A TCP port, as a number, with no leading zero.
+#
+# The leading-zero rule is not pedantry: `08` reaching an arithmetic context is
+# an invalid octal literal and `010` is 8, so a token that READS as one port
+# would be a different port to the shell. Ports also come from a root-written
+# JSON document here, and this is the one place that decides the value is sane.
+rails_assert_tcp_port() {
+  if [ "$#" -ne 1 ]; then
+    rails__die "rails_assert_tcp_port: expected 1 arg (port), got $#"
+  fi
+  local port="$1"
+  if [ -z "$port" ]; then rails__die "empty tcp port"; fi
+  case "$port" in
+    *[!0-9]*) rails__die "tcp port is not a decimal integer: '$port'" ;;
+  esac
+  case "$port" in
+    0*) rails__die "tcp port has a leading zero (or is zero): '$port'" ;;
+  esac
+  if [ "$port" -gt 65535 ]; then rails__die "tcp port out of range: $port"; fi
+  printf '%s\n' "$port"
+}
+
+# Trim ASCII whitespace from both ends. Local helper; not a rail.
+rails__trim_ws() {
+  local s="${1-}"
+  while :; do
+    case "$s" in
+      ' '*|"	"*) s="${s#?}" ;;
+      *' '|*"	") s="${s%?}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$s"
+}
+
+# Extract ONE bare decimal field from a FLAT JSON object, or refuse.
+#
+# WHY NOT A JSON PARSER, AND WHY NOT `grep -o`. The document this reads is the
+# gate daemon's runtime state (`/var/db/sanctuary/gate-runtime/<uid>/state.json`,
+# `JSON.stringify` of a flat five-field object). A regex scan would happily
+# match a `gate_port` nested inside some future sub-object and report it as THE
+# port, which is the same "read a value from somewhere other than what you
+# claimed" defect this whole block exists to end. So: the text is split on the
+# structural characters, each token must be exactly one `"key":value` pair, and
+# a field that appears more than ONCE - the shape a nested or duplicated key
+# produces - is REFUSED rather than resolved by position. Anything that is not
+# a bare decimal is refused too, so `"gate_port":"8080"` does not silently work.
+rails_json_flat_number() {
+  if [ "$#" -ne 2 ]; then
+    rails__die "rails_json_flat_number: expected 2 args (json, field), got $#"
+  fi
+  local json="$1" field="$2" tok value='' hits='' oldifs="$IFS" reglob=''
+  case "$field" in
+    ''|*[!a-z_]*) rails__die "json field name must be lowercase letters and underscores: '$field'" ;;
+  esac
+  # Word-splitting IS the parse here, so globbing must be off for it: an
+  # unquoted expansion would otherwise let a `*` inside the document expand
+  # against the working directory.
+  case "$-" in *f*) ;; *) reglob='yes' ;; esac
+  set -f
+  IFS=',{}[]'
+  # shellcheck disable=SC2086
+  set -- $json
+  IFS="$oldifs"
+  if [ -n "$reglob" ]; then set +f; fi
+  for tok in "$@"; do
+    tok="$(rails__trim_ws "$tok")"
+    case "$tok" in
+      "\"$field\":"*)
+        value="${tok#"\"$field\":"}"
+        hits="$hits."
+        ;;
+    esac
+  done
+  if [ -z "$hits" ]; then
+    rails__die "json carries no \"$field\" field"
+  fi
+  if [ "$hits" != '.' ]; then
+    rails__die "json carries the \"$field\" field more than once; refusing to guess which one is meant"
+  fi
+  value="$(rails__trim_ws "$value")"
+  case "$value" in
+    ''|*[!0-9]*) rails__die "json field \"$field\" is not a bare decimal number: '$value'" ;;
+  esac
+  printf '%s\n' "$value"
+}
+
+# Which MECHANISMS does this verdict text claim? One token per line, or nothing.
+#
+# A verdict line is product copy: it is what somebody reads at 3am when
+# deciding whether the wall held. "reachable through the gate" is not a
+# statement about an outcome, it is a statement about a MECHANISM - it says the
+# bytes traversed the CONNECT proxy. Round 5 found `P1` printing exactly that
+# sentence for a bare `curl` that had no `--proxy` and could not have had one,
+# because the harness had no way to learn the gate's port. The fix is not to
+# reword that one string; it is to make the string's mechanism words checkable
+# against what the probe actually did.
+#
+# The vocabulary is deliberately SMALL and matched case-insensitively on
+# substrings. A new phrase that means "through the gate" and is not listed here
+# is a gap, and it is named in the attack list rather than pretended away.
+rails_claim_mechanisms() {
+  if [ "$#" -ne 1 ]; then
+    rails__die "rails_claim_mechanisms: expected 1 arg (text), got $#"
+  fi
+  local text="$1" lower
+  lower="$(printf '%s' "$text" | rails__sys tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')" \
+    || rails__die 'could not case-fold the verdict text'
+  case "$lower" in
+    *'through the gate'*|*'through-gate'*|*'at the gate'*|*'via the gate'*|*'to the gate'*|*'gate path'*)
+      printf 'gate-channel\n' ;;
+  esac
+  case "$lower" in
+    *'allowlist'*|*'peer_uid_mismatch'*|*'peer_unresolved'*|*'peer='*|*'gate log'*|*'gate-log'*|*'log window'*)
+      printf 'gate-log\n' ;;
+  esac
+}
+
+# Refuse a verdict text that claims a mechanism its basis did not exercise.
+#
+# `supported` is the space-separated set of mechanisms derived FROM THE BASIS
+# RECORDS - never from the text, never from a flag, never from anything the
+# caller can assert on its own say-so.
+rails_assert_claim_supported() {
+  if [ "$#" -ne 2 ]; then
+    rails__die "rails_assert_claim_supported: expected 2 args (text, supported-mechanisms), got $#"
+  fi
+  local text="$1" supported=" $2 " mechs need
+  # Mandatory form: `rails__die` inside `$( )` would otherwise kill only the
+  # subshell and leave an empty mechanism list looking like "claims nothing".
+  # That is round 1's defect, and it would defeat this rail specifically.
+  mechs="$(rails_claim_mechanisms "$text")" \
+    || rails__die "could not classify the mechanisms claimed by the verdict text: $text"
+  for need in $mechs; do
+    case "$supported" in
+      *" $need "*) ;;
+      *) rails__die "verdict text claims the '$need' mechanism, but no observation in its basis exercised it: $text" ;;
+    esac
+  done
 }
 
 # Cursor token used by the probe battery to bind a log reason to bytes appended

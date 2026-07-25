@@ -286,9 +286,38 @@ fi
 REGISTRY_RC=0
 registry_out="$("$SUDO" -n "$WRAPPER" registry-state \
   --run-id "$RUN_ID" --operator-account "$OPERATOR" 2>&1)" || REGISTRY_RC=$?
+# ROUND-5 L2, taken past the token swap. The verb prints the registry file's
+# own BYTES between REGISTRY-BEGIN and REGISTRY-END, and its VERDICT after
+# them. A `grep` over the combined output therefore reads a machine token out
+# of a CONTENT REGION -- which is the defect, not the particular token, and
+# just renaming the token would have left it. The verdict is always the LAST
+# `WRAPPER=OK verb=registry-state state=` line by construction (content is
+# printed before it), so that is what is read. Pure shell, no external
+# command: every tool a driver's evidence rests on must be absolutely
+# resolved, and a bare `tail` here would be the round-3 BLOCKER-1 shape.
+registry_verdict=''
+while IFS= read -r _rline; do
+  case "$_rline" in
+    'WRAPPER=OK verb=registry-state state='*)
+      _rline="${_rline#WRAPPER=OK verb=registry-state state=}"
+      registry_verdict="${_rline%% *}"
+      ;;
+  esac
+done <<REGISTRY_VERDICT_EOF
+$registry_out
+REGISTRY_VERDICT_EOF
+
 if [ "$REGISTRY_RC" -ne 0 ]; then
   check_fail orphan-registry "could not READ the pf-anchor registry (rc=$REGISTRY_RC); an unread registry is not an empty registry"
-elif printf '%s\n' "$registry_out" | "$GREP" -q '^WRAPPER=REGISTRY-ABSENT'; then
+elif [ "$registry_verdict" = 'absent' ]; then
+  # ROUND-5 L2. This used to key on `^WRAPPER=REGISTRY-ABSENT`, which the verb
+  # emits BEFORE the content region -- and the same output also carries the
+  # registry file's own bytes between REGISTRY-BEGIN and REGISTRY-END. A
+  # newline in the content followed by that token would short-circuit the
+  # dirty check below, which is evaluated AFTER this branch. Not reachable
+  # today (root-written JSON has no literal newline), but the verb already
+  # emits an unambiguous single-line VERDICT and a verdict is what a verdict
+  # should be read from, not a token that can appear inside content.
   check_pass orphan-registry 'no registry file on this host'
 elif printf '%s\n' "$registry_out" | "$GREP" -q -F -- "$STORAGE"; then
   check_fail orphan-registry "the registry already references $STORAGE"

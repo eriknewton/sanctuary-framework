@@ -184,7 +184,13 @@ FINDINGS="$EVIDENCE_ROOT/FINDINGS.jsonl"
 
 # LOOP LOCK. A scheduled run and an interactive drill must never interleave.
 LOCK="$OPERATOR_HOME/.sanctuary-drill-loop.lock"
-rails_lock_acquire "$LOCK" 60 || rail_stop "could not acquire the loop lock at $LOCK"
+# ROUND-5 L3. The subshell is mandatory here for the same reason it is on every
+# other rail call in this file: `rails__die` calls `exit`, so a DIRECT call
+# terminates this script at status 20 before `rail_stop` can print the
+# machine-readable `LOOP=STOP` token the design promises. A lock rejection
+# failed closed and failed SILENTLY, which is the one thing the loop's own
+# morning-readability rule forbids.
+( rails_lock_acquire "$LOCK" 60 ) || rail_stop "could not acquire the loop lock at $LOCK"
 release_all() {
   rails_lock_release "$LOCK" 2>/dev/null || true
   cleanup_assembled

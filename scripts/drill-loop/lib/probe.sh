@@ -32,6 +32,11 @@
 #   probe.sh caller-binding <self-uid> <sudo-user> <operator>
 #   probe.sh etime <etime-string>
 #   probe.sh probe-result <exit-status> <probe-summary-line>
+#   probe.sh tcp-port <port>
+#   probe.sh json-number <json-text> <field>
+#   probe.sh claim-mechanisms <verdict-text>
+#   probe.sh claim-supported <verdict-text> <supported-mechanisms>
+#   probe.sh gate-runtime-state-path <agent-uid>
 #   probe.sh fingerprint-against <fingerprint> <deny-list> <allow-list>
 #   probe.sh host <fingerprint> [observed-name...]
 #   probe.sh host-observed <fingerprint> [observed-name...]
@@ -125,6 +130,41 @@ case "$kind" in
     RESULT="$(rails_probe_result "$@")" || die "probe-result rail rejected"
     if [ -z "$RESULT" ]; then die 'empty result after the probe-result rail'; fi
     printf 'PROBE=ACCEPT probe-result=%s\n' "$RESULT"
+    ;;
+  tcp-port)
+    # Arity forwarded verbatim so the rail's own check is what fires.
+    PORT="$(rails_assert_tcp_port "$@")" || die "tcp-port rail rejected: ${1:-<missing>}"
+    if [ -z "$PORT" ]; then die 'empty port after the tcp-port rail'; fi
+    printf 'PROBE=ACCEPT tcp-port=%s\n' "$PORT"
+    ;;
+  json-number)
+    # The gate-port reader's parse half, driven directly. This is what decides
+    # which number the battery proxies to, so every shape it can be handed --
+    # nested, duplicated, quoted, absent -- is asserted rather than assumed.
+    NUM="$(rails_json_flat_number "$@")" || die "json-number rail rejected: ${2:-<missing>}"
+    if [ -z "$NUM" ]; then die 'empty number after the json rail'; fi
+    printf 'PROBE=ACCEPT json-number=%s\n' "$NUM"
+    ;;
+  claim-mechanisms)
+    # The CLASSIFIER, printed. A verdict text that claims nothing prints
+    # nothing, which is a legitimate answer, so this probe reports the count
+    # too rather than making "empty" indistinguishable from "failed".
+    if [ "$#" -ne 1 ]; then die 'claim-mechanisms needs <text>'; fi
+    MECHS="$(rails_claim_mechanisms "$1")" || die 'claim-mechanisms rail rejected'
+    printf 'PROBE=ACCEPT claim-mechanisms=%s\n' "$(printf '%s' "$MECHS" | rails__sys tr '\n' ',')"
+    ;;
+  claim-supported)
+    # The DECISION: may this text be printed given what its basis exercised?
+    # Pure predicate, so the mandatory subshell form applies.
+    if [ "$#" -ne 2 ]; then die 'claim-supported needs <text> <supported>'; fi
+    ( rails_assert_claim_supported "$1" "$2" ) || die 'claim-supported rail rejected'
+    printf 'PROBE=ACCEPT claim-supported=yes\n'
+    ;;
+  gate-runtime-state-path)
+    if [ "$#" -ne 1 ]; then die 'gate-runtime-state-path needs <agent-uid>'; fi
+    GRSP="$(rails_product_gate_runtime_state_path "$1")" || die "gate runtime state path rail rejected: $1"
+    if [ -z "$GRSP" ]; then die 'empty gate runtime state path after rail'; fi
+    printf 'PROBE=ACCEPT gate-runtime-state-path=%s\n' "$GRSP"
     ;;
   host)
     # host <fingerprint> [observed-name...]. The FINGERPRINT is the decision;

@@ -217,6 +217,105 @@ expect_accept 'a genuinely failed battery is a FAIL' 'probe-result=FAIL' \
   -- "$PROBE" probe-result 1 "$SUM_OK"
 expect_reject 'a non-numeric status is refused' 'status is not numeric' \
   -- "$PROBE" probe-result 'zero' "$SUM_OK"
+# The REAL summary shape the battery emits now carries `defects=`, and
+# `skipped=` must stay the LAST field: `rails_probe_result` reads a non-empty
+# tail after `skipped=` as "this summary names skipped probes", so a field
+# appended after it would make every battery read as unverified forever.
+SUM_REAL='PROBE=SUMMARY failures=0 defects=0 skipped_count=0 verified=yes declared=P1,N1 ran=P1,N1 skipped='
+SUM_DEFECT='PROBE=SUMMARY failures=0 defects=1 skipped_count=1 verified=no declared=P1,N1 ran=P1 skipped=N1'
+expect_accept 'the real summary shape still folds to PASS' 'probe-result=PASS' \
+  -- "$PROBE" probe-result 0 "$SUM_REAL"
+expect_accept 'a summary reporting a HARNESS DEFECT is never a PASS' 'probe-result=UNVERIFIED' \
+  -- "$PROBE" probe-result 4 "$SUM_DEFECT"
+
+printf '== round 6: a verdict may not outrun its observation (the pure half) ==\n'
+#
+# Six review rounds, six "different" defects, ONE class: every verdict was
+# computed from something other than the thing it claimed to have measured.
+# These are the pure, exhaustively drivable rails that make the class
+# unrepresentable; the ledger that uses them is driven end to end further down.
+
+# --- the port a probe is allowed to aim at -------------------------------
+expect_accept 'an ordinary ephemeral port' 'tcp-port=49152'  -- "$PROBE" tcp-port 49152
+expect_accept 'the lowest legal port' 'tcp-port=1'           -- "$PROBE" tcp-port 1
+expect_accept 'the highest legal port' 'tcp-port=65535'      -- "$PROBE" tcp-port 65535
+expect_reject 'port zero' 'leading zero'                     -- "$PROBE" tcp-port 0
+# `08` is not octal-8, it is an INVALID octal literal, and `010` is 8. A token
+# that READS as one port would be a different port to the shell.
+expect_reject 'a leading-zero port' 'leading zero'           -- "$PROBE" tcp-port 08
+expect_reject 'a port above the range' 'out of range'        -- "$PROBE" tcp-port 65536
+expect_reject 'an empty port' 'empty tcp port'               -- "$PROBE" tcp-port ''
+expect_reject 'a non-numeric port' 'not a decimal integer'   -- "$PROBE" tcp-port 'http'
+expect_reject 'a port with a trailing newline injection' 'not a decimal integer' \
+  -- "$PROBE" tcp-port '4711 evil'
+
+# --- reading the gate port out of the daemon's own runtime state ---------
+GATE_STATE_JSON='{"agent_uid":502,"gate_port":49317,"generation_id":7,"pid":881,"pid_start":"881-1"}'
+expect_accept 'the real runtime-state shape yields the port' 'json-number=49317' \
+  -- "$PROBE" json-number "$GATE_STATE_JSON" gate_port
+expect_accept 'and the generation' 'json-number=7' \
+  -- "$PROBE" json-number "$GATE_STATE_JSON" generation_id
+expect_reject 'an absent field is refused, never defaulted' 'carries no "listen_port" field' \
+  -- "$PROBE" json-number "$GATE_STATE_JSON" listen_port
+# THE REASON THIS IS NOT A REGEX SCAN. A nested or duplicated key is exactly
+# how "read a value from somewhere other than what you claimed" gets in, so a
+# field that appears twice is REFUSED rather than resolved by position.
+expect_reject 'a NESTED gate_port cannot be mistaken for the real one' 'more than once' \
+  -- "$PROBE" json-number '{"gate_port":1,"stale":{"gate_port":2}}' gate_port
+expect_reject 'a duplicated field is refused' 'more than once' \
+  -- "$PROBE" json-number '{"gate_port":1,"gate_port":2}' gate_port
+expect_reject 'a quoted port is not a bare number' 'not a bare decimal number' \
+  -- "$PROBE" json-number '{"gate_port":"49317"}' gate_port
+expect_reject 'a null port is not a number' 'not a bare decimal number' \
+  -- "$PROBE" json-number '{"gate_port":null}' gate_port
+expect_reject 'an empty document carries nothing' 'carries no "gate_port" field' \
+  -- "$PROBE" json-number '' gate_port
+# A `*` inside the document must not be expanded against the working directory
+# when the text is word-split. Globbing off is what makes the parse a parse.
+expect_accept 'a glob character in the document is inert' 'json-number=42' \
+  -- "$PROBE" json-number '{"note":"*","gate_port":42}' gate_port
+
+expect_accept 'the gate runtime state path is composed from the product constant' \
+  'gate-runtime-state-path=/var/db/sanctuary/gate-runtime/502/state.json' \
+  -- "$PROBE" gate-runtime-state-path 502
+expect_reject 'no runtime state path for uid 0' 'agent uid 0' \
+  -- "$PROBE" gate-runtime-state-path 0
+
+# --- a claim that NAMES a mechanism must have exercised it ---------------
+#
+# ROUND-5 B1 in its most compressed form. `P1` printed
+# `RESULT=PASS "allowed endpoints reachable through the gate"` for a bare
+# `curl` that had no `--proxy` and could not have had one. The sentence is a
+# claim about a MECHANISM, and a mechanism claim is now checkable.
+expect_accept 'a through-gate claim is recognised as a mechanism claim' 'claim-mechanisms=gate-channel' \
+  -- "$PROBE" claim-mechanisms 'allowed endpoints reachable through the gate'
+expect_accept 'so is the hyphenated form' 'claim-mechanisms=gate-channel' \
+  -- "$PROBE" claim-mechanisms '2 of 6 through-gate attempts did not succeed'
+expect_accept 'CASE does not get a text out of the check' 'claim-mechanisms=gate-channel' \
+  -- "$PROBE" claim-mechanisms 'Reachable THROUGH THE GATE'
+expect_accept 'a denial-reason claim names the gate-log mechanism' 'claim-mechanisms=gate-log' \
+  -- "$PROBE" claim-mechanisms 'denied by the allowlist in the current log window'
+expect_accept 'peer_uid_mismatch is a gate-log claim' 'claim-mechanisms=gate-log' \
+  -- "$PROBE" claim-mechanisms 'denied with peer_uid_mismatch'
+expect_accept 'a text that claims BOTH names both' 'claim-mechanisms=gate-channel,gate-log' \
+  -- "$PROBE" claim-mechanisms 'reachable through the gate, denied by the allowlist'
+expect_accept 'a text that claims no mechanism claims nothing' 'claim-mechanisms=' \
+  -- "$PROBE" claim-mechanisms 'operator uid 501 is unconfined'
+
+expect_accept 'a through-gate claim backed by a through-gate basis is allowed' 'claim-supported=yes' \
+  -- "$PROBE" claim-supported 'reachable through the gate' 'gate-channel'
+expect_reject 'a through-gate claim on a DIRECT basis is refused' "claims the 'gate-channel' mechanism" \
+  -- "$PROBE" claim-supported 'reachable through the gate' 'direct-only'
+expect_reject 'a through-gate claim with NO basis mechanism is refused' "claims the 'gate-channel' mechanism" \
+  -- "$PROBE" claim-supported 'reachable through the gate' ''
+expect_reject 'an allowlist-reason claim without a gate-log observation is refused' "claims the 'gate-log' mechanism" \
+  -- "$PROBE" claim-supported 'denied by the allowlist' 'gate-channel'
+expect_accept 'a claim that names nothing needs nothing' 'claim-supported=yes' \
+  -- "$PROBE" claim-supported 'operator uid 501 is unconfined' ''
+expect_reject 'a text claiming BOTH mechanisms needs both' "claims the 'gate-log' mechanism" \
+  -- "$PROBE" claim-supported 'reachable through the gate, denied by the allowlist' 'gate-channel'
+expect_accept 'and passes when both are present' 'claim-supported=yes' \
+  -- "$PROBE" claim-supported 'reachable through the gate, denied by the allowlist' 'gate-channel gate-log'
 
 printf '== trusted-chain rail (the root-owned base) ==\n'
 expect_accept 'a real system directory' 'PROBE=ACCEPT'  -- "$PROBE" trusted-chain base /usr
@@ -572,7 +671,7 @@ LOCAL_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_local" 2>/de
 # actually runs as root.
 compose_wrapper() {
   "$HERE/build-wrapper.sh" --stdout \
-    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" -v bins="${4:-}" '
+    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" -v bins="${4:-}" -v runtime="${5:-}" '
         $0 == "wrapper_main \"$@\"" {
           print "RAILS_HOST_ALLOW_FP=\047" fp "\047"
           print "RAILS_HOST_DENY_FP=\047\047"
@@ -581,6 +680,7 @@ compose_wrapper() {
           print "RAILS_AGENT_ACCOUNT_ALLOW=\047" agents "\047"
           print "RAILS_PRODUCT_GATE_HOME_BASE=\047" gatebase "\047"
           if (bins != "") print "RAILS_SYSTEM_BIN_DIRS=\047" bins "\047"
+          if (runtime != "") print "RAILS_PRODUCT_GATE_RUNTIME_DIR=\047" runtime "\047"
         }
         { print }
       ' > "$1"
@@ -720,7 +820,7 @@ fi
 # compose a product label out of an empty string. Round 3: `kickstart-daemons`
 # had no `--agent-uid` in its call path at all, and the product's labels are
 # per-uid, so the labels it restarted could not have existed.
-for v in kickstart-daemons gate-state gate-log; do
+for v in kickstart-daemons gate-state gate-log gate-port; do
   expect_reject "verb $v refuses without an agent principal" 'requires --agent-account and --agent-uid' \
     -- "$TEST_WRAPPER" "$v" --run-id 'good1' --operator-account "$ME"
 done
@@ -765,6 +865,71 @@ expect_accept 'fortress-state reports absence as absence' 'FORTRESS entry=exclus
 expect_reject 'gate-log refuses when there is no log to read' 'CANNOT be evaluated' \
   -- "$TEST_WRAPPER_AGENT" gate-log --run-id 'good1' --operator-account "$ME" \
      --agent-account "$ME" --agent-uid "$(id -u)"
+
+# --- gate-port: how a probe learns where its own subject IS (round-5 B1) ---
+#
+# The gate is a CONNECT proxy on a per-generation loopback port and there is no
+# `rdr`, so a request only traverses it if the client was pointed at the port.
+# The whole harness had no way to learn that port: `gate_port` appeared in
+# `scripts/drill-loop/` only inside comments and inside a `RESULT=PASS ...
+# through the gate` string. This verb is where the number comes from, and
+# EVERY answer it can give is a named answer.
+printf '== gate-port: three answers, never two ==\n'
+GATE_RUNTIME="$SANDBOX/gate-runtime"
+GATE_UID="$(id -u)"
+mkdir -p "$GATE_RUNTIME/$GATE_UID"
+TEST_WRAPPER_PORT="$SANDBOX/test-wrapper-port"
+compose_wrapper "$TEST_WRAPPER_PORT" "$ME" '' '' "$GATE_RUNTIME"
+gate_port_run() {
+  "$TEST_WRAPPER_PORT" gate-port --run-id 'good1' --operator-account "$ME" \
+    --agent-account "$ME" --agent-uid "$GATE_UID"
+}
+# ABSENT is a real, legitimate state (before arming, after teardown) and it is
+# NOT an error. Folding it into either an error or a port is how "no gate" gets
+# to look like "port 0".
+expect_accept 'no published gate state is state=absent, not an error' \
+  'WRAPPER=GATE-PORT state=absent' -- gate_port_run
+printf '{"agent_uid":%s,"gate_port":49317,"generation_id":7,"pid":881,"pid_start":"881-1"}' \
+  "$GATE_UID" > "$GATE_RUNTIME/$GATE_UID/state.json"
+expect_accept 'a published gate state yields the port' \
+  "WRAPPER=GATE-PORT state=present port=49317 generation=7" -- gate_port_run
+expect_accept 'and the machine-readable verdict line agrees' \
+  'WRAPPER=OK verb=gate-port state=present' -- gate_port_run
+# THE UID BINDING. Reading one agent's runtime state and reporting it as
+# another's would be this harness's own defect class committed by the wrapper.
+printf '{"agent_uid":999999,"gate_port":49317,"generation_id":7}' \
+  > "$GATE_RUNTIME/$GATE_UID/state.json"
+expect_reject 'a runtime state naming ANOTHER uid is refused' 'names agent uid 999999' \
+  -- gate_port_run
+printf '{"agent_uid":%s,"gate_port":0,"generation_id":7}' "$GATE_UID" \
+  > "$GATE_RUNTIME/$GATE_UID/state.json"
+expect_reject 'an impossible port is refused, never reported' 'impossible gate_port' \
+  -- gate_port_run
+printf 'not json at all\n' > "$GATE_RUNTIME/$GATE_UID/state.json"
+expect_reject 'an unparseable runtime state is refused' 'no readable gate_port' \
+  -- gate_port_run
+# A SYMLINKED runtime-state file must never be followed: the gate uid owns its
+# own subdir, and root reading through a link the gate uid planted is the
+# round-4 gate-log exploit under a new name.
+PORT_VICTIM="$SANDBOX/gate-port-victim.json"
+printf '{"agent_uid":%s,"gate_port":31337,"generation_id":1}' "$GATE_UID" > "$PORT_VICTIM"
+rm -f "$GATE_RUNTIME/$GATE_UID/state.json"
+ln -s "$PORT_VICTIM" "$GATE_RUNTIME/$GATE_UID/state.json"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+port_link_out="$(gate_port_run 2>&1)"
+set -e
+case "$port_link_out" in
+  *31337*)
+    printf 'FAIL  *** root followed a symlinked gate runtime state and reported the port behind it ***\n'
+    note "output: $port_link_out"
+    FAIL=$((FAIL + 1)) ;;
+  *)
+    printf 'ok    a symlinked gate runtime state is never followed\n'
+    PASS=$((PASS + 1)) ;;
+esac
+rm -f "$GATE_RUNTIME/$GATE_UID/state.json"
+printf '{"agent_uid":%s,"gate_port":49317,"generation_id":7}' "$GATE_UID" \
+  > "$GATE_RUNTIME/$GATE_UID/state.json"
 
 # --- gate-log reads OUTSIDE the fortress through the same chokepoint -------
 #
@@ -862,7 +1027,7 @@ expect_reject 'an allowlisted agent account passes the agent rail and dies later
      --agent-account "$ME" --agent-uid "$(id -u)"
 # Every verb refuses a bad run id before doing anything at all.
 for v in mint clean-markers gate-state kickstart-daemons repair unprotect retire \
-         pf-anchor-rules registry-state fortress-state gate-log; do
+         pf-anchor-rules registry-state fortress-state gate-log gate-port; do
   expect_reject "verb $v refuses a traversal run id" 'run id rejected' \
     -- "$TEST_WRAPPER" "$v" --run-id '../../.sanctuary' --operator-account "$ME"
 done
@@ -954,6 +1119,25 @@ for a in "${args[@]}"; do
         echo 'WRAPPER=OK verb=gate-log mode=cursor'
         exit 0
       fi
+      # ROUND-5 M3: which STREAMS were actually read. `STUB_GATE_LOG_STREAMS`
+      # is the space-separated set that answered; the default is both. A run
+      # with only `peer` reproduces the real host condition where the gate
+      # account home is absent and the peer-resolver log alone is readable.
+      for key in gate_out gate_err; do
+        case " ${STUB_GATE_LOG_STREAMS:-gate peer} " in
+          *' gate '*) printf 'WRAPPER=GATE-LOG-READ key=%s state=read\n' "$key" ;;
+          *) printf 'WRAPPER=GATE-LOG-READ key=%s state=absent\n' "$key" ;;
+        esac
+      done
+      for key in peer_out peer_err; do
+        case " ${STUB_GATE_LOG_STREAMS:-gate peer} " in
+          *' peer '*) printf 'WRAPPER=GATE-LOG-READ key=%s state=read\n' "$key" ;;
+          *) printf 'WRAPPER=GATE-LOG-READ key=%s state=absent\n' "$key" ;;
+        esac
+      done
+      # Every per-stream verdict comes BEFORE this sentinel; everything after it
+      # is log CONTENT, written by the gate service uid.
+      echo 'WRAPPER=GATE-LOG-CONTENT-BEGIN'
       echo 'WRAPPER=GATE-LOG-BEGIN file=stub'
       if [ -n "$since_mode" ] && [ -n "${STUB_GATE_LOG_SINCE_BODY+x}" ]; then
         printf '%s\n' "$STUB_GATE_LOG_SINCE_BODY"
@@ -964,6 +1148,39 @@ for a in "${args[@]}"; do
       echo 'WRAPPER=OK verb=gate-log'
       exit 0
       ;;
+    gate-port)
+      # The verb that tells a probe where its own subject is. `STUB_GATE_PORT`
+      # is the port; `absent` reproduces "no gate has published state" and
+      # `refused` reproduces an unreadable one. `STUB_GATE_GENERATION` lets a
+      # case rotate the generation mid-battery.
+      case "${STUB_GATE_PORT:-49317}" in
+        refused) echo 'WRAPPER=REJECT reason=unreadable gate runtime state' >&2; exit 20 ;;
+        absent)  echo 'WRAPPER=GATE-PORT state=absent path=/stub/state.json'
+                 echo 'WRAPPER=OK verb=gate-port state=absent'; exit 0 ;;
+        *)
+          gen="${STUB_GATE_GENERATION:-7}"
+          if [ -n "${STUB_GATE_GENERATION_SEQ_FILE:-}" ]; then
+            # Each call advances the generation, which is what a rotation
+            # looks like from the outside: the port the request was aimed at
+            # is not the port the current generation owns.
+            gen="$(cat "$STUB_GATE_GENERATION_SEQ_FILE" 2>/dev/null || echo 1)"
+            echo $((gen + 1)) > "$STUB_GATE_GENERATION_SEQ_FILE"
+          fi
+          printf 'WRAPPER=GATE-PORT state=present port=%s generation=%s agent_uid=%s path=/stub/state.json\n' \
+            "${STUB_GATE_PORT:-49317}" "$gen" "$(id -u)"
+          printf 'WRAPPER=OK verb=gate-port state=present port=%s generation=%s\n' \
+            "${STUB_GATE_PORT:-49317}" "$gen"
+          exit 0 ;;
+      esac
+      ;;
+    arm)
+      # A prompting arm, so `expect/arm-expect.exp` can be driven over a real
+      # pty. `STUB_ARM_PROMPT` is the exact text the fake product asks.
+      if [ -n "${STUB_ARM_PROMPT:-}" ]; then
+        printf '%s' "$STUB_ARM_PROMPT"
+        if read -r answer; then printf '\nARM_ANSWER=%s\n' "$answer"; else printf '\nARM_ANSWER=<eof>\n'; fi
+      fi
+      exit "${STUB_ARM_RC:-0}" ;;
     kickstart-daemons)       exit "${STUB_KICKSTART_RC:-0}" ;;
     mint)                    exit "${STUB_MINT_RC:-0}" ;;
     retire)                  exit "${STUB_RETIRE_RC:-0}" ;;
@@ -973,13 +1190,24 @@ for a in "${args[@]}"; do
         echo 'sudo: a password is required' >&2
         exit 1
       fi
-      # The BLOCKED endpoint answers with a denial, so a battery run's only
-      # remaining problem can be the one the case is about.
+      # ROUND-5 B1. Whether this request was aimed at the GATE is now visible
+      # to the tests: a `--proxy` argument is the only thing that makes a
+      # request traverse the CONNECT gate, and a case can assert that P1's
+      # requests carried one and P2's did not.
+      via='direct'
+      url=''
       for u in "${args[@]}"; do
         case "$u" in
-          https://example.com) echo "${STUB_BLOCKED_CODE:-${STUB_CURL_CODE:-200}}"; exit 0 ;;
+          --proxy) via='gate' ;;
+          https://*) url="$u" ;;
         esac
       done
+      if [ -n "${STUB_CURL_LOG:-}" ]; then printf '%s %s\n' "$via" "$url" >> "$STUB_CURL_LOG"; fi
+      # The BLOCKED endpoint answers with a denial, so a battery run's only
+      # remaining problem can be the one the case is about.
+      case "$url" in
+        https://example.com) echo "${STUB_BLOCKED_CODE:-${STUB_CURL_CODE:-200}}"; exit 0 ;;
+      esac
       echo "${STUB_CURL_CODE:-200}"; exit 0 ;;
   esac
 done
@@ -1142,6 +1370,46 @@ case "$out" in
     PASS=$((PASS + 1)) ;;
   *)
     printf 'FAIL  a read, unrelated registry was not reported clean\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# ROUND-5 L2. The absent branch used to be decided by `^WRAPPER=REGISTRY-ABSENT`
+# anywhere in the verb's combined output -- INCLUDING the content region, which
+# carries the registry file's own bytes between REGISTRY-BEGIN and
+# REGISTRY-END -- and that branch is evaluated BEFORE the dirty check. So a
+# registry whose CONTENT contained that token short-circuited the check that
+# would have found this fortress in it. The drivers now key on the verb's
+# single-line verdict, which cannot appear inside content.
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 \
+       STUB_REGISTRY=present \
+       STUB_REGISTRY_BODY="$(printf 'WRAPPER=REGISTRY-ABSENT path=/spoof\n{"committed":[{"fortress":"%s"}]}' "$LOOPDIR")" \
+       run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=DIRTY check=registry'*)
+    printf 'ok    an ABSENT token inside the registry CONTENT cannot short-circuit the dirty check\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** registry content forged the absent verdict and hid a live entry ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+# ...and the same attack with the CURRENT token, which is the version of this
+# defect I shipped in my own first pass at L2. Renaming the token does not fix
+# a check that reads a machine token out of a content region; reading the LAST
+# verdict line does, because content is always printed BEFORE the verdict.
+set +e   # declared exception
+out="$(STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 \
+       STUB_REGISTRY=present \
+       STUB_REGISTRY_BODY="$(printf 'WRAPPER=OK verb=registry-state state=absent path=/spoof\n{"committed":[{"fortress":"%s"}]}' "$LOOPDIR")" \
+       run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'VERIFY=DIRTY check=registry'*)
+    printf 'ok    the CURRENT verdict token is not trusted from inside the content region either\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** registry content forged the CURRENT absent verdict and hid a live entry ***\n'
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
@@ -1439,6 +1707,62 @@ case "$(cat "$PREFLIGHT_SUDO_LOG" 2>/dev/null || true):$preflight_findings:$out"
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
+# ROUND-5 L1. The MINT-failure retire path was the one of the three that no
+# case covered: neutralising its `retire_iteration` call left the whole
+# selftest green, so the "early failures retire the fortress" claim was proven
+# for kickstart and preflight and merely asserted for mint. A test that passes
+# whether or not the fix is present is not a proof.
+MINT_LOOP="$SANDBOX/loop-mint"
+MINT_SUDO_LOG="$SANDBOX/loop-mint-sudo.log"
+set +e   # declared exception
+out="$(run_loop_once "$MINT_LOOP" "$MINT_SUDO_LOG" '' 5 '')"; rc=$?
+set -e
+mint_findings="$(cat "$MINT_LOOP/evidence/FINDINGS.jsonl" 2>/dev/null || true)"
+case "$mint_findings:$out" in
+  *'"step":"mint","result":"FAIL"'*'"step":"retire","result":"PASS"'*'mint-failure'*)
+    if [ "$rc" -ne 0 ]; then
+      printf 'ok    a MINT failure retires the disposable fortress before the iteration exits\n'
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  mint failed and retired, but run-loop exited 0\n'
+      note "output: $out"; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  *** a mint failure did not run and record retire ***\n'
+    note "sudo log: $(cat "$MINT_SUDO_LOG" 2>/dev/null || true)"
+    note "findings: $mint_findings"
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# ROUND-5 L3. Every other rail call in run-loop.sh is wrapped in `( ... ) ||
+# rail_stop` precisely because `rails__die` calls `exit`; the LOCK call was
+# not, so a lock rejection exited 20 before the machine-readable `LOOP=STOP`
+# token could be printed. It failed closed and it failed SILENTLY, and silent
+# is the one thing a morning read cannot work with.
+LOCK_LOOP="$SANDBOX/loop-locked"
+mkdir -p "$LOCK_LOOP/home"
+mkdir -p "$LOCK_LOOP/home/.sanctuary-drill-loop.lock"
+printf '%s\n' "$$" > "$LOCK_LOOP/home/.sanctuary-drill-loop.lock/pid"
+set +e   # declared exception
+out="$("$HARNESS/drivers/run-loop.sh" --mode sweep --iterations 1 \
+  --operator-account "$ME" --agent-account "$ME" --agent-uid "$(id -u)" \
+  --evidence-root "$LOCK_LOOP/evidence" --build-sha test-sha --home "$LOCK_LOOP/home" 2>&1)"; rc=$?
+set -e
+case "$out" in
+  *'LOOP=STOP reason=safety-rail'*'loop lock'*)
+    if [ "$rc" -ne 0 ]; then
+      printf 'ok    a live loop lock stops the night with the LOOP=STOP token (exit %s)\n' "$rc"
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  a lock rejection printed LOOP=STOP and exited 0\n'
+      note "output: $out"; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  *** a lock rejection exited without the LOOP=STOP token ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+rm -rf "$LOCK_LOOP/home/.sanctuary-drill-loop.lock"
+
 DIRTY_LOOP="$SANDBOX/loop-retire-dirty"
 DIRTY_SUDO_LOG="$SANDBOX/loop-retire-dirty-sudo.log"
 set +e   # declared exception
@@ -1461,11 +1785,72 @@ case "$dirty_findings:$out" in
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
-# --- THE PROBE BATTERY: A SKIP IS NOT A PASS (Codex round-3 finding 2) ----
+# --- ROUND-5 M4: the arm driver answers ONLY the question it was designed for
 #
-# The battery reported `N3 SKIP`, left FAILED at zero, exited 0, and the loop
-# wrote `"result":"PASS"` for the whole probe step. Two independent things now
-# have to be true before that can happen: exit 0 AND `verified=yes`.
+# THIS IS A SAFETY CASE, NOT A CORRECTNESS ONE. The generic branch in
+# `arm-expect.exp` matched `(?i)\(y/n\)|\[y/N\]|continue\?` and answered `y`,
+# an unbounded number of times, while driving a ROOT-run operation whose
+# effects are HOST-WIDE: the pf anchor, the LaunchDaemons, the gate service
+# account. A future product prompt of the shape "a gate is already armed for
+# uid N; tear it down? (y/n)" would have got an unattended `y` on a machine
+# that may be running something else entirely.
+printf '== arm-expect answers ONLY the prompt the drill expects ==\n'
+if command -v expect >/dev/null 2>&1; then
+  ARM_STUB_WRAPPER="$SANDBOX/fake-arm-wrapper"
+  : > "$ARM_STUB_WRAPPER"
+  chmod +x "$ARM_STUB_WRAPPER"
+  run_arm_expect() {
+    PATH="$STUBBIN:$PATH" STUB_ARM_PROMPT="$1" \
+      "$HERE/expect/arm-expect.exp" "$ARM_STUB_WRAPPER" 'good1' "$ME" "$ME" "$(id -u)" 2>&1
+  }
+  set +e   # declared exception
+  out="$(run_arm_expect 'Proceed with account creation and arming? [y/N] ')"; rc=$?
+  set -e
+  case "$out:$rc" in
+    *'ARM_ANSWER=y'*:0)
+      printf 'ok    the ONE expected arm confirmation is answered\n'; PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  *** the expected arm confirmation was not answered (rc=%s) ***\n' "$rc"
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+  set +e   # declared exception: this run is EXPECTED to exit nonzero
+  out="$(run_arm_expect 'a gate is already armed for uid 501; tear it down? (y/n) ')"; rc=$?
+  set -e
+  case "$out" in
+    *'ARM_ANSWER=y'*)
+      printf 'FAIL  *** an UNRECOGNISED root-run host-wide prompt was answered YES ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      if [ "$rc" -ne 0 ]; then
+        printf 'ok    an unrecognised confirmation prompt is refused, not consented to (exit %s)\n' "$rc"
+        PASS=$((PASS + 1))
+      else
+        printf 'FAIL  an unrecognised prompt went unanswered but the driver exited 0\n'
+        note "output: $out"; FAIL=$((FAIL + 1))
+      fi ;;
+  esac
+  case "$out" in
+    *'UNRECOGNISED confirmation prompt'*'tear it down'*)
+      printf 'ok    and the refusal names the prompt it saw\n'; PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  the refusal did not record which prompt appeared\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+else
+  printf 'SKIP  expect is not installed; the arm-driver prompt cases cannot run here\n'
+  SKIPPED=$((SKIPPED + 1))
+fi
+
+# --- THE PROBE BATTERY: A VERDICT MAY NOT OUTRUN ITS OBSERVATION ---------
+#
+# Round 3 (Codex finding 2): the battery reported `N3 SKIP`, left FAILED at
+# zero, exited 0, and the loop wrote `"result":"PASS"` for the whole probe
+# step. Two independent things have to be true before that can happen: exit 0
+# AND `verified=yes`.
+#
+# Round 6 adds the class underneath it. Every case below drives the REAL
+# battery through the REAL stub wrapper and asserts a property of the LEDGER,
+# not of one probe's wording.
 printf '== the probe battery: a skipped probe cannot become a pass ==\n'
 PB_EV="$SANDBOX/probe-evidence"
 run_probes() {
@@ -1491,7 +1876,7 @@ case "$out" in
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 case "$out" in
-  *'PROBE=SUMMARY'*'skipped=P1-reason'*)
+  *'PROBE=SUMMARY'*'skipped='*'P1-reason'*)
     printf 'ok    the summary NAMES the probes that did not run\n'; PASS=$((PASS + 1)) ;;
   *)
     printf 'FAIL  the summary did not name the skipped probes\n'
@@ -1500,8 +1885,10 @@ esac
 # And the round-4 N3 rule: a wrong-uid request that SUCCEEDED is a FAIL before
 # the log reason is even considered. Stale or even current-looking
 # peer_uid_mismatch text cannot turn an allowed request into a passing denial.
+PB_CURL_LOG="$SANDBOX/probe-curl.log"
+: > "$PB_CURL_LOG"
 set +e   # declared exception
-out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_BODY="peer=$(id -u) allowlist peer_uid_mismatch" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+out="$(STUB_GATE_LOG=ok STUB_CURL_LOG="$PB_CURL_LOG" STUB_GATE_LOG_BODY="peer=$(id -u) allowlist peer_uid_mismatch" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
 set -e
 case "$out" in
   *'PROBE=N3 RESULT=FAIL'*'SUCCEEDED with code 200'*)
@@ -1521,17 +1908,300 @@ case "$out" in
     printf 'FAIL  the reason half still produced no verdict from a readable gate log\n'
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
-set +e   # declared exception
-out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_BODY='old allowlist' STUB_GATE_LOG_SINCE_BODY="peer=$(id -u)" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
-set -e
+
+# --- ROUND-5 B1: the requests actually go THROUGH THE GATE ----------------
+#
+# The blocker in one sentence: `P1` printed `RESULT=PASS "allowed endpoints
+# reachable through the gate"` for a bare `curl` that had no `--proxy` and
+# could not have had one, because the harness had no way to learn the gate
+# port. The stub now records the CHANNEL of every request it serves, so this
+# is measured rather than reasoned about.
 case "$out" in
-  *'PROBE=N1 RESULT=FAIL'*'current log window'*)
-    printf 'ok    stale allowlist text outside the current window cannot pass N1\n'
+  *'PROBE=P1 RESULT=PASS'*'channels=gate'*'through the gate'*)
+    printf 'ok    P1 claims through-gate reachability on a through-gate basis\n'
     PASS=$((PASS + 1)) ;;
   *)
-    printf 'FAIL  *** stale allowlist text satisfied N1 without current evidence ***\n'
+    printf 'FAIL  *** P1 did not report a through-gate PASS on a gate channel ***\n'
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
+if grep -q '^gate https://api\.venice\.ai' "$PB_CURL_LOG" 2>/dev/null; then
+  printf 'ok    the P1 requests carried a --proxy at the gate port\n'; PASS=$((PASS + 1))
+else
+  printf 'FAIL  *** no request was ever aimed at the gate; the round-5 B1 defect is back ***\n'
+  note "curl log: $(cat "$PB_CURL_LOG" 2>/dev/null || true)"; FAIL=$((FAIL + 1))
+fi
+# P2 is the OTHER half of the differential and it must be DIRECT. If P2 went
+# through the gate it would be asking N3's question, and the two probes were
+# mutually contradictory as written precisely because the channel was not
+# represented anywhere.
+if grep -q '^direct https://example\.com' "$PB_CURL_LOG" 2>/dev/null; then
+  printf 'ok    the P2 differential request was made DIRECTLY, not through the gate\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL  *** P2 did not make a direct request; the per-uid differential measures nothing ***\n'
+  note "curl log: $(cat "$PB_CURL_LOG" 2>/dev/null || true)"; FAIL=$((FAIL + 1))
+fi
+# N3's wrong-uid request must go TO THE GATE PORT. `peer_uid_mismatch` is only
+# ever emitted for a socket connected to the gate, so a direct wrong-uid
+# request cannot produce the event the probe exists to observe.
+n3_channel="$(printf '%s\n' "$out" | grep -m1 '^PROBE=N3 ' || printf '')"
+case "$n3_channel" in
+  *'channels=gate'*)
+    printf 'ok    the N3 wrong-uid request was aimed at the gate port\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** N3 measured something other than a request to the gate ***\n'
+    note "line: $n3_channel"; FAIL=$((FAIL + 1)) ;;
+esac
+# THE LEDGER INVARIANT, asserted over the whole run rather than probe by probe.
+if printf '%s\n' "$out" | grep -q 'RESULT=PASS.*observed=0'; then
+  printf 'FAIL  *** a PASS was emitted with ZERO observations behind it ***\n'
+  note "output: $out"; FAIL=$((FAIL + 1))
+else
+  printf 'ok    no PASS in the run was emitted with zero observations\n'; PASS=$((PASS + 1))
+fi
+# ROUND-5 M2: N3's verdict is bound to N3's OWN request. It used to read a
+# `$code` last written by the N1 loop. Every basis id names the probe that
+# recorded it, and `report` refuses a cross-probe basis, so this asserts the
+# binding on real output.
+n3_basis_ids="$(printf '%s\n' "$n3_channel" | sed -e 's/.*basis=\([^ ]*\).*/\1/' | tr ',' ' ')"
+n3_bad=0
+for oid in $n3_basis_ids; do
+  case "$oid" in -|'') continue ;; esac
+  if ! grep -q "^$oid	N3	" "$PB_EV/observations.tsv"; then n3_bad=1; fi
+done
+if [ "$n3_bad" -eq 0 ] && [ -n "$n3_basis_ids" ]; then
+  printf 'ok    every observation N3 cited was recorded BY N3\n'; PASS=$((PASS + 1))
+else
+  printf 'FAIL  *** N3 cited an observation it did not make ***\n'
+  note "basis: $n3_basis_ids"; FAIL=$((FAIL + 1))
+fi
+
+# --- ROUND-5 B1, the negative: no gate port means no through-gate claim ---
+set +e   # declared exception
+out="$(STUB_GATE_PORT=absent STUB_GATE_LOG=ok STUB_GATE_LOG_BODY="peer=$(id -u) allowlist" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+set -e
+if printf '%s\n' "$out" | grep -q 'RESULT=PASS.*through the gate'; then
+  printf 'FAIL  *** a through-gate PASS was printed with NO gate port to aim at ***\n'
+  note "output: $out"; FAIL=$((FAIL + 1))
+else
+  printf 'ok    with no gate port, nothing claims through-gate reachability\n'; PASS=$((PASS + 1))
+fi
+case "$out:$rc" in
+  *'PROBE=P1 RESULT=UNOBSERVED'*'verified=no'*)
+    if [ "$rc" -ne 0 ]; then
+      printf 'ok    an unlearnable gate port makes P1 UNOBSERVED and the battery nonzero\n'
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  the battery was UNOBSERVED and exited 0\n'; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  *** an unlearnable gate port did not make P1 UNOBSERVED ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# --- a generation that ROTATES across a request is not attributable -------
+#
+# "assert the port used was the port the CURRENT generation committed". The
+# stub advances the generation on every read, so every through-gate request
+# straddles a rotation and its status code belongs to a gate that no longer
+# exists.
+GEN_SEQ="$SANDBOX/probe-generation.seq"
+echo 1 > "$GEN_SEQ"
+set +e   # declared exception
+out="$(STUB_GATE_GENERATION_SEQ_FILE="$GEN_SEQ" STUB_GATE_LOG=ok STUB_GATE_LOG_BODY="peer=$(id -u)" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+set -e
+case "$out" in
+  *'PROBE=P1 RESULT=UNOBSERVED'*)
+    printf 'ok    a generation rotation across a request makes it UNOBSERVED, not a pass\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** a status code from a rotated-away generation was attributed to the current one ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# --- ROUND-5 M3: an ABSENT gate log is not a gate-blamed FAILURE ----------
+#
+# The four log streams are not interchangeable. `allowlist`, `peer=` and
+# `peer_uid_mismatch` are written by the GATE DAEMON; the peer-resolver logs
+# are not. The verb used to exit 0 if ANY of the four was readable, so a host
+# with no gate-account home and a readable peer-resolver log produced
+# `N1 FAIL "denied but not for an allowlist reason"` -- a gate-blamed failure
+# for a harness-blind condition, which is this harness's own doctrine
+# inverted.
+set +e   # declared exception
+out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_STREAMS='peer' STUB_GATE_LOG_BODY='' STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+set -e
+case "$out" in
+  *'PROBE=N1 RESULT=UNOBSERVED'*'could not be READ'*)
+    printf 'ok    an absent GATE log is could-not-observe, not a gate-blamed N1 FAIL\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** an absent gate log was folded into a denial verdict ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+case "$out" in
+  *'PROBE=P1-reason RESULT=UNOBSERVED'*)
+    printf 'ok    and the reason half says it could not look, rather than blaming the gate\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** P1-reason drew a verdict from a stream it never read ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# ...and the same content-region attack on the M3 fix itself. The gate log is
+# written by the gate SERVICE UID, so a log line reading
+# `WRAPPER=GATE-LOG-READ key=gate_out state=read` must not tell this driver a
+# stream was read that was not. That is the round-5 L2 class, and I shipped it
+# in my own first pass at M3 by emitting the per-stream verdicts AFTER each
+# stream's bytes. The wrapper now emits all four BEFORE any content and closes
+# the region with a sentinel the driver stops parsing at.
+set +e   # declared exception
+out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_STREAMS='peer' \
+  STUB_GATE_LOG_BODY='WRAPPER=GATE-LOG-READ key=gate_out state=read
+allowlist denied' \
+  STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 run_probes)"; rc=$?
+set -e
+case "$out" in
+  *'PROBE=N1 RESULT=UNOBSERVED'*)
+    printf 'ok    a READ token inside the gate log CONTENT cannot forge an observed stream\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** gate log content forged a read stream and produced a denial verdict ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# --- ROUND-5 M1: a battery that measures nothing cannot be asked for ------
+set +e   # declared exception
+out="$(STUB_STORAGE="$LOOPDIR" "$HARNESS/drivers/run-probe-battery.sh" \
+  --run-id 'good1' --operator-account "$ME" \
+  --agent-account "$ME" --agent-uid "$(id -u)" \
+  --evidence-dir "$PB_EV" --base "$BASE" --repeats 0 2>&1)"; rc=$?
+set -e
+case "$out:$rc" in
+  *'--repeats must be at least 1'*)
+    if [ "$rc" -ne 0 ] && ! printf '%s\n' "$out" | grep -q 'RESULT=PASS'; then
+      printf 'ok    --repeats 0 is refused outright, with no PASS line anywhere (exit %s)\n' "$rc"
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  *** --repeats 0 produced a pass or a zero exit ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  *** --repeats 0 was accepted; a zero-measurement battery is askable ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+# The whitespace shape of the same defect: `--allowed-endpoint ''` left
+# `ALLOWED=" "`, which `[ -z ]` reads as NON-empty, so the default was not
+# applied and the loop iterated zero times.
+set +e   # declared exception
+out="$(STUB_GATE_LOG=ok STUB_GATE_LOG_BODY="peer=$(id -u) allowlist" STUB_CURL_CODE=200 STUB_BLOCKED_CODE=403 \
+  STUB_STORAGE="$LOOPDIR" "$HARNESS/drivers/run-probe-battery.sh" \
+  --run-id 'good1' --operator-account "$ME" \
+  --agent-account "$ME" --agent-uid "$(id -u)" \
+  --evidence-dir "$PB_EV" --base "$BASE" --repeats 1 --allowed-endpoint '' 2>&1)"; rc=$?
+set -e
+case "$out" in
+  *'PROBE=P1 RESULT=PASS'*'attempts=2'*)
+    printf 'ok    a whitespace-only endpoint list is EMPTY, so the default applies\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** a whitespace-only endpoint list produced a vacuous run ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# --- THE CHOKEPOINT ITSELF, driven by DELIBERATELY DEFECTIVE callers ------
+#
+# The four cases above prove the battery as written is honest. These prove the
+# LEDGER refuses a dishonest one, which is the property that has to survive the
+# next edit. Each injects one instance of the class into a byte-identical copy
+# of the battery and asserts the verdict is refused, counted as a HARNESS
+# DEFECT, and cannot be read as green.
+printf '== the ledger refuses a verdict the observations do not support ==\n'
+inject_defect() {
+  # inject_defect <name> <sed-expr> <marker-that-must-appear-after>
+  local name="$1" expr="$2" marker="$3" dst="$HARNESS/drivers/run-probe-battery-$1.sh"
+  sed -e "$expr" "$HARNESS/drivers/run-probe-battery.sh" > "$dst"
+  chmod +x "$dst"
+  # A substitution that silently did not happen would leave this case testing
+  # the UNMODIFIED battery and reporting a pass for nothing. Same discipline as
+  # the RAILS_SYSTEM_BIN_DIRS check above.
+  if ! grep -q -F -- "$marker" "$dst"; then
+    printf 'FAIL  *** the %s injection did not apply; this case would test nothing ***\n' "$name"
+    FAIL=$((FAIL + 1))
+    return 1
+  fi
+  return 0
+}
+run_defect() {
+  STUB_GATE_LOG=ok STUB_GATE_LOG_BODY="peer=$(id -u) allowlist peer_uid_mismatch" \
+  STUB_GATE_PORT="${DEFECT_GATE_PORT:-49317}" \
+  STUB_CURL_CODE=200 STUB_BLOCKED_CODE="${DEFECT_BLOCKED_CODE:-403}" STUB_STORAGE="$LOOPDIR" \
+    "$HARNESS/drivers/run-probe-battery-$1.sh" \
+    --run-id 'good1' --operator-account "$ME" \
+    --agent-account "$ME" --agent-uid "$(id -u)" \
+    --evidence-dir "$SANDBOX/probe-defect-$1" --base "$BASE" --repeats 1 2>&1
+}
+assert_defect_refused() {
+  local name="$1" what="$2" out rc
+  set +e
+  out="$(run_defect "$name")"; rc=$?
+  set -e
+  case "$out:$rc" in
+    *'HARNESS DEFECT'*'defects=1'*'verified=no'*)
+      if [ "$rc" -eq 4 ]; then
+        printf 'ok    %s\n' "$what"; PASS=$((PASS + 1))
+      else
+        printf 'FAIL  %s: refused but exited %s, not 4\n' "$what" "$rc"
+        note "output: $out"; FAIL=$((FAIL + 1))
+      fi ;;
+    *)
+      printf 'FAIL  *** %s: the ledger let it through ***\n' "$what"
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+}
+# (a) zero measurements. This is round-5 M1 at the seam rather than at the
+#     argument: even if a probe loop somehow runs zero times, it cannot pass.
+if inject_defect zerobasis \
+  's|report P1 PASS "${p1_basis#,}"|report P1 PASS ""|' \
+  'report P1 PASS ""'
+then
+  assert_defect_refused zerobasis 'a PASS with an EMPTY basis is refused as a harness defect'
+fi
+# (b) another probe's observation. `obs1` is P1's first through-gate request,
+#     so this is P2 passing on P1's evidence. The target is P2 deliberately:
+#     its verdict text names no mechanism, so OWNERSHIP is the only thing that
+#     can catch it and the case isolates that check instead of being defended
+#     by the claim guard as well.
+if inject_defect crossprobe \
+  's|report P2-operator PASS "${p2_basis#,}"|report P2-operator PASS "obs1"|' \
+  'report P2-operator PASS "obs1"'
+then
+  DEFECT_BLOCKED_CODE=200 \
+    assert_defect_refused crossprobe "a PASS citing ANOTHER probe's observation is refused"
+fi
+# (c) a mechanism claim the basis never exercised. P2's basis is direct-only.
+if inject_defect falseclaim \
+  's|report P2-operator PASS "${p2_basis#,}" "operator uid |report P2-operator PASS "${p2_basis#,}" "reached everything through the gate; operator uid |' \
+  'reached everything through the gate'
+then
+  # `DEFECT_BLOCKED_CODE=200` lets the operator reach the blocked destination
+  # directly, which is what makes P2-operator take its PASS branch at all.
+  DEFECT_BLOCKED_CODE=200 \
+    assert_defect_refused falseclaim 'a through-gate claim on a DIRECT basis is refused'
+fi
+# (d) a basis of observations that were all UNOBSERVABLE. This is the belt the
+#     other three do not reach: the basis ids exist, they belong to the right
+#     probe, and not one of them recorded anything. With no gate port to aim
+#     at, every P1 observation is unobservable. The replacement text names NO
+#     mechanism, so the claim guard cannot be what catches this and the case
+#     isolates the observed-count check.
+if inject_defect allunobservable \
+  's|report P1 UNOBSERVED .*|report P1 PASS "${p1_basis#,}" "everything was fine"|' \
+  'report P1 PASS "${p1_basis#,}" "everything was fine"'
+then
+  DEFECT_GATE_PORT=absent \
+    assert_defect_refused allunobservable 'a PASS whose basis observed NOTHING is refused'
+fi
 
 fi   # end of the wrapper-level cases
 

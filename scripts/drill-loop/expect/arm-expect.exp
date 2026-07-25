@@ -70,6 +70,38 @@ spawn sudo -n $wrapper arm \
 # mid-arm aborted the leg -- and aborted it by `exit 1` without waiting, leaving
 # the spawned `sudo` child running. The wrapper emits exactly two refusal
 # shapes and they are both machine tokens, so those are what this matches.
+#
+# ROUND-5 M4 -- AND THIS IS A SAFETY FIX, NOT A CORRECTNESS ONE.
+#
+# The generic branch here used to be `-re {(?i)\(y/n\)|\[y/N\]|continue\?}` with
+# an `exp_continue`, i.e. it answered YES to ANY question that looked like a
+# yes/no question, an unbounded number of times, while driving a ROOT-run
+# operation whose effects are HOST-WIDE and not fortress-scoped: the pf anchor,
+# the LaunchDaemons, the gate service account. A future product prompt of the
+# shape "a gate is already armed for uid N; tear it down? (y/n)" would have got
+# an unattended `y` on a machine that may be running something else entirely.
+#
+# An autonomous loop that meets a question it was not designed for must STOP,
+# not consent. So the only prompts answered are the EXACT texts this drill
+# expects, and anything else that looks like a confirmation is a hard failure
+# with the prompt text in the log so the morning read says which question
+# appeared. The list is short on purpose; adding to it is a decision somebody
+# makes deliberately, having looked at the new prompt.
+#
+# The one expected prompt today is `orchestrate.ts`'s single safety confirm:
+#   "Proceed with account creation and arming? [y/N] "
+# and `server/test/drill-loop/product-identifiers.test.ts` pins this pattern to
+# that literal, so a REWORDING goes red in CI rather than stopping the night at
+# an unrecognised question at 3am.
+#
+# A `type ARM to confirm` branch used to sit below, answering a prompt that
+# occurs NOWHERE in the product. It is gone rather than kept "just in case":
+# an allowlist with a speculative entry is not an allowlist, and this file's
+# whole correction is that a loop meeting a question it was not designed for
+# stops instead of consenting. Round 2's `--endpoint` finding and round 3's
+# `--passphrase-file` finding were both this shape.
+set expected_arm_prompt {Proceed with account creation and arming\? \[y/N\]}
+
 expect {
     -re {WRAPPER=REJECT|RAILS_REJECT:} {
         puts "\narm-expect.exp: the wrapper refused; not answering any prompt"
@@ -79,13 +111,19 @@ expect {
         puts "\narm-expect.exp: the NOPASSWD grant for the wrapper is missing; failing fast rather than burning the night at a prompt"
         exit 1
     }
-    -re {(?i)type .?ARM.? to confirm} {
-        send "ARM\r"
-        exp_continue
-    }
-    -re {(?i)\(y/n\)|\[y/N\]|continue\?} {
+    -re $expected_arm_prompt {
         send "y\r"
         exp_continue
+    }
+    -re {(?i)\(y/n\)|\[y/n\]|continue\?|type .?ARM.? to confirm} {
+        puts "\narm-expect.exp: an UNRECOGNISED confirmation prompt appeared during a root-run, host-wide arm; refusing to answer it"
+        puts "prompt context: $expect_out(buffer)"
+        # Close the pty rather than walking away from it. Leaving a root-run
+        # arm parked at an unanswered prompt is how a half-applied host-wide
+        # change survives the night; EOF on its stdin makes it abort.
+        catch {exp_close}
+        catch {exp_wait}
+        exit 1
     }
     timeout {
         puts "\narm-expect.exp: timed out waiting for the arm to complete"

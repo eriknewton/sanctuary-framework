@@ -127,6 +127,11 @@ but can be talked into touching a real fortress is worth negative value.
 | A driver observation made through a PATH-resolved tool | `rails_require_cmd` in every driver; a structural test forbids a bare command name in driver code |
 | A check that could not OBSERVE, reported as clean | tri-state verdicts: `VERIFY=UNOBSERVED` / `PREFLIGHT=FAIL` are distinct from DIRTY and both stop the night |
 | A skipped probe, summarized as a pass | `rails_probe_result`: exit status AND the battery's own `verified=yes` must agree |
+| A verdict computed from something other than what it measured | the observation ledger: `report` takes the observation ids as a REQUIRED argument and refuses an empty basis, a basis belonging to another probe, or a basis that observed nothing. A refused verdict is `UNOBSERVED` + a counted HARNESS DEFECT + exit 4 |
+| A PASS claiming a mechanism the request never used ("through the gate") | `rails_claim_mechanisms` + `rails_assert_claim_supported`: the mechanism words in a verdict text are checked against what its basis actually exercised |
+| A through-gate probe that never traversed the gate | the `gate-port` wrapper verb + `measure_http <probe> gate`: the port comes from the gate daemon's own runtime state and the request is proxied to it. `direct` requests pass `--noproxy '*'`, so the two channels cannot be confused |
+| A status code attributed to a gate generation that rotated away | `measure_http` re-reads port+generation after every through-gate request; a change makes the observation UNOBSERVABLE |
+| An absent gate log read as a gate-blamed denial | per-stream `WRAPPER=GATE-LOG-READ key=<k> state=read\|absent`; `gate_log_since_says` takes the stream CLASS the pattern would live in and returns COULD-NOT-OBSERVE when it was not read |
 | Interleaving a scheduled run with an interactive drill | `rails_lock_acquire`, atomic single-winner reclaim |
 | Running a wrapper that does not match its reviewed hash | `rails_assert_wrapper_integrity` |
 
@@ -161,7 +166,10 @@ scripts/drill-loop/
     preflight.sh                every historical defect layer as a permanent check
     run-probe-battery.sh        the pre-declared probe ladder
     teardown-verify.sh          teardown, OBSERVED-state verification, retirement
-  expect/arm-expect.exp         answers the arm confirmation over a pty
+  expect/arm-expect.exp         answers the arm confirmation over a pty -- and ONLY
+                                that one exact prompt; an unrecognised (y/n) question
+                                during a root-run, host-wide arm is a hard stop, never
+                                an unattended "y"
 ```
 
 ### Why the wrapper is assembled rather than sourced
@@ -373,6 +381,38 @@ Stated here rather than discovered at 3am:
   appended after the request boundary. N3 also requires the current wrong-uid
   request to be denied; a 2xx/3xx response is a loud FAIL even if a stale
   `peer_uid_mismatch` token exists elsewhere.
+- **CLOSED (round 6): the probes now REACH the gate, and a verdict cannot
+  outrun its observation.** Rounds 1 to 5 each fixed a list and the next round
+  found a new instance of the same class: **every probe's verdict was computed
+  from something other than the thing it claimed to have measured.** The
+  clearest instance was the request itself. The gate is an `HTTPS_PROXY`
+  CONNECT proxy on `127.0.0.1:<gate_port>`, the pf anchor passes exactly that
+  loopback destination for the agent uid, and there is no `rdr` anywhere, so a
+  bare `curl` never traverses the gate; the harness had no way to learn the
+  port at all, yet printed `RESULT=PASS ... reachable through the gate`, and
+  `N3` could never see the `peer_uid_mismatch` it exists to observe.
+
+  Two things changed rather than seven:
+
+  1. **A wrapper verb, `gate-port`,** reads the gate daemon's own published
+     runtime state as root and reports the port + generation it bound. The
+     battery proxies to that port for every through-gate probe, re-reads it
+     after each request, and records the observation UNOBSERVABLE if the
+     generation rotated across it. `P2` (per-uid differential) is DIRECT and
+     `N3` (wrong uid) is THROUGH THE GATE, which is also what resolves their
+     old mutual contradiction.
+  2. **An observation ledger.** Every act of looking at the world appends a
+     record naming the probe that made it, the mechanism it used, and whether
+     it observed anything. `report` takes the observation ids as a REQUIRED
+     argument and refuses a PASS or FAIL whose basis is empty, belongs to
+     another probe, observed nothing, or whose TEXT names a mechanism the basis
+     never exercised. A refused verdict becomes `UNOBSERVED`, is counted as a
+     HARNESS DEFECT, and the battery exits 4. Every emitted line carries the
+     derived `basis=`, `observed=` and `channels=` fields, so a reader never has
+     to trust the prose. Consequences that fall out rather than being patched:
+     `--repeats 0` cannot produce a pass, `N3` cannot read `N1`'s status code,
+     and an absent gate-daemon log is COULD-NOT-OBSERVE rather than a
+     gate-blamed FAIL (the four log streams are no longer interchangeable).
 - **No drill host is on the allowlist yet, so the wrapper refuses everywhere.**
   `RAILS_HOST_ALLOW_FP` is empty: Mini1's and Mini2's hardware fingerprints
   have not been measured, because doing so means running

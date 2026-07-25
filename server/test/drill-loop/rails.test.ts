@@ -1209,7 +1209,17 @@ describe("drill-loop wrapper: the shipped artifact's own structure", () => {
     // into "clean". These verbs are the half that lets them actually look.
     const verbs = assembled.match(/^WRAPPER_VERBS='([^']*)'/m);
     expect(verbs, "the assembled wrapper must declare its verb list").not.toBeNull();
-    for (const verb of ["registry-state", "fortress-state", "gate-log", "pf-anchor-rules"]) {
+    for (const verb of [
+      "registry-state",
+      "fortress-state",
+      "gate-log",
+      "pf-anchor-rules",
+      // ROUND-5 B1: and the fifth, without which no probe can address the gate
+      // at all. The gate is a CONNECT proxy on a per-generation loopback port
+      // with no `rdr` in front of it, so a request that was not aimed at the
+      // port did not traverse the gate whatever it returned.
+      "gate-port",
+    ]) {
       expect(verbs![1].split(" ")).toContain(verb);
     }
     // ...and `retire`, without which the disposable fortresses accumulate
@@ -1339,6 +1349,60 @@ describe("drill-loop wrapper: the shipped artifact's own structure", () => {
     // ...and the DIRECTORY the grant rests on is chain-verified, which
     // `rails_assert_wrapper_ownership` never does (it checks only the file).
     expect(exec).toContain("rails_assert_trusted_dir_chain 'grant target dir'");
+  });
+
+  it("the probe battery AIMS its through-gate requests at the gate port", () => {
+    // ROUND-5 B1, pinned structurally so it cannot be quietly undone.
+    //
+    // The gate is a `HTTPS_PROXY` CONNECT proxy on `127.0.0.1:<gate_port>`; the
+    // pf anchor's rules are `on lo0 ... user=<agent uid>` and there is NO `rdr`
+    // anywhere in `server/src/egress-gate/`, so a bare `curl` does not traverse
+    // the gate no matter what it returns. Before this round `gate_port` occurred
+    // in the entire `scripts/drill-loop/` tree only inside comments and inside a
+    // `RESULT=PASS ... through the gate` string. `P1` and `F1-F2` printed
+    // through-gate PASS lines for requests that could not have gone through the
+    // gate, and `N3` could never produce the `peer_uid_mismatch` it exists to
+    // observe, because that event is only ever emitted for a socket connected
+    // TO the gate port.
+    const battery = executableLines(
+      fs.readFileSync(path.join(DRILL_LOOP, "drivers", "run-probe-battery.sh"), "utf8")
+    );
+    // The port comes from the wrapper verb, never from a guess or a constant.
+    expect(battery).toContain('"$WRAPPER" gate-port');
+    expect(battery).toContain('rails_assert_tcp_port "$GATE_PORT"');
+    // The gate channel proxies; the direct channel explicitly does NOT, so an
+    // ambient proxy variable cannot turn a direct request into a gate one.
+    expect(battery).toContain('--proxy "http://127.0.0.1:$GATE_PORT"');
+    expect(battery).toContain("--noproxy '*'");
+    // N3's wrong-uid request is the OPERATOR through the GATE. A direct
+    // operator request is P2's question, not N3's, and the two probes were
+    // mutually contradictory as written precisely because the channel was not
+    // represented anywhere.
+    expect(battery).toMatch(/measure_http N3 gate "\$OPERATOR"/);
+    expect(battery).toMatch(/measure_http P2-operator direct "\$OPERATOR"/);
+  });
+
+  it("the probe battery's verdicts are gated on a named observation", () => {
+    // THE ROUND-6 CHOKEPOINT. Six rounds found six instances of one class:
+    // every verdict was computed from something other than the thing it claimed
+    // to have measured. `report` now takes the observation ids as a REQUIRED
+    // argument, refuses a basis from another probe, refuses a basis with
+    // nothing actually observed, and refuses a text whose mechanism words its
+    // basis never exercised. These assertions pin the seam, not the instances.
+    const battery = executableLines(
+      fs.readFileSync(path.join(DRILL_LOOP, "drivers", "run-probe-battery.sh"), "utf8")
+    );
+    expect(battery).toContain("rails_assert_claim_supported");
+    expect(battery).toContain("was recorded by probe");
+    expect(battery).toMatch(/bad="?'?all \$total observations in the basis were UNOBSERVABLE/);
+    expect(battery).toContain("HARNESS DEFECT");
+    // `obs_record` must set a GLOBAL, never print an id into a `$( )`: a
+    // command substitution would discard the sequence counter and the index in
+    // a subshell and every observation would be `obs1`. That is round 1's
+    // die-inside-a-subshell defect arriving through the front door.
+    expect(battery).not.toMatch(/=\s*"\$\(obs_record/);
+    // `--repeats` cannot ask for a zero-measurement battery.
+    expect(battery).toContain("--repeats must be at least 1");
   });
 
   it("the sudoers grant pins secure_path", () => {
@@ -1918,6 +1982,7 @@ exec /usr/bin/tail "$@"
       "registry-state",
       "fortress-state",
       "gate-log",
+      "gate-port",
     ]) {
       const r = wrapper(verb, "--run-id", "../../.sanctuary", "--operator-account", me);
       expect(r.status, `${verb} accepted a traversal run id`).not.toBe(0);
@@ -1968,9 +2033,23 @@ exec /usr/bin/tail "$@"
  * drill host and CI execute the same file.
  */
 describe("drill-loop: the standalone battery is the same battery", () => {
-  it("selftest.sh passes in full", () => {
-    const r = run("bash", [SELFTEST]);
-    expect(r.status, r.out).toBe(0);
-    expect(r.out).toMatch(/\n\d+ passed, 0 failed/);
-  });
+  // ROUND-5 B2. This case is genuinely MINUTES-scale work -- it runs the whole
+  // 250+ assertion shell battery, including several real sub-process ladders --
+  // and it was inheriting the suite-wide `testTimeout: 30_000` from
+  // `vitest.config.ts`, which is a budget sized for a ZK proof, not for this.
+  // It was RED 3/3 on macOS at ~36-38 s (Linux CI passes only because the
+  // hardware-dependent sections skip there), so the MANDATORY
+  // `npm run typecheck && npm test` commit gate was red on this branch and the
+  // previous commit needed the audited `SKIP_TEST_BASELINE=1` path. The budget
+  // is now explicit and generous; the battery keeps growing and 30 s was never
+  // the right number for it on any platform.
+  it(
+    "selftest.sh passes in full",
+    () => {
+      const r = run("bash", [SELFTEST]);
+      expect(r.status, r.out).toBe(0);
+      expect(r.out).toMatch(/\n\d+ passed, 0 failed/);
+    },
+    600_000
+  );
 });

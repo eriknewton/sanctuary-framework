@@ -8,6 +8,7 @@ import {
   EGRESS_GATE_DAEMON_LABEL_PREFIX,
   egressGateDaemonLabel,
   egressGateDaemonLogPaths,
+  egressGateRuntimeStatePath,
 } from "../../src/egress-gate/gate-daemon.js";
 import {
   PEER_RESOLVER_DAEMON_LABEL_PREFIX,
@@ -201,6 +202,65 @@ describe("drill-loop: product identifiers are pinned to the product's own export
     )}/${logDir}/egress-gate-${AGENT_UID}.out.log`;
 
     expect(harnessPath).toBe(stdoutPath);
+  });
+
+  it("composes the GATE RUNTIME STATE path the daemon actually publishes", () => {
+    // ROUND-5 B1. This document is where the harness learns the port the gate
+    // ACTUALLY bound. Without it no probe can be aimed at the gate, because
+    // the gate is a CONNECT proxy on a per-generation loopback port and there
+    // is no `rdr` redirecting anything into it; every probe in the ladder was
+    // a bare `curl` that could not have traversed the gate, while printing
+    // `RESULT=PASS ... through the gate`.
+    //
+    // The port is chosen per generation (bind-first on `127.0.0.1:0`), so this
+    // path is the ONLY thing that can be compiled in. Pin it to the product's
+    // own composer so a rename goes red here rather than making every
+    // through-gate probe silently unobservable on the next drill night.
+    const harnessPath = railsCompose("rails_product_gate_runtime_state_path", String(AGENT_UID));
+    expect(harnessPath).toBe(egressGateRuntimeStatePath(AGENT_UID));
+  });
+
+  it("the arm driver's answered prompt is the prompt the PRODUCT asks", () => {
+    // ROUND-5 M4, and this is a SAFETY pin rather than a correctness one.
+    //
+    // `arm-expect.exp` used to answer `y` to ANY text matching
+    // `(?i)\(y/n\)|\[y/N\]|continue\?`, an unbounded number of times, while
+    // driving a ROOT-run operation whose effects are HOST-WIDE (the pf anchor,
+    // the LaunchDaemons, the gate service account). A future product prompt of
+    // the shape "a gate is already armed for uid N; tear it down? (y/n)" would
+    // have got an unattended yes on a machine that may be running something
+    // else. It now answers exactly ONE text and hard-stops on anything else.
+    //
+    // The cost of that correctness is a coupling: if the product REWORDS its
+    // confirmation, every unattended night stops at an unrecognised prompt.
+    // That failure is loud and safe, but it should be caught here rather than
+    // at 3am, so the harness's allowlisted prompt is pinned to the literal the
+    // product's one confirm actually passes.
+    const orchestrate = fs.readFileSync(
+      path.join(REPO_ROOT, "server", "src", "castle-wall", "provision", "orchestrate.ts"),
+      "utf8"
+    );
+    const confirms = [...orchestrate.matchAll(/ops\.confirm\(\s*"([^"]+)"/g)].map((m) => m[1]);
+    expect(
+      confirms,
+      "the provisioning flow must ask exactly ONE confirmation; a second one is a prompt " +
+        "arm-expect.exp has never seen and will (correctly) refuse to answer"
+    ).toHaveLength(1);
+
+    const armExpect = fs.readFileSync(path.join(DRILL_LOOP, "expect", "arm-expect.exp"), "utf8");
+    const allow = armExpect.match(/^set expected_arm_prompt \{(.+)\}$/m);
+    expect(allow, "arm-expect.exp must declare its allowlisted prompt in one named place").not.toBeNull();
+    // The allowlist entry is a Tcl regex; it must MATCH the product's literal.
+    expect(new RegExp(allow![1]).test(confirms[0]), 
+      `arm-expect.exp allows /${allow![1]}/ but the product asks "${confirms[0]}"`).toBe(true);
+    // The SPECULATIVE `type ARM to confirm` branch must stay gone too: it
+    // answered a prompt that occurs nowhere in the product, and an allowlist
+    // with a speculative entry is not an allowlist.
+    expect(orchestrate).not.toContain("type ARM to confirm");
+    expect(armExpect).not.toMatch(/type \.\?ARM\.\? to confirm\}\s*\{\s*\n\s*send "ARM/);
+    // ...and the generic auto-yes branch must be gone. This is the assertion
+    // that would have caught the original defect.
+    expect(armExpect).not.toMatch(/-re \{\(\?i\)\\\(y\/n\\\)[^}]*\}\s*\{\s*\n\s*send "y/);
   });
 
   it("declares each product identifier in exactly ONE place", () => {
