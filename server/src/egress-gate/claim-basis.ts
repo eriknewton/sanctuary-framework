@@ -225,6 +225,7 @@ export type ClaimSiteId =
   | "arming-wiring.barrier-bootstrap"
   | "arming-wiring.barrier-bootout"
   | "arming-wiring.barrier-remove-hold"
+  | "arming-wiring.residue-pair-removed"
   | "arming-wiring.barrier-write-hold"
   | "arming-wiring.rearm-install-noop"
   | "arming-wiring.rearm-probed"
@@ -814,6 +815,23 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     claim: "the per-uid release hold file is gone",
     basis: "observed",
     detectorBlind: true,
+    layer: "compute",
+    branches: "single",
+  },
+  "arming-wiring.residue-pair-removed": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "removeExclusiveRoutingResiduePair",
+    claim: "BOTH the exclusive-routing marker and the exclusive-egress gate policy file are gone",
+    // OBSERVED, and observed per FILE. The success arm is reached only after
+    // each `removeFile` in the pair returned without throwing, and the caller's
+    // production remover is `rm(path, { force: true })`, which succeeds on an
+    // already-absent path and throws on everything else. A failure part way
+    // through returns `ok: false` carrying the files that WERE removed, so the
+    // partial case is representable rather than collapsing into either "done"
+    // or "nothing happened" -- that collapse (FIX G5, re-gate 2026-07-26) is
+    // what let a caller render "no Castle Wall change was made by this run"
+    // over a fortress whose marker had just been deleted.
+    basis: "observed",
     layer: "compute",
     branches: "single",
   },
@@ -1944,7 +1962,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/unprovision.ts`]: 4,
   [`${CW}/verify.ts`]: 1,
   [`${EG}/anchor-registry.ts`]: 0,
-  [`${EG}/arming-wiring.ts`]: 31,
+  [`${EG}/arming-wiring.ts`]: 33,
   [`${EG}/claim-basis.ts`]: 3,
   [`${EG}/drift-guard.ts`]: 0,
   [`${EG}/exec-runner.ts`]: 0,

@@ -27,6 +27,7 @@ import {
   type GateAccountHomeLayoutOps,
   type RootOwnedDirEnsureOps,
   restoreCoarseCompositionProduction,
+  clearExclusiveRoutingResidueWithoutAccount,
   reconcileStaleExclusiveRoutingProduction,
   reloadPeerResolverDaemonForBringUp,
   reloadLaunchdDaemonForBringUp,
@@ -1329,17 +1330,24 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
 
   function reconInput(): {
     agentUid: number;
+    intent: "observe" | "clear";
     fortressPath: string;
     audit: ReturnType<typeof vi.fn>;
     print: ReturnType<typeof vi.fn>;
   } {
     return {
       agentUid: MARKER.agent_uid,
+      // FIX F1 (2026-07-26): the reconcile is now two-intent. The default here
+      // is "clear" (judge AND remove), which is what every pre-existing
+      // liveness assertion below is about; the "observe" half has its own test.
+      intent: "clear",
       fortressPath: FORTRESS,
       audit: vi.fn(async () => undefined),
       print: vi.fn(),
     };
   }
+  /** The refusal-reason field of a keep verdict, without narrowing gymnastics. */
+  const keptReason = (r: unknown): string => (r as { reason: string }).reason;
   const enoent = (): NodeJS.ErrnoException => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
   /** Clean registry snapshot (not dirty, nothing quarantined) with optional entries. */
   const cleanRegistry = (
@@ -1363,7 +1371,7 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     });
   }
 
-  it("marker ABSENT -> no-op {reconciled:false}, no writes, no audit", async () => {
+  it("marker ABSENT -> no-op {kind:'clear'}, no writes, no audit", async () => {
     const input = reconInput();
     const removeFile = vi.fn(async () => undefined);
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
@@ -1371,7 +1379,7 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
       listRegistry: async () => cleanRegistry(),
       removeFile,
     });
-    expect(result).toEqual({ reconciled: false });
+    expect(result).toEqual({ kind: "clear" });
     expect(removeFile).not.toHaveBeenCalled();
     expect(input.audit).not.toHaveBeenCalled();
   });
@@ -1379,7 +1387,13 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
   it("FIX-1 cross-uid: a marker declaring a DIFFERENT uid than the arm target is KEPT fail-closed (never judged against the wrong subject)", async () => {
     // Arm target 999; marker declares 707. Another uid may be live, so we must
     // not reconcile this marker against uid 999's liveness.
-    const input = { agentUid: 999, fortressPath: FORTRESS, audit: vi.fn(async () => undefined), print: vi.fn() };
+    const input = {
+      agentUid: 999,
+      intent: "clear" as const,
+      fortressPath: FORTRESS,
+      audit: vi.fn(async () => undefined),
+      print: vi.fn(),
+    };
     const removeFile = vi.fn(async () => undefined);
     const listRegistry = vi.fn(async () => cleanRegistry());
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
@@ -1387,9 +1401,46 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
       listRegistry,
       removeFile,
     });
-    expect(result.reconciled).toBe(false);
-    expect(result.reason).toMatch(/cross-uid marker/);
+    // A marker we cannot scope to this run is UNCERTAIN, not a live-gate
+    // observation: the operator sentence for it must not read as "you already
+    // have a working gate".
+    expect(result.kind).toBe("kept-uncertain");
+    expect(keptReason(result)).toMatch(/cross-uid marker/);
     // The guard is BEFORE any liveness probe: no registry read, no removal.
+    expect(listRegistry).not.toHaveBeenCalled();
+    expect(removeFile).not.toHaveBeenCalled();
+    expect(input.audit).not.toHaveBeenCalled();
+  });
+
+  it("FIX F-COARSE-AFTER-EXCLUSIVE: an UNKNOWN subject uid (the pre-mutation gate on a fresh run) KEEPS the marker fail-closed and is never a wildcard", async () => {
+    // The mode-independent residue gate runs BEFORE the account exists, so it
+    // can have no uid to scope the marker against. `undefined` must take the
+    // same fail-closed branch as a cross-uid mismatch: no subject, no scoped
+    // liveness judgement, no removal.
+    const input = {
+      agentUid: undefined,
+      intent: "clear" as const,
+      fortressPath: FORTRESS,
+      audit: vi.fn(async () => undefined),
+      print: vi.fn(),
+    };
+    const removeFile = vi.fn(async () => undefined);
+    const listRegistry = vi.fn(async () => cleanRegistry());
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry,
+      // Everything below says "provably orphaned"; the guard must still keep it.
+      readRuntimeState: async () => {
+        throw enoent();
+      },
+      plistExists: noPlist,
+      removeFile,
+    });
+    // FIX F3 (2026-07-26): its OWN verdict kind, carrying the marker's uid --
+    // this is the one keep whose subject account may be gone entirely, so it
+    // needs a different sentence and a different way out.
+    expect(result).toMatchObject({ kind: "kept-unknown-subject", markerAgentUid: MARKER.agent_uid });
+    expect(keptReason(result)).toMatch(/has not resolved an agent uid/);
     expect(listRegistry).not.toHaveBeenCalled();
     expect(removeFile).not.toHaveBeenCalled();
     expect(input.audit).not.toHaveBeenCalled();
@@ -1410,7 +1461,7 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
         removed.push(p);
       },
     });
-    expect(result).toEqual({ reconciled: true });
+    expect(result).toMatchObject({ kind: "reconciled" });
     // EXACT restoreCoarseComposition removal pair, in order.
     expect(removed).toEqual([MARKER_PATH, GATE_POLICY_PATH]);
     expect(input.audit).toHaveBeenCalledWith(
@@ -1419,18 +1470,69 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     );
   });
 
-  it("KEEPS the marker when the S5-1 registry still has a committed entry for the uid (no de-confinement)", async () => {
+  it("FIX F1: intent 'observe' on the SAME provably-orphaned marker judges it ORPHANED and writes NOTHING", async () => {
+    // The consent-ordering half of the fix. The gate judges before the operator
+    // confirm so a doomed run is never confirmed, and it must be able to do that
+    // without deleting two fortress policy files first. Identical inputs to the
+    // ORPHANED test above; the ONLY difference is the intent.
+    const input = { ...reconInput(), intent: "observe" as const };
+    const removeFile = vi.fn(async () => undefined);
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry: async () => cleanRegistry([{ agent_uid: 999 }]),
+      readRuntimeState: async () => {
+        throw enoent();
+      },
+      plistExists: noPlist,
+      removeFile,
+    });
+    expect(result).toMatchObject({ kind: "orphaned" });
+    expect((result as { detail: string }).detail).toMatch(/no S5-1 registry entry and no serving gate/);
+    // Nothing on the fortress changed: no files, no audit record, no narration.
+    expect(removeFile).not.toHaveBeenCalled();
+    expect(input.audit).not.toHaveBeenCalled();
+    expect(input.print).not.toHaveBeenCalled();
+  });
+
+  it("G7: a registry entry with NO verified live listener KEEPS the marker as kept-UNCERTAIN (a record is not an observation)", async () => {
     const input = reconInput();
     const removeFile = vi.fn(async () => undefined);
     const result = await reconcileStaleExclusiveRoutingProduction(input, {
       loadMarker: async () => ({ ...MARKER }),
       listRegistry: async () => cleanRegistry([{ agent_uid: MARKER.agent_uid }]),
+      readRuntimeState: async () => {
+        throw enoent();
+      },
+      plistExists: noPlist,
       removeFile,
     });
-    expect(result.reconciled).toBe(false);
-    expect(result.reason).toMatch(/registry still has an entry/);
+    // FIX G7 (re-gate 2026-07-26): a registry entry is a RECORD, and by its own
+    // reason string it covers a "mid-bring-up" generation -- i.e. possibly the
+    // interrupted arm this gate exists for. `kept-live`'s sentence offers
+    // "nothing needs doing", which is the WRONG advice on a wedged host, so the
+    // entry alone can no longer earn it. The marker is still KEPT either way.
+    expect(result.kind).toBe("kept-uncertain");
+    expect(keptReason(result)).toMatch(/registry still has an entry/);
+    expect(keptReason(result)).toMatch(/no live gate listener was verified/);
     expect(removeFile).not.toHaveBeenCalled();
     expect(input.audit).not.toHaveBeenCalled();
+  });
+
+  it("G7: a registry entry PLUS an owner-verified serving gate is kept-LIVE (the healthy armed host keeps its 'nothing needs doing')", async () => {
+    const input = reconInput();
+    const removeFile = vi.fn(async () => undefined);
+    const result = await reconcileStaleExclusiveRoutingProduction(input, {
+      loadMarker: async () => ({ ...MARKER }),
+      listRegistry: async () => cleanRegistry([{ agent_uid: MARKER.agent_uid }]),
+      readRuntimeState: async () => runtimeStateJson(),
+      verifyPortOwner: async () => ({ ok: true as const }),
+      plistExists: noPlist,
+      removeFile,
+    });
+    expect(result.kind).toBe("kept-live");
+    expect(keptReason(result)).toMatch(/gate liveness .* is yes/);
+    expect(keptReason(result)).toMatch(/registry has an entry for that uid/);
+    expect(removeFile).not.toHaveBeenCalled();
   });
 
   it("FIX-2 crashed-mid-bring-up: a DIRTY registry (a G3 generation staged but never committed forces dirty) is KEPT fail-closed", async () => {
@@ -1449,8 +1551,8 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
       plistExists: noPlist,
       removeFile,
     });
-    expect(result.reconciled).toBe(false);
-    expect(result.reason).toMatch(/uncertain state.*dirty=true/);
+    expect(result.kind).toBe("kept-uncertain");
+    expect(keptReason(result)).toMatch(/uncertain state.*dirty=true/);
     expect(removeFile).not.toHaveBeenCalled();
   });
 
@@ -1466,8 +1568,8 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
       plistExists: noPlist,
       removeFile,
     });
-    expect(result.reconciled).toBe(false);
-    expect(result.reason).toMatch(/uncertain state.*quarantined=1/);
+    expect(result.kind).toBe("kept-uncertain");
+    expect(keptReason(result)).toMatch(/uncertain state.*quarantined=1/);
     expect(removeFile).not.toHaveBeenCalled();
   });
 
@@ -1483,8 +1585,9 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
       verifyPortOwner,
       removeFile,
     });
-    expect(result.reconciled).toBe(false);
-    expect(result.reason).toMatch(/gate liveness .* is yes/);
+    // An owner-verified live listener is LIVE, not uncertain.
+    expect(result.kind).toBe("kept-live");
+    expect(keptReason(result)).toMatch(/gate liveness .* is yes/);
     // The owner check ran against the MARKER's gate uid and the recorded port.
     expect(verifyPortOwner).toHaveBeenCalledWith(
       expect.objectContaining({ port: 49222, expectedUid: MARKER.gate_uid, expectedPid: 4242 }),
@@ -1502,8 +1605,8 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
       verifyPortOwner: async () => ({ ok: false as const, reason: "listener lookup failed: no listener" }),
       removeFile,
     });
-    expect(result.reconciled).toBe(false);
-    expect(result.reason).toMatch(/uncertain/);
+    expect(result.kind).toBe("kept-uncertain");
+    expect(keptReason(result)).toMatch(/uncertain/);
     expect(removeFile).not.toHaveBeenCalled();
   });
 
@@ -1519,8 +1622,8 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
       plistExists: async () => true,
       removeFile,
     });
-    expect(result.reconciled).toBe(false);
-    expect(result.reason).toMatch(/plist is present/);
+    expect(result.kind).toBe("kept-uncertain");
+    expect(keptReason(result)).toMatch(/plist is present/);
     expect(removeFile).not.toHaveBeenCalled();
   });
 
@@ -1562,10 +1665,268 @@ describe("reconcileStaleExclusiveRoutingProduction (D8 stale-marker self-heal)",
     };
     const first = await reconcileStaleExclusiveRoutingProduction(input, deps);
     const second = await reconcileStaleExclusiveRoutingProduction(input, deps);
-    expect(first).toEqual({ reconciled: true });
-    expect(second).toEqual({ reconciled: false });
+    expect(first).toMatchObject({ kind: "reconciled" });
+    expect(second).toEqual({ kind: "clear" });
     // Exactly ONE removal pair total (marker + gate policy), never four.
     expect(removed).toEqual([MARKER_PATH, GATE_POLICY_PATH]);
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // FIX F3 (adversarial review, 2026-07-26): the no-account residue teardown.
+  //
+  // With the dedicated agent account gone but the fortress still carrying its
+  // exclusive-routing files, `--unprotect-egress-gate` exited 2 ("nothing to
+  // unprotect"), `--repair-egress-gate` exited 2 pointing at the provision
+  // command the residue gate refuses, and the provision command refused. A
+  // closed loop whose only exit was an undocumented manual `rm`. This function
+  // is what makes the verb the refusal names actually work.
+  // ────────────────────────────────────────────────────────────────────────
+  describe("clearExclusiveRoutingResidueWithoutAccount (F3: the way out when the account is gone)", () => {
+    it("no marker on disk -> 'no-residue', nothing removed (the verb still has nothing to do)", async () => {
+      const input = reconInput();
+      const removeFile = vi.fn(async () => undefined);
+      const reconcile = vi.fn(async () => ({ kind: "clear" as const }));
+      const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+        loadMarker: async () => null,
+        reconcile,
+        removeFile,
+      });
+      expect(result).toEqual({ kind: "no-residue" });
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(removeFile).not.toHaveBeenCalled();
+    });
+
+    it("orphaned residue -> CLEARED, and the reconcile is scoped to the MARKER's own uid (guard 0 is not relaxed, it is supplied a subject)", async () => {
+      const input = reconInput();
+      const reconcile = vi.fn(async () => ({ kind: "reconciled" as const, detail: "no registry entry, no gate" }));
+      const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+        loadMarker: async () => ({ ...MARKER }),
+        reconcile,
+      });
+      expect(result).toEqual({ kind: "cleared", detail: "no registry entry, no gate" });
+      expect(reconcile).toHaveBeenCalledWith(MARKER.agent_uid);
+    });
+
+    it("live confinement for the marker's uid -> REFUSED, nothing removed (a marker-only removal would leave pf armed)", async () => {
+      const input = reconInput();
+      const removeFile = vi.fn(async () => undefined);
+      const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+        loadMarker: async () => ({ ...MARKER }),
+        reconcile: async () => ({ kind: "kept-live" as const, reason: "the S5-1 registry still has an entry" }),
+        removeFile,
+      });
+      expect(result).toEqual({ kind: "refused", reason: "the S5-1 registry still has an entry" });
+      expect(removeFile).not.toHaveBeenCalled();
+    });
+
+    // ──────────────────────────────────────────────────────────────────────
+    // FIX G1 (re-gate, 2026-07-26). The pre-fix unreadable branch removed the
+    // marker + gate policy with NO orphan proof at all, reasoning "with no
+    // account there is nothing running at the uid it names". But
+    // `loadExclusiveRoutingMarker` returns null ONLY on ENOENT and THROWS on
+    // every other read failure, so "unreadable" includes a PERFECTLY VALID
+    // marker that merely could not be read (EACCES, EIO, EISDIR, a
+    // root-squashed network fortress). "Could not look" must never authorise a
+    // destructive action.
+    // ──────────────────────────────────────────────────────────────────────
+    it("G1 REGRESSION (the reviewer's EACCES scenario): a VALID marker declaring uid 503, made unreadable, is NOT deleted while confinement exists", async () => {
+      const input = reconInput();
+      const removeFile = vi.fn(async () => undefined);
+      // The real EACCES shape: `loadExclusiveRoutingMarker` wraps the readFile
+      // failure, so the marker's agent_uid (503) is present and valid on disk
+      // and simply was not read. The registry still carries an entry -- the
+      // interrupted arm this whole gate is about.
+      const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+        loadMarker: async () => {
+          throw new ExclusiveRoutingMarkerError(
+            `cannot read ${MARKER_PATH} (EACCES: permission denied, open '${MARKER_PATH}'); ` +
+              "refusing to compose a manifest under an unknown routing mode",
+          );
+        },
+        listRegistry: async () => cleanRegistry([{ agent_uid: 503 }]),
+        removeFile,
+      });
+      expect(result.kind).toBe("refused");
+      expect((result as { reason: string }).reason).toMatch(/EACCES/);
+      expect((result as { reason: string }).reason).toMatch(/NOT provably empty/);
+      // The whole point: nothing was removed and nothing was audited as removed.
+      expect(removeFile).not.toHaveBeenCalled();
+      expect(input.audit).not.toHaveBeenCalled();
+    });
+
+    it("G1: an unreadable marker with a DIRTY or QUARANTINED registry is REFUSED too (uncertainty is not a proof of absence)", async () => {
+      for (const registry of [
+        { entries: [], dirty: true, quarantined: [] },
+        { entries: [], dirty: false, quarantined: [{ index: 0, reason: "malformed" }] },
+      ]) {
+        const input = reconInput();
+        const removeFile = vi.fn(async () => undefined);
+        const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+          loadMarker: async () => {
+            throw new ExclusiveRoutingMarkerError("EIO: i/o error");
+          },
+          listRegistry: async () => registry,
+          removeFile,
+        });
+        expect(result.kind).toBe("refused");
+        expect(removeFile).not.toHaveBeenCalled();
+      }
+    });
+
+    it("G1: an unreadable marker whose ORPHAN PROOF itself cannot be read is REFUSED (could-not-look never authorises a delete)", async () => {
+      const input = reconInput();
+      const removeFile = vi.fn(async () => undefined);
+      const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+        loadMarker: async () => {
+          throw new ExclusiveRoutingMarkerError("EACCES: permission denied");
+        },
+        listRegistry: async () => {
+          throw new Error("registry file /var/db/sanctuary/egress-anchor-registry.json is not valid JSON");
+        },
+        removeFile,
+      });
+      expect(result.kind).toBe("refused");
+      expect((result as { reason: string }).reason).toMatch(/could not be read either/);
+      expect(removeFile).not.toHaveBeenCalled();
+      expect(input.audit).not.toHaveBeenCalled();
+    });
+
+    it("G1: an unreadable marker IS cleared once the registry is PROVABLY clean and empty (the way out is preserved, on a proof)", async () => {
+      const input = reconInput();
+      const removed: string[] = [];
+      const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+        loadMarker: async () => {
+          throw new ExclusiveRoutingMarkerError("not valid JSON");
+        },
+        listRegistry: async () => cleanRegistry(),
+        removeFile: async (p) => {
+          removed.push(p);
+        },
+      });
+      expect(result).toMatchObject({ kind: "cleared" });
+      expect((result as { detail: string }).detail).toMatch(/could not be read/);
+      expect((result as { detail: string }).detail).toMatch(/holds NO entries at all/);
+      expect(removed).toEqual([MARKER_PATH, GATE_POLICY_PATH]);
+      expect(input.audit).toHaveBeenCalledWith(
+        EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP,
+        expect.objectContaining({ agent_uid: null }),
+      );
+    });
+
+    it("G4: a THROW from the scoped reconcile is a refusal, not an unhandled rejection (wrap/cli.ts awaits this with no try/catch)", async () => {
+      const input = reconInput();
+      const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+        loadMarker: async () => ({ ...MARKER }),
+        reconcile: async () => {
+          throw new Error("PfAnchorRegistryStateError: registry file is not valid JSON");
+        },
+      });
+      expect(result.kind).toBe("refused");
+      expect((result as { reason: string }).reason).toMatch(/could not complete/);
+      expect((result as { reason: string }).reason).toMatch(/PfAnchorRegistryStateError/);
+    });
+
+    it("G5: a reconcile that removed part of the pair reports PARTIAL with what it removed (never the 'nothing changed' frame)", async () => {
+      const input = reconInput();
+      const result = await clearExclusiveRoutingResidueWithoutAccount(input, {
+        loadMarker: async () => ({ ...MARKER }),
+        reconcile: async () => ({
+          kind: "removal-failed" as const,
+          detail: `removing the exclusive-egress gate policy file (${GATE_POLICY_PATH}) failed: EROFS`,
+          removed: [`the exclusive-routing marker (${MARKER_PATH})`],
+        }),
+      });
+      expect(result).toMatchObject({
+        kind: "partial",
+        removed: [`the exclusive-routing marker (${MARKER_PATH})`],
+      });
+      expect((result as { reason: string }).reason).toMatch(/EROFS/);
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // FIX G5 (re-gate, 2026-07-26): the CLEAR half's removal is tracked, and the
+  // audit is written BEFORE the first removal. Pre-fix the order was remove,
+  // remove, audit -- so a gate-policy removal that threw after the marker
+  // removal succeeded left NO audit record (invariant 3) and let the caller
+  // render "no Castle Wall change was made by this run" over a fortress that
+  // had just been put back on coarse composition.
+  // ────────────────────────────────────────────────────────────────────────
+  describe("reconcileStaleExclusiveRoutingProduction clear-half removal disposition (G5)", () => {
+    const FORTRESS = "/fortress/recon";
+    const MARKER: ExclusiveRoutingMarker = {
+      version: 1,
+      mode: "exclusive",
+      agent_uid: 707,
+      gate_uid: 708,
+      agent_id: "hermes",
+      agent_template: "hermes",
+    };
+    const MARKER_PATH = exclusiveRoutingMarkerPath(FORTRESS);
+    const GATE_POLICY_PATH = join(FORTRESS, "policy", "egress", EXCLUSIVE_EGRESS_GATE_FILENAME);
+    const enoent = (): NodeJS.ErrnoException => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+
+    function clearInput(): {
+      agentUid: number;
+      intent: "clear";
+      fortressPath: string;
+      audit: ReturnType<typeof vi.fn>;
+      print: ReturnType<typeof vi.fn>;
+    } {
+      return {
+        agentUid: MARKER.agent_uid,
+        intent: "clear",
+        fortressPath: FORTRESS,
+        audit: vi.fn(async () => undefined),
+        print: vi.fn(),
+      };
+    }
+
+    it("a gate-policy removal that FAILS after the marker was removed reports removal-failed naming the marker (not a throw, not 'reconciled')", async () => {
+      const input = clearInput();
+      const result = await reconcileStaleExclusiveRoutingProduction(input, {
+        loadMarker: async () => ({ ...MARKER }),
+        listRegistry: async () => ({ entries: [], dirty: false, quarantined: [] }),
+        readRuntimeState: async () => {
+          throw enoent();
+        },
+        plistExists: async () => false,
+        removeFile: async (p) => {
+          if (p === GATE_POLICY_PATH) throw new Error("EROFS: read-only file system");
+        },
+      });
+      expect(result).toMatchObject({ kind: "removal-failed" });
+      expect((result as { removed: string[] }).removed).toEqual([`the exclusive-routing marker (${MARKER_PATH})`]);
+      expect((result as { detail: string }).detail).toMatch(/EROFS/);
+      // Invariant 3: the removal is on the record even though it did not finish.
+      expect(input.audit).toHaveBeenCalledWith(
+        EXCLUSIVE_ROUTING_STALE_MARKER_RECONCILED_AUDIT_OP,
+        expect.objectContaining({ agent_uid: MARKER.agent_uid }),
+      );
+      // No success narration for a removal that did not complete.
+      expect(input.print).not.toHaveBeenCalled();
+    });
+
+    it("the happy clear still reports reconciled, removes the pair in order, and audits BEFORE removing", async () => {
+      const input = clearInput();
+      const order: string[] = [];
+      input.audit.mockImplementation(async () => {
+        order.push("audit");
+      });
+      const result = await reconcileStaleExclusiveRoutingProduction(input, {
+        loadMarker: async () => ({ ...MARKER }),
+        listRegistry: async () => ({ entries: [], dirty: false, quarantined: [] }),
+        readRuntimeState: async () => {
+          throw enoent();
+        },
+        plistExists: async () => false,
+        removeFile: async (p) => {
+          order.push(p);
+        },
+      });
+      expect(result).toMatchObject({ kind: "reconciled" });
+      expect(order).toEqual(["audit", MARKER_PATH, GATE_POLICY_PATH]);
+    });
   });
 });
 
