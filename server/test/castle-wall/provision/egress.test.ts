@@ -453,6 +453,23 @@ describe("castle-wall/provision/egress: publish + scrub (hermetic tmp fortress)"
       expect(result.reloadOk).toBe(false);
     });
 
+    it("refuses a snapshot entry that is not a plain provisioned-<harness>-*.json filename (never writes outside the rules dir)", async () => {
+      const fortress = await makeFortress();
+      const result = await restoreProvisionedEgressRules({
+        fortressPath: fortress,
+        harnessId: "hermes",
+        snapshot: [
+          { filename: "provisioned-hermes-../../../../etc/evil.json", content: "{}" },
+          { filename: "operator-custom.json", content: "{}" },
+        ],
+      });
+      expect(result.restored).toBe(false);
+      expect(result.problems).toHaveLength(2);
+      expect(result.problems.join(" ")).toMatch(/refusing to restore/);
+      // Nothing was written anywhere.
+      expect(await snapshotProvisionedEgressRules(fortress, "hermes")).toEqual([]);
+    });
+
     it("snapshot of a never-provisioned fortress is empty, not an error", async () => {
       const fresh = await makeFortress();
       expect(await snapshotProvisionedEgressRules(fresh, "hermes")).toEqual([]);

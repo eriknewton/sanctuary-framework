@@ -706,10 +706,32 @@ export async function restoreProvisionedEgressRules(
 ): Promise<RestoreProvisionedEgressResult> {
   const dir = egressRulesDir(input.fortressPath);
   const prefix = provisionedRuleIdPrefix(input.harnessId);
-  const wanted = new Map(input.snapshot.map((file) => [file.filename, file.content]));
   const problems: string[] = [];
   const removedRuleIds: string[] = [];
   const ruleIdOf = (filename: string): string => filename.slice(0, -".json".length);
+
+  // Defence in depth: production's only snapshot source is this module's own
+  // `readdir`, so a filename can never carry a separator -- but this function
+  // WRITES to a root-owned directory from data it was handed, so it re-derives
+  // the constraint here rather than trusting its caller. A rejected entry is a
+  // recorded problem (so `restored` is false), never a silent skip.
+  const wanted = new Map<string, string>();
+  for (const file of input.snapshot) {
+    const wellFormed =
+      file.filename.startsWith(prefix) &&
+      file.filename.endsWith(".json") &&
+      !file.filename.includes("/") &&
+      !file.filename.includes("\\") &&
+      !file.filename.includes("\0") &&
+      file.filename !== `${prefix}.json`;
+    if (!wellFormed) {
+      problems.push(
+        `refusing to restore ${JSON.stringify(file.filename)}: not a plain provisioned-${input.harnessId}-*.json rule filename`,
+      );
+      continue;
+    }
+    wanted.set(file.filename, file.content);
+  }
 
   try {
     if (wanted.size > 0) {
