@@ -462,7 +462,7 @@ export function describeObservedAgentConfinement(observed: ObservedAgentConfinem
     return (
       "This run did not arm the wall. The host's CURRENT enforcement state could NOT be observed " +
       `(${observed.reason}), so this run makes no claim about it -- check it with: ` +
-      "sanctuary castle-wall status"
+      "'sanctuary castle-wall status'."
     );
   }
   if (observed.confinedUids.length === 0 && !observed.exclusiveRoutingMarkerPresent) {
@@ -479,7 +479,7 @@ export function describeObservedAgentConfinement(observed: ObservedAgentConfinem
     "This run did not arm the wall, BUT per-agent egress confinement from an EARLIER run is live on " +
     `this host (${parts.join("; ")}). A confined agent may be reaching nothing right now, and while ` +
     "the exclusive routing composition stands this coarse path will keep being refused. Clear it with: " +
-    "sudo sanctuary protect --unprotect-egress-gate"
+    "'sudo sanctuary protect --unprotect-egress-gate'."
   );
 }
 
