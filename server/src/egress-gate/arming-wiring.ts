@@ -98,6 +98,8 @@ import {
   holdFileNameForUid,
   holdFilePathForUid,
   planParkedHarnessInstall,
+  parseReleaseWrapperRefusalRecord,
+  releaseRefusalRecordPath,
   renderHarnessReleaseHoldFile,
   runReleaseBarrierSequence,
   writeIntoHoldDir,
@@ -1718,6 +1720,21 @@ export function createProductionReleaseBarrierOps(input: {
     },
     async restoreParkedPlist(): Promise<void> {
       await writePlist(0);
+    },
+    async readWrapperRefusalRecord() {
+      const recordPath = releaseRefusalRecordPath(input.harnessLogDir);
+      try {
+        return {
+          status: "present" as const,
+          record: parseReleaseWrapperRefusalRecord(await readFile(recordPath, "utf8")),
+        };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return { status: "absent" as const };
+        return {
+          status: "unreadable" as const,
+          reason: `could not read wrapper refusal record ${recordPath}: ${(err as Error).message}`,
+        };
+      }
     },
     async harnessStatus(): Promise<HarnessDaemonStatus> {
       const status = await agentHarnessDaemonStatus(harnessOps);

@@ -21,6 +21,7 @@ import {
   rmSync,
   statSync,
   readFileSync,
+  readdirSync,
   openSync,
   fstatSync,
   closeSync,
@@ -45,6 +46,8 @@ import {
   HOLD_FILE_HEADER,
   PARKED_EXPECTED_GENERATION,
   RELEASE_EXEC_WRAPPER_SCRIPT,
+  RELEASE_REFUSAL_RECORD_FILENAME,
+  RELEASE_REFUSAL_RECORD_HEADER,
   RELEASE_WRAPPER_REFUSAL_EXIT_CODE,
   ReleaseBarrierError,
   buildBarrierProgramArguments,
@@ -52,7 +55,9 @@ import {
   executeParkedHarnessInstall,
   holdFilePathForUid,
   parseHarnessReleaseHoldFile,
+  parseReleaseWrapperRefusalRecord,
   planParkedHarnessInstall,
+  releaseRefusalRecordPath,
   releaseWrapperPath,
   renderHarnessReleaseHoldFile,
   renderReleaseExecWrapperScript,
@@ -84,6 +89,19 @@ const RECORD: HarnessReleaseHoldRecord = {
   argv_digest: "a".repeat(64),
   boot_session_uuid: "1A2B3C4D-0000-4444-8888-ABCDEFABCDEF",
 };
+
+function listTsFiles(dir: URL): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const child = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, dir);
+    if (entry.isDirectory()) {
+      out.push(...listTsFiles(child));
+    } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+      out.push(child.pathname);
+    }
+  }
+  return out;
+}
 
 describe("hold-file paths", () => {
   it("builds the per-uid hold path under the root-owned dir", () => {
@@ -187,6 +205,79 @@ describe("hold-file render + strict parse", () => {
   });
 });
 
+describe("wrapper refusal diagnostic record", () => {
+  it("derives the cleanup-exempt diagnostic path under the harness log dir", () => {
+    expect(releaseRefusalRecordPath("/var/sanctuary-agents/sanctuary-hermes/logs")).toBe(
+      `/var/sanctuary-agents/sanctuary-hermes/logs/${RELEASE_REFUSAL_RECORD_FILENAME}`,
+    );
+    expect(() => releaseRefusalRecordPath("relative/logs")).toThrow(ReleaseBarrierError);
+  });
+
+  it("parses the line-based record into a reason plus non-secret observations", () => {
+    const record = parseReleaseWrapperRefusalRecord(
+      [
+        RELEASE_REFUSAL_RECORD_HEADER,
+        "reason=hold file absent; no committed generation has released this uid",
+        "expected_generation=7",
+        "gate_port=49152",
+        "proxy_username_shape=valid",
+        `expected_label=${AGENT_HARNESS_DAEMON_LABEL}`,
+        "runtime_uid=503",
+        "hold_file_exists=no",
+        "hold_file_readable=not_checked",
+        "hold_header=not_checked",
+        "hold_generation=not_checked",
+        "hold_label=not_checked",
+        "hold_uid=not_checked",
+        "boot_session=not_checked",
+        "argv_digest=not_checked",
+        "token_file_exists=not_checked",
+        "token_file_readable=not_checked",
+        "token_generation=not_checked",
+        "token_secret_shape=not_checked",
+        "",
+      ].join("\n"),
+    );
+    expect(record.reason).toBe("hold file absent; no committed generation has released this uid");
+    expect(record.observations.expected_generation).toBe("7");
+    expect(record.observations.token_secret_shape).toBe("not_checked");
+  });
+
+  it("refuses malformed diagnostic records rather than accepting unsafe values", () => {
+    expect(() => parseReleaseWrapperRefusalRecord("wrong header\nreason=x\n")).toThrow(ReleaseBarrierError);
+    expect(() =>
+      parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\nreason=bad\nreason=dup\n`),
+    ).toThrow(ReleaseBarrierError);
+    expect(() =>
+      parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\nreason=line\nbreak\n`),
+    ).toThrow(ReleaseBarrierError);
+  });
+
+  it("the wrapper refusal recorder never serializes token contents, the proxy URL, or token JSON", () => {
+    const match = /record_refusal\(\) \{([\s\S]*?)\n\}\n\nfail\(\)/.exec(RELEASE_EXEC_WRAPPER_SCRIPT);
+    expect(match).not.toBeNull();
+    const recorder = match![1]!;
+    expect(recorder).not.toMatch(/\$TOKEN_JSON|\$TOKEN_SECRET|\$PROXY_URL/);
+    expect(recorder).toContain("token_secret_shape");
+    expect(recorder).toContain("token_generation");
+  });
+
+  it("is diagnostic-only: no non-diagnostic source consumes the refusal record reader or parser", () => {
+    const srcRoot = new URL("../../src/", import.meta.url);
+    const consumers = listTsFiles(srcRoot)
+      .filter((path) => {
+        const text = readFileSync(path, "utf8");
+        return text.includes("readWrapperRefusalRecord") || text.includes("parseReleaseWrapperRefusalRecord");
+      })
+      .map((path) => path.replace(srcRoot.pathname, "src/"))
+      .sort();
+    expect(consumers).toEqual([
+      "src/egress-gate/arming-wiring.ts",
+      "src/egress-gate/release-barrier.ts",
+    ]);
+  });
+});
+
 describe("wrapper script (static content invariants)", () => {
   it("is fully static: renderReleaseExecWrapperScript returns the constant", () => {
     expect(renderReleaseExecWrapperScript()).toBe(RELEASE_EXEC_WRAPPER_SCRIPT);
@@ -240,10 +331,11 @@ describe("wrapper script (static content invariants)", () => {
   });
 
   it("pins the wrapper argv shape plus username, token, and gate-port guards in Linux-visible static coverage", () => {
-    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ "$#" -ge 8 ] ||');
-    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('GATE_PROXY_USERNAME="$5"');
-    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ "$7" = "--" ] || fail "bad invocation (missing -- separator)"');
-    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain("shift 7");
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ "$#" -ge 9 ] ||');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('REFUSAL_RECORD_FILE="$5"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('GATE_PROXY_USERNAME="$6"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ "$8" = "--" ] || fail "bad invocation (missing -- separator)"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain("shift 8");
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
       '""|*:*|*@*|*/*|*[!a-zA-Z0-9._-]*) fail "gate proxy username is malformed" ;;',
     );
@@ -253,23 +345,23 @@ describe("wrapper script (static content invariants)", () => {
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
       '[ "$GATE_PORT" -le 65535 ] 2>/dev/null || fail "gate port is not in the TCP port range"',
     );
-    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ -f "$TOKEN_FILE" ] || fail "gate credential token file absent"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('fail "gate credential token file absent"');
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
-      '[ "$TOKEN_GEN" = "$EXPECTED_GENERATION" ] || fail "gate credential token generation does not match expected generation"',
+      'fail "gate credential token generation does not match expected generation"',
     );
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
-      '""|*[!0-9a-f]*) fail "gate credential token secret missing or malformed" ;;',
+      'fail "gate credential token secret missing or malformed"',
     );
 
-    const argcMinimum = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$#" -ge 8 ]');
-    const usernameRead = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('GATE_PROXY_USERNAME="$5"');
-    const separatorCheck = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$7" = "--" ]');
-    const shiftCount = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("shift 7");
+    const argcMinimum = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$#" -ge 9 ]');
+    const usernameRead = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('GATE_PROXY_USERNAME="$6"');
+    const separatorCheck = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$8" = "--" ]');
+    const shiftCount = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("shift 8");
     const usernameShape = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("gate proxy username is malformed");
     const portLowerBound = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$GATE_PORT" -gt 0 ]');
     const portUpperBound = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$GATE_PORT" -le 65535 ]');
-    const tokenAbsent = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ -f "$TOKEN_FILE" ]');
-    const tokenGenerationMatch = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$TOKEN_GEN" = "$EXPECTED_GENERATION" ]');
+    const tokenAbsent = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('gate credential token file absent');
+    const tokenGenerationMatch = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('gate credential token generation does not match');
     const tokenSecretHex = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('gate credential token secret missing or malformed');
     const proxyBuild = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('PROXY_URL="http://');
     expect(argcMinimum).toBeGreaterThan(0);
@@ -294,6 +386,7 @@ describe("buildBarrierProgramArguments", () => {
     expectedGenerationId: 7,
     expectedGatePort: 49152,
     tokenFilePath: "/var/db/sanctuary/gate-cred/503.token",
+    refusalRecordPath: "/var/sanctuary-agents/sanctuary-hermes/logs/agent-harness.release-refusal.log",
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
     harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
   };
@@ -305,6 +398,7 @@ describe("buildBarrierProgramArguments", () => {
       "7",
       "49152",
       "/var/db/sanctuary/gate-cred/503.token",
+      "/var/sanctuary-agents/sanctuary-hermes/logs/agent-harness.release-refusal.log",
       GATE_PROXY_BASIC_USERNAME,
       AGENT_HARNESS_DAEMON_LABEL,
       "--",
@@ -327,6 +421,9 @@ describe("buildBarrierProgramArguments", () => {
     expect(() => buildBarrierProgramArguments({ ...base, wrapperPath: "wrapper.sh" })).toThrow(ReleaseBarrierError);
     expect(() => buildBarrierProgramArguments({ ...base, holdFilePath: "503.release" })).toThrow(ReleaseBarrierError);
     expect(() => buildBarrierProgramArguments({ ...base, tokenFilePath: "503.token" })).toThrow(ReleaseBarrierError);
+    expect(() => buildBarrierProgramArguments({ ...base, refusalRecordPath: "refusal.log" })).toThrow(
+      ReleaseBarrierError,
+    );
     expect(() => buildBarrierProgramArguments({ ...base, harnessLabel: "bad label" })).toThrow(ReleaseBarrierError);
     expect(() => buildBarrierProgramArguments({ ...base, expectedGenerationId: -1 })).toThrow(ReleaseBarrierError);
     expect(() => buildBarrierProgramArguments({ ...base, expectedGatePort: -1 })).toThrow(ReleaseBarrierError);
@@ -371,6 +468,7 @@ describe("barrier plist form", () => {
     expect(plan.plistContent).toContain(`<string>${plan.holdFilePath}</string>`);
     expect(plan.plistContent).toContain("<string>0</string>");
     expect(plan.plistContent).toContain(`<string>${plan.tokenFilePath}</string>`);
+    expect(plan.plistContent).toContain(`<string>${plan.refusalRecordPath}</string>`);
     expect(plan.plistContent).toContain(`<string>${GATE_PROXY_BASIC_USERNAME}</string>`);
     expect(plan.plistContent).toContain("<string>--</string>");
     expect(plan.plistContent).toContain("<string>/opt/harness.js</string>");
@@ -387,6 +485,7 @@ describe("barrier plist form", () => {
     expect(released.plistContent).toContain("<string>42</string>");
     expect(released.plistContent).toContain("<string>49152</string>");
     expect(released.plistContent).toContain(`<string>${gateCredentialTokenPath(503)}</string>`);
+    expect(released.plistContent).toContain(`<string>${released.refusalRecordPath}</string>`);
   });
 
   it("REGRESSION (F-HARNESSENV): the RELEASE re-render carries the harness environment, not just SANCTUARY_STORAGE_PATH", () => {
@@ -1597,13 +1696,6 @@ describe("parked install against a REAL, NON-EXISTENT hold directory (drill D1)"
   });
 });
 
-/**
- * Live wrapper behavior, macOS only (the wrapper depends on
- * kern.bootsessionuuid and /usr/bin/shasum; Linux CI skips -- the Linux
- * authoritative gate covers the pure-TS surfaces above).
- */
-const isDarwin = process.platform === "darwin";
-
 function runSh(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     execFile("/bin/sh", args, { timeout: 20_000, encoding: "utf8" }, (error, stdout, stderr) => {
@@ -1613,26 +1705,59 @@ function runSh(args: string[]): Promise<{ code: number; stdout: string; stderr: 
   });
 }
 
-async function currentBootSessionUuid(): Promise<string> {
-  const r = await new Promise<{ out: string }>((resolve) => {
-    execFile("/usr/sbin/sysctl", ["-n", "kern.bootsessionuuid"], { encoding: "utf8" }, (_e, stdout) =>
-      resolve({ out: stdout.trim() }),
-    );
-  });
-  return r.out;
+const TEST_BOOT_SESSION_UUID = "1A2B3C4D-0000-4444-8888-ABCDEFABCDEF";
+
+function writeSha256SumShim(dir: string): string {
+  const path = join(dir, "test-shasum");
+  const code =
+    'const crypto=require("node:crypto");' +
+    "const chunks=[];" +
+    'process.stdin.on("data",(c)=>chunks.push(c));' +
+    'process.stdin.on("end",()=>process.stdout.write(crypto.createHash("sha256").update(Buffer.concat(chunks)).digest("hex")+"  -\\n"));';
+  writeFileSync(path, `#!/bin/sh\nexec "${process.execPath}" -e '${code}' -- "$@"\n`);
+  chmodSync(path, 0o755);
+  return path;
 }
 
-describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
+function renderLinuxVisibleWrapperScript(shasumPath: string): string {
+  const productionSysctl = "/usr/sbin/sysctl -n kern.bootsessionuuid";
+  const testSysctl = `printf '%s\\n' '${TEST_BOOT_SESSION_UUID}'`;
+  const productionShasum = "/usr/bin/shasum -a 256";
+  const testShasum = `${shasumPath} -a 256`;
+  expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(productionSysctl);
+  expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(productionShasum);
+  const script = RELEASE_EXEC_WRAPPER_SCRIPT.replace(productionSysctl, testSysctl).replace(productionShasum, testShasum);
+  expect(script.replace(testSysctl, productionSysctl).replace(testShasum, productionShasum)).toBe(
+    RELEASE_EXEC_WRAPPER_SCRIPT,
+  );
+  return script;
+}
+
+describe("wrapper script live behavior (Linux-visible test copy)", () => {
+  it("keeps the production wrapper on the real macOS commands while the test copy substitutes only those commands", () => {
+    const dir = mkdtempSync(join(tmpdir(), "s5-5-wrapper-command-sub-"));
+    try {
+      const shasum = writeSha256SumShim(dir);
+      const testScript = renderLinuxVisibleWrapperScript(shasum);
+      expect(testScript).not.toContain("/usr/sbin/sysctl -n kern.bootsessionuuid");
+      expect(testScript).not.toContain("/usr/bin/shasum -a 256");
+      expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain("/usr/sbin/sysctl -n kern.bootsessionuuid");
+      expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain("/usr/bin/shasum -a 256");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("refuses (78) on absent hold file, wrong generation, wrong digest, stale boot session; releases on full match", async () => {
     const dir = mkdtempSync(join(tmpdir(), "s5-5-wrapper-"));
     try {
+      const shasum = writeSha256SumShim(dir);
       const wrapper = join(dir, "release-exec-wrapper.sh");
-      writeFileSync(wrapper, RELEASE_EXEC_WRAPPER_SCRIPT);
+      writeFileSync(wrapper, renderLinuxVisibleWrapperScript(shasum));
       chmodSync(wrapper, 0o755);
       const hold = join(dir, "503.release");
       const token = join(dir, "503.token");
-      const bootUuid = await currentBootSessionUuid();
-      expect(bootUuid.length).toBeGreaterThan(0);
+      const refusal = join(dir, "agent-harness.release-refusal.log");
 
       const argv = ["/bin/sh", "-c", 'printf "%s\\n" "$HTTPS_PROXY" "$HTTP_PROXY" "$https_proxy" "$http_proxy"'];
       const digest = computeHarnessArgvDigest(argv);
@@ -1642,7 +1767,7 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
         agent_uid: uid,
         harness_label: AGENT_HARNESS_DAEMON_LABEL,
         argv_digest: digest,
-        boot_session_uuid: bootUuid,
+        boot_session_uuid: TEST_BOOT_SESSION_UUID,
       };
       const wrapperArgs = (gen: string) => [
         wrapper,
@@ -1650,26 +1775,32 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
         gen,
         "49152",
         token,
+        refusal,
         GATE_PROXY_BASIC_USERNAME,
         AGENT_HARNESS_DAEMON_LABEL,
         "--",
         ...argv,
       ];
+      const readRefusal = () => parseReleaseWrapperRefusalRecord(readFileSync(refusal, "utf8"));
 
       // Absent hold file: refuse.
       let r = await runSh(wrapperArgs("7"));
       expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
       expect(r.stderr).toContain("hold file absent");
+      expect(readRefusal().reason).toBe("hold file absent; no committed generation has released this uid");
+      expect(readRefusal().observations.hold_file_exists).toBe("no");
 
       // Parked sentinel generation: refuse even with a valid hold file.
       writeFileSync(hold, renderHarnessReleaseHoldFile(record));
       r = await runSh(wrapperArgs("0"));
       expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(readRefusal().reason).toContain("parked plist");
 
       // Generation mismatch (stale plist): refuse.
       r = await runSh(wrapperArgs("8"));
       expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
       expect(r.stderr).toContain("does not match expected generation");
+      expect(readRefusal().observations.hold_generation).toBe("mismatch");
 
       // Digest mismatch (swapped argv): refuse.
       writeFileSync(
@@ -1679,6 +1810,7 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
       r = await runSh(wrapperArgs("7"));
       expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
       expect(r.stderr).toContain("argv digest mismatch");
+      expect(readRefusal().observations.argv_digest).toBe("mismatch");
 
       // Stale boot session (hold file from a previous boot): refuse.
       writeFileSync(
@@ -1688,12 +1820,14 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
       r = await runSh(wrapperArgs("7"));
       expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
       expect(r.stderr).toContain("previous boot session");
+      expect(readRefusal().observations.boot_session).toBe("mismatch");
 
       // Missing token: refuse instead of execing a credential-less agent.
       writeFileSync(hold, renderHarnessReleaseHoldFile(record));
       r = await runSh(wrapperArgs("7"));
       expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
       expect(r.stderr).toContain("gate credential token file absent");
+      expect(readRefusal().observations.token_file_exists).toBe("no");
 
       // Stale token generation: refuse before exporting proxy env.
       writeFileSync(token, JSON.stringify({ version: 1, generation_id: 6, secret: "deadbeef" }));
@@ -1701,6 +1835,9 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
       r = await runSh(wrapperArgs("7"));
       expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
       expect(r.stderr).toContain("token generation does not match expected generation");
+      expect(readRefusal().observations.token_generation).toBe("mismatch");
+      expect(readFileSync(refusal, "utf8")).not.toContain("deadbeef");
+      expect(readFileSync(refusal, "utf8")).not.toContain("127.0.0.1");
 
       // Full match: export proxy env and exec the harness argv.
       writeFileSync(token, JSON.stringify({ version: 1, generation_id: 7, secret: "deadbeef" }));
@@ -1713,6 +1850,7 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
           () => `http://${GATE_PROXY_BASIC_USERNAME}:7.deadbeef@127.0.0.1:49152`,
         ),
       );
+      expect(() => readFileSync(refusal, "utf8")).toThrow(/ENOENT/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1726,25 +1864,27 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
     // valid hold file on disk; only the released re-render execs.
     const dir = mkdtempSync(join(tmpdir(), "s5-5-e2e-"));
     try {
+      const shasum = writeSha256SumShim(dir);
       const harnessArgv = ["/bin/echo", "released-ok"];
       const agentUid = process.getuid ? process.getuid() : 0;
       const token = join(dir, `${agentUid}.token`);
+      const refusalRecordPath = join(dir, "agent-harness.release-refusal.log");
       const planOptions = {
         agentAccount: "sanctuary-hermes",
         agentUid,
         harnessLaunch: testLaunch(harnessArgv),
         holdDir: dir,
         tokenFilePath: token,
+        refusalRecordPath,
       };
       const parkedPlan = planParkedHarnessInstall(planOptions);
       const committedPlan = planParkedHarnessInstall({ ...planOptions, expectedGenerationId: 7, expectedGatePort: 49152 });
 
       // Install the wrapper exactly as executeParkedHarnessInstall would.
-      writeFileSync(parkedPlan.wrapperPath, parkedPlan.wrapperContent);
+      writeFileSync(parkedPlan.wrapperPath, renderLinuxVisibleWrapperScript(shasum));
       chmodSync(parkedPlan.wrapperPath, 0o755);
 
       // A fully valid hold file for the committed generation is on disk.
-      const bootUuid = await currentBootSessionUuid();
       writeFileSync(
         parkedPlan.holdFilePath,
         renderHarnessReleaseHoldFile({
@@ -1752,7 +1892,7 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
           agent_uid: agentUid,
           harness_label: AGENT_HARNESS_DAEMON_LABEL,
           argv_digest: computeHarnessArgvDigest(harnessArgv),
-          boot_session_uuid: bootUuid,
+          boot_session_uuid: TEST_BOOT_SESSION_UUID,
         }),
       );
       writeFileSync(token, JSON.stringify({ version: 1, generation_id: 7, secret: "deadbeef" }));

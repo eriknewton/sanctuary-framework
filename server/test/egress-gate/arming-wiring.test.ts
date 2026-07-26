@@ -769,6 +769,7 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502, gate_port: 49152 }),
       writeReleasedPlist: async () => undefined,
       restoreParkedPlist: async () => undefined,
+      readWrapperRefusalRecord: async () => ({ status: "absent" as const }),
       harnessStatus: async () =>
         running
           ? { known: true, installed: true, running: true, pid: 4242 }
