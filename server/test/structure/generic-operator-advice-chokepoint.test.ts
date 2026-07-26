@@ -118,6 +118,17 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "harness-argv resolves ONLY the Hermes gateway; its refusals are Hermes-scoped by construction",
   },
   {
+    // `sanctuary doctor`'s Hermes config-parser check. It only runs on a host
+    // that HAS a Hermes config, and it reports on the one surface a missing
+    // PyYAML blocks -- the Hermes wrap path -- so naming that exact command is
+    // the whole value of the check, not leaked agent-specific advice.
+    file: "server/src/cli/doctor.ts",
+    scope: "checkHermesConfigParser",
+    snippet: "would refuse to edit config.yaml",
+    expectedCount: 1,
+    reason: "the check is gated on a Hermes config existing and predicts the Hermes wrap path only",
+  },
+  {
     // FIX F-COARSE-AFTER-EXCLUSIVE (2026-07-26): when the coarse restore FAILS
     // the fortress is left in exclusive routing composition, in which the plain
     // Hermes arm is REFUSED -- so the degrade message must name that command as
