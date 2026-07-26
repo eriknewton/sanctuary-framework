@@ -76,6 +76,38 @@ export interface FailureModeDetectorOptions {
   on_health_snapshot?: (snapshot: MeshHealthSnapshot) => void;
 }
 
+/**
+ * One observed policy claim for a given (agent_id, parent_version) generation.
+ *
+ * `outcome` records what the policy store did with it. `refused_replay` means
+ * the store already held a version at or above this one and correctly refused
+ * it; the claim is still a claim, and is retained here precisely because the
+ * store discards it.
+ */
+interface PolicyClaim {
+  event_id: string;
+  version: number;
+  /** Node that signed the envelope (the origin, not any relaying peer). */
+  origin_node: string;
+  /** Principal that authored the policy. */
+  origin_principal: string;
+  /** SHA-256 of the canonical payload; identifies the policy content. */
+  payload_hash: string;
+  emitted_at: string;
+  outcome: "applied" | "refused_replay";
+}
+
+/**
+ * Retention bounds for the policy-claim tracker. A long-lived node sees one
+ * generation per policy version per agent forever, so the map is capped;
+ * oldest generations are dropped first. The per-generation cap bounds the
+ * candidate list an operator is asked to choose from - the conflict has
+ * already been raised by the second claim, so dropping a 17th only costs a
+ * row in the candidate table, never the alarm itself.
+ */
+const POLICY_CLAIM_GENERATION_LIMIT = 512;
+const POLICY_CLAIMS_PER_GENERATION_LIMIT = 16;
+
 interface CompromisedSignalState {
   last_monotonic_seq: number;
   attestation_failures: number;
@@ -103,6 +135,14 @@ export class FailureModeDetector {
     string,
     SignedEvent<LocatorUpdatePayload>[]
   >();
+  /**
+   * Map `${agent_id}:p${parent_version}` → every distinct policy claim seen
+   * for that (agent, parent_version) generation, whether the store applied it
+   * or refused it as a replay. Siblings of the same parent_version are the
+   * only claims that can genuinely compete; a lower version under a DIFFERENT
+   * parent is ordinary linear history arriving late, not a split.
+   */
+  private policyClaimsByGeneration = new Map<string, PolicyClaim[]>();
 
   constructor(node: MeshNode, deps: {
     emit_context: AlertEmitContext;
@@ -299,21 +339,31 @@ export class FailureModeDetector {
       }
     };
 
-    // Policy-conflict signal: same agent, same parent_version, two distinct
-    // policy_versions arriving from different principals during partition heal.
+    // Policy-conflict signal: same agent, same parent_version, two conflicting
+    // policy claims arriving from different origins during partition heal.
     // PolicyBundleStore.upsert emits explicit rejection reasons or 'applied',
-    // but not a dedicated 'conflict' branch. We detect here by tracking
-    // observed (agent_id, parent_version) tuples across applied updates.
-    const observedPolicy = new Map<string, Set<number>>();
-    this.node.onPolicyUpdate = (evt, _result) => {
-      if (_result !== "applied") return;
-      const key = `${evt.payload.agent_id}:p${evt.payload.parent_version ?? 0}`;
-      const seen = observedPolicy.get(key) ?? new Set();
-      seen.add(evt.payload.policy_version);
-      observedPolicy.set(key, seen);
-      if (seen.size > 1) {
-        this.detectPolicySplitBrain(evt.payload.agent_id, [...seen]);
+    // but not a dedicated 'conflict' branch, so the conflict is reconstructed
+    // here from observed (agent_id, parent_version) claims.
+    //
+    // ORDERING: the store keeps only the highest policy_version per agent and
+    // refuses anything at or below it as `policy_version_replay`. That is
+    // correct anti-rollback behaviour and is NOT relaxed. But a detector that
+    // counts only `applied` results can see a conflict only when the network
+    // happens to deliver the competing versions in ascending order, and there
+    // is no delivery-order guarantee on a gossip mesh. If the newer sibling
+    // lands first, the older one is refused as a replay and thrown away, and
+    // the operator is never told a second policy exists. A replay refusal that
+    // carries a DIFFERENT origin under the same parent_version is exactly the
+    // evidence of a split, so it is recorded rather than discarded.
+    this.node.onPolicyUpdate = (evt, result) => {
+      if (result === "applied") {
+        this.recordPolicyClaim(evt, "applied");
+      } else if (result === "policy_version_replay") {
+        this.recordPolicyClaim(evt, "refused_replay");
       }
+      // Every other rejection reason (malformed payload, missing/invalid or
+      // out-of-range validity window) says nothing about who authored what;
+      // those already surface on their own via onPolicyBundleRejected.
     };
 
     this.node.onPolicyBundleRejected = (event) => {
@@ -422,27 +472,125 @@ export class FailureModeDetector {
     this.emitSentinel(alert);
   }
 
-  private detectPolicySplitBrain(agentId: string, versions: number[]): void {
+  /**
+   * Record one policy claim against its (agent_id, parent_version) generation
+   * and raise SPLIT_BRAIN when the generation now holds competing claims.
+   *
+   * Called for `applied` AND for `policy_version_replay`. The replay branch is
+   * the whole point: the store throws the refused event away, so if the
+   * detector does not keep it, a conflict delivered newest-first is invisible.
+   *
+   * What is deliberately NOT treated as a conflict:
+   *   - the same envelope redelivered (same `event_id`) - gossip duplicates
+   *     and sync backfill both re-present events a node already has;
+   *   - the same origin re-announcing its own version (same version, same
+   *     origin node) - a legitimate retransmit under a fresh envelope;
+   *   - byte-identical policy content re-signed by another node (same version,
+   *     same `payload_hash`) - one decision forwarded, not two decisions;
+   *   - a lower version under a DIFFERENT `parent_version` - a node catching
+   *     up after being offline receives ancestors, and an ancestor is refused
+   *     as a replay without ever being a sibling. Generation keying, not
+   *     special-casing, is what keeps that quiet.
+   */
+  private recordPolicyClaim(
+    evt: SignedEvent<PolicyUpdatePayload>,
+    outcome: PolicyClaim["outcome"]
+  ): void {
+    const payload = evt.payload;
+    const agentId = payload.agent_id;
+    const key = `${agentId}:p${payload.parent_version ?? 0}`;
+    const claims = this.policyClaimsByGeneration.get(key) ?? [];
+    const claim: PolicyClaim = {
+      event_id: evt.event_id,
+      version: payload.policy_version,
+      origin_node: evt.emitter_node,
+      origin_principal: evt.emitter_principal,
+      payload_hash: evt.payload_hash,
+      emitted_at: evt.emitted_at,
+      outcome,
+    };
+
+    const isRedelivery = claims.some(
+      (c) =>
+        c.event_id === claim.event_id ||
+        (c.version === claim.version &&
+          (c.origin_node === claim.origin_node ||
+            (claim.payload_hash.length > 0 &&
+              c.payload_hash === claim.payload_hash)))
+    );
+    if (isRedelivery) return;
+    if (claims.length >= POLICY_CLAIMS_PER_GENERATION_LIMIT) return;
+
+    claims.push(claim);
+    this.policyClaimsByGeneration.set(key, claims);
+    // Map iteration is insertion-ordered; drop the oldest generations first.
+    while (this.policyClaimsByGeneration.size > POLICY_CLAIM_GENERATION_LIMIT) {
+      const oldest = this.policyClaimsByGeneration.keys().next();
+      if (oldest.done === true || oldest.value === key) break;
+      this.policyClaimsByGeneration.delete(oldest.value);
+    }
+
+    if (outcome === "applied") {
+      // Unchanged v0.1 semantics: two distinct policy_versions applied under
+      // one parent_version is a conflict on its own.
+      const appliedVersions = new Set(
+        claims.filter((c) => c.outcome === "applied").map((c) => c.version)
+      );
+      if (appliedVersions.size > 1) {
+        this.detectPolicySplitBrain(agentId, claims, claim);
+      }
+      return;
+    }
+
+    // Refused as a replay. Evidence of a split only when some other origin
+    // already claimed this same generation - otherwise it is our own history
+    // coming back to us.
+    const rival = claims.find(
+      (c) => c !== claim && c.origin_node !== claim.origin_node
+    );
+    if (rival) {
+      this.detectPolicySplitBrain(agentId, claims, claim);
+    }
+  }
+
+  private detectPolicySplitBrain(
+    agentId: string,
+    claims: readonly PolicyClaim[],
+    trigger: PolicyClaim
+  ): void {
+    const candidates = claims.map((c) => ({
+      event_id: c.event_id,
+      version: c.version,
+      canonical_node: c.origin_node,
+      signed_at: c.emitted_at,
+    }));
     const conflict: SplitBrainConflict = {
       conflict_id: generateId(),
       agent_id: agentId,
-      candidates: versions.map((v) => ({
-        event_id: `policy:${agentId}:v${v}`,
-        version: v,
-        canonical_node: "",
-        signed_at: "",
-      })),
+      candidates,
       detected_at: Date.now(),
     };
     this.splitBrainConflicts.set(conflict.conflict_id, conflict);
+    const message =
+      trigger.outcome === "refused_replay"
+        ? `Two conflicting policy versions were issued for Agent ${agentId} from the same parent_version by different nodes. Version ${trigger.version} from ${trigger.origin_node} arrived after a newer version was already pinned, so it was correctly refused as a rollback - but it is still a second, competing policy. Choose which to keep.`
+        : `Two distinct policy versions issued for Agent ${agentId} from the same parent_version. Choose which to keep.`;
     const alert = this.makeAlert({
       mode: FAILURE_MODE.SPLIT_BRAIN,
       target: agentId,
-      message: `Two distinct policy versions issued for Agent ${agentId} from the same parent_version. Choose which to keep.`,
+      message,
       detail: {
         kind: "policy_conflict",
         conflict_id: conflict.conflict_id,
-        versions,
+        versions: [...new Set(claims.map((c) => c.version))],
+        candidates: claims.map((c) => ({
+          event_id: c.event_id,
+          version: c.version,
+          origin_node: c.origin_node,
+          origin_principal: c.origin_principal,
+          outcome: c.outcome,
+        })),
+        trigger_outcome: trigger.outcome,
       },
     });
     this.publishAlert(alert);
