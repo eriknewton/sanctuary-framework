@@ -381,10 +381,10 @@ export function parseHarnessReleaseHoldFile(text: string): HarnessReleaseHoldRec
 /**
  * The exec wrapper, as a STATIC POSIX-sh script: nothing is interpolated into
  * the script body (the hold-file path, expected generation, gate port, token
- * path, and label arrive as launchd-controlled `ProgramArguments`, and the
- * harness argv arrives as `"$@"`), so there is no render-time injection
- * surface at all. Root-owned 0755; runs as the agent uid via the plist's
- * `UserName` drop. Every refusal exits
+ * path, Basic username, and label arrive as launchd-controlled
+ * `ProgramArguments`, and the harness argv arrives as `"$@"`), so there is no
+ * render-time injection surface at all. Root-owned 0755; runs as the agent uid
+ * via the plist's `UserName` drop. Every refusal exits
  * {@link RELEASE_WRAPPER_REFUSAL_EXIT_CODE} without exec.
  */
 export const RELEASE_EXEC_WRAPPER_SCRIPT = `#!/bin/sh
@@ -400,14 +400,15 @@ fail() {
   exit 78
 }
 
-[ "$#" -ge 7 ] || fail "bad invocation (expected hold-file, generation, gate-port, token-file, label, --, argv...)"
+[ "$#" -ge 8 ] || fail "bad invocation (expected hold-file, generation, gate-port, token-file, proxy-username, label, --, argv...)"
 HOLD_FILE="$1"
 EXPECTED_GENERATION="$2"
 GATE_PORT="$3"
 TOKEN_FILE="$4"
-EXPECTED_LABEL="$5"
-[ "$6" = "--" ] || fail "bad invocation (missing -- separator)"
-shift 6
+GATE_PROXY_USERNAME="$5"
+EXPECTED_LABEL="$6"
+[ "$7" = "--" ] || fail "bad invocation (missing -- separator)"
+shift 7
 
 case "$EXPECTED_GENERATION" in
   ""|*[!0-9]*) fail "expected generation is not a number" ;;
@@ -463,7 +464,7 @@ case "$TOKEN_SECRET" in
   ""|*[!0-9a-f]*) fail "gate credential token secret missing or malformed" ;;
 esac
 
-PROXY_URL="http://${GATE_PROXY_BASIC_USERNAME}:$TOKEN_GEN.$TOKEN_SECRET@127.0.0.1:$GATE_PORT"
+PROXY_URL="http://$GATE_PROXY_USERNAME:$TOKEN_GEN.$TOKEN_SECRET@127.0.0.1:$GATE_PORT"
 export HTTPS_PROXY="$PROXY_URL"
 export HTTP_PROXY="$PROXY_URL"
 export https_proxy="$PROXY_URL"
@@ -503,8 +504,9 @@ export interface BarrierProgramArgumentsInput {
 
 /**
  * Compose the barrier-form `ProgramArguments`: wrapper first, then the
- * wrapper's own arguments, then `--`, then the untouched harness argv. The
- * plist renderer's control-character validation applies to every element.
+ * wrapper's own arguments (including the fixed Basic username), then `--`,
+ * then the untouched harness argv. The plist renderer's control-character
+ * validation applies to every element.
  */
 export function buildBarrierProgramArguments(input: BarrierProgramArgumentsInput): string[] {
   if (!isAbsolute(input.wrapperPath)) {
@@ -541,6 +543,7 @@ export function buildBarrierProgramArguments(input: BarrierProgramArgumentsInput
     String(gen),
     String(gatePort),
     input.tokenFilePath,
+    GATE_PROXY_BASIC_USERNAME,
     input.harnessLabel,
     "--",
     ...input.harnessArgv,

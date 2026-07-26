@@ -192,6 +192,13 @@ describe("wrapper script (static content invariants)", () => {
     expect(renderReleaseExecWrapperScript()).toBe(RELEASE_EXEC_WRAPPER_SCRIPT);
   });
 
+  it("has no render-time template interpolation in the wrapper body", () => {
+    const src = readFileSync(new URL("../../src/egress-gate/release-barrier.ts", import.meta.url), "utf8");
+    const match = /RELEASE_EXEC_WRAPPER_SCRIPT = `([\s\S]*?)`;\n/.exec(src);
+    expect(match).not.toBeNull();
+    expect(match![1]).not.toMatch(/\$\{/);
+  });
+
   it("execs the untouched argv and refuses with the documented exit code", () => {
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('exec "$@"');
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(`exit ${RELEASE_WRAPPER_REFUSAL_EXIT_CODE}`);
@@ -231,6 +238,35 @@ describe("wrapper script (static content invariants)", () => {
     expect(RELEASE_EXEC_WRAPPER_SCRIPT.startsWith("#!/bin/sh\n")).toBe(true);
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain("set -eu");
   });
+
+  it("pins the token and gate-port guards in Linux-visible static coverage", () => {
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      '[ "$GATE_PORT" -gt 0 ] 2>/dev/null || fail "gate port is not in the TCP port range"',
+    );
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      '[ "$GATE_PORT" -le 65535 ] 2>/dev/null || fail "gate port is not in the TCP port range"',
+    );
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ -f "$TOKEN_FILE" ] || fail "gate credential token file absent"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      '[ "$TOKEN_GEN" = "$EXPECTED_GENERATION" ] || fail "gate credential token generation does not match expected generation"',
+    );
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      '""|*[!0-9a-f]*) fail "gate credential token secret missing or malformed" ;;',
+    );
+
+    const portLowerBound = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$GATE_PORT" -gt 0 ]');
+    const portUpperBound = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$GATE_PORT" -le 65535 ]');
+    const tokenAbsent = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ -f "$TOKEN_FILE" ]');
+    const tokenGenerationMatch = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$TOKEN_GEN" = "$EXPECTED_GENERATION" ]');
+    const tokenSecretHex = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('gate credential token secret missing or malformed');
+    const proxyBuild = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('PROXY_URL="http://');
+    expect(portLowerBound).toBeGreaterThan(0);
+    expect(portUpperBound).toBeGreaterThan(portLowerBound);
+    expect(tokenAbsent).toBeGreaterThan(portUpperBound);
+    expect(tokenGenerationMatch).toBeGreaterThan(tokenAbsent);
+    expect(tokenSecretHex).toBeGreaterThan(tokenGenerationMatch);
+    expect(proxyBuild).toBeGreaterThan(tokenSecretHex);
+  });
 });
 
 describe("buildBarrierProgramArguments", () => {
@@ -251,6 +287,7 @@ describe("buildBarrierProgramArguments", () => {
       "7",
       "49152",
       "/var/db/sanctuary/gate-cred/503.token",
+      GATE_PROXY_BASIC_USERNAME,
       AGENT_HARNESS_DAEMON_LABEL,
       "--",
       "/usr/local/bin/node",
@@ -316,6 +353,7 @@ describe("barrier plist form", () => {
     expect(plan.plistContent).toContain(`<string>${plan.holdFilePath}</string>`);
     expect(plan.plistContent).toContain("<string>0</string>");
     expect(plan.plistContent).toContain(`<string>${plan.tokenFilePath}</string>`);
+    expect(plan.plistContent).toContain(`<string>${GATE_PROXY_BASIC_USERNAME}</string>`);
     expect(plan.plistContent).toContain("<string>--</string>");
     expect(plan.plistContent).toContain("<string>/opt/harness.js</string>");
   });
@@ -395,7 +433,7 @@ describe("barrier plist form", () => {
       environment: {
         HOME: "/var/sanctuary-agents/sanctuary-hermes",
         PYTHONPATH: "/var/sanctuary-agents/sanctuary-hermes/.hermes/hermes-agent",
-        HTTPS_PROXY: `http://${GATE_PROXY_BASIC_USERNAME}:42.${secret}@127.0.0.1:49152`,
+        AGENT_PROXY_URL: `http://${GATE_PROXY_BASIC_USERNAME}:42.${secret}@127.0.0.1:49152`,
       },
     });
     expect(() =>
@@ -406,7 +444,7 @@ describe("barrier plist form", () => {
         expectedGenerationId: 42,
         expectedGatePort: 49152,
       }),
-    ).toThrow(/HTTPS_PROXY/);
+    ).toThrow(/AGENT_PROXY_URL value containing URL credentials/);
     expect(HARNESS_FORBIDDEN_PLIST_ENV).toEqual(
       expect.arrayContaining(["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]),
     );
@@ -1594,6 +1632,7 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
         gen,
         "49152",
         token,
+        GATE_PROXY_BASIC_USERNAME,
         AGENT_HARNESS_DAEMON_LABEL,
         "--",
         ...argv,

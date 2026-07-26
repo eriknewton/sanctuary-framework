@@ -92,6 +92,19 @@ describe("egress-gate/gate-credential parse/format", () => {
     expect(parseGateCredentialHeader(basic(`${GATE_PROXY_BASIC_USERNAME}:7deadbeef`))).toBeNull(); // no dot
     expect(parseGateCredentialHeader(basic(`${GATE_PROXY_BASIC_USERNAME}:7.DEADBEEF`))).toBeNull();
   });
+
+  it("rejects lenient-but-decodable Basic base64 variants of an otherwise valid credential", () => {
+    const canonical = Buffer.from(`${GATE_PROXY_BASIC_USERNAME}:7.deadbeef`, "utf8").toString("base64");
+    const variants = [
+      canonical.slice(0, 4) + " " + canonical.slice(4), // whitespace is ignored by lenient decoders
+      canonical.slice(0, 4) + "@@" + canonical.slice(4), // non-base64 alphabet ignored by Node's decoder
+      canonical.replace(/==$/, "="), // non-canonical padding still decodes leniently
+    ];
+    for (const variant of variants) {
+      expect(Buffer.from(variant, "base64").toString("utf8")).toBe(`${GATE_PROXY_BASIC_USERNAME}:7.deadbeef`);
+      expect(parseGateCredentialHeader(`Basic ${variant}`)).toBeNull();
+    }
+  });
 });
 
 describe("egress-gate/gate-credential verify (constant-time, current-only)", () => {

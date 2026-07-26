@@ -103,6 +103,8 @@ export const FORBIDDEN_PLIST_ENV = [
   "http_proxy",
 ];
 
+const CREDENTIALED_URL_VALUE_RE = /:\/\/[^/@\s]*:[^/@\s]*@/;
+
 export interface ExecFileResult {
   code: number;
   stdout: string;
@@ -265,6 +267,14 @@ function assertNoControlChars(value: string, what: string): void {
   }
 }
 
+function assertNoCredentialedPlistEnvValue(name: string, value: string): void {
+  if (CREDENTIALED_URL_VALUE_RE.test(value)) {
+    throw new Error(
+      `Refusing to embed ${name} value containing URL credentials in a world-readable LaunchDaemon plist.`,
+    );
+  }
+}
+
 export interface BootPlistOptions {
   /**
    * Full argv the daemon runs as, e.g.
@@ -416,6 +426,9 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
         `Refusing to embed ${name} in a world-readable LaunchDaemon plist.`,
       );
     }
+  }
+  for (const [name, value] of envEntries) {
+    assertNoCredentialedPlistEnvValue(name, value);
   }
 
   const argsXml = opts.programArguments

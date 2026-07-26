@@ -260,6 +260,15 @@ describe("castle-wall boot service (F1 Option C)", () => {
       ).toThrow(/absolute/);
     });
 
+    it("rejects a credentialed URL-shaped env value in the world-readable plist", () => {
+      expect(() =>
+        renderBootLaunchDaemonPlist({
+          ...base,
+          fortressPath: "/tmp/http://sanctuary-gate:7.deadbeef@127.0.0.1",
+        }),
+      ).toThrow(/SANCTUARY_STORAGE_PATH value containing URL credentials/);
+    });
+
     it("rejects a missing or relative signer client path", () => {
       expect(() =>
         renderBootLaunchDaemonPlist({ ...base, signerClientPath: "" }),
