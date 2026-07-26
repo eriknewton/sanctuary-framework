@@ -97,6 +97,7 @@ import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
   EGRESS_GATE_STAND_DOWN_EFFECT,
 } from "./operator-advice.js";
+import { GATE_PROXY_BASIC_USERNAME, gateCredentialTokenPath } from "./gate-credential.js";
 
 /** Root-owned parent directory for hold files + the exec wrapper (0755 root). */
 export const AGENT_HARNESS_HOLD_DIR = "/var/db/sanctuary/agent-harness";
@@ -379,11 +380,12 @@ export function parseHarnessReleaseHoldFile(text: string): HarnessReleaseHoldRec
 
 /**
  * The exec wrapper, as a STATIC POSIX-sh script: nothing is interpolated into
- * the script body (the hold-file path, expected generation, and label arrive
- * as launchd-controlled `ProgramArguments`, and the harness argv arrives as
- * `"$@"`), so there is no render-time injection surface at all. Root-owned
- * 0755; runs as the agent uid via the plist's `UserName` drop. Every refusal
- * exits {@link RELEASE_WRAPPER_REFUSAL_EXIT_CODE} without exec.
+ * the script body (the hold-file path, expected generation, gate port, token
+ * path, and label arrive as launchd-controlled `ProgramArguments`, and the
+ * harness argv arrives as `"$@"`), so there is no render-time injection
+ * surface at all. Root-owned 0755; runs as the agent uid via the plist's
+ * `UserName` drop. Every refusal exits
+ * {@link RELEASE_WRAPPER_REFUSAL_EXIT_CODE} without exec.
  */
 export const RELEASE_EXEC_WRAPPER_SCRIPT = `#!/bin/sh
 # Sanctuary agent-harness release-barrier exec wrapper (Unified Protect S5-5).
@@ -398,17 +400,25 @@ fail() {
   exit 78
 }
 
-[ "$#" -ge 5 ] || fail "bad invocation (expected hold-file, generation, label, --, argv...)"
+[ "$#" -ge 7 ] || fail "bad invocation (expected hold-file, generation, gate-port, token-file, label, --, argv...)"
 HOLD_FILE="$1"
 EXPECTED_GENERATION="$2"
-EXPECTED_LABEL="$3"
-[ "$4" = "--" ] || fail "bad invocation (missing -- separator)"
-shift 4
+GATE_PORT="$3"
+TOKEN_FILE="$4"
+EXPECTED_LABEL="$5"
+[ "$6" = "--" ] || fail "bad invocation (missing -- separator)"
+shift 6
 
 case "$EXPECTED_GENERATION" in
   ""|*[!0-9]*) fail "expected generation is not a number" ;;
 esac
 [ "$EXPECTED_GENERATION" -gt 0 ] || fail "parked plist (expected generation 0); no release is possible"
+
+case "$GATE_PORT" in
+  ""|*[!0-9]*) fail "gate port is not a number" ;;
+esac
+[ "$GATE_PORT" -gt 0 ] 2>/dev/null || fail "gate port is not in the TCP port range"
+[ "$GATE_PORT" -le 65535 ] 2>/dev/null || fail "gate port is not in the TCP port range"
 
 [ -f "$HOLD_FILE" ] || fail "hold file absent; no committed generation has released this uid"
 
@@ -440,6 +450,25 @@ esac
 ACTUAL_DIGEST=$(printf '%s\\0' "$@" | /usr/bin/shasum -a 256 | cut -d" " -f1)
 [ "$DIGEST" = "$ACTUAL_DIGEST" ] || fail "argv digest mismatch (the committed release names a different harness argv)"
 
+[ -f "$TOKEN_FILE" ] || fail "gate credential token file absent"
+[ -r "$TOKEN_FILE" ] || fail "gate credential token file unreadable"
+TOKEN_JSON=$(cat "$TOKEN_FILE") || fail "gate credential token file unreadable"
+TOKEN_GEN=$(printf '%s\\n' "$TOKEN_JSON" | sed -n 's/.*"generation_id"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p')
+TOKEN_SECRET=$(printf '%s\\n' "$TOKEN_JSON" | sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\\([0-9a-f][0-9a-f]*\\)".*/\\1/p')
+case "$TOKEN_GEN" in
+  ""|*[!0-9]*) fail "gate credential token generation missing or malformed" ;;
+esac
+[ "$TOKEN_GEN" = "$EXPECTED_GENERATION" ] || fail "gate credential token generation does not match expected generation"
+case "$TOKEN_SECRET" in
+  ""|*[!0-9a-f]*) fail "gate credential token secret missing or malformed" ;;
+esac
+
+PROXY_URL="http://${GATE_PROXY_BASIC_USERNAME}:$TOKEN_GEN.$TOKEN_SECRET@127.0.0.1:$GATE_PORT"
+export HTTPS_PROXY="$PROXY_URL"
+export HTTP_PROXY="$PROXY_URL"
+export https_proxy="$PROXY_URL"
+export http_proxy="$PROXY_URL"
+
 exec "$@"
 `;
 
@@ -459,6 +488,13 @@ export interface BarrierProgramArgumentsInput {
    * for the parked form (which the wrapper refuses unconditionally).
    */
   expectedGenerationId: number;
+  /**
+   * The committed gate port the wrapper uses for the proxy URL, or 0 for the
+   * parked form (the wrapper refuses before exporting anything).
+   */
+  expectedGatePort: number;
+  /** Agent-readable token file path; production passes `/var/db/sanctuary/gate-cred/<uid>.token`. */
+  tokenFilePath: string;
   /** The job label the wrapper cross-checks against the hold file. */
   harnessLabel: string;
   /** The REAL harness argv (absolute program path first). */
@@ -477,6 +513,9 @@ export function buildBarrierProgramArguments(input: BarrierProgramArgumentsInput
   if (!isAbsolute(input.holdFilePath)) {
     throw new ReleaseBarrierError(`hold-file path must be absolute (got ${input.holdFilePath})`);
   }
+  if (!isAbsolute(input.tokenFilePath)) {
+    throw new ReleaseBarrierError(`token-file path must be absolute (got ${input.tokenFilePath})`);
+  }
   if (!SAFE_LABEL_RE.test(input.harnessLabel)) {
     throw new ReleaseBarrierError(`harness label is not a safe label (got ${JSON.stringify(input.harnessLabel)})`);
   }
@@ -484,10 +523,28 @@ export function buildBarrierProgramArguments(input: BarrierProgramArgumentsInput
   if (!Number.isInteger(gen) || gen < 0) {
     throw new ReleaseBarrierError(`expected generation id must be a non-negative integer (got ${String(gen)})`);
   }
+  const gatePort = input.expectedGatePort;
+  if (!Number.isInteger(gatePort) || gatePort < 0 || gatePort > 65535) {
+    throw new ReleaseBarrierError(`expected gate port must be in the TCP port range or parked 0 (got ${String(gatePort)})`);
+  }
+  if ((gen === PARKED_EXPECTED_GENERATION) !== (gatePort === 0)) {
+    throw new ReleaseBarrierError(
+      `expected generation and gate port must be parked together or released together (got generation ${gen}, port ${gatePort})`,
+    );
+  }
   if (input.harnessArgv.length === 0 || !isAbsolute(input.harnessArgv[0]!)) {
     throw new ReleaseBarrierError("harness argv must be non-empty with an absolute program path first");
   }
-  return [input.wrapperPath, input.holdFilePath, String(gen), input.harnessLabel, "--", ...input.harnessArgv];
+  return [
+    input.wrapperPath,
+    input.holdFilePath,
+    String(gen),
+    String(gatePort),
+    input.tokenFilePath,
+    input.harnessLabel,
+    "--",
+    ...input.harnessArgv,
+  ];
 }
 
 /** Options for {@link planParkedHarnessInstall}. */
@@ -514,12 +571,16 @@ export interface ParkedHarnessInstallOptions {
   logDir?: string;
   /** Hold dir override (tests only). Default {@link AGENT_HARNESS_HOLD_DIR}. */
   holdDir?: string;
+  /** Token path override (tests only). Default {@link gateCredentialTokenPath}. */
+  tokenFilePath?: string;
   /**
    * Expected generation for the rendered plist. Default
    * {@link PARKED_EXPECTED_GENERATION} (parked: the wrapper refuses). The
    * release sequence re-renders with the real committed id before enabling.
    */
   expectedGenerationId?: number;
+  /** Expected gate port for the rendered plist. Default 0 for the parked form. */
+  expectedGatePort?: number;
 }
 
 /** A planned parked install: plist + wrapper + where the hold file will live. */
@@ -531,6 +592,7 @@ export interface ParkedHarnessInstallPlan {
   wrapperPath: string;
   wrapperContent: string;
   holdFilePath: string;
+  tokenFilePath: string;
   harnessLabel: string;
   /** The service account the parked plist runs the harness as. */
   agentAccount: string;
@@ -549,10 +611,13 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
   const holdDir = options.holdDir ?? AGENT_HARNESS_HOLD_DIR;
   const wrapperPath = releaseWrapperPath(holdDir);
   const holdFilePath = holdFilePathForUid(options.agentUid, holdDir);
+  const tokenFilePath = options.tokenFilePath ?? gateCredentialTokenPath(options.agentUid);
   const programArguments = buildBarrierProgramArguments({
     wrapperPath,
     holdFilePath,
     expectedGenerationId: options.expectedGenerationId ?? PARKED_EXPECTED_GENERATION,
+    expectedGatePort: options.expectedGatePort ?? 0,
+    tokenFilePath,
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
     harnessArgv: options.harnessLaunch.programArguments,
   });
@@ -575,6 +640,7 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
     wrapperPath,
     wrapperContent: renderReleaseExecWrapperScript(),
     holdFilePath,
+    tokenFilePath,
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
     agentAccount: options.agentAccount,
   };
@@ -1387,6 +1453,7 @@ export interface ReleaseBarrierContext {
 export interface CommittedGenerationIdentity {
   generation_id: number;
   agent_uid: number;
+  gate_port: number;
 }
 
 /**
@@ -1772,16 +1839,21 @@ export async function runReleaseBarrierSequence(
   if (
     committed.agent_uid !== ctx.agentUid ||
     !Number.isInteger(committed.generation_id) ||
-    committed.generation_id <= 0
+    committed.generation_id <= 0 ||
+    !Number.isInteger(committed.gate_port) ||
+    committed.gate_port <= 0 ||
+    committed.gate_port > 65535
   ) {
     // Identity keying (design: "the G5 commit names what it releases"). A
-    // commit for a different uid, or a non-positive id, must never release.
+    // commit for a different uid, a non-positive id, or no concrete gate port
+    // must never release.
     const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
     return await parkedOutcome(ops, {
       stage: "commit-generation",
       reason:
         `committed generation identity mismatch: commit names uid ${String(committed.agent_uid)} ` +
-        `generation ${String(committed.generation_id)}, release is for uid ${ctx.agentUid}`,
+        `generation ${String(committed.generation_id)} gate port ${String(committed.gate_port)}, ` +
+        `release is for uid ${ctx.agentUid}`,
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
@@ -1806,15 +1878,17 @@ export async function runReleaseBarrierSequence(
     }
     if (
       reverify.observed.generation_id !== committed.generation_id ||
-      reverify.observed.agent_uid !== committed.agent_uid
+      reverify.observed.agent_uid !== committed.agent_uid ||
+      reverify.observed.gate_port !== committed.gate_port
     ) {
       const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
       return await parkedOutcome(ops, {
         stage: "verify-committed",
         reason:
           `post-commit verification observed uid ${String(reverify.observed.agent_uid)} ` +
-          `generation ${String(reverify.observed.generation_id)}, but the commit named uid ` +
-          `${String(committed.agent_uid)} generation ${String(committed.generation_id)}; ` +
+          `generation ${String(reverify.observed.generation_id)} gate port ${String(reverify.observed.gate_port)}, ` +
+          `but the commit named uid ${String(committed.agent_uid)} generation ` +
+          `${String(committed.generation_id)} gate port ${String(committed.gate_port)}; ` +
           "refusing to release a generation that is not the verified live gate generation",
         holdFileRemoved: cleanup.holdFileRemoved,
         jobDisabled: cleanup.jobDisabled,

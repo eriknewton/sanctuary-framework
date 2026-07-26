@@ -34,6 +34,7 @@ import { ensureAgentHarnessHoldDir } from "../../src/egress-gate/arming-wiring.j
 import {
   AGENT_HARNESS_DAEMON_LABEL,
   AGENT_HARNESS_DAEMON_PLIST_PATH,
+  HARNESS_FORBIDDEN_PLIST_ENV,
   renderAgentHarnessDaemonPlist,
   harnessLaunchSpec,
 } from "../../src/egress-gate/harness-daemon.js";
@@ -60,6 +61,10 @@ import {
   type HarnessReleaseHoldRecord,
   type ParkedInstallOps,
 } from "../../src/egress-gate/release-barrier.js";
+import {
+  GATE_PROXY_BASIC_USERNAME,
+  gateCredentialTokenPath,
+} from "../../src/egress-gate/gate-credential.js";
 
 /**
  * FIX F-HARNESSENV: a `HarnessLaunchSpec` is the ONLY thing the parked planner
@@ -202,6 +207,22 @@ describe("wrapper script (static content invariants)", () => {
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(HOLD_FILE_HEADER);
   });
 
+  it("exports proxy env only after the release checks and token checks pass", () => {
+    const digestCheck = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('argv digest mismatch');
+    const tokenRead = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('TOKEN_JSON=$(cat "$TOKEN_FILE")');
+    const proxyBuild = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('PROXY_URL="http://');
+    const exportUpper = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('export HTTPS_PROXY="$PROXY_URL"');
+    const execLine = RELEASE_EXEC_WRAPPER_SCRIPT.lastIndexOf('exec "$@"');
+    expect(digestCheck).toBeGreaterThan(0);
+    expect(tokenRead).toBeGreaterThan(digestCheck);
+    expect(proxyBuild).toBeGreaterThan(tokenRead);
+    expect(exportUpper).toBeGreaterThan(proxyBuild);
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('export HTTP_PROXY="$PROXY_URL"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('export https_proxy="$PROXY_URL"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('export http_proxy="$PROXY_URL"');
+    expect(exportUpper).toBeLessThan(execLine);
+  });
+
   it("refuses the parked sentinel generation", () => {
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ "$EXPECTED_GENERATION" -gt 0 ]');
   });
@@ -217,6 +238,8 @@ describe("buildBarrierProgramArguments", () => {
     wrapperPath: "/var/db/sanctuary/agent-harness/release-exec-wrapper.sh",
     holdFilePath: "/var/db/sanctuary/agent-harness/503.release",
     expectedGenerationId: 7,
+    expectedGatePort: 49152,
+    tokenFilePath: "/var/db/sanctuary/gate-cred/503.token",
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
     harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
   };
@@ -226,6 +249,8 @@ describe("buildBarrierProgramArguments", () => {
       base.wrapperPath,
       base.holdFilePath,
       "7",
+      "49152",
+      "/var/db/sanctuary/gate-cred/503.token",
       AGENT_HARNESS_DAEMON_LABEL,
       "--",
       "/usr/local/bin/node",
@@ -234,15 +259,29 @@ describe("buildBarrierProgramArguments", () => {
   });
 
   it("accepts the parked sentinel generation (rendered as 0)", () => {
-    const argv = buildBarrierProgramArguments({ ...base, expectedGenerationId: PARKED_EXPECTED_GENERATION });
+    const argv = buildBarrierProgramArguments({
+      ...base,
+      expectedGenerationId: PARKED_EXPECTED_GENERATION,
+      expectedGatePort: 0,
+    });
     expect(argv[2]).toBe("0");
+    expect(argv[3]).toBe("0");
   });
 
   it("refuses relative wrapper/hold paths, unsafe labels, negative generations, and a relative harness program", () => {
     expect(() => buildBarrierProgramArguments({ ...base, wrapperPath: "wrapper.sh" })).toThrow(ReleaseBarrierError);
     expect(() => buildBarrierProgramArguments({ ...base, holdFilePath: "503.release" })).toThrow(ReleaseBarrierError);
+    expect(() => buildBarrierProgramArguments({ ...base, tokenFilePath: "503.token" })).toThrow(ReleaseBarrierError);
     expect(() => buildBarrierProgramArguments({ ...base, harnessLabel: "bad label" })).toThrow(ReleaseBarrierError);
     expect(() => buildBarrierProgramArguments({ ...base, expectedGenerationId: -1 })).toThrow(ReleaseBarrierError);
+    expect(() => buildBarrierProgramArguments({ ...base, expectedGatePort: -1 })).toThrow(ReleaseBarrierError);
+    expect(() => buildBarrierProgramArguments({ ...base, expectedGatePort: 65536 })).toThrow(ReleaseBarrierError);
+    expect(() => buildBarrierProgramArguments({ ...base, expectedGenerationId: 7, expectedGatePort: 0 })).toThrow(
+      ReleaseBarrierError,
+    );
+    expect(() =>
+      buildBarrierProgramArguments({ ...base, expectedGenerationId: PARKED_EXPECTED_GENERATION, expectedGatePort: 49152 }),
+    ).toThrow(ReleaseBarrierError);
     expect(() => buildBarrierProgramArguments({ ...base, harnessArgv: ["node", "x.js"] })).toThrow(
       ReleaseBarrierError,
     );
@@ -276,18 +315,22 @@ describe("barrier plist form", () => {
     expect(plan.plistContent).toContain(`<string>${plan.wrapperPath}</string>`);
     expect(plan.plistContent).toContain(`<string>${plan.holdFilePath}</string>`);
     expect(plan.plistContent).toContain("<string>0</string>");
+    expect(plan.plistContent).toContain(`<string>${plan.tokenFilePath}</string>`);
     expect(plan.plistContent).toContain("<string>--</string>");
     expect(plan.plistContent).toContain("<string>/opt/harness.js</string>");
   });
 
-  it("release re-render embeds the committed generation id", () => {
+  it("release re-render embeds the committed generation id and gate port", () => {
     const released = planParkedHarnessInstall({
       agentAccount: "sanctuary-hermes",
       agentUid: 503,
       harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
       expectedGenerationId: 42,
+      expectedGatePort: 49152,
     });
     expect(released.plistContent).toContain("<string>42</string>");
+    expect(released.plistContent).toContain("<string>49152</string>");
+    expect(released.plistContent).toContain(`<string>${gateCredentialTokenPath(503)}</string>`);
   });
 
   it("REGRESSION (F-HARNESSENV): the RELEASE re-render carries the harness environment, not just SANCTUARY_STORAGE_PATH", () => {
@@ -310,6 +353,7 @@ describe("barrier plist form", () => {
       harnessLaunch: launch,
       fortressPath: "/Users/op/.sanctuary",
       expectedGenerationId: 42,
+      expectedGatePort: 49152,
     });
     for (const [form, plist] of [
       ["parked", parked.plistContent],
@@ -322,8 +366,50 @@ describe("barrier plist form", () => {
       // The fortress env is still rendered; the bug was that it was the ONLY one.
       expect(plist).toContain("<key>SANCTUARY_STORAGE_PATH</key>");
     }
-    // The ONLY difference between the two forms is the generation id.
-    expect(released.plistContent.replace("<string>42</string>", "<string>0</string>")).toBe(parked.plistContent);
+    // The ONLY differences between the two forms are the generation id and gate port.
+    expect(
+      released.plistContent
+        .replace("<string>42</string>", "<string>0</string>")
+        .replace("<string>49152</string>", "<string>0</string>"),
+    ).toBe(parked.plistContent);
+  });
+
+  it("STRUCTURAL (F-GATEUNREACHABLE): a rendered barrier plist never carries proxy credentials", () => {
+    const secret = "ab".repeat(32);
+    const normal = planParkedHarnessInstall({
+      agentAccount: "sanctuary-hermes",
+      agentUid: 503,
+      harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+      expectedGenerationId: 42,
+      expectedGatePort: 49152,
+    });
+    expect(normal.plistContent).not.toContain(secret);
+    expect(normal.plistContent).not.toContain(`${GATE_PROXY_BASIC_USERNAME}:42.${secret}`);
+    expect(normal.plistContent).not.toMatch(/Proxy-Authorization/i);
+    for (const proxyName of ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]) {
+      expect(normal.plistContent).not.toContain(`<key>${proxyName}</key>`);
+    }
+
+    const launchWithProxySecret = harnessLaunchSpec({
+      programArguments: ["/usr/local/bin/node", "/opt/harness.js"],
+      environment: {
+        HOME: "/var/sanctuary-agents/sanctuary-hermes",
+        PYTHONPATH: "/var/sanctuary-agents/sanctuary-hermes/.hermes/hermes-agent",
+        HTTPS_PROXY: `http://${GATE_PROXY_BASIC_USERNAME}:42.${secret}@127.0.0.1:49152`,
+      },
+    });
+    expect(() =>
+      planParkedHarnessInstall({
+        agentAccount: "sanctuary-hermes",
+        agentUid: 503,
+        harnessLaunch: launchWithProxySecret,
+        expectedGenerationId: 42,
+        expectedGatePort: 49152,
+      }),
+    ).toThrow(/HTTPS_PROXY/);
+    expect(HARNESS_FORBIDDEN_PLIST_ENV).toEqual(
+      expect.arrayContaining(["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"]),
+    );
   });
 
   it("legacy render (no barrier options) is byte-identical to the pre-S5-5 form", () => {
@@ -1488,10 +1574,11 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
       writeFileSync(wrapper, RELEASE_EXEC_WRAPPER_SCRIPT);
       chmodSync(wrapper, 0o755);
       const hold = join(dir, "503.release");
+      const token = join(dir, "503.token");
       const bootUuid = await currentBootSessionUuid();
       expect(bootUuid.length).toBeGreaterThan(0);
 
-      const argv = ["/bin/echo", "released-ok"];
+      const argv = ["/bin/sh", "-c", 'printf "%s\\n" "$HTTPS_PROXY" "$HTTP_PROXY" "$https_proxy" "$http_proxy"'];
       const digest = computeHarnessArgvDigest(argv);
       const uid = process.getuid ? process.getuid() : 0;
       const record: HarnessReleaseHoldRecord = {
@@ -1501,7 +1588,16 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
         argv_digest: digest,
         boot_session_uuid: bootUuid,
       };
-      const wrapperArgs = (gen: string) => [wrapper, hold, gen, AGENT_HARNESS_DAEMON_LABEL, "--", ...argv];
+      const wrapperArgs = (gen: string) => [
+        wrapper,
+        hold,
+        gen,
+        "49152",
+        token,
+        AGENT_HARNESS_DAEMON_LABEL,
+        "--",
+        ...argv,
+      ];
 
       // Absent hold file: refuse.
       let r = await runSh(wrapperArgs("7"));
@@ -1536,11 +1632,30 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
       expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
       expect(r.stderr).toContain("previous boot session");
 
-      // Full match: exec the harness argv (echo).
+      // Missing token: refuse instead of execing a credential-less agent.
       writeFileSync(hold, renderHarnessReleaseHoldFile(record));
       r = await runSh(wrapperArgs("7"));
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stderr).toContain("gate credential token file absent");
+
+      // Stale token generation: refuse before exporting proxy env.
+      writeFileSync(token, JSON.stringify({ version: 1, generation_id: 6, secret: "deadbeef" }));
+      chmodSync(token, 0o600);
+      r = await runSh(wrapperArgs("7"));
+      expect(r.code).toBe(RELEASE_WRAPPER_REFUSAL_EXIT_CODE);
+      expect(r.stderr).toContain("token generation does not match expected generation");
+
+      // Full match: export proxy env and exec the harness argv.
+      writeFileSync(token, JSON.stringify({ version: 1, generation_id: 7, secret: "deadbeef" }));
+      chmodSync(token, 0o600);
+      r = await runSh(wrapperArgs("7"));
       expect(r.code).toBe(0);
-      expect(r.stdout.trim()).toBe("released-ok");
+      expect(r.stdout.trim().split("\n")).toEqual(
+        Array.from(
+          { length: 4 },
+          () => `http://${GATE_PROXY_BASIC_USERNAME}:7.deadbeef@127.0.0.1:49152`,
+        ),
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -1556,14 +1671,16 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
     try {
       const harnessArgv = ["/bin/echo", "released-ok"];
       const agentUid = process.getuid ? process.getuid() : 0;
+      const token = join(dir, `${agentUid}.token`);
       const planOptions = {
         agentAccount: "sanctuary-hermes",
         agentUid,
         harnessLaunch: testLaunch(harnessArgv),
         holdDir: dir,
+        tokenFilePath: token,
       };
       const parkedPlan = planParkedHarnessInstall(planOptions);
-      const committedPlan = planParkedHarnessInstall({ ...planOptions, expectedGenerationId: 7 });
+      const committedPlan = planParkedHarnessInstall({ ...planOptions, expectedGenerationId: 7, expectedGatePort: 49152 });
 
       // Install the wrapper exactly as executeParkedHarnessInstall would.
       writeFileSync(parkedPlan.wrapperPath, parkedPlan.wrapperContent);
@@ -1581,6 +1698,8 @@ describe.runIf(isDarwin)("wrapper script live behavior (macOS)", () => {
           boot_session_uuid: bootUuid,
         }),
       );
+      writeFileSync(token, JSON.stringify({ version: 1, generation_id: 7, secret: "deadbeef" }));
+      chmodSync(token, 0o600);
 
       const extractProgramArguments = (plist: string): string[] => {
         const block = /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/.exec(plist);

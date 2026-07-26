@@ -253,7 +253,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
       },
       verifyGate: async () => {
         barrierEvents.push("verifyGate");
-        return { ok: true };
+        return { ok: true, observed: { generation_id: 7, agent_uid: 502, gate_port: 49152 } };
       },
       commitGeneration: async () => {
         barrierEvents.push("commit");
@@ -1205,7 +1205,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-2: dirty registry
 });
 
 describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-check before release)", () => {
-  function mkBarrierOps(commitGen: number): ReleaseBarrierOps {
+  function mkBarrierOps(commitGen: number, gatePort = ENTRY.gate_port): ReleaseBarrierOps {
     // Stateful (fix-round 3, 2026-07-19): reassert-parked OBSERVES the stop.
     let running = false;
     return {
@@ -1221,8 +1221,8 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-c
       writeHoldFile: async () => undefined,
       bootSessionUuid: async () => "ABCDEF01-2345-6789-ABCD-EF0123456789",
       rearmAnchor: async () => ({ ok: true }),
-      verifyGate: async () => ({ ok: true, observed: { generation_id: commitGen, agent_uid: 502 } }),
-      commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502 }),
+      verifyGate: async () => ({ ok: true, observed: { generation_id: commitGen, agent_uid: 502, gate_port: gatePort } }),
+      commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502, gate_port: gatePort }),
       writeReleasedPlist: async () => undefined,
       restoreParkedPlist: async () => undefined,
       harnessStatus: async () =>
@@ -1259,7 +1259,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-c
     expect(reason).toContain("generation 8");
   });
 
-  it("a matching generation at commit still releases (no false park from the re-check)", async () => {
+  it("a matching generation and gate port at commit still releases (no false park from the re-check)", async () => {
     const handle = await startExclusiveEgressBootSupervisor({
       resolveAgent: async () => OK_CTX,
       audit: async () => undefined,

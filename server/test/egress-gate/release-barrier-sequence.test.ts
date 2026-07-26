@@ -74,11 +74,11 @@ function makeOps(overrides?: Partial<Record<keyof ReleaseBarrierOps, unknown>>):
     },
     async verifyGate() {
       calls.push("verifyGate");
-      return { ok: true as const, observed: { generation_id: 7, agent_uid: 503 } };
+      return { ok: true as const, observed: { generation_id: 7, agent_uid: 503, gate_port: 49152 } };
     },
     async commitGeneration(): Promise<CommittedGenerationIdentity> {
       calls.push("commit");
-      return { generation_id: 7, agent_uid: 503 };
+      return { generation_id: 7, agent_uid: 503, gate_port: 49152 };
     },
     async writeReleasedPlist(committed) {
       calls.push("writeReleasedPlist");
@@ -146,7 +146,7 @@ describe("runReleaseBarrierSequence: happy path", () => {
       },
     ]);
     // The released plist re-render received the exact committed identity.
-    expect(releasedPlists).toEqual([{ generation_id: 7, agent_uid: 503 }]);
+    expect(releasedPlists).toEqual([{ generation_id: 7, agent_uid: 503, gate_port: 49152 }]);
   });
 
   it("refuses invalid contexts outright (bad uid, unsafe label)", async () => {
@@ -280,7 +280,7 @@ describe("runReleaseBarrierSequence: abort branches (fail-closed, hold removed, 
     const { ops, calls } = makeOps({
       commitGeneration: async () => {
         calls.push("commit");
-        return { generation_id: 7, agent_uid: 601 };
+        return { generation_id: 7, agent_uid: 601, gate_port: 49152 };
       },
     });
     const outcome = await runReleaseBarrierSequence(CTX, ops);
@@ -294,7 +294,7 @@ describe("runReleaseBarrierSequence: abort branches (fail-closed, hold removed, 
 
   it("a commit with a non-positive generation id parks", async () => {
     const { ops } = makeOps({
-      commitGeneration: async () => ({ generation_id: 0, agent_uid: 503 }),
+      commitGeneration: async () => ({ generation_id: 0, agent_uid: 503, gate_port: 49152 }),
     });
     const outcome = await runReleaseBarrierSequence(CTX, ops);
     expect(outcome.kind).toBe("parked");
@@ -462,7 +462,7 @@ describe("runReleaseBarrierSequence: verify-committed (TOCTOU binding; fix-round
         // Pre-commit verify sees generation 6; the commit returns 7; the
         // post-commit re-verify still sees 6 (the commit did not become the
         // live gate generation). The hold file must never be written.
-        return { ok: true as const, observed: { generation_id: 6, agent_uid: 503 } };
+        return { ok: true as const, observed: { generation_id: 6, agent_uid: 503, gate_port: 49152 } };
       },
     });
     const outcome = await runReleaseBarrierSequence(CTX, ops);
@@ -485,8 +485,8 @@ describe("runReleaseBarrierSequence: verify-committed (TOCTOU binding; fix-round
       verifyGate: async () => {
         verifyCount += 1;
         return verifyCount === 1
-          ? { ok: true as const, observed: { generation_id: 7, agent_uid: 503 } }
-          : { ok: true as const, observed: { generation_id: 7, agent_uid: 601 } };
+          ? { ok: true as const, observed: { generation_id: 7, agent_uid: 503, gate_port: 49152 } }
+          : { ok: true as const, observed: { generation_id: 7, agent_uid: 601, gate_port: 49152 } };
       },
     });
     const outcome = await runReleaseBarrierSequence(CTX, ops);
@@ -496,13 +496,33 @@ describe("runReleaseBarrierSequence: verify-committed (TOCTOU binding; fix-round
     expect(calls).not.toContain("writeHold");
   });
 
+  it("parks when the post-commit re-verify observes a DIFFERENT gate port", async () => {
+    let verifyCount = 0;
+    const { ops, calls } = makeOps({
+      verifyGate: async () => {
+        verifyCount += 1;
+        return verifyCount === 1
+          ? { ok: true as const, observed: { generation_id: 7, agent_uid: 503, gate_port: 49152 } }
+          : { ok: true as const, observed: { generation_id: 7, agent_uid: 503, gate_port: 49153 } };
+      },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("verify-committed");
+    expect(outcome.reason).toContain("gate port 49153");
+    expect(outcome.reason).toContain("gate port 49152");
+    expect(calls).not.toContain("writeHold");
+    expect(calls).not.toContain("writeReleasedPlist");
+  });
+
   it("parks when the post-commit re-verify itself fails or throws (fail-closed)", async () => {
     let verifyCount = 0;
     const { ops: failOps, calls: failCalls } = makeOps({
       verifyGate: async () => {
         verifyCount += 1;
         return verifyCount === 1
-          ? { ok: true as const, observed: { generation_id: 7, agent_uid: 503 } }
+          ? { ok: true as const, observed: { generation_id: 7, agent_uid: 503, gate_port: 49152 } }
           : { ok: false as const, reasons: ["gate went down mid-release"] };
       },
     });
@@ -518,7 +538,7 @@ describe("runReleaseBarrierSequence: verify-committed (TOCTOU binding; fix-round
       verifyGate: async () => {
         throwCount += 1;
         if (throwCount > 1) throw new Error("oracle timeout");
-        return { ok: true as const, observed: { generation_id: 7, agent_uid: 503 } };
+        return { ok: true as const, observed: { generation_id: 7, agent_uid: 503, gate_port: 49152 } };
       },
     });
     const threw = await runReleaseBarrierSequence(CTX, throwOps);
@@ -533,7 +553,7 @@ describe("runReleaseBarrierSequence: write-released-plist (fix-round HIGH-1)", (
   it("the released-plist write receives the committed identity and precedes enable", async () => {
     const { ops, calls, releasedPlists } = makeOps();
     await runReleaseBarrierSequence(CTX, ops);
-    expect(releasedPlists).toEqual([{ generation_id: 7, agent_uid: 503 }]);
+    expect(releasedPlists).toEqual([{ generation_id: 7, agent_uid: 503, gate_port: 49152 }]);
     expect(calls.indexOf("writeReleasedPlist")).toBeGreaterThan(calls.indexOf("writeHold"));
     expect(calls.indexOf("writeReleasedPlist")).toBeLessThan(calls.indexOf("enable"));
   });

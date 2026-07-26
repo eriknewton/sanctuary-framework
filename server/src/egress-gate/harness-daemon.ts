@@ -54,7 +54,14 @@ type LaunchctlResult = { code: number; stdout: string; stderr: string };
  * (duplicated, not imported: `egress-gate` is a library module and must not
  * depend on the CLI layer). A structural test pins the two lists equal.
  */
-export const HARNESS_FORBIDDEN_PLIST_ENV = ["SANCTUARY_PASSPHRASE", "SANCTUARY_RECOVERY_KEY"];
+export const HARNESS_FORBIDDEN_PLIST_ENV = [
+  "SANCTUARY_PASSPHRASE",
+  "SANCTUARY_RECOVERY_KEY",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "https_proxy",
+  "http_proxy",
+];
 
 // ---------------------------------------------------------------------------
 // FIX F-HARNESSENV (HIGH, Mini1 confined-Hermes re-drill 2026-07-26)

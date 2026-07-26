@@ -542,6 +542,7 @@ describe("verifyHarnessParkedPersistent (fix-round-2 HIGH-2: posture verify enum
       fortressPath: PARK_CTX.fortressPath,
       logDir: PARK_CTX.harnessLogDir,
       expectedGenerationId: 7, // a RELEASED plist form
+      expectedGatePort: 40001,
     });
     const { fn } = parkLaunchctl();
     const verdict = await verifyHarnessParkedPersistent(PARK_CTX, {
@@ -764,8 +765,8 @@ describe("createInstallExclusiveEgressOps runReleaseSequence (fix-round-4 P1: re
       writeHoldFile: async () => undefined,
       bootSessionUuid: async () => "ABCDEF01-2345-6789-ABCD-EF0123456789",
       rearmAnchor: async () => ({ ok: true }),
-      verifyGate: async () => ({ ok: true, observed: { generation_id: commitGen, agent_uid: 502 } }),
-      commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502 }),
+      verifyGate: async () => ({ ok: true, observed: { generation_id: commitGen, agent_uid: 502, gate_port: 49152 } }),
+      commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502, gate_port: 49152 }),
       writeReleasedPlist: async () => undefined,
       restoreParkedPlist: async () => undefined,
       harnessStatus: async () =>
