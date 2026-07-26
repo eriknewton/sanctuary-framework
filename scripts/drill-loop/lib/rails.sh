@@ -494,6 +494,17 @@ rails__stat_size() {
   rails__sys stat -c '%s' "$1" 2>/dev/null || rails__sys stat -f '%z' "$1" 2>/dev/null || return 1
 }
 
+# Hard-link count, GNU stat then BSD stat.
+#
+# ROUND-4 F1 / ROUND-6 M1. The fd-identity rail compares inode,uid,gid across
+# an open, which catches a swapped or symlinked leaf -- but a HARD LINK passes
+# all three, because it IS the target's inode. Every privileged read that
+# hand-walks a service-owned subtree therefore also refuses a multiply-linked
+# leaf, and this is where the count comes from.
+rails__stat_nlink() {
+  rails__sys stat -c '%h' "$1" 2>/dev/null || rails__sys stat -f '%l' "$1" 2>/dev/null || return 1
+}
+
 # Stable identity for an opened regular file: inode, owner uid, group id.
 #
 # This intentionally omits device on macOS because `stat /dev/fd/<n>` reports

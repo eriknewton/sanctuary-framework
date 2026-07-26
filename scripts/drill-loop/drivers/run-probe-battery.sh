@@ -330,6 +330,9 @@ report() {
       case "$-" in *f*) ;; *) reglob='yes' ;; esac
       set -f
       IFS=','
+      # ROUND-6 L4: this CLOBBERS report()'s own $1..$4. Every argument was
+      # copied to a local above, and nothing below may read a positional
+      # parameter -- from here on $1.. are observation ids, not arguments.
       # shellcheck disable=SC2086
       set -- $basis
       IFS="$oldifs"

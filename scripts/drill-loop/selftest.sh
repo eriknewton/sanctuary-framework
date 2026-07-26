@@ -927,9 +927,99 @@ case "$port_link_out" in
     printf 'ok    a symlinked gate runtime state is never followed\n'
     PASS=$((PASS + 1)) ;;
 esac
+# A HARD-LINKED runtime state must be refused too (round-4 F1 / round-6 M1). A
+# hard link shares its target's inode, uid and gid, so the fd-identity rail
+# alone cannot see it: the gate uid owns its own runtime uid dir and could
+# plant `state.json` as a SECOND NAME for a file outside the approved tree,
+# and root would read the target. The refusal is the link count, before open.
+rm -f "$GATE_RUNTIME/$GATE_UID/state.json"
+ln "$PORT_VICTIM" "$GATE_RUNTIME/$GATE_UID/state.json"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+port_link_out="$(gate_port_run 2>&1)"
+port_link_rc=$?
+set -e
+case "$port_link_out" in
+  *31337*)
+    printf 'FAIL  *** root read a HARD-LINKED gate runtime state and reported the port behind it ***\n'
+    note "output: $port_link_out"
+    FAIL=$((FAIL + 1)) ;;
+  *'hard links'*)
+    if [ "$port_link_rc" -ne 0 ]; then
+      printf 'ok    a hard-linked gate runtime state is refused, for the link-count reason\n'
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  gate-port named the hard link but exited 0\n'
+      FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  gate-port neither read the hard link nor refused it for the link-count reason\n'
+    note "output: $port_link_out"
+    FAIL=$((FAIL + 1)) ;;
+esac
 rm -f "$GATE_RUNTIME/$GATE_UID/state.json"
 printf '{"agent_uid":%s,"gate_port":49317,"generation_id":7}' "$GATE_UID" \
   > "$GATE_RUNTIME/$GATE_UID/state.json"
+
+# --- gate-port under the REAL-HOST ownership shape (round-6 H1) -------------
+#
+# On a real host the product chowns `gate-runtime/<uid>` to the GATE uid
+# (`server/src/egress-gate/runtime-fs-plan.ts`), so the root-run reader is NOT
+# the owner of the leaf dir and the owner is NOT root. Every other case in this
+# battery has self == owner for every component, so the one ownership condition
+# this verb exists to cross was structurally unexercised -- and the round-6
+# gate-port deterministically died on it, turning every through-gate probe
+# UNOBSERVED on the platform that matters. This case injects the foreign owner
+# through a `stat` that lies ONLY about the uid dir's owner, reproducing the
+# production trust shape in the sandbox: trusted base, leaf dir owned by
+# SOMEBODY ELSE.
+STATBIN="$SANDBOX/statbin"
+mkdir -p "$STATBIN"
+cat > "$STATBIN/stat" <<'STATSTUB'
+#!/bin/bash
+# TEST-ONLY stat: reports a foreign owner uid for ONE directory, real facts
+# for everything else.
+if [ -n "${DRILL_TEST_FOREIGN_DIR:-}" ]; then
+  args=("$@")
+  last="${args[$((${#args[@]}-1))]}"
+  if [ "$last" = "$DRILL_TEST_FOREIGN_DIR" ]; then
+    for a in "$@"; do
+      case "$a" in
+        '%u') echo 555; exit 0 ;;
+      esac
+    done
+  fi
+fi
+exec /usr/bin/stat "$@"
+STATSTUB
+chmod +x "$STATBIN/stat"
+GATE_RUNTIME_FOREIGN="$SANDBOX/gate-runtime-foreign"
+mkdir -p "$GATE_RUNTIME_FOREIGN/$GATE_UID"
+printf '{"agent_uid":%s,"gate_port":49317,"generation_id":7}' "$GATE_UID" \
+  > "$GATE_RUNTIME_FOREIGN/$GATE_UID/state.json"
+# ANTI-VACUITY, first: prove the injected owner IS what the ownership rail
+# refuses when the rail is pointed at the uid dir. A stub that never fired
+# would make the accept case below vacuous (the neutered-guard lesson: attack
+# the guard by neutering it, not only by feeding it a violation).
+foreign_rail_direct() {
+  DRILL_TEST_FOREIGN_DIR="$GATE_RUNTIME_FOREIGN/$GATE_UID" bash -c \
+    ". '$HERE/lib/rails.sh'; RAILS_SYSTEM_BIN_DIRS='$STATBIN /usr/bin /bin /usr/sbin /sbin'; rails_assert_trusted_dir_chain 'foreign dir' '$GATE_RUNTIME_FOREIGN/$GATE_UID'"
+}
+expect_reject 'anti-vacuity: the injected foreign owner IS refused by the ownership rail' \
+  'owned by uid 555' -- foreign_rail_direct
+# THE CASE ITSELF. The composed wrapper resolves `stat` through the stub dir,
+# so the uid dir reports owner 555 while the caller is neither 555 nor root:
+# exactly the shape the round-6 wrapper died on. The fixed verb trust-chains
+# only the root-owned base and hand-walks the gate-owned remainder, so it must
+# still yield the port.
+TEST_WRAPPER_PORT_FOREIGN="$SANDBOX/test-wrapper-port-foreign"
+compose_wrapper "$TEST_WRAPPER_PORT_FOREIGN" "$ME" '' "$STATBIN /usr/bin /bin /usr/sbin /sbin" "$GATE_RUNTIME_FOREIGN"
+gate_port_foreign_run() {
+  DRILL_TEST_FOREIGN_DIR="$GATE_RUNTIME_FOREIGN/$GATE_UID" \
+    "$TEST_WRAPPER_PORT_FOREIGN" gate-port --run-id 'good1' --operator-account "$ME" \
+    --agent-account "$ME" --agent-uid "$GATE_UID"
+}
+expect_accept 'a gate-owned runtime uid dir (reader != owner != root) still yields the port' \
+  'WRAPPER=GATE-PORT state=present port=49317 generation=7' -- gate_port_foreign_run
 
 # --- gate-log reads OUTSIDE the fortress through the same chokepoint -------
 #
@@ -1020,6 +1110,38 @@ case "$gate_out" in
     printf 'FAIL  gate-log neither read the safe log nor exposed the substitution clearly\n'
     note "output: $gate_out"; FAIL=$((FAIL + 1)) ;;
 esac
+# A HARD-LINKED gate log leaf must be refused (round-4 F1 / round-6 M1). The
+# gate uid owns `logs/`, and a hard link at the log name shares its target's
+# inode/uid/gid, so the fd-identity rail alone would let root tail an
+# ARBITRARY file into the evidence bundle. The suite already refused a
+# symlinked leaf and a symlinked dir; this is the third alias shape.
+LINK_VICTIM="$SANDBOX/gate-log-link-victim.log"
+printf 'SECRET-BEHIND-A-HARD-LINK\n' > "$LINK_VICTIM"
+rm -f "$ATTACK_LOG"
+ln "$LINK_VICTIM" "$ATTACK_LOG"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+gate_out="$("$TEST_WRAPPER_GATE" gate-log --run-id 'good1' --operator-account "$ME" \
+  --agent-account "$ME" --agent-uid "$(id -u)" 2>&1)"
+gate_rc=$?
+set -e
+case "$gate_out" in
+  *SECRET-BEHIND-A-HARD-LINK*)
+    printf 'FAIL  *** root tailed a HARD-LINKED gate log and printed the file behind it ***\n'
+    note "output: $gate_out"; FAIL=$((FAIL + 1)) ;;
+  *'hard links'*)
+    if [ "$gate_rc" -ne 0 ]; then
+      printf 'ok    a hard-linked gate log leaf is refused, for the link-count reason\n'
+      PASS=$((PASS + 1))
+    else
+      printf 'FAIL  gate-log named the hard link but exited 0\n'
+      FAIL=$((FAIL + 1))
+    fi ;;
+  *)
+    printf 'FAIL  gate-log neither printed the hard-linked content nor refused it for the link-count reason\n'
+    note "output: $gate_out"; FAIL=$((FAIL + 1)) ;;
+esac
+rm -f "$ATTACK_LOG" "$LINK_VICTIM"
+printf 'SAFE-GATE-LOG peer=%s\n' "$(id -u)" > "$ATTACK_LOG"
 # ...and the same account IS accepted once it is on the allowlist, so the rail
 # has been seen to say yes as well as no.
 expect_reject 'an allowlisted agent account passes the agent rail and dies later' 'kickstart failed for' \

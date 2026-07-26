@@ -396,7 +396,7 @@ wrapper_cursor_identity() {
 }
 
 wrapper_open_safe_file_under() {
-  local root="$1" rel="$2" label="$3" checked oldpwd parent_rel leaf expected actual oldifs noglob_was_set='' seg
+  local root="$1" rel="$2" label="$3" checked oldpwd parent_rel leaf expected actual oldifs noglob_was_set='' seg nlink
   WRAPPER_SAFE_TARGET=''
   WRAPPER_SAFE_OPEN_SIZE=''
   WRAPPER_SAFE_OPEN_IDENTITY=''
@@ -462,6 +462,25 @@ wrapper_open_safe_file_under() {
   fi
   if [ ! -f "$leaf" ]; then
     wrapper_die "$label path exists and is not a regular file: $checked"
+  fi
+  # ROUND-4 F1, closed at the ONE open chokepoint every privileged read shares
+  # (gate-log tail, gate-log cursor, gate-port cat). The fd-identity check
+  # below compares inode,uid,gid across the open, which catches a swapped or
+  # symlinked leaf -- but a HARD LINK passes all three, because it IS the
+  # target's inode. The gate service uid owns its own log dir and its runtime
+  # uid dir, so it could plant a log name or `state.json` as a hard link at a
+  # file outside the approved tree and this root-run wrapper would read the
+  # target. No file this wrapper legitimately reads has a second name, so a
+  # multiply-linked leaf is refused outright, BEFORE the open. A link added
+  # AFTER this lstat cannot help an attacker: replacing the leaf itself changes
+  # the inode and dies on the identity check below.
+  nlink="$(rails__stat_nlink "$leaf")" \
+    || wrapper_die "could not read the link count for $label: $checked"
+  case "$nlink" in
+    ''|*[!0-9]*) wrapper_die "unparseable link count for $label: $checked" ;;
+  esac
+  if [ "$nlink" -gt 1 ]; then
+    wrapper_die "$label has $nlink hard links; refusing to read a multiply-linked file that can alias a path outside the approved tree: $checked"
   fi
   WRAPPER_SAFE_OPEN_IDENTITY="$(rails__stat_identity "$leaf")" \
     || wrapper_die "could not stat identity for $label before open: $checked"
@@ -532,13 +551,43 @@ wrapper_tail_safe_file_under() {
   return 0
 }
 
-wrapper_prepare_gate_log_root() {
+# ONE preparation for every verb that reads a SERVICE-OWNED subtree: trust-chain
+# only the root-owned base, because the remainder of the path is owned by the
+# product's service uid ON PURPOSE (the gate account owns its own home; the gate
+# daemon's runtime uid dir is chowned to the gate uid at arming time,
+# `server/src/egress-gate/runtime-fs-plan.ts`). The service-owned remainder is
+# then hand-walked through `wrapper_open_safe_file_under`, which proves each
+# component is a real, non-symlink directory that resolves where it says and
+# reads the leaf through a checked fd -- but applies NO root-or-self ownership
+# rail, because on a real host the owner IS the service uid and a root-run read
+# across that ownership boundary is the whole point of the verb.
+#
+# ROUND-6 H1. `gate-port` did not use this shape. It resolved the runtime state
+# through `wrapper_resolve_absolute_optional_file`, whose trusted-chain rail
+# covers the WHOLE parent -- including `/var/db/sanctuary/gate-runtime/<uid>`,
+# which the product chowns to the gate uid -- so on a real host the root-run
+# wrapper deterministically died reading the daemon's own document and every
+# through-gate probe reported UNOBSERVED. The selftest stayed green because its
+# sandbox is owned by the caller (self == owner satisfies the rail), which is
+# the same stub-fidelity blind spot that kept round-5 B1 alive. Both gate verbs
+# now prepare their base HERE, so there is one matcher, not two that can drift;
+# the ownership shape itself is exercised by an injected-owner selftest.
+wrapper_prepare_service_base() {
+  local label="$1" base="$2"
   WRAPPER_SAFE_TARGET=''
-  if [ ! -e "$RAILS_PRODUCT_GATE_HOME_BASE" ]; then return 1; fi
-  WRAPPER_SAFE_TARGET="$(rails_assert_trusted_dir_chain 'gate account home base' "$RAILS_PRODUCT_GATE_HOME_BASE")" \
-    || wrapper_die "gate account home base is not a trusted root-owned chain: $RAILS_PRODUCT_GATE_HOME_BASE"
-  if [ -z "$WRAPPER_SAFE_TARGET" ]; then wrapper_die 'empty gate account home base after trusted-chain rail'; fi
+  if [ ! -e "$base" ]; then return 1; fi
+  WRAPPER_SAFE_TARGET="$(rails_assert_trusted_dir_chain "$label" "$base")" \
+    || wrapper_die "$label is not a trusted root-owned chain: $base"
+  if [ -z "$WRAPPER_SAFE_TARGET" ]; then wrapper_die "empty $label after trusted-chain rail"; fi
   return 0
+}
+
+wrapper_prepare_gate_log_root() {
+  wrapper_prepare_service_base 'gate account home base' "$RAILS_PRODUCT_GATE_HOME_BASE"
+}
+
+wrapper_prepare_gate_runtime_root() {
+  wrapper_prepare_service_base 'gate runtime base' "$RAILS_PRODUCT_GATE_RUNTIME_DIR"
 }
 
 wrapper_resolve_absolute_optional_file() {
@@ -979,22 +1028,33 @@ wrapper_verb_gate_log() {
 # how "no gate port" becomes "port 0" becomes a green-looking probe.
 wrapper_verb_gate_port() {
   wrapper_require_agent
-  local state_path content rc=0 parent leaf port generation
+  local state_path content runtime_base rel port generation
   state_path="$(rails_product_gate_runtime_state_path "$AGENT_UID")" \
     || wrapper_die "could not compose the gate runtime state path for uid $AGENT_UID"
   if [ -z "$state_path" ]; then wrapper_die 'empty gate runtime state path after the composer'; fi
 
-  if ! wrapper_resolve_absolute_optional_file "$state_path" 'gate runtime state'; then
+  # ROUND-6 H1. The per-uid dir under the runtime base is chowned to the GATE
+  # uid by the product, so the ownership rail must stop at the root-owned base
+  # and the gate-owned remainder is hand-walked -- exactly how `gate-log` reads
+  # its gate-owned tree, through the same two functions. An absent base or an
+  # absent uid dir/state file are both the legitimate `absent` answer; a
+  # symlink, a hard link, a traversal, or a swap across the open all die inside
+  # the shared chokepoints.
+  if ! wrapper_prepare_gate_runtime_root; then
     printf 'WRAPPER=GATE-PORT state=absent path=%s\n' "$state_path"
     printf 'WRAPPER=OK verb=gate-port state=absent agent_uid=%s path=%s\n' "$AGENT_UID" "$state_path"
     return 0
   fi
-  parent="${WRAPPER_SAFE_TARGET%/*}"
-  leaf="${WRAPPER_SAFE_TARGET##*/}"
-  content="$(wrapper_cat_safe_file_under "$parent" "$leaf" 'gate runtime state')" || rc=$?
-  if [ "$rc" -ne 0 ]; then
-    wrapper_die "could not READ the gate runtime state at $state_path (cat rc=$rc); a port this wrapper did not read is not a port a probe may aim at"
+  runtime_base="$WRAPPER_SAFE_TARGET"
+  rel="$AGENT_UID/$RAILS_PRODUCT_GATE_RUNTIME_STATE_FILE"
+  if ! wrapper_open_safe_file_under "$runtime_base" "$rel" 'gate runtime state'; then
+    printf 'WRAPPER=GATE-PORT state=absent path=%s\n' "$state_path"
+    printf 'WRAPPER=OK verb=gate-port state=absent agent_uid=%s path=%s\n' "$AGENT_UID" "$state_path"
+    return 0
   fi
+  content="$(rails__sys cat <&9)" \
+    || { exec 9<&-; wrapper_die "could not READ the gate runtime state at $state_path from its checked fd; a port this wrapper did not read is not a port a probe may aim at"; }
+  exec 9<&-
   port="$(rails_json_flat_number "$content" gate_port)" \
     || wrapper_die "the gate runtime state at $state_path carries no readable gate_port"
   port="$(rails_assert_tcp_port "$port")" \
