@@ -61,3 +61,24 @@
 
 Defaults:agentmac secure_path="/usr/bin:/bin:/usr/sbin:/sbin"
 agentmac ALL=(root) NOPASSWD: /usr/local/sbin/sanctuary-drill-wrapper
+
+# THE AS-AGENT PROBE GRANT (added 2026-07-26, provisioning Mini1)
+#
+# This is the "separate, narrowly scoped grant" the note above prescribes, and
+# it is the whole of it: one command, run as one non-root account, with no
+# arguments constrained away because curl's arguments are the probe. Without
+# it the probe battery asks once, reports every probe SKIP, exits nonzero with
+# verified=no, and the night records UNVERIFIED and stops -- honest, and
+# useless.
+#
+# What it does NOT grant, deliberately: not (ALL), not root, not sanctuary-
+# gate-hermes (the gate's own service account, whose whole role is to be the
+# thing being tested), and not the operator's own account. The blast radius is
+# "make network requests as the confined drill agent", which is precisely what
+# the drill is measuring and what that account can already do for itself.
+#
+# The principal here MUST stay in sync with RAILS_AGENT_ACCOUNT_ALLOW in
+# lib/rails.sh. Two names, one meaning: widening one without the other either
+# breaks the night or, worse, leaves a grant behind for an account the harness
+# no longer drills.
+agentmac ALL=(sanctuary-hermes) NOPASSWD: /usr/bin/curl
