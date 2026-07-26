@@ -187,10 +187,12 @@ export {
 export {
   GATE_CRED_DIR,
   GATE_AUTH_SCHEME,
+  GATE_PROXY_BASIC_USERNAME,
   GATE_CREDENTIAL_VERSION,
   GATE_CREDENTIAL_SECRET_BYTES,
   GateCredentialAuthority,
   formatGateCredentialHeader,
+  formatGateCredentialBasicHeader,
   parseGateCredentialHeader,
   verifyGateCredential,
   mintGateSecret,

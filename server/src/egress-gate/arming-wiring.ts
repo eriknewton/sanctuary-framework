@@ -1491,7 +1491,7 @@ export function createProductionReleaseBarrierOps(input: {
     return listed;
   }
 
-  async function writePlist(expectedGenerationId: number): Promise<void> {
+  async function writePlist(expectedGenerationId: number, expectedGatePort = 0): Promise<void> {
     const plan = planParkedHarnessInstall({
       agentAccount: input.agentAccount,
       agentUid: input.agentUid,
@@ -1499,6 +1499,7 @@ export function createProductionReleaseBarrierOps(input: {
       fortressPath: input.fortressPath,
       logDir: input.harnessLogDir,
       expectedGenerationId,
+      expectedGatePort,
     });
     await writeFile(plan.plistPath, plan.plistContent, { mode: 0o644 });
   }
@@ -1518,7 +1519,7 @@ export function createProductionReleaseBarrierOps(input: {
       registryDirty: listed.dirty,
     });
     if (committed.committedGenerationId === undefined || entry === null) return null;
-    return { generation_id: committed.committedGenerationId, agent_uid: input.agentUid };
+    return { generation_id: committed.committedGenerationId, agent_uid: input.agentUid, gate_port: entry.gate_port };
   }
 
   async function readCommitted(): Promise<CommittedGenerationIdentity | null> {
@@ -1713,7 +1714,7 @@ export function createProductionReleaseBarrierOps(input: {
       return committed;
     },
     async writeReleasedPlist(committed): Promise<void> {
-      await writePlist(committed.generation_id);
+      await writePlist(committed.generation_id, committed.gate_port);
     },
     async restoreParkedPlist(): Promise<void> {
       await writePlist(0);
@@ -1818,11 +1819,12 @@ export function createInstallExclusiveEgressOps(input: ExclusiveEgressWiringInpu
         ...barrierOps,
         commitGeneration: async (): Promise<CommittedGenerationIdentity> => {
           const observed = await barrierOps.commitGeneration();
-          if (observed.generation_id !== committed.generation_id) {
+          if (observed.generation_id !== committed.generation_id || observed.gate_port !== committed.gate_port) {
             throw new Error(
               `registry changed during release for uid ${input.agentUid}: this run brought up committed ` +
-                `generation ${committed.generation_id} but the registry now commits generation ` +
-                `${observed.generation_id} (a concurrent install/repair advanced it); refusing to ` +
+                `generation ${committed.generation_id} on gate port ${committed.gate_port} but the registry now ` +
+                `commits generation ${observed.generation_id} on gate port ${observed.gate_port} ` +
+                "(a concurrent install/repair advanced it); refusing to " +
                 "release a generation this run did not bring up; the agent stays parked fail-closed " +
                 "-- re-run the repair",
             );
@@ -3754,15 +3756,17 @@ export async function startExclusiveEgressBootSupervisor(input: {
         // before any release surface is written): a mismatch THROWS, which
         // the barrier maps to a loud fail-closed park at commit-generation.
         const resolvedGenerationId = entry.generation_id;
+        const resolvedGatePort = entry.gate_port;
         const guardedOps: ReleaseBarrierOps = {
           ...releaseBarrierOps,
           commitGeneration: async (): Promise<CommittedGenerationIdentity> => {
             const committed = await releaseBarrierOps.commitGeneration();
-            if (committed.generation_id !== resolvedGenerationId) {
+            if (committed.generation_id !== resolvedGenerationId || committed.gate_port !== resolvedGatePort) {
               throw new Error(
                 `registry changed during boot release for uid ${agentUid}: resolution captured committed ` +
-                  `generation ${resolvedGenerationId ?? "none"} but the registry now commits generation ` +
-                  `${committed.generation_id} (a concurrent install/repair advanced it); the resolved ` +
+                  `generation ${resolvedGenerationId ?? "none"} on gate port ${resolvedGatePort} but the registry ` +
+                  `now commits generation ${committed.generation_id} on gate port ${committed.gate_port} ` +
+                  "(a concurrent install/repair advanced it); the resolved " +
                   "release context may be stale; parking fail-closed -- re-run the boot release or repair",
               );
             }

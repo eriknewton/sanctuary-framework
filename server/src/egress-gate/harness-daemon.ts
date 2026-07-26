@@ -54,7 +54,16 @@ type LaunchctlResult = { code: number; stdout: string; stderr: string };
  * (duplicated, not imported: `egress-gate` is a library module and must not
  * depend on the CLI layer). A structural test pins the two lists equal.
  */
-export const HARNESS_FORBIDDEN_PLIST_ENV = ["SANCTUARY_PASSPHRASE", "SANCTUARY_RECOVERY_KEY"];
+export const HARNESS_FORBIDDEN_PLIST_ENV = [
+  "SANCTUARY_PASSPHRASE",
+  "SANCTUARY_RECOVERY_KEY",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "https_proxy",
+  "http_proxy",
+];
+
+const CREDENTIALED_URL_VALUE_RE = /:\/\/[^/@\s]*:[^/@\s]*@/;
 
 // ---------------------------------------------------------------------------
 // FIX F-HARNESSENV (HIGH, Mini1 confined-Hermes re-drill 2026-07-26)
@@ -163,6 +172,14 @@ function assertNoControlChars(value: string, what: string): void {
   }
 }
 
+function assertNoCredentialedPlistValue(name: string, value: string): void {
+  if (CREDENTIALED_URL_VALUE_RE.test(value)) {
+    throw new Error(
+      `Refusing to embed ${name} value containing URL credentials in a world-readable LaunchDaemon plist.`,
+    );
+  }
+}
+
 /** Options for {@link renderAgentHarnessDaemonPlist}. */
 export interface AgentHarnessDaemonPlistOptions {
   /**
@@ -243,6 +260,7 @@ export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOp
   }
   for (const arg of options.programArguments) {
     assertNoControlChars(arg, "program argument");
+    assertNoCredentialedPlistValue("program argument", arg);
   }
 
   const envEntries: Array<[string, string]> = [];
@@ -262,6 +280,9 @@ export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOp
     if (HARNESS_FORBIDDEN_PLIST_ENV.includes(name)) {
       throw new Error(`Refusing to embed ${name} in a world-readable LaunchDaemon plist.`);
     }
+  }
+  for (const [name, value] of envEntries) {
+    assertNoCredentialedPlistValue(name, value);
   }
 
   const logDir =
