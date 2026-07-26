@@ -102,6 +102,75 @@ jobs:
           rm -f "$RUNNER_TEMP/preflight.p12"
           echo "All five Apple credentials are present and the .p12 parses."
 
+      # Presence is not validity. 2026-07-25 (run 30181951917) the step above
+      # passed, the app built and signed, and the job then died at "Notarize and
+      # staple" with Apple HTTP 401 "Invalid credentials": the notary secrets
+      # were SET but WRONG, and the pipeline only learned that after the entire
+      # build. Same failure class as the six-week silent gap that motivated the
+      # presence preflight, one layer up.
+      #
+      # So before any build step, make the same round-trip to Apple that the
+      # notarize step will make, using a cheap read-only call. `notarytool
+      # history` authenticates with the identical apple-id/team-id/password
+      # triple as `notarytool submit` and lists past submissions without
+      # uploading anything, so it succeeds if and only if the notarize step's
+      # credentials would be accepted.
+      #
+      # This step runs AFTER the presence checks on purpose: a missing secret
+      # must still be reported as missing (by the step above), never as
+      # "invalid". This step therefore only ever fires on secrets that exist
+      # but are rejected by Apple. Never print a secret value; classify from
+      # the HTTP status code alone and do not dump raw notarytool output
+      # (it can echo the Apple ID back).
+      - name: Preflight notary credential validity against Apple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+        run: |
+          set -u
+
+          status=0
+          output=$(xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_NOTARY_PASSWORD" 2>&1) || status=$?
+
+          if [ "$status" -eq 0 ]; then
+            echo "Notary credentials are VALID: notarytool history round-trip to Apple succeeded."
+            exit 0
+          fi
+
+          http_code=$(printf '%s' "$output" \
+            | grep -oE 'HTTP status code: [0-9]{3}' \
+            | head -n 1 \
+            | grep -oE '[0-9]{3}' || true)
+
+          echo "::error::Preflight check FAILED: notary credential VALIDITY (credentials are present but Apple rejected them)."
+          echo "notarytool history exited with status $status before any build step ran."
+          echo "The presence preflight already passed, so all five secrets are set; the notary triple (APPLE_NOTARY_APPLE_ID / APPLE_NOTARY_PASSWORD / APPLE_TEAM_ID) is being rejected or is unreachable."
+          echo ""
+          case "$http_code" in
+            401)
+              echo "Apple error class: HTTP 401 invalid credentials. The Apple ID + app-specific password + Team ID combination was rejected."
+              echo "Fix: regenerate the app-specific password at appleid.apple.com (Sign-In and Security > App-Specific Passwords) and paste the NEW value into the APPLE_NOTARY_PASSWORD repository secret."
+              echo "The Apple ID account password will NOT work; notarytool requires an app-specific password."
+              ;;
+            403)
+              echo "Apple error class: HTTP 403 forbidden. Usually a pending developer-agreement or account/team access issue, not a wrong password."
+              echo "Fix: sign in at developer.apple.com with the notary Apple ID and accept any pending agreements, then re-run."
+              ;;
+            "")
+              echo "Apple error class: no HTTP status code in notarytool output. Likely a network failure, an Xcode command-line-tools problem on the runner, or a malformed invocation rather than a credential rejection."
+              echo "Fix: re-run the job; if it persists, run the same notarytool history call locally with the same credentials to see the full error."
+              ;;
+            *)
+              echo "Apple error class: HTTP $http_code (neither 401 invalid-credentials nor 403 agreement/access)."
+              echo "Fix: run the same notarytool history call locally with the same credentials to see the full error."
+              ;;
+          esac
+          exit 1
+
       - name: Import signing certificate
         env:
           P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
