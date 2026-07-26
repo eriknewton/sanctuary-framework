@@ -255,7 +255,12 @@ RAILS_HOST_DENY_FP='0b97135457bbb970241f6c37af3ced6e4477163e92ca5258dc9f549cea0d
 #
 # and paste the printed fingerprint here, with the machine named in a comment.
 # Re-review the diff: this list is the whole host allowlist.
-RAILS_HOST_ALLOW_FP=''
+#
+# c793843d... = Mini1, ComputerName "Agent's Mac mini", macOS 26.5.2, operator
+# account agentmac. The dedicated drill box: stripped, unencrypted, no real
+# tenant, and not a coordinator host. Measured with host-fingerprint.sh on the
+# machine itself 2026-07-26.
+RAILS_HOST_ALLOW_FP='c793843d54555cfe0334e206967811d69df3f4f309c58d3447668d0c1837724d'
 
 # NAME denylist, kept as a BELT and never as the mechanism. Names cannot ADD a
 # host (there is no name allowlist any more), so an entry here can only ever
@@ -285,7 +290,13 @@ RAILS_HOST_DENY='eriks-macbook-air eriksmacbookair erik-macbook-air erikmbp'
 # failure mode. Provision it in the same reviewed diff as the host fingerprint
 # (see README "Install"), space separated, and re-review: this list is the
 # entire set of principals root will act against.
-RAILS_AGENT_ACCOUNT_ALLOW=''
+#
+# sanctuary-hermes (uid 503 on Mini1, shell /usr/bin/false, home under
+# /var/sanctuary-agents) is the confined agent principal every prior S5 drill
+# used. Deliberately ONE entry: sanctuary-gate-hermes (504) is the gate's own
+# service account, which the product provisions, never a drill principal; and
+# sanctuary-agent (502) has a live login shell, so it is not named here.
+RAILS_AGENT_ACCOUNT_ALLOW='sanctuary-hermes'
 
 # Fortress paths that are never disposable, checked BEFORE the allowlist so the
 # ordering matches the host rail's proven deny-first shape. The relative entries

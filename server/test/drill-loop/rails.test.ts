@@ -759,12 +759,20 @@ describe("drill-loop rails: host rail, decided on hardware", () => {
     expectReject(probe("fingerprint-against", ALLOWED, DENIED, ""), "allowlist is EMPTY");
   });
 
-  it("the SHIPPED allowlist is empty and the SHIPPED denylist is not", () => {
+  it("the SHIPPED allowlist holds EXACTLY the one provisioned drill host, and the SHIPPED denylist is not empty", () => {
     // The shipped lists, asserted directly, because no override can fake this
-    // and because an accidentally-populated allowlist is the one change here
-    // that would matter most.
+    // and because a silently-widened allowlist is the one change here that
+    // would matter most.
+    //
+    // The list was empty until 2026-07-26, when Mini1 was provisioned in a
+    // reviewed diff per the README. This assertion is pinned to that exact
+    // value rather than relaxed to "some fingerprint": adding a SECOND drill
+    // host must fail here and be argued for, which is the whole point of
+    // asserting the shipped constant.
     const rails = fs.readFileSync(path.join(DRILL_LOOP, "lib", "rails.sh"), "utf8");
-    expect(rails).toMatch(/^RAILS_HOST_ALLOW_FP=''$/m);
+    expect(rails).toMatch(
+      /^RAILS_HOST_ALLOW_FP='c793843d54555cfe0334e206967811d69df3f4f309c58d3447668d0c1837724d'$/m
+    );
     expect(rails).toMatch(/^RAILS_HOST_DENY_FP='[0-9a-f]{64}'$/m);
     // and the generic name allowlist is gone, not merely unused
     expect(rails).not.toMatch(/^RAILS_HOST_ALLOW=/m);
@@ -1197,10 +1205,15 @@ describe("drill-loop wrapper: the shipped artifact's own structure", () => {
     }
   });
 
-  it("ships an EMPTY agent-account allowlist, so root acts for nobody yet", () => {
-    // ROUND-3 M2. Same posture as the empty host allowlist: an unprovisioned
-    // harness refuses rather than acting for whatever account it is handed.
-    expect(assembled).toContain("RAILS_AGENT_ACCOUNT_ALLOW=''");
+  it("ships EXACTLY ONE agent principal, so root acts against that account and no other", () => {
+    // ROUND-3 M2. Same posture as the host allowlist: root acts only against a
+    // principal named in a reviewed diff, never against whatever account it is
+    // handed. Empty until 2026-07-26; now the single confined drill account.
+    //
+    // Pinned to the exact value, not to "non-empty": a second principal, and
+    // in particular the gate's own service account or any account with a live
+    // login shell, must fail here and be argued for.
+    expect(assembled).toContain("RAILS_AGENT_ACCOUNT_ALLOW='sanctuary-hermes'");
   });
 
   it("carries the four READ verbs the drivers observe through", () => {
