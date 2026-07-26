@@ -199,6 +199,51 @@ RAILS_PRODUCT_GATE_RUNTIME_DIR='/var/db/sanctuary/gate-runtime'
 RAILS_PRODUCT_GATE_RUNTIME_STATE_FILE='state.json'
 
 # ###########################################################################
+# THE TWO CLASSES OF PRODUCT DAEMON, AND WHY THE HARNESS MUST NOT CONFLATE THEM
+#
+# 2026-07-25, the FIRST live supervised run on Mini1 stopped at step 0 of
+# iteration 1 with
+#
+#   WRAPPER=REJECT reason=kickstart failed for: ai.sanctuaryprotocol.egress-gate.503
+#     ai.sanctuaryprotocol.egress-gate-peer-resolver.503 (restarted: none)
+#
+# on a host where NOTHING was wrong. The two labels named there are the PER-UID
+# GATE daemons, and the product only brings them into existence when a uid is
+# ARMED -- which happens at step 3 of the SAME ladder that had just refused to
+# get past step 0. On a clean, disarmed host they legitimately do not exist, so
+# no iteration could ever run: their absence is the expected pre-arm state, and
+# the verb reported it as a restart failure.
+#
+# The daemons that DO exist on every installed host, whatever is armed, are the
+# two below. They are the ones that have to be restarted for an iteration to be
+# measuring the dist that was just built, and a restart failure on one of THEM
+# is a genuine, fatal problem.
+#
+# So the harness carries two label classes, and `wrapper_verb_kickstart_daemons`
+# treats absence differently for each:
+#
+#   HOST daemons  - installed by the product, independent of any arm. Absence is
+#                   NEVER expected: the iteration would measure nothing.
+#   PER-UID gate  - created by the arm. Absence is expected BEFORE this uid is
+#                   armed and is a defect AFTER it, and which of those two the
+#                   host is in is OBSERVED (the root-owned pf-anchor registry),
+#                   never inferred from an iteration number or a step index.
+# ###########################################################################
+
+# `CASTLE_WALL_BOOT_LABEL`, server/src/cli/castle-wall-boot.ts.
+RAILS_PRODUCT_CASTLE_WALL_LABEL='ai.sanctuaryprotocol.castle-wall.daemon'
+
+# `CASTLE_SIGNER_HELPER_LABEL`, server/src/cli/castle-wall-signer-helper.ts.
+RAILS_PRODUCT_SIGNER_HELPER_LABEL='ai.sanctuaryprotocol.macos.castle-wall.signer-helper'
+
+# The directory every one of the product's system daemons installs its plist
+# into (`CASTLE_WALL_BOOT_PLIST_PATH`, `egressGateDaemonPlistPath`,
+# `peerResolverDaemonPlistPath` all compose `<dir>/<label>.plist`). Declared
+# once here so the wrapper and the drivers ask the same question of the same
+# place; a second declaration site is how four identifiers drifted at once.
+RAILS_PRODUCT_LAUNCHDAEMONS_DIR='/Library/LaunchDaemons'
+
+# ###########################################################################
 # HOST IDENTITY IS A HARDWARE FINGERPRINT, NOT A NAME.
 #
 # A live audit of the real machines (2026-07-25) killed the name-based
@@ -752,13 +797,98 @@ rails_product_gate_runtime_state_path() {
     "$(rails__squeeze_slashes "$RAILS_PRODUCT_GATE_RUNTIME_DIR")" "$1" "$RAILS_PRODUCT_GATE_RUNTIME_STATE_FILE"
 }
 
-# Both labels, space separated, in the order the wrapper restarts them.
+# Both PER-UID labels, space separated, in the order the wrapper restarts them.
+# These exist only once the uid is armed; see the two-classes block above.
 rails_product_daemon_labels() {
   if [ "$#" -ne 1 ]; then rails__die "rails_product_daemon_labels: expected 1 arg (agent uid), got $#"; fi
   local gate resolver
   gate="$(rails_product_gate_label "$1")" || rails__die "gate label rejected for uid $1"
   resolver="$(rails_product_resolver_label "$1")" || rails__die "resolver label rejected for uid $1"
   printf '%s %s\n' "$gate" "$resolver"
+}
+
+# The ALWAYS-INSTALLED host daemons, space separated. Not per-uid: these are the
+# product's own, one per host, and they are the ones whose absence means the
+# product is not installed rather than "not armed yet".
+rails_product_host_daemon_labels() {
+  if [ "$#" -ne 0 ]; then rails__die "rails_product_host_daemon_labels: expected 0 args, got $#"; fi
+  printf '%s %s\n' "$RAILS_PRODUCT_CASTLE_WALL_LABEL" "$RAILS_PRODUCT_SIGNER_HELPER_LABEL"
+}
+
+# `<LaunchDaemons dir>/<label>.plist`, the path the product installs a system
+# daemon's job description at. Used as ONE of the two existence signals: a job
+# launchd has loaded answers `launchctl print`, and a job whose plist is on disk
+# exists even when launchd has not bootstrapped it (which is itself a defect,
+# and one this harness must be able to SEE rather than read as "not installed").
+rails_product_daemon_plist_path() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_product_daemon_plist_path: expected 1 arg (label), got $#"; fi
+  local label="$1"
+  if [ -z "$label" ]; then rails__die 'empty daemon label; refusing to compose a plist path'; fi
+  case "$label" in
+    *[!a-zA-Z0-9._-]*) rails__die "daemon label contains characters that cannot compose a safe plist path: $label" ;;
+  esac
+  printf '%s/%s.plist\n' "$(rails__squeeze_slashes "$RAILS_PRODUCT_LAUNCHDAEMONS_DIR")" "$label"
+}
+
+# ---------------------------------------------------------------------------
+# OBSERVED ARM STATE: does the product's own registry name this uid?
+# ---------------------------------------------------------------------------
+#
+# PURE. Content in, uid in, `yes`/`no` out, so the decision that governs whether
+# a missing gate daemon is expected can be driven exhaustively by the battery on
+# any platform, without a host, root, pf, or launchd.
+#
+# The subject is `PF_ANCHOR_REGISTRY_PATH`'s JSON, written by
+# server/src/egress-gate/anchor-registry.ts: one `{"agent_uid":<n>,...}` object
+# per confined uid. This is a SCANNER for that key, not a JSON parser, and the
+# distinction is deliberate: a hand-rolled JSON parser inside a root process is
+# more defect surface than the question is worth, and this question is an
+# EXPECTATION signal ("would absence surprise us"), never a security boundary.
+# The file is root-owned 0600 and only the product writes it, so the one way to
+# fool the scanner -- a string VALUE containing the literal `"agent_uid": <n>` --
+# requires already being able to write the registry as root.
+#
+# Whitespace between the key, the colon and the number is tolerated because
+# tolerating it costs three lines and NOT tolerating it would make a
+# pretty-printed registry read as "no uid is armed", which is the fail-open
+# direction: it is the answer that makes a missing gate daemon look expected.
+rails_registry_names_agent_uid() {
+  if [ "$#" -ne 2 ]; then
+    rails__die "rails_registry_names_agent_uid: expected 2 args (content, agent uid), got $#"
+  fi
+  local content="$1" uid="$2" rest c num
+  rails__assert_agent_uid_shape 'registry agent uid probe' "$uid"
+  rest="$content"
+  while :; do
+    case "$rest" in
+      *'"agent_uid"'*) ;;
+      *) printf 'no\n'; return 0 ;;
+    esac
+    rest="${rest#*'"agent_uid"'}"
+    while :; do
+      c="${rest%"${rest#?}"}"
+      case "$c" in ' '|$'\t'|$'\n'|$'\r') rest="${rest#?}" ;; *) break ;; esac
+    done
+    case "$rest" in
+      :*) rest="${rest#:}" ;;
+      *) continue ;;
+    esac
+    while :; do
+      c="${rest%"${rest#?}"}"
+      case "$c" in ' '|$'\t'|$'\n'|$'\r') rest="${rest#?}" ;; *) break ;; esac
+    done
+    num=''
+    while :; do
+      c="${rest%"${rest#?}"}"
+      case "$c" in [0-9]) num="$num$c"; rest="${rest#?}" ;; *) break ;; esac
+    done
+    # A number longer than any real uid is not this uid, and feeding it to
+    # arithmetic would abort the wrapper under `set -e` rather than answer.
+    if [ -n "$num" ] && [ "${#num}" -le 10 ] && [ "$((10#$num))" -eq "$((10#$uid))" ]; then
+      printf 'yes\n'
+      return 0
+    fi
+  done
 }
 
 rails_product_agent_id_from_account() {

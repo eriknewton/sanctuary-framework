@@ -8,13 +8,17 @@ import {
   EGRESS_GATE_DAEMON_LABEL_PREFIX,
   egressGateDaemonLabel,
   egressGateDaemonLogPaths,
+  egressGateDaemonPlistPath,
   egressGateRuntimeStatePath,
 } from "../../src/egress-gate/gate-daemon.js";
 import {
   PEER_RESOLVER_DAEMON_LABEL_PREFIX,
   peerResolverDaemonLabel,
+  peerResolverDaemonPlistPath,
 } from "../../src/egress-gate/peer-resolver-daemon.js";
 import { PF_ANCHOR_REGISTRY_PATH } from "../../src/egress-gate/anchor-registry.js";
+import { CASTLE_WALL_BOOT_LABEL, CASTLE_WALL_BOOT_PLIST_PATH } from "../../src/cli/castle-wall-boot.js";
+import { CASTLE_SIGNER_HELPER_LABEL } from "../../src/cli/castle-wall-signer-helper.js";
 import {
   GATE_ACCOUNT_NAME_PREFIX,
   deriveGateAccountName,
@@ -179,6 +183,49 @@ describe("drill-loop: product identifiers are pinned to the product's own export
     );
   });
 
+  it("pins the ALWAYS-INSTALLED host daemon labels to the product's exports", () => {
+    // The 2026-07-25 live finding. `kickstart-daemons` restarted ONLY the
+    // per-uid gate labels, which the ARM creates -- three ladder steps after
+    // the kickstart -- so on a clean host it reported a failed restart of two
+    // daemons that legitimately did not exist yet, and no iteration could
+    // begin. The daemons that DO exist on every installed host, and that
+    // therefore have to be restarted for an iteration to be measuring the dist
+    // just built, are these two. They are pinned for the same reason as the
+    // rest: if the product renames one, this goes red instead of the harness
+    // silently restarting nothing while reporting success.
+    expect(shellConst(railsSrc, "RAILS_PRODUCT_CASTLE_WALL_LABEL", "lib/rails.sh")).toBe(
+      CASTLE_WALL_BOOT_LABEL
+    );
+    expect(shellConst(railsSrc, "RAILS_PRODUCT_SIGNER_HELPER_LABEL", "lib/rails.sh")).toBe(
+      CASTLE_SIGNER_HELPER_LABEL
+    );
+    expect(
+      shellConst(assembled, "RAILS_PRODUCT_CASTLE_WALL_LABEL", "the assembled wrapper")
+    ).toBe(CASTLE_WALL_BOOT_LABEL);
+    expect(
+      shellConst(assembled, "RAILS_PRODUCT_SIGNER_HELPER_LABEL", "the assembled wrapper")
+    ).toBe(CASTLE_SIGNER_HELPER_LABEL);
+    expect(railsCompose("rails_product_host_daemon_labels")).toBe(
+      `${CASTLE_WALL_BOOT_LABEL} ${CASTLE_SIGNER_HELPER_LABEL}`
+    );
+  });
+
+  it("composes the PLIST PATH the product installs a daemon's job at", () => {
+    // The second of the two existence signals behind the absent-versus-failed
+    // distinction: a job whose plist is on disk EXISTS even when launchd has
+    // not bootstrapped it, and that state has to read as "present and it would
+    // not restart" rather than as the expected pre-arm absence.
+    expect(railsCompose("rails_product_daemon_plist_path", CASTLE_WALL_BOOT_LABEL)).toBe(
+      CASTLE_WALL_BOOT_PLIST_PATH
+    );
+    expect(
+      railsCompose("rails_product_daemon_plist_path", egressGateDaemonLabel(AGENT_UID))
+    ).toBe(egressGateDaemonPlistPath(AGENT_UID));
+    expect(
+      railsCompose("rails_product_daemon_plist_path", peerResolverDaemonLabel(AGENT_UID))
+    ).toBe(peerResolverDaemonPlistPath(AGENT_UID));
+  });
+
   it("composes the GATE LOG path the product actually writes", () => {
     // M5: the probe battery tailed `<fortress>/logs/egress-gate.log`, which
     // nothing writes. The gate daemon's stdout goes to the GATE SERVICE
@@ -270,12 +317,16 @@ describe("drill-loop: product identifiers are pinned to the product's own export
     const wrapperMain = executableLines(
       fs.readFileSync(path.join(DRILL_LOOP, "wrapper-main.sh"), "utf8")
     );
+    const launchDaemonsDir = path.dirname(CASTLE_WALL_BOOT_PLIST_PATH);
     for (const value of [
       PF_ANCHOR_NAME,
       EGRESS_GATE_DAEMON_LABEL_PREFIX,
       PEER_RESOLVER_DAEMON_LABEL_PREFIX,
       PF_ANCHOR_REGISTRY_PATH,
       GATE_ACCOUNT_HOME_BASE,
+      CASTLE_WALL_BOOT_LABEL,
+      CASTLE_SIGNER_HELPER_LABEL,
+      launchDaemonsDir,
     ]) {
       expect(
         wrapperMain,
@@ -289,6 +340,9 @@ describe("drill-loop: product identifiers are pinned to the product's own export
         EGRESS_GATE_DAEMON_LABEL_PREFIX,
         PEER_RESOLVER_DAEMON_LABEL_PREFIX,
         PF_ANCHOR_REGISTRY_PATH,
+        CASTLE_WALL_BOOT_LABEL,
+        CASTLE_SIGNER_HELPER_LABEL,
+        launchDaemonsDir,
       ]) {
         expect(
           src,

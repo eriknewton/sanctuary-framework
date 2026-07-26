@@ -1921,9 +1921,19 @@ exec /usr/bin/tail "$@"
   it("kickstart-daemons reports a FAILED restart instead of printing OK over it", () => {
     // The reviewed verb ran `launchctl kickstart ... || true` and then printed
     // `WRAPPER=OK verb=kickstart-daemons` unconditionally. The kickstart IS
-    // the verb's whole job, so its status is the verb's status. There is no
-    // Sanctuary gate daemon on a test machine, so this must fail -- and it
-    // proves the agent allowlist says YES as well as no.
+    // the verb's whole job, so its status is the verb's status. A test machine
+    // is not a provisioned drill host, so this must fail -- and it proves the
+    // agent allowlist says YES as well as no.
+    //
+    // 2026-07-25 (the first LIVE run): what it must fail FOR changed. The
+    // per-uid gate daemons are created by the ARM, three ladder steps after
+    // this verb, so their absence on a disarmed host is the EXPECTED state and
+    // must not be the reason -- that conflation is what stopped iteration 1 on
+    // Mini1. The failure here is now the always-installed HOST daemons, which
+    // a test machine either does not have or cannot restart unprivileged, and
+    // the evidence line has to keep the two apart. The four fields are
+    // asserted in `scripts/drill-loop/selftest.sh`, where launchd and the
+    // plist directory are injectable and all four outcomes can be driven.
     const r = agentWrapperRun(
       "kickstart-daemons",
       "--run-id",
@@ -1939,9 +1949,23 @@ exec /usr/bin/tail "$@"
     expect(r.status).not.toBe(0);
     expect(r.out).not.toContain("WRAPPER=OK verb=kickstart-daemons");
     expect(r.out).toContain("kickstart failed for");
-    // ...and the labels it tried are the PRODUCT's, per confined uid (H3).
-    expect(r.out).toContain(`ai.sanctuaryprotocol.egress-gate.${myUid}`);
-    expect(r.out).toContain(`ai.sanctuaryprotocol.egress-gate-peer-resolver.${myUid}`);
+    // The refusal names the ALWAYS-INSTALLED host daemons, never the per-uid
+    // gate daemons: on this machine nothing is armed, so their absence is
+    // expected and this run must be reporting something else.
+    expect(r.out).toMatch(
+      /kickstart failed for:[^(]*ai\.sanctuaryprotocol\.castle-wall\.daemon/
+    );
+    expect(r.out).not.toMatch(
+      new RegExp(`kickstart failed for:[^(]*ai\\.sanctuaryprotocol\\.egress-gate\\.${myUid}`)
+    );
+    // ...and the per-uid labels it screened are still the PRODUCT's (H3), now
+    // reported as the expected pre-arm absence rather than as a failure.
+    expect(r.out).toContain(
+      `absent_expected=ai.sanctuaryprotocol.egress-gate.${myUid},` +
+        `ai.sanctuaryprotocol.egress-gate-peer-resolver.${myUid}`
+    );
+    // The arm state that decided that is OBSERVED and NAMED, not assumed.
+    expect(r.out).toMatch(/arm_state=(armed|not-armed) arm_basis=registry-\S+/);
   });
 
   it("pf-anchor-rules refuses when pfctl could not be run at all", () => {

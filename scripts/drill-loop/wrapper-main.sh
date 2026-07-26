@@ -69,9 +69,14 @@ verbs:
                     changes is that this run's own empty disposable directory
                     exists afterwards, root-owned, like every other verb
   mint              same, said out loud, for a driver that wants only that
-  kickstart-daemons restart this agent's gate + peer-resolver daemons
-                    (needs --agent-account and --agent-uid: the product's
-                    labels are per confined uid)
+  kickstart-daemons restart every product daemon that is PRESENT: the
+                    always-installed host daemons, plus this agent's per-uid
+                    gate + peer-resolver daemons once they exist (needs
+                    --agent-account and --agent-uid: the per-uid labels are per
+                    confined uid). Reports restarted, absent-and-expected,
+                    absent-and-unexpected and restart-failed as four separate
+                    fields; a per-uid daemon's absence is expected only while
+                    the pf-anchor registry says this uid is not confined
   arm               protect --exclusive-egress against the disposable fortress
   repair            protect --repair-egress-gate (the gate-port rotation path)
   unprotect         protect --unprotect-egress-gate (teardown)
@@ -700,6 +705,94 @@ wrapper_verb_mint() {
   printf 'WRAPPER=OK verb=mint storage=%s\n' "$STORAGE"
 }
 
+# ---------------------------------------------------------------------------
+# DAEMON OBSERVATION, for `kickstart-daemons`
+# ---------------------------------------------------------------------------
+
+# One evidence field: the accumulated space-prefixed list, comma-joined, or `-`
+# when it is empty. A field that is EMPTY and a field that is ABSENT must not
+# look the same in an evidence line somebody reads at 7am.
+wrapper_daemon_field() {
+  local v="${1# }"
+  if [ -z "$v" ]; then printf -- '-'; return 0; fi
+  printf '%s' "${v// /,}"
+}
+
+# Does this daemon EXIST on this host? Two independent signals, and either one
+# is enough:
+#
+#   - launchd has the job loaded (`launchctl print` answers). This is true for
+#     an on-demand job that is not currently running, which is why it is the
+#     first question and not "is there a pid".
+#   - the product's plist for it is on disk. A plist present with no loaded job
+#     is a real state (an install that never bootstrapped), and it MUST read as
+#     "exists" so that the kickstart of it is attempted and its failure named --
+#     reading it as "not installed" is how a broken install would pass as the
+#     expected pre-arm absence.
+#
+# Deliberately NOT inferred from `launchctl kickstart`'s exit code, which is
+# non-zero both for "no such service" and for "it would not restart".
+wrapper_daemon_present() {
+  local label="$1" plist
+  if rails__sys launchctl print "system/$label" >/dev/null 2>&1; then return 0; fi
+  plist="$(rails_product_daemon_plist_path "$label")" \
+    || wrapper_die "could not compose the plist path for $label"
+  if [ -z "$plist" ]; then wrapper_die "empty plist path composed for $label"; fi
+  if [ -e "$plist" ]; then return 0; fi
+  return 1
+}
+
+# `restarted`, `restart-failed` or `absent` for one label. The caller decides
+# what an `absent` MEANS, because that depends on the label's class and on the
+# observed arm state, and this function deliberately knows neither.
+wrapper_kickstart_classify() {
+  local label="$1"
+  if ! wrapper_daemon_present "$label"; then printf 'absent\n'; return 0; fi
+  if rails__sys launchctl kickstart -k "system/$label" >/dev/null 2>&1; then
+    printf 'restarted\n'
+  else
+    printf 'restart-failed\n'
+  fi
+}
+
+# Is this uid CONFINED right now, according to the product's own record?
+#
+# Sets WRAPPER_ARM_STATE (`armed` / `not-armed`) and WRAPPER_ARM_BASIS, which
+# names WHICH observation produced the answer, so the evidence line carries the
+# reason and not just the verdict.
+#
+# There is no third value for "I could not look": a registry that exists and
+# cannot be read is a REFUSAL, because an unobserved arm state cannot decide
+# whether a missing gate daemon is the expected pre-arm state or a defect, and
+# guessing would have to guess in the direction that makes absence look fine.
+wrapper_observe_arm_state() {
+  local uid="$1" reg="$RAILS_PRODUCT_ANCHOR_REGISTRY" content rc=0 parent leaf root names
+  WRAPPER_ARM_STATE=''
+  WRAPPER_ARM_BASIS=''
+  if ! wrapper_resolve_absolute_optional_file "$reg" 'pf-anchor registry'; then
+    # No registry at all: nothing on this host is confined, so no gate daemon
+    # is owed. This is an OBSERVED answer, the same one `registry-state`
+    # reports as `state=absent`, not an assumption.
+    WRAPPER_ARM_STATE='not-armed'
+    WRAPPER_ARM_BASIS='registry-absent'
+    return 0
+  fi
+  parent="${WRAPPER_SAFE_TARGET%/*}"
+  leaf="${WRAPPER_SAFE_TARGET##*/}"
+  root="$parent"
+  content="$(wrapper_cat_safe_file_under "$root" "$leaf" 'pf-anchor registry')" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    wrapper_die "could not READ the pf-anchor registry at $reg (cat rc=$rc); the arm state of uid $uid is UNOBSERVED, and an unobserved arm state cannot say whether a missing gate daemon is expected"
+  fi
+  names="$(rails_registry_names_agent_uid "$content" "$uid")" \
+    || wrapper_die "could not probe the pf-anchor registry for uid $uid"
+  case "$names" in
+    yes) WRAPPER_ARM_STATE='armed';     WRAPPER_ARM_BASIS='registry-names-uid' ;;
+    no)  WRAPPER_ARM_STATE='not-armed'; WRAPPER_ARM_BASIS='registry-silent-on-uid' ;;
+    *)   wrapper_die "unrecognised registry probe answer '$names' for uid $uid" ;;
+  esac
+}
+
 # The reviewed build ran `launchctl kickstart ... || true` and then printed
 # WRAPPER=OK unconditionally, which made a failed restart read as a success.
 # The kickstart IS this verb's entire job, so its status IS the verb's status.
@@ -712,23 +805,98 @@ wrapper_verb_mint() {
 # iteration and a failed kickstart is (correctly) fatal, the loop as shipped
 # could not complete a single iteration. The labels now come from
 # `rails_product_daemon_labels`, which is pinned to the product's exports.
+#
+# 2026-07-25, THE FIRST LIVE SUPERVISED RUN (Mini1): the verb still could not
+# let iteration 1 begin, for a reason no amount of correcting strings reaches.
+# It restarted the two PER-UID gate labels and nothing else, and it read a
+# non-zero `launchctl kickstart` as one thing: a failed restart. On a clean,
+# disarmed host those two daemons DO NOT EXIST YET -- the arm creates them, and
+# the arm is step 3 of the ladder this verb is step 0 of -- so the loop refused
+# to start for the state it is designed to start from, reporting
+# `(restarted: none)`, which is equally what a total restart failure looks like.
+#
+# THREE STATES, NOT TWO, AND ALL THREE OBSERVED:
+#
+#   restarted        the daemon was seen to exist and `kickstart -k` succeeded.
+#   absent-expected  the daemon was seen NOT to exist, and its class says
+#                    absence is the expected state right now.
+#   absent-unexpected / restart-failed
+#                    the two failures, kept apart in the evidence because they
+#                    need different mornings: one means "the thing that should
+#                    be here is not", the other means "it is here and it would
+#                    not restart".
+#
+# EXISTENCE IS OBSERVED, NEVER INFERRED FROM THE RESTART'S EXIT CODE. That
+# inference is the whole defect: `launchctl kickstart` exits non-zero for
+# "no such service" and for "the service refused to restart" alike.
+#
+# WHAT MAKES ABSENCE EXPECTED IS ALSO OBSERVED. It is not the iteration number
+# and not the step index -- both of those would go stale the first time the
+# ladder re-kickstarts after arming, and would make this verb permanently blind
+# to a gate daemon that SHOULD exist by then. It is the product's own
+# root-owned pf-anchor registry: if that registry names this uid, the uid is
+# confined and its gate daemons must be there. A registry that exists and
+# cannot be READ is neither answer, and gets neither: the verb refuses, because
+# an unobserved arm state cannot decide whether an absence is expected.
 wrapper_verb_kickstart_daemons() {
   wrapper_require_agent
-  local labels label failed='' restarted=''
-  labels="$(rails_product_daemon_labels "$AGENT_UID")" \
+  local host_labels gate_labels label klass
+  local restarted='' absent_expected='' absent_unexpected='' restart_failed=''
+
+  wrapper_observe_arm_state "$AGENT_UID"
+
+  host_labels="$(rails_product_host_daemon_labels)" \
+    || wrapper_die 'could not compose the product host daemon labels'
+  if [ -z "$host_labels" ]; then wrapper_die 'empty host daemon label list after the rail'; fi
+  gate_labels="$(rails_product_daemon_labels "$AGENT_UID")" \
     || wrapper_die "could not compose the product daemon labels for uid $AGENT_UID"
-  if [ -z "$labels" ]; then wrapper_die 'empty daemon label list after the rail'; fi
-  for label in $labels; do
-    if rails__sys launchctl kickstart -k "system/$label" >/dev/null 2>&1; then
-      restarted="$restarted $label"
-    else
-      failed="$failed $label"
-    fi
+  if [ -z "$gate_labels" ]; then wrapper_die 'empty per-uid daemon label list after the rail'; fi
+
+  # The host daemons are installed by the product and do not depend on any arm,
+  # so there is no state of this host in which their absence is expected. An
+  # iteration that ran without them would measure code nobody restarted.
+  for label in $host_labels; do
+    klass="$(wrapper_kickstart_classify "$label")" \
+      || wrapper_die "could not classify the host daemon $label"
+    case "$klass" in
+      restarted)      restarted="$restarted $label" ;;
+      restart-failed) restart_failed="$restart_failed $label" ;;
+      absent)         absent_unexpected="$absent_unexpected $label" ;;
+      *)              wrapper_die "unrecognised daemon classification '$klass' for $label" ;;
+    esac
   done
-  if [ -n "$failed" ]; then
-    wrapper_die "kickstart failed for:$failed (restarted:${restarted:- none})"
+
+  # The per-uid gate daemons exist only while this uid is armed. Note that the
+  # arm state governs ONLY what an ABSENCE means: a gate daemon that is present
+  # is restarted, and its restart failure is fatal, armed or not.
+  for label in $gate_labels; do
+    klass="$(wrapper_kickstart_classify "$label")" \
+      || wrapper_die "could not classify the gate daemon $label"
+    case "$klass" in
+      restarted)      restarted="$restarted $label" ;;
+      restart-failed) restart_failed="$restart_failed $label" ;;
+      absent)
+        if [ "$WRAPPER_ARM_STATE" = 'armed' ]; then
+          absent_unexpected="$absent_unexpected $label"
+        else
+          absent_expected="$absent_expected $label"
+        fi ;;
+      *)              wrapper_die "unrecognised daemon classification '$klass' for $label" ;;
+    esac
+  done
+
+  if [ -n "$restart_failed" ] || [ -n "$absent_unexpected" ]; then
+    # The leading token stays `kickstart failed for:` so the one thing a
+    # morning reader greps for has not moved, and the three-way breakdown
+    # follows it: today's `(restarted: none)` was ambiguous between "everything
+    # failed to restart", "nothing was there" and "nothing was there and that
+    # was fine".
+    wrapper_die "kickstart failed for:$restart_failed$absent_unexpected (arm_state=$WRAPPER_ARM_STATE arm_basis=$WRAPPER_ARM_BASIS restarted=$(wrapper_daemon_field "$restarted") absent_expected=$(wrapper_daemon_field "$absent_expected") absent_unexpected=$(wrapper_daemon_field "$absent_unexpected") restart_failed=$(wrapper_daemon_field "$restart_failed"))"
   fi
-  printf 'WRAPPER=OK verb=kickstart-daemons restarted=%s\n' "${restarted# }"
+  printf 'WRAPPER=OK verb=kickstart-daemons arm_state=%s arm_basis=%s restarted=%s absent_expected=%s absent_unexpected=%s restart_failed=%s\n' \
+    "$WRAPPER_ARM_STATE" "$WRAPPER_ARM_BASIS" \
+    "$(wrapper_daemon_field "$restarted")" "$(wrapper_daemon_field "$absent_expected")" \
+    "$(wrapper_daemon_field "$absent_unexpected")" "$(wrapper_daemon_field "$restart_failed")"
 }
 
 wrapper_verb_arm() {

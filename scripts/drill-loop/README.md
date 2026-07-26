@@ -283,6 +283,41 @@ and names which one it was. That is the 2026-06-24 "claimed all drills dry"
 failure, and the whole point of automating drills is that it must not be
 automated too.
 
+### Step 0: absent is not the same as failed
+
+The first live supervised run (Mini1, 2026-07-25) never reached step 1. Step 0
+restarts the product's daemons so the iteration measures the dist that was just
+built, and it restarted only the **per-uid gate daemons** -- which the *arm*
+creates, three steps later in the same ladder. On a clean, disarmed host they
+legitimately do not exist, `launchctl kickstart` exits non-zero for a service
+that is not there, and the verb reported `(restarted: none)`: exactly what a
+total restart failure also looks like. No iteration could ever begin.
+
+The verb now reports four states, all observed:
+
+```
+WRAPPER=OK verb=kickstart-daemons arm_state=not-armed arm_basis=registry-absent \
+  restarted=<labels> absent_expected=<labels> absent_unexpected=- restart_failed=-
+```
+
+* `restarted` -- the daemon was **seen** to exist (launchd has the job, or its
+  plist is on disk) and `kickstart -k` succeeded.
+* `absent_expected` -- seen not to exist, and absence is the expected state for
+  its class right now. Not a failure.
+* `absent_unexpected` / `restart_failed` -- the two failures, kept apart because
+  they need different mornings. Either one is fatal to the iteration, and the
+  refusal still leads with `kickstart failed for:`.
+
+Existence is never inferred from the restart's exit code, and what makes an
+absence expected is never an iteration number or a step index. The
+always-installed host daemons (Castle Wall's boot daemon and signer helper) may
+never be absent. A per-uid gate daemon may be absent only while the product's
+own root-owned pf-anchor registry says this uid is not confined; once the
+registry names it, absence is a failure, so arming does not buy the harness
+blindness. A registry that exists and cannot be read is neither answer and gets
+neither: the verb refuses, because an unobserved arm state cannot decide whether
+an absence is expected.
+
 ### Output
 
 Per iteration: an evidence bundle (console, gate state, audit excerpts, timings)

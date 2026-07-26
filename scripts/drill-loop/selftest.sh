@@ -402,6 +402,48 @@ expect_accept 'hh:mm:ss'     'seconds=3725'  -- "$PROBE" etime '01:02:05'
 expect_accept 'dd-hh:mm:ss'  'seconds=93784' -- "$PROBE" etime '1-02:03:04'
 expect_reject 'garbage etime' 'unparseable'  -- "$PROBE" etime 'soon'
 
+printf '== the arm-state probe: is THIS uid confined, according to the product ==\n'
+#
+# 2026-07-25, the first live supervised run. `kickstart-daemons` treated the
+# per-uid gate daemons' expected PRE-ARM absence as a failed restart, so
+# iteration 1 could never start on the only kind of host the loop is ever
+# started from. What separates "absent and expected" from "absent and wrong" is
+# whether the product's own root-owned registry names this uid, and this is
+# that decision, driven as a pure function.
+#
+# `no` is the FAIL-OPEN answer: it is the one that makes a missing gate daemon
+# look expected. So the cases below lean on every shape that could return `no`
+# by accident -- pretty-printed JSON, a uid that is a PREFIX of the one asked
+# about, a second entry after the first -- rather than only on the happy path.
+expect_accept 'no registry content names nothing' 'registry-names-uid=no' \
+  -- "$PROBE" registry-names-uid '' '503'
+expect_accept 'an empty committed set names nothing' 'registry-names-uid=no' \
+  -- "$PROBE" registry-names-uid '{"version":1,"committed":[]}' '503'
+expect_accept 'a committed entry for this uid is ARMED' 'registry-names-uid=yes' \
+  -- "$PROBE" registry-names-uid '{"version":1,"committed":[{"agent_uid":503,"gate_port":49317}]}' '503'
+expect_accept 'a committed entry for ANOTHER uid is not this uid' 'registry-names-uid=no' \
+  -- "$PROBE" registry-names-uid '{"version":1,"committed":[{"agent_uid":504,"gate_port":49317}]}' '503'
+expect_accept 'this uid found behind another entry' 'registry-names-uid=yes' \
+  -- "$PROBE" registry-names-uid '{"committed":[{"agent_uid":600},{"agent_uid":503}]}' '503'
+expect_accept 'a PRETTY-PRINTED registry still names the uid' 'registry-names-uid=yes' \
+  -- "$PROBE" registry-names-uid '{ "agent_uid" : 503 }' '503'
+expect_accept 'a uid this one is a PREFIX of is not a match' 'registry-names-uid=no' \
+  -- "$PROBE" registry-names-uid '{"committed":[{"agent_uid":5031}]}' '503'
+expect_accept 'an absurd number is not this uid, and does not abort the probe' 'registry-names-uid=no' \
+  -- "$PROBE" registry-names-uid '{"committed":[{"agent_uid":999999999999999999999}]}' '503'
+expect_accept 'the key without a value is not a match' 'registry-names-uid=no' \
+  -- "$PROBE" registry-names-uid '{"agent_uid"}' '503'
+expect_reject 'uid 0 is refused rather than probed for' 'refusing' \
+  -- "$PROBE" registry-names-uid '{"committed":[{"agent_uid":0}]}' '0'
+expect_reject 'a non-numeric uid is refused' 'not a plain non-negative integer' \
+  -- "$PROBE" registry-names-uid '{}' '5o3'
+# ...and the plist path the existence probe asks about is composed, once.
+expect_accept 'the daemon plist path is composed from the one constant' \
+  'daemon-plist-path=/Library/LaunchDaemons/ai.sanctuaryprotocol.castle-wall.daemon.plist' \
+  -- "$PROBE" daemon-plist-path 'ai.sanctuaryprotocol.castle-wall.daemon'
+expect_reject 'a label that could escape the plist directory is refused' 'cannot compose a safe plist path' \
+  -- "$PROBE" daemon-plist-path '../../etc/passwd'
+
 printf '== host rail: the decision is a HARDWARE FINGERPRINT ==\n'
 #
 # A live audit of the real machines (2026-07-25) measured the intended drill
@@ -671,7 +713,7 @@ LOCAL_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_local" 2>/de
 # actually runs as root.
 compose_wrapper() {
   "$HERE/build-wrapper.sh" --stdout \
-    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" -v bins="${4:-}" -v runtime="${5:-}" '
+    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" -v bins="${4:-}" -v runtime="${5:-}" -v plists="${6:-}" -v registry="${7:-}" '
         $0 == "wrapper_main \"$@\"" {
           print "RAILS_HOST_ALLOW_FP=\047" fp "\047"
           print "RAILS_HOST_DENY_FP=\047\047"
@@ -681,6 +723,8 @@ compose_wrapper() {
           print "RAILS_PRODUCT_GATE_HOME_BASE=\047" gatebase "\047"
           if (bins != "") print "RAILS_SYSTEM_BIN_DIRS=\047" bins "\047"
           if (runtime != "") print "RAILS_PRODUCT_GATE_RUNTIME_DIR=\047" runtime "\047"
+          if (plists != "") print "RAILS_PRODUCT_LAUNCHDAEMONS_DIR=\047" plists "\047"
+          if (registry != "") print "RAILS_PRODUCT_ANCHOR_REGISTRY=\047" registry "\047"
         }
         { print }
       ' > "$1"
@@ -1242,6 +1286,223 @@ printf 'SAFE-GATE-LOG peer=%s\n' "$(id -u)" > "$ATTACK_LOG"
 expect_reject 'an allowlisted agent account passes the agent rail and dies later' 'kickstart failed for' \
   -- "$TEST_WRAPPER_AGENT" kickstart-daemons --run-id 'good1' --operator-account "$ME" \
      --agent-account "$ME" --agent-uid "$(id -u)"
+
+printf '== kickstart-daemons: ABSENT-BEFORE-ARM is not a failed restart ==\n'
+#
+# THE FIRST LIVE SUPERVISED RUN (Mini1, 2026-07-25) stopped at step 0 of
+# iteration 1 on a host where nothing was wrong:
+#
+#   WRAPPER=REJECT reason=kickstart failed for: ai.sanctuaryprotocol.egress-gate.503
+#     ai.sanctuaryprotocol.egress-gate-peer-resolver.503 (restarted: none)
+#
+# Those are the PER-UID gate daemons, and the ARM creates them -- three steps
+# LATER in the same ladder. So on a clean, disarmed host they legitimately do
+# not exist, the verb read `launchctl kickstart`'s non-zero exit as a failed
+# restart, and no iteration could ever begin. `(restarted: none)` was equally
+# what a total restart failure and a nothing-to-restart host look like.
+#
+# Four cases, because the verb now has four outcomes and every one of them has
+# a way of being wrong:
+#
+#   A  absent BEFORE the arm      accepted, and named as expected
+#   B  present                    restarted, whatever the arm state
+#   C  present and will not restart   still a hard FAIL, unchanged
+#   D  absent AFTER the arm       a FAIL, so the fix is not blindness
+#
+# ANTI-VACUITY IS ON THE FIXTURE, not on the verdict: each case asserts that
+# the launchctl stub was actually ASKED (its log) and that the plists it screens
+# are actually in the state the case claims. A verdict alone cannot tell a
+# wrapper that looked from a wrapper that guessed, which is the entire subject.
+KICKBIN="$SANDBOX/kickbin"
+mkdir -p "$KICKBIN"
+cat > "$KICKBIN/launchctl" <<'KICKSTUB'
+#!/bin/bash
+# TEST-ONLY launchctl. `print` answers ONLY for labels in
+# DRILL_TEST_LAUNCHD_LOADED; `kickstart` fails for labels in
+# DRILL_TEST_LAUNCHD_KICK_FAIL. Every invocation is logged, so a case can prove
+# the wrapper asked the question rather than inferred the answer.
+verb="$1"
+target=''
+for a in "$@"; do case "$a" in system/*) target="${a#system/}" ;; esac; done
+if [ -n "${DRILL_TEST_LAUNCHD_LOG:-}" ]; then
+  printf '%s %s\n' "$verb" "$target" >> "$DRILL_TEST_LAUNCHD_LOG"
+fi
+case "$verb" in
+  print)
+    case " ${DRILL_TEST_LAUNCHD_LOADED:-} " in
+      *" $target "*) printf 'state = running\n'; exit 0 ;;
+    esac
+    printf 'Could not find service "%s"\n' "$target" >&2
+    exit 113 ;;
+  kickstart)
+    case " ${DRILL_TEST_LAUNCHD_KICK_FAIL:-} " in
+      *" $target "*) printf 'Could not kickstart service "%s"\n' "$target" >&2; exit 5 ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+KICKSTUB
+chmod +x "$KICKBIN/launchctl"
+
+KICK_PLISTS="$SANDBOX/launchdaemons"
+KICK_REGDIR="$SANDBOX/kick-registry"
+mkdir -p "$KICK_PLISTS" "$KICK_REGDIR"
+KICK_REG="$KICK_REGDIR/egress-anchor-registry.json"
+KICK_LOG="$SANDBOX/kick-launchctl.log"
+TEST_WRAPPER_KICK="$SANDBOX/test-wrapper-kickstart"
+compose_wrapper "$TEST_WRAPPER_KICK" "$ME" '' \
+  "$KICKBIN /usr/bin /bin /usr/sbin /sbin" '' "$KICK_PLISTS" "$KICK_REG"
+
+KICK_UID="$(id -u)"
+# COMPOSED, never re-spelled: a second declaration site for a product label is
+# how four of them drifted at once in round 3.
+KICK_HOSTS="$(bash -c ". '$HERE/lib/rails.sh'; rails_product_host_daemon_labels")"
+KICK_GATES="$(bash -c ". '$HERE/lib/rails.sh'; rails_product_daemon_labels '$KICK_UID'")"
+KICK_HOST_A="${KICK_HOSTS%% *}"
+KICK_HOST_B="${KICK_HOSTS##* }"
+KICK_GATE="${KICK_GATES%% *}"
+KICK_PEER="${KICK_GATES##* }"
+
+kick_plant_plists() {
+  rm -f "$KICK_PLISTS"/*.plist
+  local l
+  for l in "$@"; do printf '<plist/>\n' > "$KICK_PLISTS/$l.plist"; done
+}
+kick_registry_naming() {
+  # $1 empty -> no registry file at all (nothing on this host is confined)
+  if [ -z "${1:-}" ]; then rm -f "$KICK_REG"; return 0; fi
+  printf '{"version":1,"committed":[{"agent_uid":%s,"gate_port":49317,"fortress_path":"/private/var/sanctuary-drill/x"}]}' "$1" > "$KICK_REG"
+}
+run_kickstart() {
+  # run_kickstart <loaded labels> <kickstart-failing labels>
+  : > "$KICK_LOG"
+  DRILL_TEST_LAUNCHD_LOG="$KICK_LOG" \
+  DRILL_TEST_LAUNCHD_LOADED="${1:-}" \
+  DRILL_TEST_LAUNCHD_KICK_FAIL="${2:-}" \
+  "$TEST_WRAPPER_KICK" kickstart-daemons --run-id 'good1' --operator-account "$ME" \
+    --agent-account "$ME" --agent-uid "$KICK_UID" 2>&1
+}
+kick_log_has() { grep -qxF "$1" "$KICK_LOG"; }
+
+# --- A: absent BEFORE the arm is the expected state, not a failure ---------
+kick_plant_plists "$KICK_HOST_A" "$KICK_HOST_B"
+kick_registry_naming ''
+set +e   # declared exception
+kick_out="$(run_kickstart "$KICK_HOST_A $KICK_HOST_B" '')"; kick_rc=$?
+set -e
+if [ -e "$KICK_PLISTS/$KICK_GATE.plist" ] || [ -e "$KICK_PLISTS/$KICK_PEER.plist" ] \
+   || [ -e "$KICK_REG" ] || ! kick_log_has "print $KICK_GATE"; then
+  printf 'FAIL  anti-vacuity: the pre-arm fixture was not pre-arm, or the wrapper never LOOKED for the gate daemon\n'
+  note "log: $(cat "$KICK_LOG" 2>/dev/null || true)"
+  FAIL=$((FAIL + 1))
+else
+  case "$kick_out" in
+    *'arm_state=not-armed arm_basis=registry-absent'*"restarted=$KICK_HOST_A,$KICK_HOST_B"*"absent_expected=$KICK_GATE,$KICK_PEER"*'absent_unexpected=- restart_failed=-'*)
+      if [ "$kick_rc" -eq 0 ] && kick_log_has "kickstart $KICK_HOST_A" && kick_log_has "kickstart $KICK_HOST_B"; then
+        printf 'ok    a per-uid gate daemon that does not exist YET is absent-and-expected, and the host daemons still restart\n'
+        PASS=$((PASS + 1))
+      else
+        printf 'FAIL  the pre-arm verdict was right but the host daemons were not actually restarted (rc=%s)\n' "$kick_rc"
+        note "log: $(cat "$KICK_LOG" 2>/dev/null || true)"; FAIL=$((FAIL + 1))
+      fi ;;
+    *'kickstart failed for'*)
+      printf 'FAIL  *** a clean pre-arm host STILL cannot start iteration 1: absence read as a failed restart ***\n'
+      note "output: $kick_out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      printf 'FAIL  kickstart produced no recognizable three-way verdict on a pre-arm host\n'
+      note "output: $kick_out"; FAIL=$((FAIL + 1)) ;;
+  esac
+fi
+
+# --- B: a daemon that EXISTS is restarted, and existence is OBSERVED -------
+# The gate plists are on disk but NOT loaded in launchd, so the plist limb of
+# the existence probe is the one that has to answer. A probe that only asked
+# `launchctl print` would call these absent and, being armed, FAIL.
+kick_plant_plists "$KICK_HOST_A" "$KICK_HOST_B" "$KICK_GATE" "$KICK_PEER"
+kick_registry_naming "$KICK_UID"
+set +e   # declared exception
+kick_out="$(run_kickstart "$KICK_HOST_A $KICK_HOST_B" '')"; kick_rc=$?
+set -e
+if [ ! -e "$KICK_PLISTS/$KICK_GATE.plist" ] || [ ! -s "$KICK_REG" ]; then
+  printf 'FAIL  anti-vacuity: the armed fixture was never planted\n'; FAIL=$((FAIL + 1))
+elif kick_log_has "kickstart $KICK_GATE" && kick_log_has "kickstart $KICK_PEER" \
+     && kick_log_has "kickstart $KICK_HOST_A" && kick_log_has "kickstart $KICK_HOST_B"; then
+  case "$kick_out" in
+    *'arm_state=armed arm_basis=registry-names-uid'*"restarted=$KICK_HOST_A,$KICK_HOST_B,$KICK_GATE,$KICK_PEER"*'absent_expected=- absent_unexpected=- restart_failed=-'*)
+      if [ "$kick_rc" -eq 0 ]; then
+        printf 'ok    every daemon that EXISTS is restarted, plist-present counts as existing\n'
+        PASS=$((PASS + 1))
+      else
+        printf 'FAIL  every daemon restarted but the verb exited %s\n' "$kick_rc"
+        note "output: $kick_out"; FAIL=$((FAIL + 1))
+      fi ;;
+    *)
+      printf 'FAIL  a present-and-restarted host did not produce the all-restarted verdict\n'
+      note "output: $kick_out"; FAIL=$((FAIL + 1)) ;;
+  esac
+else
+  printf 'FAIL  anti-vacuity: the wrapper never asked launchctl to restart the planted daemons\n'
+  note "log: $(cat "$KICK_LOG" 2>/dev/null || true)"; FAIL=$((FAIL + 1))
+fi
+
+# --- C: a PRESENT daemon that will not restart is still a hard FAIL --------
+# The registry is silent on this uid here, so the case also proves the arm
+# state governs only what an ABSENCE means: a gate daemon that is present is
+# restarted, and its failure is fatal, armed or not.
+kick_plant_plists "$KICK_HOST_A" "$KICK_HOST_B" "$KICK_GATE" "$KICK_PEER"
+kick_registry_naming "$((KICK_UID + 1))"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+kick_out="$(run_kickstart "$KICK_HOST_A $KICK_HOST_B" "$KICK_GATE")"; kick_rc=$?
+set -e
+if ! kick_log_has "kickstart $KICK_GATE"; then
+  printf 'FAIL  anti-vacuity: the failing restart was never attempted\n'
+  note "log: $(cat "$KICK_LOG" 2>/dev/null || true)"; FAIL=$((FAIL + 1))
+else
+  case "$kick_out" in
+    *"kickstart failed for: $KICK_GATE"*"restart_failed=$KICK_GATE"*)
+      if [ "$kick_rc" -ne 0 ]; then
+        printf 'ok    a PRESENT daemon that will not restart is still fatal, and named as restart_failed\n'
+        PASS=$((PASS + 1))
+      else
+        printf 'FAIL  a daemon refused to restart and the verb exited 0\n'
+        note "output: $kick_out"; FAIL=$((FAIL + 1))
+      fi ;;
+    *'WRAPPER=OK verb=kickstart-daemons'*)
+      printf 'FAIL  *** a failed restart printed OK over itself ***\n'
+      note "output: $kick_out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      printf 'FAIL  a failed restart produced no recognizable refusal\n'
+      note "output: $kick_out"; FAIL=$((FAIL + 1)) ;;
+  esac
+fi
+
+# --- D: absent AFTER the arm is a FAILURE, so this is not blindness --------
+kick_plant_plists "$KICK_HOST_A" "$KICK_HOST_B"
+kick_registry_naming "$KICK_UID"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+kick_out="$(run_kickstart "$KICK_HOST_A $KICK_HOST_B" '')"; kick_rc=$?
+set -e
+if [ ! -s "$KICK_REG" ] || [ -e "$KICK_PLISTS/$KICK_GATE.plist" ]; then
+  printf 'FAIL  anti-vacuity: the armed-but-absent fixture was never planted\n'; FAIL=$((FAIL + 1))
+else
+  case "$kick_out" in
+    *"kickstart failed for: $KICK_GATE $KICK_PEER"*"absent_unexpected=$KICK_GATE,$KICK_PEER"*)
+      if [ "$kick_rc" -ne 0 ]; then
+        printf 'ok    a gate daemon missing while the registry says this uid is CONFINED is a failure, not an expected absence\n'
+        PASS=$((PASS + 1))
+      else
+        printf 'FAIL  an armed uid with no gate daemon exited 0\n'
+        note "output: $kick_out"; FAIL=$((FAIL + 1))
+      fi ;;
+    *'WRAPPER=OK verb=kickstart-daemons'*)
+      printf 'FAIL  *** the harness is BLIND: a gate daemon that should exist by now read as expected-absent ***\n'
+      note "output: $kick_out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      printf 'FAIL  an armed-but-absent gate daemon produced no recognizable refusal\n'
+      note "output: $kick_out"; FAIL=$((FAIL + 1)) ;;
+  esac
+fi
+rm -f "$KICK_PLISTS"/*.plist "$KICK_REG"
 # Every verb refuses a bad run id before doing anything at all.
 for v in mint clean-markers gate-state kickstart-daemons repair unprotect retire \
          pf-anchor-rules registry-state fortress-state gate-log gate-port; do
@@ -1398,7 +1659,23 @@ for a in "${args[@]}"; do
         if read -r answer; then printf '\nARM_ANSWER=%s\n' "$answer"; else printf '\nARM_ANSWER=<eof>\n'; fi
       fi
       exit "${STUB_ARM_RC:-0}" ;;
-    kickstart-daemons)       exit "${STUB_KICKSTART_RC:-0}" ;;
+    kickstart-daemons)
+      # The verb answers in FOUR fields plus the observed arm state that
+      # decided which absences were expected, and run-loop.sh records them
+      # verbatim. `STUB_KICKSTART_SILENT` reproduces the one remaining way a
+      # zero exit can still be untrustworthy: a run that exited 0 without ever
+      # printing its own verdict.
+      if [ "${STUB_KICKSTART_RC:-0}" -ne 0 ]; then
+        printf 'WRAPPER=REJECT reason=kickstart failed for: stub-gate-daemon (arm_state=armed arm_basis=registry-names-uid restarted=stub-host-daemon absent_expected=- absent_unexpected=stub-gate-daemon restart_failed=-)\n'
+        exit "$STUB_KICKSTART_RC"
+      fi
+      if [ -z "${STUB_KICKSTART_SILENT:-}" ]; then
+        printf 'WRAPPER=OK verb=kickstart-daemons arm_state=%s arm_basis=%s restarted=stub-host-daemon absent_expected=%s absent_unexpected=- restart_failed=-\n' \
+          "${STUB_KICKSTART_ARM_STATE:-not-armed}" \
+          "${STUB_KICKSTART_ARM_BASIS:-registry-absent}" \
+          "${STUB_KICKSTART_ABSENT_EXPECTED:-stub-gate-daemon}"
+      fi
+      exit 0 ;;
     mint)                    exit "${STUB_MINT_RC:-0}" ;;
     retire)                  exit "${STUB_RETIRE_RC:-0}" ;;
     unprotect|clean-markers) exit "${STUB_WRAPPER_RC:-0}" ;;
@@ -1901,6 +2178,51 @@ case "$(cat "$KICK_SUDO_LOG" 2>/dev/null || true):$kick_findings:$out" in
     printf 'FAIL  *** a kickstart failure did not run and record retire ***\n'
     note "sudo log: $(cat "$KICK_SUDO_LOG" 2>/dev/null || true)"
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# The loop must record what the verb SAID, not what the loop hoped. Before the
+# 2026-07-25 live finding this step's PASS text was the fixed string 'gate and
+# resolver daemons restarted on the current dist' -- which was a claim about
+# two daemons that, on the host it was written for, did not exist.
+KICKOK_LOOP="$SANDBOX/loop-kickstart-ok"
+KICKOK_SUDO_LOG="$SANDBOX/loop-kickstart-ok-sudo.log"
+set +e   # declared exception: preflight still fails on a non-drill host
+out="$(run_loop_once "$KICKOK_LOOP" "$KICKOK_SUDO_LOG" '' '' '')"; rc=$?
+set -e
+kickok_findings="$(cat "$KICKOK_LOOP/evidence/FINDINGS.jsonl" 2>/dev/null || true)"
+case "$kickok_findings" in
+  *'"step":"kickstart","result":"PASS"'*'arm_state=not-armed'*'absent_expected=stub-gate-daemon'*)
+    printf 'ok    the kickstart finding carries the verb OWN four-field account, absent-expected included\n'
+    PASS=$((PASS + 1)) ;;
+  *'"step":"kickstart","result":"PASS"'*)
+    printf 'FAIL  *** the kickstart PASS said more than the verb did: no restarted/absent breakdown ***\n'
+    note "findings: $kickok_findings"; FAIL=$((FAIL + 1)) ;;
+  *)
+    printf 'FAIL  a successful kickstart produced no PASS finding\n'
+    note "findings: $kickok_findings"; FAIL=$((FAIL + 1)) ;;
+esac
+
+# A zero exit with no verdict line is the same shape as an OK dump that observed
+# nothing: it must not be read as a successful restart.
+KICKSILENT_LOOP="$SANDBOX/loop-kickstart-silent"
+mkdir -p "$KICKSILENT_LOOP/home"
+set +e   # declared exception
+out="$(STUB_KICKSTART_SILENT=yes "$HARNESS/drivers/run-loop.sh" --mode sweep --iterations 1 \
+  --operator-account "$ME" --agent-account "$ME" --agent-uid "$(id -u)" \
+  --evidence-root "$KICKSILENT_LOOP/evidence" --build-sha test-sha \
+  --home "$KICKSILENT_LOOP/home" 2>&1)"; rc=$?
+set -e
+silent_findings="$(cat "$KICKSILENT_LOOP/evidence/FINDINGS.jsonl" 2>/dev/null || true)"
+case "$silent_findings" in
+  *'"step":"kickstart","result":"FAIL"'*'without its verdict line'*)
+    printf 'ok    a kickstart that exited 0 without saying what it restarted is not a PASS\n'
+    PASS=$((PASS + 1)) ;;
+  *'"step":"kickstart","result":"PASS"'*)
+    printf 'FAIL  *** a silent zero exit was recorded as daemons restarted ***\n'
+    note "findings: $silent_findings"; FAIL=$((FAIL + 1)) ;;
+  *)
+    printf 'FAIL  a silent kickstart produced no recognizable finding\n'
+    note "findings: $silent_findings"; FAIL=$((FAIL + 1)) ;;
 esac
 
 PREFLIGHT_LOOP="$SANDBOX/loop-preflight"

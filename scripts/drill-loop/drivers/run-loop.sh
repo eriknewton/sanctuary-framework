@@ -219,6 +219,28 @@ probe_summary() {
   if [ -n "$line" ]; then printf '%s' "$line"; else printf 'the probe battery produced no SUMMARY line'; fi
 }
 
+# THE KICKSTART VERB'S OWN ACCOUNT OF WHAT IT DID, verbatim, for the same
+# reason `probe_summary` exists: this loop must never describe a step as more
+# than the step said it was. The wrapper answers in four fields (restarted,
+# absent_expected, absent_unexpected, restart_failed) plus the OBSERVED arm
+# state that decided which absences were expected; all of it goes into the
+# finding so the three outcomes are distinguishable in the morning.
+#
+# On the refusal path there is no `WRAPPER=OK` line -- the verb died -- so the
+# REJECT reason carries the same breakdown and is read instead. Pure shell, no
+# external command: a `grep`/`tail` here would be the round-3 BLOCKER-1 shape.
+kickstart_summary() {
+  local log="$1" ok='' reject='' line
+  [ -f "$log" ] || { printf ''; return 0; }
+  while IFS= read -r line; do
+    case "$line" in
+      'WRAPPER=OK verb=kickstart-daemons '*) ok="${line#WRAPPER=OK verb=kickstart-daemons }" ;;
+      'WRAPPER=REJECT reason=kickstart failed for:'*) reject="${line#WRAPPER=REJECT reason=}" ;;
+    esac
+  done < "$log"
+  if [ -n "$ok" ]; then printf '%s' "$ok"; else printf '%s' "$reject"; fi
+}
+
 # THE RESULT OF A PROBE RUN. The fold itself lives in lib/rails.sh as
 # `rails_probe_result`, a pure function driven exhaustively by both batteries;
 # see the long note there for why a skipped probe can never become a PASS.
@@ -288,14 +310,29 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   # so the labels could not have been fixed from here even with the right
   # prefix. A failed kickstart is (correctly) fatal to the iteration, so the
   # loop as shipped could not complete a single iteration on any host.
-  if "$SUDO" -n "$INSTALLED_WRAPPER" kickstart-daemons \
+  #
+  # 2026-07-25, the first LIVE run: it still could not, because the verb read
+  # the per-uid gate daemons' expected pre-arm ABSENCE as a failed restart. The
+  # wrapper now answers in four fields and this finding carries them verbatim,
+  # so a morning reader can tell "restarted", "absent and expected" and "failed"
+  # apart. `(restarted: none)` told them none of the three.
+  KICK_RC=0
+  "$SUDO" -n "$INSTALLED_WRAPPER" kickstart-daemons \
        --run-id "$RUN_ID" --operator-account "$OPERATOR" \
        --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
-       > "$IEV/kickstart.log" 2>&1
-  then
-    emit_finding "$ITER" kickstart PASS '' 'gate and resolver daemons restarted on the current dist' "$IEV/kickstart.log"
+       > "$IEV/kickstart.log" 2>&1 || KICK_RC=$?
+  KICK_SUMMARY="$(kickstart_summary "$IEV/kickstart.log")"
+  if [ "$KICK_RC" -eq 0 ] && [ -n "$KICK_SUMMARY" ]; then
+    emit_finding "$ITER" kickstart PASS '' "every daemon that exists is on the dist under test: $KICK_SUMMARY" "$IEV/kickstart.log"
   else
-    emit_finding "$ITER" kickstart FAIL '' 'a daemon did not restart; the iteration would measure stale or absent code' "$IEV/kickstart.log"
+    if [ "$KICK_RC" -eq 0 ]; then
+      # Exited 0 without its own verdict line. The same shape as an OK dump
+      # that observed nothing: it must not be read as a successful restart.
+      kick_detail='kickstart exited 0 without its verdict line; what it restarted cannot be trusted'
+    else
+      kick_detail="a daemon that EXISTS did not restart, or one that should exist by now is absent; the iteration would measure stale or absent code${KICK_SUMMARY:+ ($KICK_SUMMARY)}"
+    fi
+    emit_finding "$ITER" kickstart FAIL '' "$kick_detail" "$IEV/kickstart.log"
     TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
     TAINT='kickstart'
     if ! retire_iteration "$ITER" "$RUN_ID" "$IEV" "$TAINT" 'kickstart-failure'; then

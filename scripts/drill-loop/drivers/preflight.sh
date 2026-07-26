@@ -201,7 +201,8 @@ DAEMON_LABELS="$(rails_product_daemon_labels "$AGENT_UID")" \
 [ -n "$DAEMON_LABELS" ] || die 'empty daemon label list after the rail'
 
 for label in $DAEMON_LABELS; do
-  plist="/Library/LaunchDaemons/$label.plist"
+  plist="$(rails_product_daemon_plist_path "$label")" \
+    || die "could not compose the plist path for $label"
   if [ ! -f "$plist" ]; then
     check_fail "daemon-dist-$label" "no plist at $plist; the daemon is not installed"
     continue
@@ -336,7 +337,8 @@ plist_problem=''
 plist_absent=''
 plist_seen=0
 for label in $DAEMON_LABELS; do
-  plist="/Library/LaunchDaemons/$label.plist"
+  plist="$(rails_product_daemon_plist_path "$label")" \
+    || die "could not compose the plist path for $label"
   if [ ! -f "$plist" ]; then
     plist_absent="$plist_absent $plist"
     continue

@@ -160,6 +160,25 @@ case "$kind" in
     ( rails_assert_claim_supported "$1" "$2" ) || die 'claim-supported rail rejected'
     printf 'PROBE=ACCEPT claim-supported=yes\n'
     ;;
+  registry-names-uid)
+    # THE DECISION THAT DECIDES WHETHER AN ABSENT GATE DAEMON IS EXPECTED.
+    # Pure: registry content in, uid in, yes/no out. Driven directly here
+    # because it is the half of the 2026-07-25 live finding that no host can
+    # exercise cheaply -- a real armed/disarmed flip costs a whole drill leg --
+    # and because an answer of `no` is the FAIL-OPEN direction (it is what
+    # makes a missing daemon look expected), so every shape that could return
+    # `no` by accident has to be asserted rather than argued about.
+    if [ "$#" -ne 2 ]; then die 'registry-names-uid needs <content> <agent-uid>'; fi
+    NAMES="$(rails_registry_names_agent_uid "$1" "$2")" || die 'registry-names-uid rail rejected'
+    if [ -z "$NAMES" ]; then die 'empty answer after the registry-uid rail'; fi
+    printf 'PROBE=ACCEPT registry-names-uid=%s\n' "$NAMES"
+    ;;
+  daemon-plist-path)
+    if [ "$#" -ne 1 ]; then die 'daemon-plist-path needs <label>'; fi
+    DPP="$(rails_product_daemon_plist_path "$1")" || die "daemon plist path rail rejected: $1"
+    if [ -z "$DPP" ]; then die 'empty daemon plist path after rail'; fi
+    printf 'PROBE=ACCEPT daemon-plist-path=%s\n' "$DPP"
+    ;;
   gate-runtime-state-path)
     if [ "$#" -ne 1 ]; then die 'gate-runtime-state-path needs <agent-uid>'; fi
     GRSP="$(rails_product_gate_runtime_state_path "$1")" || die "gate runtime state path rail rejected: $1"
