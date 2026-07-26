@@ -26,9 +26,11 @@
  *   --out      output path for release-manifest.json (default: cwd).
  *
  * This script is invoked from the Publish workflow AFTER npm publish, with the
- * private key sourced from the GitHub Actions secret RELEASE_SIGNING_KEY. Until
- * the key is activated (Erik-present), the secret is empty and the workflow
- * step SKIPS this script entirely, so nothing here runs pre-activation.
+ * private key sourced from the GitHub Actions secret RELEASE_SIGNING_KEY. The
+ * key was ACTIVATED 2026-07-01; the workflow fails closed BEFORE publishing if
+ * the secret is empty or absent (step "Require release signing key"), and this
+ * script's own missing-env failure is the second, unconditional layer of that
+ * gate. There is no skip path: a publish without a signed manifest is a defect.
  *
  * Crypto is NOT hand-rolled: canonicalization + the signed-message construction
  * come from release-manifest.ts; the Ed25519 sign primitive comes from

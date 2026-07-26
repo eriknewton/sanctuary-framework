@@ -10,13 +10,15 @@ Publish intent is separate from tag intent. Tag pushes do not publish; manual wo
 4. Type the version string from `server/package.json` into the `version` input (do not prefix with `v`). Optionally set `ref` to the tag you just pushed; leave blank to publish from the selected branch.
 5. Click "Run workflow". The job verifies the input matches `server/package.json` at the checked-out ref, runs typecheck and tests, builds, and publishes. Pre-release versions (containing a hyphen) publish under the `next` dist-tag; plain versions publish under `latest`.
 
-## Required repo secret
+## Required repo secrets
 
-`NPM_TOKEN` (automation token with publish access to the `@sanctuary-framework` scope). Add at Settings, Secrets and variables, Actions.
+- `NPM_TOKEN` (automation token with publish access to the `@sanctuary-framework` scope). Add at Settings, Secrets and variables, Actions.
+- `RELEASE_SIGNING_KEY` (base64url of the 32-byte Ed25519 release-signing seed; activated 2026-07-01). The publish job signs `release-manifest.json` with it and attaches the manifest to the GitHub Release; the shipped product pins the corresponding public key (`PINNED_RELEASE_SIGNING_PUBLIC_KEY_B64URL` in `server/src/release-manifest.ts`) and refuses updates that do not verify. The job FAILS CLOSED, before publishing, if this secret is empty or missing: a green publish run guarantees a signed manifest was attached. The seed also has an off-host operator escrow; if the secret is lost from the repo, restore it from escrow rather than minting a new key (a new key would require a product-side pinned-key rotation to be believed by shipped clients).
 
 ## Failure modes and what to do
 
 - Input version empty or does not match `server/package.json` at ref: job fails at the verify step. Fix the input or the ref, rerun.
+- "Require release signing key (fail closed)" fails: the `RELEASE_SIGNING_KEY` secret is empty or not reaching the job. Nothing was published. Restore the secret (from the operator escrow) and rerun.
 - `NPM_TOKEN` missing or expired: `npm publish` step fails. Rotate the token and rerun.
 - Tests or typecheck fail: treat as a real failure, do not bypass. Fix on a branch, merge, rerun dispatch.
 - Release dependency pin check fails: a direct release-critical dependency uses a range or its lockfile root does not match the manifest. Pin the direct dependency to the exact version being released, regenerate the relevant lockfile, and rerun `npm run check:release-dependency-pins`.
