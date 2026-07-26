@@ -501,6 +501,13 @@ rails__stat_size() {
 # all three, because it IS the target's inode. Every privileged read that
 # hand-walks a service-owned subtree therefore also refuses a multiply-linked
 # leaf, and this is where the count comes from.
+#
+# The AUTHORITATIVE call site passes `/dev/fd/<n>`, not a pathname. A count
+# read from a pathname is a SEPARATE namei from the open, and an attacker who
+# swaps the leaf in that window has the count measured on a discarded file --
+# which is how the first version of this guard was defeated by execution.
+# Both stat families report the TARGET's link count for an open fd (`%h` GNU,
+# `%l` BSD), exactly as they already report its inode for the identity rail.
 rails__stat_nlink() {
   rails__sys stat -c '%h' "$1" 2>/dev/null || rails__sys stat -f '%l' "$1" 2>/dev/null || return 1
 }

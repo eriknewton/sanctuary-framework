@@ -396,7 +396,7 @@ wrapper_cursor_identity() {
 }
 
 wrapper_open_safe_file_under() {
-  local root="$1" rel="$2" label="$3" checked oldpwd parent_rel leaf expected actual oldifs noglob_was_set='' seg nlink
+  local root="$1" rel="$2" label="$3" checked oldpwd parent_rel leaf expected actual oldifs noglob_was_set='' seg nlink fd_nlink
   WRAPPER_SAFE_TARGET=''
   WRAPPER_SAFE_OPEN_SIZE=''
   WRAPPER_SAFE_OPEN_IDENTITY=''
@@ -471,9 +471,19 @@ wrapper_open_safe_file_under() {
   # uid dir, so it could plant a log name or `state.json` as a hard link at a
   # file outside the approved tree and this root-run wrapper would read the
   # target. No file this wrapper legitimately reads has a second name, so a
-  # multiply-linked leaf is refused outright, BEFORE the open. A link added
-  # AFTER this lstat cannot help an attacker: replacing the leaf itself changes
-  # the inode and dies on the identity check below.
+  # multiply-linked leaf is refused outright.
+  #
+  # ROUND-6 RE-GATE. This pathname lstat is a CHEAP EARLY REFUSAL and nothing
+  # more. A previous version of this comment claimed a link added after it
+  # "cannot help an attacker, because replacing the leaf changes the inode and
+  # dies on the identity check below." That was WRONG, and was defeated by
+  # execution: this lstat is a SEPARATE namei from the identity lstat below,
+  # so an attacker who unlinks the leaf and hard-links a victim in its place
+  # between the two has the count measured on the DISCARDED file while the
+  # identity lstat and the open both see the hard link and agree with each
+  # other. Nothing bound this read to the open. The binding read is the one on
+  # the HELD FD after the open, below; that one measures the same object the
+  # bytes come from, by construction.
   nlink="$(rails__stat_nlink "$leaf")" \
     || wrapper_die "could not read the link count for $label: $checked"
   case "$nlink" in
@@ -490,6 +500,22 @@ wrapper_open_safe_file_under() {
   if [ "$(rails__stat_identity /dev/fd/9)" != "$WRAPPER_SAFE_OPEN_IDENTITY" ]; then
     exec 9<&-
     wrapper_die "$label changed between path resolution and fd open; refusing to read a substituted path: $checked"
+  fi
+  # THE AUTHORITATIVE LINK-COUNT READ. Same fd the bytes come from, so it is
+  # bound to the open the way the identity compare above is; the pathname
+  # pre-check is not, and a swap in its window is a real attack (round-6
+  # re-gate, proved by execution on both `gate-port` and `gate-log`). `stat`
+  # on `/dev/fd/<n>` reports the TARGET's link count on both stat families,
+  # the same way it already reports the target's inode/uid/gid for the
+  # identity compare, so this needs no new mechanism -- just the right object.
+  fd_nlink="$(rails__stat_nlink /dev/fd/9)" \
+    || { exec 9<&-; wrapper_die "could not read the link count for $label from its checked fd: $checked"; }
+  case "$fd_nlink" in
+    ''|*[!0-9]*) exec 9<&-; wrapper_die "unparseable link count for $label from its checked fd: $checked" ;;
+  esac
+  if [ "$fd_nlink" -gt 1 ]; then
+    exec 9<&-
+    wrapper_die "$label has $fd_nlink hard links; refusing to read a multiply-linked file that can alias a path outside the approved tree: $checked"
   fi
   cd -P "$oldpwd" 2>/dev/null || cd -P / || wrapper_die "could not restore cwd after opening $label"
   return 0

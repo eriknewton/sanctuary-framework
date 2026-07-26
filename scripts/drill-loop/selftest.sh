@@ -960,6 +960,101 @@ rm -f "$GATE_RUNTIME/$GATE_UID/state.json"
 printf '{"agent_uid":%s,"gate_port":49317,"generation_id":7}' "$GATE_UID" \
   > "$GATE_RUNTIME/$GATE_UID/state.json"
 
+# --- the link count must be read from the FD, not the pathname (round-6 re-gate)
+#
+# The static case above is refused by a link count read with an lstat on the
+# PATHNAME, which is a SEPARATE namei from the identity lstat and the open
+# below it. The re-gate defeated that by execution on both verbs: unlink the
+# leaf and hard-link a victim in its place AFTER the count is taken, and the
+# count was measured on the DISCARDED file while the identity lstat and the
+# open both see the hard link and agree with each other. Root then read a file
+# outside the approved tree into the evidence bundle.
+#
+# This case reproduces that window deterministically -- a `stat` stub that
+# answers the link-count question truthfully for the ORIGINAL file and then
+# performs the swap, exactly once -- and asserts the refusal now comes from the
+# link count read on the HELD FD. One case at the chokepoint covers all three
+# privileged readers (gate-log tail, gate-log cursor, gate-port cat); they all
+# open through `wrapper_open_safe_file_under` and no root read bypasses it.
+SWAPBIN="$SANDBOX/swapbin"
+mkdir -p "$SWAPBIN"
+cat > "$SWAPBIN/stat" <<'SWAPSTUB'
+#!/bin/bash
+# TEST-ONLY stat: wins the window between the PATHNAME link-count read and the
+# open. It answers the link-count question with the REAL, pre-swap count of the
+# real file (so the pathname pre-check legitimately sees 1), then unlinks the
+# leaf and hard-links the victim in its place. Fires at most once, so the run
+# is deterministic and no LATER stat can be the reason for a refusal.
+want=''
+for a in "$@"; do
+  case "$a" in '%h'|'%l') want='yes' ;; esac
+done
+args=("$@")
+last="${args[$((${#args[@]}-1))]}"
+if [ -n "$want" ] && [ -n "${DRILL_TEST_SWAP_LEAF:-}" ] && [ "$last" = "$DRILL_TEST_SWAP_LEAF" ] \
+   && [ ! -e "${DRILL_TEST_SWAP_MARKER:-/nonexistent}" ]; then
+  if out="$(/usr/bin/stat "$@" 2>/dev/null)"; then
+    : > "$DRILL_TEST_SWAP_MARKER"
+    rm -f -- "$DRILL_TEST_SWAP_TARGET"
+    ln -- "$DRILL_TEST_SWAP_VICTIM" "$DRILL_TEST_SWAP_TARGET"
+    printf '%s\n' "$out"
+    exit 0
+  fi
+  exit 1
+fi
+exec /usr/bin/stat "$@"
+SWAPSTUB
+chmod +x "$SWAPBIN/stat"
+GATE_RUNTIME_SWAP="$SANDBOX/gate-runtime-swap"
+mkdir -p "$GATE_RUNTIME_SWAP/$GATE_UID"
+SWAP_TARGET="$GATE_RUNTIME_SWAP/$GATE_UID/state.json"
+SWAP_VICTIM="$SANDBOX/gate-port-swap-victim.json"
+SWAP_MARKER="$SANDBOX/gate-port-swap-fired"
+rm -f "$SWAP_MARKER"
+printf '{"agent_uid":%s,"gate_port":49317,"generation_id":7}' "$GATE_UID" > "$SWAP_TARGET"
+printf '{"agent_uid":%s,"gate_port":31337,"generation_id":1}' "$GATE_UID" > "$SWAP_VICTIM"
+TEST_WRAPPER_PORT_SWAP="$SANDBOX/test-wrapper-port-swap"
+compose_wrapper "$TEST_WRAPPER_PORT_SWAP" "$ME" '' "$SWAPBIN /usr/bin /bin /usr/sbin /sbin" "$GATE_RUNTIME_SWAP"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+port_swap_out="$(DRILL_TEST_SWAP_LEAF='state.json' DRILL_TEST_SWAP_MARKER="$SWAP_MARKER" \
+  DRILL_TEST_SWAP_TARGET="$SWAP_TARGET" DRILL_TEST_SWAP_VICTIM="$SWAP_VICTIM" \
+  "$TEST_WRAPPER_PORT_SWAP" gate-port --run-id 'good1' --operator-account "$ME" \
+  --agent-account "$ME" --agent-uid "$GATE_UID" 2>&1)"
+port_swap_rc=$?
+set -e
+# ANTI-VACUITY on the FIXTURE, not on the verdict: if the stub never fired, the
+# wrapper read the untouched state.json and this case proves nothing about the
+# window. Assert the swap actually happened -- the leaf must now BE the victim,
+# by identity, and carry two links.
+swap_leaf_id="$(bash -c ". '$HERE/lib/rails.sh'; rails__stat_identity '$SWAP_TARGET'")"
+swap_victim_id="$(bash -c ". '$HERE/lib/rails.sh'; rails__stat_identity '$SWAP_VICTIM'")"
+swap_leaf_nlink="$(bash -c ". '$HERE/lib/rails.sh'; rails__stat_nlink '$SWAP_TARGET'")"
+if [ ! -e "$SWAP_MARKER" ] || [ "$swap_leaf_id" != "$swap_victim_id" ] || [ "$swap_leaf_nlink" != '2' ]; then
+  printf 'FAIL  anti-vacuity: the swap never happened, so the window was never exercised\n'
+  note "marker=$([ -e "$SWAP_MARKER" ] && printf fired || printf absent) leaf=$swap_leaf_id victim=$swap_victim_id nlink=$swap_leaf_nlink"
+  FAIL=$((FAIL + 1))
+else
+  case "$port_swap_out" in
+    *31337*)
+      printf 'FAIL  *** root read a file hard-linked in AFTER the pathname link-count check ***\n'
+      note "output: $port_swap_out"
+      FAIL=$((FAIL + 1)) ;;
+    *'hard links'*)
+      if [ "$port_swap_rc" -ne 0 ]; then
+        printf 'ok    a leaf hard-linked inside the link-count window is refused from the held fd\n'
+        PASS=$((PASS + 1))
+      else
+        printf 'FAIL  gate-port named the raced hard link but exited 0\n'
+        FAIL=$((FAIL + 1))
+      fi ;;
+    *)
+      printf 'FAIL  gate-port neither read the raced hard link nor refused it for the link-count reason\n'
+      note "output: $port_swap_out"
+      FAIL=$((FAIL + 1)) ;;
+  esac
+fi
+rm -f "$SWAP_TARGET" "$SWAP_VICTIM" "$SWAP_MARKER"
+
 # --- gate-port under the REAL-HOST ownership shape (round-6 H1) -------------
 #
 # On a real host the product chowns `gate-runtime/<uid>` to the GATE uid
