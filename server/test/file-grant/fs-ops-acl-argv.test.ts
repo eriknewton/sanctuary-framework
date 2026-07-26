@@ -36,6 +36,33 @@ import type {
 import { withPathLock } from "../../src/storage/cross-process-lock.js";
 import { makeFileGrantTestStore } from "./fixtures.js";
 
+/**
+ * Poll `check` until it is true, or throw after `timeoutMs`.
+ *
+ * Use this instead of `await sleep(n); expect(cond).toBe(true)` whenever the
+ * condition is reached by a CONCURRENT actor: a fixed sleep encodes a guess
+ * about scheduler latency, and a loaded CI runner falsifies the guess. The
+ * timeout is deliberately generous -- the failure mode being removed is
+ * "slower than expected", not "never happens" -- but it is still a real
+ * timeout, so a condition that never becomes true fails the test with a label
+ * naming exactly what was being waited for.
+ */
+async function pollUntilTrue(
+  check: () => boolean,
+  label: string,
+  timeoutMs = 30_000,
+  stepMs = 5
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (check()) return;
+    if (Date.now() >= deadline) {
+      throw new Error(`pollUntilTrue: ${label} did not become true within ${timeoutMs}ms`);
+    }
+    await new Promise((r) => setTimeout(r, stepMs));
+  }
+}
+
 function pinnedSource(overrides: Partial<FileGrantPinnedSource> = {}): FileGrantPinnedSource {
   return {
     source_realpath: "/operator/source.txt",
@@ -963,8 +990,15 @@ describe("file-grant ACL command argv construction", () => {
 
     // A first holder that parks inside the locked critical section long enough
     // for a second acquire to be forced to wait, proving mutual exclusion.
+    //
+    // Every step below waits on an OBSERVED state change rather than on a
+    // fixed sleep. The fixed sleeps this replaces were the flake: on a loaded
+    // runner `first` had not yet acquired after its 20ms grace, so `second`
+    // could take the lock uncontended -- which fails loudly at best and, worse,
+    // could pass VACUOUSLY (a `second` that never even reached an acquire
+    // attempt trivially satisfies "did not enter while first held").
     let firstInside = false;
-    let secondEnteredWhileFirstInside = false;
+    let secondEnteredWhileFirstInside: boolean | null = null;
     let releaseFirst: () => void = () => {};
     const firstDone = new Promise<void>((r) => (releaseFirst = r));
 
@@ -974,9 +1008,14 @@ describe("file-grant ACL command argv construction", () => {
       await firstDone;
       firstInside = false;
     });
-    // Give `first` a tick to acquire.
-    await new Promise((r) => setTimeout(r, 20));
+    // Wait for `first` to be provably INSIDE the critical section.
+    await pollUntilTrue(() => firstInside, "first holder entered the lock");
 
+    // `second` must OBSERVE the lock held (an EEXIST on the O_EXCL create)
+    // while `first` is inside. That observation is the proof that mutual
+    // exclusion was actually exercised; elapsed wall-clock is not.
+    let contendedWhileFirstInside = false;
+    let observedContention = false;
     const second = withPathLock(
       lockDir,
       ".fortress-ace.lock",
@@ -984,17 +1023,39 @@ describe("file-grant ACL command argv construction", () => {
         // If the lock is real, we only get here after `first` released.
         secondEnteredWhileFirstInside = firstInside;
       },
-      { retryMs: 5, timeoutMs: 2000 }
+      {
+        retryMs: 5,
+        // Generous by design: the failure mode being removed is "too slow on a
+        // loaded runner". A BROKEN lock still fails this test regardless of
+        // budget, because `second` would enter immediately with `firstInside`
+        // still true.
+        timeoutMs: 120_000,
+        onContended: () => {
+          observedContention = true;
+          if (firstInside) contendedWhileFirstInside = true;
+        },
+      }
     );
 
-    // Second must still be blocked while first holds the lock.
-    await new Promise((r) => setTimeout(r, 30));
+    // Wait for `second` to resolve EITHER way -- it contended (lock works) or
+    // it walked straight in (lock broken). Waiting on both outcomes is what
+    // makes a broken lock fail FAST with a precise assertion instead of
+    // stalling until the test timeout.
+    await pollUntilTrue(
+      () => observedContention || secondEnteredWhileFirstInside !== null,
+      "second acquire either contended or entered the lock"
+    );
+
+    // Second is provably blocked, and first provably still holds.
+    expect(secondEnteredWhileFirstInside).toBe(null);
+    expect(contendedWhileFirstInside).toBe(true);
     expect(firstInside).toBe(true);
     releaseFirst();
     await first;
     await second;
+    // `null` here would mean second's critical section never ran at all.
     expect(secondEnteredWhileFirstInside).toBe(false);
-  });
+  }, 60_000);
 
   it("holds the fortress-ACE lock THROUGH the mint probe (a concurrent acquire times out during the probe; round-4 bug-inject)", async () => {
     if (process.getuid === undefined) return; // POSIX-only
