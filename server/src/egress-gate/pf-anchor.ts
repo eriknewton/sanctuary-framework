@@ -46,6 +46,17 @@
  * unparseable output is NOT live. The gate server refuses to proxy when
  * this check fails, and posture surfaces MUST report not-protected.
  *
+ * THE pf ENABLE REFERENCE IS NOT THIS MODULE'S TO REASON ABOUT. This module
+ * owns the anchor's RULES; `pf-enable-state.ts` owns the `pfctl -E` reference
+ * lifecycle end to end (acquire, resolve, release) and is the only place that
+ * decides whether this fortress holds a live reference of its own. That split
+ * exists because the same enable-state mistake was made at three call sites in
+ * this file and cost a wrong-allow twice on hardware: once when a persisted
+ * token outlived the reboot that zeroed it (F-PFBOOT), and once when a global
+ * `Status: Enabled` read was mistaken for evidence that the reference holding
+ * pf up was ours (F-PFTHIRDPARTY). Read that module's header before changing
+ * anything here that touches `-E` or `-X`.
+ *
  * All privileged commands run through an injected {@link PfCommandRunner}
  * so the logic is unit-testable without root or a real pf.
  */
@@ -55,6 +66,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createExecFileRunner } from "./exec-runner.js";
+import {
+  ensurePfEnableReference,
+  observePfEnabled,
+  releasePfEnableReference,
+  type BootSessionReader,
+  type PfEnabledObservation,
+  type PfEnableReference,
+  type PfEnableReferenceDisposition,
+  type PfEnableReferenceEnsured,
+  type PfEnableReferenceRelease,
+} from "./pf-enable-state.js";
 
 import {
   validateExclusiveEgressGatePolicy,
@@ -347,6 +369,22 @@ export function renderPfAnchorRulesForUids(
   return lines.join("\n");
 }
 
+/**
+ * Render {@link observePfEnabled} into the liveness checks' not-live reason
+ * strings. Empty when pf is observed enabled -- and, deliberately, NOT empty
+ * when pf could not be read: an unreadable pf is never a passing probe.
+ *
+ * The disabled-pf string is kept byte-stable because it is the sentence the
+ * boot supervisor surfaces to the operator and the one the drill logs quote.
+ */
+function pfEnabledLivenessReasons(observed: PfEnabledObservation): string[] {
+  if (!observed.known) return [observed.reason];
+  if (!observed.enabled) {
+    return ["pf is not enabled (pfctl -s info lacks 'Status: Enabled')"];
+  }
+  return [];
+}
+
 /** Liveness verdict with the positive/negative evidence that produced it. */
 export interface PfLivenessResult {
   /** True ONLY when every positive-evidence check passed. */
@@ -391,20 +429,7 @@ export async function checkPfAnchorLiveness(
   }
   const reasons: string[] = [];
 
-  let info: PfCommandResult;
-  try {
-    info = await runner.run("pfctl", ["-s", "info"]);
-  } catch (err) {
-    return {
-      live: false,
-      reasons: [`pfctl -s info failed to run: ${err instanceof Error ? err.message : String(err)}`],
-    };
-  }
-  if (info.code !== 0) {
-    reasons.push(`pfctl -s info exited ${info.code}`);
-  } else if (!/^Status:\s+Enabled\b/m.test(info.stdout)) {
-    reasons.push("pf is not enabled (pfctl -s info lacks 'Status: Enabled')");
-  }
+  reasons.push(...pfEnabledLivenessReasons(await observePfEnabled(runner)));
 
   let rules: PfCommandResult;
   try {
@@ -574,20 +599,7 @@ export async function checkPfAnchorUnionLiveness(
   }
   const reasons: string[] = [];
 
-  let info: PfCommandResult;
-  try {
-    info = await runner.run("pfctl", ["-s", "info"]);
-  } catch (err) {
-    return {
-      live: false,
-      reasons: [`pfctl -s info failed to run: ${err instanceof Error ? err.message : String(err)}`],
-    };
-  }
-  if (info.code !== 0) {
-    reasons.push(`pfctl -s info exited ${info.code}`);
-  } else if (!/^Status:\s+Enabled\b/m.test(info.stdout)) {
-    reasons.push("pf is not enabled (pfctl -s info lacks 'Status: Enabled')");
-  }
+  reasons.push(...pfEnabledLivenessReasons(await observePfEnabled(runner)));
 
   let rules: PfCommandResult;
   try {
@@ -711,12 +723,44 @@ export interface ArmPfAnchorOptions {
   settleTimeoutMs?: number;
   /** Injected for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Reads `kern.bootsessionuuid`, used to bind a newly acquired pf enable
+   * reference to the boot session that minted it. Injected for tests; defaults
+   * to the real sysctl reader in `pf-enable-state.ts`.
+   */
+  bootSession?: BootSessionReader;
 }
 
 /** Result of a successful arm. */
 export interface ArmPfAnchorResult {
-  /** Reference token from `pfctl -E`, needed for symmetric release (`-X`). */
-  enableToken?: string;
+  /**
+   * The pf enable reference this fortress now holds -- token PLUS the boot
+   * session that minted it. The caller persists the WHOLE record, never the
+   * token alone: a bare token is indistinguishable from a token a reboot
+   * invalidated, which is the F-PFBOOT defect in one sentence.
+   *
+   * Present whenever the arm established a reference (acquired OR verified as
+   * still ours and live), so a caller that saves it always saves something
+   * current.
+   */
+  enableReference?: PfEnableReference;
+  /** True when THIS arm ran `pfctl -E` rather than reusing a verified reference. */
+  acquiredEnableReference?: boolean;
+  /**
+   * What happened to the reference the acquire SUPERSEDED, when there was one.
+   * Absent on a reuse and on a first arm.
+   *
+   * Carried out of the chokepoint verbatim -- `reason` included -- because a
+   * superseded release that could not be accounted for leaves the kernel
+   * holding an ORPHANED enable reference with no registry row naming it, and
+   * dropping the reason here is what made that condition invisible. It
+   * over-enforces (pf stays enabled) and can never be a wrong-allow, but an
+   * operator who runs `--unprotect-egress-gate` and finds pf still enabled is
+   * entitled to the sentence that explains why. Log it; do not act on it.
+   */
+  supersededEnableRelease?: PfEnableReferenceRelease;
+  /** What the enable-reference chokepoint observed, for logs and diagnostics. */
+  enableEvidence?: string[];
   /** How many liveness probes ran during the settle phase. */
   settleProbes: number;
 }
@@ -783,16 +827,22 @@ async function installAnchorHookIfAbsent(
 /** Options for {@link armPfAnchorUnion}. */
 export interface ArmPfAnchorUnionOptions extends ArmPfAnchorOptions {
   /**
-   * The `pfctl -E` reference token this fortress already holds, when pf was
-   * enabled by a PRIOR arm of this anchor (the registry threads its committed
-   * token here). When present, {@link armPfAnchorUnion} does NOT call
-   * `pfctl -E` again -- each `-E` bumps pf's enable reference count and returns
-   * a NEW token, so re-enabling on every mutation would leak references that a
-   * single `-X` at teardown could never fully release, leaving pf stuck
-   * enabled. When absent, this is the first arm: `pfctl -E` runs and the new
-   * token is returned for the caller to persist and release at final disarm.
+   * The pf enable reference this fortress RECORDED at a prior arm (the
+   * registry threads its committed record here): the `pfctl -E` token plus the
+   * boot session that minted it.
+   *
+   * It is a RECORD, NEVER A GUARANTEE. Reference counting still matters -- each
+   * `-E` bumps pf's count and returns a new token, so re-enabling on every
+   * in-boot mutation would leak references -- but whether this record still
+   * names a live reference OF OURS is a question only an observation can
+   * answer, and `pf-enable-state.ts` answers it. Three verdicts, one
+   * permission: reuse happens only when the reference is confirmed ours and
+   * live in THIS boot; a stale record (post-reboot) or a pf held up by
+   * somebody else's reference re-acquires, and the fresh record comes back in
+   * {@link ArmPfAnchorResult.enableReference} for the caller to persist in
+   * place of the old one.
    */
-  existingEnableToken?: string;
+  existingEnableReference?: PfEnableReference;
 }
 
 /**
@@ -806,8 +856,10 @@ export interface ArmPfAnchorUnionOptions extends ArmPfAnchorOptions {
  * and un-preempted.
  *
  * Two deliberate differences from {@link armPfAnchor}:
- *   - It NEVER re-enables pf when `existingEnableToken` is supplied (reference
- *     counting -- see {@link ArmPfAnchorUnionOptions.existingEnableToken}).
+ *   - It reuses a supplied enable reference instead of minting a new one, but
+ *     ONLY when `pf-enable-state.ts` confirms that reference is ours and live
+ *     in this boot session (reference counting -- see
+ *     {@link ArmPfAnchorUnionOptions.existingEnableReference}).
  *   - ON FAILURE IT DOES NOT FLUSH THE ANCHOR (Codex B2). A flush would drop
  *     every other confined uid's rules; the anchor is a shared multi-uid
  *     surface now. The caller (the registry) owns rollback: it re-asserts the
@@ -832,11 +884,11 @@ export async function armPfAnchorUnion(
 
   const dir = await mkdtemp(join(tmpdir(), "sanctuary-pf-"));
   const rulesFile = join(dir, "egress-gate.rules");
-  let enableToken: string | undefined = options.existingEnableToken;
-  // The `pfctl -E` reference THIS call acquired (only set on the first arm,
-  // when no existing token was supplied). Tracked so a post-enable failure
-  // releases exactly the reference this call took, never one another uid or
-  // an earlier arm depends on (folds gate-round finding: leaked -E reference).
+  let ensured: PfEnableReferenceEnsured | undefined;
+  // The `pfctl -E` reference THIS call acquired. Tracked so a post-enable
+  // failure releases exactly the reference this call took, never one another
+  // uid or an earlier arm depends on (folds gate-round finding: leaked -E
+  // reference).
   let acquiredToken: string | undefined;
   try {
     await writeFile(rulesFile, rulesText, { mode: 0o600 });
@@ -848,24 +900,32 @@ export async function armPfAnchorUnion(
 
     await installAnchorHookIfAbsent(runner, anchorName, rulesFile, mainConfPath, dir);
 
-    // Enable pf ONLY if we do not already hold a reference token (first arm).
-    if (options.existingEnableToken === undefined) {
-      const enable = await runner.run("pfctl", ["-E"]);
-      if (enable.code !== 0) {
-        throw new Error(`pfctl -E exited ${enable.code}: ${enable.stderr.trim()}`);
-      }
-      const tokenMatch = /Token\s*:\s*(\d+)/.exec(`${enable.stdout}\n${enable.stderr}`);
-      if (tokenMatch === null) {
-        // Fail-closed (AGENTS.md rule 5): a 0-exit `-E` with no parsable token
-        // means pf is now enabled with a reference we cannot track or release.
-        // Refuse to arm rather than commit an untracked pf enable reference.
-        throw new Error(
-          "pfctl -E exited 0 but printed no numeric token; refusing to arm with an " +
-            "untracked pf enable reference (cannot be released at disarm)",
-        );
-      }
-      enableToken = tokenMatch[1];
-      acquiredToken = tokenMatch[1];
+    // Establish that THIS fortress holds a live pf enable reference of its
+    // own, minted in THIS boot session. The whole decision -- reuse or
+    // re-acquire, and the release of anything superseded -- belongs to the
+    // chokepoint; there is deliberately no enable-state branch left here.
+    //
+    // The two defects that made this a chokepoint instead of an inline `if`
+    // (Mini1, 2026-07-26, merged main `ed7722ce`):
+    //   F-PFBOOT     -- `if (existingEnableToken === undefined)` skipped
+    //                   `pfctl -E` after every reboot because the persisted
+    //                   token survived the kernel state it described. pf stayed
+    //                   disabled, the anchor stayed loaded and inert, and the
+    //                   confined uid regained loopback reach to sshd, Screen
+    //                   Sharing, Ollama and PostgreSQL (CONNECTED 3/3 each,
+    //                   against blocked 3/3 in the armed control).
+    //   F-PFTHIRDPARTY -- a reference-count or `Status: Enabled` test alone
+    //                   would have reused the record whenever ANY reference
+    //                   held pf up. Measured: when that foreign reference was
+    //                   released, confinement vanished in the same boot and the
+    //                   same generation while the product reported health.
+    // Holding our OWN reference is what makes the second case survivable.
+    ensured = await ensurePfEnableReference(
+      { runner, ...(options.bootSession !== undefined ? { bootSession: options.bootSession } : {}) },
+      options.existingEnableReference,
+    );
+    if (ensured.acquired) {
+      acquiredToken = ensured.reference.token;
     }
 
     // Settle-probe on the EXACT union: require N consecutive live results.
@@ -892,11 +952,15 @@ export async function armPfAnchorUnion(
         await sleep(settleDelayMs);
       }
     }
-    const armResult: ArmPfAnchorResult = { settleProbes: probes };
-    if (enableToken !== undefined) {
-      armResult.enableToken = enableToken;
-    }
-    return armResult;
+    return {
+      settleProbes: probes,
+      enableReference: ensured.reference,
+      acquiredEnableReference: ensured.acquired,
+      ...(ensured.supersededRelease !== undefined
+        ? { supersededEnableRelease: ensured.supersededRelease }
+        : {}),
+      enableEvidence: ensured.evidence,
+    };
   } catch (err) {
     // Codex B2: NO catch-FLUSH -- the anchor is a shared multi-uid surface, so
     // `-F all` would drop every OTHER confined uid's rules; the registry owns
@@ -906,8 +970,25 @@ export async function armPfAnchorUnion(
     // (gate-round finding -- unbounded leak on retry + silent host-firewall
     // posture change). We only release what WE acquired this call (an existing
     // token belongs to a prior arm and stays live).
-    if (acquiredToken !== undefined) {
-      await runner.run("pfctl", ["-X", acquiredToken]).catch(() => undefined);
+    //
+    // ONE EXCEPTION, AND IT IS THE WHOLE POINT OF THIS MODULE (fix-round F1).
+    // When the acquire SUPERSEDED a reference that was really released, the
+    // reference this call took is no longer an ADDITION -- it is the only thing
+    // holding pf up, for every confined uid on the host, including ones this
+    // mutation never touched. Giving it back would take the count to zero under
+    // a loaded anchor and unconfine a BYSTANDER uid until the registry
+    // rollback's own `-E` (unbounded if that rollback also fails). Keeping it is
+    // an orphaned reference: over-enforcing, releasable, and visible in
+    // `pfctl -s References` -- which is the fail direction this module chose
+    // everywhere else, so the failure path chooses it too.
+    //
+    // `already-gone` is NOT this case: it means the kernel held no such
+    // reference, so nothing that was holding pf up was destroyed and the
+    // reference we took really is ours alone to give back. `undefined` means no
+    // supersession happened at all (a first arm). Both still release.
+    const supersededWasReleased = ensured?.supersededRelease?.disposition === "released";
+    if (acquiredToken !== undefined && !supersededWasReleased) {
+      await releasePfEnableReference({ runner }, acquiredToken).catch(() => undefined);
     }
     throw err;
   } finally {
@@ -958,7 +1039,7 @@ export async function armPfAnchor(
   // CodeQL-clean temp handling: a fresh mkdtemp dir, file removed after load.
   const dir = await mkdtemp(join(tmpdir(), "sanctuary-pf-"));
   const rulesFile = join(dir, "egress-gate.rules");
-  let enableToken: string | undefined;
+  let ensured: PfEnableReferenceEnsured | undefined;
   try {
     await writeFile(rulesFile, rulesText, { mode: 0o600 });
 
@@ -971,21 +1052,14 @@ export async function armPfAnchor(
     // enforces nothing). Skipped when the call rule is already present.
     await installAnchorHookIfAbsent(runner, anchorName, rulesFile, mainConfPath, dir);
 
-    const enable = await runner.run("pfctl", ["-E"]);
-    if (enable.code !== 0) {
-      throw new Error(`pfctl -E exited ${enable.code}: ${enable.stderr.trim()}`);
-    }
-    const tokenMatch = /Token\s*:\s*(\d+)/.exec(`${enable.stdout}\n${enable.stderr}`);
-    if (tokenMatch === null) {
-      // Fail-closed (gate-round finding): a 0-exit `-E` with no parsable token
-      // enabled pf with a reference we cannot release at disarm. Refuse rather
-      // than proceed with an untracked reference (the catch below disarms).
-      throw new Error(
-        "pfctl -E exited 0 but printed no numeric token; refusing to arm with an " +
-          "untracked pf enable reference (cannot be released at disarm)",
-      );
-    }
-    enableToken = tokenMatch[1];
+    // SAME chokepoint as the union path, deliberately. This single-uid arm has
+    // no production caller today, and a second hand-written enable-state branch
+    // here is exactly how it would drift back into the defect the union path
+    // just had removed.
+    ensured = await ensurePfEnableReference(
+      { runner, ...(options.bootSession !== undefined ? { bootSession: options.bootSession } : {}) },
+      undefined,
+    );
 
     // Settle-probe: require N consecutive live results before declaring armed.
     const deadline = Date.now() + settleTimeoutMs;
@@ -1011,16 +1085,18 @@ export async function armPfAnchor(
         await sleep(settleDelayMs);
       }
     }
-    const armResult: ArmPfAnchorResult = { settleProbes: probes };
-    if (enableToken !== undefined) {
-      armResult.enableToken = enableToken;
-    }
-    return armResult;
+    return {
+      settleProbes: probes,
+      enableReference: ensured.reference,
+      acquiredEnableReference: ensured.acquired,
+      enableEvidence: ensured.evidence,
+    };
   } catch (err) {
     // Symmetric rollback: a half-armed anchor must not linger.
-    await disarmPfAnchor(runner, { anchorName, ...(enableToken !== undefined ? { enableToken } : {}) }).catch(
-      () => undefined,
-    );
+    await disarmPfAnchor(runner, {
+      anchorName,
+      ...(ensured !== undefined ? { enableToken: ensured.reference.token } : {}),
+    }).catch(() => undefined);
     throw err;
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
@@ -1034,11 +1110,37 @@ export interface DisarmPfAnchorOptions {
   enableToken?: string;
 }
 
+/** What {@link disarmPfAnchor} did with the enable reference it was handed. */
+export interface DisarmPfAnchorResult {
+  /**
+   * `none-supplied` when there was no token to release; otherwise the
+   * chokepoint's disposition (`released`, or `already-gone` for a reference
+   * the kernel does not have).
+   */
+  enableReference: PfEnableReferenceDisposition | "none-supplied";
+  /** The evidence behind an `already-gone` call (absent otherwise). */
+  staleReason?: string;
+}
+
 /**
  * Disarm symmetry: flush every rule out of the Sanctuary anchor, then
  * release the pf enable reference taken at arm time (when a token was
  * captured). Throws on failure: a disarm that silently did nothing would
  * leave state the operator believes is gone.
+ *
+ * ONE DELIBERATE EXCEPTION, and it is a recovery path rather than a leniency.
+ * A `pfctl -X` that fails BECAUSE the kernel has no such reference is not a
+ * teardown failure -- it is the truth about a token a reboot invalidated.
+ * Before this, that failure made `--unprotect-egress-gate` throw
+ * (`pfctl: pf: token invalid`, measured) and left a committed registry entry
+ * NO product path could clear: the operator's last escape hatch was itself
+ * deadlocked, and the only measured way out was an out-of-band `pfctl -E`,
+ * which creates the F-PFTHIRDPARTY wrong-allow. `pf-enable-state.ts` decides
+ * that question from BOTH captured pfctl failure messages plus an observation
+ * of pf, and still throws on any failure it cannot account for. The fail
+ * direction is safe in one direction only, which is the right one: an
+ * unreleased reference leaves pf ENABLED (over-enforcing, visible in
+ * `pfctl -s References`), never a confined uid with reach it should not have.
  *
  * The MAIN-RULESET call rule installed at arm time is deliberately left in
  * place: with the sub-anchor flushed empty it evaluates nothing (inert),
@@ -1049,19 +1151,21 @@ export interface DisarmPfAnchorOptions {
 export async function disarmPfAnchor(
   runner: PfCommandRunner,
   options: DisarmPfAnchorOptions = {},
-): Promise<void> {
+): Promise<DisarmPfAnchorResult> {
   const anchorName = options.anchorName ?? PF_ANCHOR_NAME;
   const flush = await runner.run("pfctl", ["-a", anchorName, "-F", "all"]);
   if (flush.code !== 0) {
     throw new Error(`pfctl -a ${anchorName} -F all exited ${flush.code}: ${flush.stderr.trim()}`);
   }
-  if (options.enableToken !== undefined) {
-    if (!/^\d+$/.test(options.enableToken)) {
-      throw new Error("disarmPfAnchor: enableToken must be a numeric pfctl reference token");
-    }
-    const release = await runner.run("pfctl", ["-X", options.enableToken]);
-    if (release.code !== 0) {
-      throw new Error(`pfctl -X exited ${release.code}: ${release.stderr.trim()}`);
-    }
+  if (options.enableToken === undefined) {
+    return { enableReference: "none-supplied" };
   }
+  if (!/^\d+$/.test(options.enableToken)) {
+    throw new Error("disarmPfAnchor: enableToken must be a numeric pfctl reference token");
+  }
+  const release = await releasePfEnableReference({ runner }, options.enableToken);
+  return {
+    enableReference: release.disposition,
+    ...(release.reason !== undefined ? { staleReason: release.reason } : {}),
+  };
 }

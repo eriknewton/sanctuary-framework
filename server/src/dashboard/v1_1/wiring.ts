@@ -34,6 +34,14 @@ import { join } from "node:path";
 import { defaultConfig, type SanctuaryConfig } from "../../config.js";
 import { exportExitBundle } from "../../exit/bundle.js";
 import type { AuditLog } from "../../operational/audit-log.js";
+import {
+  auditEntryAgentId,
+  type AuditAttributionOptionsResolver,
+} from "../../castle-wall/audit-attribution.js";
+import {
+  loadFortressProducerKey,
+  type ProducerKeyLoad,
+} from "../../castle-wall/runtime/producer-signature.js";
 import { IdentityManager } from "../../cognitive/tools.js";
 import {
   HubService,
@@ -45,8 +53,13 @@ import {
   readPersistedLocalAgents,
   writePersistedLocalAgents,
 } from "../../hub/agent-registry-persistence.js";
+import {
+  agentRecordAttributionIds,
+  publicAgentIdForVerifiedAttribution,
+} from "../../hub/agent-attribution.js";
 import type { ChannelTemplateId } from "../../policy-engine/constants.js";
 import type { HubAgentStatus } from "../../contracts/v1.1/constants.js";
+import type { LocalAgentRecord } from "../../contracts/v1.1/local-agent-records.js";
 import type { SubstrateSelector } from "../../intelligence/selector.js";
 import type { ReputationStore } from "../../reputation/reputation-store.js";
 import { loadPrincipalPolicy } from "../../principal-policy/loader.js";
@@ -54,6 +67,7 @@ import type { PrincipalPolicy } from "../../principal-policy/types.js";
 import type { StorageBackend } from "../../storage/interface.js";
 import {
   ConciergeMemoryStore,
+  AgentContextCache,
   OperatorChatService,
   OperatorChatStore,
   type ConciergeContextProviders,
@@ -173,6 +187,22 @@ export interface BuildV11BindingsInputs {
    * binding reports inactive.
    */
   tierBPiiRedactorInstalled?: boolean;
+  /**
+   * Optional fixed Castle Wall producer public key for read-side audit
+   * attribution. Production callers usually omit this and let the wiring load
+   * from `storagePath`; tests can inject a deterministic key.
+   */
+  pinnedProducerKeyB64url?: string | null;
+  /**
+   * Optional live attribution resolver. When supplied it wins over the fixed
+   * key/storage loader and lets an entry point share an already-loaded key cache.
+   */
+  resolveAuditAttribution?: AuditAttributionOptionsResolver;
+  /**
+   * Optional warning sink for producer-key load failures. Default is stderr via
+   * `console.error`; tests can inject a no-op when exercising unreadable keys.
+   */
+  warnProducerKeyUnavailable?: (reason: string) => void;
 }
 
 /** Anomaly-detection binding mounted behind the dashboard auth chokepoint. */
@@ -335,6 +365,73 @@ class CapabilityErrorAgentController implements HubAgentController {
   }
 }
 
+function buildAuditAttributionResolver(
+  inputs: BuildV11BindingsInputs,
+): AuditAttributionOptionsResolver {
+  if (inputs.resolveAuditAttribution) return inputs.resolveAuditAttribution;
+  const staticKey = inputs.pinnedProducerKeyB64url ?? null;
+  const subjectFortressId = inputs.fortressId;
+  if (staticKey !== null) {
+    return () => ({
+      pinnedProducerKeyB64url: staticKey,
+      subjectFortressId,
+    });
+  }
+
+  const storagePath = inputs.storagePath;
+  if (storagePath === undefined) {
+    return () => ({
+      pinnedProducerKeyB64url: null,
+      subjectFortressId,
+    });
+  }
+
+  let cached: ProducerKeyLoad | undefined;
+  let lastWarnedReason: string | null = null;
+  const warn =
+    inputs.warnProducerKeyUnavailable ??
+    ((reason: string) => {
+      // SAFETY: stderr is the only operator-visible channel available in this
+      // sync wiring helper; no key material is printed, only the load status.
+      // Visible fail-honest path: a present-but-unusable key means Castle Wall
+      // agent attribution is deliberately omitted until the key can be read.
+      console.error(
+        `Warning: Castle Wall audit attribution unavailable (${reason}).`,
+      );
+    });
+
+  return async () => {
+    if (cached?.status === "present") {
+      return {
+        pinnedProducerKeyB64url: cached.keyB64url,
+        subjectFortressId,
+      };
+    }
+    let load: ProducerKeyLoad;
+    try {
+      load = await loadFortressProducerKey(storagePath);
+    } catch {
+      load = { status: "unreadable", reason: "producer_key_load_threw" };
+    }
+    if (load.status === "present") {
+      cached = load;
+      lastWarnedReason = null;
+      return {
+        pinnedProducerKeyB64url: load.keyB64url,
+        subjectFortressId,
+      };
+    }
+    if (load.status === "unreadable" && load.reason !== lastWarnedReason) {
+      lastWarnedReason = load.reason;
+      warn(load.reason);
+    }
+    return {
+      pinnedProducerKeyB64url: null,
+      subjectFortressId,
+    };
+  };
+}
+
 /**
  * Construct the v1.1 hub bindings the dashboard entry points share. Caller
  * keeps ownership of the returned `HubService`; pass it through to the
@@ -366,6 +463,7 @@ export function buildV11Bindings(
   void pruneExpiredDidWebKeysOnUnlock(inputs).catch(() => {
     // Best-effort unlock pruning must not block dashboard construction.
   });
+  const resolveAuditAttribution = buildAuditAttributionResolver(inputs);
 
   // WP-V1.2-4: construct the operator-chat service when the caller has
   // wired the fortress storage + master key. Concierge surface depends
@@ -409,6 +507,26 @@ export function buildV11Bindings(
       // hiccup should not block hub construction. The next unlock
       // re-runs the prune.
     });
+    const agentContextCache = new AgentContextCache({
+      identityId: inputs.identityId,
+      agentRegistry: registry,
+      auditLog: inputs.auditLog,
+      resolveAuditAttribution,
+      onRefreshError: (error) => {
+        const message =
+          error instanceof Error ? error.message : String(error);
+        const warn =
+          inputs.warnProducerKeyUnavailable ??
+          ((reason: string) => {
+            // SAFETY: startup/degradation warning to local server stderr only.
+            console.error(
+              `Warning: Castle Wall audit attribution unavailable (${reason}).`,
+            );
+          });
+        warn(`agent_context_cache_refresh_failed:${message}`);
+      },
+    });
+    void agentContextCache.refresh();
     operatorChatService = new OperatorChatService({
       store: chatStore,
       auditLog: inputs.auditLog,
@@ -420,14 +538,17 @@ export function buildV11Bindings(
         auditLog: inputs.auditLog,
         identityId: inputs.identityId,
         registry,
+        resolveAuditAttribution,
       }),
       conciergePiiFilter: buildConciergePiiFilter(),
-      // Rho-2.5: thread the live Tier B config so the concierge smart-mode
-      // rewrite path reads `shouldRewriteSmartMode()` at invocation time.
-      // The reverse-mapping store (encrypted, per-fortress) is required
-      // for the smart-mode path to fire end-to-end (store mappings ->
-      // restore at render); wired here when storage + master key + a
-      // storage path are available.
+      // Rho-2.5: thread the live Tier B config so the concierge rewrite
+      // path reads the gates (`evaluateForQuery()`) at invocation time:
+      // smart mode when `smart_mode_enabled`, basic anonymize-all when
+      // only `enabled`. The reverse-mapping store (encrypted,
+      // per-fortress) is required for the smart-mode path to fire
+      // end-to-end (store mappings -> restore at render); wired here when
+      // storage + master key + a storage path are available. Without it,
+      // smart mode degrades to the basic anonymize-all rewrite.
       ...(piiConfigStore
         ? {
             queryAnonymityConfig: piiConfigStore,
@@ -448,6 +569,7 @@ export function buildV11Bindings(
         auditLog: inputs.auditLog,
         identityId: inputs.identityId,
         registry,
+        resolveAuditAttribution,
       }),
       ...(inputs.intelligenceSelector
         ? {
@@ -457,6 +579,7 @@ export function buildV11Bindings(
             }),
           }
         : {}),
+      conciergeAgentContextCache: agentContextCache,
     });
   }
 
@@ -545,6 +668,8 @@ export function buildV11Bindings(
     activitySources: {
       auditLog: inputs.auditLog,
       identityId: inputs.identityId,
+      subjectFortressId: inputs.fortressId,
+      resolveAuditAttribution,
     },
     policyBudgetSources: {
       listPolicySummaries: () => [],
@@ -640,20 +765,24 @@ function buildConciergeContextProviders(args: {
   auditLog: AuditLog;
   identityId: string;
   registry: InMemoryLocalAgentRegistry;
+  resolveAuditAttribution: AuditAttributionOptionsResolver;
 }): ConciergeContextProviders {
   return {
     recentActivity: async () => {
       const result = await args.auditLog.query({ limit: 30 });
+      const auditAttribution = await args.resolveAuditAttribution();
+      const records = args.registry.list({ identity_id: args.identityId });
       const lines = result.entries
-        .filter((e) => e.identity_id === args.identityId)
+        .filter((e) =>
+          entryBelongsToConciergeScope(
+            e,
+            args.identityId,
+            records,
+            auditAttribution,
+          ),
+        )
         .slice(-30)
-        .map((e) => {
-          const agentId =
-            (e.details && typeof e.details["agent_id"] === "string"
-              ? (e.details["agent_id"] as string)
-              : null) ?? "_fortress";
-          return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
-        });
+        .map((e) => formatConciergeActivityLine(e, auditAttribution, records));
       if (lines.length === 0) return "(no recent activity)";
       return lines.join("\n");
     },
@@ -695,6 +824,7 @@ function buildConciergeContextFetchers(args: {
   auditLog: AuditLog;
   identityId: string;
   registry: InMemoryLocalAgentRegistry;
+  resolveAuditAttribution: AuditAttributionOptionsResolver;
 }): ContextFetchers {
   const empty = async () => "";
   return {
@@ -729,15 +859,24 @@ function buildConciergeContextFetchers(args: {
     },
     agent_activity: async (agentNameHint) => {
       const result = await args.auditLog.query({ limit: 50 });
-      const owned = result.entries.filter(
-        (e) => e.identity_id === args.identityId,
+      const auditAttribution = await args.resolveAuditAttribution();
+      const records = args.registry.list({ identity_id: args.identityId });
+      const owned = result.entries.filter((e) =>
+        entryBelongsToConciergeScope(
+          e,
+          args.identityId,
+          records,
+          auditAttribution,
+        ),
       );
       const filtered = agentNameHint
         ? owned.filter((e) => {
             const agentId =
-              e.details && typeof e.details["agent_id"] === "string"
-                ? (e.details["agent_id"] as string)
-                : "";
+              publicAgentIdForConciergeActivity(
+                e,
+                auditAttribution,
+                records,
+              ) ?? "";
             return agentId
               .toLowerCase()
               .includes(agentNameHint.toLowerCase());
@@ -746,19 +885,20 @@ function buildConciergeContextFetchers(args: {
       const tail = (filtered.length > 0 ? filtered : owned).slice(-20);
       if (tail.length === 0) return "(no activity)";
       return tail
-        .map((e) => {
-          const agentId =
-            (e.details && typeof e.details["agent_id"] === "string"
-              ? (e.details["agent_id"] as string)
-              : null) ?? "_fortress";
-          return `${e.timestamp}  ${e.layer}.${e.operation}  agent=${agentId}  result=${e.result}`;
-        })
+        .map((e) => formatConciergeActivityLine(e, auditAttribution, records))
         .join("\n");
     },
     audit_log: async () => {
       const result = await args.auditLog.query({ limit: 30 });
-      const owned = result.entries.filter(
-        (e) => e.identity_id === args.identityId,
+      const auditAttribution = await args.resolveAuditAttribution();
+      const records = args.registry.list({ identity_id: args.identityId });
+      const owned = result.entries.filter((e) =>
+        entryBelongsToConciergeScope(
+          e,
+          args.identityId,
+          records,
+          auditAttribution,
+        ),
       );
       if (owned.length === 0) return "(no audit log entries)";
       return owned
@@ -786,6 +926,44 @@ function buildConciergeContextFetchers(args: {
     },
     verascore_deltas: empty,
   };
+}
+
+type ConciergeAuditAttribution = Awaited<
+  ReturnType<AuditAttributionOptionsResolver>
+>;
+
+function publicAgentIdForConciergeActivity(
+  entry: Parameters<typeof auditEntryAgentId>[0],
+  auditAttribution: ConciergeAuditAttribution,
+  records: ReadonlyArray<LocalAgentRecord>,
+): string | null {
+  const verifiedSubject = auditEntryAgentId(entry, auditAttribution);
+  return verifiedSubject === null
+    ? null
+    : publicAgentIdForVerifiedAttribution(verifiedSubject, records);
+}
+
+function formatConciergeActivityLine(
+  entry: Parameters<typeof auditEntryAgentId>[0],
+  auditAttribution: ConciergeAuditAttribution,
+  records: ReadonlyArray<LocalAgentRecord>,
+): string {
+  const agentId =
+    publicAgentIdForConciergeActivity(entry, auditAttribution, records) ??
+    "_fortress";
+  return `${entry.timestamp}  ${entry.layer}.${entry.operation}  agent=${agentId}  result=${entry.result}`;
+}
+
+function entryBelongsToConciergeScope(
+  entry: Parameters<typeof auditEntryAgentId>[0],
+  identityId: string,
+  records: ReadonlyArray<LocalAgentRecord>,
+  auditAttribution: ConciergeAuditAttribution,
+): boolean {
+  if (entry.identity_id === identityId) return true;
+  const agentId = auditEntryAgentId(entry, auditAttribution);
+  if (agentId === null) return false;
+  return records.some((record) => agentRecordAttributionIds(record).has(agentId));
 }
 
 /**
@@ -872,7 +1050,10 @@ function buildConciergePiiFilter(): ConciergePiiFilter {
  * Synthesize a stable fortress id from the storage path. Until v1.2 lands
  * a canonical fortress id source, the storage path hash is stable across
  * boots of the same fortress and unique across distinct fortresses on the
- * same host. Display only; not used for trust decisions.
+ * same host. This value is the local fortress namespace and the comparison
+ * basis for fortress-scoped liveness checks. It is not remote evidence, but it
+ * is a local trust anchor for separating one storage-backed fortress from
+ * another.
  */
 export function fortressIdFromStoragePath(storagePath: string): string {
   const digest = createHash("sha256").update(storagePath).digest("hex");

@@ -11,6 +11,16 @@
  * sees is the F3 lockout generator this build removes. When no OS keyring
  * is available this module returns null and the caller enrolls a different
  * second factor (or records an explicit degraded install mode).
+ *
+ * RATIFIED POSTURE (2026-07-22, docs/custody-recovery-posture.md): this
+ * machine-resident factor may UNLOCK the master for daily use but must never
+ * BOOTSTRAP new human-held custody. No verb enrolls a new passphrase, mints a
+ * recovery key, or rotates the master from a keychain-only unlock — the OS
+ * keyring releases this key to any process in the logged-in session, so such
+ * a verb would let anyone at an unlocked machine silently take over custody.
+ * Custody-changing ceremonies require a human-held credential (passphrase or
+ * recovery key). The absence of that verb is the security property; do not
+ * "fix" it without superseding the posture doc.
  */
 
 import { spawn } from "node:child_process";

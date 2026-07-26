@@ -8,9 +8,13 @@
 
 import { describe, it, expect } from "vitest";
 import { join } from "node:path";
+import { userInfo } from "node:os";
 import {
   resolveStoragePath,
   resolveDashboardPort,
+  assertHermeticStoragePath,
+  homeFortressPath,
+  NonHermeticStoragePathError,
   DEFAULT_DASHBOARD_PORT,
   DEFAULT_STORAGE_DIR,
 } from "../../src/paths.js";
@@ -47,6 +51,88 @@ describe("resolveStoragePath", () => {
       fakeHome
     );
     expect(a).not.toBe(b);
+  });
+});
+
+// ── Hermeticity guard ────────────────────────────────────────────────
+//
+// The suite must never read from or write to the operator's own fortress.
+// Doing so pollutes real state (the backup directory grew on essentially
+// every run) and makes results depend on whether the host happens to have a
+// fortress, so the same test can pass locally and fail on a fresh CI runner.
+// These tests pin the guard that makes that failure loud instead of silent.
+
+describe("assertHermeticStoragePath", () => {
+  // The account record, not $HOME: a test that isolates itself by moving
+  // $HOME must still be measured against the operator's actual home.
+  const operatorFortress = join(userInfo().homedir, DEFAULT_STORAGE_DIR);
+
+  it("throws when a test resolves the operator's own fortress", () => {
+    expect(() => assertHermeticStoragePath(operatorFortress)).toThrow(
+      NonHermeticStoragePathError,
+    );
+  });
+
+  it("names the offending path and how to fix it", () => {
+    let thrown: unknown;
+    try {
+      assertHermeticStoragePath(operatorFortress);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(NonHermeticStoragePathError);
+    const message = (thrown as Error).message;
+    expect(message).toContain(operatorFortress);
+    expect(message).toContain("createTempFortress");
+  });
+
+  it("allows any path that is not the operator's fortress", () => {
+    expect(() => assertHermeticStoragePath("/tmp/some-temp-fortress")).not.toThrow();
+    // A sibling of the real fortress is a different directory, not the one
+    // under protection.
+    expect(() =>
+      assertHermeticStoragePath(`${operatorFortress}-scratch`),
+    ).not.toThrow();
+  });
+
+  it("honours the explicit opt-out for a test that must observe the default", () => {
+    const previous = process.env.SANCTUARY_ALLOW_OPERATOR_FORTRESS;
+    process.env.SANCTUARY_ALLOW_OPERATOR_FORTRESS = "1";
+    try {
+      expect(() => assertHermeticStoragePath(operatorFortress)).not.toThrow();
+    } finally {
+      if (previous === undefined) {
+        delete process.env.SANCTUARY_ALLOW_OPERATOR_FORTRESS;
+      } else {
+        process.env.SANCTUARY_ALLOW_OPERATOR_FORTRESS = previous;
+      }
+    }
+  });
+
+  it("guards resolveStoragePath's ambient home fallback", () => {
+    // No storage-path override and the operator's real home: exactly the
+    // silent-pollution path this guard exists to close.
+    expect(() =>
+      resolveStoragePath({}, userInfo().homedir),
+    ).toThrow(NonHermeticStoragePathError);
+  });
+
+  it("does not fire when a storage-path override redirects the resolution", () => {
+    expect(
+      resolveStoragePath(
+        { SANCTUARY_STORAGE_PATH: "/tmp/tenant-a" },
+        userInfo().homedir,
+      ),
+    ).toBe("/tmp/tenant-a");
+  });
+
+  it("guards homeFortressPath, the shared default-location chokepoint", () => {
+    expect(() => homeFortressPath(userInfo().homedir)).toThrow(
+      NonHermeticStoragePathError,
+    );
+    expect(homeFortressPath("/home/somebody-else")).toBe(
+      join("/home/somebody-else", DEFAULT_STORAGE_DIR),
+    );
   });
 });
 

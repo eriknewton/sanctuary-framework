@@ -41,6 +41,7 @@ import {
   resolveProducerPubKeyPath,
   loadFortressProducerKey,
 } from "../../src/castle-wall/runtime/producer-signature.js";
+import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -51,6 +52,8 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
 } from "../../src/castle-wall/constants.js";
 
 import { DashboardApprovalChannel } from "../../src/principal-policy/dashboard.js";
@@ -103,6 +106,37 @@ function stubIdentityManager(): IdentityManager {
 const FRESH_TS = Date.now() - 1000;
 const daemonPriv = ed25519.utils.randomPrivateKey();
 const daemonPub = ed25519.getPublicKey(daemonPriv);
+const FORTRESS = "fortress:test";
+
+function subjectForUid(uid: number): string {
+  const subject = protectionSubjectForUid(FORTRESS, uid);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
+}
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
+const CLAIM_UID = 601;
+const CLAIM_TOKEN = auditTokenForRuid(CLAIM_UID);
+const CLAIM_SUBJECT = subjectForUid(CLAIM_UID);
 
 function toBase64url(bytes: Uint8Array): string {
   let bin = "";
@@ -115,9 +149,9 @@ function canonicalEntry(): string {
     timestamp: new Date(FRESH_TS).toISOString(),
     layer: "l1",
     operation: "egress_allowed",
-    identity_id: "id-1",
+    identity_id: CLAIM_TOKEN,
     result: "success",
-    details: { agent_id: "id-1", dest_host: "ok.example" },
+    details: { agent_id: CLAIM_TOKEN, dest_host: "ok.example" },
   });
 }
 
@@ -129,7 +163,7 @@ async function appendGenuine(log: AuditLog): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation: "egress_allowed",
-    identity_id: "id-1",
+    identity_id: CLAIM_SUBJECT,
     result: "success",
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
@@ -139,6 +173,8 @@ async function appendGenuine(log: AuditLog): Promise<void> {
       [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -152,7 +188,7 @@ async function appendForged(log: AuditLog): Promise<void> {
   await log.appendCritical({
     layer: "l1",
     operation: "egress_allowed",
-    identity_id: "id-1",
+    identity_id: CLAIM_SUBJECT,
     result: "success",
     timestamp: new Date(FRESH_TS).toISOString(),
     details: {
@@ -162,6 +198,8 @@ async function appendForged(log: AuditLog): Promise<void> {
       [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -335,6 +373,7 @@ describe("producer-key production wiring — startDashboard snapshot server", ()
       identityManager: stubIdentityManager(),
       teeAvailable: true,
       reputation: { score: 90, profile_url: "https://verascore.ai/p/x" },
+      resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
       resolvePinnedProducerKey: () =>
         load.status === "present" ? load.keyB64url : null,
       ...(load.status === "unreadable"

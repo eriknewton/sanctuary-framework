@@ -8,7 +8,11 @@
 
 import type { SubstrateSelector } from "../intelligence/selector.js";
 import type { Surface } from "../intelligence/types.js";
-import { PII_CATEGORIES, type PiiCategory } from "./pii-rewrite.js";
+import {
+  PII_CATEGORIES,
+  rewritePiiRegexOnly,
+  type PiiCategory,
+} from "./pii-rewrite.js";
 
 export type QueryIntentCategory =
   | "location_grounded"
@@ -49,11 +53,19 @@ export async function classifyQueryIntent(
   query: string,
   selector: QueryIntentSelector,
 ): Promise<QueryIntent> {
+  // The classify surface (`privacy-filter-tier-2`) is pinned local-only
+  // (ratified 2026-07-23; `TIER2_PINNED_SURFACE` in
+  // intelligence/types.ts), and the RAW query is still not embedded in
+  // the prompt: defense in depth costs nothing here, and intent
+  // classification keys on query STRUCTURE ("who is [NAME_0]?",
+  // "restaurants near [STREET_ADDRESS_0]"), which the category-stable
+  // placeholders preserve.
+  const scrubbedQuery = rewritePiiRegexOnly(query).rewritten;
   const prompt = [
     "Classify the operator query for Rho-3 query anonymity smart mode.",
     `PII classes: ${PII_CATEGORIES.join(", ")}.`,
     "Return the intent category whose original PII is needed for a useful answer.",
-    `Query: ${query}`,
+    `Query: ${scrubbedQuery}`,
   ].join("\n");
   const response = await selector.invokeClassify(QUERY_INTENT_CLASSIFIER_SURFACE, {
     kind: "classify",

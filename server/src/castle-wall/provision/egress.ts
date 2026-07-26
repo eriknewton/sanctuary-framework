@@ -232,20 +232,57 @@ export function endpointIsMessagingExfilRisk(endpoint: HarnessEndpoint): boolean
 }
 
 /**
+ * Routing mode for the provisioned endpoint rules (Unified Protect Slice 5
+ * S5-4, the exclusive routing model, design BLOCKER-1 fix):
+ *
+ *  - `coarse` (default, byte-identical to the shipped v1 shape): rules ship
+ *    UNSCOPED (`scope: {}`), so the confined agent may reach its declared
+ *    endpoints DIRECTLY. The drill-proven coarse posture.
+ *  - `exclusive`: rules are RE-SCOPED AWAY FROM THE AGENT to the gate
+ *    principal (`scope.uids = [gate_uid]`, the S5-0 per-principal axis), so
+ *    the GATE uid is kernel-bounded to the declared endpoint set while the
+ *    agent's only sanctioned path off the box is the gate channel. macOS-only
+ *    (the Linux daemon fail-closed refuses `uids`-bearing rule files by
+ *    design); the exclusive-routing composer asserts no agent-reachable
+ *    direct endpoint allow survives composition.
+ */
+export type ProvisionedEgressRouting =
+  | { readonly mode: "coarse" }
+  | { readonly mode: "exclusive"; readonly gate_uid: number };
+
+/**
  * Build the provisioned allow rules for a harness endpoint set (pure).
  *
  * Shape decisions (design section 3.3): exact host + pinned port + pinned
- * protocol; UNSCOPED (v1 carries the mandatory same-PR `.unattributed`
- * uid-mode evaluator hardening instead of a uids scope axis, which has a
- * real cross-language version-skew hazard); `derived: true` + provenance id
- * + harness-naming description (section 2.3). Throws when any built rule
- * fails schema validation -- a rule that cannot be published safely must
- * abort the flow, never be silently dropped.
+ * protocol; `derived: true` + provenance id + harness-naming description
+ * (section 2.3). Scope is routing-mode dependent (see
+ * {@link ProvisionedEgressRouting}): UNSCOPED in coarse mode (the shipped v1
+ * shape, byte-identical), gate-uid-scoped in exclusive mode (S5-4). Throws
+ * when any built rule fails schema validation -- a rule that cannot be
+ * published safely must abort the flow, never be silently dropped -- and
+ * when an exclusive routing carries a non-positive gate uid.
  */
 export function buildProvisionedEgressRules(
   set: HarnessEndpointSet,
   createdAt: string,
+  routing: ProvisionedEgressRouting = { mode: "coarse" },
 ): AllowlistRule[] {
+  if (
+    routing.mode === "exclusive" &&
+    (!Number.isInteger(routing.gate_uid) || routing.gate_uid <= 0)
+  ) {
+    throw new Error(
+      `provisioned egress rules: exclusive routing requires a positive integer gate_uid, got ${String(
+        (routing as { gate_uid: unknown }).gate_uid,
+      )}`,
+    );
+  }
+  const scope: AllowlistRule["scope"] =
+    routing.mode === "exclusive" ? { uids: [routing.gate_uid] } : {};
+  const routingNote =
+    routing.mode === "exclusive"
+      ? " Exclusive routing: bound to the sanctuary-gate principal (S5-0 uids scope); the agent transits the gate."
+      : "";
   const rules: AllowlistRule[] = set.endpoints.map((endpoint) => ({
     id: provisionedRuleId(set.harnessId, endpoint),
     schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
@@ -253,13 +290,14 @@ export function buildProvisionedEgressRules(
     description:
       `Provisioned egress for harness "${set.harnessId}": ${endpoint.name} ` +
       `(${endpoint.host}:${endpoint.port}/${endpoint.protocol}). Published by 'sanctuary protect'; ` +
-      `revocable via unprovision (provenance-tagged id).`,
+      `revocable via unprovision (provenance-tagged id).` +
+      routingNote,
     match: {
       host: [endpoint.host],
       port: [endpoint.port],
       protocol: endpoint.protocol,
     },
-    scope: {},
+    scope: { ...scope },
     disposition: "allow",
     derived: true,
   }));
@@ -436,6 +474,13 @@ export interface PublishProvisionedEgressInput {
    * unreachable socket -- is a fail-closed refusal.
    */
   reloadPolicy: PolicyReloadTrigger;
+  /**
+   * Routing mode for the published rules (S5-4). Default coarse (the shipped
+   * v1 shape, byte-identical). Exclusive scopes every provisioned rule to the
+   * gate principal; the same provenance-tagged ids are reused, so a mode
+   * switch republishes (overwrites) the same files rather than duplicating.
+   */
+  routing?: ProvisionedEgressRouting;
   now?: () => Date;
 }
 
@@ -459,7 +504,11 @@ export async function publishProvisionedEgressRules(
   const now = input.now ?? (() => new Date());
   const dir = egressRulesDir(input.fortressPath);
   try {
-    const rules = buildProvisionedEgressRules(input.endpointSet, now().toISOString());
+    const rules = buildProvisionedEgressRules(
+      input.endpointSet,
+      now().toISOString(),
+      input.routing ?? { mode: "coarse" },
+    );
     await mkdir(dir, { recursive: true, mode: 0o700 });
     const wantedFilenames = new Set(rules.map((rule) => `${rule.id}.json`));
     for (const rule of rules) {
@@ -558,6 +607,199 @@ export async function scrubProvisionedEgressRules(
     }
   }
   return { removedRuleIds, reloadOk };
+}
+
+/**
+ * The raw bytes of one provisioned rule file, captured before a run mutates
+ * the rules directory. Bytes, not parsed rules: the restore must reproduce the
+ * signing source EXACTLY, and a parse-then-reserialize round trip is a second
+ * chance to change what the operator signed.
+ */
+export interface ProvisionedEgressRuleFile {
+  filename: string;
+  content: string;
+}
+
+/**
+ * FIX F-REVOKE (HIGH, Mini1 confined-Hermes drill 2026-07-26), step 1 of 2:
+ * capture every `provisioned-<harness>-*` rule file BEFORE this run publishes
+ * over them, so an abort can put the operator's rule set back the way it was
+ * instead of blanket-scrubbing it.
+ *
+ * The pre-fix abort path called {@link scrubProvisionedEgressRules}, which
+ * removes ALL provisioned rules for the harness -- including the ones a
+ * PREVIOUS successful run published and this run never touched. On hardware a
+ * refused second arm therefore took a running, correctly-confined agent from
+ * "reaches its own manifest" to "reaches nothing" while reporting a clean
+ * rollback. Fail-closed, never a wrong-allow, but an adopter trap with no
+ * product CLI path back.
+ *
+ * Fail-loud: an unreadable rules directory throws, because a snapshot that
+ * silently came back empty would license exactly the blanket scrub this
+ * exists to prevent.
+ */
+export async function snapshotProvisionedEgressRules(
+  fortressPath: string,
+  harnessId: string,
+): Promise<ProvisionedEgressRuleFile[]> {
+  const dir = egressRulesDir(fortressPath);
+  const prefix = provisionedRuleIdPrefix(harnessId);
+  let filenames: string[];
+  try {
+    filenames = await readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+  const snapshot: ProvisionedEgressRuleFile[] = [];
+  for (const filename of filenames.filter((n) => n.startsWith(prefix) && n.endsWith(".json")).sort()) {
+    snapshot.push({ filename, content: await readFile(join(dir, filename), "utf8") });
+  }
+  return snapshot;
+}
+
+/** Input to {@link restoreProvisionedEgressRules}. */
+export interface RestoreProvisionedEgressInput {
+  fortressPath: string;
+  harnessId: string;
+  /** The pre-run capture from {@link snapshotProvisionedEgressRules}. An empty snapshot restores to "no provisioned rules". */
+  snapshot: ReadonlyArray<ProvisionedEgressRuleFile>;
+  /**
+   * Optional reload trigger. Rules on disk are the signing source, but the
+   * RUNNING daemon keeps serving the previous composition until it reloads --
+   * so a restore whose reload could not be confirmed has not reached the
+   * agent yet, and says so rather than claiming success.
+   */
+  reloadPolicy?: PolicyReloadTrigger;
+}
+
+/** Outcome of {@link restoreProvisionedEgressRules}. Every field is an OBSERVATION, never an intent. */
+export interface RestoreProvisionedEgressResult {
+  /** True only when the post-restore read-back matched the snapshot byte-for-byte. */
+  restored: boolean;
+  /** True when a reload was requested AND confirmed. False (with `restored` true) means "on disk, not yet serving". */
+  reloadOk: boolean;
+  restoredRuleIds: string[];
+  removedRuleIds: string[];
+  /** Human-readable reasons `restored` is false, or `[]`. */
+  problems: string[];
+}
+
+/**
+ * FIX F-REVOKE, step 2 of 2: restore the harness's provisioned rule files to
+ * the captured pre-run state and VERIFY the restoration by reading the
+ * directory back, rather than reporting success because no call threw
+ * (`recovery-paths-must-verify-not-report`).
+ *
+ * Semantics are "make the provisioned rule set equal the snapshot": files this
+ * run added are removed, files it overwrote or deleted are rewritten from the
+ * captured bytes. An EMPTY snapshot therefore degenerates to exactly the old
+ * scrub behaviour, which is the correct outcome for a first-ever run -- the
+ * defect was never the scrub itself, it was scrubbing a state this run did not
+ * create.
+ *
+ * Never throws: this runs on abort paths where an exception would mask the
+ * original failure. Every problem is reported in the result instead.
+ */
+export async function restoreProvisionedEgressRules(
+  input: RestoreProvisionedEgressInput,
+): Promise<RestoreProvisionedEgressResult> {
+  const dir = egressRulesDir(input.fortressPath);
+  const prefix = provisionedRuleIdPrefix(input.harnessId);
+  const problems: string[] = [];
+  const removedRuleIds: string[] = [];
+  const ruleIdOf = (filename: string): string => filename.slice(0, -".json".length);
+
+  // Defence in depth: production's only snapshot source is this module's own
+  // `readdir`, so a filename can never carry a separator -- but this function
+  // WRITES to a root-owned directory from data it was handed, so it re-derives
+  // the constraint here rather than trusting its caller. A rejected entry is a
+  // recorded problem (so `restored` is false), never a silent skip.
+  const wanted = new Map<string, string>();
+  for (const file of input.snapshot) {
+    const wellFormed =
+      file.filename.startsWith(prefix) &&
+      file.filename.endsWith(".json") &&
+      !file.filename.includes("/") &&
+      !file.filename.includes("\\") &&
+      !file.filename.includes("\0") &&
+      file.filename !== `${prefix}.json`;
+    if (!wellFormed) {
+      problems.push(
+        `refusing to restore ${JSON.stringify(file.filename)}: not a plain provisioned-${input.harnessId}-*.json rule filename`,
+      );
+      continue;
+    }
+    wanted.set(file.filename, file.content);
+  }
+
+  try {
+    if (wanted.size > 0) {
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+    }
+    let present: string[] = [];
+    try {
+      present = (await readdir(dir)).filter((n) => n.startsWith(prefix) && n.endsWith(".json"));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    for (const filename of present) {
+      if (wanted.has(filename)) continue;
+      await unlink(join(dir, filename));
+      removedRuleIds.push(ruleIdOf(filename));
+    }
+    for (const [filename, content] of wanted) {
+      await writeFile(join(dir, filename), stringToBytes(content), { mode: 0o600 });
+    }
+  } catch (err) {
+    problems.push(`rewriting the provisioned rule files failed: ${(err as Error).message}`);
+  }
+
+  // Verified read-back. The claim "restored" is only ever made about state
+  // observed AFTER the writes, and only when the bytes match.
+  let observed: ProvisionedEgressRuleFile[];
+  try {
+    observed = await snapshotProvisionedEgressRules(input.fortressPath, input.harnessId);
+  } catch (err) {
+    return {
+      restored: false,
+      reloadOk: false,
+      restoredRuleIds: [],
+      removedRuleIds,
+      problems: [...problems, `the restored rule set could not be read back for verification: ${(err as Error).message}`],
+    };
+  }
+  const observedByName = new Map(observed.map((file) => [file.filename, file.content]));
+  for (const [filename, content] of wanted) {
+    const actual = observedByName.get(filename);
+    if (actual === undefined) {
+      problems.push(`${ruleIdOf(filename)} was not restored`);
+    } else if (actual !== content) {
+      problems.push(`${ruleIdOf(filename)} was restored with different content than the pre-run capture`);
+    }
+  }
+  for (const filename of observedByName.keys()) {
+    if (!wanted.has(filename)) {
+      problems.push(`${ruleIdOf(filename)} survived the restore but was not in the pre-run capture`);
+    }
+  }
+  const restored = problems.length === 0;
+
+  let reloadOk = true;
+  if (input.reloadPolicy !== undefined) {
+    try {
+      reloadOk = (await input.reloadPolicy()).ok;
+    } catch {
+      reloadOk = false;
+    }
+  }
+  return {
+    restored,
+    reloadOk,
+    restoredRuleIds: restored ? [...wanted.keys()].map(ruleIdOf) : [],
+    removedRuleIds,
+    problems,
+  };
 }
 
 /** One row of the post-arm as-uid probe report. */

@@ -149,6 +149,7 @@ async function buildChainWithFreshArmEvidence(
 function badgeRead(reader: AuditLog, now?: number) {
   return reader.runEagerReads(() =>
     buildCastleWallPosture({
+      protectionClaimSubject: FORTRESS,
       auditLog: reader,
       originMachine: FORTRESS,
       pinnedProducerKeyB64url: null,

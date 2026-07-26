@@ -93,11 +93,33 @@ export function validateExclusiveEgressGatePolicy(
   return { agent_uid: c.agent_uid, gate_port: c.gate_port };
 }
 
+/** Options for {@link deriveGateAllowRule}. */
+export interface DeriveGateAllowRuleOptions {
+  /**
+   * Exclusive routing (Unified Protect Slice 5 S5-4, design section "The
+   * exclusive routing model" point 2 / the S5-0 row's "gate-channel to the
+   * agent principal"): scope the derived gate-channel rule to the AGENT uid
+   * (`scope.uids = [agent_uid]`) instead of the legacy empty scope, so under
+   * the two-confined-uid origin model the gate channel binds to exactly the
+   * agent principal and never also matches the gate principal (or any other
+   * confined uid). Default false: the legacy empty-scope form is emitted
+   * byte-identically (the shipped Slice-1 composition is unchanged).
+   *
+   * macOS-only semantics: `scope.uids` is the S5-0 macOS axis; the Linux
+   * (Rust) daemon fail-closed REFUSES uids-bearing rules by design, so this
+   * option is only ever set by the macOS exclusive-routing composition.
+   */
+  scope_to_agent_uid?: boolean;
+}
+
 /**
  * Derive the `.agent`-scoped manifest allow rule for the gate channel:
- * destination `127.0.0.1/32`, the gate port, TCP, disposition allow, empty
- * scope (all wrapped agents; the evaluator only consults rules for
- * agent-classified flows, so this rule never widens operator posture).
+ * destination `127.0.0.1/32`, the gate port, TCP, disposition allow. Scope is
+ * empty by default (all wrapped agents; the evaluator only consults rules for
+ * agent-classified flows, so this rule never widens operator posture); the
+ * S5-4 exclusive-routing composition passes `scope_to_agent_uid` so the gate
+ * channel binds to exactly the agent principal under the two-confined-uid
+ * origin model.
  *
  * Callers MUST pass a policy that already survived
  * {@link validateExclusiveEgressGatePolicy}; this function re-validates and
@@ -106,6 +128,7 @@ export function validateExclusiveEgressGatePolicy(
 export function deriveGateAllowRule(
   policy: ExclusiveEgressGatePolicy,
   createdAt: string,
+  options?: DeriveGateAllowRuleOptions,
 ): AllowlistRule {
   if (validateExclusiveEgressGatePolicy(policy) === null) {
     throw new Error(
@@ -125,7 +148,10 @@ export function deriveGateAllowRule(
       port: [policy.gate_port],
       protocol: "tcp",
     },
-    scope: {},
+    scope:
+      options?.scope_to_agent_uid === true
+        ? { uids: [policy.agent_uid] }
+        : {},
     disposition: "allow",
     derived: true,
   };

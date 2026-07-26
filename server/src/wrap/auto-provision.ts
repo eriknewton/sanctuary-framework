@@ -29,8 +29,23 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, rename, copyFile, chmod, chown as fsChown, lchown, access, lstat, readlink, symlink, rm, cp } from "node:fs/promises";
-import { dirname, relative, resolve as pathResolve, sep } from "node:path";
+import {
+  mkdir,
+  rename,
+  copyFile,
+  chmod,
+  chown as fsChown,
+  lchown,
+  access,
+  lstat,
+  readFile,
+  readlink,
+  symlink,
+  rm,
+  cp,
+  realpath,
+} from "node:fs/promises";
+import { basename, dirname, join, normalize as normalizePath, relative, resolve as pathResolve, sep } from "node:path";
 import { resolve as dnsResolve } from "node:dns/promises";
 
 import {
@@ -42,9 +57,14 @@ import {
   RehomeExecutionError,
   restoreRehomeSteps,
   resolveHermesGatewayArgv,
+  realHarnessArgvOps,
   runProvisionFlow,
   resolvePolicyDaemonAction,
   withProvisionLock,
+  PROVISION_LOCK_PATH,
+  ProvisionLockHeldError,
+  type ProvisionLockOps,
+  type DisarmNePreferenceOutcome,
   type ProvisionFlowOps,
   type ProvisionFlowOutcome,
   type RehomeStepResult,
@@ -54,27 +74,65 @@ import {
   publishProvisionedEgressRules,
   readEgressRulesFromDisk,
   verifyProvisionedEgressStatically,
-  scrubProvisionedEgressRules,
+  snapshotProvisionedEgressRules,
+  restoreProvisionedEgressRules,
+  type ProvisionedEgressRuleFile,
   buildAgentEgressProbeSpecs,
   buildAgentEgressReport,
   asUidTlsProbeArgv,
   asUidProbeReachableDecision,
+  parseHighestAssignedUidFromDsclList,
+  parseDsclOutputWithNoUnparsedResidue,
+  parseServiceAccountIsHidden,
+  AccountUidEnumerationError,
   type AgentEgressVerifyReport,
 } from "../castle-wall/provision/index.js";
 import { resolveCastleWallSocketPath } from "../castle-wall/runtime/socket-path.js";
 import {
-  planAgentHarnessDaemonInstall,
+  AGENT_HARNESS_DAEMON_PLIST_PATH,
+  planCoarseHarnessDaemonInstall,
   installAgentHarnessDaemon,
   uninstallAgentHarnessDaemon,
   agentHarnessDaemonStatus,
+  setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
+  type HarnessLaunchSpec,
 } from "../egress-gate/harness-daemon.js";
+import {
+  planParkedHarnessInstall,
+  executeParkedHarnessInstall,
+  projectRevertToRestoreReport,
+  revertParkedHarnessInstall,
+  type HarnessStandDownSnapshot,
+  type ParkedInstallRevertOps,
+} from "../egress-gate/release-barrier.js";
+import {
+  createInstallExclusiveEgressOps,
+  createRepairExclusiveEgressOps,
+  createUnprotectExclusiveEgressOps,
+  ensureAgentHarnessHoldDir,
+  clearExclusiveRoutingResidueWithoutAccount,
+  observeAgentConfinementProduction,
+  reconcileStaleExclusiveRoutingProduction,
+  type ExclusiveEgressWiringInput,
+  type ExclusiveRoutingResidueTeardown,
+} from "../egress-gate/arming-wiring.js";
+import { deriveGateAccountName } from "../egress-gate/gate-account.js";
+// FIX G2: the no-account teardown's refusal states the exit at the FILE level,
+// so it names the two real surfaces that carry per-uid confinement.
+import { EGRESS_GATE_DAEMON_LABEL_PREFIX } from "../egress-gate/gate-daemon.js";
+import { PF_ANCHOR_REGISTRY_PATH } from "../egress-gate/anchor-registry.js";
+import {
+  runEgressGateRepair,
+  type ExclusiveEgressArmOps,
+  type EgressGateRepairOutcome,
+} from "../castle-wall/provision/exclusive-arm.js";
+import { runEgressGateUnprotect } from "../castle-wall/provision/exclusive-unprotect.js";
 
 const execFileAsync = promisify(execFile);
 
 const PROVISION_CEILING = 500;
 const NEW_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
-const PROVISION_LOCK_PATH = "/var/run/sanctuary-provision.lock";
 
 /** Budget for polling the policy-daemon socket to become reachable after install-boot (Bug B). */
 const POLICY_DAEMON_SOCKET_BUDGET_MS = 10_000;
@@ -518,6 +576,52 @@ export function allHermesCredentialDestPaths(): string[] {
 }
 
 /**
+ * FIX F-ALREADYDEDICATED (HIGH, Mini1 confined-Hermes drill 2026-07-26): the
+ * credential set the pre-arm/post-arm verify must probe, resolved for BOTH
+ * provisioning paths rather than only the fresh one.
+ *
+ * R6-5 threaded the ACTUALLY-MOVED set through the fresh path so a legitimate
+ * partial Hermes install (no Google Workspace MCP, no OAuth login) could arm.
+ * The alreadyDedicated path -- every SECOND and later `protect` run -- left it
+ * `undefined` and fell back to `allHermesCredentialDestPaths()`, the full
+ * static adapter list. On hardware that meant the first arm succeeded and
+ * every re-run refused at verify-before-arm on four credentials the install
+ * had never had (`.hermes/auth.json`, `.google_workspace_mcp/credentials`,
+ * `.workspace-mcp/cli-tokens`, `.hermes/google-mcp-creds`), printing a remedy
+ * the operator could not act on. That is what left the exclusive-egress gate
+ * unarmable.
+ *
+ * The fix keeps the invariant and does NOT widen the check: re-home did not
+ * run on this path, so "what was actually moved" is recovered by OBSERVING the
+ * account instead of assuming a list. Every adapter secret path that is
+ * PRESENT on the account is probed for readable-by-agent-uid exactly as
+ * before, so a moved-but-unreadable credential still fails closed; only paths
+ * that are genuinely absent are dropped. Presence is checked NO-FOLLOW, so a
+ * dangling symlink at a credential path counts as present and is probed (and
+ * fails) rather than silently vanishing from the verified set. An account with
+ * NO credential present returns `[]`, which the R7-2 guard in
+ * {@link hermesEndpointProbes} turns into a synthetic always-false probe --
+ * arming over an agent with nothing to confine stays refused.
+ */
+export async function resolveCredentialDestPathsToVerify(input: {
+  /** The `moved` + `isSecret` dest paths this run re-homed, or undefined when re-home did not run. */
+  movedThisRun: string[] | undefined;
+  newAccountHome: string;
+  /** No-follow presence check (production: `pathExistsNoFollow`). */
+  existsNoFollow: (path: string) => Promise<boolean>;
+}): Promise<string[]> {
+  if (input.movedThisRun !== undefined) return input.movedThisRun;
+  const accountBase = input.newAccountHome.replace(/\/+$/, "");
+  const observed: string[] = [];
+  for (const destRelativePath of allHermesCredentialDestPaths()) {
+    if (await input.existsNoFollow(`${accountBase}/${destRelativePath}`)) {
+      observed.push(destRelativePath);
+    }
+  }
+  return observed;
+}
+
+/**
  * Build the real, injected pre-arm/post-arm endpoint probe list for Hermes.
  * Exported (fix chokepoint, 2026-07-07 re-gate 3) so the real-ops unit suite
  * can drive the FULL probe list (DNS hosts + every credential path) against
@@ -550,9 +654,14 @@ export function hermesEndpointProbes(
   // (e.g. no Google Workspace MCP, so `google-mcp-creds`/`cli-tokens`/
   // `credentials` are `skipped-absent`) would otherwise fail verify on the
   // absent-credential probes and could NEVER arm. `credentialDestPaths` is
-  // the `moved` set threaded from the re-home results; it falls back to the
-  // full adapter list only when unknown (the alreadyDedicated path, where the
-  // account is presumed already complete).
+  // the `moved` set threaded from the re-home results.
+  //
+  // FIX F-ALREADYDEDICATED: PRODUCTION NOW ALWAYS SUPPLIES A MEASURED SET --
+  // `resolveCredentialDestPathsToVerify` observes the account on the
+  // alreadyDedicated path, so the `?? allHermesCredentialDestPaths()` fallback
+  // below is a defensive last resort for a caller with no knowledge at all,
+  // not a live path. It WAS live, and it is why every second `protect` run
+  // refused on credentials the install had never had.
   const destPaths = credentialDestPaths ?? allHermesCredentialDestPaths();
   const traverseFrom = dirname(newAccountHome);
   for (const destRelativePath of destPaths) {
@@ -713,32 +822,84 @@ async function resolveOperatorIdentity(): Promise<OperatorIdentity | undefined> 
   return { uid: sudoIdentity.uid, gid: sudoIdentity.gid, home };
 }
 
-/**
- * FIX (round 5, item N4): parse the record names out of `dscl . -search
- * /Users UniqueID <n>` output. `dscl -search` emits the matched attribute in
- * the PARENTHESIZED, multi-line plist form, e.g.
- *
- *   eriknewton\t\tUniqueID = (
- *       501
- *   )
- *
- * The pre-fix parser was `/^(\S+)\s+UniqueID\s*=\s*\d+/m`, which requires the
- * uid digits on the SAME line as `UniqueID =` and therefore NEVER matched the
- * real `= (` form: every uid-fallback home lookup and every
- * `resolveAccountShapeVerdict` account-name check silently missed. This
- * parser matches the record-name line (`name  UniqueID =`) whether the value
- * is parenthesized-multiline or single-line, and returns ALL matched record
- * names (a `-search` can in principle return more than one record). Exported
- * so the seam can drive it against captured real dscl output.
- */
-export function parseDsclSearchAccountNames(stdout: string): string[] {
-  const names: string[] = [];
-  const re = /^(\S+)\s+UniqueID\s*=/gm;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(stdout)) !== null) {
-    names.push(m[1]);
+const DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE = /^(.+?)\s+UniqueID\s*=\s*(.*)$/;
+const DSCL_UNIQUE_ID_VALUE_RE = /^(?:"(-?\d+)"|(-?\d+))$/;
+
+interface DsclSearchAccountRecord {
+  readonly accountName: string;
+  readonly uid: number;
+}
+
+function parseDsclSearchUidValue(rawValue: string): number | undefined {
+  const match = DSCL_UNIQUE_ID_VALUE_RE.exec(rawValue);
+  if (match === null) return undefined;
+  const uid = Number(match[1] ?? match[2]);
+  return Number.isSafeInteger(uid) ? uid : undefined;
+}
+
+function parseDsclSearchAccountRecordAt(
+  lines: readonly string[],
+  lineIndex: number,
+): { readonly value: DsclSearchAccountRecord; readonly nextLineIndex: number } | undefined {
+  const line = lines[lineIndex]!;
+  if (/^\s/.test(line)) return undefined;
+  const match = DSCL_SEARCH_UNIQUE_ID_RECORD_LINE_RE.exec(line);
+  if (match === null) return undefined;
+  const accountName = match[1]!.trimEnd();
+  if (accountName.length === 0) return undefined;
+
+  const rawValue = match[2]!.trim();
+  const sameLineUid = parseDsclSearchUidValue(rawValue);
+  if (sameLineUid !== undefined) {
+    return { value: { accountName, uid: sameLineUid }, nextLineIndex: lineIndex + 1 };
   }
-  return names;
+  if (rawValue !== "(") return undefined;
+
+  const values: string[] = [];
+  let cursor = lineIndex + 1;
+  while (cursor < lines.length) {
+    const trimmed = lines[cursor]!.trim();
+    cursor += 1;
+    if (trimmed.length === 0) continue;
+    if (trimmed === ")") {
+      if (values.length !== 1) return undefined;
+      const uid = parseDsclSearchUidValue(values[0]!);
+      if (uid === undefined) return undefined;
+      return { value: { accountName, uid }, nextLineIndex: cursor };
+    }
+    values.push(trimmed);
+  }
+  return undefined;
+}
+
+/**
+ * Parse the record names out of `dscl . -search /Users UniqueID <n>` output.
+ * The parser uses the shared no-residue dscl discipline: unparsed output is not
+ * evidence of absence, so non-empty unfamiliar lines throw instead of returning
+ * an empty holder list.
+ */
+export function parseDsclSearchAccountNames(stdout: string, searchedUid: number): string[] {
+  if (!Number.isSafeInteger(searchedUid)) {
+    throw new AccountUidEnumerationError(
+      `Refusing to trust dscl . -search /Users UniqueID <uid>: searched uid must be a safe integer ` +
+        `(got ${String(searchedUid)}).`,
+    );
+  }
+  const records = parseDsclOutputWithNoUnparsedResidue(
+    stdout,
+    `dscl . -search /Users UniqueID ${searchedUid}`,
+    parseDsclSearchAccountRecordAt,
+  );
+  for (const record of records) {
+    if (record.uid !== searchedUid) {
+      throw new AccountUidEnumerationError(
+        `Refusing to trust dscl . -search /Users UniqueID ${searchedUid}: record ` +
+          `${JSON.stringify(record.accountName)} reported UniqueID=${record.uid}, expected ${searchedUid}. ` +
+          `Search output must prove the requested name-to-uid binding.`,
+      );
+    }
+  }
+  return records.map((record) => record.accountName);
 }
 
 /** Look up a NFSHomeDirectory by account name (preferred) or uid, via dscl. Fail-closed: any error or unparsed output resolves undefined. */
@@ -758,7 +919,7 @@ async function lookupHomeDirectory(user: string | undefined, uid: number): Promi
     ]);
     // FIX (round 5, item N4): parse the parenthesized dscl -search output
     // shape (the pre-fix same-line-digits regex never matched it).
-    const [accountName] = parseDsclSearchAccountNames(searchOut);
+    const [accountName] = parseDsclSearchAccountNames(searchOut, uid);
     if (accountName === undefined) return undefined;
     const { stdout } = await execFileAsync("/usr/bin/dscl", [
       ".",
@@ -789,6 +950,13 @@ export interface RunAutoProvisionForWrapOptions {
   getuid?: () => number;
   /** Override for the resolved operator identity (tests only; production leaves this undefined and resolves via SUDO_UID/GID/USER). */
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+  /**
+   * Unified Protect Slice 5 S5-6: fine-grained (exclusive-egress) mode. The
+   * harness is PARK-installed (S5-5 barrier form) and the exclusive-egress
+   * arming stage (gate generation + release barrier) runs after the coarse
+   * stages prove live. Off by default (coarse drill-proven path unchanged).
+   */
+  exclusiveEgress?: boolean;
 }
 
 /**
@@ -810,6 +978,26 @@ export function policyDaemonInstallBootArgs(
     args.push("--binary", cliBinary);
   }
   return args;
+}
+
+/**
+ * Resolve the argv prefix that launches the exclusive-egress gate daemon.
+ *
+ * The gate daemon runs as the confined gate service account, whose launchd
+ * PATH has no `node`. Both a supplied `--binary` path and the fallback CLI
+ * path are `.js` entrypoints carrying a `#!/usr/bin/env node` shebang, which
+ * fails with `env: node: No such file or directory` under that account and
+ * crashes the daemon at startup (the "D9" gate-daemon crash proven on
+ * hardware 2026-07-21). Pinning `process.execPath` (an absolute interpreter)
+ * makes the launch independent of the account's PATH.
+ *
+ * Single chokepoint for both provisioning builders so the two call sites can
+ * never drift back to a bare shebang-dependent argv.
+ */
+export function resolveGateDaemonArgvPrefix(cliBinary?: string): string[] {
+  return cliBinary !== undefined && cliBinary.length > 0
+    ? [process.execPath, cliBinary]
+    : [process.execPath, process.argv[1] ?? "sanctuary"];
 }
 
 export interface AutoProvisionPolicyDaemonSignals {
@@ -942,6 +1130,14 @@ export async function runAutoProvisionForWrap(
     candidateUid !== undefined && candidateUid >= PROVISION_CEILING && candidateUid !== consoleOwnerUid
       ? await resolveAccountShapeVerdict(accountName, candidateUid)
       : undefined;
+  // Caller-supplied excluded uids are a backstop for live identities observed
+  // outside the dscl uid lookup. A stale harness-config uid may be free after
+  // account deletion; the direct uid observation in planAndCreateAccount settles
+  // that instead of treating configured state as known-live.
+  const excludedAgentAccountUids = [
+    consoleOwnerUid,
+    ...(runningAgentUid !== undefined ? [runningAgentUid] : []),
+  ];
   const detectResult = detectProvisionNeed({
     harnessConfiguredUid,
     runningAgentUid,
@@ -961,11 +1157,118 @@ export async function runAutoProvisionForWrap(
   let resolvedAgentUidGid: { uid: number; gid: number } | undefined;
   // FIX (round 5 / R6-5): the dest-relative paths re-home ACTUALLY moved this
   // run (moved + isSecret entries). Threaded into the endpoint probes so a
-  // legitimately-absent (skipped-absent) credential is never probed. Stays
-  // undefined on the alreadyDedicated path (re-home did not run), where the
-  // probe falls back to the full adapter set (the account is presumed
-  // complete).
-  let movedCredentialDestPaths: string[] | undefined;
+  // legitimately-absent (skipped-absent) credential is never probed.
+  //
+  // FIX F-ALREADYDEDICATED: this is now "the credential set to verify", not
+  // "the set this run moved". On the alreadyDedicated path re-home does not
+  // run, so `installHarnessDaemon` (which runs on EVERY path, strictly before
+  // either probe call) resolves it by OBSERVING the account instead of leaving
+  // it undefined and falling back to the full static adapter list.
+  let credentialDestPathsToVerify: string[] | undefined;
+  // FIX F-REVOKE: the harness's provisioned egress rule FILES exactly as they
+  // were before this run published over them. Captured once, in
+  // `provisionEgress`, and the sole source of truth for what an abort must
+  // restore. `undefined` means the capture never ran (no publish happened), and
+  // the restore op refuses rather than inventing a pre-run state.
+  let preRunProvisionedEgressRules: ProvisionedEgressRuleFile[] | undefined;
+  // S5-6: the REAL harness LAUNCH captured at parked-install time (the release
+  // barrier's argv-digest source AND the environment every later plist
+  // re-render needs -- FIX F-HARNESSENV). Set exactly once, only in exclusive
+  // mode.
+  let capturedHarnessLaunch: HarnessLaunchSpec | undefined;
+  // Drill-D2 fix-round (2026-07-18): what the harness looked like BEFORE the
+  // parked install stood it down -- prior plist bytes + prior installed/running
+  // state. The material `restoreStoodDownHarness` needs to put the operator's
+  // agent back on any abort. Set exactly once, only in exclusive mode, only
+  // when a parked install actually ran.
+  let harnessStandDownSnapshot: HarnessStandDownSnapshot | undefined;
+
+  // The ONE best-effort CLI audit closure for this flow's fortress. Hoisted
+  // out of `buildExclusiveWiringInput` so the mode-independent residue gate
+  // below can audit through the same sink WITHOUT constructing the exclusive
+  // wiring input (which throws before the parked install has resolved a uid,
+  // and which must not be a precondition for a coarse run).
+  const castleWallAuditBestEffort = async (
+    operation: string,
+    details: Record<string, unknown>,
+  ): Promise<void> => {
+    try {
+      const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+      await appendCastleWallCliAuditBestEffort(
+        operation,
+        { source: "sanctuary-protect", ...details },
+        wallFortressPath,
+        process.env,
+        process.stderr,
+      );
+    } catch {
+      // Best-effort by contract.
+    }
+  };
+
+  // S5-6: the exclusive-egress arming stage's production wiring. Built
+  // LAZILY: the agent uid + harness argv are only known after the parked
+  // install ran, and the stage is only ever invoked after it (orchestrate
+  // asserts the parked form first). A call before that state exists is a
+  // contract violation and throws (fail-closed; the orchestrator maps it to
+  // the degrade-loud outcome, which leaves the agent parked).
+  const buildExclusiveWiringInput = (): ExclusiveEgressWiringInput => {
+    if (resolvedAgentUidGid === undefined || capturedHarnessLaunch === undefined) {
+      throw new Error(
+        "exclusive-egress stage invoked before the parked harness install resolved the agent uid/launch (contract violation)",
+      );
+    }
+    const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
+      const { requestPolicyReload } = await import("../cli/castle-wall.js");
+      const result = await requestPolicyReload(wallFortressPath, "darwin");
+      return result.ok ? { ok: true } : { ok: false, error: result.error };
+    };
+    return {
+      agentId,
+      agentUid: resolvedAgentUidGid.uid,
+      agentAccount: accountName,
+      fortressPath: wallFortressPath,
+      harnessLaunch: capturedHarnessLaunch,
+      harnessLogDir: resolveHarnessDaemonLogDir(newAccountHome),
+      agentTemplate: agentId,
+      gateDaemonArgvPrefix: resolveGateDaemonArgvPrefix(options.cliBinary),
+      excludeUids: [consoleOwnerUid],
+      gateAccountCeiling: PROVISION_CEILING,
+      gateHomeDirectory: `${NEW_ACCOUNT_HOME_BASE}/${deriveGateAccountName(agentId)}`,
+      reloadPolicy,
+      publishProvisionedRules: async (routing) => {
+        const published = await publishProvisionedEgressRules({
+          fortressPath: wallFortressPath,
+          endpointSet: HERMES_ENDPOINT_SET,
+          reloadPolicy,
+          routing,
+        });
+        return published.ok
+          ? { ok: true as const, ruleIds: published.ruleIds }
+          : { ok: false as const, error: published.error };
+      },
+      audit: castleWallAuditBestEffort,
+      print,
+      accountOps: realAccountProvisionOps(),
+    };
+  };
+  let cachedExclusiveOps: ExclusiveEgressArmOps | undefined;
+  const lazyExclusiveOps = (): ExclusiveEgressArmOps => {
+    cachedExclusiveOps ??= createInstallExclusiveEgressOps(buildExclusiveWiringInput());
+    return cachedExclusiveOps;
+  };
+  const exclusiveEgressOps: ExclusiveEgressArmOps | undefined =
+    options.exclusiveEgress === true
+      ? {
+          bringUpGeneration: () => lazyExclusiveOps().bringUpGeneration(),
+          runReleaseSequence: (committed) => lazyExclusiveOps().runReleaseSequence(committed),
+          restoreCoarseComposition: (reason) => lazyExclusiveOps().restoreCoarseComposition(reason),
+          startHarnessCoarse: () => lazyExclusiveOps().startHarnessCoarse(),
+          assessHarnessParked: () => lazyExclusiveOps().assessHarnessParked(),
+          audit: (operation, details) => lazyExclusiveOps().audit(operation, details),
+          print,
+        }
+      : undefined;
 
   const ops: ProvisionFlowOps = {
     confirm: (promptText) => confirmOnTty(promptText),
@@ -976,7 +1279,12 @@ export async function runAutoProvisionForWrap(
       // time, so the confined harness resolves ~/.hermes to where the
       // secrets actually get moved.
       return planAndCreateAccount(
-        { accountName, ceiling: PROVISION_CEILING, homeDirectory: newAccountHome },
+        {
+          accountName,
+          ceiling: PROVISION_CEILING,
+          homeDirectory: newAccountHome,
+          excludedUids: excludedAgentAccountUids,
+        },
         realAccountProvisionOps(),
       );
     },
@@ -1018,7 +1326,7 @@ export async function runAutoProvisionForWrap(
       // MOVED (never skipped-absent), so the endpoint probes verify only what
       // this run actually placed on the account -- a partial-credential
       // install (some sources legitimately absent) can still arm.
-      movedCredentialDestPaths = results
+      credentialDestPathsToVerify = results
         .filter((r) => r.status === "moved" && r.entry.isSecret)
         .map((r) => r.entry.destRelativePath);
       return { plan, results };
@@ -1031,6 +1339,17 @@ export async function runAutoProvisionForWrap(
       // and `arm`'s `--agent-uid=<uid>` below, which both treat uid===gid
       // for this dedicated service account).
       resolvedAgentUidGid = { uid, gid: uid };
+      // FIX F-ALREADYDEDICATED: resolve the credential set the verify will
+      // probe on EVERY path. On the fresh path `rehome` already set it (step 5
+      // precedes this step 6), including the deliberate EMPTY set the R7-2
+      // guard fails closed on -- `undefined` here means, and only means, that
+      // re-home did not run, i.e. the alreadyDedicated path. Observe the
+      // account rather than assuming the full static adapter list.
+      credentialDestPathsToVerify = await resolveCredentialDestPathsToVerify({
+        movedThisRun: credentialDestPathsToVerify,
+        newAccountHome,
+        existsNoFollow: pathExistsNoFollow,
+      });
       // FIX (round 5 / R7-1, R8-1): report the honest daemon-presence signals
       // and NEVER throw -- return a discriminated result so the orchestrator's
       // teardown decision keys on "did this attempt stand the daemon up" for
@@ -1045,17 +1364,83 @@ export async function runAutoProvisionForWrap(
         before = { known: false, installed: false };
       }
       try {
-        const resolved = await resolveHermesGatewayArgv({ pathExists: pathExists }, { agentHome: newAccountHome });
+        // FIX F-INTERP: resolve the interpreter by what the AGENT uid can
+        // actually execute (never by `pathExists` on a system python), so the
+        // installed plist cannot pair a system interpreter with a foreign-ABI
+        // venv and crash-loop before launchd sees a stable pid.
+        const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
+          agentHome: newAccountHome,
+          agentUid: uid,
+        });
         const harnessLogDir = resolveHarnessDaemonLogDir(newAccountHome);
         await mkdir(harnessLogDir, { recursive: true, mode: 0o700 });
         await chmod(harnessLogDir, 0o700);
         await fsChown(harnessLogDir, uid, uid);
-        const plan = planAgentHarnessDaemonInstall({
+        if (options.exclusiveEgress === true) {
+          // S5-6 fine-grained mode: the S5-5 PARKED install. The plist is the
+          // barrier form (Disabled + RunAtLoad=false + wrapper argv), the job
+          // is launchctl-disabled, any stale hold file is removed, and
+          // NOTHING is bootstrapped: the release barrier starts the agent
+          // strictly after the gate generation commits. The REAL harness argv
+          // is captured for the barrier's argv-digest.
+          capturedHarnessLaunch = resolved.launch;
+          const plan = planParkedHarnessInstall({
+            agentAccount: accountName,
+            agentUid: uid,
+            harnessLaunch: resolved.launch,
+            fortressPath: process.env.SANCTUARY_STORAGE_PATH,
+            logDir: harnessLogDir,
+          });
+          const snapshot = await executeParkedHarnessInstall(plan, {
+            // Fix-round 2 (2026-07-18): the SAME revert ops the outcome
+            // chokepoint uses, handed to the install itself so a failure
+            // AFTER it has mutated undoes its own work before the error
+            // leaves. Previously the snapshot reached this scope only on the
+            // success path, so the one assertion that fired on Mini1 stood the
+            // agent down and destroyed the record of how to restore it.
+            ...realParkedInstallRevertOps(daemonOps),
+            // Drill D1: the wrapper lands in the root-owned hold dir, which
+            // nothing else in a first-ever install creates. `ensureHoldDir` is
+            // the production ensure the release sequence's hold-file write
+            // also uses, so both writers agree on one root-owned 0755 dir.
+            ensureHoldDir: ensureAgentHarnessHoldDir,
+            // Drill-D2 fix-round: the SNAPSHOT source. The install is about to
+            // overwrite the singleton harness plist; without capturing the
+            // prior bytes first there is nothing to restore an aborted run to.
+            readFile: async (path) => {
+              try {
+                return await readFile(path, "utf8");
+              } catch (err) {
+                if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+                throw err;
+              }
+            },
+            writeFile: daemonOps.writeFile,
+            removeFile: daemonOps.removeFile,
+            runLaunchctl: daemonOps.runLaunchctl,
+            harnessStatus: () => agentHarnessDaemonStatus(daemonOps),
+            // Drill D2: the parked install stands down an already-running
+            // harness. Stopping the operator's live agent is never silent.
+            notify: (message) => print(message),
+          });
+          // Drill-D2 fix-round: hold the snapshot so an abort ANYWHERE
+          // downstream can put the operator's agent back exactly as it was.
+          // Reported to the orchestrator as `harnessStoodDown`, which -- unlike
+          // `bootstrappedThisRun: false` -- does not claim the pre-existing job
+          // was left alone.
+          harnessStandDownSnapshot = snapshot;
+          return {
+            ok: true as const,
+            bootstrappedThisRun: false,
+            parked: true,
+            harnessStoodDown: snapshot.preexistingJobModified,
+          };
+        }
+        const plan = planCoarseHarnessDaemonInstall({
           agentAccount: accountName,
-          programArguments: resolved.programArguments,
+          harnessLaunch: resolved.launch,
           fortressPath: process.env.SANCTUARY_STORAGE_PATH,
           logDir: harnessLogDir,
-          environment: resolved.environment,
         });
         await installAgentHarnessDaemon(plan, daemonOps);
         return { ok: true as const, bootstrappedThisRun: before.known && !before.installed };
@@ -1075,6 +1460,35 @@ export async function runAutoProvisionForWrap(
     // reporting a clean rollback. Reuses the shipped fail-loud uninstaller.
     uninstallHarnessDaemon: async () => {
       await uninstallAgentHarnessDaemon(realHarnessDaemonOps());
+    },
+    // Drill-D2 fix-round: put a harness THIS run stood down back the way it
+    // was. Distinct from `uninstallHarnessDaemon`, which destroys a daemon
+    // this run CREATED -- here the job pre-existed, so the remedy is restore,
+    // never removal. Called from the orchestrator's single outcome chokepoint.
+    restoreStoodDownHarness: async () => {
+      const snapshot = harnessStandDownSnapshot;
+      if (snapshot === undefined) {
+        // Nothing was stood down, so nothing is owed. Said in the shape the
+        // orchestrator's wording keys on: no restart was needed, none happened.
+        return { restored: true, wasRunning: false, harnessRestarted: false, problems: [] };
+      }
+      // Fix-round 2 (2026-07-18): pass the OBSERVED verdict straight through.
+      // This used to be `result.errors.length === 0` -- a statement about how
+      // quietly the revert failed. `revertParkedHarnessInstall` now derives
+      // `restored` from post-restore state (plist back AND the job running
+      // again, or never running), so a stopped agent can no longer be reported
+      // as restored. `harnessRestarted` reaches the operator-facing wording
+      // instead of being discarded here.
+      //
+      // FIX-ROUND 6 (2026-07-19): this used to be a hand-rolled object literal
+      // listing four of the five fields, and the one it omitted was the
+      // OBSERVED run-state claim -- the eleventh instance of the subsystem's
+      // one defect. The projection is now a single shared function next to the
+      // type it projects, so the claim cannot be dropped by a caller who did
+      // not know it was there.
+      return projectRevertToRestoreReport(
+        await revertParkedHarnessInstall(snapshot, realParkedInstallRevertOps(realHarnessDaemonOps())),
+      );
     },
     // Bug B (the one-flow gap): ensure a reachable Castle Wall POLICY daemon for
     // the target fortress BEFORE arming. Arming with no policy daemon deny-all-
@@ -1229,6 +1643,22 @@ export async function runAutoProvisionForWrap(
         const result = await requestPolicyReload(wallFortressPath, "darwin");
         return result.ok ? { ok: true as const } : { ok: false as const, error: result.error };
       };
+      // FIX F-REVOKE: capture the harness's EXISTING signed grants before this
+      // run publishes over them, so an abort can put them back instead of
+      // revoking a previous successful run's rules and strangling a live
+      // agent. Fail CLOSED if the capture is impossible: without it the only
+      // available rollback would be the blanket scrub that caused the defect.
+      try {
+        preRunProvisionedEgressRules = await snapshotProvisionedEgressRules(wallFortressPath, agentId);
+      } catch (err) {
+        return {
+          ok: false as const,
+          error:
+            `the agent's existing egress allow rules could not be captured before publishing ` +
+            `(${(err as Error).message}); refusing to provision, because a failed run could not then be ` +
+            `rolled back without revoking grants this run did not create.`,
+        };
+      }
       const published = await publishProvisionedEgressRules({
         fortressPath: wallFortressPath,
         endpointSet: HERMES_ENDPOINT_SET,
@@ -1282,19 +1712,38 @@ export async function runAutoProvisionForWrap(
         dnsRulePresent: staticVerify.dnsRulePresent,
       };
     },
-    // Scrub every provisioned-hermes-* rule from the signing source (verified
-    // read-back) and best-effort propagate to a still-running daemon. Used on
-    // abort/rollback so a failed run never leaves orphan grants.
-    scrubProvisionedEgress: async () => {
+    // FIX F-REVOKE: put the harness's provisioned rules back to the state the
+    // pre-publish capture observed (verified read-back), then propagate to a
+    // still-running daemon. On a FIRST run the capture is empty, so this is
+    // exactly the old scrub -- no orphan grants on a failed run. On a re-run it
+    // additionally keeps a previously-armed agent's grants alive, instead of
+    // revoking six signed allow rules the run never published and reporting a
+    // clean rollback.
+    restoreProvisionedEgressToPreRunState: async () => {
+      if (preRunProvisionedEgressRules === undefined) {
+        // Contract violation: the orchestrator only calls this after
+        // provisionEgress ran, and provisionEgress fails closed when it
+        // cannot capture. Refuse rather than guess at a pre-run state.
+        return {
+          restored: false,
+          reloadOk: false,
+          problems: [
+            "no pre-publish capture of the agent's egress rules exists, so their pre-run state is unknown; " +
+              "nothing was changed",
+          ],
+        };
+      }
       const { requestPolicyReload } = await import("../cli/castle-wall.js");
-      await scrubProvisionedEgressRules({
+      const result = await restoreProvisionedEgressRules({
         fortressPath: wallFortressPath,
         harnessId: agentId,
+        snapshot: preRunProvisionedEgressRules,
         reloadPolicy: async () => {
-          const result = await requestPolicyReload(wallFortressPath, "darwin");
-          return result.ok ? { ok: true as const } : { ok: false as const, error: result.error };
+          const reloaded = await requestPolicyReload(wallFortressPath, "darwin");
+          return reloaded.ok ? { ok: true as const } : { ok: false as const, error: reloaded.error };
         },
       });
+      return { restored: result.restored, reloadOk: result.reloadOk, problems: result.problems };
     },
     // Post-arm as-uid egress verification (design section 5): spawn a probe
     // process under the AGENT uid (`sudo -n -u '#<uid>'`; the wall and the
@@ -1328,7 +1777,35 @@ export async function runAutoProvisionForWrap(
     // somehow still undefined, fail closed to an unreachable synthetic probe
     // rather than defaulting to the CONSOLE owner's uid, which would silently
     // check readability against the wrong identity.
-    preArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, movedCredentialDestPaths),
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half): the real observation behind
+    // the refused-run enforcement sentence. Reads the committed egress-gate
+    // registry + this fortress's exclusive-routing marker; never throws, and
+    // an unreadable surface reports UNKNOWN rather than "nothing is confined".
+    observeAgentConfinement: () => observeAgentConfinementProduction(wallFortressPath),
+    // FIX F-COARSE-AFTER-EXCLUSIVE (class half): wired UNCONDITIONALLY, not
+    // under `options.exclusiveEgress === true`. The self-heal used to be
+    // reachable only through `exclusiveEgressOps` above, so the plain coarse
+    // run that hit the defect could not run it. Deliberately calls the
+    // production reconcile DIRECTLY rather than through
+    // `buildExclusiveWiringInput`, which throws before the parked install has
+    // resolved a uid -- this gate runs before any of that.
+    reconcileExclusiveRoutingResidue: (armTargetUid, intent) =>
+      reconcileStaleExclusiveRoutingProduction({
+        agentUid: armTargetUid,
+        intent,
+        fortressPath: wallFortressPath,
+        audit: castleWallAuditBestEffort,
+        print,
+      }),
+    // FIX G3 (re-gate, 2026-07-26): the residue gate's fallback subject. The
+    // detect probe resolves a uid only from a RUNNING gateway process in v1, so
+    // without this a host whose agent is merely stopped got the unknown-subject
+    // refusal -- whose remedy is a full destructive teardown -- on a fortress
+    // that is perfectly healthy. `lookupAccountUid` returns `undefined` when the
+    // account genuinely does not exist, which is exactly the state the
+    // unknown-subject sentence is written for.
+    lookupDedicatedAccountUid: async () => realAccountProvisionOps().lookupAccountUid(accountName),
+    preArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, credentialDestPathsToVerify),
     checkUidExistence: async (uid) => {
       const { checkUidExistenceBeforeArm } = await import("../castle-wall/provision/uid-gate.js");
       return checkUidExistenceBeforeArm(accountName, uid, realUidExistenceOps());
@@ -1349,7 +1826,7 @@ export async function runAutoProvisionForWrap(
       ]);
       return code === 0 ? { ok: true } : { ok: false, error: `castle-wall enable exited ${code}` };
     },
-    postArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, movedCredentialDestPaths),
+    postArmEndpoints: () => resolveEndpointProbes(newAccountHome, resolvedAgentUidGid, credentialDestPathsToVerify),
     // FIX G1 (HIGH, 2026-07-07 re-gate 3 / fix-round 3): see
     // `disarmExitCodeDecision` above for the full rationale -- `runDisable`
     // returns (does not throw) a nonzero code on failure, and this closure
@@ -1362,22 +1839,21 @@ export async function runAutoProvisionForWrap(
       // arm op above) so the fast post-arm rollback lever cannot miss the wall
       // it just armed on a non-default fortress.
       //
-      // Bug B P1: capture whether the disable AFFIRMATIVELY confirmed the NE
-      // preference is OFF, surfaced alongside the exit code via the
-      // onDisableNeConfirmedOff out-callback (runDisable's numeric contract is
-      // unchanged for every other caller). A non-throwing disarm alone is NOT
-      // sufficient to remove a freshly-installed policy daemon -- the
-      // fail-open-after-lease-revoke sub-case returns success while the NE
-      // preference may still be enabled -- so the orchestrator tears the fresh
-      // daemon down only when `neConfirmedOff === true`.
-      let neConfirmedOff = false;
+      // Bug B P1/B round-2: capture the disable outcome alongside the exit
+      // code. Only `corroborated_off` is observed-off evidence; a
+      // save-accepted-but-inconclusive disable remains a rollback result, not a
+      // protection claim.
+      let nePreferenceOutcome: DisarmNePreferenceOutcome | undefined;
       const code = await runDisable(["--fortress", wallFortressPath], {
-        onDisableNeConfirmedOff: (confirmed) => {
-          neConfirmedOff = confirmed;
+        onDisableNePreferenceOutcome: (outcome) => {
+          nePreferenceOutcome = outcome;
         },
       });
       throwIfDisarmFailed(code);
-      return { neConfirmedOff };
+      if (nePreferenceOutcome === undefined) {
+        throw new Error("castle-wall disable did not report an NE preference outcome");
+      }
+      return { nePreferenceOutcome };
     },
     restoreRehome: async (results: RehomeStepResult[]) => {
       // FIX F2/F3 (2026-07-07 fix-round): thread the OPERATOR's uid/gid
@@ -1425,8 +1901,11 @@ export async function runAutoProvisionForWrap(
         // Confined-agent egress: the SAME endpoint set the provisioning +
         // probes consume, threaded for the Tier-1 confirm plan-print.
         harnessEndpoints: HERMES_ENDPOINT_SET,
+        // S5-6: fine-grained (exclusive-egress) mode -- parked install +
+        // exclusive arming stage after the coarse stages prove live.
+        fineGrainedDeclared: options.exclusiveEgress === true,
       },
-      ops,
+      { ...ops, ...(exclusiveEgressOps !== undefined ? { exclusiveEgress: exclusiveEgressOps } : {}) },
     ),
   );
 
@@ -1602,7 +2081,8 @@ async function readRunningHermesGatewayUid(): Promise<number | undefined> {
  *   - the account NAME at this uid is exactly `expectedAccountName`
  *     (`sanctuary-<agentId>`), read via `dscl . -search /Users UniqueID` so
  *     the name<->uid binding comes from the directory service, not assumed;
- *   - `IsHidden` is `1`;
+ *   - `IsHidden` is truthy (`1`, `YES`, or `TRUE`; macOS uses `YES` on
+ *     some of its own hidden accounts);
  *   - the login shell is `/usr/bin/false` (no-login shape).
  * Any dscl failure, any missing field, or any mismatch resolves
  * `"indeterminate"`/`"not-dedicated"` -- fail-closed, never `"verified-dedicated"`
@@ -1626,7 +2106,7 @@ async function resolveAccountShapeVerdict(
     // and the alreadyDedicated fast-path could never confirm a genuinely
     // dedicated account. Parse the real shape and require the expected account
     // name to be among the matched records.
-    const searchedNames = parseDsclSearchAccountNames(searchOut);
+    const searchedNames = parseDsclSearchAccountNames(searchOut, candidateUid);
     if (!searchedNames.includes(expectedAccountName)) {
       return "not-dedicated";
     }
@@ -1636,7 +2116,8 @@ async function resolveAccountShapeVerdict(
       `/Users/${expectedAccountName}`,
       "IsHidden",
     ]);
-    if (!/IsHidden:\s*1/.test(hiddenOut)) {
+    const hiddenValue = dsclAttributeValueLineRegExp("IsHidden").exec(hiddenOut)?.[1]?.trim();
+    if (parseServiceAccountIsHidden(hiddenValue) !== true) {
       return "not-dedicated";
     }
     const { stdout: shellOut } = await execFileAsync("/usr/bin/dscl", [
@@ -1666,25 +2147,278 @@ async function confirmOnTty(promptText: string): Promise<boolean> {
   }
 }
 
+export async function canonicalizeHomeDirectory(
+  rawPath: string,
+  realpathFn: (path: string) => Promise<string> = realpath,
+): Promise<string> {
+  const normalized = normalizePath(rawPath);
+  const trimmed = normalized === "/" ? normalized : normalized.replace(/\/+$/, "");
+  const pendingSegments: string[] = [];
+  let cursor = trimmed;
+  while (true) {
+    try {
+      const resolvedPrefix = await realpathFn(cursor);
+      const combined = pendingSegments.length === 0 ? resolvedPrefix : join(resolvedPrefix, ...pendingSegments);
+      const normalizedCombined = normalizePath(combined);
+      return normalizedCombined === "/" ? normalizedCombined : normalizedCombined.replace(/\/+$/, "");
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      const parent = dirname(cursor);
+      if (parent === cursor) throw err;
+      pendingSegments.unshift(basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+export interface DsclReadResult {
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly execErrorCode?: string;
+}
+
+export type DsclRecordReadDecision = "present" | "record-absent" | "unknown";
+
+export type DsclAttributeReadDecision =
+  | { readonly kind: "value"; readonly value: string }
+  | { readonly kind: "attribute-absent" }
+  | { readonly kind: "record-absent" }
+  | { readonly kind: "unknown"; readonly diagnostic: string };
+
+const DSCL_STDIO_MAXBUFFER_ERROR = "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+const DSCL_DIAGNOSTIC_MAX_CHARS = 512;
+const DSCL_RECORD_NOT_FOUND_RE = /eDSRecordNotFound|DS Error:\s*-14136|Invalid Path/i;
+const DSCL_NO_SUCH_KEY_RE = /^No such key:\s*([A-Za-z_][A-Za-z0-9_-]*)\b/i;
+const DSCL_ATTRIBUTE_LINE_RE = /^(?:dsAttrTypeNative:)?([A-Za-z_][A-Za-z0-9_-]*):(?:\s|$)/;
+
+function dsclRawDiagnostic(result: Pick<DsclReadResult, "stdout" | "stderr">): string {
+  return [result.stderr, result.stdout]
+    .filter((part) => part.trim().length > 0)
+    .join("\n")
+    .trim();
+}
+
+function dsclDiagnosticLines(result: Pick<DsclReadResult, "stdout" | "stderr">): string[] {
+  return dsclRawDiagnostic(result)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+function allDsclDiagnosticLinesMatch(
+  result: Pick<DsclReadResult, "stdout" | "stderr">,
+  predicate: (line: string) => boolean,
+): boolean {
+  const lines = dsclDiagnosticLines(result);
+  return lines.length > 0 && lines.every(predicate);
+}
+
+function boundedDsclDiagnostic(summary: string): string {
+  if (summary.length <= DSCL_DIAGNOSTIC_MAX_CHARS) return summary;
+  return `${summary.slice(0, DSCL_DIAGNOSTIC_MAX_CHARS - "...<truncated>".length)}...<truncated>`;
+}
+
+function summarizeDsclNames(names: ReadonlySet<string>): string {
+  const sorted = [...names].sort((a, b) => a.localeCompare(b));
+  const shown = sorted.slice(0, 8);
+  return shown.join(", ") + (sorted.length > shown.length ? `, +${sorted.length - shown.length} more` : "");
+}
+
+function summarizeDsclStream(label: "stdout" | "stderr", content: string): string | undefined {
+  const lines = content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length === 0) return undefined;
+
+  const attributeNames = new Set<string>();
+  const missingAttributeNames = new Set<string>();
+  let recordNotFoundLines = 0;
+  let unclassifiedLines = 0;
+
+  for (const line of lines) {
+    const noSuchKey = DSCL_NO_SUCH_KEY_RE.exec(line);
+    if (noSuchKey !== null) {
+      missingAttributeNames.add(noSuchKey[1]!);
+      continue;
+    }
+    if (DSCL_RECORD_NOT_FOUND_RE.test(line)) {
+      recordNotFoundLines += 1;
+      continue;
+    }
+    const attribute = DSCL_ATTRIBUTE_LINE_RE.exec(line);
+    if (attribute !== null) {
+      attributeNames.add(attribute[1]!);
+      continue;
+    }
+    unclassifiedLines += 1;
+  }
+
+  const parts = [
+    `${label}: ${Buffer.byteLength(content, "utf8")} bytes`,
+    `${lines.length} line${lines.length === 1 ? "" : "s"}`,
+  ];
+  if (attributeNames.size > 0) parts.push(`attributes=[${summarizeDsclNames(attributeNames)}]`);
+  if (missingAttributeNames.size > 0) {
+    parts.push(`missing-attributes=[${summarizeDsclNames(missingAttributeNames)}]`);
+  }
+  if (recordNotFoundLines > 0) parts.push(`record-not-found-lines=${recordNotFoundLines}`);
+  if (unclassifiedLines > 0) parts.push(`unclassified-lines=${unclassifiedLines}`);
+  return parts.join(", ");
+}
+
+export function dsclDiagnostic(result: DsclReadResult): string {
+  const parts = [
+    result.execErrorCode !== undefined ? `exec-error=${result.execErrorCode}` : undefined,
+    summarizeDsclStream("stderr", result.stderr),
+    summarizeDsclStream("stdout", result.stdout),
+  ].filter((part): part is string => part !== undefined && part.length > 0);
+  return boundedDsclDiagnostic(parts.join("; "));
+}
+
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function dsclAttributeValueLineRegExp(attribute: string): RegExp {
+  return new RegExp(`^(?:dsAttrTypeNative:)?${escapeRegExpLiteral(attribute)}:\\s*(.*)$`, "m");
+}
+
+export function decideDsclRecordRead(result: DsclReadResult): DsclRecordReadDecision {
+  // Test-only retained: production existence probes read explicit attributes.
+  if (result.code === 0) return "present";
+  if (result.execErrorCode === DSCL_STDIO_MAXBUFFER_ERROR) return "unknown";
+  if (result.execErrorCode !== undefined) return "unknown";
+  return allDsclDiagnosticLinesMatch(result, (line) => DSCL_RECORD_NOT_FOUND_RE.test(line))
+    ? "record-absent"
+    : "unknown";
+}
+
+export function decideDsclAttributeRead(
+  attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  result: DsclReadResult,
+): DsclAttributeReadDecision {
+  if (result.code !== 0) {
+    if (result.execErrorCode === DSCL_STDIO_MAXBUFFER_ERROR) {
+      return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+    }
+    if (result.execErrorCode !== undefined) {
+      return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+    }
+    return allDsclDiagnosticLinesMatch(result, (line) => DSCL_RECORD_NOT_FOUND_RE.test(line))
+      ? { kind: "record-absent" }
+      : { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+  }
+  const match = dsclAttributeValueLineRegExp(attribute).exec(result.stdout);
+  if (match !== null) return { kind: "value", value: match[1]!.trim() };
+  if (
+    result.stdout.trim().length === 0 &&
+    allDsclDiagnosticLinesMatch(result, (line) => DSCL_NO_SUCH_KEY_RE.test(line))
+  ) {
+    return { kind: "attribute-absent" };
+  }
+  return { kind: "unknown", diagnostic: dsclDiagnostic(result) };
+}
+
 function realAccountProvisionOps() {
+  const dsclReadResult = async (args: readonly string[]): Promise<DsclReadResult> => {
+    try {
+      const { stdout, stderr } = await execFileAsync("/usr/bin/dscl", [...args]);
+      return { code: 0, stdout, stderr };
+    } catch (err) {
+      const e = err as { code?: unknown; stdout?: unknown; stderr?: unknown; message?: unknown };
+      return {
+        code: typeof e.code === "number" ? e.code : 1,
+        ...(typeof e.code === "string" ? { execErrorCode: e.code } : {}),
+        stdout: typeof e.stdout === "string" ? e.stdout : "",
+        stderr:
+          typeof e.stderr === "string"
+            ? e.stderr
+            : typeof e.message === "string"
+              ? e.message
+              : "",
+      };
+    }
+  };
+  const recordExists = async (accountName: string): Promise<boolean> => {
+    const result = await dsclReadResult([".", "-read", `/Users/${accountName}`, "UniqueID"]);
+    const decision = decideDsclAttributeRead("UniqueID", result);
+    if (decision.kind === "value" || decision.kind === "attribute-absent") return true;
+    if (decision.kind === "record-absent") return false;
+    throw new Error(
+      `dscl could not determine whether ${accountName} exists (${decision.diagnostic || "no diagnostic"})`,
+    );
+  };
+  const readAttribute = async (
+    accountName: string,
+    attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  ): Promise<{ kind: "value"; value: string } | { kind: "attribute-absent" } | { kind: "record-absent" }> => {
+    const result = await dsclReadResult([".", "-read", `/Users/${accountName}`, attribute]);
+    const decision = decideDsclAttributeRead(attribute, result);
+    if (decision.kind !== "unknown") return decision;
+    throw new Error(
+      `dscl could not read ${attribute} for ${accountName} (${decision.diagnostic || "no diagnostic"})`,
+    );
+  };
+  const readExistingAttribute = async (
+    accountName: string,
+    attribute: "UniqueID" | "NFSHomeDirectory" | "IsHidden" | "UserShell",
+  ): Promise<string | undefined> => {
+    const read = await readAttribute(accountName, attribute);
+    if (read.kind === "value") return read.value;
+    if (read.kind === "attribute-absent") return undefined;
+    throw new Error(`directory-service record "${accountName}" disappeared while reading ${attribute}`);
+  };
+  const readExistingUid = async (accountName: string): Promise<number> => {
+    const uidText = await readExistingAttribute(accountName, "UniqueID");
+    if (uidText === undefined) {
+      throw new Error(
+        `directory-service record "${accountName}" exists but UniqueID is missing; refusing to treat it as absent`,
+      );
+    }
+    const uid = Number(uidText);
+    if (!Number.isSafeInteger(uid) || uid <= 0) {
+      throw new Error(`dscl returned an invalid UniqueID for ${accountName}: ${uidText}`);
+    }
+    return uid;
+  };
   return {
     lookupAccountUid: async (accountName: string): Promise<number | undefined> => {
-      try {
-        const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-read", `/Users/${accountName}`, "UniqueID"]);
-        const match = /UniqueID:\s*(\d+)/.exec(stdout);
-        return match ? Number(match[1]) : undefined;
-      } catch {
-        return undefined;
-      }
+      if (!(await recordExists(accountName))) return undefined;
+      return readExistingUid(accountName);
     },
+    canonicalizeHomeDirectory,
     highestAssignedUid: async (): Promise<number> => {
       const { stdout } = await execFileAsync("/usr/bin/dscl", [".", "-list", "/Users", "UniqueID"]);
-      let highest = PROVISION_CEILING - 1;
-      for (const line of stdout.split("\n")) {
-        const match = /\s(\d+)\s*$/.exec(line);
-        if (match) highest = Math.max(highest, Number(match[1]));
+      return parseHighestAssignedUidFromDsclList(stdout, PROVISION_CEILING - 1);
+    },
+    lookupAccountNamesByUid: async (uid: number): Promise<readonly string[]> => {
+      if (!Number.isSafeInteger(uid)) {
+        throw new Error(`uid must be a safe integer for direct lookup (got ${String(uid)})`);
       }
-      return highest;
+      const result = await dsclReadResult([".", "-search", "/Users", "UniqueID", String(uid)]);
+      if (result.code !== 0) {
+        throw new Error(`dscl could not search accounts by uid ${uid} (${dsclDiagnostic(result)})`);
+      }
+      return parseDsclSearchAccountNames(result.stdout, uid);
+    },
+    lookupAccountRecord: async (
+      accountName: string,
+    ): Promise<{ uid: number; homeDirectory?: string; isHidden?: boolean; userShell?: string } | undefined> => {
+      if (!(await recordExists(accountName))) return undefined;
+      const uid = await readExistingUid(accountName);
+      const homeDirectory = await readExistingAttribute(accountName, "NFSHomeDirectory");
+      const hiddenText = await readExistingAttribute(accountName, "IsHidden");
+      const userShell = await readExistingAttribute(accountName, "UserShell");
+      const parsedHidden = parseServiceAccountIsHidden(hiddenText);
+      return {
+        uid,
+        ...(homeDirectory !== undefined ? { homeDirectory } : {}),
+        ...(parsedHidden !== undefined ? { isHidden: parsedHidden } : {}),
+        ...(userShell !== undefined ? { userShell } : {}),
+      };
     },
     createUser: async (
       accountName: string,
@@ -1698,14 +2432,12 @@ function realAccountProvisionOps() {
       // production ops object satisfies the AccountProvisionOps interface
       // for the orchestration to call end to end during the drill.
       //
-      // FIX F7 (HIGH/PLAUSIBLE, Codex second family, 2026-07-07 fix-round):
-      // `-home` binds NFSHomeDirectory to the re-home target at create
-      // time, so the confined harness (running as this account) resolves
-      // ~/.hermes to where the secrets actually get moved, instead of
-      // whatever sysadminctl would otherwise default the home to. Verified
-      // with an explicit `dscl -create NFSHomeDirectory` follow-up (belt
-      // and suspenders: `-home` is documented sysadminctl behavior, but the
-      // dscl write makes the binding explicit and independently checkable).
+      // FIX F7 + S5 drill D4: `-home` is the primary directory-service writer
+      // for NFSHomeDirectory. A redundant post-create `dscl -create
+      // NFSHomeDirectory` remains only a plausible, unproven D4 suspect; a
+      // hardware capture showing sysadminctl's read-back plus the redundant
+      // write failure would confirm it. Post-create hardening now runs through
+      // `hardenCreatedUser`, inside the observed recovery envelope.
       await execFileAsync("/usr/sbin/sysadminctl", [
         "-addUser",
         accountName,
@@ -1717,14 +2449,9 @@ function realAccountProvisionOps() {
         homeDirectory,
         ...(comment ? ["-fullName", comment] : []),
       ]);
+    },
+    hardenCreatedUser: async (accountName: string): Promise<void> => {
       await execFileAsync("/usr/bin/dscl", [".", "-create", `/Users/${accountName}`, "IsHidden", "1"]);
-      await execFileAsync("/usr/bin/dscl", [
-        ".",
-        "-create",
-        `/Users/${accountName}`,
-        "NFSHomeDirectory",
-        homeDirectory,
-      ]);
     },
   };
 }
@@ -2085,6 +2812,15 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
       const { writeFile } = await import("node:fs/promises");
       await writeFile(path, content, { mode });
     },
+    readFile: async (path) => {
+      const { readFile } = await import("node:fs/promises");
+      try {
+        return await readFile(path, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        throw err;
+      }
+    },
     removeFile: async (path) => {
       const { unlink } = await import("node:fs/promises");
       await unlink(path).catch((err) => {
@@ -2095,6 +2831,53 @@ function realHarnessDaemonOps(): HarnessDaemonOps {
       return runLaunchctlWithTimeout(args);
     },
     sleepMs: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+  };
+}
+
+/**
+ * THE ONE production recovery routine for a parked install (fix-round 2,
+ * 2026-07-18). Used in BOTH places the stand-down can need undoing:
+ *
+ *   1. inside `executeParkedHarnessInstall`, when the install itself fails
+ *      after mutating (the Mini1 path -- the snapshot never leaves the
+ *      function, so the revert cannot live outside it); and
+ *   2. at the orchestrator's outcome chokepoint, when a LATER stage refuses.
+ *
+ * One routine, so the two paths cannot drift into disagreeing about what
+ * "restored" means. `restoreRunningHarness` is deliberately the same
+ * enable + coarse-install pair the S5-6 degrade path (`startHarnessCoarse`)
+ * uses, and `installAgentHarnessDaemon` refuses unless launchd reports a
+ * STABLE running pid FOR THE UNIT IT JUST WROTE -- since fix-round 3 it boots
+ * out and re-bootstraps whenever the bytes differ from what is on disk, so the
+ * pid it observes cannot be the barrier job the stand-down replaced. That is
+ * what makes its resolving an OBSERVATION that the agent is back up, rather
+ * than merely a request that it should be.
+ */
+function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallRevertOps {
+  return {
+    restoreRunningHarness: async (plistContent) => {
+      await setAgentHarnessJobDisabled(daemonOps, false);
+      await installAgentHarnessDaemon(
+        {
+          plistPath: AGENT_HARNESS_DAEMON_PLIST_PATH,
+          plistContent,
+          bootstrapArgs: ["bootstrap", "system", AGENT_HARNESS_DAEMON_PLIST_PATH],
+        },
+        daemonOps,
+      );
+    },
+    clearJobDisable: async () => {
+      await setAgentHarnessJobDisabled(daemonOps, false);
+    },
+    writeFile: daemonOps.writeFile,
+    readFile: daemonOps.readFile,
+    removeFile: daemonOps.removeFile,
+    // Fix-round 5 (2026-07-19): the revert's run-state claim. Deliberately the
+    // PLAIN status read, not the stable-pid refinement `probeHarnessRunning`
+    // uses -- `assessHarnessParked` disqualifies a park on ANY pid, so a
+    // stability downgrade cannot change its verdict and would only nest a
+    // second settle loop inside the chokepoint's.
+    harnessStatus: () => agentHarnessDaemonStatus(daemonOps),
   };
 }
 
@@ -2117,4 +2900,542 @@ function realLockOps() {
 /** Exposed for the CLI `unprovision`/rollback surface (reuses this module's real ops). */
 export async function uninstallAutoProvisionedHarnessDaemon(): Promise<void> {
   await uninstallAgentHarnessDaemon(realHarnessDaemonOps());
+}
+
+// ── S5-6/S5-7: the `--repair-egress-gate` / `--unprotect-egress-gate` CLI runners ──
+
+/**
+ * The shared production {@link ExclusiveEgressWiringInput} for the Hermes
+ * exclusive-egress CLI verbs (repair + unprotect): one construction so the
+ * two runners can never drift on gate-daemon argv, endpoint set, audit
+ * plumbing, or account ops. `auditSource` distinguishes the verbs in the
+ * audit trail.
+ */
+export function buildHermesExclusiveCliWiring(input: {
+  agentUid: number;
+  accountName: string;
+  newAccountHome: string;
+  wallFortressPath: string;
+  /**
+   * FIX F-HARNESSENV: the resolved harness launch (argv + environment), or
+   * `undefined` when the re-homed runtime could not be resolved. `undefined`
+   * IS the S5-7 MED-1 condition, so it now drives the plist-removal park
+   * directly instead of a separate `parkPlistFallbackRemoval` boolean that a
+   * caller had to remember to set in lockstep with a placeholder argv.
+   */
+  harnessLaunch?: HarnessLaunchSpec;
+  operatorUid: number;
+  auditSource: string;
+  print: (line: string) => void;
+  accountOps: ReturnType<typeof realAccountProvisionOps>;
+  cliBinary?: string;
+}): ExclusiveEgressWiringInput {
+  const agentId = "hermes";
+  const reloadPolicy = async (): Promise<{ ok: boolean; error?: string }> => {
+    const { requestPolicyReload } = await import("../cli/castle-wall.js");
+    const result = await requestPolicyReload(input.wallFortressPath, "darwin");
+    return result.ok ? { ok: true } : { ok: false, error: result.error };
+  };
+  return {
+    agentId,
+    agentUid: input.agentUid,
+    agentAccount: input.accountName,
+    fortressPath: input.wallFortressPath,
+    ...(input.harnessLaunch !== undefined ? { harnessLaunch: input.harnessLaunch } : {}),
+    harnessLogDir: resolveHarnessDaemonLogDir(input.newAccountHome),
+    agentTemplate: agentId,
+    gateDaemonArgvPrefix: resolveGateDaemonArgvPrefix(input.cliBinary),
+    excludeUids: [input.operatorUid],
+    gateAccountCeiling: PROVISION_CEILING,
+    gateHomeDirectory: `${NEW_ACCOUNT_HOME_BASE}/${deriveGateAccountName(agentId)}`,
+    reloadPolicy,
+    publishProvisionedRules: async (routing) => {
+      const published = await publishProvisionedEgressRules({
+        fortressPath: input.wallFortressPath,
+        endpointSet: HERMES_ENDPOINT_SET,
+        reloadPolicy,
+        routing,
+      });
+      return published.ok
+        ? { ok: true as const, ruleIds: published.ruleIds }
+        : { ok: false as const, error: published.error };
+    },
+    audit: async (operation, details) => {
+      try {
+        const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+        await appendCastleWallCliAuditBestEffort(
+          operation,
+          { source: input.auditSource, ...details },
+          input.wallFortressPath,
+          process.env,
+          process.stderr,
+        );
+      } catch {
+        // Best-effort by contract.
+      }
+    },
+    print: input.print,
+    accountOps: input.accountOps,
+  };
+}
+
+/**
+ * FIX F-COARSE-AFTER-EXCLUSIVE: the ONE place a failed repair's routing-mode
+ * consequence is put into words, derived from the outcome field the sequence
+ * SET from what it actually did (or failed to do) -- never from the code path
+ * the reader happens to be standing in. Exported so the sentence is asserted
+ * directly rather than only through the CLI runner (which is darwin/root-gated).
+ */
+export function describeRepairCoarseComposition(
+  composition: "restored" | "not-attempted" | "exclusive-left",
+  restoreError?: string,
+): string {
+  switch (composition) {
+    case "not-attempted":
+      // The failure preceded the bring-up, so this run never put the fortress
+      // into exclusive composition. Say nothing about a mode we did not touch.
+      return "";
+    case "restored":
+      return (
+        " The fortress was returned to COARSE routing composition (audited), so the plain " +
+        "'sudo sanctuary protect --hermes' path works again."
+      );
+    case "exclusive-left":
+      return (
+        " WARNING: this run left the fortress in EXCLUSIVE routing composition and could NOT restore " +
+        `coarse (${restoreError ?? "no detail"}). While it stays that way, a plain ` +
+        "'sudo sanctuary protect --hermes' will be REFUSED by the composition invariant, and a confined " +
+        "agent may be reaching nothing. Clear it with: sudo sanctuary protect --unprotect-egress-gate"
+      );
+  }
+}
+
+/**
+ * S5-7 fix-round-3: run the repair sequence under the exclusive provision lock
+ * (the SAME `PROVISION_LOCK_PATH` single source the arm/unprotect CLI runners
+ * take), so arm, repair, and unprotect are genuinely mutually exclusive. Repair
+ * MUTATES the registry (addOrUpdate re-arm + release-barrier bootstrap); without
+ * the lock a concurrent `--repair-egress-gate` could re-arm / re-bootstrap a uid
+ * while an in-flight unprotect tears that same uid's gate, credential, and
+ * policy down (or vice versa) -- the residual race both adversarial families
+ * flagged. Returns the repair outcome when the lock was free, or
+ * `{ locked: false }` (fail-closed, NOTHING mutated -- the refusal is already
+ * printed) when another provisioning run holds it.
+ *
+ * NO SELF-DEADLOCK: the repair sub-ops self-lock on the REGISTRY lock
+ * (`PF_ANCHOR_REGISTRY_LOCK_PATH`) and the per-uid GENERATION lock, both DISTINCT
+ * paths from `PROVISION_LOCK_PATH`; nothing inside `runEgressGateRepair`
+ * re-acquires this path. The lock releases in `withProvisionLock`'s `finally` on
+ * every throw. Only the interactive CLI runner takes this wrap (matching where
+ * arm/unprotect take it); no single-threaded boot path repairs, so nothing is
+ * wedged. Extracted with an injectable `lockOps` (production default
+ * {@link realLockOps}) so the concurrency behavior is host-free unit-testable --
+ * the CLI runner itself is darwin/root-gated over real account ops.
+ */
+export async function runEgressGateRepairUnderProvisionLock(
+  runRepair: () => Promise<EgressGateRepairOutcome>,
+  print: (line: string) => void,
+  lockOps: ProvisionLockOps = realLockOps(),
+): Promise<{ locked: true; outcome: EgressGateRepairOutcome } | { locked: false }> {
+  try {
+    const outcome = await withProvisionLock(PROVISION_LOCK_PATH, lockOps, runRepair);
+    return { locked: true, outcome };
+  } catch (err) {
+    if (err instanceof ProvisionLockHeldError) {
+      // SAFETY: stderr is the operator-facing CLI channel; a fixed, safe string
+      // plus the lock error message (a lock-path only, no secrets).
+      print(
+        `Repair refused: another 'sanctuary protect' provisioning run is already in progress ` +
+          `(${(err as Error).message}); this run made NO changes. Wait for it to finish, then re-run.`,
+      );
+      return { locked: false };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Run the exclusive-egress repair sequence for the already-provisioned
+ * fine-grained Hermes agent (Unified Protect Slice 5 S5-6, design MED-7).
+ * Drift-guard first (foreign transient pf rules REFUSE without the
+ * interactive override), then recover -> bring-up -> release barrier. The whole
+ * sequence runs under the exclusive provision lock
+ * ({@link runEgressGateRepairUnderProvisionLock}), so a concurrent arm or
+ * unprotect cannot race the registry mutation. Returns a process exit code
+ * (0 = repaired; 2 = refused/failed -- the agent stays parked or coarse-only,
+ * loudly).
+ */
+export async function runEgressGateRepairForCli(options: {
+  isTty: boolean;
+  overrideTransientPfRules: boolean;
+  print?: (line: string) => void;
+  cliBinary?: string;
+  getuid?: () => number;
+  resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+}): Promise<number> {
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+  // this is only the default when no `print` override is supplied (the CLI
+  // caller always supplies one). Never used to print secrets or key material.
+  const print = options.print ?? ((line: string) => console.error(`  ${line}`));
+  if (osPlatform() !== "darwin") {
+    print("--repair-egress-gate is macOS-only (the pf/launchd exclusive-egress stack).");
+    return 2;
+  }
+  const getuid = options.getuid ?? process.getuid?.bind(process);
+  if (getuid?.() !== 0) {
+    print("Repairing the exclusive-egress gate requires root. Re-run: sudo sanctuary protect --repair-egress-gate");
+    return 2;
+  }
+  const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
+  const operatorIdentity = await resolveIdentity();
+  if (operatorIdentity === undefined) {
+    print("Could not determine the operator account under sudo (SUDO_UID/SUDO_GID unset); refusing to repair.");
+    return 2;
+  }
+  const wallFortressPath = resolveWallFortressPath(process.env, operatorIdentity.home);
+  const agentId = "hermes";
+  const accountName = deriveAgentAccountName(agentId);
+  const newAccountHome = `${NEW_ACCOUNT_HOME_BASE}/${accountName}`;
+  const accountOps = realAccountProvisionOps();
+  const agentUid = await accountOps.lookupAccountUid(accountName);
+  if (agentUid === undefined || agentUid === null) {
+    // FIX F3 (adversarial review, 2026-07-26): this used to point at
+    // `--hermes --exclusive-egress`, which is precisely the command the
+    // exclusive-routing residue gate refuses when a marker survives the
+    // account. Repair -> provision -> refused -> repair was a closed loop with
+    // a manual `rm` as its only exit. The residue teardown lives on the
+    // unprotect verb (it is a teardown, not a repair), so name that instead.
+    print(
+      `No dedicated agent account "${accountName}" exists; nothing to repair. ` +
+        "If this fortress still carries leftover exclusive-egress state from an interrupted arm, " +
+        "clear it with: sudo sanctuary protect --unprotect-egress-gate. " +
+        "Otherwise provision first: sudo sanctuary protect --hermes --exclusive-egress",
+    );
+    return 2;
+  }
+  let harnessLaunch: HarnessLaunchSpec;
+  try {
+    const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
+      agentHome: newAccountHome,
+      agentUid,
+    });
+    harnessLaunch = resolved.launch;
+  } catch (err) {
+    print(`Could not resolve the harness argv for the repair (${(err as Error).message}); refusing.`);
+    return 2;
+  }
+  const wiring = buildHermesExclusiveCliWiring({
+    agentUid,
+    accountName,
+    newAccountHome,
+    wallFortressPath,
+    harnessLaunch,
+    operatorUid: operatorIdentity.uid,
+    auditSource: "sanctuary-protect-repair",
+    print,
+    accountOps,
+    ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
+  });
+  // CONCURRENCY (S5-7 fix-round-3): run the WHOLE repair sequence under the
+  // SAME exclusive provision lock the arm (`runProvisionFlow`, above) and
+  // unprotect (`withUnprotectLock`) paths take, so arm, repair, and unprotect
+  // are genuinely mutually exclusive. See {@link runEgressGateRepairUnderProvisionLock}
+  // for the rationale and the no-self-deadlock argument.
+  const locked = await runEgressGateRepairUnderProvisionLock(
+    () =>
+      runEgressGateRepair(
+        { agentUid, isTty: options.isTty, overrideTransientPfRules: options.overrideTransientPfRules },
+        createRepairExclusiveEgressOps(wiring),
+      ),
+    print,
+  );
+  if (!locked.locked) {
+    // Fail-closed: another arm/repair/unprotect run holds the provision lock, so
+    // the repair sequence NEVER ran and this run mutated NOTHING (the helper
+    // already printed the loud refusal).
+    return 2;
+  }
+  const outcome = locked.outcome;
+  switch (outcome.kind) {
+    case "repaired":
+      print(`Exclusive-egress gate repaired: generation ${outcome.generationId} live; the agent harness was released.`);
+      return 0;
+    case "repaired-repark-failed":
+      print(
+        `Exclusive-egress gate repaired (generation ${outcome.generationId}) BUT the boot-state re-park failed ` +
+          `(${outcome.reparkError}); the next boot could auto-start the agent before the gate re-arms. Re-run the repair.`,
+      );
+      return 2;
+    case "refused-foreign-transient-rules":
+    case "refused-non-tty-override":
+    case "refused-diff-unavailable":
+      // The repair sequence already printed the specific refusal + guidance.
+      return 2;
+    case "repair-failed":
+      // BLOCKER-3 honesty, tightened by fix-round-2 HIGH-2: claim PARKED only
+      // when the FULL persistent parked posture was verified (not running +
+      // launchd job disabled + hold file absent + parked plist); otherwise
+      // enumerate exactly which checks failed -- the agent may be startable
+      // now or at the next boot (stale release material).
+      print(
+        `Exclusive-egress repair FAILED at ${outcome.stage}: ${outcome.reason}. ` +
+          (outcome.parkedStateVerified
+            ? "The agent harness remains PARKED (verified: not running, job disabled, hold file absent, " +
+              "parked plist on disk; fail-closed). Investigate, then re-run the repair."
+            : "WARNING: the agent's parked state could NOT be fully verified -- it may be startable now " +
+              `or at the next boot. Failed checks: ${outcome.parkedStateProblems.join("; ") || "no probe detail"}. ` +
+              "Investigate immediately.") +
+          // FIX F-COARSE-AFTER-EXCLUSIVE: say what the fortress's ROUTING
+          // COMPOSITION was left in. Pre-fix a failed repair said only
+          // "re-run the repair" while having left the host in a mode that
+          // refuses the plain coarse arm, with no product path named.
+          describeRepairCoarseComposition(outcome.coarseComposition, outcome.coarseRestoreError),
+      );
+      return 2;
+  }
+}
+
+/**
+ * THE operator sentence + exit code for the NO-ACCOUNT exclusive-routing
+ * residue teardown (`--unprotect-egress-gate` on a fortress whose dedicated
+ * agent account is gone). Exported so the mapping verdict -> sentence is
+ * asserted directly rather than only through the CLI runner, which is
+ * darwin/root-gated.
+ *
+ * FIX G2 (re-gate, 2026-07-26): the `refused` branch used to end at "Re-create
+ * the dedicated agent account", which names NO product verb: there is no
+ * command that creates the account without provisioning, and provisioning is
+ * refused by the same residue gate that sends the operator here. That restored
+ * the closed loop one state over. The exit is now stated at the FILE level,
+ * which is available in every state, plus the verb that finishes the job once
+ * an account exists.
+ *
+ * FIX G5 (re-gate, 2026-07-26): `partial` exists because a teardown that
+ * stopped part way must not render under the "Nothing was changed" frame that
+ * `refused` owns.
+ */
+export function describeNoAccountResidueTeardown(
+  accountName: string,
+  teardown: ExclusiveRoutingResidueTeardown,
+): { line: string; code: number } {
+  switch (teardown.kind) {
+    case "no-residue":
+      return {
+        code: 2,
+        line:
+          `No dedicated agent account "${accountName}" exists and this fortress carries no ` +
+          "exclusive-routing state; nothing to unprotect. " +
+          "(Account removal is a separate, operator-present step and is never bundled here.)",
+      };
+    case "cleared":
+      return {
+        code: 0,
+        line:
+          `No dedicated agent account "${accountName}" exists, but this fortress still carried ` +
+          `leftover exclusive-egress state, and it has been CLEARED: ${teardown.detail}. ` +
+          "The fortress is back on coarse composition; provisioning can now run.",
+      };
+    case "refused":
+      return {
+        code: 2,
+        line:
+          `No dedicated agent account "${accountName}" exists, and the exclusive-egress state on ` +
+          `this fortress is NOT residue: ${teardown.reason}. Nothing was changed (removing the ` +
+          "routing marker alone would leave the pf anchor and any gate daemon armed for that uid). " +
+          "To finish the teardown, either re-create the dedicated agent account and re-run this " +
+          "command, which then runs the full account-present teardown (park, gate surfaces, " +
+          "registry entry, pf anchor, gate daemon), or remove the confinement for that uid " +
+          `directly: the S5-1 anchor registry at ${PF_ANCHOR_REGISTRY_PATH} and the gate daemon ` +
+          `plist at /Library/LaunchDaemons/${EGRESS_GATE_DAEMON_LABEL_PREFIX}.<uid>.plist both name ` +
+          "the uid, and 'sudo sanctuary protect --repair-egress-gate' recovers an interrupted arm " +
+          "once an account exists.",
+      };
+    case "partial":
+      return {
+        code: 2,
+        line:
+          `No dedicated agent account "${accountName}" exists, and the teardown of this fortress's ` +
+          `leftover exclusive-egress state FAILED part way: ${teardown.reason}. This run DID ` +
+          `remove ${teardown.removed.length === 0 ? "nothing" : teardown.removed.join(" and ")}, so ` +
+          "the fortress is in a mixed state. Fix the cause named above and re-run this command; it " +
+          "is idempotent and will finish the removal.",
+      };
+  }
+}
+
+/**
+ * Run the S5-7 per-agent exclusive-egress UNPROTECT for the provisioned
+ * fine-grained Hermes agent (Unified Protect Slice 5 S5-7): verified
+ * persistent park -> generation recovery -> gate daemon down -> credential +
+ * oracle-token teardown -> provisioned-rule scrub -> policy surfaces off ->
+ * registry remove (union re-render preserving every remaining confined uid;
+ * the anchor is flushed ONLY when the last agent leaves). Returns a process
+ * exit code (0 = unprotected; 2 = failed -- remaining protection intact, the
+ * agent stays parked, loudly). Idempotent: a re-run after any failure
+ * converges.
+ *
+ * SCOPE (matches the design's S5-7 row): the exclusive-egress teardown only.
+ * It does NOT delete the agent/gate service accounts (Erik-present, separate
+ * build by standing decision) and does NOT disarm the coarse wall or restore
+ * re-homed files (the unprovision flow owns those).
+ */
+export async function runEgressGateUnprotectForCli(options: {
+  print?: (line: string) => void;
+  cliBinary?: string;
+  getuid?: () => number;
+  resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
+}): Promise<number> {
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand;
+  // this is only the default when no `print` override is supplied (the CLI
+  // caller always supplies one). Never used to print secrets or key material.
+  const print = options.print ?? ((line: string) => console.error(`  ${line}`));
+  if (osPlatform() !== "darwin") {
+    print("--unprotect-egress-gate is macOS-only (the pf/launchd exclusive-egress stack).");
+    return 2;
+  }
+  const getuid = options.getuid ?? process.getuid?.bind(process);
+  if (getuid?.() !== 0) {
+    print(
+      "Removing the exclusive-egress gate requires root. Re-run: sudo sanctuary protect --unprotect-egress-gate",
+    );
+    return 2;
+  }
+  const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
+  const operatorIdentity = await resolveIdentity();
+  if (operatorIdentity === undefined) {
+    print("Could not determine the operator account under sudo (SUDO_UID/SUDO_GID unset); refusing to unprotect.");
+    return 2;
+  }
+  const wallFortressPath = resolveWallFortressPath(process.env, operatorIdentity.home);
+  const accountName = deriveAgentAccountName("hermes");
+  const newAccountHome = `${NEW_ACCOUNT_HOME_BASE}/${accountName}`;
+  const accountOps = realAccountProvisionOps();
+  const agentUid = await accountOps.lookupAccountUid(accountName);
+  if (agentUid === undefined || agentUid === null) {
+    // FIX F3 (adversarial review, 2026-07-26): "nothing to unprotect" was FALSE
+    // whenever the account went away while the fortress kept its
+    // exclusive-routing files (a drill teardown, a restored fortress, an
+    // unprotect that died between parking the harness and removing the marker).
+    // In that state the provision run is refused by the residue gate, repair
+    // exits 2, and this verb exited 2 -- a closed loop whose only exit was an
+    // undocumented manual `rm`. The residue teardown makes this verb TRUE, and
+    // it is the verb the gate's refusal sentence names.
+    const teardown = await clearExclusiveRoutingResidueWithoutAccount({
+      fortressPath: wallFortressPath,
+      audit: async (operation, details) => {
+        try {
+          const { appendCastleWallCliAuditBestEffort } = await import("../cli/castle-wall.js");
+          await appendCastleWallCliAuditBestEffort(
+            operation,
+            { source: "sanctuary-protect-unprotect", ...details },
+            wallFortressPath,
+            process.env,
+            process.stderr,
+          );
+        } catch {
+          // Best-effort by contract.
+        }
+      },
+      print,
+    });
+    const rendered = describeNoAccountResidueTeardown(accountName, teardown);
+    print(rendered.line);
+    return rendered.code;
+  }
+  // MED-1 (teardown wedge on a damaged install): argv resolution needs the
+  // re-homed Hermes runtime tree (runtime files + system python + venv). If it
+  // was damaged or deleted, REFUSING here would wedge the unprotect verb
+  // permanently while pf rules + the registry entry + the gate daemon + the
+  // credential all persist -- a fail-closed dead-end with no recovery path. The
+  // argv is only needed to RE-RENDER the parked plist; an ABSENT plist is
+  // equally unbootable (and `verifyHarnessParkedPersistent` accepts it), so we
+  // fall back to a plist-REMOVAL park and still complete the teardown.
+  //
+  // FIX F-HARNESSENV: the pre-fix code invented a `/usr/bin/false` PLACEHOLDER
+  // argv here purely to keep the parked-plan renderer from throwing, and set a
+  // separate `parkPlistFallbackRemoval` boolean beside it. Two fields, one
+  // condition, and the placeholder was also what the parked-form COMPARISON
+  // rendered against. An UNRESOLVED launch is now simply `undefined`, and the
+  // removal disposition is derived from it downstream.
+  let harnessLaunch: HarnessLaunchSpec | undefined;
+  try {
+    const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
+      agentHome: newAccountHome,
+      agentUid,
+    });
+    harnessLaunch = resolved.launch;
+  } catch (err) {
+    print(
+      `Could not resolve the harness argv for the unprotect (${(err as Error).message}); ` +
+        "falling back to a plist-removal park -- the harness will be left unbootable (no parked plist) and " +
+        "the teardown will still complete. (The re-homed Hermes runtime tree looks damaged or removed.)",
+    );
+    harnessLaunch = undefined;
+  }
+  const wiring = buildHermesExclusiveCliWiring({
+    agentUid,
+    accountName,
+    newAccountHome,
+    wallFortressPath,
+    ...(harnessLaunch !== undefined ? { harnessLaunch } : {}),
+    operatorUid: operatorIdentity.uid,
+    auditSource: "sanctuary-protect-unprotect",
+    print,
+    accountOps,
+    ...(options.cliBinary !== undefined ? { cliBinary: options.cliBinary } : {}),
+  });
+  const outcome = await runEgressGateUnprotect(
+    { agentUid },
+    createUnprotectExclusiveEgressOps(wiring),
+  );
+  switch (outcome.kind) {
+    case "unprotected":
+      print(
+        outcome.flushed
+          ? `Exclusive-egress protection removed for uid ${agentUid}; no confined agents remain (pf anchor flushed).`
+          : `Exclusive-egress protection removed for uid ${agentUid}; ${outcome.remainingUids.length} confined ` +
+              "agent(s) remain with confinement re-verified live.",
+      );
+      // LOW-2 (UX honesty): unprotect removes the exclusive-egress GATE and
+      // parks the harness DOWN -- it does NOT re-release the agent to run under
+      // the coarse wall. The harness stays parked/unbootable until it is
+      // explicitly re-provisioned or the operator releases it. (Account removal
+      // and coarse-wall disarm are separate, operator-present steps.)
+      print(
+        "The agent harness is left PARKED (down / unbootable), not running coarse -- re-provision or " +
+          "release it explicitly to bring it back up.",
+      );
+      if (outcome.registryDirty) {
+        print(
+          "NOTE: the registry still carries a repair-owed marker (posture stays non-green). " +
+            "Run: sudo sanctuary protect --repair-egress-gate",
+        );
+        return 2;
+      }
+      return 0;
+    case "unprotect-failed":
+      print(
+        `Exclusive-egress unprotect FAILED at ${outcome.stage}: ${outcome.reason}. ` +
+          "Remaining protection is INTACT (fail-closed). " +
+          (outcome.parkedStateVerified
+            ? "The agent harness is PARKED (verified: not running, job disabled, hold file absent, " +
+              "parked plist on disk). Investigate, then re-run the unprotect."
+            : "WARNING: the agent's parked state could NOT be fully verified -- it may be startable now " +
+              `or at the next boot. Failed checks: ${outcome.parkedStateProblems.join("; ") || "no probe detail"}. ` +
+              "Investigate immediately."),
+      );
+      return 2;
+    case "unprotect-refused":
+      // Fail-closed refusal (S5-7 fix-round-2): the sole-exclusive-agent
+      // invariant did not hold, the committed registry could not be read, or
+      // another provisioning run held the lock. NOTHING was torn down.
+      print(
+        `Exclusive-egress unprotect REFUSED (nothing torn down; every surface INTACT): ${outcome.reason}.` +
+          (outcome.conflictingUids.length > 0
+            ? " Per-agent unprotect of a shared-fortress/harness config is not supported until the " +
+              "multi-agent teardown lands."
+            : ""),
+      );
+      return 2;
+  }
 }

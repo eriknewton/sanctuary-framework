@@ -7,9 +7,56 @@
 
 import { describe, it, expect, vi } from "vitest";
 
-import { runProvisionFlow, type ProvisionFlowContext, type ProvisionFlowOps } from "../../../src/castle-wall/provision/orchestrate.js";
+import {
+  runProvisionFlow,
+  describeObservedAgentConfinement,
+  describeExclusiveRoutingResidueRefusal,
+  exclusiveRoutingResidueRefusal,
+  type ProvisionFlowContext,
+  type ProvisionFlowOps,
+} from "../../../src/castle-wall/provision/orchestrate.js";
 import type { ProvisionNeedResult } from "../../../src/castle-wall/provision/detect.js";
 import type { RehomeStepResult } from "../../../src/castle-wall/provision/rehome.js";
+import {
+  assessHarnessParked,
+  runStateAdvice,
+  type RunStateAdvice,
+} from "../../../src/egress-gate/parked-claim.js";
+import {
+  projectRevertToRestoreReport,
+  revertParkedHarnessInstall,
+  runStateOwed,
+  type ParkedInstallRevertOps,
+} from "../../../src/egress-gate/release-barrier.js";
+import type { HarnessDaemonStatus } from "../../../src/egress-gate/harness-daemon.js";
+// FIX G8 (re-gate, 2026-07-26): the throw -> verdict classification keys on the
+// REAL error the marker load contract raises, so the fakes below raise that
+// class rather than a hand-rolled `Error` that happens to read like one.
+import { ExclusiveRoutingMarkerError } from "../../../src/castle-wall/allowlist/routing-marker.js";
+
+const HARNESS_LOCATOR = {
+  plistPath: "/Library/LaunchDaemons/ai.sanctuaryprotocol.agent-harness.plist",
+  harnessLabel: "ai.sanctuaryprotocol.agent-harness",
+};
+
+/**
+ * Build a run-state advice the way production must: through the chokepoint.
+ *
+ * FIX-ROUND 6. These tests cannot hand-roll one -- `RunStateAdvice` is branded
+ * and `runStateAdvice` is its sole constructor -- which is deliberate. The
+ * eleventh instance of this subsystem's defect existed precisely because the
+ * op boundary let a caller render run-state prose with NO claim in hand. A
+ * test that could fake one would be pinning the same hole.
+ */
+async function observedRunState(status: HarnessDaemonStatus): Promise<RunStateAdvice> {
+  const claim = await assessHarnessParked({
+    probe: { harnessStatus: async () => status, sleepMs: async () => {} },
+  });
+  return runStateAdvice(claim, { locator: HARNESS_LOCATOR });
+}
+
+const PARKED_STATUS: HarnessDaemonStatus = { known: true, installed: true, running: false };
+const LIVE_STATUS: HarnessDaemonStatus = { known: true, installed: true, running: true, pid: 9001 };
 
 const CEILING = 500;
 const AGENT_UID = 502;
@@ -100,7 +147,7 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       checks: [{ name: "LLM (Venice)", host: "api.venice.ai", port: 443, allowed: true }],
       dnsRulePresent: true,
     })),
-    scrubProvisionedEgress: vi.fn(async () => undefined),
+    restoreProvisionedEgressToPreRunState: vi.fn(async () => ({ restored: true, reloadOk: true, problems: [] })),
     verifyAgentEgressAfterArm: vi.fn(async () => passingEgressReport()),
     auditEgress: vi.fn(async () => undefined),
     createAccount: vi.fn(async () => ({
@@ -113,13 +160,23 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
     })),
     installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
     uninstallHarnessDaemon: vi.fn(async () => undefined),
+    // The common case the chokepoint exists for: a RUNNING agent was stood
+    // down and was verifiably restarted. `harnessRestarted` is the field the
+    // fix-round-2 wording keys on -- the production op used to discard it, so
+    // a stopped agent read as "was restarted".
+    restoreStoodDownHarness: vi.fn(async () => ({
+      restored: true,
+      wasRunning: true,
+      harnessRestarted: true,
+      problems: [] as string[],
+    })),
     ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
     teardownPolicyDaemon: vi.fn(async () => undefined),
     preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
     checkUidExistence: vi.fn(async () => ({ ok: true, accountName: "sanctuary-hermes", uid: AGENT_UID })),
     arm: vi.fn(async () => ({ ok: true as const })),
     postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => true }]),
-    disarm: vi.fn(async () => ({ neConfirmedOff: true as const })),
+    disarm: vi.fn(async () => ({ nePreferenceOutcome: "corroborated_off" as const })),
     restoreRehome: vi.fn(async () => ({
       fullyRestored: true,
       restoredCount: REHOME_RESULTS.length,
@@ -127,8 +184,37 @@ function happyPathOps(overrides: Partial<ProvisionFlowOps> = {}): ProvisionFlowO
       backupPaths: REHOME_RESULTS.filter((r) => r.backupPath).map((r) => r.backupPath!),
       conflictPaths: [],
     })),
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half): the default is a host with
+    // NOTHING confined, which is what the pre-fix flat sentence assumed. The
+    // regression tests below override it with the drill's actual state.
+    observeAgentConfinement: vi.fn(async () => ({
+      known: true as const,
+      confinedUids: [],
+      exclusiveRoutingMarkerPresent: false,
+    })),
+    // FIX F-COARSE-AFTER-EXCLUSIVE (class half): the mode-independent residue
+    // gate. Default = no marker on disk, so the gate is a no-op for every test
+    // that is not about it.
+    reconcileExclusiveRoutingResidue: vi.fn(async () => ({ kind: "clear" as const })),
+    // FIX G3 (re-gate 2026-07-26): the residue gate's FALLBACK subject. Default
+    // = no dedicated account exists, which is the state every pre-existing test
+    // was implicitly written against.
+    lookupDedicatedAccountUid: vi.fn(async () => undefined),
     ...overrides,
   };
+}
+
+/**
+ * A residue op for a marker that is PROVABLY ORPHANED. The `"observe"` call
+ * judges it without touching anything; only the `"clear"` call removes it. This
+ * split is the whole point of FIX F1: the judgement may run before the operator
+ * confirm, the removal may not.
+ */
+function residueOp(): ReturnType<typeof vi.fn> {
+  const detail = "no S5-1 registry entry and no serving gate for uid 707";
+  return vi.fn(async (_armTargetUid: number | undefined, intent: "observe" | "clear") =>
+    intent === "observe" ? { kind: "orphaned" as const, detail } : { kind: "reconciled" as const, detail },
+  );
 }
 
 describe("castle-wall/provision/orchestrate", () => {
@@ -449,7 +535,7 @@ describe("castle-wall/provision/orchestrate", () => {
         if (err !== undefined) {
           throw err;
         }
-        return { neConfirmedOff: true };
+        return { nePreferenceOutcome: "corroborated_off" as const };
       }),
     });
     const result = await runProvisionFlow(baseCtx(), ops);
@@ -648,17 +734,24 @@ describe("castle-wall/provision/orchestrate", () => {
 
   // ── Bug B (the one-flow gap): ensure a policy daemon before arming ──────────
   describe("Bug B: ensurePolicyDaemon step (single-wall-per-machine, refuse-not-swap)", () => {
-    it("happy path calls ensurePolicyDaemon with ctx.fortressPath (between install-daemon and arm), still arms, tears down nothing", async () => {
+    it("happy path calls ensurePolicyDaemon with ctx.fortressPath BEFORE the harness install and before arm, still arms, tears down nothing", async () => {
       const ops = happyPathOps();
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
       expect(ops.ensurePolicyDaemon).toHaveBeenCalledWith(FORTRESS_PATH);
-      // Ordering: the policy daemon is ensured AFTER the harness daemon and
-      // BEFORE arming (arming with no policy daemon deny-all-locks the box).
+      // ORDER CHANGE (drill-D2 fix-round, 2026-07-18): the policy daemon is
+      // now ensured BEFORE the harness install, not after it. In fine-grained
+      // mode the harness install STOPS the operator's live agent, and this
+      // step -- the one-wall-per-machine refusal -- is the flow's most likely
+      // refusal and the one the 2026-07-18 drill actually hit. Refusing after
+      // the destructive step left the agent dead; refusing before it costs
+      // nothing. Still strictly before arming, which is the constraint this
+      // step originally existed for (arming with no policy daemon deny-all-
+      // locks the box).
       const ensureOrder = (ops.ensurePolicyDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       const installOrder = (ops.installHarnessDaemon as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       const armOrder = (ops.arm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-      expect(installOrder).toBeLessThan(ensureOrder);
+      expect(ensureOrder).toBeLessThan(installOrder);
       expect(ensureOrder).toBeLessThan(armOrder);
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
     });
@@ -684,9 +777,14 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon", rolledBack: true });
       expect(ops.arm).not.toHaveBeenCalled();
-      // The harness daemon was installed this run -> tear it down. The existing
-      // (different-fortress) wall is NEVER torn down -- refuse, not swap.
-      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      // ORDER CHANGE: the harness is never installed OR stood down on this
+      // path any more, because this refusal now happens first. That is the
+      // whole point -- the 2026-07-18 drill hit exactly this refusal, and
+      // post-D2-fix it would have left the operator's agent stopped with
+      // nothing to restart it. There is now nothing to tear down or restore.
+      expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+      expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
       expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
       expect((result as { reason: string }).reason).toMatch(/different fortress/);
@@ -727,7 +825,9 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon" });
       expect(ops.arm).not.toHaveBeenCalled();
       expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
-      expect(ops.uninstallHarnessDaemon).toHaveBeenCalledTimes(1);
+      // Reordered: no harness was installed yet, so there is nothing to tear
+      // down -- only the fresh wall this run stood up.
+      expect(ops.uninstallHarnessDaemon).not.toHaveBeenCalled();
     });
 
     it("a FAILED policy-daemon teardown on abort is surfaced LOUDLY (daemonTeardownFailed + a manual uninstall-boot note), never silently swallowed", async () => {
@@ -747,8 +847,13 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(ops.restoreRehome).toHaveBeenCalledWith(REHOME_RESULTS);
     });
 
-    it("ensurePolicyDaemon is NOT called when an EARLIER step (install-daemon) fails -- it is strictly downstream of the harness daemon install", async () => {
+    it("a fresh policy daemon is torn back down when the LATER harness install fails (it now runs first, so its rollback must reach this branch)", async () => {
+      // The mirror of the old "ensurePolicyDaemon is strictly downstream of
+      // install-daemon" test. Reversing the order moved the rollback
+      // obligation with it: install-daemon aborting must now undo the wall
+      // this run stood up, which it did not have to before.
       const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
         installHarnessDaemon: vi.fn(async () => ({
           ok: false as const,
           error: "launchctl bootstrap exited 5",
@@ -757,7 +862,21 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
-      expect(ops.ensurePolicyDaemon).not.toHaveBeenCalled();
+      expect(ops.ensurePolicyDaemon).toHaveBeenCalledTimes(1);
+      expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    it("a PRE-EXISTING wall is still never torn down when the later harness install fails", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: false })),
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: false as const,
+          error: "launchctl bootstrap exited 5",
+          daemonPreexisted: false,
+        })),
+      });
+      await runProvisionFlow(baseCtx(), ops);
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
     });
 
@@ -788,6 +907,22 @@ describe("castle-wall/provision/orchestrate", () => {
       expect((result as { reason: string }).reason).toMatch(/disarmed as part of this rollback|castle-wall status/i);
     });
 
+    it("B1: save-accepted-but-inconclusive disarm does not become observed-off evidence", async () => {
+      const ops = happyPathOps({
+        ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        disarm: vi.fn(async () => ({
+          nePreferenceOutcome: "save_accepted_inconclusive" as const,
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
+      expect(ops.teardownPolicyDaemon).toHaveBeenCalledTimes(1);
+      expect((result as { disarmObservedOff?: true }).disarmObservedOff).toBeUndefined();
+      expect((result as { wallMayBeArmed?: true }).wallMayBeArmed).toBeUndefined();
+      expect((result as { reason: string }).reason).toContain("status corroboration was inconclusive");
+    });
+
     it("P0 honesty gap: arm ok:false + fresh daemon + disarm THROWS leaves the policy daemon UP (never boots it out into a lockout), sets wallMayBeArmed, and is NOT a clean rollback", async () => {
       const ops = happyPathOps({
         ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
@@ -811,18 +946,18 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(reason).toMatch(/castle-wall disable/);
     });
 
-    it("P1 (fail-open-after-lease-revoke): arm ok:false + fresh daemon + disarm returns neConfirmedOff:FALSE leaves the daemon UP (never a reboot-brick) + sets wallMayBeArmed, even though disarm did NOT throw", async () => {
+    it("P1 (fail-open-after-lease-revoke): arm ok:false + fresh daemon + disarm returns fail_open_deadman leaves the daemon UP (never a reboot-brick) + sets wallMayBeArmed, even though disarm did NOT throw", async () => {
       const ops = happyPathOps({
         ensurePolicyDaemon: vi.fn(async () => ({ ok: true as const, freshlyInstalled: true })),
         arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
         // Disarm did NOT throw (it succeeded as a dead-man lever, fail-open),
-        // but the NE preference was NOT confirmed off -- the exact P1 sub-case.
-        disarm: vi.fn(async () => ({ neConfirmedOff: false })),
+        // but the NE preference was NOT observed off -- the exact P1 sub-case.
+        disarm: vi.fn(async () => ({ nePreferenceOutcome: "fail_open_deadman" as const })),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "arm", wallMayBeArmed: true });
       expect(ops.disarm).toHaveBeenCalledTimes(1);
-      // CRITICAL: a non-throwing-but-not-confirmed disarm must NOT tear the fresh
+      // CRITICAL: a non-throwing-but-not-observed-off disarm must NOT tear the fresh
       // daemon down -- removing it while the NE preference may still be enabled
       // risks a reboot-brick (provider up enabled + no daemon = deny-all).
       expect(ops.teardownPolicyDaemon).not.toHaveBeenCalled();
@@ -868,7 +1003,7 @@ describe("castle-wall/provision/orchestrate", () => {
           rule_ids: ["provisioned-hermes-abc123def456"],
         }),
       );
-      expect(ops.scrubProvisionedEgress).not.toHaveBeenCalled();
+      expect(ops.restoreProvisionedEgressToPreRunState).not.toHaveBeenCalled();
     });
 
     it("refuse-to-arm (fail-closed): provisionEgress ok:false aborts at 'provision-egress' BEFORE arm, scrubs any partial publish, and audits egress_provision_refused", async () => {
@@ -884,7 +1019,7 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toMatchObject({ kind: "aborted", stage: "provision-egress", rolledBack: true });
       expect(ops.arm).not.toHaveBeenCalled();
       // A partial publish must never survive a refused run (no orphan grants).
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
       expect(ops.auditEgress).toHaveBeenCalledWith(
         "egress_provision_refused",
         expect.objectContaining({ stage: "provision-egress", disarm_outcome: "not-armed" }),
@@ -897,6 +1032,91 @@ describe("castle-wall/provision/orchestrate", () => {
       // The per-endpoint table was printed.
       const printed = (ops.print as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
       expect(printed.some((line) => /\[FAIL\] LLM \(Venice\)/.test(line))).toBe(true);
+    });
+
+    // -----------------------------------------------------------------------
+    // FIX F-COARSE-AFTER-EXCLUSIVE, honesty half (HIGH, Mini1 re-drill
+    // 2026-07-26). This abort printed the flat sentence "The wall was NOT
+    // armed". At the instant it printed on the drill host, pf was
+    // `Status: Enabled`, the gate registry showed
+    // `committed: [{agent_uid: 503, generation_id: 23}]`, and the confined
+    // agent was 0/9 reachable INCLUDING its own manifest. The sentence was
+    // true about the CODE PATH and false about the HOST.
+    // -----------------------------------------------------------------------
+    const refusingEgressOps = (
+      observe: ProvisionFlowOps["observeAgentConfinement"],
+    ): ProvisionFlowOps =>
+      happyPathOps({
+        provisionEgress: vi.fn(async () => ({
+          ok: false as const,
+          error: "policy reload after publishing egress rules failed: Exclusive routing composition rejected",
+          checks: [],
+          dnsRulePresent: true,
+        })),
+        observeAgentConfinement: observe,
+      });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a refused run over an ALREADY-CONFINED host never claims nothing is armed", async () => {
+      const result = await runProvisionFlow(
+        baseCtx(),
+        refusingEgressOps(
+          vi.fn(async () => ({
+            known: true as const,
+            confinedUids: [503],
+            exclusiveRoutingMarkerPresent: true,
+          })),
+        ),
+      );
+      const reason = (result as { reason: string }).reason;
+      // The pre-fix sentence, verbatim, must not be reachable.
+      expect(reason).not.toMatch(/The wall was NOT armed/);
+      // What IS said comes from the observation.
+      expect(reason).toMatch(/This run did not arm the wall, BUT/);
+      expect(reason).toMatch(/uid\(s\) 503 are confined/);
+      expect(reason).toMatch(/exclusive-routing marker/);
+      // And it names the product path that provably clears it (the drill's D9).
+      expect(reason).toMatch(/--unprotect-egress-gate/);
+    });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): a clean host is described as clean, and an UNOBSERVABLE host as unknown", async () => {
+      const clean = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => ({ known: true as const, confinedUids: [], exclusiveRoutingMarkerPresent: false })),
+      ));
+      expect((clean as { reason: string }).reason).toMatch(/no per-agent egress confinement was observed/);
+      expect((clean as { reason: string }).reason).not.toMatch(/unprotect-egress-gate/);
+
+      // "Could not look" must never collapse into "nothing is armed".
+      const unknown = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => ({ known: false as const, reason: "the egress-gate registry could not be read: EACCES" })),
+      ));
+      const unknownReason = (unknown as { reason: string }).reason;
+      expect(unknownReason).toMatch(/could NOT be observed/);
+      expect(unknownReason).toMatch(/EACCES/);
+      expect(unknownReason).not.toMatch(/no per-agent egress confinement was observed/);
+
+      // A THROWING probe is also unknown, never quiet, and never fatal.
+      const threw = await runProvisionFlow(baseCtx(), refusingEgressOps(
+        vi.fn(async () => Promise.reject(new Error("probe exploded"))),
+      ));
+      expect((threw as { reason: string }).reason).toMatch(/probe threw: probe exploded/);
+    });
+
+    it("REGRESSION (F-COARSE-AFTER-EXCLUSIVE): describeObservedAgentConfinement is a pure function of the observation", () => {
+      // The render chokepoint asserted directly: the same observation must
+      // produce the same sentence regardless of which caller reached it.
+      expect(
+        describeObservedAgentConfinement({ known: true, confinedUids: [], exclusiveRoutingMarkerPresent: false }),
+      ).toBe("This run did not arm the wall, and no per-agent egress confinement was observed on this host.");
+      const markerOnly = describeObservedAgentConfinement({
+        known: true,
+        confinedUids: [],
+        exclusiveRoutingMarkerPresent: true,
+      });
+      // A marker with NO committed uid is still exclusive composition, and is
+      // still enough to refuse the coarse path -- so it must not read clean.
+      expect(markerOnly).toMatch(/exclusive-routing marker/);
+      expect(markerOnly).toMatch(/--unprotect-egress-gate/);
+      expect(markerOnly).not.toMatch(/no per-agent egress confinement was observed/);
     });
 
     it("post-arm as-uid verify failure fast-disarms, scrubs the provisioned rules, audits egress_provision_refused, and returns the DISTINCT egress-unprovisioned-rolled-back outcome", async () => {
@@ -920,13 +1140,13 @@ describe("castle-wall/provision/orchestrate", () => {
       expect(result).toMatchObject({
         kind: "egress-unprovisioned-rolled-back",
         uid: AGENT_UID,
-        scrubbed: true,
+        egressRestoredToPreRunState: true,
       });
       expect(ops.disarm).toHaveBeenCalledTimes(1);
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
       // Fast-disarm ordering: filter off BEFORE the rule scrub.
       const disarmOrder = (ops.disarm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-      const scrubOrder = (ops.scrubProvisionedEgress as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+      const scrubOrder = (ops.restoreProvisionedEgressToPreRunState as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
       expect(disarmOrder).toBeLessThan(scrubOrder);
       expect(ops.auditEgress).toHaveBeenCalledWith(
         "egress_provision_refused",
@@ -1012,7 +1232,7 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "uid-existence-gate" });
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
     });
 
     it("a FAILED egress scrub on abort is surfaced LOUDLY in the reason, never silently swallowed", async () => {
@@ -1022,13 +1242,13 @@ describe("castle-wall/provision/orchestrate", () => {
           accountName: "sanctuary-hermes",
           reason: "account does not exist",
         })),
-        scrubProvisionedEgress: vi.fn(async () => {
+        restoreProvisionedEgressToPreRunState: vi.fn(async () => {
           throw new Error("EACCES: rules dir not writable");
         }),
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       const reason = (result as { reason: string }).reason;
-      expect(reason).toMatch(/provisioned egress allow rules could NOT be scrubbed/);
+      expect(reason).toMatch(/egress allow rules could NOT be restored to their pre-run state/);
       expect(reason).toMatch(/EACCES: rules dir not writable/);
     });
 
@@ -1043,7 +1263,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "ensure-policy-daemon" });
       expect(ops.provisionEgress).not.toHaveBeenCalled();
-      expect(ops.scrubProvisionedEgress).not.toHaveBeenCalled();
+      expect(ops.restoreProvisionedEgressToPreRunState).not.toHaveBeenCalled();
     });
 
     it("the Tier-1 confirm plan-print names every egress grant BEFORE the confirm, with the exfil-risk marking on messaging hosts", async () => {
@@ -1083,7 +1303,1206 @@ describe("castle-wall/provision/orchestrate", () => {
       });
       const result = await runProvisionFlow(baseCtx(), ops);
       expect(result).toMatchObject({ kind: "armed-then-rolled-back", uid: AGENT_UID });
-      expect(ops.scrubProvisionedEgress).toHaveBeenCalledTimes(1);
+      expect(ops.restoreProvisionedEgressToPreRunState).toHaveBeenCalledTimes(1);
+    });
+
+    /**
+     * FIX F-REVOKE (Mini1 confined-Hermes drill 2026-07-26): the rollback is
+     * only allowed to read as clean when the pre-run rule state was OBSERVED
+     * back AND is being served. On hardware the operator got "the re-homed
+     * paths were restored to your account" while six signed allow rules a
+     * previous run had published were gone and the live agent could reach
+     * nothing.
+     */
+    describe("F-REVOKE: a rollback that did not restore the agent's grants says so loudly", () => {
+      it("REGRESSION: an unrestored rule set warns that a still-running agent may reach nothing, and names the recovery command", async () => {
+        const ops = happyPathOps({
+          checkUidExistence: vi.fn(async () => ({
+            ok: false as const,
+            accountName: "sanctuary-hermes",
+            reason: "account does not exist",
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: false,
+            reloadOk: false,
+            problems: ["provisioned-hermes-abc123def456 was not restored"],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        const reason = (result as { reason: string }).reason;
+        expect(reason).toMatch(/MAY NOW REACH NOTHING/);
+        expect(reason).toMatch(/sudo sanctuary protect --hermes/);
+        expect(reason).toMatch(/provisioned-hermes-abc123def456 was not restored/);
+      });
+
+      it("REGRESSION: rules back on disk but no confirmed reload is reported as not-yet-serving, with the reload command", async () => {
+        const ops = happyPathOps({
+          checkUidExistence: vi.fn(async () => ({
+            ok: false as const,
+            accountName: "sanctuary-hermes",
+            reason: "account does not exist",
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: true,
+            reloadOk: false,
+            problems: [],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        const reason = (result as { reason: string }).reason;
+        expect(reason).toMatch(/restored on disk but the policy daemon did NOT confirm/);
+        expect(reason).toMatch(/sanctuary castle-wall reload/);
+      });
+
+      it("REGRESSION: the post-arm outcome does NOT claim the pre-run rule state was restored when the reload was unconfirmed", async () => {
+        const ops = happyPathOps({
+          verifyAgentEgressAfterArm: vi.fn(async () => ({
+            ok: false,
+            rows: [
+              {
+                name: "LLM (Venice)",
+                host: "api.venice.ai",
+                port: 443,
+                expected: "reachable" as const,
+                observed: "blocked" as const,
+                pass: false,
+              },
+            ],
+          })),
+          restoreProvisionedEgressToPreRunState: vi.fn(async () => ({
+            restored: true,
+            reloadOk: false,
+            problems: [],
+          })),
+        });
+        const result = await runProvisionFlow(baseCtx(), ops);
+        expect(result).toMatchObject({
+          kind: "egress-unprovisioned-rolled-back",
+          egressRestoredToPreRunState: false,
+        });
+        expect(ops.auditEgress).toHaveBeenCalledWith(
+          "egress_provision_refused",
+          expect.objectContaining({ egress_rules_restored_to_pre_run_state: false }),
+        );
+      });
+    });
+  });
+
+  describe("S5-6 exclusive-egress (fine-grained) stage", () => {
+    const COMMITTED = { generation_id: 4, agent_uid: AGENT_UID, gate_port: 40001 };
+
+    /** Exclusive ops whose bring-up + release succeed. */
+    function happyExclusiveOps() {
+      return {
+        bringUpGeneration: vi.fn(async () => COMMITTED),
+        runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
+        restoreCoarseComposition: vi.fn(async () => undefined),
+        startHarnessCoarse: vi.fn(async () => undefined),
+        audit: vi.fn(async () => undefined),
+        print: vi.fn(),
+      };
+    }
+
+    /** happyPathOps with the PARKED install form the fine-grained mode requires. */
+    function fineGrainedOps(exclusive = happyExclusiveOps(), overrides: Partial<ProvisionFlowOps> = {}) {
+      return {
+        ops: happyPathOps({
+          installHarnessDaemon: vi.fn(async () => ({
+            ok: true as const,
+            bootstrappedThisRun: false,
+            parked: true,
+          })),
+          exclusiveEgress: exclusive,
+          ...overrides,
+        }),
+        exclusive,
+      };
+    }
+
+    it("PREFLIGHT (fail-closed, before ANY mutation): fine-grained declared with no exclusive ops wired aborts with nothing changed", async () => {
+      const ops = happyPathOps();
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-egress-preflight" });
+      // Nothing ran: no confirm ceremony, no account, no daemon, no arm.
+      expect(ops.confirm).not.toHaveBeenCalled();
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    it("BARRIER ASSERTION: a non-parked install in fine-grained mode aborts at install-daemon and tears the daemon down (never an agent running before the barrier)", async () => {
+      const { ops } = fineGrainedOps(happyExclusiveOps(), {
+        // The install "succeeds" but NOT in the parked form.
+        installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+      expect(String((result as { reason: string }).reason)).toMatch(/parked/i);
+      expect(ops.uninstallHarnessDaemon).toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    it("happy fine-grained path: coarse stages first, then the exclusive stage, terminal outcome armed-exclusive (never plain armed)", async () => {
+      const { ops, exclusive } = fineGrainedOps();
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toEqual({ kind: "armed-exclusive", uid: AGENT_UID, generationId: COMMITTED.generation_id });
+      // The exclusive stage ran strictly AFTER the coarse arm proved live.
+      const armOrder = (ops.arm as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const bringUpOrder = exclusive.bringUpGeneration.mock.invocationCallOrder[0]!;
+      expect(armOrder).toBeLessThan(bringUpOrder);
+      expect(exclusive.runReleaseSequence).toHaveBeenCalledWith(COMMITTED);
+      // No degrade surfaces touched on the happy path.
+      expect(exclusive.restoreCoarseComposition).not.toHaveBeenCalled();
+      expect(exclusive.startHarnessCoarse).not.toHaveBeenCalled();
+    });
+
+    it("released-repark-failed maps to the DISTINCT armed-exclusive-repark-failed outcome (amber, never green)", async () => {
+      const exclusive = happyExclusiveOps();
+      exclusive.runReleaseSequence = vi.fn(async () => ({
+        kind: "released-repark-failed" as const,
+        generation_id: COMMITTED.generation_id,
+        reparkError: "launchctl disable exited 1",
+      }));
+      const { ops } = fineGrainedOps(exclusive);
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toEqual({
+        kind: "armed-exclusive-repark-failed",
+        uid: AGENT_UID,
+        generationId: COMMITTED.generation_id,
+        reparkError: "launchctl disable exited 1",
+      });
+    });
+
+    it("DEGRADE-LOUD: a failed bring-up maps to exclusive-egress-unarmed-coarse-active carrying the stage/reason/restore/start signals", async () => {
+      const exclusive = happyExclusiveOps();
+      exclusive.bringUpGeneration = vi.fn(async () => {
+        throw new Error("pf anchor liveness probe reported NOT live");
+      });
+      const { ops } = fineGrainedOps(exclusive);
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({
+        kind: "exclusive-egress-unarmed-coarse-active",
+        uid: AGENT_UID,
+        stage: "bring-up",
+        coarseCompositionRestored: true,
+        harness: { disposition: "started-coarse" },
+      });
+      expect(String((result as { reason: string }).reason)).toMatch(/NOT live/);
+      // The proven coarse wall was NOT disarmed by the degrade path.
+      expect(ops.disarm).not.toHaveBeenCalled();
+    });
+
+    it("coarse mode (fineGrainedDeclared absent) never invokes the exclusive stage even when ops are wired", async () => {
+      const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
+        installHarnessDaemon: vi.fn(async () => ({ ok: true as const, bootstrappedThisRun: true })),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
+    });
+
+    it("D8 REGRESSION: a stale exclusive-routing marker from a crashed prior arm is cleared BEFORE ANY MUTATION, and the arm PROCEEDS to a live exclusive arm", async () => {
+      // The 2026-07-21 hardware wedge: an interrupted prior arm left a stale
+      // marker on the fortress. The gate self-heals it (orphaned, no live
+      // confinement present); pre-fix, the daemon composed EXCLUSIVE over the
+      // coarse rules provision-egress publishes and failed closed, so the flow
+      // never got past provision-egress.
+      const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
+        reconcileExclusiveRoutingResidue: residueOp(),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      // The flow proceeded all the way to a live exclusive arm.
+      expect(result).toEqual({ kind: "armed-exclusive", uid: AGENT_UID, generationId: COMMITTED.generation_id });
+      const residue = ops.reconcileExclusiveRoutingResidue as ReturnType<typeof vi.fn>;
+      // Judged once, cleared once.
+      expect(residue.mock.calls.map((c) => c[1])).toEqual(["observe", "clear"]);
+      // The clear ran strictly BEFORE the first mutation (createAccount) and
+      // therefore before provision-egress (the wedge point) and the arm.
+      const clearOrder = residue.mock.invocationCallOrder[1]!;
+      const createOrder = (ops.createAccount as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      const provisionOrder = (ops.provisionEgress as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]!;
+      expect(clearOrder).toBeLessThan(createOrder);
+      expect(clearOrder).toBeLessThan(provisionOrder);
+      expect(exclusive.bringUpGeneration).toHaveBeenCalledTimes(1);
+    });
+
+    it("D8 fail-closed: a marker the gate cannot read (throws) ABORTS with nothing changed -- never arms over an unreadable routing mode", async () => {
+      const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
+        // The real op raises the marker load contract's own error class (G8).
+        reconcileExclusiveRoutingResidue: vi.fn(async () => {
+          throw new ExclusiveRoutingMarkerError("exclusive-routing.json is not valid JSON");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue", rolledBack: false });
+      expect((result as { reason: string }).reason).toMatch(/could NOT be read/);
+      expect((result as { reason: string }).reason).toMatch(/not valid JSON/);
+      // Nothing mutated: no account, no install, no egress publish, no arm.
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+      expect(ops.provisionEgress).not.toHaveBeenCalled();
+      expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
+    });
+
+    it("D8 fail-closed: a marker that is KEPT (confinement may be live) REFUSES pre-mutation and names the way out", async () => {
+      // Pre-fix this printed the reason and CONTINUED, straight into the
+      // provision-egress wedge. A kept marker means the daemon will compose
+      // exclusive against this run's coarse rules, so continuing can only end
+      // in a refusal AFTER the host has been changed.
+      const { ops, exclusive } = fineGrainedOps(happyExclusiveOps(), {
+        reconcileExclusiveRoutingResidue: vi.fn(async () => ({
+          kind: "kept-uncertain" as const,
+          reason: "the S1 anchor registry is in an uncertain state (dirty=true, quarantined=0)",
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
+      expect((result as { reason: string }).reason).toMatch(/uncertain state/);
+      expect((result as { reason: string }).reason).toMatch(/sudo sanctuary protect --unprotect-egress-gate/);
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // FIX F-COARSE-AFTER-EXCLUSIVE, CLASS half (Mini1 re-drill, 2026-07-26).
+  //
+  // The instance was fixed on 2026-07-25 (the repair verb restores coarse
+  // composition; the abort sentence is derived from an observation). The CLASS
+  // was not: the residue self-heal was reachable ONLY when
+  // `fineGrainedDeclared === true` AND the exclusive ops were wired, so the
+  // plain COARSE `protect --hermes --provision-agent-account` run -- the exact
+  // command that hit the defect on the drill host -- never ran it, was judged
+  // by the exclusive composition rules the leftover marker imposes, and was
+  // refused AFTER mutating the host.
+  //
+  // The gate is now mode-independent, and its irreversible half sits AFTER the
+  // one confirm (FIX F1/F2, 2026-07-26). These assert both properties on the
+  // COARSE path, where every one of them was previously absent.
+  // ────────────────────────────────────────────────────────────────────────
+  describe("exclusive-routing residue gate (mode-independent, consent-ordered)", () => {
+    it("REGRESSION (coarse): a run with NO exclusive mode declared and NO exclusive ops wired STILL runs the residue gate", async () => {
+      const ops = happyPathOps();
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      // Pre-fix this op did not exist on the coarse path at all: the self-heal
+      // was gated on a mode the wedging component (the signing daemon) does
+      // not read. With no marker on disk the judgement is the only call.
+      expect(ops.reconcileExclusiveRoutingResidue).toHaveBeenCalledTimes(1);
+      expect(ops.reconcileExclusiveRoutingResidue).toHaveBeenCalledWith(undefined, "observe");
+      expect(ops.exclusiveEgress).toBeUndefined();
+    });
+
+    it("REGRESSION (coarse, the drill command): a live gate REFUSES before any mutation and names the way out", async () => {
+      // The drill: a failed exclusive arm left exclusive-routing.json +
+      // exclusive-egress-gate.json behind, and the next plain coarse
+      // `protect --hermes --provision-agent-account` run was refused with the
+      // host already changed. It must now refuse with nothing changed. On the
+      // real F-COARSE-AFTER-EXCLUSIVE host the S5-1 registry held a committed
+      // entry, so this -- KEPT, not self-healed -- is the drill's own verdict.
+      const ops = happyPathOps({
+        reconcileExclusiveRoutingResidue: vi.fn(async () => ({
+          kind: "kept-live" as const,
+          reason: "the S5-1 anchor registry still has an entry for uid 503 (committed or mid-bring-up)",
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+      expect(result).toMatchObject({
+        kind: "aborted",
+        stage: "exclusive-routing-residue",
+        rolledBack: false,
+        rehomeAttempted: false,
+      });
+      const reason = (result as { reason: string }).reason;
+      expect(reason).toMatch(/entry for uid 503/);
+      expect(reason).toMatch(/No account was created, nothing was re-homed, and no Castle Wall change was made/);
+      expect(reason).toMatch(/sudo sanctuary protect --unprotect-egress-gate/);
+      // Refused before the confirm, and before every mutation.
+      expect(ops.confirm).not.toHaveBeenCalled();
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(ops.rehome).not.toHaveBeenCalled();
+      expect(ops.installHarnessDaemon).not.toHaveBeenCalled();
+      expect(ops.ensurePolicyDaemon).not.toHaveBeenCalled();
+      expect(ops.provisionEgress).not.toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    it("REGRESSION (coarse): a marker that cannot be READ refuses fail-closed -- 'could not look' is never 'nothing there'", async () => {
+      const ops = happyPathOps({
+        // The real op raises the marker load contract's own error class; the
+        // sentence classification (G8) keys on it, so the fake must too.
+        reconcileExclusiveRoutingResidue: vi.fn(async () => {
+          throw new ExclusiveRoutingMarkerError("exclusive-routing marker: unknown version 2");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
+      expect((result as { reason: string }).reason).toMatch(/could NOT be read/);
+      expect((result as { reason: string }).reason).toMatch(/unknown version 2/);
+      expect(ops.arm).not.toHaveBeenCalled();
+      expect(ops.createAccount).not.toHaveBeenCalled();
+    });
+
+    it("REGRESSION (coarse): a provably-orphaned marker is SELF-HEALED and the coarse run proceeds to arm", async () => {
+      const ops = happyPathOps({ reconcileExclusiveRoutingResidue: residueOp() });
+      const printed: string[] = [];
+      (ops as { print: (line: string) => void }).print = (line: string) => printed.push(line);
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "armed", uid: AGENT_UID });
+      // The removal is NAMED before the confirm, so the operator's yes covers it.
+      expect(printed.join("\n")).toMatch(/will be cleared if you proceed/);
+      // FIX F7: the flow does NOT re-print the self-heal fact. The production
+      // reconcile prints it (with the uid) at the moment it removes the files;
+      // both printing meant the operator read the same fact twice.
+      expect(printed.filter((l) => /Reconciled a stale exclusive-routing marker/.test(l))).toEqual([]);
+    });
+
+    it("scopes the reconcile to the uid this run RESOLVED, and passes undefined when none is resolved", async () => {
+      const dedicated = happyPathOps();
+      await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), dedicated);
+      expect(dedicated.reconcileExclusiveRoutingResidue).toHaveBeenCalledWith(AGENT_UID, "observe");
+
+      const fresh = happyPathOps();
+      await runProvisionFlow(baseCtx({ detectResult: NEEDS_PROVISIONING }), fresh);
+      // NEEDS_PROVISIONING resolved nothing; a marker then has no subject to be
+      // judged against, and the production reconcile keeps it fail-closed.
+      expect(fresh.reconcileExclusiveRoutingResidue).toHaveBeenCalledWith(undefined, "observe");
+    });
+
+    // ── FIX F1 (adversarial review, 2026-07-26) ──────────────────────────
+    // The first cut ran the WHOLE gate -- the self-heal's two `rm`s included --
+    // above the non-TTY refusal and the pre-declined return. A scripted run and
+    // an explicit decline therefore deleted `exclusive-routing.json` and
+    // `exclusive-egress-gate.json` from the operator's fortress and then
+    // reported that provisioning had been skipped. These three assert the
+    // property the PR claimed and did not have.
+    it("F1: a NON-TTY run never reaches the residue gate at all (it was never going to arm)", async () => {
+      const ops = happyPathOps({ reconcileExclusiveRoutingResidue: residueOp() });
+      const result = await runProvisionFlow(baseCtx({ isTty: false }), ops);
+      expect(result).toMatchObject({ kind: "skipped-non-tty-cooperative-only" });
+      // Pre-fix: called, and the marker + gate policy were already deleted.
+      expect(ops.reconcileExclusiveRoutingResidue).not.toHaveBeenCalled();
+    });
+
+    it("F1: an explicitly DECLINED run (--no-provision-agent-account) never reaches the residue gate", async () => {
+      const ops = happyPathOps({ reconcileExclusiveRoutingResidue: residueOp() });
+      const result = await runProvisionFlow(baseCtx({ preAnsweredProvision: false }), ops);
+      expect(result).toEqual({ kind: "declined-by-operator" });
+      expect(ops.reconcileExclusiveRoutingResidue).not.toHaveBeenCalled();
+    });
+
+    it("F1: an operator who answers 'n' at the confirm leaves the marker ON DISK -- the irreversible half never runs", async () => {
+      // The gate JUDGES before the confirm (so a doomed run is not confirmed)
+      // and REMOVES after it. This is the case the placement-only fix misses:
+      // the judgement is allowed, the removal is not.
+      const residue = residueOp();
+      const ops = happyPathOps({
+        reconcileExclusiveRoutingResidue: residue,
+        confirm: vi.fn(async () => false),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toEqual({ kind: "declined-by-operator" });
+      expect(residue.mock.calls.map((c) => c[1])).toEqual(["observe"]);
+      expect(residue).not.toHaveBeenCalledWith(expect.anything(), "clear");
+    });
+
+    it("F1: the CLEAR half re-probes, and a marker that went live during the confirm ABORTS with the host untouched", async () => {
+      // The judgement-to-removal window spans operator think-time. Trusting the
+      // observation across it would mean removing a marker whose confinement
+      // came live in between -- a de-confinement. The clear call is authoritative.
+      const ops = happyPathOps({
+        reconcileExclusiveRoutingResidue: vi.fn(async (_uid: number | undefined, intent: "observe" | "clear") =>
+          intent === "observe"
+            ? { kind: "orphaned" as const, detail: "no registry entry and no serving gate for uid 707" }
+            : { kind: "kept-live" as const, reason: "a gate daemon now owns port 40001 under gate uid 708" },
+        ),
+      });
+      const result = await runProvisionFlow(baseCtx(), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
+      expect((result as { reason: string }).reason).toMatch(/owns port 40001/);
+      expect(ops.createAccount).not.toHaveBeenCalled();
+      expect(ops.rehome).not.toHaveBeenCalled();
+      expect(ops.arm).not.toHaveBeenCalled();
+    });
+
+    // ── FIX F2/F3/F5 (adversarial review, 2026-07-26): the sentences ─────
+    it("the refusal sentence is built from the VERDICT, and makes no claim about whether the wall is armed", () => {
+      const sentences = [
+        describeExclusiveRoutingResidueRefusal({ kind: "kept-live", reason: "a gate is serving port 40001" }),
+        describeExclusiveRoutingResidueRefusal({ kind: "kept-uncertain", reason: "the registry is dirty" }),
+        describeExclusiveRoutingResidueRefusal({
+          kind: "kept-unknown-subject",
+          reason: "no subject",
+          markerAgentUid: 707,
+        }),
+        describeExclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "EACCES", source: "marker" }),
+        // G5: the ONE refusal reachable after a mutation. With nothing removed
+        // the flat "no Castle Wall change" claim is still true, so it belongs
+        // in this invariant loop; the removed-something case is asserted below.
+        describeExclusiveRoutingResidueRefusal({ kind: "removal-failed", detail: "EROFS", removed: [] }),
+      ];
+      for (const sentence of sentences) {
+        // The armed/not-armed claim belongs to describeObservedAgentConfinement,
+        // which derives it from a probe. This sentence must not invent one.
+        expect(sentence).not.toMatch(/wall was NOT armed/i);
+        expect(sentence).not.toMatch(/did not arm the wall/i);
+        // FIX F2: no counterfactual about a step this run does not reach. The
+        // refusing run never gets to arming, so it cannot report what arming
+        // would have done -- that is the same shape as the defect this whole
+        // fix exists downstream of.
+        expect(sentence).not.toMatch(/would be refused at the arming step/);
+        // FIX F5: "Nothing has been changed." was false at the command level --
+        // the cooperative wrap has already rewritten config by this point. The
+        // claim is scoped to what this flow did not do.
+        expect(sentence).not.toMatch(/Nothing has been changed/);
+        expect(sentence).toMatch(
+          /No account was created, nothing was re-homed, and no Castle Wall change was made by this run\./,
+        );
+        expect(sentence).toMatch(/--unprotect-egress-gate/);
+      }
+    });
+
+    it("F2: a LIVE gate and an UNCERTAIN surface get different sentences and different remedies", () => {
+      const live = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-live",
+        reason: "the S5-1 anchor registry still has an entry for uid 503",
+      });
+      // The common instance of this refusal is a HEALTHY, correctly armed host.
+      // Telling that operator to unprotect tells them to de-confine a working
+      // agent and leave the harness parked and down, so "nothing needs doing"
+      // comes first and the cost of the teardown is stated.
+      expect(live).toMatch(/already has exclusive-egress confinement in place/);
+      expect(live).toMatch(/If the confinement already in place is the one you want, nothing needs doing/);
+      expect(live).toMatch(/leaves the harness parked and down/);
+      expect(live).not.toMatch(/could NOT be shown to be stale/);
+
+      const uncertain = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-uncertain",
+        reason: "the S5-1 anchor registry is in an uncertain state (dirty=true, quarantined=0)",
+      });
+      expect(uncertain).toMatch(/could NOT be shown to be stale/);
+      expect(uncertain).toMatch(/--repair-egress-gate/);
+      expect(uncertain).not.toMatch(/nothing needs doing/);
+    });
+
+    it("F3: the unknown-subject refusal names the verb that actually works when the agent account is gone", () => {
+      // The accepted wrong-refuse. Its old justification -- "it names the verb
+      // that clears it" -- was false: both named verbs resolved their subject
+      // with lookupAccountUid("_sanctuary-hermes"), so with the account gone
+      // unprotect exited 2 ("nothing to unprotect") and repair exited 2 telling
+      // the operator to run the very command this gate refuses. The sentence
+      // now names ONE verb, and that verb has a no-account residue teardown.
+      const sentence = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-unknown-subject",
+        reason: "this run has not resolved an agent uid to scope it against",
+        markerAgentUid: 707,
+      });
+      expect(sentence).toMatch(/marker for agent uid 707/);
+      expect(sentence).toMatch(/could not determine the agent's run-as identity/);
+      expect(sentence).toMatch(/--unprotect-egress-gate/);
+      // Repair is NOT offered here: it exits 2 in exactly this state.
+      expect(sentence).not.toMatch(/--repair-egress-gate/);
+    });
+
+    // ── FIX G2 (re-gate, 2026-07-26) ────────────────────────────────────
+    it("G2: the unknown-subject sentence promises the removal CONDITIONALLY, because the teardown it names refuses on live state", () => {
+      const sentence = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-unknown-subject",
+        reason: "this run has not resolved an agent uid to scope it against",
+        markerAgentUid: 707,
+      });
+      // The pre-fix sentence promised the removal UNCONDITIONALLY ("which
+      // removes this residue even when the dedicated agent account is gone").
+      // `clearExclusiveRoutingResidueWithoutAccount` REFUSES whenever uid 707
+      // still has a registry entry or a gate that could serve, so that promise
+      // was false on exactly the branch that refuses -- the sentence class this
+      // change exists to eliminate.
+      expect(sentence).not.toMatch(/gate', which removes this residue even when/);
+      expect(sentence).toMatch(/when nothing is still armed for uid 707 it removes the residue/);
+      expect(sentence).toMatch(/when something IS still armed for that uid it changes nothing/);
+    });
+
+    // ── FIX G6 (re-gate, 2026-07-26) ────────────────────────────────────
+    it("G6: the unknown-subject sentence does not assert 'no running agent' from a probe that returns undefined on failure", () => {
+      const sentence = describeExclusiveRoutingResidueRefusal({
+        kind: "kept-unknown-subject",
+        reason: "r",
+        markerAgentUid: 707,
+      });
+      // `readRunningHermesGatewayUid` is `try { ps } catch { return undefined }`,
+      // so a ps failure, a PATH problem, and a sandbox restriction are
+      // indistinguishable from "no process". detect.ts is careful and says
+      // "could NOT determine"; this sentence used to flatten that into a
+      // positive claim.
+      expect(sentence).not.toMatch(/and no running agent\b/);
+      expect(sentence).toMatch(/no agent process was found/);
+    });
+
+    // ── FIX G8 (re-gate, 2026-07-26) ────────────────────────────────────
+    it("G8: 'unreadable' blames the MARKER only when the marker is what failed", () => {
+      const marker = describeExclusiveRoutingResidueRefusal({
+        kind: "unreadable",
+        detail: "the residue reconcile threw: cannot read .../exclusive-routing.json (EACCES)",
+        source: "marker",
+      });
+      expect(marker).toMatch(/exclusive-routing marker could NOT be read/);
+      expect(marker).toMatch(/--unprotect-egress-gate/);
+
+      // The verdict is produced by ANY throw out of the op. A malformed anchor
+      // registry leaves the marker perfectly readable, and removing it fixes
+      // nothing -- so neither the claim nor the remedy may be the marker's.
+      const other = describeExclusiveRoutingResidueRefusal({
+        kind: "unreadable",
+        detail: "the residue reconcile threw: PfAnchorRegistryStateError: registry file is not valid JSON",
+        source: "residue-check",
+      });
+      expect(other).toMatch(/residue check could NOT complete/);
+      expect(other).not.toMatch(/marker could NOT be read/);
+      expect(other).toMatch(/the marker itself may be perfectly readable, so removing it is not the remedy/);
+    });
+
+    // ── FIX G5 (re-gate, 2026-07-26) ────────────────────────────────────
+    it("G5: a removal that failed PART WAY states what it removed instead of claiming no Castle Wall change", () => {
+      const sentence = describeExclusiveRoutingResidueRefusal({
+        kind: "removal-failed",
+        detail: "removing the exclusive-egress gate policy file (/f/policy/egress/x.json) failed: EROFS",
+        removed: ["the exclusive-routing marker (/f/allowlist/exclusive-routing.json)"],
+      });
+      expect(sentence).not.toMatch(/no Castle Wall change was made by this run/);
+      expect(sentence).toMatch(/this run DID change Castle Wall state/);
+      expect(sentence).toMatch(/it removed the exclusive-routing marker \(\/f\/allowlist\/exclusive-routing\.json\)/);
+      expect(sentence).toMatch(/FAILED part way/);
+    });
+
+    it("F4: the op boundary is a TOTAL union -- a keep can no longer be spelled by omission", () => {
+      // The op used to return `{ reconciled: boolean; reason?: string }`, so a
+      // wiring that KEPT a marker but omitted the reason read as "clear" and the
+      // run walked into the wedge. That is the two-fields-that-can-disagree
+      // shape #1006 deleted at the park boundary. Every verdict now carries its
+      // own discriminant, and the refusal narrowing is a switch: a new kind is
+      // a type error at this seam, not a silent "keep going".
+      expect(exclusiveRoutingResidueRefusal({ kind: "clear" })).toBeUndefined();
+      expect(exclusiveRoutingResidueRefusal({ kind: "orphaned", detail: "d" })).toBeUndefined();
+      expect(exclusiveRoutingResidueRefusal({ kind: "reconciled", detail: "d" })).toBeUndefined();
+      expect(exclusiveRoutingResidueRefusal({ kind: "kept-live", reason: "r" })).toMatchObject({ kind: "kept-live" });
+      expect(exclusiveRoutingResidueRefusal({ kind: "kept-uncertain", reason: "r" })).toMatchObject({
+        kind: "kept-uncertain",
+      });
+      expect(
+        exclusiveRoutingResidueRefusal({ kind: "kept-unknown-subject", reason: "r", markerAgentUid: 707 }),
+      ).toMatchObject({ kind: "kept-unknown-subject" });
+      expect(exclusiveRoutingResidueRefusal({ kind: "unreadable", detail: "d", source: "marker" })).toMatchObject({
+        kind: "unreadable",
+      });
+      expect(exclusiveRoutingResidueRefusal({ kind: "removal-failed", detail: "d", removed: [] })).toMatchObject({
+        kind: "removal-failed",
+      });
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // FIX G3 (re-gate, 2026-07-26): the residue gate's SUBJECT.
+    //
+    // `readHarnessConfiguredUid()` is hardcoded `undefined` in v1, so
+    // `detectResult.resolved` comes ONLY from a `ps` grep for a RUNNING Hermes
+    // gateway. It is therefore `undefined` on every run whose agent is merely
+    // stopped, crashed, parked, or booting -- which made `kept-unknown-subject`
+    // the DOMINANT keep in production, and its remedy is a destructive teardown
+    // that leaves a healthy host parked and down.
+    // ────────────────────────────────────────────────────────────────────
+    describe("G3: the residue gate's fallback subject (a stopped agent is not an unknown subject)", () => {
+      /** A ctx whose detect probe resolved NO uid: the agent is simply not running. */
+      function stoppedAgentCtx(): ReturnType<typeof baseCtx> {
+        const ctx = baseCtx();
+        return {
+          ...ctx,
+          detectResult: { ...ctx.detectResult, alreadyDedicated: false, resolved: undefined },
+        };
+      }
+
+      it("scopes the gate to the DEDICATED ACCOUNT's uid when this run resolved none, so a stopped agent gets a real verdict", async () => {
+        const reconcile = vi.fn(async () => ({ kind: "clear" as const }));
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: vi.fn(async () => 503),
+        });
+        await runProvisionFlow(stoppedAgentCtx(), ops);
+        // Pre-fix this was called with `undefined` and guard 0 refused the run.
+        expect(reconcile).toHaveBeenCalledWith(503, "observe");
+        expect(reconcile).not.toHaveBeenCalledWith(undefined, "observe");
+      });
+
+      it("uses the SAME subject for the clear half as for the observe half the operator confirmed", async () => {
+        const detail = "no S5-1 registry entry and no serving gate for uid 503";
+        const reconcile = vi.fn(async (_uid: number | undefined, intent: "observe" | "clear") =>
+          intent === "observe" ? { kind: "orphaned" as const, detail } : { kind: "reconciled" as const, detail },
+        );
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: vi.fn(async () => 503),
+        });
+        await runProvisionFlow(stoppedAgentCtx(), ops);
+        expect(reconcile.mock.calls).toEqual([
+          [503, "observe"],
+          [503, "clear"],
+        ]);
+      });
+
+      it("does NOT relax guard 0: no account -> still an unknown subject, still refused", async () => {
+        const reconcile = vi.fn(async () => ({
+          kind: "kept-unknown-subject" as const,
+          reason: "no subject",
+          markerAgentUid: 707,
+        }));
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: vi.fn(async () => undefined),
+        });
+        const result = await runProvisionFlow(stoppedAgentCtx(), ops);
+        expect(reconcile).toHaveBeenCalledWith(undefined, "observe");
+        expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
+        expect(ops.arm).not.toHaveBeenCalled();
+      });
+
+      it("a lookup that THROWS is not a subject: the gate falls back to undefined and refuses, never to a guess", async () => {
+        const reconcile = vi.fn(async () => ({
+          kind: "kept-unknown-subject" as const,
+          reason: "no subject",
+          markerAgentUid: 707,
+        }));
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: vi.fn(async () => {
+            throw new Error("dscl: could not read the directory service");
+          }),
+        });
+        const result = await runProvisionFlow(stoppedAgentCtx(), ops);
+        expect(reconcile).toHaveBeenCalledWith(undefined, "observe");
+        expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
+        expect(ops.createAccount).not.toHaveBeenCalled();
+      });
+
+      it("an ALREADY-RESOLVED uid wins: the fallback lookup is not consulted at all", async () => {
+        const lookup = vi.fn(async () => 503);
+        const reconcile = vi.fn(async () => ({ kind: "clear" as const }));
+        const ops = happyPathOps({
+          reconcileExclusiveRoutingResidue: reconcile,
+          lookupDedicatedAccountUid: lookup,
+        });
+        await runProvisionFlow(baseCtx({ detectResult: ALREADY_DEDICATED }), ops);
+        expect(lookup).not.toHaveBeenCalled();
+        expect(reconcile).toHaveBeenCalledWith(AGENT_UID, "observe");
+      });
+    });
+
+    // ── FIX G8 (re-gate): the throw -> verdict classification ────────────
+    it("G8: a MARKER load throw is source 'marker'; any other throw out of the op is source 'residue-check'", async () => {
+      const markerRun = await runProvisionFlow(
+        baseCtx(),
+        happyPathOps({
+          reconcileExclusiveRoutingResidue: vi.fn(async () => {
+            throw new ExclusiveRoutingMarkerError("cannot read exclusive-routing.json (EACCES)");
+          }),
+        }),
+      );
+      expect((markerRun as { reason: string }).reason).toMatch(/exclusive-routing marker could NOT be read/);
+
+      const otherRun = await runProvisionFlow(
+        baseCtx(),
+        happyPathOps({
+          reconcileExclusiveRoutingResidue: vi.fn(async () => {
+            throw new Error("PfAnchorRegistryStateError: registry file is not valid JSON");
+          }),
+        }),
+      );
+      expect((otherRun as { reason: string }).reason).toMatch(/residue check could NOT complete/);
+      expect((otherRun as { reason: string }).reason).not.toMatch(/marker could NOT be read/);
+    });
+  });
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Drill-D2 fix-round (2026-07-18): the harness-restore chokepoint.
+  //
+  // In fine-grained mode the harness install STOPS the operator's live agent.
+  // Both adversarial gate lenses found that every abort between that step and
+  // the exclusive stage left it dead, with an unrecoverable plist and printed
+  // guidance that could not work. These assert the OUTCOME -- the agent is put
+  // back -- rather than that a particular internal was invoked, because the
+  // gates specifically noted the prior tests would pass against subtly wrong
+  // implementations.
+  // ────────────────────────────────────────────────────────────────────────
+  describe("harness-restore chokepoint (the fine-grained install is destructive, so it is reversible)", () => {
+    const COMMITTED = { generation_id: 4, agent_uid: AGENT_UID, gate_port: 40001 };
+
+    function exclusiveOps() {
+      return {
+        bringUpGeneration: vi.fn(async () => COMMITTED),
+        runReleaseSequence: vi.fn(async () => ({ kind: "released" as const, generation_id: COMMITTED.generation_id })),
+        restoreCoarseComposition: vi.fn(async () => undefined),
+        startHarnessCoarse: vi.fn(async () => undefined),
+        audit: vi.fn(async () => undefined),
+        print: vi.fn(),
+      };
+    }
+
+    /** A fine-grained run whose parked install STOOD A PRE-EXISTING AGENT DOWN. */
+    function stoodDownOps(overrides: Partial<ProvisionFlowOps> = {}) {
+      return happyPathOps({
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: true as const,
+          bootstrappedThisRun: false,
+          parked: true,
+          harnessStoodDown: true,
+        })),
+        exclusiveEgress: exclusiveOps(),
+        ...overrides,
+      });
+    }
+
+    // The exhaustive form of the gate's "seven abort sites" finding. Each of
+    // these is a real refusal the flow can reach after the agent is stopped;
+    // ALL of them must put it back. Table-driven deliberately: adding a stage
+    // here is cheaper than discovering the eighth one on a drill host.
+    const abortSites: Array<{ stage: string; overrides: Partial<ProvisionFlowOps> }> = [
+      {
+        stage: "provision-egress",
+        overrides: {
+          provisionEgress: vi.fn(async () => ({ ok: false as const, error: "reload refused" })),
+        },
+      },
+      {
+        stage: "verify-before-arm",
+        overrides: { preArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]) },
+      },
+      {
+        stage: "uid-existence-gate",
+        overrides: {
+          checkUidExistence: vi.fn(async () => ({ ok: false as const, reason: "uid 503 no longer exists" })),
+        },
+      },
+      {
+        stage: "arm",
+        overrides: { arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })) },
+      },
+    ];
+
+    for (const { stage, overrides } of abortSites) {
+      it(`restores the stood-down agent when the flow aborts at ${stage}`, async () => {
+        const ops = stoodDownOps(overrides);
+        const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+        expect(result).toMatchObject({ kind: "aborted", stage });
+        expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+        // The operator is TOLD, not left to infer it from silence.
+        expect(String((result as { reason: string }).reason)).toMatch(/stood down was restarted/i);
+      });
+    }
+
+    it("restores the agent on the post-arm rollback paths too (the outcomes that never routed through the teardown helper)", async () => {
+      // These two return `armed-then-rolled-back` / `egress-unprovisioned-
+      // rolled-back` instead of `aborted`, so a per-site restore bolted onto
+      // `teardownDaemonAndRestore` would have missed them entirely. Deciding
+      // from the OUTCOME is what covers them.
+      const postArm = stoodDownOps({
+        postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+      });
+      const postArmResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), postArm);
+      expect(postArmResult.kind).toBe("armed-then-rolled-back");
+      expect(postArm.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+
+      const asUid = stoodDownOps({
+        verifyAgentEgressAfterArm: vi.fn(async () => ({
+          ok: false as const,
+          rows: [{ name: "LLM", kind: "allow" as const, pass: false, detail: "blocked" }],
+        })),
+      });
+      const asUidResult = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), asUid);
+      expect(asUidResult.kind).toBe("egress-unprovisioned-rolled-back");
+      expect(asUid.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+    });
+
+    it("restores the agent when the barrier assertion rejects a non-parked install", async () => {
+      const ops = happyPathOps({
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: true as const,
+          bootstrappedThisRun: false,
+          harnessStoodDown: true,
+        })),
+        exclusiveEgress: exclusiveOps(),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "install-daemon" });
+      expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+    });
+
+    it("restores the agent when a step THROWS rather than returning an outcome, and still surfaces the original error", async () => {
+      // The abort path nobody enumerates. A restore driven off the outcome
+      // would miss it, so the chokepoint covers the throw explicitly.
+      const ops = stoodDownOps({
+        checkUidExistence: vi.fn(async () => {
+          throw new Error("dscl blew up");
+        }),
+      });
+      await expect(runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops)).rejects.toThrow(/dscl blew up/);
+      expect(ops.restoreStoodDownHarness).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT restore when the exclusive stage succeeded -- that would tear a correctly-confined agent back to coarse", async () => {
+      const ops = stoodDownOps();
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result.kind).toBe("armed-exclusive");
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
+    });
+
+    it("does NOT restore on the degrade-loud path -- that stage already decided the harness's disposition", async () => {
+      const exclusive = exclusiveOps();
+      exclusive.bringUpGeneration = vi.fn(async () => {
+        throw new Error("pf anchor liveness probe reported NOT live");
+      });
+      const ops = stoodDownOps({ exclusiveEgress: exclusive });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result.kind).toBe("exclusive-egress-unarmed-coarse-active");
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
+    });
+
+    it("does NOT restore when the install never stood anything down (a clean host has nothing to put back)", async () => {
+      const ops = happyPathOps({
+        installHarnessDaemon: vi.fn(async () => ({
+          ok: true as const,
+          bootstrappedThisRun: false,
+          parked: true,
+          harnessStoodDown: false,
+        })),
+        exclusiveEgress: exclusiveOps(),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+      });
+      await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(ops.restoreStoodDownHarness).not.toHaveBeenCalled();
+    });
+
+    it("a FAILED restore is LOUD: it prints the OBSERVED run state and the recovery step that follows from it", async () => {
+      // FIX-ROUND 6. This test used to be titled "names the agent as stopped
+      // and gives a command" and pinned the sentence "This run did NOT bring
+      // it back up, and did not verify its run state" plus an unconditional
+      // "re-run protect --hermes". Round 4 had already stopped the note naming
+      // the agent as stopped; the title and the ungated command survived, and
+      // the round-6 gate reproduced that exact pair being printed over a
+      // harness the run had observed ALIVE. The note is now the observation.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["launchctl bootstrap exited 5"],
+          runState: await observedRunState(PARKED_STATUS),
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/could NOT be fully restored/);
+      expect(reason).toMatch(/launchctl bootstrap exited 5/);
+      // The run state is the OBSERVED one, and the recovery step follows from
+      // it: over a genuine park, "bring it back up" is the right instruction.
+      expect(reason).toMatch(/The agent is PARKED \(not running\)/);
+      expect(reason).toMatch(/to bring it back up/);
+      // ...and the claim the round-6 gate falsified is gone for good.
+      expect(reason).not.toMatch(/did not verify its run state/i);
+      // The ORIGINAL abort reason is never displaced by the cleanup note.
+      expect(reason).toMatch(/castle-wall enable exited 1/);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // FIX-ROUND 6 (2026-07-19) -- THE ELEVENTH INSTANCE.
+    //
+    // The caller-side chokepoint routed the restore DECISION to one place and
+    // rebuilt the CLAIM at each consumer. The production op spent a full
+    // 20-sample settle loop, received `alive (pid 9001)`, and DISCARDED it at
+    // the op boundary, whose result type had no run-state field -- after which
+    // this note told the operator the run "did not verify its run state" and
+    // sent them to re-run over the live agent.
+    //
+    // These assert on the RENDERED operator message, driven through the real
+    // flow, over a modelled harness that is alive on every sample.
+    // ────────────────────────────────────────────────────────────────────
+
+    it("R6: an OBSERVED LIVE harness is never described as unverified, and never draws a bring-it-back-up", async () => {
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["the agent harness was stopped by this run and could NOT be restarted: bootstrap exited 5"],
+          runState: await observedRunState(LIVE_STATUS),
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+
+      // 1. The falsehood: an observation DID occur, so the run may not say none did.
+      expect(reason, "the round-6 HIGH").not.toMatch(/did not verify its run state/i);
+      // 2. The imperative: following it stands a live agent down again.
+      expect(reason, "the round-5 HIGH's imperative, at the sibling site").not.toMatch(
+        /to bring it back up/i,
+      );
+      // 3. What the operator gets instead: the observation, and advice premised on it.
+      expect(reason).toMatch(/The agent is RUNNING \(pid 9001\)/);
+      expect(reason).toMatch(/Do NOT re-run/);
+      // The original abort still wins the message.
+      expect(reason).toMatch(/castle-wall enable exited 1/);
+    });
+
+    it("R6: the REAL revert's observed claim survives the production op projection end to end", async () => {
+      // The gate's probes K + K2, as a regression test. K drove the REAL
+      // `revertParkedHarnessInstall` over a crash-loop survivor (launchd
+      // returns pid 9001 on every sample) and showed the claim being dropped
+      // by the projection at `wrap/auto-provision.ts`; K2 fed that projection
+      // into the REAL `runProvisionFlow` and captured the false sentence.
+      // Nothing here is a mock of the thing under test: the claim comes from
+      // the real revert, and the prose from the real flow.
+      let statusCalls = 0;
+      const revertOps: ParkedInstallRevertOps = {
+        harnessStatus: async (): Promise<HarnessDaemonStatus> => {
+          statusCalls += 1;
+          return LIVE_STATUS;
+        },
+        sleepMs: async () => {},
+        restoreRunningHarness: async () => {
+          throw new Error("launchctl bootstrap exited 5");
+        },
+        clearJobDisable: async () => {},
+        writeFile: async () => {},
+        readFile: async () => "<plist>prior</plist>",
+        removeFile: async () => {},
+      };
+      const revert = await revertParkedHarnessInstall(
+        {
+          wasInstalled: true,
+          wasRunning: true,
+          preexistingJobModified: true,
+          priorPlistContent: "<plist>prior</plist>",
+          plistPath: HARNESS_LOCATOR.plistPath,
+          harnessLabel: HARNESS_LOCATOR.harnessLabel,
+        },
+        revertOps,
+      );
+
+      // Ground truth: the run really did read the harness, and read it alive.
+      expect(statusCalls).toBeGreaterThan(0);
+      expect(revert.runState?.claim.state).toBe("alive");
+      // The invariant that makes the projection below safe.
+      expect(revert.runState !== undefined).toBe(runStateOwed(revert));
+
+      // THE REAL PROJECTION -- the same function `wrap/auto-provision.ts`
+      // calls, not a copy of it. Copying it here is what the production op did,
+      // and the copy is where the claim was lost.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => projectRevertToRestoreReport(revert)),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+
+      expect(reason).toMatch(/The agent is RUNNING \(pid 9001\)/);
+      expect(reason).not.toMatch(/did not verify its run state/i);
+      expect(reason).not.toMatch(/to bring it back up/i);
+      expect(reason).toMatch(/Do NOT re-run/);
+    });
+
+    it("R6: a THROWING restore op yields an explicitly WEAKENED claim, not an invented one", async () => {
+      // The op threw, so nothing was observed -- but the old fallback
+      // synthesized `wasRunning: true` with no claim, which under
+      // `runStateOwed` OWES a run-state sentence and had none. That is how the
+      // renderer came to invent one. "I could not tell" is now said out loud.
+      const printed: string[] = [];
+      const ops = stoodDownOps({
+        print: vi.fn((line: string) => printed.push(line)),
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => {
+          throw new Error("EROFS");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/EROFS/);
+      expect(reason).toMatch(/could NOT be established/);
+      expect(reason).toMatch(/Treat the agent as POSSIBLY RUNNING/);
+      // No park was observed, so no bring-it-back-up may be issued.
+      expect(reason).not.toMatch(/to bring it back up/i);
+      expect(reason).toMatch(/Establish the harness's state before re-running/);
+    });
+
+    it("R6: a job that was NOT running before gets no run-state claim and no restart instruction", async () => {
+      // The other direction of the same rule. `runStateOwed` is false here, so
+      // there is no claim -- and a note that invented "re-run to bring it back
+      // up" would be the identical defect with the sign flipped.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: false,
+          harnessRestarted: false,
+          problems: ["the parked harness plist is STILL PRESENT after removing it"],
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/STILL PRESENT/);
+      expect(reason).toMatch(/Nothing was running before this run began/);
+      expect(reason).not.toMatch(/to bring it back up/i);
+      // ...and it makes no claim about what the agent is doing NOW.
+      expect(reason).not.toMatch(/The agent is/);
+    });
+
+    it("a THROWING restore op cannot take the flow down with it", async () => {
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => {
+          throw new Error("EROFS");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result).toMatchObject({ kind: "aborted", stage: "arm" });
+      expect(String((result as { reason: string }).reason)).toMatch(/EROFS/);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // FIX-ROUND 2 (2026-07-18). Round 1's note was derived from a single
+    // boolean the production op computed from an empty error list. These
+    // assert the note is a function of what was OBSERVED, in each of the
+    // three shapes that boolean collapsed together.
+    // ────────────────────────────────────────────────────────────────────
+
+    it("B2: a restore that did NOT restart a running agent is never described as restarted", async () => {
+      // The exact case both lenses built: the job was running, it could not be
+      // restarted, and NOTHING raised an error. Under the old
+      // `errors.length === 0` rule this printed "was restarted and restored to
+      // its previous state" over a stopped agent.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["the agent harness was running before this run and this run did not restart it"],
+          runState: await observedRunState(PARKED_STATUS),
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).not.toMatch(/was restarted/i);
+      expect(reason).not.toMatch(/restored to its previous state/i);
+      // FIX-ROUND 6: this used to pin "did not verify its run state" -- a
+      // sentence that was false whenever the op HAD verified it. What the note
+      // owes the operator is the observation, and it is here.
+      expect(reason).toMatch(/The agent is PARKED \(not running\)/);
+      expect(reason).toMatch(/sanctuary protect --hermes/);
+    });
+
+    it("B2: the note keys on the VERDICT, not on the error list -- a silent failed restore is still loud", async () => {
+      // The literal shape the brief named: was running, could not be
+      // restarted, and NO errors raised. Production cannot produce this any
+      // more (the revert turns that silence into an error), which is exactly
+      // why it is pinned here: the note must be a function of `restored`, so
+      // that a future op which forgets to complain still cannot print
+      // "restarted" over a stopped agent.
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: [] as string[],
+          runState: await observedRunState(PARKED_STATUS),
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).not.toMatch(/was restarted/i);
+      expect(reason).toMatch(/could NOT be fully restored/);
+      expect(reason).toMatch(/The agent is PARKED \(not running\)/);
+    });
+
+    it("B2: a job that was NOT running before is described as put back, not as restarted", async () => {
+      const ops = stoodDownOps({
+        arm: vi.fn(async () => ({ ok: false as const, error: "castle-wall enable exited 1" })),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: true,
+          wasRunning: false,
+          harnessRestarted: false,
+          problems: [] as string[],
+        })),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/was put back/i);
+      expect(reason).toMatch(/not running before this run, and this run did not start it/i);
+      expect(reason).not.toMatch(/was restarted/i);
+    });
+
+    it("MED: armed-rollback-failed restores the harness but NOT the re-home, and stops claiming otherwise", async () => {
+      // Sites 14/16 return directly, without `teardownDaemonAndRestore`, so
+      // the re-home stands. Restoring the harness there runs the agent under
+      // its PRE-run account and home -- whose secrets this run already moved.
+      // "Restored to its previous state" was simply false.
+      const ops = stoodDownOps({
+        postArmEndpoints: vi.fn(() => [{ name: "LLM", probe: async () => false }]),
+        disarm: vi.fn(async () => {
+          throw new Error("pfctl -d exited 1");
+        }),
+      });
+      const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
+      expect(result.kind).toBe("armed-rollback-failed");
+      const reason = String((result as { reason: string }).reason);
+      expect(reason).toMatch(/re-home was deliberately NOT reversed/i);
+      expect(reason).toMatch(/not a return to your previous state/i);
+    });
+
+    it("MED: the restore note cannot be silenced by an outcome that has no `reason` field", async () => {
+      // The restore DECISION defaults to safe (an allow-list). The NOTE used
+      // to default to SILENCE: `withHarnessRestoreNote` returned the outcome
+      // untouched when it had no `reason`, dropping even the loud
+      // agent-is-stopped message. No outcome shape can swallow it now.
+      const printed: string[] = [];
+      const reasonless = stoodDownOps({
+        print: vi.fn((line: string) => printed.push(line)),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["launchctl bootstrap exited 5"],
+          runState: await observedRunState(PARKED_STATUS),
+        })),
+        // `armed` carries no `reason`. It cannot co-occur with a parked
+        // install today, which is exactly why the silence went unnoticed --
+        // so drive it explicitly rather than trust that it stays unreachable.
+        exclusiveEgress: undefined,
+      });
+      const coarse = await runProvisionFlow(baseCtx({ fineGrainedDeclared: false }), reasonless);
+      expect(coarse.kind).toBe("armed");
+      expect(printed.join("\n")).toMatch(/could NOT be fully restored/);
+      expect(printed.join("\n")).toMatch(/The agent is PARKED \(not running\)/);
+    });
+
+    it("MED: a restore on the THROW path is reported too, instead of being swallowed with the error", async () => {
+      const printed: string[] = [];
+      const ops = stoodDownOps({
+        print: vi.fn((line: string) => printed.push(line)),
+        checkUidExistence: vi.fn(async () => {
+          throw new Error("dscl blew up");
+        }),
+        restoreStoodDownHarness: vi.fn(async () => ({
+          restored: false,
+          wasRunning: true,
+          harnessRestarted: false,
+          problems: ["launchctl bootstrap exited 5"],
+          runState: await observedRunState(PARKED_STATUS),
+        })),
+      });
+      await expect(runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops)).rejects.toThrow(/dscl blew up/);
+      // The original error still wins as the outcome, but the operator is no
+      // longer left to discover their agent is down by noticing it is down.
+      expect(printed.join("\n")).toMatch(/could NOT be fully restored/);
+      expect(printed.join("\n")).toMatch(/The agent is PARKED \(not running\)/);
     });
   });
 });

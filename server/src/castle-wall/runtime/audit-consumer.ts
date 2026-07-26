@@ -22,9 +22,14 @@ import {
   CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
   CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED,
+  CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+  CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
 } from "../constants.js";
 import { canonicalize } from "../../mesh/canonical-json.js";
 import type {
@@ -35,6 +40,7 @@ import {
   verifyProducerSignature,
   type ProducerSignatureInput,
 } from "./producer-signature.js";
+import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
 import type { UnifiedInboxBridge } from "../../principal-policy/unified-inbox-bridge.js";
 import { ingestCastleWallBlockedEgress } from "../../principal-policy/unified-inbox-producers.js";
 
@@ -128,6 +134,23 @@ export interface CriticalEventEnvelope {
    * and verify, or the event is rejected (fail closed).
    */
   producer?: ProducerSignatureInput;
+  /**
+   * Subject-binding context for producer-signed verdicts. For macOS extension
+   * verdicts, the signed WAL body carries the raw audit token and the local
+   * runtime supplies the fortress id. For drain-shaped events whose signed WAL
+   * body already carries a canonical `identity_id`, the persist path uses that
+   * signed identity directly. A verified signature without one of these bindings
+   * is rejected before persistence so signed evidence can never inherit the
+   * unsigned envelope identity.
+   */
+  producerSubjectBinding?:
+    | {
+        kind: "macos_audit_token";
+        fortressId: string;
+      }
+    | {
+        kind: "signed_identity_id";
+      };
 }
 
 /** Metric-batch entry shape, mirroring the IPC message. */
@@ -403,14 +426,32 @@ export class AuditConsumer {
     if (sigOutcome.kind === "verified") {
       this.stats.producerSignatureAccepted += 1;
     }
+    const identityOutcome = persistedIdentityForEvent(envelope, sigOutcome);
+    if (identityOutcome.kind === "rejected") {
+      this.stats.producerSignatureRejections += 1;
+      await this.sink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        "producer_signature_rejected",
+        envelope.event.fortress_id ?? "unknown",
+        {
+          reason: identityOutcome.reason,
+          event_type: envelope.event.event_type,
+          seq: envelope.event.details.seq,
+        },
+        "failure"
+      );
+      await this.sink.flush();
+      await this.tryAck(envelope, "producer_signature_rejected");
+      throw new AuditChainError(identityOutcome.reason);
+    }
 
     try {
       await this.sink.append(
         CASTLE_WALL_AUDIT_LAYER,
         envelope.event.event_type,
-        envelope.event.fortress_id,
-        buildDetailsForEvent(envelope.event, sigOutcome),
-        "success"
+        identityOutcome.identityId,
+        buildDetailsForEvent(envelope, sigOutcome),
+        resultForSignatureOutcome(sigOutcome),
       );
       if (this.inboxBridge && envelope.event.event_type === "egress_blocked") {
         ingestCastleWallBlockedEgress({
@@ -420,7 +461,7 @@ export class AuditConsumer {
         await this.sink.append(
           CASTLE_WALL_AUDIT_LAYER,
           "castle_wall_blocked_egress",
-          envelope.event.fortress_id,
+          identityOutcome.identityId,
           {
             event_type: envelope.event.event_type,
             seq: envelope.event.details.seq,
@@ -542,13 +583,17 @@ export class AuditConsumer {
     if (details === null || details === undefined) {
       return { kind: "error", reason: "chain_fields_missing" };
     }
-    const hasSeq = Object.prototype.hasOwnProperty.call(event.details, "seq");
+    const hasSeq = Object.prototype.hasOwnProperty.call(
+      event.details,
+      CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+    );
     const hasPriorHash = Object.prototype.hasOwnProperty.call(
       event.details,
-      "prior_sha256_hex"
+      CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
     );
-    const seq = event.details.seq;
-    const priorHash = event.details.prior_sha256_hex;
+    const seq = event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
+    const priorHash =
+      event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY];
     if (
       !hasSeq ||
       typeof seq !== "number" ||
@@ -660,7 +705,8 @@ export class AuditConsumer {
     // the consumer's chain already rejects seq regressions; require the signed
     // seq to match the event's own seq so a signature lifted from one event
     // cannot be stapled onto a different-seq event.
-    const eventSeq = envelope.event.details.seq;
+    const eventSeq =
+      envelope.event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
     if (typeof eventSeq === "number" && eventSeq !== envelope.producer.seq) {
       return { kind: "rejected", reason: "producer_signature_seq_mismatch" };
     }
@@ -671,14 +717,22 @@ export class AuditConsumer {
         ? (parsed.body.details as Record<string, unknown>)
         : {};
     if (
-      Object.prototype.hasOwnProperty.call(signedDetails, "seq") &&
-      signedDetails.seq !== envelope.producer.seq
+      Object.prototype.hasOwnProperty.call(
+        signedDetails,
+        CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+      ) &&
+      signedDetails[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] !==
+        envelope.producer.seq
     ) {
       return { kind: "rejected", reason: "producer_signed_body_seq_mismatch" };
     }
     if (
-      Object.prototype.hasOwnProperty.call(signedDetails, "prior_sha256_hex") &&
-      signedDetails.prior_sha256_hex !== envelope.event.details.prior_sha256_hex
+      Object.prototype.hasOwnProperty.call(
+        signedDetails,
+        CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+      ) &&
+      signedDetails[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY] !==
+        envelope.event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY]
     ) {
       return {
         kind: "rejected",
@@ -831,9 +885,10 @@ function parseSignedBody(
 
 /** Build the `details` payload from an event, omitting redundant top-level fields. */
 function buildDetailsForEvent(
-  event: CastleWallAuditEvent,
+  envelope: CriticalEventEnvelope,
   signature: SignatureOutcome
 ): Record<string, unknown> {
+  const { event } = envelope;
   // For a PRODUCER-SIGNED entry the authoritative evidence is the SIGNED BODY,
   // not the attacker-controllable `CastleWallAuditEvent`. We persist the signed
   // body's own `details` (agent_id, dest_*, decision_provenance, rule_id_matched,
@@ -851,11 +906,23 @@ function buildDetailsForEvent(
         : {};
     const out: Record<string, unknown> = { ...signedDetails };
     // Preserve the chain bookkeeping the upstream WAL-chain check authenticated.
-    if (Object.prototype.hasOwnProperty.call(event.details, "seq")) {
-      out.seq = event.details.seq;
+    if (
+      Object.prototype.hasOwnProperty.call(
+        event.details,
+        CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY,
+      )
+    ) {
+      out[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY] =
+        event.details[CASTLE_WALL_WAL_SEQUENCE_DETAIL_KEY];
     }
-    if (Object.prototype.hasOwnProperty.call(event.details, "prior_sha256_hex")) {
-      out.prior_sha256_hex = event.details.prior_sha256_hex;
+    if (
+      Object.prototype.hasOwnProperty.call(
+        event.details,
+        CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY,
+      )
+    ) {
+      out[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY] =
+        event.details[CASTLE_WALL_WAL_PRIOR_SHA256_HEX_DETAIL_KEY];
     }
     out[CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY] = signature.signatureB64url;
     out[CASTLE_WALL_PRODUCER_KID_DETAIL_KEY] = signature.keyId;
@@ -868,6 +935,13 @@ function buildDetailsForEvent(
       signature.eventCanonicalJson;
     out[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY] =
       signature.capturedAtUnixMs;
+    if (envelope.producerSubjectBinding?.kind === "macos_audit_token") {
+      out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY] =
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN;
+    } else if (envelope.producerSubjectBinding?.kind === "signed_identity_id") {
+      out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY] =
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID;
+    }
     out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
       CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED;
     out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
@@ -887,6 +961,7 @@ function buildDetailsForEvent(
   // read-side consumer might mistake for a verified signature.
   delete out[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
   delete out[CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY];
+  delete out[CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY];
   out[CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY] =
     CASTLE_WALL_EVIDENCE_BASIS_CHANNEL_UNSIGNED;
   // Provenance LAST, so a forged `event.details.cw_source` cannot survive into
@@ -894,6 +969,85 @@ function buildDetailsForEvent(
   // this marker (see CASTLE_WALL_AUDIT_PROVENANCE_KEY).
   out[CASTLE_WALL_AUDIT_PROVENANCE_KEY] = CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
   return out;
+}
+
+function resultForSignatureOutcome(
+  signature: SignatureOutcome,
+): "success" | "failure" {
+  if (signature.kind !== "verified") return "success";
+  const result = signature.signedBody.result;
+  if (result === "failure" || result === "blocked") return "failure";
+  return "success";
+}
+
+function signedDetailsFromBody(
+  signedBody: Record<string, unknown>
+): Record<string, unknown> {
+  return signedBody.details !== null &&
+    typeof signedBody.details === "object" &&
+    !Array.isArray(signedBody.details)
+    ? (signedBody.details as Record<string, unknown>)
+    : {};
+}
+
+function persistedIdentityForEvent(
+  envelope: CriticalEventEnvelope,
+  signature: SignatureOutcome,
+):
+  | { kind: "ok"; identityId: string }
+  | { kind: "rejected"; reason: string } {
+  const subjectBinding = envelope.producerSubjectBinding;
+  if (signature.kind !== "verified") {
+    return { kind: "ok", identityId: envelope.event.fortress_id };
+  }
+  if (subjectBinding === undefined) {
+    return {
+      kind: "rejected",
+      reason: "producer_signed_without_subject_binding",
+    };
+  }
+  if (subjectBinding.kind === "macos_audit_token") {
+    const signedDetails = signedDetailsFromBody(signature.signedBody);
+    const agentId =
+      typeof signedDetails.agent_id === "string"
+        ? signedDetails.agent_id
+        : null;
+    if (agentId === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_missing_agent_id",
+      };
+    }
+    const subject = protectionSubjectFromMacOSAuditToken(
+      subjectBinding.fortressId,
+      agentId,
+    );
+    if (subject === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_agent_subject_unresolvable",
+      };
+    }
+    return { kind: "ok", identityId: subject };
+  }
+  if (subjectBinding.kind === "signed_identity_id") {
+    const identityId =
+      typeof signature.signedBody.identity_id === "string" &&
+      signature.signedBody.identity_id.length > 0
+        ? signature.signedBody.identity_id
+        : null;
+    if (identityId === null) {
+      return {
+        kind: "rejected",
+        reason: "producer_signed_body_missing_identity_id",
+      };
+    }
+    return { kind: "ok", identityId };
+  }
+  return {
+    kind: "rejected",
+    reason: "producer_signed_body_subject_binding_unknown",
+  };
 }
 
 function computeCanonicalHash(event: CastleWallAuditEvent): string {

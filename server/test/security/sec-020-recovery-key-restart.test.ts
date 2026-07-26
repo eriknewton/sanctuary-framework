@@ -27,6 +27,7 @@ import { hashToString } from "../../src/core/hashing.js";
 import { encrypt, decrypt } from "../../src/core/encryption.js";
 import { createSanctuaryServer } from "../../src/index.js";
 import { deriveNamespaceKey } from "../../src/core/key-derivation.js";
+import { createTempHome } from "../helpers/temp-fortress.js";
 
 // These tests inject a MemoryStorage backend, so the boot path does NOT own a
 // filesystem fortress and the durable off-host escrow gate does not apply
@@ -55,6 +56,27 @@ afterEach(() => {
   } else {
     delete process.env.SANCTUARY_RECOVERY_KEY;
   }
+});
+
+
+// Fortress hermeticity: `createSanctuaryServer` boots the real server, and its
+// step 20 writes the config unconditionally. With `HOME` left alone that write
+// lands on the operator's own `~/.sanctuary/sanctuary.json` -- measured, not
+// inferred: this file was one of five bisected as rewriting it on every suite
+// run. Injecting `MemoryStorage` is not enough, because `config.storage_path`
+// still comes from `defaultConfig()`'s `join(homedir(), ".sanctuary")`.
+// Moving `HOME` redirects the mkdir, the permission tightening, and the config
+// write onto a throwaway directory without changing anything under test.
+// `saveConfig` now fails such a write closed under Vitest, so removing this
+// isolation turns the leak into a loud failure rather than a silent one.
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+
+beforeEach(async () => {
+  fortressHome = await createTempHome("sanctuary-sec020");
+});
+
+afterEach(async () => {
+  await fortressHome.cleanup();
 });
 
 describe("SEC-020: Recovery key path must not regenerate master key", () => {

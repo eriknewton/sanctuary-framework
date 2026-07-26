@@ -27,7 +27,7 @@
  * (AES-GCM uses a random IV, so the bytes differ each run) — only do that
  * intentionally on origin/main, never after a behavior change.
  *
- * Usage (from server/):  npx vite-node scripts/gen-at-rest-fixtures.ts
+ * Usage (from server/):  npx tsx scripts/gen-at-rest-fixtures.ts
  *
  * Dependency-free beyond the server's own modules + Node built-ins.
  */

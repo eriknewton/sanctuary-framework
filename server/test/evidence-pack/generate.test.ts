@@ -28,6 +28,10 @@ import {
   type BuildEvidencePackDeps,
 } from "../../src/evidence-pack/generate.js";
 import { canonicalJSON } from "../../src/evidence-pack/signer.js";
+import {
+  deriveAuditReadOutcome,
+  readRetentionUsage,
+} from "../../src/evidence-pack/cli.js";
 import { emptyInventorySnapshot } from "../../src/evidence-pack/inventory.js";
 import {
   populated,
@@ -162,6 +166,355 @@ describe("buildEvidencePack", () => {
     expect(agg(pack).by_category.allowed).toBe(1);
     expect(agg(pack).by_category.denied).toBe(1);
     expect(agg(pack).by_category.human_approved).toBe(1);
+  });
+
+  // ─── Codex-F1 / D7-1 (dry-bar round 7): the SIGNED manifest must never
+  // serialize a definitive `retention_at_cap` boolean for a state where at-cap
+  // was NOT determinable (a merged census with no usable per-store breakdown).
+  // It emits the explicit `retention_at_cap_determinable: false` marker and
+  // omits the boolean, mirroring the top-level `determinable: false` convention. ─
+  describe("F1: manifest retention_at_cap determinability", () => {
+    // The round-7 state: daemon `included`, merged retained_total (110) over
+    // one store's cap (100), never-pruned, earliest after the quarter start.
+    function mergedOverCap(
+      perStore: RetentionFacts["per_store_retention"]
+    ): RetentionFacts {
+      return {
+        max_entries: 100,
+        retained_total: 110,
+        max_total_size_bytes: 100 * 1024 * 1024,
+        retained_total_size_bytes: 0,
+        ever_pruned: false,
+        earliest_retained_at: "2026-08-01T00:00:00.000Z",
+        daemon_store: { status: "included", included_entry_count: 50 },
+        per_store_retention: perStore,
+      };
+    }
+
+    const variants: Array<[string, RetentionFacts["per_store_retention"]]> = [
+      ["absent (undefined)", undefined],
+      ["empty ([])", []],
+      ["null (untyped caller)", null as unknown as undefined],
+      [
+        "operator-only while the daemon store is `included`",
+        [
+          {
+            store: "operator",
+            max_entries: 100,
+            retained_total: 60,
+            max_total_size_bytes: 1_000_000,
+            retained_total_size_bytes: 0,
+          },
+        ],
+      ],
+      // Fix-round F1: mirror of the operator-only case -- a daemon-only
+      // breakdown omits the operator row that EVERY census includes, so the
+      // SIGNED manifest must carry the not-determinable marker, never a
+      // definitive retention_at_cap:false computed over the daemon row alone.
+      [
+        "daemon-only (operator row missing)",
+        [
+          {
+            store: "daemon",
+            max_entries: 100,
+            retained_total: 50,
+            max_total_size_bytes: 1_000_000,
+            retained_total_size_bytes: 0,
+          },
+        ],
+      ],
+      // ─── F2-R2 (Codex second-family review + Dry-8 sweep): row PRESENCE
+      // without row FIELD COMPLETENESS. Presence-only rows sailed through the
+      // chokepoint, atCapForStore evaluated the missing/NaN/wrong-typed fields
+      // as "not at cap", and the SIGNED manifest carried a definitive
+      // flattering retention_at_cap:false; duplicate/unknown-store rows fed
+      // the at-cap OR and could sign the definitive OVER-claim (true). Every
+      // variant must serialize the not-determinable marker instead. ───
+      [
+        "tags-only rows with NO cap fields (presence-only exploit)",
+        [
+          { store: "operator" },
+          { store: "daemon" },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      [
+        "operator row with NaN max_entries",
+        [
+          { store: "operator", max_entries: NaN, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        "operator row with string-typed max_entries (wrong type)",
+        [
+          { store: "operator", max_entries: "100", retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      [
+        "operator row with undefined retained_total_size_bytes (contract is null-or-finite)",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: undefined },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      [
+        "daemon row missing max_total_size_bytes",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, retained_total_size_bytes: 0 },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      [
+        // Dry-8 HIGH repro: the duplicate is AT its cap -- the old code signed
+        // a definitive retention_at_cap:true from the invalid extra row.
+        "duplicate operator rows (second duplicate at cap)",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "operator", max_entries: 100, retained_total: 100, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        "duplicate daemon rows",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        // Dry-8 HIGH repro: an unknown store tag AT its own (tiny) cap flipped
+        // the at-cap OR -- a signed falsehood in the OVER-claiming direction.
+        "unknown-store row (store:'archive' at its own cap) alongside complete rows",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "archive", max_entries: 1, retained_total: 1, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ] as unknown as RetentionFacts["per_store_retention"],
+      ],
+      // ─── D8-1 (Dry-8 sweep): FINITE is not USABLE. Pre-D8-1, the three
+      // variants below all VALIDATED and the SIGNED manifest carried a
+      // definitive flattering retention_at_cap:false -- over a cap declared
+      // unknown in-band (0 = "cap not known to this reporter", Leg B) or a
+      // size dimension nobody read (null = "unread", Leg C). ───
+      [
+        "D8-1 Leg B: row with size cap declared unknown (max_total_size_bytes: 0)",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 0, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        "D8-1 Leg B: row with entry cap declared unknown (max_entries: 0)",
+        [
+          { store: "operator", max_entries: 0, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
+      ],
+      [
+        "D8-1 Leg C: row with an UNREAD size (retained_total_size_bytes: null)",
+        [
+          { store: "operator", max_entries: 100, retained_total: 60, max_total_size_bytes: 1_000_000, retained_total_size_bytes: null },
+          { store: "daemon", max_entries: 100, retained_total: 50, max_total_size_bytes: 1_000_000, retained_total_size_bytes: 0 },
+        ],
+      ],
+    ];
+
+    for (const [name, perStore] of variants) {
+      it(`serializes the not-determinable marker (never a definitive boolean) for ${name}`, () => {
+        const pack = buildEvidencePack(
+          baseInput(),
+          deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], mergedOverCap(perStore))
+        );
+        const c = coverage(pack);
+        // The definitive boolean is OMITTED...
+        expect("retention_at_cap" in c).toBe(false);
+        // ...and the explicit marker is present.
+        expect(c.retention_at_cap_determinable).toBe(false);
+        // The serialized SIGNED manifest agrees byte-for-byte with the typed view
+        // (the marker key name contains the boolean's, so match the exact key).
+        const json = canonicalJSON(pack.manifest);
+        expect(json).toContain('"retention_at_cap_determinable":false');
+        expect(json).not.toContain('"retention_at_cap":');
+        // The report PROSE for the same render hedges: no flattering reassurance.
+        const report = pack.files[0]!.content;
+        expect(report).not.toMatch(/below both/i);
+        expect(report).not.toMatch(/no recorded activity before/i);
+        expect(report).toMatch(/cannot be ruled out/i);
+      });
+    }
+
+    it("non-vacuity: a determinable render serializes the definitive boolean, NO marker, and the pre-change key shape", () => {
+      const pack = buildEvidencePack(
+        baseInput(),
+        deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+      );
+      const c = coverage(pack);
+      expect(c.retention_at_cap).toBe(false);
+      expect("retention_at_cap_determinable" in c).toBe(false);
+      // The determinable manifest coverage shape is UNCHANGED by the round-7 fix.
+      expect(Object.keys(c)).toEqual([
+        "determinable",
+        "covered_from",
+        "covered_to_exclusive",
+        "shortfall",
+        "in_progress_quarter",
+        "retention_at_cap",
+        "daemon_store",
+      ]);
+    });
+
+    it("shipped-CLI-path: retention derived by deriveAuditReadOutcome (daemon included) stays determinable with an unchanged manifest shape", () => {
+      // runEvidencePack derives its RetentionFacts exclusively through
+      // deriveAuditReadOutcome, which ALWAYS seeds a complete per-store
+      // breakdown (operator row + daemon row when merged), so a real CLI pack
+      // must never hit the not-determinable branch. Exercises the same
+      // derivation + generation components runEvidencePack composes.
+      // Full untruncated reads (entryCount == entries read == windowed total)
+      // so the derivation's fail-closed truncation guards do not fire: operator
+      // 60 + daemon 50 retained -> merged 110 over one store's 100 cap while
+      // NEITHER store is at its own cap.
+      const operatorEntries = Array.from({ length: 60 }, (_, i) =>
+        entry(`2026-08-02T00:00:${String(i).padStart(2, "0")}.000Z`, "gate_allow:op")
+      );
+      const daemonEntries = Array.from({ length: 50 }, (_, i) =>
+        entry(`2026-08-03T00:00:${String(i).padStart(2, "0")}.000Z`, "gate_deny:daemon")
+      );
+      // D8-1 Leg B: the shipped happy path carries REAL caps (the default
+      // AuditLog config is 100k entries / 100 MB and is never 0); a 0 size cap
+      // is the in-band "cap not known" encoding and now (correctly) renders
+      // not-determinable, so this shipped-path fixture models the real config.
+      const outcome = deriveAuditReadOutcome({
+        entries: operatorEntries,
+        windowedTotal: 60,
+        retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 100 * 1024 * 1024 },
+        usage: { entryCount: 60, totalSizeBytes: 1024, everPruned: false },
+        daemon: {
+          status: "included",
+          entries: daemonEntries,
+          windowedTotal: 50,
+          usage: { entryCount: 50, totalSizeBytes: 1024, everPruned: false },
+          retentionConfig: { maxEntries: 100, maxTotalSizeBytes: 100 * 1024 * 1024 },
+        },
+      });
+      if (outcome.status !== "populated") throw new Error("expected populated");
+      // The merged total (110) exceeds one store's cap (100) -- the exact
+      // figures that are NOT determinable when hand-built without a breakdown --
+      // but the shipped derivation carries the complete breakdown, so the
+      // manifest serializes the definitive (false) boolean and no marker.
+      expect(outcome.value.retention.retained_total).toBe(110);
+      const pack = buildEvidencePack(baseInput(), {
+        audit: outcome,
+        signer,
+        masterKey,
+      });
+      const c = coverage(pack);
+      expect(c.retention_at_cap).toBe(false);
+      expect("retention_at_cap_determinable" in c).toBe(false);
+      expect(Object.keys(c)).toEqual([
+        "determinable",
+        "covered_from",
+        "covered_to_exclusive",
+        "shortfall",
+        "in_progress_quarter",
+        "retention_at_cap",
+        "daemon_store",
+      ]);
+    });
+
+    it("D8-1 Leg A: a shipped-CLI usage-throw (query() succeeded, getRetentionUsage() threw) makes the SIGNED manifest carry the not-determinable marker, converging with the hedged prose", async () => {
+      // The exact Dry-8 D8-1 repro shape, driven through the REAL components
+      // the shipped CLI composes: the real usage catch (readRetentionUsage
+      // with an injected throw), the real deriveAuditReadOutcome, the real
+      // buildEvidencePack. Pre-D8-1 the catch substituted { entryCount: null,
+      // totalSizeBytes: 0, everPruned: null }; the filler 0 became a per-store
+      // retained_total_size_bytes: 0 that passed the chokepoint's finiteness
+      // checks, and the SIGNED manifest serialized a definitive
+      // retention_at_cap: false while the SAME pack's prose hedged
+      // ("size-based pruning cannot be ruled out") -- two contradicting
+      // surfaces in one signed artifact.
+      const usage = await readRetentionUsage({
+        getRetentionUsage: async (): Promise<{
+          entryCount: number;
+          totalSizeBytes: number;
+          everPruned: boolean | null;
+        }> => {
+          throw new Error("transient storage fault between the two storage.list() calls");
+        },
+      });
+      const outcome = deriveAuditReadOutcome({
+        entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+        windowedTotal: 1,
+        retentionConfig: { maxEntries: 100_000, maxTotalSizeBytes: 100 * 1024 * 1024 },
+        usage,
+      });
+      expect(outcome.status).toBe("populated");
+      const pack = buildEvidencePack(baseInput(), {
+        audit: outcome,
+        signer,
+        masterKey,
+      });
+      const c = coverage(pack);
+      // The definitive boolean is never signed for an unread retention position...
+      expect("retention_at_cap" in c).toBe(false);
+      // ...the explicit marker is, and the serialized manifest agrees.
+      expect(c.retention_at_cap_determinable).toBe(false);
+      const json = canonicalJSON(pack.manifest);
+      expect(json).toContain('"retention_at_cap_determinable":false');
+      expect(json).not.toContain('"retention_at_cap":');
+      // The prose hedges -- and now AGREES with the manifest instead of
+      // contradicting it.
+      const report = pack.files[0]!.content;
+      expect(report).not.toMatch(/below both/i);
+      expect(report).not.toMatch(/no recorded activity before/i);
+      expect(report).toMatch(/cannot be ruled out/i);
+    });
+
+    it("D8-1 Leg B: the legacy single-store fallback with a cap declared unknown (max_total_size_bytes: 0) serializes the marker, never the definitive boolean", () => {
+      const pack = buildEvidencePack(
+        baseInput(),
+        deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+          max_entries: 100_000,
+          retained_total: 42,
+          max_total_size_bytes: 0, // documented in-band "cap not known"
+          retained_total_size_bytes: 100,
+          ever_pruned: false,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        })
+      );
+      const c = coverage(pack);
+      expect("retention_at_cap" in c).toBe(false);
+      expect(c.retention_at_cap_determinable).toBe(false);
+      const report = pack.files[0]!.content;
+      expect(report).not.toMatch(/below both/i);
+      expect(report).toMatch(/cannot be ruled out/i);
+    });
+
+    it("D8-1 Leg C: a null (unread) top-level retained_total_size_bytes on the legacy single-store path serializes the marker (DELIBERATE REVERSAL of the null-is-usable allowance)", () => {
+      const pack = buildEvidencePack(
+        baseInput(),
+        deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+          max_entries: 100_000,
+          retained_total: 42,
+          max_total_size_bytes: 100 * 1024 * 1024,
+          retained_total_size_bytes: null, // unread -- never read this run
+          ever_pruned: false,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          daemon_store: { status: "absent", included_entry_count: 0 },
+        })
+      );
+      const c = coverage(pack);
+      expect("retention_at_cap" in c).toBe(false);
+      expect(c.retention_at_cap_determinable).toBe(false);
+      const report = pack.files[0]!.content;
+      // Never "below both its entry and size retention caps" over a size
+      // dimension nobody read.
+      expect(report).not.toMatch(/below both/i);
+      expect(report).not.toMatch(/no recorded activity before/i);
+      expect(report).toMatch(/cannot be ruled out/i);
+    });
   });
 
   it("discloses a covered-window shortfall in the manifest and the report", () => {
@@ -387,9 +740,13 @@ describe("buildEvidencePack", () => {
     });
     const pack = buildEvidencePack(baseInput(), { audit, signer, masterKey });
     const report = pack.files[0]!.content;
-    // Of 5 merged into the census, only 2 fall in Q3 and contribute to the counts.
+    // Of 5 merged into the census, only 2 fall inside the attested window and
+    // contribute to the counts. D10-1: that window is the ATTESTED coverage span
+    // (the boundary the counts are actually taken over), not the calendar
+    // quarter, so the wording names it as such. The FIGURE is the honesty
+    // assertion here and it is unchanged.
     expect(report).toContain("Of 5 daemon-recorded enforcement entries merged");
-    expect(report).toContain("2 fall within the reporting quarter");
+    expect(report).toContain("2 fall within this report's attested coverage window");
     expect(report).toContain("contribute to the counts above");
   });
 
@@ -523,6 +880,35 @@ describe("buildEvidencePack", () => {
     expect(coverage(pack).covered_to_exclusive).toBe("2026-08-15T12:00:00.000Z");
     expect(coverage(pack).covered_to_exclusive).not.toBe("2026-10-01T00:00:00.000Z");
     expect(pack.files[0]!.content).toContain("PARTIAL QUARTER");
+  });
+
+  it("D9C-1: the SIGNED coverage window stops at the audit census, not the later generation instant", () => {
+    // TOCTOU repro at the pack level: the audit census was taken at 11:00, but
+    // the pack stamps its generation time at 12:00 (after inventory/discrete
+    // gathering). Operations appended in the 11:00-12:00 gap are NOT in the
+    // census. The signed covered_to_exclusive must be the census cut (11:00),
+    // never the generation instant (12:00) it would otherwise over-claim.
+    const census = "2026-08-15T11:00:00.000Z";
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+      retention: { ...FULL_COVERAGE },
+      census_taken_at: census,
+    });
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-15T12:00:00.000Z",
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      { audit, signer, masterKey }
+    );
+    expect(coverage(pack).covered_to_exclusive).toBe(census);
+    expect(coverage(pack).covered_to_exclusive).not.toBe("2026-08-15T12:00:00.000Z");
+    expect(coverage(pack).in_progress_quarter).toBe(true);
   });
 
   it("a POPULATED inventory still prints the coverage-basis + never-complete language", () => {
@@ -1007,5 +1393,451 @@ describe("buildEvidencePack", () => {
     // Data-export is labeled a product property, not a per-install table value.
     expect(report).toContain("a product property, not a per-install read");
     expect(report).not.toContain("| Data export | requires human (Tier 1) approval |");
+  });
+});
+
+describe("R2-2: PDF footer digest label", () => {
+  it("labels the evidence-pack footer digest 'Report SHA-256' (its digest is the report file, not the manifest)", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const pdfText = Buffer.from(pack.pdf).toString("latin1");
+    // The footer digest passed by generate.ts is `reportFile.sha256`, so the
+    // label must say so -- the shared PDF builder's default "Manifest SHA-256"
+    // (correct only for the EU AI Act bundle) would be a false label here.
+    expect(pdfText).toContain("Report SHA-256:");
+    expect(pdfText).not.toContain("Manifest SHA-256:");
+    // Sanity: the digest shown IS the report file's SHA-256 prefix.
+    expect(pdfText).toContain("Report SHA-256: " + pack.files[0]!.sha256.slice(0, 16));
+  });
+});
+
+describe("dry-bar gate-round: cover enforcement-census caveat (shortfall=false)", () => {
+  it("the COVER caveats an excluded daemon store even when operator coverage is FULL (no shortfall)", () => {
+    // FULL_COVERAGE => shortfall=false, so none of the coverage banners fire.
+    // A present-but-unreadable daemon store must still be disclosed on the cover
+    // so a full-coverage quarter is not read as a complete enforcement record.
+    const retention: RetentionFacts = {
+      ...FULL_COVERAGE,
+      daemon_store: {
+        status: "present_unreadable",
+        included_entry_count: 0,
+        unreadable_reason: "privilege",
+      },
+    };
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], retention)
+    );
+    expect(pack.shortfall.status).toBe("populated");
+    if (pack.shortfall.status === "populated") {
+      expect(pack.shortfall.value.shortfall).toBe(false);
+    }
+    const cover = pack.files[0]!.content;
+    expect(cover).toContain("ENFORCEMENT-CENSUS NOTICE");
+  });
+
+  it("the COVER caveat describes a MISSING (deleted) daemon store as destruction, never 'present'", () => {
+    const retention: RetentionFacts = {
+      ...FULL_COVERAGE,
+      daemon_store: { status: "missing", included_entry_count: 0 },
+    };
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], retention)
+    );
+    const cover = pack.files[0]!.content.split("---")[0]!; // cover section only
+    expect(cover).toContain("ENFORCEMENT-CENSUS NOTICE");
+    expect(cover).toMatch(/ABSENT/);
+    expect(cover).toMatch(/deleted or renamed|unverifiable/i);
+    // Never describes the daemon store itself as "present" on the cover for a
+    // missing store, and never over-definitely asserts it "ran and provisioned".
+    expect(cover).not.toMatch(/\(_audit-daemon\) is\s+present/i);
+    expect(cover).not.toMatch(/ran the audit-store writer split and provisioned/i);
+  });
+
+  it("a daemon store that is ABSENT/included adds no cover caveat", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], FULL_COVERAGE)
+    );
+    expect(pack.files[0]!.content.split("---")[0]).not.toContain(
+      "ENFORCEMENT-CENSUS NOTICE"
+    );
+  });
+});
+
+describe("gate round 2: §7 covered-window is operator-scoped when the daemon store is excluded", () => {
+  it("scopes the access-log covered-window sentence to the OPERATOR store on an excluded daemon", () => {
+    const retention: RetentionFacts = {
+      ...FULL_COVERAGE,
+      daemon_store: {
+        status: "present_unreadable",
+        included_entry_count: 0,
+        unreadable_reason: "privilege",
+      },
+    };
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], retention)
+    );
+    const full = pack.files[0]!.content;
+    const accessLog = full.slice(full.indexOf("# Access-log and enforcement summary"));
+    // The covered-window sentence itself is scoped, not just the counts note.
+    expect(accessLog).toMatch(/retained OPERATOR audit log spans/);
+    expect(accessLog).toMatch(/operator-store view, not a complete enforcement census/);
+  });
+
+  it("leaves the neutral covered-window wording when the daemon store is absent/included", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], FULL_COVERAGE)
+    );
+    const full = pack.files[0]!.content;
+    const accessLog = full.slice(full.indexOf("# Access-log and enforcement summary"));
+    expect(accessLog).toMatch(/retained audit log spans/);
+    expect(accessLog).not.toMatch(/retained OPERATOR audit log spans/);
+  });
+});
+
+describe("D5-3: a caller that OMITS discrete_exports never mints definitive §10 negatives", () => {
+  it("renders honest 'not gathered' read-failed §10 arms, NOT verified-empty definitives", () => {
+    // baseInput() supplies no `discrete_exports`; the generator default must NOT
+    // mint empty_verified witnesses (a definitive 'read to completion, zero
+    // records' for reads that never happened) -- the R3-5/C4 witness-minting class.
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const report = pack.files[0]!.content;
+    // The three definitive negatives minted from a NON-read are gone...
+    expect(report).not.toContain("emitted no signed transparency checkpoints yet");
+    expect(report).not.toContain("the audit-chain export was empty for this fortress");
+    expect(report).not.toContain("no public-anchor (Sigstore/Rekor) evidence is available");
+    // ...replaced by the honest not-gathered disclosure for each export.
+    expect(report).toContain("discrete exports were not gathered by this pack run");
+    // And no discrete-export FILE is signed in from a non-read.
+    const names = pack.files.map((f) => f.filename);
+    expect(names).not.toContain("transparency-bundle.json");
+    expect(names).not.toContain("audit-chain.jsonl");
+    expect(names).not.toContain("anchor-evidence.json");
+  });
+
+  it("an EXPLICIT empty_verified discrete read STILL renders the definitive-empty §10 (a real 'none')", () => {
+    // The fix scopes to the NON-read default only; a genuine verified-empty read
+    // (a real completed read that found nothing) keeps its definitive wording.
+    const input: EvidencePackInput = {
+      ...baseInput(),
+      discrete_exports: {
+        transparency: emptyVerified(),
+        audit_chain: emptyVerified(),
+        anchor: emptyVerified(),
+      },
+    };
+    const pack = buildEvidencePack(
+      input,
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const report = pack.files[0]!.content;
+    expect(report).toContain("emitted no signed transparency checkpoints yet");
+    expect(report).toContain("the audit-chain export was empty for this fortress");
+    expect(report).toContain("no public-anchor (Sigstore/Rekor) evidence is available");
+  });
+
+  // ─── Dry-9 fix-round: manifest/prose coverage honesty ───
+
+  // P1 [HIGH]: a zero-covered quarter previously signed a DEFINITIVE non-empty
+  // span into the manifest (covered_from = quarter start, covered_to = census
+  // cut, determinable:true) while the prose said "NONE of this quarter is
+  // covered". The SIGNED manifest and the prose must agree: an empty span + an
+  // explicit zero_of_quarter_covered marker, never a definitive non-empty span.
+  it("P1: the SIGNED manifest of a zero-covered quarter carries an EMPTY span + zero marker, matching the prose", () => {
+    const census = "2026-08-01T00:00:00.000Z";
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-09-15T00:00:00.000Z", "gate_allow:x")],
+      retention: { ...FULL_COVERAGE, earliest_retained_at: "2026-09-15T00:00:00.000Z" },
+      census_taken_at: census,
+    });
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-01T00:00:00.000Z",
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      { audit, signer, masterKey }
+    );
+    const c = coverage(pack);
+    // SIGNED manifest: empty span, explicit zero marker, shortfall true.
+    expect(c.covered_from).toBe(c.covered_to_exclusive);
+    expect((c as { zero_of_quarter_covered?: boolean }).zero_of_quarter_covered).toBe(true);
+    expect(c.shortfall).toBe(true);
+    // The manifest is what gets signed: verify the signature still holds.
+    const signerPub = fromBase64url(pack.manifest.signer.public_key_base64url);
+    const { manifest_signature, ...bodyM } = pack.manifest;
+    const manifestDigest = hash(stringToBytes(canonicalJSON(bodyM)));
+    expect(verify(manifestDigest, fromBase64url(manifest_signature), signerPub)).toBe(true);
+    // Prose: the cover span must NOT read as a definitive non-empty coverage
+    // window while the banner says NONE covered.
+    const report = pack.files[0]!.content;
+    expect(report).toContain("NONE of this quarter is covered");
+    expect(report).not.toContain(`2026-07-01T00:00:00.000Z to ${census} (exclusive)`);
+  });
+
+  // P2: the pure/signed path signs `included_entry_count` (daemon store) into
+  // the report prose without the non-negative safe-integer guard, so a negative
+  // count signed "-7 daemon-recorded enforcement entries ... are included."
+  it("P2: a negative daemon included_entry_count never signs an impossible count into the report", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        daemon_store: { status: "included", included_entry_count: -7 },
+      })
+    );
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain("-7 daemon-recorded");
+    expect(report).not.toMatch(/-7[^)]*enforcement entries/);
+    // Renders honest not-determinable language instead.
+    expect(report).toMatch(/not determinable|could not be determined|not[- ]gathered/i);
+  });
+
+  // D8-2 [MED]: an unparseable earliest_retained_at must never serialize a
+  // definitive shortfall:false / full-coverage span into the SIGNED manifest.
+  it("D8-2: an unparseable earliest_retained_at never signs shortfall:false into the manifest", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "garbage-not-a-date",
+        ever_pruned: true,
+      })
+    );
+    const c = coverage(pack);
+    expect(c.shortfall).toBe(true);
+    expect(c.covered_from).toBe(c.covered_to_exclusive);
+  });
+
+  // D8-4 [LOW]: an unrecognized daemon_store.status must be disclosed as
+  // not-gathered / not-determinable, never silently a complete definitive census
+  // with the never-pruned/below-caps reassurance.
+  it("D8-4: an unrecognized daemon_store.status is disclosed, never a silent complete census", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps(
+        [entry("2026-08-15T00:00:00.000Z", "gate_allow:x")],
+        {
+          max_entries: 100_000,
+          retained_total: 42,
+          max_total_size_bytes: 100 * 1024 * 1024,
+          retained_total_size_bytes: 10,
+          ever_pruned: false,
+          earliest_retained_at: "2026-08-01T00:00:00.000Z",
+          // Untyped/JSON caller smuggles an unrecognized status past the union.
+          daemon_store: {
+            status: "quarantined" as unknown as "included",
+            included_entry_count: 0,
+          },
+        }
+      )
+    );
+    const report = pack.files[0]!.content;
+    // Must NOT present the operator counts as a complete enforcement census.
+    expect(report).toMatch(/not a complete enforcement census|unrecognized|not[- ]determinable/i);
+    // Must NOT assert the flattering unqualified whole-fortress reassurance.
+    expect(report).not.toContain("the fortress had no recorded activity");
+  });
+
+  // P3: when the census cut clamps the window, the CLI/scope copy must name the
+  // census cut, not falsely claim the bound is "the generation time".
+  it("P3: the scope-and-limits covered-window copy names the audit-census cut, not only generation time", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const report = pack.files[0]!.content;
+    // The static covered-window scope bullet must acknowledge the census-cut
+    // bound so it is not stale when D9C-1 clamps to the census cut.
+    const scope = report.split("\n---\n").find((p) => p.includes("Covered window (both ends)"));
+    expect(scope).toBeTruthy();
+    expect(scope!).toMatch(/census/i);
+  });
+});
+
+// ─── Dry-9 fix-round-2: the SIGNED MANIFEST serialization chokepoint. The prior
+// round closed each defect in the PROSE, but the manifest-serialization paths
+// did not all route through the same honesty-guarded values, so the SIGNED
+// manifest (the machine-verified artifact) still asserted definitive/raw values
+// for the corrupt/unknown variants. These tests assert on the SIGNED MANIFEST
+// bytes: a dishonest manifest must be structurally unrepresentable. ───
+describe("Dry-9 fix-round-2: signed-manifest serialization chokepoint", () => {
+  /** The signed manifest body bytes, as a third-party verifier would canonicalize them. */
+  function signedManifestBytes(pack: EvidencePack): string {
+    const { manifest_signature: _sig, ...body } = pack.manifest;
+    return canonicalJSON(body);
+  }
+
+  function verifyManifest(pack: EvidencePack): boolean {
+    const signerPub = fromBase64url(pack.manifest.signer.public_key_base64url);
+    const { manifest_signature, ...body } = pack.manifest;
+    const digest = hash(stringToBytes(canonicalJSON(body)));
+    return verify(digest, fromBase64url(manifest_signature), signerPub);
+  }
+
+  // P1 [HIGH]: a present-but-UNPARSEABLE census cut previously fell back to the
+  // generation instant, so the SIGNED manifest widened coverage to
+  // generated_at (determinable:true, covered_from:quarter-start,
+  // covered_to:generated_at). A corrupt census cut cannot prove coverage
+  // through generation time; the manifest must fail closed to NOT-DETERMINABLE.
+  it("P1: an unparseable census_taken_at fails the SIGNED manifest closed to determinable:false, never widened to generated_at", () => {
+    const audit: ReadOutcome<AuditReadData> = populated({
+      entries: [entry("2026-08-01T00:00:00.000Z", "gate_allow:x")],
+      retention: { ...FULL_COVERAGE },
+      census_taken_at: "not-a-census-timestamp",
+    });
+    const pack = buildEvidencePack(
+      {
+        firm_name: "Acme Law LLP",
+        quarter: { year: 2026, quarter: 3 },
+        generated_at_override: "2026-08-15T00:00:00.000Z",
+        custody: populated({
+          custody_mode: "passphrase",
+          outbound_denied_by_default: populated(true),
+        }),
+      },
+      { audit, signer, masterKey }
+    );
+    // SIGNED manifest: coverage is NOT determinable, never a widened span.
+    expect(pack.manifest.coverage.determinable).toBe(false);
+    const bytes = signedManifestBytes(pack);
+    // The generation instant must NOT appear as a signed covered_to_exclusive.
+    expect(bytes).not.toContain('"covered_to_exclusive":"2026-08-15T00:00:00.000Z"');
+    expect(bytes).not.toContain('"covered_from":"2026-07-01T00:00:00.000Z"');
+    // The signature still holds over the honest body.
+    expect(verifyManifest(pack)).toBe(true);
+    // Prose is consistent: the cover span is not a definitive window.
+    const report = pack.files[0]!.content;
+    expect(report).not.toContain(
+      "2026-07-01T00:00:00.000Z to 2026-08-15T00:00:00.000Z (exclusive)"
+    );
+    expect(report).toMatch(/could not be parsed|not[- ]?determinable/i);
+  });
+
+  // P2 [HIGH]: an unrecognized daemon_store.status (an untyped/JSON caller)
+  // previously serialized the RAW value into the enum-shaped SIGNED manifest
+  // field. It must normalize to a recognized enum sentinel ("unrecognized"),
+  // never the raw string.
+  it("P2: an unrecognized daemon_store.status never signs the raw value; it normalizes to the 'unrecognized' sentinel", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-15T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "quarantined" as unknown as "included",
+          included_entry_count: 0,
+        },
+      })
+    );
+    const c = coverage(pack);
+    // The SIGNED enum-shaped field is a recognized value, never the raw string.
+    expect(c.daemon_store.status).toBe("unrecognized");
+    const bytes = signedManifestBytes(pack);
+    expect(bytes).not.toContain("quarantined");
+    expect(bytes).toContain('"status":"unrecognized"');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // P3 [MED]: an unparseable earliest_retained_at produces an EMPTY span but
+  // previously OMITTED the zero_of_quarter_covered marker the manifest contract
+  // promises for an empty span. The marker must be present whenever the signed
+  // span is empty.
+  it("P3: an unparseable earliest_retained_at signs the zero_of_quarter_covered marker on its EMPTY span", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "garbage-not-a-date",
+        ever_pruned: true,
+      })
+    );
+    const c = coverage(pack);
+    // Empty span AND the explicit zero marker travel together in the SIGNED bytes.
+    expect(c.covered_from).toBe(c.covered_to_exclusive);
+    expect((c as { zero_of_quarter_covered?: boolean }).zero_of_quarter_covered).toBe(true);
+    expect(signedManifestBytes(pack)).toContain('"zero_of_quarter_covered":true');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // P4 [HIGH, Dry-9 fix-round-3]: a SIBLING enum-shaped daemon field. The
+  // chokepoint normalized `daemon_store.status` but copied
+  // `daemon_store.unreadable_reason` RAW, so an untyped / JSON caller's smuggled
+  // value signed straight into the enum-shaped SIGNED field (which only allows
+  // "privilege" | "io"). The complete daemon-disclosure normalization must
+  // validate EVERY enum-shaped field, so no raw reason ever reaches the manifest.
+  it("P4: an unrecognized daemon_store.unreadable_reason never signs the raw value into the enum-shaped SIGNED field", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-15T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          // Untyped/JSON caller smuggles a reason the manifest enum forbids.
+          unreadable_reason: "bogus-reason" as unknown as "io",
+        },
+      })
+    );
+    const c = coverage(pack);
+    // Status is preserved (a recognized value); the RAW reason is NOT carried.
+    expect(c.daemon_store.status).toBe("present_unreadable");
+    expect(c.daemon_store.unreadable_reason).toBeUndefined();
+    const bytes = signedManifestBytes(pack);
+    // The confirmed dishonest bytes must be structurally absent from the signature.
+    expect(bytes).not.toContain("bogus-reason");
+    expect(bytes).not.toContain('"unreadable_reason":"bogus-reason"');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // A RECOGNIZED unreadable_reason still flows through unchanged (no regression
+  // to the honest present_unreadable/io case the manifest already carried).
+  it("P4 (honest case): a recognized unreadable_reason ('io') is preserved in the SIGNED manifest", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-15T00:00:00.000Z", "gate_allow:x")], {
+        ...FULL_COVERAGE,
+        earliest_retained_at: "2026-06-01T00:00:00.000Z",
+        daemon_store: {
+          status: "present_unreadable",
+          included_entry_count: 0,
+          unreadable_reason: "io",
+        },
+      })
+    );
+    const c = coverage(pack);
+    expect(c.daemon_store.status).toBe("present_unreadable");
+    expect(c.daemon_store.unreadable_reason).toBe("io");
+    expect(signedManifestBytes(pack)).toContain('"unreadable_reason":"io"');
+    expect(verifyManifest(pack)).toBe(true);
+  });
+
+  // Regression guard: a normal, fully-covered quarter's manifest shape is
+  // unchanged by the chokepoint (no zero marker, no unrecognized status, a real
+  // determinable span).
+  it("regression: an honest fully-covered quarter keeps its unchanged determinable manifest shape", () => {
+    const pack = buildEvidencePack(
+      baseInput(),
+      deps([entry("2026-08-01T00:00:00.000Z", "gate_allow:x")])
+    );
+    const c = coverage(pack);
+    expect(c.daemon_store.status).toBe("absent");
+    expect("zero_of_quarter_covered" in c).toBe(false);
+    expect(c.covered_from).not.toBe(c.covered_to_exclusive);
+    expect(verifyManifest(pack)).toBe(true);
   });
 });

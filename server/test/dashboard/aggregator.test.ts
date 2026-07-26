@@ -23,7 +23,10 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
 } from "../../src/castle-wall/constants.js";
+import { protectionSubjectForUid } from "../../src/castle-wall/subject-binding.js";
 import type { IdentityManager } from "../../src/cognitive/tools.js";
 import type { PublicIdentity, StoredIdentity } from "../../src/core/identity.js";
 
@@ -91,14 +94,49 @@ function stubAuditLog(
 // A fresh Castle Wall enforcement-evidence audit entry (carries the provenance
 // marker the posture reader requires); arms the wall so the overall light can
 // legitimately go green.
-function cwArmEntry(ageMs = 60_000): AuditEntry {
+const FORTRESS = "fortress:test";
+
+function subjectForUid(uid: number): string {
+  const subject = protectionSubjectForUid(FORTRESS, uid);
+  if (subject === null) throw new Error("test subject could not be derived");
+  return subject;
+}
+
+function auditTokenForRuid(uid: number): string {
+  const vals = [
+    0xffffffff,
+    uid,
+    uid,
+    uid,
+    uid,
+    0x00000269,
+    0x000186ae,
+    0x00000566,
+  ];
+  return vals
+    .map((value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value >>> 0, true);
+      return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+    })
+    .join("");
+}
+
+const CLAIM_UID = 601;
+const CLAIM_TOKEN = auditTokenForRuid(CLAIM_UID);
+const CLAIM_SUBJECT = subjectForUid(CLAIM_UID);
+
+function cwArmEntry(ageMs = 60_000, identityId = CLAIM_SUBJECT): AuditEntry {
   return {
     timestamp: new Date(Date.now() - ageMs).toISOString(),
     layer: "l1",
     operation: "egress_allowed",
-    identity_id: "id-1",
+    identity_id: identityId,
     result: "success",
-    details: { cw_source: "castle_wall_audit_consumer" },
+    details: {
+      agent_id: CLAIM_TOKEN,
+      cw_source: "castle_wall_audit_consumer",
+    },
   } as unknown as AuditEntry;
 }
 
@@ -150,12 +188,27 @@ describe("getProtectionSnapshot", () => {
       auditLog: stubAuditLog([cwArmEntry()]),
       teeAvailable: true,
       reputation: { score: 95, profile_url: "https://verascore.ai/p/xyz" },
+      resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
     });
     const snap = await getProtectionSnapshot(sources);
     expect(snap.layers.l2.state).toBe("full");
     expect(snap.overall.light).toBe("green");
     expect(snap.overall.status).toBe("healthy");
     expect(snap.overall.headline).toBe("All layers full, Castle Wall enforcing");
+  });
+
+  it("legacy dashboard hero stays non-green when Castle Wall evidence is fresh but subject-bound elsewhere", async () => {
+    const sources = baseSources({
+      identityManager: stubIdentityManager(stubIdentity()),
+      auditLog: stubAuditLog([cwArmEntry(60_000, subjectForUid(602))]),
+      teeAvailable: true,
+      reputation: { score: 95, profile_url: "https://verascore.ai/p/xyz" },
+      resolveProtectionClaimSubject: () => subjectForUid(601),
+    });
+    const snap = await getProtectionSnapshot(sources);
+    expect(snap.overall.light).toBe("yellow");
+    expect(snap.overall.status).toBe("degraded");
+    expect(snap.overall.headline).toMatch(/Castle Wall enforcement not confirmed/);
   });
 
   it("does NOT go green when all layers full and wall armed but the audit chain is tamper-flagged", async () => {
@@ -611,6 +664,7 @@ describe("getProtectionSnapshot", () => {
         auditLog,
         teeAvailable: true,
         reputation: { score: 90, profile_url: "https://verascore.ai/p/x" },
+        resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
         ...overrides,
       });
     }
@@ -726,14 +780,14 @@ describe("getProtectionSnapshot", () => {
         timestamp: new Date(FRESH_TS).toISOString(),
         layer: "l1",
         operation: "egress_allowed",
-        identity_id: "id-1",
+        identity_id: CLAIM_TOKEN,
         result: "success",
-        details: { agent_id: "id-1", dest_host: "ok.example" },
+        details: { agent_id: CLAIM_TOKEN, dest_host: "ok.example" },
       });
       await log.appendCritical({
         layer: "l1",
         operation: "egress_allowed",
-        identity_id: "id-1",
+        identity_id: CLAIM_SUBJECT,
         result: "success",
         timestamp: new Date(FRESH_TS).toISOString(),
         details: {
@@ -744,6 +798,8 @@ describe("getProtectionSnapshot", () => {
           [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
           [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
             CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+          [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+            CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
           [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
         },
       });
@@ -756,9 +812,9 @@ describe("getProtectionSnapshot", () => {
         timestamp: new Date(FRESH_TS).toISOString(),
         layer: "l1",
         operation: "egress_allowed",
-        identity_id: "id-1",
+        identity_id: CLAIM_TOKEN,
         result: "success",
-        details: { agent_id: "id-1", dest_host: "ok.example" },
+        details: { agent_id: CLAIM_TOKEN, dest_host: "ok.example" },
       });
       const sig = ed25519.sign(
         producerSigningBytes(canonical, FRESH_TS, seq),
@@ -767,7 +823,7 @@ describe("getProtectionSnapshot", () => {
       await log.appendCritical({
         layer: "l1",
         operation: "egress_allowed",
-        identity_id: "id-1",
+        identity_id: CLAIM_SUBJECT,
         result: "success",
         timestamp: new Date(FRESH_TS).toISOString(),
         details: {
@@ -778,6 +834,8 @@ describe("getProtectionSnapshot", () => {
           [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
           [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
             CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+          [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+            CASTLE_WALL_PRODUCER_SUBJECT_BINDING_MACOS_AUDIT_TOKEN,
           [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
         },
       });
@@ -793,6 +851,7 @@ describe("getProtectionSnapshot", () => {
         teeAvailable: true,
         reputation: { score: 90, profile_url: "https://verascore.ai/p/x" },
         resolvePinnedProducerKey: () => daemonPubB64,
+        resolveProtectionClaimSubject: () => CLAIM_SUBJECT,
         ...overrides,
       });
     }

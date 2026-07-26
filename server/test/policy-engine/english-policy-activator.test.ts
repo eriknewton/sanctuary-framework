@@ -24,7 +24,7 @@
  *     outbound audit ops.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Writable } from "node:stream";
@@ -58,6 +58,7 @@ import {
   handleEnglishPolicyRoute,
 } from "../../src/policy-engine/english-policy-routes.js";
 import { runPolicyCommand } from "../../src/cli/policy.js";
+import { createTempFortress } from "../helpers/temp-fortress.js";
 
 const FORTRESS_A = "fortress_a";
 const FORTRESS_B = "fortress_b";
@@ -138,6 +139,17 @@ class CollectStream extends Writable {
     return Buffer.concat(this.chunks).toString("utf-8");
   }
 }
+
+// Every test in this file that drives a CLI verb resolves a fortress. Without
+// a per-test fortress those verbs resolved the operator's own `~/.sanctuary`,
+// read its real custody, and wrote audit entries into it.
+let __fortress: Awaited<ReturnType<typeof createTempFortress>>;
+beforeEach(async () => {
+  __fortress = await createTempFortress("sanctuary-policy-activator");
+});
+afterEach(async () => {
+  await __fortress.cleanup();
+});
 
 describe("Xi-2 - applyRule pure function", () => {
   it("tier1_add_operation appends + dedupes", () => {

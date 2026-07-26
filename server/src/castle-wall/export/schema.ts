@@ -82,7 +82,13 @@ export interface EgressDecisionEvent extends EnforcementEventBase {
   destination_protocol: "tcp" | "udp" | null;
   /** The policy rule id that decided the flow, or null for a baseline default-deny. */
   rule_id: string | null;
-  /** Operator-facing agent id (for example "claude-code-1"). NEVER a key, DID, or secret. */
+  /**
+   * Verified subject attribution. Linux signed rows usually carry the
+   * operator-facing agent id (for example "claude-code-1"); macOS signed rows
+   * can carry the fortress-scoped protection subject (for example
+   * `<fortress>/uid-501`) because the OS audit token is the signed subject. The
+   * field name and scalar shape are frozen. NEVER a key, DID, or secret.
+   */
   agent_id: string | null;
   /** The agent role / template (for example "coding-assistant"). */
   agent_template: string | null;

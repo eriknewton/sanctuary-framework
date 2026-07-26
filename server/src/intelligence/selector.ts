@@ -75,6 +75,9 @@ import {
   type SummarizeRequest,
   type Surface,
   type SurfaceStatus,
+  TIER2_PINNED_SURFACE,
+  Tier2BindingPinnedError,
+  isTier2PinViolation,
 } from "./types.js";
 import { LocalSubstrate, OllamaClient, LOCAL_CAPABILITY } from "./substrates/local.js";
 import { VeniceClient, VeniceSubstrate, VENICE_CAPABILITY, VENICE_DEFAULT_ENDPOINT, VENICE_DEFAULT_MODEL, type VeniceValidateResult } from "./substrates/venice.js";
@@ -101,6 +104,7 @@ import type {
   IntelligenceSubstrateChosenPayload,
   IntelligenceSubstrateFailurePayload,
   IntelligenceSubstrateInvokedPayload,
+  IntelligenceTier2BindingPinnedPayload,
 } from "../contracts/v1.2/intelligence-events.js";
 
 const DISABLED_CAPABILITY: SubstrateCapability = {
@@ -204,6 +208,12 @@ export class SubstrateSelector {
    */
   private recentFailures = new Map<Surface, RecentFailureEntry[]>();
 
+  /**
+   * One-time-per-process latch for the tier-2 pin override audit event
+   * (`query_anonymity_tier2_binding_pinned`). See `effectiveChoice`.
+   */
+  private tier2PinOverrideAudited = false;
+
   constructor(cfg: SelectorConfig) {
     this.store = new IntelligenceConfigStore(cfg.storage, cfg.masterKey);
     this.auditLog = cfg.auditLog;
@@ -294,6 +304,13 @@ export class SubstrateSelector {
    * payload captures the hash of that text for auditor verification.
    */
   async setPerSurfaceChoice(surface: Surface, substrate: SubstrateChoice): Promise<void> {
+    // Ratified 2026-07-23: the privacy-filter-tier-2 surface is pinned
+    // local-only. Refused HERE, before any persist, so a violating
+    // binding never exists on disk via this path. See
+    // `isTier2PinViolation` in types.ts for the posture rationale.
+    if (isTier2PinViolation(surface, substrate)) {
+      throw new Tier2BindingPinnedError(substrate);
+    }
     await this.ensureLoaded();
     const prior = this.config.perSurface[surface];
     const wasDefault = prior === DEFAULT_PER_SURFACE[surface];
@@ -346,7 +363,7 @@ export class SubstrateSelector {
   async applyChoiceToAllSurfaces(
     substrate: SubstrateChoice,
     opts: { localModelPick?: LocalModelPick | null } = {},
-  ): Promise<void> {
+  ): Promise<{ skippedPinnedSurfaces: Surface[] }> {
     await this.ensureLoaded();
 
     const priorSubstrates: Partial<Record<Surface, SubstrateChoice | null>> = {};
@@ -354,9 +371,18 @@ export class SubstrateSelector {
       priorSubstrates[surface] = this.config.perSurface[surface] ?? null;
     }
 
+    // Ratified 2026-07-23: the fan-out skips a pinned surface rather
+    // than failing the whole bulk apply. The skip is reported in the
+    // return value AND stamped on the bulk audit payload so the
+    // operator can see the fan-out did not cover the pinned surface.
+    const skippedPinnedSurfaces: Surface[] = [];
     const nextPerSurface: Record<Surface, SubstrateChoice> = { ...this.config.perSurface };
     const nextLocalPicks = { ...this.config.localModelPicks };
     for (const surface of SURFACES) {
+      if (isTier2PinViolation(surface, substrate)) {
+        skippedPinnedSurfaces.push(surface);
+        continue;
+      }
       nextPerSurface[surface] = substrate;
       if (substrate === "local" && opts.localModelPick !== undefined) {
         if (opts.localModelPick === null) delete nextLocalPicks[surface];
@@ -375,8 +401,11 @@ export class SubstrateSelector {
     // Finding ZZ (v1.2.0-rc.2): bulk re-binding is a global configuration
     // gesture; prior per-surface failure entries no longer describe the
     // new bindings. Clear every surface's ring buffer so badges reflect
-    // current configuration.
+    // current configuration. A pin-skipped surface kept its binding, so
+    // its failure trail stays (mirrors the same-substrate no-op rule in
+    // setPerSurfaceChoice).
     for (const surface of SURFACES) {
+      if (skippedPinnedSurfaces.includes(surface)) continue;
       this.recentFailures.delete(surface);
     }
 
@@ -387,11 +416,15 @@ export class SubstrateSelector {
       identity_id: this.identityId,
       kind: "bulk_substrate_chosen",
       substrate,
-      surface_count: SURFACES.length,
+      surface_count: SURFACES.length - skippedPinnedSurfaces.length,
       tradeoff_text_hash: tradeoffTextHash(substrate),
       prior_substrates: priorSubstrates,
+      ...(skippedPinnedSurfaces.length > 0
+        ? { pinned_surfaces_skipped: skippedPinnedSurfaces }
+        : {}),
     };
     this.emit(INTEL_OPS.BULK_SUBSTRATE_CHOSEN, payload, "success");
+    return { skippedPinnedSurfaces };
   }
 
   /**
@@ -619,8 +652,39 @@ export class SubstrateSelector {
    */
   async getSubstrate(surface: Surface): Promise<SubstrateHandle> {
     await this.ensureLoaded();
-    const choice = this.config.perSurface[surface];
-    return this.buildHandle(surface, choice);
+    return this.buildHandle(surface, this.effectiveChoice(surface));
+  }
+
+  /**
+   * Invoke-time chokepoint for the ratified 2026-07-23 tier-2 local
+   * pin (defense in depth behind the config-write gate). Resolves the
+   * pinned `privacy-filter-tier-2` surface to `local` regardless of
+   * what the persisted config says: a pre-existing or tampered
+   * non-local binding is never honored, and the first override in this
+   * process emits a `query_anonymity_tier2_binding_pinned` audit event
+   * recording the persisted value. The persisted config itself is left
+   * untouched so the operator can see and correct it. Every persisted
+   * read that feeds an invocation or an operator-visible status MUST
+   * route through this method.
+   */
+  private effectiveChoice(surface: Surface): SubstrateChoice {
+    const persisted = this.config.perSurface[surface];
+    if (!isTier2PinViolation(surface, persisted)) return persisted;
+    if (!this.tier2PinOverrideAudited) {
+      this.tier2PinOverrideAudited = true;
+      const payload: IntelligenceTier2BindingPinnedPayload = {
+        version: "1.2",
+        event_id: makeEventId(),
+        emitted_at: new Date().toISOString(),
+        identity_id: this.identityId,
+        kind: "tier2_binding_pinned",
+        surface,
+        persisted_substrate: persisted,
+        pinned_to: "local",
+      };
+      this.emit(INTEL_OPS.TIER2_BINDING_PINNED, payload, "success");
+    }
+    return "local";
   }
 
   /**
@@ -636,7 +700,10 @@ export class SubstrateSelector {
     const hardware = await this.probeHardware();
     const surfaces: SurfaceStatus[] = [];
     for (const surface of SURFACES) {
-      const choice = this.config.perSurface[surface];
+      // Status reports the EFFECTIVE choice (tier-2 pin applied) so
+      // badges describe what invocations actually do; the raw persisted
+      // config remains visible via the config read for correction.
+      const choice = this.effectiveChoice(surface);
       const status = await this.probeSurfaceHealth(surface, choice, hardware);
       surfaces.push(status);
     }
@@ -709,7 +776,7 @@ export class SubstrateSelector {
   ): Promise<SubstrateResponse> {
     await this.ensureLoaded();
     const startedAt = Date.now();
-    const choice = this.config.perSurface[surface];
+    const choice = this.effectiveChoice(surface);
     const handle = this.buildHandle(surface, choice);
     const requestHash = hashOfRequest(req);
     const primary = await this.invokeHandle(surface, handle, method, req);
@@ -902,6 +969,12 @@ export class SubstrateSelector {
   } | null> {
     if (this.config.fallback[surface] !== "degrade-silent") return null;
     if (primary === "disabled" || primary === "hybrid") return null;
+    // Ratified 2026-07-23: the pinned tier-2 surface never escapes
+    // local via the fallback chain (local -> venice -> frontier would
+    // be a remote egress of PII-residual-bearing text). The pin means
+    // never-remote, not must-LLM: on local failure the Rho-2 caller
+    // degrades to the regex-only result.
+    if (surface === TIER2_PINNED_SURFACE) return null;
     const primaryIndex = FALLBACK_CHAIN.findIndex((choice) => choice === primary);
     if (primaryIndex < 0) return null;
 

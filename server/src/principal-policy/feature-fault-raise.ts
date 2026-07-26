@@ -179,7 +179,18 @@ function isSilentlyOff(
 ): boolean {
   if (prev === undefined) return false;
   if (!prev.audit_integrity_ok || !current.audit_integrity_ok) return false;
-  if (prev.status !== "active") return false;
+  // "Was on" = the feature was PROVING enforcement in the prior cycle. That is
+  // `active` (fresh enforcement evidence) OR, for the Castle Wall row, S5-P's
+  // `coarse_only` (the coarse wall WAS enforcing on fresh evidence; only the
+  // fine-grained exclusive-egress stack was down). A wall that was coarse_only
+  // and then goes `unknown` has silently STOPPED enforcing entirely -- the same
+  // silent death `active -> unknown` catches -- so coarse_only must count as
+  // "was on" here, or threading the S5-P cap into this panel would open a
+  // suppression hole (coarse_only -> unknown would never raise). coarse_only is
+  // itself never a raise TARGET (it is not `unconfirmed`/`unknown` below), so a
+  // healthy `active -> coarse_only` transition still does not raise.
+  const wasOn = prev.status === "active" || prev.status === "coarse_only";
+  if (!wasOn) return false;
   // An OPT-IN expectation-floor breach is a DASHBOARD-ONLY "expected-but-quiet"
   // signal, NEVER an OS notification (event-floor slice invariant 5: the §4.3
   // raise path is the 3 fault classes only). A feature that met its floor one
@@ -189,6 +200,8 @@ function isSilentlyOff(
   if (current.basis === "below_expected_floor") return false;
   // A self-reporting fault is its OWN class (castle_wall_fault); silent-off is
   // the "went quiet without a fault event" case, so we exclude `fault` here.
+  // `coarse_only` is also excluded as a target: the coarse wall is STILL
+  // enforcing, so it is loud-on-surface, never an OS silent-off notification.
   return current.status === "unconfirmed" || current.status === "unknown";
 }
 

@@ -844,7 +844,13 @@ export class HubService {
     agent_id?: string;
     category?: HubActivityFeedEntry["category"];
   }): Promise<HubActivityFeedEntry[]> {
-    return aggregateActivity(this.deps.activitySources, filter);
+    return aggregateActivity(
+      {
+        ...this.deps.activitySources,
+        listLocalAgents: () => this.listAgents(),
+      },
+      filter,
+    );
   }
 
   // ── Policy + budget summaries ──────────────────────────────────────

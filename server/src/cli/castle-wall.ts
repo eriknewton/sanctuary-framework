@@ -74,7 +74,12 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
-import { CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS } from "../castle-wall/constants.js";
+import { GENERIC_UID_CONFINEMENT_REMEDY } from "../egress-gate/operator-advice.js";
+import {
+  CASTLE_WALL_AUDIT_PROVENANCE_KEY,
+  CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+  CASTLE_WALL_RELOAD_CLIENT_TIMEOUT_MS,
+} from "../castle-wall/constants.js";
 import type {
   CastleWallMessage,
   DecisionResponse,
@@ -174,20 +179,16 @@ export interface CastleWallCommandContext {
    */
   agentOriginDescriptorProbe?: (fortressPath: string) => Promise<boolean>;
   /**
-   * Bug B P1 (disarm-first, fail-open sub-case): out-callback that surfaces,
-   * ALONGSIDE the numeric exit code, whether a `disable` AFFIRMATIVELY confirmed
-   * the NE preference is OFF. This is needed because `runDisable` returns 0 in
-   * THREE distinct meanings and the exit code alone collapses them: (B)
-   * confirmed disabled, (C) NE saved-disabled but post-change corroboration was
-   * inconclusive (still off -- the save is authoritative), and (A) the disable
-   * host-app invoke FAILED but the dead-man lease-revoke succeeded (fail-open
-   * NOW, but the NE preference may STILL be enabled -- a reboot-brick risk if a
-   * caller then removes the daemon). Fires with `false` on case A and `true` on
-   * B/C, immediately before the corresponding `return 0`. Never fires on the
-   * throwing (non-zero) paths. Only the auto-provision arm-abort rollback reads
-   * it; every other caller ignores it and the exit-code contract is unchanged.
+   * Bug B P1/B round-2: out-callback that surfaces the disable outcome
+   * ALONGSIDE the numeric exit code. `runDisable` can return 0 in three
+   * meanings: (B) status re-read observed disabled, (C) save-disabled returned
+   * ok but corroboration was inconclusive, and (A) the save did not complete
+   * but the dead-man lease revoke made the provider fail open. These must stay
+   * distinguishable because only (B) is an OBSERVED-off fact suitable for a
+   * protection claim; (C) is a recovery/control-flow success, not an
+   * observation. Never fires on non-zero paths.
    */
-  onDisableNeConfirmedOff?: (neConfirmedOff: boolean) => void;
+  onDisableNePreferenceOutcome?: (outcome: DisableNePreferenceOutcome) => void;
   /**
    * Override the agent-matchable-allow-rule counter used by the `enable`
    * no-egress brick guard (confined-agent egress design, section 5 layer 2;
@@ -274,6 +275,11 @@ export type HostAppInvoker = (
   binaryPath: string,
   args: string[],
 ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
+export type DisableNePreferenceOutcome =
+  | "corroborated_off"
+  | "save_accepted_inconclusive"
+  | "fail_open_deadman";
 
 /**
  * Runs `open` (or a test double). The default LaunchServices invoker launches
@@ -2105,12 +2111,86 @@ export async function runSafeModeDaemon(
     "Agents denied by default; persisted signed manifest enforced if present. Full operation resumes at first login.\n",
   );
 
+  // Unified Protect Slice 5 S5-6: the exclusive-egress BOOT release sequence
+  // (design "Boot ordering via the root supervisor"). For every confined
+  // agent in the S5-1 registry: re-arm the pf anchor union from the registry
+  // -> verify gate + generation -> recommit + hold file -> enable+bootstrap
+  // the parked harness, per the S5-5 persistent-park contract -- then keep
+  // the oracle freshness-token loop running (the gate's per-CONNECT liveness
+  // is TTL-fresh). PER-AGENT FAIL-CLOSED and NEVER daemon-fatal: a failure
+  // leaves that agent PARKED (loud, amber, repairable via
+  // 'sudo sanctuary protect --repair-egress-gate'), and the policy daemon
+  // keeps serving regardless.
+  let exclusiveEgressSupervisor: { stopOracleLoop(): void } | undefined;
+  try {
+    const { startExclusiveEgressBootSupervisor, NON_HERMES_BOOT_PARK_REASON } = await import(
+      "../egress-gate/arming-wiring.js"
+    );
+    const { deriveGateAccountName } = await import("../egress-gate/index.js");
+    const { loadExclusiveRoutingMarker } = await import("../castle-wall/allowlist/routing-marker.js");
+    const { deriveAgentAccountName, resolveHermesGatewayArgv, realHarnessArgvOps } = await import(
+      "../castle-wall/provision/index.js"
+    );
+    exclusiveEgressSupervisor = await startExclusiveEgressBootSupervisor({
+      // Discriminated resolution (fix-round H1): an unresolvable agent gets a
+      // REAL reassert-parked (bootout + hold-file removal + disable) inside
+      // the supervisor, never a synthetic unverified "parked" report.
+      resolveAgent: async (entry) => {
+        const marker = await loadExclusiveRoutingMarker(entry.fortress_path).catch(() => null);
+        if (marker === null || marker.agent_uid !== entry.agent_uid) {
+          return {
+            kind: "unresolvable" as const,
+            reason: `no exclusive-routing marker names uid ${entry.agent_uid} in ${entry.fortress_path} (marker missing, malformed, or for another uid)`,
+          };
+        }
+        if (marker.agent_id !== "hermes") {
+          // Fix-round M6: a deliberate v1 scope bound, not a fault.
+          return { kind: "unresolvable" as const, reason: NON_HERMES_BOOT_PARK_REASON };
+        }
+        const accountName = deriveAgentAccountName(marker.agent_id);
+        const agentHome = `/var/sanctuary-agents/${accountName}`;
+        const gateAccount = deriveGateAccountName(marker.agent_id);
+        const gateHomeDirectory = `/var/sanctuary-agents/${gateAccount}`;
+        // FIX F-INTERP: one shared production probe set (never a hand-rolled
+        // `pathExists` here), and the argv is resolved for the AGENT uid the
+        // boot release will actually run the harness as.
+        const resolved = await resolveHermesGatewayArgv(realHarnessArgvOps(), {
+          agentHome,
+          agentUid: marker.agent_uid,
+        });
+        return {
+          kind: "ok" as const,
+          agentAccount: accountName,
+          // FIX F-HARNESSENV: the boot release re-renders the harness plist, so
+          // it carries the WHOLE launch (argv + environment), never a bare argv.
+          harnessLaunch: resolved.launch,
+          harnessLogDir: `${agentHome}/logs`,
+          gateAccount,
+          gateHomeDirectory,
+          gateUid: marker.gate_uid,
+        };
+      },
+      audit: async () => undefined, // safe-mode: unified log is the boot evidence channel.
+      print: (line) => write(out, `${line}\n`),
+    });
+  } catch (bootErr) {
+    // HONESTY (fix-round-2 BLOCKER-1): a supervisor throw means NO re-park op
+    // verifiably ran here -- never claim the agents "stay PARKED"; their
+    // persisted parked posture (hold files + disable overrides) was not
+    // re-verified this boot.
+    write(
+      err,
+      `[castle-wall] exclusive-egress boot supervisor failed (${bootErr instanceof Error ? bootErr.message : String(bootErr)}); NO boot release or re-park ran and the confined agents' parked state was NOT verified -- treat them as possibly startable and intervene. Repair: sudo sanctuary protect --repair-egress-gate\n`,
+    );
+  }
+
   await new Promise<void>((resolveWait) => {
     let stopping = false;
     const stop = () => {
       if (stopping) return;
       stopping = true;
       write(err, "\nStopping Castle Wall safe-mode daemon...\n");
+      exclusiveEgressSupervisor?.stopOracleLoop();
       void daemon
         .stop()
         .catch(() => undefined)
@@ -3614,6 +3694,7 @@ async function appendArmAuditBestEffort(
       verified_state: verifiedState,
       forced,
       ...extraDetails,
+      [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
     fortressPath,
     env,
@@ -3925,8 +4006,7 @@ async function runArmDisarm(
           "Refusing to arm: no agent-origin descriptor is set for this fortress.\n" +
             "Arming would classify EVERY flow as `.agent`, so default-deny would cut\n" +
             "your OWN SSH / Tailscale / operator shell (the boot-cut).\n" +
-            "Set one first, then re-run enable:\n" +
-            "  sanctuary castle-wall configure-origin uid --agent-uid=<uid> --ceiling=500\n" +
+            `Set one first: ${GENERIC_UID_CONFINEMENT_REMEDY} Then re-run enable.\n` +
             "Or pass --force to arm agent-only anyway (you WILL lose operator access\n" +
             "unless another carve-out already exists).\n",
         );
@@ -3965,8 +4045,7 @@ async function runArmDisarm(
             "Refusing to arm: this fortress has ZERO agent-matchable allow rules, so the\n" +
               "confined agent would be default-denied for EVERYTHING (including its own\n" +
               "endpoints) -- confined into non-functionality, silently.\n" +
-              "Provision its egress first: sudo sanctuary protect --hermes (publishes the\n" +
-              "harness's signed allow rules), or add allow rules to\n" +
+              `${GENERIC_UID_CONFINEMENT_REMEDY} Also add agent-matchable allow rules to\n` +
               `${join(fortressPath, "policy", "egress", "rules")} and reload.\n` +
               "Or pass --allow-no-egress to arm a deliberate deny-all quarantine (audited).\n",
           );
@@ -4058,7 +4137,7 @@ async function runArmDisarm(
       // is NOT a confirmed filter-off; a caller must not treat it as safe to
       // remove the policy daemon (reboot could come up enabled + no daemon =
       // deny-all).
-      ctx.onDisableNeConfirmedOff?.(false);
+      ctx.onDisableNePreferenceOutcome?.("fail_open_deadman");
       return 0;
     }
     write(err, `castle-wall ${action} failed: ${detail}\n`);
@@ -4164,13 +4243,10 @@ async function runArmDisarm(
       "Castle Wall disarmed: content filter disabled (host app confirmed the save; status corroboration pending).\n",
     );
   }
-  // Bug B P1 (cases B/C): reaching here on a disable means the NE save-disabled
-  // host-app invoke SUCCEEDED (the case-A save-failed path returned earlier), so
-  // the NE preference is confirmed OFF -- whether corroboration positively
-  // confirmed it (B) or was inconclusive on Tahoe (C, the save is authoritative).
-  // Safe for a caller to remove the policy daemon.
   if (action === "disable") {
-    ctx.onDisableNeConfirmedOff?.(true);
+    ctx.onDisableNePreferenceOutcome?.(
+      confirmed ? "corroborated_off" : "save_accepted_inconclusive",
+    );
   }
   return 0;
 }

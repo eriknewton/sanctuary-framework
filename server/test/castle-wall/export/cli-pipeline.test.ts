@@ -15,17 +15,30 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
 
 import type { AuditEntry } from "../../../src/operational/audit-log.js";
+import {
+  CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
+  CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+  CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_KID_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY,
+} from "../../../src/castle-wall/constants.js";
 import {
   ENFORCEMENT_EXPORT_ENABLED,
   EXPORT_CURSOR_START,
   type ExportApprover,
   type ExportAudit,
+  type ExportCursorReadResult,
+  type ExportCursorState,
   type ExportCursorStore,
   type VerifiedChainSource,
 } from "../../../src/castle-wall/export/index.js";
 import { runExportPipeline } from "../../../src/cli/cortex-export.js";
+import { producerSigningBytes } from "../../../src/castle-wall/runtime/producer-signature.js";
 
 import { ApprovalGate } from "../../../src/principal-policy/gate.js";
 import { BaselineTracker } from "../../../src/principal-policy/baseline.js";
@@ -35,28 +48,81 @@ import { AuditLog } from "../../../src/operational/audit-log.js";
 import { MemoryStorage } from "../../../src/storage/memory.js";
 import { generateRandomKey } from "../../../src/core/random.js";
 
+const PRODUCER_PRIV = ed25519.utils.randomPrivateKey();
+const PRODUCER_PUB_B64 = toBase64url(ed25519.getPublicKey(PRODUCER_PRIV));
+const SIGNED_AT_MS = 1_777_777_777_777;
+const SUBJECT_FORTRESS_ID = "fortress:test";
+const CLAUDE_AGENT_SUBJECT = `${SUBJECT_FORTRESS_ID}/uid-503`;
+const SIGNED_MAP_OPTIONS = {
+  pinnedProducerKeyB64url: PRODUCER_PUB_B64,
+  subjectFortressId: SUBJECT_FORTRESS_ID,
+};
+
+function toBase64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function withProducerSignature(entry: AuditEntry, identityId: string): AuditEntry {
+  const seq = typeof entry.details?.seq === "number" ? entry.details.seq : 31;
+  const body = JSON.stringify({
+    timestamp: entry.timestamp,
+    layer: entry.layer,
+    operation: entry.operation,
+    identity_id: identityId,
+    result: entry.result,
+    details: entry.details ?? {},
+  });
+  const sig = ed25519.sign(
+    producerSigningBytes(body, SIGNED_AT_MS, seq),
+    PRODUCER_PRIV,
+  );
+  return {
+    ...entry,
+    identity_id: identityId,
+    details: {
+      ...(entry.details ?? {}),
+      seq,
+      [CASTLE_WALL_PRODUCER_SIG_DETAIL_KEY]: toBase64url(sig),
+      [CASTLE_WALL_PRODUCER_KID_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+      [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: body,
+      [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: SIGNED_AT_MS,
+      [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]:
+        CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    },
+  };
+}
+
 class MemoryCursorStore implements ExportCursorStore {
-  constructor(public value: number = EXPORT_CURSOR_START) {}
-  async read(): Promise<number> {
-    return this.value;
+  state: ExportCursorState;
+  constructor(sequence: number = EXPORT_CURSOR_START) {
+    this.state = { sequence, entryHash: sequence === EXPORT_CURSOR_START ? null : `eh-${sequence}` };
   }
-  async write(sequence: number): Promise<void> {
-    this.value = sequence;
+  get value(): number {
+    return this.state.sequence;
+  }
+  async read(): Promise<ExportCursorReadResult> {
+    return { state: { ...this.state }, reset: null };
+  }
+  async write(state: ExportCursorState): Promise<void> {
+    this.state = { ...state };
   }
 }
 
 function egressChain(): VerifiedChainSource {
-  const entry: AuditEntry = {
+  const entry = withProducerSignature({
     timestamp: "2026-07-10T00:00:00.000Z",
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: "system",
-    result: "success",
+    identity_id: CLAUDE_AGENT_SUBJECT,
+    result: "failure",
     details: { destination: { host: "evil.example", port: 443, protocol: "tcp" }, rule_id: "r0" },
-  };
+  }, CLAUDE_AGENT_SUBJECT);
   return {
     async streamVerifiedChain(consumer) {
-      consumer.onEntry({ sequence: 0, entry });
+      consumer.onEntry({ sequence: 0, entry_hash: "eh-0", entry });
     },
   };
 }
@@ -78,6 +144,7 @@ describe("CLI export pipeline: safe default (no network, no approval)", () => {
         lines.push(line);
       },
       fetchImpl: fetchSpy as unknown as typeof fetch,
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: async () => {},
     });
     expect(result.status).toBe("ran");
@@ -108,6 +175,7 @@ describe("CLI export pipeline: outbound push requires the Tier-1 gate", () => {
       source: egressChain(),
       cursor: new MemoryCursorStore(),
       fetchImpl: fetchSpy as unknown as typeof fetch,
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: async () => {},
     });
     expect(result.status).toBe("refused");
@@ -129,6 +197,7 @@ describe("CLI export pipeline: outbound push requires the Tier-1 gate", () => {
       source: egressChain(),
       cursor: new MemoryCursorStore(),
       fetchImpl,
+      mapOptions: SIGNED_MAP_OPTIONS,
       sleep: async () => {},
     });
     expect(result.status).toBe("ran");

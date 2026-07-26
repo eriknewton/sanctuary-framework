@@ -59,9 +59,31 @@ import {
 import {
   reverifyEntryProducerSignature,
   enforcementEntryCounts,
+  livenessEntryCounts,
   producerSignedDedupKey,
+  subjectEvidenceForReverifiedEntry,
+  signedCanonicalSubjectIssue,
   type VerifyProducerSignatureFn,
 } from "./producer-reverify.js";
+import {
+  exclusiveEgressCapsAggregateGreen,
+  type ExclusiveEgressStatus,
+} from "../egress-gate/posture.js";
+import {
+  castleWallEvidenceMatchesProtectionSubject,
+  fortressIdFromProtectionSubject,
+} from "../castle-wall/subject-binding.js";
+
+// Re-export the S5-P exclusive-egress posture surface for posture consumers
+// (routes, dashboard, CLI) so they import the wall-posture module they already
+// depend on; the canonical definitions live in `egress-gate/posture.ts`.
+export {
+  exclusiveEgressCapsAggregateGreen,
+  failedExclusiveEgressStatus,
+  type ExclusiveEgressStatus,
+  type ExclusiveEgressPosture,
+  type ExclusiveEgressMode,
+} from "../egress-gate/posture.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -136,9 +158,10 @@ export const CASTLE_WALL_LIVENESS_OPERATIONS: ReadonlySet<string> =
 
 /**
  * Castle Wall audit operations that record an INTENTIONAL stand-down — the
- * operator deliberately stopped the wall (`filter_stopped`) or revoked its arm
- * lease (`arm_lease_revoked`). Both stop the liveness heartbeat on purpose, so
- * the resulting heartbeat-then-silent pattern is NOT a silent death.
+ * operator deliberately stopped the wall (`filter_stopped`), revoked its arm
+ * lease (`arm_lease_revoked`), or the CLI recorded a completed
+ * `castle-wall disable` (`wall_disarmed`). These stop the liveness heartbeat on
+ * purpose, so the resulting heartbeat-then-silent pattern is NOT a silent death.
  *
  * This set exists to fix a false-RED defect (observability Slice 2): without it
  * a deliberately-stopped wall reads `dead_no_heartbeat`/red for ~24h, because
@@ -165,7 +188,11 @@ export const CASTLE_WALL_LIVENESS_OPERATIONS: ReadonlySet<string> =
  */
 export const CASTLE_WALL_STAND_DOWN_OPERATIONS: ReadonlySet<string> =
   Object.freeze(
-    new Set<string>(["filter_stopped", CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION]),
+    new Set<string>([
+      "filter_stopped",
+      CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+      "wall_disarmed",
+    ]),
   );
 
 /**
@@ -203,8 +230,23 @@ export const ENFORCEMENT_FUTURE_SKEW_MS = 60 * 1000;
  * fresh enforcement evidence. `degraded` means the wall is present but recent
  * evidence shows it is not enforcing. `unknown` means we cannot prove
  * enforcement either way — it renders amber, never green.
+ *
+ * `coarse_only` (Unified Protect Slice 5 S5-P, design §6): the coarse wall IS
+ * enforcing (fresh evidence would otherwise read `armed`), but a
+ * fine-grained-provisioned agent's exclusive-egress stack (gate + pf +
+ * generation match) is NOT live. A DISTINCT non-green state: aggregate green
+ * is `castle_wall_armed AND exclusive_egress_live`, so this surfaces the
+ * degrade-loud "coarse-only" mode on EVERY consumer of `arm_state` at once
+ * (every surface earns green ONLY from `armed`; the new value is non-green by
+ * construction on all of them). The specifics live in the
+ * {@link CastleWallPosture.exclusive_egress} block.
  */
-export type CastleWallArmState = "armed" | "degraded" | "unknown" | "not_installed";
+export type CastleWallArmState =
+  | "armed"
+  | "coarse_only"
+  | "degraded"
+  | "unknown"
+  | "not_installed";
 
 export interface CastleWallVerdictCounts {
   allowed: number;
@@ -228,7 +270,13 @@ export interface CastleWallPosture {
     | "stale_evidence"
     | "no_evidence"
     | "not_enforcing_evidence"
+    | "intentionally_stopped"
+    | "daemon_liveness_unconfirmed"
     | "not_installed"
+    | "subject_unbound_evidence"
+    | "legacy_macos_audit_token"
+    | "pre_canonical_linux_agent_name"
+    | "subject_unresolvable"
     // Slice P: a producer key is expected but the reader could not load it, so
     // the wall is reported `degraded` rather than green on a weaker basis.
     | "producer_key_unavailable";
@@ -270,6 +318,16 @@ export interface CastleWallPosture {
     | "producer_signed"
     | "channel_authenticated"
     | "not_applicable";
+  /**
+   * The exclusive-egress posture object (Unified Protect Slice 5 S5-P, design
+   * §6): the first-class, queryable per-agent status (mode, generation match,
+   * pf-liveness reasons, gate process) plus the wall-level summary. Present
+   * whenever an exclusive-egress posture source was supplied to the builder;
+   * absent when no producer is wired (no fine-grained agent provisioned).
+   * When this block caps green, `arm_state` reads the DISTINCT non-green
+   * `coarse_only` — never `armed`.
+   */
+  exclusive_egress?: ExclusiveEgressStatus;
 }
 
 export interface BuildCastleWallPostureInput {
@@ -304,6 +362,54 @@ export interface BuildCastleWallPostureInput {
   producerKeyExpectedButUnavailable?: boolean;
   /** Injectable verify fn for tests; defaults to the real Ed25519 verifier. */
   verifyProducerSignature?: VerifyProducerSignatureFn;
+  /**
+   * Exclusive-egress posture (Slice 5 S5-P). When provided, the block is
+   * attached verbatim to the returned posture AND the aggregate-green cap is
+   * applied: a would-be `armed` reads the DISTINCT non-green `coarse_only`
+   * whenever a fine-grained-provisioned agent's exclusive-egress stack is not
+   * live ({@link exclusiveEgressCapsAggregateGreen}). Absent/null = no
+   * producer wired = no fine-grained agent exists = unchanged behavior.
+   * PROVIDER FAILURE CONTRACT: an impure caller whose provider THROWS must
+   * pass `failedExclusiveEgressStatus(...)` (which caps green), never null —
+   * a failed posture read must not render the stronger claim.
+   */
+  exclusiveEgress?: ExclusiveEgressStatus | null;
+  /**
+   * Canonical confined-agent subject (`fortress/uid-N`) for a protection claim.
+   * When present, green-earning Castle Wall enforcement evidence must be stamped
+   * with the same subject. An unresolvable claim subject is explicit
+   * `subject_unresolvable`; mismatched/missing subjects are
+   * `subject_unbound_evidence`; legacy macOS 64-hex audit token identities are
+   * `legacy_macos_audit_token`; old Linux daemon agent-name identities are
+   * `pre_canonical_linux_agent_name`. None is green.
+   */
+  protectionClaimSubject: string | null;
+}
+
+/**
+ * Apply the Slice-5 S5-P exclusive-egress block to a computed wall posture:
+ * attach the block verbatim (queryability) and cap a would-be green to the
+ * DISTINCT non-green `coarse_only` when a fine-grained-provisioned agent's
+ * exclusive-egress stack is not live. The ONE place the cap is applied, so
+ * every arm_state consumer (CLI, dashboard, v1.1 console, hero shield,
+ * fortress-view, /v1/status, posture APIs) repaints together. Non-armed
+ * states are left as computed (already non-green; the block still attaches).
+ */
+function applyExclusiveEgress(
+  posture: CastleWallPosture,
+  exclusiveEgress: ExclusiveEgressStatus | null | undefined,
+): CastleWallPosture {
+  if (exclusiveEgress === null || exclusiveEgress === undefined) {
+    return posture;
+  }
+  const capped =
+    posture.arm_state === "armed" &&
+    exclusiveEgressCapsAggregateGreen(exclusiveEgress);
+  return {
+    ...posture,
+    ...(capped ? { arm_state: "coarse_only" as const } : {}),
+    exclusive_egress: exclusiveEgress,
+  };
 }
 
 /**
@@ -338,18 +444,21 @@ export async function buildCastleWallPosture(
   // basis, so the reader must NOT fall back to the channel basis and render
   // green — it surfaces `degraded` (not-armed) until the key is readable again.
   if (input.producerKeyExpectedButUnavailable === true) {
-    return {
-      origin_machine: input.originMachine,
-      arm_state: "degraded",
-      platform,
-      evidence_basis: "producer_key_unavailable",
-      last_enforcement_evidence_at: null,
-      freshness_window_ms: freshnessWindowMs,
-      verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
-      audit_integrity_ok: true,
-      sealed_region_unverified_at_privilege: false,
-      producer_authenticity: "not_applicable",
-    };
+    return applyExclusiveEgress(
+      {
+        origin_machine: input.originMachine,
+        arm_state: "degraded",
+        platform,
+        evidence_basis: "producer_key_unavailable",
+        last_enforcement_evidence_at: null,
+        freshness_window_ms: freshnessWindowMs,
+        verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+        audit_integrity_ok: true,
+        sealed_region_unverified_at_privilege: false,
+        producer_authenticity: "not_applicable",
+      },
+      input.exclusiveEgress,
+    );
   }
 
   // Read the l1 (Castle Wall) slice over the digest window. The freshness
@@ -383,18 +492,21 @@ export async function buildCastleWallPosture(
   } catch {
     // A failed/ tainted read must NOT be reported as armed. Fail closed to
     // unknown with integrity flagged.
-    return {
-      origin_machine: input.originMachine,
-      arm_state: "unknown",
-      platform,
-      evidence_basis: "no_evidence",
-      last_enforcement_evidence_at: null,
-      freshness_window_ms: freshnessWindowMs,
-      verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
-      audit_integrity_ok: false,
-      sealed_region_unverified_at_privilege: false,
-      producer_authenticity: "not_applicable",
-    };
+    return applyExclusiveEgress(
+      {
+        origin_machine: input.originMachine,
+        arm_state: "unknown",
+        platform,
+        evidence_basis: "no_evidence",
+        last_enforcement_evidence_at: null,
+        freshness_window_ms: freshnessWindowMs,
+        verdict_counts: { allowed: 0, blocked: 0, operator_decisions: 0 },
+        audit_integrity_ok: false,
+        sealed_region_unverified_at_privilege: false,
+        producer_authenticity: "not_applicable",
+      },
+      input.exclusiveEgress,
+    );
   }
 
   const freshnessFloor = now - freshnessWindowMs;
@@ -405,6 +517,13 @@ export async function buildCastleWallPosture(
   };
   let latestEnforcementMs: number | null = null;
   let latestNotEnforcingMs: number | null = null;
+  let latestHeartbeatMs: number | null = null;
+  let latestFreshHeartbeatMs: number | null = null;
+  let latestStandDownMs: number | null = null;
+  let latestSubjectRejectedEnforcementMs: number | null = null;
+  let latestLegacyMacOSAuditTokenEnforcementMs: number | null = null;
+  let latestPreCanonicalLinuxAgentNameEnforcementMs: number | null = null;
+  let latestSubjectUnresolvableEnforcementMs: number | null = null;
   // Track the authenticity basis of the MOST RECENT arm-eligible enforcement
   // entry, so the posture honestly reports whether the green light rests on a
   // re-verified producer signature or merely the channel basis.
@@ -455,19 +574,73 @@ export async function buildCastleWallPosture(
     // When NO key is configured, the channel basis counts (the honest legacy /
     // macOS floor).
     const keyPresent = pinnedProducerKey !== null;
+    const subjectFortressId =
+      fortressIdFromProtectionSubject(input.protectionClaimSubject) ??
+      input.originMachine;
     const reResult = reverifyEntryProducerSignature(
       entry.details,
       pinnedProducerKey,
       input.verifyProducerSignature,
+      subjectFortressId,
     );
     const isArmEligible = CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(op);
     const isNotEnforcing = CASTLE_WALL_NOT_ENFORCING_OPERATIONS.has(op);
+    const isLiveness = CASTLE_WALL_LIVENESS_OPERATIONS.has(op);
+    const isStandDown = CASTLE_WALL_STAND_DOWN_OPERATIONS.has(op);
     // Only arm-eligible enforcement ops are gated by the signature. Not-enforcing
     // (fault) ops are NOT signed and must NEVER be dropped by the gate — they
     // fail toward RED/degraded (a dropped fault would leave a green-while-faulted
     // wall). They keep the channel/marker basis.
     if (isArmEligible && !enforcementEntryCounts(reResult.basis, keyPresent)) {
       continue;
+    }
+
+    const armTs =
+      reResult.signedCapturedAtMs !== null ? reResult.signedCapturedAtMs : ts;
+    const tsValidForArm =
+      !Number.isNaN(armTs) && armTs <= now + ENFORCEMENT_FUTURE_SKEW_MS;
+
+    if (isArmEligible) {
+      const subjectMatch = castleWallEvidenceMatchesProtectionSubject(
+        input.protectionClaimSubject,
+        subjectEvidenceForReverifiedEntry(entry, reResult),
+      );
+      if (!subjectMatch.matches) {
+        const subjectIssue =
+          reResult.basis === "producer_signed_verified" && isRecord(entry.details)
+            ? signedCanonicalSubjectIssue(entry.details, subjectFortressId)
+            : null;
+        if (
+          tsValidForArm &&
+          subjectMatch.reason === "subject_unresolvable" &&
+          (latestSubjectUnresolvableEnforcementMs === null ||
+            armTs > latestSubjectUnresolvableEnforcementMs)
+        ) {
+          latestSubjectUnresolvableEnforcementMs = armTs;
+        } else if (
+          tsValidForArm &&
+          subjectMatch.reason === "legacy_macos_audit_token" &&
+          (latestLegacyMacOSAuditTokenEnforcementMs === null ||
+            armTs > latestLegacyMacOSAuditTokenEnforcementMs)
+        ) {
+          latestLegacyMacOSAuditTokenEnforcementMs = armTs;
+        } else if (
+          tsValidForArm &&
+          subjectIssue === "pre_canonical_linux_agent_name" &&
+          (latestPreCanonicalLinuxAgentNameEnforcementMs === null ||
+            armTs > latestPreCanonicalLinuxAgentNameEnforcementMs)
+        ) {
+          latestPreCanonicalLinuxAgentNameEnforcementMs = armTs;
+        } else if (
+          tsValidForArm &&
+          subjectMatch.reason !== "subject_unresolvable" &&
+          (latestSubjectRejectedEnforcementMs === null ||
+            armTs > latestSubjectRejectedEnforcementMs)
+        ) {
+          latestSubjectRejectedEnforcementMs = armTs;
+        }
+        continue;
+      }
     }
 
     // Display verdict counts over the digest window. For a re-verified
@@ -504,11 +677,6 @@ export async function buildCastleWallPosture(
     // channel-basis / fault entries there is no signed time, so the top-level
     // timestamp is used (the honest no-key floor). Future-dated evidence beyond a
     // small skew is rejected for arming either way.
-    const armTs =
-      reResult.signedCapturedAtMs !== null ? reResult.signedCapturedAtMs : ts;
-    const tsValidForArm =
-      !Number.isNaN(armTs) && armTs <= now + ENFORCEMENT_FUTURE_SKEW_MS;
-
     if (isArmEligible && tsValidForArm) {
       if (latestEnforcementMs === null || armTs > latestEnforcementMs) {
         latestEnforcementMs = armTs;
@@ -521,12 +689,55 @@ export async function buildCastleWallPosture(
         latestNotEnforcingMs = armTs;
       }
     }
+    if ((isLiveness || isStandDown) && tsValidForArm) {
+      if (!livenessEntryCounts(reResult.basis)) continue;
+      if (
+        reResult.basis === "producer_signed_verified" &&
+        !signedOperationMatchesEntry(entry.details ?? {}, op)
+      ) {
+        continue;
+      }
+      if (isLiveness) {
+        if (latestHeartbeatMs === null || armTs > latestHeartbeatMs) {
+          latestHeartbeatMs = armTs;
+        }
+        if (armTs >= freshnessFloor) {
+          latestFreshHeartbeatMs =
+            latestFreshHeartbeatMs === null
+              ? armTs
+              : Math.max(latestFreshHeartbeatMs, armTs);
+        }
+      }
+      if (isStandDown) {
+        if (latestStandDownMs === null || armTs > latestStandDownMs) {
+          latestStandDownMs = armTs;
+        }
+      }
+    }
   }
 
   const hasFreshEnforcement =
     latestEnforcementMs !== null && latestEnforcementMs >= freshnessFloor;
   const hasFreshNotEnforcing =
     latestNotEnforcingMs !== null && latestNotEnforcingMs >= freshnessFloor;
+  const hasFreshSubjectRejectedEnforcement =
+    latestSubjectRejectedEnforcementMs !== null &&
+    latestSubjectRejectedEnforcementMs >= freshnessFloor;
+  const hasFreshLegacyMacOSAuditTokenEnforcement =
+    latestLegacyMacOSAuditTokenEnforcementMs !== null &&
+    latestLegacyMacOSAuditTokenEnforcementMs >= freshnessFloor;
+  const hasFreshPreCanonicalLinuxAgentNameEnforcement =
+    latestPreCanonicalLinuxAgentNameEnforcementMs !== null &&
+    latestPreCanonicalLinuxAgentNameEnforcementMs >= freshnessFloor;
+  const hasFreshSubjectUnresolvableEnforcement =
+    latestSubjectUnresolvableEnforcementMs !== null &&
+    latestSubjectUnresolvableEnforcementMs >= freshnessFloor;
+  const hasFreshHeartbeat = latestFreshHeartbeatMs !== null;
+  const heartbeatProducerWasRunning = latestHeartbeatMs !== null;
+  const hasNewerStandDown =
+    latestEnforcementMs !== null &&
+    latestStandDownMs !== null &&
+    latestStandDownMs >= latestEnforcementMs;
 
   let armState: CastleWallArmState;
   let basis: CastleWallPosture["evidence_basis"];
@@ -538,12 +749,41 @@ export async function buildCastleWallPosture(
     // just the daemon-belief path.
     armState = "unknown";
     basis = "no_evidence";
+  } else if (
+    latestNotEnforcingMs !== null &&
+    latestNotEnforcingMs >= freshnessFloor &&
+    (latestEnforcementMs === null || latestNotEnforcingMs >= latestEnforcementMs)
+  ) {
+    armState = "degraded";
+    basis = "not_enforcing_evidence";
+  } else if (hasFreshEnforcement && hasNewerStandDown) {
+    armState = "unknown";
+    basis = "intentionally_stopped";
+  } else if (
+    hasFreshEnforcement &&
+    heartbeatProducerWasRunning &&
+    !hasFreshHeartbeat
+  ) {
+    armState = "unknown";
+    basis = "daemon_liveness_unconfirmed";
   } else if (hasFreshEnforcement) {
     armState = "armed";
     basis = "fresh_enforcement_evidence";
   } else if (hasFreshNotEnforcing) {
     armState = "degraded";
     basis = "not_enforcing_evidence";
+  } else if (hasFreshSubjectUnresolvableEnforcement) {
+    armState = "unknown";
+    basis = "subject_unresolvable";
+  } else if (hasFreshLegacyMacOSAuditTokenEnforcement) {
+    armState = "unknown";
+    basis = "legacy_macos_audit_token";
+  } else if (hasFreshPreCanonicalLinuxAgentNameEnforcement) {
+    armState = "unknown";
+    basis = "pre_canonical_linux_agent_name";
+  } else if (hasFreshSubjectRejectedEnforcement) {
+    armState = "unknown";
+    basis = "subject_unbound_evidence";
   } else if (latestEnforcementMs !== null) {
     // Evidence exists but is older than the freshness window. Stale evidence
     // is NOT armed (the wall may have been disarmed since).
@@ -567,21 +807,32 @@ export async function buildCastleWallPosture(
     producerAuthenticity = "channel_authenticated";
   }
 
-  return {
-    origin_machine: input.originMachine,
-    arm_state: armState,
-    platform,
-    evidence_basis: basis,
-    last_enforcement_evidence_at:
-      latestEnforcementMs !== null
-        ? new Date(latestEnforcementMs).toISOString()
-        : null,
-    freshness_window_ms: freshnessWindowMs,
-    verdict_counts: verdictCounts,
-    audit_integrity_ok: integrityOk,
-    sealed_region_unverified_at_privilege: sealedUnverifiedAtPrivilege,
-    producer_authenticity: producerAuthenticity,
-  };
+  // S5-P aggregate-green cap (design §6): `armed` survives ONLY when no
+  // fine-grained-provisioned agent is missing exclusive-egress liveness. The
+  // cap composes AFTER the evidence pipeline so the wall's own evidence
+  // semantics (freshness, signature re-verify, integrity) are untouched —
+  // `coarse_only` means exactly "the coarse wall earned green AND the
+  // exclusive stack did not". `producer_authenticity` keeps describing the
+  // wall-evidence basis it was computed from (the pill only renders it when
+  // `armed`, so a capped posture surfaces the coarse-only story instead).
+  return applyExclusiveEgress(
+    {
+      origin_machine: input.originMachine,
+      arm_state: armState,
+      platform,
+      evidence_basis: basis,
+      last_enforcement_evidence_at:
+        latestEnforcementMs !== null
+          ? new Date(latestEnforcementMs).toISOString()
+          : null,
+      freshness_window_ms: freshnessWindowMs,
+      verdict_counts: verdictCounts,
+      audit_integrity_ok: integrityOk,
+      sealed_region_unverified_at_privilege: sealedUnverifiedAtPrivilege,
+      producer_authenticity: producerAuthenticity,
+    },
+    input.exclusiveEgress,
+  );
 }
 
 /**
@@ -687,6 +938,7 @@ export interface AuditDigest {
 export interface BuildAuditDigestInput {
   auditLog: AuditLog;
   originMachine: string;
+  protectionClaimSubject: string | null;
   now?: number;
   windowMs?: number;
   /**
@@ -731,6 +983,9 @@ export async function buildAuditDigest(
   const windowStart = new Date(now - windowMs).toISOString();
   const windowEnd = new Date(now).toISOString();
   const pinnedProducerKey = input.pinnedProducerKeyB64url ?? null;
+  const subjectFortressId =
+    fortressIdFromProtectionSubject(input.protectionClaimSubject) ??
+    input.originMachine;
 
   // Slice P fail-honest: a producer key is expected but the reader could not
   // load it. Report an unverified chain with zero kernel counts rather than let
@@ -820,20 +1075,41 @@ export async function buildAuditDigest(
     // in-process entry (marker + claimed `producer_signed` but no valid sig)
     // fails re-verify and is NOT counted — closing the kernel-block inflation
     // hole. With no pinned key the count rests on the honest channel basis.
-    const isCastleWallBlockOrAllow =
+    const hasCastleWallProvenance =
       isRecord(entry.details) &&
       entry.details[CASTLE_WALL_AUDIT_PROVENANCE_KEY] ===
-        CASTLE_WALL_AUDIT_PROVENANCE_VALUE &&
+        CASTLE_WALL_AUDIT_PROVENANCE_VALUE;
+    const isCastleWallEnforcementEvidence =
+      hasCastleWallProvenance &&
+      CASTLE_WALL_ENFORCEMENT_OPERATIONS.has(entry.operation);
+    const isCastleWallKernelVerdict =
+      isCastleWallEnforcementEvidence &&
       (entry.operation === "egress_blocked" ||
         entry.operation === "egress_allowed");
-    let kernelCounts = !isCastleWallBlockOrAllow;
-    if (isCastleWallBlockOrAllow) {
+    let kernelCounts = !isCastleWallKernelVerdict;
+    let signedAttribution =
+      null as ReturnType<typeof reverifyEntryProducerSignature> | null;
+    let signedOperationBoundForAttribution = false;
+    if (isCastleWallEnforcementEvidence) {
       const re = reverifyEntryProducerSignature(
         entry.details,
         pinnedProducerKey,
         input.verifyProducerSignature,
+        subjectFortressId,
       );
-      kernelCounts = enforcementEntryCounts(re.basis, pinnedProducerKey !== null);
+      signedAttribution = re;
+      if (re.basis === "producer_signed_verified") {
+        signedOperationBoundForAttribution = signedOperationMatchesEntry(
+          entry.details ?? {},
+          entry.operation,
+        );
+      }
+      if (isCastleWallKernelVerdict) {
+        kernelCounts = enforcementEntryCounts(
+          re.basis,
+          pinnedProducerKey !== null,
+        );
+      }
       // For a re-verified producer-signed entry, bind the count to the SIGNATURE
       // rather than the forgeable top-level fields (codex re-review HIGH): (a)
       // the signed capture time must fall within the digest window, so a same-seq
@@ -843,23 +1119,23 @@ export async function buildAuditDigest(
       // onto a "block" entry to mis-count. Channel-basis (no-key) entries have no
       // signed time/op, so they keep the top-level-timestamp window bound applied
       // above (the honest no-key floor).
-      if (re.basis === "producer_signed_verified") {
+      if (isCastleWallKernelVerdict && re.basis === "producer_signed_verified") {
         const signedMs = re.signedCapturedAtMs;
         const inWindow =
           signedMs !== null && signedMs > now - windowMs && signedMs <= windowEndMs;
-        const opBound = signedOperationMatchesEntry(
-          entry.details ?? {},
-          entry.operation,
-        );
         const dedupKey = producerSignedDedupKey(entry.details ?? {});
         const isDuplicate = dedupKey !== null && seenSignedKeys.has(dedupKey);
         if (dedupKey !== null) seenSignedKeys.add(dedupKey);
-        kernelCounts = kernelCounts && inWindow && opBound && !isDuplicate;
+        kernelCounts =
+          kernelCounts &&
+          inWindow &&
+          signedOperationBoundForAttribution &&
+          !isDuplicate;
       }
     }
-    if (isCastleWallBlockOrAllow && kernelCounts && entry.operation === "egress_blocked")
+    if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_blocked")
       kernelBlocks += 1;
-    else if (isCastleWallBlockOrAllow && kernelCounts && entry.operation === "egress_allowed")
+    else if (isCastleWallKernelVerdict && kernelCounts && entry.operation === "egress_allowed")
       kernelAllows += 1;
     else if (entry.operation === APPROVAL_RESOLVED_OPERATION) {
       // Split by the recorded decision; fall back to the entry result
@@ -874,7 +1150,36 @@ export async function buildAuditDigest(
       else if (decision === "denied") approvalsDenied += 1;
     }
 
-    perAgent.set(entry.identity_id, (perAgent.get(entry.identity_id) ?? 0) + 1);
+    let attributionIdentityId: string | null = entry.identity_id;
+    if (signedAttribution !== null && pinnedProducerKey !== null) {
+      // Attribution must be derived from signature-verified material for EVERY
+      // enforcement event type, not an enumerated subset: the previous fix
+      // covered two of three and looked complete. `operator_decision` gets here
+      // through the same enforcement set, with signed `egress_pending` bound to
+      // the persisted row by `signedOperationMatchesEntry`.
+      if (
+        signedAttribution.basis === "producer_signed_verified" &&
+        signedOperationBoundForAttribution
+      ) {
+        const signedSubjectEvidence = subjectEvidenceForReverifiedEntry(
+          entry,
+          signedAttribution,
+        );
+        attributionIdentityId =
+          typeof signedSubjectEvidence.identity_id === "string" &&
+          signedSubjectEvidence.identity_id.length > 0
+            ? signedSubjectEvidence.identity_id
+            : null;
+      } else {
+        attributionIdentityId = null;
+      }
+    }
+    if (attributionIdentityId !== null) {
+      perAgent.set(
+        attributionIdentityId,
+        (perAgent.get(attributionIdentityId) ?? 0) + 1,
+      );
+    }
   }
 
   const byAgent = Array.from(perAgent.entries())

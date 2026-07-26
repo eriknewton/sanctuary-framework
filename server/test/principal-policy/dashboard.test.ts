@@ -1069,7 +1069,10 @@ describe("Principal Dashboard", () => {
       // Login page markers (token box + Open Dashboard button), NOT the shell.
       expect(res.body).toContain('id="auth-token"');
       expect(res.body).toContain("Open Dashboard");
-      expect(res.body).not.toContain("Sovereignty Posture");
+      // S2 (2026-07-18): the posture page identity is "Security Posture" (copy
+      // rule; renamed off the retired term, which must never appear on screen).
+      // The login page is not the posture shell, so it carries neither string.
+      expect(res.body).not.toContain("Security Posture");
     });
 
     it("serves the DASHBOARD shell at / when a VALID session cookie is presented (no re-prompt)", async () => {
@@ -1091,7 +1094,9 @@ describe("Principal Dashboard", () => {
       });
       expect(res.status).toBe(200);
       // The posture shell, NOT the login page: no re-prompt.
-      expect(res.body).toContain("Sovereignty Posture");
+      // S2: the posture page identity is "Security Posture" (renamed off the
+      // retired term, which must never appear on screen).
+      expect(res.body).toContain("Security Posture");
       expect(res.body).not.toContain('id="auth-token"');
     });
 
@@ -1101,7 +1106,9 @@ describe("Principal Dashboard", () => {
       });
       expect(res.status).toBe(200);
       expect(res.body).toContain('id="auth-token"');
-      expect(res.body).not.toContain("Sovereignty Posture");
+      // S2: the posture page identity is "Security Posture" (renamed off the
+      // retired term, which must never appear on screen).
+      expect(res.body).not.toContain("Security Posture");
     });
 
     it("still 401s the data routes without a token or valid session (auth not weakened)", async () => {
@@ -1141,7 +1148,9 @@ describe("Principal Dashboard", () => {
       expect(res.status).toBe(200);
       // The one-surface contract: loopback root is the shell, never the login
       // page. The Finding 5 cookie change must not regress this.
-      expect(res.body).toContain("Sovereignty Posture");
+      // S2: the posture page identity is "Security Posture" (renamed off the
+      // retired term, which must never appear on screen).
+      expect(res.body).toContain("Security Posture");
       expect(res.body).not.toContain('id="auth-token"');
     });
   });

@@ -41,6 +41,11 @@ export {
 } from "./operator-chat-audit-events.js";
 
 export {
+  AgentContextCache,
+  type AgentContextSnapshot,
+} from "./agent-context-cache.js";
+
+export {
   CONCIERGE_THREAD_KEY,
   OPERATOR_CHAT_MAX_THREAD_LENGTH,
   type ConciergeResponse,

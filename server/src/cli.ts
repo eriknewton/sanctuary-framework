@@ -763,9 +763,16 @@ async function runExportPassphrase(args: string[]): Promise<void> {
   const { readStoredPassphrase, PassphraseUnreadableError } = await import(
     "./wrap/passphrase.js"
   );
+  // Resolve the fortress HERE, at the CLI entry point, and pass it down.
+  // Ambient resolution is correct at this layer -- for `sanctuary
+  // export-passphrase` the operator's own environment IS the input -- but it
+  // is stated rather than left implicit, so no leaf module has to reach for
+  // process state on its own.
+  const { resolveStoragePath } = await import("./paths.js");
+  const storagePath = resolveStoragePath();
   let stored: Awaited<ReturnType<typeof readStoredPassphrase>>;
   try {
-    stored = await readStoredPassphrase();
+    stored = await readStoredPassphrase({ storagePath });
   } catch (err) {
     if (err instanceof PassphraseUnreadableError) {
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -1199,6 +1206,112 @@ async function runCastleWallCommand(args: string[]): Promise<number> {
   if (command === "observe") {
     const { runObserveCommand } = await import("./cli/castle-wall-observe.js");
     return runObserveCommand({ argv: args.slice(1) });
+  }
+
+  if (command === "egress-gate-daemon") {
+    // Unified Protect Slice 5 S5-6: the long-lived exclusive-egress gate
+    // daemon entrypoint. Spawned by launchd under the dedicated
+    // `sanctuary-gate-<agentId>` service uid (NEVER root, NEVER the agent);
+    // reads its gate-readable config copies from /var/db/sanctuary/
+    // gate-runtime, binds EXACTLY the committed gate port, and serves with
+    // the S5-3 TCB wiring (oracle liveness probe + fail-closed client auth +
+    // peer runner). A bind/config failure exits non-zero (the gate refuses
+    // to serve rather than squat another port; posture reads amber).
+    const uidArg = args.slice(1).find((a) => a.startsWith("--agent-uid="));
+    const agentUid = uidArg !== undefined ? Number(uidArg.slice("--agent-uid=".length)) : NaN;
+    if (!Number.isInteger(agentUid) || agentUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("egress-gate-daemon requires --agent-uid=<positive integer>");
+      return 2;
+    }
+    const { runEgressGateDaemon } = await import("./egress-gate/gate-daemon.js");
+    try {
+      const handle = await runEgressGateDaemon({ agentUid });
+      const stop = async (): Promise<void> => {
+        try {
+          await handle.close();
+        } finally {
+          process.exit(0);
+        }
+      };
+      process.on("SIGTERM", () => {
+        void stop();
+      });
+      process.on("SIGINT", () => {
+        void stop();
+      });
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `[egress-gate] serving uid ${agentUid} on 127.0.0.1:${handle.gate.port} (generation ${handle.generationId})`,
+      );
+      // The gate server holds the event loop open; this promise never
+      // resolves (shutdown exits via the signal handlers above).
+      return await new Promise<number>(() => undefined);
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`egress-gate daemon failed to start: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
+  if (command === "peer-resolver-daemon") {
+    // 2026-07-24 S5-3 fix (Option 1): the PRIVILEGED root helper the gate
+    // daemon dials to resolve a loopback CONNECT peer's uid (the gate daemon
+    // itself stays unprivileged and cannot see a different uid's socket --
+    // see `peer-resolver-daemon.ts`). Spawned by launchd as ROOT (no
+    // UserName in its plist), one per confined agent, alongside that agent's
+    // gate daemon.
+    const args1 = args.slice(1);
+    const uidArg = args1.find((a) => a.startsWith("--agent-uid="));
+    const gateUidArg = args1.find((a) => a.startsWith("--gate-uid="));
+    const gatePortArg = args1.find((a) => a.startsWith("--gate-port="));
+    const agentUid = uidArg !== undefined ? Number(uidArg.slice("--agent-uid=".length)) : NaN;
+    const gateUid = gateUidArg !== undefined ? Number(gateUidArg.slice("--gate-uid=".length)) : NaN;
+    const gatePort = gatePortArg !== undefined ? Number(gatePortArg.slice("--gate-port=".length)) : NaN;
+    if (!Number.isInteger(agentUid) || agentUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --agent-uid=<positive integer>");
+      return 2;
+    }
+    if (!Number.isInteger(gateUid) || gateUid <= 0) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --gate-uid=<positive integer>");
+      return 2;
+    }
+    // 2026-07-24 fix-round BLOCKER: the gate port MUST come from this
+    // daemon's OWN root-written startup config (this argv, baked into the
+    // plist at arming time), never from a wire request -- see
+    // peer-resolver-daemon.ts's module header.
+    if (!Number.isInteger(gatePort) || gatePort <= 0 || gatePort > 65535) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error("peer-resolver-daemon requires --gate-port=<valid TCP port>");
+      return 2;
+    }
+    const { runPeerResolverDaemon } = await import("./egress-gate/peer-resolver-daemon.js");
+    try {
+      const handle = await runPeerResolverDaemon({ agentUid, gateUid, gatePort });
+      const stop = async (): Promise<void> => {
+        try {
+          await handle.close();
+        } finally {
+          process.exit(0);
+        }
+      };
+      process.on("SIGTERM", () => {
+        void stop();
+      });
+      process.on("SIGINT", () => {
+        void stop();
+      });
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`[egress-gate-peer-resolver] serving uid ${agentUid} on ${handle.socketPath}`);
+      // Holds the event loop open; shutdown exits via the signal handlers above.
+      return await new Promise<number>(() => undefined);
+    } catch (err) {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(`peer-resolver daemon failed to start: ${(err as Error).message}`);
+      return 1;
+    }
   }
 
   // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.

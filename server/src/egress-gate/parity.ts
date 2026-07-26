@@ -33,6 +33,14 @@ export interface GatePolicyParityInput {
   manifestRules: readonly AllowlistRule[];
   /** The pf anchor rule text (as loaded / about to be loaded). */
   pfAnchorText: string;
+  /**
+   * Exclusive routing (Slice 5 S5-4): the manifest was composed with the
+   * gate-channel rule scoped to the agent principal
+   * (`scope.uids = [agent_uid]`). The parity expectation derives the SAME
+   * form; a manifest whose gate rule carries the wrong scope for the
+   * composition mode is drift. Default false (legacy empty scope).
+   */
+  gateRuleScopedToAgentUid?: boolean;
 }
 
 /**
@@ -65,7 +73,9 @@ export function checkGatePolicyParity(input: GatePolicyParityInput): string[] {
     );
   } else {
     const found = gateRules[0]!;
-    const expected = deriveGateAllowRule(policy, found.created_at);
+    const expected = deriveGateAllowRule(policy, found.created_at, {
+      scope_to_agent_uid: input.gateRuleScopedToAgentUid === true,
+    });
     if (JSON.stringify(normalizeRule(found)) !== JSON.stringify(normalizeRule(expected))) {
       issues.push(
         `manifest gate rule diverges from the single-source derivation for ` +

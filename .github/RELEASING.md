@@ -34,3 +34,48 @@ Release-critical dependency updates are intentional release inputs, not incident
 ## Rollback
 
 If a published version needs to be pulled, use `npm dist-tag rm` or `npm deprecate` from a trusted maintainer shell. The workflow does not handle unpublish.
+
+## Castle Wall macOS signed release
+
+Publishing the npm package does NOT ship the enforcement surface. The wall is enforced by the signed macOS app and its system extension, built by the separate `Castle Wall macOS Release Build` workflow (`.github/workflows/castle-wall-macos-release.yml`). An npm release without a corresponding signed macOS build ships the cooperative surface only.
+
+Its first run (2026-06-16) failed at "Import signing certificate" because none of the five Apple credentials below had ever been added to the repository. The error surfaced as an opaque Keychain parameter fault; a preflight step now names the missing inputs directly.
+
+The second run (2026-07-25) got through preflight, certificate import and signing, and exposed two further defects that only a real run could surface:
+
+- `build-signed.sh --wrapped` refuses to finish when it has assembled a `.systemextension` and `NOTARYTOOL_PROFILE` is unset, because a signed-but-unnotarized system extension is silently uninstalled by Tahoe `sysextd` at validation (drill 2026-06-11c, finding W6-N1). This job holds the raw Apple ID and app-specific password rather than a stored notarytool profile, and notarizes in its own step, so it now passes `--allow-unnotarized` to mean "this step is not the notarizing step". **That flag is only safe on a path where a mandatory notarization follows.**
+- The uploaded artifact was a zip taken **before** `stapler staple`, so Apple held the ticket while the shipped bundle did not carry it. Such a bundle passes `spctl` on a networked machine and fails Gatekeeper offline. The submission zip is now transient, the artifact zip is produced from the stapled bundle, and `stapler validate` proves the ticket is attached (`spctl` alone cannot, since it can satisfy itself with an online lookup).
+
+### Required repository secrets
+
+All five are required. The job now fails closed and lists every one that is absent.
+
+| Secret | What it holds |
+|---|---|
+| `APPLE_DEVELOPER_ID_P12` | Base64 of the exported Developer ID Application `.p12` |
+| `APPLE_DEVELOPER_ID_P12_PASSWORD` | The password chosen when exporting that `.p12` |
+| `APPLE_NOTARY_APPLE_ID` | Apple ID used for `notarytool` submission |
+| `APPLE_NOTARY_PASSWORD` | App-specific password for that Apple ID, not the account password |
+| `APPLE_TEAM_ID` | Developer Team ID, which must match the team in `SIGNING_IDENTITY` |
+
+### Export procedure
+
+Run on a machine whose login keychain already holds the Developer ID Application identity. Confirm it is present first:
+
+```
+security find-identity -v -p codesigning
+```
+
+Expect a line naming `Developer ID Application`. If none appears, the certificate must be created or installed from the Apple Developer account before continuing.
+
+1. In Keychain Access, select the `Developer ID Application` certificate together with its private key, right click, Export 2 items, and save as `.p12`. Choose a strong export password; that password is the value of `APPLE_DEVELOPER_ID_P12_PASSWORD`.
+2. Base64-encode it as a single line: `base64 -i cert.p12 | tr -d '\n' | pbcopy`.
+3. Add each secret at Settings, Secrets and variables, Actions. Paste the clipboard contents as `APPLE_DEVELOPER_ID_P12`.
+4. Generate the app-specific password at appleid.apple.com, Sign-In and Security, App-Specific Passwords. It is used for notarization only.
+5. Delete the local `.p12` once the secrets are set: `rm -P cert.p12`.
+
+The exported `.p12` contains the signing private key. Do not commit it, do not place it in the repository tree, and do not paste it into an issue, a pull request, or a chat transcript.
+
+### Verifying
+
+Dispatch the workflow with a version tag. The preflight reports either which credentials are missing or that all five are present and the `.p12` parses. A wrong export password is deliberately not distinguished by the preflight and will fail at the import step instead, so that a public log cannot be used to probe the password.

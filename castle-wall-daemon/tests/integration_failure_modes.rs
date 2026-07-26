@@ -127,6 +127,8 @@ fn write_signed_manifest_one_rule(policy_dir: &Path, signing: &SigningKey) {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
+        agent_origin: None,
+        operator_baseline: None,
         rules: vec![
             ManifestRuleEntry {
                 rule_id: "rule-allow-example".to_string(),
@@ -164,6 +166,8 @@ fn write_bad_signature_manifest(policy_dir: &Path, signing: &SigningKey) {
         schema_version: 1,
         fortress_id: "deadbeef".to_string(),
         issued_at: "2026-05-06T00:00:00Z".to_string(),
+        agent_origin: None,
+        operator_baseline: None,
         rules: vec![ManifestRuleEntry {
             rule_id: "rule-0".to_string(),
             file: "rule-0.json".to_string(),

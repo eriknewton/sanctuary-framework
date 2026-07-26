@@ -5,7 +5,7 @@
  * pre-change origin/main) and the read-back TEST
  * (test/security/at-rest-decrypt-fixtures.test.ts). This module carries ONLY the
  * synthetic key + per-store WRITE closures + namespace metadata, and is
- * deliberately FREE of any `vitest` import so the generator (a plain vite-node
+ * deliberately FREE of any `vitest` import so the generator (a plain tsx
  * script) can import it without pulling in the vitest runner. The READ + assert
  * logic lives in the test file (it uses `expect`).
  *

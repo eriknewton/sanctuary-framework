@@ -12,7 +12,9 @@ import {
   GenerationStateError,
   bindEphemeralGatePort,
   computeNextGenerationId,
+  createFsGenerationStagingStore,
   evaluateGenerationMatch,
+  parseGenerationStagingRecord,
   resolveCommittedGeneration,
   resolveGateRestart,
   type CommittedGeneration,
@@ -101,6 +103,8 @@ function makeHarness(opts: {
   ownerHolds?: boolean;
   failAt?: "bind" | "owner" | "arm" | "manifest";
   tombstoneThrows?: boolean;
+  /** The registry's persisted generation floor (fix-round-5 P1); omitted === no adapter method. */
+  generationFloor?: number;
 } = {}): Harness {
   const staging = memStaging();
   const reg = memRegistry(opts.registryInitial ?? []);
@@ -139,6 +143,9 @@ function makeHarness(opts: {
         await reg.ops.tombstone(uid, fallback);
       },
       readEntry: reg.ops.readEntry,
+      ...(opts.generationFloor !== undefined
+        ? { readGenerationFloor: async () => opts.generationFloor }
+        : {}),
     },
     async publishManifest(gen) {
       if (opts.failAt === "manifest") throw new Error("manifest failed");
@@ -178,6 +185,19 @@ describe("egress-gate/generation bringUp (G1-G5 happy path)", () => {
     const h = makeHarness({ registryInitial: [{ agent_uid: 502, gate_port: 111, generation_id: 8 }] });
     const committed = await h.coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" });
     expect(committed.generation_id).toBe(9);
+  });
+
+  it("allocates ABOVE the registry's persisted generation floor (fix-round-5 P1: a repair-discarded id is never reused)", async () => {
+    // The quarantine repair discarded a valid gen-8 duplicate beside this kept
+    // gen-7 entry and recorded 8 in the floor. Pre-fix, bring-up recomputed
+    // from the kept entry alone and reallocated 8.
+    const h = makeHarness({
+      registryInitial: [{ agent_uid: 502, gate_port: 19998, generation_id: 7 }],
+      generationFloor: 8,
+    });
+    const committed = await h.coord.bringUp({ agent_uid: 502, fortress_path: "/f/a" });
+    expect(committed.generation_id).toBe(9);
+    expect(h.manifestPublished[0]?.generation_id).toBe(9);
   });
 
   it("refuses to start when a staging record already exists (recover first)", async () => {
@@ -275,14 +295,70 @@ describe("egress-gate/generation recover (crash-recovery table)", () => {
     expect(out.action).toBe("tombstoned");
     expect(h.reg.tombstoneCalls.map((c) => c.uid)).toEqual([502]);
   });
+
+  it("fix-round H4 pin: recover NEVER reaches publishManifest on ANY path (the repair wiring's injected always-throwing publishManifest stays safe)", async () => {
+    // The repair ops (`createRepairExclusiveEgressOps`) wire recover() with a
+    // publishManifest that unconditionally throws. This pin proves recover's
+    // tombstone path for pf_loaded/manifest_reloaded staging records (and the
+    // discard/none paths) never invokes it: with failAt:"manifest" a single
+    // publishManifest call would reject the whole recover().
+    for (const phase of ["pf_loaded", "manifest_reloaded"] as const) {
+      const h = makeHarness({ failAt: "manifest" });
+      await h.staging.save({
+        generation_id: 3, agent_uid: 502, gate_port: 45001, gate_pid: 9001, gate_pid_start: "start-9001", fortress_path: "/f/a", phase,
+      });
+      const out = await h.coord.recover(502);
+      expect(out.action).toBe("tombstoned");
+      expect(h.events).not.toContain("manifest");
+      expect(h.manifestPublished).toHaveLength(0);
+    }
+    const discarded = makeHarness({ failAt: "manifest" });
+    await discarded.staging.save({
+      generation_id: 3, agent_uid: 502, gate_port: 45001, gate_pid: 9001, gate_pid_start: "start-9001", fortress_path: "/f/a", phase: "owner_checked",
+    });
+    expect((await discarded.coord.recover(502)).action).toBe("discarded");
+    const none = makeHarness({ failAt: "manifest" });
+    expect((await none.coord.recover(502)).action).toBe("none");
+  });
 });
 
 describe("egress-gate/generation pure helpers", () => {
-  it("computeNextGenerationId is strictly-greater over committed + staging", () => {
+  it("computeNextGenerationId is strictly-greater over committed + staging + floor", () => {
     expect(computeNextGenerationId(undefined, undefined)).toBe(1);
     expect(computeNextGenerationId(5, undefined)).toBe(6);
     expect(computeNextGenerationId(5, 9)).toBe(10);
     expect(computeNextGenerationId(9, 5)).toBe(10);
+    // Fix-round-5 P1: the registry's persisted floor (a repair-discarded
+    // generation) also bounds the next allocation.
+    expect(computeNextGenerationId(7, undefined, 8)).toBe(9);
+    expect(computeNextGenerationId(9, undefined, 3)).toBe(10);
+    expect(computeNextGenerationId(undefined, undefined, 4)).toBe(5);
+  });
+
+  it("computeNextGenerationId REFUSES to allocate without safe headroom (fix-round-8): a colliding id must never be returned", () => {
+    // Pre-fix: 2^53 + 1 === 2^53, so the allocator RETURNED the same id it
+    // was supposed to exceed -- a silent generation collision.
+    expect(() => computeNextGenerationId(Number.MAX_SAFE_INTEGER, undefined)).toThrow(
+      /no safe headroom/,
+    );
+    expect(() => computeNextGenerationId(9007199254740992, undefined)).toThrow(
+      /no safe headroom/,
+    );
+    expect(() =>
+      computeNextGenerationId(undefined, undefined, Number.MAX_SAFE_INTEGER),
+    ).toThrow(/no safe headroom/);
+    // Post-#959 LOW follow-up: the allocator now enforces the SAME
+    // `hasGenerationHeadroom` bound as the registry boundary, so an
+    // allocation landing exactly AT 2^53-1 -- itself a safe integer, but
+    // headroom-less (the registry would reject it on the next load) -- is
+    // refused HERE rather than committed and rejected later.
+    expect(() => computeNextGenerationId(Number.MAX_SAFE_INTEGER - 1, undefined)).toThrow(
+      /no safe headroom/,
+    );
+    // The last allocation WITH headroom is still served.
+    expect(computeNextGenerationId(Number.MAX_SAFE_INTEGER - 2, undefined)).toBe(
+      Number.MAX_SAFE_INTEGER - 1,
+    );
   });
 
   it("evaluateGenerationMatch serves ONLY when all three surfaces agree", () => {
@@ -345,6 +421,96 @@ describe("egress-gate/generation pure helpers", () => {
       resolveCommittedGeneration({ entry: { gate_port: 45001, generation_id: 3 }, stagingRecordPresent: false, registryDirty: true }).committedGenerationId,
     ).toBeUndefined();
     expect(resolveCommittedGeneration({ entry: null, stagingRecordPresent: false }).committedGenerationId).toBeUndefined();
+  });
+});
+
+describe("egress-gate/generation staging-record shape validation", () => {
+  const valid: GenerationStagingRecord = {
+    generation_id: 3,
+    agent_uid: 502,
+    gate_port: 45001,
+    gate_pid: 1234,
+    gate_pid_start: "starttime-abc",
+    fortress_path: "/f/a",
+    phase: "pf_loaded",
+  };
+  const path = "/var/db/sanctuary/generation-staging-502.json";
+
+  it("accepts a valid record round-tripped through JSON", () => {
+    expect(parseGenerationStagingRecord(JSON.stringify(valid), path)).toEqual(valid);
+  });
+
+  it("rejects non-JSON text, naming the staging path", () => {
+    expect(() => parseGenerationStagingRecord("not json{", path)).toThrow(GenerationStateError);
+    expect(() => parseGenerationStagingRecord("not json{", path)).toThrow(/generation-staging-502\.json/);
+  });
+
+  it("rejects a non-object payload (array, string, null)", () => {
+    for (const text of ["[]", '"str"', "null", "42"]) {
+      expect(() => parseGenerationStagingRecord(text, path)).toThrow(GenerationStateError);
+    }
+  });
+
+  it("rejects a record with a missing required field, naming the field and path", () => {
+    for (const field of Object.keys(valid)) {
+      const broken: Record<string, unknown> = { ...valid };
+      delete broken[field];
+      expect(() => parseGenerationStagingRecord(JSON.stringify(broken), path)).toThrow(
+        new RegExp(`${field}.*generation-staging-502|generation-staging-502.*${field}`),
+      );
+    }
+  });
+
+  it("rejects wrong-typed fields (string port, numeric fortress_path, unknown phase, non-integer id)", () => {
+    const cases: Array<Record<string, unknown>> = [
+      { ...valid, gate_port: "45001" },
+      { ...valid, fortress_path: 7 },
+      { ...valid, fortress_path: "" },
+      { ...valid, phase: "committed" },
+      { ...valid, generation_id: 1.5 },
+      { ...valid, gate_pid_start: 99 },
+    ];
+    for (const broken of cases) {
+      expect(() => parseGenerationStagingRecord(JSON.stringify(broken), path)).toThrow(GenerationStateError);
+    }
+  });
+
+  it("rejects semantically invalid numerics (zero/negative ids and pids, out-of-range port)", () => {
+    const cases: Array<Record<string, unknown>> = [
+      { ...valid, generation_id: 0 },
+      { ...valid, agent_uid: 0 },
+      { ...valid, agent_uid: -502 },
+      { ...valid, gate_port: 0 },
+      { ...valid, gate_port: 65536 },
+      { ...valid, gate_pid: 0 },
+      { ...valid, gate_pid: -1 },
+    ];
+    for (const broken of cases) {
+      expect(() => parseGenerationStagingRecord(JSON.stringify(broken), path)).toThrow(GenerationStateError);
+    }
+  });
+
+  // Wiring test: the validator must be load-bearing THROUGH the FS store's
+  // load(), not only when called directly (reverting the load() wiring line
+  // must fail this test).
+  it("createFsGenerationStagingStore.load routes through the validator (malformed file fails closed, valid file loads)", async () => {
+    const { mkdtemp, writeFile: wf, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = await mkdtemp(join(tmpdir(), "gen-staging-test-"));
+    try {
+      const store = createFsGenerationStagingStore(dir);
+      await wf(join(dir, "generation-staging-502.json"), JSON.stringify({ ...valid, gate_port: "45001" }));
+      await expect(store.load(502)).rejects.toThrow(GenerationStateError);
+      await wf(join(dir, "generation-staging-502.json"), JSON.stringify(valid));
+      await expect(store.load(502)).resolves.toEqual(valid);
+      expect(await store.load(999)).toBeNull(); // ENOENT path unchanged
+      // Cross-uid mismatch: a file embedding uid 502 must never drive uid 777's recovery.
+      await wf(join(dir, "generation-staging-777.json"), JSON.stringify(valid));
+      await expect(store.load(777)).rejects.toThrow(/agent_uid 502.*loaded for uid 777/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

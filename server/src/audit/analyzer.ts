@@ -106,7 +106,16 @@ const INCIDENT_CONTEXT_LEAKAGE: IncidentClass = {
     "to remote LLM providers on every inference call with no filtering mechanism.",
 };
 
-/** Exported for use in custom gap analysis extensions. */
+/**
+ * Wired as the incident precedent for the BINARY approval-gate gap (GAP-L2-001,
+ * binary variant). A binary, in-harness "requireApproval" hook is exactly the
+ * kind of safety that this incident defeated: the "always ask before acting"
+ * instruction lived in the agent's mutable context, context compaction stripped
+ * it, and the agent then deleted the inbox autonomously. Sanctuary's fix is a
+ * three-tier Principal Policy gate loaded once at startup and frozen OUT of the
+ * agent's context (AGENTS.md must-never #7), so a compaction can never strip the
+ * gate. Also exported for custom gap-analysis extensions.
+ */
 export const INCIDENT_META_INBOX: IncidentClass = {
   id: "META-INBOX-2026",
   name: "Meta inbox deletion: Safety instructions stripped by context compaction",
@@ -647,7 +656,10 @@ function generateGaps(
         "Sanctuary's three-tier Principal Policy gate auto-allows routine operations (Tier 3), " +
         "escalates anomalous behavior (Tier 2), and always requires human approval for " +
         "irreversible operations (Tier 1). Use sanctuary/principal_policy_view to inspect.",
-      incident_class: INCIDENT_META_SEV1,
+      // A binary in-harness gate is precisely what META-INBOX defeated: the
+      // "always ask" instruction lived in-context and was stripped by
+      // compaction. Sanctuary's frozen, out-of-context gate is the fix.
+      incident_class: INCIDENT_META_INBOX,
     });
   } else if (operational.approval_gate === "none") {
     gaps.push({

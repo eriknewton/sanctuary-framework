@@ -4,7 +4,9 @@
  * Slice 1 (#516) left a green-while-dead gap: a wall that silently dies (process
  * killed, sysext unbound) in a QUIET window read `unknown`/no_evidence, because
  * nothing emitted liveness in quiet windows. Slice 2 adds a periodic,
- * producer-signed `castle_wall_heartbeat` and the reader logic that turns a
+ * channel-basis `castle_wall_heartbeat` (the real producer emits it as a DIRECT,
+ * unsigned audit append with only the `cw_source` marker — see the
+ * `appendChannelHeartbeat` fixture below) and the reader logic that turns a
  * MISSING heartbeat into an honest `dead_no_heartbeat`/`fault` alarm while a
  * FRESH heartbeat reports the honest alive-but-idle `unknown`.
  *
@@ -12,9 +14,12 @@
  * are pinned hard:
  *
  *   1. A heartbeat is NOT enforcement evidence; it NEVER earns active/green.
- *   2. The heartbeat is gated by the SAME producer-signature re-verify path as
- *      `egress_blocked` — a FORGED heartbeat (right op + cw_source marker but
- *      bad/missing producer signature) must NOT count on a key-bearing host.
+ *   2. The real producer's beat is channel-basis (marker only, NO producer
+ *      signature), so a GENUINE beat counts even on a key-bearing host — the
+ *      liveness gate is deliberately LOOSER than the enforcement-evidence
+ *      signature gate `egress_blocked` uses. What IS dropped on a key-bearing
+ *      host is a FORGED beat that CLAIMS `producer_signed` with a bad/missing
+ *      signature; a genuine unsigned beat is not.
  *   3. Fault precedence is unchanged: a fresh fault still beats a fresh
  *      heartbeat.
  *   4. A tainted/integrity-failed read still fails closed to `unknown`.
@@ -51,9 +56,12 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY,
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
   CASTLE_WALL_PRODUCER_SIG_KEY_ID_V1,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY,
+  CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
 } from "../../src/castle-wall/constants.js";
 
 const FORTRESS = "fortress:test";
+const SUBJECT = `${FORTRESS}/uid-503`;
 const NOW = 1_750_000_000_000;
 // Safely inside the 10-minute freshness window AND the 5-minute sig age.
 const FRESH_TS = NOW - 1000;
@@ -92,7 +100,7 @@ function heartbeatWalBody(): string {
 }
 
 /**
- * A GENUINE daemon-signed heartbeat, persisted the way the consumer would after
+ * A valid producer-signed heartbeat, persisted the way the consumer would after
  * verifying: provenance marker + basis=producer_signed + the real signature +
  * the R-1 re-verification inputs. `tsMs` is both the top-level timestamp and the
  * signature-bound captured_at, so the signed time is what the reader judges.
@@ -117,6 +125,8 @@ async function appendGenuineHeartbeat(
       [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: tsMs,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -128,15 +138,15 @@ async function appendGenuineBlock(log: AuditLog, tsMs: number, seq: number): Pro
     timestamp: new Date(tsMs).toISOString(),
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "blocked",
-    details: { agent_id: "agent-1", dest_host: "evil.example" },
+    details: { agent_id: SUBJECT, dest_host: "evil.example" },
   });
   const sig = ed25519.sign(producerSigningBytes(canonical, tsMs, seq), daemonPriv);
   await log.appendCritical({
     layer: "l1",
     operation: "egress_blocked",
-    identity_id: FORTRESS,
+    identity_id: SUBJECT,
     result: "success",
     timestamp: new Date(tsMs).toISOString(),
     details: {
@@ -146,6 +156,8 @@ async function appendGenuineBlock(log: AuditLog, tsMs: number, seq: number): Pro
       [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: tsMs,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -167,6 +179,8 @@ async function appendForgedHeartbeat(
     [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
     [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: FRESH_TS,
     [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+    [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+      CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
     [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
   };
   if (variant === "garbage_sig") {
@@ -205,7 +219,7 @@ async function appendChannelHeartbeat(log: AuditLog, tsMs: number): Promise<void
 }
 
 /**
- * A RELABEL attack: a GENUINE daemon-signed heartbeat (the signature is over a
+ * A RELABEL attack: a valid producer-signed heartbeat (the signature is over a
  * `castle_wall_heartbeat` body) re-appended with its TOP-LEVEL operation forged
  * to `egress_blocked`. The signature re-verifies (the canonical body is genuine),
  * but the signed body attests only to LIVENESS, not adjudication. A reader that
@@ -234,6 +248,8 @@ async function appendSignedHeartbeatRelabeledAsBlock(
       [CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY]: canonical,
       [CASTLE_WALL_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY]: tsMs,
       [CASTLE_WALL_EVIDENCE_BASIS_DETAIL_KEY]: CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
+      [CASTLE_WALL_PRODUCER_SUBJECT_BINDING_DETAIL_KEY]:
+        CASTLE_WALL_PRODUCER_SUBJECT_BINDING_SIGNED_IDENTITY_ID,
       [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
     },
   });
@@ -267,6 +283,7 @@ describe("Slice 2 — fresh heartbeat alone is alive-but-idle, NEVER green (inva
     const log = newLog();
     await appendChannelHeartbeat(log, FRESH_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -283,6 +300,7 @@ describe("Slice 2 — fresh heartbeat alone is alive-but-idle, NEVER green (inva
     const log = newLog();
     await appendGenuineHeartbeat(log, FRESH_TS, 1);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -301,6 +319,7 @@ describe("Slice 2 — silent death: a missing heartbeat is a fault, not unknown"
     // The producer was provably running earlier (a stale beat exists), then stopped.
     await appendChannelHeartbeat(log, STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -315,6 +334,7 @@ describe("Slice 2 — silent death: a missing heartbeat is a fault, not unknown"
     await appendGenuineBlock(log, STALE_TS, 1); // adjudicated 30 min ago
     await appendGenuineHeartbeat(log, STALE_TS + 1000, 2); // last beat ~30 min ago
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -328,6 +348,7 @@ describe("Slice 2 — silent death: a missing heartbeat is a fault, not unknown"
   it("NEVER-installed wall (no evidence, no heartbeat ever) stays unknown — no fabricated silent-death alarm", async () => {
     const log = newLog();
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -345,12 +366,13 @@ describe("Slice 2 — silent death: a missing heartbeat is a fault, not unknown"
     await log.appendCritical({
       layer: "l1",
       operation: "egress_blocked",
-      identity_id: FORTRESS,
+      identity_id: SUBJECT,
       result: "success",
       timestamp: new Date(STALE_TS).toISOString(),
       details: { [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE },
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -375,6 +397,7 @@ describe("Slice 2 — fault precedence is unchanged: a fresh fault beats a fresh
       details: {},
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -391,6 +414,7 @@ describe("Slice 2 — fresh enforcement evidence is still green; a beat does not
     await appendGenuineBlock(log, FRESH_TS, 1);
     await appendGenuineHeartbeat(log, FRESH_TS, 2);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -413,6 +437,7 @@ describe("Slice 2 — FORGED heartbeat does not count (invariant 2; the load-bea
       await appendGenuineHeartbeat(log, STALE_TS, 1);
       await appendForgedHeartbeat(log, variant);
       const panel = await buildFeatureHealthPanel({
+        protectionClaimSubject: SUBJECT,
         auditLog: log,
         originMachine: FORTRESS,
         now: NOW,
@@ -430,6 +455,7 @@ describe("Slice 2 — FORGED heartbeat does not count (invariant 2; the load-bea
       const log = newLog();
       await appendForgedHeartbeat(log, variant);
       const panel = await buildFeatureHealthPanel({
+        protectionClaimSubject: SUBJECT,
         auditLog: log,
         originMachine: FORTRESS,
         now: NOW,
@@ -452,6 +478,7 @@ describe("Slice 2 — freshness/skew: a future-dated or stale heartbeat is not f
     // 10 minutes in the future — well beyond the 60s ENFORCEMENT_FUTURE_SKEW_MS.
     await appendChannelHeartbeat(log, NOW + 10 * 60_000);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -467,6 +494,7 @@ describe("Slice 2 — freshness/skew: a future-dated or stale heartbeat is not f
     const log = newLog();
     await appendChannelHeartbeat(log, STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -490,6 +518,7 @@ describe("Slice 2 — the GENUINE channel-basis beat (real producer shape) drive
     const log = newLog();
     await appendChannelHeartbeat(log, FRESH_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -507,6 +536,7 @@ describe("Slice 2 — the GENUINE channel-basis beat (real producer shape) drive
     // The real producer beat the channel basis earlier, then the daemon died.
     await appendChannelHeartbeat(log, STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -525,6 +555,7 @@ describe("Slice 2 — the GENUINE channel-basis beat (real producer shape) drive
     await appendGenuineBlock(log, FRESH_TS, 1);
     await appendChannelHeartbeat(log, FRESH_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -543,6 +574,7 @@ describe("Slice 2 — signed-operation binding: a verified signature over a HEAR
     const log = newLog();
     await appendSignedHeartbeatRelabeledAsBlock(log, FRESH_TS, 1);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -568,6 +600,7 @@ describe("Slice 2 — signed-operation binding: a verified signature over a HEAR
     await appendGenuineHeartbeat(log, STALE_TS, 1);
     await appendSignedHeartbeatRelabeledAsBlock(log, FRESH_TS, 2);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -593,6 +626,7 @@ describe("Slice 2 — a tainted read still fails closed to unknown (invariant 4)
     // invariant (integrityOk=false for every row): a fresh heartbeat must NOT
     // launder a tainted read into an alive-idle reading.
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: SUBJECT,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,

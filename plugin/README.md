@@ -1,20 +1,20 @@
 # Sanctuary Framework Plugin
 
-Sovereignty infrastructure for the agentic economy, as a Cowork/Claude Code plugin.
+The firewall and control panel for your AI agents, as a Cowork/Claude Code plugin.
 
 ## What it does
 
-Gives your agent encrypted state storage, self-custodied cryptographic identity, selective disclosure with zero-knowledge proofs, portable reputation, sovereignty verification, and a sovereignty audit tool that detects gaps in your current setup.
+Gives your agent encrypted state storage, self-custodied cryptographic identity, selective disclosure with zero-knowledge proofs, portable reputation, and an audit tool that finds security and privacy gaps in your current setup.
 
 ## Featured tools
 
-- **`sanctuary/sovereignty_audit`**: Audit your sovereignty posture. Scores your environment (0-100) across four layers, detects OpenClaw configurations, identifies gaps, and provides prioritized recommendations.
+- **`sanctuary/sovereignty_audit`**: Audit your protection posture. Scores your environment (0-100) across the named layers, detects OpenClaw configurations, identifies gaps, and provides prioritized recommendations.
 - **`sanctuary/identity_create`**: Establish a cryptographic Ed25519 identity for signing and verification.
 - **`sanctuary/shr_generate`**: Generate a signed Sovereignty Health Report to prove your capabilities to counterparties.
 - **`sanctuary/state_write` / `state_read`**: Encrypted state storage with AES-256-GCM and Merkle integrity.
 - **`sanctuary/zk_commit` / `zk_prove`**: Pedersen commitments and Schnorr zero-knowledge proofs.
 - **`sanctuary/reputation_record`**: Build portable, signed reputation attestations.
-- **`sanctuary/handshake_initiate`**: Sovereignty handshake protocol for mutual verification.
+- **`sanctuary/handshake_initiate`**: Handshake protocol for mutual verification between agents.
 - **`sanctuary/context_gate_filter`**: Filter agent context before sending to LLM providers, redacting secrets, PII, and internal state.
 
 ## Installation
@@ -51,7 +51,7 @@ Then run `sanctuary/sovereignty_audit` to see what Sanctuary adds on top of your
 
 ## Tools provided
 
-54 MCP tools across four sovereignty layers, sovereignty audit, context gating, L2 hardening, gateway export, federation, Concordia bridge, and system tools. See the skill documentation for the complete list.
+90+ MCP tools across the named layers (Cognitive, Operational, Selective Disclosure, Verifiable Reputation), plus the audit tool, context gating, operational hardening, gateway export, federation, the Concordia bridge, and system tools. See the skill documentation for the featured workflows.
 
 ## License
 

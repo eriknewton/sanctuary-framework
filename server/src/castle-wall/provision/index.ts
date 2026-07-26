@@ -15,15 +15,30 @@ export { detectProvisionNeed } from "./detect.js";
 
 export {
   SAFE_SERVICE_ACCOUNT_RE,
+  AccountUidEnumerationError,
+  AccountProvisionVerificationError,
+  EXPECTED_SERVICE_ACCOUNT_IS_HIDDEN,
+  EXPECTED_SERVICE_ACCOUNT_SHELL,
+  describeServiceAccountRecord,
   deriveAgentAccountName,
+  parseServiceAccountIsHidden,
+  parseDsclOutputWithNoUnparsedResidue,
   planAccountCreate,
   executeAccountProvisionPlan,
+  lookupAccountRecordAfterCreate,
+  parseHighestAssignedUidFromDsclList,
   planAndCreateAccount,
+  rollbackCreatedServiceAccount,
+  serviceAccountConflictGuidance,
+  serviceAccountRepairGuidance,
+  serviceAccountRecordProblems,
 } from "./account.js";
 export type {
   AccountProvisionOptions,
   AccountProvisionOps,
   AccountProvisionPlan,
+  AccountProvisionRollbackResult,
+  ServiceAccountRecord,
 } from "./account.js";
 
 export { checkUidExistenceBeforeArm } from "./uid-gate.js";
@@ -60,7 +75,7 @@ export type {
   ConnectivityVerifyResult,
 } from "./verify.js";
 
-export { withProvisionLock, ProvisionLockHeldError } from "./lockfile.js";
+export { withProvisionLock, ProvisionLockHeldError, PROVISION_LOCK_PATH } from "./lockfile.js";
 export type { ProvisionLockOps } from "./lockfile.js";
 
 export { unprovision, unprovisionFullyOk } from "./unprovision.js";
@@ -70,11 +85,12 @@ export type {
   UnprovisionStepOutcome,
 } from "./unprovision.js";
 
-export { resolveHermesGatewayArgv } from "./harness-argv.js";
-export type { HarnessArgvOps, ResolvedHarnessArgv } from "./harness-argv.js";
+export { resolveHermesGatewayArgv, realHarnessArgvOps } from "./harness-argv.js";
+export type { HarnessArgvOps, InterpreterVersion, ResolvedHarnessArgv } from "./harness-argv.js";
 
 export { runProvisionFlow } from "./orchestrate.js";
 export type {
+  DisarmNePreferenceOutcome,
   ProvisionFlowContext,
   ProvisionFlowOps,
   ProvisionFlowOutcome,
@@ -101,6 +117,8 @@ export {
   readEgressRulesFromDisk,
   publishProvisionedEgressRules,
   scrubProvisionedEgressRules,
+  snapshotProvisionedEgressRules,
+  restoreProvisionedEgressRules,
   buildAgentEgressProbeSpecs,
   buildAgentEgressReport,
   asUidTlsProbeArgv,
@@ -117,7 +135,42 @@ export type {
   PublishProvisionedEgressResult,
   ScrubProvisionedEgressInput,
   ScrubProvisionedEgressResult,
+  ProvisionedEgressRuleFile,
+  RestoreProvisionedEgressInput,
+  RestoreProvisionedEgressResult,
   AgentEgressProbeSpec,
   AgentEgressProbeRow,
   AgentEgressVerifyReport,
 } from "./egress.js";
+
+// Unified Protect Slice 5 S5-6: the exclusive-egress arming stage + repair +
+// boot release drivers.
+export {
+  EXCLUSIVE_EGRESS_ARMED_AUDIT_OP,
+  EXCLUSIVE_EGRESS_DEGRADED_AUDIT_OP,
+  EGRESS_GATE_REPAIR_AUDIT_OP,
+  EGRESS_GATE_REPAIR_OVERRIDE_AUDIT_OP,
+  EGRESS_GATE_REPAIR_REFUSED_AUDIT_OP,
+  runExclusiveEgressArming,
+  runEgressGateRepair,
+  runBootExclusiveEgressRelease,
+  type BootReleaseAgent,
+  type BootReleaseResult,
+  type EgressGateRepairContext,
+  type EgressGateRepairOps,
+  type EgressGateRepairOutcome,
+  type ExclusiveEgressArmOps,
+  type ExclusiveEgressArmOutcome,
+  type ExclusiveGenerationIdentity,
+} from "./exclusive-arm.js";
+
+// Unified Protect Slice 5 S5-7: the per-agent unprotect-via-registry driver.
+export {
+  EGRESS_GATE_UNPROTECT_AUDIT_OP,
+  EGRESS_GATE_UNPROTECT_FAILED_AUDIT_OP,
+  runEgressGateUnprotect,
+  type EgressGateUnprotectContext,
+  type EgressGateUnprotectOps,
+  type EgressGateUnprotectOutcome,
+  type EgressGateUnprotectStage,
+} from "./exclusive-unprotect.js";

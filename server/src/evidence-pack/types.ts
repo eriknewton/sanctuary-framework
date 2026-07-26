@@ -5,12 +5,14 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Shared types for the quarterly law-firm evidence pack (slice 1, the
- * walking skeleton). The evidence pack is a signed, human-readable PDF an
- * office manager attaches to an insurance renewal or an outside-counsel
- * audit. It reuses the shipped tamper-evident audit log, the zero-dependency
- * PDF writer, and the signed-manifest bundle pattern; the NEW code here is the
- * calendar-quarter aggregation layer plus honest coverage/shortfall
- * disclosure.
+ * walking skeleton). The evidence pack is a human-readable PDF plus a signed
+ * Markdown report and a signed manifest, which an office manager attaches to an
+ * insurance renewal or an outside-counsel audit. Integrity lives in the signed
+ * Markdown + manifest; the PDF itself is a render and is deliberately NOT
+ * signed (see the CLI help and section 10). It reuses the shipped tamper-evident
+ * audit log, the zero-dependency PDF writer, and the signed-manifest bundle
+ * pattern; the NEW code here is the calendar-quarter aggregation layer plus
+ * honest coverage/shortfall disclosure.
  *
  * NOT LEGAL ADVICE. This defines the shape of a technical evidence artifact.
  * It is not a legal interpretation of any professional-responsibility rule,
@@ -18,6 +20,38 @@
  */
 
 import type { ReadOutcome } from "./read-outcome.js";
+
+/**
+ * D9C-3 / D8-1: the SHARED "usable figure" honesty predicate for a retained
+ * COUNT or SIZE. A figure may drive a definitive verdict (a cap comparison, a
+ * signed census count) ONLY when it is a NON-NEGATIVE SAFE INTEGER.
+ * `Number.isSafeInteger` rejects `NaN`, `Infinity`, non-integers, and every
+ * value outside 2^53-1 (past which JS silently ROUNDS) in one predicate; the
+ * explicit `>= 0` bans the negative sentinel (a count of things cannot be
+ * negative). Centralised here so every count/size ingress -- the at-cap
+ * comparison in `aggregate.ts` AND the daemon-census prose in `sections.ts`
+ * (P2, Dry-9) -- routes through ONE chokepoint: a corrupt or unrepresentable
+ * figure is NOT DETERMINABLE, never a definitive verdict or an impossible
+ * signed count.
+ */
+export const isUsableFigure = (v: unknown): v is number =>
+  typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+/**
+ * D8-2 (Dry-9): the SHARED "usable timestamp" honesty predicate, the time-
+ * dimension mirror of {@link isUsableFigure}. An attestation-bearing timestamp
+ * (the earliest-retained instant that drives the start-coverage verdict, the
+ * audit-census cut that bounds the attested window) may anchor a definitive
+ * coverage verdict ONLY when it is a string that parses to a FINITE instant. A
+ * fully type-valid but UNPARSEABLE string NaNs through every numeric comparison;
+ * #954/#958 validated every NUMERIC dimension but left the TIMESTAMP dimension
+ * unguarded, so an unparseable value could sign a definitive full-coverage /
+ * no-shortfall verdict off an instant nobody parsed. Requiring `typeof string`
+ * also rejects an untyped caller's number/object smuggled past the compile-time
+ * `string` annotation.
+ */
+export const isUsableTimestamp = (v: unknown): v is string =>
+  typeof v === "string" && Number.isFinite(new Date(v).getTime());
 
 /**
  * A calendar quarter, e.g. `{ year: 2026, quarter: 3 }` for 2026-Q3 (July,
@@ -49,9 +83,14 @@ export interface QuarterWindow {
 /**
  * Category an audit entry is bucketed into for the human-review and
  * access-log sections. Derived from the entry's `operation` prefix (the
- * `gate_*` families the enforcement gate writes) and, for cross-harness
- * approvals, from the entry `result`. `other` is every operation that is not
- * an enforcement-decision record (identity ops, state writes, heartbeats).
+ * `gate_*` families the enforcement gate writes), refined by the gate's own
+ * `details.decided_by` for the human/automated split. `other` is every
+ * operation that is not a counted enforcement-decision record (identity ops,
+ * state writes, heartbeats) -- including the `cross_harness_approval_resolved`
+ * op, which is deliberately routed to `other` (NOT read from the entry
+ * `result`) because it is a paired OBSERVATION of a decision the gate already
+ * counted; counting it again would double the human-review figure (see
+ * `aggregate.ts`).
  *
  * HUMAN vs AUTOMATED via `details.decided_by` (round-2 N1 fix): the gate writes
  * `decided_by: response.decided_by` on `gate_approve:` and `gate_deny:` (see
@@ -104,8 +143,18 @@ export type DecisionCategory =
  * (FIFO retention), never calendar-based.
  */
 export interface QuarterAggregation {
+  /**
+   * D10-1: the window the counts were ACTUALLY taken over. When the aggregation
+   * comes from `censusOverAttestedWindow` (which is the only way the pack builds
+   * one), `quarter` and `label` are the calendar quarter but the BOUNDS are the
+   * ATTESTED coverage span, which is narrower whenever the census cut or the
+   * generation instant bounds the quarter. Do NOT read these bounds as the
+   * calendar quarter's: use `quarterWindow(input.quarter)` for that. Rendering a
+   * count against the calendar quarter while it was taken over the attested span
+   * is exactly the contradiction round 10 found in a signed report.
+   */
   window: QuarterWindow;
-  /** Total audit entries whose timestamp falls inside the quarter window. */
+  /** Total audit entries whose timestamp falls inside {@link window}. */
   total_in_window: number;
   /** Count per decision category (every category key is present, zero-filled). */
   by_category: Record<DecisionCategory, number>;
@@ -133,9 +182,21 @@ export interface QuarterAggregation {
  * namespace into a separate root-owned `_audit-daemon` store. The evidence pack
  * reads the operator store; this descriptor makes the daemon store's
  * contribution EXPLICIT so the census is never a silent single-store false
- * count. Four honest states:
- *   - `absent`: no daemon store exists (a fresh / never-armed fortress). The
- *     operator store is the whole census.
+ * count. Five honest states:
+ *   - `absent`: no daemon store has ever been provisioned here AND the
+ *     writer-split migration has NOT been established (a genuinely fresh /
+ *     never-armed fortress). The operator store is the whole census. This is
+ *     resolved against the split-established marker, NOT a bare directory
+ *     stat, so a DELETED store is never mislabeled `absent` (see `missing`).
+ *   - `missing` (C1): audit-store writer-split evidence is present (a split
+ *     boundary and/or established marker referencing a daemon chain) but the
+ *     daemon namespace is ABSENT. This is either genuine deletion/renaming of a
+ *     migrated store OR present-but-unverifiable split evidence (the presence
+ *     check is fail-closed on a raw boundary-file stat, so it does not assert
+ *     the migration definitively "ran"); EITHER way it is NOT a never-armed
+ *     fortress. The counts EXCLUDE it and the disclosure hedges accordingly,
+ *     never the futile "re-run as root" (root cannot recreate a missing store).
+ *     Mirrors `verifyFortressAuditFullPicture`'s `missing` verdict.
  *   - `included`: the daemon store was read at this privilege and its entries
  *     were MERGED into the census (its retention counted independently).
  *   - `present_unreadable`: a daemon store EXISTS but could not be read at this
@@ -151,7 +212,12 @@ export interface QuarterAggregation {
  *     "tamper detected, investigate", never the futile "re-run as root".
  */
 export interface DaemonStoreDisclosure {
-  status: "absent" | "included" | "present_unreadable" | "present_tampered";
+  status:
+    | "absent"
+    | "missing"
+    | "included"
+    | "present_unreadable"
+    | "present_tampered";
   /**
    * Daemon-store entries merged into the census (only when `included`). This is
    * the TOTAL retained daemon entries read, across all time -- NOT the subset
@@ -186,6 +252,74 @@ export interface DaemonStoreDisclosure {
   unreadable_reason?: "privilege" | "io";
 }
 
+/**
+ * The SINGLE predicate for "a daemon enforcement store is present on this
+ * fortress but its records are NOT in the census" -- i.e. the counts/coverage
+ * are an operator-store-only view and every definitive-census surface must
+ * disclose that. True for `present_unreadable`, `present_tampered`, and
+ * `missing` (split evidence present but the daemon store absent -- deleted or
+ * unverifiable); false for `absent` (the operator store
+ * IS the whole census) and `included` (the daemon entries are already merged).
+ *
+ * Centralised so a future status flows through ONE decision rather than N
+ * inline `||` chains that can drift apart (the recurring-hole pattern). Every
+ * count/coverage/CLI surface that scopes its wording to the operator store
+ * derives that scoping from HERE.
+ */
+export function daemonStoreExcludedFromCensus(
+  daemon: DaemonStoreDisclosure | undefined
+): boolean {
+  // A wholly-absent disclosure (a partial fixture / a report produced before
+  // this field existed) keeps its documented default: treat as `absent`, the
+  // operator store IS the whole census (NOT excluded).
+  if (daemon === undefined) return false;
+  const status = daemon.status;
+  // D8-4 (Dry-9): fail-safe allowlist. The operator store is the whole census
+  // ONLY for the two definitively-complete states: `absent` (never-armed) and
+  // `included` (daemon merged). Every excluded state (`present_unreadable`,
+  // `present_tampered`, `missing`) AND any UNRECOGNIZED status an untyped / JSON
+  // caller smuggles past the union is EXCLUDED -- disclosed, never silently
+  // presented as a complete definitive census with the never-pruned reassurance.
+  return status !== "absent" && status !== "included";
+}
+
+/**
+ * D8-4 (Dry-9): is a daemon-store status one this version explicitly recognizes?
+ * An untyped / JSON caller can smuggle any string past the compile-time union,
+ * and an unrecognized status must be DISCLOSED as not-gathered / not-determinable
+ * rather than mislabeled with a specific status's wording (e.g. the
+ * "present but not readable here" privilege excuse). Every renderer that
+ * switches on the status uses this to route an unknown value to honest
+ * "unrecognized" copy instead of a definitive census.
+ */
+export function isRecognizedDaemonStatus(
+  status: unknown
+): status is DaemonStoreDisclosure["status"] {
+  return (
+    status === "absent" ||
+    status === "missing" ||
+    status === "included" ||
+    status === "present_unreadable" ||
+    status === "present_tampered"
+  );
+}
+
+/**
+ * Dry-9 fix-round-3 (P4): is a daemon-store `unreadable_reason` one this version
+ * explicitly recognizes? Mirrors {@link isRecognizedDaemonStatus} for the OTHER
+ * enum-shaped daemon field. An untyped / JSON caller can smuggle any string past
+ * the compile-time `"privilege" | "io"` union, and a raw value must NEVER be
+ * signed into the enum-shaped SIGNED manifest field; the serialization
+ * chokepoint routes an unrecognized reason to omission via this predicate.
+ * Centralised here so the recognized-value list lives next to its sibling and
+ * cannot drift.
+ */
+export function isRecognizedDaemonUnreadableReason(
+  reason: unknown
+): reason is NonNullable<DaemonStoreDisclosure["unreadable_reason"]> {
+  return reason === "privilege" || reason === "io";
+}
+
 export interface RetentionFacts {
   /** Configured maximum retained entry count (FIFO cap). */
   max_entries: number;
@@ -194,10 +328,24 @@ export interface RetentionFacts {
   /**
    * Configured maximum total on-disk size in bytes (the OTHER FIFO cap). Audit
    * retention prunes on EITHER cap: 100,000 entries OR 100 MB by default (sweep
-   * HIGH-5). 0/absent means the size cap is not known to this reporter.
+   * HIGH-5). A value `<= 0` means the size cap is not known to this reporter,
+   * and (D8-1 Leg B) an UNKNOWN cap on any contributing row makes at-cap NOT
+   * DETERMINABLE: it can prove neither "at cap" nor "below both caps", so no
+   * definitive at-cap boolean is signed and no below-caps prose renders (the
+   * pre-D8-1 "no size-cap judgment is made" allowance still earned the signed
+   * definitive `retention_at_cap: false`, which was a claim over a cap
+   * declared unknown). F2-R2: a non-finite or ABSENT value from an untyped
+   * caller equally makes at-cap NOT DETERMINABLE.
    */
   max_total_size_bytes: number;
-  /** Total on-disk size in bytes of the retained audit log, or null if unread. */
+  /**
+   * Total on-disk size in bytes of the retained audit log, or null if unread.
+   * D8-1 Leg C: an UNREAD (`null`) size on any contributing row makes at-cap
+   * NOT DETERMINABLE -- "below both its entry and size retention caps" cannot
+   * be asserted over a size dimension nobody read, and `ever_pruned === false`
+   * does not exclude `size == cap` (pruning fires only when the size EXCEEDS
+   * the cap). This deliberately reverses the earlier null-is-usable allowance.
+   */
   retained_total_size_bytes: number | null;
   /**
    * True when the audit log has EVER pruned entries (a rotation anchor exists).
@@ -218,6 +366,52 @@ export interface RetentionFacts {
    * and whether its records are in this census. See {@link DaemonStoreDisclosure}.
    */
   daemon_store: DaemonStoreDisclosure;
+  /**
+   * D5-1 (dry-bar round 5): the per-contributing-store retention breakdown so
+   * "the log is at a retention cap" is evaluated PER STORE against each store's
+   * OWN independent cap, then OR-ed -- never the MERGED two-store total compared
+   * against a single store's cap (which falsely reports "at cap" on a healthy
+   * split fortress whose combined count exceeds one store's cap while neither
+   * store is near its own). The merged {@link retained_total} /
+   * {@link retained_total_size_bytes} above stay as the all-time DISPLAY totals;
+   * this array drives the at-cap decision. Always includes the operator store;
+   * includes the daemon store only when it was merged (`included`). When absent
+   * (a legacy fixture / a caller that predates this field), the shortfall
+   * detector treats the merged top-level fields as a single conceptual store --
+   * the correct single-store computation for a non-split fortress.
+   */
+  per_store_retention?: readonly PerStoreRetention[];
+}
+
+/**
+ * D5-1: one contributing audit store's retention position, so at-cap is judged
+ * against THIS store's own configured caps (each `AuditLog` prunes on its own
+ * independent 100k-entry / 100 MB caps; two stores have 200k/200 MB combined
+ * capacity). `retained_total` / `retained_total_size_bytes` are this store's
+ * own retained figures, never the merged census total.
+ */
+export interface PerStoreRetention {
+  /** Which contributing store these figures belong to. */
+  store: "operator" | "daemon";
+  /**
+   * This store's configured maximum retained entry count (FIFO cap).
+   * D8-1 Leg B: `<= 0` = cap unknown => at-cap NOT DETERMINABLE.
+   */
+  max_entries: number;
+  /** This store's own retained entry count (across all time). */
+  retained_total: number;
+  /**
+   * This store's configured maximum total on-disk size in bytes.
+   * D8-1 Leg B: `<= 0` = cap unknown => at-cap NOT DETERMINABLE.
+   */
+  max_total_size_bytes: number;
+  /**
+   * This store's own retained on-disk size in bytes, or null if unread.
+   * D8-1 Leg C: `null` (unread -- including a store whose usage read threw,
+   * Leg A) => at-cap NOT DETERMINABLE; no surface may claim the size
+   * dimension when the size was never read.
+   */
+  retained_total_size_bytes: number | null;
 }
 
 /**
@@ -265,16 +459,72 @@ export interface ShortfallReport {
    * True when the retained log is at or above its FIFO cap, which means
    * pruning is actively occurring and early-quarter entries were LIKELY
    * dropped (as opposed to the fortress simply having no earlier activity).
-   * Distinguishing these two causes keeps the disclosure honest.
+   * Distinguishing these two causes keeps the disclosure honest. When
+   * {@link retention_at_cap_determinable} is false this stays `false` ONLY
+   * because at-cap was never asserted, NOT because below-cap was proven.
    */
   retention_at_cap: boolean;
+  /**
+   * D7-1 / Codex-F1 (dry-bar round 7): whether {@link retention_at_cap} could
+   * honestly be COMPUTED at all, decided by the single
+   * `retentionDeterminability` chokepoint. False when the retention facts
+   * carried no usable per-store breakdown (`per_store_retention` absent,
+   * `null`, empty, or missing the daemon row while the daemon store is
+   * `included`) for anything other than the genuine legacy single-store case,
+   * or (F2-R2, second-family review) when any contributing row -- a breakdown
+   * row or the legacy top-level fallback -- is runtime-INCOMPLETE (a
+   * missing/`NaN`/`Infinity`/wrong-typed numeric field, an `undefined`
+   * `retained_total_size_bytes`, an unknown `store` tag, a duplicate row for
+   * the same store, or a non-object row): incomplete cap evidence must never
+   * be evaluated as a definitive at-cap OR below-cap position.
+   * D8-1 (Dry-8 sweep): ALSO false when any contributing row is complete but
+   * not USABLE for a definitive verdict -- an entry or size cap `<= 0` (the
+   * in-band "cap not known to this reporter" encoding, Leg B) or a `null`
+   * (unread) `retained_total_size_bytes` (Leg C; including the shipped-CLI
+   * state where `getRetentionUsage()` threw while `query()` succeeded, Leg A,
+   * which previously substituted a filler size of 0 and SIGNED a definitive
+   * `retention_at_cap: false` while the prose hedged).
+   * When false, every surface must treat at-cap as NOT DETERMINABLE: the prose
+   * suppresses both the definitive "at a retention cap" claim AND the
+   * flattering "never pruned / below both caps" reassurance, and the SIGNED
+   * manifest serializes an explicit not-determinable marker instead of a
+   * definitive `retention_at_cap` boolean.
+   */
+  retention_at_cap_determinable: boolean;
   /**
    * True when the ENTIRE retained window post-dates the quarter, so ZERO of the
    * quarter is covered even though the nominal signed span reaches the quarter
    * start (round-2 N2). Lets the cover banner state "none of this quarter is
-   * covered" precisely rather than the generic "does not reach the start".
+   * covered" precisely rather than the generic "does not reach the start". P1
+   * (Dry-9): when true, `covered_from` collapses to `covered_to_exclusive` so
+   * every surface (cover span, §7 span, SIGNED manifest) attests an EMPTY span,
+   * never a definitive non-empty one the disclosure denies.
    */
   zero_of_quarter_covered: boolean;
+  /**
+   * P3 (Dry-9): true when `covered_to_exclusive` is bounded by the AUDIT-CENSUS
+   * cut (D9C-1) -- the census instant precedes the generation instant -- rather
+   * than by the generation instant or the quarter end. Lets surfaces that echo
+   * the attestable-end bound name it honestly ("the audit-census cut point")
+   * instead of the stale "the generation time". Only meaningful when
+   * {@link in_progress_quarter} (a clamp only happens then).
+   */
+  covered_to_is_census_cut: boolean;
+  /**
+   * Dry-9 fix-round-2 (P1): whether the covered WINDOW itself could be
+   * determined at all. False when an attestation-bearing bound is present but
+   * UNUSABLE -- specifically a present-but-unparseable audit-census cut, which
+   * bounds `covered_to_exclusive` from above: with the cut unreadable the pack
+   * cannot bound the upper end of coverage, and falling back to the generation
+   * instant would attest coverage the census never proved. When false, every
+   * surface (cover span, cover banner, section-7 window, and the SIGNED
+   * manifest) renders NOT-DETERMINABLE and asserts NO definitive covered span --
+   * the same fail-closed shape a `read_failed` audit source produces. True for
+   * every determinable window (the common case), so the shipped manifest/prose
+   * shape is unchanged. Distinct from {@link zero_of_quarter_covered}, which is
+   * a DETERMINABLE finding (coverage was computed and is empty).
+   */
+  coverage_determinable: boolean;
   /** A lay-reader explanation suitable for printing in the PDF. */
   explanation: string;
   /**
@@ -489,18 +739,60 @@ export interface EvidencePackManifest {
         shortfall: boolean;
         /** True when the quarter had not ended at generation time (partial quarter). */
         in_progress_quarter: boolean;
-        retention_at_cap: boolean;
+        /**
+         * Codex-F1 (dry-bar round 7): present ONLY when at-cap was actually
+         * computable ({@link ShortfallReport.retention_at_cap_determinable}).
+         * Exactly ONE of `retention_at_cap` /
+         * `retention_at_cap_determinable: false` is serialized: a definitive
+         * boolean when at-cap was computed, the explicit marker when it was
+         * not. A definitive `retention_at_cap: false` ("not at a retention
+         * cap") must NEVER be signed for a state where at-cap could not be
+         * determined (a merged census with no usable per-store breakdown).
+         */
+        retention_at_cap?: boolean;
+        /**
+         * Serialized as `false` ONLY when at-cap was NOT determinable (and
+         * `retention_at_cap` is then omitted). Omitted entirely (never `true`)
+         * when `retention_at_cap` is present, so the shipped CLI path's
+         * manifest shape is unchanged. Mirrors the top-level
+         * `determinable: false` convention: a machine consumer that sees this
+         * marker knows the at-cap fact was not computed, not that it is false.
+         */
+        retention_at_cap_determinable?: false;
+        /**
+         * P1 (Dry-9 fix): serialized `true` ONLY when ZERO of the quarter is
+         * demonstrably covered (the entire retained window post-dates the
+         * attestable end, or the earliest instant was unusable). In that state
+         * `covered_from === covered_to_exclusive` (an EMPTY span), so a machine
+         * reader is never handed a definitive non-empty covered span the prose
+         * denies. Omitted (never `false`) otherwise, so the shipped CLI path's
+         * manifest shape is unchanged.
+         */
+        zero_of_quarter_covered?: true;
         /**
          * G-1 (two-family gate follow-up): the F2 daemon enforcement store's
          * disclosure, machine-readable, so a verifier reading `shortfall: false`
          * is never left believing the census was complete when a root-owned
          * daemon store was present but excluded. `absent`/`included` mean the
-         * count is the whole census / already merged; `present_unreadable` /
-         * `present_tampered` mean these coverage facts reflect the OPERATOR store
+         * count is the whole census / already merged; `present_unreadable`,
+         * `present_tampered`, and `missing` (split evidence present but the
+         * daemon store absent -- deleted or unverifiable, C1) mean these
+         * coverage facts reflect the OPERATOR store
          * only (never a silent single-store signal, even in the signed manifest).
+         *
+         * Dry-9 fix-round-2 (P2): the additive `"unrecognized"` value is the
+         * normalization SENTINEL the serialization chokepoint emits when an
+         * untyped / JSON caller smuggles a status the input union does not
+         * define (e.g. `"quarantined"`) into the disclosure. The enum-shaped
+         * SIGNED field is ALWAYS one of these recognized values, NEVER the raw
+         * smuggled string, so a machine reader parsing the manifest can trust
+         * the field's shape. Additive to the 0.1-preview manifest (same pattern
+         * as the prior `retention_at_cap_determinable` / `zero_of_quarter_covered`
+         * additions); the input {@link DaemonStoreDisclosure} contract, which
+         * models real fortress states, is unchanged.
          */
         daemon_store: {
-          status: DaemonStoreDisclosure["status"];
+          status: DaemonStoreDisclosure["status"] | "unrecognized";
           unreadable_reason?: "privilege" | "io";
         };
       }

@@ -37,8 +37,11 @@
  *       live `PiiConfigStore` per call and scrubs ONLY when the operator
  *       opted in (`enabled`/`smart_mode_enabled`) AND consented;
  *   (2) `queryAnonymityConfig` (the Tier B enabled/smart-mode flags from
- *       `PiiConfigStore`) is passed into the chat service so the
- *       smart-mode rewrite path is read at invocation time.
+ *       `PiiConfigStore`) is passed into the chat service, which reads
+ *       the gates at invocation time (`evaluateForQuery`) and rewrites
+ *       the query BEFORE the substrate call: smart mode when
+ *       `smart_mode_enabled`, basic anonymize-all when only `enabled`.
+ *       Both paths emit `query_anonymity_pii_rewritten` per rewrite.
  *   `effectiveTierBEnabled(config, redactorInstalled)` below now derives
  *   the truth from BOTH the live config AND the redactor-installed
  *   signal, so it returns `true` only when scrubbing genuinely happens.
@@ -423,30 +426,11 @@ export async function handlePiiRewriteRoute(
 }
 
 /**
- * Helper for the live selector wiring (Rho-2.5 follow-up): emits the
- * `query_anonymity_pii_rewritten` audit event with per-category
- * counts. Exposed here so the eventual selector-wrapper module can
- * call it without re-implementing the audit shape.
+ * Back-compat re-export: `emitPiiRewriteAudit` moved to
+ * `pii-rewrite.ts` (the primitive module, next to the audit op
+ * constants) so the live chat-service wiring can import it without
+ * dragging this route module (and its auth-middleware dependency
+ * chain) into the chat import cycle. Existing route-side consumers
+ * keep importing it from here.
  */
-export function emitPiiRewriteAudit(opts: {
-  auditLog: AuditLog;
-  identityId: string;
-  fortressId: string;
-  redactionCounts: Record<string, number>;
-  llmAssistRan: boolean;
-  llmResidualCount: number;
-  consentedToTradeOff: boolean;
-}): void {
-  void opts.auditLog.append(
-    "l2",
-    PII_REWRITE_AUDIT_OPS.PII_REWRITTEN,
-    opts.identityId,
-    {
-      fortress_id: opts.fortressId,
-      redaction_counts: opts.redactionCounts,
-      llm_assist_ran: opts.llmAssistRan,
-      llm_residual_count: opts.llmResidualCount,
-      consented_to_trade_off: opts.consentedToTradeOff,
-    },
-  );
-}
+export { emitPiiRewriteAudit } from "./pii-rewrite.js";

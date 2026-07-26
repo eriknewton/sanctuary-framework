@@ -10,7 +10,7 @@
  */
 
 import { access, constants, stat } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 /** Default top-level storage directory when no env override is set. */
@@ -85,11 +85,118 @@ function errorCode(error: unknown): string | undefined {
 }
 
 /**
+ * Thrown when a test run resolves storage to the operator's own fortress.
+ *
+ * See {@link assertHermeticStoragePath} for why this fails closed.
+ */
+export class NonHermeticStoragePathError extends Error {
+  constructor(public readonly resolvedPath: string) {
+    super(
+      `Sanctuary test isolation: a test resolved its storage path to the operator's own fortress at ${resolvedPath}.\n` +
+        `Tests must never read from or write to the real fortress: doing so pollutes it (the backup directory grows on every run),\n` +
+        `and it makes the suite non-hermetic, so the same test can pass on a developer machine that has a fortress and fail on a\n` +
+        `fresh CI runner that does not.\n` +
+        `Fix the test by giving it its own fortress: use createTempFortress() from test/helpers/temp-fortress.ts, or pass an\n` +
+        `explicit storage path to the function under test. Do not set SANCTUARY_STORAGE_PATH globally for the whole suite: several suites\n` +
+        `already isolate per test by overriding HOME, and a global override silently defeats that and collapses them onto one fortress.\n` +
+        `If a test genuinely needs to observe the default home resolution, pass an explicit fake home argument instead.`,
+    );
+    this.name = "NonHermeticStoragePathError";
+  }
+}
+
+/**
+ * The operator's real home directory, captured once at module load.
+ *
+ * `os.userInfo().homedir` reads the account record (passwd on POSIX,
+ * USERPROFILE on Windows) and so is immune to a test reassigning
+ * `process.env.HOME` -- which is exactly how several suites isolate
+ * themselves. `os.homedir()` honours `$HOME` on POSIX and therefore cannot
+ * answer this question once a test has moved it.
+ *
+ * `userInfo()` can throw when the uid has no passwd entry (some containers).
+ * "Could not look" is representable: fall back to the `HOME` observed at
+ * module load, which under Vitest is still the pristine operator value
+ * because test files mutate it in `beforeEach`, after their imports resolve.
+ * Both candidates are treated as the operator fortress so the guard stays
+ * conservative when the two disagree.
+ */
+const OPERATOR_HOME_CANDIDATES: readonly string[] = (() => {
+  const candidates = new Set<string>();
+  try {
+    candidates.add(userInfo().homedir);
+  } catch {
+    // No passwd entry for this uid; the HOME fallback below is all we have.
+  }
+  const envHome = process.env.HOME ?? process.env.USERPROFILE;
+  if (envHome && envHome.length > 0) candidates.add(envHome);
+  return [...candidates].filter((h) => h.length > 0);
+})();
+
+/**
+ * Fail closed when a Vitest run resolves storage to the operator's own fortress.
+ *
+ * The suite must be hermetic: every test runs against a fortress it provisioned
+ * itself. Reaching the operator's `~/.sanctuary` is always a defect, in both
+ * directions -- it writes into real state (the recurring backup-directory
+ * growth), and it reads real custody, so results differ between a machine with
+ * a fortress and a fresh CI runner.
+ *
+ * Only active under Vitest (`VITEST` is set in every worker). Production
+ * resolution is untouched: `~/.sanctuary` is the correct answer for a
+ * single-tenant install.
+ *
+ * `SANCTUARY_ALLOW_OPERATOR_FORTRESS=1` is the deliberate escape hatch for a
+ * test that must exercise the real default. It is opt-in per process and never
+ * set by the suite.
+ */
+export function assertHermeticStoragePath(resolvedPath: string): void {
+  if (!process.env.VITEST) return;
+  if (process.env.SANCTUARY_ALLOW_OPERATOR_FORTRESS === "1") return;
+  for (const home of OPERATOR_HOME_CANDIDATES) {
+    if (resolvedPath === join(home, DEFAULT_STORAGE_DIR)) {
+      throw new NonHermeticStoragePathError(resolvedPath);
+    }
+  }
+}
+
+/**
+ * The default single-tenant fortress location, `<home>/.sanctuary`.
+ *
+ * Every code path that wants "the fortress this host uses when nothing more
+ * specific was supplied" routes through here rather than composing
+ * `join(homedir(), ".sanctuary")` itself, so the hermeticity guard sits on one
+ * chokepoint instead of N open-coded joins.
+ *
+ * @param home Optional home directory override (for tests). Defaults to `os.homedir()`.
+ */
+export function homeFortressPath(home: string = homedir()): string {
+  const resolved = join(home, DEFAULT_STORAGE_DIR);
+  assertHermeticStoragePath(resolved);
+  return resolved;
+}
+
+/**
  * Resolve the storage path for a Sanctuary instance.
  *
  * Precedence (highest wins):
  *   1. `SANCTUARY_STORAGE_PATH` env var
  *   2. `~/.sanctuary`
+ *
+ * Resolving with no arguments reaches for ambient process state, so it belongs
+ * at a CLI entry point (where the operator's environment IS the input), not
+ * inside a leaf module. A leaf that re-resolves ambiently silently overrides
+ * the per-tenant path its caller already chose: that is the bug this module's
+ * guard exists to make loud.
+ *
+ * NOT the same answer as `loadConfig().storage_path`. This function reads only
+ * `SANCTUARY_STORAGE_PATH` and the home default; `loadConfig` additionally
+ * merges a `storage_path` key from the config FILE. They diverge when that key
+ * is present and the env var is not, and that divergence changes which
+ * keychain entry holds a fortress's master passphrase. See the "DOCUMENTED
+ * BEHAVIOUR CHANGE" block on `loadConfig` in `config.ts` for the full
+ * consequence and its fail-closed bound. Pick deliberately: the fortress you
+ * OPEN and the fortress you name the passphrase after must be the same one.
  *
  * @param env Optional env object (for tests). Defaults to `process.env`.
  * @param home Optional home directory override (for tests). Defaults to `os.homedir()`.
@@ -100,7 +207,7 @@ export function resolveStoragePath(
 ): string {
   const override = env.SANCTUARY_STORAGE_PATH;
   if (override && override.length > 0) return override;
-  return join(home, DEFAULT_STORAGE_DIR);
+  return homeFortressPath(home);
 }
 
 /**

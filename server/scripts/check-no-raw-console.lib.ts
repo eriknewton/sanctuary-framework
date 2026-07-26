@@ -23,9 +23,9 @@
  * console.* embedded in HTML template literals does not count.
  *
  * Usage:
- *   npx vite-node server/scripts/check-no-raw-console.ts
- *   npx vite-node server/scripts/check-no-raw-console.ts --quiet
- *   npx vite-node server/scripts/check-no-raw-console.ts --root <path>
+ *   npx tsx server/scripts/check-no-raw-console.ts
+ *   npx tsx server/scripts/check-no-raw-console.ts --quiet
+ *   npx tsx server/scripts/check-no-raw-console.ts --root <path>
  */
 
 import { readdirSync, readFileSync, statSync } from "node:fs";

@@ -124,7 +124,11 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await rm(fortressPath, { recursive: true, force: true });
+  // maxRetries/retryDelay: recursive teardown of a just-written fortress dir
+  // occasionally races the OS releasing child handles under parallel CI,
+  // throwing ENOTEMPTY. Bounded retries are the repo's established mitigation
+  // for that class (see audit-log-concurrent-write.test.ts).
+  await rm(fortressPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
   // Restore the process-global fortress env keys exactly as they were so this
   // file leaves the shared worker env untouched (no dead-path leak to siblings).
   if (savedStoragePath === undefined) {
@@ -622,7 +626,7 @@ describe("federation join --persist -- out-of-band pinned master", () => {
       expect(refuseCode).toBe(3);
       expect(err2.get()).toMatch(/refused to persist/);
     } finally {
-      await rm(joinerPath, { recursive: true, force: true });
+      await rm(joinerPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }
   });
 });

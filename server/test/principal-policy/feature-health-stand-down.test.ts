@@ -147,6 +147,23 @@ async function appendChannelHeartbeat(log: AuditLog, tsMs: number): Promise<void
   });
 }
 
+async function appendCW(
+  log: AuditLog,
+  operation: string,
+  tsMs: number,
+): Promise<void> {
+  await log.appendCritical({
+    layer: "l1",
+    operation,
+    identity_id: FORTRESS,
+    result: "success",
+    timestamp: new Date(tsMs).toISOString(),
+    details: {
+      [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+    },
+  });
+}
+
 /**
  * A GENUINE intentional stand-down, the SHAPE THE REAL PRODUCER EMITS: a direct
  * channel-basis append carrying the `cw_source` marker and NO producer
@@ -214,9 +231,9 @@ async function appendForgedSignedStandDown(
 }
 
 describe("Slice 2 false-RED fix — stand-down op set is honest and disjoint", () => {
-  it("the stand-down set is filter_stopped + arm_lease_revoked", () => {
+  it("the stand-down set is filter_stopped + arm_lease_revoked + wall_disarmed", () => {
     expect([...CASTLE_WALL_STAND_DOWN_OPERATIONS].sort()).toEqual(
-      ["arm_lease_revoked", "filter_stopped"].sort(),
+      ["arm_lease_revoked", "filter_stopped", "wall_disarmed"].sort(),
     );
     expect(CASTLE_WALL_STAND_DOWN_OPERATIONS.has(CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION)).toBe(
       true,
@@ -232,6 +249,46 @@ describe("Slice 2 false-RED fix — stand-down op set is honest and disjoint", (
   });
 });
 
+describe("B2 false-green fix — newer stand-down beats older fresh enforcement", () => {
+  for (const op of [
+    "filter_stopped",
+    "wall_disarmed",
+    CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION,
+  ] as const) {
+    it(`${op} after egress_allowed demotes active to intentionally_stopped`, async () => {
+      const log = newLog();
+      await appendChannelHeartbeat(log, NOW - 5 * 60_000);
+      await appendCW(log, "egress_allowed", NOW - 4 * 60_000);
+      await appendChannelStandDown(log, op, NOW - 60_000);
+      const panel = await buildFeatureHealthPanel({
+        protectionClaimSubject: FORTRESS,
+        auditLog: log,
+        originMachine: FORTRESS,
+        now: NOW,
+      });
+      const cw = cwRow(panel);
+      expect(cw.status).toBe("unknown");
+      expect(cw.basis).toBe("intentionally_stopped");
+      expect(cw.status).not.toBe("active");
+    });
+  }
+
+  it("a previously-seen heartbeat producer with no fresh heartbeat demotes stale-instance green", async () => {
+    const log = newLog();
+    await appendChannelHeartbeat(log, NOW - 20 * 60_000);
+    await appendCW(log, "egress_allowed", NOW - 9 * 60_000);
+    const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
+      auditLog: log,
+      originMachine: FORTRESS,
+      now: NOW,
+    });
+    const cw = cwRow(panel);
+    expect(cw.status).toBe("unknown");
+    expect(cw.basis).toBe("daemon_liveness_unconfirmed");
+  });
+});
+
 describe("Slice 2 false-RED fix — a clean stop is intentionally_stopped, NOT dead_no_heartbeat", () => {
   it("channel-basis (macOS / no key): stale heartbeat THEN filter_stopped → intentionally_stopped / unknown, not red", async () => {
     const log = newLog();
@@ -240,6 +297,7 @@ describe("Slice 2 false-RED fix — a clean stop is intentionally_stopped, NOT d
     await appendChannelHeartbeat(log, OLDER_TS);
     await appendChannelStandDown(log, "filter_stopped", STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -256,6 +314,7 @@ describe("Slice 2 false-RED fix — a clean stop is intentionally_stopped, NOT d
     await appendGenuineHeartbeat(log, OLDER_TS, 1);
     await appendChannelStandDown(log, "filter_stopped", STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -273,6 +332,7 @@ describe("Slice 2 false-RED fix — an arm-lease revoke is intentionally_stopped
     await appendChannelHeartbeat(log, OLDER_TS);
     await appendChannelStandDown(log, CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION, STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -287,6 +347,7 @@ describe("Slice 2 false-RED fix — an arm-lease revoke is intentionally_stopped
     await appendGenuineHeartbeat(log, OLDER_TS, 1);
     await appendChannelStandDown(log, CASTLE_WALL_ARM_LEASE_REVOKED_OPERATION, STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -304,6 +365,7 @@ describe("Slice 2 false-RED fix — a GENUINE silent death STILL fires the alarm
     // The daemon beat, then was KILLED (no stand-down marker recorded).
     await appendChannelHeartbeat(log, STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -321,6 +383,7 @@ describe("Slice 2 false-RED fix — a GENUINE silent death STILL fires the alarm
     await appendChannelStandDown(log, "filter_stopped", OLDER_TS);
     await appendChannelHeartbeat(log, STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -344,6 +407,7 @@ describe("Slice 2 false-RED fix — a FORGED stand-down cannot mute a real alarm
         await appendGenuineHeartbeat(log, STALE_TS, 1);
         await appendForgedSignedStandDown(log, op, NOW - 1000, variant);
         const panel = await buildFeatureHealthPanel({
+          protectionClaimSubject: FORTRESS,
           auditLog: log,
           originMachine: FORTRESS,
           now: NOW,
@@ -392,6 +456,7 @@ describe("Slice 2 false-RED fix — a signed heartbeat RELABELED as a stand-down
         },
       });
       const panel = await buildFeatureHealthPanel({
+        protectionClaimSubject: FORTRESS,
         auditLog: log,
         originMachine: FORTRESS,
         now: NOW,
@@ -420,6 +485,7 @@ describe("Slice 2 false-RED fix — suppression NEVER manufactures green (invari
       details: {},
     });
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -435,6 +501,7 @@ describe("Slice 2 false-RED fix — suppression NEVER manufactures green (invari
     await appendChannelHeartbeat(log, OLDER_TS);
     await appendChannelStandDown(log, "filter_stopped", STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -450,6 +517,7 @@ describe("Slice 2 false-RED fix — a tainted read still fails closed to unknown
     await appendChannelHeartbeat(log, OLDER_TS);
     await appendChannelStandDown(log, "filter_stopped", STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,
@@ -471,6 +539,7 @@ describe("Slice 2 false-RED fix — a stand-down WITHOUT prior liveness does not
     // a wall we never saw run.
     await appendChannelStandDown(log, "filter_stopped", STALE_TS);
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: log,
       originMachine: FORTRESS,
       now: NOW,

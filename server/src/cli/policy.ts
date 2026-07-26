@@ -54,11 +54,31 @@ export interface PolicyArgs {
   argv: string[];
   out?: NodeJS.WritableStream;
   err?: NodeJS.WritableStream;
+  /**
+   * The fortress this command operates on. Injection seam for callers that
+   * have already chosen a fortress (tests, and any embedder driving more than
+   * one tenant). When omitted the subcommands fall back to the ambient
+   * resolution they have always used -- which is correct for a plain CLI
+   * invocation, where the operator's environment IS the input.
+   */
+  storagePath?: string;
+}
+
+/**
+ * The per-invocation context threaded to every policy subcommand: the two
+ * output streams plus the fortress the caller selected (undefined when the
+ * subcommand should resolve ambiently, i.e. a plain CLI run).
+ */
+interface PolicyCommandContext {
+  out: NodeJS.WritableStream;
+  err: NodeJS.WritableStream;
+  storagePath?: string;
 }
 
 export async function runPolicyCommand(args: PolicyArgs): Promise<number> {
   const out = args.out ?? process.stdout;
   const err = args.err ?? process.stderr;
+  const storagePath = args.storagePath;
   const [sub, ...rest] = args.argv;
 
   if (!sub || sub === "--help" || sub === "-h") {
@@ -73,9 +93,9 @@ export async function runPolicyCommand(args: PolicyArgs): Promise<number> {
           printPolicyCompileHelp(out);
           return 0;
         }
-        return await cmdCompile(rest, { out, err });
+        return await cmdCompile(rest, { out, err, storagePath });
       case "drafts":
-        return await cmdDrafts(rest, { out, err });
+        return await cmdDrafts(rest, { out, err, storagePath });
       default:
         err.write(`Unknown subcommand: ${sub}\n`);
         printUsage(err);
@@ -149,13 +169,12 @@ SANCTUARY_POLICY_API_TOKEN.
  * the operator's fortress. Returns null when the fortress is not accessible,
  * passphrase is unavailable, or intelligence is not configured.
  */
-async function tryLoadSubstrateSelector(): Promise<{
+async function tryLoadSubstrateSelector(storagePath: string): Promise<{
   selector: SubstrateSelector;
   auditLog: AuditLog;
   fortressId: string;
 } | null> {
   try {
-    const storagePath = resolveStoragePath();
     const intelligenceDir = resolve(storagePath, "state", "_intelligence");
     if (!existsSync(intelligenceDir)) return null;
 
@@ -205,7 +224,7 @@ async function tryLoadSubstrateSelector(): Promise<{
 
 async function cmdCompile(
   argv: string[],
-  ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream },
+  ctx: PolicyCommandContext,
 ): Promise<number> {
   const englishText = argv[0];
   if (!englishText) {
@@ -217,7 +236,9 @@ async function cmdCompile(
   // v1.3.0 (BBBBB): try to load the intelligence substrate so LLM-assist
   // is available when the fortress is configured. Falls back to
   // deterministic-only when not available.
-  const fortress = await tryLoadSubstrateSelector();
+  const fortress = await tryLoadSubstrateSelector(
+    ctx.storagePath ?? resolveStoragePath(),
+  );
 
   const storage = fortress ? undefined : new MemoryStorage();
   const masterKey = fortress ? undefined : generateRandomKey();
@@ -255,7 +276,7 @@ async function cmdCompile(
 
 async function cmdDrafts(
   argv: string[],
-  ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream },
+  ctx: PolicyCommandContext,
 ): Promise<number> {
   const [sub, ...rest] = argv;
   if (sub === "list" || sub === undefined) {
@@ -293,7 +314,7 @@ async function cmdDrafts(
 
 async function cmdDraftsCheckConflicts(
   argv: string[],
-  ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream },
+  ctx: PolicyCommandContext,
 ): Promise<number> {
   const parsed = parseDraftCommandArgs(argv);
   if (!parsed.draftId) {
@@ -311,7 +332,7 @@ async function cmdDraftsCheckConflicts(
 
 async function cmdDraftsActivate(
   argv: string[],
-  ctx: { out: NodeJS.WritableStream; err: NodeJS.WritableStream },
+  ctx: PolicyCommandContext,
 ): Promise<number> {
   const parsed = parseDraftCommandArgs(argv);
   if (!parsed.draftId) {
@@ -328,12 +349,16 @@ async function cmdDraftsActivate(
   let auditLog: AuditLog | null = null;
   let auditIdentityId = "cli";
   try {
-    const config = await loadConfig();
-    const storagePath = config.storage_path;
+    const storagePath = ctx.storagePath ?? (await loadConfig()).storage_path;
     const storage = new FilesystemStorage(`${storagePath}/state`);
     let passphrase = process.env["SANCTUARY_PASSPHRASE"];
     if (!passphrase) {
-      const resolved = await getOrCreatePassphrase();
+      // Scope the passphrase lookup to the fortress this command already
+      // resolved. Calling with no argument re-resolves ambiently from the
+      // environment, which reads and can create the HOME fortress's
+      // passphrase (and its keyring entry) even when the caller selected a
+      // different fortress with --fortress.
+      const resolved = await getOrCreatePassphrase({ storagePath });
       passphrase = resolved.value;
     }
     // Unified custody (master-custody.ts): never derive a fortress master verb-locally.

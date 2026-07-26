@@ -19,10 +19,17 @@
 import { createHash } from "node:crypto";
 
 import type { AuditEntry } from "../operational/audit-log.js";
+import type { LocalAgentRecord } from "../contracts/v1.1/local-agent-records.js";
 import type {
   HubActivityFeedEntry,
   HubDisplayTemplateArg,
 } from "../contracts/v1.1/hub-events.js";
+import {
+  auditEntryAgentId,
+  verifiedCastleWallAuditAttribution,
+  type AuditAttributionOptions,
+} from "../castle-wall/audit-attribution.js";
+import { publicAgentIdForVerifiedAttribution } from "./agent-attribution.js";
 import type { HubActivitySources } from "./types.js";
 import {
   HUB_ACTIVITY_DEFAULT_LIMIT,
@@ -139,15 +146,19 @@ function buildTemplateArgs(
 }
 
 /**
- * Pull a safe `agent_id` hint out of the audit entry's details if present.
- * The contract requires only safe metadata; we copy `agent_id` only if
- * it's a string. No other fields cross the boundary.
+ * Pull a safe `agent_id` hint out of the audit entry. Attribution is projected
+ * only when the persisted producer signature re-verifies and the subject is
+ * derived from the signed canonical body.
  */
-function extractAgentIdHint(entry: AuditEntry): string | undefined {
-  const details = entry.details as Record<string, unknown> | undefined;
-  if (!details) return undefined;
-  const value = details.agent_id;
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+function extractAgentIdHint(
+  entry: AuditEntry,
+  attribution: AuditAttributionOptions,
+  localAgents: ReadonlyArray<LocalAgentRecord>,
+): string | undefined {
+  const verifiedSubject = auditEntryAgentId(entry, attribution);
+  return verifiedSubject === null
+    ? undefined
+    : publicAgentIdForVerifiedAttribution(verifiedSubject, localAgents);
 }
 
 /**
@@ -166,19 +177,25 @@ function deriveAttestationFragment(entryId: string): string {
 /**
  * Map an audit-entry result onto an attestation render state.
  *
- * Success entries render `verified`; failure entries render `degraded`.
- * Future v1.x work may enrich this (e.g. distinguish kernel-level egress
- * drops from policy-level denials), but the audit-entry result is the
- * stable signal available at projection time today.
+ * Entries render `verified` only when the persisted producer signature
+ * re-verifies. A successful unsigned row may be chain-valid, but it is not
+ * attribution-verified and must render degraded.
  */
 function deriveAttestationState(
   entry: AuditEntry,
+  attribution: AuditAttributionOptions,
 ): "verified" | "degraded" {
-  return entry.result === "success" ? "verified" : "degraded";
+  return verifiedCastleWallAuditAttribution(entry, attribution) !== null
+    ? "verified"
+    : "degraded";
 }
 
-function projectEntry(entry: AuditEntry): HubActivityFeedEntry {
-  const agentIdHint = extractAgentIdHint(entry);
+function projectEntry(
+  entry: AuditEntry,
+  attribution: AuditAttributionOptions,
+  localAgents: ReadonlyArray<LocalAgentRecord>,
+): HubActivityFeedEntry {
+  const agentIdHint = extractAgentIdHint(entry, attribution, localAgents);
   const category = categorizeOperation(entry.layer, entry.operation);
   const entryId = `${entry.timestamp}|${entry.operation}|${entry.identity_id}`;
   return {
@@ -191,10 +208,28 @@ function projectEntry(entry: AuditEntry): HubActivityFeedEntry {
     display_template_id: templateIdFor(category, entry.operation),
     display_template_args: buildTemplateArgs(entry, agentIdHint),
     attestation: {
-      state: deriveAttestationState(entry),
+      state: deriveAttestationState(entry, attribution),
       fragment: deriveAttestationFragment(entryId),
     },
   };
+}
+
+async function resolveActivityAttribution(
+  sources: HubActivitySources,
+): Promise<AuditAttributionOptions> {
+  if (sources.resolveAuditAttribution) {
+    return sources.resolveAuditAttribution();
+  }
+  return {
+    pinnedProducerKeyB64url: sources.pinnedProducerKeyB64url ?? null,
+    subjectFortressId: sources.subjectFortressId ?? null,
+  };
+}
+
+function listActivityLocalAgents(
+  sources: HubActivitySources,
+): ReadonlyArray<LocalAgentRecord> {
+  return sources.listLocalAgents ? sources.listLocalAgents() : [];
 }
 
 /**
@@ -215,10 +250,16 @@ export async function aggregateActivity(
     limit: Math.max(limit * 4, limit),
     ...(filter.since !== undefined ? { since: filter.since } : {}),
   });
+  const attribution = await resolveActivityAttribution(sources);
+  const localAgents = listActivityLocalAgents(sources);
 
   const projected = queryResult.entries
-    .filter((e) => e.identity_id === sources.identityId)
-    .map(projectEntry);
+    .filter(
+      (e) =>
+        e.identity_id === sources.identityId ||
+        verifiedCastleWallAuditAttribution(e, attribution) !== null,
+    )
+    .map((entry) => projectEntry(entry, attribution, localAgents));
 
   let filtered = projected;
   if (filter.agent_id) {

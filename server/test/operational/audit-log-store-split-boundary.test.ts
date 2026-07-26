@@ -33,7 +33,10 @@ import {
   readAuditStoreSplitBoundary,
   deriveAuditStoreSplitBoundaryMacKey,
 } from "../../src/operational/audit-log.js";
-import { verifySealedLegacyPrefix } from "../../src/operational/audit-store-split.js";
+import {
+  verifySealedLegacyPrefix,
+  verifyFortressAuditFullPicture,
+} from "../../src/operational/audit-store-split.js";
 import { generateRandomKey } from "../../src/core/random.js";
 import { FilesystemStorage } from "../../src/storage/filesystem.js";
 
@@ -459,6 +462,285 @@ describe("AuditLog split-boundary consultation (F2 Option A)", () => {
       await expect(reader.getIntegrityFindings()).resolves.toEqual([]);
     } finally {
       await chmod(boundaryDir, 0o755);
+    }
+  });
+});
+
+// F2 Option A — the SECOND contaminated namespace the #929 split missed.
+//
+// Drill Leg 1 (2026-07-15, Mini1 armed box): #929 sealed the legacy `_audit`
+// ENTRIES but left the legacy `_audit_checkpoints` namespace (rotation
+// checkpoints + `__head_anchor`) untouched. A pre-split ROOT daemon wrote those
+// files root-owned 0600, so on an armed box the operator uid's `readCheckpoints`
+// / `loadHeadAnchor` read threw EACCES, `file-grant mint` failed closed on
+// `_audit_checkpoints/audit-checkpoint-...enc`, and 10659 green tests coexisted
+// with a broken armed box because NO fixture had a pre-contaminated checkpoint
+// store. This is that fixture: root-ownership is simulated with `chmod 0o000`
+// (EACCES on read for the non-root test process), the same fidelity the sealed-
+// ENTRY tests above use. The fix has the operator's load consult the split
+// boundary for the checkpoint namespace exactly as it does for entries, without
+// weakening the integrity check.
+describe("F2 Option A: root-contaminated _audit_checkpoints under a valid boundary (drill Leg 1)", () => {
+  const dirs: string[] = [];
+
+  afterEach(async () => {
+    for (const d of dirs.splice(0)) {
+      await chmod(d, 0o700).catch(() => undefined);
+      await rm(d, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+
+  /** Build an armed-box-shaped fortress: real rotation checkpoints in
+   * `_audit_checkpoints`, a root-owned `__head_anchor`, and a valid boundary
+   * sealing the whole chain at its tip. Returns handles + the checkpoint dir. */
+  async function buildArmedCheckpointFortress() {
+    const root = await mkdtemp(join(tmpdir(), "sanctuary-f2-checkpoints-"));
+    dirs.push(root);
+    const statePath = join(root, "state");
+    const masterKey = generateRandomKey();
+    const storage = new FilesystemStorage(statePath);
+
+    // Small checkpoint interval so appends produce real `audit-checkpoint-*`
+    // files (the sealed-region checkpoints the drill found root-owned).
+    const legacy = new AuditLog(storage, masterKey, { checkpointInterval: 2 });
+    for (let i = 0; i < 6; i++) {
+      await legacy.appendCritical({
+        layer: "l1",
+        operation: `pre-split-${i}`,
+        identity_id: "id-1",
+        result: "success",
+        details: { i },
+      });
+    }
+    await legacy.flush();
+    const head = await legacy.getChainHead();
+    expect(head.sequence).toBe(6);
+
+    // Each `appendCritical` already wrote a VALID `__head_anchor` (the drill's
+    // root-owned `__head_anchor.enc`), so the checkpoint namespace holds both
+    // rotation checkpoints and a real head anchor to contaminate below.
+
+    const macKey = deriveAuditStoreSplitBoundaryMacKey(masterKey);
+    await writeAuditStoreSplitBoundary(statePath, macKey, {
+      sealed_tip_sequence: head.sequence,
+      sealed_base_sequence: 1,
+      sealed_tip_entry_hash: head.entry_hash,
+      daemon_namespace: "_audit-daemon",
+    });
+
+    const checkpointDir = join(statePath, "_audit_checkpoints");
+    const checkpointFiles = await readdir(checkpointDir);
+    // Sanity: the fixture actually has checkpoint content to contaminate.
+    expect(checkpointFiles.length).toBeGreaterThan(1);
+
+    return { statePath, masterKey, storage, head, checkpointDir, checkpointFiles };
+  }
+
+  it("does NOT fail the operator load/mint closed (the exact Leg 1 unblock)", async () => {
+    const { masterKey, storage, checkpointDir, checkpointFiles } =
+      await buildArmedCheckpointFortress();
+
+    // Root-own every checkpoint + head-anchor file (EACCES on read at the
+    // operator uid), the state the pre-split root daemon left behind.
+    for (const f of checkpointFiles) {
+      await chmod(join(checkpointDir, f), 0o000);
+    }
+    try {
+      // CONTROL: with the boundary IGNORED (consultSplitBoundary: false, the
+      // pre-fix behavior for the checkpoint namespace), the operator actually
+      // attempts the permission-denied reads and surfaces a storage finding.
+      const unsealed = new AuditLog(storage, masterKey, {
+        integrityMode: "lenient",
+        consultSplitBoundary: false,
+      });
+      const controlFindings = await unsealed.getIntegrityFindings();
+      expect(
+        controlFindings.some((f) => f.kind === "storage_unavailable"),
+      ).toBe(true);
+
+      // THE FIX: an operator instance that consults the boundary skips the
+      // sealed-region checkpoints + head anchor it cannot read, so the load is
+      // clean AND a durable append (the exact audit write `file-grant mint`
+      // makes) succeeds in STRICT mode instead of throwing AuditIntegrityError.
+      const operator = new AuditLog(storage, masterKey, {
+        integrityMode: "strict",
+      });
+      await expect(operator.getIntegrityFindings()).resolves.toEqual([]);
+      await operator.appendCritical({
+        layer: "l1",
+        operation: "mint-durable-audit-write",
+        identity_id: "id-1",
+        result: "success",
+      });
+      await expect(operator.flush()).resolves.toBeUndefined();
+      expect((await operator.getChainHead()).sequence).toBe(7);
+    } finally {
+      for (const f of checkpointFiles) {
+        await chmod(join(checkpointDir, f), 0o600).catch(() => undefined);
+      }
+    }
+  });
+
+  it("still fails closed on an unreadable checkpoint ABOVE the sealed tip (integrity check NOT weakened)", async () => {
+    const { statePath, masterKey, storage } = await buildArmedCheckpointFortress();
+
+    // Write two post-split entries so a checkpoint lands ABOVE the sealed tip
+    // (seq 6): the checkpoint at seq 8 anchors the operator's own suffix, not
+    // the sealed region, so it must NOT be skipped when unreadable.
+    const pre = new AuditLog(storage, masterKey, { checkpointInterval: 2 });
+    await pre.appendCritical({ layer: "l1", operation: "post-1", identity_id: "id-1", result: "success" });
+    await pre.appendCritical({ layer: "l1", operation: "post-2", identity_id: "id-1", result: "success" });
+    await pre.flush();
+
+    const checkpointDir = join(statePath, "_audit_checkpoints");
+    const checkpointDirFiles = await readdir(checkpointDir);
+    // Find the highest-sequence checkpoint file (the seq-8 suffix checkpoint) by
+    // reading each record's checkpoint_sequence.
+    let topFile: string | undefined;
+    let topSeq = -1;
+    for (const f of checkpointDirFiles) {
+      const raw = await readFile(join(checkpointDir, f), "utf-8").catch(() => "");
+      try {
+        const rec = JSON.parse(raw);
+        if (
+          rec &&
+          rec.checkpoint_kind === "audit-checkpoint" &&
+          typeof rec.checkpoint_sequence === "number" &&
+          rec.checkpoint_sequence > topSeq
+        ) {
+          topSeq = rec.checkpoint_sequence;
+          topFile = f;
+        }
+      } catch {
+        // Not a checkpoint record (e.g. __head_anchor); ignore.
+      }
+    }
+    expect(topFile).toBeDefined();
+    expect(topSeq).toBeGreaterThan(6); // above the sealed tip
+
+    await chmod(join(checkpointDir, topFile!), 0o000);
+    try {
+      // An unreadable checkpoint ABOVE the sealed tip is a genuine problem, not
+      // sealed-region contamination: the load must surface a finding (fail
+      // closed), never silently skip it.
+      const operator = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+      const findings = await operator.getIntegrityFindings();
+      expect(findings.some((f) => f.kind === "storage_unavailable")).toBe(true);
+    } finally {
+      await chmod(join(checkpointDir, topFile!), 0o600).catch(() => undefined);
+    }
+  });
+
+  it("reconciles the secondary finding: an armed operator gets verified_suffix_only, not findings", async () => {
+    const { statePath, masterKey, storage, checkpointDir, checkpointFiles } =
+      await buildArmedCheckpointFortress();
+
+    // Root-own BOTH the sealed entries AND the checkpoints + head anchor, the
+    // full armed-box state. With the sealed entries unreadable, the sealed-
+    // region crypto walk returns `unreadable`, which is what should drive the
+    // operator verdict to `verified_suffix_only` (amber) once the checkpoint
+    // contamination no longer manufactures spurious `findings`. #929's PR body
+    // predicted this amber; Leg 1 found `findings` instead, because the
+    // checkpoint reads failed first.
+    const auditDir = join(statePath, "_audit");
+    const entryFiles = (await readdir(auditDir)).filter((f) => f.startsWith("entry-"));
+    for (const f of entryFiles) await chmod(join(auditDir, f), 0o000);
+    for (const f of checkpointFiles) await chmod(join(checkpointDir, f), 0o000);
+    try {
+      const report = await verifyFortressAuditFullPicture({ storage, masterKey });
+      expect(report.operator.status).toBe("verified_suffix_only");
+      expect(report.operator.sealed_region?.status).toBe("unreadable");
+    } finally {
+      for (const f of entryFiles) await chmod(join(auditDir, f), 0o600).catch(() => undefined);
+      for (const f of checkpointFiles) await chmod(join(checkpointDir, f), 0o600).catch(() => undefined);
+    }
+  });
+
+  // Finding 1 (adversarial gate 2026-07-15): the head-anchor `unreadable_sealed`
+  // suppression must NOT launder a post-split tail truncation. If a suffix
+  // survives, the operator's OWN anchor is readable; an unreadable one is tamper.
+  it("Finding 1: an unreadable head anchor with a surviving post-split suffix FAILS CLOSED", async () => {
+    const { statePath, masterKey, storage } = await buildArmedCheckpointFortress();
+
+    // Operator writes a post-split suffix (entries above the sealed tip 6); this
+    // also writes an operator-owned, readable `__head_anchor` at the suffix head.
+    const operator = new AuditLog(storage, masterKey, { checkpointInterval: 100 });
+    await operator.appendCritical({ layer: "l1", operation: "s1", identity_id: "id-1", result: "success" });
+    await operator.appendCritical({ layer: "l1", operation: "s2", identity_id: "id-1", result: "success" });
+    await operator.flush();
+    expect((await operator.getChainHead()).sequence).toBeGreaterThan(6);
+
+    // Attacker makes the operator's OWN head anchor unreadable (0000) to try to
+    // force a lower-floor heal, while the suffix still survives.
+    const headAnchorFile = (await readdir(join(statePath, "_audit_checkpoints"))).find(
+      (f) => f.includes("head") || f.includes("anchor"),
+    );
+    // Fall back: chmod every checkpoint file (the head anchor is among them).
+    const cpDir = join(statePath, "_audit_checkpoints");
+    const cpFiles = await readdir(cpDir);
+    for (const f of cpFiles) await chmod(join(cpDir, f), 0o000);
+    try {
+      const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+      const findings = await reader.getIntegrityFindings();
+      expect(findings.some((f) => f.kind === "tail_anchor_invalid")).toBe(true);
+      void headAnchorFile;
+    } finally {
+      for (const f of cpFiles) await chmod(join(cpDir, f), 0o600).catch(() => undefined);
+    }
+  });
+
+  // Finding 1 (full-suffix-erasure variant): even with NO surviving suffix, a
+  // fortress that ONCE established a post-split suffix (marker set) whose suffix
+  // + suffix checkpoints were erased and whose anchor was hidden must FAIL
+  // CLOSED via the operator-provenance suffix-established marker.
+  it("Finding 1: full-suffix erasure with a hidden anchor FAILS CLOSED via the suffix-established marker", async () => {
+    const { statePath, masterKey, storage } = await buildArmedCheckpointFortress();
+
+    // Establish a post-split suffix (writes the operator-provenance
+    // AUDIT_POST_SPLIT_SUFFIX_ESTABLISHED marker in _meta).
+    const operator = new AuditLog(storage, masterKey, { checkpointInterval: 2 });
+    for (let i = 0; i < 4; i++) {
+      await operator.appendCritical({ layer: "l1", operation: `s-${i}`, identity_id: "id-1", result: "success" });
+    }
+    await operator.flush();
+
+    // Attacker erases the ENTIRE post-split suffix (entries AND checkpoints above
+    // the sealed tip 6) and hides the head anchor (unreadable), so the surviving
+    // store looks exactly like a fresh just-migrated box.
+    const auditDir = join(statePath, "_audit");
+    for (const f of (await readdir(auditDir)).filter((x) => x.startsWith("entry-"))) {
+      const seq = Number(/^entry-(\d{20})-/.exec(f)?.[1] ?? "0");
+      if (seq > 6) await unlink(join(auditDir, f));
+    }
+    const cpDir = join(statePath, "_audit_checkpoints");
+    for (const f of await readdir(cpDir)) {
+      const raw = await readFile(join(cpDir, f), "utf-8").catch(() => "");
+      let isSuffixCheckpoint = false;
+      try {
+        const rec = JSON.parse(raw);
+        isSuffixCheckpoint =
+          rec?.checkpoint_kind === "audit-checkpoint" &&
+          typeof rec.checkpoint_sequence === "number" &&
+          rec.checkpoint_sequence > 6;
+      } catch {
+        // __head_anchor / non-record: hide it (unreadable), do not delete.
+      }
+      if (isSuffixCheckpoint) {
+        await unlink(join(cpDir, f));
+      } else {
+        await chmod(join(cpDir, f), 0o000); // hide the head anchor + sealed cps
+      }
+    }
+    try {
+      const reader = new AuditLog(storage, masterKey, { integrityMode: "lenient" });
+      const findings = await reader.getIntegrityFindings();
+      // The suffix-established marker (untouched, operator-owned in _meta) proves
+      // a suffix existed, so the hidden anchor + erased suffix is caught.
+      expect(findings.some((f) => f.kind === "tail_anchor_invalid")).toBe(true);
+    } finally {
+      for (const f of await readdir(cpDir).catch(() => [])) {
+        await chmod(join(cpDir, f), 0o600).catch(() => undefined);
+      }
     }
   });
 });

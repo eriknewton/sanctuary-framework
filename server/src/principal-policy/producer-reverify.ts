@@ -44,6 +44,15 @@ import {
   CASTLE_WALL_EVIDENCE_BASIS_PRODUCER_SIGNED,
 } from "../castle-wall/constants.js";
 import {
+  parseCastleWallSignedCanonicalBody,
+  signedCanonicalIdentityId,
+} from "../castle-wall/audit-attribution.js";
+import {
+  fortressIdFromProtectionSubject,
+  isLegacyMacOSAuditTokenHex,
+  protectionSubjectFromMacOSAuditToken,
+} from "../castle-wall/subject-binding.js";
+import {
   BROKER_EVIDENCE_BASIS_DETAIL_KEY,
   BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED,
   BROKER_PRODUCER_CAPTURED_AT_MS_DETAIL_KEY,
@@ -55,6 +64,11 @@ import {
   verifyBrokerProducerSignature,
   type BrokerProducerSignatureInput,
 } from "../broker-mcp/producer-signature.js";
+import {
+  verifyProducerSignature,
+  type ProducerSignatureInput,
+  type ProducerSignatureVerdict,
+} from "../castle-wall/runtime/producer-signature.js";
 
 /**
  * The RAW `operation` string the persisted SIGNED canonical body attests to,
@@ -74,25 +88,75 @@ import {
 export function signedCanonicalOperation(
   details: Record<string, unknown>,
 ): string | null {
-  const canonical = details[CASTLE_WALL_PRODUCER_SIGNED_CANONICAL_DETAIL_KEY];
-  if (typeof canonical !== "string") return null;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(canonical);
-  } catch {
-    return null;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return null;
-  }
-  const op = (parsed as Record<string, unknown>).operation;
+  const parsed = parseCastleWallSignedCanonicalBody(details);
+  if (parsed === null) return null;
+  const op = parsed.operation;
   return typeof op === "string" ? op : null;
 }
-import {
-  verifyProducerSignature,
-  type ProducerSignatureInput,
-  type ProducerSignatureVerdict,
-} from "../castle-wall/runtime/producer-signature.js";
+
+function subjectFromSignedCanonicalValue(
+  value: unknown,
+  subjectFortressId?: string | null,
+): string | null {
+  if (typeof value !== "string" || value.length === 0) return null;
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  if (fortressIdFromProtectionSubject(value) !== subjectFortressId) return null;
+  return value;
+}
+
+function macOSSubjectFromSignedCanonicalDetails(
+  parsed: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): string | null {
+  const parsedDetails = parsed.details;
+  if (
+    parsedDetails === null ||
+    typeof parsedDetails !== "object" ||
+    Array.isArray(parsedDetails)
+  ) {
+    return null;
+  }
+  const details = parsedDetails as Record<string, unknown>;
+  const agentId = details.agent_id;
+  if (typeof agentId !== "string") {
+    return null;
+  }
+  if (subjectFortressId === null || subjectFortressId === undefined) return null;
+  return protectionSubjectFromMacOSAuditToken(subjectFortressId, agentId);
+}
+
+export type SignedCanonicalSubjectIssue = "pre_canonical_linux_agent_name";
+
+/**
+ * Classify a verified producer-signed body whose subject could not be accepted.
+ *
+ * Callers use this only after the producer signature has verified. It lets
+ * operator-facing surfaces distinguish old Linux daemon output (`identity_id` was
+ * still an agent name) from a canonical subject mismatch, while keeping both
+ * states non-green.
+ */
+export function signedCanonicalSubjectIssue(
+  details: Record<string, unknown>,
+  subjectFortressId?: string | null,
+): SignedCanonicalSubjectIssue | null {
+  const parsed = parseCastleWallSignedCanonicalBody(details);
+  if (parsed === null) return null;
+  const identityId = parsed.identity_id;
+  if (typeof identityId !== "string" || identityId.length === 0) return null;
+  if (subjectFromSignedCanonicalValue(identityId, subjectFortressId) !== null) {
+    return null;
+  }
+  if (macOSSubjectFromSignedCanonicalDetails(parsed, subjectFortressId) !== null) {
+    return null;
+  }
+  if (
+    fortressIdFromProtectionSubject(identityId) !== null ||
+    isLegacyMacOSAuditTokenHex(identityId)
+  ) {
+    return null;
+  }
+  return "pre_canonical_linux_agent_name";
+}
 
 /**
  * The injectable verify function shape — defaults to `verifyProducerSignature`
@@ -139,6 +203,11 @@ export interface EntryReverifyResult {
   basis: EntryReverifyBasis;
   /** The signature-bound capture time (ms), present only when verified. */
   signedCapturedAtMs: number | null;
+  /**
+   * The signature-bound subject from the signed canonical body. Present only
+   * when the producer signature verifies and the signed body names a subject.
+   */
+  signedIdentityId: string | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -170,10 +239,12 @@ export function reverifyEntryProducerSignature(
   details: unknown,
   pinnedProducerKeyB64url: string | null,
   verify: VerifyProducerSignatureFn = verifyProducerSignature,
+  subjectFortressId?: string | null,
 ): EntryReverifyResult {
   const channel: EntryReverifyResult = {
     basis: "channel_authenticated",
     signedCapturedAtMs: null,
+    signedIdentityId: null,
   };
   if (!isRecord(details)) return channel;
 
@@ -214,7 +285,11 @@ export function reverifyEntryProducerSignature(
     typeof capturedAtUnixMs !== "number" ||
     typeof seq !== "number"
   ) {
-    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+    return {
+      basis: "producer_signed_rejected",
+      signedCapturedAtMs: null,
+      signedIdentityId: null,
+    };
   }
 
   const input: ProducerSignatureInput = {
@@ -226,7 +301,11 @@ export function reverifyEntryProducerSignature(
   };
   const verdict = verify(input, pinnedProducerKeyB64url);
   if (!verdict.ok) {
-    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+    return {
+      basis: "producer_signed_rejected",
+      signedCapturedAtMs: null,
+      signedIdentityId: null,
+    };
   }
   // Verified: carry the SIGNATURE-BOUND capture time so the reader judges
   // freshness from it, not the forgeable top-level audit timestamp. This closes
@@ -236,6 +315,7 @@ export function reverifyEntryProducerSignature(
   return {
     basis: "producer_signed_verified",
     signedCapturedAtMs: capturedAtUnixMs,
+    signedIdentityId: signedCanonicalIdentityId(details, subjectFortressId),
   };
 }
 
@@ -251,13 +331,25 @@ export function reverifyBrokerEntryProducerSignature(
   pinnedProducerKeyB64url: string | null,
 ): EntryReverifyResult {
   if (!isRecord(details)) {
-    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+    return {
+      basis: "producer_signed_rejected",
+      signedCapturedAtMs: null,
+      signedIdentityId: null,
+    };
   }
   if (details[BROKER_EVIDENCE_BASIS_DETAIL_KEY] !== BROKER_EVIDENCE_BASIS_PRODUCER_SIGNED) {
-    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+    return {
+      basis: "producer_signed_rejected",
+      signedCapturedAtMs: null,
+      signedIdentityId: null,
+    };
   }
   if (pinnedProducerKeyB64url === null) {
-    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+    return {
+      basis: "producer_signed_rejected",
+      signedCapturedAtMs: null,
+      signedIdentityId: null,
+    };
   }
 
   const signatureB64url = details[BROKER_PRODUCER_SIG_DETAIL_KEY];
@@ -275,7 +367,11 @@ export function reverifyBrokerEntryProducerSignature(
     typeof capturedAtUnixMs !== "number" ||
     typeof seq !== "number"
   ) {
-    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+    return {
+      basis: "producer_signed_rejected",
+      signedCapturedAtMs: null,
+      signedIdentityId: null,
+    };
   }
 
   const input: BrokerProducerSignatureInput = {
@@ -288,11 +384,16 @@ export function reverifyBrokerEntryProducerSignature(
   };
   const verdict = verifyBrokerProducerSignature(input, pinnedProducerKeyB64url);
   if (!verdict.ok) {
-    return { basis: "producer_signed_rejected", signedCapturedAtMs: null };
+    return {
+      basis: "producer_signed_rejected",
+      signedCapturedAtMs: null,
+      signedIdentityId: null,
+    };
   }
   return {
     basis: "producer_signed_verified",
     signedCapturedAtMs: capturedAtUnixMs,
+    signedIdentityId: null,
   };
 }
 
@@ -360,6 +461,25 @@ export function livenessEntryCounts(basis: EntryReverifyBasis): boolean {
 /** Broker liveness counts only on a verified producer signature. */
 export function brokerLivenessEntryCounts(basis: EntryReverifyBasis): boolean {
   return basis === "producer_signed_verified";
+}
+
+/**
+ * Subject evidence after read-side re-verification.
+ *
+ * For a verified producer-signed Castle Wall entry, the signed canonical body is
+ * the only subject authority. The top-level audit row label is forgeable by the
+ * in-process appender and must not participate in subject-bound green decisions.
+ * Channel-basis entries have no signed body, so they retain the legacy row
+ * label floor.
+ */
+export function subjectEvidenceForReverifiedEntry(
+  entry: { identity_id?: unknown },
+  reverify: EntryReverifyResult,
+): { identity_id?: unknown } {
+  if (reverify.basis !== "producer_signed_verified") return entry;
+  return reverify.signedIdentityId === null
+    ? {}
+    : { identity_id: reverify.signedIdentityId };
 }
 
 /**

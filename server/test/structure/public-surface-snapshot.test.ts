@@ -36,10 +36,12 @@
  * {name, inputSchema}. reorg-surface-snapshots keeps descriptions present + non-empty.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { createTempHome } from "../helpers/temp-fortress.js";
 
 import {
   extractToolSurface,
@@ -68,6 +70,24 @@ const REGEN =
   "If this change is intentional + reviewed, regenerate the fixture in this " +
   "same PR with `npx tsx test/structure/gen-public-surface-snapshot.ts`. A " +
   "pure l1-l4 -> named-layer rename must NOT change it.";
+
+
+// Fortress hermeticity: the tool-catalog extractor boots the real server, and
+// `createSanctuaryServer` step 20 writes the config unconditionally. With
+// `HOME` left alone that write lands on the operator's own
+// `~/.sanctuary/sanctuary.json`. Moving `HOME` redirects the mkdir, the
+// permission tightening, and the config write onto a throwaway directory
+// without changing the surface under snapshot. `saveConfig` fails such a write
+// closed under Vitest, so removing this turns the leak into a loud failure.
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+
+beforeEach(async () => {
+  fortressHome = await createTempHome("sanctuary-public-surface");
+});
+
+afterEach(async () => {
+  await fortressHome.cleanup();
+});
 
 describe("public-surface snapshot: MCP tool catalog", () => {
   it("the full agent-facing tool catalog ({name, inputSchema}, by name) matches the committed golden", async () => {

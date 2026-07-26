@@ -33,6 +33,10 @@ import {
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
 } from "../constants.js";
 import { buildAuditEvent } from "../audit/builder.js";
+import {
+  EMISSION_STALL_LOG_PREFIX,
+  type EmissionLivenessNotes,
+} from "../audit/emission-liveness.js";
 import type {
   AuditEmitNotification,
   AuditProducerSignatureNotification,
@@ -49,6 +53,7 @@ import {
   type AuditSink,
   type CriticalEventEnvelope,
 } from "./audit-consumer.js";
+import { protectionSubjectFromMacOSAuditToken } from "../subject-binding.js";
 
 /** The runtime's view of a registered macOS subscriber. */
 export interface MacOSSubscriber {
@@ -105,6 +110,13 @@ export interface MacOSFlowEventConsumerInput {
   approvalQueue: MacOSApprovalQueue;
   auditSink: AuditSink;
   /**
+   * Stable fortress id whose wall is producing these events. Required for the
+   * macOS subject binding that turns the per-process audit_token_t into the
+   * canonical `fortress/uid` claim subject. Tests that omit it fall back to the
+   * signed manifest fortress id.
+   */
+  fortressId?: string;
+  /**
    * Default approval timeout in seconds, used when the extension reports
    * `expires_in_seconds <= 0`. Mirrors the existing
    * `CASTLE_WALL_DEFAULT_PROMPT_TIMEOUT_SECONDS` knob; passed in so tests
@@ -119,6 +131,14 @@ export interface MacOSFlowEventConsumerInput {
    */
   pinnedProducerKeyB64url?: string | null;
   now?: () => number;
+  /**
+   * Optional decided-vs-emitted divergence feed (Slice M emission-liveness
+   * watchdog). Every `flow_decision_recorded` arrival is noted as a decision;
+   * only a successful enforcement persist is noted as an emission; every
+   * reject/persist-failure path is noted as a rejection. The daemon owns the
+   * watchdog's tick timer and loud outputs; this consumer only feeds it.
+   */
+  emissionLiveness?: EmissionLivenessNotes;
 }
 
 /**
@@ -131,8 +151,10 @@ export class MacOSFlowEventConsumer {
   private readonly manifestProvider: MacOSManifestProvider;
   private readonly approvalQueue: MacOSApprovalQueue;
   private readonly auditSink: AuditSink;
+  private readonly fortressId: string;
   private readonly defaultApprovalTimeoutSeconds: number;
   private readonly producerAuditConsumer: AuditConsumer | null;
+  private readonly emissionLiveness: EmissionLivenessNotes | null;
   private stats: MacOSFlowEventStats = {
     subscribers: 0,
     manifestSnapshotsEmitted: 0,
@@ -148,7 +170,9 @@ export class MacOSFlowEventConsumer {
     this.manifestProvider = input.manifestProvider;
     this.approvalQueue = input.approvalQueue;
     this.auditSink = input.auditSink;
+    this.fortressId = resolveMacOSFlowFortressId(input);
     this.defaultApprovalTimeoutSeconds = input.defaultApprovalTimeoutSeconds;
+    this.emissionLiveness = input.emissionLiveness ?? null;
     this.producerAuditConsumer =
       typeof input.pinnedProducerKeyB64url === "string" &&
       input.pinnedProducerKeyB64url.length > 0
@@ -233,9 +257,15 @@ export class MacOSFlowEventConsumer {
   async handleFlowDecisionRecorded(
     notification: FlowDecisionRecordedNotification
   ): Promise<void> {
-    const reason = validateFlowDecisionRecorded(notification);
+    // Slice M emission-liveness: an ARRIVING flow_decision_recorded is
+    // evidence the wall reports having decided a flow, independent of whether
+    // it persists below. Noted FIRST so every downstream reject path counts
+    // as decided-but-not-emitted divergence, never as silence.
+    this.emissionLiveness?.noteDecision("flow_decision_recorded");
+    const reason = validateFlowDecisionRecorded(notification, this.fortressId);
     if (reason !== null) {
       this.stats.decisionsRejected += 1;
+      this.emissionLiveness?.noteRejection(`validation:${reason}`);
       await this.auditSink.append(
         CASTLE_WALL_AUDIT_LAYER,
         "flow_decision_rejected",
@@ -251,12 +281,34 @@ export class MacOSFlowEventConsumer {
     if (this.producerAuditConsumer !== null) {
       try {
         await this.producerAuditConsumer.ingestCritical(
-          buildProducerSignedEnvelope(notification, eventType)
+          buildProducerSignedEnvelope(notification, eventType, this.fortressId)
         );
         this.stats.decisionsRecorded += 1;
+        this.emissionLiveness?.noteEmission();
       } catch (err) {
         this.stats.decisionsRejected += 1;
-        if (err instanceof AuditChainError) return;
+        if (err instanceof AuditChainError) {
+          // The consumer has already durably recorded the rejection entry
+          // before throwing (audit_event_rejected / producer_signature_rejected
+          // / wal_chain_verification_failed), but this catch used to be
+          // stderr-silent. Root-cause pass 2026-07-17: a rejection BURST here
+          // is a decided-but-not-emitted divergence and must be loud, so it
+          // feeds the watchdog and leaves one greppable stderr line.
+          this.emissionLiveness?.noteRejection(
+            `audit_chain:${err.message}`
+          );
+          // SAFETY: the AuditChainError swallow used to be stderr-silent; a
+          // rejection burst is a decided-but-not-emitted divergence and must
+          // leave one greppable operator line (the rejection entry itself is
+          // already durably recorded by the consumer before the throw).
+          console.error(
+            `${EMISSION_STALL_LOG_PREFIX} flow_decision_recorded rejected by the audit chain gate (recorded as a rejection entry, NOT persisted as evidence): ${err.message}`
+          );
+          return;
+        }
+        this.emissionLiveness?.noteRejection(
+          `persist_error:${err instanceof Error ? err.message : String(err)}`
+        );
         throw err;
       }
       return;
@@ -279,29 +331,46 @@ export class MacOSFlowEventConsumer {
     // detail key added here stays private by default (no denylist to forget to
     // update). The operator reads the unredacted entry via the Castle Wall CLI /
     // dashboard.
-    await this.auditSink.append(
-      CASTLE_WALL_AUDIT_LAYER,
-      eventType,
-      notification.agent.id,
-      {
-        agent: notification.agent,
-        destination: notification.destination,
-        decision: notification.decision,
-        rule_id: notification.matched_rule_id ?? null,
-        recorded_at: notification.recorded_at,
-        source: "macos_extension",
-        // Provenance marker stamped LAST: this entry is genuine Castle Wall
-        // enforcement evidence, so the honest posture readers (posture.ts G4,
-        // the ARMED banner, the dashboard shield) count it as armed. Without
-        // this, a genuinely-enforcing macOS wall reads amber/"not confirmed"
-        // (the 2026-06-17 under-claim). Stamped last + from constructed fields
-        // only (no untrusted spread), so an inbound forged cw_source cannot win.
-        [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
-      },
-      "success"
-    );
-    await this.auditSink.flush();
+    try {
+      const subject = macOSFlowProtectionSubject(
+        this.fortressId,
+        notification.agent.id,
+      );
+      await this.auditSink.append(
+        CASTLE_WALL_AUDIT_LAYER,
+        eventType,
+        subject,
+        {
+          agent: notification.agent,
+          agent_id: notification.agent.id,
+          agent_template: notification.agent.template,
+          destination: notification.destination,
+          decision: notification.decision,
+          rule_id: notification.matched_rule_id ?? null,
+          recorded_at: notification.recorded_at,
+          source: "macos_extension",
+          // Provenance marker stamped LAST: this entry is genuine Castle Wall
+          // enforcement evidence, so the honest posture readers (posture.ts G4,
+          // the ARMED banner, the dashboard shield) count it as armed. Without
+          // this, a genuinely-enforcing macOS wall reads amber/"not confirmed"
+          // (the 2026-06-17 under-claim). Stamped last + from constructed fields
+          // only (no untrusted spread), so an inbound forged cw_source cannot win.
+          [CASTLE_WALL_AUDIT_PROVENANCE_KEY]: CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
+        },
+        "success"
+      );
+      await this.auditSink.flush();
+    } catch (err) {
+      // A failed channel-path persist re-throws to the listener (which logs
+      // to daemon stderr); the watchdog counts it so a persist-failure BURST
+      // shows up as decided-but-not-emitted divergence, not just log lines.
+      this.emissionLiveness?.noteRejection(
+        `persist_error:${err instanceof Error ? err.message : String(err)}`
+      );
+      throw err;
+    }
     this.stats.decisionsRecorded += 1;
+    this.emissionLiveness?.noteEmission();
   }
 
   /**
@@ -389,12 +458,13 @@ export class MacOSFlowEventConsumer {
 
 function buildProducerSignedEnvelope(
   notification: FlowDecisionRecordedNotification,
-  eventType: "egress_allowed" | "egress_blocked"
+  eventType: "egress_allowed" | "egress_blocked",
+  fortressId: string,
 ): CriticalEventEnvelope {
   const producer = normalizeProducerSignature(notification.producer);
   const event = buildAuditEvent({
     timestamp: notification.recorded_at,
-    fortress_id: notification.agent.id,
+    fortress_id: fortressId,
     event_type: eventType,
     agent: notification.agent,
     destination: notification.destination,
@@ -421,7 +491,19 @@ function buildProducerSignedEnvelope(
           },
         }
       : {}),
+    producerSubjectBinding: {
+      kind: "macos_audit_token",
+      fortressId,
+    },
   };
+}
+
+function macOSFlowProtectionSubject(fortressId: string, agentId: string): string {
+  const subject = protectionSubjectFromMacOSAuditToken(fortressId, agentId);
+  if (subject === null) {
+    throw new Error("agent.id must be a non-root macOS audit_token_t hex");
+  }
+  return subject;
 }
 
 function normalizeProducerSignature(
@@ -449,7 +531,8 @@ function normalizeProducerSignature(
  * valid; returns a short reason string otherwise.
  */
 export function validateFlowDecisionRecorded(
-  notification: FlowDecisionRecordedNotification
+  notification: FlowDecisionRecordedNotification,
+  fortressId = "validation",
 ): string | null {
   if (notification.type !== "flow_decision_recorded") {
     return `unexpected message type: ${String(notification.type)}`;
@@ -459,6 +542,9 @@ export function validateFlowDecisionRecorded(
   }
   if (!notification.agent || typeof notification.agent.id !== "string" || notification.agent.id.length === 0) {
     return "missing agent.id";
+  }
+  if (protectionSubjectFromMacOSAuditToken(fortressId, notification.agent.id) === null) {
+    return "agent.id must be a non-root macOS audit_token_t hex";
   }
   if (!notification.destination || typeof notification.destination.ip !== "string") {
     return "missing destination.ip";
@@ -471,6 +557,28 @@ export function validateFlowDecisionRecorded(
     return "matched_rule_id must be string or null";
   }
   return null;
+}
+
+function resolveMacOSFlowFortressId(input: MacOSFlowEventConsumerInput): string {
+  if (typeof input.fortressId === "string" && input.fortressId.length > 0) {
+    return input.fortressId;
+  }
+  try {
+    const manifestFortressId =
+      input.manifestProvider.currentSnapshot().signed_manifest?.manifest
+        ?.fortress_id;
+    if (
+      typeof manifestFortressId === "string" &&
+      manifestFortressId.length > 0
+    ) {
+      return manifestFortressId;
+    }
+  } catch {
+    // The provider is still allowed to fail when a manifest is actually read;
+    // construction itself must not hard-crash for tests/CLI readers that never
+    // subscribe to the manifest.
+  }
+  return "unknown";
 }
 
 /**

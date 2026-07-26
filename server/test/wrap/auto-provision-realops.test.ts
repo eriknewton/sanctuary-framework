@@ -33,7 +33,7 @@
  * per the re-gate spec's chokepoint requirement.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir, writeFile, readFile, access, chmod, lstat, stat, symlink, readlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -48,18 +48,26 @@ import {
   disarmExitCodeDecision,
   hermesEndpointProbes,
   allHermesCredentialDestPaths,
+  resolveCredentialDestPathsToVerify,
   resolveWallFortressPath,
   resolveHarnessDaemonLogDir,
   hermesRuntimeRehomePaths,
   moveAsideStaleHermesRuntimeDestination,
   policyDaemonInstallBootArgs,
   resolvePolicyDaemonActionForAutoProvision,
+  decideDsclAttributeRead,
+  decideDsclRecordRead,
+  dsclDiagnostic,
   runLaunchctlWithTimeout,
   LAUNCHCTL_TIMEOUT_MS,
   LAUNCHCTL_KILL_SIGNAL,
   runAgentEgressProbesAsUid,
+  buildHermesExclusiveCliWiring,
+  describeRepairCoarseComposition,
+  resolveGateDaemonArgvPrefix,
 } from "../../src/wrap/auto-provision.js";
 import { HERMES_ENDPOINT_SET } from "../../src/castle-wall/provision/egress.js";
+import { harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
 import {
   planRehome,
   executeRehomePlan,
@@ -68,6 +76,217 @@ import {
   type RehomeOps,
 } from "../../src/castle-wall/provision/rehome.js";
 import { verifyReachabilityBeforeArm } from "../../src/castle-wall/provision/verify.js";
+
+describe("wrap/auto-provision real-ops chokepoint: dscl read classifiers (fix round-3 B1)", () => {
+  it("distinguishes an absent attribute from an absent record when No such key is on stderr with exit 0", () => {
+    expect(
+      decideDsclAttributeRead("UniqueID", {
+        code: 0,
+        stdout: "",
+        stderr: "No such key: UniqueID\n",
+      }),
+    ).toEqual({ kind: "attribute-absent" });
+    expect(
+      decideDsclRecordRead({
+        code: 0,
+        stdout: "RecordName: sanctuary-hermes\n",
+        stderr: "",
+      }),
+    ).toBe("present");
+  });
+
+  it("recognizes absent records from dscl eDSRecordNotFound diagnostics", () => {
+    const absent = {
+      code: 56,
+      stdout: "",
+      stderr: "/usr/bin/dscl DS Error: -14136 (eDSRecordNotFound)\n",
+    };
+    expect(decideDsclRecordRead(absent)).toBe("record-absent");
+    expect(decideDsclAttributeRead("UniqueID", absent)).toEqual({ kind: "record-absent" });
+  });
+
+  it("preserves the full attribute value instead of truncating at the first space", () => {
+    expect(
+      decideDsclAttributeRead("NFSHomeDirectory", {
+        code: 0,
+        stdout: "NFSHomeDirectory: /var/sanctuary agents/sanctuary-hermes\n",
+        stderr: "",
+      }),
+    ).toEqual({ kind: "value", value: "/var/sanctuary agents/sanctuary-hermes" });
+  });
+
+  it("S5 drill: parses the native IsHidden capture without losing absent-record classifications or suffix anchoring", () => {
+    // Captured from the drill host with od -c: dsAttrTypeNative:IsHidden: 1\n.
+    const capturedNativeIsHiddenStdout = "dsAttrTypeNative:IsHidden: 1\n";
+    expect(Buffer.byteLength(capturedNativeIsHiddenStdout, "utf8")).toBe(29);
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 0,
+        stdout: capturedNativeIsHiddenStdout,
+        stderr: "",
+      }),
+    ).toEqual({ kind: "value", value: "1" });
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 0,
+        stdout: "IsHidden: 1\n",
+        stderr: "",
+      }),
+    ).toEqual({ kind: "value", value: "1" });
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 0,
+        stdout: "",
+        stderr: "No such key: IsHidden\n",
+      }),
+    ).toEqual({ kind: "attribute-absent" });
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 56,
+        stdout: "",
+        stderr: "/usr/bin/dscl DS Error: -14136 (eDSRecordNotFound)\n",
+      }),
+    ).toEqual({ kind: "record-absent" });
+    expect(
+      decideDsclAttributeRead("IsHidden", {
+        code: 0,
+        stdout: "NotIsHidden: 1\n",
+        stderr: "",
+      }).kind,
+    ).toBe("unknown");
+  });
+
+  it("S5 drill: diagnoses the native IsHidden capture as an attribute line", () => {
+    const capturedNativeIsHiddenStdout = "dsAttrTypeNative:IsHidden: 1\n";
+    const diagnostic = dsclDiagnostic({
+      code: 0,
+      stdout: capturedNativeIsHiddenStdout,
+      stderr: "",
+    });
+    expect(diagnostic).toContain("stdout: 29 bytes");
+    expect(diagnostic).toContain("attributes=[IsHidden]");
+    expect(diagnostic).not.toContain("unclassified-lines");
+  });
+
+  it("diagnoses an underscore-prefixed native attribute rather than calling it residue", () => {
+    // Real macOS emits native attributes whose names begin with an underscore,
+    // e.g. `dscl . -read /Users/<x> _writers_passwd`. Naming no attribute here
+    // is what sent an operator to repair a healthy account on 2026-07-20.
+    const diagnostic = dsclDiagnostic({
+      code: 0,
+      stdout: "dsAttrTypeNative:_writers_passwd: eriknewton\n",
+      stderr: "",
+    });
+    expect(diagnostic).toContain("attributes=[_writers_passwd]");
+    expect(diagnostic).not.toContain("unclassified-lines");
+  });
+
+  it("still counts genuinely unparseable dscl output as residue", () => {
+    // The fail-closed property must survive widening the attribute charclass.
+    expect(dsclDiagnostic({ code: 0, stdout: "total nonsense here\n", stderr: "" })).toContain(
+      "unclassified-lines=1",
+    );
+    expect(
+      dsclDiagnostic({
+        code: 0,
+        stdout: "dsAttrTypeNative:dsAttrTypeNative:IsHidden: 1\n",
+        stderr: "",
+      }),
+    ).toContain("unclassified-lines=1");
+  });
+
+  it("returns unknown rather than claiming absence on unclassified dscl output", () => {
+    expect(
+      decideDsclRecordRead({
+        code: 5,
+        stdout: "",
+        stderr: "DirectoryService daemon unavailable",
+      }),
+    ).toBe("unknown");
+    expect(
+      decideDsclAttributeRead("UserShell", {
+        code: 0,
+        stdout: "",
+        stderr: "",
+      }),
+    ).toEqual({ kind: "unknown", diagnostic: "" });
+  });
+
+  it("B4: the existence probe reads only UniqueID, never the whole account record", async () => {
+    const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
+    expect(source).toContain('[".", "-read", `/Users/${accountName}`, "UniqueID"]');
+    expect(source).not.toMatch(
+      /dsclReadResult\(\[\s*"\.",\s*"-read",\s*`\/Users\/\$\{accountName\}`\s*\]\)/,
+    );
+  });
+
+  it("A3: agent account creation has a direct candidate-uid observation and excluded-uid backstop", async () => {
+    const source = await readFile(new URL("../../src/wrap/auto-provision.ts", import.meta.url), "utf8");
+    expect(source).toContain("excludedUids: excludedAgentAccountUids");
+    expect(source).toContain("lookupAccountNamesByUid: async (uid: number)");
+    expect(source).toContain('[".", "-search", "/Users", "UniqueID", String(uid)]');
+    expect(source).toContain("...(runningAgentUid !== undefined ? [runningAgentUid] : [])");
+    expect(source).not.toContain('accountShapeVerdict !== "verified-dedicated" ? [candidateUid] : []');
+  });
+
+  it("B4: an execFile maxBuffer overflow is explicit unknown, not a normal exit-1 record absence", () => {
+    expect(
+      decideDsclRecordRead({
+        code: 1,
+        execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+        stdout: "AuthenticationAuthority: secret-aa\n",
+        stderr: "",
+      }),
+    ).toBe("unknown");
+    const attributeDecision = decideDsclAttributeRead("UniqueID", {
+      code: 1,
+      execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      stdout: "AuthenticationAuthority: secret-aa\n",
+      stderr: "",
+    });
+    expect(attributeDecision.kind).toBe("unknown");
+    if (attributeDecision.kind === "unknown") {
+      expect(attributeDecision.diagnostic).toContain("exec-error=ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+      expect(attributeDecision.diagnostic).toContain("attributes=[AuthenticationAuthority]");
+      expect(attributeDecision.diagnostic).not.toContain("secret-aa");
+    }
+  });
+
+  it("B4: dscl diagnostics summarize oversized records without leaking value payloads", () => {
+    const hugeRecord = [
+      "AuthenticationAuthority: super-secret-auth-authority",
+      `JPEGPhoto: ${"A".repeat(1024 * 1024)}`,
+      "GeneratedUID: generated-secret-value",
+      "ShadowHashData: salted-sha512-password-verifier",
+    ].join("\n");
+    const diagnostic = dsclDiagnostic({
+      code: 1,
+      execErrorCode: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      stdout: hugeRecord,
+      stderr: "",
+    });
+    expect(diagnostic.length).toBeLessThanOrEqual(512);
+    expect(diagnostic).toContain("exec-error=ERR_CHILD_PROCESS_STDIO_MAXBUFFER");
+    expect(diagnostic).toContain("attributes=[AuthenticationAuthority");
+    expect(diagnostic).toContain("GeneratedUID");
+    expect(diagnostic).toContain("JPEGPhoto");
+    expect(diagnostic).toContain("ShadowHashData");
+    expect(diagnostic).not.toContain("super-secret-auth-authority");
+    expect(diagnostic).not.toContain("generated-secret-value");
+    expect(diagnostic).not.toContain("salted-sha512-password-verifier");
+    expect(diagnostic).not.toContain("A".repeat(64));
+  });
+
+  it("B4: mixed diagnostics are unknown, not record-absent by any-match", () => {
+    const mixed = {
+      code: 56,
+      stdout: "",
+      stderr: "DirectoryService daemon unavailable\n/usr/bin/dscl DS Error: -14136 (eDSRecordNotFound)\n",
+    };
+    expect(decideDsclRecordRead(mixed)).toBe("unknown");
+    expect(decideDsclAttributeRead("UniqueID", mixed).kind).toBe("unknown");
+  });
+});
 
 describe("wrap/auto-provision real-ops chokepoint: credentialReadableAsUidDecision (fix R1)", () => {
   it("ENOENT (statResult undefined) -> false: an absent moved credential is never a pass", () => {
@@ -1211,23 +1430,50 @@ describe("wrap/auto-provision real-ops chokepoint: symlink-safe recursive chmod/
 describe("wrap/auto-provision real-ops chokepoint: dscl -search parser (fix round-5 N4)", () => {
   it("parses the account name from the real PARENTHESIZED multi-line dscl -search output (the pre-fix regex never matched this)", () => {
     const realOutput = "eriknewton\t\tUniqueID = (\n    501\n)\n";
-    expect(parseDsclSearchAccountNames(realOutput)).toEqual(["eriknewton"]);
+    expect(parseDsclSearchAccountNames(realOutput, 501)).toEqual(["eriknewton"]);
+  });
+
+  it("parses quoted numeric uid values from dscl -search output", () => {
+    expect(parseDsclSearchAccountNames("nobody\t\tUniqueID = (\n    \"-2\"\n)\n", -2)).toEqual(["nobody"]);
+    expect(parseDsclSearchAccountNames("sanctuary-hermes\t\tUniqueID = (\n    \"503\"\n)\n", 503)).toEqual(["sanctuary-hermes"]);
   });
 
   it("also parses the single-line form (name  UniqueID = 501)", () => {
-    expect(parseDsclSearchAccountNames("sanctuary-hermes  UniqueID = 502\n")).toEqual(["sanctuary-hermes"]);
+    expect(parseDsclSearchAccountNames("sanctuary-hermes  UniqueID = 502\n", 502)).toEqual(["sanctuary-hermes"]);
   });
 
   it("returns every matched record name when a -search returns more than one", () => {
     const twoRecords = "first\t\tUniqueID = (\n    501\n)\nsecond\t\tUniqueID = (\n    501\n)\n";
-    expect(parseDsclSearchAccountNames(twoRecords)).toEqual(["first", "second"]);
+    expect(parseDsclSearchAccountNames(twoRecords, 501)).toEqual(["first", "second"]);
   });
 
-  it("returns [] on output with no UniqueID record line (fail-closed: no fabricated name)", () => {
-    expect(parseDsclSearchAccountNames("")).toEqual([]);
-    expect(parseDsclSearchAccountNames("NFSHomeDirectory: /Users/x\n")).toEqual([]);
-    // The value lines inside the parentheses must NOT be mistaken for names.
-    expect(parseDsclSearchAccountNames("    501\n)\n")).toEqual([]);
+  it("parses a holder record whose account name contains a space", () => {
+    expect(parseDsclSearchAccountNames("Legacy Admin\t\tUniqueID = (\n    503\n)\n", 503)).toEqual(["Legacy Admin"]);
+  });
+
+  it("returns [] only on empty output", () => {
+    expect(parseDsclSearchAccountNames("", 503)).toEqual([]);
+  });
+
+  it("rejects a parsed holder record whose UniqueID is not the searched uid", () => {
+    expect(() => parseDsclSearchAccountNames("sanctuary-gate-hermes  UniqueID = 999\n", 503)).toThrow(
+      /record "sanctuary-gate-hermes" reported UniqueID=999, expected 503/,
+    );
+  });
+
+  it("renders residue counts from the same non-empty line count", () => {
+    const stdout = "eriknewton\t\tUniqueID = (\n    501\n)\nNFSHomeDirectory: /Users/eriknewton\n";
+    expect(() => parseDsclSearchAccountNames(stdout, 501)).toThrow(
+      /returned 4 non-empty lines, but only 3 parsed\/accounted for \(1 unparsed at line 4\)/,
+    );
+  });
+
+  it.each([
+    ["localized attribute name", "Legacy Admin\t\tIdentifiantUnique = (\n    503\n)\n"],
+    ["trailing unmatched line", "eriknewton\t\tUniqueID = (\n    501\n)\nNFSHomeDirectory: /Users/x\n"],
+    ["stray continuation", "    501\n)\n"],
+  ])("throws on %s because unparsed dscl output is not evidence of absence", (_name, stdout) => {
+    expect(() => parseDsclSearchAccountNames(stdout, 503)).toThrow(/Unparsed output is not evidence of absence/);
   });
 });
 
@@ -1459,7 +1705,11 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
     expect(credTargets[0]!.name).toContain(".hermes/.env");
   });
 
-  it("FIX R6-5: with no explicit moved-list (alreadyDedicated path), it falls back to the full adapter set (the account is presumed complete)", () => {
+  // FIX F-ALREADYDEDICATED: this `undefined` branch is no longer reachable
+  // from production -- `resolveCredentialDestPathsToVerify` (covered below)
+  // supplies a MEASURED set on the alreadyDedicated path too. Kept as the
+  // defensive last resort for a caller with no knowledge at all.
+  it("with no explicit list at all (defensive last resort, not a production path), it falls back to the full adapter set", () => {
     const targets = hermesEndpointProbes("/var/sanctuary-agents/sanctuary-hermes", 502, 502);
     const credTargets = targets.filter((t) => t.name.includes("moved credential"));
     expect(credTargets).toHaveLength(6);
@@ -1472,6 +1722,122 @@ describe("wrap/auto-provision real-ops chokepoint: probe-what-moved + directory 
     const guard = targets.find((t) => t.name.includes("nothing to confine"));
     expect(guard).toBeDefined();
     expect(await guard!.probe()).toBe(false);
+  });
+});
+
+/**
+ * FIX F-ALREADYDEDICATED (HIGH, Mini1 confined-Hermes drill 2026-07-26).
+ *
+ * On hardware the FIRST `protect --hermes` armed, and every SECOND and later
+ * run refused at verify-before-arm on `.hermes/auth.json`,
+ * `.google_workspace_mcp/credentials`, `.workspace-mcp/cli-tokens` and
+ * `.hermes/google-mcp-creds` -- four files a Hermes install with no Google
+ * Workspace MCP and no OAuth login has never had. Cause: the alreadyDedicated
+ * path skips re-home, left the moved-set `undefined`, and fell back to the
+ * full static adapter list. That is what made the exclusive-egress gate
+ * unarmable (and therefore what left drills P5 and #994 unmeasured).
+ *
+ * The fix does NOT widen the check: it recovers "what was actually moved" by
+ * OBSERVING the account, so a present-but-unreadable credential still fails
+ * and an account with nothing on it still refuses.
+ */
+describe("wrap/auto-provision: credential set to verify on the alreadyDedicated path (fix F-ALREADYDEDICATED)", () => {
+  let dir: string;
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "sanctuary-alreadydedicated-"));
+  });
+  afterEach(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const realExistsNoFollow = async (p: string): Promise<boolean> => {
+    try {
+      await lstat(p);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ENOENT";
+    }
+  };
+
+  it("REGRESSION: with no moved set (re-home did not run), the verified set is OBSERVED from the account -- credentials the install never had are never probed", async () => {
+    // The exact drill install: .env + config.yaml present, no OAuth/Google MCP.
+    await mkdir(join(dir, ".hermes"), { recursive: true });
+    await writeFile(join(dir, ".hermes", ".env"), "X=1\n");
+    await writeFile(join(dir, ".hermes", "config.yaml"), "a: 1\n");
+
+    const resolved = await resolveCredentialDestPathsToVerify({
+      movedThisRun: undefined,
+      newAccountHome: dir,
+      existsNoFollow: realExistsNoFollow,
+    });
+
+    expect(resolved.sort()).toEqual([".hermes/.env", ".hermes/config.yaml"]);
+    // The four the pre-fix static fallback demanded, and the install never had.
+    expect(resolved).not.toContain(".hermes/auth.json");
+    expect(resolved).not.toContain(".google_workspace_mcp/credentials");
+    expect(resolved).not.toContain(".workspace-mcp/cli-tokens");
+    expect(resolved).not.toContain(".hermes/google-mcp-creds");
+  });
+
+  it("REGRESSION: the resulting probe list lets a partial install arm -- only the observed credentials are probed", async () => {
+    await mkdir(join(dir, ".hermes"), { recursive: true });
+    await writeFile(join(dir, ".hermes", ".env"), "X=1\n");
+    const resolved = await resolveCredentialDestPathsToVerify({
+      movedThisRun: undefined,
+      newAccountHome: dir,
+      existsNoFollow: realExistsNoFollow,
+    });
+    const credTargets = hermesEndpointProbes(dir, 502, 502, resolved).filter((t) =>
+      t.name.includes("moved credential"),
+    );
+    expect(credTargets).toHaveLength(1);
+    expect(credTargets[0]!.name).toContain(".hermes/.env");
+  });
+
+  it("does NOT widen into a fail-open: an account with no credential at all returns [], which the R7-2 guard turns into a refusal", async () => {
+    const resolved = await resolveCredentialDestPathsToVerify({
+      movedThisRun: undefined,
+      newAccountHome: dir,
+      existsNoFollow: realExistsNoFollow,
+    });
+    expect(resolved).toEqual([]);
+    const guard = hermesEndpointProbes(dir, 502, 502, resolved).find((t) =>
+      t.name.includes("nothing to confine"),
+    );
+    expect(guard).toBeDefined();
+    expect(await guard!.probe()).toBe(false);
+  });
+
+  it("a DANGLING symlink at a credential path counts as present and is probed (fail-closed), never dropped from the verified set", async () => {
+    await mkdir(join(dir, ".hermes"), { recursive: true });
+    await symlink(join(dir, ".hermes", "gone"), join(dir, ".hermes", ".env"));
+    const resolved = await resolveCredentialDestPathsToVerify({
+      movedThisRun: undefined,
+      newAccountHome: dir,
+      existsNoFollow: realExistsNoFollow,
+    });
+    expect(resolved).toEqual([".hermes/.env"]);
+  });
+
+  it("the FRESH path is untouched: an explicit moved set passes through unchanged, including the empty set", async () => {
+    await mkdir(join(dir, ".hermes"), { recursive: true });
+    await writeFile(join(dir, ".hermes", "auth.json"), "{}\n");
+    // The account holds auth.json, but re-home says only .env moved: the moved
+    // set wins, because on the fresh path it is the stronger fact.
+    expect(
+      await resolveCredentialDestPathsToVerify({
+        movedThisRun: [".hermes/.env"],
+        newAccountHome: dir,
+        existsNoFollow: realExistsNoFollow,
+      }),
+    ).toEqual([".hermes/.env"]);
+    expect(
+      await resolveCredentialDestPathsToVerify({
+        movedThisRun: [],
+        newAccountHome: dir,
+        existsNoFollow: realExistsNoFollow,
+      }),
+    ).toEqual([]);
   });
 });
 
@@ -1591,5 +1957,99 @@ describe("confined-agent egress: runAgentEgressProbesAsUid (injected execFile, n
     expect(attempts.get("https://example.com:443/")).toBe(1);
     const control = report.rows[report.rows.length - 1]!;
     expect(control.pass).toBe(false);
+  });
+});
+
+describe("resolveGateDaemonArgvPrefix: gate-daemon interpreter chokepoint (real D9)", () => {
+  // Both provisioning builders route through this single helper, so pinning it
+  // here guards BOTH construction sites (the inline builder in
+  // runAutoProvisionForWrap AND buildHermesExclusiveCliWiring) against drifting
+  // back to a bare `[cliBinary]` shebang-dependent argv.
+  it("prefixes the node interpreter when a cliBinary is supplied (the D9 crash path)", () => {
+    const cliBinary = "/opt/sanctuary/dist/cli.js";
+    const prefix = resolveGateDaemonArgvPrefix(cliBinary);
+    expect(prefix[0]).toBe(process.execPath);
+    expect(prefix[1]).toBe(cliBinary);
+    // The bare-binary form the bug rode in on must never be the whole prefix.
+    expect(prefix).not.toEqual([cliBinary]);
+  });
+
+  it("prefixes the node interpreter when cliBinary is empty or undefined (the else branch that already worked)", () => {
+    expect(resolveGateDaemonArgvPrefix(undefined)[0]).toBe(process.execPath);
+    expect(resolveGateDaemonArgvPrefix("")[0]).toBe(process.execPath);
+  });
+});
+
+describe("buildHermesExclusiveCliWiring: gate-daemon interpreter prefix (real D9)", () => {
+  const baseInput = (cliBinary?: string) => ({
+    agentUid: 503,
+    accountName: "_sanctuary-hermes",
+    newAccountHome: "/var/empty/_sanctuary-hermes",
+    wallFortressPath: "/tmp/fortress",
+    harnessLaunch: harnessLaunchSpec({
+      programArguments: [process.execPath, "/opt/agent.js"],
+      environment: { HOME: "/var/empty/_sanctuary-hermes", PYTHONPATH: "/var/empty/_sanctuary-hermes/.hermes/hermes-agent" },
+    }),
+    operatorUid: 501,
+    auditSource: "test",
+    print: () => {},
+    // accountOps is not consulted when computing gateDaemonArgvPrefix.
+    accountOps: {} as never,
+    cliBinary,
+  });
+
+  it("prefixes the gate-daemon argv with the node interpreter when a cliBinary is supplied, so the daemon launches under a confined account whose launchd PATH has no `node`", () => {
+    // The confined gate account (uid 504) has no `node` on its launchd PATH.
+    // A bare `[cliBinary]` prefix relies on the `#!/usr/bin/env node` shebang,
+    // which fails with `env: node: No such file or directory` -- the real "D9"
+    // gate-daemon startup crash proven on hardware 2026-07-21. The interpreter
+    // must be pinned explicitly via process.execPath.
+    const cliBinary = "/opt/sanctuary/dist/cli.js";
+    const wiring = buildHermesExclusiveCliWiring(baseInput(cliBinary));
+    expect(wiring.gateDaemonArgvPrefix[0]).toBe(process.execPath);
+    expect(wiring.gateDaemonArgvPrefix[1]).toBe(cliBinary);
+    // The bare-binary form (which the shebang crash rode in on) must never be
+    // the whole prefix.
+    expect(wiring.gateDaemonArgvPrefix).not.toEqual([cliBinary]);
+  });
+
+  it("still pins the interpreter when no cliBinary is supplied (the else branch that already worked)", () => {
+    const wiring = buildHermesExclusiveCliWiring(baseInput(undefined));
+    expect(wiring.gateDaemonArgvPrefix[0]).toBe(process.execPath);
+  });
+
+  it("REGRESSION (F-HARNESSENV): an UNRESOLVED harness launch is absent, not a /usr/bin/false placeholder, and drives the plist-removal park", () => {
+    // Pre-fix the unprotect path invented `harnessArgv: ["/usr/bin/false"]`
+    // plus a separate `parkPlistFallbackRemoval: true` -- two fields for one
+    // condition, and the placeholder was what the parked-form COMPARISON
+    // rendered against. The condition is now representable directly.
+    const { harnessLaunch: _drop, ...withoutLaunch } = baseInput(undefined);
+    const wiring = buildHermesExclusiveCliWiring(withoutLaunch);
+    expect(wiring.harnessLaunch).toBeUndefined();
+    expect(JSON.stringify(wiring)).not.toContain("/usr/bin/false");
+    expect(Object.keys(wiring)).not.toContain("parkPlistFallbackRemoval");
+  });
+});
+
+describe("describeRepairCoarseComposition (F-COARSE-AFTER-EXCLUSIVE, operator sentence)", () => {
+  it("says nothing when this run never entered exclusive composition", () => {
+    expect(describeRepairCoarseComposition("not-attempted")).toBe("");
+  });
+
+  it("confirms the coarse path works again after a restored composition", () => {
+    const sentence = describeRepairCoarseComposition("restored");
+    expect(sentence).toMatch(/COARSE routing composition/);
+    expect(sentence).toMatch(/protect --hermes/);
+    expect(sentence).not.toMatch(/unprotect-egress-gate/);
+  });
+
+  it("names the REFUSAL and the product path that clears it when the fortress is left exclusive", () => {
+    // The drill's operator experience: a plain `protect --hermes` refused with
+    // no product path named. `--unprotect-egress-gate` is the one that works.
+    const sentence = describeRepairCoarseComposition("exclusive-left", "coarse republish failed");
+    expect(sentence).toMatch(/EXCLUSIVE routing composition/);
+    expect(sentence).toMatch(/will be REFUSED/);
+    expect(sentence).toMatch(/coarse republish failed/);
+    expect(sentence).toMatch(/sudo sanctuary protect --unprotect-egress-gate/);
   });
 });

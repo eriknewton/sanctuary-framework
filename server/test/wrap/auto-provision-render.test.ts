@@ -10,7 +10,15 @@
 
 import { describe, it, expect } from "vitest";
 import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
-import type { AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
+import { describeNoAccountResidueTeardown, type AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
+import {
+  assessHarnessParked,
+  startedCoarseDisposition,
+  type HarnessDisposition,
+  type ParkedClaim,
+} from "../../src/egress-gate/parked-claim.js";
+import type { HarnessDaemonStatus } from "../../src/egress-gate/harness-daemon.js";
+import { describeExclusiveRoutingResidueRefusal } from "../../src/castle-wall/provision/orchestrate.js";
 
 function lines(summary: AutoProvisionSummary): string[] {
   return renderAutoProvisionOutcomeLines(summary);
@@ -56,35 +64,38 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/connectivity re-check passes/);
   });
 
-  it("egress-unprovisioned-rolled-back -> honest Note frame: fast-disarmed, agent stays re-homed, scrub state surfaced, retry guidance", () => {
+  it("egress-unprovisioned-rolled-back -> honest Note frame: fast-disarmed, agent stays re-homed, egress-restore state surfaced, retry guidance", () => {
     const out = lines({
       ran: true,
       outcome: {
         kind: "egress-unprovisioned-rolled-back",
         uid: 503,
         reason: "post-arm as-uid egress verification failed for: LLM (Venice). Fast-disarmed rather than leave a bricked-or-unconfined agent.",
-        scrubbed: true,
+        egressRestoredToPreRunState: true,
       },
     });
     expect(out).toHaveLength(1);
     expect(out[0]).toMatch(/fast-disarmed/i);
     expect(out[0]).toMatch(/as-agent-uid egress verification failed/);
-    expect(out[0]).toMatch(/provisioned egress rules were scrubbed/);
+    // FIX F-REVOKE: the claim is "restored to their pre-run state", not
+    // "scrubbed" -- on a re-run the pre-run state includes a previous run's
+    // live grants, and asserting removal there was the agent-strangling case.
+    expect(out[0]).toMatch(/provisioned egress rules were restored to their pre-run state/);
     expect(out[0]).toMatch(/still runs under its dedicated, re-homed account/);
     expect(out[0]).toMatch(/Re-run 'sanctuary protect --hermes'/);
   });
 
-  it("egress-unprovisioned-rolled-back with scrubbed:false does NOT claim the rules were scrubbed", () => {
+  it("egress-unprovisioned-rolled-back with egressRestoredToPreRunState:false does NOT claim the pre-run rule state was restored", () => {
     const out = lines({
       ran: true,
       outcome: {
         kind: "egress-unprovisioned-rolled-back",
         uid: 503,
         reason: "post-arm as-uid egress verification failed for: negative control.",
-        scrubbed: false,
+        egressRestoredToPreRunState: false,
       },
     });
-    expect(out[0]).not.toMatch(/were scrubbed/);
+    expect(out[0]).not.toMatch(/were restored to their pre-run state/);
   });
 
   it("armed-rollback-failed -> LOUDEST manual-disarm guidance", () => {
@@ -179,7 +190,33 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     });
     expect(out).toHaveLength(1);
     expect(out[0]).toMatch(/^ {2}Note:/);
-    expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
+    expect(out[0]).toMatch(/No files were moved before this stop/);
+    expect(out[0]).not.toMatch(/restore of your re-homed files FAILED/);
+    expect(out[0]).not.toMatch(/WARNING/);
+  });
+
+  it("FIX F-COARSE-AFTER-EXCLUSIVE: the exclusive-routing-residue abort renders NEUTRAL (it is pre-mutation), never the 'restore FAILED' alarm", () => {
+    // The residue gate is the earliest abort in the flow: nothing has been
+    // created, moved, installed, or armed. If it ever stopped reporting
+    // `rehomeAttempted: false` this renderer would tell the operator their
+    // re-homed files need manual recovery, over a run that moved none.
+    const out = lines({
+      ran: true,
+      outcome: {
+        kind: "aborted",
+        stage: "exclusive-routing-residue",
+        reason: describeExclusiveRoutingResidueRefusal({
+          kind: "kept-live",
+          reason: "a gate daemon owns port 40001 under gate uid 708",
+        }),
+        rolledBack: false,
+        rehomeAttempted: false,
+      },
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/^ {2}Note:/);
+    expect(out[0]).toMatch(/No files were moved before this stop/);
+    expect(out[0]).toMatch(/--unprotect-egress-gate/);
     expect(out[0]).not.toMatch(/restore of your re-homed files FAILED/);
     expect(out[0]).not.toMatch(/WARNING/);
   });
@@ -211,12 +248,13 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/The dedicated account was created but no files were moved/);
   });
 
-  it("FIX R4-2: a pre-create neutral abort (accountCreated falsy) DOES say 'No dedicated account was created'", () => {
+  it("B1 round 2: a neutral abort with no observed account status does NOT claim no account was created", () => {
     const out = lines({
       ran: true,
       outcome: { kind: "aborted", stage: "root-check", reason: "requires root", rolledBack: false, rehomeAttempted: false },
     });
-    expect(out[0]).toMatch(/No dedicated account was created and nothing was moved/);
+    expect(out[0]).toMatch(/No files were moved before this stop/);
+    expect(out[0]).not.toMatch(/No dedicated account was created/);
   });
 
   it("FIX R5-2: a restore CONFLICT (conflictPaths set) renders a data-safe Note, surfaces the conflict path, and NEVER says 'restore FAILED' or overwrite-from-backup", () => {
@@ -275,5 +313,154 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/restore of your re-homed files FAILED/);
     expect(out[0]).toContain("/var/root/x.bak");
     expect(out[0]).toContain("/Users/op/.hermes/.env.restored-conflict");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX-ROUND 4: the render layer, which had ZERO register rows and ZERO tests
+// for what the operator is told about the agent's run state.
+// ---------------------------------------------------------------------------
+
+/**
+ * The round-4 HIGH printed HERE. `grep -rn "remains parked\|PARKED (not
+ * running)" test/` returned nothing before this block: the barrier gate had
+ * regression tests, and nothing asserted what the operator READS when it
+ * fires. These tests are Claude's E3 probe reproduced end to end -- the
+ * degrade outcome that arises when a live process survived the bootout, driven
+ * through the real render function, asserting on the character stream.
+ */
+describe("wrap/cli: the degrade line never asserts a run state it did not observe", () => {
+  function degradeSummary(harness: HarnessDisposition): AutoProvisionSummary {
+    return {
+      ran: true,
+      outcome: {
+        kind: "exclusive-egress-unarmed-coarse-active",
+        uid: 502,
+        stage: "release",
+        reason:
+          "release barrier parked at stage reassert-parked: the parked state was not asserted: " +
+          "a settled launchd read still reports a pid (9001) for the harness job",
+        coarseCompositionRestored: true,
+        harness,
+        cleanupErrors: [],
+      },
+    };
+  }
+
+  async function claim(status: Partial<HarnessDaemonStatus>): Promise<ParkedClaim> {
+    return assessHarnessParked({
+      probe: {
+        harnessStatus: async (): Promise<HarnessDaemonStatus> => ({
+          known: true,
+          installed: true,
+          running: false,
+          ...status,
+        }),
+        sleepMs: async () => undefined,
+      },
+    });
+  }
+
+  it("a SURVIVING process is never described as parked (the round-4 HIGH)", async () => {
+    // Ground truth: pid 9001 is alive throughout, which is the entire reason
+    // the barrier refused. The pre-fix render said, in the same sentence that
+    // reported the pid: "The agent is PARKED (not running)".
+    const out = lines(
+      degradeSummary({ disposition: "not-started", claim: await claim({ running: true, pid: 9001 }) }),
+    ).join(" ");
+    expect(out).toContain("9001");
+    expect(out).toContain("The agent is RUNNING (pid 9001)");
+    expect(out).not.toContain("PARKED");
+    expect(out).not.toContain("not running");
+    // Still LOUD and still routed to the repair verb.
+    expect(out).toContain("WARNING");
+    expect(out).toContain("--repair-egress-gate");
+  });
+
+  it("an UNKNOWABLE run state is rendered as possibly-running, never as parked", async () => {
+    const out = lines(
+      degradeSummary({ disposition: "not-started", claim: await claim({ known: false }) }),
+    ).join(" ");
+    expect(out).toContain("POSSIBLY RUNNING");
+    expect(out).not.toContain("is PARKED");
+  });
+
+  it("a genuinely stopped agent IS described as parked (the fix is not blanket hedging)", async () => {
+    const out = lines(
+      degradeSummary({ disposition: "not-started", claim: await claim({}) }),
+    ).join(" ");
+    expect(out).toContain("The agent is PARKED (not running)");
+  });
+
+  it("a coarse-started agent is still described as running in coarse-only mode", () => {
+    const out = lines(degradeSummary(startedCoarseDisposition())).join(" ");
+    expect(out).toContain("RUNNING in coarse-only mode");
+    expect(out).not.toContain("PARKED");
+  });
+
+  it("a FAILED coarse restore is reported as a manifest fact, not as a run-state claim", async () => {
+    // The `coarseCompositionRestored: false` sub-case. Pre-fix this printed
+    // "The agent is PARKED (not running) and the manifest could NOT be
+    // restored" -- one clause observed, one invented.
+    const summary = degradeSummary({
+      disposition: "not-started",
+      claim: await claim({ running: true, pid: 9001 }),
+    });
+    (summary.outcome as { coarseCompositionRestored: boolean }).coarseCompositionRestored = false;
+    const out = lines(summary).join(" ");
+    expect(out).toContain("manifest could NOT be restored to coarse scope");
+    expect(out).toContain("The agent is RUNNING (pid 9001)");
+    expect(out).not.toContain("PARKED");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX G2/G5 (re-gate, 2026-07-26): the NO-ACCOUNT residue teardown's operator
+// sentence. `runEgressGateUnprotectForCli` is darwin+root gated, so the mapping
+// verdict -> sentence is exported and asserted here directly.
+// ---------------------------------------------------------------------------
+describe("describeNoAccountResidueTeardown (the --unprotect-egress-gate exit when the agent account is gone)", () => {
+  const ACCOUNT = "sanctuary-hermes";
+
+  it("cleared -> exit 0 and says provisioning can now run", () => {
+    const out = describeNoAccountResidueTeardown(ACCOUNT, {
+      kind: "cleared",
+      detail: "no registry entry and no serving gate for uid 503",
+    });
+    expect(out.code).toBe(0);
+    expect(out.line).toMatch(/provisioning can now run/);
+  });
+
+  it("G2: refused -> the operator is given a REAL path out, not just 'Re-create the dedicated agent account'", () => {
+    // The pre-fix sentence ended at "Re-create the dedicated agent account,
+    // then re-run this command", which names NO product verb: there is no
+    // command that creates the account without provisioning, and provisioning
+    // is refused by the same residue gate that sends the operator here. That
+    // restored the closed loop one state over.
+    const out = describeNoAccountResidueTeardown(ACCOUNT, {
+      kind: "refused",
+      reason: "the S5-1 anchor registry still has an entry for uid 503",
+    });
+    expect(out.code).toBe(2);
+    // File-level statement of what carries the confinement: available in EVERY
+    // state, including the one where no verb applies.
+    expect(out.line).toMatch(/\/var\/db\/sanctuary\/egress-anchor-registry\.json/);
+    expect(out.line).toMatch(/\/Library\/LaunchDaemons\/ai\.sanctuaryprotocol\.egress-gate\.<uid>\.plist/);
+    // And a named verb for the state where one does apply.
+    expect(out.line).toMatch(/--repair-egress-gate/);
+    expect(out.line).toMatch(/Nothing was changed/);
+  });
+
+  it("G5: partial -> states what WAS removed and never claims nothing was changed", () => {
+    const out = describeNoAccountResidueTeardown(ACCOUNT, {
+      kind: "partial",
+      reason: "removing the exclusive-egress gate policy file (/f/policy/egress/x.json) failed: EROFS",
+      removed: ["the exclusive-routing marker (/f/allowlist/exclusive-routing.json)"],
+    });
+    expect(out.code).toBe(2);
+    expect(out.line).not.toMatch(/Nothing was changed/);
+    expect(out.line).toMatch(/FAILED part way/);
+    expect(out.line).toMatch(/This run DID remove the exclusive-routing marker/);
+    expect(out.line).toMatch(/mixed state/);
   });
 });

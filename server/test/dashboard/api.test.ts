@@ -333,7 +333,10 @@ describe("Dashboard HTTP API", () => {
     const res = await fetch(`${handle.url}/`);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain("Sanctuary - Sovereignty Posture");
+    // S2 (2026-07-18): posture page identity renamed off the internal
+    // "sovereignty" term to a user-facing "Security Posture" per the
+    // 2026-06-21 copy rule (sovereignty never on screen).
+    expect(html).toContain("Sanctuary - Security Posture");
   });
 
   it("401s / fallback shell when an operator token is required and missing", async () => {

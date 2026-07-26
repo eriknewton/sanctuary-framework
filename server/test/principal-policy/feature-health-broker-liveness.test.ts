@@ -140,6 +140,7 @@ async function buildPanel(
   brokerPinnedProducerKeyB64url: string | null = BROKER_PUB_B64,
 ): Promise<FeatureHealthPanel> {
   return buildFeatureHealthPanel({
+    protectionClaimSubject: FORTRESS,
     auditLog: log,
     originMachine: FORTRESS,
     now: NOW,
@@ -362,6 +363,7 @@ describe("broker daemon liveness — the 9 honesty invariants", () => {
     );
 
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: truncatedAuditLog(
         [...heartbeats, freshSelfReportingInvocationEntry(FRESH_TS)],
         pageLimit,
@@ -397,6 +399,7 @@ describe("broker daemon liveness — the 9 honesty invariants", () => {
     );
 
     const panel = await buildFeatureHealthPanel({
+      protectionClaimSubject: FORTRESS,
       auditLog: truncatedAuditLog(freshEntries, pageLimit),
       registry: Object.freeze([freshSelfReportingFeature()]),
       originMachine: FORTRESS,

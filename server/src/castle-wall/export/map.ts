@@ -20,6 +20,10 @@
 
 import type { AuditEntry } from "../../operational/audit-log.js";
 import {
+  verifiedCastleWallAuditAttribution,
+  type AuditAttributionOptions,
+} from "../audit-attribution.js";
+import {
   DISTRESS_DETAIL_MAX_CHARS,
   DISTRESS_REASONS,
   DISTRESS_SEVERITIES,
@@ -64,6 +68,8 @@ const REDACTED_SENTINEL = "[redacted]";
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHARS = /[\u0000-\u001F\u007F]+/g;
 
+export type EnforcementEventMapOptions = AuditAttributionOptions;
+
 /** Read a scalar string detail key, or null. Never recurses, never coerces objects. */
 function readString(details: Record<string, unknown> | undefined, key: string): string | null {
   if (!details) return null;
@@ -89,15 +95,6 @@ function destinationObject(details: Record<string, unknown> | undefined): Record
   const dest = details?.destination;
   if (dest && typeof dest === "object" && !Array.isArray(dest)) {
     return dest as Record<string, unknown>;
-  }
-  return undefined;
-}
-
-/** Read the nested `agent` object as a closed record, or undefined. */
-function agentObject(details: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-  const agent = details?.agent;
-  if (agent && typeof agent === "object" && !Array.isArray(agent)) {
-    return agent as Record<string, unknown>;
   }
   return undefined;
 }
@@ -148,22 +145,14 @@ function ruleIdOf(details: Record<string, unknown> | undefined): string | null {
   return readString(details, "rule_id") ?? readString(details, "rule_id_matched");
 }
 
-function agentIdOf(details: Record<string, unknown> | undefined): string | null {
-  const agent = agentObject(details);
-  const nested = agent ? agent.id : undefined;
-  if (typeof nested === "string" && nested.length > 0) return nested;
-  return readString(details, "agent_id");
-}
-
-function agentTemplateOf(details: Record<string, unknown> | undefined): string | null {
-  const agent = agentObject(details);
-  const nested = agent ? agent.template : undefined;
-  if (typeof nested === "string" && nested.length > 0) return nested;
-  return readString(details, "agent_template");
-}
-
 /** Map an egress_blocked / egress_allowed entry to a frozen egress-decision event. */
-function mapEgressDecision(entry: AuditEntry): EgressDecisionEvent {
+function mapEgressDecision(
+  entry: AuditEntry,
+  options: EnforcementEventMapOptions = {},
+): EgressDecisionEvent | null {
+  const attribution = verifiedCastleWallAuditAttribution(entry, options);
+  if (attribution === null) return null;
+
   // Coarse decision is derived from the operation TYPE, not the fine-grained
   // stored `decision` value. The fine-grained value (allow_once / deny_always /
   // timeout_default_deny) is a policy-tier signal; the public schema promises a
@@ -180,8 +169,8 @@ function mapEgressDecision(entry: AuditEntry): EgressDecisionEvent {
     destination_port: destinationPortOf(details),
     destination_protocol: destinationProtocolOf(details),
     rule_id: ruleIdOf(details),
-    agent_id: agentIdOf(details),
-    agent_template: agentTemplateOf(details),
+    agent_id: attribution.agentId,
+    agent_template: attribution.agentTemplate,
     enforcement_point: ENFORCEMENT_POINT_CASTLE_WALL,
   };
 }
@@ -267,9 +256,12 @@ function mapDistress(entry: AuditEntry): DistressEvent | null {
  * This is the SINGLE closed mapping surface. It reads only the fields named
  * above; it never spreads `entry.details`.
  */
-export function mapAuditEntryToEnforcementEvent(entry: AuditEntry): EnforcementEvent | null {
+export function mapAuditEntryToEnforcementEvent(
+  entry: AuditEntry,
+  options: EnforcementEventMapOptions = {},
+): EnforcementEvent | null {
   if (EGRESS_OPERATIONS.has(entry.operation)) {
-    return mapEgressDecision(entry);
+    return mapEgressDecision(entry, options);
   }
   const changeType = POLICY_CHANGE_OPERATIONS.get(entry.operation);
   if (changeType !== undefined) {
@@ -282,10 +274,13 @@ export function mapAuditEntryToEnforcementEvent(entry: AuditEntry): EnforcementE
 }
 
 /** Map many entries, dropping non-forwarded / malformed ones. Order is preserved. */
-export function mapEntriesToEnforcementEvents(entries: readonly AuditEntry[]): EnforcementEvent[] {
+export function mapEntriesToEnforcementEvents(
+  entries: readonly AuditEntry[],
+  options: EnforcementEventMapOptions = {},
+): EnforcementEvent[] {
   const events: EnforcementEvent[] = [];
   for (const entry of entries) {
-    const mapped = mapAuditEntryToEnforcementEvent(entry);
+    const mapped = mapAuditEntryToEnforcementEvent(entry, options);
     if (mapped !== null) events.push(mapped);
   }
   return events;

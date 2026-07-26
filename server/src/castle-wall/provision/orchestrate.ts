@@ -35,6 +35,13 @@
  */
 
 import type { ProvisionNeedResult } from "./detect.js";
+import type { HarnessDisposition, RunStateAdvice } from "../../egress-gate/parked-claim.js";
+import { assessHarnessParked, runStateAdvice } from "../../egress-gate/parked-claim.js";
+import {
+  runExclusiveEgressArming,
+  type ExclusiveEgressArmOps,
+  type ExclusiveRoutingResidue,
+} from "./exclusive-arm.js";
 import type { AccountProvisionPlan } from "./account.js";
 import type { RehomePlan, RehomeStepResult } from "./rehome.js";
 import { RehomeExecutionError } from "./rehome.js";
@@ -81,6 +88,32 @@ export interface ProvisionFlowContext {
    * so the granted set and the printed set can never drift.
    */
   harnessEndpoints: HarnessEndpointSet;
+  /**
+   * Unified Protect Slice 5 S5-6: this provision is FINE-GRAINED
+   * (exclusive-egress) mode. When true the flow REQUIRES (fail-closed,
+   * checked BEFORE any mutation): (a) `ops.exclusiveEgress` wired, and
+   * (b) `ops.installHarnessDaemon` performing the S5-5 PARKED install
+   * (`parked: true` on its result) -- the agent must not run until the
+   * release barrier passes. After the coarse stages prove live, the flow
+   * runs the exclusive arming stage (gate generation bring-up + release
+   * barrier), with the degrade-loud coarse fallback on failure.
+   */
+  fineGrainedDeclared?: boolean;
+}
+
+export type DisarmNePreferenceOutcome =
+  | "corroborated_off"
+  | "save_accepted_inconclusive"
+  | "fail_open_deadman";
+
+function disarmOutcomeObservedOff(outcome: DisarmNePreferenceOutcome): boolean {
+  return outcome === "corroborated_off";
+}
+
+function disarmOutcomeAllowsFreshDaemonTeardown(
+  outcome: DisarmNePreferenceOutcome,
+): boolean {
+  return outcome !== "fail_open_deadman";
 }
 
 /** The injected, side-effecting steps. Each corresponds to one stage of the target flow. */
@@ -116,7 +149,86 @@ export interface ProvisionFlowOps {
    */
   installHarnessDaemon(
     uid: number,
-  ): Promise<{ ok: true; bootstrappedThisRun: boolean } | { ok: false; error: string; daemonPreexisted: boolean }>;
+  ): Promise<
+    | {
+        ok: true;
+        bootstrappedThisRun: boolean;
+        /**
+         * S5-6: true when the install was the S5-5 PARKED form (plist
+         * Disabled + launchctl-disabled + hold file absent; the daemon was
+         * NOT bootstrapped). REQUIRED true when `ctx.fineGrainedDeclared`;
+         * the flow aborts fail-closed otherwise (a running agent before the
+         * release barrier is the exact BLOCKER-2 escape).
+         */
+        parked?: boolean;
+        /**
+         * S5-6 drill-D2 fix-round (2026-07-18): TRUE when the (parked) install
+         * MODIFIED a pre-existing harness job -- overwrote its plist, set a
+         * persistent launchd disable, and/or booted a loaded job out.
+         *
+         * This exists because `bootstrappedThisRun: false` used to mean "a
+         * genuinely pre-existing daemon was found and LEFT ALONE", which the
+         * parked install made false: it now stands the operator's live agent
+         * down before the flow is committed to anything. Keying an abort's
+         * cleanup on `bootstrappedThisRun` alone therefore left the agent
+         * stopped on every abort path. `uninstallHarnessDaemon` is still the
+         * wrong remedy here (this run did not create the job, so destroying it
+         * would be worse); the remedy is `restoreStoodDownHarness`.
+         */
+        harnessStoodDown?: boolean;
+      }
+    | { ok: false; error: string; daemonPreexisted: boolean }
+  >;
+  /**
+   * Put a harness this run STOOD DOWN back the way it was (drill-D2
+   * fix-round). Called from exactly one place -- the outcome chokepoint at the
+   * bottom of `runProvisionFlow` -- for every outcome that is not one where
+   * the exclusive-egress stage has taken ownership of the harness.
+   *
+   * The single call site is the point. There are seven-plus places this flow
+   * can refuse between the parked install and the exclusive stage, and a
+   * per-site restore call is how the eighth one gets forgotten. Deciding once,
+   * from the OUTCOME, means an abort added later is covered without anyone
+   * remembering to cover it.
+   *
+   * MUST NOT THROW: it runs on a path that is already failing for some other
+   * reason, and that reason is the more important message. It reports what it
+   * could not put back so the caller can surface both.
+   *
+   * FIX-ROUND 2 (2026-07-18): the result carries the two OBSERVED facts the
+   * operator-facing sentence is built from, because the re-gate found the
+   * sentence being built from neither. `restored` used to be derived by the
+   * production op from an empty error list -- so a job that was running, could
+   * not be restarted, and raised no error printed "was restarted and restored
+   * to its previous state" while stopped. Every field here must be a statement
+   * about state that was looked at, never about a call that was made.
+   *
+   * FIX-ROUND 6 (2026-07-19): `runState` was the field that did not exist, and
+   * its absence was the eleventh instance of this subsystem's one defect. The
+   * production op ALREADY paid for a full settle loop and received a
+   * `ParkedClaim` reading `alive (pid 9001)` -- then dropped it at this
+   * boundary, because this type had nowhere to put it. `harnessRestoreNote`
+   * then told the operator "this run ... did not verify its run state" and sent
+   * them to re-run over a live agent. Routing the restore DECISION through one
+   * chokepoint did nothing for the SENTENCE printed about it; the claim now
+   * travels too.
+   */
+  restoreStoodDownHarness(): Promise<{
+    /** The pre-run state is genuinely back: plist restored AND the job's run-state matches. */
+    restored: boolean;
+    /** The job was running before this run stood it down. */
+    wasRunning: boolean;
+    /** OBSERVED running again. Only ever true when a restart was verified. */
+    harnessRestarted: boolean;
+    problems: string[];
+    /**
+     * The OBSERVED run state plus the recovery step that follows from it.
+     * PRESENT EXACTLY WHEN `runStateOwed({ wasRunning, harnessRestarted })`.
+     * Branded: only `runStateAdvice` in the parked-claim chokepoint can build
+     * one, so no consumer here can compose a second copy of this advice.
+     */
+    runState?: RunStateAdvice;
+  }>;
   /**
    * Uninstall the harness daemon (fix, round 5 item N3). `installHarnessDaemon`
    * bootstraps a LIVE root LaunchDaemon; every post-install abort branch
@@ -187,14 +299,31 @@ export interface ProvisionFlowOps {
     | { ok: false; error: string; checks?: EndpointStaticCheck[]; dnsRulePresent?: boolean }
   >;
   /**
-   * Remove every provisioned egress rule this flow's harness owns from the
-   * signed manifest source (verified: no `provisioned-<harness>-*` rule
-   * survives). Used on abort/rollback after `provisionEgress` succeeded so a
-   * failed provision run never leaves orphan grants (design section 6; a
-   * stale allow surviving teardown would combine with any future evaluator
-   * widening into a standing grant). Idempotent + fail-loud.
+   * Put this harness's provisioned egress rules back to the state
+   * `provisionEgress` found them in, and VERIFY the result by reading the
+   * signing source back. Used on abort/rollback after `provisionEgress` ran.
+   *
+   * Design section 6 says a failed run must leave no orphan grants, and on a
+   * FIRST run the pre-run state is "no provisioned rules", so this still
+   * removes everything the run added. FIX F-REVOKE (Mini1 drill 2026-07-26):
+   * the pre-fix op was an unconditional scrub of every
+   * `provisioned-<harness>-*` rule, which on a SECOND run also revoked the
+   * grants a previous successful provision had published and this run never
+   * touched -- taking a live, correctly-confined agent from "reaches its own
+   * manifest" to "reaches nothing" underneath an operator-facing message that
+   * read like a clean rollback.
+   *
+   * Never throws (it runs on abort paths, where a throw would mask the
+   * original failure). `restored: false` or `reloadOk: false` MUST reach the
+   * operator as loud, actionable guidance -- see {@link restoreEgressBestEffort}.
    */
-  scrubProvisionedEgress(): Promise<void>;
+  restoreProvisionedEgressToPreRunState(): Promise<{
+    /** Observed: the rules directory matches the pre-run capture byte-for-byte. */
+    restored: boolean;
+    /** Observed: the running policy daemon reloaded, so the restored set is actually being served. */
+    reloadOk: boolean;
+    problems: string[];
+  }>;
   /**
    * Post-arm as-uid egress verification (design section 5, the check the
    * 2026-07-09 drill proved DNS-only probes cannot make): a probe process
@@ -230,21 +359,18 @@ export interface ProvisionFlowOps {
    * freshly-installed policy daemon down.
    *
    * THROWS when the disarm hard-fails (the dead-man lever itself failed).
-   * On success (no throw) it returns `neConfirmedOff`:
-   *   - `true`  -> the NE preference was AFFIRMATIVELY saved OFF (confirmed, or
-   *     saved-disabled with only inconclusive corroboration -- the save is
-   *     authoritative). Safe to remove a freshly-installed policy daemon.
-   *   - `false` -> the disable did NOT confirm the NE preference is off (the
-   *     fail-open-after-lease-revoke sub-case: the provider is fail-OPEN now, so
-   *     it is NOT enforcing, but the NE preference may STILL be enabled and a
-   *     reboot could come up enabled with no daemon = deny-all). Must be treated
-   *     exactly like a disarm that could not confirm: leave the daemon UP.
-   *
-   * IMPORTANT: a non-throwing disarm guarantees the filter is NOT ENFORCING
-   * right now; it does NOT by itself guarantee the NE preference is off -- that
-   * is exactly what `neConfirmedOff` distinguishes.
+   * On success (no throw) it returns a three-way NE preference outcome:
+   *   - `corroborated_off` -> a status re-read observed disabled. This is the
+   *     ONLY outcome that may become a user-facing observed-off claim.
+   *   - `save_accepted_inconclusive` -> the save-disabled mutation returned ok,
+   *     but the status re-read did not observe disabled. This is usable as a
+   *     rollback control-flow result, never as an observation.
+   *   - `fail_open_deadman` -> the disable save did NOT complete, but the
+   *     authenticated dead-man lease revoke made the provider fail open now.
+   *     The NE preference may still be enabled and a reboot could come up
+   *     enabled with no daemon = deny-all; leave the daemon UP.
    */
-  disarm(): Promise<{ neConfirmedOff: boolean }>;
+  disarm(): Promise<{ nePreferenceOutcome: DisarmNePreferenceOutcome }>;
   /**
    * Restore re-home from backup, used on a fail-closed abort between create
    * and arm. FIX F2/F5 (2026-07-07 fix-round): returns whether the restore
@@ -276,6 +402,293 @@ export interface ProvisionFlowOps {
      */
     failedPaths: string[];
   }>;
+  /**
+   * S5-6: the exclusive-egress arming stage ops (gate generation bring-up +
+   * S5-5 release barrier + degrade-loud coarse fallback). REQUIRED when
+   * `ctx.fineGrainedDeclared`; the flow aborts BEFORE any mutation when it is
+   * missing (a fine-grained provision without the arming stage would end with
+   * a parked agent and no path to release it).
+   */
+  exclusiveEgress?: ExclusiveEgressArmOps;
+  /**
+   * OBSERVE the host's CURRENT per-agent egress confinement, for the abort
+   * paths that must say something about enforcement state.
+   *
+   * FIX F-COARSE-AFTER-EXCLUSIVE, honesty half (HIGH, Mini1 re-drill
+   * 2026-07-26). The provision-egress abort printed the flat sentence "The
+   * wall was NOT armed". On the drill host, at the instant that sentence was
+   * printed, pf was `Status: Enabled`, the gate registry showed
+   * `committed: [{agent_uid: 503, generation_id: 23}]`, and the confined agent
+   * was 0/9 reachable INCLUDING its own manifest. The product told the
+   * operator nothing was armed while the machine was enforcing. The sentence
+   * was true about the CODE PATH ("this run did not reach the arm step") and
+   * false about the HOST -- which is the exact class this codebase forbids.
+   *
+   * So enforcement-state prose is now derived from an OBSERVATION. MUST never
+   * throw: an unobservable host is reported as unobserved, never as "nothing
+   * is armed".
+   */
+  observeAgentConfinement(): Promise<ObservedAgentConfinement>;
+  /**
+   * THE exclusive-routing residue gate (FIX F-COARSE-AFTER-EXCLUSIVE, class
+   * half, 2026-07-26). Reconcile a leftover `exclusive-routing.json` marker
+   * (plus its `exclusive-egress-gate.json`) that an interrupted or failed
+   * prior arm left in the fortress, and report what was decided.
+   *
+   * WHY THIS IS MODE-INDEPENDENT, and why it hangs here rather than off
+   * `exclusiveEgress`: the signing daemon
+   * (`castle-wall/runtime/macos-daemon.ts`) picks the manifest composition
+   * from MARKER PRESENCE ALONE. It has never consulted, and cannot consult,
+   * which mode the operator asked this CLI run for. So a leftover marker
+   * makes the daemon compose EXCLUSIVE against a plain coarse run's
+   * agent-scoped rules, find agent-reachable direct allows, and correctly
+   * refuse to produce a manifest. The self-heal used to be reachable ONLY
+   * when `fineGrainedDeclared` was true AND the exclusive ops were wired --
+   * i.e. it was gated on the one signal the wedging component does not read.
+   * That asymmetry IS the defect: on the Mini1 re-drill the plain
+   * `protect --hermes --provision-agent-account` run never ran the reconcile
+   * at all, was judged by exclusive composition rules, and was refused.
+   *
+   * CONTRACT:
+   *  - Called with `intent: "observe"` AFTER every step that can still say no
+   *    (the non-TTY refusal, the pre-declined return) and BEFORE the operator
+   *    confirm, so a doomed run is refused before anyone is asked to confirm
+   *    it and a run that was never going to arm never reaches this op at all.
+   *  - Called a SECOND time with `intent: "clear"` ONLY when the observation
+   *    was `orphaned` AND the confirm said yes. That call is the first
+   *    mutation of the run. It RE-PROBES; it does not trust the observation.
+   *  - `armTargetUid` is the uid this run resolved as the agent's run-as
+   *    identity, or `undefined` when none is resolved. A marker declaring a
+   *    different uid, or any marker when the subject is `undefined`, is KEPT
+   *    fail-closed rather than reconciled against the wrong subject.
+   *  - MUST NOT write anything on `intent: "observe"`.
+   *  - MAY THROW: a present-but-unreadable marker is the fail-closed contract
+   *    of `loadExclusiveRoutingMarker`. The flow turns the throw into the
+   *    explicit `unreadable` verdict (see {@link ExclusiveRoutingResidue});
+   *    "could not look" must never collapse into "nothing is there".
+   */
+  reconcileExclusiveRoutingResidue(
+    armTargetUid: number | undefined,
+    intent: "observe" | "clear",
+  ): Promise<ExclusiveRoutingResidue>;
+
+  /**
+   * The uid of the dedicated agent account IF one already exists, or
+   * `undefined` when it does not. Read ONLY as the residue gate's fallback
+   * subject (see {@link resolveResidueSubjectUid} and FIX G3): the detect
+   * probe resolves a uid only from a RUNNING agent process in v1, so without
+   * this every host whose agent is merely stopped hit the unknown-subject
+   * refusal, whose remedy is a destructive teardown.
+   *
+   * MUST NOT invent a uid: a lookup that finds nothing returns `undefined`,
+   * and the gate then refuses fail-closed rather than judging against a guess.
+   */
+  lookupDedicatedAccountUid(): Promise<number | undefined>;
+}
+
+export type { ExclusiveRoutingResidue };
+
+/**
+ * THE refusal sentence for a run blocked by exclusive-routing residue -- the
+ * single place this claim is put into words, exported so the mapping
+ * verdict -> sentence is asserted directly rather than through the flow.
+ *
+ * It states what was OBSERVED on disk, what that means for this run, what this
+ * run did NOT change, and a way forward that actually works for THAT verdict.
+ * It makes no claim about whether the wall is armed: that is a different
+ * observation, and inventing it from control flow is the defect this whole fix
+ * exists to close.
+ *
+ * FIX F2 (adversarial review, 2026-07-26): this used to be ONE sentence for
+ * every keep, and it asserted "this run would be refused at the arming step
+ * after changing the host". That is a counterfactual about a step the refusing
+ * run never reaches -- structurally the same defect as the "The wall was NOT
+ * armed" claim this PR exists downstream of, in the safe direction. It is
+ * gone. The keep space is also split, because a HEALTHY live gate and an
+ * uncertain surface are different facts with different remedies: telling the
+ * operator of a correctly-confined agent to run `--unprotect-egress-gate`
+ * tells them to de-confine a working agent and park it down.
+ *
+ * FIX F5: "Nothing has been changed." was false at the command level -- by the
+ * time this is reached the cooperative wrap has already rewritten config and
+ * bootstrapped identity. The claim is now scoped to what this flow actually
+ * did not do.
+ */
+export type ExclusiveRoutingResidueRefusal = Extract<
+  ExclusiveRoutingResidue,
+  { kind: "kept-live" | "kept-uncertain" | "kept-unknown-subject" | "unreadable" | "removal-failed" }
+>;
+
+/**
+ * Narrow a residue verdict to the ones that must STOP the run, or `undefined`
+ * for the ones the run may continue past (`clear`, `orphaned`, `reconciled`).
+ * A `switch` rather than a `!==` chain so a new verdict is a type error at this
+ * seam instead of silently defaulting to "keep going".
+ */
+export function exclusiveRoutingResidueRefusal(
+  residue: ExclusiveRoutingResidue,
+): ExclusiveRoutingResidueRefusal | undefined {
+  switch (residue.kind) {
+    case "kept-live":
+    case "kept-uncertain":
+    case "kept-unknown-subject":
+    case "unreadable":
+    case "removal-failed":
+      return residue;
+    case "clear":
+    case "orphaned":
+    case "reconciled":
+      return undefined;
+  }
+}
+
+export function describeExclusiveRoutingResidueRefusal(residue: ExclusiveRoutingResidueRefusal): string {
+  // F5: true at the command level. Provisioning is what did not happen; the
+  // cooperative wrap around this flow has already done its own work.
+  //
+  // FIX G5 (re-gate, 2026-07-26): "no Castle Wall change was made by this run"
+  // is DERIVED, not asserted. The one verdict that can reach this renderer
+  // after a mutation is `removal-failed`, which carries what it removed; every
+  // other refusal is produced before any removal is attempted, so the flat
+  // sentence is true for them and provably false for that one.
+  const untouched =
+    residue.kind === "removal-failed" && residue.removed.length > 0
+      ? ` No account was created and nothing was re-homed, but this run DID change Castle Wall state: it removed ${residue.removed.join(" and ")}.`
+      : " No account was created, nothing was re-homed, and no Castle Wall change was made by this run.";
+  switch (residue.kind) {
+    case "kept-live":
+      // A positive observation of live confinement. NOT a "could not tell", and
+      // NOT necessarily a problem: the common instance is a healthy, correctly
+      // armed host. So the first thing offered is "nothing needs doing".
+      return (
+        `Refusing to provision: this fortress already has exclusive-egress confinement in place ` +
+        `(${residue.reason}). While it stands, the signing daemon composes EVERY manifest under the ` +
+        "exclusive-routing rules regardless of the mode this run asked for, so a re-run cannot " +
+        "compose over it. If the confinement already in place is the one you want, nothing needs " +
+        "doing. If you meant to re-provision from scratch, tear the gate down first with 'sudo sanctuary protect " +
+        "--unprotect-egress-gate' (which also leaves the harness parked and down), then re-run this " +
+        `command.${untouched}`
+      );
+    case "kept-uncertain":
+      return (
+        `Refusing to provision: an exclusive-routing marker is present in this fortress and could ` +
+        `NOT be shown to be stale (${residue.reason}). While that marker stands, the signing daemon ` +
+        "composes EVERY manifest under the exclusive-routing rules regardless of the mode this run " +
+        "asked for. Recover an interrupted arm with 'sudo sanctuary protect --repair-egress-gate', " +
+        "or clear the exclusive-egress state outright with 'sudo sanctuary protect " +
+        `--unprotect-egress-gate', then re-run this command.${untouched}`
+      );
+    case "kept-unknown-subject":
+      // FIX F3: the one keep whose subject account may be gone entirely. The
+      // verb named here works in exactly that state -- see
+      // `clearExclusiveRoutingResidueWithoutAccount` in arming-wiring.ts, which
+      // is the no-account fallback `--unprotect-egress-gate` now runs.
+      //
+      // FIX G2 (re-gate, 2026-07-26): that promise used to be UNCONDITIONAL
+      // ("which removes this residue even when the dedicated agent account is
+      // gone"), and the teardown it names REFUSES whenever the marker's uid
+      // still has a registry entry or a gate that could serve. A sentence that
+      // promises unconditionally what a branch refuses is the exact class this
+      // change exists to eliminate, so it now says what each branch does.
+      //
+      // FIX G6 (re-gate, 2026-07-26): "no running agent" was a positive claim
+      // built on a probe (`readRunningHermesGatewayUid`) that returns
+      // `undefined` on a `ps` failure, a PATH problem, or a sandbox
+      // restriction just as it does on a genuinely absent process. What was
+      // observed is that the identity could not be DETERMINED.
+      return (
+        `Refusing to provision: an exclusive-routing marker for agent uid ${residue.markerAgentUid} ` +
+        "is present in this fortress, but this run could not determine the agent's run-as identity " +
+        "(no harness-configured uid, no dedicated agent account, and no agent process was found), " +
+        "so the marker cannot be judged stale without reconciling it against an unknown subject. " +
+        "Clear the leftover exclusive-egress state with 'sudo sanctuary protect " +
+        `--unprotect-egress-gate': when nothing is still armed for uid ${residue.markerAgentUid} it ` +
+        "removes the residue even with the dedicated agent account gone, and when something IS still " +
+        "armed for that uid it changes nothing and names the state it found. Then re-run this " +
+        `command.${untouched}`
+      );
+    case "unreadable":
+      // FIX G8 (re-gate, 2026-07-26): this verdict is produced by ANY throw out
+      // of the residue op, so asserting the MARKER was at fault was wrong
+      // whenever the throw came from another surface the check reads (a
+      // malformed anchor registry, say) -- and the remedy offered there removes
+      // a marker that is fine and fixes nothing. The claim now tracks `source`,
+      // which is classified from the error itself.
+      return residue.source === "marker"
+        ? `Refusing to provision: this fortress's exclusive-routing marker could NOT be read ` +
+            `(${residue.detail}), so the routing mode is unknown. The signing daemon composes on that ` +
+            "marker, so proceeding would mean arming over a mode nothing established. Clear the " +
+            "exclusive-egress state with 'sudo sanctuary protect --unprotect-egress-gate' (which " +
+            "removes the marker once it can prove nothing is still armed), then re-run this command." +
+            untouched
+        : `Refusing to provision: the exclusive-routing residue check could NOT complete ` +
+            `(${residue.detail}), so this fortress's routing mode is unknown. The signing daemon ` +
+            "composes on the exclusive-routing marker, so proceeding would mean arming over a mode " +
+            "nothing established. Fix the surface named above (the marker itself may be perfectly " +
+            "readable, so removing it is not the remedy), then re-run this command." + untouched;
+    case "removal-failed":
+      // FIX G5: the one refusal reachable AFTER a mutation. It must state what
+      // it removed, not inherit the "nothing changed" frame.
+      return (
+        `Refusing to provision: clearing the stale exclusive-routing residue FAILED part way ` +
+        `(${residue.detail}). The fortress is now in a mixed state, so this run will not arm over ` +
+        "it. Complete the teardown with 'sudo sanctuary protect --unprotect-egress-gate', then " +
+        `re-run this command.${untouched}`
+      );
+  }
+}
+
+/**
+ * What {@link ProvisionFlowOps.observeAgentConfinement} saw. Deliberately a
+ * discriminated union: "we could not look" must be representable, because
+ * collapsing it into `false` is how "nothing is armed" gets said about a host
+ * that is enforcing.
+ */
+export type ObservedAgentConfinement =
+  | {
+      known: true;
+      /** Uids with a committed per-uid egress-gate confinement right now. */
+      confinedUids: number[];
+      /** True when the fortress carries an exclusive-routing marker. */
+      exclusiveRoutingMarkerPresent: boolean;
+    }
+  | { known: false; reason: string };
+
+/**
+ * THE enforcement-state sentence for a refused (never-armed-by-this-run)
+ * provisioning attempt -- the single place this claim is put into words, and
+ * it is a function of the OBSERVATION, not of the caller's position in the
+ * control flow. Exported so the mapping observation -> sentence is asserted
+ * directly.
+ *
+ * The first clause is always the same, because it is the one thing the code
+ * path genuinely knows: THIS RUN did not arm anything. Everything after it
+ * comes from what was measured.
+ */
+export function describeObservedAgentConfinement(observed: ObservedAgentConfinement): string {
+  if (!observed.known) {
+    return (
+      "This run did not arm the wall. The host's CURRENT enforcement state could NOT be observed " +
+      `(${observed.reason}), so this run makes no claim about it -- check it with: ` +
+      "'sanctuary castle-wall status'."
+    );
+  }
+  if (observed.confinedUids.length === 0 && !observed.exclusiveRoutingMarkerPresent) {
+    return "This run did not arm the wall, and no per-agent egress confinement was observed on this host.";
+  }
+  const parts: string[] = [];
+  if (observed.confinedUids.length > 0) {
+    parts.push(`uid(s) ${observed.confinedUids.join(", ")} are confined by a committed egress gate`);
+  }
+  if (observed.exclusiveRoutingMarkerPresent) {
+    parts.push("the fortress carries an exclusive-routing marker");
+  }
+  return (
+    "This run did not arm the wall, BUT per-agent egress confinement from an EARLIER run is live on " +
+    `this host (${parts.join("; ")}). A confined agent may be reaching nothing right now, and while ` +
+    "the exclusive routing composition stands this coarse path will keep being refused. Clear it with: " +
+    "'sudo sanctuary protect --unprotect-egress-gate'."
+  );
 }
 
 /**
@@ -371,34 +784,295 @@ export type ProvisionFlowOutcome =
        * into a clean "rolled back; re-run" line (the honesty gap the P0 flagged).
        */
       wallMayBeArmed?: boolean;
+      /**
+       * Positive observed-off evidence from `ops.disarm()`. Absence means "not
+       * observed", never "off".
+       */
+      disarmObservedOff?: true;
     }
-  | { kind: "armed-then-rolled-back"; uid: number; reason: string }
+  | {
+      kind: "armed-then-rolled-back";
+      uid: number;
+      reason: string;
+      disarmObservedOff?: true;
+    }
   | { kind: "armed-rollback-failed"; uid: number; reason: string; disarmError: string }
   /**
    * Egress-provision outcome vocabulary (design section 5): a DISTINCT local
    * variant, never a widened shared enum (the file-grant round-4 lesson).
    * The wall ARMED, but the post-arm AS-UID egress verification failed (an
    * endpoint unreachable as the agent uid, or the negative control
-   * reachable), so the flow fast-disarmed (fix B2) and scrubbed the
-   * provisioned rules rather than leave a confined-into-silence agent or an
-   * unverified grant. The agent stays re-homed under its dedicated account.
+   * reachable), so the flow fast-disarmed (fix B2) and put the provisioned
+   * rules back to their pre-run state rather than leave a confined-into-silence
+   * agent or an unverified grant. The agent stays re-homed under its dedicated
+   * account.
    */
   | {
       kind: "egress-unprovisioned-rolled-back";
       uid: number;
       reason: string;
-      /** False when the provisioned-rule scrub after fast-disarm could not be confirmed. */
-      scrubbed: boolean;
+      /**
+       * FIX F-REVOKE: OBSERVED -- the harness's provisioned rules match the
+       * pre-run capture and the daemon confirmed the reload. On a first run the
+       * pre-run state is "none", so this is the old scrub claim; on a re-run it
+       * additionally asserts a previous run's grants SURVIVED. False when
+       * either could not be confirmed (the outcome carries the loud note).
+       */
+      egressRestoredToPreRunState: boolean;
+      disarmObservedOff?: true;
+    }
+  /**
+   * S5-6 (Unified Protect Slice 5): the FULL fine-grained outcome -- coarse
+   * stages proved live AND the exclusive-egress generation committed AND the
+   * S5-5 release barrier released the (previously parked) harness. The only
+   * fine-grained outcome that may contribute to aggregate green.
+   */
+  | { kind: "armed-exclusive"; uid: number; generationId: number }
+  /**
+   * S5-6: exclusive stack LIVE and the harness running confined, but the
+   * persistent boot state could not be re-parked (the next boot could
+   * auto-start the harness before G5). DISTINCT AMBER, never green; fixed by
+   * `sudo sanctuary protect --repair-egress-gate`.
+   */
+  | { kind: "armed-exclusive-repark-failed"; uid: number; generationId: number; reparkError: string }
+  /**
+   * S5-6 DEGRADE-LOUD (design answer 2 choice (b), requires S5-P on every
+   * surface): fine-grained was declared but the exclusive stack could not
+   * come live; the PROVEN coarse wall stays armed. The manifest was
+   * explicitly recomposed to coarse scope through the audited S5-4 fallback
+   * (`coarseCompositionRestored`). What happened to the AGENT PROCESS is
+   * `harness` and nothing else: a failed restore or a failed start is a fact
+   * about this run, never evidence that a process is gone. ALWAYS a distinct
+   * non-green posture (`coarse-only` / amber on every surface); NEVER silent,
+   * NEVER fake-green.
+   */
+  | {
+      kind: "exclusive-egress-unarmed-coarse-active";
+      uid: number;
+      stage: "bring-up" | "release";
+      reason: string;
+      coarseCompositionRestored: boolean;
+      /**
+       * What happened to the agent process. Fix-round 4 replaced the former
+       * `harnessStartedCoarse: boolean`, whose FALSE branch ("this run did not
+       * start it") was rendered here and at the CLI as "the agent is PARKED
+       * (not running)" over processes that were demonstrably alive.
+       */
+      harness: HarnessDisposition;
+      cleanupErrors: string[];
     };
+
+/**
+ * Mutable box threaded into the step sequence so the outcome chokepoint below
+ * knows whether the (destructive) fine-grained harness install stood a
+ * pre-existing agent down.
+ */
+interface HarnessStandDownState {
+  owed: boolean;
+}
+
+/**
+ * Outcomes after which the harness is NOT owed a restore, because the
+ * exclusive-egress stage has taken ownership of it:
+ *   - `armed-exclusive` / `armed-exclusive-repark-failed`: the release barrier
+ *     started the agent under a committed generation. Restoring the PRE-run
+ *     plist here would tear a correctly-confined agent back to coarse.
+ *   - `exclusive-egress-unarmed-coarse-active`: the S5-6 degrade path already
+ *     decided the harness's disposition (`harness`) and says so loudly in its
+ *     own outcome, INCLUDING the case where it could not decide -- a degrade
+ *     whose claim is `alive` or `unknown` still suppresses the chokepoint
+ *     restore, because restoring a plist under a live process would fight it.
+ *     The suppression is right; what round 4 fixed is the CLAIM attached to
+ *     it, which used to say "parked" regardless.
+ *
+ * Deliberately an ALLOW-LIST of "already handled", not a deny-list of aborts:
+ * a new abort kind added later defaults to restoring, which is the safe
+ * direction. Getting on this list has to be a deliberate act.
+ */
+const OUTCOMES_THAT_OWN_THE_HARNESS: ReadonlySet<string> = new Set([
+  "armed-exclusive",
+  "armed-exclusive-repark-failed",
+  "exclusive-egress-unarmed-coarse-active",
+]);
 
 /**
  * Run the full one-flow orchestration. Every fail-closed branch below is
  * reachable purely through the injected ops, so unit tests can assert each
  * outcome without a real host.
+ *
+ * THE HARNESS-RESTORE CHOKEPOINT (drill-D2 fix-round, 2026-07-18). In
+ * fine-grained mode the harness install is destructive: it stops the
+ * operator's live agent. Everything between that step and the exclusive stage
+ * can still refuse, and both gate lenses found that none of those refusals put
+ * the agent back. Rather than add a restore call to each of them -- the shape
+ * that guarantees the next one added is missed -- the decision is made ONCE,
+ * here, from the outcome. Anything that is not an outcome where the exclusive
+ * stage owns the harness gets the agent restored, including a throw.
  */
 export async function runProvisionFlow(
   ctx: ProvisionFlowContext,
   ops: ProvisionFlowOps,
+): Promise<ProvisionFlowOutcome> {
+  const standDown: HarnessStandDownState = { owed: false };
+  let outcome: ProvisionFlowOutcome;
+  try {
+    outcome = await runProvisionFlowSteps(ctx, ops, standDown);
+  } catch (err) {
+    // A step that THREW rather than returning an outcome is exactly the abort
+    // path nobody enumerates. Restore, then let the original error surface.
+    // FIX-ROUND 2: the restore's own verdict is PRINTED here rather than
+    // swallowed. The thrown error still wins as the outcome, but a restore
+    // that left the agent stopped is news the operator needs regardless of
+    // what else went wrong, and this path had no way to tell them.
+    if (standDown.owed) await restoreStoodDownHarnessQuietly(ops);
+    throw err;
+  }
+  if (!standDown.owed || OUTCOMES_THAT_OWN_THE_HARNESS.has(outcome.kind)) {
+    return outcome;
+  }
+  const restore = await restoreStoodDownHarnessOrWeakenedClaim(ops);
+  const note = harnessRestoreNote(restore, outcome.kind);
+  if (!("reason" in outcome) || typeof outcome.reason !== "string") {
+    // FIX-ROUND 2 (MED): the restore DECISION defaults to safe (an allow-list
+    // of outcomes that own the harness, so a new abort restores). The restore
+    // NOTE used to default to SILENCE -- an outcome without a `reason` field
+    // dropped the message on the floor, including the loud one that names the
+    // agent as stopped. Today no such outcome co-occurs with a stand-down, but
+    // "currently unreachable" is how the last two blockers started. There is
+    // no longer a shape of outcome that can swallow it.
+    ops.print(note);
+    return outcome;
+  }
+  return { ...outcome, reason: `${outcome.reason} ${note}` } as ProvisionFlowOutcome;
+}
+
+/** Best-effort restore on the throw path; the original error must win. */
+async function restoreStoodDownHarnessQuietly(ops: ProvisionFlowOps): Promise<void> {
+  try {
+    ops.print(harnessRestoreNote(await restoreStoodDownHarnessOrWeakenedClaim(ops), "aborted"));
+  } catch {
+    // The caller is already propagating a more important failure.
+  }
+}
+
+/**
+ * The restore op, with a THROWN op turned into an explicitly WEAKENED claim
+ * rather than into silence (fix-round 6).
+ *
+ * The old fallback synthesized `{ restored: false, wasRunning: true }` and
+ * nothing else. Under the invariant `runStateOwed` states, that shape OWES the
+ * operator a run-state sentence and had none to give -- so the renderer had no
+ * choice but to invent one, which is exactly how the eleventh instance got
+ * written. An op that threw is the textbook `cannotProbe` case: the claim says
+ * what was NOT observed, and the advice that follows tells the operator to
+ * establish the state themselves rather than to assume the agent is down.
+ */
+async function restoreStoodDownHarnessOrWeakenedClaim(
+  ops: ProvisionFlowOps,
+): Promise<Awaited<ReturnType<ProvisionFlowOps["restoreStoodDownHarness"]>>> {
+  try {
+    return await ops.restoreStoodDownHarness();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      restored: false,
+      wasRunning: true,
+      harnessRestarted: false,
+      problems: [message],
+      runState: runStateAdvice(
+        await assessHarnessParked({
+          cannotProbe: `the restore operation itself failed before any run-state read (${message})`,
+        }),
+      ),
+    };
+  }
+}
+
+/**
+ * Outcomes that restore the harness but deliberately do NOT reverse the
+ * re-home (they return directly, without `teardownDaemonAndRestore`). The
+ * agent is put back, but under its pre-run account and home -- whose secrets
+ * this run already moved to the dedicated account. Saying "restored to its
+ * previous state" there is false in a way that matters: the restarted harness
+ * may not find its credentials.
+ */
+const OUTCOMES_THAT_KEEP_THE_REHOME: ReadonlySet<string> = new Set(["armed-rollback-failed"]);
+
+/**
+ * The operator-facing sentence about the restore, built ONLY from observed
+ * facts (fix-round 2, 2026-07-18; tightened fix-round 4, 2026-07-19).
+ *
+ * The rule this PR has now had to learn several times: state what was seen,
+ * not what was attempted. `harnessRestarted` is true only when a restart was
+ * verified against launchd, and `wasRunning` distinguishes "correctly not
+ * restarted" from "should be running and is not" -- a distinction the previous
+ * single boolean collapsed, which is how a stopped agent got described as
+ * restarted.
+ *
+ * FIX-ROUND 4 found two SURVIVING run-state assertions here, and found them
+ * with the round's own render-layer guard rather than by review: the failed-
+ * restore branch said "The agent is STOPPED" and the never-was-running branch
+ * said "is not running now". Both were derived from the restore having failed
+ * or not been attempted -- control flow -- over a process nothing here probed.
+ * This function is SYNCHRONOUS and has no launchd access, so the correct fix
+ * is the weakened form: it now states only what this RUN did, and makes no
+ * assertion about whether a process is alive. A caller that needs the run
+ * state must obtain a `ParkedClaim` from `assessHarnessParked`.
+ *
+ * FIX-ROUND 6 found that the weakened form was not the end of it. The failed-
+ * restore branch went on to say "and did not verify its run state" and to
+ * instruct "Re-run ... to bring it back up" -- over a harness the run HAD
+ * verified, across twenty samples, as alive at pid 9001. The observation was
+ * discarded one frame away at the op boundary. Two lessons are encoded here:
+ *
+ *   - A weakened claim states what was NOT observed. "Did not verify its run
+ *     state" states that no observation OCCURRED, which is a different and
+ *     falsifiable thing -- and it was false.
+ *   - An IMPERATIVE premised on a state is a claim about that state. This
+ *     function no longer composes one. Where a run state is owed it prints the
+ *     branded `RunStateAdvice` the op observed; where none is owed it makes no
+ *     run-state claim and issues no run-state instruction.
+ */
+function harnessRestoreNote(
+  restore: {
+    restored: boolean;
+    wasRunning: boolean;
+    harnessRestarted: boolean;
+    problems: string[];
+    runState?: RunStateAdvice;
+  },
+  outcomeKind: string,
+): string {
+  if (!restore.restored) {
+    // `runState` is absent EXACTLY when none is owed -- i.e. nothing was
+    // running before this run, so there is no "bring it back up" to give and
+    // saying otherwise would be the same defect in the opposite direction.
+    const advice =
+      restore.runState !== undefined
+        ? restore.runState.text
+        : "Nothing was running before this run began, so no restart is owed; resolve the problem(s) above " +
+          "before re-running 'sudo sanctuary protect --hermes'.";
+    return (
+      `The agent harness this run stood down could NOT be fully restored: ${restore.problems.join("; ")}. ` +
+      advice
+    );
+  }
+  const what = restore.harnessRestarted
+    ? "was restarted and is running again"
+    : restore.wasRunning
+      ? "was put back"
+      : "was put back; it was not running before this run, and this run did not start it";
+  const scope = OUTCOMES_THAT_KEEP_THE_REHOME.has(outcomeKind)
+    ? " NOTE: the re-home was deliberately NOT reversed on this outcome, so the harness is back but its " +
+      "secrets remain on the dedicated account. This is not a return to your previous state."
+    : "";
+  return `The agent harness this run stood down ${what}.${scope}`;
+}
+
+async function runProvisionFlowSteps(
+  ctx: ProvisionFlowContext,
+  ops: ProvisionFlowOps,
+  standDown: HarnessStandDownState,
 ): Promise<ProvisionFlowOutcome> {
   let uid: number;
   // Re-home results accumulated so far, threaded into every restore call
@@ -411,6 +1085,23 @@ export async function runProvisionFlow(
   // on the alreadyDedicated path (the account pre-existed; we did not create
   // it) and for every pre-create abort.
   let accountCreated = false;
+
+  // S5-6 PREFLIGHT (fail-closed BEFORE any mutation): a fine-grained
+  // provision without the exclusive arming stage wired is a caller contract
+  // violation -- proceeding would end with a permanently parked agent (the
+  // parked install has no release path) or, worse, tempt a wiring layer into
+  // an un-parked install. Refuse up front; nothing has been changed.
+  if (ctx.fineGrainedDeclared === true && ops.exclusiveEgress === undefined) {
+    return {
+      kind: "aborted",
+      stage: "exclusive-egress-preflight",
+      reason:
+        "fine-grained (exclusive-egress) mode was declared but no exclusive-egress arming ops were " +
+        "wired; refusing to provision (the parked agent would have no release path). Nothing was changed.",
+      rolledBack: false,
+      rehomeAttempted: false,
+    };
+  }
 
   // FIX F6 (HIGH, Codex second family, 2026-07-07 fix-round): `alreadyDedicated`
   // used to short-circuit straight to "done" -- reporting "already a
@@ -486,9 +1177,90 @@ export async function runProvisionFlow(
     return { kind: "declined-by-operator" };
   }
 
+  // EXCLUSIVE-ROUTING RESIDUE GATE, JUDGEMENT HALF (FIX F-COARSE-AFTER-EXCLUSIVE
+  // class half, 2026-07-26; placement per FIX F1/F2, 2026-07-26).
+  //
+  // MODE-INDEPENDENT: it runs on every run, coarse or fine-grained. See
+  // `ProvisionFlowOps.reconcileExclusiveRoutingResidue` for why mode cannot be
+  // a condition here (the daemon composes on marker presence alone).
+  //
+  // PLACEMENT. This sits BELOW the non-TTY refusal and the pre-declined return
+  // and ABOVE the confirm, and it is deliberately BOTH:
+  //  - below the two early returns, because the first cut ran the whole gate --
+  //    self-heal removal included -- ahead of them, so a scripted non-TTY run
+  //    and an explicit `--no-provision-agent-account` decline both DELETED two
+  //    fortress policy files and then reported that provisioning was skipped.
+  //    A run that was never going to arm must not reach this op at all.
+  //  - above the confirm, because a run that is already doomed must be refused
+  //    before an operator is asked to approve it.
+  // The removal itself waits for the confirm (see the CLEAR half below), which
+  // is this function's own rule at the confirm: a step that cannot be undone
+  // runs only after every step that can still say no has said yes.
+  // FIX G3: the subject is the resolved run-as uid, falling back to the
+  // dedicated account's own uid when this run could not resolve one (the
+  // common case: the agent is simply not running). Resolved ONCE and used for
+  // BOTH halves, so the clear half cannot be scoped differently from the
+  // observe half that the operator confirmed.
+  const residueSubjectUid = await resolveResidueSubjectUid(ops, ctx.detectResult.resolved?.uid);
+  const residue = await reconcileResidueSafely(ops, residueSubjectUid, "observe");
+  const refusal = exclusiveRoutingResidueRefusal(residue);
+  if (refusal !== undefined) {
+    return {
+      kind: "aborted",
+      stage: "exclusive-routing-residue",
+      reason: describeExclusiveRoutingResidueRefusal(refusal),
+      rolledBack: false,
+      rehomeAttempted: false,
+    };
+  }
+  if (residue.kind === "orphaned") {
+    // Name the removal BEFORE the confirm, so the yes covers it.
+    ops.print(
+      "A stale exclusive-routing marker left by an interrupted prior arm is present and will be " +
+        `cleared if you proceed (${residue.detail}).`,
+    );
+  }
+
   const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ");
   if (!proceed) {
     return { kind: "declined-by-operator" };
+  }
+
+  // RESIDUE GATE, CLEAR half: the FIRST mutation of this run, immediately after
+  // the one confirm and still before the account create, the re-home, every
+  // daemon install, provision-egress, and the arm. It RE-PROBES rather than
+  // trusting the observation above: the confirm prompt is operator think-time,
+  // and removing a marker whose confinement came live in that window would be a
+  // de-confinement. A verdict that is no longer `orphaned` aborts here, with
+  // the host still untouched.
+  if (residue.kind === "orphaned") {
+    const cleared = await reconcileResidueSafely(ops, residueSubjectUid, "clear");
+    const clearedRefusal = exclusiveRoutingResidueRefusal(cleared);
+    if (clearedRefusal !== undefined) {
+      return {
+        kind: "aborted",
+        stage: "exclusive-routing-residue",
+        reason: describeExclusiveRoutingResidueRefusal(clearedRefusal),
+        rolledBack: false,
+        rehomeAttempted: false,
+      };
+    }
+    if (cleared.kind === "orphaned") {
+      // The op judged the marker orphaned and did not remove it, on a call whose
+      // whole purpose was removal. Refuse rather than arm over state this run
+      // did not clear.
+      return {
+        kind: "aborted",
+        stage: "exclusive-routing-residue",
+        reason:
+          "Refusing to provision: the exclusive-routing residue teardown reported the marker as " +
+          "still orphaned instead of removing it, so the marker is still on disk and the signing " +
+          "daemon would still compose exclusive. No account was created, nothing was re-homed, and " +
+          "no Castle Wall change was made by this run.",
+        rolledBack: false,
+        rehomeAttempted: false,
+      };
+    }
   }
 
   if (ctx.detectResult.alreadyDedicated) {
@@ -552,62 +1324,32 @@ export async function runProvisionFlow(
     }
   }
 
-  // Step 6: install the harness daemon. Agent now runs at ruid = uid; wall
-  // NOT yet armed. A failure here means we already moved secrets -- restore
-  // them before reporting the abort (never leave a half-provisioned agent).
-  const install = await ops.installHarnessDaemon(uid);
-  if (!install.ok) {
-    // FIX (round 5, item N3 / R8-1): a failed install may have left a fresh
-    // daemon live (the belt-and-suspenders bootstrap-then-verify path). Tear it
-    // down iff this attempt stood one up -- `!daemonPreexisted` is the honest
-    // signal (never the `!alreadyDedicated` heuristic, which does not track
-    // daemon presence): a fresh daemon this attempt left live is removed; a
-    // genuinely pre-existing daemon (R6-3) is preserved.
-    // This abort fires BEFORE the ensure-policy-daemon step (step 6.5), so no
-    // policy daemon was touched this run -- never tear one down here.
-    const td = await teardownDaemonAndRestore(ops, rehomeResults, !install.daemonPreexisted, false);
-    return {
-      kind: "aborted",
-      stage: "install-daemon",
-      reason: withDaemonTeardownNote(install.error, td.daemonTeardownError, td.policyDaemonTeardownError),
-      rolledBack: td.rolledBack,
-      backupPaths: td.backupPaths,
-      conflictPaths: td.conflictPaths,
-      failedPaths: td.failedPaths,
-      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
-      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
-      accountCreated,
-    };
-  }
-  // FIX (round 5 / R7-1): the honest "did this run stand the daemon up" signal
-  // -- the post-install abort branches key their teardown on it (never on
-  // `alreadyDedicated`, which does not track daemon presence).
-  const daemonBootstrappedThisRun = install.bootstrappedThisRun;
-  ops.print("Harness daemon installed; agent now runs under the dedicated account.");
-
-  // Step 6.5 (Bug B, the one-flow gap): ensure a reachable Castle Wall POLICY
-  // daemon for the target fortress BEFORE arming. Arming with no policy daemon
-  // deny-all-locks the box (filter on + daemon down); the arm's own probe
-  // refuses in that state, so on a box with no wall for this fortress the whole
-  // flow would otherwise roll back. Stand the policy daemon up here (install a
-  // fresh singleton boot service on a box with no wall; (re)start a stopped one
-  // that already targets this fortress; REFUSE to swap a wall that belongs to a
+  // Step 6 (Bug B, the one-flow gap): ensure a reachable Castle Wall POLICY
+  // daemon for the target fortress. Arming with no policy daemon deny-all-locks
+  // the box (filter on + daemon down); the arm's own probe refuses in that
+  // state, so on a box with no wall for this fortress the whole flow would
+  // otherwise roll back. Stand the policy daemon up here (install a fresh
+  // singleton boot service on a box with no wall; (re)start a stopped one that
+  // already targets this fortress; REFUSE to swap a wall that belongs to a
   // DIFFERENT fortress -- one machine runs one wall). This step NEVER arms the
   // filter and NEVER leaves the box filter-on/daemon-down.
+  //
+  // ORDER (drill-D2 fix-round, 2026-07-18): this used to run AFTER the harness
+  // install, as "step 6.5". It moved ahead of it because the harness install in
+  // fine-grained mode is DESTRUCTIVE -- it stands the operator's live agent
+  // down -- while this step is the flow's most likely refusal, and the one the
+  // 2026-07-18 drill actually hit ("one machine runs one wall"). Refusing here
+  // used to cost the operator a stopped agent that nothing restarted; refusing
+  // BEFORE the destructive step costs them nothing. The general rule the two
+  // gate lenses converged on: a step that cannot be undone runs only after
+  // every step that can still say no has said yes.
   const ensure = await ops.ensurePolicyDaemon(ctx.fortressPath);
   if (!ensure.ok) {
     // Fail-closed: we never proceed to arm without a reachable policy daemon.
-    // The harness daemon is LIVE by now (step 6 succeeded); tear it down iff
-    // this run stood it up, tear down a FRESH policy daemon iff this attempt
-    // stood one up (a refuse-to-swap abort leaves the machine's existing wall
-    // untouched -- ensure.freshlyInstalled is false there), then restore the
-    // re-home.
-    const td = await teardownDaemonAndRestore(
-      ops,
-      rehomeResults,
-      daemonBootstrappedThisRun,
-      ensure.freshlyInstalled,
-    );
+    // Nothing has been installed or stood down yet (that is the whole point of
+    // this step's position), so the only thing to reverse is the re-home. A
+    // FRESH policy daemon this attempt stood up is still torn back down.
+    const td = await teardownDaemonAndRestore(ops, rehomeResults, false, ensure.freshlyInstalled);
     return {
       kind: "aborted",
       stage: "ensure-policy-daemon",
@@ -632,9 +1374,102 @@ export async function runProvisionFlow(
       : "Castle Wall policy daemon reachable for this fortress; ready to arm.",
   );
 
+  // Step 6.5: install the harness daemon. Agent now runs at ruid = uid; wall
+  // NOT yet armed. A failure here means we already moved secrets -- restore
+  // them before reporting the abort (never leave a half-provisioned agent).
+  const install = await ops.installHarnessDaemon(uid);
+  if (!install.ok) {
+    // FIX (round 5, item N3 / R8-1): a failed install may have left a fresh
+    // daemon live (the belt-and-suspenders bootstrap-then-verify path). Tear it
+    // down iff this attempt stood one up -- `!daemonPreexisted` is the honest
+    // signal (never the `!alreadyDedicated` heuristic, which does not track
+    // daemon presence): a fresh daemon this attempt left live is removed; a
+    // genuinely pre-existing daemon (R6-3) is preserved.
+    // ORDER CHANGE (2026-07-18): ensure-policy-daemon now runs BEFORE this
+    // step, so a policy daemon this run freshly installed must be torn back
+    // down here too (a pre-existing wall is still never touched).
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      !install.daemonPreexisted,
+      policyDaemonFreshlyInstalled,
+    );
+    return {
+      kind: "aborted",
+      stage: "install-daemon",
+      reason: withDaemonTeardownNote(install.error, td.daemonTeardownError, td.policyDaemonTeardownError),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      accountCreated,
+    };
+  }
+  // FIX (round 5 / R7-1): the honest "did this run stand the daemon up" signal
+  // -- the post-install abort branches key their teardown on it (never on
+  // `alreadyDedicated`, which does not track daemon presence).
+  const daemonBootstrappedThisRun = install.bootstrappedThisRun;
+  // Drill-D2 fix-round: the SECOND, independent signal -- did this install
+  // stop/overwrite a job that was already there? From here on, ANY outcome
+  // that is not one where the exclusive stage owns the harness owes the
+  // operator a restore, handled once at the outcome chokepoint (see
+  // `runProvisionFlow`). Recorded before the barrier assertion below so even
+  // that abort restores.
+  standDown.owed = install.harnessStoodDown === true;
+
+  // S5-6 BARRIER ASSERTION (fail-closed): in fine-grained mode the install
+  // MUST have been the S5-5 PARKED form -- a bootstrapped (running) agent
+  // before the release barrier is the exact BLOCKER-2 escape the barrier
+  // exists to close. Tear the daemon back down and abort rather than proceed
+  // with an agent that is already running unconfined-by-the-gate.
+  if (ctx.fineGrainedDeclared === true && install.parked !== true) {
+    const td = await teardownDaemonAndRestore(
+      ops,
+      rehomeResults,
+      daemonBootstrappedThisRun,
+      policyDaemonFreshlyInstalled,
+    );
+    return {
+      kind: "aborted",
+      stage: "install-daemon",
+      reason: withDaemonTeardownNote(
+        "fine-grained (exclusive-egress) mode requires the PARKED harness install (the release " +
+          "barrier starts the agent only after the gate generation commits), but the install op " +
+          "did not report parked:true; aborting fail-closed rather than run the agent before the barrier.",
+        td.daemonTeardownError,
+        td.policyDaemonTeardownError,
+      ),
+      rolledBack: td.rolledBack,
+      backupPaths: td.backupPaths,
+      conflictPaths: td.conflictPaths,
+      failedPaths: td.failedPaths,
+      daemonTeardownFailed: td.daemonTeardownError !== undefined || td.policyDaemonTeardownError !== undefined,
+      rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
+      accountCreated,
+    };
+  }
+  ops.print(
+    ctx.fineGrainedDeclared === true
+      ? "Harness daemon PARK-installed (disabled; the release barrier starts it after the gate commits)."
+      : "Harness daemon installed; agent now runs under the dedicated account.",
+  );
+
+  // D8 SELF-HEAL: NOT here any more. The reconcile used to sit at this point,
+  // gated on `fineGrainedDeclared === true && ops.exclusiveEgress !== undefined`,
+  // on the theory that only the fine-grained arm path runs a coarse
+  // publish+reload that a stale marker could wedge. That theory was wrong in
+  // the direction that matters: the daemon composes EXCLUSIVE on MARKER
+  // PRESENCE ALONE, so a plain coarse run wedges identically -- which is
+  // exactly what F-COARSE-AFTER-EXCLUSIVE caught on the Mini1 re-drill. The
+  // gate is now MODE-INDEPENDENT, and straddles the one confirm above (judge
+  // before it, remove after it); by the time control reaches here the residue
+  // is provably clear or reconciled, and no mode can skip it.
+
   // Step 6.7 (confined-agent egress, design section 5 layer 1): provision the
   // harness's signed egress allow rules and statically verify them BEFORE
-  // arming. The policy daemon is reachable by construction (step 6.5 just
+  // arming. The policy daemon is reachable by construction (step 6 just
   // passed), so the publish rides the existing pinned-signer reload path.
   // Failure aborts before arm -- arming a wall the agent cannot function
   // behind is the exact confine-into-silence outcome this step exists to
@@ -666,17 +1501,20 @@ export async function runProvisionFlow(
       policyDaemonFreshlyInstalled,
       true,
     );
+    // FIX F-COARSE-AFTER-EXCLUSIVE (honesty half): OBSERVE before claiming.
+    // See `describeObservedAgentConfinement`.
+    const observedConfinement = await observeConfinementSafely(ops);
     return {
       kind: "aborted",
       stage: "provision-egress",
       reason: withDaemonTeardownNote(
         `refusing to arm: the egress path for the confined agent could not be provisioned and verified ` +
-          `(${egress.error}). The wall was NOT armed; the agent would have been confined into ` +
-          `non-functionality. ` +
+          `(${egress.error}). ${describeObservedAgentConfinement(observedConfinement)} ` +
+          `The agent would have been confined into non-functionality. ` +
           describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
         td.daemonTeardownError,
         td.policyDaemonTeardownError,
-        td.egressScrubError,
+        td.egressRestoreNote,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
@@ -728,7 +1566,7 @@ export async function runProvisionFlow(
           describeRestoreForReason(td.rolledBack, td.conflictPaths, td.failedPaths),
         td.daemonTeardownError,
         td.policyDaemonTeardownError,
-        td.egressScrubError,
+        td.egressRestoreNote,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
@@ -762,7 +1600,7 @@ export async function runProvisionFlow(
         existenceCheck.reason,
         td.daemonTeardownError,
         td.policyDaemonTeardownError,
-        td.egressScrubError,
+        td.egressRestoreNote,
       ),
       rolledBack: td.rolledBack,
       backupPaths: td.backupPaths,
@@ -792,29 +1630,26 @@ export async function runProvisionFlow(
     // CONFIRMS the NE preference is off. Order is ALWAYS filter-off THEN
     // daemon-down.
     //
-    // P1 refinement: a non-throwing disarm guarantees the filter is not
-    // ENFORCING now, but NOT that the NE preference is off. The
-    // fail-open-after-lease-revoke sub-case returns success while the NE
-    // preference may STILL be enabled -- removing the daemon there risks a
-    // reboot-brick (the provider could come up enabled + no daemon = deny-all).
-    // So the teardown condition is `neConfirmedOff === true`, never merely
-    // "disarm did not throw". Both a throw AND a non-throwing-but-not-confirmed
-    // disarm leave the daemon UP + set wallMayBeArmed.
+    // P1 refinement: a non-throwing disarm can still be either a save-accepted
+    // result or the fail-open-after-lease-revoke sub-case. The latter may leave
+    // the NE preference enabled; removing the daemon there risks a reboot-brick
+    // (provider enabled + no daemon = deny-all). Teardown therefore depends on
+    // the explicit disable outcome, not merely "disarm did not throw."
     let tearDownPolicyDaemon = false;
     let wallMayBeArmed = false;
+    let disarmObservedOff = false;
     let disarmNote: string | undefined;
     if (policyDaemonFreshlyInstalled) {
       try {
         const disarmResult = await ops.disarm();
-        if (disarmResult.neConfirmedOff) {
-          // NE preference AFFIRMATIVELY off (saved disabled -- confirmed, or
-          // saved with inconclusive corroboration where the save is
-          // authoritative). Safe to tear the fresh daemon down. Note the wall
-          // was disarmed during rollback so the operator can confirm -- not a
-          // bare "nothing happened" clean rollback.
+        if (disarmOutcomeAllowsFreshDaemonTeardown(disarmResult.nePreferenceOutcome)) {
           tearDownPolicyDaemon = true;
-          disarmNote =
-            "The content filter was disarmed as part of this rollback; confirm it is off with 'sanctuary castle-wall status'.";
+          disarmObservedOff = disarmOutcomeObservedOff(
+            disarmResult.nePreferenceOutcome,
+          );
+          disarmNote = disarmObservedOff
+            ? "The content filter was observed disabled as part of this rollback; confirm current state with 'sanctuary castle-wall status'."
+            : "The content-filter disable save was accepted during rollback, but status corroboration was inconclusive; observe live state before relying on it.";
         } else {
           // Disarm succeeded as a dead-man lever (not ENFORCING now) but did NOT
           // confirm the NE preference is off (fail-open after lease revoke). The
@@ -824,7 +1659,7 @@ export async function runProvisionFlow(
           // and surface loudly.
           wallMayBeArmed = true;
           disarmNote =
-            "disarm reported success as a dead-man lever but did NOT confirm the NE preference is off (fail-open after lease revoke); the wall may still be enabled at the preference level";
+            "disarm reported success as a dead-man lever but did NOT save the NE preference disabled (fail-open after lease revoke); the wall may still be enabled at the preference level";
         }
       } catch (disarmErr) {
         // Disarm hard-failed: it could NOT confirm the filter is off. Do NOT
@@ -849,7 +1684,7 @@ export async function runProvisionFlow(
           armResult.error,
           td.daemonTeardownError,
           td.policyDaemonTeardownError,
-          td.egressScrubError,
+          td.egressRestoreNote,
         ),
         wallMayBeArmed,
         disarmNote,
@@ -862,6 +1697,7 @@ export async function runProvisionFlow(
       // P0 honesty gap: when the filter may still be armed (disarm could not
       // confirm), the CLI must NOT render a clean "rolled back; re-run" line.
       wallMayBeArmed: wallMayBeArmed ? true : undefined,
+      disarmObservedOff: disarmObservedOff ? true : undefined,
       rehomeAttempted: rehomeResults.some((r) => r.status === "moved"),
       accountCreated,
     };
@@ -896,8 +1732,12 @@ export async function runProvisionFlow(
     // entirely, the CLI's generic catch swallowed it into NO outcome, and
     // the wrap's own success banner still printed over an ARMED wall with a
     // FAILED rollback. Catch it and return a distinct, loud outcome instead.
+    let disarmObservedOff: boolean;
     try {
-      await ops.disarm();
+      const disarmResult = await ops.disarm();
+      disarmObservedOff = disarmOutcomeObservedOff(
+        disarmResult.nePreferenceOutcome,
+      );
     } catch (disarmErr) {
       return {
         kind: "armed-rollback-failed",
@@ -908,15 +1748,16 @@ export async function runProvisionFlow(
         disarmError: (disarmErr as Error).message,
       };
     }
-    // No orphan grants on a rolled-back run (design section 6): scrub the
-    // egress rules this run provisioned. Best-effort + fail-loud (folded into
+    // No orphan grants on a rolled-back run (design section 6): put the egress
+    // rules back to their pre-run state. Best-effort + fail-loud (folded into
     // the reason); the wall is already down, so a surviving rule is inert
     // until a future arm, but it must still be surfaced, never silent.
-    const scrubNote = await scrubEgressBestEffort(ops, egressProvisionedThisRun);
+    const restoreNote = await restoreEgressBestEffort(ops, egressProvisionedThisRun);
     return {
       kind: "armed-then-rolled-back",
       uid,
-      reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.${scrubNote}`,
+      reason: `${baseReason} Fast-disarmed rather than leave a bricked agent.${egressRestoreReasonSuffix(restoreNote)}`,
+      disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
 
@@ -940,9 +1781,13 @@ export async function runProvisionFlow(
       `and must NOT reach the negative control; anything less confines the agent into ` +
       `non-functionality or proves nothing about confinement.`;
     let disarmed: boolean;
+    let disarmObservedOff: boolean;
     try {
-      await ops.disarm();
+      const disarmResult = await ops.disarm();
       disarmed = true;
+      disarmObservedOff = disarmOutcomeObservedOff(
+        disarmResult.nePreferenceOutcome,
+      );
     } catch (disarmErr) {
       await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
         stage: "post-arm-as-uid-verify",
@@ -959,7 +1804,7 @@ export async function runProvisionFlow(
         disarmError: (disarmErr as Error).message,
       };
     }
-    const scrubNote = await scrubEgressBestEffort(ops, egressProvisionedThisRun);
+    const restoreNote = await restoreEgressBestEffort(ops, egressProvisionedThisRun);
     await ops.auditEgress(EGRESS_PROVISION_REFUSED_AUDIT_OP, {
       stage: "post-arm-as-uid-verify",
       harness: ctx.agentId,
@@ -967,13 +1812,14 @@ export async function runProvisionFlow(
       declared_endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
       probe_rows: egressVerify.rows,
       disarm_outcome: "fast-disarmed",
-      rules_scrubbed: scrubNote === "",
+      egress_rules_restored_to_pre_run_state: restoreNote === "",
     });
     return {
       kind: "egress-unprovisioned-rolled-back",
       uid,
-      reason: `${egressBaseReason} Fast-disarmed rather than leave a bricked-or-unconfined agent.${scrubNote}`,
-      scrubbed: disarmed && scrubNote === "",
+      reason: `${egressBaseReason} Fast-disarmed rather than leave a bricked-or-unconfined agent.${egressRestoreReasonSuffix(restoreNote)}`,
+      egressRestoredToPreRunState: disarmed && restoreNote === "",
+      disarmObservedOff: disarmObservedOff ? true : undefined,
     };
   }
 
@@ -984,30 +1830,160 @@ export async function runProvisionFlow(
     endpoints: ctx.harnessEndpoints.endpoints.map((e) => `${e.host}:${e.port}`),
     probe_rows: egressVerify.rows,
   });
-  return { kind: "armed", uid };
+
+  if (ctx.fineGrainedDeclared !== true) {
+    return { kind: "armed", uid };
+  }
+
+  // S5-6: the exclusive-egress arming stage. Runs ONLY after the coarse
+  // stages proved live (wall armed + as-uid egress verified) and only over a
+  // PARKED harness (asserted at install). Every failure inside the stage is
+  // handled by the stage itself (degrade-loud coarse fallback / parked), so
+  // the mapping here is 1:1 outcome translation -- no failure path can fall
+  // through to a green "armed".
+  ops.print("Coarse stages live; arming the exclusive-egress gate (fine-grained mode).");
+  const exclusive = await runExclusiveEgressArming({ agentUid: uid }, ops.exclusiveEgress!);
+  if (exclusive.kind === "exclusive-armed") {
+    return { kind: "armed-exclusive", uid, generationId: exclusive.generationId };
+  }
+  if (exclusive.kind === "exclusive-armed-repark-failed") {
+    return {
+      kind: "armed-exclusive-repark-failed",
+      uid,
+      generationId: exclusive.generationId,
+      reparkError: exclusive.reparkError,
+    };
+  }
+  return {
+    kind: "exclusive-egress-unarmed-coarse-active",
+    uid,
+    stage: exclusive.stage,
+    reason: exclusive.reason,
+    coarseCompositionRestored: exclusive.coarseCompositionRestored,
+    harness: exclusive.harness,
+    cleanupErrors: exclusive.cleanupErrors,
+  };
 }
 
 /**
- * Best-effort provisioned-rule scrub for the rolled-back branches. Returns
- * "" on success (or when nothing was provisioned this run), or a loud
- * manual-recovery note to append to the outcome reason on failure. Never
- * throws.
+ * Best-effort provisioned-rule restore for the rolled-back branches. Returns
+ * "" when the pre-run rule set was restored AND is being served again (or when
+ * nothing was provisioned this run), or a bare, loud manual-recovery sentence
+ * naming the recovery path otherwise. Never throws.
+ *
+ * FIX F-REVOKE: the note distinguishes the two failure shapes, because they
+ * strand the operator differently. `restored: false` means the rule FILES may
+ * be wrong on disk. `reloadOk: false` means the files are right but the
+ * running daemon has not picked them up, so a still-running agent may be
+ * reaching nothing until it does. The sentence is returned UNWRAPPED so the
+ * two consumers (an inline reason suffix and {@link withDaemonTeardownNote})
+ * punctuate it their own way without either owning a second copy of the words.
  */
-async function scrubEgressBestEffort(
+async function restoreEgressBestEffort(
   ops: ProvisionFlowOps,
   egressProvisionedThisRun: boolean,
 ): Promise<string> {
   if (!egressProvisionedThisRun) return "";
+  let result: { restored: boolean; reloadOk: boolean; problems: string[] };
   try {
-    await ops.scrubProvisionedEgress();
-    return "";
+    result = await ops.restoreProvisionedEgressToPreRunState();
   } catch (err) {
+    result = { restored: false, reloadOk: false, problems: [(err as Error).message] };
+  }
+  if (!result.restored) {
     return (
-      ` (NOTE: the provisioned egress allow rules could NOT be scrubbed automatically: ` +
-      `${(err as Error).message}. They are inert while the wall is disarmed, but remove the ` +
-      `provisioned-* rule files under <fortress>/policy/egress/rules/ before re-arming manually.)`
+      `WARNING: the agent's egress allow rules could NOT be restored to their pre-run state ` +
+      `(${result.problems.join("; ")}). A CONFINED AGENT THAT IS STILL RUNNING MAY NOW REACH NOTHING. ` +
+      `Recover with: sudo sanctuary protect --hermes (re-provisions and republishes the agent's grants), ` +
+      `or inspect the provisioned-* rule files under <fortress>/policy/egress/rules/ directly.`
     );
   }
+  if (!result.reloadOk) {
+    return (
+      `WARNING: the agent's egress allow rules were restored on disk but the policy daemon did NOT confirm ` +
+      `a reload, so the running wall may still be serving the composition from this failed run. ` +
+      `Apply it with: sudo sanctuary castle-wall reload.`
+    );
+  }
+  return "";
+}
+
+/**
+ * Run {@link ProvisionFlowOps.observeAgentConfinement} without letting it
+ * change the abort's outcome. A probe that throws is UNKNOWN, never "nothing
+ * is confined" -- the whole point of the fix is that an unobservable host must
+ * not be described as a quiet one.
+ */
+async function observeConfinementSafely(ops: ProvisionFlowOps): Promise<ObservedAgentConfinement> {
+  try {
+    return await ops.observeAgentConfinement();
+  } catch (err) {
+    return { known: false, reason: `confinement probe threw: ${(err as Error).message}` };
+  }
+}
+
+/**
+ * Run {@link ProvisionFlowOps.reconcileExclusiveRoutingResidue} and add the ONE
+ * verdict the op itself cannot return: a THROW is `unreadable`, NEVER `clear`.
+ * The op throws precisely when a marker is present but cannot be parsed, so
+ * treating a throw as "no residue" would mean proceeding under a routing mode
+ * nothing established -- the exact wrong-allow this gate exists to prevent.
+ *
+ * FIX F4 (adversarial review, 2026-07-26): this function used to BUILD the
+ * union out of a `{ reconciled: boolean; reason?: string }` the op handed over,
+ * so "kept with no reason" silently read as `clear` and the run walked into the
+ * wedge. The op returns the total union now; this wrapper only adds the throw
+ * case, so a keep can no longer be spelled by omission at the boundary.
+ */
+async function reconcileResidueSafely(
+  ops: ProvisionFlowOps,
+  armTargetUid: number | undefined,
+  intent: "observe" | "clear",
+): Promise<ExclusiveRoutingResidue> {
+  try {
+    return await ops.reconcileExclusiveRoutingResidue(armTargetUid, intent);
+  } catch (err) {
+    // FIX G8 (re-gate, 2026-07-26): classify WHICH surface failed instead of
+    // blaming the marker for every throw. `ExclusiveRoutingMarkerError` is the
+    // marker load/parse contract firing; anything else came from another
+    // surface the op reads (the anchor registry, the gate runtime state, a
+    // removal), and on those the marker's own readability is unknown.
+    const source = (err as Error)?.name === "ExclusiveRoutingMarkerError" ? "marker" : "residue-check";
+    return { kind: "unreadable", source, detail: `the residue reconcile threw: ${(err as Error).message}` };
+  }
+}
+
+/**
+ * FIX G3 (re-gate, 2026-07-26): the residue gate's SUBJECT, with the dedicated
+ * account's own uid as the fallback.
+ *
+ * `detectResult.resolved` comes from a harness-config probe that is hardcoded
+ * `undefined` in v1 plus a `ps` grep for a RUNNING gateway, so it is `undefined`
+ * on every run whose agent process is not currently up -- a stopped agent, a
+ * crashed gateway, the window after a park, a boot window. That made
+ * `kept-unknown-subject` the DOMINANT keep in production rather than the rare
+ * one, and its remedy is a destructive teardown that parks a healthy host down.
+ * The dedicated account's uid is a real subject on every host where the account
+ * exists, so guard 0 can judge the marker properly there and the unknown-subject
+ * refusal shrinks back to the account-actually-gone case its sentence is written
+ * for.
+ *
+ * This does NOT relax guard 0: a lookup that finds nothing, or that fails,
+ * still yields `undefined` and the run is still refused fail-closed. "Could not
+ * look" is never a subject.
+ */
+async function resolveResidueSubjectUid(ops: ProvisionFlowOps, resolved: number | undefined): Promise<number | undefined> {
+  if (resolved !== undefined) return resolved;
+  try {
+    return await ops.lookupDedicatedAccountUid();
+  } catch {
+    return undefined;
+  }
+}
+
+/** Punctuate a {@link restoreEgressBestEffort} sentence for appending to an outcome reason. */
+function egressRestoreReasonSuffix(note: string): string {
+  return note === "" ? "" : ` (${note})`;
 }
 
 function describeRestoreForReason(
@@ -1083,7 +2059,7 @@ async function teardownDaemonAndRestore(
   results: RehomeStepResult[],
   tearDownDaemon: boolean,
   tearDownPolicyDaemon: boolean,
-  scrubEgress = false,
+  restoreEgress = false,
 ): Promise<{
   rolledBack: boolean | "partial";
   backupPaths: string[];
@@ -1091,7 +2067,8 @@ async function teardownDaemonAndRestore(
   failedPaths: string[];
   daemonTeardownError?: string;
   policyDaemonTeardownError?: string;
-  egressScrubError?: string;
+  /** The loud note from {@link restoreEgressBestEffort}, or undefined when the pre-run rule set is back and being served. */
+  egressRestoreNote?: string;
 }> {
   // FIX (round 5 / R6-3): only tear the harness daemon down when THIS run stood
   // it up (the fresh-provision path). On the alreadyDedicated re-run path the
@@ -1124,17 +2101,12 @@ async function teardownDaemonAndRestore(
       policyDaemonTeardownError = (err as Error).message;
     }
   }
-  // Confined-agent egress (design section 6): rules this run provisioned are
-  // scrubbed on abort so a failed run never leaves orphan grants. Best-effort
-  // + fail-loud (folded into the abort reason), never blocks the restore.
-  let egressScrubError: string | undefined;
-  if (scrubEgress) {
-    try {
-      await ops.scrubProvisionedEgress();
-    } catch (err) {
-      egressScrubError = (err as Error).message;
-    }
-  }
+  // Confined-agent egress (design section 6 + FIX F-REVOKE): the harness's
+  // rules are put back to the state this run found them in, so a failed run
+  // leaves neither orphan grants (first run: pre-run state is "none") nor a
+  // strangled agent (re-run: a previous run's grants survive). Best-effort +
+  // fail-loud (folded into the abort reason), never blocks the restore.
+  const egressRestoreNote = (await restoreEgressBestEffort(ops, restoreEgress)) || undefined;
   const restore = await safeRestore(ops, results);
   return {
     rolledBack: restore.rolledBack,
@@ -1143,7 +2115,7 @@ async function teardownDaemonAndRestore(
     failedPaths: restore.failedPaths,
     daemonTeardownError,
     policyDaemonTeardownError,
-    egressScrubError,
+    egressRestoreNote,
   };
 }
 
@@ -1158,7 +2130,7 @@ function withDaemonTeardownNote(
   reason: string,
   daemonTeardownError?: string,
   policyDaemonTeardownError?: string,
-  egressScrubError?: string,
+  egressRestoreNote?: string,
 ): string {
   const notes: string[] = [];
   if (daemonTeardownError !== undefined) {
@@ -1174,11 +2146,11 @@ function withDaemonTeardownNote(
         `A root LaunchDaemon may still be running -- run 'sudo sanctuary castle-wall uninstall-boot --yes' to remove it before re-running.`,
     );
   }
-  if (egressScrubError !== undefined) {
-    notes.push(
-      `the provisioned egress allow rules could NOT be scrubbed automatically: ${egressScrubError}. ` +
-        `Remove the provisioned-* rule files under <fortress>/policy/egress/rules/ before re-arming manually.`,
-    );
+  if (egressRestoreNote !== undefined) {
+    // FIX F-REVOKE: already a complete, actionable sentence (it names which of
+    // the two failure shapes happened and the recovery command); folding it in
+    // verbatim keeps ONE author of that wording rather than two that can drift.
+    notes.push(egressRestoreNote);
   }
   if (notes.length === 0) {
     return reason;

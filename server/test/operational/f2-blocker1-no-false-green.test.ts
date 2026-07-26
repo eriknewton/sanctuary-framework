@@ -149,6 +149,7 @@ describe("F2 BLOCKER-1: no clean-claiming surface reports a false green over a t
     const digest = await buildAuditDigest({
       auditLog: new AuditLog(f.storage, f.masterKey),
       originMachine: "fortress:test",
+      protectionClaimSubject: "fortress:test",
       now: Date.now(),
     });
     expect(digest.chain_verified).toBe(false);

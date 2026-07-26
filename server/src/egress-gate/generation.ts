@@ -41,7 +41,7 @@
  *                      `generation_id` (written at G3) is now the ACTIVE
  *                      committed generation by virtue of there being no staging
  *                      record. This is the barrier line: only after G5 may a
- *                      consumer unpark the agent harness (S5-5/S5-6, owed).
+ *                      consumer unpark the agent harness (S5-5/S5-6, WIRED).
  *
  * GENERATION MATCH (never green from stale rules). {@link evaluateGenerationMatch}
  * refuses traffic unless the pf pass-rule port, the manifest port, and the
@@ -54,7 +54,7 @@
  * only, over INJECTED ops (bind, owner-check, registry, manifest-publish,
  * staging store), so the whole machine -- every crash-recovery branch -- is
  * unit-testable with no host, root, gate, or pf. It does NOT wire arming into
- * install (S5-6, owed), does NOT provision the gate service uid or its
+ * install (that is S5-6's `arming-wiring.ts`), does NOT provision the gate service uid or its
  * client-auth / liveness oracle (S5-3, owed), does NOT compose the exclusive
  * routing manifest (S5-4 owns the endpoint re-scope; G4 here only publishes the
  * generation-bearing gate policy file), and does NOT park/unpark the harness
@@ -68,6 +68,7 @@ import {
   withProvisionLock,
   type ProvisionLockOps,
 } from "../castle-wall/provision/lockfile.js";
+import { hasGenerationHeadroom } from "./anchor-registry.js";
 
 /** Default per-uid generation lock path prefix (an internal on-disk artifact). */
 export const GENERATION_LOCK_PATH_PREFIX = "/var/db/sanctuary/generation";
@@ -150,6 +151,19 @@ export interface GenerationRegistryOps {
     generation_id?: number;
     tombstone?: boolean;
   } | null>;
+  /**
+   * Read the registry's persisted generation floor (fix-round-5 P1): a
+   * strictly-exceeded lower bound recorded by the quarantine repair verb when
+   * it removes an entry whose generation survives in no other entry. OPTIONAL
+   * (older adapters); absent or `undefined` === no floor. Bring-up folds it
+   * into {@link computeNextGenerationId} so a repair-discarded generation is
+   * never reallocated. Fix-round-6 F1: when the registry's persisted floor is
+   * MALFORMED but its preserved raw parses numerically, the registry folds the
+   * parsed value into this read, so allocation stays above it even before the
+   * repair verb resolves the raw (the dirty registry separately withholds
+   * release until then).
+   */
+  readGenerationFloor?(): Promise<number | undefined>;
 }
 
 /** Everything the coordinator needs, all injectable so it is host-free in tests. */
@@ -230,13 +244,40 @@ export interface GateRestartOutcome {
  * Monotonic-per-agent next generation id: strictly greater than any generation
  * this agent has committed OR staged, so a restart/crash can never reuse an id
  * (a reused id would let a stale manifest/pf rule masquerade as current).
+ *
+ * `generationFloor` (fix-round-5 P1) is the registry's persisted floor: the
+ * quarantine repair verb records there any generation it REMOVED without a
+ * surviving entry (e.g. a discarded valid duplicate at gen 8 beside a kept gen
+ * 7), so the next allocation must exceed it too -- otherwise the removed id
+ * would be reused and its stale manifest/pf artifacts could masquerade as
+ * current.
  */
 export function computeNextGenerationId(
   committedGenerationId: number | undefined,
   stagingGenerationId: number | undefined,
+  generationFloor?: number,
 ): number {
-  const highest = Math.max(committedGenerationId ?? 0, stagingGenerationId ?? 0);
-  return highest + 1;
+  const highest = Math.max(
+    committedGenerationId ?? 0,
+    stagingGenerationId ?? 0,
+    generationFloor ?? 0,
+  );
+  const next = highest + 1;
+  // Fail-closed backstop (fix-round-8; bound tightened post-#959): the
+  // registry boundary rejects unsafe generation values, but if one ever
+  // reaches allocation anyway, n+1 === n at 2^53 would silently commit a
+  // COLLIDING generation. The bound is the SAME `hasGenerationHeadroom`
+  // predicate the registry enforces (value AND value+1 both safe), so an
+  // allocation landing exactly AT 2^53-1 -- itself a safe integer, but with
+  // no headroom for the NEXT allocation -- is refused HERE, at the
+  // allocator, rather than committed now and rejected later at the registry
+  // boundary. Refuse instead.
+  if (!hasGenerationHeadroom(next) || next <= highest) {
+    throw new Error(
+      `generation allocation has no safe headroom above ${highest}; the anchor registry needs repair`,
+    );
+  }
+  return next;
 }
 
 /**
@@ -405,6 +446,71 @@ export async function bindEphemeralGatePort(host = "127.0.0.1"): Promise<GateBin
   };
 }
 
+// Exhaustiveness guard: adding a GenerationPhase variant without listing it
+// here is a compile error (the parser would otherwise silently reject it).
+const GENERATION_PHASE_SET: Record<GenerationPhase, true> = {
+  owner_checked: true,
+  pf_loaded: true,
+  manifest_reloaded: true,
+};
+const GENERATION_PHASES = Object.keys(GENERATION_PHASE_SET) as readonly GenerationPhase[];
+
+/**
+ * Post-parse shape validation for an on-disk staging record. `JSON.parse`
+ * output is untrusted-shape even on a root-only path (a truncated write, a
+ * hand-edited file, or an older/newer binary's layout): recovery decisions key
+ * off these fields, so a malformed record must FAIL CLOSED (loud error naming
+ * the file) rather than flow through as `undefined`/wrong-typed values.
+ */
+export function parseGenerationStagingRecord(
+  text: string,
+  path: string,
+): GenerationStagingRecord {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new GenerationStateError(
+      `staging record at ${path} is not valid JSON (${(err as Error).message}); refusing to interpret it`,
+    );
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new GenerationStateError(
+      `staging record at ${path} is not a JSON object; refusing to interpret it`,
+    );
+  }
+  const record = parsed as Record<string, unknown>;
+  const bad = (field: string, want: string): GenerationStateError =>
+    new GenerationStateError(
+      `staging record at ${path} has a missing/invalid ${JSON.stringify(field)} (expected ${want}); refusing to interpret it`,
+    );
+  const requireInt = (field: string, min: number, max = Number.MAX_SAFE_INTEGER): number => {
+    const value = record[field];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
+      throw bad(field, `an integer in [${min}, ${max === Number.MAX_SAFE_INTEGER ? "…" : max}]`);
+    }
+    return value;
+  };
+  const requireString = (field: string): string => {
+    const value = record[field];
+    if (typeof value !== "string" || value.length === 0) throw bad(field, "a non-empty string");
+    return value;
+  };
+  const phase = record.phase;
+  if (typeof phase !== "string" || !(GENERATION_PHASES as readonly string[]).includes(phase)) {
+    throw bad("phase", `one of ${GENERATION_PHASES.join(", ")}`);
+  }
+  return {
+    generation_id: requireInt("generation_id", 1),
+    agent_uid: requireInt("agent_uid", 1),
+    gate_port: requireInt("gate_port", 1, 65535),
+    gate_pid: requireInt("gate_pid", 1),
+    gate_pid_start: requireString("gate_pid_start"),
+    fortress_path: requireString("fortress_path"),
+    phase: phase as GenerationPhase,
+  };
+}
+
 /** A default FS staging store: one `generation-staging-<uid>.json` per uid (0600). */
 export function createFsGenerationStagingStore(
   dir = "/var/db/sanctuary",
@@ -424,8 +530,15 @@ export function createFsGenerationStagingStore(
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw err;
       }
-      const parsed = JSON.parse(text) as GenerationStagingRecord;
-      return parsed;
+      const record = parseGenerationStagingRecord(text, path);
+      // A staging file whose embedded uid disagrees with the uid it was loaded
+      // for must never drive that uid's recovery (cross-uid port/fortress mixup).
+      if (record.agent_uid !== agentUid) {
+        throw new GenerationStateError(
+          `staging record at ${path} carries agent_uid ${record.agent_uid} but was loaded for uid ${agentUid}; refusing to interpret it`,
+        );
+      }
+      return record;
     },
     async save(record: GenerationStagingRecord): Promise<void> {
       const { writeFile, rename, mkdir } = await import("node:fs/promises");
@@ -503,7 +616,18 @@ export class GenerationCoordinator {
     const binding = await this.ops.bind({ agent_uid, fortress_path });
     try {
       const committed = await this.ops.registry.readEntry(agent_uid);
-      const generation_id = computeNextGenerationId(committed?.generation_id, undefined);
+      // Fix-round-5 P1: fold in the registry's persisted generation floor so a
+      // generation the quarantine repair REMOVED (surviving in no entry) can
+      // never be reallocated to this or any uid.
+      const generationFloor =
+        this.ops.registry.readGenerationFloor !== undefined
+          ? await this.ops.registry.readGenerationFloor()
+          : undefined;
+      const generation_id = computeNextGenerationId(
+        committed?.generation_id,
+        undefined,
+        generationFloor,
+      );
       const base: CommittedGeneration = {
         generation_id,
         agent_uid,
@@ -546,7 +670,7 @@ export class GenerationCoordinator {
       // G5: commit -- removing the staging record makes the G3-written
       // generation_id the ACTIVE committed generation. The gate keeps holding
       // the port (NOT released). Only now may a consumer unpark the harness
-      // (S5-5/S5-6, owed -- not this library).
+      // (S5-5/S5-6 release barrier -- not this library).
       await this.ops.staging.delete(agent_uid);
       return base;
     } catch (err) {

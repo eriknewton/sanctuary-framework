@@ -38,7 +38,7 @@
  * fails marks the registry dirty.
  *
  * HONESTY BOUNDS. This is the multi-uid mutation-SAFETY primitive only. It does
- * NOT arm anything at install (that is S5-6, owed), does NOT own the generation
+ * NOT arm anything at install (that is S5-6's `arming-wiring.ts`), does NOT own the generation
  * state machine (S5-2, owed -- the state schema is versioned so `generation_id`
  * is added additively there), does NOT start the gate (S5-3, owed), and makes
  * NO external enforcement claim. HIGH-4 is REMEDIATED-once-callers-route-through
@@ -76,10 +76,12 @@ import {
   disarmPfAnchor,
   type ArmPfAnchorResult,
   type ArmPfAnchorUnionOptions,
+  type DisarmPfAnchorResult,
   type PfAnchorUnionEntry,
   type PfCommandRunner,
   type PfLivenessResult,
 } from "./pf-anchor.js";
+import { PF_ENABLE_TOKEN_RE, type PfEnableReference } from "./pf-enable-state.js";
 
 export { ProvisionLockHeldError } from "../castle-wall/provision/lockfile.js";
 
@@ -128,10 +130,52 @@ export interface PfAnchorRegistryState {
   committed: PfAnchorRegistryEntry[];
   /** The `pfctl -E` reference token held while the union is non-empty. */
   enable_token?: string;
+  /**
+   * `kern.bootsessionuuid` at the moment {@link enable_token} was minted
+   * (F-PFBOOT, 2026-07-26). A pf enable reference is VOLATILE kernel state a
+   * reboot zeroes; this file is not. Without the binding, a token that has
+   * been dead since the last boot is indistinguishable on disk from one that
+   * is live -- which is precisely how a reboot left a confined uid with full
+   * loopback reach while the registry read clean.
+   *
+   * NEVER read as consent: it only ever produces a cheap DEFINITE NEGATIVE
+   * (different session = dead token, no pfctl call needed). A matching session
+   * still has to pass `pf-enable-state.ts`'s pfctl attribution before the
+   * token is reused. ADDITIVE + OPTIONAL (absent = resolve by attribution
+   * alone); the state version stays `1` and v1 state on disk loads unchanged.
+   */
+  enable_token_boot_session?: string;
   /** Journaled desired set mid-mutation (Codex B1); absent when quiescent. */
   pending?: PfAnchorRegistryEntry[];
   /** Needs-repair: the anchor and registry may diverge; posture MUST be red. */
   dirty?: boolean;
+  /**
+   * Generation floor (fix-round-5 P1): a STRICTLY-EXCEEDED lower bound for any
+   * future generation allocation. Written by {@link PfAnchorRegistry.repairQuarantined}
+   * when it REMOVES a quarantined entry whose raw parse carried a valid
+   * `generation_id` that no surviving entry preserves (a removed duplicate, or
+   * a malformed entry that could not be salvaged as a tombstone) -- without the
+   * floor, the next bring-up would recompute from the surviving entry alone and
+   * could REUSE the discarded generation, letting a stale manifest/pf rule
+   * masquerade as current. Monotone: only ever raised. ADDITIVE + OPTIONAL
+   * (absent === no floor); the state version stays `1`.
+   */
+  generation_floor?: number;
+  /**
+   * PRESERVED raw value of a malformed `generation_floor` (fix-round-6 F1).
+   * A present-but-malformed floor must never be silently dropped: dropped
+   * dirty-only, a later successful mutation cleared dirty and saved a state
+   * WITHOUT the floor, making the discarded generation reallocatable
+   * (monotonicity fail-open). Instead the raw value is carried here through
+   * every mutation, the dirty marker stays STICKY while it is present (see
+   * `clearDirtyUnlessFloorRepairOwed`), and only
+   * {@link PfAnchorRegistry.repairQuarantined} resolves it (best-effort
+   * numeric parse folded into the repaired floor; loud reset when
+   * unrecoverable). A PARSEABLE raw is additionally folded into the effective
+   * `generation_floor` on load, so the generation allocator respects it even
+   * before repair. ADDITIVE + OPTIONAL; the state version stays `1`.
+   */
+  generation_floor_raw?: unknown;
 }
 
 /** Injected persistence for the registry state (root-owned file in production). */
@@ -140,6 +184,15 @@ export interface PfAnchorRegistryStore {
   load(): Promise<PfAnchorRegistryState | null>;
   /** Persist the state atomically (production: temp-write + rename, 0600). */
   save(state: PfAnchorRegistryState): Promise<void>;
+  /**
+   * Read the persisted state's RAW BYTES verbatim (`null` when no registry
+   * exists). OPTIONAL, but the production FS store provides it: the quarantine
+   * repair's forensic sidecar must preserve the byte-exact pre-repair file
+   * (duplicate JSON keys, formatting -- everything `JSON.parse` flattens,
+   * fix-round-5 P3). A store without raw access degrades the sidecar to a
+   * canonical re-serialization of the parsed state.
+   */
+  loadRaw?(): Promise<string | null>;
 }
 
 /** Everything the registry needs, all injectable so it is host-free in tests. */
@@ -152,23 +205,112 @@ export interface PfAnchorRegistryOps {
   /** Defaults to {@link PF_ANCHOR_NAME}. */
   anchorName?: string;
   /** Arm-union options threaded to {@link armPfAnchorUnion} (settle tuning, mainConfPath). */
-  armOptions?: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableToken">;
+  armOptions?: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableReference">;
   /** Injected for tests; default to the real pf-anchor functions. */
   armUnion?: (
     entries: readonly PfAnchorUnionEntry[],
     options: ArmPfAnchorUnionOptions,
   ) => Promise<ArmPfAnchorResult>;
-  disarm?: (options: { anchorName: string; enableToken?: string }) => Promise<void>;
+  disarm?: (options: { anchorName: string; enableToken?: string }) => Promise<DisarmPfAnchorResult | void>;
   unionLiveness?: (
     entries: readonly PfAnchorUnionEntry[],
     anchorName: string,
   ) => Promise<PfLivenessResult>;
+  /**
+   * Forensic sink for {@link PfAnchorRegistry.repairQuarantined}: persist the
+   * BYTE-EXACT pre-repair registry file (fix-round-5 P3; the store's raw bytes
+   * when it exposes {@link PfAnchorRegistryStore.loadRaw}, else a canonical
+   * snapshot of the parsed state) BEFORE anything is removed and return the
+   * absolute path written. MUST throw on failure (the repair then refuses to
+   * remove anything -- an entry is never dropped without its bytes preserved).
+   * Injected for tests; defaults to {@link createFsQuarantineForensicsWriter}.
+   */
+  quarantineForensics?: (payload: string) => Promise<string>;
 }
 
 /** The result of a mutation: the new committed set and whether repair is owed. */
 export interface PfAnchorRegistryMutationResult {
   committed: PfAnchorRegistryEntry[];
   dirty: boolean;
+}
+
+/** One quarantined committed entry the repair verb acted on (fix-round-4 P2). */
+export interface PfAnchorQuarantineRepairFinding {
+  /** Position of the raw entry in the on-disk `committed` array. */
+  index: number;
+  /** The quarantine listing's classification reason. */
+  reason: string;
+  /** Best-effort uid recovered from the raw entry (`null` when unrecoverable). */
+  agent_uid: number | null;
+  /**
+   * `tombstoned`: the raw entry's uid/port/fortress still validate, so the uid
+   * is KEPT in the union as a block-only tombstone (packet-confined, no gate
+   * channel) -- fail-closed for the affected agent. `removed`: nothing
+   * renderable could be salvaged (or the uid duplicates a valid entry), so the
+   * entry is dropped from the committed set outright.
+   */
+  disposition: "tombstoned" | "removed";
+  /**
+   * Present ONLY when a structurally VALID duplicate of a kept uid was REMOVED
+   * (fix-round-5 P1): discarding a valid committed entry must be LOUD, naming
+   * the kept sibling's generation and the removed one's (`null` when the
+   * respective entry carries no generation). A removed generation is folded
+   * into the persisted {@link PfAnchorRegistryState.generation_floor} so it
+   * can never be reallocated.
+   */
+  duplicate?: {
+    kept_generation_id: number | null;
+    removed_generation_id: number | null;
+  };
+}
+
+/** Result of {@link PfAnchorRegistry.repairQuarantined} (fix-round-4 P2). */
+export interface PfAnchorQuarantineRepairResult {
+  /** True when at least one quarantined entry was removed/tombstoned. */
+  repaired: boolean;
+  /** What was acted on, per entry (empty when `repaired` is false). */
+  findings: PfAnchorQuarantineRepairFinding[];
+  /** Absolute path of the forensic sidecar (`null` when nothing was repaired). */
+  forensicPath: string | null;
+  /** The committed set after the repair (valid entries + salvaged tombstones). */
+  remaining: PfAnchorRegistryEntry[];
+  /**
+   * Present when the persisted generation floor itself was malformed and this
+   * repair resolved it (fix-round-6 F1). `parsed` is the best-effort numeric
+   * recovery of the preserved raw value (`null` = unrecoverable). When
+   * unrecoverable, the floor is RESET to the maximum generation observed
+   * across surviving entries + tombstones (+ any generation removed by this
+   * repair) with NO invented safety margin; the caller MUST report that reset
+   * loudly (the original floor was unrecoverable; re-provision is advised).
+   * `resolved_floor` is the floor actually persisted (`null` when no
+   * generation survived anywhere to derive a floor from, in which case no
+   * floor is persisted at all).
+   */
+  floorRepair?: {
+    raw: unknown;
+    parsed: number | null;
+    resolved_floor: number | null;
+    unrecoverable: boolean;
+  };
+}
+
+/**
+ * Production forensic writer for {@link PfAnchorRegistry.repairQuarantined}:
+ * a root-only (0600) timestamped sidecar beside the registry file, opened
+ * `wx` so an existing capture is never overwritten. Returns the path written.
+ */
+export function createFsQuarantineForensicsWriter(
+  registryPath: string = PF_ANCHOR_REGISTRY_PATH,
+): (payload: string) => Promise<string> {
+  return async (payload: string): Promise<string> => {
+    const { writeFile, mkdir } = await import("node:fs/promises");
+    const { dirname } = await import("node:path");
+    await mkdir(dirname(registryPath), { recursive: true, mode: 0o700 }).catch(() => undefined);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const path = `${registryPath}.quarantine-${stamp}-${process.pid}.json`;
+    await writeFile(path, payload, { mode: 0o600, flag: "wx" });
+    return path;
+  };
 }
 
 /** The persisted state was corrupt/unusable. Fail-closed: never mutate from an unknown baseline. */
@@ -221,10 +363,15 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
   // ADDITIVE optional fields (S5-2). Reject a present-but-malformed value
   // (fail-closed: a garbled generation/tombstone marker is a repair signal,
   // never silently coerced); a MISSING field is the v1-compatible legacy shape.
-  // `generation_id` must be a POSITIVE integer: generated ids start at 1
-  // (`computeNextGenerationId`), so a persisted 0 is a corruption/reuse signal,
-  // never a legitimate committed generation (gate finding).
-  if (c.generation_id !== undefined && (!Number.isInteger(c.generation_id) || (c.generation_id as number) < 1)) {
+  // `generation_id` must be a POSITIVE integer WITH allocation headroom
+  // (fix-round-8, `hasGenerationHeadroom`): generated ids start at 1
+  // (`computeNextGenerationId`), so a persisted 0 is a corruption/reuse
+  // signal, and an unsafe-magnitude id would wedge every future allocation
+  // (n+1 === n at 2^53) -- both are repair signals, never silently coerced.
+  if (
+    c.generation_id !== undefined &&
+    (typeof c.generation_id !== "number" || !hasGenerationHeadroom(c.generation_id))
+  ) {
     return null;
   }
   if (c.tombstone !== undefined && typeof c.tombstone !== "boolean") return null;
@@ -236,6 +383,170 @@ function validateEntry(candidate: unknown): PfAnchorRegistryEntry | null {
   if (c.generation_id !== undefined) entry.generation_id = c.generation_id as number;
   if (c.tombstone === true) entry.tombstone = true;
   return entry;
+}
+
+/**
+ * A generation value is usable ONLY with allocation headroom (fix-round-8):
+ * the value and value+1 must both be safe integers, because
+ * `computeNextGenerationId` allocates value+1 and the gate runtime rejects
+ * unsafe generation ids -- at 2^53-1, n+1 === n, so an at-or-above value
+ * would make every future allocation collide. This is the SINGLE boundary
+ * shared by entry validation, floor classification/parsing, repair salvage,
+ * AND the allocator's own backstop (`computeNextGenerationId` imports it, so
+ * an allocation that lands exactly AT 2^53-1 -- headroom-less even though it
+ * is itself a safe integer -- is refused at the allocator rather than
+ * committed and rejected later at this boundary). Exported for that
+ * allocator; no other module should need it.
+ */
+export function hasGenerationHeadroom(n: number): boolean {
+  return Number.isSafeInteger(n) && n >= 1 && Number.isSafeInteger(n + 1);
+}
+
+/**
+ * Best-effort numeric recovery of a malformed generation-floor value
+ * (fix-round-6 F1): a number, or a numeric string (e.g. `"8"`), that resolves
+ * to a finite value >= 1 WITH allocation headroom (`hasGenerationHeadroom`).
+ * Fractional values round UP (a floor must never be lowered by coercion).
+ * Anything else is unrecoverable (`null`).
+ */
+function parseGenerationFloorRaw(raw: unknown): number | null {
+  const n =
+    typeof raw === "number"
+      ? raw
+      : typeof raw === "string" && raw.trim() !== ""
+        ? Number(raw)
+        : Number.NaN;
+  if (!Number.isFinite(n) || n < 1) return null;
+  const ceiled = Math.ceil(n);
+  if (!hasGenerationHeadroom(ceiled)) return null;
+  return ceiled;
+}
+
+/**
+ * Classify the persisted generation floor of a loaded state (fix-round-6 F1):
+ * the SHARED boundary between `normalizeState`, `listQuarantined`, and
+ * `repairQuarantined`, so all three agree on what counts as a malformed floor.
+ * `validFloor` is a well-formed persisted `generation_floor`; `raw` is the
+ * preserved evidence of a malformed one (either a malformed `generation_floor`
+ * observed now, or a `generation_floor_raw` carried from an earlier load);
+ * `rawParsed` is the best-effort numeric recovery across that evidence.
+ */
+function classifyGenerationFloor(loaded: PfAnchorRegistryState): {
+  validFloor?: number;
+  raw?: unknown;
+  rawParsed: number | null;
+} {
+  const out: { validFloor?: number; raw?: unknown; rawParsed: number | null } = {
+    rawParsed: null,
+  };
+  const rawCandidates: unknown[] = [];
+  if (loaded.generation_floor !== undefined) {
+    // Same allocation-headroom bound as parseGenerationFloorRaw: a
+    // well-formed-looking floor at or above 2^53-1 cannot allocate a distinct
+    // next id, so it is malformed evidence, not a valid floor.
+    if (
+      typeof loaded.generation_floor === "number" &&
+      hasGenerationHeadroom(loaded.generation_floor)
+    ) {
+      out.validFloor = loaded.generation_floor;
+    } else {
+      rawCandidates.push(loaded.generation_floor);
+    }
+  }
+  if (loaded.generation_floor_raw !== undefined) {
+    rawCandidates.push(loaded.generation_floor_raw);
+  }
+  if (rawCandidates.length > 0) {
+    // The newest malformed evidence wins as the preserved raw (a malformed
+    // `generation_floor` can only appear via external mutation and is newer
+    // than a carried raw); the parse folds across ALL candidates, monotone.
+    out.raw = rawCandidates[0];
+    for (const candidate of rawCandidates) {
+      const parsed = parseGenerationFloorRaw(candidate);
+      if (parsed !== null) out.rawParsed = Math.max(out.rawParsed ?? 0, parsed);
+    }
+  }
+  return out;
+}
+
+/**
+ * Clear the needs-repair marker after a successful mutation, reconcile, or
+ * rollback -- UNLESS a preserved malformed generation-floor raw is still
+ * pending repair (fix-round-6 F1). A successful apply proves the ANCHOR
+ * matches the registry, but it cannot resolve the floor: clearing dirty here
+ * would let posture read green (and the next save look clean) while the
+ * floor's true value is still unknown. Only
+ * {@link PfAnchorRegistry.repairQuarantined} resolves the raw and clears this.
+ */
+function clearDirtyUnlessFloorRepairOwed(state: PfAnchorRegistryState): void {
+  if (state.generation_floor_raw === undefined) {
+    delete state.dirty;
+  } else {
+    state.dirty = true;
+  }
+}
+
+/**
+ * THE single reader of the persisted pf enable reference. Token and boot
+ * session are one fact and are never read apart: a caller that took the token
+ * alone would be reconstructing the exact record-without-provenance that
+ * F-PFBOOT turned into a wrong-allow.
+ *
+ * A malformed or empty boot session is DROPPED rather than treated as
+ * matching -- the reference then resolves through pfctl attribution, which is
+ * strictly more work and strictly less trusting.
+ */
+function readEnableReference(state: PfAnchorRegistryState): PfEnableReference | undefined {
+  if (state.enable_token === undefined) return undefined;
+  const session = state.enable_token_boot_session;
+  return {
+    token: state.enable_token,
+    ...(typeof session === "string" && session.trim().length > 0
+      ? { boot_session_uuid: session.trim() }
+      : {}),
+  };
+}
+
+/**
+ * The same read against an UNNORMALIZED loaded state, for the quarantine
+ * repair path -- which cannot normalize (that is what it is repairing) and
+ * must still carry the enable reference forward as one fact. Validates the
+ * token itself rather than assuming the file's shape.
+ */
+function readEnableReferenceFromRaw(loaded: PfAnchorRegistryState): PfEnableReference | undefined {
+  if (typeof loaded.enable_token !== "string" || !PF_ENABLE_TOKEN_RE.test(loaded.enable_token)) {
+    return undefined;
+  }
+  const session = loaded.enable_token_boot_session;
+  return {
+    token: loaded.enable_token,
+    ...(typeof session === "string" && session.trim().length > 0
+      ? { boot_session_uuid: session.trim() }
+      : {}),
+  };
+}
+
+/**
+ * THE single writer of the persisted pf enable reference. Token and boot
+ * session are set or cleared together, so no path can leave a token bound to
+ * the wrong boot -- including the rollback path, which used to restore a bare
+ * `previousToken`.
+ */
+function writeEnableReference(
+  state: PfAnchorRegistryState,
+  reference: PfEnableReference | undefined,
+): void {
+  if (reference === undefined) {
+    delete state.enable_token;
+    delete state.enable_token_boot_session;
+    return;
+  }
+  state.enable_token = reference.token;
+  if (reference.boot_session_uuid !== undefined) {
+    state.enable_token_boot_session = reference.boot_session_uuid;
+  } else {
+    delete state.enable_token_boot_session;
+  }
 }
 
 /** Normalize a loaded state (or `null`) into a usable state. Throws on corruption. */
@@ -266,8 +577,18 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
     committed.push(entry);
   }
   const state: PfAnchorRegistryState = { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed };
-  if (typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token)) {
+  if (typeof loaded.enable_token === "string" && PF_ENABLE_TOKEN_RE.test(loaded.enable_token)) {
     state.enable_token = loaded.enable_token;
+    // Carry the boot binding ONLY alongside a valid token, and only when it is
+    // a non-empty string. A binding without a token is meaningless; a
+    // malformed binding is dropped so the reference falls back to pfctl
+    // attribution rather than being compared against something unusable.
+    if (
+      typeof loaded.enable_token_boot_session === "string" &&
+      loaded.enable_token_boot_session.trim().length > 0
+    ) {
+      state.enable_token_boot_session = loaded.enable_token_boot_session.trim();
+    }
   }
   // Preserve the journaled `pending` set (gate finding: it was dropped on
   // reload, making the two-phase journal dead across a crash). Validate it the
@@ -295,6 +616,25 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
     }
   }
   if (loaded.dirty === true) state.dirty = true;
+  // Fix-round-5 P1 + fix-round-6 F1: preserve the persisted generation floor
+  // (a strictly-exceeded lower bound for future generation allocation, written
+  // by the quarantine repair verb when it removes an entry carrying a
+  // generation_id no surviving entry preserves). A present-but-malformed floor
+  // is a repair signal (dirty) and its RAW value is PRESERVED in
+  // `generation_floor_raw`, never silently dropped: a floor that vanished on
+  // the next save would make the discarded generation reallocatable once a
+  // later mutation cleared dirty (the round-6 fail-open). A parseable raw is
+  // ALSO folded into the effective floor (defense in depth: the allocator
+  // respects it even before repair), and dirty stays STICKY until
+  // repairQuarantined resolves the raw (see clearDirtyUnlessFloorRepairOwed).
+  const floorInfo = classifyGenerationFloor(loaded);
+  if (floorInfo.validFloor !== undefined || floorInfo.rawParsed !== null) {
+    state.generation_floor = Math.max(floorInfo.validFloor ?? 0, floorInfo.rawParsed ?? 0);
+  }
+  if (floorInfo.raw !== undefined) {
+    state.generation_floor_raw = floorInfo.raw;
+    state.dirty = true;
+  }
   // A non-empty committed set with no valid enable token is inconsistent (pf
   // should be enabled and its reference releasable): treat as needs-repair
   // (gate finding). reconcile-on-entry re-asserts the committed union, which
@@ -303,6 +643,50 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
     state.dirty = true;
   }
   return state;
+}
+
+/**
+ * Structural checks + per-entry quarantine classification of a loaded state
+ * (the SHARED boundary between `listQuarantined` and `repairQuarantined`,
+ * fix-round-4 P2: what the listing classifies as malformed is exactly what
+ * the repair verb may act on -- nothing more). STRUCTURAL corruption throws;
+ * a malformed or duplicate ENTRY becomes a quarantined finding carrying its
+ * raw value (for forensics), while the valid entries stay usable.
+ */
+function classifyCommitted(loaded: PfAnchorRegistryState): {
+  entries: PfAnchorRegistryEntry[];
+  quarantined: { index: number; reason: string; raw: unknown }[];
+} {
+  if (typeof loaded !== "object") {
+    throw new PfAnchorRegistryStateError("not an object");
+  }
+  if (loaded.version !== PF_ANCHOR_REGISTRY_STATE_VERSION) {
+    throw new PfAnchorRegistryStateError(`unknown state version ${String(loaded.version)}`);
+  }
+  if (!Array.isArray(loaded.committed)) {
+    throw new PfAnchorRegistryStateError("committed is not an array");
+  }
+  const entries: PfAnchorRegistryEntry[] = [];
+  const quarantined: { index: number; reason: string; raw: unknown }[] = [];
+  const seen = new Set<number>();
+  loaded.committed.forEach((raw, index) => {
+    const entry = validateEntry(raw);
+    if (entry === null) {
+      quarantined.push({
+        index,
+        reason: "malformed committed entry (failed the fail-closed entry validation)",
+        raw,
+      });
+      return;
+    }
+    if (seen.has(entry.agent_uid)) {
+      quarantined.push({ index, reason: `duplicate committed agent_uid ${entry.agent_uid}`, raw });
+      return;
+    }
+    seen.add(entry.agent_uid);
+    entries.push(entry);
+  });
+  return { entries, quarantined };
 }
 
 /**
@@ -319,7 +703,20 @@ function toUnionEntry(entry: PfAnchorRegistryEntry): PfAnchorUnionEntry {
   };
 }
 
-/** An FS-backed store (temp-write + rename for atomicity, 0600). */
+/**
+ * An FS-backed store (temp-write + rename for atomicity, 0600).
+ *
+ * HONEST BOUND (fix-round-6 F3, accepted documented residual). The registry
+ * file -- including `generation_floor` -- is protected by root-only fs modes
+ * (0700 directory / 0600 file) and by COOPERATIVE-MUTATION monotonicity only
+ * (this module never lowers the floor and never drops a preserved raw). An
+ * EXTERNAL restore of an older registry file (a root actor, a backup/rollback
+ * tool, disk-image restore) can lower the floor or resurrect a removed entry;
+ * nothing here anchors the file against that. This is the same residual class
+ * as the other root-owned state files in this codebase; anti-rollback
+ * anchoring is a separate ratified mechanism class and is deliberately NOT
+ * built into this store.
+ */
 export function createFsRegistryStore(path: string = PF_ANCHOR_REGISTRY_PATH): PfAnchorRegistryStore {
   return {
     async load(): Promise<PfAnchorRegistryState | null> {
@@ -337,6 +734,15 @@ export function createFsRegistryStore(path: string = PF_ANCHOR_REGISTRY_PATH): P
         throw new PfAnchorRegistryStateError(
           `registry file ${path} is not valid JSON: ${errText(err)}`,
         );
+      }
+    },
+    async loadRaw(): Promise<string | null> {
+      const { readFile } = await import("node:fs/promises");
+      try {
+        return await readFile(path, "utf8");
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
       }
     },
     async save(state: PfAnchorRegistryState): Promise<void> {
@@ -362,10 +768,11 @@ export class PfAnchorRegistry {
   private readonly lock: ProvisionLockOps;
   private readonly lockPath: string;
   private readonly anchorName: string;
-  private readonly armOptions: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableToken">;
+  private readonly armOptions: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableReference">;
   private readonly armUnion: NonNullable<PfAnchorRegistryOps["armUnion"]>;
   private readonly disarm: NonNullable<PfAnchorRegistryOps["disarm"]>;
   private readonly unionLiveness: NonNullable<PfAnchorRegistryOps["unionLiveness"]>;
+  private readonly quarantineForensics: NonNullable<PfAnchorRegistryOps["quarantineForensics"]>;
 
   constructor(ops: PfAnchorRegistryOps) {
     this.store = ops.store;
@@ -381,6 +788,7 @@ export class PfAnchorRegistry {
     this.unionLiveness =
       ops.unionLiveness ??
       ((entries) => checkPfAnchorUnionLiveness(runner, entries, anchorName));
+    this.quarantineForensics = ops.quarantineForensics ?? createFsQuarantineForensicsWriter();
   }
 
   /**
@@ -390,12 +798,293 @@ export class PfAnchorRegistry {
    * the next mutation's reconcile-on-entry re-asserts it, so posture must not
    * read green (gate finding: `pending` was ignored here).
    */
-  async list(): Promise<{ entries: PfAnchorRegistryEntry[]; dirty: boolean }> {
+  async list(): Promise<{ entries: PfAnchorRegistryEntry[]; dirty: boolean; generationFloor?: number }> {
     const state = normalizeState(await this.store.load());
     return {
       entries: state.committed,
       dirty: state.dirty === true || state.pending !== undefined,
+      // Fix-round-5 P1: surface the persisted generation floor so allocation
+      // adapters (generation bring-up) can never reuse a repair-discarded id.
+      // Fix-round-6 F1: this includes a PARSEABLE malformed-raw floor folded
+      // on load, so allocation respects it even while repair is still owed.
+      ...(state.generation_floor !== undefined ? { generationFloor: state.generation_floor } : {}),
     };
+  }
+
+  /**
+   * Read the committed set with PER-ENTRY QUARANTINE (fix-round-2 MED-6): one
+   * malformed committed entry must not starve the boot daemon's oracle
+   * refresh loop for every OTHER agent -- with the wholesale-throwing
+   * {@link list}, a single bad entry made the refresh return before
+   * refreshing anyone and every gate denied within one token TTL.
+   *
+   * SEMANTICS (fail-closed direction preserved):
+   *  - STRUCTURAL corruption (unparseable JSON, wrong version, `committed`
+   *    not an array) still THROWS wholesale: there is no trustworthy entry to
+   *    salvage from a file whose shape is unknown.
+   *  - A malformed or duplicate ENTRY is returned as a `quarantined` finding
+   *    (individually identified by index + reason) while the remaining valid
+   *    entries stay usable. The quarantined entry's own agent gets NO
+   *    refresh, so ITS gate keeps denying (fail-closed for the bad entry,
+   *    live for the good ones).
+   *  - Any quarantined entry forces `dirty` (repair owed): posture must
+   *    never read green over a quarantine.
+   *
+   * READ-ONLY consumers only (the refresh loop / boot supervisor). Every
+   * MUTATION still normalizes wholesale fail-closed via `normalizeState`:
+   * never mutate from a partially-valid baseline.
+   */
+  async listQuarantined(): Promise<{
+    entries: PfAnchorRegistryEntry[];
+    dirty: boolean;
+    quarantined: { index: number; reason: string }[];
+  }> {
+    const loaded = await this.store.load();
+    if (loaded === null) {
+      return { entries: [], dirty: false, quarantined: [] };
+    }
+    const { entries, quarantined } = classifyCommitted(loaded);
+    const enableTokenValid =
+      typeof loaded.enable_token === "string" && PF_ENABLE_TOKEN_RE.test(loaded.enable_token);
+    // Fix-round-6 F2: a malformed persisted generation_floor must be VISIBLE
+    // on this read path too -- the boot supervisor and oracle refresh loop
+    // read through here, and a floor problem only normalizeState noticed
+    // would let the boot refresh run green over a monotonicity hole. It is
+    // reported as a registry-LEVEL finding (index -1: it is not a committed
+    // entry) and FORCES dirty, so every token is withheld until repair.
+    const floorInfo = classifyGenerationFloor(loaded);
+    const quarantinedOut = quarantined.map((q) => ({ index: q.index, reason: q.reason }));
+    if (floorInfo.raw !== undefined) {
+      quarantinedOut.push({
+        index: -1,
+        reason:
+          "registry-level generation_floor is malformed (not a committed entry; the raw value " +
+          "is preserved for repair); generation-floor monotonicity cannot be trusted until " +
+          "'sanctuary protect --repair-egress-gate' resolves it",
+      });
+    }
+    const dirty =
+      loaded.dirty === true ||
+      loaded.pending !== undefined ||
+      quarantined.length > 0 ||
+      floorInfo.raw !== undefined ||
+      (entries.length > 0 && !enableTokenValid);
+    return {
+      entries,
+      dirty,
+      quarantined: quarantinedOut,
+    };
+  }
+
+  /**
+   * The coded recovery path for a QUARANTINED committed entry (fix-round-4
+   * P2). A malformed committed entry correctly marks the registry dirty
+   * (fail-closed: every token is withheld host-wide), but every registry
+   * MUTATION normalizes wholesale via `normalizeState`, which THROWS on that
+   * same entry -- so without this verb the documented repair
+   * (`--repair-egress-gate`) failed before it could rewrite anything and the
+   * only way out was manual registry surgery.
+   *
+   * SEMANTICS (root-only caller, loud, audited by the repair sequence):
+   *  - Acts ONLY on entries the quarantine listing itself classifies as
+   *    malformed/duplicate ({@link classifyCommitted} -- the exact same
+   *    boundary `listQuarantined` reports). Transiently-invalid state (a
+   *    missing/garbled enable token, a journaled `pending` set, an explicit
+   *    dirty marker) is NEVER grounds to drop an entry: with no quarantined
+   *    entry this is a read-only no-op and the normal mutation reconcile
+   *    handles that dirt without discarding confinement state.
+   *  - STRUCTURAL corruption (unparseable file, wrong version, `committed`
+   *    not an array) still throws wholesale: nothing salvageable.
+   *  - Forensics FIRST and BYTE-EXACT (fix-round-5 P3): the pre-repair
+   *    registry file's raw bytes are persisted verbatim through the injected
+   *    {@link PfAnchorRegistryOps.quarantineForensics} sink BEFORE any
+   *    removal; a forensic write failure aborts the repair with the registry
+   *    untouched.
+   *  - Fail-closed disposition per entry: when the raw entry's
+   *    uid/port/fortress still validate, the uid is KEPT as a block-only
+   *    TOMBSTONE (packet-confined, gate channel gone) rather than dropped --
+   *    removing it would drop its live block rules from the anchor
+   *    (fail-open). Only an entry with nothing renderable (or a duplicate of
+   *    a valid sibling) is removed outright. Either way the affected uid
+   *    needs re-provisioning before its gate serves again.
+   *  - Generation monotonicity (fix-round-5 P1): a REMOVED entry whose raw
+   *    parse carried a valid `generation_id` folds that id into the persisted
+   *    {@link PfAnchorRegistryState.generation_floor}, and removing a
+   *    structurally VALID duplicate is reported loudly with both generations
+   *    (see {@link PfAnchorQuarantineRepairFinding.duplicate}) -- a discarded
+   *    generation must never be silently reusable.
+   *  - Malformed floor resolution (fix-round-6 F1): a preserved malformed
+   *    `generation_floor` raw (see
+   *    {@link PfAnchorRegistryState.generation_floor_raw}) is RESOLVED here:
+   *    a parseable raw folds into the repaired floor; an unrecoverable raw
+   *    resets the floor to the maximum generation still observable across
+   *    surviving entries + tombstones (no invented margin), reported via
+   *    {@link PfAnchorQuarantineRepairResult.floorRepair} so the caller says
+   *    LOUDLY that the original floor was unrecoverable and re-provision is
+   *    advised. A floor problem alone makes this verb act (it is not a no-op).
+   *  - The remaining union is re-rendered + re-armed and the state persisted
+   *    CLEAN (the explicit re-assert supersedes any journaled `pending`,
+   *    exactly like reconcile-on-entry). An arm/save failure leaves the
+   *    on-disk registry untouched (still quarantined + dirty, posture red)
+   *    and throws.
+   */
+  async repairQuarantined(): Promise<PfAnchorQuarantineRepairResult> {
+    return withProvisionLock(this.lockPath, this.lock, async () => {
+      const loaded = await this.store.load();
+      if (loaded === null) {
+        return { repaired: false, findings: [], forensicPath: null, remaining: [] };
+      }
+      const { entries: valid, quarantined } = classifyCommitted(loaded);
+      // Fix-round-6 F1: a malformed persisted generation_floor is ALSO a
+      // repairable finding -- without this, the preserved raw kept the
+      // registry dirty forever (sticky by design) while the documented repair
+      // verb reported "nothing to repair".
+      const floorInfo = classifyGenerationFloor(loaded);
+      if (quarantined.length === 0 && floorInfo.raw === undefined) {
+        return { repaired: false, findings: [], forensicPath: null, remaining: valid };
+      }
+      // Forensics FIRST, and BYTE-EXACT (fix-round-5 P3): the sidecar is the
+      // ORIGINAL on-disk registry file copied verbatim BEFORE any mutation --
+      // duplicate JSON keys, formatting, everything `JSON.parse` flattens. A
+      // store without raw access (an injected non-FS store) degrades to a
+      // canonical snapshot of the parsed state; the production FS store is raw.
+      // Nothing is removed unless this write lands.
+      const rawBytes = this.store.loadRaw !== undefined ? await this.store.loadRaw() : null;
+      const forensicPath = await this.quarantineForensics(
+        rawBytes ??
+          JSON.stringify(
+            {
+              captured_at: new Date().toISOString(),
+              registry_version: loaded.version,
+              note:
+                "canonical (non-byte-exact) pre-repair snapshot -- the store exposed no raw bytes; " +
+                "raw committed entries removed/tombstoned by the quarantine repair verb " +
+                "(sanctuary protect --repair-egress-gate); the affected uid(s) must be re-provisioned",
+              quarantined,
+            },
+            null,
+            2,
+          ),
+      );
+      const findings: PfAnchorQuarantineRepairFinding[] = [];
+      const next = [...valid];
+      let removedGenerationMax: number | undefined;
+      for (const q of quarantined) {
+        const raw = (q.raw !== null && typeof q.raw === "object" ? q.raw : {}) as Record<string, unknown>;
+        const uid =
+          typeof raw.agent_uid === "number" && Number.isInteger(raw.agent_uid) ? raw.agent_uid : null;
+        const rawGenerationId =
+          typeof raw.generation_id === "number" && hasGenerationHeadroom(raw.generation_id)
+            ? raw.generation_id
+            : null;
+        let disposition: PfAnchorQuarantineRepairFinding["disposition"] = "removed";
+        let duplicate: PfAnchorQuarantineRepairFinding["duplicate"];
+        if (uid !== null && !next.some((e) => e.agent_uid === uid)) {
+          // Carry the raw generation_id when it is independently valid (the
+          // entry may be malformed for an unrelated field): dropping a live
+          // id here would let the next bring-up reuse an already-committed
+          // generation (the same monotonicity rule the S5-2 tombstone
+          // fallback preserves).
+          const salvage = validateEntry({
+            agent_uid: raw.agent_uid,
+            gate_port: raw.gate_port,
+            fortress_path: raw.fortress_path,
+            tombstone: true,
+            ...(rawGenerationId !== null ? { generation_id: rawGenerationId } : {}),
+          });
+          if (salvage !== null) {
+            next.push(salvage);
+            disposition = "tombstoned";
+          }
+        } else if (uid !== null && validateEntry(q.raw) !== null) {
+          // Fix-round-5 P1 (loudness): a structurally VALID committed entry is
+          // being REMOVED because it duplicates a kept uid. Name both
+          // generations in the report so the discard is loud, never silent.
+          const kept = next.find((e) => e.agent_uid === uid);
+          duplicate = {
+            kept_generation_id: kept?.generation_id ?? null,
+            removed_generation_id: rawGenerationId,
+          };
+        }
+        if (disposition === "removed" && rawGenerationId !== null) {
+          // Fix-round-5 P1 (monotonicity): a REMOVED entry's parseable
+          // generation_id survives in no entry, so fold it into the persisted
+          // floor below -- otherwise the next bring-up recomputes from the
+          // kept sibling (e.g. gen 7) and REUSES the discarded id (gen 8).
+          removedGenerationMax = Math.max(removedGenerationMax ?? 0, rawGenerationId);
+        }
+        findings.push({
+          index: q.index,
+          reason: q.reason,
+          agent_uid: uid,
+          disposition,
+          ...(duplicate !== undefined ? { duplicate } : {}),
+        });
+      }
+      // Re-render + re-arm the union from what remains, then persist CLEAN. A
+      // failure here propagates with the on-disk registry untouched: still
+      // quarantined + dirty, posture red, repair still owed -- never a
+      // half-repaired silent state.
+      const state: PfAnchorRegistryState = {
+        version: PF_ANCHOR_REGISTRY_STATE_VERSION,
+        committed: next,
+      };
+      writeEnableReference(state, readEnableReferenceFromRaw(loaded));
+      // Fold the generation floor: carry any valid persisted floor forward and
+      // raise it to cover every generation removed above. Monotone by
+      // construction (Math.max); never lowered, never dropped by a repair.
+      const priorFloor = floorInfo.validFloor;
+      let nextFloor =
+        priorFloor !== undefined || removedGenerationMax !== undefined
+          ? Math.max(priorFloor ?? 0, removedGenerationMax ?? 0)
+          : undefined;
+      // Fix-round-6 F1: RESOLVE a preserved malformed floor. Parseable raw:
+      // fold the recovered value in (monotone). Unrecoverable raw: reset the
+      // floor to the maximum generation still observable across surviving
+      // entries + tombstones (+ anything removed above) -- no invented safety
+      // margin; the honest bound is "at least every generation we can still
+      // see". The caller must report the reset loudly (the original floor was
+      // unrecoverable; re-provision is advised). Either way the raw is
+      // consumed here: the repaired state carries no `generation_floor_raw`,
+      // which un-sticks the dirty marker.
+      let floorRepair: PfAnchorQuarantineRepairResult["floorRepair"];
+      if (floorInfo.raw !== undefined) {
+        if (floorInfo.rawParsed !== null) {
+          nextFloor = Math.max(nextFloor ?? 0, floorInfo.rawParsed);
+          floorRepair = {
+            raw: floorInfo.raw,
+            parsed: floorInfo.rawParsed,
+            resolved_floor: nextFloor,
+            unrecoverable: false,
+          };
+        } else {
+          const maxObservedGeneration = next.reduce(
+            (max, entry) => Math.max(max, entry.generation_id ?? 0),
+            0,
+          );
+          const reset = Math.max(nextFloor ?? 0, maxObservedGeneration);
+          nextFloor = reset >= 1 ? reset : undefined;
+          floorRepair = {
+            raw: floorInfo.raw,
+            parsed: null,
+            resolved_floor: nextFloor ?? null,
+            unrecoverable: true,
+          };
+        }
+      }
+      if (nextFloor !== undefined) {
+        state.generation_floor = nextFloor;
+      }
+      await this.applyUnion(state, next);
+      await this.store.save(state);
+      return {
+        repaired: true,
+        findings,
+        forensicPath,
+        remaining: next,
+        ...(floorRepair !== undefined ? { floorRepair } : {}),
+      };
+    });
   }
 
   /**
@@ -502,15 +1191,56 @@ export class PfAnchorRegistry {
     return withProvisionLock(this.lockPath, this.lock, async () => {
       const state = normalizeState(await this.store.load());
 
+      // Compute the desired set BEFORE reconciling, because whether reconcile
+      // is needed at all depends on it (see below). `apply` is pure over the
+      // committed array and does not touch the host.
+      const desired = apply([...state.committed]);
+      assertNoDuplicateUids(desired);
+
       // Reconcile-on-entry (Codex H5): make sure the committed union is still
       // exact-live before layering a new mutation on top. Re-asserts on drift;
       // marks dirty if the re-assert itself fails.
-      await this.reconcile(state);
+      //
+      // SKIPPED FOR A FULL TEARDOWN, and this is the operator's escape hatch.
+      // Measured on hardware: after a reboot, `--unprotect-egress-gate` failed
+      // at stage `recover` even though its desired set is EMPTY, because
+      // reconcile re-asserted the previous non-empty union first and that
+      // re-assert needed the very pf state that was missing. Every other
+      // recovery verb pointed at unprotect, and unprotect pointed at
+      // "investigate" -- a closed loop with no product exit.
+      //
+      // Re-asserting a union we are about to FLUSH ENTIRELY buys nothing:
+      // `applyUnion(state, [])` runs `-F all`, which is strictly more teardown
+      // than any re-assert would achieve, so skipping the re-assert cannot
+      // leave a rule behind that reconcile would have removed. The skip is
+      // scoped to the last uid leaving; removing one uid while others stay
+      // confined still reconciles, because there the anchor must keep holding
+      // the survivors' rules exactly.
+      if (desired.length > 0) {
+        await this.reconcile(state);
+      }
 
       const previousCommitted = [...state.committed];
-      const previousToken = state.enable_token;
-      const desired = apply(state.committed);
-      assertNoDuplicateUids(desired);
+      const previousReference = readEnableReference(state);
+
+      // Unprotect generation-monotonicity (S5-7, extends fix-round-5 P1): a
+      // committed entry this mutation REMOVES (its uid survives in no desired
+      // entry -- today only `remove()`, the unprotect path) folds its
+      // generation_id into the persisted floor, so a later re-protect of the
+      // same uid can never reuse a generation whose stale manifest/pf/credential
+      // artifacts might survive a partial teardown. Folded BEFORE the pending
+      // journal save (a crash mid-mutation keeps the raised floor --
+      // over-restrictive, never fail-open) and left raised by a rollback
+      // (harmless: allocation is strictly-above, and the restored entry's own
+      // generation already bounds it).
+      for (const prev of previousCommitted) {
+        if (
+          prev.generation_id !== undefined &&
+          !desired.some((e) => e.agent_uid === prev.agent_uid)
+        ) {
+          state.generation_floor = Math.max(state.generation_floor ?? 0, prev.generation_id);
+        }
+      }
 
       // Journal the pending desired set BEFORE touching the anchor (Codex B1).
       state.pending = desired;
@@ -524,13 +1254,16 @@ export class PfAnchorRegistry {
         forwardReleased = await this.applyUnion(state, desired);
         state.committed = desired;
         delete state.pending;
-        delete state.dirty;
+        clearDirtyUnlessFloorRepairOwed(state);
         await this.store.save(state);
-        return { committed: state.committed, dirty: false };
+        // Fix-round-6 F1: report the REAL post-mutation dirtiness -- a sticky
+        // malformed-floor raw keeps the registry dirty through a successful
+        // mutation, and the caller must not read that as clean.
+        return { committed: state.committed, dirty: state.dirty === true };
       } catch (applyErr) {
         // Roll back to the previous committed union. Throws
         // PfAnchorRegistryDirtyError if the rollback itself fails.
-        await this.rollback(state, previousCommitted, previousToken, forwardReleased, applyErr);
+        await this.rollback(state, previousCommitted, previousReference, forwardReleased, applyErr);
         throw applyErr;
       }
     });
@@ -555,16 +1288,24 @@ export class PfAnchorRegistry {
         anchorName: this.anchorName,
         ...(hadToken ? { enableToken: state.enable_token } : {}),
       });
-      delete state.enable_token;
+      writeEnableReference(state, undefined);
       return hadToken;
     }
     const res = await this.armUnion(desired.map(toUnionEntry), {
       ...this.armOptions,
       anchorName: this.anchorName,
-      ...(state.enable_token !== undefined ? { existingEnableToken: state.enable_token } : {}),
+      ...(readEnableReference(state) !== undefined
+        ? { existingEnableReference: readEnableReference(state) }
+        : {}),
     });
-    if (res.enableToken !== undefined) {
-      state.enable_token = res.enableToken;
+    // Persist WHATEVER reference the arm ended up holding, bound to its boot
+    // session, in the SAME save that commits the union. That co-sequencing is
+    // load-bearing: a fix that cleared a stale token without minting its
+    // replacement in the same save would trip `normalizeState`'s
+    // "committed but no token = dirty" rule and rebuild the deadlock through
+    // a different door.
+    if (res.enableReference !== undefined) {
+      writeEnableReference(state, res.enableReference);
     }
     return false;
   }
@@ -587,7 +1328,7 @@ export class PfAnchorRegistry {
       if (state.dirty || state.pending !== undefined) {
         try {
           await this.applyUnion(state, []); // disarm: `-F all` + release token
-          delete state.dirty;
+          clearDirtyUnlessFloorRepairOwed(state);
           delete state.pending;
           await this.store.save(state);
         } catch (repairErr) {
@@ -608,7 +1349,7 @@ export class PfAnchorRegistry {
     // Drift (or a leftover dirty/pending marker): re-assert the committed set.
     try {
       await this.applyUnion(state, state.committed);
-      delete state.dirty;
+      clearDirtyUnlessFloorRepairOwed(state);
       delete state.pending;
       await this.store.save(state);
     } catch (repairErr) {
@@ -629,13 +1370,13 @@ export class PfAnchorRegistry {
    *
    * `forwardReleased` (gate finding) tells rollback whether the FAILED apply
    * already released the pf enable reference (the remove-last flush path). If
-   * so, `previousToken` is spent and pf is disabled, so rollback must re-arm
-   * the previous union with a FRESH `-E`, not reuse the dead token.
+   * so, `previousReference` is spent and pf is disabled, so rollback must
+   * re-arm the previous union with a FRESH `-E`, not reuse the dead token.
    */
   private async rollback(
     state: PfAnchorRegistryState,
     previousCommitted: PfAnchorRegistryEntry[],
-    previousToken: string | undefined,
+    previousReference: PfEnableReference | undefined,
     forwardReleased: boolean,
     cause: unknown,
   ): Promise<void> {
@@ -654,24 +1395,24 @@ export class PfAnchorRegistry {
         state.committed = [];
       } else if (forwardReleased) {
         // The forward apply RELEASED the enable reference (remove-last flushed +
-        // `-X`, then the commit save failed). pf is disabled and `previousToken`
-        // is spent -- clear it so the re-arm acquires a FRESH `-E`.
-        delete state.enable_token;
+        // `-X`, then the commit save failed). pf is disabled and the previous
+        // reference is spent -- clear it so the re-arm acquires a FRESH `-E`.
+        writeEnableReference(state, undefined);
         await this.applyUnion(state, previousCommitted);
         state.committed = previousCommitted;
       } else {
         // The forward apply threw WITHOUT releasing (a mid-arm failure). The
-        // previous token, if any, is still live; re-assert with it.
-        if (previousToken !== undefined) {
-          state.enable_token = previousToken;
-        } else {
-          delete state.enable_token;
-        }
+        // previous reference, if any, may still be live; re-assert with it --
+        // as a RECORD, restored token-and-boot-session together so the arm
+        // path's resolver can judge it. Restoring a bare token here would hand
+        // the next arm a reference with no provenance, which is the F-PFBOOT
+        // shape rebuilt inside the rollback path.
+        writeEnableReference(state, previousReference);
         await this.applyUnion(state, previousCommitted);
         state.committed = previousCommitted;
       }
       delete state.pending;
-      delete state.dirty;
+      clearDirtyUnlessFloorRepairOwed(state);
       await this.store.save(state);
     } catch (rollbackErr) {
       state.dirty = true;

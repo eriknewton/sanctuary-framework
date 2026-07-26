@@ -33,7 +33,7 @@ function emDashCount(rel: string): number {
   const abs = join(REPO_ROOT, rel);
   if (!existsSync(abs)) return 0;
   let txt = readFileSync(abs, "utf8");
-  if (isFirstPartySourceCode(rel)) txt = stripCodeComments(txt);
+  if (isFirstPartySourceCode(rel)) txt = stripCodeComments(txt, rel);
   let n = 0;
   let idx = txt.indexOf(EM_DASH);
   while (idx !== -1) {

@@ -13,9 +13,11 @@
  *       PR. It is a separate, Erik-present `[M]` build item: `--keepHome`
  *       stays the default (never auto-delete the home directory), and
  *       account removal must NEVER be bundled into the install one-confirm
- *       ceremony. This module does not import, call, or stub any account-
- *       deletion primitive; there is deliberately no `deleteUser`-shaped
- *       function anywhere in this PR's diff.
+ *       ceremony. Fresh-create failure recovery is intentionally
+ *       non-destructive: any observed record is left in place for in-place
+ *       repair because a name-based delete cannot prove it targets this run's
+ *       creation. This module still does not expose or call routine account
+ *       removal.
  *
  * Callers inject the daemon uninstall + disarm functions (rather than this
  * module importing egress-gate/harness-daemon.ts and cli/castle-wall.ts

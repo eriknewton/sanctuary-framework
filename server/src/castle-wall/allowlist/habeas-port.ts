@@ -474,6 +474,16 @@ export interface ComposeEffectiveRulesInput {
    * no gate rule (the pre-exclusive-egress composition, unchanged).
    */
   exclusiveEgressGate?: ExclusiveEgressGatePolicy | undefined;
+  /**
+   * Exclusive routing (Slice 5 S5-4): emit the derived gate-channel rule
+   * scoped to the AGENT uid (`scope.uids = [agent_uid]`) instead of the
+   * legacy empty scope, binding the gate channel to exactly the agent
+   * principal under the S5-0 two-confined-uid origin model. Only meaningful
+   * with `exclusiveEgressGate` present; default false leaves the shipped
+   * composition byte-identical. macOS-only (the Linux daemon refuses `uids`
+   * rules fail-closed by design); set only by the exclusive-routing composer.
+   */
+  gateRuleScopeToAgentUid?: boolean;
   /** Timestamp stamped onto every derived rule. */
   createdAt: string;
 }
@@ -529,8 +539,14 @@ export function composeEffectiveRules(input: ComposeEffectiveRulesInput): Allowl
   // derived allow rule pinning the agent's gate channel to loopback TCP on
   // the gate port. `deriveGateAllowRule` re-validates and throws on a
   // malformed policy, so a bad config can never sign a malformed rule.
+  // S5-4: the exclusive-routing composer binds the rule to the agent
+  // principal (`scope.uids = [agent_uid]`); the default stays byte-identical.
   if (input.exclusiveEgressGate !== undefined) {
-    rules.push(deriveGateAllowRule(input.exclusiveEgressGate, input.createdAt));
+    rules.push(
+      deriveGateAllowRule(input.exclusiveEgressGate, input.createdAt, {
+        scope_to_agent_uid: input.gateRuleScopeToAgentUid === true,
+      }),
+    );
   }
   // Self-check: the composed output must pass the same composed-manifest gate
   // the Linux daemon applies before putting a manifest into force

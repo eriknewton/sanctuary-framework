@@ -33,7 +33,14 @@ import type {
   ShortfallReport,
 } from "./types.js";
 import type { QuarterWindow } from "./types.js";
+import {
+  daemonStoreExcludedFromCensus,
+  isRecognizedDaemonStatus,
+  isUsableFigure,
+} from "./types.js";
 import { notCollectedInventorySnapshot } from "./inventory.js";
+import { IGNORED_OS_METADATA_LABEL } from "./pack-files.js";
+import { declareArtifactScope } from "./artifact-scope.js";
 import {
   claimFromCompleteRead,
   foldOutcome,
@@ -86,7 +93,14 @@ function renderCover(
   // shows BOTH bounds (not just the end) so a cover-only reader is not misled
   // when early entries were pruned in a completed quarter (MED-1).
   const coveredSpan = foldOutcome(shortfall, {
-    populated: (s) => `${s.covered_from} to ${s.covered_to_exclusive} (exclusive)`,
+    // Dry-9 fix-round-2 (P1): when the covered WINDOW was not determinable (a
+    // present-but-unparseable audit-census cut), render "could not be
+    // determined" -- never a definitive (here empty) span -- so the cover
+    // matches the SIGNED manifest's determinable:false.
+    populated: (s) =>
+      s.coverage_determinable
+        ? `${s.covered_from} to ${s.covered_to_exclusive} (exclusive)`
+        : "could not be determined",
     emptyVerified: () => "could not be determined",
     readFailed: () => "could not be determined (the audit log could not be read)",
   });
@@ -106,6 +120,14 @@ function renderCover(
   ];
   const banner = foldOutcome(shortfall, {
     populated: (s) => {
+      // Dry-9 fix-round-2 (P1): coverage window not determinable (a present-but-
+      // unparseable audit-census cut). Make no coverage claim -- the same
+      // fail-closed posture the SIGNED manifest takes -- with the precise reason,
+      // never the start-side "does not reach the quarter start" banner (which
+      // would misattribute a census-cut fault to pruning).
+      if (!s.coverage_determinable) {
+        return ["> COVERAGE UNAVAILABLE: " + s.explanation, ""];
+      }
       if (s.in_progress_quarter) {
         return [
           "> PARTIAL QUARTER: this report was generated before " +
@@ -119,22 +141,23 @@ function renderCover(
       }
       if (s.zero_of_quarter_covered) {
         // G-1(c): when a root-owned daemon store is present but EXCLUDED
-        // (unreadable/tampered), scope the zero-coverage claim to the OPERATOR
-        // store (the daemon may hold enforcement history for the quarter) and
-        // signpost it. When the daemon store is absent/included, the operator
-        // count IS the whole census, so keep the neutral wording (do not
-        // introduce a distinction that under-claims the single-store case).
-        const daemonExcluded =
-          s.daemon_store?.status === "present_unreadable" ||
-          s.daemon_store?.status === "present_tampered";
+        // (unreadable/tampered/missing), scope the zero-coverage claim to the
+        // OPERATOR store (the daemon may hold enforcement history for the
+        // quarter) and signpost it. When the daemon store is absent/included,
+        // the operator count IS the whole census, so keep the neutral wording
+        // (do not introduce a distinction that under-claims the single-store
+        // case).
+        // When a daemon store is excluded, scope the zero-coverage claim to the
+        // OPERATOR store (the daemon may hold quarter history). The daemon store
+        // itself is disclosed by the daemon cover caveat appended below (which
+        // is status-correct for present-unreadable/tampered vs. deleted), so this
+        // banner does not describe the daemon store's state here.
         return [
-          daemonExcluded
+          daemonStoreExcludedFromCensus(s.daemon_store)
             ? "> COVERAGE NOTICE: NONE of this quarter is covered by the operator " +
               "audit log; no operator-store entries from " +
               window.label +
-              " survive in the retained log. See the access-log section for " +
-              "details, including a separate root-owned daemon enforcement store " +
-              "that is present but not included in these counts."
+              " survive in the retained log. See the access-log section for details."
             : "> COVERAGE NOTICE: NONE of this quarter is covered; no entries from " +
               window.label +
               " survive in the retained log. See the access-log section for " +
@@ -143,10 +166,19 @@ function renderCover(
         ];
       }
       if (s.shortfall) {
+        // C2 (dry-bar): the generic start-side shortfall banner asserted
+        // "earlier-quarter access history is not in the retained log" without
+        // qualification. When a root-owned daemon store is EXCLUDED, scope that
+        // to the OPERATOR store; the daemon store's own state is disclosed by the
+        // daemon cover caveat appended below.
         return [
-          "> COVERAGE NOTICE: the signed span above does NOT reach the quarter " +
-            "start; earlier-quarter access history is not in the retained log. " +
-            "See the access-log section for details.",
+          daemonStoreExcludedFromCensus(s.daemon_store)
+            ? "> COVERAGE NOTICE: the signed span above does NOT reach the quarter " +
+              "start; earlier-quarter access history is not in the retained " +
+              "OPERATOR audit log. See the access-log section for details."
+            : "> COVERAGE NOTICE: the signed span above does NOT reach the quarter " +
+              "start; earlier-quarter access history is not in the retained log. " +
+              "See the access-log section for details.",
           "",
         ];
       }
@@ -162,6 +194,14 @@ function renderCover(
     ],
   });
   body.push(...banner);
+  // Cover-level enforcement-census caveat: fires whenever a daemon store is
+  // EXCLUDED, INDEPENDENT of the shortfall banner above -- so a full-operator-
+  // coverage quarter (shortfall=false) with an excluded/missing daemon store is
+  // never presented on the cover as a complete enforcement record (dry-bar
+  // gate-round HIGH). Status-correct wording (deleted vs. unreadable vs. tampered).
+  const coverDaemon =
+    shortfall.status === "populated" ? shortfall.value.daemon_store : undefined;
+  body.push(...daemonCoverCaveat(coverDaemon));
   body.push(
     // HIGH-4: honest evidence-toward framing. Three of the five CNA sections are
     // labeled placeholders in this build, and every file is self-signed with the
@@ -195,7 +235,25 @@ function renderCover(
  * witness. This is the MED-1 fix: a failed read can never print as a definitive
  * zero via the type, not merely via adjacent prose.
  */
-function toolInventoryLine(inv: InventorySnapshot): string {
+function toolInventoryLine(
+  inv: InventorySnapshot,
+  scope: { quarterLabel: string; generatedAt: string }
+): string {
+  // D11-2: the inventory is read at GENERATION time and printed under a
+  // reporting-quarter heading, so "AI tools inventoried: 0" in a Q1 pack reads
+  // as "the firm used no AI tools in Q1" when the truth is "the fortress has no
+  // registered tools as of today". The inventory SECTION disclosed that rows
+  // reflect the last persisted configuration, but the exec-summary bullet a
+  // reader actually reads carried no qualifier, and neither surface named the
+  // mismatch with the reporting quarter. Declared from the scope registry.
+  const scopeNote = declareArtifactScope("tool_inventory", {
+    quarterLabel: scope.quarterLabel,
+    generatedAt: scope.generatedAt,
+  });
+  return toolInventoryClaim(inv) + scopeNote;
+}
+
+function toolInventoryClaim(inv: InventorySnapshot): string {
   if (
     inv.agents.status === "read_failed" ||
     inv.mcp_servers.status === "read_failed"
@@ -245,10 +303,11 @@ function toolInventoryLine(inv: InventorySnapshot): string {
 function renderExecutiveSummary(
   aggregation: ReadOutcome<QuarterAggregation>,
   shortfall: ReadOutcome<ShortfallReport>,
-  inv: InventorySnapshot
+  inv: InventorySnapshot,
+  scope: { quarterLabel: string; generatedAt: string }
 ): PackSection {
   const machines = "1 (this Sanctuary install)";
-  const toolLine = toolInventoryLine(inv);
+  const toolLine = toolInventoryLine(inv, scope);
 
   // The decision-count bullets are DEFINITIVE claims (e.g. "0 denied"), so they
   // may only be drawn from a completed audit read. A read failure prints an
@@ -814,20 +873,46 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
   // non-split fortress): print nothing rather than throw.
   if (!d || d.status === "absent") return [];
   if (d.status === "included") {
-    // G-2: "the counts above" are quarter-windowed (aggregateQuarter skips
-    // out-of-window entries), so the figure that contributes to them is the
-    // WINDOWED daemon count, not the all-time total read. Render the windowed
-    // figure when the generator supplied it; otherwise fall back to a
-    // window-agnostic phrasing that does not claim the total was merged into the
-    // counts above.
-    if (d.windowed_entry_count !== undefined) {
+    // P2 (Dry-9): `included_entry_count` (and the windowed subset) are signed
+    // into this prose. Guard them with the shared `isUsableFigure` chokepoint --
+    // a negative / non-safe-integer count is an impossible census (the shipped
+    // CLI derives it from `daemon.entries.length` and is safe, but this
+    // pure/signed path must not sign "-7 daemon-recorded enforcement entries").
+    // An unusable count renders NOT-DETERMINABLE, never a definitive impossible
+    // number.
+    if (!isUsableFigure(d.included_entry_count)) {
+      return [
+        "> ENFORCEMENT-CENSUS NOTICE: a separate root-owned daemon enforcement " +
+          "store (_audit-daemon) is reported as included, but its merged entry " +
+          "count is not a usable figure, so the number of daemon-recorded " +
+          "enforcement entries in this census is NOT DETERMINABLE. Do not treat " +
+          "these counts as a complete enforcement census; investigate the daemon " +
+          "store.",
+        "",
+      ];
+    }
+    // G-2: "the counts above" are windowed, so the figure that contributes to
+    // them is the WINDOWED daemon count, not the all-time total read. Render the
+    // windowed figure when the generator supplied it AND it is usable; otherwise
+    // fall back to a window-agnostic phrasing that does not claim the total was
+    // merged into the counts above.
+    //
+    // D10-1: that window is now the ATTESTED coverage window, not the calendar
+    // quarter, because the counts it describes are taken over the attested
+    // window. The figure and the counts stay consistent (both come from the one
+    // chokepoint); the WORDING below is what had to follow, since "within the
+    // reporting quarter" would now name a boundary the figure did not apply.
+    if (
+      d.windowed_entry_count !== undefined &&
+      isUsableFigure(d.windowed_entry_count)
+    ) {
       return [
         `Daemon enforcement store: included. Of ${d.included_entry_count} ` +
           "daemon-recorded enforcement entries merged into this report's census " +
           "(from the root-owned _audit-daemon store created by the audit-store " +
-          `split), ${d.windowed_entry_count} fall within the reporting quarter ` +
-          "and contribute to the counts above; the remainder are retained daemon " +
-          "history outside the quarter window.",
+          `split), ${d.windowed_entry_count} fall within this report's attested ` +
+          "coverage window and contribute to the counts above; the remainder are " +
+          "retained daemon history outside that window.",
         "",
       ];
     }
@@ -852,6 +937,41 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
         "above, and this failure is itself evidence that the store was " +
         "modified or corrupted. Investigate before relying on this report; do " +
         "not treat this as a complete enforcement census.",
+      "",
+    ];
+  }
+  if (d.status === "missing") {
+    // C1 (dry-bar): audit-store writer-split evidence is present but the daemon
+    // namespace is absent. Not a fresh fortress, and not a privilege limitation
+    // ("re-run as root" is futile -- root cannot recreate a missing store).
+    // Gate round 2: the split evidence is a fail-closed signal that may be a
+    // valid boundary/marker (genuine deletion) OR a present-but-unverifiable
+    // record, so the wording hedges rather than definitively asserting the
+    // migration "ran".
+    return [
+      "> ENFORCEMENT-CENSUS NOTICE: audit-store writer-split evidence is present " +
+        "on this fortress (a split boundary and/or established marker naming a " +
+        "separate root-owned daemon enforcement store, _audit-daemon), but that " +
+        "store is ABSENT: either the writer-split migration ran and the store was " +
+        "since deleted or renamed, or the split evidence on disk is present but " +
+        "unverifiable. Either way, daemon-recorded enforcement events are NOT " +
+        "included in the counts above and this is NOT a clean fresh or " +
+        "never-armed fortress. Investigate before relying on this report; do not " +
+        "treat these counts as a complete enforcement census.",
+      "",
+    ];
+  }
+  // D8-4 (Dry-9): an UNRECOGNIZED status (an untyped / JSON caller smuggled a
+  // string past the union) must be disclosed as not-determinable, never
+  // mislabeled with the present_unreadable "not readable at this privilege"
+  // wording below (a specific false diagnosis) and never silently dropped.
+  if (!isRecognizedDaemonStatus(d.status)) {
+    return [
+      "> ENFORCEMENT-CENSUS NOTICE: the daemon enforcement store disclosure " +
+        "carried an UNRECOGNIZED status, so whether a separate root-owned daemon " +
+        "enforcement store contributed to these counts could NOT be determined. " +
+        "Do not treat these counts as a complete enforcement census; investigate " +
+        "the daemon store.",
       "",
     ];
   }
@@ -898,6 +1018,45 @@ function daemonStoreNote(d: DaemonStoreDisclosure | undefined): string[] {
  * duplicating the "re-run as root" advice (which keeps it G-3-correct by
  * construction: no root advice is emitted from here for any reason).
  */
+/**
+ * Cover-level enforcement-census caveat, appended to the cover whenever a daemon
+ * store is EXCLUDED from the census -- independent of the coverage/shortfall
+ * banner, so a shortfall=false quarter never presents a clean cover as a
+ * complete enforcement record. Wording is STATUS-CORRECT: a `missing` store is
+ * described as absent (deleted, or present-but-unverifiable split evidence),
+ * never "present" and never a definitive "the migration ran". Empty for
+ * `absent`/`included`.
+ */
+function daemonCoverCaveat(d: DaemonStoreDisclosure | undefined): string[] {
+  if (!daemonStoreExcludedFromCensus(d)) return [];
+  const phrase =
+    d!.status === "missing"
+      ? "audit-store writer-split evidence is present on this fortress but the " +
+        "separate root-owned daemon enforcement store (_audit-daemon) it " +
+        "references is ABSENT (deleted or renamed, or the split evidence is " +
+        "present but unverifiable), so this is not a clean fresh fortress"
+      : d!.status === "present_tampered"
+        ? "a separate root-owned daemon enforcement store (_audit-daemon) is " +
+          "present but FAILED integrity verification (tamper evidence)"
+        : // D8-4 (Dry-9): an unrecognized status gets honest not-determinable
+          // wording, never the specific "not readable here" privilege excuse.
+          !isRecognizedDaemonStatus(d!.status)
+          ? "the daemon enforcement store disclosure carried an UNRECOGNIZED " +
+            "status, so its contribution to the census is not determinable"
+          : "a separate root-owned daemon enforcement store (_audit-daemon) is " +
+            "present but was not readable here";
+  return [
+    "> ENFORCEMENT-CENSUS NOTICE: " +
+      phrase +
+      ". Its daemon-recorded enforcement (automated Castle Wall gate decisions " +
+      "and egress denials) is NOT included in this report's counts or its " +
+      "covered-window / shortfall assessment, so those are an operator-store " +
+      "view, NOT a complete enforcement census. See the access-log and " +
+      "enforcement summary section.",
+    "",
+  ];
+}
+
 function daemonCensusCaveat(d: DaemonStoreDisclosure | undefined): string[] {
   if (!d) return [];
   if (d.status === "present_unreadable") {
@@ -923,6 +1082,33 @@ function daemonCensusCaveat(d: DaemonStoreDisclosure | undefined): string[] {
         "Do not treat these counts as a complete enforcement census; investigate. " +
         "The access-log and enforcement summary section carries the full " +
         "disclosure.",
+      "",
+    ];
+  }
+  if (d.status === "missing") {
+    return [
+      "> ENFORCEMENT-CENSUS NOTICE: these counts are drawn from the operator " +
+        "audit store only. Audit-store writer-split evidence is present on this " +
+        "fortress, but the separate root-owned daemon enforcement store " +
+        "(_audit-daemon) it references is ABSENT (deleted or renamed, or the " +
+        "split evidence is present but unverifiable), so its daemon-recorded " +
+        "enforcement events are NOT included in the counts here. This is NOT a " +
+        "clean fresh fortress; do not treat these counts as a complete " +
+        "enforcement census; investigate. The access-log and enforcement summary " +
+        "section carries the full disclosure.",
+      "",
+    ];
+  }
+  // D8-4 (Dry-9): an unrecognized status is disclosed as not-determinable so the
+  // adjacent definitive counts are never presented as a complete census.
+  if (!isRecognizedDaemonStatus(d.status)) {
+    return [
+      "> ENFORCEMENT-CENSUS NOTICE: these counts are drawn from the operator " +
+        "audit store only. The daemon enforcement store disclosure carried an " +
+        "UNRECOGNIZED status, so whether a separate root-owned daemon enforcement " +
+        "store contributed is NOT DETERMINABLE. Do not treat these counts as a " +
+        "complete enforcement census; investigate. The access-log and enforcement " +
+        "summary section carries the full disclosure.",
       "",
     ];
   }
@@ -967,12 +1153,34 @@ function renderAccessLog(
     readFailed: (reason) => countsUnavailable(reason),
   });
   const window = foldOutcome(shortfall, {
-    populated: (s) => [
+    populated: (s) => {
+      // Dry-9 fix-round-2 (P1): coverage window not determinable (a present-but-
+      // unparseable audit-census cut) makes NO coverage claim and asserts NO
+      // definitive covered-window sentence, matching the SIGNED manifest's
+      // determinable:false. The daemon disclosure still renders (it is
+      // independent of the census cut).
+      if (!s.coverage_determinable) {
+        return [
+          "Covered window: could NOT be determined for this quarter. This " +
+            "report makes no coverage claim. Reason: " +
+            s.explanation,
+          "",
+          ...daemonStoreNote(s.daemon_store),
+        ];
+      }
+      return [
       // R3-2: the covered window is derived from what the retained log SPANS.
       // Without the second clause, a quarter where Sanctuary was simply not
       // running (retained entries on both sides, zero decisions in between)
       // reads as "fully covered, zero denials, everything enforced".
-      `Covered window attested for this quarter: ${s.covered_from} to ${s.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter; it reflects what the retained audit log spans and does not by itself prove the enforcement stack was running and recording at every moment within it.`,
+      //
+      // Gate round 2 (dry-bar): when a daemon store is EXCLUDED, this covered
+      // window is derived from the OPERATOR log only, so scope it explicitly --
+      // it is not the enforcement stack's covered window (the daemon store's own
+      // coverage is not reflected here; the ENFORCEMENT-CENSUS notice below and
+      // on the cover carry that). Without this, a full-operator-coverage quarter
+      // reads as a complete enforcement census on this signed section too.
+      `Covered window attested for this quarter: ${s.covered_from} to ${s.covered_to_exclusive} (exclusive). This is the span the report actually backs, which is NOT necessarily the full quarter; it reflects what the retained ${daemonStoreExcludedFromCensus(s.daemon_store) ? "OPERATOR " : ""}audit log spans and does not by itself prove the enforcement stack was running and recording at every moment within it.${daemonStoreExcludedFromCensus(s.daemon_store) ? " A separate daemon enforcement store is excluded from this window (see the notice below), so this covered window is an operator-store view, not a complete enforcement census." : ""}`,
       "",
       ...(s.shortfall ? ["> COVERAGE NOTICE: " + s.explanation, ""] : []),
       // WATCH-1: the F2 audit-store split routes daemon-produced enforcement
@@ -980,7 +1188,8 @@ function renderAccessLog(
       // root-owned store. State its contribution explicitly so the counts above
       // are never read as a complete census when a second store exists.
       ...daemonStoreNote(s.daemon_store),
-    ],
+      ];
+    },
     emptyVerified: () => [],
     readFailed: (reason) => [
       "Covered window: could NOT be determined for this quarter because the " +
@@ -1093,9 +1302,56 @@ export interface DiscreteExportsView {
   anchor: DiscreteExportView;
 }
 
+/**
+ * D11-2: the SINGLE construction site for what the public-anchor export lets a
+ * reader confirm. Anchor receipts bind to checkpoint RECORDS; those records ship
+ * in the transparency bundle. So the strength of the claim is a function of both
+ * exports, and taking both as parameters is what stops the anchor arm from
+ * asserting confirmation from a dependency the pack did not include.
+ *
+ * The verifier itself already encodes this relationship: `anchor-verify.ts`
+ * raises an `anchor_beyond_bundle` finding when a receipt proves a counter the
+ * supplied bundle does not reach. A reader handed anchors without a bundle
+ * cannot run that check at all.
+ */
+function anchorConfirmationLines(
+  anchorFilename: string,
+  transparency: DiscreteExportView,
+  scope: { quarterLabel: string }
+): string[] {
+  const preamble =
+    `Included as \`${anchorFilename}\`. It carries the anchor receipts this ` +
+    "fortress recorded. It contains salted commitments handed over " +
+    "deliberately, never content." +
+    declareArtifactScope("anchor_evidence", {
+      quarterLabel: scope.quarterLabel,
+    });
+  if (transparency.outcome.status === "populated") {
+    return [
+      preamble +
+        " Checked against the transparency checkpoint bundle above, an auditor " +
+        "can confirm those checkpoints were publicly anchored (freshness and " +
+        "fork detection).",
+      "",
+    ];
+  }
+  return [
+    preamble +
+      " NOTE: the transparency checkpoint bundle is NOT included in this pack " +
+      "(see above for why), and anchor receipts are checked AGAINST those " +
+      "checkpoint records. So this file alone does NOT let an auditor confirm " +
+      "that this fortress's checkpoints were publicly anchored: it shows which " +
+      "checkpoint counters carry anchor receipts, but the records they bind to " +
+      "are not here to check them against. Obtain the transparency bundle " +
+      "before relying on these receipts for freshness or fork detection.",
+    "",
+  ];
+}
+
 function renderVerification(
   signerDid: string,
-  discreteExports: DiscreteExportsView
+  discreteExports: DiscreteExportsView,
+  scope: { quarterLabel: string }
 ): PackSection {
   const body = [
     "# Verifying this pack as a third party",
@@ -1106,19 +1362,34 @@ function renderVerification(
     "",
     "Each Markdown and export file in this pack is individually SHA-256 hashed " +
       "and Ed25519-signed with the firm's primary identity; the signatures and " +
-      "hashes are recorded in `00_pack_manifest.json`. To verify a file " +
-      "without any Sanctuary software:",
+      "hashes are recorded in `00_pack_manifest.json`. The manifest's `files` " +
+      "list is EXHAUSTIVE for this pack: the generator writes the delivered " +
+      "directory as a complete set, so apart from this report's PDF copy there " +
+      "should be no other Markdown or export file present. Step 3 below lets " +
+      "you confirm that yourself. To verify a file without any Sanctuary " +
+      "software:",
     "",
     "1. Recompute the file's SHA-256 (for example, `sha256sum <file>`) and " +
       "confirm it matches the `sha256` recorded for that file in the manifest.",
     "2. Verify the Ed25519 signature over that SHA-256 digest against the " +
       `signer public key in the manifest (signer: ${signerDid}).`,
-    "3. (Optional) Verify the manifest's own `manifest_signature`. Reproduce the " +
+    "3. Reconcile the DIRECTORY against the manifest: list the files you " +
+      "received (including hidden ones, for example `ls -a`) and confirm every " +
+      "one is either recorded in the manifest's `files` list or is " +
+      "`00_pack_manifest.json` or `evidence-pack.pdf`. A file present here but " +
+      "absent from the manifest is NOT covered by these signatures and must " +
+      "not be relied on, even if it looks like a valid Sanctuary artifact and " +
+      "verifies on its own: it may be left over from a different reporting " +
+      "period. The ONLY exception is inert operating-system metadata, which " +
+      "the generator ignores and which carries no evidentiary content: " +
+      IGNORED_OS_METADATA_LABEL +
+      ". Any other file, hidden or not, is a reconciliation failure.",
+    "4. (Optional) Verify the manifest's own `manifest_signature`. Reproduce the " +
       "canonical body EXACTLY: take the manifest JSON, DROP the " +
       "`manifest_signature` field, sort ALL object keys recursively in ASCII " +
       "order, serialize with NO whitespace, then Ed25519-verify " +
       "`manifest_signature` over the SHA-256 digest of that canonical string, " +
-      "using the same signer public key. (Steps 1 and 2 are the primary, " +
+      "using the same signer public key. (Steps 1 to 3 are the primary, " +
       "tool-free integrity checks; this manifest self-signature is a " +
       "belt-and-suspenders check and depends on reproducing the canonicalization " +
       "above.)",
@@ -1171,7 +1442,10 @@ function renderVerification(
         "A PASS (exit 0) confirms the signed checkpoint chain. A stale but " +
           "genesis-rooted bundle can still pass offline verification; only " +
           "public anchoring (below) plus a pinned log key adds freshness and " +
-          "fork detection.",
+          "fork detection." +
+          declareArtifactScope("transparency_bundle", {
+            quarterLabel: scope.quarterLabel,
+          }),
         "",
       ],
       emptyVerified: () => [
@@ -1180,10 +1454,11 @@ function renderVerification(
           "one-line verify command above.",
         "",
       ],
-      readFailed: (reason) => [
-        `Not included: the transparency bundle could not be gathered. ${reason}`,
-        "",
-      ],
+      // D10-3 (dry-bar round 10): the reason ALREADY leads with "the
+      // transparency bundle could not be gathered", so re-prefixing it printed
+      // the clause twice, the second time lowercase after a period. Render the
+      // bare reason, exactly like the two sibling arms below.
+      readFailed: (reason) => [`Not included: ${reason}`, ""],
     }),
     "### Audit-chain export",
     "",
@@ -1200,37 +1475,56 @@ function renderVerification(
         "```",
         "",
         "The export carries encrypted payload bytes only (no plaintext content " +
-          "is exposed).",
+          "is exposed)." +
+          // D11-2: this file spans the whole retained log, so a reader
+          // comparing its record count against the in-quarter totals stated
+          // elsewhere would otherwise conclude the report understates.
+          declareArtifactScope("audit_chain", {
+            quarterLabel: scope.quarterLabel,
+          }),
         "",
       ],
       emptyVerified: () => [
         "Not included: the audit-chain export was empty for this fortress.",
         "",
       ],
-      readFailed: (reason) => [
-        `Not included: the audit-chain export could not be gathered. ${reason}`,
-        "",
-      ],
+      // The reason is self-contained (it covers BOTH a genuine gather failure
+      // and the deliberate split-fortress omission, C2/R2-1), so it carries the
+      // "why" without a fixed "could not be gathered" prefix that would
+      // misdescribe a deliberate omission as a failure.
+      readFailed: (reason) => [`Not included: ${reason}`, ""],
     }),
     "### Public-anchor (Rekor) evidence",
     "",
     ...foldOutcome(discreteExports.anchor.outcome, {
-      populated: () => [
-        `Included as \`${discreteExports.anchor.filename}\`. It lets an auditor ` +
-          "confirm the checkpoints were publicly anchored (freshness and fork " +
-          "detection). It contains salted commitments handed over deliberately, " +
-          "never content.",
-        "",
-      ],
+      // D11-2 (Codex lens, dry-bar round 11): the confirmation claim is
+      // cross-gated on the transparency bundle actually being IN the pack. The
+      // anchor receipts prove a checkpoint COUNTER was anchored; confirming
+      // that means checking the receipt against the checkpoint record it binds
+      // to, and those records live in the transparency bundle. When the bundle
+      // is absent (for example a multi-key checkpoint history makes it
+      // ungatherable, which is a state this pack reaches on its own), the pack
+      // used to say an auditor "can confirm those checkpoints were publicly
+      // anchored" from a dependency it had not shipped -- a definitive
+      // verification claim over evidence the reader does not hold. The claim is
+      // now built from what was actually included.
+      populated: () =>
+        anchorConfirmationLines(
+          discreteExports.anchor.filename,
+          discreteExports.transparency,
+          scope
+        ),
+      // C4 (dry-bar): reached ONLY when a real read found no anchor evidence --
+      // either anchoring was never enabled, or it is enabled but no checkpoint
+      // has been anchored yet. State both honestly rather than asserting a
+      // definitive "not enabled" the read may not support.
       emptyVerified: () => [
-        "Not included: public transparency anchoring (Sigstore/Rekor) is opt-in " +
-          "and is not enabled on this install.",
+        "Not included: no public-anchor (Sigstore/Rekor) evidence is available " +
+          "for this install. Public anchoring is opt-in; either it is not enabled, " +
+          "or it is enabled but no checkpoint has been anchored yet.",
         "",
       ],
-      readFailed: (reason) => [
-        `Not included: the anchor evidence could not be gathered. ${reason}`,
-        "",
-      ],
+      readFailed: (reason) => [`Not included: ${reason}`, ""],
     }),
   ];
 
@@ -1262,10 +1556,11 @@ function renderScopeAndLimits(): PackSection {
     "- **Covered window (both ends).** Audit retention is size/count-based " +
       "(FIFO), not time-based, so a busy fortress can prune early-quarter " +
       "entries (start-side shortfall); and a report generated before the " +
-      "quarter closes can only attest coverage through its generation time " +
-      "(end-side / partial-quarter shortfall). This report detects and " +
-      "discloses both above and states the real covered-through instant, " +
-      "never assuming coverage to the quarter end.",
+      "quarter closes can only attest coverage through the earlier of its " +
+      "generation time and the audit-census cut point (the instant the audit " +
+      "log was read) (end-side / partial-quarter shortfall). This report " +
+      "detects and discloses both above and states the real covered-through " +
+      "instant, never assuming coverage to the quarter end.",
     "- **A covered window proves retention span, not recording liveness.** " +
       "The covered window states what the retained audit log spans. It does " +
       "not prove the enforcement stack was running and recording at every " +
@@ -1335,7 +1630,10 @@ export function renderSections(params: {
       params.productName,
       params.shortfall
     ),
-    renderExecutiveSummary(params.aggregation, params.shortfall, inv),
+    renderExecutiveSummary(params.aggregation, params.shortfall, inv, {
+      quarterLabel: params.window.label,
+      generatedAt: params.generatedAt,
+    }),
     renderInventory(inv),
     renderGovernancePolicy(),
     renderTrainingAttestations(),
@@ -1348,7 +1646,9 @@ export function renderSections(params: {
     renderAccessLog(params.aggregation, params.shortfall),
     renderCustody(params.custody),
     renderIncidentResponse(),
-    renderVerification(params.signerDid, params.discreteExports),
+    renderVerification(params.signerDid, params.discreteExports, {
+      quarterLabel: params.window.label,
+    }),
     renderScopeAndLimits(),
     renderPerMachineAppendix(),
   ];

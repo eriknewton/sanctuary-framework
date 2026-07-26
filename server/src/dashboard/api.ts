@@ -27,6 +27,13 @@ import { getProcessInstance, getProcessSince } from "./process-identity.js";
 import { logCaughtError } from "../http/error-envelope.js";
 import { renderPostureHomeHTML } from "../principal-policy/posture-home-html.js";
 import {
+  renderMobileCompanionHTML,
+  MOBILE_COMPANION_WEBMANIFEST,
+  MOBILE_COMPANION_SERVICE_WORKER_JS,
+  MOBILE_COMPANION_CSP,
+  MOBILE_COMPANION_ROUTE_PREFIX,
+} from "./mobile.js";
+import {
   handlePostureRoute,
   POSTURE_AGENT_PATH_PREFIX,
   POSTURE_API_PREFIX,
@@ -225,10 +232,17 @@ function generateEphemeralKey(): Uint8Array {
   return new Uint8Array(randomBytes(32));
 }
 
-function writeText(res: ServerResponse, status: number, body: string, contentType = "text/plain"): void {
+function writeText(
+  res: ServerResponse,
+  status: number,
+  body: string,
+  contentType = "text/plain",
+  extraHeaders?: Record<string, string>,
+): void {
   res.writeHead(status, {
     "Content-Type": contentType,
     "Cache-Control": "no-store",
+    ...(extraHeaders ?? {}),
   });
   res.end(body);
 }
@@ -268,6 +282,37 @@ export async function handleRequest(
     return true;
   }
 
+  // ── Mobile companion (PWA) -- slice 1: phone-as-approval ─────────────
+  // Served TOKENLESS, exactly like the v1.1 concierge SPA: the shell carries
+  // NO operator data and runs its own client-side auth (the operator's token
+  // is sent only as a bearer header to the EXISTING gated /api routes -- see
+  // ./mobile.ts for the full security posture). The service worker is
+  // scope-limited to /m/ and never caches /api traffic.
+  if (
+    method === "GET" &&
+    (path === MOBILE_COMPANION_ROUTE_PREFIX || path === `${MOBILE_COMPANION_ROUTE_PREFIX}/`)
+  ) {
+    writeText(res, 200, renderMobileCompanionHTML(), "text/html; charset=utf-8", {
+      "Content-Security-Policy": MOBILE_COMPANION_CSP,
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+    });
+    return true;
+  }
+  if (method === "GET" && path === `${MOBILE_COMPANION_ROUTE_PREFIX}/manifest.webmanifest`) {
+    writeText(res, 200, MOBILE_COMPANION_WEBMANIFEST, "application/manifest+json; charset=utf-8", {
+      "X-Content-Type-Options": "nosniff",
+    });
+    return true;
+  }
+  if (method === "GET" && path === `${MOBILE_COMPANION_ROUTE_PREFIX}/sw.js`) {
+    writeText(res, 200, MOBILE_COMPANION_SERVICE_WORKER_JS, "text/javascript; charset=utf-8", {
+      "X-Content-Type-Options": "nosniff",
+      "Service-Worker-Allowed": "/m/",
+    });
+    return true;
+  }
+
   if (
     path === POSTURE_API_PREFIX ||
     path.startsWith(`${POSTURE_API_PREFIX}/`) ||
@@ -291,6 +336,8 @@ export async function handleRequest(
           deps.sources.resolveBrokerPinnedProducerKey,
         brokerProducerKeyExpectedButUnavailable:
           deps.sources.brokerProducerKeyExpectedButUnavailable === true,
+        resolveProtectionClaimSubject:
+          deps.sources.resolveProtectionClaimSubject,
         // Fleet Console: pass the SAME read-only fleet-roster provider the
         // `/api/fleet/roster` route uses to the posture routes, so the already-
         // served posture-home fleet panel (`GET /api/posture/fleet`) lights up

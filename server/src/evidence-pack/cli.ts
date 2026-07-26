@@ -15,7 +15,7 @@
  * NOT LEGAL ADVICE. The generated pack is a technical artifact.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { createSanctuaryServer } from "../index.js";
@@ -24,8 +24,18 @@ import type { StoredIdentity } from "../core/identity.js";
 import { AuditIntegrityError, type AuditEntry } from "../operational/audit-log.js";
 import {
   createDaemonAuditLog,
-  probeDaemonChainAccess,
+  daemonMigrationEstablished,
+  errnoAccessReason,
+  resolveDaemonStorePresence,
 } from "../operational/audit-store-split.js";
+import { fortressRanAuditStoreSplitMigration } from "../cli/audit-chain-export.js";
+import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
+import { isPackRelevantEntry } from "./pack-files.js";
+import {
+  anchorReceiptsPresentOnDisk,
+  buildAnchorsExport,
+  readAnchorConfig,
+} from "../transparency/anchoring.js";
 import type { StorageBackend } from "../storage/interface.js";
 import { FilesystemStorage } from "../storage/filesystem.js";
 import { StateStore } from "../cognitive/state-store.js";
@@ -40,14 +50,17 @@ import {
   TRANSPARENCY_BUNDLE_FORMAT,
   type TransparencyBundle,
 } from "../transparency/checkpoint.js";
-import { exportAuditChain } from "../cli/audit-chain-export.js";
+import { exportAuditChain, totalRecordsSkipped } from "../cli/audit-chain-export.js";
 import type {
   CustodyFacts,
   DaemonStoreDisclosure,
+  EvidencePack,
   EvidencePackDiscreteExports,
   EvidencePackInput,
   InventorySnapshot,
+  PerStoreRetention,
   RetentionFacts,
+  ShortfallReport,
 } from "./types.js";
 import {
   buildInventorySnapshot,
@@ -55,6 +68,7 @@ import {
   type ProxyServerView,
 } from "./inventory.js";
 import {
+  describeReadFailureCause,
   emptyVerified,
   populated,
   readFailed,
@@ -63,12 +77,163 @@ import {
 import {
   buildEvidencePack,
   MANIFEST_FILENAME,
+  PACK_FILENAMES,
   PDF_FILENAME,
   PRODUCT_NAME,
   REPORT_FILENAME,
   type AuditReadData,
 } from "./generate.js";
 import { currentQuarter, parseQuarterLabel, quarterLabel } from "./quarter.js";
+
+/**
+ * D10-DISC-1 (dry-bar round 10): the ONE place a caught read error becomes a
+ * reason string for the pack. It splits the two audiences that were previously
+ * conflated by interpolating a raw `Error.message` into the artifact:
+ *
+ *  - THE LAW FIRM gets `lead` plus a COARSE category from the closed set in
+ *    `describeReadFailureCause`. The error's free-text message is never read,
+ *    so an absolute fortress path, username, hostname, or raw syscall string
+ *    cannot reach the signed report or the SIGNED manifest `coverage.reason`.
+ *  - THE OPERATOR gets the full raw diagnostic on the local console, which is
+ *    not part of the pack and never leaves the machine.
+ *
+ * Round 10 rendered a full absolute fortress path into the signed, firm-facing
+ * report through the raw-interpolation shape this replaces. Every read-failure
+ * site in this CLI routes through here; `readFailed` additionally scrubs the
+ * result, so a future site that forgets this helper still cannot emit a path.
+ */
+function readFailureReason(lead: string, cause: unknown): string {
+  const raw =
+    cause instanceof Error ? cause.message : String(cause);
+  // SAFETY: stderr is the operator-facing CLI channel for this subcommand; no logger module is in scope yet. This is deliberately the ONLY place the raw diagnostic appears, and stderr is not part of the delivered pack.
+  console.error(
+    `[sanctuary evidence-pack] ${lead}. Local diagnostic (operator console ` +
+      `only, deliberately NOT included in the pack): ${raw}`
+  );
+  return `${lead}: ${describeReadFailureCause(cause)}`;
+}
+
+// ── D10-2: THE OUTPUT-DIRECTORY CHOKEPOINT ──────────────────────────
+//
+// The pack that reaches the law firm is the DIRECTORY (the operator zips or
+// attaches it), not the manifest alone. Round 10 showed the directory drifting
+// out of agreement with the manifest that describes it: run A emitted
+// `transparency-bundle.json`; a routine Castle Wall signing-key rotation flipped
+// that arm to `read_failed`; run B into the SAME directory wrote a manifest
+// listing only its own files and a report saying the bundle was "Not included",
+// and run A's bundle survived byte-identical under the canonical filename the
+// verification section tells auditors to look for.
+//
+// That is worse than untidy for two reasons. The stale bundle is GENUINE and
+// internally valid, so an auditor who follows the report's own instruction to
+// verify it offline gets a CLEAN result and concludes the enforcement history
+// was independently corroborated, in the exact quarter the report says it was
+// not. And section 1 of the SIGNED report asserts a universally-quantified
+// claim: that each Markdown and export file in the pack is recorded in
+// `00_pack_manifest.json`. A stale export falsifies a claim the firm's signature
+// stands behind.
+//
+// So the directory is made a GENERATED SET rather than an accumulating one:
+// after this function returns, the directory contains EXACTLY the files this run
+// emitted. The universal claim in section 1 is then true by construction rather
+// than by hope, which is why the fix lives here and not in the wording.
+//
+// Files this tool never writes are REFUSED, not deleted: sweeping an operator's
+// own file out of their directory would be a data-loss bug, and a foreign file
+// in the shipped directory is exactly what would falsify section 1.
+//
+// D11-1 (Codex lens, dry-bar round 11): the exemption for files the claim does
+// NOT range over used to be "any name starting with a dot". That was a
+// deliberate usability tradeoff -- refusing on `.DS_Store` would make the tool
+// unusable on a machine whose file browser has opened the delivery folder -- but
+// it was too wide to keep the signed claim true. A hidden `.counsel-notes.md` is
+// still a Markdown file in the delivered directory, so it bypassed both the
+// pre-write foreign check and the post-write reconciliation while section 1
+// asserted every Markdown and export file in the pack is recorded in the
+// manifest. A conscious tradeoff that breaks an honesty claim is still a defect.
+//
+// The exemption is now a CLOSED, NAMED set of inert operating-system metadata,
+// defined once in `pack-files.ts` and published from there into BOTH the writer
+// below and the signed section-1 verification recipe. The shipped directory and
+// the signed prose read from one definition, so they cannot disagree about what
+// "every file" means. Anything hidden but NOT on that list -- any `.md`,
+// `.json`, `.jsonl`, or any other unrecognized dotfile -- is pack-relevant and
+// is refused or reconciled exactly like a visible file.
+
+/**
+ * Write the pack so the output directory ends up containing EXACTLY this run's
+ * files (see the block comment above). Refuses rather than deleting anything
+ * this tool does not itself emit, and reconciles the directory against the
+ * manifest afterwards so a drift can never ship silently.
+ */
+export async function writePackDirectory(
+  outputDir: string,
+  pack: EvidencePack
+): Promise<void> {
+  // The complete set this run is entitled to leave behind: the signed manifest,
+  // the unsigned human-readable PDF, and every file the manifest lists.
+  const expected = new Set<string>([
+    MANIFEST_FILENAME,
+    PDF_FILENAME,
+    ...pack.files.map((f) => f.filename),
+  ]);
+
+  await mkdir(outputDir, { recursive: true });
+  const before = (await readdir(outputDir)).filter(isPackRelevantEntry);
+
+  const foreign = before.filter((name) => !PACK_FILENAMES.includes(name));
+  if (foreign.length > 0) {
+    throw new Error(
+      `The output directory already contains ${foreign.length} file(s) this ` +
+        `command did not write: ${foreign.sort().join(", ")}. The evidence pack ` +
+        "is delivered as a whole directory, and its signed report states that " +
+        "every Markdown and export file in the pack is recorded in " +
+        `${MANIFEST_FILENAME}, so an unrecorded file would make that signed ` +
+        "statement false. Point --output at an empty directory, or remove the " +
+        "listed file(s), and run again. Nothing was written."
+    );
+  }
+
+  // Sweep this tool's own artifacts from earlier runs that THIS run does not
+  // emit. Without this, a conditional export that a previous run gathered and
+  // this one could not survives as stale evidence beside a manifest that omits
+  // it. Files that ARE in `expected` need no removal; the writes below replace
+  // them.
+  for (const name of before) {
+    if (!expected.has(name)) {
+      await rm(join(outputDir, name), { force: true });
+    }
+  }
+
+  await writeFile(
+    join(outputDir, MANIFEST_FILENAME),
+    JSON.stringify(pack.manifest, null, 2),
+    "utf-8"
+  );
+  for (const file of pack.files) {
+    await writeFile(join(outputDir, file.filename), file.content, "utf-8");
+  }
+  await writeFile(join(outputDir, PDF_FILENAME), pack.pdf);
+
+  // Reconcile: prove the shipped directory IS the pack. This is the step the
+  // report's section-1 verification recipe now tells the auditor to repeat, so
+  // the generator must not ship a directory that would fail it.
+  const after = (await readdir(outputDir)).filter(isPackRelevantEntry);
+  const unexpected = after.filter((name) => !expected.has(name));
+  const missing = [...expected].filter((name) => !after.includes(name));
+  if (unexpected.length > 0 || missing.length > 0) {
+    throw new Error(
+      "The output directory does not match the signed manifest after writing " +
+        (unexpected.length > 0
+          ? `(unexpected: ${unexpected.sort().join(", ")}) `
+          : "") +
+        (missing.length > 0 ? `(missing: ${missing.sort().join(", ")}) ` : "") +
+        "so this pack must not be delivered. Something else wrote to the " +
+        "directory during generation. Use a private empty --output directory " +
+        "and run again."
+    );
+  }
+}
 
 /**
  * Enumerate the AI-tool inventory from the fortress's persisted state,
@@ -94,7 +259,7 @@ async function gatherInventory(
       return {
         ok: false,
         records: [],
-        reason: `the hub agent registry could not be read: ${(e as Error).message}`,
+        reason: readFailureReason("the hub agent registry could not be read", e),
       };
     }
   })();
@@ -115,7 +280,7 @@ async function gatherInventory(
       return {
         ok: false,
         records: [],
-        reason: `the sovereignty profile could not be read: ${(e as Error).message}`,
+        reason: readFailureReason("the sovereignty profile could not be read", e),
       };
     }
   })();
@@ -154,7 +319,7 @@ async function gatherInventory(
         return {
           ok: false,
           records: [],
-          reason: `the observe store could not be read: ${(e as Error).message}`,
+          reason: readFailureReason("the observe store could not be read", e),
         };
       }
     })();
@@ -171,13 +336,34 @@ async function gatherInventory(
  * Gather the discrete third-party verification exports from persisted state,
  * offline: the signed transparency-checkpoint bundle (assembled from the
  * shipped `readPersistedCheckpoints`; requires a single signing key across the
- * checkpoints), and the audit-chain JSONL export (from the shipped
- * `exportAuditChain`). Public-anchor evidence is opt-in / default-off and is
- * reported absent unless a later slice wires it. Each absent export carries an
- * honest reason string. Never contacts the network.
+ * checkpoints), the audit-chain JSONL export (from the shipped
+ * `exportAuditChain`), and the public-anchor evidence (from the shipped
+ * `buildAnchorsExport`). Each absent export carries an honest reason string.
+ * Never contacts the network.
+ *
+ * R2-1 (dry-bar): the raw `exportAuditChain` dumps the OPERATOR `_audit` chain
+ * only. On a fortress that ran the writer-split migration, a daemon enforcement
+ * chain (`_audit-daemon`) also exists, so an operator-only export would present
+ * an INCOMPLETE enforcement history as "the recorded enforcement history" (the
+ * census hole G-1 closed on the counts, on the export surface). The gather omits
+ * the audit-chain export (an honest `read_failed`) whenever EITHER the export
+ * module's daemon-dir/marker probe (`fortressRanAuditStoreSplitMigration`, what
+ * `runExport` fails closed on) OR the boundary-aware `daemonMigrationEstablished`
+ * (which the census path uses and which catches a boundary-only migrated
+ * fortress whose daemon dir + `_meta` marker were deleted) fires -- so the
+ * export surface omits on the SAME evidence-destruction cases the census path
+ * flags `missing`, not a weaker subset.
+ *
+ * C4 (dry-bar): the anchor export is read from actual anchoring state via
+ * `readAnchorConfig` + `buildAnchorsExport`, NEVER minted as a bare
+ * `empty_verified` (which would render a DEFINITIVE "anchoring is not enabled on
+ * this install" even when it is enabled with receipts). A genuinely-absent
+ * (authenticated) config is the only path to `empty_verified`.
  */
-async function gatherDiscreteExports(
-  storage: StorageBackend,
+export async function gatherDiscreteExports(
+  storage: FilesystemStorage,
+  masterKey: Uint8Array,
+  fortressId: string,
   generatedAt: string
 ): Promise<EvidencePackDiscreteExports> {
   const transparency: ReadOutcome<string> = await (async () => {
@@ -200,12 +386,44 @@ async function gatherDiscreteExports(
       };
       return populated(JSON.stringify(bundle, null, 2));
     } catch (e) {
-      return readFailed(`the transparency bundle could not be gathered: ${(e as Error).message}`);
+      return readFailed(
+        readFailureReason("the transparency bundle could not be gathered", e)
+      );
     }
   })();
 
   const audit_chain: ReadOutcome<string> = await (async () => {
     try {
+      // R2-1: refuse an operator-only chain on a split (migrated) fortress. The
+      // raw exporter dumps `_audit` only; the daemon enforcement chain would be
+      // silently omitted. This is the SAME fail-closed guard `runExport`
+      // enforces (marker-aware: it also fires when the daemon directory was
+      // deleted but the migration marker survives). Omitting it as a
+      // `read_failed` is honest: §10 then states the export is not included and
+      // why, instead of calling an incomplete chain "the recorded enforcement
+      // history".
+      // Consult BOTH the export module's own daemon-dir/marker probe AND the
+      // marker+boundary-aware `daemonMigrationEstablished` (which the pack can
+      // run because it holds the master key): the former misses a boundary-only
+      // migrated fortress whose daemon dir was deleted and whose _meta marker is
+      // absent, the latter closes that hole. Either firing means an operator-
+      // only export would omit the daemon chain.
+      if (
+        (await fortressRanAuditStoreSplitMigration(storage)) ||
+        (await daemonMigrationEstablished(storage, masterKey))
+      ) {
+        return readFailed(
+          "a single-file audit-chain export could NOT be shown to be complete for " +
+            "this fortress: it appears to have run the audit-store writer split (a " +
+            "daemon enforcement chain _audit-daemon, or a durable split marker, is " +
+            "present, or the check could not rule it out), so an operator-`_audit`-" +
+            "only export would omit the root-owned daemon enforcement chain. It was " +
+            "NOT included rather than risk presenting an incomplete enforcement " +
+            "history as complete. Export the operator chain with 'sanctuary " +
+            "audit-chain export --operator-only' and the daemon chain separately as " +
+            "root."
+        );
+      }
       const chunks: Buffer[] = [];
       const sink = new Writable({
         write(chunk, _enc, cb) {
@@ -213,19 +431,163 @@ async function gatherDiscreteExports(
           cb();
         },
       });
-      await exportAuditChain(storage, sink);
+      const summary = await exportAuditChain(storage, sink);
       const jsonl = Buffer.concat(chunks).toString("utf8");
+      // P1-A (dry-bar round 6): one or more LISTED records were unreadable /
+      // invalid JSON / not a V2 envelope and were SKIPPED, so this export is
+      // INCOMPLETE. Distinguish "listed N, exported < N" (a corrupt / partial
+      // chain) from "listed 0" (a genuinely empty chain): never render a corrupt
+      // all-skipped chain as a definitive §10 `emptyVerified` "empty" (a false
+      // clean bill, the opposite of the tamper-evidence the export exists to
+      // provide), and never sign a silently-partial chain as complete. Disclose
+      // it as a read failure carrying the listed/exported/skipped counts.
+      const skipped = totalRecordsSkipped(summary);
+      if (skipped > 0) {
+        return readFailed(
+          "the audit-chain export could NOT be shown to be complete for this " +
+            `fortress: ${skipped} listed record(s) were unreadable, invalid, or ` +
+            "not a recognized audit record and were skipped (entries: listed " +
+            `${summary.entriesListed}, exported ${summary.entriesExported}, ` +
+            `skipped ${summary.entriesSkipped}; checkpoints: listed ` +
+            `${summary.checkpointsListed}, exported ${summary.checkpointsExported}, ` +
+            `skipped ${summary.checkpointsSkipped}). It was NOT included rather ` +
+            "than present a corrupt or incomplete chain as a complete or empty one."
+        );
+      }
       return jsonl.length > 0 ? populated(jsonl) : emptyVerified();
     } catch (e) {
-      return readFailed(`the audit-chain export could not be gathered: ${(e as Error).message}`);
+      return readFailed(
+        readFailureReason("the audit-chain export could not be gathered", e)
+      );
     }
   })();
 
-  // Public anchoring is opt-in / default-off; a not-enabled install is a
-  // verified empty, not a read failure.
-  const anchor: ReadOutcome<string> = emptyVerified();
+  // C4: read ACTUAL anchoring state rather than minting a bare verified-empty
+  // (which renders a DEFINITIVE "anchoring is not enabled" even when it is
+  // enabled with receipts). Public anchoring is opt-in / default-off. Honest
+  // mapping, each arm backed by a real read:
+  //   - config absent (MAC-authenticated) AND no receipts on disk -> verified
+  //     empty (no anchor evidence: not enabled, or enabled-and-nothing-anchored;
+  //     the §10 wording covers both);
+  //   - config present (enabled/disabled) with >=1 receipt -> the real anchors
+  //     export (historical anchors stay auditable even when currently disabled);
+  //   - config present but ZERO receipts -> verified empty (configured, nothing
+  //     anchored yet) -- NEVER populated, so §10 never says a receipt-less export
+  //     lets an auditor "confirm the checkpoints were publicly anchored";
+  //   - config absent but receipts PRESENT on disk (inconsistent), a tampered
+  //     config, or any other read error -> read_failed, never a false "not
+  //     enabled". `anchorReceiptsPresentOnDisk` fails toward "present", so an
+  //     unlistable receipt store becomes read_failed here, not a false empty.
+  const anchor: ReadOutcome<string> = await (async () => {
+    try {
+      const state = await readAnchorConfig({ storage, masterKey });
+      const receiptsPresent = await anchorReceiptsPresentOnDisk(storage);
+      if (state.status === "absent") {
+        return receiptsPresent
+          ? readFailed(
+              "the anchoring config is absent but anchor receipts are present on " +
+                "disk (an inconsistent anchoring state), so the anchor evidence " +
+                "could not be gathered and this install's anchoring status could " +
+                "not be determined."
+            )
+          : emptyVerified();
+      }
+      const anchorsDoc = await buildAnchorsExport({
+        storage,
+        masterKey,
+        fortressId,
+        now: () => new Date(generatedAt),
+      });
+      // Only a receipt with status "anchored" is public-anchor evidence. A
+      // receipt-less export -- or one carrying ONLY failed anchor attempts (a
+      // Rekor outage persists `status:"failed"` receipts) -- proves NOTHING was
+      // publicly anchored, so it must not render as a definitive "publicly
+      // anchored" claim. Verified empty instead ("enabled, nothing anchored yet").
+      const hasAnchored = anchorsDoc.receipts.some(
+        (r) => r.status === "anchored"
+      );
+      return hasAnchored
+        ? populated(JSON.stringify(anchorsDoc, null, 2))
+        : emptyVerified();
+    } catch (e) {
+      return readFailed(
+        readFailureReason("the anchor evidence could not be gathered", e)
+      );
+    }
+  })();
 
   return { transparency, audit_chain, anchor };
+}
+
+/**
+ * D5-2 (dry-bar round 5): merge two stores' `ever_pruned` facts WITHOUT
+ * laundering an UNKNOWN (`null`) into a definitive `false`. `null` means a
+ * store's `getRetentionUsage()` threw, so its pruned-status is genuinely
+ * unknown; it is ABSORBING unless the other store DEFINITELY pruned:
+ *
+ *   - `true || anything    -> true`   (some store definitely pruned)
+ *   - `null || (false|null) -> null`  (an unknown can NEVER become never-pruned)
+ *   - `false || false      -> false`  (both stores definitely never pruned)
+ *
+ * The old `Boolean(a) || Boolean(b)` collapsed `null || false` to a definitive
+ * `false`, re-enabling the flattering "the log has never pruned ... no recorded
+ * activity before X" reassurance from a census that was not fully read. Exported
+ * for direct unit coverage of the three-state truth table.
+ */
+export function mergeEverPruned(
+  a: boolean | null,
+  b: boolean | null
+): boolean | null {
+  if (a === true || b === true) return true;
+  if (a === null || b === null) return null;
+  return false;
+}
+
+/**
+ * D8-1 Leg A (Dry-8 sweep): one store's retention-usage read as the pack
+ * consumes it. `entryCount: null` is the SINGLE "usage unavailable" signal:
+ * the underlying `AuditLog.getRetentionUsage()` returns a plain `number`
+ * entryCount and can NEVER produce `null` itself, so a `null` here means the
+ * whole usage read THREW and NOTHING about the store's on-disk usage was
+ * read. `totalSizeBytes` is therefore `null` ("unread") in that state --
+ * never the old `0` placeholder, which was a FILLER masquerading as a read
+ * figure: it passed the chokepoint's finiteness checks and let the SIGNED
+ * manifest serialize a definitive `retention_at_cap: false` (plus "below
+ * both caps" prose) from a size nobody read, while the same pack's prose
+ * hedged. `everPruned` may independently be `null` (its sub-read inside a
+ * successful usage read is best-effort).
+ */
+export interface RetentionUsageRead {
+  entryCount: number | null;
+  totalSizeBytes: number | null;
+  everPruned: boolean | null;
+}
+
+/**
+ * D8-1 Leg A: the ONE catch for a failed `getRetentionUsage()` read (both the
+ * operator and daemon call sites route through it). On a throw -- e.g. a
+ * transient storage fault between `query()` succeeding and the usage
+ * `storage.list()` -- it returns the all-`null` "usage unavailable" signal,
+ * never placeholder figures. `deriveAuditReadOutcome` then records the
+ * store's size position as UNREAD (`retained_total_size_bytes: null`), which
+ * the `retentionDeterminability` chokepoint classifies NOT-DETERMINABLE: the
+ * prose hedges AND the signed manifest carries the explicit
+ * `retention_at_cap_determinable: false` marker instead of a definitive
+ * boolean -- the two surfaces converge instead of contradicting each other.
+ * Exported so tests can drive the REAL failure path with an injected throw.
+ */
+export async function readRetentionUsage(log: {
+  getRetentionUsage(): Promise<{
+    entryCount: number;
+    totalSizeBytes: number;
+    everPruned: boolean | null;
+  }>;
+}): Promise<RetentionUsageRead> {
+  try {
+    return await log.getRetentionUsage();
+  } catch {
+    return { entryCount: null, totalSizeBytes: null, everPruned: null };
+  }
 }
 
 /**
@@ -252,6 +614,23 @@ async function gatherDiscreteExports(
  *   false cause while older entries sit on disk outside the window. Neither
  *   truncation is constructible with today's defaults; the guard makes the
  *   anticipated configurations structurally safe.
+ * - D8-1 Leg A note on F3 when usage is UNAVAILABLE (`entryCount: null`): the
+ *   window-vs-census comparison has no census to compare against, so the
+ *   `windowTruncated` half of the guard is INERT in that state. That is
+ *   accepted, precisely because every claim the guard protects is disarmed
+ *   elsewhere in the same state: (a) the `queryTruncated` half still fails
+ *   closed on `query()`'s own internal truncation; (b) a RAM window smaller
+ *   than the disk cap is not constructible with today's defaults
+ *   (`maxInMemoryEntries` defaults to `maxEntries` -- the same reason F3 is
+ *   an anticipatory guard at all); and (c) with usage unavailable this
+ *   derivation records the store's size position as UNREAD (`null`), so the
+ *   `retentionDeterminability` chokepoint classifies at-cap NOT-DETERMINABLE
+ *   and the reassurance arm F3 exists to protect ("never pruned ... below
+ *   both caps ... no recorded activity before X") structurally cannot fire
+ *   (`ever_pruned` is also `null`, which `mergeEverPruned` keeps absorbing).
+ *   The residual exposure -- a future window-smaller-than-disk configuration
+ *   AND a usage fault in the same run -- yields hedged prose plus the signed
+ *   not-determinable marker, never a definitive claim.
  * - R3-3 (round-3 sweep 2026-07-14): `earliest_retained_at` is the MINIMUM
  *   entry timestamp, not the positionally-first entry. Audit entries sort by
  *   append sequence, so under backward clock skew a later-appended entry can
@@ -265,35 +644,51 @@ export function deriveAuditReadOutcome(params: {
   entries: readonly AuditEntry[];
   windowedTotal: number;
   retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
-  usage: {
-    entryCount: number | null;
-    totalSizeBytes: number;
-    everPruned: boolean | null;
-  };
+  /** See {@link RetentionUsageRead}: `entryCount: null` = usage unavailable. */
+  usage: RetentionUsageRead;
   /**
    * WATCH-1: the F2 daemon enforcement store (`_audit-daemon`) read, when the
    * operator store has been split. Omit (or `absent`) on a non-split fortress.
    * `included` merges the daemon entries + retention into the census;
    * `present_unreadable` discloses the daemon store exists but was not readable
    * at this privilege (the counts then EXCLUDE it, disclosed, never silent).
+   * `missing` (C1): audit-store split evidence is present but the daemon store
+   * is absent (deleted/renamed, or the split evidence is present-but-unverifiable
+   * -- fail-closed) (excluded + disclosed, never conflated with `absent`).
    */
   daemon?:
     | { status: "absent" }
+    | { status: "missing" }
     | { status: "present_unreadable"; unreadable_reason?: "privilege" | "io" }
     | { status: "present_tampered" }
     | {
         status: "included";
         entries: readonly AuditEntry[];
         windowedTotal: number;
-        usage: {
-          entryCount: number | null;
-          totalSizeBytes: number;
-          everPruned: boolean | null;
-        };
+        /** See {@link RetentionUsageRead}: `entryCount: null` = usage unavailable. */
+        usage: RetentionUsageRead;
+        /**
+         * D5-1: the daemon store's OWN retention caps. Its own `AuditLog`
+         * instance prunes on independent 100k-entry / 100 MB caps, so at-cap
+         * must be evaluated against THESE, not the operator caps applied to the
+         * merged two-store total.
+         */
+        retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
       };
+  /**
+   * D9C-1: the instant the audit census was taken (captured by the CLI BEFORE
+   * `auditLog.query()`), threaded onto the returned {@link AuditReadData} so the
+   * generator can bound the attested coverage window at the census cut rather
+   * than the later generation instant. Omit for callers that do not track it.
+   */
+  censusTakenAt?: string;
 }): ReadOutcome<AuditReadData> {
   const { entries, windowedTotal, retentionConfig, usage } = params;
   const daemon = params.daemon ?? { status: "absent" as const };
+  // `entryCount: null` (usage unavailable) disarms this half of the F3 guard;
+  // see the "D8-1 Leg A note on F3" in the doc comment for why that is inert
+  // (queryTruncated still guards, the window==disk-cap default, and the unread
+  // size position makes every protected claim not-determinable downstream).
   const windowTruncated =
     usage.entryCount !== null && usage.entryCount > windowedTotal;
   const queryTruncated = entries.length < windowedTotal;
@@ -307,14 +702,42 @@ export function deriveAuditReadOutcome(params: {
     );
   }
 
+  // D8-1 Leg A: a store whose usage read THREW (`entryCount: null`) had
+  // NOTHING about its on-disk usage read, so its size position is UNREAD
+  // (`null`) -- even if a stale caller still passes the old `totalSizeBytes: 0`
+  // placeholder alongside `entryCount: null`, that figure is a filler by
+  // construction, never a read, and must not reach the chokepoint as one. The
+  // `null` size makes `retentionDeterminability` classify at-cap
+  // NOT-DETERMINABLE (hedged prose + the signed manifest marker), which is the
+  // honest rendering of "the retention position was not read this run".
+  const readSize = (u: RetentionUsageRead): number | null =>
+    u.entryCount === null ? null : u.totalSizeBytes;
+  // Merged DISPLAY size: a sum over an unread contributor is itself unread.
+  const addSizes = (a: number | null, b: number | null): number | null =>
+    a === null || b === null ? null : a + b;
+
   // WATCH-1: fold the daemon store in. A truncated daemon read is the same
   // honesty failure as a truncated operator read: fail closed rather than
   // present a partial daemon census as complete.
   let mergedEntries: readonly AuditEntry[] = entries;
   let retainedTotal = usage.entryCount ?? windowedTotal;
-  let retainedSizeBytes = usage.totalSizeBytes;
+  let retainedSizeBytes = readSize(usage);
   let everPruned = usage.everPruned;
   let includedDaemonCount = 0;
+  // D5-1: the per-store retention breakdown that drives the at-cap decision.
+  // The operator store is always a contributor; the daemon store is added only
+  // when merged (`included`). `detectShortfall` ORs at-cap PER STORE against
+  // each store's OWN cap, so a healthy split fortress whose MERGED total exceeds
+  // one store's cap (while neither store is near its own) never renders "at cap".
+  const perStoreRetention: PerStoreRetention[] = [
+    {
+      store: "operator",
+      max_entries: retentionConfig.maxEntries,
+      retained_total: usage.entryCount ?? windowedTotal,
+      max_total_size_bytes: retentionConfig.maxTotalSizeBytes,
+      retained_total_size_bytes: readSize(usage),
+    },
+  ];
   if (daemon.status === "included") {
     const daemonWindowTruncated =
       daemon.usage.entryCount !== null &&
@@ -332,12 +755,22 @@ export function deriveAuditReadOutcome(params: {
     mergedEntries = [...entries, ...daemon.entries];
     includedDaemonCount = daemon.entries.length;
     retainedTotal += daemon.usage.entryCount ?? daemon.windowedTotal;
-    retainedSizeBytes += daemon.usage.totalSizeBytes;
-    // Either store having pruned means early-quarter entries may be missing.
-    everPruned =
-      usage.everPruned === null && daemon.usage.everPruned === null
-        ? null
-        : Boolean(usage.everPruned) || Boolean(daemon.usage.everPruned);
+    retainedSizeBytes = addSizes(retainedSizeBytes, readSize(daemon.usage));
+    // D5-2: merge the pruned-status WITHOUT laundering an UNKNOWN into `false`.
+    // `null` (a store whose `getRetentionUsage()` threw) is ABSORBING unless the
+    // other store definitely pruned: `true || anything -> true`,
+    // `false || null -> null`, `null || null -> null`. The old `Boolean(a)||
+    // Boolean(b)` collapsed `null || false` to a definitive `false`, re-enabling
+    // the flattering "never pruned / no activity before X" reassurance from an
+    // unreadable census. An unknown must never become a definitive never-pruned.
+    everPruned = mergeEverPruned(usage.everPruned, daemon.usage.everPruned);
+    perStoreRetention.push({
+      store: "daemon",
+      max_entries: daemon.retentionConfig.maxEntries,
+      retained_total: daemon.usage.entryCount ?? daemon.windowedTotal,
+      max_total_size_bytes: daemon.retentionConfig.maxTotalSizeBytes,
+      retained_total_size_bytes: readSize(daemon.usage),
+    });
   }
 
   // R3-3: min-scan, never positional (entries are append-ordered, and clock
@@ -371,30 +804,48 @@ export function deriveAuditReadOutcome(params: {
         ? { unreadable_reason: daemon.unreadable_reason }
         : {}),
     },
+    // D5-1: judge at-cap per store against each store's own cap (see above).
+    per_store_retention: perStoreRetention,
   };
   // G-2: hand the generator the daemon entries separately (in addition to the
   // merged census) so it can compute how many fall INSIDE the reporting quarter
   // window -- the figure the §7 "N merged into the counts above" note renders,
   // rather than the all-time total. Only present when the daemon store was
   // merged (`included`); the window itself is not known at this pre-window layer.
+  // D9C-1: carry the census cut (when the caller captured one) so the generator
+  // never signs a coverage window that post-dates the operations counted here.
+  const censusFields =
+    params.censusTakenAt !== undefined
+      ? { census_taken_at: params.censusTakenAt }
+      : {};
   return populated(
     daemon.status === "included"
-      ? { entries: mergedEntries, retention, daemon_entries: daemon.entries }
-      : { entries: mergedEntries, retention }
+      ? { entries: mergedEntries, retention, daemon_entries: daemon.entries, ...censusFields }
+      : { entries: mergedEntries, retention, ...censusFields }
   );
 }
 
 /**
  * WATCH-1: read the F2 daemon enforcement store (`_audit-daemon`) for the
- * census. Returns `absent` on a non-split fortress (nothing to add),
- * `present_unreadable` when a daemon store exists but this privilege cannot read
- * it (the pack then DISCLOSES the omission), `present_tampered` when the store
- * WAS readable but failed integrity verification (round-5 gate: tamper evidence
- * must never be mislabeled as a privilege limitation, and "re-run as root" is
- * futile advice when root already hit the integrity failure), or `included`
- * with the daemon entries + retention to merge. A non-integrity read failure
- * after the directory was listable is `present_unreadable` so a pack always
- * generates and discloses rather than crashing.
+ * census. Returns:
+ *   - `absent` on a genuinely fresh / never-armed fortress (nothing to add);
+ *   - `missing` (C1) when audit-store split evidence is present but the daemon
+ *     store is absent (deleted/renamed, or present-but-unverifiable split
+ *     evidence -- fail-closed), distinguished from `absent` via the marker-aware
+ *     {@link resolveDaemonStorePresence}, and EXCLUDED from the census with a
+ *     hedged split-evidence disclosure;
+ *   - `present_unreadable` when a daemon store exists but this privilege cannot
+ *     read it (the pack then DISCLOSES the omission), with the reason
+ *     (`privilege` vs `io`) classified from the actual filesystem errno (C3) so
+ *     the disclosure only advises "re-run as root" for a privilege limitation;
+ *   - `present_tampered` when the store WAS readable but failed integrity
+ *     verification (round-5 gate: tamper evidence must never be mislabeled as a
+ *     privilege limitation, and "re-run as root" is futile advice when root
+ *     already hit the integrity failure);
+ *   - `included` with the daemon entries + retention to merge.
+ * A non-integrity read failure after the directory was listable is
+ * `present_unreadable` so a pack always generates and discloses rather than
+ * crashing.
  *
  * Exported for the integration regression test only; the CLI is the caller.
  */
@@ -403,47 +854,50 @@ export async function readDaemonStore(
   masterKey: Uint8Array
 ): Promise<
   | { status: "absent" }
+  | { status: "missing" }
   | { status: "present_unreadable"; unreadable_reason: "privilege" | "io" }
   | { status: "present_tampered" }
   | {
       status: "included";
       entries: readonly AuditEntry[];
       windowedTotal: number;
-      usage: {
-        entryCount: number | null;
-        totalSizeBytes: number;
-        everPruned: boolean | null;
-      };
+      /** See {@link RetentionUsageRead}: `entryCount: null` = usage unavailable. */
+      usage: RetentionUsageRead;
+      // D5-1: the daemon store's OWN retention caps, so at-cap is judged against
+      // this store's independent limits, never the merged total vs a single cap.
+      retentionConfig: { maxEntries: number; maxTotalSizeBytes: number };
     }
 > {
-  const access = await probeDaemonChainAccess(storage);
-  if (access === "absent") return { status: "absent" };
-  // A directory that exists but is not listable at this uid is a PRIVILEGE
-  // limitation (the expected operator-uid case on an armed box, where re-running
-  // as root reads it), never an I/O error.
-  if (access === "present_unreadable") {
-    return { status: "present_unreadable", unreadable_reason: "privilege" };
+  // C1 + C3: the marker-aware presence chokepoint distinguishes a fresh
+  // fortress (`absent`) from a deleted daemon store on a migrated one
+  // (`missing`), and classifies an unreadable store's reason from the actual
+  // stat/readdir errno instead of assuming `privilege`.
+  const presence = await resolveDaemonStorePresence(storage, masterKey);
+  if (presence.kind === "absent") return { status: "absent" };
+  if (presence.kind === "missing") return { status: "missing" };
+  if (presence.kind === "present_unreadable") {
+    return {
+      status: "present_unreadable",
+      unreadable_reason: presence.reason,
+    };
   }
   try {
     const daemonLog = createDaemonAuditLog(storage, masterKey);
     // Default strict integrity mode: a daemon-store tamper makes query() throw
     // AuditIntegrityError, distinguished below from an access failure.
     const { entries, total } = await daemonLog.query({ limit: 1_000_000 });
-    let usage: {
-      entryCount: number | null;
-      totalSizeBytes: number;
-      everPruned: boolean | null;
-    };
-    try {
-      usage = await daemonLog.getRetentionUsage();
-    } catch {
-      usage = { entryCount: null, totalSizeBytes: 0, everPruned: null };
-    }
+    // D8-1 Leg A: a usage-read throw yields the all-null "usage unavailable"
+    // signal (never placeholder figures), so the daemon store's retention
+    // position renders not-determinable instead of a signed below-cap claim.
+    const usage = await readRetentionUsage(daemonLog);
     return {
       status: "included",
       entries: entries as readonly AuditEntry[],
       windowedTotal: total,
       usage,
+      // D5-1: capture the daemon store's OWN retention caps for the per-store
+      // at-cap comparison (a distinct AuditLog instance with independent caps).
+      retentionConfig: daemonLog.getRetentionConfig(),
     };
   } catch (e) {
     // A strict-mode integrity failure over a READABLE store is tamper evidence,
@@ -478,14 +932,10 @@ export async function readDaemonStore(
  * on disk).
  */
 export function daemonUnreadableReason(e: unknown): "privilege" | "io" {
-  for (let cur: unknown = e, depth = 0; cur != null && depth < 8; depth++) {
-    const code = (cur as NodeJS.ErrnoException).code;
-    if (code === "EACCES" || code === "EPERM") return "privilege";
-    const next = (cur as { cause?: unknown }).cause;
-    if (next === cur) break;
-    cur = next;
-  }
-  return "io";
+  // Delegates to the single canonical classifier in `operational` (the lowest
+  // layer that owns the daemon store) so the privilege-vs-io walk can never
+  // drift between the presence resolver and this post-read path.
+  return errnoAccessReason(e);
 }
 
 /**
@@ -495,10 +945,22 @@ export function daemonUnreadableReason(e: unknown): "privilege" | "io" {
  * (`entry_unreadable` / `storage_unavailable` -- a file the directory listed but
  * this uid could not read, e.g. a per-file EACCES under a root-owned store).
  * Only the former is tamper evidence. Classify a purely-access-failure error as
- * a PRIVILEGE limitation (`present_unreadable`; re-run as root reads it), never
- * `present_tampered` -- crying "tamper" for a permission problem is the round-5
- * mislabel in the other direction. Any genuine tamper finding (even mixed with
- * access findings) is `present_tampered`. Exported for direct unit coverage.
+ * `present_unreadable` (re-run as root may read it), never `present_tampered` --
+ * crying "tamper" for a permission problem is the round-5 mislabel in the other
+ * direction. Any genuine tamper finding (even mixed with access findings) is
+ * `present_tampered`. Exported for direct unit coverage.
+ *
+ * C3 (dry-bar): within the access-only case, distinguish the reason from the
+ * REAL errno rather than the finding KIND. Both `entry_unreadable` (a per-file
+ * read failure) and `storage_unavailable` (a namespace listing / anchor read
+ * failure) can be EITHER a permission limit (a root-owned file the operator uid
+ * cannot read -- root clears it, "re-run as root" is correct) OR a genuine I/O /
+ * corruption / disappearance error (root will NOT clear it). audit-log.ts stamps
+ * the underlying error's message onto the finding, so classify `privilege` iff
+ * any access-only finding's message reveals a permission errno (`EACCES`/
+ * `EPERM`), else the claim-less `io` (honest "investigate", no futile root
+ * advice). This closes the mislabel in BOTH directions and for BOTH access
+ * kinds (a pure `entry_unreadable`/EIO no longer advises a futile root re-run).
  */
 export function classifyDaemonIntegrityError(
   e: AuditIntegrityError
@@ -512,10 +974,20 @@ export function classifyDaemonIntegrityError(
   const allAccessFailures =
     e.findings.length > 0 &&
     e.findings.every((f) => ACCESS_ONLY_KINDS.has(f.kind));
-  if (allAccessFailures) {
-    return { status: "present_unreadable", unreadable_reason: "privilege" };
+  if (!allAccessFailures) {
+    return { status: "present_tampered" };
   }
-  return { status: "present_tampered" };
+  // Privilege ONLY when a permission errno is actually present in a finding
+  // message; otherwise the claim-less `io` (covers EIO, a null/disappeared
+  // read, and any non-permission storage failure), so no access kind ever
+  // advises a futile "re-run as root" for a non-permission error.
+  const anyPermissionErrno = e.findings.some((f) =>
+    /\bE(ACCES|PERM)\b/.test(f.message)
+  );
+  return {
+    status: "present_unreadable",
+    unreadable_reason: anyPermissionErrno ? "privilege" : "io",
+  };
 }
 
 /**
@@ -533,24 +1005,62 @@ export function daemonStoreCliWarning(
   if (!daemon) return [];
   if (daemon.status === "present_unreadable") {
     return [
-      "  NOTE: the recorded-operation count above is from the OPERATOR audit",
-      "  store only. A root-owned daemon enforcement store (_audit-daemon) is",
-      "  present but was not readable here, so daemon-recorded enforcement is NOT",
-      "  in that count (not a complete enforcement census). See the report's",
-      "  access-log and enforcement summary section.",
+      "  NOTE: the recorded-operation count AND the covered-window / shortfall",
+      "  assessment above are from the OPERATOR audit store only. A root-owned",
+      "  daemon enforcement store (_audit-daemon) is present but was not readable",
+      "  here, so daemon-recorded enforcement is NOT reflected in them; treat these",
+      "  as an operator-store view, not a complete enforcement census. See the",
+      "  report's access-log and enforcement summary section.",
       "",
     ];
   }
   if (daemon.status === "present_tampered") {
     return [
       "  WARNING: a root-owned daemon enforcement store (_audit-daemon) is present",
-      "  but FAILED integrity verification, so the recorded-operation count above",
-      "  is the OPERATOR store only and the daemon store shows tamper evidence;",
-      "  investigate. See the report's access-log and enforcement summary section.",
+      "  but FAILED integrity verification, so the recorded-operation count AND the",
+      "  covered-window / shortfall assessment above are the OPERATOR store only and",
+      "  the daemon store shows tamper evidence; investigate. See the report's",
+      "  access-log and enforcement summary section.",
+      "",
+    ];
+  }
+  if (daemon.status === "missing") {
+    return [
+      "  WARNING: audit-store writer-split evidence is present but the root-owned",
+      "  daemon enforcement store (_audit-daemon) is ABSENT (deleted or renamed, or",
+      "  the split evidence is present but unverifiable), so the recorded-operation",
+      "  count AND the covered-window / shortfall assessment above are the OPERATOR",
+      "  store only. This is NOT a clean fresh fortress; investigate. See the",
+      "  report's access-log and enforcement summary section.",
       "",
     ];
   }
   return [];
+}
+
+/**
+ * Dry-9 fix-round-3 (P5): the operator-console "Covered window" line, derived
+ * from the SAME honesty-guarded {@link ShortfallReport} the signed manifest,
+ * cover span, and PDF read. It must NOT diverge from them. For a present-but-
+ * unparseable audit-census cut the shortfall is populated but
+ * `coverage_determinable === false` and the span collapses to a zero-width point
+ * (`covered_from === covered_to_exclusive === window.start`); branching on
+ * `sf.status === "populated"` ALONE printed that zero-width span as a
+ * definitive-looking window, conflating "window not determinable" with
+ * "determined zero-width span". Mirroring `sections.ts`, the not-determinable
+ * case renders "could not be determined ...", never a span -- so every surface
+ * agrees.
+ */
+export function coverageSummaryLine(sf: ReadOutcome<ShortfallReport>): string {
+  if (sf.status !== "populated") {
+    return "could not be determined (audit log unreadable)";
+  }
+  if (!sf.value.coverage_determinable) {
+    // The manifest serializes determinable:false and the cover reads "could not
+    // be determined" here; the console must match, never a zero-width span.
+    return "could not be determined (audit-census cut unparseable)";
+  }
+  return `${sf.value.covered_from} to ${sf.value.covered_to_exclusive} (exclusive)`;
 }
 
 interface EvidencePackCliOptions {
@@ -699,20 +1209,24 @@ export async function runEvidencePack(args: string[]): Promise<void> {
   // denials" / "full quarter covered".
   const audit: ReadOutcome<AuditReadData> = await (async () => {
     try {
+      // D9C-1: stamp the census cut BEFORE the query. Every entry the census
+      // counts has a timestamp at or before the query's storage snapshot, which
+      // is at or after this instant; bounding the attested coverage window at
+      // `censusTakenAt` therefore guarantees the signed span never claims
+      // coverage of an operation appended after the census (and never counted).
+      // The generation time is stamped LATER (after inventory + discrete-export
+      // gathering), so attesting through it would over-claim the intervening gap.
+      const censusTakenAt = new Date().toISOString();
       const { entries, total } = await auditLog.query({ limit: 1_000_000 });
       const retentionConfig = auditLog.getRetentionConfig();
       // Read the on-disk usage + ever-pruned so the shortfall detector can tell
-      // size-cap pruning from genuine inactivity (sweep HIGH-5). Best-effort.
-      let usage: {
-        entryCount: number | null;
-        totalSizeBytes: number;
-        everPruned: boolean | null;
-      };
-      try {
-        usage = await auditLog.getRetentionUsage();
-      } catch {
-        usage = { entryCount: null, totalSizeBytes: 0, everPruned: null };
-      }
+      // size-cap pruning from genuine inactivity (sweep HIGH-5). Best-effort:
+      // D8-1 Leg A -- a throw here (a transient fault between query()'s
+      // storage.list() and this one) yields the all-null "usage unavailable"
+      // signal, never placeholder figures, so the pack's retention position
+      // renders not-determinable (hedged prose + signed manifest marker)
+      // instead of a definitive below-cap claim built on a filler size of 0.
+      const usage = await readRetentionUsage(auditLog);
       // WATCH-1: after the F2 audit-store split, daemon-produced enforcement
       // records live in the separate root-owned `_audit-daemon` store, which the
       // operator `auditLog.query()` above does NOT see. Probe it and, when
@@ -725,9 +1239,12 @@ export async function runEvidencePack(args: string[]): Promise<void> {
         retentionConfig,
         usage,
         daemon,
+        censusTakenAt,
       });
     } catch (e) {
-      return readFailed(`the audit log could not be read: ${(e as Error).message}`);
+      return readFailed(
+        readFailureReason("the audit log could not be read", e)
+      );
     }
   })();
 
@@ -749,7 +1266,17 @@ export async function runEvidencePack(args: string[]): Promise<void> {
   // third-party verification exports, both READ-ONLY from persisted state.
   const generatedAt = new Date().toISOString();
   const inventory = await gatherInventory(config, storage, masterKey, signer);
-  const discreteExports = await gatherDiscreteExports(storage, generatedAt);
+  const discreteExports = await gatherDiscreteExports(
+    storage,
+    masterKey,
+    // Stamp the anchor export with the SAME fortress id the transparency
+    // checkpoints carry (derived from the storage path), NOT the signer identity
+    // id: the auditor's `verify-transparency --check-anchors` cross-checks the
+    // anchors export's `fortress_id` against the checkpoints, and a mismatch
+    // makes it emit "not evidence about this bundle" (Codex/Family-B MED).
+    fortressIdFromStoragePath(config.storage_path),
+    generatedAt
+  );
 
   const input: EvidencePackInput = {
     firm_name: opts.firmName,
@@ -762,16 +1289,7 @@ export async function runEvidencePack(args: string[]): Promise<void> {
 
   const pack = buildEvidencePack(input, { audit, signer, masterKey });
 
-  await mkdir(outputDir, { recursive: true });
-  await writeFile(
-    join(outputDir, MANIFEST_FILENAME),
-    JSON.stringify(pack.manifest, null, 2),
-    "utf-8"
-  );
-  for (const file of pack.files) {
-    await writeFile(join(outputDir, file.filename), file.content, "utf-8");
-  }
-  await writeFile(join(outputDir, PDF_FILENAME), pack.pdf);
+  await writePackDirectory(outputDir, pack);
 
   const summaryLines = [
     "",
@@ -787,18 +1305,24 @@ export async function runEvidencePack(args: string[]): Promise<void> {
       ""
     );
   } else if (sf.status === "populated" && sf.value.in_progress_quarter) {
+    // P3 (Dry-9): name the actual attestable-end bound. When D9C-1 clamps the
+    // window to the audit-census cut, say so -- never the stale "the generation
+    // time" (the census was read BEFORE the generation instant).
+    const boundLabel = sf.value.covered_to_is_census_cut
+      ? "the audit-census cut point"
+      : "the generation time";
     summaryLines.push(
       `  WARNING: ${label} is still IN PROGRESS. This pack covers only through`,
-      `  ${sf.value.covered_to_exclusive} (the generation time), NOT the full`,
+      `  ${sf.value.covered_to_exclusive} (${boundLabel}), NOT the full`,
       "  quarter. Do not present it to an insurer or client as a complete-quarter",
       "  report; regenerate after the quarter closes. The report is stamped PARTIAL.",
       ""
     );
   }
-  const coverageLine =
-    sf.status === "populated"
-      ? `${sf.value.covered_from} to ${sf.value.covered_to_exclusive} (exclusive)`
-      : "could not be determined (audit log unreadable)";
+  // P5: the console line is derived from the SAME honest verdict as the manifest
+  // + PDF, so a non-determinable window never prints as a definitive zero-width
+  // span. See coverageSummaryLine.
+  const coverageLine = coverageSummaryLine(sf);
   const shortfallLine =
     sf.status === "populated"
       ? sf.value.shortfall

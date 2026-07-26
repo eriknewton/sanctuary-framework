@@ -25,6 +25,7 @@
  * is unit-testable hermetically -- no real `~/.sanctuary`, no real network.
  */
 
+import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { Writable } from "node:stream";
@@ -46,6 +47,7 @@ import {
   FileExportCursorStore,
   readExportConfig,
   stdoutLineWriter,
+  type EnforcementEventMapOptions,
   type EnforcementExportConfig,
   type ExportApprover,
   type ExportAudit,
@@ -54,6 +56,7 @@ import {
   type StreamRunOutcome,
   type VerifiedChainSource,
 } from "../castle-wall/export/index.js";
+import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
 
 export interface CortexExportCommandArgs {
   argv: string[];
@@ -160,6 +163,8 @@ export interface ExportPipelineDeps {
   fileWriter?: LineWriter;
   /** Injected fetch for the http sink (real `fetch` in production; mocked in tests). */
   fetchImpl?: typeof fetch;
+  /** Read-side attribution verification context for mapped Castle Wall rows. */
+  mapOptions?: EnforcementEventMapOptions;
   /** Batch size / retry budget forwarded to the streamer. */
   batchSize?: number;
   maxRetries?: number;
@@ -178,6 +183,7 @@ export async function runExportPipeline(deps: ExportPipelineDeps): Promise<Expor
     audit: deps.audit,
     ...(deps.fileWriter ? { fileWriter: deps.fileWriter } : {}),
     ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    ...(deps.mapOptions ? { mapOptions: deps.mapOptions } : {}),
   });
 
   const enable = await exporter.enable();
@@ -189,6 +195,7 @@ export async function runExportPipeline(deps: ExportPipelineDeps): Promise<Expor
     exporter,
     cursor: deps.cursor,
     audit: deps.audit,
+    ...(deps.mapOptions ? { mapOptions: deps.mapOptions } : {}),
     ...(deps.batchSize !== undefined ? { batchSize: deps.batchSize } : {}),
     ...(deps.maxRetries !== undefined ? { maxRetries: deps.maxRetries } : {}),
     ...(deps.retryBackoffMs !== undefined ? { retryBackoffMs: deps.retryBackoffMs } : {}),
@@ -241,6 +248,42 @@ function formatApprovalPrompt(request: ApprovalRequest): string {
   );
 }
 
+/** Minimal audit surface `buildExportAudit` needs (an `AuditLog` in production). */
+type ExportAuditSink = Pick<AuditLog, "appendCritical">;
+
+/**
+ * Build the export-lifecycle audit sink. Appends are best-effort by design -- a
+ * failed audit NEVER blocks the operator verb (the export op still runs). But a
+ * DROPPED append is made LOUD on `err` instead of silently swallowed: that
+ * silence is the exact per-flow silent-audit-emission class #946 made loud on
+ * the Swift side, and it must not re-open here. The operator sees that a
+ * lifecycle event went unrecorded, so the audit trail's completeness stays
+ * honest (a missing record is visible, not invisible).
+ *
+ * Exported so the loud-drop path is unit-testable with a throwing audit stub
+ * (the production wiring constructs the real `AuditLog` internally).
+ */
+export function buildExportAudit(auditLog: ExportAuditSink, err: Writable): ExportAudit {
+  return async (operation, details, result) => {
+    try {
+      await auditLog.appendCritical({
+        layer: "l1",
+        operation,
+        identity_id: "operator",
+        result,
+        details,
+      });
+    } catch (error) {
+      write(
+        err,
+        `Warning: cortex-export audit append for "${operation}" was dropped ` +
+          `(${error instanceof Error ? error.message : String(error)}); the export ` +
+          `proceeded but this lifecycle event has no audit record.\n`,
+      );
+    }
+  };
+}
+
 /**
  * A file-sink line writer that APPENDS one NDJSON line to `filePath`. Never a
  * network sink. Used when the operator config sets `file_path`.
@@ -255,6 +298,11 @@ function appendFileLineWriter(filePath: string): LineWriter {
 function resolveFortressArg(fortress: string | undefined, env: NodeJS.ProcessEnv): string {
   if (!fortress) return resolveStoragePath(env);
   return isAbsolute(fortress) ? fortress : resolve(process.cwd(), fortress);
+}
+
+function fortressIdForAttribution(storagePath: string): string {
+  const digest = createHash("sha256").update(storagePath).digest("hex");
+  return `fortress-${digest.slice(0, 16)}`;
 }
 
 export async function runCortexExportCommand(args: CortexExportCommandArgs): Promise<number> {
@@ -324,23 +372,25 @@ async function cmdRun(
     // Present-but-invalid cortex-export.json throws here (fail closed). A missing
     // file means the safe default: local file sink, no network, no approval.
     const exportConfig = await readExportConfig(config.storage_path);
+    const producerKeyLoad = await loadFortressProducerKey(config.storage_path);
+    if (producerKeyLoad.status === "unreadable") {
+      write(
+        err,
+        `Error: Castle Wall audit producer key is unavailable (${producerKeyLoad.reason}); refusing to export unverifiable agent attribution.\n`,
+      );
+      return 1;
+    }
+    const mapOptions: EnforcementEventMapOptions = {
+      pinnedProducerKeyB64url:
+        producerKeyLoad.status === "present" ? producerKeyLoad.keyB64url : null,
+      subjectFortressId: fortressIdForAttribution(config.storage_path),
+    };
 
     // A best-effort local audit append (a failed audit never blocks the operator
     // verb; the export lifecycle is recorded on a best-effort basis, same posture
-    // as the observe CLI).
-    const audit: ExportAudit = async (operation, details, result) => {
-      try {
-        await auditLog.appendCritical({
-          layer: "l1",
-          operation,
-          identity_id: "operator",
-          result,
-          details,
-        });
-      } catch {
-        // Best-effort only.
-      }
-    };
+    // as the observe CLI). A DROPPED append is made LOUD on stderr (never
+    // silently swallowed): see `buildExportAudit` (silent-audit-drop class #946).
+    const audit = buildExportAudit(auditLog, err);
 
     // Tier-1 approval gate, built ONLY when the outbound http lane is configured.
     // For the file sink `approve` is never invoked (enable() short-circuits), so
@@ -363,7 +413,10 @@ async function cmdRun(
         ? appendFileLineWriter(exportConfig.file_path)
         : stdoutLineWriter();
 
-    const cursor = new FileExportCursorStore(fortressPath);
+    // The durable cursor is master-key-AUTHENTICATED (MAC'd + chain-identity
+    // bound): a hand-written / tampered / stale cursor is discarded loudly and the
+    // run re-scans from the start rather than silently going blind. See cursor.ts.
+    const cursor = new FileExportCursorStore(fortressPath, masterKey);
 
     const result = await runExportPipeline({
       config: exportConfig,
@@ -372,6 +425,7 @@ async function cmdRun(
       source: auditLog,
       cursor,
       fileWriter,
+      mapOptions,
       // Real fetch for the http sink; the sink is only ever armed behind the gate.
       fetchImpl: fetch,
     });

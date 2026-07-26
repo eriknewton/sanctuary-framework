@@ -130,16 +130,29 @@ export class PiiConfigStore {
   }
 
   /**
-   * Read the persisted config. Returns the canonical default when
-   * the fortress has never set one. Returns null only on decode
-   * failure (corrupt payload, wrong fortress, version mismatch).
+   * Read the persisted config. Returns the canonical default when the
+   * fortress has GENUINELY never set one (the storage read succeeds
+   * and returns no record). Returns null only on decode failure
+   * (corrupt payload, wrong fortress, version mismatch).
+   *
+   * Throws `PiiConfigReadFailed` when the storage-layer read itself
+   * THROWS (I/O error, lock contention, permissions). This is
+   * deliberately NOT folded into the default: on a failed read the
+   * operator's persisted posture is unknown, and treating unknown as
+   * default-off would let an enabled+consented fortress silently send
+   * un-rewritten text (hard-constraint 5). Live call sites fail the
+   * query on this error; the consent-gated redactor catches it and
+   * reports the truthful filter_tier:1 passthrough.
    */
   async get(): Promise<PiiRewriteConfig | null> {
     let raw: Uint8Array | null;
     try {
       raw = await this.storage.read(TIER_B_NAMESPACE, TIER_B_CONFIG_KEY);
-    } catch {
-      return defaultPiiRewriteConfig(this.now);
+    } catch (err) {
+      throw new PiiConfigReadFailed(
+        "Tier B config storage read failed; operator posture unknown",
+        err,
+      );
     }
     if (!raw) return defaultPiiRewriteConfig(this.now);
     if (raw.length > MAX_PAYLOAD_BYTES) return null;
@@ -236,6 +249,32 @@ export class PiiConfigStore {
   }
 
   /**
+   * One-read gate evaluation for the live query path (Rho-2.5 wiring).
+   * Returns every signal a rewrite call site needs from a single store
+   * read: the basic Tier B gate, the smart-mode gate, and the consent
+   * snapshot the `query_anonymity_pii_rewritten` audit event records.
+   *
+   * Returns `null` on config decode failure (corrupt payload, wrong
+   * fortress, version mismatch) and propagates `PiiConfigReadFailed`
+   * when the storage read throws, both matching `get()`. Live call
+   * sites must fail the query on either state rather than treating it
+   * as default-off (hard-constraint 5): the operator's posture is
+   * unknown, and only a genuinely-absent record means default-off.
+   *
+   * `shouldRewrite` / `shouldRewriteSmartMode` delegate here so the
+   * gate logic lives in exactly one place.
+   */
+  async evaluateForQuery(): Promise<PiiQueryGates | null> {
+    const config = await this.get();
+    if (!config) return null;
+    return {
+      rewrite: config.enabled || config.smart_mode_enabled,
+      smart: config.smart_mode_enabled,
+      consented: config.consented_to_trade_off,
+    };
+  }
+
+  /**
    * Whether Tier B should fire for THIS call. Combines the
    * per-fortress flag with an optional per-query override.
    *
@@ -247,17 +286,17 @@ export class PiiConfigStore {
    */
   async shouldRewrite(perQueryOverride?: boolean): Promise<boolean> {
     if (perQueryOverride === false) return false;
-    const config = await this.get();
-    if (!config) return false;
+    const gates = await this.evaluateForQuery();
+    if (!gates) return false;
     if (perQueryOverride === true) {
-      if (!config.consented_to_trade_off) {
+      if (!gates.consented) {
         throw new PiiConsentRequired(
           "per-query opt-in requires recorded consent",
         );
       }
       return true;
     }
-    return config.enabled || config.smart_mode_enabled;
+    return gates.rewrite;
   }
 
   /**
@@ -267,18 +306,31 @@ export class PiiConfigStore {
    */
   async shouldRewriteSmartMode(perQueryOverride?: boolean): Promise<boolean> {
     if (perQueryOverride === false) return false;
-    const config = await this.get();
-    if (!config) return false;
+    const gates = await this.evaluateForQuery();
+    if (!gates) return false;
     if (perQueryOverride === true) {
-      if (!config.consented_to_trade_off) {
+      if (!gates.consented) {
         throw new PiiConsentRequired(
           "per-query smart-mode opt-in requires recorded consent",
         );
       }
       return true;
     }
-    return config.smart_mode_enabled;
+    return gates.smart;
   }
+}
+
+/**
+ * Result of `PiiConfigStore.evaluateForQuery()`: the per-call gate
+ * signals for the live Tier B rewrite path.
+ */
+export interface PiiQueryGates {
+  /** Basic Tier B gate: `enabled || smart_mode_enabled`. */
+  rewrite: boolean;
+  /** Rho-3 smart-mode gate: `smart_mode_enabled`. */
+  smart: boolean;
+  /** Consent snapshot for audit emission and defense-in-depth gating. */
+  consented: boolean;
 }
 
 /** Raised when consent has not been recorded but enable is requested. */
@@ -287,5 +339,19 @@ export class PiiConsentRequired extends Error {
   constructor(message: string) {
     super(message);
     this.name = "PiiConsentRequired";
+  }
+}
+
+/**
+ * Raised when the storage-layer read of the Tier B config THROWS
+ * (I/O error, lock contention, permissions), leaving the operator's
+ * persisted posture unknown. Distinct from a genuinely-absent record
+ * (default-off) and from a decode failure (`get()` returns null).
+ */
+export class PiiConfigReadFailed extends Error {
+  readonly code = "config_read_failed" as const;
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "PiiConfigReadFailed";
   }
 }

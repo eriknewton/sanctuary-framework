@@ -4,7 +4,9 @@
 [![npm version](https://img.shields.io/npm/v/@sanctuary-framework/mcp-server.svg)](https://www.npmjs.com/package/@sanctuary-framework/mcp-server)
 [![License](https://img.shields.io/npm/l/@sanctuary-framework/mcp-server.svg)](LICENSE)
 
-**The firewall and control panel for your AI agents.**
+**Your agent will know you better than you know yourself. Make sure that stays between you.**
+
+Sanctuary is the open source standard for secure, private AI: a wall the operating system enforces in both directions, and your data under your own keys, portable anywhere. Any agent, local or cloud, solo or fleet. One command to get started. One dashboard to secure them all.
 
 Sanctuary wraps any AI agent, on your machine or in your cloud, so every action it takes is blocked at the network layer if you did not allow it, signed with keys only you hold, and logged to an audit trail you can actually read. One dashboard manages the security and privacy of every agent you run, whether that is one agent on your laptop or a whole fleet across your machines. Your data, and the reputation your agents build, stay on hardware you control, and you can pick them up and leave whenever you want. No lock-in.
 
@@ -20,7 +22,7 @@ That one command puts the wall, the keys, the audit trail, and the dashboard aro
 
 **The claim underneath everything: custody.** Plenty of tools can sandbox an agent when the agent, or its harness, chooses to run inside one. Sanctuary is built for the harder promise: the wall is imposed by the operator and does not depend on the agent's cooperation, the keys never leave hardware you control, and no vendor, including us, sits in the path or can decrypt your state. Every public capability claim traces to a proven row in the [Assurance Matrix](ASSURANCE_MATRIX.md), with its limits stated on the row.
 
-Why this exists: [What Sovereign Actually Means](https://sanctuaryprotocol.ai/2026/03/30/what-sovereign-actually-means.html).
+Why this exists: [The Base Layer](https://sanctuaryprotocol.ai/2026/07/23/the-base-layer.html).
 
 ---
 
@@ -40,7 +42,7 @@ What happens when you run protect:
 2. Your existing harness config is backed up to `~/.sanctuary/backup/`.
 3. The config is rewritten so every tool call routes through Sanctuary.
 4. The Sovereignty Dashboard starts on `http://localhost:3501` (or the next free port up to 3510) and opens in your browser with a one-click auth token.
-5. Every call is logged and policy-gated. Sensitive-content redaction and query-layer anonymity (Tiers 1 and 2) layer on top per the Assurance Matrix. Dangerous operations require your approval.
+5. Every call is logged and policy-gated. Sensitive-content redaction and query-layer anonymity layer on top per the Assurance Matrix: fingerprintable-header stripping is on by default, and an opt-in, consent-gated PII rewrite scrubs query content before it leaves the machine, with the rewrite's internal classifier pinned to local processing so a privacy feature can never become an egress channel. Dangerous operations require your approval.
 
 Useful flags: `--dry-run` previews changes without touching anything. `--no-open` runs headless for CI. `--unwrap` restores the original harness config.
 
@@ -68,7 +70,7 @@ Current capability summary:
 |---|---|
 | Local `sanctuary protect` (alias `wrap`), dashboard, policy gates, encrypted state, audit trail, signed exit bundle | Shipped (v1.0 through v1.3) |
 | Cooperative MCP gates: three-tier approval, four canonical policy slots, channel templates | Shipped |
-| Context gating, sensitive-field redaction, query-layer anonymity (Tier 1 + Tier 2) | Shipped |
+| Context gating, sensitive-field redaction, query-layer anonymity (header strip default-on; opt-in PII rewrite live, classifier surface pinned local-only) | Shipped |
 | Portable identity, state export/import, recovery flows, reputation bundles | Shipped |
 | Local multi-agent coordination, fortress-local hub APIs, signed audit chain | Shipped |
 | Federation Protocol v0.1 foundation | Shipped; cross-operator federation hardening underway per Wave 1 design (2026-05-26) |
@@ -295,9 +297,9 @@ The operator remains the custody root in every mode. Commodity operator-cloud mo
 
 ## The Castle Architecture
 
-Sanctuary installs the protections your body used to provide by default: a perimeter, custody, memory, and a record of what happened. Architecturally it ships as five named mechanisms.
+Sanctuary installs the protections your body used to provide by default: a perimeter, custody, memory, and a record of what happened. Everything it protects for you together is **your Sanctuary**: each machine is a rampart the Castle Wall holds, each fortress is a keep inside those walls, and each agent is a resident of exactly one keep. The unit never blurs: one agent, one account, one fortress, one master key. Architecturally it ships as five named mechanisms.
 
-**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped (Phase 1, 2026-05-06). macOS backend (signed system extension + content-filter provider) has a proven per-uid allow/deny egress-enforcement demonstration captured on a real host (drill 2026-06-11): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected. That is a demonstration on one host and one OS version, not reboot-survival and not an audited per-rule-per-flow trail. Windows on the roadmap.
+**Castle Wall: the perimeter.** What the world cannot cross without your consent. OS-level egress enforcement at the operator-external boundary. The kernel itself blocks unauthorized cross-boundary calls. Even prompt-injected agents cannot bypass. Linux backend shipped (Phase 1, 2026-05-06). macOS backend (signed system extension + content-filter provider) enforces a signed operator policy with a proven per-uid allow/deny demonstration that survives reboot, captured on a real host (drills 2026-06-11 through 2026-06-22, boot survival 5 of 5 on a Dev-ID-signed and notarized binary): agent egress to a non-allowlisted address blocked, allowlisted egress allowed, operator egress unaffected, and enforcement live again after every reboot. That is a demonstration on one host and one OS version, not an audited per-rule-per-flow trail. Windows on the roadmap.
 
 **Sentinels: the nerves.** What surfaces what's happening to your awareness. Internal observation via process introspection and behavioral baselining. Anomalies surface through the menubar or notifications. Observation, not enforcement.
 

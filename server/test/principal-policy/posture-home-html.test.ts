@@ -5,6 +5,12 @@ import {
   queryPrivacyPill,
   renderPostureHomeHTML,
 } from "../../src/principal-policy/posture-home-html.js";
+// S3: the page's renderers now call the shared freshness formatter for their
+// "checked Ns ago" stamps. These harnesses eval SLICES of the page script, so
+// each slice must be given the same page-level helper the real page has in
+// scope. Supplying the real shared source (not a stub) keeps the harness
+// honest: the tests exercise the exact formatter the browser runs.
+import { REL_TIME_FN_SOURCE } from "../../src/principal-policy/posture-html-shared.js";
 import type { FeatureHealthStatus } from "../../src/principal-policy/feature-health.js";
 import type { CustodyState } from "../../src/principal-policy/posture.js";
 import type { FleetRoster } from "../../src/principal-policy/fleet-roster.js";
@@ -96,6 +102,8 @@ function storyHarness(initialStore: Record<string, string> = {}): StoryHarness {
   };
   const source =
     html.slice(escStart, escEnd) +
+    "\n" +
+    REL_TIME_FN_SOURCE +
     "\n" +
     html.slice(storyStart, storyEnd) +
     "\nreturn { renderStory: renderStory, wireStoryToggle: wireStoryToggle };";
@@ -202,6 +210,8 @@ function fleetHarness(): FleetHarness {
   const source =
     html.slice(escStart, escEnd) +
     "\n" +
+    REL_TIME_FN_SOURCE +
+    "\n" +
     html.slice(fleetStart, fleetEnd) +
     "\nreturn { renderFleet: renderFleet };";
   const helpers = new Function("document", source)(document) as Pick<
@@ -239,6 +249,8 @@ function bannerHarness(): BannerHarness {
     html.slice(escStart, escEnd) +
     "\n" +
     html.slice(wallStart, wallEnd) +
+    "\n" +
+    REL_TIME_FN_SOURCE +
     "\n" +
     html.slice(bannerStart, bannerEnd) +
     "\nreturn { renderBanner: renderBanner };";
@@ -312,6 +324,27 @@ describe("posture home — feature-health panel honesty", () => {
     expect(fnSource).not.toMatch(/unknown[^\n]*pill green/);
     expect(fnSource).toContain('unconfirmed") return \'<span class="pill amber">');
   });
+
+  it("explains subject-binding non-green bases with distinct non-daemon copy", () => {
+    const html = renderPostureHomeHTML();
+
+    expect(html).toContain('case "subject_unbound_evidence":');
+    expect(html).toContain(
+      "Castle Wall has recent enforcement evidence, but it is not attributed to this confined agent.",
+    );
+    expect(html).toContain('case "legacy_macos_audit_token":');
+    expect(html).toContain(
+      "Evidence predates the subject-binding format; re-arm Castle Wall to produce subject-bound evidence.",
+    );
+    expect(html).toContain('case "pre_canonical_linux_agent_name":');
+    expect(html).toContain(
+      "Linux evidence predates canonical subject binding; upgrade the daemon path before claiming this agent is protected.",
+    );
+    expect(html).toContain('case "subject_unresolvable":');
+    expect(html).toContain(
+      "This agent's confinement identity could not be read, so no enforcement evidence can be bound to it.",
+    );
+  });
 });
 
 describe("posture home - Today's story plain summary toggle", () => {
@@ -334,8 +367,15 @@ describe("posture home - Today's story plain summary toggle", () => {
     expect(h.storyEl.innerHTML).toContain(
       '<div class="story-line"><strong>212</strong> operations in the last 24h.</div>',
     );
+    // S3 (2026-07-18): the story counts gained DENOMINATORS. "4 blocked" is
+    // ambiguous on its own; "4 of 212 observed" is the auditable claim. The
+    // baseline moved deliberately, and the totals are computed from digest
+    // fields already on the payload (blocks + allows, denied + granted).
     expect(h.storyEl.innerHTML).toContain(
-      "<strong>4</strong> outbound connections blocked at the kernel; 208 allowed.",
+      "<strong>4</strong> of 212 observed outbound connections blocked at the kernel; 208 allowed.",
+    );
+    expect(h.storyEl.innerHTML).toContain(
+      "<strong>1</strong> of 4 decided approvals denied by you, 3 granted.",
     );
     expect(h.storyEl.innerHTML).not.toContain("story-summary");
   });

@@ -60,7 +60,10 @@ import type { SovereigntyProfileStore, SovereigntyProfileUpdate, UpstreamServer 
 import { generateSystemPrompt } from "../system-prompt-generator.js";
 import type { ClientManager } from "../proxy/client-manager.js";
 import { dispatchV11Request } from "../dashboard/v1_1/dispatch.js";
-import type { V11Bindings } from "../dashboard/v1_1/wiring.js";
+import {
+  fortressIdFromStoragePath,
+  type V11Bindings,
+} from "../dashboard/v1_1/wiring.js";
 import { getProcessInstance, getProcessSince } from "../dashboard/process-identity.js";
 import {
   getProtectionSnapshot,
@@ -107,8 +110,11 @@ import {
   buildCastleWallPosture,
   DEFAULT_ENFORCEMENT_FRESHNESS_MS,
   mapPlatform,
+  failedExclusiveEgressStatus,
   type CastleWallPosture,
+  type ExclusiveEgressStatus,
 } from "./posture.js";
+import { resolveProtectionSubjectFromFortressPath } from "../castle-wall/subject-binding.js";
 import {
   createPostureStreamRegistry,
   type PostureStreamRegistry,
@@ -699,6 +705,10 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    * old 501 oracle.
    */
   private supervisorBridge: SupervisorBridge | null = null;
+  /** S5-P exclusive-egress posture provider (S5-6's arming-wiring producer; null while detached). */
+  private _exclusiveEgressPostureProvider:
+    | (() => Promise<ExclusiveEgressStatus | null> | ExclusiveEgressStatus | null)
+    | null = null;
 
   /**
    * Slice 2 (park-not-exit): true when this dashboard booted WITHOUT a master
@@ -1270,6 +1280,16 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       this.identityManager?.getPrimaryIdentityId() ??
       "local";
     const auditLog = this.auditLog;
+    // S5-P (codex MED fix): thread the SAME fail-closed exclusive-egress
+    // snapshot every other feature-health consumer uses, so the fault-raise
+    // panel's `castle_wall_egress` row agrees with the rendered dashboard row
+    // (both compute `coarse_only` when the exclusive stack is down). This keeps
+    // the raise path's transition memory consistent with what the operator
+    // sees; `coarse_only` is not in the silent-off set, so it never spuriously
+    // raises an OS notification (coarse-only stays loud on the surface, not a
+    // notification - the ratified tight fault-class set is unchanged).
+    const exclusiveEgress = await this.resolveExclusiveEgressPosture();
+    const protectionClaimSubject = await this.resolveProtectionClaimSubject();
     return auditLog.runEagerReads(() =>
       buildFeatureHealthPanel({
         auditLog,
@@ -1285,6 +1305,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         ...(brokerLoad?.status === "unreadable"
           ? { brokerProducerKeyExpectedButUnavailable: true }
           : {}),
+        ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+        protectionClaimSubject,
       }),
     );
   }
@@ -1670,10 +1692,18 @@ export class DashboardApprovalChannel implements ApprovalChannel {
         brokerLoad?.status === "present" ? brokerLoad.keyB64url : null,
       brokerProducerKeyExpectedButUnavailable:
         brokerLoad?.status === "unreadable",
+      resolveProtectionClaimSubject: () =>
+        this.resolveProtectionClaimSubject(),
       // Wire the shared registry so the SSE live-refresh stream is available and
       // its concurrency cap is enforced server-wide. The stream reuses `buildHome`
       // (no new data, no new green paths) on a cadence plus a heartbeat.
       streamRegistry: this.postureStreamRegistry,
+      // S5-P: the exclusive-egress posture provider (fail-closed resolve lives
+      // in the route layer; this passes the raw provider through so post-wiring
+      // is observed lazily per request). Null until S5-6 attaches a producer.
+      ...(this._exclusiveEgressPostureProvider
+        ? { exclusiveEgressPosture: this._exclusiveEgressPostureProvider }
+        : {}),
     };
     return handlePostureRoute(deps, req, res, url, method);
   }
@@ -1866,6 +1896,12 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       // runs changes. This is the operator/badge read, NOT the agent-facing
       // `/api/posture/evidence` audit surface (which deliberately stays
       // per-request re-verified).
+      // S5-P: resolve the exclusive-egress posture (fail-closed) OUTSIDE the
+      // eager read scope, then let the ONE canonical shaper apply the
+      // aggregate-green cap so /v1/status and the posture routes can never
+      // diverge on green.
+      const exclusiveEgress = await this.resolveExclusiveEgressPosture();
+      const protectionClaimSubject = await this.resolveProtectionClaimSubject();
       return await this.auditLog.runEagerReads(() =>
         buildCastleWallPosture({
           auditLog: this.auditLog as AuditLog,
@@ -1875,6 +1911,8 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           ...(load?.status === "unreadable"
             ? { producerKeyExpectedButUnavailable: true }
             : {}),
+          ...(exclusiveEgress !== null ? { exclusiveEgress } : {}),
+          protectionClaimSubject,
         }),
       );
     } catch {
@@ -2128,6 +2166,57 @@ export class DashboardApprovalChannel implements ApprovalChannel {
    */
   setSupervisorBridge(bridge: SupervisorBridge | null): void {
     this.supervisorBridge = bridge;
+  }
+
+  /**
+   * Unified Protect Slice 5 S5-P: bind (or detach with `null`) the
+   * exclusive-egress posture provider. The provider is produced by the
+   * root-supervised provisioning/boot flow (S5-6: the arming-wiring posture
+   * producer, bound by dashboard-standalone on darwin) and resolves the
+   * per-agent exclusive-egress posture objects + wall-level summary. While
+   * detached (today: no fine-grained agent is provisioned anywhere), every
+   * posture surface behaves exactly as before. Once attached, the wall
+   * posture, the feature-health panel, the hero shield, /v1/status, and the
+   * CLI all apply the ONE aggregate-green capping rule through the canonical
+   * builders. Detaching reverts to the unwired behavior.
+   */
+  setExclusiveEgressPostureProvider(
+    provider:
+      | (() => Promise<ExclusiveEgressStatus | null> | ExclusiveEgressStatus | null)
+      | null,
+  ): void {
+    this._exclusiveEgressPostureProvider = provider;
+  }
+
+  /**
+   * Resolve the S5-P exclusive-egress posture provider FAIL-CLOSED: absent
+   * provider -> null (no fine-grained agent; no cap); a provider that THROWS
+   * -> `failedExclusiveEgressStatus` (caps green). Shared by every dashboard
+   * consumer (posture routes deps, /v1/status, the hero-shield aggregator) so
+   * all surfaces resolve identically and none can silently green through a
+   * failed posture read.
+   */
+  private async resolveExclusiveEgressPosture(): Promise<ExclusiveEgressStatus | null> {
+    const provider = this._exclusiveEgressPostureProvider;
+    if (!provider) return null;
+    try {
+      return await provider();
+    } catch (err) {
+      return failedExclusiveEgressStatus(
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  private async resolveProtectionClaimSubject(): Promise<string | null> {
+    const storagePath = this._sanctuaryConfig?.storage_path;
+    if (storagePath === undefined || storagePath.length === 0) return null;
+    const fortressId =
+      this.v11Bindings?.fortressId ?? fortressIdFromStoragePath(storagePath);
+    return (await resolveProtectionSubjectFromFortressPath(
+      storagePath,
+      fortressId,
+    )).subject;
   }
 
   /**
@@ -6725,6 +6814,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       }
       const { nodeId, nodeMode } = parseResult;
 
+      // Build the federation deps ONCE for this request (pure synchronous
+      // object construction; every closure reads live `this` state, so a
+      // single instance observes the same state as per-call rebuilds did).
+      const federationDeps = this.buildV1FederationDeps();
+
       try {
         // Capacity pre-check FIRST: an operator at cap should never even
         // reach the ceremony. Advisory UX only (see doc comment above); the
@@ -6751,7 +6845,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
                 "Cannot determine current fleet node count; refusing to mint an enrollment token. Try again shortly.",
             }),
           );
-          void this.buildV1FederationDeps().audit({
+          void federationDeps.audit({
             operation: "fleet_enroll_token_mint",
             result: "failure",
             identityId: nodeId,
@@ -6775,7 +6869,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
                 "enroll another. Every existing node keeps its Castle Wall protection.",
             }),
           );
-          void this.buildV1FederationDeps().audit({
+          void federationDeps.audit({
             operation: "fleet_enroll_token_mint",
             result: "failure",
             identityId: nodeId,
@@ -6798,7 +6892,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             "Cache-Control": "no-store",
           });
           res.end(JSON.stringify({ error: "federation_not_provisioned" }));
-          void this.buildV1FederationDeps().audit({
+          void federationDeps.audit({
             operation: "fleet_enroll_token_mint",
             result: "failure",
             identityId: nodeId,
@@ -6819,7 +6913,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
             "Cache-Control": "no-store",
           });
           res.end(JSON.stringify({ error: "federation_not_provisioned" }));
-          void this.buildV1FederationDeps().audit({
+          void federationDeps.audit({
             operation: "fleet_enroll_token_mint",
             result: "failure",
             identityId: nodeId,
@@ -6833,7 +6927,7 @@ export class DashboardApprovalChannel implements ApprovalChannel {
           "Cache-Control": "no-store",
         });
         res.end(JSON.stringify({ ok: true, bootstrap_token: bootstrapToken }));
-        void this.buildV1FederationDeps().audit({
+        void federationDeps.audit({
           operation: "fleet_enroll_token_mint",
           result: "success",
           identityId: nodeId,
@@ -6983,6 +7077,11 @@ export class DashboardApprovalChannel implements ApprovalChannel {
       ...(load?.status === "unreadable"
         ? { producerKeyExpectedButUnavailable: true }
         : {}),
+      // S5-P: hand the hero shield the SAME fail-closed exclusive-egress
+      // resolver every other surface uses, so the shield's wall arm-state
+      // (via the ONE canonical shaper) caps green identically.
+      resolveExclusiveEgressPosture: () => this.resolveExclusiveEgressPosture(),
+      resolveProtectionClaimSubject: () => this.resolveProtectionClaimSubject(),
       pendingApprovals: Array.from(this.pending.values()).map((p) => ({
         id: p.id,
         operation: p.request.operation,

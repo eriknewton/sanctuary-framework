@@ -94,6 +94,42 @@ import {
   createStandaloneJoinApprover,
 } from "./mesh/lifecycle/index.js";
 
+type StandaloneProcessCleanup = () => void;
+
+const standaloneSignalCleanups = new Set<StandaloneProcessCleanup>();
+const standaloneExitCleanups = new Set<StandaloneProcessCleanup>();
+let standaloneProcessListenersInstalled = false;
+
+function runStandaloneSignalCleanups(): void {
+  const cleanups = [...standaloneSignalCleanups];
+  standaloneSignalCleanups.clear();
+  standaloneExitCleanups.clear();
+  for (const cleanup of cleanups) cleanup();
+}
+
+function runStandaloneExitCleanups(): void {
+  const cleanups = [...standaloneExitCleanups];
+  standaloneSignalCleanups.clear();
+  standaloneExitCleanups.clear();
+  for (const cleanup of cleanups) cleanup();
+}
+
+function registerStandaloneProcessCleanup(
+  cleanup: StandaloneProcessCleanup,
+  options: { runOnExit?: boolean } = {},
+): void {
+  standaloneSignalCleanups.add(cleanup);
+  if (options.runOnExit === true) {
+    standaloneExitCleanups.add(cleanup);
+  }
+  if (!standaloneProcessListenersInstalled) {
+    standaloneProcessListenersInstalled = true;
+    process.on("SIGINT", runStandaloneSignalCleanups);
+    process.on("SIGTERM", runStandaloneSignalCleanups);
+    process.on("exit", runStandaloneExitCleanups);
+  }
+}
+
 export interface StandaloneDashboardOptions {
   passphrase?: string;
   port?: number;
@@ -689,6 +725,35 @@ async function wireUnlockedDeps(args: {
   // 5. Initialize audit log (for reading historical entries)
   const auditLog = new AuditLog(storage, masterKey);
 
+  // Unified Protect Slice 5 S5-6: bind the exclusive-egress posture PRODUCER
+  // (the S5-P provider -- previously "no live producer exists"). Reads the
+  // real root-supervised surfaces per call (exclusive-routing marker, S5-1
+  // registry + dirty, S5-2 staging, gate runtime state, the oracle's signed
+  // freshness token verified against the pinned public key). The coarse-wall
+  // evidence probe is the SAME adjudicated-flow evidence surface the wrap
+  // banner and feature-health already trust (never daemon self-report). A
+  // provider throw is mapped to failedExclusiveEgressStatus by the
+  // dashboard's shared fail-closed resolver (caps green, never silently
+  // reads "no fine-grained agents"). darwin-only; elsewhere the provider
+  // stays detached and every surface behaves exactly as before.
+  if (process.platform === "darwin") {
+    const { createExclusiveEgressPostureProducer } = await import(
+      "./egress-gate/arming-wiring.js"
+    );
+    dashboard.setExclusiveEgressPostureProvider(
+      createExclusiveEgressPostureProducer({
+        fortressPath: config.storage_path,
+        coarseWallArmed: async (): Promise<boolean> => {
+          const { probeCoarseCastleWallEnforcementObserved } = await import("./wrap/cli.js");
+          // The producer needs the coarse enforcement evidence only; protection
+          // claims are resolved after this provider has produced the capped
+          // verdict, avoiding recursion.
+          return probeCoarseCastleWallEnforcementObserved(auditLog, config.storage_path);
+        },
+      }),
+    );
+  }
+
   // 5pre. Custody audit trail (mirrors the MCP server boot): record
   // envelope creation / migration / deferral - wrap types and install mode
   // only, never key material.
@@ -1212,9 +1277,7 @@ async function wireUnlockedDeps(args: {
     clearTenantRuntime(config.storage_path).catch(() => {});
     distressListener?.stop().catch(() => {});
   };
-  process.once("SIGINT", clearRuntime);
-  process.once("SIGTERM", clearRuntime);
-  process.once("exit", clearRuntime);
+  registerStandaloneProcessCleanup(clearRuntime, { runOnExit: true });
 
   // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
   console.error(`Sanctuary Dashboard v${SANCTUARY_VERSION} (standalone mode)`);
@@ -1281,6 +1344,5 @@ async function wireUnlockedDeps(args: {
   const saveBaseline = () => {
     baseline.save().catch(() => {});
   };
-  process.on("SIGINT", saveBaseline);
-  process.on("SIGTERM", saveBaseline);
+  registerStandaloneProcessCleanup(saveBaseline);
 }

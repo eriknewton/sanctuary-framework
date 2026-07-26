@@ -78,6 +78,7 @@ import {
   type RefreshLock,
   type VerifiedManifestRead,
 } from "../castle-wall/observe/index.js";
+import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
 const CASTLE_PINNED_PUBKEY = "castle-pinned-pubkey.bin";
@@ -344,6 +345,15 @@ export async function runObserveCandidates(
   if (!boot) return 1;
 
   if (!noRefresh) {
+    const producerKey = await loadFortressProducerKey(boot.fortressPath);
+    if (producerKey.status === "unreadable") {
+      write(
+        err,
+        `Error: could not refresh candidates -- Castle Wall audit-producer key is unreadable (${producerKey.reason}). ` +
+          "Nothing was changed. Refusing to fold agent-scoped candidates without verified producer attribution.\n",
+      );
+      return 1;
+    }
     // The idempotent, allowlist-aware refresh chokepoint (sweep finding
     // R3-1): every audit event folds exactly once (persisted watermark), and
     // a destination the operator's verified policy already permits is never
@@ -359,6 +369,9 @@ export async function runObserveCandidates(
           lockHolderDescription = holder;
         }),
         now: new Date(),
+        pinnedProducerKeyB64url:
+          producerKey.status === "present" ? producerKey.keyB64url : null,
+        subjectFortressId: fortressIdFromStoragePath(boot.fortressPath),
       });
     } catch (error) {
       // streamVerifiedChain's strict verification failed: the audit chain

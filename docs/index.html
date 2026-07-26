@@ -6,14 +6,14 @@ layout: null
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sanctuary. Your agent. Your machine. Your keys.</title>
-<meta name="description" content="Sanctuary is a kernel-level firewall and substrate for AI agents. It blocks prompt-injected egress at the operating system, gives compliant agents a sovereignty surface, and ships receipts and reputation that travel with the operator. One MCP server, runnable with npx.">
+<title>Sanctuary. The open source standard for secure, private AI.</title>
+<meta name="description" content="Your agent will know you better than you know yourself. Make sure that stays between you. Sanctuary is the open source standard for secure, private AI: a wall the operating system enforces in both directions, and your data under your own keys, portable anywhere.">
 <meta name="author" content="Erik Newton">
 <meta name="theme-color" content="#0b1326">
 
 <!-- Open Graph -->
-<meta property="og:title" content="Sanctuary. Your agent. Your machine. Your keys.">
-<meta property="og:description" content="A kernel-level firewall and sovereignty substrate for AI agents. Real egress enforcement at the operating system. Sovereignty surface for compliant agents. Receipts and reputation across vendors. Runs locally. Apache-2.0. Install with npx.">
+<meta property="og:title" content="Sanctuary. The open source standard for secure, private AI.">
+<meta property="og:description" content="Your agent will know you better than you know yourself. Make sure that stays between you. A wall the operating system enforces in both directions, and your data under your own keys, portable anywhere. Any agent, local or cloud, solo or fleet. Apache-2.0. Install with npx.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="https://sanctuaryprotocol.ai/">
 <meta property="og:site_name" content="Sanctuary Protocol">
@@ -65,17 +65,16 @@ layout: null
     </div>
 
     <h1 id="hero-title" class="hero__title">
-      Your agent.<br>
-      Your machine.<br>
-      Your <span class="text-gradient">keys</span>.
+      Your agent will know you<br>
+      better than you know yourself.<br>
+      <span class="text-gradient">Make sure that stays between you.</span>
     </h1>
 
     <p class="hero__sub">
-      Sanctuary is a firewall for AI agents that runs on your hardware. It blocks prompt-injected
-      egress at the operating system, gives compliant agents an encrypted sovereignty surface,
-      and ships receipts and reputation across vendors. One MCP server, runnable with
-      <code class="mono">npx</code>. Drop it under any harness (Claude Code, OpenClaw, CrewAI,
-      LangChain) without touching your agent code.
+      Sanctuary is the open source standard for secure, private AI: a wall the operating system
+      enforces in both directions, and your data under your own keys, portable anywhere.
+      Any agent, local or cloud, solo or fleet. One command to get started.
+      One dashboard to secure them all.
     </p>
 
     <!-- Install block -->
@@ -102,7 +101,7 @@ layout: null
 
     <div class="hero__stats" aria-label="Project stats">
       <div class="hero__stat"><strong>5</strong><span>Castle layers</span></div>
-      <div class="hero__stat"><strong>4,763</strong><span>Passing tests</span></div>
+      <div class="hero__stat"><strong>11,998</strong><span>Passing tests</span></div>
       <div class="hero__stat"><strong>203</strong><span>Kernel-binding tests</span></div>
       <div class="hero__stat"><strong>0</strong><span>Harness changes</span></div>
     </div>
@@ -155,7 +154,9 @@ layout: null
               <p class="provisioning__body">
                 The Castle Wall blocks unauthorized outbound calls at the operating system. A
                 prompt-injected agent cannot route around it because the kernel itself enforces.
-                DNS, DoH, DoT, raw sockets, all covered. Phase 1 live on Linux and macOS.
+                DNS, DoH, DoT, raw sockets, all covered. Live on Linux and macOS: the wall
+                enforces a signed operator policy, with a clean per-account allow/deny
+                demonstration and 5/5 reboot survival behind the claim.
               </p>
             </div>
           </li>
@@ -193,7 +194,7 @@ layout: null
         <h2 id="layers-title">The Castle Architecture.</h2>
         <p>
           Five layers, each with a distinct contract. Real enforcement at the perimeter,
-          observation inside, a sovereignty surface for compliant agents, receipts and reputation
+          observation inside, an encrypted state surface for compliant agents, receipts and reputation
           across vendors, and an install-time substrate that binds it all to the operator.
           The layers compose. None of them substitute for another.
         </p>
@@ -201,7 +202,7 @@ layout: null
 
       <div class="layers">
         <article class="layer surface-card">
-          <span class="layer__id">L1 · perimeter</span>
+          <span class="layer__id">Perimeter</span>
           <h3 class="layer__title">Castle Wall</h3>
           <p class="layer__body">
             Operating-system-level egress filtering. nftables, cgroup v2, and NFQUEUE on Linux.
@@ -216,7 +217,7 @@ layout: null
         </article>
 
         <article class="layer surface-card">
-          <span class="layer__id">L2 · observation</span>
+          <span class="layer__id">Observation</span>
           <h3 class="layer__title">Sentinels</h3>
           <p class="layer__body">
             Internal behavioral observation. eBPF on Linux. Cross-platform auditd-tail. Seven
@@ -231,7 +232,7 @@ layout: null
         </article>
 
         <article class="layer surface-card">
-          <span class="layer__id">L3 · sovereignty surface</span>
+          <span class="layer__id">Cooperative surface</span>
           <h3 class="layer__title">Charter (Cooperative MCP)</h3>
           <p class="layer__body">
             Encrypted state, signed audit, mandate primitives, canonical policy slots,
@@ -246,7 +247,7 @@ layout: null
         </article>
 
         <article class="layer surface-card">
-          <span class="layer__id">L4 · accountability</span>
+          <span class="layer__id">Accountability</span>
           <h3 class="layer__title">Heralds (Receipts and Reputation)</h3>
           <p class="layer__body">
             Cryptographic receipts on cross-castle transactions, portable reputation that
@@ -261,7 +262,7 @@ layout: null
         </article>
 
         <article class="layer surface-card">
-          <span class="layer__id">L0 · substrate</span>
+          <span class="layer__id">Substrate</span>
           <h3 class="layer__title">Mantle (install-time binding)</h3>
           <p class="layer__body">
             Install-time substrate-binding to the operator. The Mantle gives the rest of the
@@ -286,7 +287,7 @@ layout: null
         <h2 id="harnesses-title">Drop it into any harness.</h2>
         <p>
           Sanctuary speaks standard MCP. No forks, no adapters, no special case for your stack.
-          Point your harness at the server and every tool in the sovereignty layer becomes
+          Point your harness at the server and every tool in the custody stack becomes
           available to your agent immediately.
         </p>
       </div>
@@ -361,7 +362,7 @@ sanctuary = MCPTool.from_stdio(
     <div class="container">
       <div class="section__heading">
         <span class="eyebrow">60 seconds</span>
-        <h2 id="quickstart-title">From zero to <span class="text-gradient">sovereign</span>.</h2>
+        <h2 id="quickstart-title">From zero to <span class="text-gradient">custody</span>.</h2>
         <p>
           Three commands. A local vault, a self-custodied identity, and a running approval
           dashboard before your coffee cools.
@@ -408,6 +409,20 @@ sanctuary = MCPTool.from_stdio(
       </div>
 
       <div class="journal">
+        <a class="journal__card surface-card" href="/2026/07/13/residency-is-not-custody.html">
+          <div class="journal__meta">
+            <span>Position</span>
+            <span>2026-07-13</span>
+          </div>
+          <h3 class="journal__title">Residency Is Not Custody</h3>
+          <p class="journal__excerpt">
+            Microsoft's CEO says data location was never the point. He's right. The test for
+            AI security is custody: who holds the keys, what enforces the deny, and who can
+            edit the record. Three questions, and the drill evidence behind ours.
+          </p>
+          <span class="btn btn--terminal">Read the post</span>
+        </a>
+
         <a class="journal__card surface-card" href="/2026/05/15/nobody-else-was-going-to-build-it.html">
           <div class="journal__meta">
             <span>Story</span>
@@ -447,7 +462,7 @@ sanctuary = MCPTool.from_stdio(
   <section class="section" aria-labelledby="cta-title">
     <div class="container">
       <div class="cta surface-card">
-        <span class="eyebrow">Ship sovereign agents</span>
+        <span class="eyebrow">Ship agents you actually control</span>
         <h2 id="cta-title">Give your agent a real firewall in one command.</h2>
         <p>Open source. Runs locally. No platform dependency. No blockchain. No telemetry.</p>
         <div class="btn-row" style="justify-content: center;">
@@ -470,7 +485,7 @@ sanctuary = MCPTool.from_stdio(
           Sanctuary
         </a>
         <p>
-          A firewall and sovereignty substrate for AI agents. Real egress enforcement,
+          A firewall and custody substrate for AI agents. Real egress enforcement,
           portable reputation, no platform dependency.
         </p>
       </div>
