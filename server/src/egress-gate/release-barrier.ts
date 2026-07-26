@@ -456,6 +456,7 @@ const SAFE_REFUSAL_RECORD_KEY_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SAFE_REFUSAL_RECORD_VALUE_RE = /^[A-Za-z0-9 ._/:;(),+=@-]{1,240}$/;
 
 function describeUnsafeRefusalRecordKey(key: string): string {
+  // eslint-disable-next-line no-control-regex
   const controlStripped = key.replace(/[\x00-\x1F\x7F]/g, "");
   const capped = controlStripped.slice(0, 64);
   return JSON.stringify(capped);
