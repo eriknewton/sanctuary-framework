@@ -99,6 +99,7 @@ describe("egress-gate/gate-credential parse/format", () => {
       canonical.slice(0, 4) + " " + canonical.slice(4), // whitespace is ignored by lenient decoders
       canonical.slice(0, 4) + "@@" + canonical.slice(4), // non-base64 alphabet ignored by Node's decoder
       canonical.replace(/==$/, "="), // non-canonical padding still decodes leniently
+      canonical.replace(/=+$/, "").replace(/g$/, "h"), // non-canonical trailing bits decode to the same payload
     ];
     for (const variant of variants) {
       expect(Buffer.from(variant, "base64").toString("utf8")).toBe(`${GATE_PROXY_BASIC_USERNAME}:7.deadbeef`);

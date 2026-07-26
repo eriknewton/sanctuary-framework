@@ -172,7 +172,7 @@ function assertNoControlChars(value: string, what: string): void {
   }
 }
 
-function assertNoCredentialedPlistEnvValue(name: string, value: string): void {
+function assertNoCredentialedPlistValue(name: string, value: string): void {
   if (CREDENTIALED_URL_VALUE_RE.test(value)) {
     throw new Error(
       `Refusing to embed ${name} value containing URL credentials in a world-readable LaunchDaemon plist.`,
@@ -260,6 +260,7 @@ export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOp
   }
   for (const arg of options.programArguments) {
     assertNoControlChars(arg, "program argument");
+    assertNoCredentialedPlistValue("program argument", arg);
   }
 
   const envEntries: Array<[string, string]> = [];
@@ -281,7 +282,7 @@ export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOp
     }
   }
   for (const [name, value] of envEntries) {
-    assertNoCredentialedPlistEnvValue(name, value);
+    assertNoCredentialedPlistValue(name, value);
   }
 
   const logDir =

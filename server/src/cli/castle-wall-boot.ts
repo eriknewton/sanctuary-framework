@@ -267,7 +267,7 @@ function assertNoControlChars(value: string, what: string): void {
   }
 }
 
-function assertNoCredentialedPlistEnvValue(name: string, value: string): void {
+function assertNoCredentialedPlistValue(name: string, value: string): void {
   if (CREDENTIALED_URL_VALUE_RE.test(value)) {
     throw new Error(
       `Refusing to embed ${name} value containing URL credentials in a world-readable LaunchDaemon plist.`,
@@ -362,6 +362,7 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
   }
   for (const arg of opts.programArguments) {
     assertNoControlChars(arg, "program argument");
+    assertNoCredentialedPlistValue("program argument", arg);
   }
   if (!opts.programArguments.includes("--safe-mode")) {
     // Fail-closed: the boot service must come up in safe mode (boot token only,
@@ -428,7 +429,7 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
     }
   }
   for (const [name, value] of envEntries) {
-    assertNoCredentialedPlistEnvValue(name, value);
+    assertNoCredentialedPlistValue(name, value);
   }
 
   const argsXml = opts.programArguments

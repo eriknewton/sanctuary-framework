@@ -410,6 +410,10 @@ EXPECTED_LABEL="$6"
 [ "$7" = "--" ] || fail "bad invocation (missing -- separator)"
 shift 7
 
+case "$GATE_PROXY_USERNAME" in
+  ""|*:*|*@*|*/*|*[!a-zA-Z0-9._-]*) fail "gate proxy username is malformed" ;;
+esac
+
 case "$EXPECTED_GENERATION" in
   ""|*[!0-9]*) fail "expected generation is not a number" ;;
 esac

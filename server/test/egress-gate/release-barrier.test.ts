@@ -239,7 +239,14 @@ describe("wrapper script (static content invariants)", () => {
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain("set -eu");
   });
 
-  it("pins the token and gate-port guards in Linux-visible static coverage", () => {
+  it("pins the wrapper argv shape plus username, token, and gate-port guards in Linux-visible static coverage", () => {
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ "$#" -ge 8 ] ||');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('GATE_PROXY_USERNAME="$5"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain('[ "$7" = "--" ] || fail "bad invocation (missing -- separator)"');
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain("shift 7");
+    expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
+      '""|*:*|*@*|*/*|*[!a-zA-Z0-9._-]*) fail "gate proxy username is malformed" ;;',
+    );
     expect(RELEASE_EXEC_WRAPPER_SCRIPT).toContain(
       '[ "$GATE_PORT" -gt 0 ] 2>/dev/null || fail "gate port is not in the TCP port range"',
     );
@@ -254,12 +261,23 @@ describe("wrapper script (static content invariants)", () => {
       '""|*[!0-9a-f]*) fail "gate credential token secret missing or malformed" ;;',
     );
 
+    const argcMinimum = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$#" -ge 8 ]');
+    const usernameRead = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('GATE_PROXY_USERNAME="$5"');
+    const separatorCheck = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$7" = "--" ]');
+    const shiftCount = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("shift 7");
+    const usernameShape = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf("gate proxy username is malformed");
     const portLowerBound = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$GATE_PORT" -gt 0 ]');
     const portUpperBound = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$GATE_PORT" -le 65535 ]');
     const tokenAbsent = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ -f "$TOKEN_FILE" ]');
     const tokenGenerationMatch = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('[ "$TOKEN_GEN" = "$EXPECTED_GENERATION" ]');
     const tokenSecretHex = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('gate credential token secret missing or malformed');
     const proxyBuild = RELEASE_EXEC_WRAPPER_SCRIPT.indexOf('PROXY_URL="http://');
+    expect(argcMinimum).toBeGreaterThan(0);
+    expect(usernameRead).toBeGreaterThan(argcMinimum);
+    expect(separatorCheck).toBeGreaterThan(usernameRead);
+    expect(shiftCount).toBeGreaterThan(separatorCheck);
+    expect(usernameShape).toBeGreaterThan(shiftCount);
+    expect(portLowerBound).toBeGreaterThan(usernameShape);
     expect(portLowerBound).toBeGreaterThan(0);
     expect(portUpperBound).toBeGreaterThan(portLowerBound);
     expect(tokenAbsent).toBeGreaterThan(portUpperBound);

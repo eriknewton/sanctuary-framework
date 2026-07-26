@@ -180,6 +180,18 @@ describe("egress-gate/harness-daemon", () => {
       ).toThrow(/AGENT_PROXY_URL value containing URL credentials/);
     });
 
+    it("refuses a credentialed URL value in ProgramArguments", () => {
+      expect(() =>
+        renderAgentHarnessDaemonPlist({
+          ...BASE,
+          programArguments: [
+            "/usr/local/bin/node",
+            "http://sanctuary-gate:7.deadbeef@127.0.0.1:49152",
+          ],
+        }),
+      ).toThrow(/program argument value containing URL credentials/);
+    });
+
     it("keeps the forbidden-env list in lockstep with cli/castle-wall-boot.ts", () => {
       expect([...HARNESS_FORBIDDEN_PLIST_ENV].sort()).toEqual([...FORBIDDEN_PLIST_ENV].sort());
     });
