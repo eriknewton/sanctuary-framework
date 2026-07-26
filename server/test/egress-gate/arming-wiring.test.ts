@@ -59,7 +59,12 @@ import {
 } from "../../src/egress-gate/gate-daemon.js";
 import { gateLivenessTokenPath } from "../../src/egress-gate/liveness-oracle.js";
 import { peerResolverDaemonLabel, peerResolverDaemonPlistPath } from "../../src/egress-gate/peer-resolver-daemon.js";
-import { AGENT_HARNESS_DAEMON_LABEL, HARNESS_STOP_SETTLE_SAMPLES, harnessLaunchSpec } from "../../src/egress-gate/harness-daemon.js";
+import {
+  AGENT_HARNESS_DAEMON_LABEL,
+  HARNESS_STOP_SETTLE_INTERVAL_MS,
+  HARNESS_STOP_SETTLE_SAMPLES,
+  harnessLaunchSpec,
+} from "../../src/egress-gate/harness-daemon.js";
 import {
   holdFilePathForUid,
   planParkedHarnessInstall,
@@ -385,7 +390,7 @@ describe("parkHarnessPersistently (fix-round-2 HIGH-2: full persistent park)", (
     });
     const fs = parkFs();
     await expect(parkHarnessPersistently(PARK_CTX, { runLaunchctlFn: fn, ...fs })).rejects.toThrow(
-      /reports RUNNING \(pid 4242\)/,
+      /still RUNNING after waiting .* across .* samples \(pid 4242\)/,
     );
   });
 
@@ -450,6 +455,83 @@ describe("verifyHarnessParkedPersistent (fix-round-2 HIGH-2: posture verify enum
     await expect(
       verifyHarnessParkedPersistent(PARK_CTX, { runLaunchctlFn: fn, ...parkFs() }),
     ).resolves.toEqual({ ok: true });
+  });
+
+  it("settles a transient running launchd readback before claiming parked", async () => {
+    let printSamples = 0;
+    const calls: string[] = [];
+    const fn = async (args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+      calls.push(args.join(" "));
+      if (args[0] === "print-disabled") {
+        return { code: 0, stdout: `\t"${AGENT_HARNESS_DAEMON_LABEL}" => disabled\n`, stderr: "" };
+      }
+      if (args[0] === "print") {
+        printSamples += 1;
+        if (printSamples === 1) {
+          return { code: 0, stdout: "\tstate = running\n\tpid = 4242\n", stderr: "" };
+        }
+        return { code: 3, stdout: "", stderr: "Could not find service" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    await expect(
+      verifyHarnessParkedPersistent(PARK_CTX, {
+        runLaunchctlFn: fn,
+        sleepMs: async () => undefined,
+        ...parkFs({ [PARKED_PLAN.plistPath]: PARKED_PLAN.plistContent }),
+      }),
+    ).resolves.toEqual({ ok: true });
+    expect(printSamples).toBeGreaterThan(1);
+    expect(calls.filter((c) => c.startsWith("print system/"))).toHaveLength(2);
+  });
+
+  it("fails closed when launchd never settles stopped and names the measured wait and sample count", async () => {
+    let printSamples = 0;
+    const fn = async (args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+      if (args[0] === "print-disabled") {
+        return { code: 0, stdout: `\t"${AGENT_HARNESS_DAEMON_LABEL}" => disabled\n`, stderr: "" };
+      }
+      if (args[0] === "print") {
+        printSamples += 1;
+        return { code: 0, stdout: "\tstate = running\n\tpid = 4242\n", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const verdict = await verifyHarnessParkedPersistent(PARK_CTX, {
+      runLaunchctlFn: fn,
+      sleepMs: async () => undefined,
+      ...parkFs({ [PARKED_PLAN.plistPath]: PARKED_PLAN.plistContent }),
+    });
+    expect(verdict.ok).toBe(false);
+    expect(printSamples).toBe(HARNESS_STOP_SETTLE_SAMPLES);
+    const problem = (verdict as { problems: string[] }).problems.join(" ");
+    expect(problem).toMatch(/still RUNNING after waiting \d+ ms across 20 samples \(pid 4242\)/);
+    expect(problem).not.toContain(`${(HARNESS_STOP_SETTLE_SAMPLES - 1) * HARNESS_STOP_SETTLE_INTERVAL_MS} ms`);
+  });
+
+  it("fails closed on an untrustworthy launchd status without fabricating a wait", async () => {
+    let printSamples = 0;
+    const fn = async (args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+      if (args[0] === "print-disabled") {
+        return { code: 0, stdout: `\t"${AGENT_HARNESS_DAEMON_LABEL}" => disabled\n`, stderr: "" };
+      }
+      if (args[0] === "print") {
+        printSamples += 1;
+        return { code: 5, stdout: "", stderr: "launchd transient failure" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const verdict = await verifyHarnessParkedPersistent(PARK_CTX, {
+      runLaunchctlFn: fn,
+      sleepMs: async () => undefined,
+      ...parkFs({ [PARKED_PLAN.plistPath]: PARKED_PLAN.plistContent }),
+    });
+    expect(verdict.ok).toBe(false);
+    expect(printSamples).toBe(1);
+    const problem = (verdict as { problems: string[] }).problems.join(" ");
+    expect(problem).toContain("launchctl did not return a trustworthy harness status");
+    expect(problem).toContain("sampling once with no settle wait");
+    expect(problem).not.toContain(`${(HARNESS_STOP_SETTLE_SAMPLES - 1) * HARNESS_STOP_SETTLE_INTERVAL_MS} ms`);
   });
 
   it("STALE RELEASE MATERIAL is enumerated: lingering hold file and a non-parked (released) plist are each named", async () => {
@@ -2274,7 +2356,7 @@ describe("reloadPeerResolverDaemonForBringUp (fix-round-2 BLOCKER + fix-round-3 
 // in `productionBringUp` must force-replace the running gate the SAME way the
 // peer-resolver reload does. The pre-fix gate block used a raw
 // `bootstrap + kickstart(no -k)` that no-ops on an already-running daemon, so a
-// `sudo sanctuary protect --repair-egress-gate` rotated the pf anchor + port
+// `sudo sanctuary protect --repair-egress-gate --stand-down-agent` rotated the pf anchor + port
 // but never restarted the gate -> pf confined the agent to a port nothing
 // served -> the agent was strangled (fail-CLOSED, not a wrong-allow). The fix
 // routes the gate through the SHARED `reloadLaunchdDaemonForBringUp` chokepoint

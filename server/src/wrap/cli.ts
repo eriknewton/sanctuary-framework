@@ -89,6 +89,11 @@ import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
 import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
 import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
 import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+} from "../egress-gate/operator-advice.js";
+import {
   buildV11Bindings,
   fortressIdFromStoragePath,
 } from "../dashboard/v1_1/wiring.js";
@@ -307,6 +312,12 @@ export interface WrapOptions {
    * interactive TTY. Does not wrap anything.
    */
   repairEgressGate?: boolean;
+  /**
+   * Required operator acknowledgement for the S5-6/S5-7 repair and unprotect
+   * verbs: the sequence stops/disables the agent harness and verifies launchd
+   * settled it stopped before continuing.
+   */
+  standDownAgent?: boolean;
   /**
    * Explicit, interactive-only override for the repair drift guard (design
    * MED-7). TTY-only: refused on a non-interactive stdin. Audited
@@ -2062,7 +2073,7 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
         `  WARNING: the exclusive-egress gate is LIVE (uid ${outcome.uid}, generation ${outcome.generationId}) and the ` +
           `agent's only sanctioned egress path is the gate, but the persistent boot state could NOT be re-parked ` +
           `(${outcome.reparkError}). ` +
-          `The NEXT boot could start the agent before the gate re-arms. Run 'sudo sanctuary protect --repair-egress-gate' now.`,
+          `The NEXT boot could start the agent before the gate re-arms. Run '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) now.`,
       ];
     case "exclusive-egress-unarmed-coarse-active": {
       // S5-6 degrade-loud: DISTINCT non-green state; every posture surface
@@ -2085,7 +2096,7 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
         `  WARNING: fine-grained exclusive egress could NOT come live at "${outcome.stage}" (${outcome.reason}). ` +
           `The coarse Castle Wall remains armed over the agent -- this is a DISTINCT NON-GREEN (coarse-only) state ` +
           `on every posture surface, not full protection. ${manifestState} ${agentState}${cleanupNote} ` +
-          `Fix with: sudo sanctuary protect --repair-egress-gate`,
+          `Fix with: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       ];
     }
     case "aborted":
@@ -2326,6 +2337,7 @@ export async function runWrap(
     const code = await runEgressGateRepairForCli({
       isTty: process.stdin.isTTY === true,
       overrideTransientPfRules: options.overrideTransientPfRules === true,
+      standDownAgent: options.standDownAgent === true,
       cliBinary: resolveAutoProvisionCliBinary(options),
     });
     process.exit(code);
@@ -2338,6 +2350,7 @@ export async function runWrap(
   if (options.unprotectEgressGate === true) {
     const { runEgressGateUnprotectForCli } = await import("./auto-provision.js");
     const code = await runEgressGateUnprotectForCli({
+      standDownAgent: options.standDownAgent === true,
       cliBinary: resolveAutoProvisionCliBinary(options),
     });
     process.exit(code);
@@ -5020,6 +5033,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--exclusive-egress",
   "--repair-egress-gate",
   "--unprotect-egress-gate",
+  "--stand-down-agent",
   "--override-transient-pf-rules",
   "--help",
   "-h",
@@ -5136,6 +5150,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--unprotect-egress-gate":
         options.unprotectEgressGate = true;
         break;
+      case "--stand-down-agent":
+        options.standDownAgent = true;
+        break;
       case "--override-transient-pf-rules":
         options.overrideTransientPfRules = true;
         break;
@@ -5153,6 +5170,16 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
         printWrapHelp();
         process.exit(0);
     }
+  }
+
+  if (
+    options.standDownAgent === true &&
+    options.repairEgressGate !== true &&
+    options.unprotectEgressGate !== true
+  ) {
+    throw new Error(
+      "--stand-down-agent is only valid with --repair-egress-gate or --unprotect-egress-gate.",
+    );
   }
 
   return options;
@@ -5220,6 +5247,11 @@ function printWrapHelp(): void {
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.
                        Pass the absolute path to dist/cli.js.
+    --stand-down-agent
+                       With --repair-egress-gate or --unprotect-egress-gate,
+                       acknowledge and permit the required agent-harness stop.
+                       Those verbs stop and disable the harness before changing
+                       exclusive-egress state and refuse without this flag.
     --help, -h         Show this help
 
   What happens:

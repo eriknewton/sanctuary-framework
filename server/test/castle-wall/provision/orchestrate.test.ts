@@ -1558,7 +1558,9 @@ describe("castle-wall/provision/orchestrate", () => {
       const result = await runProvisionFlow(baseCtx({ fineGrainedDeclared: true }), ops);
       expect(result).toMatchObject({ kind: "aborted", stage: "exclusive-routing-residue" });
       expect((result as { reason: string }).reason).toMatch(/uncertain state/);
-      expect((result as { reason: string }).reason).toMatch(/sudo sanctuary protect --unprotect-egress-gate/);
+      expect((result as { reason: string }).reason).toMatch(
+        /sudo sanctuary protect --unprotect-egress-gate --stand-down-agent/,
+      );
       expect(ops.createAccount).not.toHaveBeenCalled();
       expect(exclusive.bringUpGeneration).not.toHaveBeenCalled();
     });
@@ -1616,7 +1618,7 @@ describe("castle-wall/provision/orchestrate", () => {
       const reason = (result as { reason: string }).reason;
       expect(reason).toMatch(/entry for uid 503/);
       expect(reason).toMatch(/No account was created, nothing was re-homed, and no Castle Wall change was made/);
-      expect(reason).toMatch(/sudo sanctuary protect --unprotect-egress-gate/);
+      expect(reason).toMatch(/sudo sanctuary protect --unprotect-egress-gate --stand-down-agent/);
       // Refused before the confirm, and before every mutation.
       expect(ops.confirm).not.toHaveBeenCalled();
       expect(ops.createAccount).not.toHaveBeenCalled();

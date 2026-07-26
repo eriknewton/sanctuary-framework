@@ -80,6 +80,38 @@ describe("egress-gate/liveness-oracle sign + verify", () => {
     expect(await probe.check()).toEqual({ live: true, reasons: [] });
   });
 
+  it("a caller-abandoned live refresh invalidates instead of minting a stale-positive token", async () => {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const h = harness({ now: 1_000, live: true });
+    const oracle = new GateLivenessOracle(privateKey, h.ops, { ttlMs: 2_000 });
+    await oracle.refresh(binding);
+    const probe = createOracleLivenessProbe({ source: h.source, publicKey, binding, now: () => 1_500 });
+    expect((await probe.check()).live).toBe(true);
+
+    h.set({ now: 2_000, live: true });
+    const result = await oracle.refresh(binding, { shouldPublish: () => false });
+    expect(result).toBeNull();
+    expect(h.removed).toContain(binding.agentUid);
+    const after = await probe.check();
+    expect(after.live).toBe(false);
+    expect(after.reasons.join(" ")).toContain("absent");
+  });
+
+  it("a timeout-invalidated abandoned refresh can skip a late publish without removing a newer token", async () => {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const h = harness({ now: 1_000, live: true });
+    const oracle = new GateLivenessOracle(privateKey, h.ops, { ttlMs: 2_000 });
+    await oracle.refresh(binding);
+    const probe = createOracleLivenessProbe({ source: h.source, publicKey, binding, now: () => 1_500 });
+    expect((await probe.check()).live).toBe(true);
+
+    h.set({ now: 2_000, live: true });
+    const result = await oracle.refresh(binding, { shouldPublish: () => "skip" });
+    expect(result).toBeNull();
+    expect(h.removed).toHaveLength(0);
+    expect((await probe.check()).live).toBe(true);
+  });
+
   it("an absent token is not live (supervisor invalidated / never published)", async () => {
     const { publicKey } = generateKeyPairSync("ed25519");
     const emptySource: LivenessTokenSource = { read: () => Promise.resolve(null) };

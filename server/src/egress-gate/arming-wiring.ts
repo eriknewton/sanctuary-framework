@@ -6,7 +6,7 @@
  *   1. INSTALL (`sudo sanctuary protect --hermes --exclusive-egress`, via
  *      `wrap/auto-provision.ts` -> `runProvisionFlow`'s exclusive stage):
  *      {@link createInstallExclusiveEgressOps}.
- *   2. REPAIR (`sudo sanctuary protect --repair-egress-gate`):
+ *   2. REPAIR (`sudo sanctuary protect --repair-egress-gate --stand-down-agent`):
  *      {@link createRepairExclusiveEgressOps} (+ the MED-7 drift guard).
  *   3. BOOT (the root Castle Wall policy daemon):
  *      {@link startExclusiveEgressBootSupervisor} -- re-arm -> gate-verify ->
@@ -90,6 +90,7 @@ import {
   setAgentHarnessJobDisabled,
   type HarnessDaemonOps,
   type HarnessDaemonStatus,
+  type HarnessStopSettleResult,
   type HarnessLaunchSpec,
 } from "./harness-daemon.js";
 import {
@@ -132,6 +133,7 @@ import {
   failedExclusiveEgressStatus,
   type ExclusiveEgressStatus,
 } from "./posture.js";
+import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE } from "./operator-advice.js";
 import { verifyLivenessToken } from "./liveness-oracle.js";
 import {
   exclusiveRoutingMarkerPath,
@@ -170,6 +172,13 @@ const GATE_RUNTIME_WAIT_BUDGET_MS = 15_000;
 const GATE_RUNTIME_WAIT_INTERVAL_MS = 250;
 export const GATE_ACCOUNT_HOME_BASE = "/var/sanctuary-agents";
 const GATE_ACCOUNT_HOME_BASE_RESOLVED = "/private/var/sanctuary-agents";
+const ORACLE_REFRESH_SKIP_WARN_THRESHOLD = 3;
+const ORACLE_REFRESH_STUCK_THRESHOLD = 6;
+const ORACLE_REFRESH_DEFAULT_TIMEOUT_MS = 10_000;
+// HONEST BOUND: per-uid scaling is a conservative estimate against the prior
+// ~350 ms/uid review measurement; it is a tuning guard, not drilled evidence.
+const ORACLE_REFRESH_PER_UID_TIMEOUT_MS = 500;
+const ORACLE_REFRESH_MAX_ABANDONED_ATTEMPTS = 1;
 
 /** Real O_EXCL lock ops (the shipped provision-lock discipline). */
 export function fsLockOps(): ProvisionLockOps {
@@ -1362,7 +1371,7 @@ export async function reloadLaunchdDaemonForBringUp(input: {
   // on Mini1; see `harness-daemon.ts:406-427`). Re-sample `launchctl print`
   // until the job is proven not-running BEFORE bootstrapping, so bootstrap
   // loads the NEW argv instead of no-op'ing on "already loaded".
-  const after = await awaitHarnessStoppedVia(() => launchdDaemonStatusByLabel(run, label), input.sleepMs);
+  const after = (await awaitHarnessStoppedVia(() => launchdDaemonStatusByLabel(run, label), input.sleepMs)).status;
   if (!after.known) {
     throw new Error(
       `launchctl print system/${label} did not return a trustworthy status after bootout; refusing to bring up ` +
@@ -1476,7 +1485,7 @@ export function createProductionReleaseBarrierOps(input: {
       print(
         `[castle-wall] release barrier (uid ${input.agentUid}, ${context}): registry entry #${q.index} ` +
           `is malformed and QUARANTINED (${q.reason}); uid ${input.agentUid}'s valid entry proceeds ` +
-          "through the barrier's own fail-closed checks; repair is owed: sudo sanctuary protect --repair-egress-gate",
+          `through the barrier's own fail-closed checks; repair is owed: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       );
     }
     return listed;
@@ -1625,7 +1634,7 @@ export function createProductionReleaseBarrierOps(input: {
               `uid ${input.agentUid}'s pf anchor rules are not live (${live.reasons.join("; ")}) and a ` +
               `quarantined registry entry (#${listed.quarantined.map((q) => q.index).join(", #")}) blocks a ` +
               "safe union re-arm (a partial re-render could drop the quarantined uid's block rules); " +
-              "repair: sudo sanctuary protect --repair-egress-gate",
+              `repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
           };
         }
         // Re-assert the committed union (idempotent add/update re-renders +
@@ -2651,6 +2660,13 @@ export async function verifyHarnessJobDisabled(
   };
 }
 
+function describeHarnessStopObservation(settled: HarnessStopSettleResult): string {
+  if (settled.samples === 1) {
+    return `sampling once with no settle wait (elapsed ${settled.elapsedMs} ms)`;
+  }
+  return `waiting ${settled.elapsedMs} ms across ${settled.samples} samples`;
+}
+
 /**
  * Verify the FULL persistent parked posture for the harness (fix-round-2
  * HIGH-2): (a) the job has no running pid, (b) the job is disabled in
@@ -2675,11 +2691,21 @@ export async function verifyHarnessParkedPersistent(
   const problems: string[] = [];
   // (a) Not running.
   try {
-    const status = await agentHarnessDaemonStatus(harnessOps);
+    const settled = await awaitHarnessStoppedVia(() => agentHarnessDaemonStatus(harnessOps), deps.sleepMs);
+    const status = settled.status;
+    const observation = describeHarnessStopObservation(settled);
     if (!status.known) {
-      problems.push("launchctl did not return a trustworthy harness status");
+      problems.push(
+        `launchctl did not return a trustworthy harness status (${observation})`,
+      );
     } else if (status.running) {
-      problems.push(`the harness job reports RUNNING (pid ${status.pid ?? "unknown"})`);
+      problems.push(
+        `the harness job is still RUNNING after ${observation} (pid ${status.pid ?? "unknown"})`,
+      );
+    } else if (status.pid !== undefined) {
+      problems.push(
+        `the harness job still reports pid ${status.pid} after ${observation}`,
+      );
     }
   } catch (err) {
     problems.push(`status probe errored: ${(err as Error).message}`);
@@ -3225,6 +3251,7 @@ export interface ExclusiveEgressBootSupervisorInternals {
   runBarrier?: typeof runReleaseBarrierSequence;
   createBarrierOps?: typeof createProductionReleaseBarrierOps;
   createOracle?: (privateKey: KeyObject, gateUid: number) => Pick<GateLivenessOracle, "refresh">;
+  removeLivenessToken?: (agentUid: number) => Promise<void>;
   removeHoldFile?: (agentUid: number) => Promise<void>;
   readRuntimeState?: (agentUid: number) => Promise<string>;
   gateWaitBudgetMs?: number;
@@ -3237,6 +3264,14 @@ export interface ExclusiveEgressBootSupervisorInternals {
     gateUid: number;
     gateHomeDirectory: string;
   }) => Promise<{ logDir: string }>;
+  /** TEST-ONLY: bound a hung oracle-refresh attempt faster than production. */
+  oracleRefreshTimeoutMs?: number;
+  /** TEST-ONLY: scale the whole-pass refresh timeout for multi-uid fleets. */
+  oracleRefreshPerUidTimeoutMs?: number;
+  /** TEST-ONLY: cap abandoned async attempts left behind after a timeout. */
+  oracleRefreshMaxAbandonedAttempts?: number;
+  /** TEST-ONLY: make the stuck-transition threshold deterministic and fast. */
+  oracleRefreshStuckThreshold?: number;
 }
 
 /**
@@ -3392,7 +3427,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
     input.print(
       `[castle-wall] boot: exclusive-egress registry unreadable (${(err as Error).message}); ` +
         "NO boot release or re-park ran; confined agents remain in their persisted parked state, " +
-        "which was NOT re-verified this boot. Repair: sudo sanctuary protect --repair-egress-gate",
+        `which was NOT re-verified this boot. Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
     );
     return { results: [], stopOracleLoop: () => undefined };
   }
@@ -3401,7 +3436,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
     input.print(
       `[castle-wall] boot: registry entry #${q.index} is malformed and QUARANTINED (${q.reason}); ` +
         "its agent gets no boot release and its gate denies (fail-closed); repair is owed. " +
-        "Other agents proceed. Repair: sudo sanctuary protect --repair-egress-gate",
+        `Other agents proceed. Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
     );
   }
   // NOTE (fix 2026-07-23): do NOT early-return on an empty registry. The
@@ -3457,7 +3492,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
     for (const entry of entries) {
       input.print(
         `[castle-wall] boot: uid ${entry.agent_uid} ${reason}; treat the agent as possibly ` +
-          "startable and intervene manually. Repair: sudo sanctuary protect --repair-egress-gate",
+          `startable and intervene manually. Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       );
       await input.audit("exclusive_egress_boot_release", {
         agent_uid: entry.agent_uid,
@@ -3480,7 +3515,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
           "the exclusive-egress liveness refresh loop did NOT start. The registry is empty now, so no " +
           "confined agent exists yet, but any agent armed after this boot will NOT get its liveness token refreshed " +
           "and its gate will deny ALL egress within one token TTL. " +
-          "Repair: sudo sanctuary protect --repair-egress-gate",
+          `Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       );
       await input.audit("exclusive_egress_boot_release", {
         outcome: "oracle-loop-not-started",
@@ -3606,7 +3641,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
           input.print(
             `[castle-wall] boot: uid ${agentUid} gate account home layout assert failed: ${reason}; ` +
               "the release barrier will refuse release and park fail-closed. " +
-              "Repair: sudo sanctuary protect --repair-egress-gate",
+              `Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
           );
           try {
             await input.audit("exclusive_egress_gate_home_layout_failed", {
@@ -3767,31 +3802,103 @@ export async function startExclusiveEgressBootSupervisor(input: {
   // EVERY freshness token (gates deny within one TTL, fail-closed) and
   // warns once per uid until the registry is clean again.
   const interval = input.refreshIntervalMs ?? 1_000;
-  const REFRESH_SKIP_WARN_THRESHOLD = 3;
+  const refreshBaseTimeoutMs = internals.oracleRefreshTimeoutMs ?? Math.max(ORACLE_REFRESH_DEFAULT_TIMEOUT_MS, interval * 5);
+  const refreshPerUidTimeoutMs = internals.oracleRefreshPerUidTimeoutMs ?? ORACLE_REFRESH_PER_UID_TIMEOUT_MS;
+  const maxAbandonedRefreshAttempts =
+    internals.oracleRefreshMaxAbandonedAttempts ?? ORACLE_REFRESH_MAX_ABANDONED_ATTEMPTS;
+  const refreshStuckThreshold = internals.oracleRefreshStuckThreshold ?? ORACLE_REFRESH_STUCK_THRESHOLD;
+  const removeLivenessToken =
+    internals.removeLivenessToken ?? (async (uid: number): Promise<void> => rm(gateLivenessTokenPath(uid), { force: true }));
   const warnedUids = new Set<number>();
   const warnedQuarantined = new Set<string>();
   const warnedDirtyUids = new Set<number>();
+  const warnedUnusableGenerationUids = new Set<number>();
   let warnedRegistryUnreadable = false;
-  let refreshInFlight = false;
-  let consecutiveSkips = 0;
-  const timer = setInterval(() => {
-    if (refreshInFlight) {
-      consecutiveSkips += 1;
-      if (consecutiveSkips % REFRESH_SKIP_WARN_THRESHOLD === 0) {
+  let activeRefresh: { id: number; timeout: ReturnType<typeof setTimeout> } | null = null;
+  const abandonedRefreshAttempts = new Set<number>();
+  let refreshAttemptId = 0;
+  let consecutiveRefreshMisses = 0;
+  let refreshStuck = false;
+  let knownRefreshUids = new Set<number>(
+    entries.filter((entry) => entry.tombstone !== true).map((entry) => entry.agent_uid),
+  );
+
+  const currentRefreshTimeoutMs = (): number =>
+    refreshBaseTimeoutMs + Math.max(0, knownRefreshUids.size - 1) * refreshPerUidTimeoutMs;
+  const rememberRefreshUids = (currentEntries: BootRegistryEntry[]): void => {
+    knownRefreshUids = new Set(
+      currentEntries.filter((entry) => entry.tombstone !== true).map((entry) => entry.agent_uid),
+    );
+  };
+  const invalidateKnownRefreshTokens = (condition: string): void => {
+    for (const uid of knownRefreshUids) {
+      void removeLivenessToken(uid).catch((err) => {
         input.print(
-          `[castle-wall] oracle refresh: previous refresh still running; ${consecutiveSkips} ` +
-            "consecutive tick(s) skipped (slow host or hung registry/pfctl probe); tokens may " +
-            "expire within the TTL and gates then deny (fail-closed)",
+          `[castle-wall] oracle refresh: token invalidation failed for uid ${uid} after ${condition}: ` +
+            `${(err as Error).message}; any prior token can survive only until its TTL (fail-closed)`,
         );
+      });
+    }
+  };
+  const recordRefreshMiss = (condition: string, timeoutMs: number = currentRefreshTimeoutMs()): void => {
+    consecutiveRefreshMisses += 1;
+    const reason =
+      `oracle refresh stuck: ${consecutiveRefreshMisses} consecutive timed-out/skipped tick(s); ` +
+      `latest condition: ${condition}; could not observe fresh registry/pf liveness inside ` +
+      `${timeoutMs} ms, so no freshness token is being minted (fail-closed)`;
+    if (consecutiveRefreshMisses >= refreshStuckThreshold) {
+      if (!refreshStuck) {
+        refreshStuck = true;
+        input.print(`[castle-wall] oracle refresh STUCK: ${reason}`);
       }
       return;
     }
-    refreshInFlight = true;
+    if (consecutiveRefreshMisses % ORACLE_REFRESH_SKIP_WARN_THRESHOLD === 0) {
+      input.print(
+        `[castle-wall] oracle refresh: ${condition}; ${consecutiveRefreshMisses} ` +
+          "consecutive refresh miss(es) (slow host, unreadable registry, or hung pfctl probe); " +
+          "tokens may expire within the TTL and gates then deny (fail-closed)",
+      );
+    }
+  };
+  const clearRefreshMisses = (): void => {
+    if (refreshStuck) {
+      input.print("[castle-wall] oracle refresh: stuck condition cleared; refresh completed within the timeout");
+    }
+    consecutiveRefreshMisses = 0;
+    refreshStuck = false;
+  };
+  const timer = setInterval(() => {
+    if (activeRefresh !== null) {
+      recordRefreshMiss("previous refresh still running; skipped this tick");
+      return;
+    }
+    if (abandonedRefreshAttempts.size >= maxAbandonedRefreshAttempts) {
+      recordRefreshMiss(
+        `${abandonedRefreshAttempts.size} abandoned refresh attempt(s) still pending; capped new attempts to avoid piling up hung probes`,
+      );
+      return;
+    }
+    const attemptId = ++refreshAttemptId;
+    const attemptTimeoutMs = currentRefreshTimeoutMs();
+    const timeout = setTimeout(() => {
+      if (activeRefresh?.id !== attemptId) return;
+      abandonedRefreshAttempts.add(attemptId);
+      activeRefresh = null;
+      invalidateKnownRefreshTokens(`refresh attempt ${attemptId} timed out`);
+      recordRefreshMiss(`refresh attempt timed out after ${attemptTimeoutMs} ms and was abandoned`, attemptTimeoutMs);
+    }, attemptTimeoutMs);
+    timeout.unref();
+    activeRefresh = { id: attemptId, timeout };
+    let attemptedObservation = false;
+    let completedObservation = false;
+    let missedCondition: string | null = null;
     void (async (): Promise<void> => {
       let current: BootRegistryListing;
       try {
         current = await listEntries();
       } catch (err) {
+        missedCondition = `registry unreadable (${(err as Error).message})`;
         if (!warnedRegistryUnreadable) {
           warnedRegistryUnreadable = true;
           input.print(
@@ -3801,6 +3908,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
         }
         return;
       }
+      rememberRefreshUids(current.entries);
       if (warnedRegistryUnreadable) {
         warnedRegistryUnreadable = false;
         input.print("[castle-wall] oracle refresh: registry readable again; refresh resumed");
@@ -3827,6 +3935,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
       // release barrier, which also refuses to release over a dirty
       // registry. Warn-once per uid; re-armed when the registry is clean.
       if (current.dirty) {
+        missedCondition = "registry dirty; withholding tokens until repair";
         for (const entry of current.entries) {
           if (!warnedDirtyUids.has(entry.agent_uid)) {
             warnedDirtyUids.add(entry.agent_uid);
@@ -3834,7 +3943,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
               `[castle-wall] oracle refresh: registry is DIRTY (needs repair), so the freshness token ` +
                 `for uid ${entry.agent_uid} is WITHHELD; its gate denies within one TTL (fail-closed: ` +
                 "per-uid liveness cannot rule out extra permissive rules on a dirty anchor); " +
-                "repair: sudo sanctuary protect --repair-egress-gate (warn-once until the registry is clean)",
+                `repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE} (warn-once until the registry is clean)`,
             );
           }
         }
@@ -3846,13 +3955,26 @@ export async function startExclusiveEgressBootSupervisor(input: {
       }
       for (const entry of current.entries) {
         if (entry.tombstone === true) continue;
+        attemptedObservation = true;
         const generationId = entry.generation_id;
-        if (typeof generationId !== "number" || !Number.isInteger(generationId) || generationId <= 0) continue;
+        if (typeof generationId !== "number" || !Number.isInteger(generationId) || generationId <= 0) {
+          missedCondition ??= `entry for uid ${entry.agent_uid} has no usable generation_id`;
+          if (!warnedUnusableGenerationUids.has(entry.agent_uid)) {
+            warnedUnusableGenerationUids.add(entry.agent_uid);
+            input.print(
+              `[castle-wall] oracle refresh: entry for uid ${entry.agent_uid} has no usable generation_id; ` +
+                `its gate denies within one TTL (fail-closed); repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE} ` +
+                "(warn-once)",
+            );
+          }
+          continue;
+        }
         let gateUid = gateUids.get(entry.agent_uid);
         if (gateUid === undefined) {
           try {
             const marker = await loadMarker(entry.fortress_path);
             if (marker === null || marker.agent_uid !== entry.agent_uid) {
+              missedCondition ??= `no exclusive-routing marker resolved a gate uid for uid ${entry.agent_uid}`;
               if (!warnedUids.has(entry.agent_uid)) {
                 warnedUids.add(entry.agent_uid);
                 input.print(
@@ -3864,6 +3986,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
             gateUid = marker.gate_uid;
             gateUids.set(entry.agent_uid, gateUid);
           } catch (err) {
+            missedCondition ??= `marker read failed for uid ${entry.agent_uid} (${(err as Error).message})`;
             if (!warnedUids.has(entry.agent_uid)) {
               warnedUids.add(entry.agent_uid);
               input.print(
@@ -3875,26 +3998,56 @@ export async function startExclusiveEgressBootSupervisor(input: {
         }
         try {
           const oracle = createOracle(keys.privateKey, gateUid);
-          await oracle.refresh({
-            agentUid: entry.agent_uid,
-            gatePort: entry.gate_port,
-            generationId,
-          });
+          await oracle.refresh(
+            {
+              agentUid: entry.agent_uid,
+              gatePort: entry.gate_port,
+              generationId,
+            },
+            { shouldPublish: () => (activeRefresh?.id === attemptId ? true : "skip") },
+          );
+          completedObservation = true;
         } catch (err) {
+          missedCondition ??= `oracle refresh failed for uid ${entry.agent_uid} (${(err as Error).message})`;
           input.print(
             `[castle-wall] oracle refresh failed for uid ${entry.agent_uid}: ${(err as Error).message} (gate denies until it recovers)`,
           );
         }
       }
-    })().finally(() => {
-      refreshInFlight = false;
-      consecutiveSkips = 0;
-    });
+    })()
+      .catch((err) => {
+        missedCondition = `unexpected refresh failure (${(err as Error).message})`;
+        input.print(
+          `[castle-wall] oracle refresh: unexpected refresh failure (${(err as Error).message}); ` +
+            "no freshness token was minted for that tick (fail-closed)",
+        );
+      })
+      .finally(() => {
+        if (abandonedRefreshAttempts.delete(attemptId)) return;
+        if (activeRefresh?.id !== attemptId) return;
+        clearTimeout(timeout);
+        activeRefresh = null;
+        if (missedCondition === null && (completedObservation || !attemptedObservation)) {
+          clearRefreshMisses();
+          return;
+        }
+        recordRefreshMiss(
+          missedCondition ?? "refresh completed without any usable liveness observation",
+          attemptTimeoutMs,
+        );
+      });
   }, interval);
   timer.unref();
   return {
     results,
-    stopOracleLoop: (): void => clearInterval(timer),
+    stopOracleLoop: (): void => {
+      clearInterval(timer);
+      if (activeRefresh !== null) {
+        clearTimeout(activeRefresh.timeout);
+        activeRefresh = null;
+      }
+      abandonedRefreshAttempts.clear();
+    },
   };
 }
 
