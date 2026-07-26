@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.7.1] - 2026-07-26
+
+Patch release for the four-leg drill D1/D2/D3 findings. No new capability.
+
+### Fixed
+
+- **Exclusive-egress oracle refresh no longer wedges permanently.** The root supervisor now bounds a hung refresh attempt, abandons it so later ticks can retry, and guards the oracle write path so a late abandoned attempt invalidates instead of minting a live token. Repeated timeouts/skips escalate once per stuck transition and surface per uid through the exclusive-egress posture.
+- **Harness park verification waits for launchd to settle.** Repair/unprotect park verification reuses the shared stopped-settle loop and refuses fail-closed with the waited millisecond window if the harness remains running. The new `--stand-down-agent` flag explicitly discloses the stop/disable behavior on repair and unprotect.
+- **Castle Wall daemon collision messages show a real pid when available.** The already-running message interpolates the active-config pid, or says `pid unavailable` when the socket-only guard has no pid, and no longer emits the literal `<pid>` placeholder.
+
 ## [1.6.1] - 2026-07-01
 
 Patch release: the install path works again, and the first-run experience tells the truth. No new capability.

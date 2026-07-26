@@ -308,6 +308,12 @@ export interface WrapOptions {
    */
   repairEgressGate?: boolean;
   /**
+   * Operator disclosure for the S5-6/S5-7 repair and unprotect verbs: the
+   * sequence will stop/disable the agent harness and verify launchd settled it
+   * stopped before continuing. This is explicit because it stops the agent.
+   */
+  standDownAgent?: boolean;
+  /**
    * Explicit, interactive-only override for the repair drift guard (design
    * MED-7). TTY-only: refused on a non-interactive stdin. Audited
    * (`egress_gate_repair_override`) before any pf mutation.
@@ -2326,6 +2332,7 @@ export async function runWrap(
     const code = await runEgressGateRepairForCli({
       isTty: process.stdin.isTTY === true,
       overrideTransientPfRules: options.overrideTransientPfRules === true,
+      standDownAgent: options.standDownAgent === true,
       cliBinary: resolveAutoProvisionCliBinary(options),
     });
     process.exit(code);
@@ -2338,6 +2345,7 @@ export async function runWrap(
   if (options.unprotectEgressGate === true) {
     const { runEgressGateUnprotectForCli } = await import("./auto-provision.js");
     const code = await runEgressGateUnprotectForCli({
+      standDownAgent: options.standDownAgent === true,
       cliBinary: resolveAutoProvisionCliBinary(options),
     });
     process.exit(code);
@@ -5020,6 +5028,7 @@ const WRAP_BOOLEAN_FLAGS = new Set([
   "--exclusive-egress",
   "--repair-egress-gate",
   "--unprotect-egress-gate",
+  "--stand-down-agent",
   "--override-transient-pf-rules",
   "--help",
   "-h",
@@ -5136,6 +5145,9 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
       case "--unprotect-egress-gate":
         options.unprotectEgressGate = true;
         break;
+      case "--stand-down-agent":
+        options.standDownAgent = true;
+        break;
       case "--override-transient-pf-rules":
         options.overrideTransientPfRules = true;
         break;
@@ -5220,6 +5232,11 @@ function printWrapHelp(): void {
                        version doesn't have new subcommands yet, and
                        npx pulls from the registry, not your checkout.
                        Pass the absolute path to dist/cli.js.
+    --stand-down-agent
+                       With --repair-egress-gate or --unprotect-egress-gate,
+                       explicitly stop and disable the agent harness first,
+                       wait for launchd to settle it stopped, then proceed.
+                       This stops the agent.
     --help, -h         Show this help
 
   What happens:

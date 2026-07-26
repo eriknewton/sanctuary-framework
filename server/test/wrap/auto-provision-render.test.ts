@@ -10,7 +10,11 @@
 
 import { describe, it, expect } from "vitest";
 import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
-import { describeNoAccountResidueTeardown, type AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
+import {
+  describeNoAccountResidueTeardown,
+  describeStandDownAgentForCli,
+  type AutoProvisionSummary,
+} from "../../src/wrap/auto-provision.js";
 import {
   assessHarnessParked,
   startedCoarseDisposition,
@@ -313,6 +317,15 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/restore of your re-homed files FAILED/);
     expect(out[0]).toContain("/var/root/x.bak");
     expect(out[0]).toContain("/Users/op/.hermes/.env.restored-conflict");
+  });
+});
+
+describe("describeStandDownAgentForCli", () => {
+  it("plainly says the explicit repair flag stops the agent", () => {
+    const line = describeStandDownAgentForCli("--repair-egress-gate");
+    expect(line).toContain("--repair-egress-gate --stand-down-agent");
+    expect(line).toContain("stopping and disabling the agent harness");
+    expect(line).toContain("This stops the agent.");
   });
 });
 

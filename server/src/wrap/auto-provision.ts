@@ -3010,6 +3010,29 @@ export function describeRepairCoarseComposition(
   }
 }
 
+export function describeStandDownAgentForCli(
+  verb: "--repair-egress-gate" | "--unprotect-egress-gate",
+): string {
+  return (
+    `${verb} --stand-down-agent: stopping and disabling the agent harness, then waiting for ` +
+    "launchd to settle it stopped before continuing. This stops the agent."
+  );
+}
+
+function withExplicitStandDownAgent<T extends { parkHarness(): Promise<void> }>(
+  ops: T,
+  print: (line: string) => void,
+  verb: "--repair-egress-gate" | "--unprotect-egress-gate",
+): T {
+  return {
+    ...ops,
+    parkHarness: async (): Promise<void> => {
+      print(describeStandDownAgentForCli(verb));
+      await ops.parkHarness();
+    },
+  };
+}
+
 /**
  * S5-7 fix-round-3: run the repair sequence under the exclusive provision lock
  * (the SAME `PROVISION_LOCK_PATH` single source the arm/unprotect CLI runners
@@ -3068,6 +3091,7 @@ export async function runEgressGateRepairUnderProvisionLock(
 export async function runEgressGateRepairForCli(options: {
   isTty: boolean;
   overrideTransientPfRules: boolean;
+  standDownAgent?: boolean;
   print?: (line: string) => void;
   cliBinary?: string;
   getuid?: () => number;
@@ -3145,7 +3169,9 @@ export async function runEgressGateRepairForCli(options: {
     () =>
       runEgressGateRepair(
         { agentUid, isTty: options.isTty, overrideTransientPfRules: options.overrideTransientPfRules },
-        createRepairExclusiveEgressOps(wiring),
+        options.standDownAgent === true
+          ? withExplicitStandDownAgent(createRepairExclusiveEgressOps(wiring), print, "--repair-egress-gate")
+          : createRepairExclusiveEgressOps(wiring),
       ),
     print,
   );
@@ -3282,6 +3308,7 @@ export function describeNoAccountResidueTeardown(
 export async function runEgressGateUnprotectForCli(options: {
   print?: (line: string) => void;
   cliBinary?: string;
+  standDownAgent?: boolean;
   getuid?: () => number;
   resolveOperatorIdentity?: () => Promise<OperatorIdentity | undefined>;
 }): Promise<number> {
@@ -3386,7 +3413,9 @@ export async function runEgressGateUnprotectForCli(options: {
   });
   const outcome = await runEgressGateUnprotect(
     { agentUid },
-    createUnprotectExclusiveEgressOps(wiring),
+    options.standDownAgent === true
+      ? withExplicitStandDownAgent(createUnprotectExclusiveEgressOps(wiring), print, "--unprotect-egress-gate")
+      : createUnprotectExclusiveEgressOps(wiring),
   );
   switch (outcome.kind) {
     case "unprotected":

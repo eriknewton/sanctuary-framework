@@ -100,6 +100,14 @@ export interface GateProcessStatus {
   reasons: string[];
 }
 
+export interface OracleRefreshPostureStatus {
+  stuck: true;
+  reason: string;
+  consecutive_misses: number;
+  timeout_ms: number;
+  last_transition_at_ms: number;
+}
+
 /**
  * The registry entry surface the posture reads (the S5-1 `PfAnchorRegistryEntry`
  * projection the generation machine already consumes - `generation_id` and
@@ -146,6 +154,12 @@ export interface ExclusiveEgressPostureInput {
    * absent/expired/forged/mismatched tokens by construction.
    */
   pf_liveness: PfLivenessResult;
+  /**
+   * Root-supervisor refresh-loop health. Distinct from `pf_liveness`: this
+   * reports "could not observe/renew" when a hung refresh loop is withholding
+   * new tokens, not an observed pf denial for this uid.
+   */
+  oracle_refresh?: OracleRefreshPostureStatus | null;
   /** The gate-process probe result (up + port-owner-verified). */
   gate_process: GateProcessStatus;
 }
@@ -170,6 +184,8 @@ export interface ExclusiveEgressPosture {
   manifest_gate_rule_generation: number | null;
   /** The full pf-liveness reasons vector (never collapsed to a boolean). */
   pf_liveness: { live: boolean; reasons: string[] };
+  /** Root-supervisor refresh-loop health for this uid, when degraded. */
+  oracle_refresh: OracleRefreshPostureStatus | null;
   /** Gate process up + port-owner-verified. */
   gate_process: GateProcessStatus;
   /** The S5-2 three-surface generation-match verdict (serve/refuse + reasons). */
@@ -252,6 +268,9 @@ export function buildExclusiveEgressPosture(
       reasons.push(...pfReasons.map((r) => `pf: ${r}`));
     }
   }
+  if (input.oracle_refresh?.stuck === true) {
+    reasons.push(`oracle: ${input.oracle_refresh.reason}`);
+  }
   if (!input.gate_process.up) {
     reasons.push("gate: process not up");
   }
@@ -265,6 +284,7 @@ export function buildExclusiveEgressPosture(
   const live =
     generationMatch.serve &&
     input.pf_liveness.live === true &&
+    input.oracle_refresh?.stuck !== true &&
     input.gate_process.up &&
     input.gate_process.port_owner_verified;
 
@@ -295,6 +315,7 @@ export function buildExclusiveEgressPosture(
       live: input.pf_liveness.live === true,
       reasons: [...input.pf_liveness.reasons],
     },
+    oracle_refresh: input.oracle_refresh ?? null,
     gate_process: {
       up: input.gate_process.up,
       port_owner_verified: input.gate_process.port_owner_verified,

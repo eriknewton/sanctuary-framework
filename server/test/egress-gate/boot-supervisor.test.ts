@@ -22,6 +22,8 @@ import { assessHarnessParked } from "../../src/egress-gate/parked-claim.js";
 import { generateKeyPairSync } from "node:crypto";
 
 import {
+  clearExclusiveEgressOracleRefreshStatus,
+  getExclusiveEgressOracleRefreshStatus,
   NON_HERMES_BOOT_PARK_REASON,
   startExclusiveEgressBootSupervisor,
   type BootAgentResolution,
@@ -707,6 +709,44 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
     // One boot read + exactly ONE in-flight refresh read: every overlapping
     // tick was skipped instead of piling a concurrent read on the slow host.
     expect(listCalls).toBe(2);
+  });
+
+  it("a hung refresh is timed out, surfaced as stuck, and the next tick can start", async () => {
+    clearExclusiveEgressOracleRefreshStatus();
+    let listCalls = 0;
+    const releases: Array<() => void> = [];
+    const printed: string[] = [];
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 5,
+      internals: baseInternals({
+        oracleRefreshTimeoutMs: 20,
+        oracleRefreshStuckThreshold: 1,
+        listRegistryEntries: async () => {
+          listCalls += 1;
+          if (listCalls > 1) {
+            await new Promise<void>((resolve) => {
+              releases.push(resolve);
+            });
+          }
+          return { entries: [ENTRY], quarantined: [], dirty: false };
+        },
+      }),
+    });
+    const deadline = Date.now() + 2_000;
+    while (listCalls < 3 && Date.now() < deadline) {
+      await sleep(5);
+    }
+    const stuck = getExclusiveEgressOracleRefreshStatus(ENTRY.agent_uid);
+    handle.stopOracleLoop();
+    for (const release of releases) release();
+    expect(listCalls).toBeGreaterThanOrEqual(3);
+    expect(printed.join("\n")).toContain("oracle refresh STUCK");
+    expect(stuck?.reason).toContain("could not observe fresh registry/pf liveness");
+    expect(stuck?.consecutive_misses).toBeGreaterThanOrEqual(1);
+    clearExclusiveEgressOracleRefreshStatus();
   });
 });
 

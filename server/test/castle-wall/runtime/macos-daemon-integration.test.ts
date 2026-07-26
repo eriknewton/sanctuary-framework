@@ -13,7 +13,7 @@ import { generateRandomKey } from "../../../src/core/random.js";
 import { toBase64url } from "../../../src/core/encoding.js";
 import { runProvisionPin } from "../../../src/cli/castle-wall.js";
 import {
-  CASTLE_WALL_ALREADY_RUNNING_MESSAGE,
+  formatCastleWallAlreadyRunningMessage,
   safeModeHandoffMessage,
   startMacOSCastleWallDaemon,
   type MacOSCastleWallListenerOptions,
@@ -35,6 +35,13 @@ describe("Castle Wall macOS daemon integration", () => {
   const tempDirs: string[] = [];
   const liveSockets: Socket[] = [];
   const liveServers: ReturnType<typeof createServer>[] = [];
+
+  it("formats the already-running message with a concrete pid, never the placeholder", () => {
+    const message = formatCastleWallAlreadyRunningMessage(4242);
+    expect(message).toContain("PID 4242");
+    expect(message).not.toContain("<pid>");
+    expect(formatCastleWallAlreadyRunningMessage()).toContain("PID pid unavailable");
+  });
 
   // Stand up a REAL listener on `socketPath` so the daemon's liveness probe
   // (socketHasLiveListener) sees a genuine live peer — used to exercise the
@@ -1142,8 +1149,9 @@ describe("Castle Wall macOS daemon integration", () => {
       listenerFactory: fakeListenerFactory,
     });
 
-    await expect(
-      startMacOSCastleWallDaemon({
+    let caught: Error | undefined;
+    try {
+      await startMacOSCastleWallDaemon({
         fortressPath,
         fortressId: "fortress-test",
         masterKey,
@@ -1151,8 +1159,13 @@ describe("Castle Wall macOS daemon integration", () => {
         auditLog,
         platform: "darwin",
         activeConfigPath: configPath,
-      }),
-    ).rejects.toThrow(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+      });
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeDefined();
+    expect(caught!.message).toContain("Castle Wall daemon already running");
+    expect(caught!.message).not.toContain("<pid>");
 
     await first.stop();
   });
@@ -1244,7 +1257,7 @@ describe("Castle Wall macOS daemon integration", () => {
         activeConfigPath: configPath,
         listenerFactory: fakeListenerFactory,
       }),
-    ).rejects.toThrow(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+    ).rejects.toThrow(formatCastleWallAlreadyRunningMessage(process.pid));
   });
 
   it("IGNORES a stale active-config whose recorded socket has NO live listener — reboot pid-reuse safe (#450 A1 rep-2 fix)", async () => {
@@ -1332,7 +1345,7 @@ describe("Castle Wall macOS daemon integration", () => {
           activeConfigPath: configPath,
           listenerFactory: fakeListenerFactory,
         }),
-      ).rejects.toThrow(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+      ).rejects.toThrow(formatCastleWallAlreadyRunningMessage());
     } finally {
       await new Promise<void>((resolve) => liveServer.close(() => resolve()));
     }
