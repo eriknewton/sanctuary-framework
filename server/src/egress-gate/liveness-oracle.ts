@@ -230,7 +230,10 @@ export class GateLivenessOracle {
       // attempt timed out and was abandoned). Do not turn it into a fresh live
       // token later. Most callers invalidate here; the supervisor's timeout
       // branch invalidates when the attempt is abandoned, so its later
-      // completion uses "skip" to avoid stripping a newer token.
+      // completion uses "skip" to avoid stripping a newer token. Supervisor
+      // shutdown can also reach "skip" after `activeRefresh` is cleared; that
+      // case suppresses publish during process exit and any existing token
+      // expires within its short TTL.
       if (publishDecision !== "skip") {
         await this.ops.removeToken(agentUid);
       }

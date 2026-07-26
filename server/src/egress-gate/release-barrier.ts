@@ -93,6 +93,7 @@ import {
   type ParkedClaimProbeOps,
   type RunStateAdvice,
 } from "./parked-claim.js";
+import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE } from "./operator-advice.js";
 
 /** Root-owned parent directory for hold files + the exec wrapper (0755 root). */
 export const AGENT_HARNESS_HOLD_DIR = "/var/db/sanctuary/agent-harness";
@@ -780,7 +781,7 @@ export async function executeParkedHarnessInstall(
         "the agent harness is ALREADY running under a committed exclusive-egress generation (its plist " +
           "routes through the release wrapper and launchd reports it running). Refusing to stop a live " +
           "confined agent to re-run an install it does not need. To re-verify or repair the gate, run " +
-          "'sudo sanctuary protect --repair-egress-gate'; to take it down, run 'sudo sanctuary unprotect'.",
+          `'${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}'; to take it down, run 'sudo sanctuary unprotect'.`,
       );
     }
   }

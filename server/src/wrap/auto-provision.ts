@@ -118,6 +118,13 @@ import {
   type ExclusiveRoutingResidueTeardown,
 } from "../egress-gate/arming-wiring.js";
 import { deriveGateAccountName } from "../egress-gate/gate-account.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
+} from "../egress-gate/operator-advice.js";
 // FIX G2: the no-account teardown's refusal states the exit at the FILE level,
 // so it names the two real surfaces that carry per-uid confinement.
 import { EGRESS_GATE_DAEMON_LABEL_PREFIX } from "../egress-gate/gate-daemon.js";
@@ -3005,7 +3012,7 @@ export function describeRepairCoarseComposition(
         " WARNING: this run left the fortress in EXCLUSIVE routing composition and could NOT restore " +
         `coarse (${restoreError ?? "no detail"}). While it stays that way, a plain ` +
         "'sudo sanctuary protect --hermes' will be REFUSED by the composition invariant, and a confined " +
-        "agent may be reaching nothing. Clear it with: sudo sanctuary protect --unprotect-egress-gate"
+        `agent may be reaching nothing. Clear it with: ${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}`
       );
   }
 }
@@ -3013,8 +3020,12 @@ export function describeRepairCoarseComposition(
 export function describeStandDownAgentForCli(
   verb: "--repair-egress-gate" | "--unprotect-egress-gate",
 ): string {
+  const command =
+    verb === "--repair-egress-gate"
+      ? EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND
+      : EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND;
   return (
-    `${verb} --stand-down-agent: acknowledged operator opt-in to stop and disable the agent ` +
+    `${command}: acknowledged operator opt-in to stop and disable the agent ` +
     "harness, then wait for launchd to settle it stopped before continuing."
   );
 }
@@ -3025,9 +3036,13 @@ export function ensureStandDownAgentAcknowledgedForCli(
   verb: "--repair-egress-gate" | "--unprotect-egress-gate",
 ): boolean {
   if (standDownAgent === true) return true;
+  const command =
+    verb === "--repair-egress-gate"
+      ? EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND
+      : EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND;
   print(
-    `${verb} stops and disables the agent harness before changing exclusive-egress state. ` +
-      `This is not the silent default: re-run with ${verb} --stand-down-agent to acknowledge the stop and proceed.`,
+    `${verb} ${EGRESS_GATE_STAND_DOWN_EFFECT} before changing exclusive-egress state. ` +
+      `This is not the silent default: re-run with ${command} to acknowledge the stop and proceed.`,
   );
   return false;
 }
@@ -3114,16 +3129,18 @@ export async function runEgressGateRepairForCli(options: {
   // this is only the default when no `print` override is supplied (the CLI
   // caller always supplies one). Never used to print secrets or key material.
   const print = options.print ?? ((line: string) => console.error(`  ${line}`));
+  if (!ensureStandDownAgentAcknowledgedForCli(options.standDownAgent, print, "--repair-egress-gate")) {
+    return 2;
+  }
   if (osPlatform() !== "darwin") {
     print("--repair-egress-gate is macOS-only (the pf/launchd exclusive-egress stack).");
     return 2;
   }
   const getuid = options.getuid ?? process.getuid?.bind(process);
   if (getuid?.() !== 0) {
-    print("Repairing the exclusive-egress gate requires root. Re-run: sudo sanctuary protect --repair-egress-gate");
-    return 2;
-  }
-  if (!ensureStandDownAgentAcknowledgedForCli(options.standDownAgent, print, "--repair-egress-gate")) {
+    print(
+      `Repairing the exclusive-egress gate requires root. Re-run: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
+    );
     return 2;
   }
   const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
@@ -3148,7 +3165,7 @@ export async function runEgressGateRepairForCli(options: {
     print(
       `No dedicated agent account "${accountName}" exists; nothing to repair. ` +
         "If this fortress still carries leftover exclusive-egress state from an interrupted arm, " +
-        "clear it with: sudo sanctuary protect --unprotect-egress-gate. " +
+        `clear it with: ${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}. ` +
         "Otherwise provision first: sudo sanctuary protect --hermes --exclusive-egress",
     );
     return 2;
@@ -3287,7 +3304,7 @@ export function describeNoAccountResidueTeardown(
           "registry entry, pf anchor, gate daemon), or remove the confinement for that uid " +
           `directly: the S5-1 anchor registry at ${PF_ANCHOR_REGISTRY_PATH} and the gate daemon ` +
           `plist at /Library/LaunchDaemons/${EGRESS_GATE_DAEMON_LABEL_PREFIX}.<uid>.plist both name ` +
-          "the uid, and 'sudo sanctuary protect --repair-egress-gate' recovers an interrupted arm " +
+          `the uid, and '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}' recovers an interrupted arm ` +
           "once an account exists.",
       };
     case "partial":
@@ -3330,6 +3347,9 @@ export async function runEgressGateUnprotectForCli(options: {
   // this is only the default when no `print` override is supplied (the CLI
   // caller always supplies one). Never used to print secrets or key material.
   const print = options.print ?? ((line: string) => console.error(`  ${line}`));
+  if (!ensureStandDownAgentAcknowledgedForCli(options.standDownAgent, print, "--unprotect-egress-gate")) {
+    return 2;
+  }
   if (osPlatform() !== "darwin") {
     print("--unprotect-egress-gate is macOS-only (the pf/launchd exclusive-egress stack).");
     return 2;
@@ -3337,11 +3357,8 @@ export async function runEgressGateUnprotectForCli(options: {
   const getuid = options.getuid ?? process.getuid?.bind(process);
   if (getuid?.() !== 0) {
     print(
-      "Removing the exclusive-egress gate requires root. Re-run: sudo sanctuary protect --unprotect-egress-gate",
+      `Removing the exclusive-egress gate requires root. Re-run: ${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}`,
     );
-    return 2;
-  }
-  if (!ensureStandDownAgentAcknowledgedForCli(options.standDownAgent, print, "--unprotect-egress-gate")) {
     return 2;
   }
   const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
@@ -3452,7 +3469,7 @@ export async function runEgressGateUnprotectForCli(options: {
       if (outcome.registryDirty) {
         print(
           "NOTE: the registry still carries a repair-owed marker (posture stays non-green). " +
-            "Run: sudo sanctuary protect --repair-egress-gate",
+            `Run: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
         );
         return 2;
       }

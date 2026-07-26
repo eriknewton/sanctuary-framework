@@ -88,6 +88,7 @@ import {
 import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
 import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
 import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
+import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE } from "../egress-gate/operator-advice.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -2068,7 +2069,7 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
         `  WARNING: the exclusive-egress gate is LIVE (uid ${outcome.uid}, generation ${outcome.generationId}) and the ` +
           `agent's only sanctioned egress path is the gate, but the persistent boot state could NOT be re-parked ` +
           `(${outcome.reparkError}). ` +
-          `The NEXT boot could start the agent before the gate re-arms. Run 'sudo sanctuary protect --repair-egress-gate' now.`,
+          `The NEXT boot could start the agent before the gate re-arms. Run '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}' now.`,
       ];
     case "exclusive-egress-unarmed-coarse-active": {
       // S5-6 degrade-loud: DISTINCT non-green state; every posture surface
@@ -2091,7 +2092,7 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
         `  WARNING: fine-grained exclusive egress could NOT come live at "${outcome.stage}" (${outcome.reason}). ` +
           `The coarse Castle Wall remains armed over the agent -- this is a DISTINCT NON-GREEN (coarse-only) state ` +
           `on every posture surface, not full protection. ${manifestState} ${agentState}${cleanupNote} ` +
-          `Fix with: sudo sanctuary protect --repair-egress-gate`,
+          `Fix with: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       ];
     }
     case "aborted":

@@ -2356,7 +2356,7 @@ describe("reloadPeerResolverDaemonForBringUp (fix-round-2 BLOCKER + fix-round-3 
 // in `productionBringUp` must force-replace the running gate the SAME way the
 // peer-resolver reload does. The pre-fix gate block used a raw
 // `bootstrap + kickstart(no -k)` that no-ops on an already-running daemon, so a
-// `sudo sanctuary protect --repair-egress-gate` rotated the pf anchor + port
+// `sudo sanctuary protect --repair-egress-gate --stand-down-agent` rotated the pf anchor + port
 // but never restarted the gate -> pf confined the agent to a port nothing
 // served -> the agent was strangled (fail-CLOSED, not a wrong-allow). The fix
 // routes the gate through the SHARED `reloadLaunchdDaemonForBringUp` chokepoint

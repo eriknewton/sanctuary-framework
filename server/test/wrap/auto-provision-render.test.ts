@@ -8,12 +8,14 @@
  * decision is driven directly here.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
 import {
   describeNoAccountResidueTeardown,
   describeStandDownAgentForCli,
   ensureStandDownAgentAcknowledgedForCli,
+  runEgressGateRepairForCli,
+  runEgressGateUnprotectForCli,
   type AutoProvisionSummary,
 } from "../../src/wrap/auto-provision.js";
 import {
@@ -350,6 +352,46 @@ describe("describeStandDownAgentForCli", () => {
     );
     expect(ok).toBe(true);
     expect(printed).toEqual([]);
+  });
+
+  it("runEgressGateRepairForCli refuses missing stand-down acknowledgement before platform/root/identity gates", async () => {
+    const printed: string[] = [];
+    const resolveOperatorIdentity = vi.fn(async () => {
+      throw new Error("identity should not be reached");
+    });
+
+    const code = await runEgressGateRepairForCli({
+      isTty: false,
+      overrideTransientPfRules: false,
+      print: (line) => printed.push(line),
+      getuid: () => 0,
+      resolveOperatorIdentity,
+    });
+
+    expect(code).toBe(2);
+    expect(printed.join("\n")).toContain("--repair-egress-gate stops and disables the agent harness");
+    expect(printed.join("\n")).toContain("sudo sanctuary protect --repair-egress-gate --stand-down-agent");
+    expect(printed.join("\n")).not.toContain("macOS-only");
+    expect(resolveOperatorIdentity).not.toHaveBeenCalled();
+  });
+
+  it("runEgressGateUnprotectForCli refuses missing stand-down acknowledgement before platform/root/identity gates", async () => {
+    const printed: string[] = [];
+    const resolveOperatorIdentity = vi.fn(async () => {
+      throw new Error("identity should not be reached");
+    });
+
+    const code = await runEgressGateUnprotectForCli({
+      print: (line) => printed.push(line),
+      getuid: () => 0,
+      resolveOperatorIdentity,
+    });
+
+    expect(code).toBe(2);
+    expect(printed.join("\n")).toContain("--unprotect-egress-gate stops and disables the agent harness");
+    expect(printed.join("\n")).toContain("sudo sanctuary protect --unprotect-egress-gate --stand-down-agent");
+    expect(printed.join("\n")).not.toContain("macOS-only");
+    expect(resolveOperatorIdentity).not.toHaveBeenCalled();
   });
 });
 

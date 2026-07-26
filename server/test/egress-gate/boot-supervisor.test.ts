@@ -710,7 +710,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
     expect(listCalls).toBe(2);
   });
 
-  it("a hung refresh is timed out, surfaced as stuck, and the next tick can start", async () => {
+  it("a timed-out refresh is surfaced as stuck at the production cap, then a later-resolved attempt lets the next tick start", async () => {
     let listCalls = 0;
     const releases: Array<() => void> = [];
     const printed: string[] = [];
@@ -722,7 +722,6 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
       internals: baseInternals({
         oracleRefreshTimeoutMs: 20,
         oracleRefreshStuckThreshold: 1,
-        oracleRefreshMaxAbandonedAttempts: 10,
         listRegistryEntries: async () => {
           listCalls += 1;
           if (listCalls > 1) {
@@ -734,14 +733,24 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
         },
       }),
     });
-    const deadline = Date.now() + 2_000;
-    while (listCalls < 3 && Date.now() < deadline) {
+    const stuckDeadline = Date.now() + 2_000;
+    while (!printed.some((line) => line.includes("refresh attempt timed out after 20 ms")) && Date.now() < stuckDeadline) {
+      await sleep(5);
+    }
+    expect(printed.join("\n")).toContain("oracle refresh STUCK");
+    expect(printed.join("\n")).toContain("refresh attempt timed out after 20 ms");
+    await sleep(120);
+    // Production cap is 1: a still-pending abandoned attempt caps new refreshes.
+    // One boot read + one abandoned refresh read; no third read starts yet.
+    expect(listCalls).toBe(2);
+    for (const release of [...releases]) release();
+    const retryDeadline = Date.now() + 2_000;
+    while (listCalls < 3 && Date.now() < retryDeadline) {
       await sleep(5);
     }
     handle.stopOracleLoop();
     for (const release of releases) release();
     expect(listCalls).toBeGreaterThanOrEqual(3);
-    expect(printed.join("\n")).toContain("oracle refresh STUCK");
     expect(printed.join("\n")).toContain("could not observe fresh registry/pf liveness");
   });
 
@@ -839,6 +848,40 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
     handle.stopOracleLoop();
     expect(printed.join("\n")).toContain("oracle refresh STUCK");
     expect(printed.join("\n")).toContain("registry unreadable");
+  });
+
+  it("a legacy entry with no generation_id counts as an attempted observation and escalates instead of clearing misses", async () => {
+    const legacyEntry: BootRegistryEntry = {
+      agent_uid: ENTRY.agent_uid,
+      gate_port: ENTRY.gate_port,
+      fortress_path: ENTRY.fortress_path,
+    };
+    const printed: string[] = [];
+    let refreshCalls = 0;
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 5,
+      internals: baseInternals({
+        oracleRefreshStuckThreshold: 2,
+        listRegistryEntries: async () => ({ entries: [legacyEntry], quarantined: [], dirty: false }),
+        createOracle: (() => ({
+          refresh: async () => {
+            refreshCalls += 1;
+            return null;
+          },
+        })) as never,
+      }),
+    });
+    const deadline = Date.now() + 2_000;
+    while (!printed.some((line) => line.includes("oracle refresh STUCK")) && Date.now() < deadline) {
+      await sleep(5);
+    }
+    handle.stopOracleLoop();
+    expect(refreshCalls).toBe(0);
+    expect(printed.join("\n")).toContain("entry for uid 502 has no usable generation_id");
+    expect(printed.join("\n")).toContain("oracle refresh STUCK");
   });
 
   it("per-uid oracle refresh throws escalate as stuck instead of resetting the miss counter", async () => {

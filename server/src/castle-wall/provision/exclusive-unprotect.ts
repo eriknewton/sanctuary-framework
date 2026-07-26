@@ -95,6 +95,7 @@
  */
 
 import { ProvisionLockHeldError } from "./lockfile.js";
+import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE } from "../../egress-gate/operator-advice.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EGRESS_GATE_UNPROTECT_AUDIT_OP = "egress_gate_unprotected";
@@ -441,7 +442,7 @@ async function runUnprotectSequenceLocked(
   if (removal.dirty) {
     ops.print(
       "[castle-wall] unprotect: the registry still carries a repair-owed marker (posture stays " +
-        "non-green). Run: sudo sanctuary protect --repair-egress-gate",
+        `non-green). Run: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
     );
   }
   return {

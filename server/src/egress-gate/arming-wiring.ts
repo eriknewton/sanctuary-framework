@@ -6,7 +6,7 @@
  *   1. INSTALL (`sudo sanctuary protect --hermes --exclusive-egress`, via
  *      `wrap/auto-provision.ts` -> `runProvisionFlow`'s exclusive stage):
  *      {@link createInstallExclusiveEgressOps}.
- *   2. REPAIR (`sudo sanctuary protect --repair-egress-gate`):
+ *   2. REPAIR (`sudo sanctuary protect --repair-egress-gate --stand-down-agent`):
  *      {@link createRepairExclusiveEgressOps} (+ the MED-7 drift guard).
  *   3. BOOT (the root Castle Wall policy daemon):
  *      {@link startExclusiveEgressBootSupervisor} -- re-arm -> gate-verify ->
@@ -133,6 +133,7 @@ import {
   failedExclusiveEgressStatus,
   type ExclusiveEgressStatus,
 } from "./posture.js";
+import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE } from "./operator-advice.js";
 import { verifyLivenessToken } from "./liveness-oracle.js";
 import {
   exclusiveRoutingMarkerPath,
@@ -174,6 +175,8 @@ const GATE_ACCOUNT_HOME_BASE_RESOLVED = "/private/var/sanctuary-agents";
 const ORACLE_REFRESH_SKIP_WARN_THRESHOLD = 3;
 const ORACLE_REFRESH_STUCK_THRESHOLD = 6;
 const ORACLE_REFRESH_DEFAULT_TIMEOUT_MS = 10_000;
+// HONEST BOUND: per-uid scaling is a conservative estimate against the prior
+// ~350 ms/uid review measurement; it is a tuning guard, not drilled evidence.
 const ORACLE_REFRESH_PER_UID_TIMEOUT_MS = 500;
 const ORACLE_REFRESH_MAX_ABANDONED_ATTEMPTS = 1;
 
@@ -1482,7 +1485,7 @@ export function createProductionReleaseBarrierOps(input: {
       print(
         `[castle-wall] release barrier (uid ${input.agentUid}, ${context}): registry entry #${q.index} ` +
           `is malformed and QUARANTINED (${q.reason}); uid ${input.agentUid}'s valid entry proceeds ` +
-          "through the barrier's own fail-closed checks; repair is owed: sudo sanctuary protect --repair-egress-gate",
+          `through the barrier's own fail-closed checks; repair is owed: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       );
     }
     return listed;
@@ -1631,7 +1634,7 @@ export function createProductionReleaseBarrierOps(input: {
               `uid ${input.agentUid}'s pf anchor rules are not live (${live.reasons.join("; ")}) and a ` +
               `quarantined registry entry (#${listed.quarantined.map((q) => q.index).join(", #")}) blocks a ` +
               "safe union re-arm (a partial re-render could drop the quarantined uid's block rules); " +
-              "repair: sudo sanctuary protect --repair-egress-gate",
+              `repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
           };
         }
         // Re-assert the committed union (idempotent add/update re-renders +
@@ -3424,7 +3427,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
     input.print(
       `[castle-wall] boot: exclusive-egress registry unreadable (${(err as Error).message}); ` +
         "NO boot release or re-park ran; confined agents remain in their persisted parked state, " +
-        "which was NOT re-verified this boot. Repair: sudo sanctuary protect --repair-egress-gate",
+        `which was NOT re-verified this boot. Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
     );
     return { results: [], stopOracleLoop: () => undefined };
   }
@@ -3433,7 +3436,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
     input.print(
       `[castle-wall] boot: registry entry #${q.index} is malformed and QUARANTINED (${q.reason}); ` +
         "its agent gets no boot release and its gate denies (fail-closed); repair is owed. " +
-        "Other agents proceed. Repair: sudo sanctuary protect --repair-egress-gate",
+        `Other agents proceed. Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
     );
   }
   // NOTE (fix 2026-07-23): do NOT early-return on an empty registry. The
@@ -3489,7 +3492,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
     for (const entry of entries) {
       input.print(
         `[castle-wall] boot: uid ${entry.agent_uid} ${reason}; treat the agent as possibly ` +
-          "startable and intervene manually. Repair: sudo sanctuary protect --repair-egress-gate",
+          `startable and intervene manually. Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       );
       await input.audit("exclusive_egress_boot_release", {
         agent_uid: entry.agent_uid,
@@ -3512,7 +3515,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
           "the exclusive-egress liveness refresh loop did NOT start. The registry is empty now, so no " +
           "confined agent exists yet, but any agent armed after this boot will NOT get its liveness token refreshed " +
           "and its gate will deny ALL egress within one token TTL. " +
-          "Repair: sudo sanctuary protect --repair-egress-gate",
+          `Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       );
       await input.audit("exclusive_egress_boot_release", {
         outcome: "oracle-loop-not-started",
@@ -3638,7 +3641,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
           input.print(
             `[castle-wall] boot: uid ${agentUid} gate account home layout assert failed: ${reason}; ` +
               "the release barrier will refuse release and park fail-closed. " +
-              "Repair: sudo sanctuary protect --repair-egress-gate",
+              `Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
           );
           try {
             await input.audit("exclusive_egress_gate_home_layout_failed", {
@@ -3809,6 +3812,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
   const warnedUids = new Set<number>();
   const warnedQuarantined = new Set<string>();
   const warnedDirtyUids = new Set<number>();
+  const warnedUnusableGenerationUids = new Set<number>();
   let warnedRegistryUnreadable = false;
   let activeRefresh: { id: number; timeout: ReturnType<typeof setTimeout> } | null = null;
   const abandonedRefreshAttempts = new Set<number>();
@@ -3939,7 +3943,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
               `[castle-wall] oracle refresh: registry is DIRTY (needs repair), so the freshness token ` +
                 `for uid ${entry.agent_uid} is WITHHELD; its gate denies within one TTL (fail-closed: ` +
                 "per-uid liveness cannot rule out extra permissive rules on a dirty anchor); " +
-                "repair: sudo sanctuary protect --repair-egress-gate (warn-once until the registry is clean)",
+                `repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE} (warn-once until the registry is clean)`,
             );
           }
         }
@@ -3951,9 +3955,20 @@ export async function startExclusiveEgressBootSupervisor(input: {
       }
       for (const entry of current.entries) {
         if (entry.tombstone === true) continue;
-        const generationId = entry.generation_id;
-        if (typeof generationId !== "number" || !Number.isInteger(generationId) || generationId <= 0) continue;
         attemptedObservation = true;
+        const generationId = entry.generation_id;
+        if (typeof generationId !== "number" || !Number.isInteger(generationId) || generationId <= 0) {
+          missedCondition ??= `entry for uid ${entry.agent_uid} has no usable generation_id`;
+          if (!warnedUnusableGenerationUids.has(entry.agent_uid)) {
+            warnedUnusableGenerationUids.add(entry.agent_uid);
+            input.print(
+              `[castle-wall] oracle refresh: entry for uid ${entry.agent_uid} has no usable generation_id; ` +
+                `its gate denies within one TTL (fail-closed); repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE} ` +
+                "(warn-once until the registry is clean)",
+            );
+          }
+          continue;
+        }
         let gateUid = gateUids.get(entry.agent_uid);
         if (gateUid === undefined) {
           try {

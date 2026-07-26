@@ -38,6 +38,10 @@ import type { ProvisionNeedResult } from "./detect.js";
 import type { HarnessDisposition, RunStateAdvice } from "../../egress-gate/parked-claim.js";
 import { assessHarnessParked, runStateAdvice } from "../../egress-gate/parked-claim.js";
 import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE,
+} from "../../egress-gate/operator-advice.js";
+import {
   runExclusiveEgressArming,
   type ExclusiveEgressArmOps,
   type ExclusiveRoutingResidue,
@@ -565,18 +569,17 @@ export function describeExclusiveRoutingResidueRefusal(residue: ExclusiveRouting
         `(${residue.reason}). While it stands, the signing daemon composes EVERY manifest under the ` +
         "exclusive-routing rules regardless of the mode this run asked for, so a re-run cannot " +
         "compose over it. If the confinement already in place is the one you want, nothing needs " +
-        "doing. If you meant to re-provision from scratch, tear the gate down first with 'sudo sanctuary protect " +
-        "--unprotect-egress-gate' (which also leaves the harness parked and down), then re-run this " +
-        `command.${untouched}`
+        `doing. If you meant to re-provision from scratch, tear the gate down first with '${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}'; ` +
+        `this leaves the harness parked and down. Then re-run this command.${untouched}`
       );
     case "kept-uncertain":
       return (
         `Refusing to provision: an exclusive-routing marker is present in this fortress and could ` +
         `NOT be shown to be stale (${residue.reason}). While that marker stands, the signing daemon ` +
         "composes EVERY manifest under the exclusive-routing rules regardless of the mode this run " +
-        "asked for. Recover an interrupted arm with 'sudo sanctuary protect --repair-egress-gate', " +
-        "or clear the exclusive-egress state outright with 'sudo sanctuary protect " +
-        `--unprotect-egress-gate', then re-run this command.${untouched}`
+        `asked for. Recover an interrupted arm with '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}', ` +
+        `or clear the exclusive-egress state outright with '${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}', ` +
+        `then re-run this command.${untouched}`
       );
     case "kept-unknown-subject":
       // FIX F3: the one keep whose subject account may be gone entirely. The
@@ -601,8 +604,8 @@ export function describeExclusiveRoutingResidueRefusal(residue: ExclusiveRouting
         "is present in this fortress, but this run could not determine the agent's run-as identity " +
         "(no harness-configured uid, no dedicated agent account, and no agent process was found), " +
         "so the marker cannot be judged stale without reconciling it against an unknown subject. " +
-        "Clear the leftover exclusive-egress state with 'sudo sanctuary protect " +
-        `--unprotect-egress-gate': when nothing is still armed for uid ${residue.markerAgentUid} it ` +
+        `Clear the leftover exclusive-egress state with '${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}': ` +
+        `when nothing is still armed for uid ${residue.markerAgentUid} it ` +
         "removes the residue even with the dedicated agent account gone, and when something IS still " +
         "armed for that uid it changes nothing and names the state it found. Then re-run this " +
         `command.${untouched}`
@@ -618,7 +621,7 @@ export function describeExclusiveRoutingResidueRefusal(residue: ExclusiveRouting
         ? `Refusing to provision: this fortress's exclusive-routing marker could NOT be read ` +
             `(${residue.detail}), so the routing mode is unknown. The signing daemon composes on that ` +
             "marker, so proceeding would mean arming over a mode nothing established. Clear the " +
-            "exclusive-egress state with 'sudo sanctuary protect --unprotect-egress-gate' (which " +
+            `exclusive-egress state with '${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}' (which ` +
             "removes the marker once it can prove nothing is still armed), then re-run this command." +
             untouched
         : `Refusing to provision: the exclusive-routing residue check could NOT complete ` +
@@ -632,7 +635,7 @@ export function describeExclusiveRoutingResidueRefusal(residue: ExclusiveRouting
       return (
         `Refusing to provision: clearing the stale exclusive-routing residue FAILED part way ` +
         `(${residue.detail}). The fortress is now in a mixed state, so this run will not arm over ` +
-        "it. Complete the teardown with 'sudo sanctuary protect --unprotect-egress-gate', then " +
+        `it. Complete the teardown with '${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}', then ` +
         `re-run this command.${untouched}`
       );
   }
@@ -687,7 +690,7 @@ export function describeObservedAgentConfinement(observed: ObservedAgentConfinem
     "This run did not arm the wall, BUT per-agent egress confinement from an EARLIER run is live on " +
     `this host (${parts.join("; ")}). A confined agent may be reaching nothing right now, and while ` +
     "the exclusive routing composition stands this coarse path will keep being refused. Clear it with: " +
-    "'sudo sanctuary protect --unprotect-egress-gate'."
+    `'${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}'.`
   );
 }
 
@@ -832,7 +835,7 @@ export type ProvisionFlowOutcome =
    * S5-6: exclusive stack LIVE and the harness running confined, but the
    * persistent boot state could not be re-parked (the next boot could
    * auto-start the harness before G5). DISTINCT AMBER, never green; fixed by
-   * `sudo sanctuary protect --repair-egress-gate`.
+   * `sudo sanctuary protect --repair-egress-gate --stand-down-agent`.
    */
   | { kind: "armed-exclusive-repark-failed"; uid: number; generationId: number; reparkError: string }
   /**
