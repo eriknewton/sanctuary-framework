@@ -225,6 +225,7 @@ export type ClaimSiteId =
   | "arming-wiring.barrier-bootstrap"
   | "arming-wiring.barrier-bootout"
   | "arming-wiring.barrier-remove-hold"
+  | "arming-wiring.residue-pair-removed"
   | "arming-wiring.barrier-write-hold"
   | "arming-wiring.rearm-install-noop"
   | "arming-wiring.rearm-probed"
@@ -262,6 +263,11 @@ export type ClaimSiteId =
   | "pf-anchor.arm"
   | "pf-anchor.arm-union"
   | "pf-anchor.disarm"
+  | "pf-enable-state.observe-enabled"
+  | "pf-enable-state.observe-references"
+  | "pf-enable-state.resolve"
+  | "pf-enable-state.ensure"
+  | "pf-enable-state.release"
   | "liveness-oracle.mint"
   | "liveness-oracle.verify"
   | "runtime-fs-plan.apply"
@@ -812,6 +818,23 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
     layer: "compute",
     branches: "single",
   },
+  "arming-wiring.residue-pair-removed": {
+    file: `${EG}/arming-wiring.ts`,
+    symbol: "removeExclusiveRoutingResiduePair",
+    claim: "BOTH the exclusive-routing marker and the exclusive-egress gate policy file are gone",
+    // OBSERVED, and observed per FILE. The success arm is reached only after
+    // each `removeFile` in the pair returned without throwing, and the caller's
+    // production remover is `rm(path, { force: true })`, which succeeds on an
+    // already-absent path and throws on everything else. A failure part way
+    // through returns `ok: false` carrying the files that WERE removed, so the
+    // partial case is representable rather than collapsing into either "done"
+    // or "nothing happened" -- that collapse (FIX G5, re-gate 2026-07-26) is
+    // what let a caller render "no Castle Wall change was made by this run"
+    // over a fortress whose marker had just been deleted.
+    basis: "observed",
+    layer: "compute",
+    branches: "single",
+  },
   "arming-wiring.barrier-write-hold": {
     file: `${EG}/arming-wiring.ts`,
     symbol: "writeHoldFile",
@@ -1250,8 +1273,19 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "pf-anchor.arm-union": {
     file: `${EG}/pf-anchor.ts`,
     symbol: "armPfAnchorUnion",
-    claim: "the union is loaded, hooked, pf enabled and live",
-    basis: "observed",
+    claim:
+      "the union is loaded, hooked, live, and pf is held enabled by a reference THIS fortress owns",
+    basis: "weakened",
+    unobserved:
+      "the LOAD/HOOK/LIVE half is fully observed -- the settle-probe re-reads pf's status, the " +
+      "anchor's exact rules, the main ruleset's call rule, the skip flags and the preempting-quick " +
+      "scan. The OWNERSHIP half is not read back by this verb at all: the settle-probe never runs " +
+      "`pfctl -s References`, so ownership is delegated whole to `pf-enable-state.ensure`, whose own " +
+      "row is `weakened` for one branch -- when the post-acquire `pfctl -s References` is unreadable " +
+      "or unparseable, that observation is recorded rather than thrown, and ownership then rests on " +
+      "`pfctl -E` exiting 0 with a token. A composed claim is graded by its weakest input, so this " +
+      "row inherits that weakening instead of re-laundering it as `observed` one layer up. The " +
+      "`enableEvidence` vector says which branch a given arm took.",
     detectorBlind: true,
     layer: "compute",
     branches: "boolean",
@@ -1264,12 +1298,14 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "pf-anchor.disarm": {
     file: `${EG}/pf-anchor.ts`,
     symbol: "disarmPfAnchor",
-    claim: "the anchor is flushed empty and the pf enable reference released",
+    claim: "the anchor is flushed empty and the pf enable reference is no longer held by us",
     basis: "documented-bound",
     unobserved:
-      "exit codes of `pfctl -F all` and `pfctl -X` only; the anchor is never re-listed as empty, asymmetric " +
-      "with the arm paths' settle-probes. This is the weakest link in the unprotect outcome and is the " +
-      "highest-value remaining observation gap in this subsystem.",
+      "the FLUSH is exit-code only: the anchor is never re-listed as empty, asymmetric with the arm " +
+      "paths' settle-probes, and that remains the highest-value observation gap in the unprotect " +
+      "outcome. The RELEASE half is no longer exit-code-only -- `pf-enable-state.release` " +
+      "cross-checks a failed `pfctl -X` against an observation of pf before calling the reference " +
+      "gone -- but this row does not re-read the reference table after a successful release.",
     detectorBlind: true,
     layer: "compute",
     branches: "boolean",
@@ -1279,6 +1315,80 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
       basis: "documented-bound",
       unobserved:
         "pfctl exit codes only on both branches; the anchor is not re-listed either way. This remains the highest-value unprotect observation gap.",
+    },
+  },
+  "pf-enable-state.observe-enabled": {
+    file: `${EG}/pf-enable-state.ts`,
+    symbol: "observePfEnabled",
+    claim: "pf's global enable state, as `pfctl -s info` reports it right now",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim: "pf's enable state could not be read; the observation is `known: false`, never `false`",
+      basis: "observed",
+    },
+  },
+  "pf-enable-state.observe-references": {
+    file: `${EG}/pf-enable-state.ts`,
+    symbol: "observePfEnableReferences",
+    claim: "the exact set of pf enable-reference tokens the kernel holds right now",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim:
+        "the reference table could not be read or parsed; the observation is `known: false`, so an " +
+        "out-of-date parser can never be mistaken for an absent reference",
+      basis: "observed",
+    },
+  },
+  "pf-enable-state.resolve": {
+    file: `${EG}/pf-enable-state.ts`,
+    symbol: "resolvePfEnableReference",
+    claim:
+      "the recorded pf enable reference is ours, live, and from this boot session (`ours-live`)",
+    basis: "observed",
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim:
+        "the reference is definitely not ours-and-live (`not-ours`), or could not be established " +
+        "(`unknown`); the two are kept distinct and NEITHER permits reuse",
+      basis: "observed",
+    },
+  },
+  "pf-enable-state.ensure": {
+    file: `${EG}/pf-enable-state.ts`,
+    symbol: "ensurePfEnableReference",
+    claim: "this fortress holds the returned pf enable reference, and pf is enabled",
+    basis: "weakened",
+    unobserved:
+      "both halves ARE read back after an acquire (`pfctl -s info` plus this token's presence in " +
+      "`pfctl -s References`), and DEFINITE negative evidence on either throws. The weakening is " +
+      "that an UNREADABLE probe does not throw: the claim then rests on `pfctl -E` exiting 0 with a " +
+      "token, and is left to the caller's own fail-closed settle probe rather than turned into an " +
+      "availability cliff on a transient pfctl read failure. The evidence vector says which of the " +
+      "two it was.",
+    detectorBlind: true,
+    layer: "compute",
+    branches: "single",
+  },
+  "pf-enable-state.release": {
+    file: `${EG}/pf-enable-state.ts`,
+    symbol: "releasePfEnableReference",
+    claim: "the reference named by this token is no longer held (released, or never existed)",
+    basis: "weakened",
+    unobserved:
+      "a 0-exit `pfctl -X` is taken at its word; the reference table is not re-read afterwards. The " +
+      "`already-gone` branch is NOT exit-code-only -- it requires either of the two captured pfctl " +
+      "absence messages, or an observation that pf is not enabled -- and any other failure throws.",
+    detectorBlind: true,
+    layer: "compute",
+    branches: "boolean",
+    negativeBranch: {
+      claim: "the release failed for a reason we cannot account for; the caller must not clear state",
+      basis: "observed",
     },
   },
   "liveness-oracle.mint": {
@@ -1852,7 +1962,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/unprovision.ts`]: 4,
   [`${CW}/verify.ts`]: 1,
   [`${EG}/anchor-registry.ts`]: 0,
-  [`${EG}/arming-wiring.ts`]: 31,
+  [`${EG}/arming-wiring.ts`]: 33,
   [`${EG}/claim-basis.ts`]: 3,
   [`${EG}/drift-guard.ts`]: 0,
   [`${EG}/exec-runner.ts`]: 0,
@@ -1873,6 +1983,7 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${EG}/peer-resolver-daemon.ts`]: 4,
   [`${EG}/peer-resolver-protocol.ts`]: 3,
   [`${EG}/pf-anchor.ts`]: 0,
+  [`${EG}/pf-enable-state.ts`]: 4,
   [`${EG}/posture.ts`]: 1,
   [`${EG}/protection-claim.ts`]: 0,
   [`${EG}/release-barrier.ts`]: 15,

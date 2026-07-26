@@ -499,7 +499,12 @@ async function deriveFortressMasterKey(ctx: {
   const storage = new FilesystemStorage(`${storagePath}/state`);
   let passphrase = ctx.args.passphrase ?? process.env["SANCTUARY_PASSPHRASE"];
   if (!passphrase) {
-    const resolved = await getOrCreatePassphrase();
+    // Scope the passphrase lookup to the fortress this command already
+    // resolved. Calling with no argument re-resolves ambiently from the
+    // environment, which reads and can create the HOME fortress's
+    // passphrase (and its keyring entry) even when the caller selected a
+    // different fortress with --fortress.
+    const resolved = await getOrCreatePassphrase({ storagePath });
     passphrase = resolved.value;
   }
   // Unified custody (master-custody.ts): never derive a fortress master verb-locally.

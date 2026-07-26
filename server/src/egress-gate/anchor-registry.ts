@@ -76,10 +76,12 @@ import {
   disarmPfAnchor,
   type ArmPfAnchorResult,
   type ArmPfAnchorUnionOptions,
+  type DisarmPfAnchorResult,
   type PfAnchorUnionEntry,
   type PfCommandRunner,
   type PfLivenessResult,
 } from "./pf-anchor.js";
+import { PF_ENABLE_TOKEN_RE, type PfEnableReference } from "./pf-enable-state.js";
 
 export { ProvisionLockHeldError } from "../castle-wall/provision/lockfile.js";
 
@@ -128,6 +130,21 @@ export interface PfAnchorRegistryState {
   committed: PfAnchorRegistryEntry[];
   /** The `pfctl -E` reference token held while the union is non-empty. */
   enable_token?: string;
+  /**
+   * `kern.bootsessionuuid` at the moment {@link enable_token} was minted
+   * (F-PFBOOT, 2026-07-26). A pf enable reference is VOLATILE kernel state a
+   * reboot zeroes; this file is not. Without the binding, a token that has
+   * been dead since the last boot is indistinguishable on disk from one that
+   * is live -- which is precisely how a reboot left a confined uid with full
+   * loopback reach while the registry read clean.
+   *
+   * NEVER read as consent: it only ever produces a cheap DEFINITE NEGATIVE
+   * (different session = dead token, no pfctl call needed). A matching session
+   * still has to pass `pf-enable-state.ts`'s pfctl attribution before the
+   * token is reused. ADDITIVE + OPTIONAL (absent = resolve by attribution
+   * alone); the state version stays `1` and v1 state on disk loads unchanged.
+   */
+  enable_token_boot_session?: string;
   /** Journaled desired set mid-mutation (Codex B1); absent when quiescent. */
   pending?: PfAnchorRegistryEntry[];
   /** Needs-repair: the anchor and registry may diverge; posture MUST be red. */
@@ -188,13 +205,13 @@ export interface PfAnchorRegistryOps {
   /** Defaults to {@link PF_ANCHOR_NAME}. */
   anchorName?: string;
   /** Arm-union options threaded to {@link armPfAnchorUnion} (settle tuning, mainConfPath). */
-  armOptions?: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableToken">;
+  armOptions?: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableReference">;
   /** Injected for tests; default to the real pf-anchor functions. */
   armUnion?: (
     entries: readonly PfAnchorUnionEntry[],
     options: ArmPfAnchorUnionOptions,
   ) => Promise<ArmPfAnchorResult>;
-  disarm?: (options: { anchorName: string; enableToken?: string }) => Promise<void>;
+  disarm?: (options: { anchorName: string; enableToken?: string }) => Promise<DisarmPfAnchorResult | void>;
   unionLiveness?: (
     entries: readonly PfAnchorUnionEntry[],
     anchorName: string,
@@ -469,6 +486,69 @@ function clearDirtyUnlessFloorRepairOwed(state: PfAnchorRegistryState): void {
   }
 }
 
+/**
+ * THE single reader of the persisted pf enable reference. Token and boot
+ * session are one fact and are never read apart: a caller that took the token
+ * alone would be reconstructing the exact record-without-provenance that
+ * F-PFBOOT turned into a wrong-allow.
+ *
+ * A malformed or empty boot session is DROPPED rather than treated as
+ * matching -- the reference then resolves through pfctl attribution, which is
+ * strictly more work and strictly less trusting.
+ */
+function readEnableReference(state: PfAnchorRegistryState): PfEnableReference | undefined {
+  if (state.enable_token === undefined) return undefined;
+  const session = state.enable_token_boot_session;
+  return {
+    token: state.enable_token,
+    ...(typeof session === "string" && session.trim().length > 0
+      ? { boot_session_uuid: session.trim() }
+      : {}),
+  };
+}
+
+/**
+ * The same read against an UNNORMALIZED loaded state, for the quarantine
+ * repair path -- which cannot normalize (that is what it is repairing) and
+ * must still carry the enable reference forward as one fact. Validates the
+ * token itself rather than assuming the file's shape.
+ */
+function readEnableReferenceFromRaw(loaded: PfAnchorRegistryState): PfEnableReference | undefined {
+  if (typeof loaded.enable_token !== "string" || !PF_ENABLE_TOKEN_RE.test(loaded.enable_token)) {
+    return undefined;
+  }
+  const session = loaded.enable_token_boot_session;
+  return {
+    token: loaded.enable_token,
+    ...(typeof session === "string" && session.trim().length > 0
+      ? { boot_session_uuid: session.trim() }
+      : {}),
+  };
+}
+
+/**
+ * THE single writer of the persisted pf enable reference. Token and boot
+ * session are set or cleared together, so no path can leave a token bound to
+ * the wrong boot -- including the rollback path, which used to restore a bare
+ * `previousToken`.
+ */
+function writeEnableReference(
+  state: PfAnchorRegistryState,
+  reference: PfEnableReference | undefined,
+): void {
+  if (reference === undefined) {
+    delete state.enable_token;
+    delete state.enable_token_boot_session;
+    return;
+  }
+  state.enable_token = reference.token;
+  if (reference.boot_session_uuid !== undefined) {
+    state.enable_token_boot_session = reference.boot_session_uuid;
+  } else {
+    delete state.enable_token_boot_session;
+  }
+}
+
 /** Normalize a loaded state (or `null`) into a usable state. Throws on corruption. */
 function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryState {
   if (loaded === null) {
@@ -497,8 +577,18 @@ function normalizeState(loaded: PfAnchorRegistryState | null): PfAnchorRegistryS
     committed.push(entry);
   }
   const state: PfAnchorRegistryState = { version: PF_ANCHOR_REGISTRY_STATE_VERSION, committed };
-  if (typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token)) {
+  if (typeof loaded.enable_token === "string" && PF_ENABLE_TOKEN_RE.test(loaded.enable_token)) {
     state.enable_token = loaded.enable_token;
+    // Carry the boot binding ONLY alongside a valid token, and only when it is
+    // a non-empty string. A binding without a token is meaningless; a
+    // malformed binding is dropped so the reference falls back to pfctl
+    // attribution rather than being compared against something unusable.
+    if (
+      typeof loaded.enable_token_boot_session === "string" &&
+      loaded.enable_token_boot_session.trim().length > 0
+    ) {
+      state.enable_token_boot_session = loaded.enable_token_boot_session.trim();
+    }
   }
   // Preserve the journaled `pending` set (gate finding: it was dropped on
   // reload, making the two-phase journal dead across a crash). Validate it the
@@ -678,7 +768,7 @@ export class PfAnchorRegistry {
   private readonly lock: ProvisionLockOps;
   private readonly lockPath: string;
   private readonly anchorName: string;
-  private readonly armOptions: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableToken">;
+  private readonly armOptions: Omit<ArmPfAnchorUnionOptions, "anchorName" | "existingEnableReference">;
   private readonly armUnion: NonNullable<PfAnchorRegistryOps["armUnion"]>;
   private readonly disarm: NonNullable<PfAnchorRegistryOps["disarm"]>;
   private readonly unionLiveness: NonNullable<PfAnchorRegistryOps["unionLiveness"]>;
@@ -755,7 +845,7 @@ export class PfAnchorRegistry {
     }
     const { entries, quarantined } = classifyCommitted(loaded);
     const enableTokenValid =
-      typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token);
+      typeof loaded.enable_token === "string" && PF_ENABLE_TOKEN_RE.test(loaded.enable_token);
     // Fix-round-6 F2: a malformed persisted generation_floor must be VISIBLE
     // on this read path too -- the boot supervisor and oracle refresh loop
     // read through here, and a floor problem only normalizeState noticed
@@ -939,9 +1029,7 @@ export class PfAnchorRegistry {
         version: PF_ANCHOR_REGISTRY_STATE_VERSION,
         committed: next,
       };
-      if (typeof loaded.enable_token === "string" && /^\d+$/.test(loaded.enable_token)) {
-        state.enable_token = loaded.enable_token;
-      }
+      writeEnableReference(state, readEnableReferenceFromRaw(loaded));
       // Fold the generation floor: carry any valid persisted floor forward and
       // raise it to cover every generation removed above. Monotone by
       // construction (Math.max); never lowered, never dropped by a repair.
@@ -1103,15 +1191,37 @@ export class PfAnchorRegistry {
     return withProvisionLock(this.lockPath, this.lock, async () => {
       const state = normalizeState(await this.store.load());
 
+      // Compute the desired set BEFORE reconciling, because whether reconcile
+      // is needed at all depends on it (see below). `apply` is pure over the
+      // committed array and does not touch the host.
+      const desired = apply([...state.committed]);
+      assertNoDuplicateUids(desired);
+
       // Reconcile-on-entry (Codex H5): make sure the committed union is still
       // exact-live before layering a new mutation on top. Re-asserts on drift;
       // marks dirty if the re-assert itself fails.
-      await this.reconcile(state);
+      //
+      // SKIPPED FOR A FULL TEARDOWN, and this is the operator's escape hatch.
+      // Measured on hardware: after a reboot, `--unprotect-egress-gate` failed
+      // at stage `recover` even though its desired set is EMPTY, because
+      // reconcile re-asserted the previous non-empty union first and that
+      // re-assert needed the very pf state that was missing. Every other
+      // recovery verb pointed at unprotect, and unprotect pointed at
+      // "investigate" -- a closed loop with no product exit.
+      //
+      // Re-asserting a union we are about to FLUSH ENTIRELY buys nothing:
+      // `applyUnion(state, [])` runs `-F all`, which is strictly more teardown
+      // than any re-assert would achieve, so skipping the re-assert cannot
+      // leave a rule behind that reconcile would have removed. The skip is
+      // scoped to the last uid leaving; removing one uid while others stay
+      // confined still reconciles, because there the anchor must keep holding
+      // the survivors' rules exactly.
+      if (desired.length > 0) {
+        await this.reconcile(state);
+      }
 
       const previousCommitted = [...state.committed];
-      const previousToken = state.enable_token;
-      const desired = apply(state.committed);
-      assertNoDuplicateUids(desired);
+      const previousReference = readEnableReference(state);
 
       // Unprotect generation-monotonicity (S5-7, extends fix-round-5 P1): a
       // committed entry this mutation REMOVES (its uid survives in no desired
@@ -1153,7 +1263,7 @@ export class PfAnchorRegistry {
       } catch (applyErr) {
         // Roll back to the previous committed union. Throws
         // PfAnchorRegistryDirtyError if the rollback itself fails.
-        await this.rollback(state, previousCommitted, previousToken, forwardReleased, applyErr);
+        await this.rollback(state, previousCommitted, previousReference, forwardReleased, applyErr);
         throw applyErr;
       }
     });
@@ -1178,16 +1288,24 @@ export class PfAnchorRegistry {
         anchorName: this.anchorName,
         ...(hadToken ? { enableToken: state.enable_token } : {}),
       });
-      delete state.enable_token;
+      writeEnableReference(state, undefined);
       return hadToken;
     }
     const res = await this.armUnion(desired.map(toUnionEntry), {
       ...this.armOptions,
       anchorName: this.anchorName,
-      ...(state.enable_token !== undefined ? { existingEnableToken: state.enable_token } : {}),
+      ...(readEnableReference(state) !== undefined
+        ? { existingEnableReference: readEnableReference(state) }
+        : {}),
     });
-    if (res.enableToken !== undefined) {
-      state.enable_token = res.enableToken;
+    // Persist WHATEVER reference the arm ended up holding, bound to its boot
+    // session, in the SAME save that commits the union. That co-sequencing is
+    // load-bearing: a fix that cleared a stale token without minting its
+    // replacement in the same save would trip `normalizeState`'s
+    // "committed but no token = dirty" rule and rebuild the deadlock through
+    // a different door.
+    if (res.enableReference !== undefined) {
+      writeEnableReference(state, res.enableReference);
     }
     return false;
   }
@@ -1252,13 +1370,13 @@ export class PfAnchorRegistry {
    *
    * `forwardReleased` (gate finding) tells rollback whether the FAILED apply
    * already released the pf enable reference (the remove-last flush path). If
-   * so, `previousToken` is spent and pf is disabled, so rollback must re-arm
-   * the previous union with a FRESH `-E`, not reuse the dead token.
+   * so, `previousReference` is spent and pf is disabled, so rollback must
+   * re-arm the previous union with a FRESH `-E`, not reuse the dead token.
    */
   private async rollback(
     state: PfAnchorRegistryState,
     previousCommitted: PfAnchorRegistryEntry[],
-    previousToken: string | undefined,
+    previousReference: PfEnableReference | undefined,
     forwardReleased: boolean,
     cause: unknown,
   ): Promise<void> {
@@ -1277,19 +1395,19 @@ export class PfAnchorRegistry {
         state.committed = [];
       } else if (forwardReleased) {
         // The forward apply RELEASED the enable reference (remove-last flushed +
-        // `-X`, then the commit save failed). pf is disabled and `previousToken`
-        // is spent -- clear it so the re-arm acquires a FRESH `-E`.
-        delete state.enable_token;
+        // `-X`, then the commit save failed). pf is disabled and the previous
+        // reference is spent -- clear it so the re-arm acquires a FRESH `-E`.
+        writeEnableReference(state, undefined);
         await this.applyUnion(state, previousCommitted);
         state.committed = previousCommitted;
       } else {
         // The forward apply threw WITHOUT releasing (a mid-arm failure). The
-        // previous token, if any, is still live; re-assert with it.
-        if (previousToken !== undefined) {
-          state.enable_token = previousToken;
-        } else {
-          delete state.enable_token;
-        }
+        // previous reference, if any, may still be live; re-assert with it --
+        // as a RECORD, restored token-and-boot-session together so the arm
+        // path's resolver can judge it. Restoring a bare token here would hand
+        // the next arm a reference with no provenance, which is the F-PFBOOT
+        // shape rebuilt inside the rollback path.
+        writeEnableReference(state, previousReference);
         await this.applyUnion(state, previousCommitted);
         state.committed = previousCommitted;
       }

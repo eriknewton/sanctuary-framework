@@ -65,20 +65,86 @@ export interface ExclusiveGenerationIdentity {
 }
 
 /**
- * Outcome of {@link ExclusiveEgressArmOps.reconcileStaleExclusiveRouting}
- * (D8 self-heal). `reconciled: true` means an ORPHANED marker (no live
- * confinement anywhere) was removed; `reconciled: false` means there was
- * nothing to do (marker absent) OR the marker was KEPT because confinement
- * may be live (`reason` says which). A malformed marker is NOT reported here:
- * it THROWS (fail-closed, the caller must not arm over an unreadable routing
- * mode).
+ * What the exclusive-routing residue gate OBSERVED on disk, and -- on a
+ * `"clear"` intent -- what it did about it. The ONE caller is the
+ * mode-independent gate `ProvisionFlowOps.reconcileExclusiveRoutingResidue`
+ * in `orchestrate.ts` (plus the no-account teardown fallback the
+ * `--unprotect-egress-gate` verb uses).
+ *
+ * FIX F-COARSE-AFTER-EXCLUSIVE (class half, 2026-07-26): this type used to
+ * belong to an op on {@link ExclusiveEgressArmOps}, which is wired ONLY when
+ * exclusive-egress mode is declared. That is why the self-heal never ran on
+ * the plain COARSE run that hit the defect. The reconcile now hangs off the
+ * mode-independent flow ops instead; the type stays here because the coarse
+ * restore it shares its removal pair with lives in this stage.
+ *
+ * FIX F4 (adversarial review, 2026-07-26): this WAS `{ reconciled: boolean;
+ * reason?: string }`, i.e. two fields that can disagree -- a wiring that kept
+ * a marker but forgot the `reason` read as "nothing there" and the run walked
+ * into the wedge. That is the same shape #1006 deleted at the park boundary.
+ * The union is now TOTAL at the op boundary: "kept" cannot be spelled by
+ * omission, and each keep carries the reason its own operator sentence needs.
+ *
+ * FIX F1/F2 (adversarial review, 2026-07-26): `orphaned` is separate from
+ * `reconciled` because the JUDGEMENT and the irreversible REMOVAL are now two
+ * steps: the flow judges before the operator confirm (so it never asks anyone
+ * to confirm a doomed run) and removes only after the confirm has said yes.
  */
-export interface StaleExclusiveRoutingReconcileResult {
-  /** True ONLY when a provably-orphaned marker was removed. */
-  reconciled: boolean;
-  /** Why the marker was kept (present only when `reconciled` is false and a marker existed). */
-  reason?: string;
-}
+export type ExclusiveRoutingResidue =
+  /** No marker on disk. Coarse composition; the run may proceed. */
+  | { kind: "clear" }
+  /**
+   * A marker is present and PROVABLY orphaned (no registry entry, no serving
+   * gate, no gate plist), and this call was an `"observe"`: it has NOT been
+   * removed. The caller may remove it with a second `"clear"` call once every
+   * step that can still say no has said yes.
+   */
+  | { kind: "orphaned"; detail: string }
+  /** A provably-orphaned marker WAS removed by this call. The run may proceed. */
+  | { kind: "reconciled"; detail: string }
+  /**
+   * A marker is present and confinement for its uid looks LIVE (a committed or
+   * mid-bring-up S5-1 registry entry, or an owner-verified gate daemon serving
+   * the recorded port). This is not residue: a re-run cannot compose over it.
+   */
+  | { kind: "kept-live"; reason: string }
+  /**
+   * A marker is present and could NOT be shown to be stale (dirty or
+   * quarantined registry, unreadable/unparseable gate runtime state, a
+   * surviving gate plist, a cross-uid marker). Fail toward confinement: KEEP.
+   */
+  | { kind: "kept-uncertain"; reason: string }
+  /**
+   * A marker is present but this run resolved NO agent uid to scope it
+   * against, so guard 0 has no subject and a reconcile would be a cross-uid
+   * reconcile. Distinct from `kept-uncertain` because it is the one keep whose
+   * subject account may be gone entirely, and so needs its own way out.
+   */
+  | { kind: "kept-unknown-subject"; reason: string; markerAgentUid: number }
+  /**
+   * The residue check could not complete. The run must REFUSE, fail-closed:
+   * "could not look" is never "nothing there".
+   *
+   * FIX G8 (re-gate, 2026-07-26): `source` exists because this verdict is
+   * produced by ANY throw out of the op, and the operator sentence used to
+   * assert the MARKER was at fault on every one of them. `"marker"` is the
+   * load contract firing on a present-but-unreadable/malformed marker (the
+   * remedy that removes the marker without parsing it is on point).
+   * `"residue-check"` is some OTHER surface the check reads throwing -- a
+   * malformed anchor registry, for instance -- where the marker's own
+   * readability is UNKNOWN and removing it fixes nothing.
+   */
+  | { kind: "unreadable"; detail: string; source: "marker" | "residue-check" }
+  /**
+   * FIX G5 (re-gate, 2026-07-26): a `"clear"` intent ran the removal half and
+   * it FAILED PART WAY. `removed` names, in order, what this call actually did
+   * delete before the failure, so the refusal sentence can state what changed
+   * on the fortress instead of asserting that nothing did. The pre-fix code
+   * let the second `removeFile`'s throw propagate, which rendered "no Castle
+   * Wall change was made by this run" over a fortress that had just been put
+   * back on coarse composition.
+   */
+  | { kind: "removal-failed"; detail: string; removed: string[] };
 
 /**
  * Injected side effects for the exclusive-egress arming stage. Production
@@ -117,25 +183,6 @@ export interface ExclusiveEgressArmOps {
    * LOUDLY rather than starting it over an exclusive-scoped manifest).
    */
   restoreCoarseComposition(reason: string): Promise<void>;
-  /**
-   * D8 SELF-HEAL PREFLIGHT (2026-07-22): before the arm's early coarse
-   * publish+reload, remove an ORPHANED exclusive-routing marker that a
-   * hard-interrupted prior arm (crash / killed process / dropped `ssh -tt`)
-   * left behind. A stale marker wedges EVERY subsequent arm: the coarse
-   * publish's reload makes the signing daemon compose in EXCLUSIVE mode
-   * against the freshly-published COARSE (agent-scoped) rules, correctly find
-   * agent-reachable direct allows, and fail closed (the composition invariant
-   * working as designed) -- so the flow never gets past provision-egress.
-   *
-   * SAFETY (invariant 2, fail toward confinement): removing the marker forces
-   * the next reload to compose COARSE, which would DE-CONFINE a live agent, so
-   * this removes ONLY when it can prove NO live confinement exists (no S5-1
-   * registry entry for the uid -- committed OR staged -- AND no gate daemon
-   * serving the recorded port). When uncertain it KEEPS the marker. A malformed
-   * marker THROWS (fail-closed; the caller must abort rather than arm over an
-   * unreadable routing mode). Idempotent. Emits a DISTINCT audit op on removal.
-   */
-  reconcileStaleExclusiveRouting(): Promise<StaleExclusiveRoutingReconcileResult>;
   /**
    * Start the harness in COARSE mode after a successful coarse restore (the
    * degrade-loud path's "the coarse wall is proven protection" semantics):

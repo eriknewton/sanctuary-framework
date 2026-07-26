@@ -159,6 +159,15 @@ const RELEASE_VERSION_SHAPE = /^\d+\.\d+\.\d+(-[\w.]+)?$/;
  */
 export function isWrappedInstall(): boolean {
   try {
+    // KNOWN GAP (same shape as the block in `wrap/config-reader.ts`): this
+    // composes the backup directory from an AMBIENT resolution rather than a
+    // storage path a caller chose. It is a leaf with no `storagePath`
+    // parameter and no caller that could supply one, and it only ever answers
+    // a yes/no advice question, so the blast radius is a wrong upgrade hint
+    // rather than a wrong fortress being opened. Threading a path here means
+    // threading it through the update-check surface for zero behaviour change;
+    // that is the same trade `config-reader.ts` documents and defers. Recorded
+    // rather than left silent so the two gaps are enumerable together.
     const backupDir = join(resolveStoragePath(), "backup");
     for (const name of readdirSync(backupDir)) {
       if (name === "wrap-meta.json" || /^wrap-meta-[0-9a-f]{12}\.json$/.test(name)) {

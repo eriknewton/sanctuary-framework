@@ -126,6 +126,17 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
           rm -f "$RUNNER_TEMP/cert.p12"
 
+      # `build-signed.sh --wrapped` notarizes INLINE when NOTARYTOOL_PROFILE names
+      # a stored notarytool keychain profile, and otherwise refuses, because a
+      # signed-but-unnotarized .systemextension is silently uninstalled by Tahoe
+      # sysextd at validation (drill 2026-06-11c, finding W6-N1). This job has no
+      # such profile: it holds the raw Apple ID + app-specific password as secrets
+      # and notarizes in the dedicated step below.
+      #
+      # `--allow-unnotarized` therefore says "this step is not the notarizing
+      # step", NOT "ship it unnotarized". The guard's intent is preserved by the
+      # Notarize step, which is mandatory here and fails the job if it does not
+      # run. Do NOT use this flag in a path that has no following notarization.
       - name: Build, wrap, and sign
         working-directory: castle-wall-macos
         env:
@@ -133,23 +144,42 @@ jobs:
         run: |
           swift build -c release
           bash scripts/build-wrapped.sh
-          bash scripts/build-signed.sh --wrapped
+          bash scripts/build-signed.sh --wrapped --allow-unnotarized
 
-      - name: Notarize
+      # Ordering matters and was wrong before: the uploaded artifact used to be a
+      # zip taken BEFORE `stapler staple`, so Apple held the ticket while the
+      # shipped bundle did not carry it. That bundle passes `spctl` on a machine
+      # that can reach Apple and fails Gatekeeper offline, which is the worst
+      # place to discover it. Staple the .app first, prove the ticket is attached
+      # with `stapler validate`, and only then produce the artifact zip.
+      - name: Notarize and staple
         env:
           APPLE_ID: ${{ secrets.APPLE_NOTARY_APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
         working-directory: castle-wall-macos
         run: |
-          ditto -c -k --keepParent build/Sanctuary-CastleWall.app build/Sanctuary-CastleWall.app.zip
-          xcrun notarytool submit build/Sanctuary-CastleWall.app.zip \
+          set -euo pipefail
+
+          # Submission zip is a transient input to notarytool, never the artifact.
+          ditto -c -k --keepParent build/Sanctuary-CastleWall.app "$RUNNER_TEMP/notarize-submission.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize-submission.zip" \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_NOTARY_PASSWORD" \
             --wait
+          rm -f "$RUNNER_TEMP/notarize-submission.zip"
+
           xcrun stapler staple build/Sanctuary-CastleWall.app
+
+          # `stapler validate` is the check that the ticket is actually ATTACHED
+          # to the bundle. `spctl` alone can pass on a networked machine via an
+          # online lookup, so it cannot distinguish stapled from merely notarized.
+          xcrun stapler validate build/Sanctuary-CastleWall.app
           spctl --assess --type execute --verbose=4 build/Sanctuary-CastleWall.app
+
+          # Artifact zip is produced from the STAPLED bundle.
+          ditto -c -k --keepParent build/Sanctuary-CastleWall.app build/Sanctuary-CastleWall.app.zip
 
       - name: Upload signed artifact
         uses: actions/upload-artifact@v7

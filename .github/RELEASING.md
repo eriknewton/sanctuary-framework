@@ -39,7 +39,12 @@ If a published version needs to be pulled, use `npm dist-tag rm` or `npm depreca
 
 Publishing the npm package does NOT ship the enforcement surface. The wall is enforced by the signed macOS app and its system extension, built by the separate `Castle Wall macOS Release Build` workflow (`.github/workflows/castle-wall-macos-release.yml`). An npm release without a corresponding signed macOS build ships the cooperative surface only.
 
-That workflow has never completed. Its single run, 2026-06-16, failed at "Import signing certificate" because none of the five Apple credentials below had ever been added to the repository. The error surfaced as an opaque Keychain parameter fault; a preflight step now names the missing inputs directly.
+Its first run (2026-06-16) failed at "Import signing certificate" because none of the five Apple credentials below had ever been added to the repository. The error surfaced as an opaque Keychain parameter fault; a preflight step now names the missing inputs directly.
+
+The second run (2026-07-25) got through preflight, certificate import and signing, and exposed two further defects that only a real run could surface:
+
+- `build-signed.sh --wrapped` refuses to finish when it has assembled a `.systemextension` and `NOTARYTOOL_PROFILE` is unset, because a signed-but-unnotarized system extension is silently uninstalled by Tahoe `sysextd` at validation (drill 2026-06-11c, finding W6-N1). This job holds the raw Apple ID and app-specific password rather than a stored notarytool profile, and notarizes in its own step, so it now passes `--allow-unnotarized` to mean "this step is not the notarizing step". **That flag is only safe on a path where a mandatory notarization follows.**
+- The uploaded artifact was a zip taken **before** `stapler staple`, so Apple held the ticket while the shipped bundle did not carry it. Such a bundle passes `spctl` on a networked machine and fails Gatekeeper offline. The submission zip is now transient, the artifact zip is produced from the stapled bundle, and `stapler validate` proves the ticket is attached (`spctl` alone cannot, since it can satisfy itself with an online lookup).
 
 ### Required repository secrets
 

@@ -42,7 +42,28 @@ export {
   type ArmPfAnchorUnionOptions,
   type ArmPfAnchorResult,
   type DisarmPfAnchorOptions,
+  type DisarmPfAnchorResult,
 } from "./pf-anchor.js";
+
+export {
+  PF_ENABLE_TOKEN_RE,
+  readBootSessionUuid,
+  observePfEnabled,
+  observePfEnableReferences,
+  parsePfEnableReferenceTokens,
+  resolvePfEnableReference,
+  releasePfEnableReference,
+  ensurePfEnableReference,
+  type BootSessionReader,
+  type PfEnableReference,
+  type PfEnableReferenceOps,
+  type PfEnableReferenceResolution,
+  type PfEnableReferenceRelease,
+  type PfEnableReferenceDisposition,
+  type PfEnableReferenceEnsured,
+  type PfEnabledObservation,
+  type PfEnableReferencesObservation,
+} from "./pf-enable-state.js";
 
 export {
   PF_ANCHOR_REGISTRY_PATH,

@@ -22,6 +22,7 @@ import { bytesToString } from "../core/encoding.js";
 import type { PersistedAuditEnvelopeV2 } from "../operational/audit-log.js";
 import type { AuditCheckpointRecord } from "../audit/chain.js";
 import { lockdownBanner, readLockdownStatus } from "../lockdown/status.js";
+import { homeFortressPath } from "../paths.js";
 
 export const AUDIT_EXPORT_NAMESPACE = "_audit";
 export const AUDIT_EXPORT_CHECKPOINT_NAMESPACE = "_audit_checkpoints";
@@ -330,13 +331,11 @@ async function daemonAuditChainPresent(
 }
 
 export async function runExport(args: ExportArgs): Promise<void> {
-  const { default: os } = await import("node:os");
-
   const fortressPath =
     args.fortressPath ??
     process.env.SANCTUARY_FORTRESS_PATH ??
     process.env.SANCTUARY_STORAGE_PATH ??
-    join(os.homedir(), ".sanctuary");
+    homeFortressPath();
   const storagePath = args.storagePath ?? resolveAuditStoragePath(fortressPath);
 
   const { FilesystemStorage } = await import("../storage/filesystem.js");

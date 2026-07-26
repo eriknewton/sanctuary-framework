@@ -15,9 +15,10 @@
  * corrected to stop claiming.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createSanctuaryServer } from "../src/index.js";
 import { MemoryStorage } from "../src/storage/memory.js";
+import { createTempHome } from "./helpers/temp-fortress.js";
 
 async function callServerTool(
   server: Awaited<ReturnType<typeof createSanctuaryServer>>["server"],
@@ -37,6 +38,27 @@ async function callServerTool(
 function parse(result: { content: Array<{ type: string; text: string }> }) {
   return JSON.parse(result.content[0]!.text);
 }
+
+
+// Fortress hermeticity: `createSanctuaryServer` boots the real server, and its
+// step 20 writes the config unconditionally. With `HOME` left alone that write
+// lands on the operator's own `~/.sanctuary/sanctuary.json` -- measured, not
+// inferred: this file was one of five bisected as rewriting it on every suite
+// run. Injecting `MemoryStorage` is not enough, because `config.storage_path`
+// still comes from `defaultConfig()`'s `join(homedir(), ".sanctuary")`.
+// Moving `HOME` redirects the mkdir, the permission tightening, and the config
+// write onto a throwaway directory without changing anything under test.
+// `saveConfig` now fails such a write closed under Vitest, so removing this
+// isolation turns the leak into a loud failure rather than a silent one.
+let fortressHome: Awaited<ReturnType<typeof createTempHome>>;
+
+beforeEach(async () => {
+  fortressHome = await createTempHome("sanctuary-manifest-grades");
+});
+
+afterEach(async () => {
+  await fortressHome.cleanup();
+});
 
 describe("manifest honest grades (audit S3)", () => {
   it("does NOT self-grade walked-back capabilities as 'full'", async () => {

@@ -18,7 +18,7 @@
  *   - Castle-walking: routes do not surface outbound network.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -26,6 +26,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Writable } from "node:stream";
+import { useTestPassphrase } from "../helpers/temp-fortress.js";
 
 import {
   AuditLog,
@@ -600,6 +601,17 @@ describe("Chi-3 — HTTP routes", () => {
 });
 
 describe("Chi-3 — CLI subcommands", () => {
+  // Pin the passphrase so deriveFortressMasterKey never falls through to the
+  // OS keyring: against a fresh temp fortress that resolver would GENERATE
+  // and store a new login-keychain entry on every run.
+  let restorePassphrase: () => void;
+  beforeEach(() => {
+    restorePassphrase = useTestPassphrase();
+  });
+  afterEach(() => {
+    restorePassphrase();
+  });
+
   it("anomaly detectors list emits the catalog entries", async () => {
     const out = new CollectStream();
     const err = new CollectStream();

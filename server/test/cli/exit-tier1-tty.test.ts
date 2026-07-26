@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 
 import { confirmTier1, runExitCommand } from "../../src/exit/cli.js";
+import { isolateChildFortress } from "./helpers/run-cli.js";
 
 const CLI_PATH = join(__dirname, "../../dist/cli.js");
 
@@ -71,26 +72,35 @@ describe("Tier 1 CLI approval terminal binding", () => {
     expect(err.text).toContain("Aborted.");
   });
 
-  it("exits non-zero for piped exit export approval denial", () => {
-    const result = spawnSync(
-      process.execPath,
-      [
-        CLI_PATH,
-        "exit",
-        "export",
-        "--out",
-        "/tmp/sanctuary-f-ga-5-denied-process",
-      ],
-      {
-        input: "y\n",
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          NODE_NO_WARNINGS: "1",
-          SANCTUARY_PASSPHRASE: "unused-because-approval-denies-first",
-        },
-      },
-    );
+  it("exits non-zero for piped exit export approval denial", async () => {
+    // This spawns the built CLI directly rather than through `runCli`, because
+    // it needs piped stdin and `execFile` cannot supply it. It still has to be
+    // hermetic: without isolation the child resolves the operator's own
+    // `~/.sanctuary`, reads real custody, and can write into it. Route the
+    // ENVIRONMENT through the shared chokepoint even though the spawn itself
+    // stays local.
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      NODE_NO_WARNINGS: "1",
+      SANCTUARY_PASSPHRASE: "unused-because-approval-denies-first",
+    };
+    const cleanup = await isolateChildFortress(env);
+    let result: ReturnType<typeof spawnSync>;
+    try {
+      result = spawnSync(
+        process.execPath,
+        [
+          CLI_PATH,
+          "exit",
+          "export",
+          "--out",
+          "/tmp/sanctuary-f-ga-5-denied-process",
+        ],
+        { input: "y\n", encoding: "utf8", env },
+      );
+    } finally {
+      await cleanup();
+    }
 
     expect(result.status).toBe(78);
     expect(result.stdout).toBe("");

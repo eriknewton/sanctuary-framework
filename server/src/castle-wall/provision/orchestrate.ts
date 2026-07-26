@@ -40,6 +40,7 @@ import { assessHarnessParked, runStateAdvice } from "../../egress-gate/parked-cl
 import {
   runExclusiveEgressArming,
   type ExclusiveEgressArmOps,
+  type ExclusiveRoutingResidue,
 } from "./exclusive-arm.js";
 import type { AccountProvisionPlan } from "./account.js";
 import type { RehomePlan, RehomeStepResult } from "./rehome.js";
@@ -428,6 +429,213 @@ export interface ProvisionFlowOps {
    * is armed".
    */
   observeAgentConfinement(): Promise<ObservedAgentConfinement>;
+  /**
+   * THE exclusive-routing residue gate (FIX F-COARSE-AFTER-EXCLUSIVE, class
+   * half, 2026-07-26). Reconcile a leftover `exclusive-routing.json` marker
+   * (plus its `exclusive-egress-gate.json`) that an interrupted or failed
+   * prior arm left in the fortress, and report what was decided.
+   *
+   * WHY THIS IS MODE-INDEPENDENT, and why it hangs here rather than off
+   * `exclusiveEgress`: the signing daemon
+   * (`castle-wall/runtime/macos-daemon.ts`) picks the manifest composition
+   * from MARKER PRESENCE ALONE. It has never consulted, and cannot consult,
+   * which mode the operator asked this CLI run for. So a leftover marker
+   * makes the daemon compose EXCLUSIVE against a plain coarse run's
+   * agent-scoped rules, find agent-reachable direct allows, and correctly
+   * refuse to produce a manifest. The self-heal used to be reachable ONLY
+   * when `fineGrainedDeclared` was true AND the exclusive ops were wired --
+   * i.e. it was gated on the one signal the wedging component does not read.
+   * That asymmetry IS the defect: on the Mini1 re-drill the plain
+   * `protect --hermes --provision-agent-account` run never ran the reconcile
+   * at all, was judged by exclusive composition rules, and was refused.
+   *
+   * CONTRACT:
+   *  - Called with `intent: "observe"` AFTER every step that can still say no
+   *    (the non-TTY refusal, the pre-declined return) and BEFORE the operator
+   *    confirm, so a doomed run is refused before anyone is asked to confirm
+   *    it and a run that was never going to arm never reaches this op at all.
+   *  - Called a SECOND time with `intent: "clear"` ONLY when the observation
+   *    was `orphaned` AND the confirm said yes. That call is the first
+   *    mutation of the run. It RE-PROBES; it does not trust the observation.
+   *  - `armTargetUid` is the uid this run resolved as the agent's run-as
+   *    identity, or `undefined` when none is resolved. A marker declaring a
+   *    different uid, or any marker when the subject is `undefined`, is KEPT
+   *    fail-closed rather than reconciled against the wrong subject.
+   *  - MUST NOT write anything on `intent: "observe"`.
+   *  - MAY THROW: a present-but-unreadable marker is the fail-closed contract
+   *    of `loadExclusiveRoutingMarker`. The flow turns the throw into the
+   *    explicit `unreadable` verdict (see {@link ExclusiveRoutingResidue});
+   *    "could not look" must never collapse into "nothing is there".
+   */
+  reconcileExclusiveRoutingResidue(
+    armTargetUid: number | undefined,
+    intent: "observe" | "clear",
+  ): Promise<ExclusiveRoutingResidue>;
+
+  /**
+   * The uid of the dedicated agent account IF one already exists, or
+   * `undefined` when it does not. Read ONLY as the residue gate's fallback
+   * subject (see {@link resolveResidueSubjectUid} and FIX G3): the detect
+   * probe resolves a uid only from a RUNNING agent process in v1, so without
+   * this every host whose agent is merely stopped hit the unknown-subject
+   * refusal, whose remedy is a destructive teardown.
+   *
+   * MUST NOT invent a uid: a lookup that finds nothing returns `undefined`,
+   * and the gate then refuses fail-closed rather than judging against a guess.
+   */
+  lookupDedicatedAccountUid(): Promise<number | undefined>;
+}
+
+export type { ExclusiveRoutingResidue };
+
+/**
+ * THE refusal sentence for a run blocked by exclusive-routing residue -- the
+ * single place this claim is put into words, exported so the mapping
+ * verdict -> sentence is asserted directly rather than through the flow.
+ *
+ * It states what was OBSERVED on disk, what that means for this run, what this
+ * run did NOT change, and a way forward that actually works for THAT verdict.
+ * It makes no claim about whether the wall is armed: that is a different
+ * observation, and inventing it from control flow is the defect this whole fix
+ * exists to close.
+ *
+ * FIX F2 (adversarial review, 2026-07-26): this used to be ONE sentence for
+ * every keep, and it asserted "this run would be refused at the arming step
+ * after changing the host". That is a counterfactual about a step the refusing
+ * run never reaches -- structurally the same defect as the "The wall was NOT
+ * armed" claim this PR exists downstream of, in the safe direction. It is
+ * gone. The keep space is also split, because a HEALTHY live gate and an
+ * uncertain surface are different facts with different remedies: telling the
+ * operator of a correctly-confined agent to run `--unprotect-egress-gate`
+ * tells them to de-confine a working agent and park it down.
+ *
+ * FIX F5: "Nothing has been changed." was false at the command level -- by the
+ * time this is reached the cooperative wrap has already rewritten config and
+ * bootstrapped identity. The claim is now scoped to what this flow actually
+ * did not do.
+ */
+export type ExclusiveRoutingResidueRefusal = Extract<
+  ExclusiveRoutingResidue,
+  { kind: "kept-live" | "kept-uncertain" | "kept-unknown-subject" | "unreadable" | "removal-failed" }
+>;
+
+/**
+ * Narrow a residue verdict to the ones that must STOP the run, or `undefined`
+ * for the ones the run may continue past (`clear`, `orphaned`, `reconciled`).
+ * A `switch` rather than a `!==` chain so a new verdict is a type error at this
+ * seam instead of silently defaulting to "keep going".
+ */
+export function exclusiveRoutingResidueRefusal(
+  residue: ExclusiveRoutingResidue,
+): ExclusiveRoutingResidueRefusal | undefined {
+  switch (residue.kind) {
+    case "kept-live":
+    case "kept-uncertain":
+    case "kept-unknown-subject":
+    case "unreadable":
+    case "removal-failed":
+      return residue;
+    case "clear":
+    case "orphaned":
+    case "reconciled":
+      return undefined;
+  }
+}
+
+export function describeExclusiveRoutingResidueRefusal(residue: ExclusiveRoutingResidueRefusal): string {
+  // F5: true at the command level. Provisioning is what did not happen; the
+  // cooperative wrap around this flow has already done its own work.
+  //
+  // FIX G5 (re-gate, 2026-07-26): "no Castle Wall change was made by this run"
+  // is DERIVED, not asserted. The one verdict that can reach this renderer
+  // after a mutation is `removal-failed`, which carries what it removed; every
+  // other refusal is produced before any removal is attempted, so the flat
+  // sentence is true for them and provably false for that one.
+  const untouched =
+    residue.kind === "removal-failed" && residue.removed.length > 0
+      ? ` No account was created and nothing was re-homed, but this run DID change Castle Wall state: it removed ${residue.removed.join(" and ")}.`
+      : " No account was created, nothing was re-homed, and no Castle Wall change was made by this run.";
+  switch (residue.kind) {
+    case "kept-live":
+      // A positive observation of live confinement. NOT a "could not tell", and
+      // NOT necessarily a problem: the common instance is a healthy, correctly
+      // armed host. So the first thing offered is "nothing needs doing".
+      return (
+        `Refusing to provision: this fortress already has exclusive-egress confinement in place ` +
+        `(${residue.reason}). While it stands, the signing daemon composes EVERY manifest under the ` +
+        "exclusive-routing rules regardless of the mode this run asked for, so a re-run cannot " +
+        "compose over it. If the confinement already in place is the one you want, nothing needs " +
+        "doing. If you meant to re-provision from scratch, tear the gate down first with 'sudo sanctuary protect " +
+        "--unprotect-egress-gate' (which also leaves the harness parked and down), then re-run this " +
+        `command.${untouched}`
+      );
+    case "kept-uncertain":
+      return (
+        `Refusing to provision: an exclusive-routing marker is present in this fortress and could ` +
+        `NOT be shown to be stale (${residue.reason}). While that marker stands, the signing daemon ` +
+        "composes EVERY manifest under the exclusive-routing rules regardless of the mode this run " +
+        "asked for. Recover an interrupted arm with 'sudo sanctuary protect --repair-egress-gate', " +
+        "or clear the exclusive-egress state outright with 'sudo sanctuary protect " +
+        `--unprotect-egress-gate', then re-run this command.${untouched}`
+      );
+    case "kept-unknown-subject":
+      // FIX F3: the one keep whose subject account may be gone entirely. The
+      // verb named here works in exactly that state -- see
+      // `clearExclusiveRoutingResidueWithoutAccount` in arming-wiring.ts, which
+      // is the no-account fallback `--unprotect-egress-gate` now runs.
+      //
+      // FIX G2 (re-gate, 2026-07-26): that promise used to be UNCONDITIONAL
+      // ("which removes this residue even when the dedicated agent account is
+      // gone"), and the teardown it names REFUSES whenever the marker's uid
+      // still has a registry entry or a gate that could serve. A sentence that
+      // promises unconditionally what a branch refuses is the exact class this
+      // change exists to eliminate, so it now says what each branch does.
+      //
+      // FIX G6 (re-gate, 2026-07-26): "no running agent" was a positive claim
+      // built on a probe (`readRunningHermesGatewayUid`) that returns
+      // `undefined` on a `ps` failure, a PATH problem, or a sandbox
+      // restriction just as it does on a genuinely absent process. What was
+      // observed is that the identity could not be DETERMINED.
+      return (
+        `Refusing to provision: an exclusive-routing marker for agent uid ${residue.markerAgentUid} ` +
+        "is present in this fortress, but this run could not determine the agent's run-as identity " +
+        "(no harness-configured uid, no dedicated agent account, and no agent process was found), " +
+        "so the marker cannot be judged stale without reconciling it against an unknown subject. " +
+        "Clear the leftover exclusive-egress state with 'sudo sanctuary protect " +
+        `--unprotect-egress-gate': when nothing is still armed for uid ${residue.markerAgentUid} it ` +
+        "removes the residue even with the dedicated agent account gone, and when something IS still " +
+        "armed for that uid it changes nothing and names the state it found. Then re-run this " +
+        `command.${untouched}`
+      );
+    case "unreadable":
+      // FIX G8 (re-gate, 2026-07-26): this verdict is produced by ANY throw out
+      // of the residue op, so asserting the MARKER was at fault was wrong
+      // whenever the throw came from another surface the check reads (a
+      // malformed anchor registry, say) -- and the remedy offered there removes
+      // a marker that is fine and fixes nothing. The claim now tracks `source`,
+      // which is classified from the error itself.
+      return residue.source === "marker"
+        ? `Refusing to provision: this fortress's exclusive-routing marker could NOT be read ` +
+            `(${residue.detail}), so the routing mode is unknown. The signing daemon composes on that ` +
+            "marker, so proceeding would mean arming over a mode nothing established. Clear the " +
+            "exclusive-egress state with 'sudo sanctuary protect --unprotect-egress-gate' (which " +
+            "removes the marker once it can prove nothing is still armed), then re-run this command." +
+            untouched
+        : `Refusing to provision: the exclusive-routing residue check could NOT complete ` +
+            `(${residue.detail}), so this fortress's routing mode is unknown. The signing daemon ` +
+            "composes on the exclusive-routing marker, so proceeding would mean arming over a mode " +
+            "nothing established. Fix the surface named above (the marker itself may be perfectly " +
+            "readable, so removing it is not the remedy), then re-run this command." + untouched;
+    case "removal-failed":
+      // FIX G5: the one refusal reachable AFTER a mutation. It must state what
+      // it removed, not inherit the "nothing changed" frame.
+      return (
+        `Refusing to provision: clearing the stale exclusive-routing residue FAILED part way ` +
+        `(${residue.detail}). The fortress is now in a mixed state, so this run will not arm over ` +
+        "it. Complete the teardown with 'sudo sanctuary protect --unprotect-egress-gate', then " +
+        `re-run this command.${untouched}`
+      );
+  }
 }
 
 /**
@@ -969,9 +1177,90 @@ async function runProvisionFlowSteps(
     return { kind: "declined-by-operator" };
   }
 
+  // EXCLUSIVE-ROUTING RESIDUE GATE, JUDGEMENT HALF (FIX F-COARSE-AFTER-EXCLUSIVE
+  // class half, 2026-07-26; placement per FIX F1/F2, 2026-07-26).
+  //
+  // MODE-INDEPENDENT: it runs on every run, coarse or fine-grained. See
+  // `ProvisionFlowOps.reconcileExclusiveRoutingResidue` for why mode cannot be
+  // a condition here (the daemon composes on marker presence alone).
+  //
+  // PLACEMENT. This sits BELOW the non-TTY refusal and the pre-declined return
+  // and ABOVE the confirm, and it is deliberately BOTH:
+  //  - below the two early returns, because the first cut ran the whole gate --
+  //    self-heal removal included -- ahead of them, so a scripted non-TTY run
+  //    and an explicit `--no-provision-agent-account` decline both DELETED two
+  //    fortress policy files and then reported that provisioning was skipped.
+  //    A run that was never going to arm must not reach this op at all.
+  //  - above the confirm, because a run that is already doomed must be refused
+  //    before an operator is asked to approve it.
+  // The removal itself waits for the confirm (see the CLEAR half below), which
+  // is this function's own rule at the confirm: a step that cannot be undone
+  // runs only after every step that can still say no has said yes.
+  // FIX G3: the subject is the resolved run-as uid, falling back to the
+  // dedicated account's own uid when this run could not resolve one (the
+  // common case: the agent is simply not running). Resolved ONCE and used for
+  // BOTH halves, so the clear half cannot be scoped differently from the
+  // observe half that the operator confirmed.
+  const residueSubjectUid = await resolveResidueSubjectUid(ops, ctx.detectResult.resolved?.uid);
+  const residue = await reconcileResidueSafely(ops, residueSubjectUid, "observe");
+  const refusal = exclusiveRoutingResidueRefusal(residue);
+  if (refusal !== undefined) {
+    return {
+      kind: "aborted",
+      stage: "exclusive-routing-residue",
+      reason: describeExclusiveRoutingResidueRefusal(refusal),
+      rolledBack: false,
+      rehomeAttempted: false,
+    };
+  }
+  if (residue.kind === "orphaned") {
+    // Name the removal BEFORE the confirm, so the yes covers it.
+    ops.print(
+      "A stale exclusive-routing marker left by an interrupted prior arm is present and will be " +
+        `cleared if you proceed (${residue.detail}).`,
+    );
+  }
+
   const proceed = await ops.confirm("Proceed with account creation and arming? [y/N] ");
   if (!proceed) {
     return { kind: "declined-by-operator" };
+  }
+
+  // RESIDUE GATE, CLEAR half: the FIRST mutation of this run, immediately after
+  // the one confirm and still before the account create, the re-home, every
+  // daemon install, provision-egress, and the arm. It RE-PROBES rather than
+  // trusting the observation above: the confirm prompt is operator think-time,
+  // and removing a marker whose confinement came live in that window would be a
+  // de-confinement. A verdict that is no longer `orphaned` aborts here, with
+  // the host still untouched.
+  if (residue.kind === "orphaned") {
+    const cleared = await reconcileResidueSafely(ops, residueSubjectUid, "clear");
+    const clearedRefusal = exclusiveRoutingResidueRefusal(cleared);
+    if (clearedRefusal !== undefined) {
+      return {
+        kind: "aborted",
+        stage: "exclusive-routing-residue",
+        reason: describeExclusiveRoutingResidueRefusal(clearedRefusal),
+        rolledBack: false,
+        rehomeAttempted: false,
+      };
+    }
+    if (cleared.kind === "orphaned") {
+      // The op judged the marker orphaned and did not remove it, on a call whose
+      // whole purpose was removal. Refuse rather than arm over state this run
+      // did not clear.
+      return {
+        kind: "aborted",
+        stage: "exclusive-routing-residue",
+        reason:
+          "Refusing to provision: the exclusive-routing residue teardown reported the marker as " +
+          "still orphaned instead of removing it, so the marker is still on disk and the signing " +
+          "daemon would still compose exclusive. No account was created, nothing was re-homed, and " +
+          "no Castle Wall change was made by this run.",
+        rolledBack: false,
+        rehomeAttempted: false,
+      };
+    }
   }
 
   if (ctx.detectResult.alreadyDedicated) {
@@ -1167,32 +1456,16 @@ async function runProvisionFlowSteps(
       : "Harness daemon installed; agent now runs under the dedicated account.",
   );
 
-  // D8 SELF-HEAL PREFLIGHT (2026-07-22): only the fine-grained arm path runs
-  // the coarse publish+reload just below, and only that reload wedges on a
-  // STALE exclusive-routing marker a hard-interrupted prior arm left behind
-  // (the daemon composes EXCLUSIVE against the freshly-published COARSE rules,
-  // finds agent-reachable direct allows, and correctly fails closed -- the
-  // composition invariant working as designed). Run it AFTER the parked-install
-  // barrier above (so we know the harness is parked, not running) and BEFORE
-  // provision-egress. reconcileStaleExclusiveRouting removes the marker ONLY
-  // when it can prove no live confinement exists (no registry entry AND no
-  // serving gate), keeps it otherwise, and THROWS on a marker it cannot read
-  // -- which aborts fail-closed here (runProvisionFlow's catch restores the
-  // stood-down harness), never arming over an unreadable routing mode.
-  if (ctx.fineGrainedDeclared === true && ops.exclusiveEgress !== undefined) {
-    const reconcile = await ops.exclusiveEgress.reconcileStaleExclusiveRouting();
-    if (reconcile.reconciled) {
-      ops.print(
-        "Reconciled a stale exclusive-routing marker from an interrupted prior arm (no live " +
-          "confinement present); proceeding.",
-      );
-    } else if (reconcile.reason !== undefined) {
-      // A marker was present but KEPT (confinement may be live). Surface why --
-      // diagnosability is this PR's second theme, and otherwise the operator
-      // gets nothing before a possible provision-egress wedge below.
-      ops.print(`Exclusive-routing marker present but KEPT: ${reconcile.reason}.`);
-    }
-  }
+  // D8 SELF-HEAL: NOT here any more. The reconcile used to sit at this point,
+  // gated on `fineGrainedDeclared === true && ops.exclusiveEgress !== undefined`,
+  // on the theory that only the fine-grained arm path runs a coarse
+  // publish+reload that a stale marker could wedge. That theory was wrong in
+  // the direction that matters: the daemon composes EXCLUSIVE on MARKER
+  // PRESENCE ALONE, so a plain coarse run wedges identically -- which is
+  // exactly what F-COARSE-AFTER-EXCLUSIVE caught on the Mini1 re-drill. The
+  // gate is now MODE-INDEPENDENT, and straddles the one confirm above (judge
+  // before it, remove after it); by the time control reaches here the residue
+  // is provably clear or reconciled, and no mode can skip it.
 
   // Step 6.7 (confined-agent egress, design section 5 layer 1): provision the
   // harness's signed egress allow rules and statically verify them BEFORE
@@ -1646,6 +1919,65 @@ async function observeConfinementSafely(ops: ProvisionFlowOps): Promise<Observed
     return await ops.observeAgentConfinement();
   } catch (err) {
     return { known: false, reason: `confinement probe threw: ${(err as Error).message}` };
+  }
+}
+
+/**
+ * Run {@link ProvisionFlowOps.reconcileExclusiveRoutingResidue} and add the ONE
+ * verdict the op itself cannot return: a THROW is `unreadable`, NEVER `clear`.
+ * The op throws precisely when a marker is present but cannot be parsed, so
+ * treating a throw as "no residue" would mean proceeding under a routing mode
+ * nothing established -- the exact wrong-allow this gate exists to prevent.
+ *
+ * FIX F4 (adversarial review, 2026-07-26): this function used to BUILD the
+ * union out of a `{ reconciled: boolean; reason?: string }` the op handed over,
+ * so "kept with no reason" silently read as `clear` and the run walked into the
+ * wedge. The op returns the total union now; this wrapper only adds the throw
+ * case, so a keep can no longer be spelled by omission at the boundary.
+ */
+async function reconcileResidueSafely(
+  ops: ProvisionFlowOps,
+  armTargetUid: number | undefined,
+  intent: "observe" | "clear",
+): Promise<ExclusiveRoutingResidue> {
+  try {
+    return await ops.reconcileExclusiveRoutingResidue(armTargetUid, intent);
+  } catch (err) {
+    // FIX G8 (re-gate, 2026-07-26): classify WHICH surface failed instead of
+    // blaming the marker for every throw. `ExclusiveRoutingMarkerError` is the
+    // marker load/parse contract firing; anything else came from another
+    // surface the op reads (the anchor registry, the gate runtime state, a
+    // removal), and on those the marker's own readability is unknown.
+    const source = (err as Error)?.name === "ExclusiveRoutingMarkerError" ? "marker" : "residue-check";
+    return { kind: "unreadable", source, detail: `the residue reconcile threw: ${(err as Error).message}` };
+  }
+}
+
+/**
+ * FIX G3 (re-gate, 2026-07-26): the residue gate's SUBJECT, with the dedicated
+ * account's own uid as the fallback.
+ *
+ * `detectResult.resolved` comes from a harness-config probe that is hardcoded
+ * `undefined` in v1 plus a `ps` grep for a RUNNING gateway, so it is `undefined`
+ * on every run whose agent process is not currently up -- a stopped agent, a
+ * crashed gateway, the window after a park, a boot window. That made
+ * `kept-unknown-subject` the DOMINANT keep in production rather than the rare
+ * one, and its remedy is a destructive teardown that parks a healthy host down.
+ * The dedicated account's uid is a real subject on every host where the account
+ * exists, so guard 0 can judge the marker properly there and the unknown-subject
+ * refusal shrinks back to the account-actually-gone case its sentence is written
+ * for.
+ *
+ * This does NOT relax guard 0: a lookup that finds nothing, or that fails,
+ * still yields `undefined` and the run is still refused fail-closed. "Could not
+ * look" is never a subject.
+ */
+async function resolveResidueSubjectUid(ops: ProvisionFlowOps, resolved: number | undefined): Promise<number | undefined> {
+  if (resolved !== undefined) return resolved;
+  try {
+    return await ops.lookupDedicatedAccountUid();
+  } catch {
+    return undefined;
   }
 }
 
