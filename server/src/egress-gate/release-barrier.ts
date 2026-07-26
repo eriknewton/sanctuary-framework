@@ -452,7 +452,14 @@ const RELEASE_REFUSAL_OBSERVATION_KEYS: readonly ReleaseRefusalObservationKey[] 
   "token_secret_shape",
 ];
 
+const SAFE_REFUSAL_RECORD_KEY_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SAFE_REFUSAL_RECORD_VALUE_RE = /^[A-Za-z0-9 ._/:;(),+=@-]{1,240}$/;
+
+function describeUnsafeRefusalRecordKey(key: string): string {
+  const controlStripped = key.replace(/[\x00-\x1F\x7F]/g, "");
+  const capped = controlStripped.slice(0, 64);
+  return JSON.stringify(capped);
+}
 
 /**
  * Parse the wrapper's diagnostic refusal record.
@@ -474,11 +481,14 @@ export function parseReleaseWrapperRefusalRecord(text: string): ReleaseWrapperRe
     }
     const key = line.slice(0, eq);
     const value = line.slice(eq + 1);
+    if (!SAFE_REFUSAL_RECORD_KEY_RE.test(key)) {
+      throw new ReleaseBarrierError(`wrapper refusal record key ${describeUnsafeRefusalRecordKey(key)} is unsafe`);
+    }
     if (seen.has(key)) {
-      throw new ReleaseBarrierError(`wrapper refusal record key duplicated: ${key}`);
+      throw new ReleaseBarrierError(`wrapper refusal record key duplicated: ${describeUnsafeRefusalRecordKey(key)}`);
     }
     if (!SAFE_REFUSAL_RECORD_VALUE_RE.test(value)) {
-      throw new ReleaseBarrierError(`wrapper refusal record key ${key} has an unsafe value`);
+      throw new ReleaseBarrierError(`wrapper refusal record key ${describeUnsafeRefusalRecordKey(key)} has an unsafe value`);
     }
     seen.set(key, value);
   }
@@ -863,7 +873,16 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
   const holdFilePath = holdFilePathForUid(options.agentUid, holdDir);
   const tokenFilePath = options.tokenFilePath ?? gateCredentialTokenPath(options.agentUid);
   const renderedLogDir = options.logDir ?? (options.fortressPath !== undefined ? join(options.fortressPath, "logs") : undefined);
-  const refusalRecordPath = options.refusalRecordPath ?? releaseRefusalRecordPath(renderedLogDir ?? holdDir);
+  const diagnosticLogDir = renderedLogDir;
+  let refusalRecordPath: string;
+  if (options.refusalRecordPath !== undefined) {
+    refusalRecordPath = options.refusalRecordPath;
+  } else {
+    if (diagnosticLogDir === undefined) {
+      throw new ReleaseBarrierError("refusal-record path needs logDir, fortressPath, or an explicit refusalRecordPath");
+    }
+    refusalRecordPath = releaseRefusalRecordPath(diagnosticLogDir);
+  }
   const programArguments = buildBarrierProgramArguments({
     wrapperPath,
     holdFilePath,
@@ -2386,7 +2405,8 @@ async function describeWrapperRefusalObservation(
     );
   }
   return (
-    `the job spawned and the release wrapper refused: ${read.record.reason}; observations: ` +
+    `an agent-writable wrapper refusal record ` +
+    `(diagnostic only; not independently verified) reports: ${read.record.reason}; observations: ` +
     `hold_file_exists=${observed.hold_file_exists}, hold_file_readable=${observed.hold_file_readable}, ` +
     `hold_header=${observed.hold_header}, hold_generation=${observed.hold_generation}, ` +
     `hold_label=${observed.hold_label}, hold_uid=${observed.hold_uid}, boot_session=${observed.boot_session}, ` +

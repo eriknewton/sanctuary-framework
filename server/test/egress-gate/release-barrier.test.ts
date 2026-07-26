@@ -207,10 +207,30 @@ describe("hold-file render + strict parse", () => {
 
 describe("wrapper refusal diagnostic record", () => {
   it("derives the cleanup-exempt diagnostic path under the harness log dir", () => {
-    expect(releaseRefusalRecordPath("/var/sanctuary-agents/sanctuary-hermes/logs")).toBe(
-      `/var/sanctuary-agents/sanctuary-hermes/logs/${RELEASE_REFUSAL_RECORD_FILENAME}`,
-    );
+    const holdDir = "/var/db/sanctuary/agent-harness";
+    const logDir = "/var/sanctuary-agents/sanctuary-hermes/logs";
+    const plan = planParkedHarnessInstall({
+      agentAccount: "sanctuary-hermes",
+      agentUid: 503,
+      harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+      holdDir,
+      logDir,
+    });
+    expect(releaseRefusalRecordPath(logDir)).toBe(`${logDir}/${RELEASE_REFUSAL_RECORD_FILENAME}`);
+    expect(plan.refusalRecordPath).toBe(releaseRefusalRecordPath(logDir));
+    expect(plan.refusalRecordPath.startsWith(`${holdDir}/`)).toBe(false);
+    expect(plan.plistContent).toContain(`<string>${plan.refusalRecordPath}</string>`);
     expect(() => releaseRefusalRecordPath("relative/logs")).toThrow(ReleaseBarrierError);
+  });
+
+  it("fails closed when no cleanup-exempt diagnostic path can be derived", () => {
+    expect(() =>
+      planParkedHarnessInstall({
+        agentAccount: "sanctuary-hermes",
+        agentUid: 503,
+        harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+      }),
+    ).toThrow(/refusal-record path needs/);
   });
 
   it("parses the line-based record into a reason plus non-secret observations", () => {
@@ -251,6 +271,33 @@ describe("wrapper refusal diagnostic record", () => {
     expect(() =>
       parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\nreason=line\nbreak\n`),
     ).toThrow(ReleaseBarrierError);
+    expect(() =>
+      parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\nreason=bad\u001bvalue\n`),
+    ).toThrow(/unsafe value/);
+    expect(() =>
+      parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\nreason=${"a".repeat(241)}\n`),
+    ).toThrow(/unsafe value/);
+    expect(() =>
+      parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\nexpected_generation=7\n`),
+    ).toThrow(/missing reason/);
+    expect(() =>
+      parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\nbad\u001bkey=ok\nreason=ok\n`),
+    ).toThrow(/key .* is unsafe/);
+    expect(() =>
+      parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\n${"a".repeat(65)}=ok\nreason=ok\n`),
+    ).toThrow(/key .* is unsafe/);
+
+    const hostileKey = `\u001b[2K\r${"release_APPROVED_by_operator_policy".repeat(16)}`;
+    try {
+      parseReleaseWrapperRefusalRecord(`${RELEASE_REFUSAL_RECORD_HEADER}\n${hostileKey}=~\nreason=ok\n`);
+      throw new Error("expected unsafe key to be refused");
+    } catch (err) {
+      const message = (err as Error).message;
+      expect(message).not.toContain("\u001b");
+      expect(message).not.toContain("\r");
+      expect(message.length).toBeLessThan(180);
+      expect(message).toContain("wrapper refusal record key");
+    }
   });
 
   it("the wrapper refusal recorder never serializes token contents, the proxy URL, or token JSON", () => {
@@ -258,6 +305,7 @@ describe("wrapper refusal diagnostic record", () => {
     expect(match).not.toBeNull();
     const recorder = match![1]!;
     expect(recorder).not.toMatch(/\$TOKEN_JSON|\$TOKEN_SECRET|\$PROXY_URL/);
+    expect(recorder).toContain("umask 077");
     expect(recorder).toContain("token_secret_shape");
     expect(recorder).toContain("token_generation");
   });
@@ -479,6 +527,7 @@ describe("barrier plist form", () => {
       agentAccount: "sanctuary-hermes",
       agentUid: 503,
       harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+      fortressPath: "/Users/op/.sanctuary",
       expectedGenerationId: 42,
       expectedGatePort: 49152,
     });
@@ -535,6 +584,7 @@ describe("barrier plist form", () => {
       agentAccount: "sanctuary-hermes",
       agentUid: 503,
       harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+      fortressPath: "/Users/op/.sanctuary",
       expectedGenerationId: 42,
       expectedGatePort: 49152,
     });
@@ -558,6 +608,7 @@ describe("barrier plist form", () => {
         agentAccount: "sanctuary-hermes",
         agentUid: 503,
         harnessLaunch: launchWithProxySecret,
+        fortressPath: "/Users/op/.sanctuary",
         expectedGenerationId: 42,
         expectedGatePort: 49152,
       }),
@@ -580,10 +631,20 @@ describe("barrier plist form", () => {
 
   it("plan refuses a root account and a non-positive uid (renderer validation still applies)", () => {
     expect(() =>
-      planParkedHarnessInstall({ agentAccount: "root", agentUid: 503, harnessLaunch: testLaunch(["/x"]) }),
+      planParkedHarnessInstall({
+        agentAccount: "root",
+        agentUid: 503,
+        harnessLaunch: testLaunch(["/x"]),
+        fortressPath: "/Users/op/.sanctuary",
+      }),
     ).toThrow(/root/);
     expect(() =>
-      planParkedHarnessInstall({ agentAccount: "sanctuary-hermes", agentUid: 0, harnessLaunch: testLaunch(["/x"]) }),
+      planParkedHarnessInstall({
+        agentAccount: "sanctuary-hermes",
+        agentUid: 0,
+        harnessLaunch: testLaunch(["/x"]),
+        fortressPath: "/Users/op/.sanctuary",
+      }),
     ).toThrow(ReleaseBarrierError);
   });
 
@@ -736,6 +797,7 @@ describe("executeParkedHarnessInstall", () => {
     agentAccount: "sanctuary-hermes",
     agentUid: 503,
     harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+    fortressPath: "/Users/op/.sanctuary",
   });
 
   it("writes wrapper 0755 + plist 0644, disables, stands down, removes any stale hold file, and NEVER bootstraps", async () => {
@@ -1456,6 +1518,7 @@ describe("revertParkedHarnessInstall (drill-D2 fix-round: the stand-down is reve
     agentAccount: "sanctuary-hermes",
     agentUid: 503,
     harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
+    fortressPath: "/Users/op/.sanctuary",
   });
 
   it("R5: a revert that cannot restart a LIVE harness reports it RUNNING, never STOPPED", async () => {
@@ -1625,6 +1688,7 @@ describe("parked install against a REAL, NON-EXISTENT hold directory (drill D1)"
         agentUid: 503,
         harnessLaunch: testLaunch(["/usr/local/bin/node", "/opt/harness.js"]),
         holdDir,
+        logDir: join(tmpRoot, "logs"),
       });
       expect(realPlan.wrapperPath).toBe(join(holdDir, "release-exec-wrapper.sh"));
 

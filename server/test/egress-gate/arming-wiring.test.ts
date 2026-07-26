@@ -66,8 +66,10 @@ import {
   harnessLaunchSpec,
 } from "../../src/egress-gate/harness-daemon.js";
 import {
+  RELEASE_REFUSAL_RECORD_HEADER,
   holdFilePathForUid,
   planParkedHarnessInstall,
+  releaseRefusalRecordPath,
   type ReleaseBarrierOps,
 } from "../../src/egress-gate/release-barrier.js";
 import {
@@ -588,6 +590,57 @@ describe("verifyHarnessJobDisabled (persistent override-db read-back)", () => {
       const { fn } = parkLaunchctl(c);
       const verdict = await verifyHarnessJobDisabled(fn);
       expect(verdict.ok).toBe(false);
+    }
+  });
+});
+
+describe("createProductionReleaseBarrierOps wrapper-refusal reader", () => {
+  function mkReaderOps(harnessLogDir: string) {
+    return createProductionReleaseBarrierOps({
+      agentUid: 502,
+      agentAccount: "sanctuary-hermes",
+      harnessLaunch: TEST_LAUNCH,
+      fortressPath: "/fortress/a",
+      harnessLogDir,
+      gateUid: 511,
+      oracle: {} as never,
+      rearm: "boot-rearm",
+      internals: { registry: {} as never },
+    });
+  }
+
+  it("reads the real diagnostic path as absent, present, and unreadable", async () => {
+    const harnessLogDir = await mkdtemp(join(tmpdir(), "sanctuary-refusal-reader-"));
+    try {
+      const recordPath = releaseRefusalRecordPath(harnessLogDir);
+      const ops = mkReaderOps(harnessLogDir);
+
+      await expect(ops.readWrapperRefusalRecord()).resolves.toEqual({ status: "absent" });
+
+      await writeFile(
+        recordPath,
+        [
+          RELEASE_REFUSAL_RECORD_HEADER,
+          "reason=hold file absent; no committed generation has released this uid",
+          "expected_generation=7",
+          "gate_port=49152",
+          "",
+        ].join("\n"),
+      );
+      const present = await ops.readWrapperRefusalRecord();
+      expect(present.status).toBe("present");
+      if (present.status !== "present") throw new Error("expected present refusal record");
+      expect(present.record.reason).toBe("hold file absent; no committed generation has released this uid");
+      expect(present.record.observations.expected_generation).toBe("7");
+
+      await writeFile(recordPath, "wrong header\nreason=x\n");
+      const unreadable = await ops.readWrapperRefusalRecord();
+      expect(unreadable.status).toBe("unreadable");
+      if (unreadable.status !== "unreadable") throw new Error("expected unreadable refusal record");
+      expect(unreadable.reason).toContain(recordPath);
+      expect(unreadable.reason).toContain("header mismatch");
+    } finally {
+      await rm(harnessLogDir, { recursive: true, force: true });
     }
   });
 });

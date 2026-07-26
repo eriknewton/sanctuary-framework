@@ -7,12 +7,17 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
 import {
   RELEASE_REFUSAL_RECORD_HEADER,
   ReleaseBarrierError,
   computeHarnessArgvDigest,
+  parseReleaseWrapperRefusalRecord,
+  releaseRefusalRecordPath,
   runReleaseBarrierSequence,
   type CommittedGenerationIdentity,
   type HarnessReleaseHoldRecord,
@@ -662,13 +667,83 @@ describe("runReleaseBarrierSequence: verify-running (liveness; fix-round HIGH-3)
     if (outcome.kind !== "parked") return;
     expect(outcome.stage).toBe("verify-running");
     expect(outcome.reason).toContain(
-      "the job spawned and the release wrapper refused: hold file absent; no committed generation has released this uid",
+      "an agent-writable wrapper refusal record " +
+        "(diagnostic only; not independently verified) reports: hold file absent; no committed generation has released this uid",
     );
     expect(outcome.reason).toContain("hold_file_exists=no");
     expect(outcome.reason).toContain("token_secret_shape=not_checked");
     expect(outcome.reason).not.toContain("deadbeef");
     expect(outcome.reason).not.toContain("PROXY_URL");
     expect(outcome.reason).not.toContain("may be refusing");
+  });
+
+  it("cleanup removes the hold file and restores the parked plist without deleting the diagnostic record", async () => {
+    const root = await mkdtemp(join(tmpdir(), "release-cleanup-record-"));
+    try {
+      const holdDir = join(root, "hold");
+      const logDir = join(root, "logs");
+      const holdPath = join(holdDir, "503.release");
+      const parkedPlistPath = join(root, "agent-harness.plist");
+      await mkdir(holdDir, { recursive: true });
+      await mkdir(logDir, { recursive: true });
+
+      const recordPath = releaseRefusalRecordPath(logDir);
+      await writeFile(
+        recordPath,
+        [
+          RELEASE_REFUSAL_RECORD_HEADER,
+          "reason=hold file absent; no committed generation has released this uid",
+          "expected_generation=7",
+          "gate_port=49152",
+          "",
+        ].join("\n"),
+      );
+
+      let bootstrapped = false;
+      const { ops, calls } = makeOps({
+        bootstrapJob: async () => {
+          calls.push("bootstrap");
+          bootstrapped = true;
+        },
+        writeHoldFile: async (record) => {
+          calls.push("writeHold");
+          await writeFile(holdPath, `generation=${record.generation_id}\n`);
+        },
+        removeHoldFile: async () => {
+          calls.push("removeHold");
+          await rm(holdPath, { force: true });
+        },
+        restoreParkedPlist: async () => {
+          calls.push("restoreParkedPlist");
+          await writeFile(parkedPlistPath, "parked\n");
+        },
+        harnessStatus: async () => {
+          calls.push("harnessStatus");
+          return bootstrapped
+            ? { known: true, installed: true, running: false }
+            : { known: true, installed: true, running: false };
+        },
+        readWrapperRefusalRecord: async () => ({
+          status: "present" as const,
+          record: parseReleaseWrapperRefusalRecord(await readFile(recordPath, "utf8")),
+        }),
+      });
+
+      const outcome = await runReleaseBarrierSequence(CTX, ops);
+      expect(outcome.kind).toBe("parked");
+      if (outcome.kind !== "parked") return;
+      expect(outcome.stage).toBe("verify-running");
+      expect(outcome.holdFileRemoved).toBe(true);
+      expect(outcome.jobDisabled).toBe(true);
+      expect(outcome.reason).toContain("agent-writable wrapper refusal record");
+      await expect(readFile(holdPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(parkedPlistPath, "utf8")).toBe("parked\n");
+      const survivingRecord = parseReleaseWrapperRefusalRecord(await readFile(recordPath, "utf8"));
+      expect(survivingRecord.reason).toBe("hold file absent; no committed generation has released this uid");
+      expect(calls.filter((c) => c === "restoreParkedPlist")).toHaveLength(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("distinguishes a job that never spawned from a wrapper refusal", async () => {
