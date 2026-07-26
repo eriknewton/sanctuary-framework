@@ -88,7 +88,11 @@ import {
 import type { ProvisionFlowOutcome } from "../castle-wall/provision/index.js";
 import { ProvisionLockHeldError } from "../castle-wall/provision/index.js";
 import { harnessDispositionSentence } from "../egress-gate/parked-claim.js";
-import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE } from "../egress-gate/operator-advice.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+} from "../egress-gate/operator-advice.js";
 import {
   buildV11Bindings,
   fortressIdFromStoragePath,
@@ -2069,7 +2073,7 @@ export function renderAutoProvisionOutcomeLines(summary: AutoProvisionSummary): 
         `  WARNING: the exclusive-egress gate is LIVE (uid ${outcome.uid}, generation ${outcome.generationId}) and the ` +
           `agent's only sanctioned egress path is the gate, but the persistent boot state could NOT be re-parked ` +
           `(${outcome.reparkError}). ` +
-          `The NEXT boot could start the agent before the gate re-arms. Run '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}' now.`,
+          `The NEXT boot could start the agent before the gate re-arms. Run '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) now.`,
       ];
     case "exclusive-egress-unarmed-coarse-active": {
       // S5-6 degrade-loud: DISTINCT non-green state; every posture surface

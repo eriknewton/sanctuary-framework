@@ -3304,7 +3304,7 @@ export function describeNoAccountResidueTeardown(
           "registry entry, pf anchor, gate daemon), or remove the confinement for that uid " +
           `directly: the S5-1 anchor registry at ${PF_ANCHOR_REGISTRY_PATH} and the gate daemon ` +
           `plist at /Library/LaunchDaemons/${EGRESS_GATE_DAEMON_LABEL_PREFIX}.<uid>.plist both name ` +
-          `the uid, and '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}' recovers an interrupted arm ` +
+          `the uid, and '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) recovers an interrupted arm ` +
           "once an account exists.",
       };
     case "partial":

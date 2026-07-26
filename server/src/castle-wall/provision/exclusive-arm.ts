@@ -42,6 +42,8 @@ import {
 } from "../../egress-gate/parked-claim.js";
 import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
 } from "../../egress-gate/operator-advice.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
@@ -406,10 +408,10 @@ async function degradeLoud(
           // path that provably clears it.
           "The manifest could NOT be restored to coarse scope, so the fortress is STILL in EXCLUSIVE " +
           "routing composition: a plain 'sudo sanctuary protect --hermes' will be REFUSED until it is " +
-          "cleared with 'sudo sanctuary protect --unprotect-egress-gate --stand-down-agent (stops and disables the agent harness)'. ") +
+          `cleared with '${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}). `) +
       // The ONE sentence about run state, and it comes from the chokepoint.
       harnessDispositionSentence(harness) +
-      " Fix with: sudo sanctuary protect --repair-egress-gate --stand-down-agent (stops and disables the agent harness)",
+      ` Fix with: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
   );
   return {
     kind: "degraded-coarse-active",

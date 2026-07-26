@@ -3964,7 +3964,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
             input.print(
               `[castle-wall] oracle refresh: entry for uid ${entry.agent_uid} has no usable generation_id; ` +
                 `its gate denies within one TTL (fail-closed); repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE} ` +
-                "(warn-once until the registry is clean)",
+                "(warn-once)",
             );
           }
           continue;

@@ -82,7 +82,11 @@ import {
   type PfLivenessResult,
 } from "./pf-anchor.js";
 import { PF_ENABLE_TOKEN_RE, type PfEnableReference } from "./pf-enable-state.js";
-import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE } from "./operator-advice.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+} from "./operator-advice.js";
 
 export { ProvisionLockHeldError } from "../castle-wall/provision/lockfile.js";
 
@@ -335,7 +339,7 @@ export class PfAnchorRegistryDirtyError extends Error {
     super(
       "pf-anchor registry is DIRTY: a mutation failed and the rollback to the previous " +
         "confined-uid union also failed, so the anchor and the registry may diverge. Posture " +
-        `must be treated as NOT protected until '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}' re-asserts ` +
+        `must be treated as NOT protected until '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) re-asserts ` +
         `the union. Original failure: ${errText(cause)}. Rollback failure: ${errText(rollbackError)}.`,
     );
     this.name = "PfAnchorRegistryDirtyError";
@@ -861,7 +865,7 @@ export class PfAnchorRegistry {
         reason:
           "registry-level generation_floor is malformed (not a committed entry; the raw value " +
           "is preserved for repair); generation-floor monotonicity cannot be trusted until " +
-          `'${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}' resolves it`,
+          `'${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) resolves it`,
       });
     }
     const dirty =

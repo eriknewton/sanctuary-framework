@@ -884,6 +884,50 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 MED-5: refresh loop re
     expect(printed.join("\n")).toContain("oracle refresh STUCK");
   });
 
+  it("a mixed legacy entry and healthy uid still escalates instead of letting the healthy refresh clear misses", async () => {
+    const legacyEntry: BootRegistryEntry = {
+      agent_uid: ENTRY.agent_uid,
+      gate_port: ENTRY.gate_port,
+      fortress_path: ENTRY.fortress_path,
+    };
+    const healthyEntry: BootRegistryEntry = {
+      agent_uid: 601,
+      gate_port: 40002,
+      fortress_path: "/fortress/b",
+      generation_id: 7,
+    };
+    const printed: string[] = [];
+    const refreshed: number[] = [];
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async ({ agent_uid }) => ({
+        ...OK_CTX,
+        gateUid: agent_uid === healthyEntry.agent_uid ? 612 : OK_CTX.gateUid,
+      }),
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 5,
+      internals: baseInternals({
+        oracleRefreshStuckThreshold: 2,
+        listRegistryEntries: async () => ({ entries: [legacyEntry, healthyEntry], quarantined: [], dirty: false }),
+        createOracle: (() => ({
+          refresh: async (binding: { agentUid: number }) => {
+            refreshed.push(binding.agentUid);
+            return null;
+          },
+        })) as never,
+      }),
+    });
+    const deadline = Date.now() + 2_000;
+    while (!printed.some((line) => line.includes("oracle refresh STUCK")) && Date.now() < deadline) {
+      await sleep(5);
+    }
+    handle.stopOracleLoop();
+    expect(refreshed).toContain(healthyEntry.agent_uid);
+    expect(refreshed).not.toContain(legacyEntry.agent_uid);
+    expect(printed.join("\n")).toContain("entry for uid 502 has no usable generation_id");
+    expect(printed.join("\n")).toContain("oracle refresh STUCK");
+  });
+
   it("per-uid oracle refresh throws escalate as stuck instead of resetting the miss counter", async () => {
     const printed: string[] = [];
     let refreshCalls = 0;
