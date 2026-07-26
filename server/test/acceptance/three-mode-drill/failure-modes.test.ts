@@ -363,16 +363,22 @@ describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
       // the detector's policy-conflict observer records both versions for the
       // shared (agent, parent_version) key and raises SPLIT_BRAIN.
       //
-      // ORDERING BARRIER (do not remove -- this is a correctness constraint,
-      // not a speed-up). The detector only counts a policy_update whose
-      // PolicyBundleStore result is `applied`, and the store rejects any
-      // version <= the one it already holds as `policy_version_replay`. Two
-      // gossipsub publishes from two DIFFERENT peers have no delivery-order
-      // guarantee at A, so if C's v8 landed first, B's v7 would be rejected as
-      // a replay, only ONE version would ever be recorded for the shared
-      // (agent, parent_version) key, and the split-brain condition below would
-      // never hold -- at any timeout. We therefore publish v7 first and wait
-      // for A to have APPLIED it before publishing v8.
+      // ORDERING BARRIER. Two gossipsub publishes from two DIFFERENT peers
+      // have no delivery-order guarantee at A, so this test pins the order:
+      // publish v7, wait for A to have APPLIED it, then publish v8. That keeps
+      // the drill deterministic about WHICH version A ends up holding.
+      //
+      // It is no longer load-bearing for detection itself. The detector used
+      // to count only policy_updates whose PolicyBundleStore result was
+      // `applied`, and the store refuses any version <= the one it already
+      // holds as `policy_version_replay`; so if C's v8 had landed first, B's
+      // v7 was thrown away and the conflict below could never hold, at any
+      // timeout. The detector now also records a refusal that carries a
+      // different origin under the same parent_version, so both arrival orders
+      // raise SPLIT_BRAIN. Both orders are covered deterministically in
+      // `test/mesh/failure-modes.test.ts` ("policy conflict is arrival-order
+      // independent"), which is where that property is proven; keep this
+      // barrier so the drill does not depend on network luck.
       const agentId = "agent-split";
       await drill.nodeB.publishPolicyUpdate({
         payload: {
