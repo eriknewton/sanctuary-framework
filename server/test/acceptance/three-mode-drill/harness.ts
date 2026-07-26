@@ -119,9 +119,28 @@ export interface ThreeModeDrillHandle {
 }
 
 /**
+ * ONE shared budget for "a gossipsub message published on one node has been
+ * received and dispatched on another", used instead of a per-call-site magic
+ * number.
+ *
+ * Sizing rationale: locally these settle in well under 2s; a shared CI runner
+ * under concurrent job load is the slow case, so CI gets a deliberately
+ * generous multiple. This is HEADROOM ONLY. Raising it can only ever fix a
+ * genuinely-slow wait -- if a wait can never become true (a wrong or racy
+ * condition), no budget rescues it and the right fix is at the call site, not
+ * here. Do not reach for this constant to silence a wait that fails
+ * deterministically.
+ */
+export const GOSSIP_SETTLE_MS = process.env.CI ? 60_000 : 20_000;
+
+/**
  * Poll `check` until it returns truthy or the deadline expires. Throws a
  * descriptive error on timeout so a flaky libp2p boot shows up clearly in
  * vitest output instead of as an opaque assertion failure downstream.
+ *
+ * `check` is awaited and its rejections are NOT swallowed: a throwing check
+ * propagates immediately rather than being retried until the deadline, so the
+ * timeout message never stands in for a real error.
  */
 export async function waitFor(
   check: () => boolean | Promise<boolean>,
@@ -134,6 +153,9 @@ export async function waitFor(
     if (await check()) return;
     await new Promise((r) => setTimeout(r, stepMs));
   }
+  // One last look: the condition may have become true during the final sleep,
+  // and reporting a timeout without re-checking would be its own timing flake.
+  if (await check()) return;
   throw new Error(`waitFor: ${label} did not hold within ${timeoutMs}ms`);
 }
 

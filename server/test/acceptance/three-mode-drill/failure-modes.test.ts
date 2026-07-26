@@ -44,7 +44,12 @@ import type {
 } from "../../../src/mesh/types.js";
 import type { CompiledPolicy } from "../../../src/policy-engine/types.js";
 
-import { bootThreeModeDrill, type ThreeModeDrillHandle, waitFor } from "./harness.js";
+import {
+  bootThreeModeDrill,
+  GOSSIP_SETTLE_MS,
+  type ThreeModeDrillHandle,
+  waitFor,
+} from "./harness.js";
 
 let active: ThreeModeDrillHandle | null = null;
 
@@ -357,6 +362,17 @@ describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
       // but different policy_versions. Node A observes both via gossipsub;
       // the detector's policy-conflict observer records both versions for the
       // shared (agent, parent_version) key and raises SPLIT_BRAIN.
+      //
+      // ORDERING BARRIER (do not remove -- this is a correctness constraint,
+      // not a speed-up). The detector only counts a policy_update whose
+      // PolicyBundleStore result is `applied`, and the store rejects any
+      // version <= the one it already holds as `policy_version_replay`. Two
+      // gossipsub publishes from two DIFFERENT peers have no delivery-order
+      // guarantee at A, so if C's v8 landed first, B's v7 would be rejected as
+      // a replay, only ONE version would ever be recorded for the shared
+      // (agent, parent_version) key, and the split-brain condition below would
+      // never hold -- at any timeout. We therefore publish v7 first and wait
+      // for A to have APPLIED it before publishing v8.
       const agentId = "agent-split";
       await drill.nodeB.publishPolicyUpdate({
         payload: {
@@ -370,6 +386,12 @@ describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
         principal_private_key: drill.root_principal_keypair.privateKey,
         emitter_principal: drill.root_principal_cert.principal_id,
       });
+      await waitFor(
+        () => drill.nodeA.getPolicyBundle().versionOf(agentId) === 7,
+        GOSSIP_SETTLE_MS,
+        50,
+        "A applied B's policy_version 7"
+      );
       await drill.nodeC.publishPolicyUpdate({
         payload: {
           agent_id: agentId,
@@ -394,12 +416,7 @@ describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
             )
           );
         },
-        // CI-load headroom: the condition always eventually holds (the test
-        // passes in <2s locally, N=3), but shared CI runners under concurrent
-        // job load have intermittently exceeded 15s here. No race - just a
-        // timing flake; 30s gives margin while a genuinely-broken dispatch
-        // still fails.
-        30_000,
+        GOSSIP_SETTLE_MS,
         50,
         "split-brain conflict observed on A"
       );
@@ -456,7 +473,10 @@ describe("three-mode-drill §12.8 - five §8 failure modes end-to-end", () => {
       );
       expect(splitBrainBridged).toBeDefined();
     },
-    90_000
+    // Boot (~37s of bounded harness waits worst case) + two GOSSIP_SETTLE_MS
+    // budgets. Sized so a slow wait reports through waitFor's descriptive
+    // message rather than as an opaque vitest test-timeout.
+    180_000
   );
 
   it(
