@@ -167,10 +167,11 @@ export async function assessHarnessParked(
 
   let status: HarnessDaemonStatus;
   try {
-    status = await awaitHarnessStoppedVia(
+    const settled = await awaitHarnessStoppedVia(
       () => source.probe.harnessStatus(),
       source.probe.sleepMs,
     );
+    status = settled.status;
   } catch (err) {
     return unknownClaim(
       `the launchd status probe errored (${err instanceof Error ? err.message : String(err)})`,

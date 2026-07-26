@@ -40,7 +40,7 @@ describe("Castle Wall macOS daemon integration", () => {
     const message = formatCastleWallAlreadyRunningMessage(4242);
     expect(message).toContain("PID 4242");
     expect(message).not.toContain("<pid>");
-    expect(formatCastleWallAlreadyRunningMessage()).toContain("PID pid unavailable");
+    expect(formatCastleWallAlreadyRunningMessage()).toContain("(pid unavailable)");
   });
 
   // Stand up a REAL listener on `socketPath` so the daemon's liveness probe

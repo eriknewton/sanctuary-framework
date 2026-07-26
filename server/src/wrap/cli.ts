@@ -308,9 +308,9 @@ export interface WrapOptions {
    */
   repairEgressGate?: boolean;
   /**
-   * Operator disclosure for the S5-6/S5-7 repair and unprotect verbs: the
-   * sequence will stop/disable the agent harness and verify launchd settled it
-   * stopped before continuing. This is explicit because it stops the agent.
+   * Required operator acknowledgement for the S5-6/S5-7 repair and unprotect
+   * verbs: the sequence stops/disables the agent harness and verifies launchd
+   * settled it stopped before continuing.
    */
   standDownAgent?: boolean;
   /**
@@ -5167,6 +5167,16 @@ export function parseWrapArgs(argv: string[]): WrapOptions {
     }
   }
 
+  if (
+    options.standDownAgent === true &&
+    options.repairEgressGate !== true &&
+    options.unprotectEgressGate !== true
+  ) {
+    throw new Error(
+      "--stand-down-agent is only valid with --repair-egress-gate or --unprotect-egress-gate.",
+    );
+  }
+
   return options;
 }
 
@@ -5234,9 +5244,9 @@ function printWrapHelp(): void {
                        Pass the absolute path to dist/cli.js.
     --stand-down-agent
                        With --repair-egress-gate or --unprotect-egress-gate,
-                       explicitly stop and disable the agent harness first,
-                       wait for launchd to settle it stopped, then proceed.
-                       This stops the agent.
+                       acknowledge and permit the required agent-harness stop.
+                       Those verbs stop and disable the harness before changing
+                       exclusive-egress state and refuse without this flag.
     --help, -h         Show this help
 
   What happens:

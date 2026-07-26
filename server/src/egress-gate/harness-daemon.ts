@@ -684,6 +684,15 @@ export interface HarnessDaemonStatus {
   pid?: number;
 }
 
+export interface HarnessStopSettleResult {
+  /** The final launchd status sample. */
+  status: HarnessDaemonStatus;
+  /** Number of status samples taken. */
+  samples: number;
+  /** Measured wall-clock time spent in the settle loop. */
+  elapsedMs: number;
+}
+
 /**
  * Query `launchctl print system/<label>` and parse the state. Fail-closed
  * for POSTURE purposes: an absent service is known-not-installed, but a
@@ -755,20 +764,23 @@ export async function agentHarnessDaemonStableRunning(ops: HarnessDaemonOps): Pr
 export async function awaitHarnessStoppedVia(
   sample: () => Promise<HarnessDaemonStatus>,
   sleepMs?: (ms: number) => Promise<void>,
-): Promise<HarnessDaemonStatus> {
+): Promise<HarnessStopSettleResult> {
   const sleep = sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const stillAlive = (s: HarnessDaemonStatus): boolean => s.known && (s.running || s.pid !== undefined);
+  const startedAt = Date.now();
+  let samples = 1;
   let status = await sample();
   for (let i = 1; i < HARNESS_STOP_SETTLE_SAMPLES && stillAlive(status); i++) {
     await sleep(HARNESS_STOP_SETTLE_INTERVAL_MS);
+    samples += 1;
     status = await sample();
   }
-  return status;
+  return { status, samples, elapsedMs: Date.now() - startedAt };
 }
 
 /** {@link awaitHarnessStoppedVia} bound to `launchctl print` through `ops`. */
 export async function awaitAgentHarnessDaemonStopped(ops: HarnessDaemonOps): Promise<HarnessDaemonStatus> {
-  return awaitHarnessStoppedVia(() => agentHarnessDaemonStatus(ops), ops.sleepMs);
+  return (await awaitHarnessStoppedVia(() => agentHarnessDaemonStatus(ops), ops.sleepMs)).status;
 }
 
 /**

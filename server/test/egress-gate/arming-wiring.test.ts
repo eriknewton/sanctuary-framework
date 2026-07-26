@@ -390,7 +390,7 @@ describe("parkHarnessPersistently (fix-round-2 HIGH-2: full persistent park)", (
     });
     const fs = parkFs();
     await expect(parkHarnessPersistently(PARK_CTX, { runLaunchctlFn: fn, ...fs })).rejects.toThrow(
-      /still RUNNING after waiting .* \(pid 4242\)/,
+      /still RUNNING after waiting .* across .* samples \(pid 4242\)/,
     );
   });
 
@@ -485,8 +485,7 @@ describe("verifyHarnessParkedPersistent (fix-round-2 HIGH-2: posture verify enum
     expect(calls.filter((c) => c.startsWith("print system/"))).toHaveLength(2);
   });
 
-  it("fails closed when launchd never settles stopped and names the waited window", async () => {
-    const waitMs = (HARNESS_STOP_SETTLE_SAMPLES - 1) * HARNESS_STOP_SETTLE_INTERVAL_MS;
+  it("fails closed when launchd never settles stopped and names the measured wait and sample count", async () => {
     let printSamples = 0;
     const fn = async (args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
       if (args[0] === "print-disabled") {
@@ -505,9 +504,34 @@ describe("verifyHarnessParkedPersistent (fix-round-2 HIGH-2: posture verify enum
     });
     expect(verdict.ok).toBe(false);
     expect(printSamples).toBe(HARNESS_STOP_SETTLE_SAMPLES);
-    expect((verdict as { problems: string[] }).problems.join(" ")).toContain(
-      `still RUNNING after waiting ${waitMs} ms (pid 4242)`,
-    );
+    const problem = (verdict as { problems: string[] }).problems.join(" ");
+    expect(problem).toMatch(/still RUNNING after waiting \d+ ms across 20 samples \(pid 4242\)/);
+    expect(problem).not.toContain(`${(HARNESS_STOP_SETTLE_SAMPLES - 1) * HARNESS_STOP_SETTLE_INTERVAL_MS} ms`);
+  });
+
+  it("fails closed on an untrustworthy launchd status without fabricating a wait", async () => {
+    let printSamples = 0;
+    const fn = async (args: readonly string[]): Promise<{ code: number; stdout: string; stderr: string }> => {
+      if (args[0] === "print-disabled") {
+        return { code: 0, stdout: `\t"${AGENT_HARNESS_DAEMON_LABEL}" => disabled\n`, stderr: "" };
+      }
+      if (args[0] === "print") {
+        printSamples += 1;
+        return { code: 5, stdout: "", stderr: "launchd transient failure" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const verdict = await verifyHarnessParkedPersistent(PARK_CTX, {
+      runLaunchctlFn: fn,
+      sleepMs: async () => undefined,
+      ...parkFs({ [PARKED_PLAN.plistPath]: PARKED_PLAN.plistContent }),
+    });
+    expect(verdict.ok).toBe(false);
+    expect(printSamples).toBe(1);
+    const problem = (verdict as { problems: string[] }).problems.join(" ");
+    expect(problem).toContain("launchctl did not return a trustworthy harness status");
+    expect(problem).toContain("sampling once with no settle wait");
+    expect(problem).not.toContain(`${(HARNESS_STOP_SETTLE_SAMPLES - 1) * HARNESS_STOP_SETTLE_INTERVAL_MS} ms`);
   });
 
   it("STALE RELEASE MATERIAL is enumerated: lingering hold file and a non-parked (released) plist are each named", async () => {

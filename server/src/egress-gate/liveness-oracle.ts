@@ -129,8 +129,12 @@ export interface LivenessOracleRefreshOptions {
    * Last-chance write guard evaluated after the live probe and immediately
    * before publishing. A supervisor can abandon a timed-out attempt without
    * letting that old async path mint a later live token.
+   *
+   * Return `false` to invalidate an existing token. Return `"skip"` when the
+   * caller has already invalidated the token for this abandoned attempt and
+   * only needs to suppress a late publish.
    */
-  shouldPublish?: () => boolean;
+  shouldPublish?: () => boolean | "skip";
 }
 
 /**
@@ -220,11 +224,16 @@ export class GateLivenessOracle {
       await this.ops.removeToken(agentUid);
       return null;
     }
-    if (options.shouldPublish !== undefined && !options.shouldPublish()) {
+    const publishDecision = options.shouldPublish?.();
+    if (publishDecision !== undefined && publishDecision !== true) {
       // The caller no longer trusts this observation (for example, its refresh
       // attempt timed out and was abandoned). Do not turn it into a fresh live
-      // token later; invalidate instead so the gate keeps denying fail-closed.
-      await this.ops.removeToken(agentUid);
+      // token later. Most callers invalidate here; the supervisor's timeout
+      // branch invalidates when the attempt is abandoned, so its later
+      // completion uses "skip" to avoid stripping a newer token.
+      if (publishDecision !== "skip") {
+        await this.ops.removeToken(agentUid);
+      }
       return null;
     }
     const claims: LivenessTokenClaims = {

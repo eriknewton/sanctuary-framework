@@ -3014,9 +3014,22 @@ export function describeStandDownAgentForCli(
   verb: "--repair-egress-gate" | "--unprotect-egress-gate",
 ): string {
   return (
-    `${verb} --stand-down-agent: stopping and disabling the agent harness, then waiting for ` +
-    "launchd to settle it stopped before continuing. This stops the agent."
+    `${verb} --stand-down-agent: acknowledged operator opt-in to stop and disable the agent ` +
+    "harness, then wait for launchd to settle it stopped before continuing."
   );
+}
+
+export function ensureStandDownAgentAcknowledgedForCli(
+  standDownAgent: boolean | undefined,
+  print: (line: string) => void,
+  verb: "--repair-egress-gate" | "--unprotect-egress-gate",
+): boolean {
+  if (standDownAgent === true) return true;
+  print(
+    `${verb} stops and disables the agent harness before changing exclusive-egress state. ` +
+      `This is not the silent default: re-run with ${verb} --stand-down-agent to acknowledge the stop and proceed.`,
+  );
+  return false;
 }
 
 function withExplicitStandDownAgent<T extends { parkHarness(): Promise<void> }>(
@@ -3110,6 +3123,9 @@ export async function runEgressGateRepairForCli(options: {
     print("Repairing the exclusive-egress gate requires root. Re-run: sudo sanctuary protect --repair-egress-gate");
     return 2;
   }
+  if (!ensureStandDownAgentAcknowledgedForCli(options.standDownAgent, print, "--repair-egress-gate")) {
+    return 2;
+  }
   const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
   const operatorIdentity = await resolveIdentity();
   if (operatorIdentity === undefined) {
@@ -3169,9 +3185,7 @@ export async function runEgressGateRepairForCli(options: {
     () =>
       runEgressGateRepair(
         { agentUid, isTty: options.isTty, overrideTransientPfRules: options.overrideTransientPfRules },
-        options.standDownAgent === true
-          ? withExplicitStandDownAgent(createRepairExclusiveEgressOps(wiring), print, "--repair-egress-gate")
-          : createRepairExclusiveEgressOps(wiring),
+        withExplicitStandDownAgent(createRepairExclusiveEgressOps(wiring), print, "--repair-egress-gate"),
       ),
     print,
   );
@@ -3327,6 +3341,9 @@ export async function runEgressGateUnprotectForCli(options: {
     );
     return 2;
   }
+  if (!ensureStandDownAgentAcknowledgedForCli(options.standDownAgent, print, "--unprotect-egress-gate")) {
+    return 2;
+  }
   const resolveIdentity = options.resolveOperatorIdentity ?? resolveOperatorIdentity;
   const operatorIdentity = await resolveIdentity();
   if (operatorIdentity === undefined) {
@@ -3413,9 +3430,7 @@ export async function runEgressGateUnprotectForCli(options: {
   });
   const outcome = await runEgressGateUnprotect(
     { agentUid },
-    options.standDownAgent === true
-      ? withExplicitStandDownAgent(createUnprotectExclusiveEgressOps(wiring), print, "--unprotect-egress-gate")
-      : createUnprotectExclusiveEgressOps(wiring),
+    withExplicitStandDownAgent(createUnprotectExclusiveEgressOps(wiring), print, "--unprotect-egress-gate"),
   );
   switch (outcome.kind) {
     case "unprotected":

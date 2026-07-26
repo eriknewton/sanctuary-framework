@@ -1,6 +1,6 @@
 {
   "name": "@sanctuary-framework/mcp-server",
-  "version": "1.7.1",
+  "version": "1.7.0",
   "description": "The open source standard for secure, private AI: a wall the operating system enforces in both directions, and your data under your own keys, portable anywhere. Any agent, local or cloud, solo or fleet.",
   "type": "module",
   "main": "dist/index.cjs",

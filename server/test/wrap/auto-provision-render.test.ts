@@ -13,6 +13,7 @@ import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
 import {
   describeNoAccountResidueTeardown,
   describeStandDownAgentForCli,
+  ensureStandDownAgentAcknowledgedForCli,
   type AutoProvisionSummary,
 } from "../../src/wrap/auto-provision.js";
 import {
@@ -321,11 +322,34 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
 });
 
 describe("describeStandDownAgentForCli", () => {
-  it("plainly says the explicit repair flag stops the agent", () => {
+  it("plainly says the repair flag acknowledges the required agent stop", () => {
     const line = describeStandDownAgentForCli("--repair-egress-gate");
     expect(line).toContain("--repair-egress-gate --stand-down-agent");
-    expect(line).toContain("stopping and disabling the agent harness");
-    expect(line).toContain("This stops the agent.");
+    expect(line).toContain("acknowledged operator opt-in");
+    expect(line).toContain("stop and disable the agent harness");
+  });
+
+  it("refuses repair/unprotect when the required stand-down acknowledgement is absent", () => {
+    const printed: string[] = [];
+    const ok = ensureStandDownAgentAcknowledgedForCli(
+      undefined,
+      (line) => printed.push(line),
+      "--unprotect-egress-gate",
+    );
+    expect(ok).toBe(false);
+    expect(printed.join("\n")).toContain("--unprotect-egress-gate stops and disables the agent harness");
+    expect(printed.join("\n")).toContain("--unprotect-egress-gate --stand-down-agent");
+  });
+
+  it("allows repair/unprotect when the stand-down acknowledgement is present", () => {
+    const printed: string[] = [];
+    const ok = ensureStandDownAgentAcknowledgedForCli(
+      true,
+      (line) => printed.push(line),
+      "--repair-egress-gate",
+    );
+    expect(ok).toBe(true);
+    expect(printed).toEqual([]);
   });
 });
 

@@ -54,6 +54,12 @@ describe("Wrap CLI", () => {
       expect(opts.standDownAgent).toBe(true);
     });
 
+    it("rejects --stand-down-agent without repair or unprotect so it cannot be silently ignored", () => {
+      expect(() => parseWrapArgs(["--stand-down-agent"])).toThrow(
+        /only valid with --repair-egress-gate or --unprotect-egress-gate/,
+      );
+    });
+
     it("parses --unwrap flag", () => {
       const opts = parseWrapArgs(["--unwrap"]);
       expect(opts.unwrap).toBe(true);

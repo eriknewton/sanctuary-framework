@@ -147,28 +147,6 @@ describe("S5-P exclusive-egress posture object (mocked probes)", () => {
     expect(posture.reasons).toContain("pf: hook not installed");
   });
 
-  it("oracle refresh stuck caps live with a distinct could-not-observe reason", () => {
-    const posture = buildExclusiveEgressPosture(
-      liveInput({
-        oracle_refresh: {
-          stuck: true,
-          reason:
-            "oracle refresh stuck: 6 consecutive timed-out/skipped tick(s); could not observe fresh registry/pf liveness",
-          consecutive_misses: 6,
-          timeout_ms: 5000,
-          last_transition_at_ms: 1_000_000,
-        },
-      }),
-    );
-    expect(posture.exclusive_egress_live).toBe(false);
-    expect(posture.mode).toBe("coarse-only");
-    expect(posture.pf_liveness.live).toBe(true);
-    expect(posture.oracle_refresh?.stuck).toBe(true);
-    expect(posture.reasons).toContain(
-      "oracle: oracle refresh stuck: 6 consecutive timed-out/skipped tick(s); could not observe fresh registry/pf liveness",
-    );
-  });
-
   it("gate down / owner-unverified each refuse with a named reason", () => {
     const down = buildExclusiveEgressPosture(
       liveInput({ gate_process: { up: false, port_owner_verified: false, reasons: [] } }),

@@ -105,12 +105,10 @@ export interface DaemonSigner {
 export function formatCastleWallAlreadyRunningMessage(pid?: number | null): string {
   const pidText =
     typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0
-      ? String(pid)
+      ? `PID ${pid}`
       : "pid unavailable";
-  return `Castle Wall daemon already running for this fortress (PID ${pidText}). Multi-wrap-per-fortress is Phase 3.`;
+  return `Castle Wall daemon already running for this fortress (${pidText}). Multi-wrap-per-fortress is Phase 3.`;
 }
-
-export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE = formatCastleWallAlreadyRunningMessage();
 
 /**
  * Default cadence (seconds) of the periodic AUDIT liveness heartbeat
