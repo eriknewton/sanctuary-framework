@@ -272,6 +272,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
       bootstrapJob: async () => {
         throw new Error("harness must not bootstrap after gate verification fails");
       },
+      readWrapperRefusalRecord: async () => ({ status: "absent" as const }),
       harnessStatus: async () => ({ known: true, installed: true, running: false }),
       sleepMs: async () => undefined,
     };
@@ -1225,6 +1226,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 MED-4: generation re-c
       commitGeneration: async () => ({ generation_id: commitGen, agent_uid: 502, gate_port: gatePort }),
       writeReleasedPlist: async () => undefined,
       restoreParkedPlist: async () => undefined,
+      readWrapperRefusalRecord: async () => ({ status: "absent" as const }),
       harnessStatus: async () =>
         running
           ? { known: true, installed: true, running: true, pid: 4242 }
