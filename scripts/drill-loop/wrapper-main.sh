@@ -19,14 +19,62 @@
 #
 # EVERYTHING here treats its arguments as hostile. This process is uid 0.
 
-# The Sanctuary CLI this wrapper is permitted to invoke. Compiled in: never
-# from argv, never from the environment. This is a DECLARED trust boundary, not
-# a defended one - the entire purpose of the drill is to exercise the real
-# product under sudo, so the product's own binary necessarily runs as root.
-# What the wrapper guarantees is that it runs THIS path and no other, that the
-# path is a root-owned, non-group-writable, non-symlink regular file, and that
-# every argument handed to it has passed a rail.
-WRAPPER_CLI='/usr/local/bin/sanctuary'
+# The Sanctuary CLI this wrapper is permitted to invoke, as an ORDERED
+# CANDIDATE LIST. Compiled in: never from argv, never from the environment,
+# never resolved from PATH. This is a DECLARED trust boundary, not a defended
+# one - the entire purpose of the drill is to exercise the real product under
+# sudo, so the product's own binary necessarily runs as root. What the wrapper
+# guarantees is that it runs one of THESE paths and no other, that the one it
+# picked is a root-owned, non-group-writable, non-symlink regular file under a
+# root-owned directory chain, and that every argument handed to it has passed
+# a rail.
+#
+# WHY A LIST, AND WHY THE LIST DOES NOT WEAKEN ANYTHING. The third live
+# supervised run refused every executing verb with
+#
+#   WRAPPER=REJECT reason=CLI not found: /usr/local/bin/sanctuary
+#
+# on a drill host that HAS the product CLI: `/usr/local/bin` does not exist
+# there at all and `sanctuary` resolves to `/opt/homebrew/bin/sanctuary`. One
+# hard-coded path made "the CLI is not installed on this host" and "the CLI is
+# installed somewhere this wrapper was never told about" the same message. That
+# is the same substitution as the PyYAML walk in preflight.sh, one layer down.
+#
+# The fix is NOT to let the caller name a path (`--cli`, `$SANCTUARY_CLI`, a
+# PATH lookup), all of which would let the grant holder aim root at code it
+# writes. It is a list of absolute, CODE-CONTROLLED paths, resolved by
+# OBSERVATION: `wrapper_cli_candidate_state` probes each one and only a
+# candidate that passes the full ownership gauntlet may be selected.
+# EXISTENCE MUST NOT SELECT - that is precisely the defect this file keeps
+# finding - so a candidate that exists but is operator-writable is REFUSED and
+# named, never preferred over one further down the list.
+#
+# `/opt/homebrew/bin/sanctuary` is in the list so its state is MEASURED AND
+# REPORTED, not so it is trusted. On the drill host it is an operator-owned
+# symlink inside an operator-owned, group-writable directory, chaining into a
+# checkout in the operator's home; the gauntlet refuses it on the first rule it
+# breaks, and the operator learns from the refusal that the CLI they installed
+# is not one root may execute. Naming it is the difference between an
+# actionable refusal and a mystery.
+#
+# WHY THE REPO'S OWN `server/dist/cli.js` IS DELIBERATELY NOT A CANDIDATE.
+# It is the code under test, in a checkout the operator writes to by
+# construction, so it can never pass this gauntlet - listing it would add a
+# candidate guaranteed to be refused, and, worse, would put standing pressure
+# on a later edit to carve an exception into the ownership rule for exactly the
+# one path that must not have one. It also cannot be executed without a second
+# trusted program (an absolute `node`), and on the drill host `node` is itself
+# an operator-owned symlink into an operator-owned Cellar, so the exception
+# would have to be widened twice. The honest outcome on a host with no
+# root-owned CLI is a loud refusal naming the remedy, not a quiet escalation.
+WRAPPER_CLI_CANDIDATES='/usr/local/bin/sanctuary /opt/homebrew/bin/sanctuary'
+
+# The SELECTED candidate, and the per-candidate probe record. Both are set only
+# by `wrapper_resolve_cli`. `WRAPPER_CLI` empty means no trusted CLI has been
+# selected; nothing reads it without having run the resolver first, and
+# `wrapper_cli` re-asserts it immediately before every exec.
+WRAPPER_CLI=''
+WRAPPER_CLI_PROBED=''
 
 # Verbs this wrapper will run. Anything else is refused. There is no
 # passthrough verb and no `--` escape into a general shell.
@@ -647,9 +695,76 @@ wrapper_resolve_absolute_optional_file() {
   wrapper_resolve_optional_file_under "$root" "$leaf" "$label"
 }
 
-# The compiled-in CLI must be a root-owned, non-symlink, non-group-writable
-# regular file. A wrapper that execs an operator-writable path would hand the
-# grant away.
+# ONE candidate's state, as a single token. Every branch is an OBSERVATION:
+# there is no state here that means "I did not look", the same rule the
+# tri-state verify checks in teardown-verify.sh live by.
+#
+#   symlink                      the leaf is a symlink; lstat'd FIRST, so a
+#                                dangling one reads as `symlink` and not as
+#                                `absent`
+#   absent                       nothing at the path
+#   not-a-regular-file           a directory, socket, device
+#   not-executable
+#   unstattable                  it is there and we could not read its metadata,
+#                                which is not the same as it being fine
+#   group-or-world-writable(...)
+#   not-root-owned(uid=N)
+#   untrusted-parent(DIR)        the file is root-owned but sits in a directory
+#                                chain that is not, so it can be UNLINKED AND
+#                                REPLACED by whoever owns that directory. This
+#                                is the rule the single-path version was missing
+#                                entirely: `/usr/local/bin` is operator-owned on
+#                                a Mac often enough that this repo already
+#                                refuses to put it on PATH, and the compiled-in
+#                                CLI lived there with only its own mode and
+#                                owner checked.
+#   ok
+#
+# `rails_assert_trusted_dir_chain` fails by `exit`, deliberately (rails design
+# rule 2), so it is called in an explicit SUBSHELL: a candidate that fails must
+# advance the walk, not kill a uid-0 process mid-verb.
+wrapper_cli_candidate_state() {
+  local cand="$1" mode owner parent
+  if [ -L "$cand" ]; then printf 'symlink'; return 0; fi
+  if [ ! -e "$cand" ]; then printf 'absent'; return 0; fi
+  if [ ! -f "$cand" ]; then printf 'not-a-regular-file'; return 0; fi
+  if [ ! -x "$cand" ]; then printf 'not-executable'; return 0; fi
+  if ! mode="$(rails__stat_mode "$cand")"; then printf 'unstattable'; return 0; fi
+  if [ $(( 8#$mode & 8#22 )) -ne 0 ]; then
+    printf 'group-or-world-writable(mode=%s)' "$mode"; return 0
+  fi
+  if ! owner="$(rails__stat_owner_uid "$cand")"; then printf 'unstattable'; return 0; fi
+  if [ "$owner" -ne 0 ]; then printf 'not-root-owned(uid=%s)' "$owner"; return 0; fi
+  parent="${cand%/*}"
+  if [ -z "$parent" ]; then parent='/'; fi
+  if ! ( rails_assert_trusted_dir_chain 'cli parent' "$parent" ) >/dev/null 2>&1; then
+    printf 'untrusted-parent(%s)' "$parent"; return 0
+  fi
+  printf 'ok'
+}
+
+# Walk the compiled-in candidates and select the FIRST TRUSTED one, recording
+# what every candidate probed before it did. Sets `WRAPPER_CLI` and
+# `WRAPPER_CLI_PROBED`; returns non-zero when no candidate is trustworthy.
+#
+# FIRST TRUSTED, never first existing. The walk stops at the first `ok` because
+# a later candidate's state is not evidence about a question already answered
+# yes, and it does NOT stop at the first candidate that merely exists, which is
+# the whole point.
+wrapper_resolve_cli() {
+  local cand state
+  WRAPPER_CLI=''
+  WRAPPER_CLI_PROBED=''
+  for cand in $WRAPPER_CLI_CANDIDATES; do
+    state="$(wrapper_cli_candidate_state "$cand")"
+    WRAPPER_CLI_PROBED="$WRAPPER_CLI_PROBED $cand=$state"
+    if [ "$state" = 'ok' ]; then WRAPPER_CLI="$cand"; break; fi
+  done
+  [ -n "$WRAPPER_CLI" ]
+}
+
+# The wrapper may exec only a candidate that passed the whole gauntlet. A
+# wrapper that execs an operator-writable path would hand the grant away.
 #
 # This runs immediately before every real CLI invocation, NOT as part of the
 # argument gauntlet. The distinction matters for the `check` oracle: `check`
@@ -658,30 +773,27 @@ wrapper_resolve_absolute_optional_file() {
 # has not installed the product yet. CLI availability is reported by `check` as
 # an advisory field instead, and is a hard precondition for anything that
 # actually executes.
+#
+# ON TOTAL FAILURE THE REFUSAL NAMES EVERY CANDIDATE AND WHAT WAS WRONG WITH
+# EACH, and then names the remedy. "No trusted CLI anywhere" and "the CLI you
+# installed is one root must not run" are two very different mornings, and the
+# operator can only act on the second if the message tells them which it is.
 wrapper_assert_cli() {
-  local mode owner
-  if [ -L "$WRAPPER_CLI" ]; then wrapper_die "CLI path is a symlink: $WRAPPER_CLI"; fi
-  if [ ! -f "$WRAPPER_CLI" ]; then wrapper_die "CLI not found: $WRAPPER_CLI"; fi
-  if [ ! -x "$WRAPPER_CLI" ]; then wrapper_die "CLI not executable: $WRAPPER_CLI"; fi
-  if ! mode="$(rails__stat_mode "$WRAPPER_CLI")"; then wrapper_die "cannot stat $WRAPPER_CLI"; fi
-  if [ $(( 8#$mode & 8#22 )) -ne 0 ]; then
-    wrapper_die "CLI $WRAPPER_CLI is group- or world-writable (mode $mode)"
+  if ! wrapper_resolve_cli; then
+    wrapper_die "no trusted Sanctuary CLI on this host; probed:$WRAPPER_CLI_PROBED -- this wrapper runs the CLI as ROOT, so it will not execute an operator-writable path, a symlink, or a file under a directory chain the operator can replace it in; install the product CLI as a root-owned non-group-writable regular file under a root-owned directory (for example: sudo install -o root -g wheel -m 0755 <cli> /usr/local/bin/sanctuary, with /usr/local/bin itself root-owned and not group-writable)"
   fi
-  if ! owner="$(rails__stat_owner_uid "$WRAPPER_CLI")"; then wrapper_die "cannot stat owner of $WRAPPER_CLI"; fi
-  if [ "$owner" -ne 0 ]; then wrapper_die "CLI $WRAPPER_CLI is not owned by root (uid $owner)"; fi
 }
 
-# Non-fatal CLI probe, for the `check` advisory field only.
+# Non-fatal CLI probe, for the `check` advisory field only. Two fields: the
+# selected path (or `-`), and the per-candidate record either way, so `check`
+# on a host with no usable CLI says which candidates it looked at rather than
+# one bare token.
 wrapper_cli_status() {
-  if [ -L "$WRAPPER_CLI" ]; then printf 'symlink'; return 0; fi
-  if [ ! -f "$WRAPPER_CLI" ]; then printf 'missing'; return 0; fi
-  if [ ! -x "$WRAPPER_CLI" ]; then printf 'not-executable'; return 0; fi
-  local mode owner
-  if ! mode="$(rails__stat_mode "$WRAPPER_CLI")"; then printf 'unstattable'; return 0; fi
-  if [ $(( 8#$mode & 8#22 )) -ne 0 ]; then printf 'writable'; return 0; fi
-  if ! owner="$(rails__stat_owner_uid "$WRAPPER_CLI")"; then printf 'unstattable'; return 0; fi
-  if [ "$owner" -ne 0 ]; then printf 'not-root-owned'; return 0; fi
-  printf 'ok'
+  if wrapper_resolve_cli; then
+    printf 'ok cli_path=%s cli_probed:%s' "$WRAPPER_CLI" "$WRAPPER_CLI_PROBED"
+  else
+    printf 'none cli_path=- cli_probed:%s' "$WRAPPER_CLI_PROBED"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -694,6 +806,10 @@ wrapper_cli() {
   # it, so there is one place to audit.
   if [ -z "$STORAGE" ]; then wrapper_die 'refusing to invoke the CLI with an empty storage path'; fi
   wrapper_assert_cli
+  # Post-condition, in the same shape as the two non-empty storage
+  # post-conditions above: the resolver is the ONLY writer of `WRAPPER_CLI`,
+  # and an empty one here would exec the argument vector through the shell.
+  if [ -z "$WRAPPER_CLI" ]; then wrapper_die 'empty CLI path after the resolver'; fi
   SANCTUARY_STORAGE_PATH="$STORAGE" "$WRAPPER_CLI" "$@"
 }
 
@@ -909,17 +1025,20 @@ wrapper_verb_arm() {
   # equal, so this is not a behavior change today; it is the habit that stops a
   # later edit from reintroducing a validated-then-unvalidated split.
   wrapper_cli protect --exclusive-egress --agent-account "$ARG_AGENT" --agent-uid "$AGENT_UID"
-  printf 'WRAPPER=OK verb=arm storage=%s\n' "$STORAGE"
+  # WHICH CANDIDATE RAN, in the verdict line. An evidence file that records the
+  # arm but not the binary that armed it cannot answer "which build was this"
+  # on a host with more than one install.
+  printf 'WRAPPER=OK verb=arm storage=%s cli=%s\n' "$STORAGE" "$WRAPPER_CLI"
 }
 
 wrapper_verb_repair() {
   wrapper_cli protect --repair-egress-gate
-  printf 'WRAPPER=OK verb=repair storage=%s\n' "$STORAGE"
+  printf 'WRAPPER=OK verb=repair storage=%s cli=%s\n' "$STORAGE" "$WRAPPER_CLI"
 }
 
 wrapper_verb_unprotect() {
   wrapper_cli protect --unprotect-egress-gate
-  printf 'WRAPPER=OK verb=unprotect storage=%s\n' "$STORAGE"
+  printf 'WRAPPER=OK verb=unprotect storage=%s cli=%s\n' "$STORAGE" "$WRAPPER_CLI"
 }
 
 # Deletes a fixed list of named files under the rail-approved storage path.

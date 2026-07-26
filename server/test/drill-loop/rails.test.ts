@@ -65,6 +65,21 @@ const SHA_FILE = path.join(DRILL_LOOP, "wrapper.sha256");
 const SHIPPED_BASE = "/private/var/sanctuary-drill";
 const SHIPPED_PATH_LINE = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
 
+/**
+ * The compiled-in Sanctuary CLI candidates, READ OUT OF THE SOURCE rather than
+ * re-spelled here. A second declaration site is how the harness's four product
+ * identifiers were all wrong at once in round 3; a refusal must name whatever
+ * the wrapper actually probed, so the assertion reads the same list it does.
+ */
+function shippedCliCandidates(): string[] {
+  const src = fs.readFileSync(path.join(DRILL_LOOP, "wrapper-main.sh"), "utf8");
+  const m = src.match(/^WRAPPER_CLI_CANDIDATES='([^']*)'/m);
+  expect(m, "wrapper-main.sh must declare WRAPPER_CLI_CANDIDATES").not.toBeNull();
+  const list = m![1].split(" ").filter((s) => s !== "");
+  expect(list.length, "the CLI candidate list must not be empty").toBeGreaterThan(0);
+  return list;
+}
+
 interface Ran {
   status: number;
   out: string;
@@ -1989,18 +2004,34 @@ exec /usr/bin/tail "$@"
     expect(r.out).toContain("arm requires");
   });
 
-  it("repair refuses a missing CLI rather than exec-ing whatever is there", () => {
+  // The compiled-in CLI is an ORDERED CANDIDATE LIST as of the 2026-07-25
+  // round-3 live run, which refused every executing verb with `CLI not found:
+  // /usr/local/bin/sanctuary` on a host that HAS the product CLI (at
+  // /opt/homebrew/bin/sanctuary, with /usr/local/bin absent entirely). What
+  // these two hold is unchanged: on a machine with no TRUSTED candidate the
+  // verb refuses rather than exec-ing anything, and it names every candidate it
+  // probed so "installed nowhere" and "installed somewhere root must not run
+  // it" are different messages. The selection rules themselves are driven with
+  // planted candidates by scripts/drill-loop/selftest.sh, which can build the
+  // untrusted fixtures this suite cannot.
+  it("repair refuses an untrusted CLI rather than exec-ing whatever is there", () => {
     const r = wrapper("repair", "--run-id", "good1", "--operator-account", me);
     if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
-    expect(r.out).toContain("CLI not found");
+    expect(r.out).toContain("no trusted Sanctuary CLI on this host");
+    expect(r.out).toContain("/usr/local/bin/sanctuary=");
   });
 
-  it("unprotect refuses a missing CLI", () => {
+  it("unprotect refuses an untrusted CLI, naming every candidate it probed", () => {
     const r = wrapper("unprotect", "--run-id", "good1", "--operator-account", me);
     if (!wrapperFullPath()) return expectHostRailRefusal(r);
     expect(r.status).not.toBe(0);
-    expect(r.out).toContain("CLI not found");
+    expect(r.out).toContain("no trusted Sanctuary CLI on this host");
+    // Every compiled-in candidate carries its own observed state; a refusal
+    // that named only the first one is the defect this replaced.
+    for (const cand of shippedCliCandidates()) {
+      expect(r.out, `the refusal did not name ${cand}`).toContain(`${cand}=`);
+    }
   });
 
   it("EVERY verb refuses a traversal run id before doing anything", () => {

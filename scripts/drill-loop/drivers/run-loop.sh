@@ -265,6 +265,30 @@ preflight_summary() {
   printf '%s' "$summary"
 }
 
+# TEARDOWN-VERIFY'S OWN ACCOUNT, for the same reason as the two above, and for
+# one more that is specific to this step.
+#
+# `teardown PASS` used to record the fixed sentence "torn down and verified
+# clean by observed state" and `teardown FAIL` the fixed sentence "teardown or
+# verify-clean failed". Both are claims the driver does not make. A PASS is now
+# one of two genuinely different mornings -- the verb tore something down, or
+# there was nothing armed to tear down and the host was observed clean anyway --
+# and a FAIL is one of four, only some of which mean there is state to go and
+# clean up. The finding carries the summary VERBATIM so the distinction survives
+# into the file a morning reader greps.
+#
+# The summary is teardown-verify's LAST line by construction.
+teardown_summary() {
+  local log="$1" summary='' line
+  [ -f "$log" ] || { printf ''; return 0; }
+  while IFS= read -r line; do
+    case "$line" in
+      'VERIFY=SUMMARY '*) summary="${line#VERIFY=SUMMARY }" ;;
+    esac
+  done < "$log"
+  if [ -n "$summary" ]; then printf '%s' "$summary"; else printf 'teardown-verify produced no SUMMARY line'; fi
+}
+
 # THE RESULT OF A PROBE RUN. The fold itself lives in lib/rails.sh as
 # `rails_probe_result`, a pure function driven exhaustively by both batteries;
 # see the long note there for why a skipped probe can never become a PASS.
@@ -464,13 +488,16 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   # No precondition: teardown is attempted no matter what happened above,
   # because leaving state behind is the one thing that poisons every later
   # iteration.
-  if "$HERE/teardown-verify.sh" --run-id "$RUN_ID" \
-       --operator-account "$OPERATOR" --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
-       --evidence-dir "$IEV" > "$IEV/teardown.log" 2>&1
+  TEARDOWN_RC=0
+  "$HERE/teardown-verify.sh" --run-id "$RUN_ID" \
+    --operator-account "$OPERATOR" --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
+    --evidence-dir "$IEV" > "$IEV/teardown.log" 2>&1 || TEARDOWN_RC=$?
+  TEARDOWN_SUMMARY="$(teardown_summary "$IEV/teardown.log")"
+  if [ "$TEARDOWN_RC" -eq 0 ]
   then
-    emit_finding "$ITER" teardown PASS "$TAINT" 'torn down and verified clean by observed state' "$IEV/teardown.log"
+    emit_finding "$ITER" teardown PASS "$TAINT" "verified clean by observed state: $TEARDOWN_SUMMARY" "$IEV/teardown.log"
   else
-    emit_finding "$ITER" teardown FAIL "$TAINT" 'teardown or verify-clean failed; stopping the night' "$IEV/teardown.log"
+    emit_finding "$ITER" teardown FAIL "$TAINT" "teardown or verify-clean failed; stopping the night: $TEARDOWN_SUMMARY" "$IEV/teardown.log"
     TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
     NIGHT_STOPPED='teardown'
     break

@@ -775,7 +775,7 @@ LOCAL_FP="$(bash -c ". '$HERE/lib/rails.sh'; rails_host_fingerprint_local" 2>/de
 # actually runs as root.
 compose_wrapper() {
   "$HERE/build-wrapper.sh" --stdout \
-    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" -v bins="${4:-}" -v runtime="${5:-}" -v plists="${6:-}" -v registry="${7:-}" '
+    | awk -v fp="$LOCAL_FP" -v base="$BASE" -v agents="$2" -v gatebase="${3:-/var/sanctuary-agents}" -v bins="${4:-}" -v runtime="${5:-}" -v plists="${6:-}" -v registry="${7:-}" -v clis="${8:-}" '
         $0 == "wrapper_main \"$@\"" {
           print "RAILS_HOST_ALLOW_FP=\047" fp "\047"
           print "RAILS_HOST_DENY_FP=\047\047"
@@ -787,6 +787,7 @@ compose_wrapper() {
           if (runtime != "") print "RAILS_PRODUCT_GATE_RUNTIME_DIR=\047" runtime "\047"
           if (plists != "") print "RAILS_PRODUCT_LAUNCHDAEMONS_DIR=\047" plists "\047"
           if (registry != "") print "RAILS_PRODUCT_ANCHOR_REGISTRY=\047" registry "\047"
+          if (clis != "") print "WRAPPER_CLI_CANDIDATES=\047" clis "\047"
         }
         { print }
       ' > "$1"
@@ -903,15 +904,211 @@ else
 fi
 rm -rf "${LOOPDIR:?}/state"
 
-# `arm` needs a root-owned CLI at the compiled-in path, which does not exist on
-# a test machine, so what is asserted here is that it refuses BEFORE reaching
-# it, and that it never prints ACCEPT.
+# `arm` needs a TRUSTED CLI, which cannot exist among the fixtures a non-root
+# battery can plant, so what is asserted here is that it refuses BEFORE reaching
+# one, and that it never prints ACCEPT.
 expect_reject 'arm without an agent account' 'arm requires' \
   -- "$TEST_WRAPPER" arm --run-id 'good1' --operator-account "$ME"
-expect_reject 'repair refuses a missing CLI rather than exec-ing anything' 'CLI not found' \
-  -- "$TEST_WRAPPER" repair --run-id 'good1' --operator-account "$ME"
-expect_reject 'unprotect refuses a missing CLI' 'CLI not found' \
-  -- "$TEST_WRAPPER" unprotect --run-id 'good1' --operator-account "$ME"
+
+# ==========================================================================
+# THE CLI CANDIDATE WALK
+# ==========================================================================
+#
+# THE 2026-07-25 ROUND-3 LIVE RUN refused every executing verb with
+# `CLI not found: /usr/local/bin/sanctuary` on a drill host that HAS the CLI:
+# `/usr/local/bin` does not exist there and `sanctuary` is at
+# `/opt/homebrew/bin/sanctuary`. One compiled-in path made "not installed" and
+# "installed somewhere this wrapper was never told about" the same message.
+#
+# The list is the fix; what these cases hold is that the list does not become a
+# way for the operator to hand themselves root. THE WRAPPER RUNS THE SELECTED
+# CANDIDATE AS UID 0, so the property under test is not "it found one" but
+# "TRUST selected it, not existence" -- an operator-writable candidate must be
+# REFUSED and NAMED, never preferred, and never executed.
+#
+# THE FIXTURES. A non-root battery cannot create a root-owned file, so the
+# trusted candidate is a REAL one: `/usr/bin/true` is root-owned 0755 under a
+# root-owned, non-group-writable chain on both platforms, i.e. it satisfies the
+# gauntlet for the same reasons a correctly installed CLI would. It also runs,
+# so a case can prove the SELECTED candidate is the one that got exec'd rather
+# than merely named.
+CLIDIR="$SANDBOX/cli-candidates"
+mkdir -p "$CLIDIR"
+# Operator-owned and EXECUTABLE, so it would win any first-existing walk -- and
+# it records its own execution, so "the wrapper refused it" is proved by the
+# absence of a file rather than by the absence of a message.
+CLI_EXEC_MARK="$CLIDIR/OPERATOR-CANDIDATE-WAS-EXECUTED"
+cat > "$CLIDIR/operator-owned" <<CLISTUB
+#!/bin/bash
+: > '$CLI_EXEC_MARK'
+exit 0
+CLISTUB
+chmod 0755 "$CLIDIR/operator-owned"
+printf 'not executable\n' > "$CLIDIR/not-executable"
+chmod 0644 "$CLIDIR/not-executable"
+printf 'world writable\n' > "$CLIDIR/world-writable"
+chmod 0777 "$CLIDIR/world-writable"
+mkdir -p "$CLIDIR/a-directory"
+ln -sfn /usr/bin/true "$CLIDIR/a-symlink"
+# A ROOT-OWNED, correctly-moded executable reached through a symlinked PARENT.
+# This is the state the single-path version could not represent at all: it
+# checked the FILE's mode and owner and never looked at the directory the file
+# sits in, so a root-owned CLI in a directory the operator can repoint (or
+# unlink and replace the file in) passed every rule there was.
+ln -sfn /usr/bin "$CLIDIR/parent-symlink"
+
+printf '== the CLI is selected by TRUST, never by existence ==\n'
+# ANTI-VACUITY ON THE FIXTURES, first. Every case below is about which
+# candidate wins, so a fixture that was never planted, or a `/usr/bin/true`
+# that is not actually trustworthy on this machine, would make them all pass
+# while proving nothing.
+cli_fixture_ok=1
+[ -x "$CLIDIR/operator-owned" ] || cli_fixture_ok=0
+[ -e "$CLIDIR/absent" ] && cli_fixture_ok=0
+[ -x /usr/bin/true ] || cli_fixture_ok=0
+[ "$(stat -f '%u' /usr/bin/true 2>/dev/null || stat -c '%u' /usr/bin/true)" = '0' ] || cli_fixture_ok=0
+[ "$(stat -f '%u' "$CLIDIR/operator-owned" 2>/dev/null || stat -c '%u' "$CLIDIR/operator-owned")" != '0' ] || cli_fixture_ok=0
+[ -L "$CLIDIR/parent-symlink" ] || cli_fixture_ok=0
+if [ "$cli_fixture_ok" -eq 1 ]; then
+  printf 'ok    anti-vacuity: the candidate fixtures are planted and /usr/bin/true is genuinely root-owned\n'
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL  *** the CLI candidate fixtures were never planted; every case below proves nothing ***\n'
+  FAIL=$((FAIL + 1))
+fi
+
+# 1. ABSENT THEN PRESENT. The first candidate does not exist; the second does
+#    and is trusted. The walk must reach it -- this is the live defect, where
+#    one absent path ended the story.
+compose_wrapper "$SANDBOX/wrapper-cli-absent-then-present" '' '' '' '' '' '' \
+  "$CLIDIR/absent /usr/bin/true"
+expect_accept 'an ABSENT first candidate is walked past to a trusted second' \
+  'verb=unprotect' \
+  -- "$SANDBOX/wrapper-cli-absent-then-present" unprotect \
+     --run-id 'good1' --operator-account "$ME"
+expect_accept 'and the verdict line NAMES the candidate that was selected' \
+  'cli=/usr/bin/true' \
+  -- "$SANDBOX/wrapper-cli-absent-then-present" unprotect \
+     --run-id 'good1' --operator-account "$ME"
+
+# 2. EXISTENCE MUST NOT SELECT. An operator-owned executable sits FIRST. A
+#    first-existing walk takes it and hands the grant away; a first-TRUSTED
+#    walk passes it over, names why, and takes the root-owned one behind it.
+compose_wrapper "$SANDBOX/wrapper-cli-untrusted-first" '' '' '' '' '' '' \
+  "$CLIDIR/operator-owned /usr/bin/true"
+expect_accept 'an operator-owned candidate is passed over for a root-owned one' \
+  'cli_path=/usr/bin/true' \
+  -- "$SANDBOX/wrapper-cli-untrusted-first" check \
+     --run-id 'good1' --operator-account "$ME"
+expect_accept 'and the probe record says WHY it was passed over' \
+  "$CLIDIR/operator-owned=not-root-owned(uid=" \
+  -- "$SANDBOX/wrapper-cli-untrusted-first" check \
+     --run-id 'good1' --operator-account "$ME"
+
+# 3. AN UNTRUSTED CANDIDATE IS REFUSED, NOT SELECTED. It is the only candidate,
+#    so a wrapper that treated "found something executable" as resolution would
+#    exec an operator-writable file AS ROOT. The marker file is what proves it
+#    did not: this is the escalation the design forbids, asserted by execution
+#    rather than by message.
+rm -f "$CLI_EXEC_MARK"
+compose_wrapper "$SANDBOX/wrapper-cli-untrusted-only" '' '' '' '' '' '' \
+  "$CLIDIR/operator-owned"
+expect_reject 'an operator-owned candidate is REFUSED rather than executed as root' \
+  'no trusted Sanctuary CLI' \
+  -- "$SANDBOX/wrapper-cli-untrusted-only" unprotect \
+     --run-id 'good1' --operator-account "$ME"
+if [ -e "$CLI_EXEC_MARK" ]; then
+  printf 'FAIL  *** the wrapper EXECUTED an operator-writable candidate; the grant is handed away ***\n'
+  FAIL=$((FAIL + 1))
+else
+  printf 'ok    the operator-writable candidate was never executed\n'
+  PASS=$((PASS + 1))
+fi
+
+# 4. A ROOT-OWNED FILE UNDER A PARENT THE OPERATOR CONTROLS IS NOT TRUSTED.
+#    Same inode, same mode, same owner as the candidate that passes in case 1;
+#    the ONLY difference is that it is reached through a symlink the operator
+#    can repoint. The single-path version had no rule that could see this.
+compose_wrapper "$SANDBOX/wrapper-cli-untrusted-parent" '' '' '' '' '' '' \
+  "$CLIDIR/parent-symlink/true"
+expect_reject 'a root-owned CLI under an operator-controlled parent is refused' \
+  "$CLIDIR/parent-symlink/true=untrusted-parent(" \
+  -- "$SANDBOX/wrapper-cli-untrusted-parent" unprotect \
+     --run-id 'good1' --operator-account "$ME"
+
+# 5. ALL CANDIDATES FAIL, AND THE REFUSAL NAMES EVERY ONE AND WHAT WAS WRONG
+#    WITH IT. "No CLI is installed anywhere" and "the CLI you installed is one
+#    root must not run" are different mornings, and only the second is
+#    actionable -- which is the whole reason the live message was useless.
+compose_wrapper "$SANDBOX/wrapper-cli-all-bad" '' '' '' '' '' '' \
+  "$CLIDIR/a-symlink $CLIDIR/absent $CLIDIR/a-directory $CLIDIR/not-executable $CLIDIR/world-writable $CLIDIR/operator-owned"
+set +e   # declared exception: this run is EXPECTED to exit nonzero
+allbad_out="$("$SANDBOX/wrapper-cli-all-bad" unprotect \
+  --run-id 'good1' --operator-account "$ME" 2>&1)"
+allbad_rc=$?
+set -e
+allbad_missing=''
+for expect_pair in \
+  "$CLIDIR/a-symlink=symlink" \
+  "$CLIDIR/absent=absent" \
+  "$CLIDIR/a-directory=not-a-regular-file" \
+  "$CLIDIR/not-executable=not-executable" \
+  "$CLIDIR/world-writable=group-or-world-writable(mode=" \
+  "$CLIDIR/operator-owned=not-root-owned(uid="
+do
+  case "$allbad_out" in
+    *"$expect_pair"*) ;;
+    *) allbad_missing="$allbad_missing $expect_pair" ;;
+  esac
+done
+if [ "$allbad_rc" -eq 0 ]; then
+  printf 'FAIL  *** the wrapper ACCEPTED with no trusted candidate anywhere ***\n'
+  note "output: $allbad_out"
+  FAIL=$((FAIL + 1))
+elif [ -n "$allbad_missing" ]; then
+  printf 'FAIL  the all-bad refusal did not name:%s\n' "$allbad_missing"
+  note "output: $allbad_out"
+  FAIL=$((FAIL + 1))
+else
+  printf 'ok    with no trusted candidate it REFUSES, naming each one and what was wrong with it\n'
+  PASS=$((PASS + 1))
+fi
+case "$allbad_out" in
+  *'install the product CLI as a root-owned'*)
+    printf 'ok    and the refusal tells the operator the remedy\n'; PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  the all-bad refusal names no remedy\n'
+    note "output: $allbad_out"
+    FAIL=$((FAIL + 1)) ;;
+esac
+
+# 6. THE SHIPPED LIST IS WHAT IT CLAIMS TO BE. Every constant this battery
+#    overrides has its shipped value asserted separately; an override that
+#    quietly diverged from what runs as root would make all of the above a
+#    fixture test.
+SHIPPED_CLIS="$( { grep -m1 "^WRAPPER_CLI_CANDIDATES=" "$HERE/wrapper-main.sh" || true; } \
+  | sed -e "s/^WRAPPER_CLI_CANDIDATES='//" -e "s/'\$//")"
+cli_shipped_ok=1
+[ -n "$SHIPPED_CLIS" ] || cli_shipped_ok=0
+for c in $SHIPPED_CLIS; do
+  case "$c" in
+    /*) ;;
+    *) cli_shipped_ok=0 ;;
+  esac
+  # The repo's own dist is deliberately NOT a candidate: it lives in a checkout
+  # the operator writes to, so it could only be selected by carving a hole in
+  # the ownership rule.
+  case "$c" in
+    *dist/cli.js|*"$HOME"*) cli_shipped_ok=0 ;;
+  esac
+done
+if [ "$cli_shipped_ok" -eq 1 ]; then
+  printf 'ok    the SHIPPED candidate list is absolute, code-controlled, and carries no checkout path (%s)\n' "$SHIPPED_CLIS"
+  PASS=$((PASS + 1))
+else
+  printf 'FAIL  *** the shipped CLI candidate list is not absolute/code-controlled: %s ***\n' "$SHIPPED_CLIS"
+  FAIL=$((FAIL + 1))
+fi
 # `kickstart-daemons` must report the FAILURE of the thing that is its whole
 # job. The reviewed verb ran `|| true` and printed WRAPPER=OK regardless.
 # The verb behind the pf fail-closed fix, driven directly. `pfctl` needs root
@@ -1753,7 +1950,23 @@ for a in "${args[@]}"; do
       exit 0 ;;
     mint)                    exit "${STUB_MINT_RC:-0}" ;;
     retire)                  exit "${STUB_RETIRE_RC:-0}" ;;
-    unprotect|clean-markers) exit "${STUB_WRAPPER_RC:-0}" ;;
+    # `STUB_UNPROTECT` selects WHAT KIND of non-zero this is, which is the whole
+    # subject of the teardown-verdict cases. `refused` is a controlled rail
+    # refusal: the marker AND status 20, exactly what the real wrapper prints
+    # when it will not run the CLI. `bare20` is status 20 with NO marker, the
+    # one way that number can arrive meaning something else entirely -- the
+    # product CLI's own exit status surfacing through the verb -- and it must
+    # NOT be read as a refusal. `errored` is any other uncontrolled non-zero.
+    unprotect)
+      case "${STUB_UNPROTECT:-ok}" in
+        ok)      exit "${STUB_WRAPPER_RC:-0}" ;;
+        refused) echo 'WRAPPER=REJECT reason=no trusted Sanctuary CLI on this host; probed: /usr/local/bin/sanctuary=absent'
+                 echo 'sanctuary-drill-wrapper: no trusted Sanctuary CLI on this host' >&2
+                 exit 20 ;;
+        bare20)  echo 'the product cli exited 20' >&2; exit 20 ;;
+        errored) exit "${STUB_UNPROTECT_RC:-9}" ;;
+      esac ;;
+    clean-markers)           exit "${STUB_WRAPPER_RC:-0}" ;;
     *curl)
       if [ "${STUB_CURL:-ok}" = 'refused' ]; then
         echo 'sudo: a password is required' >&2
@@ -2088,6 +2301,110 @@ else
   note "output: $out"
   FAIL=$((FAIL + 1))
 fi
+
+# ==========================================================================
+# "THERE WAS NOTHING TO TEAR DOWN" IS NOT "TEARING DOWN FAILED"
+# ==========================================================================
+#
+# THE 2026-07-25 ROUND-3 LIVE RUN stopped the night on
+#
+#   TEARDOWN rc=20
+#   VERIFY=CLEAN check=registry / pf-anchor / fortress-state / marker / locks /
+#                agent-unconfined / retire
+#   VERIFY=SUMMARY dirty=0 unobserved=0 teardown_rc=20 ...
+#
+# recorded as "teardown or verify-clean failed". Nothing was dirty and nothing
+# was unobserved: the arm had never happened, so `unprotect` refused because
+# there was nothing armed. That is the SAME conflation already fixed at
+# kickstart and at preflight, one rung further down the ladder.
+#
+# WHAT MUST NOT MOVE. The stop-the-night rule is why continuing past a dirty
+# teardown cannot wedge the host, so the benign reading is gated on the OBSERVED
+# verify summary and on a CONTROLLED refusal, never on the exit status alone.
+# The four cases below are the four combinations that matter, and three of them
+# still stop the night.
+printf '== a teardown with nothing to tear down is not a failed teardown ==\n'
+
+# expect_teardown_verdict <name> <teardown= token> <stops-the-night: yes|no> <rc> <output>
+#
+# BOTH halves are asserted, always. A case that checked only the exit status
+# would pass on a build that returned the right answer for the wrong reason,
+# and a case that checked only the token would pass on a build that classified
+# correctly and then ignored its own classification.
+expect_teardown_verdict() {
+  local name="$1" token="$2" stop="$3" rc="$4" out="$5"
+  case "$out" in
+    *"teardown=$token"*) ;;
+    *)
+      printf 'FAIL  %s: the summary did not carry teardown=%s\n' "$name" "$token"
+      note "output: $out"; FAIL=$((FAIL + 1)); return 0 ;;
+  esac
+  if [ "$stop" = 'yes' ] && [ "$rc" -eq 0 ]; then
+    printf 'FAIL  *** %s: exited 0; the stop-the-night rule was weakened ***\n' "$name"
+    note "output: $out"; FAIL=$((FAIL + 1)); return 0
+  fi
+  if [ "$stop" = 'no' ] && [ "$rc" -ne 0 ]; then
+    printf 'FAIL  *** %s: still stopped the night (rc=%s) ***\n' "$name" "$rc"
+    note "output: $out"; FAIL=$((FAIL + 1)); return 0
+  fi
+  printf 'ok    %s\n' "$name"
+  PASS=$((PASS + 1))
+}
+
+# ANTI-VACUITY ON THE FIXTURE, first: `STUB_UNPROTECT=refused` must really make
+# the verb refuse. If the stub returned 0 the benign case would pass for the
+# reason every other teardown case passes, and prove nothing about the verdict.
+set +e   # declared exception
+out="$(STUB_UNPROTECT=refused STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 run_teardown)"; rc=$?
+set -e
+case "$out" in
+  *'TEARDOWN rc=20'*)
+    printf 'ok    anti-vacuity: the refusing-unprotect fixture really refuses\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** anti-vacuity: the refusing-unprotect fixture did not refuse ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+expect_teardown_verdict \
+  'a refusal with dirty=0 unobserved=0 is NOT a failure, and says which case it was' \
+  'refused-nothing-to-tear-down' no "$rc" "$out"
+
+# DIRT STILL STOPS THE NIGHT. A refusal explains nothing about state we can
+# still see.
+set +e   # declared exception
+out="$(STUB_UNPROTECT=refused STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 \
+       STUB_MARKER=present run_teardown)"; rc=$?
+set -e
+expect_teardown_verdict 'a refusal with something DIRTY still stops the night' \
+  'refused-but-state-remains' yes "$rc" "$out"
+
+# AND SO DOES A CHECK THAT COULD NOT LOOK. This is the pairing that would be
+# easiest to lose: `unobserved` is not `dirty`, and gating the benign reading on
+# `dirty` alone would let a blind harness call a refused teardown clean.
+set +e   # declared exception
+out="$(STUB_UNPROTECT=refused STUB_PF=refused STUB_CURL_CODE=200 run_teardown)"; rc=$?
+set -e
+expect_teardown_verdict 'a refusal with something UNOBSERVED still stops the night' \
+  'refused-but-state-remains' yes "$rc" "$out"
+
+# STATUS 20 IS NOT SELF-CERTIFYING. `wrapper_cli` execs the product CLI as the
+# verb's last command, so a product CLI that itself exited 20 arrives here as
+# the same number with the opposite meaning. Without the refusal marker it is an
+# uncontrolled exit that may have landed mid-mutation, and post-state that
+# happens to look clean is not evidence that it is.
+set +e   # declared exception
+out="$(STUB_UNPROTECT=bare20 STUB_PF=ok STUB_PF_RULES='' STUB_CURL_CODE=200 run_teardown)"; rc=$?
+set -e
+expect_teardown_verdict 'status 20 with NO refusal marker is an error, not a refusal' \
+  'errored(rc=20)' yes "$rc" "$out"
+
+# ANY OTHER NON-ZERO IS AN ERROR, whatever the observations say.
+set +e   # declared exception
+out="$(STUB_UNPROTECT=errored STUB_UNPROTECT_RC=9 STUB_PF=ok STUB_PF_RULES='' \
+       STUB_CURL_CODE=200 run_teardown)"; rc=$?
+set -e
+expect_teardown_verdict 'an uncontrolled non-zero teardown stops the night on an observed-clean host' \
+  'errored(rc=9)' yes "$rc" "$out"
 
 set +e   # declared exception
 out="$(STUB_PF=ok STUB_PF_RULES='block drop all' STUB_CURL_CODE=200 run_teardown)"; rc=$?

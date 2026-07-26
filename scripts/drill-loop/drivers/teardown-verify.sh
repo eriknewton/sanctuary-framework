@@ -40,11 +40,19 @@
 # past a dirty teardown wedges the host and every later iteration is born
 # tainted, so the loop stops rather than compounding state.
 #
+# AND THE TEARDOWN VERB'S OWN EXIT STATUS IS NOT THAT FAILURE. A verb that
+# refused because there was nothing armed to unprotect, on a host every one of
+# the checks below observed and found clean, is not a failed teardown; see the
+# long note at the verdict block near the end of this file. The stop-the-night
+# rule itself is unchanged: any dirt, any check that could not observe, and any
+# uncontrolled exit still stop the night.
+#
 # Usage: teardown-verify.sh --run-id <id> --operator-account <a>
 #          --agent-account <a> --agent-uid <n> --evidence-dir <d> [--base <dir>]
 #          [--no-retire]
-# Exit:  0 torn down and verified clean; 1 dirty or unobservable (STOP THE
-#        NIGHT); 2 usage
+# Exit:  0 torn down (or nothing to tear down) and verified clean by observed
+#        state; 1 dirty, unobservable, or a teardown that did not merely refuse
+#        (STOP THE NIGHT); 2 usage
 
 set -euo pipefail
 
@@ -115,12 +123,35 @@ STORAGE="$(rails_assert_disposable_storage "$ANCHOR" "$DERIVED")" \
 LOG="$EVIDENCE/teardown.log"
 
 # --- tear down ------------------------------------------------------------
+#
+# The output is CAPTURED rather than appended straight into "$LOG", because the
+# refusal marker in it is load-bearing for the verdict below and "$LOG" is also
+# this script's own stdout target when run-loop.sh drives it. Every other
+# verdict-bearing read in this file already works this way.
 TEARDOWN_RC=0
-"$SUDO" -n "$WRAPPER" unprotect \
+teardown_out="$("$SUDO" -n "$WRAPPER" unprotect \
   --run-id "$RUN_ID" --operator-account "$OPERATOR" \
-  --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
-  >> "$LOG" 2>&1 || TEARDOWN_RC=$?
+  --agent-account "$AGENT" --agent-uid "$AGENT_UID" 2>&1)" || TEARDOWN_RC=$?
+printf 'unprotect rc=%s:\n%s\n' "$TEARDOWN_RC" "$teardown_out" >> "$LOG"
 printf 'TEARDOWN rc=%s\n' "$TEARDOWN_RC"
+
+# DID THE RAIL SAY NO, or did the command blow up? Two different facts, and the
+# reviewed build had one exit-code test for both.
+#
+# `RAILS_REJECT_STATUS` (20) is the status EVERY controlled refusal exits with,
+# and a controlled refusal is by construction a statement that the wrapper did
+# NOT reach the CLI. But the status alone is not sufficient evidence of that:
+# `wrapper_cli` execs the product CLI as the verb's last command, so a product
+# CLI that itself exited 20 would surface here as the identical number with a
+# completely different meaning. The wrapper prints a machine-readable marker on
+# every refusal path (`WRAPPER=REJECT`, or `RAILS_REJECT` from the rails), so
+# the status is corroborated by the marker rather than trusted on its own. rc=20
+# with no marker is an exit code that came from somewhere else, and is treated
+# as an error.
+TEARDOWN_REFUSED=''
+case "$teardown_out" in
+  *'WRAPPER=REJECT reason='*|*'RAILS_REJECT: '*) TEARDOWN_REFUSED='yes' ;;
+esac
 
 CLEAN_MARKERS_RC=0
 "$SUDO" -n "$WRAPPER" clean-markers \
@@ -323,12 +354,65 @@ else
   printf 'VERIFY=SKIPPED check=retire reason=--no-retire was passed\n'
 fi
 
-printf 'VERIFY=SUMMARY dirty=%s unobserved=%s teardown_rc=%s clean_markers_rc=%s retire_rc=%s operator_uid=%s\n' \
-  "$DIRTY" "$UNOBSERVED" "$TEARDOWN_RC" "$CLEAN_MARKERS_RC" "$RETIRE_RC" "$OPERATOR_UID"
+# --- what the teardown VERB's exit status means, decided from OBSERVED state -
+#
+# THE 2026-07-25 ROUND-3 LIVE RUN, ONE RUNG BELOW THE TWO ALREADY FIXED. The
+# night stopped on
+#
+#   TEARDOWN rc=20
+#   VERIFY=SUMMARY dirty=0 unobserved=0 teardown_rc=20 ...
+#
+# recorded as "teardown or verify-clean failed; stopping the night". Nothing was
+# dirty and nothing was unobserved: the arm had never happened (the wrapper
+# could not find a trusted CLI), so `unprotect` refused because there was
+# NOTHING TO UNPROTECT. "There was nothing to tear down" had collapsed into
+# "tearing down failed" -- the same conflation this harness fixed at kickstart
+# ("a daemon that does not exist yet is not a daemon that failed to restart")
+# and at preflight ("a check that cannot look yet is not a check that failed"),
+# reached again the moment the ladder got one rung further.
+#
+# THE FIX IS NOT A WEAKER STOP-THE-NIGHT RULE, and the predicate below is
+# deliberately narrow. `exit 1` still fires on ANY dirt and on ANY check that
+# could not observe, because continuing past a dirty teardown wedges the host.
+# What changed is which EVIDENCE decides, and that is the seven observations,
+# never the verb's exit status on its own:
+#
+#   ran                          rc=0. The verb did its work.
+#   refused-nothing-to-tear-down rc=20 AND a refusal marker AND every one of the
+#                                seven checks OBSERVED and OBSERVED CLEAN. The
+#                                host is clean because it was looked at, which
+#                                is this file's entire doctrine (verify, do not
+#                                report) applied to the verb as well as to the
+#                                state.
+#   refused-but-state-remains    a refusal, with dirt or an unobservable check.
+#                                A refusal explains nothing about state we can
+#                                still see, or cannot see. STOP THE NIGHT.
+#   errored                      any other non-zero status, including rc=20 with
+#                                no marker. An uncontrolled exit may have landed
+#                                MID-mutation, so post-state that happens to
+#                                look clean is not evidence that it is.
+#                                STOP THE NIGHT.
+TEARDOWN_FAILED=''
+if [ "$TEARDOWN_RC" -eq 0 ]; then
+  TEARDOWN_VERDICT='ran'
+elif [ "$TEARDOWN_RC" -eq "$RAILS_REJECT_STATUS" ] && [ -n "$TEARDOWN_REFUSED" ]; then
+  if [ "$DIRTY" -eq 0 ] && [ "$UNOBSERVED" -eq 0 ]; then
+    TEARDOWN_VERDICT='refused-nothing-to-tear-down'
+  else
+    TEARDOWN_VERDICT='refused-but-state-remains'
+    TEARDOWN_FAILED='yes'
+  fi
+else
+  TEARDOWN_VERDICT="errored(rc=$TEARDOWN_RC)"
+  TEARDOWN_FAILED='yes'
+fi
+
+printf 'VERIFY=SUMMARY dirty=%s unobserved=%s teardown=%s teardown_rc=%s clean_markers_rc=%s retire_rc=%s operator_uid=%s\n' \
+  "$DIRTY" "$UNOBSERVED" "$TEARDOWN_VERDICT" "$TEARDOWN_RC" "$CLEAN_MARKERS_RC" "$RETIRE_RC" "$OPERATOR_UID"
 
 # UNOBSERVED stops the night exactly as hard as DIRTY. The whole subject of this
 # file is that they are different facts, not that one of them is survivable.
 if [ "$DIRTY" -ne 0 ] || [ "$UNOBSERVED" -ne 0 ] \
-   || [ "$TEARDOWN_RC" -ne 0 ] || [ "$CLEAN_MARKERS_RC" -ne 0 ] || [ "$RETIRE_RC" -ne 0 ]; then
+   || [ -n "$TEARDOWN_FAILED" ] || [ "$CLEAN_MARKERS_RC" -ne 0 ] || [ "$RETIRE_RC" -ne 0 ]; then
   exit 1
 fi
