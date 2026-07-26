@@ -85,7 +85,11 @@ verbs:
   gate-state        read-only gate/registry state dump (needs --agent-uid)
   pf-anchor-rules   print the pf anchor's rules; nonzero if pf could not be read
   registry-state    print the root-owned pf-anchor registry; nonzero if it
-                    exists and could not be read
+                    exists and could not be read. With --agent-account and
+                    --agent-uid the verdict line ALSO carries the observed
+                    arm state of that uid (arm_state + arm_basis), which is
+                    the ONE decision that says whether a missing per-uid gate
+                    daemon or plist is the expected pre-arm state or a defect
   fortress-state    report the marker and lock files inside this run's fortress
                     AS ROOT, so a driver observes rather than guesses
   gate-log          tail this agent's gate + peer-resolver daemon logs; nonzero
@@ -998,11 +1002,47 @@ wrapper_verb_gate_state() {
 # directory, so an unprivileged `grep` returns 2 and the `else` branch still
 # says CLEAN. "no match", "cannot read" and "not there" were one verdict. Root
 # can actually read it, so root is who reads it.
+#
+# 2026-07-25 FOLLOW-ON: THIS VERB IS ALSO WHERE THE ARM-STATE DECISION IS
+# PUBLISHED, AND IT IS PUBLISHED ONCE.
+#
+# `kickstart-daemons` learned that a per-uid gate daemon's absence is expected
+# only while the registry is silent on this uid. `preflight.sh` screens exactly
+# the same per-uid daemons one step later and needs exactly the same decision.
+# The tempting shape is for the driver to fetch the registry bytes (it already
+# does, for `orphan-registry`) and answer the question itself -- which would put
+# TWO implementations of one predicate in the tree, in two languages of shell,
+# maintained by whoever next touches either. This project has already lost a
+# round to two copies of one matcher drifting apart, so the driver gets the
+# WRAPPER'S answer instead of its own: `wrapper_observe_arm_state` is the single
+# source, the same function `kickstart-daemons` calls, and this verb just prints
+# what it said.
+#
+# The arm fields ride on the EXISTING single verdict line, after the content
+# region, for the reason the `state=` field is read from there (ROUND-5 L2): the
+# registry's own bytes are printed between REGISTRY-BEGIN and REGISTRY-END, so a
+# token a driver greps for must never be one that content could contain.
+#
+# `arm_state=unqueried` when no agent was named. An ABSENT field and a field
+# meaning "you did not ask" must not look the same to a driver that DID ask:
+# a consumer that requested a uid and got `unqueried` has been answered by a
+# wrapper that did not understand the question, and that is a refusal, not a
+# not-armed.
 wrapper_verb_registry_state() {
   local reg="$RAILS_PRODUCT_ANCHOR_REGISTRY" content rc=0 parent leaf root
+  local arm_fields
+  if [ -n "$AGENT_UID" ]; then
+    # Refuses (dies) on a registry that exists and cannot be read, which is the
+    # same refusal the read below makes, for the same reason.
+    wrapper_observe_arm_state "$AGENT_UID"
+    arm_fields="$(printf 'arm_state=%s arm_basis=%s agent_uid=%s' \
+      "$WRAPPER_ARM_STATE" "$WRAPPER_ARM_BASIS" "$AGENT_UID")"
+  else
+    arm_fields='arm_state=unqueried arm_basis=no-agent-uid-given'
+  fi
   if ! wrapper_resolve_absolute_optional_file "$reg" 'pf-anchor registry'; then
     printf 'WRAPPER=REGISTRY-ABSENT path=%s\n' "$reg"
-    printf 'WRAPPER=OK verb=registry-state state=absent path=%s\n' "$reg"
+    printf 'WRAPPER=OK verb=registry-state state=absent path=%s %s\n' "$reg" "$arm_fields"
     return 0
   fi
   parent="${WRAPPER_SAFE_TARGET%/*}"
@@ -1015,7 +1055,7 @@ wrapper_verb_registry_state() {
   printf 'WRAPPER=REGISTRY-BEGIN path=%s\n' "$reg"
   printf '%s' "$content"
   printf '\nWRAPPER=REGISTRY-END\n'
-  printf 'WRAPPER=OK verb=registry-state state=present path=%s\n' "$reg"
+  printf 'WRAPPER=OK verb=registry-state state=present path=%s %s\n' "$reg" "$arm_fields"
 }
 
 # Report the marker and lock files inside THIS run's disposable fortress, AS

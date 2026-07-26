@@ -241,6 +241,30 @@ kickstart_summary() {
   if [ -n "$ok" ]; then printf '%s' "$ok"; else printf '%s' "$reject"; fi
 }
 
+# PREFLIGHT'S OWN ACCOUNT, for the same reason as the kickstart one above.
+#
+# This step used to record the fixed sentence `all preflight checks passed`,
+# which is now a claim preflight does not make: as of the 2026-07-25 follow-on it
+# reports THREE verdicts, and a run with `expected=2 failures=0` is a clean
+# pre-arm host whose per-uid gate daemons legitimately are not up yet. Writing
+# "all checks passed" over that hides the third state from exactly the file a
+# morning reader greps -- the same shape as `(restarted: none)` standing in for
+# three different mornings.
+#
+# The summary is preflight's LAST line by construction, and it is the only line
+# a driver reads: every check's own verdict is in the log artifact, which the
+# finding already points at.
+preflight_summary() {
+  local log="$1" summary='' line
+  [ -f "$log" ] || { printf ''; return 0; }
+  while IFS= read -r line; do
+    case "$line" in
+      'PREFLIGHT=SUMMARY '*) summary="${line#PREFLIGHT=SUMMARY }" ;;
+    esac
+  done < "$log"
+  printf '%s' "$summary"
+}
+
 # THE RESULT OF A PROBE RUN. The fold itself lives in lib/rails.sh as
 # `rails_probe_result`, a pure function driven exhaustively by both batteries;
 # see the long note there for why a skipped probe can never become a PASS.
@@ -372,13 +396,23 @@ while [ "$ITER" -le "$ITERATIONS" ]; do
   [ -n "$STORAGE" ] || rail_stop 'empty storage after rail'
 
   # --- step 1: preflight ---------------------------------------------------
-  if "$HERE/preflight.sh" --run-id "$RUN_ID" --operator-account "$OPERATOR" \
+  PREFLIGHT_RC=0
+  "$HERE/preflight.sh" --run-id "$RUN_ID" --operator-account "$OPERATOR" \
        --build-sha "$BUILD_SHA" --agent-account "$AGENT" --agent-uid "$AGENT_UID" \
-       > "$IEV/preflight.log" 2>&1
-  then
-    emit_finding "$ITER" preflight PASS '' 'all preflight checks passed' "$IEV/preflight.log"
+       > "$IEV/preflight.log" 2>&1 || PREFLIGHT_RC=$?
+  PREFLIGHT_SUMMARY="$(preflight_summary "$IEV/preflight.log")"
+  if [ "$PREFLIGHT_RC" -eq 0 ] && [ -n "$PREFLIGHT_SUMMARY" ]; then
+    emit_finding "$ITER" preflight PASS '' "no preflight check failed: $PREFLIGHT_SUMMARY" "$IEV/preflight.log"
   else
-    emit_finding "$ITER" preflight FAIL '' 'one or more preflight checks failed' "$IEV/preflight.log"
+    # A zero exit with NO summary line is the same shape as an OK dump that
+    # observed nothing: preflight exits 0 only after printing its own account,
+    # so a missing one means it died partway and every check after that point
+    # was never made. That is a failure, not a pass with a thin detail.
+    if [ "$PREFLIGHT_RC" -eq 0 ]; then
+      emit_finding "$ITER" preflight FAIL '' 'preflight exited 0 without printing its own summary; it did not run to the end' "$IEV/preflight.log"
+    else
+      emit_finding "$ITER" preflight FAIL '' "one or more preflight checks failed: ${PREFLIGHT_SUMMARY:-<no summary printed>}" "$IEV/preflight.log"
+    fi
     TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
     TAINT='preflight'
     # A preflight failure is a finding, not a crash. The iteration aborts

@@ -10,6 +10,7 @@ import {
   egressGateDaemonLogPaths,
   egressGateDaemonPlistPath,
   egressGateRuntimeStatePath,
+  renderEgressGateDaemonPlist,
 } from "../../src/egress-gate/gate-daemon.js";
 import {
   PEER_RESOLVER_DAEMON_LABEL_PREFIX,
@@ -17,7 +18,11 @@ import {
   peerResolverDaemonPlistPath,
 } from "../../src/egress-gate/peer-resolver-daemon.js";
 import { PF_ANCHOR_REGISTRY_PATH } from "../../src/egress-gate/anchor-registry.js";
-import { CASTLE_WALL_BOOT_LABEL, CASTLE_WALL_BOOT_PLIST_PATH } from "../../src/cli/castle-wall-boot.js";
+import {
+  CASTLE_WALL_BOOT_LABEL,
+  CASTLE_WALL_BOOT_PLIST_PATH,
+  renderBootLaunchDaemonPlist,
+} from "../../src/cli/castle-wall-boot.js";
 import { CASTLE_SIGNER_HELPER_LABEL } from "../../src/cli/castle-wall-signer-helper.js";
 import {
   GATE_ACCOUNT_NAME_PREFIX,
@@ -25,6 +30,8 @@ import {
 } from "../../src/egress-gate/gate-account.js";
 import { GATE_ACCOUNT_HOME_BASE } from "../../src/egress-gate/arming-wiring.js";
 import { deriveAgentAccountName } from "../../src/castle-wall/provision/account.js";
+import { SYSTEM_PYTHON3_CANDIDATES } from "../../src/castle-wall/provision/harness-argv.js";
+import { hermesParityPythonCandidates } from "../../src/wrap/hermes-yaml-parse-parity.js";
 
 /**
  * THE PIN. This file is the chokepoint for the round-3 BLOCKER, and it is worth
@@ -85,6 +92,34 @@ function railsCompose(fn: string, ...args: string[]): string {
     encoding: "utf8",
   }).trim();
 }
+
+/**
+ * Run one of the harness's PURE plist readers over plist XML. The content goes
+ * through the environment rather than the command line: a rendered plist is
+ * arbitrary XML and single-quote splicing it into a `bash -c` string would make
+ * this helper's own quoting part of what is under test.
+ */
+function railsPlistRead(fn: string, plistXml: string): string {
+  return execFileSync("bash", ["-c", `. "${RAILS}"; ${fn} "$DRILL_TEST_PLIST"`], {
+    encoding: "utf8",
+    env: { ...process.env, DRILL_TEST_PLIST: plistXml },
+  }).trim();
+}
+
+/** The directory the product installs a system daemon's plist into. */
+const LAUNCH_DAEMONS_DIR = path.dirname(CASTLE_WALL_BOOT_PLIST_PATH);
+
+/**
+ * The signer helper's plist, as it SHIPS: inside the app bundle, registered by
+ * `SMAppService`, never written to {@link LAUNCH_DAEMONS_DIR}.
+ */
+const SIGNER_HELPER_BUNDLE_PLIST = path.join(
+  REPO_ROOT,
+  "castle-wall-macos",
+  "Sources",
+  "CastleWallSignerHelper",
+  `${CASTLE_SIGNER_HELPER_LABEL}.plist`
+);
 
 /** Non-comment lines only: these files EXPLAIN the old wrong values at length. */
 const executableLines = (s: string): string =>
@@ -224,6 +259,173 @@ describe("drill-loop: product identifiers are pinned to the product's own export
     expect(
       railsCompose("rails_product_daemon_plist_path", peerResolverDaemonLabel(AGENT_UID))
     ).toBe(peerResolverDaemonPlistPath(AGENT_UID));
+  });
+
+  it("PARTITIONS the host daemons by whether they HAVE a plist to screen", () => {
+    // 2026-07-25 follow-on. `preflight.sh` screens plist CONTENT (D7 staleness,
+    // D9 absolute program), and before the arm the only labels it screened --
+    // the per-uid gate daemons -- do not exist yet, so it was choosing between
+    // an unearned pass and a wrong failure over an empty input set. The
+    // always-installed host daemon joins that screen so the pre-arm run measures
+    // something real.
+    //
+    // But only ONE of the two host daemons has a plist at
+    // `<LaunchDaemons>/<label>.plist`. The signer helper ships INSIDE the signed
+    // app bundle and is registered by `SMAppService.daemon(plistName:)`, so on
+    // every correctly installed host there is no such file -- and screening it
+    // by that path would have to call a correct host either permanently broken
+    // or permanently excused. Both are wrong, so the classes are declared once,
+    // here, against the product's own artifacts.
+    const screenable = railsCompose("rails_product_plist_screenable_host_daemon_labels");
+    const bundled = railsCompose("rails_product_bundle_registered_host_daemon_labels");
+    expect(screenable).toBe(CASTLE_WALL_BOOT_LABEL);
+    expect(bundled).toBe(CASTLE_SIGNER_HELPER_LABEL);
+
+    // The two classes PARTITION the host set: every host daemon is screened by
+    // exactly one signal, and none is screened by neither.
+    const host = railsCompose("rails_product_host_daemon_labels").split(" ").sort();
+    const partitioned = [...screenable.split(" "), ...bundled.split(" ")].sort();
+    expect(partitioned).toEqual(host);
+    expect(new Set(partitioned).size).toBe(partitioned.length);
+
+    // THE EVIDENCE FOR THE SPLIT, not the assertion of it. The screenable one's
+    // plist path is the product's own installed path; the bundled one's plist
+    // lives in the app bundle source tree, names a BUNDLE-RELATIVE
+    // `BundleProgram`, and carries no ProgramArguments for a D9 screen to read.
+    expect(CASTLE_WALL_BOOT_PLIST_PATH.startsWith(`${LAUNCH_DAEMONS_DIR}/`)).toBe(true);
+    const bundledPlist = fs.readFileSync(SIGNER_HELPER_BUNDLE_PLIST, "utf8");
+    expect(bundledPlist).toContain(`<string>${CASTLE_SIGNER_HELPER_LABEL}</string>`);
+    expect(bundledPlist).toContain("<key>BundleProgram</key>");
+    expect(bundledPlist).not.toContain("<key>ProgramArguments</key>");
+    // And nothing in the product writes it into /Library/LaunchDaemons, which
+    // is what would make the plist screen the right signal for it after all.
+    expect(
+      fs.existsSync(path.join(REPO_ROOT, "server", "src", "cli", "castle-wall-signer-helper.ts"))
+    ).toBe(true);
+    expect(
+      fs.readFileSync(
+        path.join(REPO_ROOT, "server", "src", "cli", "castle-wall-signer-helper.ts"),
+        "utf8"
+      )
+    ).not.toContain(LAUNCH_DAEMONS_DIR);
+  });
+
+  it("READS THE PROGRAM out of the plist shapes the product actually renders", () => {
+    // THE TRAP THAT CAME WITH THE WIDER SCREEN. `preflight.sh`'s program reader
+    // was "the first absolute .js/.cjs/.mjs anywhere in the file". Every plist
+    // it had ever been handed was a gate daemon's, so the reader survived. The
+    // Castle Wall boot daemon renders a 5-element shape whose program is a CLI
+    // SHIM with no extension at all, so adding it to the screen would have
+    // swapped one false FAIL ("no plist at ...") for another ("could not read a
+    // JavaScript program path out of ...").
+    //
+    // These assertions run the harness's reader over plists the PRODUCT
+    // rendered, not over hand-written fixtures, so the day a renderer changes
+    // shape this goes red rather than the screen silently misreading it.
+    const shimPlist = renderBootLaunchDaemonPlist({
+      programArguments: [
+        "/usr/local/bin/sanctuary",
+        "castle-wall",
+        "daemon",
+        "--safe-mode",
+        "--launchd",
+      ],
+      fortressPath: "/var/sanctuary-drill/fortress",
+      signerClientPath: "/usr/local/bin/castle-wall-signer-client",
+    });
+    expect(railsPlistRead("rails_plist_program", shimPlist)).toBe("/usr/local/bin/sanctuary");
+    // Nothing to interpret: the shim IS the file a rebuild rewrites.
+    expect(railsPlistRead("rails_plist_dist_file", shimPlist)).toBe("/usr/local/bin/sanctuary");
+
+    const interpreterPlist = renderBootLaunchDaemonPlist({
+      programArguments: [
+        "/opt/homebrew/bin/node",
+        "/usr/local/lib/sanctuary/dist/cli.js",
+        "castle-wall",
+        "daemon",
+        "--safe-mode",
+        "--launchd",
+      ],
+      fortressPath: "/var/sanctuary-drill/fortress",
+      signerClientPath: "/usr/local/bin/castle-wall-signer-client",
+    });
+    expect(railsPlistRead("rails_plist_program", interpreterPlist)).toBe(
+      "/opt/homebrew/bin/node"
+    );
+    // ...but D7 must stat the SCRIPT. `npm run build` never rewrites the node
+    // binary, so statting the interpreter would make every stale daemon look
+    // current -- the D7 defect committed by the D7 check.
+    expect(railsPlistRead("rails_plist_dist_file", interpreterPlist)).toBe(
+      "/usr/local/lib/sanctuary/dist/cli.js"
+    );
+
+    // The per-uid gate daemon, the plist the screen was originally written for.
+    const gatePlist = renderEgressGateDaemonPlist({
+      agentUid: AGENT_UID,
+      gateAccount: deriveGateAccountName("hermes"),
+      gateHomeDirectory: path.join(GATE_ACCOUNT_HOME_BASE, deriveGateAccountName("hermes")),
+      programArguments: [
+        "/opt/homebrew/bin/node",
+        "/usr/local/lib/sanctuary/dist/cli.js",
+        "castle-wall",
+        "egress-gate-daemon",
+        `--agent-uid=${AGENT_UID}`,
+      ],
+      fortressPath: "/var/sanctuary-drill/fortress",
+    });
+    expect(railsPlistRead("rails_plist_program", gatePlist)).toBe("/opt/homebrew/bin/node");
+    expect(railsPlistRead("rails_plist_dist_file", gatePlist)).toBe(
+      "/usr/local/lib/sanctuary/dist/cli.js"
+    );
+
+    // And the shape that must answer NOTHING rather than something relative:
+    // reporting `Contents/MacOS/...` as the program would make the D9
+    // absolute-program screen fail every correctly installed host.
+    expect(
+      railsPlistRead("rails_plist_program", fs.readFileSync(SIGNER_HELPER_BUNDLE_PLIST, "utf8"))
+    ).toBe("");
+  });
+
+  it("pins the PYTHON3 CANDIDATE LIST, IN ORDER, to the product's own", () => {
+    // The third copy of a bug the product fixed twice. `preflight.sh` selected
+    // the FIRST EXISTING candidate and then tested only that one for PyYAML, so
+    // `/usr/bin/python3` -- present on every macOS box, and on the drill host the
+    // one WITHOUT PyYAML -- always won, and the 2026-07-25 live run reported
+    // `/usr/bin/python3 cannot import yaml` about a host where PyYAML was
+    // importable in the next candidate. First-existing is not first-capable.
+    //
+    // The walk itself is mirrored in bash (preflight screens the dist, so it
+    // must not answer a preflight question by RUNNING the dist -- see the long
+    // note at that check). What must NOT be mirrored is the LIST: a fourth
+    // hand-spelled copy is how four identifiers drifted at once in round 3, so
+    // the harness takes the product's own array, ORDER INCLUDED. The order is
+    // load-bearing: homebrew first is what makes the drill host's capable
+    // interpreter the one tried first.
+    expect(shellConst(railsSrc, "RAILS_PRODUCT_PYTHON3_CANDIDATES", "lib/rails.sh")).toBe(
+      SYSTEM_PYTHON3_CANDIDATES.join(" ")
+    );
+    expect(railsCompose("rails_product_python3_candidates")).toBe(
+      SYSTEM_PYTHON3_CANDIDATES.join(" ")
+    );
+    // The same list the product's fail-closed Hermes parse-parity resolver
+    // probes, so "what preflight screened" and "what the product will resolve"
+    // cannot diverge.
+    expect(hermesParityPythonCandidates()).toEqual(SYSTEM_PYTHON3_CANDIDATES);
+    // Absolute-only: a bare `python3` would be PATH-resolved, and PATH is an
+    // environment input.
+    for (const candidate of SYSTEM_PYTHON3_CANDIDATES) {
+      expect(path.isAbsolute(candidate)).toBe(true);
+    }
+    // And preflight composes it rather than re-spelling any of them.
+    const preflightSrc = executableLines(
+      fs.readFileSync(path.join(DRIVERS, "preflight.sh"), "utf8")
+    );
+    for (const candidate of SYSTEM_PYTHON3_CANDIDATES) {
+      expect(
+        preflightSrc,
+        `preflight.sh spells out "${candidate}" instead of composing the candidate list`
+      ).not.toContain(candidate);
+    }
   });
 
   it("composes the GATE LOG path the product actually writes", () => {

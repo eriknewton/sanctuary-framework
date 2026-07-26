@@ -36,6 +36,8 @@
 #   probe.sh json-number <json-text> <field>
 #   probe.sh claim-mechanisms <verdict-text>
 #   probe.sh claim-supported <verdict-text> <supported-mechanisms>
+#   probe.sh plist-program <plist-content>
+#   probe.sh plist-dist-file <plist-content>
 #   probe.sh gate-runtime-state-path <agent-uid>
 #   probe.sh fingerprint-against <fingerprint> <deny-list> <allow-list>
 #   probe.sh host <fingerprint> [observed-name...]
@@ -172,6 +174,31 @@ case "$kind" in
     NAMES="$(rails_registry_names_agent_uid "$1" "$2")" || die 'registry-names-uid rail rejected'
     if [ -z "$NAMES" ]; then die 'empty answer after the registry-uid rail'; fi
     printf 'PROBE=ACCEPT registry-names-uid=%s\n' "$NAMES"
+    ;;
+  plist-program)
+    # THE D9 SUBJECT, as a pure function. `preflight.sh` decides whether a
+    # daemon's program is absolute from this, and the reader it replaced could
+    # only see an absolute `.js` -- so the Castle Wall boot plist's CLI-shim
+    # shape, which names a program with no extension at all, would have been
+    # reported as "could not read a program" the moment that daemon joined the
+    # screen. Driven directly because every shape the product renders can be
+    # asserted here with no host, no launchd and no /Library.
+    #
+    # An EMPTY answer is legitimate (a `BundleProgram` plist names no
+    # PATH-resolvable program), so this probe reports `<none>` rather than
+    # treating empty as a rail failure: a caller has to be able to tell that
+    # apart from a plist naming `node`.
+    # Arity forwarded verbatim so the rail's own check is what fires.
+    PLP="$(rails_plist_program "$@")" || die 'plist-program rail rejected'
+    printf 'PROBE=ACCEPT plist-program=%s\n' "${PLP:-<none>}"
+    ;;
+  plist-dist-file)
+    # The D7 subject: the file whose mtime moves when the dist is rebuilt.
+    # Distinct from the program for an interpreter+script plist, where statting
+    # the interpreter would make every stale daemon look current.
+    # Arity forwarded verbatim so the rail's own check is what fires.
+    PLD="$(rails_plist_dist_file "$@")" || die 'plist-dist-file rail rejected'
+    printf 'PROBE=ACCEPT plist-dist-file=%s\n' "${PLD:-<none>}"
     ;;
   daemon-plist-path)
     if [ "$#" -ne 1 ]; then die 'daemon-plist-path needs <label>'; fi

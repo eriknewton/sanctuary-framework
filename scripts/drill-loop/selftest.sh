@@ -444,6 +444,68 @@ expect_accept 'the daemon plist path is composed from the one constant' \
 expect_reject 'a label that could escape the plist directory is refused' 'cannot compose a safe plist path' \
   -- "$PROBE" daemon-plist-path '../../etc/passwd'
 
+printf '== the plist reader: what a launchd job says it RUNS ==\n'
+#
+# THE TRAP THE PRE-ARM SCREEN WALKS INTO. Preflight's D7/D9 screens had one
+# reader -- "the first absolute .js anywhere in the file" -- and it worked only
+# because the only plists it ever screened were the per-uid gate daemons'. Add
+# the always-installed Castle Wall boot daemon so the pre-arm run screens
+# something real, and that reader turns "no plist at ..." into "could not read a
+# JavaScript program path out of ...": the boot plist's 5-element shape names an
+# absolute CLI SHIM with no extension at all
+# (`programArgumentsRunCastleWallDaemon`, server/src/cli/castle-wall-boot.ts),
+# and the signer helper is a compiled Swift binary.
+#
+# So both shapes are asserted here, as pure functions, plus the ones that could
+# make the reader answer by accident: a `.js` outside ProgramArguments, a key
+# whose value is not an array, and a bundle-relative program that must answer
+# NOTHING rather than something relative.
+PL_SHIM='<dict><key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/sanctuary</string>
+		<string>castle-wall</string>
+		<string>--launchd</string>
+	</array>
+</dict>'
+PL_INTERP='<dict><key>ProgramArguments</key><array><string>/opt/homebrew/bin/node</string><string>/usr/local/lib/sanctuary/cli.js</string><string>castle-wall</string></array></dict>'
+expect_accept 'a CLI shim with NO extension is the program' 'plist-program=/usr/local/bin/sanctuary' \
+  -- "$PROBE" plist-program "$PL_SHIM"
+expect_accept 'and it is also the file whose mtime tracks the dist' 'plist-dist-file=/usr/local/bin/sanctuary' \
+  -- "$PROBE" plist-dist-file "$PL_SHIM"
+expect_accept 'an interpreter+script plist runs the INTERPRETER' 'plist-program=/opt/homebrew/bin/node' \
+  -- "$PROBE" plist-program "$PL_INTERP"
+# ...and D7 must stat the SCRIPT, not the interpreter: `npm run build` never
+# rewrites /opt/homebrew/bin/node, so statting it would make every stale daemon
+# look current, which is the exact D7 defect wearing preflight's own clothes.
+expect_accept 'but the D7 subject is the SCRIPT it was handed' 'plist-dist-file=/usr/local/lib/sanctuary/cli.js' \
+  -- "$PROBE" plist-dist-file "$PL_INTERP"
+expect_accept 'a compiled binary with no arguments is read too' 'plist-program=/usr/local/libexec/signer' \
+  -- "$PROBE" plist-program '<dict><key>ProgramArguments</key><array><string>/usr/local/libexec/signer</string></array></dict>'
+expect_accept 'a bare node is reported AS the program, not skipped' 'plist-program=node' \
+  -- "$PROBE" plist-program '<dict><key>ProgramArguments</key><array><string>node</string><string>/opt/x.js</string></array></dict>'
+# The reader it replaced would have answered `/opt/other/thing.js` here, out of
+# a key that is not ProgramArguments at all.
+expect_accept 'a .js OUTSIDE ProgramArguments is not the program' 'plist-program=/usr/local/bin/sanctuary' \
+  -- "$PROBE" plist-program '<dict><key>StandardOutPath</key><string>/opt/other/thing.js</string><key>ProgramArguments</key><array><string>/usr/local/bin/sanctuary</string></array></dict>'
+expect_accept 'a Program key wins over the argument vector' 'plist-program=/usr/libexec/helper' \
+  -- "$PROBE" plist-program '<dict><key>Program</key><string>/usr/libexec/helper</string><key>ProgramArguments</key><array><string>helper</string><string>/etc/conf</string></array></dict>'
+# With `Program` set, ProgramArguments[1] is argv[1], never a script.
+expect_accept 'and the D7 subject stays the Program, not its argv' 'plist-dist-file=/usr/libexec/helper' \
+  -- "$PROBE" plist-dist-file '<dict><key>Program</key><string>/usr/libexec/helper</string><key>ProgramArguments</key><array><string>helper</string><string>/etc/conf</string></array></dict>'
+# THE BUNDLE CASE, and why the signer helper is not in the plist screen at all:
+# its plist (castle-wall-macos/Sources/CastleWallSignerHelper/) names a
+# BUNDLE-RELATIVE `BundleProgram` and is registered by `SMAppService`, not
+# dropped into /Library/LaunchDaemons. Answering `Contents/MacOS/...` here would
+# make D9 read it as a PATH-relative program and fail every correct host.
+expect_accept 'a BundleProgram plist names NO PATH-resolvable program' 'plist-program=<none>' \
+  -- "$PROBE" plist-program '<dict><key>BundleProgram</key><string>Contents/MacOS/castle-wall-signer-helper</string></dict>'
+expect_accept 'a key whose value is not an array donates nothing' 'plist-program=<none>' \
+  -- "$PROBE" plist-program '<dict><key>ProgramArguments</key><dict><key>a</key><string>/bin/sh</string></dict></dict>'
+expect_accept 'an empty plist answers nothing rather than guessing' 'plist-program=<none>' \
+  -- "$PROBE" plist-program '<dict/>'
+expect_reject 'the plist reader refuses a wrong argument count' 'expected 1 arg' \
+  -- "$PROBE" plist-program
+
 printf '== host rail: the decision is a HARDWARE FINGERPRINT ==\n'
 #
 # A live audit of the real machines (2026-07-25) measured the intended drill
@@ -1555,14 +1617,27 @@ for a in "${args[@]}"; do
       exit 0
       ;;
     registry-state)
+      # The verdict line also publishes the OBSERVED ARM STATE of the uid the
+      # caller named -- the one decision that says whether a missing per-uid
+      # gate daemon is the expected pre-arm state or a defect. It is emitted
+      # by `wrapper_observe_arm_state`, the same single source
+      # `kickstart-daemons` uses, and preflight CONSUMES it rather than
+      # scanning the registry bytes a second time.
+      #
+      # `STUB_REGISTRY_ARM=none` reproduces the one shape a driver must refuse
+      # rather than resolve: a verdict line with no arm field at all, i.e. an
+      # older wrapper that does not answer the question. That must never read
+      # as "not armed".
+      arm_fields="arm_state=${STUB_REGISTRY_ARM:-not-armed} arm_basis=${STUB_REGISTRY_ARM_BASIS:-registry-absent}"
+      if [ "${STUB_REGISTRY_ARM:-}" = 'none' ]; then arm_fields=''; fi
       case "${STUB_REGISTRY:-absent}" in
         refused) echo 'sudo: a password is required' >&2; exit 1 ;;
         absent)  echo 'WRAPPER=REGISTRY-ABSENT path=/var/db/sanctuary/egress-anchor-registry.json'
-                 echo 'WRAPPER=OK verb=registry-state state=absent'; exit 0 ;;
+                 echo "WRAPPER=OK verb=registry-state state=absent $arm_fields"; exit 0 ;;
         *)       echo 'WRAPPER=REGISTRY-BEGIN path=/var/db/sanctuary/egress-anchor-registry.json'
                  printf '%s\n' "${STUB_REGISTRY_BODY:-}"
                  echo 'WRAPPER=REGISTRY-END'
-                 echo 'WRAPPER=OK verb=registry-state state=present'; exit 0 ;;
+                 echo "WRAPPER=OK verb=registry-state state=present $arm_fields"; exit 0 ;;
       esac
       ;;
     fortress-state)
@@ -1716,6 +1791,51 @@ printf '%s\n' '    "IOPlatformUUID" = "$LOOP_UUID"'
 STUB
 chmod +x "$STUBBIN/ioreg"
 
+# WHERE THE DRIVER BATTERY'S DAEMON PLISTS LIVE.
+#
+# `preflight.sh` screens plist CONTENT, and until now the battery could only
+# drive it against the real /Library/LaunchDaemons -- where, on any machine
+# running this suite, there are no Sanctuary plists at all. So the ONLY branch
+# reachable was "the whole input set is absent", and every branch that reads a
+# plist (the D7 dist stat, the D9 absolute-program screen) was structurally
+# untestable. That is how the reader that could only see an absolute `.js`
+# survived: nothing ever handed it the CLI-shim shape the product actually
+# renders. Pointing the constant at a sandbox directory is what makes the
+# planted-plist cases real; absent stays the default, so the round-3
+# "an absent plist set FAILS the D9 check" case is unchanged and now
+# deterministic rather than incidental.
+PFPLISTS="$SANDBOX/preflight-launchdaemons"
+mkdir -p "$PFPLISTS"
+
+# THE PYTHON CANDIDATES THE PREFLIGHT PYYAML WALK PROBES.
+#
+# Same reason as the plists: the real list is three absolute system paths whose
+# PyYAML state is a property of whatever machine runs this suite, so the ONE
+# branch a test could rely on was "whichever one happens to be first". That is
+# how `first EXISTING` survived review while the comment above it said "resolve
+# by capability, not existence": no case could ever construct the host where the
+# two answers differ. These stubs are that host, deterministically -- candidate 1
+# runs and cannot import yaml, candidate 2 runs and can.
+PFPY="$SANDBOX/preflight-python"
+mkdir -p "$PFPY"
+# Exit 20 is the product's IMPORT_MISSING code, which the walk reads as
+# "this interpreter ran and has no PyYAML" rather than as a broken interpreter.
+cat > "$PFPY/python3-nopyyaml" <<'PYSTUB'
+#!/bin/bash
+exit 20
+PYSTUB
+cat > "$PFPY/python3-usable" <<'PYSTUB'
+#!/bin/bash
+exit 0
+PYSTUB
+cat > "$PFPY/python3-broken" <<'PYSTUB'
+#!/bin/bash
+echo 'Segmentation fault' >&2
+exit 139
+PYSTUB
+chmod +x "$PFPY/python3-nopyyaml" "$PFPY/python3-usable" "$PFPY/python3-broken"
+PFPY_LIST="$PFPY/python3-absent $PFPY/python3-nopyyaml $PFPY/python3-usable"
+
 # The sandbox harness: byte-identical drivers, with only fixture constants
 # substituted so the tests can run without touching the real host state.
 HARNESS="$SANDBOX/harness"
@@ -1737,6 +1857,8 @@ sed -e "s|^RAILS_SYSTEM_BIN_DIRS='/usr/bin /bin /usr/sbin /sbin'\$|RAILS_SYSTEM_
   -e "s|^RAILS_HOST_ALLOW_FP=.*|RAILS_HOST_ALLOW_FP='$LOOP_FP'|" \
   -e "s|^RAILS_HOST_DENY_FP=.*|RAILS_HOST_DENY_FP=''|" \
   -e "s|^RAILS_HOST_DENY=.*|RAILS_HOST_DENY=''|" \
+  -e "s|^RAILS_PRODUCT_LAUNCHDAEMONS_DIR=.*|RAILS_PRODUCT_LAUNCHDAEMONS_DIR='$PFPLISTS'|" \
+  -e "s|^RAILS_PRODUCT_PYTHON3_CANDIDATES=.*|RAILS_PRODUCT_PYTHON3_CANDIDATES='$PFPY_LIST'|" \
   "$HERE/lib/rails.sh" > "$HARNESS/lib/rails.sh"
 cat >> "$HARNESS/lib/rails.sh" <<'STUB'
 
@@ -1749,7 +1871,9 @@ STUB
 # the real /usr/bin/sudo and reporting whatever that did. That is the same class
 # as everything else in this file, so it is checked rather than assumed.
 if grep -q "^RAILS_SYSTEM_BIN_DIRS='$STUBBIN " "$HARNESS/lib/rails.sh" &&
-   grep -q "^RAILS_DISPOSABLE_BASE='$BASE'\$" "$HARNESS/lib/rails.sh"; then
+   grep -q "^RAILS_DISPOSABLE_BASE='$BASE'\$" "$HARNESS/lib/rails.sh" &&
+   grep -q "^RAILS_PRODUCT_LAUNCHDAEMONS_DIR='$PFPLISTS'\$" "$HARNESS/lib/rails.sh" &&
+   grep -q "^RAILS_PRODUCT_PYTHON3_CANDIDATES='$PFPY_LIST'\$" "$HARNESS/lib/rails.sh"; then
   printf 'ok    the driver battery resolves its tools through the rails CONSTANT, not PATH\n'
   PASS=$((PASS + 1))
 else
@@ -2145,6 +2269,327 @@ case "$out" in
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
 esac
 
+printf '== preflight: ABSENT-BEFORE-ARM is a third state, not a softer PASS ==\n'
+#
+# The same conflation `kickstart-daemons` was cured of, one rung higher. Step 0
+# now lets a clean pre-arm host begin an iteration; step 1 then screened the
+# SAME per-uid gate labels -- which the arm creates two steps later -- and
+# failed with `no plist at .../ai.sanctuaryprotocol.egress-gate.<uid>.plist;
+# the daemon is not installed`. The live run would have stopped there instead.
+#
+# The fix must not be "an absent plist passes". The round-3 remediation that
+# made an absent input set FAIL is the reason this file has a D9 check worth
+# having, and the case asserting it is directly above, unchanged. So there are
+# three verdicts, and the cases below drive all three against the SAME check:
+#
+#   pre-arm, gate label   EXPECTED, and never PASS and never FAIL
+#   post-arm, gate label  FAIL      (so the third state is not blindness)
+#   host label, either    FAIL      (its absence is never expected)
+#   arm state unobserved  FAIL      (an unread registry excuses nothing)
+#
+# ANTI-VACUITY IS ON THE FIXTURE. Each case asserts what is actually on disk in
+# the sandbox LaunchDaemons directory before reading a verdict about it -- a
+# verdict alone cannot tell a driver that screened a plist from one that
+# screened an empty directory, and "screened an empty directory and called it
+# fine" is the whole defect class this file exists for.
+PF_GATE_LABEL="$(bash -c ". '$HERE/lib/rails.sh'; rails_product_gate_label '$(id -u)'")"
+PF_PEER_LABEL="$(bash -c ". '$HERE/lib/rails.sh'; rails_product_resolver_label '$(id -u)'")"
+PF_HOST_LABEL="$(bash -c ". '$HERE/lib/rails.sh'; rails_product_plist_screenable_host_daemon_labels")"
+PF_BUNDLE_LABEL="$(bash -c ". '$HERE/lib/rails.sh'; rails_product_bundle_registered_host_daemon_labels")"
+PF_PROG="$SANDBOX/preflight-programs"
+mkdir -p "$PF_PROG"
+
+# The CLI-shim shape the Castle Wall boot daemon actually renders: an absolute
+# program with NO extension (`programArgumentsRunCastleWallDaemon`'s 5-element
+# form). The reader this replaced could only see an absolute `.js`, so this
+# plist would have produced "could not read a JavaScript program path out of
+# ..." -- one false FAIL swapped for another.
+: > "$PF_PROG/sanctuary"
+chmod +x "$PF_PROG/sanctuary"
+pf_plant_plist() {
+  # pf_plant_plist <label> <program-args...>
+  local label="$1"; shift
+  {
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n<dict>\n'
+    printf '\t<key>Label</key>\n\t<string>%s</string>\n' "$label"
+    printf '\t<key>ProgramArguments</key>\n\t<array>\n'
+    local a
+    for a in "$@"; do printf '\t\t<string>%s</string>\n' "$a"; done
+    printf '\t</array>\n</dict>\n</plist>\n'
+  } > "$PFPLISTS/$label.plist"
+}
+pf_clear_plists() { rm -f "$PFPLISTS"/*.plist; }
+
+# --- A: pre-arm, and the gate plists are absent ----------------------------
+pf_clear_plists
+pf_plant_plist "$PF_HOST_LABEL" "$PF_PROG/sanctuary" 'castle-wall' 'daemon' '--safe-mode' '--launchd'
+set +e   # declared exception: preflight still fails on a non-drill host
+out="$(STUB_REGISTRY_ARM=not-armed STUB_REGISTRY_ARM_BASIS=registry-absent run_preflight)"; rc=$?
+set -e
+if [ ! -f "$PFPLISTS/$PF_HOST_LABEL.plist" ] || [ -e "$PFPLISTS/$PF_GATE_LABEL.plist" ]; then
+  printf 'FAIL  anti-vacuity: the pre-arm plist fixture was not pre-arm\n'; FAIL=$((FAIL + 1))
+else
+  case "$out" in
+    *"PREFLIGHT=EXPECTED check=daemon-dist-$PF_GATE_LABEL reason=absent-before-arm"*)
+      printf 'ok    a per-uid gate plist that does not exist YET is EXPECTED, not a failure\n'
+      PASS=$((PASS + 1)) ;;
+    *"PREFLIGHT=FAIL check=daemon-dist-$PF_GATE_LABEL"*)
+      printf 'FAIL  *** a clean pre-arm host STILL cannot preflight: the absent gate plist is a failure ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      printf 'FAIL  the absent pre-arm gate plist produced no recognizable verdict\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+  # NEVER A PASS. The third state has to be its own token, or it is just the
+  # absence-means-good fail-open with a new spelling.
+  case "$out" in
+    *"PREFLIGHT=PASS check=daemon-dist-$PF_GATE_LABEL"*)
+      printf 'FAIL  *** an absent gate daemon was reported as a PASS ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      printf 'ok    the expected absence is not spelled PASS anywhere\n'; PASS=$((PASS + 1)) ;;
+  esac
+  # And the D9 screen: a real plist screened, the expected ones named, PASS.
+  case "$out" in
+    *'PREFLIGHT=EXPECTED check=plist-absolute-node reason=absent-before-arm'*'PREFLIGHT=PASS check=plist-absolute-node screened 1 plist(s)'*)
+      printf 'ok    D9 screens the host plist for real and names the pre-arm absences separately\n'
+      PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  D9 did not screen the planted host plist alongside the expected absences\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+  # THE NON-.js PROGRAM. D7 must get PAST reading the program -- the failure it
+  # reaches is "not running" (there is no launchd job in a sandbox), which is
+  # only reachable once the program was read AND found on disk.
+  case "$out" in
+    *"PREFLIGHT=FAIL check=daemon-dist-$PF_HOST_LABEL"*'is not running'*)
+      printf 'ok    a plist whose program is a CLI shim with no .js extension is read, not errored on\n'
+      PASS=$((PASS + 1)) ;;
+    *'could not read a JavaScript program path'*|*"check=daemon-dist-$PF_HOST_LABEL"*'names no program to stat'*)
+      printf 'FAIL  *** the D7 program reader still only understands a .js path ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      printf 'FAIL  the planted host plist produced no recognizable D7 verdict\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+  # The bundle-registered signer helper has no plist to screen and is never
+  # excused for it.
+  case "$out" in
+    *"PREFLIGHT=FAIL check=daemon-loaded-$PF_BUNDLE_LABEL"*)
+      printf 'ok    the signed host daemon is screened by launchd, and its absence is never expected\n'
+      PASS=$((PASS + 1)) ;;
+    *"PREFLIGHT=EXPECTED check=daemon-loaded-$PF_BUNDLE_LABEL"*|*"PREFLIGHT=PASS check=daemon-dist-$PF_BUNDLE_LABEL"*)
+      printf 'FAIL  *** the bundle-registered host daemon was excused or screened by a plist it never has ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      printf 'FAIL  the bundle-registered host daemon produced no recognizable verdict\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+fi
+
+# --- B: ARMED, and the gate plists are absent. A FAILURE, or this is blind --
+set +e   # declared exception
+out="$(STUB_REGISTRY=present STUB_REGISTRY_ARM=armed STUB_REGISTRY_ARM_BASIS=registry-names-uid \
+       run_preflight)"; rc=$?
+set -e
+if [ -e "$PFPLISTS/$PF_GATE_LABEL.plist" ]; then
+  printf 'FAIL  anti-vacuity: the armed-but-absent fixture planted a gate plist\n'; FAIL=$((FAIL + 1))
+else
+  case "$out" in
+    *"PREFLIGHT=EXPECTED check=daemon-dist-$PF_GATE_LABEL"*)
+      printf 'FAIL  *** the harness is BLIND: a gate plist that should exist by now read as expected-absent ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *"PREFLIGHT=FAIL check=daemon-dist-$PF_GATE_LABEL"*'not installed'*)
+      printf 'ok    a gate plist missing while the registry says this uid is CONFINED is a failure\n'
+      PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  an armed-but-absent gate plist produced no recognizable verdict\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+  case "$out" in
+    *'PREFLIGHT=PASS check=plist-absolute-node'*)
+      printf 'FAIL  *** D9 PASSED while an armed uid had no gate plist to screen ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *'PREFLIGHT=FAIL check=plist-absolute-node'*'no plist to screen'*)
+      printf 'ok    D9 fails on an armed uid whose gate plists are missing\n'; PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  D9 produced no recognizable verdict on an armed uid\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+  case "$out" in
+    *'PREFLIGHT=PASS check=arm-state'*'arm_state=armed arm_basis=registry-names-uid'*)
+      printf 'ok    the observed arm state is recorded as its own check, with its basis\n'
+      PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  preflight did not record the arm state that governed its absences\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+fi
+
+# --- C: a HOST plist is absent. Never expected, whatever the arm state ------
+for pf_arm in not-armed armed; do
+  pf_clear_plists
+  set +e   # declared exception
+  out="$(STUB_REGISTRY_ARM="$pf_arm" run_preflight)"; rc=$?
+  set -e
+  if [ -e "$PFPLISTS/$PF_HOST_LABEL.plist" ]; then
+    printf 'FAIL  anti-vacuity: the host plist was not actually cleared\n'; FAIL=$((FAIL + 1))
+    continue
+  fi
+  case "$out" in
+    *"PREFLIGHT=EXPECTED check=daemon-dist-$PF_HOST_LABEL"*)
+      printf 'FAIL  *** an absent HOST daemon was excused as a pre-arm absence (arm_state=%s) ***\n' "$pf_arm"
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *"PREFLIGHT=FAIL check=daemon-dist-$PF_HOST_LABEL"*'not installed'*)
+      printf 'ok    an absent host daemon FAILS with arm_state=%s\n' "$pf_arm"
+      PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  an absent host daemon produced no recognizable verdict (arm_state=%s)\n' "$pf_arm"
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+done
+
+# --- D: the arm state was NEVER OBSERVED. Refuse; excuse nothing ------------
+#
+# Two shapes, and the second is the one a verdict-shaped parser walks into: a
+# registry the wrapper could not read at all, and a verdict line that came back
+# WITHOUT an arm field. The second must not read as "not armed" -- that is the
+# fail-open direction, because "not armed" is what makes a missing gate daemon
+# look fine.
+pf_clear_plists
+for pf_case in 'refused-registry' 'no-arm-field'; do
+  set +e   # declared exception
+  if [ "$pf_case" = 'refused-registry' ]; then
+    out="$(STUB_REGISTRY=refused run_preflight)"; rc=$?
+  else
+    out="$(STUB_REGISTRY_ARM=none run_preflight)"; rc=$?
+  fi
+  set -e
+  case "$out" in
+    *'PREFLIGHT=EXPECTED'*)
+      printf 'FAIL  *** an UNOBSERVED arm state still excused an absence (%s) ***\n' "$pf_case"
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *'PREFLIGHT=FAIL check=arm-state'*'cannot say whether a missing per-uid gate daemon'*)
+      if [ "$rc" -ne 0 ]; then
+        printf 'ok    an unobserved arm state is a refusal and excuses nothing (%s)\n' "$pf_case"
+        PASS=$((PASS + 1))
+      else
+        printf 'FAIL  preflight refused the arm state and exited 0 (%s)\n' "$pf_case"
+        note "output: $out"; FAIL=$((FAIL + 1))
+      fi ;;
+    *)
+      printf 'FAIL  an unobserved arm state produced no recognizable refusal (%s)\n' "$pf_case"
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+done
+
+# --- E: the D9 property itself, over BOTH program shapes -------------------
+# Property 1: the program launchd execs must be ABSOLUTE. Property 2: no bare
+# `node` anywhere in the arguments, because `/usr/bin/env node` satisfies
+# property 1 and still resolves an interpreter on a PATH launchd does not give.
+pf_clear_plists
+pf_plant_plist "$PF_HOST_LABEL" 'sanctuary' 'castle-wall' 'daemon'
+set +e   # declared exception
+out="$(run_preflight)"; rc=$?
+set -e
+case "$out" in
+  *'PREFLIGHT=FAIL check=plist-absolute-node'*'a program launchd must resolve on PATH'*)
+    printf 'ok    a plist whose program is RELATIVE fails D9 even with no .js anywhere in it\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** a PATH-relative program passed the D9 screen ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+pf_clear_plists
+pf_plant_plist "$PF_HOST_LABEL" '/usr/bin/env' 'node' "$PF_PROG/sanctuary"
+set +e   # declared exception
+out="$(run_preflight)"; rc=$?
+set -e
+case "$out" in
+  *'PREFLIGHT=FAIL check=plist-absolute-node'*'PATH-relative node in'*)
+    printf 'ok    an absolute /usr/bin/env with a bare node behind it still fails D9\n'
+    PASS=$((PASS + 1)) ;;
+  *)
+    printf 'FAIL  *** the #986 bare-node shape survived behind an absolute env ***\n'
+    note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+pf_clear_plists
+
+printf '== preflight: PyYAML is resolved by CAPABILITY, not by existence ==\n'
+#
+# The third copy of a bug the product fixed twice (#987, then a 2026-07-22
+# backout). The reviewed loop took the FIRST EXISTING candidate and then tested
+# only that one, so `/usr/bin/python3` -- present on every macOS box -- always
+# won, and on the drill host it is exactly the one WITHOUT PyYAML. The
+# 2026-07-25 live run reported `/usr/bin/python3 cannot import yaml` about a
+# host where PyYAML was installed and importable in the very next candidate.
+#
+# The fixture is the host where the two answers DIFFER, which is what no case
+# could construct before: candidate 1 absent, candidate 2 runs and has no
+# PyYAML, candidate 3 runs and has it. On the reviewed code candidate 2 wins and
+# the check FAILS.
+set +e   # declared exception: preflight still fails on a non-drill host
+out="$(run_preflight)"; rc=$?
+set -e
+# ANTI-VACUITY ON THE FIXTURE: the passed-over candidate must really be there
+# and really be incapable, or "it skipped it" proves nothing.
+if [ ! -x "$PFPY/python3-nopyyaml" ] || [ ! -x "$PFPY/python3-usable" ] \
+   || [ -e "$PFPY/python3-absent" ]; then
+  printf 'FAIL  anti-vacuity: the python candidate fixture was never planted\n'; FAIL=$((FAIL + 1))
+elif "$PFPY/python3-nopyyaml" -E -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+  printf 'FAIL  anti-vacuity: the no-PyYAML candidate does not actually refuse\n'; FAIL=$((FAIL + 1))
+else
+  case "$out" in
+    *"PREFLIGHT=PASS check=pyyaml-importable interpreter=$PFPY/python3-usable"*)
+      printf 'ok    a candidate that EXISTS but cannot import yaml is passed over for one that can\n'
+      PASS=$((PASS + 1)) ;;
+    *'PREFLIGHT=FAIL check=pyyaml-importable'*)
+      printf 'FAIL  *** first-EXISTING is still standing in for first-CAPABLE ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *)
+      printf 'FAIL  the pyyaml check produced no recognizable verdict\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+  # AND IT SAYS WHAT IT PROBED. "PyYAML is not installed anywhere" and "we
+  # looked in the wrong place" are different mornings, and a verdict that names
+  # only its winner cannot tell them apart.
+  case "$out" in
+    *"check=pyyaml-importable"*"$PFPY/python3-absent=absent"*"$PFPY/python3-nopyyaml=no-pyyaml"*)
+      printf 'ok    the verdict names every candidate probed and what each one did\n'
+      PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  the pyyaml verdict did not name what it probed\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+fi
+# ALL CANDIDATES FAIL: still a real preflight FAILURE (the drill genuinely needs
+# an interpreter that can import yaml), but named honestly and per candidate.
+PFPY_ALLBAD="$PFPY/python3-absent $PFPY/python3-nopyyaml $PFPY/python3-broken"
+sed -i.bak "s|^RAILS_PRODUCT_PYTHON3_CANDIDATES=.*|RAILS_PRODUCT_PYTHON3_CANDIDATES='$PFPY_ALLBAD'|" \
+  "$HARNESS/lib/rails.sh"
+rm -f "$HARNESS/lib/rails.sh.bak"
+set +e   # declared exception
+out="$(run_preflight)"; rc=$?
+set -e
+if ! grep -q "^RAILS_PRODUCT_PYTHON3_CANDIDATES='$PFPY_ALLBAD'\$" "$HARNESS/lib/rails.sh"; then
+  printf 'FAIL  anti-vacuity: the all-bad candidate list was never substituted\n'; FAIL=$((FAIL + 1))
+else
+  case "$out" in
+    *'PREFLIGHT=PASS check=pyyaml-importable'*)
+      printf 'FAIL  *** the pyyaml check PASSED with no capable interpreter anywhere ***\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+    *'PREFLIGHT=FAIL check=pyyaml-importable reason=no python3 candidate can import yaml'*"$PFPY/python3-broken=unrunnable(rc=139)"*)
+      printf 'ok    with no capable interpreter it still FAILS, and separates no-pyyaml from unrunnable\n'
+      PASS=$((PASS + 1)) ;;
+    *)
+      printf 'FAIL  an all-incapable candidate list produced no recognizable verdict\n'
+      note "output: $out"; FAIL=$((FAIL + 1)) ;;
+  esac
+fi
+sed -i.bak "s|^RAILS_PRODUCT_PYTHON3_CANDIDATES=.*|RAILS_PRODUCT_PYTHON3_CANDIDATES='$PFPY_LIST'|" \
+  "$HARNESS/lib/rails.sh"
+rm -f "$HARNESS/lib/rails.sh.bak"
+
 # --- RUN-LOOP: EARLY FAILURES STILL RETIRE THE DISPOSABLE FORTRESS --------
 printf '== run-loop: early failures retire the disposable fortress ==\n'
 run_loop_once() {
@@ -2244,6 +2689,23 @@ case "$(cat "$PREFLIGHT_SUDO_LOG" 2>/dev/null || true):$preflight_findings:$out"
     printf 'FAIL  *** a preflight failure did not run and record retire ***\n'
     note "sudo log: $(cat "$PREFLIGHT_SUDO_LOG" 2>/dev/null || true)"
     note "output: $out"; FAIL=$((FAIL + 1)) ;;
+esac
+# THE LOOP MUST RECORD WHAT PREFLIGHT SAID, not what the loop hoped -- the same
+# lesson as the kickstart finding above. This step's text was the fixed sentence
+# `all preflight checks passed`, and preflight now reports THREE verdicts: a run
+# with `expected=2 failures=0` is a clean pre-arm host whose per-uid gate daemons
+# are correctly not up yet, and "all checks passed" would erase the third state
+# from the one file a morning reader greps.
+case "$preflight_findings" in
+  *'"step":"preflight"'*'failures='*'expected='*)
+    printf 'ok    the preflight finding carries preflight OWN summary, expected-count included\n'
+    PASS=$((PASS + 1)) ;;
+  *'all preflight checks passed'*|*'one or more preflight checks failed"'*)
+    printf 'FAIL  *** the preflight finding is still a fixed sentence; the third state is invisible ***\n'
+    note "findings: $preflight_findings"; FAIL=$((FAIL + 1)) ;;
+  *)
+    printf 'FAIL  the preflight finding carried no recognizable summary\n'
+    note "findings: $preflight_findings"; FAIL=$((FAIL + 1)) ;;
 esac
 
 # ROUND-5 L1. The MINT-failure retire path was the one of the three that no

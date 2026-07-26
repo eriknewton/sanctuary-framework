@@ -234,6 +234,21 @@ RAILS_PRODUCT_GATE_RUNTIME_STATE_FILE='state.json'
 RAILS_PRODUCT_CASTLE_WALL_LABEL='ai.sanctuaryprotocol.castle-wall.daemon'
 
 # `CASTLE_SIGNER_HELPER_LABEL`, server/src/cli/castle-wall-signer-helper.ts.
+#
+# THIS ONE HAS NO PLIST AT `RAILS_PRODUCT_LAUNCHDAEMONS_DIR`, AND THAT IS NOT A
+# DEFECT. The signer helper ships INSIDE the signed app bundle at
+# `Contents/Library/LaunchDaemons/<label>.plist`
+# (castle-wall-macos/Sources/CastleWallSignerHelper/) and is registered with
+# launchd via `SMAppService.daemon(plistName:)`, not by dropping a file into
+# /Library/LaunchDaemons. Its plist also names `BundleProgram`, a
+# BUNDLE-RELATIVE path, rather than `ProgramArguments` -- so it has no absolute
+# program for a D9 screen to read and no on-disk plist for a D7 screen to stat.
+#
+# A driver that screened it by plist path would find nothing on every correctly
+# installed host, forever, and would have to call that either a permanent FAIL
+# or an excused absence. Both are wrong. Its one observable existence signal is
+# launchd's own job table, so that is the signal it is screened by, and the two
+# classes are declared here rather than each caller guessing.
 RAILS_PRODUCT_SIGNER_HELPER_LABEL='ai.sanctuaryprotocol.macos.castle-wall.signer-helper'
 
 # The directory every one of the product's system daemons installs its plist
@@ -242,6 +257,25 @@ RAILS_PRODUCT_SIGNER_HELPER_LABEL='ai.sanctuaryprotocol.macos.castle-wall.signer
 # once here so the wrapper and the drivers ask the same question of the same
 # place; a second declaration site is how four identifiers drifted at once.
 RAILS_PRODUCT_LAUNCHDAEMONS_DIR='/Library/LaunchDaemons'
+
+# `SYSTEM_PYTHON3_CANDIDATES`, server/src/castle-wall/provision/harness-argv.ts,
+# shared by the product's Hermes parse-parity resolver
+# (`hermesParityPythonCandidates`, server/src/wrap/hermes-yaml-parse-parity.ts).
+#
+# THE ORDER IS PART OF THE VALUE, AND IT IS HOMEBREW-FIRST. The harness carried
+# the REVERSE order and, worse, selected on EXISTENCE: `for cand in
+# /usr/bin/python3 ...; do if [ -x "$cand" ]; then py="$cand"; break; fi; done`
+# picks the system python because it is always there, and then tests only that
+# one. On the actual drill host `/opt/homebrew/bin/python3` has PyYAML and
+# `/usr/bin/python3` does not, so the 2026-07-25 live run reported
+# `PREFLIGHT=FAIL check=pyyaml-importable reason=/usr/bin/python3 cannot import
+# yaml` about a host where PyYAML was installed and importable. First-existing
+# is not first-capable; see the walk in preflight.sh.
+#
+# ABSOLUTE-ONLY AND CODE-CONTROLLED, for the product's reason: a bare `python3`
+# would be PATH-resolved, and PATH is an environment input. No caller argument
+# and no environment variable may add, reorder or substitute an interpreter.
+RAILS_PRODUCT_PYTHON3_CANDIDATES='/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3'
 
 # ###########################################################################
 # HOST IDENTITY IS A HARDWARE FINGERPRINT, NOT A NAME.
@@ -815,6 +849,49 @@ rails_product_host_daemon_labels() {
   printf '%s %s\n' "$RAILS_PRODUCT_CASTLE_WALL_LABEL" "$RAILS_PRODUCT_SIGNER_HELPER_LABEL"
 }
 
+# The host daemons whose job description the product WRITES to
+# `<LaunchDaemons dir>/<label>.plist`, and which therefore have a plist a
+# driver can stat and screen. Today: the Castle Wall boot daemon.
+#
+# `kickstart-daemons` does not need this split -- `wrapper_daemon_present` asks
+# launchd FIRST and only falls back to the plist -- but a driver that screens
+# plist CONTENT does, because for a bundle-registered daemon there is no
+# content and never will be. Splitting the classes here, once, is what stops a
+# plist screen from having to invent a meaning for a file that is correctly
+# absent. See the note on `RAILS_PRODUCT_SIGNER_HELPER_LABEL`.
+rails_product_plist_screenable_host_daemon_labels() {
+  if [ "$#" -ne 0 ]; then
+    rails__die "rails_product_plist_screenable_host_daemon_labels: expected 0 args, got $#"
+  fi
+  printf '%s\n' "$RAILS_PRODUCT_CASTLE_WALL_LABEL"
+}
+
+# The host daemons launchd knows about WITHOUT a plist at that path, because the
+# product registers them out of a signed app bundle (`SMAppService`). Their
+# existence is observable only through launchd's job table, and their absence is
+# never expected on an installed host.
+rails_product_bundle_registered_host_daemon_labels() {
+  if [ "$#" -ne 0 ]; then
+    rails__die "rails_product_bundle_registered_host_daemon_labels: expected 0 args, got $#"
+  fi
+  printf '%s\n' "$RAILS_PRODUCT_SIGNER_HELPER_LABEL"
+}
+
+# The python3 interpreters to PROBE, in the product's own order. Every entry is
+# absolute; the list comes from a constant and never from PATH or the
+# environment. A driver walks them for CAPABILITY, never for existence.
+rails_product_python3_candidates() {
+  if [ "$#" -ne 0 ]; then rails__die "rails_product_python3_candidates: expected 0 args, got $#"; fi
+  local c
+  for c in $RAILS_PRODUCT_PYTHON3_CANDIDATES; do
+    case "$c" in
+      /*) ;;
+      *) rails__die "python3 candidate is not absolute: $c" ;;
+    esac
+  done
+  printf '%s\n' "$RAILS_PRODUCT_PYTHON3_CANDIDATES"
+}
+
 # `<LaunchDaemons dir>/<label>.plist`, the path the product installs a system
 # daemon's job description at. Used as ONE of the two existence signals: a job
 # launchd has loaded answers `launchctl print`, and a job whose plist is on disk
@@ -828,6 +905,152 @@ rails_product_daemon_plist_path() {
     *[!a-zA-Z0-9._-]*) rails__die "daemon label contains characters that cannot compose a safe plist path: $label" ;;
   esac
   printf '%s/%s.plist\n' "$(rails__squeeze_slashes "$RAILS_PRODUCT_LAUNCHDAEMONS_DIR")" "$label"
+}
+
+# ---------------------------------------------------------------------------
+# WHAT A LAUNCHD PLIST SAYS IT RUNS
+# ---------------------------------------------------------------------------
+#
+# PURE. Plist bytes in, one path out, so the D7 staleness screen and the D9
+# absolute-program screen can be driven over every shape the product actually
+# renders, on any platform, with no host and no launchd.
+#
+# THE READER THIS REPLACES, and why the extension was the smaller half of its
+# problem:
+#
+#   sed -n 's|.*<string>\(/[^<]*\.[cm]\{0,1\}js\)</string>.*|\1|p' | head -1
+#
+# i.e. the first absolute `.js` ANYWHERE IN THE FILE.
+#
+#   1. It is not scoped to ProgramArguments. A `StandardOutPath`, an
+#      `EnvironmentVariables` value or a comment that happened to end in `.js`
+#      would have been read as the program.
+#   2. Half the product's own daemons name no `.js` file at all. The Castle Wall
+#      boot plist's 5-element shape is
+#      `[<abs sanctuary CLI shim>, castle-wall, daemon, --safe-mode, --launchd]`
+#      (`programArgumentsRunCastleWallDaemon`, server/src/cli/castle-wall-boot.ts):
+#      the program is a shim with NO extension. Adding that daemon to the D7/D9
+#      screen without widening this would have swapped one false FAIL ("no plist
+#      at ...") for another ("could not read a JavaScript program path out of
+#      ..."), which is the same defect wearing a different string.
+#
+# HONEST BOUND. This is a SCANNER for two named keys, not an XML parser. It
+# reads a plist the product itself rendered, whose values already passed
+# `assertNoControlChars`, so no value carries a newline and no `<string>` is
+# CDATA-wrapped. It is used to decide whether an iteration is measuring the
+# dist it says it is; it is not a security boundary and nothing is executed
+# from its output.
+
+# The `<string>` values of the `<array>` that is the value of `<key>KEY</key>`,
+# one per line, in order. Prints nothing if the key is absent or its value is
+# not an array -- a key whose value is a `<dict>` must not silently donate the
+# dict's first string.
+rails__plist_array_strings() {
+  local content="$1" key="$2" rest seg c v
+  case "$content" in
+    *"<key>$key</key>"*) ;;
+    *) return 0 ;;
+  esac
+  rest="${content#*"<key>$key</key>"}"
+  while :; do
+    c="${rest%"${rest#?}"}"
+    case "$c" in ' '|$'\t'|$'\n'|$'\r') rest="${rest#?}" ;; *) break ;; esac
+  done
+  case "$rest" in
+    '<array>'*) rest="${rest#<array>}" ;;
+    *) return 0 ;;
+  esac
+  case "$rest" in
+    *'</array>'*) seg="${rest%%</array>*}" ;;
+    *) return 0 ;;
+  esac
+  while :; do
+    case "$seg" in
+      *'<string>'*) ;;
+      *) return 0 ;;
+    esac
+    seg="${seg#*<string>}"
+    case "$seg" in
+      *'</string>'*) v="${seg%%</string>*}"; seg="${seg#*</string>}" ;;
+      *) return 0 ;;
+    esac
+    printf '%s\n' "$v"
+  done
+}
+
+# The single `<string>` value of `<key>KEY</key>`. Prints nothing if the key is
+# absent or its value is not a string.
+rails__plist_string_value() {
+  local content="$1" key="$2" rest c
+  case "$content" in
+    *"<key>$key</key>"*) ;;
+    *) return 0 ;;
+  esac
+  rest="${content#*"<key>$key</key>"}"
+  while :; do
+    c="${rest%"${rest#?}"}"
+    case "$c" in ' '|$'\t'|$'\n'|$'\r') rest="${rest#?}" ;; *) break ;; esac
+  done
+  case "$rest" in
+    '<string>'*) rest="${rest#<string>}" ;;
+    *) return 0 ;;
+  esac
+  case "$rest" in
+    *'</string>'*) printf '%s\n' "${rest%%</string>*}" ;;
+    *) return 0 ;;
+  esac
+}
+
+# The Nth (0-based) ProgramArguments entry.
+rails__plist_program_argument() {
+  local content="$1" want="$2" i=0 v
+  while IFS= read -r v; do
+    if [ "$i" -eq "$want" ]; then printf '%s\n' "$v"; return 0; fi
+    i=$((i + 1))
+  done <<PLIST_ARGS_EOF
+$(rails__plist_array_strings "$content" 'ProgramArguments')
+PLIST_ARGS_EOF
+  return 0
+}
+
+# THE PROGRAM LAUNCHD EXECS, exactly as the plist names it -- `Program` when the
+# plist uses that key, otherwise ProgramArguments[0].
+#
+# Prints NOTHING when the plist names neither. That is a third answer, not an
+# error and not a relative path: `BundleProgram` plists (the signer helper) name
+# a program launchd resolves against a registered app bundle, and a caller has
+# to be able to tell "this plist names no PATH-resolvable program" from "this
+# plist names `node`". Collapsing them is how D9 would start failing a correct
+# host.
+rails_plist_program() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_plist_program: expected 1 arg (plist content), got $#"; fi
+  local content="$1" v
+  v="$(rails__plist_string_value "$content" 'Program')"
+  if [ -n "$v" ]; then printf '%s\n' "$v"; return 0; fi
+  rails__plist_program_argument "$content" 0
+}
+
+# THE FILE WHOSE MTIME MOVES WHEN THE DIST IS REBUILT -- the D7 subject.
+#
+# For an interpreter+script plist (`[<abs node>, <abs script>, ...]`, the Castle
+# Wall boot plist's 6-element shape) the subject is the SCRIPT: the interpreter
+# is a system binary that a `npm run build` never touches, so statting it would
+# make every stale-dist daemon look current. For a single-program plist (the
+# 5-element CLI-shim shape, or a compiled binary) the subject is the program.
+rails_plist_dist_file() {
+  if [ "$#" -ne 1 ]; then rails__die "rails_plist_dist_file: expected 1 arg (plist content), got $#"; fi
+  local content="$1" via prog second
+  via="$(rails__plist_string_value "$content" 'Program')"
+  # With `Program` set, ProgramArguments[0] is argv[0] and the rest are argv --
+  # none of them is a script the program is asked to run.
+  if [ -n "$via" ]; then printf '%s\n' "$via"; return 0; fi
+  prog="$(rails__plist_program_argument "$content" 0)"
+  if [ -z "$prog" ]; then return 0; fi
+  second="$(rails__plist_program_argument "$content" 1)"
+  case "$second" in
+    /*) printf '%s\n' "$second"; return 0 ;;
+  esac
+  printf '%s\n' "$prog"
 }
 
 # ---------------------------------------------------------------------------

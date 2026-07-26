@@ -318,6 +318,71 @@ blindness. A registry that exists and cannot be read is neither answer and gets
 neither: the verb refuses, because an unobserved arm state cannot decide whether
 an absence is expected.
 
+### Step 1: the same distinction, and a third preflight verdict
+
+Fixing step 0 moved the same conflation one rung up. `preflight.sh` screens the
+**same** per-uid daemon labels for the D7 stale-dist layer and the D9
+absolute-program layer, so on the same clean pre-arm host it failed with `no
+plist at .../ai.sanctuaryprotocol.egress-gate.<uid>.plist; the daemon is not
+installed`, and the live run would have stopped there instead.
+
+The answer is *not* that an absent plist passes. The rule that a check whose
+whole input set is missing has **not** passed -- it has not run -- is the reason
+this file has a D9 check worth having, and it is unchanged. Preflight reports
+three verdicts:
+
+```
+PREFLIGHT=PASS      check=<name> <detail>
+PREFLIGHT=EXPECTED  check=<name> reason=absent-before-arm arm_state=<s> arm_basis=<b> <detail>
+PREFLIGHT=FAIL      check=<name> reason=<why>
+PREFLIGHT=SUMMARY   failures=<n> expected=<n> storage=<path>
+```
+
+`EXPECTED` is never a pass and never clears a check: if the same check also has
+an *unexpected* absence, the check FAILS and says so. It is gated on the arm
+state the **wrapper** observed, not on a second copy of that decision -- the
+`registry-state` verb now publishes `arm_state` / `arm_basis` on its verdict
+line from `wrapper_observe_arm_state`, the same single source `kickstart-daemons`
+uses, and preflight consumes it. An arm state that could not be observed (an
+unreadable registry, or a verdict line with no arm field) is a refusal: it
+excuses nothing.
+
+Two supporting changes came with it, because a screen with a real input set
+reaches code an empty one never did:
+
+* **The pre-arm screen now has something to screen.** The always-installed
+  Castle Wall boot daemon joins the D7/D9 plist screen, and its absence is never
+  expected. The signer helper does *not*: the product ships its plist inside the
+  signed app bundle and registers it with `SMAppService`, so there is no file at
+  `/Library/LaunchDaemons/<label>.plist` on a correct host and its plist names a
+  bundle-relative `BundleProgram`. It is screened by the one signal it has --
+  launchd's job table -- and its absence is never expected either.
+* **The program reader understands every shape the product renders.** It was
+  "the first absolute `.js` anywhere in the file"; the boot plist's five-element
+  form names an absolute CLI **shim** with no extension, and the signer helper is
+  a compiled binary. D7 now stats the file a rebuild actually rewrites (the
+  script for an interpreter+script plist, the program otherwise), and D9 asserts
+  the program launchd execs is absolute *and* that no bare `node` hides behind an
+  absolute `/usr/bin/env`.
+
+The same live run also produced `PREFLIGHT=FAIL check=pyyaml-importable
+reason=/usr/bin/python3 cannot import yaml` on a host where PyYAML *was*
+importable. Same class again: that check took the first **existing** interpreter
+and then tested only that one, and `/usr/bin/python3` exists on every macOS box
+while on the drill host it is the one without PyYAML. It now walks the product's
+own ordered candidate list and selects the first that actually imports `yaml`,
+reporting what each candidate did (`usable` / `no-pyyaml` / `absent` /
+`unrunnable(rc=N)`) so "PyYAML is installed nowhere" reads differently from "we
+looked in the wrong place". No capable candidate is still a preflight FAILURE:
+the drill genuinely needs one.
+
+The walk mirrors the product's `probePyYamlCandidates()` /
+`hermesParityPythonCandidates()` rather than calling it, because preflight
+*screens* the dist and must not answer a preflight question by running the build
+it is screening. The list itself is **not** mirrored: it comes from
+`RAILS_PRODUCT_PYTHON3_CANDIDATES`, pinned in order to the product's
+`SYSTEM_PYTHON3_CANDIDATES` by `product-identifiers.test.ts`.
+
 ### Output
 
 Per iteration: an evidence bundle (console, gate state, audit excerpts, timings)
