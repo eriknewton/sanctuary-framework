@@ -127,7 +127,13 @@ describe("promoteCandidates: approval channel UP (approved)", () => {
     for (const rule of outcome.addedRules) {
       expect(validateRule(rule)).toEqual([]);
     }
-    expect(publishedRules).toEqual(outcome.addedRules);
+    // Round-4 C2: the published set is the added rules PLUS exactly one
+    // genuine derived habeas local lane (every promote-signed manifest must
+    // satisfy the Rust daemon's composed-manifest gate).
+    expect(publishedRules!.slice(0, 2)).toEqual(outcome.addedRules);
+    const lanes = publishedRules!.filter((r) => r.id === "reserved_habeas_distress_local");
+    expect(lanes).toHaveLength(1);
+    expect(publishedRules!).toHaveLength(3);
     // Exactly one audit call per promoted candidate.
     expect(auditedKeys.sort()).toEqual([candidateKey(a), candidateKey(b)].sort());
     expect(outcome.promotedKeys.sort()).toEqual([candidateKey(a), candidateKey(b)].sort());
@@ -156,8 +162,10 @@ describe("promoteCandidates: approval channel UP (approved)", () => {
       now: NOW,
     });
 
-    expect(publishedRules).toHaveLength(2);
+    // Round-4 C2: carried rule + added rule + the mandatory habeas lane.
+    expect(publishedRules).toHaveLength(3);
     expect(publishedRules!.map((r) => r.id)).toContain("curated-anthropic-api");
+    expect(publishedRules!.map((r) => r.id)).toContain("reserved_habeas_distress_local");
   });
 
   it("drops a not-found key without calling approve or publish for it, and reports it in `dropped`", async () => {

@@ -395,10 +395,12 @@ export function assertExclusiveRoutingComposition(
       // the generic residue advice ("republish the provisioned rules")
       // does not apply to it.
       const observeRemedy = rule.id.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX)
-        ? " Remedy: this is an observe-promoted rule from before exclusive routing was armed; run" +
-          " 'sanctuary castle-wall observe promote --all' on this fortress (it re-scopes stale promoted" +
-          " rules to the gate principal under the same Tier-1 approval, even with no pending candidates)," +
-          " or discard it by deleting its file from policy/egress/rules/."
+        ? " Remedy: if this rule was promoted by 'observe promote' before exclusive routing was armed," +
+          " run 'sanctuary castle-wall observe promote --all' on this fortress (it re-scopes promoted" +
+          " rules ITS OWN signed manifest owns to the gate principal, under the same Tier-1 approval," +
+          " even with no pending candidates). An OPERATOR-AUTHORED rule file that merely carries this" +
+          " id prefix is not promote-owned and must be re-scoped or removed manually" +
+          " (delete its file from policy/egress/rules/)."
         : "";
       violations.push({
         rule_id: rule.id,

@@ -82,6 +82,16 @@ import type { CandidateObservation } from "../../../src/castle-wall/observe/type
 import { EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND } from "../../../src/egress-gate/operator-advice.js";
 import { AutoApproveChannel } from "../../../src/principal-policy/approval-channel.js";
 import { StateStore } from "../../../src/cognitive/state-store.js";
+import {
+  HABEAS_LOCAL_RULE_ID,
+  isGenuineDerivedHabeasRule,
+} from "../../../src/castle-wall/allowlist/habeas-port.js";
+import {
+  publishProvisionedEgressRules,
+  readEgressRulesFromDisk,
+  type HarnessEndpointSet,
+} from "../../../src/castle-wall/provision/egress.js";
+import { egressPolicyWriterLock } from "../../../src/castle-wall/provision/lockfile.js";
 import type { SignedManifest } from "../../../src/castle-wall/allowlist/manifest.js";
 import type { AllowlistRule } from "../../../src/castle-wall/allowlist/schema.js";
 import { IdentityManager } from "../../../src/cognitive/tools.js";
@@ -238,6 +248,18 @@ describe("observe promote reaches live enforcement (the real composer, not promo
     expect(composed!.disposition).toBe("allow");
     // The SIGNED manifest the daemon broadcasts carries it too.
     expect(state.signed.manifest.rules.some((entry) => entry.rule_id === ruleId)).toBe(true);
+
+    // Round-4 C2: the promote also placed the genuine habeas lane FILE in
+    // rules/ (for the Linux manifest contract). The composer must still
+    // produce EXACTLY ONE local lane -- the byte-genuine file is skipped and
+    // the composer's own derivation injected -- never a duplicate-id throw
+    // and never a reserved-namespace conflict brick.
+    const composedLanes = state.rules.filter((rule) => rule.id === HABEAS_LOCAL_RULE_ID);
+    expect(composedLanes).toHaveLength(1);
+    // And the provisioning read-half (which feeds the gate's scope-blind
+    // destination snapshot) excludes the lane file the same way.
+    const provisionRead = await readEgressRulesFromDisk(fortressPath);
+    expect(provisionRead.some((rule) => rule.id === HABEAS_LOCAL_RULE_ID)).toBe(false);
   });
 
   it("FAIL-WITHOUT-FIX: the published tree matches the Linux enforcer's resolution contract (manifest beside, rules under rules/, digests intact)", async () => {
@@ -265,6 +287,21 @@ describe("observe promote reaches live enforcement (the real composer, not promo
       (name) => name.endsWith(".json") && name !== "manifest.json",
     );
     expect(besideManifest).toEqual([]);
+
+    // FAIL-WITHOUT-FIX (round-4 C2): the Rust daemon's composed-manifest
+    // gate (habeas.rs find_habeas_conflicts_in_composed) refuses any loaded
+    // manifest without EXACTLY ONE genuine local distress lane. Pin the
+    // content contract with the shipped TS parity mirror of that gate's
+    // genuineness recognizer -- a fresh promote used to publish a lane-less
+    // manifest that Linux enforcement rejects while the CLI reported success.
+    const parsedRules = await Promise.all(
+      signed.manifest.rules.map(async (entry) =>
+        JSON.parse(await readFile(join(egressDir, "rules", entry.file), "utf8")) as AllowlistRule,
+      ),
+    );
+    const lanes = parsedRules.filter((rule) => rule.id === HABEAS_LOCAL_RULE_ID);
+    expect(lanes).toHaveLength(1);
+    expect(isGenuineDerivedHabeasRule(lanes[0]!)).toBe(true);
   });
 
   it("FAIL-WITHOUT-FIX (F4): promote NEVER deletes rule files it did not publish, even ones named derived-observe-*", async () => {
@@ -528,6 +565,125 @@ describe("observe promote reaches live enforcement (the real composer, not promo
     const composed = state.rules.find((rule) => rule.id === first.ruleId);
     expect(composed).toBeDefined();
     expect(composed!.scope).toEqual({ uids: [GATE_UID] });
+  });
+
+  it("FAIL-WITHOUT-FIX (C1): provisioning refuses to write/revoke while a promote holds the shared egress-policy writer lock (and vice versa)", async () => {
+    const endpointSet: HarnessEndpointSet = {
+      harnessId: "testharness",
+      endpoints: [
+        {
+          name: "API",
+          host: "api.harness.example",
+          port: 443,
+          protocol: "tcp",
+          riskClass: "standard",
+        },
+      ],
+    };
+
+    // Direction 1: promote paused INSIDE its locked publish window (holding
+    // the shared writer lock); a provisioning publish (which writes AND
+    // revokes in the same shared rules/ directory) must refuse with nothing
+    // written, instead of interleaving with the promote's CAS-and-publish.
+    let reachedRename!: () => void;
+    const renameReached = new Promise<void>((resolve) => (reachedRename = resolve));
+    let releaseRename!: () => void;
+    const renameGate = new Promise<void>((resolve) => (releaseRename = resolve));
+    const inner = new FilesystemManifestStorage(egressDir);
+    const gatedStorage: ManifestStorage = {
+      writeRule: (filename, bytes) => inner.writeRule(filename, bytes),
+      listRules: () => inner.listRules(),
+      removeRule: (filename) => inner.removeRule(filename),
+      atomicRenameManifest: async (bytes) => {
+        reachedRename();
+        await renameGate;
+        return inner.atomicRenameManifest(bytes);
+      },
+    };
+    const promotePromise = promoteSelectionViaProductionWiring(
+      [{ key: "k1" }],
+      new Map([["k1", candidate("api.newlyapproved.example")]]),
+      { storage: gatedStorage },
+    );
+    await renameReached;
+
+    const provisionDuringPromote = await publishProvisionedEgressRules({
+      fortressPath,
+      endpointSet,
+      reloadPolicy: async () => ({ ok: true }),
+    });
+    expect(provisionDuringPromote.ok).toBe(false);
+    if (provisionDuringPromote.ok) throw new Error("unreachable");
+    expect(provisionDuringPromote.error).toContain("writer lock");
+    // Nothing was written by the refused provision.
+    const midFiles = await readdir(join(egressDir, "rules"));
+    expect(midFiles.some((name) => name.startsWith("provisioned-testharness-"))).toBe(false);
+
+    releaseRename();
+    const promoteOutcome = await promotePromise;
+    expect(promoteOutcome.status).toBe("promoted");
+
+    // After the promote releases the lock, the same provision succeeds.
+    const provisionAfter = await publishProvisionedEgressRules({
+      fortressPath,
+      endpointSet,
+      reloadPolicy: async () => ({ ok: true }),
+    });
+    expect(provisionAfter.ok).toBe(true);
+
+    // Direction 2: provisioning (any writer) holds the lock; a promote
+    // refuses loud with nothing published.
+    const heldRelease = await egressPolicyWriterLock(fortressPath).acquire();
+    expect(heldRelease).not.toBeNull();
+    try {
+      const outcome = await promoteSelectionViaProductionWiring(
+        [{ key: "k1" }],
+        new Map([["k1", candidate("other.example.com")]]),
+      );
+      expect(outcome.status).toBe("publish_in_progress");
+    } finally {
+      await heldRelease!();
+    }
+  });
+
+  it("pins (C3): an operator-authored rules/derived-observe-*.json is NEVER rescoped by an empty-selection promote (membership, not name, is ownership)", async () => {
+    // A legitimate coarse-era promoted rule (in promote's signed manifest)...
+    const row = candidate("api.newlyapproved.example");
+    const first = await promoteExpectPromoted(row);
+    // ...and an OPERATOR-AUTHORED template-scoped file that merely carries
+    // the observe id prefix, NOT referenced by promote's manifest.
+    const operatorFile = join(egressDir, "rules", "derived-observe-operatorhand.json");
+    const operatorBytes = JSON.stringify({
+      id: "derived-observe-operatorhand",
+      schema_version: 1,
+      created_at: "2026-07-27T00:00:00Z",
+      match: { host: ["operator.example.com"], port: [443], protocol: "tcp" },
+      scope: { template_ids: ["claude-code"] },
+      disposition: "allow",
+    });
+    await writeFile(operatorFile, operatorBytes);
+
+    await writeFile(exclusiveRoutingMarkerPath(fortressPath), exclusiveMarkerDoc());
+
+    // The empty-selection rescope path re-scopes EXACTLY the manifest-owned
+    // stale rule; the operator's prefix-colliding file is untouchable.
+    const outcome = await promoteSelectionViaProductionWiring([], new Map());
+    expect(outcome.status).toBe("promoted");
+    if (outcome.status !== "promoted") throw new Error("unreachable");
+    expect(outcome.rewrittenRules.map((rule) => rule.id)).toEqual([first.ruleId]);
+    expect(await readFile(operatorFile, "utf8")).toBe(operatorBytes);
+
+    // The exclusive compose still (correctly) refuses on the operator's
+    // agent-reachable rule -- and the violation's remedy now distinguishes
+    // promote-owned from operator-authored rather than over-promising.
+    await expect(
+      loadManifestState({
+        fortressPath,
+        fortressId: "fortress-test",
+        signer: daemonSigner,
+        exclusiveEgressGate: gatePolicy,
+      }),
+    ).rejects.toThrow(/OPERATOR-AUTHORED/);
   });
 });
 

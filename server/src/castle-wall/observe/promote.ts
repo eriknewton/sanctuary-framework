@@ -41,6 +41,10 @@
 
 import { validateRule, type AllowlistRule, type RuleMatch, type RuleScope } from "../allowlist/schema.js";
 import type { AgentOrigin, OperatorBaseline } from "../allowlist/manifest.js";
+import {
+  deriveHabeasDistressRules,
+  HABEAS_LOCAL_RULE_ID,
+} from "../allowlist/habeas-port.js";
 import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 import { synthesizeCandidateRule, type PromoteRouting } from "./synthesize.js";
 import type { RefreshLock } from "./refresh.js";
@@ -326,6 +330,59 @@ export function describeEffectiveRule(match: RuleMatch, scope: RuleScope): strin
 /** Max synthesized-match lines put into the approval context before summarizing the tail. */
 const MAX_APPROVAL_RULE_LINES = 25;
 
+/**
+ * The R3 rescope-eligibility computation (round-4 C3: eligibility is
+ * MEMBERSHIP-bounded, the same ownership source deletion uses).
+ *
+ * `rules` is ONLY ever the verified promote-signed manifest's own rule set
+ * (`readVerifiedManifest` output) -- promote's membership ledger -- NEVER a
+ * scan of the shared rules/ directory. An operator-authored file named
+ * `derived-observe-*.json` sitting in rules/ is not referenced by promote's
+ * manifest, so it can never appear here and is never rescoped (the
+ * `derived-observe-` prefix below is a NARROWING filter WITHIN membership --
+ * it keeps carried non-observe manifest rules, e.g. the habeas distress
+ * lane, out of the rescope set -- not an ownership claim; constants.ts
+ * documents the prefix as non-ownership). Only the scope (and the
+ * gate-binding description note) changes; same id => same signed match.
+ *
+ * The coarse direction has no orphan rescue: a gate-scoped orphan under
+ * coarse composes fine (dead but inert), and its original template cannot be
+ * reconstructed from the rule.
+ */
+function computeRescopeRules(
+  rules: readonly AllowlistRule[],
+  routing: PromoteRouting,
+  excludeIds: ReadonlySet<string>,
+): AllowlistRule[] {
+  if (routing.mode !== "exclusive") return [];
+  const wantScope: RuleScope = { uids: [routing.gate_uid] };
+  const rescoped: AllowlistRule[] = [];
+  for (const existing of rules) {
+    if (!existing.id.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX)) continue;
+    if (existing.disposition !== "allow") continue;
+    if (excludeIds.has(existing.id)) continue; // the candidate-driven rewrite covers it
+    if (ruleScopesEqual(existing.scope, wantScope)) continue;
+    // The coarse-era description should not survive a gate re-scope
+    // unannotated; append the same gate-binding note the fresh exclusive
+    // synthesis carries (guarded against double-append).
+    const gateNote =
+      " Exclusive routing: bound to the sanctuary-gate principal (S5-0 uids scope); the agent transits the gate.";
+    const description =
+      existing.description !== undefined && !existing.description.includes(gateNote.trim())
+        ? existing.description + gateNote
+        : existing.description;
+    const candidate: AllowlistRule = {
+      ...existing,
+      ...(description !== undefined ? { description } : {}),
+      scope: { uids: [routing.gate_uid] },
+    };
+    // A rescope that fails validation is dropped, never signed; with a
+    // marker-validated positive gate uid this cannot happen in practice.
+    if (validateRule(candidate).length === 0) rescoped.push(candidate);
+  }
+  return rescoped;
+}
+
 /** Deep equality over the two routing shapes (mode + gate uid). */
 function routingEquals(a: PromoteRouting, b: PromoteRouting): boolean {
   if (a.mode !== b.mode) return false;
@@ -393,41 +450,15 @@ export async function promoteCandidates(
   // promoted rule bricks every compose (fail-closed) with NO pending
   // candidate left to drive the F3 rewrite -- no product path out. On an
   // exclusive fortress, promote therefore also offers to re-scope EVERY
-  // verified observe-promoted allow whose scope disagrees with the gate
-  // principal, candidate or not, under the same Tier-1 gate. Exact-prefix
-  // observe rules only (never another producer's rules), and only the scope
-  // changes (same id => same signed match). The coarse direction has no
-  // orphan rescue: a gate-scoped orphan under coarse composes fine (dead but
-  // inert), and its original template cannot be reconstructed from the rule.
+  // eligible observe-promoted allow whose scope disagrees with the gate
+  // principal, candidate or not, under the same Tier-1 gate. This BASIS-side
+  // computation gates the flow and feeds the approval context; the set
+  // actually PUBLISHED is re-derived from the CURRENT verified rules inside
+  // the locked section below (round-4 C1: never publish from a pre-lock
+  // read; the digest CAS makes the two identical whenever publish proceeds).
   const routing = deps.routing ?? { mode: "coarse" };
-  const rescopeRules: AllowlistRule[] = [];
-  if (routing.mode === "exclusive") {
-    const promotableIds = new Set(promotable.map((row) => row.rule.id));
-    const wantScope: RuleScope = { uids: [routing.gate_uid] };
-    for (const existing of basisRules) {
-      if (!existing.id.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX)) continue;
-      if (existing.disposition !== "allow") continue;
-      if (promotableIds.has(existing.id)) continue; // the candidate-driven rewrite covers it
-      if (ruleScopesEqual(existing.scope, wantScope)) continue;
-      // Round-3 cosmetic: the coarse-era description should not survive a
-      // gate re-scope unannotated; append the same gate-binding note the
-      // fresh exclusive synthesis carries (guarded against double-append).
-      const gateNote =
-        " Exclusive routing: bound to the sanctuary-gate principal (S5-0 uids scope); the agent transits the gate.";
-      const description =
-        existing.description !== undefined && !existing.description.includes(gateNote.trim())
-          ? existing.description + gateNote
-          : existing.description;
-      const rescoped: AllowlistRule = {
-        ...existing,
-        ...(description !== undefined ? { description } : {}),
-        scope: { uids: [routing.gate_uid] },
-      };
-      // A rescope that fails validation is dropped, never signed; with a
-      // marker-validated positive gate uid this cannot happen in practice.
-      if (validateRule(rescoped).length === 0) rescopeRules.push(rescoped);
-    }
-  }
+  const promotableIds = new Set(promotable.map((row) => row.rule.id));
+  const rescopeRules = computeRescopeRules(basisRules, routing, promotableIds);
 
   if (promotable.length === 0 && rescopeRules.length === 0) {
     // Nothing to approve, nothing to publish. Deliberately does NOT call
@@ -575,7 +606,13 @@ export async function promoteCandidates(
     // invariant explicit for a future reader.
     void basisIds;
     const promotableById = new Map(promotable.map((row) => [row.rule.id, row.rule]));
-    const rescopeById = new Map(rescopeRules.map((rule) => [rule.id, rule]));
+    // Round-4 C1: the PUBLISHED rescope set is re-derived from the CURRENT
+    // verified rules INSIDE the locked section -- never the pre-lock basis
+    // read (the digest CAS above makes the two identical whenever this line
+    // is reached; re-deriving makes that a structural property instead of an
+    // argument).
+    const lockedRescopes = computeRescopeRules(currentRules, routing, promotableIds);
+    const rescopeById = new Map(lockedRescopes.map((rule) => [rule.id, rule]));
     const rewrittenRules: AllowlistRule[] = [];
     const carriedRules = currentRules.map((existing) => {
       const fresh = promotableById.get(existing.id) ?? rescopeById.get(existing.id);
@@ -587,6 +624,24 @@ export async function promoteCandidates(
       .filter((row) => !existingIds.has(row.rule.id))
       .map((row) => row.rule);
     const mergedRules = [...carriedRules, ...addedRules];
+    // Round-4 C2: EVERY promote-signed manifest carries exactly one genuine
+    // local habeas distress lane. The Rust daemon's composed-manifest gate
+    // (castle-wall-daemon habeas.rs `find_habeas_conflicts_in_composed`,
+    // policy.rs) REFUSES a lane-less manifest outright, so a fresh-basis
+    // promote used to publish a manifest Linux enforcement rejects while the
+    // CLI reported success. The lane is derived by the SAME shared machinery
+    // the composition chokepoint uses (`deriveHabeasDistressRules`, local
+    // lane only -- the webhook lane is optional and config-owned); a
+    // carried-forward manifest keeps its existing lane byte-stable, and a
+    // legacy lane-less manifest is healed on this publish. The lane's rule
+    // FILE necessarily lands in rules/ (a manifest entry must resolve at
+    // rules/<file> for the Rust loader); the macOS composer and the
+    // provisioning read-half recognize the byte-genuine lane file and skip
+    // it (they derive their own lanes), so it never trips the
+    // reserved-namespace firewall.
+    if (!mergedRules.some((rule) => rule.id === HABEAS_LOCAL_RULE_ID)) {
+      mergedRules.push(...deriveHabeasDistressRules({ createdAt }));
+    }
     const publishResult = await deps.publish(mergedRules, descriptors);
 
     for (const row of promotable) {

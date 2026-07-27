@@ -14,7 +14,16 @@
  * exclusive to one in-flight provision at a time. Fail-loud on collision:
  * a second invocation refuses immediately rather than silently waiting or
  * silently proceeding.
+ *
+ * ALSO HOME (round-4 C1) to the fortress-scoped EGRESS-POLICY WRITER lock
+ * shared by every mutator of `policy/egress/rules/` + `manifest.json` (the
+ * provisioning publish/scrub/restore paths here AND the observe promote in
+ * `cli/castle-wall-observe.ts`). Placed in this module -- not the CLI --
+ * because provision code must never import the CLI layer.
  */
+
+import { open, readFile, rm } from "node:fs/promises";
+import { join } from "node:path";
 
 /**
  * The canonical exclusive provision-lock path. The auto-provision arm/repair
@@ -75,5 +84,116 @@ export async function withProvisionLock<T>(
     return await fn();
   } finally {
     await ops.release(lockPath);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The EGRESS-POLICY WRITER lock (2026-07-27 round-4 C1).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Lockfile basename for the fortress-scoped EGRESS-POLICY WRITER mutual
+ * exclusion. Lives directly under the fortress root, beside the observe
+ * refresh lock. Writer-neutral by design: EVERY mutator of the shared
+ * `policy/egress/rules/` directory + `policy/egress/manifest.json` pair
+ * serializes on it -- the observe promote publish (which holds it across its
+ * verified re-read, digest CAS, publish, and orphan-cleanup) AND the
+ * provisioning write/revoke/restore paths (`provision/egress.ts`). Without
+ * one shared lock, a provisioning revoke interleaved with a promote's
+ * publish window could produce torn multi-file views of the rule source (the
+ * promote's manifest-digest CAS sees only manifest.json, which provisioning
+ * never touches). New in this PR's fix stack; no compatibility concern.
+ */
+export const EGRESS_POLICY_WRITER_LOCK_FILE = ".egress-policy.lock";
+
+/** The `acquire()` contract shared with `observe/refresh.ts`'s RefreshLock (structural). */
+export interface EgressPolicyWriterLock {
+  acquire(): Promise<(() => Promise<void>) | null>;
+}
+
+/**
+ * Cross-process egress-policy writer lock: O_EXCL create with pid metadata,
+ * NEVER auto-broken (the same TOCTOU rationale as the observe refresh lock:
+ * any read-check-unlink-retry breaker can unlink a peer's freshly-created
+ * lock and let two writers run concurrently, which is exactly what this lock
+ * exists to prevent). Contended => `acquire()` returns null and the caller
+ * refuses loudly with nothing written.
+ *
+ * ROOT-VS-OPERATOR CONTEXT (stated, per the round-4 review): provisioning
+ * runs as root, promote as the operator. A shared O_EXCL file at the
+ * fortress root works for both: whoever acquires owns the file; the OTHER
+ * writer's O_EXCL create fails EEXIST regardless of the owner uid, and
+ * unlink permission is governed by the FORTRESS DIRECTORY (operator-owned;
+ * root writes anywhere), so a stale root-owned lock is still removable by
+ * the operator following the holder guidance.
+ *
+ * Release is BEST-EFFORT (round-3 L1 discipline): a failed unlink is noted
+ * on stderr with the lock path and never thrown over the caller's outcome.
+ */
+export function egressPolicyWriterLock(
+  fortressPath: string,
+  onContention?: (holderDescription: string) => void,
+): EgressPolicyWriterLock {
+  const lockPath = join(fortressPath, EGRESS_POLICY_WRITER_LOCK_FILE);
+  return {
+    async acquire() {
+      try {
+        const handle = await open(lockPath, "wx", 0o600);
+        try {
+          await handle.writeFile(
+            JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() }),
+          );
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+        return async () => {
+          try {
+            await rm(lockPath, { force: true });
+          } catch (releaseError) {
+            process.stderr.write(
+              `Warning: could not remove the lock file ${lockPath} (${(releaseError as Error).message}). ` +
+                "The operation itself completed; remove the file manually or the next run will report it as held.\n",
+            );
+          }
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        if (onContention) onContention(await describeEgressPolicyLockHolder(lockPath));
+        return null;
+      }
+    },
+  };
+}
+
+/** True iff `pid` names a live process this user could signal. */
+function isEgressLockHolderAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user -- still alive
+    // (the expected shape when root holds the lock and the operator probes).
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** Best-effort description of who holds the writer lock. Never throws. */
+async function describeEgressPolicyLockHolder(lockPath: string): Promise<string> {
+  try {
+    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as {
+      pid?: unknown;
+      acquired_at?: unknown;
+    };
+    const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+    const at = typeof parsed.acquired_at === "string" ? parsed.acquired_at : "an unknown time";
+    if (pid === null) return `held since ${at} by an unrecorded process`;
+    return isEgressLockHolderAlive(pid)
+      ? `held since ${at} by running process ${pid}`
+      : `held since ${at} by process ${pid}, which is NO LONGER RUNNING -- this lock is almost ` +
+          `certainly stale from a crashed run; verify with \`ps -p ${pid}\` and then remove ${lockPath}`;
+  } catch {
+    return `present but unreadable at ${lockPath}`;
   }
 }

@@ -41,6 +41,8 @@
 import { readdir, mkdir, writeFile, unlink, readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { egressPolicyWriterLock } from "./lockfile.js";
+
 import { sha256 } from "@noble/hashes/sha256";
 
 import { canonicalize } from "../../mesh/canonical-json.js";
@@ -57,6 +59,10 @@ import {
   canonicalizeConnectAuthority,
 } from "../egress-proxy.js";
 import { MESSAGING_HOST_DENYLIST } from "../runtime/curated-allowlist.js";
+import {
+  HABEAS_RULE_ID_PREFIX,
+  isGenuineDerivedHabeasRule,
+} from "../allowlist/habeas-port.js";
 
 /**
  * Risk class a harness adapter declares for one of its endpoints.
@@ -454,6 +460,18 @@ export async function readEgressRulesFromDisk(fortressPath: string): Promise<All
     if (issues.length > 0) {
       throw new Error(`rule ${filename} invalid: ${issues.join("; ")}`);
     }
+    // Round-4 C2: mirror of the daemon read-half's genuine-lane skip (see
+    // `runtime/macos-daemon.ts` loadManifestState). The observe promote
+    // places the byte-genuine derived habeas lane file here for the Linux
+    // manifest contract; this read-half feeds compositions that derive
+    // their own lanes AND the gate daemon's destination-rules snapshot
+    // (whose CONNECT evaluator is scope-blind, so including the
+    // emitter-scoped lane would newly allow the agent a loopback lane
+    // through the gate). Skip only the exact-genuine shape; a claimed-but-
+    // non-genuine habeas id still flows through to the fail-closed firewall.
+    if (parsed.id.startsWith(HABEAS_RULE_ID_PREFIX) && isGenuineDerivedHabeasRule(parsed)) {
+      continue;
+    }
     rules.push(parsed);
   }
   return rules;
@@ -503,6 +521,24 @@ export async function publishProvisionedEgressRules(
 ): Promise<PublishProvisionedEgressResult> {
   const now = input.now ?? (() => new Date());
   const dir = egressRulesDir(input.fortressPath);
+  // Round-4 C1: every writer of the shared rules/ + manifest.json pair
+  // serializes on the fortress egress-policy writer lock (the observe
+  // promote holds the same lock across its CAS + publish). Contended =>
+  // fail-closed refusal, nothing written; the caller aborts before arm.
+  let holderDescription = "";
+  const lock = egressPolicyWriterLock(input.fortressPath, (holder) => {
+    holderDescription = holder;
+  });
+  const release = await lock.acquire();
+  if (release === null) {
+    return {
+      ok: false,
+      error:
+        `another egress-policy writer holds this fortress's writer lock` +
+        (holderDescription ? ` (${holderDescription})` : "") +
+        `; refusing to publish concurrently. Wait for it to finish and re-run.`,
+    };
+  }
   try {
     const rules = buildProvisionedEgressRules(
       input.endpointSet,
@@ -536,6 +572,8 @@ export async function publishProvisionedEgressRules(
     return { ok: true, ruleIds: rules.map((rule) => rule.id), staleRuleIdsRemoved };
   } catch (err) {
     return { ok: false, error: (err as Error).message };
+  } finally {
+    await release();
   }
 }
 
@@ -573,40 +611,60 @@ export async function scrubProvisionedEgressRules(
 ): Promise<ScrubProvisionedEgressResult> {
   const dir = egressRulesDir(input.fortressPath);
   const prefix = provisionedRuleIdPrefix(input.harnessId);
-  const removedRuleIds: string[] = [];
-  let filenames: string[];
-  try {
-    filenames = await readdir(dir);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") {
-      return { removedRuleIds: [], reloadOk: true };
-    }
-    throw err;
-  }
-  for (const filename of filenames) {
-    if (!filename.startsWith(prefix) || !filename.endsWith(".json")) continue;
-    await unlink(join(dir, filename));
-    removedRuleIds.push(filename.slice(0, -".json".length));
-  }
-  // Verified read-back: the scrub is only a scrub if nothing survives.
-  const survivors = (await readdir(dir)).filter(
-    (name) => name.startsWith(prefix) && name.endsWith(".json"),
-  );
-  if (survivors.length > 0) {
+  // Round-4 C1: the scrub is a REVOCATION writer on the shared rule source;
+  // it serializes on the same egress-policy writer lock as every other
+  // mutator. Contended => throw (fail-loud, mirroring this function's
+  // existing survivor-check posture); nothing removed.
+  let holderDescription = "";
+  const lock = egressPolicyWriterLock(input.fortressPath, (holder) => {
+    holderDescription = holder;
+  });
+  const release = await lock.acquire();
+  if (release === null) {
     throw new Error(
-      `egress rule scrub left ${survivors.length} provisioned rule file(s) behind: ${survivors.join(", ")}`,
+      `egress rule scrub refused: another egress-policy writer holds this fortress's writer lock` +
+        (holderDescription ? ` (${holderDescription})` : "") +
+        `. Wait for it to finish and re-run.`,
     );
   }
-  let reloadOk = true;
-  if (input.reloadPolicy) {
+  try {
+    const removedRuleIds: string[] = [];
+    let filenames: string[];
     try {
-      reloadOk = (await input.reloadPolicy()).ok;
-    } catch {
-      reloadOk = false;
+      filenames = await readdir(dir);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") {
+        return { removedRuleIds: [], reloadOk: true };
+      }
+      throw err;
     }
+    for (const filename of filenames) {
+      if (!filename.startsWith(prefix) || !filename.endsWith(".json")) continue;
+      await unlink(join(dir, filename));
+      removedRuleIds.push(filename.slice(0, -".json".length));
+    }
+    // Verified read-back: the scrub is only a scrub if nothing survives.
+    const survivors = (await readdir(dir)).filter(
+      (name) => name.startsWith(prefix) && name.endsWith(".json"),
+    );
+    if (survivors.length > 0) {
+      throw new Error(
+        `egress rule scrub left ${survivors.length} provisioned rule file(s) behind: ${survivors.join(", ")}`,
+      );
+    }
+    let reloadOk = true;
+    if (input.reloadPolicy) {
+      try {
+        reloadOk = (await input.reloadPolicy()).ok;
+      } catch {
+        reloadOk = false;
+      }
+    }
+    return { removedRuleIds, reloadOk };
+  } finally {
+    await release();
   }
-  return { removedRuleIds, reloadOk };
 }
 
 /**
@@ -710,6 +768,35 @@ export async function restoreProvisionedEgressRules(
   const removedRuleIds: string[] = [];
   const ruleIdOf = (filename: string): string => filename.slice(0, -".json".length);
 
+  // Round-4 C1: the restore rewrites the shared rule source; same writer
+  // lock. This function's contract is NEVER-THROWS (it runs on abort paths),
+  // so contention is a recorded problem with `restored: false`, not a throw.
+  let holderDescription = "";
+  const lock = egressPolicyWriterLock(input.fortressPath, (holder) => {
+    holderDescription = holder;
+  });
+  let release: (() => Promise<void>) | null = null;
+  try {
+    release = await lock.acquire();
+  } catch (err) {
+    problems.push(`could not acquire the egress-policy writer lock: ${(err as Error).message}`);
+  }
+  if (release === null) {
+    return {
+      restored: false,
+      reloadOk: false,
+      restoredRuleIds: [],
+      removedRuleIds: [],
+      problems: [
+        ...problems,
+        `another egress-policy writer holds this fortress's writer lock` +
+          (holderDescription ? ` (${holderDescription})` : "") +
+          `; the restore was not attempted. Re-run it once the other writer finishes.`,
+      ],
+    };
+  }
+  try {
+
   // Defence in depth: production's only snapshot source is this module's own
   // `readdir`, so a filename can never carry a separator -- but this function
   // WRITES to a root-owned directory from data it was handed, so it re-derives
@@ -800,6 +887,9 @@ export async function restoreProvisionedEgressRules(
     removedRuleIds,
     problems,
   };
+  } finally {
+    await release();
+  }
 }
 
 /** One row of the post-arm as-uid probe report. */

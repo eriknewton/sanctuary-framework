@@ -89,6 +89,7 @@ import {
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
   EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
 } from "../egress-gate/operator-advice.js";
+import { egressPolicyWriterLock } from "../castle-wall/provision/lockfile.js";
 import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
@@ -516,8 +517,6 @@ export async function runObserveCandidates(
 /** Lockfile basename for the cross-process refresh mutual exclusion (Codex gate BLOCKER; see castle-wall/observe/refresh.ts guarantee 2). Lives directly under the fortress root (mode 0700). */
 const OBSERVE_REFRESH_LOCK_FILE = ".observe-refresh.lock";
 
-/** Lockfile basename for the cross-process PROMOTE publish mutual exclusion (round-3 R1; see castle-wall/observe/promote.ts `publishLock`). Lives directly under the fortress root, beside the refresh lock. */
-const OBSERVE_PROMOTE_LOCK_FILE = ".observe-promote.lock";
 
 /** True iff `pid` names a live process this user could signal (mirrors the audit write-lock's stale-holder detection in operational/audit-log.ts). */
 function isLockHolderAlive(pid: number): boolean {
@@ -574,20 +573,22 @@ export function observeRefreshFileLock(
 }
 
 /**
- * Cross-process PROMOTE publish lock (round-3 R1): the same O_EXCL,
- * never-auto-broken discipline as the refresh lock, on its own lockfile.
- * Held by `promoteCandidates` across the publish-time verified re-read, the
- * digest compare-and-set, and the publish + orphan-cleanup, so two approved
- * promotes can never both pass the CAS against the same digest and then
- * clobber each other's rename (the second silently dropping the first's rule
- * from the signed manifest). The loser aborts loud (`publish_in_progress`)
- * with nothing published.
+ * The promote publish lock (round-3 R1, WIDENED round-4 C1): now the shared
+ * fortress EGRESS-POLICY WRITER lock (`.egress-policy.lock`,
+ * `castle-wall/provision/lockfile.ts`) that EVERY mutator of the shared
+ * `policy/egress/rules/` + `manifest.json` pair serializes on -- the
+ * provisioning publish/scrub/restore paths acquire the same lock, so a
+ * provision revoke can never interleave with a promote's CAS-and-publish
+ * window (the CAS sees only manifest.json bytes, which provisioning never
+ * touches). Held by `promoteCandidates` across the publish-time verified
+ * re-read, the digest compare-and-set, and the publish + orphan-cleanup.
+ * The loser aborts loud (`publish_in_progress`) with nothing published.
  */
 export function observePromoteFileLock(
   fortressPath: string,
   onContention?: (holderDescription: string) => void,
 ): RefreshLock {
-  return fortressExclusiveFileLock(join(fortressPath, OBSERVE_PROMOTE_LOCK_FILE), onContention);
+  return egressPolicyWriterLock(fortressPath, onContention);
 }
 
 /** Shared O_EXCL fortress lockfile implementation behind both locks above. */
