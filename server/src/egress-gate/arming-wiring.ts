@@ -885,9 +885,14 @@ async function productionBringUp(
   // false). `reloadPeerResolverDaemonForBringUp` boots the old job OUT first,
   // THEN bootstraps the rewritten plist + kickstarts, guaranteeing the new
   // argv is loaded on every bring-up. The v2 matched-port-in-response client
-  // reject is the fail-closed backstop. A mere reboot reuses this on-disk
-  // plist unchanged via `bootstrapPeerResolverDaemonForBoot` (argv cannot
-  // drift on the boot path -- nothing rewrites the plist there).
+  // reject is the fail-closed backstop. FIX (hardware drill 2026-07-27,
+  // `drill-994-boot-selfheal`): a mere reboot does NOT get a free pass on
+  // this reasoning -- `bootstrapPeerResolverDaemonForBoot` used to assume the
+  // on-disk plist is unchanged and skip the bootout, but a boot-time plist
+  // self-heal can rewrite the file the SAME boot launchd already loaded the
+  // stale copy from (measured 0/5 on real hardware). The boot path now routes
+  // through this SAME bootout-first chokepoint, so whatever is on disk at
+  // call time is what launchd actually starts, in the SAME boot.
   const resolverPlistPath = peerResolverDaemonPlistPath(input.agentUid);
   await writeFile(
     resolverPlistPath,
@@ -943,10 +948,13 @@ async function productionBringUp(
   // bootout->settle->bootstrap->kickstart chokepoint the peer-resolver reload
   // uses, so the running gate is force-replaced and re-reads the new committed
   // generation. Fail CLOSED: if the old gate will not settle/reap, this THROWS
-  // rather than arm over an unproven-reaped gate. (The boot path's benign
-  // `Bootstrap failed: 5: Input/output error` tolerance is deliberately NOT
-  // carried here: post-settle, an IO error is a real failure, not the
-  // already-loaded race the boot path may legitimately hit.)
+  // rather than arm over an unproven-reaped gate. (Post-settle, an
+  // `already bootstrapped` / `Bootstrap failed: 5: Input/output error`
+  // bootstrap result is a real failure, not a benign no-op: the boot path
+  // used to tolerate that shape when it bootstrapped without a bootout
+  // first, but the boot path now routes through this SAME chokepoint --
+  // see {@link reloadLaunchdDaemonForBringUp}'s doc -- so there is no
+  // remaining caller of this function that still has that tolerance.)
   await reloadLaunchdDaemonForBringUp({ label, plistPath });
   // Change 2: hand waitForGateRuntime this gate daemon's own stderr log path so
   // a timeout surfaces the daemon's REAL exit reason (bind/spawn failure)
