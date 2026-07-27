@@ -28,7 +28,7 @@ Castle-walking principle: real enforcement AND delightful operator experience. H
 
 `sanctuary protect` wraps OpenClaw, Hermes, Claude Code, Cursor, and Cline today (others via the `--wrap` flag for any MCP-compatible harness). The operator's existing harness continues to work; Sanctuary adds the substrate underneath, invisibly. **Why it matters:** the install motion has to be one minute or operators bounce. Per-harness compatibility status lives in the [Assurance Matrix](ASSURANCE_MATRIX.md).
 
-*Status: shipped through v1.6.1 (latest release tag, 2026-07-01).*
+*Status: shipped through v1.7.0 (latest release tag, 2026-07-26).*
 
 ### Castle Wall on Linux: kernel-level enforcement
 

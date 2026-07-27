@@ -70,7 +70,7 @@ Example output:
   Overall Score: 23 / 100  [■■░░░░░░░░]  MINIMAL
 
   Environment:
-  • Sanctuary v1.6.1 .............. ✓ installed
+  • Sanctuary v1.7.0 .............. ✓ installed
   • OpenClaw ...................... ✓ detected
   • OpenClaw requireApproval ...... ✓ enabled
   • OpenClaw sandbox policy ....... ✓ active
@@ -207,4 +207,4 @@ Beneath the cooperative surface, the Castle Wall enforces egress policy at the o
 
 All state is encrypted with AES-256-GCM. Keys are derived via Argon2id. Integrity is verified via Merkle trees. Identity is Ed25519 with key rotation support. No plaintext ever touches persistent storage.
 
-90+ MCP tools. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. Published as `@sanctuary-framework/mcp-server` on npm (current stable v1.6.1).
+90+ MCP tools. Three approval channels (stderr, dashboard, webhook). Concordia bridge. Protection-posture audit. Context gating. Apache 2.0. Published as `@sanctuary-framework/mcp-server` on npm (current stable v1.7.0).
