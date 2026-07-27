@@ -44,10 +44,11 @@ export {
   naiveRegisteredDomain,
   widenableRegisteredDomain,
   REFUSED_MULTI_LABEL_PUBLIC_SUFFIXES,
+  OBSERVE_PROMOTED_RULE_ID_PREFIX,
   synthesizeCandidateRule,
   synthesizeCandidateRules,
 } from "./synthesize.js";
-export type { SynthesizeCandidateRulesResult } from "./synthesize.js";
+export type { SynthesizeCandidateRulesResult, PromoteRouting } from "./synthesize.js";
 
 export { ObserveStore } from "./store.js";
 export type { ObserveWriteIdentity } from "./store.js";

@@ -87,6 +87,16 @@ export function widenableRegisteredDomain(host: string): string | null {
   return domain;
 }
 
+/**
+ * The id prefix EVERY observe-promoted rule carries. Single source shared by
+ * `stableCandidateRuleId` below and the CLI's `FilesystemManifestStorage`
+ * orphan-cleanup scoping (cli/castle-wall-observe.ts), so the publisher's
+ * "which rule files does observe own" matcher can never drift from the ids
+ * this module actually mints (a guard must share its matcher with the code
+ * it guards).
+ */
+export const OBSERVE_PROMOTED_RULE_ID_PREFIX = "derived-observe-";
+
 function stableCandidateRuleId(
   observation: CandidateObservation,
   granularity: ObserveGranularity,
@@ -102,8 +112,32 @@ function stableCandidateRuleId(
     observation.protocol,
   ]);
   const digest = createHash("sha256").update(basis).digest("hex");
-  return `derived-observe-${digest.slice(0, 20)}`;
+  return `${OBSERVE_PROMOTED_RULE_ID_PREFIX}${digest.slice(0, 20)}`;
 }
+
+/**
+ * Routing mode for a promoted rule's SCOPE (2026-07-27 enforcement-reach fix,
+ * Option A). Mirrors `provision/egress.ts`'s `ProvisionedEgressRouting` shape
+ * (kept local to avoid an observe->provision import edge; the AXIS is reused,
+ * not reinvented -- `scope.uids`, the S5-0 per-principal axis):
+ *
+ *  - `coarse` (default; the shipped shape): template/agent-scoped per the
+ *    operator's granularity choice. The confined agent reaches the promoted
+ *    destination DIRECTLY.
+ *  - `exclusive`: the rule is SCOPED AWAY FROM THE AGENT to the gate
+ *    principal (`scope.uids = [gate_uid]`), exactly like the provisioned
+ *    endpoint rules under exclusive routing. REQUIRED whenever the fortress
+ *    carries the exclusive-routing marker: now that promoted rules reach the
+ *    composer (`policy/egress/rules/`), a template/agent-scoped promoted rule
+ *    would be an agent-reachable direct off-box allow, which the exclusive
+ *    compose-time assertion rejects by THROWING -- no manifest, no arm, a
+ *    bricked policy reload. Gate-uid scoping keeps the reload composable and
+ *    routes the promoted destination through the gate, the only sanctioned
+ *    off-box path in exclusive mode.
+ */
+export type PromoteRouting =
+  | { readonly mode: "coarse" }
+  | { readonly mode: "exclusive"; readonly gate_uid: number };
 
 function buildMatch(
   observation: CandidateObservation,
@@ -144,7 +178,14 @@ function buildMatch(
 function buildScope(
   observation: CandidateObservation,
   granularity: ObserveGranularity,
+  routing: PromoteRouting,
 ): RuleScope {
+  if (routing.mode === "exclusive") {
+    // Exclusive routing: bind to the gate principal ONLY. The scope axes
+    // compose as an OR at enforcement, so ALSO carrying the template/agent
+    // axis would keep the rule agent-reachable and defeat the whole point.
+    return { uids: [routing.gate_uid] };
+  }
   return granularity === "per_instance_domain"
     ? { agent_ids: [observation.agent_id] }
     : { template_ids: [observation.agent_template] };
@@ -153,16 +194,22 @@ function buildScope(
 function describeCandidateRule(
   observation: CandidateObservation,
   granularity: ObserveGranularity,
+  routing: PromoteRouting,
 ): string {
   const dest = observation.host ?? observation.ip;
   const widened =
     granularity === "per_template_etld1"
       ? " (widened to the registered domain; an explicit operator choice, never the default)"
       : "";
+  const routingNote =
+    routing.mode === "exclusive"
+      ? " Exclusive routing: bound to the sanctuary-gate principal (S5-0 uids scope); the agent transits the gate."
+      : "";
   return (
     `Observe/Learn candidate: ${observation.agent_template} reached ` +
     `${dest}:${observation.port}/${observation.protocol}${widened}, seen ` +
-    `${observation.times_seen}x between ${observation.first_seen} and ${observation.last_seen}.`
+    `${observation.times_seen}x between ${observation.first_seen} and ${observation.last_seen}.` +
+    routingNote
   );
 }
 
@@ -170,12 +217,16 @@ function describeCandidateRule(
  * Synthesize ONE candidate into an `AllowlistRule`, or `null` when the
  * candidate cannot yield a valid rule (no usable host/IP, or the resulting
  * rule fails `validateRule`). Never throws -- an unsynthesizable candidate is
- * dropped, not an error.
+ * dropped, not an error. `routing` decides the SCOPE axis (see
+ * {@link PromoteRouting}); an exclusive routing with an invalid gate uid
+ * fails `validateRule` (positive-integer uids) and drops the candidate,
+ * never signs a malformed scope.
  */
 export function synthesizeCandidateRule(
   observation: CandidateObservation,
   createdAt: string,
   granularity: ObserveGranularity = DEFAULT_OBSERVE_GRANULARITY,
+  routing: PromoteRouting = { mode: "coarse" },
 ): AllowlistRule | null {
   const match = buildMatch(observation, granularity);
   if (!match) return null;
@@ -184,9 +235,9 @@ export function synthesizeCandidateRule(
     id: stableCandidateRuleId(observation, granularity),
     schema_version: CASTLE_WALL_SCHEMA_VERSION_V1,
     created_at: createdAt,
-    description: describeCandidateRule(observation, granularity),
+    description: describeCandidateRule(observation, granularity, routing),
     match,
-    scope: buildScope(observation, granularity),
+    scope: buildScope(observation, granularity, routing),
     disposition: "allow",
     derived: true,
   };
@@ -209,12 +260,13 @@ export function synthesizeCandidateRules(
   observations: readonly CandidateObservation[],
   createdAt: string,
   granularityFor?: (observation: CandidateObservation) => ObserveGranularity,
+  routing: PromoteRouting = { mode: "coarse" },
 ): SynthesizeCandidateRulesResult {
   const rules: AllowlistRule[] = [];
   const dropped: CandidateObservation[] = [];
   for (const observation of observations) {
     const granularity = granularityFor ? granularityFor(observation) : DEFAULT_OBSERVE_GRANULARITY;
-    const rule = synthesizeCandidateRule(observation, createdAt, granularity);
+    const rule = synthesizeCandidateRule(observation, createdAt, granularity, routing);
     if (rule) {
       rules.push(rule);
     } else {

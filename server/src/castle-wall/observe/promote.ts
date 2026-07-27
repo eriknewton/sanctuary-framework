@@ -41,7 +41,7 @@
 
 import type { AllowlistRule, RuleMatch, RuleScope } from "../allowlist/schema.js";
 import type { AgentOrigin, OperatorBaseline } from "../allowlist/manifest.js";
-import { synthesizeCandidateRule } from "./synthesize.js";
+import { synthesizeCandidateRule, type PromoteRouting } from "./synthesize.js";
 import {
   DEFAULT_OBSERVE_GRANULARITY,
   type CandidateObservation,
@@ -148,6 +148,16 @@ export interface PromoteDeps {
     candidate: CandidateObservation;
   }) => Promise<void>;
   now: Date;
+  /**
+   * Scope routing for the synthesized rules (2026-07-27 enforcement-reach
+   * fix). The CLI resolves this from the fortress's exclusive-routing marker
+   * (`resolvePromoteRouting` in cli/castle-wall-observe.ts): marker present
+   * => `exclusive` with the marker's gate uid, so the promoted rule binds to
+   * the gate principal and the exclusive compose-time assertion accepts the
+   * reload; absent => `coarse` (the shipped template/agent scoping). Defaults
+   * to coarse.
+   */
+  routing?: PromoteRouting;
 }
 
 export type PromoteDroppedReason = "not_found" | "failed_validation";
@@ -273,7 +283,12 @@ export async function promoteCandidates(
       dropped.push({ key: row.key, reason: "not_found" });
       continue;
     }
-    const rule = synthesizeCandidateRule(observation, createdAt, row.granularity ?? DEFAULT_OBSERVE_GRANULARITY);
+    const rule = synthesizeCandidateRule(
+      observation,
+      createdAt,
+      row.granularity ?? DEFAULT_OBSERVE_GRANULARITY,
+      deps.routing ?? { mode: "coarse" },
+    );
     if (!rule) {
       dropped.push({ key: row.key, reason: "failed_validation" });
       continue;

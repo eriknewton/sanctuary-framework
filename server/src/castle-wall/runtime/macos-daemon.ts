@@ -389,7 +389,8 @@ export interface MacOSCastleWallDaemonHandle {
   stop(): Promise<void>;
 }
 
-interface ManifestState {
+/** The composed + signed manifest state `loadManifestState` produces. */
+export interface ManifestState {
   signed: SignedManifest;
   rules: AllowlistRule[];
 }
@@ -1939,7 +1940,23 @@ async function assertGlobalPinMatchesLiveKey(
   }
 }
 
-async function loadManifestState(input: {
+/**
+ * THE manifest composer: read every rule file from the fortress's
+ * `policy/egress/rules/` directory (the one true rule source -- promotion,
+ * provisioning, and operator-authored rules all publish there), compose the
+ * effective ruleset (habeas lanes, derived DNS, gate rule, and the
+ * exclusive-routing assertion when the routing marker is present), and sign
+ * the result. This is the daemon's ONLY manifest production path, for both
+ * the initial load and every reload.
+ *
+ * Exported (2026-07-27) so the observe/promote enforcement-reach end-to-end
+ * test can assert against the REAL composer the daemon runs, not a
+ * test-local reimplementation of its read half -- the original defect
+ * shipped precisely because the only round-trip test paired the promote
+ * writer with the promote module's own reader while no enforcement path read
+ * that location. Production callers remain inside this module.
+ */
+export async function loadManifestState(input: {
   fortressPath: string;
   fortressId: string;
   signer: DaemonSigner;
