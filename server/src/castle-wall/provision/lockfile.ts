@@ -138,7 +138,13 @@ export function egressPolicyWriterLock(
   return {
     async acquire() {
       try {
-        const handle = await open(lockPath, "wx", 0o600);
+        // 0644 (round-5 RC3a): the holder metadata is pid + timestamp, not
+        // secret, and the two writers run as DIFFERENT users (provisioning
+        // as root, promote as the operator). A 0600 root-owned lock left by
+        // a crashed root holder was unreadable by the operator's
+        // stale-holder description -- defeating the guidance in exactly its
+        // target case. World-readable, owner-writable.
+        const handle = await open(lockPath, "wx", 0o644);
         try {
           await handle.writeFile(
             JSON.stringify({ pid: process.pid, acquired_at: new Date().toISOString() }),

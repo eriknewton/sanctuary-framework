@@ -1251,9 +1251,10 @@ export async function runObservePromote(
   if (outcome.status === "publish_in_progress") {
     write(
       err,
-      "Error: another `observe promote` is publishing to this fortress" +
+      "Error: another egress-policy writer (an `observe promote`, or a provisioning publish/revoke/restore) " +
+        "is writing to this fortress" +
         (promoteLockHolder ? ` (${promoteLockHolder})` : "") +
-        ". Nothing was changed (a concurrent publish could silently drop the other promote's rules). " +
+        ". Nothing was changed (concurrent writers could silently drop each other's rules). " +
         "Wait for it to finish and re-run. This lock is never broken automatically.\n",
     );
     return 1;
