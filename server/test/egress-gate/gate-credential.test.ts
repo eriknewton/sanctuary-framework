@@ -12,7 +12,9 @@ import { join } from "node:path";
 
 import {
   GateCredentialAuthority,
+  formatGateCredentialBasicHeader,
   formatGateCredentialHeader,
+  GATE_PROXY_BASIC_USERNAME,
   parseGateCredentialHeader,
   verifyGateCredential,
   mintGateSecret,
@@ -64,6 +66,12 @@ describe("egress-gate/gate-credential parse/format", () => {
     expect(parseGateCredentialHeader(header)).toEqual({ generation_id: 7, secret: "deadbeef" });
   });
 
+  it("round-trips a standard Basic proxy credential with the fixed username and same password payload", () => {
+    const header = formatGateCredentialBasicHeader({ generation_id: 7, secret: "deadbeef" });
+    expect(header).toBe(`Basic ${Buffer.from(`${GATE_PROXY_BASIC_USERNAME}:7.deadbeef`, "utf8").toString("base64")}`);
+    expect(parseGateCredentialHeader(header)).toEqual({ generation_id: 7, secret: "deadbeef" });
+  });
+
   it("rejects absent, wrong-scheme, array, and malformed headers (fail-closed parse)", () => {
     expect(parseGateCredentialHeader(undefined)).toBeNull();
     expect(parseGateCredentialHeader(["Sanctuary-Gate 1.aa", "x"])).toBeNull(); // duplicated header
@@ -74,6 +82,29 @@ describe("egress-gate/gate-credential parse/format", () => {
     expect(parseGateCredentialHeader("Sanctuary-Gate x.aa")).toBeNull(); // non-numeric gen
     expect(parseGateCredentialHeader("Sanctuary-Gate 1.NOThex")).toBeNull(); // non-hex secret
     expect(parseGateCredentialHeader("Sanctuary-Gate 1.aAbB")).toBeNull(); // uppercase hex rejected
+  });
+
+  it("rejects malformed Basic credentials before verification", () => {
+    const basic = (value: string): string => `Basic ${Buffer.from(value, "utf8").toString("base64")}`;
+    expect(parseGateCredentialHeader("Basic not@@base64")).toBeNull();
+    expect(parseGateCredentialHeader(basic(`${GATE_PROXY_BASIC_USERNAME}7.deadbeef`))).toBeNull(); // no colon
+    expect(parseGateCredentialHeader(basic(`wrong-user:7.deadbeef`))).toBeNull();
+    expect(parseGateCredentialHeader(basic(`${GATE_PROXY_BASIC_USERNAME}:7deadbeef`))).toBeNull(); // no dot
+    expect(parseGateCredentialHeader(basic(`${GATE_PROXY_BASIC_USERNAME}:7.DEADBEEF`))).toBeNull();
+  });
+
+  it("rejects lenient-but-decodable Basic base64 variants of an otherwise valid credential", () => {
+    const canonical = Buffer.from(`${GATE_PROXY_BASIC_USERNAME}:7.deadbeef`, "utf8").toString("base64");
+    const variants = [
+      canonical.slice(0, 4) + " " + canonical.slice(4), // whitespace is ignored by lenient decoders
+      canonical.slice(0, 4) + "@@" + canonical.slice(4), // non-base64 alphabet ignored by Node's decoder
+      canonical.replace(/==$/, "="), // non-canonical padding still decodes leniently
+      canonical.replace(/=+$/, "").replace(/g$/, "h"), // non-canonical trailing bits decode to the same payload
+    ];
+    for (const variant of variants) {
+      expect(Buffer.from(variant, "base64").toString("utf8")).toBe(`${GATE_PROXY_BASIC_USERNAME}:7.deadbeef`);
+      expect(parseGateCredentialHeader(`Basic ${variant}`)).toBeNull();
+    }
   });
 });
 

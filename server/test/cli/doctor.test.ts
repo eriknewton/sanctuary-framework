@@ -11,6 +11,10 @@ import { deriveMasterKey, derivePurposeKey } from "../../src/core/key-derivation
 import { stringToBytes } from "../../src/core/encoding.js";
 import { IdentityManager } from "../../src/cognitive/tools.js";
 import { createIdentity } from "../../src/core/identity.js";
+import {
+  hermesParityPythonCandidates,
+  type SidecarExec,
+} from "../../src/wrap/hermes-yaml-parse-parity.js";
 
 class Capture extends Writable {
   chunks: string[] = [];
@@ -225,5 +229,94 @@ approval_channel:
       platform: "linux",
     });
     expect(noKey.find((c) => c.name === "audit chain")?.status).toBe("WARN");
+  });
+
+  // -- Hermes config parser (PyYAML) --------------------------------------
+  //
+  // `sudo sanctuary protect --hermes` refuses to touch config.yaml unless a
+  // REAL PyYAML parse can be run to check the line scanner against. Before this
+  // check the operator found that out only by running protect and watching it
+  // stop partway. Every case simulates the host layout through the injected
+  // probe exec, so none of them depends on which python on THIS machine happens
+  // to carry PyYAML -- the exact coupling that made the first fix attempt pass
+  // on a dev Mac and fail on the drill host.
+
+  function probeExec(opts: { withPyYaml: string[]; absent?: string[] }): SidecarExec {
+    const withPyYaml = new Set(opts.withPyYaml);
+    const absent = new Set(opts.absent ?? []);
+    return async (command) => {
+      if (absent.has(command)) return { stdout: "", stderr: "", code: null };
+      if (withPyYaml.has(command)) {
+        return { stdout: JSON.stringify({ hasBlock: false, entryNames: [] }), stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 20 }; // ran, no PyYAML
+    };
+  }
+
+  it("hermes config parser: n/a (and spawns nothing) when this host has no Hermes config", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid" });
+    let spawned = 0;
+    const checks = await runDoctorChecks({
+      storagePath: fortress,
+      env: {},
+      platform: "linux",
+      hermesConfigPath: join(fortress, "definitely-absent", "config.yaml"),
+      pyYamlProbe: {
+        exec: async () => {
+          spawned += 1;
+          return { stdout: "", stderr: "", code: 20 };
+        },
+      },
+    });
+    const check = checks.find((c) => c.name === "hermes config parser");
+    expect(check?.status).toBe("OK");
+    expect(check?.message).toContain("n/a");
+    expect(spawned).toBe(0);
+  });
+
+  it("hermes config parser: THE INVERSE-LAYOUT CASE -- names the later interpreter that can actually import yaml", async () => {
+    // The first candidate exists and runs fine; it simply has no PyYAML. A
+    // first-EXISTING resolver reports failure here; resolution by capability
+    // must walk past it and name the one that works.
+    const fortress = await makeFortress({ identity: true, policy: "valid" });
+    const hermesConfigPath = join(fortress, "hermes-config.yaml");
+    await writeFile(hermesConfigPath, "mcp_servers:\n  weather: {}\n");
+    const candidates = hermesParityPythonCandidates();
+    const checks = await runDoctorChecks({
+      storagePath: fortress,
+      env: {},
+      platform: "linux",
+      hermesConfigPath,
+      pyYamlProbe: { exec: probeExec({ withPyYaml: [candidates[2]!] }) },
+    });
+    const check = checks.find((c) => c.name === "hermes config parser");
+    expect(check?.status).toBe("OK");
+    expect(check?.message).toContain(candidates[2]!);
+    expect(check?.message).not.toContain(candidates[0]!);
+  });
+
+  it("hermes config parser: WARNs and names every probed interpreter when none can import yaml", async () => {
+    const fortress = await makeFortress({ identity: true, policy: "valid" });
+    const hermesConfigPath = join(fortress, "hermes-config.yaml");
+    await writeFile(hermesConfigPath, "mcp_servers:\n  weather: {}\n");
+    const candidates = hermesParityPythonCandidates();
+    const checks = await runDoctorChecks({
+      storagePath: fortress,
+      env: {},
+      platform: "linux",
+      hermesConfigPath,
+      pyYamlProbe: {
+        exec: probeExec({ withPyYaml: [], absent: [candidates[0]!] }),
+      },
+    });
+    const check = checks.find((c) => c.name === "hermes config parser");
+    expect(check?.status).toBe("WARN");
+    expect(check?.message).toContain("protect --hermes");
+    for (const candidate of candidates) {
+      expect(check?.hint).toContain(candidate);
+    }
+    // Per-candidate outcomes, so the remedy is not aimed at a path that is not there.
+    expect(check?.hint).toContain("could not be run");
+    expect(check?.hint).toContain("ran but cannot import yaml");
   });
 });

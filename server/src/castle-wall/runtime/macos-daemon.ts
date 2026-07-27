@@ -102,8 +102,13 @@ export interface DaemonSigner {
   signNonce(nonce: Uint8Array): Promise<Uint8Array>;
 }
 
-export const CASTLE_WALL_ALREADY_RUNNING_MESSAGE =
-  "Castle Wall daemon already running for this fortress (PID <pid>). Multi-wrap-per-fortress is Phase 3.";
+export function formatCastleWallAlreadyRunningMessage(pid?: number | null): string {
+  const pidText =
+    typeof pid === "number" && Number.isSafeInteger(pid) && pid > 0
+      ? `PID ${pid}`
+      : "pid unavailable";
+  return `Castle Wall daemon already running for this fortress (${pidText}). Multi-wrap-per-fortress is Phase 3.`;
+}
 
 /**
  * Default cadence (seconds) of the periodic AUDIT liveness heartbeat
@@ -2066,7 +2071,7 @@ async function assertSocketNotOwnedByLiveProcess(socketPath: string): Promise<vo
   }
 
   if (await socketHasLiveListener(socketPath)) {
-    throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+    throw new Error(formatCastleWallAlreadyRunningMessage());
   }
 
   await unlink(socketPath).catch((err: unknown) => {
@@ -2127,7 +2132,7 @@ async function assertActiveConfigNotOwnedByLiveProcess(
     if (config.mode === "safe") {
       throw new Error(safeModeHandoffMessage(config.pid));
     }
-    throw new Error(CASTLE_WALL_ALREADY_RUNNING_MESSAGE);
+    throw new Error(formatCastleWallAlreadyRunningMessage(config.pid));
   }
 }
 

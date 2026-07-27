@@ -65,6 +65,20 @@ export interface CrossProcessLockOptions {
   timeoutMs?: number;
   /** Poll interval while a lock is held (default {@link CROSS_PROCESS_LOCK_RETRY_MS}). */
   retryMs?: number;
+  /**
+   * Observability seam: invoked each time an acquire OBSERVES the lock already
+   * held (an `EEXIST` on the O_EXCL create) and is about to sleep and retry.
+   * `attempt` counts observed contentions, starting at 1.
+   *
+   * This is a pure notification -- it never changes acquire behaviour, and a
+   * throw from it is not caught, so implementations must not throw. It exists
+   * so a caller can prove contention actually happened rather than infer it
+   * from elapsed wall-clock: a mutual-exclusion test that only sleeps and
+   * hopes the contender got as far as an acquire attempt passes VACUOUSLY on a
+   * loaded machine where it did not. Diagnostic logging is the other intended
+   * consumer.
+   */
+  onContended?: (attempt: number) => void;
 }
 
 /**
@@ -120,6 +134,7 @@ export async function withPathLock<T>(
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
   const lockPath = join(lockDir, lockFileName);
   const started = Date.now();
+  let contentions = 0;
 
   for (;;) {
     try {
@@ -150,6 +165,8 @@ export async function withPathLock<T>(
       // read-then-unlink stale-break is a TOCTOU double-acquire (see module
       // header). Wait out the bounded budget, then fail CLOSED with a recovery
       // hint. A genuinely-dead holder is cleared by a one-time operator `rm`.
+      contentions += 1;
+      options.onContended?.(contentions);
       if (Date.now() - started >= timeoutMs) {
         throw new CrossProcessLockError(
           `cross-process lock ${lockPath} held >${timeoutMs}ms; refusing to proceed ` +

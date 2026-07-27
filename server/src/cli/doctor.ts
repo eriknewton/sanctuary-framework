@@ -7,6 +7,7 @@
 import { execSync as nodeExecSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, constants, readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { getSanctuaryVersion } from "../version.js";
@@ -14,6 +15,11 @@ import { FilesystemStorage } from "../storage/filesystem.js";
 import { IdentityManager } from "../cognitive/tools.js";
 import { resolveCliMasterKey } from "../core/master-custody.js";
 import { detectCustodyFactorOrphan } from "../wrap/orphan-detection.js";
+import {
+  describePyYamlCandidateFailure,
+  probePyYamlCandidates,
+  type ParseParityOptions,
+} from "../wrap/hermes-yaml-parse-parity.js";
 import { parsePolicy } from "../principal-policy/loader.js";
 import { resolveStoragePath } from "../paths.js";
 import { checkNodeVersion } from "./node-version.js";
@@ -115,6 +121,15 @@ export async function runDoctorChecks(opts: {
   platform: NodeJS.Platform;
   execSyncFn?: (command: string) => string;
   nodeVersion?: string;
+  /**
+   * Test-only seams for the Hermes config-parser check. Deliberately NOT on
+   * `DoctorCommandArgs`: nothing on the CLI surface (argv or env) may steer
+   * which interpreter is probed, matching the wrap guard's rule that the
+   * candidate list is code-controlled. Doctor is read-only and decides nothing,
+   * so an internal seam here cannot bypass a mutating gate.
+   */
+  hermesConfigPath?: string;
+  pyYamlProbe?: ParseParityOptions;
 }): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
   checks.push(checkRequiredNodeVersion(opts.nodeVersion));
@@ -125,9 +140,77 @@ export async function runDoctorChecks(opts: {
   checks.push(await checkAuditChain(opts.storagePath, masterKey ?? undefined));
   checks.push(await checkCustodyFactors(opts.storagePath));
   checks.push(checkRuntime());
+  checks.push(await checkHermesConfigParser(opts));
   checks.push(await checkCastleWall(opts));
   if (masterKey) masterKey.fill(0);
   return checks;
+}
+
+/**
+ * Bound on ONE candidate-interpreter probe in the doctor check. Shorter than
+ * wrap's 5s parse budget on purpose: doctor is an interactive diagnostic, and
+ * the worst case is (candidates x this), paid only on hosts that actually have
+ * a Hermes config.
+ */
+const DOCTOR_PYYAML_PROBE_TIMEOUT_MS = 3000;
+
+/**
+ * Hermes config parser: can wrap actually validate a Hermes `config.yaml`?
+ *
+ * WHY THIS CHECK EXISTS. `sudo sanctuary protect --hermes` edits
+ * `~/.hermes/config.yaml` through a line scanner whose view is validated
+ * against a REAL PyYAML parse before any byte is written, and that guard is
+ * fail-closed: no PyYAML, no wrap. Before this check, an operator learned that
+ * only by running protect and watching it refuse partway through. Worse, the
+ * condition is invisible from the shell -- `python3 -c 'import yaml'` can
+ * succeed for the operator while the interpreter wrap resolves has no PyYAML at
+ * all (the 2026-07-22 drill), so "it works in my terminal" is not evidence.
+ *
+ * IT SHARES THE MATCHER WITH THE THING IT PREDICTS. This runs
+ * {@link probePyYamlCandidates} -- the same chokepoint, same candidate list,
+ * same parse program, same selection-by-importability rule that wrap uses --
+ * with an EMPTY document, which that program defines as a valid parse. So the
+ * check measures the exact predicate wrap depends on rather than a second copy
+ * of it that can drift (the first fix attempt at this shipped RED precisely
+ * because a hand-rolled "first EXISTING python3" copy disagreed with the real
+ * requirement).
+ *
+ * Scoped to hosts that have a Hermes config: elsewhere there is nothing to
+ * wrap, so no interpreter is spawned and the check reports n/a rather than
+ * inventing a verdict about a path this host does not use.
+ *
+ * Severity is WARN, not FAIL: this blocks ONE optional surface (the Hermes wrap
+ * path), and doctor reserves FAIL for fortress-integrity problems. The
+ * fail-closed refusal itself stays where it belongs, on the mutating wrap path,
+ * which exits non-zero and writes nothing.
+ */
+async function checkHermesConfigParser(opts: {
+  env: NodeJS.ProcessEnv;
+  hermesConfigPath?: string;
+  pyYamlProbe?: ParseParityOptions;
+}): Promise<DoctorCheck> {
+  const name = "hermes config parser";
+  const home = opts.env.HOME ?? homedir();
+  const configPath = opts.hermesConfigPath ?? join(home, ".hermes", "config.yaml");
+  try {
+    await access(configPath, constants.R_OK);
+  } catch {
+    return ok(name, `n/a (no Hermes config at ${configPath})`, "none");
+  }
+  // Empty document: a valid parse for this program, so the probe exercises the
+  // real interpreter selection without reading the operator's config content.
+  const probe = await probePyYamlCandidates("", {
+    timeoutMs: DOCTOR_PYYAML_PROBE_TIMEOUT_MS,
+    ...opts.pyYamlProbe,
+  });
+  if (probe.selected !== undefined) {
+    return ok(name, `PyYAML parse validator resolves to ${probe.selected.interpreter}`, "none");
+  }
+  return warn(
+    name,
+    "no python3 Sanctuary probes can import yaml, so 'sanctuary protect --hermes' would refuse to edit config.yaml",
+    describePyYamlCandidateFailure(probe.outcomes),
+  );
 }
 
 /**
@@ -436,7 +519,8 @@ function printUsage(out: Writable): void {
     `Usage: sanctuary doctor [--json] [--fortress <path>]
 
 Runs read-only local diagnostics for state directory, identity, principal
-policy, audit-chain integrity, runtime versions, and Castle Wall status.
+policy, audit-chain integrity, runtime versions, the Hermes config parser,
+and Castle Wall status.
 `,
   );
 }

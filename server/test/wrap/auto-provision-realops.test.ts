@@ -2045,11 +2045,11 @@ describe("describeRepairCoarseComposition (F-COARSE-AFTER-EXCLUSIVE, operator se
 
   it("names the REFUSAL and the product path that clears it when the fortress is left exclusive", () => {
     // The drill's operator experience: a plain `protect --hermes` refused with
-    // no product path named. `--unprotect-egress-gate` is the one that works.
+    // no product path named. `--unprotect-egress-gate --stand-down-agent` is the one that works.
     const sentence = describeRepairCoarseComposition("exclusive-left", "coarse republish failed");
     expect(sentence).toMatch(/EXCLUSIVE routing composition/);
     expect(sentence).toMatch(/will be REFUSED/);
     expect(sentence).toMatch(/coarse republish failed/);
-    expect(sentence).toMatch(/sudo sanctuary protect --unprotect-egress-gate/);
+    expect(sentence).toMatch(/sudo sanctuary protect --unprotect-egress-gate --stand-down-agent/);
   });
 });

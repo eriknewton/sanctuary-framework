@@ -13,7 +13,9 @@ import {
   type GatePeerResolution,
 } from "../../src/egress-gate/gate-client-auth.js";
 import {
+  formatGateCredentialBasicHeader,
   formatGateCredentialHeader,
+  GATE_PROXY_BASIC_USERNAME,
   GATE_CREDENTIAL_VERSION,
   type GateAcceptSource,
   type GateCredentialAcceptRecord,
@@ -72,6 +74,7 @@ describe("egress-gate/gate-client-auth authenticator (injected accept-source)", 
   };
   const acceptSource: GateAcceptSource = { current: () => Promise.resolve(accept) };
   const validHeader = formatGateCredentialHeader({ generation_id: 7, secret: "deadbeef" });
+  const validBasicHeader = formatGateCredentialBasicHeader({ generation_id: 7, secret: "deadbeef" });
 
   it("authorizes a valid credential from the matching peer", async () => {
     const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
@@ -79,10 +82,32 @@ describe("egress-gate/gate-client-auth authenticator (injected accept-source)", 
     expect(decision).toEqual({ allow: true, peerUid: 502 });
   });
 
+  it("authorizes a valid Basic proxy credential through the same accept record", async () => {
+    const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
+    const decision = await auth.authorize({ credentialHeader: validBasicHeader, peer: resolvedAgent });
+    expect(decision).toEqual({ allow: true, peerUid: 502 });
+  });
+
   it("denies a present-but-garbage header as malformed_credential", async () => {
     const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
     const decision = await auth.authorize({ credentialHeader: "Sanctuary-Gate garbage", peer: resolvedAgent });
     expect(decision).toEqual({ allow: false, reason: "malformed_credential" });
+  });
+
+  it("denies malformed Basic payloads as malformed_credential", async () => {
+    const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
+    const basic = (value: string): string => `Basic ${Buffer.from(value, "utf8").toString("base64")}`;
+    for (const credentialHeader of [
+      "Basic not@@base64",
+      basic(`${GATE_PROXY_BASIC_USERNAME}7.deadbeef`),
+      basic(`wrong-user:7.deadbeef`),
+      basic(`${GATE_PROXY_BASIC_USERNAME}:7deadbeef`),
+    ]) {
+      await expect(
+        auth.authorize({ credentialHeader, peer: resolvedAgent }),
+        credentialHeader,
+      ).resolves.toEqual({ allow: false, reason: "malformed_credential" });
+    }
   });
 
   it("denies an absent header as no_credential", async () => {
@@ -98,10 +123,44 @@ describe("egress-gate/gate-client-auth authenticator (injected accept-source)", 
     expect(decision).toEqual({ allow: false, reason: "stale_generation" });
   });
 
+  it("denies a stale-generation Basic credential before secret comparison", async () => {
+    const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
+    const stale = formatGateCredentialBasicHeader({ generation_id: 6, secret: "deadbeef" });
+    const decision = await auth.authorize({ credentialHeader: stale, peer: resolvedAgent });
+    expect(decision).toEqual({ allow: false, reason: "stale_generation" });
+  });
+
+  it("denies a current-generation Basic credential with a stale secret as bad_secret", async () => {
+    const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
+    const staleSecret = formatGateCredentialBasicHeader({ generation_id: 7, secret: "00000000" });
+    const decision = await auth.authorize({ credentialHeader: staleSecret, peer: resolvedAgent });
+    expect(decision).toEqual({ allow: false, reason: "bad_secret" });
+  });
+
   it("denies a valid credential from the WRONG peer uid (bearer never overrides peer)", async () => {
     const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
     const decision = await auth.authorize({ credentialHeader: validHeader, peer: resolvedOperator });
     expect(decision).toEqual({ allow: false, reason: "peer_uid_mismatch", peerUid: 501, peerPid: 888 });
+  });
+
+  it("denies a valid Basic credential from the wrong or unresolved peer (Basic never overrides peer)", async () => {
+    const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
+    await expect(
+      auth.authorize({ credentialHeader: validBasicHeader, peer: resolvedOperator }),
+    ).resolves.toEqual({ allow: false, reason: "peer_uid_mismatch", peerUid: 501, peerPid: 888 });
+    await expect(auth.authorize({ credentialHeader: validBasicHeader, peer: unresolved })).resolves.toEqual({
+      allow: false,
+      reason: "peer_unresolved",
+    });
+  });
+
+  it("denies an array-valued Proxy-Authorization header", async () => {
+    const auth = createGateClientAuthenticator({ agentUid: 502, acceptSource });
+    const decision = await auth.authorize({
+      credentialHeader: [validBasicHeader, validHeader],
+      peer: resolvedAgent,
+    });
+    expect(decision.allow).toBe(false);
   });
 
   it("denies a valid credential when the peer is unresolved", async () => {
