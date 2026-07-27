@@ -3880,7 +3880,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
           input.print(
             `[castle-wall] boot: uid ${agentUid} gate plist self-heal failed (${reason}); ` +
               "the release barrier will verify and park fail-closed. " +
-              "Repair: sudo sanctuary protect --repair-egress-gate",
+              `Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
           );
           try {
             await input.audit("exclusive_egress_gate_plist_self_heal_failed", {

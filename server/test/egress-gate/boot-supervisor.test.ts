@@ -752,7 +752,7 @@ describe("startExclusiveEgressBootSupervisor (boot self-heal: stale pre-#986 gat
     "<string>node</string>",
   );
 
-  it("rewrites the on-disk plist to an ABSOLUTE-interpreter argv BEFORE bootstrapping the gate daemon", async () => {
+  it("COMBINED #994+#1027 path: heals the plist, then bootout -> settle -> bootstrap picks up the healed file in the SAME boot", async () => {
     const events: string[] = [];
     let writtenPath: string | undefined;
     let writtenContent: string | undefined;
@@ -767,8 +767,25 @@ describe("startExclusiveEgressBootSupervisor (boot self-heal: stale pre-#986 gat
           writtenPath = plistPath;
           writtenContent = plistContent;
         },
+        // TEST-HARNESS (post-#1027): the fake launchctl must be able to
+        // represent launchd's real states. This boot models the drill's
+        // stale-plist scenario: the STALE job is LOADED (launchd scanned
+        // /Library/LaunchDaemons before any Sanctuary code ran) but not
+        // running (RunAtLoad=false), so the pre-check reports not-running,
+        // the bootout is issued against the loaded stale job, and the
+        // settle read then proves it deregistered (not-loaded) so bootstrap
+        // loads the file the self-heal just wrote -- in the SAME boot.
         runLaunchctlFn: async (args) => {
           events.push(`launchctl ${args.join(" ")}`);
+          if (args[0] === "print" && args[1] === "system/ai.sanctuaryprotocol.egress-gate.502") {
+            const bootedOut = events.includes("launchctl bootout system/ai.sanctuaryprotocol.egress-gate.502");
+            return bootedOut
+              ? { code: 113, stdout: "", stderr: "Could not find service" }
+              : { code: 0, stdout: "system/ai.sanctuaryprotocol.egress-gate.502 = {\n\tstate = not running\n}\n", stderr: "" };
+          }
+          if (args[0] === "print") {
+            return { code: 113, stdout: "", stderr: "Could not find service" };
+          }
           return { code: 0, stdout: "", stderr: "" };
         },
         runBarrier: async () => {
@@ -787,13 +804,22 @@ describe("startExclusiveEgressBootSupervisor (boot self-heal: stale pre-#986 gat
     // genuinely broken (a bare `node` interpreter).
     expect(firstProgramArgument(STALE_NON_ABSOLUTE_PLIST)).toBe("node");
     expect(writtenContent).not.toBe(STALE_NON_ABSOLUTE_PLIST);
-    // The rewrite happened BEFORE the (mocked) bootstrap of the on-disk plist.
+    // The COMBINED ordering the hardware drill requires: heal the file FIRST,
+    // then bootout the stale loaded job, prove it gone (settle print), and
+    // only then bootstrap -- so what launchd loads this boot IS the healed
+    // file, not the cached stale argv.
     const writeIdx = events.indexOf("writePlist");
+    const bootoutIdx = events.indexOf("launchctl bootout system/ai.sanctuaryprotocol.egress-gate.502");
     const bootstrapIdx = events.indexOf(
       "launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate.502.plist",
     );
+    const settleIdx = events.indexOf("launchctl print system/ai.sanctuaryprotocol.egress-gate.502", bootoutIdx + 1);
+    const kickstartIdx = events.indexOf("launchctl kickstart system/ai.sanctuaryprotocol.egress-gate.502");
     expect(writeIdx).toBeGreaterThanOrEqual(0);
-    expect(bootstrapIdx).toBeGreaterThan(writeIdx);
+    expect(bootoutIdx).toBeGreaterThan(writeIdx);
+    expect(settleIdx).toBeGreaterThan(bootoutIdx);
+    expect(bootstrapIdx).toBeGreaterThan(settleIdx);
+    expect(kickstartIdx).toBeGreaterThan(bootstrapIdx);
     expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
   });
 
@@ -844,7 +870,14 @@ describe("startExclusiveEgressBootSupervisor (boot self-heal: stale pre-#986 gat
         writeGateDaemonPlist: async (_plistPath, plistContent) => {
           writtenContent = plistContent;
         },
+        // Nothing loaded in this fixture: print reports genuinely NOT LOADED
+        // (post-#1027 the settle loop reads a { code: 0, stdout: "" }
+        // catch-all as STILL LOADED and would spin a full real-timer settle
+        // before failing closed).
         runLaunchctlFn: async (args) => {
+          if (args[0] === "print") {
+            return { code: 113, stdout: "", stderr: "Could not find service" };
+          }
           if (args[0] === "bootstrap") bootstrapped = true;
           return { code: 0, stdout: "", stderr: "" };
         },
@@ -880,7 +913,14 @@ describe("startExclusiveEgressBootSupervisor (boot self-heal: stale pre-#986 gat
         writeGateDaemonPlist: async () => {
           throw new Error("EACCES: /Library/LaunchDaemons is read-only");
         },
+        // Nothing loaded in this fixture: print reports genuinely NOT LOADED
+        // (post-#1027 the settle loop reads a { code: 0, stdout: "" }
+        // catch-all as STILL LOADED and would spin a full real-timer settle
+        // before failing closed).
         runLaunchctlFn: async (args) => {
+          if (args[0] === "print") {
+            return { code: 113, stdout: "", stderr: "Could not find service" };
+          }
           if (args[0] === "bootstrap") bootstrapped = true;
           return { code: 0, stdout: "", stderr: "" };
         },
