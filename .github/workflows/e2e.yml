@@ -10,17 +10,39 @@ permissions:
   contents: read
 
 jobs:
+  playwright-version:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read @playwright/test version from server/package.json
+        id: detect
+        run: |
+          RAW="$(node -p "require('./server/package.json').devDependencies['@playwright/test']")"
+          # Strip any semver range prefix (^, ~) defensively; the value should
+          # already be an exact pin, but dependabot or a manual edit could
+          # reintroduce a range.
+          VERSION="${RAW#^}"
+          VERSION="${VERSION#~}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
   e2e:
+    needs: playwright-version
     runs-on: ubuntu-22.04
     # Run inside the official Playwright image so chromium/webkit are pre-baked
-    # and version-matched to @playwright/test 1.59.1. This eliminates the
-    # cdn.playwright.dev browser download that reliably stalled in CI (3x480s
-    # all timed out on the chromium zip), so there is no install or cache step:
-    # the browsers ship in the image and Playwright finds them via the image's
-    # PLAYWRIGHT_BROWSERS_PATH. Keep this tag in lockstep with the
-    # @playwright/test version in server/package.json.
+    # and version-matched to @playwright/test. The image tag is derived above
+    # from server/package.json's devDependencies["@playwright/test"] (the
+    # playwright-version job), not hardcoded, so a dependabot bump to the
+    # package version automatically pulls the matching image on the next run.
+    # This eliminates the cdn.playwright.dev browser download that reliably
+    # stalled in CI (3x480s all timed out on the chromium zip), so there is no
+    # install or cache step: the browsers ship in the image and Playwright
+    # finds them via the image's PLAYWRIGHT_BROWSERS_PATH. If a bump lands
+    # before Microsoft has published a matching tag, the container pull fails
+    # loud (image-not-found) rather than silently mismatching versions.
     container:
-      image: mcr.microsoft.com/playwright:v1.61.1-noble
+      image: mcr.microsoft.com/playwright:v${{ needs.playwright-version.outputs.version }}-noble
     timeout-minutes: 30
 
     steps:
