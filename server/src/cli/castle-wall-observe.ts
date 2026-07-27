@@ -147,8 +147,11 @@ Commands:
   start        Turn observe mode on.
   status       Show whether observe mode is on and pending candidate count.
   candidates   Refresh + list candidate destinations pending review.
-  promote      Promote selected candidates into live allow rules. Tier-1
-               FORCED (requires approval).
+  promote      Promote selected candidates into allow rules. Tier-1
+               FORCED (requires approval). KNOWN DEFECT: promoted rules
+               do not currently reach live enforcement (the enforcement
+               daemons read a different rule source), so promoted
+               destinations stay denied. Fix in progress.
   discard      Drop selected (or all) candidates without promoting them.
 
 Run "sanctuary castle-wall observe <command> --help" for command-specific options.
@@ -992,11 +995,11 @@ export async function runObservePromote(
 
   write(
     out,
-    `Added ${outcome.addedRules.length} allow rule(s). Your wall's manifest was re-signed and republished.\n`,
+    `Added ${outcome.addedRules.length} allow rule(s) to the promote store. Your wall's manifest was re-signed and republished.\n`,
   );
   write(
     out,
-    "Run `sanctuary castle-wall reload` (or restart the daemon) so a running Castle Wall daemon picks up the new rules immediately.\n",
+    "KNOWN DEFECT: promoted rules do NOT currently reach live enforcement (the enforcement daemons read a different rule source), so the destinations you just approved stay denied, fail-closed. A fix is in progress; until it lands, promotion records your approval but does not change what the wall allows.\n",
   );
   if (outcome.dropped.length > 0) {
     write(out, `${outcome.dropped.length} row(s) were skipped:\n`);
