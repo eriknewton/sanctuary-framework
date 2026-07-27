@@ -7,11 +7,17 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { AGENT_HARNESS_DAEMON_LABEL } from "../../src/egress-gate/harness-daemon.js";
 import {
+  RELEASE_REFUSAL_RECORD_HEADER,
   ReleaseBarrierError,
   computeHarnessArgvDigest,
+  parseReleaseWrapperRefusalRecord,
+  releaseRefusalRecordPath,
   runReleaseBarrierSequence,
   type CommittedGenerationIdentity,
   type HarnessReleaseHoldRecord,
@@ -24,6 +30,30 @@ const CTX: ReleaseBarrierContext = {
   harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
   harnessArgv: ["/usr/local/bin/node", "/opt/harness.js"],
 };
+
+const matchingWrapperRefusal = {
+  header: RELEASE_REFUSAL_RECORD_HEADER,
+  reason: "hold file absent; no committed generation has released this uid",
+  observations: {
+    expected_generation: "7",
+    gate_port: "49152",
+    proxy_username_shape: "valid",
+    expected_label: AGENT_HARNESS_DAEMON_LABEL,
+    runtime_uid: "503",
+    hold_file_exists: "no",
+    hold_file_readable: "not_checked",
+    hold_header: "not_checked",
+    hold_generation: "not_checked",
+    hold_label: "not_checked",
+    hold_uid: "not_checked",
+    boot_session: "not_checked",
+    argv_digest: "not_checked",
+    token_file_exists: "not_checked",
+    token_file_readable: "not_checked",
+    token_generation: "not_checked",
+    token_secret_shape: "not_checked",
+  },
+} as const;
 
 interface SpyOps {
   ops: ReleaseBarrierOps;
@@ -86,6 +116,10 @@ function makeOps(overrides?: Partial<Record<keyof ReleaseBarrierOps, unknown>>):
     },
     async restoreParkedPlist() {
       calls.push("restoreParkedPlist");
+    },
+    async readWrapperRefusalRecord() {
+      calls.push("readWrapperRefusalRecord");
+      return { status: "absent" as const };
     },
     async harnessStatus() {
       calls.push("harnessStatus");
@@ -607,10 +641,187 @@ describe("runReleaseBarrierSequence: verify-running (liveness; fix-round HIGH-3)
     if (outcome.kind !== "parked") return;
     expect(outcome.stage).toBe("verify-running");
     expect(outcome.reason).toContain("did not reach a stable running state after bootstrap");
+    expect(outcome.reason).toContain("could not determine whether the job spawned or exec'd");
+    expect(outcome.reason).toContain("no matching wrapper refusal record");
+    expect(outcome.reason).not.toContain("may be refusing");
     expect(outcome.holdFileRemoved).toBe(true);
     expect(outcome.jobDisabled).toBe(true);
     expect(calls).toContain("bootout");
     expect(calls.filter((c) => c === "restoreParkedPlist")).toHaveLength(2);
+  });
+
+  it("quotes the recorded wrapper refusal reason and observations when the diagnostic record matches this release", async () => {
+    let bootstrapped = false;
+    const { ops } = makeOps({
+      bootstrapJob: async () => {
+        bootstrapped = true;
+      },
+      harnessStatus: async () =>
+        bootstrapped
+          ? { known: true, installed: true, running: false }
+          : { known: true, installed: true, running: false },
+      readWrapperRefusalRecord: async () => ({ status: "present" as const, record: matchingWrapperRefusal }),
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.stage).toBe("verify-running");
+    expect(outcome.reason).toContain(
+      "an agent-writable wrapper refusal record " +
+        "(diagnostic only; not independently verified) reports: hold file absent; no committed generation has released this uid",
+    );
+    expect(outcome.reason).toContain("hold_file_exists=no");
+    expect(outcome.reason).toContain("token_secret_shape=not_checked");
+    expect(outcome.reason).not.toContain("deadbeef");
+    expect(outcome.reason).not.toContain("PROXY_URL");
+    expect(outcome.reason).not.toContain("may be refusing");
+  });
+
+  it("cleanup removes the hold file and restores the parked plist without deleting the diagnostic record", async () => {
+    const root = await mkdtemp(join(tmpdir(), "release-cleanup-record-"));
+    try {
+      const holdDir = join(root, "hold");
+      const logDir = join(root, "logs");
+      const holdPath = join(holdDir, "503.release");
+      const parkedPlistPath = join(root, "agent-harness.plist");
+      await mkdir(holdDir, { recursive: true });
+      await mkdir(logDir, { recursive: true });
+
+      const recordPath = releaseRefusalRecordPath(logDir);
+      await writeFile(
+        recordPath,
+        [
+          RELEASE_REFUSAL_RECORD_HEADER,
+          "reason=hold file absent; no committed generation has released this uid",
+          "expected_generation=7",
+          "gate_port=49152",
+          "",
+        ].join("\n"),
+      );
+
+      let bootstrapped = false;
+      const { ops, calls } = makeOps({
+        bootstrapJob: async () => {
+          calls.push("bootstrap");
+          bootstrapped = true;
+        },
+        writeHoldFile: async (record) => {
+          calls.push("writeHold");
+          await writeFile(holdPath, `generation=${record.generation_id}\n`);
+        },
+        removeHoldFile: async () => {
+          calls.push("removeHold");
+          await rm(holdPath, { force: true });
+        },
+        restoreParkedPlist: async () => {
+          calls.push("restoreParkedPlist");
+          await writeFile(parkedPlistPath, "parked\n");
+        },
+        harnessStatus: async () => {
+          calls.push("harnessStatus");
+          return bootstrapped
+            ? { known: true, installed: true, running: false }
+            : { known: true, installed: true, running: false };
+        },
+        readWrapperRefusalRecord: async () => ({
+          status: "present" as const,
+          record: parseReleaseWrapperRefusalRecord(await readFile(recordPath, "utf8")),
+        }),
+      });
+
+      const outcome = await runReleaseBarrierSequence(CTX, ops);
+      expect(outcome.kind).toBe("parked");
+      if (outcome.kind !== "parked") return;
+      expect(outcome.stage).toBe("verify-running");
+      expect(outcome.holdFileRemoved).toBe(true);
+      expect(outcome.jobDisabled).toBe(true);
+      expect(outcome.reason).toContain("agent-writable wrapper refusal record");
+      await expect(readFile(holdPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(parkedPlistPath, "utf8")).toBe("parked\n");
+      const survivingRecord = parseReleaseWrapperRefusalRecord(await readFile(recordPath, "utf8"));
+      expect(survivingRecord.reason).toBe("hold file absent; no committed generation has released this uid");
+      expect(calls.filter((c) => c === "restoreParkedPlist")).toHaveLength(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("distinguishes a job that never spawned from a wrapper refusal", async () => {
+    let bootstrapped = false;
+    const { ops } = makeOps({
+      bootstrapJob: async () => {
+        bootstrapped = true;
+      },
+      harnessStatus: async () =>
+        bootstrapped
+          ? { known: true, installed: false, running: false }
+          : { known: true, installed: true, running: false },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.reason).toContain("the job never spawned");
+    expect(outcome.reason).not.toContain("wrapper refused");
+    expect(outcome.reason).not.toContain("may be refusing");
+  });
+
+  it("distinguishes a spawned process that did not stay up when launchd observed a pid and no wrapper refusal record matched", async () => {
+    let bootstrapped = false;
+    const { ops } = makeOps({
+      bootstrapJob: async () => {
+        bootstrapped = true;
+      },
+      harnessStatus: async () =>
+        bootstrapped
+          ? { known: true, installed: true, running: false, pid: 4242 }
+          : { known: true, installed: true, running: false },
+    });
+    const outcome = await runReleaseBarrierSequence(CTX, ops);
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind !== "parked") return;
+    expect(outcome.reason).toContain("the job spawned but did not stay up: launchd observed pid 4242");
+    expect(outcome.reason).not.toContain("wrapper refused");
+    expect(outcome.reason).not.toContain("may be refusing");
+  });
+
+  it("says could not determine when the only refusal record is stale or unreadable", async () => {
+    let bootstrapped = false;
+    const staleRecord = {
+      ...matchingWrapperRefusal,
+      observations: { ...matchingWrapperRefusal.observations, expected_generation: "6" },
+    };
+    const { ops: staleOps } = makeOps({
+      bootstrapJob: async () => {
+        bootstrapped = true;
+      },
+      harnessStatus: async () =>
+        bootstrapped
+          ? { known: true, installed: true, running: false }
+          : { known: true, installed: true, running: false },
+      readWrapperRefusalRecord: async () => ({ status: "present" as const, record: staleRecord }),
+    });
+    const stale = await runReleaseBarrierSequence(CTX, staleOps);
+    expect(stale.kind).toBe("parked");
+    if (stale.kind !== "parked") return;
+    expect(stale.reason).toContain("could not determine whether this launch's wrapper refused");
+    expect(stale.reason).toContain("generation 6");
+
+    bootstrapped = false;
+    const { ops: unreadableOps } = makeOps({
+      bootstrapJob: async () => {
+        bootstrapped = true;
+      },
+      harnessStatus: async () =>
+        bootstrapped
+          ? { known: true, installed: true, running: false }
+          : { known: true, installed: true, running: false },
+      readWrapperRefusalRecord: async () => ({ status: "unreadable" as const, reason: "EACCES" }),
+    });
+    const unreadable = await runReleaseBarrierSequence(CTX, unreadableOps);
+    expect(unreadable.kind).toBe("parked");
+    if (unreadable.kind !== "parked") return;
+    expect(unreadable.reason).toContain("could not determine whether the wrapper refused: EACCES");
+    expect(unreadable.reason).not.toContain("may be refusing");
   });
 
   it("parks fail-closed when the status is untrustworthy or the probe throws", async () => {

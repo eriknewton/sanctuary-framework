@@ -689,7 +689,7 @@ export async function kickstartAgentHarnessDaemon(ops: HarnessDaemonOps): Promis
   }
   if (!(await agentHarnessDaemonStableRunning(ops))) {
     throw new Error(
-      `launchctl kickstart system/${AGENT_HARNESS_DAEMON_LABEL} was accepted, but the job did not report a stable running pid (the release wrapper may be refusing to exec)`,
+      `launchctl kickstart system/${AGENT_HARNESS_DAEMON_LABEL} was accepted, but the job did not report a stable running pid; this probe did not determine whether the wrapper refused or the process exited after exec`,
     );
   }
 }
