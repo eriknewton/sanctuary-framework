@@ -66,7 +66,25 @@ function baseInternals(overrides: ExclusiveEgressBootSupervisorInternals = {}): 
   return {
     listRegistryEntries: async () => ({ entries: [ENTRY], quarantined: [], dirty: false }),
     ensureKeys: async () => KEYS,
-    runLaunchctlFn: async () => ({ code: 0, stdout: "", stderr: "" }),
+    // TEST-HARNESS FIX (harden-loop review, 2026-07-27): this default used to
+    // return `{ code: 0, stdout: "", stderr: "" }` for EVERY launchctl verb,
+    // including `print`. That shape parses as `{ known: true, installed:
+    // true, running: false }` -- "loaded but between processes" -- which is
+    // indistinguishable from a job that is STILL LOADED after bootout. Before
+    // `reloadLaunchdDaemonForBringUp`'s settle loop cared about `installed`
+    // (it used to settle on `running` alone), this inconsistency was inert.
+    // Now it makes the settle loop spin for the full HARNESS_STOP_SETTLE_SAMPLES
+    // and then throw "STILL LOADED after bootout" on every test that reaches
+    // the gate-daemon reload through this default and never overrides
+    // `runLaunchctlFn` itself -- most of which have nothing to do with the
+    // daemon-reload feature. A first-ever-boot label that was never
+    // bootstrapped genuinely reports NOT LOADED on `print`, same as it does
+    // on `bootout`; model that here so the default stays a true "nothing to
+    // reload, everything trivially succeeds" fixture.
+    runLaunchctlFn: async (args) =>
+      args[0] === "print"
+        ? { code: 113, stdout: "", stderr: "Could not find service" }
+        : { code: 0, stdout: "", stderr: "" },
     runBarrier: async () => RELEASED,
     createBarrierOps: (() => ({})) as never,
     createOracle: () => ({ refresh: vi.fn(async () => null) }) as never,
@@ -183,8 +201,18 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
       print: () => undefined,
       refreshIntervalMs: 60_000,
       internals: baseInternals({
+        // TEST-HARNESS FIX (harden-loop review, 2026-07-27): `print` must
+        // report genuinely NOT LOADED (same as the tolerated `bootout`
+        // below), not `{ code: 0, stdout: "" }` -- which the settle loop now
+        // reads as "installed but between processes" and would spin on for
+        // the full HARNESS_STOP_SETTLE_SAMPLES before throwing "STILL LOADED
+        // after bootout". Nothing was ever bootstrapped in this fixture, so
+        // `print` should say so, same as real launchd would.
         runLaunchctlFn: async (args) => {
           events.push(`launchctl ${args.join(" ")}`);
+          if (args[0] === "print") {
+            return { code: 113, stdout: "", stderr: "Could not find service" };
+          }
           return { code: 0, stdout: "", stderr: "" };
         },
         ensureRuntimeFs: async () => {
@@ -357,10 +385,19 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
       print: (line) => printed.push(line),
       refreshIntervalMs: 60_000,
       internals: baseInternals({
+        // TEST-HARNESS FIX (fix round, 2026-07-27): `print` must report
+        // genuinely NOT LOADED, or the settle loop reads the catch-all
+        // `{ code: 0, stdout: "" }` as "installed but between processes",
+        // spins a full real-timer settle for BOTH daemons (~9.5s) and throws
+        // "STILL LOADED after bootout" -- so `bootstrap` was never reached
+        // and this test silently stopped testing bootstrap-failure
+        // propagation (the exit-5 stub below).
         runLaunchctlFn: async (args) =>
-          args[0] === "bootstrap"
-            ? { code: 5, stdout: "", stderr: "Bootstrap failed: 125: Unknown error" }
-            : { code: 0, stdout: "", stderr: "" },
+          args[0] === "print"
+            ? { code: 113, stdout: "", stderr: "Could not find service" }
+            : args[0] === "bootstrap"
+              ? { code: 5, stdout: "", stderr: "Bootstrap failed: 125: Unknown error" }
+              : { code: 0, stdout: "", stderr: "" },
         runBarrier: async () => {
           barrierRan = true;
           return {
@@ -401,8 +438,15 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
       print: () => undefined,
       refreshIntervalMs: 60_000,
       internals: baseInternals({
+        // TEST-HARNESS FIX (harden-loop review, 2026-07-27): `print` needs
+        // the SAME not-loaded shape as `bootout` here -- nothing was ever
+        // bootstrapped, so real launchd would report the label unknown on
+        // print too. Without this, the settle loop reads the previous
+        // catch-all `{ code: 0, stdout: "" }` as "installed but between
+        // processes", spins for HARNESS_STOP_SETTLE_SAMPLES, and throws
+        // "STILL LOADED after bootout" before bootstrap/kickstart ever runs.
         runLaunchctlFn: async (args) => {
-          if (args[0] === "bootout") {
+          if (args[0] === "bootout" || args[0] === "print") {
             return { code: 113, stdout: "", stderr: "Could not find service" };
           }
           if (args[0] === "kickstart" && args[1] === `system/ai.sanctuaryprotocol.egress-gate.502`) kicked = true;
@@ -517,6 +561,157 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     expect(calls).not.toContain(
       "launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate-peer-resolver.502.plist",
     );
+  });
+
+  it("FIX (second-family re-gate, 2026-07-27): a gate-daemon-reload failure forces the REAL release-barrier sequence to park, even when the gate ops otherwise report a fully healthy stale gate", async () => {
+    // The prior two tests in this block ("gate bootstrap failure logs
+    // LOUDLY..." and the "STILL RUNNING" one above) both inject `runBarrier`
+    // as a parked STUB: they prove a log line appears and that a
+    // hand-returned stub is what the test calls "parked" -- they do NOT
+    // prove production would park, because `runBarrier` never runs the real
+    // sequencing logic and `verifyGate` is never called at all. That is
+    // exactly the mock-weakness the second-family adversarial review named
+    // as the HIGH: `bootstrapGateDaemonForBoot` can throw "STILL RUNNING
+    // after bootout" and the boot supervisor's catch only LOGGED it, so
+    // production `verifyGate` had no knowledge the reload failed -- if a
+    // stale gate process still looked healthy (matching runtime state,
+    // owner, generation, live pf union), the barrier could release over it.
+    //
+    // This test exercises the REAL production wiring end to end:
+    //  - `runBarrier` is the REAL `runReleaseBarrierSequence` (not a stub),
+    //    so the actual stage sequencing (reassert-parked -> re-arm ->
+    //    gate-verify -> commit -> ...) decides parked vs. released.
+    //  - `createBarrierOps` returns a hand-built `ReleaseBarrierOps` whose
+    //    `verifyGate` reports `{ ok: true }` -- standing in for "the stale
+    //    gate's runtime state, owner, generation and pf liveness ALL still
+    //    look healthy", which is the exact adversarial condition the
+    //    reviewer named. The innermost per-check verifyGate (disk read of
+    //    `/var/db/sanctuary/gate-runtime/<uid>/state.json` + a real `lsof`
+    //    port-owner probe) is NOT reachable from a non-root unit test --
+    //    `createProductionReleaseBarrierOps`'s `verifyGate` closure calls
+    //    `verifyLoopbackTcpPortOwner` and `readFile(egressGateRuntimeStatePath(...))`
+    //    directly with no injectable seam, and the runtime-state path is a
+    //    root-owned absolute path. That boundary is a real STUB -- this test
+    //    does not paper over it, it names it here.
+    //  - `bootstrapGateDaemonForBoot` (the function that actually THROWS
+    //    "STILL RUNNING after bootout") is the REAL production function,
+    //    driven only via its `runLaunchctlFn` seam (same technique as the
+    //    "STILL RUNNING" test above) -- so the failure this test forces is
+    //    the genuine production throw, not a hand-rolled one.
+    //
+    // Before the fix in this PR, `gateDaemonBootstrapFailure` was never
+    // captured or wired into `releaseBarrierOps`, so the wrapped
+    // `verifyGate` this test exercises did not exist: `barrierOps.verifyGate`
+    // (returning `ok: true`) would have been called UNWRAPPED, the real
+    // `runReleaseBarrierSequence` would have proceeded past gate-verify, and
+    // this test's `outcome.kind === "parked"` assertion (and the "must not
+    // run" throws on commit/hold-file/enable/bootstrap below) would FAIL --
+    // this is the fail-before/pass-after proof for the fix.
+    const printed: string[] = [];
+    const audits: Array<{ operation: string; details: Record<string, unknown> }> = [];
+    const barrierEvents: string[] = [];
+    let gatePrintCalls = 0;
+    const barrierOps: ReleaseBarrierOps = {
+      bootoutJob: async () => void barrierEvents.push("bootout"),
+      removeHoldFile: async () => void barrierEvents.push("removeHold"),
+      disableJob: async () => void barrierEvents.push("disable"),
+      restoreParkedPlist: async () => void barrierEvents.push("restoreParkedPlist"),
+      rearmAnchor: async () => {
+        barrierEvents.push("rearm");
+        return { ok: true };
+      },
+      verifyGate: async () => {
+        barrierEvents.push("verifyGate");
+        // Stands in for "runtime state, owner, generation and pf liveness
+        // ALL look healthy" -- the exact stale-but-healthy-looking gate the
+        // reviewer's HIGH described.
+        return { ok: true, observed: { generation_id: 7, agent_uid: 502, gate_port: 40001 } };
+      },
+      commitGeneration: async () => {
+        barrierEvents.push("commit");
+        throw new Error("commit must not run after a forced gate-verify failure");
+      },
+      bootSessionUuid: async () => "boot-session",
+      writeHoldFile: async () => {
+        throw new Error("hold file must not be written after a forced gate-verify failure");
+      },
+      writeReleasedPlist: async () => {
+        throw new Error("released plist must not be written after a forced gate-verify failure");
+      },
+      enableJob: async () => {
+        throw new Error("job must not be enabled after a forced gate-verify failure");
+      },
+      bootstrapJob: async () => {
+        throw new Error("harness must not bootstrap after a forced gate-verify failure");
+      },
+      readWrapperRefusalRecord: async () => ({ status: "absent" as const }),
+      harnessStatus: async () => ({ known: true, installed: true, running: false }),
+      sleepMs: async () => undefined,
+    };
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async (operation, details) => void audits.push({ operation, details }),
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        gateReloadSleepMs: async () => undefined,
+        runLaunchctlFn: async (args) => {
+          if (args[0] === "print" && args[1] === "system/ai.sanctuaryprotocol.egress-gate.502") {
+            gatePrintCalls += 1;
+            // The live-re-entry pre-check probes the gate label BEFORE
+            // deciding whether to reload at all. First call = that pre-check:
+            // report NOT loaded, so the cold-boot reload path runs (matching
+            // this test's boot premise). Every call AFTER the bootout (the
+            // settle loop) reports STILL running, so the failure this test
+            // forces is the genuine production "STILL RUNNING after bootout"
+            // throw, not a hand-rolled one.
+            if (gatePrintCalls === 1) {
+              return { code: 113, stdout: "", stderr: "Could not find service" };
+            }
+            return {
+              code: 0,
+              stdout: "system/ai.sanctuaryprotocol.egress-gate.502 = {\n\tpid = 13651\n\tstate = running\n}\n",
+              stderr: "",
+            };
+          }
+          if (args[0] === "print") {
+            // Any other label (the peer resolver): genuinely not loaded, so
+            // its own reload succeeds trivially and stays out of this test's
+            // way.
+            return { code: 113, stdout: "", stderr: "Could not find service" };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        runBarrier: runReleaseBarrierSequence,
+        createBarrierOps: (() => barrierOps) as never,
+      }),
+    });
+    handle.stopOracleLoop();
+    expect(printed.join("\n")).toContain("gate daemon bootstrap failed");
+    expect(printed.join("\n")).toContain("STILL RUNNING after bootout");
+    expect(printed.join("\n")).toContain("refuse release");
+    expect(printed.join("\n")).toContain("repair-egress-gate");
+    // gate-verify is REACHED (proving the real sequence ran and called our
+    // wrapped verifyGate) but nothing past it runs: the forced ok:false
+    // short-circuits before commit/hold-file/enable/bootstrap.
+    expect(barrierEvents).toEqual(["bootout", "removeHold", "disable", "restoreParkedPlist", "rearm", "verifyGate"]);
+    const bootstrapAudit = audits.find((entry) => entry.operation === "exclusive_egress_gate_daemon_bootstrap_failed");
+    expect(bootstrapAudit?.details).toMatchObject({
+      agent_uid: 502,
+      gate_account: "sanctuary-gate-hermes",
+      gate_uid: 511,
+      barrier_continues_fail_closed: true,
+    });
+    expect(bootstrapAudit?.details.reason).toContain("STILL RUNNING after bootout");
+    const outcome = handle.results[0]!.outcome;
+    expect(outcome.kind).toBe("parked");
+    if (outcome.kind === "parked") {
+      expect(outcome.reason).toContain("release barrier parked at stage gate-verify");
+      expect(outcome.reason).toContain("gate daemon bootstrap/reload failed before release");
+      expect(outcome.reason).toContain("STILL RUNNING after bootout");
+      expect(outcome.reason).toContain("unproven launchd state");
+      expect(outcome.parkedClaim.state).toBe("parked");
+    }
   });
 });
 
@@ -782,6 +977,15 @@ describe("startExclusiveEgressBootSupervisor (fix-round-2 HIGH-3: host-singleton
         listRegistryEntries: async () => ({ entries: [okEntry, staleEntry], quarantined: [], dirty: false }),
         runLaunchctlFn: async (args) => {
           events.push(`launchctl ${args.join(" ")}`);
+          // TEST-HARNESS FIX (fix round, 2026-07-27): nothing is loaded in
+          // this fixture, so `print` reports NOT LOADED -- the catch-all
+          // `{ code: 0, stdout: "" }` shape parses as "installed but between
+          // processes" and makes uid 601's two real daemon reloads spin a
+          // full real-timer settle (~9.5s) before failing closed, which the
+          // RELEASED runBarrier stub then silently ignored.
+          if (args[0] === "print") {
+            return { code: 113, stdout: "", stderr: "Could not find service" };
+          }
           return { code: 0, stdout: "", stderr: "" };
         },
         removeHoldFile: async (uid: number) => void events.push(`removeHold ${uid}`),
@@ -1255,10 +1459,17 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-1: shared-label s
             // `gateReloadSleepMs` override here) before throwing, and the test
             // only still asserted uid 601 `released` because `runBarrier` is a
             // fixed `async () => RELEASED` stub that ignores both failures.
-            // Scoping keeps uid 601's reload prints on the default
-            // known-not-running answer (falls through below), so its daemons
-            // settle on the first sample like every other fixture here.
+            // Scoping keeps uid 601's reload prints on a genuinely
+            // NOT-LOADED answer (below), so its daemons settle on the first
+            // sample like every other fixture here. (Fix round, 2026-07-27:
+            // that answer must be the not-loaded shape, code 113 -- the
+            // settle loop reads `{ code: 0, stdout: "" }` as "installed but
+            // between processes", i.e. STILL LOADED, and would spin a full
+            // real-timer settle per daemon before failing closed.)
             if (args[0] === "print" && args[1] === `system/${AGENT_HARNESS_DAEMON_LABEL}`) return printOutput;
+            if (args[0] === "print") {
+              return { code: 113, stdout: "", stderr: "Could not find service" };
+            }
             return { code: 0, stdout: "", stderr: "" };
           },
           removeHoldFile: async () => undefined,

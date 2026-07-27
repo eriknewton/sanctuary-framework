@@ -2529,6 +2529,45 @@ describe("reloadLaunchdDaemonForBringUp (fix-round-4: shared chokepoint; the GAT
     await expect(reload(fn)).rejects.toThrow(/bootstrap .* exited 5/);
     expect(calls).not.toContain(`kickstart system/${GATE_LABEL}`);
   });
+
+  // -------------------------------------------------------------------------
+  // FIX (harden-loop review, 2026-07-27): the settle loop used to declare
+  // victory as soon as `launchctl print` stopped reporting a running pid,
+  // even though a `print` that exits 0 with NO pid line means the label is
+  // still LOADED (bootout accepted the stop, but launchd has not yet
+  // deregistered the job) -- distinct from a `print` that exits non-zero
+  // ("not loaded"), which is the only reading that actually proves the
+  // label is gone. Settling on the former and proceeding to bootstrap would
+  // hit "already bootstrapped" and, post-settle, throw anyway -- so the
+  // fix makes the settle loop keep sampling through that ambiguous state
+  // instead of stopping early on it.
+  // -------------------------------------------------------------------------
+  it("keeps sampling through a LOADED-but-not-running print (no pid line, exit 0) until the label is actually gone, then bootstraps + kickstarts", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      // Sample 1: still loaded, process already reaped (no pid line, exit 0).
+      // Sample 2: genuinely unloaded (non-zero, "not loaded" shaped).
+      print: [
+        { code: 0, stdout: `system/${GATE_LABEL} = {\n\tstate = not running\n}\n` },
+        { code: 113, stdout: "", stderr: "Could not find service" },
+      ],
+    });
+    await expect(reload(fn)).resolves.toBeUndefined();
+    const printCalls = calls.filter((c) => c === `print system/${GATE_LABEL}`);
+    expect(printCalls.length).toBe(2);
+    expect(calls).toContain(`bootstrap system ${GATE_PLIST}`);
+    expect(calls).toContain(`kickstart system/${GATE_LABEL}`);
+  });
+
+  it("FAILS CLOSED (STILL LOADED, not STILL RUNNING) when the label stays loaded-but-not-running through every sample", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      print: { code: 0, stdout: `system/${GATE_LABEL} = {\n\tstate = not running\n}\n` },
+    });
+    await expect(reload(fn)).rejects.toThrow(/STILL LOADED after bootout/);
+    expect(calls).not.toContain(`bootstrap system ${GATE_PLIST}`);
+    expect(calls).not.toContain(`kickstart system/${GATE_LABEL}`);
+    const printCalls = calls.filter((c) => c === `print system/${GATE_LABEL}`);
+    expect(printCalls.length).toBe(HARNESS_STOP_SETTLE_SAMPLES);
+  });
 });
 
 // ---------------------------------------------------------------------------

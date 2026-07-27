@@ -1472,19 +1472,42 @@ export async function reloadLaunchdDaemonForBringUp(input: {
   // SETTLE BEFORE BOOTSTRAP: a tolerated bootout does not prove the old
   // process is reaped (the exact lesson `uninstallAgentHarnessDaemon` learned
   // on Mini1; see `harness-daemon.ts:406-427`). Re-sample `launchctl print`
-  // until the job is proven not-running BEFORE bootstrapping, so bootstrap
-  // loads the NEW argv instead of no-op'ing on "already loaded".
-  const after = (await awaitHarnessStoppedVia(() => launchdDaemonStatusByLabel(run, label), input.sleepMs)).status;
+  // until the job is proven UNLOADED (not merely not-running) BEFORE
+  // bootstrapping, so bootstrap loads the NEW argv instead of no-op'ing on
+  // "already loaded".
+  //
+  // FIX (harden-loop review, 2026-07-27): `awaitHarnessStoppedVia`'s shared
+  // `stillAlive` predicate settles as soon as `running` goes false, but
+  // `launchdDaemonStatusByLabel` can report the job installed yet without a
+  // running process -- STILL LOADED, just between processes (a bootout that
+  // returned EINPROGRESS can reap the pid before launchd finishes
+  // deregistering the job). Settling on that transient reading and
+  // proceeding straight to bootstrap would either no-op on "already
+  // bootstrapped" (silently keeping the stale argv, the exact defect this
+  // chokepoint exists to prevent) or, post-settle, throw on that same
+  // "already loaded" result -- parking a boot the untouched pre-chokepoint
+  // callers would have tolerated. Feed `installed` back into the shared
+  // settle loop as still-alive so it keeps sampling (bounded by the same
+  // `HARNESS_STOP_SETTLE_SAMPLES`) until the label is genuinely gone, then
+  // make the fail-closed decision on the real last-observed status.
+  let lastStatus: HarnessDaemonStatus = { known: false, installed: false, running: false };
+  await awaitHarnessStoppedVia(async () => {
+    lastStatus = await launchdDaemonStatusByLabel(run, label);
+    // Still-alive means loaded OR running: the settle loop must not stop on
+    // an installed-but-processless read.
+    return { ...lastStatus, running: lastStatus.installed || lastStatus.running };
+  }, input.sleepMs);
+  const after = lastStatus;
   if (!after.known) {
     throw new Error(
       `launchctl print system/${label} did not return a trustworthy status after bootout; refusing to bring up ` +
         "the daemon against unknown launchd state (the OLD daemon may still be serving a stale gate generation)",
     );
   }
-  if (after.running) {
+  if (after.running || after.installed) {
     throw new Error(
-      `system/${label} is STILL RUNNING after bootout; refusing to bring up the daemon rather than arm ` +
-        "the agent over a daemon that may still serve the OLD gate generation",
+      `system/${label} is STILL ${after.running ? "RUNNING" : "LOADED"} after bootout; refusing to bring up ` +
+        "the daemon rather than arm the agent over a daemon that may still serve the OLD gate generation",
     );
   }
   // Proven unloaded: an "already loaded"-shaped bootstrap result here would
@@ -3756,6 +3779,19 @@ export async function startExclusiveEgressBootSupervisor(input: {
           input.print(`[castle-wall] boot: uid ${agentUid} runtime-fs assert failed: ${(err as Error).message}`);
         }
         let gateHomeLayoutFailure: string | undefined;
+        // Fix-round (second-family re-gate, 2026-07-27): a gate daemon reload
+        // that reports "STILL RUNNING after bootout" (a stale process that
+        // may still serve the OLD gate generation) is caught below, but the
+        // catch used to only LOG it and fall through to `runBarrier` with
+        // production `verifyGate` unaware anything failed. If the stale
+        // process's runtime state, owner, generation and pf liveness all
+        // still look healthy, `verifyGate` can report an ok verdict and the
+        // barrier releases -- a fail-OPEN over an unproven launchd state.
+        // Mirrors `gateHomeLayoutFailure` immediately below: capture the
+        // failure here and fold it into the SAME `verifyGate` override so a
+        // gate-daemon-bootstrap failure is a HARD parked outcome, never left
+        // for later verification to maybe notice.
+        let gateDaemonBootstrapFailure: string | undefined;
         try {
           await ensureGateHomeLayout({
             agentUid,
@@ -3844,10 +3880,27 @@ export async function startExclusiveEgressBootSupervisor(input: {
             ...(internals.gateReloadSleepMs !== undefined ? { sleepMs: internals.gateReloadSleepMs } : {}),
           });
         } catch (err) {
+          const reason = (err as Error).message;
+          gateDaemonBootstrapFailure = reason;
           input.print(
-            `[castle-wall] boot: uid ${agentUid} gate daemon bootstrap failed (${(err as Error).message}); ` +
-              "the release barrier will verify and park fail-closed.",
+            `[castle-wall] boot: uid ${agentUid} gate daemon bootstrap failed (${reason}); ` +
+              "the release barrier will refuse release and park fail-closed. " +
+              `Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
           );
+          try {
+            await input.audit("exclusive_egress_gate_daemon_bootstrap_failed", {
+              agent_uid: agentUid,
+              gate_account: ctx.gateAccount,
+              gate_uid: ctx.gateUid,
+              reason,
+              barrier_continues_fail_closed: true,
+            });
+          } catch (auditErr) {
+            input.print(
+              `[castle-wall] boot: uid ${agentUid} could not record gate daemon bootstrap failure audit ` +
+                `(${(auditErr as Error).message}); the release barrier will still verify and park fail-closed`,
+            );
+          }
         }
         const oracle = createOracle(keys.privateKey, ctx.gateUid);
         const barrierOps = createBarrierOps({
@@ -3862,18 +3915,28 @@ export async function startExclusiveEgressBootSupervisor(input: {
           print: input.print,
         });
         const releaseBarrierOps: ReleaseBarrierOps =
-          gateHomeLayoutFailure === undefined
+          gateHomeLayoutFailure === undefined && gateDaemonBootstrapFailure === undefined
             ? barrierOps
             : {
                 ...barrierOps,
                 verifyGate: async () => {
                   const gate = await barrierOps.verifyGate();
+                  const forcedReasons: string[] = [];
+                  if (gateHomeLayoutFailure !== undefined) {
+                    forcedReasons.push(
+                      `gate account home layout assertion failed before release: ${gateHomeLayoutFailure}`,
+                    );
+                  }
+                  if (gateDaemonBootstrapFailure !== undefined) {
+                    forcedReasons.push(
+                      `gate daemon bootstrap/reload failed before release: ${gateDaemonBootstrapFailure} ` +
+                        "(unproven launchd state -- refusing to trust a stale gate process even if it " +
+                        "otherwise verifies)",
+                    );
+                  }
                   return {
                     ok: false,
-                    reasons: [
-                      `gate account home layout assertion failed before release: ${gateHomeLayoutFailure}`,
-                      ...(gate.ok ? [] : gate.reasons),
-                    ],
+                    reasons: [...forcedReasons, ...(gate.ok ? [] : gate.reasons)],
                   };
                 },
               };
