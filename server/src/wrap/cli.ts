@@ -178,14 +178,34 @@ function runProcessShutdownCleanups(): void {
   for (const cleanup of cleanups) cleanup();
 }
 
+// FIX (N1-1, 2026-07-26): SIGINT/SIGTERM handlers that only run cleanups
+// disable Node's default termination behavior for that signal -- installing
+// ANY listener suppresses the runtime's built-in "exit on signal" action, so
+// `sanctuary protect` survived a plain `kill` and drills needed `kill -9`
+// (drill record 2026-07-26). Exit explicitly with the conventional
+// 128+signal code after cleanups complete. The `exit` listener is a
+// different event (fired during an already-in-progress shutdown) and must
+// keep running cleanups only -- calling `process.exit()` from inside an
+// `exit` handler has no effect and would be misleading to leave in.
+const SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
+  SIGINT: 128 + 2,
+  SIGTERM: 128 + 15,
+};
+
+/** Exported for the seam: unit-test the exit code without sending real signals. */
+export function handleProcessShutdownSignal(signal: NodeJS.Signals): void {
+  runProcessShutdownCleanups();
+  process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
+}
+
 function registerProcessShutdownCleanup(
   cleanup: ProcessShutdownCleanup,
 ): () => void {
   processShutdownCleanups.add(cleanup);
   if (!processShutdownListenersInstalled) {
     processShutdownListenersInstalled = true;
-    process.on("SIGINT", runProcessShutdownCleanups);
-    process.on("SIGTERM", runProcessShutdownCleanups);
+    process.on("SIGINT", handleProcessShutdownSignal);
+    process.on("SIGTERM", handleProcessShutdownSignal);
     process.on("exit", runProcessShutdownCleanups);
   }
   return () => {
@@ -2364,6 +2384,37 @@ export async function runWrap(
   else if (options.cline) platformHint = "cline";
   else if (options.mastra) platformHint = "mastra";
 
+  // FIX (N1-3, 2026-07-26): `sanctuary protect --exclusive-egress` (or
+  // `--provision-agent-account`) without an agent selection silently armed
+  // NOTHING -- maybeRunAutoProvisionForWrap's early return
+  // (`agentConfig.platform !== "hermes"`) prints nothing, and there was zero
+  // cross-flag validation on these flags. Only Hermes is provisionable
+  // today; refuse loudly, before any wrap work (config detection, file
+  // writes, dashboard start) happens, rather than quietly performing a
+  // plain cooperative wrap while the operator believes exclusive egress (or
+  // account provisioning) was armed. Fires the same regardless of
+  // --dry-run -- a dry run must not silently omit the same refusal.
+  if (
+    (options.exclusiveEgress === true || options.provisionAgentAccount === true) &&
+    platformHint !== "hermes"
+  ) {
+    const requestedFlags = [
+      options.exclusiveEgress === true ? "--exclusive-egress" : undefined,
+      options.provisionAgentAccount === true ? "--provision-agent-account" : undefined,
+    ]
+      .filter((flag): flag is string => flag !== undefined)
+      .join(" / ");
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error(
+      `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+        `but none was given. Only Hermes is provisionable today -- re-run with ` +
+        `--hermes. Without it, wrap would proceed as a plain cooperative wrap ` +
+        `and arm nothing.\n`
+    );
+    process.exit(2);
+    return;
+  }
+
   let detection = await detectAgentConfigWithDiagnostics(
     platformHint,
     options.wrap
@@ -3854,6 +3905,31 @@ export async function runWrap(
     record: localAgentRecord,
     autoProvisionSummary,
   });
+
+  // FIX (N1-2, 2026-07-26): when the operator declines the step-2 arm
+  // confirm, the flow used to fall through to the foreground dashboard
+  // serve started above -- the listening dashboard handle holds the event
+  // loop open forever, so a run that declines the arm prompt never returns
+  // (drills needed `kill -9`). The cooperative wrap (config rewrite,
+  // identity, dashboard-backed audit log) already completed and stands
+  // unchanged; only the foreground dashboard serve is skipped. This does
+  // not touch the accept path, any other outcome kind, or the default
+  // interactive dashboard behavior on acceptance.
+  if (
+    autoProvisionSummary.ran &&
+    autoProvisionSummary.outcome?.kind === "declined-by-operator"
+  ) {
+    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+    console.error(
+      `  Run 'sanctuary dashboard' separately to view the dashboard for this fortress.\n`
+    );
+    if (wrapAuditLog) {
+      await wrapAuditLog.flush();
+    }
+    await dashboard.stop();
+    process.exit(0);
+    return;
+  }
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 

@@ -114,6 +114,23 @@ function runStandaloneExitCleanups(): void {
   for (const cleanup of cleanups) cleanup();
 }
 
+// FIX (N1-1, 2026-07-26): same defect as server/src/wrap/cli.ts -- a
+// SIGINT/SIGTERM handler that only runs cleanups suppresses Node's default
+// "exit on signal" behavior, so the standalone dashboard survived a plain
+// `kill` and required `kill -9`. Exit explicitly with 128+signal after
+// cleanups complete. The `exit` listener stays cleanup-only (calling
+// `process.exit()` during the `exit` event has no effect).
+const STANDALONE_SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
+  SIGINT: 128 + 2,
+  SIGTERM: 128 + 15,
+};
+
+/** Exported for the seam: unit-test the exit code without sending real signals. */
+export function handleStandaloneShutdownSignal(signal: NodeJS.Signals): void {
+  runStandaloneSignalCleanups();
+  process.exit(STANDALONE_SIGNAL_EXIT_CODE[signal] ?? 128);
+}
+
 function registerStandaloneProcessCleanup(
   cleanup: StandaloneProcessCleanup,
   options: { runOnExit?: boolean } = {},
@@ -124,8 +141,8 @@ function registerStandaloneProcessCleanup(
   }
   if (!standaloneProcessListenersInstalled) {
     standaloneProcessListenersInstalled = true;
-    process.on("SIGINT", runStandaloneSignalCleanups);
-    process.on("SIGTERM", runStandaloneSignalCleanups);
+    process.on("SIGINT", handleStandaloneShutdownSignal);
+    process.on("SIGTERM", handleStandaloneShutdownSignal);
     process.on("exit", runStandaloneExitCleanups);
   }
 }
