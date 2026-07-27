@@ -10,6 +10,17 @@
 /** Schema version for v1 allowlist rules + manifest + signed envelopes. */
 export const CASTLE_WALL_SCHEMA_VERSION_V1 = 1 as const;
 
+/**
+ * The id prefix EVERY observe-promoted rule carries (provenance marker,
+ * mirroring provisioning's `provisioned-<harness>-` convention). Lives here
+ * (not in `observe/synthesize.ts`, which re-exports it) so the allowlist
+ * layer's exclusive-routing violation remedy can NAME the observe recovery
+ * path for a stale promoted rule without an allowlist->observe import cycle.
+ * NOT an ownership claim: the CLI publisher's orphan-cleanup owns files by
+ * membership in the previous promote-signed manifest, never by name.
+ */
+export const OBSERVE_PROMOTED_RULE_ID_PREFIX = "derived-observe-" as const;
+
 /** Audit-log layer for every Castle Wall event. Layer 1 per the Castle Architecture ADR. */
 export const CASTLE_WALL_AUDIT_LAYER = "l1" as const;
 

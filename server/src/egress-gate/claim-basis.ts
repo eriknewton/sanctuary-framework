@@ -1960,7 +1960,10 @@ export const CLAIM_LITERAL_COUNTS: Readonly<Record<string, number>> = {
   [`${CW}/exclusive-unprotect.ts`]: 4,
   [`${CW}/harness-argv.ts`]: 1,
   [`${CW}/index.ts`]: 0,
-  [`${CW}/lockfile.ts`]: 0,
+  // lockfile.ts round-4 C1: `isEgressLockHolderAlive` returns a truthy
+  // pid-liveness probe result for the lock-holder description; not a
+  // protection claim.
+  [`${CW}/lockfile.ts`]: 1,
   [`${CW}/orchestrate.ts`]: 10,
   [`${CW}/policy-daemon.ts`]: 0,
   [`${CW}/rehome.ts`]: 0,

@@ -114,6 +114,7 @@
 
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { ruleProtocolMatches, ruleScopeCoversAgent } from "../allowlist/match.js";
+import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 import { ipMatches, cidrMatches } from "../allowlist/ip-cidr.js";
 import type { RuleMatch } from "../allowlist/schema.js";
 import type { VerifiedChainConsumer } from "../../operational/audit-log.js";
@@ -246,9 +247,12 @@ export type RefreshOutcome =
  *   2. AN EXACT UNCONDITIONAL ALLOW EXISTS: an allow rule with no
  *      time_window (conditional allowance never suppresses; the Linux
  *      daemon refuses such manifests outright), whose scope covers this
- *      row's agent (`ruleScopeCoversAgent` -- identical semantics in the
- *      daemon and the macOS filter; the scope-blind proxy allows a
- *      fortiori), and whose destination matches on the axes EVERY enforcer
+ *      row's agent (`ruleScopeCoversAgent` -- shared-axis parity with the
+ *      daemon and the macOS filter, and CONSERVATIVE on the macOS-only
+ *      `uids` axis: a uids-only rule, e.g. an exclusive-routing GATE-scoped
+ *      promoted rule the gate daemon only loads at re-arm, NEVER suppresses
+ *      -- 2026-07-27 fix-round F2, the third recurrence of the self-masking
+ *      shape), and whose destination matches on the axes EVERY enforcer
  *      agrees on: a catch-all destination (no destination axes), an exact
  *      (ASCII-case-insensitive) `host` entry for a hostname-bearing row,
  *      or an exact `ip` entry for an IP-only row. host_pattern and cidr
@@ -305,6 +309,45 @@ export function candidateCurrentlyAllowed(
       rule.disposition === "allow" &&
       rule.time_window === undefined &&
       ruleScopeCoversAgent(rule.scope, agent) &&
+      ruleProtocolMatches(rule.match.protocol, row.protocol) &&
+      portAxisAdmits(rule.match.port, row.port) &&
+      allowDestinationExact(rule.match, row),
+  );
+}
+
+/**
+ * Round-3 R2(b): true iff this row's destination is covered by an
+ * OBSERVE-PROMOTED, gate-scoped, unconditional allow in the verified ruleset
+ * -- i.e. the row was promoted on THIS exclusive-routing fortress and is
+ * awaiting the re-arm that loads the gate daemon's destination snapshot.
+ * Such a rule NEVER suppresses the row (F2: uids-only does not cover the
+ * agent), so without this marker the candidates listing could not tell
+ * "promoted, awaiting re-arm" from "never promoted".
+ *
+ * Round-3 L2 tightening (the over-marking direction): the covering rule must
+ * (a) carry the `derived-observe-` id prefix -- a provisioned gate-uid
+ * endpoint rule covering the same destination is NOT a promotion and must
+ * not mark a never-promoted row -- and (b) be scoped to exactly the CURRENT
+ * marker's gate uid (`gateUid`): a rule bound to a STALE gate uid is one the
+ * next re-arm will not serve, so claiming "awaiting re-arm" for it would be
+ * false. Destination legs are the SAME exact-match helpers
+ * `candidateCurrentlyAllowed` uses, so the two verdicts cannot drift.
+ * Purely informational: no suppression, no pruning.
+ */
+export function candidatePromotedAwaitingRearm(
+  rules: readonly AllowlistRule[],
+  row: Pick<CandidateObservation, "host" | "ip" | "port" | "protocol">,
+  gateUid: number,
+): boolean {
+  return rules.some(
+    (rule) =>
+      rule.disposition === "allow" &&
+      rule.id.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX) &&
+      rule.time_window === undefined &&
+      rule.scope?.uids?.length === 1 &&
+      rule.scope.uids[0] === gateUid &&
+      (rule.scope.agent_ids?.length ?? 0) === 0 &&
+      (rule.scope.template_ids?.length ?? 0) === 0 &&
       ruleProtocolMatches(rule.match.protocol, row.protocol) &&
       portAxisAdmits(rule.match.port, row.port) &&
       allowDestinationExact(rule.match, row),
