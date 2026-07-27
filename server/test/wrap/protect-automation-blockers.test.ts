@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   handleProcessShutdownSignal,
+  registerProcessShutdownCleanup,
   runWrap,
   type RunWrapDeps,
   type WrapOptions,
@@ -61,13 +62,28 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     exitSpy.mockRestore();
   });
 
-  it("exits with 130 (128 + SIGINT=2) on SIGINT", () => {
-    handleProcessShutdownSignal("SIGINT");
+  it("exits with 130 (128 + SIGINT=2) on SIGINT", async () => {
+    await handleProcessShutdownSignal("SIGINT");
     expect(exitSpy).toHaveBeenCalledWith(130);
   });
 
-  it("exits with 143 (128 + SIGTERM=15) on SIGTERM", () => {
-    handleProcessShutdownSignal("SIGTERM");
+  it("exits with 143 (128 + SIGTERM=15) on SIGTERM", async () => {
+    await handleProcessShutdownSignal("SIGTERM");
+    expect(exitSpy).toHaveBeenCalledWith(143);
+  });
+
+  // FIX (N1-1 corrected, 2026-07-27): the handler must AWAIT every
+  // registered cleanup before exiting, not just start them and exit in the
+  // same synchronous turn (that truncated every cleanup past its first
+  // `await` -- see the doc comment on `runProcessShutdownCleanups`).
+  it("awaits a registered async cleanup before exiting", async () => {
+    let cleanupSettled = false;
+    registerProcessShutdownCleanup(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      cleanupSettled = true;
+    });
+    await handleProcessShutdownSignal("SIGTERM");
+    expect(cleanupSettled).toBe(true);
     expect(exitSpy).toHaveBeenCalledWith(143);
   });
 });
@@ -85,13 +101,13 @@ describe("handleStandaloneShutdownSignal (dashboard-standalone.ts) exits after c
     exitSpy.mockRestore();
   });
 
-  it("exits with 130 (128 + SIGINT=2) on SIGINT", () => {
-    handleStandaloneShutdownSignal("SIGINT");
+  it("exits with 130 (128 + SIGINT=2) on SIGINT", async () => {
+    await handleStandaloneShutdownSignal("SIGINT");
     expect(exitSpy).toHaveBeenCalledWith(130);
   });
 
-  it("exits with 143 (128 + SIGTERM=15) on SIGTERM", () => {
-    handleStandaloneShutdownSignal("SIGTERM");
+  it("exits with 143 (128 + SIGTERM=15) on SIGTERM", async () => {
+    await handleStandaloneShutdownSignal("SIGTERM");
     expect(exitSpy).toHaveBeenCalledWith(143);
   });
 });
@@ -211,24 +227,43 @@ describe("runWrap: declined step-2 arm confirm exits instead of holding the dash
 describe("runWrap: --exclusive-egress / --provision-agent-account require a provisionable agent selector", () => {
   let exitSpy: ReturnType<typeof vi.spyOn>;
   let stderrSpy: ReturnType<typeof vi.spyOn>;
+  let tmpHome: string;
+  let originalHome: string | undefined;
+  let originalStoragePath: string | undefined;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     stderrSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
       throw new Error(`process.exit:${code ?? 0}`);
     }) as never);
+    // FIX (N1-3 corrected, 2026-07-27): the refusal now checks the RESOLVED
+    // platform, which means `detectAgentConfigWithDiagnostics` actually runs
+    // (it's read-only). Sandbox HOME to an empty tmp dir so "no agent
+    // selector" tests deterministically find no config, instead of
+    // depending on whatever happens to exist on the machine running the
+    // suite.
+    tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-exclusive-egress-"));
+    originalHome = process.env.HOME;
+    originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
+    process.env.HOME = tmpHome;
+    process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     stderrSpy.mockRestore();
     exitSpy.mockRestore();
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
+    else process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
+    await rm(tmpHome, { recursive: true, force: true });
   });
 
   function options(extra: WrapOptions = {}): WrapOptions {
     return { noOpen: true, noDashboard: true, ...extra };
   }
 
-  it("refuses --exclusive-egress alone (no agent selector) before any wrap work, exit code 2", async () => {
+  it("refuses --exclusive-egress alone (no agent config anywhere) before any wrap work, exit code 2", async () => {
     const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
     const startDashboard = vi.fn();
     await expect(
@@ -239,13 +274,14 @@ describe("runWrap: --exclusive-egress / --provision-agent-account require a prov
     const printed = stderrSpy.mock.calls.flat().join("\n");
     expect(printed).toContain("--exclusive-egress");
     expect(printed).toContain("--hermes");
-    // Refuses BEFORE any wrap work: no config detection/rewrite, no
-    // auto-provision, no dashboard start.
+    // Refuses BEFORE any state-changing wrap work: no config rewrite, no
+    // auto-provision, no dashboard start. (Detection itself is a read-only
+    // probe and DOES run now -- that's the fix -- but it finds nothing here.)
     expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
     expect(startDashboard).not.toHaveBeenCalled();
   });
 
-  it("refuses --provision-agent-account alone (no agent selector) before any wrap work, exit code 2", async () => {
+  it("refuses --provision-agent-account alone (no agent config anywhere) before any wrap work, exit code 2", async () => {
     const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
     const startDashboard = vi.fn();
     await expect(
@@ -260,12 +296,32 @@ describe("runWrap: --exclusive-egress / --provision-agent-account require a prov
     expect(startDashboard).not.toHaveBeenCalled();
   });
 
+  it("refuses --exclusive-egress when the detected platform is NOT hermes (explicit wrong selector)", async () => {
+    // A non-hermes config exists and is explicitly selected -- the resolved
+    // platform is knowably wrong, so this must still refuse loudly rather
+    // than silently proceeding as a plain cooperative wrap.
+    const cursorDir = join(tmpHome, ".cursor");
+    await mkdir(cursorDir, { recursive: true });
+    await cp(join(fixturesDir, "hermes.json"), join(cursorDir, "mcp.json"));
+
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    const startDashboard = vi.fn();
+    await expect(
+      runWrap(
+        options({ cursor: true, exclusiveEgress: true }),
+        { runAutoProvisionForWrap, startDashboard },
+      ),
+    ).rejects.toThrow("process.exit:2");
+
+    expect(exitSpy).toHaveBeenCalledWith(2);
+    const printed = stderrSpy.mock.calls.flat().join("\n");
+    expect(printed).toContain("--exclusive-egress");
+    expect(printed).toContain("cursor");
+    expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
+    expect(startDashboard).not.toHaveBeenCalled();
+  });
+
   it("does NOT refuse --hermes --exclusive-egress (a supported selector was given)", async () => {
-    const tmpHome = await mkdtemp(join(tmpdir(), "sanctuary-exclusive-egress-hermes-"));
-    const originalHome = process.env.HOME;
-    const originalStoragePath = process.env.SANCTUARY_STORAGE_PATH;
-    process.env.HOME = tmpHome;
-    process.env.SANCTUARY_STORAGE_PATH = join(tmpHome, ".sanctuary");
     installHermesParityHook(agreeingHermesParity);
     try {
       const hermesDir = join(tmpHome, ".hermes");
@@ -292,11 +348,43 @@ describe("runWrap: --exclusive-egress / --provision-agent-account require a prov
       expect(exitSpy).not.toHaveBeenCalledWith(2);
     } finally {
       clearHermesParityHook();
-      if (originalHome === undefined) delete process.env.HOME;
-      else process.env.HOME = originalHome;
-      if (originalStoragePath === undefined) delete process.env.SANCTUARY_STORAGE_PATH;
-      else process.env.SANCTUARY_STORAGE_PATH = originalStoragePath;
-      await rm(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  // FIX (N1-3 corrected, 2026-07-27): the actual bug -- a Hermes host with
+  // NO `--hermes` flag at all (plain `sanctuary protect --exclusive-egress`,
+  // relying on auto-detect, exactly as the drill record described) must
+  // still reach the real wrap flow. The pre-fix guard keyed on the CLI hint
+  // (`platformHint`, only set by an explicit --openclaw/--hermes/etc. flag)
+  // rather than the platform `detectAgentConfigWithDiagnostics` actually
+  // resolves, so it refused this case even though auto-provision would have
+  // gone on to arm successfully.
+  it("does NOT refuse --exclusive-egress when Hermes is auto-detected without --hermes", async () => {
+    installHermesParityHook(agreeingHermesParity);
+    try {
+      const hermesDir = join(tmpHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      await cp(join(fixturesDir, "hermes.json"), join(hermesDir, "cli-config.json"));
+
+      const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+      await expect(
+        runWrap(
+          options({ exclusiveEgress: true }),
+          {
+            runAutoProvisionForWrap,
+            resolvePassphrase: async () => ({
+              value: "test-passphrase",
+              location: "test-keychain",
+              source: "generated" as const,
+            }),
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
+      expect(exitSpy).not.toHaveBeenCalledWith(2);
+    } finally {
+      clearHermesParityHook();
     }
   });
 });

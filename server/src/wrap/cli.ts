@@ -167,15 +167,28 @@ import {
 import type { UpstreamServer, SovereigntyProfile } from "../sovereignty-profile.js";
 import { runProvisionPin } from "../cli/castle-wall.js";
 
-type ProcessShutdownCleanup = () => void;
+type ProcessShutdownCleanup = () => void | Promise<void>;
 
 const processShutdownCleanups = new Set<ProcessShutdownCleanup>();
 let processShutdownListenersInstalled = false;
 
-function runProcessShutdownCleanups(): void {
+// FIX (N1-1 corrected, 2026-07-27): every registered cleanup starts an async
+// operation (Castle Wall daemon teardown, tenant-runtime unlink, audit-log
+// flush) rather than awaiting it -- `process.exit()` right after firing them
+// synchronously abandons every promise past its first `await`, so a `kill
+// <pid>` still lost the graceful-shutdown audit checkpoint, the
+// `filter_stopped` close record, and the tenant-runtime unlink even though
+// the process itself now exits. Await every cleanup to completion (via
+// `Promise.allSettled` so one failing cleanup cannot block the others)
+// before returning.
+async function runProcessShutdownCleanups(): Promise<void> {
   const cleanups = [...processShutdownCleanups];
   processShutdownCleanups.clear();
-  for (const cleanup of cleanups) cleanup();
+  await Promise.allSettled(
+    cleanups.map(async (cleanup) => {
+      await cleanup();
+    }),
+  );
 }
 
 // FIX (N1-1, 2026-07-26): SIGINT/SIGTERM handlers that only run cleanups
@@ -193,12 +206,15 @@ const SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
 };
 
 /** Exported for the seam: unit-test the exit code without sending real signals. */
-export function handleProcessShutdownSignal(signal: NodeJS.Signals): void {
-  runProcessShutdownCleanups();
+export async function handleProcessShutdownSignal(
+  signal: NodeJS.Signals,
+): Promise<void> {
+  await runProcessShutdownCleanups();
   process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
 }
 
-function registerProcessShutdownCleanup(
+/** Exported for the seam: unit-test that a registered cleanup is awaited. */
+export function registerProcessShutdownCleanup(
   cleanup: ProcessShutdownCleanup,
 ): () => void {
   processShutdownCleanups.add(cleanup);
@@ -2384,19 +2400,36 @@ export async function runWrap(
   else if (options.cline) platformHint = "cline";
   else if (options.mastra) platformHint = "mastra";
 
-  // FIX (N1-3, 2026-07-26): `sanctuary protect --exclusive-egress` (or
-  // `--provision-agent-account`) without an agent selection silently armed
-  // NOTHING -- maybeRunAutoProvisionForWrap's early return
+  let detection = await detectAgentConfigWithDiagnostics(
+    platformHint,
+    options.wrap
+  );
+  let agentConfig = detection.config;
+
+  // FIX (N1-3 corrected, 2026-07-27): `sanctuary protect --exclusive-egress`
+  // (or `--provision-agent-account`) without a provisionable agent selected
+  // silently armed NOTHING -- maybeRunAutoProvisionForWrap's early return
   // (`agentConfig.platform !== "hermes"`) prints nothing, and there was zero
   // cross-flag validation on these flags. Only Hermes is provisionable
-  // today; refuse loudly, before any wrap work (config detection, file
-  // writes, dashboard start) happens, rather than quietly performing a
-  // plain cooperative wrap while the operator believes exclusive egress (or
-  // account provisioning) was armed. Fires the same regardless of
-  // --dry-run -- a dry run must not silently omit the same refusal.
+  // today; refuse loudly rather than quietly performing a plain cooperative
+  // wrap while the operator believes exclusive egress (or account
+  // provisioning) was armed. Fires the same regardless of --dry-run -- a
+  // dry run must not silently omit the same refusal.
+  //
+  // This checks the RESOLVED platform (`agentConfig?.platform`), not the
+  // explicit `--hermes` flag: `platformHint` is only set when the operator
+  // passed a platform selector, but `maybeRunAutoProvisionForWrap` (and the
+  // arming it gates) key on the platform `detectAgentConfigWithDiagnostics`
+  // actually resolves, which auto-detects Hermes with no flag at all (and
+  // resolves Hermes from an explicit `--wrap ~/.hermes/cli-config.json`
+  // too). A hint-only check refused those cases even though the real wrap
+  // flow would have gone on to auto-detect Hermes and arm successfully --
+  // detection is a read-only probe, so hoisting it above this refusal keeps
+  // the "before any wrap work" property (no file writes, no dashboard
+  // start) for hosts that genuinely aren't Hermes.
   if (
     (options.exclusiveEgress === true || options.provisionAgentAccount === true) &&
-    platformHint !== "hermes"
+    agentConfig?.platform !== "hermes"
   ) {
     const requestedFlags = [
       options.exclusiveEgress === true ? "--exclusive-egress" : undefined,
@@ -2404,22 +2437,19 @@ export async function runWrap(
     ]
       .filter((flag): flag is string => flag !== undefined)
       .join(" / ");
+    const platformClause = agentConfig
+      ? `the detected/configured platform is "${agentConfig.platform}"`
+      : "no agent configuration could be found";
     // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
     console.error(
       `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
-        `but none was given. Only Hermes is provisionable today -- re-run with ` +
-        `--hermes. Without it, wrap would proceed as a plain cooperative wrap ` +
-        `and arm nothing.\n`
+        `but ${platformClause}. Only Hermes is provisionable today -- re-run with ` +
+        `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
+        `plain cooperative wrap and arm nothing.\n`
     );
     process.exit(2);
     return;
   }
-
-  let detection = await detectAgentConfigWithDiagnostics(
-    platformHint,
-    options.wrap
-  );
-  let agentConfig = detection.config;
 
   // If no config file exists for an explicitly-hinted platform, bootstrap an
   // empty one at the canonical (first-listed) path. Wrap then proceeds to
@@ -2803,8 +2833,12 @@ export async function runWrap(
   const registerCastleWallCleanup = () => {
     if (!castleWallDaemon) return;
     unregisterCastleWallCleanup?.();
-    const stop = () => {
-      castleWallDaemon?.stop().catch(() => {});
+    const stop = async () => {
+      try {
+        await castleWallDaemon?.stop();
+      } catch {
+        /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+      }
     };
     unregisterCastleWallCleanup = registerProcessShutdownCleanup(stop);
   };
@@ -3706,6 +3740,24 @@ export async function runWrap(
       wrapAuditStorage = v11Storage;
       wrapAuditMasterKey = derived.key;
       wrapAuditLog = new AuditLog(v11Storage, derived.key);
+      // FIX (N1-1 corrected, 2026-07-27): `flush()` is the documented
+      // contract for durability on short-lived-CLI exit (drains
+      // `pendingWrites`/`appendQueue` and writes the graceful-shutdown
+      // checkpoint -- see AuditLog.flush()'s doc comment), but it was never
+      // registered as a shutdown cleanup. A SIGINT/SIGTERM during the
+      // foreground dashboard serve (the normal way this long-lived process
+      // ends) abandoned any in-flight append and skipped the checkpoint
+      // entirely. `flush()` documents itself as safe to call more than
+      // once, so this is harmless alongside the explicit `flush()` calls on
+      // the normal-completion exit paths below.
+      const flushAuditLogOnShutdown = wrapAuditLog;
+      registerProcessShutdownCleanup(async () => {
+        try {
+          await flushAuditLogOnShutdown.flush();
+        } catch {
+          /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+        }
+      });
       await bestEffortRecordWrapWorkloadRegistration({
         auditLog: wrapAuditLog,
         storagePath,
@@ -3923,6 +3975,24 @@ export async function runWrap(
     console.error(
       `  Run 'sanctuary dashboard' separately to view the dashboard for this fortress.\n`
     );
+    // FIX (N1-2 corrected, 2026-07-27): a declined arm can still leave a
+    // live in-process Castle Wall daemon running (started earlier by
+    // `startCastleWallForWrap`, above). Stop it -- and let its own
+    // `filter_stopped` audit append land -- BEFORE flushing the audit log,
+    // so the close record isn't lost or reordered after the flush. This
+    // can't be left to the process-shutdown cleanup registry: this is a
+    // normal-completion `process.exit(0)`, not a signal, and (per the
+    // signal-handler fix above) even the signal path only just started
+    // awaiting its cleanups -- relying on an unawaited fire-and-forget
+    // `.catch()` here would reproduce the exact truncation bug.
+    if (castleWallDaemon) {
+      unregisterCastleWallCleanup?.();
+      try {
+        await castleWallDaemon.stop();
+      } catch {
+        /* best-effort: an operator decline must still exit cleanly */
+      }
+    }
     if (wrapAuditLog) {
       await wrapAuditLog.flush();
     }
@@ -3956,8 +4026,12 @@ export async function runWrap(
       : {}),
     mode: "wrap",
   });
-  const cleanupRuntime = () => {
-    clearTenantRuntime(storagePath).catch(() => {});
+  const cleanupRuntime = async () => {
+    try {
+      await clearTenantRuntime(storagePath);
+    } catch {
+      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    }
   };
   registerProcessShutdownCleanup(cleanupRuntime);
 

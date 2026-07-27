@@ -94,24 +94,38 @@ import {
   createStandaloneJoinApprover,
 } from "./mesh/lifecycle/index.js";
 
-type StandaloneProcessCleanup = () => void;
+type StandaloneProcessCleanup = () => void | Promise<void>;
 
 const standaloneSignalCleanups = new Set<StandaloneProcessCleanup>();
 const standaloneExitCleanups = new Set<StandaloneProcessCleanup>();
 let standaloneProcessListenersInstalled = false;
 
-function runStandaloneSignalCleanups(): void {
+// FIX (N1-1 corrected, 2026-07-27): same defect as server/src/wrap/cli.ts --
+// every registered cleanup here starts an async operation (tenant-runtime
+// unlink, distress-listener stop, baseline save) without awaiting it, so the
+// synchronous `process.exit()` right after abandoned each one past its
+// first `await`. Await every cleanup to completion (via `Promise.allSettled`
+// so one failing cleanup cannot block the others) before returning.
+async function runStandaloneSignalCleanups(): Promise<void> {
   const cleanups = [...standaloneSignalCleanups];
   standaloneSignalCleanups.clear();
   standaloneExitCleanups.clear();
-  for (const cleanup of cleanups) cleanup();
+  await Promise.allSettled(cleanups.map(async (cleanup) => {
+    await cleanup();
+  }));
 }
 
 function runStandaloneExitCleanups(): void {
   const cleanups = [...standaloneExitCleanups];
   standaloneSignalCleanups.clear();
   standaloneExitCleanups.clear();
-  for (const cleanup of cleanups) cleanup();
+  // Node's `exit` event cannot await async work (the event loop stops
+  // processing microtasks once shutdown begins), so this fires each
+  // cleanup and intentionally does not wait for it -- same limitation the
+  // doc comment above `handleStandaloneShutdownSignal` describes. The
+  // SIGINT/SIGTERM path (`runStandaloneSignalCleanups`, above) is the one
+  // that actually awaits.
+  for (const cleanup of cleanups) void cleanup();
 }
 
 // FIX (N1-1, 2026-07-26): same defect as server/src/wrap/cli.ts -- a
@@ -126,8 +140,10 @@ const STANDALONE_SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
 };
 
 /** Exported for the seam: unit-test the exit code without sending real signals. */
-export function handleStandaloneShutdownSignal(signal: NodeJS.Signals): void {
-  runStandaloneSignalCleanups();
+export async function handleStandaloneShutdownSignal(
+  signal: NodeJS.Signals,
+): Promise<void> {
+  await runStandaloneSignalCleanups();
   process.exit(STANDALONE_SIGNAL_EXIT_CODE[signal] ?? 128);
 }
 
@@ -1290,9 +1306,17 @@ async function wireUnlockedDeps(args: {
     distressListener = undefined;
   }
 
-  const clearRuntime = () => {
-    clearTenantRuntime(config.storage_path).catch(() => {});
-    distressListener?.stop().catch(() => {});
+  const clearRuntime = async () => {
+    try {
+      await clearTenantRuntime(config.storage_path);
+    } catch {
+      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    }
+    try {
+      await distressListener?.stop();
+    } catch {
+      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    }
   };
   registerStandaloneProcessCleanup(clearRuntime, { runOnExit: true });
 
@@ -1358,8 +1382,12 @@ async function wireUnlockedDeps(args: {
   }
 
   // 12. Save baseline on exit
-  const saveBaseline = () => {
-    baseline.save().catch(() => {});
+  const saveBaseline = async () => {
+    try {
+      await baseline.save();
+    } catch {
+      /* best-effort: a shutdown cleanup must not throw out of the signal handler */
+    }
   };
   registerStandaloneProcessCleanup(saveBaseline);
 }

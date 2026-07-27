@@ -268,13 +268,16 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "wrap parser guidance lists supported agent flags",
   },
   {
-    // FIX (N1-3, 2026-07-26): --exclusive-egress / --provision-agent-account
-    // without a provisionable agent selector silently armed nothing; the
-    // refusal names --hermes because it is the ONLY provisionable agent
-    // today, not as leaked agent-specific advice.
+    // FIX (N1-3, 2026-07-26; corrected 2026-07-27): --exclusive-egress /
+    // --provision-agent-account without a provisionable agent selector
+    // silently armed nothing; the refusal names --hermes because it is the
+    // ONLY provisionable agent today, not as leaked agent-specific advice.
+    // The 2026-07-27 fix keys the refusal on the RESOLVED platform rather
+    // than the CLI hint (so auto-detected/`--wrap`-resolved Hermes hosts
+    // aren't wrongly refused), which reworded this literal.
     file: "server/src/wrap/cli.ts",
     scope: "runWrap",
-    snippet: "--hermes. Without it, wrap would proceed as a plain cooperative wrap ",
+    snippet: "--hermes against a Hermes config. Without it, wrap would proceed as a ",
     exact: true,
     expectedCount: 1,
     reason: "the refusal fires only for --exclusive-egress / --provision-agent-account without a provisionable selector; Hermes is the only one today",
