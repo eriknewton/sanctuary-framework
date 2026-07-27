@@ -205,11 +205,33 @@ const SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
   SIGTERM: 128 + 15,
 };
 
+// FIX (N1-1 second-signal, 2026-07-27): `process.on` (not `once`) means a
+// repeat SIGINT/SIGTERM -- the habitual operator response to a process that
+// does not die instantly -- re-enters this handler while the first call is
+// still mid-await on `runProcessShutdownCleanups()`. Without a latch, the
+// second call sees the cleanup set already drained (cleared synchronously by
+// the first call), so its own `Promise.allSettled([])` resolves on the very
+// next microtask and it calls `process.exit()` immediately -- racing ahead
+// of, and abandoning, the first call's in-flight cleanups (audit flush,
+// Castle Wall stop, tenant-runtime unlink). Latch the in-flight promise so a
+// repeat signal joins the SAME run instead of starting a second, empty one;
+// only the call that started the run performs the exit.
+let processShutdownInFlight: Promise<void> | undefined;
+
 /** Exported for the seam: unit-test the exit code without sending real signals. */
 export async function handleProcessShutdownSignal(
   signal: NodeJS.Signals,
 ): Promise<void> {
-  await runProcessShutdownCleanups();
+  if (processShutdownInFlight) {
+    await processShutdownInFlight;
+    return;
+  }
+  processShutdownInFlight = runProcessShutdownCleanups();
+  try {
+    await processShutdownInFlight;
+  } finally {
+    processShutdownInFlight = undefined;
+  }
   process.exit(SIGNAL_EXIT_CODE[signal] ?? 128);
 }
 
@@ -2260,6 +2282,17 @@ export interface RunWrapDeps {
    * daemon-install / arm side effects.
    */
   runAutoProvisionForWrap?: typeof runAutoProvisionForWrap;
+  /**
+   * Override the resolved OS platform used by the `--exclusive-egress` /
+   * `--provision-agent-account` darwin-only refusal (for tests). Production
+   * callers leave this undefined and get the real `node:os` `platform()`.
+   * Auto-provision itself (`wrap/auto-provision.ts:runAutoProvisionForWrap`)
+   * is gated the same way but is NOT test-overridable here -- this seam
+   * exists so a test can deterministically exercise the CLI-level refusal
+   * independent of the CI runner's actual OS, without needing to fake the
+   * full auto-provision darwin gate too.
+   */
+  osPlatform?: () => NodeJS.Platform;
   /** Override dashboard starter (for tests). */
   startDashboard?: DashboardStarter;
   /** Override browser opener (for tests). */
@@ -2406,51 +2439,6 @@ export async function runWrap(
   );
   let agentConfig = detection.config;
 
-  // FIX (N1-3 corrected, 2026-07-27): `sanctuary protect --exclusive-egress`
-  // (or `--provision-agent-account`) without a provisionable agent selected
-  // silently armed NOTHING -- maybeRunAutoProvisionForWrap's early return
-  // (`agentConfig.platform !== "hermes"`) prints nothing, and there was zero
-  // cross-flag validation on these flags. Only Hermes is provisionable
-  // today; refuse loudly rather than quietly performing a plain cooperative
-  // wrap while the operator believes exclusive egress (or account
-  // provisioning) was armed. Fires the same regardless of --dry-run -- a
-  // dry run must not silently omit the same refusal.
-  //
-  // This checks the RESOLVED platform (`agentConfig?.platform`), not the
-  // explicit `--hermes` flag: `platformHint` is only set when the operator
-  // passed a platform selector, but `maybeRunAutoProvisionForWrap` (and the
-  // arming it gates) key on the platform `detectAgentConfigWithDiagnostics`
-  // actually resolves, which auto-detects Hermes with no flag at all (and
-  // resolves Hermes from an explicit `--wrap ~/.hermes/cli-config.json`
-  // too). A hint-only check refused those cases even though the real wrap
-  // flow would have gone on to auto-detect Hermes and arm successfully --
-  // detection is a read-only probe, so hoisting it above this refusal keeps
-  // the "before any wrap work" property (no file writes, no dashboard
-  // start) for hosts that genuinely aren't Hermes.
-  if (
-    (options.exclusiveEgress === true || options.provisionAgentAccount === true) &&
-    agentConfig?.platform !== "hermes"
-  ) {
-    const requestedFlags = [
-      options.exclusiveEgress === true ? "--exclusive-egress" : undefined,
-      options.provisionAgentAccount === true ? "--provision-agent-account" : undefined,
-    ]
-      .filter((flag): flag is string => flag !== undefined)
-      .join(" / ");
-    const platformClause = agentConfig
-      ? `the detected/configured platform is "${agentConfig.platform}"`
-      : "no agent configuration could be found";
-    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
-    console.error(
-      `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
-        `but ${platformClause}. Only Hermes is provisionable today -- re-run with ` +
-        `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
-        `plain cooperative wrap and arm nothing.\n`
-    );
-    process.exit(2);
-    return;
-  }
-
   // If no config file exists for an explicitly-hinted platform, bootstrap an
   // empty one at the canonical (first-listed) path. Wrap then proceeds to
   // inject Sanctuary as the sole entry. First-time operators on a fresh
@@ -2538,6 +2526,87 @@ export async function runWrap(
         console.error(`  Error: ${(err as Error).message}\n`);
         process.exit(1);
       }
+    }
+  }
+
+  // FIX (N1-3 corrected, 2026-07-27): `sanctuary protect --exclusive-egress`
+  // (or `--provision-agent-account`) without a provisionable agent selected
+  // silently armed NOTHING -- maybeRunAutoProvisionForWrap's early return
+  // (`agentConfig.platform !== "hermes"`) prints nothing, and there was zero
+  // cross-flag validation on these flags. Only Hermes is provisionable
+  // today; refuse loudly rather than quietly performing a plain cooperative
+  // wrap while the operator believes exclusive egress (or account
+  // provisioning) was armed. Fires the same regardless of --dry-run -- a
+  // dry run must not silently omit the same refusal.
+  //
+  // This checks the RESOLVED platform (`agentConfig?.platform`), not the
+  // explicit `--hermes` flag: `platformHint` is only set when the operator
+  // passed a platform selector, but `maybeRunAutoProvisionForWrap` (and the
+  // arming it gates) key on the platform `detectAgentConfigWithDiagnostics`
+  // actually resolves, which auto-detects Hermes with no flag at all (and
+  // resolves Hermes from an explicit `--wrap ~/.hermes/cli-config.json`
+  // too).
+  //
+  // FIX (N1-3 placement, 2026-07-27 harden-loop): this check must run AFTER
+  // the fresh-config bootstrap directly above, not before it. Hermes
+  // detection only probes the legacy JSON compat surface
+  // (`~/.hermes/cli-config.json` / `config.json`) -- never the authoritative
+  // `~/.hermes/config.yaml` that v0.16.0 actually routes MCP traffic
+  // through (see the DEBT note above). A first-install/yaml-only Hermes
+  // host therefore has `agentConfig === undefined` on the FIRST detection
+  // call, and only resolves to a Hermes config once the bootstrap block
+  // above has written the compat JSON file and re-detected. Checking before
+  // the bootstrap falsely refused that exact host with "re-run with
+  // --hermes" advice the operator had already followed. Placed here --
+  // after the bootstrap, before the generic "Configuration Not Found"
+  // handler -- `agentConfig` reflects the FINAL resolution, and a genuinely
+  // unresolvable config (no platform hint, or a hint the bootstrap can't
+  // help) still falls through to that handler's better diagnostics
+  // (paths checked, per-path errors) unchanged.
+  if (options.exclusiveEgress === true || options.provisionAgentAccount === true) {
+    const requestedFlags = [
+      options.exclusiveEgress === true ? "--exclusive-egress" : undefined,
+      options.provisionAgentAccount === true ? "--provision-agent-account" : undefined,
+    ]
+      .filter((flag): flag is string => flag !== undefined)
+      .join(" / ");
+    if (agentConfig?.platform !== "hermes") {
+      const platformClause = agentConfig
+        ? `the detected/configured platform is "${agentConfig.platform}"`
+        : "no agent configuration could be found";
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+          `but ${platformClause}. Only Hermes is provisionable today -- re-run with ` +
+          `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
+          `plain cooperative wrap and arm nothing.\n`
+      );
+      process.exit(2);
+      return;
+    }
+    // FIX (N1-3 non-darwin gap, 2026-07-27 harden-loop): the check above
+    // only guards the platform-selector dimension. `runAutoProvisionForWrap`
+    // (auto-provision.ts) ALSO no-ops silently -- `{ ran: false }`, nothing
+    // printed -- on any non-darwin host, D1's v1 scope being darwin-only.
+    // Without this, a non-darwin Hermes host reached the real wrap flow,
+    // auto-provision silently armed nothing, and `printWrapSuccess` still
+    // rendered a success banner with no statement that exclusive egress (or
+    // account provisioning) armed nothing. Refuse loudly here too, before
+    // any wrap work, exactly like the platform-selector case above.
+    // `deps.osPlatform` is a test-only seam (defaults to the real `node:os`
+    // `platform()`) so this deterministically exercises both branches
+    // regardless of the CI runner's actual OS.
+    const resolvedOsPlatform = (deps.osPlatform ?? platform)();
+    if (resolvedOsPlatform !== "darwin") {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary: ${requestedFlags} requires automatic account provisioning ` +
+          `and Castle Wall arming, which are darwin-only today (this host reports ` +
+          `"${resolvedOsPlatform}"). Without it, wrap would proceed as a plain cooperative ` +
+          `wrap and arm nothing.\n`
+      );
+      process.exit(2);
+      return;
     }
   }
 
@@ -3958,48 +4027,33 @@ export async function runWrap(
     autoProvisionSummary,
   });
 
-  // FIX (N1-2, 2026-07-26): when the operator declines the step-2 arm
-  // confirm, the flow used to fall through to the foreground dashboard
-  // serve started above -- the listening dashboard handle holds the event
-  // loop open forever, so a run that declines the arm prompt never returns
-  // (drills needed `kill -9`). The cooperative wrap (config rewrite,
-  // identity, dashboard-backed audit log) already completed and stands
-  // unchanged; only the foreground dashboard serve is skipped. This does
-  // not touch the accept path, any other outcome kind, or the default
-  // interactive dashboard behavior on acceptance.
-  if (
-    autoProvisionSummary.ran &&
-    autoProvisionSummary.outcome?.kind === "declined-by-operator"
-  ) {
-    // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
-    console.error(
-      `  Run 'sanctuary dashboard' separately to view the dashboard for this fortress.\n`
-    );
-    // FIX (N1-2 corrected, 2026-07-27): a declined arm can still leave a
-    // live in-process Castle Wall daemon running (started earlier by
-    // `startCastleWallForWrap`, above). Stop it -- and let its own
-    // `filter_stopped` audit append land -- BEFORE flushing the audit log,
-    // so the close record isn't lost or reordered after the flush. This
-    // can't be left to the process-shutdown cleanup registry: this is a
-    // normal-completion `process.exit(0)`, not a signal, and (per the
-    // signal-handler fix above) even the signal path only just started
-    // awaiting its cleanups -- relying on an unawaited fire-and-forget
-    // `.catch()` here would reproduce the exact truncation bug.
-    if (castleWallDaemon) {
-      unregisterCastleWallCleanup?.();
-      try {
-        await castleWallDaemon.stop();
-      } catch {
-        /* best-effort: an operator decline must still exit cleanly */
-      }
-    }
-    if (wrapAuditLog) {
-      await wrapAuditLog.flush();
-    }
-    await dashboard.stop();
-    process.exit(0);
-    return;
-  }
+  // FIX (N1-2, 2026-07-26; REVERTED 2026-07-27 harden-loop): a prior version
+  // of this fix exited the process whenever `declined-by-operator` was the
+  // outcome, on the premise that falling through to the foreground
+  // dashboard serve "holds the event loop open forever". That premise does
+  // not hold for this outcome kind: `declined-by-operator` is returned by
+  // the provision orchestrator ONLY when `ctx.isTty === true` (a
+  // non-interactive run returns the distinct `skipped-non-tty-cooperative-
+  // only` kind instead, via an earlier check in that same function) --
+  // i.e. this is always a real interactive operator at a terminal, for whom
+  // holding the dashboard open until they stop it is the entire point of
+  // `sanctuary protect`, identical to the accepted-arm path just below.
+  // Exiting here regressed the default interactive case: a bare Enter at
+  // the step-2 confirm (the DEFAULT-N prompt) or the explicit, common
+  // `--no-provision-agent-account` flag both terminated the whole wrap
+  // instead of continuing to serve the dashboard, and skipped
+  // `resolveWrapProtectionClaim` / `printWrapSuccess` entirely -- dropping
+  // the honest protection-state claim, the dashboard URL, and the
+  // passphrase location precisely on the un-armed path where the operator
+  // most needs them. The actual automation blocker this was meant to fix
+  // (a `kill` not terminating the process) is the SIGINT/SIGTERM fix above
+  // (`handleProcessShutdownSignal` now calls `process.exit` after cleanups,
+  // and the Castle Wall daemon started above is already registered via
+  // `registerProcessShutdownCleanup`, so it is torn down on that path
+  // without any special-casing here). Decline is informational only
+  // (`renderAutoProvisionOutcome` above already printed it) and the flow
+  // continues exactly like every other non-arming outcome, matching the
+  // `--no-dashboard` branch's sibling handling of the same outcome kind.
 
   const dashboardUrl = dashboard.createSessionUrl?.() ?? dashboard.url;
 

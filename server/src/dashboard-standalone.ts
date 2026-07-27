@@ -139,11 +139,29 @@ const STANDALONE_SIGNAL_EXIT_CODE: Partial<Record<NodeJS.Signals, number>> = {
   SIGTERM: 128 + 15,
 };
 
+// FIX (N1-1 second-signal, 2026-07-27): same defect as the matching latch in
+// server/src/wrap/cli.ts -- `process.on` (not `once`) lets a repeat
+// SIGINT/SIGTERM re-enter this handler while the first call is still
+// mid-await on `runStandaloneSignalCleanups()`. Without a latch the second
+// call sees the cleanup sets already drained and exits immediately,
+// abandoning the first call's in-flight cleanups. Join the same in-flight
+// run instead of starting a second, empty one.
+let standaloneShutdownInFlight: Promise<void> | undefined;
+
 /** Exported for the seam: unit-test the exit code without sending real signals. */
 export async function handleStandaloneShutdownSignal(
   signal: NodeJS.Signals,
 ): Promise<void> {
-  await runStandaloneSignalCleanups();
+  if (standaloneShutdownInFlight) {
+    await standaloneShutdownInFlight;
+    return;
+  }
+  standaloneShutdownInFlight = runStandaloneSignalCleanups();
+  try {
+    await standaloneShutdownInFlight;
+  } finally {
+    standaloneShutdownInFlight = undefined;
+  }
   process.exit(STANDALONE_SIGNAL_EXIT_CODE[signal] ?? 128);
 }
 

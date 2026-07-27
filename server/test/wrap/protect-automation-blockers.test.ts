@@ -1,18 +1,35 @@
 /**
  * N1: three bounded automation-blocker fixes for `sanctuary protect`
- * (drill record 2026-07-26):
+ * (drill record 2026-07-26), fix 2 corrected 2026-07-27 (harden-loop):
  *
- *   1. SIGINT/SIGTERM handlers must exit after cleanups run. Installing a
- *      signal listener suppresses Node's default "exit on signal" action;
- *      without an explicit `process.exit`, `sanctuary protect` and the
- *      standalone dashboard survived a plain `kill` and drills needed
- *      `kill -9`.
- *   2. When the operator declines the step-2 arm confirm, the flow must not
- *      fall through to the foreground dashboard serve -- the listening
- *      handle held the event loop open forever.
+ *   1. SIGINT/SIGTERM handlers must exit after cleanups run, and a repeat
+ *      signal (a plain listener suppresses Node's default "exit on signal"
+ *      action, and the habitual double Ctrl-C) must join the SAME in-flight
+ *      cleanup run rather than racing ahead with an already-drained,
+ *      trivially-resolved cleanup set. Without the exit, `sanctuary protect`
+ *      and the standalone dashboard survived a plain `kill` and drills
+ *      needed `kill -9`; without the latch, a second signal could abandon
+ *      the first signal's in-flight audit-flush / Castle Wall teardown.
+ *   2. CORRECTED 2026-07-27: a declined step-2 arm confirm must NOT exit
+ *      the process. `declined-by-operator` is only ever returned when the
+ *      run is interactive (a non-interactive run gets the distinct
+ *      `skipped-non-tty-cooperative-only` kind), so this is always a real
+ *      operator at a terminal -- for whom continuing to serve the
+ *      dashboard, exactly like the accepted-arm path, is correct, not a
+ *      hang. The initial fix's exit-on-decline regressed every interactive
+ *      Hermes wrap: a bare Enter at the default-N confirm, or the common
+ *      `--no-provision-agent-account` flag, killed the whole session and
+ *      skipped the protection-claim / dashboard-URL / passphrase-location
+ *      success output. Decline is informational only; the flow now falls
+ *      through exactly like the `--no-dashboard` branch's handling of the
+ *      same outcome kind.
  *   3. `--exclusive-egress` / `--provision-agent-account` without a
  *      provisionable agent selector (Hermes-only today) must refuse loudly
- *      and exit 2, not silently arm nothing.
+ *      and exit 2, not silently arm nothing -- checked AFTER the
+ *      fresh-config bootstrap (so a first-install/yaml-only Hermes host is
+ *      not falsely refused) and ALSO on non-darwin hosts (auto-provision is
+ *      darwin-only and otherwise no-ops silently even when Hermes is the
+ *      resolved platform).
  */
 
 import {
@@ -23,7 +40,7 @@ import {
   it,
   vi,
 } from "vitest";
-import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -86,6 +103,32 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     expect(cleanupSettled).toBe(true);
     expect(exitSpy).toHaveBeenCalledWith(143);
   });
+
+  // FIX (N1-1 second-signal, 2026-07-27 harden-loop): `process.on` (not
+  // `once`) lets a repeat SIGINT/SIGTERM -- the habitual double Ctrl-C --
+  // re-enter this handler while the first call is still mid-await on its
+  // cleanups. Pre-fix, the second call saw the cleanup set already drained
+  // by the first call, so its own `Promise.allSettled([])` resolved
+  // immediately and it called `process.exit()` right away, racing ahead of
+  // the first call's still-in-flight cleanup (abandoning it, same class of
+  // bug the await-fix above closes for a SINGLE signal).
+  it("a repeat signal while cleanups are in flight joins the same run instead of racing ahead", async () => {
+    let cleanupSettled = false;
+    registerProcessShutdownCleanup(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      cleanupSettled = true;
+    });
+
+    const first = handleProcessShutdownSignal("SIGTERM");
+    const second = handleProcessShutdownSignal("SIGINT");
+    await Promise.all([first, second]);
+
+    expect(cleanupSettled).toBe(true);
+    // Only the call that started the run exits; the joining repeat signal
+    // must not race ahead with an empty, already-drained cleanup set.
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(143);
+  });
 });
 
 describe("handleStandaloneShutdownSignal (dashboard-standalone.ts) exits after cleanups", () => {
@@ -110,11 +153,27 @@ describe("handleStandaloneShutdownSignal (dashboard-standalone.ts) exits after c
     await handleStandaloneShutdownSignal("SIGTERM");
     expect(exitSpy).toHaveBeenCalledWith(143);
   });
+
+  // FIX (N1-1 second-signal, 2026-07-27 harden-loop): same latch as
+  // `handleProcessShutdownSignal` above. Without it, two signals fired back
+  // to back each independently race their own (here, trivially empty)
+  // `Promise.allSettled([])` to resolution and BOTH call `process.exit()`
+  // -- the second call's exit racing ahead is exactly the bug class the
+  // latch closes, visible here even with no registered cleanup at all.
+  it("a repeat signal joins the same run instead of both independently calling process.exit", async () => {
+    const first = handleStandaloneShutdownSignal("SIGTERM");
+    const second = handleStandaloneShutdownSignal("SIGINT");
+    await Promise.all([first, second]);
+
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(143);
+  });
 });
 
-// ── Fix 2: declined arm must exit, not hold the dashboard open ──────────
+// ── Fix 2: declined arm must NOT exit -- it's always interactive, so it
+// continues exactly like the accepted-arm path ───────────────────────────
 
-describe("runWrap: declined step-2 arm confirm exits instead of holding the dashboard open", () => {
+describe("runWrap: declined step-2 arm confirm does not exit, matching the accepted-arm path", () => {
   let tmpHome: string;
   let originalHome: string | undefined;
   let originalStoragePath: string | undefined;
@@ -183,7 +242,7 @@ describe("runWrap: declined step-2 arm confirm exits instead of holding the dash
     };
   }
 
-  it("exits 0, stops the already-started dashboard, and points at `sanctuary dashboard` -- does not hold the event loop open", async () => {
+  it("does NOT exit early and does NOT stop the dashboard on a declined arm -- the cooperative wrap still serves normally, and still prints the informational decline line", async () => {
     const stopSpy = vi.fn(async () => {});
     const runAutoProvisionForWrap = vi.fn(
       async (): Promise<AutoProvisionSummary> => ({
@@ -195,12 +254,12 @@ describe("runWrap: declined step-2 arm confirm exits instead of holding the dash
 
     await expect(
       runWrap({ hermes: true, noOpen: true }, deps),
-    ).rejects.toThrow("process.exit:0");
+    ).resolves.toBeUndefined();
 
-    expect(stopSpy).toHaveBeenCalledTimes(1);
-    expect(exitSpy).toHaveBeenCalledWith(0);
+    expect(stopSpy).not.toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
     const printed = stderrSpy.mock.calls.flat().join("\n");
-    expect(printed).toMatch(/sanctuary dashboard/);
+    expect(printed).toMatch(/Account provisioning declined/);
   });
 
   it("does NOT exit early / does NOT stop the dashboard on an accepted arm", async () => {
@@ -334,6 +393,11 @@ describe("runWrap: --exclusive-egress / --provision-agent-account require a prov
           options({ hermes: true, exclusiveEgress: true }),
           {
             runAutoProvisionForWrap,
+            // Pin the resolved OS platform to "darwin" so this deterministically
+            // exercises the non-refusal path regardless of the CI runner's
+            // actual OS (the darwin-only gate is fix N1-3's own check, tested
+            // separately below).
+            osPlatform: () => "darwin",
             resolvePassphrase: async () => ({
               value: "test-passphrase",
               location: "test-keychain",
@@ -372,6 +436,7 @@ describe("runWrap: --exclusive-egress / --provision-agent-account require a prov
           options({ exclusiveEgress: true }),
           {
             runAutoProvisionForWrap,
+            osPlatform: () => "darwin",
             resolvePassphrase: async () => ({
               value: "test-passphrase",
               location: "test-keychain",
@@ -383,6 +448,88 @@ describe("runWrap: --exclusive-egress / --provision-agent-account require a prov
 
       expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
       expect(exitSpy).not.toHaveBeenCalledWith(2);
+    } finally {
+      clearHermesParityHook();
+    }
+  });
+
+  // FIX (N1-3 placement, 2026-07-27 harden-loop): a Hermes host whose ONLY
+  // MCP-routing surface is `~/.hermes/config.yaml` (no legacy
+  // `cli-config.json` -- a fresh v0.16.0 install, or any install that never
+  // had the compat JSON written) must still reach the real wrap flow for
+  // `--hermes --exclusive-egress`. Pre-fix, the refusal ran on the FIRST
+  // `detectAgentConfigWithDiagnostics` call, before the fresh-config
+  // bootstrap that writes the compat JSON and re-detects -- so `agentConfig`
+  // was still undefined at the refusal, and it exited 2 telling the
+  // operator to "re-run with --hermes" when they already had.
+  it("does NOT refuse --hermes --exclusive-egress on a config.yaml-only Hermes host (no cli-config.json yet)", async () => {
+    installHermesParityHook(agreeingHermesParity);
+    try {
+      const hermesDir = join(tmpHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      // Only the authoritative YAML surface exists; no cli-config.json.
+      await writeFile(
+        join(hermesDir, "config.yaml"),
+        "mcp_servers:\n  weather:\n    command: uvx\n    args:\n      - mcp-weather\n",
+      );
+
+      const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+      await expect(
+        runWrap(
+          options({ hermes: true, exclusiveEgress: true }),
+          {
+            runAutoProvisionForWrap,
+            osPlatform: () => "darwin",
+            resolvePassphrase: async () => ({
+              value: "test-passphrase",
+              location: "test-keychain",
+              source: "generated" as const,
+            }),
+          },
+        ),
+      ).resolves.toBeUndefined();
+
+      // Reaches the real wrap flow -- the bootstrap ran and resolved a
+      // hermes config before the refusal check, so it never fired.
+      expect(runAutoProvisionForWrap).toHaveBeenCalledTimes(1);
+      expect(exitSpy).not.toHaveBeenCalledWith(2);
+    } finally {
+      clearHermesParityHook();
+    }
+  });
+
+  // FIX (N1-3 non-darwin gap, 2026-07-27 harden-loop): a resolved Hermes
+  // config on a non-darwin host must ALSO refuse -- auto-provision itself
+  // is darwin-only (`runAutoProvisionForWrap` in auto-provision.ts no-ops
+  // silently on any other platform), so without this the CLI-level refusal
+  // only closed the platform-selector door, leaving the OS door open: a
+  // non-darwin Hermes host reached the real wrap flow, auto-provision armed
+  // nothing, and `printWrapSuccess` still rendered a plain success banner
+  // with no statement that exclusive egress armed nothing.
+  it("refuses --hermes --exclusive-egress on a non-darwin host even though Hermes is the resolved platform", async () => {
+    installHermesParityHook(agreeingHermesParity);
+    try {
+      const hermesDir = join(tmpHome, ".hermes");
+      await mkdir(hermesDir, { recursive: true });
+      await cp(join(fixturesDir, "hermes.json"), join(hermesDir, "cli-config.json"));
+
+      const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+      const startDashboard = vi.fn();
+      await expect(
+        runWrap(
+          options({ hermes: true, exclusiveEgress: true }),
+          { runAutoProvisionForWrap, startDashboard, osPlatform: () => "linux" },
+        ),
+      ).rejects.toThrow("process.exit:2");
+
+      expect(exitSpy).toHaveBeenCalledWith(2);
+      const printed = stderrSpy.mock.calls.flat().join("\n");
+      expect(printed).toContain("--exclusive-egress");
+      expect(printed).toContain("darwin-only");
+      // Refuses BEFORE any state-changing wrap work, exactly like the
+      // platform-selector refusal above.
+      expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
+      expect(startDashboard).not.toHaveBeenCalled();
     } finally {
       clearHermesParityHook();
     }
