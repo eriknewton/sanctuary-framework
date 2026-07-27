@@ -236,9 +236,11 @@ function scopeIsAll(scope: RuleScope | undefined): boolean {
  * evaluation model (the three axes compose as an OR): an empty scope covers
  * every wrapped agent; `uids` naming the agent uid covers it; `agent_ids` /
  * `template_ids` naming the agent's identity cover it. A rule bound ONLY to
- * other uids/ids does not. Deliberately NOT `match.ts:ruleScopeCoversAgent`,
- * which predates the `uids` axis and reads a uids-only scope as "all agents"
- * - conservative for its observe/learn consumer, but exactly wrong here.
+ * other uids/ids does not. Deliberately NOT `match.ts:ruleScopeCoversAgent`:
+ * that check has no uid identity for its subject (observe rows carry no uid
+ * attribution) and treats a uids-only scope as not-covering, whereas this
+ * assertion KNOWS the agent's uid and must treat `uids: [agent_uid]` as
+ * reaching the agent.
  */
 export function allowRuleScopeReachesAgent(
   scope: RuleScope | undefined,

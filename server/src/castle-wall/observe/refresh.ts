@@ -246,9 +246,12 @@ export type RefreshOutcome =
  *   2. AN EXACT UNCONDITIONAL ALLOW EXISTS: an allow rule with no
  *      time_window (conditional allowance never suppresses; the Linux
  *      daemon refuses such manifests outright), whose scope covers this
- *      row's agent (`ruleScopeCoversAgent` -- identical semantics in the
- *      daemon and the macOS filter; the scope-blind proxy allows a
- *      fortiori), and whose destination matches on the axes EVERY enforcer
+ *      row's agent (`ruleScopeCoversAgent` -- shared-axis parity with the
+ *      daemon and the macOS filter, and CONSERVATIVE on the macOS-only
+ *      `uids` axis: a uids-only rule, e.g. an exclusive-routing GATE-scoped
+ *      promoted rule the gate daemon only loads at re-arm, NEVER suppresses
+ *      -- 2026-07-27 fix-round F2, the third recurrence of the self-masking
+ *      shape), and whose destination matches on the axes EVERY enforcer
  *      agrees on: a catch-all destination (no destination axes), an exact
  *      (ASCII-case-insensitive) `host` entry for a hostname-bearing row,
  *      or an exact `ip` entry for an IP-only row. host_pattern and cidr

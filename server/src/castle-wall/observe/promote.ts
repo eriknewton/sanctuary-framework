@@ -158,6 +158,18 @@ export interface PromoteDeps {
    * to coarse.
    */
   routing?: PromoteRouting;
+  /**
+   * Fix-round F5 (marker TOCTOU): re-resolve the fortress's routing
+   * immediately AFTER approval, before anything is published. The Tier-1
+   * approval can block on a human for minutes; an arming or unprotect in
+   * that window flips the routing mode, and rules synthesized under the
+   * stale basis would then be signed with the WRONG scope (agent-reachable
+   * on a now-exclusive fortress, or gate-dead on a now-coarse one). When
+   * provided and the re-resolved routing differs from `routing` (or the
+   * re-resolve throws, e.g. the marker became malformed), the promote
+   * ABORTS with `routing_changed` and publishes nothing.
+   */
+  reresolveRouting?: () => Promise<PromoteRouting>;
 }
 
 export type PromoteDroppedReason = "not_found" | "failed_validation";
@@ -184,9 +196,28 @@ export type PromoteOutcome =
       dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
     }
   | {
+      /**
+       * Fix-round F5: the fortress's routing mode changed (or became
+       * unreadable) between the approval basis and publish. Nothing changed.
+       */
+      status: "routing_changed";
+      reason: string;
+      dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
+    }
+  | {
       status: "promoted";
       promotedKeys: string[];
       addedRules: AllowlistRule[];
+      /**
+       * Fix-round F3 (mode-transition residue): previously-promoted rules
+       * whose id matched a selected candidate but whose SCOPE disagreed with
+       * the current routing resolution, now re-signed with the current-mode
+       * scope (same content-derived id => same match by construction; only
+       * the scope/description are rewritten). Without this, a rule promoted
+       * under one routing mode kept its stale scope forever while re-promote
+       * reported success -- an unrepairable dead or agent-reachable rule.
+       */
+      rewrittenRules: AllowlistRule[];
       dropped: Array<{ key: string; reason: PromoteDroppedReason }>;
       publish: PromotePublishResult;
     };
@@ -257,6 +288,28 @@ export function describeEffectiveRule(match: RuleMatch, scope: RuleScope): strin
 /** Max synthesized-match lines put into the approval context before summarizing the tail. */
 const MAX_APPROVAL_RULE_LINES = 25;
 
+/** Deep equality over the two routing shapes (mode + gate uid). */
+function routingEquals(a: PromoteRouting, b: PromoteRouting): boolean {
+  if (a.mode !== b.mode) return false;
+  return a.mode !== "exclusive" || b.mode !== "exclusive" || a.gate_uid === b.gate_uid;
+}
+
+/**
+ * Order-insensitive scope equality (fix-round F3): normalizes each axis to a
+ * sorted array so `{template_ids:["a","b"]}` equals `{template_ids:["b","a"]}`
+ * and an absent axis equals an empty one. Used to decide whether an existing
+ * same-id rule's scope agrees with the current routing resolution.
+ */
+export function ruleScopesEqual(a: RuleScope | undefined, b: RuleScope | undefined): boolean {
+  const norm = (scope: RuleScope | undefined): string =>
+    JSON.stringify({
+      agent_ids: [...(scope?.agent_ids ?? [])].sort(),
+      template_ids: [...(scope?.template_ids ?? [])].sort(),
+      uids: [...(scope?.uids ?? [])].sort((x, y) => x - y),
+    });
+  return norm(a) === norm(b);
+}
+
 export async function promoteCandidates(
   selection: readonly PromoteSelectionRow[],
   candidatesByKey: ReadonlyMap<string, CandidateObservation>,
@@ -322,6 +375,34 @@ export async function promoteCandidates(
     return { status: "denied", reason: approval.reason ?? "not approved", dropped };
   }
 
+  // ── Post-approval routing re-check (fix-round F5, marker TOCTOU) ────────
+  // The approval can block on a human for minutes; if the fortress's routing
+  // mode changed in that window (an arming wrote the marker, an unprotect
+  // removed it), every rule synthesized above carries the WRONG scope for
+  // the fortress as it now stands. Abort; nothing was published.
+  if (deps.reresolveRouting) {
+    const basisRouting = deps.routing ?? { mode: "coarse" };
+    let routingNow: PromoteRouting;
+    try {
+      routingNow = await deps.reresolveRouting();
+    } catch (error) {
+      return {
+        status: "routing_changed",
+        reason: `the routing mode could not be re-resolved after approval: ${(error as Error).message}`,
+        dropped,
+      };
+    }
+    if (!routingEquals(basisRouting, routingNow)) {
+      return {
+        status: "routing_changed",
+        reason:
+          `the fortress's egress routing changed while approval was pending ` +
+          `(was ${basisRouting.mode}, is now ${routingNow.mode})`,
+        dropped,
+      };
+    }
+  }
+
   // ── Publish-time re-read + verify + compare-and-set (FIX 1 + FIX 2) ─────
   // Re-verify the on-disk manifest AFTER approval (approval may block on
   // human input). If it no longer verifies, or if its digest changed since
@@ -347,16 +428,36 @@ export async function promoteCandidates(
   // Merge: the VERIFIED carry-forward rules first, then the freshly
   // synthesized + validated added rules whose id is not already present.
   // Both sides are trustworthy (currentRules are cryptographically verified;
-  // addedRules are validateRule-clean), and ids are content-derived, so a
-  // collision means identical content -- keeping the existing verified rule
-  // is the safe direction and a synthesized rule can never shadow it.
+  // addedRules are validateRule-clean). Ids are content-derived over the
+  // MATCH inputs (granularity, template/agent, host/ip, port, protocol) but
+  // deliberately NOT over the routing mode, so an id collision means
+  // identical match content -- with possibly a DIFFERENT scope when the
+  // fortress's routing mode changed since the rule was first promoted.
+  //
+  // Fix-round F3 (mode-transition residue): a same-id carry-forward rule
+  // whose scope disagrees with the current routing resolution is REWRITTEN
+  // to the freshly synthesized rule (the human just approved exactly that
+  // effective match+scope in the Tier-1 context above). Silently keeping the
+  // stale rule while reporting success left a template-scoped rule
+  // agent-reachable forever after an exclusive arm (reload-bricking), and a
+  // gate-scoped rule dead forever after a coarse restore -- with no product
+  // path to repair either. A same-id rule whose scope already agrees is kept
+  // as-is (idempotent re-promote).
   const existingIds = new Set(currentRules.map((rule) => rule.id));
   // Defensive: the publish-time set must be digest-equal to the basis, so
   // basisIds and existingIds agree; kept distinct only to make the invariant
   // explicit for a future reader.
   void basisIds;
+  const promotableById = new Map(promotable.map((row) => [row.rule.id, row.rule]));
+  const rewrittenRules: AllowlistRule[] = [];
+  const carriedRules = currentRules.map((existing) => {
+    const fresh = promotableById.get(existing.id);
+    if (!fresh || ruleScopesEqual(existing.scope, fresh.scope)) return existing;
+    rewrittenRules.push(fresh);
+    return fresh;
+  });
   const addedRules = promotable.filter((row) => !existingIds.has(row.rule.id)).map((row) => row.rule);
-  const mergedRules = [...currentRules, ...addedRules];
+  const mergedRules = [...carriedRules, ...addedRules];
   const publishResult = await deps.publish(mergedRules, descriptors);
 
   for (const row of promotable) {
@@ -374,6 +475,7 @@ export async function promoteCandidates(
     status: "promoted",
     promotedKeys: promotable.map((row) => row.key),
     addedRules,
+    rewrittenRules,
     dropped,
     publish: publishResult,
   };

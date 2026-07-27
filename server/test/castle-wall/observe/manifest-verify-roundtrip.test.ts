@@ -118,13 +118,17 @@ describe("readVerifiedManifest: real publisher round-trip + tamper detection (FI
     expect(read.status).toBe("tampered");
   });
 
-  it("dropping a referenced rule file is tampered (missing file), never a silent drop", async () => {
+  it("dropping a referenced rule file is tampered (missing file) WITH a named remedy, never a silent drop or a bare 'unreadable' (F8)", async () => {
     await publish([rule("r-good", "api.example.com")]);
     await rm(join(egressDir, "rules", "r-good.json"));
     const read = await readVerifiedManifest(egressDir, publicKey);
     expect(read.status).toBe("tampered");
     if (read.status !== "tampered") throw new Error("unreachable");
     expect(read.reason).toContain("r-good.json");
+    // Fix-round F8 (remedy discoverability): the refusal names the recovery
+    // path instead of stranding the operator on a generic tamper message.
+    expect(read.reason).toContain("Remedy");
+    expect(read.reason).toContain(join(egressDir, "manifest.json"));
   });
 
   it("a rule file at the LEGACY location (beside manifest.json) is an explicit refusal naming the remedy, never a silent fallback read", async () => {

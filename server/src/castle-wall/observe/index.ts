@@ -53,7 +53,7 @@ export type { SynthesizeCandidateRulesResult, PromoteRouting } from "./synthesiz
 export { ObserveStore } from "./store.js";
 export type { ObserveWriteIdentity } from "./store.js";
 
-export { promoteCandidates, describeEffectiveRule } from "./promote.js";
+export { promoteCandidates, describeEffectiveRule, ruleScopesEqual } from "./promote.js";
 export type {
   PromoteSelectionRow,
   PromotePublishResult,

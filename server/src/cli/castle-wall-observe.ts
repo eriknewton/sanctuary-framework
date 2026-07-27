@@ -69,7 +69,6 @@ import {
 } from "../castle-wall/allowlist/parse.js";
 import {
   ObserveStore,
-  OBSERVE_PROMOTED_RULE_ID_PREFIX,
   promoteCandidates,
   refreshCandidatesFromAudit,
   type CandidateObservation,
@@ -84,6 +83,10 @@ import {
   loadExclusiveRoutingMarker,
   ExclusiveRoutingMarkerError,
 } from "../castle-wall/allowlist/index.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+} from "../egress-gate/operator-advice.js";
 import { loadFortressProducerKey } from "../castle-wall/runtime/producer-signature.js";
 
 /** Same on-disk filenames `runProvisionPin` (cli/castle-wall.ts) establishes under the fortress root. Re-declared here (that module keeps them private) rather than reused, since they are plain filename literals, not secret material. */
@@ -157,6 +160,10 @@ Commands:
                FORCED (requires approval). Approved rules are published
                into the same rule source the enforcement daemons read;
                a running daemon applies them on its next policy reload.
+               On an exclusive-routing fortress the gate daemon applies
+               promoted destinations at the next re-arm (for example
+               ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}), and the
+               destinations stay listed as pending until then.
   discard      Drop selected (or all) candidates without promoting them.
 
 Run "sanctuary castle-wall observe <command> --help" for command-specific options.
@@ -632,9 +639,43 @@ function formatApprovalPrompt(request: ApprovalRequest): string {
 
 export class FilesystemManifestStorage implements ManifestStorage {
   private readonly rulesDir: string;
+  /**
+   * The rule filenames the PREVIOUS promote-owned manifest referenced,
+   * captured from `manifest.json` before this publish overwrites it. This is
+   * the publisher's OWNERSHIP LEDGER (fix-round F4): `listRules` returns only
+   * these files, so `publishSignedManifest`'s orphan-cleanup can only ever
+   * delete a file a previous promote itself published and this publish
+   * stopped referencing. Ownership by MEMBERSHIP, not by name: an
+   * operator-authored file in the shared `rules/` directory survives even if
+   * it happens to be named `derived-observe-*.json`, and provisioning's
+   * `provisioned-<harness>-*` files are structurally untouchable (the
+   * F-REVOKE blanket-scrub class). Absent/unreadable previous manifest =>
+   * owns nothing => cleans nothing (the safe direction).
+   */
+  private previousOwned: Set<string> | null = null;
 
   constructor(private readonly egressDir: string) {
     this.rulesDir = join(egressDir, "rules");
+  }
+
+  private async captureOwnedOnce(): Promise<void> {
+    if (this.previousOwned !== null) return;
+    const owned = new Set<string>();
+    try {
+      const raw = await readFile(join(this.egressDir, "manifest.json"), "utf8");
+      const parsed = JSON.parse(raw) as { manifest?: { rules?: Array<{ file?: unknown }> } };
+      for (const entry of parsed.manifest?.rules ?? []) {
+        if (typeof entry.file === "string" && !entry.file.includes("/") && !entry.file.includes("\\")) {
+          owned.add(entry.file);
+        }
+      }
+    } catch {
+      // No previous manifest (fresh install) or unreadable/corrupt: own
+      // nothing, clean nothing. Promote itself verifies the manifest through
+      // `readVerifiedManifest` and aborts on tamper long before publishing;
+      // this ledger only bounds DELETION and errs toward deleting less.
+    }
+    this.previousOwned = owned;
   }
 
   async writeRule(filename: string, bytes: Uint8Array): Promise<void> {
@@ -649,6 +690,7 @@ export class FilesystemManifestStorage implements ManifestStorage {
     // enforcement path reads, so promoted destinations stayed denied while
     // the CLI reported success. `readVerifiedManifest` reads the same
     // `rules/` location, so the published tree stays self-consistent.
+    await this.captureOwnedOnce();
     await mkdir(this.rulesDir, { recursive: true, mode: 0o700 });
     await writeFile(join(this.rulesDir, filename), bytes, { mode: 0o600 });
   }
@@ -656,6 +698,9 @@ export class FilesystemManifestStorage implements ManifestStorage {
   async atomicRenameManifest(bytes: Uint8Array): Promise<void> {
     // The signed manifest itself stays at `policy/egress/manifest.json`
     // (the location the Linux enforcer and the transparency emitter read).
+    // Capture the previous manifest's membership BEFORE overwriting it (the
+    // zero-rule publish path reaches here without any writeRule call).
+    await this.captureOwnedOnce();
     await mkdir(this.egressDir, { recursive: true, mode: 0o700 });
     const tmpPath = join(
       this.egressDir,
@@ -666,25 +711,15 @@ export class FilesystemManifestStorage implements ManifestStorage {
   }
 
   async listRules(): Promise<string[]> {
-    // Return ONLY the rule files this publisher OWNS: observe-promoted
-    // `derived-observe-*.json` (the prefix is the single source
-    // `OBSERVE_PROMOTED_RULE_ID_PREFIX` that `synthesizeCandidateRule` mints
-    // ids with, so the ownership matcher can never drift from the writer).
-    // The `rules/` directory is SHARED with other producers -- provisioning's
-    // `provisioned-<harness>-*.json` and any operator-authored rule file --
-    // and `publishSignedManifest`'s orphan-cleanup removes every listed file
-    // the new manifest does not reference. Listing the whole directory would
-    // therefore let a promote DELETE the provisioned egress rules out of the
-    // daemon's signing source (the F-REVOKE blanket-scrub class). Scoping the
-    // listing to observe-owned files makes that structurally impossible.
+    // The ownership ledger (see `previousOwned`): only files the PREVIOUS
+    // promote-owned manifest referenced, and only those still present in the
+    // shared rules/ directory. `publishSignedManifest` removes the listed
+    // files its new manifest no longer references -- exactly the
+    // promote-owned delta, nothing else.
+    await this.captureOwnedOnce();
     try {
       const names = await readdir(this.rulesDir);
-      return names.filter(
-        (name) =>
-          name.endsWith(".json") &&
-          name.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX) &&
-          !name.startsWith("."),
-      );
+      return names.filter((name) => this.previousOwned!.has(name));
     } catch (error) {
       if (isEnoent(error)) return [];
       throw error;
@@ -786,6 +821,22 @@ export async function readVerifiedManifest(
               `to abandon it, delete the legacy rule files and manifest.json.`,
           };
         }
+        // Fix-round F8 (remedy discoverability): a promoted rule file deleted
+        // out of rules/ used to surface as a bare "unreadable" tamper with no
+        // way forward. Name the recovery: the promote-owned state is
+        // manifest.json plus the files it references, and resetting it does
+        // not touch enforcement (the daemons compose from the rules directory
+        // itself, which still holds every file you did not delete).
+        return {
+          status: "tampered",
+          reason:
+            `referenced rule file ${entry.file} is missing from ${join(egressDir, "rules")} ` +
+            `(the promote-signed manifest references it, but the file no longer exists). ` +
+            `Remedy: if the deletion was deliberate, delete ${join(egressDir, "manifest.json")} as well ` +
+            `to reset the promote-owned state, then re-promote what you still want; enforcement is ` +
+            `unaffected by that reset (the daemons compose from the rules directory itself). ` +
+            `If it was not deliberate, investigate before promoting again.`,
+        };
       }
       return {
         status: "tampered",
@@ -937,6 +988,26 @@ export async function runObservePromote(
   const boot = await bootstrap(argv, err, env);
   if (!boot) return 1;
 
+  // Resolve the scope routing FIRST (before even looking at the selection): a
+  // malformed exclusive-routing marker refuses the promote outright. The
+  // signing daemon refuses to compose a manifest under an unreadable routing
+  // marker, so promoting into that state could only make the outage wider;
+  // fail closed, never guess a mode (fix-round F7 pins this branch).
+  let routing: PromoteRouting;
+  try {
+    routing = await resolvePromoteRouting(boot.fortressPath);
+  } catch (error) {
+    const reason =
+      error instanceof ExclusiveRoutingMarkerError ? error.message : (error as Error).message;
+    write(
+      err,
+      `Error: could not resolve this fortress's egress routing mode (${reason}). ` +
+        "Nothing was changed. The signing daemon refuses to compose a manifest under an unreadable " +
+        "routing marker, so promoting would not reach enforcement either; repair the marker first.\n",
+    );
+    return 1;
+  }
+
   const candidatesByKey = await boot.observeStore.listCandidates();
   const granularity = granularityFlag as ObserveGranularity | undefined;
   const selection: PromoteSelectionRow[] = [];
@@ -992,25 +1063,6 @@ export async function runObservePromote(
 
   const egressDir = join(boot.fortressPath, "policy", "egress");
 
-  // Resolve the scope routing BEFORE anything else touches policy state: a
-  // malformed exclusive-routing marker refuses the promote outright (the
-  // daemon would refuse to compose under it too; promoting into that state
-  // could only make the outage wider).
-  let routing: PromoteRouting;
-  try {
-    routing = await resolvePromoteRouting(boot.fortressPath);
-  } catch (error) {
-    const reason =
-      error instanceof ExclusiveRoutingMarkerError ? error.message : (error as Error).message;
-    write(
-      err,
-      `Error: could not resolve this fortress's egress routing mode (${reason}). ` +
-        "Nothing was changed. The signing daemon refuses to compose a manifest under an unreadable " +
-        "routing marker, so promoting would not reach enforcement either; repair the marker first.\n",
-    );
-    return 1;
-  }
-
   const pinnedPublicKey = await loadPinnedPublicKey(boot.fortressPath, err);
   if (!pinnedPublicKey) return 1;
 
@@ -1063,6 +1115,10 @@ export async function runObservePromote(
     },
     now: new Date(),
     routing,
+    // Fix-round F5: the Tier-1 approval can block on a human; re-resolve the
+    // marker after it returns so a mode flip in that window aborts instead of
+    // signing rules scoped for the fortress as it no longer is.
+    reresolveRouting: () => resolvePromoteRouting(boot.fortressPath),
   });
 
   if (outcome.status === "no_candidates") {
@@ -1094,25 +1150,59 @@ export async function runObservePromote(
     );
     return 1;
   }
+  if (outcome.status === "routing_changed") {
+    write(
+      err,
+      `Aborted: this fortress's egress routing changed while you were reviewing this promote (${outcome.reason}). ` +
+        "Nothing changed. Re-run `sanctuary castle-wall observe promote` so the rules are scoped for the " +
+        "fortress as it now stands.\n",
+    );
+    return 1;
+  }
 
-  for (const key of outcome.promotedKeys) {
-    await boot.observeStore.removeCandidate(key);
+  // Fix-round F1(b): in EXCLUSIVE mode the promoted candidates stay in the
+  // pending list. The gate daemon loads its destination rules only at arming,
+  // gate denials are not folded into the audit chain, and a removed row would
+  // therefore vanish with nothing to re-mint it -- reporting "done" for a
+  // destination the agent still cannot reach (the original defect's shape).
+  // The row leaves the list when the operator discards it, or is pruned by a
+  // future refresh only when a rule that actually covers the agent's
+  // enforcement path exists.
+  if (routing.mode !== "exclusive") {
+    for (const key of outcome.promotedKeys) {
+      await boot.observeStore.removeCandidate(key);
+    }
   }
 
   write(
     out,
     `Added ${outcome.addedRules.length} allow rule(s). Your wall's manifest was re-signed and republished to the rule source the enforcement daemons read.\n`,
   );
+  if (outcome.rewrittenRules.length > 0) {
+    write(
+      out,
+      `Updated ${outcome.rewrittenRules.length} previously promoted rule(s) whose scope no longer matched this ` +
+        `fortress's routing mode; they were re-signed with the current-mode scope.\n`,
+    );
+  }
   if (routing.mode === "exclusive") {
     write(
       out,
-      "This fortress runs exclusive routing: the new rule(s) are bound to the sanctuary-gate principal, so your agent reaches the approved destination(s) through the gate, never directly.\n",
+      "This fortress runs exclusive routing: the new rule(s) are bound to the sanctuary-gate principal (your agent's only sanctioned off-box path is the gate).\n",
+    );
+    write(
+      out,
+      "IMPORTANT: the running gate daemon loads its destination rules only when the gate is armed, so your agent " +
+        "CANNOT reach the approved destination(s) yet. Re-arm to apply them, for example: " +
+        `${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}. Until then the destination(s) stay listed in ` +
+        "`observe candidates` as pending.\n",
+    );
+  } else {
+    write(
+      out,
+      "Run `sanctuary castle-wall reload` (or restart the daemon) so a running Castle Wall daemon picks up the new rules immediately.\n",
     );
   }
-  write(
-    out,
-    "Run `sanctuary castle-wall reload` (or restart the daemon) so a running Castle Wall daemon picks up the new rules immediately.\n",
-  );
   if (outcome.dropped.length > 0) {
     write(out, `${outcome.dropped.length} row(s) were skipped:\n`);
     for (const dropped of outcome.dropped) write(out, `  ${dropped.key}: ${dropped.reason}\n`);

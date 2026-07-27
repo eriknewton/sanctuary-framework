@@ -88,12 +88,13 @@ export function widenableRegisteredDomain(host: string): string | null {
 }
 
 /**
- * The id prefix EVERY observe-promoted rule carries. Single source shared by
- * `stableCandidateRuleId` below and the CLI's `FilesystemManifestStorage`
- * orphan-cleanup scoping (cli/castle-wall-observe.ts), so the publisher's
- * "which rule files does observe own" matcher can never drift from the ids
- * this module actually mints (a guard must share its matcher with the code
- * it guards).
+ * The id prefix EVERY observe-promoted rule carries (provenance marker,
+ * mirroring provisioning's `provisioned-<harness>-` convention). NOTE
+ * (fix-round F4): this prefix is NOT an ownership claim -- the CLI
+ * publisher's orphan-cleanup owns files by MEMBERSHIP in the previous
+ * promote-signed manifest, never by name, so an operator-authored
+ * `derived-observe-*.json` in the shared rules directory is never deleted
+ * by a promote.
  */
 export const OBSERVE_PROMOTED_RULE_ID_PREFIX = "derived-observe-";
 
