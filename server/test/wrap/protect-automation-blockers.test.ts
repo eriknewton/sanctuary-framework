@@ -40,7 +40,7 @@ import {
   it,
   vi,
 } from "vitest";
-import { cp, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -127,6 +127,38 @@ describe("handleProcessShutdownSignal (wrap/cli.ts) exits after cleanups", () =>
     // Only the call that started the run exits; the joining repeat signal
     // must not race ahead with an empty, already-drained cleanup set.
     expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(143);
+  });
+
+  // FIX (harden-loop, late-registration drop): nothing stops `runWrap`'s
+  // main flow when a signal lands -- it keeps running in the same await
+  // window as the in-flight cleanup drain, and can register a brand-new
+  // cleanup (e.g. the tenant-runtime unlink registered right after
+  // `writeTenantRuntime` resolves) AFTER `runProcessShutdownCleanups` has
+  // already snapshotted-and-cleared the set for its current batch. A
+  // single-pass drain abandons that cleanup: `process.exit()` fires once
+  // the drain returns, and the only other place that would ever run it,
+  // the fire-and-forget `process.on("exit", ...)` listener, cannot
+  // complete async work before the process actually tears down.
+  it("a cleanup registered while a batch is already draining is still awaited before exit, not abandoned", async () => {
+    let firstSettled = false;
+    let lateSettled = false;
+    registerProcessShutdownCleanup(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      firstSettled = true;
+    });
+
+    const signalPromise = handleProcessShutdownSignal("SIGTERM");
+    // Simulates the main flow registering a new cleanup after the drain's
+    // synchronous snapshot-and-clear has already run (the drain is
+    // suspended on `Promise.allSettled` for the first batch at this point).
+    registerProcessShutdownCleanup(async () => {
+      lateSettled = true;
+    });
+    await signalPromise;
+
+    expect(firstSettled).toBe(true);
+    expect(lateSettled).toBe(true);
     expect(exitSpy).toHaveBeenCalledWith(143);
   });
 });
@@ -533,5 +565,64 @@ describe("runWrap: --exclusive-egress / --provision-agent-account require a prov
     } finally {
       clearHermesParityHook();
     }
+  });
+
+  // FIX (harden-loop, dry-run gap): on a FRESH host (no existing
+  // ~/.hermes/cli-config.json), the exclusive-egress refusal used to live
+  // only inside the fresh-config bootstrap's `options.dryRun` early return
+  // as a check against the resolved `agentConfig?.platform` -- which stays
+  // `undefined` on a dry run, since a dry run never writes the bootstrap
+  // file or re-detects. Without this fix, `--dry-run` silently omitted the
+  // refusal a real run would give, printing a clean "Would bootstrap.../Dry
+  // run. No changes made." for a command that refuses when actually run.
+  it("refuses --hermes --exclusive-egress --dry-run on a fresh (no-config) non-darwin host, instead of silently reporting a clean dry-run plan", async () => {
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    const startDashboard = vi.fn();
+    await expect(
+      runWrap(
+        options({ hermes: true, exclusiveEgress: true, dryRun: true }),
+        { runAutoProvisionForWrap, startDashboard, osPlatform: () => "linux" },
+      ),
+    ).rejects.toThrow("process.exit:2");
+
+    expect(exitSpy).toHaveBeenCalledWith(2);
+    const printed = stderrSpy.mock.calls.flat().join("\n");
+    expect(printed).toContain("--exclusive-egress");
+    expect(printed).toContain("darwin-only");
+    // The refusal must preempt the dry-run's own "Would bootstrap.../Dry
+    // run. No changes made." reporting, not run alongside or after it.
+    expect(printed).not.toContain("Would bootstrap");
+    expect(printed).not.toContain("Dry run. No changes made.");
+    expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
+    expect(startDashboard).not.toHaveBeenCalled();
+  });
+
+  // FIX (harden-loop, side-effect-before-refusal): the fresh-config
+  // bootstrap wrote the compat JSON config to disk (and printed
+  // "Bootstrapped a fresh config at ...") BEFORE the resolved-platform
+  // refusal further down ever ran, so a refused, exit-2
+  // `--exclusive-egress` command still left a stub config an operator
+  // never asked for at the canonical path. Assert the refusal now fires
+  // before that write.
+  it("refuses --hermes --exclusive-egress on a fresh (no-config) non-darwin host WITHOUT bootstrapping a config file first", async () => {
+    const runAutoProvisionForWrap = vi.fn(async (): Promise<AutoProvisionSummary> => ({ ran: true }));
+    const startDashboard = vi.fn();
+    await expect(
+      runWrap(
+        options({ hermes: true, exclusiveEgress: true }),
+        { runAutoProvisionForWrap, startDashboard, osPlatform: () => "linux" },
+      ),
+    ).rejects.toThrow("process.exit:2");
+
+    expect(exitSpy).toHaveBeenCalledWith(2);
+    const printed = stderrSpy.mock.calls.flat().join("\n");
+    expect(printed).toContain("--exclusive-egress");
+    expect(printed).toContain("darwin-only");
+    expect(printed).not.toContain("Bootstrapped a fresh config");
+    await expect(
+      stat(join(tmpHome, ".hermes", "cli-config.json")),
+    ).rejects.toThrow();
+    expect(runAutoProvisionForWrap).not.toHaveBeenCalled();
+    expect(startDashboard).not.toHaveBeenCalled();
   });
 });

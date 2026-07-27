@@ -181,14 +181,31 @@ let processShutdownListenersInstalled = false;
 // the process itself now exits. Await every cleanup to completion (via
 // `Promise.allSettled` so one failing cleanup cannot block the others)
 // before returning.
+//
+// FIX (harden-loop, late-registration drop): a single snapshot-clear-drain
+// pass silently abandoned any cleanup registered by `registerProcessShutdown
+// Cleanup` DURING the drain -- nothing here stops `runWrap`'s main flow
+// (there is no "shutting down" flag it checks), so it keeps running in the
+// same await window as this function's `Promise.allSettled`, and can
+// register a brand-new cleanup (e.g. the tenant-runtime unlink registered
+// right after `writeTenantRuntime` resolves) into the Set this function
+// already cleared. That cleanup then sits unawaited: `process.exit()` runs
+// once THIS call returns, and the only other place that would ever run it,
+// `process.on("exit", runProcessShutdownCleanups)`, cannot do async work
+// (Node tears down synchronously once `exit` listeners return), so it is
+// abandoned at its first `await`. Loop until the set is observed empty so
+// any cleanup registered while a previous batch was draining gets picked up
+// by the next iteration instead of orphaned.
 async function runProcessShutdownCleanups(): Promise<void> {
-  const cleanups = [...processShutdownCleanups];
-  processShutdownCleanups.clear();
-  await Promise.allSettled(
-    cleanups.map(async (cleanup) => {
-      await cleanup();
-    }),
-  );
+  while (processShutdownCleanups.size > 0) {
+    const cleanups = [...processShutdownCleanups];
+    processShutdownCleanups.clear();
+    await Promise.allSettled(
+      cleanups.map(async (cleanup) => {
+        await cleanup();
+      }),
+    );
+  }
 }
 
 // FIX (N1-1, 2026-07-26): SIGINT/SIGTERM handlers that only run cleanups
@@ -2439,6 +2456,60 @@ export async function runWrap(
   );
   let agentConfig = detection.config;
 
+  // FIX (harden-loop, side-effect-before-refusal): shared by both the
+  // dry-run branch below and the real (write) branch. Pre-fix, this check
+  // only ran inside the `options.dryRun` early-return, so on a REAL run the
+  // fresh-config bootstrap's `writeFileSafeUnderRoot` (further down) landed
+  // on disk -- and its "Bootstrapped a fresh config at ..." line printed --
+  // BEFORE this refusal could fire, on the exact darwin-only / wrong-
+  // platform-selector cases it's meant to block. That left a stub
+  // `~/.hermes/cli-config.json` (or platform equivalent) an operator never
+  // asked for sitting at the canonical path after a refused, exit-2 command,
+  // which then makes the NEXT run see a "configured" platform and skip the
+  // bootstrap branch entirely. Calling this BEFORE the write makes the
+  // refusal side-effect-free on both paths, matching the PR's own claim
+  // that it fires "before any wrap work (config detection, file writes,
+  // dashboard start)". Uses `platformHint`, not `agentConfig?.platform`:
+  // neither branch has a resolved `agentConfig` yet at this point (that's
+  // the whole reason the bootstrap block exists), and a real run would
+  // bootstrap a config FOR the hinted platform, so `platformHint` is what
+  // `agentConfig?.platform` would become.
+  function refuseUnsupportedExclusiveArmForHint(): boolean {
+    if (options.exclusiveEgress !== true && options.provisionAgentAccount !== true) {
+      return false;
+    }
+    const requestedFlags = [
+      options.exclusiveEgress === true ? "--exclusive-egress" : undefined,
+      options.provisionAgentAccount === true ? "--provision-agent-account" : undefined,
+    ]
+      .filter((flag): flag is string => flag !== undefined)
+      .join(" / ");
+    if (platformHint !== "hermes") {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+          `but the detected/configured platform is "${platformHint}". Only Hermes is provisionable today -- re-run with ` +
+          `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
+          `plain cooperative wrap and arm nothing.\n`
+      );
+      process.exit(2);
+      return true;
+    }
+    const resolvedOsPlatform = (deps.osPlatform ?? platform)();
+    if (resolvedOsPlatform !== "darwin") {
+      // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+      console.error(
+        `\n  Sanctuary: ${requestedFlags} requires automatic account provisioning ` +
+          `and Castle Wall arming, which are darwin-only today (this host reports ` +
+          `"${resolvedOsPlatform}"). Without it, wrap would proceed as a plain cooperative ` +
+          `wrap and arm nothing.\n`
+      );
+      process.exit(2);
+      return true;
+    }
+    return false;
+  }
+
   // If no config file exists for an explicitly-hinted platform, bootstrap an
   // empty one at the canonical (first-listed) path. Wrap then proceeds to
   // inject Sanctuary as the sole entry. First-time operators on a fresh
@@ -2464,6 +2535,16 @@ export async function runWrap(
     // --hermes --dry-run` on a host with no config still created the file.
     // Report what would be bootstrapped and stop before any write path.
     if (canonicalPath && options.dryRun) {
+      // FIX (N1-3 dry-run gap, harden-loop): this early return happens
+      // BEFORE the `--exclusive-egress` / `--provision-agent-account`
+      // refusal further below, which only runs on the resolved
+      // `agentConfig?.platform` -- but a dry run never actually writes the
+      // bootstrap file or re-detects, so `agentConfig` stays undefined and
+      // that refusal is unreachable here. Without this, a dry run against a
+      // fresh (or non-hermes) host prints a clean "Would bootstrap.../Dry
+      // run. No changes made." plan for a command that refuses when run for
+      // real -- exactly the false belief the refusal exists to prevent.
+      if (refuseUnsupportedExclusiveArmForHint()) return;
       // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
       if (hermesYamlExists) {
         // SAFETY: stderr / stdout is the operator-facing CLI channel for this subcommand; no logger module is in scope yet.
@@ -2485,6 +2566,15 @@ export async function runWrap(
       return;
     }
     if (canonicalPath) {
+      // FIX (harden-loop, side-effect-before-refusal): mirror the dry-run
+      // check above BEFORE the write below. Without this, `sanctuary
+      // protect --hermes --exclusive-egress` on a non-darwin host (or
+      // `--cursor --exclusive-egress` with no cursor config) bootstrapped
+      // and printed "Bootstrapped a fresh config at ..." for real, THEN hit
+      // the resolved-platform refusal further down and exited 2 -- leaving
+      // a stub config on disk the operator never had, for a command that
+      // never armed anything.
+      if (refuseUnsupportedExclusiveArmForHint()) return;
       try {
         // Round-3 P1-A: the fresh-config bootstrap used mkdir(recursive) +
         // plain writeFile, both of which follow a symlinked parent (e.g.
@@ -2571,13 +2661,55 @@ export async function runWrap(
       .filter((flag): flag is string => flag !== undefined)
       .join(" / ");
     if (agentConfig?.platform !== "hermes") {
-      const platformClause = agentConfig
-        ? `the detected/configured platform is "${agentConfig.platform}"`
-        : "no agent configuration could be found";
+      if (!agentConfig) {
+        // FIX (N1-3 diagnostics-swallow, harden-loop): this refusal exits
+        // BEFORE the "Configuration Not Found" handler below ever runs, so
+        // that handler's better diagnostics (`detection.pathsChecked`, the
+        // per-path `detection.errors`) and the underlying read error were
+        // silently dropped -- and the fixed "re-run with --hermes" advice
+        // is actively wrong when the operator already gave an explicit
+        // `--wrap <path>` (a typo'd path just gets told to try a flag that
+        // wouldn't change anything) or already passed `--hermes` itself
+        // (whose config the bootstrap above could not resolve). Surface
+        // the diagnostics this check would otherwise swallow, and only
+        // suggest `--hermes` when the operator has not already tried an
+        // explicit selector.
+        const alreadyTriedSelector = options.wrap !== undefined || platformHint === "hermes";
+        let diagnosticsClause = "";
+        if (detection.pathsChecked.length > 0) {
+          diagnosticsClause += `\n\n  Paths checked:\n${detection.pathsChecked
+            .map((p) => `    ${p}`)
+            .join("\n")}`;
+        }
+        if (detection.errors.length > 0) {
+          diagnosticsClause += `\n\n  Errors encountered:\n${detection.errors
+            .map((e) => `    ${e.path}: ${e.error}`)
+            .join("\n")}`;
+        }
+        const notFoundClause = "no agent configuration could be found";
+        if (alreadyTriedSelector) {
+          // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+          console.error(
+            `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+              `but ${notFoundClause}. Only Hermes is provisionable today. Without it, ` +
+              `wrap would proceed as a plain cooperative wrap and arm nothing.${diagnosticsClause}\n`
+          );
+        } else {
+          // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
+          console.error(
+            `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
+              `but ${notFoundClause}. Only Hermes is provisionable today -- re-run with ` +
+              `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
+              `plain cooperative wrap and arm nothing.${diagnosticsClause}\n`
+          );
+        }
+        process.exit(2);
+        return;
+      }
       // SAFETY: stderr is the operator-facing CLI channel for this subcommand.
       console.error(
         `\n  Sanctuary: ${requestedFlags} requires a provisionable agent selector, ` +
-          `but ${platformClause}. Only Hermes is provisionable today -- re-run with ` +
+          `but the detected/configured platform is "${agentConfig.platform}". Only Hermes is provisionable today -- re-run with ` +
           `--hermes against a Hermes config. Without it, wrap would proceed as a ` +
           `plain cooperative wrap and arm nothing.\n`
       );

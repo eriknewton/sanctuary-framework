@@ -29,6 +29,7 @@
 import { platform as osPlatform } from "node:os";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { unlinkSync } from "node:fs";
 import {
   mkdir,
   rename,
@@ -2877,18 +2878,57 @@ function realParkedInstallRevertOps(daemonOps: HarnessDaemonOps): ParkedInstallR
   };
 }
 
+// FIX (N1-4, harden-loop): `handleProcessShutdownSignal` (wrap/cli.ts) now
+// calls `process.exit()` once its REGISTERED shutdown cleanups finish, but
+// nothing registers a cleanup that releases the provision lock -- and
+// `withProvisionLock`'s `finally` release (lockfile.ts) never runs because
+// `process.exit()` unwinds past it, not through it. A SIGINT/SIGTERM during
+// provisioning (account create, secret re-home, pf arm, release-barrier
+// sequence -- all mid-flow, all awaiting) therefore stranded
+// `/var/run/sanctuary-provision.lock` permanently: every subsequent
+// `protect --exclusive-egress`, `--repair-egress-gate`, and
+// `--unprotect-egress-gate` (which takes the SAME lock via
+// `withUnprotectLock` -> `withProvisionLock`) throws `ProvisionLockHeldError`
+// until an operator manually deletes the file or reboots -- removing the
+// product's own recovery verb after a half-armed exclusive gate. Node's
+// `exit` event fires synchronously even when `process.exit()` is called
+// mid-flight (no async work survives it, matching the same limitation the
+// standalone-dashboard exit-cleanup fallback documents), so a plain
+// `unlinkSync` registered here closes the gap without any new async
+// cleanup-registration plumbing (which would need to reach across from this
+// module into wrap/cli.ts's shutdown-cleanup registry and risk a circular
+// import: cli.ts already imports FROM this module).
 function realLockOps() {
+  let heldLockPath: string | undefined;
+  let exitFallbackInstalled = false;
+
+  function installExitFallback(): void {
+    if (exitFallbackInstalled) return;
+    exitFallbackInstalled = true;
+    process.on("exit", () => {
+      if (heldLockPath === undefined) return;
+      try {
+        unlinkSync(heldLockPath);
+      } catch {
+        /* best-effort: an exit-time fallback must not throw past `exit` */
+      }
+    });
+  }
+
   return {
     acquire: async (lockPath: string): Promise<void> => {
       const { open } = await import("node:fs/promises");
       const handle = await open(lockPath, "wx");
       await handle.close();
+      heldLockPath = lockPath;
+      installExitFallback();
     },
     release: async (lockPath: string): Promise<void> => {
       const { unlink } = await import("node:fs/promises");
       await unlink(lockPath).catch((err) => {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       });
+      if (heldLockPath === lockPath) heldLockPath = undefined;
     },
   };
 }

@@ -275,12 +275,40 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     // The 2026-07-27 fix keys the refusal on the RESOLVED platform rather
     // than the CLI hint (so auto-detected/`--wrap`-resolved Hermes hosts
     // aren't wrongly refused), which reworded this literal.
+    //
+    // FIX (N1-3 dry-run + diagnostics-swallow, harden-loop): the same
+    // refusal now ALSO fires (a) before the fresh-config bootstrap's own
+    // dry-run early return, so `--dry-run` cannot silently omit it, and
+    // (b) in the genuinely-unresolvable-config case, where it used to
+    // swallow the "Configuration Not Found" handler's diagnostics -- three
+    // occurrences of the same literal across the one provisionable-agent
+    // gate in `runWrap`, not three independent refusals. FIX (harden-loop,
+    // side-effect-before-refusal): the dry-run-branch occurrence and a
+    // twin check placed just before the fresh-config bootstrap's write are
+    // now the SAME call, factored into `refuseUnsupportedExclusiveArmForHint`
+    // (own scope below) so the write path can't apply a refusal the dry-run
+    // path doesn't share (or vice versa) -- leaving 2 remaining inline
+    // occurrences directly in `runWrap` (the resolved-config cases).
     file: "server/src/wrap/cli.ts",
     scope: "runWrap",
     snippet: "--hermes against a Hermes config. Without it, wrap would proceed as a ",
     exact: true,
+    expectedCount: 2,
+    reason: "the refusal fires only for --exclusive-egress / --provision-agent-account without a provisionable selector; Hermes is the only one today -- checked post-bootstrap (resolved config) and in the no-selector-tried config-not-found case; the pre-bootstrap (dry-run + pre-write) check lives in refuseUnsupportedExclusiveArmForHint below",
+  },
+  {
+    // FIX (harden-loop, side-effect-before-refusal): shared helper called
+    // from BOTH the dry-run early-return and immediately before the
+    // fresh-config bootstrap's real write, so a refused
+    // --exclusive-egress / --provision-agent-account never leaves a stub
+    // config file on disk (or a "Bootstrapped a fresh config at ..." print)
+    // the operator never asked for.
+    file: "server/src/wrap/cli.ts",
+    scope: "refuseUnsupportedExclusiveArmForHint",
+    snippet: "--hermes against a Hermes config. Without it, wrap would proceed as a ",
+    exact: true,
     expectedCount: 1,
-    reason: "the refusal fires only for --exclusive-egress / --provision-agent-account without a provisionable selector; Hermes is the only one today",
+    reason: "the refusal fires only for --exclusive-egress / --provision-agent-account without a provisionable selector; Hermes is the only one today -- this is the single pre-bootstrap check shared by the dry-run and real-write paths",
   },
   {
     file: "server/src/wrap/cli.ts",
