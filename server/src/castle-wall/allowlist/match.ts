@@ -185,15 +185,20 @@ export function allowlistAllowsTarget(rules: AllowlistRule[], target: CanonicalC
 }
 
 /**
- * Does this rule's SCOPE apply to the given agent? Byte-for-byte parity with
- * the enforcing Rust daemon's `RuleScope::applies_to`
- * (castle-wall-daemon/src/policy.rs): an empty scope (no agent_ids and no
- * template_ids) applies to every wrapped agent; otherwise the agent matches
- * when EITHER its instance id is in agent_ids OR its template is in
- * template_ids. (NOTE: the in-process CONNECT proxy's `ruleMatchesTarget`
- * path deliberately does not evaluate scope -- the proxy has no per-flow
- * agent attribution; the daemon does, and any consumer reasoning about "is
- * this flow allowed for THIS agent" must use this check.)
+ * Does this rule's SCOPE apply to the given agent? Follows the enforcing
+ * Rust daemon's `RuleScope::applies_to` (castle-wall-daemon/src/policy.rs)
+ * on the axes both sides share: a fully-empty scope applies to every wrapped
+ * agent; otherwise the agent matches when EITHER its instance id is in
+ * agent_ids OR its template is in template_ids. The macOS-only `uids` axis
+ * (which the Rust daemon fail-closed refuses outright) is handled
+ * CONSERVATIVELY for this consumer: a uids-only scope does NOT cover the
+ * agent, because this check's callers attribute rows by (agent_id,
+ * agent_template) with no uid attribution and so cannot distinguish the
+ * agent's own uid from another principal's (see the F2 note in the body).
+ * (NOTE: the in-process CONNECT proxy's `ruleMatchesTarget` path
+ * deliberately does not evaluate scope -- the proxy has no per-flow agent
+ * attribution; the daemon does, and any consumer reasoning about "is this
+ * flow allowed for THIS agent" must use this check.)
  */
 export function ruleScopeCoversAgent(
   scope: RuleScope,
@@ -201,7 +206,22 @@ export function ruleScopeCoversAgent(
 ): boolean {
   const scopedByAgent = (scope.agent_ids?.length ?? 0) > 0;
   const scopedByTemplate = (scope.template_ids?.length ?? 0) > 0;
-  if (!scopedByAgent && !scopedByTemplate) return true;
+  const scopedByUids = (scope.uids?.length ?? 0) > 0;
+  // 2026-07-27 fix-round F2: a scope carrying ONLY the `uids` axis does NOT
+  // cover the agent here. This consumer reasons about rows attributed by
+  // (agent_id, agent_template) with NO uid attribution, so it cannot tell a
+  // uid-scoped rule that names the agent's own uid from one that names a
+  // DIFFERENT principal -- and the product's gate-scoped rules
+  // (`scope.uids = [gate_uid]`, exclusive routing) are exactly the latter:
+  // an allow the AGENT's kernel path never gets and the gate daemon only
+  // loads at re-arm. Reading uids-only as "all agents" (the pre-fix
+  // behavior) made the observe refresh suppress a candidate as "already
+  // allowed" while the destination stayed denied for the agent: the
+  // self-masking direction. Returning false only ever KEEPS a candidate
+  // visible (conservative). A scope that ALSO names the agent on the
+  // agent_ids/template_ids axes still covers it through those axes (the
+  // axes compose as an OR at enforcement).
+  if (!scopedByAgent && !scopedByTemplate && !scopedByUids) return true;
   if (scopedByAgent && scope.agent_ids!.includes(agent.agent_id)) return true;
   if (scopedByTemplate && scope.template_ids!.includes(agent.agent_template)) return true;
   return false;

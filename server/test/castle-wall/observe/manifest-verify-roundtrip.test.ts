@@ -108,8 +108,9 @@ describe("readVerifiedManifest: real publisher round-trip + tamper detection (FI
 
   it("editing a referenced rule file's bytes after signing is tampered (sha256 mismatch)", async () => {
     await publish([rule("r-good", "api.example.com")]);
-    // The rule file lives next to manifest.json as `<id>.json`.
-    const ruleFile = join(egressDir, "r-good.json");
+    // The rule file lives in the enforcement rule source `rules/<id>.json`
+    // (2026-07-27 enforcement-reach fix, Option A).
+    const ruleFile = join(egressDir, "rules", "r-good.json");
     const original = JSON.parse(await readFile(ruleFile, "utf8")) as AllowlistRule;
     original.match = { host_pattern: "*", port: [443], protocol: "tcp" }; // widen to everything
     await writeFile(ruleFile, JSON.stringify(original));
@@ -117,13 +118,37 @@ describe("readVerifiedManifest: real publisher round-trip + tamper detection (FI
     expect(read.status).toBe("tampered");
   });
 
-  it("dropping a referenced rule file is tampered (missing file), never a silent drop", async () => {
+  it("dropping a referenced rule file is tampered (missing file) WITH a named remedy, never a silent drop or a bare 'unreadable' (F8)", async () => {
     await publish([rule("r-good", "api.example.com")]);
-    await rm(join(egressDir, "r-good.json"));
+    await rm(join(egressDir, "rules", "r-good.json"));
     const read = await readVerifiedManifest(egressDir, publicKey);
     expect(read.status).toBe("tampered");
     if (read.status !== "tampered") throw new Error("unreachable");
     expect(read.reason).toContain("r-good.json");
+    // Fix-round F8 (remedy discoverability): the refusal names the recovery
+    // path instead of stranding the operator on a generic tamper message.
+    expect(read.reason).toContain("Remedy");
+    expect(read.reason).toContain(join(egressDir, "manifest.json"));
+  });
+
+  it("a rule file at the LEGACY location (beside manifest.json) is an explicit refusal naming the remedy, never a silent fallback read", async () => {
+    // Reproduce a pre-2026-07-27 fortress: the manifest references a rule
+    // whose file sits BESIDE manifest.json (the location the defective
+    // promote wrote to, which no enforcement path reads).
+    await publish([rule("r-good", "api.example.com")]);
+    const inRules = join(egressDir, "rules", "r-good.json");
+    const legacy = join(egressDir, "r-good.json");
+    await writeFile(legacy, await readFile(inRules));
+    await rm(inRules);
+
+    const read = await readVerifiedManifest(egressDir, publicKey);
+    expect(read.status).toBe("tampered");
+    if (read.status !== "tampered") throw new Error("unreachable");
+    // The refusal names the legacy location AND the remedy, so the operator
+    // is never left staring at a generic "unreadable file" tamper message.
+    expect(read.reason).toContain("LEGACY location");
+    expect(read.reason).toContain(legacy);
+    expect(read.reason).toContain(join(egressDir, "rules"));
   });
 
   it("corrupting the manifest JSON is tampered", async () => {

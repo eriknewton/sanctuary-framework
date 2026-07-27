@@ -11,7 +11,11 @@ import { decrypt, encrypt, type EncryptedPayload } from "../../core/encryption.j
 import type { AuditLog } from "../../operational/audit-log.js";
 import type { AllowlistRule } from "../allowlist/schema.js";
 import { validateRule } from "../allowlist/schema.js";
-import { composeEffectiveRules } from "../allowlist/habeas-port.js";
+import {
+  composeEffectiveRules,
+  HABEAS_RULE_ID_PREFIX,
+  isGenuineDerivedHabeasRule,
+} from "../allowlist/habeas-port.js";
 import { composeExclusiveRoutingRules } from "../allowlist/exclusive-routing.js";
 import { loadExclusiveRoutingMarker } from "../allowlist/routing-marker.js";
 import { collectSystemResolvers } from "./system-resolvers.js";
@@ -389,7 +393,8 @@ export interface MacOSCastleWallDaemonHandle {
   stop(): Promise<void>;
 }
 
-interface ManifestState {
+/** The composed + signed manifest state `loadManifestState` produces. */
+export interface ManifestState {
   signed: SignedManifest;
   rules: AllowlistRule[];
 }
@@ -1939,7 +1944,23 @@ async function assertGlobalPinMatchesLiveKey(
   }
 }
 
-async function loadManifestState(input: {
+/**
+ * THE manifest composer: read every rule file from the fortress's
+ * `policy/egress/rules/` directory (the one true rule source -- promotion,
+ * provisioning, and operator-authored rules all publish there), compose the
+ * effective ruleset (habeas lanes, derived DNS, gate rule, and the
+ * exclusive-routing assertion when the routing marker is present), and sign
+ * the result. This is the daemon's ONLY manifest production path, for both
+ * the initial load and every reload.
+ *
+ * Exported (2026-07-27) so the observe/promote enforcement-reach end-to-end
+ * test can assert against the REAL composer the daemon runs, not a
+ * test-local reimplementation of its read half -- the original defect
+ * shipped precisely because the only round-trip test paired the promote
+ * writer with the promote module's own reader while no enforcement path read
+ * that location. Production callers remain inside this module.
+ */
+export async function loadManifestState(input: {
   fortressPath: string;
   fortressId: string;
   signer: DaemonSigner;
@@ -1976,6 +1997,21 @@ async function loadManifestState(input: {
     const issues = validateRule(parsed);
     if (issues.length > 0) {
       throw new Error(`rule ${filename} invalid: ${issues.join("; ")}`);
+    }
+    // Round-4 C2: the observe promote publishes the genuine derived habeas
+    // lane INTO its signed manifest (the Linux daemon's composed-manifest
+    // gate requires exactly one), which necessarily places the lane's rule
+    // FILE in this directory (a manifest entry must resolve at
+    // rules/<file> for the Rust loader). This composer derives its OWN
+    // lanes and treats everything here as operator input, so a byte-GENUINE
+    // lane file (the shipped exact-shape recognizer, never id-trust or the
+    // `derived` flag) is skipped as the known cross-platform artifact --
+    // semantically a dedup, never a widening: the injected lane is
+    // identical. A file that merely CLAIMS a habeas id still flows through
+    // and is rejected by the reserved-namespace firewall
+    // (`findHabeasConflicts`), fail-closed, unchanged.
+    if (parsed.id.startsWith(HABEAS_RULE_ID_PREFIX) && isGenuineDerivedHabeasRule(parsed)) {
+      continue;
     }
     rules.push(parsed);
   }

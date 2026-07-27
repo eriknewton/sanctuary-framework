@@ -75,8 +75,14 @@ export type {
   ConnectivityVerifyResult,
 } from "./verify.js";
 
-export { withProvisionLock, ProvisionLockHeldError, PROVISION_LOCK_PATH } from "./lockfile.js";
-export type { ProvisionLockOps } from "./lockfile.js";
+export {
+  withProvisionLock,
+  ProvisionLockHeldError,
+  PROVISION_LOCK_PATH,
+  egressPolicyWriterLock,
+  EGRESS_POLICY_WRITER_LOCK_FILE,
+} from "./lockfile.js";
+export type { ProvisionLockOps, EgressPolicyWriterLock } from "./lockfile.js";
 
 export { unprovision, unprovisionFullyOk } from "./unprovision.js";
 export type {

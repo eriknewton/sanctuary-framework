@@ -29,6 +29,7 @@ export { flowEventsFromAuditEntries, flowEventFromAuditEntry } from "./adapter.j
 export {
   refreshCandidatesFromAudit,
   candidateCurrentlyAllowed,
+  candidatePromotedAwaitingRearm,
   inProcessRefreshLock,
 } from "./refresh.js";
 export type {
@@ -44,15 +45,16 @@ export {
   naiveRegisteredDomain,
   widenableRegisteredDomain,
   REFUSED_MULTI_LABEL_PUBLIC_SUFFIXES,
+  OBSERVE_PROMOTED_RULE_ID_PREFIX,
   synthesizeCandidateRule,
   synthesizeCandidateRules,
 } from "./synthesize.js";
-export type { SynthesizeCandidateRulesResult } from "./synthesize.js";
+export type { SynthesizeCandidateRulesResult, PromoteRouting } from "./synthesize.js";
 
 export { ObserveStore } from "./store.js";
 export type { ObserveWriteIdentity } from "./store.js";
 
-export { promoteCandidates, describeEffectiveRule } from "./promote.js";
+export { promoteCandidates, describeEffectiveRule, ruleScopesEqual } from "./promote.js";
 export type {
   PromoteSelectionRow,
   PromotePublishResult,

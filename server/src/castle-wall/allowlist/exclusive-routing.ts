@@ -76,6 +76,7 @@
  * as-gate-uid / as-agent-uid legs, never this library.
  */
 
+import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 import type { AllowlistRule, RuleScope } from "./schema.js";
 import {
   DERIVED_GATE_RULE_ID,
@@ -236,9 +237,11 @@ function scopeIsAll(scope: RuleScope | undefined): boolean {
  * evaluation model (the three axes compose as an OR): an empty scope covers
  * every wrapped agent; `uids` naming the agent uid covers it; `agent_ids` /
  * `template_ids` naming the agent's identity cover it. A rule bound ONLY to
- * other uids/ids does not. Deliberately NOT `match.ts:ruleScopeCoversAgent`,
- * which predates the `uids` axis and reads a uids-only scope as "all agents"
- * - conservative for its observe/learn consumer, but exactly wrong here.
+ * other uids/ids does not. Deliberately NOT `match.ts:ruleScopeCoversAgent`:
+ * that check has no uid identity for its subject (observe rows carry no uid
+ * attribution) and treats a uids-only scope as not-covering, whereas this
+ * assertion KNOWS the agent's uid and must treat `uids: [agent_uid]` as
+ * reaching the agent.
  */
 export function allowRuleScopeReachesAgent(
   scope: RuleScope | undefined,
@@ -385,15 +388,29 @@ export function assertExclusiveRoutingComposition(
     // 4. Direct off-box allow: agent-reachable => violation (this includes
     // the derived DNS rule when its parent union reaches the agent).
     if (allowRuleScopeReachesAgent(rule.scope, principals)) {
+      // 2026-07-27 round-3 R3(ii): an observe-PROMOTED rule with a
+      // pre-exclusive (template/agent) scope has a PRODUCT recovery path;
+      // name it here, because this error is exactly what the operator sees
+      // when a coarse-era promoted rule bricks the exclusive compose, and
+      // the generic residue advice ("republish the provisioned rules")
+      // does not apply to it.
+      const observeRemedy = rule.id.startsWith(OBSERVE_PROMOTED_RULE_ID_PREFIX)
+        ? " Remedy: if this rule was promoted by 'observe promote' before exclusive routing was armed," +
+          " run 'sanctuary castle-wall observe promote --all' on this fortress (it re-scopes promoted" +
+          " rules ITS OWN signed manifest owns to the gate principal, under the same Tier-1 approval," +
+          " even with no pending candidates). An OPERATOR-AUTHORED rule file that merely carries this" +
+          " id prefix is not promote-owned and must be re-scoped or removed manually" +
+          " (delete its file from policy/egress/rules/)."
+        : "";
       violations.push({
         rule_id: rule.id,
         reason:
-          rule.id === DERIVED_DNS_RULE_ID
+          (rule.id === DERIVED_DNS_RULE_ID
             ? "the derived DNS allow's parent-scope union reaches the agent " +
               "(an agent-reachable hostname allow exists; the agent must have NO direct DNS - the gate resolves)"
             : scopeIsAll(rule.scope)
               ? "unscoped allow (scope: {} covers every wrapped agent) grants the agent a direct off-box endpoint"
-              : "scope covers the confined agent (uids/agent_ids/template_ids axis names it)",
+              : "scope covers the confined agent (uids/agent_ids/template_ids axis names it)") + observeRemedy,
       });
       continue;
     }
