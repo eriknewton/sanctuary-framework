@@ -58,7 +58,7 @@
  *
  * Secrets NEVER go into the plist: /Library/LaunchDaemons plists are
  * root-owned but world-readable (0644). The renderer rejects any attempt to
- * embed SANCTUARY_PASSPHRASE / SANCTUARY_RECOVERY_KEY.
+ * embed direct Sanctuary secrets or proxy variables that may carry credentials.
  */
 
 import { spawnSync } from "node:child_process";
@@ -92,10 +92,18 @@ const CASTLE_GLOBAL_PINNED_PUBKEY_PATH =
 const SAFE_NAME_RE = /^[a-zA-Z0-9._-]+$/;
 /**
  * Env names that must never be rendered into a LaunchDaemon plist. The plist
- * is world-readable; embedding either of these would leak the master secret
- * to every local user (hard constraint #6 adjacent).
+ * is world-readable; these may carry master or proxy credentials.
  */
-export const FORBIDDEN_PLIST_ENV = ["SANCTUARY_PASSPHRASE", "SANCTUARY_RECOVERY_KEY"];
+export const FORBIDDEN_PLIST_ENV = [
+  "SANCTUARY_PASSPHRASE",
+  "SANCTUARY_RECOVERY_KEY",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "https_proxy",
+  "http_proxy",
+];
+
+const CREDENTIALED_URL_VALUE_RE = /:\/\/[^/@\s]*:[^/@\s]*@/;
 
 export interface ExecFileResult {
   code: number;
@@ -259,6 +267,14 @@ function assertNoControlChars(value: string, what: string): void {
   }
 }
 
+function assertNoCredentialedPlistValue(name: string, value: string): void {
+  if (CREDENTIALED_URL_VALUE_RE.test(value)) {
+    throw new Error(
+      `Refusing to embed ${name} value containing URL credentials in a world-readable LaunchDaemon plist.`,
+    );
+  }
+}
+
 export interface BootPlistOptions {
   /**
    * Full argv the daemon runs as, e.g.
@@ -346,6 +362,7 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
   }
   for (const arg of opts.programArguments) {
     assertNoControlChars(arg, "program argument");
+    assertNoCredentialedPlistValue("program argument", arg);
   }
   if (!opts.programArguments.includes("--safe-mode")) {
     // Fail-closed: the boot service must come up in safe mode (boot token only,
@@ -410,6 +427,9 @@ export function renderBootLaunchDaemonPlist(opts: BootPlistOptions): string {
         `Refusing to embed ${name} in a world-readable LaunchDaemon plist.`,
       );
     }
+  }
+  for (const [name, value] of envEntries) {
+    assertNoCredentialedPlistValue(name, value);
   }
 
   const argsXml = opts.programArguments

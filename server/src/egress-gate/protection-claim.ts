@@ -2,7 +2,11 @@ import {
   exclusiveEgressCapsAggregateGreen,
   type ExclusiveEgressStatus,
 } from "./posture.js";
-import { GENERIC_UID_CONFINEMENT_REMEDY } from "./operator-advice.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+  GENERIC_UID_CONFINEMENT_REMEDY,
+} from "./operator-advice.js";
 
 /**
  * Protection-copy chokepoint for the wrap success banner and legacy dashboard
@@ -227,7 +231,8 @@ export function protectionStateAdvice(
   const inspectImperative =
     "Run 'sanctuary castle-wall status' to inspect live enforcement before relying on this wrap.";
   const repairImperative =
-    "Run 'sudo sanctuary protect --repair-egress-gate' to repair fine-grained exclusive egress.";
+    `Run '${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}) ` +
+    "to repair fine-grained exclusive egress.";
   switch (claim.state) {
     case "exclusive":
       return {

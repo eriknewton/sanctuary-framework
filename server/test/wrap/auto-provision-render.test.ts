@@ -8,9 +8,16 @@
  * decision is driven directly here.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { renderAutoProvisionOutcomeLines } from "../../src/wrap/cli.js";
-import { describeNoAccountResidueTeardown, type AutoProvisionSummary } from "../../src/wrap/auto-provision.js";
+import {
+  describeNoAccountResidueTeardown,
+  describeStandDownAgentForCli,
+  ensureStandDownAgentAcknowledgedForCli,
+  runEgressGateRepairForCli,
+  runEgressGateUnprotectForCli,
+  type AutoProvisionSummary,
+} from "../../src/wrap/auto-provision.js";
 import {
   assessHarnessParked,
   startedCoarseDisposition,
@@ -313,6 +320,78 @@ describe("wrap/cli renderAutoProvisionOutcomeLines", () => {
     expect(out[0]).toMatch(/restore of your re-homed files FAILED/);
     expect(out[0]).toContain("/var/root/x.bak");
     expect(out[0]).toContain("/Users/op/.hermes/.env.restored-conflict");
+  });
+});
+
+describe("describeStandDownAgentForCli", () => {
+  it("plainly says the repair flag acknowledges the required agent stop", () => {
+    const line = describeStandDownAgentForCli("--repair-egress-gate");
+    expect(line).toContain("--repair-egress-gate --stand-down-agent");
+    expect(line).toContain("acknowledged operator opt-in");
+    expect(line).toContain("stop and disable the agent harness");
+  });
+
+  it("refuses repair/unprotect when the required stand-down acknowledgement is absent", () => {
+    const printed: string[] = [];
+    const ok = ensureStandDownAgentAcknowledgedForCli(
+      undefined,
+      (line) => printed.push(line),
+      "--unprotect-egress-gate",
+    );
+    expect(ok).toBe(false);
+    expect(printed.join("\n")).toContain("--unprotect-egress-gate stops and disables the agent harness");
+    expect(printed.join("\n")).toContain("--unprotect-egress-gate --stand-down-agent");
+  });
+
+  it("allows repair/unprotect when the stand-down acknowledgement is present", () => {
+    const printed: string[] = [];
+    const ok = ensureStandDownAgentAcknowledgedForCli(
+      true,
+      (line) => printed.push(line),
+      "--repair-egress-gate",
+    );
+    expect(ok).toBe(true);
+    expect(printed).toEqual([]);
+  });
+
+  it("runEgressGateRepairForCli refuses missing stand-down acknowledgement before platform/root/identity gates", async () => {
+    const printed: string[] = [];
+    const resolveOperatorIdentity = vi.fn(async () => {
+      throw new Error("identity should not be reached");
+    });
+
+    const code = await runEgressGateRepairForCli({
+      isTty: false,
+      overrideTransientPfRules: false,
+      print: (line) => printed.push(line),
+      getuid: () => 0,
+      resolveOperatorIdentity,
+    });
+
+    expect(code).toBe(2);
+    expect(printed.join("\n")).toContain("--repair-egress-gate stops and disables the agent harness");
+    expect(printed.join("\n")).toContain("sudo sanctuary protect --repair-egress-gate --stand-down-agent");
+    expect(printed.join("\n")).not.toContain("macOS-only");
+    expect(resolveOperatorIdentity).not.toHaveBeenCalled();
+  });
+
+  it("runEgressGateUnprotectForCli refuses missing stand-down acknowledgement before platform/root/identity gates", async () => {
+    const printed: string[] = [];
+    const resolveOperatorIdentity = vi.fn(async () => {
+      throw new Error("identity should not be reached");
+    });
+
+    const code = await runEgressGateUnprotectForCli({
+      print: (line) => printed.push(line),
+      getuid: () => 0,
+      resolveOperatorIdentity,
+    });
+
+    expect(code).toBe(2);
+    expect(printed.join("\n")).toContain("--unprotect-egress-gate stops and disables the agent harness");
+    expect(printed.join("\n")).toContain("sudo sanctuary protect --unprotect-egress-gate --stand-down-agent");
+    expect(printed.join("\n")).not.toContain("macOS-only");
+    expect(resolveOperatorIdentity).not.toHaveBeenCalled();
   });
 });
 

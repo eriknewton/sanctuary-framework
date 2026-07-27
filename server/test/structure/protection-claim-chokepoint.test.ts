@@ -4,7 +4,11 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
-import { GENERIC_UID_CONFINEMENT_REMEDY } from "../../src/egress-gate/operator-advice.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+  GENERIC_UID_CONFINEMENT_REMEDY,
+} from "../../src/egress-gate/operator-advice.js";
 import { PROTECTION_HERO_COPY } from "../../src/egress-gate/protection-claim.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -42,6 +46,39 @@ function flattenConcat(node: ts.Node): string | undefined {
     const left = flattenConcat(node.left);
     const right = flattenConcat(node.right);
     return left !== undefined && right !== undefined ? left + right : undefined;
+  }
+  return undefined;
+}
+
+function staticStringExpression(
+  expression: ts.Expression,
+  knownStrings: ReadonlyMap<string, string>,
+): string | undefined {
+  if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
+    return expression.text;
+  }
+  if (ts.isParenthesizedExpression(expression)) {
+    return staticStringExpression(expression.expression, knownStrings);
+  }
+  if (ts.isIdentifier(expression)) {
+    return knownStrings.get(expression.text);
+  }
+  if (
+    ts.isBinaryExpression(expression) &&
+    expression.operatorToken.kind === ts.SyntaxKind.PlusToken
+  ) {
+    const left = staticStringExpression(expression.left, knownStrings);
+    const right = staticStringExpression(expression.right, knownStrings);
+    return left !== undefined && right !== undefined ? left + right : undefined;
+  }
+  if (ts.isTemplateExpression(expression)) {
+    let out = expression.head.text;
+    for (const span of expression.templateSpans) {
+      const value = staticStringExpression(span.expression, knownStrings);
+      if (value === undefined) return undefined;
+      out += value + span.literal.text;
+    }
+    return out;
   }
   return undefined;
 }
@@ -325,8 +362,8 @@ function resolveAdvicePhraseExpression(
   source: ts.SourceFile,
   unresolved: string[],
 ): string | undefined {
-  const flattened = flattenConcat(expression);
-  if (flattened !== undefined) return flattened;
+  const resolvedStatic = staticStringExpression(expression, localStrings);
+  if (resolvedStatic !== undefined) return resolvedStatic;
   if (ts.isIdentifier(expression)) {
     const value = localStrings.get(expression.text);
     if (value !== undefined) return value;
@@ -358,21 +395,21 @@ function extractProtectionStateAdvicePhrases(sourceText: string): {
     true,
   );
   const advice = findProtectionStateAdviceFunction(source);
-  const localStrings = new Map<string, string>();
+  const localStrings = new Map<string, string>([
+    ["EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND", EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND],
+    ["EGRESS_GATE_STAND_DOWN_EFFECT", EGRESS_GATE_STAND_DOWN_EFFECT],
+    ["GENERIC_UID_CONFINEMENT_REMEDY", GENERIC_UID_CONFINEMENT_REMEDY],
+  ]);
   for (const statement of advice.body!.statements) {
     if (!ts.isVariableStatement(statement)) continue;
     for (const declaration of statement.declarationList.declarations) {
       if (!ts.isIdentifier(declaration.name) || declaration.initializer === undefined) {
         continue;
       }
-      const value = flattenConcat(declaration.initializer);
+      const value = staticStringExpression(declaration.initializer, localStrings);
       if (value !== undefined) localStrings.set(declaration.name.text, value);
     }
   }
-  localStrings.set(
-    "GENERIC_UID_CONFINEMENT_REMEDY",
-    GENERIC_UID_CONFINEMENT_REMEDY,
-  );
 
   const phrases = new Set<string>(Object.values(PROTECTION_HERO_COPY));
   const unresolved: string[] = [];

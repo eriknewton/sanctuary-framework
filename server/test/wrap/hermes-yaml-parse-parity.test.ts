@@ -27,7 +27,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   assertHermesYamlParseParity,
+  describePyYamlCandidateFailure,
   hermesParityPythonCandidates,
+  probePyYamlCandidates,
   PYYAML_PARSE_PROGRAM,
   HermesYamlParityRefusedError,
   type SidecarExec,
@@ -952,5 +954,134 @@ describe("runWrap --hermes parse-parity guard (end-to-end)", () => {
     // sequence.
     expect(await readFile(yamlPath, "utf-8")).toBe(original);
     expect(await readFile(yamlPath, "utf-8")).not.toContain("mcp_servers");
+  });
+});
+
+// -- The interpreter-resolution CHOKEPOINT (probePyYamlCandidates) ---------
+//
+// One resolver, exported, so every consumer (the wrap guard, `sanctuary
+// doctor`, any future preflight) measures the SAME predicate. The first fix
+// attempt at this shipped RED because a second, hand-rolled copy resolved the
+// first EXISTING python3 instead of the first one that can import yaml -- and
+// the dev Mac is the INVERSE of the drill host, so the wrong rule passed
+// locally and failed on the machine that mattered. Every case below simulates
+// the host layout through the injected exec; none of them reads this machine.
+
+describe("probePyYamlCandidates - resolve by capability, not existence", () => {
+  const HOMEBREW = "/opt/homebrew/bin/python3";
+  const USRLOCAL = "/usr/local/bin/python3";
+  const SYSTEM = "/usr/bin/python3";
+
+  it("THE INVERSE-LAYOUT CASE: an interpreter that EXISTS and runs but cannot import yaml loses to a later one that can", async () => {
+    // Drill-host shape inverted onto the dev Mac: homebrew python is present
+    // and perfectly runnable, it simply has no PyYAML. An existence-based
+    // resolver stops there and fails; a capability-based one walks on.
+    const { exec } = recordingResolverExec({ withPyYaml: [SYSTEM] });
+    const probe = await probePyYamlCandidates("", { exec });
+    expect(probe.selected?.interpreter).toBe(SYSTEM);
+    expect(probe.outcomes).toEqual([
+      { interpreter: HOMEBREW, status: "no-pyyaml" },
+      { interpreter: USRLOCAL, status: "no-pyyaml" },
+      { interpreter: SYSTEM, status: "usable" },
+    ]);
+  });
+
+
+  it("distinguishes 'ran but no PyYAML' from 'could not be run at all'", async () => {
+    // These two need OPPOSITE remedies (pip install here vs install python3
+    // there), so collapsing them into one "tried: a, b, c" line sends the
+    // operator to install PyYAML into a path that does not exist.
+    const { exec } = recordingResolverExec({
+      withPyYaml: [SYSTEM],
+      absent: [HOMEBREW],
+    });
+    const probe = await probePyYamlCandidates("", { exec });
+    expect(probe.outcomes).toEqual([
+      { interpreter: HOMEBREW, status: "unrunnable" },
+      { interpreter: USRLOCAL, status: "no-pyyaml" },
+      { interpreter: SYSTEM, status: "usable" },
+    ]);
+  });
+
+  it("records NO outcome for a candidate it never probed (stops at the first usable one)", async () => {
+    // An unprobed candidate must never be reported as if it had been measured.
+    const { exec, calls } = recordingResolverExec({ withPyYaml: [HOMEBREW] });
+    const probe = await probePyYamlCandidates("", { exec });
+    expect(calls).toEqual([HOMEBREW]);
+    expect(probe.outcomes).toEqual([
+      { interpreter: HOMEBREW, status: "usable" },
+    ]);
+  });
+
+  it("selects nothing (fails closed) when no candidate can import yaml, and reports all three", async () => {
+    const { exec } = recordingResolverExec({ withPyYaml: [] });
+    const probe = await probePyYamlCandidates("", { exec });
+    expect(probe.selected).toBeUndefined();
+    expect(probe.outcomes.map((o) => o.interpreter)).toEqual([
+      HOMEBREW,
+      USRLOCAL,
+      SYSTEM,
+    ]);
+    expect(probe.outcomes.every((o) => o.status === "no-pyyaml")).toBe(true);
+  });
+});
+
+describe("describePyYamlCandidateFailure - name what was probed and what is wanted", () => {
+  const HOMEBREW = "/opt/homebrew/bin/python3";
+  const USRLOCAL = "/usr/local/bin/python3";
+
+  it("names every interpreter probed, what each one turned out to be, and the remedy", async () => {
+    const { exec } = recordingResolverExec({
+      withPyYaml: [],
+      absent: [HOMEBREW],
+    });
+    const probe = await probePyYamlCandidates("", { exec });
+    const message = describePyYamlCandidateFailure(probe.outcomes);
+    // Every candidate named...
+    for (const candidate of hermesParityPythonCandidates()) {
+      expect(message).toContain(candidate);
+    }
+    // ...with its ACTUAL outcome, not a single undifferentiated list...
+    expect(message).toContain("could not be run");
+    expect(message).toContain("ran but cannot import yaml");
+    // ...and a remedy pointed at an interpreter that actually RAN, never at
+    // the absent one (installing PyYAML into a path that is not there is the
+    // advice the old undifferentiated "tried: a, b, c" message produced).
+    expect(message).toContain(`"${USRLOCAL} -m pip install`);
+    expect(message).not.toContain(`"${HOMEBREW} -m pip install`);
+  });
+
+  it("asks for python3 itself (never a pip install) when nothing could be run at all", async () => {
+    const { exec } = recordingResolverExec({
+      withPyYaml: [],
+      absent: hermesParityPythonCandidates(),
+    });
+    const probe = await probePyYamlCandidates("", { exec });
+    const message = describePyYamlCandidateFailure(probe.outcomes);
+    expect(message).toContain("install python3 with PyYAML");
+    expect(message).not.toContain("pip install");
+  });
+});
+
+describe("assertHermesYamlParseParity - the refusal names each candidate's outcome", () => {
+  const yaml = "mcp_servers:\n  weather:\n    command: \"uvx\"\n";
+  const HOMEBREW = "/opt/homebrew/bin/python3";
+
+  it("wrap's fail-closed refusal carries the per-candidate diagnosis, not just the list", async () => {
+    const { exec } = recordingResolverExec({
+      withPyYaml: [],
+      absent: [HOMEBREW],
+    });
+    const err = await assertHermesYamlParseParity(yaml, { exec }).catch(
+      (e) => e
+    );
+    expect(err).toBeInstanceOf(HermesYamlParityRefusedError);
+    expect((err as HermesYamlParityRefusedError).reason).toBe(
+      "sidecar-unavailable"
+    );
+    const message = (err as HermesYamlParityRefusedError).message;
+    expect(message).toContain("PyYAML");
+    expect(message).toContain(`${HOMEBREW} (could not be run`);
+    expect(message).toContain("-m pip install");
   });
 });

@@ -124,6 +124,19 @@ export interface LivenessProbeBinding {
   generationId: number;
 }
 
+export interface LivenessOracleRefreshOptions {
+  /**
+   * Last-chance write guard evaluated after the live probe and immediately
+   * before publishing. A supervisor can abandon a timed-out attempt without
+   * letting that old async path mint a later live token.
+   *
+   * Return `false` to invalidate an existing token. Return `"skip"` when the
+   * caller has already invalidated the token for this abandoned attempt and
+   * only needs to suppress a late publish.
+   */
+  shouldPublish?: () => boolean | "skip";
+}
+
 /**
  * Deterministic, injection-free serialization of the signed claims. A FIXED
  * field order (never `JSON.stringify` over an object whose key order a caller
@@ -183,7 +196,10 @@ export class GateLivenessOracle {
    *     stale token persists);
    *   - probe LIVE -> sign + publish a fresh live token.
    */
-  async refresh(binding: LivenessProbeBinding): Promise<SignedLivenessToken | null> {
+  async refresh(
+    binding: LivenessProbeBinding,
+    options: LivenessOracleRefreshOptions = {},
+  ): Promise<SignedLivenessToken | null> {
     const { agentUid, gatePort, generationId } = binding;
     let result: PfLivenessResult;
     try {
@@ -206,6 +222,21 @@ export class GateLivenessOracle {
       // Not live -> remove the token (do NOT publish a live:false token that a
       // write failure could fail to overwrite). A removal failure is loud.
       await this.ops.removeToken(agentUid);
+      return null;
+    }
+    const publishDecision = options.shouldPublish?.();
+    if (publishDecision !== undefined && publishDecision !== true) {
+      // The caller no longer trusts this observation (for example, its refresh
+      // attempt timed out and was abandoned). Do not turn it into a fresh live
+      // token later. Most callers invalidate here; the supervisor's timeout
+      // branch invalidates when the attempt is abandoned, so its later
+      // completion uses "skip" to avoid stripping a newer token. Supervisor
+      // shutdown can also reach "skip" after `activeRefresh` is cleared; that
+      // case suppresses publish during process exit and any existing token
+      // expires within its short TTL.
+      if (publishDecision !== "skip") {
+        await this.ops.removeToken(agentUid);
+      }
       return null;
     }
     const claims: LivenessTokenClaims = {

@@ -54,7 +54,16 @@ type LaunchctlResult = { code: number; stdout: string; stderr: string };
  * (duplicated, not imported: `egress-gate` is a library module and must not
  * depend on the CLI layer). A structural test pins the two lists equal.
  */
-export const HARNESS_FORBIDDEN_PLIST_ENV = ["SANCTUARY_PASSPHRASE", "SANCTUARY_RECOVERY_KEY"];
+export const HARNESS_FORBIDDEN_PLIST_ENV = [
+  "SANCTUARY_PASSPHRASE",
+  "SANCTUARY_RECOVERY_KEY",
+  "HTTPS_PROXY",
+  "HTTP_PROXY",
+  "https_proxy",
+  "http_proxy",
+];
+
+const CREDENTIALED_URL_VALUE_RE = /:\/\/[^/@\s]*:[^/@\s]*@/;
 
 // ---------------------------------------------------------------------------
 // FIX F-HARNESSENV (HIGH, Mini1 confined-Hermes re-drill 2026-07-26)
@@ -163,6 +172,14 @@ function assertNoControlChars(value: string, what: string): void {
   }
 }
 
+function assertNoCredentialedPlistValue(name: string, value: string): void {
+  if (CREDENTIALED_URL_VALUE_RE.test(value)) {
+    throw new Error(
+      `Refusing to embed ${name} value containing URL credentials in a world-readable LaunchDaemon plist.`,
+    );
+  }
+}
+
 /** Options for {@link renderAgentHarnessDaemonPlist}. */
 export interface AgentHarnessDaemonPlistOptions {
   /**
@@ -243,6 +260,7 @@ export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOp
   }
   for (const arg of options.programArguments) {
     assertNoControlChars(arg, "program argument");
+    assertNoCredentialedPlistValue("program argument", arg);
   }
 
   const envEntries: Array<[string, string]> = [];
@@ -262,6 +280,9 @@ export function renderAgentHarnessDaemonPlist(options: AgentHarnessDaemonPlistOp
     if (HARNESS_FORBIDDEN_PLIST_ENV.includes(name)) {
       throw new Error(`Refusing to embed ${name} in a world-readable LaunchDaemon plist.`);
     }
+  }
+  for (const [name, value] of envEntries) {
+    assertNoCredentialedPlistValue(name, value);
   }
 
   const logDir =
@@ -668,7 +689,7 @@ export async function kickstartAgentHarnessDaemon(ops: HarnessDaemonOps): Promis
   }
   if (!(await agentHarnessDaemonStableRunning(ops))) {
     throw new Error(
-      `launchctl kickstart system/${AGENT_HARNESS_DAEMON_LABEL} was accepted, but the job did not report a stable running pid (the release wrapper may be refusing to exec)`,
+      `launchctl kickstart system/${AGENT_HARNESS_DAEMON_LABEL} was accepted, but the job did not report a stable running pid; this probe did not determine whether the wrapper refused or the process exited after exec`,
     );
   }
 }
@@ -682,6 +703,15 @@ export interface HarnessDaemonStatus {
   /** True when the service has a running pid. */
   running: boolean;
   pid?: number;
+}
+
+export interface HarnessStopSettleResult {
+  /** The final launchd status sample. */
+  status: HarnessDaemonStatus;
+  /** Number of status samples taken. */
+  samples: number;
+  /** Measured wall-clock time spent in the settle loop. */
+  elapsedMs: number;
 }
 
 /**
@@ -755,20 +785,23 @@ export async function agentHarnessDaemonStableRunning(ops: HarnessDaemonOps): Pr
 export async function awaitHarnessStoppedVia(
   sample: () => Promise<HarnessDaemonStatus>,
   sleepMs?: (ms: number) => Promise<void>,
-): Promise<HarnessDaemonStatus> {
+): Promise<HarnessStopSettleResult> {
   const sleep = sleepMs ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const stillAlive = (s: HarnessDaemonStatus): boolean => s.known && (s.running || s.pid !== undefined);
+  const startedAt = Date.now();
+  let samples = 1;
   let status = await sample();
   for (let i = 1; i < HARNESS_STOP_SETTLE_SAMPLES && stillAlive(status); i++) {
     await sleep(HARNESS_STOP_SETTLE_INTERVAL_MS);
+    samples += 1;
     status = await sample();
   }
-  return status;
+  return { status, samples, elapsedMs: Date.now() - startedAt };
 }
 
 /** {@link awaitHarnessStoppedVia} bound to `launchctl print` through `ops`. */
 export async function awaitAgentHarnessDaemonStopped(ops: HarnessDaemonOps): Promise<HarnessDaemonStatus> {
-  return awaitHarnessStoppedVia(() => agentHarnessDaemonStatus(ops), ops.sleepMs);
+  return (await awaitHarnessStoppedVia(() => agentHarnessDaemonStatus(ops), ops.sleepMs)).status;
 }
 
 /**

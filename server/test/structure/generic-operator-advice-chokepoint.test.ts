@@ -4,11 +4,19 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import ts from "typescript";
-import { GENERIC_UID_CONFINEMENT_REMEDY } from "../../src/egress-gate/operator-advice.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
+  GENERIC_UID_CONFINEMENT_REMEDY,
+} from "../../src/egress-gate/operator-advice.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const SERVER_SRC = join(REPO_ROOT, "server", "src");
 const GENERIC_REMEDY_OWNER = "server/src/egress-gate/operator-advice.ts";
+const OPERATOR_ADVICE_OWNER = "server/src/egress-gate/operator-advice.ts";
 
 const GENERIC_ADVICE_SURFACES = [
   {
@@ -18,6 +26,40 @@ const GENERIC_ADVICE_SURFACES = [
   {
     file: "server/src/cli/castle-wall.ts",
     functionName: "runArmDisarm",
+  },
+] as const;
+
+const EGRESS_GATE_ADVICE_SURFACES = [
+  {
+    file: "server/src/castle-wall/provision/exclusive-arm.ts",
+    functionName: "degradeLoud",
+    requiredConstants: [
+      "EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND",
+      "EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE",
+    ],
+  },
+  {
+    file: "server/src/egress-gate/protection-claim.ts",
+    functionName: "protectionStateAdvice",
+    requiredConstants: [
+      "EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND",
+      "EGRESS_GATE_STAND_DOWN_EFFECT",
+    ],
+  },
+] as const;
+
+const EGRESS_GATE_RECOVERY_COMMANDS = [
+  {
+    name: "repair",
+    bareCommand: "sudo sanctuary protect --repair-egress-gate",
+    command: EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+    advice: EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  },
+  {
+    name: "unprotect",
+    bareCommand: "sudo sanctuary protect --unprotect-egress-gate",
+    command: EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
+    advice: EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE,
   },
 ] as const;
 
@@ -76,6 +118,17 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     reason: "harness-argv resolves ONLY the Hermes gateway; its refusals are Hermes-scoped by construction",
   },
   {
+    // `sanctuary doctor`'s Hermes config-parser check. It only runs on a host
+    // that HAS a Hermes config, and it reports on the one surface a missing
+    // PyYAML blocks -- the Hermes wrap path -- so naming that exact command is
+    // the whole value of the check, not leaked agent-specific advice.
+    file: "server/src/cli/doctor.ts",
+    scope: "checkHermesConfigParser",
+    snippet: "would refuse to edit config.yaml",
+    expectedCount: 1,
+    reason: "the check is gated on a Hermes config existing and predicts the Hermes wrap path only",
+  },
+  {
     // FIX F-COARSE-AFTER-EXCLUSIVE (2026-07-26): when the coarse restore FAILS
     // the fortress is left in exclusive routing composition, in which the plain
     // Hermes arm is REFUSED -- so the degrade message must name that command as
@@ -83,7 +136,7 @@ const HERMES_LITERAL_CLASSIFICATIONS: readonly HermesLiteralClassification[] = [
     file: "server/src/castle-wall/provision/exclusive-arm.ts",
     scope: "degradeLoud",
     snippet: "will be REFUSED until it is",
-    expectedCount: 3,
+    expectedCount: 2,
     reason: "the exclusive-egress arming stage is only reached from the Hermes-gated auto-provision path",
   },
   {
@@ -390,6 +443,17 @@ function genericRemedyCopy(text: string): boolean {
   );
 }
 
+function egressGateRecoveryCommandCopy(text: string): boolean {
+  return EGRESS_GATE_RECOVERY_COMMANDS.some((row) => text.includes(row.bareCommand));
+}
+
+function quotedGlossBearingAdvice(sourceText: string): boolean {
+  return (
+    sourceText.includes("'${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}'") ||
+    sourceText.includes("'${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE}'")
+  );
+}
+
 function matchingHermesClassifications(hit: LiteralHit): number[] {
   return HERMES_LITERAL_CLASSIFICATIONS.flatMap((classification, index) =>
     classification.file === hit.file &&
@@ -439,6 +503,52 @@ describe("generic operator advice chokepoint", () => {
     expect(
       offenders.map((hit) => `${hit.file}:${hit.line} ${JSON.stringify(hit.text)}`),
       "generic uid-confinement advice must be imported from operator-advice.ts, not recopied",
+    ).toEqual([]);
+  });
+
+  it("keeps egress-gate stand-down advice on the shared chokepoint", () => {
+    for (const row of EGRESS_GATE_RECOVERY_COMMANDS) {
+      expect(
+        row.command,
+        `${row.name} command must include the explicit stand-down acknowledgement`,
+      ).toContain("--stand-down-agent");
+      expect(row.advice, `${row.name} advice must state the command effect outside the command`).toBe(
+        `${row.command} (${EGRESS_GATE_STAND_DOWN_EFFECT})`,
+      );
+    }
+
+    for (const surface of EGRESS_GATE_ADVICE_SURFACES) {
+      const sourceText = readSource(surface.file);
+      const range = findFunctionRange(surface.file, sourceText, surface.functionName);
+      const body = sourceText.slice(range.start, range.end);
+      for (const requiredConstant of surface.requiredConstants) {
+        expect(
+          body,
+          `${surface.file}:${surface.functionName} must consume ${requiredConstant}`,
+        ).toContain(requiredConstant);
+      }
+    }
+  });
+
+  it("keeps hardcoded egress-gate recovery commands out of emitted source", () => {
+    const offenders: LiteralHit[] = [];
+    const quotedAdviceOffenders: string[] = [];
+    for (const filePath of tsFiles(SERVER_SRC)) {
+      const file = relative(REPO_ROOT, filePath);
+      if (file === OPERATOR_ADVICE_OWNER) continue;
+      const sourceText = readFileSync(filePath, "utf8");
+      offenders.push(...scanCodeLiterals(file, sourceText, egressGateRecoveryCommandCopy));
+      if (quotedGlossBearingAdvice(sourceText)) {
+        quotedAdviceOffenders.push(file);
+      }
+    }
+    expect(
+      offenders.map((hit) => `${hit.file}:${hit.line} ${JSON.stringify(hit.text)}`),
+      "egress-gate recovery commands must be imported from operator-advice.ts, not recopied",
+    ).toEqual([]);
+    expect(
+      quotedAdviceOffenders,
+      "gloss-bearing _ADVICE constants must not sit inside quoted command spans; quote the _COMMAND constant only",
     ).toEqual([]);
   });
 

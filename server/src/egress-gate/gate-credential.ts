@@ -16,8 +16,9 @@
  *
  *   - the AGENT TOKEN file `<agent_uid>.token` (owner agent_uid, 0600): the
  *     JSON `{ version, generation_id, secret }` the agent reads and presents on
- *     every CONNECT via a `Proxy-Authorization: Sanctuary-Gate <gen>.<secret>`
- *     header;
+ *     every CONNECT either via the native `Proxy-Authorization:
+ *     Sanctuary-Gate <gen>.<secret>` header or the standard HTTP Basic proxy
+ *     form whose password is that same `<gen>.<secret>` payload;
  *   - the GATE ACCEPT file `<agent_uid>.accept` (owner gate_uid, 0600): the
  *     JSON `{ version, generation_id, secret_sha256 }` the NON-ROOT gate reads.
  *     The gate holds only the HASH + the generation id -- never the raw secret,
@@ -72,6 +73,9 @@ export const GATE_CRED_DIR = "/var/db/sanctuary/gate-cred";
 /** The `Proxy-Authorization` auth-scheme token the agent presents. */
 export const GATE_AUTH_SCHEME = "Sanctuary-Gate";
 
+/** Fixed Basic-auth username; identity is still only the uid + generation-bound secret. */
+export const GATE_PROXY_BASIC_USERNAME = "sanctuary-gate";
+
 /** On-disk schema version for both credential files. */
 export const GATE_CREDENTIAL_VERSION = 1 as const;
 
@@ -94,7 +98,7 @@ export interface GateCredentialAcceptRecord {
   secret_sha256: string;
 }
 
-/** A parsed `Proxy-Authorization: Sanctuary-Gate <gen>.<secret>` header. */
+/** A parsed generation-bound credential from either accepted proxy-auth scheme. */
 export interface PresentedGateCredential {
   generation_id: number;
   secret: string;
@@ -154,31 +158,27 @@ export function formatGateCredentialHeader(token: {
 }
 
 /**
- * Parse a `Proxy-Authorization` header value into a presented credential, or
- * null if it is absent/malformed. STRICT by construction (fail-closed): the
- * scheme must match exactly, the generation id must be a non-negative integer,
- * and the secret must be a non-empty lowercase-hex string. A header array
- * (Node folds duplicate headers) is rejected -- the gate accepts exactly one.
+ * Format the standard Basic proxy-auth header that unmodified HTTP clients
+ * produce from `http://user:pass@host:port` proxy URLs. The password carries
+ * the exact same payload {@link verifyGateCredential} verifies.
  */
-export function parseGateCredentialHeader(
-  headerValue: string | string[] | undefined,
-): PresentedGateCredential | null {
-  if (typeof headerValue !== "string") {
-    // undefined (absent) or string[] (duplicated header) -> no single credential.
+export function formatGateCredentialBasicHeader(token: {
+  generation_id: number;
+  secret: string;
+}): string {
+  return `Basic ${Buffer.from(
+    `${GATE_PROXY_BASIC_USERNAME}:${token.generation_id}.${token.secret}`,
+    "utf8",
+  ).toString("base64")}`;
+}
+
+function parseGateCredentialPayload(payload: string): PresentedGateCredential | null {
+  const dot = payload.indexOf(".");
+  if (dot <= 0 || dot === payload.length - 1) {
     return null;
   }
-  const trimmed = headerValue.trim();
-  const prefix = `${GATE_AUTH_SCHEME} `;
-  if (!trimmed.startsWith(prefix)) {
-    return null;
-  }
-  const rest = trimmed.slice(prefix.length);
-  const dot = rest.indexOf(".");
-  if (dot <= 0 || dot === rest.length - 1) {
-    return null;
-  }
-  const genPart = rest.slice(0, dot);
-  const secret = rest.slice(dot + 1);
+  const genPart = payload.slice(0, dot);
+  const secret = payload.slice(dot + 1);
   if (!/^\d+$/.test(genPart)) {
     return null;
   }
@@ -190,6 +190,76 @@ export function parseGateCredentialHeader(
     return null;
   }
   return { generation_id, secret };
+}
+
+function strictBase64Decode(value: string): string | null {
+  if (value.length === 0 || /\s/.test(value)) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    return null;
+  }
+  if (value.includes("=") && value.length % 4 !== 0) {
+    return null;
+  }
+  const remainder = value.length % 4;
+  if (remainder === 1) {
+    return null;
+  }
+  const normalized = `${value}${"=".repeat((4 - remainder) % 4)}`;
+  const decoded = Buffer.from(normalized, "base64");
+  const canonical = decoded.toString("base64").replace(/=+$/, "");
+  if (canonical !== value.replace(/=+$/, "")) {
+    return null;
+  }
+  return decoded.toString("utf8");
+}
+
+function parseBasicGateCredential(payload: string): PresentedGateCredential | null {
+  const decoded = strictBase64Decode(payload);
+  if (decoded === null) {
+    return null;
+  }
+  const colon = decoded.indexOf(":");
+  if (colon <= 0) {
+    return null;
+  }
+  const username = decoded.slice(0, colon);
+  if (username !== GATE_PROXY_BASIC_USERNAME) {
+    return null;
+  }
+  return parseGateCredentialPayload(decoded.slice(colon + 1));
+}
+
+/**
+ * Parse a `Proxy-Authorization` header value into a presented credential, or
+ * null if it is absent/malformed. STRICT by construction (fail-closed): the
+ * scheme must be either the native Sanctuary scheme or HTTP Basic with the
+ * fixed username above, the generation id must be a non-negative integer, and
+ * the secret must be a non-empty lowercase-hex string. A header array (Node
+ * folds duplicate headers) is rejected -- the gate accepts exactly one.
+ */
+export function parseGateCredentialHeader(
+  headerValue: string | string[] | undefined,
+): PresentedGateCredential | null {
+  if (typeof headerValue !== "string") {
+    // undefined (absent) or string[] (duplicated header) -> no single credential.
+    return null;
+  }
+  const trimmed = headerValue.trim();
+  const separator = trimmed.indexOf(" ");
+  if (separator <= 0) {
+    return null;
+  }
+  const scheme = trimmed.slice(0, separator);
+  const rest = trimmed.slice(separator + 1);
+  if (scheme === GATE_AUTH_SCHEME) {
+    return parseGateCredentialPayload(rest);
+  }
+  if (scheme.toLowerCase() === "basic") {
+    return parseBasicGateCredential(rest);
+  }
+  return null;
 }
 
 /**

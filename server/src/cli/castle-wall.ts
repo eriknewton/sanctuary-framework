@@ -74,7 +74,10 @@ import {
   bootServiceReady,
 } from "./castle-wall-boot.js";
 import { fortressIdFromStoragePath } from "../dashboard/v1_1/wiring.js";
-import { GENERIC_UID_CONFINEMENT_REMEDY } from "../egress-gate/operator-advice.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  GENERIC_UID_CONFINEMENT_REMEDY,
+} from "../egress-gate/operator-advice.js";
 import {
   CASTLE_WALL_AUDIT_PROVENANCE_KEY,
   CASTLE_WALL_AUDIT_PROVENANCE_VALUE,
@@ -2119,7 +2122,7 @@ export async function runSafeModeDaemon(
   // the oracle freshness-token loop running (the gate's per-CONNECT liveness
   // is TTL-fresh). PER-AGENT FAIL-CLOSED and NEVER daemon-fatal: a failure
   // leaves that agent PARKED (loud, amber, repairable via
-  // 'sudo sanctuary protect --repair-egress-gate'), and the policy daemon
+  // 'sudo sanctuary protect --repair-egress-gate --stand-down-agent'), and the policy daemon
   // keeps serving regardless.
   let exclusiveEgressSupervisor: { stopOracleLoop(): void } | undefined;
   try {
@@ -2180,7 +2183,7 @@ export async function runSafeModeDaemon(
     // re-verified this boot.
     write(
       err,
-      `[castle-wall] exclusive-egress boot supervisor failed (${bootErr instanceof Error ? bootErr.message : String(bootErr)}); NO boot release or re-park ran and the confined agents' parked state was NOT verified -- treat them as possibly startable and intervene. Repair: sudo sanctuary protect --repair-egress-gate\n`,
+      `[castle-wall] exclusive-egress boot supervisor failed (${bootErr instanceof Error ? bootErr.message : String(bootErr)}); NO boot release or re-park ran and the confined agents' parked state was NOT verified -- treat them as possibly startable and intervene. Repair: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}\n`,
     );
   }
 

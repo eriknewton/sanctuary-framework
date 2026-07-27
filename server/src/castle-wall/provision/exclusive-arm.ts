@@ -40,6 +40,11 @@ import {
   type HarnessDisposition,
   type ParkedClaim,
 } from "../../egress-gate/parked-claim.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
+} from "../../egress-gate/operator-advice.js";
 
 /** Distinct local audit operation strings (never a widened shared enum). */
 export const EXCLUSIVE_EGRESS_ARMED_AUDIT_OP = "exclusive_egress_armed";
@@ -403,10 +408,10 @@ async function degradeLoud(
           // path that provably clears it.
           "The manifest could NOT be restored to coarse scope, so the fortress is STILL in EXCLUSIVE " +
           "routing composition: a plain 'sudo sanctuary protect --hermes' will be REFUSED until it is " +
-          "cleared with 'sudo sanctuary protect --unprotect-egress-gate'. ") +
+          `cleared with '${EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}). `) +
       // The ONE sentence about run state, and it comes from the chokepoint.
       harnessDispositionSentence(harness) +
-      " Fix with: sudo sanctuary protect --repair-egress-gate",
+      ` Fix with: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
   );
   return {
     kind: "degraded-coarse-active",
@@ -419,7 +424,7 @@ async function degradeLoud(
 }
 
 // ---------------------------------------------------------------------------
-// Repair verb (`sudo sanctuary protect --repair-egress-gate`, design MED-7)
+// Repair verb (`sudo sanctuary protect --repair-egress-gate --stand-down-agent`, design MED-7)
 // ---------------------------------------------------------------------------
 
 /** Context for {@link runEgressGateRepair}. */
@@ -935,7 +940,7 @@ export async function runBootExclusiveEgressRelease(
       ops.print(
         `[castle-wall] boot: uid ${agent.agent_uid} exclusive egress NOT live AND the parked state ` +
           `was NOT verified (${outcome.reason}); treat the agent as possibly startable and ` +
-          "intervene manually. Fix with: sudo sanctuary protect --repair-egress-gate",
+          `intervene manually. Fix with: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       );
     } else if (outcome.kind === "parked") {
       // Fix-round 4: the run-state sentence is the CHOKEPOINT's, not this
@@ -949,7 +954,7 @@ export async function runBootExclusiveEgressRelease(
             ? ` WARNING: re-park ops reported failures (hold file removed: ${outcome.holdFileRemoved}, ` +
               `job disabled: ${outcome.jobDisabled}): ${outcome.cleanupErrors.join("; ")}.`
             : "") +
-          " Fix with: sudo sanctuary protect --repair-egress-gate",
+          ` Fix with: ${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE}`,
       );
     } else {
       ops.print(

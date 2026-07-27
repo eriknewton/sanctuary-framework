@@ -74,7 +74,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import {
   AGENT_HARNESS_DAEMON_LABEL,
@@ -93,6 +93,11 @@ import {
   type ParkedClaimProbeOps,
   type RunStateAdvice,
 } from "./parked-claim.js";
+import {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+} from "./operator-advice.js";
+import { GATE_PROXY_BASIC_USERNAME, gateCredentialTokenPath } from "./gate-credential.js";
 
 /** Root-owned parent directory for hold files + the exec wrapper (0755 root). */
 export const AGENT_HARNESS_HOLD_DIR = "/var/db/sanctuary/agent-harness";
@@ -110,6 +115,17 @@ export const HOLD_FILE_HEADER = "sanctuary-agent-harness-release v1";
 
 /** The exec wrapper's file name inside {@link AGENT_HARNESS_HOLD_DIR}. */
 export const RELEASE_WRAPPER_FILENAME = "release-exec-wrapper.sh";
+
+/**
+ * Agent-writable diagnostic record emitted by the exec wrapper on refusal.
+ *
+ * This file is EXEMPT from release abort cleanup on purpose: the cleanup must
+ * remove the root-owned hold file and re-park launchd state, but it must not
+ * erase the only post-mortem explanation for why the wrapper refused. It is
+ * diagnostic-only and agent-forgeable; no authorization, release, posture, or
+ * confinement decision may read it.
+ */
+export const RELEASE_REFUSAL_RECORD_FILENAME = "agent-harness.release-refusal.log";
 
 /** Exit code the wrapper uses for every refusal (EX_CONFIG; never 0). */
 export const RELEASE_WRAPPER_REFUSAL_EXIT_CODE = 78;
@@ -141,6 +157,14 @@ export function holdFilePathForUid(agentUid: number, dir: string = AGENT_HARNESS
 /** Canonical wrapper path (root-owned 0755, inside the root-owned hold dir). */
 export function releaseWrapperPath(dir: string = AGENT_HARNESS_HOLD_DIR): string {
   return `${dir}/${RELEASE_WRAPPER_FILENAME}`;
+}
+
+/** Diagnostic refusal-record path under the agent-owned harness log dir. */
+export function releaseRefusalRecordPath(logDir: string): string {
+  if (!isAbsolute(logDir)) {
+    throw new ReleaseBarrierError(`refusal-record log dir must be absolute (got ${logDir})`);
+  }
+  return join(logDir, RELEASE_REFUSAL_RECORD_FILENAME);
 }
 
 /** A release-barrier input or on-disk record violated a constraint. Fail-closed. */
@@ -373,13 +397,121 @@ export function parseHarnessReleaseHoldFile(text: string): HarnessReleaseHoldRec
   return record;
 }
 
+/** Header for the agent-forgeable diagnostic record written by the wrapper. */
+export const RELEASE_REFUSAL_RECORD_HEADER = "sanctuary-release-wrapper-refusal v1";
+
+export type ReleaseRefusalObservationKey =
+  | "expected_generation"
+  | "gate_port"
+  | "proxy_username_shape"
+  | "expected_label"
+  | "runtime_uid"
+  | "hold_file_exists"
+  | "hold_file_readable"
+  | "hold_header"
+  | "hold_generation"
+  | "hold_label"
+  | "hold_uid"
+  | "boot_session"
+  | "argv_digest"
+  | "token_file_exists"
+  | "token_file_readable"
+  | "token_generation"
+  | "token_secret_shape";
+
+export type ReleaseRefusalObservations = Record<ReleaseRefusalObservationKey, string>;
+
+export interface ReleaseWrapperRefusalRecord {
+  header: typeof RELEASE_REFUSAL_RECORD_HEADER;
+  reason: string;
+  observations: ReleaseRefusalObservations;
+}
+
+export type ReleaseWrapperRefusalRead =
+  | { status: "absent" }
+  | { status: "unreadable"; reason: string }
+  | { status: "present"; record: ReleaseWrapperRefusalRecord };
+
+const RELEASE_REFUSAL_OBSERVATION_KEYS: readonly ReleaseRefusalObservationKey[] = [
+  "expected_generation",
+  "gate_port",
+  "proxy_username_shape",
+  "expected_label",
+  "runtime_uid",
+  "hold_file_exists",
+  "hold_file_readable",
+  "hold_header",
+  "hold_generation",
+  "hold_label",
+  "hold_uid",
+  "boot_session",
+  "argv_digest",
+  "token_file_exists",
+  "token_file_readable",
+  "token_generation",
+  "token_secret_shape",
+];
+
+const SAFE_REFUSAL_RECORD_KEY_RE = /^[A-Za-z0-9._-]{1,64}$/;
+const SAFE_REFUSAL_RECORD_VALUE_RE = /^[A-Za-z0-9 ._/:;(),+=@-]{1,240}$/;
+
+function describeUnsafeRefusalRecordKey(key: string): string {
+  // eslint-disable-next-line no-control-regex
+  const controlStripped = key.replace(/[\x00-\x1F\x7F]/g, "");
+  const capped = controlStripped.slice(0, 64);
+  return JSON.stringify(capped);
+}
+
+/**
+ * Parse the wrapper's diagnostic refusal record.
+ *
+ * SECURITY BOUND: this parser is for operator explanation only. The file is
+ * written by the agent uid, can be forged by that uid, survives abort cleanup,
+ * and must never be consulted by an authorization/release/posture decision.
+ */
+export function parseReleaseWrapperRefusalRecord(text: string): ReleaseWrapperRefusalRecord {
+  const lines = text.split("\n").filter((l) => l.length > 0);
+  if (lines[0] !== RELEASE_REFUSAL_RECORD_HEADER) {
+    throw new ReleaseBarrierError("wrapper refusal record header mismatch");
+  }
+  const seen = new Map<string, string>();
+  for (const line of lines.slice(1)) {
+    const eq = line.indexOf("=");
+    if (eq <= 0) {
+      throw new ReleaseBarrierError(`wrapper refusal record line is malformed: ${JSON.stringify(line)}`);
+    }
+    const key = line.slice(0, eq);
+    const value = line.slice(eq + 1);
+    if (!SAFE_REFUSAL_RECORD_KEY_RE.test(key)) {
+      throw new ReleaseBarrierError(`wrapper refusal record key ${describeUnsafeRefusalRecordKey(key)} is unsafe`);
+    }
+    if (seen.has(key)) {
+      throw new ReleaseBarrierError(`wrapper refusal record key duplicated: ${describeUnsafeRefusalRecordKey(key)}`);
+    }
+    if (!SAFE_REFUSAL_RECORD_VALUE_RE.test(value)) {
+      throw new ReleaseBarrierError(`wrapper refusal record key ${describeUnsafeRefusalRecordKey(key)} has an unsafe value`);
+    }
+    seen.set(key, value);
+  }
+  const reason = seen.get("reason");
+  if (reason === undefined) {
+    throw new ReleaseBarrierError("wrapper refusal record is missing reason");
+  }
+  const observations = Object.fromEntries(
+    RELEASE_REFUSAL_OBSERVATION_KEYS.map((key) => [key, seen.get(key) ?? "not_checked"]),
+  ) as ReleaseRefusalObservations;
+  return { header: RELEASE_REFUSAL_RECORD_HEADER, reason, observations };
+}
+
 /**
  * The exec wrapper, as a STATIC POSIX-sh script: nothing is interpolated into
- * the script body (the hold-file path, expected generation, and label arrive
- * as launchd-controlled `ProgramArguments`, and the harness argv arrives as
+ * the script body (the hold-file path, expected generation, gate port, token
+ * path, refusal-record path, Basic username, and label arrive as
+ * launchd-controlled `ProgramArguments`, and the harness argv arrives as
  * `"$@"`), so there is no render-time injection surface at all. Root-owned
  * 0755; runs as the agent uid via the plist's `UserName` drop. Every refusal
- * exits {@link RELEASE_WRAPPER_REFUSAL_EXIT_CODE} without exec.
+ * best-effort writes a diagnostic-only refusal record and exits
+ * {@link RELEASE_WRAPPER_REFUSAL_EXIT_CODE} without exec.
  */
 export const RELEASE_EXEC_WRAPPER_SCRIPT = `#!/bin/sh
 # Sanctuary agent-harness release-barrier exec wrapper (Unified Protect S5-5).
@@ -389,26 +521,109 @@ export const RELEASE_EXEC_WRAPPER_SCRIPT = `#!/bin/sh
 # macOS-only (kern.bootsessionuuid, /usr/bin/shasum).
 set -eu
 
+REFUSAL_RECORD_FILE=""
+EXPECTED_GENERATION="unset"
+GATE_PORT="unset"
+GATE_PROXY_USERNAME="unset"
+EXPECTED_LABEL="unset"
+OBS_PROXY_USERNAME_SHAPE="not_checked"
+OBS_RUNTIME_UID="not_checked"
+OBS_HOLD_FILE_EXISTS="not_checked"
+OBS_HOLD_FILE_READABLE="not_checked"
+OBS_HOLD_HEADER="not_checked"
+OBS_HOLD_GENERATION="not_checked"
+OBS_HOLD_LABEL="not_checked"
+OBS_HOLD_UID="not_checked"
+OBS_BOOT_SESSION="not_checked"
+OBS_ARGV_DIGEST="not_checked"
+OBS_TOKEN_FILE_EXISTS="not_checked"
+OBS_TOKEN_FILE_READABLE="not_checked"
+OBS_TOKEN_GENERATION="not_checked"
+OBS_TOKEN_SECRET_SHAPE="not_checked"
+
+record_refusal() {
+  [ -n "$REFUSAL_RECORD_FILE" ] || return 0
+  case "$REFUSAL_RECORD_FILE" in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  tmp="$REFUSAL_RECORD_FILE.tmp.$$"
+  (
+    umask 077
+    {
+      printf '%s\\n' 'sanctuary-release-wrapper-refusal v1'
+      printf 'reason=%s\\n' "$1"
+      printf 'expected_generation=%s\\n' "$EXPECTED_GENERATION"
+      printf 'gate_port=%s\\n' "$GATE_PORT"
+      printf 'proxy_username_shape=%s\\n' "$OBS_PROXY_USERNAME_SHAPE"
+      printf 'expected_label=%s\\n' "$EXPECTED_LABEL"
+      printf 'runtime_uid=%s\\n' "$OBS_RUNTIME_UID"
+      printf 'hold_file_exists=%s\\n' "$OBS_HOLD_FILE_EXISTS"
+      printf 'hold_file_readable=%s\\n' "$OBS_HOLD_FILE_READABLE"
+      printf 'hold_header=%s\\n' "$OBS_HOLD_HEADER"
+      printf 'hold_generation=%s\\n' "$OBS_HOLD_GENERATION"
+      printf 'hold_label=%s\\n' "$OBS_HOLD_LABEL"
+      printf 'hold_uid=%s\\n' "$OBS_HOLD_UID"
+      printf 'boot_session=%s\\n' "$OBS_BOOT_SESSION"
+      printf 'argv_digest=%s\\n' "$OBS_ARGV_DIGEST"
+      printf 'token_file_exists=%s\\n' "$OBS_TOKEN_FILE_EXISTS"
+      printf 'token_file_readable=%s\\n' "$OBS_TOKEN_FILE_READABLE"
+      printf 'token_generation=%s\\n' "$OBS_TOKEN_GENERATION"
+      printf 'token_secret_shape=%s\\n' "$OBS_TOKEN_SECRET_SHAPE"
+    } > "$tmp" &&
+    mv "$tmp" "$REFUSAL_RECORD_FILE"
+  ) 2>/dev/null || {
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+  }
+}
+
 fail() {
+  record_refusal "$1"
   echo "sanctuary-release-wrapper: refusing to start agent harness: $1" >&2
   exit 78
 }
 
-[ "$#" -ge 5 ] || fail "bad invocation (expected hold-file, generation, label, --, argv...)"
+[ "$#" -ge 9 ] || fail "bad invocation (expected hold-file, generation, gate-port, token-file, refusal-record-file, proxy-username, label, --, argv...)"
 HOLD_FILE="$1"
 EXPECTED_GENERATION="$2"
-EXPECTED_LABEL="$3"
-[ "$4" = "--" ] || fail "bad invocation (missing -- separator)"
-shift 4
+GATE_PORT="$3"
+TOKEN_FILE="$4"
+REFUSAL_RECORD_FILE="$5"
+GATE_PROXY_USERNAME="$6"
+EXPECTED_LABEL="$7"
+[ "$8" = "--" ] || fail "bad invocation (missing -- separator)"
+shift 8
+rm -f "$REFUSAL_RECORD_FILE" 2>/dev/null || true
+
+case "$GATE_PROXY_USERNAME" in
+  ""|*:*|*@*|*/*|*[!a-zA-Z0-9._-]*) fail "gate proxy username is malformed" ;;
+  *) OBS_PROXY_USERNAME_SHAPE="valid" ;;
+esac
 
 case "$EXPECTED_GENERATION" in
   ""|*[!0-9]*) fail "expected generation is not a number" ;;
 esac
 [ "$EXPECTED_GENERATION" -gt 0 ] || fail "parked plist (expected generation 0); no release is possible"
 
-[ -f "$HOLD_FILE" ] || fail "hold file absent; no committed generation has released this uid"
+case "$GATE_PORT" in
+  ""|*[!0-9]*) fail "gate port is not a number" ;;
+esac
+[ "$GATE_PORT" -gt 0 ] 2>/dev/null || fail "gate port is not in the TCP port range"
+[ "$GATE_PORT" -le 65535 ] 2>/dev/null || fail "gate port is not in the TCP port range"
 
-head -n 1 "$HOLD_FILE" | grep -q "^sanctuary-agent-harness-release v1$" || fail "hold file header mismatch"
+[ -f "$HOLD_FILE" ] && OBS_HOLD_FILE_EXISTS="yes" || {
+  OBS_HOLD_FILE_EXISTS="no"
+  fail "hold file absent; no committed generation has released this uid"
+}
+[ -r "$HOLD_FILE" ] && OBS_HOLD_FILE_READABLE="yes" || OBS_HOLD_FILE_READABLE="no"
+
+if head -n 1 "$HOLD_FILE" | grep -q "^sanctuary-agent-harness-release v1$"; then
+  OBS_HOLD_HEADER="match"
+else
+  OBS_HOLD_HEADER="mismatch_or_unreadable"
+  fail "hold file header mismatch"
+fi
 
 hold_field() {
   n=$(grep -c "^$1=" "$HOLD_FILE" || true)
@@ -422,19 +637,81 @@ LABEL=$(hold_field harness_label)
 DIGEST=$(hold_field argv_digest)
 BOOT_UUID=$(hold_field boot_session_uuid)
 
-[ "$GEN" = "$EXPECTED_GENERATION" ] || fail "hold generation $GEN does not match expected generation $EXPECTED_GENERATION (stale plist or stale hold file)"
-[ "$LABEL" = "$EXPECTED_LABEL" ] || fail "hold label does not match this job"
-[ "$UID_EXPECTED" = "$(id -u)" ] || fail "hold uid $UID_EXPECTED does not match runtime uid $(id -u)"
+if [ "$GEN" = "$EXPECTED_GENERATION" ]; then
+  OBS_HOLD_GENERATION="match"
+else
+  OBS_HOLD_GENERATION="mismatch"
+  fail "hold generation $GEN does not match expected generation $EXPECTED_GENERATION (stale plist or stale hold file)"
+fi
+if [ "$LABEL" = "$EXPECTED_LABEL" ]; then
+  OBS_HOLD_LABEL="match"
+else
+  OBS_HOLD_LABEL="mismatch"
+  fail "hold label does not match this job"
+fi
+OBS_RUNTIME_UID=$(id -u)
+if [ "$UID_EXPECTED" = "$OBS_RUNTIME_UID" ]; then
+  OBS_HOLD_UID="match"
+else
+  OBS_HOLD_UID="mismatch"
+  fail "hold uid $UID_EXPECTED does not match runtime uid $OBS_RUNTIME_UID"
+fi
 
 CURRENT_BOOT=$(/usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null || true)
-[ -n "$CURRENT_BOOT" ] || fail "cannot read kern.bootsessionuuid"
-[ "$BOOT_UUID" = "$CURRENT_BOOT" ] || fail "hold file was written in a previous boot session (park until the boot daemon re-commits)"
+if [ -n "$CURRENT_BOOT" ]; then
+  OBS_BOOT_SESSION="read"
+else
+  OBS_BOOT_SESSION="unreadable"
+  fail "cannot read kern.bootsessionuuid"
+fi
+if [ "$BOOT_UUID" = "$CURRENT_BOOT" ]; then
+  OBS_BOOT_SESSION="match"
+else
+  OBS_BOOT_SESSION="mismatch"
+  fail "hold file was written in a previous boot session (park until the boot daemon re-commits)"
+fi
 
 case "$DIGEST" in
-  ""|*[!0-9a-f]*) fail "hold argv digest malformed" ;;
+  ""|*[!0-9a-f]*) OBS_ARGV_DIGEST="malformed"; fail "hold argv digest malformed" ;;
 esac
 ACTUAL_DIGEST=$(printf '%s\\0' "$@" | /usr/bin/shasum -a 256 | cut -d" " -f1)
-[ "$DIGEST" = "$ACTUAL_DIGEST" ] || fail "argv digest mismatch (the committed release names a different harness argv)"
+if [ "$DIGEST" = "$ACTUAL_DIGEST" ]; then
+  OBS_ARGV_DIGEST="match"
+else
+  OBS_ARGV_DIGEST="mismatch"
+  fail "argv digest mismatch (the committed release names a different harness argv)"
+fi
+
+[ -f "$TOKEN_FILE" ] && OBS_TOKEN_FILE_EXISTS="yes" || {
+  OBS_TOKEN_FILE_EXISTS="no"
+  fail "gate credential token file absent"
+}
+[ -r "$TOKEN_FILE" ] && OBS_TOKEN_FILE_READABLE="yes" || {
+  OBS_TOKEN_FILE_READABLE="no"
+  fail "gate credential token file unreadable"
+}
+TOKEN_JSON=$(cat "$TOKEN_FILE") || fail "gate credential token file unreadable"
+TOKEN_GEN=$(printf '%s\\n' "$TOKEN_JSON" | sed -n 's/.*"generation_id"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p')
+TOKEN_SECRET=$(printf '%s\\n' "$TOKEN_JSON" | sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\\([0-9a-f][0-9a-f]*\\)".*/\\1/p')
+case "$TOKEN_GEN" in
+  ""|*[!0-9]*) OBS_TOKEN_GENERATION="malformed"; fail "gate credential token generation missing or malformed" ;;
+esac
+if [ "$TOKEN_GEN" = "$EXPECTED_GENERATION" ]; then
+  OBS_TOKEN_GENERATION="match"
+else
+  OBS_TOKEN_GENERATION="mismatch"
+  fail "gate credential token generation does not match expected generation"
+fi
+case "$TOKEN_SECRET" in
+  ""|*[!0-9a-f]*) OBS_TOKEN_SECRET_SHAPE="malformed"; fail "gate credential token secret missing or malformed" ;;
+  *) OBS_TOKEN_SECRET_SHAPE="hex" ;;
+esac
+
+PROXY_URL="http://$GATE_PROXY_USERNAME:$TOKEN_GEN.$TOKEN_SECRET@127.0.0.1:$GATE_PORT"
+export HTTPS_PROXY="$PROXY_URL"
+export HTTP_PROXY="$PROXY_URL"
+export https_proxy="$PROXY_URL"
+export http_proxy="$PROXY_URL"
 
 exec "$@"
 `;
@@ -455,6 +732,18 @@ export interface BarrierProgramArgumentsInput {
    * for the parked form (which the wrapper refuses unconditionally).
    */
   expectedGenerationId: number;
+  /**
+   * The committed gate port the wrapper uses for the proxy URL, or 0 for the
+   * parked form (the wrapper refuses before exporting anything).
+   */
+  expectedGatePort: number;
+  /** Agent-readable token file path; production passes `/var/db/sanctuary/gate-cred/<uid>.token`. */
+  tokenFilePath: string;
+  /**
+   * Agent-writable diagnostic record path. The wrapper writes this on refusal
+   * and cleanup deliberately leaves it in place; it is never a security input.
+   */
+  refusalRecordPath: string;
   /** The job label the wrapper cross-checks against the hold file. */
   harnessLabel: string;
   /** The REAL harness argv (absolute program path first). */
@@ -463,8 +752,9 @@ export interface BarrierProgramArgumentsInput {
 
 /**
  * Compose the barrier-form `ProgramArguments`: wrapper first, then the
- * wrapper's own arguments, then `--`, then the untouched harness argv. The
- * plist renderer's control-character validation applies to every element.
+ * wrapper's own arguments (including the fixed Basic username), then `--`,
+ * then the untouched harness argv. The plist renderer's control-character
+ * validation applies to every element.
  */
 export function buildBarrierProgramArguments(input: BarrierProgramArgumentsInput): string[] {
   if (!isAbsolute(input.wrapperPath)) {
@@ -473,6 +763,12 @@ export function buildBarrierProgramArguments(input: BarrierProgramArgumentsInput
   if (!isAbsolute(input.holdFilePath)) {
     throw new ReleaseBarrierError(`hold-file path must be absolute (got ${input.holdFilePath})`);
   }
+  if (!isAbsolute(input.tokenFilePath)) {
+    throw new ReleaseBarrierError(`token-file path must be absolute (got ${input.tokenFilePath})`);
+  }
+  if (!isAbsolute(input.refusalRecordPath)) {
+    throw new ReleaseBarrierError(`refusal-record path must be absolute (got ${input.refusalRecordPath})`);
+  }
   if (!SAFE_LABEL_RE.test(input.harnessLabel)) {
     throw new ReleaseBarrierError(`harness label is not a safe label (got ${JSON.stringify(input.harnessLabel)})`);
   }
@@ -480,10 +776,30 @@ export function buildBarrierProgramArguments(input: BarrierProgramArgumentsInput
   if (!Number.isInteger(gen) || gen < 0) {
     throw new ReleaseBarrierError(`expected generation id must be a non-negative integer (got ${String(gen)})`);
   }
+  const gatePort = input.expectedGatePort;
+  if (!Number.isInteger(gatePort) || gatePort < 0 || gatePort > 65535) {
+    throw new ReleaseBarrierError(`expected gate port must be in the TCP port range or parked 0 (got ${String(gatePort)})`);
+  }
+  if ((gen === PARKED_EXPECTED_GENERATION) !== (gatePort === 0)) {
+    throw new ReleaseBarrierError(
+      `expected generation and gate port must be parked together or released together (got generation ${gen}, port ${gatePort})`,
+    );
+  }
   if (input.harnessArgv.length === 0 || !isAbsolute(input.harnessArgv[0]!)) {
     throw new ReleaseBarrierError("harness argv must be non-empty with an absolute program path first");
   }
-  return [input.wrapperPath, input.holdFilePath, String(gen), input.harnessLabel, "--", ...input.harnessArgv];
+  return [
+    input.wrapperPath,
+    input.holdFilePath,
+    String(gen),
+    String(gatePort),
+    input.tokenFilePath,
+    input.refusalRecordPath,
+    GATE_PROXY_BASIC_USERNAME,
+    input.harnessLabel,
+    "--",
+    ...input.harnessArgv,
+  ];
 }
 
 /** Options for {@link planParkedHarnessInstall}. */
@@ -510,12 +826,21 @@ export interface ParkedHarnessInstallOptions {
   logDir?: string;
   /** Hold dir override (tests only). Default {@link AGENT_HARNESS_HOLD_DIR}. */
   holdDir?: string;
+  /** Token path override (tests only). Default {@link gateCredentialTokenPath}. */
+  tokenFilePath?: string;
+  /**
+   * Refusal-record path override (tests only). Defaults to
+   * {@link RELEASE_REFUSAL_RECORD_FILENAME} inside the rendered log dir.
+   */
+  refusalRecordPath?: string;
   /**
    * Expected generation for the rendered plist. Default
    * {@link PARKED_EXPECTED_GENERATION} (parked: the wrapper refuses). The
    * release sequence re-renders with the real committed id before enabling.
    */
   expectedGenerationId?: number;
+  /** Expected gate port for the rendered plist. Default 0 for the parked form. */
+  expectedGatePort?: number;
 }
 
 /** A planned parked install: plist + wrapper + where the hold file will live. */
@@ -527,6 +852,8 @@ export interface ParkedHarnessInstallPlan {
   wrapperPath: string;
   wrapperContent: string;
   holdFilePath: string;
+  tokenFilePath: string;
+  refusalRecordPath: string;
   harnessLabel: string;
   /** The service account the parked plist runs the harness as. */
   agentAccount: string;
@@ -545,10 +872,25 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
   const holdDir = options.holdDir ?? AGENT_HARNESS_HOLD_DIR;
   const wrapperPath = releaseWrapperPath(holdDir);
   const holdFilePath = holdFilePathForUid(options.agentUid, holdDir);
+  const tokenFilePath = options.tokenFilePath ?? gateCredentialTokenPath(options.agentUid);
+  const renderedLogDir = options.logDir ?? (options.fortressPath !== undefined ? join(options.fortressPath, "logs") : undefined);
+  const diagnosticLogDir = renderedLogDir;
+  let refusalRecordPath: string;
+  if (options.refusalRecordPath !== undefined) {
+    refusalRecordPath = options.refusalRecordPath;
+  } else {
+    if (diagnosticLogDir === undefined) {
+      throw new ReleaseBarrierError("refusal-record path needs logDir, fortressPath, or an explicit refusalRecordPath");
+    }
+    refusalRecordPath = releaseRefusalRecordPath(diagnosticLogDir);
+  }
   const programArguments = buildBarrierProgramArguments({
     wrapperPath,
     holdFilePath,
     expectedGenerationId: options.expectedGenerationId ?? PARKED_EXPECTED_GENERATION,
+    expectedGatePort: options.expectedGatePort ?? 0,
+    tokenFilePath,
+    refusalRecordPath,
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
     harnessArgv: options.harnessLaunch.programArguments,
   });
@@ -556,7 +898,7 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
     agentAccount: options.agentAccount,
     programArguments,
     fortressPath: options.fortressPath,
-    logDir: options.logDir,
+    logDir: renderedLogDir,
     // FIX F-HARNESSENV: derived from the SAME value the argv came from, so a
     // parked/released re-render can never drop it.
     environment: options.harnessLaunch.environment,
@@ -571,6 +913,8 @@ export function planParkedHarnessInstall(options: ParkedHarnessInstallOptions): 
     wrapperPath,
     wrapperContent: renderReleaseExecWrapperScript(),
     holdFilePath,
+    tokenFilePath,
+    refusalRecordPath,
     harnessLabel: AGENT_HARNESS_DAEMON_LABEL,
     agentAccount: options.agentAccount,
   };
@@ -780,7 +1124,7 @@ export async function executeParkedHarnessInstall(
         "the agent harness is ALREADY running under a committed exclusive-egress generation (its plist " +
           "routes through the release wrapper and launchd reports it running). Refusing to stop a live " +
           "confined agent to re-run an install it does not need. To re-verify or repair the gate, run " +
-          "'sudo sanctuary protect --repair-egress-gate'; to take it down, run 'sudo sanctuary unprotect'.",
+          `'${EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND}' (${EGRESS_GATE_STAND_DOWN_EFFECT}); to take it down, run 'sudo sanctuary unprotect'.`,
       );
     }
   }
@@ -1383,6 +1727,7 @@ export interface ReleaseBarrierContext {
 export interface CommittedGenerationIdentity {
   generation_id: number;
   agent_uid: number;
+  gate_port: number;
 }
 
 /**
@@ -1452,6 +1797,11 @@ export interface ReleaseBarrierOps {
    * posture, alongside the launchctl disable override). Throws on failure.
    */
   restoreParkedPlist(): Promise<void>;
+  /**
+   * Read the wrapper's agent-writable refusal record for diagnostics only.
+   * This record is not trusted and must never authorize release or posture.
+   */
+  readWrapperRefusalRecord(): Promise<ReleaseWrapperRefusalRead>;
   /**
    * The harness job's launchd status. Production wiring MUST make `running`
    * mean STABLE-running (the exported `agentHarnessDaemonStableRunning`
@@ -1768,16 +2118,21 @@ export async function runReleaseBarrierSequence(
   if (
     committed.agent_uid !== ctx.agentUid ||
     !Number.isInteger(committed.generation_id) ||
-    committed.generation_id <= 0
+    committed.generation_id <= 0 ||
+    !Number.isInteger(committed.gate_port) ||
+    committed.gate_port <= 0 ||
+    committed.gate_port > 65535
   ) {
     // Identity keying (design: "the G5 commit names what it releases"). A
-    // commit for a different uid, or a non-positive id, must never release.
+    // commit for a different uid, a non-positive id, or no concrete gate port
+    // must never release.
     const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
     return await parkedOutcome(ops, {
       stage: "commit-generation",
       reason:
         `committed generation identity mismatch: commit names uid ${String(committed.agent_uid)} ` +
-        `generation ${String(committed.generation_id)}, release is for uid ${ctx.agentUid}`,
+        `generation ${String(committed.generation_id)} gate port ${String(committed.gate_port)}, ` +
+        `release is for uid ${ctx.agentUid}`,
       holdFileRemoved: cleanup.holdFileRemoved,
       jobDisabled: cleanup.jobDisabled,
       cleanupErrors: cleanup.errors,
@@ -1802,15 +2157,17 @@ export async function runReleaseBarrierSequence(
     }
     if (
       reverify.observed.generation_id !== committed.generation_id ||
-      reverify.observed.agent_uid !== committed.agent_uid
+      reverify.observed.agent_uid !== committed.agent_uid ||
+      reverify.observed.gate_port !== committed.gate_port
     ) {
       const cleanup = await parkCleanup(ops, { removeHold: true, disable: true });
       return await parkedOutcome(ops, {
         stage: "verify-committed",
         reason:
           `post-commit verification observed uid ${String(reverify.observed.agent_uid)} ` +
-          `generation ${String(reverify.observed.generation_id)}, but the commit named uid ` +
-          `${String(committed.agent_uid)} generation ${String(committed.generation_id)}; ` +
+          `generation ${String(reverify.observed.generation_id)} gate port ${String(reverify.observed.gate_port)}, ` +
+          `but the commit named uid ${String(committed.agent_uid)} generation ` +
+          `${String(committed.generation_id)} gate port ${String(committed.gate_port)}; ` +
           "refusing to release a generation that is not the verified live gate generation",
         holdFileRemoved: cleanup.holdFileRemoved,
         jobDisabled: cleanup.jobDisabled,
@@ -1902,11 +2259,11 @@ export async function runReleaseBarrierSequence(
 
   // Stage: verify-running (post-bootstrap). A bootstrap/kickstart that
   // launchctl accepted proves nothing about the harness actually running:
-  // the wrapper may be refusing (exit 78) on every start. Require a live
-  // status probe (stable-running in production wiring) before claiming
-  // anything.
+  // the wrapper may exit before exec, or the harness may exec and then exit.
+  // Require a live status probe (stable-running in production wiring) before
+  // claiming anything, then explain the failed observation without guessing.
   {
-    const probe = await probeHarnessRunning(ops);
+    const probe = await probeHarnessRunning(ops, committed);
     if (!probe.ok) {
       const cleanup = await parkCleanup(ops, {
         removeHold: true,
@@ -1947,7 +2304,7 @@ export async function runReleaseBarrierSequence(
   // already restored; the cleanup removes the hold file and boots the dead
   // job out.
   {
-    const probe = await probeHarnessRunning(ops);
+    const probe = await probeHarnessRunning(ops, committed);
     if (!probe.ok) {
       const cleanup = await parkCleanup(ops, {
         removeHold: true,
@@ -1981,18 +2338,81 @@ export async function runReleaseBarrierSequence(
 /** Fail-closed harness liveness probe: unknown status or a throw is NOT running. */
 async function probeHarnessRunning(
   ops: ReleaseBarrierOps,
+  committed: CommittedGenerationIdentity,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   let status: HarnessDaemonStatus;
   try {
     status = await ops.harnessStatus();
   } catch (err) {
-    return { ok: false, reason: `status probe errored: ${(err as Error).message}` };
+    return {
+      ok: false,
+      reason: `could not determine whether the job spawned: launchctl status probe errored: ${(err as Error).message}`,
+    };
   }
   if (!status.known) {
-    return { ok: false, reason: "launchctl did not return a trustworthy harness status" };
+    return {
+      ok: false,
+      reason: "could not determine whether the job spawned: launchctl did not return a trustworthy harness status",
+    };
   }
   if (!status.running) {
-    return { ok: false, reason: "the job has no stable running pid (the release wrapper may be refusing to exec)" };
+    const refusal = await describeWrapperRefusalObservation(ops, committed);
+    if (refusal !== undefined) {
+      return { ok: false, reason: refusal };
+    }
+    if (!status.installed) {
+      return { ok: false, reason: "the job never spawned: launchd no longer reports the harness job installed" };
+    }
+    if (status.pid !== undefined) {
+      return {
+        ok: false,
+        reason:
+          `the job spawned but did not stay up: launchd observed pid ${status.pid}, ` +
+          "and no matching wrapper refusal record was present",
+      };
+    }
+    return {
+      ok: false,
+      reason:
+        "could not determine whether the job spawned or exec'd: launchd reports the job installed with no stable pid, " +
+        "and no matching wrapper refusal record was present",
+    };
   }
   return { ok: true };
+}
+
+async function describeWrapperRefusalObservation(
+  ops: ReleaseBarrierOps,
+  committed: CommittedGenerationIdentity,
+): Promise<string | undefined> {
+  let read: ReleaseWrapperRefusalRead;
+  try {
+    read = await ops.readWrapperRefusalRecord();
+  } catch (err) {
+    return `could not determine whether the wrapper refused: refusal-record reader errored: ${(err as Error).message}`;
+  }
+  if (read.status === "absent") return undefined;
+  if (read.status === "unreadable") {
+    return `could not determine whether the wrapper refused: ${read.reason}`;
+  }
+  const expectedGeneration = String(committed.generation_id);
+  const expectedGatePort = String(committed.gate_port);
+  const observed = read.record.observations;
+  if (observed.expected_generation !== expectedGeneration || observed.gate_port !== expectedGatePort) {
+    return (
+      "could not determine whether this launch's wrapper refused: found a stale or mismatched wrapper refusal " +
+      `record for generation ${observed.expected_generation} gate port ${observed.gate_port}; ` +
+      `this release expected generation ${expectedGeneration} gate port ${expectedGatePort}`
+    );
+  }
+  return (
+    `an agent-writable wrapper refusal record ` +
+    `(diagnostic only; not independently verified) reports: ${read.record.reason}; observations: ` +
+    `hold_file_exists=${observed.hold_file_exists}, hold_file_readable=${observed.hold_file_readable}, ` +
+    `hold_header=${observed.hold_header}, hold_generation=${observed.hold_generation}, ` +
+    `hold_label=${observed.hold_label}, hold_uid=${observed.hold_uid}, boot_session=${observed.boot_session}, ` +
+    `argv_digest=${observed.argv_digest}, token_file_exists=${observed.token_file_exists}, ` +
+    `token_file_readable=${observed.token_file_readable}, token_generation=${observed.token_generation}, ` +
+    `token_secret_shape=${observed.token_secret_shape}`
+  );
 }

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+Four-leg drill D1/D2/D3 fixes. No new capability.
+
+### Fixed
+
+- **Exclusive-egress gate is reachable by proxy-env-honoring harnesses.** The gate now accepts standard HTTP Basic proxy credentials whose password carries the existing generation-bound token payload, and the release wrapper exports HTTP(S)_PROXY/http(s)_proxy only at exec time after the release barrier and token checks pass. Clients that ignore proxy environment variables still cannot use this path; this does not add transparent interception.
+- **Exclusive-egress proxy credential residual is documented.** The wrapper delivers the per-generation proxy credential through the agent harness environment, so agent-side tooling that dumps its own environment can expose it in harness logs; credentials rotate per generation and remain uid-bound at the gate. `NO_PROXY` remains unset because pf confinement already blocks direct loopback for the confined uid; setting it would change the denial path, not restore loopback introspection.
+- **Exclusive-egress oracle refresh now fails closed loudly on hung refreshes.** The root supervisor bounds a refresh attempt, invalidates known tokens at timeout, caps abandoned work, and guards the oracle write path so a late abandoned attempt cannot mint a live token. A permanently abandoned probe can still cap later attempts; it now surfaces as stuck and denies by token expiry instead of silently preserving freshness.
+- **Harness park verification waits for launchd to settle.** Repair/unprotect park verification reuses the shared stopped-settle loop and refuses fail-closed with measured elapsed time and sample count when the harness remains running or launchd status is untrustworthy. The `--stand-down-agent` flag is now required to acknowledge that repair and unprotect stop/disable the agent harness.
+- **Castle Wall daemon collision messages show a real pid when available.** The already-running message interpolates the active-config pid, or says `pid unavailable` when the socket-only guard has no pid, and no longer emits the literal `<pid>` placeholder.
+
 ## [1.6.1] - 2026-07-01
 
 Patch release: the install path works again, and the first-run experience tells the truth. No new capability.

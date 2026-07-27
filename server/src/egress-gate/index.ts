@@ -187,10 +187,12 @@ export {
 export {
   GATE_CRED_DIR,
   GATE_AUTH_SCHEME,
+  GATE_PROXY_BASIC_USERNAME,
   GATE_CREDENTIAL_VERSION,
   GATE_CREDENTIAL_SECRET_BYTES,
   GateCredentialAuthority,
   formatGateCredentialHeader,
+  formatGateCredentialBasicHeader,
   parseGateCredentialHeader,
   verifyGateCredential,
   mintGateSecret,
@@ -303,6 +305,11 @@ export {
 } from "./posture.js";
 
 export {
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_REPAIR_WITH_STAND_DOWN_COMMAND,
+  EGRESS_GATE_STAND_DOWN_EFFECT,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_ADVICE,
+  EGRESS_GATE_UNPROTECT_WITH_STAND_DOWN_COMMAND,
   GENERIC_UID_CONFINEMENT_REMEDY,
 } from "./operator-advice.js";
 

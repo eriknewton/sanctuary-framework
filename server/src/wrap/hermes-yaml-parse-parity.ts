@@ -316,6 +316,158 @@ export function hermesParityPythonCandidates(): string[] {
 }
 
 /**
+ * What ONE candidate interpreter turned out to be capable of, as measured by
+ * actually running the parse program through it.
+ *
+ *  - "usable"      the interpreter ran AND imported yaml. Its result is
+ *                  authoritative (even when that result is a real parser's
+ *                  rejection of the file).
+ *  - "no-pyyaml"   the interpreter ran but `import yaml` failed (exit 20).
+ *  - "unrunnable"  the interpreter could not be executed at all: absent, not
+ *                  executable, spawn failure, or probe timeout (exit code
+ *                  null).
+ *
+ * The distinction is the whole point of naming the failure: "install PyYAML
+ * into /opt/homebrew/bin/python3" is useless advice on a host where that path
+ * does not exist, and "install python3" is useless advice on a host where three
+ * interpreters ran and none had PyYAML.
+ */
+export type PyYamlCandidateStatus = "usable" | "no-pyyaml" | "unrunnable";
+
+/** One candidate's measured outcome, in the order it was probed. */
+export interface PyYamlCandidateOutcome {
+  interpreter: string;
+  status: PyYamlCandidateStatus;
+}
+
+/**
+ * The result of walking the candidate list. `outcomes` records every candidate
+ * ACTUALLY probed (the walk stops at the first usable one, so later candidates
+ * are absent from the list rather than recorded as unknown -- an unprobed
+ * candidate must never be reported as if it had been measured).
+ */
+export interface PyYamlProbeResult {
+  outcomes: PyYamlCandidateOutcome[];
+  /** The first candidate that ran AND had PyYAML, with its raw result. */
+  selected?: { interpreter: string; result: SidecarExecResult };
+}
+
+/**
+ * THE CHOKEPOINT. Walk the candidate interpreters in preference order and
+ * return the first that can ACTUALLY import yaml, together with the raw result
+ * of running the parse program through it.
+ *
+ * RESOLVE BY CAPABILITY, NOT EXISTENCE. The predicate every consumer of this
+ * function depends on is "can this interpreter import yaml", so that is exactly
+ * what is measured: the parse program is run and its exit status read back. A
+ * `pathExists`-style probe answers a different question and shipped RED once
+ * already (2026-07-22): first-EXISTING is not first-with-PyYAML, and a dev Mac
+ * is the INVERSE of the drill host (homebrew python present but PyYAML-less on
+ * one, the reverse on the other), so an existence check passes locally and
+ * fails on the machine that matters.
+ *
+ * The probe and the use are THE SAME INVOCATION, deliberately. There is no
+ * separate "check, then run" pair that could disagree with each other or race:
+ * the parse IS the capability measurement, so a candidate reported usable is
+ * by construction the one whose output is being consumed.
+ *
+ * Callers pass the document to parse. `sanctuary doctor` passes an EMPTY
+ * document, which this program defines as a valid parse yielding
+ * `{hasBlock:false, entryNames:[]}` -- so the diagnostic exercises the exact
+ * same program, candidate list, and selection rule that `wrap` will use, rather
+ * than a second copy of the matcher that can drift from it.
+ */
+export async function probePyYamlCandidates(
+  document: string,
+  options: ParseParityOptions = {}
+): Promise<PyYamlProbeResult> {
+  const exec = options.exec ?? defaultSidecarExec;
+  const timeoutMs = options.timeoutMs ?? 5000;
+  // `!== undefined` (not truthiness): an explicitly-pinned interpreter is used
+  // as-is even when it is the empty string, so an invalid pin fails closed
+  // rather than silently falling back to the candidate list.
+  const candidates =
+    options.pythonPath !== undefined
+      ? [options.pythonPath]
+      : hermesParityPythonCandidates();
+
+  const outcomes: PyYamlCandidateOutcome[] = [];
+  for (const interpreter of candidates) {
+    const result = await exec(
+      interpreter,
+      // `-E` ignores PYTHONPATH/PYTHONHOME; combined with the sys.path
+      // absolute-only filter inside PYYAML_PARSE_PROGRAM, the fail-closed parse
+      // imports only the interpreter's own PyYAML, never an env- or cwd-planted
+      // `yaml` module. (`-I`/`-s` are deliberately NOT used: they would also
+      // drop user-site-packages, where a legitimately `pip install --user`ed
+      // PyYAML lives, and fail-close a healthy host.)
+      ["-E", "-c", PYYAML_PARSE_PROGRAM],
+      document,
+      timeoutMs
+    );
+    if (result.code === null) {
+      // Absent interpreter / spawn failure / timeout: try the next candidate.
+      outcomes.push({ interpreter, status: "unrunnable" });
+      continue;
+    }
+    if (result.code === PYYAML_EXIT.IMPORT_MISSING) {
+      // This interpreter ran but has no PyYAML: try the next candidate.
+      outcomes.push({ interpreter, status: "no-pyyaml" });
+      continue;
+    }
+    // This candidate has PyYAML (it parsed, or gave a real parser rejection of
+    // the file): its result is authoritative and the walk stops here.
+    outcomes.push({ interpreter, status: "usable" });
+    return { outcomes, selected: { interpreter, result } };
+  }
+  return { outcomes };
+}
+
+/** Human-readable form of one candidate's measured outcome. */
+function renderCandidateOutcome(outcome: PyYamlCandidateOutcome): string {
+  const why =
+    outcome.status === "no-pyyaml"
+      ? "ran but cannot import yaml"
+      : outcome.status === "unrunnable"
+        ? "could not be run (absent, not executable, or timed out)"
+        : "can import yaml";
+  return `${outcome.interpreter} (${why})`;
+}
+
+/**
+ * The operator-facing sentence for "no candidate could import yaml". Names
+ * EVERY interpreter probed AND what each one turned out to be, then names what
+ * is wanted. Shared by the wrap refusal and the `sanctuary doctor` check so the
+ * operator reads the same diagnosis from both surfaces.
+ *
+ * Naming per-candidate outcomes rather than just the list is not cosmetic: the
+ * remedy differs per outcome, and the pre-fix message ("tried: A, B, C") sent
+ * operators to `pip install` into interpreters that do not exist on their host.
+ */
+export function describePyYamlCandidateFailure(
+  outcomes: readonly PyYamlCandidateOutcome[]
+): string {
+  const ranWithoutPyYaml = outcomes.filter((o) => o.status === "no-pyyaml");
+  const probed = outcomes.map(renderCandidateOutcome).join("; ");
+  if (outcomes.length === 0) {
+    // Defensive: an empty candidate list is not reachable through
+    // hermesParityPythonCandidates(), but must never read as success.
+    return "no python3 interpreter was probed at all; PyYAML is required to validate the Hermes config parse";
+  }
+  if (ranWithoutPyYaml.length === 0) {
+    return (
+      `none of the python3 interpreters Sanctuary probed could be run [${probed}]; ` +
+      "install python3 with PyYAML at one of those paths"
+    );
+  }
+  const target = ranWithoutPyYaml[0]!.interpreter;
+  return (
+    `none of the python3 interpreters Sanctuary probed can import yaml [${probed}]; ` +
+    `install PyYAML for one of them (e.g. "${target} -m pip install --user PyYAML")`
+  );
+}
+
+/**
  * Interpret a parse result from a candidate that DID run and DID have PyYAML
  * (exit code is neither null nor IMPORT_MISSING). Returns the view on success,
  * or throws the appropriate fail-closed refusal when the real parser rejects
@@ -393,15 +545,12 @@ function interpretParseResult(
  * HermesYamlParityRefusedError("sidecar-unavailable", ...) when a real,
  * trustworthy parse could not be produced.
  *
- * Interpreter resolution is by ACTUAL PyYAML importability, not by file
+ * Interpreter resolution is delegated to the one chokepoint,
+ * {@link probePyYamlCandidates}: by ACTUAL PyYAML importability, never by file
  * existence or a static ordering (see hermesParityPythonCandidates for why a
- * static order cannot be correct on every host). Each candidate is run through
- * the injected executor in preference order; a candidate that cannot run
- * (exit code null: absent / spawn failure / timeout) or that lacks PyYAML
- * (exit code IMPORT_MISSING) is SKIPPED and the next is tried. The first
- * candidate that runs and has PyYAML wins -- its result is authoritative even
- * when it is a fail-closed rejection of the file. If NO candidate can produce
- * a trustworthy parse, refuse fail-closed.
+ * static order cannot be correct on every host). If NO candidate can produce a
+ * trustworthy parse, refuse fail-closed with the message that names every
+ * interpreter probed and what each one turned out to be.
  *
  * An explicit `options.pythonPath` pins a single interpreter and is used
  * as-is: it is NEVER silently replaced by a fallback candidate, so an explicit
@@ -412,58 +561,14 @@ async function pyYamlView(
   existingContent: string,
   options: ParseParityOptions
 ): Promise<PyYamlMcpServersView> {
-  const exec = options.exec ?? defaultSidecarExec;
-  const timeoutMs = options.timeoutMs ?? 5000;
-  // `!== undefined` (not truthiness): an explicitly-pinned interpreter is used
-  // as-is even when it is the empty string, so an invalid pin fails closed
-  // rather than silently falling back to the candidate list.
-  const candidates =
-    options.pythonPath !== undefined
-      ? [options.pythonPath]
-      : hermesParityPythonCandidates();
-
-  // Tracks whether at least one candidate RAN but lacked PyYAML, so the
-  // exhaustion message can distinguish "no PyYAML anywhere" from "no python
-  // could be run at all".
-  let sawInterpreterWithoutPyYaml = false;
-
-  for (const python of candidates) {
-    const result = await exec(
-      python,
-      // `-E` ignores PYTHONPATH/PYTHONHOME; combined with the sys.path
-      // absolute-only filter inside PYYAML_PARSE_PROGRAM, the fail-closed parse
-      // imports only the interpreter's own PyYAML, never an env- or cwd-planted
-      // `yaml` module. (`-I`/`-s` are deliberately NOT used: they would also
-      // drop user-site-packages, where a legitimately `pip install --user`ed
-      // PyYAML lives, and fail-close a healthy host.)
-      ["-E", "-c", PYYAML_PARSE_PROGRAM],
-      existingContent,
-      timeoutMs
+  const probe = await probePyYamlCandidates(existingContent, options);
+  if (probe.selected === undefined) {
+    throw new HermesYamlParityRefusedError(
+      "sidecar-unavailable",
+      describePyYamlCandidateFailure(probe.outcomes)
     );
-    if (result.code === null) {
-      // Absent interpreter / spawn failure / timeout: try the next candidate.
-      continue;
-    }
-    if (result.code === PYYAML_EXIT.IMPORT_MISSING) {
-      // This interpreter ran but has no PyYAML: try the next candidate.
-      sawInterpreterWithoutPyYaml = true;
-      continue;
-    }
-    // This candidate has PyYAML (it parsed, or gave a real parser rejection of
-    // the file): its result is authoritative.
-    return interpretParseResult(result);
   }
-
-  throw new HermesYamlParityRefusedError(
-    "sidecar-unavailable",
-    sawInterpreterWithoutPyYaml
-      ? `PyYAML is not importable in any resolved python3 (tried: ${candidates.join(
-          ", "
-        )}); install PyYAML into one of these interpreters`
-      : `no python3 interpreter could be run to validate the parse (tried: ${candidates.join(
-          ", "
-        )}); install python3 with PyYAML`
-  );
+  return interpretParseResult(probe.selected.result);
 }
 
 // -- Parity check ---------------------------------------------------------
