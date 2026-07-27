@@ -1192,6 +1192,25 @@ export async function waitForGateRuntime(
  * install path's bootstrap sequence in {@link productionBringUp}. Throws on
  * failure; the boot caller logs loudly and lets the barrier's `verifyGate`
  * produce the honest parked outcome.
+ *
+ * FIX (hardware drill 2026-07-27, `drill-994-boot-selfheal`): this used to
+ * issue a raw `bootstrap` + `kickstart` and TOLERATE "already bootstrapped".
+ * That tolerance is exactly the defect a stale-plist self-heal exposed: by
+ * the time the boot supervisor runs, launchd has ALREADY loaded whatever
+ * plist was on disk when it scanned `/Library/LaunchDaemons` at boot, so a
+ * self-heal that rewrites the file on disk during this SAME boot is invisible
+ * to launchd until the NEXT boot -- `bootstrap` no-ops on the already-loaded
+ * (stale) job and `kickstart` relaunches the cached stale argv, measured
+ * 0/5 on real hardware. This now routes through the SAME
+ * {@link reloadLaunchdDaemonForBringUp} chokepoint the install/repair path
+ * uses (bootout the possibly-stale loaded job -> settle until proven
+ * not-running -> bootstrap the CURRENT on-disk plist -> kickstart), so
+ * whatever is on disk at the moment this runs is what launchd actually
+ * starts, in the SAME boot. The bootout is unconditional (not conditioned on
+ * whether a self-heal actually wrote): the boot path already kickstarts this
+ * daemon every boot, so a bootout first costs nothing in the healthy case
+ * and a not-loaded bootout (first-ever boot, nothing to boot out) is
+ * tolerated by the chokepoint itself.
  */
 export async function bootstrapGateDaemonForBoot(input: {
   agentUid: number;
@@ -1208,21 +1227,18 @@ export async function bootstrapGateDaemonForBoot(input: {
    * timeout, today's behavior.
    */
   gateDaemonStderrPath?: string;
+  /** TEST-ONLY: replaces the reload chokepoint's bootout-settle sleep. */
+  sleepMs?: (ms: number) => Promise<void>;
 }): Promise<void> {
   const run = input.runLaunchctlFn ?? runLaunchctl;
   const label = egressGateDaemonLabel(input.agentUid);
   const plistPath = egressGateDaemonPlistPath(input.agentUid);
-  const bootstrap = await run(["bootstrap", "system", plistPath]);
-  if (
-    bootstrap.code !== 0 &&
-    !/already bootstrapped|service already loaded|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)
-  ) {
-    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
-  }
-  const kick = await run(["kickstart", `system/${label}`]);
-  if (kick.code !== 0) {
-    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
-  }
+  await reloadLaunchdDaemonForBringUp({
+    label,
+    plistPath,
+    runLaunchctlFn: run,
+    ...(input.sleepMs !== undefined ? { sleepMs: input.sleepMs } : {}),
+  });
   if (input.expected !== null) {
     await waitForGateRuntime(input.agentUid, input.expected.generationId, input.expected.gatePort, {
       ...(input.readState !== undefined ? { readState: input.readState } : {}),
@@ -1240,29 +1256,35 @@ export async function bootstrapGateDaemonForBoot(input: {
  * resolver after a reboot, and every CONNECT would deny again exactly as the
  * Mini1 drill found. No runtime-state file to wait for (the resolver
  * publishes nothing; the gate's own `waitForGateRuntime` is the boot
- * sequence's readiness gate), so this is bootstrap+kickstart only. Throws on
- * failure; the boot caller logs loudly and lets the barrier's `verifyGate`
- * produce the honest parked outcome (a gate that cannot resolve peers denies
- * fail-closed, it does not silently degrade).
+ * sequence's readiness gate). Throws on failure; the boot caller logs loudly
+ * and lets the barrier's `verifyGate` produce the honest parked outcome (a
+ * gate that cannot resolve peers denies fail-closed, it does not silently
+ * degrade).
+ *
+ * FIX (hardware drill 2026-07-27, `drill-994-boot-selfheal`): identical shape
+ * and identical defect as {@link bootstrapGateDaemonForBoot} -- a raw
+ * `bootstrap` + `kickstart` that tolerates "already bootstrapped" never
+ * re-reads a plist launchd already loaded from disk at boot. Routed through
+ * the same {@link reloadLaunchdDaemonForBringUp} chokepoint for the same
+ * reason; see that function's fix note. This is a chokepoint fix, not a
+ * one-site patch -- a sibling left on the old shape would still strangle the
+ * resolver (and therefore every gated CONNECT) for a whole boot.
  */
 export async function bootstrapPeerResolverDaemonForBoot(input: {
   agentUid: number;
   runLaunchctlFn?: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+  /** TEST-ONLY: replaces the reload chokepoint's bootout-settle sleep. */
+  sleepMs?: (ms: number) => Promise<void>;
 }): Promise<void> {
   const run = input.runLaunchctlFn ?? runLaunchctl;
   const label = peerResolverDaemonLabel(input.agentUid);
   const plistPath = peerResolverDaemonPlistPath(input.agentUid);
-  const bootstrap = await run(["bootstrap", "system", plistPath]);
-  if (
-    bootstrap.code !== 0 &&
-    !/already bootstrapped|service already loaded|Bootstrap failed: 5: Input\/output error/i.test(bootstrap.stderr)
-  ) {
-    throw new Error(`launchctl bootstrap ${label} exited ${bootstrap.code}: ${bootstrap.stderr.trim()}`);
-  }
-  const kick = await run(["kickstart", `system/${label}`]);
-  if (kick.code !== 0) {
-    throw new Error(`launchctl kickstart ${label} exited ${kick.code}: ${kick.stderr.trim()}`);
-  }
+  await reloadLaunchdDaemonForBringUp({
+    label,
+    plistPath,
+    runLaunchctlFn: run,
+    ...(input.sleepMs !== undefined ? { sleepMs: input.sleepMs } : {}),
+  });
 }
 
 /**
@@ -1339,17 +1361,30 @@ async function launchdDaemonStatusByLabel(
  * and refusing to arm is a louder, more recoverable failure than that.
  *
  * Once the settle loop has PROVEN the label unloaded, a bootstrap that
- * reports "already loaded" is no longer a legitimate no-op (unlike the boot
- * path, which may race a concurrent load) -- it means the print readback was
- * wrong, so it is treated as an error like any other bootstrap failure. This
- * is why the strict semantics here deliberately do NOT carry the boot path's
- * `Bootstrap failed: 5: Input/output error` tolerance: post-settle, an IO
- * error is a real failure, not the benign already-loaded race.
+ * reports "already loaded" is no longer a legitimate no-op -- it means the
+ * print readback was wrong, so it is treated as an error like any other
+ * bootstrap failure. Post-settle, an IO error (`Bootstrap failed: 5:
+ * Input/output error`) is a real failure too, not the benign already-loaded
+ * race the raw boot-time callers used to tolerate.
  *
- * The BOOT paths ({@link bootstrapPeerResolverDaemonForBoot},
- * {@link bootstrapGateDaemonForBoot}) deliberately do NOT bootout-first: a
- * reboot re-launches from the CURRENT on-disk plist and nothing rewrites it
- * there, so argv cannot drift.
+ * FIX (hardware drill 2026-07-27, `drill-994-boot-selfheal`): the BOOT paths
+ * ({@link bootstrapPeerResolverDaemonForBoot}, {@link bootstrapGateDaemonForBoot})
+ * used to deliberately NOT bootout-first, on the reasoning that a reboot
+ * re-launches from the CURRENT on-disk plist and nothing rewrites it there,
+ * so argv could not drift. A boot-time plist self-heal breaks that premise:
+ * launchd scans and loads every `/Library/LaunchDaemons` plist at boot
+ * BEFORE the boot supervisor runs, so a self-heal that rewrites the file
+ * during this same boot is loading a job launchd has already bootstrapped
+ * from the STALE prior content -- the raw `bootstrap` no-ops (tolerated as
+ * "already bootstrapped") and `kickstart` relaunches the cached stale argv,
+ * measured 0/5 on real hardware (the healed file took effect only on the
+ * NEXT boot). Both boot paths now route through this SAME chokepoint, so
+ * whatever is on disk at the moment they run is what launchd actually
+ * starts, in the SAME boot. This costs one extra `bootout` + settle per
+ * boot, tolerated as not-loaded on a clean host (nothing was running yet),
+ * and cheap even when something was running (RunAtLoad=false means neither
+ * daemon does meaningful work between launchd's boot-time load and this
+ * call).
  */
 export async function reloadLaunchdDaemonForBringUp(input: {
   label: string;
@@ -3275,6 +3310,14 @@ export interface ExclusiveEgressBootSupervisorInternals {
   readRuntimeState?: (agentUid: number) => Promise<string>;
   gateWaitBudgetMs?: number;
   gateWaitIntervalMs?: number;
+  /**
+   * TEST-ONLY: replaces the reload chokepoint's bootout-settle sleep for both
+   * the peer-resolver and gate-daemon boot bootstraps (fix: `bootstrapGateDaemonForBoot` /
+   * `bootstrapPeerResolverDaemonForBoot` now route through
+   * `reloadLaunchdDaemonForBringUp`, whose settle loop sleeps between
+   * `launchctl print` samples). Absent = production's real timer.
+   */
+  gateReloadSleepMs?: (ms: number) => Promise<void>;
   loadMarker?: (fortressPath: string) => Promise<{ agent_uid: number; gate_uid: number } | null>;
   ensureRuntimeFs?: (input: { agentUid: number; gateUid: number }) => Promise<void>;
   ensureGateHomeLayout?: (input: {
@@ -3686,7 +3729,11 @@ export async function startExclusiveEgressBootSupervisor(input: {
         // CONNECT fail-closed (peer_unresolved), the honest degraded outcome,
         // never a crash and never a silent widen.
         try {
-          await bootstrapPeerResolverDaemonForBoot({ agentUid, runLaunchctlFn: launchctlFn });
+          await bootstrapPeerResolverDaemonForBoot({
+            agentUid,
+            runLaunchctlFn: launchctlFn,
+            ...(internals.gateReloadSleepMs !== undefined ? { sleepMs: internals.gateReloadSleepMs } : {}),
+          });
         } catch (err) {
           input.print(
             `[castle-wall] boot: uid ${agentUid} peer-resolver daemon bootstrap failed (${(err as Error).message}); ` +
@@ -3728,6 +3775,7 @@ export async function startExclusiveEgressBootSupervisor(input: {
             ...(internals.gateWaitBudgetMs !== undefined ? { waitBudgetMs: internals.gateWaitBudgetMs } : {}),
             ...(internals.gateWaitIntervalMs !== undefined ? { waitIntervalMs: internals.gateWaitIntervalMs } : {}),
             ...(bootGateStderrPath !== undefined ? { gateDaemonStderrPath: bootGateStderrPath } : {}),
+            ...(internals.gateReloadSleepMs !== undefined ? { sleepMs: internals.gateReloadSleepMs } : {}),
           });
         } catch (err) {
           input.print(

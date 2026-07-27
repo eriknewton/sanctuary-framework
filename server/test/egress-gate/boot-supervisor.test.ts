@@ -236,6 +236,35 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     expect(resolverBootstrapIdx).toBeGreaterThanOrEqual(0);
     expect(resolverKickIdx).toBeGreaterThan(resolverBootstrapIdx);
     expect(bootstrapIdx).toBeGreaterThan(resolverKickIdx);
+    // FIX (hardware drill 2026-07-27, drill-994-boot-selfheal): the boot path
+    // must BOOTOUT each label BEFORE bootstrapping it, so a plist that was
+    // rewritten (by a self-heal, or just left over from a prior boot) during
+    // THIS boot is what launchd actually loads -- not whatever launchd had
+    // already bootstrapped from disk before the supervisor ran. This is the
+    // assertion that FAILS against the pre-fix raw bootstrap+kickstart (which
+    // never issues a bootout at all) and PASSES once bootstrap*ForBoot route
+    // through the reloadLaunchdDaemonForBringUp chokepoint.
+    const gateBootoutIdx = events.indexOf(
+      "launchctl bootout system/ai.sanctuaryprotocol.egress-gate.502",
+    );
+    const resolverBootoutIdx = events.indexOf(
+      "launchctl bootout system/ai.sanctuaryprotocol.egress-gate-peer-resolver.502",
+    );
+    expect(resolverBootoutIdx).toBeGreaterThanOrEqual(0);
+    expect(resolverBootoutIdx).toBeLessThan(resolverBootstrapIdx);
+    expect(gateBootoutIdx).toBeGreaterThanOrEqual(0);
+    expect(gateBootoutIdx).toBeLessThan(bootstrapIdx);
+    // The reload chokepoint SETTLES (launchctl print) between bootout and
+    // bootstrap for each label -- proving the old job is reaped before the
+    // rewritten plist is loaded, not just tolerating an unverified bootout.
+    const gatePrintIdx = events.indexOf("launchctl print system/ai.sanctuaryprotocol.egress-gate.502");
+    const resolverPrintIdx = events.indexOf(
+      "launchctl print system/ai.sanctuaryprotocol.egress-gate-peer-resolver.502",
+    );
+    expect(resolverPrintIdx).toBeGreaterThan(resolverBootoutIdx);
+    expect(resolverPrintIdx).toBeLessThan(resolverBootstrapIdx);
+    expect(gatePrintIdx).toBeGreaterThan(gateBootoutIdx);
+    expect(gatePrintIdx).toBeLessThan(bootstrapIdx);
   });
 
   it("a boot gate-home layout failure logs LOUDLY and forces the release barrier to park fail-closed", async () => {
@@ -355,7 +384,11 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     expect(handle.results[0]!.outcome.kind).toBe("parked");
   });
 
-  it("'already bootstrapped' from launchctl is tolerated (idempotent boot)", async () => {
+  it("a NOT-LOADED bootout (first-ever boot: nothing was ever bootstrapped) is tolerated and the boot still releases", async () => {
+    // A first-ever boot has nothing to boot out for either label. The reload
+    // chokepoint's not-loaded tolerance must not turn that into a boot
+    // failure -- this is the ordinary, most common case (every boot, not
+    // just a self-heal boot), so it must stay cheap and silent.
     let kicked = false;
     const handle = await startExclusiveEgressBootSupervisor({
       resolveAgent: async () => OK_CTX,
@@ -364,10 +397,10 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
       refreshIntervalMs: 60_000,
       internals: baseInternals({
         runLaunchctlFn: async (args) => {
-          if (args[0] === "bootstrap") {
-            return { code: 37, stdout: "", stderr: "Bootstrap failed: 37: already bootstrapped" };
+          if (args[0] === "bootout") {
+            return { code: 113, stdout: "", stderr: "Could not find service" };
           }
-          if (args[0] === "kickstart") kicked = true;
+          if (args[0] === "kickstart" && args[1] === `system/ai.sanctuaryprotocol.egress-gate.502`) kicked = true;
           return { code: 0, stdout: "", stderr: "" };
         },
       }),
@@ -375,6 +408,60 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     handle.stopOracleLoop();
     expect(kicked).toBe(true);
     expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+  });
+
+  it("FIX (drill-994-boot-selfheal): the gate daemon STILL RUNNING after bootout is refused, not silently kickstarted over -- the settle discipline the raw boot path never had", async () => {
+    // Before the fix, bootstrapGateDaemonForBoot never issued a bootout at
+    // all, so it could not distinguish "the old job settled" from "the old
+    // job is still there" -- it just kickstarted whatever launchd already
+    // had loaded, which is the exact mechanism the hardware drill caught
+    // (0/5 stale-plist reboots recovered in the same boot). Now that it
+    // routes through the shared settle-before-bootstrap chokepoint, a job
+    // that refuses to stop is a LOUD, parked failure -- never a silent
+    // kickstart of a daemon that might still be serving the OLD generation.
+    const printed: string[] = [];
+    let barrierRan = false;
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: (line) => printed.push(line),
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        gateReloadSleepMs: async () => undefined,
+        runLaunchctlFn: async (args) => {
+          if (args[0] === "print" && args[1] === "system/ai.sanctuaryprotocol.egress-gate.502") {
+            return {
+              code: 0,
+              stdout: "system/ai.sanctuaryprotocol.egress-gate.502 = {\n\tpid = 13651\n\tstate = running\n}\n",
+              stderr: "",
+            };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        runBarrier: async () => {
+          barrierRan = true;
+          return {
+            kind: "parked",
+            stage: "gate-verify",
+            reason: "gate runtime state unreadable",
+            holdFileRemoved: true,
+            jobDisabled: true,
+            cleanupErrors: [],
+            parkedClaim: await assessHarnessParked({
+              probe: {
+                harnessStatus: async () => ({ known: true, installed: true, running: false }),
+                sleepMs: async () => undefined,
+              },
+            }),
+          };
+        },
+      }),
+    });
+    handle.stopOracleLoop();
+    expect(barrierRan).toBe(true);
+    expect(printed.join("\n")).toContain("gate daemon bootstrap failed");
+    expect(printed.join("\n")).toContain("STILL RUNNING after bootout");
+    expect(handle.results[0]!.outcome.kind).toBe("parked");
   });
 });
 
