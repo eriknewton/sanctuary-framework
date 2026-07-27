@@ -31,6 +31,8 @@ import {
   reconcileStaleExclusiveRoutingProduction,
   reloadPeerResolverDaemonForBringUp,
   reloadLaunchdDaemonForBringUp,
+  bootstrapGateDaemonForBoot,
+  bootstrapPeerResolverDaemonForBoot,
   describeGateDaemonStderrTail,
   waitForGateRuntime,
   GATE_DAEMON_STDERR_TAIL_MAX_LINES,
@@ -2526,5 +2528,216 @@ describe("reloadLaunchdDaemonForBringUp (fix-round-4: shared chokepoint; the GAT
     });
     await expect(reload(fn)).rejects.toThrow(/bootstrap .* exited 5/);
     expect(calls).not.toContain(`kickstart system/${GATE_LABEL}`);
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX (harden-loop review, 2026-07-27): the settle loop used to declare
+  // victory as soon as `launchctl print` stopped reporting a running pid,
+  // even though a `print` that exits 0 with NO pid line means the label is
+  // still LOADED (bootout accepted the stop, but launchd has not yet
+  // deregistered the job) -- distinct from a `print` that exits non-zero
+  // ("not loaded"), which is the only reading that actually proves the
+  // label is gone. Settling on the former and proceeding to bootstrap would
+  // hit "already bootstrapped" and, post-settle, throw anyway -- so the
+  // fix makes the settle loop keep sampling through that ambiguous state
+  // instead of stopping early on it.
+  // -------------------------------------------------------------------------
+  it("keeps sampling through a LOADED-but-not-running print (no pid line, exit 0) until the label is actually gone, then bootstraps + kickstarts", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      // Sample 1: still loaded, process already reaped (no pid line, exit 0).
+      // Sample 2: genuinely unloaded (non-zero, "not loaded" shaped).
+      print: [
+        { code: 0, stdout: `system/${GATE_LABEL} = {\n\tstate = not running\n}\n` },
+        { code: 113, stdout: "", stderr: "Could not find service" },
+      ],
+    });
+    await expect(reload(fn)).resolves.toBeUndefined();
+    const printCalls = calls.filter((c) => c === `print system/${GATE_LABEL}`);
+    expect(printCalls.length).toBe(2);
+    expect(calls).toContain(`bootstrap system ${GATE_PLIST}`);
+    expect(calls).toContain(`kickstart system/${GATE_LABEL}`);
+  });
+
+  it("FAILS CLOSED (STILL LOADED, not STILL RUNNING) when the label stays loaded-but-not-running through every sample", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      print: { code: 0, stdout: `system/${GATE_LABEL} = {\n\tstate = not running\n}\n` },
+    });
+    await expect(reload(fn)).rejects.toThrow(/STILL LOADED after bootout/);
+    expect(calls).not.toContain(`bootstrap system ${GATE_PLIST}`);
+    expect(calls).not.toContain(`kickstart system/${GATE_LABEL}`);
+    const printCalls = calls.filter((c) => c === `print system/${GATE_LABEL}`);
+    expect(printCalls.length).toBe(HARNESS_STOP_SETTLE_SAMPLES);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX (hardware drill 2026-07-27, drill-994-boot-selfheal): the boot-time
+// gate-daemon and peer-resolver bootstraps used to issue a raw
+// `bootstrap` + `kickstart` and TOLERATE "already bootstrapped". On real
+// hardware, launchd has ALREADY loaded whatever plist was on disk when it
+// scanned /Library/LaunchDaemons at boot -- BEFORE the boot supervisor ever
+// runs -- so a plist rewritten during THIS boot (by a self-heal, or by any
+// other repair) is invisible to a raw bootstrap: it no-ops on the
+// already-loaded (stale) job and kickstart relaunches the cached stale
+// argv. Measured 0/5 on stale-plist reboots; the self-heal's write to disk
+// only took effect on the NEXT boot.
+//
+// These tests exercise `bootstrapGateDaemonForBoot` /
+// `bootstrapPeerResolverDaemonForBoot` directly (rather than only through
+// the whole boot supervisor) so the fix is pinned at its narrowest possible
+// surface. The FIRST test in each pair is the one that FAILS against the
+// pre-fix raw bootstrap+kickstart implementation (which never calls
+// `bootout` or `print` at all) and PASSES once the function routes through
+// `reloadLaunchdDaemonForBringUp`.
+// ---------------------------------------------------------------------------
+describe("bootstrapGateDaemonForBoot / bootstrapPeerResolverDaemonForBoot (fix: bootout-before-bootstrap so a healed plist takes effect in the SAME boot)", () => {
+  const AGENT_UID = 502;
+  const GATE_LABEL = egressGateDaemonLabel(AGENT_UID);
+  const GATE_PLIST = egressGateDaemonPlistPath(AGENT_UID);
+  const RESOLVER_LABEL = peerResolverDaemonLabel(AGENT_UID);
+  const RESOLVER_PLIST = peerResolverDaemonPlistPath(AGENT_UID);
+
+  function recordingLaunchctl(
+    handlers: Partial<Record<"bootout" | "bootstrap" | "kickstart", { code: number; stderr?: string }>> & {
+      print?: { code: number; stdout?: string; stderr?: string };
+      /**
+       * Sequence of `print` responses returned IN CALL ORDER (the harden-loop
+       * PR #1027 fix's pre-check print comes first, then any settle-loop
+       * samples after a bootout). The LAST entry repeats once the sequence is
+       * exhausted, so a short sequence still models a settle loop that never
+       * resolves. Overrides `print` when both are supplied.
+       */
+      printSequence?: Array<{ code: number; stdout?: string; stderr?: string }>;
+    } = {},
+  ): {
+    fn: (args: readonly string[]) => Promise<{ code: number; stdout: string; stderr: string }>;
+    calls: string[];
+  } {
+    const calls: string[] = [];
+    let printCallIndex = 0;
+    return {
+      calls,
+      fn: (args) => {
+        const verb = args[0] as "bootout" | "bootstrap" | "kickstart" | "print";
+        calls.push(args.join(" "));
+        if (verb === "print") {
+          let resp: { code: number; stdout?: string; stderr?: string };
+          if (handlers.printSequence !== undefined && handlers.printSequence.length > 0) {
+            const idx = Math.min(printCallIndex, handlers.printSequence.length - 1);
+            resp = handlers.printSequence[idx]!;
+            printCallIndex += 1;
+          } else {
+            resp = handlers.print ?? { code: 113, stdout: "", stderr: "Could not find service" };
+          }
+          return Promise.resolve({ code: resp.code, stdout: resp.stdout ?? "", stderr: resp.stderr ?? "" });
+        }
+        const h = handlers[verb];
+        return Promise.resolve({ code: h?.code ?? 0, stdout: "", stderr: h?.stderr ?? "" });
+      },
+    };
+  }
+
+  it("bootstrapGateDaemonForBoot: pre-check finds the label NOT running (cold boot), so it BOOTS OUT, SETTLES, then bootstraps + kickstarts -- the exact order the drill's hardware evidence requires", async () => {
+    const { fn, calls } = recordingLaunchctl();
+    await expect(
+      bootstrapGateDaemonForBoot({ agentUid: AGENT_UID, expected: null, runLaunchctlFn: fn, sleepMs: async () => {} }),
+    ).resolves.toBeUndefined();
+    expect(calls).toEqual([
+      `print system/${GATE_LABEL}`,
+      `bootout system/${GATE_LABEL}`,
+      `print system/${GATE_LABEL}`,
+      `bootstrap system ${GATE_PLIST}`,
+      `kickstart system/${GATE_LABEL}`,
+    ]);
+  });
+
+  it("bootstrapGateDaemonForBoot: TOLERATES a not-loaded bootout (first-ever boot -- nothing was ever bootstrapped) and still bootstraps + kickstarts", async () => {
+    const { fn, calls } = recordingLaunchctl({ bootout: { code: 113, stderr: "Could not find service" } });
+    await expect(
+      bootstrapGateDaemonForBoot({ agentUid: AGENT_UID, expected: null, runLaunchctlFn: fn, sleepMs: async () => {} }),
+    ).resolves.toBeUndefined();
+    expect(calls).toContain(`bootstrap system ${GATE_PLIST}`);
+    expect(calls).toContain(`kickstart system/${GATE_LABEL}`);
+  });
+
+  it("bootstrapGateDaemonForBoot: FAILS CLOSED (throws, never kickstarts) when the old gate job will not settle stopped after bootout", async () => {
+    // Pre-check sees NOT running (so it proceeds into the bootout, as a
+    // genuine cold boot would), but the settle loop after the bootout keeps
+    // finding it running (e.g. an in-flight CONNECT tunnel the daemon cannot
+    // force-close) -- the fail-closed backstop the PR #1027 review finding
+    // requires is still reachable after the pre-check fix.
+    const { fn, calls } = recordingLaunchctl({
+      printSequence: [
+        { code: 113, stdout: "", stderr: "Could not find service" },
+        { code: 0, stdout: `system/${GATE_LABEL} = {\n\tpid = 13651\n\tstate = running\n}\n` },
+      ],
+    });
+    await expect(
+      bootstrapGateDaemonForBoot({ agentUid: AGENT_UID, expected: null, runLaunchctlFn: fn, sleepMs: async () => {} }),
+    ).rejects.toThrow(/STILL RUNNING after bootout/);
+    expect(calls).not.toContain(`bootstrap system ${GATE_PLIST}`);
+    expect(calls).not.toContain(`kickstart system/${GATE_LABEL}`);
+  });
+
+  it("bootstrapGateDaemonForBoot: SKIPS the whole reload when the label is ALREADY RUNNING (live re-entry) -- never bootouts a serving gate daemon", async () => {
+    // The HIGH finding this test pins: `startExclusiveEgressBootSupervisor`
+    // is not boot-only (its LaunchDaemon is KeepAlive=true + crash-restarts,
+    // and `protect`'s "restart-existing" branch re-runs it too), so a live,
+    // already-serving gate must never be bootout-ed just because the boot
+    // supervisor happened to run again.
+    const { fn, calls } = recordingLaunchctl({
+      print: { code: 0, stdout: `system/${GATE_LABEL} = {\n\tpid = 13651\n\tstate = running\n}\n` },
+    });
+    await expect(
+      bootstrapGateDaemonForBoot({ agentUid: AGENT_UID, expected: null, runLaunchctlFn: fn, sleepMs: async () => {} }),
+    ).resolves.toBeUndefined();
+    expect(calls).toEqual([`print system/${GATE_LABEL}`]);
+  });
+
+  it("bootstrapPeerResolverDaemonForBoot: pre-check finds the label NOT running (cold boot), so it BOOTS OUT, SETTLES, then bootstraps + kickstarts -- same fix, same shape", async () => {
+    const { fn, calls } = recordingLaunchctl();
+    await expect(
+      bootstrapPeerResolverDaemonForBoot({ agentUid: AGENT_UID, runLaunchctlFn: fn, sleepMs: async () => {} }),
+    ).resolves.toBeUndefined();
+    expect(calls).toEqual([
+      `print system/${RESOLVER_LABEL}`,
+      `bootout system/${RESOLVER_LABEL}`,
+      `print system/${RESOLVER_LABEL}`,
+      `bootstrap system ${RESOLVER_PLIST}`,
+      `kickstart system/${RESOLVER_LABEL}`,
+    ]);
+  });
+
+  it("bootstrapPeerResolverDaemonForBoot: TOLERATES a not-loaded bootout (first-ever boot) and still bootstraps + kickstarts", async () => {
+    const { fn, calls } = recordingLaunchctl({ bootout: { code: 113, stderr: "Could not find service" } });
+    await expect(
+      bootstrapPeerResolverDaemonForBoot({ agentUid: AGENT_UID, runLaunchctlFn: fn, sleepMs: async () => {} }),
+    ).resolves.toBeUndefined();
+    expect(calls).toContain(`bootstrap system ${RESOLVER_PLIST}`);
+    expect(calls).toContain(`kickstart system/${RESOLVER_LABEL}`);
+  });
+
+  it("bootstrapPeerResolverDaemonForBoot: FAILS CLOSED when the old resolver job will not settle stopped after bootout", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      printSequence: [
+        { code: 113, stdout: "", stderr: "Could not find service" },
+        { code: 0, stdout: `system/${RESOLVER_LABEL} = {\n\tpid = 4242\n\tstate = running\n}\n` },
+      ],
+    });
+    await expect(
+      bootstrapPeerResolverDaemonForBoot({ agentUid: AGENT_UID, runLaunchctlFn: fn, sleepMs: async () => {} }),
+    ).rejects.toThrow(/STILL RUNNING after bootout/);
+    expect(calls).not.toContain(`bootstrap system ${RESOLVER_PLIST}`);
+    expect(calls).not.toContain(`kickstart system/${RESOLVER_LABEL}`);
+  });
+
+  it("bootstrapPeerResolverDaemonForBoot: SKIPS the whole reload when the label is ALREADY RUNNING (live re-entry) -- never bootouts a serving resolver", async () => {
+    const { fn, calls } = recordingLaunchctl({
+      print: { code: 0, stdout: `system/${RESOLVER_LABEL} = {\n\tpid = 4242\n\tstate = running\n}\n` },
+    });
+    await expect(
+      bootstrapPeerResolverDaemonForBoot({ agentUid: AGENT_UID, runLaunchctlFn: fn, sleepMs: async () => {} }),
+    ).resolves.toBeUndefined();
+    expect(calls).toEqual([`print system/${RESOLVER_LABEL}`]);
   });
 });

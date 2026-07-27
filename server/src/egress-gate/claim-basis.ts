@@ -1195,7 +1195,10 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "arming-wiring.peer-resolver-reload-settled": {
     file: `${EG}/arming-wiring.ts`,
     symbol: "reloadPeerResolverDaemonForBringUp",
-    claim: "the old resolver job settled to stopped before the rewritten plist was bootstrapped",
+    claim:
+      "the old resolver job settled to UNLOADED (not merely stopped) before the rewritten plist was " +
+      "bootstrapped (strengthened fix-round 2026-07-27: an installed-but-processless job is still loaded, " +
+      "and bootstrapping over it silently keeps the stale argv)",
     basis: "observed",
     detectorBlind: true,
     layer: "compute",
@@ -1210,7 +1213,10 @@ export const CLAIM_SITES: Record<ClaimSiteId, ClaimSiteDeclaration> = {
   "arming-wiring.gate-daemon-reload-settled": {
     file: `${EG}/arming-wiring.ts`,
     symbol: "reloadLaunchdDaemonForBringUp",
-    claim: "the old gate daemon settled to stopped before the rewritten plist was bootstrapped",
+    claim:
+      "the old gate daemon settled to UNLOADED (not merely stopped) before the rewritten plist was " +
+      "bootstrapped (strengthened fix-round 2026-07-27: an installed-but-processless job is still loaded, " +
+      "and bootstrapping over it silently keeps the stale argv)",
     basis: "observed",
     detectorBlind: true,
     layer: "compute",
