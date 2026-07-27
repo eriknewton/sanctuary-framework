@@ -44,6 +44,8 @@ import type { AgentOrigin, OperatorBaseline } from "../allowlist/manifest.js";
 import {
   deriveHabeasDistressRules,
   HABEAS_LOCAL_RULE_ID,
+  HABEAS_RULE_ID_PREFIX,
+  isGenuineDerivedHabeasRule,
 } from "../allowlist/habeas-port.js";
 import { OBSERVE_PROMOTED_RULE_ID_PREFIX } from "../constants.js";
 import { synthesizeCandidateRule, type PromoteRouting } from "./synthesize.js";
@@ -639,10 +641,31 @@ export async function promoteCandidates(
     // provisioning read-half recognize the byte-genuine lane file and skip
     // it (they derive their own lanes), so it never trips the
     // reserved-namespace firewall.
-    if (!mergedRules.some((rule) => rule.id === HABEAS_LOCAL_RULE_ID)) {
-      mergedRules.push(...deriveHabeasDistressRules({ createdAt }));
-    }
-    const publishResult = await deps.publish(mergedRules, descriptors);
+    //
+    // Round-5 RC1: the decision is made by the GENUINE-lane predicate (the
+    // same parity-pinned recognizer the Rust gate mirrors), never by id
+    // presence alone. The reserved habeas namespace is not operator content,
+    // yet a pinned-key-signed basis can carry a schema-valid but NON-GENUINE
+    // rule under a reserved id (e.g. a wrong-IP "local lane" signed by an
+    // earlier toolchain); id-only presence let that rule SUPPRESS the lane
+    // injection, so promote re-signed and reported success while the Rust
+    // gate counts zero genuine local lanes and rejects the whole policy.
+    // Any non-genuine reserved-id rule is REPLACED: dropped from the signed
+    // set (its now-unreferenced file is swept by the ownership-ledger
+    // cleanup), and the genuine local derivation ensured. A genuine webhook
+    // lane is carried as-is; a non-genuine webhook-id claimer is dropped
+    // without replacement (that lane is config-owned, and the Rust gate
+    // rejects non-genuine prefix claimers outright).
+    const reservedNamespaceClean = mergedRules.filter(
+      (rule) => !rule.id.startsWith(HABEAS_RULE_ID_PREFIX) || isGenuineDerivedHabeasRule(rule),
+    );
+    const hasGenuineLocalLane = reservedNamespaceClean.some(
+      (rule) => rule.id === HABEAS_LOCAL_RULE_ID && isGenuineDerivedHabeasRule(rule),
+    );
+    const finalRules = hasGenuineLocalLane
+      ? reservedNamespaceClean
+      : [...reservedNamespaceClean, ...deriveHabeasDistressRules({ createdAt })];
+    const publishResult = await deps.publish(finalRules, descriptors);
 
     for (const row of promotable) {
       if (!deps.auditPromotedCandidate) continue;

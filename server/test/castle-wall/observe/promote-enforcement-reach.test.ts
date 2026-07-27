@@ -567,6 +567,106 @@ describe("observe promote reaches live enforcement (the real composer, not promo
     expect(composed!.scope).toEqual({ uids: [GATE_UID] });
   });
 
+  it("FAIL-WITHOUT-FIX (RC1): a signed basis carrying a NON-GENUINE reserved-id rule is REPAIRED, never re-signed into a Linux-rejected manifest", async () => {
+    // A pinned-key-signed basis manifest with a schema-valid but NON-GENUINE
+    // rule under the reserved local-lane id (wrong IP). Id-only presence
+    // checking let this rule suppress the genuine-lane injection: promote
+    // re-signed it, reported success, and the Rust composed-manifest gate
+    // (which counts GENUINE local lanes, habeas.rs) rejected the whole
+    // policy.
+    const bogusLane: AllowlistRule = {
+      id: "reserved_habeas_distress_local",
+      schema_version: 1,
+      created_at: "2026-07-27T00:00:00Z",
+      match: { ip: ["10.0.0.1"], port: [8741], protocol: "tcp" },
+      scope: { agent_ids: ["sanctuary:habeas-distress-emitter"] },
+      disposition: "allow",
+      derived: true,
+    };
+    expect(isGenuineDerivedHabeasRule(bogusLane)).toBe(false);
+    await publishSignedManifest(
+      {
+        fortressId: "fortress-test",
+        issuedAt: new Date().toISOString(),
+        rules: [bogusLane],
+        signer,
+      },
+      new FilesystemManifestStorage(egressDir),
+    );
+
+    const outcome = await promoteViaProductionWiring(candidate("api.newlyapproved.example"));
+    expect(outcome.status).toBe("promoted");
+
+    // The published manifest satisfies the Rust manifest contract: exactly
+    // one local-lane rule, and it is GENUINE (the bogus one was replaced,
+    // never carried).
+    const signed = JSON.parse(
+      await readFile(join(egressDir, "manifest.json"), "utf8"),
+    ) as SignedManifest;
+    const parsedRules = await Promise.all(
+      signed.manifest.rules.map(async (entry) =>
+        JSON.parse(await readFile(join(egressDir, "rules", entry.file), "utf8")) as AllowlistRule,
+      ),
+    );
+    const lanes = parsedRules.filter((rule) => rule.id === HABEAS_LOCAL_RULE_ID);
+    expect(lanes).toHaveLength(1);
+    expect(isGenuineDerivedHabeasRule(lanes[0]!)).toBe(true);
+    // And no other reserved-prefix claimer survived into the signed set.
+    expect(
+      parsedRules.every(
+        (rule) => !rule.id.startsWith("reserved_habeas_distress") || isGenuineDerivedHabeasRule(rule),
+      ),
+    ).toBe(true);
+  });
+
+  it("settles (RC2): a provisioned-* rule REFERENCED BY the promote manifest is rewritten BYTE-IDENTICALLY by a promote (and an unreferenced one is untouched, per F4)", async () => {
+    // The round-4 PR premise said promote "never writes" provisioned files;
+    // Codex read the merge path as republishing every carried rule. Settle
+    // it by measurement: put a provisioned-* rule INTO the promote-signed
+    // manifest (not the production shape -- production manifests carry only
+    // observe rules + the lane -- but exactly the disputed scenario), run a
+    // promote, and compare the file's bytes.
+    const provisionedRule: AllowlistRule = {
+      id: "provisioned-hermes-abc123def456",
+      schema_version: 1,
+      created_at: "2026-07-27T00:00:00Z",
+      match: { host: ["api.venice.ai"], port: [443], protocol: "tcp" },
+      scope: {},
+      disposition: "allow",
+      derived: true,
+    };
+    await publishSignedManifest(
+      {
+        fortressId: "fortress-test",
+        issuedAt: new Date().toISOString(),
+        rules: [provisionedRule],
+        signer,
+      },
+      new FilesystemManifestStorage(egressDir),
+    );
+    const provisionedPath = join(egressDir, "rules", "provisioned-hermes-abc123def456.json");
+    const bytesBefore = await readFile(provisionedPath);
+
+    const outcome = await promoteViaProductionWiring(candidate("api.newlyapproved.example"));
+    expect(outcome.status).toBe("promoted");
+
+    // MEASURED REALITY: the carried manifest-referenced rule IS rewritten by
+    // the publish (every merged rule is), and the rewrite is BYTE-IDENTICAL
+    // -- the carried rule was sha256-verified against these exact canonical
+    // bytes and re-rendered through the same canonical renderer. Harmless,
+    // and serialized under the shared writer lock either way.
+    const bytesAfter = await readFile(provisionedPath);
+    expect(bytesAfter.equals(bytesBefore)).toBe(true);
+    // It also remains in the re-signed manifest (carried forward, never
+    // dropped).
+    const signed = JSON.parse(
+      await readFile(join(egressDir, "manifest.json"), "utf8"),
+    ) as SignedManifest;
+    expect(
+      signed.manifest.rules.some((entry) => entry.rule_id === "provisioned-hermes-abc123def456"),
+    ).toBe(true);
+  });
+
   it("FAIL-WITHOUT-FIX (C1): provisioning refuses to write/revoke while a promote holds the shared egress-policy writer lock (and vice versa)", async () => {
     const endpointSet: HarnessEndpointSet = {
       harnessId: "testharness",
