@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [1.7.1] - Unreleased
+## [1.7.1] - 2026-07-27
 
 Patch release: completes the exclusive-egress gate path that shipped in v1.7.0, the first signed and notarized macOS release. No new capability.
 
