@@ -257,9 +257,14 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     // The reload chokepoint SETTLES (launchctl print) between bootout and
     // bootstrap for each label -- proving the old job is reaped before the
     // rewritten plist is loaded, not just tolerating an unverified bootout.
-    const gatePrintIdx = events.indexOf("launchctl print system/ai.sanctuaryprotocol.egress-gate.502");
+    // A PRE-CHECK print (the harden-loop PR #1027 live-re-entry fix) also
+    // runs BEFORE the bootout, so `indexOf`'s FIRST match is that pre-check
+    // call, not the post-bootout settle read -- search from just after the
+    // bootout for the settle-read occurrence this assertion means to pin.
+    const gatePrintIdx = events.indexOf("launchctl print system/ai.sanctuaryprotocol.egress-gate.502", gateBootoutIdx + 1);
     const resolverPrintIdx = events.indexOf(
       "launchctl print system/ai.sanctuaryprotocol.egress-gate-peer-resolver.502",
+      resolverBootoutIdx + 1,
     );
     expect(resolverPrintIdx).toBeGreaterThan(resolverBootoutIdx);
     expect(resolverPrintIdx).toBeLessThan(resolverBootstrapIdx);
@@ -421,6 +426,7 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     // kickstart of a daemon that might still be serving the OLD generation.
     const printed: string[] = [];
     let barrierRan = false;
+    let gatePrintCalls = 0;
     const handle = await startExclusiveEgressBootSupervisor({
       resolveAgent: async () => OK_CTX,
       audit: async () => undefined,
@@ -430,6 +436,16 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
         gateReloadSleepMs: async () => undefined,
         runLaunchctlFn: async (args) => {
           if (args[0] === "print" && args[1] === "system/ai.sanctuaryprotocol.egress-gate.502") {
+            gatePrintCalls += 1;
+            // The harden-loop PR #1027 live-re-entry fix pre-checks the
+            // label BEFORE bootout-ing it. The FIRST print call here is that
+            // pre-check: report NOT running, so the cold-boot bootout path
+            // still runs (matching this test's own boot-selfheal premise).
+            // Every call AFTER the bootout (the settle loop) reports STILL
+            // running, pinning the fail-closed backstop this test exists for.
+            if (gatePrintCalls === 1) {
+              return { code: 113, stdout: "", stderr: "Could not find service" };
+            }
             return {
               code: 0,
               stdout: "system/ai.sanctuaryprotocol.egress-gate.502 = {\n\tpid = 13651\n\tstate = running\n}\n",
@@ -462,6 +478,45 @@ describe("startExclusiveEgressBootSupervisor (fix-round H2: gate daemon boot boo
     expect(printed.join("\n")).toContain("gate daemon bootstrap failed");
     expect(printed.join("\n")).toContain("STILL RUNNING after bootout");
     expect(handle.results[0]!.outcome.kind).toBe("parked");
+  });
+
+  it("FIX (harden-loop PR #1027): a LIVE RE-ENTRY (the safe-mode daemon's own KeepAlive crash-restart, or a `protect` re-run) never bootouts an already-running gate or peer-resolver daemon", async () => {
+    // `startExclusiveEgressBootSupervisor` is not boot-only in practice --
+    // its own LaunchDaemon runs KeepAlive=true + ThrottleInterval=5, so a
+    // crash restarts this exact supervisor against an agent it already
+    // released. Both daemons are already running here (as a genuine re-entry
+    // would find them); a bootout must NEVER fire against them, because an
+    // in-flight CONNECT tunnel can leave the old gate process unable to
+    // settle stopped, aborting the bring-up and parking a healthy agent
+    // (the HIGH finding this test pins).
+    const calls: string[] = [];
+    const handle = await startExclusiveEgressBootSupervisor({
+      resolveAgent: async () => OK_CTX,
+      audit: async () => undefined,
+      print: () => undefined,
+      refreshIntervalMs: 60_000,
+      internals: baseInternals({
+        runLaunchctlFn: async (args) => {
+          calls.push(`launchctl ${args.join(" ")}`);
+          if (args[0] === "print") {
+            const label = args[1] as string;
+            return { code: 0, stdout: `${label} = {\n\tpid = 4242\n\tstate = running\n}\n`, stderr: "" };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        },
+        runBarrier: async () => RELEASED,
+      }),
+    });
+    handle.stopOracleLoop();
+    expect(handle.results[0]!.outcome).toEqual({ kind: "released", generationId: 7 });
+    expect(calls).not.toContain("launchctl bootout system/ai.sanctuaryprotocol.egress-gate.502");
+    expect(calls).not.toContain("launchctl bootout system/ai.sanctuaryprotocol.egress-gate-peer-resolver.502");
+    expect(calls).not.toContain(
+      "launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate.502.plist",
+    );
+    expect(calls).not.toContain(
+      "launchctl bootstrap system /Library/LaunchDaemons/ai.sanctuaryprotocol.egress-gate-peer-resolver.502.plist",
+    );
   });
 });
 
@@ -1186,7 +1241,24 @@ describe("startExclusiveEgressBootSupervisor (fix-round-3 HIGH-1: shared-label s
           listRegistryEntries: async () => ({ entries: [okEntry, staleEntry], quarantined: [], dirty: false }),
           runLaunchctlFn: async (args: readonly string[]) => {
             launchctlCalls.push(`launchctl ${args.join(" ")}`);
-            if (args[0] === "print") return printOutput;
+            // Scoped to the SHARED harness label (harden-loop fix, 2026-07-27):
+            // this fixture answers the uid-502 skip-path status probe, which
+            // only ever asks about `system/${AGENT_HARNESS_DAEMON_LABEL}`. A
+            // blanket `if (args[0] === "print") return printOutput` also
+            // answered uid 601's PER-UID peer-resolver and gate-daemon reload
+            // prints (`reloadLaunchdDaemonForBringUp`'s post-bootout settle
+            // read) with the SAME shape. When `printOutput` reports a live pid
+            // (the "stale launchd state" test), that made both of uid 601's
+            // real daemon reloads observe "STILL RUNNING after bootout": each
+            // burned a full `HARNESS_STOP_SETTLE_SAMPLES` x
+            // `HARNESS_STOP_SETTLE_INTERVAL_MS` real-timer settle loop (no
+            // `gateReloadSleepMs` override here) before throwing, and the test
+            // only still asserted uid 601 `released` because `runBarrier` is a
+            // fixed `async () => RELEASED` stub that ignores both failures.
+            // Scoping keeps uid 601's reload prints on the default
+            // known-not-running answer (falls through below), so its daemons
+            // settle on the first sample like every other fixture here.
+            if (args[0] === "print" && args[1] === `system/${AGENT_HARNESS_DAEMON_LABEL}`) return printOutput;
             return { code: 0, stdout: "", stderr: "" };
           },
           removeHoldFile: async () => undefined,

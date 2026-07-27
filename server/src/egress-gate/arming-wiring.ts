@@ -1214,11 +1214,30 @@ export async function waitForGateRuntime(
  * uses (bootout the possibly-stale loaded job -> settle until proven
  * not-running -> bootstrap the CURRENT on-disk plist -> kickstart), so
  * whatever is on disk at the moment this runs is what launchd actually
- * starts, in the SAME boot. The bootout is unconditional (not conditioned on
- * whether a self-heal actually wrote): the boot path already kickstarts this
- * daemon every boot, so a bootout first costs nothing in the healthy case
- * and a not-loaded bootout (first-ever boot, nothing to boot out) is
- * tolerated by the chokepoint itself.
+ * starts, in the SAME boot. The bootout is NOT unconditional (fix below);
+ * a not-loaded bootout (first-ever boot, nothing to boot out) is tolerated
+ * by the chokepoint itself either way.
+ *
+ * FIX (harden-loop 2026-07-27, PR #1027 review finding): the chokepoint
+ * reload only fires when a PRE-CHECK proves the label is NOT already
+ * running. `startExclusiveEgressBootSupervisor` is not boot-only in
+ * practice -- its LaunchDaemon runs `KeepAlive=true` + `ThrottleInterval=5`
+ * (`castle-wall-boot.ts`), so a crash restarts it against an already-armed,
+ * already-serving gate, and `sanctuary protect`'s "restart-existing"
+ * auto-provision branch bootout+bootstraps the SAME label before re-running
+ * this supervisor. At a genuine cold boot the RunAtLoad=false job is loaded
+ * but never started (no pid), so the pre-check reports not-running and the
+ * bootout->settle->bootstrap->kickstart sequence still runs exactly as
+ * `drill-994-boot-selfheal` requires, picking up a same-boot self-heal. On a
+ * LIVE re-entry the pre-check proves the label already running -- the only
+ * way it could be is because THIS chokepoint already brought it up earlier
+ * against the on-disk plist at that time -- so the reload is skipped
+ * entirely rather than bootout-ing a daemon that may be holding open client
+ * connections (e.g. a CONNECT tunnel `http.Server.close()` cannot force
+ * shut). The runtime-state wait below still runs regardless, so a running
+ * process that turns out to serve a stale generation is caught fail-closed
+ * (`waitForGateRuntime` times out and the barrier parks), never silently
+ * trusted.
  */
 export async function bootstrapGateDaemonForBoot(input: {
   agentUid: number;
@@ -1241,12 +1260,20 @@ export async function bootstrapGateDaemonForBoot(input: {
   const run = input.runLaunchctlFn ?? runLaunchctl;
   const label = egressGateDaemonLabel(input.agentUid);
   const plistPath = egressGateDaemonPlistPath(input.agentUid);
-  await reloadLaunchdDaemonForBringUp({
-    label,
-    plistPath,
-    runLaunchctlFn: run,
-    ...(input.sleepMs !== undefined ? { sleepMs: input.sleepMs } : {}),
-  });
+  // Pre-check (fix above): only force the bootout-first reload when the
+  // label is NOT already known-running. `known: false` (untrustworthy
+  // readback) falls through to the full reload -- exactly today's
+  // unconditional behavior -- rather than risking a skip over unverifiable
+  // state.
+  const preCheck = await launchdDaemonStatusByLabel(run, label);
+  if (preCheck.running !== true) {
+    await reloadLaunchdDaemonForBringUp({
+      label,
+      plistPath,
+      runLaunchctlFn: run,
+      ...(input.sleepMs !== undefined ? { sleepMs: input.sleepMs } : {}),
+    });
+  }
   if (input.expected !== null) {
     await waitForGateRuntime(input.agentUid, input.expected.generationId, input.expected.gatePort, {
       ...(input.readState !== undefined ? { readState: input.readState } : {}),
@@ -1277,6 +1304,18 @@ export async function bootstrapGateDaemonForBoot(input: {
  * reason; see that function's fix note. This is a chokepoint fix, not a
  * one-site patch -- a sibling left on the old shape would still strangle the
  * resolver (and therefore every gated CONNECT) for a whole boot.
+ *
+ * FIX (harden-loop 2026-07-27, PR #1027 review finding): same live-re-entry
+ * pre-check as {@link bootstrapGateDaemonForBoot} -- see that function's fix
+ * note for the full rationale (the safe-mode boot daemon's `KeepAlive=true`
+ * crash-restart and `protect`'s "restart-existing" branch both re-run this
+ * against an already-armed agent). Skipping the reload when the resolver
+ * label is already known-running is safe here even without a runtime-state
+ * re-verification step: the resolver carries no per-generation identity of
+ * its own (it answers a generic uid/pid-for-loopback-port query), and the
+ * gate's own generation check (`evaluateGenerationMatch` /
+ * `peer-resolver-protocol.ts`'s matched-port-in-response reject) is what
+ * actually binds a CONNECT to the committed generation.
  */
 export async function bootstrapPeerResolverDaemonForBoot(input: {
   agentUid: number;
@@ -1287,6 +1326,10 @@ export async function bootstrapPeerResolverDaemonForBoot(input: {
   const run = input.runLaunchctlFn ?? runLaunchctl;
   const label = peerResolverDaemonLabel(input.agentUid);
   const plistPath = peerResolverDaemonPlistPath(input.agentUid);
+  const preCheck = await launchdDaemonStatusByLabel(run, label);
+  if (preCheck.running === true) {
+    return;
+  }
   await reloadLaunchdDaemonForBringUp({
     label,
     plistPath,
@@ -1388,11 +1431,26 @@ async function launchdDaemonStatusByLabel(
  * measured 0/5 on real hardware (the healed file took effect only on the
  * NEXT boot). Both boot paths now route through this SAME chokepoint, so
  * whatever is on disk at the moment they run is what launchd actually
- * starts, in the SAME boot. This costs one extra `bootout` + settle per
- * boot, tolerated as not-loaded on a clean host (nothing was running yet),
- * and cheap even when something was running (RunAtLoad=false means neither
- * daemon does meaningful work between launchd's boot-time load and this
- * call).
+ * starts, in the SAME boot.
+ *
+ * REVISED (harden-loop 2026-07-27, PR #1027 review finding): the paragraph
+ * above originally called the bootout here "unconditional... cheap even
+ * when something was running", reasoning that RunAtLoad=false means nothing
+ * does meaningful work between launchd's boot-time load and this call. That
+ * is true only at a genuine cold boot. `startExclusiveEgressBootSupervisor`
+ * is not boot-only in practice: its LaunchDaemon runs `KeepAlive=true` +
+ * `ThrottleInterval=5`, so a crash restarts it against an already-armed,
+ * already-serving gate holding real client connections, and `protect`'s
+ * "restart-existing" auto-provision branch re-runs it the same way. Bouncing
+ * a live gate daemon there can strand an in-flight CONNECT tunnel long
+ * enough that the post-bootout settle read (this function, below) still
+ * sees it running and throws, aborting the bring-up entirely. The two boot
+ * callers now pre-check `known-running` before calling into this chokepoint
+ * and skip the whole reload when it is already up (see their doc comments);
+ * this function itself stays unconditional, because ITS other callers
+ * (`productionBringUp`, `reloadPeerResolverDaemonForBringUp`) call it only
+ * right after rewriting the plist, where an unconditional force-reload is
+ * the whole point.
  */
 export async function reloadLaunchdDaemonForBringUp(input: {
   label: string;
